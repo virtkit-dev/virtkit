@@ -1624,13 +1624,17 @@ enum Cmd {
         /// declares its own `x-virtkit.reclaim`, to every service.
         #[arg(long, value_name = "POLICY")]
         reclaim: Option<vk_core::reclaim::Policy>,
-        /// DAX window for virtio-fs shares: a size, or off
+        /// DAX window for virtio-fs shares: a size, off, <size>:always or <size>:inode=<min>
         ///
         /// With a window the guest maps the host's page cache for the shared files it
         /// reads, so a tree is not cached twice and a host-side edit is visible at once;
-        /// the window is guest address space, not memory. The default is 8G per share, and
-        /// a guest holds 64G of windows in total. The built-in VMM only. Applies to the
-        /// primary and, unless a service declares its own `x-virtkit.dax`, to every service.
+        /// the window is guest address space, not memory. A bare size maps only regular
+        /// files of 1M and more (`dax=inode`): each mapping costs a host mmap per 2M range
+        /// whatever the file's size, which a source tree's small files never repay.
+        /// `:always` maps every file; `:inode=64K` moves the floor. The default is 8G per
+        /// share, and a guest holds 64G of windows in total. The built-in VMM only. Applies
+        /// to the primary and, unless a service declares its own `x-virtkit.dax`, to every
+        /// service.
         #[arg(long, value_name = "SIZE")]
         dax: Option<crate::vmm::Dax>,
         /// Forward the host SSH agent ($SSH_AUTH_SOCK) into the guest

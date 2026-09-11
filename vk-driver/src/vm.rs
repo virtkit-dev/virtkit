@@ -1118,7 +1118,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // `[executor.vm] dax`: the window each directory share gets, so the guest reads a shared tree
     // out of the host page cache rather than copying it into its own. Same window for every
     // share here — the tools tree is the one several job VMs read at once.
-    let dax = crate::run::dax_window(vm_dax(cfg)?, None, crate::vmm::libkrun_selected());
+    let dax = crate::run::dax_share(vm_dax(cfg)?, None, crate::vmm::libkrun_selected());
     if let Some(share) = &cfg.executor.share {
         let vfsd_sock = ctx.vfsd_sock();
         // libkrun mounts the host dir directly (built-in virtio-fs); only
@@ -1298,6 +1298,12 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     let dax_tags = crate::run::dax_tags(&shares);
     if !dax_tags.is_empty() {
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS_DAX={dax_tags}"));
+    }
+    // The subset served `dax=inode`: the agent mounts those with a file-size floor rather
+    // than mapping every file.
+    let dax_inode_tags = crate::run::dax_inode_tags(&shares);
+    if !dax_inode_tags.is_empty() {
+        cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS_DAX_INODE={dax_inode_tags}"));
     }
 
     // Idle page-cache trimming (`[executor.vm] reclaim`): the job guest gives file cache it stopped
@@ -2466,7 +2472,10 @@ mod tests {
         cfg.executor.vm.dax = Some("4G".into());
         assert_eq!(
             vm_dax(&cfg).unwrap(),
-            Some(crate::vmm::Dax::Window(4 << 30))
+            Some(crate::vmm::Dax::Inode {
+                window: 4 << 30,
+                min: crate::vmm::DAX_INODE_MIN_DEFAULT
+            })
         );
         cfg.executor.vm.dax = Some("off".into());
         assert_eq!(vm_dax(&cfg).unwrap(), Some(crate::vmm::Dax::Off));

@@ -629,14 +629,20 @@ copy: ten concurrent job VMs reading a tools tree held eleven copies on the host
 
 ```toml
 [executor.vm]
-dax = "8G"            # per share; the default
+dax = "8G"            # per share; the default: files of 1M and more through the window
+# dax = "8G:always"   # every file through the window
+# dax = "8G:inode=64K" # another size floor
 ```
 
 The window reserves guest address space, not memory, and costs nothing until mapped.
-`"off"` disables it. Each guest supports 64G of windows — eight at the default size, with
-further shares served without DAX. Guests with more than 63.25G of RAM have no room for
-windows and receive none. Mappings are 4 KiB-granular, so the benefit is avoiding a tools
-tree's memory cost per VM, not per-fault latency. Compose services inherit the job VM's
+`"off"` disables it. Each mapping costs the host an mmap and the guest an EPT invalidation
+per 2 MiB range whatever the file's size, which a source tree's small files never repay:
+by default only regular files of 1M and more are mapped (`dax=inode`; the host marks them),
+the rest read through the guest page cache as without DAX. Each guest supports 64G of
+windows — eight at the default size, with further shares served without DAX. Guests with
+more than 63.25G of RAM have no room for windows and receive none.
+Mappings are 4 KiB-granular, so the benefit is avoiding a tools tree's memory cost per
+VM, not per-fault latency. Compose services inherit the job VM's
 setting unless they declare `x-virtkit.dax`. DAX requires the built-in VMM;
 cloud-hypervisor has no DAX path and serves shares the ordinary way whatever this says.
 

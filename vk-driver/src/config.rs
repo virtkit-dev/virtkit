@@ -426,10 +426,14 @@ pub struct Vm {
     /// a minute or two (multi-gen LRU); `"512M"`/`"2G"` or `"5%"` keep that much as a fixed
     /// floor; `"off"` keeps everything. What goes returns to the host through the balloon.
     pub reclaim: String,
-    /// DAX window per virtio-fs share in job and service VMs: a size (default `"8G"`) or
-    /// `"off"`. Maps the host page cache into guest address space, avoiding a copy per VM.
-    /// Reserves address space, not memory; libkrun only. Unset by default so cloud-hypervisor
-    /// can distinguish an explicit request for unsupported DAX from the default.
+    /// DAX window per virtio-fs share in job and service VMs: a size (default `"8G"`),
+    /// `"off"`, `"<size>:always"` or `"<size>:inode=<min>"`. Maps the host page cache into
+    /// guest address space, avoiding a copy per VM. A bare size maps only regular files of
+    /// 1M and more (`dax=inode`): a mapping costs a host mmap per 2M range whatever the
+    /// file's size, which a source tree's small files never repay; `:always` maps every
+    /// file, `:inode=` sets the floor. Reserves address space, not memory; libkrun only.
+    /// Unset by default so cloud-hypervisor can distinguish an explicit request for
+    /// unsupported DAX from the default.
     pub dax: Option<String>,
     /// Ceilings for the per-job MICROVM_CPUS/MICROVM_MEM variables; unset =
     /// jobs cannot request more than the cpus/mem defaults above

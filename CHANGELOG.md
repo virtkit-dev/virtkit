@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **DAX maps only the files worth mapping.** A share's window now serves regular files of
+  1M and more by default (`dax=inode`); smaller files read through the guest page cache as
+  without DAX, so a source tree no longer spends the window's overhead on files too small to
+  benefit. `vk run --dax`, `x-virtkit.dax` and `[executor.vm] dax` take `<size>:always` for
+  the previous behaviour and `<size>:inode=<min>` for another floor.
+
 ### Changed
 
 - **Reading a large tree from a read-only share is faster.** A guest that reads many small

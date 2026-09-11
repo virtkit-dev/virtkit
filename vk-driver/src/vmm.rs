@@ -165,13 +165,41 @@ impl Disk {
 pub enum Dax {
     /// No window: file data is copied into the guest's page cache on every read.
     Off,
-    /// A window this many bytes wide, per share.
+    /// A window this many bytes wide, per share, used for every file (`dax=always`).
     Window(u64),
+    /// A window this many bytes wide, per share, used only for regular files of at least
+    /// `min` bytes (`dax=inode`): a mapping costs the host an mmap and the guest an EPT
+    /// invalidation per 2 MiB range whatever the file's size, which a small file never
+    /// repays — so a source tree reads through the guest page cache and only the large
+    /// files (images, archives, build products) share the host's.
+    Inode { window: u64, min: u64 },
+}
+
+/// The smallest file `Dax::Inode` maps by default. Half a range is the point where mapping
+/// beats copying on the trees measured (30k files of 2K each never repaid the mmap; an
+/// archive or a disk image does at once).
+pub const DAX_INODE_MIN_DEFAULT: u64 = 1 << 20;
+
+/// One host page. A DAX floor below this maps every regular file — that is `dax=always`
+/// with a slower spelling — so `inode=<min>` rejects anything smaller.
+const DAX_INODE_MIN_FLOOR: u64 = 4096;
+
+/// What one share is served with: its window and, for `dax=inode`, the size floor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DaxShare {
+    /// Bytes of guest address space for the window.
+    pub window: u64,
+    /// `Some(bytes)`: DAX only for regular files at least this large (`dax=inode`);
+    /// `None`: every file (`dax=always`).
+    pub inode_min: Option<u64>,
 }
 
 /// Default per-share window. Reserves address space, not memory: the host maps and unmaps
 /// file ranges on demand, so it costs nothing until used. Sized for a working tree, not RAM.
-pub const DAX_DEFAULT: Dax = Dax::Window(8 << 30);
+pub const DAX_DEFAULT: Dax = Dax::Inode {
+    window: 8 << 30,
+    min: DAX_INODE_MIN_DEFAULT,
+};
 
 /// Smallest useful window: the guest's FUSE DAX layer hands out 2 MiB ranges.
 const DAX_MIN: u64 = 2 << 20;
@@ -191,19 +219,57 @@ pub const DAX_TOTAL_MAX: u64 = 64 << 30;
 pub const DAX_MAX_GUEST_MIB: u64 = 64768;
 
 impl Dax {
-    /// The window in bytes, or `None` when off.
-    pub fn window(self) -> Option<u64> {
+    /// What a share gets under this policy, or `None` when off.
+    pub fn share(self) -> Option<DaxShare> {
         match self {
             Dax::Off => None,
-            Dax::Window(bytes) => Some(bytes),
+            Dax::Window(window) => Some(DaxShare {
+                window,
+                inode_min: None,
+            }),
+            Dax::Inode { window, min } => Some(DaxShare {
+                window,
+                inode_min: Some(min),
+            }),
         }
+    }
+}
+
+/// A size with an optional binary suffix: `<n>G`, `<n>M`, `<n>K`, or bare MiB.
+fn parse_size(s: &str) -> Option<u64> {
+    let (digits, scale) = if let Some(d) = s.strip_suffix(['G', 'g']) {
+        (d, 1u64 << 30)
+    } else if let Some(d) = s.strip_suffix(['M', 'm']) {
+        (d, 1 << 20)
+    } else if let Some(d) = s.strip_suffix(['K', 'k']) {
+        (d, 1 << 10)
+    } else {
+        (s, 1 << 20)
+    };
+    digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(scale))
+}
+
+/// `8G`, `512M`, `1K` — whole units where the value has them, else the largest that divides it.
+fn fmt_size(bytes: u64) -> String {
+    if bytes.is_multiple_of(1 << 30) {
+        format!("{}G", bytes >> 30)
+    } else if bytes.is_multiple_of(1 << 20) {
+        format!("{}M", bytes >> 20)
+    } else {
+        format!("{}K", bytes >> 10)
     }
 }
 
 impl std::str::FromStr for Dax {
     type Err = String;
 
-    /// `off`, or a window size: `<n>G`, `<n>M`, or a bare MiB count.
+    /// `off`; a window size (`<n>G`, `<n>M`, or a bare MiB count), which maps files of at
+    /// least [`DAX_INODE_MIN_DEFAULT`]; `<window>:always` for every file; or
+    /// `<window>:inode=<size>` for another floor. The window may be left out before the
+    /// colon (`always`, `inode=4M`) to take the default 8G.
     fn from_str(s: &str) -> Result<Self, String> {
         let s = s.trim();
         // The spellings a YAML or TOML scalar turns "no" into; they are not sizes, so `0M`
@@ -211,23 +277,47 @@ impl std::str::FromStr for Dax {
         if matches!(s, "off" | "false" | "0" | "no") {
             return Ok(Dax::Off);
         }
-        let (digits, scale) = match s.strip_suffix(['G', 'g']) {
-            Some(d) => (d, 1 << 30),
-            None => (s.strip_suffix(['M', 'm']).unwrap_or(s), 1 << 20),
+        let usage = || {
+            format!(
+                "expected off; a window of 2M..{}G written <n>G, <n>M or a MiB count; or \
+                 <window>:always / <window>:inode=<min size>, got {s:?}",
+                DAX_TOTAL_MAX >> 30
+            )
         };
-        digits
-            .parse::<u64>()
-            .ok()
-            .and_then(|n| n.checked_mul(scale))
-            .filter(|bytes| (DAX_MIN..=DAX_TOTAL_MAX).contains(bytes))
-            .map(Dax::Window)
-            .ok_or_else(|| {
-                format!(
-                    "expected off, or a window of 2M..{}G written <n>G, <n>M or a MiB count, \
-                     got {s:?}",
-                    DAX_TOTAL_MAX >> 30
-                )
-            })
+        let (size, mode) = match s.split_once(':') {
+            Some((size, mode)) => (size.trim(), Some(mode.trim())),
+            // `always` / `inode[=…]` alone: the default window under that mode.
+            None if s == "always" || s.starts_with("inode") => ("", Some(s)),
+            None => (s, None),
+        };
+        let window = if size.is_empty() {
+            8 << 30
+        } else {
+            parse_size(size)
+                .filter(|bytes| (DAX_MIN..=DAX_TOTAL_MAX).contains(bytes))
+                .ok_or_else(usage)?
+        };
+        match mode {
+            None => Ok(Dax::Inode {
+                window,
+                min: DAX_INODE_MIN_DEFAULT,
+            }),
+            Some("always") => Ok(Dax::Window(window)),
+            Some("inode") => Ok(Dax::Inode {
+                window,
+                min: DAX_INODE_MIN_DEFAULT,
+            }),
+            Some(m) => {
+                let min = m
+                    .strip_prefix("inode=")
+                    .and_then(parse_size)
+                    // Below one page is `always` with a slower spelling; above the window
+                    // nothing would ever map.
+                    .filter(|min| (DAX_INODE_MIN_FLOOR..=window).contains(min))
+                    .ok_or_else(usage)?;
+                Ok(Dax::Inode { window, min })
+            }
+        }
     }
 }
 
@@ -235,10 +325,14 @@ impl std::fmt::Display for Dax {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Dax::Off => f.write_str("off"),
-            // Whole gibibytes as `8G`, the spelling the docs and the CLI use; anything
-            // else in MiB, which every size this parser takes can be written in.
-            Dax::Window(bytes) if bytes.is_multiple_of(1 << 30) => write!(f, "{}G", bytes >> 30),
-            Dax::Window(bytes) => write!(f, "{}M", bytes >> 20),
+            Dax::Window(bytes) => write!(f, "{}:always", fmt_size(*bytes)),
+            // The default floor is implied by the bare window, the spelling the docs use.
+            Dax::Inode { window, min } if *min == DAX_INODE_MIN_DEFAULT => {
+                f.write_str(&fmt_size(*window))
+            }
+            Dax::Inode { window, min } => {
+                write!(f, "{}:inode={}", fmt_size(*window), fmt_size(*min))
+            }
         }
     }
 }
@@ -253,14 +347,14 @@ pub struct FsShare {
     pub socket: PathBuf,
     pub host_dir: PathBuf,
     pub read_only: bool,
-    /// Bytes of guest address space for this share's DAX window; `None` = no window.
-    /// libkrun passes it to `krun_add_virtiofs4` as its `shm_size`.
+    /// This share's DAX window and file-size floor; `None` = no window. libkrun takes the
+    /// window as `krun_add_virtiofs5`'s `shm_size` and the floor as its `dax_inode_min`.
     #[serde(default)]
-    pub dax: Option<u64>,
+    pub dax: Option<DaxShare>,
     /// virtiofsd-style UID id-map spec strings (`type:from:to[:count]`) applied at the
     /// guest↔host boundary; empty = identity. Under cloud-hypervisor these become
     /// `--uid-map` args to the bundled virtiofsd; under libkrun they go to
-    /// `krun_add_virtiofs4`. `gid_map` is the same for GIDs.
+    /// `krun_add_virtiofs5`. `gid_map` is the same for GIDs.
     #[serde(default)]
     pub uid_map: Vec<String>,
     #[serde(default)]
@@ -292,7 +386,9 @@ pub fn apply_dax_budget(shares: &mut [FsShare], mem: &str) {
     }
     let mut next = 0u64;
     for share in shares.iter_mut() {
-        let Some(window) = share.dax else { continue };
+        let Some(DaxShare { window, .. }) = share.dax else {
+            continue;
+        };
         let placed = window
             .checked_next_power_of_two()
             .map(|size| size.max(DAX_MIN))
@@ -962,10 +1058,37 @@ mod tests {
     #[test]
     fn dax_policy_parses_sizes_and_the_spellings_of_off() {
         use std::str::FromStr;
-        assert_eq!(Dax::from_str("8G").unwrap(), Dax::Window(8 << 30));
-        assert_eq!(Dax::from_str("512M").unwrap(), Dax::Window(512 << 20));
+        let inode = |window| Dax::Inode {
+            window,
+            min: DAX_INODE_MIN_DEFAULT,
+        };
+        // A bare window maps files from the default floor up.
+        assert_eq!(Dax::from_str("8G").unwrap(), inode(8 << 30));
+        assert_eq!(Dax::from_str("512M").unwrap(), inode(512 << 20));
         // A bare count is MiB, like every other size this CLI takes.
-        assert_eq!(Dax::from_str("64").unwrap(), Dax::Window(64 << 20));
+        assert_eq!(Dax::from_str("64").unwrap(), inode(64 << 20));
+        // `:always` maps every file; `:inode=` picks the floor; the window may be left out.
+        assert_eq!(Dax::from_str("8G:always").unwrap(), Dax::Window(8 << 30));
+        assert_eq!(Dax::from_str("always").unwrap(), Dax::Window(8 << 30));
+        assert_eq!(Dax::from_str("inode").unwrap(), inode(8 << 30));
+        assert_eq!(
+            Dax::from_str("4G:inode=64K").unwrap(),
+            Dax::Inode {
+                window: 4 << 30,
+                min: 64 << 10
+            }
+        );
+        assert_eq!(
+            Dax::from_str("inode=4M").unwrap(),
+            Dax::Inode {
+                window: 8 << 30,
+                min: 4 << 20
+            }
+        );
+        // A floor under a page or above the window, or an unknown mode, is refused.
+        assert!(Dax::from_str("8G:inode=1K").is_err());
+        assert!(Dax::from_str("2M:inode=4M").is_err());
+        assert!(Dax::from_str("8G:sometimes").is_err());
         // What a YAML or TOML scalar turns "no" into all mean off.
         for off in ["off", "false", "0", "no", " off "] {
             assert_eq!(Dax::from_str(off).unwrap(), Dax::Off, "{off}");
@@ -978,18 +1101,46 @@ mod tests {
         assert!(Dax::from_str("128G").is_err());
         assert_eq!(
             Dax::from_str(&format!("{}G", DAX_TOTAL_MAX >> 30)).unwrap(),
-            Dax::Window(DAX_TOTAL_MAX)
+            inode(DAX_TOTAL_MAX)
         );
         // Round-trips through the config file, which stores the policy as a string.
         assert_eq!(DAX_DEFAULT.to_string(), "8G");
-        assert_eq!(Dax::Window(512 << 20).to_string(), "512M");
+        assert_eq!(Dax::Window(512 << 20).to_string(), "512M:always");
+        for spelled in ["8G:always", "4G:inode=64K", "inode=4M", "2M"] {
+            let policy = Dax::from_str(spelled).unwrap();
+            assert_eq!(
+                Dax::from_str(&policy.to_string()).unwrap(),
+                policy,
+                "{spelled}"
+            );
+        }
+        assert_eq!(
+            Dax::from_str("8G").unwrap().share(),
+            Some(DaxShare {
+                window: 8 << 30,
+                inode_min: Some(DAX_INODE_MIN_DEFAULT)
+            })
+        );
+        assert_eq!(
+            Dax::Window(8 << 30).share(),
+            Some(DaxShare {
+                window: 8 << 30,
+                inode_min: None
+            })
+        );
+        assert_eq!(Dax::Off.share(), None);
         assert_eq!(
             Dax::from_str(&DAX_DEFAULT.to_string()).unwrap(),
             DAX_DEFAULT
         );
         assert_eq!(Dax::Off.to_string(), "off");
-        assert_eq!(Dax::Off.window(), None);
-        assert_eq!(DAX_DEFAULT.window(), Some(8 << 30));
+        assert_eq!(window(Dax::Off), None);
+        assert_eq!(window(DAX_DEFAULT), Some(8 << 30));
+    }
+
+    /// The policy's window, as the tests compare it: `share()` without the floor.
+    fn window(policy: Dax) -> Option<u64> {
+        policy.share().map(|d| d.window)
     }
 
     fn dax_share(tag: &str, dax: Option<u64>) -> FsShare {
@@ -998,7 +1149,10 @@ mod tests {
             socket: PathBuf::new(),
             host_dir: PathBuf::new(),
             read_only: false,
-            dax,
+            dax: dax.map(|window| DaxShare {
+                window,
+                inode_min: None,
+            }),
             uid_map: Vec::new(),
             gid_map: Vec::new(),
         }
@@ -1009,11 +1163,15 @@ mod tests {
         // Eight default windows fill the span exactly; the ninth gets none, and a share
         // that asked for nothing is charged nothing.
         let mut shares: Vec<FsShare> = (0..9)
-            .map(|i| dax_share(&format!("s{i}"), DAX_DEFAULT.window()))
+            .map(|i| dax_share(&format!("s{i}"), window(DAX_DEFAULT)))
             .collect();
         shares.push(dax_share("atop", None));
         apply_dax_budget(&mut shares, "4G");
-        assert!(shares[..8].iter().all(|s| s.dax == DAX_DEFAULT.window()));
+        assert!(
+            shares[..8]
+                .iter()
+                .all(|s| s.dax.map(|d| d.window) == window(DAX_DEFAULT))
+        );
         assert_eq!(shares[8].dax, None);
         assert_eq!(shares[9].dax, None);
     }
@@ -1041,10 +1199,10 @@ mod tests {
     /// about a window would earn a refused mount on every boot.
     #[test]
     fn a_guest_too_large_for_the_span_gets_no_windows_at_all() {
-        let shares = || vec![dax_share("work", DAX_DEFAULT.window())];
+        let shares = || vec![dax_share("work", window(DAX_DEFAULT))];
         let mut s = shares();
         apply_dax_budget(&mut s, &format!("{DAX_MAX_GUEST_MIB}M"));
-        assert_eq!(s[0].dax, DAX_DEFAULT.window());
+        assert_eq!(s[0].dax.map(|d| d.window), window(DAX_DEFAULT));
         let mut s = shares();
         apply_dax_budget(&mut s, &format!("{}M", DAX_MAX_GUEST_MIB + 1));
         assert_eq!(s[0].dax, None);
@@ -1052,7 +1210,7 @@ mod tests {
         // window to lose anyway.
         let mut s = shares();
         apply_dax_budget(&mut s, "64G@0");
-        assert_eq!(s[0].dax, DAX_DEFAULT.window());
+        assert_eq!(s[0].dax.map(|d| d.window), window(DAX_DEFAULT));
     }
 
     /// The CI path: API socket (graceful shutdown), a rw qcow2 overlay root,
