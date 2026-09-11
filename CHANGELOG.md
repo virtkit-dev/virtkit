@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Reading many small files from a read-only share is faster**, including `:overlay`
+  volumes and the executor's host checkout. This removes a per-file host cost that could
+  dominate file-heavy jobs on large trees.
+
 ### Fixed
 
 - **A job's first git command no longer re-hashes the whole checkout.** The host writes the
