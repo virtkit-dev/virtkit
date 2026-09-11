@@ -61,6 +61,9 @@ const FIRST_LEASE: u32 = 2;
 /// ServerHello). Bounding the dial fails the flow in seconds — we drop the guest stream
 /// and ipstack RSTs it — so a dead backend degrades to a fast connection error, not a hang.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Retransmissions of a guest-bound TCP segment before the flow is reset (see `run`'s
+/// `TcpConfig`): 1+2+4+…+32s of tolerance for a switch the host did not schedule.
+const TCP_MAX_RETRANSMITS: usize = 6;
 
 #[derive(Clone, Copy)]
 struct Cfg {
@@ -796,6 +799,14 @@ pub async fn run(
     let (ret_tx, mut ret_rx) = unbounded_channel::<Vec<u8>>();
     let mut config = IpStackConfig::default();
     config.mtu_unchecked(MTU);
+    // A guest-bound segment is retransmitted on a doubling timeout from 1s; the default gives
+    // up after 3 tries — 7s. A switch a busy host fails to schedule for that long abandons the
+    // segment; unpatched, ipstack then left the flow Established with a permanent hole and the
+    // guest's transfer stuck at 0 bytes. Six tries hold the segment for 63s; past that the
+    // patched stack resets the connection, so the guest application fails fast and reconnects.
+    let mut tcp = ipstack::TcpConfig::default();
+    tcp.max_retransmit_count = TCP_MAX_RETRANSMITS;
+    config.with_tcp_config(tcp);
     let ip_stack = IpStack::new(
         config,
         ChannelDevice {
