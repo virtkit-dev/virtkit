@@ -49,6 +49,7 @@ pub(crate) mod browse;
 pub(crate) mod captions;
 pub mod client;
 pub mod config;
+pub(crate) mod dav;
 pub(crate) mod forms;
 pub(crate) mod html;
 pub(crate) mod keys;
@@ -430,6 +431,245 @@ impl Store {
     /// read through.
     fn repo_blob_path(&self, name: &str, hex: &str) -> PathBuf {
         self.root.join("repos").join(name).join("blobs").join(hex)
+    }
+
+    /// A private staging file under `uploads/` for a body whose digest is only known once it
+    /// has been read — the WebDAV `PUT`. [`Store::stage_promotion`] and
+    /// [`Store::promote_staged`] install it; one a crash leaves behind is swept with the
+    /// idle uploads by [`Store::gc`].
+    pub(crate) fn stage_file(&self) -> Result<(PathBuf, std::fs::File)> {
+        let dir = self.uploads_dir();
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = self.upload_path(&format!(
+            "{}-{}-{}",
+            std::process::id(),
+            self.next_upload.fetch_add(1, Ordering::Relaxed),
+            accounts::random_token(16),
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
+            .open(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        Ok((path, file))
+    }
+
+    /// The repositories one level below `name` (`""` for the top level), sorted: the
+    /// subdirectories of `repos/<name>` that are not its own layout directories. By
+    /// `lstat`, so a symlink is neither followed nor shown.
+    pub(crate) fn repo_children(&self, name: &str) -> Vec<String> {
+        if !name.is_empty() && !valid_name(name) {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = std::fs::read_dir(self.root.join("repos").join(name))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !REPO_SUBDIRS.contains(&n.as_str()) && valid_name(n))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Whether `repos/<name>` is a directory: a repository, or a path component above one.
+    /// What the WebDAV `files/` tree calls a directory, since a nested repository's name
+    /// brings its parents into being as directories and a client expects to find them.
+    pub(crate) fn repo_dir_exists(&self, name: &str) -> bool {
+        valid_name(name)
+            && std::fs::symlink_metadata(self.root.join("repos").join(name))
+                .is_ok_and(|m| m.is_dir())
+    }
+
+    /// Bring `name` into being empty: a `tags/` with nothing in it, which is what makes
+    /// [`Store::has_repo`] answer — for a WebDAV `MKCOL`, where a directory exists before
+    /// anything is stored under it. Missing ancestors are created with it. Under the shared
+    /// lock, so a [`Store::remove_empty_repo`] of an ancestor cannot take it as it appears.
+    pub(crate) fn create_repo(&self, name: &str) -> Result<()> {
+        if !valid_name(name) {
+            bail!("invalid repository name {name}");
+        }
+        let _lock = self.lock_shared()?;
+        let tags = self.root.join("repos").join(name).join("tags");
+        std::fs::create_dir_all(&tags).with_context(|| format!("creating {}", tags.display()))
+    }
+
+    /// Remove a repository that holds no tag and no nested repository. `Ok(false)` when it
+    /// holds either. What else its directory may still hold — manifest sidecars and
+    /// membership markers — records content no tag reaches any more, and goes with it.
+    ///
+    /// Under the exclusive lock, as [`Store::gc`] is: every write into a repository holds it
+    /// shared, and a raw file records its membership markers before its tag, so without it a
+    /// write between the check and the removal would lose its markers or its tag and still
+    /// answer success. Blocks until those writes finish; call it off the async runtime.
+    pub(crate) fn remove_empty_repo(&self, name: &str) -> Result<bool> {
+        if !valid_name(name) {
+            bail!("invalid repository name {name}");
+        }
+        let _lock = self.lock_exclusive()?;
+        if !self.repo_children(name).is_empty() {
+            return Ok(false);
+        }
+        let dir = self.root.join("repos").join(name);
+        // A tag of its own keeps the repository: `remove_dir` refuses a `tags/` with entries.
+        match std::fs::remove_dir(dir.join("tags")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => return Ok(false),
+            Err(e) => return Err(e).with_context(|| format!("removing {}", dir.display())),
+        }
+        std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
+        Ok(true)
+    }
+
+    /// Bump a tag's mtime — the "last used" record [`Store::gc`]'s retention keys on — for a
+    /// use that did not go through [`Store::get_manifest`].
+    pub(crate) fn touch_tag(&self, name: &str, tag: &str) {
+        if valid_name(name) && valid_tag(tag) {
+            touch(&self.tag_path(name, tag));
+        }
+    }
+
+    /// Tie a stored blob to `name:tag` as a raw file: the shared empty config, the two
+    /// membership records, and the single-layer manifest — the same writes a `/v2/` push
+    /// makes. `size` is the blob's canonical length; `title` is kept as the OCI title
+    /// annotation when there is one. Under the caller's shared lock, like every
+    /// check→reference sequence. Returns the manifest digest.
+    pub(crate) fn put_raw_file(
+        &self,
+        name: &str,
+        tag: &str,
+        layer_hex: &str,
+        size: u64,
+        title: Option<&str>,
+    ) -> Result<String> {
+        let config_digest = self.put_blob(RAW_FILE_EMPTY_CONFIG)?;
+        // These bytes arrived through this server, for this repository, so they are readable
+        // through it. `put_manifest` records only the manifest itself — a reference is not
+        // evidence that the referrer holds the content — so the two blobs are recorded here,
+        // where we do hold them.
+        self.record_blob(name, config_digest.trim_start_matches("sha256:"))?;
+        self.record_blob(name, layer_hex)?;
+        let mut layer = serde_json::json!({
+            "mediaType": RAW_FILE_MEDIA_TYPE,
+            "digest": format!("sha256:{layer_hex}"),
+            "size": size,
+        });
+        if let Some(title) = title.filter(|t| !t.is_empty()) {
+            layer["annotations"] = serde_json::json!({
+                "org.opencontainers.image.title": title,
+            });
+        }
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": DEFAULT_MANIFEST_TYPE,
+            "config": {
+                "mediaType": RAW_FILE_CONFIG_MEDIA_TYPE,
+                "digest": config_digest,
+                "size": RAW_FILE_EMPTY_CONFIG.len(),
+            },
+            "layers": [layer],
+        });
+        self.put_manifest(
+            name,
+            tag,
+            DEFAULT_MANIFEST_TYPE,
+            serde_json::to_vec(&manifest)?.as_slice(),
+        )
+    }
+
+    /// Check for a valid repository with at least one repository subdirectory, without walking
+    /// its contents.
+    pub(crate) fn has_repo(&self, name: &str) -> bool {
+        valid_name(name)
+            && REPO_SUBDIRS
+                .iter()
+                .any(|k| self.root.join("repos").join(name).join(k).is_dir())
+    }
+
+    /// Collection mtime for `repos/<rel>`, falling back to the epoch. Empty `rel` refers to
+    /// `repos/`.
+    pub(crate) fn repos_path_modified(&self, rel: &str) -> SystemTime {
+        std::fs::symlink_metadata(self.root.join("repos").join(rel))
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+
+    /// Return the tag's manifest hex and mtime without refreshing retention. Listings must not
+    /// keep tags alive.
+    pub(crate) fn tag_target(&self, name: &str, tag: &str) -> Option<(String, SystemTime)> {
+        if !valid_name(name) || !valid_tag(tag) {
+            return None;
+        }
+        let path = self.tag_path(name, tag);
+        let modified = std::fs::symlink_metadata(&path).ok()?.modified().ok()?;
+        let digest = std::fs::read_to_string(&path).ok()?;
+        let hex = digest.trim().trim_start_matches("sha256:").to_string();
+        is_blob_hex(&hex).then_some((hex, modified))
+    }
+
+    /// Manifest length, media type and membership mtime, using the same media-type fallbacks as
+    /// [`Store::get_manifest`].
+    pub(crate) fn manifest_meta(&self, name: &str, hex: &str) -> Option<(u64, String, SystemTime)> {
+        if !valid_name(name) || !is_blob_hex(hex) {
+            return None;
+        }
+        let blob = self.blob_path(hex);
+        let len = std::fs::metadata(&blob).ok()?.len();
+        let sidecar = self.manifest_type_path(name, hex);
+        let modified = std::fs::symlink_metadata(&sidecar)
+            .or_else(|_| std::fs::metadata(&blob))
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let ctype = std::fs::read_to_string(&sidecar)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .or_else(|| {
+                std::fs::read(&blob)
+                    .ok()
+                    .and_then(|d| declared_media_type(&d))
+            })
+            .map(|t| manifest_media_type(&t).to_string())
+            .unwrap_or_else(|| DEFAULT_MANIFEST_TYPE.to_string());
+        Some((len, ctype, modified))
+    }
+
+    /// A blob's canonical length and mtime: one `open`, and for a zstd-stored blob a read
+    /// of the frame header — the same length `Content-Length` reports on a `GET`.
+    pub(crate) fn blob_meta(&self, hex: &str) -> Option<(u64, SystemTime)> {
+        let (path, is_zstd) = self.find_blob(hex)?;
+        let mut file = std::fs::File::open(&path).ok()?;
+        let meta = file.metadata().ok()?;
+        let modified = meta.modified().ok()?;
+        let len = if is_zstd {
+            zstd_canonical_len(&mut file).ok()?
+        } else {
+            meta.len()
+        };
+        Some((len, modified))
+    }
+
+    /// Sorted valid digest hexes under `repos/<name>/<kind>` for DAV listings.
+    pub(crate) fn repo_member_hexes(&self, name: &str, kind: &str) -> Vec<String> {
+        if !valid_name(name) || !REPO_SUBDIRS.contains(&kind) {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = std::fs::read_dir(self.root.join("repos").join(name).join(kind))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| is_blob_hex(n))
+            .collect();
+        out.sort();
+        out
     }
 
     fn manifest_type_path(&self, name: &str, hex: &str) -> PathBuf {
@@ -1351,6 +1591,39 @@ const MAX_MANIFEST_BYTES: usize = 4 << 20;
 /// ask for (references × repositories the caller may read).
 const MAX_MANIFEST_REFERENCES: usize = 4096;
 
+/// The layer media type of a file stored as one blob under a single-layer manifest — what
+/// `/upload` and `/dav/files/` write, and what `vk registry pull` refuses: a raw file is for
+/// fetching, not for booting.
+pub(crate) const RAW_FILE_MEDIA_TYPE: &str = "application/vnd.virtkit.raw-file";
+pub(crate) const RAW_FILE_CONFIG_MEDIA_TYPE: &str =
+    "application/vnd.virtkit.raw-file.config.v1+json";
+
+/// A raw-file manifest's config blob: fixed, empty content — a raw file has no build
+/// config, but the OCI manifest schema requires a config descriptor. Every raw file
+/// references the *same* config blob, which dedups after the first one.
+pub(crate) const RAW_FILE_EMPTY_CONFIG: &[u8] = b"{}";
+
+/// The layer of a raw-file manifest as `(hex, canonical size)`, or `None` for a manifest of
+/// any other shape: an image pushed over `/v2/` into a `files/` repository is not a file
+/// the WebDAV view serves.
+pub(crate) fn raw_file_layer(manifest: &[u8]) -> Option<(String, u64)> {
+    let v: serde_json::Value = serde_json::from_slice(manifest).ok()?;
+    let [layer] = v.pointer("/layers")?.as_array()?.as_slice() else {
+        return None;
+    };
+    if layer.pointer("/mediaType")?.as_str()? != RAW_FILE_MEDIA_TYPE {
+        return None;
+    }
+    let hex = layer
+        .pointer("/digest")?
+        .as_str()?
+        .strip_prefix("sha256:")?;
+    if !is_blob_hex(hex) {
+        return None;
+    }
+    Some((hex.to_string(), layer.pointer("/size")?.as_u64()?))
+}
+
 /// What a [`Store::gc`] pass removed (or, on a dry run, would remove).
 #[derive(Default)]
 pub struct GcReport {
@@ -1998,6 +2271,12 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // of a stage in one request instead of a `HEAD` per step.
     if path == EXISTS_PATH {
         return manifests_exist(&state.store, &authz, req).await;
+    }
+
+    // DAV authorizes each resource: `files/<dir>` or the OCI repository name. Keep it outside
+    // `is_human_path` so clients receive a 401 challenge, not a login redirect.
+    if path == "/dav" || path.starts_with("/dav/") {
+        return dav::route(&state, &authz, req).await;
     }
     let store = state.store.clone();
     let method = req.method().clone();
@@ -4616,6 +4895,39 @@ mod tests {
         );
         drop(gc);
         assert!(try_lock(libc::LOCK_SH));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Removing an empty repository waits out a write in flight — held here as a WebDAV
+    /// `PUT` holds it, across the membership markers and the tag — and then finds the
+    /// repository no longer empty, rather than removing it from under that write.
+    #[test]
+    fn removing_an_empty_repo_waits_for_a_write_and_keeps_it() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-rmrepo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Store::new(dir.clone()).unwrap());
+        let name = "files/x/a";
+        store.create_repo(name).unwrap();
+
+        let write = store.lock_shared().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let remover = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || tx.send(store.remove_empty_repo(name).unwrap()))
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the removal waits while a write holds the lock"
+        );
+        let hex = store.put_blob(b"payload").unwrap();
+        let hex = hex.trim_start_matches("sha256:");
+        store.put_raw_file(name, "k", hex, 7, None).unwrap();
+        drop(write);
+
+        assert!(!rx.recv().unwrap(), "the repository now holds a tag");
+        remover.join().unwrap().unwrap();
+        assert!(store.tag_path(name, "k").is_file());
+        assert!(store.repo_blob_path(name, hex).is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
