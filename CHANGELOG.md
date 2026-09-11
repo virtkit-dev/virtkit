@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **DAX defaults to regular files of at least 1M** (`dax=inode`). Smaller files use the
+  guest page cache as without DAX, avoiding mapping overhead that does not benefit small
+  source files. `vk run --dax`, `x-virtkit.dax` and `[executor.vm] dax` accept
+  `<size>:always` for the previous behaviour and `<size>:inode=<min>` to change the floor.
+
 ### Changed
 
 - **Reading many small files from a read-only share is faster**, including `:overlay`

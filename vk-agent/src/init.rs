@@ -30,10 +30,14 @@
 //!                        belongs to eth0
 //!   VIRTKIT_VIRTIOFS     tag:path[,tag:path] virtiofs shares to mount
 //!   VIRTKIT_VIRTIOFS_DAX tag[,tag] — these shares have a DAX window, so mount them
-//!                        `dax=always`: file data is read straight out of the host page
+//!                        through it: file data is read straight out of the host page
 //!                        cache through the window instead of being copied into this
-//!                        guest's own. A share whose DAX mount fails is mounted without
-//!                        it (a slower share, not a failed boot)
+//!                        guest's own. `dax=always` unless the tag is also in
+//!                        VIRTKIT_VIRTIOFS_DAX_INODE. A share whose DAX mount fails is
+//!                        mounted without it (a slower share, not a failed boot)
+//!   VIRTKIT_VIRTIOFS_DAX_INODE tag[,tag] — mount these DAX shares `dax=inode`: the host
+//!                        marks the files worth mapping (regular files above a size
+//!                        floor) and the rest read through this guest's page cache
 //!   VIRTKIT_VIRTIOFS_OVERLAY  tag[,tag] — mount these shares as the read-only lower
 //!                        layer of a tmpfs-backed overlayfs at their path, so every
 //!                        write under the mountpoint runs at guest-native speed. A
@@ -1179,6 +1183,17 @@ fn materialize_env(cfg: Option<&RunConfig>) {
 fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<Vec<CString>> {
     let mut overlay = overlay_tags(cmdline)?;
     let dax = share_tags(cmdline, "VIRTKIT_VIRTIOFS_DAX")?;
+    let dax_inode = share_tags(cmdline, "VIRTKIT_VIRTIOFS_DAX_INODE")?;
+    // A share can only be mounted `dax=inode` through a window it has.
+    let windowless: HashSet<String> = dax_inode.difference(&dax).cloned().collect();
+    if !windowless.is_empty() {
+        warn!(
+            "vk-agent init: VIRTKIT_VIRTIOFS_DAX_INODE names {}, which has no DAX window; \
+             mounting without DAX",
+            sorted_join(&windowless)
+        );
+    }
+    let dax_mode = |tag: &str| DaxMount::of(tag, &dax, &dax_inode);
     let size = overlay_size(cmdline)?;
     let overlay_disks = overlay_disk_devices(cmdline)?;
     // Each overlay-upper disk names a tag; that tag must be one of the overlay shares, or the
@@ -1215,7 +1230,7 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<Vec<CString>> {
                 path,
                 size,
                 overlay_disks.get(tag).map(String::as_str),
-                dax.contains(tag),
+                dax_mode(tag),
             )
             .with_context(|| format!("overlay-mounting virtiofs share {tag} at {path}"))?;
             freeze.extend(upper);
@@ -1238,7 +1253,7 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<Vec<CString>> {
                 continue;
             }
         };
-        if let Err(e) = mount_share(tag, path, 0, dax.contains(tag)) {
+        if let Err(e) = mount_share(tag, path, 0, dax_mode(tag)) {
             warn!(
                 "vk-agent init: mount virtiofs {tag} at {} failed: {e}",
                 mountpoint.display()
@@ -1373,11 +1388,41 @@ fn share_tags(cmdline: &HashMap<String, String>, key: &str) -> Result<HashSet<St
     Ok(tags)
 }
 
-/// A virtio-fs share's mount options: `dax=always` where the share has a DAX window, none
-/// otherwise. `always` and not `inode`, so a kernel or a device that cannot honour it says
-/// so (`inode` would quietly mount without the window and leave nothing to fall back from).
-fn virtiofs_data(dax: bool) -> Option<&'static str> {
-    dax.then_some("dax=always")
+/// How a virtio-fs share uses its DAX window, from the cmdline's tag sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaxMount {
+    /// No window.
+    None,
+    /// Every file's data goes through the window (`dax=always`).
+    Always,
+    /// Only the files the host marks — regular files above its size floor — go through the
+    /// window; the rest read through this guest's page cache (`dax=inode`).
+    Inode,
+}
+
+impl DaxMount {
+    fn of(tag: &str, dax: &HashSet<String>, dax_inode: &HashSet<String>) -> DaxMount {
+        if !dax.contains(tag) {
+            DaxMount::None
+        } else if dax_inode.contains(tag) {
+            DaxMount::Inode
+        } else {
+            DaxMount::Always
+        }
+    }
+}
+
+/// A virtio-fs share's mount options: `dax=always` or `dax=inode` where the share has a DAX
+/// window, none otherwise. `always` rather than `inode` for the whole-share case, so a
+/// kernel or a device that cannot honour it says so (`inode` would quietly mount without the
+/// window and leave nothing to fall back from); a per-inode share accepts that silence — a
+/// file the host does not mark reads through the page cache either way.
+fn virtiofs_data(dax: DaxMount) -> Option<&'static str> {
+    match dax {
+        DaxMount::None => None,
+        DaxMount::Always => Some("dax=always"),
+        DaxMount::Inode => Some("dax=inode"),
+    }
 }
 
 /// Mount virtio-fs share `tag` at `path`, through its DAX window when it has one.
@@ -1388,7 +1433,7 @@ fn virtiofs_data(dax: bool) -> Option<&'static str> {
 /// a reason to fail the boot. The fallback is unconditional rather than keyed on the errno:
 /// a mount that fails for some other reason fails again and reports itself properly, which
 /// beats guessing which errnos mean "no DAX here".
-fn mount_share(tag: &str, path: &str, flags: libc::c_ulong, dax: bool) -> io::Result<()> {
+fn mount_share(tag: &str, path: &str, flags: libc::c_ulong, dax: DaxMount) -> io::Result<()> {
     if let Some(data) = virtiofs_data(dax) {
         match mount_data(tag, path, "virtiofs", flags, data) {
             Ok(()) => {
@@ -1489,7 +1534,7 @@ fn mount_share_overlay(
     path: &str,
     size: Option<&str>,
     upper_device: Option<&str>,
-    dax: bool,
+    dax: DaxMount,
 ) -> Result<Option<CString>> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let OverlayDirs {
@@ -3089,10 +3134,19 @@ mod tests {
 
     #[test]
     fn a_dax_share_asks_for_the_window_and_the_others_ask_for_nothing() {
-        // `always` and not `inode`: a kernel that cannot honour the option must fail the mount
-        // so mount_share can retry without it, which `inode` would not do.
-        assert_eq!(virtiofs_data(true), Some("dax=always"));
-        assert_eq!(virtiofs_data(false), None);
+        // `always` and not `inode` for a whole-share window: a kernel that cannot honour the
+        // option must fail the mount so mount_share can retry without it.
+        assert_eq!(virtiofs_data(DaxMount::Always), Some("dax=always"));
+        assert_eq!(virtiofs_data(DaxMount::Inode), Some("dax=inode"));
+        assert_eq!(virtiofs_data(DaxMount::None), None);
+        // The mode of a tag comes from the two cmdline sets; a tag named for per-inode DAX
+        // without a window is not a DAX share at all.
+        let set = |tags: &[&str]| tags.iter().map(|t| t.to_string()).collect::<HashSet<_>>();
+        let (dax, inode) = (set(&["work", "big"]), set(&["work", "stray"]));
+        assert_eq!(DaxMount::of("work", &dax, &inode), DaxMount::Inode);
+        assert_eq!(DaxMount::of("big", &dax, &inode), DaxMount::Always);
+        assert_eq!(DaxMount::of("stray", &dax, &inode), DaxMount::None);
+        assert_eq!(DaxMount::of("other", &dax, &inode), DaxMount::None);
     }
 
     #[test]

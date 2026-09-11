@@ -3254,7 +3254,13 @@ mod tests {
         let u = one("services:\n  s:\n    image: x\n    x-virtkit: { dax: off }\n");
         assert_eq!(u.dax, Some(crate::vmm::Dax::Off));
         let u = one("services:\n  s:\n    image: x\n    x-virtkit: { dax: 2G }\n");
-        assert_eq!(u.dax, Some(crate::vmm::Dax::Window(2 << 30)));
+        assert_eq!(
+            u.dax,
+            Some(crate::vmm::Dax::Inode {
+                window: 2 << 30,
+                min: crate::vmm::DAX_INODE_MIN_DEFAULT
+            })
+        );
         for bad in ["lots", "1M", "1023K"] {
             assert!(
                 parse(
