@@ -408,7 +408,32 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
     git(dest, &["update-ref", "--no-deref", "HEAD", sha], "detach")?;
     git(dest, &["reset", "--hard", sha], "reset")?;
     git(dest, &["clean", "-ffdx"], "clean")?;
+    settle_index(dest)?;
     Ok(())
+}
+
+/// Leave the checkout with no racily-clean index entries.
+///
+/// `reset --hard` writes the index right after the files, so every file written in the index's
+/// own second has an mtime equal to the index timestamp. Git cannot tell from stat data whether
+/// such a file changed after it was indexed (racy-git), so it re-reads and re-hashes those
+/// entries at the next refresh. Here that refresh would run in the job guest, over virtio-fs,
+/// on every job; a fast checkout (a small tree, or a tmpfs host) can leave the whole tree racy.
+/// Waiting out the index's second and refreshing once on the host rewrites the index with a
+/// later timestamp, so the guest's first git command is a stat pass. The one-second wait
+/// assumes ≤1s mtime granularity (tmpfs/ext4, as `checkout_dir` realistically is); on a coarser
+/// filesystem it may not clear the second, harmlessly leaving the refresh a no-op.
+fn settle_index(dest: &Path) -> Result<()> {
+    let index = dest.join(".git").join("index");
+    // A missing stat or a backward clock step (Err from duration_since) skips the wait: the
+    // refresh below still runs, degrading to the pre-settle slow path — never wrong, only slower.
+    if let Ok(written) = std::fs::metadata(&index).and_then(|m| m.modified())
+        && let Ok(age) = SystemTime::now().duration_since(written)
+        && age < Duration::from_secs(1)
+    {
+        std::thread::sleep(Duration::from_secs(1) - age);
+    }
+    git(dest, &["update-index", "-q", "--refresh"], "refresh")
 }
 
 /// A git ref name safe to pass as a fetch argument: git's own rules already forbid these in a
@@ -811,5 +836,54 @@ mod tests {
         assert!(!s.used.exists());
         assert!(!s.id.exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// After `settle_index` no entry is racily clean: the index is strictly newer than every
+    /// file `reset --hard` wrote, so a refresh in another mount (the job guest) is a stat pass.
+    #[test]
+    fn settle_index_leaves_the_index_newer_than_the_tree() {
+        let repo = root("settle");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo = repo.as_path();
+        let sh = |args: &[&str]| {
+            let st = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?}");
+        };
+        sh(&["init", "-q"]);
+        for i in 0..50 {
+            std::fs::write(repo.join(format!("f{i}")), format!("{i}")).unwrap();
+        }
+        sh(&["add", "-A"]);
+        sh(&["commit", "-qm", "init"]);
+        for i in 0..50 {
+            std::fs::remove_file(repo.join(format!("f{i}"))).unwrap();
+        }
+        sh(&["reset", "-q", "--hard"]);
+        settle_index(repo).unwrap();
+        let index = std::fs::metadata(repo.join(".git/index"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let newest = (0..50)
+            .map(|i| {
+                std::fs::metadata(repo.join(format!("f{i}")))
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+            })
+            .max()
+            .unwrap();
+        assert!(
+            index > newest,
+            "index {index:?} not newer than newest file {newest:?}"
+        );
+        // git's own view: refreshing again touches nothing (no racy entries left to re-hash).
+        sh(&["update-index", "--refresh"]);
     }
 }

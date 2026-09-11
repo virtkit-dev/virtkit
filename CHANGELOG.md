@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`host_checkout` jobs no longer stall on the first git command inside the guest.** The
+  job's first `git status` or `git checkout` now runs at full speed instead of stalling once
+  per job.
+
 ## [0.68.0] - 2026-09-11
 
 ### Changed
