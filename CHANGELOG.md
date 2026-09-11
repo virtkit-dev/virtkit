@@ -28,6 +28,9 @@ All notable changes to virtkit will be documented in this file.
   nesting a second `.virtkit` when the compose file is itself `.virtkit/compose.yaml`. After
   upgrading, move an existing backing to the new location, or let the ones that reset when
   their image changes recreate from scratch.
+- **`vk dev list` measures each environment's on-disk size by default.** The `ON DISK` column
+  was blank unless you passed `--sizes`; it is now filled in, and `--no-sizes` skips the walk.
+  The `--sizes` flag is removed — a script still passing it now errors.
 
 ### Removed
 

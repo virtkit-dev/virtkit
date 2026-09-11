@@ -467,7 +467,7 @@ separate state, SSH identities and endpoint allocations.
 
 ```sh
 vk dev list
-vk dev list --sizes --json
+vk dev list --json
 vk dev gc --all-stale
 vk dev gc ENVIRONMENT_NAME --yes
 ```
@@ -794,7 +794,7 @@ shape for inspection, not a complete script to execute.
 | "The remote host does not meet the prerequisites for running VS Code Server", or extension installs fail with "Signature verification failed with 'ENOENT'" | The image has no FHS loader or libraries for the prebuilt glibc binaries Remote-SSH installs (Nix images in particular). Provide `/lib64/ld-linux-x86-64.so.2`, `/usr/lib64/libstdc++.so.6`, and libssl/libcrypto on the loader's search path, then run `refresh`; this repo's `.devcontainer/Dockerfile` does it with nix-ld. |
 | Startup hook fails | Read its output and guest logs; fix the command, user or working directory before retrying. |
 | Pre-commit overlay is refused | Pair `checkout = "overlay"` with `policy = "ephemeral"`. |
-| Disk use keeps growing | Inspect `storage list --sizes` and host-wide `list --sizes`; reset or GC only data you intend to discard. |
+| Disk use keeps growing | Inspect `storage list --sizes` and host-wide `list`; reset or GC only data you intend to discard. |
 
 Logs remain readable after exit. Filter with `--kernel`, `--agent`, `--guest` or
 `--level warn`, and follow with `-f`. Use `--service NAME` for a service console.
@@ -827,6 +827,6 @@ individual options.
 | `plan` | Inspect the resolved config; `--explain`, `--diff`, `--format`, `--show-secrets`. |
 | `stop` | Stop the environment and publishers; `--timeout SECONDS`. |
 | `storage list`, `storage reset NAME` | Inspect storage or destroy a durable item's data. |
-| `list` | Host-wide environment inventory; `--sizes`, `--json`. |
+| `list` | Host-wide environment inventory (on-disk sizes by default); `--no-sizes`, `--json`. |
 | `gc [NAME…]` | Remove stopped state; `--all-stale`, `--yes`. |
 | `schema` | Print the configuration JSON Schema. |

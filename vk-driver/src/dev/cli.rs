@@ -356,17 +356,19 @@ enum DevAction {
     ///
     /// Host-wide, and needs no config in the current directory: one row per state directory
     /// under `$XDG_STATE_HOME/virtkit/dev` — which workspace and environment it belongs to,
-    /// whether it is running, which vk created it, how long ago it last booted and — with
-    /// `--sizes` — what it holds on disk. Flagged when its workspace is gone, or when it
-    /// recorded no boot at all — the shape a task run in a throwaway environment leaves.
+    /// whether it is running, which vk created it, how long ago it last booted and what it
+    /// holds on disk (`--no-sizes` skips the measure). Flagged when its workspace is gone, or
+    /// when it recorded no boot at all — the shape a task run in a throwaway environment leaves.
     /// Reads only.
     List {
         /// print the same facts as JSON
         #[arg(long)]
         json: bool,
-        /// measure what each environment holds on disk, which reads every file in it
+        /// skip the on-disk size measurement (a stat walk of every file)
+        ///
+        /// The `ON DISK` column then shows `-`.
         #[arg(long)]
-        sizes: bool,
+        no_sizes: bool,
     },
     /// Remove the state of environments that are finished with
     ///
@@ -616,8 +618,8 @@ async fn dev_action(
         };
     }
     // Like `init`, these host-wide commands read the state base and need no config.
-    if let DevAction::List { json, sizes } = action {
-        let report = match crate::dev::list::state(sizes).and_then(|rows| match json {
+    if let DevAction::List { json, no_sizes } = action {
+        let report = match crate::dev::list::state(!no_sizes).and_then(|rows| match json {
             true => crate::dev::list::json(&rows),
             false => Ok(crate::dev::list::render(&rows)),
         }) {
@@ -1207,6 +1209,22 @@ mod tests {
         assert!(matches!(dev.action, DevAction::Schema));
         assert!(dev.workspace.is_none() && dev.dev_config.is_none());
         assert_eq!(dev.environment, "dev");
+    }
+
+    #[test]
+    fn list_measures_sizes_by_default_and_no_sizes_opts_out() {
+        // Guard the flag sense used by `state(!no_sizes)`: measure by default, skip with `--no-sizes`.
+        assert!(matches!(
+            parse(&["vk", "dev", "list"]).action,
+            DevAction::List {
+                no_sizes: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["vk", "dev", "list", "--no-sizes"]).action,
+            DevAction::List { no_sizes: true, .. }
+        ));
     }
 
     #[test]

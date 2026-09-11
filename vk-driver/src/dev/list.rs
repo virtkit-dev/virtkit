@@ -16,7 +16,8 @@
 //!
 //! `vk dev list --json` is an array of [`Row`], and its field names are the interface: they
 //! are added to, never renamed or repurposed. `size_bytes` is the exception that is absent
-//! rather than null — measuring a state directory walks all of it, so `--sizes` asks for it.
+//! rather than null — measuring a state directory walks all of it, and `--no-sizes` skips
+//! the default measurement.
 
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -86,7 +87,7 @@ pub struct Row {
     pub booted_secs: Option<u64>,
     /// how long ago that boot was, at the time of the scan
     pub age_secs: Option<u64>,
-    /// what the directory holds, when the caller asked to measure it
+    /// what the directory holds; measured by default, omitted with `--no-sizes`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
     pub flags: Vec<Flag>,
@@ -417,8 +418,8 @@ fn running_dirs() -> Vec<PathBuf> {
 }
 
 /// Every environment this host keeps state for, as `vk dev list` and `vk dev gc` see it:
-/// the state base scanned against what is running. Measuring what each holds on disk reads
-/// every file in it, so it is asked for rather than assumed.
+/// the state base scanned against what is running. Measuring what each holds on disk is a stat
+/// walk of every file in it, done by default; `--no-sizes` (`sizes = false`) opts out.
 pub fn state(sizes: bool) -> Result<Vec<Row>> {
     Ok(scan(
         &crate::dev::plan::dev_state_base()?,
