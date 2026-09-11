@@ -1003,3 +1003,209 @@ async fn the_repos_view_reads_back_what_v2_stored() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// GET refreshes mtimes older than an hour; HEAD does not. Last-Modified reports the pre-touch
+/// value.
+#[tokio::test]
+async fn a_get_refreshes_an_idle_objects_mtime_and_a_head_does_not() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("touch");
+    let state = open_state(&dir);
+    let root = state.store.files_dir();
+    let url = spawn(state);
+    let c = client();
+
+    for name in ["got", "headed", "fresh"] {
+        let resp = c
+            .put(format!("{url}/dav/files/cache/{name}"))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+    }
+    // Idle since 1994 — an instant with a known RFC 1123 spelling.
+    let long_ago = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(784_887_151);
+    for name in ["got", "headed"] {
+        std::fs::File::open(root.join("cache").join(name))
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+    }
+    let mtime = |name: &str| {
+        std::fs::metadata(root.join("cache").join(name))
+            .unwrap()
+            .modified()
+            .unwrap()
+    };
+    let fresh_before = mtime("fresh");
+
+    let resp = c
+        .get(format!("{url}/dav/files/cache/got"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let reported = resp.headers()["last-modified"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(resp.text().await.unwrap(), "x");
+    assert!(
+        mtime("got") > SystemTime::now() - std::time::Duration::from_secs(60),
+        "a hit on an idle object refreshes it"
+    );
+    // The header is the pre-touch time.
+    assert_eq!(reported, "Tue, 15 Nov 1994 08:12:31 GMT");
+
+    let resp = c
+        .head(format!("{url}/dav/files/cache/headed"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(mtime("headed"), long_ago, "a HEAD is not a use");
+
+    let resp = c
+        .get(format!("{url}/dav/files/cache/fresh"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        mtime("fresh"),
+        fresh_before,
+        "a fresh record is not rewritten"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// PUT recreates shard directories removed by eviction.
+#[tokio::test]
+async fn a_put_into_a_swept_shard_succeeds() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("shard");
+    let state = open_state(&dir);
+    let store = state.store.clone();
+    let url = spawn(state);
+    let c = client();
+
+    let resp = c
+        .put(format!("{url}/dav/files/cache/ab/cd/key1"))
+        .body("v1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let shard = store.files_dir().join("cache/ab/cd");
+    std::fs::File::open(shard.join("key1"))
+        .unwrap()
+        .set_modified(SystemTime::now() - std::time::Duration::from_secs(40 * 86_400))
+        .unwrap();
+    store
+        .write_files_policy(
+            "cache",
+            Some(&vk_registry::files_policy::FilesPolicy {
+                ttl: Some(std::time::Duration::from_secs(30 * 86_400)),
+                max_bytes: None,
+            }),
+        )
+        .unwrap();
+    let r = store.sweep_files_once(false).unwrap();
+    assert_eq!(r.dirs[0].objects_dropped, 1);
+    assert_eq!(r.dirs[0].dirs_dropped, 2, "cd/ then ab/");
+    assert!(!shard.exists());
+    assert!(store.files_dir().join("cache").is_dir());
+
+    let resp = c
+        .put(format!("{url}/dav/files/cache/ab/cd/key2"))
+        .body("v2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "the shard is recreated under the PUT");
+    assert!(shard.join("key2").is_file());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Reject top-level PUTs without blocking later directory creation or file eviction.
+#[tokio::test]
+async fn a_put_at_a_top_level_name_is_refused_before_the_directory_exists() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("toplevel");
+    let state = open_state(&dir);
+    let store = state.store.clone();
+    let root = store.files_dir();
+    let url = spawn(state);
+    let c = client();
+
+    store
+        .write_files_policy(
+            "cache",
+            Some(&vk_registry::files_policy::FilesPolicy {
+                ttl: Some(std::time::Duration::ZERO),
+                max_bytes: Some(0),
+            }),
+        )
+        .unwrap();
+    for p in ["/dav/files/cache", "/dav/files/cache/"] {
+        let resp = c
+            .put(format!("{url}{p}"))
+            .body("payload".repeat(1024))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 405, "PUT {p}");
+        assert_eq!(resp.headers()["allow"], FILES_ALLOW, "PUT {p}");
+        assert!(
+            std::fs::symlink_metadata(root.join("cache")).is_err(),
+            "PUT {p} created nothing at the directory's name"
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(root.join(".staging")).map_or(0, Iterator::count),
+        0,
+        "a refused top-level PUT left nothing in staging"
+    );
+
+    // PUT also fails after MKCOL.
+    assert_eq!(
+        c.request(method("MKCOL"), format!("{url}/dav/files/cache"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        201
+    );
+    let resp = c
+        .put(format!("{url}/dav/files/cache"))
+        .body("payload".repeat(1024))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 405);
+    assert!(root.join("cache").is_dir());
+
+    // The preconfigured policy applies to subsequent uploads.
+    let resp = c
+        .put(format!("{url}/dav/files/cache/key"))
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    assert_eq!(store.files_stats("cache").unwrap().bytes, 7);
+    let r = store.sweep_files_once(false).unwrap();
+    assert_eq!(r.dirs[0].dir, "cache");
+    assert_eq!(r.dirs[0].objects_dropped, 1);
+    assert!(!root.join("cache/key").exists());
+    assert!(root.join("cache").is_dir(), "the top level stays");
+    assert_eq!(
+        std::fs::read_dir(root.join(".staging")).unwrap().count(),
+        0,
+        "the upload left no staging file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

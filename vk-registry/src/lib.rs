@@ -50,6 +50,8 @@ pub(crate) mod captions;
 pub mod client;
 pub mod config;
 pub(crate) mod dav;
+pub mod files_policy;
+pub mod files_sweep;
 pub(crate) mod forms;
 pub(crate) mod html;
 pub(crate) mod keys;
@@ -1700,6 +1702,9 @@ pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
     let mut state = cfg.into_state()?;
     state.tls = tls;
     let state = Arc::new(state);
+    // Start even without policies: they can be added at runtime, and staging cleanup always
+    // runs.
+    tokio::spawn(files_sweep::sweep_files_forever(state.store.clone()));
     // Accounts mode only, and the db the socket administers is the one this server holds —
     // `Authenticator` is what says whether there is one at all.
     if let (Some(path), Authenticator::Accounts { db, .. }) = (admin_socket, &state.auth) {
@@ -3251,8 +3256,8 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `vk registry gc` — collect `root` and print a one-line summary; see
-/// [`Store::gc`] for the retention model.
+/// Collect OCI garbage and print its summary, then sweep `files/` under per-directory policies
+/// and report each affected directory.
 pub fn gc(root: PathBuf, retention: Duration, grace: Duration, dry_run: bool) -> Result<()> {
     let Some(store) = Store::open(&root)? else {
         println!(
@@ -3274,6 +3279,13 @@ pub fn gc(root: PathBuf, retention: Duration, grace: Duration, dry_run: bool) ->
         r.uploads_dropped,
         r.blob_markers_dropped,
     );
+    let f = store.sweep_files_once(dry_run)?;
+    for line in f.lines(dry_run) {
+        println!("vk registry: gc {}: {line}", store.root.display());
+    }
+    if let Some(line) = f.unpoliced_line() {
+        println!("vk registry: gc {}: {line}", store.root.display());
+    }
     Ok(())
 }
 
@@ -3341,7 +3353,45 @@ pub fn status(root: PathBuf) -> Result<()> {
         println!("  Blobs without tag references may still be protected by GC's grace period.");
         println!("  Preview cleanup with `vk registry gc --dry-run` (use the same store root).");
     }
+    let files = files_table(&store)?;
+    if !files.is_empty() {
+        println!();
+        for line in files {
+            println!("  {line}");
+        }
+    }
     Ok(())
+}
+
+/// Build the files table shared by `status` and `files policy`: object count, bytes and policy
+/// per directory, including policies for missing directories. Return no rows if both
+/// directories and policies are absent.
+pub fn files_table(store: &Store) -> Result<Vec<String>> {
+    let policies = store.read_files_policies()?;
+    let mut names: BTreeSet<String> = store.files_dirs()?.into_iter().collect();
+    names.extend(policies.iter().map(|(d, _)| d.clone()));
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut rows = vec![format!(
+        "{:<40} {:>8} {:>10}  POLICY",
+        "FILES DIRECTORY", "OBJECTS", "SIZE"
+    )];
+    for name in names {
+        let policy = match policies.iter().find(|(d, _)| *d == name) {
+            None => "none".to_string(),
+            Some((_, Ok(p))) => p.describe(),
+            Some((_, Err(_))) => "invalid".to_string(),
+        };
+        let stats = store.files_stats(&name).unwrap_or_default();
+        rows.push(format!(
+            "{:<40} {:>8} {:>10}  {policy}",
+            name,
+            stats.objects,
+            human_bytes(stats.bytes)
+        ));
+    }
+    Ok(rows)
 }
 
 /// A byte count in binary units (`B`, `KiB`, ... `PiB`), one decimal past `B`. Shared

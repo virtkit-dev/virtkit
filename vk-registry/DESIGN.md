@@ -443,7 +443,7 @@ absent from listings.
 | Verb on `files/` | Answer |
 |---|---|
 | `GET`, `HEAD` | 200 with the object (`application/octet-stream`, `nosniff`, `Content-Disposition: attachment`); a directory or a missing path is 404 |
-| `PUT` | streamed to `.staging/` and renamed into place — 201 when created, 204 when replaced, so a replace is atomic; 413 past 4 GiB; 405 onto a directory, its body read through first |
+| `PUT` | streamed to `.staging/` and renamed into place — 201 when created, 204 when replaced, so a replace is atomic; 413 past 4 GiB; 405 for directories and top-level names, after draining the body |
 | `PROPFIND` | 207 for a file or a directory; at `Depth: 1` the directory's members follow it, each with `getcontentlength` (files) and `getlastmodified`, which opendal requires; 404 when absent |
 | `MKCOL` | 201, creating missing ancestors — a top-level directory included, which is how one comes to exist; 405 when anything is at the name; 409 when a file is in the way |
 | `DELETE` | 204 for an object or an empty directory; 403 for a directory with members; 404 when absent |

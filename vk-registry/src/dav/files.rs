@@ -5,7 +5,7 @@
 
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -21,6 +21,7 @@ use super::{
     ALLOWED_FILES, ALLOWED_READ, Depth, Entry, created, href, http_date, method_not_allowed,
     modified_of, multistatus, no_content, not_found, propfind_depth,
 };
+use crate::files_policy::valid_dir;
 use crate::{Authz, Body, STREAM_CHUNK, ServerState, Store, accounts, body_of, error_response};
 
 /// Maximum object size, checked both against Content-Length and while streaming.
@@ -28,6 +29,9 @@ const MAX_OBJECT: u64 = 4 << 30;
 
 /// Serve uploads as binary attachments to prevent rendering on the `/browse` origin.
 const OBJECT_TYPE: &str = "application/octet-stream";
+
+/// Minimum age before GET refreshes mtime for eviction, limiting metadata writes.
+const TOUCH_AFTER: Duration = Duration::from_secs(3600);
 
 /// Serve one `files/` request; `segs` are the decoded components after `/dav/files/`.
 pub(super) async fn route(
@@ -72,7 +76,7 @@ pub(super) async fn route(
     match method {
         "GET" | "HEAD" => get(&path, &href(&parts, false), method == "HEAD"),
         "PROPFIND" => propfind(&path, &parts, req).await,
-        "PUT" => put(store, &path, &href(&parts, false), req).await,
+        "PUT" => put(store, &path, rel.is_empty(), &href(&parts, false), req).await,
         "MKCOL" => mkcol(&path, &href(&parts, true)),
         "DELETE" => delete(&path, &href(&parts, false)),
         _ => Ok(method_not_allowed(&href(&parts, false), ALLOWED_FILES)),
@@ -124,14 +128,6 @@ async fn root(
     }
 }
 
-/// A top-level directory is one component of the repository name it authorizes as, so it
-/// is held to [`crate::valid_name`]'s charset — which is also what keeps it off a separator
-/// and out of `.`/`..` — and never one of the reserved dot-names that sit beside the
-/// directories and hold the store's own state.
-fn valid_dir(dir: &str) -> bool {
-    !dir.contains('/') && !super::reserved(dir) && crate::valid_name(dir)
-}
-
 /// `GET`/`HEAD` an object. A directory or a missing path is a 404 — listings are
 /// `PROPFIND`'s — and `Range` is ignored, a full 200 being a legal answer to it.
 fn get(path: &Path, href: &str, head: bool) -> Result<Response<Body>> {
@@ -152,6 +148,15 @@ fn get(path: &Path, href: &str, head: bool) -> Result<Response<Body>> {
         return Ok(not_found(href));
     }
     let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    // GET refreshes stale mtimes for eviction; HEAD does not. A failed touch may cause early
+    // eviction but should not fail the read.
+    if !head
+        && SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|idle| idle > TOUCH_AFTER)
+    {
+        let _ = file.set_modified(SystemTime::now());
+    }
     let builder = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, OBJECT_TYPE)
@@ -229,6 +234,7 @@ enum PutError {
 async fn put(
     store: &Store,
     path: &Path,
+    top_level: bool,
     href: &str,
     req: Request<Incoming>,
 ) -> Result<Response<Body>> {
@@ -247,9 +253,9 @@ async fn put(
             href,
         ));
     }
-    // Defer the directory-conflict response until the body is drained.
+    // Reserve top-level names for directories. Drain the body before returning 405.
     let existing = std::fs::symlink_metadata(path).ok();
-    if existing.as_ref().is_some_and(|m| m.is_dir()) {
+    if top_level || existing.as_ref().is_some_and(|m| m.is_dir()) {
         return match drain_into(&mut tokio::io::sink(), req.into_body(), MAX_OBJECT).await {
             Ok(()) => Ok(method_not_allowed(href, ALLOWED_FILES)),
             Err(PutError::TooLarge) => Ok(error_response(
@@ -433,19 +439,5 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 400);
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The names a top-level directory may have: a repository-name component, never a
-    /// reserved dot-name.
-    #[test]
-    fn only_a_plain_name_is_a_directory() {
-        for ok in ["sccache", "ccache", "team-a.artifacts", "x_1"] {
-            assert!(valid_dir(ok), "{ok}");
-        }
-        for bad in [
-            ".staging", ".policy", ".", "..", "a/b", "bad dir", "", "tags",
-        ] {
-            assert!(!valid_dir(bad), "{bad}");
-        }
     }
 }
