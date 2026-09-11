@@ -1059,11 +1059,7 @@ async fn build_and_boot(
     let timings = Timings::new();
     // Supply run-specific `${VK_*}` values without storing host paths in the compose file.
     let mut compose_units: Vec<crate::compose::Unit> = match &args.compose {
-        Some(p) => {
-            let builtins =
-                crate::compose::Builtins::resolve(args.workspace.as_deref(), Some(work))?;
-            crate::compose::load(p, Some(&builtins))?
-        }
+        Some(p) => crate::compose::load(p, Some(&compose_builtins(args, work)?))?,
         None => Vec::new(),
     };
     apply_service_overrides(
@@ -2910,6 +2906,20 @@ fn plan_services(
     Ok(planned)
 }
 
+/// Builtins for loading a run's compose file. The persist anchor is set only when the run pins
+/// a durable state dir (`--state-dir`, which `vk dev` always passes): the auto-managed backings
+/// that must outlive the run then live under it, out of the workspace. Without one, `work` is an
+/// ephemeral per-pid scratch, so the anchor stays unset and the backings fall back beside the
+/// compose file under `.virtkit/`.
+fn compose_builtins(args: &RunArgs, work: &Path) -> Result<crate::compose::Builtins> {
+    let mut builtins = crate::compose::Builtins::resolve(args.workspace.as_deref(), Some(work))?;
+    // `WorkDir::pinned` preserves `--state-dir` verbatim as `work`; use it as the durable anchor.
+    if let Some(dir) = &args.state_dir {
+        builtins.persist_anchor = Some(dir.clone());
+    }
+    Ok(builtins)
+}
+
 /// `vk run --compose` with no primary — compose up: boot the enabled services
 /// on the run LAN and hold until ctrl-c; everything dies with this process.
 async fn compose_up(
@@ -2924,8 +2934,7 @@ async fn compose_up(
         .compose
         .as_ref()
         .expect("compose_up requires --compose");
-    let builtins = crate::compose::Builtins::resolve(args.workspace.as_deref(), Some(work))?;
-    let mut units = crate::compose::load(compose, Some(&builtins))?;
+    let mut units = crate::compose::load(compose, Some(&compose_builtins(args, work)?))?;
     if units.is_empty() {
         bail!("{} declares no services", compose.display());
     }

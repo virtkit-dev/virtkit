@@ -20,6 +20,14 @@ All notable changes to virtkit will be documented in this file.
   default even without an `[executor]` table.
 - **A CI job's guest is named `vk` by default, not `runner`.** Set `[executor.vm] hostname`
   to keep the old name.
+- **Auto-managed persistent backings follow the run's durable state directory.** A
+  `persist_root` root or `overlay,persist` upper is kept under the state dir when the run pins
+  one — `vk dev`, or `vk run --state-dir` — at `<state-dir>/roots|overlays/`, so it lives out
+  of the workspace and out of the guest's view. A run without a durable state dir (plain
+  `vk run`, the GitLab executor) keeps them beside the compose file under `.virtkit/`, no longer
+  nesting a second `.virtkit` when the compose file is itself `.virtkit/compose.yaml`. After
+  upgrading, move an existing backing to the new location, or let the ones that reset when
+  their image changes recreate from scratch.
 
 ### Removed
 
@@ -29,11 +37,6 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
-- **`persist_root` and `overlay,persist` backings no longer nest a second `.virtkit`.**
-  They were anchored on the compose file's own directory, so a compose file kept at
-  `.virtkit/compose.yaml` (the vk layout) stored them under `.virtkit/.virtkit/roots|overlays/`.
-  They now live under the workspace's `.virtkit/roots|overlays/`. After upgrading, move an
-  existing `.virtkit/.virtkit/` into place, or let the generation-bound backing recreate fresh.
 - **Ctrl-C and Ctrl-Z work while a `--detach` run (or a `vk dev` boot) is still building or
   booting.** Ctrl-Z did nothing before and Ctrl-C only forced the run down indirectly; now
   Ctrl-C ends it and Ctrl-Z suspends it like any foreground job. During the build a Ctrl-C

@@ -289,6 +289,10 @@ const RESERVED_STATE_ENTRIES: &[&str] = &[
     "boot.log",
     // `crate::publish`'s registry of what is published, which the host reads back
     "publish",
+    // auto-managed persistent backings the boot keeps under the state dir: `persist_root`
+    // roots and `overlay,persist` uppers, which a mount naming them would corrupt
+    "roots",
+    "overlays",
 ];
 
 /// Resolve the environment `name` of a loaded config against this host.

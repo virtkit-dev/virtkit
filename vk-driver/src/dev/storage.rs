@@ -128,9 +128,11 @@ pub fn running(plan: &Plan) -> Result<Running> {
 pub fn inventory(plan: &Plan, sizes: bool) -> Result<Vec<Item>> {
     let mut items = Vec::new();
     if let Source::Compose { file, .. } = &plan.source {
-        // Use the boot's builtins so `${VK_WORKSPACE}/…` resolves to the same backing.
-        let builtins =
+        // Match the boot's builtins and durable anchor (`vk dev` always pins a state dir)
+        // so `${VK_WORKSPACE}/…` and reported roots/overlays resolve to the paths it creates.
+        let mut builtins =
             crate::compose::Builtins::resolve(Some(&plan.workspace), Some(&plan.state_dir))?;
+        builtins.persist_anchor = Some(plan.state_dir.clone());
         for unit in crate::compose::load(file, Some(&builtins))? {
             for v in &unit.volumes {
                 if v.disk {

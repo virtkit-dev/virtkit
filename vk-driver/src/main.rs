@@ -3557,6 +3557,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 }
                 // Match `vk run --compose` so prebuild and boot resolve the same cache keys.
                 // Invalid --workspace or --state-dir values are flag errors (exit 2).
+                // Build selection ignores backing paths, so leave `persist_anchor` unset.
                 let builtins =
                     match compose::Builtins::resolve(workspace.as_deref(), state_dir.as_deref()) {
                         Ok(b) => b,

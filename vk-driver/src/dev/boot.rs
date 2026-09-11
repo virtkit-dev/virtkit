@@ -754,6 +754,8 @@ fn build_into_cache(
     // image it actually runs.
     let to_build = match &plan.source {
         Source::Compose { file, .. } => {
+            // Build selection ignores backing paths, so leave `persist_anchor` unset.
+            // Boot sets it via `run::compose_builtins`.
             let builtins =
                 crate::compose::Builtins::resolve(Some(&plan.workspace), Some(&plan.state_dir))?;
             let units = crate::compose::load(file, Some(&builtins))?;

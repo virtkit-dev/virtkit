@@ -320,7 +320,7 @@ throwaway layer over the image, and `volumes:` bind host paths into the guest. A
 |------|----------------|-----------|
 | `rw` (default), `ro` | the host directory or file, live | to the host (`rw`), or are refused (`ro`) |
 | `overlay` | the host tree, read-only underneath | to guest RAM — fast, gone at reboot |
-| `overlay,persist[,size=SIZE]` | the host tree, read-only underneath | to a disk kept next to the compose file |
+| `overlay,persist[,size=SIZE]` | the host tree, read-only underneath | to a disk that survives restarts (see below) |
 | `disk[,size=SIZE]` | a private filesystem of its own | to that disk; the host path is its image |
 | `socket` | a unix socket at the guest path | each connection is relayed to the host socket |
 
@@ -358,8 +358,10 @@ services:
 ```
 
 Persistent state — a `persist_root` root, an `overlay,persist` layer — survives an in-guest
-reboot, `vk service down`/`up`, and stopping and later restarting the run. It lives under
-`.virtkit/` beside the compose file (add it to `.gitignore`), and is reset when what it
+reboot, `vk service down`/`up`, and stopping and later restarting the run. When the run pins a
+durable state directory — `vk dev`, or `vk run --state-dir` — it is kept there, out of the
+workspace and so out of the guest's view; otherwise it lives under `.virtkit/` beside the
+compose file (add that to `.gitignore`). Either way it is reset when what it
 was built on changes: a new image rebuilds a persistent root from scratch, and a new image
 or a changed host tree discards a persistent overlay's writes. A `disk` volume persists
 unconditionally; delete its file to start over. All of this applies alike to a service
