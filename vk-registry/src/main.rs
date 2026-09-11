@@ -196,6 +196,51 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AccountsCmd,
     },
+    /// Manage files served at /dav/files/
+    ///
+    /// Eviction requires a per-directory TTL or size policy. Set policies locally in the store;
+    /// DAV credentials cannot change them. The server applies changes within five minutes; gc
+    /// applies them immediately.
+    Files {
+        #[command(subcommand)]
+        cmd: FilesCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum FilesCmd {
+    /// Show, set or clear a directory's eviction policy
+    ///
+    /// With no flags, show the policy and usage; omit <dir> to list all directories. --ttl-days
+    /// and --max-bytes replace the policy; omitted limits are removed. --clear disables
+    /// eviction. Policies may be set before a directory exists.
+    Policy {
+        /// The top-level directory under files/ (the `<dir>` of /dav/files/<dir>/)
+        dir: Option<String>,
+        /// Drop objects unused for more than this many days (0: drop them on the next pass)
+        ///
+        /// A `GET` counts as a use.
+        #[arg(long, value_name = "DAYS", requires = "dir", conflicts_with = "clear")]
+        ttl_days: Option<u64>,
+        /// Past this size, drop the least recently used objects until under it
+        ///
+        /// Binary units: 200G, 200GiB and 214748364800 are the same size.
+        #[arg(long, value_name = "SIZE", requires = "dir", conflicts_with = "clear")]
+        max_bytes: Option<String>,
+        /// Remove the policy; the directory is then never swept
+        #[arg(long, requires = "dir")]
+        clear: bool,
+        /// Store directory [default: VK_REGISTRY_ROOT, then --config, then the shared store]
+        ///
+        /// VK_REGISTRY_ROOT overrides the root in the config file.
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Read the store root from a serve config file
+        ///
+        /// Defaults to VK_REGISTRY_CONFIG. An unreadable config file is an error.
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+    },
 }
 
 /// Which accounts a subcommand works on, and how it reaches them. The db is an explicit
@@ -650,7 +695,106 @@ async fn run(cli: Cli) -> Result<()> {
         // handled in `main`, before this dispatch
         Cmd::Update { .. } => unreachable!("update is handled in main"),
         Cmd::Accounts { store, cmd } => run_accounts(store, cmd),
+        Cmd::Files {
+            cmd:
+                FilesCmd::Policy {
+                    dir,
+                    ttl_days,
+                    max_bytes,
+                    clear,
+                    root,
+                    config,
+                },
+        } => {
+            let root = store_root(root, config, |name| std::env::var_os(name))?;
+            // clap requires <dir> with each mutation flag.
+            let named = || {
+                dir.as_deref()
+                    .expect("clap requires <dir> with these flags")
+            };
+            let change = if clear {
+                Some((named(), None))
+            } else if ttl_days.is_some() || max_bytes.is_some() {
+                Some((
+                    named(),
+                    Some(vk_registry::files_policy::FilesPolicy {
+                        ttl: ttl_days.map(|d| Duration::from_secs(d.saturating_mul(86_400))),
+                        max_bytes: max_bytes
+                            .as_deref()
+                            .map(vk_registry::files_policy::parse_bytes)
+                            .transpose()?,
+                    }),
+                ))
+            } else {
+                None
+            };
+            run_files_policy(root, dir.as_deref(), change)
+        }
     }
+}
+
+/// Show policies and usage, or set/clear one policy. Require an existing store; this command
+/// does not create it.
+fn run_files_policy(
+    root: PathBuf,
+    dir: Option<&str>,
+    change: Option<(&str, Option<vk_registry::files_policy::FilesPolicy>)>,
+) -> Result<()> {
+    let Some(store) = vk_registry::Store::open(&root)? else {
+        if change.is_some() {
+            anyhow::bail!(
+                "no store at {}: start `vk-registry serve` once, or name the store with --root",
+                root.display()
+            );
+        }
+        println!("vk registry: {} — no store here", root.display());
+        return Ok(());
+    };
+    if let Some((dir, policy)) = change {
+        store.write_files_policy(dir, policy.as_ref())?;
+        match policy {
+            Some(p) => println!(
+                "vk registry: {}: files/{dir} policy set to {}; a running server applies it \
+                 within {} minutes, `vk-registry gc` applies it now",
+                root.display(),
+                p.describe(),
+                vk_registry::files_sweep::SWEEP_TICK.as_secs() / 60,
+            ),
+            None => println!(
+                "vk registry: {}: files/{dir} policy cleared; the directory is no longer swept",
+                root.display()
+            ),
+        }
+        return Ok(());
+    }
+    println!("vk registry: {}", root.display());
+    let table = vk_registry::files_table(&store)?;
+    match dir {
+        Some(dir) => {
+            // Validates the name; the path itself is not needed here.
+            store.files_policy_path(dir)?;
+            let rows: Vec<&String> = table
+                .iter()
+                .enumerate()
+                .filter(|(i, row)| *i == 0 || row.split_whitespace().next() == Some(dir))
+                .map(|(_, row)| row)
+                .collect();
+            if rows.len() < 2 {
+                println!("  files/{dir}: no such directory and no policy");
+                return Ok(());
+            }
+            for row in rows {
+                println!("  {row}");
+            }
+        }
+        None if table.is_empty() => println!("  files/: no directories and no policies"),
+        None => {
+            for row in &table {
+                println!("  {row}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_accounts(store: StoreArgs, cmd: AccountsCmd) -> Result<()> {
@@ -1368,6 +1512,69 @@ mod tests {
         };
         assert_eq!(root, None);
         assert_eq!(config.as_deref(), Some(Path::new("/etc/reg.toml")));
+    }
+
+    /// Test policy CLI modes, required directory arguments, conflicting flags and store
+    /// resolution.
+    #[test]
+    fn files_policy_parses_show_list_set_and_clear() {
+        use std::path::Path;
+
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(["vk-registry", "files", "policy"].iter().chain(args)).map(|cli| {
+                match cli.cmd {
+                    Cmd::Files {
+                        cmd:
+                            FilesCmd::Policy {
+                                dir,
+                                ttl_days,
+                                max_bytes,
+                                clear,
+                                root,
+                                config,
+                            },
+                    } => (dir, ttl_days, max_bytes, clear, root, config),
+                    _ => panic!("expected Cmd::Files"),
+                }
+            })
+        };
+        let (dir, ttl, max, clear, ..) = parse(&[]).expect("list");
+        assert_eq!((dir, ttl, max, clear), (None, None, None, false));
+        let (dir, ttl, max, clear, ..) = parse(&["sccache"]).expect("show");
+        assert_eq!(
+            (dir.as_deref(), ttl, max, clear),
+            (Some("sccache"), None, None, false)
+        );
+        let (dir, ttl, max, clear, root, config) = parse(&[
+            "sccache",
+            "--ttl-days",
+            "30",
+            "--max-bytes",
+            "200G",
+            "--config",
+            "/etc/reg.toml",
+        ])
+        .expect("set");
+        assert_eq!(dir.as_deref(), Some("sccache"));
+        assert_eq!(
+            (ttl, max.as_deref(), clear),
+            (Some(30), Some("200G"), false)
+        );
+        assert_eq!(root, None);
+        assert_eq!(config.as_deref(), Some(Path::new("/etc/reg.toml")));
+        let (dir, _, _, clear, ..) = parse(&["sccache", "--clear"]).expect("clear");
+        assert_eq!((dir.as_deref(), clear), (Some("sccache"), true));
+
+        for bad in [
+            &["--ttl-days", "30"][..],
+            &["--max-bytes", "1G"],
+            &["--clear"],
+            &["sccache", "--clear", "--ttl-days", "1"],
+            &["sccache", "--clear", "--max-bytes", "1G"],
+            &["sccache", "--ttl-days", "soon"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     // `--addr`'s `[default: …]` is prose, not clap's own line: with no clap default there
