@@ -294,8 +294,7 @@ pub struct Executor {
     /// `[executor.vm] reclaim` is `"off"` (or `[executor.vm] balloon` is, which stops the
     /// trimming too).
     pub atop: bool,
-    /// Seconds between samples. Must be at least 1. Default 30, matching the interval the
-    /// runner hosts' own atop uses, so the two logs read at the same resolution.
+    /// Seconds between samples. Must be at least 1. Default 10.
     pub atop_interval_secs: u64,
     /// How many days back the archive keeps beside today's, counted in whole UTC days rather
     /// than elapsed time. A day past the window is dropped whole, by the first job recorded

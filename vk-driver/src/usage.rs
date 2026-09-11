@@ -62,9 +62,10 @@ pub struct Usage {
     /// `(the high-water mark, the capacity)` of the guest's writable layer, in bytes — the
     /// tmpfs a job's writes land on where its checkout is built on an in-guest overlay
     /// (`[executor] checkout_overlay`). The pair reads as "how close the build tree came to the
-    /// wall": the capacity is half the VM memory, so a job can fail with `ENOSPC` at a peak
-    /// well under the ceiling beside it while `disk` says it wrote nothing at all — those
-    /// pages are RAM, and no host counter is in a position to see them.
+    /// wall": the capacity is `[executor] checkout_overlay_size` (default 80% of the VM
+    /// memory, or an explicit size), so a job can fail with `ENOSPC` at a peak well under the
+    /// ceiling beside it while `disk` says it wrote nothing at all — those pages are RAM, and
+    /// no host counter is in a position to see them.
     ///
     /// `None` where there was no such layer to ask about: every phase but a job on an overlaid
     /// checkout, and a guest whose agent is too old to answer.
