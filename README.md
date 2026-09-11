@@ -597,7 +597,9 @@ coordination, or a shared compiler cache. The whole store is also served over We
 `/dav/`, behind the same TLS and credentials as the rest of the server: `/dav/repos/` is a
 read-only view of every repository's tags, manifests and blobs, and `/dav/files/` is a
 plain-file area where an `sccache` pointed at `/dav/files/<dir>` lets jobs in throwaway
-microVMs reuse each other's compiled units. Its lease and heartbeat protocol prevents
+microVMs reuse each other's compiled units; `vk-registry files policy <dir> --ttl-days 30
+--max-bytes 200G` bounds such a directory, and the running server applies the change within
+minutes. Its lease and heartbeat protocol prevents
 runners from independently building the same content while a healthy peer is already
 doing so.
 

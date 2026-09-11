@@ -101,6 +101,14 @@ All notable changes to virtkit will be documented in this file.
   `SCCACHE_WEBDAV_ENDPOINT` at `https://<registry>/dav/files/<dir>` and every runner's jobs
   share one cache of compiled units over the registry's existing TLS and credentials; a
   read-only credential gives a pipeline the hits without letting it write.
+- **`vk-registry files policy` bounds a `/dav/files/` directory.** `vk-registry files policy
+  sccache --ttl-days 30 --max-bytes 200G` makes the server drop objects nobody has read or
+  written for thirty days and, past 200 GiB, the least recently used until it fits; `--clear`
+  makes the directory an ordinary directory again. A directory without a policy is never
+  swept — the server names those in its log, and `status` lists every directory with its
+  policy. The policy is a file in the store, so a running server applies a change within
+  five minutes without a restart, and `vk-registry gc` applies it at once. Staging files a
+  crashed upload left behind are removed after a day regardless.
 
 ### Changed
 
