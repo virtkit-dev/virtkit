@@ -62,7 +62,9 @@ pub struct Config {
     /// by `vk gc` (the checkout-cache settings) and `vk tune` (the VM template and
     /// `[executor.schedule]`); never read by `vk run` /
     /// `vk build`. See [`Executor`]. Always present; an empty file is enough for its
-    /// defaults (not for `prepare`, which validates the image paths).
+    /// defaults (not for `prepare`, which validates the image paths). `vk config` omits it
+    /// entirely when it is untouched, so a non-CI host is not shown a page of CI defaults.
+    #[serde(skip_serializing_if = "Executor::is_default")]
     pub executor: Executor,
     /// The file this config was loaded from; None = built-in defaults (no file
     /// found). Set by [`Config::load`], not a config key.
@@ -325,6 +327,16 @@ pub struct Executor {
 /// The default `checkout_overlay_size`. Named because the guest applies the kernel's own tmpfs
 /// default when it is told nothing, so this is the policy and that is only the fallback.
 pub const CHECKOUT_OVERLAY_SIZE: &str = "80%";
+
+impl Executor {
+    /// Whether the executor is entirely at its defaults — nothing on this host configures the
+    /// GitLab executor. `vk config` uses it to omit the whole `[executor]` tree, which would
+    /// otherwise print a page of CI defaults on a host that only runs `vk run`/`vk dev`.
+    /// Compared through TOML so no field type has to grow a `PartialEq` for this alone.
+    pub fn is_default(&self) -> bool {
+        toml::Value::try_from(self).ok() == toml::Value::try_from(Self::default()).ok()
+    }
+}
 
 impl Default for Executor {
     fn default() -> Self {
@@ -1096,6 +1108,31 @@ mod tests {
         let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back.executor.vm.cpus, 6);
         assert_eq!(back.executor.schedule.mem_budget.as_deref(), Some("48G"));
+    }
+
+    #[test]
+    fn vk_config_omits_an_untouched_executor() {
+        // A host that configures nothing CI-related: the effective config carries a default
+        // executor, and `vk config` must not print a page of `[executor]` defaults for it.
+        let bare = Config::default();
+        assert!(bare.executor.is_default());
+        let toml = toml::to_string(&bare).unwrap();
+        assert!(!toml.contains("[executor"), "{toml}");
+
+        // Configure a single nested executor key and the whole tree is shown again.
+        let cfg: Config = toml::from_str("[executor.vm]\ncpus = 6\n").unwrap();
+        assert!(!cfg.executor.is_default());
+        let toml = toml::to_string(&cfg).unwrap();
+        assert!(
+            toml.contains("[executor.vm]") && toml.contains("cpus = 6"),
+            "{toml}"
+        );
+
+        // A flat `[executor]` scalar shows it too, guarding the top-level-key path.
+        let cfg: Config = toml::from_str("[executor]\natop = false\n").unwrap();
+        assert!(!cfg.executor.is_default());
+        let toml = toml::to_string(&cfg).unwrap();
+        assert!(toml.contains("atop = false"), "{toml}");
     }
 
     /// Every section that moved under `[executor]` is refused at load with a hint

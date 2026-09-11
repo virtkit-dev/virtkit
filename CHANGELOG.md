@@ -20,6 +20,10 @@ All notable changes to virtkit will be documented in this file.
   default even without an `[executor]` table.
 - **A CI job's guest is named `vk` by default, not `runner`.** Set `[executor.vm] hostname`
   to keep the old name.
+- **`vk config` omits the `[executor]` section when nothing configures it.** A host that only
+  runs `vk run`/`vk dev` was shown a page of GitLab-executor defaults; now the section is left
+  out (with a one-line note) until the config sets an `[executor…]` key. `vk config --example`
+  still shows every executor option.
 - **Auto-managed persistent backings follow the run's durable state directory.** A
   `persist_root` root or `overlay,persist` upper is kept under the state dir when the run pins
   one — `vk dev`, or `vk run --state-dir` — at `<state-dir>/roots|overlays/`, so it lives out

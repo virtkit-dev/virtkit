@@ -2396,7 +2396,21 @@ fn config_cmd(cfg: &Config, path: bool) -> ExitCode {
         None => println!("# effective configuration (no config file found; built-in defaults)"),
     }
     print!("{toml}");
+    if let Some(note) = executor_omitted_note(cfg) {
+        println!("{note}");
+    }
     ExitCode::SUCCESS
+}
+
+/// The trailing note `vk config` prints when it drops an all-default `[executor]` — `None` when
+/// the executor is configured and the whole section is shown instead. Built as a string so a
+/// test can assert it; points at `vk config --example` for the keys it leaves out.
+fn executor_omitted_note(cfg: &Config) -> Option<String> {
+    cfg.executor.is_default().then(|| {
+        "# [executor] omitted: the GitLab executor is left at its defaults — \
+         `vk config --example` shows its keys"
+            .to_string()
+    })
 }
 
 /// The `vk paths` report: each effective host path, where it comes from, and how
@@ -5038,6 +5052,17 @@ impl<R: std::io::Read> std::io::Read for ProgressReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_notes_an_omitted_default_executor() {
+        // A pure-default host: the section is dropped and the note points at --example.
+        let note = executor_omitted_note(&config::Config::default())
+            .expect("a default executor prints the omission note");
+        assert!(note.contains("[executor] omitted") && note.contains("vk config --example"));
+        // Any configured executor key shows the section again, with no note.
+        let cfg: config::Config = toml::from_str("[executor.vm]\ncpus = 6\n").unwrap();
+        assert!(executor_omitted_note(&cfg).is_none());
+    }
 
     #[test]
     fn journal_enabled_defaults_on_and_either_side_can_opt_out() {
