@@ -592,9 +592,14 @@ boundaries and interpretation.
 ### Caching and registries
 
 Local image conversion and build caches require no server. `vk-registry` is optional and
-is useful when several runners need a shared OCI store, pull-through cache, or build-once
-coordination. Its lease and heartbeat protocol prevents runners from independently
-building the same content while a healthy peer is already doing so.
+is useful when several runners need a shared OCI store, pull-through cache, build-once
+coordination, or a shared compiler cache. The whole store is also served over WebDAV under
+`/dav/`, behind the same TLS and credentials as the rest of the server: `/dav/repos/` is a
+read-only view of every repository's tags, manifests and blobs, and `/dav/files/` is a
+plain-file area where an `sccache` pointed at `/dav/files/<dir>` lets jobs in throwaway
+microVMs reuse each other's compiled units. Its lease and heartbeat protocol prevents
+runners from independently building the same content while a healthy peer is already
+doing so.
 
 Use `vk registry push|pull|inspect` for guest bundles and `vk registry status|gc` for a
 local store. The central server and storage model are documented in
@@ -606,7 +611,7 @@ local store. The central server and storage model are documented in
 | --- | --- |
 | `vk` | Host CLI, VMM, image builder, userspace network, compose runner, and GitLab executor. It embeds the default guest kernel and `vk-agent`. |
 | `vk-agent` | Guest PID 1 and command server. It configures mounts, networking, hostname, shared directories, optional SSH, and host-driven execution over vsock. |
-| `vk-registry` | Optional OCI-distribution server with a pull-through cache, shared build cache, and build-once locking. |
+| `vk-registry` | Optional OCI-distribution server with a pull-through cache, a WebDAV view of the store with a plain-file area for compiler caches, and build-once locking. |
 | `vk-runnerctl` | Optional root-side helper that adjusts GitLab runner concurrency within an administrator-configured range. |
 
 ## Architecture
