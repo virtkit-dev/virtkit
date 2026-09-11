@@ -49,6 +49,7 @@ pub(crate) mod browse;
 pub(crate) mod captions;
 pub mod client;
 pub mod config;
+pub(crate) mod dav;
 pub(crate) mod forms;
 pub(crate) mod html;
 pub(crate) mod keys;
@@ -350,7 +351,12 @@ impl Store {
             let p = root.join(sub);
             std::fs::create_dir_all(&p).with_context(|| format!("creating {}", p.display()))?;
         }
-        Ok(Store::at(root))
+        let store = Store::at(root);
+        // Stage WebDAV PUTs on the destination filesystem so publication can use rename.
+        let staging = store.files_staging_dir();
+        std::fs::create_dir_all(&staging)
+            .with_context(|| format!("creating {}", staging.display()))?;
+        Ok(store)
     }
 
     /// The store at `root` if there is one, creating nothing — for [`status`] and [`gc`],
@@ -429,6 +435,141 @@ impl Store {
     /// read through.
     fn repo_blob_path(&self, name: &str, hex: &str) -> PathBuf {
         self.root.join("repos").join(name).join("blobs").join(hex)
+    }
+
+    /// Plain-file storage for `/dav/files/`, separate from the OCI blob pool.
+    pub fn files_dir(&self) -> PathBuf {
+        self.root.join("files")
+    }
+
+    /// Staging directory for PUTs, hidden from DAV by its reserved dot-name.
+    pub(crate) fn files_staging_dir(&self) -> PathBuf {
+        self.files_dir().join(FILES_STAGING)
+    }
+
+    /// Join validated components under `files/<dir>` and check the resulting prefix. Empty
+    /// `rel` refers to the directory itself.
+    pub(crate) fn files_object_path(&self, dir: &str, rel: &[String]) -> Option<PathBuf> {
+        let base = self.files_dir().join(dir);
+        let mut path = base.clone();
+        for seg in rel {
+            path.push(seg);
+        }
+        path.starts_with(&base).then_some(path)
+    }
+
+    /// Create a staging file exclusively, retrying name collisions from earlier processes with
+    /// the same PID.
+    pub(crate) fn new_files_staging(&self) -> Result<(PathBuf, std::fs::File)> {
+        let dir = self.files_staging_dir();
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let mut last = None;
+        for _ in 0..STAGING_ATTEMPTS {
+            let seq = CACHE_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("{}-{seq}", std::process::id()));
+            match std::fs::File::options()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(f) => return Ok((path, f)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("creating {}", path.display()));
+                }
+            }
+        }
+        Err(last
+            .map(anyhow::Error::from)
+            .unwrap_or_else(|| anyhow::anyhow!("no staging name was free")))
+        .with_context(|| format!("staging an object under {}", dir.display()))
+    }
+
+    /// Check for a valid repository with at least one repository subdirectory, without walking
+    /// its contents.
+    pub(crate) fn has_repo(&self, name: &str) -> bool {
+        valid_name(name)
+            && REPO_SUBDIRS
+                .iter()
+                .any(|k| self.root.join("repos").join(name).join(k).is_dir())
+    }
+
+    /// Collection mtime for `repos/<rel>`, falling back to the epoch. Empty `rel` refers to
+    /// `repos/`.
+    pub(crate) fn repos_path_modified(&self, rel: &str) -> SystemTime {
+        std::fs::symlink_metadata(self.root.join("repos").join(rel))
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+
+    /// Return the tag's manifest hex and mtime without refreshing retention. Listings must not
+    /// keep tags alive.
+    pub(crate) fn tag_target(&self, name: &str, tag: &str) -> Option<(String, SystemTime)> {
+        if !valid_name(name) || !valid_tag(tag) {
+            return None;
+        }
+        let path = self.tag_path(name, tag);
+        let modified = std::fs::symlink_metadata(&path).ok()?.modified().ok()?;
+        let digest = std::fs::read_to_string(&path).ok()?;
+        let hex = digest.trim().trim_start_matches("sha256:").to_string();
+        is_blob_hex(&hex).then_some((hex, modified))
+    }
+
+    /// Manifest length, media type and membership mtime, using the same media-type fallbacks as
+    /// [`Store::get_manifest`].
+    pub(crate) fn manifest_meta(&self, name: &str, hex: &str) -> Option<(u64, String, SystemTime)> {
+        if !valid_name(name) || !is_blob_hex(hex) {
+            return None;
+        }
+        let blob = self.blob_path(hex);
+        let len = std::fs::metadata(&blob).ok()?.len();
+        let sidecar = self.manifest_type_path(name, hex);
+        let modified = std::fs::symlink_metadata(&sidecar)
+            .or_else(|_| std::fs::metadata(&blob))
+            .and_then(|m| m.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let ctype = std::fs::read_to_string(&sidecar)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .or_else(|| {
+                std::fs::read(&blob)
+                    .ok()
+                    .and_then(|d| declared_media_type(&d))
+            })
+            .map(|t| manifest_media_type(&t).to_string())
+            .unwrap_or_else(|| DEFAULT_MANIFEST_TYPE.to_string());
+        Some((len, ctype, modified))
+    }
+
+    /// A blob's canonical length and mtime: one `open`, and for a zstd-stored blob a read
+    /// of the frame header — the same length `Content-Length` reports on a `GET`.
+    pub(crate) fn blob_meta(&self, hex: &str) -> Option<(u64, SystemTime)> {
+        let (path, is_zstd) = self.find_blob(hex)?;
+        let mut file = std::fs::File::open(&path).ok()?;
+        let meta = file.metadata().ok()?;
+        let modified = meta.modified().ok()?;
+        let len = if is_zstd {
+            zstd_canonical_len(&mut file).ok()?
+        } else {
+            meta.len()
+        };
+        Some((len, modified))
+    }
+
+    /// Sorted valid digest hexes under `repos/<name>/<kind>` for DAV listings.
+    pub(crate) fn repo_member_hexes(&self, name: &str, kind: &str) -> Vec<String> {
+        if !valid_name(name) || !REPO_SUBDIRS.contains(&kind) {
+            return Vec::new();
+        }
+        let mut out: Vec<String> = std::fs::read_dir(self.root.join("repos").join(name).join(kind))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| is_blob_hex(n))
+            .collect();
+        out.sort();
+        out
     }
 
     fn manifest_type_path(&self, name: &str, hex: &str) -> PathBuf {
@@ -1265,6 +1406,16 @@ const MAX_MANIFEST_BYTES: usize = 4 << 20;
 /// ask for (references × repositories the caller may read).
 const MAX_MANIFEST_REFERENCES: usize = 4096;
 
+/// Reserved staging directory for WebDAV PUTs.
+pub(crate) const FILES_STAGING: &str = ".staging";
+
+/// Monotonic suffix source for [`Store::new_files_staging`] (unique within this process;
+/// the pid disambiguates across the concurrent servers sharing a store).
+static CACHE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum attempts to skip existing staging filenames.
+const STAGING_ATTEMPTS: usize = 32;
+
 /// What a [`Store::gc`] pass removed (or, on a dry run, would remove).
 #[derive(Default)]
 pub struct GcReport {
@@ -1891,6 +2042,12 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // of a stage in one request instead of a `HEAD` per step.
     if path == EXISTS_PATH {
         return manifests_exist(&state.store, &authz, req).await;
+    }
+
+    // DAV authorizes each resource: `files/<dir>` or the OCI repository name. Keep it outside
+    // `is_human_path` so clients receive a 401 challenge, not a login redirect.
+    if path == "/dav" || path.starts_with("/dav/") {
+        return dav::route(&state, &authz, req).await;
     }
     let store = state.store.clone();
     let method = req.method().clone();

@@ -94,6 +94,13 @@ All notable changes to virtkit will be documented in this file.
   settings, caches — and forgets the reconciliation, then opens the editor as usual;
   Remote-SSH installs the server again and `[dev.editor.vscode]` is applied afresh. The
   environment keeps running. `vk dev editor reset` does the same without opening an editor.
+- **`vk-registry` serves its store over WebDAV under `/dav/`.** `/dav/repos/` is a
+  read-only view of every repository the credential may read — tags and manifests download
+  as manifests, blobs as their bytes — and `/dav/files/` is a plain-file area any WebDAV
+  client can write to, scoped per top-level directory (`write:files/sccache`). Point
+  `SCCACHE_WEBDAV_ENDPOINT` at `https://<registry>/dav/files/<dir>` and every runner's jobs
+  share one cache of compiled units over the registry's existing TLS and credentials; a
+  read-only credential gives a pipeline the hits without letting it write.
 
 ### Changed
 
