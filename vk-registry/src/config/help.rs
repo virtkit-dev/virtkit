@@ -89,6 +89,11 @@ const KEYS: &[Key] = &[
     },
     Key {
         table: Table::Top,
+        name: "webdav",
+        help: "enable /dav/; false returns 404 [default: true]",
+    },
+    Key {
+        table: Table::Top,
         name: "oidc",
         help: "the [oidc] table below; required in accounts mode",
     },

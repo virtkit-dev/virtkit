@@ -82,6 +82,10 @@ pub struct ServerConfig {
     /// `[oidc]`, required in `mode = "accounts"` — it is the only login path that mode
     /// has.
     pub oidc: Option<OidcSpec>,
+    /// Enable `/dav/` (default: true). When disabled, requests return 404 after auth; the
+    /// objects already stored under `files/` stay reachable over `/v2/` and expire under `gc`
+    /// like any tag.
+    pub webdav: bool,
 }
 
 /// The `[oidc]` config table, as declared (before its client secret is read and checked
@@ -133,6 +137,8 @@ struct FileConfig {
     accounts_db: Option<PathBuf>,
     /// `false` to bind no admin socket, a path to move it, `true` for the default one.
     admin_socket: Option<FileAdminSocket>,
+    /// Enable `/dav/`; defaults to true.
+    webdav: Option<bool>,
     oidc: Option<FileOidc>,
     #[serde(default)]
     upstream: Vec<FileUpstream>,
@@ -225,6 +231,7 @@ impl ServerConfig {
             accounts_db: None,
             admin_socket: AdminSocket::Unset,
             oidc: None,
+            webdav: true,
         }
     }
 
@@ -401,6 +408,7 @@ impl ServerConfig {
                 client_secret_file: o.client_secret_file,
                 public_url: o.public_url,
             }),
+            webdav: f.webdav.unwrap_or(true),
         };
         // Also here, not only in `build_auth`: `load` is where a file becomes a config, so
         // a contradictory file is refused by parsing it at all, not only by the path that
@@ -658,6 +666,7 @@ impl ServerConfig {
             locks: LockManager::new(),
             auth,
             tls: None,
+            webdav: self.webdav,
         })
     }
 }

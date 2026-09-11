@@ -28,6 +28,7 @@ bytes.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
+httpdate.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util", "sync", "fs"] }
 reqwest.workspace = true
 rustls.workspace = true

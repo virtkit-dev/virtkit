@@ -4617,6 +4617,7 @@ dependencies = [
  "clap",
  "futures",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
  "jemallocator",

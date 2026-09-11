@@ -1342,6 +1342,7 @@ async fn a_relayed_blob_becomes_a_member_of_the_repo_it_was_fetched_for() {
         locks: LockManager::new(),
         auth: Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     }));
 
     // Mirror: accounts mode, empty store, everything routed upstream.
@@ -1442,6 +1443,7 @@ async fn shared_secret_mode_is_unchanged_by_repo_scoping() {
         locks: LockManager::new(),
         auth: Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     }));
     let client = no_redirect_client();
 

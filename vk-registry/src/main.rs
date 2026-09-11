@@ -154,7 +154,7 @@ enum Cmd {
         /// Keep unreferenced blobs and stale uploads this many days past their last use
         ///
         /// The window protects in-flight multi-request pushes.
-        #[arg(long, default_value_t = 1, value_name = "DAYS")]
+        #[arg(long, default_value_t = vk_registry::DEFAULT_GC_GRACE_DAYS, value_name = "DAYS")]
         grace_days: u64,
         /// Report what would be removed without removing anything
         #[arg(long)]

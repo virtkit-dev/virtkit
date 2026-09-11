@@ -1,11 +1,13 @@
 # vk-registry design
 
-`vk-registry` is a central OCI Distribution server for virtkit runners. It provides three
+`vk-registry` is a central OCI Distribution server for virtkit runners. It provides four
 services behind one listener:
 
 - a content-addressed OCI store shared by all runners;
-- a pull-through cache for upstream registries; and
-- a leased lock service that coordinates build-once work across runners.
+- a pull-through cache for upstream registries;
+- a leased lock service that coordinates build-once work across runners; and
+- a WebDAV view of the store, with a plain-file area for build caches such as
+  `sccache`, backed by the same blob pool.
 
 The server is intended to run on a dedicated host or as a user service. Local virtkit use
 does not require it: `vk` uses the same `Store` implementation directly for its default
@@ -19,8 +21,8 @@ scope.
 ## Architecture
 
 The `vk-registry` crate contains both the reusable store library and the server binary.
-The library provides the store, OCI routes, pull-through relay, build lock service, and
-authentication. In accounts mode it also provides OIDC login, browser, upload, and local
+The library provides the store, OCI routes, pull-through relay, build lock service, WebDAV
+view, and authentication. In accounts mode it also provides OIDC login, browser, upload, and local
 administration surfaces.
 
 The binary provides `serve`, `status`, `gc`, `install-service`, `accounts`, and `update`.
@@ -42,10 +44,13 @@ Repository names and tags are metadata over that shared blob pool.
   repos/<name>/tags/<tag>       manifest digest referenced by the tag
   repos/<name>/manifests/<hex>  manifest media type and repository membership
   repos/<name>/blobs/<hex>      blob membership marker
-  uploads/<id>                  in-progress upload
+  uploads/<id>                  in-progress upload, or a WebDAV PUT being staged
   uploads/owners/<id>           repository that opened the upload
   accounts/accounts.db          account data, when accounts mode is enabled
 ```
+
+The plain-file area `/dav/files/` uses the same pool: each object is a tag on a raw-file
+manifest in a `files/` repository, with its bytes stored as a blob. See "WebDAV view".
 
 The `sha256` and `zstd` directories are two physical encodings of the same logical
 namespace. A digest always identifies the uncompressed bytes. Deduplication is therefore
@@ -388,6 +393,138 @@ The normal build-once sequence for content key `K` is:
 5. Build and push on a miss, or record the failure.
 6. Release the lease.
 
+## WebDAV view (`/dav/`)
+
+The whole store is reachable over WebDAV under one root, through the registry's existing
+listener, TLS and client auth, with the permission model the OCI API enforces. WebDAV is
+enabled by default. Set `webdav = false` to disable it: `/dav/` requests return 404 after
+authentication, and the server logs this setting at startup.
+
+The verb set is what opendal's `webdav` service issues — the client behind `sccache`, `oli`
+and other opendal-based tools: `PROPFIND` at `Depth` 0 and 1, `GET`, `HEAD`, `PUT`, `MKCOL`, `DELETE`
+and `OPTIONS`. `Depth: infinity` is refused with 403, as RFC 4918 allows, and a missing
+`Depth` is served as 0, what opendal means by omitting it, where RFC 4918 reads it as
+infinity. `COPY`, `MOVE`, `LOCK` and `PROPPATCH` are 405. No client XML is parsed: a `PROPFIND`
+body of up to 64 KiB is drained and ignored, `allprop` being both what the client sends and
+what an empty body means; a larger one is 413.
+
+```text
+/dav/                                 repos/  files/
+/dav/repos/<name>/                    tags/  manifests/  blobs/  (+ nested repositories)
+/dav/repos/<name>/tags/<tag>          the manifest the tag resolves to, with its media type
+/dav/repos/<name>/manifests/<hex>     that manifest
+/dav/repos/<name>/blobs/<hex>         the blob's canonical bytes; a stored zstd frame is decoded
+/dav/files/<dir>/<path…>              plain files: repositories and tags under files/, read-write
+```
+
+**`repos/` is a read-only view, not an export.** The disk tree is not what a client wants:
+a stored blob may be a zstd frame, a tag file holds a digest rather than a manifest, and the
+blob pool is readable per repository, not as one directory. So tags and manifests download
+as the manifest bytes with their media type and blobs as their canonical bytes, through the
+same handlers `/v2/` uses and under the same authorization — `Read` on the repository, and
+membership for anything addressed by digest. The tree is derived from the list of
+repositories the principal may read, never from a `read_dir` of `repos/`: a repository the
+principal cannot read is a 404, as `/browse` answers, and a scope such as `read:team-a/*`
+lists `team-a/` and nothing beside it. A `files/` directory appears there as the repository
+it is, under the same grant. Blobs download with `Content-Disposition: attachment`, as
+`files/` objects do. Every write verb there is 405: an OCI write verifies
+a digest, records membership and holds the store lock, and a DAV client cannot supply a
+manifest's media type. Those go through `/v2/`. A listing of `blobs/` carries each member's
+canonical length, which for a zstd-stored blob is one `open` and a frame-header read; a
+repository of chunked bundles lists thousands of members, so that listing is an
+interactive operation and never on a CI path.
+
+**`files/` is a directory tree over the pool.** A path's directories are a repository under
+`files/` and its leaf a tag on a single-layer raw-file manifest, the shape `/upload` writes:
+`/dav/files/sccache/a/b/abcdef` is the tag `abcdef` of the repository `files/sccache/a/b`,
+and its bytes are the layer blob. An object therefore dedups, compresses and is collected
+like any other content, and is reachable over `/v2/` and `/browse` under that name.
+
+Each resource authorizes as the repository it is or is a tag of, the name `/v2/` checks for
+the same content: `GET`, `HEAD` and `PROPFIND` are reads, `PUT`, `MKCOL` and `DELETE`
+writes. A `PUT` needs `Write` on its parent repository, a `MKCOL` on the one it creates, and
+the other verbs on whichever the path resolves to; a caller holding the action on neither the
+path's own name nor its parent's is 403 before anything is looked up. To reads and to
+`DELETE`, a directory or object the caller may not read is otherwise absent, from listings
+and when named. A write refused over a clash — a `PUT` onto a directory or a tag that is not
+a raw file, a `MKCOL` onto anything, either below a tag — answers 405 or 409 whether or not
+the caller may read the name it clashed with, and so reveals that the name exists. The key
+above
+authorizes as `files/sccache/a/b`, so a cache directory takes `write:files/sccache/*` or
+`read:files/sccache/*`, both covering `files/sccache` itself; an exact `files/sccache` covers
+only the objects directly in it. `OPTIONS` needs no grant. Nothing in the server knows what
+`sccache` is; it is a directory that a compiler cache happens to write to.
+
+Every component obeys the OCI name rules — `[A-Za-z0-9._-]`, at most 16 components counting
+`files`, `<dir>` and the leaf, none named `tags`, `manifests` or `blobs` — and anything else
+is 400. A tag whose manifest is not a raw file, an image pushed over `/v2/` into a `files/`
+repository, is absent to reads and a 409 to `PUT` and `DELETE`, so this view neither replaces
+nor removes it.
+
+| Verb on `files/` | Answer |
+|---|---|
+| `GET`, `HEAD` | 200 with the layer blob (`application/octet-stream`, `nosniff`, `Content-Disposition: attachment`, `Last-Modified` from the tag); a directory, a missing path, or an object's path with a trailing `/` is 404. A `GET` that serves the object refreshes the tag's mtime once it is an hour old — the use the gc's retention keys on — so `Last-Modified` and `getlastmodified` move forward on reads too; a `HEAD` refreshes nothing, neither the tag nor the layer blob |
+| `PUT` | streamed to `uploads/` and hashed on the way, then promoted into the pool and tied to the tag by a manifest under the shared store lock — 201 when the tag is new, 204 when it is replaced, the previous content left for the gc. Missing parent directories are created with it, where RFC 4918 answers 409. 413 past 4 GiB; 405 for directories, top-level names and paths ending in `/`; 409 below an object or onto a tag that is not a raw file |
+| `PROPFIND` | 207 for an object or a directory; at `Depth: 1` the nested directories and the objects follow it, each object with `getcontentlength` (the layer's canonical size) and `getlastmodified` (the tag's), which opendal requires; an object is listed, and answers, only when a `GET` would serve it; 404 when absent |
+| `MKCOL` | 201, creating an empty repository (a `tags/` with nothing in it) and its missing ancestors, a top-level directory included; 405 when the path is already a directory or a tag; 409 when a tag is above it; 415 with a request body, as RFC 4918 allows |
+| `DELETE` | 204 for an object (the tag goes; the bytes wait for the gc) or an empty directory; 403 for a directory with members — a tag, a nested directory, or any entry that is not the repository's layout; 409 for one holding fresh records other than its deleted objects' (see below) or for a tag that is not a raw file; 404 when absent or unreadable to the caller; 503 when the store lock stays taken (see below) |
+| `OPTIONS` | `DAV: 1` and the verbs that resource serves: the `files/` list below `/dav/files/`, the read-only one at `/dav/`, `/dav/files/` and throughout `/dav/repos/`; every other verb is 405 with the same list |
+
+Every refusal reads the request body through first, and so does every `DELETE`, up to the
+4 GiB object cap (past it, 413); only a declared `Content-Length` over the cap is refused at
+once. A status sent with
+request bytes still unread closes the socket with a reset, and `sccache` takes a reset on its startup probe as
+an unwritable store and runs the whole build read-only. A read-only key makes that probe
+fail with 403, which the client reports as read-only mode: an untrusted pipeline consumes
+the cache without writing to it. Since a writer with `Write` on a directory owns its
+content, give write access only to trusted pipelines (protected branches), hand everything
+else a read-only key, and use one directory per trust level when that is not enough.
+
+A directory's `DELETE` removes only leftovers: what a deleted object leaves behind — its
+raw-file manifest's sidecar and the membership markers of its layer and of the shared empty
+config — and any other record older than the default gc grace window of one day. A fresh
+sidecar of any other manifest may be pulled by digest, and the gc roots it while its blob is
+that fresh; a fresh marker no raw-file sidecar there accounts for may be a `/v2/` push that
+has uploaded its blobs and not yet its manifest. Either keeps the directory, with a 409, until
+it ages past the window, so a marker whose layer lives on in another repository after the gc
+swept the manifest does not keep it forever. The removal holds the store lock exclusive,
+lists every directory strictly, and unlinks only the entries it saw before a `remove_dir` of
+each directory. The lock is tried rather than waited for, with backoff, releasing the
+namespace lock below between attempts so the other `files/` writes proceed; after 30 s of
+shared holders or a running gc, the answer is 503.
+
+`PUT`, `MKCOL` and `DELETE` under `files/` hold one process-local lock across their checks
+and namespace changes. `PUT` rechecks its path after staging, so `MKCOL` and `PUT` of one
+path cannot both succeed. `/v2/` pushes into `files/` do not take this lock. Listings,
+`MKCOL` and `DELETE` run on the blocking pool. A `Depth: 1` listing uses memory proportional
+to the collection's members.
+
+Paths are split on raw `/` before each component is percent-decoded on its own — `%XX`
+escapes only, `+` being itself, and the result UTF-8 — so `%2F` cannot smuggle a separator;
+`.`, `..`, empty, over-long (255 bytes) and control-byte components, malformed escapes,
+invalid UTF-8, and more than 18 components below the area — a 16-component repository name
+and `blobs/<hex>` — are refused; under `files/` the 16-component name bound, `files`
+included, refuses a path first.
+Hrefs in a 207 are rebuilt from the decoded
+components, percent-encoded, with a trailing slash on a collection. `/dav/` is not a human
+path, so an unauthenticated client gets the 401 challenge rather than a login redirect.
+
+**Enumeration** is the one disclosure a listing makes beyond what the caller named. A
+`Depth: 1` on `/dav/`, `/dav/repos/`, `/dav/files/` or a path component above repositories
+shows only what the principal may read, and on a server with no credential configured at
+all it is refused with 403, for the reason `/browse` does not exist in shared-secret mode:
+a catalog is not something anyone who can reach the port gets for free. `Depth: 0` there,
+which is what opendal's parent walk asks, always answers.
+
+### Lifecycle
+
+An object is a tag, so `gc` expires it as it expires every tag: dropped once idle past the
+retention window, its blobs swept once unreferenced and past the grace window, both windows
+store-wide. Idleness is the tag's mtime, which a `PUT` sets and a `GET` refreshes once it is an
+hour old, so a read-only pipeline's hits keep an entry alive as a writer's do. There is no
+per-directory policy and no size cap; a replaced or deleted object frees no disk until the
+next `gc`. A staging file a crashed `PUT` left in `uploads/` goes with the idle uploads.
+
 ## Accounts administration
 
 `vk-registry accounts` manages users, sessions, administrators, and API keys. The command
@@ -464,6 +601,9 @@ phase does not traverse child manifests. The pass aborts before deleting anythin
 indexes can be stored and mounted, but a store containing a live tagged index cannot be
 collected until the mark phase supports that graph.
 
+The `/dav/files/` objects are tags and blobs under `files/` and need no pass of their own:
+`gc` and `status` treat them as the repositories they are.
+
 ## Guest credential proxy
 
 With `vk run --registry-proxy` or `[registry] proxy_guests = true`, the host starts a
@@ -481,6 +621,21 @@ layers. The feature is opt-in and requires guest networking.
 - The lock manager and accounts database assume one server process. Multi-replica operation
   requires a distributed lock implementation and a replicated account store.
 - Pull-through cache eviction is retention-based; there is no size-capped LRU policy.
+- `files/` entries expire only through `gc`'s store-wide retention; there is no per-directory
+  policy and no size cap (see "Lifecycle").
+- Every `files/` directory is a repository. `sccache` shards keys as `a/b/c/<key>`, so one
+  cache directory grows to up to 4096 repositories and the path components above them, and
+  each entry costs about five files — the tag, the manifest sidecar, the layer's membership
+  marker and the pool's manifest and layer blobs, the last two shared with identical
+  entries. Everything that walks every repository name pays for those directories: a
+  membership miss on `/v2/` (`readable_through`), a `/dav/repos/` prefix lookup or listing,
+  `/browse`, `status` and `gc`.
+- The `files/` area trusts its writers: a stored compiler-cache entry is linked into every
+  project computing the same key, so write access belongs to trusted pipelines only (see
+  "WebDAV view").
+- The store directory must be writable only by trusted local users. Requests can follow
+  symlinks in parent directories under `repos/files/`; checks reject only a symlink at the
+  final path component. Preventing this requires descriptor-relative path resolution.
 - Chunk boundaries are client-defined. Clients using different chunkers share the blob pool
   but may not deduplicate the same artifact effectively.
 - Expired sessions are removed when presented, not by a periodic sweep.
