@@ -4,6 +4,30 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **DAX maps only the files worth mapping.** A share's window now serves regular files of
+  1M and more by default (`dax=inode`); smaller files read through the guest page cache as
+  without DAX, so a source tree no longer spends the window's overhead on files too small to
+  benefit. `vk run --dax`, `x-virtkit.dax` and `[executor.vm] dax` take `<size>:always` for
+  the previous behaviour and `<size>:inode=<min>` for another floor.
+
+### Changed
+
+- **Reading a large tree from a read-only share is faster.** A guest that reads many small
+  files — from an `:overlay` volume or the executor's host checkout — no longer pays a
+  per-file host cost that could dominate file-heavy jobs.
+
+### Fixed
+
+- **A stalled network transfer inside a guest now fails fast instead of hanging for the rest
+  of the job.** When the host was briefly overloaded a guest download could wedge and never
+  recover — a `cargo` fetch stuck at 0 bytes was the usual symptom. It now errors out
+  promptly and the application reconnects.
+- **`host_checkout` jobs no longer stall on the first git command inside the guest.** The
+  job's first `git status` or `git checkout` now runs at full speed instead of stalling once
+  per job.
+
 ## [0.68.0] - 2026-09-11
 
 ### Changed

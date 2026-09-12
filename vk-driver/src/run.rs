@@ -1769,7 +1769,7 @@ async fn build_and_boot(
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     // The DAX window each directory share gets: the guest maps the host page cache through
     // it instead of copying file data into its own, so a tree read twice is read once.
-    let dax = dax_window(marker_dax, args.dax, crate::vmm::libkrun_selected());
+    let dax = dax_share(marker_dax, args.dax, crate::vmm::libkrun_selected());
     // Host-side helpers killed by `teardown_run`: virtiofsd and socket forwarders.
     let mut aux_children: Vec<Child> = Vec::new();
     let mut virtiofs = String::new();
@@ -2011,6 +2011,12 @@ async fn build_and_boot(
     let dax_tags = dax_tags(&shares);
     if !dax_tags.is_empty() {
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS_DAX={dax_tags}"));
+    }
+    // The subset served `dax=inode`: the agent mounts those with a file-size floor rather
+    // than mapping every file.
+    let dax_inode_tags = dax_inode_tags(&shares);
+    if !dax_inode_tags.is_empty() {
+        cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS_DAX_INODE={dax_inode_tags}"));
     }
     if !overlay_tags.is_empty() {
         cmdline.push_str(&format!(
@@ -2579,22 +2585,23 @@ pub(crate) fn effective_dax(
     declared.or(fallback).unwrap_or(crate::vmm::DAX_DEFAULT)
 }
 
-/// DAX window per guest directory share, in bytes; `None` for no window.
+/// What each guest directory share is served with: its DAX window and file-size floor;
+/// `None` for no window.
 ///
 /// Only libkrun supports DAX; cloud-hypervisor serves shares the ordinary way. Warn once
 /// for an explicit window request so the unsupported setting is visible; defaults stay
 /// silent.
 /// Pass `libkrun` explicitly because tests cannot set the process-global backend selection.
-pub(crate) fn dax_window(
+pub(crate) fn dax_share(
     declared: Option<crate::vmm::Dax>,
     fallback: Option<crate::vmm::Dax>,
     libkrun: bool,
-) -> Option<u64> {
-    let window = effective_dax(declared, fallback).window();
+) -> Option<crate::vmm::DaxShare> {
+    let share = effective_dax(declared, fallback).share();
     if libkrun {
-        return window;
+        return share;
     }
-    if window.is_some() && declared.or(fallback).is_some() {
+    if share.is_some() && declared.or(fallback).is_some() {
         static SAID: std::sync::Once = std::sync::Once::new();
         SAID.call_once(|| {
             eprintln!(
@@ -2607,11 +2614,22 @@ pub(crate) fn dax_window(
 }
 
 /// The `VIRTKIT_VIRTIOFS_DAX` value for these shares: the tags that got a window, which is
-/// what tells the agent to mount them `dax=always`. Empty when none did.
+/// what tells the agent to mount them through it. Empty when none did.
 pub(crate) fn dax_tags(shares: &[crate::vmm::FsShare]) -> String {
     shares
         .iter()
         .filter(|s| s.dax.is_some())
+        .map(|s| s.tag.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The `VIRTKIT_VIRTIOFS_DAX_INODE` value: the subset of [`dax_tags`] whose window serves
+/// only files above a size floor, which the agent mounts `dax=inode` rather than `always`.
+pub(crate) fn dax_inode_tags(shares: &[crate::vmm::FsShare]) -> String {
+    shares
+        .iter()
+        .filter(|s| s.dax.is_some_and(|d| d.inode_min.is_some()))
         .map(|s| s.tag.as_str())
         .collect::<Vec<_>>()
         .join(",")
@@ -4927,39 +4945,40 @@ mod tests {
 
         // The agent is told the tags that actually got a window, and nothing else — a
         // share mounted `dax=always` without one would fall back on every boot.
-        let share = |tag: &str, dax| crate::vmm::FsShare {
+        let share = |tag: &str, dax: Option<Dax>| crate::vmm::FsShare {
             tag: tag.into(),
             socket: PathBuf::new(),
             host_dir: PathBuf::new(),
             read_only: false,
-            dax,
+            dax: dax.and_then(Dax::share),
             uid_map: Vec::new(),
             gid_map: Vec::new(),
         };
-        assert_eq!(
-            dax_tags(&[
-                share("work", Some(8 << 30)),
-                share("atop", None),
-                share("vol1", Some(8 << 30)),
-            ]),
-            "work,vol1"
-        );
+        let shares = [
+            share("work", Some(crate::vmm::DAX_DEFAULT)),
+            share("atop", None),
+            share("vol1", Some(Dax::Window(8 << 30))),
+        ];
+        assert_eq!(dax_tags(&shares), "work,vol1");
+        // Only the size-floored window is mounted `dax=inode`.
+        assert_eq!(dax_inode_tags(&shares), "work");
         assert_eq!(dax_tags(&[share("atop", None)]), "");
         assert_eq!(dax_tags(&[]), "");
+        assert_eq!(
+            dax_inode_tags(&[share("vol1", Some(Dax::Window(1 << 30)))]),
+            ""
+        );
 
         // The window exists only under the built-in VMM; cloud-hypervisor's virtio-fs has
         // no DAX path, so every share there is served the ordinary way whatever was asked.
+        assert_eq!(dax_share(None, None, true), crate::vmm::DAX_DEFAULT.share());
+        assert_eq!(dax_share(Some(Dax::Off), None, true), None);
         assert_eq!(
-            dax_window(None, None, true),
-            crate::vmm::DAX_DEFAULT.window()
-        );
-        assert_eq!(dax_window(Some(Dax::Off), None, true), None);
-        assert_eq!(
-            dax_window(Some(Dax::Window(1 << 30)), None, true),
+            dax_share(Some(Dax::Window(1 << 30)), None, true).map(|d| d.window),
             Some(1 << 30)
         );
-        assert_eq!(dax_window(None, None, false), None);
-        assert_eq!(dax_window(Some(Dax::Window(1 << 30)), None, false), None);
+        assert_eq!(dax_share(None, None, false), None);
+        assert_eq!(dax_share(Some(Dax::Window(1 << 30)), None, false), None);
     }
 
     #[test]

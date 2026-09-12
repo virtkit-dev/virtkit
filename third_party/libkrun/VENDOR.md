@@ -261,3 +261,22 @@ same page-cache mapping, and mmap still enforces that a writable mapping needs a
 The reopen fallback stays for a mapping whose inode has no open fd (a read after close). The
 lookup keys on the inode and access mode, not on the guest's handle, which is absent for DAX.
 Covered by the `setupmapping_*` tests. Search for `The guest passes fh = u64::MAX`.
+
+`src/devices/src/virtio/fs/read_only.rs` + `src/devices/src/virtio/fs/linux/passthrough.rs` —
+REMOVEMAPPING on a read-only share keeps the DAX mapping in place (bounds still checked):
+tearing a range down was one mmap over the window plus a KVM invalidation, and a guest reading
+a source tree reclaims a range for nearly every file once its window is full — 30k files cost
+57k host mmaps, 47% of them removals. The next SETUPMAPPING replaces a kept mapping with
+MAP_FIXED, and a read-only share cannot be written through it. The read-write path merges the
+adjacent ranges of a batch into one mmap (`merge_mappings`). Covered by
+`removemapping_keeps_the_mapping_but_checks_bounds` and
+`removemapping_batches_merge_adjacent_ranges`.
+
+`src/libkrun/src/lib.rs` + `src/vmm/src/vmm_config/fs.rs` + `src/devices/src/virtio/fs/`
+(`device.rs`, `fuse.rs`, `linux/passthrough.rs`) — per-inode DAX by file size.
+`krun_add_virtiofs5(…, dax_inode_min)` (`krun_add_virtiofs4` delegates with 0) carries a size
+floor to the passthrough filesystem, which then answers INIT with `HAS_INODE_DAX` when the
+guest offers it (a `dax=inode` mount) and sets `ATTR_DAX` on the entries of regular files at or
+above the floor, so only those are mapped through the window. Every DAX mapping costs a host
+mmap and a guest EPT invalidation per 2 MiB range whatever the file's size; a source tree's
+small files never repay it. Covered by `lookup_marks_large_regular_files_for_dax`.

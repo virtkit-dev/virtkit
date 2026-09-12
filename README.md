@@ -283,9 +283,13 @@ in per-fault latency.
 
 The window reserves address space, not memory, and costs nothing until mapped. It defaults
 to 8G per share; `vk run --dax`, a service's `x-virtkit.dax` and the executor's `[executor.vm] dax`
-resize it or turn it `off`. Each guest supports 64G of windows — eight at the default size,
-with further shares served without DAX. Guests with more than 63.25G of RAM have no room
-for windows and receive none. DAX requires the built-in VMM. Under
+resize it or turn it `off`. Each mapping costs the host an mmap and the guest an EPT
+invalidation per 2 MiB range whatever the file's size, so by default only regular files of
+1M and more go through the window (`dax=inode`; the host marks them) and smaller files read
+through the guest's page cache as without DAX; `<size>:always` maps every file, and
+`<size>:inode=<min>` moves the floor. Each guest supports 64G of windows — eight at the
+default size, with further shares served without DAX. Guests with more than 63.25G of RAM
+have no room for windows and receive none. DAX requires the built-in VMM. Under
 `VIRTKIT_VMM=cloud-hypervisor`, and for single-file binds and `vk build` stage guests,
 shares are served the ordinary way.
 

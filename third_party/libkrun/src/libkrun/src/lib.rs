@@ -644,6 +644,7 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
                 uid_map: Vec::new(),
                 gid_map: Vec::new(),
                 negative_timeout_ms: 0,
+                dax_inode_min: None,
                 virtual_entries: {
                     #[allow(unused_mut)]
                     let mut v = Vec::new();
@@ -721,6 +722,27 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
     c_uid_map: *const c_char,
     c_gid_map: *const c_char,
 ) -> i32 {
+    krun_add_virtiofs5(
+        ctx_id, c_tag, c_path, shm_size, read_only, c_uid_map, c_gid_map, 0,
+    )
+}
+
+/// `krun_add_virtiofs4` plus per-inode DAX: `dax_inode_min` > 0 marks regular files of at
+/// least that many bytes for DAX (`ATTR_DAX` on their entries, `HAS_INODE_DAX` at INIT), for
+/// a guest that mounts the share `dax=inode`; 0 leaves DAX to the mount option.
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub unsafe extern "C" fn krun_add_virtiofs5(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    shm_size: u64,
+    read_only: bool,
+    c_uid_map: *const c_char,
+    c_gid_map: *const c_char,
+    dax_inode_min: u64,
+) -> i32 {
     if c_tag.is_null() {
         return -libc::EINVAL;
     }
@@ -788,6 +810,7 @@ pub unsafe extern "C" fn krun_add_virtiofs4(
                 gid_map,
                 virtual_entries,
                 negative_timeout_ms: 0,
+                dax_inode_min: (dax_inode_min > 0).then_some(dax_inode_min),
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -2537,6 +2560,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                 gid_map: Vec::new(),
                 virtual_entries,
                 negative_timeout_ms: 0,
+                dax_inode_min: None,
             });
 
             ctx_cfg.set_block_root(device, fstype, options);

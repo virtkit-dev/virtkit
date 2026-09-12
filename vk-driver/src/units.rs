@@ -527,7 +527,7 @@ pub fn boot_unit(
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     // The DAX window each of this service's shares gets (its own `x-virtkit.dax`, else the
     // run-wide default already folded in before provisioning).
-    let dax = crate::run::dax_window(svc.dax, None, crate::vmm::libkrun_selected());
+    let dax = crate::run::dax_share(svc.dax, None, crate::vmm::libkrun_selected());
     let mut virtiofs = String::new();
     // Tags the agent should mount behind a tmpfs-backed overlay (`host:guest:overlay`),
     // exactly as the primary's own `-v`/compose volumes do in `run::build_and_boot` — a
@@ -705,6 +705,12 @@ pub fn boot_unit(
         let dax_tags = crate::run::dax_tags(&shares);
         if !dax_tags.is_empty() {
             cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS_DAX={dax_tags}"));
+        }
+        // The subset served `dax=inode`: the agent mounts those with a file-size floor rather
+        // than mapping every file.
+        let dax_inode_tags = crate::run::dax_inode_tags(&shares);
+        if !dax_inode_tags.is_empty() {
+            cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS_DAX_INODE={dax_inode_tags}"));
         }
         // Idle page-cache trimming: a service that idles between requests gives the file
         // cache it piled up back to the host, not just the pages its processes freed. A

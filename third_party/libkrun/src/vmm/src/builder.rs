@@ -2010,6 +2010,7 @@ fn attach_fs_devices(
                 config.gid_map.clone(),
                 config.virtual_entries.clone(),
                 config.negative_timeout_ms,
+                config.dax_inode_min,
             )
             .unwrap(),
         ));
