@@ -32,7 +32,7 @@ use anyhow::{Context, Result, bail};
 // >= 0 on success, a negative errno on failure.
 use krun::{
     KRUN_EXIT_GUEST_RESET, krun_add_disk2, krun_add_net_tap, krun_add_net_unixstream,
-    krun_add_virtiofs4, krun_add_vsock_port2, krun_create_ctx, krun_disable_balloon,
+    krun_add_virtiofs5, krun_add_vsock_port2, krun_create_ctx, krun_disable_balloon,
     krun_disable_implicit_init, krun_get_shutdown_eventfd, krun_init_log,
     krun_set_block_dirty_socket, krun_set_console_output, krun_set_kernel, krun_set_nested_virt,
     krun_set_pmu, krun_set_vm_config, krun_start_enter,
@@ -234,17 +234,20 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         for share in &spec.shares {
             let tag = cstr(&share.tag);
             let dir = cstr(&share.host_dir.to_string_lossy());
-            // The id-map rules for this share, joined by ',' as krun_add_virtiofs4 expects;
+            // The id-map rules for this share, joined by ',' as krun_add_virtiofs5 expects;
             // an empty map yields an empty string, which the FFI treats as an identity map.
             let uid_map = cstr(&share.uid_map.join(","));
             let gid_map = cstr(&share.gid_map.join(","));
             // shm_size is the share's DAX window, guest address space reserved above RAM
             // (0 = none). `vmm::apply_dax_budget` has already dropped the windows that do
-            // not fit the guest's span, so whatever is here is placeable.
-            let shm_size = share.dax.unwrap_or(0);
+            // not fit the guest's span, so whatever is here is placeable. dax_inode_min is
+            // the smallest regular file the server marks for DAX (0 = every file): the
+            // guest mounts such a share `dax=inode` and maps only the files so marked.
+            let shm_size = share.dax.map_or(0, |d| d.window);
+            let dax_inode_min = share.dax.and_then(|d| d.inode_min).unwrap_or(0);
             ck(
-                "krun_add_virtiofs4",
-                krun_add_virtiofs4(
+                "krun_add_virtiofs5",
+                krun_add_virtiofs5(
                     ctx,
                     tag.as_ptr(),
                     dir.as_ptr(),
@@ -252,6 +255,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
                     share.read_only,
                     uid_map.as_ptr(),
                     gid_map.as_ptr(),
+                    dax_inode_min,
                 ),
             )?;
         }

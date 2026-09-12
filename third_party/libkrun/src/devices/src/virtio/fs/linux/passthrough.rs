@@ -391,6 +391,11 @@ pub struct Config {
     pub export_fsid: u64,
     /// Table of exported FDs to share with other subsystems.
     pub export_table: Option<ExportTable>,
+
+    /// Per-inode DAX: `Some(bytes)` marks regular files at least this large for DAX
+    /// (`ATTR_DAX` on their entries, `HAS_INODE_DAX` at INIT) so a guest mounted
+    /// `dax=inode` maps only those; `None` leaves DAX to the mount option alone.
+    pub dax_inode_min: Option<u64>,
 }
 
 impl Default for Config {
@@ -406,6 +411,7 @@ impl Default for Config {
             proc_sfd_rawfd: None,
             export_fsid: 0,
             export_table: None,
+            dax_inode_min: None,
         }
     }
 }
@@ -877,6 +883,27 @@ fn forget_one(
     }
 }
 
+/// Coalesce the `(moffset, len)` window ranges of a REMOVEMAPPING batch: sorted by offset,
+/// touching or overlapping ranges merged, so each run costs one mmap. Zero-length ranges drop
+/// out. Callers bounds-check `moffset + len` against the window first; the `saturating_add`
+/// only keeps an unchecked caller from overflowing.
+pub(crate) fn merge_mappings(requests: &[fuse::RemovemappingOne]) -> Vec<(u64, u64)> {
+    let mut ranges: Vec<(u64, u64)> = requests
+        .iter()
+        .filter(|r| r.len > 0)
+        .map(|r| (r.moffset, r.moffset.saturating_add(r.len)))
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, last_end)) if start <= *last_end => *last_end = (*last_end).max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged.into_iter().map(|(s, e)| (s, e - s)).collect()
+}
+
 impl FileSystem for PassthroughFs {
     type Inode = Inode;
     type Handle = Handle;
@@ -933,6 +960,12 @@ impl FileSystem for PassthroughFs {
             self.writeback.store(true, Ordering::Relaxed);
         }
 
+        // The guest offers HAS_INODE_DAX when mounted `dax=inode`; taking it is what makes it
+        // honour ATTR_DAX on the entries below. Without a floor configured, decline it and the
+        // mount option alone decides (`always` maps every file, `inode` none).
+        if self.cfg.dax_inode_min.is_some() && capable.contains(FsOptions::HAS_INODE_DAX) {
+            opts |= FsOptions::HAS_INODE_DAX;
+        }
         if capable.contains(FsOptions::SUBMOUNTS) {
             opts |= FsOptions::SUBMOUNTS;
             self.announce_submounts.store(true, Ordering::Relaxed);
@@ -1017,6 +1050,17 @@ impl FileSystem for PassthroughFs {
             && (st.st_dev != p.dev || mnt_id != p.mnt_id)
         {
             attr_flags |= fuse::ATTR_SUBMOUNT;
+        }
+        // Per-inode DAX by size: mapping a 2 MiB range costs the same for a 2 KiB file as for
+        // a large one, and only the large one repays it. The kernel decides DAX for an inode
+        // from the entry that instantiates it, and every entry-creating path (lookup,
+        // readdirplus, create) comes through here.
+        if let Some(min) = self.cfg.dax_inode_min {
+            if st.st_mode & libc::S_IFMT == libc::S_IFREG
+                && u64::try_from(st.st_size).is_ok_and(|size| size >= min)
+            {
+                attr_flags |= fuse::ATTR_DAX;
+            }
         }
 
         let altkey = InodeAltKey {
@@ -2191,16 +2235,25 @@ impl FileSystem for PassthroughFs {
         host_shm_base: u64,
         shm_size: u64,
     ) -> io::Result<()> {
-        for req in requests {
-            let addr = host_shm_base + req.moffset;
-            if (req.moffset + req.len) > shm_size {
+        for req in &requests {
+            if req
+                .moffset
+                .checked_add(req.len)
+                .is_none_or(|end| end > shm_size)
+            {
                 return Err(einval());
             }
-            debug!("removemapping: addr={:x} len={:?}", addr, req.len);
+        }
+        // The guest reclaims DAX ranges in batches; each range torn down is one mmap over
+        // the window and one KVM invalidation of that guest-physical span. Adjacent ranges
+        // in a batch are torn down with a single call.
+        for (moffset, len) in merge_mappings(&requests) {
+            let addr = host_shm_base + moffset;
+            debug!("removemapping: addr={addr:x} len={len}");
             let ret = unsafe {
                 libc::mmap(
                     addr as *mut libc::c_void,
-                    req.len as usize,
+                    len as usize,
                     libc::PROT_NONE,
                     libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
                     -1,
@@ -2530,5 +2583,86 @@ mod tests {
 
         unsafe { libc::munmap(base, page) };
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Touching and overlapping window ranges of one REMOVEMAPPING batch collapse into single
+    /// runs, in offset order; zero-length entries drop out.
+    #[test]
+    fn removemapping_batches_merge_adjacent_ranges() {
+        let r = |moffset, len| fuse::RemovemappingOne { moffset, len };
+        let two_mib = 2u64 << 20;
+        let merged = merge_mappings(&[
+            r(4 * two_mib, two_mib),
+            r(0, two_mib),
+            r(two_mib, two_mib),
+            r(9 * two_mib, 0),
+            r(4 * two_mib + 4096, two_mib),
+        ]);
+        assert_eq!(
+            merged,
+            vec![(0, 2 * two_mib), (4 * two_mib, two_mib + 4096)]
+        );
+        assert!(merge_mappings(&[]).is_empty());
+    }
+
+    /// With a size floor, lookup marks the regular files at or above it for DAX and nothing
+    /// else, and INIT takes HAS_INODE_DAX only from a guest that offers it.
+    #[test]
+    fn lookup_marks_large_regular_files_for_dax() {
+        let root_dir = tmp_root();
+        let root = std::path::Path::new(&root_dir);
+        std::fs::write(root.join("small"), vec![0u8; 4095]).unwrap();
+        std::fs::write(root.join("exact"), vec![0u8; 4096]).unwrap();
+        std::fs::write(root.join("large"), vec![0u8; 65536]).unwrap();
+        std::fs::create_dir(root.join("dir")).unwrap();
+        let with_floor = |floor: Option<u64>| {
+            PassthroughFs::new(
+                Config {
+                    root_dir: root_dir.clone(),
+                    dax_inode_min: floor,
+                    ..Default::default()
+                },
+                Arc::new(InodeAllocator::new()),
+            )
+            .unwrap()
+        };
+        let fs = with_floor(Some(4096));
+        let taken = fs
+            .init(FsOptions::HAS_INODE_DAX | FsOptions::SUBMOUNTS)
+            .unwrap();
+        assert!(taken.contains(FsOptions::HAS_INODE_DAX));
+        let flags = |name: &CStr| fs.lookup(ctx(), fuse::ROOT_ID, name).unwrap().attr_flags;
+        assert_eq!(flags(c"small") & fuse::ATTR_DAX, 0, "under the floor");
+        assert_eq!(
+            flags(c"exact") & fuse::ATTR_DAX,
+            fuse::ATTR_DAX,
+            "at the floor"
+        );
+        assert_eq!(flags(c"large") & fuse::ATTR_DAX, fuse::ATTR_DAX);
+        assert_eq!(
+            flags(c"dir") & fuse::ATTR_DAX,
+            0,
+            "directories are never DAX"
+        );
+        // A guest mounted `dax=always` offers no HAS_INODE_DAX; the server must not claim it.
+        let fs2 = with_floor(Some(4096));
+        assert!(!fs2
+            .init(FsOptions::SUBMOUNTS)
+            .unwrap()
+            .contains(FsOptions::HAS_INODE_DAX));
+        // Without a floor the flag is neither taken nor set, whatever the guest offers.
+        let fs3 = with_floor(None);
+        assert!(!fs3
+            .init(FsOptions::HAS_INODE_DAX)
+            .unwrap()
+            .contains(FsOptions::HAS_INODE_DAX));
+        assert_eq!(
+            fs3.lookup(ctx(), fuse::ROOT_ID, c"large")
+                .unwrap()
+                .attr_flags
+                & fuse::ATTR_DAX,
+            0
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 }

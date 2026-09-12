@@ -4,6 +4,30 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **DAX maps only the files worth mapping.** A share's window now serves regular files of
+  1M and more by default (`dax=inode`); smaller files read through the guest page cache as
+  without DAX, so a source tree no longer spends the window's overhead on files too small to
+  benefit. `vk run --dax`, `x-virtkit.dax` and `[executor.vm] dax` take `<size>:always` for
+  the previous behaviour and `<size>:inode=<min>` for another floor.
+
+### Changed
+
+- **Reading a large tree from a read-only share is faster.** A guest that reads many small
+  files — from an `:overlay` volume or the executor's host checkout — no longer pays a
+  per-file host cost that could dominate file-heavy jobs.
+
+### Fixed
+
+- **A stalled network transfer inside a guest now fails fast instead of hanging for the rest
+  of the job.** When the host was briefly overloaded a guest download could wedge and never
+  recover — a `cargo` fetch stuck at 0 bytes was the usual symptom. It now errors out
+  promptly and the application reconnects.
+- **`host_checkout` jobs no longer stall on the first git command inside the guest.** The
+  job's first `git status` or `git checkout` now runs at full speed instead of stalling once
+  per job.
+
 ## [0.68.0] - 2026-09-11
 
 ### Changed
@@ -70,6 +94,22 @@ All notable changes to virtkit will be documented in this file.
   settings, caches — and forgets the reconciliation, then opens the editor as usual;
   Remote-SSH installs the server again and `[dev.editor.vscode]` is applied afresh. The
   environment keeps running. `vk dev editor reset` does the same without opening an editor.
+- **`vk-registry` serves its store over WebDAV under `/dav/`.** `/dav/repos/` is a
+  read-only view of every repository the credential may read — tags and manifests download
+  as manifests, blobs as their bytes — and `/dav/files/` is a plain-file area any WebDAV
+  client can write to, scoped per top-level directory (`write:files/sccache`). Point
+  `SCCACHE_WEBDAV_ENDPOINT` at `https://<registry>/dav/files/<dir>` and every runner's jobs
+  share one cache of compiled units over the registry's existing TLS and credentials; a
+  read-only credential gives a pipeline the hits without letting it write. WebDAV is enabled
+  by default; set `webdav = false` in the server config to disable it.
+- **`vk-registry files policy` bounds a `/dav/files/` directory.** `vk-registry files policy
+  sccache --ttl-days 30 --max-bytes 200G` makes the server drop objects nobody has read or
+  written for thirty days and, past 200 GiB, the least recently used until it fits; `--clear`
+  makes the directory an ordinary directory again. A directory without a policy is never
+  swept — the server names those in its log, and `status` lists every directory with its
+  policy. The policy is a file in the store, so a running server applies a change within
+  five minutes without a restart, and `vk-registry gc` applies it at once. Staging files a
+  crashed upload left behind are removed after a day regardless.
 
 ### Changed
 

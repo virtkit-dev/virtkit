@@ -530,6 +530,9 @@ pub const FUSE_COMPAT_22_INIT_OUT_SIZE: u32 = 24;
 
 /// Object is a submount root
 pub const ATTR_SUBMOUNT: u32 = 1;
+/// Enable DAX for this file in per-inode DAX mode (the guest mounted `dax=inode` and the
+/// server answered INIT with `HAS_INODE_DAX`).
+pub const ATTR_DAX: u32 = 2;
 
 /// Kill suid and sgid if executable
 pub const OPEN_KILL_SUIDGID: u32 = 1;

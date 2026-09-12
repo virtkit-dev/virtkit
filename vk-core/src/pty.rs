@@ -187,7 +187,7 @@ impl Drop for RawModeGuard {
 #[cfg(test)]
 mod tests {
     use super::openpty;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, RawFd};
     use std::process::Stdio;
     use tokio::io::AsyncReadExt;
 
@@ -207,10 +207,14 @@ mod tests {
     #[tokio::test]
     async fn no_child_inherits_the_master() {
         let (mut master, slave) = openpty(24, 80).unwrap();
+        // Check this master's fd: the child may inherit unrelated PTY masters (in vscode terminal for example).
+        let master_fd = master.as_raw_fd();
+        // List each child fd as `<fd> <target>`.
+        const LIST_FDS: &str =
+            r#"for f in /proc/self/fd/*; do echo "${f##*/} $(readlink "$f" 2>/dev/null)"; done"#;
         let mut cmd = tokio::process::Command::new("sh");
-        // The child's own fds: its stdio is the slave, and a master would show as ptmx.
         cmd.arg("-c")
-            .arg("ls -l /proc/self/fd")
+            .arg(LIST_FDS)
             .stdin(Stdio::from(slave.try_clone().unwrap()))
             .stdout(Stdio::from(slave.try_clone().unwrap()))
             .stderr(Stdio::from(slave));
@@ -230,7 +234,15 @@ mod tests {
         .unwrap();
         let out = String::from_utf8_lossy(&out);
         assert!(out.contains("/dev/pts/"), "no listing: {out}");
-        assert!(!out.contains("ptmx"), "the master reached the child: {out}");
+        let leaked = out.lines().any(|line| {
+            let mut words = line.split_whitespace();
+            let fd = words.next().and_then(|fd| fd.parse::<RawFd>().ok());
+            fd == Some(master_fd) && words.next() == Some("/dev/ptmx")
+        });
+        assert!(
+            !leaked,
+            "the master (fd {master_fd}) reached the child: {out}"
+        );
     }
 
     #[tokio::test]

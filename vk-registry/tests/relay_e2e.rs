@@ -94,6 +94,7 @@ async fn relay_caches_digest_not_tag() {
         locks: LockManager::new(),
         auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     });
     let up_url = spawn(up_state);
 
@@ -112,6 +113,7 @@ async fn relay_caches_digest_not_tag() {
         locks: LockManager::new(),
         auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     });
     let mirror_url = spawn(mirror_state);
     let http = reqwest::Client::new();
@@ -183,6 +185,7 @@ async fn multi_lock_is_atomic_all_or_nothing() {
         locks: LockManager::new(),
         auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     });
     let url = spawn(state);
     let c = LockClient::new(url, vk_registry::ClientAuth::None, reqwest::Client::new());
@@ -256,6 +259,7 @@ async fn lock_client_authenticates_with_basic() {
             pass: "p".into(),
         }),
         tls: None,
+        webdav: true,
     });
     let url = spawn(state);
     let ttl = Duration::from_secs(30);
@@ -297,6 +301,7 @@ async fn lock_client_authenticates_with_bearer() {
             token: "s3cret".into(),
         }),
         tls: None,
+        webdav: true,
     });
     let url = spawn(state);
     let ttl = Duration::from_secs(30);
@@ -334,6 +339,7 @@ async fn lock_client_round_trips_against_the_server() {
         locks: LockManager::new(),
         auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     });
     let url = spawn(state);
     let c = LockClient::new(url, vk_registry::ClientAuth::None, reqwest::Client::new());
@@ -400,6 +406,7 @@ async fn bearer_auth_gates_everything_including_the_probe() {
             token: "s3cret".to_string(),
         }),
         tls: None,
+        webdav: true,
     });
     let url = spawn(state);
     let http = reqwest::Client::new();
@@ -482,6 +489,7 @@ async fn basic_auth_gates_and_challenges() {
             pass: "p".to_string(),
         }),
         tls: None,
+        webdav: true,
     });
     let url = spawn(state);
     let http = reqwest::Client::new();
@@ -696,6 +704,7 @@ async fn relay_does_not_leak_upstream_credentials_to_the_client() {
         locks: LockManager::new(),
         auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     });
     let mirror_url = spawn(mirror_state);
     let http = reqwest::Client::new();
@@ -737,6 +746,7 @@ async fn lock_api_build_once_over_http() {
         locks: LockManager::new(),
         auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     });
     let url = spawn(state);
     let http = reqwest::Client::new();
@@ -1038,6 +1048,7 @@ async fn browse_belongs_to_accounts_mode_and_redirects_a_signed_out_browser() {
         locks: LockManager::new(),
         auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     });
     let open_url = spawn(open);
     let url = open_url.clone();
@@ -1242,6 +1253,7 @@ async fn a_relayed_manifests_content_type_is_held_to_a_manifest_type() {
         locks: LockManager::new(),
         auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     });
     let url = spawn(mirror);
     let http = reqwest::Client::new();
@@ -1328,6 +1340,7 @@ async fn a_blob_head_is_never_relayed() {
         locks: LockManager::new(),
         auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     }));
 
     let mirror_dir = tmp("head-mirror");
@@ -1344,6 +1357,7 @@ async fn a_blob_head_is_never_relayed() {
         locks: LockManager::new(),
         auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     }));
     let http = reqwest::Client::new();
     let hex = bdigest.trim_start_matches("sha256:");
@@ -1408,6 +1422,7 @@ async fn a_blob_head_agrees_with_the_get_for_a_compressed_blob() {
         locks: LockManager::new(),
         auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     }));
     let http = reqwest::Client::new();
 
@@ -1510,6 +1525,7 @@ async fn a_blob_larger_than_one_chunk_streams_back_intact() {
         locks: LockManager::new(),
         auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
         tls: None,
+        webdav: true,
     }));
 
     // This client is built without any compression feature, so it sends no

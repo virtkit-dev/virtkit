@@ -283,9 +283,13 @@ in per-fault latency.
 
 The window reserves address space, not memory, and costs nothing until mapped. It defaults
 to 8G per share; `vk run --dax`, a service's `x-virtkit.dax` and the executor's `[executor.vm] dax`
-resize it or turn it `off`. Each guest supports 64G of windows — eight at the default size,
-with further shares served without DAX. Guests with more than 63.25G of RAM have no room
-for windows and receive none. DAX requires the built-in VMM. Under
+resize it or turn it `off`. Each mapping costs the host an mmap and the guest an EPT
+invalidation per 2 MiB range whatever the file's size, so by default only regular files of
+1M and more go through the window (`dax=inode`; the host marks them) and smaller files read
+through the guest's page cache as without DAX; `<size>:always` maps every file, and
+`<size>:inode=<min>` moves the floor. Each guest supports 64G of windows — eight at the
+default size, with further shares served without DAX. Guests with more than 63.25G of RAM
+have no room for windows and receive none. DAX requires the built-in VMM. Under
 `VIRTKIT_VMM=cloud-hypervisor`, and for single-file binds and `vk build` stage guests,
 shares are served the ordinary way.
 
@@ -588,9 +592,16 @@ boundaries and interpretation.
 ### Caching and registries
 
 Local image conversion and build caches require no server. `vk-registry` is optional and
-is useful when several runners need a shared OCI store, pull-through cache, or build-once
-coordination. Its lease and heartbeat protocol prevents runners from independently
-building the same content while a healthy peer is already doing so.
+is useful when several runners need a shared OCI store, pull-through cache, build-once
+coordination, or a shared compiler cache. The whole store is also served over WebDAV under
+`/dav/`, behind the same TLS and credentials as the rest of the server: `/dav/repos/` is a
+read-only view of every repository's tags, manifests and blobs, and `/dav/files/` is a
+plain-file area where an `sccache` pointed at `/dav/files/<dir>` lets jobs in throwaway
+microVMs reuse each other's compiled units; `vk-registry files policy <dir> --ttl-days 30
+--max-bytes 200G` bounds such a directory, and the running server applies the change within
+minutes. Set `webdav = false` in the server config to disable WebDAV. Its lease and
+heartbeat protocol prevents runners from independently building the same content while
+a healthy peer is already doing so.
 
 Use `vk registry push|pull|inspect` for guest bundles and `vk registry status|gc` for a
 local store. The central server and storage model are documented in
@@ -602,7 +613,7 @@ local store. The central server and storage model are documented in
 | --- | --- |
 | `vk` | Host CLI, VMM, image builder, userspace network, compose runner, and GitLab executor. It embeds the default guest kernel and `vk-agent`. |
 | `vk-agent` | Guest PID 1 and command server. It configures mounts, networking, hostname, shared directories, optional SSH, and host-driven execution over vsock. |
-| `vk-registry` | Optional OCI-distribution server with a pull-through cache, shared build cache, and build-once locking. |
+| `vk-registry` | Optional OCI-distribution server with a pull-through cache, a WebDAV view of the store with a plain-file area for compiler caches, and build-once locking. |
 | `vk-runnerctl` | Optional root-side helper that adjusts GitLab runner concurrency within an administrator-configured range. |
 
 ## Architecture
