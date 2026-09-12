@@ -402,9 +402,12 @@ The normal build-once sequence for content key `K` is:
 ## WebDAV view (`/dav/`)
 
 The whole store is reachable over WebDAV under one root, through the registry's existing
-listener, TLS and client auth, with the permission model the OCI API enforces. The verb set
-is what opendal's `webdav` service issues — the client behind `sccache`, `oli` and other
-opendal-based tools: `PROPFIND` at `Depth` 0 and 1, `GET`, `HEAD`, `PUT`, `MKCOL`, `DELETE`
+listener, TLS and client auth, with the permission model the OCI API enforces. WebDAV is
+enabled by default. Set `webdav = false` to disable it: `/dav/` requests return 404 after
+authentication, and the server logs this setting at startup. File eviction continues.
+
+The verb set is what opendal's `webdav` service issues — the client behind `sccache`, `oli`
+and other opendal-based tools: `PROPFIND` at `Depth` 0 and 1, `GET`, `HEAD`, `PUT`, `MKCOL`, `DELETE`
 and `OPTIONS`. `Depth: infinity` is refused with 403, as RFC 4918 allows; `COPY`, `MOVE`,
 `LOCK` and `PROPPATCH` are 405. No client XML is parsed: a `PROPFIND` body is drained and
 ignored, `allprop` being both what the client sends and what an empty body means.

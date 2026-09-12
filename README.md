@@ -599,9 +599,9 @@ read-only view of every repository's tags, manifests and blobs, and `/dav/files/
 plain-file area where an `sccache` pointed at `/dav/files/<dir>` lets jobs in throwaway
 microVMs reuse each other's compiled units; `vk-registry files policy <dir> --ttl-days 30
 --max-bytes 200G` bounds such a directory, and the running server applies the change within
-minutes. Its lease and heartbeat protocol prevents
-runners from independently building the same content while a healthy peer is already
-doing so.
+minutes. Set `webdav = false` in the server config to disable WebDAV. Its lease and
+heartbeat protocol prevents runners from independently building the same content while
+a healthy peer is already doing so.
 
 Use `vk registry push|pull|inspect` for guest bundles and `vk registry status|gc` for a
 local store. The central server and storage model are documented in

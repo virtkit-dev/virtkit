@@ -90,6 +90,8 @@ pub struct ServerState {
     pub locks: lock::LockManager,
     pub auth: Authenticator,
     pub tls: Option<tokio_rustls::TlsAcceptor>,
+    /// Enable WebDAV routes.
+    pub webdav: bool,
 }
 
 impl ServerState {
@@ -1768,6 +1770,9 @@ pub async fn serve_on(listener: TcpListener, state: Arc<ServerState>) -> Result<
             )
         );
     }
+    if !state.webdav {
+        eprintln!("vk-registry: WebDAV off (webdav = false): /dav/ answers 404");
+    }
     loop {
         let (stream, _peer) = listener.accept().await.context("accept")?;
         let state = state.clone();
@@ -2051,7 +2056,8 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
 
     // DAV authorizes each resource: `files/<dir>` or the OCI repository name. Keep it outside
     // `is_human_path` so clients receive a 401 challenge, not a login redirect.
-    if path == "/dav" || path.starts_with("/dav/") {
+    // Disabled WebDAV routes fall through to 404.
+    if state.webdav && (path == "/dav" || path.starts_with("/dav/")) {
         return dav::route(&state, &authz, req).await;
     }
     let store = state.store.clone();

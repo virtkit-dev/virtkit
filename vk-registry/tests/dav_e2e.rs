@@ -1209,3 +1209,85 @@ async fn a_put_at_a_top_level_name_is_refused_before_the_directory_exists() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// WebDAV defaults to enabled. Disabling it returns 404 for DAV requests while
+/// OCI requests and file eviction still work.
+#[tokio::test]
+async fn webdav_false_turns_the_dav_tree_off_and_nothing_else() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("webdav-off");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Check the default and both explicit values.
+    for (text, want) in [
+        ("", true),
+        ("webdav = true\n", true),
+        ("webdav = false\n", false),
+    ] {
+        let path = dir.join("cfg.toml");
+        std::fs::write(&path, format!("root = {:?}\n{text}", dir.join("store"))).unwrap();
+        let cfg = ServerConfig::load(&path, None, None).expect("a valid config");
+        assert_eq!(cfg.webdav, want, "{text:?}");
+    }
+
+    let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store"));
+    cfg.webdav = false;
+    let state = Arc::new(cfg.into_state().expect("a local config starts"));
+    let store = state.store.clone();
+    let url = spawn(state);
+    let c = client();
+
+    for (verb, path) in [
+        ("PROPFIND", "/dav/"),
+        ("PROPFIND", "/dav/files/"),
+        ("PUT", "/dav/files/sccache/.sccache_check"),
+        ("GET", "/dav/files/sccache/.sccache_check"),
+        ("MKCOL", "/dav/files/sccache"),
+        ("OPTIONS", "/dav/files/sccache"),
+        ("GET", "/dav/repos/"),
+        ("PROPFIND", "/dav"),
+    ] {
+        let resp = c
+            .request(method(verb), format!("{url}{path}"))
+            .header("Depth", "0")
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "{verb} {path}");
+        assert!(
+            !resp.headers().contains_key("dav"),
+            "{verb} {path} must not advertise DAV"
+        );
+    }
+    assert!(
+        !store.files_dir().join("sccache").exists(),
+        "nothing under files/ came into being"
+    );
+
+    // OCI remains available.
+    let resp = c.get(format!("{url}/v2/")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Eviction still applies to stored files.
+    let files = store.files_dir();
+    std::fs::create_dir_all(files.join("sccache")).unwrap();
+    std::fs::write(files.join("sccache/old"), "x").unwrap();
+    std::fs::File::open(files.join("sccache/old"))
+        .unwrap()
+        .set_modified(SystemTime::now() - std::time::Duration::from_secs(40 * 86_400))
+        .unwrap();
+    store
+        .write_files_policy(
+            "sccache",
+            Some(&vk_registry::files_policy::FilesPolicy {
+                ttl: Some(std::time::Duration::from_secs(30 * 86_400)),
+                max_bytes: None,
+            }),
+        )
+        .unwrap();
+    let r = store.sweep_files_once(false).unwrap();
+    assert_eq!(r.dirs[0].objects_dropped, 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

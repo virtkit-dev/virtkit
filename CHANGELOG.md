@@ -100,7 +100,8 @@ All notable changes to virtkit will be documented in this file.
   client can write to, scoped per top-level directory (`write:files/sccache`). Point
   `SCCACHE_WEBDAV_ENDPOINT` at `https://<registry>/dav/files/<dir>` and every runner's jobs
   share one cache of compiled units over the registry's existing TLS and credentials; a
-  read-only credential gives a pipeline the hits without letting it write.
+  read-only credential gives a pipeline the hits without letting it write. WebDAV is enabled
+  by default; set `webdav = false` in the server config to disable it.
 - **`vk-registry files policy` bounds a `/dav/files/` directory.** `vk-registry files policy
   sccache --ttl-days 30 --max-bytes 200G` makes the server drop objects nobody has read or
   written for thirty days and, past 200 GiB, the least recently used until it fits; `--clear`
