@@ -89,6 +89,11 @@ const KEYS: &[Key] = &[
     },
     Key {
         table: Table::Top,
+        name: "webdav",
+        help: "enable /dav/; false returns 404 [default: true]",
+    },
+    Key {
+        table: Table::Top,
         name: "oidc",
         help: "the [oidc] table below; required in accounts mode",
     },
@@ -152,6 +157,7 @@ root = \"/srv/vk-registry\"
 tls_cert = \"/etc/vk-registry/fullchain.pem\"
 tls_key = \"/etc/vk-registry/privkey.pem\"
 token_file = \"/etc/vk-registry/token\"
+webdav = true
 
 [[upstream]]
 prefix = \"docker.io\"
@@ -170,6 +176,7 @@ tls_cert = \"/etc/vk-registry/fullchain.pem\"
 tls_key = \"/etc/vk-registry/privkey.pem\"
 mode = \"accounts\"
 accounts_db = \"/srv/vk-registry/accounts/accounts.db\"
+webdav = true
 
 [oidc]
 issuer = \"https://id.example.com\"
