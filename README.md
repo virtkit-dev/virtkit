@@ -613,9 +613,10 @@ coordination, or a shared compiler cache. The whole store is also served over We
 read-only view of every repository's tags, manifests and blobs, and `/dav/files/` is a
 plain-file area where an `sccache` pointed at `/dav/files/<dir>` lets jobs in throwaway
 microVMs reuse each other's compiled units; the objects are stored in the OCI pool under
-`files/<dir>` and expire under `vk-registry gc`'s tag retention like any other tag. Its
-lease and heartbeat protocol prevents runners from independently building the same content
-while a healthy peer is already doing so.
+`files/<dir>` and expire under `vk-registry gc`'s tag retention like any other tag. Set
+`webdav = false` in the server config to disable WebDAV. Its lease and
+heartbeat protocol prevents runners from independently building the same content while
+a healthy peer is already doing so.
 
 Use `vk registry push|pull|inspect` for guest bundles and `vk registry status|gc` for a
 local store. The central server and storage model are documented in
