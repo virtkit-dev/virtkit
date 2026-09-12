@@ -3216,6 +3216,7 @@ mod tests {
             locks: vk_registry::lock::LockManager::new(),
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
+            webdav: true,
         }));
         let rg = Registry::for_share(url, true, None, String::new(), None, None, None);
         assert_eq!(
@@ -3266,6 +3267,7 @@ mod tests {
             locks: vk_registry::lock::LockManager::new(),
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
+            webdav: true,
         }));
         // plain HTTP on loopback, which `for_share`'s `insecure` flag is for. The directory
         // push is the path that reaches `push_file`, and it goes through a `Config`.
@@ -3520,6 +3522,7 @@ mod tests {
             locks: vk_registry::lock::LockManager::new(),
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
+            webdav: true,
         }));
         let remote = Registry::for_share(url, true, None, String::new(), None, None, None);
         for rg in [&local, &remote] {
@@ -3558,6 +3561,7 @@ mod tests {
             locks: vk_registry::lock::LockManager::new(),
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
+            webdav: true,
         }));
         let remote = Registry::for_share(url, true, None, String::new(), None, None, None);
         // Manifest PUT returns a `Location` URL. Callers need the digest to pin
@@ -3591,6 +3595,7 @@ mod tests {
             locks: vk_registry::lock::LockManager::new(),
             auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
             tls: None,
+            webdav: true,
         }));
         let remote = Registry::for_share(url, true, None, String::new(), None, None, None);
         // A dense parent, then an untouched overlay with one dirty cluster: the diff

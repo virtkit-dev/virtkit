@@ -1244,3 +1244,64 @@ async fn a_put_at_a_top_level_name_is_refused_before_the_directory_exists() {
     assert_eq!(staging_left(&staging), 0, "the upload left no staging file");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// WebDAV defaults to enabled. Disabling it returns 404 for DAV requests while OCI requests
+/// still work.
+#[tokio::test]
+async fn webdav_false_turns_the_dav_tree_off_and_nothing_else() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("webdav-off");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Check the default and both explicit values.
+    for (text, want) in [
+        ("", true),
+        ("webdav = true\n", true),
+        ("webdav = false\n", false),
+    ] {
+        let path = dir.join("cfg.toml");
+        std::fs::write(&path, format!("root = {:?}\n{text}", dir.join("store"))).unwrap();
+        let cfg = ServerConfig::load(&path, None, None).expect("a valid config");
+        assert_eq!(cfg.webdav, want, "{text:?}");
+    }
+
+    let mut cfg = ServerConfig::local("127.0.0.1:5000".parse().unwrap(), dir.join("store"));
+    cfg.webdav = false;
+    let state = Arc::new(cfg.into_state().expect("a local config starts"));
+    let url = spawn(state);
+    let c = client();
+
+    for (verb, path) in [
+        ("PROPFIND", "/dav/"),
+        ("PROPFIND", "/dav/files/"),
+        ("PUT", "/dav/files/sccache/.sccache_check"),
+        ("GET", "/dav/files/sccache/.sccache_check"),
+        ("MKCOL", "/dav/files/sccache"),
+        ("OPTIONS", "/dav/files/sccache"),
+        ("GET", "/dav/repos/"),
+        ("PROPFIND", "/dav"),
+    ] {
+        let resp = c
+            .request(method(verb), format!("{url}{path}"))
+            .header("Depth", "0")
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "{verb} {path}");
+        assert!(
+            !resp.headers().contains_key("dav"),
+            "{verb} {path} must not advertise DAV"
+        );
+    }
+    assert!(
+        !dir.join("store/repos/files").exists(),
+        "nothing under files/ came into being"
+    );
+
+    // OCI remains available.
+    let resp = c.get(format!("{url}/v2/")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
