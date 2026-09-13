@@ -48,6 +48,9 @@ const DNS_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// At most one upstream-failure line per distinct fault per window: a resolver that is
 /// down fails every lookup a guest makes, and switch.log is read as a whole.
 const DNS_LOG_WINDOW: Duration = Duration::from_secs(30);
+/// At most one failed-flow line per distinct fault per window: a destination that has stopped
+/// answering fails every flow a guest opens to it, and one line per flow would bury the log.
+const FLOW_LOG_WINDOW: Duration = Duration::from_secs(30);
 /// Response codes the gateway resolver answers with itself.
 const RCODE_SERVFAIL: u8 = 2;
 const RCODE_NXDOMAIN: u8 = 3;
@@ -274,6 +277,8 @@ struct EgressGuard {
     published: Mutex<(u64, u64)>,
     /// Throttles the upstream-resolver failure log (see `log_dns_upstream`).
     dns_log: LogLimiter,
+    /// Throttles the failed-flow log (see `log_flow_failure`).
+    flow_log: LogLimiter,
 }
 
 impl EgressGuard {
@@ -292,6 +297,7 @@ impl EgressGuard {
             received: AtomicU64::new(0),
             published: Mutex::new((0, 0)),
             dns_log: LogLimiter::new(DNS_LOG_WINDOW),
+            flow_log: LogLimiter::new(FLOW_LOG_WINDOW),
         }
     }
     fn with_per_source(mut self, per_source: HashMap<Ipv4Addr, Egress>) -> Self {
@@ -403,6 +409,19 @@ impl EgressGuard {
             n => format!(" ({n} more since the last line)"),
         };
         eprintln!("switch: dns upstream {upstream} failed for {question}: {err}{more}");
+    }
+    /// Name a flow that ended with an error and the fault behind it, throttled to one line per
+    /// fault per [`FLOW_LOG_WINDOW`]. Keyed by (destination, error kind), so the named guest is
+    /// whichever hit the fault first this window and the count spans every guest that hit it.
+    fn log_flow_failure(&self, guest: SocketAddr, dst: SocketAddr, err: &std::io::Error) {
+        let Some(suppressed) = self.flow_log.admit((dst, err.kind()), Instant::now()) else {
+            return;
+        };
+        let more = match suppressed {
+            0 => String::new(),
+            n => format!(" ({n} more since the last line)"),
+        };
+        eprintln!("switch: tcp {guest} -> {dst} failed: {err}{more}");
     }
     /// Record an allowed external domain the guest resolved to the audit channel, for the
     /// end-of-job "domains contacted" summary and the standing list of names a job reaches
@@ -1235,11 +1254,20 @@ async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard
                 inner: host,
                 egress: egress.clone(),
             };
-            let _ = tokio::io::copy_bidirectional(&mut guest, &mut host).await;
+            // copy_bidirectional errors when a side tears the flow down rather than closing it
+            // cleanly. A reset is how a peer routinely closes — an HTTP server without keepalive,
+            // a client that aborts — so it is left unlogged; the rarer faults are worth a line: a
+            // timeout, a broken pipe, the upstream gone (see `detect_dead_peer`). Either way,
+            // returning drops `guest` and resets its connection, which is all the guest sees.
+            if let Err(e) = tokio::io::copy_bidirectional(&mut guest, &mut host).await
+                && e.kind() != std::io::ErrorKind::ConnectionReset
+            {
+                egress.log_flow_failure(guest.local_addr(), dst, &e);
+            }
         }
         // Connect refused, failed, or timed out: return so the guest stream drops and
         // ipstack RSTs it, failing the guest's flow at once instead of leaving it hung.
-        Err(e) => eprintln!("switch: tcp connect {target}: {e} — closing guest flow"),
+        Err(e) => eprintln!("switch: tcp connect {target}: {e} — resetting the guest flow"),
     }
 }
 
