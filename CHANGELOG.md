@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A build stage that derives from another (`FROM <stage>`) no longer rebuilds its whole image
+  the first time it is pushed to a shared cache, and completed stages are recorded again.** A
+  freshly pushed stage could not be found in the cache, so anything built on it was rebuilt from
+  scratch.
+
 ## [0.70.0] - 2026-09-13
 
 ### Changed

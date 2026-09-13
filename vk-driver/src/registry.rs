@@ -921,15 +921,29 @@ async fn push_ext4_diff_async(
         subject: None,
         annotations: None,
     });
-    let digest = client
-        .push_manifest(&image, &manifest)
-        .await
-        .with_context(|| format!("pushing the bundle manifest to {image}"))?;
+    let digest = push_manifest(&client, &image, &manifest).await?;
     println!(
         "virtkit: registry: pushed {}/{name}:{tag} -> {digest}",
         rg.repo
     );
     Ok((ret_layers, total_size, digest))
+}
+
+/// Push `manifest` to `image` and return its `sha256:` digest. oci-client's
+/// `push_manifest` returns a `Location` URL; using it as a digest breaks
+/// `FROM <stage>` chunk reuse and completed-stage aliases.
+async fn push_manifest(
+    client: &oci_client::Client,
+    image: &OciReference,
+    manifest: &OciManifest,
+) -> Result<String> {
+    let body = serde_json::to_vec(manifest).context("serializing the bundle manifest")?;
+    let digest = sha256_hex(&body);
+    client
+        .push_manifest_raw(image, body, OCI_IMAGE_MEDIA_TYPE.parse()?)
+        .await
+        .with_context(|| format!("pushing the bundle manifest to {image}"))?;
+    Ok(digest)
 }
 
 /// Whether a push failed because the registry does not hold a blob the manifest names.
@@ -1394,10 +1408,7 @@ async fn push_async(
         subject: None,
         annotations: None,
     });
-    let digest = client
-        .push_manifest(&image, &manifest)
-        .await
-        .with_context(|| format!("pushing the bundle manifest to {}", image))?;
+    let digest = push_manifest(&client, &image, &manifest).await?;
     println!(
         "virtkit: registry: pushed {}/{name}:{tag} -> {digest}",
         rg.repo
@@ -3527,6 +3538,90 @@ mod tests {
             assert_eq!(after.completed_stages, 1);
             assert_eq!(after.stage_data_bytes, 4096);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn remote_pushes_return_a_digest_not_the_manifest_location() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = retry_tmpdir("remote-push-digest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("store");
+        let ext4 = dir.join("image.ext4");
+        std::fs::write(&ext4, vec![7; 4096]).unwrap();
+        let key = format!("snap-{:064x}", 1);
+        let name = vk_registry::BUILD_CACHE_REPO;
+        let store = std::sync::Arc::new(vk_registry::Store::new(root).unwrap());
+        let url = spawn_registry(std::sync::Arc::new(vk_registry::ServerState {
+            store: store.clone(),
+            upstreams: vec![],
+            locks: vk_registry::lock::LockManager::new(),
+            auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+            tls: None,
+        }));
+        let remote = Registry::for_share(url, true, None, String::new(), None, None, None);
+        // Manifest PUT returns a `Location` URL. Callers need the digest to pin
+        // `FROM <stage>` parents and completed-stage aliases.
+        let digest = push_ext4(&remote, name, &key, &ext4, "generic-disk").unwrap();
+        assert!(digest.starts_with("sha256:"), "{digest}");
+        assert_eq!(store.get_manifest(name, &key).unwrap().unwrap().0, digest);
+        let (layers, total) = fetch_chunks(&remote, name, &digest).unwrap().unwrap();
+        assert_eq!(total, 4096);
+        assert!(!layers.is_empty());
+        record_build_stage(&remote, &key, &digest).unwrap();
+        let stage_tag = vk_registry::build_stage_tag(&key).unwrap();
+        assert_eq!(
+            store.get_manifest(name, &stage_tag).unwrap().unwrap().0,
+            digest
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn remote_diff_push_returns_a_digest_not_the_manifest_location() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = retry_tmpdir("remote-diff-digest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("store");
+        let name = vk_registry::BUILD_CACHE_REPO;
+        let store = std::sync::Arc::new(vk_registry::Store::new(root).unwrap());
+        let url = spawn_registry(std::sync::Arc::new(vk_registry::ServerState {
+            store: store.clone(),
+            upstreams: vec![],
+            locks: vk_registry::lock::LockManager::new(),
+            auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+            tls: None,
+        }));
+        let remote = Registry::for_share(url, true, None, String::new(), None, None, None);
+        // A dense parent, then an untouched overlay with one dirty cluster: the diff
+        // push (push_ext4_diff_async) reuses the clean parent chunks and pushes only the
+        // dirty one. Its manifest PUT is answered with a `Location` URL; the caller needs
+        // the digest, which pins the child stage and anything derived from it.
+        let base = dir.join("base.ext4");
+        std::fs::write(&base, pseudo_random(16 << 20, 0x51a9)).unwrap();
+        push_ext4(&remote, name, "parent", &base, "generic-disk").unwrap();
+        let (parent_layers, total) = fetch_chunks(&remote, name, "parent").unwrap().unwrap();
+        let overlay = dir.join("child.qcow2");
+        crate::qcow2::create_overlay(&overlay, &base).unwrap();
+        let dirty = [(0u64, 1u64 << 20)];
+        let (_layers, size, digest) = push_ext4_diff(
+            &remote,
+            name,
+            "child",
+            &overlay,
+            "generic-disk",
+            total,
+            &dirty,
+            &[],
+            &parent_layers,
+        )
+        .unwrap();
+        assert!(digest.starts_with("sha256:"), "{digest}");
+        assert_eq!(size, total);
+        assert_eq!(
+            store.get_manifest(name, "child").unwrap().unwrap().0,
+            digest
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
