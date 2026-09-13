@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`vk atop` groups unnamed short-lived tasks into one `(exited, unnamed)` row.**
+  This replaces blank rows that undercounted processor time for tasks that exited before
+  they could be identified.
+
 ## [0.69.0] - 2026-09-13
 
 ### Added

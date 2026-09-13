@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::atop_report::{Totals, plain, secs_of};
+use crate::atop_report::{EXITED_UNNAMED, NO_PID, Totals, plain, secs_of};
 use crate::atoplog::{SECTOR, Sample};
 use crate::usage::{fmt_bytes, fmt_cpu};
 
@@ -755,23 +755,49 @@ fn process_table(state: &View, sample: &Sample, room: usize, cols: usize) -> Vec
                 command: t.command(),
             })
             .collect(),
-        false => sample
-            .procs
-            .iter()
-            .filter(|p| matches(p.command()))
-            .map(|p| Row {
-                cpu: secs_of(p.cpu_seconds()),
-                mem: p.rsize.saturating_mul(1024),
-                disk: p.io_stats.then(|| {
-                    p.sectors_read
-                        .saturating_add(p.sectors_written)
-                        .saturating_mul(SECTOR)
-                }),
-                pid: p.pid,
-                state: p.state,
-                command: plain(p.command()),
-            })
-            .collect(),
+        false => {
+            let mut rows: Vec<Row> = sample
+                .procs
+                .iter()
+                .filter(|p| matches(p.command()))
+                .map(|p| Row {
+                    cpu: secs_of(p.cpu_seconds()),
+                    mem: p.rsize.saturating_mul(1024),
+                    disk: p.io_stats.then(|| {
+                        p.sectors_read
+                            .saturating_add(p.sectors_written)
+                            .saturating_mul(SECTOR)
+                    }),
+                    pid: p.pid,
+                    state: p.state,
+                    command: plain(p.command()),
+                })
+                .collect();
+            // Unnamed exited tasks are absent from `procs`. Add this sample's tally as one
+            // exited row with no pid, using the whole-job view's naming and filtering.
+            // The whole-job view already includes these tasks in its totals.
+            if let Some(e) = &sample.exited_unknown {
+                let command = match e.tasks {
+                    1 => EXITED_UNNAMED.to_string(),
+                    n => format!("{EXITED_UNNAMED} ×{n}"),
+                };
+                if matches(&command) {
+                    rows.push(Row {
+                        cpu: secs_of(e.cpu_seconds()),
+                        mem: 0,
+                        disk: e.io_stats.then(|| {
+                            e.sectors_read
+                                .saturating_add(e.sectors_written)
+                                .saturating_mul(SECTOR)
+                        }),
+                        pid: NO_PID,
+                        state: 'E',
+                        command,
+                    });
+                }
+            }
+            rows
+        }
     };
     // The pid last, for the same reason the report orders on it: the whole-job totals come out
     // of a map, and rows that tie must not swap places between one frame and the next.
@@ -800,7 +826,11 @@ fn process_table(state: &View, sample: &Sample, room: usize, cols: usize) -> Vec
         out.push(clip(
             &format!(
                 "{:>7}  {:>2}  {:>8}  {:>9}  {:>9}  {}",
-                row.pid,
+                // The unnamed exited aggregate has no single pid.
+                match row.pid < 0 {
+                    true => "-".to_string(),
+                    false => row.pid.to_string(),
+                },
                 row.state,
                 fmt_cpu(row.cpu),
                 fmt_bytes(row.mem),
@@ -1211,6 +1241,32 @@ mod tests {
             dead.contains("×3"),
             "three runs of it, one per sample: {dead:?}"
         );
+    }
+
+    /// The per-sample table adds unnamed exited tasks from the separate tally as one
+    /// labeled, exited row with no pid; otherwise only the whole-job view shows them.
+    #[test]
+    fn exited_unnamed_tasks_show_in_the_per_sample_table() {
+        use crate::atoplog::ExitedUnknown;
+        let state = view(false);
+        let mut sample = state.current().expect("a sample").clone();
+        sample.exited_unknown = Some(ExitedUnknown {
+            tasks: 3,
+            hertz: 100,
+            utime: 400,
+            stime: 50,
+            sectors_read: 8,
+            sectors_written: 4,
+            io_stats: true,
+        });
+        let rows = process_table(&state, &sample, 24, 100);
+        let row = rows
+            .iter()
+            .find(|r| r.contains("(exited, unnamed)"))
+            .expect("the aggregate in this sample's own view, not just the whole-job one");
+        assert!(row.contains("×3"), "three of them, this sample: {row:?}");
+        assert!(row.contains(" - "), "no one pid to name: {row:?}");
+        assert!(row.contains(" E "), "all exited: {row:?}");
     }
 
     /// A filter narrows the table to the commands it matches, and while it is being typed

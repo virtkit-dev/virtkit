@@ -122,6 +122,9 @@ pub struct Sample {
     pub ifaces: Vec<Iface>,
     /// One entry per process, the four process labels of this sample merged by pid.
     pub procs: Vec<Proc>,
+    /// Per-sample count and totals for unnamed exited tasks (pid 0). Their shared pid
+    /// cannot distinguish them, so they stay out of `procs`. `None` if no such tasks occur.
+    pub exited_unknown: Option<ExitedUnknown>,
 }
 
 /// Processor time over the interval, in ticks of `hertz`.
@@ -353,6 +356,33 @@ impl Proc {
     }
 }
 
+/// atop's placeholder for tasks it caught exiting but could not identify — pid 0, no name,
+/// state `E`, the leftover of a command too short-lived for the sweep to read from `/proc`.
+/// A recording can hold many at once, all under the one pid; the four process labels of a
+/// task cannot be matched up across them, so this is all a reader can honestly keep: how many
+/// there were and the time they charged, summed.
+#[derive(Clone, Default, serde::Serialize)]
+pub struct ExitedUnknown {
+    /// Tasks in this sample, counted once each on the CPU record.
+    pub tasks: u64,
+    pub hertz: u64,
+    pub utime: u64,
+    pub stime: u64,
+    pub sectors_read: u64,
+    pub sectors_written: u64,
+    pub io_stats: bool,
+}
+
+impl ExitedUnknown {
+    /// The processor time these tasks charged together, in seconds.
+    pub fn cpu_seconds(&self) -> f64 {
+        match self.hertz {
+            0 => 0.0,
+            hz => self.utime.saturating_add(self.stime) as f64 / hz as f64,
+        }
+    }
+}
+
 /// Parse every complete sample in `text`.
 pub fn parse(text: &str) -> Parsed {
     let mut out = Parsed {
@@ -482,6 +512,9 @@ struct Builder {
     boot: bool,
     sample: Sample,
     procs: BTreeMap<i32, Proc>,
+    /// Sum unnamed exited tasks as records arrive: their shared pid 0 cannot identify
+    /// separate entries in `procs`.
+    exited_unknown: ExitedUnknown,
     any: bool,
     /// Whether the generic columns have been taken from a record yet — a flag rather than a
     /// sentinel epoch, since a guest whose clock is unset stamps 0 and means it.
@@ -499,6 +532,8 @@ impl Builder {
         let mut sample = std::mem::take(&mut self.sample);
         sample.boot = std::mem::take(&mut self.boot);
         sample.procs = std::mem::take(&mut self.procs).into_values().collect();
+        let unknown = std::mem::take(&mut self.exited_unknown);
+        sample.exited_unknown = (unknown.tasks > 0).then_some(unknown);
         // At least 1, whatever the log says: this is the divisor of every rate a reader
         // computes, and the guest promises but does not enforce it.
         sample.interval = sample.interval.max(1);
@@ -596,6 +631,10 @@ impl Builder {
                 bytes_in: r.num("bytes-in"),
                 bytes_out: r.num("bytes-out"),
             }),
+            // A process label carrying pid 0 is atop's exited-but-unnamed placeholder, never a
+            // real process: it is summed rather than merged into a `procs` entry that 0 would
+            // make no key for.
+            "PRG" | "PRC" | "PRM" | "PRD" if r.num::<i32>("pid") == 0 => self.exited_unknown(r),
             "PRG" => {
                 let p = self.proc(r);
                 p.name = r.text("name");
@@ -623,6 +662,28 @@ impl Builder {
                 p.io_stats = r.flag("io-stats");
                 p.sectors_read = r.num("sectors-read");
                 p.sectors_written = r.num("sectors-written");
+            }
+            _ => {}
+        }
+    }
+
+    /// Fold one pid-0 record into the sample's exited-but-unnamed total. The task is counted
+    /// once, on its PRC record — the one that carries cpu, and the one atop writes per task;
+    /// the other labels only add their own quarter, and PRG and PRM carry a name and a
+    /// resident size an exited task no longer has.
+    fn exited_unknown(&mut self, r: &Record) {
+        let acc = &mut self.exited_unknown;
+        match r.label.name {
+            "PRC" => {
+                acc.tasks = acc.tasks.saturating_add(1);
+                acc.hertz = acc.hertz.max(r.num("hertz"));
+                acc.utime = acc.utime.saturating_add(r.num("utime"));
+                acc.stime = acc.stime.saturating_add(r.num("stime"));
+            }
+            "PRD" => {
+                acc.io_stats |= r.flag("io-stats");
+                acc.sectors_read = acc.sectors_read.saturating_add(r.num("sectors-read"));
+                acc.sectors_written = acc.sectors_written.saturating_add(r.num("sectors-written"));
             }
             _ => {}
         }
@@ -788,6 +849,36 @@ SEP
         assert_eq!(second.procs[0].cpu_seconds(), 0.75);
         assert!(second.cpu.is_some() && second.psi.is_none());
         assert!(!second.boot);
+    }
+
+    /// Unnamed exited records share pid 0 within a sample. Sum them in `exited_unknown`
+    /// instead of merging them into one process in `procs`.
+    #[test]
+    fn pid_zero_records_sum_into_exited_unknown() {
+        let extra = "\
+PRC runner 1000 1970/01/01 00:16:40 40 0 () E 100 100 50 0 0 0 0 -1 0 0 y 0 () 0 -3 -3
+PRC runner 1000 1970/01/01 00:16:40 40 0 () E 100 20 10 0 0 0 0 -1 0 0 y 0 () 0 -3 -3
+PRD runner 1000 1970/01/01 00:16:40 40 0 () E n y 2 8 1 4 0 0 n y
+PRD runner 1000 1970/01/01 00:16:40 40 0 () E n y 2 8 1 4 0 0 n y
+";
+        let text = LOG.replacen("SEP\n", &format!("{extra}SEP\n"), 1);
+        let first = &parse(&text).samples[0];
+        // The two real processes are untouched; pid 0 never becomes one of them.
+        assert_eq!(first.procs.len(), 2);
+        assert!(first.procs.iter().all(|p| p.pid != 0));
+
+        let u = first
+            .exited_unknown
+            .as_ref()
+            .expect("an exited-unknown total");
+        assert_eq!(u.tasks, 2, "one per PRC record, not clobbered");
+        assert_eq!((u.utime, u.stime), (120, 60), "summed, not overwritten");
+        assert_eq!(u.cpu_seconds(), 1.8);
+        assert_eq!((u.sectors_read, u.sectors_written), (16, 8));
+        assert!(u.io_stats);
+
+        // A sample with no such records carries none.
+        assert!(parse(LOG).samples[0].exited_unknown.is_none());
     }
 
     /// The crash guarantee: a guest killed mid-write leaves a truncated line, and the

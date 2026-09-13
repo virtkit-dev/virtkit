@@ -23,7 +23,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::atoplog::{Parsed, Proc, SECTOR, Sample, Stall};
+use crate::atoplog::{ExitedUnknown, Parsed, Proc, SECTOR, Sample, Stall};
 use crate::usage::{fmt_bytes, fmt_cpu};
 
 /// The bars a sparkline is drawn with, lightest first.
@@ -616,7 +616,9 @@ impl Totals {
                     .add(p);
             }
         }
-        burst_rows(by_proc.into_values().collect())
+        let mut rows = burst_rows(by_proc.into_values().collect());
+        rows.extend(exited_unknown(samples));
+        rows
     }
 
     pub(crate) fn pid(&self) -> i32 {
@@ -713,8 +715,8 @@ impl Totals {
         };
         [
             truncated(&self.command(), COMMAND_WIDTH),
-            match self.runs > 1 {
-                // A row standing for many runs has no one pid to name.
+            match self.runs > 1 || self.pid < 0 {
+                // Multiple runs and unidentified tasks have no single pid.
                 true => "-".to_string(),
                 false => self.pid.to_string(),
             },
@@ -764,6 +766,48 @@ fn burst_rows(totals: Vec<Totals>) -> Vec<Totals> {
         }
     }
     out
+}
+
+/// Negative pid for the aggregate built by [`exited_unknown`], distinct from positive
+/// process pids. [`Totals::row`] displays it as `-` because it identifies no single task.
+pub(crate) const NO_PID: i32 = -1;
+
+/// Shared aggregate label to keep the report and panel consistent. Each adds the `×N`
+/// suffix where the count is known.
+pub(crate) const EXITED_UNNAMED: &str = "(exited, unnamed)";
+
+/// Sum unnamed exited tasks (pid 0) across the recording into one row. Their CPU time
+/// belongs in the job's totals despite the missing commands and pids. `runs` counts the
+/// tasks for both the `×N` suffix and the churn line.
+fn exited_unknown(samples: &[Sample]) -> Option<Totals> {
+    let mut total = ExitedUnknown::default();
+    for e in samples.iter().filter_map(|s| s.exited_unknown.as_ref()) {
+        total.tasks = total.tasks.saturating_add(e.tasks);
+        total.hertz = total.hertz.max(e.hertz);
+        total.utime = total.utime.saturating_add(e.utime);
+        total.stime = total.stime.saturating_add(e.stime);
+        total.sectors_read = total.sectors_read.saturating_add(e.sectors_read);
+        total.sectors_written = total.sectors_written.saturating_add(e.sectors_written);
+        total.io_stats |= e.io_stats;
+    }
+    if total.tasks == 0 {
+        return None;
+    }
+    Some(Totals {
+        pid: NO_PID,
+        command: EXITED_UNNAMED.to_string(),
+        cpu: total.cpu_seconds(),
+        rss_peak_kib: 0,
+        read: total.sectors_read.saturating_mul(SECTOR),
+        written: total.sectors_written.saturating_mul(SECTOR),
+        io_stats: total.io_stats,
+        runs: total.tasks,
+        // A burst, so the churn line counts these and the row wears its `×N`; every one of
+        // them exited, which is the only way atop names them at all.
+        burst: true,
+        exited: true,
+        failures: 0,
+    })
 }
 
 /// One row of the process table, headings included: a fixed width so `head`, `row`, `widths`
@@ -1181,6 +1225,135 @@ mod tests {
             "{out}"
         );
         assert!(out.lines().any(|l| l.contains("cc1 ×15")), "{out}");
+    }
+
+    /// Unnamed exited tasks (pid 0) sum into one labeled row with no pid and count toward
+    /// churn. Previously they overwrote each other and rendered as a blank row.
+    #[test]
+    fn exited_unnamed_tasks_are_one_named_row() {
+        let mut text = log();
+        let sep = text.rfind("SEP\n").expect("a sample to add to");
+        let h = |label: &str| format!("{label} runner 1060 1970/01/01 00:17:40 30");
+        let mut unknown = String::new();
+        for _ in 0..3 {
+            // pid 0, empty name, exited: 100 user + 50 system ticks, 8 sectors read, 4 written
+            unknown.push_str(&format!(
+                "{} 0 () E 100 100 50 0 0 0 0 -1 0 0 y 0 () 0 -3 -3\n",
+                h("PRC")
+            ));
+            unknown.push_str(&format!("{} 0 () E n y 2 8 1 4 0 0 n y\n", h("PRD")));
+        }
+        text.insert_str(sep, &unknown);
+        let out = report(&text);
+        println!("{out}");
+
+        let row = out
+            .lines()
+            .find(|l| l.contains("(exited, unnamed)"))
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            row.contains("(exited, unnamed) ×3"),
+            "one row for the three: {out}"
+        );
+        assert!(row.contains(" - "), "they have no one pid to name: {row}");
+        // three tasks of 150 ticks each at 100 Hz — summed, not the 1.5s a clobber would show
+        assert!(row.contains("4.5s"), "their cpu together: {row}");
+        // three of 8 sectors read and 4 written, at 512 bytes a sector
+        assert!(
+            row.contains("12 KiB") && row.contains("6 KiB"),
+            "what they moved: {row}"
+        );
+        assert!(
+            out.contains("3 short-lived tasks came and went"),
+            "counted in the churn: {out}"
+        );
+        // No row is left with a blank command, which is the bug this fixes.
+        assert!(
+            !out.lines()
+                .any(|l| l.contains("  0  ") && l.contains(" B ")),
+            "no blank pid-0 row survives: {out}"
+        );
+    }
+
+    /// A single unnamed exited task has no `×N` suffix and uses "1 short-lived task"
+    /// in the churn count.
+    #[test]
+    fn a_lone_exited_unnamed_task_wears_no_multiplier() {
+        let mut text = log();
+        let sep = text.rfind("SEP\n").expect("a sample to add to");
+        let h = |label: &str| format!("{label} runner 1060 1970/01/01 00:17:40 30");
+        let mut unknown = String::new();
+        unknown.push_str(&format!(
+            "{} 0 () E 100 100 50 0 0 0 0 -1 0 0 y 0 () 0 -3 -3\n",
+            h("PRC")
+        ));
+        unknown.push_str(&format!("{} 0 () E n y 2 8 1 4 0 0 n y\n", h("PRD")));
+        text.insert_str(sep, &unknown);
+        let out = report(&text);
+        println!("{out}");
+
+        let row = out
+            .lines()
+            .find(|l| l.contains("(exited, unnamed)"))
+            .unwrap_or_default()
+            .to_string();
+        assert!(!row.contains('×'), "one task, no multiplier: {row}");
+        assert!(row.contains(" - "), "still no pid: {row}");
+        assert!(
+            out.contains("1 short-lived task came and went"),
+            "the churn counts the one, singular: {out}"
+        );
+    }
+
+    /// The tasks are summed across every sample, not only within one: they share the one pid,
+    /// so the total over the recording is the only figure that means anything.
+    #[test]
+    fn exited_unknown_sums_across_samples() {
+        let sample = |tasks, utime, sectors_read| Sample {
+            exited_unknown: Some(ExitedUnknown {
+                tasks,
+                hertz: 100,
+                utime,
+                stime: 0,
+                sectors_read,
+                sectors_written: 0,
+                io_stats: true,
+            }),
+            ..Default::default()
+        };
+        let total = exited_unknown(&[sample(2, 100, 8), sample(3, 200, 16)])
+            .expect("an aggregate over the two samples");
+        assert_eq!(total.runs, 5, "two plus three tasks");
+        assert_eq!(total.cpu, 3.0, "(100 + 200) ticks at 100 Hz");
+        assert_eq!(
+            total.read,
+            24u64.saturating_mul(SECTOR),
+            "eight plus sixteen sectors"
+        );
+    }
+
+    /// A job containing only unnamed short-lived tasks still produces one aggregate row.
+    #[test]
+    fn a_job_of_only_unnamed_tasks_totals_to_the_one_row() {
+        let sample = Sample {
+            exited_unknown: Some(ExitedUnknown {
+                tasks: 2,
+                hertz: 100,
+                utime: 100,
+                stime: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rows = Totals::over(&[sample]);
+        assert_eq!(rows.len(), 1, "only the aggregate");
+        assert_eq!(rows[0].pid(), NO_PID, "it names no one task");
+        assert!(
+            rows[0].command().starts_with("(exited, unnamed)"),
+            "named for what it is: {}",
+            rows[0].command()
+        );
     }
 
     /// A log torn off mid-sample still reports what it has, and says that it was torn.
