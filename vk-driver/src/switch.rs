@@ -64,6 +64,18 @@ const FIRST_LEASE: u32 = 2;
 /// ServerHello). Bounding the dial fails the flow in seconds — we drop the guest stream
 /// and ipstack RSTs it — so a dead backend degrades to a fast connection error, not a hang.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Keepalive on an upstream flow: probe after this long idle, repeat every
+/// [`KEEPALIVE_INTERVAL`] seconds, give up after [`KEEPALIVE_PROBES`] unanswered probes — about
+/// 90 seconds to notice a destination that vanished without a FIN or a RST (powered off, a NAT
+/// that dropped the flow), which nothing else would ever fail: the socket, and the guest
+/// waiting on it, would stay open for good. Six probes ten seconds apart rather than a tighter
+/// schedule: a job's uplink is often a lossy VPN, and killing a live connection over a handful
+/// of dropped probes is the worse failure. Data the switch has sent and the peer never
+/// acknowledges is left to the kernel's own retransmission limit: a user timeout would also
+/// abort a peer that merely advertises a zero window, and it overrides the probe count above.
+const KEEPALIVE_IDLE: libc::c_int = 30;
+const KEEPALIVE_INTERVAL: libc::c_int = 10;
+const KEEPALIVE_PROBES: libc::c_int = 6;
 /// Retransmissions of a guest-bound TCP segment before the flow is reset (see `run`'s
 /// `TcpConfig`): six tries at 1, 3, 7, 15, 31 and 63 seconds, and the segment is abandoned
 /// when the seventh falls due at 127 — two minutes of tolerance for a switch the host did not
@@ -1334,12 +1346,60 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Counted<S> {
 /// `TimedOut` error instead of blocking on the OS default connect timeout — see
 /// [`CONNECT_TIMEOUT`] for why an unbounded dial stalls the guest.
 async fn connect_egress(target: SocketAddr, timeout: Duration) -> std::io::Result<TcpStream> {
-    match tokio::time::timeout(timeout, TcpStream::connect(target)).await {
-        Ok(res) => res,
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!("connect timed out after {}s", timeout.as_secs()),
-        )),
+    let sock = match tokio::time::timeout(timeout, TcpStream::connect(target)).await {
+        Ok(res) => res?,
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("connect timed out after {}s", timeout.as_secs()),
+            ));
+        }
+    };
+    // Best effort: the socket erroring out is what gets the guest its RST, but a flow is
+    // worth carrying without its timeouts — just not silently.
+    if let Err(e) = detect_dead_peer(&sock) {
+        log::warn!("could not set the keepalive timeouts for {target}: {e}");
+    }
+    Ok(sock)
+}
+
+/// Arm the kernel's keepalive on an upstream socket, so a destination that stops answering
+/// surfaces as an error within about a minute and a half. See [`KEEPALIVE_IDLE`]. The options
+/// are Linux-only, as is `vk`.
+fn detect_dead_peer(sock: &TcpStream) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = sock.as_raw_fd();
+    set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+    set_sock_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, KEEPALIVE_IDLE)?;
+    set_sock_opt(
+        fd,
+        libc::IPPROTO_TCP,
+        libc::TCP_KEEPINTVL,
+        KEEPALIVE_INTERVAL,
+    )?;
+    set_sock_opt(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEPALIVE_PROBES)
+}
+
+/// One integer-valued socket option.
+fn set_sock_opt(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> std::io::Result<()> {
+    // SAFETY: every option here takes one int, and `value` outlives the call.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            name,
+            std::ptr::from_ref(&value).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    match rc {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
     }
 }
 
@@ -2069,6 +2129,43 @@ mod tests {
         assert_eq!(log_tail(&log, 2), "\nthree\nfour");
         assert_eq!(log_tail(&log, 9), "\none\ntwo\nthree\nfour");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One integer socket option, for checking what `detect_dead_peer` set.
+    fn sock_opt(sock: &TcpStream, level: libc::c_int, name: libc::c_int) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        let mut value: libc::c_int = -1;
+        let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: every option read here is one int, and both out-parameters are live.
+        let rc = unsafe {
+            libc::getsockopt(
+                sock.as_raw_fd(),
+                level,
+                name,
+                std::ptr::from_mut(&mut value).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt: {}", std::io::Error::last_os_error());
+        value
+    }
+
+    #[tokio::test]
+    async fn an_upstream_socket_carries_the_dead_peer_options() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move { listener.accept().await });
+        let sock = connect_egress(target, CONNECT_TIMEOUT).await.unwrap();
+        accepted.await.unwrap().unwrap();
+
+        assert_eq!(sock_opt(&sock, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+        let tcp = libc::IPPROTO_TCP;
+        assert_eq!(sock_opt(&sock, tcp, libc::TCP_KEEPIDLE), KEEPALIVE_IDLE);
+        assert_eq!(
+            sock_opt(&sock, tcp, libc::TCP_KEEPINTVL),
+            KEEPALIVE_INTERVAL
+        );
+        assert_eq!(sock_opt(&sock, tcp, libc::TCP_KEEPCNT), KEEPALIVE_PROBES);
     }
 
     #[test]
