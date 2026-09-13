@@ -6,6 +6,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A job's first git command no longer re-hashes the whole checkout.** The host writes the
+  checkout as the user vk runs as and the guest sees it, through the share's id-map, as the
+  job user; git took the owner mismatch on every index entry as a possible modification and
+  re-read the entire tree over virtio-fs (13s and 6s of CPU per job on a 30k-file
+  repository). The checkout's config now sets `core.checkStat = minimal`, so the guest's git
+  compares mtime and size only.
 - **`host_checkout` jobs no longer stall on the guest's first git command**, such as
   `git status` or `git checkout`.
 

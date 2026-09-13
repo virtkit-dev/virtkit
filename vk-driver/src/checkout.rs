@@ -409,7 +409,28 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
     git(dest, &["reset", "--hard", sha], "reset")?;
     git(dest, &["clean", "-ffdx"], "clean")?;
     settle_index(dest)?;
+    trust_stat_for_guest(dest)?;
     Ok(())
+}
+
+/// Make the guest's git trust the index it inherits from the host.
+///
+/// Git's index records each file's uid, gid, inode and ctime along with mtime and size, and
+/// by default any of them differing from what `lstat` returns means "maybe modified": the file
+/// is re-read and re-hashed. The checkout is written on the host as the user vk runs as, and
+/// the guest sees it through the share's id-map as the job user — so every entry's owner
+/// differs and the job's first `git checkout`/`status` re-hashes the entire tree over
+/// virtio-fs (on the wab repository 30k files, 650 MiB: 13s and 6s of CPU per job, against a
+/// stat pass of a second). `core.checkStat = minimal` compares mtime and size only, both of
+/// which the share carries unchanged; racy-git's protection for files written within the
+/// index's own second is independent of it and stays. Set in the repository's config, which
+/// the guest reads through the share.
+fn trust_stat_for_guest(dest: &Path) -> Result<()> {
+    git(
+        dest,
+        &["config", "core.checkStat", "minimal"],
+        "config core.checkStat",
+    )
 }
 
 /// Leave the checkout with no racily-clean index entries.
@@ -885,5 +906,38 @@ mod tests {
         );
         // git's own view: refreshing again touches nothing (no racy entries left to re-hash).
         sh(&["update-index", "--refresh"]);
+    }
+
+    /// The host checkout's config tells the guest's git to compare mtime and size only, so an
+    /// index whose recorded owner is the host user is not re-hashed by the id-mapped job user.
+    #[test]
+    fn the_guest_trusts_mtime_and_size_only() {
+        let repo = root("checkstat");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo = repo.as_path();
+        let sh = |args: &[&str]| {
+            let st = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {args:?}");
+        };
+        let checkstat = || {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["config", "--get-all", "core.checkStat"])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        sh(&["init", "-q"]);
+        trust_stat_for_guest(repo).unwrap();
+        assert_eq!(checkstat().trim(), "minimal");
+        // Idempotent: a reused slot sets it again without error or duplication.
+        trust_stat_for_guest(repo).unwrap();
+        assert_eq!(checkstat().lines().count(), 1);
     }
 }
