@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **A VM's uploads are no longer paced by a 16 KiB window.** The switch let a VM send only that
+  much before pausing for the far end, so a large upload advanced one batch per round trip. It
+  now allows 64 KiB, the most TCP carries without window scaling.
+
 ### Fixed
 
 - **A VM that stops reading for a few minutes no longer loses the connection.** A VM with no room

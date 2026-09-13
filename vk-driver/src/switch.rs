@@ -87,6 +87,13 @@ const TCP_MAX_RETRANSMITS: usize = 6;
 /// than holding a socket longer — fifteen minutes is well past any real idle. A guest that has
 /// stopped answering is reset by retransmission exhaustion ([`TCP_MAX_RETRANSMITS`]) first.
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// The window the switch advertises to a guest, and the ceiling on what one flow holds
+/// unacknowledged in the other direction. The stack has no window scaling — it writes the
+/// window into the bare 16-bit header field — so 64 KiB less a byte is the most a guest can be
+/// told it may send, and its 16 KiB default would pace an upload at a quarter of that per round
+/// trip. A session costs about three buffers this size: reassembly, the handoff to the reader,
+/// and data the guest has not acknowledged.
+const TCP_WINDOW: usize = u16::MAX as usize;
 
 #[derive(Clone, Copy)]
 struct Cfg {
@@ -895,6 +902,8 @@ pub async fn run(
     let mut tcp = ipstack::TcpConfig::default();
     tcp.max_retransmit_count = TCP_MAX_RETRANSMITS;
     tcp.timeout = TCP_IDLE_TIMEOUT;
+    tcp.read_buffer_size = TCP_WINDOW;
+    tcp.max_unacked_bytes = TCP_WINDOW as u32;
     config.with_tcp_config(tcp);
     let ip_stack = IpStack::new(
         config,
