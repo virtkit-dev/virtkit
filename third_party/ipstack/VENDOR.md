@@ -1,24 +1,18 @@
 # Vendored ipstack
 
-Source: https://github.com/narrowlink/ipstack
-Revision: `a343ea8c696e761acce8dbcd6687c862ecd8aacd` (crates.io 1.0.1)
+Source: https://github.com/virtkit-dev/ipstack
+Revision: `f5a682d417219a708adbf8a8dc44c6f52faf0652`
 
-The crates.io 1.0.1 sources are vendored (`Cargo.toml`, `Cargo.lock`, `LICENSE`, `README.md`,
-`build.rs`, `src/`); `examples/` and `scripts/` are dropped. `Cargo.lock` is kept for a standalone build
-of this workspace-excluded crate. The root workspace's `[patch.crates-io]` points the
-`ipstack` dependency here, so the switch (`vk-driver/src/switch.rs`) builds against this copy.
+Our fork of [narrowlink/ipstack](https://github.com/narrowlink/ipstack), branched from
+upstream `e1d8506`. Every fix the switch needs lives there as its own commit, written to go
+upstream as a pull request; nothing is patched here, so `git log` in the fork is the patch
+list.
 
-## Local patches
+Refresh it with `third_party/ipstack/vendor.sh <fork checkout> [rev]`, which copies the
+sources, trims the manifest down to what a patched crate outside the workspace can carry
+(see the script's header) and regenerates `Cargo.lock`.
 
-+ `src/stream/tcb.rs` + `src/stream/tcp.rs` — reset a connection whose retransmissions are
-  exhausted. Upstream drops the abandoned segment from the in-flight queue and leaves the
-  connection Established: the peer never receives those bytes, its duplicate ACKs can no
-  longer be served, and the application reads nothing for good. `collect_timed_out_inflight_packets`
-  now also reports the exhaustion; the TCP task then sends RST|ACK, moves to Closed and exits,
-  so the guest's socket errors out and the application can reconnect. Covered by
-  `exhausted_retransmissions_are_reported`.
-
-## Refreshing
-
-Copy the new crates.io sources over this directory, re-apply the patch above, update the
-revision here.
+The root workspace's `[patch.crates-io]` points the `ipstack` dependency here, so the
+switch (`vk-driver/src/switch.rs`) builds against this copy. Its requirement spells out the
+fork's pre-release version, because a plain requirement matches none; keep the two in step
+when the fork's version moves. Run the tests with `./dev.sh test -p ipstack`.

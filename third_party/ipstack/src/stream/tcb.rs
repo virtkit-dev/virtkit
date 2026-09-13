@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 pub(super) const MAX_UNACK: u32 = 1024 * 16; // 16KB
 pub(super) const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
+pub(super) const READ_CHUNK: usize = 8192; // 8KB, bytes drained from the reassembly buffer per handoff
 pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
 /// Retransmission timeout
@@ -11,6 +12,9 @@ pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Maximum count of retransmissions before dropping the packet
 pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
+
+/// Longest interval between window probes while the peer's receive window is closed
+const MAX_PERSIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
@@ -21,6 +25,7 @@ pub(crate) enum TcpState {
     Established,
     FinWait1, // act as a client, actively send a farewell packet to the other side, followed with FinWait2, TimeWait, Closed
     FinWait2,
+    Closing, // our farewell crossed the peer's; waiting for ours to be acknowledged
     TimeWait,
     CloseWait, // act as a server, followed with LastAck, Closed
     LastAck,
@@ -60,6 +65,16 @@ pub(crate) struct Tcb {
     max_count_for_dup_ack: usize,
     rto: std::time::Duration,
     max_retransmit_count: usize,
+    /// Count session-task wakes in tests. Extra wakes add scheduler round trips between ACKs and
+    /// the writes they unblock. Keeping the counter here reuses the lock held on each iteration
+    /// without extra plumbing.
+    #[cfg(test)]
+    wakes: usize,
+    aborted: bool,
+    fin_requested: bool,
+    last_write_at: Option<std::time::Instant>,
+    persist_deadline: Option<std::time::Instant>,
+    persist_timeout: std::time::Duration,
 }
 
 impl Tcb {
@@ -92,7 +107,64 @@ impl Tcb {
             max_count_for_dup_ack,
             rto,
             max_retransmit_count,
+            #[cfg(test)]
+            wakes: 0,
+            aborted: false,
+            fin_requested: false,
+            last_write_at: None,
+            persist_deadline: None,
+            persist_timeout: rto,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn note_wake(&mut self) {
+        self.wakes += 1;
+    }
+
+    #[cfg(test)]
+    pub(super) fn wakes(&self) -> usize {
+        self.wakes
+    }
+
+    /// Record a reset so the application receives an error instead of mistaking EOF for a
+    /// completed transfer.
+    pub(super) fn mark_aborted(&mut self) {
+        self.aborted = true;
+    }
+
+    pub(super) fn is_aborted(&self) -> bool {
+        self.aborted
+    }
+
+    /// Record that the local side is done writing while data it sent is still unacknowledged.
+    /// The session task sends the FIN once the in-flight queue drains.
+    pub(super) fn request_fin(&mut self) {
+        self.fin_requested = true;
+    }
+
+    pub(super) fn fin_requested(&self) -> bool {
+        self.fin_requested
+    }
+
+    /// Clear the request after sending FIN so the session task cannot send it twice.
+    pub(super) fn clear_fin_request(&mut self) {
+        self.fin_requested = false;
+    }
+
+    /// When the application last put data on the wire. The half-close deadline runs from here:
+    /// the peer has stopped sending, so the application's own writing is all that says the
+    /// session is still in use.
+    pub(super) fn note_write(&mut self) {
+        self.last_write_at = Some(std::time::Instant::now());
+    }
+
+    pub(super) fn forget_writes(&mut self) {
+        self.last_write_at = None;
+    }
+
+    pub(super) fn last_write_at(&self) -> Option<std::time::Instant> {
+        self.last_write_at
     }
 
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
@@ -117,11 +189,47 @@ impl Tcb {
 
     pub(super) fn add_unordered_packet(&mut self, seq: SeqNum, buf: Vec<u8>) {
         if seq < self.ack {
-            #[rustfmt::skip]
-            log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
+            // A retransmission reaching back over what is already acknowledged. Keeping the bytes
+            // past `ack` saves the peer the round trip that dropping the whole segment would cost.
+            let overlap = self.ack.distance(seq) as usize;
+            if overlap >= buf.len() {
+                #[rustfmt::skip]
+                log::trace!("{:?}: Received fully acknowledged packet seq {seq} below ack {}, len = {}", self.state, self.ack, buf.len());
+                return;
+            }
+            self.buffer_segment(self.ack, buf[overlap..].to_vec());
             return;
         }
-        self.unordered_packets.insert(seq, buf);
+        // The head-of-line segment always advances the stream, so it is admitted even at the limit;
+        // any other segment beyond the receive window is dropped for the peer's RTO to resend.
+        if seq != self.ack && self.get_unordered_packets_total_len() >= self.read_buffer_size {
+            #[rustfmt::skip]
+            log::warn!("{:?}: Receive window full, dropping packet seq {seq}, len = {}", self.state, buf.len());
+            return;
+        }
+        // A segment further ahead than the window reaches was never ours to receive. Holding it
+        // would keep the window closed on a gap nothing can fill until the session times out.
+        if seq.distance(self.ack) as usize >= self.read_buffer_size {
+            #[rustfmt::skip]
+            log::warn!("{:?}: Dropping packet seq {seq} beyond the receive window at ack {}, len = {}", self.state, self.ack, buf.len());
+            return;
+        }
+        self.buffer_segment(seq, buf);
+    }
+
+    /// Keep the longer segment at a given sequence number. A retransmission split into smaller
+    /// segments can repeat only a prefix; replacing the buffered copy would leave a hole.
+    fn buffer_segment(&mut self, seq: SeqNum, buf: Vec<u8>) {
+        match self.unordered_packets.entry(seq) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().len() < buf.len() {
+                    entry.insert(buf);
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(buf);
+            }
+        }
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
         self.read_buffer_size.saturating_sub(self.get_unordered_packets_total_len())
@@ -137,8 +245,19 @@ impl Tcb {
 
         while remaining_bytes > 0 {
             if let Some(seq) = self.unordered_packets.keys().next().copied() {
-                if seq != self.ack {
+                if seq > self.ack {
                     break; // sequence number is not continuous, stop extracting
+                }
+
+                if seq < self.ack {
+                    // A retransmission re-segmented across `ack` left a stale head entry; trim the
+                    // part already delivered so consumption can continue from `ack`.
+                    let payload = self.unordered_packets.remove(&seq).unwrap();
+                    let consumed = self.ack.distance(seq) as usize;
+                    if consumed < payload.len() {
+                        self.buffer_segment(self.ack, payload[consumed..].to_vec());
+                    }
+                    continue;
                 }
 
                 // remove and get the first packet
@@ -155,7 +274,7 @@ impl Tcb {
                     let remaining_payload = payload.split_off(remaining_bytes);
                     data.extend_from_slice(&payload);
                     self.ack += remaining_bytes as u32;
-                    self.unordered_packets.insert(self.ack, remaining_payload);
+                    self.buffer_segment(self.ack, remaining_payload);
                     break;
                 }
             } else {
@@ -190,8 +309,36 @@ impl Tcb {
     pub(super) fn get_state(&self) -> TcpState {
         self.state
     }
+    /// Take the peer's advertised window, arming the persist timer while it is closed: nothing
+    /// may be sent to a peer with no room but a probe.
     pub(super) fn update_send_window(&mut self, window: u16) {
+        if window == 0 {
+            if self.persist_deadline.is_none() {
+                self.persist_timeout = self.rto;
+                self.persist_deadline = Some(std::time::Instant::now() + self.rto);
+            }
+        } else {
+            self.persist_deadline = None;
+        }
         self.send_window = window;
+    }
+
+    /// Whether a window probe is due, re-arming the timer at twice the interval when it is.
+    /// Probing replaces retransmission while the window is closed and never gives up on the
+    /// peer. The interval is capped at `max_interval` as well as at a minute: the peer's answers
+    /// to these probes are all that keep the session from being declared idle, so probing more
+    /// slowly than the session tolerates silence would reset the very peer it is waiting for.
+    pub(super) fn take_due_persist_probe(&mut self, max_interval: Duration) -> bool {
+        let Some(deadline) = self.persist_deadline else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        if now < deadline {
+            return false;
+        }
+        self.persist_timeout = (self.persist_timeout * 2).min(MAX_PERSIST_TIMEOUT).min(max_interval);
+        self.persist_deadline = Some(now + self.persist_timeout);
+        true
     }
     pub(super) fn get_send_window(&self) -> u16 {
         self.send_window
@@ -289,29 +436,40 @@ impl Tcb {
     }
 
     #[must_use]
-    /// Collect the in-flight packets due for retransmission, and report whether any packet
-    /// exhausted its retransmissions. Such a packet is dropped from the queue: the peer will
-    /// never receive those bytes, so the caller must abort the connection rather than carry
-    /// on with a stream that has a permanent hole in it.
+    /// Collect packets due for retransmission and report any that exhausted `max_retransmit_count`.
+    /// Exhausted packets leave the queue, so the caller must reset the connection: those bytes
+    /// will never reach the peer, leaving a hole in the stream. Leave packets whose own timers
+    /// have not expired alone, even if another packet's timer has expired.
     pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> (Vec<InflightPacket>, bool) {
         let mut retransmit_list = Vec::new();
         let mut exhausted = false;
 
         self.inflight_packets.retain(|_, packet| {
+            if !packet.is_timed_out() {
+                return true; // keep the packet in the inflight_packets
+            }
             if packet.retransmit_count >= self.max_retransmit_count {
                 log::warn!("Packet with seq {:?} reached max retransmit count, dropping packet", packet.seq);
                 exhausted = true;
                 return false; // remove this packet
             }
-            if packet.is_timed_out() {
-                packet.retransmit_count += 1;
-                packet.retransmit_timeout *= 2; // increase timeout exponentially
-                packet.send_time = std::time::Instant::now();
-                retransmit_list.push(packet.clone());
-            }
-            true // keep the packet in the inflight_packets
+            packet.retransmit_count += 1;
+            packet.retransmit_timeout *= 2; // increase timeout exponentially
+            packet.send_time = std::time::Instant::now();
+            retransmit_list.push(packet.clone());
+            true
         });
         (retransmit_list, exhausted)
+    }
+
+    /// Return the next window-probe deadline while the peer's window is closed, otherwise the
+    /// earliest retransmission deadline, or `None` if neither exists. The session task uses this
+    /// timer to retransmit and eventually abandon a silent peer without waiting for incoming data.
+    pub(crate) fn next_timer_deadline(&self) -> Option<std::time::Instant> {
+        if self.send_window == 0 {
+            return self.persist_deadline;
+        }
+        self.inflight_packets.values().map(|p| p.send_time + p.retransmit_timeout).min()
     }
 
     pub(crate) fn get_inflight_packets_total_len(&self) -> usize {
@@ -414,6 +572,101 @@ mod tests {
         assert!(data.is_none());
     }
 
+    /// A retransmission starting behind `ack` carries bytes already delivered; only what follows
+    /// them is new, and a segment with nothing new at all is ignored.
+    #[test]
+    fn an_overlapping_retransmit_keeps_only_the_new_bytes() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        tcb.add_unordered_packet(SeqNum(900), vec![1; 300]);
+        let data = tcb.consume_unordered_packets(10_000).unwrap();
+        assert_eq!(data.len(), 200); // the 100 bytes below ack are dropped, the rest kept
+        assert_eq!(tcb.ack, SeqNum(1200));
+
+        tcb.add_unordered_packet(SeqNum(900), vec![1; 300]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), 0);
+    }
+
+    /// A retransmission re-segmented into a short repeat of what is buffered must not replace it:
+    /// the shorter copy would leave a hole in data the stream already holds.
+    #[test]
+    fn a_shorter_repeat_does_not_shrink_a_buffered_segment() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        tcb.add_unordered_packet(SeqNum(1200), vec![1; 400]);
+        tcb.add_unordered_packet(SeqNum(1200), vec![2; 100]);
+        assert_eq!(tcb.unordered_packets.get(&SeqNum(1200)).unwrap().len(), 400);
+    }
+
+    #[test]
+    fn test_add_unordered_packet_enforces_read_buffer() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        // a segment further ahead than the window reaches is dropped, buffer or no buffer
+        tcb.add_unordered_packet(SeqNum(1000 + READ_BUFFER_SIZE as u32), vec![6; 500]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), 0);
+
+        // fill the receive buffer to its limit with an out-of-order gap held open
+        tcb.add_unordered_packet(SeqNum(1100), vec![7; READ_BUFFER_SIZE]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), READ_BUFFER_SIZE);
+
+        // a further out-of-order segment is dropped, keeping the buffer bounded
+        tcb.add_unordered_packet(SeqNum(1050), vec![8; 500]);
+        assert_eq!(tcb.get_unordered_packets_total_len(), READ_BUFFER_SIZE);
+
+        // the head-of-line segment is admitted even at the limit, so the stream advances
+        tcb.add_unordered_packet(SeqNum(1000), vec![9; 500]);
+        assert_eq!(tcb.unordered_packets.get(&SeqNum(1000)).unwrap().len(), 500);
+    }
+
+    #[test]
+    fn test_consume_trims_overlapping_head_entry() {
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            RTO,
+            MAX_RETRANSMIT_COUNT,
+        );
+
+        // an out-of-order segment stored ahead of ack
+        tcb.add_unordered_packet(SeqNum(1200), vec![2; 300]);
+        // the gap-filler that a retransmission re-segmented to overlap the stored one
+        tcb.add_unordered_packet(SeqNum(1000), vec![1; 400]);
+
+        // consuming pulls [1000..1400), advancing ack into the stored entry keyed at 1200
+        let data = tcb.consume_unordered_packets(10_000).unwrap();
+        assert_eq!(data.len(), 500); // 400 + the 100 bytes of the stored entry past ack
+        assert_eq!(tcb.ack, SeqNum(1500));
+        assert_eq!(tcb.unordered_packets.len(), 0);
+    }
+
     #[test]
     fn test_update_inflight_packet_queue() {
         let mut tcb = Tcb::new(
@@ -471,34 +724,39 @@ mod tests {
 
     #[test]
     fn test_retransmit_with_exponential_backoff() {
+        let rto = std::time::Duration::from_millis(5);
         let mut tcb = Tcb::new(
             SeqNum(1000),
             1500,
             MAX_UNACK,
             READ_BUFFER_SIZE,
             MAX_COUNT_FOR_DUP_ACK,
-            RTO,
+            rto,
             MAX_RETRANSMIT_COUNT,
         );
+        let slack = std::time::Duration::from_millis(5);
 
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
 
         // Simulate retransmission timeouts
         for i in 0..MAX_RETRANSMIT_COUNT {
             // Simulate a timeout for the first packet
-            let timeout = tcb.inflight_packets.values().next().unwrap().retransmit_timeout + std::time::Duration::from_millis(100);
-            println!("timeout: {timeout:?}");
+            let timeout = tcb.inflight_packets.values().next().unwrap().retransmit_timeout + slack;
             std::thread::sleep(timeout);
 
-            let (packets, _) = tcb.collect_timed_out_inflight_packets();
+            let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
             assert_eq!(packets.len(), 1);
+            assert!(!exhausted, "the packet was given up on with retransmissions left");
             let packet = &packets[0];
             assert_eq!(packet.retransmit_count, i + 1);
-            assert!(packet.retransmit_timeout > RTO);
+            assert!(packet.retransmit_timeout > rto);
         }
 
-        let (packets, _) = tcb.collect_timed_out_inflight_packets();
-        assert!(packets.is_empty());
+        // The last retransmission is unacknowledged too, which takes one more timeout to learn.
+        let timeout = tcb.inflight_packets.values().next().unwrap().retransmit_timeout + slack;
+        std::thread::sleep(timeout);
+        let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
+        assert!(packets.is_empty() && exhausted);
         assert!(tcb.inflight_packets.is_empty());
     }
 
@@ -522,5 +780,23 @@ mod tests {
         assert!(tcb.inflight_packets.is_empty());
         let (packets, again) = tcb.collect_timed_out_inflight_packets();
         assert!(packets.is_empty() && !again, "an empty queue reports nothing");
+    }
+
+    /// A packet is given up on only after its own timer expires with its retransmissions spent.
+    #[test]
+    fn a_packet_whose_timer_has_not_expired_is_not_given_up_on() {
+        let rto = std::time::Duration::from_millis(5);
+        let mut tcb = Tcb::new(SeqNum(1000), 1500, MAX_UNACK, READ_BUFFER_SIZE, MAX_COUNT_FOR_DUP_ACK, rto, 1);
+        tcb.add_inflight_packet(vec![1; 100]).unwrap();
+
+        std::thread::sleep(rto * 4);
+        let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
+        assert_eq!(packets.len(), 1, "the only retransmission never went out");
+        assert!(!exhausted);
+
+        // The retransmission has just gone out; its timer has not expired again.
+        let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
+        assert!(packets.is_empty() && !exhausted, "the packet was given up on before its timer");
+        assert_eq!(tcb.inflight_packets.len(), 1);
     }
 }

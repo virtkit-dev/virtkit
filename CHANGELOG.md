@@ -6,6 +6,53 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A VM that stops reading for a few minutes no longer loses the connection.** A VM with no room
+  left for incoming data was treated as a VM that had gone away, and its connection was reset. The
+  switch now waits for the VM to make room, however long it takes, and picks the transfer back up.
+
+- **A connection a VM closes now ends at the far end straight away.** The other side waited
+  seconds for an end of transfer the VM had already sent — dead time for a server that reads
+  until end of input.
+
+- **A VM's upload is no longer cut short when the VM closes the connection.** Data the VM had sent
+  and the switch had taken was thrown away as the connection ended, so the far end saw a truncated
+  transfer — tens of megabytes of a large upload.
+
+- **Data a VM sends together with its close is no longer lost.** The last bytes of an upload
+  that travelled in the same packet as the end of transfer were dropped, and that packet went
+  unanswered, so the VM kept resending it until it gave up.
+
+- **A VM that closes only its sending side still gets the far end's answer.** The switch closed
+  the connection in both directions as soon as the VM finished sending, so a server's reply to a
+  request sent that way never arrived.
+
+- **A VM sending faster than the far end accepts can no longer grow the switch's memory without
+  bound.** Whatever a VM sent was buffered in the switch, however slowly the other end of the
+  connection took it. A connection now buffers a fixed amount and makes the VM wait once it is
+  full, the way a real network would.
+
+- **A VM's upload no longer stalls when its packets reach the switch out of order.** Everything the
+  VM had sent behind a missing packet was thrown away and had to be sent again, and the VM had to
+  discover the loss from its own timer. The switch now keeps what arrived early, says at once what
+  it is missing, and hands on the whole run once the gap closes.
+
+- **`vk switch` no longer hangs on exit while a VM still has a connection open.** Tearing down a
+  connection as the switch was stopping could wedge it, and the switch then never exited.
+
+- **A connection the far end closes right after its last data now ends in the guest too.**
+  The close was dropped when data was still on its way to the VM, so the application sat
+  waiting for more of a transfer that was already complete.
+
+- **A stalled download into a VM now recovers, or fails, on its own.** Lost traffic to a VM was
+  only resent while the VM was talking back, so a transfer that stalled with the VM waiting for
+  data stayed stalled. Whatever is missing is now resent on its own schedule, and the connection
+  fails if it cannot be delivered.
+
+- **A guest connection whose far end dies now fails quickly instead of hanging.** When the
+  remote end of a connection a VM had open was reset or went away, the VM was told nothing
+  and its application sat there until its own timeout — half an hour of a stalled CI job in
+  the worst case. The connection now fails in the guest the way it would on a real network.
+
 - **`vk atop` groups unnamed short-lived tasks into one `(exited, unnamed)` row.**
   This replaces blank rows that undercounted processor time for tasks that exited before
   they could be identified.

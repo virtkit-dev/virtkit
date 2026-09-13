@@ -124,8 +124,10 @@ jsonwebtoken = { version = "10", default-features = false, features = ["rust_cry
 # the `switch` subcommand: a userspace L2 gateway for microVMs. etherparse parses
 # and builds ethernet/ARP/IPv4/UDP (checksums); ipstack terminates arbitrary guest
 # TCP/UDP for transparent egress through the host's sockets (the gvproxy replacement).
+# ipstack names the vendored fork's own pre-release version: a requirement that does not
+# spell one out matches no pre-release, and the patch below would be ignored.
 etherparse = "0.21"
-ipstack = "1"
+ipstack = "1.0.2-dev"
 listenfd = "1"
 log = "0"
 rand = "0.10"
@@ -162,7 +164,7 @@ unicode-width = "0.2"
 # Use indicatif's transitive ANSI classifier in dashboard layout tests.
 console = { version = "0.16", default-features = false, features = ["ansi-parsing"] }
 
-# ipstack 1.0.1 with one local patch: reset TCP connections after retry exhaustion instead
-# of leaving them Established with missing bytes. See third_party/ipstack/VENDOR.md.
+# Our vendored fork of ipstack: the fixes a guest's flows need are still on their way
+# upstream. See third_party/ipstack/VENDOR.md.
 [patch.crates-io]
 ipstack = { path = "third_party/ipstack" }

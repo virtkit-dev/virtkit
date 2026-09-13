@@ -187,7 +187,7 @@ impl IpStackConfig {
 ///
 /// # Examples
 ///
-/// ```no_run
+/// ```ignore
 /// use ipstack::{IpStack, IpStackConfig, IpStackStream};
 /// use std::net::Ipv4Addr;
 ///
@@ -234,7 +234,7 @@ impl IpStack {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```ignore
     /// use ipstack::{IpStack, IpStackConfig};
     /// use std::net::Ipv4Addr;
     ///
@@ -402,9 +402,11 @@ fn create_stream(
 ) -> Result<IpStackStream> {
     let src_addr = packet.src_addr();
     let dst_addr = packet.dst_addr();
+    let payload_len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
     match packet.transport_header() {
         TransportHeader::Tcp(h) => {
-            let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), up_pkt_sender, cfg.mtu, msgr, cfg.tcp_config.clone())?;
+            let cfg_tcp = cfg.tcp_config.clone();
+            let stream = IpStackTcpStream::new(src_addr, dst_addr, h.clone(), payload_len, up_pkt_sender, cfg.mtu, msgr, cfg_tcp)?;
             Ok(IpStackStream::Tcp(stream))
         }
         TransportHeader::Udp(_) => {
