@@ -10,6 +10,10 @@ All notable changes to virtkit will be documented in this file.
   left for incoming data was treated as a VM that had gone away, and its connection was reset. The
   switch now waits for the VM to make room, however long it takes, and picks the transfer back up.
 
+- **A connection a VM leaves idle is no longer dropped out from under it.** A pooled or
+  interactive connection — an open shell, a kept-alive HTTP connection — that sits quiet is now
+  held for fifteen minutes before the switch reclaims it, well past any real idle.
+
 - **A connection a VM closes now ends at the far end straight away.** The other side waited
   seconds for an end of transfer the VM had already sent — dead time for a server that reads
   until end of input.

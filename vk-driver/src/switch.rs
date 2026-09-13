@@ -65,8 +65,16 @@ const FIRST_LEASE: u32 = 2;
 /// and ipstack RSTs it — so a dead backend degrades to a fast connection error, not a hang.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Retransmissions of a guest-bound TCP segment before the flow is reset (see `run`'s
-/// `TcpConfig`): 1+2+4+…+32s of tolerance for a switch the host did not schedule.
+/// `TcpConfig`): six tries at 1, 3, 7, 15, 31 and 63 seconds, and the segment is abandoned
+/// when the seventh falls due at 127 — two minutes of tolerance for a switch the host did not
+/// schedule, or a guest too busy to answer.
 const TCP_MAX_RETRANSMITS: usize = 6;
+/// How long a guest flow may go without a packet from the guest before the stack resets it.
+/// A leak guard for flows whose guest is gone, not a liveness check: a pooled HTTP or
+/// interactive connection is idle for minutes at a time, and resetting one is a worse failure
+/// than holding a socket longer — fifteen minutes is well past any real idle. A guest that has
+/// stopped answering is reset by retransmission exhaustion ([`TCP_MAX_RETRANSMITS`]) first.
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Copy)]
 struct Cfg {
@@ -869,13 +877,12 @@ pub async fn run(
     let (ret_tx, mut ret_rx) = unbounded_channel::<Vec<u8>>();
     let mut config = IpStackConfig::default();
     config.mtu_unchecked(MTU);
-    // A guest-bound segment is retransmitted on a doubling timeout from 1s; the default gives
-    // up after 3 tries — 7s. A switch a busy host fails to schedule for that long abandons the
-    // segment; unpatched, ipstack then left the flow Established with a permanent hole and the
-    // guest's transfer stuck at 0 bytes. Six tries hold the segment for 63s; past that the
-    // patched stack resets the connection, so the guest application fails fast and reconnects.
+    // The default of 3 retransmits abandons a guest-bound segment 15s in, which a busy host
+    // that fails to schedule the switch reaches on a healthy flow; the stack then resets the
+    // connection and the guest's application reconnects. `TCP_MAX_RETRANSMITS` allows 127s.
     let mut tcp = ipstack::TcpConfig::default();
     tcp.max_retransmit_count = TCP_MAX_RETRANSMITS;
+    tcp.timeout = TCP_IDLE_TIMEOUT;
     config.with_tcp_config(tcp);
     let ip_stack = IpStack::new(
         config,
