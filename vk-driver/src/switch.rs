@@ -291,7 +291,7 @@ impl EgressGuard {
             sent: AtomicU64::new(0),
             received: AtomicU64::new(0),
             published: Mutex::new((0, 0)),
-            dns_log: LogLimiter::default(),
+            dns_log: LogLimiter::new(DNS_LOG_WINDOW),
         }
     }
     fn with_per_source(mut self, per_source: HashMap<Ipv4Addr, Egress>) -> Self {
@@ -568,15 +568,22 @@ fn install_logger() {
     }
 }
 
-/// Logs once per [`DNS_LOG_WINDOW`] per fault, counting suppressed lines so the operator
-/// sees the scale. Keying by fault rather than query keeps one entry per upstream failure kind.
-#[derive(Default)]
+/// Logs once per window per fault, counting suppressed lines so the operator sees the scale.
+/// Keying by fault rather than by lookup keeps one entry per upstream failure kind. The window
+/// is per instance, so callers throttle independently.
 struct LogLimiter {
+    window: Duration,
     /// Per key: when it last printed, and how many lines it has suppressed since.
     seen: Mutex<HashMap<(SocketAddr, std::io::ErrorKind), (Instant, u64)>>,
 }
 
 impl LogLimiter {
+    fn new(window: Duration) -> Self {
+        LogLimiter {
+            window,
+            seen: Mutex::new(HashMap::new()),
+        }
+    }
     /// Returns the suppressed count if `key` can print now, or `None` to stay quiet.
     /// Passing `now` lets tests run without sleeping.
     fn admit(&self, key: (SocketAddr, std::io::ErrorKind), now: Instant) -> Option<u64> {
@@ -586,7 +593,7 @@ impl LogLimiter {
                 seen.insert(key, (now, 0));
                 Some(0)
             }
-            Some((last, suppressed)) if now.duration_since(*last) < DNS_LOG_WINDOW => {
+            Some((last, suppressed)) if now.duration_since(*last) < self.window => {
                 *suppressed += 1;
                 None
             }
@@ -2887,7 +2894,7 @@ mod tests {
 
     #[test]
     fn log_limiter_collapses_a_burst_into_one_line() {
-        let limiter = LogLimiter::default();
+        let limiter = LogLimiter::new(DNS_LOG_WINDOW);
         let up: SocketAddr = "127.0.0.53:53".parse().unwrap();
         let refused = (up, std::io::ErrorKind::ConnectionRefused);
         let t0 = Instant::now();
@@ -2905,6 +2912,23 @@ mod tests {
         // …and the count starts over.
         assert_eq!(limiter.admit(refused, past + Duration::from_secs(1)), None);
         assert_eq!(limiter.admit(refused, past + DNS_LOG_WINDOW), Some(1));
+    }
+
+    /// Each limiter throttles on its own window: the same fault prints again once the shorter
+    /// window has passed while the longer one still suppresses it.
+    #[test]
+    fn a_limiters_window_is_its_own() {
+        let short = LogLimiter::new(Duration::from_secs(1));
+        let long = LogLimiter::new(Duration::from_secs(60));
+        let dst: SocketAddr = "203.0.113.7:443".parse().unwrap();
+        let fault = (dst, std::io::ErrorKind::ConnectionReset);
+        let t0 = Instant::now();
+        assert_eq!(short.admit(fault, t0), Some(0));
+        assert_eq!(long.admit(fault, t0), Some(0));
+        // Two seconds on: past the short window, still inside the long one.
+        let t1 = t0 + Duration::from_secs(2);
+        assert_eq!(short.admit(fault, t1), Some(0));
+        assert_eq!(long.admit(fault, t1), None);
     }
 
     #[test]
