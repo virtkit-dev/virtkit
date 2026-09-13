@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.70.0] - 2026-09-13
+
 ### Changed
 
 - **A VM's uploads are no longer paced by a 16 KiB window.** The switch let a VM send only that
@@ -2801,7 +2803,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.69.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.70.0...HEAD
+[0.70.0]: https://github.com/virtkit-dev/virtkit/compare/v0.69.0...v0.70.0
 [0.69.0]: https://github.com/virtkit-dev/virtkit/compare/v0.68.0...v0.69.0
 [0.68.0]: https://github.com/virtkit-dev/virtkit/compare/v0.67.0...v0.68.0
 [0.67.0]: https://github.com/virtkit-dev/virtkit/compare/v0.66.0...v0.67.0
