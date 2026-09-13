@@ -525,6 +525,49 @@ impl EgressGuard {
     }
 }
 
+/// The `log` backend of the switch process: `ipstack` reports a reset connection or a
+/// dropped packet through the `log` crate, and without a backend those lines are
+/// dropped. stderr is switch.log, so they land next to the switch's own diagnostics.
+struct SwitchLog(log::LevelFilter);
+
+impl log::Log for SwitchLog {
+    fn enabled(&self, meta: &log::Metadata) -> bool {
+        meta.level() <= self.0
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!(
+                "{}",
+                log_line(record.level(), record.target(), record.args())
+            );
+        }
+    }
+    fn flush(&self) {}
+}
+
+/// Use the usual `switch:` prefix, followed by level and reporting module,
+/// to distinguish ipstack messages from the switch's own diagnostics.
+fn log_line(level: log::Level, target: &str, args: &std::fmt::Arguments) -> String {
+    format!(
+        "switch: {} {target}: {args}",
+        level.as_str().to_ascii_lowercase()
+    )
+}
+
+/// Install the switch's log backend with `VK_SWITCH_LOG` (default: `warn`).
+/// `debug` and `trace` enable ipstack's per-flow and per-packet diagnostics without
+/// a rebuild. One bare level applies process-wide; `RUST_LOG`-style per-module
+/// filters fail to parse and fall back to `warn`.
+fn install_logger() {
+    let level = std::env::var("VK_SWITCH_LOG")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(log::LevelFilter::Warn);
+    if log::set_boxed_logger(Box::new(SwitchLog(level))).is_ok() {
+        log::set_max_level(level);
+    }
+}
+
 /// Logs once per [`DNS_LOG_WINDOW`] per fault, counting suppressed lines so the operator
 /// sees the scale. Keying by fault rather than query keeps one entry per upstream failure kind.
 #[derive(Default)]
@@ -792,6 +835,7 @@ pub async fn run(
     if listen.is_empty() {
         bail!("switch: at least one --listen is required");
     }
+    install_logger();
     // One shared ipstack for egress: it reads the off-subnet IPv4 packets the
     // switch forwards and writes reply packets back, which we route to the owning
     // VM by destination IP.
@@ -1983,6 +2027,16 @@ mod tests {
         assert_eq!(log_tail(&log, 2), "\nthree\nfour");
         assert_eq!(log_tail(&log, 9), "\none\ntwo\nthree\nfour");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn log_line_names_the_level_and_the_reporting_module() {
+        let line = log_line(
+            log::Level::Warn,
+            "ipstack::stream::tcp",
+            &format_args!("reset"),
+        );
+        assert_eq!(line, "switch: warn ipstack::stream::tcp: reset");
     }
 
     #[test]

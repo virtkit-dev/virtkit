@@ -679,6 +679,7 @@ The small environment-variable surface is:
 | `VIRTKIT_CONFIG` | Select a configuration file. |
 | `VIRTKIT_VMM` | Override the VMM backend; currently useful for `cloud-hypervisor`. |
 | `VIRTKIT_DEBUG=1` | Enable verbose VMM and guest logging. |
+| `VK_SWITCH_LOG=debug` | Set the userspace network switch's log level in `switch.log` (default: `warn`). |
 | `VIRTKIT_TIMING=1` | Print per-phase build and boot timing. |
 | `VIRTKIT_PROGRESS=plain` | Use line-oriented build progress suitable for CI logs. |
 | `VIRTKIT_NO_TITLE` | Disable terminal-title updates without disabling the dashboard. |
