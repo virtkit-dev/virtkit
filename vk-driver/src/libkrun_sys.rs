@@ -261,7 +261,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
                     entry_ms,
                     attr_ms,
                     negative_ms,
-                    true,
+                    share.cache.xattr(),
                 ),
             )?;
         }

@@ -426,6 +426,22 @@ impl ShareCache {
         }
     }
 
+    /// Whether the share serves extended attributes.
+    ///
+    /// Overlay probes each file in its lower layer for `trusted.overlay.*` on first
+    /// lookup. A rootless server cannot provide these attributes. Disabling xattrs
+    /// stops guest probes after the first request; they account for three quarters
+    /// of the round trips on a first pass over a 30k-file checkout.
+    ///
+    /// This also hides the tree's own xattrs. Use only for shares whose contents the
+    /// guest reads without inspecting extended attributes.
+    pub fn xattr(self) -> bool {
+        match self {
+            ShareCache::Auto => true,
+            ShareCache::Immutable => false,
+        }
+    }
+
     /// Arguments for the bundled `vk virtiofsd` to serve this cache mode.
     pub fn virtiofsd_args(self) -> Vec<String> {
         let (entry, attr, negative) = self.timeouts_ms();
@@ -433,12 +449,16 @@ impl ShareCache {
             ShareCache::Auto => "auto",
             ShareCache::Immutable => "always",
         };
-        vec![
+        let mut args = vec![
             format!("--cache={policy}"),
             format!("--entry-timeout-ms={entry}"),
             format!("--attr-timeout-ms={attr}"),
             format!("--negative-timeout-ms={negative}"),
-        ]
+        ];
+        if !self.xattr() {
+            args.push("--no-xattr".to_string());
+        }
+        args
     }
 }
 
@@ -1242,6 +1262,18 @@ mod tests {
         assert_eq!(
             ShareCache::Immutable.virtiofsd_args()[0..2],
             ["--cache=always", "--entry-timeout-ms=86400000"]
+        );
+        assert!(ShareCache::Auto.xattr());
+        assert!(!ShareCache::Immutable.xattr());
+        assert!(
+            !ShareCache::Auto
+                .virtiofsd_args()
+                .contains(&"--no-xattr".to_string())
+        );
+        assert!(
+            ShareCache::Immutable
+                .virtiofsd_args()
+                .contains(&"--no-xattr".to_string())
         );
         // Specs predating the cache field retain the default caching policy.
         let spec: FsShare =

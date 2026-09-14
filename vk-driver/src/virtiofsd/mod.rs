@@ -84,6 +84,11 @@ struct Opt {
     /// how long (ms) the guest may cache a failed lookup (0: every miss asks again)
     #[arg(long = "negative-timeout-ms", default_value_t = 0)]
     negative_timeout_ms: u32,
+    /// serve no extended attributes: every xattr request is answered ENOSYS, which stops
+    /// the guest sending them at all (an overlay lower layer otherwise probes every file
+    /// for `trusted.overlay.*`)
+    #[arg(long = "no-xattr")]
+    no_xattr: bool,
     /// sandbox mode: none | chroot
     #[arg(long, default_value = "none")]
     sandbox: String,
@@ -184,6 +189,7 @@ pub fn run(argv: Vec<String>) -> Result<()> {
         entry_timeout: Duration::from_millis(opt.entry_timeout_ms.into()),
         attr_timeout: Duration::from_millis(opt.attr_timeout_ms.into()),
         negative_timeout: Duration::from_millis(opt.negative_timeout_ms.into()),
+        xattr: !opt.no_xattr,
         ..Default::default()
     };
     let uid = IdTable::new(&opt.uid_map);
