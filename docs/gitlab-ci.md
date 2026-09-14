@@ -244,6 +244,12 @@ block device. Read the pair as the room the job had left — `4.2 GiB of 16.0 Gi
 `15.9 GiB of 16.0 GiB` is a job about to fail on space — and raise `MICROVM_MEM` when a build
 tree needs more, since the capacity follows it.
 
+Because that checkout is read-only for the job's life, the guest caches its paths, attributes,
+misses and directory listings for the whole job: `git status` or a build tool's dependency check
+walks the tree against the host once, and every later pass is answered from the guest's own
+cache. With `checkout_overlay = false` the share is read-write and keeps close-to-open
+consistency (attributes re-fetched after 5 s).
+
 The figure is the high-water mark, not what the layer held at the end: a job that unpacks an
 archive and deletes it would otherwise read as having needed nothing. It comes from the guest,
 which is the only place a tmpfs can be seen from, so a job with no overlaid checkout reports

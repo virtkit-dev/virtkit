@@ -1143,6 +1143,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             dax,
             uid_map: Vec::new(),
             gid_map: Vec::new(),
+            cache: crate::vmm::ShareCache::Auto,
         });
     }
 
@@ -1171,6 +1172,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             dax,
             uid_map: Vec::new(),
             gid_map: Vec::new(),
+            cache: crate::vmm::ShareCache::Auto,
         });
         cmdline.push_str(" VIRTKIT_TOOLS=vktools:/run/virtkit-tools");
     }
@@ -1206,12 +1208,23 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             .unwrap_or_default();
         let (uid_map, gid_map) =
             checkout_id_maps(&run_user, &media.rootfs, (owner.uid(), owner.gid()));
+        // Behind the overlay the host tree is read-only for the whole job (prepare wrote it,
+        // nothing on the host touches it until cleanup), so the guest may keep every entry,
+        // attribute and miss it fetched: a tree-wide pass — git status, a build tool's
+        // dependency check — round-trips to the host once instead of once per pass. A
+        // read-write share is the guest's and the host's at once, so it keeps the default.
+        let cache = if overlay {
+            crate::vmm::ShareCache::Immutable
+        } else {
+            crate::vmm::ShareCache::Auto
+        };
 
         if !crate::vmm::libkrun_selected() {
             let mut vfsd = cfg.virtiofsd_command();
             vfsd.arg(format!("--socket-path={}", sock.display()))
                 .arg(format!("--shared-dir={}", host_dir.display()))
-                .args(["--cache=auto", "--sandbox=none"]);
+                .args(cache.virtiofsd_args())
+                .arg("--sandbox=none");
             if overlay {
                 vfsd.arg("--readonly");
             }
@@ -1236,6 +1249,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             dax,
             uid_map,
             gid_map,
+            cache,
         });
         cmdline.push_str(&checkout_virtiofs_cmdline(
             mount,
@@ -1284,6 +1298,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 dax: None,
                 uid_map: Vec::new(),
                 gid_map: Vec::new(),
+                cache: crate::vmm::ShareCache::Auto,
             });
             crate::run::push_knob(
                 &mut cmdline,

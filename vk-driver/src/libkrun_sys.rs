@@ -32,7 +32,7 @@ use anyhow::{Context, Result, bail};
 // >= 0 on success, a negative errno on failure.
 use krun::{
     KRUN_EXIT_GUEST_RESET, krun_add_disk2, krun_add_net_tap, krun_add_net_unixstream,
-    krun_add_virtiofs5, krun_add_vsock_port2, krun_create_ctx, krun_disable_balloon,
+    krun_add_virtiofs6, krun_add_vsock_port2, krun_create_ctx, krun_disable_balloon,
     krun_disable_implicit_init, krun_get_shutdown_eventfd, krun_init_log,
     krun_set_block_dirty_socket, krun_set_console_output, krun_set_kernel, krun_set_nested_virt,
     krun_set_pmu, krun_set_vm_config, krun_start_enter,
@@ -234,7 +234,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         for share in &spec.shares {
             let tag = cstr(&share.tag);
             let dir = cstr(&share.host_dir.to_string_lossy());
-            // The id-map rules for this share, joined by ',' as krun_add_virtiofs5 expects;
+            // The id-map rules for this share, joined by ',' as krun_add_virtiofs6 expects;
             // an empty map yields an empty string, which the FFI treats as an identity map.
             let uid_map = cstr(&share.uid_map.join(","));
             let gid_map = cstr(&share.gid_map.join(","));
@@ -245,9 +245,10 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
             // guest mounts such a share `dax=inode` and maps only the files so marked.
             let shm_size = share.dax.map_or(0, |d| d.window);
             let dax_inode_min = share.dax.and_then(|d| d.inode_min).unwrap_or(0);
+            let (entry_ms, attr_ms, negative_ms) = share.cache.timeouts_ms();
             ck(
-                "krun_add_virtiofs5",
-                krun_add_virtiofs5(
+                "krun_add_virtiofs6",
+                krun_add_virtiofs6(
                     ctx,
                     tag.as_ptr(),
                     dir.as_ptr(),
@@ -256,6 +257,10 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
                     uid_map.as_ptr(),
                     gid_map.as_ptr(),
                     dax_inode_min,
+                    share.cache.krun_policy(),
+                    entry_ms,
+                    attr_ms,
+                    negative_ms,
                 ),
             )?;
         }

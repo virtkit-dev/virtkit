@@ -330,7 +330,10 @@ throwaway layer over the image, and `volumes:` bind host paths into the guest. A
 
 `overlay` is for build trees and checkouts: reads come from the host, every write lands
 in guest memory and never touches the host tree. Add `persist` to keep those writes on
-disk instead. `disk` is for data that needs real filesystem semantics (ownership, sockets,
+disk instead. A read-only share (`ro`, `overlay`) takes `immutable` when the host will not
+change the tree while the service runs: the guest then keeps what it read for its whole
+life, so a pass over the tree (`git status`, a build's dependency check) asks the host once
+rather than on every pass. `disk` is for data that needs real filesystem semantics (ownership, sockets,
 device nodes) a shared directory cannot offer — a database's data directory, say. `socket`
 forwards a host service's unix socket and is implied when the host path is one — for
 example, `/var/run/docker.sock:/var/run/docker.sock` lets the guest drive the host's Docker.

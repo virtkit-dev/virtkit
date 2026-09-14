@@ -4,6 +4,16 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **A CI job's checkout no longer costs a host round trip per file on every pass over the
+  tree.** Behind the overlay the host tree cannot change while the job runs, so the guest now
+  keeps every path, attribute, miss and directory listing it has read for the whole job instead
+  of asking again every few seconds. Tools that walk the tree repeatedly — `git status`, a build's dependency
+  check, a linter — pay for the walk once. The same is available to `vk run` and compose
+  volumes shared read-only with the new `immutable` option (`:ro,immutable`,
+  `:overlay,immutable`), for a tree the host will not touch while the VM runs.
+
 ## [0.70.1] - 2026-09-14
 
 ### Fixed

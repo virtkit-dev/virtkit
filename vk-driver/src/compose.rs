@@ -165,6 +165,12 @@ pub struct Volume {
     /// relays each connection over vsock to `host`; only bytes cross. Explicit `:socket` and
     /// an automatically detected socket source are equivalent. Excludes every other mode.
     pub socket: bool,
+    /// `ro,immutable` / `overlay,immutable`: the host does not change the tree while the VM
+    /// runs, so the guest keeps every entry, attribute, miss and directory listing it fetched for the VM's life
+    /// instead of asking the host again every few seconds — a tree-wide pass (`git status`, a
+    /// build's dependency check) round-trips to the host once, not once per pass. Read-only
+    /// modes only: the guest could not see a host-side change until it reboots.
+    pub immutable: bool,
     /// Formatted capacity for a freshly created `disk` volume or `overlay,persist` upper, from
     /// its `size=` suffix. Ignored once the backing file already exists — its own capacity
     /// applies, since this ext4 writer has no resize. `None` uses a generous built-in default.
@@ -174,6 +180,17 @@ pub struct Volume {
     /// plain (tmpfs) overlay and on every non-overlay volume; filled in by [`map_service`],
     /// which alone knows the owning service's name. See [`ensure_persist_overlay_backing`].
     pub persist_backing: Option<PathBuf>,
+}
+
+impl Volume {
+    /// The cache policy for this volume's share.
+    pub fn cache(&self) -> crate::vmm::ShareCache {
+        if self.immutable {
+            crate::vmm::ShareCache::Immutable
+        } else {
+            crate::vmm::ShareCache::Auto
+        }
+    }
 }
 
 /// The service's start-time config layered over the image's defaults, compose
@@ -1020,7 +1037,8 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
         [h, g, m] => (*h, *g, *m),
         _ => bail!(
             "bad volume {spec:?} \
-             (want host:guest[:(ro|rw|overlay[,persist]|socket)[,optional]|:disk[,size=SIZE]])"
+             (want host:guest[:(ro|rw|overlay[,persist]|socket)[,optional][,immutable]\
+             |:disk[,size=SIZE]])"
         ),
     };
     if !(host.starts_with('/') || host.starts_with('.') || host.starts_with('~')) {
@@ -1051,6 +1069,7 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
     let mut disk_size_mib = None;
     let mut optional = false;
     let mut persist = false;
+    let mut immutable = false;
     let mut saw_size = false;
     for opt in mode_parts {
         // Parsed regardless of order (`overlay,persist,size=` and `overlay,size=,persist` both
@@ -1082,8 +1101,19 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
             ),
             "persist" if persist => bail!("volume {spec:?}: persist given more than once"),
             "persist" => persist = true,
+            // The guest keeps what it cached for its whole life, so it must be a tree the
+            // host cannot change under it: one it shares read-only.
+            "immutable" if !read_only => bail!(
+                "volume {spec:?}: immutable applies to ro and overlay modes only \
+                 (the guest caches the tree for its whole life, so the host must not write it)"
+            ),
+            "immutable" if immutable => {
+                bail!("volume {spec:?}: immutable given more than once")
+            }
+            "immutable" => immutable = true,
             other => bail!(
-                "volume {spec:?}: unknown option {other:?} (want optional, persist, or size=SIZE)"
+                "volume {spec:?}: unknown option {other:?} \
+                 (want optional, persist, immutable, or size=SIZE)"
             ),
         }
     }
@@ -1163,6 +1193,7 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
         read_only,
         overlay,
         persist,
+        immutable,
         is_file,
         disk,
         socket,
@@ -2217,6 +2248,7 @@ mod tests {
             read_only: true,
             overlay: true,
             persist: true,
+            immutable: false,
             is_file: false,
             disk: false,
             socket: false,
@@ -2590,6 +2622,28 @@ mod tests {
         let sock = dir.join("d.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         (dir, sock, listener)
+    }
+
+    #[test]
+    fn volume_option_immutable_is_for_read_only_shares() {
+        let base = Path::new("/b");
+        let ro = parse_volume("/src:/dst:ro,immutable", base).unwrap();
+        assert!(ro.immutable && ro.read_only);
+        assert_eq!(ro.cache(), crate::vmm::ShareCache::Immutable);
+        let ovl = parse_volume("/src:/dst:overlay,immutable", base).unwrap();
+        assert!(ovl.immutable && ovl.overlay);
+        assert_eq!(ovl.cache(), crate::vmm::ShareCache::Immutable);
+        let plain = parse_volume("/src:/dst:ro", base).unwrap();
+        assert!(!plain.immutable);
+        assert_eq!(plain.cache(), crate::vmm::ShareCache::Auto);
+        let err = parse_volume("/src:/dst:rw,immutable", base)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ro and overlay modes only"), "{err}");
+        let err = parse_volume("/src:/dst:ro,immutable,immutable", base)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than once"), "{err}");
     }
 
     #[test]

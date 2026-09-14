@@ -136,15 +136,17 @@ pub(crate) fn pin_spawner() {
 /// `shared_dir` (optionally read-only) and wait for its socket to appear. A read-only
 /// share is a host-side guarantee the guest can never write back to the shared tree.
 /// `uid_maps` / `gid_maps` are soft_idmap spec strings (`type:from:to[:count]`) forwarded
-/// as `--uid-map` / `--gid-map` to virtiofsd; empty slices = identity (no remapping). `prio`
-/// says whether the share serves a build stage, which only the cloud-hypervisor backend
-/// reaches — libkrun serves a build's context in-process.
+/// as `--uid-map` / `--gid-map` to virtiofsd; empty slices = identity (no remapping). `cache`
+/// sets the share's cache policy (`ShareCache`). `prio` says whether the share
+/// serves a build stage, which only the cloud-hypervisor backend reaches — libkrun serves a
+/// build's context in-process.
 pub(crate) fn spawn_virtiofsd(
     sock: &Path,
     shared_dir: &Path,
     readonly: bool,
     uid_maps: &[String],
     gid_maps: &[String],
+    cache: crate::vmm::ShareCache,
     prio: crate::prio::Prio,
 ) -> Result<Child> {
     let _ = std::fs::remove_file(sock);
@@ -152,7 +154,7 @@ pub(crate) fn spawn_virtiofsd(
     cmd.arg("virtiofsd")
         .arg(format!("--socket-path={}", sock.display()))
         .arg(format!("--shared-dir={}", shared_dir.display()))
-        .arg("--cache=auto")
+        .args(cache.virtiofsd_args())
         .arg("--sandbox=none");
     if readonly {
         cmd.arg("--readonly");

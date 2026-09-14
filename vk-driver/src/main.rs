@@ -1570,7 +1570,8 @@ enum Cmd {
         /// (default|image|entrypoint), `kernel` (default|image|<path>) and `persist_root`
         /// (keep `/` across restarts). Volume modes: `ro`, `rw`, `overlay` (writes in RAM),
         /// `overlay,persist[,size=]` (writes kept on disk) and `disk[,size=]` (a private
-        /// filesystem). Persistent state lives under `.virtkit/` beside the compose file and
+        /// filesystem); `ro`/`overlay` take `,immutable` for a host tree that will not change
+        /// while the service runs (the guest caches it for its life). Persistent state lives under `.virtkit/` beside the compose file and
         /// is reset when the image (or, for an overlay, its shared host tree) changes.
         /// `examples/compose.yaml` in the source tree shows every compose feature a service
         /// can use.
@@ -1748,14 +1749,18 @@ enum Cmd {
         /// host disk). `:socket` forwards a host unix socket (`/var/run/docker.sock`) to
         /// the guest path — implied when HOST is one, and it hands the guest whatever that
         /// socket grants (a Docker socket is host-root-equivalent). A share (not a disk)
-        /// may add `,optional` to skip an absent source instead of failing the boot.
+        /// may add `,optional` to skip an absent source instead of failing the boot. A
+        /// read-only share (`ro`, `overlay`) may add `,immutable` when the host will not change
+        /// the tree while the VM runs: the guest then keeps what it read for its whole life, so
+        /// a pass over the tree (git status, a build's dependency check) asks the host once
+        /// instead of once per pass.
         /// `overlay,persist` (an overlay whose writes are kept on disk) and
         /// `x-virtkit.persist_root` belong to compose services, which have a file to keep
         /// that state beside — see --compose.
         #[arg(
             short = 'v',
             long = "volume",
-            value_name = "HOST:GUEST[:(ro|rw|overlay|socket)[,optional]|:disk[,size=SIZE]]",
+            value_name = "HOST:GUEST[:(ro|rw|overlay|socket)[,optional][,immutable]|:disk[,size=SIZE]]",
             help_heading = "Mounts and disks"
         )]
         volume: Vec<String>,

@@ -597,6 +597,7 @@ pub fn boot_unit(
                 vol.read_only,
                 &[],
                 &[],
+                vol.cache(),
                 crate::prio::Prio::Normal,
             )?);
         }
@@ -639,6 +640,7 @@ pub fn boot_unit(
             dax: if vol.is_file { None } else { dax },
             uid_map: Vec::new(),
             gid_map: Vec::new(),
+            cache: vol.cache(),
         });
     }
     let shared_mem = !shares.is_empty();

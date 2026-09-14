@@ -1789,6 +1789,7 @@ async fn build_and_boot(
                 false,
                 &[],
                 &[],
+                crate::vmm::ShareCache::Auto,
                 crate::prio::Prio::Normal,
             )?);
         }
@@ -1801,6 +1802,7 @@ async fn build_and_boot(
             dax,
             uid_map: Vec::new(),
             gid_map: Vec::new(),
+            cache: crate::vmm::ShareCache::Auto,
         });
     }
     // A --primary primary gets its compose volumes, and any primary its `--volume`
@@ -1881,6 +1883,7 @@ async fn build_and_boot(
                 vol.read_only,
                 &[],
                 &[],
+                vol.cache(),
                 crate::prio::Prio::Normal,
             )?);
         }
@@ -1927,6 +1930,7 @@ async fn build_and_boot(
             dax: if vol.is_file { None } else { dax },
             uid_map: Vec::new(),
             gid_map: Vec::new(),
+            cache: vol.cache(),
         });
     }
     // `--atop`: record what this guest does from boot, exactly as a CI job's guest is
@@ -1980,6 +1984,7 @@ async fn build_and_boot(
                     false,
                     &[],
                     &[],
+                    crate::vmm::ShareCache::Auto,
                     crate::prio::Prio::Normal,
                 )?);
             }
@@ -1993,6 +1998,7 @@ async fn build_and_boot(
                 dax: None,
                 uid_map: Vec::new(),
                 gid_map: Vec::new(),
+                cache: crate::vmm::ShareCache::Auto,
             });
             push_knob(&mut cmdline, &vk_core::atop::cmdline_knob(secs));
             println!(
@@ -4372,6 +4378,7 @@ pub(crate) async fn boot_session(
                 true,
                 &[],
                 &[],
+                crate::vmm::ShareCache::Auto,
                 crate::prio::Prio::Build,
             )?);
         }
@@ -4386,6 +4393,7 @@ pub(crate) async fn boot_session(
             dax: None,
             uid_map: Vec::new(),
             gid_map: Vec::new(),
+            cache: crate::vmm::ShareCache::Auto,
         });
     }
 
@@ -4952,6 +4960,7 @@ mod tests {
             dax: dax.and_then(Dax::share),
             uid_map: Vec::new(),
             gid_map: Vec::new(),
+            cache: crate::vmm::ShareCache::Auto,
         };
         let shares = [
             share("work", Some(crate::vmm::DAX_DEFAULT)),

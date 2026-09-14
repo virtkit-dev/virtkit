@@ -24,6 +24,7 @@ use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
@@ -74,6 +75,15 @@ struct Opt {
     /// cache policy: never | auto | always (metadata is treated as auto)
     #[arg(long, default_value = "auto")]
     cache: String,
+    /// how long (ms) the guest may reuse a looked-up directory entry
+    #[arg(long = "entry-timeout-ms", default_value_t = 5_000)]
+    entry_timeout_ms: u32,
+    /// how long (ms) the guest may reuse fetched attributes
+    #[arg(long = "attr-timeout-ms", default_value_t = 5_000)]
+    attr_timeout_ms: u32,
+    /// how long (ms) the guest may cache a failed lookup (0: every miss asks again)
+    #[arg(long = "negative-timeout-ms", default_value_t = 0)]
+    negative_timeout_ms: u32,
     /// sandbox mode: none | chroot
     #[arg(long, default_value = "none")]
     sandbox: String,
@@ -108,8 +118,8 @@ pub fn run(argv: Vec<String>) -> Result<()> {
     raise_nofile_limit(1_000_000)?;
 
     let cache_policy = match opt.cache.as_str() {
-        // upstream virtiofsd's `metadata` sits between never and auto; this engine
-        // has no equivalent, and virtkit only ever passes auto.
+        // upstream virtiofsd's `metadata` sits between never and auto; this engine has no
+        // equivalent, so fold it into auto. virtkit's own shares pass auto or always.
         "metadata" => CachePolicy::Auto,
         s => CachePolicy::from_str(s).map_err(|_| anyhow!("invalid --cache {s:?}"))?,
     };
@@ -171,6 +181,9 @@ pub fn run(argv: Vec<String>) -> Result<()> {
     let fs_cfg = FsConfig {
         root_dir,
         cache_policy,
+        entry_timeout: Duration::from_millis(opt.entry_timeout_ms.into()),
+        attr_timeout: Duration::from_millis(opt.attr_timeout_ms.into()),
+        negative_timeout: Duration::from_millis(opt.negative_timeout_ms.into()),
         ..Default::default()
     };
     let uid = IdTable::new(&opt.uid_map);

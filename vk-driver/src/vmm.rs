@@ -361,6 +361,85 @@ pub struct FsShare {
     pub uid_map: Vec<String>,
     #[serde(default)]
     pub gid_map: Vec<String>,
+    /// The share's cache policy: see [`ShareCache`].
+    #[serde(default)]
+    pub cache: ShareCache,
+}
+
+/// How long a guest may trust what it read from a share before asking the host again.
+///
+/// Every lookup, `stat` and cache miss the guest cannot answer itself is a round trip to the
+/// host's virtio-fs server — a few tens of µs on bare metal, several hundred under nested
+/// virtualization. A tree-wide pass (`git status`, a build system's dependency check, a
+/// linter walking the sources) is tens of thousands of them, and with [`ShareCache::Auto`]
+/// it pays them again on every pass once the 5-second validity has lapsed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ShareCache {
+    /// Close-to-open consistency: entries and attributes stay valid for seconds, misses are
+    /// not cached, so a change the host makes shows in the guest promptly. For any tree the
+    /// host may touch while the VM runs.
+    #[default]
+    Auto,
+    /// The host does not change the tree while it is shared, so the guest keeps every entry,
+    /// attribute, miss, directory listing and page it fetched for the life of the VM: a pass over the tree
+    /// round-trips once, not once per pass. Choose it only for trees that are read-only on the
+    /// host side for the VM's whole life (a job's checkout behind an overlay).
+    Immutable,
+}
+
+/// How long an [`ShareCache::Immutable`] share's entries, attributes and misses stay valid:
+/// longer than any VM here lives, and a bound the kernel keeps in jiffies without overflow.
+const IMMUTABLE_TIMEOUT_MS: u32 = 86_400_000;
+
+/// libkrun's `krun_add_virtiofs6` cache ABI (`krun::KRUN_FS_CACHE_*`,
+/// `krun::KRUN_FS_TIMEOUT_DEFAULT_MS`), mirrored so the virtiofsd path can name these codes
+/// without the optional `libkrun` feature. The assertion below fails the build if they drift.
+const KRUN_CACHE_AUTO: u32 = 1;
+const KRUN_CACHE_ALWAYS: u32 = 2;
+const KRUN_TIMEOUT_DEFAULT_MS: u32 = 5_000;
+
+#[cfg(feature = "libkrun")]
+const _: () = {
+    assert!(KRUN_CACHE_AUTO == krun::KRUN_FS_CACHE_AUTO);
+    assert!(KRUN_CACHE_ALWAYS == krun::KRUN_FS_CACHE_ALWAYS);
+    assert!(KRUN_TIMEOUT_DEFAULT_MS == krun::KRUN_FS_TIMEOUT_DEFAULT_MS);
+};
+
+impl ShareCache {
+    /// libkrun's `krun_add_virtiofs6` cache-policy code for this mode.
+    pub fn krun_policy(self) -> u32 {
+        match self {
+            ShareCache::Auto => KRUN_CACHE_AUTO,
+            ShareCache::Immutable => KRUN_CACHE_ALWAYS,
+        }
+    }
+
+    /// Entry, attribute and negative-lookup validity in ms, in that order.
+    pub fn timeouts_ms(self) -> (u32, u32, u32) {
+        match self {
+            ShareCache::Auto => (KRUN_TIMEOUT_DEFAULT_MS, KRUN_TIMEOUT_DEFAULT_MS, 0),
+            ShareCache::Immutable => (
+                IMMUTABLE_TIMEOUT_MS,
+                IMMUTABLE_TIMEOUT_MS,
+                IMMUTABLE_TIMEOUT_MS,
+            ),
+        }
+    }
+
+    /// Arguments for the bundled `vk virtiofsd` to serve this cache mode.
+    pub fn virtiofsd_args(self) -> Vec<String> {
+        let (entry, attr, negative) = self.timeouts_ms();
+        let policy = match self {
+            ShareCache::Auto => "auto",
+            ShareCache::Immutable => "always",
+        };
+        vec![
+            format!("--cache={policy}"),
+            format!("--entry-timeout-ms={entry}"),
+            format!("--attr-timeout-ms={attr}"),
+            format!("--negative-timeout-ms={negative}"),
+        ]
+    }
 }
 
 /// Drop windows that do not fit the guest's DAX span so the agent receives only usable tags.
@@ -1144,6 +1223,33 @@ mod tests {
         policy.share().map(|d| d.window)
     }
 
+    #[test]
+    fn an_immutable_share_is_served_cache_always_with_day_long_validity() {
+        assert_eq!(ShareCache::Auto.krun_policy(), KRUN_CACHE_AUTO);
+        assert_eq!(ShareCache::Auto.timeouts_ms(), (5_000, 5_000, 0));
+        assert_eq!(
+            ShareCache::Auto.virtiofsd_args(),
+            [
+                "--cache=auto",
+                "--entry-timeout-ms=5000",
+                "--attr-timeout-ms=5000",
+                "--negative-timeout-ms=0"
+            ]
+        );
+        assert_eq!(ShareCache::Immutable.krun_policy(), KRUN_CACHE_ALWAYS);
+        let day = 86_400_000;
+        assert_eq!(ShareCache::Immutable.timeouts_ms(), (day, day, day));
+        assert_eq!(
+            ShareCache::Immutable.virtiofsd_args()[0..2],
+            ["--cache=always", "--entry-timeout-ms=86400000"]
+        );
+        // Specs predating the cache field retain the default caching policy.
+        let spec: FsShare =
+            serde_json::from_str(r#"{"tag":"t","socket":"/s","host_dir":"/h","read_only":true}"#)
+                .unwrap();
+        assert_eq!(spec.cache, ShareCache::Auto);
+    }
+
     fn dax_share(tag: &str, dax: Option<u64>) -> FsShare {
         FsShare {
             tag: tag.into(),
@@ -1156,6 +1262,7 @@ mod tests {
             }),
             uid_map: Vec::new(),
             gid_map: Vec::new(),
+            cache: ShareCache::Auto,
         }
     }
 
@@ -1234,6 +1341,7 @@ mod tests {
                 dax: None,
                 uid_map: Vec::new(),
                 gid_map: Vec::new(),
+                cache: ShareCache::Auto,
             }],
             vsock_cid: 3,
             vsock_socket: "/job/vsock.sock".into(),
