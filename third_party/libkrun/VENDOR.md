@@ -315,3 +315,11 @@ guest offers it (a `dax=inode` mount) and sets `ATTR_DAX` on the entries of regu
 above the floor, so only those are mapped through the window. Every DAX mapping costs a host
 mmap and a guest EPT invalidation per 2 MiB range whatever the file's size; a source tree's
 small files never repay it. Covered by `lookup_marks_large_regular_files_for_dax`.
+
+`src/devices/src/virtio/fs/server.rs` — READDIRPLUS forgets an entry that did not fit the reply.
+The filesystem has to look an entry up before the server can tell whether it fits, and that
+lookup takes a reference on the inode; an entry the guest never receives is one the kernel never
+counted, so no FORGET ever releases it and `PassthroughFs` keeps its O_PATH fd for the life of
+the mount. Upstream virtiofsd forgets it there; upstream libkrun does not. On a 37k-entry source
+tree, 362 inodes stayed pinned after the guest had dropped every cached dentry. Covered by
+`readdirplus_forgets_the_entry_that_did_not_fit`.

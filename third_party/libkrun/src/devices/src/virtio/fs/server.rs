@@ -992,7 +992,20 @@ impl<F: FileSystem + Sync> Server<F> {
                 fh.into(),
                 size,
                 offset,
-                |d, e| add_dirent(&mut cursor, size, d, Some(e)),
+                |d, e| {
+                    // `readdirplus` looked this entry up, which took a reference on the inode.
+                    // An entry that does not reach the guest is one the kernel never counted,
+                    // so it will never FORGET it: release that reference here, or the inode --
+                    // and whatever the filesystem pins with it -- is held for the life of the
+                    // mount. At most one entry per call fails to fit; the guest re-lists it
+                    // from the same offset on the next call.
+                    let inode = e.inode;
+                    let res = add_dirent(&mut cursor, size, d, Some(e));
+                    if !matches!(res, Ok(len) if len > 0) {
+                        self.fs.forget(Context::from(in_header), inode.into(), 1);
+                    }
+                    res
+                },
             )
         } else {
             self.fs.readdir(
@@ -1654,4 +1667,130 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
     }
 
     Ok(extensions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::virtio::descriptor_utils::{create_descriptor_chain, DescriptorType};
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
+
+    /// Serves three entries from one directory, recording every lookup it does for them and
+    /// every FORGET the server sends back.
+    #[derive(Default)]
+    struct DirFs {
+        looked_up: Mutex<Vec<u64>>,
+        forgotten: Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl FileSystem for DirFs {
+        type Inode = u64;
+        type Handle = u64;
+
+        fn forget(&self, _ctx: Context, inode: u64, count: u64) {
+            self.forgotten.lock().unwrap().push((inode, count));
+        }
+
+        fn readdirplus<F>(
+            &self,
+            _ctx: Context,
+            _inode: u64,
+            _handle: u64,
+            _size: u32,
+            _offset: u64,
+            mut add_entry: F,
+        ) -> io::Result<()>
+        where
+            F: FnMut(DirEntry, Entry) -> io::Result<usize>,
+        {
+            for inode in 1..=3u64 {
+                let name = format!("entry-{inode}");
+                // A readdirplus entry costs a lookup before the server can know whether it
+                // fits, exactly as `PassthroughFs` does.
+                self.looked_up.lock().unwrap().push(inode);
+                let entry = Entry {
+                    inode,
+                    generation: 0,
+                    attr: unsafe { std::mem::zeroed() },
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: Duration::ZERO,
+                };
+                let dirent = DirEntry {
+                    ino: inode,
+                    offset: inode,
+                    type_: u32::from(libc::DT_REG),
+                    name: name.as_bytes(),
+                };
+                if add_entry(dirent, entry)? == 0 {
+                    break;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn readdirplus_forgets_the_entry_that_did_not_fit() {
+        // `entry-N` is 7 bytes, so one entry is an `EntryOut` plus a `Dirent` and the name
+        // padded to 8. Sizing the reply at one and a half of those leaves the second entry
+        // looked up but unsent.
+        let one = (size_of::<EntryOut>() + size_of::<Dirent>() + 8) as u32;
+        let reply_size = one + one / 2;
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let buf = GuestAddress(0x1000);
+        let req_len = (size_of::<InHeader>() + size_of::<ReadIn>()) as u32;
+        let chain = create_descriptor_chain(
+            &mem,
+            GuestAddress(0),
+            buf,
+            vec![
+                (DescriptorType::Readable, req_len),
+                (DescriptorType::Writable, 0x1000),
+            ],
+            0,
+        )
+        .unwrap();
+
+        let in_header = InHeader {
+            len: req_len,
+            opcode: Opcode::Readdirplus as u32,
+            unique: 1,
+            nodeid: ROOT_ID,
+            ..Default::default()
+        };
+        mem.write_slice(in_header.as_slice(), buf).unwrap();
+        let read_in = ReadIn {
+            size: reply_size,
+            ..Default::default()
+        };
+        let read_in_addr = buf
+            .checked_add(size_of::<InHeader>() as u64)
+            .expect("request header fits in guest memory");
+        mem.write_slice(read_in.as_slice(), read_in_addr).unwrap();
+
+        let server = Server::new(DirFs::default());
+        server
+            .handle_message(
+                Reader::new(&mem, chain.clone()).unwrap(),
+                Writer::new(&mem, chain).unwrap(),
+                &None,
+                &Arc::new(AtomicI32::new(0)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            *server.fs.looked_up.lock().unwrap(),
+            vec![1, 2],
+            "the second entry is looked up before the server can tell it will not fit"
+        );
+        assert_eq!(
+            *server.fs.forgotten.lock().unwrap(),
+            vec![(2, 1)],
+            "the entry the guest never sees must be forgotten, and only that one"
+        );
+    }
 }
