@@ -792,7 +792,11 @@ impl PassthroughFs {
                 if flags & libc::O_DIRECTORY == 0 {
                     opts |= OpenOptions::KEEP_CACHE;
                 } else {
-                    opts |= OpenOptions::CACHE_DIR;
+                    // FOPEN_KEEP_CACHE as well: `fuse_dir_open` (fs/fuse/dir.c) drops the
+                    // directory's page cache on every opendir without it, which is where the
+                    // FOPEN_CACHE_DIR readdir cache lives, so every directory would be
+                    // re-read from the host on every pass over the tree.
+                    opts |= OpenOptions::CACHE_DIR | OpenOptions::KEEP_CACHE;
                 }
             }
             _ => {}

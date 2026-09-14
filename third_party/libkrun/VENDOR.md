@@ -38,6 +38,14 @@ every earlier entry point behaves as before. Used by virtkit for shares whose ho
 read-only for the VM's life (a job's checkout behind its overlay): `always` with day-long
 validity, so a tree-wide pass round-trips once.
 
+`src/devices/src/virtio/fs/{linux,macos}/passthrough.rs` — `do_open` on a directory under
+`CachePolicy::Always` replies `FOPEN_CACHE_DIR | FOPEN_KEEP_CACHE` instead of `FOPEN_CACHE_DIR`
+alone. The kernel's readdir cache lives in the directory inode's page cache, and
+`fuse_dir_open` (fs/fuse/dir.c) drops those pages on every `opendir` unless `FOPEN_KEEP_CACHE`
+is set, so without it every directory was re-read (a full `READDIRPLUS`, one host lookup per
+entry) on every pass over the tree, whatever the entry timeouts said. Upstream virtiofsd has
+the same omission. `auto`/`never` are untouched.
+
 `src/devices/src/virtio/descriptor_utils.rs` + `src/devices/src/virtio/fs/mod.rs` —
 expose the fs engine to external transports: `Reader/Writer::from_volatile_slices`
 constructors (build a FUSE request view from buffers collected by another virtio
