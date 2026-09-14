@@ -46,6 +46,18 @@ is set, so without it every directory was re-read (a full `READDIRPLUS`, one hos
 entry) on every pass over the tree, whatever the entry timeouts said. Upstream virtiofsd has
 the same omission. `auto`/`never` are untouched.
 
+`src/devices/src/virtio/fs/linux/passthrough.rs` — a `CachePolicy::Always` share serves its
+directories without `opendir`. `init` advertises `FUSE_NO_OPENDIR_SUPPORT` and `opendir`
+answers `ENOSYS`, which is what actually sets `fc->no_opendir` (`fuse_file_open`,
+fs/fuse/file.c): the guest then sends no `OPENDIR` or `RELEASEDIR` for the life of the mount
+and uses the kernel's own `FOPEN_KEEP_CACHE|FOPEN_CACHE_DIR` defaults, removing the last
+per-directory round trip of a pass over the tree. `READDIR`/`READDIRPLUS` and `FSYNCDIR` then
+carry no handle, and are served through a descriptor opened from the inode for that request
+alone — the offset comes from the request, so nothing is lost with the handle. `auto`/`never`
+keep `opendir`: it is where the kernel drops a directory's cached listing. The macOS
+passthrough is untouched; its readdir reads through a per-handle cached `DIR*` stream rather
+than a request-scoped `getdents64`, so it has no cheap handle-less path.
+
 `src/devices/src/virtio/descriptor_utils.rs` + `src/devices/src/virtio/fs/mod.rs` —
 expose the fs engine to external transports: `Reader/Writer::from_volatile_slices`
 constructors (build a FUSE request view from buffers collected by another virtio

@@ -157,6 +157,23 @@ fn einval() -> io::Error {
     io::Error::from_raw_os_error(libc::EINVAL)
 }
 
+fn fsync_fd(fd: RawFd, datasync: bool) -> io::Result<()> {
+    // Safe because this doesn't modify any memory and we check the return value.
+    let res = unsafe {
+        if datasync {
+            libc::fdatasync(fd)
+        } else {
+            libc::fsync(fd)
+        }
+    };
+
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn stat(f: &File) -> io::Result<libc::stat64> {
     let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
@@ -444,6 +461,12 @@ pub struct PassthroughFs {
     // `cfg.writeback` is true and `init` was called with `FsOptions::WRITEBACK_CACHE`.
     writeback: AtomicBool,
     announce_submounts: AtomicBool,
+
+    // Whether the guest was told to skip OPENDIR and RELEASEDIR. Set in `init` for a
+    // cache=always share only; directory requests then arrive with no handle and are served
+    // through an fd opened for the request alone.
+    zero_message_opendir: AtomicBool,
+
     my_uid: Option<libc::uid_t>,
     my_gid: Option<libc::gid_t>,
     cap_fowner: bool,
@@ -514,6 +537,7 @@ impl PassthroughFs {
 
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
+            zero_message_opendir: AtomicBool::new(false),
             my_uid,
             my_gid,
             cap_fowner,
@@ -609,14 +633,24 @@ impl PassthroughFs {
             return Ok(());
         }
 
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = if self.zero_message_opendir.load(Ordering::Relaxed) {
+            // The guest never sent an OPENDIR, so there is no handle to read through. The
+            // request carries the offset the kernel wants, so an fd opened for this request
+            // alone answers it.
+            Arc::new(HandleData {
+                inode,
+                file: RwLock::new(self.open_inode(inode, libc::O_RDONLY | libc::O_DIRECTORY)?),
+                exported: Default::default(),
+            })
+        } else {
+            self.handles
+                .read()
+                .unwrap()
+                .get(&handle)
+                .filter(|hd| hd.inode == inode)
+                .cloned()
+                .ok_or_else(ebadf)?
+        };
 
         let mut buf = vec![0; size as usize];
 
@@ -975,6 +1009,18 @@ impl FileSystem for PassthroughFs {
             self.announce_submounts.store(true, Ordering::Relaxed);
         }
 
+        // A cache=always share's tree cannot change behind the guest's back, so let it skip
+        // OPENDIR and RELEASEDIR for every directory and use the kernel's own
+        // FOPEN_KEEP_CACHE|FOPEN_CACHE_DIR defaults — two fewer round trips per directory per
+        // pass over the tree. cache=auto keeps them: the OPENDIR is where the kernel drops a
+        // directory's cached listing.
+        if matches!(self.cfg.cache_policy, CachePolicy::Always)
+            && capable.contains(FsOptions::ZERO_MESSAGE_OPENDIR)
+        {
+            opts |= FsOptions::ZERO_MESSAGE_OPENDIR;
+            self.zero_message_opendir.store(true, Ordering::Relaxed);
+        }
+
         Ok(opts)
     }
 
@@ -1134,6 +1180,12 @@ impl FileSystem for PassthroughFs {
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        if self.zero_message_opendir.load(Ordering::Relaxed) {
+            // Declining OPENDIR is what actually stops it: `fuse_file_open` (fs/fuse/file.c)
+            // sets `fc->no_opendir` on ENOSYS and sends no further OPENDIR or RELEASEDIR on
+            // this connection. Advertising FUSE_NO_OPENDIR_SUPPORT only says we may do so.
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
         self.do_open(inode, false, flags | (libc::O_DIRECTORY as u32))
     }
 
@@ -1144,6 +1196,9 @@ impl FileSystem for PassthroughFs {
         _flags: u32,
         handle: Handle,
     ) -> io::Result<()> {
+        if self.zero_message_opendir.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         self.do_release(inode, handle)
     }
 
@@ -1769,20 +1824,7 @@ impl FileSystem for PassthroughFs {
 
         let fd = data.file.write().unwrap().as_raw_fd();
 
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe {
-            if datasync {
-                libc::fdatasync(fd)
-            } else {
-                libc::fsync(fd)
-            }
-        };
-
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        fsync_fd(fd, datasync)
     }
 
     fn fsyncdir(
@@ -1792,6 +1834,11 @@ impl FileSystem for PassthroughFs {
         datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
+        if self.zero_message_opendir.load(Ordering::Relaxed) {
+            // No OPENDIR, so no handle: reach the directory through the inode instead.
+            let dir = self.open_inode(inode, libc::O_RDONLY | libc::O_DIRECTORY)?;
+            return fsync_fd(dir.as_raw_fd(), datasync);
+        }
         self.fsync(ctx, inode, datasync, handle)
     }
 
