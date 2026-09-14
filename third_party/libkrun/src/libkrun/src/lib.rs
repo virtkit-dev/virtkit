@@ -15,6 +15,8 @@ use env_logger::{Env, Target};
 use krun_display::DisplayBackend;
 
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+use devices::virtio::fs::passthrough::CachePolicy;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
 use libc::{c_char, c_int, size_t};
 use once_cell::sync::Lazy;
@@ -643,6 +645,9 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
                 read_only: false,
                 uid_map: Vec::new(),
                 gid_map: Vec::new(),
+                cache_policy: Default::default(),
+                entry_timeout_ms: KRUN_FS_TIMEOUT_DEFAULT_MS,
+                attr_timeout_ms: KRUN_FS_TIMEOUT_DEFAULT_MS,
                 negative_timeout_ms: 0,
                 dax_inode_min: None,
                 virtual_entries: {
@@ -743,6 +748,58 @@ pub unsafe extern "C" fn krun_add_virtiofs5(
     c_gid_map: *const c_char,
     dax_inode_min: u64,
 ) -> i32 {
+    krun_add_virtiofs6(
+        ctx_id,
+        c_tag,
+        c_path,
+        shm_size,
+        read_only,
+        c_uid_map,
+        c_gid_map,
+        dax_inode_min,
+        KRUN_FS_CACHE_AUTO,
+        KRUN_FS_TIMEOUT_DEFAULT_MS,
+        KRUN_FS_TIMEOUT_DEFAULT_MS,
+        0,
+    )
+}
+
+/// `cache_policy` values for `krun_add_virtiofs6`: what the guest may cache of a share.
+/// `KRUN_FS_CACHE_AUTO` is close-to-open consistency (what every earlier `krun_add_virtiofs*`
+/// gives); `KRUN_FS_CACHE_ALWAYS` lets the guest keep what it cached, for a tree the host
+/// never changes while it is shared; `KRUN_FS_CACHE_NEVER` caches nothing.
+pub const KRUN_FS_CACHE_NEVER: u32 = 0;
+pub const KRUN_FS_CACHE_AUTO: u32 = 1;
+pub const KRUN_FS_CACHE_ALWAYS: u32 = 2;
+/// The entry/attribute validity every earlier `krun_add_virtiofs*` gives a share.
+pub const KRUN_FS_TIMEOUT_DEFAULT_MS: u32 = 5_000;
+
+/// `krun_add_virtiofs5` plus the guest's caching of the share: `cache_policy` is one of the
+/// `KRUN_FS_CACHE_*` codes, and the `*_timeout_ms` say how long (ms) the guest may reuse a
+/// looked-up entry, fetched attributes, and a failed lookup without asking the host again.
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub unsafe extern "C" fn krun_add_virtiofs6(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    shm_size: u64,
+    read_only: bool,
+    c_uid_map: *const c_char,
+    c_gid_map: *const c_char,
+    dax_inode_min: u64,
+    cache_policy: u32,
+    entry_timeout_ms: u32,
+    attr_timeout_ms: u32,
+    negative_timeout_ms: u32,
+) -> i32 {
+    let cache_policy = match cache_policy {
+        KRUN_FS_CACHE_NEVER => CachePolicy::Never,
+        KRUN_FS_CACHE_AUTO => CachePolicy::Auto,
+        KRUN_FS_CACHE_ALWAYS => CachePolicy::Always,
+        _ => return -libc::EINVAL,
+    };
     if c_tag.is_null() {
         return -libc::EINVAL;
     }
@@ -809,7 +866,10 @@ pub unsafe extern "C" fn krun_add_virtiofs5(
                 uid_map,
                 gid_map,
                 virtual_entries,
-                negative_timeout_ms: 0,
+                cache_policy,
+                entry_timeout_ms,
+                attr_timeout_ms,
+                negative_timeout_ms,
                 dax_inode_min: (dax_inode_min > 0).then_some(dax_inode_min),
             });
         }
@@ -2559,6 +2619,9 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                 uid_map: Vec::new(),
                 gid_map: Vec::new(),
                 virtual_entries,
+                cache_policy: Default::default(),
+                entry_timeout_ms: KRUN_FS_TIMEOUT_DEFAULT_MS,
+                attr_timeout_ms: KRUN_FS_TIMEOUT_DEFAULT_MS,
                 negative_timeout_ms: 0,
                 dax_inode_min: None,
             });

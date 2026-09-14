@@ -1,3 +1,4 @@
+use devices::virtio::fs::passthrough::CachePolicy;
 #[cfg(not(feature = "aws-nitro"))]
 use devices::virtio::fs::virtual_entry::VirtualDirEntry;
 
@@ -15,6 +16,14 @@ pub struct FsDeviceConfig {
     pub gid_map: Vec<String>,
     #[cfg(not(feature = "aws-nitro"))]
     pub virtual_entries: Vec<VirtualDirEntry>,
+    /// What the guest may cache of this share's data: `Auto` (the default) is close-to-open
+    /// consistency, `Always` keeps whatever it cached — for a tree the host never changes
+    /// while it is shared — and `Never` caches nothing.
+    pub cache_policy: CachePolicy,
+    /// How long (ms) the guest may reuse a directory entry it looked up without asking again.
+    pub entry_timeout_ms: u32,
+    /// How long (ms) the guest may reuse the attributes it fetched for an inode.
+    pub attr_timeout_ms: u32,
     /// How long (ms) the guest may cache a failed (ENOENT) lookup. `0` = no caching
     /// (the previous behavior: every miss round-trips).
     pub negative_timeout_ms: u32,

@@ -2009,6 +2009,9 @@ fn attach_fs_devices(
                 config.uid_map.clone(),
                 config.gid_map.clone(),
                 config.virtual_entries.clone(),
+                config.cache_policy.clone(),
+                config.entry_timeout_ms,
+                config.attr_timeout_ms,
                 config.negative_timeout_ms,
                 config.dax_inode_min,
             )
