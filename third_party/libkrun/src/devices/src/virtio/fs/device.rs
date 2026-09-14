@@ -73,6 +73,7 @@ impl Fs {
         entry_timeout_ms: u32,
         attr_timeout_ms: u32,
         negative_timeout_ms: u32,
+        xattr: bool,
         dax_inode_min: Option<u64>,
     ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
@@ -88,6 +89,7 @@ impl Fs {
             entry_timeout: std::time::Duration::from_millis(entry_timeout_ms.into()),
             attr_timeout: std::time::Duration::from_millis(attr_timeout_ms.into()),
             negative_timeout: std::time::Duration::from_millis(negative_timeout_ms.into()),
+            xattr,
             dax_inode_min,
             ..Default::default()
         });

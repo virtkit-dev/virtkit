@@ -27,6 +27,9 @@ pub struct FsDeviceConfig {
     /// How long (ms) the guest may cache a failed (ENOENT) lookup. `0` = no caching
     /// (the previous behavior: every miss round-trips).
     pub negative_timeout_ms: u32,
+    /// Whether the share serves extended attributes. `false` answers every xattr request
+    /// `ENOSYS`, which is what makes the guest stop sending them for the life of the mount.
+    pub xattr: bool,
     /// Per-inode DAX: regular files at least this many bytes are marked for DAX
     /// (`ATTR_DAX`), for a guest that mounts the share `dax=inode`. `None` = the mount
     /// option alone decides.

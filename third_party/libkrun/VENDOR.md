@@ -32,9 +32,13 @@ Additive: with no map, behaviour is unchanged. Used by virtkit to squash the Git
 `cache_policy` (the passthrough engine's `never`/`auto`/`always`) and `entry_timeout_ms` /
 `attr_timeout_ms` beside the existing `negative_timeout_ms`, and `Fs::new` puts them into the
 passthrough `Config` that until now always used its defaults (auto, 5 s, 5 s).
-`krun_add_virtiofs6(…, cache_policy, entry_timeout_ms, attr_timeout_ms, negative_timeout_ms)`
-sets them (`KRUN_FS_CACHE_*` codes); `krun_add_virtiofs5` delegates with the defaults, so
-every earlier entry point behaves as before. Used by virtkit for shares whose host tree is
+`FsDeviceConfig` also carries `xattr`, the passthrough option that decides whether the share
+serves extended attributes at all (`false` answers every xattr request `ENOSYS`, and
+`fuse_getxattr`/`fuse_listxattr` in fs/fuse/xattr.c then set `no_getxattr`/`no_listxattr` and
+send no more for the life of the mount).
+`krun_add_virtiofs6(…, cache_policy, entry_timeout_ms, attr_timeout_ms, negative_timeout_ms,
+xattr)` sets them (`KRUN_FS_CACHE_*` codes); `krun_add_virtiofs5` delegates with the defaults,
+so every earlier entry point behaves as before. Used by virtkit for shares whose host tree is
 read-only for the VM's life (a job's checkout behind its overlay): `always` with day-long
 validity, so a tree-wide pass round-trips once.
 

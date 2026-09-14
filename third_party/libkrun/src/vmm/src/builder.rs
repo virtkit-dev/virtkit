@@ -2013,6 +2013,7 @@ fn attach_fs_devices(
                 config.entry_timeout_ms,
                 config.attr_timeout_ms,
                 config.negative_timeout_ms,
+                config.xattr,
                 config.dax_inode_min,
             )
             .unwrap(),

@@ -649,6 +649,7 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
                 entry_timeout_ms: KRUN_FS_TIMEOUT_DEFAULT_MS,
                 attr_timeout_ms: KRUN_FS_TIMEOUT_DEFAULT_MS,
                 negative_timeout_ms: 0,
+                xattr: true,
                 dax_inode_min: None,
                 virtual_entries: {
                     #[allow(unused_mut)]
@@ -761,6 +762,7 @@ pub unsafe extern "C" fn krun_add_virtiofs5(
         KRUN_FS_TIMEOUT_DEFAULT_MS,
         KRUN_FS_TIMEOUT_DEFAULT_MS,
         0,
+        true,
     )
 }
 
@@ -774,9 +776,11 @@ pub const KRUN_FS_CACHE_ALWAYS: u32 = 2;
 /// The entry/attribute validity every earlier `krun_add_virtiofs*` gives a share.
 pub const KRUN_FS_TIMEOUT_DEFAULT_MS: u32 = 5_000;
 
-/// `krun_add_virtiofs5` plus the guest's caching of the share: `cache_policy` is one of the
-/// `KRUN_FS_CACHE_*` codes, and the `*_timeout_ms` say how long (ms) the guest may reuse a
-/// looked-up entry, fetched attributes, and a failed lookup without asking the host again.
+/// `krun_add_virtiofs5` plus the guest's caching of the share and whether it serves extended
+/// attributes: `cache_policy` is one of the `KRUN_FS_CACHE_*` codes, the `*_timeout_ms` say how
+/// long (ms) the guest may reuse a looked-up entry, fetched attributes, and a failed lookup
+/// without asking the host again, and `xattr` false answers every xattr request `ENOSYS`, which
+/// stops the guest sending them at all.
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
@@ -793,6 +797,7 @@ pub unsafe extern "C" fn krun_add_virtiofs6(
     entry_timeout_ms: u32,
     attr_timeout_ms: u32,
     negative_timeout_ms: u32,
+    xattr: bool,
 ) -> i32 {
     let cache_policy = match cache_policy {
         KRUN_FS_CACHE_NEVER => CachePolicy::Never,
@@ -870,6 +875,7 @@ pub unsafe extern "C" fn krun_add_virtiofs6(
                 entry_timeout_ms,
                 attr_timeout_ms,
                 negative_timeout_ms,
+                xattr,
                 dax_inode_min: (dax_inode_min > 0).then_some(dax_inode_min),
             });
         }
@@ -2623,6 +2629,7 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                 entry_timeout_ms: KRUN_FS_TIMEOUT_DEFAULT_MS,
                 attr_timeout_ms: KRUN_FS_TIMEOUT_DEFAULT_MS,
                 negative_timeout_ms: 0,
+                xattr: true,
                 dax_inode_min: None,
             });
 
