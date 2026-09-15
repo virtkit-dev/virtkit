@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.72.0] - 2026-09-15
+
 ### Added
 
 - **Every VM on a multi-socket host is now placed on one memory node.** A `vk run`
@@ -2842,7 +2844,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.71.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.72.0...HEAD
+[0.72.0]: https://github.com/virtkit-dev/virtkit/compare/v0.71.0...v0.72.0
 [0.71.0]: https://github.com/virtkit-dev/virtkit/compare/v0.70.1...v0.71.0
 [0.70.1]: https://github.com/virtkit-dev/virtkit/compare/v0.70.0...v0.70.1
 [0.70.0]: https://github.com/virtkit-dev/virtkit/compare/v0.69.0...v0.70.0
