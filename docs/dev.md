@@ -474,9 +474,13 @@ vk dev gc ENVIRONMENT_NAME --yes
 
 `list` and `gc` work from anywhere without a project config. Copy names from
 `list`; they identify state directories, not just the config's `dev` or `hook`
-selector. `gc` refuses running environments. `--all-stale` selects stopped state
-whose workspace is gone or which never recorded a boot, including leftovers
-from throwaway tasks. It does not mean every stopped development environment.
+selector. The `MEM` column shows what a running environment's VM holds on the
+host now over the size it booted with (`1.2G/8G`), the same figure `vk list`
+reports; a stopped environment reads `-`, and `mem_used_bytes` in `--json` is
+null for it. `gc` refuses running environments. `--all-stale` selects stopped
+state whose workspace is gone or which never recorded a boot, including
+leftovers from throwaway tasks. It does not mean every stopped development
+environment.
 
 Without `--yes`, GC asks on a terminal; without a terminal it only lists what
 would be removed. GC deletes state directories, including managed data inside

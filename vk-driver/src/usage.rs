@@ -643,6 +643,54 @@ pub(crate) fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
+/// The memory a process tree holds *now*, in bytes — `root` and every process descending
+/// from it, which for a VM is the guest, its compose service VMs, the switch, the
+/// virtiofsds and the forwards. The live figure [`Usage::peak_rss`] deliberately is not:
+/// `vk list` reports what a VM is costing the host at this moment, not the demand it once
+/// passed through.
+///
+/// Proportional (`Pss`), because the tree shares pages with itself: the driver, the libkrun
+/// keeper and the boot child it forked all map this binary's text, and summing their `VmRSS`
+/// would charge it three times. Reading Pss requires a page-table walk per process.
+///
+/// Processes that exit during the walk are skipped. Returns `None` when `root` is gone
+/// or no process has a readable memory measurement.
+pub(crate) fn tree_resident(root: i32) -> Option<u64> {
+    let pids = descendants(root, &HashSet::new());
+    if pids.is_empty() {
+        return None;
+    }
+    // Saturate to avoid wrapping or a debug-build panic if /proc reports an impossible total.
+    pids.into_iter()
+        .filter_map(resident)
+        .reduce(u64::saturating_add)
+}
+
+/// One process's proportional share of resident memory, in bytes. `smaps_rollup` where the
+/// kernel publishes it, else `VmRSS` — which over-counts that process's share of anything
+/// shared rather than dropping it from the tree, the safer way to be wrong about a figure
+/// the caller is summing. `None` for a process that is gone.
+fn resident(pid: i32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+        .ok()
+        .and_then(|rollup| parse_pss(&rollup))
+        .or_else(|| mem(pid).map(|(rss, _)| rss))
+}
+
+/// `Pss` from `smaps_rollup`, in bytes. Match the colon to exclude the `Pss_Anon` and
+/// `Pss_Dirty` subtotals.
+fn parse_pss(rollup: &str) -> Option<u64> {
+    rollup.lines().find_map(|l| {
+        let kb: u64 = l
+            .strip_prefix("Pss:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        kb.checked_mul(1024)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,6 +1306,84 @@ mod tests {
             }
             .summary("job"),
             "virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB"
+        );
+    }
+
+    #[test]
+    fn reads_the_proportional_share_and_not_the_subtotals_beside_it() {
+        let rollup = "55d0-7ffc ---p 00000000 00:00 0  [rollup]\n\
+                      Rss:                8148 kB\n\
+                      Pss:                7736 kB\n\
+                      Pss_Dirty:           128 kB\n\
+                      Pss_Anon:            128 kB\n";
+        // Pss, not the Pss_Dirty/Pss_Anon subsets printed under it.
+        assert_eq!(parse_pss(rollup), Some(7736 * 1024));
+        assert_eq!(parse_pss("Rss:  8148 kB\n"), None);
+        assert_eq!(parse_pss("Pss:  notanumber\n"), None);
+        assert_eq!(parse_pss("Pss:  18446744073709551615 kB\n"), None);
+    }
+
+    /// A shell that holds nothing itself and waits on a child that holds `mib`. The root is
+    /// dedicated, so unlike a reading rooted at the test process this one cannot be moved by
+    /// the sibling tests' children coming and going.
+    struct NestedHog(Reap);
+
+    impl NestedHog {
+        fn pid(&self) -> i32 {
+            self.0.pid()
+        }
+    }
+
+    impl Drop for NestedHog {
+        fn drop(&mut self) {
+            // The child owns a dedicated process group; kill its descendants too.
+            // Reap then waits for the direct child.
+            unsafe { libc::kill(-self.pid(), libc::SIGKILL) };
+        }
+    }
+
+    fn nested_hog(mib: usize) -> NestedHog {
+        use std::os::unix::process::CommandExt;
+
+        let inner = format!(
+            "s=$(head -c {} /dev/zero | tr \"\\0\" x); while true; do sleep 1; done",
+            mib * 1024 * 1024
+        );
+        NestedHog(Reap(
+            std::process::Command::new("sh")
+                .args(["-c", &format!("sh -c '{inner}' & wait")])
+                .process_group(0)
+                .spawn()
+                .expect("spawning a shell whose child holds memory"),
+        ))
+    }
+
+    #[test]
+    fn tree_resident_descends_to_a_child_and_reports_nothing_for_a_dead_root() {
+        // A pid that cannot exist has no tree, which is not the same as a tree of zero:
+        // `vk list` dashes the cell rather than claiming the VM holds nothing.
+        assert_eq!(tree_resident(-1), None);
+
+        let root = nested_hog(64);
+        let grown = Instant::now();
+        while tree_resident(root.pid()).is_none_or(|t| t < 32 * 1024 * 1024) {
+            assert!(
+                grown.elapsed() < Duration::from_secs(30),
+                "the child never grew"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // The memory is all in the child, so a reading that stopped at the root would see
+        // almost none of it — which is exactly how `vmm_pid` reads for a VM booted with
+        // reboot-in-place, where the libkrun keeper holds nothing and its forked child holds
+        // the guest.
+        let (total, own) = (
+            tree_resident(root.pid()).unwrap(),
+            resident(root.pid()).unwrap(),
+        );
+        assert!(
+            own * 4 < total,
+            "the root holds {own} of the tree's {total}; the walk did not descend"
         );
     }
 }

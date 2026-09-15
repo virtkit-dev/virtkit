@@ -17,7 +17,8 @@
 //! `vk dev list --json` is an array of [`Row`], and its field names are the interface: they
 //! are added to, never renamed or repurposed. `size_bytes` is the exception that is absent
 //! rather than null — measuring a state directory walks all of it, and `--no-sizes` skips
-//! the default measurement.
+//! the default measurement. `mem_used_bytes` is always requested; null means the environment
+//! is stopped or its memory could not be read.
 
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
@@ -72,6 +73,20 @@ impl Flag {
     }
 }
 
+/// A running VM as [`scan`] needs it: the state directory that ties it to a row, plus the
+/// memory facts that row reports. Carried as its own type rather than a [`crate::vms::VmEntry`]
+/// so `scan` stays a pure function over facts a test can state outright — measuring a live
+/// process tree is the caller's job, not the scan's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Running {
+    /// the VM's `--state-dir`, as the registry recorded it
+    pub state_dir: PathBuf,
+    /// what its whole process tree holds on the host now (`crate::usage::tree_resident`);
+    /// `None` when the tree could not be read
+    pub mem_used: Option<u64>,
+    /// the memory size it booted with, the `--mem` token verbatim
+    pub mem: Option<String>,
+}
 /// One state directory, as `vk dev list` reports it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Row {
@@ -87,6 +102,14 @@ pub struct Row {
     pub booted_secs: Option<u64>,
     /// how long ago that boot was, at the time of the scan
     pub age_secs: Option<u64>,
+    /// what the environment's VM holds on the host right now, in bytes: its whole process
+    /// tree, counted proportionally, the same figure `vk list` reports. `null` for an
+    /// environment that is not running — a stopped one holds nothing, which is a fact, not a
+    /// missing measurement — and for a running one whose tree could not be read.
+    pub mem_used_bytes: Option<u64>,
+    /// the memory size its VM booted with, the `--mem` token as recorded; `null` when it is
+    /// not running, or the run recorded none
+    pub mem: Option<String>,
     /// what the directory holds; measured by default, omitted with `--no-sizes`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size_bytes: Option<u64>,
@@ -115,7 +138,7 @@ pub struct Entry {
 /// List state directories under `base`, using `running` to identify active VMs. Read-only.
 /// Keep rows with absent or unreadable `dev.json` so `gc` can collect them.
 /// `sizes` measures each directory, walking its root images and server trees.
-pub fn scan(base: &Path, running: &[PathBuf], sizes: bool) -> Vec<Row> {
+pub fn scan(base: &Path, running: &[Running], sizes: bool) -> Vec<Row> {
     let Ok(entries) = std::fs::read_dir(base) else {
         return Vec::new();
     };
@@ -128,7 +151,7 @@ pub fn scan(base: &Path, running: &[PathBuf], sizes: bool) -> Vec<Row> {
     rows
 }
 
-fn row(dir: &Path, running: &[PathBuf], sizes: bool) -> Row {
+fn row(dir: &Path, running: &[Running], sizes: bool) -> Row {
     let identity = std::fs::read(dir.join("dev.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<crate::dev::Identity>(&b).ok());
@@ -139,7 +162,9 @@ fn row(dir: &Path, running: &[PathBuf], sizes: bool) -> Row {
     // The registry records canonical state dirs, so compare against both forms: the base
     // itself reaches us through `$HOME`, which is a symlink on some hosts.
     let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let is_running = running.iter().any(|r| r == dir || r == &canonical);
+    let live = running
+        .iter()
+        .find(|r| r.state_dir == dir || r.state_dir == canonical);
     let mut flags = Vec::new();
     // Require the workspace's parent to exist: an unmounted share or unplugged disk must
     // not make its environments stale and let `gc --all-stale --yes` destroy their storage.
@@ -160,7 +185,7 @@ fn row(dir: &Path, running: &[PathBuf], sizes: bool) -> Row {
         dir: dir.to_path_buf(),
         workspace,
         environment: manifest("environment"),
-        status: match (is_running, identity.is_some()) {
+        status: match (live.is_some(), identity.is_some()) {
             (true, _) => Status::Running,
             (false, true) => Status::Stopped,
             (false, false) => Status::NeverBooted,
@@ -171,6 +196,8 @@ fn row(dir: &Path, running: &[PathBuf], sizes: bool) -> Row {
             .filter(|by| !by.is_empty()),
         booted_secs,
         age_secs: booted_secs.map(|s| crate::vms::unix_now().saturating_sub(s)),
+        mem_used_bytes: live.and_then(|r| r.mem_used),
+        mem: live.and_then(|r| r.mem.clone()),
         size_bytes: sizes.then(|| crate::dev::storage::dir_size(dir)),
         flags,
     }
@@ -253,6 +280,7 @@ pub fn render(rows: &[Row]) -> String {
                     .map(short_creator)
                     .unwrap_or_default(),
                 r.age_secs.map(crate::vms::fmt_uptime).unwrap_or_default(),
+                crate::vms::mem_cell(r.mem_used_bytes, r.mem.as_deref()),
                 fmt_size(r.size_bytes),
                 r.flags
                     .iter()
@@ -270,6 +298,7 @@ pub fn render(rows: &[Row]) -> String {
             "STATUS",
             "CREATED BY",
             "LAST BOOT",
+            "MEM",
             "ON DISK",
             "FLAGS",
         ],
@@ -409,11 +438,28 @@ pub fn remove(selected: &[Row]) -> Result<String> {
     Ok(out)
 }
 
-/// The state dirs VMs are currently up on.
+/// Running VMs' state directories. `remove` needs only liveness, so this skips the memory
+/// walk in [`running_vms`].
 fn running_dirs() -> Vec<PathBuf> {
     crate::vms::running()
         .into_iter()
         .map(|e| e.state_dir)
+        .collect()
+}
+/// The running VMs, each with the live memory reading its row reports. One `/proc` walk per
+/// VM, which is cheap beside the stat walk of every file that `sizes` does by default — and
+/// unlike that one it has no opt-out, since a row with no memory figure would not say
+/// whether the VM holds nothing or was never asked.
+fn running_vms() -> Vec<Running> {
+    crate::vms::running()
+        .into_iter()
+        .map(|e| Running {
+            mem_used: i32::try_from(e.pid)
+                .ok()
+                .and_then(crate::usage::tree_resident),
+            mem: e.mem,
+            state_dir: e.state_dir,
+        })
         .collect()
 }
 
@@ -423,7 +469,7 @@ fn running_dirs() -> Vec<PathBuf> {
 pub fn state(sizes: bool) -> Result<Vec<Row>> {
     Ok(scan(
         &crate::dev::plan::dev_state_base()?,
-        &running_dirs(),
+        &running_vms(),
         sizes,
     ))
 }
@@ -612,8 +658,17 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let dir = booted(&base, "repo-aaaa", &workspace, "vk 0.62.0 (abcdef)");
 
-        let rows = scan(&base, &[dir], true);
+        let live = Running {
+            state_dir: dir,
+            mem_used: Some(1_288_490_189),
+            mem: Some("8G".into()),
+        };
+        let rows = scan(&base, std::slice::from_ref(&live), true);
         assert_eq!(rows[0].status, Status::Running);
+        // A running row carries the live figure and the size it booted with, so the MEM
+        // column has both halves; a stopped one has neither (see the render test).
+        assert_eq!(rows[0].mem_used_bytes, Some(1_288_490_189));
+        assert_eq!(rows[0].mem.as_deref(), Some("8G"));
         assert!(!rows[0].stale());
         let e = select_gc(rows, &["repo-aaaa".into()], false).unwrap_err();
         assert!(format!("{e:#}").contains("repo-aaaa is running"), "{e:#}");
@@ -659,7 +714,10 @@ mod tests {
     fn render_aligns_the_columns_and_names_what_is_missing() {
         let tmp = scratch("render");
         let base = tmp.0.join("state");
+        let workspace = tmp.0.join("repo");
         std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let up = booted(&base, "a-live-dddd", &workspace, "vk 0.62.0 (abcdef)");
         booted(
             &base,
             "gone-bbbb",
@@ -667,29 +725,48 @@ mod tests {
             "vk 0.62.0 (abcdef)",
         );
         ephemeral(&base, "repo-hook-cccc");
-        let mut rows = scan(&base, &[], true);
-        // Fixed, so the column reads the same on every run.
-        rows[0].age_secs = Some(7200);
+        let live = Running {
+            state_dir: up,
+            mem_used: Some(1_288_490_189),
+            mem: Some("8G".into()),
+        };
+        let mut rows = scan(&base, std::slice::from_ref(&live), true);
+        // Fixed, so the columns read the same on every run.
+        for row in &mut rows {
+            row.age_secs = row.age_secs.map(|_| 7200);
+        }
 
         let out = render(&rows);
         let lines: Vec<&str> = out.lines().collect();
         assert!(lines[0].starts_with("NAME"), "{out}");
         assert!(
-            lines[0].contains("CREATED BY  LAST BOOT  ON DISK  FLAGS"),
+            lines[0].contains("CREATED BY  LAST BOOT  MEM      ON DISK  FLAGS"),
+            "{out}"
+        );
+        // The running row is the only one holding memory: what its tree holds now over the
+        // size it booted with, the same cell `vk list` prints.
+        assert!(
+            lines[1].contains("running") && lines[1].contains("1.2G/8G"),
             "{out}"
         );
         assert!(
-            lines[1].contains("stopped") && lines[1].contains("vk 0.62.0"),
+            lines[2].contains("stopped") && lines[2].contains("vk 0.62.0"),
+            "{out}"
+        );
+        // A stopped environment holds nothing, and the column says so rather than guessing
+        // from the `--mem` its last boot used.
+        assert!(
+            lines[2].contains("2h0m") && lines[2].ends_with("workspace missing"),
             "{out}"
         );
         assert!(
-            lines[1].contains("2h0m") && lines[1].ends_with("workspace missing"),
-            "{out}"
+            lines[2].contains("  -  ") || lines[2].contains(" -       "),
+            "a stopped row dashes MEM: {out}"
         );
         // Nothing was recorded, so the workspace and environment columns say so.
-        assert!(lines[2].starts_with("repo-hook-cccc  ?"), "{out}");
+        assert!(lines[3].starts_with("repo-hook-cccc  ?"), "{out}");
         assert!(
-            lines[2].contains("never booted") && lines[2].ends_with("ephemeral"),
+            lines[3].contains("never booted") && lines[3].ends_with("ephemeral"),
             "{out}"
         );
         assert_eq!(render(&[]), "no dev environment state on this host\n");

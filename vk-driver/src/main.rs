@@ -1909,15 +1909,18 @@ enum Cmd {
     },
     /// List the running vk VMs
     ///
-    /// VMs started with `--state-dir`, with their pid, uptime, name, compose services,
-    /// project directory (`--workspace`, then `--workdir`, then launch directory) and
-    /// published ports (`listen->to`; `@service` when a compose sibling dials). The table
-    /// folds `$HOME` to `~` and names at most three services; `--wide` shows every service,
-    /// the project directory in full and the exec-channel address. With PID or DIR, only the
-    /// VM with that pid, or the VMs whose project is DIR or below it (or whose state dir is
-    /// DIR); a selector that names exactly one VM prints its full record instead of a table
-    /// row. The record folds nothing, so `--wide` has nothing to add there. Use `--json` or
-    /// `--field` for scripts; neither takes `--wide`, since both already report every field.
+    /// VMs started with `--state-dir`, with their pid, uptime, memory, name, compose
+    /// services, project directory (`--workspace`, then `--workdir`, then launch directory)
+    /// and published ports (`listen->to`; `@service` when a compose sibling dials). MEM is
+    /// what the VM's whole process tree holds on the host right now over the size it booted
+    /// with (`1.2G/8G`) — the guest, its service VMs and their helpers, counted
+    /// proportionally so pages they share are charged once. The table folds `$HOME` to `~`
+    /// and names at most three services; `--wide` shows every service, the project directory
+    /// in full and the exec-channel address. With PID or DIR, only the VM with that pid, or
+    /// the VMs whose project is DIR or below it (or whose state dir is DIR); a selector that
+    /// names exactly one VM prints its full record instead of a table row. The record folds
+    /// nothing, so `--wide` has nothing to add there. Use `--json` or `--field` for scripts;
+    /// neither takes `--wide`, since both already report every field.
     #[command(display_order = 6)]
     List {
         /// which VMs: a PID, or those whose project is DIR or below it (default: all)

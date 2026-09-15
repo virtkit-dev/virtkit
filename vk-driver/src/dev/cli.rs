@@ -356,10 +356,12 @@ enum DevAction {
     ///
     /// Host-wide, and needs no config in the current directory: one row per state directory
     /// under `$XDG_STATE_HOME/virtkit/dev` — which workspace and environment it belongs to,
-    /// whether it is running, which vk created it, how long ago it last booted and what it
-    /// holds on disk (`--no-sizes` skips the measure). Flagged when its workspace is gone, or
-    /// when it recorded no boot at all — the shape a task run in a throwaway environment leaves.
-    /// Reads only.
+    /// whether it is running, which vk created it, how long ago it last booted, what its VM
+    /// holds in memory and what it holds on disk (`--no-sizes` skips the disk measure). MEM
+    /// is the running VM's whole process tree over the size it booted with (`1.2G/8G`), as
+    /// `vk list` reports it, and `-` for an environment that is not running. Flagged when its
+    /// workspace is gone, or when it recorded no boot at all — the shape a task run in a
+    /// throwaway environment leaves. Reads only.
     List {
         /// print the same facts as JSON
         #[arg(long)]

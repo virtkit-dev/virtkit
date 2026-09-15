@@ -513,6 +513,10 @@ struct VmView<'a> {
     guest_ip: Option<std::net::Ipv4Addr>,
     cpus: Option<u32>,
     mem: Option<&'a str>,
+    /// Live host memory for the guest, service VMs and helpers (`usage::tree_resident`),
+    /// beside the boot-time size in `mem`. `null` when the managing `vk run` is gone or
+    /// the tree's memory could not be read from `/proc`.
+    mem_used_bytes: Option<u64>,
     nested: Option<bool>,
     atop_log: Option<&'a Path>,
     created_secs: u64,
@@ -573,6 +577,7 @@ fn view<'a>(
     published: &'a [Published],
     freshness: Freshness,
     stale: bool,
+    mem_used: Option<u64>,
 ) -> VmView<'a> {
     VmView {
         state_dir: &entry.state_dir,
@@ -586,6 +591,7 @@ fn view<'a>(
         guest_ip: entry.guest_ip,
         cpus: entry.cpus,
         mem: entry.mem.as_deref(),
+        mem_used_bytes: mem_used,
         nested: entry.nested,
         atop_log: entry.atop_log.as_deref(),
         created_secs: entry.created_secs,
@@ -804,6 +810,42 @@ fn services_cell(entry: &VmEntry, units: Option<&[UnitStatus]>, wide: bool) -> S
     )
 }
 
+/// The `MEM` cell pairs live process-tree usage with the boot-time size: `1.2G/8G`.
+/// Usage includes service VMs and helpers, so this is not guest used/total memory.
+/// Each unknown half reads `-` (an unreadable tree or an older `vk run` that did not record
+/// `--mem`); when both are unknown, the cell is a single `-`.
+pub(crate) fn mem_cell(used: Option<u64>, configured: Option<&str>) -> String {
+    if used.is_none() && configured.is_none() {
+        return "-".to_string();
+    }
+    format!(
+        "{}/{}",
+        used.map_or_else(|| "-".to_string(), compact_bytes),
+        configured.unwrap_or("-")
+    )
+}
+
+/// A memory figure in the narrowest form that still reads — `1.2G`, `780M`, `64K`. The
+/// spacious `usage::fmt_bytes` (`1.6 GiB`) is what the detail view uses; the table holds two
+/// figures and a slash in one column, so this drops the space and the `iB` and keeps the
+/// unit letter of the `--mem` token it sits beside.
+fn compact_bytes(bytes: u64) -> String {
+    let (gib, mib, kib) = (
+        bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        bytes as f64 / (1024.0 * 1024.0),
+        bytes as f64 / 1024.0,
+    );
+    // Each arm branches on the rounded figure it is about to print rather than a coarser
+    // one, for the reason `usage::fmt_bytes` spells out: branching on the untruncated MiB
+    // while printing the rounded one renders 1023.7 MiB as "1024M".
+    match bytes {
+        _ if mib.round() >= 1024.0 => format!("{gib:.1}G"),
+        _ if kib.round() >= 1024.0 => format!("{mib:.0}M"),
+        1024.. => format!("{kib:.0}K"),
+        _ => format!("{bytes}B"),
+    }
+}
+
 /// The PROJECT column: the directory as recorded, or with `$HOME` folded to `~` unless
 /// `wide`. `-` when the run recorded none.
 fn project_cell(project_dir: Option<&Path>, home: Option<&Path>, wide: bool) -> String {
@@ -961,6 +1003,15 @@ pub fn list_report(
         .collect();
     let units_by_vm: Vec<Option<Vec<UnitStatus>>> = vms.iter().map(service_units).collect();
     let published_by_vm: Vec<Vec<Published>> = vms.iter().map(published).collect();
+    // Measure once per VM for all output forms: table, detail record and JSON.
+    let mem_used: Vec<Option<u64>> = vms
+        .iter()
+        .map(|e| {
+            i32::try_from(e.pid)
+                .ok()
+                .and_then(crate::usage::tree_resident)
+        })
+        .collect();
 
     if json || !fields.is_empty() {
         let views: Vec<VmView> = vms
@@ -968,8 +1019,9 @@ pub fn list_report(
             .zip(&units_by_vm)
             .zip(&published_by_vm)
             .zip(&fresh)
-            .map(|(((entry, units), published), freshness)| {
-                view(entry, units.as_deref(), published, *freshness, stale)
+            .zip(&mem_used)
+            .map(|((((entry, units), published), freshness), used)| {
+                view(entry, units.as_deref(), published, *freshness, stale, *used)
             })
             .collect();
         if !fields.is_empty() {
@@ -989,14 +1041,15 @@ pub fn list_report(
         });
     }
     if full_record(target.as_ref(), vms.len())
-        && let ([e], [units], [published], [f]) = (
+        && let ([e], [units], [published], [f], [used]) = (
             vms.as_slice(),
             units_by_vm.as_slice(),
             published_by_vm.as_slice(),
             fresh.as_slice(),
+            mem_used.as_slice(),
         )
     {
-        return Ok(detail(e, units.as_deref(), published, *f, stale));
+        return Ok(detail(e, units.as_deref(), published, *f, stale, *used));
     }
     // `tilde` matches against a canonical `project_dir`, so canonicalize `$HOME` as well;
     // only the narrow table folds it.
@@ -1008,6 +1061,7 @@ pub fn list_report(
         &units_by_vm,
         &published_by_vm,
         &fresh,
+        &mem_used,
         home.as_deref(),
         stale,
         wide,
@@ -1020,16 +1074,18 @@ pub fn list_report(
 /// because padding uses column positions.
 ///
 /// Per-VM slices come from `list_report`, in `vms` order.
+#[allow(clippy::too_many_arguments)]
 fn table(
     vms: &[VmEntry],
     units_by_vm: &[Option<Vec<UnitStatus>>],
     published_by_vm: &[Vec<Published>],
     fresh: &[Freshness],
+    mem_used: &[Option<u64>],
     home: Option<&Path>,
     stale: bool,
     wide: bool,
 ) -> String {
-    let mut headers: Vec<&str> = vec!["PID", "UPTIME", "NAME", "SERVICES", "PROJECT"];
+    let mut headers: Vec<&str> = vec!["PID", "UPTIME", "MEM", "NAME", "SERVICES", "PROJECT"];
     if wide {
         headers.push("EXEC ADDRESS");
     }
@@ -1042,10 +1098,12 @@ fn table(
         .zip(units_by_vm)
         .zip(published_by_vm)
         .zip(fresh)
-        .map(|(((e, units), published), f)| {
+        .zip(mem_used)
+        .map(|((((e, units), published), f), used)| {
             let mut row = vec![
                 e.pid.to_string(),
                 uptime(e.created_secs),
+                mem_cell(*used, e.mem.as_deref()),
                 e.label.clone(),
                 services_cell(e, units.as_deref(), wide),
                 project_cell(e.project_dir.as_deref(), home, wide),
@@ -1096,12 +1154,17 @@ fn table(
 /// folded or left out here, so `--wide` has nothing to add. A field the run did not record
 /// (an older `vk`, no `--ssh`, no `--net`) reads `-`; a service's state reads `-` when the
 /// VM could not be asked, or did not report it.
+///
+/// `MEM USED` comes from `/proc` at report time; `MEM` is the recorded boot-time token.
+/// The table combines them, but the detail record keeps them separate. Unreadable usage
+/// reads `-`.
 fn detail(
     e: &VmEntry,
     units: Option<&[UnitStatus]>,
     published: &[Published],
     freshness: Freshness,
     stale: bool,
+    mem_used: Option<u64>,
 ) -> String {
     let dash = || "-".to_string();
     let opt = |v: Option<String>| v.unwrap_or_else(dash);
@@ -1128,6 +1191,7 @@ fn detail(
         ("VMM", vmm),
         ("CPUS", opt(e.cpus.map(|n| n.to_string()))),
         ("MEM", opt(e.mem.clone())),
+        ("MEM USED", opt(mem_used.map(crate::usage::fmt_bytes))),
         ("NESTED", yes_no(e.nested)),
         ("ATOP LOG", path(e.atop_log.as_deref())),
     ];
@@ -1844,7 +1908,7 @@ mod tests {
     }
 
     fn services_json(e: &VmEntry, units: Option<&[UnitStatus]>) -> serde_json::Value {
-        serde_json::to_value(view(e, units, &[], Freshness::Unknown, false)).unwrap()["services"]
+        serde_json::to_value(view(e, units, &[], Freshness::Unknown, false, None)).unwrap()["services"]
             .take()
     }
 
@@ -1953,13 +2017,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&real);
     }
 
-    /// One VM per row, with no publishers and unknown freshness — enough to check which
-    /// columns the table emits.
+    /// One VM per row, with no publishers, unknown freshness and no memory reading — enough
+    /// to check which columns the table emits. `table_of_mem` supplies the figures.
     fn table_of(vms: &[VmEntry], home: Option<&Path>, stale: bool, wide: bool) -> String {
+        let none: Vec<Option<u64>> = vms.iter().map(|_| None).collect();
+        table_of_mem(vms, &none, home, stale, wide)
+    }
+
+    fn table_of_mem(
+        vms: &[VmEntry],
+        mem_used: &[Option<u64>],
+        home: Option<&Path>,
+        stale: bool,
+        wide: bool,
+    ) -> String {
         let units: Vec<Option<Vec<UnitStatus>>> = vms.iter().map(|_| None).collect();
         let published: Vec<Vec<Published>> = vms.iter().map(|_| Vec::new()).collect();
         let fresh: Vec<Freshness> = vms.iter().map(|_| Freshness::Unknown).collect();
-        table(vms, &units, &published, &fresh, home, stale, wide)
+        table(vms, &units, &published, &fresh, mem_used, home, stale, wide)
     }
 
     /// The cells of one table line. No cell holds two consecutive spaces, so the padding
@@ -1991,7 +2066,7 @@ mod tests {
         ];
         for (stale, wide) in [(false, false), (false, true), (true, false), (true, true)] {
             let text = table_of(&vms, Some(Path::new("/home/me")), stale, wide);
-            let mut expected = vec!["PID", "UPTIME", "NAME", "SERVICES", "PROJECT"];
+            let mut expected = vec!["PID", "UPTIME", "MEM", "NAME", "SERVICES", "PROJECT"];
             if wide {
                 expected.push("EXEC ADDRESS");
             }
@@ -2068,6 +2143,7 @@ GUEST IP      10.0.0.2
 VMM           libkrun (pid 4242)
 CPUS          4
 MEM           8G
+MEM USED      1.6 GiB
 NESTED        yes
 ATOP LOG      /state/app/atop.log
 STALE         yes
@@ -2078,7 +2154,14 @@ PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 4242
             up = uptime(e.created_secs)
         );
         assert_eq!(
-            detail(&e, Some(&units), &published, Freshness::Stale, true),
+            detail(
+                &e,
+                Some(&units),
+                &published,
+                Freshness::Stale,
+                true,
+                Some(1_717_986_918)
+            ),
             expected
         );
     }
@@ -2101,6 +2184,7 @@ GUEST IP      -
 VMM           -
 CPUS          -
 MEM           -
+MEM USED      -
 NESTED        -
 ATOP LOG      -
 SERVICES      -
@@ -2110,7 +2194,7 @@ PUBLISHED     -
         );
         // Without --stale the STALE row is absent entirely, not reported as unknown.
         assert_eq!(
-            detail(&plain, None, &[], Freshness::Unknown, false),
+            detail(&plain, None, &[], Freshness::Unknown, false, None),
             expected
         );
     }
@@ -2121,7 +2205,7 @@ PUBLISHED     -
         e.nested = Some(false);
         // A VMM the run named but whose pid it did not record prints bare.
         e.vmm = Some("cloud-hypervisor".into());
-        let text = detail(&e, None, &[], Freshness::Fresh, true);
+        let text = detail(&e, None, &[], Freshness::Fresh, true, None);
         assert!(
             text.contains("\nVMM           cloud-hypervisor\n"),
             "{text}"
@@ -2133,7 +2217,14 @@ PUBLISHED     -
     #[test]
     fn detail_dashes_a_service_the_vm_did_not_report_but_keeps_its_exec_address() {
         // The VM answered and knows of neither service, so only the recorded facts remain.
-        let text = detail(&compose_entry(), Some(&[]), &[], Freshness::Unknown, true);
+        let text = detail(
+            &compose_entry(),
+            Some(&[]),
+            &[],
+            Freshness::Unknown,
+            true,
+            None,
+        );
         assert!(
             text.contains(
                 "SERVICES      db     -  -  vsock-auto:///state/app/svc-db/vsock.sock:4444\n"
@@ -2168,6 +2259,7 @@ PUBLISHED     -
             &published,
             Freshness::Unknown,
             false,
+            None,
         );
         let lines: Vec<&str> = text.lines().collect();
         let published_at = lines
@@ -2247,8 +2339,9 @@ PUBLISHED     -
         plain.label = "plain".into();
         plain.pid = 7;
         vec![
-            serde_json::to_value(view(&e, Some(&units), &[], Freshness::Unknown, false)).unwrap(),
-            serde_json::to_value(view(&plain, None, &[], Freshness::Unknown, false)).unwrap(),
+            serde_json::to_value(view(&e, Some(&units), &[], Freshness::Unknown, false, None))
+                .unwrap(),
+            serde_json::to_value(view(&plain, None, &[], Freshness::Unknown, false, None)).unwrap(),
         ]
     }
 
@@ -2314,7 +2407,10 @@ PUBLISHED     -
         assert!(err.contains("(pass --stale)"), "{err}");
         let plain = entry(PathBuf::from("/state/plain"), None);
         let with_stale =
-            [serde_json::to_value(view(&plain, None, &[], Freshness::Unknown, true)).unwrap()];
+            [
+                serde_json::to_value(view(&plain, None, &[], Freshness::Unknown, true, None))
+                    .unwrap(),
+            ];
         assert_eq!(fields(&with_stale, &["stale"], false).unwrap(), "null\n");
 
         // Malformed paths and repeats are rejected up front, even with nothing running.
@@ -2496,7 +2592,8 @@ PUBLISHED     -
             ),
         ];
         let json =
-            serde_json::to_value(view(&e, None, &published, Freshness::Unknown, false)).unwrap();
+            serde_json::to_value(view(&e, None, &published, Freshness::Unknown, false, None))
+                .unwrap();
         assert_eq!(
             json["published"],
             serde_json::json!([
@@ -2518,7 +2615,8 @@ PUBLISHED     -
         );
         // Nothing published is an empty array, not an absent key, so `--field` into it reads
         // null rather than failing.
-        let none = serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false)).unwrap();
+        let none =
+            serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false, None)).unwrap();
         assert_eq!(none["published"], serde_json::json!([]));
         assert_eq!(
             fields(&[json.clone(), none], &["published.0.listen"], false).unwrap(),
@@ -2560,7 +2658,8 @@ PUBLISHED     -
         e.mem = Some("8G".into());
         e.nested = Some(true);
         e.guest_ip = Some(std::net::Ipv4Addr::new(10, 42, 0, 2));
-        let json = serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false)).unwrap();
+        let json =
+            serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false, None)).unwrap();
         assert_eq!(json["vmm"], "libkrun");
         assert_eq!(json["vmm_pid"], 4242);
         assert_eq!(json["cpus"], 4);
@@ -2571,7 +2670,8 @@ PUBLISHED     -
         // A run without `--net` has no address: an explicit null, not an absent key, so
         // scripts can tell it from a field this `vk` never emitted.
         let e = entry(PathBuf::from("/state/app"), None);
-        let json = serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false)).unwrap();
+        let json =
+            serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false, None)).unwrap();
         assert_eq!(json.get("guest_ip"), Some(&serde_json::Value::Null));
     }
 
@@ -2590,6 +2690,7 @@ PUBLISHED     -
             guest_ip: None,
             cpus: None,
             mem: None,
+            mem_used_bytes: None,
             nested: None,
             atop_log: None,
             created_secs: 0,
@@ -2630,7 +2731,8 @@ PUBLISHED     -
         assert_eq!(e.mem, None);
         assert_eq!(e.nested, None);
         assert_eq!(e.guest_ip, None);
-        let json = serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false)).unwrap();
+        let json =
+            serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false, None)).unwrap();
         for key in [
             "atop_log", "vmm", "vmm_pid", "cpus", "mem", "nested", "guest_ip",
         ] {
@@ -2642,7 +2744,8 @@ PUBLISHED     -
     fn list_view_reports_the_atop_log_path() {
         let mut e = entry(PathBuf::from("/state/app"), None);
         e.atop_log = Some(PathBuf::from("/state/app/atop/atop.log"));
-        let json = serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false)).unwrap();
+        let json =
+            serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false, None)).unwrap();
         assert_eq!(json["atop_log"], "/state/app/atop/atop.log");
     }
 
@@ -2664,5 +2767,119 @@ PUBLISHED     -
         assert!(uptime(now.saturating_sub(90)).ends_with('m'));
         assert!(uptime(now.saturating_sub(7200)).contains('h'));
         assert!(uptime(now.saturating_sub(200_000)).contains('d'));
+    }
+
+    #[test]
+    fn mem_cell_pairs_what_is_held_with_what_was_asked_for() {
+        // Both known: the live figure over the boot token, as recorded.
+        assert_eq!(mem_cell(Some(1_288_490_189), Some("8G")), "1.2G/8G");
+        // Preserve the VMM token's spelling and units, even when the usage units differ.
+        assert_eq!(mem_cell(Some(817_889_280), Some("2048m")), "780M/2048m");
+        // Either half alone still prints, so a row says which of the two it is missing.
+        assert_eq!(mem_cell(None, Some("512M")), "-/512M");
+        assert_eq!(mem_cell(Some(1024), None), "1K/-");
+        // Neither: one dash, not "-/-", which reads as two known-absent facts.
+        assert_eq!(mem_cell(None, None), "-");
+    }
+
+    #[test]
+    fn compact_bytes_keeps_a_table_cell_narrow_without_lying_at_a_boundary() {
+        assert_eq!(compact_bytes(0), "0B");
+        assert_eq!(compact_bytes(1023), "1023B");
+        assert_eq!(compact_bytes(1024), "1K");
+        assert_eq!(compact_bytes(1024 * 1024), "1M");
+        assert_eq!(compact_bytes(1024 * 1024 * 1024), "1.0G");
+        assert_eq!(compact_bytes(1_717_986_918), "1.6G");
+        // Round into the larger unit instead of printing "1024M" or "1024K" by branching
+        // on the rounded figure, as `usage::fmt_bytes` does.
+        assert_eq!(compact_bytes(1024 * 1024 * 1024 - 1), "1.0G");
+        assert_eq!(compact_bytes(1024 * 1024 - 1), "1M");
+    }
+
+    #[test]
+    fn the_table_shows_memory_after_uptime() {
+        let vms = [entry(PathBuf::from("/state/solo"), None)];
+        let mut sized = vms[0].clone();
+        sized.mem = Some("8G".into());
+        let text = table_of_mem(
+            std::slice::from_ref(&sized),
+            &[Some(1_288_490_189)],
+            None,
+            false,
+            false,
+        );
+        let mut lines = text.lines();
+        let header = cells(lines.next().unwrap());
+        let row = cells(lines.next().unwrap());
+        // The column sits third, between UPTIME and NAME, in the header and the row alike.
+        assert_eq!(header[1..3], ["UPTIME", "MEM"], "{text}");
+        assert_eq!(row[2], "1.2G/8G", "{text}");
+        // A VM with neither figure keeps the column and dashes it, so the row stays aligned.
+        let bare = table_of(&vms, None, false, false);
+        assert_eq!(cells(bare.lines().nth(1).unwrap())[2], "-", "{bare}");
+    }
+
+    #[test]
+    fn json_view_reports_memory_used_in_bytes_beside_the_boot_token() {
+        let mut e = entry(PathBuf::from("/state/x"), None);
+        e.mem = Some("8G".into());
+        let json = serde_json::to_value(view(
+            &e,
+            None,
+            &[],
+            Freshness::Unknown,
+            false,
+            Some(1_288_490_189),
+        ))
+        .unwrap();
+        // JSON gives scripts bytes without parsing "1.2G", beside the unchanged boot token.
+        assert_eq!(json["mem_used_bytes"], 1_288_490_189u64);
+        assert_eq!(json["mem"], "8G");
+        // Unreadable tree: an explicit null, distinct from a zero-byte tree.
+        let unknown =
+            serde_json::to_value(view(&e, None, &[], Freshness::Unknown, false, None)).unwrap();
+        assert_eq!(unknown["mem_used_bytes"], serde_json::Value::Null);
+    }
+
+    /// Renders the exact table the README shows, so the sample there cannot drift out of
+    /// alignment with the formatter.
+    #[test]
+    fn readme_table_sample_is_what_the_formatter_emits() {
+        let vm = |label: &str, pid: u32, mem: &str, services: &[&str], project: &str| {
+            let mut e = entry(PathBuf::from("/state/x"), None);
+            e.services = compose_entry_with(services).services[2..].to_vec();
+            e.label = label.to_string();
+            e.pid = pid;
+            e.mem = Some(mem.to_string());
+            e.project_dir = Some(PathBuf::from(project));
+            e.created_secs = unix_now();
+            e
+        };
+        let vms = [
+            vm("app/Dockerfile:dev", 41230, "8G", &[], "/home/me/app"),
+            vm(
+                "shop",
+                41877,
+                "16G",
+                &["db", "redis", "web", "worker", "mailer", "queue", "search"],
+                "/home/me/shop",
+            ),
+        ];
+        let text = table_of_mem(
+            &vms,
+            &[Some(1_288_490_189), Some(6_335_076_761)],
+            Some(Path::new("/home/me")),
+            false,
+            false,
+        );
+        let header = text.lines().next().unwrap();
+        assert_eq!(
+            header,
+            "PID    UPTIME  MEM       NAME                SERVICES            PROJECT  PUBLISHED",
+            "{text}"
+        );
+        // The two figures as the README prints them, in the cells it puts them in.
+        assert_eq!(cells(text.lines().nth(1).unwrap())[2], "1.2G/8G", "{text}");
+        assert_eq!(cells(text.lines().nth(2).unwrap())[2], "5.9G/16G", "{text}");
     }
 }

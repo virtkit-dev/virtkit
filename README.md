@@ -435,12 +435,20 @@ vk list
 ```
 
 ```
-PID    UPTIME  NAME                SERVICES            PROJECT  PUBLISHED
-41230  2h14m   app/Dockerfile:dev  -                   ~/app    127.0.0.1:8443->localhost:443
-41877  35m     shop                db, redis, web, +4  ~/shop   127.0.0.1:5432->127.0.0.1:5432@db
+PID    UPTIME  MEM       NAME                SERVICES            PROJECT  PUBLISHED
+41230  2h14m   1.2G/8G   app/Dockerfile:dev  -                   ~/app    127.0.0.1:8443->localhost:443
+41877  35m     5.9G/16G  shop                db, redis, web, +4  ~/shop   127.0.0.1:5432->127.0.0.1:5432@db
 ```
 
-NAME is the built Dockerfile with its target stage, the compose primary, or the image ref.
+MEM is what the VM is costing the host now over the size it booted with: the resident
+memory of its whole process tree — the guest, its service VMs, the switch, the virtiofsds
+and the forwards — counted proportionally so a page several of them map is charged once,
+over the `--mem` token as the run recorded it. When proportional usage is unavailable,
+resident usage is used instead and may count shared pages more than once. The total includes
+service VMs and helpers, so it is not the primary guest's memory utilization.
+Either half is `-` on its own when unknown,
+and the cell is a bare `-` when neither is. NAME is the built Dockerfile with its target
+stage, the compose primary, or the image ref.
 SERVICES lists the compose services running beside the primary, or every declared one when
 the VM cannot be asked; `-` for none. Past three names, the rest are counted (`+4`).
 PROJECT is the run's `--workspace`, then its `--workdir`, then its launch directory, with
@@ -482,6 +490,7 @@ GUEST IP      10.0.0.2
 VMM           libkrun (pid 41902)
 CPUS          4
 MEM           8G
+MEM USED      5.9 GiB
 NESTED        no
 ATOP LOG      -
 SERVICES      db      running  10.0.0.3   vsock-auto:///home/me/shop/.vk/svc-db/vsock.sock:4444
@@ -496,15 +505,16 @@ PUBLISHED     pg  127.0.0.1:5432->127.0.0.1:5432@db  pid 42011
 ```
 
 `--json` gives an array of objects, one per VM, with `pid`, `label`, `project_dir`,
-`exec_addr`, `state_dir`, `vmm`, `vmm_pid`, `cpus`, `mem`, `nested`, `guest_ip` (the eth0
-address on a `--net` LAN), `ssh_addr`, `atop_log`, `created_secs`, `uptime_secs`,
-`services` (every declared compose service with its `name`, `exec_addr`, `state` and LAN
-`ip`), and `published` (each publisher's `name`, `listen`, `to` and `pid`, plus `via` when
-a compose sibling dials — the one `vk publish ensure --via` named — and `"unconfirmed":
-true` when its liveness could not be checked). `--field` picks fields without jq, one
-`--field` per field: one line per VM and tab-separated in flag order, or with `--json`
-objects holding only those fields; a dotted path reaches into nested values, and a key a
-record omits reads `null`:
+`exec_addr`, `state_dir`, `vmm`, `vmm_pid`, `cpus`, `mem`, `mem_used_bytes` (what the VM's
+process tree holds on the host now, in bytes — `null` when it could not be read),
+`nested`, `guest_ip` (the eth0 address on a `--net` LAN), `ssh_addr`, `atop_log`,
+`created_secs`, `uptime_secs`, `services` (every declared compose service with its
+`name`, `exec_addr`, `state` and LAN `ip`), and `published` (each publisher's `name`,
+`listen`, `to` and `pid`, plus `via` when a compose sibling dials — the one
+`vk publish ensure --via` named — and `"unconfirmed": true` when its liveness could not
+be checked). `--field` picks fields without jq, one `--field` per field: one line per VM
+and tab-separated in flag order, or with `--json` objects holding only those fields; a
+dotted path reaches into nested values, and a key a record omits reads `null`:
 
 ```sh
 vk list . --field pid                   # the pid to hand to vk stop

@@ -16,6 +16,10 @@ All notable changes to virtkit will be documented in this file.
   `vk run --numa off|auto|interleave|N` decides for one VM. Single-node hosts, which are
   most of them, are unaffected.
 
+- **`vk list` and `vk dev list` show live host memory usage beside the VM's configured
+  memory.** The detailed VM record adds `MEM USED`, and JSON output includes
+  `mem_used_bytes` for scripts.
+
 ## [0.71.0] - 2026-09-14
 
 ### Changed
