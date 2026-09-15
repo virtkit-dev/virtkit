@@ -54,6 +54,7 @@ mod local;
 mod manager;
 mod mkoci;
 mod net;
+mod numa;
 mod oci;
 mod oomkills;
 mod ova;
@@ -1465,6 +1466,19 @@ enum Cmd {
         /// Default 1G, or the --primary service's own x-virtkit.mem.
         #[arg(long, value_name = "SIZE", help_heading = "Guest")]
         mem: Option<String>,
+        /// memory node for this VM: `off`, `auto`, `interleave`, or a node id
+        ///
+        /// Default `auto`: the host's `[numa] mode` decides, which on a multi-socket host
+        /// means the emptiest node this VM fits on, or all of them interleaved when it fits
+        /// none. Anything else overrides that mode for this VM alone — compose services and
+        /// a -f build's stage guests follow the host's whatever the flag says.
+        #[arg(
+            long,
+            value_parser = numa::NumaArg::parse,
+            value_name = "off|auto|interleave|NODE",
+            help_heading = "Guest"
+        )]
+        numa: Option<numa::NumaArg>,
         /// interfaces the guest gets on the run LAN
         ///
         /// Default 1 (eth0 alone), or the --primary service's own x-virtkit.nics. More adds
@@ -2747,6 +2761,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
     // build or boot path runs (VIRTKIT_VMM still overrides the config key).
     build::set_tuning(&cfg.build);
     vmm::set_config_backend(cfg.vmm);
+    numa::set_policy(cfg.numa.mode);
     if let Cmd::Config {
         example: false,
         path,
@@ -2884,6 +2899,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         cloud_hypervisor,
         cpus,
         mem,
+        numa,
         nics,
         boot_timeout,
         vm_name,
@@ -2991,6 +3007,11 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 2,
             );
         }
+        // Reject nonexistent nodes before pulling, rather than silently placing elsewhere.
+        let numa = match numa.unwrap_or(numa::NumaArg::Auto).resolve() {
+            Ok(numa) => numa,
+            Err(e) => return fail(&e, 2),
+        };
         let build_args: Vec<(String, String)> = build_arg
             .iter()
             .map(|a| {
@@ -3070,6 +3091,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             insecure: *insecure,
             cpus: *cpus,
             mem: mem.clone(),
+            numa,
             nics: *nics,
             service_cpus: service_cpus.clone(),
             service_mem: service_mem.clone(),
@@ -5538,6 +5560,36 @@ mod tests {
         assert!(Cli::try_parse_from(["vk", "run", "--atop", "30", "debian:12"]).is_err());
         // A zero interval would have the guest sampling without pause.
         assert!(Cli::try_parse_from(["vk", "run", "--atop=0", "debian:12"]).is_err());
+    }
+
+    /// `--numa` takes a mode or a node id, and nothing else — a typo names a node the host
+    /// has to have, so it must not reach the boot as one.
+    #[test]
+    fn run_numa_flag_takes_a_mode_or_a_node() {
+        let numa_of = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Cmd::Run { numa, .. } = cli.cmd else {
+                panic!("expected Cmd::Run")
+            };
+            numa
+        };
+        assert_eq!(numa_of(&["vk", "run", "debian:12"]), None);
+        assert_eq!(
+            numa_of(&["vk", "run", "--numa", "off", "debian:12"]),
+            Some(numa::NumaArg::Off)
+        );
+        assert_eq!(
+            numa_of(&["vk", "run", "--numa", "interleave", "debian:12"]),
+            Some(numa::NumaArg::Interleave)
+        );
+        assert_eq!(
+            numa_of(&["vk", "run", "--numa", "1", "debian:12"]),
+            Some(numa::NumaArg::Node(1))
+        );
+        let Err(err) = Cli::try_parse_from(["vk", "run", "--numa", "node1", "debian:12"]) else {
+            panic!("--numa node1 must be rejected")
+        };
+        assert!(err.to_string().contains("off, auto, interleave"), "{err}");
     }
 
     #[test]

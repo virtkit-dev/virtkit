@@ -57,6 +57,9 @@ pub struct Config {
     /// Defaults for `vk build` so a runner need not pass them every invocation;
     /// see [`Build`]. A CLI flag always overrides the matching config value.
     pub build: Build,
+    /// Which memory node each VM this host boots is placed on; see [`Numa`]. On by default,
+    /// and a no-op on the single-node hosts most machines are.
+    pub numa: Numa,
     /// The GitLab custom executor: read by `vk gitlab
     /// config|prepare|run|cleanup|usage|supervise`, and — each for the subset it needs —
     /// by `vk gc` (the checkout-cache settings) and `vk tune` (the VM template and
@@ -206,6 +209,34 @@ pub struct Schedule {
     /// which GitLab retries when the job asks it to (`retry: { when: runner_system_failure }`)
     /// — set that on jobs you would rather see land on another runner than fail. Default 600.
     pub wait_timeout_secs: Option<u64>,
+}
+
+/// `[numa]` — NUMA placement for every VM this host boots. On a multi-socket host a VM whose
+/// memory is scattered across the sockets and whose vCPUs run on the far side of it loses
+/// throughput to the interconnect for as long as it runs; placed on one node — vCPUs pinned
+/// to it, memory preferring it — it does not. A single-node host has nothing to place, and
+/// nothing here changes it.
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct Numa {
+    pub mode: NumaMode,
+}
+
+/// `[numa] mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NumaMode {
+    /// Place each VM on the emptiest node it fits on — by the admission ledger for a CI job
+    /// on a host that has one, else by the nodes' live free memory — and interleave one that
+    /// fits nowhere.
+    #[default]
+    Auto,
+    /// Place nothing; the kernel decides, as it did before.
+    Off,
+    /// Interleave every VM across all nodes, choosing none. For a host whose VMs are all
+    /// larger than a node, or one where the per-node accounting cannot be trusted because
+    /// something outside virtkit is taking the memory.
+    Interleave,
 }
 
 /// Host credentials forwarded into job VMs. The SSH agent is relayed over a vsock
@@ -1112,6 +1143,22 @@ mod tests {
         let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back.executor.vm.cpus, 6);
         assert_eq!(back.executor.schedule.mem_budget.as_deref(), Some("48G"));
+    }
+
+    /// `[numa]` is host-wide — it governs every VM, not just the CI executor's — so it sits
+    /// at the top level and round-trips through `vk config` from there.
+    #[test]
+    fn numa_mode_parses_at_the_top_level_and_round_trips() {
+        let cfg: Config = toml::from_str("[numa]\nmode = \"interleave\"\n").unwrap();
+        assert_eq!(cfg.numa.mode, NumaMode::Interleave);
+        let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back.numa.mode, NumaMode::Interleave);
+        // Unset, every host places the VMs it boots.
+        assert_eq!(Config::default().numa.mode, NumaMode::Auto);
+        assert_eq!(
+            toml::from_str::<Config>("").unwrap().numa.mode,
+            NumaMode::Auto
+        );
     }
 
     #[test]

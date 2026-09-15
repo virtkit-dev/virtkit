@@ -94,6 +94,33 @@
 #                        # (default), "idle", or "none" to leave it alone. Only a block
 #                        # scheduler that honours I/O priority acts on it (BFQ, mq-deadline)
 
+# [numa]                 # which memory node each VM this host boots is placed on: a
+#                        # `vk run` guest, a build's stage guests, compose services, a CI
+#                        # job. Only a multi-socket host has more than one node; on every
+#                        # other host this changes nothing. Unplaced, a VM's memory lands
+#                        # wherever the thread that first touched each page ran and its
+#                        # vCPUs then drift away from it, so the guest pays the interconnect
+#                        # for as long as it runs.
+# mode = "auto"          # "auto" (default): place each VM on the emptiest node it fits on,
+#                        # its vCPUs pinned to that node's CPUs and its memory preferring
+#                        # the node — preferring, not bound, so a guest that outgrows it
+#                        # spills onto another node instead of being OOM-killed while the
+#                        # rest of the host is roomy. A VM that fits no single node — more
+#                        # RAM than the node has room for, or more vCPUs than the node has
+#                        # CPUs — is interleaved across every node instead, which at least
+#                        # spreads it evenly. "off" places nothing and leaves it to the
+#                        # kernel; "interleave" spreads every VM across all nodes, choosing
+#                        # none.
+#                        # A CI job on a host with [executor.schedule] mem_budget set is
+#                        # placed from the admission ledger, so it counts what the other
+#                        # runners' jobs were granted rather than what they have faulted in
+#                        # so far. Every other VM is placed against what the nodes have free
+#                        # right now, plus what this process has already booted and the host
+#                        # has not seen fault its memory in yet.
+#                        # A stage guest wider than a node has no node to go on: [build] cpus
+#                        # above one node's CPU count interleaves every build stage instead of
+#                        # placing it. The default (2-4 vCPUs a stage) fits any node.
+
 # MICROVM_IMAGE is prefix-based (the prefix names the source): unset = local/default;
 # `local/<name>` = a bundle dir under [local] dir; `virtkit/<name>[:tag|@digest]` =
 # a [registry] bundle; `docker/<name>[:tag|@digest]` = an OCI image booted directly

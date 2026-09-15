@@ -277,6 +277,10 @@ pub struct RunArgs {
     /// an explicit flag overrides the service's declaration, like `--init`/`--kernel`.
     pub cpus: Option<u32>,
     pub mem: Option<String>,
+    /// Primary VM placement (`vk run --numa`), resolved against the host topology on the
+    /// command line. The default, [`crate::numa::Numa::Auto`], follows the host's `[numa] mode`.
+    /// Compose services and build stages always follow the host mode.
+    pub numa: crate::numa::Numa,
     /// How many NICs the primary VM gets on the run LAN (`vk run --nics`). `None` = a
     /// `--primary` service's own `x-virtkit.nics`, else one — an explicit flag overrides
     /// the service's declaration, like `--cpus`/`--mem`. See [`effective_nics`].
@@ -443,6 +447,7 @@ impl Default for RunArgs {
             insecure: false,
             cpus: None,
             mem: None,
+            numa: crate::numa::Numa::Auto,
             service_cpus: Vec::new(),
             nics: None,
             service_mem: Vec::new(),
@@ -2147,6 +2152,7 @@ async fn build_and_boot(
         proc_name: crate::vmm::resolve_proc_name(&unit_name),
         // A `vk run` session reboots in place on a guest reset (see keep()).
         reboot: true,
+        numa: args.numa.clone(),
     };
     // Control server on the primary's hybrid-vsock control socket — only the
     // primary's guest can reach it, so the control plane is scoped to this run.
@@ -2160,6 +2166,12 @@ async fn build_and_boot(
         });
     }
 
+    // Report explicit `vk run --numa <node>`/`interleave` placement here; spawn_vmm only
+    // announces placements it chooses, as the CI ledger does. Use `describe` because an
+    // explicit interleave is not the auto path's "does not fit one node" fallback.
+    if let crate::numa::Numa::Placed(placement) = &spec.numa {
+        eprintln!("virtkit: NUMA: {}", placement.describe());
+    }
     let mut ch = match spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal) {
         Ok(ch) => ch,
         // The --net switch and the aux children (--workdir plus any --primary compose
@@ -3934,12 +3946,60 @@ pub(crate) fn spawn_vmm(
             });
         }
     }
+    // Where the guest's RAM and its vCPU threads go on a multi-socket host: the placement
+    // its caller already chose, or one chosen here against what this process has booted.
+    // Before the priority hook only because the two are independent; both run in the forked
+    // child.
+    let placed = match &spec.numa {
+        crate::numa::Numa::Off => None,
+        // No ticket, so no `Outstanding`: a caller that chose the node accounts for it
+        // itself. The CI supervisor's cross-process ledger outlives this process; a `vk run
+        // --numa <node>` is an instruction, not a reservation, so a compose service booted
+        // `auto` in the same process does not see the node the primary took — accepted,
+        // because pinning by hand opts out of the balancing the accounting is for.
+        crate::numa::Numa::Placed(placement) => Some((placement.clone(), None)),
+        // A `mem` the VMM's own syntax accepts and this does not leaves the VM unplaced
+        // rather than placed against a guess at the one figure that decides whether it fits.
+        crate::numa::Numa::Auto => parse_mem_mib(&spec.mem)
+            .and_then(|mem_mib| crate::numa::auto_place(spec.cpus, mem_mib))
+            .map(|(placement, ticket)| (placement, Some(ticket))),
+    };
+    if let Some((placement, _)) = &placed {
+        placement.apply(&mut cmd);
+    }
     // A build stage's guest is the heaviest thing a build runs, and the priority lands on
     // the VMM's vCPU threads with it.
     prio.apply(&mut cmd);
     // Self-reap the VM if virtkit dies before teardown — a leaked VMM is a whole
     // running guest, not just an idle helper (spawn_tied).
-    crate::spawn::spawn_tied(cmd).context("spawning the VMM")
+    let child = crate::spawn::spawn_tied(cmd).context("spawning the VMM")?;
+    if let Some((placement, ticket)) = placed {
+        // The node stays claimed for as long as this VMM is alive, so the VMs booted after
+        // it are placed knowing what it took. Said out loud only for a placement decided
+        // here: one handed down was announced by whoever chose it.
+        if let Some(ticket) = ticket {
+            ticket.spawned(child.id());
+            eprintln!("virtkit: NUMA: {}", crate::numa::announce(&placement));
+        }
+        // The affinity is set in the child's pre_exec, so it is normally in place the instant
+        // the VMM exists; a loaded host can still be a beat behind. Re-read a few times while
+        // it reads as a miss before concluding the child could not take it — a single early
+        // read cried wolf. A placement the child truly could not take is worth a line and
+        // nothing more: the VM runs, just unplaced (see numa::Placement::apply for what
+        // refuses it).
+        let mut took = crate::numa::landed(child.id(), &placement);
+        for _ in 0..4 {
+            if took != Some(false) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            took = crate::numa::landed(child.id(), &placement);
+        }
+        if took == Some(false) {
+            eprintln!("virtkit: the VMM did not take its NUMA placement — running unplaced");
+        }
+    }
+    Ok(child)
 }
 
 /// Report a VMM that exited during boot: name the backend that actually ran (libkrun
@@ -4468,6 +4528,7 @@ pub(crate) async fn boot_session(
         proc_name: crate::vmm::resolve_proc_name(stem),
         // A build stage VM ends on a guest reset rather than rebooting in place.
         reboot: false,
+        numa: crate::numa::Numa::Auto,
     };
     let vmm = crate::vmm::selected(cloud_hypervisor);
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
@@ -5884,6 +5945,7 @@ mod tests {
             pass_fds: vec![medium.fd()],
             proc_name: "vk:test".into(),
             reboot: false,
+            numa: crate::numa::Numa::Auto,
         };
         let mut child = spawn_vmm(&CatVmm, &spec, crate::prio::Prio::Normal).unwrap();
         assert!(child.wait().unwrap().success());

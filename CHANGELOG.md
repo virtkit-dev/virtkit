@@ -4,6 +4,18 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Every VM on a multi-socket host is now placed on one memory node.** A `vk run`
+  session, each build stage guest, each compose service and each CI job boots on the node
+  with the most room left that it fits on, its vCPUs pinned there and its memory kept on
+  that node — spilling onto another node rather than failing when it runs short. A VM too
+  large for any one node is spread evenly across them all, and VMs that start close together,
+  such as a build's parallel stages, are balanced across the nodes rather than all landing on
+  the same one. `[numa] mode` turns placement off or spreads every VM across all nodes;
+  `vk run --numa off|auto|interleave|N` decides for one VM. Single-node hosts, which are
+  most of them, are unaffected.
+
 ## [0.71.0] - 2026-09-14
 
 ### Changed

@@ -830,6 +830,61 @@ from the `CI_*` variables beside it, so it is not something a job can name for i
 a runner old enough not to write that account, the report is refused rather than answered from
 what the job claims.
 
+### Placing a job on a memory node
+
+On a multi-socket runner, guest RAM that is scattered across the sockets costs the job for its
+whole life: each page lands on whichever node the thread that first touched it happened to be
+running on, and the scheduler then moves the vCPU threads away from it. A VM placed on one
+node — its vCPUs pinned there and its memory preferring that node — pays none of that.
+
+Placement is on by default and does nothing on a single-node host, which is most of them. It
+is host-wide, not a runner setting: the same key places `vk run` guests, build stage guests
+and compose services on the machine.
+
+```toml
+[numa]
+mode = "auto"         # the default; "off" or "interleave" instead
+```
+
+`auto` puts each VM on the node with the most room left that it fits on, and interleaves one
+that fits nowhere — more RAM than the node has room for, or more vCPUs than the node has
+CPUs — across every node instead, which at least spreads it evenly rather than piling it onto
+whichever node booted it. The node is a preference for memory and not a cap: a guest that
+grows past what its node has free spills onto another node instead of driving that node into
+reclaim and an out-of-memory kill, so a placement the host outgrows costs locality and nothing
+more. Each VM says which it got:
+
+```
+virtkit: NUMA: node 1 (cpus 24-47) of 2
+virtkit: NUMA: interleaved across 2 nodes (the VM does not fit one node)
+```
+
+With `mem_budget` set, placement uses the admission ledger. Each job's node is recorded
+beside its claim, so later jobs count what others were **granted**, including RAM they have
+yet to fault in. Without a budget, jobs use live per-node free memory plus this process's
+outstanding allocations, like other VMs. Live memory figures lag newly admitted VMs;
+setting a budget accounts for those grants across runners on a busy host.
+
+`off` places nothing and leaves it to the kernel. `interleave` spreads every VM across all
+nodes without choosing one, for a host whose jobs are all larger than a node, or one where
+something outside virtkit is taking memory the ledger cannot see.
+
+Placement is best-effort: it is applied to the VMM process before it starts, and a host that
+refuses it — a cpuset that excludes the chosen node, a kernel built without NUMA — gets a line
+in the log and a VM that boots unplaced, never a failed job.
+
+To measure what it is worth on a given host, run the same job (or the same `vk build`) twice,
+once with `mode = "off"` and once with `mode = "auto"`, and compare the wall time the trace
+reports. The kernel's own counters say whether the difference is the placement: while the VM
+runs, `numastat -p <vmm>` breaks that VMM's resident memory down per node. `-p` takes a
+process-name pattern as well as a pid, which is the easier handle on a job: under libkrun the
+job's VMM is named `vk:<hostname>` (`[executor.vm] hostname`), under cloud-hypervisor it is
+`cloud-hypervisor`. `numastat` with no arguments counts the allocations that did not land on
+the node that asked, `numa_miss` and `other_node`. A placed VM concentrates its pages on one
+node and stops growing `other_node`; an interleaved one splits them evenly. Check the
+`virtkit: NUMA:` line first when a run measures the same either way: a VM wider than a node is
+interleaved in both, and interleaving is not what the comparison is testing.
+
 ### What admission does not do
 
 A waiting job has already been assigned by GitLab: it holds a `concurrent` slot and its own

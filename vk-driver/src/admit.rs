@@ -5,8 +5,11 @@
 //! killer arbitrates — it takes a VMM, and that job dies mid-stage. So a job reserves what
 //! it is about to boot before it boots it, and waits when the host is full.
 //!
-//! The ledger is one file per job under `<state_dir>/admit/`, holding what the job reserved
-//! and when it asked. A reservation counts only while someone holds a shared `flock` on it:
+//! Each job has a ledger file under `<state_dir>/admit/` with its reservation, request time,
+//! and the memory node chosen by the supervisor. Later jobs use that placement to account
+//! for the node's load ([`Reservation::place`]).
+//!
+//! A reservation counts only while someone holds a shared `flock` on it:
 //! `prepare` takes one while it waits and keeps it until it exits, and the supervisor takes
 //! its own for the job's life, so the two overlap and the reservation never lapses between
 //! them — and a job killed at any point has its reservation freed by the kernel. Admission
@@ -38,9 +41,13 @@ const POLL: Duration = Duration::from_secs(2);
 /// process exiting) releases the lock, which is what makes the reservation stop counting —
 /// the file itself stays for the next holder, and is removed by [`release`] at cleanup or
 /// reclaimed by the next admission that finds it unlocked.
+///
+/// Keep the writable handle and job name so [`Reservation::place`] can record the node
+/// through the locked descriptor without resolving the entry's path again.
 #[derive(Debug)]
 pub struct Reservation {
-    _file: File,
+    file: File,
+    job_id: String,
 }
 
 /// Reserve `want_mib` for `job_id` against `budget_mib`, waiting up to `timeout` for room.
@@ -82,6 +89,9 @@ pub fn acquire(
         want_mib,
         asked: now_nanos(),
         granted: false,
+        // Decided later, by the supervisor that boots the VM: prepare does not know the
+        // topology matters until there is a VM to place.
+        node: None,
     };
     // Held from here on: while waiting it marks a live request other jobs must queue behind,
     // and once granted it is the reservation itself. Created under the directory lock, which
@@ -137,7 +147,10 @@ pub fn acquire(
                     Instant::now().duration_since(since).as_secs_f64()
                 );
             }
-            return Ok(Reservation { _file: file });
+            return Ok(Reservation {
+                file,
+                job_id: job_id.to_string(),
+            });
         }
         if let Some(note) = wait_note {
             println!("{note}");
@@ -171,7 +184,10 @@ pub fn hold(dir: &Path, job_id: &str) -> Option<Reservation> {
     // scan can parse and none can reclaim while this process holds it locked. The job's memory
     // would then count for nobody for the whole of its life.
     match open_locked_shared(&path) {
-        Ok(file) => Some(Reservation { _file: file }),
+        Ok(file) => Some(Reservation {
+            file,
+            job_id: job_id.to_string(),
+        }),
         // admission is off — prepare never made an entry
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         // An entry that exists but cannot be re-locked is not the same as no entry at all:
@@ -184,6 +200,102 @@ pub fn hold(dir: &Path, job_id: &str) -> Option<Reservation> {
             );
             None
         }
+    }
+}
+
+impl Reservation {
+    /// Choose the memory node this job's VM boots on, and record it in the ledger so the jobs
+    /// placed after it know the node is taken.
+    ///
+    /// Against the ledger rather than the host's live per-node memory, for the reason
+    /// admission itself is: a guest faults its RAM in over minutes, so a node carrying a VM
+    /// that booted a moment ago still looks empty. What a node may carry is its share of the
+    /// host's `mem_budget` — the budget is a whole-host figure, and a node with a quarter of
+    /// the host's memory can back a quarter of it. `host_total_mib` unreadable leaves each
+    /// node capped at its own memory, which is the most it could ever back anyway.
+    ///
+    /// The reserved size is read back out of this job's own entry rather than passed in, so a
+    /// `from_history` reservation is placed against the figure it actually holds.
+    pub fn place(
+        &self,
+        dir: &Path,
+        topology: &crate::numa::Topology,
+        budget_mib: u64,
+        host_total_mib: Option<u64>,
+        cpus: u32,
+    ) -> Result<crate::numa::Placement> {
+        let mut anomalies = Vec::new();
+        // Collect anomalies under the host-wide directory lock and report them after
+        // releasing it, as admission does, so logging does not block other runners.
+        let out = {
+            let _dir_lock = lock_dir(dir)?;
+            self.place_locked(
+                dir,
+                topology,
+                budget_mib,
+                host_total_mib,
+                cpus,
+                &mut anomalies,
+            )
+        };
+        report(&anomalies);
+        out
+    }
+
+    fn place_locked(
+        &self,
+        dir: &Path,
+        topology: &crate::numa::Topology,
+        budget_mib: u64,
+        host_total_mib: Option<u64>,
+        cpus: u32,
+        anomalies: &mut Vec<String>,
+    ) -> Result<crate::numa::Placement> {
+        // `u128::MAX`: nothing is queued behind this job — it is already admitted — so every
+        // other entry counts and none of them is "ahead".
+        let held = tally(dir, &self.job_id, u128::MAX, anomalies)?;
+        let path = dir.join(&self.job_id);
+        let mut entry =
+            Entry::read(&self.file).with_context(|| format!("re-reading {}", path.display()))?;
+        let mut load = held.per_node;
+        // Charge interleaved jobs equally to every node; omitting them would make occupied
+        // nodes look empty, especially on hosts where most jobs interleave.
+        let share = held
+            .spread
+            .granted_mib
+            .checked_div(u64::try_from(topology.nodes.len()).unwrap_or(1))
+            .unwrap_or(0);
+        for node in &topology.nodes {
+            let carried = load.entry(node.id).or_default();
+            carried.granted_mib = carried.granted_mib.saturating_add(share);
+            carried.jobs = carried.jobs.saturating_add(held.spread.jobs);
+        }
+        let placement = crate::numa::pick(
+            topology,
+            &load,
+            |node| node_budget_mib(node, budget_mib, host_total_mib),
+            entry.want_mib,
+            cpus,
+        );
+        entry.node = Some(match &placement {
+            crate::numa::Placement::Bind { node, .. } => Place::Node(*node),
+            crate::numa::Placement::Interleave { .. } => Place::Spread,
+        });
+        entry.write(&self.file, &path)?;
+        Ok(placement)
+    }
+}
+
+/// Scale the host's memory budget by this node's share of host memory. If the host total
+/// is unreadable, use the node's full memory; this cap only guides placement.
+fn node_budget_mib(node: &crate::numa::Node, budget_mib: u64, host_total_mib: Option<u64>) -> u64 {
+    match host_total_mib {
+        Some(total) => node
+            .mem_total_mib
+            .saturating_mul(budget_mib)
+            .checked_div(total)
+            .unwrap_or(node.mem_total_mib),
+        None => node.mem_total_mib,
     }
 }
 
@@ -1018,6 +1130,13 @@ pub struct Held {
     pub granted_mib: u64,
     pub granted: usize,
     pub ahead: usize,
+    /// Granted memory by node, used to place the next job. Entries without a placement,
+    /// including older virtkit entries and jobs on hosts with placement disabled, appear in
+    /// neither this map nor `spread`. Their sum never exceeds `granted_mib`; a host with
+    /// placement disabled has an empty breakdown.
+    pub per_node: HashMap<u32, crate::numa::NodeLoad>,
+    /// What the interleaved jobs hold, which is a share of every node rather than any one.
+    pub spread: crate::numa::NodeLoad,
 }
 
 /// What this host has committed right now, for a caller with no entry of its own — the
@@ -1083,6 +1202,15 @@ fn tally(dir: &Path, job_id: &str, asked: u128, anomalies: &mut Vec<String>) -> 
         if entry.granted {
             out.granted_mib = out.granted_mib.saturating_add(entry.want_mib);
             out.granted = out.granted.saturating_add(1);
+            let placed = match entry.node {
+                Some(Place::Node(id)) => Some(out.per_node.entry(id).or_default()),
+                Some(Place::Spread) => Some(&mut out.spread),
+                None => None,
+            };
+            if let Some(node) = placed {
+                node.granted_mib = node.granted_mib.saturating_add(entry.want_mib);
+                node.jobs = node.jobs.saturating_add(1);
+            }
         } else if entry.asked < asked {
             out.ahead = out.ahead.saturating_add(1);
         }
@@ -1090,20 +1218,46 @@ fn tally(dir: &Path, job_id: &str, asked: u128, anomalies: &mut Vec<String>) -> 
     Ok(out)
 }
 
-/// One ledger entry: what the job wants, when it first asked (its place in the queue), and
-/// whether it holds that memory yet.
+/// One ledger entry: what the job wants, when it first asked (its place in the queue),
+/// whether it holds that memory yet, and which memory node it took.
 struct Entry {
     want_mib: u64,
     asked: u128,
     granted: bool,
+    node: Option<Place>,
+}
+
+/// Where a job's guest RAM went, as the ledger records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// All of it on one node.
+    Node(u32),
+    /// Interleaved over every node — the VM did not fit one.
+    Spread,
+}
+
+impl Place {
+    fn parse(field: &str) -> Option<Place> {
+        match field {
+            "spread" => Some(Place::Spread),
+            _ => Some(Place::Node(field.strip_prefix("node=")?.parse().ok()?)),
+        }
+    }
 }
 
 impl Entry {
-    /// `<mib> <asked> <granted|waiting>`, rewritten whole each time so a reader either sees
-    /// the previous line or the new one, never a splice of both.
+    /// `<mib> <asked> <granted|waiting> [node=<n>|spread]`, rewritten whole each time so a
+    /// reader either sees the previous line or the new one, never a splice of both. The node
+    /// is absent until one is chosen, and absent for good on a host that places nothing — so
+    /// a three-field line, all this ledger ever held before, still reads.
     fn write(&self, mut file: &File, path: &Path) -> Result<()> {
         let state = if self.granted { "granted" } else { "waiting" };
-        let line = format!("{} {} {state}\n", self.want_mib, self.asked);
+        let node = match self.node {
+            Some(Place::Node(id)) => format!(" node={id}"),
+            Some(Place::Spread) => " spread".to_string(),
+            None => String::new(),
+        };
+        let line = format!("{} {} {state}{node}\n", self.want_mib, self.asked);
         file.set_len(0)
             .and_then(|()| file.seek(SeekFrom::Start(0)))
             .and_then(|_| file.write_all(line.as_bytes()))
@@ -1112,6 +1266,8 @@ impl Entry {
     }
 
     fn read(mut file: &File) -> Option<Entry> {
+        // Rewind because [`Reservation::place`] reads through the handle that wrote the entry.
+        file.seek(SeekFrom::Start(0)).ok()?;
         let mut text = String::new();
         file.read_to_string(&mut text).ok()?;
         let mut fields = text.split_whitespace();
@@ -1119,6 +1275,7 @@ impl Entry {
             want_mib: fields.next()?.parse().ok()?,
             asked: fields.next()?.parse().ok()?,
             granted: fields.next()? == "granted",
+            node: fields.next().and_then(Place::parse),
         })
     }
 }
@@ -1138,10 +1295,11 @@ fn open_shared(path: &Path) -> Result<File> {
     Ok(file)
 }
 
-/// Open an existing `path` and take a shared lock on it, without creating. The `io::Error` is
-/// returned unwrapped so a caller can tell a missing entry from one it could not lock.
+/// Open an existing `path` writable and take a shared lock, without creating it.
+/// [`Reservation::place`] needs write access to record the job's NUMA placement. Return the
+/// original `io::Error` so callers can distinguish a missing entry from a lock failure.
 fn open_locked_shared(path: &Path) -> std::io::Result<File> {
-    let file = File::options().read(true).open(path)?;
+    let file = File::options().read(true).write(true).open(path)?;
     lock_shared(&file)?;
     Ok(file)
 }
@@ -1297,11 +1455,24 @@ mod tests {
 
     /// A reservation held by this test, as another job's would be.
     fn held(dir: &Path, job: &str, want_mib: u64, asked: u128, granted: bool) -> File {
+        held_on(dir, job, want_mib, asked, granted, None)
+    }
+
+    /// The same, placed on a node.
+    fn held_on(
+        dir: &Path,
+        job: &str,
+        want_mib: u64,
+        asked: u128,
+        granted: bool,
+        node: Option<Place>,
+    ) -> File {
         let file = open_shared(&dir.join(job)).unwrap();
         Entry {
             want_mib,
             asked,
             granted,
+            node,
         }
         .write(&file, &dir.join(job))
         .unwrap();
@@ -2279,6 +2450,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
             want_mib: 2048,
             asked: 1,
             granted: true,
+            node: None,
         }
         .write(&garbled, &dir.join("mid-write"))
         .unwrap();
@@ -2304,6 +2476,131 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
             "gave up before the timeout it was given"
         );
         assert!(!dir.join("waiter").exists(), "a refused job leaves nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The node a job was placed on survives a round trip through the ledger, and an entry
+    /// written before placement existed still reads as one that was never placed.
+    #[test]
+    fn an_entry_remembers_the_node_it_was_placed_on() {
+        let dir = tmpdir("entry-node");
+
+        let bound = held_on(&dir, "bound", 2048, 1, true, Some(Place::Node(3)));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("bound")).unwrap(),
+            "2048 1 granted node=3\n"
+        );
+        assert_eq!(Entry::read(&bound).unwrap().node, Some(Place::Node(3)));
+
+        let spread = held_on(&dir, "spread", 1024, 2, true, Some(Place::Spread));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("spread")).unwrap(),
+            "1024 2 granted spread\n"
+        );
+        assert_eq!(Entry::read(&spread).unwrap().node, Some(Place::Spread));
+
+        // Three fields: every entry this ledger held before placement, and every entry on a
+        // host that places nothing.
+        let old = open_shared(&dir.join("old")).unwrap();
+        (&old).write_all(b"512 7 granted\n").unwrap();
+        let entry = Entry::read(&old).unwrap();
+        assert_eq!((entry.want_mib, entry.asked, entry.granted), (512, 7, true));
+        assert_eq!(entry.node, None);
+
+        // An unplaced entry counts against the budget as it always did, and against no node:
+        // neither the per-node breakdown nor the interleaved share knows anything about it.
+        let held = committed(&dir).unwrap();
+        assert_eq!(held.granted_mib, 2048 + 1024 + 512);
+        assert_eq!(held.per_node.len(), 1);
+        assert_eq!(
+            held.per_node.get(&3).copied(),
+            Some(crate::numa::NodeLoad {
+                granted_mib: 2048,
+                jobs: 1,
+            })
+        );
+        assert_eq!(
+            held.spread,
+            crate::numa::NodeLoad {
+                granted_mib: 1024,
+                jobs: 1,
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A job lands on the node the ledger says is emptiest, its entry says so afterwards, and
+    /// one that fits on no node is spread instead.
+    #[test]
+    fn a_job_is_placed_on_the_emptiest_node_the_ledger_knows() {
+        let dir = tmpdir("place");
+        let topology = crate::numa::Topology::of(vec![
+            crate::numa::Node {
+                id: 0,
+                cpus: (0..4).collect(),
+                mem_total_mib: 16384,
+            },
+            crate::numa::Node {
+                id: 1,
+                cpus: (4..8).collect(),
+                mem_total_mib: 16384,
+            },
+        ]);
+        // Another job already holds half of node 0.
+        let _other = held_on(&dir, "other", 8192, 1, true, Some(Place::Node(0)));
+
+        let mine = acquire(&dir, "mine", 4096, 32768, Duration::from_secs(0)).unwrap();
+        let placement = mine.place(&dir, &topology, 32768, Some(32768), 2).unwrap();
+        assert_eq!(
+            placement,
+            crate::numa::Placement::Bind {
+                node: 1,
+                cpus: vec![4, 5, 6, 7],
+                nodes_total: 2,
+            }
+        );
+        let line = std::fs::read_to_string(dir.join("mine")).unwrap();
+        assert!(
+            line.starts_with("4096 ") && line.ends_with(" granted node=1\n"),
+            "{line}"
+        );
+
+        let held = committed(&dir).unwrap();
+        assert_eq!(held.granted_mib, 12288);
+        assert_eq!(
+            held.per_node.get(&0).copied(),
+            Some(crate::numa::NodeLoad {
+                granted_mib: 8192,
+                jobs: 1,
+            })
+        );
+        assert_eq!(
+            held.per_node.get(&1).copied(),
+            Some(crate::numa::NodeLoad {
+                granted_mib: 4096,
+                jobs: 1,
+            })
+        );
+
+        // A job larger than either node's share of the budget is interleaved, and the ledger
+        // records that rather than a node.
+        let big = acquire(&dir, "big", 20480, 32768, Duration::from_secs(0)).unwrap();
+        assert_eq!(
+            big.place(&dir, &topology, 32768, Some(32768), 2).unwrap(),
+            crate::numa::Placement::Interleave { nodes: vec![0, 1] }
+        );
+        assert!(
+            std::fs::read_to_string(dir.join("big"))
+                .unwrap()
+                .ends_with(" granted spread\n")
+        );
+        assert_eq!(
+            committed(&dir).unwrap().spread,
+            crate::numa::NodeLoad {
+                granted_mib: 20480,
+                jobs: 1,
+            }
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

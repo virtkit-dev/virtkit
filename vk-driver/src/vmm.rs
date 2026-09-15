@@ -746,6 +746,12 @@ pub struct VmSpec {
     /// services, `vk run` sessions); left off for build/job VMs, which end on reset.
     #[serde(default)]
     pub reboot: bool,
+    /// Guest RAM and vCPU placement, applied before exec by [`crate::run::spawn_vmm`] and
+    /// inherited by the VMM's threads. Defaults to [`crate::numa::Numa::Auto`], which lets
+    /// the boot path choose under the host's `[numa] mode`. Applies to every backend without
+    /// changing the VMM's arguments.
+    #[serde(default)]
+    pub numa: crate::numa::Numa,
 }
 
 /// A virtual machine monitor that can boot a [`VmSpec`]. `Send` so a boxed `dyn Vmm`
@@ -1395,6 +1401,7 @@ mod tests {
             pass_fds: Vec::new(),
             proc_name: "vk:ci".into(),
             reboot: false,
+            numa: crate::numa::Numa::Auto,
         };
         assert_eq!(
             args(&ch.command(&spec)),
@@ -1466,6 +1473,7 @@ mod tests {
             pass_fds: Vec::new(),
             proc_name: "vk:build".into(),
             reboot: false,
+            numa: crate::numa::Numa::Auto,
         };
         assert_eq!(
             args(&ch.command(&spec)),

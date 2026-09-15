@@ -1067,7 +1067,13 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // The other half of the memory reservation prepare took (see admit): held here for the
     // job's whole life, so what this job booted keeps counting against the host budget until
     // the VM is gone. `None` when admission is off.
-    let _reservation = crate::admit::hold(&ctx.admit_dir(), &ctx.job_id);
+    let reservation = crate::admit::hold(&ctx.admit_dir(), &ctx.job_id);
+    // Record placement in the reservation this supervisor holds for the VM's lifetime.
+    let placement = job_placement(ctx, reservation.as_ref(), cpus).unwrap_or_else(|e| {
+        // Fall back to live host memory; a placement error must not fail the job.
+        eprintln!("virtkit: placing this job from the ledger ({e:#}) — using the live figures");
+        crate::numa::Numa::Auto
+    });
     // A build-tier base already carries its own reference straight from the build that
     // promoted it (see `Media::use_guard`) — no gap to close here. Anything resolved through
     // `image::resolve_ref` instead takes its reference fresh, now.
@@ -1530,6 +1536,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         proc_name: crate::vmm::resolve_proc_name(&cfg.executor.vm.hostname),
         // A CI job VM ends on a guest reset rather than rebooting in place.
         reboot: false,
+        numa: placement,
     };
     // passive listeners the guest dials once up: safe (and simplest) to start before
     // the VMM, and intentionally not bind-waited — they bind long before the guest
@@ -2138,6 +2145,42 @@ fn clamp_service_size(cfg: &crate::config::Config, unit: &mut crate::compose::Un
         }
     }
     Ok(())
+}
+
+/// Where this job's VM goes on a multi-socket host, announced in the job trace.
+///
+/// Use the admission ledger on hosts with a memory budget: other runners' grants count
+/// even before guests fault in their RAM. Without a budget, in `mode = "interleave"`, or on
+/// a single-node host, defer to the shared boot path ([`crate::numa::auto_place`]).
+fn job_placement(
+    ctx: &JobCtx,
+    reservation: Option<&crate::admit::Reservation>,
+    cpus: u32,
+) -> Result<crate::numa::Numa> {
+    use crate::config::NumaMode;
+    let cfg = &ctx.cfg;
+    match cfg.numa.mode {
+        NumaMode::Off => return Ok(crate::numa::Numa::Off),
+        // Interleaving chooses no node, so it needs neither the ledger nor a job's size.
+        NumaMode::Interleave => return Ok(crate::numa::Numa::Auto),
+        NumaMode::Auto => {}
+    }
+    let (Some(reservation), Some(budget), Some(topology)) = (
+        reservation,
+        budget_mib(cfg),
+        crate::numa::Topology::detect(),
+    ) else {
+        return Ok(crate::numa::Numa::Auto);
+    };
+    let placement = reservation.place(
+        &ctx.admit_dir(),
+        &topology,
+        budget?,
+        crate::schedule::host_total_mib(),
+        cpus,
+    )?;
+    println!("virtkit: NUMA: {}", crate::numa::announce(&placement));
+    Ok(crate::numa::Numa::Placed(placement))
 }
 
 /// The guest RAM this job declares, in MiB: `MICROVM_MEM` clamped by the host ceilings, the
