@@ -63,7 +63,10 @@ pub fn open_log(path: &Path) -> Result<(std::fs::File, u64)> {
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        // Non-blocking as well, so the check below is reached at all: opening a FIFO for
+        // reading waits for a writer, and a FIFO is exactly what the check is there to
+        // refuse. A regular file reads the same either way — it is never short of data.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .with_context(|| format!("reading {}", path.display()))?;
     let md = file
@@ -1053,5 +1056,33 @@ SEP
         assert_eq!(p.samples.len(), 1);
         assert_eq!(p.dropped, 0);
         assert!(p.samples[0].cpu.is_some());
+    }
+
+    /// A guest owns the directory its recording goes in and can leave a FIFO where the log
+    /// belongs. Opening one for reading waits for a writer that may never come, so the
+    /// refusal that is there to catch it has to be reachable in the first place.
+    #[test]
+    fn a_fifo_where_the_log_goes_is_refused_rather_than_waited_on() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = std::env::temp_dir().join(format!("vk-atoplog-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("atop.log");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a nul-terminated path that outlives the call, and mkfifo
+        // returns 0 or -1.
+        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // no FIFOs on this filesystem, so there is nothing to refuse
+        }
+        let e = open_log(&path).expect_err("a FIFO is not a recording");
+        assert!(format!("{e:#}").contains("not a regular file"), "{e:#}");
+
+        // And a recording beside it still opens, and still reports how long it is.
+        let real = dir.join("real.log");
+        std::fs::write(&real, b"SEP\n").unwrap();
+        assert_eq!(open_log(&real).unwrap().1, 4);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

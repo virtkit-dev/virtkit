@@ -31,6 +31,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`vk atop` now says so when a recording is not one, instead of waiting for ever.** A
+  guest that left a pipe where its log belongs could hold a read of it open indefinitely.
+
 - **A full-screen panel now gives the terminal back however it is ended.** Two signals
   arriving together while `vk atop --view` or `vk dash` held the screen could leave the
   process stuck with the terminal in raw mode and no cursor.
