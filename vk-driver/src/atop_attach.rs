@@ -106,6 +106,24 @@ impl Recording {
         }
     }
 
+    /// End it now, and wait until it has actually ended.
+    ///
+    /// Dropping a recording only *asks* for that: the pump is aborted, and the task — with
+    /// the connection and the file holding the log's lock inside it — is dropped on a
+    /// runtime thread some time after. A caller that hands the same log straight on to a
+    /// `vk atop`, which takes the same lock, has to wait for that to have happened, and an
+    /// aborted handle resolves exactly then. No final sample: this is the way out for a
+    /// caller that has none to wait for.
+    pub(crate) async fn stop_now(mut self) {
+        self.stop.cancel();
+        if let Some(pump) = self.pump.take() {
+            pump.abort();
+            // Aborted on purpose, so neither the cancellation nor the sampler's own last
+            // word is news; what this waits for is the task having been dropped.
+            let _ = pump.await;
+        }
+    }
+
     /// Why a pump that ended before the recording had its first sample did, in the terms an
     /// operator can act on. Leaves nothing behind for the drop to end.
     async fn ended_early(&mut self) -> anyhow::Error {
@@ -257,6 +275,12 @@ pub(crate) async fn start(
     Ok(recording)
 }
 
+/// What a VM's exec address failing to parse is about. Said in one place because two callers
+/// dial the same registry field: `vk atop` here, and the dashboard's guest pane.
+pub(crate) fn exec_addr_context(addr: &str) -> String {
+    format!("the VM's exec address {addr:?}")
+}
+
 /// Attach to `entry`'s guest and record it, laying the log down at
 /// `<state dir>/atop/atop.log` (replacing any previous attach's recording). With a
 /// terminal — and without `summary`, which records headless on purpose — the follow
@@ -266,7 +290,7 @@ pub async fn attach(entry: &vms::VmEntry, interval_secs: u64, summary: bool) -> 
     let addr: SocketAddr = entry
         .exec_addr
         .parse()
-        .with_context(|| format!("the VM's exec address {:?}", entry.exec_addr))?;
+        .with_context(|| exec_addr_context(&entry.exec_addr))?;
     // The panel only where somebody is watching one: `--summary` is the headless form,
     // and without a terminal the panel can draw on there is nothing to open it on (the
     // recording still runs). Decided here rather than left to the panel to refuse, so a
@@ -525,6 +549,37 @@ mod tests {
             .await
             .expect("the pump outlived the recording that owned it")
             .expect_err("the pump ended by itself rather than being ended");
+    }
+
+    /// Stopping now is a happens-after: once it returns, the pump has been dropped, and
+    /// with it the connection and the file holding the log's lock. An abort on its own only
+    /// asks for that, which is not enough for a caller about to hand the same log to a
+    /// `vk atop --follow` that takes the same lock.
+    #[tokio::test]
+    async fn stopping_now_returns_only_once_the_pump_has_gone() {
+        let held = std::sync::Arc::new(());
+        let carried = std::sync::Arc::clone(&held);
+        let recording = Recording {
+            log: PathBuf::from("/state/vm/atop/atop.log"),
+            pump: Some(tokio::spawn(async move {
+                // Stands in for the connection and the locked file the pump holds.
+                let _carried = carried;
+                std::future::pending::<()>().await;
+                Ok(CmdResult {
+                    code: Some(0),
+                    signal: None,
+                })
+            })),
+            stop: CancellationToken::new(),
+        };
+        // So the stop below is a running task's, not a task that never started.
+        tokio::task::yield_now().await;
+        recording.stop_now().await;
+        assert_eq!(
+            std::sync::Arc::strong_count(&held),
+            1,
+            "the pump was still holding the recording"
+        );
     }
 
     /// Stopping asks the guest for its final sample by closing its stdin — exactly once,

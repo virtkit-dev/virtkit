@@ -33,6 +33,7 @@
 mod actions;
 mod console;
 mod envs;
+mod guest;
 mod pane;
 mod poll;
 mod render;
@@ -40,6 +41,7 @@ mod state;
 
 use std::io::Write;
 use std::os::unix::process::CommandExt;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::Duration;
 
@@ -62,6 +64,10 @@ pub(crate) struct Args {
     pub(crate) interval: Duration,
     /// whether the frame may use colour at all; it carries no meaning either way
     pub(crate) colour: bool,
+    /// The runtime to put the one thing here that is asynchronous on: recording a guest over
+    /// its exec channel. Taken from the caller rather than looked up here, because this runs
+    /// on a thread of its own and there is nothing to find from one of those.
+    pub(crate) handle: tokio::runtime::Handle,
 }
 
 /// Draw the dashboard until the reader leaves it.
@@ -102,6 +108,16 @@ pub(crate) fn run(args: Args) -> Result<()> {
     poll::spawn_refresher(tx.clone(), args.interval, stop.clone());
     poll::spawn_console(tx.clone(), stop.clone(), follow.clone());
     poll::spawn_sampler(tx.clone(), stop.clone(), follow.clone(), args.interval);
+    // The one that records a guest is held apart for the same reason the key reader is:
+    // handing the terminal to a `vk atop --follow` means letting go of the recording first,
+    // since both of them want the same log.
+    let spawner: Arc<dyn guest::Spawner> = Arc::new(guest::OnRuntime::new(args.handle));
+    let mut watcher = poll::spawn_guest(
+        tx.clone(),
+        follow.clone(),
+        Arc::clone(&spawner),
+        args.interval,
+    );
 
     let mut app = App::new(args.interval, args.colour);
     while !app.quit() {
@@ -128,8 +144,18 @@ pub(crate) fn run(args: Args) -> Result<()> {
                 Request::Preview { name, rows } => poll::spawn_preview(rows, name, tx.clone()),
                 Request::Run(job) => actions::spawn(job, tx.clone()),
                 Request::Handover(job) => {
+                    // Whatever this hands the terminal to may want the guest's recording:
+                    // `a` is a `vk atop` against the same VM, and one recording at a time is
+                    // all a VM has. It is taken up again below.
+                    watcher.stand_down();
                     let (said, reader) = hand_over(&mut raw, &mut screen, keys, &tx, &rx, &job)?;
                     keys = reader;
+                    watcher = poll::spawn_guest(
+                        tx.clone(),
+                        follow.clone(),
+                        Arc::clone(&spawner),
+                        args.interval,
+                    );
                     app.on_event(Event::Said(said));
                     // Whatever happened in there, it may have changed what is running.
                     poll::refresh_once(tx.clone());
@@ -139,6 +165,15 @@ pub(crate) fn run(args: Args) -> Result<()> {
     }
     stop.raise();
     keys.raise();
+    // The reader's terminal comes back first on the way out. Standing the watcher down waits
+    // for a guest's recording to have been let go of, and that wait must not be spent on the
+    // alternate screen with nothing being drawn on it. The handover above keeps the other
+    // order on purpose: there the recording has to be gone before the child takes the log.
+    drop(screen.take());
+    drop(raw.take());
+    // Waited for rather than left to a raised flag: what it is holding is a sampler running
+    // inside somebody's guest, and leaving the dashboard is not a reason to leave that.
+    watcher.stand_down();
     Ok(())
 }
 

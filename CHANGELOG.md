@@ -14,7 +14,11 @@ All notable changes to virtkit will be documented in this file.
   through a whole boot and narrowable by writer and by severity without losing any of it.
   A second pane meters what a running environment is taking from the host itself —
   processor against the vCPUs it was given, memory against the size it booted with, and the
-  disk traffic behind it. `s` totals what each one occupies on disk. `x` offers what can be
+  disk traffic behind it. A third shows the same environment as its own guest sees it:
+  which of its processors are busy, how much of its memory is cache, whether it is stalling
+  on memory or on disk, and which of its own processes is behind it — asked of the guest
+  only while that pane is on screen, and of a guest already recording itself not at all.
+  `s` totals what each one occupies on disk. `x` offers what can be
   done to the selected environment — stop it, start it, refresh it, open a shell or the
   editor on it, or remove what a finished one left behind — each of which runs the command
   it names against that environment's own checkout, with the reason spelled out for

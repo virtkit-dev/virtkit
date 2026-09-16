@@ -18,8 +18,8 @@ const KEYS: &[(&str, &str)] = &[
     ("home end", "the ends of the list, or of the pane below it"),
     ("tab", "move between the list and the pane below it"),
     (
-        "1  2",
-        "the console, or what the environment costs this host",
+        "1  2  3",
+        "the console, what it costs this host, what its guest says",
     ),
     ("f", "follow the newest console line again"),
     (

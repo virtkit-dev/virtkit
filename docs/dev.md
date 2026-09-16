@@ -552,14 +552,14 @@ The left column lists every environment and its state, running first, followed
 by the running count and total memory use. `s` walks the state directories to
 add their disk usage. The right column shows the selected environment's
 workspace, state directory, VM, memory and guest address. Below it, a pane shows
-either the console, with kernel, agent and guest lines distinguished and
-filterable by source and severity, or the VM's host resource usage.
+the console, with kernel, agent and guest lines distinguished and filterable by
+source and severity; the VM's host resource usage; or the guest's own figures.
 
 | Keys | Purpose |
 | --- | --- |
 | `j` `k`, arrows, `pgup` `pgdn`, `home` `end` | Move the selection, or scroll the pane below it. |
 | `tab` | Move between the list and that pane. |
-| `1` `2` | Show the console, or the host cost. |
+| `1` `2` `3` | Show the console, the host cost, or the guest's own figures. |
 | `f`, `K` `A` `G`, `[` `]` | Follow the newest console line; show or hide the kernel, the agent, the guest; raise or lower the severity floor. |
 | `r`, `s` | Re-read the environments now; total what each holds on disk. |
 | `x` | What can be done to the selected environment. |
@@ -578,9 +578,19 @@ of sight and report in the key bar. Removing an environment shows the command
 and the same listing of the directory's contents `vk dev gc` prints, and waits
 for `y`.
 
-The usage pane measures the VM's host process tree: CPU against its vCPU
+The host pane measures the VM's host process tree: CPU against its vCPU
 allocation, resident memory against its boot allocation, and block I/O.
-For the guest's own view, `a` hands the terminal to `vk atop STATE_DIR --follow`.
+
+The guest pane answers the other half of that question, in the guest's own
+terms: its processors, its memory and cache, its pressure stall figures, its
+disks and interfaces, and the processes using them — the panel `vk atop --view`
+draws, inside the dashboard. Getting those figures costs the guest a sampler of
+its own, so one is started only while that pane is on screen and is stopped
+again half a minute after you leave it; a VM booted with `vk run --atop` is
+already recording itself and its recording is read rather than a second one
+started. `a` still hands the whole terminal to `vk atop STATE_DIR --follow`,
+which is the same panel with its keys — stepping back through the recording,
+sorting and filtering the process table.
 
 `vk dash` reads the VM registry of the host it runs on. Run inside a `vk dev`
 guest it therefore lists that guest's own registry, normally empty, and not the

@@ -5,12 +5,12 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::actions::{Action, Job, Refusal, Weight};
 use super::console;
 use super::envs::Env;
-use super::poll::{Event, Sample, Selected};
+use super::poll::{Event, Guest, GuestAddr, Sample, Selected};
 use crate::consolelog::Source;
 use crate::dev::list::Row;
 use crate::term::Press;
@@ -24,7 +24,9 @@ pub(crate) enum Pane {
     /// the selected environment's guest console
     Console,
     /// what the selected environment is costing this host
-    Usage,
+    Host,
+    /// what the selected environment's guest makes of itself
+    Guest,
 }
 
 /// Which half of the screen the movement keys belong to.
@@ -121,6 +123,12 @@ pub(crate) struct App {
     /// doing now.
     pub(crate) sample: Option<Sample>,
     pub(crate) previous: Option<Sample>,
+    /// The guest's own account of itself: how far the asking has got, and the newest sample
+    /// once it has got that far.
+    pub(crate) guest: Option<Guest>,
+    /// When that sample reached this host, on this host's clock — a guest whose own clock is
+    /// wrong is exactly the guest a reader is looking at this pane about.
+    pub(crate) guest_at: Option<Instant>,
     /// Which environment the console thread is working for. Bumped whenever the selection
     /// moves, so a pass that began under the last one is recognised and dropped.
     epoch: u64,
@@ -134,6 +142,9 @@ pub(crate) struct App {
     /// the process tree they were last pointed at, which changes without the environment
     /// doing so every time one starts or stops
     sampled: Option<i32>,
+    /// whether they were last told the guest's own figures were wanted, which changes with
+    /// no selection moving at all: the pane keys alone decide it
+    wanted_guest: bool,
     quit: bool,
     requests: VecDeque<Request>,
 }
@@ -158,10 +169,13 @@ impl App {
             console_missing: false,
             sample: None,
             previous: None,
+            guest: None,
+            guest_at: None,
             epoch: 0,
             sample_epoch: 0,
             followed: None,
             sampled: None,
+            wanted_guest: false,
             quit: false,
             requests: VecDeque::new(),
         }
@@ -227,6 +241,16 @@ impl App {
                     self.previous = self.sample.replace(sample);
                 }
             }
+            Event::Guest { epoch, guest } => {
+                // Read for the process tree the reader has left, or for the one a restart
+                // replaced: it is not about the guest in front of them.
+                if epoch == self.sample_epoch {
+                    if matches!(guest, Guest::Sample(_)) {
+                        self.guest_at = Some(Instant::now());
+                    }
+                    self.guest = Some(guest);
+                }
+            }
             Event::Preview { name, text } => {
                 // A listing read for an environment the reader has since backed out of, or
                 // moved on from, describes something they are no longer being asked about.
@@ -274,6 +298,13 @@ impl App {
         self.epoch
     }
 
+    /// The same for the threads that follow the process tree, so a test can hand the
+    /// dashboard a reading or a guest's sample exactly as they do.
+    #[cfg(test)]
+    pub(crate) fn sample_epoch(&self) -> u64 {
+        self.sample_epoch
+    }
+
     /// Whether the console pane is showing the newest line.
     pub(crate) fn following(&self) -> bool {
         self.scrollback == 0
@@ -309,7 +340,17 @@ impl App {
         let pid = selected
             .and_then(|env| env.vm.as_ref())
             .and_then(|vm| i32::try_from(vm.pid).ok());
-        if dir == self.followed && pid == self.sampled {
+        let guest = selected
+            .and_then(|env| env.vm.as_ref())
+            .map(|vm| GuestAddr {
+                exec_addr: vm.exec_addr.clone(),
+                state_dir: vm.state_dir.clone(),
+                own_log: vm.atop_log.clone(),
+            });
+        // The guest is asked for its own figures only while the pane that draws them is up,
+        // so a pane key alone is reason enough to point the threads again.
+        let want_guest = self.pane == Pane::Guest;
+        if dir == self.followed && pid == self.sampled && want_guest == self.wanted_guest {
             return;
         }
         if dir != self.followed {
@@ -327,14 +368,19 @@ impl App {
             self.sample_epoch = self.sample_epoch.wrapping_add(1);
             self.sample = None;
             self.previous = None;
+            self.guest = None;
+            self.guest_at = None;
         }
         self.followed = dir.clone();
         self.sampled = pid;
+        self.wanted_guest = want_guest;
         self.ask(Request::Follow(Selected {
             epoch: self.epoch,
             sample_epoch: self.sample_epoch,
             dir,
             pid,
+            guest,
+            want_guest,
         }));
     }
 
@@ -390,6 +436,15 @@ impl App {
         self.sizes_pending = true;
         let dirs = self.envs.iter().map(|env| env.dir.clone()).collect();
         self.ask(Request::Sizes(dirs));
+    }
+
+    /// Show one of the lower pane's tabs.
+    ///
+    /// Not only a change of screen: the guest is asked for its own figures while that pane
+    /// is up and left alone otherwise, so the threads that follow the selection are told.
+    fn show_pane(&mut self, pane: Pane) {
+        self.pane = pane;
+        self.retarget();
     }
 
     /// Show a source, or stop showing it, keeping the window somewhere the pane can draw
@@ -533,8 +588,9 @@ impl App {
                     Focus::Lower => Focus::List,
                 }
             }
-            Press::Char('1') => self.pane = Pane::Console,
-            Press::Char('2') => self.pane = Pane::Usage,
+            Press::Char('1') => self.show_pane(Pane::Console),
+            Press::Char('2') => self.show_pane(Pane::Host),
+            Press::Char('3') => self.show_pane(Pane::Guest),
             Press::Char('r') => self.ask(Request::Refresh),
             Press::Char('s') => self.walk_sizes(),
 
@@ -831,8 +887,10 @@ mod tests {
         assert_eq!(app.focus, Focus::List);
 
         app.key(Press::Char('2'));
-        assert_eq!(app.pane, Pane::Usage);
+        assert_eq!(app.pane, Pane::Host);
         assert_eq!(app.focus, Focus::List, "a pane key moved the focus");
+        app.key(Press::Char('3'));
+        assert_eq!(app.pane, Pane::Guest);
         app.key(Press::Char('1'));
         assert_eq!(app.pane, Pane::Console);
     }
@@ -1057,6 +1115,64 @@ mod tests {
             app.sample.is_none(),
             "a reading of the tree that ended stood"
         );
+    }
+
+    /// The guest is asked for its own figures only while the pane that draws them is up, so
+    /// a pane key on its own points the threads again — and an answer that arrives for the
+    /// process tree the reader has left is dropped, as a reading of the host's cost is.
+    #[test]
+    fn the_guest_is_asked_for_its_figures_only_while_its_pane_is_up() {
+        let mut app = app();
+        app.on_event(Event::Envs(running(2)));
+        match drain(&mut app).as_slice() {
+            [Request::Follow(followed)] => {
+                assert!(!followed.want_guest, "a guest was asked for unprompted");
+                assert_eq!(
+                    followed.guest.as_ref().map(|guest| guest.state_dir.clone()),
+                    Some(PathBuf::from("/state/env-0")),
+                );
+            }
+            other => panic!("the first read asked for {other:?}"),
+        }
+
+        // Showing the pane says so, and leaving it says so too.
+        app.key(Press::Char('3'));
+        match drain(&mut app).as_slice() {
+            [Request::Follow(followed)] => assert!(followed.want_guest),
+            other => panic!("the pane key asked for {other:?}"),
+        }
+        app.key(Press::Char('1'));
+        match drain(&mut app).as_slice() {
+            [Request::Follow(followed)] => assert!(!followed.want_guest),
+            other => panic!("leaving the pane asked for {other:?}"),
+        }
+
+        let sample = || {
+            Guest::Sample(Box::new(super::super::pane::guest::fixture::sample(
+                "sh -c make test",
+            )))
+        };
+        app.on_event(Event::Guest {
+            epoch: app.sample_epoch,
+            guest: sample(),
+        });
+        assert!(matches!(app.guest, Some(Guest::Sample(_))));
+        assert!(app.guest_at.is_some(), "the sample was not timed");
+
+        // Read for the tree the reader has left, and arriving after they moved on.
+        app.on_event(Event::Guest {
+            epoch: app.sample_epoch.wrapping_sub(1),
+            guest: Guest::Failed("the VM went away".to_string()),
+        });
+        assert!(
+            matches!(app.guest, Some(Guest::Sample(_))),
+            "a stale answer reached the pane"
+        );
+
+        // Another environment is another guest, so its figures start again rather than
+        // sitting under the new one's name.
+        app.key(Press::Char('j'));
+        assert!(app.guest.is_none() && app.guest_at.is_none());
     }
 
     /// `x` opens the menu, and while it is up it has the keyboard: a key that would have

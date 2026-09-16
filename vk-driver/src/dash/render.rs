@@ -275,7 +275,8 @@ fn right_column(app: &App, width: usize, rows: usize) -> Vec<Line> {
     let room = rows.saturating_sub(lines.len());
     lines.extend(match app.pane {
         Pane::Console => pane::console::lines(app, width, room),
-        Pane::Usage => pane::usage::lines(app, width, room),
+        Pane::Host => pane::host::lines(app, width, room),
+        Pane::Guest => pane::guest::lines(app, width, room),
     });
     lines
 }
@@ -285,7 +286,14 @@ fn right_column(app: &App, width: usize, rows: usize) -> Vec<Line> {
 fn tabs(app: &App) -> Line {
     let focused = app.focus == Focus::Lower;
     let mut line = Line::new();
-    for (key, name, pane) in [('1', "console", Pane::Console), ('2', "usage", Pane::Usage)] {
+    // Named for whose figures they are rather than for what they measure: the two halves of
+    // the same question are the host's account of the VM and the guest's account of itself,
+    // and a reader who takes one for the other reads every number on it backwards.
+    for (key, name, pane) in [
+        ('1', "console", Pane::Console),
+        ('2', "host", Pane::Host),
+        ('3', "guest", Pane::Guest),
+    ] {
         let showing = app.pane == pane;
         let label = match showing {
             true => format!("[{key}] {name}  "),
@@ -331,10 +339,10 @@ fn key_bar(app: &App, cols: usize) -> Line {
         Focus::List => "tab pane",
         Focus::Lower => "tab list",
     };
-    let mut hints = vec!["j/k move", "x act", focus, "1/2 pane"];
+    let mut hints = vec!["j/k move", "x act", focus, "1/2/3 pane"];
     // The console's keys before the list's: a reader looking at a guest's console wants
     // them more than the two that re-read the host, and the bar drops hints from the right.
-    // The usage pane's own key is the one that shows the other half of the same question.
+    // The host pane's own key is the one that shows the other half of the same question.
     if app.pane == Pane::Console {
         hints.extend(["f follow", "KAG source", "[ ] level"]);
     } else {
@@ -512,8 +520,19 @@ mod tests {
                 at,
             }));
         }
+        // And one of the guest's own, which is the other half of the same question.
+        app.on_event(Event::Guest {
+            epoch: app.sample_epoch(),
+            guest: crate::dash::poll::Guest::Sample(Box::new(
+                crate::dash::pane::guest::fixture::sample("sh -c make test"),
+            )),
+        });
         app
     }
+
+    /// Every pane the lower half can be showing, since each fills the same room with a
+    /// different thing.
+    const PANES: [Pane; 3] = [Pane::Console, Pane::Host, Pane::Guest];
 
     /// Console lines, as the tail hands them over for whatever is selected now.
     fn console_batch(app: &App, raw: &[&str]) -> crate::dash::console::Batch {
@@ -570,7 +589,7 @@ mod tests {
                 // things into the same room — and under each of the panes the room is
                 // shared with.
                 for mut app in [app(), read_app()] {
-                    for pane in [Pane::Console, Pane::Usage] {
+                    for pane in PANES {
                         app.pane = pane;
                         app.mode = mode.clone();
                         app.colour = true;
@@ -647,12 +666,12 @@ mod tests {
         assert!(drawn.contains("KAG source"), "the keys to undo it are gone");
     }
 
-    /// The usage pane says whose figures these are. A reader who takes the host's cost for
+    /// The host pane says whose figures these are. A reader who takes the host's cost for
     /// the guest's own view of itself reads every number on it backwards.
     #[test]
-    fn the_usage_pane_says_it_is_the_host_that_is_paying() {
+    fn the_host_pane_says_it_is_the_host_that_is_paying() {
         let mut app = read_app();
-        app.pane = Pane::Usage;
+        app.pane = Pane::Host;
         let drawn = rows_of(&frame(&app, 24, 100)).join("\n");
         assert!(drawn.contains("host cost"), "{drawn}");
         assert!(drawn.contains("not what the guest sees"), "{drawn}");
@@ -678,6 +697,37 @@ mod tests {
         app.key(Press::Char('j'));
         let drawn = rows_of(&frame(&app, 24, 100)).join("\n");
         assert!(drawn.contains("costing this host nothing"), "{drawn}");
+    }
+
+    /// The guest pane says the figures are the guest's own, and the tab strip says which of
+    /// the three is showing — at eighty columns, where the strip has least room.
+    #[test]
+    fn the_guest_pane_says_the_figures_are_the_guests_own() {
+        let mut app = read_app();
+        app.key(Press::Char('3'));
+        let drawn = rows_of(&frame(&app, 24, 80)).join("\n");
+        assert!(drawn.contains("guest figures"), "{drawn}");
+        assert!(drawn.contains("what it sees inside itself"), "{drawn}");
+        assert!(
+            drawn.contains("[3] guest"),
+            "the tab is not marked: {drawn}"
+        );
+        assert!(drawn.contains(" 1  console"), "{drawn}");
+        assert!(drawn.contains(" 2  host"), "{drawn}");
+        // The guest's own account of itself, not the host's of the VM.
+        assert!(drawn.contains("psi "), "{drawn}");
+        // Its processes need a column wide enough to hold a table; at eighty the system
+        // lines are what there is room for, and the table is dropped rather than cut up.
+        assert!(!drawn.contains("sh -c make test"), "{drawn}");
+        let wide = rows_of(&frame(&app, 24, 120)).join("\n");
+        assert!(wide.contains("sh -c make test"), "{wide}");
+
+        // An environment that is not running has nothing to say about itself, and says so
+        // rather than showing the last guest's figures under its name.
+        app.key(Press::Char('j'));
+        app.key(Press::Char('j'));
+        let drawn = rows_of(&frame(&app, 24, 120)).join("\n");
+        assert!(drawn.contains("nothing to say about itself"), "{drawn}");
     }
 
     /// The menu says what can be done and, for what cannot, why — in words, because the
@@ -779,7 +829,7 @@ mod tests {
         }
         // Including the panes that draw bars and console lines, which is where the escape
         // sequences would come from if any pane wrote its own.
-        for pane in [Pane::Console, Pane::Usage] {
+        for pane in PANES {
             let mut app = read_app();
             app.pane = pane;
             let frame = frame(&app, 24, 100);

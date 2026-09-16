@@ -2860,7 +2860,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
         };
     }
     // A host-wide read, like the listings above it. It blocks this thread until the reader
-    // leaves; it never awaits and spawns no task, so the runtime's workers stay free.
+    // leaves and never awaits, so the runtime's workers stay free for the one thing it does
+    // put on them: recording a guest that is asked for its own figures.
     if let Cmd::Dash { interval, no_color } = &cli.cmd {
         // `TERM=dumb` needs no test of its own: the dashboard refuses a terminal that
         // cannot address its own screen before it draws anything at all.
@@ -2868,6 +2869,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         return match dash::run(dash::Args {
             interval: std::time::Duration::from_secs(*interval),
             colour,
+            handle: tokio::runtime::Handle::current(),
         }) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 2),

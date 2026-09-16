@@ -1,4 +1,4 @@
-//! The usage pane: what the selected environment is taking from **this host**.
+//! The host pane: what the selected environment is taking from **this host**.
 //!
 //! Not what the guest sees inside itself. A guest counts every page it has touched, its own
 //! cache included, and will happily report gigabytes the host is not backing; the host is
