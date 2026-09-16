@@ -13,6 +13,8 @@
 //! off not one escape sequence beyond the cursor controls is emitted, and the screen says
 //! everything the coloured one does.
 
+use std::path::Path;
+
 use unicode_width::UnicodeWidthChar;
 
 use super::pane;
@@ -38,6 +40,8 @@ pub(crate) enum Style {
     Dim,
     /// what the eye should land on first
     Bold,
+    /// running, or otherwise fine
+    Good,
     /// wants the reader
     Alarm,
 }
@@ -50,6 +54,7 @@ impl Style {
             Style::Bold => "\x1b[1m",
             Style::Dim => "\x1b[2m",
             Style::Alarm => "\x1b[31m",
+            Style::Good => "\x1b[32m",
         }
     }
 }
@@ -85,6 +90,9 @@ pub(crate) struct Painter {
     width: usize,
     /// columns there are
     cols: usize,
+    /// the column this line may not draw past, for as long as it stands: what keeps one
+    /// column of a two-column layout out of the next
+    limit: usize,
     colour: bool,
     /// whether a style is in force and still has to be turned off
     open: bool,
@@ -96,14 +104,25 @@ impl Painter {
             out: String::new(),
             width: 0,
             cols,
+            limit: cols,
             colour,
             open: false,
         }
     }
 
+    /// Draw nothing past column `col` until [`Painter::unlimit`] lifts it.
+    pub(crate) fn limit(&mut self, col: usize) {
+        self.limit = col.min(self.cols);
+    }
+
+    /// Give the rest of the screen back.
+    pub(crate) fn unlimit(&mut self) {
+        self.limit = self.cols;
+    }
+
     /// Draw `text` in `style`, as much of it as there is room for.
     pub(crate) fn push(&mut self, text: &str, style: Style) {
-        let (fitted, used) = fit(text, self.cols.saturating_sub(self.width));
+        let (fitted, used) = fit(text, self.limit.saturating_sub(self.width));
         if fitted.is_empty() {
             return;
         }
@@ -126,7 +145,7 @@ impl Painter {
 
     /// Fill with spaces up to column `col`, if the line has not already passed it.
     pub(crate) fn pad_to(&mut self, col: usize) {
-        let room = col.min(self.cols).saturating_sub(self.width);
+        let room = col.min(self.limit).saturating_sub(self.width);
         if room > 0 {
             self.push(&" ".repeat(room), Style::Plain);
         }
@@ -207,16 +226,20 @@ pub(crate) fn frame(app: &App, rows: u16, cols: u16) -> String {
 fn dashboard(app: &App, rows: usize, cols: usize) -> Vec<String> {
     let two = cols >= LIST_WIDTH.saturating_add(MIN_RIGHT).saturating_add(1);
     if !two {
-        return paint_all(&left_column(app, cols), cols, app.colour);
+        return paint_all(&pane::list::lines(app, cols, rows), cols, app.colour);
     }
     let right_width = cols.saturating_sub(LIST_WIDTH).saturating_sub(2);
-    let left = left_column(app, LIST_WIDTH);
+    let left = pane::list::lines(app, LIST_WIDTH, rows);
     let right = right_column(app, right_width);
     (0..rows)
         .map(|i| {
             let mut painter = Painter::new(cols, app.colour);
+            // The list keeps to its own column: a long name or a long total must not run
+            // through the rule and into the facts on the other side of it.
+            painter.limit(LIST_WIDTH);
             paint_into(&mut painter, left.get(i));
             painter.pad_to(LIST_WIDTH);
+            painter.unlimit();
             painter.push("│", Style::Dim);
             painter.push(" ", Style::Plain);
             paint_into(&mut painter, right.get(i));
@@ -225,33 +248,15 @@ fn dashboard(app: &App, rows: usize, cols: usize) -> Vec<String> {
         .collect()
 }
 
-/// The left-hand column: what is on this host.
-fn left_column(app: &App, _width: usize) -> Vec<Line> {
-    vec![
-        vec![span("ENVIRONMENTS", heading(app.focus == Focus::List))],
-        Line::new(),
-        vec![span("nothing read yet", Style::Dim)],
-    ]
-}
-
 /// The right-hand column: the selected environment's facts, then the tab strip, then
 /// whichever pane it names.
 fn right_column(app: &App, width: usize) -> Vec<Line> {
-    let mut lines = vec![vec![span("nothing selected", Style::Dim)]];
+    let mut lines = pane::detail::lines(app, width);
+    lines.truncate(DETAIL_ROWS);
     lines.resize(DETAIL_ROWS, Line::new());
     lines.push(tabs(app));
     lines.push(vec![span("─".repeat(width), Style::Dim)]);
     lines
-}
-
-/// How the heading of a column is drawn, given whether the movement keys belong to it.
-/// Weight rather than hue, so it survives a terminal with no colour — and the key bar says
-/// which in words, so it survives one with no styling at all.
-fn heading(focused: bool) -> Style {
-    match focused {
-        true => Style::Bold,
-        false => Style::Dim,
-    }
 }
 
 /// The tab strip. Which tab is showing is said by the brackets as well as by the weight,
@@ -293,7 +298,7 @@ fn key_bar(app: &App, cols: usize) -> Line {
     };
     let mut bar = String::from(" ");
     let mut used = 1usize.saturating_add(ALWAYS.chars().count());
-    for hint in [focus, "1/2 pane"] {
+    for hint in ["j/k move", focus, "1/2 pane", "s size", "r refresh"] {
         let cost = hint.chars().count().saturating_add(2);
         if used.saturating_add(cost) > cols {
             break;
@@ -323,6 +328,40 @@ fn paint_into(painter: &mut Painter, line: Option<&Line>) {
     }
 }
 
+/// A name with its hash cut to something a column can hold.
+///
+/// An environment is called `virtkit-4171942f2d70bae7`: a stem naming the checkout and
+/// sixteen hex digits telling it apart from the other environment over the same one. The
+/// stem is what a reader reads and the hash is what they need only enough of to tell two
+/// rows apart, so the list keeps the stem whole and the first eight of the hash. The full
+/// name stays the name everywhere it matters, the column beside it included.
+pub(crate) fn short_name(name: &str) -> String {
+    /// Enough hex to tell apart every environment on a host, and no more.
+    const KEEP: usize = 8;
+
+    let Some((stem, hash)) = name.rsplit_once('-') else {
+        return name.to_string();
+    };
+    let hashlike = hash.len() > KEEP && hash.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if !hashlike {
+        return name.to_string();
+    }
+    let kept: String = hash.chars().take(KEEP).collect();
+    format!("{stem}-{kept}")
+}
+
+/// A path with the reader's home written as `~`, which is how they think of it and how it
+/// fits in a column this wide.
+pub(crate) fn tilde(path: &Path) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(Path::new(&home)) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // An assertion is how a test reports; the panic lints this module gates on exist to
@@ -335,6 +374,8 @@ mod tests {
     )]
 
     use super::*;
+    use crate::term::Press;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     /// Every size a frame might be asked for, from one that cannot hold a word to one
@@ -353,6 +394,26 @@ mod tests {
 
     fn app() -> App {
         App::new(Duration::from_secs(3), false)
+    }
+
+    /// A dashboard with a host's worth of environments read into it: one running, one
+    /// stopped, one that answers to no environment, and a name long enough to have to be
+    /// cut down to the column.
+    fn read_app() -> App {
+        use crate::dash::envs::fixture::{row, vm};
+        use crate::dash::poll::Event;
+        use crate::dev::list::Status;
+
+        let mut app = app();
+        app.on_event(Event::Envs(crate::dash::envs::join(
+            vec![
+                row("virtkit-4171942f2d70bae7", "/state/a", Status::Running),
+                row("wab-qa-d3a92b42d7d0a15f", "/state/b", Status::Stopped),
+            ],
+            vec![vm("/state/a", 3928432), vm("/state/scratch", 4242)],
+        )));
+        app.sizes.insert(PathBuf::from("/state/a"), 63_887_450_112);
+        app
     }
 
     /// The rows of a frame, as the terminal would see them: the cursor controls that
@@ -394,26 +455,53 @@ mod tests {
     fn a_frame_is_exactly_the_screen_it_was_given() {
         for (rows, cols) in SIZES {
             for mode in [Mode::Normal, Mode::Help] {
-                let mut app = app();
-                app.mode = mode.clone();
-                app.colour = true;
-                let frame = frame(&app, rows, cols);
-                let drawn = rows_of(&frame);
-                assert_eq!(
-                    drawn.len(),
-                    rows as usize,
-                    "{rows}x{cols} {mode:?} drew {} rows",
-                    drawn.len()
-                );
-                for line in &drawn {
-                    assert!(
-                        columns(line) <= cols as usize,
-                        "{rows}x{cols} {mode:?} drew {} columns: {line:?}",
-                        columns(line)
+                // Before anything has been read and after, since the two draw different
+                // things into the same room.
+                for mut app in [app(), read_app()] {
+                    app.mode = mode.clone();
+                    app.colour = true;
+                    let frame = frame(&app, rows, cols);
+                    let drawn = rows_of(&frame);
+                    assert_eq!(
+                        drawn.len(),
+                        rows as usize,
+                        "{rows}x{cols} {mode:?} drew {} rows",
+                        drawn.len()
                     );
+                    for line in &drawn {
+                        assert!(
+                            columns(line) <= cols as usize,
+                            "{rows}x{cols} {mode:?} drew {} columns: {line:?}",
+                            columns(line)
+                        );
+                    }
                 }
             }
         }
+    }
+
+    /// What the dashboard has read reaches the screen: the list marks the selected row, the
+    /// state is a word, and the column beside it is about that row and not another.
+    #[test]
+    fn the_frame_says_what_was_read() {
+        let app = read_app();
+        let drawn = rows_of(&frame(&app, 24, 100)).join("\n");
+        assert!(drawn.contains("> scratch"), "{drawn}");
+        assert!(drawn.contains("virtkit-4171942f "), "the name was not cut");
+        assert!(drawn.contains("running"), "{drawn}");
+        assert!(drawn.contains("stopped"), "{drawn}");
+        assert!(drawn.contains("3 envs · 2 up"), "{drawn}");
+        assert!(drawn.contains("59.5 GiB on disk"), "{drawn}");
+        // The right-hand column is about the marked row and no other.
+        assert!(drawn.contains("pid 4242"), "{drawn}");
+        assert!(drawn.contains("192.168.127.2"), "{drawn}");
+
+        // And it follows the selection when that moves.
+        let mut moved = read_app();
+        moved.key(Press::Char('j'));
+        let drawn = rows_of(&frame(&moved, 24, 100)).join("\n");
+        assert!(drawn.contains("> virtkit-4171942f"), "{drawn}");
+        assert!(drawn.contains("pid 3928432"), "{drawn}");
     }
 
     /// The frame is written in one call with the cursor homed and every line erasing its
@@ -492,5 +580,31 @@ mod tests {
         painter.push("ab", Style::Plain);
         painter.push("日", Style::Plain);
         assert_eq!(painter.finish(), "ab");
+    }
+
+    /// A row is a stem and as much of a hash as tells two environments apart. Anything that
+    /// is not a hash is left alone: a name is not the dashboard's to rewrite.
+    #[test]
+    fn a_name_keeps_its_stem_and_enough_of_its_hash() {
+        assert_eq!(short_name("virtkit-4171942f2d70bae7"), "virtkit-4171942f");
+        assert_eq!(short_name("wab-qa-d3a92b42d7d0a15f"), "wab-qa-d3a92b42");
+        assert_ne!(
+            short_name("virtkit-4171942f2d70bae7"),
+            short_name("virtkit-9c02b11840e6c3da"),
+            "two environments over one checkout became one row"
+        );
+        assert_eq!(short_name("virtkit"), "virtkit");
+        assert_eq!(short_name("my-project-name"), "my-project-name");
+        assert_eq!(short_name("deadbeef"), "deadbeef");
+    }
+
+    /// A path under the reader's home is written the way they think of it.
+    #[test]
+    fn a_path_under_home_is_written_with_a_tilde() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return; // nothing to abbreviate against, and the environment is not ours to set
+        };
+        assert_eq!(tilde(&home.join("src/vk")), "~/src/vk");
+        assert_eq!(tilde(Path::new("/srv/build")), "/srv/build");
     }
 }

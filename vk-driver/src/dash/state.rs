@@ -3,9 +3,16 @@
 //! Keys update plain state values, which the renderer draws. This module performs no
 //! terminal, file or process I/O, so every key can be tested without a terminal.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
+use super::envs::Env;
+use super::poll::Event;
 use crate::term::Press;
+
+/// How far a page key moves the selection.
+const PAGE: isize = 10;
 
 /// Which of the lower pane's tabs is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,8 +42,31 @@ pub(crate) enum Mode {
     Help,
 }
 
+/// Something the loop is to do on the dashboard's behalf, because this module owns no
+/// thread and no channel to do it with itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Request {
+    /// re-read the environment list now
+    Refresh,
+    /// total what each of these state directories holds on disk
+    Sizes(Vec<PathBuf>),
+}
+
 /// The dashboard.
 pub(crate) struct App {
+    /// Every environment on the host, running first. Empty until the first read lands,
+    /// which is why the list has something to say about waiting.
+    pub(crate) envs: Vec<Env>,
+    /// Which row is selected, as an index into `envs`; kept in range by every path that
+    /// changes either.
+    pub(crate) selected: usize,
+    /// On-disk sizes, by state directory. Empty until the reader asks for them, because the
+    /// walk behind them is slow enough to be a key of its own.
+    pub(crate) sizes: HashMap<PathBuf, u64>,
+    pub(crate) sizes_pending: bool,
+    /// Whether anything has been read yet, so the list can say it is waiting rather than
+    /// claim this host has no environments.
+    pub(crate) read: bool,
     pub(crate) pane: Pane,
     pub(crate) focus: Focus,
     pub(crate) mode: Mode,
@@ -49,11 +79,17 @@ pub(crate) struct App {
     /// How often the environment list is re-read, for the help screen to state.
     pub(crate) interval: Duration,
     quit: bool,
+    request: Option<Request>,
 }
 
 impl App {
     pub(crate) fn new(interval: Duration, colour: bool) -> Self {
         Self {
+            envs: Vec::new(),
+            selected: 0,
+            sizes: HashMap::new(),
+            sizes_pending: false,
+            read: false,
             pane: Pane::Console,
             focus: Focus::List,
             mode: Mode::Normal,
@@ -61,12 +97,102 @@ impl App {
             colour,
             interval,
             quit: false,
+            request: None,
         }
     }
 
     /// Whether the reader has asked to leave.
     pub(crate) fn quit(&self) -> bool {
         self.quit
+    }
+
+    /// What the loop is to do next on the dashboard's behalf, if anything.
+    pub(crate) fn take_request(&mut self) -> Option<Request> {
+        self.request.take()
+    }
+
+    /// The environment the right-hand column is about.
+    pub(crate) fn selected_env(&self) -> Option<&Env> {
+        self.envs.get(self.selected)
+    }
+
+    /// How many environments there are, how many are up, and what they are costing this
+    /// host between them — the figures under the list.
+    pub(crate) fn totals(&self) -> (usize, usize, Option<u64>) {
+        let running = self.envs.iter().filter(|env| env.is_running()).count();
+        let mut used = None;
+        for bytes in self.envs.iter().filter_map(|env| env.mem_used) {
+            used = Some(used.unwrap_or(0u64).saturating_add(bytes));
+        }
+        (self.envs.len(), running, used)
+    }
+
+    /// Fold in whatever a background thread noticed.
+    pub(crate) fn on_event(&mut self, event: Event) {
+        match event {
+            Event::Key(press) => self.key(press),
+            Event::Envs(envs) => self.on_envs(envs),
+            Event::Sizes(sizes) => {
+                self.sizes_pending = false;
+                self.sizes.extend(sizes);
+            }
+            Event::Failed(said) => {
+                self.read = true;
+                self.status = Some(said);
+            }
+        }
+    }
+
+    /// A completed read: keep the reader looking at the environment they had selected,
+    /// wherever it has moved to in the new list.
+    ///
+    /// By identity, not by position — a refresh reorders the list as environments start and
+    /// stop, and following the index would move the selection under the reader's hand. An
+    /// environment that has gone leaves the selection where it was rather than stranding it
+    /// past the end.
+    fn on_envs(&mut self, envs: Vec<Env>) {
+        self.read = true;
+        let was = self.selected_env().map(|env| env.dir.clone());
+        let moved_to = was
+            .as_ref()
+            .and_then(|dir| envs.iter().position(|env| &env.dir == dir));
+        self.envs = envs;
+        self.selected = moved_to.unwrap_or(self.selected).min(self.last_index());
+    }
+
+    fn last_index(&self) -> usize {
+        self.envs.len().saturating_sub(1)
+    }
+
+    /// Move the selection, staying inside the list however far the key asks for.
+    fn select(&mut self, delta: isize) {
+        if self.envs.is_empty() {
+            return;
+        }
+        self.selected = self
+            .selected
+            .saturating_add_signed(delta)
+            .min(self.last_index());
+    }
+
+    /// Up or down: the selection while the list has the keys, the pane below once it does.
+    fn step(&mut self, delta: isize) {
+        match self.focus {
+            Focus::List => self.select(delta),
+            // The pane below has nothing to scroll yet; the console gives it something.
+            Focus::Lower => {}
+        }
+    }
+
+    /// Total what every environment holds on disk, unless a walk is already under way.
+    fn walk_sizes(&mut self) {
+        if self.sizes_pending || self.envs.is_empty() {
+            return;
+        }
+        self.sizes_pending = true;
+        self.request = Some(Request::Sizes(
+            self.envs.iter().map(|env| env.dir.clone()).collect(),
+        ));
     }
 
     /// Act on a key.
@@ -95,6 +221,15 @@ impl App {
             }
             Press::Char('1') => self.pane = Pane::Console,
             Press::Char('2') => self.pane = Pane::Usage,
+            Press::Char('r') => self.request = Some(Request::Refresh),
+            Press::Char('s') => self.walk_sizes(),
+
+            Press::Char('j') | Press::Down => self.step(1),
+            Press::Char('k') | Press::Up => self.step(-1),
+            Press::PageDown => self.step(PAGE),
+            Press::PageUp => self.step(-PAGE),
+            Press::Home => self.step(isize::MIN),
+            Press::End => self.step(isize::MAX),
             _ => {}
         }
     }
@@ -142,6 +277,146 @@ mod tests {
             app.key(press);
             assert!(!app.quit(), "{press:?} left the dashboard");
         }
+        assert_eq!(app.selected, 0);
+        assert!(app.selected_env().is_none());
+        assert_eq!(app.totals(), (0, 0, None));
+        // There is nothing to walk, so `s` asked for no walk rather than an empty one.
+        assert!(!app.sizes_pending);
+    }
+
+    /// A list of environments, as a completed read hands one over.
+    fn envs(count: usize) -> Vec<Env> {
+        let rows = (0..count)
+            .map(|i| {
+                super::super::envs::fixture::row(
+                    &format!("env-{i}"),
+                    &format!("/state/env-{i}"),
+                    crate::dev::list::Status::Stopped,
+                )
+            })
+            .collect();
+        super::super::envs::join(rows, Vec::new())
+    }
+
+    /// The selection moves with the keys and stays inside the list however far they ask for:
+    /// a page key on a list of three is the last row, not an index past the end.
+    #[test]
+    fn the_selection_moves_and_stays_in_range() {
+        let mut app = app();
+        app.on_event(Event::Envs(envs(4)));
+        assert_eq!(app.selected, 0);
+        app.key(Press::Char('j'));
+        app.key(Press::Down);
+        assert_eq!(app.selected, 2);
+        app.key(Press::Char('k'));
+        assert_eq!(app.selected, 1);
+        app.key(Press::PageDown);
+        assert_eq!(app.selected, 3, "a page ran off the end of the list");
+        app.key(Press::End);
+        assert_eq!(app.selected, 3);
+        app.key(Press::PageUp);
+        assert_eq!(app.selected, 0);
+        app.key(Press::Home);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.selected_env().map(|env| env.name()), Some("env-0"));
+    }
+
+    /// While the pane below has the keys, the movement keys belong to it, so the selection
+    /// stays where the reader left it.
+    #[test]
+    fn the_pane_below_takes_the_movement_keys_with_the_focus() {
+        let mut app = app();
+        app.on_event(Event::Envs(envs(4)));
+        app.key(Press::Char('j'));
+        app.key(Press::Tab);
+        app.key(Press::Char('j'));
+        app.key(Press::PageDown);
+        assert_eq!(app.selected, 1);
+        app.key(Press::Tab);
+        app.key(Press::Char('j'));
+        assert_eq!(app.selected, 2);
+    }
+
+    /// A read lands every few seconds and reorders the list as environments start and stop.
+    /// The reader stays looking at the environment they selected, wherever it moved to.
+    #[test]
+    fn a_read_keeps_the_selected_environment_selected() {
+        let mut app = app();
+        app.on_event(Event::Envs(envs(4)));
+        app.key(Press::Char('j'));
+        app.key(Press::Char('j'));
+        let selected = app.selected_env().map(|env| env.dir.clone());
+        assert_eq!(
+            selected.as_deref(),
+            Some(std::path::Path::new("/state/env-2"))
+        );
+
+        // The same environments, in the other order.
+        let mut shuffled = envs(4);
+        shuffled.reverse();
+        app.on_event(Event::Envs(shuffled));
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.selected_env().map(|env| env.dir.clone()), selected);
+    }
+
+    /// An environment that has gone must not strand the selection past the end of the list,
+    /// which would leave the whole right-hand column with nothing to be about.
+    #[test]
+    fn an_environment_that_disappears_does_not_strand_the_selection() {
+        let mut app = app();
+        app.on_event(Event::Envs(envs(4)));
+        app.key(Press::End);
+        assert_eq!(app.selected, 3);
+
+        app.on_event(Event::Envs(envs(2)));
+        assert_eq!(app.selected, 1);
+        assert!(app.selected_env().is_some());
+
+        app.on_event(Event::Envs(Vec::new()));
+        assert_eq!(app.selected, 0);
+        assert!(app.selected_env().is_none());
+        assert!(app.read, "an empty host still counts as having been read");
+    }
+
+    /// The size walk is slow enough to be a key of its own, and asking twice must not start
+    /// two of them. Its answer is what says it is over.
+    #[test]
+    fn the_size_walk_is_asked_for_once_at_a_time() {
+        let mut app = app();
+        app.on_event(Event::Envs(envs(2)));
+        app.key(Press::Char('s'));
+        assert!(app.sizes_pending);
+        match app.take_request() {
+            Some(Request::Sizes(dirs)) => assert_eq!(dirs.len(), 2),
+            other => panic!("`s` asked for {other:?}"),
+        }
+        app.key(Press::Char('s'));
+        assert_eq!(app.take_request(), None, "a second walk was started");
+
+        app.on_event(Event::Sizes(vec![(PathBuf::from("/state/env-0"), 4096)]));
+        assert!(!app.sizes_pending);
+        assert_eq!(
+            app.sizes.get(std::path::Path::new("/state/env-0")),
+            Some(&4096)
+        );
+    }
+
+    /// `r` asks for a read now, rather than waiting out the interval.
+    #[test]
+    fn r_asks_for_a_read_now() {
+        let mut app = app();
+        app.key(Press::Char('r'));
+        assert_eq!(app.take_request(), Some(Request::Refresh));
+        assert_eq!(app.take_request(), None, "and only once");
+    }
+
+    /// A read that failed is a line in the key bar, not the end of the session.
+    #[test]
+    fn a_read_that_fails_is_reported_rather_than_fatal() {
+        let mut app = app();
+        app.on_event(Event::Failed("the state base is unreadable".to_string()));
+        assert!(!app.quit());
+        assert_eq!(app.status.as_deref(), Some("the state base is unreadable"));
     }
 
     /// `?` opens the help and the next key — any key — closes it, without also doing what

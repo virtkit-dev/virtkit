@@ -29,18 +29,20 @@
     clippy::indexing_slicing
 )]
 
+mod envs;
 mod pane;
+mod poll;
 mod render;
 mod state;
 
 use std::io::Write;
-use std::sync::mpsc::RecvTimeoutError;
+use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
 use crate::term::{self, AltScreen};
-use state::App;
+use state::{App, Request};
 
 /// How long the loop waits for a key before drawing anyway. A window resized while nothing
 /// is typed is redrawn at its new size within this, which is what stands in for a SIGWINCH
@@ -79,28 +81,38 @@ pub(crate) fn run(args: Args) -> Result<()> {
     if let Some(saved) = saved {
         term::catch_terminating_signals(saved);
     }
-    let keys = term::key_thread();
+    // One channel carries the keys and everything the background threads notice, so the
+    // loop has one thing to wait on.
+    let (tx, rx) = channel();
+    let stop = poll::Stop::new();
+    poll::spawn_keys(tx.clone(), &stop);
+    poll::spawn_refresher(tx.clone(), args.interval, stop.clone());
 
     let mut app = App::new(args.interval, args.colour);
-    loop {
+    while !app.quit() {
         paint(&app)?;
-        match keys.recv_timeout(IDLE) {
-            Ok(press) => {
-                app.key(press);
+        match rx.recv_timeout(IDLE) {
+            Ok(event) => {
+                app.on_event(event);
                 // Everything else already queued is folded in before the next frame: a
                 // reader holding a key down should cost one redraw, not one per repeat.
-                for queued in keys.try_iter() {
-                    app.key(queued);
+                for queued in rx.try_iter() {
+                    app.on_event(queued);
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
-            // The reader is gone (stdin closed): there is nobody left to drive this.
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            // Every sender is gone, which can only mean the threads have stopped. There is
+            // nothing left to draw from.
+            Err(RecvTimeoutError::Disconnected) => break,
         }
-        if app.quit() {
-            return Ok(());
+        match app.take_request() {
+            Some(Request::Refresh) => poll::refresh_once(tx.clone()),
+            Some(Request::Sizes(dirs)) => poll::spawn_size_walk(dirs, tx.clone()),
+            None => {}
         }
     }
+    stop.raise();
+    Ok(())
 }
 
 /// Draw one frame: the whole screen, built in one buffer and written in one call, at the
