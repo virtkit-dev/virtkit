@@ -69,6 +69,14 @@ pub(crate) struct Span {
     style: Style,
 }
 
+impl Span {
+    /// What this run says, for a test that asserts on a line before it is painted.
+    #[cfg(test)]
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+}
+
 /// A run of text, for a pane to build a line out of.
 pub(crate) fn span(text: impl Into<String>, style: Style) -> Span {
     Span {
@@ -263,7 +271,7 @@ fn right_column(app: &App, width: usize, rows: usize) -> Vec<Line> {
     let room = rows.saturating_sub(lines.len());
     lines.extend(match app.pane {
         Pane::Console => pane::console::lines(app, width, room),
-        Pane::Usage => Vec::new(),
+        Pane::Usage => pane::usage::lines(app, width, room),
     });
     lines
 }
@@ -440,6 +448,19 @@ mod tests {
                 "Started OpenBSD Secure Shell server.",
             ],
         )));
+        // Two readings of the selected environment's process tree, five seconds apart: one
+        // alone says what it has used since it booted, never what it is doing now.
+        let now = std::time::Instant::now();
+        let earlier = now.checked_sub(Duration::from_secs(5)).unwrap_or(now);
+        for (cpu, at) in [(40u64, earlier), (44, now)] {
+            app.on_event(Event::Sample(crate::dash::poll::Sample {
+                epoch: app.console_epoch(),
+                cpu: Duration::from_secs(cpu),
+                peak_rss: 2_202_009_600,
+                disk: Some((1_717_986_918, 883_195_904)),
+                at,
+            }));
+        }
         app
     }
 
@@ -495,24 +516,28 @@ mod tests {
         for (rows, cols) in SIZES {
             for mode in [Mode::Normal, Mode::Help] {
                 // Before anything has been read and after, since the two draw different
-                // things into the same room.
+                // things into the same room — and under each of the panes the room is
+                // shared with.
                 for mut app in [app(), read_app()] {
-                    app.mode = mode.clone();
-                    app.colour = true;
-                    let frame = frame(&app, rows, cols);
-                    let drawn = rows_of(&frame);
-                    assert_eq!(
-                        drawn.len(),
-                        rows as usize,
-                        "{rows}x{cols} {mode:?} drew {} rows",
-                        drawn.len()
-                    );
-                    for line in &drawn {
-                        assert!(
-                            columns(line) <= cols as usize,
-                            "{rows}x{cols} {mode:?} drew {} columns: {line:?}",
-                            columns(line)
+                    for pane in [Pane::Console, Pane::Usage] {
+                        app.pane = pane;
+                        app.mode = mode.clone();
+                        app.colour = true;
+                        let frame = frame(&app, rows, cols);
+                        let drawn = rows_of(&frame);
+                        assert_eq!(
+                            drawn.len(),
+                            rows as usize,
+                            "{rows}x{cols} {mode:?} {pane:?} drew {} rows",
+                            drawn.len()
                         );
+                        for line in &drawn {
+                            assert!(
+                                columns(line) <= cols as usize,
+                                "{rows}x{cols} {mode:?} {pane:?} drew {} columns: {line:?}",
+                                columns(line)
+                            );
+                        }
                     }
                 }
             }
@@ -571,6 +596,39 @@ mod tests {
         assert!(drawn.contains("KAG source"), "the keys to undo it are gone");
     }
 
+    /// The usage pane says whose figures these are. A reader who takes the host's cost for
+    /// the guest's own view of itself reads every number on it backwards.
+    #[test]
+    fn the_usage_pane_says_it_is_the_host_that_is_paying() {
+        let mut app = read_app();
+        app.pane = Pane::Usage;
+        let drawn = rows_of(&frame(&app, 24, 100)).join("\n");
+        assert!(drawn.contains("host cost"), "{drawn}");
+        assert!(drawn.contains("not what the guest sees"), "{drawn}");
+        // Four seconds of processor over five of wall clock, across twenty-two vCPUs.
+        assert!(drawn.contains("4% of 22 cpus"), "{drawn}");
+        assert!(drawn.contains("44.0s used since it booted"), "{drawn}");
+        assert!(drawn.contains("2.1 GiB at its highest"), "{drawn}");
+        assert!(drawn.contains("1.6 GiB read · 842 MiB written"), "{drawn}");
+        assert!(
+            drawn.contains("vk atop"),
+            "the guest's own panel is not named"
+        );
+
+        // Another environment is another process tree, and two readings of two of them make
+        // no rate between them: the pane waits for its own rather than showing the last
+        // one's figures under this one's name.
+        app.key(Press::Char('j'));
+        let drawn = rows_of(&frame(&app, 24, 100)).join("\n");
+        assert!(drawn.contains("reading the process tree"), "{drawn}");
+
+        // And one that is not running costs nothing, which is a fact rather than a set of
+        // empty meters.
+        app.key(Press::Char('j'));
+        let drawn = rows_of(&frame(&app, 24, 100)).join("\n");
+        assert!(drawn.contains("costing this host nothing"), "{drawn}");
+    }
+
     /// The frame is written in one call with the cursor homed and every line erasing its
     /// own tail — and nothing after the bottom row, which would scroll the screen.
     #[test]
@@ -601,6 +659,20 @@ mod tests {
                 assert!(
                     matches!(kind.as_str(), "[H" | "[K" | "[J"),
                     "an escape sequence was drawn without colour: {sequence:?}"
+                );
+            }
+        }
+        // Including the panes that draw bars and console lines, which is where the escape
+        // sequences would come from if any pane wrote its own.
+        for pane in [Pane::Console, Pane::Usage] {
+            let mut app = read_app();
+            app.pane = pane;
+            let frame = frame(&app, 24, 100);
+            for sequence in frame.split('\x1b').skip(1) {
+                let kind = sequence.chars().take(2).collect::<String>();
+                assert!(
+                    matches!(kind.as_str(), "[H" | "[K" | "[J"),
+                    "{pane:?} drew an escape sequence without colour: {sequence:?}"
                 );
             }
         }

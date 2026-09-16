@@ -90,6 +90,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
     poll::spawn_keys(tx.clone(), &stop);
     poll::spawn_refresher(tx.clone(), args.interval, stop.clone());
     poll::spawn_console(tx.clone(), stop.clone(), follow.clone());
+    poll::spawn_sampler(tx.clone(), stop.clone(), follow.clone(), args.interval);
 
     let mut app = App::new(args.interval, args.colour);
     while !app.quit() {

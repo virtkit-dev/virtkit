@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::console;
 use super::envs::Env;
-use super::poll::{Event, Selected};
+use super::poll::{Event, Sample, Selected};
 use crate::consolelog::Source;
 use crate::term::Press;
 
@@ -92,11 +92,25 @@ pub(crate) struct App {
     pub(crate) scrollback: usize,
     /// Whether the selected environment has no console file at all — it has never booted.
     pub(crate) console_missing: bool,
-    /// Which selection the following threads are working for. Bumped whenever it moves, so
-    /// a pass that began under the last one is recognised and dropped.
+    /// The newest reading of what the selected environment costs this host, and the one
+    /// before it. Two are kept because the interesting figure is a rate and `/proc` counts
+    /// totals: one reading alone says what a VM has used since it booted, never what it is
+    /// doing now.
+    pub(crate) sample: Option<Sample>,
+    pub(crate) previous: Option<Sample>,
+    /// Which environment the console thread is working for. Bumped whenever the selection
+    /// moves, so a pass that began under the last one is recognised and dropped.
     epoch: u64,
+    /// The same for the sampler, which follows a process tree and not a directory: an
+    /// environment restarted under the reader keeps the console of the boot that ended and
+    /// is a new tree all the same, and a reading of the old one makes no rate with it. Two
+    /// counters rather than one, because one would have to clear the console to say it.
+    sample_epoch: u64,
     /// the environment those threads were last pointed at
     followed: Option<PathBuf>,
+    /// the process tree they were last pointed at, which changes without the environment
+    /// doing so every time one starts or stops
+    sampled: Option<i32>,
     quit: bool,
     requests: VecDeque<Request>,
 }
@@ -119,8 +133,12 @@ impl App {
             filter: console::Filter::default(),
             scrollback: 0,
             console_missing: false,
+            sample: None,
+            previous: None,
             epoch: 0,
+            sample_epoch: 0,
             followed: None,
+            sampled: None,
             quit: false,
             requests: VecDeque::new(),
         }
@@ -171,6 +189,14 @@ impl App {
                 self.sizes.extend(sizes);
             }
             Event::Log(batch) => self.on_log(batch),
+            Event::Sample(sample) => {
+                // A reading taken for the environment the reader has left — or for the
+                // process tree a restart replaced — says nothing about the one in front of
+                // them.
+                if sample.epoch == self.sample_epoch {
+                    self.previous = self.sample.replace(sample);
+                }
+            }
             Event::Failed(said) => {
                 self.read = true;
                 self.status = Some(said);
@@ -238,18 +264,37 @@ impl App {
     /// The buffer belongs to one environment, so moving the selection empties it: lines from
     /// the one being left would otherwise sit above the one being arrived at, under its name.
     fn retarget(&mut self) {
-        let dir = self.selected_env().map(|env| env.dir.clone());
-        if dir == self.followed {
+        let selected = self.selected_env();
+        let dir = selected.map(|env| env.dir.clone());
+        let pid = selected
+            .and_then(|env| env.vm.as_ref())
+            .and_then(|vm| i32::try_from(vm.pid).ok());
+        if dir == self.followed && pid == self.sampled {
             return;
         }
+        if dir != self.followed {
+            // A VM that has stopped keeps the console of the boot that just ended, which is
+            // the one a reader wanting to know why it stopped is about to read. Only moving
+            // to another environment takes it away.
+            self.epoch = self.epoch.wrapping_add(1);
+            self.console.clear();
+            self.scrollback = 0;
+            self.console_missing = false;
+        }
+        if pid != self.sampled {
+            // Two readings of two different process trees make no rate between them — and a
+            // reading already under way is of the tree being left, so it is bumped past too.
+            self.sample_epoch = self.sample_epoch.wrapping_add(1);
+            self.sample = None;
+            self.previous = None;
+        }
         self.followed = dir.clone();
-        self.epoch = self.epoch.wrapping_add(1);
-        self.console.clear();
-        self.scrollback = 0;
-        self.console_missing = false;
+        self.sampled = pid;
         self.ask(Request::Follow(Selected {
             epoch: self.epoch,
+            sample_epoch: self.sample_epoch,
             dir,
+            pid,
         }));
     }
 
@@ -445,6 +490,28 @@ mod tests {
             })
             .collect();
         super::super::envs::join(rows, Vec::new())
+    }
+
+    /// The same list, with a VM behind every one of them.
+    fn running(count: usize) -> Vec<Env> {
+        let rows = (0..count)
+            .map(|i| {
+                super::super::envs::fixture::row(
+                    &format!("env-{i}"),
+                    &format!("/state/env-{i}"),
+                    crate::dev::list::Status::Running,
+                )
+            })
+            .collect();
+        let vms = (0..count)
+            .map(|i| {
+                super::super::envs::fixture::vm(
+                    &format!("/state/env-{i}"),
+                    4000u32.saturating_add(i as u32),
+                )
+            })
+            .collect();
+        super::super::envs::join(rows, vms)
     }
 
     /// The selection moves with the keys and stays inside the list however far they ask for:
@@ -768,6 +835,78 @@ mod tests {
         }));
         assert_eq!(app.console.len(), 1);
         assert!(app.following());
+    }
+
+    /// Two readings make a rate; two readings of two different process trees make nothing.
+    /// A reading for the environment the reader has left is dropped, and moving between them
+    /// starts the pair again rather than deriving a figure across the gap.
+    #[test]
+    fn a_reading_belongs_to_the_process_tree_it_was_taken_from() {
+        let mut app = app();
+        app.on_event(Event::Envs(running(2)));
+        let at = std::time::Instant::now();
+        for cpu in [10u64, 12] {
+            app.on_event(Event::Sample(Sample {
+                epoch: app.sample_epoch,
+                cpu: Duration::from_secs(cpu),
+                peak_rss: 1024,
+                disk: None,
+                at,
+            }));
+        }
+        assert!(app.sample.is_some() && app.previous.is_some());
+
+        // Taken for the one before it, and arriving after the reader moved on.
+        app.on_event(Event::Sample(Sample {
+            epoch: app.sample_epoch.wrapping_sub(1),
+            cpu: Duration::from_secs(900),
+            peak_rss: 1024,
+            disk: None,
+            at,
+        }));
+        assert_eq!(app.sample.map(|s| s.cpu), Some(Duration::from_secs(12)));
+
+        // Moving to another environment is another tree, so the pair starts again.
+        app.key(Press::Char('j'));
+        assert!(app.sample.is_none() && app.previous.is_none());
+        match drain(&mut app).as_slice() {
+            [Request::Follow(followed)] => assert_eq!(followed.pid, Some(4001)),
+            other => panic!("moving the selection asked for {other:?}"),
+        }
+    }
+
+    /// An environment restarted where it stood is one directory and two process trees: the
+    /// console of the boot that ended is what a reader wants to see, and a reading of the
+    /// tree that ended is not something to show against the new one.
+    #[test]
+    fn a_restart_in_place_drops_the_readings_of_the_tree_that_ended() {
+        let mut app = app();
+        app.on_event(Event::Envs(running(1)));
+        drain(&mut app);
+        log(&mut app, "the boot that just ended");
+        let ended = app.sample_epoch;
+
+        // The same environment, under the pid of a `vk dev up` that has just replaced it.
+        let rows = vec![super::super::envs::fixture::row(
+            "env-0",
+            "/state/env-0",
+            crate::dev::list::Status::Running,
+        )];
+        let vms = vec![super::super::envs::fixture::vm("/state/env-0", 5000)];
+        app.on_event(Event::Envs(super::super::envs::join(rows, vms)));
+        assert_eq!(app.console.len(), 1, "the restart took the console with it");
+
+        app.on_event(Event::Sample(Sample {
+            epoch: ended,
+            cpu: Duration::from_secs(900),
+            peak_rss: 1024,
+            disk: None,
+            at: std::time::Instant::now(),
+        }));
+        assert!(
+            app.sample.is_none(),
+            "a reading of the tree that ended stood"
+        );
     }
 
     /// A complaint holds the key bar only until the reader has had a chance to read it: the
