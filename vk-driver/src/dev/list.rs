@@ -436,15 +436,14 @@ fn running_dirs() -> Vec<PathBuf> {
 /// VM, which is cheap beside the stat walk of every file that `sizes` does by default — and
 /// unlike that one it has no opt-out, since a row with no memory figure would not say
 /// whether the VM holds nothing or was never asked.
-fn running_vms() -> Vec<Running> {
-    crate::vms::running()
-        .into_iter()
+pub fn running_vms(vms: &[crate::vms::VmEntry]) -> Vec<Running> {
+    vms.iter()
         .map(|e| Running {
             mem_used: i32::try_from(e.pid)
                 .ok()
                 .and_then(crate::usage::tree_resident),
-            mem: e.mem,
-            state_dir: e.state_dir,
+            mem: e.mem.clone(),
+            state_dir: e.state_dir.clone(),
         })
         .collect()
 }
@@ -453,11 +452,13 @@ fn running_vms() -> Vec<Running> {
 /// the state base scanned against what is running. Measuring what each holds on disk is a stat
 /// walk of every file in it, done by default; `--no-sizes` (`sizes = false`) opts out.
 pub fn state(sizes: bool) -> Result<Vec<Row>> {
-    Ok(scan(
-        &crate::dev::plan::dev_state_base()?,
-        &running_vms(),
-        sizes,
-    ))
+    state_with(&running_vms(&crate::vms::running()), sizes)
+}
+
+/// Reuse a caller's VM registry snapshot. Reading the registry walks and prunes its entries,
+/// so `vk dash` reads it once for both sides of the join.
+pub fn state_with(running: &[Running], sizes: bool) -> Result<Vec<Row>> {
+    Ok(scan(&crate::dev::plan::dev_state_base()?, running, sizes))
 }
 
 /// The rows as `--json` prints them.

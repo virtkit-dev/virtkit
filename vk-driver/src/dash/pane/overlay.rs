@@ -12,11 +12,16 @@ use crate::vms::fmt_uptime;
 /// Every key the dashboard has, because a keymap is otherwise something a reader keeps in
 /// their head or looks for in a README they do not have open.
 const KEYS: &[(&str, &str)] = &[
+    ("j k ↑ ↓", "move the selection"),
+    ("pgup pgdn", "move it a page at a time"),
+    ("home end", "the first environment, or the last"),
     ("tab", "move between the list and the pane below it"),
     (
         "1  2",
         "the console, or what the environment costs this host",
     ),
+    ("r", "re-read the environments now"),
+    ("s", "total what each of them holds on disk (slow)"),
     ("?", "this"),
     ("q  esc  ctrl-c", "quit"),
 ];
