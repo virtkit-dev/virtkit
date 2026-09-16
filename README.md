@@ -651,7 +651,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
 | `vk logs` | Show a VM's console log, telling kernel, agent and guest output apart; `--level warn`, `--agent`, `--service NAME`, `-f`. |
 | `vk atop` | Follow or inspect guest resource recordings. |
-| `vk dash` | A full-screen dashboard over this host's dev environments: what is up, and what is behind each one. |
+| `vk dash` | A full-screen dashboard of this host's dev environments, their state, VMs, consoles, host resource usage and available actions. |
 | `vk check` | Validate KVM, VMM, embedded assets, configured host features, and an optional minimum `vk` version. |
 | `vk gc` | Reclaim unused image bases, CI checkouts, and image-cache chunks. |
 | `vk update` | Check for or install a digest-verified GitHub release. |
