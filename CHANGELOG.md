@@ -29,6 +29,12 @@ All notable changes to virtkit will be documented in this file.
   it, instead of asking for a name. It still previews what goes and asks first; `--yes` skips
   the prompt. Named and `--all-stale` runs are unchanged and still need no config.
 
+### Fixed
+
+- **A full-screen panel now gives the terminal back however it is ended.** Two signals
+  arriving together while `vk atop --view` or `vk dash` held the screen could leave the
+  process stuck with the terminal in raw mode and no cursor.
+
 ## [0.77.0] - 2026-09-23
 
 ### Added
