@@ -14,8 +14,14 @@ All notable changes to virtkit will be documented in this file.
   through a whole boot and narrowable by writer and by severity without losing any of it.
   A second pane meters what a running environment is taking from the host itself —
   processor against the vCPUs it was given, memory against the size it booted with, and the
-  disk traffic behind it. `s` totals what each one occupies on disk. `?` lists the keys. It
-  reads without colour as well as with it, and leaves the terminal exactly as it found it.
+  disk traffic behind it. `s` totals what each one occupies on disk. `x` offers what can be
+  done to the selected environment — stop it, start it, refresh it, open a shell or the
+  editor on it, or remove what a finished one left behind — each of which runs the command
+  it names against that environment's own checkout, with the reason spelled out for
+  whatever cannot be done to it just now and, for the one thing that cannot be undone, the
+  command and everything it would delete shown before it asks. `a` hands the terminal to
+  the guest's own view of itself. `?` lists the keys. It reads without colour as well as
+  with it, and leaves the terminal exactly as it found it.
 
 ## [0.72.0] - 2026-09-15
 

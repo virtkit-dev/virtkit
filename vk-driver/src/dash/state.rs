@@ -7,10 +7,12 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use super::actions::{Action, Job, Refusal, Weight};
 use super::console;
 use super::envs::Env;
 use super::poll::{Event, Sample, Selected};
 use crate::consolelog::Source;
+use crate::dev::list::Row;
 use crate::term::Press;
 
 /// How far a page key moves the selection, and the console window.
@@ -42,11 +44,26 @@ pub(crate) enum Mode {
     Normal,
     /// every key the dashboard has, on one screen
     Help,
+    /// what can be done to the selected environment
+    Menu,
+    /// one action that cannot be undone, waiting to be told to go ahead
+    Confirm(Confirm),
+}
+
+/// A destructive action, and what it would take with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Confirm {
+    pub(crate) job: Job,
+    /// What `vk dev gc` would remove, as `vk dev gc` itself lists it — read off the disk on
+    /// a thread, so this is `None` for as long as that takes. A question with nothing under
+    /// it yet says it is still reading rather than showing an empty list, which would read
+    /// as "there is nothing in there".
+    pub(crate) removes: Option<String>,
 }
 
 /// Something the loop is to do on the dashboard's behalf, because this module owns no
 /// thread and no channel to do it with itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Request {
     /// re-read the environment list now
     Refresh,
@@ -54,6 +71,12 @@ pub(crate) enum Request {
     Sizes(Vec<PathBuf>),
     /// point the threads that follow the selection at this environment
     Follow(Selected),
+    /// read what removing these environments would take with it
+    Preview { name: String, rows: Vec<Row> },
+    /// run this action out of sight, and re-read the environments when it lands
+    Run(Job),
+    /// give this action the terminal until it is done with it
+    Handover(Job),
 }
 
 /// The dashboard.
@@ -163,6 +186,13 @@ impl App {
         self.requests.push_back(request);
     }
 
+    /// Ask the loop for something that stands even if another of its kind is already
+    /// queued. An action is not a request for the newest state of something: two of them
+    /// are two things the reader asked for, and folding them together would drop one.
+    fn demand(&mut self, request: Request) {
+        self.requests.push_back(request);
+    }
+
     /// The environment the right-hand column is about.
     pub(crate) fn selected_env(&self) -> Option<&Env> {
         self.envs.get(self.selected)
@@ -197,6 +227,16 @@ impl App {
                     self.previous = self.sample.replace(sample);
                 }
             }
+            Event::Preview { name, text } => {
+                // A listing read for an environment the reader has since backed out of, or
+                // moved on from, describes something they are no longer being asked about.
+                if let Mode::Confirm(confirm) = &mut self.mode
+                    && confirm.job.name == name
+                {
+                    confirm.removes = Some(text);
+                }
+            }
+            Event::Said(said) => self.status = Some(said),
             Event::Failed(said) => {
                 self.read = true;
                 self.status = Some(said);
@@ -359,6 +399,97 @@ impl App {
         self.clamp_scrollback();
     }
 
+    /// Whether an action can be offered for what is selected, for the menu to draw it as
+    /// available or to say in words why it is not.
+    pub(crate) fn availability(&self, action: Action) -> Result<(), Refusal> {
+        match self.selected_env() {
+            Some(env) => action.job(env).map(|_| ()),
+            None => Err(Refusal::NotAnEnvironment),
+        }
+    }
+
+    /// A key pressed while the menu is up.
+    fn menu_key(&mut self, press: Press) {
+        match press {
+            // `x` closes what `x` opened, and `q` means "put this away" rather than "leave
+            // the dashboard" for as long as an overlay is what is on screen.
+            Press::Escape | Press::Char('x') | Press::Char('q') => self.mode = Mode::Normal,
+            Press::Char(key) => {
+                if let Some(action) = Action::ALL.iter().copied().find(|a| a.key() == key) {
+                    self.act(action);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A key pressed while a destructive action is waiting to be confirmed.
+    ///
+    /// Only `y`. Not Enter, which a reader presses on the way to something else, and not
+    /// any key, which is how the help closes — a keystroke that removes an environment
+    /// should be one that could only have been meant.
+    fn confirm_key(&mut self, confirm: Confirm, press: Press) {
+        self.mode = Mode::Normal;
+        match press == Press::Char('y') {
+            true => self.start(confirm.job),
+            false => {
+                self.status = Some(format!("{}: cancelled", confirm.job.action.label()));
+            }
+        }
+    }
+
+    /// Do something to the selected environment, or say why it cannot be done.
+    fn act(&mut self, action: Action) {
+        let Some(env) = self.selected_env() else {
+            self.mode = Mode::Normal;
+            return;
+        };
+        match action.job(env) {
+            // A refusal is not a reason to close the menu: the reader pressed a key that is
+            // greyed out, and what they wanted was the reason, not an empty screen.
+            Err(refusal) => {
+                self.status = Some(format!("{}: {}", action.label(), refusal.why()));
+            }
+            Ok(job) => match action.weight() {
+                Weight::Destructive => self.ask_first(job),
+                _ => self.start(job),
+            },
+        }
+    }
+
+    /// Ask before doing something that cannot be undone, with `vk dev gc`'s own reading of
+    /// what is inside the directory under the question.
+    ///
+    /// The selection is made here rather than by the command, because it is the selection
+    /// that can refuse: `gc` will not remove a running environment, and finding that out
+    /// after agreeing to it is finding it out too late.
+    fn ask_first(&mut self, job: Job) {
+        let rows: Vec<Row> = self.envs.iter().filter_map(|env| env.row.clone()).collect();
+        match crate::dev::list::select_gc(rows, std::slice::from_ref(&job.name), false) {
+            Err(report) => {
+                self.mode = Mode::Normal;
+                self.status = Some(format!("{}: {report:#}", job.action.label()));
+            }
+            Ok(selected) => {
+                self.demand(Request::Preview {
+                    name: job.name.clone(),
+                    rows: selected,
+                });
+                self.mode = Mode::Confirm(Confirm { job, removes: None });
+            }
+        }
+    }
+
+    /// Set an action going: on a thread of its own, or with the terminal handed to it.
+    fn start(&mut self, job: Job) {
+        self.mode = Mode::Normal;
+        self.status = Some(format!("{}: {}…", job.action.label(), job.name));
+        match job.action.takes_the_terminal() {
+            true => self.demand(Request::Handover(job)),
+            false => self.demand(Request::Run(job)),
+        }
+    }
+
     /// Act on a key.
     pub(crate) fn key(&mut self, press: Press) {
         // Raw mode clears ISIG, so Ctrl-C arrives as a byte rather than as a signal. It is
@@ -373,10 +504,29 @@ impl App {
             self.mode = Mode::Normal;
             return;
         }
+        // A complaint is answered by the next key, whatever it was, so it never outlives the
+        // reader's attention to it.
         self.status = None;
+        // An overlay that can change something on this host has the keyboard to itself:
+        // letting `j` through would move the selection out from under the very thing the
+        // reader is being asked about.
+        match &self.mode {
+            Mode::Menu => return self.menu_key(press),
+            Mode::Confirm(confirm) => return self.confirm_key(confirm.clone(), press),
+            Mode::Normal | Mode::Help => {}
+        }
         match press {
             Press::Char('q') | Press::Escape => self.quit = true,
             Press::Char('?') => self.mode = Mode::Help,
+            Press::Char('x') => {
+                if self.selected_env().is_some() {
+                    self.mode = Mode::Menu;
+                }
+            }
+            // The guest's own panel has a key of its own as well as a place in the menu: it
+            // is the other half of the pane beside it, and a reader comparing the two should
+            // not have to go through a menu to do it.
+            Press::Char('a') => self.act(Action::Atop),
             Press::Tab | Press::BackTab => {
                 self.focus = match self.focus {
                     Focus::List => Focus::Lower,
@@ -906,6 +1056,172 @@ mod tests {
         assert!(
             app.sample.is_none(),
             "a reading of the tree that ended stood"
+        );
+    }
+
+    /// `x` opens the menu, and while it is up it has the keyboard: a key that would have
+    /// moved the list must not move it out from under the environment the menu is about.
+    #[test]
+    fn the_menu_holds_the_keyboard_while_it_is_up() {
+        let mut app = app();
+        app.on_event(Event::Envs(running(3)));
+        drain(&mut app);
+        app.key(Press::Char('x'));
+        assert_eq!(app.mode, Mode::Menu);
+
+        app.key(Press::Char('j'));
+        app.key(Press::Down);
+        app.key(Press::PageDown);
+        assert_eq!(app.selected, 0, "the list moved under an open menu");
+        assert_eq!(app.mode, Mode::Menu, "a movement key closed the menu");
+        assert!(drain(&mut app).is_empty(), "a movement key asked for work");
+
+        // `q` over the menu puts the menu away rather than leaving the dashboard, and so
+        // does the key that opened it.
+        app.key(Press::Char('q'));
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.quit(), "q over the menu quit the dashboard");
+        app.key(Press::Char('x'));
+        app.key(Press::Char('x'));
+        assert_eq!(app.mode, Mode::Normal);
+        app.key(Press::Char('x'));
+        app.key(Press::Escape);
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.quit(), "esc over the menu quit the dashboard");
+    }
+
+    /// An action that can be undone runs on the keystroke, and the one that hands the
+    /// terminal over is handed to the loop rather than started here.
+    #[test]
+    fn an_action_the_menu_offers_is_asked_for_on_the_keystroke() {
+        let mut app = app();
+        app.on_event(Event::Envs(running(2)));
+        drain(&mut app);
+
+        app.key(Press::Char('x'));
+        app.key(Press::Char('s'));
+        assert_eq!(app.mode, Mode::Normal, "the menu stayed up over an action");
+        match drain(&mut app).as_slice() {
+            [Request::Run(job)] => {
+                assert_eq!(job.action, Action::Stop);
+                assert_eq!(job.name, "env-0");
+            }
+            other => panic!("stopping asked for {other:?}"),
+        }
+        assert!(app.status.is_some(), "the dashboard said nothing about it");
+
+        // The guest's own panel wants the terminal, and answers to its key without the menu.
+        app.key(Press::Char('a'));
+        match drain(&mut app).as_slice() {
+            [Request::Handover(job)] => assert_eq!(job.action, Action::Atop),
+            other => panic!("the panel asked for {other:?}"),
+        }
+
+        // A refusal leaves the menu up, because the reason is what the reader wanted.
+        app.key(Press::Char('x'));
+        app.key(Press::Char('u'));
+        assert_eq!(app.mode, Mode::Menu, "a refusal closed the menu");
+        assert!(drain(&mut app).is_empty(), "a refused action was started");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("start: it is already running"),
+            "the refusal did not say why"
+        );
+    }
+
+    /// Removing an environment cannot be undone, so it asks — and only `y` answers. The
+    /// question carries the command and what `vk dev gc` says is inside the directory.
+    #[test]
+    fn removing_an_environment_asks_first_and_only_y_agrees() {
+        let mut app = app();
+        app.on_event(Event::Envs(envs(2)));
+        drain(&mut app);
+        app.key(Press::Char('x'));
+        app.key(Press::Char('d'));
+
+        let Mode::Confirm(confirm) = app.mode.clone() else {
+            panic!("removing asked nothing: {:?}", app.mode);
+        };
+        assert_eq!(confirm.job.name, "env-0");
+        assert_eq!(confirm.job.line(), "vk dev gc --yes env-0");
+        assert!(
+            confirm.removes.is_none(),
+            "the listing was read on this thread"
+        );
+        match drain(&mut app).as_slice() {
+            [Request::Preview { name, rows }] => {
+                assert_eq!(name, "env-0");
+                assert_eq!(rows.len(), 1);
+            }
+            other => panic!("the question asked for {other:?}"),
+        }
+
+        // The listing lands under the question, and a listing read for another environment
+        // does not.
+        app.on_event(Event::Preview {
+            name: "env-1".to_string(),
+            text: "would remove 1 environment(s):".to_string(),
+        });
+        app.on_event(Event::Preview {
+            name: "env-0".to_string(),
+            text: "would remove env-0".to_string(),
+        });
+        let Mode::Confirm(confirm) = &app.mode else {
+            panic!("the question went away");
+        };
+        assert_eq!(confirm.removes.as_deref(), Some("would remove env-0"));
+        app.key(Press::Escape); // put that one away before asking again
+
+        // Anything but `y` cancels, and cancelling starts nothing.
+        for press in [
+            Press::Enter,
+            Press::Char('n'),
+            Press::Escape,
+            Press::Char('d'),
+        ] {
+            app.key(Press::Char('x'));
+            app.key(Press::Char('d'));
+            assert!(matches!(app.mode, Mode::Confirm(_)), "{press:?}");
+            drain(&mut app);
+            app.key(press);
+            assert_eq!(app.mode, Mode::Normal, "{press:?}");
+            assert!(drain(&mut app).is_empty(), "{press:?} removed it anyway");
+            assert_eq!(app.status.as_deref(), Some("remove it: cancelled"));
+        }
+
+        // And `y` runs exactly what the question showed.
+        app.key(Press::Char('x'));
+        app.key(Press::Char('d'));
+        drain(&mut app);
+        app.key(Press::Char('y'));
+        assert_eq!(app.mode, Mode::Normal);
+        match drain(&mut app).as_slice() {
+            [Request::Run(job)] => assert_eq!(job.line(), "vk dev gc --yes env-0"),
+            other => panic!("agreeing asked for {other:?}"),
+        }
+    }
+
+    /// Ctrl-C is the key every terminal program answers to, and an overlay that has the
+    /// keyboard does not get to keep it from the reader.
+    #[test]
+    fn ctrl_c_quits_from_the_menu_and_from_the_question() {
+        let mut choosing = app();
+        choosing.on_event(Event::Envs(envs(1)));
+        choosing.key(Press::Char('x'));
+        choosing.key(Press::Interrupt);
+        assert!(choosing.quit(), "Ctrl-C was swallowed by the menu");
+
+        let mut asking = app();
+        asking.on_event(Event::Envs(envs(1)));
+        asking.key(Press::Char('x'));
+        asking.key(Press::Char('d'));
+        assert!(matches!(asking.mode, Mode::Confirm(_)));
+        drain(&mut asking); // the listing the question asked to be read
+        asking.key(Press::Interrupt);
+        assert!(asking.quit(), "Ctrl-C was swallowed by the question");
+        assert!(
+            drain(&mut asking).is_empty(),
+            "leaving removed the environment"
         );
     }
 

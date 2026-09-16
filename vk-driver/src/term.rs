@@ -17,6 +17,7 @@ use std::io::{IsTerminal, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -188,14 +189,15 @@ const STOP_TICK: Duration = Duration::from_millis(100);
 /// Presses from a thread of its own: reading a byte blocks, and a panel's own work must not
 /// wait for it, so a channel joins the two. The thread ends when stdin does.
 pub(crate) fn key_thread() -> Receiver<Press> {
-    key_thread_until(Arc::new(AtomicBool::new(false)))
+    key_thread_until(Arc::new(AtomicBool::new(false))).0
 }
 
-/// The same reader, ending as soon as `stop` is raised — for a caller that hands the terminal
-/// to a child, since two readers on one stdin lose keystrokes between them.
-pub(crate) fn key_thread_until(stop: Arc<AtomicBool>) -> Receiver<Press> {
+/// Stop the reader when `stop` is raised. Return its thread handle with the channel so a
+/// caller handing stdin to a child can wait for the read to end; concurrent readers would
+/// steal each other's keystrokes.
+pub(crate) fn key_thread_until(stop: Arc<AtomicBool>) -> (Receiver<Press>, JoinHandle<()>) {
     let (tx, rx) = channel();
-    std::thread::spawn(move || {
+    let reading = std::thread::spawn(move || {
         let mut keys = Keys::default();
         let mut byte = [0u8; 1];
         loop {
@@ -242,7 +244,7 @@ pub(crate) fn key_thread_until(stop: Arc<AtomicBool>) -> Receiver<Press> {
             }
         }
     });
-    rx
+    (rx, reading)
 }
 
 /// The alternate screen: a panel draws on a screen of its own, and the shell's scrollback

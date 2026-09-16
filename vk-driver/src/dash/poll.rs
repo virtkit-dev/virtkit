@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::console::{Batch, Tail};
@@ -44,6 +45,15 @@ pub(crate) enum Event {
     Log(Batch),
     /// What the selected environment's process tree is costing this host.
     Sample(Sample),
+    /// What removing an environment would take with it, for the question that asks.
+    Preview {
+        /// the environment it was read for, so an answer that arrives after the reader has
+        /// moved on is dropped rather than shown under another name
+        name: String,
+        text: String,
+    },
+    /// How an action went, in the words the key bar has room for.
+    Said(String),
     /// Something could not be read. A line in the key bar, not the end of the session.
     Failed(String),
 }
@@ -138,16 +148,46 @@ impl Stop {
     }
 }
 
+/// The terminal's reader as the loop holds it: the flag that stands it down, and the thread
+/// itself, because standing it down is not the same as it being finished — the read it is
+/// inside can still be holding a key.
+pub(crate) struct Reader {
+    stop: Stop,
+    thread: JoinHandle<()>,
+}
+
+impl Reader {
+    /// Stand the reader down and leave it to notice, for the way out: the process is going
+    /// and nothing is waiting on stdin after it.
+    pub(crate) fn raise(&self) {
+        self.stop.raise();
+    }
+
+    /// Stand it down and wait until it is out of stdin, for a caller that is about to give
+    /// stdin to a child: two readers on one terminal lose keystrokes between them.
+    pub(crate) fn stand_down(self) {
+        self.stop.raise();
+        // A reader that panicked has already been reported by the hook; what matters here
+        // is only that it is no longer reading.
+        let _ = self.thread.join();
+    }
+}
+
 /// Forward the terminal's keys into the one channel the loop reads.
-pub(crate) fn spawn_keys(tx: Sender<Event>, stop: &Stop) {
-    let keys = term::key_thread_until(Arc::clone(&stop.0));
-    std::thread::spawn(move || {
+pub(crate) fn spawn_keys(tx: Sender<Event>) -> Reader {
+    let stop = Stop::new();
+    let (keys, reading) = term::key_thread_until(Arc::clone(&stop.0));
+    let thread = std::thread::spawn(move || {
         for press in keys {
             if tx.send(Event::Key(press)).is_err() {
-                return; // the dashboard is gone
+                break; // the dashboard is gone
             }
         }
+        // The reader is the thread holding stdin, so whoever waits for this one is waiting
+        // for that one.
+        let _ = reading.join();
     });
+    Reader { stop, thread }
 }
 
 /// Re-read the environment list on a timer until told to stop.
@@ -243,6 +283,21 @@ pub(crate) fn refresh_once(tx: Sender<Event>) {
         // A send that fails means the dashboard is gone, and this thread is finished
         // either way.
         let _ = tx.send(refresh());
+    });
+}
+
+/// Read what removing these environments would take with it, for the question that asks
+/// before one is removed.
+///
+/// On a thread for the same reason every other walk is: `preview` totals each top-level
+/// entry of every state directory it is given, which means stat-ing an image and a server
+/// tree — measured in seconds on a cold cache, and the reader pressed a key.
+pub(crate) fn spawn_preview(rows: Vec<crate::dev::list::Row>, name: String, tx: Sender<Event>) {
+    std::thread::spawn(move || {
+        let text = crate::dev::list::preview(&rows);
+        // A send that fails means the dashboard is gone, and this thread is finished
+        // either way.
+        let _ = tx.send(Event::Preview { name, text });
     });
 }
 
