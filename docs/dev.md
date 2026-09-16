@@ -19,6 +19,7 @@ whereas `--config` selects virtkit's host configuration.
 - [Daily workflow and freshness](#daily-workflow-and-freshness)
 - [Compose services and endpoints](#compose-services-and-endpoints)
 - [Workspace, mounts and storage](#workspace-mounts-and-storage)
+- [The dashboard](#the-dashboard)
 - [VS Code and SSH](#vs-code-and-ssh)
 - [Lifecycle hooks](#lifecycle-hooks)
 - [Project tasks](#project-tasks)
@@ -535,6 +536,55 @@ would be removed. GC deletes state directories, including managed data inside
 them. It does not delete external disk backings merely because the environment
 referenced them. Reset durable external data explicitly before discarding its
 configuration if you no longer need it.
+
+## The dashboard
+
+`vk dash` keeps a full-screen view of the same host-wide inventory up to date,
+with the selected environment's console and host resource usage:
+
+```sh
+vk dash
+vk dash --interval 10
+vk dash --no-color
+```
+
+The left column lists every environment and its state, running first, followed
+by the running count and total memory use. `s` walks the state directories to
+add their disk usage. The right column shows the selected environment's
+workspace, state directory, VM, memory and guest address. Below it, a pane shows
+either the console, with kernel, agent and guest lines distinguished and
+filterable by source and severity, or the VM's host resource usage.
+
+| Keys | Purpose |
+| --- | --- |
+| `j` `k`, arrows, `pgup` `pgdn`, `home` `end` | Move the selection, or scroll the pane below it. |
+| `tab` | Move between the list and that pane. |
+| `1` `2` | Show the console, or the host cost. |
+| `f`, `K` `A` `G`, `[` `]` | Follow the newest console line; show or hide the kernel, the agent, the guest; raise or lower the severity floor. |
+| `r`, `s` | Re-read the environments now; total what each holds on disk. |
+| `x` | What can be done to the selected environment. |
+| `a` | The guest's own usage panel (`vk atop`). |
+| `?`, `q` `esc` `ctrl-c` | List the keys; leave. |
+
+`x` opens the actions, and each one runs the corresponding `vk dev` command —
+`stop`, `up`, `refresh`, `shell`, `code`, and `gc` to remove what a finished
+environment left behind — against the selected environment's own `--workspace`
+and `--environment`, not the directory `vk dash` was started in. An action that
+does not apply is greyed out with the reason beside it: what is stopped cannot
+be stopped, an environment whose checkout is gone cannot be built in (`gc` still
+applies to it), and a bare `vk run` is no development environment at all.
+`shell`, `code` and `a` hand the terminal over until they exit; the rest run out
+of sight and report in the key bar. Removing an environment shows the command
+and the same listing of the directory's contents `vk dev gc` prints, and waits
+for `y`.
+
+The usage pane measures the VM's host process tree: CPU against its vCPU
+allocation, resident memory against its boot allocation, and block I/O.
+For the guest's own view, `a` hands the terminal to `vk atop STATE_DIR --follow`.
+
+`vk dash` reads the VM registry of the host it runs on. Run inside a `vk dev`
+guest it therefore lists that guest's own registry, normally empty, and not the
+host's.
 
 ## VS Code and SSH
 
