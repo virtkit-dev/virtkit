@@ -23,6 +23,12 @@ All notable changes to virtkit will be documented in this file.
   the guest's own view of itself. `?` lists the keys. It reads without colour as well as
   with it, and leaves the terminal exactly as it found it.
 
+### Fixed
+
+- **A full-screen panel now gives the terminal back however it is ended.** Two signals
+  arriving together while `vk atop --view` or `vk dash` held the screen could leave the
+  process stuck with the terminal in raw mode and no cursor.
+
 ## [0.72.0] - 2026-09-15
 
 ### Added

@@ -4,7 +4,9 @@
 //! The terminal is left exactly as it was found. The alternate screen is held by a guard that
 //! restores on drop, so a panic or an error path cannot leave a shell without its cursor — and
 //! because a signal is neither, the terminating ones are caught long enough to restore it and
-//! then re-raised.
+//! then re-raised. What that handler puts back is settled before it is installed and read
+//! from a plain static: a handler runs between two instructions of whatever it interrupted,
+//! so everything it touches has to be safe to touch there, locks included.
 //!
 //! The keys are decoded here rather than by a library, because an arrow key is several bytes
 //! and the terminal gives no promise about delivering them in one read: a decoder that gives
@@ -31,9 +33,19 @@ pub(crate) fn can_draw() -> bool {
         && std::env::var("TERM").map(|t| t != "dumb").unwrap_or(true)
 }
 
-/// The terminal settings to put back from a signal handler, and the fd to put them on. Read
-/// once before raw mode is entered: a handler may touch nothing that is not already there.
-static ON_SIGNAL: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
+/// Terminal settings captured before raw mode. The handler reads this cell without a lock:
+/// a nested signal could deadlock on a lock held by the interrupted handler, leaving the
+/// terminal in raw mode. All settings must be initialized before the handler can read them.
+struct OnSignal(std::cell::UnsafeCell<std::mem::MaybeUninit<libc::termios>>);
+
+// SAFETY: written once by `catch_terminating_signals`, before the handlers that read it are
+// installed, and not touched again. `ON_SIGNAL_SET` is what publishes that write to them.
+unsafe impl Sync for OnSignal {}
+
+static ON_SIGNAL: OnSignal = OnSignal(std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()));
+
+/// Publishes initialized settings to the signal handler.
+static ON_SIGNAL_SET: AtomicBool = AtomicBool::new(false);
 
 /// This terminal's settings as they stand, or `None` where stdin is not one.
 pub(crate) fn current_termios(fd: libc::c_int) -> Option<libc::termios> {
@@ -46,13 +58,20 @@ pub(crate) fn current_termios(fd: libc::c_int) -> Option<libc::termios> {
 }
 
 /// Restore the terminal and re-raise, so the process still dies of what it was sent and the
-/// shell it dies in is usable. Only `tcsetattr` and `write` run here, both async-signal-safe.
+/// shell it dies in is usable. `tcsetattr`, `write`, `signal` and `raise` are all this runs,
+/// and all four are async-signal-safe — which matters because these signals are not blocked
+/// for each other: a SIGTERM and a SIGQUIT in quick succession run this twice, nested.
 extern "C" fn restore_and_reraise(sig: libc::c_int) {
-    if let Ok(saved) = ON_SIGNAL.lock()
-        && let Some(saved) = saved.as_ref()
-    {
-        // SAFETY: a termios read from this same fd before raw mode was entered.
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved) };
+    if ON_SIGNAL_SET.load(Ordering::Acquire) {
+        // SAFETY: a termios read from this same fd before raw mode was entered, written
+        // before this handler was installed and never written again.
+        unsafe {
+            libc::tcsetattr(
+                libc::STDIN_FILENO,
+                libc::TCSANOW,
+                (*ON_SIGNAL.0.get()).as_ptr(),
+            )
+        };
     }
     const RESTORE: &[u8] = b"\x1b[?25h\x1b[?1049l";
     // SAFETY: writing a fixed buffer to a raw fd.
@@ -65,10 +84,13 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
 
 /// Catch the signals that would otherwise end a panel without unwinding. SIGINT is not among
 /// them: raw mode clears ISIG, so Ctrl-C arrives as a byte and leaves through the loop.
+///
+/// Called once per process, by the panel about to take the terminal.
 pub(crate) fn catch_terminating_signals(saved: libc::termios) {
-    if let Ok(mut slot) = ON_SIGNAL.lock() {
-        *slot = Some(saved);
-    }
+    // SAFETY: the settings are written before the handlers that read them exist, so there is
+    // no reader to race with; the store below is what makes the write visible to them.
+    unsafe { (*ON_SIGNAL.0.get()).write(saved) };
+    ON_SIGNAL_SET.store(true, Ordering::Release);
     for sig in [libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
         // SAFETY: the handler only calls async-signal-safe functions.
         unsafe {
