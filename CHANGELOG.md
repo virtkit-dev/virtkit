@@ -12,8 +12,10 @@ All notable changes to virtkit will be documented in this file.
   costing in memory and where the guest can be reached — and its guest's console, with the
   kernel's lines, the agent's and the guest's own told apart and marked, scrollable back
   through a whole boot and narrowable by writer and by severity without losing any of it.
-  `s` totals what each one occupies on disk. `?` lists the keys. It reads without colour as well as with it, and leaves the
-  terminal exactly as it found it.
+  A second pane meters what a running environment is taking from the host itself —
+  processor against the vCPUs it was given, memory against the size it booted with, and the
+  disk traffic behind it. `s` totals what each one occupies on disk. `?` lists the keys. It
+  reads without colour as well as with it, and leaves the terminal exactly as it found it.
 
 ### Changed
 

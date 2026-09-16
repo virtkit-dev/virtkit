@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::console::{Batch, Tail};
 use super::envs::{self, Env};
@@ -42,8 +42,27 @@ pub(crate) enum Event {
     Sizes(Vec<(PathBuf, u64)>),
     /// One pass of the selected environment's console.
     Log(Batch),
+    /// What the selected environment's process tree is costing this host.
+    Sample(Sample),
     /// Something could not be read. A line in the key bar, not the end of the session.
     Failed(String),
+}
+
+/// What one environment's whole process tree had cost the host at one moment.
+///
+/// `/proc` reports cumulative totals. Each reading includes an instant so rates use the
+/// actual elapsed time between samples, which differs from the requested interval.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Sample {
+    /// which process tree it was taken for ([`Selected::sample_epoch`])
+    pub(crate) epoch: u64,
+    /// CPU time the tree has used, guest execution included
+    pub(crate) cpu: Duration,
+    /// the most memory the tree was ever seen to hold at once
+    pub(crate) peak_rss: u64,
+    /// `(read, written)` against the block layer, or `None` where the kernel accounts none
+    pub(crate) disk: Option<(u64, u64)>,
+    pub(crate) at: Instant,
 }
 
 /// Which environment the threads that follow the selection are pointed at.
@@ -52,9 +71,16 @@ pub(crate) enum Event {
 /// one guest's console appearing under another guest's name for a tick after selection moves.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Selected {
+    /// which selection the console is being read for
     pub(crate) epoch: u64,
+    /// the same for the sampler, which moves on its own when an environment is restarted in
+    /// place: the console of the boot that ended is still what the reader wants, and a
+    /// reading of the process tree that ended is not
+    pub(crate) sample_epoch: u64,
     /// the state directory, or nothing when there is no environment to follow
     pub(crate) dir: Option<PathBuf>,
+    /// the pid at the root of its process tree, or nothing when it is not running
+    pub(crate) pid: Option<i32>,
 }
 
 /// Where the threads that follow the selection read it from. The loop writes it; they read.
@@ -166,6 +192,46 @@ pub(crate) fn spawn_console(tx: Sender<Event>, stop: Stop, follow: Follow) {
                 }
             }
             stop.sleep(CONSOLE_TICK);
+        }
+    });
+}
+
+/// Read what the selected environment's process tree is costing the host, on a timer.
+///
+/// The same `/proc` walk `vk list` does for its memory column, and the reason it is here
+/// rather than on the refresher: it is taken for one environment, and it has to be taken
+/// again as soon as the reader selects another — a pane that waited out the whole interval
+/// before saying anything reads as a pane that is broken.
+pub(crate) fn spawn_sampler(tx: Sender<Event>, stop: Stop, follow: Follow, every: Duration) {
+    std::thread::spawn(move || {
+        let mut epoch: Option<u64> = None;
+        let mut taken: Option<Instant> = None;
+        while !stop.raised() {
+            let target = follow.get();
+            let due = taken.is_none_or(|at| at.elapsed() >= every);
+            if epoch == Some(target.sample_epoch) && !due {
+                std::thread::sleep(TICK);
+                continue;
+            }
+            epoch = Some(target.sample_epoch);
+            taken = Some(Instant::now());
+            if let Some(pid) = target.pid
+                && let Some(usage) = crate::usage::tree(pid)
+            {
+                let sample = Sample {
+                    epoch: target.sample_epoch,
+                    cpu: usage.cpu,
+                    peak_rss: usage.peak_rss,
+                    disk: usage.disk,
+                    // Read after the walk, not before it: the walk is what took the time,
+                    // and the rate is only as honest as the interval it is divided by.
+                    at: Instant::now(),
+                };
+                if tx.send(Event::Sample(sample)).is_err() {
+                    return; // the dashboard is gone
+                }
+            }
+            std::thread::sleep(TICK);
         }
     });
 }

@@ -8,3 +8,4 @@ pub(crate) mod console;
 pub(crate) mod detail;
 pub(crate) mod list;
 pub(crate) mod overlay;
+pub(crate) mod usage;
