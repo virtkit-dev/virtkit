@@ -82,20 +82,86 @@ const STOP_WAIT: Duration = Duration::from_secs(5);
 /// into an error rather than a panel that never fills.
 const FIRST_SAMPLE_WAIT: Duration = Duration::from_secs(10);
 
-/// Attach to `entry`'s guest and record it, laying the log down at
-/// `<state dir>/atop/atop.log` (replacing any previous attach's recording). With a
-/// terminal — and without `summary`, which records headless on purpose — the follow
-/// panel opens on the growing log and quitting it ends the recording; otherwise the
-/// recording runs in the foreground until Ctrl-C. Returns the log's path.
-pub async fn attach(entry: &vms::VmEntry, interval_secs: u64, summary: bool) -> Result<PathBuf> {
+/// A recording under way: where its samples are landing, the task relaying them, and the
+/// token that asks the guest sampler for its final one.
+///
+/// Held by whoever wants the recording to carry on, and ended by letting go of it: a caller
+/// that can wait [`Recording::finish`]es it and gets that final sample, and one that cannot
+/// simply drops it, which ends the pump and with it the connection — a guest whose exec
+/// channel hangs up has its sampler killed along with the rest of its process group.
+pub(crate) struct Recording {
+    /// Where the samples are being written.
+    pub(crate) log: PathBuf,
+    /// `None` once it has been waited out, so the drop below has nothing left to end.
+    pump: Option<tokio::task::JoinHandle<Result<CmdResult>>>,
+    stop: CancellationToken,
+}
+
+impl Recording {
+    /// Ask the guest for its final sample and let the stream drain.
+    pub(crate) async fn finish(mut self) {
+        self.stop.cancel();
+        if let Some(mut pump) = self.pump.take() {
+            wait_out_stop(&mut pump).await;
+        }
+    }
+
+    /// Why a pump that ended before the recording had its first sample did, in the terms an
+    /// operator can act on. Leaves nothing behind for the drop to end.
+    async fn ended_early(&mut self) -> anyhow::Error {
+        let Some(pump) = self.pump.take() else {
+            return anyhow!("the guest sampler ended before its first sample");
+        };
+        match pump.await {
+            Ok(Ok(result)) => anyhow!(
+                "the guest sampler ended before its first sample{} — is this VM's \
+                 vk-agent older than `vk atop`?",
+                result
+                    .code
+                    .map(|c| format!(" (exit {c})"))
+                    .unwrap_or_default()
+            ),
+            Ok(Err(e)) => e,
+            Err(e) => anyhow!(e),
+        }
+    }
+
+    /// Wait for the recording to end by itself, which is the VM going down mid-attach, and
+    /// say how it ended. Cancel-safe: dropping this future leaves the recording as it was.
+    async fn ended(&mut self) -> std::result::Result<Result<CmdResult>, tokio::task::JoinError> {
+        let Some(pump) = self.pump.as_mut() else {
+            // Already waited out: there is nothing left for this to be the end of.
+            return std::future::pending().await;
+        };
+        pump.await
+    }
+}
+
+impl Drop for Recording {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        if let Some(pump) = &self.pump {
+            pump.abort();
+        }
+    }
+}
+
+/// Start recording the guest behind `addr` into `<state_dir>/atop/atop.log`, replacing any
+/// previous attach's recording, and wait for its first sample.
+///
+/// The recording lives as long as the [`Recording`] returned. `relay_stderr` puts whatever
+/// the guest sampler complains about onto this process's stderr, which is for a caller that
+/// has a stderr to spare — not one drawing on the terminal.
+pub(crate) async fn start(
+    addr: &SocketAddr,
+    state_dir: &Path,
+    interval_secs: u64,
+    relay_stderr: bool,
+) -> Result<Recording> {
     if interval_secs == 0 {
         bail!("--interval must be at least 1 second (got 0)");
     }
-    let addr: SocketAddr = entry
-        .exec_addr
-        .parse()
-        .with_context(|| format!("the VM's exec address {:?}", entry.exec_addr))?;
-    let dir = entry.state_dir.join("atop");
+    let dir = state_dir.join("atop");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let log = dir.join(vk_core::atop::LOG_NAME);
     // Opened without following a symlink, and written only once it is the regular file a
@@ -130,7 +196,7 @@ pub async fn attach(entry: &vms::VmEntry, interval_secs: u64, summary: bool) -> 
         .try_clone()
         .with_context(|| format!("reopening {}", log.display()))?;
 
-    let (mut stream, mut sink) = vk_core::net::connect(&addr)
+    let (mut stream, mut sink) = vk_core::net::connect(addr)
         .await
         .context("connecting to the VM's vk-agent")?;
     sink.send(Message::CmdExec(CmdExec {
@@ -152,13 +218,22 @@ pub async fn attach(entry: &vms::VmEntry, interval_secs: u64, summary: bool) -> 
         other => bail!("unexpected reply to exec: {other:?}"),
     }
 
-    // The panel only where somebody is watching one: `--summary` is the headless form,
-    // and without a terminal the panel can draw on there is nothing to open it on (the
-    // recording still runs). Decided here rather than left to the panel to refuse, so a
-    // terminal it cannot drive costs the operator the panel, not the recording.
-    let panel = !summary && crate::term::can_draw();
     let stop = CancellationToken::new();
-    let mut pump = tokio::spawn(pump(stream, sink, file, !panel, stop.clone()));
+    // The pump belongs to the recording from the moment it is spawned. A bare handle held
+    // across the wait below would be *detached* by every way out of it — an early return,
+    // and a caller that drops this future — leaving the connection, the file holding the
+    // log's lock and the guest's sampler alive for the rest of the process.
+    let mut recording = Recording {
+        log,
+        pump: Some(tokio::spawn(pump(
+            stream,
+            sink,
+            file,
+            relay_stderr,
+            stop.clone(),
+        ))),
+        stop,
+    };
 
     // The sampler writes its first sample the moment it starts: wait for it, so the
     // panel opens with something to show — and so a guest that cannot run the sampler
@@ -166,19 +241,12 @@ pub async fn attach(entry: &vms::VmEntry, interval_secs: u64, summary: bool) -> 
     // rather than as a panel that never fills.
     let deadline = tokio::time::Instant::now() + FIRST_SAMPLE_WAIT;
     while !probe.metadata().is_ok_and(|m| m.len() > 0) {
-        if pump.is_finished() {
-            return Err(match pump.await {
-                Ok(Ok(result)) => anyhow!(
-                    "the guest sampler ended before its first sample{} — is this VM's \
-                     vk-agent older than `vk atop`?",
-                    result
-                        .code
-                        .map(|c| format!(" (exit {c})"))
-                        .unwrap_or_default()
-                ),
-                Ok(Err(e)) => e,
-                Err(e) => anyhow!(e),
-            });
+        if recording
+            .pump
+            .as_ref()
+            .is_some_and(|pump| pump.is_finished())
+        {
+            return Err(recording.ended_early().await);
         }
         if tokio::time::Instant::now() >= deadline {
             break; // record anyway; the follow panel copes with a log still empty
@@ -186,13 +254,33 @@ pub async fn attach(entry: &vms::VmEntry, interval_secs: u64, summary: bool) -> 
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    Ok(recording)
+}
+
+/// Attach to `entry`'s guest and record it, laying the log down at
+/// `<state dir>/atop/atop.log` (replacing any previous attach's recording). With a
+/// terminal — and without `summary`, which records headless on purpose — the follow
+/// panel opens on the growing log and quitting it ends the recording; otherwise the
+/// recording runs in the foreground until Ctrl-C. Returns the log's path.
+pub async fn attach(entry: &vms::VmEntry, interval_secs: u64, summary: bool) -> Result<PathBuf> {
+    let addr: SocketAddr = entry
+        .exec_addr
+        .parse()
+        .with_context(|| format!("the VM's exec address {:?}", entry.exec_addr))?;
+    // The panel only where somebody is watching one: `--summary` is the headless form,
+    // and without a terminal the panel can draw on there is nothing to open it on (the
+    // recording still runs). Decided here rather than left to the panel to refuse, so a
+    // terminal it cannot drive costs the operator the panel, not the recording.
+    let panel = !summary && crate::term::can_draw();
+    let mut recording = start(&addr, &entry.state_dir, interval_secs, !panel).await?;
+    let log = recording.log.clone();
+
     if panel {
         let view_log = log.clone();
         let view = tokio::task::spawn_blocking(move || crate::atop_view::view(&view_log, true));
         let outcome = view.await;
         // The panel is gone: ask for the final sample and let the stream drain.
-        stop.cancel();
-        finish(&mut pump).await;
+        recording.finish().await;
         // A panel that could not run still leaves the samples it was to draw, so the path
         // is said here — the error returned below carries the operator past the caller
         // that would otherwise have printed it.
@@ -206,19 +294,20 @@ pub async fn attach(entry: &vms::VmEntry, interval_secs: u64, summary: bool) -> 
             entry.label,
             log.display()
         );
-        tokio::select! {
-            r = &mut pump => {
+        let interrupted = tokio::select! {
+            r = recording.ended() => {
                 // The guest ended the recording on its own: the VM went down mid-attach.
                 // The log so far is still the answer, so report and keep it.
                 match r.context("the recording task failed")? {
                     Ok(_) => eprintln!("virtkit: the VM ended the recording"),
                     Err(e) => eprintln!("virtkit: the recording ended: {e:#}"),
                 }
+                false
             }
-            _ = tokio::signal::ctrl_c() => {
-                stop.cancel();
-                finish(&mut pump).await;
-            }
+            _ = tokio::signal::ctrl_c() => true,
+        };
+        if interrupted {
+            recording.finish().await;
         }
     }
     Ok(log)
@@ -230,7 +319,7 @@ pub async fn attach(entry: &vms::VmEntry, interval_secs: u64, summary: bool) -> 
 /// a short one, so it is said rather than swallowed. A pump past the deadline is abandoned
 /// rather than waited on any longer; what reads the log next reads it as a recording torn at
 /// the tail, which every reader of one already copes with.
-async fn finish(pump: &mut tokio::task::JoinHandle<Result<CmdResult>>) {
+async fn wait_out_stop(pump: &mut tokio::task::JoinHandle<Result<CmdResult>>) {
     match tokio::time::timeout(STOP_WAIT, &mut *pump).await {
         Ok(Ok(Ok(_))) => {}
         Ok(Ok(Err(e))) => eprintln!("virtkit: the recording ended: {e:#}"),
@@ -406,6 +495,36 @@ mod tests {
         assert_eq!(result.code, Some(0));
         assert_eq!(std::fs::read_to_string(&log).unwrap(), "RESET\nSEP 1\n");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A recording ends the pump it owns when it is dropped — which is how every way out of
+    /// [`start`] short of returning one ends it. A detached pump would keep the connection,
+    /// the file holding the log's lock and the guest's own sampler for the rest of the
+    /// process, and the next `vk atop` against that VM would be refused the log.
+    #[tokio::test]
+    async fn dropping_a_recording_ends_the_pump_it_owns() {
+        let (gone, ended) = tokio::sync::oneshot::channel::<()>();
+        let recording = Recording {
+            log: PathBuf::from("/state/vm/atop/atop.log"),
+            pump: Some(tokio::spawn(async move {
+                // Stands in for the connection and the locked file the real pump holds:
+                // it goes when the task is dropped, and not when it is merely asked to be.
+                let _gone = gone;
+                std::future::pending::<()>().await;
+                Ok(CmdResult {
+                    code: Some(0),
+                    signal: None,
+                })
+            })),
+            stop: CancellationToken::new(),
+        };
+        // So the drop below is a running task's, not a task that never started.
+        tokio::task::yield_now().await;
+        drop(recording);
+        tokio::time::timeout(Duration::from_secs(5), ended)
+            .await
+            .expect("the pump outlived the recording that owned it")
+            .expect_err("the pump ended by itself rather than being ended");
     }
 
     /// Stopping asks the guest for its final sample by closing its stdin — exactly once,
