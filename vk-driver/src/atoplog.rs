@@ -100,7 +100,7 @@ impl Parsed {
 }
 
 /// One interval of a guest's life, as the log records it.
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Sample {
     /// When the sample was taken (seconds since the epoch).
     pub epoch: i64,
@@ -128,7 +128,7 @@ pub struct Sample {
 }
 
 /// Processor time over the interval, in ticks of `hertz`.
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Cpu {
     /// Which processor, for a per-core record; `None` for the total across all of them.
     pub core: Option<u32>,
@@ -175,7 +175,7 @@ impl Cpu {
     }
 }
 
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Load {
     pub load1: f64,
     pub load5: f64,
@@ -185,7 +185,7 @@ pub struct Load {
 }
 
 /// Memory as it stood, in pages of `pagesize`.
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Mem {
     pub pagesize: u64,
     pub physmem: u64,
@@ -217,7 +217,7 @@ impl Mem {
     }
 }
 
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Swap {
     pub pagesize: u64,
     pub total: u64,
@@ -238,7 +238,7 @@ impl Swap {
 }
 
 /// The paging events that say a guest was short of memory, over the interval.
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Paging {
     /// Allocations that had to wait for the kernel to reclaim.
     pub allocstalls: u64,
@@ -250,14 +250,14 @@ pub struct Paging {
 
 /// One pressure-stall resource: the averages as they stood, and the microseconds stalled
 /// during the interval.
-#[derive(Clone, Copy, Default, serde::Serialize)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct Stall {
     /// The share of the last ten seconds spent stalled, as the sample was taken.
     pub avg10: f64,
     pub total_us: u64,
 }
 
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Psi {
     /// Whether the guest kernel reports pressure at all (`psi=1` on its cmdline).
     pub supported: bool,
@@ -270,7 +270,7 @@ pub struct Psi {
 
 /// One disk over the interval. A device that did nothing has no record, so an absent disk
 /// moved nothing rather than being unknown.
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Disk {
     pub name: String,
     /// Milliseconds the device was busy over the interval.
@@ -284,14 +284,14 @@ pub struct Disk {
 pub const SECTOR: u64 = 512;
 
 /// The protocol layers: connections held as they stand, segments resent over the interval.
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Net {
     pub tcp_established: u64,
     pub tcp_retrans: u64,
 }
 
 /// One interface over the interval.
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Iface {
     pub name: String,
     pub bytes_in: u64,
@@ -299,7 +299,7 @@ pub struct Iface {
 }
 
 /// One process in one sample: identity as it stands, everything else over the interval.
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Proc {
     pub pid: i32,
     pub name: String,
@@ -361,7 +361,7 @@ impl Proc {
 /// A recording can hold many at once, all under the one pid; the four process labels of a
 /// task cannot be matched up across them, so this is all a reader can honestly keep: how many
 /// there were and the time they charged, summed.
-#[derive(Clone, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ExitedUnknown {
     /// Tasks in this sample, counted once each on the CPU record.
     pub tasks: u64,

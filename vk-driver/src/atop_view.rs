@@ -105,7 +105,7 @@ pub fn view(path: &Path, follow: bool) -> Result<()> {
 }
 
 /// The log as it grows: what has been read, and where to read on from.
-struct Tail {
+pub(crate) struct Tail {
     path: PathBuf,
     file: std::fs::File,
     /// Bytes of the file already accounted for — always the end of a complete sample, so a
@@ -114,7 +114,7 @@ struct Tail {
 }
 
 impl Tail {
-    fn open(path: &Path) -> Result<Tail> {
+    pub(crate) fn open(path: &Path) -> Result<Tail> {
         // The same descriptor a report reads from: no symlink followed, nothing but a regular
         // file accepted. A guest owns the directory its log is in and can swap the log for a
         // FIFO between the moment it was resolved and the moment it is opened.
@@ -128,7 +128,7 @@ impl Tail {
 
     /// Every sample committed since the last read. The tail after the last `SEP` is a sample
     /// the guest is still writing: it stays unread until its own `SEP` arrives.
-    fn read(&mut self) -> Result<Vec<Sample>> {
+    pub(crate) fn read(&mut self) -> Result<Vec<Sample>> {
         use std::io::{Read, Seek, SeekFrom};
         self.file
             .seek(SeekFrom::Start(self.offset))
@@ -164,8 +164,9 @@ fn end_of_last_sample(bytes: &[u8]) -> usize {
 }
 
 /// What the process table is ordered by.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Sort {
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Sort {
+    #[default]
     Cpu,
     Memory,
     Disk,
@@ -179,6 +180,22 @@ impl Sort {
             Sort::Disk => "disk",
         }
     }
+}
+
+/// How the process table is to be drawn, apart from the sample it draws from.
+///
+/// The panel sets all four out of its own state. Anything else drawing the same table — the
+/// dashboard's guest pane — sets what it offers a reader and leaves the rest at its default,
+/// which is this sample's own figures, every command, ordered by processor time.
+#[derive(Default)]
+pub(crate) struct Table<'a> {
+    pub(crate) sort: Sort,
+    /// Each process's whole-job totals instead of this sample's activity.
+    pub(crate) accumulate: bool,
+    /// Only the commands holding this, compared without case. Empty admits every one.
+    pub(crate) filter: &'a str,
+    /// The whole-job totals `accumulate` draws from; empty where nothing accumulates them.
+    pub(crate) totals: &'a [Totals],
 }
 
 /// Whether the loop carries on after a key.
@@ -296,6 +313,16 @@ impl View {
     fn current(&self) -> Option<&Sample> {
         self.samples.get(self.cursor)
     }
+
+    /// How the panel wants its process table drawn.
+    fn table(&self) -> Table<'_> {
+        Table {
+            sort: self.sort,
+            accumulate: self.accumulate,
+            filter: &self.filter,
+            totals: &self.totals,
+        }
+    }
 }
 
 /// Draw one frame: the whole screen, built in one buffer and written in one call, with the
@@ -332,7 +359,7 @@ fn frame(state: &View, rows: u16, cols: u16) -> String {
             // bottom — measured from what was actually built, so a system line added or a
             // sample missing a record cannot silently eat a process row.
             let room = (rows as usize).saturating_sub(lines.len() + 1);
-            lines.extend(process_table(state, sample, room, cols));
+            lines.extend(process_table(state.table(), sample, room, cols));
         }
         None => lines.push("no sample yet — waiting for the guest to commit one".to_string()),
     }
@@ -393,7 +420,7 @@ fn status(state: &View, cols: usize) -> String {
 
 /// The system half: what the guest's processors, memory, pressure, disks and network were
 /// doing in this one sample.
-fn system_panel(s: &Sample, cols: usize) -> Vec<String> {
+pub(crate) fn system_panel(s: &Sample, cols: usize) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(cpu) = &s.cpu {
         let mut line = format!(
@@ -500,9 +527,14 @@ fn system_panel(s: &Sample, cols: usize) -> Vec<String> {
     lines.into_iter().map(|l| clip(&l, cols)).collect()
 }
 
-/// The process half: what was running, ordered by the column the panel is sorted on. With
-/// `a` the figures are each process's whole-job totals instead of this sample's.
-fn process_table(state: &View, sample: &Sample, room: usize, cols: usize) -> Vec<String> {
+/// The process half: what was running, ordered by the column the table is sorted on. With
+/// `accumulate` the figures are each process's whole-job totals instead of this sample's.
+pub(crate) fn process_table(
+    state: Table<'_>,
+    sample: &Sample,
+    room: usize,
+    cols: usize,
+) -> Vec<String> {
     let filter = state.filter.to_lowercase();
     let matches = |command: &str| filter.is_empty() || command.to_lowercase().contains(&filter);
     /// A row is a command with four figures and the state it was in, whichever set of samples
@@ -915,7 +947,7 @@ mod tests {
         state.key(Press::Left);
         let first_row = |state: &View| {
             let sample = state.current().expect("a sample").clone();
-            let rows = process_table(state, &sample, 24, 100);
+            let rows = process_table(state.table(), &sample, 24, 100);
             rows.get(1).cloned().unwrap_or_default()
         };
         assert!(first_row(&state).contains("sh -c make test"), "by cpu");
@@ -934,7 +966,7 @@ mod tests {
         );
         // The heading says which column the order rests on.
         let sample = state.current().expect("a sample").clone();
-        assert!(process_table(&state, &sample, 24, 100)[0].contains(">cpu"));
+        assert!(process_table(state.table(), &sample, 24, 100)[0].contains(">cpu"));
     }
 
     /// `a` swaps this sample's figures for each process's whole-job totals, which is a
@@ -943,9 +975,9 @@ mod tests {
     fn accumulating_shows_the_whole_job() {
         let mut state = view(false);
         let sample = state.current().expect("a sample").clone();
-        let now = process_table(&state, &sample, 24, 100);
+        let now = process_table(state.table(), &sample, 24, 100);
         state.key(Press::Char('a'));
-        let whole = process_table(&state, &sample, 24, 100);
+        let whole = process_table(state.table(), &sample, 24, 100);
         assert!(whole[0].contains("whole job"), "{:?}", whole[0]);
         assert_ne!(now[1], whole[1], "the figures are not the same question");
         // sh burned 100 ticks a sample over three samples, at 100 Hz
@@ -963,7 +995,7 @@ mod tests {
     fn an_exited_task_is_marked_in_the_table() {
         let state = view(false);
         let sample = state.current().expect("a sample").clone();
-        let rows = process_table(&state, &sample, 24, 100);
+        let rows = process_table(state.table(), &sample, 24, 100);
         assert!(rows[0].contains("st"), "a state column: {:?}", rows[0]);
         let dead = rows
             .iter()
@@ -976,7 +1008,7 @@ mod tests {
         // Accumulated over the job, the same task reads as one that ended.
         let mut state = state;
         state.key(Press::Char('a'));
-        let rows = process_table(&state, &sample, 24, 100);
+        let rows = process_table(state.table(), &sample, 24, 100);
         let dead = rows
             .iter()
             .find(|r| r.contains("true"))
@@ -1004,7 +1036,7 @@ mod tests {
             sectors_written: 4,
             io_stats: true,
         });
-        let rows = process_table(&state, &sample, 24, 100);
+        let rows = process_table(state.table(), &sample, 24, 100);
         let row = rows
             .iter()
             .find(|r| r.contains("(exited, unnamed)"))
@@ -1031,7 +1063,7 @@ mod tests {
         assert!(!state.editing);
 
         let sample = state.current().expect("a sample").clone();
-        let rows = process_table(&state, &sample, 24, 100);
+        let rows = process_table(state.table(), &sample, 24, 100);
         assert_eq!(rows.len(), 2, "a heading and the one match: {rows:?}");
         assert!(rows[1].contains("dd if="));
         assert!(
@@ -1045,7 +1077,7 @@ mod tests {
         state.key(Press::Escape);
         assert!(state.filter.is_empty());
         // a heading, the two live processes, and the task that exited
-        assert_eq!(process_table(&state, &sample, 24, 100).len(), 4);
+        assert_eq!(process_table(state.table(), &sample, 24, 100).len(), 4);
     }
 
     /// The boot sample is marked: its counters cover the guest's whole boot, so its
@@ -1203,8 +1235,8 @@ mod tests {
         let mut state = view(false);
         state.accumulate = true;
         let sample = state.current().cloned().expect("a sample");
-        let once = process_table(&state, &sample, 10, 100);
-        let twice = process_table(&state, &sample, 10, 100);
+        let once = process_table(state.table(), &sample, 10, 100);
+        let twice = process_table(state.table(), &sample, 10, 100);
         assert_eq!(once, twice, "the same table, drawn twice");
     }
 
