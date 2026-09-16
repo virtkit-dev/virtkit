@@ -156,7 +156,7 @@ pub async fn attach(entry: &vms::VmEntry, interval_secs: u64, summary: bool) -> 
     // and without a terminal the panel can draw on there is nothing to open it on (the
     // recording still runs). Decided here rather than left to the panel to refuse, so a
     // terminal it cannot drive costs the operator the panel, not the recording.
-    let panel = !summary && crate::atop_view::can_draw();
+    let panel = !summary && crate::term::can_draw();
     let stop = CancellationToken::new();
     let mut pump = tokio::spawn(pump(stream, sink, file, !panel, stop.clone()));
 
