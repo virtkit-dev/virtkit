@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk dash` opens a dashboard over this host's dev environments.** One full-screen view,
+  with `?` listing the keys and `q` leaving it. It reads without colour as well as with it,
+  and leaves the terminal exactly as it found it.
+
 ### Changed
 
 - **`vk dev gc` with no name removes this workspace's environment**, as `vk dev stop` stops

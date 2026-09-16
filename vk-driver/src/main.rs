@@ -31,6 +31,7 @@ mod compose;
 mod config;
 mod consolelog;
 mod cpio;
+mod dash;
 mod detach;
 mod dev;
 mod dockerhash;
@@ -938,6 +939,26 @@ enum Cmd {
     /// key is checked; one virtkit does not know is an error rather than a silent omission.
     #[command(display_order = 11)]
     Dev(crate::dev::cli::Dev),
+    /// A full-screen dashboard over this host's dev environments
+    ///
+    /// One screen listing every `vk dev` environment on this host, running and stopped, and
+    /// for whichever is selected the VM behind it. `?` lists the keys. It reads only: nothing
+    /// it draws changes anything on this host. Run inside a guest it sees that guest's
+    /// registry, not the host's.
+    #[command(display_order = 12)]
+    Dash {
+        /// seconds between re-reads of the environment list
+        #[arg(
+            long,
+            value_name = "SECS",
+            default_value_t = 3,
+            value_parser = clap::value_parser!(u64).range(1..)
+        )]
+        interval: u64,
+        /// draw without colour, as $NO_COLOR also does
+        #[arg(long)]
+        no_color: bool,
+    },
     /// SSH into a VM booted with `run --ssh-client`
     ///
     /// Runs the system ssh against the client setup in the VM's state dir — that run's
@@ -2835,6 +2856,20 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Err(e) => fail(&e, 2),
         };
     }
+    // A host-wide read, like the listings above it. It blocks this thread until the reader
+    // leaves; it never awaits and spawns no task, so the runtime's workers stay free.
+    if let Cmd::Dash { interval, no_color } = &cli.cmd {
+        // `TERM=dumb` needs no test of its own: the dashboard refuses a terminal that
+        // cannot address its own screen before it draws anything at all.
+        let colour = !no_color && std::env::var_os("NO_COLOR").is_none();
+        return match dash::run(dash::Args {
+            interval: std::time::Duration::from_secs(*interval),
+            colour,
+        }) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 2),
+        };
+    }
     if let Cmd::Stop {
         target,
         all,
@@ -4290,6 +4325,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         | Cmd::DockerHash { .. }
         | Cmd::Fingerprint { .. }
         | Cmd::List { .. }
+        | Cmd::Dash { .. }
         | Cmd::Stop { .. }
         | Cmd::Reboot { .. }
         | Cmd::Update { .. }
@@ -5865,6 +5901,7 @@ mod tests {
                 "atop",
                 "build",
                 "check",
+                "dash",
                 "dev",
                 "exec",
                 "export",
