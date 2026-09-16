@@ -77,6 +77,7 @@ mod sshagent;
 mod sshclient;
 mod sshconf;
 mod switch;
+mod term;
 mod timing;
 mod toolchain;
 mod units;
@@ -4032,7 +4033,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                     read_recording(
                         log,
                         Some(&entry.label),
-                        ReadAs::of(summary, json, view, follow, atop_view::can_draw()),
+                        ReadAs::of(summary, json, view, follow, term::can_draw()),
                     )
                 } else if json || view {
                     fail(
