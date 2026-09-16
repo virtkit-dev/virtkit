@@ -9,8 +9,10 @@ All notable changes to virtkit will be documented in this file.
 - **`vk dash` opens a dashboard over every dev environment on the host.** One screen lists
   them all, running and stopped, and keeps itself up to date; for whichever is selected it
   shows the VM behind it — what is holding it up, how long it has been there, what it is
-  costing in memory and where the guest can be reached. `s` totals what each one occupies
-  on disk. `?` lists the keys. It reads without colour as well as with it, and leaves the
+  costing in memory and where the guest can be reached — and its guest's console, with the
+  kernel's lines, the agent's and the guest's own told apart and marked, scrollable back
+  through a whole boot and narrowable by writer and by severity without losing any of it.
+  `s` totals what each one occupies on disk. `?` lists the keys. It reads without colour as well as with it, and leaves the
   terminal exactly as it found it.
 
 ## [0.72.0] - 2026-09-15

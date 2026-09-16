@@ -170,7 +170,7 @@ fn kernel_alarm(msg: &str) -> bool {
 }
 
 /// Classify one raw console line.
-fn classify(raw: &str) -> Line {
+pub(crate) fn classify(raw: &str) -> Line {
     let text = strip_ansi(raw.trim_end_matches(['\r', '\n'])).into_owned();
     if kernel_stamped(&text) {
         let level = kernel_alarm(&text).then_some(Level::Error);

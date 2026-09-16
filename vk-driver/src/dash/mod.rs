@@ -29,6 +29,7 @@
     clippy::indexing_slicing
 )]
 
+mod console;
 mod envs;
 mod pane;
 mod poll;
@@ -85,8 +86,10 @@ pub(crate) fn run(args: Args) -> Result<()> {
     // loop has one thing to wait on.
     let (tx, rx) = channel();
     let stop = poll::Stop::new();
+    let follow = poll::Follow::default();
     poll::spawn_keys(tx.clone(), &stop);
     poll::spawn_refresher(tx.clone(), args.interval, stop.clone());
+    poll::spawn_console(tx.clone(), stop.clone(), follow.clone());
 
     let mut app = App::new(args.interval, args.colour);
     while !app.quit() {
@@ -105,10 +108,12 @@ pub(crate) fn run(args: Args) -> Result<()> {
             // nothing left to draw from.
             Err(RecvTimeoutError::Disconnected) => break,
         }
-        match app.take_request() {
-            Some(Request::Refresh) => poll::refresh_once(tx.clone()),
-            Some(Request::Sizes(dirs)) => poll::spawn_size_walk(dirs, tx.clone()),
-            None => {}
+        while let Some(request) = app.take_request() {
+            match request {
+                Request::Refresh => poll::refresh_once(tx.clone()),
+                Request::Sizes(dirs) => poll::spawn_size_walk(dirs, tx.clone()),
+                Request::Follow(selected) => follow.point_at(selected),
+            }
         }
     }
     stop.raise();

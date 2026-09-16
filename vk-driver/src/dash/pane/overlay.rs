@@ -14,12 +14,18 @@ use crate::vms::fmt_uptime;
 const KEYS: &[(&str, &str)] = &[
     ("j k ↑ ↓", "move the selection"),
     ("pgup pgdn", "move it a page at a time"),
-    ("home end", "the first environment, or the last"),
+    ("home end", "the ends of the list, or of the pane below it"),
     ("tab", "move between the list and the pane below it"),
     (
         "1  2",
         "the console, or what the environment costs this host",
     ),
+    ("f", "follow the newest console line again"),
+    (
+        "K  A  G",
+        "show the kernel, the agent, the guest — or stop showing one",
+    ),
+    ("[  ]", "show more of the console, or only what is worse"),
     ("r", "re-read the environments now"),
     ("s", "total what each of them holds on disk (slow)"),
     ("?", "this"),
