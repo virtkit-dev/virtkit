@@ -5,7 +5,7 @@
 //! backing what the VM has genuinely taken, and that is the figure a reader deciding whether
 //! a machine full of environments is in trouble needs. The heading says so, because the two
 //! are close enough in wording to be read as each other. The guest's own view is a panel
-//! that already exists — `vk atop <state dir> --follow` — and the pane names it.
+//! that already exists — `vk atop <state dir> --follow` — and `a` hands the terminal to it.
 //!
 //! Every meter carries its figure. A bar with no number beside it is unreadable in a
 //! screenshot and meaningless without colour, so the bar is the quick read and the figure is
@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use crate::dash::poll::Sample;
-use crate::dash::render::{Line, Style, span, tilde};
+use crate::dash::render::{Line, Style, span};
 use crate::dash::state::App;
 use crate::usage::{fmt_bytes, fmt_cpu};
 use crate::vms::mem_cell;
@@ -108,10 +108,13 @@ pub(crate) fn lines(app: &App, width: usize, rows: usize) -> Vec<Line> {
         facts.push(ip.to_string());
     }
     out.push(field("vm", facts.join("  ")));
-    out.push(vec![span(
-        format!("the guest's own view: vk atop {} --follow", tilde(&env.dir)),
-        Style::Dim,
-    )]);
+    out.push(vec![
+        span("a", Style::Bold),
+        span(
+            "     the guest's own view of itself, from vk atop --follow",
+            Style::Dim,
+        ),
+    ]);
     out
 }
 

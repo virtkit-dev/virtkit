@@ -942,9 +942,12 @@ enum Cmd {
     /// A full-screen dashboard over this host's dev environments
     ///
     /// One screen listing every `vk dev` environment on this host, running and stopped, and
-    /// for whichever is selected the VM behind it. `?` lists the keys. It reads only: nothing
-    /// it draws changes anything on this host. Run inside a guest it sees that guest's
-    /// registry, not the host's.
+    /// for whichever is selected the VM behind it. `x` offers what can be done to it — stop,
+    /// start, refresh, a shell, the editor, or removing what a finished one left behind —
+    /// each of which runs the `vk dev` command it names, and the one that cannot be undone
+    /// shows the command and what would go before it asks. `?` lists the keys. It reads until
+    /// you ask it for something. Run inside a guest it sees that guest's registry, not the
+    /// host's.
     #[command(display_order = 12)]
     Dash {
         /// seconds between re-reads of the environment list

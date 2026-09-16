@@ -211,8 +211,12 @@ pub(crate) fn frame(app: &App, rows: u16, cols: u16) -> String {
     // The keys belong on the bottom row, where a reader looks for them, so the screen is
     // filled to there whatever the rest had to say.
     let body = rows.saturating_sub(1);
-    let mut lines = match app.mode {
+    let mut lines = match &app.mode {
         Mode::Help => paint_all(&pane::overlay::help(app, cols), cols, app.colour),
+        Mode::Menu => paint_all(&pane::overlay::menu(app, cols), cols, app.colour),
+        Mode::Confirm(confirm) => {
+            paint_all(&pane::overlay::confirm(confirm, body), cols, app.colour)
+        }
         Mode::Normal => dashboard(app, body, cols),
     };
     lines.truncate(body);
@@ -309,15 +313,32 @@ fn key_bar(app: &App, cols: usize) -> Line {
     if let Some(said) = &app.status {
         return vec![span(format!(" {said}"), Style::Alarm)];
     }
+    // An overlay that has the keyboard says down here what it answers to, since the keys the
+    // dashboard itself has are not the ones that work while it is up.
+    match app.mode {
+        Mode::Menu => {
+            return vec![span(" a key acts  ·  esc closes", Style::Dim)];
+        }
+        Mode::Confirm(_) => {
+            return vec![span(
+                " y goes ahead  ·  any other key cancels",
+                Style::Alarm,
+            )];
+        }
+        Mode::Normal | Mode::Help => {}
+    }
     let focus = match app.focus {
         Focus::List => "tab pane",
         Focus::Lower => "tab list",
     };
-    let mut hints = vec!["j/k move", focus, "1/2 pane"];
+    let mut hints = vec!["j/k move", "x act", focus, "1/2 pane"];
     // The console's keys before the list's: a reader looking at a guest's console wants
     // them more than the two that re-read the host, and the bar drops hints from the right.
+    // The usage pane's own key is the one that shows the other half of the same question.
     if app.pane == Pane::Console {
         hints.extend(["f follow", "KAG source", "[ ] level"]);
+    } else {
+        hints.push("a atop");
     }
     hints.extend(["s size", "r refresh"]);
     let mut bar = String::from(" ");
@@ -421,6 +442,36 @@ mod tests {
         App::new(Duration::from_secs(3), false)
     }
 
+    /// Every screen the dashboard can be showing, including the two that take the keyboard
+    /// — and the question in both of its states, since a listing that has not been read yet
+    /// and one that is longer than the screen are different amounts to fit.
+    fn modes() -> Vec<Mode> {
+        use crate::dash::actions::Action;
+        use crate::dash::state::Confirm;
+
+        let stopped = crate::dash::envs::join(
+            vec![crate::dash::envs::fixture::row(
+                "wab-qa-d3a92b42d7d0a15f",
+                "/state/b",
+                crate::dev::list::Status::Stopped,
+            )],
+            Vec::new(),
+        );
+        let asking = |removes: Option<String>| {
+            let job = Action::Remove
+                .job(stopped.first().expect("one environment"))
+                .expect("a stopped environment can be removed");
+            Mode::Confirm(Confirm { job, removes })
+        };
+        vec![
+            Mode::Normal,
+            Mode::Help,
+            Mode::Menu,
+            asking(None),
+            asking(Some(crate::dev::list::preview(&[]).repeat(20))),
+        ]
+    }
+
     /// A dashboard with a host's worth of environments read into it: one running, one
     /// stopped, one that answers to no environment, and a name long enough to have to be
     /// cut down to the column.
@@ -514,7 +565,7 @@ mod tests {
     #[test]
     fn a_frame_is_exactly_the_screen_it_was_given() {
         for (rows, cols) in SIZES {
-            for mode in [Mode::Normal, Mode::Help] {
+            for mode in modes() {
                 // Before anything has been read and after, since the two draw different
                 // things into the same room — and under each of the panes the room is
                 // shared with.
@@ -629,6 +680,70 @@ mod tests {
         assert!(drawn.contains("costing this host nothing"), "{drawn}");
     }
 
+    /// The menu says what can be done and, for what cannot, why — in words, because the
+    /// dimming that says it as well is a thing a terminal may not have.
+    #[test]
+    fn the_menu_says_what_can_be_done_and_why_not() {
+        // A bare `vk run` is not a dev environment, so every `vk dev` action is refused for
+        // it — and the reason is on the row rather than only in the key bar.
+        let mut app = read_app();
+        app.key(Press::Char('x'));
+        let drawn = rows_of(&frame(&app, 30, 80)).join("\n");
+        assert!(drawn.contains("scratch"), "{drawn}");
+        assert!(drawn.contains("s  stop"), "{drawn}");
+        assert!(drawn.contains("not a dev environment"), "{drawn}");
+        assert!(drawn.contains("a key acts"), "{drawn}");
+        // Even a row nothing can be done to has the one action that only reads.
+        assert!(drawn.contains("a  the guest's own usage panel"), "{drawn}");
+
+        // With a running dev environment selected, what it can do says nothing about why
+        // not, and what it cannot says which state it is in.
+        app.key(Press::Escape);
+        app.key(Press::Char('j'));
+        app.key(Press::Char('x'));
+        let drawn = rows_of(&frame(&app, 30, 80)).join("\n");
+        assert!(!drawn.contains("not a dev environment"), "{drawn}");
+        assert!(drawn.contains("already running"), "{drawn}");
+        assert!(drawn.contains("the VM goes down"), "{drawn}");
+
+        // And a stopped one is the one that can be removed, which is marked in a word.
+        app.key(Press::Escape);
+        app.key(Press::Char('j'));
+        app.key(Press::Char('x'));
+        let drawn = rows_of(&frame(&app, 30, 80)).join("\n");
+        assert!(drawn.contains("not running"), "{drawn}");
+        assert!(
+            drawn.contains("destroys"),
+            "removing is not marked: {drawn}"
+        );
+    }
+
+    /// The question shows the command it would run and what `vk dev gc` says is inside the
+    /// directory, so a reader is agreeing to something they can read.
+    #[test]
+    fn the_question_shows_the_command_and_what_it_would_take() {
+        let Some(Mode::Confirm(confirm)) = modes().into_iter().nth(3) else {
+            panic!("the modes no longer include an unread question");
+        };
+        let mut app = read_app();
+        app.mode = Mode::Confirm(confirm.clone());
+        let drawn = rows_of(&frame(&app, 24, 80)).join("\n");
+        assert!(
+            drawn.contains("vk dev gc --yes wab-qa-d3a92b42d7d0a15f"),
+            "{drawn}"
+        );
+        assert!(drawn.contains("reading what is in there"), "{drawn}");
+        assert!(drawn.contains("y goes ahead"), "{drawn}");
+
+        let mut read = confirm;
+        read.removes = Some("would remove 1 environment(s):\n  wab-qa  /src/wab  4.0 GiB".into());
+        app.mode = Mode::Confirm(read);
+        let drawn = rows_of(&frame(&app, 24, 80)).join("\n");
+        assert!(drawn.contains("would remove 1 environment(s)"), "{drawn}");
+        assert!(drawn.contains("4.0 GiB"), "{drawn}");
+        assert!(!drawn.contains("reading what is in there"), "{drawn}");
+    }
+
     /// The frame is written in one call with the cursor homed and every line erasing its
     /// own tail — and nothing after the bottom row, which would scroll the screen.
     #[test]
@@ -649,8 +764,8 @@ mod tests {
     /// everyone else does.
     #[test]
     fn nothing_is_coloured_when_colour_is_off() {
-        for mode in [Mode::Normal, Mode::Help] {
-            let mut app = app();
+        for mode in modes() {
+            let mut app = read_app();
             app.mode = mode;
             app.status = Some("something went wrong".to_string());
             let frame = frame(&app, 24, 80);

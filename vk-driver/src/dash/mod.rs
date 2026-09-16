@@ -1,8 +1,9 @@
 //! `vk dash`: one screen over every dev environment this host keeps state for.
 //!
-//! The dashboard reads. It holds the terminal, draws a frame, waits for a key, and draws
-//! again — nothing it does changes anything on this host, so a reader can leave it open
-//! beside whatever they are actually doing.
+//! The dashboard reads until it is asked for something. It holds the terminal, draws a
+//! frame, waits for a key, and draws again; `x` is where the keys that change something
+//! live, and the one of those that cannot be undone asks before it happens. Everything it
+//! changes it changes by re-execing this same `vk` — see [`actions`].
 //!
 //! The terminal is left exactly as it was found, by three paths that between them cover
 //! every way out: [`crate::term::AltScreen`] and [`vk_core::pty::RawModeGuard`] restore on
@@ -29,6 +30,7 @@
     clippy::indexing_slicing
 )]
 
+mod actions;
 mod console;
 mod envs;
 mod pane;
@@ -37,12 +39,16 @@ mod render;
 mod state;
 
 use std::io::Write;
-use std::sync::mpsc::{RecvTimeoutError, channel};
+use std::os::unix::process::CommandExt;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use vk_core::pty::RawModeGuard;
 
 use crate::term::{self, AltScreen};
+use actions::Job;
+use poll::{Event, Reader};
 use state::{App, Request};
 
 /// How long the loop waits for a key before drawing anyway. A window resized while nothing
@@ -73,9 +79,11 @@ pub(crate) fn run(args: Args) -> Result<()> {
     // Read before raw mode is entered: this is what the signal handler puts back.
     let saved = term::current_termios(libc::STDIN_FILENO);
     install_panic_hook();
-    let _raw = vk_core::pty::RawModeGuard::enable(libc::STDIN_FILENO)
-        .context("putting the terminal in raw mode")?;
-    let _screen = AltScreen::enter()?;
+    // Held in options because an action that hands the terminal to a child puts them both
+    // down for as long as the child has it, and takes them back afterwards.
+    let mut raw =
+        Some(RawModeGuard::enable(libc::STDIN_FILENO).context("putting the terminal in raw mode")?);
+    let mut screen = Some(AltScreen::enter()?);
     // A signal that ends the process unwinds nothing, so the guards above never run:
     // without this a SIGTERM or a closed terminal leaves the reader's shell in raw mode,
     // with no cursor and the alternate screen still on.
@@ -87,7 +95,10 @@ pub(crate) fn run(args: Args) -> Result<()> {
     let (tx, rx) = channel();
     let stop = poll::Stop::new();
     let follow = poll::Follow::default();
-    poll::spawn_keys(tx.clone(), &stop);
+    // The reader is held apart from the data threads: handing the terminal over stands *it*
+    // down and starts another afterwards, and the threads that keep reading this host must
+    // not be stopped along with it.
+    let mut keys = poll::spawn_keys(tx.clone());
     poll::spawn_refresher(tx.clone(), args.interval, stop.clone());
     poll::spawn_console(tx.clone(), stop.clone(), follow.clone());
     poll::spawn_sampler(tx.clone(), stop.clone(), follow.clone(), args.interval);
@@ -114,11 +125,104 @@ pub(crate) fn run(args: Args) -> Result<()> {
                 Request::Refresh => poll::refresh_once(tx.clone()),
                 Request::Sizes(dirs) => poll::spawn_size_walk(dirs, tx.clone()),
                 Request::Follow(selected) => follow.point_at(selected),
+                Request::Preview { name, rows } => poll::spawn_preview(rows, name, tx.clone()),
+                Request::Run(job) => actions::spawn(job, tx.clone()),
+                Request::Handover(job) => {
+                    let (said, reader) = hand_over(&mut raw, &mut screen, keys, &tx, &rx, &job)?;
+                    keys = reader;
+                    app.on_event(Event::Said(said));
+                    // Whatever happened in there, it may have changed what is running.
+                    poll::refresh_once(tx.clone());
+                }
             }
         }
     }
     stop.raise();
+    keys.raise();
     Ok(())
+}
+
+/// Give the terminal to a child, and take it back when the child is done with it.
+///
+/// Temporarily leave the alternate screen and raw mode so the child inherits the terminal
+/// settings `vk dash` started with. The signal handler and panic hook remain installed, so
+/// a kill during the child shell still restores a usable terminal.
+///
+/// Keep the host-reading threads running so their data stays current during long actions.
+/// If restoring the dashboard fails, end the session and report the child's outcome:
+/// drawing into a cooked terminal would fill scrollback with frames and echo keystrokes.
+fn hand_over(
+    raw: &mut Option<RawModeGuard>,
+    screen: &mut Option<AltScreen>,
+    keys: Reader,
+    tx: &Sender<Event>,
+    rx: &Receiver<Event>,
+    job: &Job,
+) -> Result<(String, Reader)> {
+    // Waited for rather than given a moment: the reader is inside a read of this terminal,
+    // and the child is about to be handed the same one.
+    keys.stand_down();
+    // A key it had already read is one the reader typed at the dashboard, but it arrives
+    // after a screen they typed it at is gone — so it goes no further. Everything else the
+    // threads noticed in the meantime is kept.
+    let kept: Vec<Event> = rx
+        .try_iter()
+        .filter(|event| !matches!(event, Event::Key(_)))
+        .collect();
+    for event in kept {
+        // This very function holds the receiver, so nothing here is undeliverable.
+        let _ = tx.send(event);
+    }
+    *screen = None;
+    *raw = None;
+
+    let said = run_attached(job);
+
+    // Back to the dashboard, whatever the child made of the terminal in between.
+    let entered = RawModeGuard::enable(libc::STDIN_FILENO)
+        .context("putting the terminal back in raw mode")
+        .and_then(|guard| {
+            *raw = Some(guard);
+            AltScreen::enter()
+        })
+        .with_context(|| format!("{said} — and the terminal did not come back"))?;
+    *screen = Some(entered);
+    Ok((said, poll::spawn_keys(tx.clone())))
+}
+
+/// Run the child with this terminal, and say how it went.
+fn run_attached(job: &Job) -> String {
+    let (label, name) = (job.action.label(), job.name.as_str());
+    let mut command = match job.command() {
+        Ok(command) => command,
+        Err(report) => return format!("{label}: {name}: {report:#}"),
+    };
+    // Printed onto the terminal the reader is about to be looking at, so that what happens
+    // next is not a shell appearing out of nowhere.
+    println!("vk dash: {}", job.line());
+    // SAFETY: `pre_exec` runs in the forked child before `exec`; `signal` is
+    // async-signal-safe.
+    //
+    // The child shares this terminal's foreground process group, so a Ctrl-C typed into it
+    // is delivered to the dashboard too — and out of raw mode that is a default-action kill.
+    // Ignoring it here and putting it back for the child is what makes Ctrl-C end the shell
+    // rather than the dashboard behind it.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            Ok(())
+        });
+    }
+    let held = unsafe { libc::signal(libc::SIGINT, libc::SIG_IGN) };
+    let outcome = command.status();
+    // SAFETY: putting back exactly what was there; raw mode makes it moot either way, since
+    // it delivers Ctrl-C as a byte rather than as a signal.
+    unsafe { libc::signal(libc::SIGINT, held) };
+    match outcome {
+        Ok(status) if status.success() => format!("{label}: {name} finished"),
+        Ok(status) => format!("{label}: {name} exited with {status}"),
+        Err(report) => format!("{label}: {name}: {report}"),
+    }
 }
 
 /// Draw one frame: the whole screen, built in one buffer and written in one call, at the
