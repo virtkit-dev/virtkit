@@ -12,11 +12,12 @@
 //! never a crash and never a stall.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::console::{Batch, Tail};
 use super::envs::{self, Env};
 use crate::term::{self, Press};
 
@@ -24,6 +25,10 @@ use crate::term::{self, Press};
 /// that slept a whole refresh interval would hold the alternate screen for seconds after
 /// the reader had left.
 const TICK: Duration = Duration::from_millis(100);
+
+/// How often the console is read. Fast enough that a boot scrolls rather than arrives in
+/// blocks, slow enough that a guest flooding its console costs four reads a second.
+const CONSOLE_TICK: Duration = Duration::from_millis(250);
 
 /// Everything the loop reacts to, from whichever thread noticed it.
 #[derive(Debug)]
@@ -35,8 +40,45 @@ pub(crate) enum Event {
     /// What each state directory holds on disk, which is asked for by a key rather than by
     /// a timer.
     Sizes(Vec<(PathBuf, u64)>),
+    /// One pass of the selected environment's console.
+    Log(Batch),
     /// Something could not be read. A line in the key bar, not the end of the session.
     Failed(String),
+}
+
+/// Which environment the threads that follow the selection are pointed at.
+///
+/// Each pass carries the selection epoch it began with. Discarding stale passes prevents
+/// one guest's console appearing under another guest's name for a tick after selection moves.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Selected {
+    pub(crate) epoch: u64,
+    /// the state directory, or nothing when there is no environment to follow
+    pub(crate) dir: Option<PathBuf>,
+}
+
+/// Where the threads that follow the selection read it from. The loop writes it; they read.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Follow(Arc<Mutex<Selected>>);
+
+impl Follow {
+    /// Point the following threads at this environment.
+    pub(crate) fn point_at(&self, selected: Selected) {
+        // A lock is poisoned only by a panic while it is held, and nothing here panics
+        // holding it; taking the value back is better than losing the selection over it.
+        let mut held = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *held = selected;
+    }
+
+    fn get(&self) -> Selected {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 /// The flag every background thread watches, so leaving stops them all — and so a caller
@@ -90,6 +132,40 @@ pub(crate) fn spawn_refresher(tx: Sender<Event>, every: Duration, stop: Stop) {
                 return;
             }
             stop.sleep(every);
+        }
+    });
+}
+
+/// Follow the console of whichever environment is selected, until told to stop.
+///
+/// One thread for every selection rather than one per environment: the reader looks at one
+/// console at a time, and a `j` held down would otherwise open a descriptor on every
+/// environment it passed through.
+pub(crate) fn spawn_console(tx: Sender<Event>, stop: Stop, follow: Follow) {
+    std::thread::spawn(move || {
+        let mut epoch: Option<u64> = None;
+        let mut tail: Option<Tail> = None;
+        // Whether the dashboard has been told there is no console. Sending that once, and
+        // again only when it changes, is what lets the pane say "this has never booted"
+        // instead of looking as though a console were on its way.
+        let mut told: Option<bool> = None;
+        while !stop.raised() {
+            let target = follow.get();
+            if epoch != Some(target.epoch) {
+                epoch = Some(target.epoch);
+                tail = target.dir.as_deref().map(Tail::new);
+                told = None;
+            }
+            if let (Some(epoch), Some(tail)) = (epoch, tail.as_mut()) {
+                let batch = tail.drain(epoch);
+                let speak =
+                    !batch.lines.is_empty() || batch.restarted || told != Some(batch.missing);
+                told = Some(batch.missing);
+                if speak && tx.send(Event::Log(batch)).is_err() {
+                    return; // the dashboard is gone
+                }
+            }
+            stop.sleep(CONSOLE_TICK);
         }
     });
 }

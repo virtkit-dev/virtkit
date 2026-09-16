@@ -42,6 +42,8 @@ pub(crate) enum Style {
     Bold,
     /// running, or otherwise fine
     Good,
+    /// went wrong and was continued past
+    Warn,
     /// wants the reader
     Alarm,
 }
@@ -55,6 +57,7 @@ impl Style {
             Style::Dim => "\x1b[2m",
             Style::Alarm => "\x1b[31m",
             Style::Good => "\x1b[32m",
+            Style::Warn => "\x1b[33m",
         }
     }
 }
@@ -230,7 +233,7 @@ fn dashboard(app: &App, rows: usize, cols: usize) -> Vec<String> {
     }
     let right_width = cols.saturating_sub(LIST_WIDTH).saturating_sub(2);
     let left = pane::list::lines(app, LIST_WIDTH, rows);
-    let right = right_column(app, right_width);
+    let right = right_column(app, right_width, rows);
     (0..rows)
         .map(|i| {
             let mut painter = Painter::new(cols, app.colour);
@@ -250,12 +253,18 @@ fn dashboard(app: &App, rows: usize, cols: usize) -> Vec<String> {
 
 /// The right-hand column: the selected environment's facts, then the tab strip, then
 /// whichever pane it names.
-fn right_column(app: &App, width: usize) -> Vec<Line> {
+fn right_column(app: &App, width: usize, rows: usize) -> Vec<Line> {
     let mut lines = pane::detail::lines(app, width);
     lines.truncate(DETAIL_ROWS);
     lines.resize(DETAIL_ROWS, Line::new());
     lines.push(tabs(app));
     lines.push(vec![span("─".repeat(width), Style::Dim)]);
+    // Whatever the facts and the strip did not take belongs to the pane the strip names.
+    let room = rows.saturating_sub(lines.len());
+    lines.extend(match app.pane {
+        Pane::Console => pane::console::lines(app, width, room),
+        Pane::Usage => Vec::new(),
+    });
     lines
 }
 
@@ -296,9 +305,16 @@ fn key_bar(app: &App, cols: usize) -> Line {
         Focus::List => "tab pane",
         Focus::Lower => "tab list",
     };
+    let mut hints = vec!["j/k move", focus, "1/2 pane"];
+    // The console's keys before the list's: a reader looking at a guest's console wants
+    // them more than the two that re-read the host, and the bar drops hints from the right.
+    if app.pane == Pane::Console {
+        hints.extend(["f follow", "KAG source", "[ ] level"]);
+    }
+    hints.extend(["s size", "r refresh"]);
     let mut bar = String::from(" ");
     let mut used = 1usize.saturating_add(ALWAYS.chars().count());
-    for hint in ["j/k move", focus, "1/2 pane", "s size", "r refresh"] {
+    for hint in hints {
         let cost = hint.chars().count().saturating_add(2);
         if used.saturating_add(cost) > cols {
             break;
@@ -374,6 +390,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::dash::poll::Event;
     use crate::term::Press;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -413,7 +430,29 @@ mod tests {
             vec![vm("/state/a", 3928432), vm("/state/scratch", 4242)],
         )));
         app.sizes.insert(PathBuf::from("/state/a"), 63_887_450_112);
+        app.on_event(Event::Log(console_batch(
+            &app,
+            &[
+                "[    0.420000] virtio_net virtio0 eth0: renamed from enp0s1",
+                "13:46:39 [INFO] vk-agent init: mounted /work",
+                "13:46:41 [WARN] vk-agent init: dhclient failed, falling back",
+                "[    9.120000] Out of memory: Killed process 7 (cc1plus)",
+                "Started OpenBSD Secure Shell server.",
+            ],
+        )));
         app
+    }
+
+    /// Console lines, as the tail hands them over for whatever is selected now.
+    fn console_batch(app: &App, raw: &[&str]) -> crate::dash::console::Batch {
+        crate::dash::console::Batch {
+            epoch: app.console_epoch(),
+            lines: raw
+                .iter()
+                .map(|line| crate::consolelog::classify(line))
+                .collect(),
+            ..crate::dash::console::Batch::default()
+        }
     }
 
     /// The rows of a frame, as the terminal would see them: the cursor controls that
@@ -504,6 +543,34 @@ mod tests {
         assert!(drawn.contains("pid 3928432"), "{drawn}");
     }
 
+    /// The console pane says what it is showing out of what it holds, and marks each line
+    /// with who wrote it and how bad it is — in characters, so a terminal with no colour
+    /// says everything a terminal with colour does.
+    #[test]
+    fn the_console_pane_marks_its_lines_and_says_what_is_hidden() {
+        let mut app = read_app();
+        let drawn = rows_of(&frame(&app, 24, 100)).join("\n");
+        assert!(
+            drawn.contains("5/5 lines · kernel+agent+guest · following"),
+            "{drawn}"
+        );
+        assert!(
+            drawn.contains("!k "),
+            "a kernel alarm was not marked: {drawn}"
+        );
+        assert!(drawn.contains("*a "), "an agent warning was not marked");
+        assert!(drawn.contains(" g Started OpenBSD"), "{drawn}");
+
+        // Hiding two of the three writers changes the line that says so, and says which
+        // keys bring them back.
+        app.key(Press::Char('K'));
+        app.key(Press::Char('G'));
+        let drawn = rows_of(&frame(&app, 24, 100)).join("\n");
+        assert!(drawn.contains("2/5 lines · agent · following"), "{drawn}");
+        assert!(!drawn.contains("Started OpenBSD"), "{drawn}");
+        assert!(drawn.contains("KAG source"), "the keys to undo it are gone");
+    }
+
     /// The frame is written in one call with the cursor homed and every line erasing its
     /// own tail — and nothing after the bottom row, which would scroll the screen.
     #[test]
@@ -560,6 +627,31 @@ mod tests {
         assert!(!drawn.contains('\n'), "{drawn:?}");
         assert!(!drawn.contains('\x07'), "{drawn:?}");
         assert_eq!(drawn, "boot[2Jtime[31mreddrop");
+
+        // And through the path a guest's text actually takes: a console line, classified,
+        // kept, filtered and drawn into a whole frame. `consolelog` takes the sequence out
+        // where it can; the painter refuses a cell to whatever is left.
+        // Drawn without colour, so the only escape sequences a correct frame can hold are
+        // the three cursor controls — which makes anything else the guest's.
+        let mut app = read_app();
+        app.on_event(Event::Log(console_batch(
+            &app,
+            &[
+                "\x1b[2Jcleared the screen\x07",
+                "[    1.000000] \x1b]0;retitled\x07 and \x1b[31m coloured",
+            ],
+        )));
+        let frame = frame(&app, 24, 100);
+        for sequence in frame.split('\x1b').skip(1) {
+            let kind = sequence.chars().take(2).collect::<String>();
+            assert!(
+                matches!(kind.as_str(), "[H" | "[K" | "[J"),
+                "a console line reached the terminal as an instruction: {sequence:?}"
+            );
+        }
+        let drawn = rows_of(&frame).join("\n");
+        assert!(drawn.contains("cleared the screen"), "{drawn}");
+        assert!(!drawn.contains('\x07'), "{drawn}");
     }
 
     /// A run is cut to the columns there are, counted as the terminal counts them, and the

@@ -3,15 +3,17 @@
 //! Keys update plain state values, which the renderer draws. This module performs no
 //! terminal, file or process I/O, so every key can be tested without a terminal.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use super::console;
 use super::envs::Env;
-use super::poll::Event;
+use super::poll::{Event, Selected};
+use crate::consolelog::Source;
 use crate::term::Press;
 
-/// How far a page key moves the selection.
+/// How far a page key moves the selection, and the console window.
 const PAGE: isize = 10;
 
 /// Which of the lower pane's tabs is showing.
@@ -50,6 +52,8 @@ pub(crate) enum Request {
     Refresh,
     /// total what each of these state directories holds on disk
     Sizes(Vec<PathBuf>),
+    /// point the threads that follow the selection at this environment
+    Follow(Selected),
 }
 
 /// The dashboard.
@@ -78,8 +82,23 @@ pub(crate) struct App {
     pub(crate) colour: bool,
     /// How often the environment list is re-read, for the help screen to state.
     pub(crate) interval: Duration,
+    /// The selected environment's console, as much of it as is kept.
+    pub(crate) console: console::Buffer,
+    /// Which of those lines are shown. It changes the screen and never the buffer, so a
+    /// reader who hides the kernel to find an agent complaint gets the kernel back intact.
+    pub(crate) filter: console::Filter,
+    /// How far back from the newest line the console pane is showing, counted in lines the
+    /// filter admits. Zero is following.
+    pub(crate) scrollback: usize,
+    /// Whether the selected environment has no console file at all — it has never booted.
+    pub(crate) console_missing: bool,
+    /// Which selection the following threads are working for. Bumped whenever it moves, so
+    /// a pass that began under the last one is recognised and dropped.
+    epoch: u64,
+    /// the environment those threads were last pointed at
+    followed: Option<PathBuf>,
     quit: bool,
-    request: Option<Request>,
+    requests: VecDeque<Request>,
 }
 
 impl App {
@@ -96,8 +115,14 @@ impl App {
             status: None,
             colour,
             interval,
+            console: console::Buffer::default(),
+            filter: console::Filter::default(),
+            scrollback: 0,
+            console_missing: false,
+            epoch: 0,
+            followed: None,
             quit: false,
-            request: None,
+            requests: VecDeque::new(),
         }
     }
 
@@ -108,7 +133,16 @@ impl App {
 
     /// What the loop is to do next on the dashboard's behalf, if anything.
     pub(crate) fn take_request(&mut self) -> Option<Request> {
-        self.request.take()
+        self.requests.pop_front()
+    }
+
+    /// Ask the loop for something, replacing an earlier ask of the same kind: a reader
+    /// holding `j` down moves through five environments and wants the console of the one
+    /// they stopped on, not of each one they passed.
+    fn ask(&mut self, request: Request) {
+        self.requests
+            .retain(|queued| std::mem::discriminant(queued) != std::mem::discriminant(&request));
+        self.requests.push_back(request);
     }
 
     /// The environment the right-hand column is about.
@@ -136,11 +170,87 @@ impl App {
                 self.sizes_pending = false;
                 self.sizes.extend(sizes);
             }
+            Event::Log(batch) => self.on_log(batch),
             Event::Failed(said) => {
                 self.read = true;
                 self.status = Some(said);
             }
         }
+    }
+
+    /// One pass of the console the following thread was pointed at.
+    fn on_log(&mut self, batch: console::Batch) {
+        // A pass that began before the reader moved describes another environment's guest.
+        if batch.epoch != self.epoch {
+            return;
+        }
+        self.console_missing = batch.missing;
+        if batch.restarted {
+            // The file was truncated or replaced: what is kept is about bytes that are gone.
+            self.console.clear();
+            self.scrollback = 0;
+        }
+        for line in batch.lines {
+            // A line arriving must not drag what a scrolled reader is looking at: the
+            // window is measured back from the newest line, so it moves with it.
+            if !self.following() && self.filter.admits(&line) {
+                self.scrollback = self.scrollback.saturating_add(1);
+            }
+            self.console.push(line);
+        }
+        self.clamp_scrollback();
+    }
+
+    /// Which selection the following threads are working for, so a test can hand the
+    /// dashboard a pass of the console exactly as they do.
+    #[cfg(test)]
+    pub(crate) fn console_epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Whether the console pane is showing the newest line.
+    pub(crate) fn following(&self) -> bool {
+        self.scrollback == 0
+    }
+
+    /// How many lines the filter admits, which is as far back as scrolling goes.
+    pub(crate) fn shown_lines(&self) -> usize {
+        self.console.shown(&self.filter).count()
+    }
+
+    /// Scroll the console. Positive is back into history; zero is following the newest line.
+    fn scroll(&mut self, back: isize) {
+        let ceiling = self.shown_lines().saturating_sub(1);
+        self.scrollback = self.scrollback.saturating_add_signed(back).min(ceiling);
+    }
+
+    /// Pull a scrolled reader back inside what the filter admits.
+    ///
+    /// Hiding two sources of three while scrolled a hundred lines back otherwise leaves the
+    /// window ending before the first line that survives, and the pane goes blank — which
+    /// reads as a broken dashboard rather than as a working filter.
+    fn clamp_scrollback(&mut self) {
+        self.scrollback = self.scrollback.min(self.shown_lines().saturating_sub(1));
+    }
+
+    /// Point the following threads at whatever is selected now.
+    ///
+    /// The buffer belongs to one environment, so moving the selection empties it: lines from
+    /// the one being left would otherwise sit above the one being arrived at, under its name.
+    fn retarget(&mut self) {
+        let dir = self.selected_env().map(|env| env.dir.clone());
+        if dir == self.followed {
+            return;
+        }
+        self.followed = dir.clone();
+        self.epoch = self.epoch.wrapping_add(1);
+        self.console.clear();
+        self.scrollback = 0;
+        self.console_missing = false;
+        self.ask(Request::Follow(Selected {
+            epoch: self.epoch,
+            dir,
+        }));
     }
 
     /// A completed read: keep the reader looking at the environment they had selected,
@@ -158,6 +268,7 @@ impl App {
             .and_then(|dir| envs.iter().position(|env| &env.dir == dir));
         self.envs = envs;
         self.selected = moved_to.unwrap_or(self.selected).min(self.last_index());
+        self.retarget();
     }
 
     fn last_index(&self) -> usize {
@@ -173,14 +284,16 @@ impl App {
             .selected
             .saturating_add_signed(delta)
             .min(self.last_index());
+        self.retarget();
     }
 
     /// Up or down: the selection while the list has the keys, the pane below once it does.
     fn step(&mut self, delta: isize) {
         match self.focus {
             Focus::List => self.select(delta),
-            // The pane below has nothing to scroll yet; the console gives it something.
-            Focus::Lower => {}
+            // Down is towards the newest line, which is less scrollback, so the sign turns
+            // over. Saturating, because `End` reaches here as the largest step there is.
+            Focus::Lower => self.scroll(delta.saturating_neg()),
         }
     }
 
@@ -190,9 +303,15 @@ impl App {
             return;
         }
         self.sizes_pending = true;
-        self.request = Some(Request::Sizes(
-            self.envs.iter().map(|env| env.dir.clone()).collect(),
-        ));
+        let dirs = self.envs.iter().map(|env| env.dir.clone()).collect();
+        self.ask(Request::Sizes(dirs));
+    }
+
+    /// Show a source, or stop showing it, keeping the window somewhere the pane can draw
+    /// from.
+    fn show(&mut self, source: Source) {
+        self.filter.toggle(source);
+        self.clamp_scrollback();
     }
 
     /// Act on a key.
@@ -221,8 +340,23 @@ impl App {
             }
             Press::Char('1') => self.pane = Pane::Console,
             Press::Char('2') => self.pane = Pane::Usage,
-            Press::Char('r') => self.request = Some(Request::Refresh),
+            Press::Char('r') => self.ask(Request::Refresh),
             Press::Char('s') => self.walk_sizes(),
+
+            // The console's own keys, which belong to it wherever the focus is: a reader
+            // hiding the kernel is reading the console, not moving the list.
+            Press::Char('f') => self.scrollback = 0,
+            Press::Char('K') => self.show(Source::Kernel),
+            Press::Char('A') => self.show(Source::Agent),
+            Press::Char('G') => self.show(Source::Guest),
+            Press::Char(']') => {
+                self.filter.raise();
+                self.clamp_scrollback();
+            }
+            Press::Char('[') => {
+                self.filter.lower();
+                self.clamp_scrollback();
+            }
 
             Press::Char('j') | Press::Down => self.step(1),
             Press::Char('k') | Press::Up => self.step(-1),
@@ -247,9 +381,24 @@ mod tests {
     )]
 
     use super::*;
+    use std::path::Path;
 
     fn app() -> App {
         App::new(Duration::from_secs(3), false)
+    }
+
+    /// Everything the dashboard has asked the loop for, in order.
+    fn drain(app: &mut App) -> Vec<Request> {
+        std::iter::from_fn(|| app.take_request()).collect()
+    }
+
+    /// A console line, classified as the tail classifies one.
+    fn log(app: &mut App, raw: &str) {
+        app.on_event(Event::Log(console::Batch {
+            epoch: app.epoch,
+            lines: vec![crate::consolelog::classify(raw)],
+            ..console::Batch::default()
+        }));
     }
 
     /// The keys are pressed before anything has been read, because a reader opens the
@@ -384,6 +533,7 @@ mod tests {
     fn the_size_walk_is_asked_for_once_at_a_time() {
         let mut app = app();
         app.on_event(Event::Envs(envs(2)));
+        drain(&mut app); // the read pointed the console at the first environment
         app.key(Press::Char('s'));
         assert!(app.sizes_pending);
         match app.take_request() {
@@ -468,6 +618,156 @@ mod tests {
         assert_eq!(app.focus, Focus::List, "a pane key moved the focus");
         app.key(Press::Char('1'));
         assert_eq!(app.pane, Pane::Console);
+    }
+
+    /// The console pane shows the newest line until the reader scrolls up, and `End` — or
+    /// `f`, wherever the focus is — gives following back.
+    #[test]
+    fn the_console_follows_until_it_is_scrolled_and_end_gives_it_back() {
+        let mut app = app();
+        app.on_event(Event::Envs(envs(2)));
+        for n in 0..50 {
+            log(&mut app, &format!("line {n}"));
+        }
+        assert!(app.following());
+
+        // While the list has the keys, up and down move the list and not the console.
+        app.key(Press::Up);
+        assert!(app.following());
+
+        app.key(Press::Tab);
+        app.key(Press::Up);
+        assert!(!app.following());
+        assert_eq!(app.scrollback, 1);
+        app.key(Press::PageUp);
+        assert_eq!(app.scrollback, 11);
+
+        app.key(Press::End);
+        assert!(app.following(), "end did not give following back");
+
+        app.key(Press::PageUp);
+        app.key(Press::Char('f'));
+        assert!(app.following(), "f did not give following back");
+
+        // Scrolling stops at the oldest line the buffer still holds.
+        app.key(Press::Home);
+        assert_eq!(app.scrollback, 49);
+    }
+
+    /// A line arriving while the reader is scrolled up must not drag the view: the window is
+    /// measured back from the newest line, so what they are looking at stays where it is.
+    #[test]
+    fn a_line_arriving_does_not_move_a_scrolled_reader() {
+        let mut app = app();
+        app.on_event(Event::Envs(envs(1)));
+        for n in 0..50 {
+            log(&mut app, &format!("line {n}"));
+        }
+        app.key(Press::Tab);
+        app.key(Press::PageUp);
+        let looking_at = app.scrollback;
+
+        log(&mut app, "one more");
+        assert_eq!(app.scrollback, looking_at + 1);
+    }
+
+    /// The filters change what is shown and not what is kept, and a filter that hides most
+    /// of the buffer pulls a scrolled reader back into what is left — otherwise the window
+    /// ends before the first line that survives and the pane goes blank.
+    #[test]
+    fn a_filter_pulls_a_scrolled_reader_back_into_what_it_admits() {
+        let mut app = app();
+        app.on_event(Event::Envs(envs(1)));
+        for n in 0..40 {
+            log(&mut app, &format!("guest line {n}"));
+        }
+        log(&mut app, "[    1.000000] one kernel line");
+
+        app.key(Press::Tab);
+        for _ in 0..3 {
+            app.key(Press::PageUp);
+        }
+        assert!(app.scrollback > 1);
+
+        // Only the single kernel line survives this.
+        app.key(Press::Char('G'));
+        assert_eq!(app.shown_lines(), 1);
+        assert_eq!(app.console.len(), 41, "the buffer was rebuilt to filter it");
+        assert_eq!(
+            app.scrollback, 0,
+            "the window ended before the only line left"
+        );
+
+        // And the level floor is held to the same rule: it admits no unleveled line at all.
+        app.key(Press::Char('G'));
+        for _ in 0..3 {
+            app.key(Press::PageUp);
+        }
+        app.key(Press::Char(']'));
+        assert_eq!(app.shown_lines(), 0);
+        assert_eq!(app.scrollback, 0);
+        app.key(Press::Char('['));
+        assert_eq!(app.shown_lines(), 41);
+    }
+
+    /// The console belongs to one environment. Moving the selection empties it and points
+    /// the follower at the new one, so one guest's lines never appear under another's name.
+    #[test]
+    fn moving_the_selection_follows_the_new_environment() {
+        let mut app = app();
+        app.on_event(Event::Envs(envs(3)));
+        match drain(&mut app).as_slice() {
+            [Request::Follow(followed)] => {
+                assert_eq!(followed.dir.as_deref(), Some(Path::new("/state/env-0")));
+            }
+            other => panic!("the first read asked for {other:?}"),
+        }
+        log(&mut app, "the first environment says something");
+        assert_eq!(app.console.len(), 1);
+
+        app.key(Press::Char('j'));
+        assert!(
+            app.console.is_empty(),
+            "the console outlived its environment"
+        );
+        let asked = drain(&mut app);
+        let Some(Request::Follow(followed)) = asked.first() else {
+            panic!("moving the selection asked for {asked:?}");
+        };
+        assert_eq!(followed.dir.as_deref(), Some(Path::new("/state/env-1")));
+
+        // A pass that began under the old selection is dropped rather than shown here.
+        app.on_event(Event::Log(console::Batch {
+            epoch: followed.epoch.saturating_sub(1),
+            lines: vec![crate::consolelog::classify("a line from the one we left")],
+            ..console::Batch::default()
+        }));
+        assert!(app.console.is_empty(), "a stale pass reached the buffer");
+
+        // A read that does not move the selection does not restart the follower.
+        log(&mut app, "the second environment says something");
+        app.on_event(Event::Envs(envs(3)));
+        assert_eq!(app.console.len(), 1, "a refresh cleared the console");
+        assert!(drain(&mut app).is_empty());
+    }
+
+    /// A console that was truncated or replaced describes bytes that are gone, so what was
+    /// kept goes with them rather than sitting above a new boot's first line.
+    #[test]
+    fn a_restarted_console_drops_what_it_held() {
+        let mut app = app();
+        app.on_event(Event::Envs(envs(1)));
+        for n in 0..5 {
+            log(&mut app, &format!("line {n}"));
+        }
+        app.on_event(Event::Log(console::Batch {
+            epoch: app.epoch,
+            lines: vec![crate::consolelog::classify("a fresh boot")],
+            restarted: true,
+            missing: false,
+        }));
+        assert_eq!(app.console.len(), 1);
+        assert!(app.following());
     }
 
     /// A complaint holds the key bar only until the reader has had a chance to read it: the
