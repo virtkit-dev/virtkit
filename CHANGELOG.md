@@ -21,6 +21,10 @@ All notable changes to virtkit will be documented in this file.
   output.** The standalone binary previously printed a cleanup hint for a `vk registry`
   command it does not provide.
 
+### Changed
+
+- The pinned guest kernel is bumped to 6.18.52.
+
 ## [0.72.0] - 2026-09-15
 
 ### Added
