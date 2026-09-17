@@ -55,6 +55,7 @@ pub(crate) mod keys;
 pub mod lock;
 pub mod oidc;
 pub mod relay;
+pub(crate) mod tags;
 pub(crate) mod upload;
 
 pub use client::{ClientAuth, FailInfo, Held, LockClient};
@@ -869,6 +870,25 @@ impl Store {
             })
             .collect();
         (per, total)
+    }
+
+    /// Remove a tag — the manual counterpart to what [`Store::gc`] does on a schedule, for
+    /// an admin dropping an entry through `/browse`. Only the tag pointer is unlinked: the
+    /// manifest and its blobs are content-addressed and may be shared, so reclaiming them is
+    /// left to the gc, which does it under the exclusive lock once nothing roots them. Taken
+    /// under the shared lock, so it can never drop a tag out from under a gc mid-sweep (which
+    /// holds the lock exclusive). `Ok(false)` if the tag was already gone.
+    pub fn delete_tag(&self, name: &str, tag: &str) -> Result<bool> {
+        if !valid_name(name) || !valid_tag(tag) {
+            bail!("invalid tag reference {name}:{tag}");
+        }
+        let _lock = self.lock_shared()?;
+        let path = self.tag_path(name, tag);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("removing the tag {}", path.display())),
+        }
     }
 
     /// Take the store lock shared — held by every writer/reader across its whole
@@ -1936,6 +1956,9 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
         if path == "/settings/captions" {
             return captions::route(db, p, state.cookies_are_secure(), req).await;
         }
+        if path == "/settings/tags/delete" {
+            return tags::route(&state.store, db, p, state.cookies_are_secure(), req).await;
+        }
         return keys::route(db, p, state.cookies_are_secure(), req).await;
     }
     if is_upload_path(&path) {
@@ -2716,7 +2739,10 @@ fn is_browse_path(path: &str) -> bool {
 }
 
 fn is_settings_path(path: &str) -> bool {
-    path == "/settings/keys" || path.starts_with("/settings/keys/") || path == "/settings/captions"
+    path == "/settings/keys"
+        || path.starts_with("/settings/keys/")
+        || path == "/settings/captions"
+        || path == "/settings/tags/delete"
 }
 
 fn is_upload_path(path: &str) -> bool {

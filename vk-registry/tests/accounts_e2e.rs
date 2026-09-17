@@ -1709,3 +1709,167 @@ async fn serve_binds_the_admin_socket_the_cli_resolves() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `/settings/tags/delete`: the destructive counterpart to the caption form, gated the same
+/// way — an admin session carrying a CSRF token, never a plain session and never an API key.
+/// A successful delete drops the tag pointer and redirects back to the repository's page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_tags_delete_is_admin_only_and_drops_the_pointer() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let dir = tmp("tag-delete");
+    let state = accounts_state(&dir);
+    let db = accounts_db(&state);
+    state
+        .store
+        .put_manifest(
+            "team-a/app",
+            "v1",
+            "application/vnd.oci.image.manifest.v1+json",
+            b"{}",
+        )
+        .unwrap();
+    assert!(
+        state
+            .store
+            .get_manifest("team-a/app", "v1")
+            .unwrap()
+            .is_some()
+    );
+
+    let plain = db
+        .upsert_user("https://issuer", "plain", None, None)
+        .unwrap();
+    let plain_session = db
+        .create_session(&plain.id, Duration::from_secs(3600))
+        .unwrap();
+    let plain_csrf = db.session_csrf(&plain_session).unwrap().unwrap();
+
+    let admin = db
+        .upsert_user("https://issuer", "admin", None, None)
+        .unwrap();
+    assert!(db.set_admin(&admin.id, true).unwrap());
+    let admin_session = db
+        .create_session(&admin.id, Duration::from_secs(3600))
+        .unwrap();
+    let admin_csrf = db.session_csrf(&admin_session).unwrap().unwrap();
+
+    let url = spawn(state.clone());
+    let client = no_redirect_client();
+    let post = async |session: &str, body: String| {
+        client
+            .post(format!("{url}/settings/tags/delete"))
+            .header("Cookie", format!("__Host-vk_session={session}"))
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    };
+
+    // A plain session is refused, and the tag stays.
+    let r = post(
+        &plain_session,
+        format!("repo=team-a/app&tag=v1&csrf={plain_csrf}"),
+    )
+    .await;
+    assert_eq!(r.status(), 403);
+    assert!(
+        state
+            .store
+            .get_manifest("team-a/app", "v1")
+            .unwrap()
+            .is_some()
+    );
+
+    // So is an admin session whose form carries no usable token.
+    let r = post(&admin_session, "repo=team-a/app&tag=v1&csrf=wrong".into()).await;
+    assert_eq!(r.status(), 403);
+    assert!(
+        state
+            .store
+            .get_manifest("team-a/app", "v1")
+            .unwrap()
+            .is_some()
+    );
+
+    // A name the OCI API would refuse — a bad repo or a digest where a tag is required — is
+    // a 400 before anything is unlinked.
+    for body in [
+        format!("repo=../etc&tag=v1&csrf={admin_csrf}"),
+        format!("repo=team-a/app&tag=sha256:aa&csrf={admin_csrf}"),
+        format!("repo=team-a/app&csrf={admin_csrf}"),
+    ] {
+        let r = post(&admin_session, body).await;
+        assert_eq!(r.status(), 400);
+    }
+    assert!(
+        state
+            .store
+            .get_manifest("team-a/app", "v1")
+            .unwrap()
+            .is_some()
+    );
+
+    // An API key is not a session, so it cannot delete however it is scoped.
+    let scope = Scope {
+        action: Action::Write,
+        repo_pattern: "*".to_string(),
+    };
+    let (_, token) = db
+        .create_api_key(Some(&admin.id), "ci", std::slice::from_ref(&scope), None)
+        .unwrap();
+    let r = client
+        .post(format!("{url}/settings/tags/delete"))
+        .bearer_auth(&token)
+        .body("repo=team-a/app&tag=v1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    assert!(
+        state
+            .store
+            .get_manifest("team-a/app", "v1")
+            .unwrap()
+            .is_some()
+    );
+
+    // The admin with the token: the pointer is gone and the response redirects back to the
+    // repository page, so a refresh does not re-submit.
+    let r = post(
+        &admin_session,
+        format!("repo=team-a/app&tag=v1&csrf={admin_csrf}"),
+    )
+    .await;
+    assert_eq!(r.status(), 303);
+    assert_eq!(
+        r.headers().get("location").and_then(|v| v.to_str().ok()),
+        Some("/browse/team-a/app")
+    );
+    assert!(
+        state
+            .store
+            .get_manifest("team-a/app", "v1")
+            .unwrap()
+            .is_none()
+    );
+
+    // Deleting an already-gone tag is the same outcome, not an error.
+    let r = post(
+        &admin_session,
+        format!("repo=team-a/app&tag=v1&csrf={admin_csrf}"),
+    )
+    .await;
+    assert_eq!(r.status(), 303);
+
+    // There is no page here to GET; the control lives on `/browse`.
+    let r = client
+        .get(format!("{url}/settings/tags/delete"))
+        .header("Cookie", format!("__Host-vk_session={admin_session}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 405);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

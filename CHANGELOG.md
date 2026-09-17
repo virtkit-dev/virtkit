@@ -8,6 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - **`vk-registry` browse pages now show how much disk each repository uses.** A
   repository's page lists the stored size of every tag and a total for the repository.
+- **An admin can now delete a tag from a `vk-registry` repository's browse page.** Deleting
+  a tag removes it from the repository; the disk it used is freed later by `vk-registry gc`.
 
 ## [0.72.0] - 2026-09-15
 

@@ -199,6 +199,17 @@ fn tag_list(
     // tags counted once) for the summary line. Read without bumping any tag's mtime, so
     // opening this page never renews the gc retention a resolve would.
     let (sizes, total) = store.repo_size_report(name, shown);
+    // The delete control is a CSRF-carrying POST an admin session may make — the exact gate
+    // `tags::route` enforces, so the button appears only where the POST would be accepted.
+    // `None` leaves the whole column out.
+    let delete_token = match (principal, csrf) {
+        (accounts::Principal::Session(_), Some(token))
+            if authorize(principal, Action::Write, name) =>
+        {
+            Some(token)
+        }
+        _ => None,
+    };
     let mut rows = String::new();
     for (i, t) in shown.iter().enumerate() {
         let kind = match tag_kind(t) {
@@ -214,15 +225,28 @@ fn tag_list(
             Some(n) => human_bytes(n),
             None => "&mdash;".to_string(),
         };
+        let delete = match delete_token {
+            Some(token) => format!(
+                "<td><form method=\"post\" action=\"/settings/tags/delete\">\
+                 <input type=\"hidden\" name=\"csrf\" value=\"{csrf}\">\
+                 <input type=\"hidden\" name=\"repo\" value=\"{repo}\">\
+                 <input type=\"hidden\" name=\"tag\" value=\"{tag}\">\
+                 <button type=\"submit\">Delete</button></form></td>",
+                csrf = html_escape(token),
+                repo = html_escape(name),
+                tag = html_escape(t),
+            ),
+            None => String::new(),
+        };
         rows.push_str(&format!(
             "<tr><td><a href=\"/browse/{name}/manifests/{tag}\">{tag}</a></td>\
-             {kind}<td>{size}</td></tr>\n",
+             {kind}<td>{size}</td>{delete}</tr>\n",
             name = html_escape(name),
             tag = html_escape(t),
         ));
     }
-    // Tag, [Kind,] Size.
-    let columns = 2 + kinds as usize;
+    // Tag, [Kind,] Size, [Delete].
+    let columns = 2 + kinds as usize + delete_token.is_some() as usize;
     if rows.is_empty() {
         rows = format!("<tr><td colspan=\"{columns}\"><em>no tags</em></td></tr>\n");
     }
@@ -237,6 +261,9 @@ fn tag_list(
         header.push_str("<th>Kind</th>");
     }
     header.push_str("<th>Size</th>");
+    if delete_token.is_some() {
+        header.push_str("<th></th>");
+    }
     // What an admin wrote about this repository, if anyone has. Not worth failing the
     // page over: a caption is the one thing on it that is nobody's data.
     let stored = match db.repo_caption(name) {
@@ -1176,6 +1203,62 @@ mod tests {
             body_text(page_at(&store, "/browse/team-a/app", &session("A"), Some("t")).unwrap())
                 .await;
         assert!(tags.contains("v1</a></td><td>&mdash;</td>"), "{tags}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The delete control is a CSRF-carrying POST to `tags::route`, rendered for the admin
+    /// session that may make it and for nobody else — the same gate the caption box follows.
+    #[tokio::test]
+    async fn the_delete_control_is_offered_only_to_an_admin_session() {
+        let (dir, store) = store_in("delete-form");
+        let db = Db::open_memory().unwrap();
+        store
+            .put_manifest("team-a/app", "v1", MANIFEST_TYPE, b"{}")
+            .unwrap();
+        let page = async |principal, csrf| {
+            body_text(page_at_db(&store, &db, "/browse/team-a/app", principal, csrf).unwrap()).await
+        };
+        let (admin_p, plain_p) = (admin_session("A"), session("B"));
+
+        let admin = page(&admin_p, Some("tok")).await;
+        assert!(
+            admin.contains("action=\"/settings/tags/delete\""),
+            "{admin}"
+        );
+        assert!(admin.contains("name=\"tag\" value=\"v1\""), "{admin}");
+        assert!(
+            admin.contains("name=\"repo\" value=\"team-a/app\""),
+            "{admin}"
+        );
+        assert!(
+            admin.contains("<button type=\"submit\">Delete</button>"),
+            "{admin}"
+        );
+
+        // a non-admin session and an admin without a CSRF token are shown no such control
+        let plain = page(&plain_p, Some("tok")).await;
+        assert!(!plain.contains("/settings/tags/delete"), "{plain}");
+        let unarmed = page(&admin_p, None).await;
+        assert!(!unarmed.contains("/settings/tags/delete"), "{unarmed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `delete_tag` unlinks the tag pointer, leaves the content-addressed blobs for the gc,
+    /// is idempotent, and refuses anything that is not a `(repository, tag)` pair.
+    #[test]
+    fn delete_tag_drops_the_pointer_and_is_idempotent() {
+        let (dir, store) = store_in("delete");
+        store
+            .put_manifest("team-a/app", "v1", MANIFEST_TYPE, b"{}")
+            .unwrap();
+        assert!(store.get_manifest("team-a/app", "v1").unwrap().is_some());
+        assert!(store.delete_tag("team-a/app", "v1").unwrap());
+        assert!(store.get_manifest("team-a/app", "v1").unwrap().is_none());
+        // already gone is success, not an error
+        assert!(!store.delete_tag("team-a/app", "v1").unwrap());
+        // a digest is not a tag, and a name component may not traverse
+        assert!(store.delete_tag("team-a/app", "sha256:aa").is_err());
+        assert!(store.delete_tag("../escape", "v1").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
