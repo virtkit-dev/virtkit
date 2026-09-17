@@ -43,8 +43,20 @@ const DHCP_LEASE_SECS: u32 = 86400;
 const DNS_PORT: u16 = 53;
 /// Upstream resolver used when /etc/resolv.conf yields no nameserver.
 const FALLBACK_DNS: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
-/// How long a forwarded query waits for the upstream resolver's reply.
-const DNS_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// Overall deadline for resolving one guest query upstream — the whole budget a lookup may
+/// spend across its UDP retries and any TCP fallback. Held at a guest resolver's usual
+/// patience so a slow-but-alive resolver still answers within it rather than the guest giving
+/// up first.
+const DNS_UPSTREAM_BUDGET: Duration = Duration::from_secs(5);
+/// Upstream tries per guest query, rotating across the configured nameservers. A single
+/// dropped UDP datagram — common when a guest fires a burst of parallel lookups (a yarn/npm
+/// fetch) at a loaded resolver — must not surface to the guest as SERVFAIL, so a lookup gets
+/// more than one shot, across more than one resolver, before it gives up.
+const DNS_UPSTREAM_TRIES: usize = 3;
+/// Reply deadline for every try but the last: short, so a dropped datagram fails over to the
+/// next resolver quickly. The final try instead waits out whatever remains of
+/// [`DNS_UPSTREAM_BUDGET`], so a lone slow-but-alive resolver is still given a full chance.
+const DNS_UPSTREAM_PROBE_TIMEOUT: Duration = Duration::from_millis(700);
 /// At most one upstream-failure line per distinct fault per window: a resolver that is
 /// down fails every lookup a guest makes, and switch.log is read as a whole.
 const DNS_LOG_WINDOW: Duration = Duration::from_secs(30);
@@ -700,8 +712,9 @@ struct Switch {
     next_port: AtomicU32,
     /// service name -> IP, answered by the gateway resolver (replaces /etc/hosts)
     hosts: Arc<HashMap<String, Ipv4Addr>>,
-    /// upstream resolver (the host's own) for everything else
-    upstream: SocketAddr,
+    /// upstream resolvers (the host's own) for everything else; forwarded across in order,
+    /// with retries, so one flaky resolver or a dropped datagram does not fail a lookup
+    upstreams: Arc<[SocketAddr]>,
     /// egress policy + the DNS-pinned IP set (shared with the ipstack egress tasks)
     egress: Arc<EgressGuard>,
 }
@@ -956,7 +969,12 @@ pub async fn run(
         }
     });
 
-    let upstream = host_upstream();
+    let upstreams = host_upstreams();
+    let upstreams_display = upstreams
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     let sw = Arc::new(Switch {
         cfg: Cfg { gateway, prefix },
         inner: Mutex::new(Inner {
@@ -970,7 +988,7 @@ pub async fn run(
         egress_tx,
         next_port: AtomicU32::new(0),
         hosts: Arc::new(hosts),
-        upstream,
+        upstreams: upstreams.into(),
         egress: guard,
     });
 
@@ -986,13 +1004,13 @@ pub async fn run(
 
     eprintln!(
         "switch: {} port(s), gateway {}/{} (ARP + DHCP + DNS + egress, shared LAN); \
-         resolver: {} service name(s), {} DHCP reservation(s), upstream {}; egress: {}{}",
+         resolver: {} service name(s), {} DHCP reservation(s), upstream(s) {}; egress: {}{}",
         listen.len(),
         gateway,
         prefix,
         sw.hosts.len(),
         sw.inner.lock().unwrap().reservations.len(),
-        upstream,
+        upstreams_display,
         // The audit channel is open for every CI job now — the standing list of names reads
         // it too — so its presence no longer says this job audits, and the log does not claim
         // it does.
@@ -1142,10 +1160,10 @@ impl Switch {
                         let mac: Mac = frame[6..12].try_into().unwrap();
                         let hosts = self.hosts.clone();
                         let egress = self.egress.clone();
-                        let (gw, upstream, query) =
-                            (self.cfg.gateway, self.upstream, query.to_vec());
+                        let (gw, upstreams, query) =
+                            (self.cfg.gateway, self.upstreams.clone(), query.to_vec());
                         tokio::spawn(handle_dns(
-                            query, hosts, upstream, gw, cip, src_port, mac, tx, egress,
+                            query, hosts, upstreams, gw, cip, src_port, mac, tx, egress,
                         ));
                     }
                 } else if let Some(rst) = self
@@ -1460,36 +1478,72 @@ async fn proxy_udp(mut guest: ipstack::IpStackUdpStream, egress: Arc<EgressGuard
     }
 }
 
-/// The first `nameserver` from resolv.conf text. Per resolv.conf(5) the keyword and
-/// its value are separated by any run of whitespace (space(s) or tab) — matching only
-/// a single space silently drops tab-separated entries (as some provisioners emit),
-/// leaving the switch with no upstream and falling back to the public resolver.
-fn first_nameserver(text: &str) -> Option<std::net::IpAddr> {
-    text.lines().find_map(|line| {
-        let rest = line.trim().strip_prefix("nameserver")?;
-        // Require a whitespace separator so `nameserverfoo` is not treated as a match,
-        // then read the first token — like glibc, ignore any trailing junk on the line.
-        rest.starts_with(|c: char| c.is_ascii_whitespace())
-            .then(|| {
-                rest.split_whitespace()
-                    .next()?
-                    .parse::<std::net::IpAddr>()
-                    .ok()
-            })
-            .flatten()
-    })
+/// Every `nameserver` from resolv.conf text, in file order. Per resolv.conf(5) the keyword
+/// and its value are separated by any run of whitespace (space(s) or tab) — matching only a
+/// single space silently drops tab-separated entries (as some provisioners emit). Taking all
+/// of them lets the forwarder fail over between the host's resolvers instead of pinning every
+/// lookup to the first.
+fn all_nameservers(text: &str) -> Vec<std::net::IpAddr> {
+    text.lines()
+        .filter_map(|line| {
+            let rest = line.trim().strip_prefix("nameserver")?;
+            // Require a whitespace separator so `nameserverfoo` is not treated as a match,
+            // then read the first token — like glibc, ignore any trailing junk on the line.
+            if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+                return None;
+            }
+            rest.split_whitespace().next()?.parse().ok()
+        })
+        .collect()
 }
 
-/// The host's first configured resolver (from /etc/resolv.conf), used as the
-/// gateway resolver's upstream so guest DNS honors host policy. Falls back to a
-/// public resolver when resolv.conf names none.
-fn host_upstream() -> SocketAddr {
-    if let Ok(text) = std::fs::read_to_string("/etc/resolv.conf")
-        && let Some(ip) = first_nameserver(&text)
-    {
-        return SocketAddr::new(ip, DNS_PORT);
+/// The first configured resolver — retained for the resolv.conf parsing tests; the switch
+/// itself forwards across all of them (see [`all_nameservers`]).
+#[cfg(test)]
+fn first_nameserver(text: &str) -> Option<std::net::IpAddr> {
+    all_nameservers(text).into_iter().next()
+}
+
+/// The `nameserver` entries of a resolv.conf file, or empty if it cannot be read.
+fn read_nameservers(path: &str) -> Vec<std::net::IpAddr> {
+    std::fs::read_to_string(path)
+        .map(|text| all_nameservers(&text))
+        .unwrap_or_default()
+}
+
+/// Pick the resolvers to forward guest DNS to. Normally the host's own (`/etc/resolv.conf`),
+/// but when every one of those is a loopback address — the systemd-resolved stub (127.0.0.53),
+/// or any other purely-local caching resolver — the real uplinks it forwards to instead:
+/// funnelling a whole VM fleet's DNS through one local caching stub makes every guest lookup
+/// wait on it, and a stub stall then reaches guests as SERVFAIL. Bypassing it drops a hop and
+/// yields more than one real resolver to rotate across.
+fn choose_upstreams(
+    etc: Vec<std::net::IpAddr>,
+    uplinks: Vec<std::net::IpAddr>,
+) -> Vec<std::net::IpAddr> {
+    if etc.iter().all(|ip| ip.is_loopback()) {
+        let real: Vec<_> = uplinks.into_iter().filter(|ip| !ip.is_loopback()).collect();
+        if !real.is_empty() {
+            return real;
+        }
     }
-    SocketAddr::new(FALLBACK_DNS.into(), DNS_PORT)
+    etc
+}
+
+/// The resolvers guest DNS is forwarded to (see [`choose_upstreams`]), as socket addresses.
+/// Falls back to a public resolver when nothing usable is configured.
+fn host_upstreams() -> Vec<SocketAddr> {
+    let servers = choose_upstreams(
+        read_nameservers("/etc/resolv.conf"),
+        read_nameservers("/run/systemd/resolve/resolv.conf"),
+    );
+    if servers.is_empty() {
+        return vec![SocketAddr::new(FALLBACK_DNS.into(), DNS_PORT)];
+    }
+    servers
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, DNS_PORT))
+        .collect()
 }
 
 /// Resolve a guest DNS query and send the response back to it: service names are
@@ -1498,7 +1552,7 @@ fn host_upstream() -> SocketAddr {
 async fn handle_dns(
     query: Vec<u8>,
     hosts: Arc<HashMap<String, Ipv4Addr>>,
-    upstream: SocketAddr,
+    upstreams: Arc<[SocketAddr]>,
     gateway: Ipv4Addr,
     client_ip: Ipv4Addr,
     client_port: u16,
@@ -1507,6 +1561,12 @@ async fn handle_dns(
     egress: Arc<EgressGuard>,
 ) {
     const TYPE_A: u16 = 1;
+    // The name the failure log attributes an upstream fault to: the primary resolver, even
+    // when the fault was met (and retried) across the others.
+    let primary = upstreams
+        .first()
+        .copied()
+        .unwrap_or_else(|| SocketAddr::new(FALLBACK_DNS.into(), DNS_PORT));
     let response = if let Some(r) = local_answer(&query, &hosts) {
         Some(r) // service name: on-subnet, not subject to egress pinning
     } else if let Some((name, qtype, qend)) = parse_question(&query) {
@@ -1516,10 +1576,10 @@ async fn handle_dns(
             // A PTR lookup resolves an IP to a name; it never opens a flow, so it
             // needn't be allowlisted. Forward it without pinning (its answer is a
             // name, not an A-record to admit for egress).
-            match forward_upstream(&query, upstream).await {
-                Ok(r) => Some(r),
+            match resolve_upstream(&query, &upstreams).await {
+                Ok(a) => Some(a.reply),
                 Err(e) => {
-                    egress.log_dns_upstream(upstream, &question(), &e);
+                    egress.log_dns_upstream(primary, &question(), &e);
                     Some(dns_servfail(&query, qend))
                 }
             }
@@ -1532,20 +1592,25 @@ async fn handle_dns(
             }
             // forward, then pin the A-records (scoped to this resolving guest) so its
             // connection is allowed — and only its, not another VM's with a different policy.
-            match forward_upstream(&query, upstream).await {
-                Ok(r) => {
-                    let (ips, ttl) = parse_a_records(&r);
+            match resolve_upstream(&query, &upstreams).await {
+                Ok(a) => {
+                    // A truncated answer is pinned from its TCP-recovered full record set; when
+                    // that recovery failed, pinning saw only the partial set, worth a log line.
+                    if let Some(e) = &a.degraded {
+                        egress.log_dns_upstream(primary, &question(), e);
+                    }
+                    let (ips, ttl) = parse_a_records(a.pin_source());
                     egress.record(client_ip, &ips, ttl);
                     // Audit: these IPs are now attributable to `name` for this VM, so a later
                     // connection from it is counted under the domains summary, not re-logged as
                     // a direct-IP contact.
                     egress.record_dns_ips(client_ip, &ips);
-                    Some(r)
+                    Some(a.reply)
                 }
                 // SERVFAIL rather than silence: the guest's resolver gives up on the lookup
                 // at once instead of sitting out its whole retry schedule for every name.
                 Err(e) => {
-                    egress.log_dns_upstream(upstream, &question(), &e);
+                    egress.log_dns_upstream(primary, &question(), &e);
                     Some(dns_servfail(&query, qend))
                 }
             }
@@ -1557,10 +1622,11 @@ async fn handle_dns(
     } else {
         // An unparsable question leaves nothing to echo back, so a failure can only be
         // dropped — but it is still logged.
-        forward_upstream(&query, upstream)
+        resolve_upstream(&query, &upstreams)
             .await
-            .inspect_err(|e| egress.log_dns_upstream(upstream, "an unparsable question", e))
+            .inspect_err(|e| egress.log_dns_upstream(primary, "an unparsable question", e))
             .ok()
+            .map(|a| a.reply)
     };
     if let Some(resp) = response
         && let Some(frame) = dns_frame(gateway, client_ip, client_port, client_mac, &resp)
@@ -1572,6 +1638,7 @@ async fn handle_dns(
 /// Why forwarding a query to the upstream resolver failed. The upstream is the host's
 /// own resolver, so every variant is a host-side fault the operator has to see — the
 /// guest only ever learns that the lookup failed.
+#[derive(Debug)]
 enum UpstreamError {
     /// Socket setup or I/O toward the upstream: bind, connect, send, or recv (which on
     /// a connected UDP socket reports the ICMP error a closed port answers with).
@@ -1611,12 +1678,154 @@ impl std::fmt::Display for UpstreamError {
     }
 }
 
-/// Forward a raw DNS query to the upstream resolver and return its raw response.
-async fn forward_upstream(query: &[u8], upstream: SocketAddr) -> Result<Vec<u8>, UpstreamError> {
-    forward_upstream_with(query, upstream, DNS_UPSTREAM_TIMEOUT).await
+/// An answer from the host's resolvers. `reply` is the datagram to send the guest — a
+/// UDP-sized answer, truncated (TC) when the full record set did not fit. `full` is that full
+/// set, recovered over TCP, present only when `reply` was truncated and the TCP retry
+/// succeeded: egress pinning reads its A-records so a connection to any returned IP is allowed
+/// even though the guest itself only receives `reply`. `degraded` carries the TCP fault when
+/// that retry failed, for the caller to log — pinning then saw only the truncated answer.
+#[derive(Debug)]
+struct UpstreamAnswer {
+    reply: Vec<u8>,
+    full: Option<Vec<u8>>,
+    degraded: Option<UpstreamError>,
 }
 
-/// [`forward_upstream`] with a configurable reply deadline for faster tests.
+impl UpstreamAnswer {
+    /// The bytes egress pinning reads A-records from: the full TCP answer when one was
+    /// recovered, otherwise the guest reply itself.
+    fn pin_source(&self) -> &[u8] {
+        self.full.as_deref().unwrap_or(&self.reply)
+    }
+}
+
+/// Resolve a guest query against the host's resolvers. A dropped UDP datagram
+/// must not reach the guest as SERVFAIL, so a lookup gets up to [`DNS_UPSTREAM_TRIES`] tries
+/// rotating across the configured nameservers — each early try bounded by
+/// [`DNS_UPSTREAM_PROBE_TIMEOUT`] for a quick failover, the last waiting out the rest of
+/// [`DNS_UPSTREAM_BUDGET`]. A truncated (TC) answer is re-asked over TCP so pinning sees the
+/// full A-set, while the guest still gets the UDP-sized reply. The last fault is returned only
+/// if every try failed.
+async fn resolve_upstream(
+    query: &[u8],
+    upstreams: &[SocketAddr],
+) -> Result<UpstreamAnswer, UpstreamError> {
+    resolve_upstream_with(
+        query,
+        upstreams,
+        DNS_UPSTREAM_TRIES,
+        DNS_UPSTREAM_PROBE_TIMEOUT,
+        DNS_UPSTREAM_BUDGET,
+    )
+    .await
+}
+
+/// [`resolve_upstream`] with the try count, probe deadline, and overall budget as parameters,
+/// for faster tests.
+async fn resolve_upstream_with(
+    query: &[u8],
+    upstreams: &[SocketAddr],
+    tries: usize,
+    probe_timeout: Duration,
+    budget: Duration,
+) -> Result<UpstreamAnswer, UpstreamError> {
+    let fallback = [SocketAddr::new(FALLBACK_DNS.into(), DNS_PORT)];
+    let servers: &[SocketAddr] = if upstreams.is_empty() {
+        &fallback
+    } else {
+        upstreams
+    };
+    let deadline = Instant::now() + budget;
+    let tries = tries.max(1);
+    let mut last = UpstreamError::Timeout(probe_timeout);
+    for attempt in 0..tries {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // Every try but the last gets the short probe, so a dropped datagram rotates to the
+        // next resolver fast; the last waits out the remaining budget, so a lone slow-but-alive
+        // resolver is not abandoned before it answers.
+        let this_timeout = if attempt + 1 == tries {
+            remaining
+        } else {
+            probe_timeout.min(remaining)
+        };
+        let upstream = servers[attempt % servers.len()];
+        match forward_upstream_with(query, upstream, this_timeout).await {
+            // Truncated: the answer did not fit a UDP datagram (a CDN name behind a long CNAME
+            // chain and many A records). DNS over TCP has no size limit, so the full record set
+            // — and thus the pin — is recovered, bounded by whatever budget is left. The guest
+            // still gets the truncated `reply`, which fits the buffer it asked over; a failed
+            // recovery is reported so the operator sees pinning ran on a partial answer.
+            Ok(reply) if is_truncated(&reply) => {
+                let tcp_budget = deadline.saturating_duration_since(Instant::now());
+                return Ok(
+                    match forward_upstream_tcp(query, upstream, tcp_budget).await {
+                        Ok(full) => UpstreamAnswer {
+                            reply,
+                            full: Some(full),
+                            degraded: None,
+                        },
+                        Err(e) => UpstreamAnswer {
+                            reply,
+                            full: None,
+                            degraded: Some(e),
+                        },
+                    },
+                );
+            }
+            Ok(reply) => {
+                return Ok(UpstreamAnswer {
+                    reply,
+                    full: None,
+                    degraded: None,
+                });
+            }
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// The DNS TC (truncation) flag of a response — set when the answer was too large for the UDP
+/// transport and the querier must retry over TCP. (Bit 1 of the flags byte after the id.)
+fn is_truncated(msg: &[u8]) -> bool {
+    msg.len() >= 3 && msg[2] & 0x02 != 0
+}
+
+/// Forward a query over DNS-over-TCP (RFC 1035 §4.2.2: the message framed by a 2-byte
+/// big-endian length prefix, both ways) and return the raw response — recovers a truncated
+/// UDP answer without a size limit.
+async fn forward_upstream_tcp(
+    query: &[u8],
+    upstream: SocketAddr,
+    timeout: Duration,
+) -> Result<Vec<u8>, UpstreamError> {
+    let len = u16::try_from(query.len()).map_err(|_| {
+        UpstreamError::Io(std::io::Error::other("query exceeds DNS-over-TCP length"))
+    })?;
+    let exchange = async {
+        let mut sock = TcpStream::connect(upstream).await?;
+        sock.write_all(&len.to_be_bytes()).await?;
+        sock.write_all(query).await?;
+        let mut lenbuf = [0u8; 2];
+        sock.read_exact(&mut lenbuf).await?;
+        let mut resp = vec![0u8; u16::from_be_bytes(lenbuf) as usize];
+        sock.read_exact(&mut resp).await?;
+        Ok::<Vec<u8>, std::io::Error>(resp)
+    };
+    let resp = tokio::time::timeout(timeout, exchange)
+        .await
+        .map_err(|_| UpstreamError::Timeout(timeout))??;
+    if resp.len() < 12 {
+        return Err(UpstreamError::Short(resp.len()));
+    }
+    Ok(resp)
+}
+
+/// Send a raw DNS query to a single upstream over UDP and return its raw response, with a
+/// configurable reply deadline.
 async fn forward_upstream_with(
     query: &[u8],
     upstream: SocketAddr,
@@ -2909,6 +3118,26 @@ mod tests {
     }
 
     #[test]
+    fn all_nameservers_collects_every_entry_in_order() {
+        use std::net::IpAddr;
+        let p = |s: &str| s.parse::<IpAddr>().unwrap();
+        // Every `nameserver` line, in file order, tab- or space-separated, other directives and
+        // inline comments skipped — the switch rotates across all of them, not just the first.
+        assert_eq!(
+            all_nameservers(
+                "search corp.example.com\nnameserver 1.1.1.1\nnameserver\t8.8.8.8\n  nameserver   9.9.9.9 # corp\n"
+            ),
+            vec![p("1.1.1.1"), p("8.8.8.8"), p("9.9.9.9")]
+        );
+        // A bare keyword and a glued token contribute nothing; empty input is empty.
+        assert_eq!(
+            all_nameservers("nameserver\nnameserverfoo 1.2.3.4\n"),
+            Vec::<IpAddr>::new()
+        );
+        assert_eq!(all_nameservers(""), Vec::<IpAddr>::new());
+    }
+
+    #[test]
     fn resolver_answers_service_a_records() {
         let mut hosts = HashMap::new();
         hosts.insert("redis.lan".to_string(), Ipv4Addr::new(192, 168, 127, 3));
@@ -3024,6 +3253,213 @@ mod tests {
             .expect_err("a truncated reply is rejected");
         assert!(matches!(err, UpstreamError::Short(4)), "{err}");
         assert_eq!(err.to_string(), "reply too short (4 bytes)");
+    }
+
+    #[tokio::test]
+    async fn resolve_upstream_retries_past_a_dropped_datagram() {
+        // A resolver that drops the first datagram and answers the second — the pattern a
+        // loaded resolver shows under a burst of parallel lookups (a yarn/npm fetch). One try
+        // would SERVFAIL; the retry must recover it.
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let _ = server.recv_from(&mut buf).await.unwrap(); // first datagram: dropped
+            let (n, from) = server.recv_from(&mut buf).await.unwrap(); // second: answered
+            let mut resp = buf[..n].to_vec();
+            resp[2] |= 0x80; // QR: mark as a response
+            server.send_to(&resp, from).await.unwrap();
+        });
+        let query = dns_question(1, "registry.yarnpkg.com", 1);
+        let resp = resolve_upstream_with(
+            &query,
+            &[addr],
+            3,
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("a retry recovers a single dropped datagram");
+        assert_eq!(resp.reply[0..2], query[0..2]); // same transaction id
+        assert_eq!(resp.reply[2] & 0x80, 0x80); // and it is a response
+    }
+
+    #[tokio::test]
+    async fn resolve_upstream_fails_over_to_a_healthy_resolver() {
+        // The first resolver is a black hole (bound, never answers); the second answers. The
+        // lookup must succeed by rotating onto the second within the try budget.
+        let dead = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap(); // held so the port stays bound (times out)
+        let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, from) = live.recv_from(&mut buf).await.unwrap();
+            let mut resp = buf[..n].to_vec();
+            resp[2] |= 0x80;
+            live.send_to(&resp, from).await.unwrap();
+        });
+        let query = dns_question(7, "example.com", 1);
+        let resp = resolve_upstream_with(
+            &query,
+            &[dead_addr, live_addr],
+            3,
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("failover reaches the healthy resolver");
+        assert_eq!(resp.reply[0..2], query[0..2]);
+        drop(dead);
+    }
+
+    #[tokio::test]
+    async fn resolve_upstream_gives_up_when_every_try_fails() {
+        // Two bound-but-silent resolvers: every try times out, so the lookup surfaces the last
+        // fault — the Err `handle_dns` turns into the guest's SERVFAIL.
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (aa, ba) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+        let query = dns_question(3, "nope.example", 1);
+        let err = resolve_upstream_with(
+            &query,
+            &[aa, ba],
+            3,
+            Duration::from_millis(60),
+            Duration::from_millis(200),
+        )
+        .await
+        .expect_err("every try times out");
+        assert!(matches!(err, UpstreamError::Timeout(_)), "{err}");
+        drop((a, b));
+    }
+
+    #[tokio::test]
+    async fn a_truncated_answer_is_recovered_over_tcp_while_the_guest_keeps_the_udp_reply() {
+        use tokio::net::TcpListener;
+        // One address answers UDP with a TC-truncated datagram and TCP with the full record set.
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = udp.local_addr().unwrap();
+        let tcp = TcpListener::bind(addr).await.unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, from) = udp.recv_from(&mut buf).await.unwrap();
+            let mut resp = buf[..n].to_vec();
+            resp[2] |= 0x80 | 0x02; // QR + TC: a truncated response
+            udp.send_to(&resp, from).await.unwrap();
+        });
+        tokio::spawn(async move {
+            let (mut sock, _) = tcp.accept().await.unwrap();
+            let mut lenbuf = [0u8; 2];
+            sock.read_exact(&mut lenbuf).await.unwrap();
+            let mut msg = vec![0u8; u16::from_be_bytes(lenbuf) as usize];
+            sock.read_exact(&mut msg).await.unwrap();
+            msg[2] |= 0x80; // QR, and not truncated
+            msg.push(0xAB); // a sentinel byte marking this as the full-record TCP body
+            sock.write_all(&(msg.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            sock.write_all(&msg).await.unwrap();
+        });
+        let query = dns_question(4, "cdn.example", 1);
+        let answer = resolve_upstream_with(
+            &query,
+            &[addr],
+            3,
+            Duration::from_millis(500),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the truncated answer resolves");
+        // The guest keeps the UDP-sized (still TC-marked) reply, not the oversized TCP body.
+        assert_eq!(answer.reply[0..2], query[0..2]);
+        assert_eq!(answer.reply[2] & 0x02, 0x02);
+        // Pinning, though, reads the full TCP record set.
+        let full = answer.full.as_deref().expect("TCP recovered the full set");
+        assert_eq!(full[2] & 0x02, 0, "the TCP answer is not truncated");
+        assert_eq!(*full.last().unwrap(), 0xAB);
+        assert_eq!(answer.pin_source(), full);
+        assert!(answer.degraded.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_truncated_answer_with_no_tcp_falls_back_to_the_udp_reply() {
+        // UDP truncates; nothing answers TCP on that port, so the guest still gets the truncated
+        // reply, pinning runs on it, and the TCP fault is recorded for the operator.
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = udp.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, from) = udp.recv_from(&mut buf).await.unwrap();
+            let mut resp = buf[..n].to_vec();
+            resp[2] |= 0x80 | 0x02;
+            udp.send_to(&resp, from).await.unwrap();
+        });
+        let query = dns_question(5, "cdn.example", 1);
+        let answer = resolve_upstream_with(
+            &query,
+            &[addr],
+            3,
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("a truncated answer still resolves for the guest");
+        assert_eq!(answer.reply[2] & 0x02, 0x02);
+        assert!(answer.full.is_none());
+        assert!(
+            answer.degraded.is_some(),
+            "the failed TCP recovery is recorded"
+        );
+        assert_eq!(answer.pin_source(), answer.reply.as_slice());
+    }
+
+    #[tokio::test]
+    async fn forward_upstream_tcp_round_trips_a_length_prefixed_message() {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut lenbuf = [0u8; 2];
+            sock.read_exact(&mut lenbuf).await.unwrap();
+            let mut msg = vec![0u8; u16::from_be_bytes(lenbuf) as usize];
+            sock.read_exact(&mut msg).await.unwrap();
+            msg[2] |= 0x80; // QR
+            sock.write_all(&(msg.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            sock.write_all(&msg).await.unwrap();
+        });
+        let query = dns_question(9, "files.pythonhosted.org", 1);
+        let resp = forward_upstream_tcp(&query, addr, Duration::from_secs(1))
+            .await
+            .expect("tcp exchange returns the framed response");
+        assert_eq!(resp[0..2], query[0..2]);
+        assert_eq!(resp[2] & 0x80, 0x80);
+    }
+
+    #[test]
+    fn truncation_flag_is_read_from_the_header() {
+        let mut msg = dns_question(1, "x.example", 1);
+        assert!(!is_truncated(&msg));
+        msg[2] |= 0x02; // TC
+        assert!(is_truncated(&msg));
+        assert!(!is_truncated(&[0u8; 2])); // too short to carry a flags byte
+    }
+
+    #[test]
+    fn upstreams_bypass_the_local_resolver_stub() {
+        let stub: std::net::IpAddr = "127.0.0.53".parse().unwrap();
+        let a: std::net::IpAddr = "10.10.1.218".parse().unwrap();
+        let b: std::net::IpAddr = "10.10.1.219".parse().unwrap();
+        // Only the systemd-resolved stub in resolv.conf -> use the real uplinks it forwards to.
+        assert_eq!(choose_upstreams(vec![stub], vec![a, b]), vec![a, b]);
+        // Real resolvers already in resolv.conf -> keep them, ignore the uplink file.
+        assert_eq!(choose_upstreams(vec![a], vec![b]), vec![a]);
+        // The stub, but no usable uplinks -> keep what we have rather than nothing.
+        assert_eq!(choose_upstreams(vec![stub], vec![]), vec![stub]);
+        assert_eq!(choose_upstreams(vec![stub], vec![stub]), vec![stub]);
     }
 
     #[test]

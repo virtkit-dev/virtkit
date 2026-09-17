@@ -11,6 +11,13 @@ All notable changes to virtkit will be documented in this file.
 - **An admin can now delete a tag from a `vk-registry` repository's browse page.** Deleting
   a tag removes it from the repository; the disk it used is freed later by `vk-registry gc`.
 
+### Fixed
+
+- **A guest's DNS lookups no longer fail when the host's resolver is slow or overloaded.**
+  A dropped or delayed reply used to surface inside the guest as a failed lookup — enough to
+  break a CI job that resolves many names at once, such as a `yarn` or `npm` install. Lookups
+  are now retried and spread across every resolver the host has.
+
 ## [0.72.0] - 2026-09-15
 
 ### Added
