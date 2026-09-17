@@ -629,9 +629,10 @@ async fn run(cli: Cli) -> Result<()> {
         // Both resolve their store through `store_root`, which is where the order is: it
         // reaches the one the server uses, and it is `accounts`' order too, so an operator
         // who exported a `VK_REGISTRY_*` once does not have to know which subcommand this is.
-        Cmd::Status { root, config } => {
-            vk_registry::status(store_root(root, config, |name| std::env::var_os(name))?)
-        }
+        Cmd::Status { root, config } => vk_registry::status(
+            "vk-registry",
+            store_root(root, config, |name| std::env::var_os(name))?,
+        ),
         Cmd::Gc {
             root,
             config,
@@ -645,7 +646,13 @@ async fn run(cli: Cli) -> Result<()> {
             // result line names it too, but by then the blobs are gone, and the store can
             // now come from a variable the operator did not type on this command.
             eprintln!("vk-registry gc: on the store at {}", root.display());
-            vk_registry::gc(root, days(retention_days), days(grace_days), dry_run)
+            vk_registry::gc(
+                "vk-registry",
+                root,
+                days(retention_days),
+                days(grace_days),
+                dry_run,
+            )
         }
         // handled in `main`, before this dispatch
         Cmd::Update { .. } => unreachable!("update is handled in main"),

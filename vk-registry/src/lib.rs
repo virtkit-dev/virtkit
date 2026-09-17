@@ -3186,19 +3186,47 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `vk registry gc` — collect `root` and print a one-line summary; see
-/// [`Store::gc`] for the retention model.
-pub fn gc(root: PathBuf, retention: Duration, grace: Duration, dry_run: bool) -> Result<()> {
+/// `vk registry gc` / `vk-registry gc` — collect `root` and print a one-line summary;
+/// see [`Store::gc`] for the retention model. `cmd` is the command the caller was
+/// invoked as, so the log lines name the binary the operator actually typed.
+pub fn gc(
+    cmd: &str,
+    root: PathBuf,
+    retention: Duration,
+    grace: Duration,
+    dry_run: bool,
+) -> Result<()> {
+    gc_to(
+        &mut std::io::stdout().lock(),
+        cmd,
+        root,
+        retention,
+        grace,
+        dry_run,
+    )
+}
+
+/// [`gc`] writing its summary to `out` rather than stdout, so a test can read it back.
+fn gc_to(
+    out: &mut impl std::io::Write,
+    cmd: &str,
+    root: PathBuf,
+    retention: Duration,
+    grace: Duration,
+    dry_run: bool,
+) -> Result<()> {
     let Some(store) = Store::open(&root)? else {
-        println!(
-            "vk registry: gc {}: no store here, nothing to collect",
+        writeln!(
+            out,
+            "{cmd}: gc {}: no store here, nothing to collect",
             root.display()
-        );
+        )?;
         return Ok(());
     };
     let r = store.gc(retention, grace, dry_run)?;
-    println!(
-        "vk registry: gc {}: {} {} tag(s), {} manifest(s), {} blob(s) ({:.1} MiB), \
+    writeln!(
+        out,
+        "{cmd}: gc {}: {} {} tag(s), {} manifest(s), {} blob(s) ({:.1} MiB), \
          {} upload(s), {} membership record(s)",
         store.root.display(),
         if dry_run { "would drop" } else { "dropped" },
@@ -3208,73 +3236,99 @@ pub fn gc(root: PathBuf, retention: Duration, grace: Duration, dry_run: bool) ->
         r.bytes_freed as f64 / f64::from(1u32 << 20),
         r.uploads_dropped,
         r.blob_markers_dropped,
-    );
+    )?;
     Ok(())
 }
 
-/// `vk registry status` — print a read-only usage + content report for the store at
-/// `root`: stored bytes, tag references, and a per-repository breakdown; see
-/// [`Store::stats`].
-pub fn status(root: PathBuf) -> Result<()> {
+/// `vk registry status` / `vk-registry status` — print a read-only usage + content
+/// report for the store at `root`: stored bytes, tag references, and a per-repository
+/// breakdown; see [`Store::stats`]. `cmd` is the command the caller was invoked as, so
+/// the report names the binary the operator actually typed.
+pub fn status(cmd: &str, root: PathBuf) -> Result<()> {
+    status_to(&mut std::io::stdout().lock(), cmd, root)
+}
+
+/// [`status`] writing its report to `out` rather than stdout, so a test can read it back.
+fn status_to(out: &mut impl std::io::Write, cmd: &str, root: PathBuf) -> Result<()> {
     let Some(store) = Store::open(&root)? else {
         // Not an error: a host that has cached nothing has an empty store by definition,
         // and `--root` pointed at the wrong place reads as this too — which is why the
         // path is named rather than the counts printed as zeroes.
-        println!("vk registry: {} — no store here", root.display());
+        writeln!(out, "{cmd}: {} — no store here", root.display())?;
         return Ok(());
     };
     let s = store.stats()?;
     let blobs = s.identity_blobs + s.zstd_blobs;
     let blob_bytes = s.identity_bytes + s.zstd_bytes;
-    println!("vk registry: {}", store.root.display());
-    println!(
+    writeln!(out, "{cmd}: {}", store.root.display())?;
+    writeln!(
+        out,
         "  Stored blobs:       {} ({} files)",
         human_bytes(blob_bytes),
         blobs,
-    );
-    println!("  Referenced by tags: {}", human_bytes(s.referenced_ondisk));
+    )?;
+    writeln!(
+        out,
+        "  Referenced by tags: {}",
+        human_bytes(s.referenced_ondisk)
+    )?;
     let unreferenced = blob_bytes.saturating_sub(s.referenced_ondisk);
-    println!("  No tag references:  {}", human_bytes(unreferenced));
+    writeln!(out, "  No tag references:  {}", human_bytes(unreferenced))?;
     if s.completed_stages > 0 {
         if s.sized_stages == s.completed_stages {
-            println!(
+            writeln!(
+                out,
                 "  Stage data:         {} uncompressed ({} recorded stage snapshots)",
                 human_bytes(s.stage_data_bytes),
                 s.completed_stages,
-            );
-            println!(
+            )?;
+            writeln!(
+                out,
                 "                      Shared data counts per stage; empty disk regions are excluded."
-            );
+            )?;
         } else {
-            println!("  Stage data:         unavailable (some stage manifests could not be sized)");
+            writeln!(
+                out,
+                "  Stage data:         unavailable (some stage manifests could not be sized)"
+            )?;
         }
     } else if s
         .repos
         .iter()
         .any(|r| r.name.rsplit('/').next() == Some(BUILD_CACHE_REPO) && r.tags > 0)
     {
-        println!("  Stage data:         unknown (no completed stages recorded yet)");
+        writeln!(
+            out,
+            "  Stage data:         unknown (no completed stages recorded yet)"
+        )?;
     }
     if s.uploads > 0 {
-        println!(
+        writeln!(
+            out,
             "  Uploads in progress: {} ({} files, separate from stored blobs)",
             human_bytes(s.upload_bytes),
             s.uploads,
-        );
+        )?;
     }
     if !s.repos.is_empty() {
-        println!();
-        println!("  {:<40} {:>5}", "REPOSITORY", "TAGS");
+        writeln!(out)?;
+        writeln!(out, "  {:<40} {:>5}", "REPOSITORY", "TAGS")?;
         for r in &s.repos {
-            println!("  {:<40} {:>5}", r.name, r.tags);
+            writeln!(out, "  {:<40} {:>5}", r.name, r.tags)?;
         }
     } else {
-        println!("  No repositories.");
+        writeln!(out, "  No repositories.")?;
     }
     if unreferenced > 0 {
-        println!();
-        println!("  Blobs without tag references may still be protected by GC's grace period.");
-        println!("  Preview cleanup with `vk registry gc --dry-run` (use the same store root).");
+        writeln!(out)?;
+        writeln!(
+            out,
+            "  Blobs without tag references may still be protected by GC's grace period."
+        )?;
+        writeln!(
+            out,
+            "  Preview cleanup with `{cmd} gc --dry-run` (use the same store root)."
+        )?;
     }
     Ok(())
 }
@@ -3779,16 +3833,16 @@ mod tests {
         let zero = Duration::from_secs(0);
 
         assert!(Store::open(&dir).unwrap().is_none());
-        status(dir.clone()).unwrap();
-        gc(dir.clone(), zero, zero, false).unwrap();
+        status("vk-registry", dir.clone()).unwrap();
+        gc("vk-registry", dir.clone(), zero, zero, false).unwrap();
         assert!(!dir.exists(), "{} was created by reading it", dir.display());
 
         // Someone else's directory, named by a mistyped root: reported as no store, and
         // left exactly as empty as it was.
         std::fs::create_dir_all(&dir).unwrap();
         assert!(Store::open(&dir).unwrap().is_none());
-        status(dir.clone()).unwrap();
-        gc(dir.clone(), zero, zero, false).unwrap();
+        status("vk-registry", dir.clone()).unwrap();
+        gc("vk-registry", dir.clone(), zero, zero, false).unwrap();
         assert_eq!(
             std::fs::read_dir(&dir).unwrap().count(),
             0,
@@ -3808,15 +3862,53 @@ mod tests {
         // as "no store here" is the silence this distinction exists to remove.
         std::fs::write(dir.join("a-file"), b"").unwrap();
         assert!(Store::open(&dir.join("a-file")).is_err());
-        assert!(status(dir.join("a-file")).is_err());
+        assert!(status("vk-registry", dir.join("a-file")).is_err());
         std::fs::remove_file(dir.join("a-file")).unwrap();
 
         // A store that is there is opened as usual — the report is skipped for absence,
         // not for being empty.
         let store = Store::new(dir.clone()).unwrap();
         assert!(Store::open(&store.root).unwrap().is_some());
-        status(dir.clone()).unwrap();
-        gc(dir.clone(), zero, zero, true).unwrap();
+        status("vk-registry", dir.clone()).unwrap();
+        gc("vk-registry", dir.clone(), zero, zero, true).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every command-named line in `status`/`gc` output — the prefixes and the cleanup
+    /// hint — carries the command the binary was invoked as, so the standalone binary never
+    /// points an operator at a `vk registry` command it does not provide.
+    #[test]
+    fn status_and_gc_name_the_invoking_command() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-cmdname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // An orphan blob (no tag references it) so `status` reaches the cleanup-hint line.
+        let store = Store::new(dir.clone()).unwrap();
+        store.put_blob(b"a blob no tag references").unwrap();
+        let zero = Duration::from_secs(0);
+
+        let render = |cmd: &str| {
+            let mut s = Vec::new();
+            status_to(&mut s, cmd, dir.clone()).unwrap();
+            let mut g = Vec::new();
+            gc_to(&mut g, cmd, dir.clone(), zero, zero, true).unwrap();
+            (String::from_utf8(s).unwrap(), String::from_utf8(g).unwrap())
+        };
+
+        // The standalone binary names itself, in the report prefix, the gc summary, and the
+        // cleanup hint — and never the driver's `vk registry` spelling.
+        let (s, g) = render("vk-registry");
+        assert!(s.starts_with("vk-registry:"), "{s}");
+        assert!(s.contains("`vk-registry gc --dry-run`"), "{s}");
+        assert!(!s.contains("vk registry gc"), "{s}");
+        assert!(g.starts_with("vk-registry: gc "), "{g}");
+
+        // The driver's spelling is carried through unchanged.
+        let (s, g) = render("vk registry");
+        assert!(s.starts_with("vk registry:"), "{s}");
+        assert!(s.contains("`vk registry gc --dry-run`"), "{s}");
+        assert!(g.starts_with("vk registry: gc "), "{g}");
+
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

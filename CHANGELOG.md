@@ -17,6 +17,9 @@ All notable changes to virtkit will be documented in this file.
   A dropped or delayed reply used to surface inside the guest as a failed lookup — enough to
   break a CI job that resolves many names at once, such as a `yarn` or `npm` install. Lookups
   are now retried and spread across every resolver the host has.
+- **`vk-registry status` and `vk-registry gc` now name the `vk-registry` command in their
+  output.** The standalone binary previously printed a cleanup hint for a `vk registry`
+  command it does not provide.
 
 ## [0.72.0] - 2026-09-15
 

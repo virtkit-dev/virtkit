@@ -3744,7 +3744,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                     Ok(r) => r,
                     Err(e) => return fail(&e, 2),
                 };
-                match vk_registry::status(root) {
+                match vk_registry::status("vk registry", root) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => fail(&e, 1),
                 }
@@ -3760,7 +3760,13 @@ async fn cli_main(cli: Cli) -> ExitCode {
                     Err(e) => return fail(&e, 2),
                 };
                 let days = |d: u64| std::time::Duration::from_secs(d * 86_400);
-                match vk_registry::gc(root, days(*retention_days), days(*grace_days), *dry_run) {
+                match vk_registry::gc(
+                    "vk registry",
+                    root,
+                    days(*retention_days),
+                    days(*grace_days),
+                    *dry_run,
+                ) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => fail(&e, 1),
                 }
