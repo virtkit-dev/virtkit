@@ -195,8 +195,12 @@ fn tag_list(
     // tags can carry.
     let shown = tags.get(..MAX_ROWS).unwrap_or(&tags);
     let kinds = shown.iter().any(|t| tag_kind(t).is_some());
+    // Each shown tag's own on-disk size, and the repository total (blobs shared between
+    // tags counted once) for the summary line. Read without bumping any tag's mtime, so
+    // opening this page never renews the gc retention a resolve would.
+    let (sizes, total) = store.repo_size_report(name, shown);
     let mut rows = String::new();
-    for t in shown {
+    for (i, t) in shown.iter().enumerate() {
         let kind = match tag_kind(t) {
             // A static label, so no escaping is owed — but it goes through the same
             // helper as everything else here rather than resting on that.
@@ -204,13 +208,21 @@ fn tag_list(
             None if kinds => "<td></td>".to_string(),
             None => String::new(),
         };
+        // A tag whose manifest is not readable (removed mid-gc, or corrupt) is an em dash,
+        // not `0 B` — that is a real and different answer.
+        let size = match sizes.get(i).copied().flatten() {
+            Some(n) => human_bytes(n),
+            None => "&mdash;".to_string(),
+        };
         rows.push_str(&format!(
-            "<tr><td><a href=\"/browse/{name}/manifests/{tag}\">{tag}</a></td>{kind}</tr>\n",
+            "<tr><td><a href=\"/browse/{name}/manifests/{tag}\">{tag}</a></td>\
+             {kind}<td>{size}</td></tr>\n",
             name = html_escape(name),
             tag = html_escape(t),
         ));
     }
-    let columns = 1 + kinds as usize;
+    // Tag, [Kind,] Size.
+    let columns = 2 + kinds as usize;
     if rows.is_empty() {
         rows = format!("<tr><td colspan=\"{columns}\"><em>no tags</em></td></tr>\n");
     }
@@ -220,11 +232,11 @@ fn tag_list(
             tags.len() - MAX_ROWS
         ));
     }
-    let header = if kinds {
-        "<th>Tag</th><th>Kind</th>"
-    } else {
-        "<th>Tag</th>"
-    };
+    let mut header = String::from("<th>Tag</th>");
+    if kinds {
+        header.push_str("<th>Kind</th>");
+    }
+    header.push_str("<th>Size</th>");
     // What an admin wrote about this repository, if anyone has. Not worth failing the
     // page over: a caption is the one thing on it that is nobody's data.
     let stored = match db.repo_caption(name) {
@@ -271,6 +283,16 @@ fn tag_list(
         }
         _ => String::new(),
     };
+    // The on-disk total: deduped, so shared blobs are counted once — it does not equal the
+    // sum of the per-tag column. Both the size and the count are over the shown rows, which
+    // are the whole repository unless the "more not shown" note above says otherwise, so the
+    // two never disagree.
+    let summary = format!(
+        "<p>{size} on disk across {count} tag{plural}.</p>\n",
+        size = human_bytes(total),
+        count = shown.len(),
+        plural = if shown.len() == 1 { "" } else { "s" },
+    );
     Ok(respond(
         StatusCode::OK,
         &page(
@@ -279,7 +301,7 @@ fn tag_list(
             csrf,
             &format!(
                 "<p><a href=\"/browse\">&larr; repositories</a></p>\n\
-             <h1>{name}</h1>\n{caption}{edit}\
+             <h1>{name}</h1>\n{caption}{summary}{edit}\
              <table><tr>{header}</tr>\n{rows}</table>",
                 name = html_escape(name)
             ),
@@ -865,7 +887,8 @@ mod tests {
             body_text(page_at(&store, "/browse/team-a/plain", &session("A"), Some("t")).unwrap())
                 .await;
         assert!(!plain.contains("Kind"), "{plain}");
-        assert!(plain.contains("v1.2</a></td></tr>"), "{plain}");
+        // No Kind column: the size cell follows the tag link directly, with nothing between.
+        assert!(plain.contains("v1.2</a></td><td>2 B</td></tr>"), "{plain}");
 
         // nor does an empty repository, which has nothing to describe — and it is the
         // rendered listing saying so, not a page that never came back
@@ -1103,6 +1126,56 @@ mod tests {
         // only be refused, the rule the sign-out control already follows
         let unarmed = page(&admin_p, None).await;
         assert!(!unarmed.contains("/settings/captions"), "{unarmed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repository's page reports on-disk bytes: a per-tag `Size` column and a deduped
+    /// repository total. The figure is the real stored size of the manifest blob plus the
+    /// config/layer blobs it references.
+    #[tokio::test]
+    async fn on_disk_sizes_render_on_the_tag_page() {
+        let (dir, store) = store_in("sizes");
+        let cfg = store.put_blob(b"a small config blob").unwrap();
+        let manifest = serde_json::json!({
+            "mediaType": MANIFEST_TYPE,
+            "config": {"digest": cfg, "size": 19,
+                       "mediaType": "application/vnd.oci.image.config.v1+json"},
+            "layers": []
+        });
+        let mbytes = serde_json::to_vec(&manifest).unwrap();
+        store
+            .put_manifest("team-a/app", "v1", MANIFEST_TYPE, &mbytes)
+            .unwrap();
+        // Both blobs are stored uncompressed (tiny), so the on-disk total is exactly the
+        // manifest bytes plus the 19-byte config, deduped to one tag.
+        let expected = mbytes.len() as u64 + 19;
+
+        let tags =
+            body_text(page_at(&store, "/browse/team-a/app", &session("A"), Some("t")).unwrap())
+                .await;
+        assert!(tags.contains("<th>Size</th>"), "{tags}");
+        assert!(tags.contains(&format!("<td>{expected} B</td>")), "{tags}");
+        assert!(
+            tags.contains(&format!("{expected} B on disk across 1 tag.")),
+            "{tags}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tag whose manifest cannot be read is an em dash in the size column, not `0 B` — a
+    /// pushed manifest body that is not valid JSON references no blobs, so its own bytes are
+    /// still counted, but a tag pointing at a digest with no blob at all resolves to nothing.
+    #[tokio::test]
+    async fn an_unresolvable_tag_sizes_as_a_dash() {
+        let (dir, store) = store_in("dash");
+        // a tag pointing at a manifest digest this store does not hold
+        let planted = dir.join("repos/team-a/app/tags");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::write(planted.join("v1"), format!("sha256:{}", "a".repeat(64))).unwrap();
+        let tags =
+            body_text(page_at(&store, "/browse/team-a/app", &session("A"), Some("t")).unwrap())
+                .await;
+        assert!(tags.contains("v1</a></td><td>&mdash;</td>"), "{tags}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

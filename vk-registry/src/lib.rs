@@ -805,6 +805,72 @@ impl Store {
             .collect()
     }
 
+    /// The distinct blobs a manifest occupies on disk — the manifest blob itself and each
+    /// config/layer it references — as `(hex, on-disk bytes)`, deduped within the one
+    /// manifest and sized in whichever storage form is present. `None` if the manifest blob
+    /// is gone. Lock-free best-effort, like the rest of the `/browse` reads: a blob a
+    /// concurrent gc removes mid-walk is sized 0 rather than failing the page, and an image
+    /// index (no config/layers) accounts only for its own bytes — the same reference set
+    /// [`Store::stats`] sizes.
+    fn manifest_ondisk_blobs(&self, hex: &str) -> Option<Vec<(String, u64)>> {
+        let (mpath, _) = self.find_blob(hex)?;
+        let mut out = vec![(
+            hex.to_string(),
+            std::fs::metadata(&mpath).map(|m| m.len()).unwrap_or(0),
+        )];
+        let mut seen: HashSet<String> = HashSet::from([hex.to_string()]);
+        // The raw manifest bytes parse as JSON because a manifest is always stored
+        // uncompressed (`put_manifest` writes it straight to `blob_path`, never the zstd
+        // pool); an unparseable body references no further blobs.
+        if let Ok(bytes) = std::fs::read(&mpath) {
+            for (dhex, _) in manifest_blob_sizes(&bytes) {
+                if !seen.insert(dhex.clone()) {
+                    continue;
+                }
+                let size = self
+                    .find_blob(&dhex)
+                    .map(|(p, _)| std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0))
+                    .unwrap_or(0);
+                out.push((dhex, size));
+            }
+        }
+        Some(out)
+    }
+
+    /// Per-tag and whole-repository on-disk sizes for `tags` (which the caller has already
+    /// listed): the returned vector is each tag's own on-disk footprint — its manifest and
+    /// the blobs it references, deduped within that tag — aligned to `tags` and `None` for a
+    /// tag that does not resolve; the `u64` is the repository total, blobs shared between
+    /// tags counted once. Lock-free best-effort, and it reads tag files *without* bumping
+    /// their mtime — the "last used" record [`Store::gc`] keys tag retention on, which a
+    /// listing must not renew (a resolve through [`Store::get_manifest`] would).
+    pub(crate) fn repo_size_report(&self, name: &str, tags: &[String]) -> (Vec<Option<u64>>, u64) {
+        if !valid_name(name) {
+            return (vec![None; tags.len()], 0);
+        }
+        let mut total_seen: HashSet<String> = HashSet::new();
+        let mut total = 0u64;
+        let per = tags
+            .iter()
+            .map(|tag| {
+                let digest = std::fs::read_to_string(self.tag_path(name, tag)).ok()?;
+                let hex = digest.trim().trim_start_matches("sha256:");
+                if !is_blob_hex(hex) {
+                    return None;
+                }
+                let mut per_tag = 0u64;
+                for (h, size) in self.manifest_ondisk_blobs(hex)? {
+                    per_tag += size;
+                    if total_seen.insert(h) {
+                        total += size;
+                    }
+                }
+                Some(per_tag)
+            })
+            .collect();
+        (per, total)
+    }
+
     /// Take the store lock shared — held by every writer/reader across its whole
     /// check→reference window (a local push: first `has_blob` through
     /// `put_manifest`), so a `vk registry gc` holding it *exclusive* can never
@@ -5490,6 +5556,80 @@ mod tests {
             vec![("aa".into(), 10), ("bb".into(), 20), ("cc".into(), 30),]
         );
         assert!(manifest_blob_sizes(b"not json").is_empty());
+    }
+
+    /// The repository total dedups a blob shared between two tags, while each per-tag figure
+    /// counts that tag's whole footprint — so the per-tag figures overcount the total by
+    /// exactly the shared blob, and the total is every distinct blob once.
+    #[test]
+    fn repo_size_report_dedups_shared_blobs_across_tags() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-dedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        // Tiny, so every blob is stored uncompressed and its on-disk size is its byte length.
+        let shared = b"the layer both tags reference".as_slice();
+        let (cfg_a, cfg_b) = (b"config a".as_slice(), b"config bee is longer".as_slice());
+        let dshared = store.put_blob(shared).unwrap();
+        let (dca, dcb) = (
+            store.put_blob(cfg_a).unwrap(),
+            store.put_blob(cfg_b).unwrap(),
+        );
+        let manifest = |cfg: &str, cfg_len: usize| {
+            serde_json::to_vec(&serde_json::json!({
+                "mediaType": DEFAULT_MANIFEST_TYPE,
+                "config": {"digest": cfg, "size": cfg_len},
+                "layers": [{"digest": dshared, "size": shared.len()}],
+            }))
+            .unwrap()
+        };
+        let (ma, mb) = (manifest(&dca, cfg_a.len()), manifest(&dcb, cfg_b.len()));
+        store
+            .put_manifest("repo", "a", DEFAULT_MANIFEST_TYPE, &ma)
+            .unwrap();
+        store
+            .put_manifest("repo", "b", DEFAULT_MANIFEST_TYPE, &mb)
+            .unwrap();
+
+        let (per, total) = store.repo_size_report("repo", &["a".into(), "b".into()]);
+        let (pa, pb) = (per[0].unwrap(), per[1].unwrap());
+        assert_eq!(pa, (ma.len() + cfg_a.len() + shared.len()) as u64);
+        assert_eq!(pb, (mb.len() + cfg_b.len() + shared.len()) as u64);
+        // Distinct blobs once: both manifests, both configs, the shared layer a single time.
+        let distinct = ma.len() + mb.len() + cfg_a.len() + cfg_b.len() + shared.len();
+        assert_eq!(total, distinct as u64);
+        // The per-tag figures overcount the total by exactly the once-shared layer.
+        assert_eq!(pa + pb - total, shared.len() as u64);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sizing a repository must not renew gc retention: `repo_size_report` reads the tag
+    /// files without bumping their mtime, unlike a resolve through `get_manifest`.
+    #[test]
+    fn repo_size_report_does_not_bump_tag_mtime() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-mtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        store
+            .put_manifest("repo", "v1", DEFAULT_MANIFEST_TYPE, b"{}")
+            .unwrap();
+
+        let tag = store.tag_path("repo", "v1");
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::open(&tag)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        store.repo_size_report("repo", &["v1".into()]);
+        assert_eq!(std::fs::metadata(&tag).unwrap().modified().unwrap(), old);
+
+        // A resolve, by contrast, does touch it — so the report above genuinely differs.
+        store.get_manifest("repo", "v1").unwrap();
+        assert!(std::fs::metadata(&tag).unwrap().modified().unwrap() > old);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// stats() over a store with one repo and one manifest reachable from two tags: the
