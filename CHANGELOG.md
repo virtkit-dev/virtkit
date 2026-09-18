@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Guests can again resolve names that only the host's VPN or Tailscale resolver knows.**
+  Lookups now query the host's resolver first, with its public resolvers as fallbacks.
+  Bypassing the host's resolver had caused VPN- or Tailscale-only names to return not found.
+
 ## [0.73.0] - 2026-09-17
 
 ### Added

@@ -1511,23 +1511,27 @@ fn read_nameservers(path: &str) -> Vec<std::net::IpAddr> {
         .unwrap_or_default()
 }
 
-/// Pick the resolvers to forward guest DNS to. Normally the host's own (`/etc/resolv.conf`),
-/// but when every one of those is a loopback address — the systemd-resolved stub (127.0.0.53),
-/// or any other purely-local caching resolver — the real uplinks it forwards to instead:
-/// funnelling a whole VM fleet's DNS through one local caching stub makes every guest lookup
-/// wait on it, and a stub stall then reaches guests as SERVFAIL. Bypassing it drops a hop and
-/// yields more than one real resolver to rotate across.
+/// Pick the resolvers to forward guest DNS to: the host's own (`/etc/resolv.conf`), followed
+/// by the real uplinks behind a local resolver stub such as systemd-resolved (127.0.0.53) as
+/// trailing fallbacks. The stub stays first because it is the only resolver that knows the
+/// host's split-DNS routing: a VPN's `corp.example` or Tailscale's MagicDNS domain is served by
+/// per-link resolvers that never appear in the stub's default uplink list, so asking those
+/// uplinks directly answers NXDOMAIN for every such name. Querying the stub first concentrates
+/// guest DNS load there to preserve split-DNS routing. If the stub stalls, uplinks provide
+/// best-effort fallback for public names but cannot resolve split-DNS names they do not know.
 fn choose_upstreams(
     etc: Vec<std::net::IpAddr>,
     uplinks: Vec<std::net::IpAddr>,
 ) -> Vec<std::net::IpAddr> {
-    if etc.iter().all(|ip| ip.is_loopback()) {
-        let real: Vec<_> = uplinks.into_iter().filter(|ip| !ip.is_loopback()).collect();
-        if !real.is_empty() {
-            return real;
+    let mut servers = etc;
+    if servers.iter().all(|ip| ip.is_loopback()) {
+        for ip in uplinks {
+            if !ip.is_loopback() && !servers.contains(&ip) {
+                servers.push(ip);
+            }
         }
     }
-    etc
+    servers
 }
 
 /// The resolvers guest DNS is forwarded to (see [`choose_upstreams`]), as socket addresses.
@@ -3449,17 +3453,26 @@ mod tests {
     }
 
     #[test]
-    fn upstreams_bypass_the_local_resolver_stub() {
+    fn upstreams_keep_the_local_resolver_stub_first_and_its_uplinks_as_fallbacks() {
         let stub: std::net::IpAddr = "127.0.0.53".parse().unwrap();
         let a: std::net::IpAddr = "10.10.1.218".parse().unwrap();
         let b: std::net::IpAddr = "10.10.1.219".parse().unwrap();
-        // Only the systemd-resolved stub in resolv.conf -> use the real uplinks it forwards to.
-        assert_eq!(choose_upstreams(vec![stub], vec![a, b]), vec![a, b]);
+        // Keep the systemd-resolved stub first for split-DNS routing, then its uplinks.
+        assert_eq!(choose_upstreams(vec![stub], vec![a, b]), vec![stub, a, b]);
         // Real resolvers already in resolv.conf -> keep them, ignore the uplink file.
         assert_eq!(choose_upstreams(vec![a], vec![b]), vec![a]);
-        // The stub, but no usable uplinks -> keep what we have rather than nothing.
+        // Empty resolv.conf -> fall back to the uplinks.
+        assert_eq!(choose_upstreams(vec![], vec![a, b]), vec![a, b]);
+        // The stub, but no usable uplinks -> just the stub.
         assert_eq!(choose_upstreams(vec![stub], vec![]), vec![stub]);
         assert_eq!(choose_upstreams(vec![stub], vec![stub]), vec![stub]);
+        // The host already lists a real resolver alongside the stub -> keep both as-is.
+        assert_eq!(choose_upstreams(vec![stub, a], vec![a, b]), vec![stub, a]);
+        // A repeated uplink is appended once.
+        assert_eq!(
+            choose_upstreams(vec![stub], vec![a, a, b]),
+            vec![stub, a, b]
+        );
     }
 
     #[test]
