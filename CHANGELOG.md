@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A build-cache transfer no longer fails on one dropped connection to the registry.**
+  A pull or push request whose connection could not be made, timed out, or was cut short
+  under the response (`pulling blob …: Operation timed out`) is now retried a few times,
+  seconds apart, before it fails. A registry answer — not found, unauthorized — is still
+  final at once, and a cache lookup that could not reach the registry is retried rather
+  than read as a miss.
+
 ## [0.73.1] - 2026-09-18
 
 ### Fixed

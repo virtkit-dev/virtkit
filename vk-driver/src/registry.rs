@@ -287,8 +287,7 @@ async fn inspect_async(rg: &Registry, name: &str, reference: &Reference) -> Resu
         Reference::Tag(t) => make_ref(rg, name, t)?,
         Reference::Digest(d) => make_digest_ref(rg, name, d)?,
     };
-    client
-        .fetch_manifest_digest(&image, &auth)
+    manifest_digest(&client, &image, &auth)
         .await
         .with_context(|| format!("{}/{name}: reference not found in the registry", rg.repo))
 }
@@ -306,7 +305,7 @@ pub fn exists(rg: &Registry, name: &str, tag: &str) -> bool {
         let Ok(image) = make_ref(rg, name, tag) else {
             return false;
         };
-        client.fetch_manifest_digest(&image, &auth).await.is_ok()
+        manifest_digest(&client, &image, &auth).await.is_ok()
     })
 }
 
@@ -379,7 +378,7 @@ pub fn exists_many(rg: &Registry, name: &str, tags: &[&str]) -> Vec<bool> {
         futures::stream::iter(images)
             .map(|image| async move {
                 match image {
-                    Some(image) => client.fetch_manifest_digest(&image, auth).await.is_ok(),
+                    Some(image) => manifest_digest(client, &image, auth).await.is_ok(),
                     None => false,
                 }
             })
@@ -469,7 +468,7 @@ async fn try_pull_ext4_async(
     let image = make_ref(rg, name, tag)?;
     // Absent tag (or an unreachable registry) -> build locally; only a *found* bundle
     // that then fails to pull is a hard error.
-    let Ok(digest) = client.fetch_manifest_digest(&image, &auth).await else {
+    let Ok(digest) = manifest_digest(&client, &image, &auth).await else {
         return Ok(None);
     };
     let bundle = staging_bundle(dest, ".vkpull-");
@@ -516,12 +515,14 @@ async fn try_pull_ext4_lazy_async(
 ) -> Result<Option<String>> {
     let (client, auth) = client(rg)?;
     let image = make_ref(rg, name, tag)?;
-    let Ok(digest) = client.fetch_manifest_digest(&image, &auth).await else {
+    let Ok(digest) = manifest_digest(&client, &image, &auth).await else {
         return Ok(None);
     };
     let dref = make_digest_ref(rg, name, &digest)?;
-    let (manifest, _) = client
-        .pull_manifest(&dref, &auth)
+    let (manifest, _) =
+        with_transfer_retry(&format!("pulling the manifest of {name}@{digest}"), || {
+            client.pull_manifest(&dref, &auth)
+        })
         .await
         .with_context(|| format!("pulling the manifest of {name}@{digest}"))?;
     let manifest = match manifest {
@@ -669,12 +670,14 @@ async fn fetch_chunks_async(
     } else {
         make_ref(rg, name, tag)?
     };
-    let Ok(digest) = client.fetch_manifest_digest(&image, &auth).await else {
+    let Ok(digest) = manifest_digest(&client, &image, &auth).await else {
         return Ok(None);
     };
     let dref = make_digest_ref(rg, name, &digest)?;
-    let (manifest, _) = client
-        .pull_manifest(&dref, &auth)
+    let (manifest, _) =
+        with_transfer_retry(&format!("pulling the manifest of {name}@{digest}"), || {
+            client.pull_manifest(&dref, &auth)
+        })
         .await
         .with_context(|| format!("pulling the manifest of {name}@{digest}"))?;
     let manifest = match manifest {
@@ -903,9 +906,8 @@ async fn push_ext4_diff_async(
         size: config_json.len() as i64,
         ..Default::default()
     };
-    if force || !client.blob_exists(&image, &config_digest).await? {
-        client
-            .push_blob(&image, config_json, &config_digest)
+    if force || !blob_exists(&client, &image, &config_digest).await? {
+        push_blob(&client, &image, config_json.into(), &config_digest)
             .await
             .context("pushing the bundle config blob")?;
     }
@@ -937,12 +939,17 @@ async fn push_manifest(
     image: &OciReference,
     manifest: &OciManifest,
 ) -> Result<String> {
-    let body = serde_json::to_vec(manifest).context("serializing the bundle manifest")?;
+    let body = bytes::Bytes::from(
+        serde_json::to_vec(manifest).context("serializing the bundle manifest")?,
+    );
     let digest = sha256_hex(&body);
-    client
-        .push_manifest_raw(image, body, OCI_IMAGE_MEDIA_TYPE.parse()?)
-        .await
-        .with_context(|| format!("pushing the bundle manifest to {image}"))?;
+    let media_type: reqwest::header::HeaderValue = OCI_IMAGE_MEDIA_TYPE.parse()?;
+    let (body, media_type) = (&body, &media_type);
+    with_transfer_retry(&format!("pushing the manifest to {image}"), || {
+        client.push_manifest_raw(image, body.clone(), media_type.clone())
+    })
+    .await
+    .with_context(|| format!("pushing the bundle manifest to {image}"))?;
     Ok(digest)
 }
 
@@ -1029,13 +1036,18 @@ async fn put_raw_chunk(
     if transparent {
         let digest = format!("sha256:{raw_hex}");
         let size = raw.len() as i64;
-        let uploaded = if !force && client.blob_exists(image, &digest).await? {
+        let uploaded = if !force && blob_exists(client, image, &digest).await? {
             false
         } else {
-            let frame = zstd_with_size(&raw)?;
-            push_blob_zstd(http.expect("http client"), rg, image, &digest, frame)
-                .await
-                .with_context(|| format!("pushing chunk {digest}"))?;
+            let frame = bytes::Bytes::from(zstd_with_size(&raw)?);
+            let http = http.expect("http client");
+            // Restart the upload after an unanswered PUT: the registry may have
+            // discarded the old session.
+            with_transfer_retry(&format!("pushing chunk {digest}"), || {
+                push_blob_zstd(http, rg, image, &digest, frame.clone())
+            })
+            .await
+            .with_context(|| format!("pushing chunk {digest}"))?;
             true
         };
         return Ok((
@@ -1046,7 +1058,7 @@ async fn put_raw_chunk(
     if !force
         && let Some(dir) = chunkmap
         && let Some((digest, size)) = chunkmap_get(dir, &raw_hex)
-        && client.blob_exists(image, &digest).await?
+        && blob_exists(client, image, &digest).await?
     {
         return Ok((
             chunk_descriptor(CHUNK_MEDIA_TYPE, &digest, size, offset, length),
@@ -1059,11 +1071,10 @@ async fn put_raw_chunk(
     if let Some(dir) = chunkmap {
         chunkmap_put(dir, &raw_hex, &digest, size);
     }
-    let uploaded = if !force && client.blob_exists(image, &digest).await? {
+    let uploaded = if !force && blob_exists(client, image, &digest).await? {
         false
     } else {
-        client
-            .push_blob(image, compressed, &digest)
+        push_blob(client, image, compressed.into(), &digest)
             .await
             .with_context(|| format!("pushing chunk {digest}"))?;
         true
@@ -1392,9 +1403,8 @@ async fn push_async(
         size: config_json.len() as i64,
         ..Default::default()
     };
-    if force || !client.blob_exists(&image, &config_digest).await? {
-        client
-            .push_blob(&image, config_json, &config_digest)
+    if force || !blob_exists(&client, &image, &config_digest).await? {
+        push_blob(&client, &image, config_json.into(), &config_digest)
             .await
             .context("pushing the bundle config blob")?;
     }
@@ -1432,9 +1442,8 @@ async fn push_file(
     let data = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let digest = sha256_hex(&data);
     let size = data.len() as i64;
-    if force || !client.blob_exists(image, &digest).await? {
-        client
-            .push_blob(image, data, &digest)
+    if force || !blob_exists(client, image, &digest).await? {
+        push_blob(client, image, data.into(), &digest)
             .await
             .with_context(|| format!("pushing {}", path.display()))?;
     }
@@ -1464,8 +1473,7 @@ async fn ensure_bundle_pulled(
         Reference::Digest(d) => d.clone(),
         Reference::Tag(tag) => {
             let image = make_ref(rg, name, tag)?;
-            client
-                .fetch_manifest_digest(&image, auth)
+            manifest_digest(client, &image, auth)
                 .await
                 .with_context(|| format!("resolving {name}:{tag} against {}", rg.repo))?
         }
@@ -1525,8 +1533,10 @@ async fn pull_into(
         return Ok(());
     }
     println!("virtkit: registry: pulling {label} ...");
-    let (manifest, _) = client
-        .pull_manifest(image, auth)
+    let (manifest, _) =
+        with_transfer_retry(&format!("pulling the manifest of {name}@{digest}"), || {
+            client.pull_manifest(image, auth)
+        })
         .await
         .with_context(|| format!("pulling the manifest of {name}@{digest}"))?;
     let manifest = match manifest {
@@ -1726,12 +1736,164 @@ async fn pull_blob_bytes(
     image: &OciReference,
     layer: &OciDescriptor,
 ) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(layer.size.max(0) as usize);
-    client
-        .pull_blob(image, layer, &mut buf)
-        .await
-        .with_context(|| format!("pulling blob {}", layer.digest))?;
-    Ok(buf)
+    with_transfer_retry(&format!("pulling blob {}", layer.digest), || async move {
+        let mut buf = Vec::with_capacity(layer.size.max(0) as usize);
+        client.pull_blob(image, layer, &mut buf).await?;
+        Ok::<_, OciDistributionError>(buf)
+    })
+    .await
+    .with_context(|| format!("pulling blob {}", layer.digest))
+}
+
+/// Maximum attempts and initial retry delay; subsequent delays double (2 s, 4 s, 8 s).
+const TRANSFER_ATTEMPTS: u32 = 4;
+const TRANSFER_RETRY_PAUSE: Duration = Duration::from_secs(2);
+
+/// Retry a registry request on transport failures.
+///
+/// Every request the registry gets is safe to make twice: a pull is a GET of
+/// content-addressed bytes, verified against their digest on arrival; a push puts a blob
+/// under its own digest or a manifest under its tag; an existence check is a HEAD. What
+/// gets retried is the connection not being made, timing out, or dying under the request
+/// or the response: on a lossy path a registry's send stalls in RTO backoff and reqwest's
+/// `TCP_USER_TIMEOUT` (30 s by default; `oci_client` offers no way to set it) has the
+/// kernel abort the socket mid-body, which a fresh connection a moment later serves fine.
+/// A registry *answer* — not found, unauthorized, a digest that does not match — comes
+/// back at once: repeating it would only hide it for a few seconds.
+async fn with_transfer_retry<T, E, F, Fut>(what: &str, attempt: F) -> std::result::Result<T, E>
+where
+    E: Transport + std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+{
+    retry_transfer(what, TRANSFER_RETRY_PAUSE, attempt).await
+}
+
+/// [`with_transfer_retry`] with an explicit initial delay, zero in tests.
+async fn retry_transfer<T, E, F, Fut>(
+    what: &str,
+    mut pause: Duration,
+    mut attempt: F,
+) -> std::result::Result<T, E>
+where
+    E: Transport + std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, E>>,
+{
+    for n in 1.. {
+        match attempt().await {
+            Err(e) if n < TRANSFER_ATTEMPTS && e.is_transport() => {
+                eprintln!(
+                    "virtkit: registry: {what}: {e:#}; retrying in {}s ({n}/{})",
+                    pause.as_secs(),
+                    TRANSFER_ATTEMPTS - 1
+                );
+                tokio::time::sleep(pause).await;
+                pause *= 2;
+            }
+            r => return r,
+        }
+    }
+    unreachable!("the attempt loop returns from its last iteration")
+}
+
+/// Classify transport failures for [`with_transfer_retry`], excluding registry errors.
+trait Transport {
+    fn is_transport(&self) -> bool;
+}
+
+/// Retry connection failures, timeouts, unanswered requests and truncated bodies.
+/// The latter two wrap kernel or hyper errors: `ETIMEDOUT`, `ECONNRESET`, or
+/// "connection closed". Parse errors are final: invalid JSON (serde), invalid HTTP
+/// or requests hyper refuses to send (hyper parse/user errors, also from `send()`),
+/// and malformed chunk framing (`InvalidInput`/`InvalidData` under a body error).
+impl Transport for reqwest::Error {
+    fn is_transport(&self) -> bool {
+        if self.is_connect() || self.is_timeout() {
+            return true;
+        }
+        let mut transport = self.is_request();
+        let mut source = std::error::Error::source(self);
+        while let Some(cause) = source {
+            if let Some(e) = cause.downcast_ref::<hyper::Error>() {
+                if e.is_parse() || e.is_user() {
+                    return false;
+                }
+                transport = true;
+            }
+            if let Some(e) = cause.downcast_ref::<std::io::Error>() {
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
+                ) {
+                    return false;
+                }
+                transport = true;
+            }
+            source = cause.source();
+        }
+        transport
+    }
+}
+
+impl Transport for OciDistributionError {
+    fn is_transport(&self) -> bool {
+        matches!(self, OciDistributionError::RequestError(e) if e.is_transport())
+    }
+}
+
+/// Transparent-zstd pushes wrap reqwest errors in context. Also check OCI errors:
+/// their transparent `RequestError` wrapper omits reqwest's node from the source chain.
+impl Transport for anyhow::Error {
+    fn is_transport(&self) -> bool {
+        self.chain().any(|e| {
+            e.downcast_ref::<OciDistributionError>()
+                .is_some_and(Transport::is_transport)
+                || e.downcast_ref::<reqwest::Error>()
+                    .is_some_and(Transport::is_transport)
+        })
+    }
+}
+
+/// Check blob existence with transport retries.
+async fn blob_exists(
+    client: &oci_client::Client,
+    image: &OciReference,
+    digest: &str,
+) -> oci_client::errors::Result<bool> {
+    with_transfer_retry(&format!("checking for blob {digest}"), || {
+        client.blob_exists(image, digest)
+    })
+    .await
+}
+
+/// Push a blob with transport retries; `Bytes` shares the buffer across attempts.
+async fn push_blob(
+    client: &oci_client::Client,
+    image: &OciReference,
+    data: bytes::Bytes,
+    digest: &str,
+) -> oci_client::errors::Result<String> {
+    let data = &data;
+    with_transfer_retry(&format!("pushing blob {digest}"), || {
+        client.push_blob(image, data.clone(), digest)
+    })
+    .await
+}
+
+/// `fetch_manifest_digest`, retried like every other pull. Its callers read a failure
+/// as "the registry does not have it" — the right reading of a 404, and the wrong one
+/// of a connection that was not made, which would otherwise turn into a rebuild of
+/// what the registry holds.
+async fn manifest_digest(
+    client: &oci_client::Client,
+    image: &OciReference,
+    auth: &RegistryAuth,
+) -> oci_client::errors::Result<String> {
+    with_transfer_retry(&format!("resolving {image}"), || {
+        client.fetch_manifest_digest(image, auth)
+    })
+    .await
 }
 
 /// Write a decompressed chunk into the rootfs at `offset`, preserving sparsity: an
@@ -1832,25 +1994,35 @@ fn sha256_hex(data: &[u8]) -> String {
 }
 
 /// Probe `GET /v2/` for the [`TRANSPARENT_ZSTD_HEADER`] a cooperating `regserve`
-/// advertises. Any failure — a dumb registry, a network/TLS error, a missing CA —
-/// yields `false`: fall back to the compressed-digest path. Only called in auto mode
-/// (`transparent_zstd` unset). Sends the configured credential (Basic or bearer): an
-/// authenticated vk-registry challenges `/v2/` (401) like every other path, so an anonymous
-/// probe would just 401 and mis-detect as `false`.
+/// advertises. Failures (an unsupported registry, TLS errors, a missing CA) return
+/// `false`, falling back to compressed digests. Retry transport failures first: a dropped connection
+/// would otherwise switch this build's chunk digests and lose registry deduplication.
+/// Only called in auto mode (`transparent_zstd` unset). Send configured Basic or bearer
+/// credentials because authenticated vk-registry challenges `/v2/` like other paths;
+/// an anonymous probe would misread the 401 as lack of support.
 async fn detect_transparent_zstd(rg: &Registry, image: &OciReference) -> bool {
     let Ok(http) = http_client(rg) else {
         return false;
     };
     let scheme = if rg.insecure { "http" } else { "https" };
-    let url = format!("{scheme}://{}/v2/", image.resolve_registry());
-    let mut req = http.get(&url);
-    if let Ok(c) = cred(rg) {
-        req = c.apply(req);
-    }
-    match req.send().await {
-        Ok(resp) => resp.headers().contains_key(TRANSPARENT_ZSTD_HEADER),
-        Err(_) => false,
-    }
+    let registry = image.resolve_registry();
+    let url = format!("{scheme}://{registry}/v2/");
+    let cred = cred(rg).ok();
+    with_transfer_retry(&format!("probing {registry} for transparent zstd"), || {
+        let mut req = http.get(&url);
+        if let Some(c) = &cred {
+            req = c.apply(req);
+        }
+        async move {
+            match req.send().await {
+                Ok(resp) => Ok(resp.headers().contains_key(TRANSPARENT_ZSTD_HEADER)),
+                Err(e) if e.is_transport() => Err(e),
+                Err(_) => Ok(false),
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// A reqwest client honoring the registry's TLS settings (rustls + optional PEM CA),
@@ -2144,7 +2316,7 @@ async fn push_blob_zstd(
     rg: &Registry,
     image: &OciReference,
     digest: &str,
-    frame: Vec<u8>,
+    frame: bytes::Bytes,
 ) -> Result<()> {
     let scheme = if rg.insecure { "http" } else { "https" };
     let registry = image.resolve_registry();
@@ -3078,6 +3250,348 @@ mod local {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One request as the fake registry saw it.
+    #[derive(Clone, Debug)]
+    struct Seen {
+        method: String,
+        /// Path only, without the query string.
+        path: String,
+        /// Raw query string.
+        query: String,
+        body: Vec<u8>,
+    }
+
+    /// Record requests and serve one scripted raw response per connection: an empty
+    /// string closes without replying; others can truncate a body or set an upload
+    /// `Location`. Serve one request per entry, then stop and refuse later connections.
+    struct FakeServer {
+        addr: std::net::SocketAddr,
+        seen: Arc<std::sync::Mutex<Vec<Seen>>>,
+    }
+
+    impl FakeServer {
+        fn start(responses: Vec<String>) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorder = seen.clone();
+            std::thread::spawn(move || {
+                for response in responses {
+                    let Ok((stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    let Some(request) = read_request(&stream) else {
+                        return;
+                    };
+                    recorder.lock().unwrap().push(request);
+                    // Best-effort: the client may disconnect after a parse error.
+                    let mut stream = stream;
+                    let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+                    let _ = std::io::Write::flush(&mut stream);
+                }
+            });
+            FakeServer { addr, seen }
+        }
+
+        /// A well-formed HTTP response with the given status and body.
+        fn reply(status: u16, body: &str) -> String {
+            format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        }
+
+        /// `host:port`.
+        fn authority(&self) -> String {
+            self.addr.to_string()
+        }
+
+        fn seen(&self) -> Vec<Seen> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    /// Read an HTTP/1.1 request line, headers and body using Content-Length.
+    fn read_request(stream: &std::net::TcpStream) -> Option<Seen> {
+        use std::io::{BufRead, Read};
+        let mut reader = std::io::BufReader::new(stream.try_clone().ok()?);
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        let mut parts = line.split_whitespace();
+        let method = parts.next()?.to_string();
+        let target = parts.next()?.to_string();
+        let (path, query) = match target.split_once('?') {
+            Some((p, q)) => (p.to_string(), q.to_string()),
+            None => (target, String::new()),
+        };
+        let mut length = 0;
+        loop {
+            let mut h = String::new();
+            if reader.read_line(&mut h).ok()? == 0 || h.trim().is_empty() {
+                break;
+            }
+            if let Some((name, value)) = h.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().ok()?;
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).ok()?;
+        Some(Seen {
+            method,
+            path,
+            query,
+            body,
+        })
+    }
+
+    /// Plain-HTTP registry config without credentials.
+    fn fake_registry(server: &FakeServer) -> Registry {
+        Registry::for_share(
+            format!("{}/repo", server.authority()),
+            true,
+            None,
+            String::new(),
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn install_crypto() {
+        // Another test may already have installed the same provider.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    /// Unanswered connections and truncated bodies are transport failures.
+    #[test]
+    fn a_closed_connection_and_a_truncated_body_are_the_transport() {
+        install_crypto();
+        block_on(async {
+            let server = FakeServer::start(vec![String::new()]);
+            let err = reqwest::get(format!("http://{}/", server.authority()))
+                .await
+                .unwrap_err();
+            assert!(err.is_transport(), "{err:#}");
+
+            let server = FakeServer::start(vec![
+                "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nshort".into(),
+            ]);
+            let err = reqwest::get(format!("http://{}/", server.authority()))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap_err();
+            assert!(err.is_transport(), "{err:#}");
+        });
+    }
+
+    /// HTTP status errors, invalid JSON, invalid HTTP and malformed chunks are final.
+    #[test]
+    fn registry_answers_and_parse_errors_are_final() {
+        install_crypto();
+        block_on(async {
+            let server = FakeServer::start(vec![
+                FakeServer::reply(401, "denied"),
+                FakeServer::reply(200, "not JSON"),
+            ]);
+            let url = format!("http://{}/", server.authority());
+            let status = reqwest::get(&url)
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap_err();
+            assert!(!status.is_transport(), "{status:#}");
+            let json = reqwest::get(&url)
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_err();
+            assert!(!json.is_transport(), "{json:#}");
+
+            let server = FakeServer::start(vec!["NOT HTTP\r\n\r\n".into()]);
+            let protocol = reqwest::get(format!("http://{}/", server.authority()))
+                .await
+                .unwrap_err();
+            assert!(!protocol.is_transport(), "{protocol:#}");
+
+            let server = FakeServer::start(vec![
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\ninvalid-size\r\n".into(),
+            ]);
+            let framing = reqwest::get(format!("http://{}/", server.authority()))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap_err();
+            assert!(!framing.is_transport(), "{framing:#}");
+
+            assert!(
+                !OciDistributionError::UnauthorizedError {
+                    url: "https://registry/v2/".into(),
+                }
+                .is_transport()
+            );
+        });
+    }
+
+    /// Retry transport failures up to `TRANSFER_ATTEMPTS`; registry errors are final.
+    #[test]
+    fn transfer_retry_repeats_transport_failures_only() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        install_crypto();
+        let disconnected = || async {
+            let server = FakeServer::start(vec![String::new()]);
+            let err = reqwest::get(format!("http://{}/v2/", server.authority()))
+                .await
+                .unwrap_err();
+            OciDistributionError::RequestError(err)
+        };
+        block_on(async {
+            // Two transport failures, then the answer.
+            let calls = AtomicU32::new(0);
+            let got = retry_transfer("probe", Duration::ZERO, || {
+                let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                async move {
+                    if n < 3 {
+                        return Err(disconnected().await);
+                    }
+                    Ok(n)
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(got, 3);
+
+            // Return the last error after TRANSFER_ATTEMPTS failures.
+            calls.store(0, Ordering::Relaxed);
+            let err = retry_transfer("probe", Duration::ZERO, || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async { Err::<(), _>(disconnected().await) }
+            })
+            .await
+            .unwrap_err();
+            assert!(err.is_transport());
+            assert_eq!(calls.load(Ordering::Relaxed), TRANSFER_ATTEMPTS);
+
+            // A registry answer is final on the first attempt.
+            calls.store(0, Ordering::Relaxed);
+            let err = retry_transfer("probe", Duration::ZERO, || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async {
+                    Err::<(), _>(OciDistributionError::UnauthorizedError {
+                        url: "https://registry/v2/".into(),
+                    })
+                }
+            })
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                err,
+                OciDistributionError::UnauthorizedError { .. }
+            ));
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        });
+    }
+
+    /// Discard a truncated blob's partial body and return the complete retry response.
+    #[test]
+    fn a_blob_retry_discards_the_partial_body() {
+        install_crypto();
+        let server = FakeServer::start(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\npart".into(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\ncomplete".into(),
+        ]);
+        let rg = fake_registry(&server);
+        let (client, _auth) = client(&rg).unwrap();
+        let image = make_ref(&rg, "repo", "tag").unwrap();
+        let layer = chunk_descriptor(CHUNK_MEDIA_TYPE, &sha256_hex(b"complete"), 8, 0, 8);
+        let body = block_on(pull_blob_bytes(&client, &image, &layer)).unwrap();
+        assert_eq!(body, b"complete");
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].path, seen[1].path);
+    }
+
+    /// Reject a complete blob with a digest mismatch without retrying.
+    #[test]
+    fn a_blob_digest_mismatch_is_final() {
+        install_crypto();
+        let server = FakeServer::start(vec![FakeServer::reply(200, "corrupt")]);
+        let rg = fake_registry(&server);
+        let (client, _auth) = client(&rg).unwrap();
+        let image = make_ref(&rg, "repo", "tag").unwrap();
+        let layer = chunk_descriptor(CHUNK_MEDIA_TYPE, &sha256_hex(b"correct"), 7, 0, 7);
+        let err = block_on(pull_blob_bytes(&client, &image, &layer)).unwrap_err();
+        assert!(!err.is_transport(), "{err:#}");
+        assert!(format!("{err:#}").contains("digest"), "{err:#}");
+        assert_eq!(server.seen().len(), 1);
+    }
+
+    /// After an unanswered transparent-zstd PUT, POST a new session and PUT the same
+    /// frame to its new `Location`.
+    #[test]
+    fn a_transparent_upload_retry_starts_a_new_session() {
+        install_crypto();
+        let server = FakeServer::start(vec![
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 202 Accepted\r\nLocation: /upload/first\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            String::new(),
+            "HTTP/1.1 202 Accepted\r\nLocation: /upload/second\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        ]);
+        let rg = fake_registry(&server);
+        let (client, _auth) = client(&rg).unwrap();
+        let http = http_client(&rg).unwrap();
+        let image = make_ref(&rg, "repo", "tag").unwrap();
+        let raw = b"chunk".to_vec();
+        let frame = zstd_with_size(&raw).unwrap();
+        let (desc, uploaded) = block_on(put_raw_chunk(
+            &client,
+            Some(&http),
+            &rg,
+            &image,
+            true,
+            None,
+            raw,
+            0,
+            5,
+            false,
+        ))
+        .unwrap();
+        assert!(uploaded);
+        assert_eq!(desc.digest, format!("sha256:{}", sha256_hex_raw(b"chunk")));
+        let seen = server.seen();
+        assert_eq!(
+            seen.iter().map(|r| r.method.as_str()).collect::<Vec<_>>(),
+            ["HEAD", "POST", "PUT", "POST", "PUT"]
+        );
+        assert_eq!(seen[2].path, "/upload/first");
+        assert_eq!(seen[4].path, "/upload/second");
+        assert_eq!(seen[2].body, frame);
+        assert_eq!(seen[4].body, frame);
+        assert_eq!(seen[2].query, seen[4].query);
+    }
+
+    /// Retry a disconnected transparent-zstd probe before reporting lack of support.
+    #[test]
+    fn the_transparent_probe_recovers_after_a_disconnect() {
+        install_crypto();
+        let server = FakeServer::start(vec![
+            String::new(),
+            format!(
+                "HTTP/1.1 200 OK\r\n{TRANSPARENT_ZSTD_HEADER}: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        ]);
+        let rg = fake_registry(&server);
+        let image = make_ref(&rg, "repo", "tag").unwrap();
+        assert!(block_on(detect_transparent_zstd(&rg, &image)));
+        assert_eq!(server.seen().len(), 2);
+    }
 
     fn server_error(code: u16, body: &str) -> anyhow::Error {
         anyhow::Error::from(OciDistributionError::ServerError {
