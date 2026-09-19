@@ -360,3 +360,13 @@ counted, so no FORGET ever releases it and `PassthroughFs` keeps its O_PATH fd f
 the mount. Upstream virtiofsd forgets it there; upstream libkrun does not. On a 37k-entry source
 tree, 362 inodes stayed pinned after the guest had dropped every cached dentry. Covered by
 `readdirplus_forgets_the_entry_that_did_not_fit`.
+
+`src/devices/src/virtio/net/unixstream.rs` — the network proxy's stream is read through a
+128 KiB buffer, allowing one `recv` to collect multiple queued frames. Buffered bytes and
+the saved payload length survive `NothingRead`, so a retry resumes the current frame.
+Payloads of at least 8 KiB go directly into the caller's buffer only when no payload bytes
+are buffered. EOF fails the read, including a partial direct read, and an oversized length
+is rejected before slicing. Socket-pair tests cover queued frames, split headers and
+payloads, retries, compaction, large frames, invalid lengths and EOF. The queued-frame test
+checks that all three small frames from one socket write arrive in the initial refill;
+it is a batching check, not a throughput measurement. Search for `read_buffered`.

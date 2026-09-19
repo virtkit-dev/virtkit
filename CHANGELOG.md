@@ -13,6 +13,8 @@ All notable changes to virtkit will be documented in this file.
   reach guests in larger packets.
 - **Jumbo networking uses receive memory more efficiently with libkrun.** Small packets
   no longer require a full jumbo-sized receive buffer.
+- **Network reads can receive several packets at once with libkrun.** Invalid packet
+  lengths and closed network streams now return errors instead of panicking or spinning.
 
 ## [0.73.3] - 2026-09-19
 
