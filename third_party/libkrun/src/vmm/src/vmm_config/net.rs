@@ -18,6 +18,8 @@ pub struct NetworkInterfaceConfig {
     pub mac: [u8; 6],
     /// virtio-net features for the network interface.
     pub features: u32,
+    /// Link MTU to advertise to the guest, or `None` to leave it at the driver's default.
+    pub mtu: Option<u16>,
 }
 
 /// Errors associated with `NetworkInterfaceConfig`.
@@ -65,7 +67,7 @@ impl NetBuilder {
     /// Creates a Net device from a NetworkInterfaceConfig.
     pub fn create_net(cfg: NetworkInterfaceConfig) -> Result<Net> {
         // Create and return the Net device
-        Net::new(cfg.iface_id, cfg.backend, cfg.mac, cfg.features)
+        Net::new(cfg.iface_id, cfg.backend, cfg.mac, cfg.features, cfg.mtu)
             .map_err(NetworkInterfaceError::CreateNetworkDevice)
     }
 }

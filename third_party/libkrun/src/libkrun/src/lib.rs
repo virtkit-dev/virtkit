@@ -8,6 +8,8 @@ use devices::virtio::block::{ImageType, SyncMode};
 use devices::virtio::gpu::display::DisplayInfo;
 #[cfg(feature = "net")]
 use devices::virtio::net::device::VirtioNetBackend;
+#[cfg(feature = "net")]
+use devices::virtio::net::{MAX_MTU, MIN_MTU};
 #[cfg(feature = "blk")]
 use devices::virtio::CacheType;
 use env_logger::{Env, Target};
@@ -1204,6 +1206,27 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
     features: u32,
     flags: u32,
 ) -> i32 {
+    krun_add_net_unixstream2(ctx_id, c_path, fd, c_mac, features, flags, 0)
+}
+
+/// As `krun_add_net_unixstream`, plus `mtu`: the link MTU the guest driver adopts for this
+/// interface (`VIRTIO_NET_F_MTU`), in 68..=65535. 0 advertises no MTU, leaving the driver at
+/// its own default of 1500 — which is what `krun_add_net_unixstream` passes.
+///
+/// An MTU above 1500 also makes the Linux driver post 64 KiB receive-buffer chains, so the
+/// backend can hand the guest frames that large in one piece.
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(feature = "net")]
+pub unsafe extern "C" fn krun_add_net_unixstream2(
+    ctx_id: u32,
+    c_path: *const c_char,
+    fd: c_int,
+    c_mac: *const u8,
+    features: u32,
+    flags: u32,
+    mtu: u16,
+) -> i32 {
     let path = if !c_path.is_null() {
         match CStr::from_ptr(c_path).to_str() {
             Ok(path) => Some(PathBuf::from(path)),
@@ -1239,10 +1262,16 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
         return -libc::EINVAL;
     }
 
+    let mtu = match mtu {
+        0 => None,
+        mtu if (MIN_MTU..=MAX_MTU).contains(&mtu) => Some(mtu),
+        _ => return -libc::EINVAL,
+    };
+
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            create_virtio_net(cfg, backend, mac, features);
+            create_virtio_net(cfg, backend, mac, features, mtu);
             if enable_dhcp_client {
                 cfg.vmr.dhcp_client = true;
             }
@@ -1303,7 +1332,7 @@ pub unsafe extern "C" fn krun_add_net_unixgram(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            create_virtio_net(cfg, backend, mac, features);
+            create_virtio_net(cfg, backend, mac, features, None);
             if enable_dhcp_client {
                 cfg.vmr.dhcp_client = true;
             }
@@ -1355,7 +1384,7 @@ pub unsafe extern "C" fn krun_add_net_tap(
     match CTX_MAP.lock().unwrap().entry(ctx_id) {
         Entry::Occupied(mut ctx_cfg) => {
             let cfg = ctx_cfg.get_mut();
-            create_virtio_net(cfg, VirtioNetBackend::Tap(tap_name), mac, features);
+            create_virtio_net(cfg, VirtioNetBackend::Tap(tap_name), mac, features, None);
             if enable_dhcp_client {
                 cfg.vmr.dhcp_client = true;
             }
@@ -2285,12 +2314,14 @@ fn create_virtio_net(
     backend: VirtioNetBackend,
     mac: [u8; 6],
     features: u32,
+    mtu: Option<u16>,
 ) {
     let network_interface_config = NetworkInterfaceConfig {
         iface_id: format!("eth{}", ctx_cfg.net_index),
         backend,
         mac,
         features,
+        mtu,
     };
     ctx_cfg.net_index += 1;
     ctx_cfg
@@ -3154,7 +3185,7 @@ pub extern "C" fn krun_start_enter(ctx_id: u32) -> i32 {
             let mac = ctx_cfg
                 .legacy_mac
                 .unwrap_or([0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee]);
-            create_virtio_net(&mut ctx_cfg, backend, mac, NET_COMPAT_FEATURES);
+            create_virtio_net(&mut ctx_cfg, backend, mac, NET_COMPAT_FEATURES, None);
         }
     }
 

@@ -316,6 +316,20 @@ above the floor, so only those are mapped through the window. Every DAX mapping 
 mmap and a guest EPT invalidation per 2 MiB range whatever the file's size; a source tree's
 small files never repay it. Covered by `lookup_marks_large_regular_files_for_dax`.
 
+`src/devices/src/virtio/net/{mod.rs,device.rs}` + `src/vmm/src/vmm_config/net.rs` +
+`src/libkrun/src/lib.rs` — a configurable link MTU on a virtio-net NIC. `VirtioNetConfig`
+gains the `mtu` field the virtio spec puts at offset 10 and `Net::new` takes an
+`Option<u16>`, advertising `VIRTIO_NET_F_MTU` only when one is set, so a driver reads the
+link MTU off the device instead of assuming 1500. `krun_add_net_unixstream2(…, mtu)` carries
+it from a C caller and validates it against `MIN_MTU..=MAX_MTU` (68..=65535, the ceiling
+being what still fits the device's `MAX_BUFFER_SIZE` frame buffers once the virtio-net and
+ethernet headers are counted — a static assertion ties the two together). An MTU above 1500
+also makes the Linux driver post 64 KiB receive-buffer chains, which is what lets a backend
+hand the guest a jumbo frame in one piece. `krun_add_net_unixstream` delegates with 0 and
+every other entry point passes `None`, so nothing advertises an MTU unless asked. Additive.
+Used by virtkit to put switch-attached NICs on a 65500-byte link. Covered by
+`virtio::net::device::tests`.
+
 `src/devices/src/virtio/fs/server.rs` — READDIRPLUS forgets an entry that did not fit the reply.
 The filesystem has to look an entry up before the server can tell whether it fits, and that
 lookup takes a reference on the inode; an entry the guest never receives is one the kernel never
