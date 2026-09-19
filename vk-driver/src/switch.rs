@@ -42,6 +42,13 @@ const MAX_FRAME: usize = 65535;
 /// 14-byte ethernet header is added.
 pub(crate) const MTU: u16 = vk_core::net::SWITCH_MTU;
 const _: () = assert!(MAX_FRAME >= 14 + MTU as usize);
+/// Largest TCP payload the link carries: the MTU less the IPv4 and TCP headers. The gateway
+/// advertises it in the SYN-ACK. A guest-bound splice can hand ipstack up to this much per
+/// write; ipstack emits one segment, also limited by the guest's receive window.
+const MSS: u16 = MTU - 40;
+/// Buffer for the host-bound half of a spliced flow, matching ipstack's maximum read
+/// handoff of one 8 KiB reassembly chunk. The guest kernel sizes that direction's segments.
+const HOST_BOUND_CHUNK: usize = 8 << 10;
 const ETHERTYPE_ARP: u16 = 0x0806;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_IPV6: u16 = 0x86dd;
@@ -1239,9 +1246,9 @@ fn ip_stack_config() -> IpStackConfig {
     tcp.timeout = TCP_IDLE_TIMEOUT;
     tcp.read_buffer_size = TCP_WINDOW;
     tcp.max_unacked_bytes = TCP_WINDOW as u32;
-    // Advertise the link's MSS — the MTU less the IPv4 and TCP headers — so a guest sizes
-    // its segments to the link instead of falling back to the 536-byte default.
-    tcp.options = Some(vec![ipstack::TcpOptions::MaximumSegmentSize(MTU - 40)]);
+    // Advertise the link's MSS so a guest sizes its segments to it instead of falling back
+    // to the 536-byte default.
+    tcp.options = Some(vec![ipstack::TcpOptions::MaximumSegmentSize(MSS)]);
     config.with_tcp_config(tcp);
     config
 }
@@ -1317,7 +1324,13 @@ async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard
             // a client that aborts — so it is left unlogged; the rarer faults are worth a line: a
             // timeout, a broken pipe, the upstream gone (see `detect_dead_peer`). Either way,
             // returning drops `guest` and resets its connection, which is all the guest sees.
-            if let Err(e) = tokio::io::copy_bidirectional(&mut guest, &mut host).await
+            if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
+                &mut guest,
+                &mut host,
+                HOST_BOUND_CHUNK,
+                MSS as usize,
+            )
+            .await
                 && e.kind() != std::io::ErrorKind::ConnectionReset
             {
                 egress.log_flow_failure(guest.local_addr(), dst, &e);
@@ -2450,7 +2463,7 @@ mod tests {
             assert!(synack.syn && synack.ack);
             assert_eq!(synack.window_size, u16::MAX);
             assert_eq!(synack.acknowledgment_number, 1001);
-            let mut expected = vec![TcpOptionElement::MaximumSegmentSize(MTU - 40)];
+            let mut expected = vec![TcpOptionElement::MaximumSegmentSize(MSS)];
             if scaling {
                 expected.push(TcpOptionElement::WindowScale(7));
             }
@@ -2500,6 +2513,74 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_download_can_reach_the_guest_in_packets_larger_than_8k() {
+        use etherparse::{PacketBuilder, PacketHeaders, TransportHeader};
+        use tokio::time::timeout;
+
+        timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let guest = [192, 168, 127, 2];
+            let remote = [10, 0, 0, 1];
+            let (tx, rx) = unbounded_channel();
+            let (reply_tx, mut replies) = unbounded_channel();
+            let mut stack = IpStack::new(ip_stack_config(), ChannelDevice { rx, tx: reply_tx });
+            let mut syn = Vec::new();
+            PacketBuilder::ipv4(guest, remote, 64)
+                .tcp(40000, 443, 1000, u16::MAX)
+                .syn()
+                .write(&mut syn, &[])
+                .unwrap();
+            tx.send(syn).unwrap();
+            let reply = replies.recv().await.unwrap();
+            let Some(TransportHeader::Tcp(synack)) =
+                PacketHeaders::from_ip_slice(&reply).unwrap().transport
+            else {
+                panic!("expected SYN-ACK");
+            };
+            let mut ack = Vec::new();
+            PacketBuilder::ipv4(guest, remote, 64)
+                .tcp(40000, 443, 1001, u16::MAX)
+                .ack(synack.sequence_number.wrapping_add(1))
+                .write(&mut ack, &[])
+                .unwrap();
+            tx.send(ack).unwrap();
+            let IpStackStream::Tcp(stream) = stack.accept().await.unwrap() else {
+                panic!("expected TCP stream");
+            };
+            let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
+                .with_registry_proxy(Some((remote.into(), listener.local_addr().unwrap())));
+            // Poll the proxy together with the peer so it is dropped even on a timeout.
+            let proxy = proxy_tcp(stream, Arc::new(guard));
+            let receive = async {
+                let (mut host, _) = listener.accept().await.unwrap();
+                let payload = vec![0x5a; 32 * 1024];
+                host.write_all(&payload).await.unwrap();
+                let mut received = Vec::new();
+                let mut sizes = Vec::new();
+                while received.len() < payload.len() {
+                    let packet = replies.recv().await.unwrap();
+                    let headers = PacketHeaders::from_ip_slice(&packet).unwrap();
+                    let bytes = headers.payload.slice();
+                    if !bytes.is_empty() {
+                        received.extend_from_slice(bytes);
+                        sizes.push(bytes.len());
+                    }
+                }
+                assert_eq!(received, payload);
+                assert!(sizes.iter().any(|&n| n > 8192), "payload sizes: {sizes:?}");
+                assert!(sizes.iter().all(|&n| n <= usize::from(MSS)));
+                eprintln!("32 KiB loopback download TCP payload sizes: {sizes:?}");
+            };
+            tokio::select! {
+                () = proxy => panic!("proxy closed before delivering the download"),
+                () = receive => {},
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
