@@ -20,7 +20,7 @@ use std::cmp;
 use std::io::Write;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
-use virtio_bindings::virtio_net::{VIRTIO_NET_F_MAC, VIRTIO_NET_F_MTU};
+use virtio_bindings::virtio_net::{VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_MTU};
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
 
@@ -88,8 +88,8 @@ impl Net {
     /// Create a new virtio network device using the backend.
     ///
     /// `mtu` is the link MTU the driver should adopt (`MIN_MTU..=MAX_MTU`, validated by the
-    /// caller). `None` leaves `VIRTIO_NET_F_MTU` unadvertised, so the driver keeps its own
-    /// default of 1500.
+    /// caller), and brings mergeable receive buffers with it. `None` leaves both features
+    /// unadvertised, so the driver keeps its own default of 1500 and one buffer per frame.
     pub fn new(
         id: String,
         cfg_backend: VirtioNetBackend,
@@ -102,7 +102,10 @@ impl Net {
             | (1 << VIRTIO_RING_F_EVENT_IDX)
             | (1 << VIRTIO_F_VERSION_1);
         if mtu.is_some() {
-            avail_features |= 1 << VIRTIO_NET_F_MTU;
+            // Mergeable receive buffers come with the MTU: on a link wide enough to be worth
+            // setting, a driver that has to size every posted buffer for the largest frame
+            // spends nearly all of them on packets nowhere near it.
+            avail_features |= (1 << VIRTIO_NET_F_MTU) | (1 << VIRTIO_NET_F_MRG_RXBUF);
         }
 
         let config = VirtioNetConfig {
@@ -253,13 +256,14 @@ mod tests {
         assert_eq!(u16::from_le_bytes(field), 65500);
     }
 
-    /// VIRTIO_NET_F_MTU is offered only when an MTU was configured; without one the field
-    /// stays zero and no driver is entitled to read it.
+    /// VIRTIO_NET_F_MTU and the mergeable receive buffers that come with it are offered only
+    /// when an MTU was configured; without one the field stays zero and no driver is
+    /// entitled to read it.
     #[test]
-    fn mtu_feature_is_offered_only_with_an_mtu() {
-        let bit = 1u64 << VIRTIO_NET_F_MTU;
-        assert_eq!(net(Some(1500)).avail_features() & bit, bit);
-        assert_eq!(net(None).avail_features() & bit, 0);
+    fn mtu_features_are_offered_only_with_an_mtu() {
+        let bits = (1u64 << VIRTIO_NET_F_MTU) | (1u64 << VIRTIO_NET_F_MRG_RXBUF);
+        assert_eq!(net(Some(1500)).avail_features() & bits, bits);
+        assert_eq!(net(None).avail_features() & bits, 0);
 
         let mut field = [0xffu8; 2];
         net(None).read_config(10, &mut field);

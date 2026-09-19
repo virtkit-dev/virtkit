@@ -324,11 +324,34 @@ link MTU off the device instead of assuming 1500. `krun_add_net_unixstream2(…,
 it from a C caller and validates it against `MIN_MTU..=MAX_MTU` (68..=65535, the ceiling
 being what still fits the device's `MAX_BUFFER_SIZE` frame buffers once the virtio-net and
 ethernet headers are counted — a static assertion ties the two together). An MTU above 1500
-also makes the Linux driver post 64 KiB receive-buffer chains, which is what lets a backend
-hand the guest a jumbo frame in one piece. `krun_add_net_unixstream` delegates with 0 and
+also makes the Linux driver post receive buffers sized for a frame that large, which is what
+lets a backend hand the guest one in a single piece. `krun_add_net_unixstream` delegates with 0 and
 every other entry point passes `None`, so nothing advertises an MTU unless asked. Additive.
 Used by virtkit to put switch-attached NICs on a 65500-byte link. Covered by
 `virtio::net::device::tests`.
+
+`src/devices/src/virtio/net/{device.rs,worker.rs}` + `src/devices/src/virtio/queue.rs` —
+`VIRTIO_NET_F_MRG_RXBUF` on a NIC that
+carries an MTU, so one frame may be received across several descriptor chains. Upstream writes
+each frame into a single chain, which forces the Linux driver to size every posted buffer for
+the largest frame: at MTU 65500 it posts 17-page chains of 18 descriptors, and a
+1024-descriptor queue then holds 56 of them whatever the traffic — 56 packets of depth, and a
+17-page allocation per refill, for packets mostly nowhere near that size. With the feature the
+driver posts one page fragment per buffer (1024 in the same ring, the same ~4 MiB) and the
+device spreads a frame over as many chains as it needs, putting the count in `num_buffers` of
+the first one's header (virtio 1.1 § 5.1.6.4). `write_frame_to_chains` takes whole chains until
+they hold the frame before writing anything, so a frame the driver has not posted room for yet
+is left for a retry with the queue as it was rather than half-written; chains that can never
+hold it are still handed back used-but-empty, as upstream does. `Queue::add_used` is split into
+`write_used` + `publish_used` so a frame's chains reach the used ring before the index that
+names them moves: a driver polling the ring must not read `num_buffers` off the first chain and
+find the rest missing. Advertised only with an MTU, so a NIC without one keeps upstream's
+one-chain-per-frame behaviour, and `add_used` still publishes per chain for every other device.
+Refill notifications use the observed available index even when chains were put back, with
+a race check after arming. Deferred deliveries and empty error completions still interrupt
+the guest. A full descriptor table that cannot fit the frame is returned empty, and any
+copy failure returns all participating chains empty. Covered by `virtio::net::worker::tests`
+and `queue::tests`. Search for `NUM_BUFFERS_OFFSET`.
 
 `src/devices/src/virtio/fs/server.rs` — READDIRPLUS forgets an entry that did not fit the reply.
 The filesystem has to look an entry up before the server can tell whether it fits, and that

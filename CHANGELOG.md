@@ -11,6 +11,8 @@ All notable changes to virtkit will be documented in this file.
   configuration needed inside the guest.
 - **Downloads can use the guest's jumbo link.** Downloads from external services can now
   reach guests in larger packets.
+- **Jumbo networking uses receive memory more efficiently with libkrun.** Small packets
+  no longer require a full jumbo-sized receive buffer.
 
 ## [0.73.3] - 2026-09-19
 

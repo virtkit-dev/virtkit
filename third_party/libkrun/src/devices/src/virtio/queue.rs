@@ -499,7 +499,11 @@ impl Queue {
         self.next_avail -= Wrapping(1);
     }
 
-    pub fn add_used(
+    /// Record a used descriptor chain without publishing it. The driver sees nothing until
+    /// [`Self::publish_used`], which is what lets a device hand several chains over as one
+    /// step — a virtio-net frame merged across receive buffers has to become visible whole,
+    /// or a driver polling the ring reads the first chain and finds the rest missing.
+    pub fn write_used(
         &mut self,
         mem: &GuestMemoryMmap,
         head_index: u16,
@@ -524,6 +528,12 @@ impl Queue {
         self.next_used += Wrapping(1);
         self.num_added += Wrapping(1);
 
+        Ok(())
+    }
+
+    /// Make every chain recorded since the last publish visible to the driver. The release
+    /// store is what orders the used elements ahead of the index that names them.
+    pub fn publish_used(&mut self, mem: &GuestMemoryMmap) -> Result<(), Error> {
         mem.store(
             self.next_used.0,
             self.used_ring
@@ -532,6 +542,16 @@ impl Queue {
             Ordering::Release,
         )
         .map_err(Error::GuestMemory)
+    }
+
+    pub fn add_used(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        head_index: u16,
+        len: u32,
+    ) -> Result<(), Error> {
+        self.write_used(mem, head_index, len)?;
+        self.publish_used(mem)
     }
 
     // Return the value present in the used_event field of the avail ring.
@@ -638,18 +658,31 @@ impl Queue {
     //     }
     // }
     pub fn enable_notification(&mut self, mem: &GuestMemoryMmap) -> Result<bool, Error> {
-        self.set_notification(mem, true)?;
+        self.enable_notification_at(mem, self.next_avail)
+    }
+
+    /// Request a kick when the driver adds entries beyond an observed available index.
+    /// A device retaining insufficient buffers can wait for a refill without consuming
+    /// them. Return true if the driver raced the arm, so the caller retries immediately.
+    pub(crate) fn enable_notification_at(
+        &mut self,
+        mem: &GuestMemoryMmap,
+        observed: Wrapping<u16>,
+    ) -> Result<bool, Error> {
+        if self.event_idx_enabled {
+            self.set_avail_event(mem, observed.0, Ordering::Relaxed)?;
+        } else {
+            self.set_used_flags(mem, 0, Ordering::Relaxed)?;
+        }
         // Ensures the following read is not reordered before any previous write operation.
         fence(Ordering::SeqCst);
 
         // We double check here to avoid the situation where the available ring has been updated
         // just before we re-enabled notifications, and it's possible to miss one. We compare the
-        // current `avail_idx` value to `self.next_avail` because it's where we stopped processing
-        // entries. There are situations where we intentionally avoid processing everything in the
-        // available ring (which will cause this method to return `true`), but in that case we'll
-        // probably not re-enable notifications as we already know there are pending entries.
+        // current `avail_idx` value to the observed index. Entries left available for an
+        // incomplete frame do not count as a refill; only newly posted entries do.
         self.avail_idx(mem, Ordering::Relaxed)
-            .map(|idx| idx != self.next_avail)
+            .map(|idx| idx != observed)
     }
 
     pub fn disable_notification(&mut self, mem: &GuestMemoryMmap) -> Result<(), Error> {
@@ -699,7 +732,11 @@ impl Queue {
     /// Fetch the available ring index (`virtq_avail->idx`) from guest memory.
     /// This is written by the driver, to indicate the next slot that will be filled in the avail
     /// ring.
-    fn avail_idx(&self, mem: &GuestMemoryMmap, order: Ordering) -> Result<Wrapping<u16>, Error> {
+    pub(crate) fn avail_idx(
+        &self,
+        mem: &GuestMemoryMmap,
+        order: Ordering,
+    ) -> Result<Wrapping<u16>, Error> {
         let addr = self
             .avail_ring
             .checked_add(2)
@@ -1139,5 +1176,38 @@ pub(crate) mod tests {
         let x = vq.used.ring[0].get();
         assert_eq!(x.id, 1);
         assert_eq!(x.len, 0x1000);
+    }
+
+    /// A device handing over several chains as one step records them all before the index
+    /// that names them moves, so a driver never sees part of the group.
+    #[test]
+    fn write_used_publishes_nothing_until_publish_used() {
+        let m = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), m, 16);
+
+        let mut q = vq.create_queue();
+        q.write_used(m, 0, 16).unwrap();
+        q.write_used(m, 1, 32).unwrap();
+        assert_eq!(vq.used.ring[0].get().len, 16);
+        assert_eq!(vq.used.ring[1].get().len, 32);
+        assert_eq!(vq.used.idx.get(), 0);
+
+        q.publish_used(m).unwrap();
+        assert_eq!(vq.used.idx.get(), 2);
+    }
+
+    #[test]
+    fn a_refill_racing_notification_arming_is_reported() {
+        let mem = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), mem, 16);
+        for event_idx in [false, true] {
+            let mut queue = vq.create_queue();
+            queue.set_event_idx(event_idx);
+            vq.avail.idx.set(2);
+            let observed = queue.avail_idx(mem, Ordering::Acquire).unwrap();
+            assert!(!queue.enable_notification_at(mem, observed).unwrap());
+            vq.avail.idx.set(4);
+            assert!(queue.enable_notification_at(mem, observed).unwrap());
+        }
     }
 }

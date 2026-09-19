@@ -1213,8 +1213,9 @@ pub unsafe extern "C" fn krun_add_net_unixstream(
 /// interface (`VIRTIO_NET_F_MTU`), in 68..=65535. 0 advertises no MTU, leaving the driver at
 /// its own default of 1500 — which is what `krun_add_net_unixstream` passes.
 ///
-/// An MTU above 1500 also makes the Linux driver post 64 KiB receive-buffer chains, so the
-/// backend can hand the guest frames that large in one piece.
+/// An MTU also brings mergeable receive buffers (`VIRTIO_NET_F_MRG_RXBUF`), so the driver
+/// posts buffers sized for ordinary packets and the device joins as many as a large frame
+/// needs — the backend can hand the guest a frame of any size the MTU allows.
 #[allow(clippy::missing_safety_doc)]
 #[no_mangle]
 #[cfg(feature = "net")]
