@@ -12,6 +12,8 @@ All notable changes to virtkit will be documented in this file.
   seconds apart, before it fails. A registry answer — not found, unauthorized — is still
   final at once, and a cache lookup that could not reach the registry is retried rather
   than read as a miss.
+- **The registry handles larger bursts of connections from runners,** reducing connection
+  delays when many jobs start together.
 
 ## [0.73.1] - 2026-09-18
 

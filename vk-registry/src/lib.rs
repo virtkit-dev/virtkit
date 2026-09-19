@@ -1615,6 +1615,26 @@ fn touch(path: &Path) {
     let _ = std::fs::File::open(path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
 }
 
+/// Connections waiting to be accepted, capped by `net.core.somaxconn`.
+/// Runner fleets start parallel chunk pulls across jobs at each pipeline stage.
+/// The kernel drops excess SYNs, costing clients a one-second retransmit before
+/// reaching the registry. The default backlog (128) overflowed 110 times in one
+/// afternoon of CI.
+const LISTEN_BACKLOG: u32 = 4096;
+
+/// Bind the registry address with [`LISTEN_BACKLOG`].
+fn listen(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    // Match `TcpListener::bind`: allow restarts while old connections are in TIME_WAIT.
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(LISTEN_BACKLOG)
+}
+
 /// Run a plain local registry until the process is stopped (no relay upstreams).
 /// `addr` is the listen address; `root` is the store directory.
 pub async fn serve(addr: SocketAddr, root: PathBuf) -> Result<()> {
@@ -1625,9 +1645,7 @@ pub async fn serve(addr: SocketAddr, root: PathBuf) -> Result<()> {
 /// store root).
 pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
     let addr = cfg.addr;
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("binding {addr}"))?;
+    let listener = listen(addr).with_context(|| format!("binding {addr}"))?;
     let tls = cfg.build_tls()?;
     // Resolved before `into_state` consumes the config; bound after it, because the
     // listener is only worth having once the db behind it is open.
