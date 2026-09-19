@@ -16,6 +16,18 @@ pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
 /// Longest interval between window probes while the peer's receive window is closed
 const MAX_PERSIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Largest window scale RFC 7323 § 2.3 permits, which is what the 32-bit sequence space allows.
+pub(super) const MAX_WINDOW_SHIFT: u8 = 14;
+
+/// The smallest shift that lets `buffer` be advertised in a 16-bit window field.
+fn window_shift_for(buffer: usize) -> u8 {
+    let mut shift = 0;
+    while shift < MAX_WINDOW_SHIFT && (buffer >> shift) > u16::MAX as usize {
+        shift += 1;
+    }
+    shift
+}
+
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub(crate) enum TcpState {
     // Init, /* Since we always act as a server, it starts from `Listen`, so we don't use states Init & SynSent. */
@@ -54,7 +66,14 @@ pub(crate) struct Tcb {
     ack: SeqNum,
     mtu: u16,
     last_received_ack: SeqNum,
-    send_window: u16,
+    /// The peer's receive window in bytes, already scaled by `peer_window_shift`.
+    send_window: u32,
+    /// Shift applied to the windows the peer advertises, from the scale in its SYN.
+    peer_window_shift: u8,
+    /// Shift applied to the windows we advertise, set only when the peer's SYN offered scaling:
+    /// RFC 7323 § 2.2 makes scaling a property of the connection, so neither side scales without
+    /// it. `None` is also what says the SYN-ACK carries no window scale of its own.
+    recv_window_shift: Option<u8>,
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
@@ -96,7 +115,9 @@ impl Tcb {
             ack,
             mtu,
             last_received_ack: seq.into(),
-            send_window: u16::MAX,
+            send_window: u16::MAX as u32,
+            peer_window_shift: 0,
+            recv_window_shift: None,
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
             unordered_packets: BTreeMap::new(),
@@ -231,9 +252,6 @@ impl Tcb {
             }
         }
     }
-    pub(super) fn get_available_read_buffer_size(&self) -> usize {
-        self.read_buffer_size.saturating_sub(self.get_unordered_packets_total_len())
-    }
     #[inline]
     pub(crate) fn get_unordered_packets_total_len(&self) -> usize {
         self.unordered_packets.values().map(|p| p.len()).sum()
@@ -309,9 +327,36 @@ impl Tcb {
     pub(super) fn get_state(&self) -> TcpState {
         self.state
     }
-    /// Take the peer's advertised window, arming the persist timer while it is closed: nothing
-    /// may be sent to a peer with no room but a probe.
-    pub(super) fn update_send_window(&mut self, window: u16) {
+    /// Take the window fields of the peer's SYN. A SYN's own window is never scaled, whatever it
+    /// negotiates, and the scale it carries — or does not — decides the connection: without one
+    /// neither side scales (RFC 7323 § 2.2). Our own shift is the smallest that can advertise the
+    /// read buffer in full.
+    pub(super) fn accept_syn_window(&mut self, window: u16, peer_shift: Option<u8>) {
+        self.send_window = window as u32;
+        if let Some(shift) = peer_shift {
+            // A shift past the maximum is the peer's error; RFC 7323 § 2.3 has it used as 14.
+            if shift > MAX_WINDOW_SHIFT {
+                log::warn!("Peer window scale {shift} exceeds {MAX_WINDOW_SHIFT}; clamping it");
+            }
+            self.peer_window_shift = shift.min(MAX_WINDOW_SHIFT);
+            self.recv_window_shift = Some(window_shift_for(self.read_buffer_size));
+        }
+    }
+
+    /// Our window scale, when the handshake negotiated one: the shift the SYN-ACK advertises.
+    pub(super) fn get_recv_window_shift(&self) -> Option<u8> {
+        self.recv_window_shift
+    }
+
+    /// A window the peer advertised, in bytes.
+    fn peer_window_bytes(&self, header_window: u16) -> u32 {
+        (header_window as u32) << self.peer_window_shift
+    }
+
+    /// Take the peer's advertised window from a segment past the handshake, scale and all, arming
+    /// the persist timer while it is closed: nothing may be sent to a peer with no room but a probe.
+    pub(super) fn update_send_window(&mut self, header_window: u16) {
+        let window = self.peer_window_bytes(header_window);
         if window == 0 {
             if self.persist_deadline.is_none() {
                 self.persist_timeout = self.rto;
@@ -340,11 +385,17 @@ impl Tcb {
         self.persist_deadline = Some(now + self.persist_timeout);
         true
     }
-    pub(super) fn get_send_window(&self) -> u16 {
+    pub(super) fn get_send_window(&self) -> u32 {
         self.send_window
     }
-    pub(super) fn get_recv_window(&self) -> u16 {
-        self.get_available_read_buffer_size().try_into().unwrap_or(u16::MAX)
+    /// The window we may advertise, in bytes: what the reassembly buffer still has room for.
+    pub(super) fn get_recv_window_bytes(&self) -> usize {
+        self.read_buffer_size.saturating_sub(self.get_unordered_packets_total_len())
+    }
+    /// `bytes` as a header window field: shifted by our own scale, and clamped to what the field
+    /// holds — which is all a peer that agreed to no scaling can be told about.
+    pub(super) fn scale_recv_window(&self, bytes: usize) -> u16 {
+        (bytes >> self.recv_window_shift.unwrap_or(0)).min(u16::MAX as usize) as u16
     }
     // #[inline(always)]
     // pub(super) fn buffer_size(&self, payload_len: u16) -> u16 {
@@ -374,7 +425,10 @@ impl Tcb {
                         PacketType::KeepAlive
                     } else if !payload.is_empty() {
                         PacketType::NewPacket
-                    } else if self.get_send_window() == rcvd_window && self.seq != rcvd_ack && self.is_duplicate_ack_count_exceeded() {
+                    } else if self.get_send_window() == self.peer_window_bytes(rcvd_window)
+                        && self.seq != rcvd_ack
+                        && self.is_duplicate_ack_count_exceeded()
+                    {
                         PacketType::RetransmissionRequest
                     } else {
                         PacketType::WindowUpdate
@@ -484,7 +538,7 @@ impl Tcb {
     pub fn is_send_buffer_full(&self) -> bool {
         // To respect the receiver's window (remote_window) size and avoid sending too many unacknowledged packets, which may cause packet loss
         // Simplified version: min(cwnd, rwnd)
-        self.seq.distance(self.get_last_received_ack()) >= self.max_unacked_bytes.min(self.get_send_window() as u32)
+        self.seq.distance(self.get_last_received_ack()) >= self.max_unacked_bytes.min(self.get_send_window())
     }
 }
 
@@ -780,6 +834,102 @@ mod tests {
         assert!(tcb.inflight_packets.is_empty());
         let (packets, again) = tcb.collect_timed_out_inflight_packets();
         assert!(packets.is_empty() && !again, "an empty queue reports nothing");
+    }
+
+    fn tcb_with(max_unacked_bytes: u32, read_buffer_size: usize, rto: Duration) -> Tcb {
+        Tcb::new(
+            SeqNum(1000),
+            1500,
+            max_unacked_bytes,
+            read_buffer_size,
+            MAX_COUNT_FOR_DUP_ACK,
+            rto,
+            MAX_RETRANSMIT_COUNT,
+        )
+    }
+
+    /// Our own shift is the smallest that can advertise the read buffer in full, capped where
+    /// RFC 7323 § 2.3 caps it.
+    #[test]
+    fn the_advertised_shift_covers_the_read_buffer() {
+        assert_eq!(window_shift_for(READ_BUFFER_SIZE), 0);
+        assert_eq!(window_shift_for(u16::MAX as usize), 0);
+        assert_eq!(window_shift_for(u16::MAX as usize + 1), 1);
+        assert_eq!(window_shift_for(4 * 1024 * 1024), 7);
+        assert_eq!(window_shift_for(usize::MAX), MAX_WINDOW_SHIFT);
+    }
+
+    /// A read buffer larger than the window field holds is worth nothing until it is advertised
+    /// through the scale.
+    #[test]
+    fn a_large_read_buffer_is_advertised_scaled() {
+        const FOUR_MIB: usize = 4 * 1024 * 1024;
+        let mut tcb = tcb_with(MAX_UNACK, FOUR_MIB, RTO);
+        tcb.accept_syn_window(64240, Some(7));
+
+        assert_eq!(tcb.get_recv_window_shift(), Some(7));
+        let bytes = tcb.get_recv_window_bytes();
+        assert_eq!(bytes, FOUR_MIB);
+        assert_eq!((tcb.scale_recv_window(bytes) as usize) << 7, bytes);
+    }
+
+    /// The scale in the peer's SYN applies to every window it advertises afterwards, so a
+    /// 1000-byte field at shift 7 is 128 000 bytes of room to fill.
+    #[test]
+    fn a_scaled_peer_window_admits_the_bytes_it_stands_for() {
+        let mut tcb = tcb_with(256 * 1024, READ_BUFFER_SIZE, RTO);
+        tcb.accept_syn_window(64240, Some(7));
+        assert_eq!(tcb.get_send_window(), 64240, "the SYN's own window was scaled");
+
+        tcb.update_send_window(1000);
+        assert_eq!(tcb.get_send_window(), 128_000);
+        tcb.seq = SeqNum(5000);
+        tcb.update_last_received_ack(SeqNum(5000));
+        assert!(!tcb.is_send_buffer_full());
+        tcb.seq += 127_999;
+        assert!(!tcb.is_send_buffer_full(), "the peer's window was cut short of what it scales to");
+        tcb.seq += 1;
+        assert!(tcb.is_send_buffer_full());
+    }
+
+    /// A SYN without the option leaves the connection unscaled in both directions, and one asking
+    /// for more than RFC 7323 § 2.3 allows is taken as asking for the maximum.
+    #[test]
+    fn a_peer_shift_is_used_only_when_offered_and_never_past_the_maximum() {
+        let mut unscaled = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        unscaled.accept_syn_window(64240, None);
+        unscaled.update_send_window(1000);
+        assert_eq!(unscaled.get_send_window(), 1000);
+        assert_eq!(unscaled.get_recv_window_shift(), None);
+        assert_eq!(unscaled.scale_recv_window(1000), 1000);
+
+        let mut capped = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        capped.accept_syn_window(64240, Some(20));
+        capped.update_send_window(1);
+        assert_eq!(capped.get_send_window(), 1 << MAX_WINDOW_SHIFT);
+    }
+
+    /// Zero is zero at any scale: a peer that closes its window still has to be probed before
+    /// anything more is sent to it.
+    #[test]
+    fn a_closed_window_arms_the_persist_timer_when_scaled() {
+        let rto = Duration::from_secs(60);
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, rto);
+        tcb.accept_syn_window(64240, Some(7));
+
+        tcb.update_send_window(0);
+        assert_eq!(tcb.get_send_window(), 0);
+        assert!(
+            !tcb.take_due_persist_probe(Duration::from_secs(1)),
+            "probed before the timer was due"
+        );
+        tcb.persist_deadline = Some(std::time::Instant::now());
+        assert!(tcb.take_due_persist_probe(Duration::from_secs(1)));
+
+        // The smallest window the peer can reopen with is a scaled one, and it ends persist mode.
+        tcb.update_send_window(1);
+        assert_eq!(tcb.get_send_window(), 128);
+        assert!(!tcb.take_due_persist_probe(Duration::from_secs(1)));
     }
 
     /// A packet is given up on only after its own timer expires with its retransmissions spent.

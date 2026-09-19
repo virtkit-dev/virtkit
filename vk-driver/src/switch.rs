@@ -100,12 +100,10 @@ const TCP_MAX_RETRANSMITS: usize = 6;
 /// stopped answering is reset by retransmission exhaustion ([`TCP_MAX_RETRANSMITS`]) first.
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// The window the switch advertises to a guest, and the ceiling on what one flow holds
-/// unacknowledged in the other direction. The stack has no window scaling — it writes the
-/// window into the bare 16-bit header field — so 64 KiB less a byte is the most a guest can be
-/// told it may send, and its 16 KiB default would pace an upload at a quarter of that per round
-/// trip. A session costs about three buffers this size: reassembly, the handoff to the reader,
-/// and data the guest has not acknowledged.
-const TCP_WINDOW: usize = u16::MAX as usize;
+/// unacknowledged in the other direction. Scaling lets a guest that offers it use the full
+/// 4 MiB; other peers retain the unscaled limit. Buffered data can occupy roughly three
+/// windows per flow: reassembly, the reader handoff, and unacknowledged outgoing data.
+const TCP_WINDOW: usize = 4 << 20;
 
 #[derive(Clone, Copy)]
 struct Cfg {
@@ -907,19 +905,8 @@ pub async fn run(
     // VM by destination IP.
     let (egress_tx, egress_rx) = unbounded_channel::<Vec<u8>>();
     let (ret_tx, mut ret_rx) = unbounded_channel::<Vec<u8>>();
-    let mut config = IpStackConfig::default();
-    config.mtu_unchecked(MTU);
-    // The default of 3 retransmits abandons a guest-bound segment 15s in, which a busy host
-    // that fails to schedule the switch reaches on a healthy flow; the stack then resets the
-    // connection and the guest's application reconnects. `TCP_MAX_RETRANSMITS` allows 127s.
-    let mut tcp = ipstack::TcpConfig::default();
-    tcp.max_retransmit_count = TCP_MAX_RETRANSMITS;
-    tcp.timeout = TCP_IDLE_TIMEOUT;
-    tcp.read_buffer_size = TCP_WINDOW;
-    tcp.max_unacked_bytes = TCP_WINDOW as u32;
-    config.with_tcp_config(tcp);
     let ip_stack = IpStack::new(
-        config,
+        ip_stack_config(),
         ChannelDevice {
             rx: egress_rx,
             tx: ret_tx,
@@ -1232,6 +1219,23 @@ fn flood(inner: &Inner, from: PortId, frame: &[u8]) {
             let _ = tx.send(frame.to_vec());
         }
     }
+}
+
+fn ip_stack_config() -> IpStackConfig {
+    let mut config = IpStackConfig::default();
+    config.mtu_unchecked(MTU);
+    // The default of 3 retransmits abandons a guest-bound segment 15s in, which a busy host
+    // that fails to schedule the switch reaches on a healthy flow; the stack then resets the
+    // connection and the guest's application reconnects. `TCP_MAX_RETRANSMITS` allows 127s.
+    let mut tcp = ipstack::TcpConfig::default();
+    tcp.max_retransmit_count = TCP_MAX_RETRANSMITS;
+    tcp.timeout = TCP_IDLE_TIMEOUT;
+    tcp.read_buffer_size = TCP_WINDOW;
+    tcp.max_unacked_bytes = TCP_WINDOW as u32;
+    // Advertise the IPv4 link's MSS so guests need not fall back to small segments.
+    tcp.options = Some(vec![ipstack::TcpOptions::MaximumSegmentSize(MTU - 40)]);
+    config.with_tcp_config(tcp);
+    config
 }
 
 /// ipstack's accept loop: each guest flow becomes a host-side proxy, gated by the
@@ -2398,6 +2402,96 @@ mod tests {
             &format_args!("reset"),
         );
         assert_eq!(line, "switch: warn ipstack::stream::tcp: reset");
+    }
+
+    #[tokio::test]
+    async fn tcp_handshake_advertises_mss_and_negotiates_window_scaling() {
+        use etherparse::{PacketBuilder, PacketHeaders, TcpOptionElement, TransportHeader};
+        use tokio::time::timeout;
+
+        for scaling in [false, true] {
+            let (tx, rx) = unbounded_channel();
+            let (reply_tx, mut replies) = unbounded_channel();
+            let mut stack = IpStack::new(ip_stack_config(), ChannelDevice { rx, tx: reply_tx });
+            let guest = [192, 168, 127, 2];
+            let remote = [10, 0, 0, 1];
+            let mut syn = Vec::new();
+            let options = if scaling {
+                vec![TcpOptionElement::WindowScale(7)]
+            } else {
+                Vec::new()
+            };
+            PacketBuilder::ipv4(guest, remote, 64)
+                .tcp(40000, 443, 1000, 64240)
+                .syn()
+                .options(&options)
+                .unwrap()
+                .write(&mut syn, &[])
+                .unwrap();
+            tx.send(syn).unwrap();
+
+            let reply = timeout(Duration::from_secs(2), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let Some(TransportHeader::Tcp(synack)) =
+                PacketHeaders::from_ip_slice(&reply).unwrap().transport
+            else {
+                panic!("expected a TCP SYN-ACK");
+            };
+            assert!(synack.syn && synack.ack);
+            assert_eq!(synack.window_size, u16::MAX);
+            assert_eq!(synack.acknowledgment_number, 1001);
+            let mut expected = vec![TcpOptionElement::MaximumSegmentSize(1460)];
+            if scaling {
+                expected.push(TcpOptionElement::WindowScale(7));
+            }
+            assert_eq!(
+                synack
+                    .options_iterator()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap(),
+                expected
+            );
+
+            let mut ack = Vec::new();
+            PacketBuilder::ipv4(guest, remote, 64)
+                .tcp(40000, 443, 1001, 64240)
+                .ack(synack.sequence_number.wrapping_add(1))
+                .write(&mut ack, &[])
+                .unwrap();
+            tx.send(ack).unwrap();
+            let IpStackStream::Tcp(mut stream) = timeout(Duration::from_secs(2), stack.accept())
+                .await
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("expected a TCP stream");
+            };
+            timeout(Duration::from_secs(2), stream.write_all(b"reply"))
+                .await
+                .unwrap()
+                .unwrap();
+            let reply = timeout(Duration::from_secs(2), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let Some(TransportHeader::Tcp(data)) =
+                PacketHeaders::from_ip_slice(&reply).unwrap().transport
+            else {
+                panic!("expected TCP data");
+            };
+            assert!(data.ack && !data.syn);
+            assert!(data.options.is_empty());
+            assert_eq!(
+                data.window_size as usize,
+                if scaling {
+                    TCP_WINDOW >> 7
+                } else {
+                    u16::MAX as usize
+                }
+            );
+        }
     }
 
     #[test]

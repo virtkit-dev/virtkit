@@ -4,6 +4,10 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Improve bulk network transfers between guests and external services.**
+
 ## [0.73.2] - 2026-09-19
 
 ### Fixed

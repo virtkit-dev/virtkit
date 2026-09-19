@@ -7,7 +7,10 @@ use crate::{
         tcp_flags::{ACK, FIN, PSH, RST, SYN},
         tcp_header_flags, tcp_header_fmt,
     },
-    stream::tcb::{MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, PacketType, READ_BUFFER_SIZE, READ_CHUNK, RTO, Tcb, TcpState},
+    stream::tcb::{
+        MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, MAX_WINDOW_SHIFT, PacketType, READ_BUFFER_SIZE, READ_CHUNK, RTO, Tcb,
+        TcpState,
+    },
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
 use std::{
@@ -55,7 +58,8 @@ pub struct TcpConfig {
     /// Advertised receive window and reassembly-buffer bound, in bytes. The reader handoff holds
     /// about as much again in acknowledged data, for a total footprint of roughly twice this
     /// value. Both can overshoot: the next expected segment is admitted even when the buffer is
-    /// full, and the handoff capacity is rounded to whole chunks.
+    /// full, and the handoff capacity is rounded to whole chunks. Advertising a receive window
+    /// above 65,535 bytes requires the peer to offer window scaling (RFC 7323 § 2).
     pub read_buffer_size: usize,
     /// Maximum number of duplicate ACKs before triggering fast retransmission.
     pub max_count_for_dup_ack: usize,
@@ -182,6 +186,40 @@ pub struct IpStackTcpStream {
     config: Arc<TcpConfig>,
 }
 
+/// Find the SYN's first window scale, skipping unknown options by their declared length.
+/// Stop at EOL or a malformed option; bytes beyond either cannot offer a scale.
+fn syn_window_scale(mut options: &[u8]) -> Result<Option<u8>, &'static str> {
+    use etherparse::tcp_option::{KIND_END, KIND_NOOP, KIND_WINDOW_SCALE, LEN_WINDOW_SCALE};
+
+    while let Some((&kind, rest)) = options.split_first() {
+        match kind {
+            KIND_END => return Ok(None),
+            KIND_NOOP => {
+                options = rest;
+                continue;
+            }
+            _ => {}
+        }
+        let Some((&length, _)) = rest.split_first() else {
+            return Err("missing option length");
+        };
+        if length < 2 {
+            return Err("option length is less than two");
+        }
+        let Some((option, remaining)) = options.split_at_checked(usize::from(length)) else {
+            return Err("option extends past the TCP header");
+        };
+        if kind == KIND_WINDOW_SCALE {
+            if length != LEN_WINDOW_SCALE {
+                return Err("invalid window scale option length");
+            }
+            return Ok(option.get(2).copied());
+        }
+        options = remaining;
+    }
+    Ok(None)
+}
+
 impl IpStackTcpStream {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -194,7 +232,7 @@ impl IpStackTcpStream {
         destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
         config: Arc<TcpConfig>,
     ) -> Result<IpStackTcpStream, IpStackError> {
-        let tcb = Tcb::new(
+        let mut tcb = Tcb::new(
             SeqNum(tcp.sequence_number),
             mtu,
             config.max_unacked_bytes,
@@ -213,6 +251,16 @@ impl IpStackTcpStream {
             let info = format!("Invalid TCP packet: {tuple} {}", tcp_header_fmt(&tcp));
             return Err(IpStackError::IoError(std::io::Error::new(ConnectionRefused, info)));
         }
+        let peer_window_shift = syn_window_scale(tcp.options.as_slice()).unwrap_or_else(|err| {
+            log::warn!("{tuple}: malformed SYN options: {err}");
+            None
+        });
+        tcb.accept_syn_window(tcp.window_size, peer_window_shift);
+        log::debug!(
+            "{tuple}: window scaling: peer offer {peer_window_shift:?}, effective peer shift {:?}, local shift {:?}",
+            peer_window_shift.map(|shift| shift.min(MAX_WINDOW_SHIFT)),
+            tcb.get_recv_window_shift()
+        );
 
         let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
         let data_channel_len = config.read_buffer_size.div_ceil(READ_CHUNK).max(1);
@@ -574,7 +622,7 @@ fn reset_stray_segment(sender: &PacketSender, tuple: NetworkTuple, tcp: &TcpHead
         (RST | ACK, 0, tcp.sequence_number.wrapping_add(consumed))
     };
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
-    let packet = create_raw_packet(src, dst, |_, _| 0, flags, TTL, seq, ack, 0, Vec::new(), None)?;
+    let packet = create_raw_packet(src, dst, |_, _| 0, flags, TTL, seq, ack, 0, Vec::new(), None, None)?;
     sender.send(packet).map_err(|e| std::io::Error::new(UnexpectedEof, e))
 }
 
@@ -995,11 +1043,14 @@ async fn tcp_main_logic_loop(
         log::trace!("{network_tuple} {state:?}: {l_info} {info}, {pkt_type:?}, len = {len}");
         // A segment the check above rejects — a reordered duplicate, say — still reports the room
         // the peer had when it was sent, so its window is taken even though its acknowledgment is
-        // not: that ends persist mode a probe early.
-        let reopened = tcb.get_send_window() == 0 && incoming_win > 0;
-        tcb.update_send_window(incoming_win);
-        if reopened {
-            write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+        // not: that ends persist mode a probe early. A retransmitted SYN is the exception: its
+        // window is unscaled, and the handshake already took it.
+        if flags & SYN == 0 {
+            let reopened = tcb.get_send_window() == 0 && incoming_win > 0;
+            tcb.update_send_window(incoming_win);
+            if reopened {
+                write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
+            }
         }
 
         if pkt_type == PacketType::Invalid {
@@ -1245,10 +1296,16 @@ pub(crate) fn write_packet_to_device(
 ) -> std::io::Result<usize> {
     use std::io::Error;
     let seq = seq.unwrap_or(tcb.get_seq()).0;
-    // Silly-window-syndrome avoidance: advertise a real window only when a full segment fits,
-    // otherwise advertise zero so the peer enters persist mode until the reader frees space.
-    let recv_window = tcb.get_recv_window();
-    let window_size = if recv_window >= tcb.get_mtu() { recv_window } else { 0 };
+    // Silly-window-syndrome avoidance, in bytes: advertise a real window only when a full segment
+    // fits, otherwise advertise zero so the peer enters persist mode until the reader frees space.
+    let available = tcb.get_recv_window_bytes();
+    let window_bytes = if available >= tcb.get_mtu() as usize { available } else { 0 };
+    // Our scale rides on the SYN-ACK and applies from the segment after it: the handshake's own
+    // window is read unscaled by both sides (RFC 7323 § 2.2).
+    let (window_size, window_scale) = match flags & SYN {
+        0 => (tcb.scale_recv_window(window_bytes), None),
+        _ => (window_bytes.min(u16::MAX as usize) as u16, tcb.get_recv_window_shift()),
+    };
     let ack = tcb.get_ack().0;
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
     let calc = |ip_header_len: usize, tcp_header_len: usize| tcb.calculate_payload_max_len(ip_header_len, tcp_header_len);
@@ -1263,6 +1320,7 @@ pub(crate) fn write_packet_to_device(
         window_size,
         payload.unwrap_or_default(),
         options,
+        window_scale,
     )?;
     let len = packet.payload.as_ref().map(|p| p.len()).unwrap_or(0);
     up_packet_sender.send(packet).map_err(|e| Error::new(UnexpectedEof, e))?;
@@ -1281,6 +1339,7 @@ pub(crate) fn create_raw_packet(
     win: u16,
     mut payload: Vec<u8>,
     options: Option<&Vec<TcpOptions>>,
+    window_scale: Option<u8>,
 ) -> std::io::Result<NetworkPacket> {
     let mut tcp_header = etherparse::TcpHeader::new(src_addr.port(), dst_addr.port(), seq, win);
     tcp_header.acknowledgment_number = ack;
@@ -1290,13 +1349,16 @@ pub(crate) fn create_raw_packet(
     tcp_header.fin = flags & FIN != 0;
     tcp_header.psh = flags & PSH != 0;
 
-    if let Some(opts) = options {
-        let mut tcp_options = Vec::new();
-        for opt in opts {
-            match opt {
-                TcpOptions::MaximumSegmentSize(mss) => tcp_options.push(TcpOptionElement::MaximumSegmentSize(*mss)),
-            }
+    let mut tcp_options = Vec::new();
+    for opt in options.into_iter().flatten() {
+        match opt {
+            TcpOptions::MaximumSegmentSize(mss) => tcp_options.push(TcpOptionElement::MaximumSegmentSize(*mss)),
         }
+    }
+    if let Some(shift) = window_scale {
+        tcp_options.push(TcpOptionElement::WindowScale(shift));
+    }
+    if !tcp_options.is_empty() {
         tcp_header
             .set_options(&tcp_options)
             .map_err(|e| std::io::Error::new(InvalidInput, e))?;
@@ -1374,8 +1436,21 @@ mod tests {
 
     /// The same, advertising a receive window of the peer's choosing.
     fn segment_with_window(flags: u8, seq: u32, ack: u32, payload: Vec<u8>, window: u16) -> NetworkPacket {
+        segment_with_scale(flags, seq, ack, payload, window, None)
+    }
+
+    /// The same again, offering the peer's window scale — only ever meaningful on a SYN.
+    fn segment_with_scale(flags: u8, seq: u32, ack: u32, payload: Vec<u8>, window: u16, shift: Option<u8>) -> NetworkPacket {
         let (src, dst) = addrs();
-        create_raw_packet(src, dst, |_, _| 60_000, flags, TTL, seq, ack, window, payload, None).unwrap()
+        create_raw_packet(src, dst, |_, _| 60_000, flags, TTL, seq, ack, window, payload, None, shift).unwrap()
+    }
+
+    /// The window scale a header carries, if any.
+    fn window_scale(header: &TcpHeader) -> Option<u8> {
+        header.options_iterator().flatten().find_map(|option| match option {
+            TcpOptionElement::WindowScale(shift) => Some(shift),
+            _ => None,
+        })
     }
 
     fn header(packet: &NetworkPacket) -> &TcpHeader {
@@ -1416,16 +1491,27 @@ mod tests {
         config: TcpConfig,
         messenger: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> IpStackTcpStream {
-        let (src, dst) = addrs();
         let syn = segment(SYN, PEER_ISN, 0, Vec::new());
+        established_from_syn(up_tx, up_rx, config, messenger, syn).await.0
+    }
+
+    /// The same from a SYN of the caller's making, returning the SYN-ACK it was answered with.
+    async fn established_from_syn(
+        up_tx: PacketSender,
+        up_rx: &mut PacketReceiver,
+        config: TcpConfig,
+        messenger: Option<tokio::sync::oneshot::Sender<()>>,
+        syn: NetworkPacket,
+    ) -> (IpStackTcpStream, TcpHeader) {
+        let (src, dst) = addrs();
         let stream = IpStackTcpStream::new(src, dst, header(&syn).clone(), 0, up_tx, 1500, messenger, Arc::new(config)).unwrap();
-        let synack = next_packet(up_rx).await;
-        assert_eq!(tcp_header_flags(header(&synack)), SYN | ACK);
-        let ours = header(&synack).sequence_number.wrapping_add(1);
+        let synack = header(&next_packet(up_rx).await).clone();
+        assert_eq!(tcp_header_flags(&synack), SYN | ACK);
+        let ours = synack.sequence_number.wrapping_add(1);
         stream.stream_sender().send(segment(ACK, PEER_ISN + 1, ours, Vec::new())).unwrap();
         for _ in 0..500 {
             if stream.tcb.lock().unwrap().get_state() == TcpState::Established {
-                return stream;
+                return (stream, synack);
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -2357,6 +2443,118 @@ mod tests {
         sender.send(segment(ACK | PSH, PEER_ISN + 1001, ours, vec![2; 1000])).unwrap();
         let dup_ack = packet_matching(&mut up_rx, |h| tcp_header_flags(h) == ACK).await;
         assert_eq!(dup_ack.acknowledgment_number, PEER_ISN + 1, "the gap was acknowledged as filled");
+    }
+
+    /// A 4 MiB buffer is worth nothing to a peer that is told about it in a 16-bit field: the
+    /// SYN offering a scale is answered with one of our own, and every window after the handshake
+    /// is advertised through it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scaled_syn_is_answered_with_our_own_scale() {
+        const FOUR_MIB: usize = 4 * 1024 * 1024;
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            read_buffer_size: FOUR_MIB,
+            max_unacked_bytes: FOUR_MIB as u32,
+            ..TcpConfig::default()
+        };
+        let syn = segment_with_scale(SYN, PEER_ISN, 0, Vec::new(), 64240, Some(7));
+        let (stream, synack) = established_from_syn(up_tx, &mut up_rx, config, None, syn).await;
+
+        // Seven bits of scale are what a 4 MiB buffer needs to fit the window field.
+        assert_eq!(window_scale(&synack), Some(7));
+        // The handshake's own window is read unscaled, so it says no more than the field holds.
+        assert_eq!(synack.window_size, u16::MAX);
+
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+        sender.send(segment(ACK, PEER_ISN + 1, ours, vec![1; 1000])).unwrap();
+
+        let acked = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 1001).await;
+        let advertised = (acked.window_size as usize) << 7;
+        assert_eq!(advertised, FOUR_MIB, "the window was not advertised at the scale we asked for");
+        assert!(advertised > u16::MAX as usize);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_syn_option_does_not_hide_window_scaling() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            read_buffer_size: 4 * 1024 * 1024,
+            ..TcpConfig::default()
+        };
+        let mut syn = segment(SYN, PEER_ISN, 0, Vec::new());
+        let TransportHeader::Tcp(tcp) = &mut syn.transport else {
+            unreachable!();
+        };
+        tcp.set_options_raw(&[30, 2, 3, 3, 7, 0, 0, 0]).unwrap();
+        let (stream, synack) = established_from_syn(up_tx, &mut up_rx, config, None, syn).await;
+
+        assert_eq!(window_scale(&synack), Some(7));
+        assert_eq!(stream.tcb.lock().unwrap().get_send_window(), 64240 << 7);
+    }
+
+    #[test]
+    fn syn_window_scale_obeys_option_boundaries() {
+        assert_eq!(syn_window_scale(&[]), Ok(None));
+        assert_eq!(syn_window_scale(&[1, 3, 3, 0]), Ok(Some(0)));
+        assert_eq!(syn_window_scale(&[30, 4, 3, 3, 3, 3, 255]), Ok(Some(255)));
+        assert_eq!(syn_window_scale(&[0, 3, 3, 7]), Ok(None));
+        assert_eq!(syn_window_scale(&[3, 3, 7, 3, 3, 2]), Ok(Some(7)));
+        assert_eq!(syn_window_scale(&[3, 3, 7, 30, 0]), Ok(Some(7)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_syn_options_do_not_offer_window_scaling() {
+        for options in [
+            &[30, 0, 3, 3, 7, 0, 0, 0][..],
+            &[30, 1, 3, 3, 7, 0, 0, 0],
+            &[30, 9, 3, 3, 7, 0, 0, 0],
+            &[3, 2, 3, 3, 7, 0, 0, 0],
+            &[3, 4, 7, 0, 3, 3, 7, 0],
+            &[1, 1, 3, 3],
+            &[1, 1, 1, 30],
+        ] {
+            let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+            let config = TcpConfig {
+                read_buffer_size: 4 * 1024 * 1024,
+                ..TcpConfig::default()
+            };
+            let mut syn = segment(SYN, PEER_ISN, 0, Vec::new());
+            let TransportHeader::Tcp(tcp) = &mut syn.transport else {
+                unreachable!();
+            };
+            tcp.set_options_raw(options).unwrap();
+            let (stream, synack) = established_from_syn(up_tx, &mut up_rx, config, None, syn).await;
+
+            assert_eq!(window_scale(&synack), None, "accepted malformed options {options:?}");
+            assert_eq!(synack.window_size, u16::MAX);
+            assert_eq!(stream.tcb.lock().unwrap().get_send_window(), 64240);
+        }
+    }
+
+    /// A SYN carrying no scale leaves the connection where it was: no option in the SYN-ACK, and
+    /// windows that mean exactly what they say — all a peer that never agreed to scaling can read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unscaled_syn_leaves_the_windows_as_they_are() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            read_buffer_size: 4 * 1024 * 1024,
+            ..TcpConfig::default()
+        };
+        let syn = segment(SYN, PEER_ISN, 0, Vec::new());
+        let (stream, synack) = established_from_syn(up_tx, &mut up_rx, config, None, syn).await;
+
+        assert_eq!(window_scale(&synack), None, "a scale was offered to a peer that asked for none");
+        assert_eq!(synack.window_size, u16::MAX);
+
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+        sender.send(segment(ACK, PEER_ISN + 1, ours, vec![1; 1000])).unwrap();
+
+        let acked = packet_matching(&mut up_rx, |h| h.acknowledgment_number == PEER_ISN + 1001).await;
+        assert_eq!(acked.window_size, u16::MAX, "the unscaled window did not say all the field holds");
+        // The peer's own window is unscaled too, whatever shift the buffer would have chosen.
+        assert_eq!(stream.tcb.lock().unwrap().get_send_window(), 64240);
     }
 
     #[tokio::test]

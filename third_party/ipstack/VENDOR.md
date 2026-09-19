@@ -1,7 +1,7 @@
 # Vendored ipstack
 
 Source: https://github.com/virtkit-dev/ipstack
-Revision: `f5a682d417219a708adbf8a8dc44c6f52faf0652`
+Revision: `03d8d75996d378c6f6f889d3389049d518a08186`
 
 Our fork of [narrowlink/ipstack](https://github.com/narrowlink/ipstack), branched from
 upstream `e1d8506`. Every fix the switch needs lives there as its own commit, written to go
