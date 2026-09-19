@@ -49,6 +49,12 @@ const MSS: u16 = MTU - 40;
 /// Buffer for the host-bound half of a spliced flow, matching ipstack's maximum read
 /// handoff of one 8 KiB reassembly chunk. The guest kernel sizes that direction's segments.
 const HOST_BOUND_CHUNK: usize = 8 << 10;
+/// Frame I/O on a guest's socket works in bursts: one read takes in whatever frames the
+/// socket holds, and queued frames share a write buffer. The bounds limit each batch;
+/// neither direction waits for a batch to fill.
+const READ_BUF: usize = 256 * 1024;
+const WRITE_BATCH_BYTES: usize = 256 * 1024;
+const WRITE_BATCH_FRAMES: usize = 64;
 const ETHERTYPE_ARP: u16 = 0x0806;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_IPV6: u16 = 0x86dd;
@@ -1080,10 +1086,10 @@ impl Switch {
     }
 
     async fn reader(&self, port: PortId, mut rd: tokio::net::unix::OwnedReadHalf) {
-        let mut buf = vec![0u8; MAX_FRAME];
+        let mut frames = FrameReader::new();
         loop {
-            match read_frame(&mut rd, &mut buf).await {
-                Ok(Some(n)) if n >= 14 => self.handle_frame(port, &buf[..n]),
+            match frames.next(&mut rd).await {
+                Ok(Some((a, b))) if b - a >= 14 => self.handle_frame(port, &frames.buf[a..b]),
                 Ok(Some(_)) => {} // runt
                 Ok(None) | Err(_) => return,
             }
@@ -2152,10 +2158,29 @@ impl AsyncWrite for ChannelDevice {
     }
 }
 
-/// The single writer to one guest's qemu stream.
-async fn writer_task(mut wr: tokio::net::unix::OwnedWriteHalf, mut rx: UnboundedReceiver<Vec<u8>>) {
-    while let Some(frame) = rx.recv().await {
-        if write_frame(&mut wr, &frame).await.is_err() {
+/// The single writer to one guest's qemu stream. Frames already queued behind the one
+/// that woke us share a write buffer, reducing calls when the socket accepts the batch.
+async fn writer_task<W: AsyncWrite + Unpin>(mut wr: W, mut rx: UnboundedReceiver<Vec<u8>>) {
+    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH_FRAMES);
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        if frames.is_empty() && rx.recv_many(&mut frames, WRITE_BATCH_FRAMES).await == 0 {
+            return; // every sender is gone
+        }
+        // Always take the first frame, then as many as fit: the byte bound keeps the
+        // staging buffer to one write's worth whatever the frames' size.
+        out.clear();
+        let mut taken = 0;
+        for frame in &frames {
+            if taken > 0 && out.len() + 4 + frame.len() > WRITE_BATCH_BYTES {
+                break;
+            }
+            out.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+            out.extend_from_slice(frame);
+            taken += 1;
+        }
+        frames.drain(..taken);
+        if wr.write_all(&out).await.is_err() {
             return;
         }
     }
@@ -2176,26 +2201,61 @@ fn wrap_eth(ip: &[u8], guest_mac: Mac) -> Vec<u8> {
     out
 }
 
-/// Read one qemu-framed ethernet frame; `Ok(None)` on a clean EOF.
-async fn read_frame<R: AsyncRead + Unpin>(rd: &mut R, buf: &mut [u8]) -> Result<Option<usize>> {
-    let mut hdr = [0u8; 4];
-    match rd.read_exact(&mut hdr).await {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e).context("read frame length"),
-    }
-    let len = u32::from_be_bytes(hdr) as usize;
-    if len > buf.len() {
-        bail!("frame length {len} exceeds {}", buf.len());
-    }
-    rd.read_exact(&mut buf[..len]).await.context("read frame")?;
-    Ok(Some(len))
+/// A guest's qemu stream, read through a bounded buffer. One read can collect several
+/// frames, which `next` hands out one by one.
+struct FrameReader {
+    buf: Vec<u8>,
+    start: usize,
+    end: usize,
 }
 
-async fn write_frame<W: AsyncWrite + Unpin>(wr: &mut W, frame: &[u8]) -> Result<()> {
-    wr.write_all(&(frame.len() as u32).to_be_bytes()).await?;
-    wr.write_all(frame).await?;
-    Ok(())
+impl FrameReader {
+    fn new() -> Self {
+        Self {
+            // Hold at least one full frame, even if it arrives across several reads.
+            buf: vec![0u8; READ_BUF.max(MAX_FRAME + 4)],
+            start: 0,
+            end: 0,
+        }
+    }
+
+    /// The next frame as a range into `buf`, valid until the following call; `Ok(None)`
+    /// on a clean EOF.
+    async fn next<R: AsyncRead + Unpin>(&mut self, rd: &mut R) -> Result<Option<(usize, usize)>> {
+        // Buffered frames bypass socket polls, so charge each frame to Tokio's cooperative
+        // budget to keep a busy guest from monopolizing this executor thread.
+        tokio::task::consume_budget().await;
+        loop {
+            if self.end - self.start >= 4 {
+                let hdr: [u8; 4] = self.buf[self.start..self.start + 4].try_into().unwrap();
+                let len = u32::from_be_bytes(hdr) as usize;
+                if len > MAX_FRAME {
+                    bail!("frame length {len} exceeds {MAX_FRAME}");
+                }
+                if self.end - self.start >= 4 + len {
+                    let frame = (self.start + 4, self.start + 4 + len);
+                    self.start += 4 + len;
+                    return Ok(Some(frame));
+                }
+            }
+            // Keep a whole frame's worth of tail free, so the next read can complete the
+            // frame in one go however little of it arrived.
+            if self.buf.len() - self.end < MAX_FRAME + 4 {
+                self.buf.copy_within(self.start..self.end, 0);
+                self.end -= self.start;
+                self.start = 0;
+            }
+            match rd
+                .read(&mut self.buf[self.end..])
+                .await
+                .context("read frame")?
+            {
+                0 if self.end == self.start => return Ok(None),
+                0 => bail!("truncated frame"),
+                n => self.end += n,
+            }
+        }
+    }
 }
 
 /// Answer an ARP request for the gateway address; ignore everything else.
@@ -3018,6 +3078,220 @@ mod tests {
         p[12..16].copy_from_slice(&src.octets());
         p.extend_from_slice(tail);
         p
+    }
+
+    /// A stream that yields one byte per read, so a frame is split across as many reads
+    /// as it has bytes.
+    struct Trickle {
+        data: Vec<u8>,
+        pos: usize,
+    }
+
+    impl AsyncRead for Trickle {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut TaskCtx<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let me = self.get_mut();
+            if me.pos < me.data.len() && buf.remaining() > 0 {
+                buf.put_slice(&me.data[me.pos..me.pos + 1]);
+                me.pos += 1;
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn framed(frames: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for f in frames {
+            out.extend_from_slice(&(f.len() as u32).to_be_bytes());
+            out.extend_from_slice(f);
+        }
+        out
+    }
+
+    /// The reader hands frames out one at a time however the stream is chopped up: a
+    /// whole burst arriving in one read, or a frame dribbling in a byte at a time.
+    #[tokio::test]
+    async fn frame_reader_is_indifferent_to_how_the_stream_is_chopped_up() {
+        let frames: [&[u8]; 3] = [b"one", b"a longer second frame", b"three"];
+
+        let (mut w, mut r) = tokio::io::duplex(64 * 1024);
+        w.write_all(&framed(&frames)).await.unwrap();
+        let mut burst = FrameReader::new();
+        for expect in frames {
+            let (a, b) = burst.next(&mut r).await.unwrap().unwrap();
+            assert_eq!(&burst.buf[a..b], expect);
+        }
+
+        let mut trickle = Trickle {
+            data: framed(&frames),
+            pos: 0,
+        };
+        let mut split = FrameReader::new();
+        for expect in frames {
+            let (a, b) = split.next(&mut trickle).await.unwrap().unwrap();
+            assert_eq!(&split.buf[a..b], expect);
+        }
+        // Drained, so the peer going away is a clean EOF rather than a truncated frame.
+        assert!(split.next(&mut trickle).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn frame_reader_compacts_maximum_frames_and_accepts_empty_ones() {
+        let large: Vec<u8> = (0..MAX_FRAME).map(|i| i as u8).collect();
+        let frames = [
+            large.as_slice(),
+            &[],
+            large.as_slice(),
+            large.as_slice(),
+            large.as_slice(),
+            b"tail",
+        ];
+        let wire = framed(&frames);
+        assert!(wire.len() > READ_BUF);
+        let mut input = wire.as_slice();
+        let mut reader = FrameReader::new();
+        for expected in frames {
+            let (a, b) = reader.next(&mut input).await.unwrap().unwrap();
+            assert_eq!(&reader.buf[a..b], expected);
+        }
+        assert!(reader.next(&mut input).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn frame_reader_rejects_oversized_and_truncated_frames() {
+        for size in [MAX_FRAME as u32 + 1, u32::MAX] {
+            let header = size.to_be_bytes();
+            let mut input = header.as_slice();
+            let err = FrameReader::new().next(&mut input).await.unwrap_err();
+            assert!(err.to_string().contains("exceeds"));
+        }
+        let wire = framed(&[b"payload"]);
+        for end in 1..wire.len() {
+            let mut input = &wire[..end];
+            let err = FrameReader::new().next(&mut input).await.unwrap_err();
+            assert!(err.to_string().contains("truncated"));
+        }
+        assert!(
+            FrameReader::new()
+                .next(&mut &b""[..])
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn buffered_frames_let_another_task_run() {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let other = ran.clone();
+        let task = tokio::spawn(async move { other.store(true, Ordering::SeqCst) });
+        let wire = framed(&vec![b"small".as_slice(); 1024]);
+        let mut input = wire.as_slice();
+        let mut reader = FrameReader::new();
+        for _ in 0..1024 {
+            assert!(reader.next(&mut input).await.unwrap().is_some());
+        }
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "buffered reads monopolized the executor"
+        );
+        task.await.unwrap();
+    }
+
+    struct BatchWriter {
+        writes: Vec<Vec<u8>>,
+        max_write: usize,
+    }
+
+    impl AsyncWrite for BatchWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut TaskCtx<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let n = buf.len().min(self.max_write);
+            self.writes.push(buf[..n].to_vec());
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskCtx<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut TaskCtx<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_drains_closed_channels_in_bounded_batches_and_handles_short_writes() {
+        let frames: Vec<Vec<u8>> = (0..WRITE_BATCH_FRAMES * 2 + 5)
+            .map(|i| vec![i as u8; if i % 5 == 0 { MAX_FRAME } else { i % 14 }])
+            .collect();
+        let expected = framed(&frames.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        for max_write in [usize::MAX, 1024] {
+            let (tx, rx) = unbounded_channel();
+            for frame in &frames {
+                tx.send(frame.clone()).unwrap();
+            }
+            drop(tx);
+            let mut writer = BatchWriter {
+                writes: Vec::new(),
+                max_write,
+            };
+            writer_task(&mut writer, rx).await;
+            assert_eq!(writer.writes.concat(), expected);
+            if max_write == usize::MAX {
+                assert!(writer.writes.len() > 2);
+                for batch in &writer.writes {
+                    assert!(batch.len() <= WRITE_BATCH_BYTES);
+                    let mut count = 0;
+                    let mut rest = batch.as_slice();
+                    while !rest.is_empty() {
+                        let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+                        rest = &rest[4 + len..];
+                        count += 1;
+                    }
+                    assert!(count <= WRITE_BATCH_FRAMES);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_limits_the_number_of_small_frames_per_batch() {
+        let (tx, rx) = unbounded_channel();
+        for _ in 0..WRITE_BATCH_FRAMES * 2 + 1 {
+            tx.send(vec![0x5a]).unwrap();
+        }
+        drop(tx);
+        let mut writer = BatchWriter {
+            writes: Vec::new(),
+            max_write: usize::MAX,
+        };
+        writer_task(&mut writer, rx).await;
+        assert_eq!(
+            writer.writes.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![WRITE_BATCH_FRAMES * 5, WRITE_BATCH_FRAMES * 5, 5]
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_sends_an_isolated_frame_without_waiting_for_a_full_batch() {
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        let (_, writer) = writer.into_split();
+        let (tx, rx) = unbounded_channel();
+        let task = tokio::spawn(writer_task(writer, rx));
+        tx.send(b"one".to_vec()).unwrap();
+        let mut bytes = [0; 7];
+        tokio::time::timeout(Duration::from_secs(2), reader.read_exact(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes.as_slice(), framed(&[b"one"]));
+        drop(tx);
+        task.await.unwrap();
     }
 
     async fn send(s: &mut UnixStream, frame: &[u8]) {

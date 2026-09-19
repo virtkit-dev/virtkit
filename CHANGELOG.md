@@ -15,6 +15,8 @@ All notable changes to virtkit will be documented in this file.
   no longer require a full jumbo-sized receive buffer.
 - **Network reads can receive several packets at once with libkrun.** Invalid packet
   lengths and closed network streams now return errors instead of panicking or spinning.
+- **The shared network handles packet bursts in batches.** Queued traffic is sent promptly
+  without waiting for more packets to arrive.
 
 ## [0.73.3] - 2026-09-19
 
