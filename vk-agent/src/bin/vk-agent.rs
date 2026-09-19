@@ -138,6 +138,9 @@ enum Commands {
         /// Lets the vk switch match a per-MAC DHCP reservation; omit for a kernel-random MAC.
         #[arg(long)]
         mac: Option<String>,
+        /// link MTU (omit to keep the kernel default)
+        #[arg(long, value_parser = clap::value_parser!(u16).range(68..=65521))]
+        mtu: Option<u16>,
     },
     /// Run an SSH server (russh) on --socket, so the image needs no sshd
     ///
@@ -440,9 +443,9 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                 std::process::exit(1)
             }
         }
-        Commands::Net { iface, mac } => {
+        Commands::Net { iface, mac, mtu } => {
             install_console_logger(LevelFilter::Info);
-            if let Err(e) = vk_agent::tap::run_net(&socket, &iface, mac.as_deref()).await {
+            if let Err(e) = vk_agent::tap::run_net(&socket, &iface, mac.as_deref(), mtu).await {
                 error!("net: {e:#}");
                 std::process::exit(1)
             }
@@ -500,6 +503,31 @@ async fn execute(
 #[cfg(test)]
 mod tests {
     use super::Cli;
+
+    #[test]
+    fn net_mtu_is_optional_and_bounded_by_the_frame_buffer() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["vk-agent", "--socket", "vsock://1024", "net"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            super::Commands::Net { mtu: None, .. }
+        ));
+        for mtu in ["68", "65500", "65521"] {
+            let cli =
+                Cli::try_parse_from(["vk-agent", "--socket", "vsock://1024", "net", "--mtu", mtu])
+                    .unwrap();
+            assert!(matches!(
+                cli.command,
+                super::Commands::Net { mtu: Some(_), .. }
+            ));
+        }
+        for mtu in ["0", "67", "65522", "65535"] {
+            assert!(
+                Cli::try_parse_from(["vk-agent", "--socket", "vsock://1024", "net", "--mtu", mtu])
+                    .is_err()
+            );
+        }
+    }
 
     // `-h` is a summary: a short line per command, per flag and per possible value, with
     // the detail in the doc comment's second paragraph (which clap shows as `--help`). A

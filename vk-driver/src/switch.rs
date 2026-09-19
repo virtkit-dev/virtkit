@@ -33,8 +33,15 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 /// Gateway MAC — locally administered, unicast. The guest learns it via ARP.
 const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x01];
 const BCAST_MAC: [u8; 6] = [0xff; 6];
+/// Largest ethernet frame the switch's 4-byte-length framing carries, either direction.
 const MAX_FRAME: usize = 65535;
-const MTU: u16 = 1500;
+/// Link MTU of the switch's LAN. Every guest NIC on a switch is configured with it, the
+/// gateway's own stack runs at it, and it sets the MSS the gateway advertises — siblings
+/// share the LAN, so they have to agree. Jumbo packets reduce per-frame overhead during
+/// bulk transfers. The ceiling is an IPv4 datagram (65535) and [`MAX_FRAME`] once the
+/// 14-byte ethernet header is added.
+pub(crate) const MTU: u16 = vk_core::net::SWITCH_MTU;
+const _: () = assert!(MAX_FRAME >= 14 + MTU as usize);
 const ETHERTYPE_ARP: u16 = 0x0806;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_IPV6: u16 = 0x86dd;
@@ -1232,7 +1239,8 @@ fn ip_stack_config() -> IpStackConfig {
     tcp.timeout = TCP_IDLE_TIMEOUT;
     tcp.read_buffer_size = TCP_WINDOW;
     tcp.max_unacked_bytes = TCP_WINDOW as u32;
-    // Advertise the IPv4 link's MSS so guests need not fall back to small segments.
+    // Advertise the link's MSS — the MTU less the IPv4 and TCP headers — so a guest sizes
+    // its segments to the link instead of falling back to the 536-byte default.
     tcp.options = Some(vec![ipstack::TcpOptions::MaximumSegmentSize(MTU - 40)]);
     config.with_tcp_config(tcp);
     config
@@ -2442,7 +2450,7 @@ mod tests {
             assert!(synack.syn && synack.ack);
             assert_eq!(synack.window_size, u16::MAX);
             assert_eq!(synack.acknowledgment_number, 1001);
-            let mut expected = vec![TcpOptionElement::MaximumSegmentSize(1460)];
+            let mut expected = vec![TcpOptionElement::MaximumSegmentSize(MTU - 40)];
             if scaling {
                 expected.push(TcpOptionElement::WindowScale(7));
             }

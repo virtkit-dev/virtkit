@@ -14,6 +14,9 @@ use tokio_vsock::{VMADDR_CID_ANY, VMADDR_CID_HOST, VsockAddr, VsockListener, Vso
 /// stuck server / VMM — running commands have no deadline, but connecting does.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Link MTU shared by the switch, virtio NICs and guest TAP bridges.
+pub const SWITCH_MTU: u16 = 65500;
+
 /// Client side: open a connection to a virtkit-agent server.
 pub async fn connect(socket: &SocketAddr) -> Result<(SerStream, DeSink), anyhow::Error> {
     tokio::time::timeout(CONNECT_TIMEOUT, connect_inner(socket))

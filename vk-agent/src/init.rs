@@ -1864,6 +1864,8 @@ fn net_args(port: u32, iface: &str, mac: Option<&str>) -> Vec<String> {
         "net".into(),
         "--iface".into(),
         iface.into(),
+        "--mtu".into(),
+        vk_core::net::SWITCH_MTU.to_string(),
     ];
     if let Some(mac) = mac {
         args.push("--mac".into());
@@ -3785,6 +3787,8 @@ mod tests {
                 "net",
                 "--iface",
                 "eth1",
+                "--mtu",
+                "65500",
                 "--mac",
                 "52:54:00:a8:7f:fe",
             ]
@@ -3792,7 +3796,15 @@ mod tests {
         // eth0 without a run-assigned MAC keeps the kernel's random one.
         assert_eq!(
             net_args(1024, "eth0", None),
-            vec!["--socket", "vsock://1024", "net", "--iface", "eth0"]
+            vec![
+                "--socket",
+                "vsock://1024",
+                "net",
+                "--iface",
+                "eth0",
+                "--mtu",
+                "65500"
+            ]
         );
     }
 

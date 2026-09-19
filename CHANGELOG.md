@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Guest network links now support jumbo packets (MTU 65500).** Larger packets reduce
+  per-packet overhead during bulk transfers. Both VM backends use the same MTU, with no
+  configuration needed inside the guest.
+
 ## [0.73.3] - 2026-09-19
 
 ### Fixed

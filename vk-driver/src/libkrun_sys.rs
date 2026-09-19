@@ -31,7 +31,7 @@ use anyhow::{Context, Result, bail};
 // (rlib -> shares virtkit's std; compiler-checked signatures). Every call returns
 // >= 0 on success, a negative errno on failure.
 use krun::{
-    KRUN_EXIT_GUEST_RESET, krun_add_disk2, krun_add_net_tap, krun_add_net_unixstream,
+    KRUN_EXIT_GUEST_RESET, krun_add_disk2, krun_add_net_tap, krun_add_net_unixstream2,
     krun_add_virtiofs6, krun_add_vsock_port2, krun_create_ctx, krun_disable_balloon,
     krun_disable_implicit_init, krun_get_shutdown_eventfd, krun_init_log,
     krun_set_block_dirty_socket, krun_set_console_output, krun_set_kernel, krun_set_nested_virt,
@@ -285,11 +285,13 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         // socket the switch already listens on (fd -1 = connect to `path`) and speaking the
         // switch's own 4-byte-length framing. No offload features and no flags: the switch
         // terminates TCP itself and expects complete checksums, and the guest is addressed
-        // from the cmdline, not by libkrun's DHCP client. Attach order is the guest's
-        // interface order (eth0, eth1, …): virtio-pci probes the slots in the order they
-        // were added, so `nics[i]` is `eth<i>`. The agent never has to trust that — every
-        // NIC carries the MAC its address derives from, so an interface can always be
-        // matched back to its address.
+        // from the cmdline, not by libkrun's DHCP client. Every NIC carries the switch LAN's
+        // MTU, which libkrun advertises over VIRTIO_NET_F_MTU: the guest link comes up at it
+        // with nothing configured inside the guest, and posts receive buffers big enough for
+        // a frame that size. Attach order is the guest's interface order (eth0, eth1, …):
+        // virtio-pci probes the slots in the order they were added, so `nics[i]` is `eth<i>`.
+        // The agent never has to trust that — every NIC carries the MAC its address derives
+        // from, so an interface can always be matched back to its address.
         for (i, nic) in spec.nics.iter().enumerate() {
             let path = cstr(&nic.socket.to_string_lossy());
             let (socket, want) = (nic.socket.display(), &nic.mac);
@@ -297,8 +299,16 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
                 anyhow::anyhow!("switch nic {i} ({socket}): invalid MAC {want:?}")
             })?;
             ck(
-                "krun_add_net_unixstream",
-                krun_add_net_unixstream(ctx, path.as_ptr(), -1, mac.as_ptr(), 0, 0),
+                "krun_add_net_unixstream2",
+                krun_add_net_unixstream2(
+                    ctx,
+                    path.as_ptr(),
+                    -1,
+                    mac.as_ptr(),
+                    0,
+                    0,
+                    crate::switch::MTU,
+                ),
             )?;
         }
 

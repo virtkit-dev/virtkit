@@ -34,6 +34,7 @@ const IFF_NO_PI: libc::c_short = 0x1000;
 
 /// A tap read/write never exceeds this (ethernet frame, jumbo included).
 const MAX_FRAME: usize = 65535;
+const _: () = assert!(vk_core::net::SWITCH_MTU as usize + 14 <= MAX_FRAME);
 
 /// `struct ifreq` reduced to the fields we set (name + flags), padded to the
 /// kernel struct's size so the ioctls read/write the right number of bytes.
@@ -165,14 +166,55 @@ fn set_up(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Set the TAP's link MTU before bringing it up. Leave room for the ethernet header
+/// in the bridge's frame buffer.
+fn set_mtu(name: &str, mtu: u16) -> Result<()> {
+    if mtu < 68 || usize::from(mtu) + 14 > MAX_FRAME {
+        bail!("MTU {mtu} does not fit the tap bridge");
+    }
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("socket(AF_INET)");
+    }
+    let sock = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    if name.len() >= req.ifr_name.len() {
+        bail!("interface name {name:?} too long");
+    }
+    for (dst, b) in req.ifr_name.iter_mut().zip(name.as_bytes()) {
+        *dst = *b as libc::c_char;
+    }
+    req.ifr_ifru.ifru_mtu = i32::from(mtu);
+    // SAFETY: the socket is live and req is an initialized ifreq carrying an integer MTU.
+    if unsafe {
+        libc::ioctl(
+            sock.as_raw_fd(),
+            libc::SIOCSIFMTU as libc::Ioctl,
+            &raw mut req,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error()).context("SIOCSIFMTU");
+    }
+    Ok(())
+}
+
 /// Create tap `iface`, optionally set its hardware address to `mac` (so the vk
 /// switch can match a per-MAC DHCP reservation), bring it up, and bridge it to the
 /// network backend reached at `target` (qemu framing) until either side closes.
-pub async fn run_net(target: &SocketAddr, iface: &str, mac: Option<&str>) -> Result<()> {
+pub async fn run_net(
+    target: &SocketAddr,
+    iface: &str,
+    mac: Option<&str>,
+    mtu: Option<u16>,
+) -> Result<()> {
     let tap = open_tap(iface).with_context(|| format!("creating tap {iface}"))?;
     if let Some(mac) = mac {
         let bytes = parse_mac(mac)?;
         set_hwaddr(iface, bytes).with_context(|| format!("setting {iface} MAC to {mac}"))?;
+    }
+    if let Some(mtu) = mtu {
+        set_mtu(iface, mtu).with_context(|| format!("setting {iface} MTU"))?;
     }
     set_up(iface).with_context(|| format!("bringing {iface} up"))?;
     let conn = raw_connect(target)
