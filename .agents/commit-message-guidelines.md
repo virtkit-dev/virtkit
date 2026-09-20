@@ -24,11 +24,11 @@ The same goes for the changelog: a commit with a user-visible change updates
 ```
 
 A single-line summary (no trailing period) is enough for most commits. Add a body only
-when the diff does not speak for itself, and cap it at **5 non-blank lines** — one short
-paragraph or a few bullets. Five is a hard cap, not a target: most bodies that earn one
-need two or three lines. A change that cannot be explained in five belongs in a code
-comment, or is really two commits. If a change seems to genuinely need a longer body,
-ask the user before writing one.
+when the diff does not speak for itself. Prefer one short paragraph or a few bullets,
+usually within five non-blank lines. This is a guideline, not a cap: use a longer body
+when needed to explain the change, its rationale, trade-offs, or migration requirements,
+without asking for approval. Keep the explanation focused; do not omit necessary
+context just to meet a line count.
 
 The scope prefix is optional when a change is genuinely repo-wide.
 
