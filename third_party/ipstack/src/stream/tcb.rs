@@ -32,6 +32,20 @@ const MAX_PERSIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Largest window scale RFC 7323 § 2.3 permits, which is what the 32-bit sequence space allows.
 pub(super) const MAX_WINDOW_SHIFT: u8 = 14;
 
+/// Default send MSS without a SYN offer: the 576-byte datagram IPv4 hosts must accept, minus
+/// 40 bytes of fixed headers (RFC 9293 § 3.7.1).
+pub(super) const DEFAULT_SEND_MSS_IPV4: u16 = 536;
+
+/// IPv6 default: the 1280-byte minimum link MTU minus 60 bytes of fixed headers (RFC 9293 § 3.7.1).
+pub(super) const DEFAULT_SEND_MSS_IPV6: u16 = 1220;
+
+/// Linux's `TCP_MIN_SND_MSS` floor limits header overhead for tiny offers and prevents a zero
+/// offer from blocking payload transmission.
+const MIN_SEND_MSS: u16 = 48;
+
+/// Fixed TCP header size used by the MSS option, excluding options (RFC 9293 § 3.7.1).
+const FIXED_TCP_HEADER_LEN: usize = 20;
+
 /// The smallest shift that lets `buffer` be advertised in a 16-bit window field.
 fn window_shift_for(buffer: usize) -> u8 {
     let mut shift = 0;
@@ -159,6 +173,8 @@ pub(crate) struct Tcb {
     send_window: u32,
     /// Shift applied to the windows the peer advertises, from the scale in its SYN.
     peer_window_shift: u8,
+    /// Peer payload limit from the SYN MSS offer or address-family default.
+    peer_mss: u16,
     /// Shift applied to the windows we advertise, set only when the peer's SYN offered scaling:
     /// RFC 7323 § 2.2 makes scaling a property of the connection, so neither side scales without
     /// it. `None` is also what says the SYN-ACK carries no window scale of its own.
@@ -208,6 +224,8 @@ impl Tcb {
             last_received_ack: seq.into(),
             send_window: u16::MAX as u32,
             peer_window_shift: 0,
+            // The SYN that opens the session replaces this through `accept_syn_mss`.
+            peer_mss: DEFAULT_SEND_MSS_IPV4,
             recv_window_shift: None,
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
@@ -285,10 +303,13 @@ impl Tcb {
         self.last_write_at
     }
 
+    /// Bound payload by the remaining send window, local MTU and peer MSS (RFC 9293 § 3.7.1).
+    /// The MSS assumes a fixed 20-byte TCP header; TCP options reduce its payload allowance.
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
         let send_window = self.get_send_window() as usize;
         let mtu = self.get_mtu() as usize;
-        std::cmp::min(send_window, mtu.saturating_sub(ip_header_size + tcp_header_size))
+        let peer_mss = (self.peer_mss as usize + FIXED_TCP_HEADER_LEN).saturating_sub(tcp_header_size);
+        std::cmp::min(send_window, mtu.saturating_sub(ip_header_size + tcp_header_size)).min(peer_mss)
     }
 
     pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum) {
@@ -438,6 +459,22 @@ impl Tcb {
             self.peer_window_shift = shift.min(MAX_WINDOW_SHIFT);
             self.recv_window_shift = Some(window_shift_for(self.read_buffer_size));
         }
+    }
+
+    /// Accept the peer's SYN MSS, or the address-family default from RFC 9293 § 3.7.1 if absent.
+    /// Clamp offers below `MIN_SEND_MSS` to that floor.
+    pub(super) fn accept_syn_mss(&mut self, offered: Option<u16>, ipv4: bool) {
+        let default = if ipv4 { DEFAULT_SEND_MSS_IPV4 } else { DEFAULT_SEND_MSS_IPV6 };
+        let mss = offered.unwrap_or(default);
+        if mss < MIN_SEND_MSS {
+            log::warn!("Peer MSS {mss} is below {MIN_SEND_MSS}; sending segments of {MIN_SEND_MSS} bytes");
+        }
+        self.peer_mss = mss.max(MIN_SEND_MSS);
+    }
+
+    /// Send MSS selected during the handshake.
+    pub(super) fn get_peer_mss(&self) -> u16 {
+        self.peer_mss
     }
 
     /// Our window scale, when the handshake negotiated one: the shift the SYN-ACK advertises.
@@ -1083,6 +1120,40 @@ mod tests {
         capped.accept_syn_window(64240, Some(20));
         capped.update_send_window(1);
         assert_eq!(capped.get_send_window(), 1 << MAX_WINDOW_SHIFT);
+    }
+
+    /// Payload must fit the send window, local MTU after headers, and peer MSS.
+    #[test]
+    fn the_payload_is_bounded_by_the_window_the_link_and_the_peer_mss() {
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO); // an MTU of 1500
+        tcb.accept_syn_mss(Some(9000), true);
+        assert_eq!(tcb.calculate_payload_max_len(20, 20), 1460, "the link was not the limit");
+        assert_eq!(
+            tcb.calculate_payload_max_len(40, 20),
+            1440,
+            "the larger IPv6 header was not paid for"
+        );
+
+        tcb.accept_syn_mss(Some(1000), true);
+        assert_eq!(tcb.calculate_payload_max_len(20, 20), 1000);
+        // TCP options reduce the MSS payload allowance (RFC 9293 § 3.7.1).
+        assert_eq!(tcb.calculate_payload_max_len(20, 32), 988);
+
+        tcb.update_send_window(500);
+        assert_eq!(tcb.calculate_payload_max_len(20, 20), 500, "the peer's window was overrun");
+    }
+
+    /// Missing MSS offers use the address-family default; tiny offers use the send floor.
+    #[test]
+    fn absent_and_small_mss_offers_use_defaults_and_the_send_floor() {
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        tcb.accept_syn_mss(None, true);
+        assert_eq!(tcb.get_peer_mss(), DEFAULT_SEND_MSS_IPV4);
+        tcb.accept_syn_mss(None, false);
+        assert_eq!(tcb.get_peer_mss(), DEFAULT_SEND_MSS_IPV6);
+        tcb.accept_syn_mss(Some(0), true);
+        assert_eq!(tcb.get_peer_mss(), MIN_SEND_MSS);
+        assert_eq!(tcb.calculate_payload_max_len(20, 20), MIN_SEND_MSS as usize);
     }
 
     /// Zero is zero at any scale: a peer that closes its window still has to be probed before

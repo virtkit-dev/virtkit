@@ -3009,7 +3009,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_download_can_reach_the_guest_in_packets_larger_than_8k() {
-        use etherparse::{PacketBuilder, PacketHeaders, TransportHeader};
+        use etherparse::{PacketBuilder, PacketHeaders, TcpOptionElement, TransportHeader};
         use tokio::time::timeout;
 
         timeout(Duration::from_secs(5), async {
@@ -3023,6 +3023,9 @@ mod tests {
             PacketBuilder::ipv4(guest, remote, 64)
                 .tcp(40000, 443, 1000, u16::MAX)
                 .syn()
+                // Without an MSS offer the stack uses 536-byte segments.
+                .options(&[TcpOptionElement::MaximumSegmentSize(MSS)])
+                .unwrap()
                 .write(&mut syn, &[])
                 .unwrap();
             tx.send(syn).unwrap();

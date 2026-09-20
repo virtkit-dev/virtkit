@@ -3,11 +3,15 @@
 Source: https://github.com/virtkit-dev/ipstack
 Revision: `99c1328a5c79d6d6e2ae9c85ea20f0d80ef774d9`
 
+The peer MSS changes from `f9b854b25950cd08fc4b6e3fbebafcd9f61f0b58` are applied
+locally; its independent full-buffer read fix is not included yet.
+
 Our fork of [narrowlink/ipstack](https://github.com/narrowlink/ipstack), branched from
 upstream `e1d8506`. Every fix the switch needs lives there as its own commit, written to go
 upstream as a pull request; `git log` in the fork is the patch list. The local measured-RTO
 test waits for acknowledgment processing and uses the resulting timeout, so scheduling
-delays do not require its first RTT sample to hit the minimum exactly.
+delays do not require its first RTT sample to hit the minimum exactly. Local MSS tests
+also cover malformed options and IPv6 default segmentation.
 
 Refresh it with `third_party/ipstack/vendor.sh <fork checkout> [rev]`, which copies the
 sources, trims the manifest down to what a patched crate outside the workspace can carry

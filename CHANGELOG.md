@@ -34,6 +34,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Guest downloads respect smaller network MTUs.** Guests configured with a smaller
+  MTU no longer receive oversized TCP segments.
 - **A guest upload arrives whole.** A guest that closed a connection the moment it had sent
   everything could leave the receiving end hundreds of kilobytes short, with no error on
   either side and no sign of it in the traffic figures. The switch now hands over every byte

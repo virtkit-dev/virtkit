@@ -199,36 +199,70 @@ pub struct IpStackTcpStream {
     config: Arc<TcpConfig>,
 }
 
-/// Find the SYN's first window scale, skipping unknown options by their declared length.
-/// Stop at EOL or a malformed option; bytes beyond either cannot offer a scale.
-fn syn_window_scale(mut options: &[u8]) -> Result<Option<u8>, &'static str> {
-    use etherparse::tcp_option::{KIND_END, KIND_NOOP, KIND_WINDOW_SCALE, LEN_WINDOW_SCALE};
+/// Yield complete SYN options (kind, length and body), skipping NOPs. Stop at EOL or report
+/// the first malformed option; callers ignore unknown kinds using their declared lengths.
+fn syn_options(mut options: &[u8]) -> impl Iterator<Item = Result<(u8, &[u8]), &'static str>> {
+    use etherparse::tcp_option::{KIND_END, KIND_NOOP};
 
-    while let Some((&kind, rest)) = options.split_first() {
-        match kind {
-            KIND_END => return Ok(None),
-            KIND_NOOP => {
+    let mut done = false;
+    std::iter::from_fn(move || {
+        while !done {
+            let (&kind, rest) = options.split_first()?;
+            if kind == KIND_END {
+                return None;
+            }
+            if kind == KIND_NOOP {
                 options = rest;
                 continue;
             }
-            _ => {}
+            let Some((&length, _)) = rest.split_first() else {
+                done = true;
+                return Some(Err("missing option length"));
+            };
+            if length < 2 {
+                done = true;
+                return Some(Err("option length is less than two"));
+            }
+            let Some((option, remaining)) = options.split_at_checked(usize::from(length)) else {
+                done = true;
+                return Some(Err("option extends past the TCP header"));
+            };
+            options = remaining;
+            return Some(Ok((kind, option)));
         }
-        let Some((&length, _)) = rest.split_first() else {
-            return Err("missing option length");
-        };
-        if length < 2 {
-            return Err("option length is less than two");
-        }
-        let Some((option, remaining)) = options.split_at_checked(usize::from(length)) else {
-            return Err("option extends past the TCP header");
-        };
+        None
+    })
+}
+
+/// Return the first window scale, stopping at EOL or a malformed option.
+/// Malformed options after the first scale do not invalidate it.
+fn syn_window_scale(options: &[u8]) -> Result<Option<u8>, &'static str> {
+    use etherparse::tcp_option::{KIND_WINDOW_SCALE, LEN_WINDOW_SCALE};
+
+    for option in syn_options(options) {
+        let (kind, option) = option?;
         if kind == KIND_WINDOW_SCALE {
-            if length != LEN_WINDOW_SCALE {
+            if option.len() != usize::from(LEN_WINDOW_SCALE) {
                 return Err("invalid window scale option length");
             }
             return Ok(option.get(2).copied());
         }
-        options = remaining;
+    }
+    Ok(None)
+}
+
+/// Return the SYN's first MSS offer, the peer's payload limit (RFC 9293 § 3.7.1).
+fn syn_max_segment_size(options: &[u8]) -> Result<Option<u16>, &'static str> {
+    use etherparse::tcp_option::{KIND_MAXIMUM_SEGMENT_SIZE, LEN_MAXIMUM_SEGMENT_SIZE};
+
+    for option in syn_options(options) {
+        let (kind, option) = option?;
+        if kind == KIND_MAXIMUM_SEGMENT_SIZE {
+            if option.len() != usize::from(LEN_MAXIMUM_SEGMENT_SIZE) {
+                return Err("invalid maximum segment size option length");
+            }
+            return Ok(Some(u16::from_be_bytes([option[2], option[3]])));
+        }
     }
     Ok(None)
 }
@@ -273,6 +307,15 @@ impl IpStackTcpStream {
             "{tuple}: window scaling: peer offer {peer_window_shift:?}, effective peer shift {:?}, local shift {:?}",
             peer_window_shift.map(|shift| shift.min(MAX_WINDOW_SHIFT)),
             tcb.get_recv_window_shift()
+        );
+        let peer_mss = syn_max_segment_size(tcp.options.as_slice()).unwrap_or_else(|err| {
+            log::warn!("{tuple}: malformed SYN options, falling back to the default MSS: {err}");
+            None
+        });
+        tcb.accept_syn_mss(peer_mss, dst_addr.is_ipv4());
+        log::debug!(
+            "{tuple}: peer MSS offer {peer_mss:?}, sending segments of up to {} bytes",
+            tcb.get_peer_mss()
         );
 
         let (stream_sender, stream_receiver) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
@@ -1462,6 +1505,26 @@ mod tests {
         create_raw_packet(src, dst, |_, _| 60_000, flags, TTL, seq, ack, window, payload, None, shift).unwrap()
     }
 
+    /// A SYN announcing the peer's maximum segment size: the largest payload it will receive.
+    fn syn_with_mss(mss: u16) -> NetworkPacket {
+        let (src, dst) = addrs();
+        let options = vec![TcpOptions::MaximumSegmentSize(mss)];
+        create_raw_packet(src, dst, |_, _| 0, SYN, TTL, PEER_ISN, 0, 64240, Vec::new(), Some(&options), None).unwrap()
+    }
+
+    /// The payload lengths of the segments the stack sends, until `total` bytes have gone out.
+    async fn sent_payload_lengths(up_rx: &mut PacketReceiver, total: usize) -> Vec<usize> {
+        let mut lengths: Vec<usize> = Vec::new();
+        while lengths.iter().sum::<usize>() < total {
+            let packet = next_packet(up_rx).await;
+            match packet.payload.as_ref().map(|p| p.len()).unwrap_or(0) {
+                0 => continue,
+                len => lengths.push(len),
+            }
+        }
+        lengths
+    }
+
     /// The window scale a header carries, if any.
     fn window_scale(header: &TcpHeader) -> Option<u8> {
         header.options_iterator().flatten().find_map(|option| match option {
@@ -1520,8 +1583,20 @@ mod tests {
         messenger: Option<tokio::sync::oneshot::Sender<()>>,
         syn: NetworkPacket,
     ) -> (IpStackTcpStream, TcpHeader) {
+        established_from_syn_over(up_tx, up_rx, config, messenger, syn, 1500).await
+    }
+
+    /// Establish from the supplied SYN and local MTU, returning the stream and SYN-ACK.
+    async fn established_from_syn_over(
+        up_tx: PacketSender,
+        up_rx: &mut PacketReceiver,
+        config: TcpConfig,
+        messenger: Option<tokio::sync::oneshot::Sender<()>>,
+        syn: NetworkPacket,
+        mtu: u16,
+    ) -> (IpStackTcpStream, TcpHeader) {
         let (src, dst) = addrs();
-        let stream = IpStackTcpStream::new(src, dst, header(&syn).clone(), 0, up_tx, 1500, messenger, Arc::new(config)).unwrap();
+        let stream = IpStackTcpStream::new(src, dst, header(&syn).clone(), 0, up_tx, mtu, messenger, Arc::new(config)).unwrap();
         let synack = header(&next_packet(up_rx).await).clone();
         assert_eq!(tcp_header_flags(&synack), SYN | ACK);
         let ours = synack.sequence_number.wrapping_add(1);
@@ -2649,6 +2724,33 @@ mod tests {
         assert_eq!(syn_window_scale(&[3, 3, 7, 30, 0]), Ok(Some(7)));
     }
 
+    #[test]
+    fn syn_mss_obeys_option_boundaries() {
+        for (options, expected) in [
+            (&[][..], None),
+            (&[1, 2, 4, 5, 180], Some(1460)),
+            (&[30, 4, 2, 4, 2, 4, 5, 180], Some(1460)),
+            (&[0, 2, 4, 5, 180], None),
+            (&[2, 4, 5, 180, 2, 4, 3, 232], Some(1460)),
+            (&[2, 4, 5, 180, 30, 0], Some(1460)),
+        ] {
+            assert_eq!(syn_max_segment_size(options), Ok(expected), "options {options:?}");
+        }
+        for options in [
+            &[2][..],
+            &[2, 0],
+            &[2, 1],
+            &[2, 2],
+            &[2, 3, 5],
+            &[2, 5, 5, 180, 0],
+            &[2, 4, 5],
+            &[30, 0, 2, 4, 5, 180],
+            &[30, 9, 2, 4, 5, 180],
+        ] {
+            assert!(syn_max_segment_size(options).is_err(), "accepted malformed options {options:?}");
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn malformed_syn_options_do_not_offer_window_scaling() {
         for options in [
@@ -2701,6 +2803,74 @@ mod tests {
         assert_eq!(acked.window_size, u16::MAX, "the unscaled window did not say all the field holds");
         // The peer's own window is unscaled too, whatever shift the buffer would have chosen.
         assert_eq!(stream.tcb.lock().unwrap().get_send_window(), 64240);
+    }
+
+    /// A guest's SYN MSS limits payload even when our link supports larger packets
+    /// (RFC 9293 § 3.7.1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn segments_are_capped_at_the_peer_mss() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig::default();
+        let (mut stream, _) = established_from_syn_over(up_tx, &mut up_rx, config, None, syn_with_mss(1460), 65500).await;
+
+        stream.write_all(&[7u8; 5000]).await.unwrap();
+        assert_eq!(sent_payload_lengths(&mut up_rx, 5000).await, vec![1460, 1460, 1460, 620]);
+    }
+
+    /// Without a SYN MSS offer, use the IPv4 default from RFC 9293 § 3.7.1.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_syn_without_an_mss_option_sends_the_default_segment() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig::default();
+        let syn = segment(SYN, PEER_ISN, 0, Vec::new());
+        let (mut stream, _) = established_from_syn_over(up_tx, &mut up_rx, config, None, syn, 65500).await;
+
+        stream.write_all(&[7u8; 1200]).await.unwrap();
+        assert_eq!(sent_payload_lengths(&mut up_rx, 1200).await, vec![536, 536, 128]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ipv6_syn_without_mss_uses_1220_byte_segments() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let src = "[2001:db8::1]:40000".parse().unwrap();
+        let dst = "[2001:db8::2]:443".parse().unwrap();
+        let syn = create_raw_packet(src, dst, |_, _| 0, SYN, TTL, PEER_ISN, 0, 64240, Vec::new(), None, None).unwrap();
+        let mut stream = IpStackTcpStream::new(
+            src,
+            dst,
+            header(&syn).clone(),
+            0,
+            up_tx,
+            65500,
+            None,
+            Arc::new(TcpConfig::default()),
+        )
+        .unwrap();
+        let synack = next_packet(&mut up_rx).await;
+        assert!(matches!(synack.ip, IpHeader::Ipv6(_)));
+        assert_eq!(tcp_header_flags(header(&synack)), SYN | ACK);
+        let ours = header(&synack).sequence_number.wrapping_add(1);
+        let ack = create_raw_packet(src, dst, |_, _| 0, ACK, TTL, PEER_ISN + 1, ours, 64240, Vec::new(), None, None).unwrap();
+        stream.stream_sender().send(ack).unwrap();
+        wait_until(
+            || stream.tcb.lock().unwrap().get_state() == TcpState::Established,
+            "the IPv6 handshake never completed",
+        )
+        .await;
+
+        stream.write_all(&[7u8; 2500]).await.unwrap();
+        assert_eq!(sent_payload_lengths(&mut up_rx, 2500).await, vec![1220, 1220, 60]);
+    }
+
+    /// A large peer MSS does not override the local MTU.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mss_beyond_the_link_leaves_the_mtu_in_charge() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig::default();
+        let (mut stream, _) = established_from_syn_over(up_tx, &mut up_rx, config, None, syn_with_mss(9000), 1500).await;
+
+        stream.write_all(&[7u8; 3000]).await.unwrap();
+        assert_eq!(sent_payload_lengths(&mut up_rx, 3000).await, vec![1460, 1460, 80]);
     }
 
     #[tokio::test]
