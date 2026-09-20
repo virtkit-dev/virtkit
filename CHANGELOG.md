@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.74.0] - 2026-09-20
+
 ### Added
 
 - **`vk dev prune` reclaims an environment's local boot images without deleting its
@@ -2938,7 +2940,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.73.3...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.74.0...HEAD
+[0.74.0]: https://github.com/virtkit-dev/virtkit/compare/v0.73.3...v0.74.0
 [0.73.3]: https://github.com/virtkit-dev/virtkit/compare/v0.73.2...v0.73.3
 [0.73.2]: https://github.com/virtkit-dev/virtkit/compare/v0.73.1...v0.73.2
 [0.73.1]: https://github.com/virtkit-dev/virtkit/compare/v0.73.0...v0.73.1
