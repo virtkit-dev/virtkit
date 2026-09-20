@@ -2930,6 +2930,110 @@ mod tests {
         .unwrap();
     }
 
+    /// A guest that closes its half the moment it has written everything leaves the flow
+    /// holding the tail of the upload. Every byte of it still has to reach the host.
+    #[tokio::test]
+    async fn an_upload_the_guest_closes_reaches_the_host_whole() {
+        use etherparse::{PacketBuilder, PacketHeaders, TcpOptionElement, TransportHeader};
+        use std::os::fd::AsRawFd;
+        use tokio::io::AsyncReadExt;
+        use tokio::time::timeout;
+
+        /// More than the flow hands the host in one turn, so the close lands with the tail
+        /// of the upload still queued behind it.
+        const TOTAL: usize = 256 << 10;
+        /// What an MTU-1500 guest puts in a segment.
+        const SEGMENT: usize = 1460;
+
+        timeout(Duration::from_secs(30), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            // Use a small receive buffer to exercise backpressure.
+            set_sock_opt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                4 << 10,
+            )
+            .unwrap();
+            let guest = [192, 168, 127, 2];
+            let remote = [10, 0, 0, 1];
+            let (tx, rx) = unbounded_channel();
+            let (reply_tx, mut replies) = unbounded_channel();
+            let mut stack = IpStack::new(ip_stack_config(), ChannelDevice { rx, tx: reply_tx });
+            let mut syn = Vec::new();
+            PacketBuilder::ipv4(guest, remote, 64)
+                .tcp(40000, 443, 1000, 64240)
+                .syn()
+                .options(&[TcpOptionElement::WindowScale(7)])
+                .unwrap()
+                .write(&mut syn, &[])
+                .unwrap();
+            tx.send(syn).unwrap();
+            let reply = replies.recv().await.unwrap();
+            let Some(TransportHeader::Tcp(synack)) = PacketHeaders::from_ip_slice(reply_ip(&reply))
+                .unwrap()
+                .transport
+            else {
+                panic!("expected SYN-ACK");
+            };
+            let gateway = synack.sequence_number.wrapping_add(1);
+            let mut ack = Vec::new();
+            PacketBuilder::ipv4(guest, remote, 64)
+                .tcp(40000, 443, 1001, 64240)
+                .ack(gateway)
+                .write(&mut ack, &[])
+                .unwrap();
+            tx.send(ack).unwrap();
+            let IpStackStream::Tcp(stream) = stack.accept().await.unwrap() else {
+                panic!("expected TCP stream");
+            };
+            let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
+                .with_registry_proxy(Some((remote.into(), listener.local_addr().unwrap())));
+            // Poll the proxy together with the peer so it is dropped even on a timeout.
+            let proxy = proxy_tcp(stream, Arc::new(guard));
+            let receive = async {
+                let (mut host, _) = listener.accept().await.unwrap();
+                let payload = vec![0x5a; SEGMENT];
+                let mut seq: u32 = 1001;
+                let mut sent = 0;
+                while sent < TOTAL {
+                    let len = SEGMENT.min(TOTAL - sent);
+                    let mut data = Vec::new();
+                    PacketBuilder::ipv4(guest, remote, 64)
+                        .tcp(40000, 443, seq, 64240)
+                        .ack(gateway)
+                        .write(&mut data, &payload[..len])
+                        .unwrap();
+                    tx.send(data).unwrap();
+                    seq = seq.wrapping_add(len as u32);
+                    sent += len;
+                }
+                // The guest is done writing and closes.
+                let mut fin = Vec::new();
+                PacketBuilder::ipv4(guest, remote, 64)
+                    .tcp(40000, 443, seq, 64240)
+                    .ack(gateway)
+                    .fin()
+                    .write(&mut fin, &[])
+                    .unwrap();
+                tx.send(fin).unwrap();
+                let mut got = Vec::new();
+                host.read_to_end(&mut got).await.unwrap();
+                assert_eq!(got.len(), TOTAL, "the host received a truncated upload");
+                assert!(
+                    got.iter().all(|&byte| byte == 0x5a),
+                    "the upload arrived corrupt"
+                );
+            };
+            tokio::select! {
+                () = proxy => panic!("the flow ended before the upload reached the host"),
+                () = receive => {},
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn tcp_syn_reject_builds_rst() {
         let guest = Ipv4Addr::new(192, 168, 231, 2);
