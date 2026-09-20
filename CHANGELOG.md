@@ -17,6 +17,7 @@ All notable changes to virtkit will be documented in this file.
   lengths and closed network streams now return errors instead of panicking or spinning.
 - **The shared network handles packet bursts in batches.** Queued traffic is sent promptly
   without waiting for more packets to arrive.
+- **Guest uploads use less CPU when sending small packets with libkrun.**
 
 ## [0.73.3] - 2026-09-19
 

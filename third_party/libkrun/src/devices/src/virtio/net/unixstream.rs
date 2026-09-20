@@ -24,16 +24,35 @@ const RX_BUFFER_SIZE: usize = 128 * 1024;
 const DIRECT_READ_MIN: usize = 8 * 1024;
 const _: () = assert!(RX_BUFFER_SIZE >= MAX_BUFFER_SIZE);
 
+/// How many staged bytes one send carries. Guest frames are staged back to back and leave
+/// together, so a burst costs one syscall instead of one per frame.
+const TX_BATCH_SIZE: usize = 256 * 1024;
+
+/// How many staged frames one send carries. Bounds how much copying a burst of small frames
+/// does before any of it reaches the switch.
+const TX_BATCH_FRAMES: usize = 256;
+
+/// Send a frame this large straight from the caller's buffer when nothing is staged: past
+/// this size copying it into the staging buffer costs about as much as the send it saves.
+const TX_DIRECT_MIN: usize = 16 * 1024;
+
+/// The staging buffer holds a whole batch plus the frame that takes it past the bound, so
+/// staging a frame never has to wait for the socket.
+const TX_BUFFER_SIZE: usize = TX_BATCH_SIZE + MAX_BUFFER_SIZE;
+
 pub struct Unixstream {
     fd: OwnedFd,
     // 0 when a frame length has not been read
     expecting_frame_length: u32,
-    // 0 if last write is fully complete, otherwise the length that was written
-    last_partial_write_length: usize,
     // bytes taken from the socket but not yet handed to the guest, in rx_buf[rx_start..rx_end]
     rx_buf: Vec<u8>,
     rx_start: usize,
     rx_end: usize,
+    // length-prefixed frames staged for the socket but not yet sent, in tx_buf[tx_start..tx_end]
+    tx_buf: Vec<u8>,
+    tx_start: usize,
+    tx_end: usize,
+    tx_frames: usize,
 }
 
 impl Unixstream {
@@ -52,10 +71,13 @@ impl Unixstream {
         Self {
             fd,
             expecting_frame_length: 0,
-            last_partial_write_length: 0,
             rx_buf: vec![0u8; RX_BUFFER_SIZE],
             rx_start: 0,
             rx_end: 0,
+            tx_buf: vec![0u8; TX_BUFFER_SIZE],
+            tx_start: 0,
+            tx_end: 0,
+            tx_frames: 0,
         }
     }
 
@@ -84,10 +106,13 @@ impl Unixstream {
         Ok(Self {
             fd,
             expecting_frame_length: 0,
-            last_partial_write_length: 0,
             rx_buf: vec![0u8; RX_BUFFER_SIZE],
             rx_start: 0,
             rx_end: 0,
+            tx_buf: vec![0u8; TX_BUFFER_SIZE],
+            tx_start: 0,
+            tx_end: 0,
+            tx_frames: 0,
         })
     }
 
@@ -217,35 +242,85 @@ impl Unixstream {
         Ok(())
     }
 
-    fn write_loop(&mut self, buf: &[u8]) -> Result<(), WriteError> {
-        let mut bytes_send = 0;
+    /// Bytes staged for the socket but not yet sent.
+    fn unsent(&self) -> usize {
+        self.tx_end - self.tx_start
+    }
 
+    /// Append one length-prefixed frame to the staging buffer. Room is the caller's job:
+    /// the bound in `write_frame` keeps a whole frame's worth free.
+    fn stage(&mut self, frame: &[u8]) {
+        if self.tx_buf.len() - self.tx_end < frame.len() {
+            self.tx_buf.copy_within(self.tx_start..self.tx_end, 0);
+            self.tx_end -= self.tx_start;
+            self.tx_start = 0;
+        }
+        let end = self.tx_end + frame.len();
+        self.tx_buf[self.tx_end..end].copy_from_slice(frame);
+        self.tx_end = end;
+        self.tx_frames += 1;
+    }
+
+    /// Send the staged bytes. The socket is a stream, so a short send only advances the
+    /// start of what is left: the tail keeps its place in the frame it belongs to and goes
+    /// out, unchanged, on the next call.
+    fn send_staged(&mut self) -> Result<(), WriteError> {
         #[cfg(target_os = "linux")]
         let flags = MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL;
         #[cfg(target_os = "macos")]
         let flags = MsgFlags::MSG_DONTWAIT;
 
-        while bytes_send < buf.len() {
-            match send(self.fd.as_raw_fd(), &buf[bytes_send..], flags) {
-                Ok(size) => bytes_send += size,
+        let mut sent_any = false;
+        while self.tx_start < self.tx_end {
+            match send(
+                self.fd.as_raw_fd(),
+                &self.tx_buf[self.tx_start..self.tx_end],
+                flags,
+            ) {
+                Ok(size) => {
+                    self.tx_start += size;
+                    sent_any = true;
+                }
                 #[allow(unreachable_patterns)]
                 Err(nix::Error::EAGAIN | nix::Error::EWOULDBLOCK) => {
-                    if bytes_send == 0 {
-                        return Err(WriteError::NothingWritten);
+                    log::trace!("socket blocked with {} bytes staged", self.unsent());
+                    return Err(if sent_any {
+                        WriteError::PartialWrite
                     } else {
-                        log::trace!(
-                            "Wrote {bytes_send} bytes, but socket blocked, will need try_finish_write() to finish"
-                        );
-
-                        self.last_partial_write_length += bytes_send;
-                        return Err(WriteError::PartialWrite);
-                    }
+                        WriteError::NothingWritten
+                    });
                 }
                 Err(nix::Error::EPIPE) => return Err(WriteError::ProcessNotRunning),
                 Err(e) => return Err(WriteError::Internal(e)),
             }
         }
-        self.last_partial_write_length = 0;
+        self.tx_start = 0;
+        self.tx_end = 0;
+        self.tx_frames = 0;
+        Ok(())
+    }
+
+    /// Send one frame straight from the caller's buffer, staging what the socket would not
+    /// take so the resume path is the same as for a staged batch.
+    fn send_direct(&mut self, frame: &[u8]) -> Result<(), WriteError> {
+        #[cfg(target_os = "linux")]
+        let flags = MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL;
+        #[cfg(target_os = "macos")]
+        let flags = MsgFlags::MSG_DONTWAIT;
+
+        let mut sent = 0;
+        while sent < frame.len() {
+            match send(self.fd.as_raw_fd(), &frame[sent..], flags) {
+                Ok(size) => sent += size,
+                #[allow(unreachable_patterns)]
+                Err(nix::Error::EAGAIN | nix::Error::EWOULDBLOCK) => break,
+                Err(nix::Error::EPIPE) => return Err(WriteError::ProcessNotRunning),
+                Err(e) => return Err(WriteError::Internal(e)),
+            }
+        }
+        if sent < frame.len() {
+            self.stage(&frame[sent..]);
+        }
         Ok(())
     }
 }
@@ -276,19 +351,18 @@ impl NetBackend for Unixstream {
         Ok(hdr_len + frame_length)
     }
 
-    /// Try to write a frame to the proxy.
+    /// Take a frame for the proxy. Small frames are staged and leave with the frames behind
+    /// them on the next `flush_frames`, so a burst costs one send rather than one each.
     /// (Will mutate and override parts of buf, with a frame header!)
     ///
     /// * `hdr_len` - specifies the size of any existing headers encapsulating the ethernet frame,
     ///   (such as vnet header), that can be overwritten. Must be >= FRAME_HEADER_LEN.
     /// * `buf` - the buffer to write to the proxy, `buf[..hdr_len]` may be overwritten
     ///
-    /// If this function returns WriteError::PartialWrite, you have to finish the write using
-    /// try_finish_write.
+    /// `buf` is the caller's to reuse on return: a frame this took is either on the socket or
+    /// copied into the staging buffer. `WriteError::NothingWritten` means the frame was not
+    /// taken, and the caller offers it again once the socket is writable.
     fn write_frame(&mut self, hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
-        if self.last_partial_write_length != 0 {
-            panic!("Cannot write a frame to the proxy, while a partial write is not resolved.");
-        }
         assert!(
             hdr_len >= FRAME_HEADER_LEN,
             "Not enough space to write the frame header"
@@ -298,30 +372,35 @@ impl NetBackend for Unixstream {
 
         buf[hdr_len - FRAME_HEADER_LEN..hdr_len]
             .copy_from_slice(&(frame_length as u32).to_be_bytes());
+        let frame = &buf[hdr_len - FRAME_HEADER_LEN..];
 
-        self.write_loop(&buf[hdr_len - FRAME_HEADER_LEN..])?;
+        // A full batch goes out before this frame joins it. A socket that cannot take the
+        // batch cannot take this frame either, so it stays with the caller.
+        if self.tx_frames >= TX_BATCH_FRAMES || self.unsent() >= TX_BATCH_SIZE {
+            match self.send_staged() {
+                Ok(()) | Err(WriteError::PartialWrite | WriteError::NothingWritten) => {}
+                Err(e) => return Err(e),
+            }
+            if self.unsent() > 0 {
+                return Err(WriteError::NothingWritten);
+            }
+        }
+
+        // Frames the copy would cost as much as the send go out on their own, but only
+        // when nothing is staged ahead of them: the stream's order is the frame order.
+        if self.unsent() == 0 && frame.len() >= TX_DIRECT_MIN {
+            return self.send_direct(frame);
+        }
+        self.stage(frame);
         Ok(())
     }
 
     fn has_unfinished_write(&self) -> bool {
-        self.last_partial_write_length != 0
+        self.unsent() != 0
     }
 
-    /// Try to finish a partial write
-    ///
-    /// If no partial write is required will do nothing and return Ok(())
-    ///
-    /// * `hdr_len` - must be the same value as passed to write_frame, that caused the partial write
-    /// * `buf` - must be same buffer that was given to write_frame, that caused the partial write
-    fn try_finish_write(&mut self, hdr_len: usize, buf: &[u8]) -> Result<(), WriteError> {
-        if self.last_partial_write_length != 0 {
-            let already_written = self.last_partial_write_length;
-            log::trace!("Requested to finish partial write");
-            self.write_loop(&buf[hdr_len - FRAME_HEADER_LEN + already_written..])?;
-            log::debug!("Finished partial write ({already_written}bytes written before)")
-        }
-
-        Ok(())
+    fn flush_frames(&mut self) -> Result<(), WriteError> {
+        self.send_staged()
     }
 
     fn raw_socket_fd(&self) -> RawFd {
@@ -332,12 +411,52 @@ impl NetBackend for Unixstream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
     fn pair() -> (Unixstream, UnixStream) {
         let (reader, writer) = UnixStream::pair().unwrap();
         (Unixstream::new(reader.into()), writer)
+    }
+
+    /// Offer a frame the way the worker does: a vnet header's worth of space in front of it
+    /// for the length prefix to go into.
+    fn tx_frame(tx: &mut Unixstream, frame: &[u8]) -> Result<(), WriteError> {
+        let mut buf = vec![0u8; VNET_HDR_LEN + frame.len()];
+        buf[VNET_HDR_LEN..].copy_from_slice(frame);
+        tx.write_frame(VNET_HDR_LEN, &mut buf)
+    }
+
+    /// Everything the peer can read right now.
+    fn drain(peer: &mut UnixStream) -> Vec<u8> {
+        peer.set_nonblocking(true).unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            match peer.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(size) => bytes.extend_from_slice(&chunk[..size]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("peer read failed: {e}"),
+            }
+        }
+        bytes
+    }
+
+    /// Read the peer out while the backend retries, until it holds nothing back.
+    fn drain_while_flushing(tx: &mut Unixstream, peer: &mut UnixStream) -> Vec<u8> {
+        let mut bytes = drain(peer);
+        for _ in 0..10_000 {
+            if !tx.has_unfinished_write() {
+                return bytes;
+            }
+            match tx.flush_frames() {
+                Ok(()) | Err(WriteError::PartialWrite | WriteError::NothingWritten) => {}
+                Err(e) => panic!("flush failed: {e:?}"),
+            }
+            bytes.extend_from_slice(&drain(peer));
+        }
+        panic!("the backend never finished its write");
     }
 
     fn framed(frames: &[&[u8]]) -> Vec<u8> {
@@ -456,6 +575,154 @@ mod tests {
             reader.read_frame(&mut [0; 4]),
             Err(ReadError::Internal(nix::Error::EINVAL))
         ));
+    }
+
+    #[test]
+    fn staged_frames_leave_together_and_in_order() {
+        let (mut tx, mut peer) = pair();
+        let frames: [&[u8]; 3] = [b"one", b"second frame", b"three"];
+        for frame in frames {
+            tx_frame(&mut tx, frame).unwrap();
+        }
+        assert_eq!(tx.unsent(), framed(&frames).len());
+        assert!(drain(&mut peer).is_empty(), "no frame leaves on its own");
+
+        tx.flush_frames().unwrap();
+        assert_eq!(drain(&mut peer), framed(&frames));
+        assert!(!tx.has_unfinished_write());
+    }
+
+    /// Either bound ends a batch, and only the frame that crossed it stays staged.
+    #[test]
+    fn a_burst_is_split_by_the_frame_and_the_byte_bound() {
+        for body in [vec![0x11; 8], vec![0x22; 4096]] {
+            let (mut tx, peer) = pair();
+            let reading = std::thread::spawn(move || {
+                let mut peer = peer;
+                let mut bytes = Vec::new();
+                peer.read_to_end(&mut bytes).unwrap();
+                bytes
+            });
+
+            let mut staged = 0;
+            while tx.tx_frames < TX_BATCH_FRAMES && tx.unsent() < TX_BATCH_SIZE {
+                tx_frame(&mut tx, &body).unwrap();
+                staged += 1;
+            }
+            // The two bounds are each what a burst of one of these frame sizes reaches.
+            assert_eq!(staged >= TX_BATCH_FRAMES, body.len() == 8);
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match tx_frame(&mut tx, &body) {
+                    Ok(()) => break,
+                    Err(WriteError::NothingWritten) => {}
+                    Err(e) => panic!("write failed: {e:?}"),
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the reader fell behind"
+                );
+            }
+            assert_eq!(
+                tx.tx_frames, 1,
+                "the batch left before this frame joined it"
+            );
+            assert_eq!(tx.unsent(), FRAME_HEADER_LEN + body.len());
+
+            while tx.has_unfinished_write() {
+                match tx.flush_frames() {
+                    Ok(()) | Err(WriteError::PartialWrite | WriteError::NothingWritten) => {}
+                    Err(e) => panic!("flush failed: {e:?}"),
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the reader fell behind"
+                );
+            }
+            drop(tx);
+            let expected = framed(&vec![body.as_slice(); staged + 1]);
+            assert_eq!(reading.join().unwrap(), expected);
+        }
+    }
+
+    /// A send the socket cut short resumes at the byte it stopped at, whether that falls
+    /// inside a frame or inside the length prefix in front of one.
+    #[test]
+    fn a_resume_continues_mid_frame_and_mid_header() {
+        let wire = framed(&[b"first frame", b"next"]);
+        for resume in [FRAME_HEADER_LEN + 2, FRAME_HEADER_LEN + 11 + 2] {
+            let (mut tx, mut peer) = pair();
+            tx.tx_buf[..wire.len()].copy_from_slice(&wire);
+            tx.tx_end = wire.len();
+            tx.tx_start = resume;
+            tx.tx_frames = 1;
+            assert!(tx.has_unfinished_write());
+
+            tx.flush_frames().unwrap();
+            assert!(!tx.has_unfinished_write());
+            assert_eq!(drain(&mut peer), wire[resume..]);
+        }
+    }
+
+    /// A socket too small for the batch takes it over several sends, and refuses further
+    /// frames meanwhile rather than growing the staging buffer without bound.
+    #[test]
+    fn a_blocked_socket_holds_its_place_in_the_stream() {
+        let (mut tx, mut peer) = pair();
+        setsockopt(&tx.fd, sockopt::SndBuf, &4096).unwrap();
+        let body = vec![0x5a; 1500];
+
+        let mut taken = 0;
+        loop {
+            match tx_frame(&mut tx, &body) {
+                Ok(()) => taken += 1,
+                Err(WriteError::NothingWritten) => break,
+                Err(e) => panic!("unexpected write error: {e:?}"),
+            }
+        }
+        assert!(tx.has_unfinished_write());
+
+        let bytes = drain_while_flushing(&mut tx, &mut peer);
+        assert_eq!(bytes, framed(&vec![body.as_slice(); taken]));
+    }
+
+    /// A frame past the direct bound is sent from the caller's buffer, and needs no flush.
+    #[test]
+    fn a_frame_too_large_to_be_worth_staging_goes_straight_out() {
+        let (mut tx, mut peer) = pair();
+        let body = vec![0xc3; TX_DIRECT_MIN];
+        tx_frame(&mut tx, &body).unwrap();
+        assert!(!tx.has_unfinished_write());
+        assert_eq!(drain(&mut peer), framed(&[body.as_slice()]));
+    }
+
+    /// Staged frames are in front of it in the stream, so it has to wait for them.
+    #[test]
+    fn a_staged_frame_holds_back_the_large_one_behind_it() {
+        let (mut tx, mut peer) = pair();
+        let small: &[u8] = b"small";
+        let large = vec![0xc3; TX_DIRECT_MIN];
+        tx_frame(&mut tx, small).unwrap();
+        tx_frame(&mut tx, &large).unwrap();
+        assert!(drain(&mut peer).is_empty());
+
+        tx.flush_frames().unwrap();
+        assert_eq!(drain(&mut peer), framed(&[small, large.as_slice()]));
+    }
+
+    /// The largest frame the device can produce, sent directly into a socket that takes
+    /// only part of it: the tail is staged and resumes like any other.
+    #[test]
+    fn a_jumbo_frame_the_socket_truncates_keeps_its_tail() {
+        let (mut tx, mut peer) = pair();
+        setsockopt(&tx.fd, sockopt::SndBuf, &4096).unwrap();
+        let body = vec![0x7e; MAX_BUFFER_SIZE - VNET_HDR_LEN];
+        tx_frame(&mut tx, &body).unwrap();
+        assert!(tx.has_unfinished_write());
+
+        let bytes = drain_while_flushing(&mut tx, &mut peer);
+        assert_eq!(bytes, framed(&[body.as_slice()]));
     }
 
     #[test]

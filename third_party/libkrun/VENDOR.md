@@ -370,3 +370,17 @@ is rejected before slicing. Socket-pair tests cover queued frames, split headers
 payloads, retries, compaction, large frames, invalid lengths and EOF. The queued-frame test
 checks that all three small frames from one socket write arrive in the initial refill;
 it is a batching check, not a throughput measurement. Search for `read_buffered`.
+
+`src/devices/src/virtio/net/unixstream.rs` — guest frames reach the network proxy a batch at
+a time. `write_frame` copies the length-prefixed frame into a staging buffer and returns, so
+a descriptor chain is used once its bytes are held rather than once they are on the socket;
+`NetBackend::flush_frames` replaces `try_finish_write` and sends the batch, called by the
+worker when it has drained the transmit queue and again on a writable socket. A batch ends at
+256 KiB or 256 frames, whichever comes first, and a frame offered when the socket cannot take
+the batch is refused with `NothingWritten`, which puts the chain back on the queue. The socket
+is a stream, so a short send only advances the start of what is left: the tail keeps its place
+and the bytes on the wire are the sequence an unbatched sender would have produced. Frames of
+at least 16 KiB skip the staging buffer when nothing is staged in front of them, the copy
+costing about as much as the send it would save. Socket-pair tests cover coalescing and order,
+both bounds, resuming inside a frame and inside a length prefix, a blocked socket refusing
+frames, and a jumbo frame sent directly and truncated. Search for `send_staged`.

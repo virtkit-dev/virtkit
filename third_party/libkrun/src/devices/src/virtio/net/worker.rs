@@ -53,7 +53,6 @@ pub struct NetWorker {
 
     tx_iovec: Vec<(GuestAddress, usize)>,
     tx_frame_buf: [u8; MAX_BUFFER_SIZE],
-    tx_frame_len: usize,
     tx_has_deferred_frame: bool,
 }
 
@@ -107,7 +106,6 @@ impl NetWorker {
             rx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
 
             tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
-            tx_frame_len: 0,
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
         })
@@ -260,10 +258,7 @@ impl NetWorker {
     }
 
     pub(crate) fn process_backend_socket_writeable(&mut self) {
-        match self
-            .backend
-            .try_finish_write(VNET_HDR_LEN, &self.tx_frame_buf[..self.tx_frame_len])
-        {
+        match self.backend.flush_frames() {
             Ok(()) => self.process_tx_loop(),
             Err(WriteError::PartialWrite | WriteError::NothingWritten) => {}
             Err(e @ WriteError::Internal(_)) => {
@@ -335,14 +330,14 @@ impl NetWorker {
     fn process_tx(&mut self) -> result::Result<(), TxError> {
         let tx_queue = &mut self.tx_q.queue;
 
-        if self.backend.has_unfinished_write()
-            && self
-                .backend
-                .try_finish_write(VNET_HDR_LEN, &self.tx_frame_buf[..self.tx_frame_len])
-                .is_err()
-        {
-            log::trace!("Cannot process tx because of unfinished partial write!");
-            return Ok(());
+        if self.backend.has_unfinished_write() {
+            match self.backend.flush_frames() {
+                Ok(()) => {}
+                Err(WriteError::PartialWrite | WriteError::NothingWritten) => {
+                    return Err(TxError::Backend(WriteError::NothingWritten));
+                }
+                Err(e) => return Err(TxError::Backend(e)),
+            }
         }
 
         let mut raise_irq = false;
@@ -382,45 +377,41 @@ impl NetWorker {
                 }
             }
 
-            self.tx_frame_len = read_count;
             match self
                 .backend
                 .write_frame(VNET_HDR_LEN, &mut self.tx_frame_buf[..read_count])
             {
+                // The backend has the frame's bytes, on the socket or staged for the next
+                // flush. Either way tx_frame_buf is free again and the chain is done with:
+                // the socket is a stream, so a staged frame cannot be reordered or lost
+                // behind the frames that follow it.
                 Ok(()) => {
-                    self.tx_frame_len = 0;
                     tx_queue
                         .add_used(&self.mem, head_index, 0)
                         .map_err(TxError::QueueError)?;
                     raise_irq = true;
                 }
+                // The backend could not take the frame at all, so the chain goes back on
+                // the queue and the frame is offered again when the socket drains.
                 Err(WriteError::NothingWritten) => {
                     tx_queue.undo_pop();
                     result = Err(TxError::Backend(WriteError::NothingWritten));
                     break;
                 }
-                Err(WriteError::PartialWrite) => {
-                    log::trace!("process_tx: partial write");
-                    /*
-                    This situation should be pretty rare, assuming reasonably sized socket buffers.
-                    We have written only a part of a frame to the backend socket (the socket is full).
+                Err(e) => return Err(TxError::Backend(e)),
+            }
+        }
 
-                    The frame we have read from the guest remains in tx_frame_buf, and will be sent
-                    later.
-
-                    Note that we cannot wait for the backend to process our sending frames, because
-                    the backend could be blocked on sending a remainder of a frame to us - us waiting
-                    for backend would cause a deadlock.
-                     */
-                    tx_queue
-                        .add_used(&self.mem, head_index, 0)
-                        .map_err(TxError::QueueError)?;
-                    raise_irq = true;
-                    break;
+        // Frames staged above leave in one send. What the socket cannot take now keeps its
+        // place in the backend and goes out on the next writable event, so there is nothing
+        // to wait for here: the switch could itself be blocked sending to us.
+        if result.is_ok() {
+            match self.backend.flush_frames() {
+                Ok(()) => {}
+                Err(WriteError::PartialWrite | WriteError::NothingWritten) => {
+                    result = Err(TxError::Backend(WriteError::NothingWritten));
                 }
-                Err(e @ WriteError::Internal(_) | e @ WriteError::ProcessNotRunning) => {
-                    return Err(TxError::Backend(e))
-                }
+                Err(e) => result = Err(TxError::Backend(e)),
             }
         }
 
@@ -768,6 +759,78 @@ mod tests {
         worker.rx_frame_buf_len = frame.len();
         worker.rx_has_deferred_frame = true;
         (worker, peer)
+    }
+
+    #[test]
+    fn blocked_transmit_yields_and_resumes_without_another_guest_kick() {
+        let (done, completed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use nix::sys::socket::{send, MsgFlags};
+            use std::io::Read;
+
+            let mem = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+            let vq = VirtQueue::new(GuestAddress(0), mem, QSIZE);
+            let (mut worker, mut peer) = worker(mem, &vq);
+            worker.tx_q.queue = vq.create_queue();
+            worker.tx_q.queue.set_event_idx(true);
+            peer.set_nonblocking(true).unwrap();
+
+            // Fill the socket before staging a frame, so the flush makes no progress.
+            let fd = worker.backend.raw_socket_fd();
+            loop {
+                match send(fd, &[0; 4096], MsgFlags::MSG_DONTWAIT) {
+                    Ok(n) => assert!(n > 0),
+                    Err(nix::Error::EAGAIN) => break,
+                    Err(e) => panic!("fill failed: {e}"),
+                }
+            }
+            let frame = make_frame(64);
+            mem.write_slice(&frame, GuestAddress(BUF_BASE)).unwrap();
+            vq.dtable[0].set(BUF_BASE, frame.len() as u32, 0, 0);
+            vq.avail.ring[0].set(0);
+            vq.avail.idx.set(1);
+
+            // The final flush blocks after consuming the first descriptor.
+            worker.process_tx_loop();
+            assert!(worker.tx_has_deferred_frame);
+            assert_eq!(vq.used.idx.get(), 1);
+            assert!(worker.backend.has_unfinished_write());
+            assert_ne!(worker.interrupt.status().load(Ordering::SeqCst), 0);
+
+            // A new descriptor must not make the pending-flush path spin or consume it.
+            vq.dtable[1].set(BUF_BASE, frame.len() as u32, 0, 0);
+            vq.avail.ring[1].set(1);
+            vq.avail.idx.set(2);
+            worker.process_tx_loop();
+            assert!(worker.tx_has_deferred_frame);
+            assert_eq!(vq.used.idx.get(), 1);
+
+            let mut filler = Vec::new();
+            assert_eq!(
+                peer.read_to_end(&mut filler).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            worker.process_backend_socket_writeable();
+            assert!(!worker.tx_has_deferred_frame);
+            assert!(!worker.backend.has_unfinished_write());
+            assert_eq!(vq.used.idx.get(), 2);
+            let mut wire = Vec::new();
+            assert_eq!(
+                peer.read_to_end(&mut wire).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            let body = &frame[VNET_HDR_LEN..];
+            let mut expected = Vec::new();
+            for _ in 0..2 {
+                expected.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                expected.extend_from_slice(body);
+            }
+            assert_eq!(wire, expected);
+            done.send(()).unwrap();
+        });
+        completed
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
     }
 
     #[test]
