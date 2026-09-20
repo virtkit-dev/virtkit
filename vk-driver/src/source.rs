@@ -191,61 +191,15 @@ fn docker_container_rootfs_size(docker: &Path, cid: &str) -> Option<u64> {
         .ok()
 }
 
-/// `docker image inspect` an image's runtime config (`Env`/`User`/`WorkingDir`/
-/// `Entrypoint`/`Cmd`), the docker-daemon counterpart of the OCI `pull_config`.
+/// Read Docker's runtime config (`Env`/`User`/`WorkingDir`/`Entrypoint`/`Cmd`/
+/// `ExposedPorts`) with the same parser as OCI `pull_config`.
+/// JSON preserves embedded newlines and distinguishes empty arguments from
+/// the trailing newline added by `docker image inspect`.
 fn docker_run_config(docker: &Path, image: &str) -> Result<vk_core::runcfg::RunConfig> {
-    let env = docker_inspect(docker, image, "{{range .Config.Env}}{{println .}}{{end}}")?
-        .lines()
-        .filter_map(|l| {
-            l.split_once('=')
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-        })
-        .collect();
-    Ok(vk_core::runcfg::RunConfig {
-        env,
-        user: docker_inspect(docker, image, "{{.Config.User}}")?
-            .trim()
-            .to_string(),
-        workdir: docker_inspect(docker, image, "{{.Config.WorkingDir}}")?
-            .trim()
-            .to_string(),
-        entrypoint: docker_inspect_argv(docker, image, "Entrypoint")?,
-        cmd: docker_inspect_argv(docker, image, "Cmd")?,
-        exposed_ports: docker_inspect_exposed_tcp_ports(docker, image)?,
-    })
-}
-
-/// The image's `EXPOSE`d TCP ports via `docker image inspect` — one `"<port>/<proto>"`
-/// key per line — kept for tcp only, deduplicated. Mirrors the OCI pull path's
-/// `exposed_tcp_ports`, so both readiness gates see the same set.
-fn docker_inspect_exposed_tcp_ports(docker: &Path, image: &str) -> Result<Vec<u16>> {
-    let mut ports: Vec<u16> = docker_inspect(
-        docker,
-        image,
-        "{{range $p, $_ := .Config.ExposedPorts}}{{println $p}}{{end}}",
-    )?
-    .lines()
-    .filter_map(|l| {
-        let (port, proto) = l.trim().split_once('/').unwrap_or((l.trim(), "tcp"));
-        (proto == "tcp").then(|| port.parse().ok()).flatten()
-    })
-    .collect();
-    ports.sort_unstable();
-    ports.dedup();
-    Ok(ports)
-}
-
-/// `docker image inspect` an image's `Config.<field>` argv (`Entrypoint`/`Cmd`), one
-/// element per line — empty when the field is null.
-fn docker_inspect_argv(docker: &Path, image: &str, field: &str) -> Result<Vec<String>> {
-    Ok(docker_inspect(
-        docker,
-        image,
-        &format!("{{{{range .Config.{field}}}}}{{{{println .}}}}{{{{end}}}}"),
-    )?
-    .lines()
-    .map(str::to_string)
-    .collect())
+    let json = docker_inspect(docker, image, "{{json .Config}}")?;
+    let config: serde_json::Value = serde_json::from_str(&json)
+        .with_context(|| format!("parsing the config docker image inspect {image} printed"))?;
+    Ok(crate::oci::parse_config_object(&config).into())
 }
 
 /// `docker export` a local image's rootfs, streaming the child's stdout into
@@ -325,8 +279,72 @@ fn docker_export_stream<T>(
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::os::unix::fs::DirBuilderExt;
 
     use super::*;
+
+    #[test]
+    fn docker_run_config_reads_json() {
+        let dir = std::env::temp_dir().join(format!("vk-docker-config-{}", std::process::id()));
+        std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let docker = dir.join("docker");
+        vk_fs::write_atomic(
+            &docker,
+            br#"#!/bin/sh
+set -eu
+[ "$#" -eq 5 ]
+[ "$1" = image ]
+[ "$2" = inspect ]
+[ "$3" = --format ]
+[ "$4" = '{{json .Config}}' ]
+case "$5" in
+    missing) printf '%s\n' '{"Cmd":["/bin/sh"]}' ;;
+    null) printf '%s\n' '{"Entrypoint":null,"Cmd":null}' ;;
+    empty) printf '%s\n' '{"Entrypoint":[],"Cmd":[]}' ;;
+    values)
+        printf '%s\n' '{"Env":["MULTI=a\nb=c","EMPTY="],"User":"1000:1000","WorkingDir":"/space dir ","Entrypoint":["/bin/sh","-c"],"Cmd":["echo a\necho b",""],"ExposedPorts":{"8080/tcp":{},"53/udp":{}}}'
+        ;;
+    invalid) printf '%s\n' 'not json' ;;
+    failed) printf '%s\n' 'image unavailable' >&2; exit 1 ;;
+    *) exit 2 ;;
+esac
+"#,
+            0o700,
+        )
+        .unwrap();
+
+        for image in ["missing", "null", "empty"] {
+            let c = docker_run_config(&docker, image).unwrap();
+            assert!(c.entrypoint.is_empty(), "{image}");
+            if image == "missing" {
+                assert_eq!(c.cmd, ["/bin/sh"]);
+            } else {
+                assert!(c.cmd.is_empty(), "{image}");
+            }
+            assert!(c.user.is_empty());
+            assert!(c.workdir.is_empty());
+            assert!(c.env.is_empty());
+            assert!(c.exposed_ports.is_empty());
+        }
+        let c = docker_run_config(&docker, "values").unwrap();
+        assert_eq!(
+            c.env,
+            [
+                ("MULTI".into(), "a\nb=c".into()),
+                ("EMPTY".into(), "".into())
+            ]
+        );
+        assert_eq!(c.user, "1000:1000");
+        assert_eq!(c.workdir, "/space dir ");
+        assert_eq!(c.entrypoint, ["/bin/sh", "-c"]);
+        assert_eq!(c.cmd, ["echo a\necho b", ""]);
+        assert_eq!(c.exposed_ports, [8080]);
+        let err = docker_run_config(&docker, "invalid").unwrap_err();
+        assert!(err.to_string().contains("parsing the config"));
+        let err = docker_run_config(&docker, "failed").unwrap_err();
+        assert!(err.to_string().contains("image unavailable"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     // Pin the shared sizing heuristic for both the known-count (OCI pull) and the
     // unknown-count (docker export) branch, so the two call sites can't drift.

@@ -385,7 +385,12 @@ pub async fn pull_config(reference: &str, creds: &Creds) -> Result<ImageConfig> 
 /// Parse an OCI image config JSON's `.config` into the fields a build inherits.
 fn parse_config(json: &str) -> ImageConfig {
     let v: serde_json::Value = serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
-    let c = &v["config"];
+    parse_config_object(&v["config"])
+}
+
+/// Parse the fields a build inherits from OCI `.config` or Docker inspect `.Config`.
+/// Both use the same field names and shapes.
+pub fn parse_config_object(c: &serde_json::Value) -> ImageConfig {
     let env = c["Env"]
         .as_array()
         .map(|a| {
@@ -1012,6 +1017,42 @@ mod tests {
         let empty = parse_config(r#"{"config":{"User":"","WorkingDir":""}}"#);
         assert!(empty.user.is_none() && empty.workdir.is_none() && empty.env.is_empty());
         assert!(parse_config("not json").env.is_empty());
+    }
+
+    // Missing fields must not invent an empty-string executable.
+    #[test]
+    fn parse_a_docker_daemon_config_object() {
+        let config: serde_json::Value = serde_json::from_str(
+            r#"{"Env":["PATH=/usr/sbin:/usr/bin"],"Cmd":["/bin/sh"],"WorkingDir":"/"}"#,
+        )
+        .expect("test fixture parses");
+        let c = parse_config_object(&config);
+        assert_eq!(
+            c.env,
+            vec![("PATH".to_string(), "/usr/sbin:/usr/bin".into())]
+        );
+        assert_eq!(c.cmd, ["/bin/sh"]);
+        assert!(c.entrypoint.is_empty());
+        assert!(c.user.is_none());
+        assert_eq!(c.workdir.as_deref(), Some("/"));
+        for json in [
+            r#"{"Entrypoint":null,"Cmd":null,"User":null}"#,
+            r#"{"Entrypoint":[],"Cmd":[],"User":""}"#,
+        ] {
+            let config = serde_json::from_str(json).expect("test fixture parses");
+            let c = parse_config_object(&config);
+            assert!(c.entrypoint.is_empty());
+            assert!(c.cmd.is_empty());
+            assert!(c.user.is_none());
+        }
+        // An argv element may itself contain a newline, so it survives whole.
+        let config: serde_json::Value =
+            serde_json::from_str(r#"{"Entrypoint":["/bin/sh","-c","echo a\necho b"]}"#)
+                .expect("test fixture parses");
+        assert_eq!(
+            parse_config_object(&config).entrypoint,
+            ["/bin/sh", "-c", "echo a\necho b"]
+        );
     }
 
     #[test]
