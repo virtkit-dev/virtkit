@@ -465,6 +465,39 @@ State is stored under `$XDG_STATE_HOME/virtkit/dev`, falling back to
 `~/.local/state/virtkit/dev`. Separate worktrees and environment names have
 separate state, SSH identities and endpoint allocations.
 
+To reclaim data while keeping an environment's identity, stop it and prune:
+
+```sh
+vk dev stop
+vk dev prune --dry-run              # preview local boot images (the default)
+vk dev prune                       # remove those images, after confirmation
+vk dev prune --storage              # reset persistent data inside the state directory
+vk dev prune --all --yes            # images and storage, without asking
+vk dev --environment integration prune --all --dry-run
+```
+
+`prune` uses this workspace's configuration, including `--workspace`, `--dev-config`
+and `--environment`. It requires the environment to be stopped, even for a dry run.
+The default, also spelled `--images`, removes local materialized boot images and
+disposable boot media for the primary and services. `--storage` instead removes
+persistent roots and overlays (including old services), declared disk backings
+inside state, configured managed directories and managed editor data. Their contents
+are lost. `--images --storage` and `--all` select both categories.
+
+Every deletion previews its paths. The confirmation defaults to no; without a
+terminal, `--yes` is required. `--dry-run` removes nothing even with `--yes`.
+Refusing confirmation exits nonzero; an empty selection succeeds. Prune holds the
+environment's lock while selecting and removing data, so a concurrent start cannot
+use the selected files. The next start recreates the missing data and reruns the
+creation hook if one is configured.
+
+Prune retains the environment identity, SSH keys, endpoint allocations and logs.
+External backings and ordinary host bind mounts are retained, as are the shared
+image/build caches. Use `vk gc` for unused shared caches and `vk dev storage reset`
+for intentional deletion of an individual external durable backing. Arbitrary data
+from removed mount declarations is not inferred; `vk dev gc` removes the whole
+environment state when it is no longer needed.
+
 ```sh
 vk dev list
 vk dev list --json
@@ -831,6 +864,7 @@ individual options.
 | `plan` | Inspect the resolved config; `--explain`, `--diff`, `--format`, `--show-secrets`. |
 | `stop` | Stop the environment and publishers; `--timeout SECONDS`. |
 | `storage list`, `storage reset NAME` | Inspect storage or destroy a durable item's data. |
+| `prune` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. Requires a stopped environment. |
 | `list` | Host-wide environment inventory (on-disk sizes by default); `--no-sizes`, `--json`. |
 | `gc [NAME…]` | Remove stopped state; `--all-stale`, `--yes`. |
 | `schema` | Print the configuration JSON Schema. |

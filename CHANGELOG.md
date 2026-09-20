@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **`vk dev prune` reclaims an environment's local boot images without deleting its
+  identity.** Select `--storage` to reset persistent data inside its state directory,
+  or `--all` for both. It previews the paths and asks before deleting; `--dry-run`
+  previews only and `--yes` confirms noninteractively. Stop the environment first.
 - **`vk dev stop NAME` stops an environment by name, host-wide.** It takes the name
   `vk dev list` shows, so it reaches an environment in another workspace, or one whose
   workspace is gone — neither of which the config-only `vk dev stop` could stop before.

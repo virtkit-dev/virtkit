@@ -411,6 +411,7 @@ vk dev plan                         # inspect the resolved configuration without
 vk dev doctor                       # check the host and configuration requirements
 vk dev refresh                      # rebuild and restart into the current config
 vk dev stop
+vk dev prune --dry-run              # preview local boot-image cleanup; --storage selects data
 vk dev list                         # every environment this host keeps state for, from anywhere
 vk dev gc --all-stale               # review/remove stale state; asks on a terminal
 ```

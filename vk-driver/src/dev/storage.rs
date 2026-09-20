@@ -1,5 +1,5 @@
-//! The storage a dev environment's declarations amount to, and the one operation that
-//! destroys any of it.
+//! Inventory and reset of individual storage items; environment-wide cleanup is in
+//! [`super::prune`].
 //!
 //! Nothing is declared twice: data is named where the guest gets it — a compose `disk`
 //! volume, an `x-virtkit.persist_root` root, a `${state}` mount, the editor's server

@@ -276,7 +276,7 @@ const EDITOR_MOUNT: &str = "vscode-server";
 /// What the state dir holds for the host's own use. A mount may not name these: a guest that
 /// could write the key, the client config or the recorded identity would be steering the
 /// host, and one that could read the key could reach the next boot too.
-const RESERVED_STATE_ENTRIES: &[&str] = &[
+pub(super) const RESERVED_STATE_ENTRIES: &[&str] = &[
     "editor",
     "endpoints.json",
     "id_ed25519",

@@ -396,6 +396,17 @@ enum DevAction {
         #[arg(value_name = "NAME")]
         names: Vec<String>,
     },
+    /// Remove this environment's local boot images or persistent data
+    ///
+    /// Defaults to local boot images. --storage selects persistent roots, overlays,
+    /// disks and managed directories inside the state directory; --all selects both.
+    /// Keeps the environment identity, SSH keys, external backings and shared caches.
+    /// Stop the environment first. Shows the paths and asks before deleting; without
+    /// a terminal, requires --yes. --dry-run only previews.
+    Prune {
+        #[command(flatten)]
+        options: super::prune::Options,
+    },
     /// Print what the config resolves to, without doing any of it
     ///
     /// Which source, mounts, environment, endpoints and state directory the config means
@@ -461,6 +472,7 @@ impl DevAction {
             | Self::Stop { .. }
             | Self::List { .. }
             | Self::Gc { .. }
+            | Self::Prune { .. }
             | Self::Plan { .. }
             | Self::Schema => false,
         }
@@ -664,6 +676,10 @@ async fn dev_action(
         Err(e) => return fail(&e, 2),
     };
     match action {
+        DevAction::Prune { options } => match super::prune::run(&plan, &options) {
+            Ok(report) => write_report(&report),
+            Err(e) => fail(&e, 1),
+        },
         DevAction::Up { no_wait } => {
             match dev_up(&plan, host_cfg, over, false, !no_wait, true).await {
                 Ready::Act => ExitCode::SUCCESS,
@@ -1422,6 +1438,7 @@ mod tests {
         (&["stop"], false),
         (&["list"], false),
         (&["gc", "--all-stale", "--yes"], false),
+        (&["prune"], false),
         (&["plan", "--diff"], false),
         (&["schema"], false),
     ];
