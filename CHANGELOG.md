@@ -38,6 +38,9 @@ All notable changes to virtkit will be documented in this file.
   everything could leave the receiving end hundreds of kilobytes short, with no error on
   either side and no sign of it in the traffic figures. The switch now hands over every byte
   it acknowledged before it reports a transfer finished.
+- **VM shutdown gives pending uploads up to five seconds to finish.** Runs and CI jobs
+  wait for accepted guest uploads before stopping their shared network, reducing truncated
+  transfers when the receiving end is slow.
 - **Commands run correctly with `vk run --source docker` when the image has no
   `ENTRYPOINT`, instead of failing with exit code 127.**
 - **Guest connections recover sooner from lost packets** once their response time has

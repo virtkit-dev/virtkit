@@ -1059,6 +1059,9 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         kernel_opt.as_deref().or(cfg.build.kernel.as_deref()),
     )?;
     let mut children: Vec<std::process::Child> = Vec::new();
+    // Remember the switch so `stop_helpers` can drain it after stopping the other helpers.
+    // `None` unless `net.mode = "switch"`.
+    let mut switch_pid: Option<u32> = None;
     // Reference the materialized image bases this job overlays (the primary plus every
     // service) for the whole life of `supervise`, so the cache's idle GC cannot evict a
     // base out from under a running overlay. A shared advisory lock the kernel drops when
@@ -1393,7 +1396,9 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 std::fs::create_dir_all(ctx.job_dir.join(format!("svc-{}", svc.name)))
                     .with_context(|| format!("creating service dir for {}", svc.name))?;
             }
-            children.push(spawn_switch(ctx, gateway, prefix, guest_ip, &services)?);
+            let switch = spawn_switch(ctx, gateway, prefix, guest_ip, &services)?;
+            switch_pid = Some(switch.id());
+            children.push(switch);
             for svc in &services {
                 let dir = ctx.job_dir.join(format!("svc-{}", svc.name));
                 let (child, aux) = crate::units::boot_unit(
@@ -1563,18 +1568,12 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         tokio::select! {
             _ = term.recv() => {
                 graceful_vmm_stop(ctx, &mut vmm_child);
-                for mut c in children {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
+                stop_helpers(children, switch_pid);
                 return Ok(());
             }
             _ = tokio::time::sleep(Duration::from_millis(500)) => {
                 if let Some(status) = vmm_child.try_wait()? {
-                    for mut c in children {
-                        let _ = c.kill();
-                        let _ = c.wait();
-                    }
+                    stop_helpers(children, switch_pid);
                     bail!("{} exited ({status})", vmm.name());
                 }
                 // any owned helper dying (the switch, a service VM, a virtiofsd,
@@ -1582,15 +1581,30 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 for c in &mut children {
                     if let Some(status) = c.try_wait()? {
                         graceful_vmm_stop(ctx, &mut vmm_child);
-                        for mut c in children {
-                            let _ = c.kill();
-                            let _ = c.wait();
-                        }
+                        stop_helpers(children, switch_pid);
                         bail!("a supervised helper exited ({status}) — job torn down");
                     }
                 }
             }
         }
+    }
+}
+
+/// Stop a job's helpers after its primary VM. Kill helpers with no remaining work, then
+/// let the switch drain uploads from the now-stopped sibling VMs
+/// ([`crate::run::stop_switch`]).
+fn stop_helpers(children: Vec<std::process::Child>, switch_pid: Option<u32>) {
+    let mut switch = None;
+    for mut c in children {
+        if Some(c.id()) == switch_pid {
+            switch = Some(c);
+            continue;
+        }
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    if let Some(switch) = switch {
+        crate::run::stop_switch(switch);
     }
 }
 
@@ -2339,8 +2353,9 @@ pub fn stop_supervisor(ctx: &JobCtx) {
     let tag = ctx.job_dir.to_string_lossy().into_owned();
     unsafe { libc::kill(pid, libc::SIGTERM) };
     // the supervisor's own teardown runs the graceful guest shutdown; give it
-    // that budget plus margin before the hammer.
-    let grace = Duration::from_secs(ctx.cfg.executor.vm.shutdown_timeout_secs + 15);
+    // that budget, the switch drain, and margin for the VMM fallback shutdown steps.
+    let grace = Duration::from_secs(ctx.cfg.executor.vm.shutdown_timeout_secs + 15)
+        + crate::run::SWITCH_STOP;
     if !wait_gone(pid, &tag, grace) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
         wait_gone(pid, &tag, Duration::from_secs(3));

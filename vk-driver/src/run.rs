@@ -164,10 +164,11 @@ const WORKDIR_MOUNT: &str = "/work";
 /// deltas, so the file is the whole phase's traffic.
 pub(crate) const NET_BYTES: &str = "net.bytes";
 
-/// How long a run waits for its switch to publish and exit at teardown. Long enough for a
-/// signal and one append, short enough that a wedged switch costs the run nothing anyone
-/// would notice.
-const SWITCH_STOP: Duration = Duration::from_millis(300);
+/// Wait for pending guest uploads and traffic accounting before the switch exits.
+/// Covers [`crate::switch::DRAIN_DEADLINE`] plus shutdown margin. With no active flows,
+/// the switch exits immediately.
+pub(crate) const SWITCH_STOP: Duration =
+    Duration::from_secs(crate::switch::DRAIN_DEADLINE.as_secs() + 3);
 
 /// Audit-mode channel filename in a switch's work dir (or the build scratch): the switch
 /// appends every external domain the guest resolves, the caller prints the summary at the
@@ -2518,11 +2519,15 @@ fn teardown_run(
     }
 }
 
-/// Stop a run's switch, giving it the moment it needs to publish the bytes it carried
-/// ([`NET_BYTES`]) before it goes. SIGKILLed like the rest, a run's last flow — which closes
-/// as the guest exits — would be missing from the figure the run reports. Bounded because
-/// nothing but a resource line depends on it: a switch that does not go on its own is killed.
-fn stop_switch(mut child: Child) {
+/// Let the switch drain the last guest upload and publish traffic totals ([`NET_BYTES`]).
+/// Killing it with the other helpers can truncate a flow closing at guest exit and omit
+/// its bytes from the reported total. Force-kill it if it exceeds [`SWITCH_STOP`].
+pub(crate) fn stop_switch(mut child: Child) {
+    // The supervisor may have reaped a failed switch before stopping the VMs. Its PID
+    // can then be reused; unlike Child::kill, a raw signal does not check cached status.
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     if !crate::vm::wait_child_gone(&mut child, SWITCH_STOP) {
         let _ = child.kill();

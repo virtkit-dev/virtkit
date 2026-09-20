@@ -16,13 +16,14 @@
 
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::IoSlice;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::task::{Context as TaskCtx, Poll};
 use std::time::{Duration, Instant};
 
@@ -105,6 +106,21 @@ const FIRST_LEASE: u32 = 2;
 /// ServerHello). Bounding the dial fails the flow in seconds — we drop the guest stream
 /// and ipstack RSTs it — so a dead backend degrades to a fast connection error, not a hang.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the switch keeps writing guest bytes to their host sockets after it is asked to
+/// stop. SIGTERM reaches the switch once the VM it serves is already gone, so what an egress
+/// flow still holds is the tail of an upload whose sender has exited: the switch acknowledged
+/// those bytes to the guest and is the only thing left that can deliver them. Long enough for
+/// a receiver on a slow link to take what a handful of flows hold, short enough that a
+/// destination which has stopped reading altogether costs the teardown seconds rather than
+/// minutes. Whoever stops a switch allows for it (see run's `SWITCH_STOP`).
+pub(crate) const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+/// How long a draining flow with nothing left to write waits for more guest bytes before
+/// closing the host writer. It covers the hand-off from the stack's session task
+/// to the flow — a task wakeup — and deliberately little more: a connection the guest left
+/// open and idle (one pooled by a package manager, say) must still send EOF to the host.
+/// A flow that still holds bytes is not subject to it: a slow receiver is waited for until
+/// the deadline.
+const DRAIN_SETTLE: Duration = Duration::from_millis(100);
 /// Keepalive on an upstream flow: probe after this long idle, repeat every
 /// [`KEEPALIVE_INTERVAL`] seconds, give up after [`KEEPALIVE_PROBES`] unanswered probes — about
 /// 90 seconds to notice a destination that vanished without a FIN or a RST (powered off, a NAT
@@ -953,7 +969,8 @@ pub async fn run(
     );
     let restricted = guard.restricted();
     guard.open_bytes();
-    tokio::spawn(accept_loop(ip_stack, guard.clone()));
+    let (drain, mut drained) = Drain::new();
+    tokio::spawn(accept_loop(ip_stack, guard.clone(), drain.clone()));
     // The totals go out on a timer, so a reader that cannot stop the switch first — the job
     // trace, read while the job is still running — is at most a beat behind.
     tokio::spawn({
@@ -965,11 +982,13 @@ pub async fn run(
             }
         }
     });
-    // And once more on the way out, which is what makes a `vk run` figure whole: its last
-    // flow closes as the guest exits, too late for the beat before teardown. A reader that
-    // stops the switch and waits for it therefore has everything it carried.
+    // The way out: hand the host what the guests are owed, then publish once more — which is
+    // what makes a `vk run` figure whole, its last flow closing as the guest exits, too late
+    // for the beat before teardown. A reader that stops the switch and waits for it therefore
+    // has everything it carried.
     tokio::spawn({
         let guard = guard.clone();
+        let drain = drain.clone();
         async move {
             if let Ok(mut term) =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -977,9 +996,14 @@ pub async fn run(
                 term.recv().await;
                 // PDEATHSIG is SIGTERM (see spawn_tied), so handling it puts this process's
                 // death on the runtime where the default disposition needed nothing at all.
-                // SIGALRM's default action terminates, so a publish that wedges still goes.
+                // SIGALRM's default action terminates, so a drain or a publish that wedges
+                // still goes, past the deadline the drain bounds itself with.
                 // SAFETY: alarm(2) only arms this process's own timer.
-                unsafe { libc::alarm(5) };
+                unsafe { libc::alarm(DRAIN_DEADLINE.as_secs() as u32 + 3) };
+                drain.start();
+                // Drain accepted flows; a switch with no flows exits immediately.
+                // The receiver runs dry when the last of them is done.
+                let _ = tokio::time::timeout(DRAIN_DEADLINE, drained.recv()).await;
                 guard.publish_bytes();
                 std::process::exit(0);
             }
@@ -1279,13 +1303,61 @@ fn ip_stack_config() -> IpStackConfig {
     config
 }
 
+/// The switch's exit, shared with the egress flows. SIGTERM arrives once the VM the switch
+/// serves has been torn down, so no flow has a guest left to answer to: what a guest was
+/// still uploading when it died is lost with it, but the bytes the switch took off the LAN
+/// and acknowledged are its own debt, and it settles them before it goes. Flows carrying a
+/// download discard the host response — the guest reader is gone.
+struct Drain {
+    /// Set once, before `wake` fires, and read by every flow it wakes.
+    started: AtomicBool,
+    /// Wakes the flows parked in a splice so they notice the drain rather than the deadline.
+    wake: tokio::sync::Notify,
+    /// A sender cloned into every egress flow and dropped with the flow, plus the keeper
+    /// [`Drain::start`] drops. The matching receiver reports the drain complete when the last
+    /// of them goes; taking the keeper also refuses flows opened from here on.
+    flows: Mutex<Option<UnboundedSender<()>>>,
+}
+
+impl Drain {
+    /// A drain and the receiver that reports it complete.
+    fn new() -> (Arc<Self>, UnboundedReceiver<()>) {
+        let (tx, rx) = unbounded_channel();
+        let drain = Drain {
+            started: AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+            flows: Mutex::new(Some(tx)),
+        };
+        (Arc::new(drain), rx)
+    }
+
+    fn started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    /// Stop taking flows and wake the ones in flight. A flow parked on a read sees `started`
+    /// set either through its own check or through the wakeup, whichever of the two it
+    /// reaches first.
+    fn start(&self) {
+        self.started.store(true, Ordering::Release);
+        self.flows.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.wake.notify_waiters();
+    }
+
+    /// The token a flow holds while it may still owe the host bytes. `None` once the drain
+    /// has started: a flow opened after that has a guest that is already gone.
+    fn flow(&self) -> Option<UnboundedSender<()>> {
+        self.flows.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 /// ipstack's accept loop: each guest flow becomes a host-side proxy, gated by the
 /// egress policy (static IP allowlist + DNS-pinned IPs).
-async fn accept_loop(mut ip_stack: IpStack, egress: Arc<EgressGuard>) {
+async fn accept_loop(mut ip_stack: IpStack, egress: Arc<EgressGuard>, drain: Arc<Drain>) {
     loop {
         match ip_stack.accept().await {
             Ok(IpStackStream::Tcp(tcp)) => {
-                tokio::spawn(proxy_tcp(tcp, egress.clone()));
+                tokio::spawn(proxy_tcp(tcp, egress.clone(), drain.clone()));
             }
             Ok(IpStackStream::Udp(udp)) => {
                 tokio::spawn(proxy_udp(udp, egress.clone()));
@@ -1310,55 +1382,74 @@ fn guest_src(local: SocketAddr) -> Option<Ipv4Addr> {
 
 /// Terminate a guest TCP flow and splice it to a host connection to its original
 /// destination (egress through the host's own socket).
-async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard>) {
-    let dst = guest.peer_addr();
-    // The guest's own address, so the right per-source policy applies (`local_addr` is the
-    // flow's source; egress is IPv4).
-    let src = guest_src(guest.local_addr());
-    // Registry proxy: a flow to the sentinel address is spliced to the host-local
-    // credential proxy instead of egressing (it bypasses the egress allowlist — it is our
-    // own host service, and it never touches the guest's credentials).
-    let target = match egress.registry_proxy {
-        Some((sentinel, host)) if dst.ip() == IpAddr::V4(sentinel) => host,
-        _ => {
-            if !src.is_some_and(|s| egress.allows(s, dst)) {
-                // Fallback deny path: a denied SYN is normally RST'd earlier in
-                // `reject_denied_syn` before ipstack completes the handshake, so this only
-                // fires for a flow that slipped through (e.g. a DNS pin expiring between the
-                // SYN and here). Per-stage dedup collapses any double-record.
-                eprintln!("switch: egress denied (tcp) {dst}");
-                egress.record_denial(crate::egress_report::Proto::Tcp, &dst.to_string());
-                return;
+fn proxy_tcp(
+    mut guest: ipstack::IpStackTcpStream,
+    egress: Arc<EgressGuard>,
+    drain: Arc<Drain>,
+) -> impl Future<Output = ()> {
+    // Register before the proxy is spawned: ipstack can acknowledge guest bytes while
+    // the upstream connection is still pending.
+    let owed = drain.flow();
+    async move {
+        let Some(_owed) = owed else {
+            return;
+        };
+        let dst = guest.peer_addr();
+        // The guest's own address, so the right per-source policy applies (`local_addr` is the
+        // flow's source; egress is IPv4).
+        let src = guest_src(guest.local_addr());
+        // Registry proxy: a flow to the sentinel address is spliced to the host-local
+        // credential proxy instead of egressing (it bypasses the egress allowlist — it is our
+        // own host service, and it never touches the guest's credentials).
+        let target = match egress.registry_proxy {
+            Some((sentinel, host)) if dst.ip() == IpAddr::V4(sentinel) => host,
+            _ => {
+                if !src.is_some_and(|s| egress.allows(s, dst)) {
+                    // Fallback deny path: a denied SYN is normally RST'd earlier in
+                    // `reject_denied_syn` before ipstack completes the handshake, so this only
+                    // fires for a flow that slipped through (e.g. a DNS pin expiring between the
+                    // SYN and here). Per-stage dedup collapses any double-record.
+                    eprintln!("switch: egress denied (tcp) {dst}");
+                    egress.record_denial(crate::egress_report::Proto::Tcp, &dst.to_string());
+                    return;
+                }
+                if let (Some(s), SocketAddr::V4(v4)) = (src, dst) {
+                    egress.record_ip_contact(s, v4);
+                }
+                dst
             }
-            if let (Some(s), SocketAddr::V4(v4)) = (src, dst) {
-                egress.record_ip_contact(s, v4);
+        };
+        match connect_egress(target, CONNECT_TIMEOUT).await {
+            Ok(host) => {
+                // Counted as the bytes pass rather than from what the copy returns: a flow torn
+                // down by either end — which is how most of them end — reports an error and no
+                // counts at all, and a job's traffic would read as zero.
+                let mut host = Counted {
+                    inner: host,
+                    egress: egress.clone(),
+                };
+                // The splice errors when a side tears the flow down rather than closing it
+                // cleanly. A reset is how a peer routinely closes — an HTTP server without keepalive,
+                // a client that aborts — so it is left unlogged; the rarer faults are worth a line: a
+                // timeout, a broken pipe, the upstream gone (see `detect_dead_peer`). Either way,
+                // returning drops `guest` and resets its connection, which is all the guest sees.
+                if let Err(e) = splice(
+                    &mut guest,
+                    &mut host,
+                    HOST_BOUND_CHUNK,
+                    MSS as usize,
+                    Some(&drain),
+                )
+                .await
+                    && e.kind() != std::io::ErrorKind::ConnectionReset
+                {
+                    egress.log_flow_failure(guest.local_addr(), dst, &e);
+                }
             }
-            dst
+            // Connect refused, failed, or timed out: return so the guest stream drops and
+            // ipstack RSTs it, failing the guest's flow at once instead of leaving it hung.
+            Err(e) => eprintln!("switch: tcp connect {target}: {e} — resetting the guest flow"),
         }
-    };
-    match connect_egress(target, CONNECT_TIMEOUT).await {
-        Ok(host) => {
-            // Counted as the bytes pass rather than from what the copy returns: a flow torn
-            // down by either end — which is how most of them end — reports an error and no
-            // counts at all, and a job's traffic would read as zero.
-            let mut host = Counted {
-                inner: host,
-                egress: egress.clone(),
-            };
-            // The splice errors when a side tears the flow down rather than closing it
-            // cleanly. A reset is how a peer routinely closes — an HTTP server without keepalive,
-            // a client that aborts — so it is left unlogged; the rarer faults are worth a line: a
-            // timeout, a broken pipe, the upstream gone (see `detect_dead_peer`). Either way,
-            // returning drops `guest` and resets its connection, which is all the guest sees.
-            if let Err(e) = splice(&mut guest, &mut host, HOST_BOUND_CHUNK, MSS as usize).await
-                && e.kind() != std::io::ErrorKind::ConnectionReset
-            {
-                egress.log_flow_failure(guest.local_addr(), dst, &e);
-            }
-        }
-        // Connect refused, failed, or timed out: return so the guest stream drops and
-        // ipstack RSTs it, failing the guest's flow at once instead of leaving it hung.
-        Err(e) => eprintln!("switch: tcp connect {target}: {e} — resetting the guest flow"),
     }
 }
 
@@ -1370,6 +1461,8 @@ async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard
 /// the pinned source and MIT license.
 struct CopyBuffer {
     read_done: bool,
+    /// New input since the drain last checked whether this direction was idle.
+    read_progress: bool,
     need_flush: bool,
     /// The last read filled the buffer, so the next one is worth taking more room for.
     saturated: bool,
@@ -1383,6 +1476,7 @@ impl CopyBuffer {
     fn new(max: usize) -> Self {
         Self {
             read_done: false,
+            read_progress: false,
             need_flush: false,
             saturated: false,
             pos: 0,
@@ -1390,6 +1484,11 @@ impl CopyBuffer {
             max,
             buf: Vec::new(),
         }
+    }
+
+    /// Whether the buffer still holds bytes the writer has not taken.
+    fn pending(&self) -> bool {
+        self.pos < self.cap
     }
 
     /// Whether another read can add to the buffer, growing it if that is what it takes.
@@ -1417,6 +1516,7 @@ impl CopyBuffer {
         if let Poll::Ready(Ok(())) = res {
             let filled_len = buf.filled().len();
             me.read_done = me.cap == filled_len;
+            me.read_progress |= filled_len > me.cap;
             me.saturated = filled_len == size;
             me.cap = filled_len;
         }
@@ -1539,11 +1639,18 @@ where
 /// Copy in both directions between `a` and `b` until both have reported EOF and the opposing
 /// writer has been shut down, or either side errors — tokio's `copy_bidirectional_with_sizes`
 /// with the buffer sizes read as ceilings rather than as what to allocate up front.
+///
+/// With a `drain`, the flow answers the switch's exit: from then on it finishes writing what
+/// `a` has already handed it to `b` and shuts `b` down, and abandons the other direction —
+/// `a` is a guest that no longer exists. Replies are discarded until host EOF to avoid
+/// resetting the socket with unread input. After [`DRAIN_SETTLE`] without guest bytes,
+/// the host writer is shut down; the caller bounds the drain with [`DRAIN_DEADLINE`].
 async fn splice<A, B>(
     a: &mut A,
     b: &mut B,
     a_to_b_max: usize,
     b_to_a_max: usize,
+    drain: Option<&Drain>,
 ) -> std::io::Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -1551,13 +1658,52 @@ where
 {
     let mut a_to_b = TransferState::Running(CopyBuffer::new(a_to_b_max));
     let mut b_to_a = TransferState::Running(CopyBuffer::new(b_to_a_max));
+    // Registered before the flag is first read, so a drain starting between the two wakes
+    // this flow instead of leaving it parked: `Notify` keeps no permit for a late waiter.
+    let mut wake = drain.map(|d| Box::pin(d.wake.notified()));
+    if let Some(wake) = wake.as_mut() {
+        wake.as_mut().enable();
+    }
+    let mut draining = drain.is_some_and(Drain::started);
+    let mut settle: Option<Pin<Box<tokio::time::Sleep>>> = None;
+    let mut discard = tokio::io::sink();
     std::future::poll_fn(|cx| {
-        let a_to_b = transfer_one_direction(cx, &mut a_to_b, a, b)?;
-        let b_to_a = transfer_one_direction(cx, &mut b_to_a, b, a)?;
+        if !draining && let Some(wake) = wake.as_mut() {
+            draining = wake.as_mut().poll(cx).is_ready();
+        }
+        let a_to_b_done = transfer_one_direction(cx, &mut a_to_b, a, b)?;
+        if draining {
+            // Keep reading replies, but discard them: the guest is gone. Closing a TCP
+            // socket with unread input resets it and can discard queued upload bytes.
+            let b_to_a_done = transfer_one_direction(cx, &mut b_to_a, b, &mut discard)?;
+            if a_to_b_done.is_ready() {
+                return b_to_a_done.map(Ok);
+            }
+            match &mut a_to_b {
+                TransferState::Running(buf) if !buf.pending() => {
+                    if std::mem::take(&mut buf.read_progress) {
+                        settle = None;
+                    }
+                    // Allow the stack to hand over its last bytes, then send EOF even if
+                    // the vanished guest never closed its stream.
+                    let settle =
+                        settle.get_or_insert_with(|| Box::pin(tokio::time::sleep(DRAIN_SETTLE)));
+                    if settle.as_mut().poll(cx).is_ready() {
+                        buf.read_done = true;
+                        cx.waker().wake_by_ref();
+                    }
+                }
+                _ => settle = None,
+            }
+            // Await the host's EOF after shutting down its writer. The outer deadline
+            // bounds receivers that stop reading or never close their reply stream.
+            return Poll::Pending;
+        }
+        let b_to_a_done = transfer_one_direction(cx, &mut b_to_a, b, a)?;
         // An early return is not a problem: the other direction keeps reporting Done on the
         // polls that follow.
-        std::task::ready!(a_to_b);
-        std::task::ready!(b_to_a);
+        std::task::ready!(a_to_b_done);
+        std::task::ready!(b_to_a_done);
         Poll::Ready(Ok(()))
     })
     .await
@@ -2900,7 +3046,8 @@ mod tests {
             let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
                 .with_registry_proxy(Some((remote.into(), listener.local_addr().unwrap())));
             // Poll the proxy together with the peer so it is dropped even on a timeout.
-            let proxy = proxy_tcp(stream, Arc::new(guard));
+            let (drain, _drained) = Drain::new();
+            let proxy = proxy_tcp(stream, Arc::new(guard), drain);
             let receive = async {
                 let (mut host, _) = listener.accept().await.unwrap();
                 let payload = vec![0x5a; 32 * 1024];
@@ -2990,7 +3137,8 @@ mod tests {
             let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
                 .with_registry_proxy(Some((remote.into(), listener.local_addr().unwrap())));
             // Poll the proxy together with the peer so it is dropped even on a timeout.
-            let proxy = proxy_tcp(stream, Arc::new(guard));
+            let (drain, _drained) = Drain::new();
+            let proxy = proxy_tcp(stream, Arc::new(guard), drain);
             let receive = async {
                 let (mut host, _) = listener.accept().await.unwrap();
                 let payload = vec![0x5a; SEGMENT];
@@ -3029,6 +3177,305 @@ mod tests {
                 () = proxy => panic!("the flow ended before the upload reached the host"),
                 () = receive => {},
             }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The addresses the drain tests' guest flow runs between.
+    const FLOW_GUEST: [u8; 4] = [192, 168, 127, 2];
+    const FLOW_REMOTE: [u8; 4] = [10, 0, 0, 1];
+
+    /// A guest TCP flow through a real stack, handshake done, ready to be spliced. It keeps
+    /// what the flow depends on alive — dropping the stack ends the flow, and dropping the
+    /// reply channel breaks the stack's device — and drives the guest side of it.
+    struct GuestFlow {
+        _stack: IpStack,
+        _replies: UnboundedReceiver<Vec<u8>>,
+        /// Taken by the test and handed to the flow's proxy.
+        stream: Option<ipstack::IpStackTcpStream>,
+        tx: UnboundedSender<Vec<u8>>,
+        /// Where the guest's stream is at, and what it acknowledges the gateway at.
+        seq: u32,
+        ack: u32,
+    }
+
+    impl GuestFlow {
+        async fn open() -> Self {
+            use etherparse::{PacketBuilder, PacketHeaders, TcpOptionElement, TransportHeader};
+            let (tx, rx) = unbounded_channel();
+            let (reply_tx, mut replies) = unbounded_channel();
+            let mut stack = IpStack::new(ip_stack_config(), ChannelDevice { rx, tx: reply_tx });
+            let mut syn = Vec::new();
+            PacketBuilder::ipv4(FLOW_GUEST, FLOW_REMOTE, 64)
+                .tcp(40000, 443, 1000, 64240)
+                .syn()
+                .options(&[TcpOptionElement::WindowScale(7)])
+                .unwrap()
+                .write(&mut syn, &[])
+                .unwrap();
+            tx.send(syn).unwrap();
+            let reply = replies.recv().await.unwrap();
+            let Some(TransportHeader::Tcp(synack)) = PacketHeaders::from_ip_slice(reply_ip(&reply))
+                .unwrap()
+                .transport
+            else {
+                panic!("expected SYN-ACK");
+            };
+            let ack = synack.sequence_number.wrapping_add(1);
+            let mut handshake = Vec::new();
+            PacketBuilder::ipv4(FLOW_GUEST, FLOW_REMOTE, 64)
+                .tcp(40000, 443, 1001, 64240)
+                .ack(ack)
+                .write(&mut handshake, &[])
+                .unwrap();
+            tx.send(handshake).unwrap();
+            let IpStackStream::Tcp(stream) = stack.accept().await.unwrap() else {
+                panic!("expected TCP stream");
+            };
+            GuestFlow {
+                _stack: stack,
+                _replies: replies,
+                stream: Some(stream),
+                tx,
+                seq: 1001,
+                ack,
+            }
+        }
+
+        /// One segment from the guest.
+        fn send(&mut self, payload: &[u8]) {
+            use etherparse::PacketBuilder;
+            let mut data = Vec::new();
+            PacketBuilder::ipv4(FLOW_GUEST, FLOW_REMOTE, 64)
+                .tcp(40000, 443, self.seq, 64240)
+                .ack(self.ack)
+                .write(&mut data, payload)
+                .unwrap();
+            self.tx.send(data).unwrap();
+            self.seq = self.seq.wrapping_add(payload.len() as u32);
+        }
+
+        /// The guest is done writing and closes its half.
+        fn close(&mut self) {
+            use etherparse::PacketBuilder;
+            let mut fin = Vec::new();
+            PacketBuilder::ipv4(FLOW_GUEST, FLOW_REMOTE, 64)
+                .tcp(40000, 443, self.seq, 64240)
+                .ack(self.ack)
+                .fin()
+                .write(&mut fin, &[])
+                .unwrap();
+            self.tx.send(fin).unwrap();
+        }
+    }
+
+    /// The VM is torn down with the tail of its last upload still in the switch, and the
+    /// switch is asked to stop while a slow host is taking it. Every byte still has to land.
+    #[tokio::test]
+    async fn a_drain_hands_the_host_the_tail_of_a_closed_upload() {
+        use std::os::fd::AsRawFd;
+        use tokio::time::timeout;
+
+        /// Far more than the host end takes in one turn, so the switch is still holding most
+        /// of the upload when the drain starts.
+        const TOTAL: usize = 256 << 10;
+        /// What an MTU-1500 guest puts in a segment.
+        const SEGMENT: usize = 1460;
+        /// What the host takes before the switch is asked to stop.
+        const FIRST: usize = 4 << 10;
+
+        timeout(Duration::from_secs(30), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            // A small receive buffer keeps enough of the upload in the switch to
+            // exercise pending writes during shutdown.
+            set_sock_opt(
+                listener.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                4 << 10,
+            )
+            .unwrap();
+            let mut flow = GuestFlow::open().await;
+            let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
+                .with_registry_proxy(Some((FLOW_REMOTE.into(), listener.local_addr().unwrap())));
+            let (drain, mut drained) = Drain::new();
+            let proxy = tokio::spawn(proxy_tcp(
+                flow.stream.take().unwrap(),
+                Arc::new(guard),
+                drain.clone(),
+            ));
+            let payload = vec![0x5a; SEGMENT];
+            let mut sent = 0;
+            while sent < TOTAL {
+                let len = SEGMENT.min(TOTAL - sent);
+                flow.send(&payload[..len]);
+                sent += len;
+            }
+            // The guest has written everything and closed; its VM is then torn down and the
+            // switch signalled, with the upload still crossing it.
+            flow.close();
+            let (mut host, _) = listener.accept().await.unwrap();
+            let mut got = vec![0u8; FIRST];
+            host.read_exact(&mut got).await.unwrap();
+            drain.start();
+            // A reply arrives after draining starts. It must be consumed even though
+            // the guest cannot receive it, or closing the host socket resets the upload.
+            host.write_all(&[0x42; 32 << 10]).await.unwrap();
+            assert!(
+                matches!(
+                    drained.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "the drain is not waiting for a flow that still owes the host"
+            );
+            // A receiver that takes its time still gets all of it, and the flow ends by
+            // itself once it has handed the last byte over.
+            let mut chunk = vec![0u8; 8 << 10];
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let read = host.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                got.extend_from_slice(&chunk[..read]);
+            }
+            assert_eq!(got.len(), TOTAL, "the drained upload arrived short");
+            assert!(
+                got.iter().all(|&byte| byte == 0x5a),
+                "the upload is corrupt"
+            );
+            host.shutdown().await.unwrap();
+            proxy.await.unwrap();
+            assert!(
+                drained.recv().await.is_none(),
+                "the drain is waiting on a flow that has ended"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_drain_waits_for_a_proxy_that_has_not_connected_yet() {
+        use etherparse::{PacketHeaders, TransportHeader};
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut flow = GuestFlow::open().await;
+            let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
+                .with_registry_proxy(Some((FLOW_REMOTE.into(), listener.local_addr().unwrap())));
+            let (drain, mut drained) = Drain::new();
+            // Keep the proxy unpolled until after shutdown starts. The stack can still
+            // acknowledge the entire upload before its upstream connection is opened.
+            let proxy = proxy_tcp(flow.stream.take().unwrap(), Arc::new(guard), drain.clone());
+            flow.send(b"last upload");
+            flow.close();
+            loop {
+                let reply = flow._replies.recv().await.unwrap();
+                if let Some(TransportHeader::Tcp(header)) =
+                    PacketHeaders::from_ip_slice(reply_ip(&reply))
+                        .unwrap()
+                        .transport
+                    && header.acknowledgment_number == flow.seq.wrapping_add(1)
+                {
+                    break;
+                }
+            }
+            drain.start();
+            assert!(matches!(
+                drained.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            let peer = async {
+                let (mut host, _) = listener.accept().await.unwrap();
+                let mut got = Vec::new();
+                host.read_to_end(&mut got).await.unwrap();
+                assert_eq!(got, b"last upload");
+                host.shutdown().await.unwrap();
+            };
+            tokio::join!(proxy, peer);
+            assert!(drained.recv().await.is_none());
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A switch that owes nothing goes on the signal: the drain has nobody to wait for, and
+    /// takes no flows on from there.
+    #[tokio::test]
+    async fn a_drain_with_no_flows_completes_at_once() {
+        let (drain, mut drained) = Drain::new();
+        drain.start();
+        assert!(matches!(
+            drained.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(
+            drain.flow().is_none(),
+            "a flow opened after the drain is refused"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_settles_only_after_guest_bytes_stop_arriving() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut guest, mut guest_peer) = tokio::io::duplex(64);
+            let (mut host, mut host_peer) = tokio::io::duplex(64);
+            let (drain, _drained) = Drain::new();
+            drain.start();
+            let proxy =
+                tokio::spawn(
+                    async move { splice(&mut guest, &mut host, 64, 64, Some(&drain)).await },
+                );
+            for byte in 1..=3 {
+                guest_peer.write_all(&[byte]).await.unwrap();
+                let mut got = [0];
+                host_peer.read_exact(&mut got).await.unwrap();
+                assert_eq!(got, [byte]);
+                // Each new handoff arrives before the idle interval, but the whole
+                // transfer outlasts the first timer. Fully written bytes reset it too.
+                tokio::time::advance(DRAIN_SETTLE * 3 / 4).await;
+            }
+            guest_peer.shutdown().await.unwrap();
+            assert_eq!(host_peer.read(&mut [0]).await.unwrap(), 0);
+            host_peer.shutdown().await.unwrap();
+            proxy.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    /// An idle connection sends EOF after settling instead of waiting for the guest to
+    /// close. A cooperating host then lets the drain finish before its deadline.
+    #[tokio::test]
+    async fn a_drain_does_not_wait_for_an_idle_flow() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut flow = GuestFlow::open().await;
+            let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
+                .with_registry_proxy(Some((FLOW_REMOTE.into(), listener.local_addr().unwrap())));
+            let (drain, _drained) = Drain::new();
+            let proxy = tokio::spawn(proxy_tcp(
+                flow.stream.take().unwrap(),
+                Arc::new(guard),
+                drain.clone(),
+            ));
+            let (mut host, _) = listener.accept().await.unwrap();
+            // An idle peer closes its response stream once the proxy sends EOF.
+            let peer = tokio::spawn(async move {
+                assert_eq!(host.read(&mut [0; 1]).await.unwrap(), 0);
+                host.shutdown().await.unwrap();
+            });
+            let start = Instant::now();
+            drain.start();
+            proxy.await.unwrap();
+            peer.await.unwrap();
+            assert!(
+                start.elapsed() < DRAIN_DEADLINE * 4 / 5,
+                "an idle flow held the drain for {:?}",
+                start.elapsed()
+            );
         })
         .await
         .unwrap();
@@ -3894,7 +4341,7 @@ mod tests {
             // destination forces partial writes and backpressure.
             let (mut b, mut b_peer) = tokio::io::duplex(MSS as usize * 2);
             let spliced = tokio::spawn(async move {
-                splice(&mut a, &mut b, HOST_BOUND_CHUNK, MSS as usize).await
+                splice(&mut a, &mut b, HOST_BOUND_CHUNK, MSS as usize, None).await
             });
             let request: Vec<u8> = (0..HOST_BOUND_CHUNK * 3 + 123)
                 .map(|i| (i % 251) as u8)
@@ -4025,7 +4472,7 @@ mod tests {
                 };
                 let error = tokio::time::timeout(
                     Duration::from_secs(2),
-                    splice(a, b, HOST_BOUND_CHUNK, MSS as usize),
+                    splice(a, b, HOST_BOUND_CHUNK, MSS as usize, None),
                 )
                 .await
                 .expect("a failure waited for the other direction")

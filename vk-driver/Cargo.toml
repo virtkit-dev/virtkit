@@ -128,5 +128,6 @@ virtiofsd = [
 libkrun = ["dep:krun"]
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # Match indicatif's line measurement in dashboard tests.
 console.workspace = true
