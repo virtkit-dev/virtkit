@@ -8,8 +8,8 @@ use crate::{
         tcp_header_flags, tcp_header_fmt,
     },
     stream::tcb::{
-        MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_UNACK, MAX_WINDOW_SHIFT, PacketType, READ_BUFFER_SIZE, READ_CHUNK, RTO, Tcb,
-        TcpState,
+        MAX_COUNT_FOR_DUP_ACK, MAX_RETRANSMIT_COUNT, MAX_RTO, MAX_UNACK, MAX_WINDOW_SHIFT, MIN_RTO, PacketType, READ_BUFFER_SIZE,
+        READ_CHUNK, RTO, Rto, Tcb, TcpState,
     },
 };
 use etherparse::{IpNumber, Ipv4Header, Ipv6FlowLabel, TcpHeader, TcpOptionElement};
@@ -63,8 +63,19 @@ pub struct TcpConfig {
     pub read_buffer_size: usize,
     /// Maximum number of duplicate ACKs before triggering fast retransmission.
     pub max_count_for_dup_ack: usize,
-    /// Retransmission timeout duration.
+    /// Retransmission timeout until the connection has measured a round trip, one second by
+    /// default as RFC 6298 § 2.1 has it. From the first measurement onwards the timeout follows
+    /// the round trip, between `min_rto` and `max_rto`. Must be positive and at most `max_rto`;
+    /// it may be below `min_rto`. Timeouts back off until an unambiguous RTT sample arrives.
     pub rto: std::time::Duration,
+    /// Floor for the measured retransmission timeout, 200ms by default. A peer a virtio hop away
+    /// answers in well under a millisecond, and RFC 6298 § 2.4's floor of a second would leave the
+    /// estimate no room to be of any use. Must be positive and at most `max_rto`.
+    pub min_rto: std::time::Duration,
+    /// Ceiling for the retransmission timeout, backoff included. Default is 60 seconds.
+    /// Must fit the platform's timer. Invalid RTO settings reject new TCP streams with
+    /// [`std::io::ErrorKind::InvalidInput`].
+    pub max_rto: std::time::Duration,
     /// Maximum number of retransmissions before giving up.
     pub max_retransmit_count: usize,
     /// TCP options
@@ -91,6 +102,8 @@ impl Default for TcpConfig {
             read_buffer_size: READ_BUFFER_SIZE,
             max_count_for_dup_ack: MAX_COUNT_FOR_DUP_ACK,
             rto: RTO,
+            min_rto: MIN_RTO,
+            max_rto: MAX_RTO,
             max_retransmit_count: MAX_RETRANSMIT_COUNT,
             options: Default::default(),
         }
@@ -238,7 +251,7 @@ impl IpStackTcpStream {
             config.max_unacked_bytes,
             config.read_buffer_size,
             config.max_count_for_dup_ack,
-            config.rto,
+            Rto::new(config.rto, config.min_rto, config.max_rto)?,
             config.max_retransmit_count,
         );
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
@@ -532,9 +545,10 @@ fn retransmit_or_reset(nt: NetworkTuple, sender: &PacketSender, tcb: &mut Tcb) -
         tcb.mark_aborted();
         return Ok(true);
     }
+    let rto = tcb.rto();
     for packet in timed_out {
         let (seq, count) = (packet.seq, packet.retransmit_count);
-        log::debug!("{nt} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}");
+        log::debug!("{nt} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}, timeout now {rto:?}");
         write_packet_to_device(sender, nt, tcb, None, ACK | PSH, Some(seq), Some(packet.payload))?;
     }
     Ok(false)
@@ -1081,8 +1095,7 @@ async fn tcp_main_logic_loop(
                         // segment on the wire, since nothing fits in a closed window.
                         PacketType::RetransmissionRequest if tcb.get_send_window() == 0 => {}
                         PacketType::RetransmissionRequest => {
-                            if let Some(packet) = tcb.find_inflight_packet(incoming_ack) {
-                                let (s, p) = (packet.seq, packet.payload.clone());
+                            if let Some((s, p)) = tcb.take_fast_retransmit(incoming_ack) {
                                 log::debug!(
                                     "{network_tuple} {state:?}: {l_info}, {pkt_type:?}, retransmission request, seq = {s}, len = {}",
                                     p.len()
@@ -1627,6 +1640,61 @@ mod tests {
         // The peer never took the segment, so it is still waiting at the front of it; a reset
         // anywhere past that is outside its window and RFC 5961 has it answer, not close.
         assert_eq!(reset.sequence_number, snd_una, "the reset was not where the peer is waiting");
+    }
+
+    #[test]
+    fn invalid_rto_bounds_reject_the_stream_before_sending() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (src, dst) = addrs();
+        let syn = segment(SYN, PEER_ISN, 0, Vec::new());
+        let config = TcpConfig {
+            max_rto: Duration::from_millis(100),
+            ..TcpConfig::default()
+        };
+        let err = IpStackTcpStream::new(src, dst, header(&syn).clone(), 0, up_tx, 1500, None, Arc::new(config))
+            .expect_err("reversed RTO bounds opened a session");
+        assert_eq!(std::io::Error::from(err).kind(), InvalidInput);
+        assert!(up_rx.try_recv().is_err());
+    }
+
+    /// The timer runs on the round trip the peer is answering in, not on the second the connection
+    /// starts with: one segment lost to a peer a hop away costs the floor, not a stall the
+    /// application can feel.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_segment_is_retransmitted_at_the_measured_timeout() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            min_rto: Duration::from_millis(50),
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let tcb = stream.tcb.clone();
+
+        // A write the peer acknowledges at once, which is the connection's only measurement.
+        stream.write_all(b"hello").await.unwrap();
+        let data = next_packet(&mut up_rx).await;
+        let after_data = header(&data).sequence_number.wrapping_add(5);
+        sender.send(segment(ACK, PEER_ISN + 1, after_data, Vec::new())).unwrap();
+        wait_until(
+            || tcb.lock().unwrap().get_inflight_packets_total_len() == 0,
+            "the first segment was never acknowledged",
+        )
+        .await;
+        let measured = tcb.lock().unwrap().rto();
+
+        // The next segment is never acknowledged, so it comes back on the measured timeout.
+        let sent = tokio::time::Instant::now();
+        stream.write_all(b"lost").await.unwrap();
+        assert_eq!(tcp_header_flags(header(&next_packet(&mut up_rx).await)), ACK | PSH);
+        let again = tokio::time::timeout(measured + Duration::from_millis(500), up_rx.recv())
+            .await
+            .expect("the retransmission missed its measured timeout")
+            .unwrap();
+        assert_eq!(tcp_header_flags(header(&again)), ACK | PSH);
+        assert_eq!(header(&again).sequence_number, after_data, "another segment came back");
+        let waited = sent.elapsed();
+        assert!(waited >= measured, "the retransmission overtook the timeout");
     }
 
     /// The session timeout belongs to the session, not to a reader: a stream nobody is polling
@@ -2570,7 +2638,7 @@ mod tests {
             MAX_UNACK,
             READ_BUFFER_SIZE,
             MAX_COUNT_FOR_DUP_ACK,
-            RTO,
+            Rto::new(RTO, MIN_RTO, MAX_RTO).unwrap(),
             MAX_RETRANSMIT_COUNT,
         );
         tcb.change_state(TcpState::Established);

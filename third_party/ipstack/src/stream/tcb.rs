@@ -7,8 +7,21 @@ pub(super) const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
 pub(super) const READ_CHUNK: usize = 8192; // 8KB, bytes drained from the reassembly buffer per handoff
 pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
-/// Retransmission timeout
+/// Retransmission timeout used until the round trip has been measured, as RFC 6298 § 2.1 has it
 pub(super) const RTO: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Floor for the measured retransmission timeout. RFC 6298 § 2.4 puts it at a second; Linux uses
+/// 200ms and so do we, because a peer one virtio hop away answers in well under a millisecond and
+/// a second of silence per lost segment is the whole cost this estimate is here to avoid.
+pub(super) const MIN_RTO: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Ceiling for the retransmission timeout, backoff included (RFC 6298 § 2.5 allows 60 seconds).
+pub(super) const MAX_RTO: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Clock granularity, the `G` of RFC 6298 § 2: the session task's timer is driven by tokio, which
+/// rounds its sleeps up to the millisecond, so a finer figure would claim precision we cannot wake
+/// up with.
+const CLOCK_GRANULARITY: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// Maximum count of retransmissions before dropping the packet
 pub(super) const MAX_RETRANSMIT_COUNT: usize = 3;
@@ -26,6 +39,82 @@ fn window_shift_for(buffer: usize) -> u8 {
         shift += 1;
     }
     shift
+}
+
+/// The retransmission timeout, estimated from the round trip as RFC 6298 § 2 prescribes.
+///
+/// Until the first sample it is the configured `initial`; from then on it is the smoothed round
+/// trip plus four times its variation, held between `min` and `max`. A timeout doubles it;
+/// only a fresh, unambiguous RTT sample ends the backoff.
+#[derive(Debug, Clone)]
+pub(super) struct Rto {
+    /// Smoothed round-trip time, `None` until the first sample: what says whether the estimate
+    /// exists at all.
+    srtt: Option<Duration>,
+    /// Variation of the round trip around `srtt`.
+    rttvar: Duration,
+    /// What the timer actually runs on, backoff included.
+    current: Duration,
+    min: Duration,
+    max: Duration,
+}
+
+impl Rto {
+    pub(super) fn new(initial: Duration, min: Duration, max: Duration) -> std::io::Result<Self> {
+        if initial.is_zero() || min.is_zero() || min > max || initial > max || std::time::Instant::now().checked_add(max).is_none() {
+            let message = "RTO values must be positive, rto and min_rto must not exceed max_rto, and max_rto must fit the timer";
+            log::warn!("Invalid TCP configuration: {message}");
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, message));
+        }
+        Ok(Self {
+            srtt: None,
+            rttvar: Duration::ZERO,
+            current: initial,
+            min,
+            max,
+        })
+    }
+
+    /// The timeout to arm the retransmission timer with.
+    pub(super) fn get(&self) -> Duration {
+        self.current
+    }
+
+    /// Fold in a round trip measured on a segment that went out exactly once. Karn's algorithm is
+    /// the caller's business: the acknowledgment of a segment sent twice says nothing about which
+    /// copy it answers, and timing it against either would poison the estimate.
+    pub(super) fn sample(&mut self, rtt: Duration) {
+        match self.srtt {
+            // The first measurement is all there is to go on, so it becomes the estimate outright
+            // and its half stands in for a variation nothing has shown yet (RFC 6298 § 2.2).
+            None => {
+                self.rttvar = rtt / 2;
+                self.srtt = Some(rtt);
+            }
+            // RFC 6298 § 2.3, in that order: the variation is measured against the smoothed value
+            // the sample is being compared with, not against the one it has already moved.
+            Some(srtt) => {
+                self.rttvar = (self.rttvar * 3 + srtt.abs_diff(rtt)) / 4;
+                self.srtt = Some((srtt * 7 + rtt) / 8);
+            }
+        }
+        self.recompute();
+    }
+
+    /// RFC 6298 § 5.5: a timeout doubles the timeout, up to the ceiling. Left alone with nothing
+    /// measured, the doubling is the only thing keeping a session from retransmitting into a peer
+    /// that is gone.
+    pub(super) fn back_off(&mut self) {
+        self.current = self.current.saturating_mul(2).min(self.max);
+    }
+
+    /// The timeout RFC 6298 § 2.2 computes: the smoothed round trip plus four variations, never
+    /// shorter than the clock can measure, and kept within the configured bounds.
+    fn recompute(&mut self) {
+        if let Some(srtt) = self.srtt {
+            self.current = (srtt + std::cmp::max(CLOCK_GRANULARITY, self.rttvar * 4)).clamp(self.min, self.max);
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -76,13 +165,14 @@ pub(crate) struct Tcb {
     recv_window_shift: Option<u8>,
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
+    retransmit_deadline: Option<std::time::Instant>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
     duplicate_ack_count: usize,
     duplicate_ack_count_helper: SeqNum,
     max_unacked_bytes: u32,
     read_buffer_size: usize,
     max_count_for_dup_ack: usize,
-    rto: std::time::Duration,
+    rto: Rto,
     max_retransmit_count: usize,
     /// Count session-task wakes in tests. Extra wakes add scheduler round trips between ACKs and
     /// the writes they unblock. Keeping the counter here reuses the lock held on each iteration
@@ -103,13 +193,14 @@ impl Tcb {
         max_unacked_bytes: u32,
         read_buffer_size: usize,
         max_count_for_dup_ack: usize,
-        rto: std::time::Duration,
+        rto: Rto,
         max_retransmit_count: usize,
     ) -> Tcb {
         #[cfg(debug_assertions)]
         let seq = 100;
         #[cfg(not(debug_assertions))]
         let seq = rand::RngExt::random::<u32>(&mut rand::rng());
+        let persist_timeout = rto.get();
         Tcb {
             seq: seq.into(),
             ack,
@@ -120,6 +211,7 @@ impl Tcb {
             recv_window_shift: None,
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
+            retransmit_deadline: None,
             unordered_packets: BTreeMap::new(),
             duplicate_ack_count: 0,
             duplicate_ack_count_helper: seq.into(),
@@ -134,8 +226,13 @@ impl Tcb {
             fin_requested: false,
             last_write_at: None,
             persist_deadline: None,
-            persist_timeout: rto,
+            persist_timeout,
         }
+    }
+
+    /// The timeout the retransmission timer is running on, as the round trip has it.
+    pub(crate) fn rto(&self) -> Duration {
+        self.rto.get()
     }
 
     #[cfg(test)]
@@ -359,8 +456,10 @@ impl Tcb {
         let window = self.peer_window_bytes(header_window);
         if window == 0 {
             if self.persist_deadline.is_none() {
-                self.persist_timeout = self.rto;
-                self.persist_deadline = Some(std::time::Instant::now() + self.rto);
+                // The probe interval starts where the retransmission timer stands: the round trip
+                // is as good a first guess for a window update as it is for a retransmission.
+                self.persist_timeout = self.rto.get();
+                self.persist_deadline = Some(std::time::Instant::now() + self.persist_timeout);
             }
         } else {
             self.persist_deadline = None;
@@ -453,7 +552,11 @@ impl Tcb {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Empty payload"));
         }
         let buf_len = buf.len() as u32;
-        self.inflight_packets.insert(self.seq, InflightPacket::new(self.seq, buf, self.rto));
+        let packet = InflightPacket::new(self.seq, buf);
+        if self.inflight_packets.is_empty() {
+            self.retransmit_deadline = Some(packet.send_time + self.rto.get());
+        }
+        self.inflight_packets.insert(self.seq, packet);
         self.seq += buf_len;
         Ok(())
     }
@@ -463,10 +566,23 @@ impl Tcb {
     }
 
     pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) {
+        self.update_inflight_packet_queue_at(ack, std::time::Instant::now());
+    }
+
+    fn update_inflight_packet_queue_at(&mut self, ack: SeqNum, now: std::time::Instant) {
         match self.inflight_packets.first_key_value() {
             None => return,
-            Some((&seq, _)) if ack < seq => return,
+            Some((&seq, _)) if ack <= seq || ack > self.seq => return,
             _ => {}
+        }
+        // A cumulative ACK covering retransmitted data is ambiguous even when its last
+        // segment was sent only once. Sample only fully acknowledged segments so partial
+        // ACKs cannot measure the same transmission repeatedly.
+        let ambiguous = self.inflight_packets.values().any(|p| p.seq < ack && p.retransmitted);
+        if !ambiguous && let Some(acked) = self.inflight_packets.values().find(|p| p.seq + p.payload.len() as u32 <= ack) {
+            let sample = now.saturating_duration_since(acked.send_time);
+            self.rto.sample(sample);
+            log::trace!("RTT sample {sample:?}, retransmission timeout {:?}", self.rto.get());
         }
         if let Some(seq) = self
             .inflight_packets
@@ -483,10 +599,20 @@ impl Tcb {
             }
         }
         self.inflight_packets.retain(|_, p| ack < p.seq + p.payload.len() as u32);
+        // Restart once per advancing ACK, including ACKs excluded from RTT sampling.
+        self.retransmit_deadline = (!self.inflight_packets.is_empty()).then(|| now + self.rto.get());
     }
 
-    pub(crate) fn find_inflight_packet(&self, seq: SeqNum) -> Option<&InflightPacket> {
-        self.inflight_packets.get(&seq)
+    /// The segment a run of duplicate ACKs is asking for, ready to be put on the wire again, with
+    /// the copy noted so Karn's algorithm keeps its acknowledgment out of the estimate. A fast
+    /// retransmit is not a timeout: it neither backs the timeout off nor spends one of the
+    /// retransmissions the segment is allowed before the flow is abandoned.
+    pub(crate) fn take_fast_retransmit(&mut self, seq: SeqNum) -> Option<(SeqNum, Vec<u8>)> {
+        let packet = self.inflight_packets.get_mut(&seq)?;
+        packet.retransmitted = true;
+        packet.send_time = std::time::Instant::now();
+        self.retransmit_deadline = Some(packet.send_time + self.rto.get());
+        Some((packet.seq, packet.payload.clone()))
     }
 
     #[must_use]
@@ -495,11 +621,19 @@ impl Tcb {
     /// will never reach the peer, leaving a hole in the stream. Leave packets whose own timers
     /// have not expired alone, even if another packet's timer has expired.
     pub(crate) fn collect_timed_out_inflight_packets(&mut self) -> (Vec<InflightPacket>, bool) {
+        self.collect_timed_out_inflight_packets_at(std::time::Instant::now())
+    }
+
+    fn collect_timed_out_inflight_packets_at(&mut self, now: std::time::Instant) -> (Vec<InflightPacket>, bool) {
         let mut retransmit_list = Vec::new();
         let mut exhausted = false;
+        let rto = self.rto.get();
+        if self.retransmit_deadline.is_none_or(|due| now < due) {
+            return (retransmit_list, exhausted);
+        }
 
         self.inflight_packets.retain(|_, packet| {
-            if !packet.is_timed_out() {
+            if !packet.is_timed_out(now, rto) {
                 return true; // keep the packet in the inflight_packets
             }
             if packet.retransmit_count >= self.max_retransmit_count {
@@ -508,11 +642,24 @@ impl Tcb {
                 return false; // remove this packet
             }
             packet.retransmit_count += 1;
-            packet.retransmit_timeout *= 2; // increase timeout exponentially
-            packet.send_time = std::time::Instant::now();
+            packet.retransmitted = true;
+            packet.send_time = now;
             retransmit_list.push(packet.clone());
             true
         });
+        // Back off once per timer expiry, regardless of how many segments it retransmits.
+        if !retransmit_list.is_empty() {
+            self.rto.back_off();
+        }
+        // Staggered segments share one timer round; none may back it off again before
+        // the interval armed by this expiry has elapsed.
+        self.retransmit_deadline = if self.inflight_packets.is_empty() {
+            None
+        } else if retransmit_list.is_empty() {
+            self.inflight_packets.values().map(|p| p.send_time + rto).min()
+        } else {
+            Some(now + self.rto.get())
+        };
         (retransmit_list, exhausted)
     }
 
@@ -523,7 +670,7 @@ impl Tcb {
         if self.send_window == 0 {
             return self.persist_deadline;
         }
-        self.inflight_packets.values().map(|p| p.send_time + p.retransmit_timeout).min()
+        self.retransmit_deadline
     }
 
     pub(crate) fn get_inflight_packets_total_len(&self) -> usize {
@@ -546,26 +693,32 @@ impl Tcb {
 pub struct InflightPacket {
     pub seq: SeqNum,
     pub payload: Vec<u8>,
+    /// When the copy now on the wire went out: what the retransmission timer runs from, and what
+    /// an acknowledgment is measured against.
     pub send_time: std::time::Instant,
+    /// How many times the timer has given up on this segment, which is what `max_retransmit_count`
+    /// bounds. A fast retransmit is not counted: it is the peer asking, not the peer silent.
     pub retransmit_count: usize,
-    pub retransmit_timeout: std::time::Duration, // current retransmission timeout
+    /// Whether this segment has been on the wire more than once, from the timer or from a run of
+    /// duplicate ACKs. Karn's algorithm bars such a segment from timing the round trip.
+    pub retransmitted: bool,
 }
 
 impl InflightPacket {
-    fn new(seq: SeqNum, payload: Vec<u8>, rto: Duration) -> Self {
+    fn new(seq: SeqNum, payload: Vec<u8>) -> Self {
         Self {
             seq,
             payload,
             send_time: std::time::Instant::now(),
             retransmit_count: 0,
-            retransmit_timeout: rto,
+            retransmitted: false,
         }
     }
     pub(crate) fn contains_seq_num(&self, seq: SeqNum) -> bool {
         self.seq <= seq && seq < self.seq + self.payload.len() as u32
     }
-    pub(crate) fn is_timed_out(&self) -> bool {
-        self.send_time.elapsed() >= self.retransmit_timeout
+    pub(crate) fn is_timed_out(&self, now: std::time::Instant, rto: Duration) -> bool {
+        now.saturating_duration_since(self.send_time) >= rto
     }
 }
 
@@ -573,9 +726,24 @@ impl InflightPacket {
 mod tests {
     use super::*;
 
+    /// An estimator starting from `initial`, with the crate's own bounds around it.
+    fn estimator(initial: Duration) -> Rto {
+        Rto::new(initial, MIN_RTO, MAX_RTO).unwrap()
+    }
+
+    /// Pretend every segment in flight went out a timeout ago, so the retransmission timer is due
+    /// without the test sleeping through it.
+    fn expire_inflight(tcb: &mut Tcb) {
+        let rto = tcb.rto();
+        for packet in tcb.inflight_packets.values_mut() {
+            packet.send_time -= rto;
+        }
+        tcb.retransmit_deadline = Some(std::time::Instant::now());
+    }
+
     #[test]
     fn test_in_flight_packet() {
-        let p = InflightPacket::new((u32::MAX - 1).into(), vec![10, 20, 30, 40, 50], RTO);
+        let p = InflightPacket::new((u32::MAX - 1).into(), vec![10, 20, 30, 40, 50]);
 
         assert!(p.contains_seq_num((u32::MAX - 1).into()));
         assert!(p.contains_seq_num(u32::MAX.into()));
@@ -594,7 +762,7 @@ mod tests {
             MAX_UNACK,
             READ_BUFFER_SIZE,
             MAX_COUNT_FOR_DUP_ACK,
-            RTO,
+            estimator(RTO),
             MAX_RETRANSMIT_COUNT,
         );
 
@@ -636,7 +804,7 @@ mod tests {
             MAX_UNACK,
             READ_BUFFER_SIZE,
             MAX_COUNT_FOR_DUP_ACK,
-            RTO,
+            estimator(RTO),
             MAX_RETRANSMIT_COUNT,
         );
 
@@ -659,7 +827,7 @@ mod tests {
             MAX_UNACK,
             READ_BUFFER_SIZE,
             MAX_COUNT_FOR_DUP_ACK,
-            RTO,
+            estimator(RTO),
             MAX_RETRANSMIT_COUNT,
         );
 
@@ -676,7 +844,7 @@ mod tests {
             MAX_UNACK,
             READ_BUFFER_SIZE,
             MAX_COUNT_FOR_DUP_ACK,
-            RTO,
+            estimator(RTO),
             MAX_RETRANSMIT_COUNT,
         );
 
@@ -705,7 +873,7 @@ mod tests {
             MAX_UNACK,
             READ_BUFFER_SIZE,
             MAX_COUNT_FOR_DUP_ACK,
-            RTO,
+            estimator(RTO),
             MAX_RETRANSMIT_COUNT,
         );
 
@@ -729,7 +897,7 @@ mod tests {
             MAX_UNACK,
             READ_BUFFER_SIZE,
             MAX_COUNT_FOR_DUP_ACK,
-            RTO,
+            estimator(RTO),
             MAX_RETRANSMIT_COUNT,
         );
         tcb.seq = SeqNum(100); // setting the initial seq
@@ -748,8 +916,12 @@ mod tests {
         let second_packet = tcb.inflight_packets.last_key_value().unwrap().1;
         assert_eq!(second_packet.seq, SeqNum(1100)); // no change in the second packet
 
-        // test 2: confirm all packets (ack=2000)
+        // An ACK beyond the sent data cannot retire it or change the timer.
         tcb.update_inflight_packet_queue(SeqNum(2000));
+        assert_eq!(tcb.inflight_packets.len(), 2);
+
+        // Confirm all bytes actually sent.
+        tcb.update_inflight_packet_queue(SeqNum(1600));
         assert_eq!(tcb.inflight_packets.len(), 0); // all packets are acknowledged
     }
 
@@ -761,7 +933,7 @@ mod tests {
             MAX_UNACK,
             READ_BUFFER_SIZE,
             MAX_COUNT_FOR_DUP_ACK,
-            RTO,
+            estimator(RTO),
             MAX_RETRANSMIT_COUNT,
         );
         tcb.seq = SeqNum(1000);
@@ -785,30 +957,26 @@ mod tests {
             MAX_UNACK,
             READ_BUFFER_SIZE,
             MAX_COUNT_FOR_DUP_ACK,
-            rto,
+            estimator(rto),
             MAX_RETRANSMIT_COUNT,
         );
-        let slack = std::time::Duration::from_millis(5);
-
         tcb.add_inflight_packet(vec![1; 500]).unwrap();
 
         // Simulate retransmission timeouts
         for i in 0..MAX_RETRANSMIT_COUNT {
             // Simulate a timeout for the first packet
-            let timeout = tcb.inflight_packets.values().next().unwrap().retransmit_timeout + slack;
-            std::thread::sleep(timeout);
+            expire_inflight(&mut tcb);
 
             let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
             assert_eq!(packets.len(), 1);
             assert!(!exhausted, "the packet was given up on with retransmissions left");
-            let packet = &packets[0];
-            assert_eq!(packet.retransmit_count, i + 1);
-            assert!(packet.retransmit_timeout > rto);
+            assert_eq!(packets[0].retransmit_count, i + 1);
+            // RFC 6298 § 5.5: one doubling per timeout, so the schedule is 5, 10, 20, 40ms here.
+            assert_eq!(tcb.rto(), rto * 2u32.pow(i as u32 + 1));
         }
 
         // The last retransmission is unacknowledged too, which takes one more timeout to learn.
-        let timeout = tcb.inflight_packets.values().next().unwrap().retransmit_timeout + slack;
-        std::thread::sleep(timeout);
+        expire_inflight(&mut tcb);
         let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
         assert!(packets.is_empty() && exhausted);
         assert!(tcb.inflight_packets.is_empty());
@@ -819,11 +987,19 @@ mod tests {
     #[test]
     fn exhausted_retransmissions_are_reported() {
         let rto = std::time::Duration::from_millis(5);
-        let mut tcb = Tcb::new(SeqNum(1000), 1500, MAX_UNACK, READ_BUFFER_SIZE, MAX_COUNT_FOR_DUP_ACK, rto, 2);
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            estimator(rto),
+            2,
+        );
         tcb.add_inflight_packet(vec![1; 100]).unwrap();
         let mut exhausted = false;
         for _ in 0..8 {
-            std::thread::sleep(rto * 8);
+            expire_inflight(&mut tcb);
             let (_, e) = tcb.collect_timed_out_inflight_packets();
             if e {
                 exhausted = true;
@@ -843,7 +1019,7 @@ mod tests {
             max_unacked_bytes,
             read_buffer_size,
             MAX_COUNT_FOR_DUP_ACK,
-            rto,
+            estimator(rto),
             MAX_RETRANSMIT_COUNT,
         )
     }
@@ -936,7 +1112,15 @@ mod tests {
     #[test]
     fn a_packet_whose_timer_has_not_expired_is_not_given_up_on() {
         let rto = std::time::Duration::from_millis(5);
-        let mut tcb = Tcb::new(SeqNum(1000), 1500, MAX_UNACK, READ_BUFFER_SIZE, MAX_COUNT_FOR_DUP_ACK, rto, 1);
+        let mut tcb = Tcb::new(
+            SeqNum(1000),
+            1500,
+            MAX_UNACK,
+            READ_BUFFER_SIZE,
+            MAX_COUNT_FOR_DUP_ACK,
+            estimator(rto),
+            1,
+        );
         tcb.add_inflight_packet(vec![1; 100]).unwrap();
 
         std::thread::sleep(rto * 4);
@@ -948,5 +1132,217 @@ mod tests {
         let (packets, exhausted) = tcb.collect_timed_out_inflight_packets();
         assert!(packets.is_empty() && !exhausted, "the packet was given up on before its timer");
         assert_eq!(tcb.inflight_packets.len(), 1);
+    }
+
+    /// RFC 6298 § 2.1: with no round trip measured yet, the timeout is the one the connection was
+    /// configured with.
+    #[test]
+    fn the_timeout_starts_at_the_configured_value() {
+        let tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        assert_eq!(tcb.rto(), Duration::from_secs(1));
+        assert_eq!(tcb.rto.srtt, None);
+    }
+
+    /// The first measurement is all there is to go on: it becomes the smoothed round trip outright,
+    /// with half of it standing in for the variation, and the timeout follows (RFC 6298 § 2.2).
+    #[test]
+    fn the_first_round_trip_sets_the_estimate() {
+        let mut rto = estimator(RTO);
+        rto.sample(Duration::from_millis(100));
+
+        assert_eq!(rto.srtt, Some(Duration::from_millis(100)));
+        assert_eq!(rto.rttvar, Duration::from_millis(50));
+        assert_eq!(rto.get(), Duration::from_millis(300), "100ms + 4 * 50ms");
+    }
+
+    /// Later measurements move the smoothed values by the gains of RFC 6298 § 2.3, the variation
+    /// measured against the smoothed round trip as it stood before the sample.
+    #[test]
+    fn later_round_trips_move_the_estimate() {
+        let mut rto = estimator(RTO);
+        rto.sample(Duration::from_millis(100));
+        rto.sample(Duration::from_millis(200));
+
+        // rttvar = 3/4 * 50ms + 1/4 * |100ms - 200ms|, srtt = 7/8 * 100ms + 1/8 * 200ms
+        assert_eq!(rto.rttvar, Duration::from_micros(62_500));
+        assert_eq!(rto.srtt, Some(Duration::from_micros(112_500)));
+        assert_eq!(rto.get(), Duration::from_micros(362_500), "112.5ms + 4 * 62.5ms");
+    }
+
+    /// Bound both measured timeouts and each backed-off interval.
+    #[test]
+    fn the_estimate_is_held_between_its_bounds() {
+        let mut floored = estimator(RTO);
+        floored.sample(Duration::from_micros(200));
+        assert_eq!(floored.get(), MIN_RTO);
+
+        let mut capped = estimator(RTO);
+        for _ in 0..12 {
+            capped.back_off();
+        }
+        assert_eq!(capped.get(), MAX_RTO);
+        capped.sample(MAX_RTO);
+        assert_eq!(capped.get(), MAX_RTO);
+    }
+
+    /// Only a fresh RTT sample ends the backoff; an ambiguous ACK preserves it.
+    #[test]
+    fn an_acknowledgment_of_new_data_measures_and_clears_the_backoff() {
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        tcb.seq = SeqNum(1000);
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+
+        let sent = tcb.inflight_packets[&SeqNum(1000)].send_time;
+        tcb.update_inflight_packet_queue_at(SeqNum(1500), sent + Duration::from_millis(1));
+        let measured = tcb.rto();
+        assert!(tcb.rto.srtt.is_some(), "the round trip was never measured");
+        assert_eq!(measured, MIN_RTO, "a round trip of microseconds did not floor the timeout");
+
+        // A second segment, given up on once and acknowledged afterwards.
+        tcb.add_inflight_packet(vec![2; 500]).unwrap();
+        expire_inflight(&mut tcb);
+        let (packets, _) = tcb.collect_timed_out_inflight_packets();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(tcb.rto(), measured * 2);
+
+        tcb.update_inflight_packet_queue(SeqNum(2000));
+        assert_eq!(tcb.rto(), measured * 2, "an ambiguous ACK cleared the backoff");
+
+        tcb.add_inflight_packet(vec![3; 500]).unwrap();
+        let sent = tcb.inflight_packets[&SeqNum(2000)].send_time;
+        tcb.update_inflight_packet_queue_at(SeqNum(2500), sent + Duration::from_millis(1));
+        assert_eq!(tcb.rto(), measured, "a fresh sample did not clear the backoff");
+    }
+
+    /// Karn's algorithm: an acknowledgment of a segment that has been on the wire twice cannot say
+    /// which copy it answers, so it times nothing at all.
+    #[test]
+    fn a_retransmitted_segment_is_not_measured() {
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        tcb.seq = SeqNum(1000);
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+
+        expire_inflight(&mut tcb);
+        let (packets, _) = tcb.collect_timed_out_inflight_packets();
+        assert_eq!(packets.len(), 1);
+        assert_eq!(tcb.rto(), RTO * 2);
+
+        tcb.update_inflight_packet_queue(SeqNum(1500));
+        assert_eq!(tcb.rto.srtt, None, "an ambiguous acknowledgment was measured");
+        assert_eq!(tcb.rto(), RTO * 2, "an ambiguous ACK cleared the backoff");
+    }
+
+    #[test]
+    fn invalid_rto_settings_are_rejected() {
+        for (initial, min, max) in [
+            (RTO, MIN_RTO, Duration::from_millis(100)),
+            (Duration::ZERO, MIN_RTO, MAX_RTO),
+            (RTO, Duration::ZERO, MAX_RTO),
+            (RTO, MIN_RTO, Duration::ZERO),
+            (MAX_RTO * 2, MIN_RTO, MAX_RTO),
+            (RTO, MIN_RTO, Duration::MAX),
+        ] {
+            assert_eq!(Rto::new(initial, min, max).unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        }
+        assert_eq!(
+            Rto::new(Duration::from_millis(5), MIN_RTO, MAX_RTO).unwrap().get(),
+            Duration::from_millis(5)
+        );
+        let mut capped = Rto::new(MAX_RTO, MIN_RTO, MAX_RTO).unwrap();
+        capped.back_off();
+        assert_eq!(capped.get(), MAX_RTO);
+    }
+
+    #[test]
+    fn staggered_packets_share_one_backoff_deadline() {
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        tcb.seq = SeqNum(1000);
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        let start = tcb.inflight_packets[&SeqNum(1000)].send_time;
+        tcb.add_inflight_packet(vec![2; 500]).unwrap();
+        tcb.inflight_packets.get_mut(&SeqNum(1500)).unwrap().send_time = start + Duration::from_millis(10);
+        assert_eq!(tcb.next_timer_deadline(), Some(start + RTO));
+
+        let (packets, exhausted) = tcb.collect_timed_out_inflight_packets_at(start + RTO);
+        assert!(!exhausted);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].seq, SeqNum(1000));
+        assert_eq!(tcb.rto(), RTO * 2);
+        assert_eq!(tcb.next_timer_deadline(), Some(start + RTO * 3));
+
+        let (packets, exhausted) = tcb.collect_timed_out_inflight_packets_at(start + Duration::from_millis(2010));
+        assert!(packets.is_empty() && !exhausted);
+        assert_eq!(tcb.rto(), RTO * 2);
+        assert_eq!(tcb.next_timer_deadline(), Some(start + RTO * 3));
+
+        let (packets, exhausted) = tcb.collect_timed_out_inflight_packets_at(start + RTO * 3);
+        assert!(!exhausted);
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].retransmit_count, 2);
+        assert_eq!(packets[1].retransmit_count, 1);
+        assert_eq!(tcb.rto(), RTO * 4);
+        assert_eq!(tcb.next_timer_deadline(), Some(start + RTO * 7));
+    }
+
+    #[test]
+    fn cumulative_acks_covering_retransmissions_are_not_measured() {
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        tcb.seq = SeqNum(1000);
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        tcb.add_inflight_packet(vec![2; 500]).unwrap();
+        tcb.take_fast_retransmit(SeqNum(1000)).unwrap();
+        tcb.update_inflight_packet_queue(SeqNum(2000));
+        assert_eq!(tcb.rto.srtt, None);
+        assert!(tcb.inflight_packets.is_empty());
+        assert_eq!(tcb.next_timer_deadline(), None);
+    }
+
+    #[test]
+    fn advancing_acks_restart_the_timer_and_measure_each_segment_once() {
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        tcb.seq = SeqNum(1000);
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+        tcb.add_inflight_packet(vec![2; 500]).unwrap();
+        let start = tcb.inflight_packets[&SeqNum(1000)].send_time;
+        let partial = start + Duration::from_millis(100);
+        tcb.update_inflight_packet_queue_at(SeqNum(1250), partial);
+        assert_eq!(tcb.rto.srtt, None);
+        assert_eq!(tcb.next_timer_deadline(), Some(partial + RTO));
+        tcb.update_inflight_packet_queue_at(SeqNum(1250), partial + RTO);
+        tcb.update_inflight_packet_queue_at(SeqNum(2001), partial + RTO);
+        assert_eq!(
+            tcb.next_timer_deadline(),
+            Some(partial + RTO),
+            "invalid and duplicate ACKs restarted the timer"
+        );
+
+        let full = start + Duration::from_millis(200);
+        tcb.update_inflight_packet_queue_at(SeqNum(1500), full);
+        assert_eq!(tcb.rto.srtt, Some(Duration::from_millis(200)));
+        assert_eq!(tcb.rto(), Duration::from_millis(600));
+        assert_eq!(tcb.next_timer_deadline(), Some(full + tcb.rto()));
+        tcb.update_inflight_packet_queue_at(SeqNum(1500), full + RTO);
+        assert_eq!(tcb.rto.srtt, Some(Duration::from_millis(200)));
+    }
+
+    /// A fast retransmit is the peer asking for a segment, not the peer gone silent: it spends
+    /// none of the segment's retransmissions and leaves the timeout where it is. The second copy
+    /// it puts on the wire does make the segment ambiguous, so Karn's algorithm applies to it too.
+    #[test]
+    fn a_fast_retransmit_is_not_a_timeout() {
+        let mut tcb = tcb_with(MAX_UNACK, READ_BUFFER_SIZE, RTO);
+        tcb.seq = SeqNum(1000);
+        tcb.add_inflight_packet(vec![1; 500]).unwrap();
+
+        let (seq, payload) = tcb.take_fast_retransmit(SeqNum(1000)).expect("the segment was not in flight");
+        assert_eq!((seq, payload.len()), (SeqNum(1000), 500));
+        assert_eq!(tcb.rto(), RTO, "a fast retransmit backed the timeout off");
+        assert_eq!(tcb.inflight_packets[&SeqNum(1000)].retransmit_count, 0);
+        let sent = tcb.inflight_packets[&SeqNum(1000)].send_time;
+        assert_eq!(tcb.next_timer_deadline(), Some(sent + RTO));
+        assert!(tcb.collect_timed_out_inflight_packets_at(sent + RTO / 2).0.is_empty());
+
+        tcb.update_inflight_packet_queue(SeqNum(1500));
+        assert_eq!(tcb.rto.srtt, None, "a fast-retransmitted segment timed the round trip");
     }
 }

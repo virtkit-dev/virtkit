@@ -108,11 +108,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const KEEPALIVE_IDLE: libc::c_int = 30;
 const KEEPALIVE_INTERVAL: libc::c_int = 10;
 const KEEPALIVE_PROBES: libc::c_int = 6;
-/// Retransmissions of a guest-bound TCP segment before the flow is reset (see `run`'s
-/// `TcpConfig`): six tries at 1, 3, 7, 15, 31 and 63 seconds, and the segment is abandoned
-/// when the seventh falls due at 127 — two minutes of tolerance for a switch the host did not
-/// schedule, or a guest too busy to answer.
-const TCP_MAX_RETRANSMITS: usize = 6;
+/// Retransmissions of a guest-bound TCP segment before the next timeout resets the flow.
+/// With the measured timeout at its 200 ms floor, eight retransmissions allow 102.2 s
+/// of silence (0.2 + 0.4 + … + 51.2); six would allow 25.4 s. Before an RTT sample,
+/// the 1 s initial timeout and 60 s ceiling allow 243 s. This gives a busy guest or
+/// an unscheduled switch time to recover.
+const TCP_MAX_RETRANSMITS: usize = 8;
 /// How long a guest flow may go without a packet from the guest before the stack resets it.
 /// A leak guard for flows whose guest is gone, not a liveness check: a pooled HTTP or
 /// interactive connection is idle for minutes at a time, and resetting one is a worse failure
@@ -1244,9 +1245,8 @@ fn flood(inner: &Inner, from: PortId, frame: &[u8]) {
 fn ip_stack_config() -> IpStackConfig {
     let mut config = IpStackConfig::default();
     config.mtu_unchecked(MTU);
-    // The default of 3 retransmits abandons a guest-bound segment 15s in, which a busy host
-    // that fails to schedule the switch reaches on a healthy flow; the stack then resets the
-    // connection and the guest's application reconnects. `TCP_MAX_RETRANSMITS` allows 127s.
+    // The default of 3 retransmissions abandons a segment after 3 s at the measured
+    // timeout's floor. Allow a busy guest longer to answer before resetting its flow.
     let mut tcp = ipstack::TcpConfig::default();
     tcp.max_retransmit_count = TCP_MAX_RETRANSMITS;
     tcp.timeout = TCP_IDLE_TIMEOUT;

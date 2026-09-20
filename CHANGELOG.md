@@ -19,6 +19,11 @@ All notable changes to virtkit will be documented in this file.
   without waiting for more packets to arrive.
 - **Guest uploads use less CPU when sending small packets with libkrun.**
 
+### Fixed
+
+- **Guest connections recover sooner from lost packets** once their response time has
+  been measured, while still allowing busy guests time to answer before disconnecting.
+
 ## [0.73.3] - 2026-09-19
 
 ### Fixed
