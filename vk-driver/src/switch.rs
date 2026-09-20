@@ -35,6 +35,8 @@ const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x01];
 const BCAST_MAC: [u8; 6] = [0xff; 6];
 /// Largest ethernet frame the switch's 4-byte-length framing carries, either direction.
 const MAX_FRAME: usize = 65535;
+/// Ethernet header: destination MAC, source MAC, ethertype.
+const ETH_HDR: usize = 14;
 /// Link MTU of the switch's LAN. Every guest NIC on a switch is configured with it, the
 /// gateway's own stack runs at it, and it sets the MSS the gateway advertises — siblings
 /// share the LAN, so they have to agree. Jumbo packets reduce per-frame overhead during
@@ -1004,8 +1006,8 @@ pub async fn run(
     {
         let sw = sw.clone();
         tokio::spawn(async move {
-            while let Some(ip) = ret_rx.recv().await {
-                sw.route_in(&ip);
+            while let Some(frame) = ret_rx.recv().await {
+                sw.route_in(frame);
             }
         });
     }
@@ -1185,16 +1187,21 @@ impl Switch {
                     send(inner, port, &rst);
                 } else {
                     // off-subnet (default route): egress via the shared ipstack
-                    let _ = self.egress_tx.send(ip.to_vec());
+                    let mut pkt = FRAME_POOL.take(ip.len());
+                    pkt.extend_from_slice(ip);
+                    let _ = self.egress_tx.send(pkt);
                 }
             }
             _ => {}
         }
     }
 
-    /// Route an ipstack egress reply back to the VM that owns its destination IP.
-    fn route_in(&self, ip: &[u8]) {
-        let Some(dip) = ipv4_dst(ip) else { return };
+    /// Route an ipstack egress reply back to the VM that owns its destination IP. The frame
+    /// arrives with its ethernet header reserved but not yet written (see `ChannelDevice`).
+    fn route_in(&self, mut frame: Vec<u8>) {
+        let Some(dip) = frame.get(ETH_HDR..).and_then(ipv4_dst) else {
+            return;
+        };
         let inner = self.inner.lock().unwrap();
         // Route by the authoritative IP -> port binding, not the learned `mac_port` (which a
         // guest can poison by sourcing a forged MAC), so an egress reply reaches only the VM
@@ -1205,7 +1212,8 @@ impl Switch {
         let Some(mac) = inner.ip_mac.get(&dip).copied() else {
             return;
         };
-        send(&inner, port, &wrap_eth(ip, mac));
+        write_eth_header(&mut frame, mac);
+        send_frame(&inner, port, frame);
     }
 
     /// Allocate (or reuse) a lease for `mac` and build the DHCP reply.
@@ -1228,8 +1236,13 @@ impl Switch {
 
 /// Send a frame to one port (non-blocking; dropped if the port is gone).
 fn send(inner: &Inner, port: PortId, frame: &[u8]) {
+    send_frame(inner, port, frame.to_vec());
+}
+
+/// The same, for a caller that already owns the frame's buffer.
+fn send_frame(inner: &Inner, port: PortId, frame: Vec<u8>) {
     if let Some(tx) = inner.ports.get(&port) {
-        let _ = tx.send(frame.to_vec());
+        let _ = tx.send(frame);
     }
 }
 
@@ -2116,6 +2129,51 @@ fn tcp_rst_frame(syn: &TcpSyn, client_mac: Mac) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Reuse jumbo packet buffers after consumers have copied them out. Small packets use
+/// their actual size so a backlog of ACKs does not retain a jumbo allocation per packet.
+struct FramePool {
+    free: Mutex<Vec<Vec<u8>>>,
+}
+
+/// Capacity every pooled buffer holds: the largest frame the switch carries, so a buffer
+/// out of the pool never has to grow.
+const POOL_BUF: usize = ETH_HDR + MAX_FRAME;
+/// Only large packets use the jumbo pool; smaller ones allocate their requested size.
+const POOL_MIN: usize = 16 * 1024;
+/// How many buffers the pool keeps: enough to cover the handful in flight between the
+/// gateway and a guest's writer at any moment. Past this a returned buffer is freed, so a
+/// queue that ran long does not pin memory for the rest of the run.
+const POOL_FRAMES: usize = 32;
+
+static FRAME_POOL: FramePool = FramePool {
+    free: Mutex::new(Vec::new()),
+};
+
+impl FramePool {
+    /// An empty buffer sized for the packet, reusing jumbo storage for large packets.
+    fn take(&self, size: usize) -> Vec<u8> {
+        if size < POOL_MIN {
+            return Vec::with_capacity(size);
+        }
+        match self.free.lock().unwrap().pop() {
+            Some(mut buf) => {
+                buf.clear();
+                buf
+            }
+            None => Vec::with_capacity(POOL_BUF),
+        }
+    }
+
+    /// Take a buffer back. One that cannot hold a full frame, or that arrives when the pool
+    /// is full, is dropped: the pool refills itself from the next `take`.
+    fn give(&self, buf: Vec<u8>) {
+        let mut free = self.free.lock().unwrap();
+        if buf.capacity() >= POOL_BUF && free.len() < POOL_FRAMES {
+            free.push(buf);
+        }
+    }
+}
+
 /// A tun-like device for ipstack backed by two channels: it reads the off-subnet
 /// IP packets the switch forwards and writes the IP packets ipstack emits back.
 struct ChannelDevice {
@@ -2133,6 +2191,7 @@ impl AsyncRead for ChannelDevice {
             Poll::Ready(Some(pkt)) => {
                 let n = pkt.len().min(buf.remaining());
                 buf.put_slice(&pkt[..n]);
+                FRAME_POOL.give(pkt);
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => Poll::Ready(Ok(())),
@@ -2147,7 +2206,13 @@ impl AsyncWrite for ChannelDevice {
         _cx: &mut TaskCtx<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let _ = self.get_mut().tx.send(buf.to_vec());
+        // Hand the packet on in a buffer that already reserves the ethernet header, so
+        // routing it to its guest writes the header in place instead of copying the packet
+        // into a second buffer (see `route_in`).
+        let mut frame = FRAME_POOL.take(ETH_HDR + buf.len());
+        frame.resize(ETH_HDR, 0);
+        frame.extend_from_slice(buf);
+        let _ = self.get_mut().tx.send(frame);
         Poll::Ready(Ok(buf.len()))
     }
     fn poll_flush(self: Pin<&mut Self>, _: &mut TaskCtx<'_>) -> Poll<std::io::Result<()>> {
@@ -2179,26 +2244,26 @@ async fn writer_task<W: AsyncWrite + Unpin>(mut wr: W, mut rx: UnboundedReceiver
             out.extend_from_slice(frame);
             taken += 1;
         }
-        frames.drain(..taken);
+        for frame in frames.drain(..taken) {
+            FRAME_POOL.give(frame);
+        }
         if wr.write_all(&out).await.is_err() {
             return;
         }
     }
 }
 
-/// Wrap an IP packet in an ethernet header addressed to the guest.
-fn wrap_eth(ip: &[u8], guest_mac: Mac) -> Vec<u8> {
-    let ethertype = if ip.first().map(|b| b >> 4) == Some(6) {
-        ETHERTYPE_IPV6
-    } else {
-        ETHERTYPE_IPV4
+/// Address a guest-bound frame to `guest_mac`, filling the [`ETH_HDR`] bytes it reserves
+/// ahead of its IP packet. The frame carries that reservation from the moment ipstack hands
+/// the packet over, so this writes a header rather than copying the packet.
+fn write_eth_header(frame: &mut [u8], guest_mac: Mac) {
+    let ethertype = match frame.get(ETH_HDR).map(|b| b >> 4) {
+        Some(6) => ETHERTYPE_IPV6,
+        _ => ETHERTYPE_IPV4,
     };
-    let mut out = Vec::with_capacity(14 + ip.len());
-    out.extend_from_slice(&guest_mac);
-    out.extend_from_slice(&GW_MAC);
-    out.extend_from_slice(&ethertype.to_be_bytes());
-    out.extend_from_slice(ip);
-    out
+    frame[0..6].copy_from_slice(&guest_mac);
+    frame[6..12].copy_from_slice(&GW_MAC);
+    frame[12..14].copy_from_slice(&ethertype.to_be_bytes());
 }
 
 /// A guest's qemu stream, read through a bounded buffer. One read can collect several
@@ -2420,6 +2485,12 @@ fn nth_host(gateway: Ipv4Addr, prefix: u8, index: u32) -> Result<Ipv4Addr> {
 mod tests {
     use super::*;
 
+    /// The IP packet inside a frame `ChannelDevice` handed on, past the ethernet header it
+    /// reserves for `route_in`.
+    fn reply_ip(frame: &[u8]) -> &[u8] {
+        &frame[ETH_HDR..]
+    }
+
     #[test]
     fn log_tail_shows_the_last_lines_and_nothing_when_there_are_none() {
         let dir = std::env::temp_dir().join(format!("vk-switch-tail-{}", std::process::id()));
@@ -2515,8 +2586,9 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let Some(TransportHeader::Tcp(synack)) =
-                PacketHeaders::from_ip_slice(&reply).unwrap().transport
+            let Some(TransportHeader::Tcp(synack)) = PacketHeaders::from_ip_slice(reply_ip(&reply))
+                .unwrap()
+                .transport
             else {
                 panic!("expected a TCP SYN-ACK");
             };
@@ -2557,8 +2629,9 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let Some(TransportHeader::Tcp(data)) =
-                PacketHeaders::from_ip_slice(&reply).unwrap().transport
+            let Some(TransportHeader::Tcp(data)) = PacketHeaders::from_ip_slice(reply_ip(&reply))
+                .unwrap()
+                .transport
             else {
                 panic!("expected TCP data");
             };
@@ -2595,8 +2668,9 @@ mod tests {
                 .unwrap();
             tx.send(syn).unwrap();
             let reply = replies.recv().await.unwrap();
-            let Some(TransportHeader::Tcp(synack)) =
-                PacketHeaders::from_ip_slice(&reply).unwrap().transport
+            let Some(TransportHeader::Tcp(synack)) = PacketHeaders::from_ip_slice(reply_ip(&reply))
+                .unwrap()
+                .transport
             else {
                 panic!("expected SYN-ACK");
             };
@@ -2622,7 +2696,7 @@ mod tests {
                 let mut sizes = Vec::new();
                 while received.len() < payload.len() {
                     let packet = replies.recv().await.unwrap();
-                    let headers = PacketHeaders::from_ip_slice(&packet).unwrap();
+                    let headers = PacketHeaders::from_ip_slice(reply_ip(&packet)).unwrap();
                     let bytes = headers.payload.slice();
                     if !bytes.is_empty() {
                         received.extend_from_slice(bytes);
@@ -3292,6 +3366,59 @@ mod tests {
         assert_eq!(bytes.as_slice(), framed(&[b"one"]));
         drop(tx);
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reply_reaches_the_switch_with_its_ethernet_header_reserved() {
+        let (_tx, rx) = unbounded_channel();
+        let (reply_tx, mut replies) = unbounded_channel();
+        let mut device = ChannelDevice { rx, tx: reply_tx };
+        let mut packet = vec![0x45];
+        packet.extend((1..40u8).map(|i| i * 3));
+        device.write_all(&packet).await.unwrap();
+
+        let mut frame = replies.recv().await.unwrap();
+        assert_eq!(frame.len(), ETH_HDR + packet.len());
+        assert_eq!(reply_ip(&frame), packet, "the packet is copied once, whole");
+
+        let guest = [0x52, 0x54, 0x00, 0x11, 0x22, 0x33];
+        write_eth_header(&mut frame, guest);
+        assert_eq!(&frame[0..6], guest);
+        assert_eq!(&frame[6..12], GW_MAC);
+        assert_eq!(&frame[12..14], ETHERTYPE_IPV4.to_be_bytes());
+        assert_eq!(reply_ip(&frame), packet, "the payload is left alone");
+
+        frame[ETH_HDR] = 0x60;
+        write_eth_header(&mut frame, guest);
+        assert_eq!(&frame[12..14], ETHERTYPE_IPV6.to_be_bytes());
+    }
+
+    #[test]
+    fn the_frame_pool_hands_back_the_buffer_it_was_given() {
+        let pool = FramePool {
+            free: Mutex::new(Vec::new()),
+        };
+        let mut first = pool.take(POOL_BUF);
+        assert!(first.capacity() >= POOL_BUF);
+        first.extend_from_slice(b"spent");
+        let address = first.as_ptr();
+        pool.give(first);
+        // A small packet must not take the jumbo buffer waiting in the pool.
+        let mut small = pool.take(40);
+        assert_eq!(small.capacity(), 40);
+        small.extend_from_slice(&[0x45; 40]);
+        let reused = pool.take(POOL_MIN);
+        assert!(reused.is_empty(), "a buffer comes back ready to fill");
+        assert_eq!(reused.as_ptr(), address, "and on the same allocation");
+        pool.give(reused);
+        pool.give(small);
+
+        pool.give(Vec::with_capacity(8));
+        assert_eq!(pool.free.lock().unwrap().len(), 1, "too small to keep");
+        for _ in 0..POOL_FRAMES * 2 {
+            pool.give(Vec::with_capacity(POOL_BUF));
+        }
+        assert_eq!(pool.free.lock().unwrap().len(), POOL_FRAMES);
     }
 
     async fn send(s: &mut UnixStream, frame: &[u8]) {
