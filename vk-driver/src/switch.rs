@@ -48,9 +48,15 @@ const _: () = assert!(MAX_FRAME >= 14 + MTU as usize);
 /// advertises it in the SYN-ACK. A guest-bound splice can hand ipstack up to this much per
 /// write; ipstack emits one segment, also limited by the guest's receive window.
 const MSS: u16 = MTU - 40;
-/// Buffer for the host-bound half of a spliced flow, matching ipstack's maximum read
+/// Ceiling for the host-bound half of a spliced flow, matching ipstack's maximum read
 /// handoff of one 8 KiB reassembly chunk. The guest kernel sizes that direction's segments.
 const HOST_BOUND_CHUNK: usize = 8 << 10;
+/// What a spliced flow's copy buffer is first allocated at, in either direction. A job
+/// opens hundreds of flows and most carry a request and a short reply, so a direction starts
+/// with a small buffer on its first poll and grows it while the reader keeps filling it —
+/// up to [`HOST_BOUND_CHUNK`] host-bound and [`MSS`] guest-bound, which is what a bulk
+/// transfer settles at.
+const SPLICE_INIT: usize = 8 << 10;
 /// Frame I/O on a guest's socket works in bursts: one read takes in whatever frames the
 /// socket holds, and queued frames share a write buffer. The bounds limit each batch;
 /// neither direction waits for a batch to fill.
@@ -1338,18 +1344,12 @@ async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard
                 inner: host,
                 egress: egress.clone(),
             };
-            // copy_bidirectional errors when a side tears the flow down rather than closing it
+            // The splice errors when a side tears the flow down rather than closing it
             // cleanly. A reset is how a peer routinely closes — an HTTP server without keepalive,
             // a client that aborts — so it is left unlogged; the rarer faults are worth a line: a
             // timeout, a broken pipe, the upstream gone (see `detect_dead_peer`). Either way,
             // returning drops `guest` and resets its connection, which is all the guest sees.
-            if let Err(e) = tokio::io::copy_bidirectional_with_sizes(
-                &mut guest,
-                &mut host,
-                HOST_BOUND_CHUNK,
-                MSS as usize,
-            )
-            .await
+            if let Err(e) = splice(&mut guest, &mut host, HOST_BOUND_CHUNK, MSS as usize).await
                 && e.kind() != std::io::ErrorKind::ConnectionReset
             {
                 egress.log_flow_failure(guest.local_addr(), dst, &e);
@@ -1359,6 +1359,207 @@ async fn proxy_tcp(mut guest: ipstack::IpStackTcpStream, egress: Arc<EgressGuard
         // ipstack RSTs it, failing the guest's flow at once instead of leaving it hung.
         Err(e) => eprintln!("switch: tcp connect {target}: {e} — resetting the guest flow"),
     }
+}
+
+/// One direction of a spliced flow. The copy loop is tokio's `copy_bidirectional`, with the
+/// buffer allocated on the direction's first poll and doubled up to `max` whenever a read
+/// fills it: a flow that carries a request and a short reply keeps kilobytes instead of a
+/// jumbo segment, and a bulk one still hands the writer a full buffer per write.
+/// Adapted from Tokio 1.53.1's `io/util/{copy,copy_bidirectional}.rs`; see NOTICE for
+/// the pinned source and MIT license.
+struct CopyBuffer {
+    read_done: bool,
+    need_flush: bool,
+    /// The last read filled the buffer, so the next one is worth taking more room for.
+    saturated: bool,
+    pos: usize,
+    cap: usize,
+    max: usize,
+    buf: Vec<u8>,
+}
+
+impl CopyBuffer {
+    fn new(max: usize) -> Self {
+        Self {
+            read_done: false,
+            need_flush: false,
+            saturated: false,
+            pos: 0,
+            cap: 0,
+            max,
+            buf: Vec::new(),
+        }
+    }
+
+    /// Whether another read can add to the buffer, growing it if that is what it takes.
+    fn has_room(&self) -> bool {
+        self.cap < self.buf.len() || self.buf.len() < self.max
+    }
+
+    fn poll_fill_buf<R: AsyncRead + ?Sized>(
+        &mut self,
+        cx: &mut TaskCtx<'_>,
+        reader: Pin<&mut R>,
+    ) -> Poll<std::io::Result<()>> {
+        let me = &mut *self;
+        if me.buf.is_empty() {
+            me.buf.resize(SPLICE_INIT.min(me.max), 0);
+        } else if me.saturated && me.buf.len() < me.max {
+            me.saturated = false;
+            me.buf.resize((me.buf.len() * 2).min(me.max), 0);
+        }
+        let size = me.buf.len();
+        let mut buf = ReadBuf::new(&mut me.buf);
+        buf.set_filled(me.cap);
+
+        let res = reader.poll_read(cx, &mut buf);
+        if let Poll::Ready(Ok(())) = res {
+            let filled_len = buf.filled().len();
+            me.read_done = me.cap == filled_len;
+            me.saturated = filled_len == size;
+            me.cap = filled_len;
+        }
+        res
+    }
+
+    fn poll_write_buf<R: AsyncRead + ?Sized, W: AsyncWrite + ?Sized>(
+        &mut self,
+        cx: &mut TaskCtx<'_>,
+        mut reader: Pin<&mut R>,
+        mut writer: Pin<&mut W>,
+    ) -> Poll<std::io::Result<usize>> {
+        let me = &mut *self;
+        match writer.as_mut().poll_write(cx, &me.buf[me.pos..me.cap]) {
+            Poll::Pending => {
+                // Top up the buffer towards full if we can read a bit more data — this
+                // should improve the chances of a large write.
+                if !me.read_done && me.has_room() {
+                    std::task::ready!(me.poll_fill_buf(cx, reader.as_mut()))?;
+                }
+                Poll::Pending
+            }
+            res => res,
+        }
+    }
+
+    fn poll_copy<R: AsyncRead + ?Sized, W: AsyncWrite + ?Sized>(
+        &mut self,
+        cx: &mut TaskCtx<'_>,
+        mut reader: Pin<&mut R>,
+        mut writer: Pin<&mut W>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            // If there is some space left in our buffer, then we try to read some data to
+            // continue, thus maximizing the chances of a large write.
+            if self.has_room() && !self.read_done {
+                match self.poll_fill_buf(cx, reader.as_mut()) {
+                    Poll::Ready(Ok(())) => {}
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                    Poll::Pending => {
+                        // Ignore pending reads when our buffer is not empty, because we can
+                        // try to write data immediately.
+                        if self.pos == self.cap {
+                            // Try flushing when the reader has no progress, to avoid a
+                            // deadlock when the reader depends on a buffered writer.
+                            if self.need_flush {
+                                std::task::ready!(writer.as_mut().poll_flush(cx))?;
+                                self.need_flush = false;
+                            }
+                            return Poll::Pending;
+                        }
+                    }
+                }
+            }
+
+            while self.pos < self.cap {
+                let i =
+                    std::task::ready!(self.poll_write_buf(cx, reader.as_mut(), writer.as_mut()))?;
+                if i == 0 {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "write zero byte into writer",
+                    )));
+                }
+                self.pos += i;
+                self.need_flush = true;
+            }
+            // A writer reporting more written than it was given would leave `pos` past `cap`
+            // and this loop would never stop.
+            debug_assert!(
+                self.pos <= self.cap,
+                "writer returned length larger than input slice"
+            );
+
+            self.pos = 0;
+            self.cap = 0;
+
+            // Everything written and EOF seen: flush and finish the transfer.
+            if self.read_done {
+                std::task::ready!(writer.as_mut().poll_flush(cx))?;
+                return Poll::Ready(Ok(()));
+            }
+        }
+    }
+}
+
+enum TransferState {
+    Running(CopyBuffer),
+    ShuttingDown,
+    Done,
+}
+
+fn transfer_one_direction<R, W>(
+    cx: &mut TaskCtx<'_>,
+    state: &mut TransferState,
+    r: &mut R,
+    w: &mut W,
+) -> Poll<std::io::Result<()>>
+where
+    R: AsyncRead + Unpin + ?Sized,
+    W: AsyncWrite + Unpin + ?Sized,
+{
+    let mut r = Pin::new(r);
+    let mut w = Pin::new(w);
+    loop {
+        match state {
+            TransferState::Running(buf) => {
+                std::task::ready!(buf.poll_copy(cx, r.as_mut(), w.as_mut()))?;
+                *state = TransferState::ShuttingDown;
+            }
+            TransferState::ShuttingDown => {
+                std::task::ready!(w.as_mut().poll_shutdown(cx))?;
+                *state = TransferState::Done;
+            }
+            TransferState::Done => return Poll::Ready(Ok(())),
+        }
+    }
+}
+
+/// Copy in both directions between `a` and `b` until both have reported EOF and the opposing
+/// writer has been shut down, or either side errors — tokio's `copy_bidirectional_with_sizes`
+/// with the buffer sizes read as ceilings rather than as what to allocate up front.
+async fn splice<A, B>(
+    a: &mut A,
+    b: &mut B,
+    a_to_b_max: usize,
+    b_to_a_max: usize,
+) -> std::io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let mut a_to_b = TransferState::Running(CopyBuffer::new(a_to_b_max));
+    let mut b_to_a = TransferState::Running(CopyBuffer::new(b_to_a_max));
+    std::future::poll_fn(|cx| {
+        let a_to_b = transfer_one_direction(cx, &mut a_to_b, a, b)?;
+        let b_to_a = transfer_one_direction(cx, &mut b_to_a, b, a)?;
+        // An early return is not a problem: the other direction keeps reporting Done on the
+        // polls that follow.
+        std::task::ready!(a_to_b);
+        std::task::ready!(b_to_a);
+        Poll::Ready(Ok(()))
+    })
+    .await
 }
 
 /// The host side of a guest flow, with what crosses it added to the switch's totals. Wraps
@@ -3419,6 +3620,206 @@ mod tests {
             pool.give(Vec::with_capacity(POOL_BUF));
         }
         assert_eq!(pool.free.lock().unwrap().len(), POOL_FRAMES);
+    }
+
+    /// A reader that fills whatever it is handed, `bursts` times, then stalls.
+    struct Bursty {
+        bursts: usize,
+    }
+
+    impl AsyncRead for Bursty {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _: &mut TaskCtx<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.bursts == 0 {
+                return Poll::Pending;
+            }
+            self.bursts -= 1;
+            let room = buf.remaining();
+            buf.put_slice(&vec![0x5a; room]);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spliced_direction_starts_small_and_grows_to_the_ceiling() {
+        for (max, bursts) in [(MSS as usize, 64), (HOST_BOUND_CHUNK, 8)] {
+            let mut copy = CopyBuffer::new(max);
+            assert!(copy.buf.is_empty(), "no buffer before the first poll");
+            let mut reader = Bursty { bursts: 0 };
+            let mut writer = tokio::io::sink();
+            std::future::poll_fn(|cx| {
+                assert!(
+                    copy.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut writer))
+                        .is_pending()
+                );
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(copy.buf.len(), SPLICE_INIT.min(max), "it starts small");
+
+            reader.bursts = bursts;
+            std::future::poll_fn(|cx| {
+                assert!(
+                    copy.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut writer))
+                        .is_pending()
+                );
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(copy.buf.len(), max, "a bulk transfer reaches the ceiling");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spliced_flow_copies_both_ways_and_ends_once_both_sides_close() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut a, mut a_peer) = tokio::io::duplex(1024);
+            // Queue enough input to grow the guest-bound buffer while its small
+            // destination forces partial writes and backpressure.
+            let (mut b, mut b_peer) = tokio::io::duplex(MSS as usize * 2);
+            let spliced = tokio::spawn(async move {
+                splice(&mut a, &mut b, HOST_BOUND_CHUNK, MSS as usize).await
+            });
+            let request: Vec<u8> = (0..HOST_BOUND_CHUNK * 3 + 123)
+                .map(|i| (i % 251) as u8)
+                .collect();
+            let mut received = Vec::new();
+            let ((), read) = tokio::join!(
+                async {
+                    a_peer.write_all(&request).await.unwrap();
+                    a_peer.shutdown().await.unwrap();
+                },
+                b_peer.read_to_end(&mut received)
+            );
+            read.unwrap();
+            assert_eq!(received, request);
+
+            // The first direction has reached EOF; the other must still carry a
+            // reply larger than its maximum copy buffer without losing a byte.
+            let reply: Vec<u8> = (0..MSS as usize * 3 + 321)
+                .map(|i| (i % 239) as u8)
+                .collect();
+            received.clear();
+            let ((), read) = tokio::join!(
+                async {
+                    b_peer.write_all(&reply).await.unwrap();
+                    b_peer.shutdown().await.unwrap();
+                },
+                a_peer.read_to_end(&mut received)
+            );
+            read.unwrap();
+            assert_eq!(received, reply);
+            spliced.await.unwrap().unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum CopyFault {
+        Read,
+        Write,
+        WriteZero,
+        Flush,
+        Shutdown,
+    }
+
+    struct CopyTestIo {
+        fault: Option<CopyFault>,
+        pending_read: bool,
+        remaining: &'static [u8],
+    }
+
+    impl AsyncRead for CopyTestIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut TaskCtx<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let me = self.get_mut();
+            if me.fault == Some(CopyFault::Read) {
+                return Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+            }
+            if me.pending_read {
+                return Poll::Pending;
+            }
+            let take = me.remaining.len().min(buf.remaining());
+            buf.put_slice(&me.remaining[..take]);
+            me.remaining = &me.remaining[take..];
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for CopyTestIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut TaskCtx<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(match self.fault {
+                Some(CopyFault::Write) => Err(std::io::ErrorKind::BrokenPipe.into()),
+                Some(CopyFault::WriteZero) => Ok(0),
+                _ => Ok(buf.len()),
+            })
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskCtx<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(if self.fault == Some(CopyFault::Flush) {
+                Err(std::io::ErrorKind::TimedOut.into())
+            } else {
+                Ok(())
+            })
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut TaskCtx<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(if self.fault == Some(CopyFault::Shutdown) {
+                Err(std::io::ErrorKind::ConnectionAborted.into())
+            } else {
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn splice_propagates_failures_while_the_other_direction_is_pending() {
+        use std::io::ErrorKind;
+
+        for (fault, expected) in [
+            (CopyFault::Read, ErrorKind::ConnectionReset),
+            (CopyFault::Write, ErrorKind::BrokenPipe),
+            (CopyFault::WriteZero, ErrorKind::WriteZero),
+            (CopyFault::Flush, ErrorKind::TimedOut),
+            (CopyFault::Shutdown, ErrorKind::ConnectionAborted),
+        ] {
+            for reverse in [false, true] {
+                let mut source = CopyTestIo {
+                    fault: (fault == CopyFault::Read).then_some(fault),
+                    pending_read: false,
+                    remaining: b"payload",
+                };
+                let mut sink = CopyTestIo {
+                    fault: (fault != CopyFault::Read).then_some(fault),
+                    pending_read: true,
+                    remaining: b"",
+                };
+                let (a, b) = if reverse {
+                    (&mut sink, &mut source)
+                } else {
+                    (&mut source, &mut sink)
+                };
+                let error = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    splice(a, b, HOST_BOUND_CHUNK, MSS as usize),
+                )
+                .await
+                .expect("a failure waited for the other direction")
+                .unwrap_err();
+                assert_eq!(error.kind(), expected);
+            }
+        }
     }
 
     async fn send(s: &mut UnixStream, frame: &[u8]) {
