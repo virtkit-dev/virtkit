@@ -1,10 +1,7 @@
 # Vendored ipstack
 
 Source: https://github.com/virtkit-dev/ipstack
-Revision: `99c1328a5c79d6d6e2ae9c85ea20f0d80ef774d9`
-
-The peer MSS changes from `f9b854b25950cd08fc4b6e3fbebafcd9f61f0b58` are applied
-locally; its independent full-buffer read fix is not included yet.
+Revision: `f9b854b25950cd08fc4b6e3fbebafcd9f61f0b58`
 
 Our fork of [narrowlink/ipstack](https://github.com/narrowlink/ipstack), branched from
 upstream `e1d8506`. Every fix the switch needs lives there as its own commit, written to go

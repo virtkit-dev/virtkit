@@ -404,6 +404,12 @@ fn peer_finished_sending(state: TcpState) -> bool {
 
 impl AsyncRead for IpStackTcpStream {
     fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        // Complete reads with no remaining capacity without consuming queued data
+        // or waiting for more data.
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
         // if there is data in the temp buffer, read it first
         if !self.temp_read_buffer.is_empty() {
             let len = std::cmp::min(buf.remaining(), self.temp_read_buffer.len());
@@ -1525,6 +1531,13 @@ mod tests {
         lengths
     }
 
+    /// Poll once into `buf` with a no-op waker, returning readiness without waiting.
+    fn poll_read_once(stream: &mut IpStackTcpStream, buf: &mut [u8]) -> Poll<std::io::Result<()>> {
+        let mut read_buf = tokio::io::ReadBuf::new(buf);
+        let mut cx = Context::from_waker(Waker::noop());
+        std::pin::Pin::new(stream).poll_read(&mut cx, &mut read_buf)
+    }
+
     /// The window scale a header carries, if any.
     fn window_scale(header: &TcpHeader) -> Option<u8> {
         header.options_iterator().flatten().find_map(|option| match option {
@@ -2559,6 +2572,62 @@ mod tests {
             .expect("the tail of the reassembled data never arrived")
             .unwrap();
         assert!(buf[..8192].iter().all(|&b| b == 1) && buf[8192..].iter().all(|&b| b == 2));
+    }
+
+    /// Reads with no remaining capacity leave queued and stashed data untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_poll_with_a_full_buffer_keeps_the_data_behind_it() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        assert!(matches!(poll_read_once(&mut stream, &mut []), Poll::Ready(Ok(()))));
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        let sent: Vec<u8> = (0..100u8).collect();
+        sender.send(segment(ACK | PSH, PEER_ISN + 1, ours, sent.clone())).unwrap();
+        wait_until(|| !stream.data_rx.is_empty(), "the peer's data never reached the handoff").await;
+
+        assert!(matches!(poll_read_once(&mut stream, &mut []), Poll::Ready(Ok(()))));
+        assert!(!stream.data_rx.is_empty(), "the handoff was drained into a buffer with no room");
+
+        // Reading 10 of 100 bytes stashes the remaining 90; a full-buffer poll must preserve them.
+        let mut head = [0u8; 10];
+        stream.read_exact(&mut head).await.unwrap();
+        assert_eq!(stream.temp_read_buffer.len(), 90);
+        assert!(matches!(poll_read_once(&mut stream, &mut []), Poll::Ready(Ok(()))));
+        assert_eq!(stream.temp_read_buffer.len(), 90, "the stashed bytes were dropped");
+
+        let mut tail = [0u8; 90];
+        stream.read_exact(&mut tail).await.unwrap();
+        assert_eq!([&head[..], &tail[..]].concat(), sent, "the stream lost or reordered bytes");
+    }
+
+    /// Deliver all received bytes, including the stashed remainder, before EOF after a peer FIN.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stash_outlives_the_peer_close() {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut stream = established(up_tx, &mut up_rx, TcpConfig::default()).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        sender.send(segment(ACK | PSH, PEER_ISN + 1, ours, vec![1u8; 100])).unwrap();
+        let mut head = [0u8; 10];
+        stream.read_exact(&mut head).await.unwrap();
+        assert_eq!(stream.temp_read_buffer.len(), 90);
+
+        sender.send(segment(ACK | FIN, PEER_ISN + 101, ours, Vec::new())).unwrap();
+        wait_until(
+            || peer_finished_sending(stream.tcb.lock().unwrap().get_state()),
+            "the peer's FIN was never taken",
+        )
+        .await;
+        assert!(matches!(poll_read_once(&mut stream, &mut []), Poll::Ready(Ok(()))));
+
+        let mut tail = [0u8; 90];
+        stream.read_exact(&mut tail).await.unwrap();
+        assert!(tail.iter().all(|&b| b == 1), "the stashed bytes were not the peer's");
+        let mut end = [0u8; 10];
+        assert_eq!(stream.read(&mut end).await.unwrap(), 0, "the closed stream never ended");
     }
 
     /// A window the reader reopens has to be advertised without waiting to be asked. The peer has
