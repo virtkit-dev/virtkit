@@ -380,6 +380,10 @@ impl AsyncRead for IpStackTcpStream {
         // application whatever has become of the connection since — a reset of our own included.
         // Read the handoff out before reporting the end of the stream.
         let polled = this.data_rx.poll_recv(cx);
+        // An exhausted cooperative budget yields `Pending` even with queued data. Check
+        // emptiness explicitly: treating that yield as EOF drops the acknowledged tail
+        // of a long transfer.
+        let drained = this.data_rx.is_empty();
         match polled {
             Poll::Ready(Some(data)) => {
                 let capacity = buf.remaining();
@@ -395,7 +399,7 @@ impl AsyncRead for IpStackTcpStream {
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(None) => Poll::Ready(Ok(())),
-            Poll::Pending if aborted => {
+            Poll::Pending if aborted && drained => {
                 // A connection the stack reset did not end in an orderly close. Reporting the
                 // end of the stream would tell the application the transfer finished, and a
                 // proxy would go on holding the other side of a flow that is over.
@@ -404,7 +408,7 @@ impl AsyncRead for IpStackTcpStream {
                 this.write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                 Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)))
             }
-            Poll::Pending if peer_finished_sending(state) && buffered == 0 => {
+            Poll::Pending if peer_finished_sending(state) && buffered == 0 && drained => {
                 drop(tcb);
                 if state == TcpState::Closed {
                     this.shutdown.lock().unwrap().ready();
@@ -1995,6 +1999,80 @@ mod tests {
         assert_eq!(end.expect("the end of stream waited for the teardown").unwrap(), 0);
         let state = stream.tcb.lock().unwrap().get_state();
         assert_ne!(state, TcpState::Closed, "the session had already finished closing");
+    }
+
+    /// After FIN, draining a long transfer exceeds the reader's cooperative budget.
+    /// Treating the resulting yield as EOF would discard queued, acknowledged bytes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_close_after_a_long_transfer_hands_over_every_byte() {
+        /// More segments than a task gets to poll for in one turn.
+        const SEGMENTS: usize = 400;
+        const PAYLOAD: usize = 1_460;
+
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Hold the whole transfer in the handoff without receive-window backpressure.
+        let config = TcpConfig {
+            read_buffer_size: 4 << 20,
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        let mut seq = PEER_ISN + 1;
+        for _ in 0..SEGMENTS {
+            sender.send(segment(ACK | PSH, seq, ours, vec![0x5a; PAYLOAD])).unwrap();
+            seq = seq.wrapping_add(PAYLOAD as u32);
+        }
+        sender.send(segment(ACK | FIN, seq, ours, Vec::new())).unwrap();
+        let tcb = stream.tcb.clone();
+        wait_until(
+            || tcb.lock().unwrap().get_state() == TcpState::CloseWait,
+            "the peer's close was never accepted",
+        )
+        .await;
+
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut received))
+            .await
+            .expect("the read never finished")
+            .unwrap();
+        assert_eq!(received.len(), SEGMENTS * PAYLOAD, "the reader lost the tail of the transfer");
+        assert!(received.iter().all(|&byte| byte == 0x5a), "the transfer arrived corrupt");
+    }
+
+    /// A cooperative yield must not report a reset while acknowledged data is still queued.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_after_a_long_transfer_hands_over_every_byte() {
+        const SEGMENTS: usize = 400;
+        const PAYLOAD: usize = 1_460;
+
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = TcpConfig {
+            read_buffer_size: 4 << 20,
+            ..TcpConfig::default()
+        };
+        let mut stream = established(up_tx, &mut up_rx, config).await;
+        let sender = stream.stream_sender();
+        let ours = stream.tcb.lock().unwrap().get_seq().0;
+
+        let mut seq = PEER_ISN + 1;
+        for _ in 0..SEGMENTS {
+            sender.send(segment(ACK | PSH, seq, ours, vec![0x5a; PAYLOAD])).unwrap();
+            seq = seq.wrapping_add(PAYLOAD as u32);
+        }
+        sender.send(segment(ACK | RST, seq, ours, Vec::new())).unwrap();
+        let tcb = stream.tcb.clone();
+        wait_until(|| tcb.lock().unwrap().is_aborted(), "the peer's reset was never accepted").await;
+
+        let mut received = Vec::new();
+        let err = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut received))
+            .await
+            .expect("the read never finished")
+            .expect_err("the reset read as a clean end of stream");
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+        assert_eq!(received.len(), SEGMENTS * PAYLOAD, "the reader lost the tail of the transfer");
+        assert!(received.iter().all(|&byte| byte == 0x5a), "the transfer arrived corrupt");
     }
 
     /// Two closes that cross on the wire: the peer's FIN arrives while ours is still
