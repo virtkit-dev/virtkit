@@ -16,6 +16,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
+use std::io::IoSlice;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -2425,31 +2426,42 @@ impl AsyncWrite for ChannelDevice {
 }
 
 /// The single writer to one guest's qemu stream. Frames already queued behind the one
-/// that woke us share a write buffer, reducing calls when the socket accepts the batch.
+/// that woke us share a write, reducing calls when the socket accepts the batch.
 async fn writer_task<W: AsyncWrite + Unpin>(mut wr: W, mut rx: UnboundedReceiver<Vec<u8>>) {
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH_FRAMES);
-    let mut out: Vec<u8> = Vec::new();
+    let mut headers = [[0u8; 4]; WRITE_BATCH_FRAMES];
     loop {
         if frames.is_empty() && rx.recv_many(&mut frames, WRITE_BATCH_FRAMES).await == 0 {
             return; // every sender is gone
         }
-        // Always take the first frame, then as many as fit: the byte bound keeps the
-        // staging buffer to one write's worth whatever the frames' size.
-        out.clear();
+        // Always take the first frame, then as many as fit: the byte bound keeps a batch
+        // to one write's worth whatever the frames' size.
         let mut taken = 0;
+        let mut bytes = 0;
         for frame in &frames {
-            if taken > 0 && out.len() + 4 + frame.len() > WRITE_BATCH_BYTES {
+            if taken > 0 && bytes + 4 + frame.len() > WRITE_BATCH_BYTES {
                 break;
             }
-            out.extend_from_slice(&(frame.len() as u32).to_be_bytes());
-            out.extend_from_slice(frame);
+            headers[taken] = (frame.len() as u32).to_be_bytes();
+            bytes += 4 + frame.len();
             taken += 1;
+        }
+        // Length prefixes and frames form a batch without copying frame data.
+        // Short writes advance the remaining slices.
+        let mut io = [IoSlice::new(&[]); 2 * WRITE_BATCH_FRAMES];
+        for (i, frame) in frames[..taken].iter().enumerate() {
+            io[2 * i] = IoSlice::new(&headers[i]);
+            io[2 * i + 1] = IoSlice::new(frame);
+        }
+        let mut pending = &mut io[..2 * taken];
+        while !pending.is_empty() {
+            match wr.write_vectored(pending).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => IoSlice::advance_slices(&mut pending, n),
+            }
         }
         for frame in frames.drain(..taken) {
             FRAME_POOL.give(frame);
-        }
-        if wr.write_all(&out).await.is_err() {
-            return;
         }
     }
 }
@@ -3476,9 +3488,16 @@ mod tests {
         task.await.unwrap();
     }
 
+    enum WriteStep {
+        Limit(usize),
+        Pending,
+        Error,
+    }
+
     struct BatchWriter {
         writes: Vec<Vec<u8>>,
         max_write: usize,
+        steps: std::collections::VecDeque<WriteStep>,
     }
 
     impl AsyncWrite for BatchWriter {
@@ -3490,6 +3509,37 @@ mod tests {
             let n = buf.len().min(self.max_write);
             self.writes.push(buf[..n].to_vec());
             Poll::Ready(Ok(n))
+        }
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskCtx<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let max_write = match self.steps.pop_front() {
+                Some(WriteStep::Pending) => {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Some(WriteStep::Error) => {
+                    return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+                }
+                Some(WriteStep::Limit(n)) => n,
+                None => self.max_write,
+            };
+            let mut write = Vec::new();
+            for buf in bufs {
+                if write.len() >= max_write {
+                    break;
+                }
+                let n = buf.len().min(max_write - write.len());
+                write.extend_from_slice(&buf[..n]);
+            }
+            let n = write.len();
+            self.writes.push(write);
+            Poll::Ready(Ok(n))
+        }
+        fn is_write_vectored(&self) -> bool {
+            true
         }
         fn poll_flush(self: Pin<&mut Self>, _: &mut TaskCtx<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
@@ -3514,6 +3564,7 @@ mod tests {
             let mut writer = BatchWriter {
                 writes: Vec::new(),
                 max_write,
+                steps: Default::default(),
             };
             writer_task(&mut writer, rx).await;
             assert_eq!(writer.writes.concat(), expected);
@@ -3544,12 +3595,70 @@ mod tests {
         let mut writer = BatchWriter {
             writes: Vec::new(),
             max_write: usize::MAX,
+            steps: Default::default(),
         };
         writer_task(&mut writer, rx).await;
         assert_eq!(
             writer.writes.iter().map(Vec::len).collect::<Vec<_>>(),
             vec![WRITE_BATCH_FRAMES * 5, WRITE_BATCH_FRAMES * 5, 5]
         );
+    }
+
+    #[tokio::test]
+    async fn writer_resumes_partial_vectored_writes_past_an_empty_batch_tail() {
+        let mut frames: Vec<&[u8]> = vec![b""; WRITE_BATCH_FRAMES];
+        frames[1] = b"one";
+        frames[2] = b"tail";
+        // The next batch detects a writer mistaking the final frame's empty payload
+        // for a closed socket after sending its header.
+        frames.push(b"sentinel");
+        let (tx, rx) = unbounded_channel();
+        for frame in &frames {
+            tx.send(frame.to_vec()).unwrap();
+        }
+        drop(tx);
+        let mut writer = BatchWriter {
+            writes: Vec::new(),
+            max_write: usize::MAX,
+            steps: [
+                WriteStep::Limit(2),
+                WriteStep::Pending,
+                WriteStep::Limit(3),
+                WriteStep::Pending,
+                WriteStep::Limit(7),
+            ]
+            .into(),
+        };
+        tokio::time::timeout(Duration::from_secs(2), writer_task(&mut writer, rx))
+            .await
+            .unwrap();
+        assert!(writer.steps.is_empty());
+        assert_eq!(writer.writes.concat(), framed(&frames));
+    }
+
+    #[tokio::test]
+    async fn writer_stops_on_zero_or_error_after_partial_vectored_progress() {
+        for stop in [WriteStep::Limit(0), WriteStep::Error] {
+            let (tx, rx) = unbounded_channel();
+            tx.send(b"payload".to_vec()).unwrap();
+            let mut writer = BatchWriter {
+                writes: Vec::new(),
+                max_write: usize::MAX,
+                steps: [
+                    WriteStep::Limit(2),
+                    WriteStep::Pending,
+                    stop,
+                    WriteStep::Limit(usize::MAX),
+                ]
+                .into(),
+            };
+            tokio::time::timeout(Duration::from_secs(2), writer_task(&mut writer, rx))
+                .await
+                .unwrap();
+            assert_eq!(writer.writes.concat(), framed(&[b"payload"])[..2]);
+            assert_eq!(writer.steps.len(), 1, "polled again after zero or error");
+            assert!(tx.is_closed(), "the failed port still accepts frames");
+        }
     }
 
     #[tokio::test]

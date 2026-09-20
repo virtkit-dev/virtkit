@@ -20,6 +20,7 @@ All notable changes to virtkit will be documented in this file.
 - **Guest uploads use less CPU when sending small packets with libkrun.**
 - **Guest downloads use less host CPU.**
 - **Jobs with many short network connections use less host memory.**
+- **Delivering queued network traffic to guests uses less host CPU.**
 
 ### Fixed
 
