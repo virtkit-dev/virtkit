@@ -1,5 +1,6 @@
 //! Sessions in a running environment (`exec`, `shell`, `ssh`), plus `after_boot` and `stop`.
 
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -661,27 +662,34 @@ pub struct Stopped {
     pub all_down: bool,
 }
 
-/// `vk dev stop`: stop the environment (and, with it, its publishers).
-pub fn stop(plan: &Plan, timeout: u64) -> Result<Stopped> {
+/// Stop the environment at `state_dir` and its publishers. Taking a directory rather
+/// than a plan lets `vk dev stop NAME` work host-wide without a config.
+pub fn stop(state_dir: &Path, timeout: u64) -> Result<Stopped> {
     // Stopping what is already stopped is the state asked for, not a failure — a script
     // that ends a session need not know whether the VM outlived it. Relays cannot outlive
     // the VM, but their records can; clear those too.
-    if running_vm(plan).is_none() {
-        crate::publish::stop_all_quietly(&plan.state_dir, Duration::from_secs(5));
+    if !running_at(state_dir) {
+        crate::publish::stop_all_quietly(state_dir, Duration::from_secs(5));
         return Ok(Stopped {
-            report: format!(
-                "dev environment not running ({})\n",
-                plan.state_dir.display()
-            ),
+            report: format!("dev environment not running ({})\n", state_dir.display()),
             all_down: true,
         });
     }
     let (report, all_down) = crate::vms::stop_cmd(
-        Some(crate::vms::Selector::Dir(plan.state_dir.clone())),
+        Some(crate::vms::Selector::Dir(state_dir.to_path_buf())),
         false,
         timeout,
     )?;
     Ok(Stopped { report, all_down })
+}
+
+/// Whether a VM is up on `state_dir`, matched as recorded or canonicalized — the state base
+/// reaches us through `$HOME`, a symlink on some hosts, so the registry's path may differ.
+fn running_at(state_dir: &Path) -> bool {
+    let canonical = std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
+    crate::vms::running()
+        .into_iter()
+        .any(|e| e.state_dir.as_path() == state_dir || e.state_dir == canonical)
 }
 
 #[cfg(test)]

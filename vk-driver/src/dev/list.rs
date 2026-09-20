@@ -343,14 +343,7 @@ pub fn select_gc(rows: Vec<Row>, names: &[String], all_stale: bool) -> Result<Ve
     selected.sort_by(|a, b| a.name.cmp(&b.name));
     selected.dedup_by(|a, b| a.name == b.name);
     if let Some(row) = selected.iter().find(|r| r.status == Status::Running) {
-        bail!(
-            "{} is running — `vk dev stop` in {} first",
-            row.name,
-            row.workspace
-                .as_ref()
-                .map(|w| w.display().to_string())
-                .unwrap_or_else(|| "its workspace".into())
-        );
+        bail!("{} is running — `vk dev stop {}` first", row.name, row.name);
     }
     Ok(selected)
 }
@@ -413,14 +406,7 @@ pub fn remove(selected: &[Row]) -> Result<String> {
     for (row, _) in &locked {
         let canonical = std::fs::canonicalize(&row.dir).unwrap_or_else(|_| row.dir.clone());
         if running.iter().any(|r| *r == row.dir || *r == canonical) {
-            bail!(
-                "{} is running — `vk dev stop` in {} first",
-                row.name,
-                row.workspace
-                    .as_ref()
-                    .map(|w| w.display().to_string())
-                    .unwrap_or_else(|| "its workspace".into())
-            );
+            bail!("{} is running — `vk dev stop {}` first", row.name, row.name);
         }
     }
     let mut out = String::new();

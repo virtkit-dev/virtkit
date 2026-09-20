@@ -495,7 +495,7 @@ async fn swap(
     // building it cold — seconds of downtime instead of minutes.
     eprintln!("virtkit: rebuilding while the current environment keeps running …");
     build_into_cache(plan, over, cfg, None)?;
-    let stopped = stop(plan, STOP_TIMEOUT_SECS)?;
+    let stopped = stop(&plan.state_dir, STOP_TIMEOUT_SECS)?;
     // Every other line of a boot goes to stderr, and this one runs in a child whose stdout
     // the caller may have closed.
     eprint!("{}", stopped.report);

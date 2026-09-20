@@ -474,7 +474,7 @@ fn remove_backing(backing: &Path) -> Result<()> {
 /// Stop what owns the item, so nothing has the backing open when it goes.
 async fn stop_owner(plan: &Plan, item: &Item) -> Result<()> {
     let Some(service) = &item.owner else {
-        let stopped = crate::dev::stop(plan, 10)?;
+        let stopped = crate::dev::stop(&plan.state_dir, 10)?;
         print!("{}", stopped.report);
         if !stopped.all_down {
             bail!(

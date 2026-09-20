@@ -347,7 +347,14 @@ enum DevAction {
     /// state directory stays — its storage, keys and identity are what the next `vk dev up`
     /// starts from; `vk dev gc` is what removes it. Stopping what is already stopped is the
     /// state asked for, not a failure.
+    ///
+    /// With no NAME, works on this workspace's environment, from its config. NAME instead
+    /// stops one by the identity `vk dev list` gives it, host-wide and without a config — for
+    /// an environment in another workspace, or one whose workspace is gone.
     Stop {
+        /// the environment to stop, as `vk dev list` names it [default: this workspace's]
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         /// seconds to wait for it to go
         #[arg(long, default_value_t = super::boot::STOP_TIMEOUT_SECS)]
         timeout: u64,
@@ -603,6 +610,14 @@ async fn dev_action(
     // Return the embedded schema before resolving cwd, even if that directory was deleted.
     if matches!(action, DevAction::Schema) {
         return write_report(schema::SCHEMA_JSON);
+    }
+    // Named stops use host state, so they also work from another or deleted workspace.
+    if let DevAction::Stop {
+        name: Some(name),
+        timeout,
+    } = &action
+    {
+        return dev_stop_named(name, *timeout);
     }
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
@@ -1018,7 +1033,10 @@ async fn dev_action(
             let code = write_report(&report);
             if ok { code } else { exit_code(1) }
         }
-        DevAction::Stop { timeout } => match dev::stop(&plan, timeout) {
+        DevAction::Stop {
+            name: None,
+            timeout,
+        } => match dev::stop(&plan.state_dir, timeout) {
             Ok(stopped) => match write_report(&stopped.report) {
                 ExitCode::SUCCESS if !stopped.all_down => exit_code(1),
                 code => code,
@@ -1030,6 +1048,7 @@ async fn dev_action(
         DevAction::Init { .. }
         | DevAction::List { .. }
         | DevAction::Gc { .. }
+        | DevAction::Stop { name: Some(_), .. }
         | DevAction::Schema => {
             unreachable!("handled before the plan is resolved")
         }
@@ -1139,6 +1158,39 @@ fn dev_gc(yes: bool, all_stale: bool, names: &[String]) -> ExitCode {
     }
 }
 
+/// Stop a host-wide environment by the state-directory name used by `list` and `gc`,
+/// without loading a workspace config.
+fn dev_stop_named(name: &str, timeout: u64) -> ExitCode {
+    let dir = match named_state_dir(name) {
+        Ok(dir) => dir,
+        Err(e) => return fail(&e, 1),
+    };
+    match dev::stop(&dir, timeout) {
+        Ok(stopped) => match write_report(&stopped.report) {
+            ExitCode::SUCCESS if !stopped.all_down => exit_code(1),
+            code => code,
+        },
+        Err(e) => fail(&e, 1),
+    }
+}
+
+/// Match only immediate directories, like `list`, without collecting their metadata.
+fn named_state_dir(name: &str) -> anyhow::Result<PathBuf> {
+    let base = plan::dev_state_base()?;
+    let entries = match std::fs::read_dir(&base) {
+        Ok(entries) => Some(entries),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(anyhow::Error::new(e).context("reading dev environment state")),
+    };
+    for entry in entries.into_iter().flatten() {
+        let entry = entry?;
+        if entry.file_name() == std::ffi::OsStr::new(name) && entry.file_type()?.is_dir() {
+            return Ok(entry.path());
+        }
+    }
+    anyhow::bail!("no dev environment state named {name} (`vk dev list` names them)")
+}
+
 /// Bring the environment up, from whichever of the two processes this is (see `dev`'s module
 /// docs). The child boots and then holds the VM, so it never gets here to act; where there
 /// was nothing to boot it is finished too, and the parent — released once the guest is ready
@@ -1227,6 +1279,77 @@ mod tests {
             parse(&["vk", "dev", "list", "--no-sizes"]).action,
             DevAction::List { no_sizes: true, .. }
         ));
+    }
+
+    #[test]
+    fn stop_takes_an_optional_name_selector() {
+        // No name is this workspace's environment, resolved from a config.
+        assert!(matches!(
+            parse(&["vk", "dev", "stop"]).action,
+            DevAction::Stop { name: None, .. }
+        ));
+        // A name selects host-wide, as `vk dev list`/`gc` name environments.
+        assert!(matches!(
+            parse(&["vk", "dev", "stop", "myenv-1a2b"]).action,
+            DevAction::Stop { name: Some(n), .. } if n == "myenv-1a2b"
+        ));
+    }
+
+    #[test]
+    fn named_stop_needs_neither_a_config_nor_a_surviving_cwd() {
+        const CHILD: &str = "VK_TEST_NAMED_STOP";
+        if std::env::var_os(CHILD).is_some() {
+            let cwd = std::env::current_dir().unwrap();
+            std::fs::remove_dir(&cwd).unwrap();
+            assert!(std::env::current_dir().is_err());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            for (name, expected) in [
+                ("known", ExitCode::SUCCESS),
+                ("known", ExitCode::SUCCESS),
+                ("unknown", exit_code(1)),
+                ("linked", exit_code(1)),
+                ("../outside", exit_code(1)),
+            ] {
+                let result = runtime.block_on(dev_action(
+                    DevAction::Stop {
+                        name: Some(name.into()),
+                        timeout: 0,
+                    },
+                    Some(&cwd),
+                    Some(&cwd.join("missing.toml")),
+                    "dev",
+                    &dev::Overrides::default(),
+                    &crate::config::Config::default(),
+                ));
+                assert_eq!(result, expected, "{name}");
+            }
+            return;
+        }
+        let _guard = crate::dev::testutil::env_guard();
+        let tmp = crate::dev::testutil::scratch("named-stop");
+        let state = tmp.0.join("state");
+        let base = state.join("virtkit/dev");
+        std::fs::create_dir_all(base.join("known")).unwrap();
+        std::os::unix::fs::symlink(base.join("known"), base.join("linked")).unwrap();
+        std::fs::create_dir_all(state.join("virtkit/outside")).unwrap();
+        let cwd = tmp.0.join("removed-workspace");
+        std::fs::create_dir(&cwd).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dev::cli::tests::named_stop_needs_neither_a_config_nor_a_surviving_cwd",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("XDG_STATE_HOME", &state)
+            .env("XDG_DATA_HOME", tmp.0.join("data"))
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(base.join("known").is_dir());
     }
 
     #[test]

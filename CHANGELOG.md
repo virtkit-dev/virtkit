@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk dev stop NAME` stops an environment by name, host-wide.** It takes the name
+  `vk dev list` shows, so it reaches an environment in another workspace, or one whose
+  workspace is gone — neither of which the config-only `vk dev stop` could stop before.
+
 ### Changed
 
 - **Guest network links now support jumbo packets (MTU 65500).** Larger packets reduce
