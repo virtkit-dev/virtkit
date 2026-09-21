@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.76.0] - 2026-09-21
+
 ### Added
 
 - **A CI job's checkout is served from guest RAM.** With `[executor] checkout_overlay`, the
@@ -2974,7 +2976,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.75.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.76.0...HEAD
+[0.76.0]: https://github.com/virtkit-dev/virtkit/compare/v0.75.0...v0.76.0
 [0.75.0]: https://github.com/virtkit-dev/virtkit/compare/v0.74.0...v0.75.0
 [0.74.0]: https://github.com/virtkit-dev/virtkit/compare/v0.73.3...v0.74.0
 [0.73.3]: https://github.com/virtkit-dev/virtkit/compare/v0.73.2...v0.73.3
