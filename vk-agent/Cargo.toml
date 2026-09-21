@@ -23,6 +23,9 @@ rand = { workspace = true, optional = true }
 russh = { workspace = true, optional = true }
 russh-sftp = { workspace = true, optional = true }
 simplelog.workspace = true
+# Unpack the checkout tar into the overlay's tmpfs upper at boot
+# (VIRTKIT_VIRTIOFS_OVERLAY_SEED).
+tar.workspace = true
 tokio = { workspace = true, features = [
     "net",
     "process",

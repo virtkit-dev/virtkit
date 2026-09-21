@@ -311,6 +311,15 @@ pub struct Executor {
     /// job guest has none to protect. `"50%"` restores it. Each job's usage line reports the
     /// mark it reached against this capacity, which is what to size it from.
     pub checkout_overlay_size: String,
+    /// With `checkout_overlay`, start the job with the whole worktree already in the overlay's
+    /// tmpfs upper (default on): at boot the executor packs the checkout — everything but
+    /// `.git` — into one tar that the guest streams through its DAX window and unpacks in RAM.
+    /// Every read of the tree then comes from guest memory, where the read-only lower answers
+    /// each file with a virtio-fs round trip (~200 µs; a 100k-file tree is ~20 s per pass) on
+    /// every pass a build tool, scanner or git makes over it. Costs the tree's size in guest
+    /// RAM, counted against `checkout_overlay_size`, and a second or two at boot. `false`
+    /// leaves the lower to serve files on demand.
+    pub checkout_tmpfs: bool,
     /// Record what each job's guest does: the in-guest agent samples its own `/proc` every
     /// `atop_interval_secs` and writes the samples to a per-job log under
     /// `<state_dir>/atop/<date>/<job>/`, in the text format `atop -P` prints — so an existing
@@ -378,6 +387,7 @@ impl Default for Executor {
             checkout_cache_idle_secs: None,
             checkout_overlay: true,
             checkout_overlay_size: CHECKOUT_OVERLAY_SIZE.to_string(),
+            checkout_tmpfs: true,
             atop: true,
             atop_interval_secs: 10,
             atop_retention_days: 14,

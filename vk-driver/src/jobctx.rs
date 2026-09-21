@@ -326,6 +326,11 @@ impl JobCtx {
     pub fn net_bytes_log(&self) -> PathBuf {
         self.job_dir.join("net.bytes")
     }
+    /// Checkout seed size and packing time (`<bytes> <seconds>`) for the guest tmpfs.
+    /// Cleanup reads this for the end-of-job trace; the supervisor's own log is outside it.
+    pub fn checkout_seed_log(&self) -> PathBuf {
+        self.job_dir.join("checkout.seed")
+    }
     /// Typed egress-denial records the switch appends and each `run` stage drains into the
     /// job trace (see egress_report). Separate from the human `switch.log`.
     pub fn egress_denied_log(&self) -> PathBuf {

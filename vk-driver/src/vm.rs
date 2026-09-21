@@ -147,19 +147,125 @@ fn checkout_id_maps(
 /// registration must agree on it: the agent mounts whatever tag the cmdline names.
 const CIBUILD_TAG: &str = "cibuild";
 
+/// Seed share tag, guest mountpoint and tar name ([`pack_checkout_seed`]).
+/// The cmdline helper and FsShare registration must agree on all three.
+const CICHECKOUT_TAG: &str = "cicheckout";
+const CICHECKOUT_MOUNT: &str = "/run/virtkit-checkout";
+const CICHECKOUT_TAR: &str = "worktree.tar";
+
 /// The cmdline fragment mounting the host_checkout share in the guest. The agent mounts
-/// VIRTKIT_VIRTIOFS shares at boot (mkdir -p'ing the mount point); CI supervise sets no
-/// other share, so a plain assignment is safe. With `overlay`, VIRTKIT_VIRTIOFS_OVERLAY
+/// VIRTKIT_VIRTIOFS shares at boot (mkdir -p'ing the mount point), in order; CI supervise sets
+/// no other share, so a plain assignment is safe. With `overlay`, VIRTKIT_VIRTIOFS_OVERLAY
 /// tells the agent to build the tree on a tmpfs-backed overlay above the (then read-only)
 /// share instead of mounting it directly, and VIRTKIT_VIRTIOFS_OVERLAY_SIZE how much of the
-/// VM's memory that layer may take.
-fn checkout_virtiofs_cmdline(mount: &str, overlay: bool, size: &str) -> String {
-    let mut s = format!(" VIRTKIT_VIRTIOFS={CIBUILD_TAG}:{mount}");
+/// VM's memory that layer may take. With `seed`, list its share first so the tar is available
+/// before overlay mount. VIRTKIT_VIRTIOFS_OVERLAY_SEED names the tar to unpack into the upper.
+fn checkout_virtiofs_cmdline(mount: &str, overlay: bool, size: &str, seed: bool) -> String {
+    let seed = overlay && seed;
+    let mut s = if seed {
+        format!(" VIRTKIT_VIRTIOFS={CICHECKOUT_TAG}:{CICHECKOUT_MOUNT},{CIBUILD_TAG}:{mount}")
+    } else {
+        format!(" VIRTKIT_VIRTIOFS={CIBUILD_TAG}:{mount}")
+    };
     if overlay {
         s.push_str(&format!(" VIRTKIT_VIRTIOFS_OVERLAY={CIBUILD_TAG}"));
         s.push_str(&format!(" VIRTKIT_VIRTIOFS_OVERLAY_SIZE={size}"));
     }
+    if seed {
+        s.push_str(&format!(
+            " VIRTKIT_VIRTIOFS_OVERLAY_SEED={CIBUILD_TAG}:{CICHECKOUT_MOUNT}/{CICHECKOUT_TAR}"
+        ));
+    }
     s
+}
+
+/// Pack the host checkout's worktree — everything but the top-level `.git` — into `dest`, for the
+/// guest to unpack onto its overlay's tmpfs upper at boot. Read file by file through virtio-fs the
+/// tree costs a round trip per file on every pass over it (a build tool hashing its inputs, a
+/// scanner, git); as one tar it streams through the share's DAX window at memory speed and unpacks
+/// in guest RAM in well under a second per 100k files.
+///
+/// Built with the `tar` crate rather than the `tar` binary, so it needs no GNU tar on the host:
+/// virtkit ships as a static musl binary and runs where only BusyBox tar may exist, and BusyBox
+/// tar cannot stamp ownership at all. `owner` is the guest job user's `(uid, gid)`: every entry is
+/// stamped with it, so the unpacked tree is the job's just as the id-mapped lower appears to be;
+/// `None` (root, or an unresolved user) keeps the host owner, as the unmapped lower does.
+///
+/// Regular files, directories (empty ones and their modes included) and symlinks are packed;
+/// mtimes keep tar's one-second granularity and xattrs are not carried, so a seeded file can
+/// differ from the lower in those — neither of which a source checkout depends on. Returns the
+/// tar's size in bytes.
+fn pack_checkout_seed(host_dir: &Path, dest: &Path, owner: Option<(u32, u32)>) -> Result<u64> {
+    let file =
+        std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+    let mut builder = tar::Builder::new(std::io::BufWriter::new(file));
+    append_checkout_entries(&mut builder, host_dir, host_dir, owner)?;
+    let buffered = builder.into_inner().context("finishing the checkout tar")?;
+    buffered
+        .into_inner()
+        .map_err(std::io::IntoInnerError::into_error)
+        .context("flushing the checkout tar")?;
+    Ok(std::fs::metadata(dest)
+        .with_context(|| format!("stat {}", dest.display()))?
+        .len())
+}
+
+/// Append every entry under `dir` to `builder` recursively, naming each by its path relative to
+/// `root` and stamping `owner` (when set) onto it. The top-level `.git` is skipped, and anything
+/// that is not a regular file, directory or symlink (a device, fifo or socket a source tree never
+/// has) is left out. Entries are visited in name order so the tar is reproducible run to run.
+fn append_checkout_entries<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    dir: &Path,
+    root: &Path,
+    owner: Option<(u32, u32)>,
+) -> Result<()> {
+    let mut entries = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("reading {}", dir.display()))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let disk = entry.path();
+        let rel = disk
+            .strip_prefix(root)
+            .expect("a read_dir entry is under the root");
+        if dir == root && rel == Path::new(".git") {
+            continue;
+        }
+        let meta = entry
+            .metadata()
+            .with_context(|| format!("stat {}", disk.display()))?;
+        let file_type = meta.file_type();
+        let mut header = tar::Header::new_gnu();
+        header.set_metadata(&meta);
+        if let Some((uid, gid)) = owner {
+            header.set_uid(uid.into());
+            header.set_gid(gid.into());
+        }
+        if file_type.is_dir() {
+            header.set_size(0);
+            builder
+                .append_data(&mut header, rel, std::io::empty())
+                .with_context(|| format!("packing directory {}", disk.display()))?;
+            append_checkout_entries(builder, &disk, root, owner)?;
+        } else if file_type.is_symlink() {
+            let target = std::fs::read_link(&disk)
+                .with_context(|| format!("reading symlink {}", disk.display()))?;
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Symlink);
+            builder
+                .append_link(&mut header, rel, &target)
+                .with_context(|| format!("packing symlink {}", disk.display()))?;
+        } else if file_type.is_file() {
+            let f = std::fs::File::open(&disk)
+                .with_context(|| format!("opening {}", disk.display()))?;
+            builder
+                .append_data(&mut header, rel, f)
+                .with_context(|| format!("packing {}", disk.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// `[executor] checkout_overlay_size` as a tmpfs `size=` token: a percentage (`80%`) or an
@@ -1230,6 +1336,40 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             crate::vmm::ShareCache::Ephemeral
         };
 
+        // checkout_tmpfs: the tree itself goes into the overlay's upper at boot, packed here as
+        // one tar the guest streams and unpacks onto its tmpfs — every read of it is then guest
+        // RAM, where the lower costs a virtio-fs round trip per file on every pass. A pack
+        // failure loses only that: the lower still serves the tree.
+        let seed_dir = if overlay && cfg.executor.checkout_tmpfs {
+            let seed_dir = ctx.job_dir.join("checkout");
+            std::fs::create_dir_all(&seed_dir)
+                .with_context(|| format!("creating {}", seed_dir.display()))?;
+            let started = std::time::Instant::now();
+            let owner = guest_run_user_ids(&run_user, &media.rootfs);
+            match pack_checkout_seed(&host_dir, &seed_dir.join(CICHECKOUT_TAR), owner) {
+                Ok(bytes) => {
+                    let secs = started.elapsed().as_secs_f64();
+                    eprintln!(
+                        "virtkit: checkout packed for the guest tmpfs: {} MiB in {secs:.1}s",
+                        bytes >> 20
+                    );
+                    // This process's output stays in the supervisor log; the cleanup stage
+                    // reads this record to put the figures in the job trace.
+                    let _ = std::fs::write(ctx.checkout_seed_log(), format!("{bytes} {secs:.1}\n"));
+                    Some(seed_dir)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "virtkit: warning: checkout not seeded into the guest tmpfs ({e:#}); \
+                         the guest reads it through virtio-fs"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         if !crate::vmm::libkrun_selected() {
             let mut vfsd = cfg.virtiofsd_command();
             vfsd.arg(format!("--socket-path={}", sock.display()))
@@ -1262,10 +1402,38 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             gid_map,
             cache,
         });
+        // Keep the tar outside the checkout, on a private read-only share removed with the job.
+        if let Some(seed_dir) = &seed_dir {
+            let sock = ctx.job_dir.join("cicheckout-vfsd.sock");
+            if !crate::vmm::libkrun_selected() {
+                let mut vfsd = cfg.virtiofsd_command();
+                vfsd.arg(format!("--socket-path={}", sock.display()))
+                    .arg(format!("--shared-dir={}", seed_dir.display()))
+                    .args(crate::vmm::ShareCache::Immutable.virtiofsd_args())
+                    .args(["--sandbox=none", "--readonly"]);
+                children.push(
+                    spawn_tied_logged(vfsd, &ctx.job_dir.join("cicheckout-vfsd.log"))
+                        .context("spawning the checkout seed virtiofsd")?,
+                );
+                wait_for_socket(&sock, Duration::from_secs(5))
+                    .context("the checkout seed virtiofsd did not create its socket")?;
+            }
+            shares.push(crate::vmm::FsShare {
+                tag: CICHECKOUT_TAG.into(),
+                socket: sock,
+                host_dir: seed_dir.clone(),
+                read_only: true,
+                dax,
+                uid_map: Vec::new(),
+                gid_map: Vec::new(),
+                cache: crate::vmm::ShareCache::Immutable,
+            });
+        }
         cmdline.push_str(&checkout_virtiofs_cmdline(
             mount,
             overlay,
             checkout_overlay_size(&cfg.executor.checkout_overlay_size)?,
+            seed_dir.is_some(),
         ));
     }
 
@@ -2709,17 +2877,95 @@ mod tests {
         assert!(effective_build_egress(&c.cfg, &c).is_err());
     }
 
+    // pack_checkout_seed builds a portable tar (the `tar` crate, no host `tar` binary): it drops
+    // the top-level .git, packs files/dirs/symlinks, stamps `owner`, and round-trips.
+    #[test]
+    fn pack_checkout_seed_excludes_git_stamps_owner_and_round_trips() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("vk-packseed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(src.join(".git")).unwrap();
+        std::fs::write(src.join("a.txt"), b"hello").unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"world").unwrap();
+        std::fs::write(src.join(".git/config"), b"[core]").unwrap();
+        symlink("a.txt", src.join("link")).unwrap();
+
+        let dest = root.join(CICHECKOUT_TAR);
+        let bytes = pack_checkout_seed(&src, &dest, Some((4242, 4243))).unwrap();
+        assert_eq!(bytes, std::fs::metadata(&dest).unwrap().len());
+
+        // Collect (name, entry-type, owner, symlink target) from the archive.
+        let mut entries = std::collections::BTreeMap::new();
+        for e in tar::Archive::new(std::fs::File::open(&dest).unwrap())
+            .entries()
+            .unwrap()
+        {
+            let e = e.unwrap();
+            let name = e.path().unwrap().to_string_lossy().into_owned();
+            let link = e
+                .link_name()
+                .unwrap()
+                .map(|p| p.to_string_lossy().into_owned());
+            entries.insert(
+                name,
+                (
+                    e.header().entry_type(),
+                    e.header().uid().unwrap(),
+                    e.header().gid().unwrap(),
+                    link,
+                ),
+            );
+        }
+
+        // The worktree is packed; the top-level .git is not.
+        assert!(entries.contains_key("a.txt"), "{entries:?}");
+        assert!(entries.contains_key("sub/b.txt"), "{entries:?}");
+        assert!(entries.contains_key("sub"), "{entries:?}");
+        assert!(
+            !entries.keys().any(|n| n.starts_with(".git")),
+            ".git must be excluded: {entries:?}"
+        );
+        // The symlink is a symlink pointing at its target, not the target's contents.
+        assert_eq!(
+            entries
+                .get("link")
+                .map(|(t, .., l)| (t.is_symlink(), l.clone())),
+            Some((true, Some("a.txt".to_string())))
+        );
+        // Every entry is stamped with the requested owner.
+        for (name, (_, uid, gid, _)) in &entries {
+            assert_eq!((*uid, *gid), (4242, 4243), "owner of {name}");
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn checkout_virtiofs_cmdline_pins_the_agent_contract() {
         assert_eq!(
-            checkout_virtiofs_cmdline("/builds/grp/proj", false, "80%"),
+            checkout_virtiofs_cmdline("/builds/grp/proj", false, "80%", false),
             " VIRTKIT_VIRTIOFS=cibuild:/builds/grp/proj",
             "a read-write checkout has no layer to size"
         );
         assert_eq!(
-            checkout_virtiofs_cmdline("/builds/grp/proj", true, "80%"),
+            checkout_virtiofs_cmdline("/builds/grp/proj", false, "80%", true),
+            " VIRTKIT_VIRTIOFS=cibuild:/builds/grp/proj",
+            "a read-write checkout has no upper to seed either"
+        );
+        assert_eq!(
+            checkout_virtiofs_cmdline("/builds/grp/proj", true, "80%", false),
             " VIRTKIT_VIRTIOFS=cibuild:/builds/grp/proj VIRTKIT_VIRTIOFS_OVERLAY=cibuild \
              VIRTKIT_VIRTIOFS_OVERLAY_SIZE=80%"
+        );
+        assert_eq!(
+            checkout_virtiofs_cmdline("/builds/grp/proj", true, "80%", true),
+            " VIRTKIT_VIRTIOFS=cicheckout:/run/virtkit-checkout,cibuild:/builds/grp/proj \
+             VIRTKIT_VIRTIOFS_OVERLAY=cibuild VIRTKIT_VIRTIOFS_OVERLAY_SIZE=80% \
+             VIRTKIT_VIRTIOFS_OVERLAY_SEED=cibuild:/run/virtkit-checkout/worktree.tar",
+            "the seed share is mounted first, then named as the overlay's seed"
         );
     }
 

@@ -46,6 +46,12 @@
 //!   VIRTKIT_VIRTIOFS_OVERLAY_SIZE  how much of this VM's memory each overlay layer
 //!                        above may take, as a tmpfs size= (e.g. 80%, 12G). Unset
 //!                        leaves the kernel's own tmpfs default (half the RAM)
+//!   VIRTKIT_VIRTIOFS_OVERLAY_SEED  tag:path[,tag:path] — before mounting share `tag`'s
+//!                        overlay, unpack the tar at `path` (a file on a share mounted
+//!                        earlier in VIRTKIT_VIRTIOFS order) into its upper layer, so the
+//!                        whole tree starts in guest RAM and no read of it crosses
+//!                        virtio-fs. A seed that fails to unpack is logged and skipped:
+//!                        the lower layer still holds every file, only slower
 //!   VIRTKIT_DISKS        /dev/vdX:path[,/dev/vdX:path] — mount each already-formatted ext4
 //!                        raw disk (a compose/`-v` `disk` volume) read-write at path, creating
 //!                        it. Unlike a virtiofs share, this is a real block device: full POSIX
@@ -1203,6 +1209,13 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<Vec<CString>> {
             bail!("VIRTKIT_VIRTIOFS_OVERLAY_DISK names {tag:?}, which is not an overlay share");
         }
     }
+    // A seed requires an overlay upper to unpack into.
+    let seeds = overlay_seeds(cmdline)?;
+    for tag in seeds.keys() {
+        if !overlay.contains(tag) {
+            bail!("VIRTKIT_VIRTIOFS_OVERLAY_SEED names {tag:?}, which is not an overlay share");
+        }
+    }
     // Persistent overlay uppers (host-backed ext4) to freeze at poweroff.
     let mut freeze: Vec<CString> = Vec::new();
     let Some(spec) = cmdline.get("VIRTKIT_VIRTIOFS") else {
@@ -1230,6 +1243,7 @@ fn mount_virtiofs(cmdline: &HashMap<String, String>) -> Result<Vec<CString>> {
                 path,
                 size,
                 overlay_disks.get(tag).map(String::as_str),
+                seeds.get(tag).map(String::as_str),
                 dax_mode(tag),
             )
             .with_context(|| format!("overlay-mounting virtiofs share {tag} at {path}"))?;
@@ -1362,6 +1376,31 @@ pub(crate) const OVERLAY_ROOT: &str = "/run/virtkit-overlay";
 /// than spelled twice because [`crate::fsmark`] measures that layer from the outside and must
 /// not drift from where [`overlay_dirs`] mounts it.
 pub(crate) const OVERLAY_RW: &str = "rw";
+
+/// Parse VIRTKIT_VIRTIOFS_OVERLAY_SEED=tag:path[,tag:path] for extraction before overlay mount.
+/// Each absolute tar path must be on a share mounted earlier in VIRTKIT_VIRTIOFS order.
+/// Tags follow the overlay tag rules.
+fn overlay_seeds(cmdline: &HashMap<String, String>) -> Result<HashMap<String, String>> {
+    let mut seeds = HashMap::new();
+    let Some(spec) = cmdline.get("VIRTKIT_VIRTIOFS_OVERLAY_SEED") else {
+        return Ok(seeds);
+    };
+    for entry in spec.split(',').filter(|e| !e.is_empty()) {
+        let Some((tag, path)) = entry.split_once(':') else {
+            bail!("bad VIRTKIT_VIRTIOFS_OVERLAY_SEED entry {entry:?} (want tag:/path/to.tar)");
+        };
+        if tag.is_empty() || tag.contains('/') || tag == "." || tag == ".." {
+            bail!("VIRTKIT_VIRTIOFS_OVERLAY_SEED tag {tag:?} is not a valid share tag");
+        }
+        if !path.starts_with('/') {
+            bail!("VIRTKIT_VIRTIOFS_OVERLAY_SEED path {path:?} is not absolute");
+        }
+        if seeds.insert(tag.to_string(), path.to_string()).is_some() {
+            bail!("VIRTKIT_VIRTIOFS_OVERLAY_SEED lists tag {tag:?} more than once");
+        }
+    }
+    Ok(seeds)
+}
 
 /// The share tags VIRTKIT_VIRTIOFS_OVERLAY marks for an in-guest overlay.
 ///
@@ -1527,6 +1566,9 @@ fn overlay_tmpfs_data(size: Option<&str>) -> String {
 /// and then stay in the guest page cache — or, with `dax`, are mapped from the host's own and
 /// never cached twice; the host never sees guest writes.
 ///
+/// With `seed`, a tar of the lower's tree is unpacked into a fresh upper first, so the tree is
+/// read from guest RAM rather than through virtio-fs (see [`seed_overlay_upper`]).
+///
 /// Returns the upper's ext4 mountpoint to freeze at poweroff on the persistent path, `None` on
 /// the tmpfs path (nothing on the host to flush).
 fn mount_share_overlay(
@@ -1534,6 +1576,7 @@ fn mount_share_overlay(
     path: &str,
     size: Option<&str>,
     upper_device: Option<&str>,
+    seed: Option<&str>,
     dax: DaxMount,
 ) -> Result<Option<CString>> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1588,6 +1631,22 @@ fn mount_share_overlay(
         )
         .with_context(|| format!("chmod {upper} to the share mode"))?;
     }
+    // Only a fresh upper is seeded: a persistent one already carries its tree from the previous
+    // boot. A failed seed is not a failed boot — it empties the upper again (see
+    // `seed_overlay_upper`), so the lower serves the whole tree through virtio-fs — so it is
+    // reported, not raised.
+    if let (Some(tar), true) = (seed, created_upper) {
+        match seed_overlay_upper(tar, &upper) {
+            Ok((bytes, secs)) => info!(
+                "vk-agent init: seeded the overlay {tag} upper from {tar}: {} MiB in {secs:.2}s",
+                bytes >> 20
+            ),
+            Err(e) => warn!(
+                "vk-agent init: seeding the overlay {tag} upper from {tar} failed ({e:#}); \
+                 the lower layer serves the tree instead"
+            ),
+        }
+    }
     let mountpoint = Path::new(path);
     let created_parents = create_mountpoint(mountpoint)
         .with_context(|| format!("creating overlay mountpoint {path}"))?;
@@ -1610,6 +1669,67 @@ fn create_overlay_layer_dir(path: &str) -> io::Result<bool> {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
         Err(e) => Err(e),
+    }
+}
+
+/// Unpack `tar` — the host's packing of the lower's tree — into the overlay upper `upper`,
+/// keeping modes, ownership and mtimes: the host stamped the entries with the guest job user's
+/// ids, matching what the id-mapped lower shows. One streamed read of a large file (through the
+/// share's DAX window when it has one) replaces a virtio-fs round trip per file every time the
+/// tree is read.
+///
+/// `upper` must be a freshly created, empty layer. The tar crate writes each file in place, so a
+/// failure part way — a short tmpfs truncating a file mid-write is the case to fear — would leave
+/// a truncated file that then shadows the lower's complete one. So on any error the upper is
+/// emptied again before returning, and the caller mounts the overlay with the lower serving the
+/// whole tree, not a corrupt file.
+///
+/// xattrs and ACLs are not carried, and an mtime keeps only the tar's one-second granularity, so
+/// a seeded file can differ from the lower in those; a source checkout depends on neither.
+///
+/// Returns the tar's size in bytes and the elapsed seconds.
+fn seed_overlay_upper(tar: &str, upper: &str) -> Result<(u64, f64)> {
+    let started = std::time::Instant::now();
+    let file = std::fs::File::open(tar).with_context(|| format!("opening {tar}"))?;
+    let bytes = file
+        .metadata()
+        .with_context(|| format!("stat {tar}"))?
+        .len();
+    let mut archive = tar::Archive::new(std::io::BufReader::with_capacity(1 << 20, file));
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_ownerships(true);
+    archive.set_preserve_mtime(true);
+    archive.set_unpack_xattrs(false);
+    archive.set_overwrite(true);
+    if let Err(e) = archive.unpack(upper) {
+        clear_dir_contents(Path::new(upper));
+        return Err(e).with_context(|| format!("unpacking {tar} into {upper}"));
+    }
+    Ok((bytes, started.elapsed().as_secs_f64()))
+}
+
+/// Remove everything inside `dir` but keep `dir` itself. Best-effort: it undoes a partial unpack
+/// into a freshly created overlay upper, where any leftover file would wrongly shadow the lower.
+fn clear_dir_contents(dir: &Path) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            warn!("vk-agent init: reading {} to clear it: {e}", dir.display());
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let removed = match entry.file_type() {
+            Ok(t) if t.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        if let Err(e) = removed {
+            warn!(
+                "vk-agent init: clearing a partial seed left {}: {e}",
+                path.display()
+            );
+        }
     }
 }
 
@@ -3159,6 +3279,130 @@ mod tests {
             assert!(err.contains("VIRTKIT_VIRTIOFS_OVERLAY"), "{bad}: {err}");
             assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn overlay_seeds_parse_and_reject_bad_entries() {
+        let key = "VIRTKIT_VIRTIOFS_OVERLAY_SEED".to_string();
+        let m = HashMap::from([(
+            key.clone(),
+            "cibuild:/run/virtkit-checkout/worktree.tar".to_string(),
+        )]);
+        assert_eq!(
+            overlay_seeds(&m)
+                .unwrap()
+                .get("cibuild")
+                .map(String::as_str),
+            Some("/run/virtkit-checkout/worktree.tar")
+        );
+        assert!(overlay_seeds(&HashMap::new()).unwrap().is_empty());
+        // No path, a tag that escapes the private root, a relative path, a repeated tag.
+        for bad in [
+            "cibuild",
+            "a/b:/x.tar",
+            "cibuild:relative.tar",
+            "cibuild:/x.tar,cibuild:/y.tar",
+        ] {
+            let m = HashMap::from([(key.clone(), bad.to_string())]);
+            let err = overlay_seeds(&m).unwrap_err().to_string();
+            assert!(
+                err.contains("VIRTKIT_VIRTIOFS_OVERLAY_SEED"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mount_virtiofs_rejects_a_seed_for_a_non_overlay_share() {
+        let m = HashMap::from([
+            (
+                "VIRTKIT_VIRTIOFS_OVERLAY".to_string(),
+                "cibuild".to_string(),
+            ),
+            (
+                "VIRTKIT_VIRTIOFS_OVERLAY_SEED".to_string(),
+                "other:/run/virtkit-checkout/worktree.tar".to_string(),
+            ),
+        ]);
+        let err = mount_virtiofs(&m).unwrap_err().to_string();
+        assert!(err.contains("VIRTKIT_VIRTIOFS_OVERLAY_SEED"), "{err}");
+        assert!(err.contains("other"), "{err}");
+    }
+
+    #[test]
+    fn seed_overlay_upper_unpacks_a_tar_into_the_upper() {
+        let base = std::env::temp_dir().join(format!("vk-seed-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let upper = base.join("upper");
+        std::fs::create_dir_all(&upper).unwrap();
+
+        // A two-entry tar, built the way `pack_checkout_seed` produces one.
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            b.append_data(&mut file_header(b"hello"), "a.txt", &b"hello"[..])
+                .unwrap();
+            b.append_data(&mut file_header(b"world"), "sub/b.txt", &b"world"[..])
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let tar_path = base.join("t.tar");
+        std::fs::write(&tar_path, &buf).unwrap();
+
+        let (bytes, _secs) =
+            seed_overlay_upper(tar_path.to_str().unwrap(), upper.to_str().unwrap()).unwrap();
+        assert_eq!(bytes, std::fs::metadata(&tar_path).unwrap().len());
+        assert_eq!(std::fs::read(upper.join("a.txt")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(upper.join("sub/b.txt")).unwrap(), b"world");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // The critical fallback: an unpack that fails part way must leave the fresh upper empty, so
+    // no half-written file shadows the lower — the lower then serves the whole tree.
+    #[test]
+    fn seed_overlay_upper_empties_the_upper_on_a_failed_unpack() {
+        let base = std::env::temp_dir().join(format!("vk-seed-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let upper = base.join("upper");
+        std::fs::create_dir_all(&upper).unwrap();
+
+        // A corrupt header after `a.txt` makes unpack fail with a non-empty upper to clear.
+        let mut buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut buf);
+            b.append_data(&mut file_header(b"hello"), "a.txt", &b"hello"[..])
+                .unwrap();
+            b.finish().unwrap();
+        }
+        buf.truncate(1024); // drop the all-zero end-of-archive trailer (header + data block)
+        buf.extend([0xFFu8; 512]); // a block with a bad checksum
+
+        let tar_path = base.join("bad.tar");
+        std::fs::write(&tar_path, &buf).unwrap();
+
+        assert!(seed_overlay_upper(tar_path.to_str().unwrap(), upper.to_str().unwrap()).is_err());
+        assert_eq!(
+            std::fs::read_dir(&upper).unwrap().count(),
+            0,
+            "a failed unpack must leave the upper empty"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    // A minimal 0644 tar header sized to `data`. Stamped with our own ids (not root's) so that
+    // `seed_overlay_upper`'s ownership-preserving unpack chowns to a no-op and works unprivileged;
+    // the guest agent runs as root, where any owner would.
+    fn file_header(data: &[u8]) -> tar::Header {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        h.set_uid(unsafe { libc::geteuid() }.into());
+        h.set_gid(unsafe { libc::getegid() }.into());
+        h.set_mtime(0);
+        h.set_cksum();
+        h
     }
 
     #[test]

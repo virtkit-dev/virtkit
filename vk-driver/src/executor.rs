@@ -310,6 +310,17 @@ async fn report_resource_usage(ctx: &JobCtx) {
     if let Some(line) = crate::oomkills::line(oom.as_deref(), "raise MICROVM_MEM") {
         eprintln!("virtkit: {line}");
     }
+    // Report `vm::pack_checkout_seed`'s guest tmpfs seed figures here: the supervisor's output
+    // stays in its own log, outside the job trace.
+    if let Ok(seed) = std::fs::read_to_string(ctx.checkout_seed_log())
+        && let Some((bytes, secs)) = seed.trim().split_once(' ')
+        && let Ok(bytes) = bytes.parse::<u64>()
+    {
+        eprintln!(
+            "virtkit: checkout seeded into the guest tmpfs: {} MiB, packed in {secs}s",
+            bytes >> 20
+        );
+    }
     if let Some(pid) = crate::vm::live_supervisor_pid(ctx)
         && let Some(usage) = crate::usage::tree(pid)
             .map(|u| u.with_network(&ctx.net_bytes_log()).with_overlay(overlay))

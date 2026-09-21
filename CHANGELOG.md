@@ -6,6 +6,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **A CI job's checkout is served from guest RAM.** With `[executor] checkout_overlay`, the
+  whole checkout now starts in the job's memory instead of being fetched from the host one file
+  at a time, so a build tool hashing its inputs, a scanner, or git reads the tree without the
+  per-file cost that ran to about 20 s per pass over a 100k-file tree. The checkout counts
+  against `checkout_overlay_size`, so size that for the repository; `[executor] checkout_tmpfs =
+  false` goes back to reading files from the host on demand.
 - `vk run --workdir-cache ephemeral` trades write durability for speed on a `--workdir`
   share whose files are the guest's alone during the run and are read only after the VM
   exits. Not for a workdir the host edits while the run is in flight.

@@ -4523,6 +4523,7 @@ dependencies = [
  "russh",
  "russh-sftp",
  "simplelog",
+ "tar",
  "tokio",
  "vk-core",
  "vk-fs",

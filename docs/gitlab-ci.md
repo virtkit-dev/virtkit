@@ -250,6 +250,19 @@ walks the tree against the host once, and every later pass is answered from the 
 cache. With `checkout_overlay = false` the share is read-write and keeps close-to-open
 consistency (attributes re-fetched after 5 s).
 
+Caching the paths is not the same as caching the files: a file the job reads still crosses
+virtio-fs once, and a tree of 100k small files costs about 20 s per pass that way. So with
+`[executor] checkout_tmpfs` (the default alongside `checkout_overlay`) the executor packs the
+worktree — everything but `.git` — into one tar at boot, which the guest streams through the
+share's DAX window and unpacks onto the overlay's tmpfs upper in well under a second. Every file
+then reads from guest RAM; only `.git` is still served by the lower, and its packfiles are large
+enough to be DAX-mapped. The end-of-job `checkout seeded into the guest tmpfs` trace line reports
+the tar's size and host packing time; the guest's unpack time is in its console log (`vk-agent
+init: seeded the overlay …`). The tree's size is part of the `overlay` figure and of what
+`checkout_overlay_size` must hold, so a small `MICROVM_MEM` on a large repository is where to
+look if the layer fills sooner than expected. `checkout_tmpfs = false` leaves the lower to serve
+files on demand.
+
 The figure is the high-water mark, not what the layer held at the end: a job that unpacks an
 archive and deletes it would otherwise read as having needed nothing. It comes from the guest,
 which is the only place a tmpfs can be seen from, so a job with no overlaid checkout reports
