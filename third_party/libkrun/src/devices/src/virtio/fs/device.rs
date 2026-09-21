@@ -75,6 +75,8 @@ impl Fs {
         negative_timeout_ms: u32,
         xattr: bool,
         dax_inode_min: Option<u64>,
+        writeback: bool,
+        no_sync: bool,
     ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
@@ -91,6 +93,8 @@ impl Fs {
             negative_timeout: std::time::Duration::from_millis(negative_timeout_ms.into()),
             xattr,
             dax_inode_min,
+            writeback,
+            no_sync,
             ..Default::default()
         });
 

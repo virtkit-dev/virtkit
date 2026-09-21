@@ -653,6 +653,8 @@ pub unsafe extern "C" fn krun_set_root(ctx_id: u32, c_root_path: *const c_char) 
                 negative_timeout_ms: 0,
                 xattr: true,
                 dax_inode_min: None,
+                writeback: false,
+                no_sync: false,
                 virtual_entries: {
                     #[allow(unused_mut)]
                     let mut v = Vec::new();
@@ -801,6 +803,88 @@ pub unsafe extern "C" fn krun_add_virtiofs6(
     negative_timeout_ms: u32,
     xattr: bool,
 ) -> i32 {
+    add_virtiofs(
+        ctx_id,
+        c_tag,
+        c_path,
+        shm_size,
+        read_only,
+        c_uid_map,
+        c_gid_map,
+        dax_inode_min,
+        cache_policy,
+        entry_timeout_ms,
+        attr_timeout_ms,
+        negative_timeout_ms,
+        xattr,
+        false,
+        false,
+    )
+}
+
+/// `krun_add_virtiofs6` plus the write side of a share the guest alone writes while it is
+/// mounted: `writeback` negotiates the FUSE writeback cache (the guest coalesces writes and
+/// flushes them on close instead of round-tripping each one), and `no_sync` drops durability
+/// altogether — `flush`/`fsync`/`fsyncdir` are declined with `ENOSYS`, so the guest stops
+/// sending them for the life of the mount — for a tree that is discarded with the VM.
+#[allow(clippy::missing_safety_doc)]
+#[no_mangle]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub unsafe extern "C" fn krun_add_virtiofs7(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    shm_size: u64,
+    read_only: bool,
+    c_uid_map: *const c_char,
+    c_gid_map: *const c_char,
+    dax_inode_min: u64,
+    cache_policy: u32,
+    entry_timeout_ms: u32,
+    attr_timeout_ms: u32,
+    negative_timeout_ms: u32,
+    xattr: bool,
+    writeback: bool,
+    no_sync: bool,
+) -> i32 {
+    add_virtiofs(
+        ctx_id,
+        c_tag,
+        c_path,
+        shm_size,
+        read_only,
+        c_uid_map,
+        c_gid_map,
+        dax_inode_min,
+        cache_policy,
+        entry_timeout_ms,
+        attr_timeout_ms,
+        negative_timeout_ms,
+        xattr,
+        writeback,
+        no_sync,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+unsafe fn add_virtiofs(
+    ctx_id: u32,
+    c_tag: *const c_char,
+    c_path: *const c_char,
+    shm_size: u64,
+    read_only: bool,
+    c_uid_map: *const c_char,
+    c_gid_map: *const c_char,
+    dax_inode_min: u64,
+    cache_policy: u32,
+    entry_timeout_ms: u32,
+    attr_timeout_ms: u32,
+    negative_timeout_ms: u32,
+    xattr: bool,
+    writeback: bool,
+    no_sync: bool,
+) -> i32 {
     let cache_policy = match cache_policy {
         KRUN_FS_CACHE_NEVER => CachePolicy::Never,
         KRUN_FS_CACHE_AUTO => CachePolicy::Auto,
@@ -879,6 +963,8 @@ pub unsafe extern "C" fn krun_add_virtiofs6(
                 negative_timeout_ms,
                 xattr,
                 dax_inode_min: (dax_inode_min > 0).then_some(dax_inode_min),
+                writeback,
+                no_sync,
             });
         }
         Entry::Vacant(_) => return -libc::ENOENT,
@@ -2663,6 +2749,8 @@ pub unsafe extern "C" fn krun_set_root_disk_remount(
                 negative_timeout_ms: 0,
                 xattr: true,
                 dax_inode_min: None,
+                writeback: false,
+                no_sync: false,
             });
 
             ctx_cfg.set_block_root(device, fstype, options);

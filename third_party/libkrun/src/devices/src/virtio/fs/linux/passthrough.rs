@@ -385,6 +385,15 @@ pub struct Config {
     /// The default value for this option is `false`.
     pub writeback: bool,
 
+    /// Whether the share needs no durability: `flush`, `fsync` and `fsyncdir` are declined
+    /// with `ENOSYS`, which the FUSE client takes as "not supported" and never sends again
+    /// for the life of the mount — so a close or an `fsync` costs no round trip at all. Use
+    /// it for a tree discarded when the VM exits (a CI job's scratch), where a host crash
+    /// loses nothing worth keeping and each of those round trips is pure cost.
+    ///
+    /// The default value for this option is `false`.
+    pub no_sync: bool,
+
     /// The path of the root directory.
     ///
     /// The default is `/`.
@@ -423,6 +432,7 @@ impl Default for Config {
             negative_timeout: Duration::ZERO,
             cache_policy: Default::default(),
             writeback: false,
+            no_sync: false,
             root_dir: String::from("/"),
             xattr: true,
             proc_sfd_rawfd: None,
@@ -1786,6 +1796,11 @@ impl FileSystem for PassthroughFs {
         handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
+        // ENOSYS makes the guest stop sending FLUSH for the life of the mount (`fc->no_flush`);
+        // a plain success would still cost a round trip per close.
+        if self.cfg.no_sync {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
         let data = self
             .handles
             .read()
@@ -1813,6 +1828,10 @@ impl FileSystem for PassthroughFs {
     }
 
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
+        // As in `flush`: ENOSYS sets `fc->no_fsync`, so the guest never asks again.
+        if self.cfg.no_sync {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
         let data = self
             .handles
             .read()
@@ -1834,6 +1853,10 @@ impl FileSystem for PassthroughFs {
         datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
+        // As in `flush`: ENOSYS sets `fc->no_fsyncdir`, so the guest never asks again.
+        if self.cfg.no_sync {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
         if self.zero_message_opendir.load(Ordering::Relaxed) {
             // No OPENDIR, so no handle: reach the directory through the inode instead.
             let dir = self.open_inode(inode, libc::O_RDONLY | libc::O_DIRECTORY)?;
@@ -2478,6 +2501,56 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // A `no_sync` share declines flush/fsync/fsyncdir with ENOSYS, so the guest kernel marks
+    // them unsupported (`fc->no_flush`/`no_fsync`/`no_fsyncdir`) and stops sending them.
+    #[test]
+    fn no_sync_declines_flush_and_fsync_with_enosys() {
+        let root_dir = tmp_root();
+        let cfg = Config {
+            root_dir: root_dir.clone(),
+            no_sync: true,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let (entry, handle, _) = fs
+            .create(
+                ctx(),
+                fuse::ROOT_ID,
+                &CString::new("f").unwrap(),
+                0o644,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let handle = handle.expect("create returned a handle");
+
+        assert_eq!(
+            fs.flush(ctx(), entry.inode, handle, 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOSYS),
+        );
+        assert_eq!(
+            fs.fsync(ctx(), entry.inode, false, handle)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOSYS),
+        );
+        // fsyncdir returns before it touches the handle, so the root inode is fine here.
+        assert_eq!(
+            fs.fsyncdir(ctx(), fuse::ROOT_ID, false, handle)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOSYS),
+        );
+
+        std::fs::remove_dir_all(&root_dir).ok();
     }
 
     // A writable DAX mapping of a file that is mode 0444 on disk but is held open

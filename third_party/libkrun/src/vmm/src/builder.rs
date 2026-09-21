@@ -2015,6 +2015,8 @@ fn attach_fs_devices(
                 config.negative_timeout_ms,
                 config.xattr,
                 config.dax_inode_min,
+                config.writeback,
+                config.no_sync,
             )
             .unwrap(),
         ));

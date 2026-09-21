@@ -34,4 +34,12 @@ pub struct FsDeviceConfig {
     /// (`ATTR_DAX`), for a guest that mounts the share `dax=inode`. `None` = the mount
     /// option alone decides.
     pub dax_inode_min: Option<u64>,
+    /// Negotiate the FUSE writeback cache: the guest coalesces writes and flushes them on
+    /// close instead of round-tripping each `write`. Only for a share the guest alone
+    /// writes while it is mounted.
+    pub writeback: bool,
+    /// The share needs no durability: `flush`/`fsync`/`fsyncdir` are declined with
+    /// `ENOSYS`, which the guest takes as unsupported and stops sending for the life of
+    /// the mount. For a tree discarded with the VM.
+    pub no_sync: bool,
 }
