@@ -4,6 +4,16 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Guest TCP connections through the shared network recover from loss selectively.**
+  The gateway negotiates timestamps (RFC 7323) and selective acknowledgment
+  (RFC 2018/6675) with guests, acknowledges data on arrival instead of on host
+  reads, and reports the ranges it holds, so a sender retransmits only what is
+  missing.
+- **Guest downloads use full-size segments.** Guest-bound writes are sized to what
+  one segment carries with the timestamp option, so each write is one segment.
+
 ## [0.74.0] - 2026-09-20
 
 ### Added
