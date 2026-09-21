@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **SSH sessions set `SHELL`.** Scripts that read it, including editor bootstraps, no
+  longer fall back to `sh` or warn that it is unset.
+
 ## [0.76.0] - 2026-09-21
 
 ### Added
