@@ -8,6 +8,11 @@ All notable changes to virtkit will be documented in this file.
 
 - **SSH sessions set `SHELL`.** Scripts that read it, including editor bootstraps, no
   longer fall back to `sh` or warn that it is unset.
+- **SSH sessions keep a command's stderr out of its stdout.** A command run over SSH
+  without a terminal sent both streams to the client as one, so a tool speaking a binary
+  protocol over the connection — Zed's remote server, for one — saw its own log lines
+  mixed into the data it was reading and stopped responding. Each stream now arrives on
+  its own, as it does with a stock SSH server, and plain text output is unchanged.
 
 ## [0.76.0] - 2026-09-21
 

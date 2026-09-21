@@ -648,6 +648,10 @@ fn spawn_exec(user: &str, cmdline: &str) -> Result<Child> {
     Ok(command.spawn()?)
 }
 
+/// The extended-data type SSH reserves for stderr (RFC 4254 §5.2). A client hands data
+/// that arrives under it to its own stderr and leaves the channel's data stream untouched.
+const SSH_EXTENDED_DATA_STDERR: u32 = 1;
+
 /// How long a hung-up process group gets to leave before it is killed outright.
 const HANGUP_GRACE: Duration = Duration::from_secs(5);
 
@@ -731,10 +735,17 @@ async fn shell_bridge(
     let _ = handle.close(id).await;
 }
 
-/// Bridge a session channel to a piped command: client->stdin, stdout+stderr->
-/// client (merged — no extended-data split yet), then report the exit status. If the
-/// connection goes first, hang up on the command's process group instead, and kill it if
-/// it stays.
+/// Bridge client input to stdin, stdout to channel data, and stderr to extended data,
+/// then report the exit status. On disconnect, hang up the command's process group
+/// and kill it if it stays.
+///
+/// Keeping the two output streams apart is what makes the channel a binary-transparent
+/// pipe, which is the whole contract a command without a tty is run under. A client that
+/// speaks a framed protocol over `ssh -T` — Zed's remote server, say — reads its length
+/// prefixes straight off stdout, so a single diagnostic line folded in from stderr is not
+/// noise it can skip: the next field it reads is a fragment of that line, and the stream
+/// never resynchronizes. Text commands never notice, which is why `uname` and `cat` probes
+/// pass over a channel a protocol cannot survive.
 async fn exec_bridge(
     chan: Channel<Msg>,
     mut child: Child,
@@ -742,29 +753,31 @@ async fn exec_bridge(
     id: ChannelId,
     mut gone: ConnectionGone,
 ) {
-    let stream = chan.into_stream();
-    let (mut reader, writer) = tokio::io::split(stream);
-    let writer = Arc::new(tokio::sync::Mutex::new(writer));
+    // Split for separate stdout/stderr writers without `into_stream`'s close-on-drop,
+    // which could close the channel before the exit status. Both writers share the
+    // channel's window and stay within the client's allowance.
+    let (mut read_half, write_half) = chan.split();
 
     let stdin = child.stdin.take();
     let stdin_task = tokio::spawn(async move {
         if let Some(mut si) = stdin {
-            let _ = tokio::io::copy(&mut reader, &mut si).await;
+            let mut from_client = read_half.make_reader();
+            let _ = tokio::io::copy(&mut from_client, &mut si).await;
             let _ = si.shutdown().await;
         }
     });
     let stdout = child.stdout.take();
-    let w_out = Arc::clone(&writer);
+    let to_client = write_half.make_writer();
     let mut out_task = tokio::spawn(async move {
         if let Some(mut o) = stdout {
-            pump(&mut o, w_out).await;
+            pump(&mut o, to_client).await;
         }
     });
     let stderr = child.stderr.take();
-    let w_err = Arc::clone(&writer);
+    let to_client_err = write_half.make_writer_ext(Some(SSH_EXTENDED_DATA_STDERR));
     let mut err_task = tokio::spawn(async move {
         if let Some(mut e) = stderr {
-            pump(&mut e, w_err).await;
+            pump(&mut e, to_client_err).await;
         }
     });
 
@@ -797,8 +810,8 @@ async fn exec_bridge(
     let _ = handle.close(id).await;
 }
 
-/// Copy a child output stream to the shared channel writer until EOF.
-async fn pump<R, W>(src: &mut R, dst: Arc<tokio::sync::Mutex<W>>)
+/// Copy a child output stream to its own channel writer until EOF.
+async fn pump<R, W>(src: &mut R, mut dst: W)
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
@@ -808,8 +821,7 @@ where
         match src.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let mut w = dst.lock().await;
-                if w.write_all(&buf[..n]).await.is_err() {
+                if dst.write_all(&buf[..n]).await.is_err() {
                     break;
                 }
             }
@@ -842,7 +854,99 @@ fn wait_code(status: std::io::Result<std::process::ExitStatus>) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectionGone, parse_session_env, read_session_env};
+    use super::{ConnectionGone, Duration, parse_session_env, read_session_env, run_ssh_server};
+
+    /// Run `cmdline` against a test SSH server and return the exec channel's data
+    /// and stderr extended-data streams.
+    async fn exec_over_ssh(cmdline: &str) -> (Vec<u8>, Vec<u8>) {
+        use std::sync::Arc;
+
+        use russh::client;
+        use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+
+        use vk_core::addr::SocketAddr;
+
+        /// The server key is fresh per boot and pinned by nobody; the test is about the
+        /// channel, not about trust.
+        struct AcceptAnyHostKey;
+
+        impl client::Handler for AcceptAnyHostKey {
+            type Error = russh::Error;
+
+            async fn check_server_key(
+                &mut self,
+                _key: &PublicKeyOrCertificate,
+            ) -> Result<bool, Self::Error> {
+                Ok(true)
+            }
+        }
+
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let authorized = vec![key.public_key().to_openssh().unwrap()];
+
+        let path = std::env::temp_dir().join(format!("vk-agent-ssh-exec-{}.sock", unsafe {
+            libc::getpid()
+        }));
+        let addr = SocketAddr::Unix(path.clone());
+        let keys = super::parse_authorized_keys(&authorized);
+        let server = tokio::spawn(async move { run_ssh_server(&addr, &keys, None).await });
+
+        // The listener is bound inside the task; wait for the socket to answer.
+        let stream = loop {
+            match tokio::net::UnixStream::connect(&path).await {
+                Ok(s) => break s,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+
+        // Use the test's uid: `with_user_drop` skips same-uid drops, and numeric users
+        // resolve with or without a passwd entry.
+        let user = unsafe { libc::geteuid() }.to_string();
+        let mut session = client::connect_stream(
+            Arc::new(client::Config::default()),
+            stream,
+            AcceptAnyHostKey,
+        )
+        .await
+        .unwrap();
+        assert!(
+            session
+                .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), None))
+                .await
+                .unwrap()
+                .success()
+        );
+
+        let mut channel = session.channel_open_session().await.unwrap();
+        channel.exec(true, cmdline).await.unwrap();
+        let (mut data, mut stderr) = (Vec::new(), Vec::new());
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                russh::ChannelMsg::Data { data: d } => data.extend_from_slice(&d),
+                russh::ChannelMsg::ExtendedData { data: d, ext } => {
+                    assert_eq!(ext, super::SSH_EXTENDED_DATA_STDERR);
+                    stderr.extend_from_slice(&d);
+                }
+                russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        server.abort();
+        let _ = std::fs::remove_file(&path);
+        (data, stderr)
+    }
+
+    /// The exec channel has to be the binary-transparent pipe a client without a tty is
+    /// promised: a framed protocol (Zed's remote server) reads its length prefixes straight
+    /// off the data stream, so nothing the command did not write to stdout may reach it.
+    /// Two things otherwise would: whatever it wrote to stderr, and the carriage returns a
+    /// pty inserts before newlines. Six bytes come back, or the channel is not a pipe.
+    #[tokio::test]
+    async fn exec_keeps_stderr_and_newlines_off_the_data_stream() {
+        let (data, stderr) = exec_over_ssh(r"printf 'AB\nCD\n'; printf 'a warning\n' >&2").await;
+        assert_eq!(data, b"AB\nCD\n");
+        assert_eq!(stderr, b"a warning\n");
+    }
 
     #[tokio::test]
     async fn bound_work_ends_when_its_connection_goes() {
