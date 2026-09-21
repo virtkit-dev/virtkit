@@ -13,6 +13,9 @@ All notable changes to virtkit will be documented in this file.
   protocol over the connection — Zed's remote server, for one — saw its own log lines
   mixed into the data it was reading and stopped responding. Each stream now arrives on
   its own, as it does with a stock SSH server, and plain text output is unchanged.
+- A CI checkout seeded into guest RAM kept symlinks byte for byte. A link target holding
+  `//` or `/./` was rewritten to its normalized form on the way in, so the job's tree started
+  out with those links reported modified by git.
 
 ## [0.76.0] - 2026-09-21
 

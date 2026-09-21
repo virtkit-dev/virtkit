@@ -3,6 +3,7 @@
 
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -254,8 +255,7 @@ fn append_checkout_entries<W: std::io::Write>(
                 .with_context(|| format!("reading symlink {}", disk.display()))?;
             header.set_size(0);
             header.set_entry_type(tar::EntryType::Symlink);
-            builder
-                .append_link(&mut header, rel, &target)
+            append_symlink(builder, &mut header, rel, target.as_os_str().as_bytes())
                 .with_context(|| format!("packing symlink {}", disk.display()))?;
         } else if file_type.is_file() {
             let f = std::fs::File::open(&disk)
@@ -266,6 +266,33 @@ fn append_checkout_entries<W: std::io::Write>(
         }
     }
     Ok(())
+}
+
+/// Append the symlink `rel` with the target bytes readlink returned. `Builder::append_link`
+/// stores a target through `Header::set_link_name`, which re-joins the target's `Path`
+/// components: `a//b` and `a/./b` come out as `a/b`. The unpacked link then differs from the
+/// blob git committed and the job's tree starts out modified. A target the 100-byte header field
+/// cannot hold goes in a GNU long-link record, as `append_link` writes it.
+fn append_symlink<W: std::io::Write>(
+    builder: &mut tar::Builder<W>,
+    header: &mut tar::Header,
+    rel: &Path,
+    target: &[u8],
+) -> std::io::Result<()> {
+    if header.set_link_name_literal(target).is_err() {
+        let mut long = tar::Header::new_gnu();
+        let name = b"././@LongLink";
+        long.as_gnu_mut().expect("a GNU header").name[..name.len()].copy_from_slice(name);
+        long.set_mode(0o644);
+        long.set_uid(0);
+        long.set_gid(0);
+        long.set_mtime(0);
+        long.set_size(target.len() as u64 + 1);
+        long.set_entry_type(tar::EntryType::GNULongLink);
+        long.set_cksum();
+        builder.append(&long, target.chain(std::io::repeat(0).take(1)))?;
+    }
+    builder.append_data(header, rel, std::io::empty())
 }
 
 /// `[executor] checkout_overlay_size` as a tmpfs `size=` token: a percentage (`80%`) or an
@@ -2892,6 +2919,11 @@ mod tests {
         std::fs::write(src.join("sub/b.txt"), b"world").unwrap();
         std::fs::write(src.join(".git/config"), b"[core]").unwrap();
         symlink("a.txt", src.join("link")).unwrap();
+        // Targets tar-rs would rewrite: a doubled slash, and one past the 100-byte header field.
+        symlink("sub//./b.txt", src.join("odd")).unwrap();
+        let long_target = format!("{}/b.txt", "sub/..//".repeat(20));
+        assert!(long_target.len() > 100);
+        symlink(&long_target, src.join("long")).unwrap();
 
         let dest = root.join(CICHECKOUT_TAR);
         let bytes = pack_checkout_seed(&src, &dest, Some((4242, 4243))).unwrap();
@@ -2934,6 +2966,15 @@ mod tests {
                 .get("link")
                 .map(|(t, .., l)| (t.is_symlink(), l.clone())),
             Some((true, Some("a.txt".to_string())))
+        );
+        // Link targets are stored byte for byte, so the unpacked tree matches git's blobs.
+        assert_eq!(
+            entries.get("odd").and_then(|(.., l)| l.clone()).as_deref(),
+            Some("sub//./b.txt")
+        );
+        assert_eq!(
+            entries.get("long").and_then(|(.., l)| l.clone()).as_deref(),
+            Some(long_target.as_str())
         );
         // Every entry is stamped with the requested owner.
         for (name, (_, uid, gid, _)) in &entries {
