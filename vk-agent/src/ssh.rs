@@ -474,6 +474,9 @@ fn with_user_drop(command: &mut Command, ru: &ResolvedUser) {
 
 fn login_env(command: &mut Command, user: &str, ru: &ResolvedUser) {
     command.env("USER", user).env("LOGNAME", user);
+    // sshd exports the passwd entry's shell, and scripts read it to decide what they may
+    // rely on; vk-agent's own environment is PID 1's, which has no SHELL to inherit.
+    command.env("SHELL", login_shell(ru));
     if let Some(home) = &ru.home {
         command.env("HOME", home).current_dir(home);
     }
@@ -565,14 +568,18 @@ fn env_name_ok(key: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// The user's login shell, or `/bin/sh` when the passwd entry names none.
+fn login_shell(ru: &ResolvedUser) -> std::ffi::OsString {
+    ru.shell
+        .clone()
+        .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"))
+}
+
 /// Spawn the user's login shell on a fresh pty as `user`.
 fn spawn_shell(user: &str, pty: &PtyReq) -> Result<(Child, PtyMaster)> {
     let ru = resolve_user(user)?;
     let (master, slave) = pty::openpty(pty.rows, pty.cols)?;
-    let shell = ru
-        .shell
-        .clone()
-        .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"));
+    let shell = login_shell(&ru);
     let mut command = Command::new(&shell);
     command.arg("-l");
     login_env(&mut command, user, &ru);
@@ -610,10 +617,7 @@ fn spawn_shell(user: &str, pty: &PtyReq) -> Result<(Child, PtyMaster)> {
 /// prompt — stdout stays clean for the marker parsing VS Code relies on.
 fn spawn_shell_nopty(user: &str) -> Result<Child> {
     let ru = resolve_user(user)?;
-    let shell = ru
-        .shell
-        .clone()
-        .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"));
+    let shell = login_shell(&ru);
     let mut command = Command::new(&shell);
     command.arg("-l");
     login_env(&mut command, user, &ru);
@@ -630,10 +634,7 @@ fn spawn_shell_nopty(user: &str) -> Result<Child> {
 /// Spawn `cmdline` via the user's shell with piped stdio (no tty), own pgroup.
 fn spawn_exec(user: &str, cmdline: &str) -> Result<Child> {
     let ru = resolve_user(user)?;
-    let shell = ru
-        .shell
-        .clone()
-        .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"));
+    let shell = login_shell(&ru);
     let mut command = Command::new(&shell);
     command.arg("-c").arg(cmdline);
     login_env(&mut command, user, &ru);
