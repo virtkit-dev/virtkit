@@ -47,17 +47,21 @@ const ETH_HDR: usize = 14;
 pub(crate) const MTU: u16 = vk_core::net::SWITCH_MTU;
 const _: () = assert!(MAX_FRAME >= 14 + MTU as usize);
 /// Largest TCP payload the link carries: the MTU less the IPv4 and TCP headers. The gateway
-/// advertises it in the SYN-ACK. A guest-bound splice can hand ipstack up to this much per
-/// write; ipstack emits one segment, also limited by the guest's receive window.
+/// advertises it in the SYN-ACK.
 const MSS: u16 = MTU - 40;
+/// Guest-bound write ceiling, reserving 12 bytes of [`MSS`] for timestamps
+/// (RFC 7323 § 2.2: 10 bytes plus two NOPs). On a timestamp-enabled flow with the link's
+/// MSS, enough receive window and no SACK blocks, this avoids a 12-byte tail segment.
+/// Smaller peer MSS/windows or extra SACK options can still split a write.
+const GUEST_BOUND_CHUNK: usize = MSS as usize - 12;
 /// Ceiling for the host-bound half of a spliced flow, matching ipstack's maximum read
 /// handoff of one 8 KiB reassembly chunk. The guest kernel sizes that direction's segments.
 const HOST_BOUND_CHUNK: usize = 8 << 10;
 /// What a spliced flow's copy buffer is first allocated at, in either direction. A job
 /// opens hundreds of flows and most carry a request and a short reply, so a direction starts
 /// with a small buffer on its first poll and grows it while the reader keeps filling it —
-/// up to [`HOST_BOUND_CHUNK`] host-bound and [`MSS`] guest-bound, which is what a bulk
-/// transfer settles at.
+/// up to [`HOST_BOUND_CHUNK`] host-bound and [`GUEST_BOUND_CHUNK`] guest-bound, which is
+/// what a bulk transfer settles at.
 const SPLICE_INIT: usize = 8 << 10;
 /// Frame I/O on a guest's socket works in bursts: one read takes in whatever frames the
 /// socket holds, and queued frames share a write buffer. The bounds limit each batch;
@@ -1437,7 +1441,7 @@ fn proxy_tcp(
                     &mut guest,
                     &mut host,
                     HOST_BOUND_CHUNK,
-                    MSS as usize,
+                    GUEST_BOUND_CHUNK,
                     Some(&drain),
                 )
                 .await
@@ -4307,8 +4311,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_saturated_download_with_timestamps_has_no_tiny_tail_segments() {
+        use etherparse::{PacketBuilder, PacketHeaders, TcpOptionElement, TransportHeader};
+        use tokio::io::AsyncReadExt;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (tx, rx) = unbounded_channel();
+            let (reply_tx, mut replies) = unbounded_channel();
+            let mut stack = IpStack::new(ip_stack_config(), ChannelDevice { rx, tx: reply_tx });
+            let guest = [192, 168, 127, 2];
+            let remote = [10, 0, 0, 1];
+            let mut syn = Vec::new();
+            PacketBuilder::ipv4(guest, remote, 64)
+                .tcp(40000, 443, 1000, u16::MAX)
+                .syn()
+                .options(&[
+                    TcpOptionElement::MaximumSegmentSize(MSS),
+                    TcpOptionElement::WindowScale(7),
+                    TcpOptionElement::Timestamp(7000, 0),
+                ])
+                .unwrap()
+                .write(&mut syn, &[])
+                .unwrap();
+            tx.send(syn).unwrap();
+            let reply = replies.recv().await.unwrap();
+            let Some(TransportHeader::Tcp(synack)) = PacketHeaders::from_ip_slice(reply_ip(&reply))
+                .unwrap()
+                .transport
+            else {
+                panic!("expected SYN-ACK");
+            };
+            let timestamp = synack
+                .options_iterator()
+                .find_map(|option| match option.unwrap() {
+                    TcpOptionElement::Timestamp(value, _) => Some(value),
+                    _ => None,
+                })
+                .expect("timestamps were not negotiated");
+            let mut ack = Vec::new();
+            PacketBuilder::ipv4(guest, remote, 64)
+                .tcp(40000, 443, 1001, u16::MAX)
+                .ack(synack.sequence_number.wrapping_add(1))
+                .options(&[TcpOptionElement::Timestamp(7000, timestamp)])
+                .unwrap()
+                .write(&mut ack, b"ready")
+                .unwrap();
+            tx.send(ack).unwrap();
+            let IpStackStream::Tcp(mut stream) = stack.accept().await.unwrap() else {
+                panic!("expected TCP stream");
+            };
+            // Reading the request confirms the ACK opened the scaled receive window.
+            let mut request = [0; 5];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ready");
+
+            // Fill each buffer through its growth steps, then twice at the ceiling.
+            let mut reader = Bursty { bursts: 5 };
+            let mut copy = CopyBuffer::new(GUEST_BOUND_CHUNK);
+            std::future::poll_fn(|cx| {
+                assert!(
+                    copy.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut stream))
+                        .is_pending()
+                );
+                if reader.bursts == 0 && !copy.pending() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+
+            let full_segment = usize::from(MTU) - 20 - 32;
+            let expected = [
+                SPLICE_INIT,
+                SPLICE_INIT * 2,
+                SPLICE_INIT * 4,
+                full_segment,
+                full_segment,
+            ];
+            let mut sizes = Vec::new();
+            let mut received = 0;
+            while received < expected.iter().sum() {
+                let packet = replies.recv().await.unwrap();
+                let headers = PacketHeaders::from_ip_slice(reply_ip(&packet)).unwrap();
+                let bytes = headers.payload.slice();
+                if !bytes.is_empty() {
+                    assert!(bytes.iter().all(|&byte| byte == 0x5a));
+                    sizes.push(bytes.len());
+                    received += bytes.len();
+                }
+            }
+            assert_eq!(sizes, expected);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn a_spliced_direction_starts_small_and_grows_to_the_ceiling() {
-        for (max, bursts) in [(MSS as usize, 64), (HOST_BOUND_CHUNK, 8)] {
+        for (max, bursts) in [(GUEST_BOUND_CHUNK, 64), (HOST_BOUND_CHUNK, 8)] {
             let mut copy = CopyBuffer::new(max);
             assert!(copy.buf.is_empty(), "no buffer before the first poll");
             let mut reader = Bursty { bursts: 0 };
@@ -4344,7 +4445,7 @@ mod tests {
             // destination forces partial writes and backpressure.
             let (mut b, mut b_peer) = tokio::io::duplex(MSS as usize * 2);
             let spliced = tokio::spawn(async move {
-                splice(&mut a, &mut b, HOST_BOUND_CHUNK, MSS as usize, None).await
+                splice(&mut a, &mut b, HOST_BOUND_CHUNK, GUEST_BOUND_CHUNK, None).await
             });
             let request: Vec<u8> = (0..HOST_BOUND_CHUNK * 3 + 123)
                 .map(|i| (i % 251) as u8)
@@ -4475,7 +4576,7 @@ mod tests {
                 };
                 let error = tokio::time::timeout(
                     Duration::from_secs(2),
-                    splice(a, b, HOST_BOUND_CHUNK, MSS as usize, None),
+                    splice(a, b, HOST_BOUND_CHUNK, GUEST_BOUND_CHUNK, None),
                 )
                 .await
                 .expect("a failure waited for the other direction")

@@ -11,8 +11,7 @@ All notable changes to virtkit will be documented in this file.
   (RFC 2018/6675) with guests, acknowledges data on arrival instead of on host
   reads, and reports the ranges it holds, so a sender retransmits only what is
   missing.
-- **Guest downloads use full-size segments.** Guest-bound writes are sized to what
-  one segment carries with the timestamp option, so each write is one segment.
+- **Guest downloads avoid unnecessary tiny TCP packets when timestamps are enabled.**
 
 ## [0.74.0] - 2026-09-20
 
