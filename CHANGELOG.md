@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.76.1] - 2026-09-21
+
 ### Fixed
 
 - **SSH sessions set `SHELL`.** Scripts that read it, including editor bootstraps, no
@@ -2989,7 +2991,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.76.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.76.1...HEAD
+[0.76.1]: https://github.com/virtkit-dev/virtkit/compare/v0.76.0...v0.76.1
 [0.76.0]: https://github.com/virtkit-dev/virtkit/compare/v0.75.0...v0.76.0
 [0.75.0]: https://github.com/virtkit-dev/virtkit/compare/v0.74.0...v0.75.0
 [0.74.0]: https://github.com/virtkit-dev/virtkit/compare/v0.73.3...v0.74.0
