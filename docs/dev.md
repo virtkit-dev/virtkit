@@ -484,6 +484,18 @@ persistent roots and overlays (including old services), declared disk backings
 inside state, configured managed directories and managed editor data. Their contents
 are lost. `--images --storage` and `--all` select both categories.
 
+```sh
+vk dev prune NAME --all             # prune another environment by its `vk dev list` name
+```
+
+`NAME` is the name used by `vk dev list` and `vk dev gc`. It selects an environment
+host-wide from any directory, without a workspace config. Prune uses the storage
+recorded at its last boot, so workspace moves or changes do not affect selection.
+An environment booted by a `vk` from before
+this was recorded prunes its images and its fixed roots, overlays and editor storage,
+but a disk backing left loose in the state directory cannot be identified by name; prune
+it from its workspace, or boot it once to record it.
+
 Every deletion previews its paths. The confirmation defaults to no; without a
 terminal, `--yes` is required. `--dry-run` removes nothing even with `--yes`.
 Refusing confirmation exits nonzero; an empty selection succeeds. Prune holds the
@@ -864,7 +876,7 @@ individual options.
 | `plan` | Inspect the resolved config; `--explain`, `--diff`, `--format`, `--show-secrets`. |
 | `stop` | Stop the environment and publishers; `--timeout SECONDS`. |
 | `storage list`, `storage reset NAME` | Inspect storage or destroy a durable item's data. |
-| `prune` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. Requires a stopped environment. |
+| `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. `NAME` prunes host-wide by its `vk dev list` name. Requires a stopped environment. |
 | `list` | Host-wide environment inventory (on-disk sizes by default); `--no-sizes`, `--json`. |
 | `gc [NAME…]` | Remove stopped state; `--all-stale`, `--yes`. |
 | `schema` | Print the configuration JSON Schema. |

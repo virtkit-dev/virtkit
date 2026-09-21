@@ -77,6 +77,11 @@ pub async fn after_boot(plan: &Plan) -> Result<()> {
     let generation = running_vm(plan).map(|vm| generation_of(plan, &root_identity(plan, &vm)));
     publish_endpoints(plan).await?;
     run_start_hooks(plan, generation.as_deref()).await?;
+    // What `vk dev prune` would remove, recorded so it can do so by name later without the
+    // workspace's config. If inventory fails, leave it unrecorded; the boot is otherwise ready.
+    let storage_backings = super::storage::inventory(plan, false)
+        .map(|items| items.into_iter().map(|i| i.backing).collect())
+        .ok();
     write_identity(
         plan,
         &Identity {
@@ -85,6 +90,7 @@ pub async fn after_boot(plan: &Plan) -> Result<()> {
             created_by: own_version(),
             generation: generation.unwrap_or_default(),
             manifest,
+            storage_backings,
         },
     )
 }

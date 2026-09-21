@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk dev prune NAME` prunes an environment by name, host-wide.** It takes the name
+  from `vk dev list` to reach environments in other, moved or deleted workspaces,
+  which config-only pruning could not reach.
+
 ### Changed
 
 - **Guest TCP connections through the shared network recover from loss selectively.**

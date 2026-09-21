@@ -70,6 +70,13 @@ pub struct Identity {
     pub generation: String,
     /// the plan as booted, with host-environment values fingerprinted rather than stored
     pub manifest: serde_json::Value,
+    /// the durable and managed storage backings this environment declared at boot, absolute:
+    /// what `vk dev prune --storage` removes. Recorded so prune can find them by name, without
+    /// re-reading the workspace's config — which may have moved or changed. `None` from a
+    /// `dev.json` written before this was recorded; prune by name then falls back to its
+    /// fixed-name storage and says the declared backings could not be identified.
+    #[serde(default)]
+    pub storage_backings: Option<Vec<std::path::PathBuf>>,
 }
 
 /// How long to wait for the note the child leaves for its parent.

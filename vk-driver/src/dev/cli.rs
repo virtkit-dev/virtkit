@@ -403,7 +403,14 @@ enum DevAction {
     /// Keeps the environment identity, SSH keys, external backings and shared caches.
     /// Stop the environment first. Shows the paths and asks before deleting; without
     /// a terminal, requires --yes. --dry-run only previews.
+    ///
+    /// With no NAME, works on this workspace's environment, from its config. NAME instead
+    /// prunes one by the identity `vk dev list` gives it, host-wide and without a config —
+    /// what to remove is read from what that environment recorded when it last booted.
     Prune {
+        /// the environment to prune, as `vk dev list` names it [default: this workspace's]
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
         #[command(flatten)]
         options: super::prune::Options,
     },
@@ -665,6 +672,18 @@ async fn dev_action(
     {
         return dev_gc(yes, all_stale, &names);
     }
+    // Like named stops, named prunes use host state and work from another or deleted
+    // workspace. Select from the recorded boot state without resolving a config.
+    if let DevAction::Prune {
+        name: Some(name),
+        options,
+    } = &action
+    {
+        return match super::prune::run_by_name(name, options) {
+            Ok(report) => write_report(&report),
+            Err(e) => fail(&e, 1),
+        };
+    }
     // A config that cannot be read or does not describe something virtkit can build is the
     // caller's to fix, like a usage error.
     let loaded = match config::discover(&cwd, workspace, config).and_then(config::load) {
@@ -676,7 +695,10 @@ async fn dev_action(
         Err(e) => return fail(&e, 2),
     };
     match action {
-        DevAction::Prune { options } => match super::prune::run(&plan, &options) {
+        DevAction::Prune {
+            name: None,
+            options,
+        } => match super::prune::run(&plan, &options) {
             Ok(report) => write_report(&report),
             Err(e) => fail(&e, 1),
         },
@@ -1065,6 +1087,7 @@ async fn dev_action(
         | DevAction::List { .. }
         | DevAction::Gc { .. }
         | DevAction::Stop { name: Some(_), .. }
+        | DevAction::Prune { name: Some(_), .. }
         | DevAction::Schema => {
             unreachable!("handled before the plan is resolved")
         }
@@ -1366,6 +1389,18 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(base.join("known").is_dir());
+    }
+
+    #[test]
+    fn prune_takes_an_optional_name_selector() {
+        assert!(matches!(
+            parse(&["vk", "dev", "prune"]).action,
+            DevAction::Prune { name: None, .. }
+        ));
+        assert!(matches!(
+            parse(&["vk", "dev", "prune", "myenv-1a2b", "--all"]).action,
+            DevAction::Prune { name: Some(n), .. } if n == "myenv-1a2b"
+        ));
     }
 
     #[test]
