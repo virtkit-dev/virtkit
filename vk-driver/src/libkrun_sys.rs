@@ -31,8 +31,8 @@ use anyhow::{Context, Result, bail};
 // (rlib -> shares virtkit's std; compiler-checked signatures). Every call returns
 // >= 0 on success, a negative errno on failure.
 use krun::{
-    KRUN_EXIT_GUEST_RESET, krun_add_disk2, krun_add_net_tap, krun_add_net_unixstream2,
-    krun_add_virtiofs6, krun_add_vsock_port2, krun_create_ctx, krun_disable_balloon,
+    KRUN_EXIT_GUEST_RESET, krun_add_disk3, krun_add_net_tap, krun_add_net_unixstream2,
+    krun_add_virtiofs7, krun_add_vsock_port2, krun_create_ctx, krun_disable_balloon,
     krun_disable_implicit_init, krun_get_shutdown_eventfd, krun_init_log,
     krun_set_block_dirty_socket, krun_set_console_output, krun_set_kernel, krun_set_nested_virt,
     krun_set_pmu, krun_set_vm_config, krun_start_enter,
@@ -234,7 +234,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         for share in &spec.shares {
             let tag = cstr(&share.tag);
             let dir = cstr(&share.host_dir.to_string_lossy());
-            // The id-map rules for this share, joined by ',' as krun_add_virtiofs6 expects;
+            // The id-map rules for this share, joined by ',' as krun_add_virtiofs7 expects;
             // an empty map yields an empty string, which the FFI treats as an identity map.
             let uid_map = cstr(&share.uid_map.join(","));
             let gid_map = cstr(&share.gid_map.join(","));
@@ -247,8 +247,8 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
             let dax_inode_min = share.dax.and_then(|d| d.inode_min).unwrap_or(0);
             let (entry_ms, attr_ms, negative_ms) = share.cache.timeouts_ms();
             ck(
-                "krun_add_virtiofs6",
-                krun_add_virtiofs6(
+                "krun_add_virtiofs7",
+                krun_add_virtiofs7(
                     ctx,
                     tag.as_ptr(),
                     dir.as_ptr(),
@@ -262,6 +262,8 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
                     attr_ms,
                     negative_ms,
                     share.cache.xattr(),
+                    share.cache.writeback(),
+                    share.cache.no_sync(),
                 ),
             )?;
         }
@@ -570,8 +572,18 @@ unsafe fn add_disk(ctx: u32, index: usize, disk: &Disk) -> Result<()> {
         crate::vmm::DiskFormat::Qcow2 => KRUN_DISK_FORMAT_QCOW2,
         crate::vmm::DiskFormat::VkLazyChunks => KRUN_DISK_FORMAT_VK_LAZY_CHUNKS,
     };
-    ck("krun_add_disk2", unsafe {
-        krun_add_disk2(ctx, block_id.as_ptr(), path.as_ptr(), format, disk.readonly)
+    // Use the host page cache (no direct I/O) and the disk's sync mode. Throwaway overlays
+    // offer the guest no FLUSH.
+    ck("krun_add_disk3", unsafe {
+        krun_add_disk3(
+            ctx,
+            block_id.as_ptr(),
+            path.as_ptr(),
+            format,
+            disk.readonly,
+            false,
+            disk.sync.krun_code(),
+        )
     })?;
     // Dirty-block tracking (build stages): serve the drain protocol on the given socket so a
     // checkpoint captures only the delta. Set only on the writable stage overlay.

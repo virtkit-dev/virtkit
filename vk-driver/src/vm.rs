@@ -1220,12 +1220,14 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         // Behind the overlay the host tree is read-only for the whole job (prepare wrote it,
         // nothing on the host touches it until cleanup), so the guest may keep every entry,
         // attribute and miss it fetched: a tree-wide pass — git status, a build tool's
-        // dependency check — round-trips to the host once instead of once per pass. A
-        // read-write share is the guest's and the host's at once, so it keeps the default.
+        // dependency check — round-trips to the host once instead of once per pass. Exported
+        // read-write instead, the tree is the guest's alone for the job — the host only resets
+        // it for the next one — so it caches the same way and skips every flush and fsync
+        // besides: its writes need survive neither the job nor a host crash.
         let cache = if overlay {
             crate::vmm::ShareCache::Immutable
         } else {
-            crate::vmm::ShareCache::Auto
+            crate::vmm::ShareCache::Ephemeral
         };
 
         if !crate::vmm::libkrun_selected() {
@@ -1486,7 +1488,10 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // kernel is common; the boot medium is the CoW disk overlay plus a
     // self-booting image's initrd. A generic guest on the pinned kernel ships
     // no initrd (virtio-blk + ext4 built in).
-    let disks = vec![crate::vmm::Disk::overlay(overlay.clone())];
+    // The overlay is deleted with the job, so it offers the guest no FLUSH: each fsync a
+    // package manager or build tool issues per file would otherwise be a host fsync plus
+    // qcow2 metadata writeback, for data nobody keeps.
+    let disks = vec![crate::vmm::Disk::overlay(overlay.clone()).ephemeral()];
 
     // shared=on (set via shared_mem): required by virtio-fs, harmless without.
     // vsock ports the guest uses: the exec channel always, plus the switch bridge in

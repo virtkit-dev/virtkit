@@ -1526,6 +1526,21 @@ enum Cmd {
         /// The command's outputs then land back on the host.
         #[arg(long, value_name = "DIR", help_heading = "Running the command")]
         workdir: Option<PathBuf>,
+        /// How the --workdir share is cached: auto or ephemeral
+        ///
+        /// `auto` keeps host edits visible in the guest within seconds. `ephemeral` treats
+        /// the tree as the guest's alone for this run — cached for its whole life, writes
+        /// coalesced, no flush or fsync — for a scratch checkout, or a build whose outputs
+        /// are read only after the VM exits.
+        #[arg(
+            long,
+            value_enum,
+            value_name = "MODE",
+            default_value = "auto",
+            requires = "workdir",
+            help_heading = "Running the command"
+        )]
+        workdir_cache: crate::vmm::ShareCache,
         /// Drop into an interactive shell in the guest
         ///
         /// Requires a terminal; ignores any trailing command.
@@ -2889,6 +2904,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         build_allow_ip,
         build_allow_name,
         workdir,
+        workdir_cache,
         kernel,
         console_serial,
         pmu,
@@ -3076,6 +3092,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             cache,
             build_args,
             workdir: workdir.clone(),
+            workdir_cache: *workdir_cache,
             kernel: kernel.clone(),
             console_serial: *console_serial,
             pmu: *pmu,
@@ -5599,6 +5616,67 @@ mod tests {
             panic!("--numa node1 must be rejected")
         };
         assert!(err.to_string().contains("off, auto, interleave"), "{err}");
+    }
+
+    /// `--workdir-cache` parses into `ShareCache` and defaults to `Auto`. An explicit value
+    /// requires `--workdir`; internal-only `Immutable` and unknown modes are rejected.
+    #[test]
+    fn run_workdir_cache_maps_to_share_cache_and_requires_workdir() {
+        let cache_of = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Cmd::Run { workdir_cache, .. } = cli.cmd else {
+                panic!("expected Cmd::Run")
+            };
+            workdir_cache
+        };
+        assert_eq!(
+            cache_of(&["vk", "run", "debian:12"]),
+            crate::vmm::ShareCache::Auto
+        );
+        assert_eq!(
+            cache_of(&["vk", "run", "--workdir", "/w", "debian:12"]),
+            crate::vmm::ShareCache::Auto
+        );
+        assert_eq!(
+            cache_of(&[
+                "vk",
+                "run",
+                "--workdir",
+                "/w",
+                "--workdir-cache",
+                "ephemeral",
+                "debian:12"
+            ]),
+            crate::vmm::ShareCache::Ephemeral
+        );
+        assert!(
+            Cli::try_parse_from(["vk", "run", "--workdir-cache", "ephemeral", "debian:12"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vk",
+                "run",
+                "--workdir",
+                "/w",
+                "--workdir-cache",
+                "immutable",
+                "debian:12"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "vk",
+                "run",
+                "--workdir",
+                "/w",
+                "--workdir-cache",
+                "bogus",
+                "debian:12"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

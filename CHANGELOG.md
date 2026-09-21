@@ -4,6 +4,17 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- `vk run --workdir-cache ephemeral` trades write durability for speed on a `--workdir`
+  share whose files are the guest's alone during the run and are read only after the VM
+  exits. Not for a workdir the host edits while the run is in flight.
+
+### Changed
+
+- CI jobs whose checkout is thrown away after the run are faster: write-heavy builds no
+  longer wait on the host to durably store files that the job discards when it ends.
+
 ## [0.75.0] - 2026-09-21
 
 ### Added

@@ -249,6 +249,11 @@ pub struct RunArgs {
     /// host dir shared read-write into the guest (at WORKDIR_MOUNT); the command runs
     /// there, so its outputs land back on the host. `None` = no share.
     pub workdir: Option<PathBuf>,
+    /// How the `--workdir` share is cached: `Auto` (the default) keeps host edits visible
+    /// within seconds; `Ephemeral` treats the tree as the guest's alone for the run and
+    /// skips every flush and fsync — for a scratch checkout, or a build whose outputs are
+    /// read only after the VM exits.
+    pub workdir_cache: crate::vmm::ShareCache,
     /// Which kernel the guest boots on: virtkit's pinned kernel (`Default`), the
     /// image's own kernel + modules (`Image`), or an explicit kernel file (`Path`).
     pub kernel: KernelSource,
@@ -435,6 +440,7 @@ impl Default for RunArgs {
             cache: Default::default(),
             build_args: Vec::new(),
             workdir: None,
+            workdir_cache: crate::vmm::ShareCache::Auto,
             kernel: KernelSource::Default,
             console_serial: false,
             pmu: false,
@@ -1795,7 +1801,7 @@ async fn build_and_boot(
                 false,
                 &[],
                 &[],
-                crate::vmm::ShareCache::Auto,
+                args.workdir_cache,
                 crate::prio::Prio::Normal,
             )?);
         }
@@ -1808,7 +1814,7 @@ async fn build_and_boot(
             dax,
             uid_map: Vec::new(),
             gid_map: Vec::new(),
-            cache: crate::vmm::ShareCache::Auto,
+            cache: args.workdir_cache,
         });
     }
     // A --primary primary gets its compose volumes, and any primary its `--volume`
@@ -4393,6 +4399,7 @@ pub(crate) async fn boot_session(
             format,
             readonly: true,
             dirty_control_socket: None,
+            sync: crate::vmm::DiskSync::Full,
         });
     }
     // Disk-backed /tmp for the build guest (the default; off under --build-tmp-tmpfs): a sparse
@@ -4404,11 +4411,14 @@ pub(crate) async fn boot_session(
     // so we simply attach no device and set no cmdline var.
     let tmp_dev = tmp_disk.map(|path| {
         let dev = crate::build::vd_name(disks.len());
+        // Scratch that never enters a snapshot: a guest reboot keeps it (the host page cache
+        // does), a host crash loses only a build in progress, so no FLUSH is offered.
         disks.push(crate::vmm::Disk {
             path: path.to_path_buf(),
             format: crate::vmm::DiskFormat::Raw,
             readonly: false,
             dirty_control_socket: None,
+            sync: crate::vmm::DiskSync::None,
         });
         dev
     });
@@ -4423,6 +4433,7 @@ pub(crate) async fn boot_session(
             format: crate::vmm::DiskFormat::Raw,
             readonly: false,
             dirty_control_socket: None,
+            sync: crate::vmm::DiskSync::None,
         });
         format!("/dev/{dev}")
     });
@@ -5189,6 +5200,7 @@ mod tests {
             ("kernel", "default".to_string()),
             ("init", "default".to_string()),
             ("build_net", "all".to_string()),
+            ("workdir_cache", "auto".to_string()),
         ]
         .into_iter()
         .collect();
@@ -5930,6 +5942,7 @@ mod tests {
                 format: crate::vmm::DiskFormat::Raw,
                 readonly: true,
                 dirty_control_socket: None,
+                sync: crate::vmm::DiskSync::Full,
             }],
             initramfs: None,
             shares: Vec::new(),

@@ -87,6 +87,37 @@ pub struct Disk {
     /// on this Unix socket so a checkpoint captures only the delta. `None` = untracked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dirty_control_socket: Option<PathBuf>,
+    /// Guest FLUSH handling; see [`DiskSync`]. Defaults to `Full` for non-throwaway disks.
+    #[serde(default)]
+    pub sync: DiskSync,
+}
+
+/// How the VMM honours the guest's FLUSH requests on a disk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DiskSync {
+    /// Every guest FLUSH is an `fsync` of the image: the disk survives a host crash.
+    #[default]
+    Full,
+    /// The disk offers the guest no FLUSH at all, so nothing is ever synced to the host:
+    /// for an image discarded when the VM exits (a job's CoW overlay), where each `fsync` a
+    /// package manager or build tool issues per file would be a host `fsync` plus qcow2
+    /// metadata writeback for data nobody keeps.
+    None,
+}
+
+/// libkrun's `krun_add_disk3` sync-mode codes (`SyncMode::try_from` in the vendored block
+/// device's `mod.rs`): 0 = none, 1 = relaxed, 2 = full.
+const KRUN_DISK_SYNC_NONE: u32 = 0;
+const KRUN_DISK_SYNC_FULL: u32 = 2;
+
+impl DiskSync {
+    /// libkrun's `krun_add_disk3` sync-mode code for this setting.
+    pub fn krun_code(self) -> u32 {
+        match self {
+            DiskSync::None => KRUN_DISK_SYNC_NONE,
+            DiskSync::Full => KRUN_DISK_SYNC_FULL,
+        }
+    }
 }
 
 impl Disk {
@@ -97,6 +128,7 @@ impl Disk {
             format: DiskFormat::Qcow2,
             readonly: false,
             dirty_control_socket: None,
+            sync: DiskSync::Full,
         }
     }
 
@@ -110,6 +142,7 @@ impl Disk {
             format: DiskFormat::Raw,
             readonly,
             dirty_control_socket: None,
+            sync: DiskSync::Full,
         }
     }
 
@@ -131,12 +164,19 @@ impl Disk {
             format,
             readonly,
             dirty_control_socket: None,
+            sync: DiskSync::Full,
         })
     }
 
     /// Enable dirty-block tracking, serving the drain protocol on `socket` (libkrun only).
     pub fn with_dirty_control(mut self, socket: PathBuf) -> Self {
         self.dirty_control_socket = Some(socket);
+        self
+    }
+
+    /// Mark the disk a throwaway: no FLUSH offered to the guest, nothing synced to the host.
+    pub fn ephemeral(mut self) -> Self {
+        self.sync = DiskSync::None;
         self
     }
 
@@ -373,25 +413,48 @@ pub struct FsShare {
 /// virtualization. A tree-wide pass (`git status`, a build system's dependency check, a
 /// linter walking the sources) is tens of thousands of them, and with [`ShareCache::Auto`]
 /// it pays them again on every pass once the 5-second validity has lapsed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
 pub enum ShareCache {
-    /// Close-to-open consistency: entries and attributes stay valid for seconds, misses are
-    /// not cached, so a change the host makes shows in the guest promptly. For any tree the
-    /// host may touch while the VM runs.
+    /// Close-to-open consistency, for a tree the host may change while the VM runs.
+    ///
+    /// Entries and attributes stay valid for seconds and misses are not cached, so a change
+    /// the host makes shows in the guest promptly.
     #[default]
     Auto,
     /// The host does not change the tree while it is shared, so the guest keeps every entry,
     /// attribute, miss, directory listing and page it fetched for the life of the VM: a pass over the tree
     /// round-trips once, not once per pass. Choose it only for trees that are read-only on the
     /// host side for the VM's whole life (a job's checkout behind an overlay).
+    // Internal only; excluded from `--workdir-cache`.
+    #[value(skip)]
     Immutable,
+    /// A throwaway tree the guest alone writes: cached, with writeback and no fsync.
+    ///
+    /// The guest is the tree's only writer while it is shared, and the tree is discarded
+    /// with the VM: a CI job's scratch, or a build whose outputs are copied out before the
+    /// VM exits. Cached like [`ShareCache::Immutable`] — the guest's own writes are the only
+    /// changes, so its cache is never stale — plus the FUSE writeback cache (writes coalesce
+    /// and flush on close instead of round-tripping each one) and no durability work at all:
+    /// `flush`/`fsync` are declined as unsupported, so the guest stops sending them. Wrong for
+    /// any tree the host edits, or must keep across a host crash.
+    Ephemeral,
 }
 
 /// How long an [`ShareCache::Immutable`] share's entries, attributes and misses stay valid:
 /// longer than any VM here lives, and a bound the kernel keeps in jiffies without overflow.
 const IMMUTABLE_TIMEOUT_MS: u32 = 86_400_000;
 
-/// libkrun's `krun_add_virtiofs6` cache ABI (`krun::KRUN_FS_CACHE_*`,
+/// libkrun's `krun_add_virtiofs7` cache ABI (`krun::KRUN_FS_CACHE_*`,
 /// `krun::KRUN_FS_TIMEOUT_DEFAULT_MS`), mirrored so the virtiofsd path can name these codes
 /// without the optional `libkrun` feature. The assertion below fails the build if they drift.
 const KRUN_CACHE_AUTO: u32 = 1;
@@ -406,11 +469,11 @@ const _: () = {
 };
 
 impl ShareCache {
-    /// libkrun's `krun_add_virtiofs6` cache-policy code for this mode.
+    /// libkrun's `krun_add_virtiofs7` cache-policy code for this mode.
     pub fn krun_policy(self) -> u32 {
         match self {
             ShareCache::Auto => KRUN_CACHE_AUTO,
-            ShareCache::Immutable => KRUN_CACHE_ALWAYS,
+            ShareCache::Immutable | ShareCache::Ephemeral => KRUN_CACHE_ALWAYS,
         }
     }
 
@@ -418,7 +481,7 @@ impl ShareCache {
     pub fn timeouts_ms(self) -> (u32, u32, u32) {
         match self {
             ShareCache::Auto => (KRUN_TIMEOUT_DEFAULT_MS, KRUN_TIMEOUT_DEFAULT_MS, 0),
-            ShareCache::Immutable => (
+            ShareCache::Immutable | ShareCache::Ephemeral => (
                 IMMUTABLE_TIMEOUT_MS,
                 IMMUTABLE_TIMEOUT_MS,
                 IMMUTABLE_TIMEOUT_MS,
@@ -438,8 +501,21 @@ impl ShareCache {
     pub fn xattr(self) -> bool {
         match self {
             ShareCache::Auto => true,
-            ShareCache::Immutable => false,
+            ShareCache::Immutable | ShareCache::Ephemeral => false,
         }
+    }
+
+    /// Whether the guest negotiates the FUSE writeback cache for this share: only when the
+    /// guest is the tree's sole writer, so the writes it holds back can never be overtaken
+    /// by a host change.
+    pub fn writeback(self) -> bool {
+        matches!(self, ShareCache::Ephemeral)
+    }
+
+    /// Whether the share drops durability: `flush`/`fsync` declined as unsupported, so the
+    /// guest stops sending them. Only for a tree discarded with the VM.
+    pub fn no_sync(self) -> bool {
+        matches!(self, ShareCache::Ephemeral)
     }
 
     /// Arguments for the bundled `vk virtiofsd` to serve this cache mode.
@@ -447,7 +523,7 @@ impl ShareCache {
         let (entry, attr, negative) = self.timeouts_ms();
         let policy = match self {
             ShareCache::Auto => "auto",
-            ShareCache::Immutable => "always",
+            ShareCache::Immutable | ShareCache::Ephemeral => "always",
         };
         let mut args = vec![
             format!("--cache={policy}"),
@@ -1271,6 +1347,13 @@ mod tests {
         );
         assert!(ShareCache::Auto.xattr());
         assert!(!ShareCache::Immutable.xattr());
+        // An ephemeral share caches like an immutable one and adds the write-side savings.
+        assert_eq!(ShareCache::Ephemeral.krun_policy(), KRUN_CACHE_ALWAYS);
+        assert_eq!(ShareCache::Ephemeral.timeouts_ms(), (day, day, day));
+        assert!(!ShareCache::Ephemeral.xattr());
+        assert!(ShareCache::Ephemeral.writeback() && ShareCache::Ephemeral.no_sync());
+        assert!(!ShareCache::Auto.writeback() && !ShareCache::Auto.no_sync());
+        assert!(!ShareCache::Immutable.writeback() && !ShareCache::Immutable.no_sync());
         assert!(
             !ShareCache::Auto
                 .virtiofsd_args()
@@ -1452,6 +1535,7 @@ mod tests {
                     format: DiskFormat::Raw,
                     readonly: true,
                     dirty_control_socket: None,
+                    sync: DiskSync::Full,
                 },
             ],
             initramfs: Some("/w/initramfs.cpio".into()),
