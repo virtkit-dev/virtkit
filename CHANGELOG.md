@@ -11,6 +11,15 @@ All notable changes to virtkit will be documented in this file.
   watched first. A job can turn it on with `MICROVM_EGRESS_DRY_RUN` when the host sets no
   run-phase allowlist of its own. Pair it with `audit = true` to see both allowed and denied
   traffic.
+- **CI jobs wait for disk space as well as memory.** Jobs running at once could fill the
+  filesystem holding the runner's job dirs and fail every job on it. A job now waits to boot,
+  saying so in its trace, until that filesystem has room for what it needed on recent runs
+  alongside what the jobs already running there still need; a job with the filesystem to
+  itself never waits for disk. **On by default**, with or without a memory budget. A job this
+  host has no history of is expected to need **8 GiB**, or the whole filesystem if smaller, so
+  a host whose job dirs sit on a small filesystem runs fewer jobs at once until each has run.
+  `[executor.schedule] disk_admission = false` turns it off; `disk_default` sets that 8 GiB,
+  and one set larger than the filesystem fails those jobs at once.
 - **CI jobs report how much disk their job dir took.** A job's trace line on what it has used
   lately and `vk gitlab usage` now show the most its dir on the host has held.
 

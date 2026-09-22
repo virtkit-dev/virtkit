@@ -192,6 +192,9 @@ pub enum IoNice {
 ///
 /// The budget is guest RAM, not host RAM: leave the difference for the VMMs themselves, the
 /// tmpfs a `checkout_dir` may sit on, and everything else on the box.
+///
+/// Disk admission (`disk_admission`) keeps the filesystem the job dirs share from filling the
+/// same way, and needs no budget: the filesystem's size is the budget.
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Schedule {
@@ -209,6 +212,21 @@ pub struct Schedule {
     /// which GitLab retries when the job asks it to (`retry: { when: runner_system_failure }`)
     /// — set that on jobs you would rather see land on another runner than fail. Default 600.
     pub wait_timeout_secs: Option<u64>,
+    /// Also hold a job back until the filesystem holding the job dirs (`<state_dir>/jobs`) has
+    /// room for what its dir is expected to grow to — the rootfs overlay its guest writes, above
+    /// all — on top of what the jobs already admitted there have yet to write. The expectation
+    /// is the most its dir has held lately plus headroom (capped at the filesystem's size), or
+    /// `disk_default` before it has a history. Its own test asks for at most what could come
+    /// free (what is free now plus what the other admitted jobs' dirs hold), so a job alone on
+    /// the filesystem never waits for disk; its claim on the ledger is still its full
+    /// expectation. Free space is read off the filesystem, so whatever else fills it counts too.
+    /// Independent of `mem_budget`; shares its queue and `wait_timeout_secs`. Default on;
+    /// `false` turns it off.
+    pub disk_admission: Option<bool>,
+    /// What a job with no history of its own is expected to write into its job dir, as
+    /// `"<n>G"`. Set larger than the filesystem, every such job fails at once. Default `"8G"`,
+    /// capped at the filesystem's size.
+    pub disk_default: Option<String>,
 }
 
 /// `[numa]` — NUMA placement for every VM this host boots. On a multi-socket host a VM whose
@@ -1147,6 +1165,8 @@ mod tests {
             ssh_agent = true
             [executor.schedule]
             mem_budget = "48G"
+            disk_admission = false
+            disk_default = "20G"
             "#,
         )
         .unwrap();
@@ -1157,6 +1177,8 @@ mod tests {
         let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back.executor.vm.cpus, 6);
         assert_eq!(back.executor.schedule.mem_budget.as_deref(), Some("48G"));
+        assert_eq!(back.executor.schedule.disk_admission, Some(false));
+        assert_eq!(back.executor.schedule.disk_default.as_deref(), Some("20G"));
     }
 
     /// `[numa]` is host-wide — it governs every VM, not just the CI executor's — so it sits

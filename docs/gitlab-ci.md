@@ -780,10 +780,11 @@ virtkit: job resource usage: cpu 2m14s, peak memory 1.6 GiB, overlay 1.2 GiB of 
 virtkit: most this job has used lately: memory 2.1 GiB, overlay 1.9 GiB of 16.0 GiB, job dir 6.4 GiB, read 12.0 GiB, written 3.1 GiB, sent 40 MiB, received 4.2 GiB over 37 runs; the next run reserves 2.6 GiB
 ```
 
-Only the memory is reserved against; the writable layer, the job dir and the traffic ride along
-because a job that fills its overlay or pulls 4 GiB in and out of the host every run is a fact
-about the host worth knowing. Each figure is its own maximum over the window, so they need not
-all come from the same run.
+Only the memory and the job dir are reserved against — the job dir by disk admission (see
+[Keeping the job dirs' disk from filling](#keeping-the-job-dirs-disk-from-filling)); the
+writable layer and the traffic ride along because a job that fills its overlay or pulls 4 GiB
+in and out of the host every run is a fact about the host worth knowing. Each figure is its
+own maximum over the window, so they need not all come from the same run.
 
 The run count is what the estimate rests on: the runs of the last 14 days, or the last five
 however old for a job too quiet to have that many. The `; the next run reserves …` clause
@@ -899,6 +900,59 @@ the node that asked, `numa_miss` and `other_node`. A placed VM concentrates its 
 node and stops growing `other_node`; an interleaved one splits them evenly. Check the
 `virtkit: NUMA:` line first when a run measures the same either way: a VM wider than a node is
 interleaved in both, and interleaving is not what the comparison is testing.
+
+### Keeping the job dirs' disk from filling
+
+Each job's dir under `<state_dir>/jobs` holds its rootfs overlay — every write the guest makes
+outside its checkout lands there — along with the checkout packed for the guest and the logs.
+Overlays grow while jobs run, so a filesystem that fits every job at boot can be full an hour
+later, and then every job on it fails.
+
+So a job also claims room there before it boots, and waits for it as it waits for memory:
+
+```toml
+[executor.schedule]
+disk_admission = true     # the default; false turns it off
+disk_default = "8G"       # what a job with no history of its own is expected to write;
+                          # unset, 8G or the filesystem's size, whichever is smaller
+```
+
+A job is expected to need the most its dir has held at the end of its recent runs plus 25%,
+under the same window and ceiling rule as a memory reservation from history (whether or not
+`from_history` is on), or `disk_default` until it has a history. It is admitted once the
+filesystem's free space covers that plus what the jobs already admitted there have yet to
+write: each one's expectation less what its dir holds now, which is already gone from the free
+space. A job with no other claim on the filesystem never waits for disk, whatever it expects,
+and beside other claims its own test asks for no more than could come free (what is free now
+plus what the other admitted jobs' dirs hold): a job that last filled the whole filesystem
+would otherwise wait for room that can never appear. Once admitted it still claims its full
+expectation on the ledger, so the jobs after it are held back by all it is expected to write.
+It needs no `mem_budget`, and shares the oldest-first queue and `wait_timeout_secs` with memory
+admission:
+
+```
+virtkit: waiting for 25.0 GiB of room in /var/lib/virtkit/jobs (31.2 GiB free, 18.5 GiB still to be written by the jobs admitted there, 0 job(s) asked first)
+virtkit: admitted after waiting 412s for disk space
+```
+
+A `disk_default` set larger than the filesystem can never be admitted, and fails every job
+without a history at once. Left unset it is capped at the filesystem's size, as an expectation
+from history is, so a host whose job dirs sit on a small filesystem runs its new jobs fewer at
+a time rather than not at all.
+
+Only what lands in a job's own dir, `<state_dir>/jobs/<job id>`, is claimed. Anything else a job
+writes to the same filesystem — a host checkout without `checkout_overlay`, the `atop` archive,
+when `state_dir` puts them there — is seen only as free space already gone when the next job is
+checked. So is anything outside virtkit.
+
+This bounds what the expectations say, not what jobs do: a job that writes far more than it
+ever has can still fill the filesystem, as can the first runs of jobs this host has no history
+of. It counts bytes, not inodes: a job that creates millions of small files can run the
+filesystem out of inodes with space to spare. A prepare that finds it full fails naming the
+filesystem and how much of it is used.
+
+While a host is upgraded, a job prepared by an older `vk` neither claims disk nor waits for it;
+disk admission covers the host once every job it has running was prepared by this version.
 
 ### What admission does not do
 

@@ -293,3 +293,13 @@
 #                        # pipelines have been measured.
 # wait_timeout_secs = 600  # then the job fails as a *system* failure, which GitLab retries
 #                        # for jobs that ask (`retry: { when: runner_system_failure }`)
+# disk_admission = true  # also wait until the filesystem holding <state_dir>/jobs has room
+#                        # for what this job's dir is expected to grow to (its rootfs overlay,
+#                        # above all), on top of what the jobs admitted there have yet to
+#                        # write. Expected: the most its dir held lately + 25%, or
+#                        # disk_default before it has a history; a job alone on it never
+#                        # waits for disk, though what it claims is its full expectation.
+#                        # On without a mem_budget too; false turns it off
+# disk_default = "8G"    # what a job with no history is expected to write into its job dir.
+#                        # Unset: 8G, capped at the filesystem's size; set larger than the
+#                        # filesystem, such jobs fail at once

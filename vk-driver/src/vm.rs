@@ -343,6 +343,12 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // Same fail-fast rationale for the writable-layer size: it is pure config, and the
     // authoritative check runs in the detached supervisor whose log the job never sees.
     checkout_overlay_size(&cfg.executor.checkout_overlay_size)?;
+    // And `[executor] atop_interval_secs`, before admission can hold a misconfigured job in
+    // the queue for its whole wait.
+    let atop_interval = match crate::atop::enabled(cfg) {
+        true => Some(crate::atop::interval_secs(cfg)?),
+        false => None,
+    };
 
     // A leftover job (failed cleanup, retried job id) must not leak: signal its
     // supervisor — everything it owns cascades by PDEATHSIG — and drop the state. Done before
@@ -357,14 +363,19 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         .with_context(|| format!("creating {}", ctx.job_dir.display()))
         .map_err(|e| name_full_fs(e, ctx.jobs_dir()))?;
 
+    // Admission (`[executor.schedule]`): claim the guest RAM this job is about to boot and the
+    // room its job dir will grow into before booting it, waiting for both on a full host. Held
+    // for the rest of prepare; the supervisor takes its own hold on the same reservation, so it
+    // never lapses between the two. After the stale-job teardown above, which frees a
+    // predecessor's claim, and before anything is written into the job dir.
+    let _reservation = admit(ctx, &mem)?;
+
     // [executor] atop: give this job somewhere to record what its guest does, and remember
     // where — the supervisor shares that directory into the guest, and the last stage
-    // reports the log's path. Validated here (a job-visible error names the setting) but
-    // otherwise fatal only for a full job dirs' filesystem, which has no room for the overlay
-    // either: a host whose archive cannot be written still runs jobs, unrecorded but for the
-    // warning.
-    if crate::atop::enabled(cfg) {
-        let interval = crate::atop::interval_secs(cfg)?;
+    // reports the log's path. Fatal only for a full job dirs' filesystem, which has no room for
+    // the overlay either: a host whose archive cannot be written still runs jobs, unrecorded but
+    // for the warning.
+    if let Some(interval) = atop_interval {
         // Bound what the archive costs the host before adding a job to it.
         crate::atop::prune_archive_daily(cfg);
         // Each failure paired with whether it was a write to the job dirs' filesystem: the
@@ -393,12 +404,6 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             Err((e, _)) => eprintln!("virtkit: warning: not recording guest stats: {e:#}"),
         }
     }
-
-    // Memory admission (`[executor.schedule] mem_budget`): claim the guest RAM this job is about to
-    // boot before booting it, waiting for room on a full host. Held for the rest of prepare;
-    // the supervisor takes its own hold on the same reservation, so it never lapses between
-    // the two. After the stale-job teardown above, which frees a predecessor's claim.
-    let _reservation = admit_memory(ctx, &mem)?;
 
     // [executor] host_checkout: check the sources out on the host NOW — before resolving the
     // image (a `dockerfile:`/`compose:` image is built from these sources) and before the
@@ -1231,9 +1236,9 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // base out from under a running overlay. A shared advisory lock the kernel drops when
     // this process exits — held in this Vec until supervise returns (job teardown).
     let mut use_guards: Vec<crate::cachelock::Guard> = Vec::new();
-    // The other half of the memory reservation prepare took (see admit): held here for the
-    // job's whole life, so what this job booted keeps counting against the host budget until
-    // the VM is gone. `None` when admission is off.
+    // The other half of the admission reservation prepare took (see admit): held here for the
+    // job's whole life, so the memory and disk this job claimed keep counting until the VM is
+    // gone. `None` when admission is off.
     let reservation = crate::admit::hold(&ctx.admit_dir(), &ctx.job_id);
     // Record placement in the reservation this supervisor holds for the VM's lifetime.
     let placement = job_placement(ctx, reservation.as_ref(), cpus).unwrap_or_else(|e| {
@@ -2441,20 +2446,34 @@ pub(crate) fn declared_mem_mib(ctx: &JobCtx) -> Result<u64> {
         .context("guest memory size is absurdly large")
 }
 
-/// Reserve this job's guest RAM against the host's `[executor.schedule] mem_budget`, blocking until
-/// there is room for it (see admit). `None` when no budget is configured — the host then
-/// admits every job the runner hands it, as it did before. A job that never gets room fails
-/// prepare, which exits `SYSTEM_FAILURE_EXIT_CODE`: a system failure, not the job's fault.
-fn admit_memory(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservation>> {
-    let Some(budget) = budget_mib(&ctx.cfg) else {
-        return Ok(None);
-    };
-    let budget_mib = budget?;
-    let timeout = Duration::from_secs(ctx.cfg.executor.schedule.wait_timeout_secs.unwrap_or(600));
+/// Reserve this job's guest RAM against the host's `[executor.schedule] mem_budget`, and room for
+/// its job dir on the filesystem holding it (`disk_admission`), blocking until there is room for
+/// both (see admit). `None` when both are off — the host then admits every job the runner hands
+/// it. A job that never gets room fails prepare, which exits `SYSTEM_FAILURE_EXIT_CODE`: a
+/// system failure, not the job's fault.
+fn admit(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservation>> {
     let declared_mib = parse_gib(mem)
         .context("invalid guest memory size")?
         .checked_mul(1024)
         .context("guest memory size is absurdly large")?;
+    let ask = crate::admit::Ask {
+        mem: admit_memory(ctx, declared_mib)?,
+        disk: admit_disk(ctx, declared_mib)?,
+    };
+    if ask.mem.is_none() && ask.disk.is_none() {
+        return Ok(None);
+    }
+    let timeout = Duration::from_secs(ctx.cfg.executor.schedule.wait_timeout_secs.unwrap_or(600));
+    let reservation = crate::admit::acquire(&ctx.admit_dir(), &ctx.job_id, &ask, timeout)?;
+    Ok(Some(reservation))
+}
+
+/// This job's share of `[executor.schedule] mem_budget`, or `None` when no budget is configured.
+fn admit_memory(ctx: &JobCtx, declared_mib: u64) -> Result<Option<crate::admit::MemAsk>> {
+    let Some(budget) = budget_mib(&ctx.cfg) else {
+        return Ok(None);
+    };
+    let budget_mib = budget?;
     // `[executor.schedule] from_history`: reserve what this job has been using rather than what it
     // declares. Announced, because it is the difference between a job waiting and not.
     let want_mib = match ctx.cfg.executor.schedule.from_history {
@@ -2472,10 +2491,51 @@ fn admit_memory(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservat
             .unwrap_or(declared_mib),
         false => declared_mib,
     };
-    let reservation =
-        crate::admit::acquire(&ctx.admit_dir(), &ctx.job_id, want_mib, budget_mib, timeout)?;
-    Ok(Some(reservation))
+    Ok(Some(crate::admit::MemAsk {
+        want_mib,
+        budget_mib,
+    }))
 }
+
+/// What this job's dir is expected to grow to, for `[executor.schedule] disk_admission`: from
+/// its history where it has one, else `disk_default`. `None` when disk admission is off.
+fn admit_disk(ctx: &JobCtx, declared_mib: u64) -> Result<Option<crate::admit::DiskAsk<'_>>> {
+    let schedule = &ctx.cfg.executor.schedule;
+    if !schedule.disk_admission.unwrap_or(true) {
+        return Ok(None);
+    }
+    let jobs = ctx.jobs_dir();
+    let total = crate::usage::fs_space(jobs)
+        .with_context(|| format!("reading the free space of {}", jobs.display()))?
+        .total;
+    // Resolved whether or not this job needs it, so a mistyped setting fails the first job
+    // rather than the first one without a history, days later.
+    let default = disk_default(schedule.disk_default.as_deref(), total)?;
+    let want = crate::admit::expect_disk(&ctx.history_dir(), &ctx.usage_key(), declared_mib, total)
+        .unwrap_or(default);
+    Ok(Some(crate::admit::DiskAsk { want, jobs }))
+}
+
+/// What a job with no history is expected to write into its job dir, on a filesystem of
+/// `total` bytes: `[executor.schedule] disk_default` as set — admission refuses one larger than
+/// the filesystem, which no job could ever be admitted against — or, unset, [`DISK_DEFAULT`]
+/// capped at the filesystem, as an expectation from history is: a host that never chose the
+/// figure must not have every new job fail on a filesystem smaller than it.
+fn disk_default(raw: Option<&str>, total: u64) -> Result<u64> {
+    let Some(raw) = raw else {
+        return Ok(DISK_DEFAULT.min(total));
+    };
+    parse_gib(raw)
+        .ok()
+        .and_then(|gib| gib.checked_mul(1 << 30))
+        .with_context(|| {
+            format!("[executor.schedule] disk_default {raw:?} is not a size (want \"<n>G\")")
+        })
+}
+
+/// `[executor.schedule] disk_default` unset: what a job with no history is expected to write,
+/// 8 GiB.
+const DISK_DEFAULT: u64 = 8 << 30;
 
 /// The host's `[executor.schedule] mem_budget` in MiB, resolving a percentage against this host, for a
 /// report that says there is no budget rather than inventing one. `None` when no budget is set,
@@ -3484,21 +3544,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// With no budget configured the gate is absent: nothing is claimed, and no ledger is
-    /// created under the state dir.
+    /// With no budget configured and disk admission off the gate is absent: nothing is claimed,
+    /// and no ledger is created under the state dir. Disk admission is on by default, and on
+    /// its own claims room for the job dir and no memory.
     #[test]
-    fn admission_is_absent_without_a_budget() {
+    fn admission_is_absent_without_a_budget_or_disk_admission() {
         let dir = std::env::temp_dir().join(format!("vk-admit-off-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let cfg = Config {
+        let mut cfg = Config {
             state_dir: Some(dir.clone()),
             ..Config::default()
         };
-        let ctx = JobCtx::new_for_job(cfg, "42".into()).unwrap();
+        cfg.executor.schedule.disk_admission = Some(false);
+        let mut ctx = JobCtx::new_for_job(cfg, "42".into()).unwrap();
         assert!(ctx.cfg.executor.schedule.mem_budget.is_none());
-        assert!(admit_memory(&ctx, "8G").unwrap().is_none());
+        assert!(admit(&ctx, "8G").unwrap().is_none());
         assert!(!ctx.admit_dir().exists(), "no ledger without a budget");
+
+        let schedule = &mut ctx.cfg.executor.schedule;
+        schedule.disk_admission = None;
+        schedule.disk_default = Some("1G".into());
+        schedule.wait_timeout_secs = Some(0);
+        std::fs::create_dir_all(&ctx.job_dir).unwrap();
+        let held = admit(&ctx, "8G").unwrap();
+        assert!(held.is_some(), "disk admission is on by default");
+        let entry = std::fs::read_to_string(ctx.admit_dir().join("42")).unwrap();
+        assert!(
+            entry.starts_with("0 ") && entry.ends_with(&format!(" granted disk={}\n", 1u64 << 30)),
+            "{entry}"
+        );
+        drop(held);
+
+        // Not a size at all (only `G` is): refused before any history is consulted.
+        ctx.cfg.executor.schedule.disk_default = Some("1T".into());
+        let err = admit(&ctx, "8G").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("disk_default \"1T\""),
+            "{err:#}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unset, the default is capped at the filesystem, so a small one runs new jobs one at a
+    /// time rather than none; set, it is taken as given, for admission to refuse if it cannot
+    /// fit.
+    #[test]
+    fn the_built_in_disk_default_fits_the_filesystem_and_a_set_one_is_as_given() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(disk_default(None, 100 * GIB).unwrap(), DISK_DEFAULT);
+        assert_eq!(disk_default(None, 3 * GIB).unwrap(), 3 * GIB);
+        assert_eq!(disk_default(Some("20G"), 3 * GIB).unwrap(), 20 * GIB);
+        assert!(disk_default(Some("8GiB"), 100 * GIB).is_err());
+        assert!(disk_default(Some("0G"), 100 * GIB).is_err());
     }
 
     #[test]

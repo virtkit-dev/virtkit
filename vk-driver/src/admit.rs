@@ -1,5 +1,5 @@
-//! Memory admission for CI jobs: a host-wide ledger that keeps a runner from committing
-//! more guest RAM than it can back.
+//! Admission for CI jobs: a host-wide ledger that keeps a runner from committing more guest
+//! RAM than it can back, or more disk than the filesystem holding its job dirs has room for.
 //!
 //! Without it a runner takes every job its `concurrent` limit allows and the host's OOM
 //! killer arbitrates — it takes a VMM, and that job dies mid-stage. So a job reserves what
@@ -21,8 +21,18 @@
 //! Admission is against the ledger, never against the host's free memory: a guest faults
 //! its RAM in gradually, so a VM that just booted leaves `MemAvailable` looking roomy and
 //! the next job in would be admitted against memory the previous one has not touched yet.
+//!
+//! The same entry can also claim room on the filesystem holding the job dirs ([`DiskAsk`]),
+//! which fills the same way: a job's rootfs overlay grows as its guest writes. There the
+//! filesystem's own free space counts too, so anything else on it is seen. A job fits when
+//! that covers its own expected growth plus what each admitted job has yet to write (its
+//! expectation less what its dir already holds), or when no other job holds a claim there: a
+//! job that could not run alone never could. Its own test is cut to what could ever come
+//! free, but its ledger claim is its full expectation: the room it cannot have yet is room it
+//! will want.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -50,21 +60,44 @@ pub struct Reservation {
     job_id: String,
 }
 
-/// Reserve `want_mib` for `job_id` against `budget_mib`, waiting up to `timeout` for room.
-/// Prints its wait to stdout — this runs in `prepare`, whose output the job trace keeps, so
-/// a job that starts late says why.
+/// What a job asks the ledger for: its guest RAM against the host's budget, room for its job
+/// dir to grow into, or both — each `None` where that admission is off.
+#[derive(Clone, Copy)]
+pub struct Ask<'a> {
+    pub mem: Option<MemAsk>,
+    pub disk: Option<DiskAsk<'a>>,
+}
+
+/// `want_mib` of guest RAM out of a `budget_mib` the whole host shares.
+#[derive(Clone, Copy)]
+pub struct MemAsk {
+    pub want_mib: u64,
+    pub budget_mib: u64,
+}
+
+/// Room for `want` more bytes on the filesystem holding `jobs`, the directory every job's dir
+/// is made in. A job dir is named by its job id, as its ledger entry is: that is how admission
+/// finds what each admitted job has written so far.
+#[derive(Clone, Copy)]
+pub struct DiskAsk<'a> {
+    pub want: u64,
+    pub jobs: &'a Path,
+}
+
+/// Reserve what `ask` names for `job_id`, waiting up to `timeout` for room. Prints its wait to
+/// stdout — this runs in `prepare`, whose output the job trace keeps, so a job that starts late
+/// says why.
 ///
 /// Jobs are admitted oldest-request-first: a big job would otherwise wait behind an endless
 /// stream of small ones that each fit. Erring the other way, a small job can queue behind a
 /// big one it would have fit alongside — predictable beats optimal here.
-pub fn acquire(
-    dir: &Path,
-    job_id: &str,
-    want_mib: u64,
-    budget_mib: u64,
-    timeout: Duration,
-) -> Result<Reservation> {
-    if want_mib > budget_mib {
+pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result<Reservation> {
+    if let Some(MemAsk {
+        want_mib,
+        budget_mib,
+    }) = ask.mem
+        && want_mib > budget_mib
+    {
         // A per-job MICROVM_MEM is clamped to the budget before it reaches here, so a size
         // that still exceeds it came from the host's own `[executor.vm] mem` default: name both, or the
         // message sends the reader after a job variable that is not the cause.
@@ -72,6 +105,23 @@ pub fn acquire(
             "this job's {want_mib} MiB of guest memory exceeds the host's whole {budget_mib} MiB \
              budget ([executor.schedule] mem_budget vs [executor.vm] mem) — it can never be admitted"
         );
+    }
+    if let Some(DiskAsk { want, jobs }) = ask.disk {
+        let total = crate::usage::fs_space(jobs)
+            .with_context(|| format!("reading the free space of {}", jobs.display()))?
+            .total;
+        // An expectation from history is capped at the filesystem before it reaches here, as is
+        // the built-in default, so one that still exceeds it is a `disk_default` set larger
+        // than the filesystem.
+        if want > total {
+            bail!(
+                "this job is expected to write {} into {}, more than its whole filesystem holds \
+                 ({}) — it can never be admitted ([executor.schedule] disk_default)",
+                crate::usage::fmt_bytes(want),
+                jobs.display(),
+                crate::usage::fmt_bytes(total)
+            );
+        }
     }
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -86,16 +136,17 @@ pub fn acquire(
         .with_context(|| format!("restricting {} to 0700", dir.display()))?;
     let path = dir.join(job_id);
     let mut entry = Entry {
-        want_mib,
+        want_mib: ask.mem.map_or(0, |m| m.want_mib),
         asked: now_nanos(),
         granted: false,
         // Decided later, by the supervisor that boots the VM: prepare does not know the
         // topology matters until there is a VM to place.
         node: None,
+        disk: ask.disk.map(|d| d.want),
     };
     // Held from here on: while waiting it marks a live request other jobs must queue behind,
     // and once granted it is the reservation itself. Created under the directory lock, which
-    // is what [`scan`] reaps dead entries under: an entry that exists unlocked for even the
+    // is what [`tally`] reaps dead entries under: an entry that exists unlocked for even the
     // instant between its creation and its lock would be taken for abandoned and removed,
     // leaving this job writing to an unlinked file that no later scan can see — its memory
     // then counted by nobody, which is the one thing this ledger exists to prevent.
@@ -111,47 +162,66 @@ pub fn acquire(
     };
     let deadline = Instant::now() + timeout;
     let mut waited_since = None;
+    // What held the job back on the last pass that did, which is what it ended up waiting for.
+    let mut waited_for = Blocker::Queue;
     loop {
         // Both are composed under the directory lock and reported outside it: prepare's stdout
         // is a pipe gitlab-runner drains, and a stalled reader blocking on `write` must not
         // block every other runner's admission on the host-wide lock.
         let mut wait_note = None;
         let mut anomalies = Vec::new();
-        // The block yields whether we got in and nothing more, so no reporting can sit inside
-        // the critical section even by accident.
-        let admitted = {
+        // The block yields what held the job back, if anything, and nothing more, so no
+        // reporting can sit inside the critical section even by accident.
+        let refused = {
             let _dir_lock = lock_dir(dir)?;
-            let (used_mib, ahead) = scan(dir, job_id, entry.asked, &mut anomalies)?;
-            // Saturating, like the totals it compares: a corrupt entry must not add up to
-            // apparent room.
-            if ahead == 0 && used_mib.saturating_add(want_mib) <= budget_mib {
-                entry.granted = true;
-                entry.write(&file, &path)?;
-                true
-            } else {
-                if waited_since.is_none() {
-                    waited_since = Some(Instant::now());
-                    wait_note = Some(format!(
-                        "virtkit: waiting for {want_mib} MiB of the host's {budget_mib} MiB \
-                         memory budget ({used_mib} MiB reserved, {ahead} job(s) asked first)"
-                    ));
+            let held = tally(dir, job_id, entry.asked, &mut anomalies)?;
+            let mut pass = Pass {
+                ask: *ask,
+                used_mib: held.granted_mib,
+                ahead: held.ahead,
+                room: None,
+            };
+            // Walking every admitted job's dir is the costly part of a pass, under the lock
+            // every other admission waits on: skipped while memory keeps the job out anyway.
+            if !pass.mem_short() {
+                pass.room = ask
+                    .disk
+                    .map(|d| DiskRoom::of(d.jobs, &held.disk))
+                    .transpose()?;
+            }
+            match pass.blocker() {
+                None => {
+                    // The entry keeps the full expectation `ask` put in it, not the claim this
+                    // pass cut to fit: the cut is what a full filesystem could offer now, and
+                    // recorded, it would go on under-charging this job once space frees up.
+                    entry.granted = true;
+                    entry.write(&file, &path)?;
+                    None
                 }
-                false
+                Some(blocker) => {
+                    if waited_since.is_none() {
+                        waited_since = Some(Instant::now());
+                        wait_note = Some(pass.note());
+                    }
+                    waited_for = blocker;
+                    Some(pass)
+                }
             }
         };
         report(&anomalies);
-        if admitted {
+        let Some(pass) = refused else {
             if let Some(since) = waited_since {
                 println!(
-                    "virtkit: admitted after waiting {:.0}s for memory",
-                    Instant::now().duration_since(since).as_secs_f64()
+                    "virtkit: admitted after waiting {:.0}s for {}",
+                    Instant::now().duration_since(since).as_secs_f64(),
+                    waited_for.what()
                 );
             }
             return Ok(Reservation {
                 file,
                 job_id: job_id.to_string(),
             });
-        }
+        };
         if let Some(note) = wait_note {
             println!("{note}");
         }
@@ -159,19 +229,195 @@ pub fn acquire(
             // Best-effort: the entry stops counting the moment this process drops its lock,
             // and a scan that got there first has already removed it.
             let _ = std::fs::remove_file(&path);
-            bail!(
-                "no room in the host's {budget_mib} MiB memory budget for this job's \
-                 {want_mib} MiB within {}s ([executor.schedule] wait_timeout_secs)",
-                timeout.as_secs()
-            );
+            bail!("{}", pass.refusal(timeout));
         }
         std::thread::sleep(POLL);
     }
 }
 
+/// What one admission pass found, kept to say why the job has to wait.
+struct Pass<'a> {
+    ask: Ask<'a>,
+    /// The memory the other jobs hold.
+    used_mib: u64,
+    /// How many jobs asked first and are still waiting.
+    ahead: usize,
+    /// The job dirs' filesystem, where disk is asked for.
+    room: Option<DiskRoom>,
+}
+
+/// What kept a job out on a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Blocker {
+    Memory,
+    Disk,
+    /// Nothing but the jobs that asked first.
+    Queue,
+}
+
+impl Blocker {
+    fn what(self) -> &'static str {
+        match self {
+            Blocker::Memory => "memory",
+            Blocker::Disk => "disk space",
+            Blocker::Queue => "the jobs that asked first",
+        }
+    }
+}
+
+impl<'a> Pass<'a> {
+    // Saturating, like the totals they compare: a corrupt entry must not add up to apparent
+    // room.
+    fn mem_short(&self) -> bool {
+        self.ask
+            .mem
+            .is_some_and(|m| self.used_mib.saturating_add(m.want_mib) > m.budget_mib)
+    }
+
+    /// The disk this job's own admission test asks for: what it expects, cut to what the
+    /// filesystem could ever give it — what is free now plus what the other jobs' dirs hold,
+    /// which comes free as they end. A job that last filled the filesystem expects more than
+    /// that, and would otherwise wait for room that cannot appear. Its claim on the ledger stays
+    /// its full expectation.
+    fn disk_claim(&self) -> Option<u64> {
+        let want = self.ask.disk?.want;
+        Some(match self.room {
+            Some(room) => want.min(room.avail.saturating_add(room.held)),
+            None => want,
+        })
+    }
+
+    fn disk_short(&self) -> bool {
+        match (self.disk_claim(), self.room) {
+            // Alone on the filesystem it goes in whatever it expects: nothing it waited for
+            // could make more room than it has now.
+            (Some(_), Some(room)) if room.claims == 0 => false,
+            (Some(want), Some(room)) => room.pending.saturating_add(want) > room.avail,
+            _ => false,
+        }
+    }
+
+    /// What keeps the job out, or `None` when it is admitted. Memory before disk where both
+    /// are short: it is the figure a job's trace sizes it by.
+    fn blocker(&self) -> Option<Blocker> {
+        if self.mem_short() {
+            Some(Blocker::Memory)
+        } else if self.disk_short() {
+            Some(Blocker::Disk)
+        } else if self.ahead > 0 {
+            Some(Blocker::Queue)
+        } else {
+            None
+        }
+    }
+
+    /// The line a job prints when it starts to wait: the resource it is short of, or for a job
+    /// held only by the queue, the one it asked for — memory where it asked for both.
+    fn note(&self) -> String {
+        let ahead = self.ahead;
+        let on_disk = match self.blocker() {
+            Some(Blocker::Disk) => true,
+            Some(Blocker::Queue) => self.ask.mem.is_none(),
+            _ => false,
+        };
+        match (on_disk, self.ask.mem, self.ask.disk, self.room) {
+            (true, _, Some(disk), Some(room)) => format!(
+                "virtkit: waiting for {} of room in {} ({} free, {} still to be written by the \
+                 jobs admitted there, {ahead} job(s) asked first)",
+                crate::usage::fmt_bytes(self.disk_claim().unwrap_or(disk.want)),
+                disk.jobs.display(),
+                crate::usage::fmt_bytes(room.avail),
+                crate::usage::fmt_bytes(room.pending)
+            ),
+            (
+                false,
+                Some(MemAsk {
+                    want_mib,
+                    budget_mib,
+                }),
+                _,
+                _,
+            ) => format!(
+                "virtkit: waiting for {want_mib} MiB of the host's {budget_mib} MiB memory \
+                 budget ({} MiB reserved, {ahead} job(s) asked first)",
+                self.used_mib
+            ),
+            _ => format!("virtkit: waiting behind {ahead} job(s) that asked first"),
+        }
+    }
+
+    /// Why the job gave up, from the last pass it made.
+    fn refusal(&self, timeout: Duration) -> String {
+        let secs = timeout.as_secs();
+        let knob = "([executor.schedule] wait_timeout_secs)";
+        match (self.blocker(), self.ask.mem, self.ask.disk) {
+            (Some(Blocker::Disk), _, Some(disk)) => format!(
+                "no room in {} for the {} this job is expected to write within {secs}s {knob}",
+                disk.jobs.display(),
+                crate::usage::fmt_bytes(self.disk_claim().unwrap_or(disk.want))
+            ),
+            (
+                Some(Blocker::Memory),
+                Some(MemAsk {
+                    want_mib,
+                    budget_mib,
+                }),
+                _,
+            ) => format!(
+                "no room in the host's {budget_mib} MiB memory budget for this job's \
+                 {want_mib} MiB within {secs}s {knob}"
+            ),
+            _ => format!(
+                "not admitted within {secs}s: {} job(s) that asked first are still waiting {knob}",
+                self.ahead
+            ),
+        }
+    }
+}
+
+/// The job dirs' filesystem as one pass found it: what is free, how much of that the jobs
+/// already admitted there are still expected to write, what their dirs hold now, and how many
+/// of them hold a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskRoom {
+    avail: u64,
+    pending: u64,
+    held: u64,
+    claims: usize,
+}
+
+impl DiskRoom {
+    /// Each admitted job's claim counts for what its dir has yet to grow by — its expectation
+    /// less what the dir already holds, which is out of `avail` already and would otherwise be
+    /// counted twice. A dir that cannot be read counts as empty, charging its whole claim.
+    ///
+    /// Walks every admitted job's dir, under the ledger lock its callers hold: a few dozen files
+    /// a job, and a pass every [`POLL`] per waiting job, against a lock that is otherwise only
+    /// held for the length of a directory scan.
+    fn of(jobs: &Path, claims: &[(OsString, u64)]) -> Result<DiskRoom> {
+        let mut room = DiskRoom {
+            avail: 0,
+            pending: 0,
+            held: 0,
+            claims: claims.len(),
+        };
+        for (job, want) in claims {
+            let written = crate::usage::allocated_bytes(&jobs.join(job)).unwrap_or(0);
+            room.held = room.held.saturating_add(written);
+            room.pending = room.pending.saturating_add(want.saturating_sub(written));
+        }
+        // Free space read after the walk, not before: a byte written in between is then out of
+        // `avail` and still in `pending`, counted twice against the job rather than not at all.
+        room.avail = crate::usage::fs_space(jobs)
+            .with_context(|| format!("reading the free space of {}", jobs.display()))?
+            .avail;
+        Ok(room)
+    }
+}
+
 /// Re-open the reservation `prepare` was granted and hold it for this process's life — the
 /// supervisor's half of the handoff. `None` when the job has no reservation (admission off),
-/// which is not an error: the ledger only exists when a budget is configured.
+/// which is not an error: a job has an entry only where memory or disk admission is on.
 ///
 /// Needs no directory lock, unlike [`acquire`]: prepare holds its own lock on this entry
 /// until the guest answers, which is long after this runs, so no scan can take it for
@@ -181,8 +427,8 @@ pub fn hold(dir: &Path, job_id: &str) -> Option<Reservation> {
     // One open, and never creating. Testing for the file and then opening it would be two
     // resolutions of the same path: an entry removed in between — by a racing cleanup, or by
     // the scan that reaps abandoned ones — would be re-created here as an empty file, which no
-    // scan can parse and none can reclaim while this process holds it locked. The job's memory
-    // would then count for nobody for the whole of its life.
+    // scan can parse and none can reclaim while this process holds it locked. What the job
+    // claimed would then count for nobody for the whole of its life.
     match open_locked_shared(&path) {
         Ok(file) => Some(Reservation {
             file,
@@ -191,11 +437,11 @@ pub fn hold(dir: &Path, job_id: &str) -> Option<Reservation> {
         // admission is off — prepare never made an entry
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         // An entry that exists but cannot be re-locked is not the same as no entry at all:
-        // this job's memory stops counting against the budget for the rest of its life, so
-        // say so in the supervisor log rather than degrading the host's guard in silence.
+        // what this job claimed stops counting for the rest of its life, so say so in the
+        // supervisor log rather than degrading the host's guard in silence.
         Err(e) => {
             eprintln!(
-                "virtkit: holding this job's memory reservation ({}): {e}",
+                "virtkit: holding this job's admission reservation ({}): {e}",
                 path.display()
             );
             None
@@ -352,7 +598,8 @@ struct Sample {
     /// ceiling exactly, so the mark alone could not say how near the wall a run came.
     overlay: Option<(u64, u64)>,
     /// What its job dir held on the host by the end — the rootfs overlay its guest wrote,
-    /// the checkout packed for the guest, the logs. `None` where the dir could not be read.
+    /// the checkout packed for the guest, the logs — which is what disk admission expects the
+    /// next run to need. `None` where the dir could not be read.
     footprint: Option<u64>,
 }
 
@@ -580,6 +827,22 @@ pub fn expect_mib(dir: &Path, key: &Path, declared_mib: u64) -> Option<u64> {
     // every run was stamped with went through the same conversion.
     let recent = most_recent(dir, key, declared_mib.checked_mul(MIB)?)?;
     Some(reserve_mib(recent.most / MIB, declared_mib))
+}
+
+/// What a job of this kind is expected to write into its job dir, in bytes: the most its dir
+/// has held lately plus headroom, never above `cap` — the size of the filesystem it would fill,
+/// which headroom must not price a job out of. Read against the same ceiling as its memory, and
+/// `None` in the same cases, or where no run in the window measured its dir.
+pub fn expect_disk(dir: &Path, key: &Path, declared_mib: u64, cap: u64) -> Option<u64> {
+    // Read against the memory ceiling because that is what a history's window is cut by, not
+    // because disk follows memory: a new MICROVM_MEM restarts the disk estimate too, costing a
+    // run against `disk_default` — cheaper than a second window to keep in step.
+    let recent = most_recent(dir, key, declared_mib.checked_mul(MIB)?)?;
+    let most = recent.most_footprint?;
+    Some(
+        most.saturating_add(most.saturating_mul(HEADROOM_PCT) / 100)
+            .min(cap),
+    )
 }
 
 /// What every job this host remembers would reserve if it ran now, each read against the
@@ -1143,24 +1406,6 @@ fn report(anomalies: &[String]) {
     }
 }
 
-/// What the live ledger holds, ignoring `job_id` (the caller's own entry): the granted MiB,
-/// and how many jobs asked before `asked` and are still waiting. Entries nobody holds a lock
-/// on are dead — their job is gone — and are removed as they are found. Callers hold the
-/// directory lock.
-///
-/// An unreadable ledger is an error, never an empty one: reporting nothing reserved would
-/// admit every job on the host against a guard that has stopped working. Anything odd but
-/// survivable is pushed onto `anomalies` for the caller to report once it has let the lock go.
-fn scan(
-    dir: &Path,
-    job_id: &str,
-    asked: u128,
-    anomalies: &mut Vec<String>,
-) -> Result<(u64, usize)> {
-    let held = tally(dir, job_id, asked, anomalies)?;
-    Ok((held.granted_mib, held.ahead))
-}
-
 /// What the ledger is holding: the memory granted and how many jobs hold it, plus how many
 /// asked before `asked` and are still waiting. Ignores `job_id` (the caller's own entry).
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1175,6 +1420,9 @@ pub struct Held {
     pub per_node: HashMap<u32, crate::numa::NodeLoad>,
     /// What the interleaved jobs hold, which is a share of every node rather than any one.
     pub spread: crate::numa::NodeLoad,
+    /// What each granted job claimed on the job dirs' filesystem, in bytes, by entry name —
+    /// which is its job id, and so the name of its job dir. Only the jobs that asked for disk.
+    pub disk: Vec<(OsString, u64)>,
 }
 
 /// What this host has committed right now, for a caller with no entry of its own — the
@@ -1201,6 +1449,13 @@ pub fn committed(dir: &Path) -> Result<Held> {
     out
 }
 
+/// What the live ledger holds, ignoring `job_id` (the caller's own entry), with how many jobs
+/// asked before `asked` and are still waiting. Entries nobody holds a lock on are dead — their
+/// job is gone — and are removed as they are found. Callers hold the directory lock.
+///
+/// An unreadable ledger is an error, never an empty one: reporting nothing reserved would
+/// admit every job on the host against a guard that has stopped working. Anything odd but
+/// survivable is pushed onto `anomalies` for the caller to report once it has let the lock go.
 fn tally(dir: &Path, job_id: &str, asked: u128, anomalies: &mut Vec<String>) -> Result<Held> {
     let mut out = Held::default();
     let entries = std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
@@ -1249,6 +1504,9 @@ fn tally(dir: &Path, job_id: &str, asked: u128, anomalies: &mut Vec<String>) -> 
                 node.granted_mib = node.granted_mib.saturating_add(entry.want_mib);
                 node.jobs = node.jobs.saturating_add(1);
             }
+            if let Some(bytes) = entry.disk {
+                out.disk.push((name.to_os_string(), bytes));
+            }
         } else if entry.asked < asked {
             out.ahead = out.ahead.saturating_add(1);
         }
@@ -1263,6 +1521,8 @@ struct Entry {
     asked: u128,
     granted: bool,
     node: Option<Place>,
+    /// The bytes it expects to write into its job dir, where disk admission is on.
+    disk: Option<u64>,
 }
 
 /// Where a job's guest RAM went, as the ledger records it.
@@ -1284,10 +1544,11 @@ impl Place {
 }
 
 impl Entry {
-    /// `<mib> <asked> <granted|waiting> [node=<n>|spread]`, rewritten whole each time so a
-    /// reader either sees the previous line or the new one, never a splice of both. The node
-    /// is absent until one is chosen, and absent for good on a host that places nothing — so
-    /// a three-field line, all this ledger ever held before, still reads.
+    /// `<mib> <asked> <granted|waiting> [node=<n>|spread] [disk=<bytes>]`, rewritten whole
+    /// each time so a reader either sees the previous line or the new one, never a splice of
+    /// both. The node is absent until one is chosen, and absent for good on a host that places
+    /// nothing — so a three-field line, all this ledger ever held before, still reads. The disk
+    /// claim goes last, where a reader that knows only the node passes over it.
     fn write(&self, mut file: &File, path: &Path) -> Result<()> {
         let state = if self.granted { "granted" } else { "waiting" };
         let node = match self.node {
@@ -1295,7 +1556,11 @@ impl Entry {
             Some(Place::Spread) => " spread".to_string(),
             None => String::new(),
         };
-        let line = format!("{} {} {state}{node}\n", self.want_mib, self.asked);
+        let disk = match self.disk {
+            Some(bytes) => format!(" disk={bytes}"),
+            None => String::new(),
+        };
+        let line = format!("{} {} {state}{node}{disk}\n", self.want_mib, self.asked);
         file.set_len(0)
             .and_then(|()| file.seek(SeekFrom::Start(0)))
             .and_then(|_| file.write_all(line.as_bytes()))
@@ -1309,12 +1574,27 @@ impl Entry {
         let mut text = String::new();
         file.read_to_string(&mut text).ok()?;
         let mut fields = text.split_whitespace();
-        Some(Entry {
+        let mut entry = Entry {
             want_mib: fields.next()?.parse().ok()?,
             asked: fields.next()?.parse().ok()?,
             granted: fields.next()? == "granted",
-            node: fields.next().and_then(Place::parse),
-        })
+            node: None,
+            disk: None,
+        };
+        for field in fields {
+            match field.strip_prefix("disk=") {
+                // A claim that does not parse makes the entry unreadable, not claimless: it is
+                // reported as a ledger anomaly rather than silently read as claiming no room.
+                Some(bytes) => entry.disk = Some(bytes.parse().ok()?),
+                // A field this version does not know leaves the node as it was.
+                None => {
+                    if let Some(place) = Place::parse(field) {
+                        entry.node = Some(place);
+                    }
+                }
+            }
+        }
+        Some(entry)
     }
 }
 
@@ -1427,7 +1707,7 @@ mod tests {
         dir
     }
 
-    /// Read the live ledger the way production does. `scan` reaps entries it finds unlocked,
+    /// Read the live ledger the way production does. `tally` reaps entries it finds unlocked,
     /// so it must only ever run under the directory lock: an unlocked reader can unlink an
     /// entry a concurrent `acquire` is still between opening and locking, leaving that job's
     /// memory uncounted — which would mask the very over-admission these tests look for.
@@ -1441,7 +1721,9 @@ mod tests {
     fn live(dir: &Path) -> (u64, usize) {
         let mut anomalies = Vec::new();
         let _dir_lock = lock_dir(dir).unwrap();
-        let used = scan(dir, "nobody", u128::MAX, &mut anomalies).unwrap().0;
+        let used = tally(dir, "nobody", u128::MAX, &mut anomalies)
+            .unwrap()
+            .granted_mib;
         (used, anomalies.len())
     }
 
@@ -1511,6 +1793,21 @@ mod tests {
         Path::new(name)
     }
 
+    /// Memory admission alone, as every test not about disk asks for.
+    fn acquire_mem(
+        dir: &Path,
+        job: &str,
+        want_mib: u64,
+        budget_mib: u64,
+        timeout: Duration,
+    ) -> Result<Reservation> {
+        let mem = Some(MemAsk {
+            want_mib,
+            budget_mib,
+        });
+        acquire(dir, job, &Ask { mem, disk: None }, timeout)
+    }
+
     /// A reservation held by this test, as another job's would be.
     fn held(dir: &Path, job: &str, want_mib: u64, asked: u128, granted: bool) -> File {
         held_on(dir, job, want_mib, asked, granted, None)
@@ -1531,6 +1828,7 @@ mod tests {
             asked,
             granted,
             node,
+            disk: None,
         }
         .write(&file, &dir.join(job))
         .unwrap();
@@ -1543,11 +1841,11 @@ mod tests {
         let held_by_others = held(&dir, "other", 4096, 1, true);
 
         // 4 GiB reserved of an 8 GiB budget: a 4 GiB job still fits.
-        let res = acquire(&dir, "mine", 4096, 8192, Duration::from_secs(0)).unwrap();
+        let res = acquire_mem(&dir, "mine", 4096, 8192, Duration::from_secs(0)).unwrap();
         assert_eq!(live_mib(&dir), 8192, "both counted");
 
         // The budget is now full: the next job waits, then gives up.
-        let err = acquire(&dir, "third", 4096, 8192, Duration::from_secs(0)).unwrap_err();
+        let err = acquire_mem(&dir, "third", 4096, 8192, Duration::from_secs(0)).unwrap_err();
         assert!(err.to_string().contains("no room"), "{err}");
         // A refused job leaves nothing behind.
         assert!(!dir.join("third").exists());
@@ -1564,7 +1862,7 @@ mod tests {
     #[test]
     fn a_job_larger_than_the_budget_fails_at_once() {
         let dir = tmpdir("too-big");
-        let err = acquire(&dir, "huge", 16384, 8192, Duration::from_secs(60)).unwrap_err();
+        let err = acquire_mem(&dir, "huge", 16384, 8192, Duration::from_secs(60)).unwrap_err();
         assert!(err.to_string().contains("never be admitted"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1577,7 +1875,7 @@ mod tests {
         let _full = held(&dir, "running", 8192, 1, true);
 
         // A small job that would fit the moment the running one ends must not jump the queue.
-        let err = acquire(&dir, "small", 512, 8192, Duration::from_secs(0)).unwrap_err();
+        let err = acquire_mem(&dir, "small", 512, 8192, Duration::from_secs(0)).unwrap_err();
         assert!(err.to_string().contains("no room"), "{err}");
 
         // Once the older waiter is gone, the same job is admitted.
@@ -1585,7 +1883,7 @@ mod tests {
         crate::admit::release(&dir, "big");
         drop(_full);
         crate::admit::release(&dir, "running");
-        acquire(&dir, "small", 512, 8192, Duration::from_secs(0)).unwrap();
+        acquire_mem(&dir, "small", 512, 8192, Duration::from_secs(0)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1626,7 +1924,7 @@ mod tests {
         });
 
         let asked_at = Instant::now();
-        let res = acquire(&dir, "waiter", 8192, 8192, Duration::from_secs(120)).unwrap();
+        let res = acquire_mem(&dir, "waiter", 8192, 8192, Duration::from_secs(120)).unwrap();
         assert!(asked_at.elapsed() >= POLL, "admitted without ever waiting");
         freed.join().unwrap();
 
@@ -1679,7 +1977,7 @@ mod tests {
                 let dir = dir.clone();
                 std::thread::spawn(move || {
                     let job = format!("job{i}");
-                    let res = acquire(&dir, &job, WANT, BUDGET, Duration::from_secs(120))
+                    let res = acquire_mem(&dir, &job, WANT, BUDGET, Duration::from_secs(120))
                         .unwrap_or_else(|e| panic!("{job} was never admitted: {e}"));
                     std::thread::sleep(Duration::from_millis(50));
                     drop(res);
@@ -1940,7 +2238,8 @@ mod tests {
         );
 
         // The writable layer reads beside the memory and before the traffic, as the pair it is:
-        // the mark alone would not say this job came within a hair of failing on space.
+        // the mark alone would not say this job came within a hair of failing on space. What
+        // its job dir held on the host follows it.
         remember_at(
             &dir,
             key("filled"),
@@ -2387,7 +2686,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
     #[test]
     fn the_supervisor_picks_up_the_reservation_prepare_took() {
         let dir = tmpdir("handoff");
-        let prepared = acquire(&dir, "job", 2048, 8192, Duration::from_secs(0)).unwrap();
+        let prepared = acquire_mem(&dir, "job", 2048, 8192, Duration::from_secs(0)).unwrap();
         // The supervisor takes its own lock on the same entry, then prepare exits.
         let supervised = hold(&dir, "job").expect("the entry prepare left");
         drop(prepared);
@@ -2408,7 +2707,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
     #[test]
     fn hold_does_not_resurrect_an_entry_that_has_been_released() {
         let dir = tmpdir("hold-gone");
-        let prepared = acquire(&dir, "job", 2048, 8192, Duration::from_secs(0)).unwrap();
+        let prepared = acquire_mem(&dir, "job", 2048, 8192, Duration::from_secs(0)).unwrap();
         drop(prepared);
         release(&dir, "job");
 
@@ -2461,7 +2760,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
                 .map(|i| {
                     let job = format!("job{i}");
                     (
-                        acquire(&dir, &job, 512, 8192, Duration::from_secs(0)).unwrap(),
+                        acquire_mem(&dir, &job, 512, 8192, Duration::from_secs(0)).unwrap(),
                         job,
                     )
                 })
@@ -2491,7 +2790,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         let dir = std::env::temp_dir().join(format!("vk-admit-mode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let res = acquire(&dir, "job", 2048, 8192, Duration::from_secs(0)).unwrap();
+        let res = acquire_mem(&dir, "job", 2048, 8192, Duration::from_secs(0)).unwrap();
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&dir), 0o700, "ledger directory");
         assert_eq!(mode(&dir.join("job")), 0o600, "ledger entry");
@@ -2517,6 +2816,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
             asked: 1,
             granted: true,
             node: None,
+            disk: None,
         }
         .write(&garbled, &dir.join("mid-write"))
         .unwrap();
@@ -2535,7 +2835,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         let _full = held(&dir, "running", 8192, 1, true);
 
         let asked_at = Instant::now();
-        let err = acquire(&dir, "waiter", 8192, 8192, POLL + POLL / 2).unwrap_err();
+        let err = acquire_mem(&dir, "waiter", 8192, 8192, POLL + POLL / 2).unwrap_err();
         assert!(err.to_string().contains("no room"), "{err}");
         assert!(
             asked_at.elapsed() >= POLL,
@@ -2615,7 +2915,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         // Another job already holds half of node 0.
         let _other = held_on(&dir, "other", 8192, 1, true, Some(Place::Node(0)));
 
-        let mine = acquire(&dir, "mine", 4096, 32768, Duration::from_secs(0)).unwrap();
+        let mine = acquire_mem(&dir, "mine", 4096, 32768, Duration::from_secs(0)).unwrap();
         let placement = mine.place(&dir, &topology, 32768, Some(32768), 2).unwrap();
         assert_eq!(
             placement,
@@ -2650,7 +2950,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
 
         // A job larger than either node's share of the budget is interleaved, and the ledger
         // records that rather than a node.
-        let big = acquire(&dir, "big", 20480, 32768, Duration::from_secs(0)).unwrap();
+        let big = acquire_mem(&dir, "big", 20480, 32768, Duration::from_secs(0)).unwrap();
         assert_eq!(
             big.place(&dir, &topology, 32768, Some(32768), 2).unwrap(),
             crate::numa::Placement::Interleave { nodes: vec![0, 1] }
@@ -2666,6 +2966,333 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
                 granted_mib: 20480,
                 jobs: 1,
             }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    /// A pass that asks for `want` GiB of disk in `/jobs`, with `avail` GiB free of which the
+    /// one other job holding a claim there has `pending` GiB yet to write, and with memory
+    /// asked for or not.
+    fn disk_pass(want: u64, avail: u64, pending: u64, mem: Option<MemAsk>) -> Pass<'static> {
+        Pass {
+            ask: Ask {
+                mem,
+                disk: Some(DiskAsk {
+                    want: want * GIB,
+                    jobs: Path::new("/jobs"),
+                }),
+            },
+            used_mib: 0,
+            ahead: 0,
+            room: Some(DiskRoom {
+                avail: avail * GIB,
+                pending: pending * GIB,
+                held: 0,
+                claims: 1,
+            }),
+        }
+    }
+
+    /// Bytes no filesystem can compress or deduplicate away, so a size test measures blocks
+    /// really allocated.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// A job fits on disk when what is free covers what the admitted jobs have yet to write
+    /// plus its own expectation — and not a byte less.
+    #[test]
+    fn disk_admission_charges_what_admitted_jobs_have_yet_to_write() {
+        assert_eq!(disk_pass(50, 100, 50, None).blocker(), None, "exactly fits");
+        let short = disk_pass(51, 100, 50, None);
+        assert_eq!(short.blocker(), Some(Blocker::Disk));
+        assert_eq!(
+            short.note(),
+            "virtkit: waiting for 51.0 GiB of room in /jobs (100.0 GiB free, 50.0 GiB still to \
+             be written by the jobs admitted there, 0 job(s) asked first)"
+        );
+        assert_eq!(
+            short.refusal(Duration::from_secs(600)),
+            "no room in /jobs for the 51.0 GiB this job is expected to write within 600s \
+             ([executor.schedule] wait_timeout_secs)"
+        );
+        // A job that fits waits its turn all the same, and says it is the queue it waited on.
+        let queued = Pass {
+            ahead: 2,
+            ..disk_pass(1, 100, 0, None)
+        };
+        assert_eq!(queued.blocker(), Some(Blocker::Queue));
+        assert!(
+            queued.note().contains("of room in /jobs"),
+            "{}",
+            queued.note()
+        );
+        assert_eq!(
+            queued.refusal(Duration::from_secs(5)),
+            "not admitted within 5s: 2 job(s) that asked first are still waiting \
+             ([executor.schedule] wait_timeout_secs)"
+        );
+        assert_eq!(Blocker::Queue.what(), "the jobs that asked first");
+
+        // With memory asked for too, the wait is told as one for whichever is short — memory
+        // where both are, since that is the figure a job is sized by.
+        let mem = |want_mib| {
+            Some(MemAsk {
+                want_mib,
+                budget_mib: 8192,
+            })
+        };
+        let with_mem = |want, want_mib| Pass {
+            used_mib: 4096,
+            ..disk_pass(want, 100, 50, mem(want_mib))
+        };
+        assert_eq!(with_mem(51, 4096).blocker(), Some(Blocker::Disk));
+        let both = with_mem(51, 8192);
+        assert_eq!(both.blocker(), Some(Blocker::Memory));
+        assert!(both.note().contains("MiB memory budget"), "{}", both.note());
+        let mem_only = with_mem(1, 8192);
+        assert_eq!(mem_only.blocker(), Some(Blocker::Memory));
+        assert!(
+            mem_only
+                .refusal(Duration::from_secs(1))
+                .starts_with("no room in the host's 8192 MiB memory budget"),
+            "{}",
+            mem_only.refusal(Duration::from_secs(1))
+        );
+        assert_eq!(with_mem(1, 4096).blocker(), None);
+        // A pass memory keeps out never reads the filesystem, and still says it is memory.
+        let unread = Pass {
+            room: None,
+            ..with_mem(51, 8192)
+        };
+        assert_eq!(unread.blocker(), Some(Blocker::Memory));
+        assert_eq!(unread.note(), both.note());
+        assert_eq!(
+            unread.refusal(Duration::from_secs(1)),
+            both.refusal(Duration::from_secs(1))
+        );
+
+        // Totals read off disk saturate rather than wrap into apparent room.
+        let wrapped = Pass {
+            room: Some(DiskRoom {
+                avail: 100 * GIB,
+                pending: u64::MAX,
+                held: 0,
+                claims: 1,
+            }),
+            ..disk_pass(1, 0, 0, None)
+        };
+        assert_eq!(wrapped.blocker(), Some(Blocker::Disk));
+    }
+
+    /// A claim no filesystem state could ever satisfy must not lock the job out: alone on the
+    /// filesystem a job goes in whatever it expects, and beside others its own test asks for at
+    /// most what could come free — what is free now plus what their dirs hold.
+    #[test]
+    fn a_claim_the_filesystem_cannot_meet_is_cut_to_what_it_can() {
+        let room = |avail, held, claims| {
+            Some(DiskRoom {
+                avail: avail * GIB,
+                pending: 0,
+                held: held * GIB,
+                claims,
+            })
+        };
+        // As big as the whole filesystem, of which some is always reserved: never free, and
+        // admitted the moment nobody else holds a claim.
+        let alone = Pass {
+            room: room(120, 0, 0),
+            ..disk_pass(128, 0, 0, None)
+        };
+        assert_eq!(alone.blocker(), None);
+        assert_eq!(alone.disk_claim(), Some(120 * GIB));
+        // Beside another job, more than could ever come free is cut to what could: it waits
+        // for that much, and is admitted once it is there.
+        let beside = Pass {
+            room: room(20, 30, 1),
+            ..disk_pass(128, 0, 0, None)
+        };
+        assert_eq!(beside.disk_claim(), Some(50 * GIB));
+        assert_eq!(beside.blocker(), Some(Blocker::Disk));
+        assert!(
+            beside.note().starts_with("virtkit: waiting for 50.0 GiB"),
+            "{}",
+            beside.note()
+        );
+        let freed = Pass {
+            room: room(50, 0, 1),
+            ..disk_pass(128, 0, 0, None)
+        };
+        assert_eq!(freed.blocker(), None);
+    }
+
+    /// What an admitted job still counts for is its claim less what its dir already holds:
+    /// what it has written is already out of the free space, and a job past its claim counts
+    /// for nothing more.
+    #[test]
+    fn disk_room_nets_each_claim_against_its_job_dir() {
+        let jobs = tmpdir("disk-room");
+        for job in ["partway", "past"] {
+            std::fs::create_dir_all(jobs.join(job)).unwrap();
+            std::fs::write(jobs.join(job).join("overlay.qcow2"), noise(1 << 20)).unwrap();
+        }
+        let written = crate::usage::allocated_bytes(&jobs.join("partway")).unwrap();
+        let past = crate::usage::allocated_bytes(&jobs.join("past")).unwrap();
+        assert!(written >= 1 << 20);
+
+        let claims = [
+            (OsString::from("partway"), 10 * MIB),
+            (OsString::from("past"), 1024),
+            // No dir to read: charged its whole claim.
+            (OsString::from("unseen"), 5 * MIB),
+        ];
+        let room = DiskRoom::of(&jobs, &claims).unwrap();
+        assert_eq!(room.pending, 10 * MIB - written + 5 * MIB);
+        assert_eq!(room.held, written + past);
+        assert_eq!(room.claims, 3);
+        let _ = std::fs::remove_dir_all(&jobs);
+    }
+
+    /// The ledger end to end: a disk claim is recorded in the entry, counts against the next
+    /// job for as long as it is held, a claim of the whole filesystem goes in alone and is
+    /// recorded whole — so it holds the next job back — and one larger than the whole
+    /// filesystem is refused outright rather than left to wait.
+    #[test]
+    fn a_disk_claim_holds_the_next_job_back_until_it_goes() {
+        let dir = tmpdir("disk-ledger");
+        let jobs = tmpdir("disk-ledger-jobs");
+        let ask = |want| Ask {
+            mem: None,
+            disk: Some(DiskAsk { want, jobs: &jobs }),
+        };
+        // A job already admitted that has yet to write more than the filesystem has free.
+        let blocker = open_shared(&dir.join("running")).unwrap();
+        Entry {
+            want_mib: 0,
+            asked: 1,
+            granted: true,
+            node: None,
+            disk: Some(u64::MAX / 2),
+        }
+        .write(&blocker, &dir.join("running"))
+        .unwrap();
+        assert_eq!(
+            committed(&dir).unwrap().disk,
+            vec![(OsString::from("running"), u64::MAX / 2)]
+        );
+
+        let err = acquire(&dir, "next", &ask(1), Duration::from_secs(0)).unwrap_err();
+        let jobs_shown = jobs.display().to_string();
+        assert!(
+            err.to_string()
+                .starts_with(&format!("no room in {jobs_shown} for the 1 B")),
+            "{err}"
+        );
+        assert!(!dir.join("next").exists(), "a refused job leaves nothing");
+
+        drop(blocker);
+        release(&dir, "running");
+        let res = acquire(&dir, "next", &ask(1), Duration::from_secs(0)).unwrap();
+        assert_eq!(
+            Entry::read(&res.file).unwrap().disk,
+            Some(1),
+            "the claim is in the entry"
+        );
+
+        drop(res);
+        release(&dir, "next");
+
+        // A claim of the whole filesystem, of which never all is free, goes in alone. Its own
+        // test was cut to what was free, but the ledger keeps the whole claim: recorded cut, it
+        // would let the next job in the moment space came free.
+        let total = crate::usage::fs_space(&jobs).unwrap().total;
+        let whole = acquire(&dir, "whole", &ask(total), Duration::from_secs(0)).unwrap();
+        assert_eq!(Entry::read(&whole.file).unwrap().disk, Some(total));
+        let err = acquire(&dir, "after", &ask(1), Duration::from_secs(0)).unwrap_err();
+        assert!(err.to_string().starts_with("no room in"), "{err}");
+        drop(whole);
+        release(&dir, "whole");
+
+        let err = acquire(&dir, "huge", &ask(total + 1), Duration::from_secs(60)).unwrap_err();
+        assert!(err.to_string().contains("never be admitted"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&jobs);
+    }
+
+    /// The disk claim rides after the node, where a reader that knows only the node passes over
+    /// it, and a claim that does not parse makes the entry unreadable rather than claimless.
+    #[test]
+    fn an_entry_remembers_its_disk_claim() {
+        let dir = tmpdir("entry-disk");
+        let placed = held_on(&dir, "placed", 2048, 1, true, Some(Place::Node(3)));
+        let mut entry = Entry::read(&placed).unwrap();
+        entry.disk = Some(12345);
+        entry.write(&placed, &dir.join("placed")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("placed")).unwrap(),
+            "2048 1 granted node=3 disk=12345\n"
+        );
+        let back = Entry::read(&placed).unwrap();
+        assert_eq!((back.node, back.disk), (Some(Place::Node(3)), Some(12345)));
+
+        // A field a later version adds is passed over without costing the node.
+        let later = open_shared(&dir.join("later")).unwrap();
+        (&later)
+            .write_all(b"0 1 granted node=2 disk=7 extra=1\n")
+            .unwrap();
+        let back = Entry::read(&later).unwrap();
+        assert_eq!((back.node, back.disk), (Some(Place::Node(2)), Some(7)));
+
+        let garbled = open_shared(&dir.join("garbled")).unwrap();
+        (&garbled).write_all(b"0 1 granted disk=12x\n").unwrap();
+        assert!(Entry::read(&garbled).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a job's dir is expected to grow to: the most it has held lately plus headroom,
+    /// capped at the filesystem, and nothing where no run measured it.
+    #[test]
+    fn a_disk_expectation_follows_what_the_job_dir_has_held() {
+        let dir = tmpdir("disk-history");
+        assert_eq!(expect_disk(&dir, key("job"), CEIL, u64::MAX), None);
+        // A run that could not read its dir is no evidence either way.
+        remember(&dir, key("job"), run(1000, CEIL));
+        assert_eq!(expect_disk(&dir, key("job"), CEIL, u64::MAX), None);
+
+        for footprint in [8 * GIB, 16 * GIB, 4 * GIB] {
+            let measured = Run {
+                footprint: Some(footprint),
+                ..run(1000, CEIL)
+            };
+            remember(&dir, key("job"), measured);
+        }
+        assert_eq!(
+            expect_disk(&dir, key("job"), CEIL, u64::MAX),
+            Some(20 * GIB)
+        );
+        // Headroom never asks for more than the filesystem has.
+        assert_eq!(
+            expect_disk(&dir, key("job"), CEIL, 18 * GIB),
+            Some(18 * GIB)
+        );
+        // Read against the ceiling, as memory is: another MICROVM_MEM starts again.
+        assert_eq!(expect_disk(&dir, key("job"), 2 * CEIL, u64::MAX), None);
+        assert!(
+            history_summary(&dir, key("job"), CEIL, false)
+                .unwrap()
+                .contains("memory 1000 MiB, job dir 16.0 GiB over 4 runs"),
+            "{:?}",
+            history_summary(&dir, key("job"), CEIL, false)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
