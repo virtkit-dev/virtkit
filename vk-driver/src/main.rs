@@ -57,6 +57,7 @@ mod net;
 mod numa;
 mod oci;
 mod oomkills;
+mod outrelay;
 mod ova;
 mod prio;
 mod publish;
@@ -3898,6 +3899,9 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Ok(m) => m,
             Err(e) => return fail(&e, 2),
         };
+        // The switch logs into a file (a CI job's job dir, a run's work dir): a full
+        // filesystem must not make a line a panic (see outrelay).
+        let _relay = outrelay::relay();
         return match switch::run(
             &listen_bind,
             *gateway,
@@ -3961,10 +3965,15 @@ async fn cli_main(cli: Cli) -> ExitCode {
                     Err(e) => fail(&e, ctx.system_failure),
                 }
             }
-            GitlabCmd::Supervise { job_dir } => match vm::supervise(&ctx, &job_dir).await {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(&e, 1),
-            },
+            GitlabCmd::Supervise { job_dir } => {
+                // Its stdout and stderr are a log in the job dir, so a full filesystem must
+                // not make its every line a panic. Held past `fail`, whose line it drains.
+                let _relay = outrelay::relay();
+                match vm::supervise(&ctx, &job_dir).await {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e, 1),
+                }
+            }
             GitlabCmd::Cleanup => match vm::cleanup(&ctx) {
                 Ok(()) => ExitCode::SUCCESS,
                 // gitlab-runner only logs cleanup failures; report and don't mask
@@ -4217,6 +4226,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
         // run_forward only returns on a bind error; otherwise it serves until the
         // process is killed (cleanup tears the detached child down).
         Cmd::Forward { listen, to } => {
+            // A forward logs into a file, as the switch does (see outrelay).
+            let _relay = outrelay::relay();
             match vk_core::forward::run_forward(&listen, &to, None).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e, 1),

@@ -23,6 +23,8 @@ All notable changes to virtkit will be documented in this file.
 - **A CI job on a full disk fails with a message saying so**, naming the directory the job
   dirs are made in and what its filesystem ran out of (space, inodes or quota), instead of an
   unexplained "supervisor exited during boot (exit status: 101)".
+- A CI job whose runner's job-dir filesystem fills while it runs is no longer torn down the
+  first time its supervisor, network switch or port forwards have a line to log.
 
 ## [0.76.1] - 2026-09-21
 

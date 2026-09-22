@@ -1091,6 +1091,8 @@ pub async fn run(
                 // The receiver runs dry when the last of them is done.
                 let _ = tokio::time::timeout(DRAIN_DEADLINE, drained.recv()).await;
                 guard.publish_bytes();
+                // `exit` runs no destructors, so the relay main set up is finished here.
+                crate::outrelay::finish();
                 std::process::exit(0);
             }
         }
