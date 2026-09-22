@@ -36,6 +36,8 @@ All notable changes to virtkit will be documented in this file.
   unexplained "supervisor exited during boot (exit status: 101)".
 - A CI job whose runner's job-dir filesystem fills while it runs is no longer torn down the
   first time its supervisor, network switch or port forwards have a line to log.
+- A CI job whose `image:` pins a digest no longer shows that digest twice in the trace line
+  naming the image it boots.
 
 ## [0.76.1] - 2026-09-21
 

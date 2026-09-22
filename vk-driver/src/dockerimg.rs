@@ -293,7 +293,9 @@ fn resolve_pinned(
         }
     }
     image::mark_used(&dir);
-    println!("virtkit: image {full}@{digest} (OCI direct boot)");
+    // A ref pinned by the job already carries a digest; the one it resolved to replaces it.
+    let base = strip_digest(full);
+    println!("virtkit: image {base}@{digest} (OCI direct boot)");
     // generic-disk boot: the boot applies the image's Env/User/WorkingDir/Entrypoint/Cmd
     // from the runner.ext4.json sidecar (`resolved_from_dir` loads it) — no baking.
     Ok(image::resolved_from_dir(&dir, BootKind::GenericDisk))
@@ -444,11 +446,16 @@ fn docker_hub_repo(repo_path: &str) -> Option<String> {
     }
 }
 
+/// `r` without its `@digest`, if it has one.
+fn strip_digest(r: &str) -> &str {
+    r.split_once('@').map_or(r, |(base, _)| base)
+}
+
 /// Pin a resolved digest onto `full`, dropping any existing `:tag`/`@digest`, so the pull
 /// fetches exactly the resolved content even if the tag moves. The tag is a `:` after the
 /// last `/` (a registry-host `:port` before the first `/` is left intact).
 fn pin_digest(full: &str, digest: &str) -> String {
-    let base = full.split('@').next().unwrap_or(full);
+    let base = strip_digest(full);
     let tag_at = match base.rfind('/') {
         Some(slash) => base[slash..].find(':').map(|i| slash + i),
         None => base.find(':'),
@@ -474,7 +481,7 @@ fn ref_cache_name(image: &str) -> Result<String> {
 /// the same contract `parse_ref` enforces for the `docker/` form — refusing `..`,
 /// embedded separators and empty segments so a crafted ref cannot escape the cache root.
 fn name_of(reporel: &str) -> Result<String> {
-    let base = reporel.split('@').next().unwrap_or(reporel);
+    let base = strip_digest(reporel);
     let name = match base.rsplit_once('/') {
         Some((dir, last)) => format!("{dir}/{}", last.split(':').next().unwrap_or(last)),
         None => base.split(':').next().unwrap_or(base).to_string(),
@@ -825,6 +832,20 @@ mod tests {
         );
         // traversal in the repository path is still refused
         assert!(ref_cache_name("ghcr.io/../evil").is_err());
+    }
+
+    /// Only the `@digest` comes off: a tag, and a registry host's `:port`, stay.
+    #[test]
+    fn strip_digest_drops_only_the_digest() {
+        for (r, want) in [
+            ("img", "img"),
+            ("img:1.2", "img:1.2"),
+            ("img@sha256:abc", "img"),
+            ("img:1.2@sha256:abc", "img:1.2"),
+            ("reg:5000/ns/img@sha256:abc", "reg:5000/ns/img"),
+        ] {
+            assert_eq!(strip_digest(r), want, "{r}");
+        }
     }
 
     #[test]
