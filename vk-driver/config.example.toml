@@ -38,6 +38,11 @@
 #                        # many times) at the end of its trace. Leave the lists absent
 #                        # (unrestricted) + audit = true to observe without blocking. A job
 #                        # can also set MICROVM_EGRESS_AUDIT.
+# dry_run = true         # dry-run the RUN-phase allowlist: report the flows it would
+#                        # block in the trace, but block nothing (a denied name still
+#                        # resolves). Pair with audit = true to see both sides. A job can
+#                        # set MICROVM_EGRESS_DRY_RUN, but only when this host sets no
+#                        # allow_ip/allow_name of its own, so it cannot relax a host cap.
 #
 # [egress.build]         # BUILD-phase allowlist — a git-defined image / compose build:
 #                        # service's RUN steps. Same shape/semantics as [egress]. Absent

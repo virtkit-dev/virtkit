@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Dry-run the run-phase egress allowlist.** `[egress] dry_run = true` reports the flows
+  the allowlist would block without blocking them, so an allowlist can be rolled out and
+  watched first. A job can turn it on with `MICROVM_EGRESS_DRY_RUN` when the host sets no
+  run-phase allowlist of its own. Pair it with `audit = true` to see both allowed and denied
+  traffic.
+
 ### Changed
 
 - CI egress-denied trace blocks now name the reporting stage, e.g.

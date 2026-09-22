@@ -194,10 +194,15 @@ fn now_secs() -> u64 {
 }
 
 /// Name the stage in an egress-denied header. The switch records throughout the guest's
-/// lifetime, so the same cause can produce denials in several stages.
-fn blocked_header(stage: Option<&str>) -> String {
+/// lifetime, so the same cause can produce denials in several stages. In dry-run the switch
+/// carried every flow it records, so the header says nothing was blocked.
+fn blocked_header(dry_run: bool, stage: Option<&str>) -> String {
     let label = stage.map(|s| format!(" [{s}]")).unwrap_or_default();
-    format!("virtkit: egress blocked by the allowlist{label}:")
+    if dry_run {
+        format!("virtkit: egress the allowlist would block (dry-run, not enforced){label}:")
+    } else {
+        format!("virtkit: egress blocked by the allowlist{label}:")
+    }
 }
 
 /// Forward the per-job switch's egress refusals into the job trace. The switch
@@ -229,7 +234,7 @@ fn report_egress_blocks(ctx: &JobCtx, stage: Option<&str>) {
         }
     }
     if !seen.is_empty() {
-        eprintln!("{}", blocked_header(stage));
+        eprintln!("{}", blocked_header(ctx.egress_run_dry_run(), stage));
         for (msg, n) in &seen {
             if *n > 1 {
                 eprintln!("  {msg} (x{n})");
@@ -618,15 +623,22 @@ pub async fn next(
 mod tests {
     use super::{blocked_header, parse_mark, section};
 
+    /// The egress-denied block header names its stage and, in dry-run, says nothing was
+    /// actually blocked — so a recurring block is not read as a duplicate, and a dry-run
+    /// rollout is not read as a broken pipeline.
     #[test]
-    fn blocked_header_names_the_stage() {
+    fn blocked_header_names_the_stage_and_dry_run() {
         assert_eq!(
-            blocked_header(Some("after_script")),
+            blocked_header(false, Some("after_script")),
             "virtkit: egress blocked by the allowlist [after_script]:"
         );
         assert_eq!(
-            blocked_header(None),
+            blocked_header(false, None),
             "virtkit: egress blocked by the allowlist:"
+        );
+        assert_eq!(
+            blocked_header(true, Some("step_script")),
+            "virtkit: egress the allowlist would block (dry-run, not enforced) [step_script]:"
         );
     }
 

@@ -335,6 +335,11 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // spawned later in the detached supervisor, whose log the job never sees. (The build
     // phase validates in build_git_image / build_compose_unit, also in prepare.)
     effective_run_egress(cfg, ctx)?;
+    if ctx.egress_dry_run_req && !ctx.egress_run_dry_run() {
+        eprintln!(
+            "virtkit: MICROVM_EGRESS_DRY_RUN ignored: the host enforces a run-phase allowlist"
+        );
+    }
     // Same fail-fast rationale for the writable-layer size: it is pure config, and the
     // authoritative check runs in the detached supervisor whose log the job never sees.
     checkout_overlay_size(&cfg.executor.checkout_overlay_size)?;
@@ -2035,6 +2040,7 @@ fn spawn_switch(
         allow_ip,
         allow_name,
         restrict,
+        dry_run: ctx.egress_run_dry_run(),
         per_source,
         registry_proxy,
         log: ctx.switch_log(),

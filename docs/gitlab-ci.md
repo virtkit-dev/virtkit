@@ -118,7 +118,7 @@ does not override the host default.
 | `MICROVM_CPUS` | vCPU count, clamped to the host `[executor.vm] max_cpus` ceiling. |
 | `MICROVM_MEM` | Guest RAM as `<n>G`, clamped to `[executor.vm] max_mem`. |
 | `MICROVM_USER` | User to run the job as inside the guest. |
-| `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME` / `_AUDIT` | Narrow the run-phase egress cap (see [Egress](#egress-control)). |
+| `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME` / `_AUDIT` / `_DRY_RUN` | Narrow / audit / dry-run the run-phase egress cap (see [Egress](#egress-control)). |
 | `MICROVM_BUILD_EGRESS_ALLOW_IP` / `_ALLOW_NAME` / `_AUDIT` | Narrow the build-phase egress cap. |
 | `MICROVM_USAGE_REPORT` | End this job's trace with what every job of its project has been using (see [Sizing a project](#sizing-a-project)). |
 
@@ -1181,11 +1181,41 @@ discover-egress-job:
     MICROVM_BUILD_EGRESS_AUDIT: "1"
 ```
 
+### Dry-run
+
+Audit lists the contacts the allowlist allows; dry-run lists the ones it would deny. It
+covers the **run phase** only: the would-be denials appear in an "egress the allowlist would
+block (dry-run, not enforced)" block in the trace, but nothing is blocked; a denied name
+still resolves, so the job runs unchanged. To roll an allowlist out, turn it on, watch a few
+pipelines, and add whatever the trace flags before enforcement bites.
+
+Dry-run covers the service VMs on the job's LAN too, including a service's own
+`MICROVM_EGRESS_ALLOW_*` lists.
+
+```toml
+[egress]
+allow_name = ["corp.example.com"]   # the allowlist under test
+dry_run = true                      # evaluate it, report, but don't block
+audit = true                        # (optional) also list what it allowed
+```
+
+A job can turn it on for itself with `MICROVM_EGRESS_DRY_RUN` — but, unlike audit, only when
+the host set no run-phase `allow_ip`/`allow_name` of its own: dry-run suspends enforcement,
+and a job must not relax a cap the host enforces. Where the host set a cap, only the host
+`[egress] dry_run` toggle takes effect.
+
+```yaml
+rollout-egress-job:
+  variables:
+    MICROVM_EGRESS_ALLOW_NAME: "corp.example.com"   # job-defined allowlist
+    MICROVM_EGRESS_DRY_RUN: "1"                      # 1/true/yes/on — observe, don't block
+```
+
 ### On the command line
 
 Outside CI, the same controls are CLI flags on `vk run` / `vk build`:
 `--audit-egress` audits the booted guest and `--build-audit-egress` a build's
-`RUN` steps (mirroring the `--net` / `--build-net` phase split).
+`RUN` steps (mirroring the `--net` / `--build-net` phase split). Dry-run is CI-only.
 
 ## Services
 

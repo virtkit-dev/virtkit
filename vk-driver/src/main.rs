@@ -1269,6 +1269,14 @@ enum Cmd {
         /// (set internally by the gitlab executor when a job configures egress).
         #[arg(long = "egress-restrict")]
         egress_restrict: bool,
+        /// dry-run the allowlist: record what it would block, but block nothing
+        ///
+        /// Evaluate the allowlist and log would-be denials for the job trace, but carry the
+        /// flow anyway (a denied name is still resolved and pinned). Set internally by the
+        /// gitlab executor from `[egress] dry_run` / MICROVM_EGRESS_DRY_RUN (the job var only
+        /// when the host sets no run-phase cap); no effect on an unrestricted policy.
+        #[arg(long = "egress-dry-run")]
+        egress_dry_run: bool,
         /// per-source egress override `<src-ip>;<cidr,cidr>;<name,name>` (repeatable)
         ///
         /// Flows from that source use this restricted allowlist instead of the default; an
@@ -3799,6 +3807,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         allow_ip,
         allow_name,
         egress_restrict,
+        egress_dry_run,
         source_egress,
         registry_proxy,
         denied_log,
@@ -3901,6 +3910,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             denied_log.clone(),
             audit_log.clone(),
             net_bytes.clone(),
+            *egress_dry_run,
         )
         .await
         {

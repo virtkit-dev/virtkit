@@ -4197,6 +4197,8 @@ async fn spawn_vm_switch(
         allow_ip: allow_ip.to_vec(),
         allow_name: allow_name.to_vec(),
         restrict,
+        // Dry-run is run-phase CI only (vm.rs): dev `vk run` and every build phase enforce.
+        dry_run: false,
         // Per-service egress overrides are a CI feature (from a service's `variables:`);
         // dev `vk run --compose` siblings share the run policy.
         per_source: Vec::new(),

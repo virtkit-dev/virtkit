@@ -21,7 +21,7 @@ pub enum Proto {
 }
 
 impl Proto {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Proto::Tcp => "tcp",
             Proto::Udp => "udp",
