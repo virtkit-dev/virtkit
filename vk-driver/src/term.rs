@@ -75,14 +75,21 @@ pub(crate) fn catch_terminating_signals(saved: libc::termios) {
     }
 }
 
-/// A key a panel understands, whatever the terminal spelled it as.
+/// A key as a panel receives it, whatever the terminal spelled it as.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Press {
     Left,
     Right,
+    Up,
+    Down,
     Home,
     End,
+    PageUp,
+    PageDown,
     Enter,
+    Tab,
+    /// Shift-Tab, which has no byte of its own: terminals send `ESC [ Z`.
+    BackTab,
     Backspace,
     Escape,
     /// Ctrl-C, which raw mode delivers as a byte rather than as a signal.
@@ -113,6 +120,7 @@ impl Keys {
                 }
                 0x03 => Some(Press::Interrupt),
                 b'\r' | b'\n' => Some(Press::Enter),
+                b'\t' => Some(Press::Tab),
                 0x7f | 0x08 => Some(Press::Backspace),
                 b if b.is_ascii_graphic() || b == b' ' => Some(Press::Char(b as char)),
                 _ => None,
@@ -149,11 +157,21 @@ impl Keys {
         match (sequence.as_slice(), byte) {
             (_, b'D') => Some(Press::Left),
             (_, b'C') => Some(Press::Right),
+            (_, b'A') => Some(Press::Up),
+            (_, b'B') => Some(Press::Down),
             (_, b'H') => Some(Press::Home),
             (_, b'F') => Some(Press::End),
-            // the numbered forms tmux and rxvt send for the same two jumps
-            ([0x1b, b'[', b'1' | b'7', b'~'], _) => Some(Press::Home),
-            ([0x1b, b'[', b'4' | b'8', b'~'], _) => Some(Press::End),
+            (_, b'Z') => Some(Press::BackTab),
+            // The numbered `ESC [ n ~` forms, read by their first parameter so a modifier
+            // (`ESC [ 5 ; 5 ~`) does not hide the key: 1/7 and 4/8 are the Home and End tmux and
+            // rxvt send, 5/6 the VT220 PageUp and PageDown.
+            ([0x1b, b'[', params @ .., b'~'], _) => match params.split(|&b| b == b';').next() {
+                Some(b"1" | b"7") => Some(Press::Home),
+                Some(b"4" | b"8") => Some(Press::End),
+                Some(b"5") => Some(Press::PageUp),
+                Some(b"6") => Some(Press::PageDown),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -295,13 +313,32 @@ mod tests {
         // xterm's arrows and jumps, and the numbered forms tmux and rxvt send
         assert_eq!(feed(b"\x1b[D").0, vec![Press::Left]);
         assert_eq!(feed(b"\x1b[C").0, vec![Press::Right]);
+        assert_eq!(feed(b"\x1b[A").0, vec![Press::Up]);
+        assert_eq!(feed(b"\x1b[B").0, vec![Press::Down]);
         assert_eq!(feed(b"\x1b[H").0, vec![Press::Home]);
         assert_eq!(feed(b"\x1b[F").0, vec![Press::End]);
         assert_eq!(feed(b"\x1bOD").0, vec![Press::Left], "application mode");
+        assert_eq!(feed(b"\x1bOA").0, vec![Press::Up], "application mode");
+        assert_eq!(feed(b"\x1bOB").0, vec![Press::Down], "application mode");
         assert_eq!(feed(b"\x1b[1~").0, vec![Press::Home]);
         assert_eq!(feed(b"\x1b[4~").0, vec![Press::End]);
         assert_eq!(feed(b"\x1b[7~").0, vec![Press::Home]);
         assert_eq!(feed(b"\x1b[8~").0, vec![Press::End]);
+        // the keys a list is walked with, Tab and Shift-Tab
+        assert_eq!(feed(b"\x1b[5~").0, vec![Press::PageUp]);
+        assert_eq!(feed(b"\x1b[6~").0, vec![Press::PageDown]);
+        assert_eq!(feed(b"\t").0, vec![Press::Tab]);
+        assert_eq!(feed(b"\x1b[Z").0, vec![Press::BackTab]);
+        // a modifier changes the parameters, not the key
+        assert_eq!(feed(b"\x1b[1;2A").0, vec![Press::Up], "shift");
+        assert_eq!(feed(b"\x1b[1;5B").0, vec![Press::Down], "ctrl");
+        assert_eq!(feed(b"\x1b[5;5~").0, vec![Press::PageUp], "ctrl");
+        assert_eq!(feed(b"\x1b[4;2~").0, vec![Press::End], "shift");
+        assert_eq!(
+            feed(b"\x1b[200~x").0,
+            vec![Press::Char('x')],
+            "a numbered form there is no key for is consumed whole"
+        );
         // several keys in one read, and the letters and controls a panel uses
         assert_eq!(
             feed(b"\x1b[Dq").0,
@@ -317,6 +354,15 @@ mod tests {
         let (presses, mut keys) = feed(b"\x1b[");
         assert!(presses.is_empty());
         assert_eq!(keys.feed(b'D'), Some(Press::Left));
+        let (presses, mut split) = feed(b"\x1b[6");
+        assert!(presses.is_empty());
+        assert_eq!(split.feed(b'~'), Some(Press::PageDown));
+        let (presses, mut split) = feed(b"\x1bO");
+        assert!(presses.is_empty());
+        assert_eq!(split.feed(b'A'), Some(Press::Up));
+        let (presses, mut split) = feed(b"\x1b[");
+        assert!(presses.is_empty());
+        assert_eq!(split.feed(b'Z'), Some(Press::BackTab));
         // ...and an escape that never completes was a bare Escape.
         let (_, mut alone) = feed(b"\x1b");
         assert_eq!(alone.flush(), Some(Press::Escape));
