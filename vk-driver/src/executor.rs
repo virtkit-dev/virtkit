@@ -80,7 +80,7 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path, stage: Option<&str>) ->
     // logs allowlist refusals to a host-side file the job never sees, so a script that
     // fails because it could not reach a host would otherwise get no hint why. Reported
     // whether the step passed or failed.
-    report_egress_blocks(ctx);
+    report_egress_blocks(ctx, stage);
     // On the last stage, print the once-per-job summaries — the "domains contacted" audit
     // (a no-op unless audit is on), the job's standing list of names, and what the job cost
     // the runner — so they appear at the end of the trace.
@@ -193,14 +193,21 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Name the stage in an egress-denied header. The switch records throughout the guest's
+/// lifetime, so the same cause can produce denials in several stages.
+fn blocked_header(stage: Option<&str>) -> String {
+    let label = stage.map(|s| format!(" [{s}]")).unwrap_or_default();
+    format!("virtkit: egress blocked by the allowlist{label}:")
+}
+
 /// Forward the per-job switch's egress refusals into the job trace. The switch
 /// (`net.mode = "switch"`) appends a typed denial record per refusal to its denial channel
 /// (see egress_report), which the running job never sees. This drains only the records
 /// added since the previous stage — a byte offset persisted in the job dir — so each block
 /// is reported once, in the stage during which it happened, then prints them deduplicated
-/// to stderr (gitlab-runner captures it). Best-effort: no channel (net.mode != "switch")
-/// or an IO error is a silent no-op.
-fn report_egress_blocks(ctx: &JobCtx) {
+/// to stderr (gitlab-runner captures it) under a [`blocked_header`] naming `stage`.
+/// Best-effort: no channel (net.mode != "switch") or an IO error is a silent no-op.
+fn report_egress_blocks(ctx: &JobCtx, stage: Option<&str>) {
     let pos_file = ctx.job_dir.join("egress-denied.offset");
     let start: u64 = std::fs::read_to_string(&pos_file)
         .ok()
@@ -222,7 +229,7 @@ fn report_egress_blocks(ctx: &JobCtx) {
         }
     }
     if !seen.is_empty() {
-        eprintln!("virtkit: egress blocked by the allowlist:");
+        eprintln!("{}", blocked_header(stage));
         for (msg, n) in &seen {
             if *n > 1 {
                 eprintln!("  {msg} (x{n})");
@@ -609,7 +616,19 @@ pub async fn next(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_mark, section};
+    use super::{blocked_header, parse_mark, section};
+
+    #[test]
+    fn blocked_header_names_the_stage() {
+        assert_eq!(
+            blocked_header(Some("after_script")),
+            "virtkit: egress blocked by the allowlist [after_script]:"
+        );
+        assert_eq!(
+            blocked_header(None),
+            "virtkit: egress blocked by the allowlist:"
+        );
+    }
 
     /// The framing of a collapsed section, byte for byte. GitLab reads these markers with no
     /// tolerance at all: an escape or a carriage return out of place and the section does not

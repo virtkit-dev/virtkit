@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- CI egress-denied trace blocks now name the reporting stage, e.g.
+  `egress blocked by the allowlist [after_script]:`, so refusals from a background
+  process across stages no longer look like duplicate reports.
+
 ## [0.76.1] - 2026-09-21
 
 ### Fixed
