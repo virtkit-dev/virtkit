@@ -80,7 +80,7 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path, stage: Option<&str>) ->
     // logs allowlist refusals to a host-side file the job never sees, so a script that
     // fails because it could not reach a host would otherwise get no hint why. Reported
     // whether the step passed or failed.
-    report_egress_blocks(ctx);
+    report_egress_blocks(ctx, stage);
     // On the last stage, print the once-per-job summaries — the "domains contacted" audit
     // (a no-op unless audit is on), the job's standing list of names, and what the job cost
     // the runner — so they appear at the end of the trace.
@@ -198,9 +198,12 @@ fn now_secs() -> u64 {
 /// (see egress_report), which the running job never sees. This drains only the records
 /// added since the previous stage — a byte offset persisted in the job dir — so each block
 /// is reported once, in the stage during which it happened, then prints them deduplicated
-/// to stderr (gitlab-runner captures it). Best-effort: no channel (net.mode != "switch")
-/// or an IO error is a silent no-op.
-fn report_egress_blocks(ctx: &JobCtx) {
+/// to stderr (gitlab-runner captures it). The block is labelled with `stage`, the sub-stage
+/// that drained it: the switch keeps recording for as long as the guest lives, so denials
+/// from one cause (e.g. a background process the script left running) can land across
+/// several stages, and an unlabelled header repeated verbatim reads as a spurious duplicate.
+/// Best-effort: no channel (net.mode != "switch") or an IO error is a silent no-op.
+fn report_egress_blocks(ctx: &JobCtx, stage: Option<&str>) {
     let pos_file = ctx.job_dir.join("egress-denied.offset");
     let start: u64 = std::fs::read_to_string(&pos_file)
         .ok()
@@ -222,7 +225,8 @@ fn report_egress_blocks(ctx: &JobCtx) {
         }
     }
     if !seen.is_empty() {
-        eprintln!("virtkit: egress blocked by the allowlist:");
+        let label = stage.map(|s| format!(" [{s}]")).unwrap_or_default();
+        eprintln!("virtkit: egress blocked by the allowlist{label}:");
         for (msg, n) in &seen {
             if *n > 1 {
                 eprintln!("  {msg} (x{n})");
