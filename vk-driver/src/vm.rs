@@ -2035,6 +2035,7 @@ fn spawn_switch(
         allow_ip,
         allow_name,
         restrict,
+        dry_run: ctx.egress_run_dry_run(),
         per_source,
         registry_proxy,
         log: ctx.switch_log(),

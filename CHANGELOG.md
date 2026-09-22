@@ -4,6 +4,21 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Dry-run the run-phase egress allowlist.** `[egress] dry_run = true` (or a job's
+  `MICROVM_EGRESS_DRY_RUN`, when the host set no run-phase cap of its own) evaluates the
+  allowlist and reports every flow it *would* block, but blocks nothing — a denied name is
+  still resolved and pinned, so the job runs unchanged. Roll an allowlist out in observe-only
+  mode before it bites; pair with `audit = true` to see both the allowed and the denied side.
+
+### Changed
+
+- Each run's egress-denied trace block is now labelled with the sub-stage that produced it
+  (e.g. `[after_script]`). The switch keeps recording for as long as the guest lives, so
+  denials from a background process the script left running can land across several stages;
+  the unlabelled header repeated verbatim read as a spurious duplicate.
+
 ## [0.76.1] - 2026-09-21
 
 ### Fixed

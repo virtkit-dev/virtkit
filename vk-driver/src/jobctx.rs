@@ -37,6 +37,11 @@ pub struct JobCtx {
     pub egress_audit_req: bool,
     /// MICROVM_BUILD_EGRESS_AUDIT: the same, for the build phase (`[egress.build] audit`).
     pub egress_build_audit_req: bool,
+    /// MICROVM_EGRESS_DRY_RUN job variable: when truthy, dry-run this job's run-phase
+    /// allowlist (record what it would block, block nothing). Unlike audit this relaxes
+    /// enforcement, so it is honored only when the host set no run-phase cap of its own —
+    /// see [`JobCtx::egress_run_dry_run`].
+    pub egress_dry_run_req: bool,
     /// Whether the identity above came from the runner's own account of the job rather than
     /// from the variables beside it. Anything that hands a job data keyed on that identity has
     /// to check it: the fallback is the job naming a project for itself.
@@ -138,6 +143,7 @@ impl JobCtx {
             egress_audit_req: job_var("MICROVM_EGRESS_AUDIT").is_some_and(|v| is_truthy(&v)),
             egress_build_audit_req: job_var("MICROVM_BUILD_EGRESS_AUDIT")
                 .is_some_and(|v| is_truthy(&v)),
+            egress_dry_run_req: job_var("MICROVM_EGRESS_DRY_RUN").is_some_and(|v| is_truthy(&v)),
             identity_from_runner: response.is_some(),
             usage_report_req: job_var("MICROVM_USAGE_REPORT").is_some_and(|v| is_truthy(&v)),
             build_failure: exit_code_env("BUILD_FAILURE_EXIT_CODE", 1),
@@ -352,6 +358,18 @@ impl JobCtx {
     /// own `MICROVM_BUILD_EGRESS_AUDIT` request.
     pub fn egress_build_audit(&self) -> bool {
         self.cfg.egress.build.audit || self.egress_build_audit_req
+    }
+    /// Whether this job's run-phase allowlist is dry-run (evaluated and its would-be denials
+    /// reported, but not enforced). The host `[egress] dry_run` toggle always applies; the
+    /// job's own `MICROVM_EGRESS_DRY_RUN` applies only when the host set no run-phase cap
+    /// (both lists absent), so the run-phase allowlist is then entirely job-defined and a job
+    /// dry-running it relaxes nothing the host enforces. Unlike audit — which is safe for any
+    /// job to turn on because it only observes — this suspends blocking, so it is gated.
+    pub fn egress_run_dry_run(&self) -> bool {
+        self.cfg.egress.dry_run
+            || (self.egress_dry_run_req
+                && self.cfg.egress.allow_ip.is_none()
+                && self.cfg.egress.allow_name.is_none())
     }
     /// The host unix socket the switch listens on for host vsock port `port`
     /// (`<vsock.sock>_<port>`). Under libkrun the guest's virtio-net backend dials
@@ -657,6 +675,7 @@ mod tests {
             egress_build_allow_name_req: None,
             egress_audit_req: false,
             egress_build_audit_req: false,
+            egress_dry_run_req: false,
             identity_from_runner: false,
             usage_report_req: false,
             build_failure: 1,
@@ -696,6 +715,31 @@ mod tests {
         let mut same_slug = ctx(Config::default());
         same_slug.project_id = Some("77".into());
         assert_ne!(same_slug.usage_key(), ctx(Config::default()).usage_key());
+    }
+
+    /// Dry-run suspends enforcement, so — unlike audit — a job may not turn it on for itself
+    /// when the host has set a run-phase cap: that would let the job escape the host's policy.
+    #[test]
+    fn dry_run_job_var_cannot_relax_a_host_cap() {
+        // Host toggle always applies.
+        let mut cfg = Config::default();
+        cfg.egress.dry_run = true;
+        assert!(ctx(cfg).egress_run_dry_run());
+
+        // Job var, host set no run-phase cap: honored (the allowlist is job-defined).
+        let mut c = ctx(Config::default());
+        c.egress_dry_run_req = true;
+        assert!(c.egress_run_dry_run());
+
+        // Job var, but the host set a cap: ignored, so the job cannot relax it.
+        let mut cfg = Config::default();
+        cfg.egress.allow_name = Some(vec!["corp.example.com".into()]);
+        let mut c = ctx(cfg);
+        c.egress_dry_run_req = true;
+        assert!(!c.egress_run_dry_run());
+
+        // Neither set: enforced.
+        assert!(!ctx(Config::default()).egress_run_dry_run());
     }
 
     /// Names that reduce to the same filename are still different jobs, and the digest of

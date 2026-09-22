@@ -203,6 +203,19 @@ fn now_secs() -> u64 {
 /// from one cause (e.g. a background process the script left running) can land across
 /// several stages, and an unlabelled header repeated verbatim reads as a spurious duplicate.
 /// Best-effort: no channel (net.mode != "switch") or an IO error is a silent no-op.
+/// The header for a run's egress-denied block: it names the sub-stage that drained the block,
+/// so denials from a background process that land across several stages don't read as a
+/// repeated header, and in dry-run it says the allowlist did not actually block — the switch
+/// recorded these and carried them, so the block must not look like a broken pipeline.
+fn blocked_header(dry_run: bool, stage: Option<&str>) -> String {
+    let label = stage.map(|s| format!(" [{s}]")).unwrap_or_default();
+    if dry_run {
+        format!("virtkit: egress the allowlist WOULD block (dry-run, not enforced){label}:")
+    } else {
+        format!("virtkit: egress blocked by the allowlist{label}:")
+    }
+}
+
 fn report_egress_blocks(ctx: &JobCtx, stage: Option<&str>) {
     let pos_file = ctx.job_dir.join("egress-denied.offset");
     let start: u64 = std::fs::read_to_string(&pos_file)
@@ -225,8 +238,7 @@ fn report_egress_blocks(ctx: &JobCtx, stage: Option<&str>) {
         }
     }
     if !seen.is_empty() {
-        let label = stage.map(|s| format!(" [{s}]")).unwrap_or_default();
-        eprintln!("virtkit: egress blocked by the allowlist{label}:");
+        eprintln!("{}", blocked_header(ctx.egress_run_dry_run(), stage));
         for (msg, n) in &seen {
             if *n > 1 {
                 eprintln!("  {msg} (x{n})");
@@ -613,7 +625,26 @@ pub async fn next(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_mark, section};
+    use super::{blocked_header, parse_mark, section};
+
+    /// The egress-denied block header names its stage and, in dry-run, says nothing was
+    /// actually blocked — so a recurring block is not read as a duplicate, and a dry-run
+    /// rollout is not read as a broken pipeline.
+    #[test]
+    fn blocked_header_names_the_stage_and_dry_run() {
+        assert_eq!(
+            blocked_header(false, Some("after_script")),
+            "virtkit: egress blocked by the allowlist [after_script]:"
+        );
+        assert_eq!(
+            blocked_header(false, None),
+            "virtkit: egress blocked by the allowlist:"
+        );
+        assert_eq!(
+            blocked_header(true, Some("step_script")),
+            "virtkit: egress the allowlist WOULD block (dry-run, not enforced) [step_script]:"
+        );
+    }
 
     /// The framing of a collapsed section, byte for byte. GitLab reads these markers with no
     /// tolerance at all: an escape or a carriage return out of place and the section does not

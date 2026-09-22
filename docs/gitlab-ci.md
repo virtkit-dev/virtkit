@@ -118,7 +118,7 @@ does not override the host default.
 | `MICROVM_CPUS` | vCPU count, clamped to the host `[executor.vm] max_cpus` ceiling. |
 | `MICROVM_MEM` | Guest RAM as `<n>G`, clamped to `[executor.vm] max_mem`. |
 | `MICROVM_USER` | User to run the job as inside the guest. |
-| `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME` / `_AUDIT` | Narrow the run-phase egress cap (see [Egress](#egress-control)). |
+| `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME` / `_AUDIT` / `_DRY_RUN` | Narrow / audit / dry-run the run-phase egress cap (see [Egress](#egress-control)). |
 | `MICROVM_BUILD_EGRESS_ALLOW_IP` / `_ALLOW_NAME` / `_AUDIT` | Narrow the build-phase egress cap. |
 | `MICROVM_USAGE_REPORT` | End this job's trace with what every job of its project has been using (see [Sizing a project](#sizing-a-project)). |
 
@@ -1179,6 +1179,34 @@ discover-egress-job:
   variables:
     MICROVM_EGRESS_AUDIT: "1"           # 1/true/yes/on
     MICROVM_BUILD_EGRESS_AUDIT: "1"
+```
+
+### Dry-run
+
+Dry-run goes a step further than audit for the **run phase**: it evaluates the allowlist and
+reports every flow it *would* block — an "egress the allowlist WOULD block (dry-run, not
+enforced)" block in the trace — but blocks nothing (a denied name is still resolved and
+pinned, so the job runs unchanged). It is how you roll an allowlist out: turn it on, watch a
+few pipelines, and add whatever the trace flags before enforcement bites. Pair it with
+`audit = true` to see both sides — the names the policy allows and the ones it would reject.
+
+```toml
+[egress]
+allow_name = ["corp.example.com"]   # the allowlist under test
+dry_run = true                      # evaluate it, report, but don't block
+audit = true                        # (optional) also list what it allowed
+```
+
+A job can turn it on for itself with `MICROVM_EGRESS_DRY_RUN` — but, unlike audit, only when
+the host set no run-phase `allow_ip`/`allow_name` of its own. Dry-run suspends enforcement, so
+a job must not be able to relax a cap the host enforces; where the host set a cap, only the
+host `[egress] dry_run` toggle takes effect.
+
+```yaml
+rollout-egress-job:
+  variables:
+    MICROVM_EGRESS_ALLOW_NAME: "corp.example.com"   # job-defined allowlist
+    MICROVM_EGRESS_DRY_RUN: "1"                      # 1/true/yes/on — observe, don't block
 ```
 
 ### On the command line

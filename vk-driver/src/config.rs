@@ -437,6 +437,13 @@ pub struct Egress {
     pub allow_ip: Option<Vec<String>>,
     pub allow_name: Option<Vec<String>>,
     pub audit: bool,
+    /// Dry-run the run-phase allowlist: evaluate it and surface every would-be denial in the
+    /// job trace, but block nothing (a denied name still resolves). Lets a host roll an
+    /// allowlist out in observe-only mode before it bites. Independent of `audit` (which
+    /// records the *allowed* contacts) — the two together show both sides of the policy. A
+    /// job may opt itself in with `MICROVM_EGRESS_DRY_RUN`, but only when the host set no
+    /// run-phase cap of its own, so it can never relax a cap the host does enforce.
+    pub dry_run: bool,
     /// `[egress.build]` — build phase RUN egress. Absent (the default) = unrestricted, as
     /// `docker build`.
     pub build: EgressPolicy,

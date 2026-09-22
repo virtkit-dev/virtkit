@@ -331,6 +331,14 @@ struct EgressGuard {
     /// egress in its `variables:`). A flow's policy is `per_source[src]` or `policy`.
     per_source: HashMap<Ipv4Addr, Egress>,
     gateway: Ipv4Addr,
+    /// Enforce the policy, or only observe it. `true` (the default) blocks a denied flow —
+    /// NXDOMAIN for a name outside the allowlist, RST/drop for a direct dial. `false` is
+    /// dry-run: the verdict is still computed and each would-be denial recorded to
+    /// `denied_log`, but the flow is carried anyway (a denied name is resolved and pinned so
+    /// the guest's connection succeeds). Lets a job discover what an allowlist would reject
+    /// before it is made to bite. Only meaningful under a restricted policy — an unrestricted
+    /// one denies nothing to observe.
+    enforce: bool,
     /// DNS-pinned A-records, keyed by `(source, resolved_ip)` so one VM's resolution never
     /// admits a connection from another VM with a different policy (per-source isolation).
     pinned: Mutex<HashMap<(Ipv4Addr, Ipv4Addr), Instant>>,
@@ -374,6 +382,7 @@ impl EgressGuard {
             policy,
             per_source: HashMap::new(),
             gateway,
+            enforce: true,
             pinned: Mutex::new(HashMap::new()),
             registry_proxy: None,
             denied_log: None,
@@ -389,6 +398,12 @@ impl EgressGuard {
     }
     fn with_per_source(mut self, per_source: HashMap<Ipv4Addr, Egress>) -> Self {
         self.per_source = per_source;
+        self
+    }
+    /// Set enforcement. `false` puts the guard in dry-run: policy is evaluated and would-be
+    /// denials are recorded, but no flow is blocked (see the `enforce` field).
+    fn with_enforce(mut self, enforce: bool) -> Self {
+        self.enforce = enforce;
         self
     }
     fn with_registry_proxy(mut self, redirect: Option<(Ipv4Addr, SocketAddr)>) -> Self {
@@ -617,9 +632,14 @@ impl EgressGuard {
             return None;
         }
         if !self.allows(*syn.src.ip(), SocketAddr::V4(syn.dst)) {
-            eprintln!("switch: egress denied (tcp) {} — sent RST", syn.dst);
             self.record_denial(crate::egress_report::Proto::Tcp, &syn.dst.to_string());
-            return tcp_rst_frame(&syn, client_mac);
+            if self.enforce {
+                eprintln!("switch: egress denied (tcp) {} — sent RST", syn.dst);
+                return tcp_rst_frame(&syn, client_mac);
+            }
+            // Dry-run: recorded, but carry the flow. proxy_tcp will not re-record it (this
+            // SYN gate is the authoritative one; its fallback only fires on a pin race).
+            eprintln!("switch: egress would deny (tcp) {} — dry-run, allowed", syn.dst);
         }
         if unroutable(*syn.dst.ip()) {
             // Not a policy decision, so it is not recorded as a denial: the address itself
@@ -789,6 +809,10 @@ pub struct Spawn {
     /// CI executor for a phase whose egress is configured (so `allow_name = []` = deny all);
     /// `false` for dev `vk run`, where an unset allowlist means unrestricted.
     pub restrict: bool,
+    /// Dry-run the allowlist: evaluate the policy and record every would-be denial for the
+    /// job trace, but carry the flow instead of blocking it (see `EgressGuard::enforce`).
+    /// `false` is the normal enforcing switch. Only meaningful together with `restrict`.
+    pub dry_run: bool,
     /// Per-source egress overrides — a service that set its own `MICROVM_EGRESS_ALLOW_*`
     /// (see vm.rs). Each entry `(source-ip, allow_ip, allow_name)` is always a restricted
     /// allowlist (empty = deny); a source with no entry uses the default (run) policy.
@@ -857,6 +881,9 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     }
     if opts.restrict {
         cmd.arg("--egress-restrict");
+    }
+    if opts.dry_run {
+        cmd.arg("--egress-dry-run");
     }
     for (ip, ips, names) in &opts.per_source {
         // `<src-ip>;<cidr,cidr>;<name,name>` — a source's own restricted allowlist. IPv4
@@ -945,6 +972,7 @@ pub async fn run(
     denied_log: Option<PathBuf>,
     audit_log: Option<PathBuf>,
     bytes_log: Option<PathBuf>,
+    dry_run: bool,
 ) -> Result<()> {
     if listen.is_empty() {
         bail!("switch: at least one --listen is required");
@@ -969,7 +997,8 @@ pub async fn run(
             .with_registry_proxy(registry_proxy)
             .with_denied_log(denied_log)
             .with_audit_log(audit_log)
-            .with_bytes_log(bytes_log),
+            .with_bytes_log(bytes_log)
+            .with_enforce(!dry_run),
     );
     let restricted = guard.restricted();
     guard.open_bytes();
@@ -1059,9 +1088,10 @@ pub async fn run(
         // The audit channel is open for every CI job now — the standing list of names reads
         // it too — so its presence no longer says this job audits, and the log does not claim
         // it does.
-        match restricted {
-            true => "allowlist",
-            false => "unrestricted",
+        match (restricted, dry_run) {
+            (true, false) => "allowlist",
+            (true, true) => "allowlist (dry-run, observe-only)",
+            (false, _) => "unrestricted",
         },
         if per_source_count > 0 {
             format!(" ({per_source_count} per-service override(s))")
@@ -1408,7 +1438,8 @@ fn proxy_tcp(
         let target = match egress.registry_proxy {
             Some((sentinel, host)) if dst.ip() == IpAddr::V4(sentinel) => host,
             _ => {
-                if !src.is_some_and(|s| egress.allows(s, dst)) {
+                let allowed = src.is_some_and(|s| egress.allows(s, dst));
+                if !allowed && egress.enforce {
                     // Fallback deny path: a denied SYN is normally RST'd earlier in
                     // `reject_denied_syn` before ipstack completes the handshake, so this only
                     // fires for a flow that slipped through (e.g. a DNS pin expiring between the
@@ -1417,7 +1448,10 @@ fn proxy_tcp(
                     egress.record_denial(crate::egress_report::Proto::Tcp, &dst.to_string());
                     return;
                 }
-                if let (Some(s), SocketAddr::V4(v4)) = (src, dst) {
+                // A genuinely-allowed flow is an audited IP contact; a dry-run would-be denial
+                // is not — `reject_denied_syn` already recorded it at the SYN, and it must not
+                // also count as an allowed contact.
+                if allowed && let (Some(s), SocketAddr::V4(v4)) = (src, dst) {
                     egress.record_ip_contact(s, v4);
                 }
                 dst
@@ -1831,12 +1865,18 @@ fn set_sock_opt(
 async fn proxy_udp(mut guest: ipstack::IpStackUdpStream, egress: Arc<EgressGuard>) {
     let dst = guest.peer_addr();
     let src = guest_src(guest.local_addr());
-    if !src.is_some_and(|s| egress.allows(s, dst)) {
-        eprintln!("switch: egress denied (udp) {dst}");
+    let allowed = src.is_some_and(|s| egress.allows(s, dst));
+    if !allowed {
         egress.record_denial(crate::egress_report::Proto::Udp, &dst.to_string());
-        return;
+        if egress.enforce {
+            eprintln!("switch: egress denied (udp) {dst}");
+            return;
+        }
+        eprintln!("switch: egress would deny (udp) {dst} — dry-run, allowed");
     }
-    if let (Some(s), SocketAddr::V4(v4)) = (src, dst) {
+    // Only a genuinely-allowed dial is an audited IP contact; a dry-run would-be denial is
+    // in the denial channel above instead, not double-counted as a contact.
+    if allowed && let (Some(s), SocketAddr::V4(v4)) = (src, dst) {
         egress.record_ip_contact(s, v4);
     }
     let bind: SocketAddr = if dst.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }
@@ -1983,12 +2023,20 @@ async fn handle_dns(
                     Some(dns_servfail(&query, qend))
                 }
             }
-        } else if egress.name_allowed(client_ip, &name) {
-            // Audit: count the guest's A-record lookups as its external contacts (egress
-            // is IPv4, so an A query is what precedes a connection); the paired AAAA query
-            // for the same name is not double-counted.
-            if qtype == TYPE_A {
-                egress.record_contact(&name);
+        } else if egress.name_allowed(client_ip, &name) || !egress.enforce {
+            if egress.name_allowed(client_ip, &name) {
+                // Audit: count the guest's A-record lookups as its external contacts (egress
+                // is IPv4, so an A query is what precedes a connection); the paired AAAA query
+                // for the same name is not double-counted.
+                if qtype == TYPE_A {
+                    egress.record_contact(&name);
+                }
+            } else {
+                // Dry-run: the allowlist would refuse this name. Record the would-be denial,
+                // but resolve and pin it below anyway so the guest's connection succeeds — the
+                // point of the mode is to observe without breaking the job.
+                egress.record_denial(crate::egress_report::Proto::Dns, &name);
+                eprintln!("switch: dns would refuse (egress allowlist): {name} — dry-run, resolved");
             }
             // forward, then pin the A-records (scoped to this resolving guest) so its
             // connection is allowed — and only its, not another VM's with a different policy.
@@ -3634,6 +3682,59 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_records_a_denied_syn_but_carries_it() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let client_mac: Mac = [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc];
+        let dir = std::env::temp_dir().join(format!("vk-dryrun-syn-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let denied = dir.join("egress-denied.log");
+        let _ = std::fs::remove_file(&denied);
+
+        // Restricted to 10.20.0.0/16, but dry-run: the verdict still computes, nothing blocks.
+        let guard = EgressGuard::new(Egress::new(&["10.20.0.0/16".into()], &[]).unwrap(), gw)
+            .with_denied_log(Some(denied.clone()))
+            .with_enforce(false);
+
+        let syn_to = |dst: Ipv4Addr| {
+            let mut ip = Vec::new();
+            etherparse::PacketBuilder::ipv4(guest.octets(), dst.octets(), 64)
+                .tcp(44444, 443, 1, 64240)
+                .syn()
+                .write(&mut ip, &[])
+                .unwrap();
+            ip
+        };
+
+        // A dst the allowlist denies is carried (no RST) — but recorded as a would-be denial.
+        let denied_dst = Ipv4Addr::new(93, 184, 216, 34);
+        assert!(
+            guard
+                .reject_denied_syn(&syn_to(denied_dst), client_mac)
+                .is_none(),
+            "dry-run carries a denied SYN instead of RSTing it"
+        );
+        let (recorded, _) = crate::egress_report::read_since(&denied, 0);
+        assert_eq!(
+            recorded,
+            vec![crate::egress_report::Denial {
+                proto: crate::egress_report::Proto::Tcp,
+                target: format!("{denied_dst}:443"),
+            }],
+            "the would-be denial is recorded even in dry-run"
+        );
+
+        // An unroutable dst is not a policy call: it still gets a RST, dry-run or not.
+        assert!(
+            guard
+                .reject_denied_syn(&syn_to(Ipv4Addr::new(203, 0, 113, 5)), client_mac)
+                .is_some(),
+            "an unroutable dst is RST even in dry-run"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn unroutable_covers_reserved_space_but_not_the_lan() {
         let u = |s: &str| unroutable(s.parse().unwrap());
         // RFC 5737 documentation ranges — what a test dials when it wants nowhere.
@@ -4628,6 +4729,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .await;
         });
@@ -4695,6 +4797,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .await;
         });
@@ -4775,6 +4878,7 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
             )
             .await;
         });
