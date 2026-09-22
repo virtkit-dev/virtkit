@@ -71,9 +71,8 @@ pub fn archive_dir(ctx: &JobCtx, date: &str) -> PathBuf {
     archive_root(&ctx.cfg).join(date).join(ctx.atop_component())
 }
 
-/// Create this job's archive directory and record its path in the job dir, where
-/// `supervise` (a separate process) reads it and the final stage finds the log to
-/// report. Returns the directory.
+/// Create this job's archive directory, which [`record_archive_dir`] then records. Returns
+/// the directory.
 ///
 /// A directory already there was prepared by this same job id — a re-`prepare` of the run,
 /// not a second CI run of the job — and is replaced: the job about to boot is the one the
@@ -88,12 +87,19 @@ pub fn prepare_archive(ctx: &JobCtx) -> Result<PathBuf> {
         return Err(e).with_context(|| format!("removing stale {}", dir.display()));
     }
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Record `dir`, the archive directory [`prepare_archive`] made, in the job dir, where
+/// `supervise` (a separate process) reads it and the final stage finds the log to report.
+/// Split from [`prepare_archive`] because it writes to the job dir's filesystem, not the
+/// archive's, and the caller tells the two failures apart.
+pub fn record_archive_dir(ctx: &JobCtx, dir: &Path) -> Result<()> {
     let marker = ctx.atop_dir_file();
     // The path in its own bytes: a state dir that is not UTF-8 has to come back as the
     // directory it is, not as a lossy rendering of one.
     std::fs::write(&marker, dir.as_os_str().as_bytes())
-        .with_context(|| format!("writing {}", marker.display()))?;
-    Ok(dir)
+        .with_context(|| format!("writing {}", marker.display()))
 }
 
 /// The archive directory prepare created for this job, or `None` where it recorded
@@ -688,6 +694,7 @@ mod tests {
         assert_eq!(job_archive_dir(&ctx), None, "no marker, nothing recorded");
 
         let dir = prepare_archive(&ctx).expect("the archive directory");
+        record_archive_dir(&ctx, &dir).expect("the marker");
         assert_eq!(dir, archive_dir(&ctx, &today()));
         assert!(dir.is_dir());
         assert_eq!(

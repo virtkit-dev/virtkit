@@ -1,7 +1,7 @@
 //! Per-job context: the gitlab-runner custom-executor environment
 //! (CUSTOM_ENV_*, failure exit codes) plus the job's on-disk state layout.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
@@ -240,6 +240,11 @@ impl JobCtx {
     /// on purpose: a job's own dir is wiped and recreated by its prepare.
     pub fn admit_dir(&self) -> PathBuf {
         self.cfg.state_dir().join("admit")
+    }
+
+    /// The directory every job's dir is made in, and so the filesystem their overlays fill.
+    pub fn jobs_dir(&self) -> &Path {
+        self.job_dir.parent().unwrap_or(&self.job_dir)
     }
 
     pub fn overlay(&self) -> PathBuf {

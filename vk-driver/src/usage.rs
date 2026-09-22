@@ -691,6 +691,47 @@ fn parse_pss(rollup: &str) -> Option<u64> {
     })
 }
 
+/// A filesystem's size and what is left of it for an unprivileged writer, in bytes and in
+/// inodes. The blocks and inodes ext4 reserves for root count as used: `vk` cannot take them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FsSpace {
+    pub avail: u64,
+    pub total: u64,
+    pub files_avail: u64,
+    /// 0 on a filesystem with no fixed inode count (btrfs, for one).
+    pub files: u64,
+}
+
+impl FsSpace {
+    pub fn used(&self) -> u64 {
+        self.total.saturating_sub(self.avail)
+    }
+    pub fn files_used(&self) -> u64 {
+        self.files.saturating_sub(self.files_avail)
+    }
+}
+
+/// [`FsSpace`] of the filesystem holding `path`.
+pub(crate) fn fs_space(path: &std::path::Path) -> std::io::Result<FsSpace> {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let mut buf = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: statvfs fills the whole struct through the pointer, and only on success.
+    let vfs = unsafe {
+        if libc::statvfs(c_path.as_ptr(), buf.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        buf.assume_init()
+    };
+    // Saturating: figures the kernel filled in are not worth a panic or a wrapped total.
+    Ok(FsSpace {
+        avail: vfs.f_bavail.saturating_mul(vfs.f_frsize),
+        total: vfs.f_blocks.saturating_mul(vfs.f_frsize),
+        files_avail: vfs.f_favail,
+        files: vfs.f_files,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1384,6 +1425,22 @@ mod tests {
         assert!(
             own * 4 < total,
             "the root holds {own} of the tree's {total}; the walk did not descend"
+        );
+    }
+
+    #[test]
+    fn fs_space_reads_the_filesystem_holding_a_path() {
+        let space = fs_space(&std::env::temp_dir()).unwrap();
+        assert!(space.total > 0 && space.avail <= space.total, "{space:?}");
+        assert_eq!(space.used(), space.total - space.avail);
+        assert!(
+            space.files_avail <= space.files || space.files == 0,
+            "{space:?}"
+        );
+        let gone = std::env::temp_dir().join("vk-fs-space-no-such-dir");
+        assert_eq!(
+            fs_space(&gone).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
         );
     }
 }

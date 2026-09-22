@@ -18,6 +18,12 @@ All notable changes to virtkit will be documented in this file.
   `egress blocked by the allowlist [after_script]:`, so refusals from a background
   process across stages no longer look like duplicate reports.
 
+### Fixed
+
+- **A CI job on a full disk fails with a message saying so**, naming the directory the job
+  dirs are made in and what its filesystem ran out of (space, inodes or quota), instead of an
+  unexplained "supervisor exited during boot (exit status: 101)".
+
 ## [0.76.1] - 2026-09-21
 
 ### Fixed

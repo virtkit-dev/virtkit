@@ -411,11 +411,11 @@ pub fn create_overlay(path: &Path, backing: &Path) -> Result<()> {
 
     let mut out = File::create(path).with_context(|| format!("creating {}", path.display()))?;
     use std::io::Write;
-    out.write_all(&c0)?;
-    out.write_all(&rct)?;
-    out.write_all(&rcb)?;
-    out.write_all(&l1)?;
-    Ok(())
+    out.write_all(&c0)
+        .and_then(|()| out.write_all(&rct))
+        .and_then(|()| out.write_all(&rcb))
+        .and_then(|()| out.write_all(&l1))
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 /// Flatten the full logical content of a qcow2 (resolving its whole backing chain) into a

@@ -4393,7 +4393,10 @@ fn host_policy_cmd(policy: &str, workspace: &Path, argv: &[String]) -> ExitCode 
 }
 
 fn fail(e: &anyhow::Error, code: i32) -> ExitCode {
-    eprintln!("virtkit: error: {e:#}");
+    use std::io::Write;
+    // Not `eprintln!`, which panics when the write fails: the job supervisor's stderr is a log
+    // on the job dir's filesystem, and filling that would turn every error into exit 101.
+    let _ = writeln!(std::io::stderr(), "virtkit: error: {e:#}");
     exit_code(code)
 }
 

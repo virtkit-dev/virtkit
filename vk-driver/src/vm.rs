@@ -354,23 +354,43 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             .with_context(|| format!("removing stale {}", ctx.job_dir.display()))?;
     }
     std::fs::create_dir_all(&ctx.job_dir)
-        .with_context(|| format!("creating {}", ctx.job_dir.display()))?;
+        .with_context(|| format!("creating {}", ctx.job_dir.display()))
+        .map_err(|e| name_full_fs(e, ctx.jobs_dir()))?;
 
     // [executor] atop: give this job somewhere to record what its guest does, and remember
     // where — the supervisor shares that directory into the guest, and the last stage
     // reports the log's path. Validated here (a job-visible error names the setting) but
-    // never fatal beyond that: a host whose archive cannot be written still runs jobs,
-    // silently unrecorded but for the warning.
+    // otherwise fatal only for a full job dirs' filesystem, which has no room for the overlay
+    // either: a host whose archive cannot be written still runs jobs, unrecorded but for the
+    // warning.
     if crate::atop::enabled(cfg) {
         let interval = crate::atop::interval_secs(cfg)?;
         // Bound what the archive costs the host before adding a job to it.
         crate::atop::prune_archive_daily(cfg);
-        match crate::atop::prepare_archive(ctx) {
+        // Each failure paired with whether it was a write to the job dirs' filesystem: the
+        // archive may be elsewhere, but the marker recording it is in the job dir.
+        let recorded = match crate::atop::prepare_archive(ctx) {
+            Ok(dir) => crate::atop::record_archive_dir(ctx, &dir)
+                .map(|()| dir)
+                .map_err(|e| (e, true)),
+            Err(e) => {
+                let on_jobs_fs = same_fs(ctx.jobs_dir(), &crate::atop::archive_root(cfg));
+                Err((e, on_jobs_fs))
+            }
+        };
+        match recorded {
             Ok(dir) => println!(
                 "virtkit: recording guest stats every {interval}s -> {}",
                 dir.join(vk_core::atop::LOG_NAME).display()
             ),
-            Err(e) => eprintln!("virtkit: warning: not recording guest stats: {e:#}"),
+            Err((e, on_jobs_fs))
+                if atop_failure_is_fatal(storage_full(&e), on_jobs_fs, || {
+                    jobs_fs_full(ctx).is_some()
+                }) =>
+            {
+                return Err(name_full_fs(e, ctx.jobs_dir()));
+            }
+            Err((e, _)) => eprintln!("virtkit: warning: not recording guest stats: {e:#}"),
         }
     }
 
@@ -486,8 +506,9 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     if let Some(src) = &ctx.cfg.source {
         sup_cmd.arg("--config").arg(src);
     }
-    let mut sup =
-        spawn_detached(sup_cmd, &ctx.supervisor_log()).context("spawning the job supervisor")?;
+    let mut sup = spawn_detached(sup_cmd, &ctx.supervisor_log())
+        .context("spawning the job supervisor")
+        .map_err(|e| name_full_fs(e, ctx.jobs_dir()))?;
 
     println!("virtkit: booting microVM {image_ref} (cpus={cpus}, mem={mem})");
 
@@ -501,8 +522,13 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             log_tail(&ctx.supervisor_log(), 15);
             log_tail(&ctx.console_log(), 30);
             log_tail(&ctx.vmm_log(), 20);
+            // The supervisor's log is in the job dir, so a supervisor that ran out of space
+            // there could not write down why; this process still can.
+            let full = jobs_fs_no_room(ctx)
+                .map(|why| format!(" — {why}"))
+                .unwrap_or_default();
             bail!(
-                "the job supervisor exited during boot ({status}, see {})",
+                "the job supervisor exited during boot ({status}, see {}){full}",
                 ctx.supervisor_log().display()
             );
         }
@@ -1389,6 +1415,10 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                     // reads this record to put the figures in the job trace.
                     let _ = std::fs::write(ctx.checkout_seed_log(), format!("{bytes} {secs:.1}\n"));
                     Some(seed_dir)
+                }
+                // No space for the tar is no space for the overlay beside it either.
+                Err(e) if storage_full(&e).is_some() => {
+                    return Err(name_full_fs(e, ctx.jobs_dir()));
                 }
                 Err(e) => {
                     eprintln!(
@@ -2718,6 +2748,141 @@ fn ch_api_put(sock: &Path, endpoint: &str) -> Result<()> {
     }
 }
 
+/// Free space under which the job dirs' filesystem counts as full: the overlay's metadata and
+/// the agent's initramfs alone take more.
+const FULL_BELOW: u64 = 16 * 1024 * 1024;
+
+/// Free inodes under which the job dirs' filesystem counts as full: a job dir alone takes
+/// a couple of dozen.
+const FULL_INODES_BELOW: u64 = 64;
+
+/// Whether `space` has next to no bytes or inodes left.
+fn exhausted(space: &crate::usage::FsSpace) -> bool {
+    space.avail < FULL_BELOW || inodes_exhausted(space)
+}
+
+fn inodes_exhausted(space: &crate::usage::FsSpace) -> bool {
+    space.files > 0 && space.files_avail < FULL_INODES_BELOW
+}
+
+/// The figures of the filesystem holding the job dirs, if it has next to nothing left. A
+/// quota does not show in them, so an exhausted one goes unnoticed here; a write it refuses
+/// is still named by [`name_full_fs`].
+fn jobs_fs_full(ctx: &JobCtx) -> Option<crate::usage::FsSpace> {
+    // A filesystem statvfs cannot read goes undiagnosed: the diagnosis is an extra, and the
+    // caller's own error stands without it.
+    crate::usage::fs_space(ctx.jobs_dir())
+        .ok()
+        .filter(exhausted)
+}
+
+/// Why the job dirs' filesystem has no room, if it has none: its figures where they show it
+/// full, else what it answers a small write into the job dir — a quota, or a btrfs out of
+/// metadata space, does not show in the figures.
+fn jobs_fs_no_room(ctx: &JobCtx) -> Option<String> {
+    if let Some(space) = jobs_fs_full(ctx) {
+        return Some(full_fs(ctx.jobs_dir(), space));
+    }
+    let probe = ctx.job_dir.join(".space-probe");
+    use std::io::Write;
+    let wrote = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|mut f| f.write_all(&[0u8; 4096]));
+    // Best effort: the job dir, probe and all, goes at cleanup.
+    let _ = std::fs::remove_file(&probe);
+    let kind = wrote.err()?.kind();
+    use std::io::ErrorKind::{QuotaExceeded, StorageFull};
+    matches!(kind, StorageFull | QuotaExceeded)
+        .then(|| no_room(kind, ctx.jobs_dir()))
+        .flatten()
+}
+
+/// Whether a failure to set up the atop archive fails the job: only one that found the job
+/// dirs' filesystem full (`kind` is [`storage_full`]'s). `on_jobs_fs` is whether the failed
+/// write was to that filesystem; for one that was not, `jobs_full` asks whether it is full all
+/// the same. A full archive elsewhere costs the job only its statistics.
+fn atop_failure_is_fatal(
+    kind: Option<std::io::ErrorKind>,
+    on_jobs_fs: bool,
+    jobs_full: impl FnOnce() -> bool,
+) -> bool {
+    kind.is_some() && (on_jobs_fs || jobs_full())
+}
+
+/// The kind of `e` if it is a write refused for want of space or quota.
+fn storage_full(e: &anyhow::Error) -> Option<std::io::ErrorKind> {
+    use std::io::ErrorKind::{QuotaExceeded, StorageFull};
+    e.chain().find_map(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind)
+            .filter(|kind| matches!(kind, StorageFull | QuotaExceeded))
+    })
+}
+
+/// Whether `a` and `b` are on the same filesystem. `b` may not exist yet, so its nearest
+/// existing ancestor answers for it.
+fn same_fs(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let dev = |p: &Path| {
+        p.ancestors()
+            .find_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.dev())
+    };
+    matches!((dev(a), dev(b)), (Some(x), Some(y)) if x == y)
+}
+
+/// `e` led by `dir`, the directory whose filesystem it filled, and what that filesystem ran out
+/// of: a bare `ENOSPC` names neither, and the job dir holding the file is gone by the time
+/// anyone reads the trace. Any other error, or one whose filesystem cannot be read, comes back
+/// as it is.
+fn name_full_fs(e: anyhow::Error, dir: &Path) -> anyhow::Error {
+    match storage_full(&e).and_then(|kind| no_room(kind, dir)) {
+        Some(lead) => e.context(lead),
+        None => e,
+    }
+}
+
+/// What the filesystem holding `dir` ran out of, for a write refused with `kind`
+/// (`StorageFull` or `QuotaExceeded`).
+fn no_room(kind: std::io::ErrorKind, dir: &Path) -> Option<String> {
+    match kind {
+        // statvfs does not see quotas: its figures would show a filesystem with room.
+        std::io::ErrorKind::QuotaExceeded => {
+            Some(format!("{} is over its disk quota", dir.display()))
+        }
+        // Figures statvfs cannot read give no lead: the caller's error stands as it came.
+        _ => crate::usage::fs_space(dir)
+            .ok()
+            .map(|space| full_fs(dir, space)),
+    }
+}
+
+/// How full the filesystem holding `dir` is, in inodes where those ran out with bytes left.
+/// Figures that show room (space freed since, or a btrfs out of metadata space) get "ran out
+/// of space" rather than "is full".
+fn full_fs(dir: &Path, space: crate::usage::FsSpace) -> String {
+    if inodes_exhausted(&space) && space.avail >= FULL_BELOW {
+        return format!(
+            "{} is out of inodes ({} of {} used)",
+            dir.display(),
+            space.files_used(),
+            space.files
+        );
+    }
+    format!(
+        "{} {} ({} of {} used)",
+        dir.display(),
+        match exhausted(&space) {
+            true => "is full",
+            false => "ran out of space",
+        },
+        crate::usage::fmt_bytes(space.used()),
+        crate::usage::fmt_bytes(space.total)
+    )
+}
+
 /// Dump the end of the serial console to stderr — the only useful trace when the
 /// guest never brings virtkit-agent up.
 fn log_tail(path: &Path, lines: usize) {
@@ -3622,5 +3787,107 @@ mod tests {
             service_media(&Source::Image("alpine:3.21".into())),
             ServiceMedia::Image
         );
+    }
+
+    /// A write that found no space names the filesystem it filled and how full that is, ahead
+    /// of the bare `ENOSPC`; any other failure is left as it was.
+    #[test]
+    fn a_full_filesystem_is_named_in_front_of_the_error() {
+        use std::io::ErrorKind::{PermissionDenied, QuotaExceeded, StorageFull};
+        let dir = std::env::temp_dir();
+        let failed = |kind| {
+            anyhow::Error::new(std::io::Error::from(kind)).context("writing /jobs/1/atop.dir")
+        };
+        let enospc = failed(StorageFull);
+        assert_eq!(storage_full(&enospc), Some(StorageFull));
+        let named = format!("{:#}", name_full_fs(enospc, &dir));
+        // "is full" or "ran out of space", as the real filesystem's figures have it.
+        let lead = format!("{} ", dir.display());
+        assert!(named.starts_with(&lead), "{named}");
+        assert!(
+            named.contains(" used): writing /jobs/1/atop.dir: "),
+            "{named}"
+        );
+
+        // A quota is not in the filesystem's figures, so none are given.
+        let edquot = failed(QuotaExceeded);
+        assert_eq!(storage_full(&edquot), Some(QuotaExceeded));
+        assert_eq!(
+            format!(
+                "{:#}",
+                name_full_fs(edquot, Path::new("/var/lib/virtkit/jobs"))
+            ),
+            format!(
+                "/var/lib/virtkit/jobs is over its disk quota: writing /jobs/1/atop.dir: {}",
+                std::io::Error::from(QuotaExceeded)
+            )
+        );
+
+        let other = failed(PermissionDenied);
+        assert_eq!(storage_full(&other), None);
+        let kept = format!("{:#}", name_full_fs(other, &dir));
+        assert!(kept.starts_with("writing /jobs/1/atop.dir: "), "{kept}");
+
+        // No filesystem to ask about leaves the error as it came.
+        let unnamed = anyhow::Error::new(std::io::Error::from(StorageFull));
+        let missing = dir.join("vk-no-such-dir-for-name-full-fs");
+        assert_eq!(
+            format!("{:#}", name_full_fs(unnamed, &missing)),
+            std::io::Error::from(StorageFull).to_string()
+        );
+
+        let jobs = Path::new("/var/lib/virtkit/jobs");
+        let bytes_out = crate::usage::FsSpace {
+            avail: 0,
+            total: 128 << 30,
+            files_avail: 1 << 20,
+            files: 8 << 20,
+        };
+        assert!(exhausted(&bytes_out));
+        assert_eq!(
+            full_fs(jobs, bytes_out),
+            "/var/lib/virtkit/jobs is full (128.0 GiB of 128.0 GiB used)"
+        );
+        let inodes_out = crate::usage::FsSpace {
+            avail: 64 << 30,
+            files_avail: 0,
+            ..bytes_out
+        };
+        assert!(exhausted(&inodes_out));
+        assert_eq!(
+            full_fs(jobs, inodes_out),
+            "/var/lib/virtkit/jobs is out of inodes (8388608 of 8388608 used)"
+        );
+        // A filesystem with no fixed inode count (btrfs) is never out of inodes.
+        let no_inode_count = crate::usage::FsSpace {
+            files_avail: 0,
+            files: 0,
+            ..inodes_out
+        };
+        assert!(!exhausted(&no_inode_count));
+        assert_eq!(
+            full_fs(jobs, no_inode_count),
+            "/var/lib/virtkit/jobs ran out of space (64.0 GiB of 128.0 GiB used)"
+        );
+    }
+
+    /// An atop setup failure fails the job only where it found the job dirs' filesystem full.
+    #[test]
+    fn only_a_full_job_dirs_filesystem_fails_the_atop_setup() {
+        use std::io::ErrorKind::StorageFull;
+        let unasked = || panic!("a write to the job dirs' filesystem needs no statvfs");
+        assert!(atop_failure_is_fatal(Some(StorageFull), true, unasked));
+        assert!(atop_failure_is_fatal(Some(StorageFull), false, || true));
+        // A full archive elsewhere costs only the statistics.
+        assert!(!atop_failure_is_fatal(Some(StorageFull), false, || false));
+        assert!(!atop_failure_is_fatal(None, true, || true));
+    }
+
+    /// A path that does not exist yet is on its nearest existing ancestor's filesystem.
+    #[test]
+    fn same_fs_answers_for_a_missing_path_with_its_ancestor() {
+        let dir = std::env::temp_dir();
+        assert!(same_fs(&dir, &dir.join("vk-no-such-dir/child")));
+        assert!(!same_fs(&dir, Path::new("/proc")));
     }
 }
