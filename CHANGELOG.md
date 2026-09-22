@@ -11,6 +11,8 @@ All notable changes to virtkit will be documented in this file.
   watched first. A job can turn it on with `MICROVM_EGRESS_DRY_RUN` when the host sets no
   run-phase allowlist of its own. Pair it with `audit = true` to see both allowed and denied
   traffic.
+- **CI jobs report how much disk their job dir took.** A job's trace line on what it has used
+  lately and `vk gitlab usage` now show the most its dir on the host has held.
 
 ### Changed
 

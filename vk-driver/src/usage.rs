@@ -643,6 +643,39 @@ pub(crate) fn fmt_bytes(bytes: u64) -> String {
     }
 }
 
+/// What everything under `dir` takes on disk, in bytes: allocated blocks rather than lengths,
+/// so a sparse qcow2 overlay counts for what its guest wrote and not for the disk it describes.
+/// Symlinks are not followed, nor mount points crossed: what is mounted inside the dir is
+/// another filesystem's space. A file linked in several places counts once. `None` when `dir`
+/// cannot be read; anything under it that goes away or cannot be read during the walk counts
+/// as nothing.
+pub(crate) fn allocated_bytes(dir: &std::path::Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(dir).ok()?.dev();
+    let mut total = 0u64;
+    let mut linked = std::collections::HashSet::new();
+    let mut dirs = vec![std::fs::read_dir(dir).ok()?];
+    while let Some(entries) = dirs.pop() {
+        for entry in entries.flatten() {
+            // `DirEntry::metadata` does not traverse a symlink.
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            // Everything counted is on `dir`'s device, so the inode alone names a file.
+            if meta.dev() != dev || (meta.nlink() > 1 && !linked.insert(meta.ino())) {
+                continue;
+            }
+            total = total.saturating_add(meta.blocks().saturating_mul(512));
+            if meta.is_dir()
+                && let Ok(sub) = std::fs::read_dir(entry.path())
+            {
+                dirs.push(sub);
+            }
+        }
+    }
+    Some(total)
+}
+
 /// The memory a process tree holds *now*, in bytes — `root` and every process descending
 /// from it, which for a VM is the guest, its compose service VMs, the switch, the
 /// virtiofsds and the forwards. The live figure [`Usage::peak_rss`] deliberately is not:
@@ -1397,6 +1430,41 @@ mod tests {
                 .spawn()
                 .expect("spawning a shell whose child holds memory"),
         ))
+    }
+
+    /// Blocks, not lengths: a sparse file counts for what was written into it, a nested dir is
+    /// walked, and a hard-linked file counts once.
+    #[test]
+    fn allocated_bytes_counts_what_is_written_not_what_is_described() {
+        let dir = std::env::temp_dir().join(format!("vk-allocated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("svc")).unwrap();
+        // 1 GiB described, nothing written.
+        std::fs::File::create(dir.join("sparse"))
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
+        // Bytes no filesystem can compress away, so the blocks counted are really allocated.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let noise: Vec<u8> = (0..1 << 20)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        std::fs::write(dir.join("svc/written"), noise).unwrap();
+        let bytes = allocated_bytes(&dir).unwrap();
+        assert!(
+            (1 << 20..1 << 24).contains(&bytes),
+            "{bytes} bytes for 1 MiB written and a sparse 1 GiB file"
+        );
+        // A second name for the same file adds nothing.
+        std::fs::hard_link(dir.join("svc/written"), dir.join("linked")).unwrap();
+        assert_eq!(allocated_bytes(&dir), Some(bytes));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(allocated_bytes(&dir), None);
     }
 
     #[test]

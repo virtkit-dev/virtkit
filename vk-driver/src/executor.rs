@@ -356,6 +356,9 @@ async fn report_resource_usage(ctx: &JobCtx) {
                     disk: usage.disk,
                     network: usage.network,
                     overlay: usage.overlay,
+                    // Nothing in the job dir is removed before cleanup, so by the last stage
+                    // it holds about the most it ever will.
+                    footprint: crate::usage::allocated_bytes(&ctx.job_dir),
                 },
             );
             report_job_history(ctx, ceiling_mib);

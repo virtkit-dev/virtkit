@@ -351,6 +351,9 @@ struct Sample {
     /// is remembered beside the mark because it follows the VM's memory rather than the
     /// ceiling exactly, so the mark alone could not say how near the wall a run came.
     overlay: Option<(u64, u64)>,
+    /// What its job dir held on the host by the end — the rootfs overlay its guest wrote,
+    /// the checkout packed for the guest, the logs. `None` where the dir could not be read.
+    footprint: Option<u64>,
 }
 
 /// What one run of a job cost, as its history remembers it, in bytes.
@@ -365,6 +368,8 @@ pub struct Run {
     /// How full it filled its writable layer and how much that layer held, or `None` where it
     /// had no in-guest overlay to fill.
     pub overlay: Option<(u64, u64)>,
+    /// What its job dir held on the host, or `None` where it could not be read.
+    pub footprint: Option<u64>,
 }
 
 /// The most a job has needed lately, in bytes, and over how many runs. Memory is what a
@@ -383,19 +388,22 @@ struct Recent {
     /// one. Unlike the traffic beside it this is a ceiling a job can *fail* against, so it is
     /// the figure to read when a job dies of `ENOSPC` with every host disk empty.
     most_overlay: Option<(u64, u64)>,
+    /// The most its job dir held on the host, over the runs that measured it.
+    most_footprint: Option<u64>,
     runs: usize,
 }
 
 /// Note what a job of this kind actually used, and the ceiling it used it under, for the
-/// next one to be admitted against. One
-/// `<unix seconds> <peak> <ceiling> <read> <written> <sent> <received> <overlay> <capacity>`
-/// line per run, every figure in bytes and an unmeasured pair written `-`, appended whole so
-/// runs finishing together cannot tear each other's; best-effort, since a lost sample only
-/// costs accuracy on the next admission.
+/// next one to be admitted against. One `<unix seconds> <peak> <ceiling> <read> <written>
+/// <sent> <received> <overlay> <capacity> <footprint>` line per run, every figure in bytes and
+/// an unmeasured one written `-`, appended whole so runs finishing together cannot tear each
+/// other's; best-effort, since a lost sample only costs accuracy on the next admission.
 ///
-/// Widening the line retires the histories written before it: a run without the new fields
-/// is dropped rather than read short, since a reader loose enough to accept it could not
-/// tell a torn append from a whole one. A host loses a fortnight of estimates once.
+/// A line short of any field is dropped rather than read short, since a reader loose enough
+/// to accept it could not tell a torn append from a whole one. The one exception is the
+/// footprint, the last field and the latest added: a line that ends before it is a run
+/// recorded before it existed, and reads as one whose job dir nobody measured — a torn append
+/// cut exactly there loses nothing it had recorded.
 pub fn remember(dir: &Path, key: &Path, run: Run) {
     remember_at(dir, key, run, now_secs())
 }
@@ -433,13 +441,25 @@ fn remember_at(dir: &Path, key: &Path, run: Run, now: u64) {
         return; // no lock, no safe write — a lost sample only costs the next admission
     };
     if let Ok(mut file) = File::options()
+        .read(true)
         .create(true)
         .append(true)
         .mode(0o600)
         .open(&path)
     {
+        // An append torn short of its newline — a full filesystem, most likely, since it is
+        // usually the job dirs' — would have this line glued on, its first figure fused with
+        // the torn line's last. Ended first, the torn line is its own.
+        use std::os::unix::fs::FileExt;
+        let mut last = [0u8];
+        let torn = file.metadata().is_ok_and(|m| {
+            m.len() > 0 && file.read_at(&mut last, m.len() - 1).is_ok() && last[0] != b'\n'
+        });
         // Best-effort, as the doc says: a run that goes unrecorded costs the next admission
         // a little accuracy and nothing else.
+        if torn {
+            let _ = file.write_all(b"\n");
+        }
         let _ = file.write_all(
             sample_line(&Sample {
                 at_secs: now,
@@ -448,6 +468,7 @@ fn remember_at(dir: &Path, key: &Path, run: Run, now: u64) {
                 disk: run.disk,
                 network: run.network,
                 overlay: run.overlay,
+                footprint: run.footprint,
             })
             .as_bytes(),
         );
@@ -523,6 +544,7 @@ fn most_recent_at(dir: &Path, key: &Path, ceiling: u64, now: u64) -> Option<Rece
         most_disk: heaviest(window, |s| s.disk),
         most_network: heaviest(window, |s| s.network),
         most_overlay: heaviest(window, |s| s.overlay),
+        most_footprint: window.iter().filter_map(|s| s.footprint).max(),
         runs: window.len(),
     })
 }
@@ -664,13 +686,19 @@ fn parse(text: &str) -> Vec<Sample> {
                 let other = unmeasurable_or(fields.next()?)?;
                 Some(one.zip(other))
             };
+            let (disk, network, overlay) = (pair()?, pair()?, pair()?);
             Some(Sample {
                 at_secs,
                 peak,
                 ceiling,
-                disk: pair()?,
-                network: pair()?,
-                overlay: pair()?,
+                disk,
+                network,
+                overlay,
+                // Absent on the lines written before the figure was: unmeasured, as `-` is.
+                footprint: match fields.next() {
+                    Some(f) => unmeasurable_or(f)?,
+                    None => None,
+                },
             })
         })
         .collect()
@@ -683,8 +711,11 @@ fn sample_line(s: &Sample) -> String {
         Some((one, other)) => format!("{one} {other}"),
         None => "- -".to_string(),
     };
+    let footprint = s
+        .footprint
+        .map_or_else(|| "-".to_string(), |bytes| bytes.to_string());
     format!(
-        "{} {} {} {} {} {}\n",
+        "{} {} {} {} {} {} {footprint}\n",
         s.at_secs,
         s.peak,
         s.ceiling,
@@ -731,11 +762,15 @@ fn history_summary_at(
     // are — and a line reading "37 runs in 14 days" would then be a statement of throughput
     // that is simply untrue. The guide gives the exact rule.
     let overlay = filled(recent.most_overlay);
+    let job_dir = recent
+        .most_footprint
+        .map(|bytes| format!(", job dir {}", crate::usage::fmt_bytes(bytes)))
+        .unwrap_or_default();
     let disk = moved("read", "written", recent.most_disk);
     let net = moved("sent", "received", recent.most_network);
     let most = crate::usage::fmt_bytes(recent.most);
     Some(format!(
-        "virtkit: most this job has used lately: memory {most}{overlay}{disk}{net} \
+        "virtkit: most this job has used lately: memory {most}{overlay}{job_dir}{disk}{net} \
          over {runs} {plural}{reserves}"
     ))
 }
@@ -870,14 +905,14 @@ fn report_where(
 
 /// One report row, headings included: a fixed width so `head`, `row`, `widths` and `line`
 /// cannot drift apart into a table whose columns do not line up.
-const COLS: usize = 10;
+const COLS: usize = 11;
 type Cells = [String; COLS];
 
 /// What the columns are called, in the order [`row`] fills them.
 fn head() -> Cells {
     [
-        "job", "memory", "overlay", "ceiling", "reserves", "runs", "read", "written", "sent",
-        "received",
+        "job", "memory", "overlay", "job dir", "ceiling", "reserves", "runs", "read", "written",
+        "sent", "received",
     ]
     .map(str::to_string)
 }
@@ -898,6 +933,9 @@ fn row(job: &JobUsage, from_history: bool) -> Cells {
         // legible against the layer that held it, and a job pressed against its capacity is
         // the row an operator is reading the table to find.
         overlay_cell(job.recent.most_overlay),
+        job.recent
+            .most_footprint
+            .map_or_else(|| "-".to_string(), crate::usage::fmt_bytes),
         fmt_mib(job.ceiling_mib),
         fmt_mib(job.reserves(from_history)),
         job.recent.runs.to_string(),
@@ -1438,6 +1476,26 @@ mod tests {
         mib * MIB
     }
 
+    /// An append torn short of its newline is ended before the next run's line goes on, so
+    /// that line reads whole instead of glued to the torn one's figures.
+    #[test]
+    fn a_run_appended_after_a_torn_line_reads_whole() {
+        let dir = std::env::temp_dir().join(format!("vk-hist-torn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let now = 1_700_000_000;
+        remember_at(&dir, key("torn"), run(500, 8192), now - 60);
+        let path = under(&dir, key("torn")).unwrap();
+        let whole = std::fs::read_to_string(&path).unwrap();
+        // Cut inside the last field, as a full filesystem would leave it.
+        std::fs::write(&path, &whole[..whole.len() - 2]).unwrap();
+        remember_at(&dir, key("torn"), run(700, 8192), now);
+        let samples = parse(&std::fs::read_to_string(&path).unwrap());
+        let last = samples.last().expect("the new run");
+        assert_eq!((last.at_secs, last.peak), (now, 700 * MIB));
+        assert_eq!(samples.len(), 2, "the torn line reads as a run of its own");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// What a window of runs that moved no disk reads back as.
     fn recent(most_mib: u64, runs: usize) -> Option<Recent> {
         Some(Recent {
@@ -1890,6 +1948,7 @@ mod tests {
                 peak: 15_800 * MIB,
                 ceiling: ceiling(CEIL),
                 overlay: Some((9_950 * MIB, 10_240 * MIB)),
+                footprint: Some(6_554 * MIB),
                 ..Run::default()
             },
             now,
@@ -1897,7 +1956,7 @@ mod tests {
         assert_eq!(
             history_summary_at(&dir, key("filled"), 8192, false, now).unwrap(),
             "virtkit: most this job has used lately: memory 15.4 GiB, \
-             overlay 9.7 GiB of 10.0 GiB over 1 run"
+             overlay 9.7 GiB of 10.0 GiB, job dir 6.4 GiB over 1 run"
         );
 
         // Read against the ceiling the job is running at now, so widening MICROVM_MEM leaves
@@ -2123,6 +2182,7 @@ mod tests {
                 // An overlaid checkout it nearly filled, beside a job that had no layer at all:
                 // the column has to tell those two apart.
                 overlay: Some((900 * MIB, 1024 * MIB)),
+                footprint: Some(1536 * MIB),
                 ..Run::default()
             },
         );
@@ -2134,9 +2194,9 @@ mod tests {
         // the whole failure, and an expectation wrapped to fit an indent could not show it.
         let want = "\
 virtkit: 42-acme — what its jobs have been using lately:
-  job         memory            overlay  ceiling  reserves  runs    read  written  sent  received
-  build      5.9 GiB                  -  8.0 GiB   7.3 GiB     1       -        -     -         -
-  test_unit  500 MiB  900 MiB / 1.0 GiB  2.0 GiB   625 MiB     1  10 MiB   20 MiB     -         -
+  job         memory            overlay  job dir  ceiling  reserves  runs    read  written  sent  received
+  build      5.9 GiB                  -        -  8.0 GiB   7.3 GiB     1       -        -     -         -
+  test_unit  500 MiB  900 MiB / 1.0 GiB  1.5 GiB  2.0 GiB   625 MiB     1  10 MiB   20 MiB     -         -
 virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.0 GiB
 ";
         assert_eq!(report, want);
@@ -2217,7 +2277,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         assert_eq!(
             std::fs::read_to_string(dir.join("job")).unwrap(),
             format!(
-                "{now} {} {ceil} {} {} - - - -\n{now} {} {ceil} - - - - - -\n",
+                "{now} {} {ceil} {} {} - - - - -\n{now} {} {ceil} - - - - - - -\n",
                 900 * MIB,
                 10 * MIB,
                 20 * MIB,
@@ -2231,10 +2291,11 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
                 most: 900 * MIB,
                 // The run that could measure carries the disk; the network neither run saw
                 // has no maximum at all, which is what keeps it off the trace line — as does
-                // the writable layer neither run had.
+                // the writable layer neither run had, and the job dir neither run measured.
                 most_disk: Some((10 * MIB, 20 * MIB)),
                 most_network: None,
                 most_overlay: None,
+                most_footprint: None,
                 runs: 2,
             })
         );
@@ -2292,19 +2353,23 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
         let (peak, read, written) = (900 * MIB, 10 * MIB, 20 * MIB);
         let (sent, received) = (2 * MIB, 400 * MIB);
         let (mark, cap) = (600 * MIB, 1024 * MIB);
-        let (torn, lesser) = (4000 * MIB, 700 * MIB);
+        let footprint = 3000 * MIB;
+        let (torn, lesser, narrower) = (4000 * MIB, 700 * MIB, 5000 * MIB);
+        // Two pairs where three are due: short of a field older lines have.
         std::fs::write(
             dir.join("job"),
             format!(
-                "{now} {peak} {ceil} {read} {written} {sent} {received} {mark} {cap}\n\
+                "{now} {peak} {ceil} {read} {written} {sent} {received} {mark} {cap} {footprint}\n\
                  {now} {torn} {ceil} 30 30 30\n\
                  nonsense\n\
-                 {now} {lesser} {ceil} 5 5 5 5 5 5\n"
+                 {now} {narrower} {ceil} 5 5 5 5\n\
+                 {now} {lesser} {ceil} 5 5 5 5 5 5 5\n"
             ),
         )
         .unwrap();
-        // The two whole lines, neither the one cut short mid-append nor the unparseable one —
-        // so the 4000 MiB peak and the 30 bytes it claims to have read are both left out.
+        // The two whole lines, neither the one cut short mid-append, nor the unparseable one,
+        // nor the one a field short — so the 4000 and 5000 MiB peaks and the 30 bytes the torn
+        // line claims to have read are all left out.
         assert_eq!(
             most_recent_at(&dir, key("job"), ceil, now),
             Some(Recent {
@@ -2312,6 +2377,7 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
                 most_disk: Some((read, written)),
                 most_network: Some((sent, received)),
                 most_overlay: Some((mark, cap)),
+                most_footprint: Some(footprint),
                 runs: 2,
             })
         );
@@ -2600,6 +2666,34 @@ virtkit: 2 jobs; all at once they would reserve 7.9 GiB, against a budget of 16.
                 granted_mib: 20480,
                 jobs: 1,
             }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A run recorded before the job dir figure existed ends one field short: its memory and
+    /// the rest still count, and its job dir reads as unmeasured rather than dropping the run.
+    #[test]
+    fn a_run_recorded_before_the_job_dir_figure_still_counts() {
+        let dir = tmpdir("pre-footprint");
+        let now = 1_700_000_000;
+        std::fs::create_dir_all(&dir).unwrap();
+        let ceil = ceiling(CEIL);
+        let peak = 900 * MIB;
+        std::fs::write(
+            dir.join("job"),
+            format!("{now} {peak} {ceil} 10 20 - - 600 1024\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            most_recent_at(&dir, key("job"), ceil, now),
+            Some(Recent {
+                most: peak,
+                most_disk: Some((10, 20)),
+                most_network: None,
+                most_overlay: Some((600, 1024)),
+                most_footprint: None,
+                runs: 1,
+            })
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
