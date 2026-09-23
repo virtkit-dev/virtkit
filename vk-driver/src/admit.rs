@@ -649,8 +649,8 @@ struct Recent {
 /// A line short of any field is dropped rather than read short, since a reader loose enough
 /// to accept it could not tell a torn append from a whole one. The one exception is the
 /// footprint, the last field and the latest added: a line that ends before it is a run
-/// recorded before it existed, and reads as one whose job dir nobody measured — a torn append
-/// cut exactly there loses nothing it had recorded.
+/// recorded before it existed, and reads as one whose job dir nobody measured. A torn append
+/// is therefore never left for a reader to judge: the next append cuts it off first.
 pub fn remember(dir: &Path, key: &Path, run: Run) {
     remember_at(dir, key, run, now_secs())
 }
@@ -695,17 +695,16 @@ fn remember_at(dir: &Path, key: &Path, run: Run, now: u64) {
         .open(&path)
     {
         // An append torn short of its newline — a full filesystem, most likely, since it is
-        // usually the job dirs' — would have this line glued on, its first figure fused with
-        // the torn line's last. Ended first, the torn line is its own.
-        use std::os::unix::fs::FileExt;
-        let mut last = [0u8];
-        let torn = file.metadata().is_ok_and(|m| {
-            m.len() > 0 && file.read_at(&mut last, m.len() - 1).is_ok() && last[0] != b'\n'
-        });
-        // Best-effort, as the doc says: a run that goes unrecorded costs the next admission
-        // a little accuracy and nothing else.
-        if torn {
-            let _ = file.write_all(b"\n");
+        // usually the job dirs' — is cut back off before this one goes on. Glued on, this
+        // line would fuse with it; merely ended, a line torn inside its last figures would
+        // read as a run with a figure far smaller than the one it lost — and the run that
+        // filled the disk is the one most likely to be torn.
+        let mut text = Vec::new();
+        if (&file).read_to_end(&mut text).is_ok() && text.last().is_some_and(|b| *b != b'\n') {
+            let whole = text.iter().rposition(|b| *b == b'\n').map_or(0, |at| at + 1);
+            // Best-effort, as the doc says: a run that goes unrecorded costs the next
+            // admission a little accuracy and nothing else.
+            let _ = file.set_len(whole as u64);
         }
         let _ = file.write_all(
             sample_line(&Sample {
@@ -1758,8 +1757,8 @@ mod tests {
         mib * MIB
     }
 
-    /// An append torn short of its newline is ended before the next run's line goes on, so
-    /// that line reads whole instead of glued to the torn one's figures.
+    /// An append torn short of its newline is cut off before the next run's line goes on, so
+    /// that line reads whole and the torn one is not read as a run with its figures cut short.
     #[test]
     fn a_run_appended_after_a_torn_line_reads_whole() {
         let dir = std::env::temp_dir().join(format!("vk-hist-torn-{}", std::process::id()));
@@ -1774,7 +1773,7 @@ mod tests {
         let samples = parse(&std::fs::read_to_string(&path).unwrap());
         let last = samples.last().expect("the new run");
         assert_eq!((last.at_secs, last.peak), (now, 700 * MIB));
-        assert_eq!(samples.len(), 2, "the torn line reads as a run of its own");
+        assert_eq!(samples.len(), 1, "the torn line is gone, not read short");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
