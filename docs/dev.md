@@ -515,9 +515,12 @@ vk dev list
 vk dev list --json
 vk dev gc --all-stale
 vk dev gc ENVIRONMENT_NAME --yes
+vk dev gc                           # this workspace's environment (reads its config)
 ```
 
-`list` and `gc` work from anywhere without a project config. Copy names from
+`list` and `gc` work from anywhere without a project config; a bare `gc`, with
+no name and no `--all-stale`, takes this workspace's environment instead, and
+reads its config as `stop` does. Copy names from
 `list`; they identify state directories, not just the config's `dev` or `hook`
 selector. The `MEM` column shows what a running environment's VM holds on the
 host now over the size it booted with (`1.2G/8G`), the same figure `vk list`

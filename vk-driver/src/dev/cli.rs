@@ -382,9 +382,10 @@ enum DevAction {
     /// Remove the state of environments that are finished with
     ///
     /// Takes the environments named, or with `--all-stale` every one that is not running and
-    /// whose workspace is gone or that never recorded a boot. A running environment is
-    /// refused. Without `--yes`, lists what would go — including the storage inside each —
-    /// and removes nothing; on a terminal it asks instead. Also needs no config.
+    /// whose workspace is gone or that never recorded a boot. With neither, takes this
+    /// workspace's environment, from its config. A running environment is refused. Without
+    /// `--yes`, lists what would go — including the storage inside each — and removes
+    /// nothing; on a terminal it asks instead. Named or `--all-stale`, it needs no config.
     Gc {
         /// remove without asking
         #[arg(long)]
@@ -392,7 +393,7 @@ enum DevAction {
         /// every environment whose workspace is gone, or that recorded no boot
         #[arg(long = "all-stale")]
         all_stale: bool,
-        /// the environments to remove, as `vk dev list` names them
+        /// the environments to remove, as `vk dev list` names them [default: this workspace's]
         #[arg(value_name = "NAME")]
         names: Vec<String>,
     },
@@ -664,13 +665,15 @@ async fn dev_action(
         };
         return write_report(&report);
     }
+    // A bare `gc` means this workspace's environment, so only that one reads the config.
     if let DevAction::Gc {
         yes,
         all_stale,
         names,
-    } = action
+    } = &action
+        && (*all_stale || !names.is_empty())
     {
-        return dev_gc(yes, all_stale, &names);
+        return dev_gc(*yes, *all_stale, names);
     }
     // Like named stops, named prunes use host state and work from another or deleted
     // workspace. Select from the recorded boot state without resolving a config.
@@ -1083,9 +1086,17 @@ async fn dev_action(
             // set reserves for a config or usage error.
             Err(e) => fail(&e, 1),
         },
+        // Selected by its state directory's name, as `vk dev list` and a named `gc` are.
+        DevAction::Gc { yes, .. } => {
+            let name = plan
+                .state_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            dev_gc(yes, false, &[name])
+        }
         DevAction::Init { .. }
         | DevAction::List { .. }
-        | DevAction::Gc { .. }
         | DevAction::Stop { name: Some(_), .. }
         | DevAction::Prune { name: Some(_), .. }
         | DevAction::Schema => {
@@ -1331,6 +1342,15 @@ mod tests {
         assert!(matches!(
             parse(&["vk", "dev", "stop", "myenv-1a2b"]).action,
             DevAction::Stop { name: Some(n), .. } if n == "myenv-1a2b"
+        ));
+    }
+
+    #[test]
+    fn bare_gc_parses_without_a_name() {
+        // No name and no `--all-stale` is this workspace's environment, as with `stop`.
+        assert!(matches!(
+            parse(&["vk", "dev", "gc"]).action,
+            DevAction::Gc { yes: false, all_stale: false, names } if names.is_empty()
         ));
     }
 
