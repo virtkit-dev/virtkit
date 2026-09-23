@@ -21,6 +21,7 @@
 //! reboots the VM in place — same pid and vsock socket for the supervisor.
 
 use std::ffi::CString;
+use std::io::Write;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
@@ -444,7 +445,9 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
             let code = match boot(spec) {
                 Ok(()) => 0,
                 Err(e) => {
-                    eprintln!("virtkit: libkrun boot: {e:#}");
+                    // Written, not `eprintln!`: stderr is the VMM log in the job dir, and a
+                    // full filesystem there must not turn this line into a panic.
+                    let _ = writeln!(std::io::stderr(), "virtkit: libkrun boot: {e:#}");
                     1
                 }
             };
@@ -481,7 +484,8 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
         } else {
             short_boots = 0;
         }
-        eprintln!("virtkit: guest reset — rebooting");
+        // As above: a full job dir filesystem must not stop the reboot it announces.
+        let _ = writeln!(std::io::stderr(), "virtkit: guest reset — rebooting");
     }
 }
 

@@ -10,7 +10,9 @@
 //! code it calls, and a call site missed would still panic.
 //!
 //! A child spawned with inherited stdio gets the pipe too: its output is relayed while this
-//! process lives, and its writes fail with `EPIPE` once this process is gone. A process killed
+//! process lives, and once this process is gone its writes end it by `SIGPIPE` (which `Command`
+//! puts back to its default in every child), or fail with `EPIPE` where it ignores that
+//! signal. A process killed
 //! outright loses what it wrote in the moment before, still in the pipe.
 
 use std::fs::File;
