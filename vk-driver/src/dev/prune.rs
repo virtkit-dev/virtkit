@@ -437,7 +437,11 @@ fn run_env(env: &Env, opts: &Options, confirm: impl FnOnce() -> Result<bool>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dev::testutil::once_released;
     use std::os::unix::fs::symlink;
+
+    /// What a prune says when it finds a state directory's lock held.
+    const IN_USE: &str = "environment is in use";
 
     struct Fixture {
         _env: std::sync::MutexGuard<'static, ()>,
@@ -535,7 +539,9 @@ mod tests {
         ] {
             assert!(f.plan.state_dir.join(name).exists(), "{name}");
         }
-        assert!(run(&f.plan, &opts).unwrap().contains("nothing to remove"));
+        // Again right after the run above released its locks: see `once_released`.
+        let again = once_released(IN_USE, || run(&f.plan, &opts)).unwrap();
+        assert!(again.contains("nothing to remove"));
     }
 
     #[test]
@@ -666,15 +672,14 @@ mod tests {
         )
         .unwrap();
         assert!(report.contains("declared storage was not recorded"));
-        run_env(
-            &legacy,
-            &Options {
-                all: true,
-                yes: true,
-                ..Default::default()
-            },
-            || panic!("--yes must not ask"),
-        )
+        let opts = Options {
+            all: true,
+            yes: true,
+            ..Default::default()
+        };
+        once_released(IN_USE, || {
+            run_env(&legacy, &opts, || panic!("--yes must not ask"))
+        })
         .unwrap();
         assert!(f.plan.state_dir.join("data.qcow2").exists()); // loose disk unidentified, kept
         assert!(!f.plan.state_dir.join("root.qcow2").exists()); // images gone
@@ -699,7 +704,7 @@ mod tests {
         for name in ["root.qcow2", "data.qcow2", "lifecycle/create", "dev.json"] {
             assert!(f.plan.state_dir.join(name).exists(), "{name}");
         }
-        run_env(&e, &Options::default(), || Ok(true)).unwrap();
+        once_released(IN_USE, || run_env(&e, &Options::default(), || Ok(true))).unwrap();
         assert!(!f.plan.state_dir.join("root.qcow2").exists());
     }
 

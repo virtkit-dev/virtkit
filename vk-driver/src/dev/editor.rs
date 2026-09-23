@@ -1158,15 +1158,18 @@ mod tests {
         assert!(lock_holder(&plan).is_some());
         assert!(status(&plan).contains("running"), "{}", status(&plan));
         drop(held);
-        // /proc/locks can momentarily still list a just-released flock under concurrent load,
-        // so give the kernel a beat before demanding the holder is gone.
-        let released = (0..50).any(|_| {
+        // A just-released flock can still be listed while a child another test was spawning
+        // holds a copy of the descriptor, until that child execs: give it a few seconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let released = loop {
             if lock_holder(&plan).is_none() {
-                return true;
+                break true;
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-            false
-        });
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert!(
             released,
             "lock still held after drop: {:?}",

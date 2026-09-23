@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn a_reset_refuses_while_the_environment_is_being_booted() {
         // Holds the state-dir lock, then asserts a reset succeeds once it drops; a lock
-        // inherited by a concurrent fork would outlive that drop and fail the retry.
+        // inherited by a concurrent fork outlives that drop, hence `once_released`.
         let _env = env_guard();
         let (t, plan) = fixture("locked");
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -814,7 +814,10 @@ mod tests {
         assert!(format!("{e:#}").contains("being booted"), "{e:#}");
         assert!(disk.is_file(), "nothing was removed under the boot");
         drop(held);
-        assert!(rt.block_on(reset(&plan, "runner:/var/wab", true)).is_ok());
+        let retried = crate::dev::testutil::once_released("being booted", || {
+            rt.block_on(reset(&plan, "runner:/var/wab", true))
+        });
+        assert!(retried.is_ok(), "{retried:?}");
     }
 
     #[test]

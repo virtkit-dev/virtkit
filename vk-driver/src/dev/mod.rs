@@ -144,6 +144,28 @@ pub(super) mod testutil {
         ENV.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// `op`, run again while it fails with `contended` in its message, for up to five seconds.
+    /// A lock a test has just dropped can still be held by a child another test was spawning
+    /// at that moment — tests outside this module fork without [`env_guard`] — until that
+    /// child execs. Any other error, or contention that outlasts the wait, comes back as it is.
+    pub(super) fn once_released<T>(
+        contended: &str,
+        mut op: impl FnMut() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match op() {
+                Err(e)
+                    if format!("{e:#}").contains(contended)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                done => return done,
+            }
+        }
+    }
+
     pub(super) fn plan_in(dir: &Path) -> Plan {
         Plan {
             workspace: dir.join("repo"),

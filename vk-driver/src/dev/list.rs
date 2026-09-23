@@ -631,7 +631,9 @@ mod tests {
         assert!(format!("{e:#}").contains("is in use by"), "{e:#}");
         assert!(dir.exists(), "the boot's state directory survived");
         drop(held);
-        assert!(remove(&selected).unwrap().starts_with("removed gone-bbbb"));
+        let removed =
+            crate::dev::testutil::once_released("is in use by", || remove(&selected)).unwrap();
+        assert!(removed.starts_with("removed gone-bbbb"));
         assert!(!dir.exists());
     }
 
