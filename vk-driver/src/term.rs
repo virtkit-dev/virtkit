@@ -15,6 +15,8 @@
 //! being a function over bytes it is tested without a terminal at all.
 
 use std::io::{IsTerminal, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
@@ -185,18 +187,31 @@ impl Keys {
     }
 }
 
+/// Poll interval for checking the stop flag, short enough to avoid losing the first keys
+/// when handing the terminal to a child.
+const STOP_TICK: Duration = Duration::from_millis(100);
+
 /// Presses from a thread of its own: reading a byte blocks, and a panel's own work must not
-/// wait for it, so a channel joins the two.
+/// wait for it, so a channel joins the two. The thread ends when stdin does.
 pub(crate) fn key_thread() -> Receiver<Press> {
+    key_thread_until(Arc::new(AtomicBool::new(false)))
+}
+
+/// The same reader, ending as soon as `stop` is raised — for a caller that hands the terminal
+/// to a child, since two readers on one stdin lose keystrokes between them.
+pub(crate) fn key_thread_until(stop: Arc<AtomicBool>) -> Receiver<Press> {
     let (tx, rx) = channel();
     std::thread::spawn(move || {
         let mut keys = Keys::default();
         let mut byte = [0u8; 1];
         loop {
-            // A sequence in progress waits only a moment for the rest of itself; anything
-            // else waits for as long as it takes.
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            // A sequence in progress waits only a moment for the rest of itself; anything else
+            // waits until there is a key or the flag is worth another look.
             let timeout = match keys.pending.is_empty() {
-                true => -1,
+                true => STOP_TICK.as_millis() as libc::c_int,
                 false => ESC_WAIT.as_millis() as libc::c_int,
             };
             let mut fds = libc::pollfd {
