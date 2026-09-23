@@ -484,6 +484,17 @@ impl App {
     /// any key, which is how the help closes — a keystroke that removes an environment
     /// should be one that could only have been meant.
     fn confirm_key(&mut self, confirm: Confirm, press: Press) {
+        // Not before what would go is on the screen: agreeing to a question whose answer
+        // is still being read is agreeing to nothing in particular, and `x d y` typed
+        // quickly would otherwise remove it unseen.
+        if press == Press::Char('y') && confirm.removes.is_none() {
+            self.status = Some(format!(
+                "{}: still reading what would go — y once it shows",
+                confirm.job.action.label()
+            ));
+            self.mode = Mode::Confirm(confirm);
+            return;
+        }
         self.mode = Mode::Normal;
         match press == Press::Char('y') {
             true => self.start(confirm.job),
@@ -1305,10 +1316,19 @@ mod tests {
             assert_eq!(app.status.as_deref(), Some("remove it: cancelled"));
         }
 
-        // And `y` runs exactly what the question showed.
+        // `y` agrees to nothing while what would go is still being read.
         app.key(Press::Char('x'));
         app.key(Press::Char('d'));
         drain(&mut app);
+        app.key(Press::Char('y'));
+        assert!(matches!(app.mode, Mode::Confirm(_)), "agreed unseen");
+        assert!(drain(&mut app).is_empty(), "removed before it was shown");
+
+        // And once it shows, `y` runs exactly what the question showed.
+        app.on_event(Event::Preview {
+            name: "env-0".to_string(),
+            text: "would remove env-0".to_string(),
+        });
         app.key(Press::Char('y'));
         assert_eq!(app.mode, Mode::Normal);
         match drain(&mut app).as_slice() {

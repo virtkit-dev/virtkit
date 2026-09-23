@@ -12,9 +12,11 @@
 //! **Every action names the environment it acts on.** A `vk dev` command otherwise resolves
 //! the workspace from the process's own working directory, which is wherever the reader
 //! happened to open the dashboard — so `--workspace` and `--environment` are passed from the
-//! row every time. The pair is the identity: two environments over one checkout differ only
-//! in the name, and a `stop` given the directory alone would stop whichever of them came
-//! first.
+//! row every time, with `--dev-config` where it recorded the config it booted from. The pair
+//! is the identity: two environments over one checkout differ only in the name, and a
+//! command given the directory alone would act on whichever of them came first. A stop and a
+//! removal name the state directory instead, which is that identity in one word and needs
+//! neither the checkout nor its config.
 //!
 //! **An environment that cannot be acted on says so before the key is pressed**, with the
 //! reason in words. The facts are all in the row — [`Refusal`] is the list of them.
@@ -227,14 +229,25 @@ impl Action {
                     OsString::from(&row.name),
                 ]
             }
-            Self::Stop | Self::Up | Self::Refresh | Self::Shell | Self::Code => {
+            // By the state directory's name, as `vk dev list` gives it: a named stop is
+            // host state only, so it stops a VM whose checkout is gone, or whose config
+            // no longer reads, as well as any other — and that name is the identity whole.
+            Self::Stop => {
+                let row = env.row.as_ref().ok_or(Refusal::NotAnEnvironment)?;
+                if !env.is_running() {
+                    return Err(Refusal::NotRunning);
+                }
+                vec![
+                    OsString::from("dev"),
+                    OsString::from(self.verb()),
+                    OsString::from(&row.name),
+                ]
+            }
+            Self::Up | Self::Refresh | Self::Shell | Self::Code => {
                 let row = env.row.as_ref().ok_or(Refusal::NotAnEnvironment)?;
                 let workspace = row.workspace.as_deref().ok_or(Refusal::NoWorkspace)?;
                 if row.flags.contains(&Flag::WorkspaceMissing) {
                     return Err(Refusal::WorkspaceGone);
-                }
-                if self == Self::Stop && !env.is_running() {
-                    return Err(Refusal::NotRunning);
                 }
                 if self == Self::Up && env.is_running() {
                     return Err(Refusal::AlreadyRunning);
@@ -244,14 +257,22 @@ impl Action {
                 // name for its environment too, and `dev` is what `vk dev` itself defaults
                 // to for the one that predates the field.
                 let environment = row.environment.as_deref().unwrap_or("dev");
-                vec![
+                let mut argv = vec![
                     OsString::from("dev"),
                     OsString::from("--workspace"),
                     workspace.as_os_str().to_os_string(),
                     OsString::from("--environment"),
                     OsString::from(environment),
-                    OsString::from(self.verb()),
-                ]
+                ];
+                // The config it booted from, where it recorded one: the state directory is
+                // the workspace's and the name's alone, so a boot from the workspace's
+                // default config would be this same environment built from another one.
+                if let Some(config) = &row.config {
+                    argv.push(OsString::from("--dev-config"));
+                    argv.push(config.as_os_str().to_os_string());
+                }
+                argv.push(OsString::from(self.verb()));
+                argv
             }
         };
         Ok(Job {
@@ -319,6 +340,10 @@ fn run(job: &Job) -> String {
     // frame. Nothing is read from stdin either — a command that wanted to ask something
     // would otherwise sit there unseen, waiting for an answer nobody can give it.
     command.stdin(Stdio::null());
+    // A process group of its own, out of the terminal's reach: a Ctrl-C typed into a shell
+    // the dashboard has handed the terminal to meanwhile is that shell's, and must not
+    // end a rebuild running out of sight.
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     match command.output() {
         Err(report) => format!("{label}: {name}: {report}"),
         Ok(done) if done.status.success() => format!("{label}: {name} finished"),
@@ -402,23 +427,31 @@ mod tests {
         assert_eq!(offered, Action::ALL.len());
     }
 
-    /// An action names the environment's own checkout *and* its own environment name, and
-    /// neither comes from the directory the dashboard was started in: `vk dev` resolves a
-    /// workspace from the working directory, and two environments over one checkout differ
-    /// only in the name — so a `stop` given either alone acts on something else.
+    /// An action names the environment's own checkout, its own environment name and the
+    /// config it booted from, and none of them comes from the directory the dashboard was
+    /// started in: `vk dev` resolves a workspace from the working directory, two
+    /// environments over one checkout differ only in the name, and one booted from another
+    /// config would be rebuilt from the default — so a command given less acts on something
+    /// else. A stop names the state directory, which is all three at once.
     #[test]
     fn an_action_names_the_environment_it_acts_on_and_not_the_working_directory() {
         let env = running();
         assert_eq!(
-            argv(Action::Stop, &env),
+            argv(Action::Refresh, &env),
             [
                 "dev",
                 "--workspace",
                 "/home/reader/src/virtkit",
                 "--environment",
                 "dev",
-                "stop"
+                "--dev-config",
+                "/home/reader/src/virtkit/.virtkit/config.toml",
+                "refresh"
             ]
+        );
+        assert_eq!(
+            argv(Action::Stop, &env),
+            ["dev", "stop", "virtkit-4171942f2d70bae7"]
         );
         assert_eq!(argv(Action::Shell, &env).last().unwrap(), "shell");
         assert_eq!(argv(Action::Code, &env).last().unwrap(), "code");
@@ -427,7 +460,7 @@ mod tests {
 
         let cwd = std::env::current_dir().unwrap().display().to_string();
         assert!(
-            !argv(Action::Stop, &env).contains(&cwd),
+            !argv(Action::Refresh, &env).contains(&cwd),
             "the action ran wherever the dashboard was opened"
         );
 
@@ -507,6 +540,16 @@ mod tests {
         assert!(
             Refusal::WorkspaceGone.why().contains('d'),
             "the reason does not name the key that is still offered"
+        );
+
+        // Still running, it can be stopped all the same — by name, which needs no checkout
+        // — or `d` would be refused as running and nothing at all would be offered.
+        let mut stale = row("wab-3ce70a9544f1e8b2", "/state/wab", Status::Running);
+        stale.flags.push(Flag::WorkspaceMissing);
+        let env = join(vec![stale], vec![vm("/state/wab", 4242)]).remove(0);
+        assert_eq!(
+            argv(Action::Stop, &env),
+            ["dev", "stop", "wab-3ce70a9544f1e8b2"]
         );
 
         // And one that recorded no checkout at all is refused for a different reason, with

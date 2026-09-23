@@ -96,6 +96,10 @@ pub struct Row {
     /// the workspace the identity records; `None` when nothing was recorded
     pub workspace: Option<PathBuf>,
     pub environment: Option<String>,
+    /// the config it last booted from, as the identity records it: the one a command acting
+    /// on it has to name, since one read from the workspace's default could be another
+    #[serde(skip)]
+    pub config: Option<PathBuf>,
     pub status: Status,
     /// the `vk` that booted it, as it recorded itself
     pub created_by: Option<String>,
@@ -185,6 +189,7 @@ fn row(dir: &Path, running: &[Running], sizes: bool) -> Row {
         dir: dir.to_path_buf(),
         workspace,
         environment: manifest("environment"),
+        config: manifest("config").map(PathBuf::from),
         status: match (live.is_some(), identity.is_some()) {
             (true, _) => Status::Running,
             (false, true) => Status::Stopped,
