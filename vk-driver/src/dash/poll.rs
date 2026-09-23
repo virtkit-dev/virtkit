@@ -342,6 +342,10 @@ pub(crate) fn spawn_sampler(tx: Sender<Event>, stop: Stop, follow: Follow, every
     std::thread::spawn(move || {
         let mut epoch: Option<u64> = None;
         let mut taken: Option<Instant> = None;
+        // When the process at the root of the tree started, as first seen for this epoch. A
+        // pid that has since gone and been handed to another process names a different
+        // start, and a tree walked from it would be somebody else's cost under this name.
+        let mut started: Option<u64> = None;
         while !stop.raised() {
             let target = follow.get();
             let due = taken.is_none_or(|at| at.elapsed() >= every);
@@ -349,9 +353,14 @@ pub(crate) fn spawn_sampler(tx: Sender<Event>, stop: Stop, follow: Follow, every
                 std::thread::sleep(TICK);
                 continue;
             }
+            if epoch != Some(target.sample_epoch) {
+                started = target.pid.and_then(crate::usage::proc_start);
+            }
             epoch = Some(target.sample_epoch);
             taken = Some(Instant::now());
             if let Some(pid) = target.pid
+                && started.is_some()
+                && crate::usage::proc_start(pid) == started
                 && let Some(usage) = crate::usage::tree(pid)
             {
                 let sample = Sample {

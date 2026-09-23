@@ -528,6 +528,12 @@ pub(crate) fn proc_age(pid: i32) -> Option<Duration> {
     Duration::try_from_secs_f64(uptime - started as f64 / clock_ticks() as f64).ok()
 }
 
+/// When `pid` started, in clock ticks since boot: with the pid, what names one process
+/// rather than whichever holds that number now. `None` for a pid that is gone.
+pub(crate) fn proc_start(pid: i32) -> Option<u64> {
+    parse_starttime(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
 /// `starttime` — the clock ticks since boot at which the process started. Indexed from the
 /// last `)` for the same reason [`parse_stat`] is: the comm in between is free to contain
 /// spaces and parentheses.
