@@ -562,10 +562,11 @@ pub fn guest_cwd(plan: &Plan) -> Option<String> {
     }
 }
 
-/// `vk dev shell`: the environment's own login shell, on a terminal — a login shell so the
-/// user's profile runs, as opening a terminal in the editor would.
+/// `vk dev shell`: the environment's own login shell, or a service's with `--service`, on a
+/// terminal — a login shell so the user's profile runs, as opening a terminal in the editor
+/// would.
 ///
-/// The exec channel starts this with only `exec-env` for its environment — no PAM, no login,
+/// The exec channel starts this with at most `exec-env` for its environment — no PAM, no login,
 /// hence no passwd lookup — so `$SHELL` is unset on nearly every image, and a bare
 /// `${SHELL:-/bin/sh}` would drop every user to `/bin/sh` (dash on Debian: no line editing,
 /// arrow keys echoed as escapes). Resolve the user's actual shell from the passwd database

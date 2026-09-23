@@ -137,10 +137,20 @@ enum DevAction {
     ///
     /// Runs a login shell as the configured `user` with `exec-env`, in the guest
     /// directory corresponding to your current working directory, or the guest
-    /// workspace root if you are outside the workspace.
+    /// workspace root if you are outside the workspace. With `--service`, it boots
+    /// nothing and opens the shell in that running service instead.
     ///
     /// Exiting the shell leaves the environment running.
-    Shell,
+    Shell {
+        /// open the shell in this compose service instead of the primary
+        ///
+        /// The service must be running (`vk dev service up`). As with `vk dev exec
+        /// --service`, it gets none of the primary's contract — no `exec-env`, no `user`, no
+        /// workspace directory: the shell runs as the service's default user, in its working
+        /// directory (its WORKDIR, or `/` under an image init).
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
+    },
     /// Open the workspace in VS Code, bringing the environment up first
     ///
     /// Attaches over Remote-SSH, with the run's own SSH setup — nothing to configure, and
@@ -458,9 +468,9 @@ impl DevAction {
             // A task boots only under `policy = "require"`, which is in the config rather
             // than on the command line; the fork is where a boot *may* happen, and the
             // policies that boot nothing leave the work to the parent (see `dev_up`).
-            Self::Up { .. } | Self::Shell | Self::Code { .. } | Self::Task { .. } => true,
-            // A service exec reaches a running service and boots nothing.
-            Self::Exec { service, .. } => service.is_none(),
+            Self::Up { .. } | Self::Code { .. } | Self::Task { .. } => true,
+            // A service exec or shell reaches a running service and boots nothing.
+            Self::Exec { service, .. } | Self::Shell { service } => service.is_none(),
             // Of the service operations only `up` boots the environment.
             Self::Service { action } => matches!(action, DevServiceAction::Up { .. }),
             // A dry run only reports; forking it would report twice.
@@ -863,24 +873,31 @@ async fn dev_action(
                 _ => write_report(&format!("{url}\n")),
             }
         }
-        DevAction::Shell => match dev_up(&plan, host_cfg, over, false, true, false).await {
-            Ready::Done(code) => code,
-            Ready::Act => {
-                let argv: Vec<String> = dev::LOGIN_SHELL.iter().map(|s| s.to_string()).collect();
-                match dev::exec_in_guest(
-                    &plan,
-                    &argv,
-                    dev::guest_cwd(&plan),
-                    true,
-                    vk_core::exec::client::Stdin::Forward,
-                )
-                .await
-                {
-                    Ok(result) => exec::exit(result),
-                    Err(e) => fail(&e, 1),
+        DevAction::Shell { service } => {
+            let argv: Vec<String> = dev::LOGIN_SHELL.iter().map(|s| s.to_string()).collect();
+            let result = match service {
+                Some(service) => {
+                    dev::exec_in_service(&plan, &service, &argv, None, true, None).await
                 }
+                None => match dev_up(&plan, host_cfg, over, false, true, false).await {
+                    Ready::Done(code) => return code,
+                    Ready::Act => {
+                        dev::exec_in_guest(
+                            &plan,
+                            &argv,
+                            dev::guest_cwd(&plan),
+                            true,
+                            vk_core::exec::client::Stdin::Forward,
+                        )
+                        .await
+                    }
+                },
+            };
+            match result {
+                Ok(result) => exec::exit(result),
+                Err(e) => fail(&e, 1),
             }
-        },
+        }
         DevAction::Code {
             editor,
             reset_server,
@@ -1550,6 +1567,7 @@ mod tests {
         (&["exec", "--", "true"], true),
         (&["exec", "--service", "db", "--", "true"], false),
         (&["shell"], true),
+        (&["shell", "--service", "db"], false),
         (&["code"], true),
         (&["editor", "status"], false),
         (&["editor", "reset"], false),

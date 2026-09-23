@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk dev shell --service NAME`** opens a login shell in a running compose service, as
+  `vk dev exec --service` already runs a command in one.
+
 ### Changed
 
 - **`vk dev gc` with no name removes this workspace's environment**, as `vk dev stop` stops
