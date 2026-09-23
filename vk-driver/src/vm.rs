@@ -3559,7 +3559,10 @@ mod tests {
         let mut ctx = JobCtx::new_for_job(cfg, "42".into()).unwrap();
         assert!(ctx.cfg.executor.schedule.mem_budget.is_none());
         assert!(admit(&ctx, "8G").unwrap().is_none());
-        assert!(admit(&ctx, "4096M").unwrap().is_none(), "any size a VM boots with");
+        assert!(
+            admit(&ctx, "4096M").unwrap().is_none(),
+            "any size a VM boots with"
+        );
         assert!(!ctx.admit_dir().exists(), "no ledger without a budget");
 
         let schedule = &mut ctx.cfg.executor.schedule;
