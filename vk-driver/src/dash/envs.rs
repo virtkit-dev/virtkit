@@ -153,7 +153,9 @@ pub(crate) mod fixture {
             dir: PathBuf::from(dir),
             workspace: Some(PathBuf::from("/home/reader/src/virtkit")),
             environment: Some("dev".to_string()),
-            config: Some(PathBuf::from("/home/reader/src/virtkit/.virtkit/config.toml")),
+            config: Some(PathBuf::from(
+                "/home/reader/src/virtkit/.virtkit/config.toml",
+            )),
             status,
             created_by: None,
             booted_secs: None,
