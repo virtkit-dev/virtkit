@@ -37,10 +37,17 @@ const BACKLOG: u64 = 1 << 20;
 /// caught up over the next few rather than in one frame that stalls the loop.
 const CHUNK: u64 = 1 << 18;
 
-/// How long a line without a newline is allowed to get before it is shown anyway. A guest
-/// can write for ever without ending a line, and an unbounded buffer waiting for one is a
-/// way to spend this process's memory from inside the VM.
-const MAX_LINE: usize = 64 * 1024;
+/// The most of any one line that is kept, and how long a line without a newline is allowed
+/// to get before it is shown anyway. A guest can write lines of any length, or write for
+/// ever without ending one, and keeping either whole is a way to spend this process's memory
+/// from inside the VM: capped, [`CAPACITY`] lines are a few tens of megabytes at most. A
+/// line is drawn on one row, so what is cut is never on the screen anyway.
+const MAX_LINE: usize = 4 * 1024;
+
+/// How much of what was last read is kept to recognise it by. A console truncated in place
+/// and written past its old length between two passes is no shorter than what was read, and
+/// only these bytes having changed under the tail says it is another boot's.
+const SEEN: usize = 64;
 
 /// The three writers a console carries, in the order the status line names them.
 const SOURCES: [Source; 3] = [Source::Kernel, Source::Agent, Source::Guest];
@@ -246,6 +253,10 @@ pub(crate) struct Batch {
 pub(crate) struct Tail {
     path: PathBuf,
     open: Option<Open>,
+    /// Whether anything has been read into the buffer yet. Kept apart from `open`, which a
+    /// console that is gone for a pass clears: what was read before it went is still
+    /// scrollback, and a console found again has to replace it rather than follow it.
+    followed: bool,
 }
 
 /// An opened console, identified by what the kernel resolved rather than by its name.
@@ -260,6 +271,8 @@ struct Open {
     /// whether the first line to complete is a fragment of one that began before the
     /// backlog window and so is not a line at all
     fragment: bool,
+    /// the last [`SEEN`] bytes read, which end at `read`
+    seen: Vec<u8>,
 }
 
 impl Tail {
@@ -268,6 +281,7 @@ impl Tail {
         Self {
             path: dir.join(crate::run::CONSOLE_LOG),
             open: None,
+            followed: false,
         }
     }
 
@@ -291,11 +305,15 @@ impl Tail {
             .as_ref()
             .is_none_or(|open| open.dev != stat.dev() || open.ino != stat.ino());
         if replaced {
-            // A console that was being followed and has become another file took its
-            // scrollback with it; one opened for the first time had none to lose.
-            batch.restarted = self.open.is_some();
+            // A console that was being followed and has become another file — or gone and
+            // come back, or been out of reach for a pass — took its scrollback with it; one
+            // opened for the first time had none to lose.
             match attach(&self.path, stat.len()) {
-                Some(open) => self.open = Some(open),
+                Some(open) => {
+                    batch.restarted = self.followed;
+                    self.followed = true;
+                    self.open = Some(open);
+                }
                 None => {
                     self.open = None;
                     batch.missing = true;
@@ -306,9 +324,10 @@ impl Tail {
         let Some(open) = self.open.as_mut() else {
             return batch;
         };
-        // Shorter than what has already been read: the same file, emptied. Whatever the
-        // buffer holds describes bytes that are gone.
-        if stat.len() < open.read && open.rewind() {
+        // Shorter than what has already been read, or no longer holding what was: the same
+        // file, emptied and maybe written again. Whatever the buffer holds describes bytes
+        // that are gone.
+        if (stat.len() < open.read || !open.unchanged()) && open.rewind() {
             batch.restarted = true;
         }
         open.read_into(&mut batch.lines, stat.len());
@@ -343,6 +362,7 @@ fn attach(path: &Path, len: u64) -> Option<Open> {
         read: 0,
         partial: Vec::new(),
         fragment: false,
+        seen: Vec::new(),
     };
     let from = len.saturating_sub(BACKLOG);
     if from > 0 && open.file.seek(SeekFrom::Start(from)).is_ok() {
@@ -362,7 +382,23 @@ impl Open {
         self.read = 0;
         self.partial.clear();
         self.fragment = false;
+        self.seen.clear();
         true
+    }
+
+    /// Whether the bytes last read are still where they were read from. A read that fails
+    /// says nothing either way, and is not taken for a restart.
+    fn unchanged(&self) -> bool {
+        use std::os::unix::fs::FileExt;
+
+        let Some(at) = self.read.checked_sub(self.seen.len() as u64) else {
+            return true;
+        };
+        let mut now = vec![0; self.seen.len()];
+        match self.file.read_exact_at(&mut now, at) {
+            Ok(()) => now == self.seen,
+            Err(_) => true,
+        }
     }
 
     /// Read what is there, up to [`CHUNK`], and classify the lines it completes.
@@ -378,6 +414,9 @@ impl Open {
             return;
         }
         self.read = self.read.saturating_add(bytes.len() as u64);
+        self.seen.extend_from_slice(&bytes);
+        let excess = self.seen.len().saturating_sub(SEEN);
+        self.seen.drain(..excess);
         let mut data = std::mem::take(&mut self.partial);
         data.extend_from_slice(&bytes);
 
@@ -410,8 +449,13 @@ impl Open {
 /// Decoded lossily: a serial console is bytes, not promised text, and a single byte the
 /// guest wrote outside UTF-8 must not discard the line it is in — the same decision
 /// [`crate::run`] makes when it reads a console for a boot failure.
+///
+/// Cut to [`MAX_LINE`] first, whatever its length: a whole line is kept as it came, so a
+/// guest writing long ones would otherwise decide how much of this process each one costs.
 fn line_of(raw: &[u8]) -> Line {
-    classify(&String::from_utf8_lossy(raw))
+    classify(&String::from_utf8_lossy(
+        raw.get(..MAX_LINE).unwrap_or(raw),
+    ))
 }
 
 #[cfg(test)]
@@ -595,6 +639,55 @@ mod tests {
         let batch = tail.drain(1);
         assert!(batch.restarted, "a truncated console was not noticed");
         assert_eq!(texts(&batch.lines), ["second boot"]);
+    }
+
+    /// A boot that truncates the console and writes past its old length before the next
+    /// pass leaves a file no shorter than what was read — and is still another boot's.
+    #[test]
+    fn a_log_rewritten_past_its_old_length_is_read_from_its_start() {
+        let scratch = Scratch::new("rewritten");
+        scratch.write("old boot\n");
+        let mut tail = Tail::new(&scratch.0);
+        assert_eq!(texts(&tail.drain(1).lines), ["old boot"]);
+
+        let path = scratch.0.join(crate::run::CONSOLE_LOG);
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(0).unwrap();
+        drop(file);
+        scratch.append("a new boot, longer than the old one\n");
+
+        let batch = tail.drain(1);
+        assert!(batch.restarted, "a rewritten console was not noticed");
+        assert_eq!(texts(&batch.lines), ["a new boot, longer than the old one"]);
+    }
+
+    /// A console that goes away and comes back replaces what was read before it went, rather
+    /// than being appended to it.
+    #[test]
+    fn a_console_found_again_replaces_the_scrollback() {
+        let scratch = Scratch::new("again");
+        scratch.write("before\n");
+        let mut tail = Tail::new(&scratch.0);
+        assert_eq!(tail.drain(1).lines.len(), 1);
+
+        std::fs::remove_file(scratch.0.join(crate::run::CONSOLE_LOG)).unwrap();
+        assert!(tail.drain(1).missing);
+        scratch.write("after\n");
+        let batch = tail.drain(1);
+        assert!(batch.restarted, "the old scrollback was kept");
+        assert_eq!(texts(&batch.lines), ["after"]);
+    }
+
+    /// A line is kept only up to [`MAX_LINE`], however it ends: a whole one as much as one
+    /// still waiting for its newline.
+    #[test]
+    fn a_long_line_is_kept_cut() {
+        let scratch = Scratch::new("long");
+        scratch.write(&format!("{}\n", "y".repeat(MAX_LINE * 3)));
+        let mut tail = Tail::new(&scratch.0);
+        let lines = tail.drain(1).lines;
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text.len(), MAX_LINE);
     }
 
     /// An environment that has never booted has no console, which is something to say on the
