@@ -453,9 +453,7 @@ impl Open {
 /// Cut to [`MAX_LINE`] first, whatever its length: a whole line is kept as it came, so a
 /// guest writing long ones would otherwise decide how much of this process each one costs.
 fn line_of(raw: &[u8]) -> Line {
-    classify(&String::from_utf8_lossy(
-        raw.get(..MAX_LINE).unwrap_or(raw),
-    ))
+    classify(&String::from_utf8_lossy(raw.get(..MAX_LINE).unwrap_or(raw)))
 }
 
 #[cfg(test)]
