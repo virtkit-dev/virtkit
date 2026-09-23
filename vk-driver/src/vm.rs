@@ -2452,10 +2452,10 @@ pub(crate) fn declared_mem_mib(ctx: &JobCtx) -> Result<u64> {
 /// it. A job that never gets room fails prepare, which exits `SYSTEM_FAILURE_EXIT_CODE`: a
 /// system failure, not the job's fault.
 fn admit(ctx: &JobCtx, mem: &str) -> Result<Option<crate::admit::Reservation>> {
-    let declared_mib = parse_gib(mem)
-        .context("invalid guest memory size")?
-        .checked_mul(1024)
-        .context("guest memory size is absurdly large")?;
+    // Read as the supervisor boots it, so every spelling a VM runs with — `4096M` included,
+    // which `vm.mem` has always been allowed to say — is one admission accepts too.
+    let declared_mib = crate::run::parse_mem_mib(mem)
+        .with_context(|| format!("invalid guest memory size {mem:?}"))?;
     let ask = crate::admit::Ask {
         mem: admit_memory(ctx, declared_mib)?,
         disk: admit_disk(ctx, declared_mib)?,
@@ -3559,6 +3559,7 @@ mod tests {
         let mut ctx = JobCtx::new_for_job(cfg, "42".into()).unwrap();
         assert!(ctx.cfg.executor.schedule.mem_budget.is_none());
         assert!(admit(&ctx, "8G").unwrap().is_none());
+        assert!(admit(&ctx, "4096M").unwrap().is_none(), "any size a VM boots with");
         assert!(!ctx.admit_dir().exists(), "no ledger without a budget");
 
         let schedule = &mut ctx.cfg.executor.schedule;
