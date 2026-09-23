@@ -393,10 +393,21 @@ impl App {
     /// past the end.
     fn on_envs(&mut self, envs: Vec<Env>) {
         self.read = true;
-        let was = self.selected_env().map(|env| env.dir.clone());
+        let was = self
+            .selected_env()
+            .map(|env| (env.dir.clone(), env.name().to_string()));
         let moved_to = was
             .as_ref()
-            .and_then(|dir| envs.iter().position(|env| &env.dir == dir));
+            .and_then(|(dir, _)| envs.iter().position(|env| &env.dir == dir));
+        // The menu acts on whatever is selected when its key arrives. With the environment
+        // it was opened for gone, that would be whichever took its row — so it is closed,
+        // and says why, rather than left open over something else.
+        if let Some((_, gone)) = was.as_ref().filter(|_| moved_to.is_none())
+            && self.mode == Mode::Menu
+        {
+            self.mode = Mode::Normal;
+            self.status = Some(format!("{gone} went away"));
+        }
         self.envs = envs;
         self.selected = moved_to.unwrap_or(self.selected).min(self.last_index());
         self.retarget();
@@ -752,6 +763,35 @@ mod tests {
         app.key(Press::Home);
         assert_eq!(app.selected, 0);
         assert_eq!(app.selected_env().map(|env| env.name()), Some("env-0"));
+    }
+
+    /// An open menu whose environment goes away is closed, so the next key cannot land on
+    /// whichever environment took its row.
+    #[test]
+    fn the_menu_closes_when_its_environment_goes_away() {
+        let mut app = app();
+        app.on_event(Event::Envs(envs(3)));
+        app.key(Press::Char('j'));
+        app.key(Press::Char('x'));
+        assert_eq!(app.mode, Mode::Menu);
+        let mut left = envs(3);
+        left.remove(1);
+        app.on_event(Event::Envs(left));
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.status.as_deref(), Some("env-1 went away"));
+        drain(&mut app);
+        app.key(Press::Char('d'));
+        assert!(
+            !matches!(app.mode, Mode::Confirm(_)),
+            "acted on env-2 for env-1"
+        );
+
+        // One that is still there keeps the menu open, whatever row it has moved to.
+        app.key(Press::Char('x'));
+        let mut shifted = envs(3);
+        shifted.remove(0);
+        app.on_event(Event::Envs(shifted));
+        assert_eq!(app.mode, Mode::Menu);
     }
 
     /// While the pane below has the keys, the movement keys belong to it, so the selection
