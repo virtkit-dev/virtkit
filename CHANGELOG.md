@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- A `vk dev up` joining an environment that is already up no longer waits on a boot that
+  has already finished when the state directory is reached through a symlink, such as a
+  `~/.local/state` that points to another disk.
+
 ## [0.77.0] - 2026-09-23
 
 ### Added

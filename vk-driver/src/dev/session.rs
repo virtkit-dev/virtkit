@@ -38,9 +38,7 @@ pub fn ask_on_terminal(question: &str) -> Result<bool> {
 
 /// This plan's VM, if it is up.
 pub fn running_vm(plan: &Plan) -> Option<crate::vms::VmEntry> {
-    crate::vms::running()
-        .into_iter()
-        .find(|e| e.state_dir == plan.state_dir)
+    vm_at(&plan.state_dir)
 }
 
 /// Everything that happens once the guest is up: the session environment, the endpoints,
@@ -689,13 +687,20 @@ pub fn stop(state_dir: &Path, timeout: u64) -> Result<Stopped> {
     Ok(Stopped { report, all_down })
 }
 
-/// Whether a VM is up on `state_dir`, matched as recorded or canonicalized — the state base
-/// reaches us through `$HOME`, a symlink on some hosts, so the registry's path may differ.
+/// Whether a VM is up on `state_dir`.
 fn running_at(state_dir: &Path) -> bool {
-    let canonical = std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
+    vm_at(state_dir).is_some()
+}
+
+/// The VM up on `state_dir`, matched as recorded or canonicalized — the state base reaches
+/// us through `$HOME`, a symlink on some hosts, while the registry records the canonical
+/// path. Matching the plan's path alone missed a VM under a symlinked state base, so a
+/// joining `vk dev up` waited on a boot that had long finished.
+fn vm_at(state_dir: &Path) -> Option<crate::vms::VmEntry> {
+    let canonical = crate::vms::canonical(state_dir);
     crate::vms::running()
         .into_iter()
-        .any(|e| e.state_dir.as_path() == state_dir || e.state_dir == canonical)
+        .find(|e| e.state_dir.as_path() == state_dir || e.state_dir == canonical)
 }
 
 #[cfg(test)]
@@ -892,5 +897,52 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "/usr/bin/fish");
+    }
+
+    #[test]
+    fn running_vm_finds_a_vm_registered_under_a_symlinked_state_base() {
+        const CHILD: &str = "VK_TEST_SESSION_SYMLINKED_STATE";
+        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let _guard = env_guard();
+            let tmp = scratch("session-symlinked-state");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "dev::session::tests::running_vm_finds_a_vm_registered_under_a_symlinked_state_base",
+                    "--nocapture",
+                ])
+                .env(CHILD, &tmp.0)
+                .env("XDG_DATA_HOME", tmp.0.join("data"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        };
+        use std::os::unix::io::AsRawFd;
+        // The registry records the run's canonical state dir; the plan reaches it through a
+        // symlinked base, as a `~/.local/state` that points to another disk does.
+        let real = tmp.join("real/dev/env");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(tmp.join("real"), tmp.join("link")).unwrap();
+        let via_link = tmp.join("link/dev/env");
+        let entry = serde_json::from_value(serde_json::json!({
+            "state_dir": crate::vms::canonical(&real),
+            "pid": std::process::id(),
+            "label": "devcontainer",
+            "exec_addr": "unused",
+            "created_secs": 0
+        }))
+        .unwrap();
+        let _registration = crate::vms::register(entry);
+        // Hold the lock the owning run holds, so the registry reads the entry as alive.
+        let lock = std::fs::File::open(&real).unwrap();
+        // SAFETY: the fd is owned by `lock`, alive for the rest of the test.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(vm_at(&via_link).is_some());
+        assert!(running_at(&via_link));
+        assert!(vm_at(&tmp.join("link/dev/other")).is_none());
     }
 }
