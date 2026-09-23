@@ -10,6 +10,12 @@ All notable changes to virtkit will be documented in this file.
   it, instead of failing. It still previews what goes and asks first; `--yes` skips the prompt.
   Named and `--all-stale` runs are unchanged and need no config.
 
+### Fixed
+
+- With the state directory behind a symlink, such as a `~/.local/state` on another disk,
+  `vk dev exec`, `shell`, `status`, `plan --diff` and a joining `vk dev up` no longer see a
+  running dev environment as down, and a joining `up` no longer hangs on a finished boot.
+
 ## [0.77.0] - 2026-09-23
 
 ### Added
