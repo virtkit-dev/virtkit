@@ -160,7 +160,14 @@ impl Spawner for OnRuntime {
                     .with_context(|| crate::atop_attach::exec_addr_context(&addr))?;
                 // No stderr relay: this process is drawing on the terminal, and what the
                 // guest sampler complains about would land in the middle of a frame.
-                crate::atop_attach::start(&addr, &state_dir, interval_secs, false).await
+                crate::atop_attach::start(
+                    &addr,
+                    &state_dir,
+                    crate::atop_attach::DASH_LOG_NAME,
+                    interval_secs,
+                    false,
+                )
+                .await
             };
             let started = tokio::select! {
                 // Let go of before it was ever under way. Dropping the attach is enough to
@@ -288,7 +295,7 @@ mod tests {
     /// which is the whole of how the dashboard stops asking a guest for samples.
     #[test]
     fn a_recording_ends_when_it_is_let_go_of() {
-        let spawner = fixture::Fake::new(Began::At(PathBuf::from("/state/a/atop/atop.log")));
+        let spawner = fixture::Fake::new(Began::At(PathBuf::from("/state/a/atop/dash.log")));
         let recording = Session::start(
             &spawner,
             "vsock-auto:///state/a/vsock.sock:4444",
@@ -298,7 +305,7 @@ mod tests {
         assert_eq!(spawner.started(), 1);
         assert_eq!(
             recording.began(),
-            Began::At(PathBuf::from("/state/a/atop/atop.log"))
+            Began::At(PathBuf::from("/state/a/atop/dash.log"))
         );
         assert_eq!(spawner.dropped(), 0);
         drop(recording);

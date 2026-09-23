@@ -164,8 +164,13 @@ impl Drop for Recording {
     }
 }
 
-/// Start recording the guest behind `addr` into `<state_dir>/atop/atop.log`, replacing any
-/// previous attach's recording, and wait for its first sample.
+/// Where the dashboard's guest pane records, beside `vk atop`'s [`vk_core::atop::LOG_NAME`]
+/// rather than over it: a pane opened is not a recording anyone asked to keep, and must not
+/// cost the one a `vk atop` said it had saved.
+pub(crate) const DASH_LOG_NAME: &str = "dash.log";
+
+/// Start recording the guest behind `addr` into `<state_dir>/atop/<name>`, replacing any
+/// previous recording there, and wait for its first sample.
 ///
 /// The recording lives as long as the [`Recording`] returned. `relay_stderr` puts whatever
 /// the guest sampler complains about onto this process's stderr, which is for a caller that
@@ -173,6 +178,7 @@ impl Drop for Recording {
 pub(crate) async fn start(
     addr: &SocketAddr,
     state_dir: &Path,
+    name: &str,
     interval_secs: u64,
     relay_stderr: bool,
 ) -> Result<Recording> {
@@ -181,7 +187,7 @@ pub(crate) async fn start(
     }
     let dir = state_dir.join("atop");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let log = dir.join(vk_core::atop::LOG_NAME);
+    let log = dir.join(name);
     // Opened without following a symlink, and written only once it is the regular file a
     // recording is — the same footing every reader of one opens it on. Non-blocking for the
     // same reason theirs is: a FIFO the guest left in its place would otherwise hold the
@@ -202,7 +208,8 @@ pub(crate) async fn start(
     // flock returns 0 or -1. The lock goes when this process does, which is the attach.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         bail!(
-            "{} is already being recorded by another `vk atop` — stop that one first",
+            "{} is already being recorded by another `vk atop` or `vk dash` — stop that one \
+             first",
             log.display()
         );
     }
@@ -233,7 +240,17 @@ pub(crate) async fn start(
         user: Some("0".into()),
     }))
     .await?;
-    match crate::executor::next(&mut stream).await? {
+    // Bounded like the first sample below: an agent that took the connection and then
+    // never answers would otherwise leave the caller starting for ever.
+    let reply = tokio::time::timeout(FIRST_SAMPLE_WAIT, crate::executor::next(&mut stream))
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "the VM's vk-agent did not answer within {}s",
+                FIRST_SAMPLE_WAIT.as_secs()
+            )
+        })??;
+    match reply {
         Message::StartOK => {}
         Message::StartErr { msg } => bail!("starting the sampler in the VM: {msg}"),
         other => bail!("unexpected reply to exec: {other:?}"),
@@ -299,7 +316,14 @@ pub async fn attach(entry: &vms::VmEntry, interval_secs: u64, summary: bool) -> 
     // recording still runs). Decided here rather than left to the panel to refuse, so a
     // terminal it cannot drive costs the operator the panel, not the recording.
     let panel = !summary && crate::term::can_draw();
-    let mut recording = start(&addr, &entry.state_dir, interval_secs, !panel).await?;
+    let mut recording = start(
+        &addr,
+        &entry.state_dir,
+        vk_core::atop::LOG_NAME,
+        interval_secs,
+        !panel,
+    )
+    .await?;
     let log = recording.log.clone();
 
     if panel {
