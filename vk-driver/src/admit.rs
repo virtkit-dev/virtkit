@@ -701,7 +701,10 @@ fn remember_at(dir: &Path, key: &Path, run: Run, now: u64) {
         // filled the disk is the one most likely to be torn.
         let mut text = Vec::new();
         if (&file).read_to_end(&mut text).is_ok() && text.last().is_some_and(|b| *b != b'\n') {
-            let whole = text.iter().rposition(|b| *b == b'\n').map_or(0, |at| at + 1);
+            let whole = text
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |at| at + 1);
             // Best-effort, as the doc says: a run that goes unrecorded costs the next
             // admission a little accuracy and nothing else.
             let _ = file.set_len(whole as u64);
