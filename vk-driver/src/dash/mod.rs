@@ -148,7 +148,8 @@ pub(crate) fn run(args: Args) -> Result<()> {
                     // `a` is a `vk atop` against the same VM, and one recording at a time is
                     // all a VM has. It is taken up again below.
                     watcher.stand_down();
-                    let (said, reader) = hand_over(&mut raw, &mut screen, keys, &tx, &rx, &job)?;
+                    let (said, reader) =
+                        hand_over(&mut raw, &mut screen, saved.as_ref(), keys, &tx, &rx, &job)?;
                     keys = reader;
                     watcher = poll::spawn_guest(
                         tx.clone(),
@@ -189,6 +190,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
 fn hand_over(
     raw: &mut Option<RawModeGuard>,
     screen: &mut Option<AltScreen>,
+    saved: Option<&libc::termios>,
     keys: Reader,
     tx: &Sender<Event>,
     rx: &Receiver<Event>,
@@ -213,7 +215,13 @@ fn hand_over(
 
     let said = run_attached(job);
 
-    // Back to the dashboard, whatever the child made of the terminal in between.
+    // Back to the dashboard, whatever the child made of the terminal in between. The
+    // settings it started with go back first, because they are what the raw-mode guard
+    // saves to restore on the way out: a child killed while in raw mode leaves raw settings
+    // behind, and saved as found they would be what the reader's shell got back.
+    if let Some(saved) = saved {
+        term::set_termios(libc::STDIN_FILENO, saved);
+    }
     let entered = RawModeGuard::enable(libc::STDIN_FILENO)
         .context("putting the terminal back in raw mode")
         .and_then(|guard| {
