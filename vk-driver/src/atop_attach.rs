@@ -183,11 +183,14 @@ pub(crate) async fn start(
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let log = dir.join(vk_core::atop::LOG_NAME);
     // Opened without following a symlink, and written only once it is the regular file a
-    // recording is — the same footing every reader of one opens it on.
+    // recording is — the same footing every reader of one opens it on. Non-blocking for the
+    // same reason theirs is: a FIFO the guest left in its place would otherwise hold the
+    // open until something read it, and the check below would never be reached. On a
+    // regular file the flag changes nothing.
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(&log)
         .with_context(|| format!("opening {}", log.display()))?;
     if !file.metadata()?.file_type().is_file() {
@@ -471,6 +474,33 @@ mod tests {
             .await
             .expect_err("zero is not an interval");
         assert!(format!("{e:#}").contains("--interval"), "{e:#}");
+    }
+
+    /// A FIFO where the log goes — the guest can make one through its atop share — is
+    /// refused at once rather than waited on until something reads it.
+    #[tokio::test]
+    async fn a_fifo_where_the_log_goes_is_refused_rather_than_waited_on() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = std::env::temp_dir().join(format!("vk-atop-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("atop")).unwrap();
+        let path = dir.join("atop").join(vk_core::atop::LOG_NAME);
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path for the length of the call; mkfifo
+        // returns 0 or -1.
+        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // no FIFOs on this filesystem, so there is nothing to refuse
+        }
+        let mut vm = entry("web");
+        vm.state_dir = dir.clone();
+        let e = tokio::time::timeout(Duration::from_secs(5), attach(&vm, 1, true))
+            .await
+            .expect("the open waited on the FIFO")
+            .expect_err("a FIFO is not a recording");
+        assert!(format!("{e:#}").contains(&*path.to_string_lossy()), "{e:#}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The pump's contract: the guest's stdout is the recording, byte for byte; its
