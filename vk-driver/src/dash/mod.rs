@@ -84,7 +84,7 @@ pub(crate) fn run(args: Args) -> Result<()> {
     }
     // Read before raw mode is entered: this is what the signal handler puts back.
     let saved = term::current_termios(libc::STDIN_FILENO);
-    install_panic_hook();
+    install_panic_hook(saved);
     // Held in options because an action that hands the terminal to a child puts them both
     // down for as long as the child has it, and takes them back afterwards.
     let mut raw =
@@ -265,7 +265,11 @@ fn run_attached(job: &Job) -> String {
 fn paint(app: &App) -> Result<()> {
     // A terminal that will not report its size is drawn at the size terminals had before
     // they could be asked.
-    let (rows, cols) = vk_core::pty::get_winsize(libc::STDOUT_FILENO).unwrap_or((24, 80));
+    // A pty whose size was never set reports 0×0, which is no answer either.
+    let (rows, cols) = vk_core::pty::get_winsize(libc::STDOUT_FILENO)
+        .ok()
+        .filter(|&(rows, cols)| rows > 0 && cols > 0)
+        .unwrap_or((24, 80));
     // Floored only at what a frame needs to exist at all: a line longer than the screen
     // wraps, and a wrap scrolls the whole dashboard one row further up on every repaint.
     let frame = render::frame(app, rows.max(1), cols.max(1));
@@ -276,12 +280,24 @@ fn paint(app: &App) -> Result<()> {
     Ok(())
 }
 
-/// Leave the alternate screen before the previous panic hook prints the message, so
-/// restoring the screen cannot hide it. The raw-mode guard restores settings on unwind,
-/// which happens after the hook runs.
-fn install_panic_hook() {
+/// Leave the alternate screen, and put the terminal's settings back, before the previous
+/// panic hook prints the message: restoring the screen afterwards would hide it, and a
+/// message printed in raw mode comes out as a staircase. The raw-mode guard restores them
+/// again on unwind, which happens after the hook runs.
+///
+/// Only for a panic on the thread that draws, which is the one that ends the dashboard. One
+/// on a background thread ends that thread alone, and the dashboard it leaves still drawing
+/// would otherwise draw every frame after it onto the reader's scrollback.
+fn install_panic_hook(saved: Option<libc::termios>) {
     let previous = std::panic::take_hook();
+    let drawing = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() != drawing {
+            return previous(info);
+        }
+        if let Some(saved) = &saved {
+            term::set_termios(libc::STDIN_FILENO, saved);
+        }
         let mut out = std::io::stdout();
         // Nothing to do about a write that fails here: a panic is already being reported,
         // and the hook below is about to report it wherever stderr goes.

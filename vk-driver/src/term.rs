@@ -59,6 +59,13 @@ pub(crate) fn current_termios(fd: libc::c_int) -> Option<libc::termios> {
     }
 }
 
+/// Put back settings [`current_termios`] read. Best-effort: a terminal that will not take
+/// them has nothing better to be given.
+pub(crate) fn set_termios(fd: libc::c_int, saved: &libc::termios) {
+    // SAFETY: tcsetattr only reads the termios it is given.
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, saved) };
+}
+
 /// Restore the terminal and re-raise, so the process still dies of what it was sent and the
 /// shell it dies in is usable. `tcsetattr`, `write`, `signal` and `raise` are all this runs,
 /// and all four are async-signal-safe — which matters because these signals are not blocked
