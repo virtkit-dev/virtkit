@@ -382,9 +382,10 @@ enum DevAction {
     /// Remove the state of environments that are finished with
     ///
     /// Takes the environments named, or with `--all-stale` every one that is not running and
-    /// whose workspace is gone or that never recorded a boot. A running environment is
-    /// refused. Without `--yes`, lists what would go — including the storage inside each —
-    /// and removes nothing; on a terminal it asks instead. Also needs no config.
+    /// whose workspace is gone or that never recorded a boot. With neither, takes this
+    /// workspace's environment, from its config. A running environment is refused. Without
+    /// `--yes`, lists what would go — including the storage inside each — and removes
+    /// nothing; on a terminal it asks instead. With NAME or `--all-stale` it needs no config.
     Gc {
         /// remove without asking
         #[arg(long)]
@@ -392,7 +393,7 @@ enum DevAction {
         /// every environment whose workspace is gone, or that recorded no boot
         #[arg(long = "all-stale")]
         all_stale: bool,
-        /// the environments to remove, as `vk dev list` names them
+        /// the environments to remove, as `vk dev list` names them [default: this workspace's]
         #[arg(value_name = "NAME")]
         names: Vec<String>,
     },
@@ -664,13 +665,15 @@ async fn dev_action(
         };
         return write_report(&report);
     }
+    // A bare `gc` means this workspace's environment, so only that one reads the config.
     if let DevAction::Gc {
         yes,
         all_stale,
         names,
-    } = action
+    } = &action
+        && (*all_stale || !names.is_empty())
     {
-        return dev_gc(yes, all_stale, &names);
+        return dev_gc(*yes, *all_stale, names, false);
     }
     // Like named stops, named prunes use host state and work from another or deleted
     // workspace. Select from the recorded boot state without resolving a config.
@@ -688,6 +691,10 @@ async fn dev_action(
     // caller's to fix, like a usage error.
     let loaded = match config::discover(&cwd, workspace, config).and_then(config::load) {
         Ok(l) => l,
+        Err(e) if matches!(action, DevAction::Gc { .. }) => {
+            let e = e.context("a bare `vk dev gc` takes this workspace's environment; name one (`vk dev list`) or pass --all-stale");
+            return fail(&e, 2);
+        }
         Err(e) => return fail(&e, 2),
     };
     let plan = match plan::resolve(&loaded, environment) {
@@ -1083,9 +1090,15 @@ async fn dev_action(
             // set reserves for a config or usage error.
             Err(e) => fail(&e, 1),
         },
+        // Only a bare `gc` gets here; named and `--all-stale` runs returned before the
+        // config. Selected by state-directory name, as `vk dev list` and a named `gc` are.
+        DevAction::Gc { yes, .. } => {
+            // `plan` joins an ASCII name onto the state base: the `Row.name` `scan` reads.
+            let name = plan.state_dir.file_name().unwrap_or_default();
+            dev_gc(yes, false, &[name.to_string_lossy().into_owned()], true)
+        }
         DevAction::Init { .. }
         | DevAction::List { .. }
-        | DevAction::Gc { .. }
         | DevAction::Stop { name: Some(_), .. }
         | DevAction::Prune { name: Some(_), .. }
         | DevAction::Schema => {
@@ -1157,14 +1170,19 @@ enum Ready {
     Done(ExitCode),
 }
 
-/// `vk dev gc`: choose what goes, show it, ask, and remove exactly that. Host-wide, so it
-/// works from a directory with no config. A run that only showed what would go did not do
-/// what it was asked, and exits 1.
-fn dev_gc(yes: bool, all_stale: bool, names: &[String]) -> ExitCode {
+/// `vk dev gc`: choose what goes, show it, ask, and remove exactly that. Selects by
+/// state-directory name and reads no config. `own` marks a bare `gc`, whose name came from
+/// the config: no state under it is nothing to remove, as a bare `stop` of a stopped
+/// environment is not a failure. A run that only showed what would go did not do what it
+/// was asked, and exits 1.
+fn dev_gc(yes: bool, all_stale: bool, names: &[String], own: bool) -> ExitCode {
     // Always measured: the preview's whole job is to show what is about to be destroyed.
-    let selected = match crate::dev::list::state(true)
-        .and_then(|rows| crate::dev::list::select_gc(rows, names, all_stale))
-    {
+    let selected = match crate::dev::list::state(true).and_then(|rows| {
+        if own && !rows.iter().any(|r| names.contains(&r.name)) {
+            return Ok(Vec::new());
+        }
+        crate::dev::list::select_gc(rows, names, all_stale)
+    }) {
         Ok(s) => s,
         Err(e) => return fail(&e, 1),
     };
@@ -1332,6 +1350,89 @@ mod tests {
             parse(&["vk", "dev", "stop", "myenv-1a2b"]).action,
             DevAction::Stop { name: Some(n), .. } if n == "myenv-1a2b"
         ));
+    }
+
+    #[test]
+    fn gc_takes_optional_names() {
+        // No name and no `--all-stale` is this workspace's environment, as with `stop`.
+        assert!(matches!(
+            parse(&["vk", "dev", "gc"]).action,
+            DevAction::Gc { yes: false, all_stale: false, names } if names.is_empty()
+        ));
+        assert!(matches!(
+            parse(&["vk", "dev", "gc", "a-1", "b-2"]).action,
+            DevAction::Gc { all_stale: false, names, .. } if names == ["a-1", "b-2"]
+        ));
+    }
+
+    #[test]
+    fn bare_gc_removes_this_workspaces_environment_and_selecting_gc_needs_no_config() {
+        const CHILD: &str = "VK_TEST_BARE_GC";
+        if std::env::var_os(CHILD).is_some() {
+            let cwd = std::env::current_dir().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let gc = |names: &[&str], all_stale: bool, config: Option<&Path>| {
+                runtime.block_on(dev_action(
+                    DevAction::Gc {
+                        yes: true,
+                        all_stale,
+                        names: names.iter().map(|n| n.to_string()).collect(),
+                    },
+                    Some(&cwd),
+                    config,
+                    "dev",
+                    &dev::Overrides::default(),
+                    &crate::config::Config::default(),
+                ))
+            };
+            let files = config::discover(&cwd, Some(&cwd), None).unwrap();
+            let state_dir = plan::resolve(&config::load(files).unwrap(), "dev")
+                .unwrap()
+                .state_dir;
+            let base = state_dir.parent().unwrap();
+            std::fs::create_dir_all(&state_dir).unwrap();
+            std::fs::create_dir_all(base.join("other")).unwrap();
+            std::fs::create_dir_all(base.join("stale")).unwrap();
+
+            assert_eq!(gc(&[], false, None), ExitCode::SUCCESS);
+            assert!(!state_dir.exists());
+            assert!(base.join("other").is_dir());
+            // Already gone is what a gc leaves, not a failure.
+            assert_eq!(gc(&[], false, None), ExitCode::SUCCESS);
+            // A bare gc reads the config, so a missing one is a usage error.
+            let missing = cwd.join("missing.toml");
+            assert_eq!(gc(&[], false, Some(&missing)), exit_code(2));
+            // Named and `--all-stale` runs never read it.
+            assert_eq!(gc(&["other"], false, Some(&missing)), ExitCode::SUCCESS);
+            assert!(!base.join("other").exists());
+            assert_eq!(gc(&[], true, Some(&missing)), ExitCode::SUCCESS);
+            assert!(!base.join("stale").exists());
+            return;
+        }
+        let _guard = crate::dev::testutil::env_guard();
+        let tmp = crate::dev::testutil::scratch("bare-gc");
+        let cwd = tmp.0.join("ws");
+        std::fs::create_dir_all(cwd.join(".virtkit")).unwrap();
+        std::fs::write(
+            cwd.join(config::CONFIG_FILE),
+            "schema = 1\n[dev]\nimage = \"x\"\nworkspace = \"/w\"\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "dev::cli::tests::bare_gc_removes_this_workspaces_environment_and_selecting_gc_needs_no_config",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("XDG_STATE_HOME", tmp.0.join("state"))
+            .env("XDG_DATA_HOME", tmp.0.join("data"))
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
     }
 
     #[test]

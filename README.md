@@ -414,6 +414,7 @@ vk dev stop
 vk dev prune --dry-run              # preview local boot-image cleanup; --storage selects data
 vk dev list                         # every environment this host keeps state for, from anywhere
 vk dev gc --all-stale               # review/remove stale state; asks on a terminal
+vk dev gc                           # remove this workspace's environment; asks first
 ```
 
 Configuration, local overrides, compose services, endpoints, persistent storage, editor

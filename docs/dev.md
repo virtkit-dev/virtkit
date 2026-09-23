@@ -515,17 +515,20 @@ vk dev list
 vk dev list --json
 vk dev gc --all-stale
 vk dev gc ENVIRONMENT_NAME --yes
+vk dev gc
 ```
 
-`list` and `gc` work from anywhere without a project config. Copy names from
-`list`; they identify state directories, not just the config's `dev` or `hook`
-selector. The `MEM` column shows what a running environment's VM holds on the
-host now over the size it booted with (`1.2G/8G`), the same figure `vk list`
-reports; a stopped environment reads `-`, and `mem_used_bytes` in `--json` is
-null for it. `gc` refuses running environments. `--all-stale` selects stopped
-state whose workspace is gone or which never recorded a boot, including
-leftovers from throwaway tasks. It does not mean every stopped development
-environment.
+`list`, `gc NAME` and `gc --all-stale` work from anywhere without a project
+config. A bare `gc`, like `stop`, reads the config and takes only this
+workspace's environment, not its task leftovers; if that environment has no
+state, it reports nothing to remove. Copy names from `list`; they identify state
+directories, not just the config's `dev` or `hook` selector. The `MEM` column
+shows what a running environment's VM holds on the host now over the size it
+booted with (`1.2G/8G`), the same figure `vk list` reports; a stopped
+environment reads `-`, and `mem_used_bytes` in `--json` is null for it. `gc`
+refuses running environments. `--all-stale` selects stopped state whose
+workspace is gone or which never recorded a boot, including leftovers from
+throwaway tasks. It does not mean every stopped development environment.
 
 Without `--yes`, GC asks on a terminal; without a terminal it only lists what
 would be removed. GC deletes state directories, including managed data inside
@@ -878,5 +881,5 @@ individual options.
 | `storage list`, `storage reset NAME` | Inspect storage or destroy a durable item's data. |
 | `prune [NAME]` | Remove local boot images or select `--storage` / `--all`; `--dry-run`, `--yes`. `NAME` prunes host-wide by its `vk dev list` name. Requires a stopped environment. |
 | `list` | Host-wide environment inventory (on-disk sizes by default); `--no-sizes`, `--json`. |
-| `gc [NAME…]` | Remove stopped state; `--all-stale`, `--yes`. |
+| `gc [NAME…]` | Remove stopped state (bare: this workspace's environment); `--all-stale`, `--yes`. |
 | `schema` | Print the configuration JSON Schema. |

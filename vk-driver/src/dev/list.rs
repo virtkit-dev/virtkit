@@ -7,7 +7,8 @@
 //! therefore leaves its environment's storage behind with nothing to name it, and a task
 //! that ran in a throwaway environment leaves a directory holding a root image and console
 //! logs but no `dev.json`. Both are read here from the directories themselves rather than
-//! from any config, which is why neither command resolves one.
+//! from any config, which is why `list` and a named or `--all-stale` `gc` resolve none; a
+//! bare `gc` reads the config only to name its own environment.
 //!
 //! The scan is pure: [`scan`] turns the base directory and the set of running state dirs
 //! into rows, [`select_gc`] decides which of them a `gc` takes, and only [`remove`] touches
@@ -327,6 +328,8 @@ fn short_creator(created_by: &str) -> String {
 /// checkout is gone or that never recorded a boot. A running environment is never removed;
 /// naming one is an error, not a silent skip.
 pub fn select_gc(rows: Vec<Row>, names: &[String], all_stale: bool) -> Result<Vec<Row>> {
+    // Unreachable from the CLI, where a bare `gc` passes its workspace's name; kept so an
+    // empty selection is an error, not a no-op.
     if names.is_empty() && !all_stale {
         bail!("name an environment to remove (`vk dev list`), or pass --all-stale");
     }

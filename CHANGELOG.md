@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`vk dev gc` with no name removes this workspace's environment**, as `vk dev stop` stops
+  it, instead of failing. It still previews what goes and asks first; `--yes` skips the prompt.
+  Named and `--all-stale` runs are unchanged and need no config.
+
 ## [0.77.0] - 2026-09-23
 
 ### Added
