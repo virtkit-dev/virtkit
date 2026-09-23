@@ -292,7 +292,9 @@ static REREAD: Mutex<()> = Mutex::new(());
 /// dashboard is gone.
 fn send_refresh(tx: &Sender<Event>) -> bool {
     // Guards nothing a panic could leave half-done, so a poisoned lock is still the lock.
-    let _turn = REREAD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _turn = REREAD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     tx.send(refresh()).is_ok()
 }
 
