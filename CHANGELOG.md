@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk dev shell --service NAME`** opens a login shell in a running compose service, as
+  `vk dev exec --service` already runs a command in one.
+
 ## [0.77.0] - 2026-09-23
 
 ### Added

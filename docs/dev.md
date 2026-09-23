@@ -370,6 +370,7 @@ vk dev service up runner
 vk dev endpoints --service runner
 vk dev open runner.https
 vk dev exec --service runner --user root -- id
+vk dev shell --service runner
 vk dev logs --service runner -f
 vk dev service reboot runner
 vk dev service down runner
@@ -377,9 +378,10 @@ vk dev service down runner
 
 `service up` brings up the environment if needed and builds the requested service
 on first use. `reboot` restarts the guest in place without rebuilding its image.
-Other service commands do not boot the environment. Service `exec` requires a
-running service and does not inherit the primary's user, workspace directory or
-`exec-env`; pass `--user` and `--dir` when needed.
+Other service commands do not boot the environment. Service `exec` and `shell`
+require a running service and do not inherit the primary's user, workspace directory
+or `exec-env`; the shell runs as the service's default user, and `exec` takes
+`--user` and `--dir` when needed.
 
 ### Endpoint fields
 
@@ -860,7 +862,7 @@ individual options.
 | `init` | Import or validate a config; `--from`, `--image`, `--force`. |
 | `up` | Ensure the environment is ready; `--no-wait`. |
 | `exec -- ARG…` | Run a command; `--dir`, `--user`, `--service`, `-t`. |
-| `shell` | Boot if needed and open an interactive shell. |
+| `shell` | Boot if needed and open an interactive shell; `--service`. |
 | `code` | Boot if needed and open VS Code; `--editor`. |
 | `editor status`, `editor log`, `editor retry`, `editor reset` | Follow or retry editor reconciliation, or start the server over, without booting. |
 | `build` | Build the primary or `--service NAME` into cache. |
