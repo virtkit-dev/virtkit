@@ -273,12 +273,27 @@ pub(crate) fn spawn_keys(tx: Sender<Event>) -> Reader {
 pub(crate) fn spawn_refresher(tx: Sender<Event>, every: Duration, stop: Stop) {
     std::thread::spawn(move || {
         while !stop.raised() {
-            if tx.send(refresh()).is_err() {
+            if !send_refresh(&tx) {
                 return;
             }
             stop.sleep(every);
         }
     });
+}
+
+/// Held from the start of a re-read to its delivery. Every re-read runs on a thread of its
+/// own — the timer's, the `r` key's, an action's that has just finished — and without this
+/// a slow one begun before a `stop` could land after a quick one begun after it, showing an
+/// environment just stopped as running again. One at a time, a reading arrives after every
+/// reading begun before it.
+static REREAD: Mutex<()> = Mutex::new(());
+
+/// Re-read the list and send it, in turn with every other re-read. `false` when the
+/// dashboard is gone.
+fn send_refresh(tx: &Sender<Event>) -> bool {
+    // Guards nothing a panic could leave half-done, so a poisoned lock is still the lock.
+    let _turn = REREAD.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    tx.send(refresh()).is_ok()
 }
 
 /// Follow the console of whichever environment is selected, until told to stop.
@@ -560,7 +575,7 @@ pub(crate) fn refresh_once(tx: Sender<Event>) {
     std::thread::spawn(move || {
         // A send that fails means the dashboard is gone, and this thread is finished
         // either way.
-        let _ = tx.send(refresh());
+        let _ = send_refresh(&tx);
     });
 }
 
