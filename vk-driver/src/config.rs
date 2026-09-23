@@ -377,8 +377,8 @@ pub struct Executor {
     /// agent); see [`Auth`].
     pub auth: Auth,
     /// `[executor.schedule]` — how many CI jobs this host lets run at once, by the memory
-    /// they boot; see [`Schedule`]. Off by default — jobs are admitted the moment
-    /// gitlab-runner hands them over.
+    /// they boot and the disk their job dirs grow into; see [`Schedule`]. Memory admission is
+    /// off by default, disk admission on.
     pub schedule: Schedule,
 }
 

@@ -689,7 +689,7 @@ host whose `/proc/meminfo` cannot be read fails a percentage budget rather than 
 
 The budget stays a **guest RAM** ceiling either way, not a host one: leave enough of the host
 outside it for the VMMs, a tmpfs-backed checkout, and anything else the box runs. Unset,
-admission is disabled (the default).
+memory admission is disabled (the default); disk admission is separate, and on by default.
 
 A job that waits says so in its trace, and says so again when it gets in:
 

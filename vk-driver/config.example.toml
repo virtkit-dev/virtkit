@@ -275,8 +275,8 @@
 #                        # the host keys; keys never enter the guest (no-op if unset on
 #                        # the runner). Same vsock-forward model as the services registry proxy.
 
-# [executor.schedule]    # how many CI jobs run at once, by the memory they boot. Off by
-#                        # default: gitlab-runner's `concurrent` alone decides, and past
+# [executor.schedule]    # how many CI jobs run at once, by the memory they boot and the
+#                        # disk their job dirs grow into. Memory is off by default: past
 #                        # the host's RAM the OOM killer picks which VM dies. With a budget
 #                        # set, a job claims its guest RAM before booting and waits for
 #                        # room, oldest request first. Jobs report what they actually used
