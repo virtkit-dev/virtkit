@@ -107,6 +107,8 @@ pub(crate) struct Painter {
     colour: bool,
     /// whether a style is in force and still has to be turned off
     open: bool,
+    /// the escape of the style last drawn in, empty for none
+    style: &'static str,
 }
 
 impl Painter {
@@ -118,6 +120,7 @@ impl Painter {
             limit: cols,
             colour,
             open: false,
+            style: "",
         }
     }
 
@@ -141,15 +144,17 @@ impl Painter {
             true => style.sgr(),
             false => "",
         };
-        if sgr.is_empty() {
-            if self.open {
-                self.out.push_str(RESET);
-                self.open = false;
-            }
-        } else {
+        // Turned off before another goes on, not only before plain text: SGR attributes add
+        // up, and a dim run after a bold one would otherwise be drawn bold and faint both.
+        if self.open && sgr != self.style {
+            self.out.push_str(RESET);
+            self.open = false;
+        }
+        if !sgr.is_empty() && !self.open {
             self.out.push_str(sgr);
             self.open = true;
         }
+        self.style = sgr;
         self.out.push_str(&fitted);
         self.width = self.width.saturating_add(used);
     }
