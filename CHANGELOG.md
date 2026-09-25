@@ -17,6 +17,8 @@ All notable changes to virtkit will be documented in this file.
 - **`vk dev exec --service` and `vk dev shell --service` wait for a service that is still
   booting**, for instance right after `vk dev up`, instead of failing. A stopped service
   still fails at once, now saying how to start it.
+- **Stopping a VM while it reboots powers it off**, instead of the stop hanging for a minute
+  and then killing it.
 
 ## [0.77.1] - 2026-09-23
 

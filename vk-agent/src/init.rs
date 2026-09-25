@@ -3008,15 +3008,15 @@ fn fork_exec_wait(argv: &[String]) -> Result<i32> {
     }
 }
 
-/// Wire the shutdown signals: SIGTERM and the reboot request reboot; SIGINT, the service-stop
-/// alarm, and the power-off request end the machine, rebooting if a reboot was already
-/// requested. When a service runs, first SIGTERM it and wait up to [`SERVICE_STOP_GRACE_SECS`]
-/// so applications such as databases can flush state.
+/// Install shutdown handlers. SIGTERM and reboot requests reboot unless power-off was
+/// requested; SIGINT and the service-stop alarm use the same decision. A power-off request
+/// always powers off. First SIGTERM any running service and wait up to
+/// [`SERVICE_STOP_GRACE_SECS`] so applications such as databases can flush state.
 fn install_term_handler() {
     // SAFETY: `poweroff` never returns and is async-signal-safe enough for this handler: it
-    // uses `sync`, atomic `DISK_MOUNTS`/`REBOOT_REQUESTED` reads, raw open/ioctl/close, and
-    // `reboot`. The request handlers only store an atomic and call kill(2) and alarm(2) — or,
-    // with no service, `poweroff`.
+    // uses `sync`, atomic `DISK_MOUNTS`/`REBOOT_REQUESTED`/`POWEROFF_REQUESTED` reads, raw
+    // open/ioctl/close, and `reboot`. The request handlers only store an atomic and call
+    // kill(2) and alarm(2) — or, with no service, `poweroff`.
     unsafe {
         // SIGTERM is how busybox's `reboot` signals PID 1, so treat it as a reboot request
         // (the host never SIGTERMs guest init — it uses SIG_POWEROFF or the ACPI button).
@@ -3041,7 +3041,7 @@ fn install_term_handler() {
 }
 
 /// SIGINT (console interrupt) or SIGALRM (the service-stop grace elapsed): power off, or
-/// reboot if a reboot was already requested (`poweroff` reads `REBOOT_REQUESTED`).
+/// reboot if a reboot was requested and a power-off was not (see [`poweroff`]).
 extern "C" fn handle_term(_sig: libc::c_int) {
     poweroff();
 }
@@ -3051,8 +3051,14 @@ extern "C" fn handle_term(_sig: libc::c_int) {
 static SERVICE_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// Set by a reboot request so the shutdown path ([`poweroff`]) restarts the guest (ACPI reset)
-/// instead of powering it off (ACPI S5); the host's VMM keeper then relaunches it in place.
+/// instead of powering it off (ACPI S5), unless [`POWEROFF_REQUESTED`] is set; the host's VMM
+/// keeper then relaunches it in place.
 static REBOOT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A host or power-button stop request. Overrides [`REBOOT_REQUESTED`] in either order
+/// so the host keeper does not relaunch the VM after a reset.
+static POWEROFF_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Prevent repeated requests from re-signalling the service or extending the grace period.
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3062,6 +3068,7 @@ static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 const SERVICE_STOP_GRACE_SECS: libc::c_uint = 20;
 
 extern "C" fn handle_poweroff_request(_sig: libc::c_int) {
+    POWEROFF_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
     begin_shutdown();
 }
 
@@ -3112,9 +3119,9 @@ fn supervise(serve_pid: libc::pid_t) -> Result<()> {
     poweroff();
 }
 
-/// Flush, then end the machine — power off, or reboot if [`REBOOT_REQUESTED`] is set. Host
-/// cleanup can still force-stop the VMM, but this path preserves a clean guest shutdown.
-/// Never returns.
+/// Flush, then end the machine — power off, or reboot if [`REBOOT_REQUESTED`] is set and
+/// [`POWEROFF_REQUESTED`] is not. Host cleanup can still force-stop the VMM, but this path
+/// preserves a clean guest shutdown. Never returns.
 fn poweroff() -> ! {
     // SAFETY: async-signal-safe syscall (poweroff also runs from a signal handler).
     unsafe {
@@ -3128,7 +3135,9 @@ fn poweroff() -> ! {
         crate::fsfreeze::freeze_for_poweroff(mnt);
     }
     crate::fsfreeze::freeze_for_poweroff(c"/");
-    let action = if REBOOT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed) {
+    let reboot = REBOOT_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+        && !POWEROFF_REQUESTED.load(std::sync::atomic::Ordering::Relaxed);
+    let action = if reboot {
         crate::poweroff::Action::Reboot
     } else {
         crate::poweroff::Action::PowerOff
