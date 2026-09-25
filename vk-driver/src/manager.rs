@@ -24,6 +24,8 @@ struct UnitState {
     /// profiled-down service can be built on demand the first time it is started.
     unit: crate::compose::Unit,
     child: Option<Child>,
+    /// How the last VMM exited, once reaped; cleared by the next start.
+    exited: Option<std::process::ExitStatus>,
     aux: Vec<Child>,
     /// Reference on the shared-cache base this unit overlays (image tier or build tier),
     /// held while the unit runs so the idle GC never evicts a base under a live overlay.
@@ -103,6 +105,7 @@ impl Manager {
                                 dir,
                                 unit,
                                 child: None,
+                                exited: None,
                                 aux: Vec::new(),
                                 guard: None,
                             },
@@ -285,6 +288,7 @@ impl Manager {
             Ok((child, aux)) => {
                 let ip = st.svc.ip.clone();
                 st.child = Some(child);
+                st.exited = None;
                 st.aux = aux;
                 st.guard = guard;
                 Reply::ok(format!("started {name} ({ip})"))
@@ -317,7 +321,9 @@ impl Manager {
         let console = dir.join(crate::run::CONSOLE_LOG);
         let still_up = || std::future::ready(self.still_running(name, &console));
         match crate::vms::await_agent(&unit_addr(dir), self.boot_timeout, still_up).await? {
-            crate::vms::AgentWait::Answered => Ok(()),
+            // A service that runs to completion powers its guest off, possibly before the
+            // agent answers a probe; the start did what was asked.
+            crate::vms::AgentWait::Answered | crate::vms::AgentWait::Ended => Ok(()),
             // Leave the unit running: a slow guest may still come up.
             crate::vms::AgentWait::TimedOut(e) => anyhow::bail!(
                 "{name} not ready after {}s ({e}); it is still running\n{}",
@@ -327,24 +333,28 @@ impl Manager {
         }
     }
 
-    /// [`Self::wait_ready`]'s check between probes: an error once `name` is no longer running.
-    fn still_running(&self, name: &str, console: &Path) -> Result<()> {
+    /// [`Self::wait_ready`]'s check between probes: `Ok(false)` once `name`'s VMM has exited
+    /// cleanly (its guest powered off), an error once it stopped any other way.
+    fn still_running(&self, name: &str, console: &Path) -> Result<bool> {
         // Never block on the lock: a stop holds it for up to `shutdown::STOP_GRACE`, which
         // must not stall a runtime worker. A busy lock skips this round's state check; its
         // holder is the one changing the state.
         let Some(mut u) = self.try_units_guard() else {
-            return Ok(());
+            return Ok(true);
         };
         let st = u
             .get_mut(name)
             .with_context(|| format!("no such unit {name:?}"))?;
-        if state_of(st) != "running" {
-            anyhow::bail!(
-                "{name} stopped before its agent answered\n{}",
-                crate::run::tail(console, 20)
-            );
+        if state_of(st) == "running" {
+            return Ok(true);
         }
-        Ok(())
+        if st.exited.is_some_and(|status| status.success()) {
+            return Ok(false);
+        }
+        anyhow::bail!(
+            "{name} stopped before its agent answered\n{}",
+            crate::run::tail(console, 20)
+        )
     }
 
     /// Power off a unit's guest, then kill and reap its VMM and helpers. Hold the units lock
@@ -453,8 +463,9 @@ fn unit_addr(dir: &Path) -> SocketAddr {
 fn state_of(st: &mut UnitState) -> &'static str {
     match st.child.as_mut().map(Child::try_wait) {
         Some(Ok(None)) | Some(Err(_)) => "running",
-        Some(Ok(Some(_))) => {
+        Some(Ok(Some(status))) => {
             st.child = None;
+            st.exited = Some(status);
             "stopped"
         }
         None => "stopped",
@@ -702,6 +713,39 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no such unit"), "{err}");
+    }
+
+    /// Point `cache` at a VMM stand-in that exits with `code` right away, as a guest that
+    /// powers off does; `wait_ready` keeps probing until it has.
+    fn exiting_unit(mgr: &Manager, code: i32) -> PathBuf {
+        let child = std::process::Command::new("sh")
+            .args(["-c", &format!("exit {code}")])
+            .spawn()
+            .unwrap();
+        let mut u = mgr.units_guard();
+        let st = u.get_mut("cache").unwrap();
+        st.child = Some(child);
+        st.dir.clone()
+    }
+
+    #[tokio::test]
+    async fn a_unit_whose_guest_powered_off_cleanly_is_ready() {
+        // A one-shot service (`command: cp …`) powers its guest off as soon as it finishes,
+        // possibly before a probe reaches its agent: the start succeeded.
+        let mgr = manager_over_two_units_within(std::time::Duration::from_secs(10));
+        let dir = exiting_unit(&mgr, 0);
+        mgr.wait_ready("cache", &dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_unit_whose_vmm_failed_before_its_agent_answered_is_an_error() {
+        let mgr = manager_over_two_units_within(std::time::Duration::from_secs(10));
+        let dir = exiting_unit(&mgr, 1);
+        let err = mgr.wait_ready("cache", &dir).await.unwrap_err().to_string();
+        assert!(
+            err.contains("cache stopped before its agent answered"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

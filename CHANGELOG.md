@@ -13,7 +13,8 @@ All notable changes to virtkit will be documented in this file.
   by pathname cannot. Cloud Hypervisor still rejects paths too long for its sockets.
 - **`service up` waits for the service to answer.** A `vk dev exec --service` straight after
   it no longer fails with "No such file or directory". A service that does not answer within
-  the boot timeout fails the command with its console tail and is left running.
+  the boot timeout fails the command with its console tail and is left running. A service
+  that runs to completion and powers its guest off first counts as started.
 - **`vk dev exec --service` and `vk dev shell --service` wait for a service that is still
   booting**, for instance right after `vk dev up`, instead of failing. A stopped service
   still fails at once, now saying how to start it.

@@ -522,11 +522,13 @@ async fn await_service(
             if announce {
                 eprintln!("virtkit: waiting for service {service} to come up");
             }
-            Ok(())
+            Ok(true)
         }
     };
     match crate::vms::await_agent(addr, timeout, still_up).await? {
         crate::vms::AgentWait::Answered => Ok(()),
+        // `still_up` above never reports a clean shutdown; a stopped service fails in it.
+        crate::vms::AgentWait::Ended => bail!("service {service} is not running"),
         crate::vms::AgentWait::TimedOut(e) if !managed => {
             bail!("service {service} is not answering ({e})")
         }

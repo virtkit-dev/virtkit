@@ -784,12 +784,15 @@ pub fn service_exec_addr(entry: &VmEntry, name: &str) -> Result<vk_core::addr::S
 pub enum AgentWait {
     /// The agent answered a status probe.
     Answered,
+    /// `still_up` reported the guest shut down cleanly before its agent answered.
+    Ended,
     /// The timeout passed; the last probe's error.
     TimedOut(String),
 }
 
 /// Poll the agent on `addr` until it answers or `timeout` passes. After each missed probe,
-/// `still_up` checks the guest is still coming up; its error ends the wait.
+/// `still_up` checks the guest is still coming up: `Ok(false)` (it shut down cleanly) or an
+/// error ends the wait.
 pub async fn await_agent<F, Fut>(
     addr: &vk_core::addr::SocketAddr,
     timeout: Duration,
@@ -797,7 +800,7 @@ pub async fn await_agent<F, Fut>(
 ) -> Result<AgentWait>
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<()>>,
+    Fut: Future<Output = Result<bool>>,
 {
     use vk_core::status::{BOOT_PROBE_BUDGET, get_status_within};
     let deadline = std::time::Instant::now() + timeout;
@@ -809,7 +812,9 @@ where
         let Err(e) = probe else {
             return Ok(AgentWait::Answered);
         };
-        still_up().await?;
+        if !still_up().await? {
+            return Ok(AgentWait::Ended);
+        }
         if std::time::Instant::now() >= deadline {
             return Ok(AgentWait::TimedOut(e));
         }
