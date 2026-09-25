@@ -14,6 +14,9 @@ All notable changes to virtkit will be documented in this file.
 - **`service up` waits for the service to answer.** A `vk dev exec --service` straight after
   it no longer fails with "No such file or directory". A service that does not answer within
   the boot timeout fails the command with its console tail and is left running.
+- **`vk dev exec --service` and `vk dev shell --service` wait for a service that is still
+  booting**, for instance right after `vk dev up`, instead of failing. A stopped service
+  still fails at once, now saying how to start it.
 
 ## [0.77.1] - 2026-09-23
 

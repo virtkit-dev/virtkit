@@ -1529,6 +1529,50 @@ pub fn reboot_cmd(target: Option<Selector>, all: bool, force: bool) -> Result<(S
     Ok((out, ok))
 }
 
+/// Bind a control socket that answers the first request line with `frames`, in order.
+/// `None` closes the connection without answering.
+#[cfg(test)]
+pub(crate) fn serve_frames(
+    tag: &str,
+    frames: Option<Vec<Frame>>,
+) -> (PathBuf, std::thread::JoinHandle<()>) {
+    serve_connections(tag, vec![frames])
+}
+
+/// [`serve_frames`] for several connections: the `n`th accepted is answered from `conns[n]`.
+#[cfg(test)]
+pub(crate) fn serve_connections(
+    tag: &str,
+    conns: Vec<Option<Vec<Frame>>>,
+) -> (PathBuf, std::thread::JoinHandle<()>) {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+
+    let sock = std::env::temp_dir().join(format!(
+        "vk-vms-ctl-{tag}-{}-{:?}.sock",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::remove_file(&sock).ok();
+    let listener = UnixListener::bind(&sock).unwrap();
+    let server = std::thread::spawn(move || {
+        for frames in conns {
+            let (stream, _) = listener.accept().unwrap();
+            let Some(frames) = frames else { continue };
+            let mut rd = BufReader::new(stream.try_clone().unwrap());
+            let mut req = String::new();
+            rd.read_line(&mut req).unwrap();
+            let mut w = stream;
+            for frame in frames {
+                let mut line = serde_json::to_string(&frame).unwrap();
+                line.push('\n');
+                w.write_all(line.as_bytes()).unwrap();
+            }
+        }
+    });
+    (sock, server)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2484,38 +2528,6 @@ PUBLISHED     -
     fn bare_ip_strips_the_prefix_length() {
         assert_eq!(bare_ip("10.0.0.2/24"), "10.0.0.2");
         assert_eq!(bare_ip("10.0.0.2"), "10.0.0.2");
-    }
-
-    /// Bind a control socket that answers the first request line with `frames`, in order.
-    /// `None` closes the connection without answering.
-    fn serve_frames(
-        tag: &str,
-        frames: Option<Vec<Frame>>,
-    ) -> (PathBuf, std::thread::JoinHandle<()>) {
-        use std::io::{BufRead, BufReader};
-        use std::os::unix::net::UnixListener;
-
-        let sock = std::env::temp_dir().join(format!(
-            "vk-vms-ctl-{tag}-{}-{:?}.sock",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::remove_file(&sock).ok();
-        let listener = UnixListener::bind(&sock).unwrap();
-        let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let Some(frames) = frames else { return };
-            let mut rd = BufReader::new(stream.try_clone().unwrap());
-            let mut req = String::new();
-            rd.read_line(&mut req).unwrap();
-            let mut w = stream;
-            for frame in frames {
-                let mut line = serde_json::to_string(&frame).unwrap();
-                line.push('\n');
-                w.write_all(line.as_bytes()).unwrap();
-            }
-        });
-        (sock, server)
     }
 
     #[test]

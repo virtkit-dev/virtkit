@@ -452,7 +452,7 @@ pub async fn exec_session(
 /// `vk dev exec --service`: a command in a compose service of the running environment. The
 /// service is its own guest, so nothing of the primary's contract applies — no `exec-env`,
 /// no `user`, no workspace directory — only what the caller passes. Does not boot anything:
-/// a service that is not running is an error, as is an environment that is down.
+/// a stopped service or environment is an error. Waits if the service is still booting.
 pub async fn exec_in_service(
     plan: &Plan,
     service: &str,
@@ -464,6 +464,13 @@ pub async fn exec_in_service(
     let entry = running_entry(plan)?;
     let addr = crate::vms::service_exec_addr(&entry, service)?;
     let (program, rest) = argv.split_first().context("empty command")?;
+    await_service(
+        crate::vms::control_socket(&entry),
+        service,
+        &addr,
+        SERVICE_BOOT_WAIT,
+    )
+    .await?;
     crate::exec::run(
         addr,
         false,
@@ -477,6 +484,80 @@ pub async fn exec_in_service(
         Stdin::Forward,
     )
     .await
+}
+
+/// How long an exec waits on a service that is still booting: the run's boot timeout (dev
+/// environments use the default).
+const SERVICE_BOOT_WAIT: Duration = Duration::from_secs(crate::run::DEFAULT_BOOT_TIMEOUT_SECS);
+
+/// Bounds the manager's answer to `Status`, which waits on the units lock a stop holds for up
+/// to `shutdown::STOP_GRACE`.
+const STATUS_TIMEOUT: Duration =
+    crate::shutdown::STOP_GRACE.saturating_add(Duration::from_secs(10));
+
+/// Return once `service`'s agent answers on `addr`, within `timeout`. A service still booting
+/// — running by the account of the manager on `ctl`, its agent not yet up — is waited for; one
+/// the manager reports stopped fails at once, as does any service when there is no `ctl` to
+/// tell booting from stopped (one probe).
+async fn await_service(
+    ctl: Option<std::path::PathBuf>,
+    service: &str,
+    addr: &vk_core::addr::SocketAddr,
+    timeout: Duration,
+) -> Result<()> {
+    let managed = ctl.is_some();
+    let timeout = if managed { timeout } else { Duration::ZERO };
+    let mut misses = 0u32;
+    let still_up = || {
+        misses += 1;
+        // Stopped after the first check: it went down booting, and its logs say why.
+        let (announce, crashed) = (misses == 2, misses > 1);
+        let (ctl, service) = (ctl.clone(), service.to_string());
+        async move {
+            if let Some(ctl) = ctl {
+                // `control` is blocking I/O: keep it off the runtime's workers.
+                let svc = service.clone();
+                tokio::task::spawn_blocking(move || service_running(&ctl, &svc, crashed)).await??;
+            }
+            if announce {
+                eprintln!("virtkit: waiting for service {service} to come up");
+            }
+            Ok(())
+        }
+    };
+    match crate::vms::await_agent(addr, timeout, still_up).await? {
+        crate::vms::AgentWait::Answered => Ok(()),
+        crate::vms::AgentWait::TimedOut(e) if !managed => {
+            bail!("service {service} is not answering ({e})")
+        }
+        crate::vms::AgentWait::TimedOut(e) => bail!(
+            "service {service} not ready after {}s ({e}); it is still running, \
+             `vk dev logs --service {service}` shows its console",
+            timeout.as_secs()
+        ),
+    }
+}
+
+/// An error unless the manager on `ctl` reports `service` running; `crashed` points the error
+/// at the service's logs.
+fn service_running(ctl: &Path, service: &str, crashed: bool) -> Result<()> {
+    let req = vk_core::fleetctl::Request::Status {
+        unit: service.to_string(),
+    };
+    let reply = crate::vms::control(ctl, &req, Some(STATUS_TIMEOUT), |_| {})
+        .with_context(|| format!("asking the service manager whether {service} is running"))?;
+    if !reply.ok {
+        bail!("{}", reply.message);
+    }
+    if !reply.units.iter().any(|u| u.state == "running") {
+        let why = if crashed {
+            format!("; `vk dev logs --service {service}` shows why")
+        } else {
+            String::new()
+        };
+        bail!("service {service} is not running — `vk dev service up {service}` starts it{why}");
+    }
+    Ok(())
 }
 
 /// Send one host request to the running environment's service manager, relaying
@@ -935,5 +1016,99 @@ mod tests {
         assert!(running_vm(&plan).is_some());
         plan.state_dir = tmp.join("link/dev/other");
         assert!(running_vm(&plan).is_none());
+    }
+
+    /// Return the `await_service` error for `db` when its agent never answers and the
+    /// manager answers `Status` with `reply`.
+    async fn await_db_under(
+        tag: &str,
+        reply: vk_core::fleetctl::Reply,
+        timeout: Duration,
+    ) -> String {
+        await_db_under_replies(tag, vec![reply], timeout).await
+    }
+
+    /// [`await_db_under`] with the manager answering successive `Status` requests from
+    /// `replies`, in order.
+    async fn await_db_under_replies(
+        tag: &str,
+        replies: Vec<vk_core::fleetctl::Reply>,
+        timeout: Duration,
+    ) -> String {
+        let conns = replies
+            .into_iter()
+            .map(|r| Some(vec![vk_core::fleetctl::Frame::Done(r)]))
+            .collect();
+        let (sock, server) = crate::vms::serve_connections(tag, conns);
+        let agent = vk_core::addr::SocketAddr::Unix(sock.with_extension("absent"));
+        let res = await_service(Some(sock.clone()), "db", &agent, timeout).await;
+        server.join().unwrap();
+        std::fs::remove_file(&sock).ok();
+        format!("{:#}", res.unwrap_err())
+    }
+
+    fn db(state: &str) -> vk_core::fleetctl::UnitStatus {
+        vk_core::fleetctl::UnitStatus {
+            name: "db".into(),
+            state: state.into(),
+            ip: "10.0.0.2/24".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_service_the_manager_reports_stopped_fails_at_once() {
+        let reply = vk_core::fleetctl::Reply::list(vec![db("stopped")]);
+        let err = await_db_under("stopped", reply, Duration::from_secs(60)).await;
+        assert_eq!(
+            err,
+            "service db is not running — `vk dev service up db` starts it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manager_refusal_propagates() {
+        let reply = vk_core::fleetctl::Reply::err("no such unit \"db\"");
+        let err = await_db_under("refused", reply, Duration::from_secs(60)).await;
+        assert_eq!(err, "no such unit \"db\"");
+    }
+
+    #[tokio::test]
+    async fn a_running_service_whose_agent_never_answers_times_out() {
+        let reply = vk_core::fleetctl::Reply::list(vec![db("running")]);
+        let err = await_db_under("running", reply, Duration::ZERO).await;
+        assert!(err.starts_with("service db not ready after 0s ("), "{err}");
+        assert!(
+            err.ends_with("; it is still running, `vk dev logs --service db` shows its console"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_service_that_stops_while_booting_points_at_its_logs() {
+        let replies = vec![
+            vk_core::fleetctl::Reply::list(vec![db("running")]),
+            vk_core::fleetctl::Reply::list(vec![db("stopped")]),
+        ];
+        let wait = await_db_under_replies("crashed", replies, Duration::from_secs(60));
+        let err = tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("a stopped service ends the wait");
+        assert!(
+            err.ends_with("; `vk dev logs --service db` shows why"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_manager_a_silent_agent_fails_at_once() {
+        let agent = vk_core::addr::SocketAddr::Unix(
+            std::env::temp_dir().join(format!("vk-session-absent-{}.sock", std::process::id())),
+        );
+        let wait = await_service(None, "db", &agent, Duration::from_secs(60));
+        let res = tokio::time::timeout(Duration::from_secs(10), wait)
+            .await
+            .expect("no wait without a manager");
+        let err = format!("{:#}", res.unwrap_err());
+        assert!(err.starts_with("service db is not answering ("), "{err}");
     }
 }

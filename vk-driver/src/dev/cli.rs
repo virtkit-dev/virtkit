@@ -116,9 +116,9 @@ enum DevAction {
         tty: bool,
         /// run in this compose service instead of the primary
         ///
-        /// The service must be running (`vk dev service up`). It gets none of the primary's
-        /// contract — no `exec-env`, no `user`, no workspace directory — only what is passed
-        /// here: the service is its own guest.
+        /// The service must be running (`vk dev service up`). Waits if it is still booting.
+        /// It gets none of the primary's contract — no `exec-env`, no `user`, no
+        /// workspace directory — only what is passed here: the service is its own guest.
         #[arg(long, value_name = "NAME")]
         service: Option<String>,
         /// run as this user, instead of the config's (or, in a service, its default)
@@ -144,10 +144,10 @@ enum DevAction {
     Shell {
         /// open the shell in this compose service instead of the primary
         ///
-        /// The service must be running (`vk dev service up`). As with `vk dev exec
-        /// --service`, it gets none of the primary's contract — no `exec-env`, no `user`, no
-        /// workspace directory: the shell runs as the service's default user, in its working
-        /// directory (its WORKDIR, or `/` under an image init).
+        /// The service must be running (`vk dev service up`). Waits if it is still booting.
+        /// As with `vk dev exec --service`, it gets none of the primary's contract — no
+        /// `exec-env`, no `user`, no workspace directory: the shell runs as the service's
+        /// default user, in its working directory (its WORKDIR, or `/` under an image init).
         #[arg(long, value_name = "NAME")]
         service: Option<String>,
     },

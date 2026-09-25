@@ -425,6 +425,9 @@ pub struct RunArgs {
     pub command: Vec<String>,
 }
 
+/// `--boot-timeout`'s default: how long a guest may take for its agent to answer.
+pub(crate) const DEFAULT_BOOT_TIMEOUT_SECS: u64 = 120;
+
 /// The values `vk run`'s own flags default to, so a caller that builds a run from something
 /// other than a command line — `vk dev`, from a devcontainer config — states only what it
 /// means and cannot drift from the CLI on the rest. Kept in step with the clap defaults by
@@ -461,7 +464,7 @@ impl Default for RunArgs {
             service_nics: Vec::new(),
             reclaim: None,
             dax: None,
-            boot_timeout_secs: 120,
+            boot_timeout_secs: DEFAULT_BOOT_TIMEOUT_SECS,
             vm_name: "vk:{name}".to_string(),
             ram: false,
             init: InitSource::Default,
