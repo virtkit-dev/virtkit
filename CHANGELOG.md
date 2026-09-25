@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.78.0] - 2026-09-25
+
 ### Added
 
 - **`vk-registry` serves its store over WebDAV under `/dav/`.** `/dav/repos/` is a
@@ -3078,7 +3080,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.77.2...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.78.0...HEAD
+[0.78.0]: https://github.com/virtkit-dev/virtkit/compare/v0.77.2...v0.78.0
 [0.77.2]: https://github.com/virtkit-dev/virtkit/compare/v0.77.1...v0.77.2
 [0.77.1]: https://github.com/virtkit-dev/virtkit/compare/v0.77.0...v0.77.1
 [0.77.0]: https://github.com/virtkit-dev/virtkit/compare/v0.76.1...v0.77.0
