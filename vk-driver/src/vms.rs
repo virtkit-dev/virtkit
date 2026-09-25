@@ -17,7 +17,6 @@ use std::ffi::OsStr;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
@@ -742,8 +741,8 @@ pub fn control(
     mut on_progress: impl FnMut(&str),
 ) -> Result<Reply> {
     use std::io::{BufRead, BufReader};
-    let mut stream =
-        UnixStream::connect(ctl).with_context(|| format!("control: connect {}", ctl.display()))?;
+    let mut stream = vk_core::unixpath::connect(ctl)
+        .with_context(|| format!("control: connect {}", ctl.display()))?;
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(timeout)?;
     let mut text = serde_json::to_string(req).context("encoding the control request")?;

@@ -9,7 +9,7 @@
 //! `--ssh-host` aliases.
 
 use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -51,7 +51,7 @@ pub struct Identity {
 
 /// Ask the agent at `upstream` for its identities (`REQUEST_IDENTITIES` → `IDENTITIES_ANSWER`).
 pub fn list_identities(upstream: &Path) -> Result<Vec<Identity>> {
-    let mut up = UnixStream::connect(upstream)
+    let mut up = vk_core::unixpath::connect(upstream)
         .with_context(|| format!("connecting to the agent at {}", upstream.display()))?;
     write_msg(&mut up, &[SSH_AGENTC_REQUEST_IDENTITIES])?;
     let answer = read_msg(&mut up)?
@@ -91,7 +91,7 @@ fn parse_identities(answer: &[u8]) -> Result<Vec<Identity>> {
 /// only keys in `allow`. One thread per client connection; runs until the socket is removed.
 pub fn run_proxy(listen: &Path, upstream: &Path, allow: &[Vec<u8>]) -> Result<()> {
     let _ = std::fs::remove_file(listen);
-    let l = UnixListener::bind(listen)
+    let l = vk_core::unixpath::bind(listen)
         .with_context(|| format!("binding ssh-agent proxy at {}", listen.display()))?;
     for conn in l.incoming() {
         let Ok(client) = conn else { continue };
@@ -110,7 +110,7 @@ pub fn run_proxy(listen: &Path, upstream: &Path, allow: &[Vec<u8>]) -> Result<()
 /// rest with `SSH_AGENT_FAILURE` (fail closed). REQUEST_IDENTITIES is filtered to the
 /// allowlist; SIGN_REQUEST is forwarded only for an allowed key.
 fn handle_conn(mut client: UnixStream, upstream: &Path, allow: &[Vec<u8>]) -> Result<()> {
-    let mut up = UnixStream::connect(upstream)
+    let mut up = vk_core::unixpath::connect(upstream)
         .with_context(|| format!("connecting to the agent at {}", upstream.display()))?;
     while let Some(req) = read_msg(&mut client)? {
         let reply = match req.first().copied() {

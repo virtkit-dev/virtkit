@@ -22,6 +22,7 @@
 
 use std::ffi::CString;
 use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,7 @@ use krun::{
 };
 
 use crate::vmm::{Disk, Net, VmSpec};
+use vk_core::unixpath::SocketPath;
 
 // `krun_set_kernel` kernel-format tags (see the vendored libkrun `KernelFormat`). On x86_64
 // libkrun loads a raw ELF `vmlinux` directly (ELF), or scans an "Image" for a compression magic,
@@ -126,9 +128,23 @@ fn mem_mib(mem: &str) -> Result<u32> {
         .ok_or_else(|| anyhow::anyhow!("memory size {mem:?} is not <n>G, <n>M or a MiB count"))
 }
 
+/// Convert a socket path for libkrun, keeping it within `sun_path`.
+/// Store its [`SocketPath`] in `held` for later binds and connects throughout the boot.
+/// For long paths, the descriptor pins the directory even if its pathname is replaced.
+fn socket_cstr(path: &std::path::Path, held: &mut Vec<SocketPath>) -> Result<CString> {
+    let socket = SocketPath::new(path).with_context(|| format!("socket {}", path.display()))?;
+    let c = CString::new(socket.as_path().as_os_str().as_bytes())
+        .with_context(|| format!("socket {}", path.display()))?;
+    held.push(socket);
+    Ok(c)
+}
+
 /// Boot `spec` under libkrun in this process. Returns only when the guest powers
 /// off (or never, until then) — the caller is the libkrun boot subprocess.
 pub fn boot(spec: &VmSpec) -> Result<()> {
+    // libkrun binds and dials these sockets once the VM runs — a vsock port's peer only on
+    // the guest's first connect — so their descriptors outlive `krun_start_enter`.
+    let mut sockets = Vec::new();
     unsafe {
         // libkrun logs to stderr (captured to the VMM log). Its debug level fires on the
         // block / virtio-fs I/O hot path and measurably slows a build, so default to warn
@@ -225,7 +241,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         // virtio-blk disks in order (first = /dev/vda). qcow2 overlays resolve their
         // backing chain (KRUN_DISK_FORMAT_QCOW2); raw bases use KRUN_DISK_FORMAT_RAW.
         for (i, disk) in spec.disks.iter().enumerate() {
-            add_disk(ctx, i, disk)?;
+            add_disk(ctx, i, disk, &mut sockets)?;
         }
 
         // virtio-fs shares. libkrun has no external vhost-user-fs, so it mounts the host
@@ -295,7 +311,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         // The agent never has to trust that — every NIC carries the MAC its address derives
         // from, so an interface can always be matched back to its address.
         for (i, nic) in spec.nics.iter().enumerate() {
-            let path = cstr(&nic.socket.to_string_lossy());
+            let path = socket_cstr(&nic.socket, &mut sockets)?;
             let (socket, want) = (nic.socket.display(), &nic.mac);
             let mac = crate::switch::parse_mac(want).ok_or_else(|| {
                 anyhow::anyhow!("switch nic {i} ({socket}): invalid MAC {want:?}")
@@ -322,7 +338,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         // already listens (the switch and ssh-agent bridges). cloud-hypervisor
         // gets the equivalent wiring from its single hybrid socket.
         for vp in &spec.vsock_ports {
-            let path = cstr(&vp.socket.to_string_lossy());
+            let path = socket_cstr(&vp.socket, &mut sockets)?;
             ck(
                 "krun_add_vsock_port2",
                 krun_add_vsock_port2(ctx, vp.port, path.as_ptr(), vp.listen),
@@ -343,6 +359,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         // blocks until the guest powers off or resets.
         ck("krun_start_enter", krun_start_enter(ctx))?;
     }
+    drop(sockets);
     Ok(())
 }
 
@@ -564,7 +581,12 @@ fn wait_for(pid: i32) -> Wait {
     }
 }
 
-unsafe fn add_disk(ctx: u32, index: usize, disk: &Disk) -> Result<()> {
+unsafe fn add_disk(
+    ctx: u32,
+    index: usize,
+    disk: &Disk,
+    sockets: &mut Vec<SocketPath>,
+) -> Result<()> {
     let block_id = cstr(&format!("vd{}", (b'a' + index as u8) as char));
     let path = cstr(&disk.path.to_string_lossy());
     let format = match disk.format {
@@ -588,7 +610,7 @@ unsafe fn add_disk(ctx: u32, index: usize, disk: &Disk) -> Result<()> {
     // Dirty-block tracking (build stages): serve the drain protocol on the given socket so a
     // checkpoint captures only the delta. Set only on the writable stage overlay.
     if let Some(sock) = &disk.dirty_control_socket {
-        let sock = cstr(&sock.to_string_lossy());
+        let sock = socket_cstr(sock, sockets)?;
         ck("krun_set_block_dirty_socket", unsafe {
             krun_set_block_dirty_socket(ctx, block_id.as_ptr(), sock.as_ptr())
         })?;

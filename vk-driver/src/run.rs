@@ -592,8 +592,9 @@ pub(crate) fn default_data_base() -> Result<PathBuf> {
 /// real disk sits idle. Cache semantics fit (transient, regenerable, removed on drop); the
 /// durable instruction store lives under `$XDG_DATA_HOME` instead. `--state-dir` overrides
 /// this with a caller-chosen path. The short `launch-<pid>` leaf keeps the AF_UNIX socket
-/// paths created under here well within the 108-byte limit. Shared with the build path
-/// (`build_units`), which anchors a cache-only build's scratch here for the same reason.
+/// paths created under here within the 108-byte limit cloud-hypervisor needs them to fit.
+/// Shared with the build path (`build_units`), which anchors a cache-only build's scratch
+/// here for the same reason.
 pub(crate) fn default_scratch_base() -> Result<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(xdg).join("virtkit"));
@@ -602,26 +603,41 @@ pub(crate) fn default_scratch_base() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".cache/virtkit"))
 }
 
-/// Usable bytes in Linux `sockaddr_un.sun_path`: 108 bytes minus the terminating NUL.
-pub(crate) const SUN_PATH_MAX: usize = 107;
+pub(crate) use vk_core::unixpath::SUN_PATH_MAX;
 
 /// The longest socket name bound directly in a state dir — the vsock socket of the highest
 /// port a bridged or published port can take; a virtiofsd volume socket (`vfsd-vol<i>.sock`)
 /// only overtakes it past 1000 volumes.
 const LONGEST_SOCKET_NAME: &str = "vsock.sock_65535";
 
-/// State directory byte limit, reserving room for the separator and longest socket name.
+/// State directory byte limit under cloud-hypervisor, reserving room for the separator and
+/// longest socket name.
 pub(crate) const STATE_DIR_MAX: usize = SUN_PATH_MAX - 1 - LONGEST_SOCKET_NAME.len();
 
-/// Reject a state dir too long for its sockets. Measure the path as supplied for binding;
-/// canonicalizing it would measure a different string.
+/// Reject long state dirs only under cloud-hypervisor, which receives socket paths on its
+/// command line and binds and connects by name. libkrun runs in our process and uses directory
+/// descriptors ([`vk_core::unixpath`]), as our other socket callers do, without this limit.
 pub(crate) fn check_state_dir_len(dir: &Path) -> Result<()> {
+    if crate::vmm::libkrun_selected() {
+        return Ok(());
+    }
+    check_state_dir_fits_sockets(dir)
+}
+
+/// The length check itself. Measure the path as supplied for binding; canonicalizing it
+/// would measure a different string.
+fn check_state_dir_fits_sockets(dir: &Path) -> Result<()> {
     let len = dir.as_os_str().len();
+    let or_libkrun = if cfg!(feature = "libkrun") {
+        ", or the default libkrun backend"
+    } else {
+        ""
+    };
     ensure!(
         len <= STATE_DIR_MAX,
         "state directory {} is {len} bytes long, {STATE_DIR_MAX} is the most it may be: \
-         the VM's sockets are bound under it and a unix socket path holds at most \
-         {SUN_PATH_MAX} bytes. Use a shorter path.",
+         cloud-hypervisor binds the VM's sockets under it and a unix socket path holds at \
+         most {SUN_PATH_MAX} bytes. Use a shorter path{or_libkrun}.",
         dir.display()
     );
     Ok(())
@@ -635,7 +651,9 @@ pub(crate) fn check_state_dir_len(dir: &Path) -> Result<()> {
 /// reused (stale sockets from a previous run are unlinked up front) and NEVER
 /// removed — the stable socket paths are the whole point (external tooling
 /// attaches to `vsock-auto://<dir>/vsock.sock:<port>` while the VM runs), and the
-/// caller may keep its own files (SSH keys, bind-mount sources) alongside.
+/// caller may keep its own files (SSH keys, bind-mount sources) alongside. Under a dir
+/// too long for those paths to fit `sun_path`, only `vk` itself (`vk connect`, `vk exec`)
+/// reaches the sockets: a tool that dials them by name cannot.
 struct WorkDir {
     path: PathBuf,
     pinned: bool,
@@ -2874,7 +2892,7 @@ fn plan_services(
         let dir = work.join(format!("svc-{}", unit.name));
         // The switch binds each service's vsock socket under this dir at startup, and the
         // boot writes the overlay/console here — so it must exist before either runs, and
-        // its own path has to leave room for those sockets.
+        // under cloud-hypervisor its own path has to leave room for those sockets.
         check_state_dir_len(&dir)?;
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         sited.push(Sited { unit: i, dir, slot });
@@ -4728,7 +4746,7 @@ impl VmSession {
             .dirty_socket
             .as_ref()
             .context("drain_dirty: dirty tracking not enabled for this guest")?;
-        let mut conn = std::os::unix::net::UnixStream::connect(sock)
+        let mut conn = vk_core::unixpath::connect(sock)
             .with_context(|| format!("connecting dirty-control socket {}", sock.display()))?;
         conn.write_all(b"D").context("dirty-control: send DRAIN")?;
         // Two blocks back to back: written ranges, then discarded ranges. Each is `u32 count`
@@ -4774,7 +4792,7 @@ impl VmSession {
             return;
         };
         let flush = || -> Result<()> {
-            let mut conn = std::os::unix::net::UnixStream::connect(sock)
+            let mut conn = vk_core::unixpath::connect(sock)
                 .with_context(|| format!("connecting block-control socket {}", sock.display()))?;
             conn.write_all(b"F").context("block-control: send FLUSH")?;
             let mut ack = [0u8; 1];
@@ -5795,7 +5813,7 @@ mod tests {
     }
 
     #[test]
-    fn a_state_dir_is_refused_once_its_socket_paths_would_not_fit() {
+    fn a_state_dir_is_refused_once_cloud_hypervisor_could_not_bind_its_sockets() {
         // 90 bytes: `<dir>/vsock.sock_65535` is exactly the 107 a unix socket path holds.
         let fits = PathBuf::from(format!("/{}", "d".repeat(STATE_DIR_MAX - 1)));
         assert_eq!(fits.as_os_str().len(), STATE_DIR_MAX);
@@ -5803,12 +5821,19 @@ mod tests {
             fits.join(LONGEST_SOCKET_NAME).as_os_str().len(),
             SUN_PATH_MAX
         );
-        check_state_dir_len(&fits).unwrap();
+        check_state_dir_fits_sockets(&fits).unwrap();
 
         let over = PathBuf::from(format!("/{}", "d".repeat(STATE_DIR_MAX)));
-        let err = check_state_dir_len(&over).unwrap_err().to_string();
+        let err = check_state_dir_fits_sockets(&over).unwrap_err().to_string();
         assert!(err.contains(over.to_str().unwrap()), "{err}");
         assert!(err.contains(&STATE_DIR_MAX.to_string()), "{err}");
+        assert!(err.contains("cloud-hypervisor"), "{err}");
+
+        // libkrun has no such limit.
+        assert_eq!(
+            check_state_dir_len(&over).is_ok(),
+            crate::vmm::libkrun_selected()
+        );
     }
 
     #[test]

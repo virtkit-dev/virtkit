@@ -1,5 +1,6 @@
 use crate::addr::SocketAddr;
 use crate::framing::{DeSink, SerStream, wrap_stream};
+use crate::unixpath;
 use anyhow::{Context, anyhow, bail};
 use listenfd::ListenFd;
 use log::{debug, info};
@@ -28,7 +29,7 @@ async fn connect_inner(socket: &SocketAddr) -> Result<(SerStream, DeSink), anyho
     match socket {
         SocketAddr::Systemd => bail!("cannot connect to systemd:// (serve only)"),
         SocketAddr::Unix(path) => {
-            let stream = UnixStream::connect(path)
+            let stream = unixpath::connect_tokio(path)
                 .await
                 .with_context(|| format!("connecting to {}", path.display()))?;
             Ok(wrap_stream(stream))
@@ -77,7 +78,7 @@ pub fn mac_for_ip(ip: Ipv4Addr) -> String {
 /// connect to instead of the guest.
 async fn connect_auto(path: &Path, port: u32) -> Result<UnixStream, anyhow::Error> {
     let per_port = hybrid_socket(path, port);
-    let direct_err = match UnixStream::connect(&per_port).await {
+    let direct_err = match unixpath::connect_tokio(&per_port).await {
         Ok(stream) => return Ok(stream),
         Err(e) => e,
     };
@@ -94,7 +95,7 @@ async fn connect_auto(path: &Path, port: u32) -> Result<UnixStream, anyhow::Erro
 /// `CONNECT <port>\n`, the VMM answers `OK <local port>\n` once the guest accepts, and
 /// from there the stream is raw end-to-end.
 async fn connect_mux(path: &Path, port: u32) -> Result<UnixStream, anyhow::Error> {
-    let mut stream = UnixStream::connect(path)
+    let mut stream = unixpath::connect_tokio(path)
         .await
         .with_context(|| format!("connecting to vsock mux {}", path.display()))?;
     stream
@@ -162,12 +163,13 @@ impl Listeners {
     }
 }
 
-/// Bind the agent's exec socket privately.
+/// Bind the agent's exec socket privately. Its clients connect through [`unixpath`], so the
+/// path may be of any length.
 ///
-/// [`vk_fs::bind_private`] returns a blocking listener. Convert it here to keep `vk-fs`
-/// runtime-free and reusable by `vk-registry`, whose bind path is also synchronous.
+/// [`vk_fs::bind_private_any_length`] returns a blocking listener. Convert it here to keep
+/// `vk-fs` runtime-free and reusable by `vk-registry`, whose bind path is also synchronous.
 fn bind_private(path: &Path) -> Result<UnixListener, anyhow::Error> {
-    let listener = vk_fs::bind_private(path)?;
+    let listener = vk_fs::bind_private_any_length(path)?;
     listener
         .set_nonblocking(true)
         .with_context(|| format!("making {} non-blocking", path.display()))?;
@@ -355,7 +357,7 @@ pub async fn raw_connect(target: &SocketAddr) -> Result<RawConn, anyhow::Error> 
                 .with_context(|| format!("connecting to {addr}"))?,
         ),
         SocketAddr::Unix(path) => RawConn::Unix(
-            UnixStream::connect(path)
+            unixpath::connect_tokio(path)
                 .await
                 .with_context(|| format!("connecting to {}", path.display()))?,
         ),
@@ -421,7 +423,8 @@ pub async fn raw_listen(local: &SocketAddr) -> Result<RawListener, anyhow::Error
         SocketAddr::Unix(path) => {
             let _ = std::fs::remove_file(path);
             RawListener::Unix(
-                UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?,
+                unixpath::bind_tokio(path)
+                    .with_context(|| format!("binding {}", path.display()))?,
             )
         }
         SocketAddr::Vsock { cid, port } => {
@@ -684,6 +687,36 @@ mod tests {
         served.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"raw-bytes");
         drop(decoy);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A VM's sockets under a directory deeper than `sun_path` holds are reached all the
+    /// same, the exec channel's per-port socket as well as the mux.
+    #[tokio::test]
+    async fn vsock_auto_reaches_sockets_past_the_sun_path_limit() {
+        let dir = scratch("auto-deep");
+        let deep = dir.join("d".repeat(100));
+        std::fs::create_dir_all(&deep).unwrap();
+        let base = deep.join("vsock.sock");
+        assert!(base.as_os_str().len() > crate::unixpath::SUN_PATH_MAX);
+        let direct = crate::unixpath::bind_tokio(&hybrid_socket(&base, 4444)).unwrap();
+        let mut conn = connect_auto(&base, 4444).await.unwrap();
+        conn.write_all(b"raw-bytes").await.unwrap();
+        let (mut served, _) = direct.accept().await.unwrap();
+        let mut buf = [0u8; 9];
+        served.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"raw-bytes");
+
+        let mux = crate::unixpath::bind_tokio(&base).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = mux.accept().await.unwrap();
+            let mut line = [0u8; 13];
+            s.read_exact(&mut line).await.unwrap();
+            assert_eq!(&line, b"CONNECT 5555\n");
+            s.write_all(b"OK 5555\n").await.unwrap();
+        });
+        connect_auto(&base, 5555).await.unwrap();
+        server.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

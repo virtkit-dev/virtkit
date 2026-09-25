@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use ipstack::{IpStack, IpStackConfig, IpStackStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::net::{TcpStream, UdpSocket, UnixListener, UnixStream};
+use tokio::net::{TcpStream, UdpSocket, UnixStream};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 /// Gateway MAC — locally administered, unicast. The guest learns it via ARP.
@@ -1157,8 +1157,8 @@ pub async fn run(
     let mut accepts = Vec::new();
     for (path, bound_ip, vm) in listen {
         let _ = std::fs::remove_file(path);
-        let listener =
-            UnixListener::bind(path).with_context(|| format!("switch: bind {}", path.display()))?;
+        let listener = vk_core::unixpath::bind_tokio(path)
+            .with_context(|| format!("switch: bind {}", path.display()))?;
         let sw = sw.clone();
         let bound_ip = *bound_ip;
         let vm = *vm;
@@ -4900,20 +4900,10 @@ mod tests {
         buf
     }
 
-    /// Two "VMs" on the switch: a unicast frame from A to B's MAC is forwarded to
-    /// B's port (MAC learning), and a broadcast floods to B.
-    #[tokio::test]
-    async fn forwards_between_vms() {
-        use std::time::Duration;
-        let dir = std::env::temp_dir().join(format!("switchtest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (sa, sb) = (dir.join("a.sock"), dir.join("b.sock"));
-        let (ip_a, ip_b) = (
-            Ipv4Addr::new(192, 168, 127, 2),
-            Ipv4Addr::new(192, 168, 127, 3),
-        );
-        // Two separate guests, so a frame sourcing the other's address is a spoof.
-        let listen = vec![(sa.clone(), ip_a, 0), (sb.clone(), ip_b, 1)];
+    /// Start a switch serving `listen` on 192.168.127.1/24 with egress open, and wait for its
+    /// sockets to appear.
+    async fn spawn_switch(listen: Vec<(PathBuf, Ipv4Addr, VmId)>) {
+        let paths: Vec<PathBuf> = listen.iter().map(|(p, _, _)| p.clone()).collect();
         tokio::spawn(async move {
             let _ = run(
                 &listen,
@@ -4932,11 +4922,28 @@ mod tests {
             .await;
         });
         for _ in 0..100 {
-            if sa.exists() && sb.exists() {
+            if paths.iter().all(|p| p.exists()) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Two "VMs" on the switch: a unicast frame from A to B's MAC is forwarded to
+    /// B's port (MAC learning), and a broadcast floods to B.
+    #[tokio::test]
+    async fn forwards_between_vms() {
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("switchtest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (sa, sb) = (dir.join("a.sock"), dir.join("b.sock"));
+        let (ip_a, ip_b) = (
+            Ipv4Addr::new(192, 168, 127, 2),
+            Ipv4Addr::new(192, 168, 127, 3),
+        );
+        // Two separate guests, so a frame sourcing the other's address is a spoof.
+        let listen = vec![(sa.clone(), ip_a, 0), (sb.clone(), ip_b, 1)];
+        spawn_switch(listen).await;
         let mut a = UnixStream::connect(&sa).await.unwrap();
         let mut b = UnixStream::connect(&sb).await.unwrap();
         let (mac_a, mac_b) = ([2, 0, 0, 0, 0, 0xaa], [2, 0, 0, 0, 0, 0xbb]);
@@ -4966,6 +4973,35 @@ mod tests {
         assert_eq!(got, bcast);
     }
 
+    /// A compose service's ports live one directory below its environment's, so a long state
+    /// dir puts them past what `sun_path` holds. The switch still binds them there, and a peer
+    /// dialling through `unixpath` reaches it.
+    #[tokio::test]
+    async fn serves_ports_bound_deeper_than_sun_path_holds() {
+        let root = std::env::temp_dir().join(format!("switchtest-deep-{}", std::process::id()));
+        let env = root.join("e".repeat(90));
+        let svc = env.join("svc-runner");
+        std::fs::create_dir_all(&svc).unwrap();
+        let (sa, sb) = (svc.join("vsock.sock_1024"), svc.join("vsock.sock_1025"));
+        assert!(sa.as_os_str().len() > vk_core::unixpath::SUN_PATH_MAX);
+        let (ip_a, ip_b) = (
+            Ipv4Addr::new(192, 168, 127, 2),
+            Ipv4Addr::new(192, 168, 127, 3),
+        );
+        let listen = vec![(sa.clone(), ip_a, 0), (sb.clone(), ip_b, 1)];
+        spawn_switch(listen).await;
+        let mut a = vk_core::unixpath::connect_tokio(&sa).await.unwrap();
+        let mut b = vk_core::unixpath::connect_tokio(&sb).await.unwrap();
+        let mac_a = [2, 0, 0, 0, 0, 0xaa];
+        let bcast = eth(BCAST_MAC, mac_a, 0x88b5, b"broadcast-payload");
+        send(&mut a, &bcast).await;
+        let got = tokio::time::timeout(Duration::from_secs(2), recv(&mut b))
+            .await
+            .unwrap();
+        assert_eq!(got, bcast);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A VM may only source IPv4 from the address bound to its socket: a frame forging a
     /// sibling's source is dropped before it can flood, egress, or select that sibling's
     /// egress policy. Since the source drives `policy_for`/`route_in`, this is the isolation
@@ -4982,29 +5018,7 @@ mod tests {
         );
         // Two separate guests, so a frame sourcing the other's address is a spoof.
         let listen = vec![(sa.clone(), ip_a, 0), (sb.clone(), ip_b, 1)];
-        tokio::spawn(async move {
-            let _ = run(
-                &listen,
-                Ipv4Addr::new(192, 168, 127, 1),
-                24,
-                HashMap::new(),
-                HashMap::new(),
-                Egress::AllowAll,
-                HashMap::new(),
-                None,
-                None,
-                None,
-                None,
-                false,
-            )
-            .await;
-        });
-        for _ in 0..100 {
-            if sa.exists() && sb.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        spawn_switch(listen).await;
         let mut a = UnixStream::connect(&sa).await.unwrap();
         let mut b = UnixStream::connect(&sb).await.unwrap();
         let mac_b = [2, 0, 0, 0, 0, 0xbb];
@@ -5063,29 +5077,7 @@ mod tests {
             (s1.clone(), ip1, 0),
             (s_other.clone(), ip_other, 1),
         ];
-        tokio::spawn(async move {
-            let _ = run(
-                &listen,
-                Ipv4Addr::new(192, 168, 127, 1),
-                24,
-                HashMap::new(),
-                HashMap::new(),
-                Egress::AllowAll,
-                HashMap::new(),
-                None,
-                None,
-                None,
-                None,
-                false,
-            )
-            .await;
-        });
-        for _ in 0..100 {
-            if s0.exists() && s1.exists() && s_other.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        spawn_switch(listen).await;
         let mut eth0 = UnixStream::connect(&s0).await.unwrap();
         let mut other = UnixStream::connect(&s_other).await.unwrap();
         let mac0 = [2, 0, 0, 0, 0, 0x01];

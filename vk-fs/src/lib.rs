@@ -16,9 +16,9 @@
 //!   [`dir_admits_only_us`] is the test, and it is the caller's directory that decides.
 //!
 //! [`bind_private`] applies all four to unix sockets; [`write_atomic`] applies the first
-//! three to files. `vk-core` uses `bind_private` for the agent's exec channel and
-//! `vk-registry` for its admin socket; both require the published name to refer only to a
-//! socket already restricted to `0600`.
+//! three to files. `vk-core` uses it (as [`bind_private_any_length`]) for the agent's exec
+//! channel and `vk-registry` for its admin socket; both require the published name to refer
+//! only to a socket already restricted to `0600`.
 //!
 //! [`open_dir`] and [`open_dir_nofollow`] expose the third rule to callers that anchor their
 //! own `*at()` operations.
@@ -71,8 +71,28 @@ const STAGING_ATTEMPTS: u32 = 8;
 /// bind picks its own name and never one already standing, so leavings do not accumulate
 /// into a bind that fails for a socket path that is free.
 pub fn bind_private(path: &Path) -> Result<UnixListener, anyhow::Error> {
-    bind_private_from(path, staging_names())
+    bind_private_from(path, staging_names(), PathLen::MustFit)
 }
+
+/// [`bind_private`] at a path of any length. Clients use a directory descriptor
+/// (`vk_core::unixpath`); connecting by pathname fails when it exceeds `sun_path`.
+pub fn bind_private_any_length(path: &Path) -> Result<UnixListener, anyhow::Error> {
+    bind_private_from(path, staging_names(), PathLen::AnyLength)
+}
+
+/// Which socket paths [`bind_private_from`] accepts.
+#[derive(Clone, Copy)]
+enum PathLen {
+    /// Only a path clients can pass to `connect` as it is.
+    MustFit,
+    /// Any, as long as its final name is reachable through a directory descriptor.
+    AnyLength,
+}
+
+/// Maximum filename length in `/proc/self/fd/<fd>/<name>` for any `i32` descriptor.
+/// Reserve the NUL included in [`SUN_PATH_MAX`], the prefix, 10 descriptor digits, and
+/// the separator. Mirrors `vk_core::unixpath`, which this crate cannot depend on.
+const MAX_NAME_VIA_DIR: usize = SUN_PATH_MAX - 1 - "/proc/self/fd/".len() - 10 - 1;
 
 /// The staging names one bind will try, in order.
 ///
@@ -98,23 +118,38 @@ fn staging_names() -> impl FnMut() -> Result<String, anyhow::Error> {
     }
 }
 
-/// [`bind_private`], with the staging names supplied so a test can arrange a collision.
+/// [`bind_private`] with injectable staging names for collision tests and `len` selecting
+/// the paths clients can reach.
 fn bind_private_from(
     path: &Path,
     mut next_name: impl FnMut() -> Result<String, anyhow::Error>,
+    len: PathLen,
 ) -> Result<UnixListener, anyhow::Error> {
     let Some(final_name) = path.file_name() else {
         bail!("{path:?} is not a path a socket can be bound at");
     };
-    // `bind` sees only the short `/proc/self/fd` anchor below, and `renameat` sees a descriptor
-    // plus the final component, so neither validates the address clients are given. Reject a
-    // spelling they cannot pass back to `connect` before publishing a socket through it.
-    let len = path.as_os_str().len();
-    if len >= SUN_PATH_MAX {
-        bail!(
-            "{path:?} is too long for a unix socket: it is {len} bytes and {SUN_PATH_MAX} is \
-             the limit — bind it on a shorter path"
-        );
+    // `bind` sees the short `/proc/self/fd` path; `renameat` sees a descriptor and filename.
+    // Neither validates the client's address. Before publishing, check that the full path
+    // fits for direct clients, or the filename fits after a directory descriptor otherwise.
+    match len {
+        PathLen::MustFit => {
+            let len = path.as_os_str().len();
+            if len >= SUN_PATH_MAX {
+                bail!(
+                    "{path:?} is too long for a unix socket: it is {len} bytes and \
+                     {SUN_PATH_MAX} is the limit — bind it on a shorter path"
+                );
+            }
+        }
+        PathLen::AnyLength => {
+            let len = final_name.len();
+            if len > MAX_NAME_VIA_DIR {
+                bail!(
+                    "{path:?} cannot be a unix socket: its {len}-byte name is too long to \
+                     reach through a directory descriptor, {MAX_NAME_VIA_DIR} is the most"
+                );
+            }
+        }
     }
     let final_name = cstr(final_name)?;
     let parent = path.parent().unwrap_or(Path::new("."));
@@ -559,6 +594,27 @@ mod tests {
             !long.exists(),
             "nothing may be published for a refused bind"
         );
+        // Unless its clients reach it through a descriptor on its directory: then only the
+        // final name has to fit behind one.
+        let far = dir.join("f".repeat(SUN_PATH_MAX)).join("agent.sock");
+        std::fs::create_dir_all(far.parent().unwrap()).unwrap();
+        drop(bind_private_any_length(&far).unwrap());
+        assert_eq!(
+            std::fs::symlink_metadata(&far)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        let err = format!("{:#}", bind_private_any_length(&long).unwrap_err());
+        assert!(
+            err.contains(&format!("{SUN_PATH_MAX}-byte name")),
+            "unhelpful error for an over-long name: {err}"
+        );
+        assert!(!long.exists());
+        let widest = far.with_file_name("n".repeat(MAX_NAME_VIA_DIR));
+        drop(bind_private_any_length(&widest).unwrap());
 
         // Staging costs the caller nothing now that it happens under `/proc/self/fd`: a name
         // that fits binds, however deep the directory holding it.
@@ -590,11 +646,15 @@ mod tests {
         }
 
         let mut handed_out = 0u64;
-        let listener = bind_private_from(&path, || {
-            let n = handed_out;
-            handed_out += 1;
-            Ok(format!(".taken{n}"))
-        })
+        let listener = bind_private_from(
+            &path,
+            || {
+                let n = handed_out;
+                handed_out += 1;
+                Ok(format!(".taken{n}"))
+            },
+            PathLen::MustFit,
+        )
         .unwrap();
         drop(listener);
 
@@ -628,7 +688,8 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("keep"), b"x").unwrap();
 
-        let err = bind_private_from(&path, || Ok(".staged".to_string())).unwrap_err();
+        let err =
+            bind_private_from(&path, || Ok(".staged".to_string()), PathLen::MustFit).unwrap_err();
 
         assert!(
             format!("{err:#}").contains("publishing the socket"),
@@ -742,7 +803,7 @@ mod tests {
 
         for attempt in 0..=STAGING_ATTEMPTS {
             drop(
-                bind_private_from(&path, staging_names()).unwrap_or_else(|e| {
+                bind_private_from(&path, staging_names(), PathLen::MustFit).unwrap_or_else(|e| {
                     panic!("bind {attempt} must succeed beside what is kept: {e:#}")
                 }),
             );

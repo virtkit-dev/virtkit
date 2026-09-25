@@ -8,6 +8,7 @@ use log::{error, info, warn};
 use vk_core::addr::SocketAddr;
 use vk_core::exec::client::client_run_connect;
 use vk_core::net::{RawListener, connect, raw_listen};
+use vk_core::unixpath::SUN_PATH_MAX;
 
 /// Retry interval and limit for accept errors, which may otherwise spin forever.
 const ACCEPT_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
@@ -369,6 +370,18 @@ pub async fn ensure(
     // Reject listener types that cannot cross fork/exec before starting an unwatched child.
     if !matches!(listen, SocketAddr::Tcp(_) | SocketAddr::Unix(_)) {
         bail!("vk publish ensure serves tcp:// and unix listen addresses only (got {listen})");
+    }
+    // The publisher proves the listener it adopts is this one by the path the kernel reports
+    // for it, which is a `/proc/self/fd` spelling for a path longer than `sun_path` holds.
+    if let SocketAddr::Unix(path) = listen {
+        let len = path.as_os_str().len();
+        if len > SUN_PATH_MAX {
+            bail!(
+                "{} is too long for a published unix socket: {len} bytes, \
+                 {SUN_PATH_MAX} is the most",
+                path.display()
+            );
+        }
     }
     // Port 0 cannot work because the record, list, and child argv cannot report the port
     // selected by the kernel.
@@ -1343,6 +1356,23 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("(via db)"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn ensure_refuses_a_unix_listen_path_longer_than_sun_path() {
+        let t = state("long-unix");
+        let path = t.0.join("p".repeat(SUN_PATH_MAX));
+        let listen = SocketAddr::Unix(path.clone());
+        let agent: SocketAddr = "tcp://127.0.0.1:9".parse().unwrap();
+        let err = ensure(&t.0, "runner", &agent, &listen, "tcp://runner:443", None)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("too long for a published unix socket"),
+            "{msg}"
+        );
+        assert!(!path.exists(), "nothing may be bound for a refused path");
     }
 
     #[tokio::test]

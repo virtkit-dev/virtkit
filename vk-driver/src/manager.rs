@@ -416,7 +416,7 @@ fn state_of(st: &mut UnitState) -> &'static str {
 /// the guest's /run/vk/services bridge keeps one connection open across operations).
 pub async fn control_server(listen: &Path, mgr: Arc<Manager>) -> Result<()> {
     let _ = std::fs::remove_file(listen);
-    let listener = tokio::net::UnixListener::bind(listen)
+    let listener = vk_core::unixpath::bind_tokio(listen)
         .with_context(|| format!("control: bind {}", listen.display()))?;
     loop {
         let (conn, _) = listener.accept().await?;

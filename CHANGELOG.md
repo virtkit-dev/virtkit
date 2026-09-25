@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Long state directories work under libkrun.** Compose services keep their sockets one
+  directory below their environment. With a long home directory, as on WSL, `vk dev up`
+  rejected services with "state directory … is 92 bytes long"; `vk run --state-dir` rejected
+  long paths too. `vk exec` and `vk connect` can reach these sockets, but tools that connect
+  by pathname cannot. Cloud Hypervisor still rejects paths too long for its sockets.
+
 ## [0.77.1] - 2026-09-23
 
 ### Added
