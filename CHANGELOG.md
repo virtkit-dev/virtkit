@@ -11,6 +11,9 @@ All notable changes to virtkit will be documented in this file.
   rejected services with "state directory … is 92 bytes long"; `vk run --state-dir` rejected
   long paths too. `vk exec` and `vk connect` can reach these sockets, but tools that connect
   by pathname cannot. Cloud Hypervisor still rejects paths too long for its sockets.
+- **`service up` waits for the service to answer.** A `vk dev exec --service` straight after
+  it no longer fails with "No such file or directory". A service that does not answer within
+  the boot timeout fails the command with its console tail and is left running.
 
 ## [0.77.1] - 2026-09-23
 

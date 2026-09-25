@@ -376,8 +376,9 @@ vk dev service reboot runner
 vk dev service down runner
 ```
 
-`service up` brings up the environment if needed and builds the requested service
-on first use. `reboot` restarts the guest in place without rebuilding its image.
+`service up` brings up the environment if needed, builds the requested service
+on first use, and returns once the service's agent answers. `reboot` restarts the
+guest in place without rebuilding its image.
 Other service commands do not boot the environment. Service `exec` and `shell`
 require a running service and do not inherit the primary's user, workspace
 directory or `exec-env`; the shell runs as the service's default user, and `exec`

@@ -780,6 +780,43 @@ pub fn service_exec_addr(entry: &VmEntry, name: &str) -> Result<vk_core::addr::S
     found.exec_addr.parse::<vk_core::addr::SocketAddr>()
 }
 
+/// How [`await_agent`] ended when `still_up` never failed.
+pub enum AgentWait {
+    /// The agent answered a status probe.
+    Answered,
+    /// The timeout passed; the last probe's error.
+    TimedOut(String),
+}
+
+/// Poll the agent on `addr` until it answers or `timeout` passes. After each missed probe,
+/// `still_up` checks the guest is still coming up; its error ends the wait.
+pub async fn await_agent<F, Fut>(
+    addr: &vk_core::addr::SocketAddr,
+    timeout: Duration,
+    mut still_up: F,
+) -> Result<AgentWait>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    use vk_core::status::{BOOT_PROBE_BUDGET, get_status_within};
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // The probe's error is not `Send`: keep only its text across the awaits below.
+        let probe = get_status_within(addr, BOOT_PROBE_BUDGET)
+            .await
+            .map_err(|e| e.to_string());
+        let Err(e) = probe else {
+            return Ok(AgentWait::Answered);
+        };
+        still_up().await?;
+        if std::time::Instant::now() >= deadline {
+            return Ok(AgentWait::TimedOut(e));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// How many compose siblings the default table names before folding the rest into `+N`.
 /// Keep in sync with the `vk list` help in `main.rs` and the table description in
 /// `README.md`, which both spell the number out.

@@ -387,10 +387,11 @@ services only, held until Ctrl-C.
 Inside the primary guest, `/run/vk/services/<name>/{state,ctl,log}` exposes service
 state, control, and logs through ordinary files. `vk service up|down|reboot|status` is the
 corresponding command interface: `up` starts a declared (or profiled-down) service, building
-it on first use; `down` powers it off; `reboot` restarts its guest in place on the same
-disks; `status` reports one or all. `vk run --ssh` enables SSH access for development VMs,
-including VS Code Remote-SSH workflows. In a CI fleet a service's `environment:` may also
-carry its own egress allowlist — see [Per-service egress](docs/gitlab-ci.md#per-service-egress).
+it on first use, and returns once it answers; `down` powers it off; `reboot` restarts its
+guest in place on the same disks; `status` reports one or all. `vk run --ssh` enables SSH
+access for development VMs, including VS Code Remote-SSH workflows. In a CI fleet a
+service's `environment:` may also carry its own egress allowlist — see
+[Per-service egress](docs/gitlab-ci.md#per-service-egress).
 
 ### Develop in a project environment
 

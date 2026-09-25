@@ -31,6 +31,8 @@ struct UnitState {
     guard: Option<crate::cachelock::Guard>,
 }
 
+type UnitsGuard<'a> = std::sync::MutexGuard<'a, HashMap<String, UnitState>>;
+
 /// The two roots a [`Manager`] works from, named rather than positional: passing them the wrong
 /// way round would file a run's registry corrections under a cache root, which reads the same
 /// either way at the call site.
@@ -61,6 +63,8 @@ pub struct Manager {
     dirs: ManagerDirs,
     /// how long a base may sit idle before the on-demand build path's GC evicts it
     idle: std::time::Duration,
+    /// how long a control-plane start waits for the service's agent to answer
+    boot_timeout: std::time::Duration,
     units: Mutex<HashMap<String, UnitState>>,
 }
 
@@ -75,6 +79,7 @@ impl Manager {
         build: crate::units::BuildOpts,
         dirs: ManagerDirs,
         idle: std::time::Duration,
+        boot_timeout: std::time::Duration,
         units: impl IntoIterator<Item = (crate::units::Provisioned, PathBuf, crate::compose::Unit)>,
     ) -> Manager {
         Manager {
@@ -86,6 +91,7 @@ impl Manager {
             build,
             dirs,
             idle,
+            boot_timeout,
             units: Mutex::new(
                 units
                     .into_iter()
@@ -112,14 +118,24 @@ impl Manager {
     /// panic under this lock would otherwise poison it and turn every *later* request into a
     /// failure until the whole run restarts. The map is a set of independent unit entries, so
     /// serving on from the recovered state beats bricking the control plane.
-    fn units_guard(&self) -> std::sync::MutexGuard<'_, HashMap<String, UnitState>> {
-        self.units.lock().unwrap_or_else(|e| {
-            // Report recovery once and clear the poison so later requests lock normally.
-            // Continue with the recovered guard.
-            eprintln!("virtkit: recovered the units lock a panicking request had poisoned");
-            self.units.clear_poison();
-            e.into_inner()
-        })
+    fn units_guard(&self) -> UnitsGuard<'_> {
+        self.units.lock().unwrap_or_else(|e| self.recover(e))
+    }
+
+    /// [`Self::units_guard`] without blocking: `None` while another request holds the lock.
+    fn try_units_guard(&self) -> Option<UnitsGuard<'_>> {
+        match self.units.try_lock() {
+            Ok(u) => Some(u),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(self.recover(e)),
+        }
+    }
+
+    fn recover<'a>(&self, e: std::sync::PoisonError<UnitsGuard<'a>>) -> UnitsGuard<'a> {
+        // Report recovery once and clear the poison so later requests lock normally.
+        eprintln!("virtkit: recovered the units lock a panicking request had poisoned");
+        self.units.clear_poison();
+        e.into_inner()
     }
 
     /// Number of declared units.
@@ -127,9 +143,9 @@ impl Manager {
         self.units_guard().len()
     }
 
-    /// Dispatch a request to a single (non-streaming) reply. `handle_control` intercepts
-    /// `Start`/`Restart` to stream build progress (see `stream_start`); the `Start`/`Restart`
-    /// arms here are the non-streaming fallback (a null progress sink) for any other caller.
+    /// Return a single reply. `Start`/`Restart` discard build progress and reply after spawning
+    /// the VMM, without waiting for the agent. `handle_control` routes them to `stream_start`
+    /// instead, which streams build progress and waits for the agent.
     pub fn handle(&self, req: Request) -> Reply {
         match req {
             Request::List => self.list(),
@@ -291,6 +307,44 @@ impl Manager {
                 recipe.root_ext4 = st.svc.ext4.clone();
             }
         }
+    }
+
+    /// Wait for the unit's agent to answer on its exec channel at `dir`. The VMM binds the
+    /// socket only once guest vsock is up; replying earlier lets `exec` race its creation.
+    /// Images with `EXPOSE`d ports delay the channel until those ports accept connections,
+    /// which the CI executor also relies on when waiting for services.
+    async fn wait_ready(&self, name: &str, dir: &Path) -> Result<()> {
+        let console = dir.join(crate::run::CONSOLE_LOG);
+        let still_up = || std::future::ready(self.still_running(name, &console));
+        match crate::vms::await_agent(&unit_addr(dir), self.boot_timeout, still_up).await? {
+            crate::vms::AgentWait::Answered => Ok(()),
+            // Leave the unit running: a slow guest may still come up.
+            crate::vms::AgentWait::TimedOut(e) => anyhow::bail!(
+                "{name} not ready after {}s ({e}); it is still running\n{}",
+                self.boot_timeout.as_secs(),
+                crate::run::tail(&console, 20)
+            ),
+        }
+    }
+
+    /// [`Self::wait_ready`]'s check between probes: an error once `name` is no longer running.
+    fn still_running(&self, name: &str, console: &Path) -> Result<()> {
+        // Never block on the lock: a stop holds it for up to `shutdown::STOP_GRACE`, which
+        // must not stall a runtime worker. A busy lock skips this round's state check; its
+        // holder is the one changing the state.
+        let Some(mut u) = self.try_units_guard() else {
+            return Ok(());
+        };
+        let st = u
+            .get_mut(name)
+            .with_context(|| format!("no such unit {name:?}"))?;
+        if state_of(st) != "running" {
+            anyhow::bail!(
+                "{name} stopped before its agent answered\n{}",
+                crate::run::tail(console, 20)
+            );
+        }
+        Ok(())
     }
 
     /// Power off a unit's guest, then kill and reap its VMM and helpers. Hold the units lock
@@ -460,7 +514,8 @@ async fn handle_control(conn: tokio::net::UnixStream, mgr: Arc<Manager>) -> Resu
 /// thread and forwarding its build progress to the peer as `Progress` frames, then the
 /// terminal `Done`. The build sink pushes lines onto an unbounded channel this drains until
 /// the blocking task finishes and drops it; a write error (peer gone) abandons the stream
-/// while the detached build runs to completion.
+/// while the detached build runs to completion. A successful start sends its `Done` only once
+/// the unit's agent answers (`Manager::wait_ready`), within the boot timeout.
 async fn stream_start(
     wr: &mut (impl tokio::io::AsyncWriteExt + Unpin),
     mgr: &Arc<Manager>,
@@ -471,12 +526,16 @@ async fn stream_start(
     let sink: crate::build::ProgressSink = Arc::new(move |line: &str| {
         let _ = tx.send(line.to_string());
     });
-    let mgr = Arc::clone(mgr);
-    let task = tokio::task::spawn_blocking(move || {
-        if restart {
-            let _ = mgr.stop(&unit);
+    let task = tokio::task::spawn_blocking({
+        let (mgr, unit) = (Arc::clone(mgr), unit.clone());
+        move || {
+            if restart {
+                let _ = mgr.stop(&unit);
+            }
+            let reply = mgr.start_streamed(&unit, Some(sink));
+            let dir = mgr.units_guard().get(&unit).map(|st| st.dir.clone());
+            (reply, dir)
         }
-        mgr.start_streamed(&unit, Some(sink))
     });
     // Drain build progress until the task drops its sink (build + boot done). A write error
     // here (peer gone) returns via `?`, dropping the receiver and detaching the build — it
@@ -485,9 +544,15 @@ async fn stream_start(
     while let Some(line) = rx.recv().await {
         vk_core::fleetctl::write_msg(wr, &Frame::Progress(line)).await?;
     }
-    let reply = task
+    let (mut reply, dir) = task
         .await
-        .unwrap_or_else(|e| Reply::err(format!("start task failed: {e}")));
+        .unwrap_or_else(|e| (Reply::err(format!("start task failed: {e}")), None));
+    if reply.ok
+        && let Some(dir) = dir
+        && let Err(e) = mgr.wait_ready(&unit, &dir).await
+    {
+        reply = Reply::err(format!("{e:#}"));
+    }
     vk_core::fleetctl::write_msg(wr, &Frame::Done(reply)).await
 }
 
@@ -498,6 +563,11 @@ mod tests {
     /// A manager over one `build:` unit and one `image:` unit, provisioned as `plan_services`
     /// would leave them: each addressed, neither built.
     fn manager_over_two_units() -> Manager {
+        manager_over_two_units_within(std::time::Duration::from_secs(120))
+    }
+
+    /// [`manager_over_two_units`] with a control-plane start waiting up to `boot_timeout`.
+    fn manager_over_two_units_within(boot_timeout: std::time::Duration) -> Manager {
         let compose = "services:\n  db:\n    build: ./db\n  cache:\n    image: redis:7\n";
         let units = crate::compose::parse(compose, Path::new("/proj"), &|_| None, None).unwrap();
         let gw: Ipv4Addr = "192.168.127.1".parse().unwrap();
@@ -542,6 +612,7 @@ mod tests {
                 run: Some(PathBuf::from("/run/vm")),
             },
             std::time::Duration::from_secs(1800),
+            boot_timeout,
             provisioned,
         )
     }
@@ -618,5 +689,94 @@ mod tests {
         // An `image:` service carries no recipe, and an unknown name must not panic.
         assert!(entries[1].stale_recipe.is_none());
         mgr.refresh_service_images(&mut [entry("absent", true)]);
+    }
+
+    #[tokio::test]
+    async fn waiting_on_a_unit_that_is_not_running_fails_at_once() {
+        let mgr = manager_over_two_units();
+        let dir = mgr.units_guard()["cache"].dir.clone();
+        let err = mgr.wait_ready("cache", &dir).await.unwrap_err().to_string();
+        assert!(
+            err.contains("cache stopped before its agent answered"),
+            "{err}"
+        );
+        let err = mgr
+            .wait_ready("absent", &dir)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no such unit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_unit_whose_agent_never_answers_times_out_and_is_left_running() {
+        let mgr = manager_over_two_units_within(std::time::Duration::ZERO);
+        // A live child stands in for the VMM; the unit's dir holds no exec socket.
+        let dir = {
+            let mut u = mgr.units_guard();
+            let st = u.get_mut("cache").unwrap();
+            st.child = Some(
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap(),
+            );
+            st.dir.clone()
+        };
+        let err = mgr.wait_ready("cache", &dir).await.unwrap_err().to_string();
+        let mut child = mgr
+            .units_guard()
+            .get_mut("cache")
+            .unwrap()
+            .child
+            .take()
+            .unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(err.contains("cache not ready after 0s"), "{err}");
+        assert!(err.contains("still running"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_unit_whose_agent_answers_is_ready() {
+        let mgr = manager_over_two_units_within(std::time::Duration::from_secs(10));
+        // A live child stands in for the VMM; an exec server bound late stands in for the
+        // agent, at the per-port socket the unit's `vsock-auto` address resolves to first.
+        let dir = std::env::temp_dir().join(format!("vk-mgr-ready-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let SocketAddr::VsockAuto { path, port } = unit_addr(&dir) else {
+            panic!("a unit's exec address is vsock-auto");
+        };
+        let agent = SocketAddr::Unix(vk_core::net::hybrid_socket(&path, port));
+        mgr.units_guard().get_mut("cache").unwrap().child = Some(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            vk_core::exec::server::run_server(
+                &agent,
+                Some(std::time::Duration::from_secs(60)),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        });
+        let res = mgr.wait_ready("cache", &dir).await;
+        let mut child = mgr
+            .units_guard()
+            .get_mut("cache")
+            .unwrap()
+            .child
+            .take()
+            .unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        res.unwrap();
     }
 }

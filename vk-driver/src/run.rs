@@ -1773,6 +1773,7 @@ async fn build_and_boot(
                 run: args.state_dir.as_ref().map(|_| registry_key(work)),
             },
             cfg.image_cache_idle(),
+            Duration::from_secs(args.boot_timeout_secs),
             planned.units,
         )))
     };
@@ -3058,6 +3059,7 @@ async fn compose_up(
             run: None,
         },
         cfg.image_cache_idle(),
+        Duration::from_secs(args.boot_timeout_secs),
         planned.units,
     ));
     for name in &planned.start {
@@ -4099,7 +4101,7 @@ pub(crate) fn parse_mem_mib(mem: &str) -> Option<u64> {
 /// and `vk logs`.
 pub(crate) const CONSOLE_LOG: &str = "console.log";
 
-fn tail(path: &Path, lines: usize) -> String {
+pub(crate) fn tail(path: &Path, lines: usize) -> String {
     tail_of(&read_lossy(path), lines)
 }
 
