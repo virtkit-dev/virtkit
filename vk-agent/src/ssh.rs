@@ -6,8 +6,8 @@
 //!
 //! It authenticates OpenSSH public keys passed to `ssh-serve` on the kernel
 //! command line; it does not read an authorized-keys file. It supports `pty` +
-//! `shell` with window resizing, `shell` without a pty (VS Code pipes its
-//! bootstrap script to `ssh -T`), `exec`, `sftp` (scp and VS Code's server
+//! `shell` and `pty` + `exec` with window resizing, `shell` without a pty (VS Code
+//! pipes its bootstrap script to `ssh -T`), `exec`, `sftp` (scp and VS Code's server
 //! copy), and `direct-tcpip` (VS Code's server connection and `ssh -L`/`-D`).
 //! Together these cover VS Code Remote-SSH.
 //!
@@ -202,6 +202,41 @@ impl ServerHandler {
             .clone()
             .unwrap_or_else(|| "root".to_string())
     }
+
+    /// Answer a `shell` (`cmdline` None) or `exec` request on a channel that asked for a pty:
+    /// spawn on a fresh pty and bridge it to the channel, taking the client's window changes.
+    fn start_on_pty(
+        &mut self,
+        chan: Channel<Msg>,
+        channel: ChannelId,
+        user: &str,
+        pty: &PtyReq,
+        cmdline: Option<&str>,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        match spawn_on_pty(user, pty, cmdline) {
+            Ok((child, master)) => {
+                let (resize_tx, resizes) = watch::channel((pty.rows, pty.cols));
+                self.resizes.insert(channel, resize_tx);
+                session.channel_success(channel)?;
+                let handle = session.handle();
+                tokio::spawn(shell_bridge(
+                    chan,
+                    child,
+                    master,
+                    resizes,
+                    handle,
+                    channel,
+                    self.gone.clone(),
+                ));
+            }
+            Err(e) => {
+                warn!("ssh: pty session for {user:?}: {e}");
+                session.channel_failure(channel)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Handler for ServerHandler {
@@ -300,27 +335,7 @@ impl Handler for ServerHandler {
         // script to stdin): a NON-interactive login shell with piped stdio, so no
         // prompt/PS1 noise contaminates the stdout VS Code parses.
         match self.ptys.remove(&channel) {
-            Some(pty) => match spawn_shell(&user, &pty) {
-                Ok((child, master)) => {
-                    let (resize_tx, resizes) = watch::channel((pty.rows, pty.cols));
-                    self.resizes.insert(channel, resize_tx);
-                    session.channel_success(channel)?;
-                    let handle = session.handle();
-                    tokio::spawn(shell_bridge(
-                        chan,
-                        child,
-                        master,
-                        resizes,
-                        handle,
-                        channel,
-                        self.gone.clone(),
-                    ));
-                }
-                Err(e) => {
-                    warn!("ssh: shell for {user:?}: {e}");
-                    session.channel_failure(channel)?;
-                }
-            },
+            Some(pty) => self.start_on_pty(chan, channel, &user, &pty, None, session)?,
             None => match spawn_shell_nopty(&user) {
                 Ok(child) => {
                     session.channel_success(channel)?;
@@ -348,6 +363,12 @@ impl Handler for ServerHandler {
         };
         let user = self.run_as();
         let cmdline = String::from_utf8_lossy(data).into_owned();
+        // A pty requested first (`ssh -t host cmd`) is the command's terminal, as under sshd:
+        // Zed opens its remote terminals as `exec $SHELL -l` this way, and on pipes that shell
+        // would be a non-interactive one reading commands from a stdin nobody writes to.
+        if let Some(pty) = self.ptys.remove(&channel) {
+            return self.start_on_pty(chan, channel, &user, &pty, Some(&cmdline), session);
+        }
         match spawn_exec(&user, &cmdline) {
             Ok(child) => {
                 session.channel_success(channel)?;
@@ -575,13 +596,16 @@ fn login_shell(ru: &ResolvedUser) -> std::ffi::OsString {
         .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"))
 }
 
-/// Spawn the user's login shell on a fresh pty as `user`.
-fn spawn_shell(user: &str, pty: &PtyReq) -> Result<(Child, PtyMaster)> {
+/// Spawn, on a fresh pty as `user`, the user's login shell, or `cmdline` through that shell.
+fn spawn_on_pty(user: &str, pty: &PtyReq, cmdline: Option<&str>) -> Result<(Child, PtyMaster)> {
     let ru = resolve_user(user)?;
     let (master, slave) = pty::openpty(pty.rows, pty.cols)?;
     let shell = login_shell(&ru);
     let mut command = Command::new(&shell);
-    command.arg("-l");
+    match cmdline {
+        Some(cmdline) => command.arg("-c").arg(cmdline),
+        None => command.arg("-l"),
+    };
     login_env(&mut command, user, &ru);
     if let Some(term) = &pty.term {
         command.env("TERM", term);
@@ -856,9 +880,9 @@ fn wait_code(status: std::io::Result<std::process::ExitStatus>) -> u32 {
 mod tests {
     use super::{ConnectionGone, Duration, parse_session_env, read_session_env, run_ssh_server};
 
-    /// Run `cmdline` against a test SSH server and return the exec channel's data
-    /// and stderr extended-data streams.
-    async fn exec_over_ssh(cmdline: &str) -> (Vec<u8>, Vec<u8>) {
+    /// Run `cmdline` against a test SSH server, on a pty when `pty` is set, and return the
+    /// exec channel's data and stderr extended-data streams and its exit status.
+    async fn exec_over_ssh(cmdline: &str, pty: bool) -> (Vec<u8>, Vec<u8>, Option<u32>) {
         use std::sync::Arc;
 
         use russh::client;
@@ -884,7 +908,10 @@ mod tests {
         let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let authorized = vec![key.public_key().to_openssh().unwrap()];
 
-        let path = std::env::temp_dir().join(format!("vk-agent-ssh-exec-{}.sock", unsafe {
+        // One socket per call: the tests run in parallel within one process.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("vk-agent-ssh-exec-{}-{n}.sock", unsafe {
             libc::getpid()
         }));
         let addr = SocketAddr::Unix(path.clone());
@@ -918,22 +945,33 @@ mod tests {
         );
 
         let mut channel = session.channel_open_session().await.unwrap();
-        channel.exec(true, cmdline).await.unwrap();
-        let (mut data, mut stderr) = (Vec::new(), Vec::new());
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::Data { data: d } => data.extend_from_slice(&d),
-                russh::ChannelMsg::ExtendedData { data: d, ext } => {
-                    assert_eq!(ext, super::SSH_EXTENDED_DATA_STDERR);
-                    stderr.extend_from_slice(&d);
-                }
-                russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
-                _ => {}
-            }
+        if pty {
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
         }
+        channel.exec(true, cmdline).await.unwrap();
+        let (mut data, mut stderr, mut status) = (Vec::new(), Vec::new(), None);
+        let drain = async {
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    russh::ChannelMsg::Data { data: d } => data.extend_from_slice(&d),
+                    russh::ChannelMsg::ExtendedData { data: d, ext } => {
+                        assert_eq!(ext, super::SSH_EXTENDED_DATA_STDERR);
+                        stderr.extend_from_slice(&d);
+                    }
+                    russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                    russh::ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+        };
+        let drained = tokio::time::timeout(Duration::from_secs(10), drain).await;
         server.abort();
         let _ = std::fs::remove_file(&path);
-        (data, stderr)
+        assert!(drained.is_ok(), "the channel never closed");
+        (data, stderr, status)
     }
 
     /// The exec channel has to be the binary-transparent pipe a client without a tty is
@@ -943,9 +981,23 @@ mod tests {
     /// pty inserts before newlines. Six bytes come back, or the channel is not a pipe.
     #[tokio::test]
     async fn exec_keeps_stderr_and_newlines_off_the_data_stream() {
-        let (data, stderr) = exec_over_ssh(r"printf 'AB\nCD\n'; printf 'a warning\n' >&2").await;
+        let (data, stderr, status) =
+            exec_over_ssh(r"printf 'AB\nCD\n'; printf 'a warning\n' >&2", false).await;
         assert_eq!(data, b"AB\nCD\n");
         assert_eq!(stderr, b"a warning\n");
+        assert_eq!(status, Some(0));
+    }
+
+    /// `ssh -t host cmd` asks for a pty and then execs: the command runs on that pty, as it
+    /// would under sshd, so it sees a terminal and its output comes back with the exit
+    /// status. Zed opens every remote terminal this way (`exec $SHELL -l` behind a `cd`).
+    #[tokio::test]
+    async fn exec_after_a_pty_request_runs_on_the_pty() {
+        let (data, stderr, status) =
+            exec_over_ssh("test -t 0 && test -t 1 && echo pty-ok; exit 3", true).await;
+        assert_eq!(data, b"pty-ok\r\n");
+        assert!(stderr.is_empty());
+        assert_eq!(status, Some(3));
     }
 
     #[tokio::test]
