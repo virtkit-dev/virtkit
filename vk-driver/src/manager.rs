@@ -412,12 +412,8 @@ impl Manager {
             .zip(&addrs)
             .filter_map(|((name, st), addr)| st.child.as_mut().map(|c| (name.as_str(), addr, c)))
             .collect();
-        for name in crate::shutdown::power_off_then_kill(&mut vmms) {
-            eprintln!(
-                "virtkit: service {name}: did not power off within {} s — killed",
-                crate::shutdown::STOP_GRACE.as_secs()
-            );
-        }
+        // Report each kill and its reason immediately.
+        crate::shutdown::power_off_then_kill(&mut vmms);
         for st in units.values_mut() {
             st.child = None; // killed and reaped above
             for mut a in st.aux.drain(..) {
