@@ -8,6 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - **Commands run with `ssh -t` into a VM get a terminal.** Zed's remote terminal now
   shows its shell prompt instead of sitting blank.
+- **`--user user:group` resolves a group with a long member list.** It used to fail with
+  "Numerical result out of range".
 
 ## [0.78.0] - 2026-09-25
 

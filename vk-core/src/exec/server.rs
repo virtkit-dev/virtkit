@@ -415,6 +415,10 @@ enum PasswdKey<'a> {
     Uid(libc::uid_t),
 }
 
+/// Buffer limit for getpw*_r / getgrnam_r retries on ERANGE. Entry strings,
+/// especially long group member lists, can exceed the initial 4 KiB.
+const MAX_NSS_BUF: usize = 1 << 20;
+
 /// getpwnam_r / getpwuid_r into a [`PasswdInfo`]; `Ok(None)` when there is no such entry.
 fn passwd_lookup(key: PasswdKey) -> std::io::Result<Option<PasswdInfo>> {
     use std::io::Error;
@@ -422,22 +426,26 @@ fn passwd_lookup(key: PasswdKey) -> std::io::Result<Option<PasswdInfo>> {
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0_i8; 4096];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
-    let rc = unsafe {
-        match key {
-            PasswdKey::Name(n) => libc::getpwnam_r(
-                n.as_ptr(),
-                &mut pwd,
-                buf.as_mut_ptr(),
-                buf.len(),
-                &mut result,
-            ),
-            PasswdKey::Uid(u) => {
-                libc::getpwuid_r(u, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+    loop {
+        let rc = unsafe {
+            match key {
+                PasswdKey::Name(n) => libc::getpwnam_r(
+                    n.as_ptr(),
+                    &mut pwd,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    &mut result,
+                ),
+                PasswdKey::Uid(u) => {
+                    libc::getpwuid_r(u, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+                }
             }
+        };
+        match rc {
+            0 => break,
+            libc::ERANGE if buf.len() < MAX_NSS_BUF => buf.resize(buf.len() * 2, 0),
+            _ => return Err(Error::from_raw_os_error(rc)),
         }
-    };
-    if rc != 0 {
-        return Err(Error::from_raw_os_error(rc));
     }
     if result.is_null() {
         return Ok(None);
@@ -491,17 +499,21 @@ fn resolve_gid(group: &str) -> std::io::Result<libc::gid_t> {
     let mut grp: libc::group = unsafe { std::mem::zeroed() };
     let mut buf = vec![0_i8; 4096];
     let mut result: *mut libc::group = std::ptr::null_mut();
-    let rc = unsafe {
-        libc::getgrnam_r(
-            c.as_ptr(),
-            &mut grp,
-            buf.as_mut_ptr(),
-            buf.len(),
-            &mut result,
-        )
-    };
-    if rc != 0 {
-        return Err(Error::from_raw_os_error(rc));
+    loop {
+        let rc = unsafe {
+            libc::getgrnam_r(
+                c.as_ptr(),
+                &mut grp,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut result,
+            )
+        };
+        match rc {
+            0 => break,
+            libc::ERANGE if buf.len() < MAX_NSS_BUF => buf.resize(buf.len() * 2, 0),
+            _ => return Err(Error::from_raw_os_error(rc)),
+        }
     }
     if result.is_null() {
         return Err(Error::new(
