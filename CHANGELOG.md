@@ -14,6 +14,8 @@ All notable changes to virtkit will be documented in this file.
   `GPG_TTY=$(tty)` pinentry, `screen` and `script` can reopen it by name.
 - **An SSH session still starts when the VM cannot provide a terminal.** OpenSSH clients
   run it without one, as against sshd.
+- **Commands run over SSH reach the shell byte for byte.** A file name that is not valid
+  UTF-8 in `ssh <vm> <command>` is no longer rewritten to `�`.
 
 ## [0.78.0] - 2026-09-25
 

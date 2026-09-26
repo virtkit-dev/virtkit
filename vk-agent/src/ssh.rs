@@ -30,8 +30,10 @@
 //! its existing pty (`pty.rs`) and user-drop (`exec::server`) plumbing.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::future::Future;
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -219,7 +221,7 @@ impl ServerHandler {
         chan: Channel<Msg>,
         channel: ChannelId,
         pty: PtyReq,
-        cmdline: Option<&str>,
+        cmdline: Option<&OsStr>,
         session: &mut Session,
     ) -> Result<(), russh::Error> {
         let user = self.run_as();
@@ -395,15 +397,16 @@ impl Handler for ServerHandler {
             session.channel_failure(channel)?;
             return Ok(());
         };
-        let cmdline = String::from_utf8_lossy(data).into_owned();
+        // Preserve bytes as sshd does; lossy UTF-8 decoding corrupts non-UTF-8 names.
+        let cmdline = OsStr::from_bytes(data);
         // `ssh -t host cmd` asks for a pty before the command, as Zed's remote terminal
         // does: run it on one, or an interactive shell it starts gets pipes and never
         // prompts. Without a pty the channel stays a byte-exact pipe.
         if let Some(pty) = self.ptys.remove(&channel) {
-            return self.start_on_pty(chan, channel, pty, Some(&cmdline), session);
+            return self.start_on_pty(chan, channel, pty, Some(cmdline), session);
         }
         let user = self.run_as();
-        match spawn_exec(&user, &cmdline) {
+        match spawn_exec(&user, cmdline) {
             Ok(child) => {
                 session.channel_success(channel)?;
                 let handle = session.handle();
@@ -634,7 +637,7 @@ fn login_shell(ru: &ResolvedUser) -> std::ffi::OsString {
 
 /// Spawn the user's login shell on the requested pty as `user`, or `cmdline` through
 /// that shell when given.
-fn spawn_on_pty(user: &str, pty: PtyReq, cmdline: Option<&str>) -> Result<(Child, PtyMaster)> {
+fn spawn_on_pty(user: &str, pty: PtyReq, cmdline: Option<&OsStr>) -> Result<(Child, PtyMaster)> {
     let ru = resolve_user(user)?;
     let PtyReq {
         term,
@@ -702,7 +705,7 @@ fn spawn_shell_nopty(user: &str) -> Result<Child> {
 }
 
 /// Spawn `cmdline` via the user's shell with piped stdio (no tty), own pgroup.
-fn spawn_exec(user: &str, cmdline: &str) -> Result<Child> {
+fn spawn_exec(user: &str, cmdline: &OsStr) -> Result<Child> {
     let ru = resolve_user(user)?;
     let shell = login_shell(&ru);
     let mut command = Command::new(&shell);
@@ -1021,7 +1024,11 @@ mod tests {
     /// Run `cmdline` against a test SSH server, on an 80x24 pty when `pty` says so, and
     /// collect what the channel sends until it closes. `resize` is sent as a window
     /// change right after the exec.
-    async fn exec_over_ssh(cmdline: &str, pty: bool, resize: Option<(u32, u32)>) -> ExecOutput {
+    async fn exec_over_ssh(
+        cmdline: impl Into<Vec<u8>>,
+        pty: bool,
+        resize: Option<(u32, u32)>,
+    ) -> ExecOutput {
         let test = test_session().await;
         let mut channel = test.session.channel_open_session().await.unwrap();
         if pty {
@@ -1076,6 +1083,17 @@ mod tests {
         assert_eq!(out.data, b"AB\nCD\n");
         assert_eq!(out.stderr, b"a warning\n");
         assert_eq!(out.status, Some(3));
+    }
+
+    /// The command line reaches the shell byte for byte, a non-UTF-8 name included, with
+    /// or without a pty.
+    #[tokio::test]
+    async fn exec_passes_the_command_line_through_as_bytes() {
+        for pty in [false, true] {
+            let out = exec_over_ssh(&b"printf '%s' '\xff\xfe'"[..], pty, None).await;
+            assert_eq!(out.data, b"\xff\xfe", "pty: {pty}");
+            assert_eq!(out.status, Some(0), "pty: {pty}");
+        }
     }
 
     /// `ssh -t host cmd` runs the command on the pty it asked for, as the controlling
