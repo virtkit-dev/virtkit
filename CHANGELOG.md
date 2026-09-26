@@ -12,6 +12,8 @@ All notable changes to virtkit will be documented in this file.
   "Numerical result out of range".
 - **The terminal of an SSH session or `vk exec --tty` belongs to the user it runs as.**
   `GPG_TTY=$(tty)` pinentry, `screen` and `script` can reopen it by name.
+- **An SSH session still starts when the VM cannot provide a terminal.** OpenSSH clients
+  run it without one, as against sshd.
 
 ## [0.78.0] - 2026-09-25
 

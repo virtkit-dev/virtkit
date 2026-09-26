@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -128,11 +129,18 @@ pub fn parse_authorized_keys(lines: &[String]) -> Vec<PublicKey> {
     keys
 }
 
-#[derive(Clone)]
+/// Pty pairs a connection may hold before a shell or command takes them, as sshd's
+/// default `MaxSessions`.
+const MAX_PENDING_PTYS: usize = 10;
+
+/// A granted pty request. The pair is opened at request time, so the agent refuses the
+/// request when the guest is out of ptys and the client can go on without a terminal.
 struct PtyReq {
     term: Option<String>,
     rows: u16,
     cols: u16,
+    master: PtyMaster,
+    slave: OwnedFd,
 }
 
 /// Fires once the client connection is gone; every task bridging one of its channels
@@ -203,20 +211,22 @@ impl ServerHandler {
             .unwrap_or_else(|| "root".to_string())
     }
 
-    /// Bridge the login shell or `cmdline` run through it to the channel on a pty.
-    /// Use the client's requested size; reject the request if spawning fails.
+    /// Bridge the user's login shell or `cmdline` through it to the channel on its pty.
+    /// Initialize the resize watch with the pty's opening size; reject the request
+    /// if spawning fails.
     fn start_on_pty(
         &mut self,
         chan: Channel<Msg>,
         channel: ChannelId,
-        pty: &PtyReq,
+        pty: PtyReq,
         cmdline: Option<&str>,
         session: &mut Session,
     ) -> Result<(), russh::Error> {
         let user = self.run_as();
+        let size = (pty.rows, pty.cols);
         match spawn_on_pty(&user, pty, cmdline) {
             Ok((child, master)) => {
-                let (resize_tx, resizes) = watch::channel((pty.rows, pty.cols));
+                let (resize_tx, resizes) = watch::channel(size);
                 self.resizes.insert(channel, resize_tx);
                 session.channel_success(channel)?;
                 let handle = session.handle();
@@ -285,15 +295,38 @@ impl Handler for ServerHandler {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.ptys.insert(
-            channel,
-            PtyReq {
-                term: (!term.is_empty()).then(|| term.to_string()),
-                rows: row_height.min(u32::from(u16::MAX)) as u16,
-                cols: col_width.min(u32::from(u16::MAX)) as u16,
-            },
-        );
-        session.channel_success(channel)?;
+        // Only a session channel nothing runs on yet can take a terminal, and only one: a
+        // pair granted to any other would stay open, unused, until the connection goes.
+        // Pending pairs are capped as sshd caps sessions, since each holds a guest pty.
+        if !self.channels.contains_key(&channel)
+            || self.ptys.contains_key(&channel)
+            || self.ptys.len() >= MAX_PENDING_PTYS
+        {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+        let rows = row_height.min(u32::from(u16::MAX)) as u16;
+        let cols = col_width.min(u32::from(u16::MAX)) as u16;
+        match pty::openpty(rows, cols) {
+            Ok((master, slave)) => {
+                self.ptys.insert(
+                    channel,
+                    PtyReq {
+                        term: (!term.is_empty()).then(|| term.to_string()),
+                        rows,
+                        cols,
+                        master,
+                        slave,
+                    },
+                );
+                session.channel_success(channel)?;
+            }
+            Err(e) => {
+                let user = self.run_as();
+                warn!("ssh: pty for {user:?}: {e}");
+                session.channel_failure(channel)?;
+            }
+        }
         Ok(())
     }
 
@@ -336,7 +369,7 @@ impl Handler for ServerHandler {
         // script to stdin): a NON-interactive login shell with piped stdio, so no
         // prompt/PS1 noise contaminates the stdout VS Code parses.
         match self.ptys.remove(&channel) {
-            Some(pty) => self.start_on_pty(chan, channel, &pty, None, session)?,
+            Some(pty) => self.start_on_pty(chan, channel, pty, None, session)?,
             None => match spawn_shell_nopty(&user) {
                 Ok(child) => {
                     session.channel_success(channel)?;
@@ -367,7 +400,7 @@ impl Handler for ServerHandler {
         // does: run it on one, or an interactive shell it starts gets pipes and never
         // prompts. Without a pty the channel stays a byte-exact pipe.
         if let Some(pty) = self.ptys.remove(&channel) {
-            return self.start_on_pty(chan, channel, &pty, Some(&cmdline), session);
+            return self.start_on_pty(chan, channel, pty, Some(&cmdline), session);
         }
         let user = self.run_as();
         match spawn_exec(&user, &cmdline) {
@@ -410,6 +443,8 @@ impl Handler for ServerHandler {
             session.channel_failure(channel)?;
             return Ok(());
         };
+        // sftp needs no terminal; release any pending pty.
+        self.ptys.remove(&channel);
         if name != "sftp" {
             session.channel_failure(channel)?;
             return Ok(());
@@ -597,11 +632,16 @@ fn login_shell(ru: &ResolvedUser) -> std::ffi::OsString {
         .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"))
 }
 
-/// Spawn the user's login shell on a fresh pty as `user`, or `cmdline` through that
-/// shell when given.
-fn spawn_on_pty(user: &str, pty: &PtyReq, cmdline: Option<&str>) -> Result<(Child, PtyMaster)> {
+/// Spawn the user's login shell on the requested pty as `user`, or `cmdline` through
+/// that shell when given.
+fn spawn_on_pty(user: &str, pty: PtyReq, cmdline: Option<&str>) -> Result<(Child, PtyMaster)> {
     let ru = resolve_user(user)?;
-    let (master, slave) = pty::openpty(pty.rows, pty.cols)?;
+    let PtyReq {
+        term,
+        master,
+        slave,
+        ..
+    } = pty;
     // A pty left owned by root still works through the fds the shell inherits.
     if let Err(e) = give_tty(&slave, ru.uid, ru.gid) {
         warn!("ssh: pty owner for {user:?}: {e}");
@@ -613,7 +653,7 @@ fn spawn_on_pty(user: &str, pty: &PtyReq, cmdline: Option<&str>) -> Result<(Chil
         None => command.arg("-l"),
     };
     login_env(&mut command, user, &ru);
-    if let Some(term) = &pty.term {
+    if let Some(term) = &term {
         command.env("TERM", term);
     }
     command
@@ -1070,6 +1110,35 @@ mod tests {
         .await;
         assert_eq!(String::from_utf8_lossy(&out.data), "30 100\r\n");
         assert_eq!(out.status, Some(0));
+    }
+
+    /// A pty request on a channel that already runs something is refused: nothing would
+    /// take the pair, which would stay open until the connection goes.
+    #[tokio::test]
+    async fn a_pty_request_after_exec_is_refused() {
+        let test = test_session().await;
+        let mut channel = test.session.channel_open_session().await.unwrap();
+        channel.exec(true, "sleep 5").await.unwrap();
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        let replies = async {
+            let mut replies = Vec::new();
+            while replies.len() < 2 {
+                match channel.wait().await {
+                    Some(russh::ChannelMsg::Success) => replies.push(true),
+                    Some(russh::ChannelMsg::Failure) => replies.push(false),
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+            replies
+        };
+        let replies = tokio::time::timeout(Duration::from_secs(10), replies)
+            .await
+            .expect("both requests get a reply");
+        assert_eq!(replies, [true, false]);
     }
 
     #[tokio::test]
