@@ -202,6 +202,42 @@ impl ServerHandler {
             .clone()
             .unwrap_or_else(|| "root".to_string())
     }
+
+    /// Bridge the login shell or `cmdline` run through it to the channel on a pty.
+    /// Use the client's requested size; reject the request if spawning fails.
+    fn start_on_pty(
+        &mut self,
+        chan: Channel<Msg>,
+        channel: ChannelId,
+        pty: &PtyReq,
+        cmdline: Option<&str>,
+        session: &mut Session,
+    ) -> Result<(), russh::Error> {
+        let user = self.run_as();
+        match spawn_on_pty(&user, pty, cmdline) {
+            Ok((child, master)) => {
+                let (resize_tx, resizes) = watch::channel((pty.rows, pty.cols));
+                self.resizes.insert(channel, resize_tx);
+                session.channel_success(channel)?;
+                let handle = session.handle();
+                tokio::spawn(pty_bridge(
+                    chan,
+                    child,
+                    master,
+                    resizes,
+                    handle,
+                    channel,
+                    self.gone.clone(),
+                ));
+            }
+            Err(e) => {
+                let what = cmdline.map_or("shell", |_| "exec on a pty");
+                warn!("ssh: {what} for {user:?}: {e}");
+                session.channel_failure(channel)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Handler for ServerHandler {
@@ -300,27 +336,7 @@ impl Handler for ServerHandler {
         // script to stdin): a NON-interactive login shell with piped stdio, so no
         // prompt/PS1 noise contaminates the stdout VS Code parses.
         match self.ptys.remove(&channel) {
-            Some(pty) => match spawn_shell(&user, &pty) {
-                Ok((child, master)) => {
-                    let (resize_tx, resizes) = watch::channel((pty.rows, pty.cols));
-                    self.resizes.insert(channel, resize_tx);
-                    session.channel_success(channel)?;
-                    let handle = session.handle();
-                    tokio::spawn(shell_bridge(
-                        chan,
-                        child,
-                        master,
-                        resizes,
-                        handle,
-                        channel,
-                        self.gone.clone(),
-                    ));
-                }
-                Err(e) => {
-                    warn!("ssh: shell for {user:?}: {e}");
-                    session.channel_failure(channel)?;
-                }
-            },
+            Some(pty) => self.start_on_pty(chan, channel, &pty, None, session)?,
             None => match spawn_shell_nopty(&user) {
                 Ok(child) => {
                     session.channel_success(channel)?;
@@ -346,8 +362,14 @@ impl Handler for ServerHandler {
             session.channel_failure(channel)?;
             return Ok(());
         };
-        let user = self.run_as();
         let cmdline = String::from_utf8_lossy(data).into_owned();
+        // `ssh -t host cmd` asks for a pty before the command, as Zed's remote terminal
+        // does: run it on one, or an interactive shell it starts gets pipes and never
+        // prompts. Without a pty the channel stays a byte-exact pipe.
+        if let Some(pty) = self.ptys.remove(&channel) {
+            return self.start_on_pty(chan, channel, &pty, Some(&cmdline), session);
+        }
+        let user = self.run_as();
         match spawn_exec(&user, &cmdline) {
             Ok(child) => {
                 session.channel_success(channel)?;
@@ -575,13 +597,17 @@ fn login_shell(ru: &ResolvedUser) -> std::ffi::OsString {
         .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"))
 }
 
-/// Spawn the user's login shell on a fresh pty as `user`.
-fn spawn_shell(user: &str, pty: &PtyReq) -> Result<(Child, PtyMaster)> {
+/// Spawn the user's login shell on a fresh pty as `user`, or `cmdline` through that
+/// shell when given.
+fn spawn_on_pty(user: &str, pty: &PtyReq, cmdline: Option<&str>) -> Result<(Child, PtyMaster)> {
     let ru = resolve_user(user)?;
     let (master, slave) = pty::openpty(pty.rows, pty.cols)?;
     let shell = login_shell(&ru);
     let mut command = Command::new(&shell);
-    command.arg("-l");
+    match cmdline {
+        Some(cmdline) => command.arg("-c").arg(cmdline),
+        None => command.arg("-l"),
+    };
     login_env(&mut command, user, &ru);
     if let Some(term) = &pty.term {
         command.env("TERM", term);
@@ -677,11 +703,11 @@ async fn hangup_and_reap(child: &mut Child) -> u32 {
     }
 }
 
-/// Bridge a session channel to a pty shell until either side closes or the connection
-/// goes, applying the client's window changes meanwhile; report the exit status and close
-/// the channel. A shell left behind by its client is hung up on the way a terminal would:
-/// its pty master closes first, then its group is signalled, then killed if it stays.
-async fn shell_bridge(
+/// Bridge a session channel to a login shell or command on a pty, applying window changes
+/// until either side closes or the connection ends. Report the exit status and close the
+/// channel. If the client leaves, hang up as a terminal would: close the pty master,
+/// signal the process group, then kill it if it remains.
+async fn pty_bridge(
     chan: Channel<Msg>,
     mut child: Child,
     mut master: PtyMaster,
@@ -856,10 +882,19 @@ fn wait_code(status: std::io::Result<std::process::ExitStatus>) -> u32 {
 mod tests {
     use super::{ConnectionGone, Duration, parse_session_env, read_session_env, run_ssh_server};
 
-    /// Run `cmdline` against a test SSH server and return the exec channel's data
-    /// and stderr extended-data streams.
-    async fn exec_over_ssh(cmdline: &str) -> (Vec<u8>, Vec<u8>) {
+    /// Data, stderr extended data, and exit status returned by an exec channel.
+    struct ExecOutput {
+        data: Vec<u8>,
+        stderr: Vec<u8>,
+        status: Option<u32>,
+    }
+
+    /// Run `cmdline` against a test SSH server, on an 80x24 pty when `pty` says so, and
+    /// collect what the channel sends until it closes. `resize` is sent as a window
+    /// change right after the exec.
+    async fn exec_over_ssh(cmdline: &str, pty: bool, resize: Option<(u32, u32)>) -> ExecOutput {
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
 
         use russh::client;
         use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
@@ -884,9 +919,13 @@ mod tests {
         let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let authorized = vec![key.public_key().to_openssh().unwrap()];
 
-        let path = std::env::temp_dir().join(format!("vk-agent-ssh-exec-{}.sock", unsafe {
-            libc::getpid()
-        }));
+        // Tests run in parallel in one process: the pid alone would share the socket.
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "vk-agent-ssh-exec-{}-{}.sock",
+            unsafe { libc::getpid() },
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let addr = SocketAddr::Unix(path.clone());
         let keys = super::parse_authorized_keys(&authorized);
         let server = tokio::spawn(async move { run_ssh_server(&addr, &keys, None).await });
@@ -918,22 +957,42 @@ mod tests {
         );
 
         let mut channel = session.channel_open_session().await.unwrap();
-        channel.exec(true, cmdline).await.unwrap();
-        let (mut data, mut stderr) = (Vec::new(), Vec::new());
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::Data { data: d } => data.extend_from_slice(&d),
-                russh::ChannelMsg::ExtendedData { data: d, ext } => {
-                    assert_eq!(ext, super::SSH_EXTENDED_DATA_STDERR);
-                    stderr.extend_from_slice(&d);
-                }
-                russh::ChannelMsg::Eof | russh::ChannelMsg::Close => break,
-                _ => {}
-            }
+        if pty {
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
         }
+        channel.exec(true, cmdline).await.unwrap();
+        if let Some((cols, rows)) = resize {
+            channel.window_change(cols, rows, 0, 0).await.unwrap();
+        }
+        let mut out = ExecOutput {
+            data: Vec::new(),
+            stderr: Vec::new(),
+            status: None,
+        };
+        // Read to Close, not Eof: on a pty the data stream ends before the exit status.
+        let collect = async {
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    russh::ChannelMsg::Data { data } => out.data.extend_from_slice(&data),
+                    russh::ChannelMsg::ExtendedData { data, ext } => {
+                        assert_eq!(ext, super::SSH_EXTENDED_DATA_STDERR);
+                        out.stderr.extend_from_slice(&data);
+                    }
+                    russh::ChannelMsg::ExitStatus { exit_status } => out.status = Some(exit_status),
+                    russh::ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), collect)
+            .await
+            .expect("the exec channel closes");
         server.abort();
         let _ = std::fs::remove_file(&path);
-        (data, stderr)
+        out
     }
 
     /// The exec channel has to be the binary-transparent pipe a client without a tty is
@@ -943,9 +1002,49 @@ mod tests {
     /// pty inserts before newlines. Six bytes come back, or the channel is not a pipe.
     #[tokio::test]
     async fn exec_keeps_stderr_and_newlines_off_the_data_stream() {
-        let (data, stderr) = exec_over_ssh(r"printf 'AB\nCD\n'; printf 'a warning\n' >&2").await;
-        assert_eq!(data, b"AB\nCD\n");
-        assert_eq!(stderr, b"a warning\n");
+        let out = exec_over_ssh(
+            r"printf 'AB\nCD\n'; printf 'a warning\n' >&2; exit 3",
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(out.data, b"AB\nCD\n");
+        assert_eq!(out.stderr, b"a warning\n");
+        assert_eq!(out.status, Some(3));
+    }
+
+    /// `ssh -t host cmd` runs the command on the pty it asked for, as the controlling
+    /// terminal of its own session, so an interactive shell it starts can prompt and take
+    /// job control. Both streams arrive merged on the data stream, as from sshd.
+    #[tokio::test]
+    async fn exec_after_a_pty_request_runs_on_the_pty() {
+        let out = exec_over_ssh(
+            r"test -t 0 && test -t 1 && echo $TERM && stty size && echo err >&2 && : </dev/tty && tty && exit 3",
+            true,
+            None,
+        )
+        .await;
+        let data = String::from_utf8(out.data).unwrap();
+        let lines: Vec<&str> = data.split("\r\n").collect();
+        assert!(lines.len() >= 4, "{data:?}");
+        assert_eq!(lines[..3], ["xterm", "24 80", "err"], "{data:?}");
+        assert!(lines[3].starts_with("/dev/pts/"), "{data:?}");
+        assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+        assert_eq!(out.status, Some(3));
+    }
+
+    /// A window change reaches a command run on a pty, as it does a shell. The loop runs
+    /// under `sh` whatever the test user's shell, and gives up after five seconds.
+    #[tokio::test]
+    async fn exec_on_a_pty_follows_window_changes() {
+        let out = exec_over_ssh(
+            r#"sh -c 'i=0; while [ "$(stty size)" = "24 80" ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done; stty size'"#,
+            true,
+            Some((100, 30)),
+        )
+        .await;
+        assert_eq!(String::from_utf8_lossy(&out.data), "30 100\r\n");
+        assert_eq!(out.status, Some(0));
     }
 
     #[tokio::test]

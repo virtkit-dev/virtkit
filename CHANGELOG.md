@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Commands run with `ssh -t` into a VM get a terminal.** Zed's remote terminal now
+  shows its shell prompt instead of sitting blank.
+
 ## [0.78.0] - 2026-09-25
 
 ### Added
