@@ -45,6 +45,138 @@ impl PtyMaster {
     }
 }
 
+/// Where an RFC 4254 terminal mode (§8) lives in a Linux termios.
+#[derive(Clone, Copy)]
+enum Mode {
+    Cc(usize),
+    Iflag(libc::tcflag_t),
+    Lflag(libc::tcflag_t),
+    Oflag(libc::tcflag_t),
+}
+
+/// The RFC 4254 terminal modes Linux has a place for, by opcode. Line speeds, which a pty
+/// does not use, and the character size and parity, which Linux fixes at CS8 without
+/// parity on a pty, are left out, as are control characters Linux lacks.
+const MODES: &[(u8, Mode)] = &[
+    (1, Mode::Cc(libc::VINTR)),
+    (2, Mode::Cc(libc::VQUIT)),
+    (3, Mode::Cc(libc::VERASE)),
+    (4, Mode::Cc(libc::VKILL)),
+    (5, Mode::Cc(libc::VEOF)),
+    (6, Mode::Cc(libc::VEOL)),
+    (7, Mode::Cc(libc::VEOL2)),
+    (8, Mode::Cc(libc::VSTART)),
+    (9, Mode::Cc(libc::VSTOP)),
+    (10, Mode::Cc(libc::VSUSP)),
+    (12, Mode::Cc(libc::VREPRINT)),
+    (13, Mode::Cc(libc::VWERASE)),
+    (14, Mode::Cc(libc::VLNEXT)),
+    (18, Mode::Cc(libc::VDISCARD)),
+    (30, Mode::Iflag(libc::IGNPAR)),
+    (31, Mode::Iflag(libc::PARMRK)),
+    (32, Mode::Iflag(libc::INPCK)),
+    (33, Mode::Iflag(libc::ISTRIP)),
+    (34, Mode::Iflag(libc::INLCR)),
+    (35, Mode::Iflag(libc::IGNCR)),
+    (36, Mode::Iflag(libc::ICRNL)),
+    (37, Mode::Iflag(libc::IUCLC)),
+    (38, Mode::Iflag(libc::IXON)),
+    (39, Mode::Iflag(libc::IXANY)),
+    (40, Mode::Iflag(libc::IXOFF)),
+    (41, Mode::Iflag(libc::IMAXBEL)),
+    (42, Mode::Iflag(libc::IUTF8)),
+    (50, Mode::Lflag(libc::ISIG)),
+    (51, Mode::Lflag(libc::ICANON)),
+    (52, Mode::Lflag(libc::XCASE)),
+    (53, Mode::Lflag(libc::ECHO)),
+    (54, Mode::Lflag(libc::ECHOE)),
+    (55, Mode::Lflag(libc::ECHOK)),
+    (56, Mode::Lflag(libc::ECHONL)),
+    (57, Mode::Lflag(libc::NOFLSH)),
+    (58, Mode::Lflag(libc::TOSTOP)),
+    (59, Mode::Lflag(libc::IEXTEN)),
+    (60, Mode::Lflag(libc::ECHOCTL)),
+    (61, Mode::Lflag(libc::ECHOKE)),
+    (62, Mode::Lflag(libc::PENDIN)),
+    (70, Mode::Oflag(libc::OPOST)),
+    (71, Mode::Oflag(libc::OLCUC)),
+    (72, Mode::Oflag(libc::ONLCR)),
+    (73, Mode::Oflag(libc::OCRNL)),
+    (74, Mode::Oflag(libc::ONOCR)),
+    (75, Mode::Oflag(libc::ONLRET)),
+];
+
+/// The control-character value RFC 4254 uses for "disabled".
+const MODE_DISABLED: u32 = 255;
+
+/// A terminal's current termios (tcgetattr).
+fn get_termios(fd: RawFd) -> io::Result<libc::termios> {
+    // SAFETY: termios is plain data, valid zeroed; tcgetattr fills it through a valid
+    // pointer.
+    let mut tio: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut tio) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(tio)
+}
+
+/// Encode terminal modes as RFC 4254 opcode/value pairs, as in an SSH pty request.
+/// These preserve keys, line discipline, echo and output processing on the server.
+pub fn terminal_modes(fd: RawFd) -> io::Result<Vec<(u8, u32)>> {
+    let tio = get_termios(fd)?;
+    let flag = |field: libc::tcflag_t, bit| u32::from(field & bit != 0);
+    Ok(MODES
+        .iter()
+        .map(|&(op, mode)| {
+            let value = match mode {
+                Mode::Cc(i) if tio.c_cc[i] == libc::_POSIX_VDISABLE => MODE_DISABLED,
+                Mode::Cc(i) => u32::from(tio.c_cc[i]),
+                Mode::Iflag(bit) => flag(tio.c_iflag, bit),
+                Mode::Lflag(bit) => flag(tio.c_lflag, bit),
+                Mode::Oflag(bit) => flag(tio.c_oflag, bit),
+            };
+            (op, value)
+        })
+        .collect())
+}
+
+/// Apply RFC 4254 terminal modes as sshd does for a pty request. Skip unsupported
+/// Linux opcodes and control characters outside 0..=255 instead of truncating them.
+pub fn apply_terminal_modes(fd: RawFd, modes: &[(u8, u32)]) -> io::Result<()> {
+    if modes.is_empty() {
+        return Ok(());
+    }
+    let mut tio = get_termios(fd)?;
+    for &(op, value) in modes {
+        let Some(&(_, mode)) = MODES.iter().find(|(o, _)| *o == op) else {
+            continue;
+        };
+        let (field, bit) = match mode {
+            Mode::Cc(i) => {
+                if value == MODE_DISABLED {
+                    tio.c_cc[i] = libc::_POSIX_VDISABLE;
+                } else if let Ok(c) = libc::cc_t::try_from(value) {
+                    tio.c_cc[i] = c;
+                }
+                continue;
+            }
+            Mode::Iflag(bit) => (&mut tio.c_iflag, bit),
+            Mode::Lflag(bit) => (&mut tio.c_lflag, bit),
+            Mode::Oflag(bit) => (&mut tio.c_oflag, bit),
+        };
+        if value != 0 {
+            *field |= bit;
+        } else {
+            *field &= !bit;
+        }
+    }
+    // SAFETY: tcsetattr only reads the termios.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &tio) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Apply a window size to a tty (TIOCSWINSZ) — the kernel signals SIGWINCH to the
 /// foreground process group of the pty.
 pub fn set_winsize(fd: RawFd, rows: u16, cols: u16) -> io::Result<()> {
@@ -243,6 +375,36 @@ mod tests {
             !leaked,
             "the master (fd {master_fd}) reached the child: {out}"
         );
+    }
+
+    /// RFC 4254 modes preserve every covered termios field on another pty.
+    /// Tokio is required because the pty master registers with the reactor.
+    #[tokio::test]
+    async fn terminal_modes_carry_over_to_another_pty() {
+        use super::{apply_terminal_modes, get_termios, terminal_modes};
+        let (_m1, from) = openpty(24, 80).unwrap();
+        let (_m2, to) = openpty(24, 80).unwrap();
+        let mut tio = get_termios(from.as_raw_fd()).unwrap();
+        tio.c_cc[libc::VINTR] = 2;
+        tio.c_cc[libc::VERASE] = libc::_POSIX_VDISABLE;
+        tio.c_iflag = (tio.c_iflag | libc::IUTF8) & !libc::ICRNL;
+        tio.c_lflag &= !libc::ECHO;
+        tio.c_oflag &= !libc::OPOST;
+        assert_eq!(
+            unsafe { libc::tcsetattr(from.as_raw_fd(), libc::TCSANOW, &tio) },
+            0
+        );
+
+        let modes = terminal_modes(from.as_raw_fd()).unwrap();
+        assert!(modes.contains(&(3, 255)), "erase is disabled: {modes:?}");
+        apply_terminal_modes(to.as_raw_fd(), &modes).unwrap();
+        let (a, b) = (tio, get_termios(to.as_raw_fd()).unwrap());
+        assert_eq!(
+            (a.c_iflag, a.c_lflag, a.c_oflag),
+            (b.c_iflag, b.c_lflag, b.c_oflag)
+        );
+        assert_eq!(a.c_cc[libc::VINTR], b.c_cc[libc::VINTR]);
+        assert_eq!(b.c_cc[libc::VERASE], libc::_POSIX_VDISABLE);
     }
 
     #[tokio::test]

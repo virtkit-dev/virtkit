@@ -328,7 +328,8 @@ impl Handler for ServerHandler {
         match pty::openpty(rows, cols) {
             Ok((master, slave)) => {
                 // The terminal still works with the kernel's defaults, as under sshd.
-                if let Err(e) = apply_terminal_modes(&slave, modes) {
+                let modes: Vec<(u8, u32)> = modes.iter().map(|&(m, v)| (m as u8, v)).collect();
+                if let Err(e) = pty::apply_terminal_modes(slave.as_raw_fd(), &modes) {
                     warn!("ssh: terminal modes left at their defaults: {e}");
                 }
                 self.ptys.insert(
@@ -714,100 +715,6 @@ fn login_shell(ru: &ResolvedUser) -> std::ffi::OsString {
     ru.shell
         .clone()
         .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"))
-}
-
-/// Set the terminal modes the client sent with its pty request on the slave, the way sshd
-/// does: its keys (^C, ^Z, erase…), its line discipline, echo and output processing. A
-/// client that turned off, say, ICRNL or IUTF8 locally would otherwise type into a
-/// terminal that disagrees with it. Modes Linux has no flag for, the line speeds, which a
-/// pty does not use, and the character size and parity, which Linux fixes at CS8 without
-/// parity on a pty, are skipped.
-fn apply_terminal_modes(slave: &OwnedFd, modes: &[(russh::Pty, u32)]) -> std::io::Result<()> {
-    use russh::Pty;
-    if modes.is_empty() {
-        return Ok(());
-    }
-    let fd = slave.as_raw_fd();
-    // SAFETY: termios is plain data, valid zeroed; tcgetattr fills it through a valid
-    // pointer, on the slave fd this function borrows.
-    let mut tio: libc::termios = unsafe { std::mem::zeroed() };
-    if unsafe { libc::tcgetattr(fd, &mut tio) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    for &(mode, value) in modes {
-        let cc = match mode {
-            Pty::VINTR => Some(libc::VINTR),
-            Pty::VQUIT => Some(libc::VQUIT),
-            Pty::VERASE => Some(libc::VERASE),
-            Pty::VKILL => Some(libc::VKILL),
-            Pty::VEOF => Some(libc::VEOF),
-            Pty::VEOL => Some(libc::VEOL),
-            Pty::VEOL2 => Some(libc::VEOL2),
-            Pty::VSTART => Some(libc::VSTART),
-            Pty::VSTOP => Some(libc::VSTOP),
-            Pty::VSUSP => Some(libc::VSUSP),
-            Pty::VREPRINT => Some(libc::VREPRINT),
-            Pty::VWERASE => Some(libc::VWERASE),
-            Pty::VLNEXT => Some(libc::VLNEXT),
-            Pty::VDISCARD => Some(libc::VDISCARD),
-            _ => None,
-        };
-        if let Some(i) = cc {
-            // 255 means "disabled" in the protocol. Skip out-of-range characters
-            // rather than truncating them.
-            match libc::cc_t::try_from(value) {
-                Ok(255) => tio.c_cc[i] = libc::_POSIX_VDISABLE,
-                Ok(c) => tio.c_cc[i] = c,
-                Err(_) => {}
-            }
-            continue;
-        }
-        let (field, bit) = match mode {
-            Pty::IGNPAR => (&mut tio.c_iflag, libc::IGNPAR),
-            Pty::PARMRK => (&mut tio.c_iflag, libc::PARMRK),
-            Pty::INPCK => (&mut tio.c_iflag, libc::INPCK),
-            Pty::ISTRIP => (&mut tio.c_iflag, libc::ISTRIP),
-            Pty::INLCR => (&mut tio.c_iflag, libc::INLCR),
-            Pty::IGNCR => (&mut tio.c_iflag, libc::IGNCR),
-            Pty::ICRNL => (&mut tio.c_iflag, libc::ICRNL),
-            Pty::IUCLC => (&mut tio.c_iflag, libc::IUCLC),
-            Pty::IXON => (&mut tio.c_iflag, libc::IXON),
-            Pty::IXANY => (&mut tio.c_iflag, libc::IXANY),
-            Pty::IXOFF => (&mut tio.c_iflag, libc::IXOFF),
-            Pty::IMAXBEL => (&mut tio.c_iflag, libc::IMAXBEL),
-            Pty::IUTF8 => (&mut tio.c_iflag, libc::IUTF8),
-            Pty::ISIG => (&mut tio.c_lflag, libc::ISIG),
-            Pty::ICANON => (&mut tio.c_lflag, libc::ICANON),
-            Pty::XCASE => (&mut tio.c_lflag, libc::XCASE),
-            Pty::ECHO => (&mut tio.c_lflag, libc::ECHO),
-            Pty::ECHOE => (&mut tio.c_lflag, libc::ECHOE),
-            Pty::ECHOK => (&mut tio.c_lflag, libc::ECHOK),
-            Pty::ECHONL => (&mut tio.c_lflag, libc::ECHONL),
-            Pty::NOFLSH => (&mut tio.c_lflag, libc::NOFLSH),
-            Pty::TOSTOP => (&mut tio.c_lflag, libc::TOSTOP),
-            Pty::IEXTEN => (&mut tio.c_lflag, libc::IEXTEN),
-            Pty::ECHOCTL => (&mut tio.c_lflag, libc::ECHOCTL),
-            Pty::ECHOKE => (&mut tio.c_lflag, libc::ECHOKE),
-            Pty::PENDIN => (&mut tio.c_lflag, libc::PENDIN),
-            Pty::OPOST => (&mut tio.c_oflag, libc::OPOST),
-            Pty::OLCUC => (&mut tio.c_oflag, libc::OLCUC),
-            Pty::ONLCR => (&mut tio.c_oflag, libc::ONLCR),
-            Pty::OCRNL => (&mut tio.c_oflag, libc::OCRNL),
-            Pty::ONOCR => (&mut tio.c_oflag, libc::ONOCR),
-            Pty::ONLRET => (&mut tio.c_oflag, libc::ONLRET),
-            _ => continue,
-        };
-        if value != 0 {
-            *field |= bit;
-        } else {
-            *field &= !bit;
-        }
-    }
-    // SAFETY: tcsetattr only reads the termios, on the slave fd this function borrows.
-    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &tio) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Spawn the user's login shell on the requested pty as `user`, or `cmdline` through
