@@ -893,32 +893,44 @@ mod tests {
         status: Option<u32>,
     }
 
-    /// Run `cmdline` against a test SSH server, on an 80x24 pty when `pty` says so, and
-    /// collect what the channel sends until it closes. `resize` is sent as a window
-    /// change right after the exec.
-    async fn exec_over_ssh(cmdline: &str, pty: bool, resize: Option<(u32, u32)>) -> ExecOutput {
+    /// The server key is fresh per boot and pinned by nobody; the tests are about the
+    /// channels, not about trust.
+    struct AcceptAnyHostKey;
+
+    impl russh::client::Handler for AcceptAnyHostKey {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _key: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    /// A test SSH server with its own socket and an authenticated client session.
+    /// Dropping it stops the server.
+    struct TestSession {
+        server: tokio::task::JoinHandle<anyhow::Result<()>>,
+        path: std::path::PathBuf,
+        session: russh::client::Handle<AcceptAnyHostKey>,
+    }
+
+    impl Drop for TestSession {
+        fn drop(&mut self) {
+            self.server.abort();
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    async fn test_session() -> TestSession {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
 
         use russh::client;
-        use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
+        use russh::keys::{Algorithm, PrivateKey, PrivateKeyWithHashAlg};
 
         use vk_core::addr::SocketAddr;
-
-        /// The server key is fresh per boot and pinned by nobody; the test is about the
-        /// channel, not about trust.
-        struct AcceptAnyHostKey;
-
-        impl client::Handler for AcceptAnyHostKey {
-            type Error = russh::Error;
-
-            async fn check_server_key(
-                &mut self,
-                _key: &PublicKeyOrCertificate,
-            ) -> Result<bool, Self::Error> {
-                Ok(true)
-            }
-        }
 
         let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
         let authorized = vec![key.public_key().to_openssh().unwrap()];
@@ -959,8 +971,19 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        TestSession {
+            server,
+            path,
+            session,
+        }
+    }
 
-        let mut channel = session.channel_open_session().await.unwrap();
+    /// Run `cmdline` against a test SSH server, on an 80x24 pty when `pty` says so, and
+    /// collect what the channel sends until it closes. `resize` is sent as a window
+    /// change right after the exec.
+    async fn exec_over_ssh(cmdline: &str, pty: bool, resize: Option<(u32, u32)>) -> ExecOutput {
+        let test = test_session().await;
+        let mut channel = test.session.channel_open_session().await.unwrap();
         if pty {
             channel
                 .request_pty(true, "xterm", 80, 24, 0, 0, &[])
@@ -994,8 +1017,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(30), collect)
             .await
             .expect("the exec channel closes");
-        server.abort();
-        let _ = std::fs::remove_file(&path);
         out
     }
 
