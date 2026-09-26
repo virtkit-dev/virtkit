@@ -435,6 +435,16 @@ enum PasswdKey<'a> {
 /// especially long group member lists, can exceed the initial 4 KiB.
 const MAX_NSS_BUF: usize = 1 << 20;
 
+/// Whether a getpw*_r / getgr*_r error code means "no such entry". POSIX specifies 0 with
+/// a null result for a missing entry, but glibc reports a database it cannot open (no
+/// /etc/passwd or /etc/group in a scratch image, an NSS backend that is unavailable), and
+/// musl a missing /etc/passwd or /etc/group, as ENOENT; getpwnam_r(3) lists ESRCH among
+/// the codes seen for "not found". EBADF and
+/// EPERM, listed there too, are real faults on Linux and stay errors.
+fn nss_not_found(rc: libc::c_int) -> bool {
+    matches!(rc, libc::ENOENT | libc::ESRCH)
+}
+
 /// getpwnam_r / getpwuid_r into a [`PasswdInfo`]; `Ok(None)` when there is no such entry.
 fn passwd_lookup(key: PasswdKey) -> std::io::Result<Option<PasswdInfo>> {
     use std::io::Error;
@@ -459,6 +469,7 @@ fn passwd_lookup(key: PasswdKey) -> std::io::Result<Option<PasswdInfo>> {
         };
         match rc {
             0 => break,
+            rc if nss_not_found(rc) => return Ok(None),
             libc::ERANGE if buf.len() < MAX_NSS_BUF => buf.resize(buf.len() * 2, 0),
             _ => return Err(Error::from_raw_os_error(rc)),
         }
@@ -486,7 +497,7 @@ fn passwd_lookup(key: PasswdKey) -> std::io::Result<Option<PasswdInfo>> {
 
 /// Resolve the user part of a `USER` value: a numeric uid (its passwd entry if any, else
 /// a bare uid with gid 0 — like `docker run --user <uid>` for an uid absent from
-/// /etc/passwd) or a name (getpwnam).
+/// /etc/passwd, or with no passwd database to ask) or a name (getpwnam).
 fn resolve_passwd(user: &str) -> std::io::Result<PasswdInfo> {
     use std::io::{Error, ErrorKind};
     if let Ok(uid) = user.parse::<libc::uid_t>() {
@@ -515,6 +526,7 @@ fn resolve_gid(group: &str) -> std::io::Result<libc::gid_t> {
     let mut grp: libc::group = unsafe { std::mem::zeroed() };
     let mut buf = vec![0_i8; 4096];
     let mut result: *mut libc::group = std::ptr::null_mut();
+    let unknown = || Error::new(ErrorKind::NotFound, format!("unknown group {group:?}"));
     loop {
         let rc = unsafe {
             libc::getgrnam_r(
@@ -527,15 +539,13 @@ fn resolve_gid(group: &str) -> std::io::Result<libc::gid_t> {
         };
         match rc {
             0 => break,
+            rc if nss_not_found(rc) => return Err(unknown()),
             libc::ERANGE if buf.len() < MAX_NSS_BUF => buf.resize(buf.len() * 2, 0),
             _ => return Err(Error::from_raw_os_error(rc)),
         }
     }
     if result.is_null() {
-        return Err(Error::new(
-            ErrorKind::NotFound,
-            format!("unknown group {group:?}"),
-        ));
+        return Err(unknown());
     }
     Ok(grp.gr_gid)
 }
@@ -1276,6 +1286,53 @@ mod tests {
             Err(e) => panic!("tty group: {e}"),
         };
         assert_eq!((st.st_gid, st.st_mode & 0o7777), want);
+    }
+
+    /// With no user or group database at all, as in a scratch image, a numeric uid still
+    /// resolves and an unknown group is reported as such. The test runs itself again over
+    /// an empty /etc in user and mount namespaces, and is skipped where it cannot.
+    #[test]
+    fn lookups_without_a_user_database() {
+        const INNER: &str = "VK_TEST_EMPTY_ETC";
+        if std::env::var_os(INNER).is_some() {
+            let ru = resolve_user("12345").unwrap();
+            assert_eq!((ru.uid, ru.gid, ru.groups), (12345, 0, vec![0]));
+            let e = resolve_user("0:nosuchgrp").err().unwrap();
+            assert!(e.to_string().contains("unknown group"), "{e}");
+            return;
+        }
+        let unshare = |script: &str| {
+            let mut command = std::process::Command::new("unshare");
+            command.args(["--user", "--map-root-user", "--mount", "sh", "-c", script]);
+            command
+        };
+        let usable = unshare("mount -t tmpfs none /etc")
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !usable {
+            eprintln!("skipped: needs unshare and unprivileged user namespaces");
+            return;
+        }
+        // The filter follows the module, so a rename cannot leave the inner run empty.
+        let name = format!(
+            "{}::lookups_without_a_user_database",
+            module_path!().split_once("::").unwrap().1
+        );
+        let out = unshare(r#"mount -t tmpfs none /etc && exec "$@""#)
+            .arg("sh")
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", &name])
+            .env(INNER, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]
