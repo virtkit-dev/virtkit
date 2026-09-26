@@ -7,8 +7,9 @@
 //! It authenticates OpenSSH public keys passed to `ssh-serve` on the kernel
 //! command line; it does not read an authorized-keys file. It supports `pty` +
 //! `shell` with window resizing, `shell` without a pty (VS Code pipes its
-//! bootstrap script to `ssh -T`), `exec`, `sftp` (scp and VS Code's server
-//! copy), and `direct-tcpip` (VS Code's server connection and `ssh -L`/`-D`).
+//! bootstrap script to `ssh -T`), `exec`, `signal`, `sftp` (scp and VS Code's
+//! server copy), and `direct-tcpip` (VS Code's server connection and
+//! `ssh -L`/`-D`).
 //! Together these cover VS Code Remote-SSH.
 //!
 //! Russh's default handlers return `false` for remote forwarding (`ssh -R`) and
@@ -19,12 +20,12 @@
 //! `SSH_AUTH_SOCK`, so SSH sessions must name
 //! `/run/virtkit-ssh-agent.sock` explicitly.
 //!
-//! Russh's default handlers return `Ok(())` without replying to `env`, `signal`,
-//! or `x11-req`. OpenSSH does not request replies for `env` (distro
-//! `ssh_config` uses `SendEnv LANG LC_*`) or `signal`, but waits for an
-//! `x11-req` reply. The session still starts without X11, and its locale falls
-//! back to the guest default. Supporting `LANG` and `LC_*` requires a whitelist
-//! because client values enter the login shell's environment.
+//! Russh's default handlers return `Ok(())` without replying to `env` or
+//! `x11-req`. OpenSSH does not request replies for `env` (distro `ssh_config`
+//! uses `SendEnv LANG LC_*`), but waits for an `x11-req` reply. The session
+//! still starts without X11, and its locale falls back to the guest default.
+//! Supporting `LANG` and `LC_*` requires a whitelist because client values
+//! enter the login shell's environment.
 //!
 //! Russh handles crypto and transport; virtkit-agent only connects channels to
 //! its existing pty (`pty.rs`) and user-drop (`exec::server`) plumbing.
@@ -43,11 +44,11 @@ use anyhow::{Context, Result, anyhow};
 use log::{debug, info, warn};
 use russh::keys::PublicKey;
 use russh::server::{Auth, ChannelOpenHandle, Config, Handle, Handler, Msg, Session};
-use russh::{Channel, ChannelId, ChannelOpenFailure};
+use russh::{Channel, ChannelId, ChannelOpenFailure, Sig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use vk_core::addr::SocketAddr;
 use vk_core::exec::server::{ResolvedUser, give_tty, resolve_user};
@@ -186,6 +187,8 @@ struct ServerHandler {
     /// here could resize another terminal after the master closes and its fd is reused.
     /// Only the latest size matters, so bursts of changes coalesce.
     resizes: HashMap<ChannelId, watch::Sender<(u16, u16)>>,
+    /// Route signals through the owning bridge, which tracks the process's lifetime.
+    signals: HashMap<ChannelId, mpsc::Sender<libc::c_int>>,
     /// Handed to every bridge this connection spawns.
     gone: ConnectionGone,
 }
@@ -203,6 +206,7 @@ impl ServerHandler {
             channels: HashMap::new(),
             ptys: HashMap::new(),
             resizes: HashMap::new(),
+            signals: HashMap::new(),
             gone,
         }
     }
@@ -211,6 +215,16 @@ impl ServerHandler {
         self.authed_user
             .clone()
             .unwrap_or_else(|| "root".to_string())
+    }
+
+    /// Route `channel`'s signal requests to its new bridge.
+    fn signals_for(&mut self, channel: ChannelId) -> mpsc::Receiver<libc::c_int> {
+        // Bound pending signals; drop excess requests if the bridge stalls.
+        let (tx, rx) = mpsc::channel(8);
+        // Remove closed senders so long-lived connections do not accumulate them.
+        self.signals.retain(|_, tx| !tx.is_closed());
+        self.signals.insert(channel, tx);
+        rx
     }
 
     /// Bridge the user's login shell or `cmdline` through it to the channel on its pty.
@@ -227,9 +241,10 @@ impl ServerHandler {
         let user = self.run_as();
         let size = (pty.rows, pty.cols);
         match spawn_on_pty(&user, pty, cmdline) {
-            Ok((child, master)) => {
+            Ok((child, master, uid)) => {
                 let (resize_tx, resizes) = watch::channel(size);
                 self.resizes.insert(channel, resize_tx);
+                let signals = self.signals_for(channel);
                 session.channel_success(channel)?;
                 let handle = session.handle();
                 tokio::spawn(pty_bridge(
@@ -237,6 +252,7 @@ impl ServerHandler {
                     child,
                     master,
                     resizes,
+                    Signals { rx: signals, uid },
                     handle,
                     channel,
                     self.gone.clone(),
@@ -360,6 +376,43 @@ impl Handler for ServerHandler {
         Ok(())
     }
 
+    /// Deliver a client's signal to the process group of the shell or command the channel
+    /// runs, as sshd does, pty or not: a job the shell moved to a group of its own is the
+    /// shell's to pass it on to. It is sent with the session user's credentials, as sshd
+    /// does, so a job that has since become another user, such as `sudo`, is out of its
+    /// reach. Names other than RFC 4254's and OpenSSH's USR2 are refused, and so is a
+    /// signal to a channel that runs nothing. A reply says the signal was queued for the
+    /// bridge, not delivered: waiting here for the bridge could deadlock against a bridge
+    /// waiting on the channel window, so a failed kill is only logged.
+    async fn signal(
+        &mut self,
+        channel: ChannelId,
+        signal: Sig,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let Some(signo) = signal_number(&signal) else {
+            debug!("ssh: ignoring signal {signal:?}");
+            session.channel_failure(channel)?;
+            return Ok(());
+        };
+        let Some(bridge) = self.signals.get(&channel) else {
+            session.channel_failure(channel)?;
+            return Ok(());
+        };
+        match bridge.try_send(signo) {
+            Ok(()) => session.channel_success(channel)?,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                debug!("ssh: dropping signal {signal:?}: the bridge has a backlog");
+                session.channel_failure(channel)?;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.signals.remove(&channel);
+                session.channel_failure(channel)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn shell_request(
         &mut self,
         channel: ChannelId,
@@ -377,10 +430,18 @@ impl Handler for ServerHandler {
         match self.ptys.remove(&channel) {
             Some(pty) => self.start_on_pty(chan, channel, pty, None, session)?,
             None => match spawn_shell_nopty(&user) {
-                Ok(child) => {
+                Ok((child, uid)) => {
+                    let signals = self.signals_for(channel);
                     session.channel_success(channel)?;
                     let handle = session.handle();
-                    tokio::spawn(exec_bridge(chan, child, handle, channel, self.gone.clone()));
+                    tokio::spawn(exec_bridge(
+                        chan,
+                        child,
+                        Signals { rx: signals, uid },
+                        handle,
+                        channel,
+                        self.gone.clone(),
+                    ));
                 }
                 Err(e) => {
                     warn!("ssh: shell (no pty) for {user:?}: {e}");
@@ -411,10 +472,18 @@ impl Handler for ServerHandler {
         }
         let user = self.run_as();
         match spawn_exec(&user, cmdline) {
-            Ok(child) => {
+            Ok((child, uid)) => {
+                let signals = self.signals_for(channel);
                 session.channel_success(channel)?;
                 let handle = session.handle();
-                tokio::spawn(exec_bridge(chan, child, handle, channel, self.gone.clone()));
+                tokio::spawn(exec_bridge(
+                    chan,
+                    child,
+                    Signals { rx: signals, uid },
+                    handle,
+                    channel,
+                    self.gone.clone(),
+                ));
             }
             Err(e) => {
                 warn!("ssh: exec for {user:?}: {e}");
@@ -426,7 +495,7 @@ impl Handler for ServerHandler {
 
     /// The client closed a channel before anything ran on it: forget what was kept for it.
     /// A channel a bridge closed is already gone from russh by the time the client's close
-    /// arrives, so it does not land here; its resize sender goes with the handler.
+    /// arrives, so it does not land here; its resize and signal senders go with the handler.
     async fn channel_close(
         &mut self,
         channel: ChannelId,
@@ -435,6 +504,7 @@ impl Handler for ServerHandler {
         self.channels.remove(&channel);
         self.ptys.remove(&channel);
         self.resizes.remove(&channel);
+        self.signals.remove(&channel);
         Ok(())
     }
 
@@ -734,8 +804,12 @@ fn apply_terminal_modes(slave: &OwnedFd, modes: &[(russh::Pty, u32)]) -> std::io
 }
 
 /// Spawn the user's login shell on the requested pty as `user`, or `cmdline` through
-/// that shell when given.
-fn spawn_on_pty(user: &str, pty: PtyReq, cmdline: Option<&OsStr>) -> Result<(Child, PtyMaster)> {
+/// that shell when given, and return the uid it runs as.
+fn spawn_on_pty(
+    user: &str,
+    pty: PtyReq,
+    cmdline: Option<&OsStr>,
+) -> Result<(Child, PtyMaster, libc::uid_t)> {
     let ru = resolve_user(user)?;
     let PtyReq {
         term,
@@ -778,7 +852,7 @@ fn spawn_on_pty(user: &str, pty: PtyReq, cmdline: Option<&OsStr>) -> Result<(Chi
     }
     let child = command.spawn()?;
     drop(command); // release the slave fds so the master sees EOF on shell exit
-    Ok((child, master))
+    Ok((child, master, ru.uid))
 }
 
 /// Spawn the user's login shell with piped stdio and no tty — for a `shell`
@@ -786,7 +860,7 @@ fn spawn_on_pty(user: &str, pty: PtyReq, cmdline: Option<&OsStr>) -> Result<(Chi
 /// stdin, as VS Code's server bootstrap does). Non-interactive (stdin is a pipe,
 /// not a terminal), so bash runs the piped commands without ever printing a
 /// prompt — stdout stays clean for the marker parsing VS Code relies on.
-fn spawn_shell_nopty(user: &str) -> Result<Child> {
+fn spawn_shell_nopty(user: &str) -> Result<(Child, libc::uid_t)> {
     let ru = resolve_user(user)?;
     let shell = login_shell(&ru);
     let mut command = Command::new(&shell);
@@ -799,11 +873,11 @@ fn spawn_shell_nopty(user: &str) -> Result<Child> {
         .process_group(0)
         .kill_on_drop(true);
     with_user_drop(&mut command, &ru);
-    Ok(command.spawn()?)
+    Ok((command.spawn()?, ru.uid))
 }
 
 /// Spawn `cmdline` via the user's shell with piped stdio (no tty), own pgroup.
-fn spawn_exec(user: &str, cmdline: &OsStr) -> Result<Child> {
+fn spawn_exec(user: &str, cmdline: &OsStr) -> Result<(Child, libc::uid_t)> {
     let ru = resolve_user(user)?;
     let shell = login_shell(&ru);
     let mut command = Command::new(&shell);
@@ -816,7 +890,7 @@ fn spawn_exec(user: &str, cmdline: &OsStr) -> Result<Child> {
         .process_group(0)
         .kill_on_drop(true);
     with_user_drop(&mut command, &ru);
-    Ok(command.spawn()?)
+    Ok((command.spawn()?, ru.uid))
 }
 
 /// The extended-data type SSH reserves for stderr (RFC 4254 §5.2). A client hands data
@@ -826,11 +900,97 @@ const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 /// How long a hung-up process group gets to leave before it is killed outright.
 const HANGUP_GRACE: Duration = Duration::from_secs(5);
 
+/// The pid of `child` while it is unreaped: it leads its own process group (and, on a
+/// pty, its session), so the number stays its group's until the bridge reaps it.
+fn leader_pid(child: &Child) -> Option<libc::pid_t> {
+    child.id().and_then(|p| libc::pid_t::try_from(p).ok())
+}
+
 /// Send `signal` to the whole process group `child` leads.
 fn signal_group(child: &Child, signal: libc::c_int) {
-    if let Some(pid) = child.id().and_then(|p| libc::pid_t::try_from(p).ok()) {
+    if let Some(pid) = leader_pid(child) {
+        // SAFETY: a plain syscall; the unreaped leader keeps the group id ours, and ESRCH
+        // (the group already gone) is fine to ignore.
         unsafe { libc::kill(-pid, signal) };
     }
+}
+
+/// The client's signal requests for one channel, and the uid they are sent as.
+struct Signals {
+    rx: mpsc::Receiver<libc::c_int>,
+    uid: libc::uid_t,
+}
+
+impl Signals {
+    /// Send `signal` to process group `pgid` with the session user's credentials.
+    fn deliver(&self, pgid: libc::pid_t, signal: libc::c_int) {
+        if let Err(e) = kill_group_as(self.uid, pgid, signal) {
+            debug!("ssh: signal {signal} to group {pgid}: {e}");
+        }
+    }
+}
+
+/// `kill(-pgid, signal)` as `uid`, so the kernel's permission check is the one that user
+/// would get: the agent's root reaches any process, and a job whose real and saved uids
+/// are another user's, such as one run through `sudo`, is not the session user's to
+/// signal. The switch happens on a fresh thread, through the raw syscall: Linux
+/// credentials are per thread, libc's setresuid would change every thread of the agent,
+/// and a pooled thread (`spawn_blocking`) would keep the dropped uid. The thread ends
+/// with the credentials it took. The one process-wide trace is the agent becoming
+/// non-dumpable, which changes nothing for a root process. Spawning and joining the
+/// thread from an async task costs microseconds, once per signal.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("kill_group_as needs setresuid32 on a 32-bit target");
+fn kill_group_as(uid: libc::uid_t, pgid: libc::pid_t, signal: libc::c_int) -> std::io::Result<()> {
+    // Never 1 or below: kill(-1) signals every process, and 0 the agent's own group.
+    if pgid <= 1 {
+        return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+    }
+    let kill = move || {
+        // SAFETY: a plain syscall; ESRCH or EPERM comes back as the error.
+        if unsafe { libc::kill(-pgid, signal) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    if uid == unsafe { libc::geteuid() } {
+        return kill();
+    }
+    std::thread::Builder::new()
+        .name("ssh-signal".into())
+        .spawn(move || {
+            // SAFETY: the raw setresuid changes this thread's credentials only, and the
+            // thread does nothing after the kill. It takes 32-bit uids on the 64-bit
+            // targets the agent builds for; 32-bit ones would need setresuid32.
+            if unsafe { libc::syscall(libc::SYS_setresuid, uid, uid, uid) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            kill()
+        })?
+        .join()
+        .map_err(|_| std::io::Error::other("the signal thread panicked"))?
+}
+
+/// The signal number for a name a client may send: RFC 4254's list, plus the USR2
+/// OpenSSH accepts too.
+fn signal_number(signal: &Sig) -> Option<libc::c_int> {
+    Some(match signal {
+        Sig::ABRT => libc::SIGABRT,
+        Sig::ALRM => libc::SIGALRM,
+        Sig::FPE => libc::SIGFPE,
+        Sig::HUP => libc::SIGHUP,
+        Sig::ILL => libc::SIGILL,
+        Sig::INT => libc::SIGINT,
+        Sig::KILL => libc::SIGKILL,
+        Sig::PIPE => libc::SIGPIPE,
+        Sig::QUIT => libc::SIGQUIT,
+        Sig::SEGV => libc::SIGSEGV,
+        Sig::TERM => libc::SIGTERM,
+        Sig::USR1 => libc::SIGUSR1,
+        Sig::Custom(name) if name == "USR2" => libc::SIGUSR2,
+        Sig::Custom(_) => return None,
+    })
 }
 
 /// Hang up on `child`'s process group, as sshd does when its client leaves, and reap it.
@@ -852,11 +1012,13 @@ async fn hangup_and_reap(child: &mut Child) -> u32 {
 /// until either side closes or the connection ends. Report the exit status and close the
 /// channel. If the client leaves, hang up as a terminal would: close the pty master,
 /// signal the process group, then kill it if it remains.
+#[allow(clippy::too_many_arguments)]
 async fn pty_bridge(
     chan: Channel<Msg>,
     mut child: Child,
     mut master: PtyMaster,
     mut resizes: watch::Receiver<(u16, u16)>,
+    mut signals: Signals,
     handle: Handle,
     id: ChannelId,
     mut gone: ConnectionGone,
@@ -887,6 +1049,11 @@ async fn pty_bridge(
                     let (rows, cols) = *resizes.borrow_and_update();
                     // A size the pty refuses is not worth ending the session over.
                     let _ = pty::set_winsize(master_fd, rows, cols);
+                }
+                Some(signo) = signals.rx.recv() => {
+                    if let Some(pgid) = leader_pid(&child) {
+                        signals.deliver(pgid, signo);
+                    }
                 }
             }
         }
@@ -920,6 +1087,7 @@ async fn pty_bridge(
 async fn exec_bridge(
     chan: Channel<Msg>,
     mut child: Child,
+    mut signals: Signals,
     handle: Handle,
     id: ChannelId,
     mut gone: ConnectionGone,
@@ -952,7 +1120,20 @@ async fn exec_bridge(
         }
     });
 
-    let Some(status) = gone.bound(child.wait()).await else {
+    // The client's signals go to the command's process group, the one a hang-up reaches.
+    let waited = gone.bound(async {
+        loop {
+            tokio::select! {
+                status = child.wait() => break status,
+                Some(signo) = signals.rx.recv() => {
+                    if let Some(pgid) = leader_pid(&child) {
+                        signals.deliver(pgid, signo);
+                    }
+                }
+            }
+        }
+    });
+    let Some(status) = waited.await else {
         // Connection gone: no one to report to, and a pump may sit parked on the window.
         stdin_task.abort();
         out_task.abort();
@@ -1127,14 +1308,16 @@ mod tests {
         pty: bool,
         resize: Option<(u32, u32)>,
     ) -> ExecOutput {
-        exec_over_ssh_with_modes(cmdline, pty.then_some(&[][..]), resize).await
+        exec_over_ssh_with(cmdline, pty.then_some(&[][..]), resize, None).await
     }
 
-    /// [`exec_over_ssh`], sending `modes` with the pty request when there is one.
-    async fn exec_over_ssh_with_modes(
+    /// [`exec_over_ssh`], sending `modes` with the pty request when there is one, and
+    /// `signal` once the command's output first says `ready`.
+    async fn exec_over_ssh_with(
         cmdline: impl Into<Vec<u8>>,
         modes: Option<&[(russh::Pty, u32)]>,
         resize: Option<(u32, u32)>,
+        signal: Option<russh::Sig>,
     ) -> ExecOutput {
         let test = test_session().await;
         let mut channel = test.session.channel_open_session().await.unwrap();
@@ -1148,6 +1331,7 @@ mod tests {
         if let Some((cols, rows)) = resize {
             channel.window_change(cols, rows, 0, 0).await.unwrap();
         }
+        let mut signal = signal;
         let mut out = ExecOutput {
             data: Vec::new(),
             stderr: Vec::new(),
@@ -1157,7 +1341,14 @@ mod tests {
         let collect = async {
             while let Some(msg) = channel.wait().await {
                 match msg {
-                    russh::ChannelMsg::Data { data } => out.data.extend_from_slice(&data),
+                    russh::ChannelMsg::Data { data } => {
+                        out.data.extend_from_slice(&data);
+                        if out.data.windows(5).any(|w| w == b"ready")
+                            && let Some(sig) = signal.take()
+                        {
+                            channel.signal(sig).await.unwrap();
+                        }
+                    }
                     russh::ChannelMsg::ExtendedData { data, ext } => {
                         assert_eq!(ext, super::SSH_EXTENDED_DATA_STDERR);
                         out.stderr.extend_from_slice(&data);
@@ -1240,7 +1431,7 @@ mod tests {
             (Pty::CS7, 1),
             (Pty::TTY_OP_ISPEED, 9600),
         ];
-        let out = exec_over_ssh_with_modes("stty -a", Some(&modes), None).await;
+        let out = exec_over_ssh_with("stty -a", Some(&modes), None, None).await;
         let stty = String::from_utf8_lossy(&out.data);
         for want in [
             "intr = ^B;",
@@ -1298,6 +1489,103 @@ mod tests {
             .await
             .expect("both requests get a reply");
         assert_eq!(replies, [true, false]);
+    }
+
+    /// Signals reach a non-pty command's process group. Use `sh` regardless of the
+    /// test user's shell.
+    #[tokio::test]
+    async fn a_signal_reaches_a_command() {
+        let out = exec_over_ssh_with(
+            r#"exec sh -c 'trap "echo got-term; exit 7" TERM; echo ready; while :; do sleep 0.05; done'"#,
+            None,
+            None,
+            Some(russh::Sig::TERM),
+        )
+        .await;
+        assert_eq!(out.data, b"ready\ngot-term\n");
+        assert_eq!(out.status, Some(7));
+    }
+
+    /// Signals on a pty reach the shell's own group, as under sshd, not the job it put in
+    /// the foreground. The script starts a watcher in its own group, then, with job
+    /// control on, a foreground job in a group of its own that waits for the watcher to
+    /// see the signal. Each says if the signal reached it; no step waits on a clock.
+    #[tokio::test]
+    async fn a_signal_on_a_pty_reaches_the_shells_group() {
+        let dir = std::env::temp_dir().join(format!("vk-agent-ssh-sig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (seen, script) = (dir.join("seen"), dir.join("script"));
+        let _ = std::fs::remove_file(&seen);
+        // The shell traps USR1 rather than die of it; a trap, unlike an ignore, is not
+        // inherited, so the watcher and the job can set their own.
+        std::fs::write(
+            &script,
+            format!(
+                r#"trap : USR1
+sh -c 'trap "echo group-got; touch {seen}; exit" USR1; echo ready; while :; do sleep 0.05; done' &
+set -m
+sh -c 'trap "echo job-got; exit" USR1; while [ ! -e {seen} ]; do sleep 0.05; done'
+kill $! 2>/dev/null
+echo end
+"#,
+                seen = seen.display()
+            ),
+        )
+        .unwrap();
+        let out = exec_over_ssh_with(
+            format!("exec sh {}", script.display()),
+            Some(&[]),
+            None,
+            Some(russh::Sig::USR1),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = String::from_utf8_lossy(&out.data);
+        assert!(data.contains("group-got"), "{data:?}");
+        assert!(!data.contains("job-got"), "{data:?}");
+        assert!(data.contains("end"), "{data:?}");
+        assert_eq!(out.status, Some(0));
+    }
+
+    /// A signal is sent with the session user's credentials: it reaches that user's
+    /// processes and not root's, which the agent itself could signal. Root only.
+    #[test]
+    fn a_signal_is_sent_as_the_session_user() {
+        use std::os::unix::process::CommandExt;
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root");
+            return;
+        }
+        let spawn = |uid: libc::uid_t| {
+            let mut command = std::process::Command::new("sleep");
+            command.arg("30").process_group(0);
+            if uid != 0 {
+                command.uid(uid).gid(uid);
+            }
+            command.spawn().unwrap()
+        };
+        let pgid = |c: &std::process::Child| libc::pid_t::try_from(c.id()).unwrap();
+
+        let mut roots = spawn(0);
+        let e = super::kill_group_as(65534, pgid(&roots), libc::SIGTERM).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EPERM), "{e}");
+        assert!(
+            roots.try_wait().unwrap().is_none(),
+            "root's process was signalled"
+        );
+
+        let mut users = spawn(65534);
+        super::kill_group_as(65534, pgid(&users), libc::SIGTERM).unwrap();
+        let status = users.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGTERM)
+        );
+
+        // The agent's own credentials are untouched.
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        super::kill_group_as(0, pgid(&roots), libc::SIGKILL).unwrap();
+        roots.wait().unwrap();
     }
 
     #[tokio::test]

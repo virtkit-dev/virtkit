@@ -18,6 +18,8 @@ All notable changes to virtkit will be documented in this file.
   UTF-8 in `ssh <vm> <command>` is no longer rewritten to `�`.
 - **An SSH terminal into a VM takes the client's terminal settings.** Its interrupt and
   erase keys, echo and line handling follow the client, as with sshd.
+- **Signals sent over SSH reach the command in the VM.** A client's interrupt or terminate
+  request now reaches the process group of what it ran, as with sshd.
 
 ## [0.78.0] - 2026-09-25
 
