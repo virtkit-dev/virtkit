@@ -26,6 +26,10 @@ All notable changes to virtkit will be documented in this file.
 - **A `vk exec --tty` whose client disconnects is hung up as a terminal would be**, as
   over SSH: its processes get SIGHUP, and SIGKILL only if they are still there 5 seconds
   later. They used to be killed outright.
+- **`vk exec --tty` takes the local terminal's settings.** Its interrupt and erase keys,
+  echo and UTF-8 line editing follow the terminal it runs from, as over SSH. The agent
+  protocol version is now 3: rebuild the VM image, and restart VMs a previous `vk` started
+  before running `vk exec --tty` in them.
 - **`--user <uid>` works in images without a user database.** A uid runs as-is, with
   group 0, when the guest has no `/etc/passwd` or its lookup service is unavailable, as it
   already did for a uid the database does not list.

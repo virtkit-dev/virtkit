@@ -58,16 +58,7 @@ pub async fn run(
         if unsafe { libc::isatty(0) } != 1 || unsafe { libc::isatty(1) } != 1 {
             bail!("--tty requires stdin and stdout to be a terminal");
         }
-        // (0, 0) = a terminal that does not report a size: pick a sane default.
-        let (rows, cols) = match vk_core::pty::get_winsize(0) {
-            Ok((0, 0)) | Err(_) => (24, 80),
-            Ok(size) => size,
-        };
-        Some(Tty {
-            term: std::env::var("TERM").ok(),
-            rows,
-            cols,
-        })
+        Some(Tty::local())
     } else {
         None
     };

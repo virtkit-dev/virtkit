@@ -514,6 +514,7 @@ async fn disconnect_hangs_up_a_tty_exec() {
             term: Some("xterm".into()),
             rows: 24,
             cols: 80,
+            modes: vec![],
         }),
         dir: None,
         user: AMBIENT_USER,
@@ -557,7 +558,7 @@ async fn disconnect_hangs_up_a_tty_exec() {
 
 /// Drive a tty exec and return (stdout, exit code).
 async fn run_tty(addr: &SocketAddr, script: &str, rows: u16, cols: u16) -> (String, Option<i32>) {
-    run_tty_as(addr, script, rows, cols, AMBIENT_USER).await
+    run_tty_as(addr, script, rows, cols, AMBIENT_USER, vec![]).await
 }
 
 /// [`run_tty`] as `user`.
@@ -567,6 +568,7 @@ async fn run_tty_as(
     rows: u16,
     cols: u16,
     user: Option<String>,
+    modes: Vec<(u8, u32)>,
 ) -> (String, Option<i32>) {
     let (mut stream, mut sink) = connect(addr).await.unwrap();
     sink.send(Message::CmdExec(CmdExec {
@@ -579,6 +581,7 @@ async fn run_tty_as(
             term: Some("xterm".into()),
             rows,
             cols,
+            modes,
         }),
         dir: None,
         user,
@@ -636,9 +639,24 @@ async fn tty_exec_terminal_reopens_as_its_user() {
     }
     let addr = start_server("tty-owner").await;
     let script = r#"t=$(tty) && exec 3<>"$t" && echo OK"#;
-    let (stdout, code) = run_tty_as(&addr, script, 24, 80, Some("65534".into())).await;
+    let (stdout, code) = run_tty_as(&addr, script, 24, 80, Some("65534".into()), vec![]).await;
     assert_eq!(code, Some(0), "stdout: {stdout}");
     assert!(stdout.contains("OK\r\n"), "stdout: {stdout}");
+}
+
+/// Apply the client's RFC 4254 modes to the pty: change ^C to ^B, disable echo
+/// and enable IUTF8.
+#[tokio::test]
+async fn tty_exec_takes_the_client_terminal_modes() {
+    let addr = start_server("tty-modes").await;
+    let modes = vec![(1, 2), (53, 0), (42, 1)];
+    let (stdout, code) = run_tty_as(&addr, "stty -a", 24, 80, AMBIENT_USER, modes).await;
+    assert_eq!(code, Some(0), "stdout: {stdout}");
+    assert!(stdout.contains("intr = ^B;"), "stdout: {stdout}");
+    let words: Vec<&str> = stdout.split_whitespace().collect();
+    for want in ["-echo", "iutf8"] {
+        assert!(words.contains(&want), "no {want:?} in {stdout}");
+    }
 }
 
 /// A process outliving the command keeps a pty slave handle open, so the master

@@ -762,6 +762,11 @@ async fn srv_run_cmd_tty(
         }
     };
 
+    // The client terminal's modes, as sshd applies a pty request's; the kernel's
+    // defaults still make a usable terminal.
+    if let Err(e) = pty::apply_terminal_modes(slave.as_raw_fd(), &tty.modes) {
+        warn!("command [{req_id}] terminal modes left at their defaults: {e}");
+    }
     // Give the terminal to the session user. Lookup errors surface at spawn; a
     // root-owned pty remains usable through inherited fds.
     let user = session_user(&cmd);

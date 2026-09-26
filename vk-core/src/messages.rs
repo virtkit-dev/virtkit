@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// reordering a struct field, adding an enum variant, ...): rmp_serde encodes
 /// structs as fixed-length arrays, so such changes are not wire compatible
 /// across versions. A virtkit-agent predating this field decodes its `protocol` as 0.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub enum RunMode {
@@ -83,6 +83,27 @@ pub struct Tty {
     pub term: Option<String>,
     pub rows: u16,
     pub cols: u16,
+    /// RFC 4254 opcode/value pairs applied to the pty to match the client terminal's
+    /// keys, line discipline and echo.
+    pub modes: Vec<(u8, u32)>,
+}
+
+impl Tty {
+    /// The terminal on stdin, read before it goes raw: its TERM, its size (24x80 when
+    /// it reports none) and its modes.
+    pub fn local() -> Self {
+        let (rows, cols) = match crate::pty::get_winsize(0) {
+            Ok((0, 0)) | Err(_) => (24, 80),
+            Ok(size) => size,
+        };
+        Tty {
+            term: std::env::var("TERM").ok(),
+            rows,
+            cols,
+            // A terminal whose modes cannot be read gets the pty's defaults.
+            modes: crate::pty::terminal_modes(0).unwrap_or_default(),
+        }
+    }
 }
 
 impl fmt::Display for CmdExec {

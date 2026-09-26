@@ -3901,7 +3901,6 @@ async fn run_tty(
     args: Vec<String>,
 ) -> Result<vk_core::messages::CmdResult> {
     use vk_core::messages::{CmdExec, RunMode, Tty};
-    let (rows, cols) = vk_core::pty::get_winsize(0).unwrap_or((24, 80));
     let (stream, sink) = vk_core::net::connect(addr)
         .await
         .context("connecting to the VM's vk-agent")?;
@@ -3912,11 +3911,7 @@ async fn run_tty(
         clear_env: false,
         mode: RunMode::Interactive,
         dir: None,
-        tty: Some(Tty {
-            term: std::env::var("TERM").ok(),
-            rows,
-            cols,
-        }),
+        tty: Some(Tty::local()),
         user: None,
     };
     vk_core::exec::client::client_run_tty(stream, sink, exec).await
