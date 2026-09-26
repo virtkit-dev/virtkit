@@ -22,6 +22,7 @@ All notable changes to virtkit will be documented in this file.
   request now reaches the process group of what it ran, as with sshd.
 - **An SSH terminal resized before its shell starts opens at the new size.** It used to
   keep the size of the pty request until the next resize.
+- **A `vk exec` whose client disconnects can no longer kill an unrelated process.**
 - **`--user <uid>` works in images without a user database.** A uid runs as-is, with
   group 0, when the guest has no `/etc/passwd` or its lookup service is unavailable, as it
   already did for a uid the database does not list.

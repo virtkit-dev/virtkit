@@ -19,7 +19,7 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::select;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::{task, time};
 
 #[derive(Clone)]
@@ -594,6 +594,15 @@ pub fn resolve_user(spec: &str) -> std::io::Result<ResolvedUser> {
     })
 }
 
+/// Send `signal` to the process group `child` leads. Only the task that reaps `child`
+/// may call this: until then its pid, and so its group id, cannot be reused.
+fn signal_group(child: &tokio::process::Child, signal: libc::c_int) {
+    if let Some(pid) = child.id().and_then(|p| libc::pid_t::try_from(p).ok()) {
+        // SAFETY: a plain syscall; ESRCH (the group already gone) is fine to ignore.
+        unsafe { libc::kill(-pid, signal) };
+    }
+}
+
 /// Hand a pty slave to the user a session runs as, the way sshd does: owned by them, in
 /// the `tty` group with mode 0620 when the guest has one, else in `gid` with 0600. An
 /// agent that is not root already owns the slave and serves only itself.
@@ -792,7 +801,9 @@ async fn srv_run_cmd_tty(
         reader_task(req_id, crate::messages::Fd::Stdout, master_read, tx_out).await;
     });
 
-    let child_pid = child.id();
+    // The reader reports a client that went away; the kill is this task's, which reaps
+    // the command, so no signal can reach a group whose leader was reaped.
+    let (gone_tx, mut gone) = oneshot::channel();
     let client_stream_reader = tokio::spawn(async move {
         let disconnected = loop {
             match stream.next().await {
@@ -814,24 +825,23 @@ async fn srv_run_cmd_tty(
                 None | Some(Err(_)) => break true,
             }
         };
-        if disconnected && let Some(pid) = child_pid {
-            info!("command [{req_id}] client disconnected, killing process group (pgid={pid})");
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
+        if disconnected {
+            let _ = gone_tx.send(());
         }
     });
 
-    let status = match child.wait().await {
-        Ok(it) => it,
-        Err(err) => return Err(err.into()),
+    let status = select! {
+        status = child.wait() => status?,
+        Ok(()) = &mut gone => {
+            info!("command [{req_id}] client disconnected, killing its process group");
+            signal_group(&child, libc::SIGKILL);
+            child.wait().await?
+        }
     };
 
     debug!("command [{req_id}] exit status: {status}");
-    // wait() has reaped the pid, so a disconnect handled from here on would SIGKILL a
-    // recycled process group: stop reading the client before anything that can block.
-    // Awaiting an aborted task only reports the cancellation we just caused, but it
-    // reaps the task, which is what drops its half of the master.
+    // Await cancellation to drop the reader's half of the master; the task's
+    // cancellation error is expected.
     client_stream_reader.abort();
     let _ = client_stream_reader.await;
     if status.signal().is_some() {
@@ -945,7 +955,9 @@ async fn srv_run_cmd(
         let _ = stdin.flush().await;
     });
 
-    let child_pid = child.id();
+    // The reader reports a client that went away; the kill is this task's, which reaps
+    // the command, so no signal can reach a group whose leader was reaped.
+    let (gone_tx, mut gone) = oneshot::channel();
     let client_stream_reader = tokio::spawn(async move {
         let disconnected = loop {
             let client_msg = match stream.next().await {
@@ -981,21 +993,22 @@ async fn srv_run_cmd(
                 _ => {}
             }
         };
+        if disconnected {
+            let _ = gone_tx.send(());
+        }
+    });
+
+    let status = select! {
+        status = child.wait() => status?,
         // Nobody is listening anymore: kill the command instead of letting it run
         // unattended (Ctrl-C on the client side must stop the remote command). The
         // child is its own process group leader, so signal the whole group: a bare
         // kill(pid) would orphan grandchildren (e.g. `sh -c '...; sleep 60'`).
-        if disconnected && let Some(pid) = child_pid {
-            info!("client disconnected, killing child process group (pgid={pid})");
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-            }
+        Ok(()) = &mut gone => {
+            info!("command [{req_id}] client disconnected, killing its process group");
+            signal_group(&child, libc::SIGKILL);
+            child.wait().await?
         }
-    });
-
-    let status = match child.wait().await {
-        Ok(it) => it,
-        Err(err) => return Err(err.into()),
     };
 
     debug!("command [{req_id}] exit status: {status}");
@@ -1005,9 +1018,7 @@ async fn srv_run_cmd(
             error: None,
         })
         .await;
-    // wait() has reaped the pid, so a disconnect handled from here on would SIGKILL a
-    // recycled process group: stop reading the client before anything that can block.
-    // Reaping the task also drops the stdin channel, which is what ends write_stdin.
+    // Await the reader's cancellation to drop the stdin channel and end write_stdin.
     client_stream_reader.abort();
     let _ = client_stream_reader.await;
     if status.signal().is_some() {
