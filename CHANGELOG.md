@@ -16,6 +16,8 @@ All notable changes to virtkit will be documented in this file.
   run it without one, as against sshd.
 - **Commands run over SSH reach the shell byte for byte.** A file name that is not valid
   UTF-8 in `ssh <vm> <command>` is no longer rewritten to `�`.
+- **An SSH terminal into a VM takes the client's terminal settings.** Its interrupt and
+  erase keys, echo and line handling follow the client, as with sshd.
 
 ## [0.78.0] - 2026-09-25
 

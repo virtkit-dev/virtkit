@@ -32,7 +32,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::future::Future;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
@@ -294,7 +294,7 @@ impl Handler for ServerHandler {
         row_height: u32,
         _pix_width: u32,
         _pix_height: u32,
-        _modes: &[(russh::Pty, u32)],
+        modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         // Only a session channel nothing runs on yet can take a terminal, and only one: a
@@ -311,6 +311,10 @@ impl Handler for ServerHandler {
         let cols = col_width.min(u32::from(u16::MAX)) as u16;
         match pty::openpty(rows, cols) {
             Ok((master, slave)) => {
+                // The terminal still works with the kernel's defaults, as under sshd.
+                if let Err(e) = apply_terminal_modes(&slave, modes) {
+                    warn!("ssh: terminal modes left at their defaults: {e}");
+                }
                 self.ptys.insert(
                     channel,
                     PtyReq {
@@ -633,6 +637,100 @@ fn login_shell(ru: &ResolvedUser) -> std::ffi::OsString {
     ru.shell
         .clone()
         .unwrap_or_else(|| std::ffi::OsString::from("/bin/sh"))
+}
+
+/// Set the terminal modes the client sent with its pty request on the slave, the way sshd
+/// does: its keys (^C, ^Z, erase…), its line discipline, echo and output processing. A
+/// client that turned off, say, ICRNL or IUTF8 locally would otherwise type into a
+/// terminal that disagrees with it. Modes Linux has no flag for, the line speeds, which a
+/// pty does not use, and the character size and parity, which Linux fixes at CS8 without
+/// parity on a pty, are skipped.
+fn apply_terminal_modes(slave: &OwnedFd, modes: &[(russh::Pty, u32)]) -> std::io::Result<()> {
+    use russh::Pty;
+    if modes.is_empty() {
+        return Ok(());
+    }
+    let fd = slave.as_raw_fd();
+    // SAFETY: termios is plain data, valid zeroed; tcgetattr fills it through a valid
+    // pointer, on the slave fd this function borrows.
+    let mut tio: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut tio) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    for &(mode, value) in modes {
+        let cc = match mode {
+            Pty::VINTR => Some(libc::VINTR),
+            Pty::VQUIT => Some(libc::VQUIT),
+            Pty::VERASE => Some(libc::VERASE),
+            Pty::VKILL => Some(libc::VKILL),
+            Pty::VEOF => Some(libc::VEOF),
+            Pty::VEOL => Some(libc::VEOL),
+            Pty::VEOL2 => Some(libc::VEOL2),
+            Pty::VSTART => Some(libc::VSTART),
+            Pty::VSTOP => Some(libc::VSTOP),
+            Pty::VSUSP => Some(libc::VSUSP),
+            Pty::VREPRINT => Some(libc::VREPRINT),
+            Pty::VWERASE => Some(libc::VWERASE),
+            Pty::VLNEXT => Some(libc::VLNEXT),
+            Pty::VDISCARD => Some(libc::VDISCARD),
+            _ => None,
+        };
+        if let Some(i) = cc {
+            // 255 means "disabled" in the protocol. Skip out-of-range characters
+            // rather than truncating them.
+            match libc::cc_t::try_from(value) {
+                Ok(255) => tio.c_cc[i] = libc::_POSIX_VDISABLE,
+                Ok(c) => tio.c_cc[i] = c,
+                Err(_) => {}
+            }
+            continue;
+        }
+        let (field, bit) = match mode {
+            Pty::IGNPAR => (&mut tio.c_iflag, libc::IGNPAR),
+            Pty::PARMRK => (&mut tio.c_iflag, libc::PARMRK),
+            Pty::INPCK => (&mut tio.c_iflag, libc::INPCK),
+            Pty::ISTRIP => (&mut tio.c_iflag, libc::ISTRIP),
+            Pty::INLCR => (&mut tio.c_iflag, libc::INLCR),
+            Pty::IGNCR => (&mut tio.c_iflag, libc::IGNCR),
+            Pty::ICRNL => (&mut tio.c_iflag, libc::ICRNL),
+            Pty::IUCLC => (&mut tio.c_iflag, libc::IUCLC),
+            Pty::IXON => (&mut tio.c_iflag, libc::IXON),
+            Pty::IXANY => (&mut tio.c_iflag, libc::IXANY),
+            Pty::IXOFF => (&mut tio.c_iflag, libc::IXOFF),
+            Pty::IMAXBEL => (&mut tio.c_iflag, libc::IMAXBEL),
+            Pty::IUTF8 => (&mut tio.c_iflag, libc::IUTF8),
+            Pty::ISIG => (&mut tio.c_lflag, libc::ISIG),
+            Pty::ICANON => (&mut tio.c_lflag, libc::ICANON),
+            Pty::XCASE => (&mut tio.c_lflag, libc::XCASE),
+            Pty::ECHO => (&mut tio.c_lflag, libc::ECHO),
+            Pty::ECHOE => (&mut tio.c_lflag, libc::ECHOE),
+            Pty::ECHOK => (&mut tio.c_lflag, libc::ECHOK),
+            Pty::ECHONL => (&mut tio.c_lflag, libc::ECHONL),
+            Pty::NOFLSH => (&mut tio.c_lflag, libc::NOFLSH),
+            Pty::TOSTOP => (&mut tio.c_lflag, libc::TOSTOP),
+            Pty::IEXTEN => (&mut tio.c_lflag, libc::IEXTEN),
+            Pty::ECHOCTL => (&mut tio.c_lflag, libc::ECHOCTL),
+            Pty::ECHOKE => (&mut tio.c_lflag, libc::ECHOKE),
+            Pty::PENDIN => (&mut tio.c_lflag, libc::PENDIN),
+            Pty::OPOST => (&mut tio.c_oflag, libc::OPOST),
+            Pty::OLCUC => (&mut tio.c_oflag, libc::OLCUC),
+            Pty::ONLCR => (&mut tio.c_oflag, libc::ONLCR),
+            Pty::OCRNL => (&mut tio.c_oflag, libc::OCRNL),
+            Pty::ONOCR => (&mut tio.c_oflag, libc::ONOCR),
+            Pty::ONLRET => (&mut tio.c_oflag, libc::ONLRET),
+            _ => continue,
+        };
+        if value != 0 {
+            *field |= bit;
+        } else {
+            *field &= !bit;
+        }
+    }
+    // SAFETY: tcsetattr only reads the termios, on the slave fd this function borrows.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &tio) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Spawn the user's login shell on the requested pty as `user`, or `cmdline` through
@@ -1029,11 +1127,20 @@ mod tests {
         pty: bool,
         resize: Option<(u32, u32)>,
     ) -> ExecOutput {
+        exec_over_ssh_with_modes(cmdline, pty.then_some(&[][..]), resize).await
+    }
+
+    /// [`exec_over_ssh`], sending `modes` with the pty request when there is one.
+    async fn exec_over_ssh_with_modes(
+        cmdline: impl Into<Vec<u8>>,
+        modes: Option<&[(russh::Pty, u32)]>,
+        resize: Option<(u32, u32)>,
+    ) -> ExecOutput {
         let test = test_session().await;
         let mut channel = test.session.channel_open_session().await.unwrap();
-        if pty {
+        if let Some(modes) = modes {
             channel
-                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .request_pty(true, "xterm", 80, 24, 0, 0, modes)
                 .await
                 .unwrap();
         }
@@ -1114,6 +1221,40 @@ mod tests {
         assert!(lines[3].starts_with("/dev/pts/"), "{data:?}");
         assert!(out.stderr.is_empty(), "{:?}", out.stderr);
         assert_eq!(out.status, Some(3));
+    }
+
+    /// Requested modes move interrupt from ^C to ^B and disable erase, echo,
+    /// CR-to-NL translation and output processing. An out-of-range control character,
+    /// line speed and character size are ignored without failing the request.
+    #[tokio::test]
+    async fn a_pty_takes_the_terminal_modes_the_client_sent() {
+        use russh::Pty;
+        let modes = [
+            (Pty::VINTR, 2),
+            (Pty::VERASE, 255),
+            (Pty::VQUIT, 0x1_0000),
+            (Pty::ECHO, 0),
+            (Pty::ICRNL, 0),
+            (Pty::IUTF8, 1),
+            (Pty::OPOST, 0),
+            (Pty::CS7, 1),
+            (Pty::TTY_OP_ISPEED, 9600),
+        ];
+        let out = exec_over_ssh_with_modes("stty -a", Some(&modes), None).await;
+        let stty = String::from_utf8_lossy(&out.data);
+        for want in [
+            "intr = ^B;",
+            "erase = <undef>;",
+            "quit = ^\\;",
+            "speed 38400 baud",
+        ] {
+            assert!(stty.contains(want), "no {want:?} in {stty}");
+        }
+        let words: Vec<&str> = stty.split_whitespace().collect();
+        for want in ["-echo", "-icrnl", "iutf8", "-opost", "cs8"] {
+            assert!(words.contains(&want), "no {want:?} in {stty}");
+        }
+        assert_eq!(out.status, Some(0));
     }
 
     /// A window change reaches a command run on a pty, as it does a shell. The loop runs
