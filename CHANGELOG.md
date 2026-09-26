@@ -10,6 +10,8 @@ All notable changes to virtkit will be documented in this file.
   shows its shell prompt instead of sitting blank.
 - **`--user user:group` resolves a group with a long member list.** It used to fail with
   "Numerical result out of range".
+- **The terminal of an SSH session or `vk exec --tty` belongs to the user it runs as.**
+  `GPG_TTY=$(tty)` pinentry, `screen` and `script` can reopen it by name.
 
 ## [0.78.0] - 2026-09-25
 

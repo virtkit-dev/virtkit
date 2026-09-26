@@ -486,6 +486,17 @@ async fn disconnect_kills_remote_process() {
 
 /// Drive a tty exec and return (stdout, exit code).
 async fn run_tty(addr: &SocketAddr, script: &str, rows: u16, cols: u16) -> (String, Option<i32>) {
+    run_tty_as(addr, script, rows, cols, AMBIENT_USER).await
+}
+
+/// [`run_tty`] as `user`.
+async fn run_tty_as(
+    addr: &SocketAddr,
+    script: &str,
+    rows: u16,
+    cols: u16,
+    user: Option<String>,
+) -> (String, Option<i32>) {
     let (mut stream, mut sink) = connect(addr).await.unwrap();
     sink.send(Message::CmdExec(CmdExec {
         name: "sh".into(),
@@ -499,7 +510,7 @@ async fn run_tty(addr: &SocketAddr, script: &str, rows: u16, cols: u16) -> (Stri
             cols,
         }),
         dir: None,
-        user: AMBIENT_USER,
+        user,
     }))
     .await
     .unwrap();
@@ -541,6 +552,22 @@ async fn tty_exec() {
     // the pty translates \n to \r\n (ONLCR)
     assert!(stdout.contains("33 117\r\n"), "stdout: {stdout}");
     assert!(stdout.contains("TERM=xterm\r\n"), "stdout: {stdout}");
+}
+
+/// The terminal of a tty exec belongs to the user it runs as, who can reopen it by name
+/// (`GPG_TTY=$(tty)` pinentry, screen, script).
+#[tokio::test]
+async fn tty_exec_terminal_reopens_as_its_user() {
+    // Handing the terminal over needs root; most dev/CI runs are not, so skip then.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skipping tty_exec_terminal_reopens_as_its_user: not running as root");
+        return;
+    }
+    let addr = start_server("tty-owner").await;
+    let script = r#"t=$(tty) && exec 3<>"$t" && echo OK"#;
+    let (stdout, code) = run_tty_as(&addr, script, 24, 80, Some("65534".into())).await;
+    assert_eq!(code, Some(0), "stdout: {stdout}");
+    assert!(stdout.contains("OK\r\n"), "stdout: {stdout}");
 }
 
 /// A process outliving the command keeps a pty slave handle open, so the master

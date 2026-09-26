@@ -47,7 +47,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::watch;
 
 use vk_core::addr::SocketAddr;
-use vk_core::exec::server::{ResolvedUser, resolve_user};
+use vk_core::exec::server::{ResolvedUser, give_tty, resolve_user};
 use vk_core::net::raw_listen;
 use vk_core::pty::{self, PtyMaster};
 
@@ -602,6 +602,10 @@ fn login_shell(ru: &ResolvedUser) -> std::ffi::OsString {
 fn spawn_on_pty(user: &str, pty: &PtyReq, cmdline: Option<&str>) -> Result<(Child, PtyMaster)> {
     let ru = resolve_user(user)?;
     let (master, slave) = pty::openpty(pty.rows, pty.cols)?;
+    // A pty left owned by root still works through the fds the shell inherits.
+    if let Err(e) = give_tty(&slave, ru.uid, ru.gid) {
+        warn!("ssh: pty owner for {user:?}: {e}");
+    }
     let shell = login_shell(&ru);
     let mut command = Command::new(&shell);
     match cmdline {

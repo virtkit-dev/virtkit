@@ -6,7 +6,8 @@ use crate::pty;
 use crate::status::get_status;
 use anyhow::anyhow;
 use futures::{Sink, SinkExt, Stream, StreamExt};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process;
@@ -583,6 +584,31 @@ pub fn resolve_user(spec: &str) -> std::io::Result<ResolvedUser> {
     })
 }
 
+/// Hand a pty slave to the user a session runs as, the way sshd does: owned by them, in
+/// the `tty` group with mode 0620 when the guest has one, else in `gid` with 0600. An
+/// agent that is not root already owns the slave and serves only itself.
+pub fn give_tty(slave: impl AsFd, uid: libc::uid_t, gid: libc::gid_t) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let (gid, mode) = match resolve_gid("tty") {
+        Ok(tty) => (tty, 0o620),
+        Err(e) if e.kind() == ErrorKind::NotFound => (gid, 0o600),
+        Err(e) => return Err(Error::new(e.kind(), format!("tty group: {e}"))),
+    };
+    let fd = slave.as_fd().as_raw_fd();
+    if unsafe { libc::fchown(fd, uid, gid) } != 0 {
+        let e = Error::last_os_error();
+        return Err(Error::new(e.kind(), format!("fchown {uid}:{gid}: {e}")));
+    }
+    if unsafe { libc::fchmod(fd, mode) } != 0 {
+        let e = Error::last_os_error();
+        return Err(Error::new(e.kind(), format!("fchmod {mode:o}: {e}")));
+    }
+    Ok(())
+}
+
 /// Configure `command` to exec as `user`: set HOME/USER/LOGNAME (unless the
 /// caller already provided them) and register a pre_exec that drops privileges.
 fn apply_user(command: &mut Command, cmd: &CmdExec, user: SessionUser) {
@@ -697,7 +723,15 @@ async fn srv_run_cmd_tty(
         }
     };
 
-    let mut command = build_command(&cmd, session_user(&cmd));
+    // Give the terminal to the session user. Lookup errors surface at spawn; a
+    // root-owned pty remains usable through inherited fds.
+    let user = session_user(&cmd);
+    if let Some(ru) = user.as_ref().and_then(|u| u.resolved.as_ref().ok())
+        && let Err(e) = give_tty(&slave, ru.uid, ru.gid)
+    {
+        warn!("command [{req_id}] pty owner: {e}");
+    }
+    let mut command = build_command(&cmd, user);
     if let Some(term) = &tty.term {
         command.env("TERM", term);
     }
@@ -1155,8 +1189,8 @@ async fn writer_task(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecWrapper, SessionUser, TaskState, apply_user, glob_match, inactivity_check_period,
-        resolve_user, run_as, split_user_group, wrap_cmd,
+        ExecWrapper, SessionUser, TaskState, apply_user, give_tty, glob_match,
+        inactivity_check_period, resolve_gid, resolve_user, run_as, split_user_group, wrap_cmd,
     };
     use crate::messages::{CmdExec, RunMode};
     use std::path::PathBuf;
@@ -1220,6 +1254,28 @@ mod tests {
         // The `:group` half is dropped: USER/LOGNAME name the login user, not the spec.
         assert_eq!(env_val("USER"), Some(OsStr::new("root").to_owned()));
         assert_eq!(env_val("LOGNAME"), Some(OsStr::new("root").to_owned()));
+    }
+
+    /// Run as root only (the guest agent's case): a non-root caller keeps the slave as is.
+    /// A tokio test: the pty master registers with the reactor.
+    #[tokio::test]
+    async fn give_tty_hands_the_slave_to_the_session_user() {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipped: needs root");
+            return;
+        }
+        let (_master, slave) = crate::pty::openpty(24, 80).unwrap();
+        give_tty(&slave, 65534, 65534).unwrap();
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(slave.as_raw_fd(), &mut st) }, 0);
+        assert_eq!(st.st_uid, 65534);
+        let want = match resolve_gid("tty") {
+            Ok(gid) => (gid, 0o620),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (65534, 0o600),
+            Err(e) => panic!("tty group: {e}"),
+        };
+        assert_eq!((st.st_gid, st.st_mode & 0o7777), want);
     }
 
     #[test]
