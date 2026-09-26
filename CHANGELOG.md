@@ -23,6 +23,9 @@ All notable changes to virtkit will be documented in this file.
 - **An SSH terminal resized before its shell starts opens at the new size.** It used to
   keep the size of the pty request until the next resize.
 - **A `vk exec` whose client disconnects can no longer kill an unrelated process.**
+- **A `vk exec --tty` whose client disconnects is hung up as a terminal would be**, as
+  over SSH: its processes get SIGHUP, and SIGKILL only if they are still there 5 seconds
+  later. They used to be killed outright.
 - **`--user <uid>` works in images without a user database.** A uid runs as-is, with
   group 0, when the guest has no `/etc/passwd` or its lookup service is unavailable, as it
   already did for a uid the database does not list.

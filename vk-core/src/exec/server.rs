@@ -594,12 +594,32 @@ pub fn resolve_user(spec: &str) -> std::io::Result<ResolvedUser> {
     })
 }
 
+/// How long a hung-up process group gets to leave before it is killed outright.
+const HANGUP_GRACE: Duration = Duration::from_secs(5);
+
 /// Send `signal` to the process group `child` leads. Only the task that reaps `child`
 /// may call this: until then its pid, and so its group id, cannot be reused.
 fn signal_group(child: &tokio::process::Child, signal: libc::c_int) {
     if let Some(pid) = child.id().and_then(|p| libc::pid_t::try_from(p).ok()) {
         // SAFETY: a plain syscall; ESRCH (the group already gone) is fine to ignore.
         unsafe { libc::kill(-pid, signal) };
+    }
+}
+
+/// Hang up on `child`'s process group, as sshd does when its client leaves, and reap it.
+/// A group still there when the grace period ends is killed: its client is gone, so
+/// nothing it runs is still wanted, and a session must not wait forever on a process
+/// that ignores the hang-up.
+pub async fn hangup_and_reap(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<process::ExitStatus> {
+    signal_group(child, libc::SIGHUP);
+    match time::timeout(HANGUP_GRACE, child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            signal_group(child, libc::SIGKILL);
+            child.wait().await
+        }
     }
 }
 
@@ -801,8 +821,8 @@ async fn srv_run_cmd_tty(
         reader_task(req_id, crate::messages::Fd::Stdout, master_read, tx_out).await;
     });
 
-    // The reader reports a client that went away; the kill is this task's, which reaps
-    // the command, so no signal can reach a group whose leader was reaped.
+    // The reader reports a client that went away; the hang-up is this task's, which
+    // reaps the command, so no signal can reach a group whose leader was reaped.
     let (gone_tx, mut gone) = oneshot::channel();
     let client_stream_reader = tokio::spawn(async move {
         let disconnected = loop {
@@ -825,17 +845,24 @@ async fn srv_run_cmd_tty(
                 None | Some(Err(_)) => break true,
             }
         };
+        // Its half of the master goes before the hang-up that follows.
+        drop(master_write);
         if disconnected {
             let _ = gone_tx.send(());
         }
     });
 
+    let mut hung_up = false;
     let status = select! {
         status = child.wait() => status?,
         Ok(()) = &mut gone => {
-            info!("command [{req_id}] client disconnected, killing its process group");
-            signal_group(&child, libc::SIGKILL);
-            child.wait().await?
+            info!("command [{req_id}] client disconnected, hanging up the command");
+            hung_up = true;
+            // Closing the master hangs up the session leader and ends the tty for every
+            // job on it, as a terminal would; the stream reader has dropped its half.
+            copy_out.abort();
+            let _ = (&mut copy_out).await;
+            hangup_and_reap(&mut child).await?
         }
     };
 
@@ -844,7 +871,9 @@ async fn srv_run_cmd_tty(
     // cancellation error is expected.
     client_stream_reader.abort();
     let _ = client_stream_reader.await;
-    if status.signal().is_some() {
+    if hung_up {
+        // the output copy is gone already
+    } else if status.signal().is_some() {
         copy_out.abort();
         let _ = copy_out.await;
     } else if !drain_until(&mut copy_out, time::Instant::now() + OUTPUT_DRAIN_GRACE).await? {

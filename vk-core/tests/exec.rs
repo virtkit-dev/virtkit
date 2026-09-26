@@ -484,6 +484,77 @@ async fn disconnect_kills_remote_process() {
     let _ = std::fs::remove_file(&pid_file);
 }
 
+/// Disconnecting a tty exec sends SIGHUP rather than SIGKILL: the shell records its
+/// trap, and the job it waits on exits well before the hang-up grace period ends.
+#[tokio::test]
+async fn disconnect_hangs_up_a_tty_exec() {
+    let addr = start_server("tty-hangup").await;
+    let pid_file = std::env::temp_dir().join(format!(
+        "virtkit-agent-test-{}-hangup.pid",
+        std::process::id()
+    ));
+    let hup_file = pid_file.with_extension("hup");
+    let _ = std::fs::remove_file(&pid_file);
+    let _ = std::fs::remove_file(&hup_file);
+    let (mut stream, mut sink) = connect(&addr).await.unwrap();
+    sink.send(Message::CmdExec(CmdExec {
+        name: "sh".into(),
+        args: vec![
+            "-c".into(),
+            format!(
+                r#"trap "echo hup > {}; exit" HUP; sleep 30 & echo $! > {}; wait"#,
+                hup_file.display(),
+                pid_file.display()
+            ),
+        ],
+        env: vec![],
+        clear_env: false,
+        mode: RunMode::Interactive,
+        tty: Some(Tty {
+            term: Some("xterm".into()),
+            rows: 24,
+            cols: 80,
+        }),
+        dir: None,
+        user: AMBIENT_USER,
+    }))
+    .await
+    .unwrap();
+    assert!(matches!(
+        stream.next().await.unwrap().unwrap(),
+        Message::StartOK
+    ));
+    let pid: i32 = timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(content) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = content.trim().parse()
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let started = Instant::now();
+    drop(stream);
+    drop(sink);
+    timeout(Duration::from_secs(10), async {
+        while !reaped_or_zombie(pid) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("remote process still alive after client disconnect");
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    let hup = std::fs::read_to_string(&hup_file).unwrap_or_default();
+    assert_eq!(hup.trim(), "hup", "the shell got no SIGHUP");
+    let _ = std::fs::remove_file(&pid_file);
+    let _ = std::fs::remove_file(&hup_file);
+}
+
 /// Drive a tty exec and return (stdout, exit code).
 async fn run_tty(addr: &SocketAddr, script: &str, rows: u16, cols: u16) -> (String, Option<i32>) {
     run_tty_as(addr, script, rows, cols, AMBIENT_USER).await

@@ -51,7 +51,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 
 use vk_core::addr::SocketAddr;
-use vk_core::exec::server::{ResolvedUser, give_tty, resolve_user};
+use vk_core::exec::server::{ResolvedUser, give_tty, hangup_and_reap, resolve_user};
 use vk_core::net::raw_listen;
 use vk_core::pty::{self, PtyMaster};
 
@@ -904,22 +904,10 @@ fn spawn_exec(user: &str, cmdline: &OsStr) -> Result<(Child, libc::uid_t)> {
 /// that arrives under it to its own stderr and leaves the channel's data stream untouched.
 const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 
-/// How long a hung-up process group gets to leave before it is killed outright.
-const HANGUP_GRACE: Duration = Duration::from_secs(5);
-
 /// The pid of `child` while it is unreaped: it leads its own process group (and, on a
 /// pty, its session), so the number stays its group's until the bridge reaps it.
 fn leader_pid(child: &Child) -> Option<libc::pid_t> {
     child.id().and_then(|p| libc::pid_t::try_from(p).ok())
-}
-
-/// Send `signal` to the whole process group `child` leads.
-fn signal_group(child: &Child, signal: libc::c_int) {
-    if let Some(pid) = leader_pid(child) {
-        // SAFETY: a plain syscall; the unreaped leader keeps the group id ours, and ESRCH
-        // (the group already gone) is fine to ignore.
-        unsafe { libc::kill(-pid, signal) };
-    }
 }
 
 /// The client's signal requests for one channel, and the uid they are sent as.
@@ -1000,21 +988,6 @@ fn signal_number(signal: &Sig) -> Option<libc::c_int> {
     })
 }
 
-/// Hang up on `child`'s process group, as sshd does when its client leaves, and reap it.
-/// A group still there when the grace period ends is killed: its client is gone, so
-/// nothing it runs is still wanted, and a bridge must not wait forever on a process that
-/// ignores the hang-up.
-async fn hangup_and_reap(child: &mut Child) -> u32 {
-    signal_group(child, libc::SIGHUP);
-    match tokio::time::timeout(HANGUP_GRACE, child.wait()).await {
-        Ok(status) => wait_code(status),
-        Err(_) => {
-            signal_group(child, libc::SIGKILL);
-            wait_code(child.wait().await)
-        }
-    }
-}
-
 /// Bridge a session channel to a login shell or command on a pty, applying window changes
 /// until either side closes or the connection ends. Report the exit status and close the
 /// channel. If the client leaves, hang up as a terminal would: close the pty master,
@@ -1072,7 +1045,7 @@ async fn pty_bridge(
             // session and ends its tty (reads see EOF, writes EIO), so even a shell that
             // traps SIGHUP comes off the pty. The signals are for whatever stays anyway.
             drop(master);
-            hangup_and_reap(&mut child).await
+            wait_code(hangup_and_reap(&mut child).await)
         }
     };
     let _ = handle.exit_status_request(id, code).await;
@@ -1146,7 +1119,7 @@ async fn exec_bridge(
         out_task.abort();
         err_task.abort();
         // The status has no one to go to.
-        hangup_and_reap(&mut child).await;
+        let _ = hangup_and_reap(&mut child).await;
         return;
     };
     // Let the pumps drain the command's last output, unless the connection goes first.
