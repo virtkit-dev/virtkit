@@ -340,7 +340,7 @@ async fn do_handle_conn(
     }
 }
 
-fn build_command(cmd: &CmdExec) -> Command {
+fn build_command(cmd: &CmdExec, user: Option<SessionUser>) -> Command {
     let mut command = Command::new(&cmd.name);
     command.args(&cmd.args);
     if cmd.clear_env {
@@ -354,15 +354,30 @@ fn build_command(cmd: &CmdExec) -> Command {
     if let Some(dir) = &cmd.dir {
         command.current_dir(dir);
     }
-    // Drop to the requested user (per-command override) or the guest's default
-    // (the image's USER, exported as VIRTKIT_DEFAULT_RUN_USER by the microVM init).
-    if let Some(user) = run_as(
-        cmd.user.as_deref(),
-        std::env::var("VIRTKIT_DEFAULT_RUN_USER").ok(),
-    ) {
-        apply_user(&mut command, cmd, &user);
+    if let Some(user) = user {
+        apply_user(&mut command, cmd, user);
     }
     command
+}
+
+/// The command's user spec and its lookup result.
+struct SessionUser {
+    spec: String,
+    resolved: std::io::Result<ResolvedUser>,
+}
+
+/// Who `cmd` runs as: its per-command override, else the guest's default (the image's
+/// USER, exported as VIRTKIT_DEFAULT_RUN_USER by the microVM init). `None` keeps the
+/// agent's own user.
+fn session_user(cmd: &CmdExec) -> Option<SessionUser> {
+    run_as(
+        cmd.user.as_deref(),
+        std::env::var("VIRTKIT_DEFAULT_RUN_USER").ok(),
+    )
+    .map(|spec| SessionUser {
+        resolved: resolve_user(&spec),
+        spec,
+    })
 }
 
 /// Resolve which Unix user to drop to: the per-command override wins, otherwise the
@@ -570,18 +585,19 @@ pub fn resolve_user(spec: &str) -> std::io::Result<ResolvedUser> {
 
 /// Configure `command` to exec as `user`: set HOME/USER/LOGNAME (unless the
 /// caller already provided them) and register a pre_exec that drops privileges.
-fn apply_user(command: &mut Command, cmd: &CmdExec, user: &str) {
+fn apply_user(command: &mut Command, cmd: &CmdExec, user: SessionUser) {
     let has_env = |key: &str| {
         cmd.env
             .iter()
             .any(|e| e.split_once('=').map(|(k, _)| k == key).unwrap_or(false))
     };
 
-    match resolve_user(user) {
+    let SessionUser { spec, resolved } = user;
+    match resolved {
         Ok(ru) => {
             // USER/LOGNAME name the login user, so export only the user part — never the
             // raw `user:group` spec, whose group half is not part of the name.
-            let login = split_user_group(user).0;
+            let login = split_user_group(&spec).0;
             if !cmd.clear_env && !has_env("USER") {
                 command.env("USER", login);
             }
@@ -612,7 +628,7 @@ fn apply_user(command: &mut Command, cmd: &CmdExec, user: &str) {
         }
         Err(e) => {
             // Can't fail build_command's signature; surface it as a spawn error.
-            let msg = format!("virtkit-agent: cannot run as user {user:?}: {e}");
+            let msg = format!("virtkit-agent: cannot run as user {spec:?}: {e}");
             unsafe {
                 command.pre_exec(move || Err(std::io::Error::other(msg.clone())));
             }
@@ -681,7 +697,7 @@ async fn srv_run_cmd_tty(
         }
     };
 
-    let mut command = build_command(&cmd);
+    let mut command = build_command(&cmd, session_user(&cmd));
     if let Some(term) = &tty.term {
         command.env("TERM", term);
     }
@@ -807,7 +823,7 @@ async fn srv_run_cmd(
     cmd: CmdExec,
 ) -> Result<(), anyhow::Error> {
     info!("command [{}] {}", req_id, cmd);
-    let mut command = build_command(&cmd);
+    let mut command = build_command(&cmd, session_user(&cmd));
 
     match cmd.mode {
         RunMode::Background => {
@@ -1139,8 +1155,8 @@ async fn writer_task(
 #[cfg(test)]
 mod tests {
     use super::{
-        ExecWrapper, TaskState, apply_user, glob_match, inactivity_check_period, resolve_user,
-        run_as, split_user_group, wrap_cmd,
+        ExecWrapper, SessionUser, TaskState, apply_user, glob_match, inactivity_check_period,
+        resolve_user, run_as, split_user_group, wrap_cmd,
     };
     use crate::messages::{CmdExec, RunMode};
     use std::path::PathBuf;
@@ -1188,7 +1204,11 @@ mod tests {
         use std::ffi::OsStr;
         use tokio::process::Command;
         let mut command = Command::new("true");
-        apply_user(&mut command, &sample_cmd(), "root:0");
+        let user = SessionUser {
+            spec: "root:0".into(),
+            resolved: resolve_user("root:0"),
+        };
+        apply_user(&mut command, &sample_cmd(), user);
         let std_cmd = command.as_std();
         let env_val = |key| {
             std_cmd
