@@ -365,6 +365,13 @@ impl Handler for ServerHandler {
             row_height.min(u32::from(u16::MAX)) as u16,
             col_width.min(u32::from(u16::MAX)) as u16,
         );
+        // A change before the shell or command starts resizes the pty it will get.
+        if let Some(pty) = self.ptys.get_mut(&channel) {
+            (pty.rows, pty.cols) = size;
+            // A size the pty refuses is not worth failing the session over.
+            let _ = pty::set_winsize(pty.master.as_raw_fd(), size.0, size.1);
+            return Ok(());
+        }
         if self
             .resizes
             .get(&channel)
@@ -1460,6 +1467,34 @@ mod tests {
         .await;
         assert_eq!(String::from_utf8_lossy(&out.data), "30 100\r\n");
         assert_eq!(out.status, Some(0));
+    }
+
+    /// A window change between the pty request and the command resizes the pty the
+    /// command then starts on.
+    #[tokio::test]
+    async fn a_window_change_before_exec_sizes_the_pty() {
+        let test = test_session().await;
+        let mut channel = test.session.channel_open_session().await.unwrap();
+        channel
+            .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+            .await
+            .unwrap();
+        channel.window_change(100, 30, 0, 0).await.unwrap();
+        channel.exec(true, "stty size").await.unwrap();
+        let mut data = Vec::new();
+        let collect = async {
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    russh::ChannelMsg::Data { data: d } => data.extend_from_slice(&d),
+                    russh::ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), collect)
+            .await
+            .expect("the exec channel closes");
+        assert_eq!(String::from_utf8_lossy(&data), "30 100\r\n");
     }
 
     /// A pty request on a channel that already runs something is refused: nothing would

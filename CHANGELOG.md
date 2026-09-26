@@ -20,6 +20,8 @@ All notable changes to virtkit will be documented in this file.
   erase keys, echo and line handling follow the client, as with sshd.
 - **Signals sent over SSH reach the command in the VM.** A client's interrupt or terminate
   request now reaches the process group of what it ran, as with sshd.
+- **An SSH terminal resized before its shell starts opens at the new size.** It used to
+  keep the size of the pty request until the next resize.
 - **`--user <uid>` works in images without a user database.** A uid runs as-is, with
   group 0, when the guest has no `/etc/passwd` or its lookup service is unavailable, as it
   already did for a uid the database does not list.
