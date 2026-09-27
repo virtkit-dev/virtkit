@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.79.1] - 2026-09-27
+
 ### Fixed
 
 - **`vk run` exits with the guest command's status.** A command that exits 7 makes `vk run`
@@ -3124,7 +3126,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.79.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.79.1...HEAD
+[0.79.1]: https://github.com/virtkit-dev/virtkit/compare/v0.79.0...v0.79.1
 [0.79.0]: https://github.com/virtkit-dev/virtkit/compare/v0.78.0...v0.79.0
 [0.78.0]: https://github.com/virtkit-dev/virtkit/compare/v0.77.2...v0.78.0
 [0.77.2]: https://github.com/virtkit-dev/virtkit/compare/v0.77.1...v0.77.2
