@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A crashing guest command no longer dumps core on the host.** `vk exec` and `vk dev task`
+  die of the command's signal, but a guest segfault or abort leaves no core file or coredump
+  record behind for `vk`. `vk dev task` now also dies of a guest's SIGTERM instead of exiting
+  143.
+
 ## [0.79.0] - 2026-09-26
 
 ### Fixed

@@ -89,17 +89,45 @@ pub fn exit(result: CmdResult) -> ExitCode {
         std::process::exit(code);
     }
     if let Some(signal) = result.signal {
-        // SAFETY: raising a signal at our own pid; if it is caught/ignored and
-        // returns, fall through to the conventional 128+signal encoding.
-        unsafe { libc::kill(std::process::id() as i32, signal) };
+        reraise(signal);
         return ExitCode::from(128u8.wrapping_add(signal as u8));
     }
     ExitCode::SUCCESS
 }
 
+/// Re-raise `signal` despite vk's handlers (runs catch SIGTERM for shutdown), without
+/// dumping core for a guest crash. Reject invalid or non-terminating signals from the
+/// untrusted agent: a stop signal would suspend `vk`.
+fn reraise(signal: i32) {
+    let non_terminating = [
+        libc::SIGCHLD,
+        libc::SIGCONT,
+        libc::SIGURG,
+        libc::SIGWINCH,
+        libc::SIGSTOP,
+        libc::SIGTSTP,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+    ];
+    if !(1..=libc::SIGRTMAX()).contains(&signal) || non_terminating.contains(&signal) {
+        return;
+    }
+    // SAFETY: plain syscalls on this process's own signal state and flags; a failure falls
+    // through to the caller's 128+n.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        libc::signal(signal, libc::SIG_DFL);
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, signal);
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::raise(signal);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{check_env, run};
+    use super::{check_env, reraise, run};
     use vk_core::exec::client::Stdin;
 
     #[test]
@@ -111,6 +139,46 @@ mod tests {
         // An entry without '=' is rejected, and the message names the offender.
         let err = check_env(&["OK=1".into(), "NOPE".into()]).unwrap_err();
         assert!(err.to_string().contains("NOPE"), "{err}");
+    }
+
+    #[test]
+    fn reraise_dies_of_a_hooked_signal_without_core() {
+        extern "C" fn swallow(_: libc::c_int) {}
+        for signal in [libc::SIGTERM, libc::SIGABRT] {
+            // SAFETY: the child runs only async-signal-safe calls before it dies or `_exit`s.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                // Mimic a run's tokio handler and block the signal to test unblocking.
+                unsafe {
+                    libc::signal(signal, swallow as *const () as libc::sighandler_t);
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, signal);
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+                }
+                reraise(signal);
+                unsafe { libc::_exit(0) };
+            }
+            let mut status = 0;
+            // SAFETY: reaping the child forked above.
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(
+                libc::WIFSIGNALED(status),
+                "signal {signal}: status {status:#x}"
+            );
+            assert_eq!(libc::WTERMSIG(status), signal);
+            assert!(!libc::WCOREDUMP(status), "signal {signal} dumped core");
+        }
+    }
+
+    #[test]
+    fn reraise_returns_for_a_number_that_does_not_terminate() {
+        // Filtered before any syscall, so these run in the test process itself: a stop
+        // signal must not suspend it, nor 0 or an out-of-range number reach the kernel.
+        for signal in [0, -1, libc::SIGSTOP, libc::SIGTSTP, libc::SIGCHLD, 1000] {
+            reraise(signal);
+        }
     }
 
     #[tokio::test]
