@@ -6,6 +6,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`vk run` exits with the guest command's status.** A command that exits 7 makes `vk run`
+  exit 7, and one killed by a signal ends `vk run` with that signal, as `vk exec` already
+  did. It used to exit 1 whatever the command's status, and print an error line for it, which
+  it no longer does. With `--require-cached`, exit 3 can now also be the command's own status
+  rather than a cache miss.
 - **A crashing guest command no longer dumps core on the host.** `vk exec` and `vk dev task`
   die of the command's signal, but a guest segfault or abort leaves no core file or coredump
   record behind for `vk`. `vk dev task` now also dies of a guest's SIGTERM instead of exiting

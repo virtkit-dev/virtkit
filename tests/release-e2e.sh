@@ -5,9 +5,9 @@
 # what is tested is what ships. Two identity checks come first and are preconditions — the
 # sha256 sidecars beside the binaries, and vk's version against the release tag (`vk update`
 # compares the two, so a mismatch breaks self-update); neither is worth booting a microVM
-# past. Then `vk check`, a plain image boot, and every other script in this directory, each
-# against the same vk. A failure there does not stop the run: every script reports, and the
-# exit status is non-zero if any of them failed.
+# past. Then `vk check`, a plain image boot, `vk run`'s exit status, and every other script
+# in this directory, each against the same vk. A failure there does not stop the run: every
+# script reports, and the exit status is non-zero if any of them failed.
 #
 #   VK=./dist/vk tests/release-e2e.sh                     # a local build, every script
 #   VK=./dist/vk tests/release-e2e.sh tests/systemd-boot-e2e.sh  # the smoke checks + these
@@ -118,8 +118,27 @@ check_boot() {
 }
 export -f check_boot
 
+# vk run reproduces the guest's exit code or terminating signal. A shell reports 143 for
+# both SIGTERM and exit(143); use python3 when available to distinguish their wait statuses.
+check_exit_status() {
+  local rc=0
+  "$VK" run docker.io/library/alpine:3.21 -- sh -c 'exit 7' || rc=$?
+  [ "$rc" -eq 7 ] || { echo "FAIL: guest exit 7 came back as $rc"; return 1; }
+  rc=0
+  "$VK" run docker.io/library/alpine:3.21 -- sh -c 'kill -TERM $$' || rc=$?
+  [ "$rc" -eq 143 ] || { echo "FAIL: a guest killed by SIGTERM came back as $rc, not 143"; return 1; }
+  command -v python3 >/dev/null || { echo "note: no python3, death by signal not checked"; return 0; }
+  python3 -c '
+import subprocess, sys
+r = subprocess.run(sys.argv[1:]).returncode
+r == -15 or sys.exit(f"FAIL: vk run returned {r}, not a death by SIGTERM")' \
+    "$VK" run docker.io/library/alpine:3.21 -- sh -c 'kill -TERM $$'
+}
+export -f check_exit_status
+
 step "vk check" "$VK" check
 step "boot an image" check_boot
+step "guest exit status" check_exit_status
 # Every other script here is an end-to-end test of some part of vk; a new one gates the
 # next release with no registration step. Naming scripts narrows the run to those.
 if [ "$#" -gt 0 ]; then

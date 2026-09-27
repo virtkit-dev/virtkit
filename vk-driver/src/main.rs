@@ -872,7 +872,8 @@ enum Cmd {
         /// restores from the instruction cache are allowed, but nothing may build
         ///
         /// A cache miss aborts with exit code 3, so scripts can branch cached-vs-cold without
-        /// paying for a build.
+        /// paying for a build. With a trailing command, a command that itself exits 3 looks
+        /// the same.
         #[arg(long = "require-cached", help_heading = "Instruction cache")]
         require_cached: bool,
         /// max stages built concurrently on the microVM backend
@@ -1315,7 +1316,9 @@ enum Cmd {
     ///
     /// The rootfs boots from a native ext4 disk (or a cpio initramfs in RAM with
     /// `--ram`), vk-agent runs as PID 1 over vsock, and the trailing command — or an
-    /// interactive shell — runs in the guest.
+    /// interactive shell — runs in the guest. Without `--detach`, `vk` exits with the guest
+    /// command's status, dying of its signal if it was killed; a run failure exits 1 and a
+    /// `--require-cached` miss exits 3. A `--shell` session exits 0 whatever its status.
     #[command(display_order = 1)]
     Run {
         /// Image to boot, e.g. `alpine:3.20`
@@ -3171,7 +3174,11 @@ async fn cli_main(cli: Cli) -> ExitCode {
         return match run::run(&args, &cfg).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) if build::not_cached(&e) => fail(&e, 3),
-            Err(e) => fail(&e, 1),
+            Err(e) => match run::guest_exit(&e) {
+                // Reproduce the guest's exit code or terminating signal, as `vk exec` does.
+                Some(result) => exec::exit(result),
+                None => fail(&e, 1),
+            },
         };
     }
     if let Cmd::DockerHash {

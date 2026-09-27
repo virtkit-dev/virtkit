@@ -188,8 +188,8 @@ pub enum SourceMode {
     Auto,
 }
 
-/// Preserve the guest command's non-zero exit as a typed run error so `vk dev task`
-/// reproduces its status and `vk run` reports the failure.
+/// Preserve the guest command's non-zero exit as a typed run error so `vk run` and
+/// `vk dev task` can reproduce its status.
 #[derive(Debug)]
 pub struct GuestExit(pub vk_core::messages::CmdResult);
 
@@ -3834,9 +3834,8 @@ async fn drive(
             }
         };
         timings.record(Phase::Exec, "", t_exec.elapsed());
-        // A signal counts as a failure like a non-zero code: it is carried out typed so
-        // `vk dev task` re-raises it, matching the attach path, and `vk run` reports it
-        // rather than the success that swallowing the signal would have claimed.
+        // Carry a signal as a typed failure, like a non-zero exit, so `vk run` and
+        // `vk dev task` re-raise it as the attach path does instead of reporting success.
         guest_status(result)?;
         // Ordinarily the startup command owns the run lifetime. An inactivity-managed detached
         // run instead leaves the exec server available for later `vk exec` calls. Its status
