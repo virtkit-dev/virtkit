@@ -2006,10 +2006,13 @@ fn plan_services(
     Ok(out)
 }
 
+/// The alias GitLab's docker executor gives the job container on a per-build network.
+const JOB_ALIAS: &str = "build";
+
 /// The per-job userspace switch (net.mode = "switch"): a tied supervisor child
 /// on the guest's vsock-bridge socket (`<vsock.sock>_<net_port>`) plus each
-/// service's, with the `[egress]` allowlist and the service aliases in the
-/// gateway resolver. Returns once every socket is bound.
+/// service's, with the `[egress]` allowlist, the service aliases and the job's
+/// names in the gateway resolver. Returns once every socket is bound.
 fn spawn_switch(
     ctx: &JobCtx,
     gateway: Ipv4Addr,
@@ -2049,6 +2052,11 @@ fn spawn_switch(
             reservations.push((crate::units::mac_for_ip(*extra), extra.to_string()));
         }
     }
+    // The job VM, dialed by the services as they dial each other: by its hostname and as
+    // `JOB_ALIAS`.
+    let job = [cfg.executor.vm.hostname.as_str(), JOB_ALIAS];
+    let job_hosts = crate::units::unclaimed_hosts(&job, &hosts, guest_ip);
+    hosts.extend(job_hosts);
     // Opt-in credential proxy: expose the runner's `[registry]` to the job at
     // `registry.vk`, injecting its credentials, so the job stays credential-free. The
     // switch redirects the sentinel (an unroutable class-E address) to the host-local

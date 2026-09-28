@@ -1293,6 +1293,10 @@ integration-test:
     - ./run-tests.sh                    # reaches the DB at host `db`
 ```
 
+A service reaches the job VM back as `build`, the alias GitLab's docker executor gives the
+job container on a per-build network, or by `[executor.vm] hostname`; a service aliased
+either name keeps that name.
+
 ### Per-service networking
 
 Each service is a real VM with its own address on the shared switch, so a service

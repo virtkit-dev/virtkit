@@ -359,7 +359,7 @@ fn read_merged_config(unit: &crate::compose::Unit, ext4: &Path) -> Result<RunCon
     Ok(crate::compose::merged_config(&image_cfg, unit))
 }
 
-/// Resolver entries for a VM outside the service list (a run's primary), using `names`
+/// Resolver entries for a VM outside the service list (a run's primary, a CI job VM), using `names`
 /// at `ip`. Preserve service names: the switch keeps the last entry, so appending a
 /// duplicate would override the service.
 pub fn unclaimed_hosts(
@@ -370,7 +370,7 @@ pub fn unclaimed_hosts(
     let mut hosts: Vec<(String, String)> = Vec::new();
     for name in names {
         let name = name.to_ascii_lowercase();
-        if claimed.iter().any(|(n, _)| *n == name) {
+        if claimed.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
             eprintln!(
                 "virtkit: warning: {name} resolves to the service that claims it, not to the VM at {ip}"
             );
@@ -867,10 +867,14 @@ mod tests {
     #[test]
     fn unclaimed_hosts_leaves_a_services_name_to_it() {
         let ip = Ipv4Addr::new(192, 168, 127, 2);
-        let claimed = vec![("web".to_string(), "192.168.127.254".to_string())];
-        // Skip claimed names, deduplicate, and lowercase names to match switch lookups.
+        let claimed = vec![
+            ("web".to_string(), "192.168.127.254".to_string()),
+            ("Build".to_string(), "192.168.127.253".to_string()),
+        ];
+        // Skip claimed names in any case, deduplicate, and lowercase names to match switch
+        // lookups.
         assert_eq!(
-            unclaimed_hosts(&["Dev", "web", "dev"], &claimed, ip),
+            unclaimed_hosts(&["Dev", "web", "dev", "build"], &claimed, ip),
             vec![("dev".to_string(), "192.168.127.2".to_string())]
         );
     }

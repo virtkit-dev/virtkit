@@ -10,6 +10,9 @@ All notable changes to virtkit will be documented in this file.
   `vk run --primary` VM by service name and hostname, like any other service. A non-service
   primary answers to `vm`. Previously, proxies needed its address because its name did not
   resolve.
+- **CI services resolve the job VM.** A `services:` VM reaches the job as `build`, the
+  alias GitLab's docker executor gives the job container on a per-build network, or by
+  `[executor.vm] hostname`.
 
 ## [0.79.1] - 2026-09-27
 
