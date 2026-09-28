@@ -75,6 +75,15 @@ pub fn main(action: Action, args: &[String]) -> i32 {
         eprintln!("usage: vk-agent poweroff|reboot");
         return 2;
     }
+    // Neither branch below can do its job unprivileged: PID 1 can be neither signalled nor,
+    // when it is `vk-agent init`, identified (`/proc/1/exe` is root-only), and the init-less
+    // shutdown would terminate this user's own processes, then fail to freeze or end the
+    // machine and still report success. Refuse, so the caller falls back to its own stop.
+    // SAFETY: geteuid(2) has no failure mode.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("shutdown: not root");
+        return 1;
+    }
     if pid1_is_systemd() || pid1_is_this_agent() {
         // SAFETY: plain kill(2).
         if unsafe { libc::kill(1, action.signal()) } != 0 {
@@ -268,6 +277,17 @@ mod tests {
     fn usage_error_on_arguments() {
         assert_eq!(main(Action::PowerOff, &["now".to_string()]), 2);
         assert_eq!(main(Action::Reboot, &["now".to_string()]), 2);
+    }
+
+    #[test]
+    fn refuses_unprivileged() {
+        // SAFETY: geteuid(2).
+        if unsafe { libc::geteuid() } == 0 {
+            // As root, main would really shut the machine down.
+            return;
+        }
+        assert_eq!(main(Action::PowerOff, &[]), 1);
+        assert_eq!(main(Action::Reboot, &[]), 1);
     }
 
     #[test]

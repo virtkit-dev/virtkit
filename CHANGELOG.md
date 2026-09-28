@@ -6,6 +6,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Power off and reboot work with non-root images.** `vk stop`, `vk dev stop` and
+  the end of `vk run` now request poweroff as root instead of the image's user, avoiding
+  a minute's wait followed by a VM kill. `vk reboot` now reboots instead of reporting
+  success while leaving the VM running. Previously, non-systemd guests also sent SIGTERM
+  to that user's processes. Running `vk-agent poweroff` or `reboot` as a non-root user
+  in the guest now fails.
 - **Compose services resolve the primary by name.** Siblings can reach a `vk dev` or
   `vk run --primary` VM by service name and hostname, like any other service. A non-service
   primary answers to `vm`. Previously, proxies needed its address because its name did not
