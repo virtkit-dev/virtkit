@@ -52,6 +52,240 @@ pub(super) fn identity_path(plan: &Plan) -> PathBuf {
     plan.state_dir.join("dev.json")
 }
 
+/// `<state-dir>/not-ready`: the VM is up with no identity. The parent readying it writes one
+/// naming itself as it starts, and removes it once the identity is written; a failure
+/// rewrites it naming nobody. A joiner waits while the readier it names is alive, and takes
+/// the environment over once it names nobody or a process that is gone — killed mid-readying,
+/// say.
+///
+/// Where there is no marker at all, a joiner waits out `READY_WAIT` and fails, as it did
+/// before this existed: a parent killed between the VM coming up and its writing one, or one
+/// that cannot name itself (no start time to read from procfs).
+fn not_ready_path(plan: &Plan) -> PathBuf {
+    plan.state_dir.join("not-ready")
+}
+
+/// `<state-dir>/not-ready.lock`, held across every read-modify-write of the marker, so a
+/// claim, a readier's update and a readier dropping it never interleave.
+fn lock_not_ready(plan: &Plan) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = plan.state_dir.join("not-ready.lock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    f.lock()
+        .with_context(|| format!("locking {}", path.display()))?;
+    Ok(f)
+}
+
+/// A VM's managing `vk run` and registration time. These tie a marker to its VM so a
+/// replaced VM's parent cannot leave a marker that a joiner mistakes for the current VM's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct VmTie {
+    pub pid: u32,
+    pub created_secs: u64,
+}
+
+impl VmTie {
+    pub(super) fn of(vm: &crate::vms::VmEntry) -> Self {
+        Self {
+            pid: vm.pid,
+            created_secs: vm.created_secs,
+        }
+    }
+}
+
+/// A process by pid and start time, so a pid handed out again is not taken for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct Readier {
+    pub pid: u32,
+    /// `starttime` from `/proc/<pid>/stat`
+    pub started: u64,
+}
+
+impl Readier {
+    /// `pid` as it is now; `None` once it is gone or has exited, or where procfs does not say.
+    pub(super) fn of(pid: u32) -> Option<Self> {
+        Some(Self {
+            pid,
+            started: crate::usage::proc_starttime(i32::try_from(pid).ok()?)?,
+        })
+    }
+
+    /// Whether this process is still the one running under its pid.
+    fn alive(&self) -> bool {
+        Self::of(self.pid) == Some(*self)
+    }
+}
+
+/// What the marker records: the VM, the identity its readying would write, who is readying
+/// it, and how the readying stands.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct NotReady {
+    pub vm: VmTie,
+    pub digest: String,
+    pub manifest: serde_json::Value,
+    /// what that identity would have recorded as [`Identity::booted_secs`], carried over by
+    /// a claim so the environment's age stays that of its boot
+    pub booted_secs: u64,
+    /// the parent readying the VM; `None` once its readying failed
+    pub readier: Option<Readier>,
+    /// why the readying failed; empty while it is under way
+    pub why: String,
+}
+
+impl NotReady {
+    /// What became of the readying, for a message: why it failed, or that its parent went
+    /// before finishing.
+    pub(super) fn reason(&self) -> &str {
+        if self.why.is_empty() {
+            "the process readying it is gone"
+        } else {
+            &self.why
+        }
+    }
+
+    /// Nobody is readying the VM any more: the readying failed, or the parent it names is
+    /// gone. A marker that says neither — naming nobody with no failure — is never taken.
+    pub(super) fn abandoned(&self) -> bool {
+        (!self.why.is_empty() || self.readier.is_some()) && !self.readier.is_some_and(|r| r.alive())
+    }
+}
+
+/// Write the marker; the caller holds [`lock_not_ready`].
+fn write_not_ready(plan: &Plan, left: &NotReady) -> Result<()> {
+    let json = serde_json::to_vec(left).context("serializing it")?;
+    vk_fs::write_atomic(&not_ready_path(plan), &json, 0o600)
+}
+
+/// Record how this process's readying of the VM stands, for joiners and [`claim_not_ready`].
+/// Under [`lock_not_ready`], `update` gets the marker if it names this process — a claim
+/// left it, or this readying wrote it — and returns the one to write, or `None` for none. A
+/// marker another readying holds for the same VM is left alone. Whether one was written.
+pub(super) fn mark_own_not_ready(
+    plan: &Plan,
+    update: impl FnOnce(Option<&NotReady>) -> Option<NotReady>,
+) -> bool {
+    let written = lock_not_ready(plan).and_then(|_lock| {
+        let current = read_not_ready(plan);
+        let me = Readier::of(std::process::id());
+        let own = current.as_ref().filter(|l| me.is_some() && l.readier == me);
+        let Some(left) = update(own) else {
+            return Ok(false);
+        };
+        if own.is_none() && current.as_ref().is_some_and(|c| c.vm == left.vm) {
+            return Ok(false);
+        }
+        write_not_ready(plan, &left).map(|()| true)
+    });
+    written.unwrap_or_else(|e| {
+        eprintln!(
+            "virtkit: warning: could not record how readying the environment stands ({e:#}); \
+             a `vk dev` joining it waits for this boot to time out instead of taking it over"
+        );
+        false
+    })
+}
+
+/// Write `left` whatever the marker holds, as a readying elsewhere would.
+#[cfg(test)]
+pub(super) fn mark_not_ready(plan: &Plan, left: &NotReady) {
+    lock_not_ready(plan)
+        .and_then(|_lock| write_not_ready(plan, left))
+        .unwrap();
+}
+
+/// The marker as it stands, if it is there and readable.
+pub(super) fn read_not_ready(plan: &Plan) -> Option<NotReady> {
+    serde_json::from_slice(&std::fs::read(not_ready_path(plan)).ok()?).ok()
+}
+
+/// What a joiner may do with an environment a failed readying left behind.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LeftBehind {
+    /// take it over: it was booted from this config, or from one that differs only in what
+    /// readying it applies
+    Claim,
+    /// booted from a different configuration — what the drift policy decides about
+    Drifted,
+}
+
+/// What `left` is to a joiner whose config resolves to `digest`/`manifest`, with `running`
+/// the VM now up. `None` when the marker describes another VM, or none is up: nothing to
+/// take over.
+pub(super) fn left_behind(
+    left: &NotReady,
+    running: Option<VmTie>,
+    digest: &str,
+    manifest: &serde_json::Value,
+) -> Option<LeftBehind> {
+    if running != Some(left.vm) {
+        return None;
+    }
+    if left.digest == digest || applied_on_attach(&drift(&left.manifest, manifest)) {
+        Some(LeftBehind::Claim)
+    } else {
+        Some(LeftBehind::Drifted)
+    }
+}
+
+/// Claim an abandoned marker for `parent_pid`, the next readier. Under [`lock_not_ready`],
+/// `still` rechecks the current marker, which may differ from what the caller inspected.
+/// Naming the parent makes other joiners wait, so only one retries setup. Returns `None`
+/// if the marker can no longer be claimed or the parent cannot be named.
+///
+/// Clear the recorded failure so a later parent death is reported instead of the old error.
+/// Keep the old error in the returned marker.
+pub(super) fn claim_not_ready(
+    plan: &Plan,
+    parent_pid: u32,
+    still: impl FnOnce(&NotReady) -> bool,
+) -> Option<NotReady> {
+    let _lock = lock_not_ready(plan).ok()?;
+    let mut left = read_not_ready(plan).filter(|left| left.abandoned() && still(left))?;
+    left.readier = Some(Readier::of(parent_pid)?);
+    let why = std::mem::take(&mut left.why);
+    write_not_ready(plan, &left).ok()?;
+    left.why = why;
+    Some(left)
+}
+
+/// The marker a claim left for this parent to ready `vm` from: `Some` only when it names this
+/// process, as it runs now, and that VM. A fresh boot has none.
+pub(super) fn claimed_for_me(plan: &Plan, vm: Option<VmTie>) -> Option<NotReady> {
+    let _lock = lock_not_ready(plan).ok()?;
+    read_not_ready(plan)
+        .filter(|l| l.readier.is_some() && l.readier == Readier::of(std::process::id()))
+        .filter(|l| Some(l.vm) == vm)
+}
+
+/// Remove the marker once this parent is done readying the VM, unless it no longer names
+/// this parent: then it is another readying's.
+pub(super) fn drop_own_not_ready(plan: &Plan) {
+    let Some(me) = Readier::of(std::process::id()) else {
+        return;
+    };
+    let Ok(_lock) = lock_not_ready(plan) else {
+        return;
+    };
+    if read_not_ready(plan).is_some_and(|l| l.readier == Some(me)) {
+        let _ = std::fs::remove_file(not_ready_path(plan));
+    }
+}
+
+/// Clear the marker before a new boot: it describes the VM that boot replaces. Best effort,
+/// as for the identity removed beside it; a marker left names that VM, which no joiner takes
+/// for the new one.
+pub(super) fn clear_not_ready(plan: &Plan) {
+    let _lock = lock_not_ready(plan);
+    let _ = std::fs::remove_file(not_ready_path(plan));
+}
+
 /// What the last boot recorded for this environment. A file that is absent or unreadable —
 /// a state dir never booted, or one an older `vk` wrote in another shape — means nothing to
 /// compare against, which callers report as unknown rather than mistake for a match.
@@ -450,7 +684,207 @@ mod tests {
     use crate::dev::boot::ensure_state_dir;
     use crate::dev::config::Freshness;
     use crate::dev::plan::EnvVar;
-    use crate::dev::testutil::{mount, plan_in, scratch, shell};
+    use crate::dev::testutil::{env_guard, mount, plan_in, scratch, shell};
+
+    /// A marker for `vm`, as `after_boot` leaves it for `plan` when its readying fails.
+    fn left_for(plan: &Plan, vm: VmTie) -> NotReady {
+        let (digest, manifest) = identity_of(plan, None).unwrap();
+        NotReady {
+            vm,
+            digest,
+            manifest,
+            booted_secs: 1000,
+            readier: None,
+            why: "hooks.start: exited with 1".into(),
+        }
+    }
+
+    #[test]
+    fn a_marker_is_taken_over_once_nobody_readies_it_and_by_one_caller() {
+        let t = scratch("not-ready");
+        let plan = plan_in(&t.0);
+        std::fs::create_dir_all(&plan.state_dir).unwrap();
+        let vm = VmTie {
+            pid: 41,
+            created_secs: 7,
+        };
+        let pid = std::process::id();
+        let me = Readier::of(pid).expect("this process has a start time");
+        // Nothing marked: a boot in flight is waited for, not taken over.
+        assert!(read_not_ready(&plan).is_none());
+        assert!(claim_not_ready(&plan, pid, |_| true).is_none());
+
+        // A live readier is a boot in flight; one whose pid now runs another process, or
+        // none (its readying failed), has left the VM to whoever claims it.
+        let mut left = left_for(&plan, vm);
+        left.readier = Some(me);
+        assert!(!left.abandoned());
+        mark_not_ready(&plan, &left);
+        assert!(claim_not_ready(&plan, pid, |_| true).is_none());
+        assert_eq!(
+            read_not_ready(&plan).unwrap().readier,
+            Some(me),
+            "left as it was"
+        );
+        left.readier = Some(Readier {
+            pid,
+            started: me.started + 1,
+        });
+        assert!(left.abandoned());
+        left.readier = None;
+        assert!(left.abandoned());
+        // Naming nobody without a failure says nothing about who readies it: not taken.
+        left.why.clear();
+        assert!(!left.abandoned());
+        left.why = "hooks.start: exited with 1".into();
+
+        mark_not_ready(&plan, &left);
+        assert!(
+            claim_not_ready(&plan, pid, |_| false).is_none(),
+            "a marker that no longer passes is not taken"
+        );
+        let taken = claim_not_ready(&plan, pid, |_| true).expect("it was put back");
+        assert_eq!((taken.booted_secs, taken.readier), (1000, Some(me)));
+        assert_eq!(
+            taken.why, "hooks.start: exited with 1",
+            "for the claimer to report"
+        );
+        let now = read_not_ready(&plan).unwrap();
+        assert_eq!(
+            (now.readier, now.why.as_str()),
+            (Some(me), ""),
+            "back where joiners look, naming the claimer's parent and no failure"
+        );
+        assert!(
+            claim_not_ready(&plan, pid, |_| true).is_none(),
+            "and only the first caller takes it over"
+        );
+        // A parent procfs cannot name is never made the readier.
+        mark_not_ready(&plan, &left);
+        assert!(claim_not_ready(&plan, NO_PID, |_| true).is_none());
+        assert_eq!(read_not_ready(&plan).unwrap().readier, None);
+
+        // The parent finds what was claimed for it, for the VM it readies only, and drops
+        // the marker once ready — not one naming another readier.
+        let other = VmTie {
+            pid: 42,
+            created_secs: 7,
+        };
+        claim_not_ready(&plan, pid, |_| true).unwrap();
+        assert!(claimed_for_me(&plan, Some(other)).is_none());
+        assert_eq!(claimed_for_me(&plan, Some(vm)).unwrap().vm, vm);
+        drop_own_not_ready(&plan);
+        assert!(read_not_ready(&plan).is_none());
+        mark_not_ready(&plan, &left);
+        drop_own_not_ready(&plan);
+        assert!(read_not_ready(&plan).is_some(), "not this parent's to drop");
+
+        // A new boot drops the marker.
+        clear_not_ready(&plan);
+        assert!(read_not_ready(&plan).is_none());
+    }
+
+    /// A pid no process has: pids stay below `pid_max`, which is at most 2^22.
+    const NO_PID: u32 = 1 << 22;
+
+    #[test]
+    fn a_process_that_is_gone_is_nobody_to_wait_on() {
+        // No readier to name, and a marker naming a process that has gone is abandoned.
+        assert_eq!(Readier::of(NO_PID), None);
+        let t = scratch("gone-readier");
+        let plan = plan_in(&t.0);
+        let mut left = left_for(
+            &plan,
+            VmTie {
+                pid: 41,
+                created_secs: 7,
+            },
+        );
+        left.why.clear();
+        left.readier = Some(Readier {
+            pid: NO_PID,
+            started: 1,
+        });
+        assert!(left.abandoned());
+        assert_eq!(left.reason(), "the process readying it is gone");
+    }
+
+    #[test]
+    fn a_claim_waits_for_whoever_is_rewriting_the_marker() {
+        let _env = env_guard();
+        let t = scratch("not-ready-lock");
+        let plan = plan_in(&t.0);
+        std::fs::create_dir_all(&plan.state_dir).unwrap();
+        let pid = std::process::id();
+        let mut left = left_for(
+            &plan,
+            VmTie {
+                pid: 41,
+                created_secs: 7,
+            },
+        );
+        left.readier = Some(Readier {
+            pid,
+            started: Readier::of(pid).unwrap().started + 1,
+        });
+        mark_not_ready(&plan, &left);
+        // A readier updating the marker holds the lock across its read and write; a claim
+        // meanwhile waits and then sees what it wrote — here, a live readier.
+        let held = lock_not_ready(&plan).unwrap();
+        std::thread::scope(|s| {
+            let claim = s.spawn(|| claim_not_ready(&plan, pid, |_| true));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!claim.is_finished(), "the claim waits for the lock");
+            left.readier = Readier::of(pid);
+            write_not_ready(&plan, &left).unwrap();
+            drop(held);
+            assert!(claim.join().unwrap().is_none(), "the readier is alive");
+        });
+    }
+
+    #[test]
+    fn only_the_vm_a_marker_names_is_taken_over_and_only_from_its_config() {
+        let t = scratch("left-behind");
+        let mut plan = plan_in(&t.0);
+        plan.exec_env = vec![EnvVar {
+            name: "A".into(),
+            value: "one".into(),
+            sensitive: false,
+        }];
+        let vm = VmTie {
+            pid: 41,
+            created_secs: 7,
+        };
+        let left = left_for(&plan, vm);
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        assert_eq!(
+            left_behind(&left, Some(vm), &digest, &manifest),
+            Some(LeftBehind::Claim)
+        );
+        // Another VM is up — the one a later boot put in place, or the same pid refiled —
+        // or none is: the marker describes nothing that is running.
+        let later = VmTie {
+            pid: 41,
+            created_secs: 8,
+        };
+        assert_eq!(left_behind(&left, Some(later), &digest, &manifest), None);
+        assert_eq!(left_behind(&left, None, &digest, &manifest), None);
+        // A change readying applies is no obstacle; one that takes a restart is drift.
+        let mut session = plan.clone();
+        session.exec_env[0].value = "two".into();
+        let (digest, manifest) = identity_of(&session, None).unwrap();
+        assert_eq!(
+            left_behind(&left, Some(vm), &digest, &manifest),
+            Some(LeftBehind::Claim)
+        );
+        let mut restart = plan.clone();
+        restart.mem = Some("16G".into());
+        let (digest, manifest) = identity_of(&restart, None).unwrap();
+        assert_eq!(
+            left_behind(&left, Some(vm), &digest, &manifest),
+            Some(LeftBehind::Drifted)
+        );
+    }
 
     #[test]
     fn the_identity_fingerprints_secrets_instead_of_recording_them() {

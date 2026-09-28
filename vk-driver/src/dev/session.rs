@@ -11,7 +11,8 @@ use crate::dev::plan::{Plan, Source};
 use super::boot::{alias, take_transition};
 use super::hooks::run_start_hooks;
 use super::identity::{
-    booted_wrapper_digest, generation_of, identity_of, own_version, root_identity, write_identity,
+    NotReady, Readier, VmTie, booted_wrapper_digest, claimed_for_me, drop_own_not_ready,
+    generation_of, identity_of, mark_own_not_ready, own_version, root_identity, write_identity,
 };
 use super::{Identity, Transition};
 
@@ -54,10 +55,21 @@ pub async fn after_boot(plan: &Plan) -> Result<()> {
     let transition = take_transition(plan, std::process::id())
         .await
         .unwrap_or(Transition::Reused);
+    // A marker a claim left naming this process is this parent's to ready even without the
+    // child's note, which is best effort: joiners wait on this parent for as long as it lives.
+    let booted = transition == Transition::Booted
+        || claimed_for_me(plan, running_vm(plan).map(|vm| VmTie::of(&vm))).is_some();
+    // Say who readies the VM before anything else takes time, so a joiner that finds this
+    // parent gone takes the environment over rather than waiting out `READY_WAIT`.
+    let readying = if booted {
+        Some(begin_readying(plan)?)
+    } else {
+        None
+    };
     // Whichever this is, the session environment is the config's rather than the boot's:
     // it is what the *next* session should see.
     sync_session_env(plan).await;
-    if transition == Transition::Reused {
+    let Some(readying) = readying else {
         // Attaching to what is running, which may not be what the config now says: the
         // recorded identity stays the running environment's own, and the hooks that belong
         // to a start do not run, and the session change applied above is not recorded, so
@@ -67,8 +79,112 @@ pub async fn after_boot(plan: &Plan) -> Result<()> {
         // longer match go first.
         reconcile_publishers(plan);
         return publish_endpoints(plan).await;
+    };
+    if readying.claimed {
+        // As on reuse, remove relays the failed parent started that no longer match: the
+        // claim permits endpoint edits (see `left_behind`).
+        reconcile_publishers(plan);
     }
+    ready_or_mark(plan, &readying, || {
+        running_vm(plan).map(|vm| VmTie::of(&vm))
+    })
+    .await
+}
+
+/// What this parent readies: the VM, the identity it would record, and whether a joiner's
+/// claim handed it over.
+struct Readying {
+    booted: Option<VmTie>,
+    digest: String,
+    manifest: serde_json::Value,
+    /// what the identity records as the boot time, for the age in `vk dev list`: a
+    /// takeover's is the one its marker carried over, a fresh boot's when its readying began
+    booted_secs: u64,
+    claimed: bool,
+}
+
+/// Start readying the VM now up: take over what a claim by this invocation's child left for
+/// it, and write the marker naming this parent as the readier, in one step under the marker's
+/// lock. A parent procfs cannot name writes none, so joiners wait out `READY_WAIT` rather
+/// than take over a readying still under way.
+fn begin_readying(plan: &Plan) -> Result<Readying> {
+    let booted = running_vm(plan).map(|vm| VmTie::of(&vm));
     let (digest, manifest) = identity_of(plan, booted_wrapper_digest(plan).as_deref())?;
+    let mut readying = Readying {
+        booted,
+        booted_secs: crate::vms::unix_now(),
+        claimed: false,
+        digest,
+        manifest,
+    };
+    mark_own_not_ready(plan, |own| {
+        let vm = booted?;
+        if let Some(claimed) = own.filter(|l| l.vm == vm) {
+            readying.booted_secs = claimed.booted_secs;
+            readying.claimed = true;
+        }
+        Some(NotReady {
+            vm,
+            digest: readying.digest.clone(),
+            manifest: readying.manifest.clone(),
+            booted_secs: readying.booted_secs,
+            readier: Some(Readier::of(std::process::id())?),
+            why: String::new(),
+        })
+    });
+    Ok(readying)
+}
+
+/// Run [`ready_booted`], then drop this parent's marker; on failure, rewrite it naming
+/// nobody — only if `running()`, checked after failure, still matches the VM this parent
+/// readies. A replacement VM belongs to its own parent; with none, the marker is dropped.
+async fn ready_or_mark(
+    plan: &Plan,
+    readying: &Readying,
+    running: impl FnOnce() -> Option<VmTie>,
+) -> Result<()> {
+    let readied = ready_booted(
+        plan,
+        &readying.digest,
+        &readying.manifest,
+        readying.booted_secs,
+    )
+    .await;
+    let Err(e) = &readied else {
+        drop_own_not_ready(plan);
+        return readied;
+    };
+    let mut gone = false;
+    // Up but not ready, and this process, the one that would have finished it, is about to
+    // exit: say so, for the next `vk dev` to take over at once. Checked under the marker's
+    // lock, so what a replacement VM's parent writes meanwhile is not overwritten.
+    mark_own_not_ready(plan, |_| {
+        let vm = readying.booted.filter(|vm| running() == Some(*vm));
+        gone = vm.is_none();
+        Some(NotReady {
+            vm: vm?,
+            digest: readying.digest.clone(),
+            manifest: readying.manifest.clone(),
+            booted_secs: readying.booted_secs,
+            readier: None,
+            why: format!("{e:#}"),
+        })
+    });
+    if gone {
+        // The VM went while it was being readied: the marker describes nothing now up.
+        drop_own_not_ready(plan);
+    }
+    readied
+}
+
+/// The readying steps of a fresh boot — the endpoints, `hooks.create`, `hooks.start` and
+/// the identity recorded last — for the config that resolves to `digest`/`manifest`.
+async fn ready_booted(
+    plan: &Plan,
+    digest: &str,
+    manifest: &serde_json::Value,
+    booted_secs: u64,
+) -> Result<()> {
     // What was actually booted, read off the registry entry the boot filed. `None` where
     // there is no entry to read it from, which leaves the creation hook unstamped rather
     // than stamped with something that describes nothing.
@@ -83,11 +199,11 @@ pub async fn after_boot(plan: &Plan) -> Result<()> {
     write_identity(
         plan,
         &Identity {
-            digest,
-            booted_secs: crate::vms::unix_now(),
+            digest: digest.to_string(),
+            booted_secs,
             created_by: own_version(),
             generation: generation.unwrap_or_default(),
-            manifest,
+            manifest: manifest.clone(),
             storage_backings,
         },
     )
@@ -785,6 +901,7 @@ fn vm_at(state_dir: &Path) -> Option<crate::vms::VmEntry> {
 mod tests {
     use super::*;
     use crate::dev::boot::ensure_state_dir;
+    use crate::dev::identity::{mark_not_ready, read_not_ready};
     use crate::dev::plan::EnvVar;
     use crate::dev::testutil::{env_guard, plan_in, scratch};
 
@@ -867,6 +984,96 @@ mod tests {
         ]);
         assert_eq!(text, "GOOD=one\n");
         assert_eq!(skipped, ["MULTI", "ODD\\nNAME"]);
+    }
+
+    /// `ready_or_mark` with a stand-in VM: nothing here reaches a guest either.
+    #[tokio::test]
+    async fn a_failed_readying_marks_the_vm_it_readied_and_a_ready_one_is_not_marked() {
+        let t = scratch("ready-or-mark");
+        let mut plan = plan_in(&t.0);
+        plan.unresolved = vec!["${localEnv:TOKEN} is not set".into()];
+        ensure_state_dir(&plan).unwrap();
+        let identity = plan.state_dir.join("dev.json");
+        let marker = plan.state_dir.join("not-ready");
+        let vm = VmTie {
+            pid: 41,
+            created_secs: 7,
+        };
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let readying = |booted, booted_secs| Readying {
+            booted,
+            digest: digest.clone(),
+            manifest: manifest.clone(),
+            booted_secs,
+            claimed: false,
+        };
+        let me = Readier::of(std::process::id());
+        let under_way = || NotReady {
+            vm,
+            digest: digest.clone(),
+            manifest: manifest.clone(),
+            booted_secs: 1000,
+            readier: me,
+            why: String::new(),
+        };
+
+        // Ready: the identity is recorded, and the marker naming this parent is dropped. A
+        // take-over records the boot time it carried over.
+        mark_not_ready(&plan, &under_way());
+        ready_or_mark(&plan, &readying(Some(vm), 1000), || Some(vm))
+            .await
+            .unwrap();
+        let recorded: crate::dev::Identity =
+            serde_json::from_slice(&std::fs::read(&identity).unwrap()).unwrap();
+        assert_eq!(recorded.booted_secs, 1000);
+        assert!(!marker.exists(), "a ready environment is not marked");
+
+        // The last step fails — a directory where the identity goes — with the VM this
+        // parent readied still up: marked as naming nobody, with the identity it would have
+        // written, so a joiner takes it over at once.
+        std::fs::remove_file(&identity).unwrap();
+        std::fs::create_dir(&identity).unwrap();
+        mark_not_ready(&plan, &under_way());
+        let e = ready_or_mark(&plan, &readying(Some(vm), 1000), || Some(vm))
+            .await
+            .unwrap_err();
+        let left = read_not_ready(&plan).expect("a failed readying leaves the marker");
+        assert_eq!(
+            (left.vm, left.digest.as_str(), left.booted_secs),
+            (vm, digest.as_str(), 1000)
+        );
+        assert_eq!(left.why, format!("{e:#}"));
+        assert!(left.readier.is_none() && left.abandoned());
+
+        // A marker another readying holds for that VM by then is left as it is.
+        let other = Readier {
+            pid: std::process::id(),
+            started: me.unwrap().started + 1,
+        };
+        mark_not_ready(
+            &plan,
+            &NotReady {
+                readier: Some(other),
+                ..under_way()
+            },
+        );
+        ready_or_mark(&plan, &readying(Some(vm), 1000), || Some(vm))
+            .await
+            .unwrap_err();
+        let left = read_not_ready(&plan).unwrap();
+        assert_eq!((left.readier, left.why.as_str()), (Some(other), ""));
+
+        // Another VM up by the time the steps fail, or none: not this parent's to mark, and
+        // the marker it wrote as it began, which names a VM that is gone, is dropped.
+        mark_not_ready(&plan, &under_way());
+        ready_or_mark(&plan, &readying(Some(vm), 1000), || None)
+            .await
+            .unwrap_err();
+        assert!(!marker.exists());
+        ready_or_mark(&plan, &readying(None, 1000), || None)
+            .await
+            .unwrap_err();
+        assert!(!marker.exists());
     }
 
     /// `after_boot` in the parent, against a state dir with and without the note the child
@@ -978,22 +1185,86 @@ mod tests {
     }
 
     #[test]
+    fn readying_a_boot_names_this_process_in_the_marker() {
+        const CHILD: &str = "VK_TEST_SESSION_BEGIN_READYING";
+        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let tmp = scratch("begin-readying");
+            crate::dev::testutil::in_child(
+                "dev::session::tests::readying_a_boot_names_this_process_in_the_marker",
+                CHILD,
+                &tmp.0,
+            );
+            return;
+        };
+        let plan = plan_in(&tmp);
+        let _vm = crate::dev::testutil::register_vm(&plan);
+        let readying = begin_readying(&plan).unwrap();
+        let left = read_not_ready(&plan).expect("a marker");
+        assert_eq!(left.readier, Readier::of(std::process::id()));
+        assert!(left.why.is_empty() && !left.abandoned());
+        assert_eq!(Some(left.vm), readying.booted);
+        assert_eq!(left.booted_secs, readying.booted_secs);
+        assert!(!readying.claimed);
+
+        // A marker a claim left naming this process hands its boot time over.
+        let mut claimed = left;
+        claimed.booted_secs = 1000;
+        mark_not_ready(&plan, &claimed);
+        let readying = begin_readying(&plan).unwrap();
+        assert!(readying.claimed);
+        assert_eq!(read_not_ready(&plan).unwrap().booted_secs, 1000);
+    }
+
+    /// The child's note is best effort: a claim's marker naming this parent is enough for it
+    /// to ready the environment, rather than leave joiners waiting on it for good.
+    #[tokio::test]
+    async fn a_claimed_environment_is_readied_even_without_the_childs_note() {
+        const CHILD: &str = "VK_TEST_SESSION_CLAIM_WITHOUT_NOTE";
+        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let tmp = scratch("claim-without-note");
+            crate::dev::testutil::in_child(
+                "dev::session::tests::a_claimed_environment_is_readied_even_without_the_childs_note",
+                CHILD,
+                &tmp.0,
+            );
+            return;
+        };
+        let mut plan = plan_in(&tmp);
+        plan.unresolved = vec!["${localEnv:TOKEN} is not set".into()];
+        let _vm = crate::dev::testutil::register_vm(&plan);
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        mark_not_ready(
+            &plan,
+            &NotReady {
+                vm: VmTie::of(&running_vm(&plan).unwrap()),
+                digest,
+                manifest,
+                booted_secs: 1000,
+                readier: Readier::of(std::process::id()),
+                why: String::new(),
+            },
+        );
+        after_boot(&plan).await.unwrap();
+        let recorded: crate::dev::Identity =
+            serde_json::from_slice(&std::fs::read(plan.state_dir.join("dev.json")).unwrap())
+                .unwrap();
+        assert_eq!(recorded.booted_secs, 1000);
+        assert!(
+            read_not_ready(&plan).is_none(),
+            "the readier's marker is dropped"
+        );
+    }
+
+    #[test]
     fn running_vm_finds_a_vm_registered_under_a_symlinked_state_base() {
         const CHILD: &str = "VK_TEST_SESSION_SYMLINKED_STATE";
         let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
-            let _guard = env_guard();
             let tmp = scratch("session-symlinked-state");
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "dev::session::tests::running_vm_finds_a_vm_registered_under_a_symlinked_state_base",
-                    "--nocapture",
-                ])
-                .env(CHILD, &tmp.0)
-                .env("XDG_DATA_HOME", tmp.0.join("data"))
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
+            crate::dev::testutil::in_child(
+                "dev::session::tests::running_vm_finds_a_vm_registered_under_a_symlinked_state_base",
+                CHILD,
+                &tmp.0,
+            );
             return;
         };
         // The registry records the run's canonical state dir; the plan reaches it through a

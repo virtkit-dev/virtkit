@@ -12,7 +12,8 @@ use crate::dev::plan::{Plan, Source};
 
 use super::hooks::{Where, check_requirements, note_lock, run_hook};
 use super::identity::{
-    applied_on_attach, drift, identity_of, identity_path, live_identity, note_older_creator,
+    LeftBehind, NotReady, VmTie, applied_on_attach, claim_not_ready, clear_not_ready, drift,
+    identity_of, identity_path, left_behind, live_identity, note_older_creator, read_not_ready,
     sha256_hex,
 };
 use super::session::{ask_on_terminal, on_terminal, running_vm, stop};
@@ -482,13 +483,17 @@ fn decide(
 
 /// Replace what is running with what the config now says: build, stop, and check that the
 /// way is clear. `false` when another boot took the environment over while this one was
-/// building and this process joined it instead — there is then nothing left to boot.
+/// building and this process joined it instead, or took over what that boot left not ready
+/// — there is then nothing left to boot. `digest`/`manifest` are this config's identity; a
+/// boot left not ready from another one is refused, the drift policy having been applied.
 async fn swap(
     plan: &Plan,
     cfg: &crate::config::Config,
     over: &Overrides,
     wait: bool,
     parent_pid: u32,
+    digest: &str,
+    manifest: &serde_json::Value,
 ) -> Result<bool> {
     // Build first, with the current environment still up and usable: a build that fails
     // then costs only time, and the boot below restores what this just cached rather than
@@ -506,17 +511,136 @@ async fn swap(
         bail!("the dev environment did not stop; not booting a new one");
     }
     if let Some(holder) = lock_holder(&plan.state_dir) {
-        if !wait {
-            bail!(
+        // This caller has already restarted into its config, so what the boot that took over
+        // leaves is taken over rather than restarted again, and one left from a different
+        // config is refused.
+        let joined = match take_over(plan, parent_pid, digest, manifest, false) {
+            Some(joined) => joined,
+            None if !wait => bail!(
                 "another boot of this environment ({holder}) took over while this one was \
                  rebuilding — wait for that one, or re-run without --no-wait"
-            );
-        }
-        wait_for_boot(plan).await?;
-        note_transition(plan, parent_pid, Transition::Reused);
+            ),
+            None => wait_for_boot(plan, parent_pid, digest, manifest, false).await?,
+        };
+        let transition = match joined {
+            Joined::Reused => Transition::Reused,
+            Joined::Claimed => Transition::Booted,
+            Joined::Drifted(left) => bail!("{}", refused(&left, digest)),
+            // `restart` is false above, so neither call returns this.
+            Joined::Restart => bail!(
+                "the environment the boot that took over left needs a restart — re-run \
+                 `vk dev refresh`"
+            ),
+        };
+        note_transition(plan, parent_pid, transition);
         return Ok(false);
     }
     Ok(true)
+}
+
+/// Outcome of joining another caller's boot.
+#[derive(Debug)]
+enum Joined {
+    /// the environment is ready
+    Reused,
+    /// this caller took over failed or abandoned setup
+    Claimed,
+    /// failed or abandoned setup from another config, subject to the caller's drift policy
+    /// if it has not already been applied
+    Drifted(NotReady),
+    /// a refresh restarts failed or abandoned setup regardless of its boot config
+    Restart,
+}
+
+/// The running VM's abandoned marker and its compatibility with `digest`/`manifest`
+/// (see [`left_behind`]). A live readier means a boot is in flight and returns `None`.
+fn not_ready_here(
+    plan: &Plan,
+    digest: &str,
+    manifest: &serde_json::Value,
+) -> Option<(NotReady, LeftBehind)> {
+    let left = read_not_ready(plan).filter(NotReady::abandoned)?;
+    let running = running_vm(plan).map(|vm| VmTie::of(&vm));
+    let how = left_behind(&left, running, digest, manifest)?;
+    Some((left, how))
+}
+
+/// Claim the marker [`not_ready_here`] found for the parent `parent_pid`, saying so: `false`
+/// when another caller got there first, or the marker is no longer one to claim.
+fn claim(plan: &Plan, parent_pid: u32, digest: &str, manifest: &serde_json::Value) -> bool {
+    let Some(left) = claim_not_ready(plan, parent_pid, |left| {
+        let running = running_vm(plan).map(|vm| VmTie::of(&vm));
+        left_behind(left, running, digest, manifest) == Some(LeftBehind::Claim)
+    }) else {
+        return false;
+    };
+    eprintln!(
+        "virtkit: the environment is up but its last boot did not finish readying it ({}) — \
+         doing that now",
+        left.reason()
+    );
+    true
+}
+
+/// How an environment left not ready from another configuration is described.
+fn not_ready_summary(left: &NotReady, digest: &str) -> String {
+    format!(
+        "the environment is up but its last boot did not finish readying it ({}), and it was \
+         booted from a different configuration (booted {}, now {})",
+        left.reason(),
+        short(&left.digest),
+        short(digest)
+    )
+}
+
+/// The refusal for such an environment, where nothing restarts it.
+fn refused(left: &NotReady, digest: &str) -> String {
+    format!(
+        "{} — `vk dev refresh` reboots it into this one, or `vk dev stop` ends it",
+        not_ready_summary(left, digest)
+    )
+}
+
+/// Take over an environment a failed or abandoned readying left behind, for the parent
+/// `parent_pid`: [`Joined::Claimed`] once claimed, `None` when there is nothing to take over
+/// or another caller claimed it first. One booted from another configuration is
+/// [`Joined::Drifted`], for the caller's drift policy — not readied with this config, which
+/// would record it as booted from a config it was not. With `restart`, a refresh's, either is
+/// [`Joined::Restart`] instead: the caller restarts it.
+fn take_over(
+    plan: &Plan,
+    parent_pid: u32,
+    digest: &str,
+    manifest: &serde_json::Value,
+    restart: bool,
+) -> Option<Joined> {
+    match not_ready_here(plan, digest, manifest)? {
+        _ if restart => Some(Joined::Restart),
+        (_, LeftBehind::Claim) => {
+            claim(plan, parent_pid, digest, manifest).then_some(Joined::Claimed)
+        }
+        (left, LeftBehind::Drifted) => Some(Joined::Drifted(left)),
+    }
+}
+
+/// Whether to restart an environment left not ready from another configuration: `Ok` to
+/// restart it when the freshness policy's `decision` says so, an error for anything else.
+/// Attaching to it as recorded, as for a drifted identity, is not on offer, since nothing
+/// ready is recorded. A refresh restarts it without asking (see [`Joined::Restart`]).
+fn restart_left_behind(
+    decision: impl FnOnce() -> Result<Drifted>,
+    left: &NotReady,
+    digest: &str,
+) -> Result<()> {
+    match decision()? {
+        Drifted::Restart => Ok(()),
+        Drifted::Reuse(why) => bail!(
+            "{}; {why}, but there is nothing ready to attach to — `vk dev refresh` reboots it \
+             into this one, `vk dev stop` ends it",
+            not_ready_summary(left, digest)
+        ),
+        Drifted::Refuse => bail!("{}", refused(left, digest)),
+    }
 }
 
 /// The readable head of a digest. Taken by characters rather than bytes: these are read
@@ -622,28 +746,60 @@ pub async fn boot(
                 Drifted::Restart => {}
             }
         }
-        if !swap(plan, cfg, over, wait, parent_pid).await? {
+        if !swap(plan, cfg, over, wait, parent_pid, &digest, &manifest).await? {
             return Ok(());
         }
     } else if let Some(holder) = lock_holder(&plan.state_dir) {
-        if !wait {
-            bail!(
-                "another boot of this environment is already in flight ({holder}); its output \
-                 goes to the terminal that started it — wait for that one, or re-run \
+        // Up with nothing recorded: a boot still readying it, which this waits for, or one
+        // whose readying failed or was abandoned, which this takes over — found now or while
+        // waiting. One booted from another configuration gets the freshness policy, as a
+        // drifted identity does; a refresh restarts it whatever it was booted from, found now
+        // or while waiting alike.
+        let joined = match take_over(plan, parent_pid, &digest, &manifest, refresh) {
+            Some(joined) => joined,
+            None if !wait => bail!(
+                "another boot of this environment is already in flight ({holder}); its \
+                 output goes to the terminal that started it — wait for that one, or re-run \
                  without --no-wait"
-            );
+            ),
+            None => wait_for_boot(plan, parent_pid, &digest, &manifest, refresh).await?,
+        };
+        match joined {
+            Joined::Reused => {
+                note_transition(plan, parent_pid, Transition::Reused);
+                return Ok(());
+            }
+            Joined::Claimed => {
+                note_transition(plan, parent_pid, Transition::Booted);
+                return Ok(());
+            }
+            Joined::Restart => {}
+            Joined::Drifted(left) => restart_left_behind(
+                || {
+                    decide(
+                        over.freshness.unwrap_or(plan.freshness),
+                        on_terminal(),
+                        || ask_on_terminal("rebuild and restart it now?"),
+                    )
+                },
+                &left,
+                &digest,
+            )?,
         }
-        wait_for_boot(plan).await?;
-        note_transition(plan, parent_pid, Transition::Reused);
-        return Ok(());
+        if !swap(plan, cfg, over, wait, parent_pid, &digest, &manifest).await? {
+            return Ok(());
+        }
     }
 
     note_transition(plan, parent_pid, Transition::Booted);
     // What was recorded describes an environment that is about to be replaced, and nothing
-    // describes the new one until `after_boot` has it ready. Removing it now is what a
-    // joining `vk dev` waits on (see `wait_for_boot`); a removal that fails — including the
-    // first boot's, where there is no file — only leaves that wait to time out.
+    // describes the new one until `after_boot` has it ready or leaves it marked not ready.
+    // Removing both now is what a joining `vk dev` waits on (see `wait_for_boot`); a removal
+    // that fails — including the first boot's, where there is no file — only leaves that
+    // wait to time out, and a marker left in place names the VM being replaced, which no
+    // joiner takes for this one.
     let _ = std::fs::remove_file(identity_path(plan));
+    clear_not_ready(plan);
     let mut args = run_args(
         plan,
         snapshot.as_ref().map(|(p, _)| p.as_path()),
@@ -818,21 +974,46 @@ pub(crate) fn lock_holder(state_dir: &Path) -> Option<String> {
 const READY_WAIT: Duration = Duration::from_secs(300);
 
 /// Wait for the boot someone else started to produce a *ready* environment: a registered
-/// VM, and the identity written after it.
+/// VM, and the identity written after it — [`Joined::Reused`]. If that boot's readying fails
+/// or its parent dies instead, return what [`take_over`] makes of what it left for a caller
+/// whose config resolves to `digest`/`manifest`, with `restart` passed through; a claim
+/// another caller won leaves this one waiting on that caller's readying in turn.
 ///
 /// Waiting for the VM alone released this process while the boot's own parent was still
 /// publishing endpoints and pushing the session environment — two writers doing the same
 /// work at the same time.
-async fn wait_for_boot(plan: &Plan) -> Result<()> {
-    eprintln!("waiting for the boot already in flight …");
+async fn wait_for_boot(
+    plan: &Plan,
+    parent_pid: u32,
+    digest: &str,
+    manifest: &serde_json::Value,
+    restart: bool,
+) -> Result<Joined> {
+    let mut announced = false;
     let mut up_since = None;
+    let mut waited_on = None;
     loop {
         let up = running_vm(plan).is_some();
         if up && identity_path(plan).exists() {
-            return Ok(());
+            return Ok(Joined::Reused);
+        }
+        if up && let Some(joined) = take_over(plan, parent_pid, digest, manifest, restart) {
+            return Ok(joined);
+        }
+        if !announced {
+            eprintln!("waiting for the boot already in flight …");
+            announced = true;
         }
         if lock_holder(&plan.state_dir).is_none() {
             bail!("the boot that was in flight ended without leaving a running environment");
+        }
+        // A readier that took over from another gets the whole budget for its own readying.
+        let readier = read_not_ready(plan).and_then(|left| left.readier);
+        if readier != waited_on {
+            waited_on = readier;
+            if let Some(since) = &mut up_since {
+                *since = std::time::Instant::now();
+            }
         }
         if up
             && up_since
@@ -1307,6 +1488,78 @@ mod tests {
             Drifted::Reuse("not rebuilding")
         );
         assert!(decide(Freshness::Ask, true, || bail!("no stdin")).is_err());
+    }
+
+    #[test]
+    fn a_boot_left_not_ready_from_another_config_is_restarted_or_refused_never_attached() {
+        let left = NotReady {
+            vm: VmTie {
+                pid: 41,
+                created_secs: 7,
+            },
+            digest: "a".repeat(64),
+            manifest: serde_json::json!({}),
+            booted_secs: 0,
+            readier: None,
+            why: "hooks.start: exited with 1".into(),
+        };
+        let now = "b".repeat(64);
+        assert!(restart_left_behind(|| Ok(Drifted::Restart), &left, &now).is_ok());
+        let reuse = restart_left_behind(|| Ok(Drifted::Reuse("freshness = reuse")), &left, &now)
+            .unwrap_err()
+            .to_string();
+        assert!(reuse.contains("nothing ready to attach to"), "{reuse}");
+        assert!(reuse.contains("hooks.start: exited with 1"), "{reuse}");
+        let refuse = restart_left_behind(|| Ok(Drifted::Refuse), &left, &now)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refuse.contains("booted aaaaaaaaaaaa, now bbbbbbbbbbbb"),
+            "{refuse}"
+        );
+    }
+
+    #[test]
+    fn a_failed_readying_is_claimed_or_under_a_refresh_restarted() {
+        const CHILD: &str = "VK_TEST_BOOT_TAKE_OVER";
+        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let tmp = scratch("take-over");
+            crate::dev::testutil::in_child(
+                "dev::boot::tests::a_failed_readying_is_claimed_or_under_a_refresh_restarted",
+                CHILD,
+                &tmp.0,
+            );
+            return;
+        };
+        let plan = plan_in(&tmp);
+        let _vm = crate::dev::testutil::register_vm(&plan);
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let pid = std::process::id();
+        assert!(
+            take_over(&plan, pid, &digest, &manifest, true).is_none(),
+            "nothing left"
+        );
+        crate::dev::identity::mark_not_ready(
+            &plan,
+            &NotReady {
+                vm: VmTie::of(&running_vm(&plan).unwrap()),
+                digest: digest.clone(),
+                manifest: manifest.clone(),
+                booted_secs: 1000,
+                readier: None,
+                why: "hooks.start: exited with 1".into(),
+            },
+        );
+        let joined = take_over(&plan, pid, &digest, &manifest, true);
+        assert!(matches!(joined, Some(Joined::Restart)), "{joined:?}");
+        let joined = take_over(&plan, pid, &digest, &manifest, false);
+        assert!(matches!(joined, Some(Joined::Claimed)), "{joined:?}");
+        let left = read_not_ready(&plan).unwrap();
+        assert_eq!(left.readier, crate::dev::identity::Readier::of(pid));
+        assert!(
+            take_over(&plan, pid, &digest, &manifest, true).is_none(),
+            "a claimed readying is waited on, even by a refresh"
+        );
     }
 
     #[test]

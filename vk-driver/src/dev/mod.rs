@@ -213,6 +213,42 @@ pub(super) mod testutil {
         }
     }
 
+    /// `plan`'s VM as up, managed by this process: its registry entry, and the state dir lock
+    /// its `vk run` would hold, which is what makes the registry read it as alive. Only in a
+    /// test process of its own, given a scratch `XDG_DATA_HOME`: the registry is per user.
+    pub(super) fn register_vm(plan: &Plan) -> (crate::vms::Registration, std::fs::File) {
+        std::fs::create_dir_all(&plan.state_dir).unwrap();
+        let entry = serde_json::from_value(serde_json::json!({
+            "state_dir": crate::vms::canonical(&plan.state_dir),
+            "pid": std::process::id(),
+            "label": "devcontainer",
+            "exec_addr": "unused",
+            "created_secs": 7
+        }))
+        .unwrap();
+        let registration = crate::vms::register(entry);
+        let lock = crate::dev::list::try_lock_state_dir(&plan.state_dir).expect("lock it");
+        (registration, lock)
+    }
+
+    /// Rerun test `name` in its own process with `XDG_DATA_HOME` under `dir` and `var` set to
+    /// `dir`. Check both success and the test count: a name matching no test also exits 0.
+    pub(super) fn in_child(name: &str, var: &str, dir: &Path) {
+        let _guard = env_guard();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(var, dir)
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("1 passed"),
+            "{name} did not run: {output:?}"
+        );
+    }
+
     pub(super) fn shell(line: &str) -> HookPlan {
         HookPlan::Command(HookCommand {
             run: crate::dev::config::Command::Shell(line.into()),

@@ -514,8 +514,7 @@ fn parse_stat(line: &str) -> Option<(i32, u64)> {
 /// `None` for a pid that is already gone, one procfs times against a boot it predates,
 /// or a procfs that does not answer.
 pub(crate) fn proc_age(pid: i32) -> Option<Duration> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let started = parse_starttime(&stat)?;
+    let started = proc_starttime(pid)?;
     let uptime: f64 = std::fs::read_to_string("/proc/uptime")
         .ok()?
         .split_whitespace()
@@ -528,13 +527,23 @@ pub(crate) fn proc_age(pid: i32) -> Option<Duration> {
     Duration::try_from_secs_f64(uptime - started as f64 / clock_ticks() as f64).ok()
 }
 
+/// Start time in clock ticks since boot; paired with `pid`, distinguishes reused pids.
+/// Returns `None` for a process that is gone or has exited, including one awaiting reap.
+pub(crate) fn proc_starttime(pid: i32) -> Option<u64> {
+    parse_starttime(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
 /// `starttime` — the clock ticks since boot at which the process started. Indexed from the
 /// last `)` for the same reason [`parse_stat`] is: the comm in between is free to contain
-/// spaces and parentheses.
+/// spaces and parentheses. `None` for a zombie or dead process (state `Z` or `X`): it has
+/// exited, whatever its entry still says.
 fn parse_starttime(line: &str) -> Option<u64> {
-    line.get(line.rfind(')')? + 1..)?
-        .split_whitespace()
-        .nth(19)? // starttime is field 22, i.e. the 20th after the comm
+    let mut fields = line.get(line.rfind(')')? + 1..)?.split_whitespace();
+    if matches!(fields.next()?, "Z" | "X") {
+        return None;
+    }
+    fields
+        .nth(18)? // starttime is field 22, i.e. the 19th after the state
         .parse()
         .ok()
 }
@@ -848,6 +857,8 @@ mod tests {
         assert_eq!(parse_starttime(STAT_LINE), Some(123_456));
         // A line that stops before starttime yields nothing rather than a wrong age.
         assert_eq!(parse_starttime("42 (vk) S 7"), None);
+        // An exited process awaiting its reap has no start time to match against.
+        assert_eq!(parse_starttime(&STAT_LINE.replace(") S ", ") Z ")), None);
         // This process started after the boot it is measured against, so it has an age;
         // a pid that cannot exist has none.
         assert!(proc_age(std::process::id() as i32).is_some());
