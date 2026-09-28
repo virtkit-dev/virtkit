@@ -19,7 +19,8 @@ use vk_core::status::{BOOT_PROBE_BUDGET, get_status_within};
 
 /// Maximum guest shutdown time, including the poweroff request. A systemd guest stops its units
 /// within this (its per-unit default is 90 s, though a service unit rarely approaches it).
-/// `vk-agent init` gives its service 20 s (`SERVICE_STOP_GRACE_SECS` in
+/// `vk-agent init` gives the guest's other processes 10 s (`TERM_GRACE` in
+/// `vk-agent/src/poweroff.rs`), then its service 20 s (`SERVICE_STOP_GRACE_SECS` in
 /// `vk-agent/src/init.rs`), then powers off regardless.
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(60);
 

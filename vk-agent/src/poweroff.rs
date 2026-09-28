@@ -5,8 +5,9 @@
 //!
 //! - systemd gets its poweroff/reboot request ([`SIG_POWEROFF`]/[`SIG_REBOOT`]): units stop,
 //!   filesystems unmount.
-//! - `vk-agent init` gets the same signal: it terminates its service, then ends the machine
-//!   with every filesystem frozen clean (`init`'s shutdown path).
+//! - `vk-agent init` gets the same signal: it terminates the workloads (see [`workloads`]) and
+//!   gives them a moment to exit, then stops its service, then ends the machine with every
+//!   filesystem frozen clean (`init`'s shutdown path).
 //! - Anything else — an entrypoint holding PID 1 — has no shutdown of its own, so it is done
 //!   from here: the other processes are terminated and given a moment to exit, then `sync`,
 //!   freeze every writable disk filesystem, and end the machine. An init that exits along with
@@ -20,6 +21,7 @@
 //! (ACPI S5) ends the VM and a reset (ACPI reset register) restarts it — which the host's VMM
 //! keeper relaunches in place. See [`end_machine`].
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -65,9 +67,10 @@ pub(crate) fn end_machine(action: Action) -> ! {
     std::process::exit(1)
 }
 
-/// Grace period after SIGTERM without an init. It is shorter than `vk-agent init`'s 20
-/// seconds because no init arranged an orderly stop for these processes.
-const TERM_GRACE: Duration = Duration::from_secs(10);
+/// Grace period after SIGTERM for processes no init stops in order: every process without an
+/// init, the workloads before `vk-agent init` stops its service. Shorter than that service's
+/// 20 seconds, so the two together stay well inside the host's own stop grace.
+pub(crate) const TERM_GRACE: Duration = Duration::from_secs(10);
 
 /// CLI entry for `vk-agent poweroff` / `vk-agent reboot`. Returns the process exit code.
 pub fn main(action: Action, args: &[String]) -> i32 {
@@ -167,14 +170,13 @@ fn shutdown_here(action: Action, spare: &[libc::pid_t]) -> ! {
     // SAFETY: getpid(2).
     let me = unsafe { libc::getpid() };
     let spare: Vec<libc::pid_t> = spare.iter().copied().chain([me]).collect();
-    for pid in user_pids(&spare) {
-        // SAFETY: plain kill(2); a process gone meanwhile is an ESRCH we ignore.
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-    }
-    let deadline = Instant::now() + TERM_GRACE;
-    while Instant::now() < deadline && !user_pids(&spare).is_empty() {
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    terminate(|| {
+        processes()
+            .into_iter()
+            .map(|p| p.pid)
+            .filter(|pid| !spare.contains(pid))
+            .collect()
+    });
     // SAFETY: sync(2).
     unsafe { libc::sync() };
     for mnt in writable_disk_mounts() {
@@ -184,17 +186,95 @@ fn shutdown_here(action: Action, spare: &[libc::pid_t]) -> ! {
     end_machine(action)
 }
 
-/// Live userspace processes except `spare`. Exclude PID 2, its kernel-thread children, and
+/// `vk-agent init`'s first stop step, run as PID 1: terminate the [`workloads`] around
+/// `service` (0 for none) and wait up to [`TERM_GRACE`] for them to exit.
+pub(crate) fn terminate_workloads(service: libc::pid_t) {
+    terminate(|| workloads(&processes(), service));
+}
+
+/// SIGTERM what `targets` lists, then wait up to [`TERM_GRACE`] until it lists nothing. Each
+/// poll signals what has appeared since, such as a new exec session or a child forked from a
+/// TERM trap, so it cannot hold the whole grace unsignalled.
+fn terminate(targets: impl Fn() -> Vec<libc::pid_t>) {
+    let deadline = Instant::now() + TERM_GRACE;
+    let mut signalled = HashSet::new();
+    loop {
+        let live = targets();
+        if live.is_empty() || Instant::now() >= deadline {
+            return;
+        }
+        // A pid recycled within the grace is not signalled again: negligible with pid_max's
+        // default range.
+        for pid in live.into_iter().filter(|pid| signalled.insert(*pid)) {
+            // SAFETY: plain kill(2); a process gone meanwhile is an ESRCH we ignore.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A live userspace process other than PID 1.
+struct Proc {
+    pid: libc::pid_t,
+    ppid: libc::pid_t,
+    /// Runs PID 1's own binary (same device and inode).
+    init_exe: bool,
+}
+
+/// Live userspace processes other than PID 1. Exclude PID 2, its kernel-thread children, and
 /// zombies; an init that does not reap would otherwise make every wait exhaust the grace.
-fn user_pids(spare: &[libc::pid_t]) -> Vec<libc::pid_t> {
+fn processes() -> Vec<Proc> {
     let Ok(procs) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
+    let exe = |pid: libc::pid_t| {
+        std::fs::metadata(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
+    };
+    let init = exe(1);
     procs
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().to_str()?.parse::<libc::pid_t>().ok())
-        .filter(|pid| *pid != 2 && !spare.contains(pid))
-        .filter(|pid| proc_status(*pid).is_some_and(|(ppid, state)| ppid != 2 && state != 'Z'))
+        .filter(|pid| *pid > 2)
+        .filter_map(|pid| {
+            let (ppid, state) = proc_status(pid)?;
+            (ppid != 2 && state != 'Z').then(|| Proc {
+                pid,
+                ppid,
+                init_exe: init.is_some() && exe(pid) == init,
+            })
+        })
+        .collect()
+}
+
+/// What `vk-agent init` terminates before it stops its service: the commands the host runs
+/// over the exec channel, the daemons they started — everything in `procs` but `service` and
+/// its descendants, which get the service's own stop, and every process running init's
+/// binary. Those are its helpers (the exec server, network bridges, forwarders, samplers),
+/// which workloads may flush through on SIGTERM, and the agent commands the host runs, such as
+/// `vk atop` watching the shutdown or the power-off request itself; the power-off ends them.
+/// A service descendant reparented to PID 1 (a daemonizing entrypoint's daemon) is no longer
+/// in the service's tree: it is a workload, signalled before the entrypoint's own stop.
+fn workloads(procs: &[Proc], service: libc::pid_t) -> Vec<libc::pid_t> {
+    let parent: HashMap<libc::pid_t, libc::pid_t> = procs.iter().map(|p| (p.pid, p.ppid)).collect();
+    // Walk up at most 64 parents so a corrupt chain cannot loop.
+    let in_service = |mut pid| {
+        for _ in 0..64 {
+            if pid == service {
+                return true;
+            }
+            match parent.get(&pid) {
+                Some(&ppid) => pid = ppid,
+                None => return false,
+            }
+        }
+        false
+    };
+    procs
+        .iter()
+        .filter(|p| !p.init_exe && !(service > 0 && in_service(p.pid)))
+        .map(|p| p.pid)
         .collect()
 }
 
@@ -311,11 +391,55 @@ mod tests {
     }
 
     #[test]
-    fn user_pids_spares_what_it_is_told_to() {
+    fn processes_lists_this_one_but_not_pid1() {
         // SAFETY: getpid(2).
         let me = unsafe { libc::getpid() };
-        assert!(user_pids(&[]).contains(&me));
-        assert!(!user_pids(&[me]).contains(&me));
+        let procs = processes();
+        assert!(procs.iter().any(|p| p.pid == me));
+        assert!(procs.iter().all(|p| p.pid > 2));
+    }
+
+    #[test]
+    fn workloads_spare_init_binary_and_the_service_tree() {
+        let proc = |pid, ppid, init_exe| Proc {
+            pid,
+            ppid,
+            init_exe,
+        };
+        let procs = [
+            proc(10, 1, true),   // exec server
+            proc(11, 1, true),   // network bridge
+            proc(20, 10, false), // a command the host ran
+            proc(21, 20, false), // its child
+            proc(22, 1, false),  // a daemon it started, reparented to PID 1
+            proc(23, 10, true),  // an agent command the host ran (`vk atop`, the power-off)
+            proc(24, 23, false), // a process that command started
+            proc(30, 1, false),  // the service
+            proc(31, 30, false), // its worker
+            proc(32, 31, false), // and that worker's child
+            proc(33, 1, false),  // a daemon the service started, reparented to PID 1
+            proc(40, 99, false), // parent gone from the table meanwhile
+        ];
+        assert_eq!(workloads(&procs, 30), [20, 21, 22, 24, 33, 40]);
+        // Without a service, only init's binary is spared.
+        assert_eq!(workloads(&procs, 0), [20, 21, 22, 24, 30, 31, 32, 33, 40]);
+    }
+
+    #[test]
+    fn workloads_survive_a_parent_cycle() {
+        let procs = [
+            Proc {
+                pid: 5,
+                ppid: 6,
+                init_exe: false,
+            },
+            Proc {
+                pid: 6,
+                ppid: 5,
+                init_exe: false,
+            },
+        ];
+        assert_eq!(workloads(&procs, 30), [5, 6]);
     }
 
     #[test]

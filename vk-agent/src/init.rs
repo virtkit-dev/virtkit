@@ -228,6 +228,7 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     crate::fsmark::watch();
     crate::memmark::watch(cmdline.get("VIRTKIT_MEMMARK").map(String::as_str) == Some("1"));
     crate::oomkills::watch(); // Record guest kernel OOM kills for the host.
+    start_stop_worker();
     install_term_handler();
     // Catch a host power-button press (the stop fallback when the exec channel is gone).
     crate::button::watch_power_button();
@@ -2694,7 +2695,8 @@ fn run_service(cmdline: &HashMap<String, String>, config: Option<&RunConfig>) ->
     );
 
     // VIRTKIT_DEBUG=1: fork, wait, then hold for inspection. This path installs no signal
-    // handler, so `vk-agent poweroff` reports success but the hold lasts until host teardown.
+    // handler, so `vk-agent poweroff` reports success but the hold, and every process in the
+    // guest, lasts until host teardown.
     if cmdline.get("VIRTKIT_DEBUG").map(String::as_str) == Some("1") {
         match fork_exec_wait(&argv) {
             Ok(code) => {
@@ -2740,7 +2742,9 @@ fn run_service(cmdline: &HashMap<String, String>, config: Option<&RunConfig>) ->
     };
 
     // Watch the power button and the kernel's OOM kills after the last fork, so the forked
-    // children never inherit these threads (matching `run_init`).
+    // children never inherit these threads (matching `run_init`). A stop requested before the
+    // worker starts goes straight to the service: the exec server is not up to run workloads.
+    start_stop_worker();
     crate::button::watch_power_button();
     crate::oomkills::watch();
 
@@ -2807,17 +2811,22 @@ fn reap_orphans_or_poweroff(service_pid: libc::pid_t) {
             } else {
                 -libc::WTERMSIG(status)
             };
-            info!(
-                "vk-agent init: service exited (code {code}) before its ports opened; powering off"
-            );
-            poweroff();
+            if end_on_service_exit() {
+                info!(
+                    "vk-agent init: service exited (code {code}) before its ports opened; \
+                     powering off"
+                );
+                poweroff();
+            }
         }
     }
 }
 
-/// Reap orphaned processes as PID 1; power off when the service child exits.
+/// Reap orphans as PID 1. On service exit, power off unless the stop worker is still giving
+/// workloads time to exit (see [`end_on_service_exit`]).
 /// If the optional exec server exits, log it and continue (service is the primary).
 fn supervise_service(service_pid: libc::pid_t, serve_pid: Option<libc::pid_t>) -> Result<()> {
+    let mut deferred = false;
     loop {
         let mut status: libc::c_int = 0;
         let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
@@ -2825,6 +2834,13 @@ fn supervise_service(service_pid: libc::pid_t, serve_pid: Option<libc::pid_t>) -
             let e = io::Error::last_os_error();
             match e.raw_os_error() {
                 Some(libc::EINTR) => continue,
+                // ECHILD after the service's exit was handed to the stop worker: it ends the
+                // machine once the grace is over, and the alarm `end_on_service_exit` armed
+                // bounds the wait.
+                Some(libc::ECHILD) if deferred => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
                 _ => break, // ECHILD: nothing left to wait on
             }
         }
@@ -2834,8 +2850,12 @@ fn supervise_service(service_pid: libc::pid_t, serve_pid: Option<libc::pid_t>) -
             -libc::WTERMSIG(status)
         };
         if pid == service_pid {
-            info!("vk-agent init: service exited (code {code}); ending the machine");
-            break;
+            info!("vk-agent init: service exited (code {code})");
+            if end_on_service_exit() {
+                break;
+            }
+            deferred = true;
+            continue;
         }
         if Some(pid) == serve_pid {
             info!("vk-agent init: exec server exited (code {code})");
@@ -3010,13 +3030,14 @@ fn fork_exec_wait(argv: &[String]) -> Result<i32> {
 
 /// Install shutdown handlers. SIGTERM and reboot requests reboot unless power-off was
 /// requested; SIGINT and the service-stop alarm use the same decision. A power-off request
-/// always powers off. First SIGTERM any running service and wait up to
-/// [`SERVICE_STOP_GRACE_SECS`] so applications such as databases can flush state.
+/// always powers off. A request first terminates the workloads (see [`start_stop_worker`]),
+/// then SIGTERMs any running service and waits up to [`SERVICE_STOP_GRACE_SECS`], so
+/// applications such as databases can flush state.
 fn install_term_handler() {
     // SAFETY: `poweroff` never returns and is async-signal-safe enough for this handler: it
     // uses `sync`, atomic `DISK_MOUNTS`/`REBOOT_REQUESTED`/`POWEROFF_REQUESTED` reads, raw
-    // open/ioctl/close, and `reboot`. The request handlers only store an atomic and call
-    // kill(2) and alarm(2) — or, with no service, `poweroff`.
+    // open/ioctl/close, and `reboot`. The request handlers only store atomics and call
+    // write(2) — or, before the stop worker runs, kill(2) and alarm(2) or `poweroff`.
     unsafe {
         // SIGTERM is how busybox's `reboot` signals PID 1, so treat it as a reboot request
         // (the host never SIGTERMs guest init — it uses SIG_POWEROFF or the ACPI button).
@@ -3063,8 +3084,19 @@ static POWEROFF_REQUESTED: std::sync::atomic::AtomicBool =
 /// Prevent repeated requests from re-signalling the service or extending the grace period.
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set once [`stop_service`] runs: from then on the service's exit ends the machine.
+static SERVICE_STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the first [`poweroff`] call, so a second one (the service-stop alarm, a racing
+/// supervision loop) waits for it rather than freezing and ending the machine again.
+static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Write end of the pipe that wakes [`start_stop_worker`]'s thread; negative until it runs.
+static STOP_WAKE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
 /// Service grace period after SIGTERM. systemd allows units 90 seconds; this single-service
-/// guest stays well below the host's own VMM shutdown grace period.
+/// guest stays well below the host's own VMM shutdown grace period, `poweroff::TERM_GRACE`
+/// for the workloads included.
 const SERVICE_STOP_GRACE_SECS: libc::c_uint = 20;
 
 extern "C" fn handle_poweroff_request(_sig: libc::c_int) {
@@ -3079,19 +3111,98 @@ extern "C" fn handle_reboot_request(_sig: libc::c_int) {
     begin_shutdown();
 }
 
+/// Hand the first stop request to the stop worker; before it runs, stop the service directly.
+fn begin_shutdown() {
+    if STOP_REQUESTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let wake = STOP_WAKE.load(std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: write(2) is async-signal-safe.
+    if wake >= 0 && unsafe { libc::write(wake, [0u8].as_ptr().cast(), 1) } == 1 {
+        return;
+    }
+    stop_service();
+}
+
+/// Terminate the workloads away from the signal handlers: `poweroff::terminate_workloads`
+/// reads `/proc` and sleeps through their grace. A thread waits on a pipe that
+/// [`begin_shutdown`] writes, then runs it and [`stop_service`]. Without the worker, a stop
+/// skips that step.
+fn start_stop_worker() {
+    let mut fds = [0; 2];
+    // SAFETY: pipe2(2) into a two-element array. CLOEXEC keeps both ends out of the guest's
+    // processes.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        warn!(
+            "vk-agent init: stop worker pipe: {}",
+            io::Error::last_os_error()
+        );
+        return;
+    }
+    let [wait, wake] = fds;
+    STOP_WAKE.store(wake, std::sync::atomic::Ordering::Relaxed);
+    let worker = std::thread::Builder::new().spawn(move || {
+        let mut byte = 0u8;
+        loop {
+            // SAFETY: read(2) of one byte into a local.
+            match unsafe { libc::read(wait, (&raw mut byte).cast(), 1) } {
+                1 => break,
+                n if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted => {}
+                // Not while `wake` is open; hand stop requests back to the handlers.
+                _ => return retire_stop_worker(wait),
+            }
+        }
+        crate::poweroff::terminate_workloads(
+            SERVICE_PID.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        stop_service();
+    });
+    if let Err(e) = worker {
+        warn!("vk-agent init: stop worker: {e}");
+        retire_stop_worker(wait);
+    }
+}
+
+/// Send stop requests back to the handlers' own [`stop_service`]. `wait` is closed but the
+/// write end kept open, so a handler that loaded it meanwhile fails with EPIPE and falls back
+/// too, rather than writing to a reused descriptor.
+fn retire_stop_worker(wait: libc::c_int) {
+    STOP_WAKE.store(-1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: closing the pipe's read end, which nothing else uses.
+    unsafe { libc::close(wait) };
+}
+
+/// Decide whether to end the machine after reaping the service. During the workloads' grace,
+/// defer to the stop worker so workloads can finish flushing. Clearing [`SERVICE_PID`] makes
+/// its [`stop_service`] call power off; an alarm bounds the wait if the worker stalls.
+fn end_on_service_exit() -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    // Clear before checking: whichever of this and `stop_service` runs second sees the other.
+    SERVICE_PID.store(0, SeqCst);
+    let deferred = STOP_REQUESTED.load(SeqCst) && !SERVICE_STOPPING.load(SeqCst);
+    if deferred {
+        info!("vk-agent init: service exited; ending the machine after the workloads' grace");
+        // The grace began before this exit, so it ends within TERM_GRACE; the margin keeps
+        // the alarm from cutting it short. No other alarm is pending: `stop_service` arms the
+        // service's, and it has not run (it would see no service and power off, arming none).
+        let backstop = crate::poweroff::TERM_GRACE.as_secs().saturating_add(5);
+        // SAFETY: alarm(2); its SIGALRM runs `handle_term`, which powers off.
+        unsafe { libc::alarm(libc::c_uint::try_from(backstop).unwrap_or(libc::c_uint::MAX)) };
+    }
+    !deferred
+}
+
 /// Stop the service (if any), then end the machine. With no service, end it now; otherwise
 /// SIGTERM the service and let its exit reach supervision, which ends the machine — the alarm
 /// bounds a service that ignores SIGTERM.
-fn begin_shutdown() {
-    let service = SERVICE_PID.load(std::sync::atomic::Ordering::Relaxed);
+fn stop_service() {
+    SERVICE_STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
+    let service = SERVICE_PID.load(std::sync::atomic::Ordering::SeqCst);
     if service <= 0 {
         poweroff()
-    } else if STOP_REQUESTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        return;
     }
-    // Service exit reaches supervision and ends the machine; the alarm bounds an ignored
-    // SIGTERM. Like `docker stop`, signal only the service process, so wrappers must forward
-    // SIGTERM. SAFETY: kill(2) and alarm(2) are async-signal-safe.
+    // Like `docker stop`, signal only the service process, so wrappers must forward SIGTERM.
+    // SAFETY: kill(2) and alarm(2) are async-signal-safe.
     unsafe {
         libc::kill(service, libc::SIGTERM);
         libc::alarm(SERVICE_STOP_GRACE_SECS);
@@ -3121,8 +3232,24 @@ fn supervise(serve_pid: libc::pid_t) -> Result<()> {
 
 /// Flush, then end the machine — power off, or reboot if [`REBOOT_REQUESTED`] is set and
 /// [`POWEROFF_REQUESTED`] is not. Host cleanup can still force-stop the VMM, but this path
-/// preserves a clean guest shutdown. Never returns.
+/// preserves a clean guest shutdown. Never returns; a second call waits (see [`ENDING`]).
 fn poweroff() -> ! {
+    // Block every signal on this thread first: a handler (the service-stop alarm, SIGINT)
+    // interrupting the winner would otherwise park in the loser's branch below, and the winner
+    // would never resume. Nothing after this waits for a signal on this thread.
+    // SAFETY: sigfillset(3) and pthread_sigmask(3) on a local set; both async-signal-safe.
+    unsafe {
+        let mut all: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut all);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
+    }
+    if ENDING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        loop {
+            // SAFETY: pause(2) is async-signal-safe; the first caller ends the machine, and
+            // with every signal blocked this thread just parks.
+            unsafe { libc::pause() };
+        }
+    }
     // SAFETY: async-signal-safe syscall (poweroff also runs from a signal handler).
     unsafe {
         libc::sync();

@@ -17,6 +17,12 @@ All notable changes to virtkit will be documented in this file.
   runs those steps again, with `--no-wait` too. If the configuration has since changed in a
   way that needs a restart, the freshness policy decides instead, as for any running
   environment.
+- **Stopping a VM lets its processes exit.** On guests booted with virtkit's own init (no
+  `--init image` or `--init entrypoint`), stopping or rebooting now sends SIGTERM to the
+  commands started with `vk run`, `vk exec` or `vk dev exec`, and to the daemons they
+  launched, and waits up to 10 seconds for them to exit before a compose service gets its
+  own stop. Previously they were cut off, so a database started that way ran crash recovery
+  on its next boot.
 - **Power off and reboot work with non-root images.** `vk stop`, `vk dev stop` and
   the end of `vk run` now request poweroff as root instead of the image's user, avoiding
   a minute's wait followed by a VM kill. `vk reboot` now reboots instead of reporting
