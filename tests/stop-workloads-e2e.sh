@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shutdown checks for guests running virtkit's own init.
-# Three checks, one detached run:
+# Four checks, one detached run:
 #
 # 1. A reboot request never turns into a power-off: the compose service `db` exits within a
 #    second of SIGTERM and counts its boots in a shared file; after `vk service reboot db`
@@ -8,7 +8,9 @@
 # 2. That reboot stops `db`'s workloads before its service: a daemon left in it by
 #    `vk exec --service db` records SIGTERM before the service's own TERM trap does.
 # 3. `vk stop` lets a daemon left in the primary by `vk exec` handle SIGTERM rather than
-#    meet the power cut.
+#    meet the power cut, and the command the run booted with handle it too.
+# 4. The stop powers `db` off alongside the primary: `db` stops while the primary's command
+#    is still in its TERM trap, and the whole stop stays well within `vk stop`'s 90 s.
 #
 # Run:  VK=./dist/vk tests/stop-workloads-e2e.sh
 # Needs: a `vk` with an embedded kernel/agent, KVM, and a registry to pull alpine.
@@ -38,7 +40,7 @@ services:
       - -c
       - >-
         echo boot >> /out/db-boots;
-        trap 'echo service >> /out/db-order; exit 0' TERM;
+        trap 'echo service >> /out/db-order; echo db >> /out/stop-order; exit 0' TERM;
         while :; do sleep 1; done
 EOF
 
@@ -64,6 +66,12 @@ daemon() {
   printf '%s' "trap 'echo term $op $1; exit 0' TERM; echo up > $1.up; while :; do sleep 1; done"
 }
 
+# The startup command outlasts `db`'s stop by a few seconds once it gets SIGTERM. Its `sleep`
+# ignores TERM: the guest's stop also signals processes that start during it.
+CMD="trap 'echo term > /out/cmd; (trap \"\" TERM; exec sleep 7); echo primary >> /out/stop-order
+exit 0' TERM
+while :; do sleep 1; done"
+
 # A writable `disk` volume makes the stop a guest power-off rather than a kill.
 echo "== boot a detached run: a primary and a service-mode compose service =="
 (
@@ -74,7 +82,7 @@ echo "== boot a detached run: a primary and a service-mode compose service =="
     -v "$VK:/usr/local/bin/vk:ro" \
     -v "$OUT:/out" \
     -v "$WORK/data.qcow2:/data:disk" \
-    "$IMAGE" -- true
+    "$IMAGE" -- sh -c "$CMD"
 ) || fail "the run did not start"
 "$VK" exec "$WORK" -- vk service up db
 wait_for 60 boots_are 1 || fail "the service did not boot (boots: $(boots))"
@@ -96,8 +104,18 @@ echo "== leave a daemon in the primary, then stop the run =="
 "$VK" exec "$WORK" -- \
   sh -c "setsid sh -c \"$(daemon /out/daemon)\" </dev/null >/dev/null 2>&1 &"
 wait_for 10 file_is "$OUT/daemon.up" up || fail "the daemon in the primary did not start"
+rm -f "$OUT/stop-order"
+started=$(date +%s)
 "$VK" stop "$WORK"
+took=$(($(date +%s) - started))
+echo "the stop took ${took}s"
 file_is "$OUT/daemon" term \
   || fail "the primary's daemon never saw SIGTERM (it recorded \"$(cat "$OUT/daemon" 2>/dev/null)\")"
+file_is "$OUT/cmd" term \
+  || fail "the startup command never saw SIGTERM (it recorded \"$(cat "$OUT/cmd" 2>/dev/null)\")"
+order=$(tr '\n' ' ' 2>/dev/null < "$OUT/stop-order" || true)
+[ "$order" = "db primary " ] || fail "db did not stop alongside the primary (recorded: $order)"
+[ "$took" -lt 45 ] || fail "the stop took ${took}s"
 
-echo "PASS: the service rebooted after its workloads stopped, and the stop let the daemon exit"
+echo "PASS: the service rebooted after its workloads stopped, and the stop let the daemon, the"
+echo "startup command and the service exit together"

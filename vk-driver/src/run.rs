@@ -2366,7 +2366,7 @@ async fn build_and_boot(
             Err(e) => {
                 teardown_run(
                     &mut ch,
-                    persistent.then_some(&addr),
+                    PowerOff::of(persistent, &addr),
                     &manager,
                     &mut aux_children,
                     &mut switch,
@@ -2399,7 +2399,7 @@ async fn build_and_boot(
         Err(e) => {
             teardown_run(
                 &mut ch,
-                persistent.then_some(&addr),
+                PowerOff::of(persistent, &addr),
                 &manager,
                 &mut aux_children,
                 &mut switch,
@@ -2421,7 +2421,7 @@ async fn build_and_boot(
             Err(e) => {
                 teardown_run(
                     &mut ch,
-                    persistent.then_some(&addr),
+                    PowerOff::of(persistent, &addr),
                     &manager,
                     &mut aux_children,
                     &mut switch,
@@ -2445,9 +2445,37 @@ async fn build_and_boot(
     // the guests to the VMM's parent-death signal and skipping the host-side teardown (the
     // poweroff request, the registry and mount cleanup, the summaries). Route both through
     // teardown instead.
-    let mut stopped = false;
-    let result = tokio::select! {
-        r = drive(
+    let stopping = CancellationToken::new();
+    let power_off = std::cell::Cell::new(PowerOff::of(persistent, &addr));
+    let stop = async {
+        tokio::select! {
+            _ = crate::shutdown::terminate_signal() => {}
+            _ = crate::detach::interrupt() => {}
+        }
+        println!("virtkit: stopping ...");
+        stopping.cancel();
+        if !persistent {
+            return;
+        }
+        // Power off while `run` still holds the command's session: the guest SIGKILLs a
+        // command whose client goes away, where its shutdown sends SIGTERM first.
+        if !crate::shutdown::ask_poweroff(&addr).await {
+            power_off.set(PowerOff::Refused);
+            return;
+        }
+        let at = Instant::now();
+        // The services power off alongside the primary; the teardown joins their stop.
+        let services = manager.clone().and_then(|mgr| {
+            std::thread::Builder::new()
+                .spawn(move || mgr.stop_all())
+                .ok()
+        });
+        power_off.set(PowerOff::Accepted { at, services });
+        // `run` ends as the VMM exits; the teardown takes over if it has not by the grace.
+        tokio::time::sleep(crate::shutdown::STOP_GRACE).await;
+    };
+    let run = async {
+        let result = drive(
             &mut ch,
             &addr,
             ssh_probe.as_ref(),
@@ -2459,21 +2487,27 @@ async fn build_and_boot(
             &image_workdir,
             &fallback_argv,
             &timings,
-        ) => r,
-        _ = crate::shutdown::terminate_signal() => {
-            println!("virtkit: stopping ...");
-            stopped = true;
-            Ok(())
+            &stopping,
+        )
+        .await;
+        if !stopping.is_cancelled() {
+            return result;
         }
-        _ = crate::detach::interrupt() => {
-            println!("virtkit: stopping ...");
-            stopped = true;
-            Ok(())
+        // During shutdown, a lost session or signalled command can make `drive` fail.
+        // Treat its result as the requested stop. Keep polling `stop` until the VMM exits
+        // so the power-off request can receive its answer.
+        while ch.try_wait().ok().flatten().is_none() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        Ok(())
+    };
+    let result = tokio::select! {
+        r = run => r,
+        () = stop => Ok(()),
     };
     // Fetch kills before power-off. Skip the bounded diagnostic after an explicit stop so an
     // unresponsive guest cannot delay teardown.
-    if !stopped
+    if !stopping.is_cancelled()
         && let Some(line) = crate::oomkills::line(
             crate::oomkills::fetch(&addr, None).await.as_deref(),
             "raise --mem",
@@ -2483,7 +2517,7 @@ async fn build_and_boot(
     }
     teardown_run(
         &mut ch,
-        persistent.then_some(&addr),
+        power_off.into_inner(),
         &manager,
         &mut aux_children,
         &mut switch,
@@ -2517,17 +2551,45 @@ async fn build_and_boot(
     result
 }
 
+/// The primary's power-off state when [`teardown_run`] takes over.
+enum PowerOff<'a> {
+    /// No power-off: a guest without a writable disk has nothing to lose to the kill.
+    Skip,
+    /// Not asked yet: ask the agent at this address, else press the power button.
+    Ask(&'a SocketAddr),
+    /// Asked, and the request failed or was refused: press the power button without asking
+    /// again.
+    Refused,
+    /// Accepted at `at`: wait out the grace from then. `services` is the siblings' stop, begun
+    /// alongside; without it, the teardown stops them itself.
+    Accepted {
+        at: Instant,
+        services: Option<std::thread::JoinHandle<()>>,
+    },
+}
+
+impl<'a> PowerOff<'a> {
+    /// Ask the primary at `addr` to power off only when it has a writable disk to keep whole.
+    fn of(persistent: bool, addr: &'a SocketAddr) -> Self {
+        if persistent {
+            Self::Ask(addr)
+        } else {
+            Self::Skip
+        }
+    }
+}
+
 /// Tear down every host-side child a run spawned — the VMM, the service manager, the
 /// --net switch and the aux children, and the ssh-agent / host-exec forwards.
 /// Used on both a clean exit and any error after the VMM is live, so a failed run leaks no
 /// children (a leaked `vk virtiofsd` would hold this binary's file busy for the next build).
 ///
-/// When `guest` supplies the primary's exec address, request its poweroff and wait until the
-/// `shutdown::STOP_GRACE` deadline before killing it. The manager powers off services during
-/// the same teardown. `None` skips the request and wait.
+/// Unless `primary` is [`PowerOff::Skip`], power the primary off as far as it has not been
+/// and wait until the `shutdown::STOP_GRACE` deadline before killing it. The services power
+/// off during the same grace.
 fn teardown_run(
     ch: &mut Child,
-    guest: Option<&SocketAddr>,
+    primary: PowerOff<'_>,
     manager: &Option<std::sync::Arc<crate::manager::Manager>>,
     aux_children: &mut Vec<Child>,
     switch: &mut Option<Child>,
@@ -2538,17 +2600,28 @@ fn teardown_run(
         let _ = f.kill();
         let _ = f.wait();
     }
-    let deadline = Instant::now() + crate::shutdown::STOP_GRACE;
-    let powering_off = match guest {
-        Some(addr) if ch.try_wait().ok().flatten().is_none() => {
-            // Ask the guest's agent to power off; if it cannot be reached, press the ACPI
-            // power button (SIGTERM to the VMM) so even a hung or agent-less guest still
-            // shuts down cleanly instead of being cut. Either way, wait for the VMM below.
-            crate::shutdown::request_poweroff(addr) || crate::shutdown::press_power_button(ch)
+    let mut deadline = Instant::now() + crate::shutdown::STOP_GRACE;
+    let (powering_off, services) = match primary {
+        PowerOff::Accepted { at, services } => {
+            deadline = at + crate::shutdown::STOP_GRACE;
+            (true, services)
         }
-        _ => false,
+        PowerOff::Skip => (false, None),
+        _ if ch.try_wait().ok().flatten().is_some() => (false, None),
+        // Ask the guest's agent to power off; if it cannot be reached, press the ACPI power
+        // button (SIGTERM to the VMM) so even a hung or agent-less guest still shuts down
+        // cleanly instead of being cut. Either way, wait for the VMM below.
+        PowerOff::Ask(addr) => (
+            crate::shutdown::request_poweroff(addr) || crate::shutdown::press_power_button(ch),
+            None,
+        ),
+        PowerOff::Refused => (crate::shutdown::press_power_button(ch), None),
     };
-    if let Some(mgr) = manager {
+    // Join the service shutdown started during the stop. If absent or panicked, stop
+    // the services here.
+    if !services.is_some_and(|s| s.join().is_ok())
+        && let Some(mgr) = manager
+    {
         mgr.stop_all();
     }
     if powering_off {
@@ -3747,16 +3820,22 @@ async fn drive(
     image_workdir: &str,
     fallback_argv: &[String],
     timings: &Timings,
+    stopping: &CancellationToken,
 ) -> Result<()> {
     // A reboot-capable guest can reset mid-run: the keeper stays alive and brings it back on
     // the same disks. Each pass waits for the agent, re-applies the ssh config, and re-runs
     // the workload; a keeper-alive transport error is a reboot. Ends when the command
-    // finishes without a reboot, or the VMM exits.
+    // finishes without a reboot, the VMM exits, or a stop begins before the command runs.
+    // Once `stopping` is cancelled the guest is going down, and a lost session is no reboot.
     let mut first_pass = true;
     loop {
         let t_boot = Instant::now();
         let deadline = t_boot + Duration::from_secs(args.boot_timeout_secs);
         loop {
+            // Drive nothing more in a guest a stop has begun taking down.
+            if stopping.is_cancelled() {
+                return Ok(());
+            }
             if let Some(status) = ch.try_wait()? {
                 // First boot: the VMM died before serving — a boot failure. On a later pass
                 // it means the guest powered off during the reboot wait; end cleanly.
@@ -3796,14 +3875,18 @@ async fn drive(
         // to the log and wake the foreground parent, which returns to the shell while this
         // process holds the VM below. A boot failure above bails before here, so it surfaces
         // in the foreground. A no-op unless this is the forked `--detach` child; only on the
-        // first boot (the parent is long gone by a later reboot).
+        // first boot (the parent is long gone by a later reboot). If stopping, skip readiness
+        // and command startup.
+        if stopping.is_cancelled() {
+            return Ok(());
+        }
         if first_pass && args.detach {
             crate::detach::signal_ready(args.detach_log.as_deref());
         }
         if args.shell {
             match run_shell(addr).await {
                 Ok(()) => return Ok(()),
-                Err(_) if ch.try_wait()?.is_none() => {
+                Err(_) if !stopping.is_cancelled() && ch.try_wait()?.is_none() => {
                     eprintln!("virtkit: guest rebooted — reconnecting");
                     first_pass = false;
                     continue;
@@ -3859,7 +3942,7 @@ async fn drive(
             // A dropped exec channel with a live keeper is a reboot: wait and re-run. A transient
             // vsock error is indistinguishable and re-runs a non-idempotent command; the boot loop
             // bounds it by `boot_timeout_secs`.
-            Err(_) if ch.try_wait()?.is_none() => {
+            Err(_) if !stopping.is_cancelled() && ch.try_wait()?.is_none() => {
                 eprintln!("virtkit: guest rebooted — re-running the command");
                 first_pass = false;
                 continue;
@@ -3899,7 +3982,11 @@ async fn drive(
                 } else {
                     failures = 0;
                 }
-                tokio::time::sleep(status_poll).await;
+                // On stop, interrupt the sleep and switch to watching for VMM exit.
+                tokio::select! {
+                    () = tokio::time::sleep(status_poll) => {}
+                    () = stopping.cancelled() => break,
+                }
             }
         }
         return Ok(());

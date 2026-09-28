@@ -23,6 +23,10 @@ All notable changes to virtkit will be documented in this file.
   launched, and waits up to 10 seconds for them to exit before a compose service gets its
   own stop. Previously they were cut off, so a database started that way ran crash recovery
   on its next boot.
+- **Stopping a VM lets the command it boots with exit.** When `vk stop` or `vk dev stop`
+  ends a `vk run` or `vk dev` VM with a writable disk, the command it booted with now gets
+  SIGTERM from the guest's shutdown, whatever its init. Previously it was killed as the stop
+  closed its session.
 - **Power off and reboot work with non-root images.** `vk stop`, `vk dev stop` and
   the end of `vk run` now request poweroff as root instead of the image's user, avoiding
   a minute's wait followed by a VM kill. `vk reboot` now reboots instead of reporting

@@ -350,6 +350,17 @@ pub(crate) fn request_poweroff(addr: &SocketAddr) -> bool {
     }
 }
 
+/// [`request_poweroff`] for a caller on its own runtime, whose futures stay polled meanwhile.
+pub(crate) async fn ask_poweroff(addr: &SocketAddr) -> bool {
+    match agent_command(addr, "poweroff", REQUEST_BUDGET).await {
+        Ok(accepted) => accepted,
+        Err(e) => {
+            eprintln!("virtkit: run VM: poweroff request failed ({e:#})");
+            false
+        }
+    }
+}
+
 /// Wait for SIGTERM, as sent by `vk stop` and `vk publish stop`.
 /// If the handler cannot be installed, wait forever and leave SIGTERM's default termination
 /// in place.
