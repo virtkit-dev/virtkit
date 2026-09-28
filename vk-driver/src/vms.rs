@@ -161,7 +161,7 @@ impl Freshness {
 
 /// Recompute a recipe's build key and compare it to the key its image carries (the ext4 UUID is
 /// `fingerprint([stage_key])`). Resolves base image digests, so this does network I/O — only on
-/// `--stale`, never plain `list`.
+/// `--stale` or a refresh deciding whether to keep a boot it joined, never plain `list`.
 fn freshness_of_recipe(r: &StaleRecipe) -> Freshness {
     // Read the on-disk image's stamped key first: it's a cheap local stat, and if the image is
     // absent (a `build:` service that was never started/built) there is nothing to compare, so
@@ -204,6 +204,27 @@ pub fn freshness_all(entry: &VmEntry) -> Freshness {
             .map_or(Freshness::Unknown, freshness_of_recipe)
     });
     combine(std::iter::once(freshness(entry)).chain(services))
+}
+
+/// Whether every image the VM was booted from is known to match the sources: its own root
+/// image and each service's must be `Fresh`. Stricter than [`freshness_all`], where one
+/// known-current component outweighs undeterminable ones — here an `Unknown` counts against
+/// it, whether an image boot, an image gone or a key that could not be recomputed. A service
+/// booted from a prebuilt image carries no recipe and counts as unknown too: its tag may have
+/// moved since, which a boot would pull. Resolves base image digests, so this does network
+/// I/O.
+pub fn all_fresh(entry: &VmEntry) -> bool {
+    all_fresh_by(entry, freshness_of_recipe)
+}
+
+/// [`all_fresh`], each recipe judged by `verdict`.
+fn all_fresh_by(entry: &VmEntry, verdict: impl Fn(&StaleRecipe) -> Freshness) -> bool {
+    let fresh = |r: &StaleRecipe| verdict(r) == Freshness::Fresh;
+    entry.stale_recipe.as_ref().is_some_and(fresh)
+        && entry
+            .services
+            .iter()
+            .all(|s| s.stale_recipe.as_ref().is_some_and(fresh))
 }
 
 /// Fold component verdicts: any `Stale` wins, else any `Fresh`, else `Unknown`.
@@ -1998,6 +2019,46 @@ mod tests {
             stale_recipe: None,
         });
         assert_eq!(freshness_all(&e), Freshness::Unknown);
+    }
+
+    #[test]
+    fn all_fresh_needs_the_vm_and_every_service_known_current() {
+        let recipe = |name: &str| StaleRecipe {
+            dockerfiles: Vec::new(),
+            contexts: Vec::new(),
+            build_contexts: Vec::new(),
+            build_args: Vec::new(),
+            target: None,
+            root_ext4: PathBuf::from(name),
+        };
+        // Each recipe's verdict is named by its image path.
+        let verdict = |r: &StaleRecipe| match r.root_ext4.to_str() {
+            Some("fresh") => Freshness::Fresh,
+            Some("stale") => Freshness::Stale,
+            _ => Freshness::Unknown,
+        };
+        let service = |name: &str, image: Option<&str>| ServiceEntry {
+            name: name.into(),
+            exec_addr: "unused".into(),
+            stale_recipe: image.map(recipe),
+        };
+        let mut e = entry(PathBuf::from("/state/img"), None);
+        // An image boot has nothing known current.
+        assert!(!all_fresh_by(&e, verdict));
+        e.stale_recipe = Some(recipe("fresh"));
+        assert!(all_fresh_by(&e, verdict));
+        e.services.push(service("web", Some("fresh")));
+        assert!(all_fresh_by(&e, verdict));
+        // A service not known current counts against it: stale, undeterminable, or booted
+        // from a prebuilt image, which has nothing to judge.
+        for image in [Some("stale"), Some("unknown"), None] {
+            e.services.push(service("worker", image));
+            assert!(!all_fresh_by(&e, verdict), "{image:?}");
+            e.services.pop();
+        }
+        // As does the VM's own image not known current, whatever its services say.
+        e.stale_recipe = Some(recipe("unknown"));
+        assert!(!all_fresh_by(&e, verdict));
     }
 
     #[test]

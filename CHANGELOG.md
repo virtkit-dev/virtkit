@@ -11,6 +11,9 @@ All notable changes to virtkit will be documented in this file.
   reuse a replacement when it matches the configuration, and report a mismatch otherwise.
   A `vk dev` waiting for another command's boot also keeps waiting when the environment
   is up but its owning process cannot be identified.
+- **`vk dev refresh` reuses an environment whose boot it waited for** when that boot
+  started the environment from the same configuration and images known to match the
+  sources. Otherwise it restarts as before.
 
 ## [0.79.2] - 2026-09-28
 

@@ -301,7 +301,9 @@ enum DevAction {
     /// its config alone, and `--freshness` only says what one that has drifted gets. The
     /// build runs while the current environment keeps working, so the only downtime is the
     /// restart itself — and a build that fails leaves what is running alone. Does not ask: a
-    /// wrapper that wants to confirm first should do the asking.
+    /// wrapper that wants to confirm first should do the asking. The one exception: a refresh
+    /// that waited for another `vk dev`'s boot keeps it when that boot started the VM from
+    /// this config and from images all known to match the sources.
     Refresh {
         /// say what would change (as `plan --diff` does) without building or restarting
         #[arg(long)]

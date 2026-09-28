@@ -777,26 +777,62 @@ fn serves(running: &Identity, digest: &str, manifest: &serde_json::Value) -> Opt
     applied_on_attach(&drift(&running.manifest, manifest)).then_some(true)
 }
 
+/// Whether a boot is a refresh, and how it came to the ready environment it targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refresh {
+    /// not a refresh
+    No,
+    /// a refresh that found the environment ready on arrival
+    Found,
+    /// a refresh that waited for a boot in flight to ready the environment
+    Joined,
+}
+
+/// Whether `all_fresh` finds all images current for the VM whose identity the waiter read.
+/// Return `false` if that VM is gone or replaced. Refresh requires every image to be known
+/// current (see [`crate::vms::all_fresh`]).
+fn current_images_of(
+    plan: &Plan,
+    vm: VmTie,
+    all_fresh: impl FnOnce(&crate::vms::VmEntry) -> bool,
+) -> bool {
+    running_vm(plan).is_some_and(|now| VmTie::of(&now) == vm && all_fresh(&now))
+}
+
 /// The action `up` takes for a ready environment.
 #[derive(Debug, PartialEq, Eq)]
 enum Live {
     /// Attach: the environment serves this config (see [`serves`]).
     Current { session_only: bool },
+    /// Attach: a refresh joined the boot that started the VM, which readied it from this
+    /// config and images matching the sources, so restarting it would only boot the same
+    /// thing twice.
+    JustBooted,
     /// The action when serving this config requires a restart.
     Decided(Drifted),
 }
 
-/// Choose an action for `running` given `digest`/`manifest`: refresh always restarts;
-/// otherwise attach when it [`serves`] the config, or consult the freshness `decision`.
+/// Choose an action for `running` given `digest`/`manifest`. Refresh reuses only a joined
+/// boot that started and readied the VM (see [`Identity::readied_by_its_boot`]), with the
+/// same digest and images that `current_images` says match the sources. Merely matching
+/// [`serves`] is insufficient. Outside refresh, attach when it serves the config or consult
+/// the freshness `decision`.
 fn live_decision(
     running: &Identity,
     digest: &str,
     manifest: &serde_json::Value,
-    refresh: bool,
+    refresh: Refresh,
+    current_images: impl FnOnce() -> bool,
     decision: impl FnOnce() -> Result<Drifted>,
 ) -> Result<Live> {
-    if refresh {
-        return Ok(Live::Decided(Drifted::Restart));
+    match refresh {
+        Refresh::No => {}
+        Refresh::Joined
+            if running.readied_by_its_boot && running.digest == digest && current_images() =>
+        {
+            return Ok(Live::JustBooted);
+        }
+        Refresh::Found | Refresh::Joined => return Ok(Live::Decided(Drifted::Restart)),
     }
     Ok(match serves(running, digest, manifest) {
         Some(session_only) => Live::Current { session_only },
@@ -822,19 +858,23 @@ fn policy(plan: &Plan, over: &Overrides) -> Result<Drifted> {
 
 /// Apply [`live_decision`] to `running`, whether found on arrival or after waiting.
 /// Return `Ok(true)` to restart, `Ok(false)` after attaching and recording the transition,
-/// or an error on refusal. `announce_reuse` has the same meaning as in [`boot`].
+/// or an error on refusal. `announce_reuse` has the same meaning as in [`boot`], and
+/// `current_images` as in [`live_decision`].
 #[allow(clippy::too_many_arguments)]
 fn restarts_live(
     plan: &Plan,
     over: &Overrides,
-    refresh: bool,
+    refresh: Refresh,
+    current_images: impl FnOnce() -> bool,
     announce_reuse: bool,
     parent_pid: u32,
     running: &Identity,
     digest: &str,
     manifest: &serde_json::Value,
 ) -> Result<bool> {
-    let decision = live_decision(running, digest, manifest, refresh, || policy(plan, over))?;
+    let decision = live_decision(running, digest, manifest, refresh, current_images, || {
+        policy(plan, over)
+    })?;
     let summary = || {
         format!(
             "the running environment was booted from a different configuration (booted {}, \
@@ -870,6 +910,12 @@ fn restarts_live(
                 }
             }
         }
+        // Only `vk dev refresh` gets here, so this prints regardless of `announce_reuse`, as
+        // for `Drifted::Reuse`: a refresh that does not restart says why.
+        Live::JustBooted => eprintln!(
+            "virtkit: the boot this refresh waited for readied the environment from this \
+             configuration and images matching the sources — not restarting it"
+        ),
         Live::Decided(Drifted::Reuse(why)) => {
             eprintln!(
                 "virtkit: {}; {why} — attaching to it as recorded, `vk dev refresh` applies \
@@ -919,12 +965,15 @@ pub async fn boot(
     }
     let snapshot = snapshot_wrapper(plan)?;
     let (digest, manifest) = identity_of(plan, snapshot.as_ref().map(|(_, d)| d.as_str()))?;
+    let as_refresh = |how| if refresh { how } else { Refresh::No };
 
     if let Some((running, vm)) = live_identity(plan) {
         if !restarts_live(
             plan,
             over,
-            refresh,
+            as_refresh(Refresh::Found),
+            // Never judged: what a refresh finds ready on arrival, it restarts.
+            || false,
             announce_reuse,
             parent_pid,
             &running,
@@ -941,7 +990,8 @@ pub async fn boot(
         // whose readying failed or was abandoned, which this takes over — found now or while
         // waiting. What that boot readies is then taken as if found on arrival, and one left
         // not ready from another configuration gets the freshness policy too; a refresh
-        // restarts either, whatever it was booted from.
+        // restarts either, whatever it was booted from, and what it waited for unless that
+        // boot started the VM itself and readied it from this config and current images.
         let joined = match take_over(plan, parent_pid, &digest, &manifest, refresh) {
             Some(joined) => joined,
             None if !wait => bail!(
@@ -960,7 +1010,8 @@ pub async fn boot(
                 if !restarts_live(
                     plan,
                     over,
-                    refresh,
+                    as_refresh(Refresh::Joined),
+                    || current_images_of(plan, vm, crate::vms::all_fresh),
                     announce_reuse,
                     parent_pid,
                     &running,
@@ -1750,6 +1801,7 @@ mod tests {
             generation: String::new(),
             manifest,
             storage_backings: None,
+            readied_by_its_boot: true,
         }
     }
 
@@ -1764,18 +1816,27 @@ mod tests {
         let session_only = recorded(&"b".repeat(64), endpoints);
         let drifted = recorded(&"a".repeat(64), serde_json::json!({}));
         let never = || -> Result<Drifted> { panic!("the policy was consulted") };
+        let unasked = || -> bool { panic!("the images were judged") };
 
         assert_eq!(serves(&same, &digest, &manifest), Some(false));
         assert_eq!(serves(&session_only, &digest, &manifest), Some(true));
         assert_eq!(serves(&drifted, &digest, &manifest), None);
         assert_eq!(
-            live_decision(&same, &digest, &manifest, false, never).unwrap(),
+            live_decision(&same, &digest, &manifest, Refresh::No, unasked, never).unwrap(),
             Live::Current {
                 session_only: false
             }
         );
         assert_eq!(
-            live_decision(&session_only, &digest, &manifest, false, never).unwrap(),
+            live_decision(
+                &session_only,
+                &digest,
+                &manifest,
+                Refresh::No,
+                unasked,
+                never
+            )
+            .unwrap(),
             Live::Current { session_only: true }
         );
         // Changes requiring a restart follow any of the policy's three outcomes.
@@ -1786,22 +1847,75 @@ mod tests {
         ];
         for answer in answers {
             assert_eq!(
-                live_decision(&drifted, &digest, &manifest, false, || Ok(answer())).unwrap(),
+                live_decision(&drifted, &digest, &manifest, Refresh::No, unasked, || Ok(
+                    answer()
+                ))
+                .unwrap(),
                 Live::Decided(answer())
             );
         }
-        // Refresh restarts every configuration without consulting the policy.
+        // Refresh restarts every configuration without consulting the policy: on arrival
+        // whatever its images, after joining a boot unless that boot readied it from this
+        // digest — not merely a session-only drift — and current images, judged only then.
         for running in [&same, &session_only, &drifted] {
             assert_eq!(
-                live_decision(running, &digest, &manifest, true, never).unwrap(),
+                live_decision(running, &digest, &manifest, Refresh::Found, unasked, never).unwrap(),
                 Live::Decided(Drifted::Restart)
+            );
+        }
+        for running in [&session_only, &drifted] {
+            assert_eq!(
+                live_decision(running, &digest, &manifest, Refresh::Joined, unasked, never)
+                    .unwrap(),
+                Live::Decided(Drifted::Restart)
+            );
+        }
+        // A claim's re-readying of a VM that was already up, or a record that does not say,
+        // is restarted before the images are judged. Outside a refresh the flag plays no
+        // part: either is attached to as `same` is.
+        let reclaimed = Identity {
+            readied_by_its_boot: false,
+            ..recorded(&digest, manifest.clone())
+        };
+        let mut old = serde_json::to_value(&same).unwrap();
+        old.as_object_mut().unwrap().remove("readied_by_its_boot");
+        let old: Identity = serde_json::from_value(old).unwrap();
+        for running in [&reclaimed, &old] {
+            assert_eq!(
+                live_decision(running, &digest, &manifest, Refresh::Joined, unasked, never)
+                    .unwrap(),
+                Live::Decided(Drifted::Restart)
+            );
+            assert_eq!(
+                live_decision(running, &digest, &manifest, Refresh::No, unasked, never).unwrap(),
+                Live::Current {
+                    session_only: false
+                }
+            );
+        }
+        for (current, joined) in [
+            (true, Live::JustBooted),
+            (false, Live::Decided(Drifted::Restart)),
+        ] {
+            assert_eq!(
+                live_decision(
+                    &same,
+                    &digest,
+                    &manifest,
+                    Refresh::Joined,
+                    || current,
+                    never
+                )
+                .unwrap(),
+                joined
             );
         }
         let refusal = readied_elsewhere(&drifted, &digest);
         assert!(refusal.contains("booted aaaaaaaaaaaa, now "), "{refusal}");
     }
 
-    /// Waiting for another boot gives the same decision as finding it ready on arrival.
+    /// Waiting for another boot gives the same decision as finding it ready on arrival, except
+    /// that a refresh which waited for a boot of this config from current images keeps it.
     #[tokio::test]
     async fn a_joiner_decides_on_what_it_waited_for_as_on_what_it_found() {
         const CHILD: &str = "VK_TEST_BOOT_JOIN_DECIDES";
@@ -1896,6 +2010,9 @@ mod tests {
             (&drifted, Freshness::Ask, false, Expect::Reused),
             (&drifted, Freshness::RequireCurrent, false, Expect::Refused),
             (&drifted, Freshness::Refresh, false, Expect::Restart),
+            // Refresh reuses a joined boot of this config only with known-current images.
+            // This stand-in has no recipe, so it restarts as if found on arrival. Tests for
+            // `live_decision`, `restarts_live` and `current_images_of` cover reuse.
             (&same, Freshness::Reuse, true, Expect::Restart),
         ] {
             let found = outcome(booted, freshness, refresh, false).await;
@@ -1992,7 +2109,8 @@ mod tests {
         let restarts = restarts_live(
             &plan,
             &under(Freshness::Refresh),
-            false,
+            Refresh::No,
+            || false,
             true,
             pid,
             &drifted,
@@ -2003,7 +2121,8 @@ mod tests {
         let err = restarts_live(
             &plan,
             &under(Freshness::RequireCurrent),
-            false,
+            Refresh::No,
+            || false,
             true,
             pid,
             &drifted,
@@ -2027,7 +2146,8 @@ mod tests {
         let restarts = restarts_live(
             &plan,
             &under(Freshness::Reuse),
-            false,
+            Refresh::No,
+            || false,
             true,
             pid,
             &drifted,
@@ -2037,6 +2157,157 @@ mod tests {
         assert!(!restarts.unwrap());
         let note = std::fs::read_to_string(transition_path(&plan.state_dir, pid)).unwrap();
         assert!(note.starts_with("reused "), "{note}");
+    }
+
+    #[test]
+    fn a_refresh_keeps_what_it_waited_for_only_when_its_images_are_current() {
+        let t = scratch("restarts-joined");
+        let plan = plan_in(&t.0);
+        ensure_state_dir(&plan).unwrap();
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let same = recorded(&digest, manifest.clone());
+        let pid = std::process::id();
+        let joined = |current: bool| {
+            restarts_live(
+                &plan,
+                &Overrides::default(),
+                Refresh::Joined,
+                || current,
+                false,
+                pid,
+                &same,
+                &digest,
+                &manifest,
+            )
+        };
+
+        assert!(!joined(true).unwrap());
+        let note_path = transition_path(&plan.state_dir, pid);
+        let note = std::fs::read_to_string(&note_path).unwrap();
+        assert!(note.starts_with("reused "), "{note}");
+        std::fs::remove_file(&note_path).unwrap();
+        assert!(joined(false).unwrap());
+        assert!(!note_path.exists(), "a restart notes no reuse");
+        let reclaimed = Identity {
+            readied_by_its_boot: false,
+            ..recorded(&digest, manifest.clone())
+        };
+        let restarts = restarts_live(
+            &plan,
+            &Overrides::default(),
+            Refresh::Joined,
+            || true,
+            false,
+            pid,
+            &reclaimed,
+            &digest,
+            &manifest,
+        );
+        assert!(restarts.unwrap(), "a claim's re-readying is restarted");
+    }
+
+    /// A waiter's images are judged on the VM it read the identity of, and only while it is up.
+    #[test]
+    fn current_images_are_judged_on_the_vm_waited_for() {
+        const CHILD: &str = "VK_TEST_BOOT_CURRENT_IMAGES";
+        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let tmp = scratch("current-images");
+            crate::dev::testutil::in_child(
+                "dev::boot::tests::current_images_are_judged_on_the_vm_waited_for",
+                CHILD,
+                &tmp.0,
+            );
+            return;
+        };
+        let plan = plan_in(&tmp);
+        let vm = VmTie {
+            pid: std::process::id(),
+            created_secs: 7,
+        };
+        let fresh = |_: &crate::vms::VmEntry| true;
+        assert!(!current_images_of(&plan, vm, fresh), "no VM up");
+        let _vm = crate::dev::testutil::register_vm(&plan);
+        assert_eq!(VmTie::of(&running_vm(&plan).unwrap()), vm);
+        assert!(current_images_of(&plan, vm, fresh));
+        assert!(!current_images_of(&plan, vm, |_| false));
+        let replaced = VmTie {
+            created_secs: 8,
+            ..vm
+        };
+        assert!(
+            !current_images_of(&plan, replaced, |_| panic!("judged another VM")),
+            "a VM other than the one waited for"
+        );
+    }
+
+    /// The flag a readying writes reaches a waiter through the identity it reads.
+    #[tokio::test]
+    async fn a_waiter_reads_whether_the_vms_own_boot_readied_it() {
+        const CHILD: &str = "VK_TEST_BOOT_JOIN_CLAIMED";
+        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let tmp = scratch("join-claimed");
+            crate::dev::testutil::in_child(
+                "dev::boot::tests::a_waiter_reads_whether_the_vms_own_boot_readied_it",
+                CHILD,
+                &tmp.0,
+            );
+            return;
+        };
+        let plan = plan_in(&tmp);
+        let _vm = crate::dev::testutil::register_vm(&plan);
+        let vm = VmTie::of(&running_vm(&plan).unwrap());
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let joined = async |by_its_boot: bool| {
+            let _ = std::fs::remove_file(identity_path(&plan));
+            crate::dev::identity::mark_not_ready(
+                &plan,
+                &NotReady {
+                    vm,
+                    digest: digest.clone(),
+                    manifest: manifest.clone(),
+                    booted_secs: 1000,
+                    readier: crate::dev::identity::Readier::of(std::process::id()),
+                    why: String::new(),
+                },
+            );
+            let identity = Identity {
+                readied_by_its_boot: by_its_boot,
+                ..recorded(&digest, manifest.clone())
+            };
+            let (joined, ()) = tokio::join!(
+                wait_for_boot(&plan, 4242, &digest, &manifest, true),
+                async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    crate::dev::identity::write_identity(&plan, &identity).unwrap();
+                    clear_not_ready(&plan);
+                }
+            );
+            joined.unwrap()
+        };
+
+        for by_its_boot in [true, false] {
+            match joined(by_its_boot).await {
+                Joined::Ready {
+                    identity: running,
+                    vm: tie,
+                } => {
+                    assert_eq!(tie, vm);
+                    assert_eq!(running.readied_by_its_boot, by_its_boot);
+                    let decided = live_decision(
+                        &running,
+                        &digest,
+                        &manifest,
+                        Refresh::Joined,
+                        || true,
+                        || panic!("the policy was consulted"),
+                    )
+                    .unwrap();
+                    let kept = decided == Live::JustBooted;
+                    assert_eq!(kept, by_its_boot, "{decided:?}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]

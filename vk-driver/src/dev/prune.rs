@@ -946,6 +946,7 @@ mod tests {
             generation: String::new(),
             manifest: serde_json::json!({ "environment": "web" }),
             storage_backings: Some(vec![f.plan.state_dir.join("data.qcow2")]),
+            readied_by_its_boot: true,
         };
         std::fs::write(
             f.plan.state_dir.join("dev.json"),
@@ -969,6 +970,7 @@ mod tests {
             generation: String::new(),
             manifest: serde_json::json!({}),
             storage_backings: None,
+            readied_by_its_boot: false,
         };
         std::fs::write(
             f.plan.state_dir.join("dev.json"),
@@ -1009,6 +1011,7 @@ mod tests {
                 generation: String::new(),
                 manifest: serde_json::json!({ "environment": "dev" }),
                 storage_backings: Some(vec![dir.join("data.qcow2")]),
+                readied_by_its_boot: true,
             };
             std::fs::write(dir.join("dev.json"), serde_json::to_vec(&identity).unwrap()).unwrap();
             run_by_name(

@@ -77,6 +77,11 @@ pub struct Identity {
     /// fixed-name storage and says the declared backings could not be identified.
     #[serde(default)]
     pub storage_backings: Option<Vec<std::path::PathBuf>>,
+    /// whether the VM's own boot readied it. False when a later claim completes setup left
+    /// unfinished, or when an older `vk` omitted the flag from `dev.json`. Only an explicit
+    /// `true` counts as the VM's own boot.
+    #[serde(default)]
+    pub readied_by_its_boot: bool,
 }
 
 /// How long to wait for the note the child leaves for its parent.

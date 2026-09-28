@@ -298,7 +298,9 @@ the configuration still matches.
 `refresh` unconditionally rebuilds and restarts without confirmation. The build
 runs while the current environment remains available; a failed build leaves it
 running. The restart interrupts existing sessions. Durable data follows the
-storage rules below.
+storage rules below. The one exception: a `refresh` that waited for another
+`vk dev`'s boot keeps it when that boot started the environment from this
+configuration and from images all known to match the sources.
 
 ## Compose services and endpoints
 

@@ -148,6 +148,7 @@ async fn ready_or_mark(
         &readying.digest,
         &readying.manifest,
         readying.booted_secs,
+        !readying.claimed,
     )
     .await;
     let Err(e) = &readied else {
@@ -179,11 +180,13 @@ async fn ready_or_mark(
 
 /// The readying steps of a fresh boot — the endpoints, `hooks.create`, `hooks.start` and
 /// the identity recorded last — for the config that resolves to `digest`/`manifest`.
+/// `by_its_boot` is what the identity records as [`Identity::readied_by_its_boot`].
 async fn ready_booted(
     plan: &Plan,
     digest: &str,
     manifest: &serde_json::Value,
     booted_secs: u64,
+    by_its_boot: bool,
 ) -> Result<()> {
     // What was actually booted, read off the registry entry the boot filed. `None` where
     // there is no entry to read it from, which leaves the creation hook unstamped rather
@@ -205,6 +208,7 @@ async fn ready_booted(
             generation: generation.unwrap_or_default(),
             manifest: manifest.clone(),
             storage_backings,
+            readied_by_its_boot: by_its_boot,
         },
     )
 }
@@ -1027,7 +1031,18 @@ mod tests {
         let recorded: crate::dev::Identity =
             serde_json::from_slice(&std::fs::read(&identity).unwrap()).unwrap();
         assert_eq!(recorded.booted_secs, 1000);
+        assert!(recorded.readied_by_its_boot);
         assert!(!marker.exists(), "a ready environment is not marked");
+        // A claim's readying records that the VM's own boot did not ready it.
+        mark_not_ready(&plan, &under_way());
+        let claimed = Readying {
+            claimed: true,
+            ..readying(Some(vm), 1000)
+        };
+        ready_or_mark(&plan, &claimed, || Some(vm)).await.unwrap();
+        let recorded: crate::dev::Identity =
+            serde_json::from_slice(&std::fs::read(&identity).unwrap()).unwrap();
+        assert!(!recorded.readied_by_its_boot);
 
         // The last step fails — a directory where the identity goes — with the VM this
         // parent readied still up: marked as naming nobody, with the identity it would have
@@ -1250,6 +1265,10 @@ mod tests {
             serde_json::from_slice(&std::fs::read(plan.state_dir.join("dev.json")).unwrap())
                 .unwrap();
         assert_eq!(recorded.booted_secs, 1000);
+        assert!(
+            !recorded.readied_by_its_boot,
+            "a claimed readying is not the VM's own boot's"
+        );
         assert!(
             read_not_ready(&plan).is_none(),
             "the readier's marker is dropped"
