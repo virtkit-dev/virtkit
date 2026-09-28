@@ -17,7 +17,7 @@ use super::identity::{
     sha256_hex,
 };
 use super::session::{ask_on_terminal, on_terminal, running_vm, stop};
-use super::{GENERATION_MARKER, INFLIGHT_POLL, Overrides, TRANSITION_WAIT, Transition};
+use super::{GENERATION_MARKER, INFLIGHT_POLL, Identity, Overrides, TRANSITION_WAIT, Transition};
 
 /// Shared stop timeout for refresh and the default `vk dev stop --timeout`, in seconds.
 pub(super) const STOP_TIMEOUT_SECS: u64 = 10;
@@ -649,6 +649,128 @@ fn short(digest: &str) -> String {
     digest.chars().take(12).collect()
 }
 
+/// Whether `running` serves `digest`/`manifest` without a restart: `Some(false)` for a
+/// matching digest, `Some(true)` for changes applied on attach (`exec-env`, editor settings,
+/// endpoints, tasks) that the running VM never sees, or `None` when a restart is needed.
+fn serves(running: &Identity, digest: &str, manifest: &serde_json::Value) -> Option<bool> {
+    if running.digest == digest {
+        return Some(false);
+    }
+    applied_on_attach(&drift(&running.manifest, manifest)).then_some(true)
+}
+
+/// The action `up` takes for a ready environment.
+#[derive(Debug, PartialEq, Eq)]
+enum Live {
+    /// Attach: the environment serves this config (see [`serves`]).
+    Current { session_only: bool },
+    /// The action when serving this config requires a restart.
+    Decided(Drifted),
+}
+
+/// Choose an action for `running` given `digest`/`manifest`: refresh always restarts;
+/// otherwise attach when it [`serves`] the config, or consult the freshness `decision`.
+fn live_decision(
+    running: &Identity,
+    digest: &str,
+    manifest: &serde_json::Value,
+    refresh: bool,
+    decision: impl FnOnce() -> Result<Drifted>,
+) -> Result<Live> {
+    if refresh {
+        return Ok(Live::Decided(Drifted::Restart));
+    }
+    Ok(match serves(running, digest, manifest) {
+        Some(session_only) => Live::Current { session_only },
+        None => Live::Decided(decision()?),
+    })
+}
+
+/// The freshness policy for an environment booted from another configuration, `over` taking
+/// precedence over the plan's.
+///
+/// Under `freshness = ask`, the question reaches the terminal because this child inherited
+/// the parent's stdin and stderr and the parent is blocked reading the readiness pipe — the
+/// `setsid` that detached it (in [`boot`]) cost it the controlling terminal, not the
+/// descriptors. With no terminal there is nobody to answer, so the running environment
+/// stands.
+fn policy(plan: &Plan, over: &Overrides) -> Result<Drifted> {
+    decide(
+        over.freshness.unwrap_or(plan.freshness),
+        on_terminal(),
+        || ask_on_terminal("rebuild and restart it now?"),
+    )
+}
+
+/// Apply [`live_decision`] to `running`: return `Ok(true)` for the caller to restart it,
+/// `Ok(false)` after attaching and recording the transition, or an error on refusal.
+/// `announce_reuse` has the same meaning as in [`boot`].
+#[allow(clippy::too_many_arguments)]
+fn restarts_live(
+    plan: &Plan,
+    over: &Overrides,
+    refresh: bool,
+    announce_reuse: bool,
+    parent_pid: u32,
+    running: &Identity,
+    digest: &str,
+    manifest: &serde_json::Value,
+) -> Result<bool> {
+    let decision = live_decision(running, digest, manifest, refresh, || policy(plan, over))?;
+    let summary = || {
+        format!(
+            "the running environment was booted from a different configuration (booted {}, \
+             now {})",
+            short(&running.digest),
+            short(digest)
+        )
+    };
+    match decision {
+        Live::Current { session_only } => {
+            if announce_reuse {
+                eprintln!(
+                    "virtkit: dev environment already running ({})",
+                    plan.state_dir.display()
+                );
+                if session_only {
+                    eprintln!(
+                        "virtkit: its config changed only in what attaching applies (exec-env, \
+                         editor, endpoints, tasks) — no restart needed"
+                    );
+                }
+                note_older_creator(running);
+                // Its configuration still matches; the images it was built from may not.
+                // Say so rather than leave a caller to find out, and leave the decision to
+                // them.
+                if let Some(vm) = running_vm(plan)
+                    && crate::vms::freshness_all(&vm) == crate::vms::Freshness::Stale
+                {
+                    eprintln!(
+                        "virtkit: its image no longer matches the sources — `vk dev refresh` \
+                         rebuilds and restarts it"
+                    );
+                }
+            }
+        }
+        Live::Decided(Drifted::Reuse(why)) => {
+            eprintln!(
+                "virtkit: {}; {why} — attaching to it as recorded, `vk dev refresh` applies \
+                 the config",
+                summary()
+            );
+            note_older_creator(running);
+        }
+        Live::Decided(Drifted::Refuse) => bail!(
+            "{} — `vk dev refresh` reboots it into this one, `vk dev stop` ends it, or \
+             `--freshness reuse` attaches to it as it is",
+            summary()
+        ),
+        Live::Decided(Drifted::Restart) => return Ok(true),
+    }
+    note_transition(plan, parent_pid, Transition::Reused);
+    Ok(false)
+}
+
 /// Boot the environment. Runs in the detached child (see the module docs): it returns only
 /// when the VM stops, so anything that should happen once the guest is up belongs in
 /// [`after_boot`](super::after_boot).
@@ -681,70 +803,17 @@ pub async fn boot(
     let (digest, manifest) = identity_of(plan, snapshot.as_ref().map(|(_, d)| d.as_str()))?;
 
     if let Some(running) = live_identity(plan) {
-        let drifted = running.digest != digest;
-        // A change the running VM never sees — `exec-env`, editor settings, endpoints,
-        // tasks — is applied by this attach or the next session, not by a restart, so it is
-        // no reason to offer one.
-        let session_only = drifted && applied_on_attach(&drift(&running.manifest, &manifest));
-        if (!drifted || session_only) && !refresh {
-            if announce_reuse {
-                eprintln!(
-                    "virtkit: dev environment already running ({})",
-                    plan.state_dir.display()
-                );
-                if session_only {
-                    eprintln!(
-                        "virtkit: its config changed only in what attaching applies (exec-env, \
-                         editor, endpoints, tasks) — no restart needed"
-                    );
-                }
-                note_older_creator(&running);
-                // Its configuration still matches; the images it was built from may not.
-                // Say so rather than leave a caller to find out, and leave the decision to
-                // them.
-                if let Some(vm) = running_vm(plan)
-                    && crate::vms::freshness_all(&vm) == crate::vms::Freshness::Stale
-                {
-                    eprintln!(
-                        "virtkit: its image no longer matches the sources — `vk dev refresh` \
-                         rebuilds and restarts it"
-                    );
-                }
-            }
-            note_transition(plan, parent_pid, Transition::Reused);
+        if !restarts_live(
+            plan,
+            over,
+            refresh,
+            announce_reuse,
+            parent_pid,
+            &running,
+            &digest,
+            &manifest,
+        )? {
             return Ok(());
-        }
-        if drifted && !refresh {
-            let summary = format!(
-                "the running environment was booted from a different configuration (booted \
-                 {}, now {})",
-                short(&running.digest),
-                short(&digest)
-            );
-            // The question reaches the terminal because this child inherited the parent's
-            // stdin and stderr and the parent is blocked reading the readiness pipe — the
-            // `setsid` above cost it the controlling terminal, not the descriptors. With no
-            // terminal there is nobody to answer, so the running environment stands.
-            match decide(
-                over.freshness.unwrap_or(plan.freshness),
-                on_terminal(),
-                || ask_on_terminal("rebuild and restart it now?"),
-            )? {
-                Drifted::Reuse(why) => {
-                    eprintln!(
-                        "virtkit: {summary}; {why} — attaching to it as recorded, \
-                         `vk dev refresh` applies the config"
-                    );
-                    note_older_creator(&running);
-                    note_transition(plan, parent_pid, Transition::Reused);
-                    return Ok(());
-                }
-                Drifted::Refuse => bail!(
-                    "{summary} — `vk dev refresh` reboots it into this one, `vk dev stop` \
-                     ends it, or `--freshness reuse` attaches to it as it is"
-                ),
-                Drifted::Restart => {}
-            }
         }
         if !swap(plan, cfg, over, wait, parent_pid, &digest, &manifest).await? {
             return Ok(());
@@ -774,17 +843,7 @@ pub async fn boot(
                 return Ok(());
             }
             Joined::Restart => {}
-            Joined::Drifted(left) => restart_left_behind(
-                || {
-                    decide(
-                        over.freshness.unwrap_or(plan.freshness),
-                        on_terminal(),
-                        || ask_on_terminal("rebuild and restart it now?"),
-                    )
-                },
-                &left,
-                &digest,
-            )?,
+            Joined::Drifted(left) => restart_left_behind(|| policy(plan, over), &left, &digest)?,
         }
         if !swap(plan, cfg, over, wait, parent_pid, &digest, &manifest).await? {
             return Ok(());
@@ -1517,6 +1576,127 @@ mod tests {
             refuse.contains("booted aaaaaaaaaaaa, now bbbbbbbbbbbb"),
             "{refuse}"
         );
+    }
+
+    /// Record `digest`/`manifest`, the only identity fields the decision reads.
+    fn recorded(digest: &str, manifest: serde_json::Value) -> Identity {
+        Identity {
+            digest: digest.into(),
+            booted_secs: 1000,
+            created_by: String::new(),
+            generation: String::new(),
+            manifest,
+            storage_backings: None,
+        }
+    }
+
+    #[test]
+    fn a_ready_environment_is_attached_to_restarted_or_refused_as_its_config_and_policy_say() {
+        let t = scratch("live-decision");
+        let plan = plan_in(&t.0);
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let mut endpoints = manifest.clone();
+        endpoints["endpoints"] = serde_json::json!([{ "name": "web", "host_port": 8080 }]);
+        let same = recorded(&digest, manifest.clone());
+        let session_only = recorded(&"b".repeat(64), endpoints);
+        let drifted = recorded(&"a".repeat(64), serde_json::json!({}));
+        let never = || -> Result<Drifted> { panic!("the policy was consulted") };
+
+        assert_eq!(serves(&same, &digest, &manifest), Some(false));
+        assert_eq!(serves(&session_only, &digest, &manifest), Some(true));
+        assert_eq!(serves(&drifted, &digest, &manifest), None);
+        assert_eq!(
+            live_decision(&same, &digest, &manifest, false, never).unwrap(),
+            Live::Current {
+                session_only: false
+            }
+        );
+        assert_eq!(
+            live_decision(&session_only, &digest, &manifest, false, never).unwrap(),
+            Live::Current { session_only: true }
+        );
+        // Changes requiring a restart follow any of the policy's three outcomes.
+        let answers: [fn() -> Drifted; 3] = [
+            || Drifted::Restart,
+            || Drifted::Refuse,
+            || Drifted::Reuse("freshness = reuse"),
+        ];
+        for answer in answers {
+            assert_eq!(
+                live_decision(&drifted, &digest, &manifest, false, || Ok(answer())).unwrap(),
+                Live::Decided(answer())
+            );
+        }
+        // Refresh restarts every configuration without consulting the policy.
+        for running in [&same, &session_only, &drifted] {
+            assert_eq!(
+                live_decision(running, &digest, &manifest, true, never).unwrap(),
+                Live::Decided(Drifted::Restart)
+            );
+        }
+    }
+
+    #[test]
+    fn a_drifted_ready_environment_is_restarted_refused_or_attached_to_as_the_override_says() {
+        let t = scratch("restarts-live");
+        let plan = plan_in(&t.0);
+        ensure_state_dir(&plan).unwrap();
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let drifted = recorded(&"a".repeat(64), serde_json::json!({}));
+        let under = |freshness| Overrides {
+            freshness: Some(freshness),
+            ..Overrides::default()
+        };
+        let pid = std::process::id();
+
+        let restarts = restarts_live(
+            &plan,
+            &under(Freshness::Refresh),
+            false,
+            true,
+            pid,
+            &drifted,
+            &digest,
+            &manifest,
+        );
+        assert!(restarts.unwrap());
+        let err = restarts_live(
+            &plan,
+            &under(Freshness::RequireCurrent),
+            false,
+            true,
+            pid,
+            &drifted,
+            &digest,
+            &manifest,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains(&format!(
+                "booted from a different configuration (booted {}, now {})",
+                short(&drifted.digest),
+                short(&digest)
+            )),
+            "{err}"
+        );
+        assert!(
+            err.contains("`--freshness reuse` attaches to it as it is"),
+            "{err}"
+        );
+        let restarts = restarts_live(
+            &plan,
+            &under(Freshness::Reuse),
+            false,
+            true,
+            pid,
+            &drifted,
+            &digest,
+            &manifest,
+        );
+        assert!(!restarts.unwrap());
+        let note = std::fs::read_to_string(transition_path(&plan.state_dir, pid)).unwrap();
+        assert!(note.starts_with("reused "), "{note}");
     }
 
     #[test]
