@@ -512,11 +512,19 @@ fn after_build(
     }
 }
 
+/// What [`swap`] leaves for [`boot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Swap {
+    /// the way is clear: boot
+    Boot,
+    /// joined another boot, its transition recorded: nothing left to boot
+    Joined,
+}
+
 /// Rebuild for the current config, stop `targeted`, and check that a new VM can boot.
-/// Return `false` after joining a replacement boot or taking over its unfinished setup:
-/// nothing remains to boot. `digest`/`manifest` identify this config; reject ready or
-/// unfinished replacements from another config, since the drift policy already ran.
-#[allow(clippy::too_many_arguments)]
+/// Return [`Swap::Joined`] after joining a replacement boot or finishing its setup:
+/// nothing remains to boot. Reject ready replacements that [`serves`] says need a restart
+/// for `wanted`, or unfinished replacements from another config: the drift policy already ran.
 async fn swap(
     plan: &Plan,
     cfg: &crate::config::Config,
@@ -524,9 +532,8 @@ async fn swap(
     wait: bool,
     parent_pid: u32,
     targeted: VmTie,
-    digest: &str,
-    manifest: &serde_json::Value,
-) -> Result<bool> {
+    wanted: Wanted<'_>,
+) -> Result<Swap> {
     // Build first, with the current environment still up and usable: a build that fails
     // then costs only time, and the boot below restores what this just cached rather than
     // building it cold — seconds of downtime instead of minutes.
@@ -581,7 +588,7 @@ async fn swap(
             // Nothing procfs can name holds the lock, and nothing is up, so there is no other
             // boot whose relays these could be.
             crate::publish::stop_all_quietly(&plan.state_dir, Duration::from_secs(5));
-            return Ok(true);
+            return Ok(Swap::Boot);
         }
         _ => None,
     };
@@ -605,35 +612,31 @@ async fn swap(
     };
     // A replacement that is up has its `vk run` holding the lock whether or not procfs can
     // name it, so what this waits on is the VM, not a named holder.
-    let joined = match ready.or_else(|| take_over(plan, parent_pid, digest, manifest, false)) {
+    let joined = match ready.or_else(|| take_over(plan, parent_pid, wanted, false)) {
         Some(joined) => joined,
         None if !wait => bail!(
             "another boot of this environment{} took over while this one was rebuilding — \
              wait for that one, or re-run without --no-wait",
             holder.map(|h| format!(" ({h})")).unwrap_or_default()
         ),
-        None => wait_for_boot(plan, parent_pid, digest, manifest, false).await?,
+        None => wait_for_boot(plan, parent_pid, wanted, false).await?,
     };
-    let transition = after_takeover(joined, digest, manifest)?;
+    let transition = after_takeover(joined, wanted)?;
     note_transition(plan, parent_pid, transition);
-    Ok(false)
+    Ok(Swap::Joined)
 }
 
 /// The transition after a restart joins a boot that took over during the rebuild.
-/// Refuse a ready environment unless [`serves`] accepts it for `digest`/`manifest`.
+/// Refuse a ready environment that [`serves`] says needs a restart for `wanted`.
 /// Also refuse an environment left not ready from a different config.
-fn after_takeover(
-    joined: Joined,
-    digest: &str,
-    manifest: &serde_json::Value,
-) -> Result<Transition> {
+fn after_takeover(joined: Joined, wanted: Wanted<'_>) -> Result<Transition> {
     Ok(match joined {
-        Joined::Ready { identity, .. } => match serves(&identity, digest, manifest) {
-            Some(_) => Transition::Reused,
-            None => bail!("{}", readied_elsewhere(&identity, digest)),
+        Joined::Ready { identity, .. } => match serves(&identity, wanted) {
+            Serves::Same | Serves::OnAttach => Transition::Reused,
+            Serves::NeedsRestart => bail!("{}", readied_elsewhere(&identity, wanted.digest)),
         },
         Joined::Claimed => Transition::Booted,
-        Joined::Drifted(left) => bail!("{}", refused(&left, digest)),
+        Joined::Drifted(left) => bail!("{}", refused(&left, wanted.digest)),
         // `restart` is false in `swap`, so neither call there returns this.
         Joined::Restart(_) => bail!(
             "the environment the boot that took over left needs a restart — re-run \
@@ -670,25 +673,21 @@ enum Joined {
     Restart(VmTie),
 }
 
-/// The running VM's abandoned marker and its compatibility with `digest`/`manifest`
-/// (see [`left_behind`]). A live readier means a boot is in flight and returns `None`.
-fn not_ready_here(
-    plan: &Plan,
-    digest: &str,
-    manifest: &serde_json::Value,
-) -> Option<(NotReady, LeftBehind)> {
+/// The running VM's abandoned marker and its compatibility with `wanted` (see
+/// [`left_behind`]). A live readier means a boot is in flight and returns `None`.
+fn not_ready_here(plan: &Plan, wanted: Wanted<'_>) -> Option<(NotReady, LeftBehind)> {
     let left = read_not_ready(plan).filter(NotReady::abandoned)?;
     let running = running_vm(plan).map(|vm| VmTie::of(&vm));
-    let how = left_behind(&left, running, digest, manifest)?;
+    let how = left_behind(&left, running, wanted.digest, wanted.manifest)?;
     Some((left, how))
 }
 
 /// Claim the marker [`not_ready_here`] found for the parent `parent_pid`, saying so: `false`
 /// when another caller got there first, or the marker is no longer one to claim.
-fn claim(plan: &Plan, parent_pid: u32, digest: &str, manifest: &serde_json::Value) -> bool {
+fn claim(plan: &Plan, parent_pid: u32, wanted: Wanted<'_>) -> bool {
     let Some(left) = claim_not_ready(plan, parent_pid, |left| {
         let running = running_vm(plan).map(|vm| VmTie::of(&vm));
-        left_behind(left, running, digest, manifest) == Some(LeftBehind::Claim)
+        left_behind(left, running, wanted.digest, wanted.manifest) == Some(LeftBehind::Claim)
     }) else {
         return false;
     };
@@ -725,18 +724,10 @@ fn refused(left: &NotReady, digest: &str) -> String {
 /// [`Joined::Drifted`], for the caller's drift policy — not readied with this config, which
 /// would record it as booted from a config it was not. With `restart`, a refresh's, either is
 /// [`Joined::Restart`] instead: the caller restarts it.
-fn take_over(
-    plan: &Plan,
-    parent_pid: u32,
-    digest: &str,
-    manifest: &serde_json::Value,
-    restart: bool,
-) -> Option<Joined> {
-    match not_ready_here(plan, digest, manifest)? {
+fn take_over(plan: &Plan, parent_pid: u32, wanted: Wanted<'_>, restart: bool) -> Option<Joined> {
+    match not_ready_here(plan, wanted)? {
         (left, _) if restart => Some(Joined::Restart(left.vm)),
-        (_, LeftBehind::Claim) => {
-            claim(plan, parent_pid, digest, manifest).then_some(Joined::Claimed)
-        }
+        (_, LeftBehind::Claim) => claim(plan, parent_pid, wanted).then_some(Joined::Claimed),
         (left, LeftBehind::Drifted) => Some(Joined::Drifted(left)),
     }
 }
@@ -767,14 +758,34 @@ fn short(digest: &str) -> String {
     digest.chars().take(12).collect()
 }
 
-/// Whether `running` serves `digest`/`manifest` without a restart: `Some(false)` for a
-/// matching digest, `Some(true)` for changes applied on attach (`exec-env`, editor settings,
-/// endpoints, tasks) that the running VM never sees, or `None` when a restart is needed.
-fn serves(running: &Identity, digest: &str, manifest: &serde_json::Value) -> Option<bool> {
-    if running.digest == digest {
-        return Some(false);
+/// Config identity from [`identity_of`], used to judge running or left-behind environments.
+#[derive(Debug, Clone, Copy)]
+struct Wanted<'a> {
+    digest: &'a str,
+    manifest: &'a serde_json::Value,
+}
+
+/// How a running environment serves the wanted config (see [`serves`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Serves {
+    /// booted from this very config
+    Same,
+    /// booted from one that differs only in what attaching applies (`exec-env`, editor
+    /// settings, endpoints, tasks), which the running VM never sees
+    OnAttach,
+    /// not without a restart
+    NeedsRestart,
+}
+
+/// Whether `running` serves `wanted` without a restart.
+fn serves(running: &Identity, wanted: Wanted<'_>) -> Serves {
+    if running.digest == wanted.digest {
+        Serves::Same
+    } else if applied_on_attach(&drift(&running.manifest, wanted.manifest)) {
+        Serves::OnAttach
+    } else {
+        Serves::NeedsRestart
     }
-    applied_on_attach(&drift(&running.manifest, manifest)).then_some(true)
 }
 
 /// Whether a boot is a refresh, and how it came to the ready environment it targets.
@@ -812,15 +823,14 @@ enum Live {
     Decided(Drifted),
 }
 
-/// Choose an action for `running` given `digest`/`manifest`. Refresh reuses only a joined
-/// boot that started and readied the VM (see [`Identity::readied_by_its_boot`]), with the
-/// same digest and images that `current_images` says match the sources. Merely matching
-/// [`serves`] is insufficient. Outside refresh, attach when it serves the config or consult
-/// the freshness `decision`.
+/// Choose an action for `running` given `wanted`. Refresh reuses only a joined boot that
+/// started and readied the VM (see [`Identity::readied_by_its_boot`]), with the same digest
+/// and images that `current_images` says match the sources. Merely matching [`serves`] is
+/// insufficient. Outside refresh, attach when it serves the config or consult the
+/// freshness `decision`.
 fn live_decision(
     running: &Identity,
-    digest: &str,
-    manifest: &serde_json::Value,
+    wanted: Wanted<'_>,
     refresh: Refresh,
     current_images: impl FnOnce() -> bool,
     decision: impl FnOnce() -> Result<Drifted>,
@@ -828,15 +838,20 @@ fn live_decision(
     match refresh {
         Refresh::No => {}
         Refresh::Joined
-            if running.readied_by_its_boot && running.digest == digest && current_images() =>
+            if running.readied_by_its_boot
+                && running.digest == wanted.digest
+                && current_images() =>
         {
             return Ok(Live::JustBooted);
         }
         Refresh::Found | Refresh::Joined => return Ok(Live::Decided(Drifted::Restart)),
     }
-    Ok(match serves(running, digest, manifest) {
-        Some(session_only) => Live::Current { session_only },
-        None => Live::Decided(decision()?),
+    Ok(match serves(running, wanted) {
+        Serves::Same => Live::Current {
+            session_only: false,
+        },
+        Serves::OnAttach => Live::Current { session_only: true },
+        Serves::NeedsRestart => Live::Decided(decision()?),
     })
 }
 
@@ -856,12 +871,21 @@ fn policy(plan: &Plan, over: &Overrides) -> Result<Drifted> {
     )
 }
 
-/// Apply [`live_decision`] to `running`, whether found on arrival or after waiting.
-/// Return `Ok(true)` to restart, `Ok(false)` after attaching and recording the transition,
-/// or an error on refusal. `announce_reuse` has the same meaning as in [`boot`], and
-/// `current_images` as in [`live_decision`].
+/// What [`attach_or_restart`] did about a ready environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attach {
+    /// attached to it, the transition recorded
+    Attached,
+    /// left it for the caller to restart
+    ToRestart,
+}
+
+/// Apply [`live_decision`] to `running`, whether found on arrival or after waiting: attach,
+/// recording the transition, leave it to restart, or fail on refusal.
+/// `announce_reuse` has the same meaning as in [`boot`], and `current_images` as in
+/// [`live_decision`].
 #[allow(clippy::too_many_arguments)]
-fn restarts_live(
+fn attach_or_restart(
     plan: &Plan,
     over: &Overrides,
     refresh: Refresh,
@@ -869,10 +893,9 @@ fn restarts_live(
     announce_reuse: bool,
     parent_pid: u32,
     running: &Identity,
-    digest: &str,
-    manifest: &serde_json::Value,
-) -> Result<bool> {
-    let decision = live_decision(running, digest, manifest, refresh, current_images, || {
+    wanted: Wanted<'_>,
+) -> Result<Attach> {
+    let decision = live_decision(running, wanted, refresh, current_images, || {
         policy(plan, over)
     })?;
     let summary = || {
@@ -880,7 +903,7 @@ fn restarts_live(
             "the running environment was booted from a different configuration (booted {}, \
              now {})",
             short(&running.digest),
-            short(digest)
+            short(wanted.digest)
         )
     };
     match decision {
@@ -929,10 +952,10 @@ fn restarts_live(
              `--freshness reuse` attaches to it as it is",
             summary()
         ),
-        Live::Decided(Drifted::Restart) => return Ok(true),
+        Live::Decided(Drifted::Restart) => return Ok(Attach::ToRestart),
     }
     note_transition(plan, parent_pid, Transition::Reused);
-    Ok(false)
+    Ok(Attach::Attached)
 }
 
 /// Boot the environment. Runs in the detached child (see the module docs): it returns only
@@ -965,10 +988,14 @@ pub async fn boot(
     }
     let snapshot = snapshot_wrapper(plan)?;
     let (digest, manifest) = identity_of(plan, snapshot.as_ref().map(|(_, d)| d.as_str()))?;
+    let wanted = Wanted {
+        digest: &digest,
+        manifest: &manifest,
+    };
     let as_refresh = |how| if refresh { how } else { Refresh::No };
 
     if let Some((running, vm)) = live_identity(plan) {
-        if !restarts_live(
+        if attach_or_restart(
             plan,
             over,
             as_refresh(Refresh::Found),
@@ -977,12 +1004,12 @@ pub async fn boot(
             announce_reuse,
             parent_pid,
             &running,
-            &digest,
-            &manifest,
-        )? {
+            wanted,
+        )? == Attach::Attached
+        {
             return Ok(());
         }
-        if !swap(plan, cfg, over, wait, parent_pid, vm, &digest, &manifest).await? {
+        if swap(plan, cfg, over, wait, parent_pid, vm, wanted).await? == Swap::Joined {
             return Ok(());
         }
     } else if let Some(holder) = lock_holder(&plan.state_dir) {
@@ -992,14 +1019,14 @@ pub async fn boot(
         // not ready from another configuration gets the freshness policy too; a refresh
         // restarts either, whatever it was booted from, and what it waited for unless that
         // boot started the VM itself and readied it from this config and current images.
-        let joined = match take_over(plan, parent_pid, &digest, &manifest, refresh) {
+        let joined = match take_over(plan, parent_pid, wanted, refresh) {
             Some(joined) => joined,
             None if !wait => bail!(
                 "another boot of this environment is already in flight ({holder}); its \
                  output goes to the terminal that started it — wait for that one, or re-run \
                  without --no-wait"
             ),
-            None => wait_for_boot(plan, parent_pid, &digest, &manifest, refresh).await?,
+            None => wait_for_boot(plan, parent_pid, wanted, refresh).await?,
         };
         // Keep the VM selected for restart so `swap` stops only that VM.
         let targeted = match joined {
@@ -1007,7 +1034,7 @@ pub async fn boot(
                 identity: running,
                 vm,
             } => {
-                if !restarts_live(
+                if attach_or_restart(
                     plan,
                     over,
                     as_refresh(Refresh::Joined),
@@ -1015,9 +1042,9 @@ pub async fn boot(
                     announce_reuse,
                     parent_pid,
                     &running,
-                    &digest,
-                    &manifest,
-                )? {
+                    wanted,
+                )? == Attach::Attached
+                {
                     return Ok(());
                 }
                 vm
@@ -1028,15 +1055,11 @@ pub async fn boot(
             }
             Joined::Restart(vm) => vm,
             Joined::Drifted(left) => {
-                restart_left_behind(|| policy(plan, over), &left, &digest)?;
+                restart_left_behind(|| policy(plan, over), &left, wanted.digest)?;
                 left.vm
             }
         };
-        if !swap(
-            plan, cfg, over, wait, parent_pid, targeted, &digest, &manifest,
-        )
-        .await?
-        {
+        if swap(plan, cfg, over, wait, parent_pid, targeted, wanted).await? == Swap::Joined {
             return Ok(());
         }
     }
@@ -1225,8 +1248,8 @@ const READY_WAIT: Duration = Duration::from_secs(300);
 
 /// Wait for another boot's registered VM and the identity written once ready.
 /// Return [`Joined::Ready`] for the caller to compare with its config as on arrival.
-/// If setup fails or the parent dies, return [`take_over`]'s result for `digest`/`manifest`,
-/// passing `restart` through.
+/// If setup fails or the parent dies, return [`take_over`]'s result for `wanted`, passing
+/// `restart` through.
 /// If another caller wins the claim, wait for its setup instead.
 ///
 /// Waiting for the VM alone released this process while the boot's own parent was still
@@ -1235,8 +1258,7 @@ const READY_WAIT: Duration = Duration::from_secs(300);
 async fn wait_for_boot(
     plan: &Plan,
     parent_pid: u32,
-    digest: &str,
-    manifest: &serde_json::Value,
+    wanted: Wanted<'_>,
     restart: bool,
 ) -> Result<Joined> {
     let mut announced = false;
@@ -1262,7 +1284,7 @@ async fn wait_for_boot(
                 }
             }
         }
-        if up && let Some(joined) = take_over(plan, parent_pid, digest, manifest, restart) {
+        if up && let Some(joined) = take_over(plan, parent_pid, wanted, restart) {
             return Ok(joined);
         }
         if !announced {
@@ -1810,6 +1832,10 @@ mod tests {
         let t = scratch("live-decision");
         let plan = plan_in(&t.0);
         let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let wanted = Wanted {
+            digest: &digest,
+            manifest: &manifest,
+        };
         let mut endpoints = manifest.clone();
         endpoints["endpoints"] = serde_json::json!([{ "name": "web", "host_port": 8080 }]);
         let same = recorded(&digest, manifest.clone());
@@ -1818,25 +1844,17 @@ mod tests {
         let never = || -> Result<Drifted> { panic!("the policy was consulted") };
         let unasked = || -> bool { panic!("the images were judged") };
 
-        assert_eq!(serves(&same, &digest, &manifest), Some(false));
-        assert_eq!(serves(&session_only, &digest, &manifest), Some(true));
-        assert_eq!(serves(&drifted, &digest, &manifest), None);
+        assert_eq!(serves(&same, wanted), Serves::Same);
+        assert_eq!(serves(&session_only, wanted), Serves::OnAttach);
+        assert_eq!(serves(&drifted, wanted), Serves::NeedsRestart);
         assert_eq!(
-            live_decision(&same, &digest, &manifest, Refresh::No, unasked, never).unwrap(),
+            live_decision(&same, wanted, Refresh::No, unasked, never).unwrap(),
             Live::Current {
                 session_only: false
             }
         );
         assert_eq!(
-            live_decision(
-                &session_only,
-                &digest,
-                &manifest,
-                Refresh::No,
-                unasked,
-                never
-            )
-            .unwrap(),
+            live_decision(&session_only, wanted, Refresh::No, unasked, never).unwrap(),
             Live::Current { session_only: true }
         );
         // Changes requiring a restart follow any of the policy's three outcomes.
@@ -1847,10 +1865,7 @@ mod tests {
         ];
         for answer in answers {
             assert_eq!(
-                live_decision(&drifted, &digest, &manifest, Refresh::No, unasked, || Ok(
-                    answer()
-                ))
-                .unwrap(),
+                live_decision(&drifted, wanted, Refresh::No, unasked, || Ok(answer())).unwrap(),
                 Live::Decided(answer())
             );
         }
@@ -1859,14 +1874,13 @@ mod tests {
         // digest — not merely a session-only drift — and current images, judged only then.
         for running in [&same, &session_only, &drifted] {
             assert_eq!(
-                live_decision(running, &digest, &manifest, Refresh::Found, unasked, never).unwrap(),
+                live_decision(running, wanted, Refresh::Found, unasked, never).unwrap(),
                 Live::Decided(Drifted::Restart)
             );
         }
         for running in [&session_only, &drifted] {
             assert_eq!(
-                live_decision(running, &digest, &manifest, Refresh::Joined, unasked, never)
-                    .unwrap(),
+                live_decision(running, wanted, Refresh::Joined, unasked, never).unwrap(),
                 Live::Decided(Drifted::Restart)
             );
         }
@@ -1882,12 +1896,11 @@ mod tests {
         let old: Identity = serde_json::from_value(old).unwrap();
         for running in [&reclaimed, &old] {
             assert_eq!(
-                live_decision(running, &digest, &manifest, Refresh::Joined, unasked, never)
-                    .unwrap(),
+                live_decision(running, wanted, Refresh::Joined, unasked, never).unwrap(),
                 Live::Decided(Drifted::Restart)
             );
             assert_eq!(
-                live_decision(running, &digest, &manifest, Refresh::No, unasked, never).unwrap(),
+                live_decision(running, wanted, Refresh::No, unasked, never).unwrap(),
                 Live::Current {
                     session_only: false
                 }
@@ -1898,15 +1911,7 @@ mod tests {
             (false, Live::Decided(Drifted::Restart)),
         ] {
             assert_eq!(
-                live_decision(
-                    &same,
-                    &digest,
-                    &manifest,
-                    Refresh::Joined,
-                    || current,
-                    never
-                )
-                .unwrap(),
+                live_decision(&same, wanted, Refresh::Joined, || current, never).unwrap(),
                 joined
             );
         }
@@ -2010,9 +2015,10 @@ mod tests {
             (&drifted, Freshness::Ask, false, Expect::Reused),
             (&drifted, Freshness::RequireCurrent, false, Expect::Refused),
             (&drifted, Freshness::Refresh, false, Expect::Restart),
-            // Refresh reuses a joined boot of this config only with known-current images.
-            // This stand-in has no recipe, so it restarts as if found on arrival. Tests for
-            // `live_decision`, `restarts_live` and `current_images_of` cover reuse.
+            // Refresh reuses a joined boot only if it started and readied the VM from this
+            // config with known-current images. This stand-in has no recipe, so it restarts
+            // as if found on arrival. Tests for `live_decision`, `attach_or_restart` and
+            // `current_images_of` cover reuse.
             (&same, Freshness::Reuse, true, Expect::Restart),
         ] {
             let found = outcome(booted, freshness, refresh, false).await;
@@ -2054,9 +2060,13 @@ mod tests {
         let t = scratch("after-takeover");
         let plan = plan_in(&t.0);
         let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let wanted = Wanted {
+            digest: &digest,
+            manifest: &manifest,
+        };
         let mut endpoints = manifest.clone();
         endpoints["endpoints"] = serde_json::json!([{ "name": "web", "host_port": 8080 }]);
-        let after = |joined| after_takeover(joined, &digest, &manifest);
+        let after = |joined| after_takeover(joined, wanted);
         let ready = |identity| Joined::Ready { identity, vm: VM };
 
         assert_eq!(
@@ -2099,6 +2109,10 @@ mod tests {
         let plan = plan_in(&t.0);
         ensure_state_dir(&plan).unwrap();
         let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let wanted = Wanted {
+            digest: &digest,
+            manifest: &manifest,
+        };
         let drifted = recorded(&"a".repeat(64), serde_json::json!({}));
         let under = |freshness| Overrides {
             freshness: Some(freshness),
@@ -2106,7 +2120,7 @@ mod tests {
         };
         let pid = std::process::id();
 
-        let restarts = restarts_live(
+        let restarts = attach_or_restart(
             &plan,
             &under(Freshness::Refresh),
             Refresh::No,
@@ -2114,11 +2128,10 @@ mod tests {
             true,
             pid,
             &drifted,
-            &digest,
-            &manifest,
+            wanted,
         );
-        assert!(restarts.unwrap());
-        let err = restarts_live(
+        assert_eq!(restarts.unwrap(), Attach::ToRestart);
+        let err = attach_or_restart(
             &plan,
             &under(Freshness::RequireCurrent),
             Refresh::No,
@@ -2126,8 +2139,7 @@ mod tests {
             true,
             pid,
             &drifted,
-            &digest,
-            &manifest,
+            wanted,
         )
         .unwrap_err()
         .to_string();
@@ -2143,7 +2155,7 @@ mod tests {
             err.contains("`--freshness reuse` attaches to it as it is"),
             "{err}"
         );
-        let restarts = restarts_live(
+        let restarts = attach_or_restart(
             &plan,
             &under(Freshness::Reuse),
             Refresh::No,
@@ -2151,10 +2163,9 @@ mod tests {
             true,
             pid,
             &drifted,
-            &digest,
-            &manifest,
+            wanted,
         );
-        assert!(!restarts.unwrap());
+        assert_eq!(restarts.unwrap(), Attach::Attached);
         let note = std::fs::read_to_string(transition_path(&plan.state_dir, pid)).unwrap();
         assert!(note.starts_with("reused "), "{note}");
     }
@@ -2165,10 +2176,14 @@ mod tests {
         let plan = plan_in(&t.0);
         ensure_state_dir(&plan).unwrap();
         let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let wanted = Wanted {
+            digest: &digest,
+            manifest: &manifest,
+        };
         let same = recorded(&digest, manifest.clone());
         let pid = std::process::id();
         let joined = |current: bool| {
-            restarts_live(
+            attach_or_restart(
                 &plan,
                 &Overrides::default(),
                 Refresh::Joined,
@@ -2176,23 +2191,22 @@ mod tests {
                 false,
                 pid,
                 &same,
-                &digest,
-                &manifest,
+                wanted,
             )
         };
 
-        assert!(!joined(true).unwrap());
+        assert_eq!(joined(true).unwrap(), Attach::Attached);
         let note_path = transition_path(&plan.state_dir, pid);
         let note = std::fs::read_to_string(&note_path).unwrap();
         assert!(note.starts_with("reused "), "{note}");
         std::fs::remove_file(&note_path).unwrap();
-        assert!(joined(false).unwrap());
+        assert_eq!(joined(false).unwrap(), Attach::ToRestart);
         assert!(!note_path.exists(), "a restart notes no reuse");
         let reclaimed = Identity {
             readied_by_its_boot: false,
             ..recorded(&digest, manifest.clone())
         };
-        let restarts = restarts_live(
+        let restarts = attach_or_restart(
             &plan,
             &Overrides::default(),
             Refresh::Joined,
@@ -2200,10 +2214,13 @@ mod tests {
             false,
             pid,
             &reclaimed,
-            &digest,
-            &manifest,
+            wanted,
         );
-        assert!(restarts.unwrap(), "a claim's re-readying is restarted");
+        assert_eq!(
+            restarts.unwrap(),
+            Attach::ToRestart,
+            "a claim's re-readying is restarted"
+        );
     }
 
     /// A waiter's images are judged on the VM it read the identity of, and only while it is up.
@@ -2257,6 +2274,10 @@ mod tests {
         let _vm = crate::dev::testutil::register_vm(&plan);
         let vm = VmTie::of(&running_vm(&plan).unwrap());
         let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let wanted = Wanted {
+            digest: &digest,
+            manifest: &manifest,
+        };
         let joined = async |by_its_boot: bool| {
             let _ = std::fs::remove_file(identity_path(&plan));
             crate::dev::identity::mark_not_ready(
@@ -2274,14 +2295,11 @@ mod tests {
                 readied_by_its_boot: by_its_boot,
                 ..recorded(&digest, manifest.clone())
             };
-            let (joined, ()) = tokio::join!(
-                wait_for_boot(&plan, 4242, &digest, &manifest, true),
-                async {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    crate::dev::identity::write_identity(&plan, &identity).unwrap();
-                    clear_not_ready(&plan);
-                }
-            );
+            let (joined, ()) = tokio::join!(wait_for_boot(&plan, 4242, wanted, true), async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                crate::dev::identity::write_identity(&plan, &identity).unwrap();
+                clear_not_ready(&plan);
+            });
             joined.unwrap()
         };
 
@@ -2295,8 +2313,7 @@ mod tests {
                     assert_eq!(running.readied_by_its_boot, by_its_boot);
                     let decided = live_decision(
                         &running,
-                        &digest,
-                        &manifest,
+                        wanted,
                         Refresh::Joined,
                         || true,
                         || panic!("the policy was consulted"),
@@ -2408,13 +2425,14 @@ mod tests {
         let cfg = crate::config::Config::default();
         let over = Overrides::default();
         let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let wanted = Wanted {
+            digest: &digest,
+            manifest: &manifest,
+        };
         let parent = 4242;
         let try_swap = async |wait: bool, targeted: VmTie| {
             let _ = std::fs::remove_file(transition_path(&plan.state_dir, parent));
-            let result = swap(
-                &plan, &cfg, &over, wait, parent, targeted, &digest, &manifest,
-            )
-            .await;
+            let result = swap(&plan, &cfg, &over, wait, parent, targeted, wanted).await;
             let note = std::fs::read_to_string(transition_path(&plan.state_dir, parent))
                 .ok()
                 .and_then(|n| n.split_whitespace().next().map(str::to_string));
@@ -2429,14 +2447,14 @@ mod tests {
         let relay = relay_then(&plan.state_dir, || ());
         let record = plan.state_dir.join("publish/web.json");
         assert!(record.exists());
-        assert_eq!(try_swap(false, VM).await, (Ok(true), None));
+        assert_eq!(try_swap(false, VM).await, (Ok(Swap::Boot), None));
         assert!(!record.exists(), "a leftover relay is cleared");
         relay.join().unwrap();
 
         // Still up: stopped, and then booted over.
         let (registration, mut child) = register_vm_in_child(&plan, false);
         let targeted = VmTie::of(&running_vm(&plan).unwrap());
-        assert_eq!(try_swap(false, targeted).await, (Ok(true), None));
+        assert_eq!(try_swap(false, targeted).await, (Ok(Swap::Boot), None));
         // Its lock goes before its exit is reported, so the status may lag the stop.
         let mut status = None;
         for _ in 0..100 {
@@ -2486,7 +2504,7 @@ mod tests {
         });
         assert_eq!(
             try_swap(false, targeted).await,
-            (Ok(false), Some("reused".into()))
+            (Ok(Swap::Joined), Some("reused".into()))
         );
         let (registration, mut replacement) = relay.join().unwrap();
         assert!(replacement.alive());
@@ -2526,7 +2544,7 @@ mod tests {
         write(&recorded(&digest, manifest.clone()));
         assert_eq!(
             try_swap(false, targeted).await,
-            (Ok(false), Some("reused".into()))
+            (Ok(Swap::Joined), Some("reused".into()))
         );
         assert!(stand_in.alive());
 
@@ -2563,7 +2581,7 @@ mod tests {
         });
         assert_eq!(
             try_swap(true, targeted).await,
-            (Ok(false), Some("reused".into()))
+            (Ok(Swap::Joined), Some("reused".into()))
         );
         writer.join().unwrap();
         assert!(stand_in.alive());
@@ -2592,9 +2610,13 @@ mod tests {
         let plan = plan_in(&tmp);
         let _vm = crate::dev::testutil::register_vm(&plan);
         let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let wanted = Wanted {
+            digest: &digest,
+            manifest: &manifest,
+        };
         let pid = std::process::id();
         assert!(
-            take_over(&plan, pid, &digest, &manifest, true).is_none(),
+            take_over(&plan, pid, wanted, true).is_none(),
             "nothing left"
         );
         crate::dev::identity::mark_not_ready(
@@ -2608,18 +2630,18 @@ mod tests {
                 why: "hooks.start: exited with 1".into(),
             },
         );
-        let joined = take_over(&plan, pid, &digest, &manifest, true);
+        let joined = take_over(&plan, pid, wanted, true);
         let vm = VmTie::of(&running_vm(&plan).unwrap());
         assert!(
             matches!(joined, Some(Joined::Restart(tie)) if tie == vm),
             "{joined:?}"
         );
-        let joined = take_over(&plan, pid, &digest, &manifest, false);
+        let joined = take_over(&plan, pid, wanted, false);
         assert!(matches!(joined, Some(Joined::Claimed)), "{joined:?}");
         let left = read_not_ready(&plan).unwrap();
         assert_eq!(left.readier, crate::dev::identity::Readier::of(pid));
         assert!(
-            take_over(&plan, pid, &digest, &manifest, true).is_none(),
+            take_over(&plan, pid, wanted, true).is_none(),
             "a claimed readying is waited on, even by a refresh"
         );
     }
