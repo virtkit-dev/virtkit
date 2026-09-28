@@ -11,8 +11,8 @@ use crate::dev::plan::{Plan, Source};
 use super::boot::{alias, worktree_git_dir};
 use super::hooks::{check_requirements, stamped};
 use super::identity::{
-    applied_on_attach, drift, generation_of, identity_of, read_identity, root_identity,
-    wrapper_digest,
+    LeftBehind, NotReady, VmTie, applied_on_attach, drift, generation_of, identity_of, left_behind,
+    read_identity, read_not_ready, root_identity, wrapper_digest,
 };
 use super::session::running_vm;
 
@@ -29,6 +29,8 @@ pub struct Status {
     pub pid: Option<u32>,
     /// how the config compares with the recorded identity, when running
     pub config_state: Option<ConfigState>,
+    /// readiness from the not-ready marker, for a running environment with no identity
+    pub not_ready: Option<NotReadyState>,
     pub booted_digest: Option<String>,
     pub current_digest: String,
     /// how the running images compare with the sources they were built from
@@ -65,6 +67,37 @@ pub enum ConfigState {
     Unknown,
 }
 
+/// Why a running environment is not ready, from its VM's not-ready marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum NotReadyState {
+    /// a parent is readying it now; `vk dev` waits for that
+    Readying { pid: u32 },
+    /// its readying failed or its parent is gone: the next `vk dev` command takes it over,
+    /// or, when `drifted` (booted from a different configuration), the freshness policy
+    /// decides
+    Abandoned { reason: String, drifted: bool },
+}
+
+/// Interpret `left` for `running` and the current `digest`/`manifest`, as a joiner does.
+/// Return `None` for another VM's marker, or one with neither a readier nor a failure.
+fn not_ready_state(
+    left: &NotReady,
+    running: VmTie,
+    digest: &str,
+    manifest: &serde_json::Value,
+) -> Option<NotReadyState> {
+    let how = left_behind(left, Some(running), digest, manifest)?;
+    match (left.abandoned(), left.readier) {
+        (true, _) => Some(NotReadyState::Abandoned {
+            reason: left.reason().to_string(),
+            drifted: how == LeftBehind::Drifted,
+        }),
+        (false, Some(r)) => Some(NotReadyState::Readying { pid: r.pid }),
+        (false, None) => None,
+    }
+}
+
 /// How a running environment's images compare with the sources they were built from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -87,13 +120,32 @@ pub fn status(plan: &Plan) -> Result<Status> {
     let (current_digest, manifest) = identity_of(plan, wrapper_digest(plan).as_deref())?;
     let vm = running_vm(plan);
     let recorded = vm.as_ref().and_then(|_| read_identity(plan));
-    let config_state = vm.as_ref().map(|_| match &recorded {
-        Some(id) if id.digest == current_digest => ConfigState::Matches,
+    // Without an identity, a marker naming this VM distinguishes a boot in progress
+    // from one left not ready.
+    let left = match (&vm, &recorded) {
+        (Some(vm), None) => read_not_ready(plan).and_then(|left| {
+            let state = not_ready_state(&left, VmTie::of(vm), &current_digest, &manifest)?;
+            Some((left, state))
+        }),
+        _ => None,
+    };
+    // Use the boot configuration from the identity, falling back to the not-ready marker.
+    let booted = recorded
+        .as_ref()
+        .map(|id| (&id.digest, &id.manifest))
+        .or(left
+            .as_ref()
+            .map(|(left, _)| (&left.digest, &left.manifest)));
+    let config_state = vm.as_ref().map(|_| match booted {
+        Some((digest, _)) if *digest == current_digest => ConfigState::Matches,
         // What `up` applies to a running environment is not drift worth a restart.
-        Some(id) if applied_on_attach(&drift(&id.manifest, &manifest)) => ConfigState::SessionOnly,
+        Some((_, booted)) if applied_on_attach(&drift(booted, &manifest)) => {
+            ConfigState::SessionOnly
+        }
         Some(_) => ConfigState::Drifted,
         None => ConfigState::Unknown,
     });
+    let booted_digest = booted.map(|(digest, _)| digest.clone());
     // Whether the config matches is one question; whether the images it names still match
     // their sources is another, and a caller deciding whether to refresh wants both.
     let image = vm.as_ref().map(|vm| match crate::vms::freshness_all(vm) {
@@ -133,11 +185,12 @@ pub fn status(plan: &Plan) -> Result<Status> {
         running: vm.is_some(),
         pid: vm.as_ref().map(|vm| vm.pid),
         config_state,
+        not_ready: left.map(|(_, state)| state),
         created_by: recorded
             .as_ref()
             .map(|id| id.created_by.clone())
             .filter(|v| !v.is_empty()),
-        booted_digest: recorded.map(|id| id.digest),
+        booted_digest,
         current_digest,
         generation,
         create_hook_pending,
@@ -197,6 +250,23 @@ impl Status {
             return out;
         };
         line("status", format!("running (pid {pid})"));
+        match &self.not_ready {
+            Some(NotReadyState::Readying { pid }) => line(
+                "ready",
+                format!("not yet: being readied by pid {pid}; `vk dev` waits for it"),
+            ),
+            Some(NotReadyState::Abandoned { reason, drifted }) => line(
+                "ready",
+                format!(
+                    "no: its readying did not finish ({reason}); {}",
+                    match drifted {
+                        false => "the next `vk dev` command takes it over",
+                        true => "the freshness policy decides on the next `vk dev` command",
+                    }
+                ),
+            ),
+            None => {}
+        }
         if let Some(by) = &self.created_by {
             line("created by", by.clone());
         }
@@ -479,6 +549,7 @@ fn writable(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dev::identity::Readier;
     use crate::dev::testutil::{mount, plan_in, scratch};
 
     #[test]
@@ -522,6 +593,176 @@ mod tests {
             "{report}"
         );
         assert!(!t.0.join("state").exists(), "nothing was created");
+    }
+
+    #[test]
+    fn a_marker_reads_as_a_joiner_reads_it() {
+        let t = scratch("not-ready-state");
+        let plan = plan_in(&t.0);
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let vm = VmTie {
+            pid: 41,
+            created_secs: 7,
+        };
+        let me = Readier::of(std::process::id()).unwrap();
+        let left = |readier, why: &str| NotReady {
+            vm,
+            digest: digest.clone(),
+            manifest: manifest.clone(),
+            booted_secs: 1000,
+            readier,
+            why: why.into(),
+        };
+        let state = |left: &NotReady| not_ready_state(left, vm, &digest, &manifest);
+        let abandoned = |reason: &str, drifted| {
+            Some(NotReadyState::Abandoned {
+                reason: reason.into(),
+                drifted,
+            })
+        };
+        assert_eq!(
+            state(&left(Some(me), "")),
+            Some(NotReadyState::Readying { pid: me.pid })
+        );
+        assert_eq!(
+            state(&left(None, "hooks.start: exited with 1")),
+            abandoned("hooks.start: exited with 1", false)
+        );
+        let gone = Readier {
+            started: me.started + 1,
+            ..me
+        };
+        assert_eq!(
+            state(&left(Some(gone), "")),
+            abandoned("the process readying it is gone", false)
+        );
+        // Nobody named and no failure: no joiner takes it, so it says nothing.
+        assert_eq!(state(&left(None, "")), None);
+        // Another VM's marker describes nothing up.
+        let other = VmTie { pid: 42, ..vm };
+        assert_eq!(
+            not_ready_state(&left(None, "x"), other, &digest, &manifest),
+            None
+        );
+        // Booted from another configuration: the freshness policy's to decide.
+        let drifted = NotReady {
+            digest: "a".repeat(64),
+            manifest: serde_json::json!({}),
+            ..left(None, "x")
+        };
+        assert_eq!(state(&drifted), abandoned("x", true));
+        // A live readier is waited on, whatever it was booted from.
+        let readying = NotReady {
+            readier: Some(me),
+            why: String::new(),
+            ..drifted
+        };
+        assert_eq!(
+            state(&readying),
+            Some(NotReadyState::Readying { pid: me.pid })
+        );
+    }
+
+    #[test]
+    fn a_not_ready_environment_is_reported_with_what_comes_next() {
+        let t = scratch("status-not-ready");
+        let plan = plan_in(&t.0);
+        let mut s = status(&plan).unwrap();
+        assert_eq!(
+            serde_json::to_value(&s).unwrap()["not_ready"],
+            serde_json::Value::Null
+        );
+        s.pid = Some(41);
+        s.running = true;
+        let ready = |s: &Status| {
+            s.render()
+                .lines()
+                .find_map(|l| l.strip_prefix("ready").map(|v| v.trim().to_string()))
+        };
+        assert_eq!(ready(&s), None);
+        s.not_ready = Some(NotReadyState::Readying { pid: 7 });
+        assert_eq!(
+            ready(&s).unwrap(),
+            "not yet: being readied by pid 7; `vk dev` waits for it"
+        );
+        assert_eq!(
+            serde_json::to_value(&s).unwrap()["not_ready"],
+            serde_json::json!({ "state": "readying", "pid": 7 })
+        );
+        s.not_ready = Some(NotReadyState::Abandoned {
+            reason: "hooks.start: exited with 1".into(),
+            drifted: false,
+        });
+        assert_eq!(
+            ready(&s).unwrap(),
+            "no: its readying did not finish (hooks.start: exited with 1); the next `vk dev` \
+             command takes it over"
+        );
+        s.not_ready = Some(NotReadyState::Abandoned {
+            reason: "x".into(),
+            drifted: true,
+        });
+        assert_eq!(
+            ready(&s).unwrap(),
+            "no: its readying did not finish (x); the freshness policy decides on the next \
+             `vk dev` command"
+        );
+        assert_eq!(
+            serde_json::to_value(&s).unwrap()["not_ready"],
+            serde_json::json!({ "state": "abandoned", "reason": "x", "drifted": true })
+        );
+    }
+
+    /// For a registered VM with no identity, compare against the marker's boot configuration.
+    #[test]
+    fn a_not_ready_environment_is_compared_by_what_its_marker_records() {
+        const CHILD: &str = "VK_TEST_STATUS_NOT_READY";
+        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let tmp = scratch("status-marker");
+            crate::dev::testutil::in_child(
+                "dev::status::tests::a_not_ready_environment_is_compared_by_what_its_marker_records",
+                CHILD,
+                &tmp.0,
+            );
+            return;
+        };
+        let plan = plan_in(&tmp);
+        let _vm = crate::dev::testutil::register_vm(&plan);
+        let (digest, manifest) = identity_of(&plan, wrapper_digest(&plan).as_deref()).unwrap();
+        let mut left = NotReady {
+            vm: VmTie::of(&running_vm(&plan).unwrap()),
+            digest: digest.clone(),
+            manifest: manifest.clone(),
+            booted_secs: 1000,
+            readier: None,
+            why: "hooks.start: exited with 1".into(),
+        };
+        crate::dev::identity::mark_not_ready(&plan, &left);
+        let s = status(&plan).unwrap();
+        assert_eq!(s.config_state, Some(ConfigState::Matches));
+        assert_eq!(s.booted_digest.as_deref(), Some(digest.as_str()));
+        assert!(matches!(
+            s.not_ready,
+            Some(NotReadyState::Abandoned { drifted: false, .. })
+        ));
+
+        // Booted with other endpoints, which an attach applies: taken over, not drift.
+        left.digest = "b".repeat(64);
+        left.manifest["endpoints"] = serde_json::json!([{ "name": "web", "host_port": 8080 }]);
+        crate::dev::identity::mark_not_ready(&plan, &left);
+        let s = status(&plan).unwrap();
+        assert_eq!(s.config_state, Some(ConfigState::SessionOnly));
+        assert!(matches!(
+            s.not_ready,
+            Some(NotReadyState::Abandoned { drifted: false, .. })
+        ));
+
+        left.digest = "a".repeat(64);
+        left.manifest = serde_json::json!({});
+        crate::dev::identity::mark_not_ready(&plan, &left);
+        let s = status(&plan).unwrap();
+        assert_eq!(s.config_state, Some(ConfigState::Drifted));
+        assert!(s.render().contains("DRIFTED: booted from aaaaaaaaaaaa"));
     }
 
     #[test]

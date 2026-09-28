@@ -12,11 +12,12 @@ All notable changes to virtkit will be documented in this file.
   and `vk dev code` could start a second reconciliation.
 - **An environment whose `vk dev up` failed after booting can be used again.** When
   publishing an endpoint, `hooks.create` or `hooks.start` fails, or the `vk dev` readying
-  it is killed, the VM stays up without being ready; the next `vk dev` command used to wait
-  five minutes for that boot to finish and then fail. It now takes the environment over and
-  runs those steps again, with `--no-wait` too. If the configuration has since changed in a
-  way that needs a restart, the freshness policy decides instead, as for any running
-  environment.
+  the environment is killed, the VM stays up without being ready; the next `vk dev` command
+  used to wait five minutes for that boot to finish and then fail. It now takes the
+  environment over and runs those steps again, with `--no-wait` too. If the configuration
+  has since changed in a way that needs a restart, the freshness policy decides instead, as
+  for any running environment. `vk dev status` says when the environment is being readied,
+  or was left not ready and why.
 - **Stopping a VM lets its processes exit.** On guests booted with virtkit's own init (no
   `--init image` or `--init entrypoint`), stopping or rebooting now sends SIGTERM to the
   commands started with `vk run`, `vk exec` or `vk dev exec`, and to the daemons they
