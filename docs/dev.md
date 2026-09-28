@@ -360,9 +360,10 @@ path = "/ui"
 
 The compose build context is relative to the compose file. Dependencies start
 with the primary; profiled services remain on demand unless selected through
-`[dev].profiles`. Services resolve each other over the shared LAN by service name
-and hostname. The runner image in this example must provide its own server on
-port 443; declaring an endpoint does not install or start an application.
+`[dev].profiles`. Services, the primary included, resolve each other over the
+shared LAN by service name and hostname. The runner image in this example must
+provide its own server on port 443; declaring an endpoint does not install or
+start an application.
 
 ```sh
 vk dev service status

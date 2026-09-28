@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Compose services resolve the primary by name.** Siblings can reach a `vk dev` or
+  `vk run --primary` VM by service name and hostname, like any other service. A non-service
+  primary answers to `vm`. Previously, proxies needed its address because its name did not
+  resolve.
+
 ## [0.79.1] - 2026-09-27
 
 ### Fixed

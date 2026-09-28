@@ -218,7 +218,9 @@ start (`vk service up` streams the build), the `--primary` service up front.
 path, a list of paths, or `{path, required: false}` entries, layered beneath it.
 `entrypoint:` replaces the image's entrypoint *and* drops its command; `command:` alone
 replaces only the command; `user:` replaces the user. `hostname:` (a DNS label) defaults to
-the service name and is what other services resolve.
+the service name. Other guests resolve services, including the primary, by service name or
+hostname. A non-service primary (an image or a `-f` build) resolves as `vm`. Siblings keep
+shared names on collision with the primary.
 
 Values interpolate `$VAR`, `${VAR}` and `${VAR:-default}` from the environment over a
 sibling `.env`; `$$` is a literal `$`. An unset variable with no default **fails the load**

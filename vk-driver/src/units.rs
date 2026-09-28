@@ -359,6 +359,28 @@ fn read_merged_config(unit: &crate::compose::Unit, ext4: &Path) -> Result<RunCon
     Ok(crate::compose::merged_config(&image_cfg, unit))
 }
 
+/// Resolver entries for a VM outside the service list (a run's primary), using `names`
+/// at `ip`. Preserve service names: the switch keeps the last entry, so appending a
+/// duplicate would override the service.
+pub fn unclaimed_hosts(
+    names: &[&str],
+    claimed: &[(String, String)],
+    ip: Ipv4Addr,
+) -> Vec<(String, String)> {
+    let mut hosts: Vec<(String, String)> = Vec::new();
+    for name in names {
+        let name = name.to_ascii_lowercase();
+        if claimed.iter().any(|(n, _)| *n == name) {
+            eprintln!(
+                "virtkit: warning: {name} resolves to the service that claims it, not to the VM at {ip}"
+            );
+        } else if !hosts.iter().any(|(n, _)| *n == name) {
+            hosts.push((name, ip.to_string()));
+        }
+    }
+    hosts
+}
+
 /// The `n`th static service address, counted from the TOP of the subnet down
 /// (`n = 0` → broadcast - 1). DHCP leases (a dev VM, a CI job VM) grow from the
 /// bottom (.2 up), so the two never collide in practice.
@@ -841,6 +863,17 @@ fn create_overlay(ext4: &Path, overlay: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unclaimed_hosts_leaves_a_services_name_to_it() {
+        let ip = Ipv4Addr::new(192, 168, 127, 2);
+        let claimed = vec![("web".to_string(), "192.168.127.254".to_string())];
+        // Skip claimed names, deduplicate, and lowercase names to match switch lookups.
+        assert_eq!(
+            unclaimed_hosts(&["Dev", "web", "dev"], &claimed, ip),
+            vec![("dev".to_string(), "192.168.127.2".to_string())]
+        );
+    }
 
     /// A private directory for one test, removed and recreated so a rerun starts clean; the
     /// `vk-units-` prefix and the pid keep concurrent test processes off each other's paths.

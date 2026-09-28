@@ -149,6 +149,8 @@ pub(crate) fn socket_volume_port(n: usize, guest: &str) -> Result<u32> {
 }
 /// The run LAN: gateway .1, the run VM .2, services from the top down.
 const RUN_SUBNET: &str = "192.168.127.0/24";
+/// Default run VM hostname; compose primaries use their service's hostname.
+const PRIMARY_HOSTNAME: &str = "vm";
 
 /// How the host re-invokes the agent's native subcommands (`fsfreeze`, `mount`, `copy`,
 /// `fsmark`) inside the guest. `/proc/self/exe` resolves, in the forked child, to the
@@ -1466,7 +1468,7 @@ async fn build_and_boot(
             let mut kcmd = format!(
                 "console=ttyS0 pci=conf1 VIRTKIT_PIVOT=/dev/vda \
                  VIRTKIT_VSOCK_PORT={VSOCK_PORT} VIRTKIT_HOSTNAME={}",
-                primary_hostname.as_deref().unwrap_or("vm")
+                primary_hostname.as_deref().unwrap_or(PRIMARY_HOSTNAME)
             );
             // A modular image kernel has no early hvc0: keep console on ttyS0 (see the
             // console gating in libkrun_sys). The pinned kernel has hvc0, so kernel==default
@@ -1514,7 +1516,7 @@ async fn build_and_boot(
                 format!(
                     "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
                      VIRTKIT_HOSTNAME={} VIRTKIT_VSOCK_PORT={VSOCK_PORT}",
-                    primary_hostname.as_deref().unwrap_or("vm")
+                    primary_hostname.as_deref().unwrap_or(PRIMARY_HOSTNAME)
                 ),
             )
         } else if !args.ram {
@@ -1547,7 +1549,7 @@ async fn build_and_boot(
                 format!(
                     "console=ttyS0 root=/dev/vda rw rootfstype=ext4 \
                      init=/usr/local/bin/vk-agent \
-                     VIRTKIT_HOSTNAME=vm VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
+                     VIRTKIT_HOSTNAME={PRIMARY_HOSTNAME} VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
                 ),
             )
         } else {
@@ -1581,7 +1583,8 @@ async fn build_and_boot(
                 Vec::new(),
                 Some(cpio),
                 format!(
-                    "console=ttyS0 rdinit=/usr/local/bin/vk-agent VIRTKIT_HOSTNAME=vm \
+                    "console=ttyS0 rdinit=/usr/local/bin/vk-agent \
+                     VIRTKIT_HOSTNAME={PRIMARY_HOSTNAME} \
                      VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
                 ),
             )
@@ -1643,9 +1646,21 @@ async fn build_and_boot(
         ));
     }
 
+    // The subnet fixes the gateway and the primary's eth0 address; `spawn_vm_switch` derives
+    // the same pair, so `vk list` can report the address straight from the registry.
+    let (gw, _, primary_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
+
     // Compose services: sibling unit VMs on the run switch, resolvable by alias
     // over its DNS, torn down with the run.
-    let planned = plan_services(args, cfg, state_dir, work, &compose_units, primary_idx)?;
+    let planned = plan_services(
+        args,
+        cfg,
+        state_dir,
+        work,
+        &compose_units,
+        primary_idx,
+        Some(primary_ip),
+    )?;
     // With sibling services under management, the agent exposes their control
     // plane at /run/vk/services (a FUSE bridge to the manager over vsock).
     if !planned.units.is_empty() {
@@ -1704,9 +1719,6 @@ async fn build_and_boot(
     // NICs under libkrun, or a vsock bridge the agent's tap rides under cloud-hypervisor;
     // the agent takes the static address from the cmdline fragment either way.
     // With services it also pre-listens on their sockets and answers their aliases.
-    // The subnet fixes the gateway and the primary's eth0 address; `spawn_vm_switch` derives
-    // the same pair, so `vk list` can report the address straight from the registry.
-    let (gw, _, primary_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
     let mut net_attach: Option<crate::vmm::SwitchAttach> = None;
     let mut switch = if args.net {
         // Opt-in credential proxy: run a host-local proxy that injects the runner's
@@ -2830,7 +2842,8 @@ fn build_compose_images(
 /// its real config. A `build:` sibling addresses its shared build-tier ext4 (a pure function
 /// of the stage fingerprint) but is not built yet — it gets the compose overrides alone as a
 /// placeholder until the manager builds it on demand at first start and adopts the entry it
-/// built, with that image's config.
+/// built, with that image's config. `primary_ip` names the run VM in the resolver;
+/// compose up has no primary.
 fn plan_services(
     args: &RunArgs,
     cfg: &crate::config::Config,
@@ -2838,6 +2851,7 @@ fn plan_services(
     work: &Path,
     units: &[crate::compose::Unit],
     primary_idx: Option<usize>,
+    primary_ip: Option<std::net::Ipv4Addr>,
 ) -> Result<PlannedServices> {
     let mut planned = PlannedServices {
         units: Vec::new(),
@@ -2971,7 +2985,26 @@ fn plan_services(
             planned.start.push(name);
         }
     }
+    push_primary_hosts(&mut planned.hosts, units, primary_idx, primary_ip);
     Ok(planned)
+}
+
+/// Append resolver entries for the run VM, which boots outside the sibling loop.
+/// A `--primary` service uses its service name and hostname; other primaries use their
+/// boot hostname. Compose up has no primary IP and adds no entries.
+fn push_primary_hosts(
+    hosts: &mut Vec<(String, String)>,
+    units: &[crate::compose::Unit],
+    primary_idx: Option<usize>,
+    ip: Option<std::net::Ipv4Addr>,
+) {
+    let Some(ip) = ip else { return };
+    let names = match primary_idx {
+        Some(i) => vec![units[i].name.as_str(), units[i].hostname.as_str()],
+        None => vec![PRIMARY_HOSTNAME],
+    };
+    let primary = crate::units::unclaimed_hosts(&names, hosts, ip);
+    hosts.extend(primary);
 }
 
 /// Builtins for loading a run's compose file. The persist anchor is set only when the run pins
@@ -3024,7 +3057,7 @@ async fn compose_up(
 
     // compose-up has no primary — every unit is a sibling, so there is nothing to build up
     // front here (siblings resolve/build via plan_services + the manager).
-    let planned = plan_services(args, cfg, state_dir, work, &units, None)?;
+    let planned = plan_services(args, cfg, state_dir, work, &units, None, None)?;
 
     // The switch binds every unit's socket; no VM ever dials the base socket
     // (there is no primary), it is just the switch's canonical listen path.
@@ -4898,6 +4931,91 @@ mod tests {
     use vk_core::messages::CmdResult;
 
     use super::*;
+
+    fn compose_units(yaml: &str) -> Vec<crate::compose::Unit> {
+        crate::compose::parse(yaml, Path::new("/proj"), &|_| None, None).unwrap()
+    }
+
+    /// Resolver entries after appending the primary to the siblings' hosts.
+    fn primary_hosts(
+        units: &[crate::compose::Unit],
+        primary_idx: Option<usize>,
+        hosts: &[(&str, &str)],
+        ip: Option<std::net::Ipv4Addr>,
+    ) -> Vec<(String, String)> {
+        let mut hosts = hosts
+            .iter()
+            .map(|(n, a)| (n.to_string(), a.to_string()))
+            .collect();
+        push_primary_hosts(&mut hosts, units, primary_idx, ip);
+        hosts
+    }
+
+    fn pairs(hosts: &[(String, String)]) -> Vec<(&str, &str)> {
+        hosts
+            .iter()
+            .map(|(n, a)| (n.as_str(), a.as_str()))
+            .collect()
+    }
+
+    const PRIMARY_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 127, 2);
+
+    #[test]
+    fn the_primary_service_resolves_by_its_name_and_hostname_after_the_siblings() {
+        let units = compose_units(
+            "services:\n  dev:\n    image: a\n    hostname: builder\n  web:\n    image: b\n",
+        );
+        let hosts = primary_hosts(
+            &units,
+            Some(0),
+            &[("web", "192.168.127.254")],
+            Some(PRIMARY_IP),
+        );
+        assert_eq!(
+            pairs(&hosts),
+            vec![
+                ("web", "192.168.127.254"),
+                ("dev", "192.168.127.2"),
+                ("builder", "192.168.127.2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_non_service_primary_resolves_by_its_default_hostname() {
+        let units = compose_units("services:\n  web:\n    image: b\n");
+        let hosts = primary_hosts(&units, None, &[], Some(PRIMARY_IP));
+        assert_eq!(pairs(&hosts), vec![(PRIMARY_HOSTNAME, "192.168.127.2")]);
+    }
+
+    #[test]
+    fn compose_up_registers_no_primary() {
+        let units = compose_units("services:\n  web:\n    image: b\n");
+        let hosts = primary_hosts(&units, None, &[("web", "192.168.127.254")], None);
+        assert_eq!(pairs(&hosts), vec![("web", "192.168.127.254")]);
+    }
+
+    #[test]
+    fn a_sibling_keeps_a_name_the_primary_shares() {
+        // The primary's hostname must not displace the sibling's service name.
+        let units = compose_units(
+            "services:\n  dev:\n    image: a\n    hostname: web\n  web:\n    image: b\n",
+        );
+        let hosts = primary_hosts(
+            &units,
+            Some(0),
+            &[("web", "192.168.127.254")],
+            Some(PRIMARY_IP),
+        );
+        assert_eq!(
+            pairs(&hosts),
+            vec![("web", "192.168.127.254"), ("dev", "192.168.127.2")]
+        );
+        // A service name that is also its hostname appears once.
+        let plain = compose_units("services:\n  dev:\n    image: a\n");
+        let hosts = primary_hosts(&plain, Some(0), &[], Some(PRIMARY_IP));
+        assert_eq!(pairs(&hosts), vec![("dev", "192.168.127.2")]);
+    }
 
     /// Minimal `RunArgs` for option-builder tests. It is not bootable: the CLI normally fills
     /// the VM name, boot timeout, and SSH user. Do not pass it to `run`.
