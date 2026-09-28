@@ -938,6 +938,34 @@ fn wait_gone(state_dir: &Path, name: &str, timeout: Duration) -> bool {
     }
 }
 
+/// Model a live publisher by holding its lifetime lock beside its record, for tests here and
+/// in modules that stop publishers. `service` names the compose sibling that dials, as `--via`
+/// does; `None` is the primary.
+#[cfg(test)]
+pub(crate) fn fake_publisher(
+    state_dir: &Path,
+    name: &str,
+    listen: &str,
+    to: &str,
+    pid: u32,
+    service: Option<&str>,
+) -> std::fs::File {
+    let lock = claim(state_dir, name).unwrap().expect("nothing held it");
+    write_entry(
+        state_dir,
+        &Entry {
+            name: name.to_string(),
+            listen: listen.to_string(),
+            to: to.to_string(),
+            service: service.map(str::to_string),
+            pid,
+            created_secs: 0,
+        },
+    )
+    .unwrap();
+    lock
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1213,32 +1241,6 @@ mod tests {
         );
         let _ = victim.kill();
         let _ = victim.wait();
-    }
-
-    /// Model a live publisher by holding its lifetime lock beside its record. `service`
-    /// names the compose sibling that dials, as `--via` does; `None` is the primary.
-    fn fake_publisher(
-        state_dir: &Path,
-        name: &str,
-        listen: &str,
-        to: &str,
-        pid: u32,
-        service: Option<&str>,
-    ) -> std::fs::File {
-        let lock = claim(state_dir, name).unwrap().expect("nothing held it");
-        write_entry(
-            state_dir,
-            &Entry {
-                name: name.to_string(),
-                listen: listen.to_string(),
-                to: to.to_string(),
-                service: service.map(str::to_string),
-                pid,
-                created_secs: 0,
-            },
-        )
-        .unwrap();
-        lock
     }
 
     #[test]

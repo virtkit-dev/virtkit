@@ -220,12 +220,33 @@ pub(super) mod testutil {
         register_vm_as(plan, std::process::id())
     }
 
-    /// Like [`register_vm`], with `pid` as the managing process that stop signals.
+    /// Like [`register_vm`], with `pid` as the managing process that stop signals. Since this
+    /// process holds the lock, `vk stop` and [`crate::dev::stop`] signal `pid`, while
+    /// [`crate::vms::stop_entry`] reads the entry as replaced and signals nothing.
     pub(super) fn register_vm_as(
         plan: &Plan,
         pid: u32,
     ) -> (crate::vms::Registration, std::fs::File) {
         std::fs::create_dir_all(&plan.state_dir).unwrap();
+        let lock = crate::dev::list::try_lock_state_dir(&plan.state_dir).expect("lock it");
+        (register_entry(plan, pid), lock)
+    }
+
+    /// Like [`register_vm`], managed by a stand-in that takes the state dir lock itself, as a
+    /// `vk run` does: procfs names it as the holder, and a stop that signals it brings the VM
+    /// down unless `ignores_term`.
+    pub(super) fn register_vm_in_child(
+        plan: &Plan,
+        ignores_term: bool,
+    ) -> (crate::vms::Registration, StandIn) {
+        std::fs::create_dir_all(&plan.state_dir).unwrap();
+        let stand_in = StandIn::locking(&plan.state_dir, ignores_term);
+        (register_entry(plan, stand_in.id()), stand_in)
+    }
+
+    /// Record `plan`'s VM as managed by `pid`, taking no lock: alive only while something
+    /// else holds the state dir's.
+    pub(super) fn register_entry(plan: &Plan, pid: u32) -> crate::vms::Registration {
         let entry = serde_json::from_value(serde_json::json!({
             "state_dir": crate::vms::canonical(&plan.state_dir),
             "pid": pid,
@@ -234,9 +255,70 @@ pub(super) mod testutil {
             "created_secs": 7
         }))
         .unwrap();
-        let registration = crate::vms::register(entry);
-        let lock = crate::dev::list::try_lock_state_dir(&plan.state_dir).expect("lock it");
-        (registration, lock)
+        crate::vms::register(entry)
+    }
+
+    /// Stand-in for a registered VM's `vk run`, keeping stop signals out of the test process.
+    /// Killed on drop so a failed assertion leaves nothing running.
+    pub(crate) struct StandIn(std::process::Child);
+
+    impl StandIn {
+        pub(crate) fn spawn() -> Self {
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("600")
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        /// A stand-in holding `dir`'s lock for as long as it runs; one that `ignores_term`
+        /// outlasts any stop.
+        pub(crate) fn locking(dir: &Path, ignores_term: bool) -> Self {
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::process::CommandExt;
+            let dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("600");
+            // SAFETY: only `signal`, `open` and `flock` run between fork and exec, all
+            // async-signal-safe. The descriptor is left open across the exec, so the lock lasts
+            // as long as the `sleep`; an ignored signal stays ignored across it, so the stand-in
+            // ignores a stop from the moment it exists.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if ignores_term && libc::signal(libc::SIGTERM, libc::SIG_IGN) == libc::SIG_ERR {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let fd = libc::open(dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY);
+                    if fd < 0 || libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            Self(cmd.spawn().unwrap())
+        }
+
+        pub(crate) fn id(&self) -> u32 {
+            self.0.id()
+        }
+
+        /// How it exited, once it has.
+        pub(crate) fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+            self.0.try_wait().unwrap()
+        }
+
+        pub(crate) fn alive(&mut self) -> bool {
+            self.try_wait().is_none()
+        }
+    }
+
+    impl Drop for StandIn {
+        fn drop(&mut self) {
+            // Best effort: a stand-in that already exited has nothing left to end.
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     /// Rerun test `name` in its own process with `XDG_DATA_HOME` under `dir` and `var` set to

@@ -1467,17 +1467,46 @@ pub fn stop_cmd(target: Option<Selector>, all: bool, timeout: u64) -> Result<(St
     let mut out = String::new();
     let mut ok = true;
     for e in &selected {
-        if stop_one(e, timeout) {
-            out.push_str(&format!("stopped {} (pid {})\n", e.label, e.pid));
-        } else {
-            out.push_str(&format!(
-                "{} (pid {}) did not stop after {timeout}s\n",
-                e.label, e.pid
-            ));
-            ok = false;
-        }
+        let (line, down) = stop_line(e, timeout);
+        out.push_str(&line);
+        ok &= down;
     }
     Ok((out, ok))
+}
+
+/// Stop the VM `entry` records, as [`stop_cmd`] stops each one it selects: the report line,
+/// and whether it went down.
+fn stop_line(entry: &VmEntry, timeout: u64) -> (String, bool) {
+    if stop_one(entry, timeout) {
+        (
+            format!("stopped {} (pid {})\n", entry.label, entry.pid),
+            true,
+        )
+    } else {
+        (
+            format!(
+                "{} (pid {}) did not stop after {timeout}s\n",
+                entry.label, entry.pid
+            ),
+            false,
+        )
+    }
+}
+
+/// [`stop_line`] for `entry` only: `None`, with nothing stopped or signalled, when its
+/// state-dir lock is held by a process other than its `vk run` — a run that replaced it
+/// there. [`alive`] reads any holder of the lock as this VM, which is right for `vk stop`,
+/// asked about a directory, but not for a caller that means this one VM. A holder procfs
+/// cannot name (see [`crate::run::flock_holder`]) is taken to be its own run, as `alive`
+/// takes it.
+pub(crate) fn stop_entry(entry: &VmEntry, timeout: u64) -> Option<(String, bool)> {
+    let holder = std::fs::File::open(&entry.state_dir)
+        .ok()
+        .and_then(|f| crate::run::flock_holder_pid(&f));
+    if holder.is_some_and(|pid| u32::try_from(pid) != Ok(entry.pid)) {
+        return None;
+    }
+    Some(stop_line(entry, timeout))
 }
 
 /// How a VM was rebooted, or why it was not.
@@ -2934,5 +2963,43 @@ PUBLISHED     -
         // The two figures as the README prints them, in the cells it puts them in.
         assert_eq!(cells(text.lines().nth(1).unwrap())[2], "1.2G/8G", "{text}");
         assert_eq!(cells(text.lines().nth(2).unwrap())[2], "5.9G/16G", "{text}");
+    }
+
+    /// A state-dir lock held by a process other than the entry's `vk run` reads as a run that
+    /// replaced it: neither that run nor its relays are signalled.
+    #[test]
+    fn stop_entry_leaves_a_vm_whose_lock_another_process_holds() {
+        use crate::dev::testutil::StandIn;
+
+        let dir = tmpdir("stop-entry");
+        let lock = std::fs::File::open(&dir).unwrap();
+        // SAFETY: the fd is owned by `lock`, which outlives the call.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        // stop_entry takes a holder procfs cannot name for the entry's own run, so this
+        // needs procfs to name the test process.
+        assert_eq!(
+            crate::run::flock_holder_pid(&lock),
+            i32::try_from(std::process::id()).ok()
+        );
+        let mut run = StandIn::spawn();
+        let mut relay = StandIn::spawn();
+        let _relay_lock = crate::publish::fake_publisher(
+            &dir,
+            "web",
+            "tcp://127.0.0.1:8600",
+            "vsock://80",
+            relay.id(),
+            None,
+        );
+        let mut e = entry(dir.clone(), None);
+        e.pid = run.id();
+        assert!(stop_entry(&e, 1).is_none());
+        assert!(run.alive(), "the entry's run was signalled");
+        assert!(relay.alive(), "its relay was stopped");
+        assert!(dir.join("publish/web.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

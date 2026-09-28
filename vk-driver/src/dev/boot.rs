@@ -16,11 +16,14 @@ use super::identity::{
     identity_of, identity_path, left_behind, live_identity, note_older_creator, read_not_ready,
     sha256_hex, try_read_identity,
 };
-use super::session::{ask_on_terminal, on_terminal, running_vm, stop};
+use super::session::{ask_on_terminal, on_terminal, running_vm};
 use super::{GENERATION_MARKER, INFLIGHT_POLL, Identity, Overrides, TRANSITION_WAIT, Transition};
 
 /// Shared stop timeout for refresh and the default `vk dev stop --timeout`, in seconds.
 pub(super) const STOP_TIMEOUT_SECS: u64 = 10;
+
+/// Restart stop timeout in seconds; tests wait only one second for an unresponsive stand-in.
+const SWAP_STOP_SECS: u64 = if cfg!(test) { 1 } else { STOP_TIMEOUT_SECS };
 
 /// The state dir, created private. Everything in it is host-owned — keys, the host-command
 /// allowlist, this identity — so it is 0700 from the moment it exists. The managed storage
@@ -481,17 +484,46 @@ fn decide(
     })
 }
 
-/// Replace what is running with what the config now says: build, stop, and check that the
-/// way is clear. `false` when another boot took the environment over while this one was
-/// building and this process joined it instead, or took over what that boot left not ready
-/// — there is then nothing left to boot. `digest`/`manifest` are this config's identity; a
-/// boot left not ready from another one is refused, the drift policy having been applied.
+/// Restart state after rebuilding (see [`after_build`]).
+#[derive(Debug)]
+enum AfterBuild {
+    /// `targeted` is still running: stop this entry
+    Stop(Box<crate::vms::VmEntry>),
+    /// `targeted` survived a stop attempt; contains the unprinted report
+    Stuck(String),
+    /// nothing of `targeted` is up: boot, unless another boot holds the lock
+    Clear,
+    /// another VM replaced `targeted`: join the boot that brought it up
+    Replaced(VmTie),
+}
+
+/// Compare the restart's `targeted` VM with the running VM, `now`.
+/// `stopped` holds the unprinted report from an attempted stop of `targeted`.
+fn after_build(
+    targeted: VmTie,
+    now: Option<crate::vms::VmEntry>,
+    stopped: Option<String>,
+) -> AfterBuild {
+    match (now, stopped) {
+        (None, _) => AfterBuild::Clear,
+        (Some(vm), _) if VmTie::of(&vm) != targeted => AfterBuild::Replaced(VmTie::of(&vm)),
+        (Some(_), Some(report)) => AfterBuild::Stuck(report),
+        (Some(vm), None) => AfterBuild::Stop(Box::new(vm)),
+    }
+}
+
+/// Rebuild for the current config, stop `targeted`, and check that a new VM can boot.
+/// Return `false` after joining a replacement boot or taking over its unfinished setup:
+/// nothing remains to boot. `digest`/`manifest` identify this config; reject ready or
+/// unfinished replacements from another config, since the drift policy already ran.
+#[allow(clippy::too_many_arguments)]
 async fn swap(
     plan: &Plan,
     cfg: &crate::config::Config,
     over: &Overrides,
     wait: bool,
     parent_pid: u32,
+    targeted: VmTie,
     digest: &str,
     manifest: &serde_json::Value,
 ) -> Result<bool> {
@@ -500,33 +532,91 @@ async fn swap(
     // building it cold — seconds of downtime instead of minutes.
     eprintln!("virtkit: rebuilding while the current environment keeps running …");
     build_into_cache(plan, over, cfg, None)?;
-    let stopped = stop(&plan.state_dir, STOP_TIMEOUT_SECS)?;
-    // Every other line of a boot goes to stderr, and this one runs in a child whose stdout
-    // the caller may have closed.
-    eprint!("{}", stopped.report);
-    // What matters is the state now, not whether *this* stop found something to do:
-    // another refresh may have swapped the environment while this one was building, in
-    // which case there was nothing left here to stop and nothing to report as a failure.
-    if running_vm(plan).is_some() {
-        bail!("the dev environment did not stop; not booting a new one");
-    }
-    if let Some(holder) = lock_holder(&plan.state_dir) {
-        // This caller has already restarted into its config, so what the boot that took over
-        // leaves is taken over rather than restarted again, and one readied or left from a
-        // different config is refused.
-        let joined = match take_over(plan, parent_pid, digest, manifest, false) {
-            Some(joined) => joined,
-            None if !wait => bail!(
-                "another boot of this environment ({holder}) took over while this one was \
-                 rebuilding — wait for that one, or re-run without --no-wait"
-            ),
-            None => wait_for_boot(plan, parent_pid, digest, manifest, false).await?,
-        };
-        let transition = after_takeover(joined, digest, manifest)?;
-        note_transition(plan, parent_pid, transition);
-        return Ok(false);
-    }
-    Ok(true)
+    // During the build, the target may exit or another refresh or joiner may replace it.
+    // Stop only the target; join any replacement boot below.
+    let mut tried = false;
+    // Defer a failed stop's report until rechecking: discard it if the target exited or
+    // was replaced. A successful stop's report is already printed.
+    let mut stopped = None;
+    let state = loop {
+        match after_build(targeted, running_vm(plan), stopped.take()) {
+            AfterBuild::Stop(vm) => {
+                // Left open: the targeted run dies and a replacement not yet registered takes
+                // the lock, after `stop_entry` checks the holder or where procfs cannot name
+                // it. The stale entry then reads as alive, and the stop ends the
+                // replacement's relays and signals a dead pid.
+                let Some((report, down)) = crate::vms::stop_entry(&vm, SWAP_STOP_SECS) else {
+                    // Another run holds the lock, so the targeted one is gone even though its
+                    // entry still reads as up: that run's boot is joined below.
+                    break AfterBuild::Clear;
+                };
+                if down {
+                    // Every other line of a boot goes to stderr, and this one runs in a child
+                    // whose stdout the caller may have closed.
+                    eprint!("{report}");
+                    stopped = Some(String::new());
+                } else {
+                    stopped = Some(report);
+                }
+                tried = true;
+            }
+            AfterBuild::Stuck(report) => {
+                eprint!("{report}");
+                bail!("the dev environment did not stop; not booting a new one")
+            }
+            state => break state,
+        }
+    };
+    let holder = lock_holder(&plan.state_dir);
+    let replaced = match state {
+        AfterBuild::Replaced(vm) => Some(vm),
+        _ if holder.is_none() => {
+            if !tried {
+                eprintln!("virtkit: the environment went down during the rebuild — booting it");
+            }
+            // Relays cannot outlive their VM, but their records can, and so can the addresses
+            // they hold until their next probe: left in place, the boot's own publishing would
+            // take them for the relays it wants and leave its endpoints unpublished. A stop
+            // that found the VM already gone cleared none, and clearing twice is harmless.
+            // Nothing procfs can name holds the lock, and nothing is up, so there is no other
+            // boot whose relays these could be.
+            crate::publish::stop_all_quietly(&plan.state_dir, Duration::from_secs(5));
+            return Ok(true);
+        }
+        _ => None,
+    };
+    // Another boot took over: its VM is up, or it holds the lock to boot one. This caller has
+    // already restarted into its config, so what that boot readied is attached to only if it
+    // serves this config, what it left not ready is taken over rather than restarted again,
+    // and either from a different config is refused. A replacement already ready is judged
+    // by its identity at once — nothing more is coming to wait for, `--no-wait` or not — and
+    // one whose identity cannot be read never will be.
+    let ready = match replaced {
+        Some(vm) => match try_read_identity(plan) {
+            Ok(Some(identity)) => Some(Joined::Ready { identity, vm }),
+            Ok(None) => None,
+            Err(e) => {
+                return Err(e.context(
+                    "the running environment's identity cannot be read — `vk dev stop` ends it",
+                ));
+            }
+        },
+        None => None,
+    };
+    // A replacement that is up has its `vk run` holding the lock whether or not procfs can
+    // name it, so what this waits on is the VM, not a named holder.
+    let joined = match ready.or_else(|| take_over(plan, parent_pid, digest, manifest, false)) {
+        Some(joined) => joined,
+        None if !wait => bail!(
+            "another boot of this environment{} took over while this one was rebuilding — \
+             wait for that one, or re-run without --no-wait",
+            holder.map(|h| format!(" ({h})")).unwrap_or_default()
+        ),
+        None => wait_for_boot(plan, parent_pid, digest, manifest, false).await?,
+    };
+    let transition = after_takeover(joined, digest, manifest)?;
+    note_transition(plan, parent_pid, transition);
+    Ok(false)
 }
 
 /// The transition after a restart joins a boot that took over during the rebuild.
@@ -538,14 +628,14 @@ fn after_takeover(
     manifest: &serde_json::Value,
 ) -> Result<Transition> {
     Ok(match joined {
-        Joined::Ready(running) => match serves(&running, digest, manifest) {
+        Joined::Ready { identity, .. } => match serves(&identity, digest, manifest) {
             Some(_) => Transition::Reused,
-            None => bail!("{}", readied_elsewhere(&running, digest)),
+            None => bail!("{}", readied_elsewhere(&identity, digest)),
         },
         Joined::Claimed => Transition::Booted,
         Joined::Drifted(left) => bail!("{}", refused(&left, digest)),
         // `restart` is false in `swap`, so neither call there returns this.
-        Joined::Restart => bail!(
+        Joined::Restart(_) => bail!(
             "the environment the boot that took over left needs a restart — re-run \
              `vk dev refresh`"
         ),
@@ -567,16 +657,17 @@ fn readied_elsewhere(running: &Identity, digest: &str) -> String {
 /// Outcome of joining another caller's boot.
 #[derive(Debug)]
 enum Joined {
-    /// the environment is ready, and this is what it recorded
-    Ready(Identity),
+    /// the environment is ready: `identity` is what it recorded, `vm` the VM up when it was
+    /// found
+    Ready { identity: Identity, vm: VmTie },
     /// this caller took over failed or abandoned setup
     Claimed,
     /// failed or abandoned setup from another config, subject to the caller's drift policy
     /// if it has not already been applied
     Drifted(NotReady),
     /// a refresh restarts failed or abandoned setup regardless of its boot config, and a
-    /// ready environment whose identity cannot be read
-    Restart,
+    /// ready environment whose identity cannot be read, with the VM up when it was found
+    Restart(VmTie),
 }
 
 /// The running VM's abandoned marker and its compatibility with `digest`/`manifest`
@@ -642,7 +733,7 @@ fn take_over(
     restart: bool,
 ) -> Option<Joined> {
     match not_ready_here(plan, digest, manifest)? {
-        _ if restart => Some(Joined::Restart),
+        (left, _) if restart => Some(Joined::Restart(left.vm)),
         (_, LeftBehind::Claim) => {
             claim(plan, parent_pid, digest, manifest).then_some(Joined::Claimed)
         }
@@ -829,7 +920,7 @@ pub async fn boot(
     let snapshot = snapshot_wrapper(plan)?;
     let (digest, manifest) = identity_of(plan, snapshot.as_ref().map(|(_, d)| d.as_str()))?;
 
-    if let Some(running) = live_identity(plan) {
+    if let Some((running, vm)) = live_identity(plan) {
         if !restarts_live(
             plan,
             over,
@@ -842,7 +933,7 @@ pub async fn boot(
         )? {
             return Ok(());
         }
-        if !swap(plan, cfg, over, wait, parent_pid, &digest, &manifest).await? {
+        if !swap(plan, cfg, over, wait, parent_pid, vm, &digest, &manifest).await? {
             return Ok(());
         }
     } else if let Some(holder) = lock_holder(&plan.state_dir) {
@@ -860,8 +951,12 @@ pub async fn boot(
             ),
             None => wait_for_boot(plan, parent_pid, &digest, &manifest, refresh).await?,
         };
-        match joined {
-            Joined::Ready(running) => {
+        // Keep the VM selected for restart so `swap` stops only that VM.
+        let targeted = match joined {
+            Joined::Ready {
+                identity: running,
+                vm,
+            } => {
                 if !restarts_live(
                     plan,
                     over,
@@ -874,15 +969,23 @@ pub async fn boot(
                 )? {
                     return Ok(());
                 }
+                vm
             }
             Joined::Claimed => {
                 note_transition(plan, parent_pid, Transition::Booted);
                 return Ok(());
             }
-            Joined::Restart => {}
-            Joined::Drifted(left) => restart_left_behind(|| policy(plan, over), &left, &digest)?,
-        }
-        if !swap(plan, cfg, over, wait, parent_pid, &digest, &manifest).await? {
+            Joined::Restart(vm) => vm,
+            Joined::Drifted(left) => {
+                restart_left_behind(|| policy(plan, over), &left, &digest)?;
+                left.vm
+            }
+        };
+        if !swap(
+            plan, cfg, over, wait, parent_pid, targeted, &digest, &manifest,
+        )
+        .await?
+        {
             return Ok(());
         }
     }
@@ -1089,16 +1192,17 @@ async fn wait_for_boot(
     let mut up_since = None;
     let mut waited_on = None;
     loop {
-        let up = running_vm(plan).is_some();
+        let vm = running_vm(plan).map(|vm| VmTie::of(&vm));
+        let up = vm.is_some();
         // One read, since a restart may remove the identity between two. Absent, it is still
         // to come; written whole (see `write_identity`), one that does not parse or cannot be
         // read stays that way however long this waits.
-        if up {
+        if let Some(vm) = vm {
             match try_read_identity(plan) {
                 Ok(None) => {}
-                Ok(Some(running)) => return Ok(Joined::Ready(running)),
+                Ok(Some(identity)) => return Ok(Joined::Ready { identity, vm }),
                 // A refresh restarts what it joins, so it needs nothing that was recorded.
-                Err(_) if restart => return Ok(Joined::Restart),
+                Err(_) if restart => return Ok(Joined::Restart(vm)),
                 Err(e) => {
                     return Err(e.context(
                         "the running environment's identity cannot be read — `vk dev stop` \
@@ -1114,7 +1218,9 @@ async fn wait_for_boot(
             eprintln!("waiting for the boot already in flight …");
             announced = true;
         }
-        if lock_holder(&plan.state_dir).is_none() {
+        // An up VM's `vk run` holds the lock, named or not — procfs cannot always say whose
+        // it is (see `lock_holder`) — so only with nothing up does no holder mean no boot.
+        if !up && lock_holder(&plan.state_dir).is_none() {
             bail!("the boot that was in flight ended without leaving a running environment");
         }
         // A readier that took over from another gets the whole budget for its own readying.
@@ -1206,7 +1312,7 @@ mod tests {
     use crate::dev::config::Nested;
     use crate::dev::identity::marker_of;
     use crate::dev::plan::HostExecPlan;
-    use crate::dev::testutil::{plan_in, scratch};
+    use crate::dev::testutil::{StandIn, plan_in, scratch};
 
     #[test]
     fn an_environment_caches_where_the_rest_of_the_host_caches() {
@@ -1629,6 +1735,12 @@ mod tests {
         );
     }
 
+    /// A VM tie no test registers.
+    const VM: VmTie = VmTie {
+        pid: 41,
+        created_secs: 7,
+    };
+
     /// Record `digest`/`manifest`, the only identity fields the decision reads.
     fn recorded(digest: &str, manifest: serde_json::Value) -> Identity {
         Identity {
@@ -1718,21 +1830,8 @@ mod tests {
             file.display()
         );
         // And should one ever reach the stop, it signals this stand-in, not this process.
-        struct StandIn(std::process::Child);
-        impl Drop for StandIn {
-            fn drop(&mut self) {
-                // Best effort: a stand-in that already exited has nothing left to end.
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let stand_in = StandIn(
-            std::process::Command::new("sleep")
-                .arg("600")
-                .spawn()
-                .unwrap(),
-        );
-        let _vm = crate::dev::testutil::register_vm_as(&plan, stand_in.0.id());
+        let stand_in = StandIn::spawn();
+        let _vm = crate::dev::testutil::register_vm_as(&plan, stand_in.id());
         // Without a holder to name, the joiner would boot rather than wait.
         assert!(lock_holder(&plan.state_dir).is_some());
         let (digest, manifest) = identity_of(&plan, None).unwrap();
@@ -1841,22 +1940,20 @@ mod tests {
         let mut endpoints = manifest.clone();
         endpoints["endpoints"] = serde_json::json!([{ "name": "web", "host_port": 8080 }]);
         let after = |joined| after_takeover(joined, &digest, &manifest);
+        let ready = |identity| Joined::Ready { identity, vm: VM };
 
         assert_eq!(
-            after(Joined::Ready(recorded(&digest, manifest.clone()))).unwrap(),
+            after(ready(recorded(&digest, manifest.clone()))).unwrap(),
             Transition::Reused
         );
         assert_eq!(
-            after(Joined::Ready(recorded(&"b".repeat(64), endpoints))).unwrap(),
+            after(ready(recorded(&"b".repeat(64), endpoints))).unwrap(),
             Transition::Reused
         );
         assert_eq!(after(Joined::Claimed).unwrap(), Transition::Booted);
-        let drifted = after(Joined::Ready(recorded(
-            &"a".repeat(64),
-            serde_json::json!({}),
-        )))
-        .unwrap_err()
-        .to_string();
+        let drifted = after(ready(recorded(&"a".repeat(64), serde_json::json!({}))))
+            .unwrap_err()
+            .to_string();
         assert!(
             drifted.contains("readied it from a different configuration"),
             "{drifted}"
@@ -1875,7 +1972,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(left.contains("reboots it into this one"), "{left}");
-        let restart = after(Joined::Restart).unwrap_err().to_string();
+        let restart = after(Joined::Restart(VM)).unwrap_err().to_string();
         assert!(restart.contains("needs a restart"), "{restart}");
     }
 
@@ -1943,6 +2040,273 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_stops_only_the_vm_it_was_decided_on() {
+        let entry = |tie: VmTie| -> crate::vms::VmEntry {
+            serde_json::from_value(serde_json::json!({
+                "state_dir": "/state",
+                "pid": tie.pid,
+                "label": "devcontainer",
+                "exec_addr": "unused",
+                "created_secs": tie.created_secs
+            }))
+            .unwrap()
+        };
+        let other = VmTie {
+            pid: VM.pid,
+            created_secs: VM.created_secs + 1,
+        };
+        let report = || Some("devcontainer (pid 41) did not stop after 10s\n".to_string());
+        let state = after_build(VM, Some(entry(VM)), None);
+        assert!(
+            matches!(&state, AfterBuild::Stop(vm) if VmTie::of(vm) == VM),
+            "{state:?}"
+        );
+        // Still up after a failed stop: that stop's report is the one reported.
+        let state = after_build(VM, Some(entry(VM)), report());
+        assert!(
+            matches!(&state, AfterBuild::Stuck(r) if Some(r) == report().as_ref()),
+            "{state:?}"
+        );
+        // Down on its own, or after all: nothing to stop, and no failure to report.
+        for failed in [None, report()] {
+            let state = after_build(VM, None, failed);
+            assert!(matches!(state, AfterBuild::Clear), "{state:?}");
+        }
+        // Another boot's VM, even under the same pid, is joined and never stopped, whatever a
+        // stop of the targeted one reported.
+        for failed in [None, report()] {
+            let state = after_build(VM, Some(entry(other)), failed);
+            assert!(
+                matches!(state, AfterBuild::Replaced(vm) if vm == other),
+                "{state:?}"
+            );
+        }
+    }
+
+    /// Once rebuilt, a restart boots over the VM it targeted — gone on its own or stopped —
+    /// and joins, never stops, one that replaced it or another boot holding the lock.
+    #[tokio::test]
+    async fn swap_acts_on_the_vm_up_after_the_build() {
+        use std::os::unix::process::ExitStatusExt;
+
+        use crate::dev::testutil::{register_entry, register_vm_in_child};
+
+        /// A relay of `state_dir`'s VM, and a thread that runs `then` once something has
+        /// stopped it — a stop ends the relays before it signals the VM.
+        fn relay_then<T: Send + 'static>(
+            state_dir: &Path,
+            then: impl FnOnce() -> T + Send + 'static,
+        ) -> std::thread::JoinHandle<T> {
+            let mut victim = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let lock = crate::publish::fake_publisher(
+                state_dir,
+                "web",
+                "tcp://127.0.0.1:8600",
+                "vsock://80",
+                victim.id(),
+                None,
+            );
+            std::thread::spawn(move || {
+                let _ = victim.wait();
+                // The lifetime lock goes when the publisher does.
+                drop(lock);
+                then()
+            })
+        }
+
+        const CHILD: &str = "VK_TEST_BOOT_SWAP_REPLACED";
+        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let tmp = scratch("swap-replaced");
+            crate::dev::testutil::in_child(
+                "dev::boot::tests::swap_acts_on_the_vm_up_after_the_build",
+                CHILD,
+                &tmp.0,
+            );
+            return;
+        };
+        let mut plan = plan_in(&tmp);
+        // Nothing to build, so the restart goes straight on to the stop.
+        plan.source = Source::Image {
+            reference: "debian:13".into(),
+        };
+        std::fs::create_dir_all(&plan.workspace).unwrap();
+        ensure_state_dir(&plan).unwrap();
+        let cfg = crate::config::Config::default();
+        let over = Overrides::default();
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let parent = 4242;
+        let try_swap = async |wait: bool, targeted: VmTie| {
+            let _ = std::fs::remove_file(transition_path(&plan.state_dir, parent));
+            let result = swap(
+                &plan, &cfg, &over, wait, parent, targeted, &digest, &manifest,
+            )
+            .await;
+            let note = std::fs::read_to_string(transition_path(&plan.state_dir, parent))
+                .ok()
+                .and_then(|n| n.split_whitespace().next().map(str::to_string));
+            (result.map_err(|e| format!("{e:#}")), note)
+        };
+        let write = |identity: &Identity| {
+            std::fs::write(identity_path(&plan), serde_json::to_vec(identity).unwrap()).unwrap()
+        };
+
+        // Gone on its own during the build, with no other boot: this one boots, once the
+        // relays that VM left are gone.
+        let relay = relay_then(&plan.state_dir, || ());
+        let record = plan.state_dir.join("publish/web.json");
+        assert!(record.exists());
+        assert_eq!(try_swap(false, VM).await, (Ok(true), None));
+        assert!(!record.exists(), "a leftover relay is cleared");
+        relay.join().unwrap();
+
+        // Still up: stopped, and then booted over.
+        let (registration, mut child) = register_vm_in_child(&plan, false);
+        let targeted = VmTie::of(&running_vm(&plan).unwrap());
+        assert_eq!(try_swap(false, targeted).await, (Ok(true), None));
+        // Its lock goes before its exit is reported, so the status may lag the stop.
+        let mut status = None;
+        for _ in 0..100 {
+            status = child.try_wait();
+            if status.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            status.and_then(|s| s.signal()),
+            Some(libc::SIGTERM),
+            "the targeted VM was stopped"
+        );
+        drop(registration);
+
+        // Still up after the stop: refused, rather than booted over.
+        let (registration, mut stubborn) = register_vm_in_child(&plan, true);
+        let targeted = VmTie::of(&running_vm(&plan).unwrap());
+        let (result, note) = try_swap(false, targeted).await;
+        let e = result.unwrap_err();
+        assert!(e.contains("did not stop"), "{e}");
+        assert_eq!(note, None);
+        assert!(stubborn.alive());
+
+        // Gone from the registry while the stop was failing, its lock still held: no failure
+        // after all, but a boot holding the lock, which is joined.
+        let relay = relay_then(&plan.state_dir, move || drop(registration));
+        let (result, note) = try_swap(false, targeted).await;
+        let e = result.unwrap_err();
+        assert!(e.contains("took over while this one was rebuilding"), "{e}");
+        assert_eq!(note, None);
+        relay.join().unwrap();
+
+        // Replaced while the stop was failing, by a VM readied from this config: attached to.
+        write(&recorded(&digest, manifest.clone()));
+        let registration = register_entry(&plan, stubborn.id());
+        let relay = relay_then(&plan.state_dir, {
+            let plan = plan.clone();
+            move || {
+                drop(registration);
+                // A stand-in, so a regression that stops the replacement signals it rather
+                // than this process.
+                let replacement = StandIn::spawn();
+                (register_entry(&plan, replacement.id()), replacement)
+            }
+        });
+        assert_eq!(
+            try_swap(false, targeted).await,
+            (Ok(false), Some("reused".into()))
+        );
+        let (registration, mut replacement) = relay.join().unwrap();
+        assert!(replacement.alive());
+        drop(registration);
+        std::fs::remove_file(identity_path(&plan)).unwrap();
+        assert!(stubborn.alive());
+        drop(stubborn);
+
+        // Gone, with another boot holding the lock and nothing up yet: joined, not booted.
+        let held = crate::dev::list::try_lock_state_dir(&plan.state_dir).unwrap();
+        let (result, note) = try_swap(false, VM).await;
+        let e = result.unwrap_err();
+        assert!(e.contains("took over while this one was rebuilding"), "{e}");
+        assert_eq!(note, None);
+        drop(held);
+
+        let mut stand_in = StandIn::spawn();
+        let _vm = crate::dev::testutil::register_vm_as(&plan, stand_in.id());
+        let replacement = VmTie::of(&running_vm(&plan).unwrap());
+        // Its lock is this process's, not its `vk run`'s: a run that replaced it holds it, and
+        // stopping it is left to that run's boot, which this joins. Only a holder procfs names
+        // tells the two apart.
+        assert!(lock_holder(&plan.state_dir).is_some());
+        let (result, note) = try_swap(false, replacement).await;
+        let e = result.unwrap_err();
+        assert!(e.contains("took over while this one was rebuilding"), "{e}");
+        assert_eq!(note, None);
+        assert!(stand_in.alive());
+
+        // Under the pid it was targeted under, but registered at another time: another VM.
+        let targeted = VmTie {
+            pid: replacement.pid,
+            created_secs: replacement.created_secs + 1,
+        };
+
+        // Readied from this config: attached to, even under --no-wait.
+        write(&recorded(&digest, manifest.clone()));
+        assert_eq!(
+            try_swap(false, targeted).await,
+            (Ok(false), Some("reused".into()))
+        );
+        assert!(stand_in.alive());
+
+        // Readied from another: refused.
+        write(&recorded(&"a".repeat(64), serde_json::json!({})));
+        let (result, note) = try_swap(true, targeted).await;
+        let e = result.unwrap_err();
+        assert!(
+            e.contains("readied it from a different configuration"),
+            "{e}"
+        );
+        assert_eq!(note, None);
+        assert!(stand_in.alive());
+
+        // Not ready yet, under --no-wait: refused rather than waited on.
+        std::fs::remove_file(identity_path(&plan)).unwrap();
+        let (result, note) = try_swap(false, targeted).await;
+        let e = result.unwrap_err();
+        assert!(e.contains("took over while this one was rebuilding"), "{e}");
+        assert_eq!(note, None);
+        assert!(stand_in.alive());
+
+        // Not ready yet, waited on: attached to once readied from this config. Renamed into
+        // place, as the identity is written whole.
+        let writer = std::thread::spawn({
+            let path = identity_path(&plan);
+            let body = serde_json::to_vec(&recorded(&digest, manifest.clone())).unwrap();
+            move || {
+                std::thread::sleep(Duration::from_millis(300));
+                let part = path.with_extension("part");
+                std::fs::write(&part, body).unwrap();
+                std::fs::rename(part, path).unwrap();
+            }
+        });
+        assert_eq!(
+            try_swap(true, targeted).await,
+            (Ok(false), Some("reused".into()))
+        );
+        writer.join().unwrap();
+        assert!(stand_in.alive());
+
+        // Recorded, but unreadable: reported rather than waited on.
+        std::fs::write(identity_path(&plan), b"{").unwrap();
+        let (result, note) = try_swap(true, targeted).await;
+        let e = result.unwrap_err();
+        assert!(e.contains("cannot be read"), "{e}");
+        assert_eq!(note, None);
+        assert!(stand_in.alive());
+    }
+
+    #[test]
     fn a_failed_readying_is_claimed_or_under_a_refresh_restarted() {
         const CHILD: &str = "VK_TEST_BOOT_TAKE_OVER";
         let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
@@ -1974,7 +2338,11 @@ mod tests {
             },
         );
         let joined = take_over(&plan, pid, &digest, &manifest, true);
-        assert!(matches!(joined, Some(Joined::Restart)), "{joined:?}");
+        let vm = VmTie::of(&running_vm(&plan).unwrap());
+        assert!(
+            matches!(joined, Some(Joined::Restart(tie)) if tie == vm),
+            "{joined:?}"
+        );
         let joined = take_over(&plan, pid, &digest, &manifest, false);
         assert!(matches!(joined, Some(Joined::Claimed)), "{joined:?}");
         let left = read_not_ready(&plan).unwrap();

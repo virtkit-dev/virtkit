@@ -741,17 +741,23 @@ fn lock_state_dir(dir: &Path) -> Result<std::fs::File> {
 /// recycled before the age lookup is reported with the newcomer's age.
 ///
 /// Callers use `Some` to wait for an existing environment (`dev::lock_holder`) or join a
-/// running editor reconciliation (`vk dev code`) instead of starting another. The pid and
-/// age are best-effort display text; callers do not use their values to make decisions.
+/// running editor reconciliation (`vk dev code`) instead of starting another. The text is
+/// for display only. `vms::stop_entry` uses the pid from [`flock_holder_pid`]: it signals
+/// the registered VM when the pid matches its run, or when `None` leaves the holder unknown.
 pub(crate) fn flock_holder(f: &std::fs::File) -> Option<String> {
-    let want = proc_locks_key(f)?;
-    // A lock released between reads can shift a live holder out of the listing.
-    // Retry before concluding that nobody holds the lock.
-    let pid = (0..PROC_LOCKS_PASSES).find_map(|_| holder_pid(&proc_locks()?, &want))?;
+    let pid = flock_holder_pid(f)?;
     Some(match crate::usage::proc_age(pid) {
         Some(age) => format!("pid {pid}, up {}", crate::vms::fmt_uptime(age.as_secs())),
         None => format!("pid {pid}"),
     })
+}
+
+/// The pid [`flock_holder`] names, under the same caveats: the process that took the lock.
+pub(crate) fn flock_holder_pid(f: &std::fs::File) -> Option<i32> {
+    let want = proc_locks_key(f)?;
+    // A lock released between reads can shift a live holder out of the listing.
+    // Retry before concluding that nobody holds the lock.
+    (0..PROC_LOCKS_PASSES).find_map(|_| holder_pid(&proc_locks()?, &want))
 }
 
 /// `/proc/locks` key for `f`: `<major>:<minor>:<inode>`, major/minor in hex.

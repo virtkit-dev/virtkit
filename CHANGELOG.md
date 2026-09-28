@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`vk dev refresh` and `vk dev` restarts preserve environments restarted by another
+  command during the rebuild.** They stop only the environment selected for restart,
+  reuse a replacement when it matches the configuration, and report a mismatch otherwise.
+  A `vk dev` waiting for another command's boot also keeps waiting when the environment
+  is up but its owning process cannot be identified.
+
 ## [0.79.2] - 2026-09-28
 
 ### Fixed

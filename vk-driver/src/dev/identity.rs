@@ -485,10 +485,10 @@ pub(super) fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
         .collect()
 }
 
-/// The identity of the environment that is running for this plan's state dir, if one is.
-pub(super) fn live_identity(plan: &Plan) -> Option<Identity> {
-    running_vm(plan)?;
-    read_identity(plan)
+/// The running environment's identity for this plan's state dir, and the VM it was read for.
+pub(super) fn live_identity(plan: &Plan) -> Option<(Identity, VmTie)> {
+    let vm = VmTie::of(&running_vm(plan)?);
+    Some((read_identity(plan)?, vm))
 }
 
 /// Publish the identity whole: its presence is what says the environment is ready, so a
