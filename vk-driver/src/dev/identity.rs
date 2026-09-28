@@ -290,8 +290,21 @@ pub(super) fn clear_not_ready(plan: &Plan) {
 /// a state dir never booted, or one an older `vk` wrote in another shape — means nothing to
 /// compare against, which callers report as unknown rather than mistake for a match.
 pub fn read_identity(plan: &Plan) -> Option<Identity> {
-    let bytes = std::fs::read(identity_path(plan)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    try_read_identity(plan).ok().flatten()
+}
+
+/// Like [`read_identity`], but distinguish an absent file (`Ok(None)`) from read or parse
+/// errors.
+pub(super) fn try_read_identity(plan: &Plan) -> Result<Option<Identity>> {
+    let path = identity_path(plan);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .with_context(|| format!("parsing {}", path.display()))
 }
 
 /// The identity a plan resolves to: a stable digest, and the manifest it digests. Values

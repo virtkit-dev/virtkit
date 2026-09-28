@@ -217,10 +217,18 @@ pub(super) mod testutil {
     /// its `vk run` would hold, which is what makes the registry read it as alive. Only in a
     /// test process of its own, given a scratch `XDG_DATA_HOME`: the registry is per user.
     pub(super) fn register_vm(plan: &Plan) -> (crate::vms::Registration, std::fs::File) {
+        register_vm_as(plan, std::process::id())
+    }
+
+    /// Like [`register_vm`], with `pid` as the managing process that stop signals.
+    pub(super) fn register_vm_as(
+        plan: &Plan,
+        pid: u32,
+    ) -> (crate::vms::Registration, std::fs::File) {
         std::fs::create_dir_all(&plan.state_dir).unwrap();
         let entry = serde_json::from_value(serde_json::json!({
             "state_dir": crate::vms::canonical(&plan.state_dir),
-            "pid": std::process::id(),
+            "pid": pid,
             "label": "devcontainer",
             "exec_addr": "unused",
             "created_secs": 7

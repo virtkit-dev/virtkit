@@ -18,6 +18,12 @@ All notable changes to virtkit will be documented in this file.
   has since changed in a way that needs a restart, the freshness policy decides instead, as
   for any running environment. `vk dev status` says when the environment is being readied,
   or was left not ready and why.
+- **`vk dev` checks freshness after waiting for another boot.** Previously, it attached
+  once the environment was ready, even when the configuration required a restart or the
+  command was `vk dev refresh`. It now applies the same freshness policy as on arrival,
+  and `vk dev refresh` restarts it. A restart fails if another boot takes over with an
+  incompatible configuration. An unreadable boot record produces an error with stop
+  instructions; `vk dev refresh` restarts the environment.
 - **Stopping a VM lets its processes exit.** On guests booted with virtkit's own init (no
   `--init image` or `--init entrypoint`), stopping or rebooting now sends SIGTERM to the
   commands started with `vk run`, `vk exec` or `vk dev exec`, and to the daemons they

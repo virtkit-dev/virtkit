@@ -14,7 +14,7 @@ use super::hooks::{Where, check_requirements, note_lock, run_hook};
 use super::identity::{
     LeftBehind, NotReady, VmTie, applied_on_attach, claim_not_ready, clear_not_ready, drift,
     identity_of, identity_path, left_behind, live_identity, note_older_creator, read_not_ready,
-    sha256_hex,
+    sha256_hex, try_read_identity,
 };
 use super::session::{ask_on_terminal, on_terminal, running_vm, stop};
 use super::{GENERATION_MARKER, INFLIGHT_POLL, Identity, Overrides, TRANSITION_WAIT, Transition};
@@ -512,8 +512,8 @@ async fn swap(
     }
     if let Some(holder) = lock_holder(&plan.state_dir) {
         // This caller has already restarted into its config, so what the boot that took over
-        // leaves is taken over rather than restarted again, and one left from a different
-        // config is refused.
+        // leaves is taken over rather than restarted again, and one readied or left from a
+        // different config is refused.
         let joined = match take_over(plan, parent_pid, digest, manifest, false) {
             Some(joined) => joined,
             None if !wait => bail!(
@@ -522,33 +522,60 @@ async fn swap(
             ),
             None => wait_for_boot(plan, parent_pid, digest, manifest, false).await?,
         };
-        let transition = match joined {
-            Joined::Reused => Transition::Reused,
-            Joined::Claimed => Transition::Booted,
-            Joined::Drifted(left) => bail!("{}", refused(&left, digest)),
-            // `restart` is false above, so neither call returns this.
-            Joined::Restart => bail!(
-                "the environment the boot that took over left needs a restart — re-run \
-                 `vk dev refresh`"
-            ),
-        };
+        let transition = after_takeover(joined, digest, manifest)?;
         note_transition(plan, parent_pid, transition);
         return Ok(false);
     }
     Ok(true)
 }
 
+/// The transition after a restart joins a boot that took over during the rebuild.
+/// Refuse a ready environment unless [`serves`] accepts it for `digest`/`manifest`.
+/// Also refuse an environment left not ready from a different config.
+fn after_takeover(
+    joined: Joined,
+    digest: &str,
+    manifest: &serde_json::Value,
+) -> Result<Transition> {
+    Ok(match joined {
+        Joined::Ready(running) => match serves(&running, digest, manifest) {
+            Some(_) => Transition::Reused,
+            None => bail!("{}", readied_elsewhere(&running, digest)),
+        },
+        Joined::Claimed => Transition::Booted,
+        Joined::Drifted(left) => bail!("{}", refused(&left, digest)),
+        // `restart` is false in `swap`, so neither call there returns this.
+        Joined::Restart => bail!(
+            "the environment the boot that took over left needs a restart — re-run \
+             `vk dev refresh`"
+        ),
+    })
+}
+
+/// The refusal when a boot that took over during the rebuild readied the environment from
+/// a different configuration.
+fn readied_elsewhere(running: &Identity, digest: &str) -> String {
+    format!(
+        "another boot of this environment took over while this one was rebuilding and \
+         readied it from a different configuration (booted {}, now {}) — re-running \
+         `vk dev refresh` reboots it into this one, or `vk dev stop` ends it",
+        short(&running.digest),
+        short(digest)
+    )
+}
+
 /// Outcome of joining another caller's boot.
 #[derive(Debug)]
 enum Joined {
-    /// the environment is ready
-    Reused,
+    /// the environment is ready, and this is what it recorded
+    Ready(Identity),
     /// this caller took over failed or abandoned setup
     Claimed,
     /// failed or abandoned setup from another config, subject to the caller's drift policy
     /// if it has not already been applied
     Drifted(NotReady),
-    /// a refresh restarts failed or abandoned setup regardless of its boot config
+    /// a refresh restarts failed or abandoned setup regardless of its boot config, and a
+    /// ready environment whose identity cannot be read
     Restart,
 }
 
@@ -702,9 +729,9 @@ fn policy(plan: &Plan, over: &Overrides) -> Result<Drifted> {
     )
 }
 
-/// Apply [`live_decision`] to `running`: return `Ok(true)` for the caller to restart it,
-/// `Ok(false)` after attaching and recording the transition, or an error on refusal.
-/// `announce_reuse` has the same meaning as in [`boot`].
+/// Apply [`live_decision`] to `running`, whether found on arrival or after waiting.
+/// Return `Ok(true)` to restart, `Ok(false)` after attaching and recording the transition,
+/// or an error on refusal. `announce_reuse` has the same meaning as in [`boot`].
 #[allow(clippy::too_many_arguments)]
 fn restarts_live(
     plan: &Plan,
@@ -821,9 +848,9 @@ pub async fn boot(
     } else if let Some(holder) = lock_holder(&plan.state_dir) {
         // Up with nothing recorded: a boot still readying it, which this waits for, or one
         // whose readying failed or was abandoned, which this takes over — found now or while
-        // waiting. One booted from another configuration gets the freshness policy, as a
-        // drifted identity does; a refresh restarts it whatever it was booted from, found now
-        // or while waiting alike.
+        // waiting. What that boot readies is then taken as if found on arrival, and one left
+        // not ready from another configuration gets the freshness policy too; a refresh
+        // restarts either, whatever it was booted from.
         let joined = match take_over(plan, parent_pid, &digest, &manifest, refresh) {
             Some(joined) => joined,
             None if !wait => bail!(
@@ -834,9 +861,19 @@ pub async fn boot(
             None => wait_for_boot(plan, parent_pid, &digest, &manifest, refresh).await?,
         };
         match joined {
-            Joined::Reused => {
-                note_transition(plan, parent_pid, Transition::Reused);
-                return Ok(());
+            Joined::Ready(running) => {
+                if !restarts_live(
+                    plan,
+                    over,
+                    refresh,
+                    announce_reuse,
+                    parent_pid,
+                    &running,
+                    &digest,
+                    &manifest,
+                )? {
+                    return Ok(());
+                }
             }
             Joined::Claimed => {
                 note_transition(plan, parent_pid, Transition::Booted);
@@ -1032,11 +1069,11 @@ pub(crate) fn lock_holder(state_dir: &Path) -> Option<String> {
 /// on it. Generous: it covers the leader's endpoint publishing and its `hooks.start`.
 const READY_WAIT: Duration = Duration::from_secs(300);
 
-/// Wait for the boot someone else started to produce a *ready* environment: a registered
-/// VM, and the identity written after it — [`Joined::Reused`]. If that boot's readying fails
-/// or its parent dies instead, return what [`take_over`] makes of what it left for a caller
-/// whose config resolves to `digest`/`manifest`, with `restart` passed through; a claim
-/// another caller won leaves this one waiting on that caller's readying in turn.
+/// Wait for another boot's registered VM and the identity written once ready.
+/// Return [`Joined::Ready`] for the caller to compare with its config as on arrival.
+/// If setup fails or the parent dies, return [`take_over`]'s result for `digest`/`manifest`,
+/// passing `restart` through.
+/// If another caller wins the claim, wait for its setup instead.
 ///
 /// Waiting for the VM alone released this process while the boot's own parent was still
 /// publishing endpoints and pushing the session environment — two writers doing the same
@@ -1053,8 +1090,22 @@ async fn wait_for_boot(
     let mut waited_on = None;
     loop {
         let up = running_vm(plan).is_some();
-        if up && identity_path(plan).exists() {
-            return Ok(Joined::Reused);
+        // One read, since a restart may remove the identity between two. Absent, it is still
+        // to come; written whole (see `write_identity`), one that does not parse or cannot be
+        // read stays that way however long this waits.
+        if up {
+            match try_read_identity(plan) {
+                Ok(None) => {}
+                Ok(Some(running)) => return Ok(Joined::Ready(running)),
+                // A refresh restarts what it joins, so it needs nothing that was recorded.
+                Err(_) if restart => return Ok(Joined::Restart),
+                Err(e) => {
+                    return Err(e.context(
+                        "the running environment's identity cannot be read — `vk dev stop` \
+                         ends it",
+                    ));
+                }
+            }
         }
         if up && let Some(joined) = take_over(plan, parent_pid, digest, manifest, restart) {
             return Ok(joined);
@@ -1634,6 +1685,198 @@ mod tests {
                 Live::Decided(Drifted::Restart)
             );
         }
+        let refusal = readied_elsewhere(&drifted, &digest);
+        assert!(refusal.contains("booted aaaaaaaaaaaa, now "), "{refusal}");
+    }
+
+    /// Waiting for another boot gives the same decision as finding it ready on arrival.
+    #[tokio::test]
+    async fn a_joiner_decides_on_what_it_waited_for_as_on_what_it_found() {
+        const CHILD: &str = "VK_TEST_BOOT_JOIN_DECIDES";
+        let Some(tmp) = std::env::var_os(CHILD).map(std::path::PathBuf::from) else {
+            let tmp = scratch("join-decides");
+            crate::dev::testutil::in_child(
+                "dev::boot::tests::a_joiner_decides_on_what_it_waited_for_as_on_what_it_found",
+                CHILD,
+                &tmp.0,
+            );
+            return;
+        };
+        let plan = plan_in(&tmp);
+        // The ordering `outcome` relies on below: with no `hooks.init`, `boot` has nothing to
+        // await before `wait_for_boot`.
+        assert!(plan.hooks.init.is_none());
+        // The restart cases must fail in the rebuild, reading the compose file, before
+        // anything is stopped.
+        std::fs::create_dir_all(&plan.workspace).unwrap();
+        let Source::Compose { file, .. } = &plan.source else {
+            unreachable!("plan_in boots a compose service");
+        };
+        assert!(
+            !file.exists(),
+            "{} would let the rebuild succeed",
+            file.display()
+        );
+        // And should one ever reach the stop, it signals this stand-in, not this process.
+        struct StandIn(std::process::Child);
+        impl Drop for StandIn {
+            fn drop(&mut self) {
+                // Best effort: a stand-in that already exited has nothing left to end.
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let stand_in = StandIn(
+            std::process::Command::new("sleep")
+                .arg("600")
+                .spawn()
+                .unwrap(),
+        );
+        let _vm = crate::dev::testutil::register_vm_as(&plan, stand_in.0.id());
+        // Without a holder to name, the joiner would boot rather than wait.
+        assert!(lock_holder(&plan.state_dir).is_some());
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let mut endpoints = manifest.clone();
+        endpoints["endpoints"] = serde_json::json!([{ "name": "web", "host_port": 8080 }]);
+        let cfg = crate::config::Config::default();
+        let parent = 4242;
+
+        // The boot's outcome and the note it left, with `booted` recorded before it starts or
+        // while it waits on the readying.
+        let outcome = async |booted: &[u8], freshness: Freshness, refresh: bool, waited: bool| {
+            let _ = std::fs::remove_file(identity_path(&plan));
+            let _ = std::fs::remove_file(transition_path(&plan.state_dir, parent));
+            let write = || std::fs::write(identity_path(&plan), booted).unwrap();
+            if !waited {
+                write();
+            }
+            let over = Overrides {
+                freshness: Some(freshness),
+                ..Default::default()
+            };
+            // `join!` polls the boot first, and on this current-thread runtime it runs to its
+            // first await, the poll in `wait_for_boot` (see the `hooks.init` check above):
+            // nothing is recorded when it looks.
+            let (result, ()) = tokio::join!(
+                boot(&plan, &cfg, &over, refresh, true, false, parent),
+                async {
+                    if waited {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        write();
+                    }
+                }
+            );
+            let note = std::fs::read_to_string(transition_path(&plan.state_dir, parent))
+                .ok()
+                .and_then(|n| n.split_whitespace().next().map(str::to_string));
+            (result.map_err(|e| format!("{e:#}")), note)
+        };
+
+        #[derive(Debug)]
+        enum Expect {
+            Reused,
+            Refused,
+            Restart,
+        }
+        let json = |digest: &str, manifest: serde_json::Value| {
+            serde_json::to_vec(&recorded(digest, manifest)).unwrap()
+        };
+        let same = json(&digest, manifest.clone());
+        let session_only = json(&"b".repeat(64), endpoints);
+        let drifted = json(&"a".repeat(64), serde_json::json!({}));
+        for (booted, freshness, refresh, expect) in [
+            (&same, Freshness::RequireCurrent, false, Expect::Reused),
+            (
+                &session_only,
+                Freshness::RequireCurrent,
+                false,
+                Expect::Reused,
+            ),
+            (&drifted, Freshness::Reuse, false, Expect::Reused),
+            // No terminal in this child: `ask` keeps what is running.
+            (&drifted, Freshness::Ask, false, Expect::Reused),
+            (&drifted, Freshness::RequireCurrent, false, Expect::Refused),
+            (&drifted, Freshness::Refresh, false, Expect::Restart),
+            (&same, Freshness::Reuse, true, Expect::Restart),
+        ] {
+            let found = outcome(booted, freshness, refresh, false).await;
+            let waited = outcome(booted, freshness, refresh, true).await;
+            assert_eq!(waited, found, "{freshness:?}, refresh {refresh}");
+            match (expect, found) {
+                (Expect::Reused, (Ok(()), Some(note))) if note == "reused" => {}
+                (Expect::Refused, (Err(e), None)) if e.contains("reboots it into this one") => {}
+                (Expect::Restart, (Err(e), None))
+                    if e.contains("compose.yaml") && !e.contains("did not stop") => {}
+                (expect, found) => panic!("expected {expect:?}, got {found:?}"),
+            }
+        }
+
+        // An identity that does not parse is reported at once rather than waited on, and a
+        // refresh, which needs none of it, restarts the environment.
+        for refresh in [false, true] {
+            let (result, note) = tokio::time::timeout(
+                Duration::from_secs(5),
+                outcome(b"{", Freshness::Reuse, refresh, false),
+            )
+            .await
+            .expect("decided without waiting");
+            let e = result.unwrap_err();
+            if refresh {
+                assert!(
+                    e.contains("compose.yaml") && !e.contains("did not stop"),
+                    "{e}"
+                );
+            } else {
+                assert!(e.contains("cannot be read"), "{e}");
+            }
+            assert_eq!(note, None);
+        }
+    }
+
+    #[test]
+    fn a_restart_attaches_only_to_what_the_boot_that_took_over_readied_from_its_config() {
+        let t = scratch("after-takeover");
+        let plan = plan_in(&t.0);
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let mut endpoints = manifest.clone();
+        endpoints["endpoints"] = serde_json::json!([{ "name": "web", "host_port": 8080 }]);
+        let after = |joined| after_takeover(joined, &digest, &manifest);
+
+        assert_eq!(
+            after(Joined::Ready(recorded(&digest, manifest.clone()))).unwrap(),
+            Transition::Reused
+        );
+        assert_eq!(
+            after(Joined::Ready(recorded(&"b".repeat(64), endpoints))).unwrap(),
+            Transition::Reused
+        );
+        assert_eq!(after(Joined::Claimed).unwrap(), Transition::Booted);
+        let drifted = after(Joined::Ready(recorded(
+            &"a".repeat(64),
+            serde_json::json!({}),
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            drifted.contains("readied it from a different configuration"),
+            "{drifted}"
+        );
+        let left = after(Joined::Drifted(NotReady {
+            vm: VmTie {
+                pid: 41,
+                created_secs: 7,
+            },
+            digest: "a".repeat(64),
+            manifest: serde_json::json!({}),
+            booted_secs: 0,
+            readier: None,
+            why: "hooks.start: exited with 1".into(),
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(left.contains("reboots it into this one"), "{left}");
+        let restart = after(Joined::Restart).unwrap_err().to_string();
+        assert!(restart.contains("needs a restart"), "{restart}");
     }
 
     #[test]
