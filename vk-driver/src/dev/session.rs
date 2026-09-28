@@ -261,7 +261,8 @@ async fn sync_session_env(plan: &Plan) {
             vec![format!("VK_SESSION_ENV={text}")],
             None,
             false,
-            Some("root".into()),
+            // The session-env file is root-owned, whatever the image's USER.
+            Some(crate::executor::GUEST_ROOT.into()),
             "sh".into(),
             vec!["-c".into(), script.into(), "sh".into(), path.into()],
             Stdin::Closed,

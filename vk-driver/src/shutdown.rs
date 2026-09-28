@@ -303,10 +303,9 @@ async fn agent_command(addr: &SocketAddr, command: &str, budget: Duration) -> Re
             addr,
             &[crate::run::GUEST_AGENT.to_string(), command.to_string()],
             Vec::new(),
-            // uid 0: only root may identify and signal the guest's PID 1, and the session's
-            // default user is the image's USER. By number, which an image without a `root`
-            // passwd entry still resolves.
-            Some("0".into()),
+            // Only root may identify and signal the guest's PID 1, and the session's default
+            // user is the image's USER.
+            Some(crate::executor::GUEST_ROOT.into()),
             &crate::executor::OutputSink::Inherit,
             None,
         ),

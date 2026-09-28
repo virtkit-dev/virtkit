@@ -141,9 +141,8 @@ pub async fn attach(entry: &vms::VmEntry, interval_secs: u64, summary: bool) -> 
         mode: RunMode::Interactive,
         dir: None,
         tty: None,
-        // uid 0 by number: the sampler reads every process's /proc entries, and an
-        // image without a `root` passwd entry would not resolve the name.
-        user: Some("0".into()),
+        // The sampler reads every process's /proc entries.
+        user: Some(crate::executor::GUEST_ROOT.into()),
     }))
     .await?;
     match crate::executor::next(&mut stream).await? {

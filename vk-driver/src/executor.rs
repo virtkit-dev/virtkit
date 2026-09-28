@@ -122,10 +122,9 @@ async fn finalize_atop(ctx: &JobCtx) {
                 "--stop".to_string(),
             ],
             Vec::new(),
-            // uid 0: the sampler is a child of the guest's PID 1, and a job running as the
-            // image's own user could not signal it. The number rather than the name, which
-            // an image without a `root` passwd entry would not resolve.
-            Some("0".into()),
+            // The sampler is a child of the guest's PID 1, which a job running as the
+            // image's own user could not signal.
+            Some(GUEST_ROOT.into()),
             &quiet,
             None,
         ),
@@ -520,9 +519,12 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
+/// Run guest commands as root regardless of the image's USER.
+/// Numeric uid 0 also works without a `root` passwd entry.
+pub(crate) const GUEST_ROOT: &str = "0";
+
 /// Run `script` (piped to `command`, e.g. bash) as `user` and relay its output,
-/// returning the command result. Shared by the gitlab-runner stages (run_stage)
-/// and the in-prepare services bring-up (which runs as root).
+/// returning the command result.
 ///
 /// `cancel`, when set, aborts the running command promptly (the caller tears the guest
 /// down afterwards): the parallel build passes the shared build-cancellation token so a
