@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.79.3] - 2026-09-28
+
 ### Fixed
 
 - **`vk dev refresh` and `vk dev` restarts preserve environments restarted by another
@@ -3183,7 +3185,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.79.2...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.79.3...HEAD
+[0.79.3]: https://github.com/virtkit-dev/virtkit/compare/v0.79.2...v0.79.3
 [0.79.2]: https://github.com/virtkit-dev/virtkit/compare/v0.79.1...v0.79.2
 [0.79.1]: https://github.com/virtkit-dev/virtkit/compare/v0.79.0...v0.79.1
 [0.79.0]: https://github.com/virtkit-dev/virtkit/compare/v0.78.0...v0.79.0
