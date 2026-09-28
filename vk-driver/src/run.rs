@@ -732,50 +732,56 @@ fn lock_state_dir(dir: &Path) -> Result<std::fs::File> {
 /// `/proc/locks` lists every FLOCK holder by pid and `<major>:<minor>:<inode>`
 /// (major/minor in hex), which pins the owner without scanning each process's fds.
 /// The VM registry would name it better, but a run records itself there only once its
-/// VMM is up, and the run this message is about may still be building — so procfs is
+/// VMM is up, and the run holding the lock may still be building — so procfs is
 /// the only source that covers the case, and `vk stop` has no entry to act on either.
 /// `None` when procfs names nobody: the holder can exit between the refused lock and
 /// this lookup, and on btrfs a subvolume's `st_dev` is not the superblock device
-/// `/proc/locks` prints, so the line never matches. A holder that exits and has its pid
-/// recycled before the age lookup is reported with the newcomer's age — which is why this
-/// only ever garnishes a message, and nothing acts on it.
+/// `/proc/locks` prints, so the line never matches. It is also `None` when locks released
+/// elsewhere shifted the holder out of view on every pass. A holder that exits and has its pid
+/// recycled before the age lookup is reported with the newcomer's age.
+///
+/// Callers use `Some` to wait for an existing environment (`dev::lock_holder`) or join a
+/// running editor reconciliation (`vk dev code`) instead of starting another. The pid and
+/// age are best-effort display text; callers do not use their values to make decisions.
 pub(crate) fn flock_holder(f: &std::fs::File) -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
-
-    let md = f.metadata().ok()?;
-    let want = format!(
-        "{:02x}:{:02x}:{}",
-        libc::major(md.dev()),
-        libc::minor(md.dev()),
-        md.ino()
-    );
-    let pid = holder_pid(&proc_locks()?, &want)?;
+    let want = proc_locks_key(f)?;
+    // A lock released between reads can shift a live holder out of the listing.
+    // Retry before concluding that nobody holds the lock.
+    let pid = (0..PROC_LOCKS_PASSES).find_map(|_| holder_pid(&proc_locks()?, &want))?;
     Some(match crate::usage::proc_age(pid) {
         Some(age) => format!("pid {pid}, up {}", crate::vms::fmt_uptime(age.as_secs())),
         None => format!("pid {pid}"),
     })
 }
 
-/// The text of `/proc/locks`, taken in one `read(2)`. The file is a `seq_file` over the
-/// kernel's lock list that re-seeks by position on every call: when a lock anywhere on the
-/// host is released between two reads, the next one starts an entry short and a live lock
-/// silently drops out of the listing. One call is one consistent pass, so the buffer grows
-/// until the whole list fits.
-fn proc_locks() -> Option<String> {
-    use std::io::{Read, Seek};
+/// `/proc/locks` key for `f`: `<major>:<minor>:<inode>`, major/minor in hex.
+fn proc_locks_key(f: &std::fs::File) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
 
-    let mut f = std::fs::File::open("/proc/locks").ok()?;
-    let mut size = 64 * 1024;
-    loop {
-        let mut buf = vec![0u8; size];
-        let n = f.read(&mut buf).ok()?;
-        if n < size {
-            buf.truncate(n);
-            return String::from_utf8(buf).ok();
-        }
-        size *= 4;
-        f.rewind().ok()?;
-    }
+    let md = f.metadata().ok()?;
+    Some(format!(
+        "{:02x}:{:02x}:{}",
+        libc::major(md.dev()),
+        libc::minor(md.dev()),
+        md.ino()
+    ))
+}
+
+/// Maximum passes over `/proc/locks` before [`flock_holder`] reports no holder. Each pass
+/// walks the whole list; missing a live holder requires a release ahead of it on every pass.
+const PROC_LOCKS_PASSES: usize = 3;
+
+/// The text of `/proc/locks`, read to its end. It is a `seq_file`, whose `read(2)` can stop
+/// at a page however large the buffer, so a short read is not the end of the list.
+fn proc_locks() -> Option<String> {
+    use std::io::Read;
+
+    let mut text = String::new();
+    std::fs::File::open("/proc/locks")
+        .ok()?
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
 }
 
 /// The pid holding an `FLOCK` on `want` (`<major>:<minor>:<inode>`), out of the text of
@@ -6118,6 +6124,8 @@ mod tests {
 
     #[test]
     fn a_refused_state_dir_names_the_run_holding_it() {
+        use std::os::unix::io::AsRawFd;
+
         let dir = std::env::temp_dir().join(format!("vk-statelock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -6129,6 +6137,19 @@ mod tests {
             flock_holder(&probe).is_none(),
             "an unlocked dir has no holder"
         );
+        // The kernel keeps a lock list per CPU, so pin this thread (libtest gives each test
+        // its own) for the holder and the fillers below to land on the same one, in order.
+        // SAFETY: an all-zero cpu_set_t is the empty set; sched_getcpu takes no arguments;
+        // sched_setaffinity reads a mask owned here.
+        unsafe {
+            let cpu = usize::try_from(libc::sched_getcpu()).unwrap();
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(cpu, &mut set);
+            assert_eq!(
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set),
+                0
+            );
+        }
         let held = lock_state_dir(&dir).unwrap();
 
         // flock keys on the open file description, so a second acquisition through a
@@ -6146,6 +6167,28 @@ mod tests {
         // pid alone — the age is recomputed per lookup, so a run straddling a second
         // boundary between the two renders two different strings.
         let pid = format!("pid {}", std::process::id());
+        // Enough other locks that the listing outgrows one page, which one read(2) of the
+        // seq_file can stop at: a holder listed past it must still be found. At some 60 bytes
+        // a line, one per 32 bytes of page is well past a page on their own. They are taken
+        // after the holder because the kernel lists newer locks first (hlist_add_head on the
+        // per-CPU file_lock_list), which puts the holder behind them on the CPU pinned above.
+        // SAFETY: sysconf(3) has no preconditions.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let filler: Vec<std::fs::File> = (0..page / 32)
+            .map(|i| {
+                let f = std::fs::File::create(dir.join(format!("filler-{i}"))).unwrap();
+                // SAFETY: flock(2) on an fd owned by `f`, which outlives the call.
+                assert_eq!(unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) }, 0);
+                f
+            })
+            .collect();
+        // Skip only if the device is absent from the listing. A visible filler on the
+        // same filesystem means a missing holder is a lookup failure.
+        let covered = holder_pid(
+            &proc_locks().unwrap(),
+            &proc_locks_key(filler.last().unwrap()).unwrap(),
+        )
+        .is_some();
         match flock_holder(&probe) {
             Some(who) => {
                 assert!(
@@ -6157,9 +6200,14 @@ mod tests {
                     "the refusal must name the holder: {refusal}"
                 );
             }
+            None if covered => panic!(
+                "/proc/locks lists the fillers in {} but not their holder",
+                dir.display()
+            ),
             None => eprintln!("skipped: /proc/locks names no holder for {}", dir.display()),
         }
 
+        drop(filler);
         drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }

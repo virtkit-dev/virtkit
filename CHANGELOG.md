@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`vk dev` recognises a run already holding an environment on hosts with many file
+  locks.** `vk dev up` and `vk dev exec` could try to boot a second one and fail with
+  "state-dir … is in use by a live run", a boot being waited on could be reported as ended,
+  and `vk dev code` could start a second reconciliation.
 - **Power off and reboot work with non-root images.** `vk stop`, `vk dev stop` and
   the end of `vk run` now request poweroff as root instead of the image's user, avoiding
   a minute's wait followed by a VM kill. `vk reboot` now reboots instead of reporting
