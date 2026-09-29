@@ -12,7 +12,8 @@ use super::boot::{alias, take_transition};
 use super::hooks::run_start_hooks;
 use super::identity::{
     NotReady, Readier, VmTie, booted_wrapper_digest, claimed_for_me, drop_own_not_ready,
-    generation_of, identity_of, mark_own_not_ready, own_version, root_identity, write_identity,
+    generation_of, identity_of, mark_own_not_ready, own_version, read_identity, root_identity,
+    write_identity,
 };
 use super::{Identity, Transition};
 
@@ -76,8 +77,10 @@ pub async fn after_boot(plan: &Plan) -> Result<()> {
         // `vk dev status` keeps reporting it as drift until a restart records the new
         // identity. Endpoints are the exception: `plan --diff` calls an endpoint edit
         // host-side, applied without a restart, which holds only if the relays that no
-        // longer match go first.
+        // longer match go first. So is an edit to the egress allowlist, which the running
+        // switch picks up from its file.
         reconcile_publishers(plan);
+        sync_egress(plan, read_identity(plan).as_ref().map(|i| &i.manifest))?;
         return publish_endpoints(plan).await;
     };
     if readying.claimed {
@@ -192,6 +195,12 @@ async fn ready_booted(
     // there is no entry to read it from, which leaves the creation hook unstamped rather
     // than stamped with something that describes nothing.
     let generation = running_vm(plan).map(|vm| generation_of(plan, &root_identity(plan, &vm)));
+    if !by_its_boot {
+        // A take-over readies a VM its failed parent booted, whose switch follows the lists
+        // that parent's config wrote. The claim admits only drift attaching applies, so
+        // `egress.mode` is as booted and `manifest` says whether a switch follows a file.
+        sync_egress(plan, Some(manifest))?;
+    }
     publish_endpoints(plan).await?;
     run_start_hooks(plan, generation.as_deref()).await?;
     // What `vk dev prune` would remove, recorded so it can do so by name later without the
@@ -348,6 +357,47 @@ fn stale_reason(
             _ => None,
         },
     }
+}
+
+/// Apply the config's allowlist to the running switch by rewriting the file it follows
+/// ([`crate::dev::plan::EGRESS_FILE`]); it takes effect within a second.
+///
+/// Update only when both the recorded boot manifest (`booted`) and the config are
+/// restricted. The manifest determines whether the switch follows a file, regardless of
+/// what the state directory contains. Changing the mode requires a restart, as
+/// `plan --diff` reports; until then, the switch keeps its current mode and lists.
+/// Recreate a missing file: the switch retains its last lists while it is absent and
+/// reloads it when it returns. The file always defines a restricted policy, so writing it
+/// applies the config's allowlist without lifting the restriction.
+fn sync_egress(plan: &Plan, booted: Option<&serde_json::Value>) -> Result<()> {
+    let Some(egress) = &plan.egress else {
+        return Ok(());
+    };
+    if !booted.is_some_and(|m| m["egress"]["mode"] == "restricted") {
+        return Ok(());
+    }
+    let path = plan.state_dir.join(crate::dev::plan::EGRESS_FILE);
+    let want = crate::switch::EgressFile {
+        allow_ip: egress.allow_ip.clone(),
+        allow_name: egress.allow_name.clone(),
+    };
+    let text = match std::fs::read(&path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    // A file that does not parse is one the switch refused and ignores, so the error is
+    // dropped and the file replaced like any other that differs.
+    if let Some(text) = text
+        && let Ok(held) = serde_json::from_slice::<crate::switch::EgressFile>(&text)
+        && held == want
+    {
+        return Ok(());
+    }
+    want.write(&path)
+        .with_context(|| format!("updating the egress allowlist {}", path.display()))?;
+    eprintln!("virtkit: egress allowlist updated — the running environment follows it");
+    Ok(())
 }
 
 /// Publish the config's endpoints. One that cannot be published is reported and the rest
@@ -1092,6 +1142,52 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    /// A take-over's switch was started by the failed parent, from the lists its config had.
+    #[tokio::test]
+    async fn a_take_over_holds_the_switch_it_readies_to_the_config_allowlist() {
+        let t = scratch("take-over-egress");
+        let mut plan = plan_in(&t.0);
+        plan.unresolved = vec!["${localEnv:TOKEN} is not set".into()];
+        plan.egress = Some(crate::dev::plan::EgressPlan {
+            mode: crate::dev::config::Egress::Restricted,
+            allow_name: vec!["debian.org".into()],
+            allow_ip: vec![],
+        });
+        ensure_state_dir(&plan).unwrap();
+        let vm = VmTie {
+            pid: 41,
+            created_secs: 7,
+        };
+        let (digest, manifest) = identity_of(&plan, None).unwrap();
+        let path = plan.state_dir.join(crate::dev::plan::EGRESS_FILE);
+        let file = |names: &[&str]| crate::switch::EgressFile {
+            allow_ip: vec![],
+            allow_name: names.iter().map(|n| n.to_string()).collect(),
+        };
+        let held = || {
+            serde_json::from_slice::<crate::switch::EgressFile>(&std::fs::read(&path).unwrap())
+                .unwrap()
+        };
+        for claimed in [false, true] {
+            file(&["old.example"]).write(&path).unwrap();
+            let readying = Readying {
+                booted: Some(vm),
+                digest: digest.clone(),
+                manifest: manifest.clone(),
+                booted_secs: 1000,
+                claimed,
+            };
+            ready_or_mark(&plan, &readying, || Some(vm)).await.unwrap();
+            // A fresh boot's switch reads what its own boot wrote, and is left to it.
+            let want = if claimed {
+                &["debian.org"]
+            } else {
+                &["old.example"]
+            };
+            assert_eq!(held(), file(want), "claimed: {claimed}");
+        }
+    }
+
     /// `after_boot` in the parent, against a state dir with and without the note the child
     /// leaves: the identity is written for a fresh boot and never for a reuse. Nothing here
     /// reaches a guest — no endpoints, no hooks, and an unresolved variable keeps
@@ -1403,5 +1499,72 @@ mod tests {
             .expect("no wait without a manager");
         let err = format!("{:#}", res.unwrap_err());
         assert!(err.starts_with("service db is not answering ("), "{err}");
+    }
+
+    #[test]
+    fn an_attach_rewrites_the_allowlist_only_for_a_switch_booted_restricted() {
+        let t = scratch("sync-egress");
+        let open = plan_in(&t.0);
+        std::fs::create_dir_all(&open.state_dir).unwrap();
+        let mut held = open.clone();
+        held.egress = Some(crate::dev::plan::EgressPlan {
+            mode: crate::dev::config::Egress::Restricted,
+            allow_name: vec!["debian.org".into()],
+            allow_ip: vec![],
+        });
+        let (_, restricted) = identity_of(&held, None).unwrap();
+        let (_, unrestricted) = identity_of(&open, None).unwrap();
+        let path = open.state_dir.join(crate::dev::plan::EGRESS_FILE);
+        let file = |names: &[&str]| crate::switch::EgressFile {
+            allow_ip: vec![],
+            allow_name: names.iter().map(|n| n.to_string()).collect(),
+        };
+        let read = || std::fs::read(&path).unwrap();
+
+        // No file under a switch booted unrestricted: none is created.
+        sync_egress(&held, Some(&unrestricted)).unwrap();
+        assert!(!path.exists());
+        // No file under a switch booted restricted: written afresh, since the switch follows
+        // it back once it reappears.
+        sync_egress(&held, Some(&restricted)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<crate::switch::EgressFile>(&read()).unwrap(),
+            file(&["debian.org"])
+        );
+        std::fs::remove_file(&path).unwrap();
+
+        // A file an earlier restricted boot left behind, under an environment that booted
+        // unrestricted (or recorded nothing): its switch follows nothing, so it is not touched
+        // and nothing claims an update.
+        file(&["old.example"]).write(&path).unwrap();
+        let stale = read();
+        sync_egress(&held, Some(&unrestricted)).unwrap();
+        sync_egress(&held, None).unwrap();
+        assert_eq!(read(), stale);
+
+        // The same lists, however spelt: left as they are.
+        std::fs::write(&path, br#"{"allow_name":["debian.org"]}"#).unwrap();
+        sync_egress(&held, Some(&restricted)).unwrap();
+        assert_eq!(read(), br#"{"allow_name":["debian.org"]}"#);
+
+        // Different lists, or a file that does not parse: replaced by the config's.
+        file(&["github.com"]).write(&path).unwrap();
+        sync_egress(&held, Some(&restricted)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<crate::switch::EgressFile>(&read()).unwrap(),
+            file(&["debian.org"])
+        );
+        std::fs::write(&path, b"{\"allow_name\": [").unwrap();
+        sync_egress(&held, Some(&restricted)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<crate::switch::EgressFile>(&read()).unwrap(),
+            file(&["debian.org"])
+        );
+
+        // A config that no longer restricts leaves the running switch's lists alone.
+        file(&["github.com"]).write(&path).unwrap();
+        let before = read();
+        sync_egress(&open, Some(&restricted)).unwrap();
+        assert_eq!(read(), before);
     }
 }

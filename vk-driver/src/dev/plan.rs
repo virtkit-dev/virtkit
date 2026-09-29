@@ -214,6 +214,19 @@ pub struct VsCodePlan {
     pub settings: serde_json::Value,
 }
 
+/// `[dev.network] egress = "restricted"`: what the run's switch lets the guest reach. Empty
+/// lists deny everything; the switch is the only way out, so this binds the primary and its
+/// compose siblings alike. Image pulls and `RUN` steps are the host's and the build's, not
+/// the guest's, and do not pass through it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EgressPlan {
+    /// Always `restricted`: it gives the identity an `egress.mode` key, classified restart,
+    /// so turning the restriction on or off drifts even with both lists empty.
+    pub mode: crate::dev::config::Egress,
+    pub allow_name: Vec<String>,
+    pub allow_ip: Vec<String>,
+}
+
 /// What a config resolves to on this host.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Plan {
@@ -233,6 +246,11 @@ pub struct Plan {
     pub cpus: Option<Cpus>,
     pub mem: Option<String>,
     pub nested: Nested,
+    /// the allowlist the guest's egress is held to; `None` = it reaches what the host reaches.
+    /// Left out of the record when `None`, so an environment that never asked for one keeps
+    /// the identity it booted with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressPlan>,
     /// extra binds, in name order, vk's own among them
     pub mounts: Vec<MountPlan>,
     pub container_env: Vec<EnvVar>,
@@ -269,6 +287,10 @@ pub struct Plan {
     pub secrets: BTreeSet<String>,
 }
 
+/// Allowlist file in the state dir, followed by a restricted environment's switch.
+/// `vk dev up` rewrites it to apply edits without a restart.
+pub(crate) const EGRESS_FILE: &str = "egress.json";
+
 /// The name vk gives the mount it makes for a persistent editor server, reserved so a
 /// configured mount cannot claim it.
 const EDITOR_MOUNT: &str = "vscode-server";
@@ -287,6 +309,8 @@ pub(super) const RESERVED_STATE_ENTRIES: &[&str] = &[
     "lifecycle",
     "host-exec-wrapper",
     "boot.log",
+    // the allowlist the switch follows: a guest that could write it would choose its own
+    EGRESS_FILE,
     // `crate::publish`'s registry of what is published, which the host reads back
     "publish",
     // auto-managed persistent backings the boot keeps under the state dir: `persist_root`
@@ -443,6 +467,13 @@ pub fn resolve(loaded: &Loaded, name: &str) -> Result<Plan> {
         cpus: env.cpus,
         mem: env.mem.clone(),
         nested: env.nested,
+        egress: (env.network.egress == Some(crate::dev::config::Egress::Restricted)).then(|| {
+            EgressPlan {
+                mode: crate::dev::config::Egress::Restricted,
+                allow_name: env.network.allow_name.clone(),
+                allow_ip: env.network.allow_ip.clone(),
+            }
+        }),
         mounts,
         container_env,
         exec_env,
@@ -1412,6 +1443,21 @@ impl Plan {
                      ~/.ssh/config — resolved at boot",
                     ssh.host.len(),
                     ssh.keys.len(),
+                ),
+            );
+        }
+        if let Some(e) = &self.egress {
+            let list = |v: &[String]| match v {
+                [] => "none".to_string(),
+                v => v.join(" "),
+            };
+            comment(
+                &mut out,
+                &format!(
+                    "[dev.network]: the switch holds egress to names {} and addresses {} — \
+                     no `vk run` flag spells this",
+                    list(&e.allow_name),
+                    list(&e.allow_ip),
                 ),
             );
         }

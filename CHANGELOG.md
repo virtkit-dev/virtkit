@@ -12,6 +12,16 @@ All notable changes to virtkit will be documented in this file.
   executable `gitlab-runner`. Without one, artifacts, caches and dotenv reports are not
   transferred; until now the only sign was gitlab-runner's own "Missing gitlab-runner"
   lines.
+- **`vk dev` can hold an environment's egress to an allowlist.** `[dev.network] egress =
+  "restricted"` with `allow-name` (DNS suffixes) and `allow-ip` (IPv4 CIDRs, optionally
+  port-scoped) lets the guest and its compose services reach only those; any other name
+  resolves to nothing (compose service names and reverse lookups still resolve) and any
+  other address is refused, an empty list denying everything.
+  Image pulls and build steps are unaffected. An edit to the lists applies to a running
+  environment when `vk dev up` attaches to it, without a restart and even under
+  `freshness = "reuse"`: names removed stop resolving, and new connections to their
+  addresses (unless a still-allowed name resolved to them) or to removed ranges are refused
+  within about a second; connections already open stay open.
 
 ### Changed
 

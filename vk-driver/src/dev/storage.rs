@@ -568,6 +568,7 @@ mod tests {
             cpus: None,
             mem: None,
             nested: crate::dev::config::Nested::Off,
+            egress: None,
             mounts: vec![mount(
                 "vscode-server",
                 t.0.join("state/vscode-server"),

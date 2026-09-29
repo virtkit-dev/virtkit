@@ -552,16 +552,53 @@ pub struct Endpoint {
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Network {
-    /// `unrestricted` (default)
+    /// `unrestricted` (default), or `restricted` to the allowlists below
     pub egress: Option<Egress>,
+    /// DNS suffixes the guest may resolve and reach, dot-anchored (`restricted` only)
+    #[serde(default)]
+    pub allow_name: Vec<String>,
+    /// IPv4 CIDRs, optionally `:port`-scoped, the guest may dial directly (`restricted` only)
+    #[serde(default)]
+    pub allow_ip: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Egress {
     Unrestricted,
-    /// Not implemented; parsed only so a config asking for it is refused by name.
+    /// Only the allowlists: empty ones deny everything, as the switch's `--egress-restrict`.
     Restricted,
+}
+
+impl Network {
+    fn validate(&self) -> Result<()> {
+        if self.egress != Some(Egress::Restricted) {
+            if !self.allow_name.is_empty() || !self.allow_ip.is_empty() {
+                bail!(
+                    "allow-name and allow-ip take effect only with egress = \"restricted\": \
+                     without it the guest reaches what the host reaches"
+                );
+            }
+            return Ok(());
+        }
+        for name in &self.allow_name {
+            let bare = name.trim_start_matches('.');
+            // A trailing dot is a fully qualified name, which no suffix match the switch
+            // makes would ever equal.
+            if bare.is_empty()
+                || bare.ends_with('.')
+                || bare.contains(|c: char| c.is_whitespace() || "/:@*".contains(c))
+            {
+                bail!(
+                    "allow-name {name:?}: expected a DNS suffix such as \"debian.org\", which \
+                     also allows every host under it"
+                );
+            }
+        }
+        // The switch's own parser, so a CIDR the config accepts is one the switch enforces.
+        crate::switch::Egress::restricted(&self.allow_ip, &[]).context("allow-ip")?;
+        Ok(())
+    }
 }
 
 /// `[dev.hooks]`: when project commands run around the environment.
@@ -939,12 +976,9 @@ impl Environment {
                 bail!("[{at}.endpoints.{name}] address {a:?}: expected \"auto\" or an IP address");
             }
         }
-        if self.network.egress == Some(Egress::Restricted) {
-            bail!(
-                "[{at}.network] egress = \"restricted\" is not implemented: the guest reaches \
-                 what the host reaches"
-            );
-        }
+        self.network
+            .validate()
+            .with_context(|| format!("[{at}.network]"))?;
         for (hook, cmd) in [
             ("init", &self.hooks.init),
             ("create", &self.hooks.create),
@@ -1039,6 +1073,16 @@ impl Environment {
         }
         if self.nested != Nested::Off {
             line("nested", self.nested.to_string());
+        }
+        if self.network.egress == Some(Egress::Restricted) {
+            line(
+                "egress",
+                format!(
+                    "restricted to {} name(s), {} address range(s)",
+                    self.network.allow_name.len(),
+                    self.network.allow_ip.len()
+                ),
+            );
         }
         if !self.exec_env.is_empty() || !self.container_env.is_empty() {
             line(
@@ -2670,7 +2714,40 @@ host-port = 9443
                 "[dev.endpoints.x]\ntarget = 80\naddress = \"lo\"",
                 "IP address",
             ),
-            ("[dev.network]\negress = \"restricted\"", "not implemented"),
+            // An allowlist that would silently do nothing.
+            (
+                "[dev.network]\nallow-name = [\"debian.org\"]",
+                "egress = \"restricted\"",
+            ),
+            (
+                "[dev.network]\negress = \"unrestricted\"\nallow-ip = [\"10.0.0.0/8\"]",
+                "egress = \"restricted\"",
+            ),
+            // A URL or a pattern where a suffix goes: the switch would match nothing.
+            (
+                "[dev.network]\negress = \"restricted\"\nallow-name = [\"https://debian.org\"]",
+                "DNS suffix",
+            ),
+            (
+                "[dev.network]\negress = \"restricted\"\nallow-name = [\"*.debian.org\"]",
+                "DNS suffix",
+            ),
+            (
+                "[dev.network]\negress = \"restricted\"\nallow-name = [\"\"]",
+                "DNS suffix",
+            ),
+            (
+                "[dev.network]\negress = \"restricted\"\nallow-name = [\"debian.org.\"]",
+                "DNS suffix",
+            ),
+            (
+                "[dev.network]\negress = \"restricted\"\nallow-ip = [\"10.0.0.0/33\"]",
+                "allow-ip",
+            ),
+            (
+                "[dev.network]\negress = \"restricted\"\nallow-ip = [\"gitlab.example.com\"]",
+                "allow-ip",
+            ),
             ("[dev.network]\nallow = [\"a\"]", "allow"),
             ("[dev.exec-env]\n\"A=B\" = \"x\"", "not a variable name"),
             ("[dev.container-env]\nA-B = \"x\"", "not a variable name"),

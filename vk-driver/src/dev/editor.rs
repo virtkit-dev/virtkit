@@ -1122,6 +1122,7 @@ mod tests {
             cpus: None,
             mem: None,
             nested: crate::dev::config::Nested::Off,
+            egress: None,
             mounts: vec![],
             container_env: vec![],
             exec_env: vec![],

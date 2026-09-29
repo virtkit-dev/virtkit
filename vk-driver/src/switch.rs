@@ -182,7 +182,7 @@ pub fn parse_mac(s: &str) -> Option<Mac> {
 }
 
 /// Egress policy — which off-subnet destinations the switch originates flows to.
-/// Default `AllowAll` (dev use is unrestricted); CI passes an allowlist.
+/// Default `AllowAll`; CI and `vk dev`'s restricted egress pass an allowlist.
 /// Direct (non-proxied) TCP/UDP egress is gated by destination IP (`allows_ip`);
 /// the in-switch http(s) proxy gates web egress by hostname (`allows_host`).
 #[derive(Clone, Default)]
@@ -344,8 +344,6 @@ impl EgressFile {
     }
     /// Write it whole, so a switch rereading it never sees half an edit; private, as it says
     /// what the guest may reach.
-    // `vk dev` is the writer; until it is wired in, only the tests write one.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn write(&self, path: &Path) -> Result<()> {
         let body = serde_json::to_vec_pretty(self)?;
         vk_fs::write_atomic(path, &body, 0o600)

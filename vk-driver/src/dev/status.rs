@@ -286,7 +286,8 @@ impl Status {
                 (Some(ConfigState::Matches), _) => "matches what is running".into(),
                 (Some(ConfigState::SessionOnly), _) => {
                     "changed since the boot only in what attaching applies (exec-env, editor, \
-                     endpoints, tasks); `vk dev up` applies it, no restart needed"
+                     endpoints, tasks, egress allowlist); `vk dev up` applies it, no restart \
+                     needed"
                         .into()
                 }
                 (Some(ConfigState::Drifted), Some(booted)) => format!(

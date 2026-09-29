@@ -232,6 +232,15 @@ fn run_args(
         state_dir: Some(plan.state_dir.clone()),
         // Egress, and for compose the LAN its services share.
         net: true,
+        egress_allow: plan.egress.as_ref().map(|e| crate::switch::EgressFile {
+            allow_ip: e.allow_ip.clone(),
+            allow_name: e.allow_name.clone(),
+        }),
+        // Followed by the switch, so `vk dev up` can apply an edit to the lists in place.
+        egress_file: plan
+            .egress
+            .as_ref()
+            .map(|_| plan.state_dir.join(crate::dev::plan::EGRESS_FILE)),
         cpus,
         mem: plan.mem.clone(),
         env: plan
@@ -374,6 +383,9 @@ pub fn task_args(
     args.detach = false;
     args.detach_log = None;
     args.inactivity_timeout_secs = None;
+    // Tasks use a fixed allowlist and must not overwrite the file the running
+    // environment's switch follows.
+    args.egress_file = None;
     if let Some(t) = target {
         // The fallback stage, built because the configured one was not cached.
         args.target = Some(t.to_string());
@@ -482,6 +494,25 @@ fn decide(
         Freshness::Ask if ask()? => Drifted::Restart,
         Freshness::Ask => Drifted::Reuse("not rebuilding"),
     })
+}
+
+/// Explain why attaching keeps `running`'s recorded egress mode when `wanted` changes it:
+/// only a restart replaces the switch. If both modes are restricted, list edits apply on attach.
+fn egress_as_booted(
+    running: &serde_json::Value,
+    wanted: &serde_json::Value,
+) -> Option<&'static str> {
+    let restricted = |m: &serde_json::Value| m["egress"]["mode"] == "restricted";
+    match (restricted(running), restricted(wanted)) {
+        (false, true) => Some(
+            "its egress stays unrestricted as booted — the config's allowlist applies only \
+             from `vk dev refresh`",
+        ),
+        (true, false) => Some(
+            "its egress stays restricted, to the allowlist last applied, until `vk dev refresh`",
+        ),
+        _ => None,
+    }
 }
 
 /// Restart state after rebuilding (see [`after_build`]).
@@ -771,7 +802,8 @@ enum Serves {
     /// booted from this very config
     Same,
     /// booted from one that differs only in what attaching applies (`exec-env`, editor
-    /// settings, endpoints, tasks), which the running VM never sees
+    /// settings, endpoints, tasks, the egress allowlist the running switch follows), none of
+    /// which the running VM itself holds
     OnAttach,
     /// not without a restart
     NeedsRestart,
@@ -916,7 +948,7 @@ fn attach_or_restart(
                 if session_only {
                     eprintln!(
                         "virtkit: its config changed only in what attaching applies (exec-env, \
-                         editor, endpoints, tasks) — no restart needed"
+                         editor, endpoints, tasks, egress allowlist) — no restart needed"
                     );
                 }
                 note_older_creator(running);
@@ -945,6 +977,9 @@ fn attach_or_restart(
                  the config",
                 summary()
             );
+            if let Some(note) = egress_as_booted(&running.manifest, wanted.manifest) {
+                eprintln!("virtkit: {note}");
+            }
             note_older_creator(running);
         }
         Live::Decided(Drifted::Refuse) => bail!(
@@ -1073,6 +1108,11 @@ pub async fn boot(
     // joiner takes for this one.
     let _ = std::fs::remove_file(identity_path(plan));
     clear_not_ready(plan);
+    // Remove any previous boot's allowlist on an unrestricted boot. A leftover file is
+    // harmless: attaching rewrites it only when the recorded identity is restricted.
+    if plan.egress.is_none() {
+        let _ = std::fs::remove_file(plan.state_dir.join(crate::dev::plan::EGRESS_FILE));
+    }
     let mut args = run_args(
         plan,
         snapshot.as_ref().map(|(p, _)| p.as_path()),
@@ -1631,6 +1671,38 @@ mod tests {
         assert_eq!(args.dockerfiles, [t.0.join("repo/docker/Dockerfile")]);
         assert_eq!(args.contexts, [t.0.join("repo/docker")]);
         assert_eq!(args.target.as_deref(), Some("dev"));
+
+        // Egress is the host's unless the config restricts it; a restriction reaches the
+        // switch as it was written, an empty one included (which denies everything).
+        assert!(args.egress_allow.is_none() && args.egress_file.is_none());
+        plan.egress = Some(crate::dev::plan::EgressPlan {
+            mode: crate::dev::config::Egress::Restricted,
+            allow_name: vec!["debian.org".into()],
+            allow_ip: vec!["10.0.0.0/8".into()],
+        });
+        let args = run_args(&plan, None, &over, &cfg, CheckoutMode::Shared).unwrap();
+        assert_eq!(
+            args.egress_allow,
+            Some(crate::switch::EgressFile {
+                allow_ip: vec!["10.0.0.0/8".into()],
+                allow_name: vec!["debian.org".into()],
+            })
+        );
+        // … through a file in the state dir, which the switch follows for later edits.
+        assert_eq!(
+            args.egress_file,
+            Some(plan.state_dir.join(crate::dev::plan::EGRESS_FILE))
+        );
+        plan.egress = Some(crate::dev::plan::EgressPlan {
+            mode: crate::dev::config::Egress::Restricted,
+            allow_name: vec![],
+            allow_ip: vec![],
+        });
+        let args = run_args(&plan, None, &over, &cfg, CheckoutMode::Shared).unwrap();
+        assert_eq!(
+            args.egress_allow,
+            Some(crate::switch::EgressFile::default())
+        );
     }
 
     #[test]
@@ -1743,6 +1815,30 @@ mod tests {
         // The mount is for a linked worktree's common directory; a directory git does not
         // call a repository has none.
         assert!(args.volumes.is_empty());
+    }
+
+    #[test]
+    fn a_reuse_says_when_egress_stays_as_booted() {
+        let t = scratch("egress-as-booted");
+        let open = plan_in(&t.0);
+        let held = |names: &[&str]| {
+            let mut p = open.clone();
+            p.egress = Some(crate::dev::plan::EgressPlan {
+                mode: crate::dev::config::Egress::Restricted,
+                allow_name: names.iter().map(|n| n.to_string()).collect(),
+                allow_ip: vec![],
+            });
+            identity_of(&p, None).unwrap().1
+        };
+        let (_, unrestricted) = identity_of(&open, None).unwrap();
+        let note = |running: &serde_json::Value, wanted: &serde_json::Value| {
+            egress_as_booted(running, wanted).unwrap_or_default()
+        };
+        assert!(note(&unrestricted, &held(&[])).contains("stays unrestricted"));
+        assert!(note(&held(&["debian.org"]), &unrestricted).contains("allowlist last applied"));
+        // Restricted on both sides, lists edited or not, or on neither: nothing to say.
+        assert_eq!(egress_as_booted(&held(&["debian.org"]), &held(&[])), None);
+        assert_eq!(egress_as_booted(&unrestricted, &unrestricted), None);
     }
 
     #[test]
@@ -2881,6 +2977,25 @@ mod tests {
         .unwrap();
         assert_eq!(fallback.target.as_deref(), Some("builder"));
         assert!(!fallback.require_cached);
+
+        // A restricted environment's task is held to the same lists, but never through the
+        // file the environment's own switch follows.
+        plan.egress = Some(crate::dev::plan::EgressPlan {
+            mode: crate::dev::config::Egress::Restricted,
+            allow_name: vec!["debian.org".into()],
+            allow_ip: vec![],
+        });
+        let restricted = task_args(
+            &plan,
+            &Overrides::default(),
+            &cfg,
+            &task,
+            &[],
+            None,
+            Some(&scratch_dir),
+        )
+        .unwrap();
+        assert!(restricted.egress_allow.is_some() && restricted.egress_file.is_none());
     }
 
     #[test]

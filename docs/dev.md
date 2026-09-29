@@ -409,8 +409,42 @@ allocating or booting. `--primary`, `--service NAME` and `--json` filter or form
 the output. `vk dev open NAME --print` prints the URL; without `--print`, it uses
 `xdg-open` when available and prints otherwise. It does not start the service.
 
-Development egress defaults to unrestricted. `[dev.network] egress = "restricted"`
-is currently rejected; it is not an implemented development allowlist.
+Development egress defaults to unrestricted: the guest reaches what the host reaches,
+its LAN and VPN included. To hold it to an allowlist instead:
+
+```toml
+[dev.network]
+egress = "restricted"
+allow-name = ["debian.org", "gitlab.example.com", "anthropic.com"]
+allow-ip = ["192.0.2.10/32:22"]
+```
+
+`allow-name` entries are DNS suffixes, dot-anchored: `debian.org` also allows
+`deb.debian.org`. A name outside them resolves to nothing, and the guest may reach the
+addresses an allowed name resolved to. Compose service names still resolve, and reverse
+(PTR) lookups still go to the host's resolver: they name an address, never open a way to
+one. `allow-ip` takes IPv4 CIDRs, each optionally scoped to one port, for destinations
+dialed by address; IPv6 is refused. With both lists empty, nothing is allowed. The
+allowlists are an error without `egress = "restricted"`.
+
+The environment's own switch enforces this, so it binds its compose services as well.
+It does not govern the host: image pulls, and the `RUN` steps of a `build` source, go out
+as before. SSH, `vk dev code` and `exec` reach the guest over vsock and need no entry,
+but what runs inside does — a VS Code server download, for one, needs
+`update.code.visualstudio.com` and `vscode.download.prss.microsoft.com`.
+
+Editing `allow-name` or `allow-ip` needs no restart. `plan --diff` calls it host-side,
+and the next `vk dev up` (or any command that attaches) hands the new lists to the
+running switch, which holds the guest to them within a second: a name taken off the list
+stops resolving, and new connections to the addresses it had resolved to are refused,
+even before their TTL, unless a name still listed resolved to the same address; so are
+new connections to a range taken off `allow-ip`. Connections already open stay open.
+Turning the restriction on or off is a different switch, so that one is a restart — under
+`freshness = "reuse"`, the environment keeps its restriction on or off as it booted until
+`vk dev refresh`, while edits to the lists still apply on attach.
+
+The restriction is a project default, not a sandbox the checkout enforces: a
+`.virtkit/local.toml` can widen the lists, or lift it with `remove = ["dev.network"]`.
 
 ## Workspace, mounts and storage
 

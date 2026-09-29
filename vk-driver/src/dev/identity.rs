@@ -636,6 +636,9 @@ fn effect_of(key: &str) -> Effect {
             Effect::Session
         }
         "endpoints" | "requires" => Effect::Host,
+        // The switch follows its allowlist file, which the next attach rewrites; turning the
+        // restriction on or off (`egress.mode`) is a different switch, so a restart.
+        "egress" if key.starts_with("egress.allow_") => Effect::Host,
         "cache" | "cached_only" | "fallback_target" => Effect::Rebuild,
         "source" if key.starts_with("source.Build") => Effect::Rebuild,
         _ => Effect::Restart,
@@ -897,6 +900,81 @@ mod tests {
             left_behind(&left, Some(vm), &digest, &manifest),
             Some(LeftBehind::Drifted)
         );
+    }
+
+    #[test]
+    fn an_allowlist_edit_is_host_side_and_no_allowlist_changes_no_identity() {
+        let t = scratch("egress");
+        let plan = plan_in(&t.0);
+        // Unrestricted leaves no trace in the record, so an environment booted before the
+        // allowlist existed still matches its config after an upgrade.
+        let (_, manifest) = identity_of(&plan, None).unwrap();
+        assert!(manifest.get("egress").is_none(), "{manifest}");
+        // The running switch follows its lists, so editing them is host-side; turning the
+        // restriction on or off is another switch, so a restart.
+        assert_eq!(effect_of("egress.allow_name[\"debian.org\"]"), Effect::Host);
+        assert_eq!(effect_of("egress.allow_ip[\"10.0.0.0/8\"]"), Effect::Host);
+        assert_eq!(effect_of("egress.mode"), Effect::Restart);
+        let mut held = plan.clone();
+        held.egress = Some(crate::dev::plan::EgressPlan {
+            mode: crate::dev::config::Egress::Restricted,
+            allow_name: vec!["debian.org".into()],
+            allow_ip: vec![],
+        });
+        let (before, _) = identity_of(&plan, None).unwrap();
+        let (after, manifest) = identity_of(&held, None).unwrap();
+        assert_ne!(before, after);
+        assert_eq!(manifest["egress"]["allow_name"][0], "debian.org");
+        assert_eq!(manifest["egress"]["mode"], "restricted");
+    }
+
+    #[test]
+    fn turning_the_restriction_on_or_off_is_a_restart_and_a_list_edit_is_not() {
+        let t = scratch("egress-drift");
+        let open = plan_in(&t.0);
+        let held = |names: &[&str], ips: &[&str]| {
+            let mut p = open.clone();
+            p.egress = Some(crate::dev::plan::EgressPlan {
+                mode: crate::dev::config::Egress::Restricted,
+                allow_name: names.iter().map(|n| n.to_string()).collect(),
+                allow_ip: ips.iter().map(|n| n.to_string()).collect(),
+            });
+            identity_of(&p, None).unwrap().1
+        };
+        let (_, unrestricted) = identity_of(&open, None).unwrap();
+        // The lists drift too when they are not empty, but the mode alone makes it a restart.
+        let restart = |before: &serde_json::Value, after: &serde_json::Value| {
+            let groups = drift(before, after);
+            groups
+                .get(&Effect::Restart)
+                .is_some_and(|l| l[0].starts_with("egress.mode"))
+                && !applied_on_attach(&groups)
+        };
+        // On or off, empty lists (deny all) included: a different switch.
+        for restricted in [held(&[], &[]), held(&["debian.org"], &["10.0.0.0/8"])] {
+            assert!(restart(&unrestricted, &restricted));
+            assert!(restart(&restricted, &unrestricted));
+        }
+        // Adding, removing or emptying a list is the running switch's to follow.
+        for (before, after) in [
+            (
+                held(&["debian.org"], &[]),
+                held(&["debian.org", "github.com"], &[]),
+            ),
+            (
+                held(&["debian.org"], &["10.0.0.0/8"]),
+                held(&["debian.org"], &[]),
+            ),
+            (held(&["debian.org"], &[]), held(&[], &[])),
+        ] {
+            let groups = drift(&before, &after);
+            assert_eq!(
+                groups.keys().collect::<Vec<_>>(),
+                [&Effect::Host],
+                "{groups:?}"
+            );
+            assert!(applied_on_attach(&groups));
+        }
     }
 
     #[test]

@@ -333,6 +333,15 @@ pub struct RunArgs {
     /// (or as well as) the booted guest — the build-phase counterpart of `audit_egress`,
     /// mirroring `--net` vs `--build-net`. Unused for a plain image boot (no build).
     pub build_audit_egress: bool,
+    /// Hold the booted guest's egress to this allowlist, where empty lists deny everything;
+    /// `None` = unrestricted. `vk dev`'s `egress = "restricted"`: the run's own switch
+    /// enforces it, so it binds compose siblings too. Requires `net`, and fails closed
+    /// without it: no switch means no egress at all.
+    pub egress_allow: Option<crate::switch::EgressFile>,
+    /// Where `egress_allow` is written for the switch to follow: edits to this file change a
+    /// running guest's allowlist without a restart (`vk dev`'s host-side apply). `None` = the
+    /// lists are passed once and fixed. Ignored without `egress_allow`.
+    pub egress_file: Option<PathBuf>,
     /// opt-in credential-injecting registry proxy: the upstream registry base URL
     /// (`scheme://host`). `vk` runs a host-local proxy forwarding to it with the
     /// `--username`/`--password`/`--ca` credentials, and the guest reaches it
@@ -475,6 +484,8 @@ impl Default for RunArgs {
             net: false,
             audit_egress: false,
             build_audit_egress: false,
+            egress_allow: None,
+            egress_file: None,
             registry_proxy: None,
             compose: None,
             profiles: Vec::new(),
@@ -1748,12 +1759,26 @@ async fn build_and_boot(
             }
             None => None,
         };
+        // A followed file carries the allowlist itself; written before the switch reads it.
+        let egress_file = match (&args.egress_allow, &args.egress_file) {
+            (Some(allow), Some(path)) => {
+                allow
+                    .write(path)
+                    .with_context(|| format!("writing the egress allowlist {}", path.display()))?;
+                Some(path.as_path())
+            }
+            _ => None,
+        };
+        let (allow_ip, allow_name) = match (&args.egress_allow, egress_file) {
+            (Some(allow), None) => (allow.allow_ip.as_slice(), allow.allow_name.as_slice()),
+            _ => (&[][..], &[][..]),
+        };
         let (child, attach) = spawn_vm_switch(
             &vsock,
             work,
             NET_VSOCK_PORT,
-            &[],
-            &[],
+            allow_ip,
+            allow_name,
             &planned.listen,
             &planned.primary_extra_ips,
             &hosts,
@@ -1761,9 +1786,10 @@ async fn build_and_boot(
             registry_proxy,
             args.audit_egress.then(|| work.join(AUDIT_LOG)),
             Some(work.join(NET_BYTES)),
-            // Dev `vk run` egress is unrestricted (no allowlist plumbed here).
-            false,
-            None,
+            // An allowlist, even an empty one, is restricted: `vk dev`'s `egress =
+            // "restricted"` with no names denies everything rather than nothing.
+            args.egress_allow.is_some() && egress_file.is_none(),
+            egress_file,
             crate::prio::Prio::Normal,
         )
         .await?;
@@ -3121,6 +3147,11 @@ async fn compose_up(
         .compose
         .as_ref()
         .expect("compose_up requires --compose");
+    // Its switch is started unrestricted: refuse an allowlist rather than drop it.
+    ensure!(
+        args.egress_allow.is_none(),
+        "`compose up` does not enforce an egress allowlist"
+    );
     let mut units = crate::compose::load(compose, Some(&compose_builtins(args, work)?))?;
     if units.is_empty() {
         bail!("{} declares no services", compose.display());
@@ -4314,7 +4345,7 @@ async fn spawn_vm_switch(
     // reads at the end; a run passes its own work dir.
     bytes_log: Option<PathBuf>,
     // Force allowlist mode even with empty lists (deny-all) — the CI build phase sets this
-    // for a restricted `[egress.build]`. Dev `vk run` passes `false` (unset = unrestricted).
+    // for a restricted `[egress.build]`, and a run for `vk dev`'s `egress = "restricted"`.
     restrict: bool,
     // Follow this `EgressFile` for the default policy instead of the lists above.
     egress_file: Option<&Path>,

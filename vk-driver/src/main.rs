@@ -1276,7 +1276,8 @@ enum Cmd {
         ///
         /// `{"allow_ip": [...], "allow_name": [...]}`, always restricted (empty lists deny
         /// everything). Reread when it changes, so a running guest's allowlist can be edited
-        /// in place; a missing or malformed file keeps the one in force.
+        /// in place; a missing or malformed file keeps the one in force. Set internally by
+        /// `vk dev` for `[dev.network] egress = "restricted"`.
         #[arg(
             long = "egress-file",
             value_name = "FILE",
@@ -3152,6 +3153,9 @@ async fn cli_main(cli: Cli) -> ExitCode {
             net: *net || compose.is_some(),
             audit_egress: *audit_egress,
             build_audit_egress: *build_audit_egress,
+            // A `vk dev` config setting; `vk run` has no allowlist flag for the booted guest.
+            egress_allow: None,
+            egress_file: None,
             registry_proxy: registry_proxy.clone(),
             compose: compose.clone(),
             profiles: profile.clone(),

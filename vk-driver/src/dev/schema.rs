@@ -478,6 +478,11 @@ test = ["./dev/tools/test.sh"]
 [environments.stock]
 image = "docker.io/library/debian:13"
 cpus = 4
+
+[environments.stock.network]
+egress = "restricted"
+allow-name = ["debian.org", "gitlab.example.com"]
+allow-ip = ["10.0.0.0/8", "192.0.2.10/32:22"]
 "#;
 
     /// The keys only a local layer may carry.
@@ -691,19 +696,14 @@ image = "docker.io/library/debian:13"
         assert!(err.contains("`schema = 1`"), "{err}");
     }
 
-    /// `restricted` parses, so `vk` refuses it with an explanation rather than an editor
-    /// reporting a value the schema has never heard of.
+    /// The schema and config accept a restricted environment with no allowlist: deny all.
     #[test]
-    fn the_document_takes_the_egress_vk_refuses_by_name() {
+    fn the_document_takes_a_restricted_egress_with_nothing_allowed() {
         let text = "schema = 1\n[dev]\nimage = \"x\"\n[dev.network]\negress = \"restricted\"\n";
         against_schema(&schema(), text);
 
         let config: Schema = toml::from_str(text).expect("devconfig reads it");
-        let err = format!(
-            "{:#}",
-            config.validate().expect_err("but vk does not run it")
-        );
-        assert!(err.contains("not implemented"), "{err}");
+        config.validate().expect("and vk runs it");
     }
 
     /// The constraints the document states itself, rather than leaving to `vk dev`.
