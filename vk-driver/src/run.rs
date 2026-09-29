@@ -1763,6 +1763,7 @@ async fn build_and_boot(
             Some(work.join(NET_BYTES)),
             // Dev `vk run` egress is unrestricted (no allowlist plumbed here).
             false,
+            None,
             crate::prio::Prio::Normal,
         )
         .await?;
@@ -3162,6 +3163,7 @@ async fn compose_up(
         args.audit_egress.then(|| work.join(AUDIT_LOG)),
         Some(work.join(NET_BYTES)),
         false,
+        None,
         crate::prio::Prio::Normal,
     )
     .await?;
@@ -4314,6 +4316,8 @@ async fn spawn_vm_switch(
     // Force allowlist mode even with empty lists (deny-all) — the CI build phase sets this
     // for a restricted `[egress.build]`. Dev `vk run` passes `false` (unset = unrestricted).
     restrict: bool,
+    // Follow this `EgressFile` for the default policy instead of the lists above.
+    egress_file: Option<&Path>,
     // Whether the VM this switch serves is a build stage (its downloads are the build's).
     prio: crate::prio::Prio,
 ) -> Result<(Child, crate::vmm::SwitchAttach)> {
@@ -4346,6 +4350,7 @@ async fn spawn_vm_switch(
         allow_ip: allow_ip.to_vec(),
         allow_name: allow_name.to_vec(),
         restrict,
+        egress_file: egress_file.map(Path::to_path_buf),
         // Dry-run is run-phase CI only (vm.rs): dev `vk run` and every build phase enforce.
         dry_run: false,
         // Per-service egress overrides are a CI feature (from a service's `variables:`);
@@ -4650,6 +4655,7 @@ pub(crate) async fn boot_session(
             // A restricted build policy (`BuildNet::Allow`, incl. empty = deny) forces
             // allowlist mode; `BuildNet::All` is unrestricted.
             matches!(net, crate::build::BuildNet::Allow { .. }),
+            None,
             crate::prio::Prio::Build,
         )
         .await?;

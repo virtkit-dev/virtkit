@@ -1272,6 +1272,17 @@ enum Cmd {
         /// (set internally by the gitlab executor when a job configures egress).
         #[arg(long = "egress-restrict")]
         egress_restrict: bool,
+        /// take the egress allowlist from this JSON file, and follow its edits
+        ///
+        /// `{"allow_ip": [...], "allow_name": [...]}`, always restricted (empty lists deny
+        /// everything). Reread when it changes, so a running guest's allowlist can be edited
+        /// in place; a missing or malformed file keeps the one in force.
+        #[arg(
+            long = "egress-file",
+            value_name = "FILE",
+            conflicts_with_all = ["allow_ip", "allow_name", "egress_restrict", "egress_dry_run"]
+        )]
+        egress_file: Option<PathBuf>,
         /// dry-run the allowlist: record what it would block, but block nothing
         ///
         /// Evaluate the allowlist and log would-be denials for the job trace, but carry the
@@ -3816,6 +3827,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         allow_ip,
         allow_name,
         egress_restrict,
+        egress_file,
         egress_dry_run,
         source_egress,
         registry_proxy,
@@ -3886,7 +3898,15 @@ async fn cli_main(cli: Cli) -> ExitCode {
         // --egress-restrict forces allowlist mode: an empty allowlist denies everything
         // (the CI executor sets it when a job configures egress) rather than collapsing to
         // unrestricted the way the dev `vk switch` / `vk run` path does.
-        let built = if *egress_restrict {
+        let mut followed = None;
+        let built = if let Some(f) = egress_file {
+            // The bytes read are what the follower compares against, so an edit landing
+            // between this read and its first poll is still applied.
+            switch::EgressFile::load(f).map(|(policy, text)| {
+                followed = Some((f.clone(), text));
+                policy
+            })
+        } else if *egress_restrict {
             switch::Egress::restricted(allow_ip, allow_name)
         } else {
             switch::Egress::new(allow_ip, allow_name)
@@ -3923,6 +3943,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             audit_log.clone(),
             net_bytes.clone(),
             *egress_dry_run,
+            followed,
         )
         .await
         {

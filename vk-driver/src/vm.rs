@@ -2149,6 +2149,8 @@ fn spawn_switch(
     let (allow_ip, allow_name, restrict) = effective_run_egress(cfg, ctx)?;
     let per_source = service_per_source(cfg, services)?;
     crate::switch::spawn(&crate::switch::Spawn {
+        // A CI job's allowlist is the job's, fixed for its run.
+        egress_file: None,
         listen,
         gateway,
         prefix,

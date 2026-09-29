@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::task::{Context as TaskCtx, Poll};
 use std::time::{Duration, Instant};
@@ -318,6 +319,123 @@ impl Egress {
     }
 }
 
+/// The default allowlist for `--egress-file`, reloaded when the file changes. Always
+/// restricted: empty lists deny everything, so an edit cannot switch to unrestricted mode.
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressFile {
+    #[serde(default)]
+    pub allow_ip: Vec<String>,
+    #[serde(default)]
+    pub allow_name: Vec<String>,
+}
+
+impl EgressFile {
+    /// Read and validate `path`, returning the policy and its bytes so
+    /// [`follow_egress_file`] detects edits made after this read.
+    pub fn load(path: &Path) -> Result<(Egress, Vec<u8>)> {
+        let text = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let policy = Self::parse(&text).with_context(|| format!("in {}", path.display()))?;
+        Ok((policy, text))
+    }
+    fn parse(text: &[u8]) -> Result<Egress> {
+        let file: EgressFile = serde_json::from_slice(text)?;
+        Egress::restricted(&file.allow_ip, &file.allow_name)
+    }
+    /// Write it whole, so a switch rereading it never sees half an edit; private, as it says
+    /// what the guest may reach.
+    // `vk dev` is the writer; until it is wired in, only the tests write one.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn write(&self, path: &Path) -> Result<()> {
+        let body = serde_json::to_vec_pretty(self)?;
+        vk_fs::write_atomic(path, &body, 0o600)
+    }
+}
+
+/// How often a switch with an `--egress-file` checks it for an edit.
+const EGRESS_FILE_POLL: Duration = Duration::from_secs(1);
+
+/// Why [`follow_egress_file`] last kept the policy in force, so each reason is said once.
+#[derive(PartialEq)]
+enum Refused {
+    /// The file could not be read (missing, or no access).
+    Unreadable,
+    /// It read as these bytes, which do not parse to a policy.
+    Rejected(Vec<u8>),
+}
+
+/// Follow `path` for the switch's life, replacing `guard`'s default policy when the contents
+/// differ from `applied`, the bytes of the current policy. Missing or invalid files leave
+/// that policy intact, with one warning per bad version rather than one per second.
+async fn follow_egress_file(guard: Arc<EgressGuard>, path: PathBuf, mut applied: Vec<u8>) {
+    let mut refused: Option<Refused> = None;
+    loop {
+        tokio::time::sleep(EGRESS_FILE_POLL).await;
+        let read = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || std::fs::read(path)).await
+        };
+        let text = match read {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
+                if refused != Some(Refused::Unreadable) {
+                    eprintln!(
+                        "switch: egress file {}: {e}; keeping the allowlist in force",
+                        path.display()
+                    );
+                    refused = Some(Refused::Unreadable);
+                }
+                continue;
+            }
+            // The read panicked or the runtime is shutting down: nothing was read, and the
+            // next poll tries again.
+            Err(_) => continue,
+        };
+        if text == applied {
+            refused = None;
+            continue;
+        }
+        if matches!(&refused, Some(Refused::Rejected(bad)) if *bad == text) {
+            continue;
+        }
+        match EgressFile::parse(&text) {
+            Ok(policy) => {
+                guard.replace_policy(policy);
+                eprintln!("switch: egress allowlist reloaded from {}", path.display());
+                applied = text;
+                refused = None;
+            }
+            Err(e) => {
+                eprintln!(
+                    "switch: egress file {}: {e:#}; keeping the allowlist in force",
+                    path.display()
+                );
+                refused = Some(Refused::Rejected(text));
+            }
+        }
+    }
+}
+
+/// An address a guest may reach because it resolved allowed names to it.
+#[derive(Default)]
+struct NamePin {
+    /// Every name it was resolved for, each with its own expiry, so a policy edit revokes it
+    /// only once no name still allowed resolved to it.
+    names: HashMap<String, Instant>,
+}
+
+impl NamePin {
+    /// Pin it for `name` until `until`, never shortening what an earlier answer granted.
+    fn extend(&mut self, name: &str, until: Instant) {
+        let t = self.names.entry(name.to_string()).or_insert(until);
+        *t = (*t).max(until);
+    }
+    /// Whether any of its names still holds it at `now`.
+    fn live(&self, now: Instant) -> bool {
+        self.names.values().any(|&until| until > now)
+    }
+}
+
 /// The guard's call on one direct flow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
@@ -335,10 +453,14 @@ enum Verdict {
 /// serves a single job VM, so the pin set is per-switch (not keyed by VM).
 struct EgressGuard {
     /// The default policy — the primary guest and any service without its own override.
-    policy: Egress,
+    /// Replaced whole when an `--egress-file` changes (see [`EgressGuard::replace_policy`]);
+    /// a flow takes the policy current when it is decided, so one being decided never sees
+    /// half of an edit.
+    policy: RwLock<Arc<Egress>>,
     /// Per-source overrides, keyed by the source VM's IPv4 (a service that declared its own
-    /// egress in its `variables:`). A flow's policy is `per_source[src]` or `policy`.
-    per_source: HashMap<Ipv4Addr, Egress>,
+    /// egress in its `variables:`). A flow's policy is `per_source[src]` or `policy`. Fixed
+    /// for the switch's life: an `--egress-file` governs the default policy only.
+    per_source: HashMap<Ipv4Addr, Arc<Egress>>,
     gateway: Ipv4Addr,
     /// Observe the policy instead of enforcing it. `false` (the default) blocks a denied flow:
     /// NXDOMAIN for a name outside the allowlist, RST/drop for a direct dial. `true` still
@@ -347,7 +469,7 @@ struct EgressGuard {
     dry_run: bool,
     /// DNS-pinned A-records, keyed by `(source, resolved_ip)` so one VM's resolution never
     /// admits a connection from another VM with a different policy (per-source isolation).
-    pinned: Mutex<HashMap<(Ipv4Addr, Ipv4Addr), Instant>>,
+    pinned: Mutex<HashMap<(Ipv4Addr, Ipv4Addr), NamePin>>,
     /// `(sentinel, host)`: a guest flow to `sentinel` is redirected to the host-local
     /// credential registry proxy at `host` (see regproxy.rs). `None` = disabled.
     registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
@@ -385,7 +507,7 @@ struct EgressGuard {
 impl EgressGuard {
     fn new(policy: Egress, gateway: Ipv4Addr) -> Self {
         EgressGuard {
-            policy,
+            policy: RwLock::new(Arc::new(policy)),
             per_source: HashMap::new(),
             gateway,
             dry_run: false,
@@ -403,7 +525,10 @@ impl EgressGuard {
         }
     }
     fn with_per_source(mut self, per_source: HashMap<Ipv4Addr, Egress>) -> Self {
-        self.per_source = per_source;
+        self.per_source = per_source
+            .into_iter()
+            .map(|(src, e)| (src, Arc::new(e)))
+            .collect();
         self
     }
     /// See the `dry_run` field.
@@ -567,37 +692,65 @@ impl EgressGuard {
     /// Any restriction at all — the default policy or any per-source override. Drives the
     /// startup log summary.
     fn restricted(&self) -> bool {
-        !matches!(self.policy, Egress::AllowAll) || !self.per_source.is_empty()
+        !matches!(*self.default_policy(), Egress::AllowAll) || !self.per_source.is_empty()
+    }
+    fn default_policy(&self) -> Arc<Egress> {
+        self.policy.read().unwrap().clone()
+    }
+    /// Replace the default policy and remove disallowed names from its DNS pins, revoking
+    /// their access before the TTL expires. An address stays pinned until the latest expiry
+    /// among its still-allowed names. Sources with their own policy keep their pins.
+    /// Prune under the write lock: [`Self::record_if_allowed`] either pins under the old
+    /// policy before this pruning, or waits and checks the new policy.
+    fn replace_policy(&self, policy: Egress) {
+        let mut current = self.policy.write().unwrap();
+        self.pinned.lock().unwrap().retain(|(src, _), pin| {
+            if self.per_source.contains_key(src) {
+                return true;
+            }
+            pin.names.retain(|name, _| policy.allows_host(name));
+            !pin.names.is_empty()
+        });
+        *current = Arc::new(policy);
     }
     /// The policy that governs flows from source `src`: its per-source override, else the
     /// default. `src` is authenticated by `handle_frame` against the address bound to its
     /// port, so a guest cannot forge a sibling's source to select the sibling's policy.
-    fn policy_for(&self, src: Ipv4Addr) -> &Egress {
-        self.per_source.get(&src).unwrap_or(&self.policy)
+    fn policy_for(&self, src: Ipv4Addr) -> Arc<Egress> {
+        match self.per_source.get(&src) {
+            Some(own) => own.clone(),
+            None => self.default_policy(),
+        }
     }
     /// May `src`'s resolver answer this name? (allowed names get forwarded + pinned.)
     fn name_allowed(&self, src: Ipv4Addr, host: &str) -> bool {
         self.policy_for(src).allows_host(host)
     }
-    /// Pin the A-records returned for an allowed name for its TTL (+ a small grace), scoped
-    /// to the resolving source so the guest's imminent connection to one of them is
-    /// permitted — and only that guest's, not another VM's.
-    fn record(&self, src: Ipv4Addr, ips: &[Ipv4Addr], ttl: u32) {
-        if matches!(self.policy_for(src), Egress::AllowAll) || ips.is_empty() {
-            return;
+    /// Pin the A-records `src` resolved `name` to for their TTL (+ a small grace), scoped to
+    /// the resolving source so the guest's imminent connection to one of them is permitted —
+    /// and only that guest's, not another VM's. Returns whether `src`'s policy allows `name`
+    /// now, which is checked and pinned under one read of the policy so an edit landing in
+    /// between cannot leave a pin for a name it removed; dry-run pins a refused name too.
+    fn record_if_allowed(&self, src: Ipv4Addr, name: &str, ips: &[Ipv4Addr], ttl: u32) -> bool {
+        let default = self.policy.read().unwrap();
+        let policy = self.per_source.get(&src).unwrap_or(&*default);
+        let allowed = policy.allows_host(name);
+        if (!allowed && !self.dry_run) || matches!(**policy, Egress::AllowAll) || ips.is_empty() {
+            return allowed;
         }
         let until = Instant::now() + Duration::from_secs(u64::from(ttl).max(30) + 60);
         let mut pinned = self.pinned.lock().unwrap();
         for ip in ips {
-            pinned.insert((src, *ip), until);
+            pinned.entry((src, *ip)).or_default().extend(name, until);
         }
+        allowed
     }
     /// May `src` open a direct flow to `dst`? Unrestricted => yes. Otherwise DNS must go to
     /// our resolver (so pinning holds), and the dst must be in `src`'s static allowlist or
     /// freshly pinned by one of `src`'s own allowed-name lookups.
     fn allows(&self, src: Ipv4Addr, dst: SocketAddr) -> bool {
         let policy = self.policy_for(src);
-        if matches!(policy, Egress::AllowAll) {
+        if matches!(*policy, Egress::AllowAll) {
             return true;
         }
         if dst.port() == DNS_PORT && dst.ip() != IpAddr::V4(self.gateway) {
@@ -611,7 +764,7 @@ impl EgressGuard {
         };
         let mut pinned = self.pinned.lock().unwrap();
         match pinned.get(&(src, v4)) {
-            Some(&until) if until > Instant::now() => true,
+            Some(pin) if pin.live(Instant::now()) => true,
             Some(_) => {
                 pinned.remove(&(src, v4));
                 false
@@ -870,6 +1023,9 @@ pub struct Spawn {
     /// (see vm.rs). Each entry `(source-ip, allow_ip, allow_name)` is always a restricted
     /// allowlist (empty = deny); a source with no entry uses the default (run) policy.
     pub per_source: Vec<(Ipv4Addr, Vec<String>, Vec<String>)>,
+    /// Take the default policy from this [`EgressFile`] instead of `allow_ip`/`allow_name`,
+    /// and follow its edits for the switch's life. `None` = the lists above, fixed.
+    pub egress_file: Option<PathBuf>,
     /// `(sentinel, host)`: redirect a guest flow to `sentinel` to the host-local
     /// credential registry proxy at `host` (see regproxy.rs). `None` = disabled.
     pub registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
@@ -934,6 +1090,9 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     }
     if opts.restrict {
         cmd.arg("--egress-restrict");
+    }
+    if let Some(f) = &opts.egress_file {
+        cmd.arg("--egress-file").arg(f);
     }
     if opts.dry_run {
         cmd.arg("--egress-dry-run");
@@ -1026,6 +1185,8 @@ pub async fn run(
     audit_log: Option<PathBuf>,
     bytes_log: Option<PathBuf>,
     dry_run: bool,
+    // An `--egress-file` to follow, with the bytes `egress` was loaded from.
+    egress_file: Option<(PathBuf, Vec<u8>)>,
 ) -> Result<()> {
     if listen.is_empty() {
         bail!("switch: at least one --listen is required");
@@ -1055,6 +1216,9 @@ pub async fn run(
     );
     let restricted = guard.restricted();
     guard.open_bytes();
+    if let Some((path, applied)) = egress_file {
+        tokio::spawn(follow_egress_file(guard.clone(), path, applied));
+    }
     let (drain, mut drained) = Drain::new();
     tokio::spawn(accept_loop(ip_stack, guard.clone(), drain.clone()));
     // The totals go out on a timer, so a reader that cannot stop the switch first — the job
@@ -2082,12 +2246,19 @@ async fn handle_dns(
                         egress.log_dns_upstream(primary, &question(), e);
                     }
                     let (ips, ttl) = parse_a_records(a.pin_source());
-                    egress.record(client_ip, &ips, ttl);
-                    // Audit: these IPs are now attributable to `name` for this VM, so a later
-                    // connection from it is counted under the domains summary, not re-logged as
-                    // a direct-IP contact.
-                    egress.record_dns_ips(client_ip, &ips);
-                    Some(a.reply)
+                    // `--egress-file` can change the policy while awaiting the upstream: a
+                    // name it no longer allows is refused, and its addresses not pinned.
+                    if !egress.record_if_allowed(client_ip, &name, &ips, ttl) && !egress.dry_run {
+                        eprintln!("switch: dns refused (egress allowlist, just changed): {name}");
+                        egress.record_denial(crate::egress_report::Proto::Dns, &name);
+                        Some(dns_nxdomain(&query, qend))
+                    } else {
+                        // Audit: these IPs are now attributable to `name` for this VM, so a
+                        // later connection from it is counted under the domains summary, not
+                        // re-logged as a direct-IP contact.
+                        egress.record_dns_ips(client_ip, &ips);
+                        Some(a.reply)
+                    }
                 }
                 // SERVFAIL rather than silence: the guest's resolver gives up on the lookup
                 // at once instead of sitting out its whole retry schedule for every name.
@@ -3846,6 +4017,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A stub upstream resolver answering its first query with one A record for `answer_ip`,
+    /// after running `on_query`.
+    async fn stub_upstream(
+        answer_ip: Ipv4Addr,
+        on_query: impl FnOnce() + Send + 'static,
+    ) -> SocketAddr {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, from) = upstream.recv_from(&mut buf).await.unwrap();
+            on_query();
+            let mut resp = buf[..n].to_vec();
+            resp[2..4].copy_from_slice(&[0x81, 0x80]); // QR, RD, RA; NOERROR
+            resp[6..8].copy_from_slice(&[0, 1]); // ANCOUNT = 1
+            resp.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4]);
+            resp.extend_from_slice(&answer_ip.octets());
+            upstream.send_to(&resp, from).await.unwrap();
+        });
+        upstream_addr
+    }
+
     /// Run one A query for a name outside the allowlist through `handle_dns`, against a stub
     /// upstream that answers it with `answer_ip`. Returns the DNS payload the guest got, the
     /// guard, and the denied and audit logs.
@@ -3866,18 +4059,7 @@ mod tests {
                 .with_audit_log(Some(audit_log.clone()))
                 .with_dry_run(dry_run),
         );
-        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 512];
-            let (n, from) = upstream.recv_from(&mut buf).await.unwrap();
-            let mut resp = buf[..n].to_vec();
-            resp[2..4].copy_from_slice(&[0x81, 0x80]); // QR, RD, RA; NOERROR
-            resp[6..8].copy_from_slice(&[0, 1]); // ANCOUNT = 1
-            resp.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4]);
-            resp.extend_from_slice(&answer_ip.octets());
-            upstream.send_to(&resp, from).await.unwrap();
-        });
+        let upstream_addr = stub_upstream(answer_ip, || {}).await;
         let (tx, mut rx) = unbounded_channel();
         handle_dns(
             dns_question(9, "blocked.example", 1),
@@ -3930,6 +4112,55 @@ mod tests {
         );
         assert!(!guard.allows(guest, SocketAddr::new(ip.into(), 443)));
         let _ = std::fs::remove_dir_all(denied_log.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn dns_refuses_a_name_the_policy_dropped_while_it_was_resolving() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let ip = Ipv4Addr::new(10, 20, 30, 40);
+        let dir = std::env::temp_dir().join(format!("vk-dns-changed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let denied_log = dir.join("denied.log");
+        let guard = Arc::new(
+            EgressGuard::new(
+                Egress::restricted(&[], &["corp.example.com".into()]).unwrap(),
+                gw,
+            )
+            .with_denied_log(Some(denied_log.clone())),
+        );
+        // The edit lands while the upstream holds the query.
+        let upstream = stub_upstream(ip, {
+            let guard = guard.clone();
+            move || guard.replace_policy(Egress::restricted(&[], &[]).unwrap())
+        })
+        .await;
+        let (tx, mut rx) = unbounded_channel();
+        handle_dns(
+            dns_question(9, "git.corp.example.com", 1),
+            Arc::new(HashMap::new()),
+            vec![upstream].into(),
+            gw,
+            guest,
+            40000,
+            [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc],
+            tx,
+            guard.clone(),
+        )
+        .await;
+        let frame = rx.try_recv().expect("handle_dns answers the guest");
+        let reply = &frame[ETH_HDR + 20 + 8..];
+        assert_eq!(reply[3] & 0x0f, RCODE_NXDOMAIN, "NXDOMAIN");
+        assert_eq!(
+            crate::egress_report::read_since(&denied_log, 0).0,
+            vec![crate::egress_report::Denial {
+                proto: crate::egress_report::Proto::Dns,
+                target: "git.corp.example.com".into(),
+            }]
+        );
+        assert!(!guard.allows(guest, SocketAddr::new(ip.into(), 443)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4085,7 +4316,13 @@ mod tests {
         let g = EgressGuard::new(Egress::new(&[], &["corp.example.com".into()]).unwrap(), gw);
         let corp: SocketAddr = "10.20.30.40:443".parse().unwrap();
         assert!(!g.allows(src, corp)); // not resolved yet
-        g.record(src, &[Ipv4Addr::new(10, 20, 30, 40)], 300); // resolver pinned it for this src
+        // resolver pinned it for this src
+        assert!(g.record_if_allowed(
+            src,
+            "git.corp.example.com",
+            &[Ipv4Addr::new(10, 20, 30, 40)],
+            300
+        ));
         assert!(g.allows(src, corp)); // now allowed
         assert!(!g.allows(src, "8.8.8.8:443".parse().unwrap())); // unrelated dst
         assert!(!g.allows(src, "8.8.8.8:53".parse().unwrap())); // DNS forced through the switch
@@ -4114,6 +4351,204 @@ mod tests {
         // The DB's deny-all policy refuses every name at the resolver, so it never resolves
         // (and thus never pins) an external host — no egress at all.
         assert!(!g.name_allowed(db, "example.com"));
+    }
+
+    #[test]
+    fn a_replaced_policy_decides_the_next_flow_and_revokes_the_old_pins() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let src = Ipv4Addr::new(192, 168, 231, 2);
+        let db = Ipv4Addr::new(192, 168, 231, 5);
+        let mut per = HashMap::new();
+        per.insert(
+            db,
+            Egress::restricted(&[], &["corp.example.com".into()]).unwrap(),
+        );
+        let g = EgressGuard::new(
+            Egress::restricted(&[], &["corp.example.com".into()]).unwrap(),
+            gw,
+        )
+        .with_per_source(per);
+        let corp: SocketAddr = "10.20.30.40:443".parse().unwrap();
+        let ip = [Ipv4Addr::new(10, 20, 30, 40)];
+        assert!(g.record_if_allowed(src, "git.corp.example.com", &ip, 300));
+        assert!(g.record_if_allowed(db, "git.corp.example.com", &ip, 300));
+        assert!(g.allows(src, corp) && g.allows(db, corp));
+
+        g.replace_policy(Egress::restricted(&["192.0.2.0/24:22".into()], &[]).unwrap());
+        // The default source is held to the new lists at once: the name is refused, and the
+        // address it resolved to before is no longer reachable on the old word.
+        assert!(!g.name_allowed(src, "git.corp.example.com"));
+        assert!(!g.allows(src, corp));
+        assert!(g.allows(src, "192.0.2.7:22".parse().unwrap()));
+        assert!(!g.allows(src, "192.0.2.7:80".parse().unwrap()));
+        // Nor can a lookup decided on the old policy pin it after the fact.
+        assert!(!g.record_if_allowed(src, "git.corp.example.com", &ip, 300));
+        assert!(!g.allows(src, corp));
+        // A source with its own policy keeps it, and what it pinned.
+        assert!(g.name_allowed(db, "git.corp.example.com"));
+        assert!(g.allows(db, corp));
+    }
+
+    #[test]
+    fn a_policy_edit_keeps_the_pins_of_names_it_still_allows() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let src = Ipv4Addr::new(192, 168, 231, 2);
+        let names = |n: &[&str]| n.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let g = EgressGuard::new(
+            Egress::restricted(&[], &names(&["debian.org", "github.com"])).unwrap(),
+            gw,
+        );
+        let deb: SocketAddr = "198.51.100.1:443".parse().unwrap();
+        let gh: SocketAddr = "198.51.100.2:443".parse().unwrap();
+        assert!(g.record_if_allowed(
+            src,
+            "deb.debian.org",
+            &[Ipv4Addr::new(198, 51, 100, 1)],
+            300
+        ));
+        assert!(g.record_if_allowed(src, "github.com", &[Ipv4Addr::new(198, 51, 100, 2)], 300));
+
+        // An addition leaves every address already resolved reachable.
+        g.replace_policy(
+            Egress::restricted(&[], &names(&["debian.org", "github.com", "gitlab.com"])).unwrap(),
+        );
+        assert!(g.allows(src, deb) && g.allows(src, gh));
+        // A removal revokes what that name resolved to, and only that.
+        g.replace_policy(Egress::restricted(&[], &names(&["debian.org", "gitlab.com"])).unwrap());
+        assert!(g.allows(src, deb));
+        assert!(!g.allows(src, gh));
+    }
+
+    #[test]
+    fn a_shared_address_stays_pinned_while_one_of_its_names_is_allowed() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let src = Ipv4Addr::new(192, 168, 231, 2);
+        let names = |n: &[&str]| n.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let g = EgressGuard::new(
+            Egress::restricted(&[], &names(&["a.com", "b.com"])).unwrap(),
+            gw,
+        );
+        let shared: SocketAddr = "198.51.100.7:443".parse().unwrap();
+        let ip = [Ipv4Addr::new(198, 51, 100, 7)];
+        assert!(g.record_if_allowed(src, "a.com", &ip, 300));
+        assert!(g.record_if_allowed(src, "b.com", &ip, 300));
+        // b.com last resolved to it, but a.com still vouches for it.
+        g.replace_policy(Egress::restricted(&[], &names(&["a.com"])).unwrap());
+        assert!(g.allows(src, shared));
+        g.replace_policy(Egress::restricted(&[], &[]).unwrap());
+        assert!(!g.allows(src, shared));
+        assert!(g.pinned.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pin_lasts_until_the_latest_of_its_names_expiries() {
+        let now = Instant::now();
+        let mut pin = NamePin::default();
+        pin.extend("a.com", now + Duration::from_secs(600));
+        // A shorter answer later, for the same name or another, does not cut it short.
+        pin.extend("a.com", now + Duration::from_secs(60));
+        pin.extend("b.com", now + Duration::from_secs(90));
+        assert!(pin.live(now + Duration::from_secs(300)));
+        assert!(!pin.live(now + Duration::from_secs(601)));
+        // Once the longer name is gone, the shorter one is all that holds it.
+        pin.names.remove("a.com");
+        assert!(pin.live(now + Duration::from_secs(80)));
+        assert!(!pin.live(now + Duration::from_secs(91)));
+    }
+
+    #[test]
+    fn an_egress_file_is_always_restricted_and_strictly_read() {
+        let deny = |e: &Egress| {
+            !e.allows_host("example.com") && !e.allows_ip("192.0.2.1".parse().unwrap(), 443)
+        };
+        // Empty — or empty lists — is a closed switch, never an open one.
+        assert!(deny(&EgressFile::parse(b"{}").unwrap()));
+        assert!(deny(
+            &EgressFile::parse(br#"{"allow_ip": [], "allow_name": []}"#).unwrap()
+        ));
+        let e = EgressFile::parse(br#"{"allow_name": ["Debian.org"]}"#).unwrap();
+        assert!(e.allows_host("deb.debian.org") && !e.allows_host("example.com"));
+        // A misspelt key or a bad range is refused rather than read as "nothing allowed".
+        assert!(EgressFile::parse(br#"{"allow_names": ["debian.org"]}"#).is_err());
+        assert!(EgressFile::parse(br#"{"allow_ip": ["10.0.0.0/33"]}"#).is_err());
+        assert!(EgressFile::parse(b"not json").is_err());
+
+        let dir = std::env::temp_dir().join(format!("vk-egress-file-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("egress.json");
+        EgressFile {
+            allow_ip: vec!["192.0.2.0/24".into()],
+            allow_name: vec!["debian.org".into()],
+        }
+        .write(&path)
+        .unwrap();
+        let (e, text) = EgressFile::load(&path).unwrap();
+        assert_eq!(text, std::fs::read(&path).unwrap());
+        assert!(e.allows_host("deb.debian.org") && e.allows_ip("192.0.2.9".parse().unwrap(), 1));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Paused: the follower's polls, and the waits for them, run on the test clock.
+    #[tokio::test(start_paused = true)]
+    async fn a_switch_follows_its_egress_file_and_keeps_the_last_good_one() {
+        let dir = std::env::temp_dir().join(format!("vk-egress-follow-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("egress.json");
+        let write = |names: &[&str]| {
+            EgressFile {
+                allow_ip: vec![],
+                allow_name: names.iter().map(|n| n.to_string()).collect(),
+            }
+            .write(&path)
+            .unwrap()
+        };
+        write(&["debian.org"]);
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let src = Ipv4Addr::new(192, 168, 231, 2);
+        let (policy, applied) = EgressFile::load(&path).unwrap();
+        let g = Arc::new(EgressGuard::new(policy, gw));
+        tokio::spawn(follow_egress_file(g.clone(), path.clone(), applied));
+        // Within a few polls of an edit, the next decision is the new list's.
+        let settles = |name: &'static str, want: bool| {
+            let g = g.clone();
+            async move {
+                for _ in 0..50 {
+                    if g.name_allowed(src, name) == want {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                false
+            }
+        };
+        assert!(g.name_allowed(src, "deb.debian.org"));
+        write(&["debian.org", "github.com"]);
+        assert!(
+            settles("github.com", true).await,
+            "an added name is followed"
+        );
+        write(&["debian.org"]);
+        assert!(
+            settles("github.com", false).await,
+            "a removed name is followed"
+        );
+        // A broken edit, then a missing file: the switch keeps what it last read.
+        std::fs::write(&path, b"{\"allow_name\": [").unwrap();
+        tokio::time::sleep(EGRESS_FILE_POLL * 3).await;
+        assert!(g.name_allowed(src, "deb.debian.org") && !g.name_allowed(src, "github.com"));
+        std::fs::remove_file(&path).unwrap();
+        tokio::time::sleep(EGRESS_FILE_POLL * 3).await;
+        assert!(g.name_allowed(src, "deb.debian.org") && !g.name_allowed(src, "github.com"));
+        // And follows again once it is repaired.
+        write(&["github.com"]);
+        assert!(settles("deb.debian.org", false).await);
+        assert!(g.name_allowed(src, "github.com"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4918,6 +5353,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
             )
             .await;
         });
