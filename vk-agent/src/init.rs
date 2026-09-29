@@ -128,6 +128,8 @@ use log::{info, warn};
 use vk_core::addr::SocketAddr;
 use vk_core::runcfg::{ImageInit, RunConfig};
 
+use crate::tools::{SharedRunner, ToolsScan};
+
 const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const SSH_VSOCK_PORT: u32 = 2222;
 /// Guest-side SSH_AUTH_SOCK the forwarder binds (on the /run tmpfs, never in the image).
@@ -1820,6 +1822,9 @@ fn apply_symlinks(cmdline: &HashMap<String, String>) {
 /// (/usr/local/bin) — but only when the job image does not already provide that
 /// command (per-image opt-out, checked here in-guest where PATH is accurate). The
 /// host keeps the binaries; nothing is copied into the guest or baked into a bundle.
+///
+/// A job left without gitlab-runner, by the share and the image alike, is recorded for
+/// `vk-agent tools` (the `tools` module) with the share's reason.
 fn link_ci_tools(cmdline: &HashMap<String, String>) {
     let Some(spec) = cmdline.get("VIRTKIT_TOOLS") else {
         return;
@@ -1828,32 +1833,55 @@ fn link_ci_tools(cmdline: &HashMap<String, String>) {
         warn!("vk-agent init: bad VIRTKIT_TOOLS {spec:?} (want tag:mountpoint)");
         return;
     };
-    let _ = run_cmd("modprobe", &["virtiofs"]); // built-in on our kernel; harmless
-    let _ = std::fs::create_dir_all(mnt);
-    if let Err(e) = mount(tag, mnt, "virtiofs", 0) {
-        warn!("vk-agent init: mount CI tools {tag} at {mnt} failed: {e}");
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(mnt) else {
+    // Before linking, which would put the share's own gitlab-runner on PATH.
+    let image_has_runner = which_runnable("gitlab-runner");
+    let scan = link_ci_tools_from(tag, mnt, image_has_runner);
+    let Some(why) = crate::tools::problem(&scan, image_has_runner) else {
+        if let Err(why) = &scan {
+            warn!("vk-agent init: CI tools {tag} at {mnt}: {why}");
+        }
         return;
     };
+    warn!("vk-agent init: CI tools {tag} at {mnt}: this job has no gitlab-runner: {why}");
+    crate::tools::record(&why);
+}
+
+/// Mount the share `tag` at `mnt` and link its tools onto PATH; `Err` when it cannot be
+/// mounted or read. The share's gitlab-runner is left to the image's when `image_has_runner`.
+fn link_ci_tools_from(tag: &str, mnt: &str, image_has_runner: bool) -> Result<ToolsScan, String> {
+    let _ = run_cmd("modprobe", &["virtiofs"]); // built-in on our kernel; harmless
+    let _ = std::fs::create_dir_all(mnt);
+    mount(tag, mnt, "virtiofs", 0).map_err(|e| format!("the share cannot be mounted: {e}"))?;
+    let entries = std::fs::read_dir(mnt).map_err(|e| format!("the share cannot be read: {e}"))?;
     let _ = std::fs::create_dir_all("/usr/local/bin");
     // `git` ships with its `git-remote-http(s)` helpers (https is not a builtin); the
     // family is all-or-nothing, governed by whether the image already has git, so we
     // never mix our helpers with the image's git. Captured before we link anything.
     let image_has_git = which("git");
     let mut linked_git = false;
+    let mut scan = ToolsScan {
+        empty: true,
+        runner: SharedRunner::Absent,
+    };
     for entry in entries.flatten() {
+        scan.empty = false;
         let src = entry.path();
         let Some(name) = src.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if !src.is_file() {
+        if name == "gitlab-runner" {
+            if !crate::tools::runnable(&src) {
+                scan.runner = SharedRunner::Unusable;
+                continue;
+            }
+        } else if !src.is_file() {
             continue; // is_file follows the symlink (git-remote-https -> git-remote-http)
         }
         // per-image opt-out: leave a tool to the image when it already provides it
         let skip = if name == "git" || name.starts_with("git-remote") {
             image_has_git
+        } else if name == "gitlab-runner" {
+            image_has_runner // only a runnable one: a stray file must not block the share's
         } else {
             which(name)
         };
@@ -1868,8 +1896,16 @@ fn link_ci_tools(cmdline: &HashMap<String, String>) {
                 if name == "git" {
                     linked_git = true;
                 }
+                if name == "gitlab-runner" {
+                    scan.runner = SharedRunner::Linked;
+                }
             }
-            Err(e) => warn!("vk-agent init: link {} -> {link}: {e}", src.display()),
+            Err(e) => {
+                warn!("vk-agent init: link {} -> {link}: {e}", src.display());
+                if name == "gitlab-runner" {
+                    scan.runner = SharedRunner::LinkFailed(e.to_string());
+                }
+            }
         }
     }
     // The injected static git's compiled-in CA bundle is Alpine's /etc/ssl/cert.pem,
@@ -1888,6 +1924,7 @@ fn link_ci_tools(cmdline: &HashMap<String, String>) {
             info!("vk-agent init: GIT_SSL_CAINFO={ca}");
         }
     }
+    Ok(scan)
 }
 
 /// `VIRTKIT_RECLAIM=[auto:]<floor_mib>`: fork the page-cache trimmer (the `reclaim` module).
@@ -3291,6 +3328,14 @@ fn which(cmd: &str) -> bool {
         .unwrap_or_default()
         .split(':')
         .any(|d| !d.is_empty() && Path::new(d).join(cmd).is_file())
+}
+
+/// [`which`], counting only a [`crate::tools::runnable`] file.
+fn which_runnable(cmd: &str) -> bool {
+    std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .any(|d| !d.is_empty() && crate::tools::runnable(&Path::new(d).join(cmd)))
 }
 
 fn cstr(s: &str) -> CString {

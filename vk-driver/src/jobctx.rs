@@ -292,6 +292,11 @@ impl JobCtx {
     pub fn tools_vfsd_log(&self) -> PathBuf {
         self.job_dir.join("tools-vfsd.log")
     }
+    /// The directory `[executor] tools_dir` resolved to at boot, recorded by the supervisor.
+    /// Prepare runs separately and must report that directory even if the link is repointed.
+    pub fn tools_root_file(&self) -> PathBuf {
+        self.job_dir.join("tools.root")
+    }
     /// Where prepare records the archive directory this job's guest statistics go to
     /// (`[executor] atop`), for the supervisor and the final stage — separate processes,
     /// which must not each derive a date of their own around midnight.

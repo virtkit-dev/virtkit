@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **GitLab jobs warn when they have no `gitlab-runner`.** With `[executor] tools_dir` set,
+  a job whose image and share both lack an executable `gitlab-runner` says so in its log
+  during prepare, with the reason: the share cannot be mounted or read, is empty, or has no
+  executable `gitlab-runner`. Without one, artifacts, caches and dotenv reports are not
+  transferred; until now the only sign was gitlab-runner's own "Missing gitlab-runner"
+  lines.
+
 ### Changed
 
 - `vk check --feature gitlab` fails when `[executor] tools_dir` has no executable
@@ -25,6 +34,9 @@ All notable changes to virtkit will be documented in this file.
   applies to a root that is not a link: a `tools_dir` or share dir that others could
   replace, or inside or holding such a directory, now fails the job where it used to be
   served.
+- **A non-executable `gitlab-runner` in a GitLab job image no longer keeps the
+  `[executor] tools_dir` one off the job's PATH**, and a non-executable one in the share is
+  no longer linked.
 
 ## [0.79.3] - 2026-09-28
 

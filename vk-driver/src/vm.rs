@@ -559,6 +559,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
                     start.elapsed().as_secs_f32()
                 );
                 probe_guest_shell(ctx, &addr).await;
+                report_tools_share(ctx, &addr).await;
                 // Only signal ready (exit 0) once the services the job declared are up too:
                 // they boot concurrently in the supervisor and the job script runs the moment
                 // this stage exits.
@@ -1338,6 +1339,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         let dir = guest_writable
             .resolve(dir)
             .with_context(|| format!("resolving share root {}", dir.display()))?;
+        // Best-effort: without it the report names only the configured tools_dir.
+        let _ = std::fs::write(ctx.tools_root_file(), dir.as_os_str().as_bytes());
         let sock = ctx.tools_vfsd_sock();
         if !crate::vmm::libkrun_selected() {
             let mut vfsd = cfg.virtiofsd_command();
@@ -1909,6 +1912,68 @@ async fn probe_guest_shell(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
         ctx.job_dir.join("guest.shell"),
         if has_bash { "configured" } else { "sh" },
     );
+}
+
+/// Warn in the job trace when gitlab-runner is missing, with the guest's reason about the
+/// CI tools share (`[executor] tools_dir`). Without it, helper steps transfer no artifacts,
+/// caches or dotenv reports and the job still passes, so the warning explains the loss.
+/// The guest decides because only it knows whether the image provides gitlab-runner.
+/// Best-effort: an agent that cannot answer delays prepare by at most 5 s, never failing
+/// the job.
+async fn report_tools_share(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
+    let Some(dir) = &ctx.cfg.executor.tools_dir else {
+        return;
+    };
+    let (out, sink) = crate::executor::stdout_capture();
+    let asked = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::executor::exec_script(
+            addr,
+            &[crate::run::GUEST_AGENT.to_string(), "tools".to_string()],
+            Vec::new(),
+            None,
+            &sink,
+            None,
+        ),
+    )
+    .await;
+    if !matches!(asked, Ok(Ok(r)) if r.code == Some(0)) {
+        return;
+    }
+    let Ok(out) = out.lock() else {
+        return;
+    };
+    let Some(why) = tools_problem(&out) else {
+        return;
+    };
+    // The tree this job booted with, not what a link repointed since names now.
+    let shown = match std::fs::read(ctx.tools_root_file()) {
+        Ok(root) if !root.is_empty() && root != dir.as_os_str().as_bytes() => format!(
+            "{} -> {}",
+            dir.display(),
+            Path::new(std::ffi::OsStr::from_bytes(&root)).display()
+        ),
+        _ => dir.display().to_string(),
+    };
+    eprintln!(
+        "virtkit: warning: this job has no gitlab-runner, so artifacts, caches and dotenv \
+         reports will not be transferred ([executor] tools_dir {shown}: {why})"
+    );
+}
+
+/// Format the guest-written `vk-agent tools` diagnostic as one job-trace line. Replace
+/// control characters to prevent forged lines and cap the length. `None` means no report.
+fn tools_problem(out: &[u8]) -> Option<String> {
+    let line = std::str::from_utf8(out).ok()?.lines().next()?.trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(
+        line.chars()
+            .take(200)
+            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+            .collect(),
+    )
 }
 
 /// Where a CI service's image comes from — the three-way choice [`plan_services`] makes.
@@ -3809,6 +3874,24 @@ mod tests {
             err,
             format!("{} was removed while it was being resolved", dir.display())
         );
+    }
+
+    /// What the guest says about its tools share reaches the trace as one line at most.
+    #[test]
+    fn a_tools_problem_is_one_trace_line() {
+        assert_eq!(tools_problem(b""), None);
+        assert_eq!(tools_problem(b"\n"), None);
+        assert_eq!(
+            tools_problem(b"the share is empty\n").as_deref(),
+            Some("the share is empty")
+        );
+        assert_eq!(
+            tools_problem(b"bad\x1b[2Kline\nvirtkit: forged\n").as_deref(),
+            Some("bad\u{fffd}[2Kline")
+        );
+        assert_eq!(tools_problem(b"bad \xff utf-8\n"), None);
+        let long = "x".repeat(1000);
+        assert_eq!(tools_problem(long.as_bytes()).unwrap().len(), 200);
     }
 
     /// Unset is not "8G": the cloud-hypervisor backend warns only about a window the host
