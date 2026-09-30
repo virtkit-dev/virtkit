@@ -20,6 +20,9 @@
 //!
 //! A string field is parenthesised and may hold spaces — a command line is one of them —
 //! so a record is split into cells by [`cells`] rather than on whitespace.
+//!
+//! Two labels are virtkit's own, not atop's: [`WCHANS`] and [`STACK`], which say what a
+//! multi-threaded process's threads wait in.
 
 /// The virtio-fs tag of the archive share. The host's `FsShare` and the cmdline knob
 /// must name the same tag: the guest mounts whatever the cmdline says.
@@ -502,6 +505,162 @@ pub fn label_of(cells: &[&str]) -> Option<&'static Label> {
     LABELS.iter().copied().find(|l| l.name == name)
 }
 
+/// The vk-specific label for a multi-threaded process's wait channels: after the [`HEADER`]
+/// columns, `<pid> (<name>)`, then one `<wchan>:<threads>` cell per kernel function its
+/// non-running threads wait in, sorted by name. A running thread has no wait channel and is
+/// counted in PRG's `threads-running` instead, so a process whose threads all run has no cell.
+///
+/// The guest writes one only when the histogram differs from the one it last wrote for the
+/// same task, and for every multi-threaded process in the sample after `RESET`: the latest
+/// record stands until the next one, or until PRG reports the process single-threaded. Its
+/// arity varies, so it is not a [`Label`] and not in [`LABELS`]; [`label_of`] does not know
+/// it, which is how an atop-format reader that does not read it skips it.
+pub const WCHANS: &str = "PRW";
+
+/// The vk-specific label for one thread's kernel stack, written once per task when its
+/// process meets the [`Stall`] test in the guest: after the [`HEADER`] columns, `<pid>
+/// (<name>) <tid> <wchan> <frames>`. `<wchan>` is `-` for a thread with none; `<frames>` is
+/// the stack innermost first, joined by `;`, each frame `function+offset/length` as
+/// `/proc/<pid>/task/<tid>/stack` prints it, or `-` where the kernel exposes no stack.
+pub const STACK: &str = "PRK";
+
+/// How long a multi-threaded process's wait channels must stand unchanged, with no thread
+/// running and no disk transfer, before it counts as stalled.
+///
+/// Five minutes: the waits of a CI step that is making progress (a lock, a slow download, a
+/// child finishing) change some thread's channel within seconds, while a hang that runs into
+/// a job's timeout (an hour and up) is caught long before its VM is torn down.
+pub const STALL_SECS: u64 = 300;
+
+/// Minimum unchanged samples per stall, so a coarse sampling interval cannot trigger a
+/// verdict after only one or two samples.
+pub const STALL_MIN_SAMPLES: u32 = 3;
+
+/// Whether one sample shows a multi-threaded process standing still against the previous
+/// sample it appeared in: the same wait channels recorded, no thread running, and no disk
+/// sectors moved over the interval. Processor time is not part of it: idle threads polling a
+/// stuck worker keep a hung process at a percent or so of a processor.
+pub fn idle(same_wchans: bool, threads_running: u64, sectors: u64) -> bool {
+    same_wchans && threads_running == 0 && sectors == 0
+}
+
+/// Whether one sample's processor ticks and 512-byte sectors, both over its interval, show a
+/// process doing work.
+pub fn worked(ticks: u64, sectors: u64) -> bool {
+    ticks > 0 || sectors > 0
+}
+
+/// One multi-threaded process's progress towards a stall. Guest and host each keep one per
+/// task (pid and start time) and feed it the same figures from each sample on disk, so the
+/// stacks the guest writes ([`STACK`]) and the stalls the host reports are the same ones.
+///
+/// A stall is a stretch of [`idle`] samples lasting [`STALL_SECS`] and [`STALL_MIN_SAMPLES`],
+/// by a process that [`worked`] in a sample up to the one the stretch starts at. That sample
+/// counts because its figures cover the interval before the stretch; work inside the stretch
+/// is its own idle threads polling. The boot-covering first sample is not work of the job's,
+/// so a daemon that has done nothing since the guest booted never stalls — though one that
+/// worked and then idles with its wait channels frozen does.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stall {
+    seen: bool,
+    from: i64,
+    unchanged: u32,
+    worked: bool,
+}
+
+impl Stall {
+    /// Observe a sample and return whether the process is stalled. `idle` is [`idle`] against
+    /// the previous sample (false for the first); `worked` is [`worked`] over this sample's
+    /// interval (false for the boot-covering sample).
+    pub fn observe(&mut self, epoch: i64, idle: bool, worked: bool) -> bool {
+        match idle && self.seen {
+            true => self.unchanged = self.unchanged.saturating_add(1),
+            false => {
+                self.from = epoch;
+                self.unchanged = 0;
+                self.worked |= worked;
+            }
+        }
+        self.seen = true;
+        let secs = epoch.saturating_sub(self.from).max(0) as u64;
+        self.worked && secs >= STALL_SECS && self.unchanged >= STALL_MIN_SAMPLES
+    }
+
+    /// When the current stretch began (seconds since the epoch).
+    pub fn from(&self) -> i64 {
+        self.from
+    }
+}
+
+/// A [`WCHANS`] record, read.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Wchans<'a> {
+    pub pid: i32,
+    pub name: &'a str,
+    /// `(wchan, threads)`, in the order the record lists them.
+    pub counts: Vec<(&'a str, u32)>,
+}
+
+/// A [`WCHANS`] record's own fields, or `None` when `cells` is not one or is malformed: a
+/// pid that is no number, a name that is not parenthesised, or a cell that is not
+/// `<wchan>:<count>`. A wchan is a kernel symbol and holds no `:`, but the count is taken
+/// after the last one regardless.
+pub fn parse_wchans<'a>(cells: &[&'a str]) -> Option<Wchans<'a>> {
+    let (pid, name, rest) = task_cells(cells, WCHANS)?;
+    let counts = rest
+        .iter()
+        .map(|cell| match cell.rsplit_once(':') {
+            Some((wchan, count)) if !wchan.is_empty() => Some((wchan, count.parse().ok()?)),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(Wchans { pid, name, counts })
+}
+
+/// A [`STACK`] record, read.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Stack<'a> {
+    pub pid: i32,
+    pub name: &'a str,
+    pub tid: i32,
+    /// `None` for a thread with no wait channel (written `-`).
+    pub wchan: Option<&'a str>,
+    /// Innermost first; empty where the kernel exposed no stack (written `-`).
+    pub frames: Vec<&'a str>,
+}
+
+/// A [`STACK`] record's own fields, or `None` when `cells` is not one or does not carry
+/// exactly its five.
+pub fn parse_stack<'a>(cells: &[&'a str]) -> Option<Stack<'a>> {
+    let (pid, name, rest) = task_cells(cells, STACK)?;
+    let [tid, wchan, frames] = rest else {
+        return None;
+    };
+    let dash = |cell: &'a str| (cell != "-").then_some(cell);
+    Some(Stack {
+        pid,
+        name,
+        tid: tid.parse().ok()?,
+        wchan: dash(wchan),
+        frames: dash(frames)
+            .map(|f| f.split(';').filter(|f| !f.is_empty()).collect())
+            .unwrap_or_default(),
+    })
+}
+
+/// The pid and unparenthesised name that open a vk-specific process record of `label`, and
+/// the cells after them.
+fn task_cells<'c, 'a>(cells: &'c [&'a str], label: &str) -> Option<(i32, &'a str, &'c [&'a str])> {
+    if cells.first() != Some(&label) {
+        return None;
+    }
+    let [pid, name, rest @ ..] = cells.get(HEADER_COLS..)? else {
+        return None;
+    };
+    let name = name.strip_prefix('(')?.strip_suffix(')')?;
+    Some((pid.parse().ok()?, name, rest))
+}
+
 /// Now, in seconds since the epoch: the `epoch` column of a record, and the day a job is
 /// filed under. Both sides stamp their own clock, so both read it here.
 pub fn now_epoch() -> i64 {
@@ -721,6 +880,119 @@ mod tests {
         assert!(label_of(&cells("SEP")).is_none());
         assert!(label_of(&cells("RESET")).is_none());
         assert!(label_of(&[]).is_none());
+    }
+
+    /// The wait-channel record reads back as its pid, name and counts; a record whose cells
+    /// are not all `<wchan>:<count>` is refused whole rather than read in part. Neither
+    /// vk-specific label is one [`label_of`] knows, so a positional reader skips both.
+    #[test]
+    fn a_wait_channel_record_reads_back() {
+        let h = "PRW h 100 1970/01/01 00:01:40 30";
+        let line = format!("{h} 412 (ruff check) futex_do_wait:1 hrtimer_nanosleep:7");
+        let c = cells(&line);
+        assert!(label_of(&c).is_none());
+        assert_eq!(
+            parse_wchans(&c),
+            Some(Wchans {
+                pid: 412,
+                name: "ruff check",
+                counts: vec![("futex_do_wait", 1), ("hrtimer_nanosleep", 7)],
+            })
+        );
+        // Every thread running: no cell after the name.
+        let all_running = format!("{h} 412 (ruff)");
+        let w = parse_wchans(&cells(&all_running)).expect("a record with no channels");
+        assert!(w.counts.is_empty());
+        for bad in [
+            format!("{h} 412 (ruff) futex_do_wait"),
+            format!("{h} 412 (ruff) futex_do_wait:x"),
+            format!("{h} 412 (ruff) :3"),
+            format!("{h} x (ruff) futex_do_wait:1"),
+            format!("{h} 412 ruff futex_do_wait:1"),
+            format!("{h} 412"),
+            "PRW h 100".to_string(),
+            format!("PRK{} 412 (ruff) futex_do_wait:1", &h[3..]),
+        ] {
+            assert_eq!(parse_wchans(&cells(&bad)), None, "{bad}");
+        }
+    }
+
+    /// The stack record: a thread's wait channel and frames, `-` standing for either being
+    /// absent — a thread with no wait channel, a kernel that exposes no stacks.
+    #[test]
+    fn a_stack_record_reads_back() {
+        let h = "PRK h 100 1970/01/01 00:01:40 30";
+        let line = format!(
+            "{h} 412 (ruff) 415 request_wait_answer \
+             request_wait_answer+0x7c/0x1e0;fuse_simple_request+0x1a0/0x2d0"
+        );
+        let c = cells(&line);
+        assert!(label_of(&c).is_none());
+        assert_eq!(
+            parse_stack(&c),
+            Some(Stack {
+                pid: 412,
+                name: "ruff",
+                tid: 415,
+                wchan: Some("request_wait_answer"),
+                frames: vec![
+                    "request_wait_answer+0x7c/0x1e0",
+                    "fuse_simple_request+0x1a0/0x2d0"
+                ],
+            })
+        );
+        let bare = format!("{h} 412 (ruff) 413 - -");
+        let s = parse_stack(&cells(&bare)).expect("a record with nothing to show");
+        assert_eq!((s.wchan, s.frames.len()), (None, 0));
+        for bad in [
+            format!("{h} 412 (ruff) 413 -"),
+            format!("{h} 412 (ruff) 413 - - extra"),
+            format!("{h} 412 (ruff) tid - -"),
+        ] {
+            assert_eq!(parse_stack(&cells(&bad)), None, "{bad}");
+        }
+    }
+
+    /// A stall needs work before it, then five minutes and three samples of standing still.
+    /// A sample that moves starts the stretch over, and its own work counts; work inside the
+    /// stretch does not, and neither does the boot sample's.
+    #[test]
+    fn a_stall_takes_work_then_time_and_samples() {
+        assert_eq!(
+            STALL_MIN_SAMPLES, 3,
+            "the samples below are counted out for three"
+        );
+        let secs = STALL_SECS as i64;
+        // Worked in the sample the stretch starts at.
+        let mut s = Stall::default();
+        assert!(!s.observe(0, false, true));
+        assert!(!s.observe(secs - 1, true, false), "not five minutes yet");
+        assert!(!s.observe(secs, true, false), "two samples");
+        assert!(s.observe(secs + 10, true, false));
+        assert_eq!(s.from(), 0);
+        // A coarse interval reaches five minutes before three samples.
+        let mut s = Stall::default();
+        s.observe(0, false, true);
+        assert!(!s.observe(secs * 10, true, false));
+        assert!(!s.observe(secs * 11, true, false));
+        assert!(s.observe(secs * 12, true, false));
+        // Idle since the boot sample, polling ticks inside the stretch notwithstanding.
+        let mut s = Stall::default();
+        s.observe(0, false, false);
+        for i in 1..100 {
+            assert!(!s.observe(i * 10, true, true));
+        }
+        // A sample that moves restarts the stretch there.
+        let mut s = Stall::default();
+        s.observe(0, false, true);
+        s.observe(10, true, false);
+        s.observe(20, false, false);
+        assert_eq!(s.from(), 20);
+        assert!(!s.observe(secs + 10, true, false));
+        assert!(!s.observe(secs + 20, true, false));
+        assert!(s.observe(secs + 30, true, false));
+        assert!(idle(true, 0, 0) && !idle(false, 0, 0) && !idle(true, 1, 0) && !idle(true, 0, 1));
+        assert!(worked(1, 0) && worked(0, 1) && !worked(0, 0));
     }
 
     /// The knob the host writes is the knob the guest parses — the two sides agree on

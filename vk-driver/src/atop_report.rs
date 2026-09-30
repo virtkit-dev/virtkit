@@ -2,7 +2,7 @@
 //!
 //! A log is a few hundred lines per interval and nobody reads that; this is the account of
 //! it — how long the guest ran, what it did with its processors and memory, what it moved,
-//! where it stalled, and which of its processes the time went to.
+//! where it stalled, which of its processes the time went to, and which of them sat stuck.
 //!
 //! Two properties of the format shape every figure here. Counter labels carry per-interval
 //! differences, so a *total* is a sum over samples and a *rate* is one sample divided by its
@@ -148,6 +148,7 @@ fn body(parsed: &Parsed) -> Option<String> {
         ));
     }
     out.push_str(&processes(samples));
+    out.push_str(&stalls(samples));
     Some(out)
 }
 
@@ -728,6 +729,201 @@ impl Totals {
     }
 }
 
+/// How many stalled processes the "stalled" section lists.
+const TOP_STALLS: usize = 5;
+
+/// A multi-threaded process's longest stall ([`vk_core::atop::Stall`], the test the guest
+/// dumps stacks by): its wait channels as the guest last recorded them, and the stacks it
+/// dumped.
+struct Stuck {
+    pid: i32,
+    /// Started after the boot sample, i.e. by the job rather than with the guest.
+    launched: bool,
+    command: String,
+    threads: u64,
+    from: i64,
+    to: i64,
+    wchans: BTreeMap<String, u32>,
+    stacks: Vec<crate::atoplog::Stack>,
+    /// When the guest wrote `stacks` — at the process's first stall, which need not be this
+    /// one — and how many threads it had then.
+    stacks_at: i64,
+    stacks_of: u64,
+}
+
+/// The processes that stalled, those the job started first, then longest first: where each
+/// one's threads waited, and the kernel stacks the guest wrote for it. Empty when none did,
+/// or the log records no wait channels.
+fn stalls(samples: &[Sample]) -> String {
+    // Per multi-threaded process (pid, start time): its tracker, fed what the guest fed its
+    // own from the same samples, and when the wait channels it last saw were recorded.
+    let mut tracks: HashMap<(i32, i64), (vk_core::atop::Stall, i64)> = HashMap::new();
+    let mut found: HashMap<(i32, i64), Stuck> = HashMap::new();
+    // The one sample holding a process's dump, found wherever it falls: its time, the
+    // process's threads then, and the stacks.
+    let mut dumps: HashMap<(i32, i64), (i64, u64, &Vec<crate::atoplog::Stack>)> = HashMap::new();
+    // The job's own processes are the ones started after the guest's boot sample; a log
+    // without one says nothing either way.
+    let boot = samples.first().filter(|s| s.boot).map(|s| s.epoch);
+    for s in samples {
+        let mut next = HashMap::new();
+        for p in &s.procs {
+            let key = (p.pid, p.started);
+            if !p.stacks.is_empty() {
+                dumps.insert(key, (s.epoch, p.threads, &p.stacks));
+            }
+            let (Some(wchans), Some(since)) = (&p.wchans, p.wchans_since) else {
+                continue;
+            };
+            let sectors = p.sectors_read.saturating_add(p.sectors_written);
+            let (mut track, before) = match tracks.get(&key) {
+                Some((track, before)) => (*track, Some(*before)),
+                None => (vk_core::atop::Stall::default(), None),
+            };
+            let idle = vk_core::atop::idle(before == Some(since), p.threads_running, sectors);
+            let worked = !s.boot && vk_core::atop::worked(p.utime.saturating_add(p.stime), sectors);
+            let stalled = track.observe(s.epoch, idle, worked);
+            next.insert(key, (track, since));
+            if !stalled {
+                continue;
+            }
+            let from = track.from();
+            match found.get_mut(&key) {
+                Some(stall) if stall.from == from => stall.to = s.epoch,
+                Some(stall)
+                    if stall.to.saturating_sub(stall.from) >= s.epoch.saturating_sub(from) => {}
+                _ => {
+                    found.insert(
+                        key,
+                        Stuck {
+                            pid: p.pid,
+                            launched: boot.is_some_and(|b| p.started > b),
+                            command: plain(p.command()),
+                            threads: p.threads,
+                            from,
+                            to: s.epoch,
+                            wchans: wchans.clone(),
+                            stacks: Vec::new(),
+                            stacks_at: 0,
+                            stacks_of: 0,
+                        },
+                    );
+                }
+            }
+        }
+        tracks = next;
+    }
+    for (key, stall) in &mut found {
+        if let Some((at, of, stacks)) = dumps.get(key) {
+            stall.stacks.clone_from(stacks);
+            (stall.stacks_at, stall.stacks_of) = (*at, *of);
+        }
+    }
+    if found.is_empty() {
+        return String::new();
+    }
+    let mut stalls: Vec<Stuck> = found.into_values().collect();
+    stalls.sort_by(|a, b| {
+        b.launched
+            .cmp(&a.launched)
+            .then(
+                b.to.saturating_sub(b.from)
+                    .cmp(&a.to.saturating_sub(a.from)),
+            )
+            .then(a.pid.cmp(&b.pid))
+    });
+    let mut out = format!(
+        "\n  stalled — no thread running and none changing what it waits in, for {} or more{}\n",
+        fmt_secs(vk_core::atop::STALL_SECS),
+        match stalls.len() > TOP_STALLS {
+            true => format!("; {TOP_STALLS} of {} shown", stalls.len()),
+            false => String::new(),
+        }
+    );
+    for stall in stalls.iter().take(TOP_STALLS) {
+        out.push_str(&stall.render());
+    }
+    out
+}
+
+impl Stuck {
+    fn render(&self) -> String {
+        let mut out = format!(
+            "  {} (pid {}, {} {}) for {} from {} UTC\n",
+            truncated(&self.command, COMMAND_WIDTH),
+            self.pid,
+            self.threads,
+            plural(self.threads, "thread"),
+            fmt_secs(self.to.saturating_sub(self.from).max(0) as u64),
+            vk_core::atop::date_time(self.from).1,
+        );
+        // The least crowded channel first, as the stacks below: the odd one out leads.
+        let mut wchans: Vec<(&String, &u32)> = self.wchans.iter().collect();
+        wchans.sort_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(b.0)));
+        let waits: Vec<String> = wchans
+            .iter()
+            .map(|(wchan, n)| format!("{n} in {}", plain(wchan)))
+            .collect();
+        out.push_str(&format!(
+            "    waiting: {}\n",
+            match waits.is_empty() {
+                true => "nothing".to_string(),
+                false => waits.join(", "),
+            }
+        ));
+        // Group threads with the same stack on one line so a thread waiting elsewhere
+        // stands out beside a pool of idle workers.
+        let mut groups: Vec<(Vec<String>, Vec<i32>)> = Vec::new();
+        for stack in &self.stacks {
+            let frames: Vec<String> = match stack.frames.is_empty() {
+                true => vec![format!(
+                    "{} (no stack)",
+                    plain(stack.wchan.as_deref().unwrap_or("-"))
+                )],
+                // The function alone: the offsets are for a debugger, not a reader.
+                false => stack
+                    .frames
+                    .iter()
+                    .map(|f| plain(f.split_once('+').map_or(f.as_str(), |(func, _)| func)))
+                    .collect(),
+            };
+            match groups.iter_mut().find(|(f, _)| *f == frames) {
+                Some((_, tids)) => tids.push(stack.tid),
+                None => groups.push((frames, vec![stack.tid])),
+            }
+        }
+        groups.sort_by(|a, b| a.1.len().cmp(&b.1.len()).then(a.1.cmp(&b.1)));
+        if !groups.is_empty() {
+            // Fewer stacks than threads: the guest writes a process's first 256, and a thread
+            // can exit while it is read.
+            let len = self.stacks.len() as u64;
+            out.push_str(&format!(
+                "    stacks at {} UTC{}:\n",
+                vk_core::atop::date_time(self.stacks_at).1,
+                match len < self.stacks_of {
+                    true => format!(" ({len} of {} threads)", self.stacks_of),
+                    false => String::new(),
+                }
+            ));
+        }
+        for (frames, tids) in &groups {
+            let shown: Vec<String> = tids.iter().take(3).map(i32::to_string).collect();
+            out.push_str(&format!(
+                "      {} {} ({}{}): {}\n",
+                tids.len(),
+                plural(tids.len() as u64, "thread"),
+                shown.join(" "),
+                match tids.len() > 3 {
+                    true => " …",
+                    false => "",
+                },
+                frames.join(" < ")
+            ));
+        }
+        out
+    }
+}
+
 /// Fold the commands a job ran over and over into one row each.
 ///
 /// A task the sampler only ever heard the death of is one of a burst — a compile forking a
@@ -1152,6 +1348,161 @@ mod tests {
         for line in &table {
             assert!(!line.ends_with(' '), "trailing whitespace: {line:?}");
         }
+    }
+
+    /// A process that worked and then sat with its threads in the same wait channels, none
+    /// running, for five minutes is reported as stalled — with where they wait and the stacks
+    /// the guest wrote, threads sharing a stack on one line — however much processor time its
+    /// idle threads burn. The job's own processes come before the guest's older ones. One
+    /// whose channels move, whose thread runs, whose stall is shorter, or that has been idle
+    /// since the guest booted, is not reported.
+    #[test]
+    fn a_stalled_process_is_reported_with_its_wait_channels_and_stacks() {
+        let mut text = String::from("RESET\n");
+        for i in 0..40i64 {
+            let epoch = 1_000 + i * 10;
+            let (d, t) = vk_core::atop::date_time(epoch);
+            let h = |label: &str| format!("{label} runner {epoch} {d} {t} 10");
+            let prg = |pid: i32, name: &str, started: i64, running: u32| {
+                format!(
+                    "{} {pid} ({name}) S 1000 100 {pid} 9 0 {started} ({name} check .) 1 {running} \
+                     {} 0 1000 100 1000 100 1000 100 0 y 0 0 - - ()\n",
+                    h("PRG"),
+                    9 - running
+                )
+            };
+            let prc = |pid: i32, name: &str, utime: u32, stime: u32| {
+                format!(
+                    "{} {pid} ({name}) S 100 {utime} {stime} 0 20 0 0 0 0 {pid} y 0 (futex_do_wait) 0 -3 -3\n",
+                    h("PRC")
+                )
+            };
+            let prw = |pid: i32, name: &str, wchans: &str| {
+                format!("{} {pid} ({name}) {wchans}\n", h("PRW"))
+            };
+            // ruff: started by the job at 1025, stuck at once, a little cpu from its polling
+            // workers.
+            if i >= 3 {
+                text.push_str(&prg(412, "ruff", 1_025, 0));
+                text.push_str(&prc(412, "ruff", 0, 1));
+            }
+            if i == 3 {
+                text.push_str(&prw(
+                    412,
+                    "ruff",
+                    "futex_do_wait:1 hrtimer_nanosleep:7 request_wait_answer:1",
+                ));
+            }
+            // java: up since boot, busy in the second sample, then stuck for longer than ruff.
+            text.push_str(&prg(900, "java", 900, u32::from(i == 1)));
+            text.push_str(&prc(900, "java", u32::from(i == 1) * 50, 0));
+            match i {
+                0 => text.push_str(&prw(900, "java", "futex_wait_queue:9")),
+                1 => text.push_str(&prw(900, "java", "futex_wait_queue:8")),
+                2 => text.push_str(&prw(900, "java", "futex_wait_queue:9")),
+                _ => {}
+            }
+            // dockerd: idle since boot, its channels never moving, a tick now and then.
+            text.push_str(&prg(800, "dockerd", 900, 0));
+            text.push_str(&prc(800, "dockerd", u32::from(i % 7 == 3), 0));
+            if i == 0 {
+                text.push_str(&prw(800, "dockerd", "ep_poll:9"));
+            }
+            // poexam: its channels move every sample.
+            text.push_str(&prg(500, "poexam", 1_005, 0));
+            text.push_str(&prc(500, "poexam", 5, 0));
+            text.push_str(&prw(
+                500,
+                "poexam",
+                &format!("futex_wait_queue:{}", 1 + i % 2),
+            ));
+            // mypy: a thread runs now and then.
+            text.push_str(&prg(600, "mypy", 1_005, u32::from(i % 20 == 19)));
+            text.push_str(&prc(600, "mypy", 5, 0));
+            if i == 1 {
+                text.push_str(&prw(600, "mypy", "futex_wait_queue:8"));
+            }
+            // black: stuck, but only for the last two minutes.
+            text.push_str(&prg(700, "black", 1_005, 0));
+            text.push_str(&prc(700, "black", 5, 0));
+            if i == 28 {
+                text.push_str(&prw(700, "black", "pipe_read:8"));
+            }
+            if i == 33 {
+                text.push_str(&format!(
+                    "{} 412 (ruff) 412 futex_do_wait futex_do_wait+0x4e/0x80;__futex_wait+0x8c/0x110\n",
+                    h("PRK")
+                ));
+                for tid in 413..=419 {
+                    text.push_str(&format!(
+                        "{} 412 (ruff) {tid} hrtimer_nanosleep \
+                         hrtimer_nanosleep+0x7c/0x1e0;do_nanosleep+0x62/0x180\n",
+                        h("PRK")
+                    ));
+                }
+                text.push_str(&format!(
+                    "{} 412 (ruff) 420 request_wait_answer -\n",
+                    h("PRK")
+                ));
+            }
+            text.push_str("SEP\n");
+        }
+        let out = report(&text);
+        let section: Vec<&str> = out
+            .lines()
+            .skip_while(|l| !l.contains("stalled —"))
+            .collect();
+        assert_eq!(
+            section,
+            [
+                "  stalled — no thread running and none changing what it waits in, for 5m00s or more",
+                "  ruff check . (pid 412, 9 threads) for 6m00s from 00:17:10 UTC",
+                "    waiting: 1 in futex_do_wait, 1 in request_wait_answer, 7 in hrtimer_nanosleep",
+                "    stacks at 00:22:10 UTC:",
+                "      1 thread (412): futex_do_wait < __futex_wait",
+                "      1 thread (420): request_wait_answer (no stack)",
+                "      7 threads (413 414 415 …): hrtimer_nanosleep < do_nanosleep",
+                "  java check . (pid 900, 9 threads) for 6m10s from 00:17:00 UTC",
+                "    waiting: 9 in futex_wait_queue",
+            ],
+            "{out}"
+        );
+        // A log without wait channels has no such section.
+        assert!(!report(&log()).contains("stalled"));
+    }
+
+    /// A dump holding fewer stacks than the process had threads — the guest caps it — says
+    /// how many it covers.
+    #[test]
+    fn a_cut_stack_dump_says_how_many_threads_it_covers() {
+        let stuck = Stuck {
+            pid: 412,
+            launched: true,
+            command: "ruff check .".into(),
+            threads: 300,
+            from: 1_000,
+            to: 1_300,
+            wchans: BTreeMap::from([("futex_do_wait".to_string(), 300)]),
+            stacks: (1..=256)
+                .map(|tid| crate::atoplog::Stack {
+                    tid,
+                    wchan: Some("futex_do_wait".into()),
+                    frames: vec!["futex_do_wait+0x4e/0x80".into()],
+                })
+                .collect(),
+            stacks_at: 1_300,
+            stacks_of: 300,
+        };
+        let out = stuck.render();
+        let lines: Vec<&str> = out.lines().skip(2).collect();
+        assert_eq!(
+            lines,
+            [
+                "    stacks at 00:21:40 UTC (256 of 300 threads):",
+                "      256 threads (1 2 3 …): futex_do_wait",
+            ],
+            "{out}"
+        );
     }
 
     /// A burst of short-lived commands is one row of many runs, not many rows of one — which is

@@ -395,6 +395,33 @@ them failed: a build that forks a thousand compilers is a thousand processes no 
 and one row of `cc1plus ×1184` says what a thousand rows of one run each would bury. A process
 the sampler did watch keeps its own row, however many namesakes came and went around it.
 
+A multi-threaded process that did some work and then kept its threads in the same kernel wait
+channels, none of them running and no disk I/O, for five minutes or more gets a `stalled`
+section after the table. Its idle threads may still use a little cpu during the stall, so cpu
+use then does not rule a process out. A process that has done nothing at all since the guest
+booted is left out, but that is the only kind of idle daemon the test excludes: one that
+worked and then went idle with its wait channels frozen (a JVM or Gradle daemon, a `dockerd`
+the job started) is listed too. Processes the job started come first, then the longest
+stalls. The section lists where the threads waited and, when the guest could read them, their
+kernel stacks, one line per distinct stack:
+
+```
+  stalled — no thread running and none changing what it waits in, for 5m00s or more
+  ruff check . (pid 412, 9 threads) for 11h58m from 07:22:10 UTC
+    waiting: 1 in futex_do_wait, 1 in request_wait_answer, 7 in hrtimer_nanosleep
+    stacks at 07:27:10 UTC:
+      1 thread (412): futex_do_wait < __futex_wait < …
+      1 thread (420): request_wait_answer < fuse_simple_request < …
+      7 threads (413 414 415 …): hrtimer_nanosleep < do_nanosleep < …
+```
+
+The guest applies the same test to the same samples and writes those stacks once per process,
+at its first stall and for its first 256 threads; the `stacks at` line says when, and how many
+threads they cover when that is not all of them. The frames need a guest kernel built with
+`CONFIG_STACKTRACE`; without it, each thread shows only its wait channel and `(no stack)`. A
+thread stuck in `request_wait_answer` or another `fuse_*` function is waiting on a virtio-fs
+request; one in `futex_*` alone is waiting on a lock in the tool itself.
+
 `--view` walks the recording a sample at a time in a full-screen panel — the guest's
 processors (each core its own bar), memory and swap, pressure, disks and interfaces, then the
 processes ordered by what they were using at that moment:
@@ -446,8 +473,15 @@ compute than read. The units are the log's own: pages, with their `pagesize` bes
 ticks, with their `hertz` beside them; 512-byte sectors; and KiB for a process's resident size
 (`rsize_kib`). A counter the guest's kernel does not have is `null` rather than a zero — as is
 a scale whose record a sample did not carry, so check `hertz` and `pagesize` before dividing by
-one. A log with no complete sample writes nothing and exits 0, where `--summary` reports that
-there is nothing to account yet:
+one. Each process has `threads` and `threads_running`, the thread count and how many threads
+were running when the sample was taken. A multi-threaded one also has `wchans`, its
+non-running threads counted by kernel wait channel as last recorded, and `wchans_since`, the
+epoch at which that histogram was recorded; both are `null` when none is recorded (always for a
+single-threaded one).
+`stacks` is the one-time dump of a stalled process's per-thread kernel stacks (`tid`, `wchan`,
+`frames`), present in the one sample that recorded it and `[]` everywhere else, so it shows
+that moment, not the process's current state. A log with no complete sample writes nothing
+and exits 0, where `--summary` reports that there is nothing to account yet:
 
 ```sh
 vk atop 42137 --json | jq -c '{t: .epoch, user_sys: (.cpu.user + .cpu.system)}'
@@ -464,14 +498,21 @@ carry per-interval differences; size labels carry the value as it stood.
 The system labels are `CPU`, `cpu` (per processor), `CPL`, `MEM`, `SWP`, `PAG`, `PSI`, `DSK` and
 `NET`; every process gets a `PRG`, `PRC`, `PRM` and `PRD` line, and so does every task that
 *ended* during the interval — those carry state `E`, the status they exited with and how long
-they lived. So the busiest samples of a job
-are one sort away:
+they lived.
+So the busiest samples of a job are one sort away:
 
 ```sh
 awk '$1 == "CPU" { print $5, $9 + $10 }' atop.log | sort -k2 -n | tail   # time, busy ticks
 grep '^PRM ' atop.log | sort -k12 -n | tail   # largest processes (column 12 only while no
                                               # process name holds a space — see below)
 ```
+
+Two labels are virtkit's own, which atop-format parsers skip as unknown. `PRW` lists a
+multi-threaded process's non-running threads by wait channel (`<pid> (<name>) futex_do_wait:1
+hrtimer_nanosleep:7 …`). It is written only when that histogram changes, so the latest line
+stands until the next one. `PRK` holds one thread's kernel stack (`<pid> (<name>)
+<tid> <wchan> <frame>;<frame>;…`, frames `-` without `CONFIG_STACKTRACE`) and is written once
+for each thread of a stalled process.
 
 Worth knowing before reading a log:
 

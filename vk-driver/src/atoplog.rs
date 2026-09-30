@@ -16,9 +16,11 @@
 //!   so a rate is a division that cannot fail;
 //! * the first sample is announced by `RESET` and covers the guest's whole boot, which is a
 //!   window of its own: totals want it, rates do not (see [`Sample::boot`]);
-//! * `-1` is "the kernel does not have this counter", never zero.
+//! * `-1` is "the kernel does not have this counter", never zero;
+//! * a process's wait channels (`PRW`) are written only when they change, so the latest
+//!   record stands for every sample after it — which is what [`Proc::wchans`] carries.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -326,6 +328,32 @@ pub struct Proc {
     pub sectors_read: u64,
     pub sectors_written: u64,
     pub io_stats: bool,
+    /// Threads in all, and how many of them were running as the sample was taken.
+    pub threads: u64,
+    pub threads_running: u64,
+    /// Non-running threads by kernel wait channel, as last recorded. The guest writes this
+    /// histogram only when it changes. `None` for a single-threaded process (whose wait
+    /// channel is in PRC) or a log without these records.
+    ///
+    /// Carried across samples within one [`parse`]. A reader parsing pieces of a log, such
+    /// as a follower, sees it only from the first record in each piece.
+    pub wchans: Option<BTreeMap<String, u32>>,
+    /// When `wchans` was recorded (seconds since the epoch): it has stood unchanged since.
+    pub wchans_since: Option<i64>,
+    /// The kernel stack of each thread, in the one sample carrying the dump the guest writes
+    /// once for a process it finds stalled (see `vk_core::atop::Stall`); empty in every
+    /// other. A snapshot of that moment, not the process's current state.
+    pub stacks: Vec<Stack>,
+}
+
+/// One thread's kernel stack.
+#[derive(Clone, Default, serde::Serialize)]
+pub struct Stack {
+    pub tid: i32,
+    /// `None` for a thread waiting in nothing.
+    pub wchan: Option<String>,
+    /// `function+offset/length`, innermost first; empty where the guest's kernel exposed none.
+    pub frames: Vec<String>,
 }
 
 impl Proc {
@@ -407,12 +435,21 @@ pub fn parse(text: &str) -> Parsed {
         }
         if line == atop::RESET {
             cur.boot = true;
+            // The guest writes every process's wait channels afresh after one.
+            cur.known.clear();
             continue;
         }
         if line.is_empty() {
             continue;
         }
         let cells = atop::cells(line);
+        // virtkit's own labels, whose arity is their own to check.
+        if cells.first() == Some(&atop::WCHANS) || cells.first() == Some(&atop::STACK) {
+            if !cur.task_record(&cells) {
+                out.dropped = out.dropped.saturating_add(1);
+            }
+            continue;
+        }
         let Some(label) = atop::label_of(&cells) else {
             continue; // a label this version does not read is not an error
         };
@@ -519,6 +556,15 @@ struct Builder {
     /// Whether the generic columns have been taken from a record yet — a flag rather than a
     /// sentinel epoch, since a guest whose clock is unset stamps 0 and means it.
     generic: bool,
+    /// This sample's PRW and PRK records, by pid.
+    wchans: BTreeMap<i32, BTreeMap<String, u32>>,
+    stacks: BTreeMap<i32, Vec<Stack>>,
+    /// The wait channels last recorded for each live multi-threaded process (pid, start time),
+    /// and when — carried from sample to sample, since the guest does not repeat them. A
+    /// histogram holds one entry per distinct channel, a handful, so a copy per sample costs
+    /// about what the command line beside it does. Stacks are not carried: they are the
+    /// largest record in a log, and stay in the one sample that holds them.
+    known: HashMap<(i32, i64), (BTreeMap<String, u32>, i64)>,
 }
 
 impl Builder {
@@ -527,11 +573,14 @@ impl Builder {
     fn finish(&mut self) -> Option<Sample> {
         if !self.any {
             self.boot = false;
+            self.wchans.clear();
+            self.stacks.clear();
             return None;
         }
         let mut sample = std::mem::take(&mut self.sample);
         sample.boot = std::mem::take(&mut self.boot);
         sample.procs = std::mem::take(&mut self.procs).into_values().collect();
+        self.carry(&mut sample);
         let unknown = std::mem::take(&mut self.exited_unknown);
         sample.exited_unknown = (unknown.tasks > 0).then_some(unknown);
         // At least 1, whatever the log says: this is the divisor of every rate a reader
@@ -540,6 +589,61 @@ impl Builder {
         self.any = false;
         self.generic = false;
         Some(sample)
+    }
+
+    /// Attach each process's last recorded wait channels and this sample's stacks. Carry
+    /// the wait channels into the next sample, forgetting processes that are gone or now
+    /// single-threaded.
+    fn carry(&mut self, sample: &mut Sample) {
+        let mut wchans = std::mem::take(&mut self.wchans);
+        let mut stacks = std::mem::take(&mut self.stacks);
+        let mut known = HashMap::new();
+        for p in &mut sample.procs {
+            let key = (p.pid, p.started);
+            if p.threads <= 1 || p.exited() {
+                continue;
+            }
+            p.stacks = stacks.remove(&p.pid).unwrap_or_default();
+            let recorded = match wchans.remove(&p.pid) {
+                Some(w) => Some((w, sample.epoch)),
+                None => self.known.remove(&key),
+            };
+            if let Some((w, since)) = recorded {
+                p.wchans = Some(w.clone());
+                p.wchans_since = Some(since);
+                known.insert(key, (w, since));
+            }
+        }
+        self.known = known;
+    }
+
+    /// Take a PRW or PRK record into this sample; `false` when it is malformed. A later
+    /// record replaces an earlier one for the same process or thread: a torn sample (no
+    /// `SEP`) runs into the next, which may carry the same records again.
+    fn task_record(&mut self, cells: &[&str]) -> bool {
+        if let Some(w) = atop::parse_wchans(cells) {
+            let mut hist = BTreeMap::new();
+            for (wchan, n) in w.counts {
+                let slot: &mut u32 = hist.entry(wchan.to_string()).or_default();
+                *slot = slot.saturating_add(n);
+            }
+            self.wchans.insert(w.pid, hist);
+            return true;
+        }
+        if let Some(s) = atop::parse_stack(cells) {
+            let stack = Stack {
+                tid: s.tid,
+                wchan: s.wchan.map(str::to_string),
+                frames: s.frames.into_iter().map(str::to_string).collect(),
+            };
+            let stacks = self.stacks.entry(s.pid).or_default();
+            match stacks.iter_mut().find(|t| t.tid == stack.tid) {
+                Some(held) => *held = stack,
+                None => stacks.push(stack),
+            }
+            return true;
+        }
+        false
     }
 
     fn record(&mut self, r: &Record) {
@@ -642,6 +746,8 @@ impl Builder {
                 p.started = r.num("starttime");
                 p.state = r.char("state");
                 p.exitcode = r.num("exitcode");
+                p.threads = r.num("threads");
+                p.threads_running = r.num("threads-running");
             }
             "PRC" => {
                 let p = self.proc(r);
@@ -1040,6 +1146,150 @@ SEP
             write_json(&parse(text).samples, &mut out).expect("writing to a Vec cannot fail");
             assert!(out.is_empty(), "{text:?} holds no complete sample");
         }
+    }
+
+    /// A multi-threaded process's wait channels are written only when they change, so each
+    /// sample carries the latest ones and when they were recorded — as does its JSON — while
+    /// the stacks the guest dumped stay in the one sample that holds them. A process that
+    /// turns single-threaded has none, and a malformed record is damage.
+    #[test]
+    fn wait_channels_carry_forward_until_they_change() {
+        let sample = |epoch: i64, threads: u32, extra: &str| {
+            let (date, time) = atop::date_time(epoch);
+            let h = |label: &str| format!("{label} runner {epoch} {date} {time} 10");
+            format!(
+                "{} 412 (ruff) S 1000 100 412 {threads} 0 900 (ruff check .) 1 0 {threads} 0 \
+                 1000 100 1000 100 1000 100 0 y 0 0 - - ()\n{extra}SEP\n",
+                h("PRG")
+            )
+            .replace("{PRW}", &h("PRW"))
+            .replace("{PRK}", &h("PRK"))
+        };
+        let text = [
+            sample(1_000, 9, "{PRW} 412 (ruff) futex_do_wait:1 hrtimer_nanosleep:8\n"),
+            sample(1_010, 9, ""),
+            sample(
+                1_020,
+                9,
+                "{PRW} 412 (ruff) futex_do_wait:1 hrtimer_nanosleep:7 request_wait_answer:1\n\
+                 {PRK} 412 (ruff) 412 futex_do_wait futex_do_wait+0x4e/0x80;__futex_wait+0x8c/0x110\n\
+                 {PRK} 412 (ruff) 415 request_wait_answer -\n",
+            ),
+            sample(1_030, 9, "{PRW} 412 (ruff) futex_do_wait:x\n"),
+            sample(1_040, 1, ""),
+        ]
+        .concat();
+        let p = parse(&text);
+        assert_eq!(p.samples.len(), 5);
+        assert_eq!(p.dropped, 1, "the PRW whose count is no number");
+        let ruff = |i: usize| &p.samples[i].procs[0];
+        assert_eq!((ruff(0).threads, ruff(0).threads_running), (9, 0));
+        let first = ruff(0).wchans.clone().expect("recorded");
+        assert_eq!(first.get("hrtimer_nanosleep"), Some(&8));
+        assert_eq!(ruff(1).wchans.as_ref(), Some(&first), "carried");
+        assert_eq!(ruff(1).wchans_since, Some(1_000));
+        assert!(ruff(1).stacks.is_empty());
+        assert_eq!(ruff(2).wchans_since, Some(1_020));
+        assert_eq!(ruff(2).wchans.as_ref().map(|w| w.len()), Some(3));
+        assert_eq!(ruff(2).stacks.len(), 2);
+        assert_eq!(
+            ruff(2).stacks[1].wchan.as_deref(),
+            Some("request_wait_answer")
+        );
+        assert!(ruff(2).stacks[1].frames.is_empty());
+        assert_eq!(
+            ruff(3).wchans_since,
+            Some(1_020),
+            "the damaged record changed nothing"
+        );
+        assert!(
+            ruff(3).stacks.is_empty(),
+            "stacks stay in the sample that holds them"
+        );
+        assert!(ruff(4).wchans.is_none() && ruff(4).stacks.is_empty());
+
+        let mut out: Vec<u8> = Vec::new();
+        write_json(&p.samples, &mut out).expect("writing to a Vec cannot fail");
+        let text = String::from_utf8(out).expect("json is text");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("a JSON object"))
+            .collect();
+        let proc = &lines[2]["procs"][0];
+        assert_eq!(proc["threads"], 9);
+        assert_eq!(proc["threads_running"], 0);
+        assert_eq!(lines[3]["procs"][0]["wchans"]["request_wait_answer"], 1);
+        assert_eq!(lines[3]["procs"][0]["wchans_since"], 1_020);
+        assert_eq!(lines[3]["procs"][0]["stacks"], serde_json::json!([]));
+        assert_eq!(proc["stacks"][0]["tid"], 412);
+        assert_eq!(proc["stacks"][0]["frames"][1], "__futex_wait+0x8c/0x110");
+        assert_eq!(proc["stacks"][1]["wchan"], "request_wait_answer");
+        assert_eq!(lines[4]["procs"][0]["wchans"], serde_json::Value::Null);
+    }
+
+    /// A multi-threaded process's PRG line, the wait-channel and stack records given, and a
+    /// `SEP` when `sep` — one guest sample at `epoch`.
+    fn threaded_sample(epoch: i64, extra: &str, sep: bool) -> String {
+        let (date, time) = atop::date_time(epoch);
+        let h = |label: &str| format!("{label} runner {epoch} {date} {time} 10");
+        format!(
+            "{} 412 (ruff) S 1000 100 412 9 0 900 (ruff check .) 1 0 9 0 \
+             1000 100 1000 100 1000 100 0 y 0 0 - - ()\n{}{}",
+            h("PRG"),
+            extra
+                .replace("{PRW}", &h("PRW"))
+                .replace("{PRK}", &h("PRK")),
+            match sep {
+                true => "SEP\n",
+                false => "",
+            }
+        )
+    }
+
+    /// A torn sample — no `SEP` — runs into the next one, which carries the same records
+    /// again: the later ones replace the earlier, so no count doubles and no thread has two
+    /// stacks.
+    #[test]
+    fn a_torn_sample_does_not_double_its_task_records() {
+        let records = "{PRW} 412 (ruff) futex_do_wait:1 hrtimer_nanosleep:8\n\
+                       {PRK} 412 (ruff) 412 futex_do_wait futex_do_wait+0x4e/0x80\n\
+                       {PRK} 412 (ruff) 413 hrtimer_nanosleep -\n";
+        let text = [
+            threaded_sample(1_000, records, false),
+            threaded_sample(1_010, records, true),
+        ]
+        .concat();
+        let p = parse(&text);
+        assert_eq!(p.samples.len(), 1);
+        let ruff = &p.samples[0].procs[0];
+        assert_eq!(
+            ruff.wchans,
+            Some(BTreeMap::from([
+                ("futex_do_wait".to_string(), 1),
+                ("hrtimer_nanosleep".to_string(), 8),
+            ]))
+        );
+        let tids: Vec<i32> = ruff.stacks.iter().map(|s| s.tid).collect();
+        assert_eq!(tids, [412, 413]);
+    }
+
+    /// A `RESET` mid-log is a guest that restarted its sampler: the wait channels recorded
+    /// before it no longer stand, so a sample after it without a PRW has none.
+    #[test]
+    fn a_reset_forgets_the_wait_channels_before_it() {
+        let text = [
+            threaded_sample(1_000, "{PRW} 412 (ruff) futex_do_wait:9\n", true),
+            threaded_sample(1_010, "", true),
+            "RESET\n".to_string(),
+            threaded_sample(1_020, "", true),
+        ]
+        .concat();
+        let p = parse(&text);
+        assert_eq!(p.samples.len(), 3);
+        assert!(p.samples[1].procs[0].wchans.is_some(), "carried");
+        assert!(p.samples[2].boot);
+        assert_eq!(p.samples[2].procs[0].wchans, None);
+        assert_eq!(p.samples[2].procs[0].wchans_since, None);
     }
 
     /// A label this version does not know is skipped, not counted as damage: the guest may

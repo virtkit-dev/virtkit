@@ -21,6 +21,13 @@ All notable changes to virtkit will be documented in this file.
   without a restart and even under `freshness = "reuse"`: names removed stop resolving,
   and new connections to their addresses (unless a still-allowed name resolved to them) or
   to removed ranges are refused within about a second; connections already open stay open.
+- **Job recordings show where a hung process's threads are waiting.** Each multi-threaded
+  process gets its non-running threads counted by kernel wait channel, recorded when the
+  count changes. A process that did some work and then goes five minutes with no thread
+  running, no disk I/O and no change in those counts is reported as stalled, and the guest
+  records every thread's kernel stack once. `vk atop --summary` lists such processes in a
+  new `stalled` section, and `--json` gives each process `threads`, `threads_running`,
+  `wchans` and `wchans_since`, plus `stacks` in the sample holding the dump.
 
 ### Changed
 

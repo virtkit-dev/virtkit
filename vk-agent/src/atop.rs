@@ -21,14 +21,19 @@
 //! precedes the first one — whose counters cover boot→now. Counter labels carry
 //! per-interval differences, size labels the value as it stands.
 //!
+//! Two labels are virtkit's own, which atop does not have: PRW, a multi-threaded process's
+//! threads by wait channel, written when that histogram changes, and PRK, each thread's
+//! kernel stack, written once for a process that has stalled (see [`Stalls`]).
+//!
 //! Emitted labels: CPU, cpu, CPL, MEM, SWP, PAG, PSI, DSK, NET (upper + per
-//! interface), PRG, PRC, PRM, PRD. Not emitted: PRN (per-process network needs
-//! netatop even for real atop), PRE/GPU and the NFS/InfiniBand/NUMA/LLC/LVM/MDD labels.
+//! interface), PRG, PRC, PRM, PRD, PRW, PRK. Not emitted: PRN (per-process network
+//! needs netatop even for real atop), PRE/GPU and the NFS/InfiniBand/NUMA/LLC/LVM/MDD
+//! labels.
 //! Exited processes are recorded with state `E` from the kernel's taskstats exit
 //! reports, including processes that start and exit within one interval, unless
 //! listener registration fails or the kernel drops the record (see `Exits`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -36,7 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use vk_core::atop::{LOG_NAME, PID_FILE, RESET, SEP, date_time, now_epoch};
+use vk_core::atop::{LOG_NAME, PID_FILE, RESET, SEP, STACK, Stall, WCHANS, date_time, now_epoch};
 
 /// Set by the SIGUSR2 handler: write one final sample, then exit.
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -223,6 +228,7 @@ fn run(dir: &Path, interval: Duration) -> Result<()> {
     );
 
     let mut prev: Option<Sys> = None;
+    let mut stalls = Stalls::default();
     let mut failures: u64 = 0;
     // An absolute cadence: sleeping a whole interval *after* each collection would walk the
     // samples away from the wall clock the host's own atop keeps, and the two logs are read
@@ -236,15 +242,25 @@ fn run(dir: &Path, interval: Duration) -> Result<()> {
             Some(p) => covered_secs(cur.epoch, p.epoch),
             None => uptime_secs().max(1),
         };
+        let (tracks, due) = stalls.advance(&cur, prev.as_ref());
+        let dumping: Vec<(i32, i64)> = due.iter().map(|p| (p.pid, p.btime)).collect();
+        let stacks: Vec<Stack> = due
+            .iter()
+            .flat_map(|p| read_stacks(&Path::new("/proc").join(p.pid.to_string()), p))
+            .collect();
         // One buffer per sample: a VM torn down mid-write then truncates the tail of
         // one sample instead of interleaving two, and the file stays line-parseable.
-        let text = sample_text(&env, &cur, prev.as_ref(), &exited, covered);
+        let text = sample_text(&env, &cur, prev.as_ref(), &exited, covered, &stacks);
         match sink.write(&text) {
             // `prev` advances only for a sample that reached the log, so a write that failed
             // leaves its interval to be covered by the next one that lands — counters and
             // `interval` column together — rather than dropping it. It also keeps `RESET`
-            // owed until the first sample is actually on disk.
-            Ok(()) => prev = Some(cur),
+            // owed until the first sample is actually on disk, and a wait-channel change or
+            // a stack dump owed until the sample carrying it is.
+            Ok(()) => {
+                stalls.commit(tracks, &dumping);
+                prev = Some(cur);
+            }
             Err(e) => {
                 // Reported once. A share that cannot be written stays that way, and a line
                 // per interval would crowd out the rest of a long job's console log.
@@ -371,6 +387,70 @@ impl Exits {
     }
 }
 
+/// Multi-threaded processes on their way to a stall ([`vk_core::atop::Stall`]), followed
+/// across samples so that each stalled one has its threads' kernel stacks written once (PRK).
+#[derive(Default)]
+struct Stalls {
+    /// Per task (pid, start time), as of the last sample on disk.
+    tracks: HashMap<(i32, i64), Stall>,
+    /// The tasks whose stacks are in the log already.
+    dumped: HashSet<(i32, i64)>,
+}
+
+impl Stalls {
+    /// Advance each multi-threaded process's tracker from `prev`, the last sample on disk,
+    /// and return stalled processes not yet dumped. Apply the trackers with [`Stalls::commit`]
+    /// only after the sample reaches the log, so the host and guest judge the same samples.
+    fn advance<'a>(
+        &self,
+        cur: &'a Sys,
+        prev: Option<&Sys>,
+    ) -> (HashMap<(i32, i64), Stall>, Vec<&'a Proc>) {
+        let before: HashMap<i32, &Proc> = prev
+            .map(|p| p.procs.iter().map(|q| (q.pid, q)).collect())
+            .unwrap_or_default();
+        let mut tracks = HashMap::new();
+        let mut due = Vec::new();
+        for p in cur.procs.iter().filter(|p| p.wchans.is_some()) {
+            let key = (p.pid, p.btime);
+            let q = before.get(&p.pid).filter(|q| q.btime == p.btime);
+            let sectors = p.rsz.saturating_add(p.wsz);
+            // The same per-interval figures the sample prints: a task absent from `prev`
+            // started since, so its counters are this interval's too.
+            let (ticks, sectors) = match q {
+                Some(q) => (
+                    sub(
+                        p.utime.saturating_add(p.stime),
+                        q.utime.saturating_add(q.stime),
+                    ),
+                    sub(sectors, q.rsz.saturating_add(q.wsz)),
+                ),
+                None => (p.utime.saturating_add(p.stime), sectors),
+            };
+            let idle =
+                q.is_some_and(|q| vk_core::atop::idle(p.wchans == q.wchans, p.nthrrun, sectors));
+            // The boot-covering sample's counters are the guest's whole life, not the job's.
+            let worked = prev.is_some() && vk_core::atop::worked(ticks, sectors);
+            let mut track = self.tracks.get(&key).copied().unwrap_or_default();
+            if track.observe(cur.epoch, idle, worked) && !self.dumped.contains(&key) {
+                due.push(p);
+            }
+            tracks.insert(key, track);
+        }
+        (tracks, due)
+    }
+
+    /// Apply the trackers from [`Stalls::advance`] and mark `dumped` as written once the
+    /// sample reaches the log.
+    fn commit(&mut self, tracks: HashMap<(i32, i64), Stall>, dumped: &[(i32, i64)]) {
+        self.tracks = tracks;
+        self.dumped.extend(dumped.iter().copied());
+        // A task that is gone does not come back, so what is kept stays bounded by the
+        // multi-threaded tasks alive now.
+        self.dumped.retain(|key| self.tracks.contains_key(key));
+    }
+}
+
 /// One sample as it goes to the log: the `RESET` line when there is nothing to deviate
 /// from — its counters cover the guest's whole boot — the records themselves, then the
 /// `SEP` line that marks the sample complete.
@@ -380,13 +460,20 @@ fn sample_text(
     prev: Option<&Sys>,
     exited: &[crate::taskstats::Exit],
     covered: u64,
+    stacks: &[Stack],
 ) -> String {
     let mut buf = String::with_capacity(64 * 1024);
     if prev.is_none() {
         buf.push_str(RESET);
         buf.push('\n');
     }
-    write_sample(&mut buf, env, &deviate(cur, prev, exited, env), covered);
+    write_sample(
+        &mut buf,
+        env,
+        &deviate(cur, prev, exited, env),
+        covered,
+        stacks,
+    );
     buf.push_str(SEP);
     buf.push('\n');
     buf
@@ -634,6 +721,12 @@ struct Proc {
     nthrrun: u64,
     nthrslpi: u64,
     nthrslpu: u64,
+    /// The threads not running, by the kernel function each waits in; `None` for a
+    /// single-threaded process, whose wait channel is PRC's.
+    wchans: Option<BTreeMap<String, u32>>,
+    /// Whether `wchans` changed or the same task has no previous snapshot; controls whether
+    /// the sample writes a PRW record.
+    wchans_changed: bool,
     /// start time (epoch seconds)
     btime: i64,
     /// absent from the previous snapshot — atop's 'N' marker
@@ -1191,29 +1284,123 @@ fn parse_proc_status(text: &str, p: &mut Proc) {
     }
 }
 
-/// The per-state thread counts PRG reports, from the states of the process's own
-/// tasks (`/proc/<pid>/task/*/stat`). atop counts running, interruptible-sleeping and
-/// uninterruptible-sleeping threads; any other state is in the total only.
+/// The per-state thread counts PRG reports, and the wait-channel histogram PRW reports, from
+/// the process's own tasks (`/proc/<pid>/task/*/{stat,wchan}`). atop counts running,
+/// interruptible-sleeping and uninterruptible-sleeping threads; any other state is in the
+/// total only. The histogram counts every thread that is not running by the kernel function
+/// it waits in, leaving out one with none (`0`). Only a process whose `stat` gave it more
+/// than one thread has one — the same test PRG's `threads` gives a reader — and a
+/// single-threaded one reads no `wchan` at all.
 fn read_proc_threads(dir: &Path, p: &mut Proc) {
     let Ok(tasks) = std::fs::read_dir(dir.join("task")) else {
         return;
     };
+    let threaded = p.nthr > 1;
+    let mut wchans: BTreeMap<String, u32> = BTreeMap::new();
     for task in tasks.flatten() {
         let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
             continue;
         };
-        let state = stat
-            .rfind(')')
-            .and_then(|close| stat.get(close + 1..))
-            .and_then(|rest| rest.split_whitespace().next())
-            .and_then(|s| s.chars().next());
+        let state = task_state(&stat);
         match state {
             Some('R') => p.nthrrun += 1,
             Some('S') => p.nthrslpi += 1,
             Some('D') => p.nthrslpu += 1,
             _ => {}
         }
+        if !threaded || state == Some('R') {
+            continue;
+        }
+        if let Some(wchan) = wchan_of(&read(task.path().join("wchan"))) {
+            match wchans.get_mut(wchan) {
+                Some(n) => *n = n.saturating_add(1),
+                None => {
+                    wchans.insert(wchan.to_string(), 1);
+                }
+            }
+        }
     }
+    if threaded {
+        p.wchans = Some(wchans);
+    }
+}
+
+/// A task's state, from its `stat` line: the first field after the command's closing
+/// parenthesis.
+fn task_state(stat: &str) -> Option<char> {
+    stat.rfind(')')
+        .and_then(|close| stat.get(close + 1..))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|s| s.chars().next())
+}
+
+/// A `wchan` file's symbol, or `None` for a task waiting in nothing: the kernel prints `0`
+/// for a running one, and a task that exited mid-read leaves the file empty.
+fn wchan_of(text: &str) -> Option<&str> {
+    let wchan = text.trim();
+    (!wchan.is_empty() && wchan != "0").then_some(wchan)
+}
+
+/// One thread's kernel stack, as a PRK record carries it.
+struct Stack {
+    pid: i32,
+    name: String,
+    tid: i32,
+    /// Empty for a thread waiting in nothing.
+    wchan: String,
+    /// Innermost first; empty where the kernel exposes none.
+    frames: Vec<String>,
+}
+
+/// Maximum threads per stack dump. A handful can reveal a hang; a process with thousands
+/// should not add a line for each. The host reports when a dump covers fewer threads than
+/// the process has.
+const MAX_STACKS: usize = 256;
+
+/// The kernel stack and wait channel of each thread of `p`, whose `/proc` directory is
+/// `dir`, by thread id. Best effort and silent: `stack` needs `CONFIG_STACKTRACE`, which a
+/// guest kernel may lack, and a thread can exit while it is read — a thread whose stack
+/// cannot be read still carries its wait channel.
+fn read_stacks(dir: &Path, p: &Proc) -> Vec<Stack> {
+    let Ok(tasks) = std::fs::read_dir(dir.join("task")) else {
+        return Vec::new();
+    };
+    let mut tids: Vec<i32> = tasks
+        .flatten()
+        .filter_map(|t| t.file_name().to_str()?.parse().ok())
+        .collect();
+    tids.sort_unstable();
+    tids.truncate(MAX_STACKS);
+    tids.into_iter()
+        .map(|tid| {
+            let task = dir.join("task").join(tid.to_string());
+            Stack {
+                pid: p.pid,
+                name: p.name.clone(),
+                tid,
+                wchan: wchan_of(&read(task.join("wchan")))
+                    .unwrap_or_default()
+                    .to_string(),
+                frames: stack_frames(&read(task.join("stack"))),
+            }
+        })
+        .collect()
+}
+
+/// `/proc/<pid>/task/<tid>/stack`: one `[<address>] function+offset/length` line per frame,
+/// innermost first. The address goes — the kernel prints it as `0` unless asked not to hash
+/// it — and the rest is kept as printed, since the offset maps back to a line of the pinned
+/// guest kernel.
+fn stack_frames(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .map(|line| match line.starts_with('[') {
+            true => line.split_once("] ").map_or("", |(_, frame)| frame.trim()),
+            false => line,
+        })
+        .filter(|frame| !frame.is_empty())
+        .map(token)
+        .collect()
 }
 
 /// `/proc/<pid>/schedstat`: `<runtime> <waittime> <timeslices>`, whose wait time is
@@ -1256,6 +1443,7 @@ fn deviate(cur: &Sys, prev: Option<&Sys>, exited: &[crate::taskstats::Exit], env
     let Some(p) = prev else {
         for proc in &mut d.procs {
             proc.is_new = true;
+            proc.wchans_changed = true;
             proc.vgrow = proc.vmem as i64;
             proc.rgrow = proc.rmem as i64;
         }
@@ -1351,6 +1539,7 @@ fn deviate(cur: &Sys, prev: Option<&Sys>, exited: &[crate::taskstats::Exit], env
         match before.get(&proc.pid).filter(|q| q.btime == proc.btime) {
             Some(q) => {
                 proc.is_new = false;
+                proc.wchans_changed = proc.wchans != q.wchans;
                 proc.vgrow = proc.vmem as i64 - q.vmem as i64;
                 proc.rgrow = proc.rmem as i64 - q.rmem as i64;
                 proc.utime = sub(proc.utime, q.utime);
@@ -1367,6 +1556,7 @@ fn deviate(cur: &Sys, prev: Option<&Sys>, exited: &[crate::taskstats::Exit], env
             }
             None => {
                 proc.is_new = true;
+                proc.wchans_changed = true;
                 proc.vgrow = proc.vmem as i64;
                 proc.rgrow = proc.rmem as i64;
             }
@@ -1494,7 +1684,7 @@ const NO_PERF: (u64, u64) = (0, 0);
 /// cgroup v2 support, which is the honest report for a sampler that reads none.
 const NO_CGROUP: i64 = -3;
 
-fn write_sample(out: &mut String, env: &Env, s: &Sys, interval: u64) {
+fn write_sample(out: &mut String, env: &Env, s: &Sys, interval: u64, stacks: &[Stack]) {
     let h = |label: &str| header(label, env, s.epoch, interval);
     print_cpu(out, &h("CPU"), env, s);
     print_cpus(out, &h("cpu"), env, s);
@@ -1509,6 +1699,8 @@ fn write_sample(out: &mut String, env: &Env, s: &Sys, interval: u64) {
     print_prc(out, &h("PRC"), env, s);
     print_prm(out, &h("PRM"), env, s);
     print_prd(out, &h("PRD"), env, s);
+    print_prw(out, &h(WCHANS), s);
+    print_prk(out, &h(STACK), stacks);
 }
 
 /// The six generic columns every line starts with: label, host, epoch, date, time and
@@ -1550,6 +1742,23 @@ fn balanced(s: &str) -> bool {
         }
     }
     depth == 0
+}
+
+/// A string from the guest's kernel as one bare cell: whitespace and control characters, the
+/// parentheses a reader takes for a string field and the `;` PRK joins frames with become
+/// `_`, and nothing at all becomes `-`. A kernel symbol holds none of them.
+fn token(s: &str) -> String {
+    if s.is_empty() {
+        return "-".to_string();
+    }
+    s.chars()
+        .map(
+            |c| match c.is_whitespace() || c.is_control() || matches!(c, '(' | ')' | ';') {
+                true => '_',
+                false => c,
+            },
+        )
+        .collect()
 }
 
 fn yn(b: bool) -> char {
@@ -1891,6 +2100,42 @@ fn print_prd(out: &mut String, h: &str, env: &Env, s: &Sys) {
             p.wsz,
             p.cwsz,
             p.tgid
+        );
+    }
+}
+
+/// PRW (virtkit's own, see [`vk_core::atop::WCHANS`]): pid, name, then `<wchan>:<threads>`
+/// for each wait channel of the process's threads that are not running — for each
+/// multi-threaded process whose histogram is not the one the previous sample carried.
+fn print_prw(out: &mut String, h: &str, s: &Sys) {
+    for p in s.procs.iter().filter(|p| p.wchans_changed) {
+        let Some(wchans) = &p.wchans else {
+            continue;
+        };
+        let _ = write!(out, "{h} {} {}", p.pid, paren(&p.name));
+        for (wchan, n) in wchans {
+            let _ = write!(out, " {}:{n}", token(wchan));
+        }
+        out.push('\n');
+    }
+}
+
+/// PRK (virtkit's own, see [`vk_core::atop::STACK`]): pid, name, thread id, wait channel,
+/// and the kernel stack's frames joined by `;` — one record per thread of a process that
+/// has stalled.
+fn print_prk(out: &mut String, h: &str, stacks: &[Stack]) {
+    for s in stacks {
+        let _ = writeln!(
+            out,
+            "{h} {} {} {} {} {}",
+            s.pid,
+            paren(&s.name),
+            s.tid,
+            token(&s.wchan),
+            match s.frames.is_empty() {
+                true => "-".to_string(),
+                false => s.frames.join(";"),
+            }
         );
     }
 }
@@ -2631,6 +2876,8 @@ mod tests {
             nthrrun: 1,
             nthrslpi: 2,
             nthrslpu: 0,
+            wchans: Some(BTreeMap::from([("futex_wait_queue".to_string(), 2)])),
+            wchans_changed: false,
             btime: 1_767_225_000,
             is_new: true,
             utime: 120,
@@ -2759,12 +3006,12 @@ mod tests {
             procs: vec![proc_fixture()],
             ..Default::default()
         };
-        let first = sample_text(&env(), &s, None, &[], 30);
+        let first = sample_text(&env(), &s, None, &[], 30, &[]);
         assert!(first.starts_with("RESET\n"), "{first}");
         assert!(first.ends_with("SEP\n"));
         assert_eq!(first.matches("RESET\n").count(), 1);
 
-        let next = sample_text(&env(), &s, Some(&s), &[], 30);
+        let next = sample_text(&env(), &s, Some(&s), &[], 30, &[]);
         assert!(
             !next.contains("RESET"),
             "only the first sample announces one"
@@ -2791,9 +3038,304 @@ mod tests {
             labels,
             vec![
                 "RESET", "CPU", "cpu", "CPL", "MEM", "SWP", "PAG", "PSI", "NET", "PRG", "PRC",
-                "PRM", "PRD", "SEP"
+                "PRM", "PRD", "PRW", "SEP"
             ]
         );
+    }
+
+    /// A fake `/proc/<pid>`, removed on drop so a failing assertion does not leak it.
+    struct FakeProc(PathBuf);
+
+    impl std::ops::Deref for FakeProc {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for FakeProc {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A fake `/proc/<pid>` holding one `task/<tid>/{stat,wchan}` pair per thread, under a
+    /// per-test, per-process directory.
+    fn fake_proc(name: &str, tasks: &[(i32, char, &str)]) -> FakeProc {
+        let dir = std::env::temp_dir().join(format!("vk-atop-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (tid, state, wchan) in tasks {
+            let task = dir.join("task").join(tid.to_string());
+            std::fs::create_dir_all(&task).unwrap();
+            std::fs::write(
+                task.join("stat"),
+                format!("{tid} (worker (1)) {state} 1 412 412 0 -1\n"),
+            )
+            .unwrap();
+            std::fs::write(task.join("wchan"), wchan).unwrap();
+        }
+        FakeProc(dir)
+    }
+
+    /// The threads of a process are counted by state for PRG and, those not running, by the
+    /// kernel function each waits in for PRW. A running thread has no wait channel (`0`), and
+    /// neither has a sleeping one the kernel cannot name; a single-threaded process gets no
+    /// histogram at all, since PRC already carries its one wait channel.
+    #[test]
+    fn a_process_s_threads_are_counted_by_wait_channel() {
+        let dir = fake_proc(
+            "threads",
+            &[
+                (412, 'S', "futex_do_wait"),
+                (413, 'S', "hrtimer_nanosleep"),
+                (414, 'S', "hrtimer_nanosleep"),
+                (415, 'D', "request_wait_answer"),
+                (416, 'R', "0"),
+                // a stale name on a running thread is not a wait
+                (417, 'R', "hrtimer_nanosleep"),
+                (418, 'S', "0"),
+            ],
+        );
+        let mut p = Proc {
+            nthr: 7,
+            ..Default::default()
+        };
+        read_proc_threads(&dir, &mut p);
+        assert_eq!((p.nthrrun, p.nthrslpi, p.nthrslpu), (2, 4, 1));
+        assert_eq!(
+            p.wchans,
+            Some(BTreeMap::from([
+                ("futex_do_wait".to_string(), 1),
+                ("hrtimer_nanosleep".to_string(), 2),
+                ("request_wait_answer".to_string(), 1),
+            ]))
+        );
+
+        // `stat` says how many threads there are, and one gets no histogram.
+        let dir = fake_proc("one-thread", &[(7, 'S', "do_wait")]);
+        let mut p = Proc {
+            nthr: 1,
+            ..Default::default()
+        };
+        read_proc_threads(&dir, &mut p);
+        assert_eq!((p.nthrslpi, p.wchans), (1, None));
+
+        // Every thread running is a histogram with nothing in it, not no histogram.
+        let dir = fake_proc("all-running", &[(8, 'R', "0"), (9, 'R', "0")]);
+        let mut p = Proc {
+            nthr: 2,
+            ..Default::default()
+        };
+        read_proc_threads(&dir, &mut p);
+        assert_eq!(p.wchans, Some(BTreeMap::new()));
+    }
+
+    /// PRW: pid, name, then the channels in name order. A name holding spaces or
+    /// parentheses stays one field, and a channel the kernel named oddly stays one cell.
+    #[test]
+    fn a_wait_channel_line_matches_its_format() {
+        let mut p = proc_fixture();
+        p.name = "ruff check (x".into();
+        p.wchans_changed = true;
+        p.wchans = Some(BTreeMap::from([
+            ("hrtimer_nanosleep".to_string(), 7),
+            ("futex_do_wait".to_string(), 1),
+            ("odd name".to_string(), 1),
+        ]));
+        let s = Sys {
+            procs: vec![p],
+            ..Default::default()
+        };
+        let mut out = String::new();
+        print_prw(&mut out, H, &s);
+        assert_eq!(
+            out,
+            format!("{H} 412 (ruff check  x) futex_do_wait:1 hrtimer_nanosleep:7 odd_name:1\n")
+        );
+        let line = out.replacen("LBL", WCHANS, 1);
+        let w = vk_core::atop::parse_wchans(&vk_core::atop::cells(line.trim_end()))
+            .expect("the record reads back");
+        assert_eq!(w.counts.len(), 3);
+        assert_eq!(w.name, "ruff check  x");
+    }
+
+    /// PRW is written when a process's histogram is not the one the last sample *on disk*
+    /// carried: once for a histogram that stands still, again when it moves, and still after
+    /// a write that failed — `prev` does not advance past a sample that never landed, so the
+    /// change it carried is owed to the next one.
+    #[test]
+    fn a_wait_channel_record_is_written_when_the_histogram_changes() {
+        let at = |epoch: i64, wchan: &str| {
+            let mut p = proc_fixture();
+            p.wchans = Some(BTreeMap::from([(wchan.to_string(), 2)]));
+            Sys {
+                epoch,
+                cpus: vec![Cpu::default()],
+                procs: vec![p],
+                ..Default::default()
+            }
+        };
+        let prw = |text: &str| text.lines().filter(|l| l.starts_with("PRW ")).count();
+        let first = at(1_000, "futex_wait_queue");
+        assert_eq!(prw(&sample_text(&env(), &first, None, &[], 30, &[])), 1);
+        let same = at(1_010, "futex_wait_queue");
+        assert_eq!(
+            prw(&sample_text(&env(), &same, Some(&first), &[], 10, &[])),
+            0
+        );
+        let moved = at(1_020, "pipe_read");
+        let text = sample_text(&env(), &moved, Some(&same), &[], 10, &[]);
+        assert!(text.contains(" 412 (sh) pipe_read:2\n"), "{text}");
+        // `moved` failed to land, so the next sample is taken against `same` still.
+        let after = at(1_030, "pipe_read");
+        assert_eq!(
+            prw(&sample_text(&env(), &after, Some(&same), &[], 20, &[])),
+            1
+        );
+
+        // A pid reused by another task is a new task, whose histogram is written whatever
+        // its predecessor's was.
+        let mut reused = at(1_030, "futex_wait_queue");
+        reused.procs[0].btime += 5;
+        assert_eq!(
+            prw(&sample_text(&env(), &reused, Some(&same), &[], 20, &[])),
+            1
+        );
+        // A process that went single-threaded has nothing to write.
+        let mut single = at(1_030, "futex_wait_queue");
+        single.procs[0].wchans = None;
+        assert_eq!(
+            prw(&sample_text(&env(), &single, Some(&same), &[], 20, &[])),
+            0
+        );
+    }
+
+    /// A process that worked and then sat with the same wait channels, no thread running and
+    /// no disk transfer for as long as `Stall` asks has its stacks written once — not before,
+    /// not again while it stays stuck. A dump whose sample failed to land is owed to the next
+    /// one. The processor time its idle threads burn during the stretch does not matter either
+    /// way, and neither do syscalls that move no disk sectors.
+    #[test]
+    fn an_active_then_stuck_process_has_its_stacks_written_once() {
+        // Sample `i`, 10s apart: `ticks` of processor time so far, and whether a thread runs.
+        let at = |i: i64, ticks: u64, running: u64| {
+            let mut p = proc_fixture();
+            (p.utime, p.nthrrun) = (ticks, running);
+            Sys {
+                epoch: i * 10,
+                procs: vec![p],
+                ..Default::default()
+            }
+        };
+        // The samples at which a dump is due, as `run` drives it: the first sample carrying a
+        // dump fails to reach the log, so neither `prev` nor the trackers advance past it.
+        let fired = |samples: &[Sys]| {
+            let mut stalls = Stalls::default();
+            let mut prev: Option<&Sys> = None;
+            let mut fired = Vec::new();
+            for (i, cur) in samples.iter().enumerate() {
+                let (tracks, due) = stalls.advance(cur, prev);
+                let dumping: Vec<(i32, i64)> = due.iter().map(|p| (p.pid, p.btime)).collect();
+                if !dumping.is_empty() {
+                    fired.push(i as i64);
+                    if fired.len() == 1 {
+                        continue; // the write failed
+                    }
+                }
+                stalls.commit(tracks, &dumping);
+                prev = Some(cur);
+            }
+            fired
+        };
+        let k = vk_core::atop::STALL_SECS as i64 / 10;
+
+        // Seen at boot, busy in sample 1, stuck from sample 2 on at a tick an interval: the
+        // stretch starts at sample 1, so the dump is due five minutes after it.
+        let hung: Vec<Sys> = (0..=60)
+            .map(|i| match i {
+                0 => at(0, 100, 0),
+                1 => at(1, 150, 1),
+                i => at(i, 150 + i as u64, 0),
+            })
+            .collect();
+        assert_eq!(
+            fired(&hung),
+            [k + 1, k + 2],
+            "due at 5 minutes, then once more"
+        );
+
+        // The same process, never seen doing anything but what it did before the boot sample:
+        // an idle daemon, whatever its idle threads burn.
+        let daemon: Vec<Sys> = (0..=60).map(|i| at(i, 100 + i as u64, 0)).collect();
+        assert!(fired(&daemon).is_empty());
+
+        // Started after the boot sample and stuck at once: its first sample's counters cover
+        // its own start, which is work.
+        let mut started: Vec<Sys> = (0..=60).map(|i| at(i, 120, 0)).collect();
+        started[0].procs.clear();
+        assert_eq!(fired(&started), [k + 1, k + 2]);
+
+        // A thread that runs, or a disk transfer, starts the stretch over; syscalls alone
+        // (a heartbeat to a pipe) do not.
+        let mut broken = hung.clone();
+        broken[20].procs[0].nthrrun = 1;
+        broken[40].procs[0].rsz += 1;
+        assert!(fired(&broken).is_empty());
+        let mut chatty = hung.clone();
+        for (i, sample) in chatty.iter_mut().enumerate() {
+            sample.procs[0].rio += i as u64;
+        }
+        assert_eq!(fired(&chatty), [k + 1, k + 2]);
+    }
+
+    /// A stack reads off `/proc/<pid>/task/<tid>/stack` with the hashed address gone, one
+    /// frame per line; a kernel without stacks leaves the file absent, and the thread still
+    /// has its wait channel.
+    #[test]
+    fn a_stack_is_read_frame_by_frame() {
+        assert_eq!(
+            stack_frames(
+                "[<0>] request_wait_answer+0x7c/0x1e0\n\
+                 [<0>] fuse_simple_request+0x1a0/0x2d0\n\
+                 [<0>] do_syscall_64+0x5d/0x170 [odd]\n\
+                 [<0>]\n"
+            ),
+            [
+                "request_wait_answer+0x7c/0x1e0",
+                "fuse_simple_request+0x1a0/0x2d0",
+                "do_syscall_64+0x5d/0x170_[odd]"
+            ]
+        );
+        assert!(stack_frames("").is_empty());
+
+        let dir = fake_proc(
+            "stacks",
+            &[(413, 'S', "hrtimer_nanosleep"), (412, 'S', "futex_do_wait")],
+        );
+        std::fs::write(
+            dir.join("task/412/stack"),
+            "[<0>] futex_do_wait+0x4e/0x80\n[<0>] __futex_wait+0x8c/0x110\n",
+        )
+        .unwrap();
+        let mut p = proc_fixture();
+        p.name = "ruff".into();
+        let stacks = read_stacks(&dir, &p);
+        let mut out = String::new();
+        print_prk(&mut out, H, &stacks);
+        assert_eq!(
+            out,
+            format!(
+                "{H} 412 (ruff) 412 futex_do_wait futex_do_wait+0x4e/0x80;__futex_wait+0x8c/0x110\n\
+                 {H} 412 (ruff) 413 hrtimer_nanosleep -\n"
+            )
+        );
+        for line in out.lines() {
+            let line = line.replacen("LBL", STACK, 1);
+            assert!(
+                vk_core::atop::parse_stack(&vk_core::atop::cells(&line)).is_some(),
+                "{line}"
+            );
+        }
     }
 
     /// The counters atop reports per interval are differences against the previous
@@ -3097,10 +3639,15 @@ mod tests {
         assert!(s.mem.physmem > 0, "physical memory");
         assert!(!s.procs.is_empty(), "at least this test process");
         let mut out = String::new();
-        write_sample(&mut out, &env, &deviate(&s, None, &[], &env), 30);
+        write_sample(&mut out, &env, &deviate(&s, None, &[], &env), 30, &[]);
         let mut seen: Vec<&str> = Vec::new();
         for line in out.lines() {
             let cells = vk_core::atop::cells(line);
+            // virtkit's own label has no fixed arity; it reads back or it does not.
+            if cells.first() == Some(&WCHANS) {
+                assert!(vk_core::atop::parse_wchans(&cells).is_some(), "{line}");
+                continue;
+            }
             let label = vk_core::atop::label_of(&cells)
                 .unwrap_or_else(|| panic!("no schema for this record: {line}"));
             seen.push(label.name);
