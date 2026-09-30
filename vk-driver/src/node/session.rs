@@ -235,6 +235,8 @@ async fn handle(ws: &mut Ws, msg: HubMsg, within: Duration) -> Result<()> {
             };
             send(ws, &NodeMsg::Ack(ack), within).await
         }
+        // No ack is sent yet, so there is nothing a record could settle.
+        HubMsg::Recorded(_) => Ok(()),
         HubMsg::Refused { code, reason } => Err(refusal(code, &reason)),
         HubMsg::Challenge { .. } | HubMsg::Welcome { .. } => {
             bail!("the hub repeated its handshake inside a session")

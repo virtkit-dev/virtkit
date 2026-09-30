@@ -28,6 +28,18 @@
 //! **Display.** Every string a host reports is the host's to choose; whoever prints one to a
 //! terminal, a log or a page passes it through [`display_safe`] first.
 //!
+//! **Steering.** Once a session is up the node sends a [`Report`] of its observed state —
+//! the desired-state generation it last applied, its [`NodeState`], whether its runner is
+//! taking jobs, its concurrency — and again whenever that changes, along with an ack for
+//! every command whose outcome the hub has not yet recorded. The hub answers each ack with
+//! [`HubMsg::Recorded`], resends desired state to a node whose report shows it behind, and
+//! resends commands that have no final outcome; the node recognizes a command it journaled
+//! by its ID and answers with the outcome it recorded rather than acting twice.
+//!
+//! Version 1 has not shipped in a release, so these messages are version 1's own. From the
+//! first release on, a message or variant an older peer could not parse takes a new version,
+//! and only optional fields are added within one.
+//!
 //! Every ID is 16 random bytes as lowercase hex ([`valid_id`]): the node ID the hub assigns
 //! at enrollment, the incarnation a node draws each time `vk node run` starts, and command
 //! IDs. Timestamps are seconds since the Unix epoch.
@@ -260,8 +272,11 @@ pub enum NodeMsg {
     Inventory(Inventory),
     /// Sent every [`HubMsg::Welcome`] `heartbeat_secs`.
     Heartbeat(Heartbeat),
-    /// What became of a [`HubMsg::Command`].
+    /// What became of a [`HubMsg::Command`]; repeated until the hub answers
+    /// [`HubMsg::Recorded`].
     Ack(CommandAck),
+    /// Sent once a session is up and again whenever it changes.
+    Report(Report),
 }
 
 /// Hub → node.
@@ -286,6 +301,8 @@ pub enum HubMsg {
     Desired(DesiredState),
     /// An operation, journaled by the node before it acts on it.
     Command(Command),
+    /// The hub has stored this ack; the node stops repeating it.
+    Recorded(CommandAck),
     /// The session is refused or ended; the connection closes after this.
     Refused { code: RefusalCode, reason: String },
 }
@@ -457,10 +474,89 @@ pub struct DesiredState {
     pub acquisition: Acquisition,
 }
 
+/// A node's own state, persisted on the node: losing the hub changes none of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeState {
+    #[default]
+    Ready,
+    Draining,
+    Drained,
+    /// Left only by [`Operation::Release`].
+    Quarantined,
+}
+
+/// How the node's gitlab-runner is run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerMode {
+    /// `vk node run` supervises it, and can stop and resume its acquisition.
+    Managed,
+    /// Something else runs it; only its concurrency can be steered.
+    #[default]
+    External,
+}
+
+/// What a node observes of itself: the answer to the desired state and commands it was sent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Report {
+    /// The last desired-state generation applied; `None` before the first.
+    pub applied_generation: Option<u64>,
+    /// What of the applied desired state this node cannot carry out, in words.
+    #[serde(default)]
+    pub unsupported: Vec<String>,
+    pub state: NodeState,
+    /// Whether the runner can take jobs: `Stop` only once a stopped runner has exited, since
+    /// a runner still quitting may yet be one that never heard the signal.
+    pub acquisition: Acquisition,
+    pub runner: RunnerMode,
+    /// The supervised runner's process; `None` for an external runner.
+    pub runner_state: Option<RunnerState>,
+    /// `None` until the node's concurrency loop has run once.
+    pub concurrency: Option<Concurrency>,
+    /// Why the node's last attempt to set its runner's concurrency failed, if it did.
+    #[serde(default)]
+    pub concurrency_error: Option<String>,
+    /// Present while draining: which of the conditions for `drained` hold.
+    pub drain: Option<DrainProgress>,
+}
+
+/// `effective = min(estimate, hub_ceiling, local_ceiling)`, as the node last worked it out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Concurrency {
+    pub estimate: Option<u32>,
+    pub hub_ceiling: Option<u32>,
+    pub local_ceiling: Option<u32>,
+    pub effective: Option<u32>,
+}
+
+/// A supervised runner's process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerState {
+    Running,
+    /// Sent `SIGQUIT`: taking no new jobs, finishing the ones it has. gitlab-runner has no way
+    /// back from this, so acquisition resumes only with a new runner once this one exits.
+    Quitting,
+    #[default]
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainProgress {
+    /// The runner has exited, having finished its jobs.
+    pub runner_stopped: bool,
+    /// No reservation is held or waited for in the admission ledger.
+    pub ledger_empty: bool,
+    /// Job supervisors still running.
+    pub active_jobs: u32,
+}
+
 /// Whether the runner may take new jobs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Acquisition {
+    #[default]
     Run,
     Stop,
 }
@@ -477,8 +573,17 @@ pub struct Command {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Operation {
+    /// Stop taking jobs, let running ones finish, then report [`NodeState::Drained`].
     Drain,
-    Update { version: String },
+    /// Back to [`NodeState::Ready`] from a drain, taking jobs again.
+    Undrain,
+    /// Stop taking jobs until an operator releases the node, whatever else it is told.
+    Quarantine,
+    /// Leave a quarantine for [`NodeState::Ready`].
+    Release,
+    Update {
+        version: String,
+    },
     Reset,
 }
 
@@ -750,6 +855,27 @@ mod tests {
                 id: id.clone(),
                 outcome: Outcome::Expired,
             }),
+            NodeMsg::Report(Report::default()),
+            NodeMsg::Report(Report {
+                applied_generation: Some(4),
+                unsupported: vec!["stop acquisition".into()],
+                state: NodeState::Draining,
+                acquisition: Acquisition::Stop,
+                runner: RunnerMode::Managed,
+                runner_state: Some(RunnerState::Quitting),
+                concurrency: Some(Concurrency {
+                    estimate: Some(8),
+                    hub_ceiling: Some(4),
+                    local_ceiling: None,
+                    effective: Some(4),
+                }),
+                drain: Some(DrainProgress {
+                    runner_stopped: false,
+                    ledger_empty: true,
+                    active_jobs: 1,
+                }),
+                concurrency_error: Some("invalid [executor.vm] mem".into()),
+            }),
         ] {
             round_trip(&msg);
         }
@@ -773,9 +899,18 @@ mod tests {
                 },
             }),
             HubMsg::Command(Command {
-                id,
+                id: id.clone(),
                 expires_at: 0,
                 op: Operation::Drain,
+            }),
+            HubMsg::Command(Command {
+                id: id.clone(),
+                expires_at: 0,
+                op: Operation::Quarantine,
+            }),
+            HubMsg::Recorded(CommandAck {
+                id,
+                outcome: Outcome::Done,
             }),
             HubMsg::Refused {
                 code: RefusalCode::NotEnrolled,

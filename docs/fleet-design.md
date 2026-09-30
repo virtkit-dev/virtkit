@@ -94,8 +94,10 @@ Then:
   (`drain`, `update`, `reset`), each with an ID and an expiry.
 
 A node applies a desired-state generation at most once, and journals every command before
-acting on it, so a command redelivered after a reconnect is recognized and not repeated. A
-lost connection means the node's state is unknown, not that it stopped.
+acting on it, so a command redelivered after a reconnect is recognized and not repeated. It
+repeats each command's outcome until the hub says it has stored it, and the hub resends
+desired state to a node that reports an older generation, and every command without a final
+outcome. A lost connection means the node's state is unknown, not that it stopped.
 
 **Losing the hub does not stop the fleet.** A disconnected node keeps running CI under its
 local policy and the last desired state it applied. A drain or quarantine it has persisted

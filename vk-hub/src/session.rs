@@ -314,6 +314,8 @@ async fn record(hub: &Hub, node: &Node, msg: NodeMsg) -> Result<()> {
             );
             Ok(())
         }
+        // Nothing is steered yet, so there is nothing a report answers.
+        NodeMsg::Report(_) => Ok(()),
         NodeMsg::Hello { .. } | NodeMsg::Auth { .. } => {
             bail!("the node repeated its handshake inside a session")
         }
