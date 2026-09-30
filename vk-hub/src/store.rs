@@ -24,24 +24,37 @@ use anyhow::{Context, Result, bail};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use vk_fleet_proto::{Heartbeat, Inventory};
+use vk_fleet_proto::{
+    Acquisition, Command, CommandAck, DesiredState, Heartbeat, Inventory, NodeState, Operation,
+    Outcome, Report,
+};
 
 /// Key: node ID. Value: JSON [`NodeRow`].
 const NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
 /// Key: `sha256(token)`, hex. Value: JSON [`TokenRow`].
 const TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("tokens");
+/// Key: `<node id>/<command id>`, so a node's commands are one range. Value: JSON
+/// [`CommandRow`].
+const COMMANDS: TableDefinition<&str, &[u8]> = TableDefinition::new("commands");
 /// Key: a sequence number, oldest first. Value: JSON [`AuditRow`].
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
+/// Key: `(node id, sequence number)` of each node's audit rows, so one node's log is a range.
+const AUDIT_BY_NODE: TableDefinition<(&str, u64), ()> = TableDefinition::new("audit_by_node");
+
 /// Key: `sha256(sign-in token)`, hex. Value: JSON [`LoginRow`].
 const UI_LOGINS: TableDefinition<&str, &[u8]> = TableDefinition::new("ui_logins");
 /// Key: `sha256(session secret)`, hex. Value: JSON [`UiSessionRow`].
 const UI_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("ui_sessions");
 
-/// The most audit rows kept. Bounded by count rather than age: a quiet hub keeps its history
-/// for years, and a busy one the newest hundred thousand actions. Past it, the oldest go, a
-/// thousand at a time.
+/// The most audit rows kept. Bounded by count rather than age: a quiet fleet keeps its history
+/// for years, and a busy one keeps the newest hundred thousand actions and outcomes — months
+/// at the rate of a few dozen nodes. Past it, the oldest go, a thousand at a time.
 const AUDIT_MAX: u64 = 100_000;
 const AUDIT_PRUNE: u64 = 1000;
+
+/// How long a command is kept once it is settled — finished, refused, expired, or never
+/// taken by its expiry — for `vk-hub nodes` and a look back. The audit log keeps the record.
+const COMMAND_KEEP: u64 = 30 * 86_400;
 
 /// Every enrollment token starts with this, so one pasted into the wrong place is
 /// recognizable.
@@ -130,19 +143,9 @@ impl UiSession {
     }
 }
 
-/// One line of the audit log.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuditRow {
-    pub at: u64,
-    /// Who: `uid <n>` for whoever used the admin socket, a session's principal for what it
-    /// did, `vk-hub` for what the hub itself started.
-    pub actor: String,
-    pub event: String,
-}
-
 /// An enrolled node. Fields added later carry `#[serde(default)]` so rows written by an
 /// older hub still read.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NodeRow {
     /// The pinned ed25519 public key, hex.
     pub public_key: String,
@@ -161,6 +164,55 @@ pub struct NodeRow {
     pub heartbeat: Option<Heartbeat>,
     #[serde(default)]
     pub heartbeat_at: Option<u64>,
+    /// What the hub wants of the node; `None` until an operator first asks for anything.
+    #[serde(default)]
+    pub desired: Option<DesiredState>,
+    /// The node's latest report of itself.
+    #[serde(default)]
+    pub report: Option<Report>,
+}
+
+/// A command issued to a node, and what the node last said it came to.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommandRow {
+    pub node_id: String,
+    pub command: Command,
+    pub issued_at: u64,
+    #[serde(default)]
+    pub outcome: Option<Outcome>,
+    #[serde(default)]
+    pub outcome_at: Option<u64>,
+}
+
+impl CommandRow {
+    /// Still to be delivered or finished: no outcome yet, or one that is under way.
+    fn pending(&self) -> bool {
+        matches!(self.outcome, None | Some(Outcome::Accepted))
+    }
+
+    /// Settled more than `keep` before `now`: a final outcome that old, or an expiry that
+    /// old for a command never taken.
+    fn settled_before(&self, now: u64, keep: u64) -> bool {
+        let settled_at = match &self.outcome {
+            Some(Outcome::Accepted) => return false,
+            Some(_) => self.outcome_at.unwrap_or(self.issued_at),
+            None => self.command.expires_at,
+        };
+        now.saturating_sub(settled_at) > keep
+    }
+}
+
+/// One line of the audit log.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditRow {
+    pub at: u64,
+    /// The node it is about; `None` for the hub's own, and for everything in local mode.
+    #[serde(default)]
+    pub node: Option<String>,
+    /// Who: `uid <n>` for an operator on the admin socket, a session's principal for what it
+    /// did, `node` for what a node reported.
+    pub actor: String,
+    pub event: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -261,7 +313,11 @@ impl Db {
             .context("starting the hub db's first write")?;
         txn.open_table(NODES).context("opening the nodes table")?;
         txn.open_table(TOKENS).context("opening the tokens table")?;
+        txn.open_table(COMMANDS)
+            .context("opening the commands table")?;
         txn.open_table(AUDIT).context("opening the audit table")?;
+        txn.open_table(AUDIT_BY_NODE)
+            .context("opening the audit index")?;
         txn.open_table(UI_LOGINS)
             .context("opening the sign-in links table")?;
         txn.open_table(UI_SESSIONS)
@@ -272,7 +328,7 @@ impl Db {
 
     /// Issue a single-use enrollment token valid for `ttl`. Returns the token — shown once,
     /// never stored — and when it expires. Expired tokens are swept in the same write.
-    pub fn create_token(&self, ttl: Duration, now: u64) -> Result<(String, u64)> {
+    pub fn create_token(&self, ttl: Duration, actor: &str, now: u64) -> Result<(String, u64)> {
         if ttl.is_zero() || ttl > MAX_TOKEN_TTL {
             bail!(
                 "a token's lifetime must be between 1s and {} days",
@@ -300,6 +356,17 @@ impl Db {
             };
             table.insert(token_key(&token).as_str(), encode(&row)?.as_slice())?;
         }
+        // The token itself is never logged: it is the credential.
+        append_audit(
+            &txn,
+            None,
+            actor,
+            &format!(
+                "{actor} issued an enrollment token valid for {}s",
+                ttl.as_secs()
+            ),
+            now,
+        )?;
         txn.commit().context("storing an enrollment token")?;
         Ok((token, expires_at))
     }
@@ -357,11 +424,7 @@ impl Db {
                             public_key: public_key.to_string(),
                             hostname: vk_fleet_proto::display_safe(hostname),
                             enrolled_at: now,
-                            incarnation: None,
-                            last_seen: None,
-                            inventory: None,
-                            heartbeat: None,
-                            heartbeat_at: None,
+                            ..NodeRow::default()
                         };
                         nodes.insert(node_id.as_str(), encode(&row)?.as_slice())?;
                         Enrollment::Enrolled { node_id }
@@ -403,11 +466,23 @@ impl Db {
         })
     }
 
-    /// Remove a node: its key is no longer pinned, and a session it opens is refused.
-    /// `Ok(false)` when there was no such node.
-    pub fn remove_node(&self, id: &str) -> Result<bool> {
+    /// Remove a node: its key is no longer pinned, a session it opens is refused, and its
+    /// commands go. Audited as `actor`'s. `Ok(false)` when there was no such node.
+    pub fn remove_node(&self, id: &str, actor: &str, now: u64) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
         let removed = txn.open_table(NODES)?.remove(id)?.is_some();
+        if removed {
+            let (start, end) = command_range(id);
+            txn.open_table(COMMANDS)?
+                .retain_in(start.as_str()..end.as_str(), |_, _| false)?;
+            append_audit(
+                &txn,
+                Some(id),
+                actor,
+                &format!("{actor} removed the node"),
+                now,
+            )?;
+        }
         txn.commit().context("removing a node")?;
         Ok(removed)
     }
@@ -432,18 +507,215 @@ impl Db {
     /// Record `event`, done by `actor`, in the audit log.
     pub fn audit(&self, actor: &str, event: &str, now: u64) -> Result<()> {
         let txn = self.db.begin_write().context("starting a write")?;
-        append_audit(&txn, actor, event, now)?;
+        append_audit(&txn, None, actor, event, now)?;
         txn.commit().context("writing an audit line")
     }
 
-    /// The last `limit` audit lines, oldest first.
-    #[cfg(test)]
-    pub fn audits(&self, limit: usize) -> Result<Vec<AuditRow>> {
+    /// Change what the hub wants of node `id` through `change`, from the defaults — no
+    /// ceiling, acquisition running — when nothing was wanted yet. A change takes the next
+    /// generation after both the hub's and the one the node last reported applying, so it is
+    /// newer to the node whatever the hub has forgotten; one that changes nothing is not
+    /// stored. Audited as `actor` doing `what`. Returns the new desired state, or `None` when
+    /// it was already so.
+    pub fn set_desired(
+        &self,
+        id: &str,
+        change: impl FnOnce(&mut DesiredState),
+        actor: &str,
+        what: &str,
+        now: u64,
+    ) -> Result<Option<DesiredState>> {
+        self.update_audited(
+            id,
+            Durability::Immediate,
+            |row| {
+                let before = row.desired.clone().unwrap_or(DEFAULT_DESIRED);
+                let mut next = before.clone();
+                change(&mut next);
+                if next.ceiling == before.ceiling && next.acquisition == before.acquisition {
+                    return (None, Vec::new());
+                }
+                next.generation = before.generation.max(applied(row)).saturating_add(1);
+                row.desired = Some(next.clone());
+                let event = format!("{actor} {what} (generation {})", next.generation);
+                (Some(next), vec![(actor.to_string(), event)])
+            },
+            now,
+        )
+    }
+
+    /// Store node `id`'s report, and audit what it says that is new: a state, an applied
+    /// generation, what the node cannot carry out.
+    ///
+    /// A node that reports a generation newer than the hub's own has taken it from a hub that
+    /// knew more — this one restored from a backup, say. The hub then moves past it: its
+    /// desired state is re-issued as the generation after the node's, so the node, which
+    /// ignores anything not newer than what it applied, takes it, and nothing is sent before
+    /// the report that shows where the node is.
+    pub fn record_report(&self, id: &str, report: Report, now: u64) -> Result<()> {
+        let mut report = report;
+        for note in &mut report.unsupported {
+            *note = vk_fleet_proto::display_safe(note);
+        }
+        if let Some(error) = report.concurrency_error.as_mut() {
+            *error = vk_fleet_proto::display_safe(error);
+        }
+        self.update_audited(
+            id,
+            Durability::Immediate,
+            |row| {
+                let mut events: Vec<(String, String)> = report_events(row.report.as_ref(), &report)
+                    .into_iter()
+                    .map(|e| ("node".to_string(), e))
+                    .collect();
+                let ours = row.desired.as_ref().map_or(0, |d| d.generation);
+                if let Some(theirs) = report.applied_generation
+                    && theirs > ours
+                {
+                    let mut desired = row.desired.clone().unwrap_or(DEFAULT_DESIRED);
+                    desired.generation = theirs.saturating_add(1);
+                    events.push((
+                        "hub".to_string(),
+                        format!(
+                            "the node applied generation {theirs}, past this hub's {ours}: \
+                         re-issued the desired state as generation {}",
+                            desired.generation
+                        ),
+                    ));
+                    row.desired = Some(desired);
+                }
+                row.report = Some(report);
+                row.last_seen = Some(now);
+                ((), events)
+            },
+            now,
+        )
+    }
+
+    /// Issue `op` to node `id`, valid for `ttl`, audited as `actor`'s. The node must be
+    /// enrolled. Its commands settled longer than [`COMMAND_KEEP`] ago go in the same write.
+    pub fn issue_command(
+        &self,
+        id: &str,
+        op: Operation,
+        ttl: Duration,
+        actor: &str,
+        now: u64,
+    ) -> Result<Command> {
+        let command = Command {
+            id: crate::random_hex(vk_fleet_proto::ID_BYTES)?,
+            expires_at: now.saturating_add(ttl.as_secs()),
+            op,
+        };
+        let row = CommandRow {
+            node_id: id.to_string(),
+            command: command.clone(),
+            issued_at: now,
+            outcome: None,
+            outcome_at: None,
+        };
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            if txn.open_table(NODES)?.get(id)?.is_none() {
+                bail!("node {id} is not enrolled");
+            }
+            let mut commands = txn.open_table(COMMANDS)?;
+            let (start, end) = command_range(id);
+            commands.retain_in(start.as_str()..end.as_str(), |_, value| {
+                decode::<CommandRow>(value).map_or(true, |r| !r.settled_before(now, COMMAND_KEEP))
+            })?;
+            let key = format!("{id}/{}", command.id);
+            commands.insert(key.as_str(), encode(&row)?.as_slice())?;
+            let event = format!(
+                "{actor} issued {} (command {})",
+                operation_name(&command.op),
+                command.id
+            );
+            append_audit(&txn, Some(id), actor, &event, now)?;
+        }
+        txn.commit().context("issuing a command")?;
+        Ok(command)
+    }
+
+    /// Node `id`'s commands still to deliver or finish, oldest first, leaving out those past
+    /// their expiry that it never answered — it would only refuse them.
+    pub fn pending_commands(&self, id: &str, now: u64) -> Result<Vec<Command>> {
+        let mut rows = self.node_commands(id)?;
+        rows.retain(|r| r.pending() && (r.outcome.is_some() || r.command.expires_at > now));
+        rows.sort_by_key(|r| r.issued_at);
+        Ok(rows.into_iter().map(|r| r.command).collect())
+    }
+
+    /// Every command of node `id`.
+    pub fn node_commands(&self, id: &str) -> Result<Vec<CommandRow>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(COMMANDS)?;
+        let (start, end) = command_range(id);
+        let mut out = Vec::new();
+        for entry in table.range(start.as_str()..end.as_str())? {
+            let (_, value) = entry?;
+            out.push(decode::<CommandRow>(value.value())?);
+        }
+        Ok(out)
+    }
+
+    /// Store what node `id` said command `ack.id` came to, and audit it. Returns whether the
+    /// outcome was news; `false` for one already recorded, a command this hub never issued,
+    /// and anything after a final outcome — a stale `accepted` arriving late must not reopen a
+    /// finished command.
+    pub fn record_ack(&self, id: &str, ack: &CommandAck, now: u64) -> Result<bool> {
+        let key = format!("{id}/{}", ack.id);
+        let txn = self.db.begin_write().context("starting a write")?;
+        let news = {
+            let mut table = txn.open_table(COMMANDS)?;
+            let row = table
+                .get(key.as_str())?
+                .map(|g| decode::<CommandRow>(g.value()))
+                .transpose()?;
+            match row {
+                // A final outcome stays: nothing the node sends after it replaces it.
+                Some(mut row) if row.pending() && row.outcome.as_ref() != Some(&ack.outcome) => {
+                    row.outcome = Some(ack.outcome.clone());
+                    row.outcome_at = Some(now);
+                    table.insert(key.as_str(), encode(&row)?.as_slice())?;
+                    Some(row.command)
+                }
+                _ => None,
+            }
+        };
+        if let Some(command) = &news {
+            let event = format!(
+                "command {} ({}): {}",
+                command.id,
+                operation_name(&command.op),
+                outcome_text(&ack.outcome)
+            );
+            append_audit(&txn, Some(id), "node", &event, now)?;
+        }
+        txn.commit().context("recording an ack")?;
+        Ok(news.is_some())
+    }
+
+    /// The last `limit` audit lines, oldest first, of one node or of all.
+    pub fn audits(&self, node: Option<&str>, limit: usize) -> Result<Vec<AuditRow>> {
         let txn = self.db.begin_read().context("starting a read")?;
         let table = txn.open_table(AUDIT)?;
         let mut out = Vec::new();
-        for entry in table.iter()?.rev().take(limit) {
-            out.push(decode::<AuditRow>(entry?.1.value())?);
+        match node {
+            None => {
+                for entry in table.iter()?.rev().take(limit) {
+                    out.push(decode::<AuditRow>(entry?.1.value())?);
+                }
+            }
+            Some(node) => {
+                let index = txn.open_table(AUDIT_BY_NODE)?;
+                for entry in index.range((node, 0)..=(node, u64::MAX))?.rev().take(limit) {
+                    let seq = entry?.0.value().1;
+                    if let Some(row) = table.get(seq)? {
+                        out.push(decode::<AuditRow>(row.value())?);
+                    }
+                }
+            }
         }
         out.reverse();
         Ok(out)
@@ -480,6 +752,7 @@ impl Db {
         }
         append_audit(
             &txn,
+            None,
             actor,
             &format!(
                 "{actor} issued a sign-in link for the {} role, valid for {}s",
@@ -537,7 +810,7 @@ impl Db {
                         session.principal(),
                         session.issued_by
                     );
-                    append_audit(&txn, &session.principal(), &event, now)?;
+                    append_audit(&txn, None, &session.principal(), &event, now)?;
                     Some((secret, session))
                 }
                 _ => None,
@@ -605,7 +878,7 @@ impl Db {
             } else {
                 format!("{actor} ended {principal}")
             };
-            append_audit(&txn, actor, &event, now)?;
+            append_audit(&txn, None, actor, &event, now)?;
         }
         txn.commit().context("ending web UI sessions")?;
         Ok(ended.len())
@@ -633,40 +906,163 @@ impl Db {
         durability: Durability,
         change: impl FnOnce(&mut NodeRow),
     ) -> Result<()> {
+        self.update_audited(
+            id,
+            durability,
+            |row| {
+                change(row);
+                ((), Vec::new())
+            },
+            0,
+        )
+    }
+
+    /// [`Db::update`], with the audit rows `change` returns — `(actor, event)` pairs — written
+    /// in the same transaction as the change they describe.
+    fn update_audited<R>(
+        &self,
+        id: &str,
+        durability: Durability,
+        change: impl FnOnce(&mut NodeRow) -> (R, Vec<(String, String)>),
+        now: u64,
+    ) -> Result<R> {
         let mut txn = self.db.begin_write().context("starting a write")?;
         txn.set_durability(durability)
             .context("setting a write's durability")?;
-        {
+        let out = {
             let mut table = txn.open_table(NODES)?;
             let mut row = match table.get(id)? {
                 Some(g) => decode::<NodeRow>(g.value())?,
                 None => bail!("node {id} is not enrolled"),
             };
-            change(&mut row);
+            let (out, events) = change(&mut row);
             table.insert(id, encode(&row)?.as_slice())?;
-        }
-        txn.commit().context("updating a node")
+            for (actor, event) in events {
+                append_audit(&txn, Some(id), &actor, &event, now)?;
+            }
+            out
+        };
+        txn.commit().context("updating a node")?;
+        Ok(out)
     }
 }
 
+/// What the hub wants of a node it has asked nothing of.
+const DEFAULT_DESIRED: DesiredState = DesiredState {
+    generation: 0,
+    ceiling: None,
+    acquisition: Acquisition::Run,
+};
+
+/// The generation node `row` last reported applying, 0 before any.
+fn applied(row: &NodeRow) -> u64 {
+    row.report
+        .as_ref()
+        .and_then(|r| r.applied_generation)
+        .unwrap_or(0)
+}
+
+/// The key range of node `id`'s commands.
+fn command_range(id: &str) -> (String, String) {
+    (format!("{id}/"), format!("{id}0"))
+}
+
 /// Append an audit row inside `txn`, dropping the oldest past [`AUDIT_MAX`].
-fn append_audit(txn: &redb::WriteTransaction, actor: &str, event: &str, now: u64) -> Result<()> {
+fn append_audit(
+    txn: &redb::WriteTransaction,
+    node: Option<&str>,
+    actor: &str,
+    event: &str,
+    now: u64,
+) -> Result<()> {
     let row = AuditRow {
         at: now,
+        node: node.map(str::to_string),
         actor: actor.to_string(),
         event: vk_fleet_proto::display_safe(event),
     };
     let mut table = txn.open_table(AUDIT)?;
+    let mut index = txn.open_table(AUDIT_BY_NODE)?;
     let seq = table
         .last()?
         .map_or(0, |(k, _)| k.value().saturating_add(1));
     table.insert(seq, encode(&row)?.as_slice())?;
+    if let Some(node) = node {
+        index.insert((node, seq), ())?;
+    }
     let first = table.first()?.map_or(seq, |(k, _)| k.value());
     if seq.saturating_sub(first) >= AUDIT_MAX {
         let cut = first.saturating_add(AUDIT_PRUNE);
-        table.retain_in(first..cut, |_, _| false)?;
+        let mut dropped = Vec::new();
+        for entry in table.range(first..cut)? {
+            let (k, v) = entry?;
+            dropped.push((k.value(), decode::<AuditRow>(v.value())?.node));
+        }
+        for (seq, node) in dropped {
+            table.remove(seq)?;
+            if let Some(node) = node {
+                index.remove((node.as_str(), seq))?;
+            }
+        }
     }
     Ok(())
+}
+
+/// The audit lines a report is worth: a new state, a newly applied generation, and what of it
+/// the node cannot carry out — or its concurrency — as it changes.
+fn report_events(previous: Option<&Report>, report: &Report) -> Vec<String> {
+    let mut events = Vec::new();
+    if previous.is_none_or(|p| p.state != report.state) {
+        events.push(format!("state {}", state_name(report.state)));
+    }
+    if previous.is_none_or(|p| p.applied_generation != report.applied_generation)
+        && let Some(generation) = report.applied_generation
+    {
+        events.push(format!("applied generation {generation}"));
+    }
+    if previous.is_none_or(|p| p.unsupported != report.unsupported) {
+        for note in &report.unsupported {
+            events.push(format!("cannot comply: {note}"));
+        }
+    }
+    if previous.is_none_or(|p| p.concurrency_error != report.concurrency_error)
+        && let Some(error) = &report.concurrency_error
+    {
+        events.push(format!("cannot set its concurrency: {error}"));
+    }
+    events
+}
+
+pub(crate) fn state_name(state: NodeState) -> &'static str {
+    match state {
+        NodeState::Ready => "ready",
+        NodeState::Draining => "draining",
+        NodeState::Drained => "drained",
+        NodeState::Quarantined => "quarantined",
+    }
+}
+
+pub(crate) fn operation_name(op: &Operation) -> String {
+    match op {
+        Operation::Drain => "drain".into(),
+        Operation::Undrain => "undrain".into(),
+        Operation::Quarantine => "quarantine".into(),
+        Operation::Release => "release".into(),
+        Operation::Update { version } => {
+            format!("update to {}", vk_fleet_proto::display_safe(version))
+        }
+        Operation::Reset => "reset".into(),
+    }
+}
+
+fn outcome_text(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Accepted => "accepted".into(),
+        Outcome::Done => "done".into(),
+        Outcome::Failed { message } => format!("failed: {}", vk_fleet_proto::display_safe(message)),
+        Outcome::Refused { reason } => format!("refused: {}", vk_fleet_proto::display_safe(reason)),
+        Outcome::Expired => "expired".into(),
+    }
 }
 
 /// A token's key in [`TOKENS`], and a sign-in token's or session secret's in its table.
@@ -721,14 +1117,14 @@ mod tests {
 
     fn audit(db: &Db, event: &str, at: u64) {
         let txn = db.db.begin_write().unwrap();
-        append_audit(&txn, "uid 0", event, at).unwrap();
+        append_audit(&txn, None, "uid 0", event, at).unwrap();
         txn.commit().unwrap();
     }
 
     #[test]
     fn a_token_enrolls_exactly_one_node() {
         let db = Db::open_memory().unwrap();
-        let (token, expires) = db.create_token(DAY, 1000).unwrap();
+        let (token, expires) = db.create_token(DAY, "uid 0", 1000).unwrap();
         assert!(token.starts_with(TOKEN_PREFIX));
         assert_eq!(expires, 1000 + 86_400);
         let Enrollment::Enrolled { node_id } = db.enroll(&token, "aa", "ci-1", 1001).unwrap()
@@ -751,7 +1147,9 @@ mod tests {
     #[test]
     fn an_expired_or_unknown_token_enrolls_nothing() {
         let db = Db::open_memory().unwrap();
-        let (token, expires) = db.create_token(Duration::from_secs(60), 1000).unwrap();
+        let (token, expires) = db
+            .create_token(Duration::from_secs(60), "uid 0", 1000)
+            .unwrap();
         assert_eq!(
             db.enroll(&token, "aa", "h", expires).unwrap(),
             Enrollment::BadToken
@@ -766,9 +1164,9 @@ mod tests {
     #[test]
     fn a_pinned_key_enrolls_again_as_its_node_and_a_removed_one_anew() {
         let db = Db::open_memory().unwrap();
-        let (t1, _) = db.create_token(DAY, 0).unwrap();
-        let (t2, _) = db.create_token(DAY, 0).unwrap();
-        let (t3, _) = db.create_token(DAY, 0).unwrap();
+        let (t1, _) = db.create_token(DAY, "uid 0", 0).unwrap();
+        let (t2, _) = db.create_token(DAY, "uid 0", 0).unwrap();
+        let (t3, _) = db.create_token(DAY, "uid 0", 0).unwrap();
         let Enrollment::Enrolled { node_id } = db.enroll(&t1, "aa", "h", 1).unwrap() else {
             panic!("expected an enrollment");
         };
@@ -781,8 +1179,8 @@ mod tests {
         // The second token is spent by it all the same.
         assert_eq!(db.enroll(&t2, "bb", "h", 1).unwrap(), Enrollment::BadToken);
         assert_eq!(db.nodes().unwrap().len(), 1);
-        assert!(db.remove_node(&node_id).unwrap());
-        assert!(!db.remove_node(&node_id).unwrap());
+        assert!(db.remove_node(&node_id, "uid 0", 2).unwrap());
+        assert!(!db.remove_node(&node_id, "uid 0", 2).unwrap());
         let Enrollment::Enrolled { node_id: again } = db.enroll(&t3, "aa", "h", 1).unwrap() else {
             panic!("expected a new enrollment");
         };
@@ -792,10 +1190,11 @@ mod tests {
     #[test]
     fn token_lifetimes_are_bounded_and_expired_tokens_are_swept() {
         let db = Db::open_memory().unwrap();
-        assert!(db.create_token(Duration::ZERO, 0).is_err());
-        assert!(db.create_token(MAX_TOKEN_TTL + DAY, 0).is_err());
-        db.create_token(Duration::from_secs(10), 0).unwrap();
-        db.create_token(DAY, 20).unwrap();
+        assert!(db.create_token(Duration::ZERO, "uid 0", 0).is_err());
+        assert!(db.create_token(MAX_TOKEN_TTL + DAY, "uid 0", 0).is_err());
+        db.create_token(Duration::from_secs(10), "uid 0", 0)
+            .unwrap();
+        db.create_token(DAY, "uid 0", 20).unwrap();
         let txn = db.db.begin_read().unwrap();
         let table = txn.open_table(TOKENS).unwrap();
         assert_eq!(redb::ReadableTableMetadata::len(&table).unwrap(), 1);
@@ -804,7 +1203,7 @@ mod tests {
     #[test]
     fn a_session_inventory_and_heartbeat_are_recorded() {
         let db = Db::open_memory().unwrap();
-        let (token, _) = db.create_token(DAY, 0).unwrap();
+        let (token, _) = db.create_token(DAY, "uid 0", 0).unwrap();
         let Enrollment::Enrolled { node_id } = db.enroll(&token, "aa", "h", 1).unwrap() else {
             panic!("expected an enrollment");
         };
@@ -832,38 +1231,208 @@ mod tests {
         );
     }
 
+    fn enrolled(db: &Db) -> String {
+        let (token, _) = db.create_token(DAY, "uid 0", 0).unwrap();
+        let Enrollment::Enrolled { node_id } = db.enroll(&token, "aa", "h", 1).unwrap() else {
+            panic!("expected an enrollment");
+        };
+        node_id
+    }
+
     #[test]
-    fn old_audit_rows_are_pruned() {
+    fn a_desired_change_takes_the_next_generation_and_no_change_takes_none() {
         let db = Db::open_memory().unwrap();
-        let txn = db.db.begin_write().unwrap();
-        for i in 0..AUDIT_MAX + 5 {
-            append_audit(&txn, "uid 0", &format!("e{i}"), i).unwrap();
-        }
-        txn.commit().unwrap();
-        let txn = db.db.begin_read().unwrap();
-        let rows = redb::ReadableTableMetadata::len(&txn.open_table(AUDIT).unwrap()).unwrap();
+        let id = enrolled(&db);
+        let set = |ceiling| {
+            db.set_desired(&id, |d| d.ceiling = ceiling, "uid 0", "set a ceiling", 5)
+                .unwrap()
+        };
+        let d = set(Some(4)).unwrap();
+        assert_eq!((d.generation, d.ceiling), (1, Some(4)));
+        assert!(set(Some(4)).is_none());
+        let d = db
+            .set_desired(
+                &id,
+                |d| d.acquisition = Acquisition::Stop,
+                "uid 0",
+                "changed",
+                5,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!((d.generation, d.ceiling), (2, Some(4)));
+        assert_eq!(db.node(&id).unwrap().unwrap().desired, Some(d));
         assert!(
-            rows <= AUDIT_MAX && rows > AUDIT_MAX - AUDIT_PRUNE,
-            "{rows}"
-        );
-        drop(txn);
-        assert_eq!(
-            db.audits(1).unwrap()[0].event,
-            format!("e{}", AUDIT_MAX + 4)
+            db.set_desired(&"0".repeat(32), |d| d.ceiling = None, "uid 0", "changed", 5)
+                .is_err()
         );
     }
 
     #[test]
-    fn the_audit_log_reads_back_in_order_and_display_safe() {
+    fn a_command_is_pending_until_it_has_a_final_outcome() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        let other = {
+            let (token, _) = db.create_token(DAY, "uid 0", 0).unwrap();
+            let Enrollment::Enrolled { node_id } = db.enroll(&token, "bb", "h", 1).unwrap() else {
+                panic!("expected an enrollment");
+            };
+            node_id
+        };
+        let drain = db
+            .issue_command(&id, Operation::Drain, DAY, "uid 0", 10)
+            .unwrap();
+        db.issue_command(&other, Operation::Quarantine, DAY, "uid 0", 10)
+            .unwrap();
+        assert_eq!(
+            db.pending_commands(&id, 11).unwrap(),
+            std::slice::from_ref(&drain)
+        );
+        let ack = |outcome| CommandAck {
+            id: drain.id.clone(),
+            outcome,
+        };
+        assert!(db.record_ack(&id, &ack(Outcome::Accepted), 12).unwrap());
+        // Under way is still pending; recording the same outcome again is no news.
+        assert_eq!(db.pending_commands(&id, 13).unwrap().len(), 1);
+        assert!(!db.record_ack(&id, &ack(Outcome::Accepted), 13).unwrap());
+        assert!(db.record_ack(&id, &ack(Outcome::Done), 14).unwrap());
+        assert!(db.pending_commands(&id, 15).unwrap().is_empty());
+        // A late `accepted` does not reopen it, nor another outcome replace the final one.
+        assert!(!db.record_ack(&id, &ack(Outcome::Accepted), 16).unwrap());
+        assert!(!db.record_ack(&id, &ack(Outcome::Expired), 16).unwrap());
+        let row = db
+            .node_commands(&id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.command.id == drain.id)
+            .unwrap();
+        assert_eq!(row.outcome, Some(Outcome::Done));
+        let events: Vec<String> = db
+            .audits(Some(&id), 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert!(events[0].starts_with("uid 0 issued drain"), "{events:?}");
+        assert_eq!(events.len(), 3, "{events:?}");
+        // An unanswered command past its expiry is not resent; another node's is not ours.
+        db.issue_command(&id, Operation::Release, Duration::from_secs(5), "uid 0", 20)
+            .unwrap();
+        assert!(db.pending_commands(&id, 30).unwrap().is_empty());
+        assert_eq!(db.node_commands(&other).unwrap().len(), 1);
+        assert!(
+            db.issue_command(&"0".repeat(32), Operation::Drain, DAY, "uid 0", 1)
+                .is_err()
+        );
+    }
+
+    /// A hub restored from a backup may be behind the generation a node applied; it moves
+    /// past the node's rather than send what the node would ignore.
+    #[test]
+    fn a_node_ahead_of_the_hub_gets_the_desired_state_reissued_past_it() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        db.set_desired(&id, |d| d.ceiling = Some(4), "uid 0", "set a ceiling", 1)
+            .unwrap();
+        let report = |applied| Report {
+            applied_generation: applied,
+            ..Report::default()
+        };
+        db.record_report(&id, report(Some(1)), 2).unwrap();
+        assert_eq!(
+            db.node(&id).unwrap().unwrap().desired.unwrap().generation,
+            1
+        );
+        db.record_report(&id, report(Some(9)), 3).unwrap();
+        let desired = db.node(&id).unwrap().unwrap().desired.unwrap();
+        assert_eq!((desired.generation, desired.ceiling), (10, Some(4)));
+        // And a change takes the generation after both.
+        db.record_report(&id, report(Some(12)), 4).unwrap();
+        let next = db
+            .set_desired(&id, |d| d.ceiling = None, "uid 0", "lifted the ceiling", 5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.generation, 14);
+        let events: Vec<String> = db
+            .audits(Some(&id), 20)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.contains("re-issued the desired state as generation 10")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn old_audit_rows_and_settled_commands_are_pruned() {
+        let db = Db::open_memory().unwrap();
+        let txn = db.db.begin_write().unwrap();
+        for i in 0..AUDIT_MAX + 5 {
+            append_audit(&txn, Some("n"), "uid 0", &format!("e{i}"), i).unwrap();
+        }
+        txn.commit().unwrap();
+        let txn = db.db.begin_read().unwrap();
+        let rows = redb::ReadableTableMetadata::len(&txn.open_table(AUDIT).unwrap()).unwrap();
+        let indexed =
+            redb::ReadableTableMetadata::len(&txn.open_table(AUDIT_BY_NODE).unwrap()).unwrap();
+        assert!(
+            rows <= AUDIT_MAX && rows > AUDIT_MAX - AUDIT_PRUNE,
+            "{rows}"
+        );
+        assert_eq!(rows, indexed);
+        drop(txn);
+        assert_eq!(
+            db.audits(Some("n"), 1).unwrap()[0].event,
+            format!("e{}", AUDIT_MAX + 4)
+        );
+
+        let id = enrolled(&db);
+        let old = db
+            .issue_command(&id, Operation::Release, DAY, "uid 0", 0)
+            .unwrap();
+        db.record_ack(
+            &id,
+            &CommandAck {
+                id: old.id,
+                outcome: Outcome::Done,
+            },
+            1,
+        )
+        .unwrap();
+        db.issue_command(&id, Operation::Release, DAY, "uid 0", 2 + COMMAND_KEEP)
+            .unwrap();
+        assert_eq!(db.node_commands(&id).unwrap().len(), 1);
+        assert!(db.remove_node(&id, "uid 0", 3 + COMMAND_KEEP).unwrap());
+        assert!(db.node_commands(&id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_audit_log_reads_back_in_order_and_by_node() {
         let db = Db::open_memory().unwrap();
         for i in 0..5u64 {
-            audit(&db, &format!("event {i}"), i);
+            let node = if i % 2 == 0 { Some("a") } else { Some("b") };
+            let txn = db.db.begin_write().unwrap();
+            append_audit(&txn, node, "uid 0", &format!("event {i}"), i).unwrap();
+            txn.commit().unwrap();
         }
-        audit(&db, "stopped a VM\u{1b}[2J", 9);
-        let all = db.audits(100).unwrap();
+        let txn = db.db.begin_write().unwrap();
+        append_audit(&txn, None, "uid 0", "issued a token\u{1b}[2J", 9).unwrap();
+        txn.commit().unwrap();
+        let all = db.audits(None, 100).unwrap();
         assert_eq!(all.len(), 6);
-        assert_eq!(all[5].event, "stopped a VM[2J");
-        assert_eq!(db.audits(2).unwrap()[0].event, "event 4");
+        assert_eq!(all[5].event, "issued a token[2J");
+        let a: Vec<_> = db
+            .audits(Some("a"), 2)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert_eq!(a, ["event 2", "event 4"]);
     }
 
     #[test]
@@ -928,7 +1497,7 @@ mod tests {
         assert_eq!(db.end_ui_sessions(None, "uid 0", 1200).unwrap(), 1);
         assert!(db.ui_sessions(1200).unwrap().is_empty());
         let events: Vec<String> = db
-            .audits(20)
+            .audits(None, 20)
             .unwrap()
             .into_iter()
             .map(|r| r.event)

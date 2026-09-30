@@ -28,8 +28,10 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::server::{Hub, Reach};
+use crate::ops;
+use crate::server::Hub;
 use crate::store::{Role, UiSession};
+use vk_fleet_proto::{Acquisition, Command, DesiredState, Operation};
 
 /// Bumped only for a change an older peer could misread.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -53,6 +55,23 @@ enum Call {
     ListNodes,
     RemoveNode {
         id: String,
+    },
+    /// `None` lifts the ceiling.
+    SetCeiling {
+        id: String,
+        ceiling: Option<u32>,
+    },
+    SetAcquisition {
+        id: String,
+        acquisition: Acquisition,
+    },
+    Command {
+        id: String,
+        operation: Operation,
+    },
+    Audit {
+        node: Option<String>,
+        limit: usize,
     },
     UiLogin {
         role: Role,
@@ -92,21 +111,7 @@ pub struct CreatedToken {
     pub expires_at: u64,
 }
 
-/// One row of `vk-hub nodes`: what the database holds about a node, joined with whether it
-/// has a session open now.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeView {
-    pub id: String,
-    pub hostname: String,
-    pub connected: bool,
-    pub last_seen: Option<u64>,
-    pub vk: Option<String>,
-    pub cpus: Option<u32>,
-    pub mem_total_mib: Option<u64>,
-    pub committed_mib: Option<u64>,
-    pub budget_mib: Option<u64>,
-    pub desired_concurrency: Option<u32>,
-}
+use crate::ops::NodeView;
 
 /// A web UI sign-in link, and when it stops working.
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,6 +119,9 @@ pub struct LoginLink {
     pub url: String,
     pub expires_at: u64,
 }
+
+/// One audit line, as `vk-hub audit` prints it.
+pub type AuditView = crate::store::AuditRow;
 
 /// Bind the admin socket at `path`, replacing one a hub that is gone left behind.
 ///
@@ -238,14 +246,26 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
     let actor = format!("uid {uid}");
     let value = match envelope.call {
         Call::CreateToken { ttl_secs } => {
-            let (token, expires_at) = hub
-                .db
-                .create_token(Duration::from_secs(ttl_secs), crate::now_secs())?;
+            let (token, expires_at) =
+                hub.db
+                    .create_token(Duration::from_secs(ttl_secs), &actor, crate::now_secs())?;
             // The token itself is never logged: it is the credential.
             eprintln!("vk-hub: admin: uid {uid} issued an enrollment token valid for {ttl_secs}s");
             serde_json::to_value(CreatedToken { token, expires_at })?
         }
-        Call::ListNodes => serde_json::to_value(node_views(hub)?)?,
+        Call::ListNodes => serde_json::to_value(ops::node_views(hub)?)?,
+        Call::SetCeiling { id, ceiling } => {
+            serde_json::to_value(ops::set_ceiling(hub, &actor, &id, ceiling)?)?
+        }
+        Call::SetAcquisition { id, acquisition } => {
+            serde_json::to_value(ops::set_acquisition(hub, &actor, &id, acquisition)?)?
+        }
+        Call::Command { id, operation } => {
+            serde_json::to_value(ops::command(hub, &actor, &id, operation)?)?
+        }
+        Call::Audit { node, limit } => {
+            serde_json::to_value(hub.db.audits(node.as_deref(), limit)?)?
+        }
         Call::UiLogin { role, ttl_secs } => {
             let Some(base) = &hub.ui_url else {
                 bail!("the web UI is not being served");
@@ -280,7 +300,7 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
             serde_json::to_value(ended)?
         }
         Call::RemoveNode { id } => {
-            let removed = hub.db.remove_node(&id)?;
+            let removed = hub.db.remove_node(&id, &actor, crate::now_secs())?;
             if removed {
                 hub.revoke(&id);
             }
@@ -293,34 +313,6 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
         }
     };
     Ok(value)
-}
-
-/// Every enrolled node, as `vk-hub nodes` shows it, ordered by hostname.
-fn node_views(hub: &Hub) -> Result<Vec<NodeView>> {
-    let mut views: Vec<NodeView> = hub
-        .db
-        .nodes()?
-        .into_iter()
-        .map(|(id, row)| {
-            let reach = hub.reach(&id);
-            let inventory = row.inventory.as_ref();
-            let admission = row.heartbeat.as_ref().and_then(|h| h.admission.as_ref());
-            NodeView {
-                connected: reach == Reach::Connected,
-                hostname: row.hostname.clone(),
-                last_seen: row.last_seen,
-                vk: inventory.map(|i| i.versions.vk.clone()),
-                cpus: inventory.map(|i| i.hardware.cpus),
-                mem_total_mib: inventory.and_then(|i| i.hardware.mem_total_mib),
-                committed_mib: admission.map(|a| a.committed_mib),
-                budget_mib: admission.and_then(|a| a.budget_mib),
-                desired_concurrency: row.heartbeat.as_ref().and_then(|h| h.desired_concurrency),
-                id,
-            }
-        })
-        .collect();
-    views.sort_by(|a, b| (&a.hostname, &a.id).cmp(&(&b.hostname, &b.id)));
-    Ok(views)
 }
 
 /// The running hub, reached over its admin socket. One short connection per call.
@@ -351,6 +343,39 @@ impl Client {
     /// Whether there was such a node to remove.
     pub fn remove_node(&self, id: &str) -> Result<bool> {
         self.call(Call::RemoveNode { id: id.to_string() })
+    }
+
+    /// The new desired state, or `None` when it was already so.
+    pub fn set_ceiling(&self, id: &str, ceiling: Option<u32>) -> Result<Option<DesiredState>> {
+        self.call(Call::SetCeiling {
+            id: id.to_string(),
+            ceiling,
+        })
+    }
+
+    pub fn set_acquisition(
+        &self,
+        id: &str,
+        acquisition: Acquisition,
+    ) -> Result<Option<DesiredState>> {
+        self.call(Call::SetAcquisition {
+            id: id.to_string(),
+            acquisition,
+        })
+    }
+
+    pub fn command(&self, id: &str, op: Operation) -> Result<Command> {
+        self.call(Call::Command {
+            id: id.to_string(),
+            operation: op,
+        })
+    }
+
+    pub fn audit(&self, node: Option<&str>, limit: usize) -> Result<Vec<AuditView>> {
+        self.call(Call::Audit {
+            node: node.map(str::to_string),
+            limit,
+        })
     }
 
     pub fn ui_login(&self, role: Role, ttl: Duration) -> Result<LoginLink> {
@@ -519,5 +544,22 @@ mod tests {
         );
         let ended = dispatch(br#"{"v":1,"call":{"op":"ui-logout","id":null}}"#, &hub, 0).unwrap();
         assert_eq!(ended, 1);
+    }
+
+    #[test]
+    fn a_zero_ceiling_and_operations_not_built_are_refused() {
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()));
+        let id = "ab".repeat(16);
+        let call = |call: &str| dispatch(format!(r#"{{"v":1,"call":{call}}}"#).as_bytes(), &hub, 0);
+        let err = call(&format!(
+            r#"{{"op":"set-ceiling","id":"{id}","ceiling":0}}"#
+        ))
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("stop acquisition"), "{err:#}");
+        let err = call(&format!(
+            r#"{{"op":"command","id":"{id}","operation":{{"kind":"reset"}}}}"#
+        ))
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("not implemented"), "{err:#}");
     }
 }

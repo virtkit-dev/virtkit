@@ -2,9 +2,11 @@
 
 Status: proposal, implemented in part and experimental: the list of the VMs a host runs
 (`vk workloads`) and local mode's web UI showing it and acting on it (`vk-hub local`),
-signed into with links it prints; enrollment, the node session, inventory and heartbeats
-(`vk-hub serve`, `token create`, `nodes`; `vk node join`, `run`). The hub observes its nodes
-only — nothing it steers is built yet.
+signed into with links it prints; enrollment, the node session, inventory and heartbeats;
+desired state (hub ceiling, stopping acquisition), drain and quarantine, with the node
+applying them and the hub auditing them (`vk-hub nodes ceiling`, `stop`, `resume`, `drain`,
+`undrain`, `quarantine`, `release`, `vk-hub audit`). Updates, resets, the GitLab API pause and
+the fleet's web UI are not built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -99,7 +101,8 @@ A node applies a desired-state generation at most once, and journals every comma
 acting on it, so a command redelivered after a reconnect is recognized and not repeated. It
 repeats each command's outcome until the hub says it has stored it, and the hub resends
 desired state to a node that reports an older generation, and every command without a final
-outcome. A lost connection means the node's state is unknown, not that it stopped.
+outcome. A command the node never takes expires after a day. A lost connection means the
+node's state is unknown, not that it stopped.
 
 **Losing the hub does not stop the fleet.** A disconnected node keeps running CI under its
 local policy and the last desired state it applied. A drain or quarantine it has persisted
@@ -462,7 +465,11 @@ browser is not built.
   another name that resolves to the UI's address reaches nothing (DNS rebinding); a reverse
   proxy in front of the UI must pass the `Host` it was asked for.
 - The hub runs on its own host; its database and secrets are backed up, and a restored hub
-  reconciles against the nodes before it sends anything.
+  reconciles against the nodes before it sends anything: it sends desired state only in
+  answer to a node's report of the generation it applied, and a node that reports one newer
+  than the hub's own gets the hub's desired state re-issued as the generation after it. A
+  node, for its part, forgets the generation it applied when it is enrolled anew or with
+  another hub, since generations count for one hub and one enrollment.
 
 ## Phase 2: generic jobs and docker-executor VMs
 

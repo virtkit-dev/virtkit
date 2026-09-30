@@ -35,7 +35,7 @@ fn keypair() -> Ed25519KeyPair {
 
 fn token(hub: &Hub) -> String {
     hub.db
-        .create_token(Duration::from_secs(60), now_secs())
+        .create_token(Duration::from_secs(60), "uid 0", now_secs())
         .unwrap()
         .0
 }
@@ -272,7 +272,7 @@ async fn a_removed_node_is_revoked_mid_session_and_refused_after() {
         open(&mut ws, &node_id, &"0a".repeat(16), &key).await,
         HubMsg::Welcome { .. }
     ));
-    assert!(hub.db.remove_node(&node_id).unwrap());
+    assert!(hub.db.remove_node(&node_id, "uid 0", now_secs()).unwrap());
     hub.revoke(&node_id);
     let HubMsg::Refused { code, .. } = receive(&mut ws).await else {
         panic!("expected a refusal");
@@ -424,10 +424,44 @@ fn ttls_parse_within_bounds() {
     assert_eq!(human_duration(Duration::from_secs(90)), "90s");
 }
 
+/// The cell under `column` in `line`, by where the header puts the column.
+fn cell<'a>(header: &str, line: &'a str, column: &str) -> &'a str {
+    let names = [
+        "ID",
+        "NAME",
+        "REACH",
+        "STATE",
+        "ACQUIRE",
+        "CEILING",
+        "CONC",
+        "SYNC",
+        "LAST SEEN",
+        "VK",
+        "CPUS",
+        "RAM",
+        "ADMITTED",
+    ];
+    let at = |name: &str| {
+        header
+            .find(&format!("{name} "))
+            .or_else(|| header.find(name))
+            .unwrap()
+    };
+    let start = at(column);
+    let next = names
+        .iter()
+        .map(|n| at(n))
+        .filter(|&p| p > start)
+        .min()
+        .unwrap_or(line.len());
+    line.get(start..next.min(line.len())).unwrap_or("").trim()
+}
+
 #[test]
-fn the_nodes_table_lines_up_and_marks_what_is_unknown() {
+fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
+    use vk_fleet_proto::{Acquisition, Concurrency, DesiredState, NodeState, Report};
     let nodes = [
-        admin::NodeView {
+        ops::NodeView {
             id: "a".repeat(32),
             hostname: "ci-1".into(),
             connected: true,
@@ -437,34 +471,172 @@ fn the_nodes_table_lines_up_and_marks_what_is_unknown() {
             mem_total_mib: Some(512 * 1024),
             committed_mib: Some(8 * 1024),
             budget_mib: Some(400 * 1024),
-            desired_concurrency: Some(12),
+            desired: Some(DesiredState {
+                generation: 3,
+                ceiling: Some(4),
+                acquisition: Acquisition::Stop,
+            }),
+            report: Some(Report {
+                applied_generation: Some(2),
+                state: NodeState::Draining,
+                acquisition: Acquisition::Run,
+                concurrency: Some(Concurrency {
+                    estimate: Some(9),
+                    hub_ceiling: Some(6),
+                    local_ceiling: None,
+                    effective: Some(6),
+                }),
+                runner_state: Some(vk_fleet_proto::RunnerState::Quitting),
+                unsupported: vec!["stopping acquisition: external".into()],
+                concurrency_error: Some("bad mem".into()),
+                ..Report::default()
+            }),
+            pending_commands: 1,
         },
-        admin::NodeView {
+        ops::NodeView {
             id: "b".repeat(32),
             hostname: "ci-2".into(),
-            connected: false,
-            last_seen: None,
-            vk: None,
-            cpus: None,
-            mem_total_mib: None,
-            committed_mib: None,
-            budget_mib: None,
-            desired_concurrency: None,
+            ..ops::NodeView::default()
         },
     ];
     let table = render_nodes(&nodes, 1000);
     let lines: Vec<&str> = table.lines().collect();
-    assert_eq!(lines.len(), 3);
-    assert!(lines[0].starts_with("ID "));
-    let a = "a".repeat(32);
-    let b = "b".repeat(32);
+    assert_eq!(lines.len(), 5, "{table}");
     assert_eq!(
-        lines[1],
-        format!("{a}  ci-1  connected    5s ago     0.80.0  64    512G  8G/400G   12")
+        lines[3],
+        "ci-1: cannot comply: stopping acquisition: external"
     );
-    assert_eq!(
-        lines[2],
-        format!("{b}  ci-2  unreachable  never      -       -     -     -         -")
-    );
+    assert_eq!(lines[4], "ci-1: cannot set its concurrency: bad mem");
+    let (header, a, b) = (lines[0], lines[1], lines[2]);
+    assert!(header.starts_with("ID "));
+    for (column, want) in [
+        ("NAME", "ci-1"),
+        ("REACH", "connected"),
+        ("STATE", "draining, 1 pending"),
+        ("ACQUIRE", "stop (node: run, quitting)"),
+        ("CEILING", "4 (node: 6)"),
+        ("CONC", "6"),
+        ("SYNC", "behind (2<3)"),
+        ("LAST SEEN", "5s ago"),
+        ("ADMITTED", "8G/400G"),
+    ] {
+        assert_eq!(cell(header, a, column), want, "{column}\n{table}");
+    }
+    for (column, want) in [
+        ("REACH", "unreachable"),
+        ("STATE", "-"),
+        ("ACQUIRE", "run"),
+        ("CEILING", "-"),
+        ("SYNC", "-"),
+        ("LAST SEEN", "never"),
+    ] {
+        assert_eq!(cell(header, b, column), want, "{column}\n{table}");
+    }
     assert_eq!(ago(10_000, 10_000 - 7300), Duration::from_secs(7200));
+}
+
+#[test]
+fn audit_times_are_utc() {
+    assert_eq!(utc(0), "1970-01-01T00:00:00Z");
+    assert_eq!(utc(951_782_400), "2000-02-29T00:00:00Z");
+    assert_eq!(utc(1_790_755_279), "2026-09-30T08:01:19Z");
+}
+
+/// Desired state goes to a node that reports itself behind, and pending commands on every
+/// session until the node reports them finished; the node's acks are recorded and audited.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lagging_node_gets_desired_state_and_commands_until_they_are_done() {
+    use vk_fleet_proto::{Acquisition, CommandAck, Operation, Outcome, Report};
+    let (addr, hub) = start().await;
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    let desired = hub
+        .db
+        .set_desired(
+            &node_id,
+            |d| d.ceiling = Some(3),
+            "uid 0",
+            "set a ceiling",
+            1,
+        )
+        .unwrap()
+        .unwrap();
+    let drain = hub
+        .db
+        .issue_command(
+            &node_id,
+            Operation::Drain,
+            Duration::from_secs(600),
+            "uid 0",
+            now_secs(),
+        )
+        .unwrap();
+    let report = |applied| {
+        NodeMsg::Report(Report {
+            applied_generation: applied,
+            ..Report::default()
+        })
+    };
+
+    let mut ws = dial(addr).await;
+    assert!(matches!(
+        open(&mut ws, &node_id, &"0d".repeat(16), &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    send(&mut ws, &report(None)).await;
+    assert_eq!(receive(&mut ws).await, HubMsg::Desired(desired.clone()));
+    assert_eq!(receive(&mut ws).await, HubMsg::Command(drain.clone()));
+    let accepted = CommandAck {
+        id: drain.id.clone(),
+        outcome: Outcome::Accepted,
+    };
+    send(&mut ws, &NodeMsg::Ack(accepted.clone())).await;
+    assert_eq!(receive(&mut ws).await, HubMsg::Recorded(accepted));
+    // A change while connected is sent at once.
+    hub.db
+        .set_desired(
+            &node_id,
+            |d| d.acquisition = Acquisition::Stop,
+            "uid 0",
+            "stopped acquisition",
+            1,
+        )
+        .unwrap();
+    hub.kick(&node_id);
+    let HubMsg::Desired(second) = receive(&mut ws).await else {
+        panic!("expected desired state");
+    };
+    assert_eq!(second.generation, 2);
+    ws.close(None).await.unwrap();
+
+    // Reconnected still behind, with the drain under way: both again.
+    let mut ws = dial(addr).await;
+    open(&mut ws, &node_id, &"0d".repeat(16), &key).await;
+    send(&mut ws, &report(Some(1))).await;
+    assert_eq!(receive(&mut ws).await, HubMsg::Desired(second));
+    assert_eq!(receive(&mut ws).await, HubMsg::Command(drain.clone()));
+    let done = CommandAck {
+        id: drain.id.clone(),
+        outcome: Outcome::Done,
+    };
+    send(&mut ws, &NodeMsg::Ack(done.clone())).await;
+    assert_eq!(receive(&mut ws).await, HubMsg::Recorded(done));
+    assert!(
+        hub.db
+            .pending_commands(&node_id, now_secs())
+            .unwrap()
+            .is_empty()
+    );
+    let events: Vec<String> = hub
+        .db
+        .audits(Some(&node_id), 100)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .collect();
+    assert!(
+        events.iter().any(|e| e.ends_with("(drain): done")),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|e| e == "state ready"), "{events:?}");
 }

@@ -22,8 +22,14 @@ All notable changes to virtkit will be documented in this file.
   and keeps what each one reports about itself. `vk-hub nodes` lists them: whether each is
   connected, when it was last seen, its `vk` version, CPUs and memory, the memory its CI jobs
   have committed against the budget, and the concurrency it wants; `vk-hub nodes remove`
-  takes one out of the fleet. The hub only observes for now; it does not steer its hosts
-  yet.
+  takes one out of the fleet.
+- **Experimental: `vk-hub` steers its hosts.** `vk-hub nodes ceiling <id> <n|none>` caps how
+  many jobs a host's runner accepts, `nodes stop` and `resume` stop and restart it taking
+  jobs, `nodes drain` and `undrain` empty a host and bring it back, and `nodes quarantine`
+  keeps a host out of work until `nodes release`. A host that is offline gets what changed
+  when it reconnects. `vk-hub nodes` shows what the hub asked beside what each host reports,
+  which hosts have not caught up, and what a host says it cannot do; `vk-hub audit` lists
+  every operator action and what the hosts made of it.
 - **Experimental: `vk node join` and `vk node run` make a host a member of a fleet.**
   `vk node join https://hub --token -` enrolls the host with a `vk-hub` once, reading the
   token on stdin (or `--token-file`), and refuses while `vk check` fails on KVM, the VMM or

@@ -1,6 +1,7 @@
 //! One node's WebSocket session: the hello/challenge/auth handshake against the key pinned at
 //! enrollment, then inventory and heartbeats into the database until the node goes away.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -226,9 +227,9 @@ async fn handshake(ws: &mut Ws, hub: &Hub, exported: Exported) -> Result<Node, R
     })
 }
 
-/// The authenticated part: store what the node reports, ping it every heartbeat so it can
-/// tell a dead hub from a quiet one, and end when it goes quiet itself. `Ok` carries why the
-/// session ended normally.
+/// The authenticated part: store what the node reports, send it what the hub wants of it,
+/// ping it every heartbeat so it can tell a dead hub from a quiet one, and end when it goes
+/// quiet itself. `Ok` carries why the session ended normally.
 async fn serve(
     ws: &mut Ws,
     hub: &Hub,
@@ -240,6 +241,7 @@ async fn serve(
     let mut ping = tokio::time::interval(HEARTBEAT);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut deadline = tokio::time::Instant::now() + quiet;
+    let mut steer = Steer::default();
     loop {
         tokio::select! {
             () = ending.notify.notified() => {
@@ -255,6 +257,7 @@ async fn serve(
                 refuse(ws, code, reason).await;
                 return Ok(why);
             }
+            () = ending.kick.notified() => steer.sync(ws, hub, node).await?,
             _ = ping.tick() => {
                 tokio::time::timeout(HEARTBEAT, ws.send(Message::Ping(Default::default())))
                     .await
@@ -285,14 +288,58 @@ async fn serve(
                 hub.heard(&node.id, session);
                 let msg: NodeMsg = serde_json::from_str(text.as_str())
                     .context("the node sent a message this hub does not understand")?;
-                record(hub, node, msg).await?;
+                record(ws, hub, node, &mut steer, msg).await?;
             }
         }
     }
 }
 
-/// Store one message of an authenticated session.
-async fn record(hub: &Hub, node: &Node, msg: NodeMsg) -> Result<()> {
+/// What this session knows of the node's state and has sent it, so desired state goes to a
+/// node that reports itself behind, once per generation, and each pending command once.
+#[derive(Default)]
+struct Steer {
+    /// The generation the node last reported applying; `Some` once it has reported at all —
+    /// nothing is sent before, since the report is what says what the node lacks.
+    applied: Option<Option<u64>>,
+    sent_generation: Option<u64>,
+    sent_commands: HashSet<String>,
+}
+
+impl Steer {
+    async fn sync(&mut self, ws: &mut Ws, hub: &Hub, node: &Node) -> Result<()> {
+        let Some(applied) = self.applied else {
+            return Ok(());
+        };
+        let db = hub.db.clone();
+        let id = node.id.clone();
+        let (row, pending) = tokio::task::spawn_blocking(move || {
+            anyhow::Ok((db.node(&id)?, db.pending_commands(&id, crate::now_secs())?))
+        })
+        .await??;
+        if let Some(desired) = row.and_then(|r| r.desired)
+            && applied < Some(desired.generation)
+            && self.sent_generation != Some(desired.generation)
+        {
+            self.sent_generation = Some(desired.generation);
+            send(ws, &HubMsg::Desired(desired)).await?;
+        }
+        for command in pending {
+            if self.sent_commands.insert(command.id.clone()) {
+                send(ws, &HubMsg::Command(command)).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Store one message of an authenticated session, and answer it where it needs an answer.
+async fn record(
+    ws: &mut Ws,
+    hub: &Hub,
+    node: &Node,
+    steer: &mut Steer,
+    msg: NodeMsg,
+) -> Result<()> {
     let db = hub.db.clone();
     let id = node.id.clone();
     let now = crate::now_secs();
@@ -303,19 +350,18 @@ async fn record(hub: &Hub, node: &Node, msg: NodeMsg) -> Result<()> {
         NodeMsg::Heartbeat(heartbeat) => {
             tokio::task::spawn_blocking(move || db.record_heartbeat(&id, heartbeat, now)).await?
         }
-        // No command is sent yet, so an ack answers nothing; noted rather than refused, since
-        // a newer node may acknowledge what an older hub never tracked.
-        NodeMsg::Ack(ack) => {
-            eprintln!(
-                "vk-hub: node {}: acknowledged command {} ({:?})",
-                node.id,
-                vk_fleet_proto::display_safe(&ack.id),
-                ack.outcome
-            );
-            Ok(())
+        NodeMsg::Report(report) => {
+            steer.applied = Some(report.applied_generation);
+            tokio::task::spawn_blocking(move || db.record_report(&id, report, now)).await??;
+            steer.sync(ws, hub, node).await
         }
-        // Nothing is steered yet, so there is nothing a report answers.
-        NodeMsg::Report(_) => Ok(()),
+        NodeMsg::Ack(ack) => {
+            let recorded = ack.clone();
+            tokio::task::spawn_blocking(move || db.record_ack(&id, &ack, now)).await??;
+            // Answered whether or not the command is one this hub issued: an ack for an unknown
+            // one would otherwise be repeated for ever.
+            send(ws, &HubMsg::Recorded(recorded)).await
+        }
         NodeMsg::Hello { .. } | NodeMsg::Auth { .. } => {
             bail!("the node repeated its handshake inside a session")
         }
