@@ -1,13 +1,15 @@
 # Fleet: a hub and its nodes
 
-Status: proposal, implemented in part and experimental: the list of the VMs a host runs
-(`vk workloads`) and local mode's web UI showing it and acting on it (`vk-hub local`),
-signed into with links it prints; enrollment, the node session, inventory and heartbeats;
-desired state (hub ceiling, stopping acquisition), drain and quarantine, with the node
-applying them and the hub auditing them (`vk-hub nodes ceiling`, `stop`, `resume`, `drain`,
-`undrain`, `quarantine`, `release`, `vk-hub audit`); the web UI's live nodes, node and audit
-pages and its steering actions, signed into with links from `vk-hub ui login`. Updates,
-resets, the GitLab API pause and the rest of the web UI are not built yet.
+Status: proposal, implemented in part and experimental: the list of the VMs a host runs (`vk
+workloads`) and local mode's web UI showing it and acting on it (`vk-hub local`), signed
+into with links it prints; enrollment, the node session, inventory and heartbeats; desired
+state (hub ceiling, stopping acquisition), drain and quarantine, with the node applying them
+and the hub auditing them (`vk-hub nodes ceiling`, `stop`, `resume`, `drain`, `undrain`,
+`quarantine`, `release`, `vk-hub audit`); the web UI's live nodes, node and audit pages and
+its steering actions, signed into with links from `vk-hub ui login`; releases held by the
+hub and served to the nodes updating to them (`vk-hub release`, `vk-hub nodes update`).
+Updates on the node, rollouts, resets, the GitLab API pause and the rest of the web UI are
+not built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -294,6 +296,27 @@ Fleet updates add:
 - the same pinning for the gitlab-runner binary;
 - one `vk` binary per job for the job's whole life: executor stages running during a switch
   must not mix versions, which draining guarantees.
+
+Built so far: `vk-hub release add <file> --version <v>` copies a `vk` binary into
+`<data_dir>/releases/`, named by its sha256, and `release list` and `release remove` show and
+delete them — a release a node is still updating to stays. Adding the same bytes as the same
+version again answers with the release already held, so an add retried after its answer was
+lost does not fail. The hub never runs a binary it is
+handed: it holds the database, its TLS key and every node's pinned key, so it only reads the
+file, checking that it is an x86-64 ELF of at most 1 GiB that holds the stated version as a
+string of its own; the version is the operator's to state, and the node's smoke test is what
+proves it. `vk-hub nodes update <id> --release <sha256>` issues the update, which names the
+release by digest and size.
+
+A node downloads the release it was told to from the node listener, `GET
+/v1/releases/<sha256>`, with its node ID, the time and a signature over both, the release and
+the connection's TLS exporter — the session auth's binding — in its headers. The hub serves it
+only to an enrolled node whose pinned key verifies, within five minutes of the hub's clock,
+and which has an update to that release still to finish: the hub is not a download site, and
+no grant sits in a command or the node's journal to be replayed. The body is streamed from the
+file, one download per connection; once authenticated, a download no longer counts against the
+connections the listener allows before authentication, and may hold its connection for up to
+30 minutes.
 
 ## Resets
 

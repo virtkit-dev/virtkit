@@ -44,6 +44,9 @@ const AUDIT_BY_NODE: TableDefinition<(&str, u64), ()> = TableDefinition::new("au
 const UI_LOGINS: TableDefinition<&str, &[u8]> = TableDefinition::new("ui_logins");
 /// Key: `sha256(session secret)`, hex. Value: JSON [`UiSessionRow`].
 const UI_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("ui_sessions");
+/// Key: a `vk` release's sha256, hex. Value: JSON [`ReleaseRow`]; the binary is a file of
+/// that name in the hub's releases directory.
+const RELEASES: TableDefinition<&str, &[u8]> = TableDefinition::new("releases");
 
 /// The most audit rows kept. Bounded by count rather than age: a quiet fleet keeps its history
 /// for years, and a busy one keeps the newest hundred thousand actions and outcomes — months
@@ -189,6 +192,19 @@ impl CommandRow {
         matches!(self.outcome, None | Some(Outcome::Accepted))
     }
 
+    /// Still to be delivered or finished, and not past an expiry the node never answered —
+    /// it would only refuse it. A command the node has accepted runs on past its expiry.
+    fn live(&self, now: u64) -> bool {
+        self.pending() && (self.outcome.is_some() || self.command.expires_at > now)
+    }
+
+    /// [`CommandRow::live`], and an update to release `sha256`: what keeps the release on the
+    /// hub, and what a node's download of it is allowed for.
+    fn updates_to(&self, sha256: &str, now: u64) -> bool {
+        self.live(now)
+            && matches!(&self.command.op, Operation::Update { sha256: s, .. } if s == sha256)
+    }
+
     /// Settled more than `keep` before `now`: a final outcome that old, or an expiry that
     /// old for a command never taken.
     fn settled_before(&self, now: u64, keep: u64) -> bool {
@@ -199,6 +215,27 @@ impl CommandRow {
         };
         now.saturating_sub(settled_at) > keep
     }
+}
+
+/// A `vk` binary the hub holds for its nodes to update to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseRow {
+    /// The version the operator stated, which the binary's `--version` must report.
+    pub version: String,
+    pub size: u64,
+    /// A release key's ed25519 signature over [`vk_fleet_proto::release_message`], base64.
+    #[serde(default)]
+    pub signature: Option<String>,
+    pub added_at: u64,
+    pub added_by: String,
+}
+
+/// A release as `vk-hub release list` shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release {
+    pub sha256: String,
+    #[serde(flatten)]
+    pub row: ReleaseRow,
 }
 
 /// One line of the audit log.
@@ -321,6 +358,8 @@ impl Db {
             .context("opening the sign-in links table")?;
         txn.open_table(UI_SESSIONS)
             .context("opening the web UI sessions table")?;
+        txn.open_table(RELEASES)
+            .context("opening the releases table")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db { db })
     }
@@ -640,7 +679,7 @@ impl Db {
     /// their expiry that it never answered — it would only refuse them.
     pub fn pending_commands(&self, id: &str, now: u64) -> Result<Vec<Command>> {
         let mut rows = self.node_commands(id)?;
-        rows.retain(|r| r.pending() && (r.outcome.is_some() || r.command.expires_at > now));
+        rows.retain(|r| r.live(now));
         rows.sort_by_key(|r| r.issued_at);
         Ok(rows.into_iter().map(|r| r.command).collect())
     }
@@ -917,6 +956,115 @@ impl Db {
         Ok(out)
     }
 
+    /// Record release `sha256`, whose binary is already in place, audited as `actor`'s. A
+    /// release already recorded is refused: its version and signature are what nodes were
+    /// told, and replacing them under a command in flight would change what it means.
+    pub fn add_release(&self, sha256: &str, row: &ReleaseRow, actor: &str) -> Result<()> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            let mut table = txn.open_table(RELEASES)?;
+            if let Some(existing) = table.get(sha256)? {
+                let existing = decode::<ReleaseRow>(existing.value())?;
+                bail!(
+                    "release {sha256} is already held, as version {}",
+                    existing.version
+                );
+            }
+            table.insert(sha256, encode(row)?.as_slice())?;
+            let event = format!(
+                "{actor} added release {} as vk {}{}",
+                short(sha256),
+                row.version,
+                if row.signature.is_some() {
+                    ", signed"
+                } else {
+                    ""
+                }
+            );
+            append_audit(&txn, None, actor, &event, row.added_at)?;
+        }
+        txn.commit().context("recording a release")
+    }
+
+    pub fn release(&self, sha256: &str) -> Result<Option<ReleaseRow>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        txn.open_table(RELEASES)?
+            .get(sha256)?
+            .map(|g| decode::<ReleaseRow>(g.value()))
+            .transpose()
+    }
+
+    /// Every release, newest first.
+    pub fn releases(&self) -> Result<Vec<Release>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(RELEASES)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            out.push(Release {
+                sha256: key.value().to_string(),
+                row: decode(value.value())?,
+            });
+        }
+        out.sort_by(|a, b| (b.row.added_at, &b.sha256).cmp(&(a.row.added_at, &a.sha256)));
+        Ok(out)
+    }
+
+    /// The one release whose sha256 starts with `prefix`, of at least 8 hex digits.
+    pub fn resolve_release(&self, prefix: &str) -> Result<Release> {
+        if prefix.len() < 8
+            || !prefix
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            bail!("{prefix:?}: name a release by its sha256, or at least its first 8 hex digits");
+        }
+        let mut found = self
+            .releases()?
+            .into_iter()
+            .filter(|r| r.sha256.starts_with(prefix));
+        match (found.next(), found.next()) {
+            (Some(r), None) => Ok(r),
+            (None, _) => bail!("there is no release {prefix}"),
+            (Some(_), Some(_)) => bail!("{prefix} names more than one release; give more digits"),
+        }
+    }
+
+    /// Forget release `sha256`, audited as `actor`'s, unless a command still to finish
+    /// updates a node to it. `Ok(false)` when there was no such release.
+    pub fn remove_release(&self, sha256: &str, actor: &str, now: u64) -> Result<bool> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let removed = {
+            for entry in txn.open_table(COMMANDS)?.iter()? {
+                let row = decode::<CommandRow>(entry?.1.value())?;
+                if row.updates_to(sha256, now) {
+                    bail!(
+                        "node {} is still being updated to this release (command {})",
+                        row.node_id,
+                        row.command.id
+                    );
+                }
+            }
+            let removed = txn.open_table(RELEASES)?.remove(sha256)?.is_some();
+            if removed {
+                let event = format!("{actor} removed release {}", short(sha256));
+                append_audit(&txn, None, actor, &event, now)?;
+            }
+            removed
+        };
+        txn.commit().context("removing a release")?;
+        Ok(removed)
+    }
+
+    /// Whether node `id` has a command still to finish that updates it to `sha256`: the one
+    /// thing a node's download of that release is allowed for.
+    pub fn updating_to(&self, id: &str, sha256: &str, now: u64) -> Result<bool> {
+        Ok(self
+            .node_commands(id)?
+            .iter()
+            .any(|c| c.updates_to(sha256, now)))
+    }
+
     /// Rewrite one node's row. A node removed meanwhile is an error: its session is then
     /// one the hub no longer recognizes.
     fn update(
@@ -964,6 +1112,11 @@ impl Db {
         txn.commit().context("updating a node")?;
         Ok(out)
     }
+}
+
+/// A sha256's first 12 hex digits, as releases are named in lines people read.
+pub(crate) fn short(sha256: &str) -> &str {
+    sha256.get(..12).unwrap_or(sha256)
 }
 
 /// What the hub wants of a node it has asked nothing of.
@@ -1069,9 +1222,13 @@ pub(crate) fn operation_name(op: &Operation) -> String {
         Operation::Undrain => "undrain".into(),
         Operation::Quarantine => "quarantine".into(),
         Operation::Release => "release".into(),
-        Operation::Update { version, .. } => {
-            format!("update to {}", vk_fleet_proto::display_safe(version))
-        }
+        Operation::Update {
+            version, sha256, ..
+        } => format!(
+            "update to vk {} ({})",
+            vk_fleet_proto::display_safe(version),
+            short(sha256)
+        ),
         Operation::Reset => "reset".into(),
     }
 }
@@ -1547,6 +1704,59 @@ mod tests {
         assert_eq!(next, [(2, "event 2".into()), (1, "event 1".into())]);
         let a = events(db.audit_page(Some("a"), Some(4), 10).unwrap());
         assert_eq!(a, [(2, "event 2".into()), (0, "event 0".into())]);
+    }
+
+    fn update(sha256: &str) -> Operation {
+        Operation::Update {
+            version: "0.81.0".into(),
+            sha256: sha256.into(),
+            size: 10,
+            signature: None,
+            force: false,
+            within_secs: None,
+        }
+    }
+
+    #[test]
+    fn a_release_is_recorded_once_and_kept_while_a_node_updates_to_it() {
+        let db = Db::open_memory().unwrap();
+        let sha = "ab".repeat(32);
+        let row = ReleaseRow {
+            version: "0.81.0".into(),
+            size: 10,
+            signature: None,
+            added_at: 5,
+            added_by: "uid 0".into(),
+        };
+        db.add_release(&sha, &row, "uid 0").unwrap();
+        assert!(db.add_release(&sha, &row, "uid 0").is_err());
+        assert_eq!(db.resolve_release(&sha[..8]).unwrap().row, row);
+        assert!(db.resolve_release("abab").is_err());
+        assert!(db.resolve_release("cdcdcdcd").is_err());
+        let id = enrolled(&db);
+        let cmd = db
+            .issue_command(&id, update(&sha), DAY, "uid 0", 10)
+            .unwrap();
+        assert!(db.updating_to(&id, &sha, 11).unwrap());
+        assert!(!db.updating_to(&id, &"cd".repeat(32), 11).unwrap());
+        let err = db.remove_release(&sha, "uid 0", 11).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("still being updated"),
+            "{err:#}"
+        );
+        db.record_ack(
+            &id,
+            &CommandAck {
+                id: cmd.id,
+                outcome: Outcome::Done,
+            },
+            12,
+        )
+        .unwrap();
+        assert!(!db.updating_to(&id, &sha, 13).unwrap());
+        assert!(db.remove_release(&sha, "uid 0", 13).unwrap());
+        assert!(!db.remove_release(&sha, "uid 0", 13).unwrap());
+        assert!(db.releases().unwrap().is_empty());
     }
 
     #[test]

@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -23,11 +24,20 @@ use tokio::sync::{Notify, Semaphore, watch};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
-use vk_fleet_proto::{ENROLL_PATH, EnrollRequest, EnrollResponse, ErrorBody, NODE_PATH};
+use vk_fleet_proto::{
+    ENROLL_PATH, EnrollRequest, EnrollResponse, ErrorBody, NODE_PATH, RELEASE_PATH,
+};
 
 use crate::store::{Db, Enrollment};
 
-type Body = Full<Bytes>;
+/// A response body: whole, or a release binary streamed from its file.
+type Body = BoxBody<Bytes, std::io::Error>;
+
+fn full(bytes: impl Into<Bytes>) -> Body {
+    Full::new(bytes.into())
+        .map_err(|never| match never {})
+        .boxed()
+}
 
 /// How often a node heartbeats, told to it at the start of each session. Short under test,
 /// so a quiet session is dropped within a test's patience.
@@ -49,6 +59,10 @@ const LISTEN_BACKLOG: u32 = 1024;
 /// it.
 pub const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a release download may take as a whole: a few hundred megabytes over a slow
+/// link, and a peer that stops reading holds its connection no longer than this.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// Connections at once that have not yet reached a session — in TLS, in HTTP, in an
 /// enrollment. Far above what a fleet of tens of nodes reconnecting together needs, and what
 /// bounds the descriptors and memory an unauthenticated peer can hold. One past it is closed
@@ -67,6 +81,10 @@ pub struct Hub {
     pub(crate) handshakes: Arc<Semaphore>,
     /// The web UI's origin, which its sign-in links start with; `None` with the UI off.
     pub ui_url: Option<String>,
+    /// Where release binaries are kept; `None` for a hub that holds none.
+    releases: Option<std::path::PathBuf>,
+    /// Held by an add or a remove of a release, from its file to its row.
+    releases_lock: Mutex<()>,
     /// Bumped whenever anything a page shows may have changed, for its live updates.
     changes: watch::Sender<u64>,
     /// The same, for one node: what that node's page follows. An entry exists while someone
@@ -111,6 +129,8 @@ impl Hub {
             connections: Arc::new(Semaphore::new(MAX_PRE_AUTH)),
             handshakes: Arc::new(Semaphore::new(MAX_PRE_AUTH)),
             ui_url: None,
+            releases: None,
+            releases_lock: Mutex::new(()),
             changes: watch::Sender::new(0),
             node_changes: Mutex::new(HashMap::new()),
             sessions: watch::Sender::new(0),
@@ -163,6 +183,27 @@ impl Hub {
     /// Wake on the next [`Hub::sessions_changed`].
     pub(crate) fn subscribe_sessions(&self) -> watch::Receiver<u64> {
         self.sessions.subscribe()
+    }
+
+    /// This hub keeping release binaries in `dir`.
+    pub fn with_releases(mut self, dir: std::path::PathBuf) -> Self {
+        self.releases = Some(dir);
+        self
+    }
+
+    /// Where release binaries are kept.
+    pub fn releases_dir(&self) -> Result<&std::path::Path> {
+        self.releases
+            .as_deref()
+            .context("this hub keeps no releases")
+    }
+
+    /// One release add or remove at a time. A panic while it was held left nothing it guards
+    /// half-changed that a later holder could trip on, so poisoning is ignored.
+    pub(crate) fn releases_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.releases_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// This hub with its web UI at `url`.
@@ -275,11 +316,15 @@ pub(crate) trait Stream:
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
 pub(crate) type Io = TokioIo<Box<dyn Stream>>;
 
+/// A connection's place among the unauthenticated ones, which it gives up once it has proved
+/// who it is and goes on to hold the connection for longer: a node downloading a release.
+pub(crate) type PreAuth = Arc<Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>;
+
 /// Serve nodes on `listener` until the process ends.
 pub async fn serve(listener: TcpListener, tls: Option<TlsAcceptor>, hub: Arc<Hub>) -> Result<()> {
     let permits = hub.connections.clone();
-    accept(listener, tls, permits, move |io, peer, exported| {
-        serve_conn(io, hub.clone(), peer, exported)
+    accept(listener, tls, permits, move |io, peer, exported, permit| {
+        serve_conn(io, hub.clone(), peer, exported, permit)
     })
     .await
 }
@@ -294,7 +339,7 @@ pub(crate) async fn accept<F, Fut>(
     conn: F,
 ) -> Result<()>
 where
-    F: Fn(Io, SocketAddr, Exported) -> Fut + Send + Sync + 'static,
+    F: Fn(Io, SocketAddr, Exported, PreAuth) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let conn = Arc::new(conn);
@@ -313,6 +358,7 @@ where
             drop(stream);
             continue;
         };
+        let permit: PreAuth = Arc::new(Mutex::new(Some(permit)));
         let tls = tls.clone();
         let conn = conn.clone();
         tokio::spawn(async move {
@@ -330,7 +376,7 @@ where
                                 return;
                             }
                             let io: Box<dyn Stream> = Box::new(stream);
-                            conn(TokioIo::new(io), peer, Some(exported)).await;
+                            conn(TokioIo::new(io), peer, Some(exported), permit.clone()).await;
                         }
                         Ok(Err(e)) => eprintln!("vk-hub: {peer}: TLS handshake error: {e}"),
                         Err(_) => eprintln!("vk-hub: {peer}: TLS handshake timed out"),
@@ -338,7 +384,7 @@ where
                 }
                 None => {
                     let io: Box<dyn Stream> = Box::new(stream);
-                    conn(TokioIo::new(io), peer, None).await;
+                    conn(TokioIo::new(io), peer, None, permit.clone()).await;
                 }
             }
             drop(permit);
@@ -346,21 +392,42 @@ where
     }
 }
 
-async fn serve_conn(io: Io, hub: Arc<Hub>, peer: SocketAddr, exported: Exported) {
-    let svc = service_fn(move |req| handle(req, hub.clone(), peer, exported));
+async fn serve_conn(io: Io, hub: Arc<Hub>, peer: SocketAddr, exported: Exported, permit: PreAuth) {
+    let downloading = Arc::new(AtomicBool::new(false));
+    let flag = downloading.clone();
+    let svc = service_fn(move |req| {
+        handle(
+            req,
+            hub.clone(),
+            peer,
+            exported,
+            (flag.clone(), permit.clone()),
+        )
+    });
     // `with_upgrades`: a WebSocket is an HTTP/1.1 upgrade, handed over once the 101 is out,
     // which is also when this future ends. The header timeout needs the timer — without one
     // hyper quietly applies none. The connection as a whole is bounded too: a node makes one
-    // request on it, an enrollment or an upgrade, so one kept idle is only one held open.
+    // request on it, an enrollment, an upgrade or a download, so one kept idle is only one
+    // held open. A download, authenticated, gets [`DOWNLOAD_TIMEOUT`] instead.
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(PRE_AUTH_TIMEOUT)
         .serve_connection(io, svc)
         .with_upgrades();
-    match tokio::time::timeout(PRE_AUTH_TIMEOUT * 3, conn).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("vk-hub: {peer}: connection error: {e}"),
-        Err(_) => {}
+    tokio::pin!(conn);
+    let ended = tokio::select! {
+        ended = &mut conn => Some(ended),
+        () = tokio::time::sleep(PRE_AUTH_TIMEOUT * 3) => None,
+    };
+    let ended = match ended {
+        Some(ended) => Some(ended),
+        None if downloading.load(Ordering::Relaxed) => {
+            tokio::time::timeout(DOWNLOAD_TIMEOUT, conn).await.ok()
+        }
+        None => None,
+    };
+    if let Some(Err(e)) = ended {
+        eprintln!("vk-hub: {peer}: connection error: {e}");
     }
 }
 
@@ -369,10 +436,15 @@ async fn handle(
     hub: Arc<Hub>,
     peer: SocketAddr,
     exported: Exported,
+    (downloading, permit): (Arc<AtomicBool>, PreAuth),
 ) -> Result<Response<Body>, Infallible> {
-    let resp = match (req.method(), req.uri().path()) {
+    let path = req.uri().path().to_string();
+    let resp = match (req.method(), path.as_str()) {
         (&Method::POST, ENROLL_PATH) => enroll(req, &hub, peer).await,
         (&Method::GET, NODE_PATH) => Ok(upgrade(req, hub, peer, exported)),
+        (&Method::GET, p) if p.starts_with(RELEASE_PATH) => {
+            download(&req, &hub, peer, exported, (&downloading, &permit)).await
+        }
         _ => Ok(error(StatusCode::NOT_FOUND, "no such endpoint")),
     };
     Ok(resp.unwrap_or_else(|e| {
@@ -437,6 +509,153 @@ async fn enroll(req: Request<Incoming>, hub: &Hub, peer: SocketAddr) -> Result<R
     })
 }
 
+/// `GET /v1/releases/<sha256>`: a release's binary, to a node that proves it is one — by a
+/// signature over [`vk_fleet_proto::download_message`] with its pinned key, bound to this
+/// connection — and has an update to that release still to finish. Nothing else may fetch a
+/// release: the hub is not a download site, and a node learns of a release only from the
+/// command that names it.
+async fn download(
+    req: &Request<Incoming>,
+    hub: &Arc<Hub>,
+    peer: SocketAddr,
+    exported: Exported,
+    (downloading, permit): (&AtomicBool, &PreAuth),
+) -> Result<Response<Body>> {
+    let sha256 = req
+        .uri()
+        .path()
+        .strip_prefix(RELEASE_PATH)
+        .unwrap_or_default()
+        .to_string();
+    if sha256.len() != vk_fleet_proto::SHA256_LEN * 2
+        || !sha256
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Ok(error(StatusCode::NOT_FOUND, "no such release"));
+    }
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let (Some(node_id), Some(at), Some(signature)) = (
+        header(vk_fleet_proto::NODE_HEADER).filter(|id| vk_fleet_proto::valid_id(id)),
+        header(vk_fleet_proto::TIME_HEADER).and_then(|t| t.parse::<u64>().ok()),
+        header(vk_fleet_proto::SIGNATURE_HEADER),
+    ) else {
+        return Ok(error(
+            StatusCode::UNAUTHORIZED,
+            "a release is downloaded by a node, signing for it",
+        ));
+    };
+    let now = crate::now_secs();
+    if now.abs_diff(at) > vk_fleet_proto::DOWNLOAD_SKEW_SECS {
+        return Ok(error(
+            StatusCode::UNAUTHORIZED,
+            "the signed time is too far from the hub's clock",
+        ));
+    }
+    let db = hub.db.clone();
+    let (id, sha) = (node_id.clone(), sha256.clone());
+    let (row, wanted, release) = tokio::task::spawn_blocking(move || {
+        anyhow::Ok((
+            db.node(&id)?,
+            db.updating_to(&id, &sha, now)?,
+            db.release(&sha)?,
+        ))
+    })
+    .await
+    .context("looking a download up")??;
+    let Some(row) = row else {
+        return Ok(error(StatusCode::FORBIDDEN, "no such node"));
+    };
+    let public_key = vk_fleet_proto::from_hex(&row.public_key)
+        .with_context(|| format!("node {node_id} has a corrupt pinned key"))?;
+    let channel = match &exported {
+        Some(exported) => vk_fleet_proto::Channel::Tls(exported),
+        None => vk_fleet_proto::Channel::Plaintext,
+    };
+    let message = vk_fleet_proto::download_message(&node_id, &sha256, at, channel);
+    if !crate::verify(&public_key, &message, &signature) {
+        return Ok(error(
+            StatusCode::FORBIDDEN,
+            "the signature does not match the node's pinned key",
+        ));
+    }
+    let (Some(release), true) = (release, wanted) else {
+        return Ok(error(
+            StatusCode::FORBIDDEN,
+            "this node has no update to that release under way",
+        ));
+    };
+    let path = crate::releases::path(hub.releases_dir()?, &sha256);
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "vk-hub: release {sha256} is recorded but {} is missing",
+                path.display()
+            );
+            return Ok(error(
+                StatusCode::NOT_FOUND,
+                "the release's binary is missing",
+            ));
+        }
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
+    let size = file
+        .metadata()
+        .await
+        .with_context(|| format!("reading {}", path.display()))?
+        .len();
+    if size != release.size {
+        eprintln!(
+            "vk-hub: release {sha256} is recorded as {} bytes but {} holds {size}",
+            release.size,
+            path.display()
+        );
+        return Ok(error(
+            StatusCode::NOT_FOUND,
+            "the release's binary is damaged",
+        ));
+    }
+    downloading.store(true, Ordering::Relaxed);
+    // Authenticated: the connection no longer counts against the ones that are not.
+    drop(
+        permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(),
+    );
+    eprintln!(
+        "vk-hub: {peer}: node {node_id} is downloading release {}",
+        crate::store::short(&sha256)
+    );
+    let chunks = futures::stream::try_unfold(file, |mut file| async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = vec![0u8; 256 * 1024];
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        buf.truncate(n);
+        Ok(Some((hyper::body::Frame::data(Bytes::from(buf)), file)))
+    });
+    let mut resp = Response::new(StreamBody::new(chunks).boxed());
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/octet-stream"),
+    );
+    h.insert(
+        header::CONTENT_LENGTH,
+        header::HeaderValue::from(release.size),
+    );
+    Ok(resp)
+}
+
 /// `GET /v1/node`: answer the WebSocket handshake and run the session on the upgraded
 /// connection.
 fn upgrade(
@@ -490,7 +709,7 @@ fn upgrade(
                 .await;
         crate::session::run(ws, hub, peer, exported).await;
     });
-    let mut resp = Response::new(Body::default());
+    let mut resp = Response::new(full(Bytes::new()));
     *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
     let h = resp.headers_mut();
     h.insert(
@@ -516,7 +735,7 @@ fn json<T: serde::Serialize>(status: StatusCode, value: &T) -> Response<Body> {
     // The protocol's own types, which always serialize; an empty body would be the only
     // outcome of a failure, and the status still says what happened.
     let body = serde_json::to_vec(value).unwrap_or_default();
-    let mut resp = Response::new(Body::from(body));
+    let mut resp = Response::new(full(body));
     *resp.status_mut() = status;
     resp.headers_mut().insert(
         header::CONTENT_TYPE,

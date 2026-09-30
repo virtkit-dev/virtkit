@@ -157,6 +157,11 @@ impl HubConfig {
         self.data_dir.join("hub.db")
     }
 
+    /// Where release binaries are kept.
+    pub fn releases_dir(&self) -> PathBuf {
+        self.data_dir.join("releases")
+    }
+
     /// The admin socket `vk-hub token` and `vk-hub nodes` reach the running hub through.
     pub fn admin_socket(&self) -> PathBuf {
         self.data_dir.join("admin.sock")

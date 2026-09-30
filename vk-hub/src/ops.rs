@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use vk_fleet_proto::{Acquisition, Command, DesiredState, Operation, Report};
 
 use crate::server::{Hub, Reach};
-use crate::store::NodeRow;
+use crate::store::{NodeRow, Release};
 
 /// How long an operator's command waits for its node to come and take it. A day covers a
 /// node rebooting or a hub outage; a drain found a week later is not what anyone meant.
@@ -119,14 +119,35 @@ pub fn set_acquisition(
     Ok(changed)
 }
 
-/// Issue `operation` to node `id`.
+/// Issue `operation` to node `id`. An update is issued by [`update`], which names the release.
 pub fn command(hub: &Hub, actor: &str, id: &str, operation: Operation) -> Result<Command> {
-    if matches!(operation, Operation::Update { .. } | Operation::Reset) {
-        bail!(
-            "{} is not implemented yet",
-            crate::store::operation_name(&operation)
-        );
+    match operation {
+        Operation::Update { .. } => bail!("an update names a release; see `vk-hub nodes update`"),
+        Operation::Reset => bail!("reset is not implemented yet"),
+        _ => issue(hub, actor, id, operation),
     }
+}
+
+/// Update node `id` to the release whose sha256 starts with `release`. `force` lets a node
+/// whose runner is external update without draining it.
+pub fn update(hub: &Hub, actor: &str, id: &str, release: &str, force: bool) -> Result<Command> {
+    let release = hub.db.resolve_release(release)?;
+    issue(hub, actor, id, update_operation(&release, force))
+}
+
+/// The command that updates a node to `release`.
+pub fn update_operation(release: &Release, force: bool) -> Operation {
+    Operation::Update {
+        version: release.row.version.clone(),
+        sha256: release.sha256.clone(),
+        size: release.row.size,
+        signature: release.row.signature.clone(),
+        force,
+        within_secs: None,
+    }
+}
+
+fn issue(hub: &Hub, actor: &str, id: &str, operation: Operation) -> Result<Command> {
     let command = hub
         .db
         .issue_command(id, operation, COMMAND_TTL, actor, crate::now_secs())?;

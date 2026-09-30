@@ -640,3 +640,127 @@ async fn a_lagging_node_gets_desired_state_and_commands_until_they_are_done() {
     );
     assert!(events.iter().any(|e| e == "state ready"), "{events:?}");
 }
+
+/// A fake `vk`: an x86-64 ELF header, then bytes that hold `version` as a string of its own.
+fn fake_vk(version: &str) -> Vec<u8> {
+    let mut bin = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x02\0\x3e\0".to_vec();
+    bin.extend_from_slice(b"\0vk-driver ");
+    bin.extend_from_slice(version.as_bytes());
+    bin.extend_from_slice(&[0u8; 5000]);
+    bin
+}
+
+/// `GET <path>` with `headers`, by hand: the status and the body.
+async fn get_with(addr: SocketAddr, path: &str, headers: &[(&str, String)]) -> (u16, Vec<u8>) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut head = format!("GET {path} HTTP/1.1\r\nHost: hub\r\nConnection: close\r\n");
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await.unwrap();
+    let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let status = std::str::from_utf8(&resp[9..12]).unwrap().parse().unwrap();
+    (status, resp[split + 4..].to_vec())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_is_served_only_to_a_node_updating_to_it_that_signs_for_it() {
+    let dir = std::env::temp_dir().join(format!("vk-hub-releases-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let listener = server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hub = Arc::new(
+        Hub::new(Arc::new(Db::open_memory().unwrap())).with_releases(dir.join("releases")),
+    );
+    tokio::spawn(server::serve(listener, None, hub.clone()));
+
+    let bin = fake_vk("0.81.0");
+    let file = dir.join("vk");
+    std::fs::write(&file, &bin).unwrap();
+    // The version must be in it, and it must be an ELF.
+    assert!(releases::add(&hub, "uid 0", &file, "0.81.1", None).is_err());
+    std::fs::write(dir.join("script"), b"#!/bin/sh\necho 0.81.0\n").unwrap();
+    assert!(releases::add(&hub, "uid 0", &dir.join("script"), "0.81.0", None).is_err());
+    let release = releases::add(&hub, "uid 0", &file, "0.81.0", None).unwrap();
+    assert_eq!(release.row.size, bin.len() as u64);
+    // Added again as the same release — a retry whose answer was lost — it is the same one;
+    // as another version, refused.
+    let again = releases::add(&hub, "uid 0", &file, "0.81.0", None).unwrap();
+    assert_eq!(again, release);
+    let bin2 = fake_vk("0.81.0 0.82.0");
+    std::fs::write(&file, &bin2).unwrap();
+    let other = releases::add(&hub, "uid 0", &file, "0.82.0", None).unwrap();
+    std::fs::write(&file, &bin).unwrap();
+    assert!(releases::add(&hub, "uid 0", &file, "0.82.0", None).is_err());
+    assert!(releases::remove(&hub, "uid 0", &other.sha256).unwrap());
+    let sha = release.sha256.clone();
+
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    let path = format!("{}{sha}", vk_fleet_proto::RELEASE_PATH);
+    let signed = |key: &Ed25519KeyPair, at: u64| {
+        let message = vk_fleet_proto::download_message(
+            &node_id,
+            &sha,
+            at,
+            vk_fleet_proto::Channel::Plaintext,
+        );
+        vec![
+            (vk_fleet_proto::NODE_HEADER, node_id.clone()),
+            (vk_fleet_proto::TIME_HEADER, at.to_string()),
+            (
+                vk_fleet_proto::SIGNATURE_HEADER,
+                vk_fleet_proto::to_hex(key.sign(&message).as_ref()),
+            ),
+        ]
+    };
+    // No update under way: refused, however well signed.
+    assert_eq!(
+        get_with(addr, &path, &signed(&key, now_secs())).await.0,
+        403
+    );
+    ops::update(&hub, "uid 0", &node_id, &sha[..8], false).unwrap();
+    let (status, body) = get_with(addr, &path, &signed(&key, now_secs())).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, bin);
+    assert_eq!(get_with(addr, &path, &[]).await.0, 401);
+    assert_eq!(
+        get_with(addr, &path, &signed(&keypair(), now_secs()))
+            .await
+            .0,
+        403
+    );
+    let stale = now_secs() - vk_fleet_proto::DOWNLOAD_SKEW_SECS - 5;
+    assert_eq!(get_with(addr, &path, &signed(&key, stale)).await.0, 401);
+    // Signed for another release, presented for this one.
+    let other = format!("{}{}", vk_fleet_proto::RELEASE_PATH, "cd".repeat(32));
+    assert_eq!(
+        get_with(addr, &other, &signed(&key, now_secs())).await.0,
+        403
+    );
+
+    // Removal waits for the update, then takes the file too.
+    assert!(releases::remove(&hub, "uid 0", &sha).is_err());
+    let command = hub
+        .db
+        .pending_commands(&node_id, now_secs())
+        .unwrap()
+        .remove(0);
+    hub.db
+        .record_ack(
+            &node_id,
+            &vk_fleet_proto::CommandAck {
+                id: command.id,
+                outcome: vk_fleet_proto::Outcome::Done,
+            },
+            now_secs(),
+        )
+        .unwrap();
+    assert!(releases::remove(&hub, "uid 0", &sha).unwrap());
+    assert!(!dir.join("releases").join(&sha).exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
