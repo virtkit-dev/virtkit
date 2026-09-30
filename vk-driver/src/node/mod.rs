@@ -27,6 +27,7 @@
 mod core;
 mod identity;
 mod inventory;
+mod reset;
 mod runner;
 mod session;
 mod state;

@@ -10,8 +10,8 @@ audit pages and its steering actions, signed into with links from `vk-hub ui log
 releases held by the hub (`vk-hub release`), which nodes update to on trial, checking their
 signatures against keys of their own (`vk release-key`) and rolling back to the previous
 binary when one does not pass (`vk-hub nodes update`); rollouts by wave, with a canary per
-hardware profile (`vk-hub rollout`). Resets, the GitLab API pause, gitlab-runner pinning and
-the rest of the web UI are not built yet.
+hardware profile (`vk-hub rollout`); resets (`vk-hub nodes reset`). Restart, redeploy, the
+GitLab API pause, gitlab-runner pinning and the rest of the web UI are not built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -278,9 +278,9 @@ All of it is persisted on the node, and a restart or a lost hub leaves it where 
 `validating` runs a boot/exec/network smoke test and, when configured, a synthetic job
 before the node goes back to `ready`.
 
-Built so far for updates: an update is taken from `ready`, `draining` or `drained` and drains
-the node first (a drain already under way is joined, and the node returns to `drained`
-after); `maintenance` covers the download and the switch, `validating` the release's trial,
+Built so far for updates and resets (see [Resets](#resets)): an update is taken from
+`ready`, `draining` or `drained` and drains the node first (a drain already under way is
+joined, and the node returns to `drained` after); `maintenance` covers the download and the switch, `validating` the release's trial,
 and the node then returns to the state it came from — or enters a quarantine that arrived
 meanwhile, which is in force from the moment it is received since maintenance takes no jobs.
 While the node still drains, `undrain` or `quarantine` call the update off; once maintenance
@@ -445,6 +445,27 @@ connections the listener allows before authentication, and may hold its connecti
 | redeploy | reinstall the host (Redfish/IPMI and PXE) — only on [managed nodes](#managed-nodes) |
 
 A node without a BMC integration reports redeploy as unavailable.
+
+Built so far: reset. `vk-hub nodes reset <id> [--images]`, or the reset button on a node's
+page — which asks again, on a form of its own, before the reset is issued — drains the node
+like an update does, from `ready`, `draining` or `drained` and only with a managed runner,
+except that the drain is over once the runner has exited and the admission ledger is empty: a
+job supervisor a failed cleanup left running is what a reset is for, not something it waits
+on. In `maintenance` it stops the processes past jobs left: those of the node's user whose
+binary is `vk` (the installed one, one under the node dir, or any so named), a
+`cloud-hypervisor` or a `virtiofsd`, and whose arguments name a path inside one of its job
+dirs, whole or as a `--flag=` value — a shell or a `tail` of a job's log is not one of them.
+Each is sent `SIGTERM` through a pidfd opened while it matched, and `SIGKILL` if it has not
+exited ten seconds later; a `/proc` the node cannot list fails the reset rather than find
+nothing. It then gives back each job dir's network lease, removes the job dirs under
+`<state_dir>/jobs`, sweeps the host checkouts no job uses, and with `--images` evicts the
+materialized images under `<state_dir>/{registry,docker,build}` as `vk gc --idle-secs 0`
+does. The build cache's registry store is never touched. `validating` then runs what an
+update's does, `vk check`'s gate and `[node] validate`, and the node returns to the state it
+was in; a node that fails it stays `drained`, with the reset `failed` and the reason, rather
+than take jobs on a host that does not pass. A reset clears the last update's progress from
+the node's report, and a reset and an update exclude each other; a crash during either is
+taken up again by the next `vk node run`. Restart and redeploy are not built.
 
 ## Web UI
 

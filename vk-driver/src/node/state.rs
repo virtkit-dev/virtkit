@@ -12,10 +12,11 @@
 //! pair it holds them for, and forgets the applied generation — not the node's own state —
 //! when the node has since enrolled anew or with another hub.
 //!
-//! An update is a [`Job`] beside the state it moves the node through: accepted from ready or
-//! drained, it drains the node, then holds it in `maintenance` while the release is fetched,
-//! then in `validating` while the release runs on [`Trial`], and ends where the node started —
-//! or quarantined, when a quarantine arrived meanwhile.
+//! An update or a reset is a [`Job`] beside the state it moves the node through: accepted
+//! from ready or drained, it drains the node, then holds it in `maintenance` — while the
+//! release is fetched, or the node cleared — then in `validating` — while the release runs on
+//! [`Trial`], or the node is checked — and ends where the node started, or quarantined, when a
+//! quarantine arrived meanwhile.
 
 use std::path::{Path, PathBuf};
 
@@ -59,12 +60,12 @@ pub struct Persisted {
     pub installed: Option<PathBuf>,
 }
 
-/// An update under way: accepted, and not yet done, failed or rolled back.
+/// An update or a reset under way: accepted, and not yet done, failed or rolled back.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     /// The command's ID, whose journal entry says how it ended.
     pub command: String,
-    pub release: Release,
+    pub work: Work,
     /// The state the node returns to: ready, or drained when it was drained or draining.
     pub resume: NodeState,
     /// A quarantine arrived during maintenance: the node enters it instead of `resume`.
@@ -82,6 +83,27 @@ pub struct Job {
     /// By when it must be confirmed, set as maintenance begins from `within_secs`.
     #[serde(default)]
     pub deadline: Option<u64>,
+}
+
+/// What a job does in maintenance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Work {
+    Update(Release),
+    /// Clear what past jobs left, images too with `images`.
+    Reset {
+        images: bool,
+    },
+}
+
+impl Job {
+    /// The release an update installs; `None` for a reset.
+    pub fn release(&self) -> Option<&Release> {
+        match &self.work {
+            Work::Update(r) => Some(r),
+            Work::Reset { .. } => None,
+        }
+    }
 }
 
 /// The release an update installs, as its command named it.
@@ -372,7 +394,7 @@ impl Persisted {
                 });
                 self.job = Some(Job {
                     command: id.to_string(),
-                    release,
+                    work: Work::Update(release),
                     resume,
                     quarantine_after: false,
                     trial: None,
@@ -385,7 +407,34 @@ impl Persisted {
                 }
                 Outcome::Accepted
             }
-            (Operation::Reset, _) => refused("this vk does not run that operation yet"),
+            (Operation::Reset { .. }, NodeState::Quarantined) => {
+                refused("the node is quarantined; release it first")
+            }
+            (Operation::Reset { .. }, _) if !managed => {
+                refused("vk node cannot drain a runner it does not run, and a reset needs that")
+            }
+            (Operation::Reset { images }, state) => {
+                let (resume, next) = match state {
+                    NodeState::Ready => (NodeState::Ready, NodeState::Draining),
+                    NodeState::Draining => (NodeState::Drained, NodeState::Draining),
+                    _ => (NodeState::Drained, NodeState::Maintenance),
+                };
+                self.state = next;
+                // The last update's outcome was news until now; a report showing it beside a
+                // reset under way would read as the reset's.
+                self.update = None;
+                self.job = Some(Job {
+                    command: id.to_string(),
+                    work: Work::Reset { images: *images },
+                    resume,
+                    quarantine_after: false,
+                    trial: None,
+                    expires_at: command.expires_at,
+                    within_secs: None,
+                    deadline: None,
+                });
+                Outcome::Accepted
+            }
         }
     }
 
@@ -396,10 +445,17 @@ impl Persisted {
         let job = self.job.as_mut()?;
         let draining = self.state == NodeState::Draining;
         let busy = |job: &Job| Outcome::Refused {
-            reason: format!("an update is under way (command {})", job.command),
+            reason: format!(
+                "{} is under way (command {})",
+                match job.work {
+                    Work::Update(_) => "an update",
+                    Work::Reset { .. } => "a reset",
+                },
+                job.command
+            ),
         };
         Some(match op {
-            Operation::Update { .. } | Operation::Reset => busy(job),
+            Operation::Update { .. } | Operation::Reset { .. } => busy(job),
             Operation::Drain if draining => {
                 job.resume = NodeState::Drained;
                 Outcome::Accepted
@@ -412,7 +468,7 @@ impl Persisted {
             Operation::Undrain if draining => {
                 self.end_job(
                     Outcome::Failed {
-                        message: "undrained before the update started".into(),
+                        message: "undrained before maintenance started".into(),
                     },
                     UpdatePhase::Failed,
                 );
@@ -424,7 +480,7 @@ impl Persisted {
             Operation::Quarantine if draining => {
                 self.end_job(
                     Outcome::Failed {
-                        message: "quarantined before the update started".into(),
+                        message: "quarantined before maintenance started".into(),
                     },
                     UpdatePhase::Failed,
                 );
@@ -445,13 +501,27 @@ impl Persisted {
         })
     }
 
-    /// End the update under way with `outcome`, reported as `phase`: its journal entry takes
-    /// the outcome, and the node goes back to where it was, or into the quarantine that
-    /// arrived meanwhile. Returns whether there was one to end.
+    /// End the job under way with `outcome`, an update's reported as `phase`: its journal
+    /// entry takes the outcome, and the node goes back to where it was, or into the quarantine
+    /// that arrived meanwhile. Returns whether there was one to end.
     pub fn end_job(&mut self, outcome: Outcome, phase: UpdatePhase) -> bool {
-        let Some(job) = self.job.take() else {
+        self.end_job_in(outcome, phase, None)
+    }
+
+    /// [`Persisted::end_job`], returning the node to `resume` rather than where it was, when
+    /// given.
+    pub fn end_job_in(
+        &mut self,
+        outcome: Outcome,
+        phase: UpdatePhase,
+        resume: Option<NodeState>,
+    ) -> bool {
+        let Some(mut job) = self.job.take() else {
             return false;
         };
+        if let Some(resume) = resume {
+            job.resume = resume;
+        }
         // The phase already says it was rolled back; the ack says so in words of its own.
         let message = match &outcome {
             Outcome::Failed { message } => Some(
@@ -487,13 +557,17 @@ impl Persisted {
     }
 
     /// The drain finished: `drained`, and every drain still under way is done — or, draining
-    /// for an update, on to its maintenance.
+    /// for an update or a reset, on to its maintenance.
     pub fn finish_drain(&mut self, now: u64) -> bool {
         if self.state != NodeState::Draining {
             return false;
         }
         if self.job.is_some() {
-            self.set_phase(NodeState::Maintenance, UpdatePhase::Downloading);
+            let update = self.job.as_ref().is_some_and(|j| j.release().is_some());
+            self.state = NodeState::Maintenance;
+            if update && let Some(u) = self.update.as_mut() {
+                u.phase = UpdatePhase::Downloading;
+            }
             self.begin_maintenance(now);
         } else {
             self.state = NodeState::Drained;
@@ -949,5 +1023,37 @@ mod tests {
         assert!(p.finish_drain(10));
         assert!(!p.drain_expired(200));
         assert_eq!(p.job.as_ref().unwrap().deadline, Some(60));
+    }
+
+    #[test]
+    fn a_reset_drains_and_is_refused_while_another_job_runs() {
+        let mut p = Persisted::default();
+        let reset = |id: &str| command(id, Operation::Reset { images: false });
+        assert!(matches!(
+            p.command(reset("x"), 1, false).outcome,
+            Outcome::Refused { .. }
+        ));
+        assert_eq!(p.command(reset("r"), 1, true).outcome, Outcome::Accepted);
+        assert_eq!(p.state, NodeState::Draining);
+        let ack = p.command(update("u"), 1, true);
+        assert!(
+            matches!(&ack.outcome, Outcome::Refused { reason } if reason.contains("a reset")),
+            "{ack:?}"
+        );
+        assert!(p.finish_drain(1));
+        assert_eq!(p.state, NodeState::Maintenance);
+        // No update's progress to report.
+        assert_eq!(p.update, None);
+        p.set_phase(NodeState::Validating, UpdatePhase::Validating);
+        p.end_job_in(
+            Outcome::Failed {
+                message: "vk check: kvm".into(),
+            },
+            UpdatePhase::Failed,
+            Some(NodeState::Drained),
+        );
+        assert_eq!(p.state, NodeState::Drained);
+        assert!(matches!(p.journal[0].outcome, Outcome::Refused { .. }));
+        assert!(matches!(p.journal[1].outcome, Outcome::Failed { .. }));
     }
 }

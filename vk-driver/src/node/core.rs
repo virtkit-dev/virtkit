@@ -375,7 +375,18 @@ impl Core {
                 .unwrap_or(u32::MAX),
         };
         self.set(&self.drain, Some(progress));
-        if drained(&progress) && self.update(|p| p.finish_drain(now))? {
+        // A reset exists for the job a failed cleanup left running: its drain is over once
+        // the runner is gone and nothing is admitted, and clearing stops the rest.
+        let for_reset = lock(&self.persisted)
+            .job
+            .as_ref()
+            .is_some_and(|j| matches!(j.work, super::state::Work::Reset { .. }));
+        let done = if for_reset {
+            progress.runner_stopped && progress.ledger_empty
+        } else {
+            drained(&progress)
+        };
+        if done && self.update(|p| p.finish_drain(now))? {
             eprintln!("vk node: drained");
             self.set(&self.drain, None);
         }
@@ -677,6 +688,54 @@ mod tests {
         assert!(read() <= after_tick, "{} after {after_tick}", read());
         halt.send(true).unwrap();
         task.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reset is for the job a failed cleanup left running: its drain does not wait for it.
+    #[test]
+    fn a_reset_drains_past_a_leftover_supervisor() {
+        let dir = scratch("reset-drain");
+        let jobs = dir.join("state").join("jobs");
+        let job = jobs.join("77");
+        std::fs::create_dir_all(&job).unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "while :; do sleep 1; done", job.to_str().unwrap()])
+            .spawn()
+            .unwrap();
+        std::fs::write(job.join("supervisor.pid"), child.id().to_string()).unwrap();
+        let (core, _) = Core::open(&dir, true, issuer(), stopped()).unwrap();
+        let cfg = cfg(&dir);
+        let drain = Command {
+            id: "d".into(),
+            expires_at: u64::MAX,
+            op: Operation::Drain,
+        };
+        core.command(drain, 1).unwrap();
+        core.step(&cfg, true).unwrap();
+        // A plain drain waits for the job.
+        assert_eq!(core.state(), NodeState::Draining);
+        core.command(
+            Command {
+                id: "u".into(),
+                expires_at: u64::MAX,
+                op: Operation::Undrain,
+            },
+            1,
+        )
+        .unwrap();
+        core.command(
+            Command {
+                id: "r".into(),
+                expires_at: u64::MAX,
+                op: Operation::Reset { images: false },
+            },
+            1,
+        )
+        .unwrap();
+        core.step(&cfg, true).unwrap();
+        assert_eq!(core.state(), NodeState::Maintenance);
+        child.kill().unwrap();
+        child.wait().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

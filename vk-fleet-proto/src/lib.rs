@@ -753,7 +753,13 @@ pub enum Operation {
         #[serde(default)]
         within_secs: Option<u64>,
     },
-    Reset,
+    /// Drain, stop what past jobs left running, clear the job dirs and host checkouts —
+    /// materialized images too with `images` — validate, and return to the state the node was
+    /// in. The build cache's registry store is never touched.
+    Reset {
+        #[serde(default)]
+        images: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1090,6 +1096,11 @@ mod tests {
                 expires_at: 0,
                 op: Operation::Quarantine,
             }),
+            HubMsg::Command(Command {
+                id: id.clone(),
+                expires_at: 0,
+                op: Operation::Reset { images: true },
+            }),
             HubMsg::Recorded(CommandAck {
                 id,
                 outcome: Outcome::Done,
@@ -1152,6 +1163,12 @@ mod tests {
                 vk_version: "9.9.9".into(),
             }
         );
+    }
+
+    #[test]
+    fn a_reset_reads_without_its_optional_field() {
+        let op: Operation = serde_json::from_str(r#"{"kind":"reset"}"#).unwrap();
+        assert_eq!(op, Operation::Reset { images: false });
     }
 
     #[test]

@@ -599,6 +599,23 @@ async fn action(req: Request<Incoming>, ui: &Ui, id: String) -> Result<Response<
         },
         _ => None,
     };
+    // A reset drains the node and deletes what its jobs left: asked for again, on its own
+    // form, before it is issued. The policy allows no `confirm()`, and a second post is as
+    // plain as the first.
+    if op == "reset" && field(&form, "confirm") != Some("yes") {
+        let prompt = pages::confirm_reset(&id, &auth);
+        let mut resp = if htmx {
+            html_response(StatusCode::OK, prompt)
+        } else {
+            html_response(StatusCode::OK, pages::confirm_reset_page(&auth, prompt))
+        };
+        if htmx {
+            // Only the prompt, out of band: the fragment stays as it is.
+            resp.headers_mut()
+                .insert("hx-reswap", HeaderValue::from_static("none"));
+        }
+        return Ok(resp);
+    }
     let principal = auth.session.principal();
     let hub = ui.hub.clone();
     let node = id.clone();
@@ -634,6 +651,7 @@ async fn action(req: Request<Incoming>, ui: &Ui, id: String) -> Result<Response<
             "undrain" => command(Operation::Undrain),
             "quarantine" => command(Operation::Quarantine),
             "release" => command(Operation::Release),
+            "reset" => command(Operation::Reset { images: false }),
             _ => return Ok(None),
         };
         // The operation's own refusal, such as a ceiling of 0, is the operator's to read.

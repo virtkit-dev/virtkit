@@ -1565,7 +1565,8 @@ pub(crate) fn operation_name(op: &Operation) -> String {
             vk_fleet_proto::display_safe(version),
             short(sha256)
         ),
-        Operation::Reset => "reset".into(),
+        Operation::Reset { images: false } => "reset".into(),
+        Operation::Reset { images: true } => "reset, images included".into(),
     }
 }
 

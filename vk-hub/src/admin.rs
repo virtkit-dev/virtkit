@@ -659,7 +659,7 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_ceiling_and_operations_not_built_are_refused() {
+    fn a_zero_ceiling_and_an_update_without_a_release_are_refused() {
         let hub = Hub::new(Arc::new(Db::open_memory().unwrap()));
         let id = "ab".repeat(16);
         let call = |call: &str| dispatch(format!(r#"{{"v":1,"call":{call}}}"#).as_bytes(), &hub, 0);
@@ -668,11 +668,6 @@ mod tests {
         ))
         .unwrap_err();
         assert!(format!("{err:#}").contains("stop acquisition"), "{err:#}");
-        let err = call(&format!(
-            r#"{{"op":"command","id":"{id}","operation":{{"kind":"reset"}}}}"#
-        ))
-        .unwrap_err();
-        assert!(format!("{err:#}").contains("not implemented"), "{err:#}");
         // An update goes through its release, never a version and digest the caller made up.
         let err = call(&format!(
             r#"{{"op":"command","id":"{id}","operation":{{"kind":"update","version":"1","sha256":"ab","size":1}}}}"#

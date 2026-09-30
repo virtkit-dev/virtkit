@@ -1,4 +1,5 @@
-//! Updating a node's `vk` to a release its hub holds: download it from the hub, check it,
+//! Updating a node's `vk` to a release its hub holds, and the maintenance loop that also runs
+//! resets ([`super::reset`]): download it from the hub, check it,
 //! run it on trial, and keep it only once it has passed — else go back to the binary it
 //! replaced. See `docs/fleet-design.md`, "Updates".
 //!
@@ -85,7 +86,7 @@ pub fn on_start(dir: &Path, now: u64) -> Result<Start> {
     let Some(job) = p.job.clone() else {
         return Ok(Start::Run);
     };
-    let Some(trial) = job.trial.clone() else {
+    let (Some(trial), Some(release)) = (job.trial.clone(), job.release().cloned()) else {
         return Ok(Start::Run);
     };
     if running_is(&trial.next) {
@@ -104,7 +105,7 @@ pub fn on_start(dir: &Path, now: u64) -> Result<Start> {
         Ok(Start::Run)
     };
     if trial.confirmed {
-        match install(&trial.next, &job.release.sha256, &trial) {
+        match install(&trial.next, &release.sha256, &trial) {
             Ok(()) => {}
             Err(e) if e.is::<InstalledChanged>() => {
                 return replaced_meanwhile(&mut p, dir, &trial, &e);
@@ -113,10 +114,7 @@ pub fn on_start(dir: &Path, now: u64) -> Result<Start> {
         }
         p.end_job(Outcome::Done, UpdatePhase::Done);
         p.save_durable(dir)?;
-        prune(
-            dir,
-            &[Some(job.release.sha256.clone()), trial.previous.clone()],
-        );
+        prune(dir, &[Some(release.sha256.clone()), trial.previous.clone()]);
         eprintln!("vk node: installed the release that passed its trial");
         return Ok(if running_is(&trial.exe) {
             Start::Run
@@ -134,7 +132,7 @@ pub fn on_start(dir: &Path, now: u64) -> Result<Start> {
             &format!("it was started {MAX_ATTEMPTS} times without passing its trial"),
         );
     }
-    if hash_file(&trial.next).ok().as_deref() != Some(job.release.sha256.as_str()) {
+    if hash_file(&trial.next).ok().as_deref() != Some(release.sha256.as_str()) {
         return roll_back(
             &mut p,
             "the release on disk no longer hashes to what was downloaded",
@@ -406,6 +404,11 @@ pub async fn maintain(
         if let Some(job) = p.job.clone() {
             let work = async {
                 match (p.state, &job.trial) {
+                    (NodeState::Maintenance | NodeState::Validating, None)
+                        if job.release().is_none() =>
+                    {
+                        super::reset::run(&core, &cfg, p.state).await;
+                    }
                     (NodeState::Maintenance, None) => {
                         if let Err(e) = prepare(&core, &cfg, &node, &job).await {
                             eprintln!("vk node: the update failed: {e:#}");
@@ -441,7 +444,9 @@ pub async fn maintain(
 /// to it on trial. Returns only on failure, with the binary unchanged.
 async fn prepare(core: &Core, cfg: &Config, node: &Node, job: &Job) -> Result<()> {
     let dir = core.dir().to_path_buf();
-    let release = job.release.clone();
+    let Some(release) = job.release().cloned() else {
+        return Ok(());
+    };
     if own_sha256().as_deref() == Some(release.sha256.as_str()) {
         eprintln!("vk node: already running release {}", release.sha256);
         core.change(|p| p.end_job(Outcome::Done, UpdatePhase::Done))?;
@@ -567,6 +572,9 @@ fn deadline_of(trial: &Trial) -> tokio::time::Instant {
 /// End the trial by `verdict`: passed, install the release and execute it as the installed
 /// binary; not, hand the node back to the binary it replaced.
 async fn conclude(core: &Core, job: &Job, trial: &Trial, verdict: Result<(), String>) {
+    let Some(release) = job.release().cloned() else {
+        return;
+    };
     if let Err(why) = verdict {
         roll_back(core, trial, &why).await;
         return;
@@ -586,11 +594,7 @@ async fn conclude(core: &Core, job: &Job, trial: &Trial, verdict: Result<(), Str
         return;
     }
     let installed = {
-        let (next, sha, trial) = (
-            trial.next.clone(),
-            job.release.sha256.clone(),
-            trial.clone(),
-        );
+        let (next, sha, trial) = (trial.next.clone(), release.sha256.clone(), trial.clone());
         blocking(move || install(&next, &sha, &trial)).await
     };
     match installed {
@@ -621,12 +625,12 @@ async fn conclude(core: &Core, job: &Job, trial: &Trial, verdict: Result<(), Str
     }
     eprintln!(
         "vk node: updated to vk {}, installed as {}",
-        job.release.version,
+        release.version,
         trial.exe.display()
     );
     prune(
         core.dir(),
-        &[Some(job.release.sha256.clone()), trial.previous.clone()],
+        &[Some(release.sha256.clone()), trial.previous.clone()],
     );
     // Installed: from here the update is done whatever else fails. It is recorded, and the
     // node goes on as the installed binary rather than from its releases directory; should
@@ -729,7 +733,7 @@ fn runnable(path: &Path, sha256: Option<&str>) -> bool {
 }
 
 /// `vk check`'s gate, then `[node] validate` if there is one.
-async fn validate(cfg: &Arc<Config>) -> Result<(), String> {
+pub async fn validate(cfg: &Arc<Config>) -> Result<(), String> {
     let gate = cfg.clone();
     let failed: Vec<String> = tokio::task::spawn_blocking(move || super::inventory::checks(&gate))
         .await

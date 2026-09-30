@@ -269,6 +269,7 @@ fn actions(h: &mut Html, auth: &Auth, id: &str) {
         ("undrain", "undrain"),
         ("quarantine", "quarantine"),
         ("release", "release"),
+        ("reset", "reset"),
     ] {
         form(h, op);
         h.raw("<button>").raw(label).raw("</button></form>");
@@ -286,6 +287,32 @@ pub fn flash(text: &str, error: bool) -> Html {
         .text(text)
         .raw("</div>");
     h
+}
+
+/// The question a reset asks before it is issued, in the flash's place: what it does, and a
+/// form that posts it again, confirmed. The node's ID is one the hub issued, checked as hex.
+pub fn confirm_reset(id: &str, auth: &Auth) -> Html {
+    let mut h = Html::new();
+    h.raw("<div id=\"flash\" hx-swap-oob=\"true\" class=\"error\">")
+        .raw("Reset drains this node, stops what its past jobs left running and deletes their ")
+        .raw("job directories and its idle host checkouts. ")
+        .raw("<form method=\"post\" action=\"/node/")
+        .text(id)
+        .raw("/action\" hx-post=\"/node/")
+        .text(id)
+        .raw("/action\" hx-target=\"#detail\">");
+    csrf_field(&mut h, auth);
+    h.raw("<input type=\"hidden\" name=\"op\" value=\"reset\">")
+        .raw("<input type=\"hidden\" name=\"confirm\" value=\"yes\">")
+        .raw("<button>reset it</button></form></div>");
+    h
+}
+
+/// [`confirm_reset`] as a page of its own, for a plain form post.
+pub fn confirm_reset_page(auth: &Auth, prompt: Html) -> Html {
+    let mut main = Html::new();
+    main.raw("<h1>Reset</h1>").html(&prompt);
+    layout("reset", auth, &main)
 }
 
 /// A live region's last fragment, once its session has ended.

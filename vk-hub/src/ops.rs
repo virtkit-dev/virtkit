@@ -124,7 +124,6 @@ pub fn set_acquisition(
 pub fn command(hub: &Hub, actor: &str, id: &str, operation: Operation) -> Result<Command> {
     match operation {
         Operation::Update { .. } => bail!("an update names a release; see `vk-hub nodes update`"),
-        Operation::Reset => bail!("reset is not implemented yet"),
         _ => issue(hub, actor, id, operation),
     }
 }

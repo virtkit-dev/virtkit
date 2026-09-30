@@ -1745,3 +1745,45 @@ async fn rollouts_are_shown_live_and_steered_by_an_operator_alone() {
     .await;
     assert_eq!(reply.status, 404);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_is_issued_only_once_confirmed() {
+    let (addr, hub, origin) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let post = |form: String| {
+        let (cookie, origin) = (format!("Cookie: {operator}"), format!("Origin: {origin}"));
+        let path = format!("/node/{node}/action");
+        async move {
+            request(
+                addr,
+                "POST",
+                &path,
+                &[
+                    &cookie,
+                    &origin,
+                    "HX-Request: true",
+                    "Content-Type: application/x-www-form-urlencoded",
+                ],
+                &form,
+            )
+            .await
+        }
+    };
+    let reply = post(format!("_csrf={csrf}&op=reset")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.header("hx-reswap"), Some("none"));
+    assert!(
+        reply.body.contains("name=\"confirm\" value=\"yes\""),
+        "{}",
+        reply.body
+    );
+    assert!(hub.db.node_commands(&node).unwrap().is_empty());
+    let reply = post(format!("_csrf={csrf}&op=reset&confirm=yes")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let commands = hub.db.pending_commands(&node, crate::now_secs()).unwrap();
+    assert_eq!(
+        commands[0].op,
+        vk_fleet_proto::Operation::Reset { images: false }
+    );
+}

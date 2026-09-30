@@ -323,6 +323,16 @@ enum NodesCmd {
     Quarantine { id: String },
     /// End a quarantine: back to `ready`
     Release { id: String },
+    /// Drain the node, clear what past jobs left, validate, and return it where it was
+    ///
+    /// Stops whatever the node's user still runs from past jobs and removes the job dirs
+    /// and host checkouts; the build cache's registry store is never touched.
+    Reset {
+        id: String,
+        /// Evict the materialized images too
+        #[arg(long)]
+        images: bool,
+    },
     /// Replace the node's vk with a release the hub holds, and roll back if it fails
     ///
     /// The node drains, downloads and checks the release, runs it on trial and keeps it only
@@ -438,6 +448,9 @@ async fn run(cli: Cli) -> Result<()> {
                     command(client, id, Operation::Quarantine).await
                 }
                 Some(NodesCmd::Release { id }) => command(client, id, Operation::Release).await,
+                Some(NodesCmd::Reset { id, images }) => {
+                    command(client, id, Operation::Reset { images }).await
+                }
                 Some(NodesCmd::Update { id, release, force }) => {
                     let command = tokio::task::spawn_blocking(move || {
                         client.update_node(&id, &release, force)
