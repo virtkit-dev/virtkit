@@ -386,41 +386,11 @@ impl Tool {
         digest_at(client, &target.digest_url, self.name).await
     }
 
-    /// Confirm the downloaded binary runs on this host and is the version we asked for:
-    /// the digest proves the transfer was faithful, not that the release is usable here
-    /// (a foreign architecture hashes fine and cannot exec). Runs before the rename, so
-    /// a binary that fails this never becomes the installed one.
+    /// Confirm the downloaded binary runs on this host and is the version we asked for;
+    /// see [`smoke_test`]. Runs before the rename, so a binary that fails this never becomes
+    /// the installed one.
     fn smoke_test(&self, path: &Path, version: &str) -> Result<()> {
-        let out = run_version(path).map_err(|e| {
-            // Which errno this is decides what went wrong, and the causes are nothing alike:
-            // a release built for another architecture (ENOEXEC), a file some process still
-            // holds open for writing (ETXTBSY, and `run_version` has already waited it out),
-            // a host with no room left to fork (EAGAIN). Only the first two name a cause worth
-            // reporting — offering one for the rest buries the errno under a wrong answer.
-            let hint = match e.raw_os_error() {
-                Some(libc::ENOEXEC) => " (is the release built for this architecture?)",
-                Some(libc::ETXTBSY) => {
-                    " (something is still holding the download open for writing)"
-                }
-                _ => "",
-            };
-            anyhow::Error::new(e).context(format!("running {} --version{hint}", path.display()))
-        })?;
-        // Non-UTF-8 output is not a version string: fall through to the error below with
-        // it empty rather than mangling the bytes to report them.
-        let reported = std::str::from_utf8(&out.stdout).unwrap_or_default();
-        // A whole token, not a substring: `vk --version` prints `vk-driver <version> (<hash>)`,
-        // and `contains` would let a binary reporting `0.30.0` satisfy a request for `0.3`.
-        let named = reported.split_whitespace().any(|t| t == version);
-        if !out.status.success() || !named {
-            bail!(
-                "the downloaded {} did not report version {version} ({}, output: {})",
-                self.name,
-                out.status,
-                reported.trim()
-            );
-        }
-        Ok(())
+        smoke_test(self.name, path, version)
     }
 
     /// Ask on stderr, read the answer on stdin. Anything but an explicit yes declines,
@@ -441,6 +411,40 @@ impl Tool {
             .context("reading the answer")?;
         Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
     }
+}
+
+/// Confirm that `path`, a download of tool `name`, runs on this host and reports `version`
+/// as a whole word of its `--version`: a digest proves a transfer was faithful, not that the
+/// release is usable here (a foreign architecture hashes fine and cannot exec). Public so a
+/// fleet node puts the release its hub sends through the same gate.
+pub fn smoke_test(name: &str, path: &Path, version: &str) -> Result<()> {
+    let out = run_version(path).map_err(|e| {
+        // Which errno this is decides what went wrong, and the causes are nothing alike:
+        // a release built for another architecture (ENOEXEC), a file some process still
+        // holds open for writing (ETXTBSY, and `run_version` has already waited it out),
+        // a host with no room left to fork (EAGAIN). Only the first two name a cause worth
+        // reporting — offering one for the rest buries the errno under a wrong answer.
+        let hint = match e.raw_os_error() {
+            Some(libc::ENOEXEC) => " (is the release built for this architecture?)",
+            Some(libc::ETXTBSY) => " (something is still holding the download open for writing)",
+            _ => "",
+        };
+        anyhow::Error::new(e).context(format!("running {} --version{hint}", path.display()))
+    })?;
+    // Non-UTF-8 output is not a version string: fall through to the error below with
+    // it empty rather than mangling the bytes to report them.
+    let reported = std::str::from_utf8(&out.stdout).unwrap_or_default();
+    // A whole token, not a substring: `vk --version` prints `vk-driver <version> (<hash>)`,
+    // and `contains` would let a binary reporting `0.30.0` satisfy a request for `0.3`.
+    let named = reported.split_whitespace().any(|t| t == version);
+    if !out.status.success() || !named {
+        bail!(
+            "the downloaded {name} did not report version {version} ({}, output: {})",
+            out.status,
+            reported.trim()
+        );
+    }
+    Ok(())
 }
 
 /// The API endpoint for a release: the one `tag` names, or the latest published one.
