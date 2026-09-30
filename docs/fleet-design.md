@@ -1,8 +1,9 @@
 # Fleet: a hub and its nodes
 
 Status: proposal, implemented in part and experimental: the list of the VMs a host runs
-(`vk workloads`), and local mode's web UI showing it and acting on it (`vk-hub local`),
-signed into with links it prints. Everything else below is not built yet.
+(`vk workloads`) and local mode's web UI showing it and acting on it (`vk-hub local`),
+signed into with links it prints; `vk-hub` enrolls nodes and records their inventory and
+heartbeats. Nothing it would steer is built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -60,7 +61,10 @@ vk node join https://hub.example.com --token <enrollment-token>
 
 generates the node's ed25519 identity, which the hub pins on first contact. The node signs
 the token with that key, so the hub pins only a key the caller holds. Enrollment tokens are
-single-use and expire. The identity survives `vk` updates; the hub can revoke it.
+single-use and expire, and are issued by `vk-hub token create` through a unix socket on the
+hub's host rather than over the network. A node whose enrollment answer was lost enrolls
+again with a new token and the same key, and gets its node ID back. The identity survives
+`vk` updates; `vk-hub nodes remove` revokes it and ends its session.
 
 ## Hub ↔ node protocol
 

@@ -1,23 +1,35 @@
-//! The hub's database: the web UI's sign-in links and sessions, and the audit log, in
-//! [`redb`] like `vk-registry`'s accounts store — tables of JSON rows.
+//! The hub's database: enrolled nodes and outstanding enrollment tokens, the web UI's sign-in
+//! links and sessions, and the audit log, in [`redb`] like `vk-registry`'s accounts store —
+//! tables of JSON rows, small enough that listing every node is a scan.
 //!
-//! A sign-in token and a session's secret are stored as their `sha256`, so the file holds
-//! nothing that signs anyone in. A token is looked up in a read transaction first, so a
-//! caller guessing at tokens costs the hub reads, never a durable write, and it is spent in
-//! the write that opens its session: a link opens exactly one session even with two posts
-//! racing on it.
+//! A token is stored as `sha256(token)`, so the file holds nothing that enrolls a node.
+//! Consuming a token and pinning the node's key happen in one write transaction: a token
+//! enrolls exactly one node even with two enrollments racing on it. A token is looked up in a
+//! read transaction first, so an unauthenticated caller guessing at tokens costs the hub
+//! reads, never a durable write. The web UI's sign-in tokens and session cookies are kept the
+//! same way: by hash, a sign-in token spent in the write that opens its session.
 //!
-//! Every audit line goes through [`vk_fleet_proto::display_safe`]: it holds what the host's
-//! `vk` said, and the log is read on terminals and pages.
+//! Every string a node or the host's `vk` reports is stored through
+//! [`vk_fleet_proto::display_safe`]: the database is where it crosses into the operator's
+//! terminal and pages.
+//!
+//! Heartbeats are written at [`Durability::None`]: one arrives from every node every few
+//! seconds, and losing the last few to a crash costs nothing — the next one replaces them.
+//! Everything else is durable.
 
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use vk_fleet_proto::{Heartbeat, Inventory};
 
+/// Key: node ID. Value: JSON [`NodeRow`].
+const NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
+/// Key: `sha256(token)`, hex. Value: JSON [`TokenRow`].
+const TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("tokens");
 /// Key: a sequence number, oldest first. Value: JSON [`AuditRow`].
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 /// Key: `sha256(sign-in token)`, hex. Value: JSON [`LoginRow`].
@@ -30,6 +42,14 @@ const UI_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("ui_sessi
 /// thousand at a time.
 const AUDIT_MAX: u64 = 100_000;
 const AUDIT_PRUNE: u64 = 1000;
+
+/// Every enrollment token starts with this, so one pasted into the wrong place is
+/// recognizable.
+const TOKEN_PREFIX: &str = "vkh_";
+
+/// The longest-lived token an operator may issue. A token is a bearer credential for adding
+/// a machine to the fleet; one that outlives its purpose by months is one somebody finds.
+pub const MAX_TOKEN_TTL: Duration = Duration::from_secs(30 * 86_400);
 
 /// Every web UI sign-in token starts with this, so one pasted into the wrong place is
 /// recognizable.
@@ -120,6 +140,52 @@ pub struct AuditRow {
     pub event: String,
 }
 
+/// An enrolled node. Fields added later carry `#[serde(default)]` so rows written by an
+/// older hub still read.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeRow {
+    /// The pinned ed25519 public key, hex.
+    pub public_key: String,
+    /// The hostname given at enrollment, replaced by each inventory's.
+    pub hostname: String,
+    pub enrolled_at: u64,
+    /// The incarnation of the node's latest session.
+    #[serde(default)]
+    pub incarnation: Option<String>,
+    /// When the node last authenticated or sent anything.
+    #[serde(default)]
+    pub last_seen: Option<u64>,
+    #[serde(default)]
+    pub inventory: Option<Inventory>,
+    #[serde(default)]
+    pub heartbeat: Option<Heartbeat>,
+    #[serde(default)]
+    pub heartbeat_at: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TokenRow {
+    created_at: u64,
+    expires_at: u64,
+}
+
+/// What an enrollment came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Enrollment {
+    Enrolled {
+        node_id: String,
+    },
+    /// The key was already pinned, so the node it was pinned to is the answer: a node whose
+    /// first enrollment reply was lost enrolls again with a new token and the same key, and
+    /// holding both is exactly what the first enrollment asked for.
+    Reenrolled {
+        node_id: String,
+    },
+    /// The token is unknown, already used, or expired — deliberately not said which, to a
+    /// caller who may be guessing.
+    BadToken,
+}
+
 pub struct Db {
     db: Database,
 }
@@ -193,6 +259,8 @@ impl Db {
         let txn = db
             .begin_write()
             .context("starting the hub db's first write")?;
+        txn.open_table(NODES).context("opening the nodes table")?;
+        txn.open_table(TOKENS).context("opening the tokens table")?;
         txn.open_table(AUDIT).context("opening the audit table")?;
         txn.open_table(UI_LOGINS)
             .context("opening the sign-in links table")?;
@@ -200,6 +268,165 @@ impl Db {
             .context("opening the web UI sessions table")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db { db })
+    }
+
+    /// Issue a single-use enrollment token valid for `ttl`. Returns the token — shown once,
+    /// never stored — and when it expires. Expired tokens are swept in the same write.
+    pub fn create_token(&self, ttl: Duration, now: u64) -> Result<(String, u64)> {
+        if ttl.is_zero() || ttl > MAX_TOKEN_TTL {
+            bail!(
+                "a token's lifetime must be between 1s and {} days",
+                MAX_TOKEN_TTL.as_secs() / 86_400
+            );
+        }
+        let token = format!("{TOKEN_PREFIX}{}", crate::random_hex(32)?);
+        let expires_at = now.saturating_add(ttl.as_secs());
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            let mut table = txn.open_table(TOKENS)?;
+            let mut expired = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                if decode::<TokenRow>(value.value())?.expires_at <= now {
+                    expired.push(key.value().to_string());
+                }
+            }
+            for key in expired {
+                table.remove(key.as_str())?;
+            }
+            let row = TokenRow {
+                created_at: now,
+                expires_at,
+            };
+            table.insert(token_key(&token).as_str(), encode(&row)?.as_slice())?;
+        }
+        txn.commit().context("storing an enrollment token")?;
+        Ok((token, expires_at))
+    }
+
+    /// Consume `token` and pin `public_key` (hex) as a new node, or answer with the node it is
+    /// already pinned to. The caller has checked the node's signature.
+    pub fn enroll(
+        &self,
+        token: &str,
+        public_key: &str,
+        hostname: &str,
+        now: u64,
+    ) -> Result<Enrollment> {
+        let key = token_key(token);
+        {
+            let txn = self.db.begin_read().context("starting a read")?;
+            let tokens = txn.open_table(TOKENS)?;
+            let live = tokens
+                .get(key.as_str())?
+                .map(|g| decode::<TokenRow>(g.value()))
+                .transpose()?
+                .is_some_and(|row| row.expires_at > now);
+            // Expired tokens are left for `create_token`'s sweep: removing one here would be
+            // the write this read exists to avoid.
+            if !live {
+                return Ok(Enrollment::BadToken);
+            }
+        }
+        // Checked again under the write lock: another enrollment may have spent it since.
+        let txn = self.db.begin_write().context("starting a write")?;
+        let outcome = {
+            let mut tokens = txn.open_table(TOKENS)?;
+            let row = tokens
+                .remove(key.as_str())?
+                .map(|g| decode::<TokenRow>(g.value()))
+                .transpose()?;
+            // Removed whether or not it is still valid: an expired token is no use to anyone
+            // and a spent one is removed by definition.
+            match row {
+                Some(row) if row.expires_at > now => {
+                    let mut nodes = txn.open_table(NODES)?;
+                    let mut pinned = None;
+                    for entry in nodes.iter()? {
+                        let (id, value) = entry?;
+                        if decode::<NodeRow>(value.value())?.public_key == public_key {
+                            pinned = Some(id.value().to_string());
+                            break;
+                        }
+                    }
+                    if let Some(node_id) = pinned {
+                        Enrollment::Reenrolled { node_id }
+                    } else {
+                        let node_id = crate::random_hex(vk_fleet_proto::ID_BYTES)?;
+                        let row = NodeRow {
+                            public_key: public_key.to_string(),
+                            hostname: vk_fleet_proto::display_safe(hostname),
+                            enrolled_at: now,
+                            incarnation: None,
+                            last_seen: None,
+                            inventory: None,
+                            heartbeat: None,
+                            heartbeat_at: None,
+                        };
+                        nodes.insert(node_id.as_str(), encode(&row)?.as_slice())?;
+                        Enrollment::Enrolled { node_id }
+                    }
+                }
+                _ => Enrollment::BadToken,
+            }
+        };
+        txn.commit().context("recording an enrollment")?;
+        Ok(outcome)
+    }
+
+    pub fn node(&self, id: &str) -> Result<Option<NodeRow>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(NODES)?;
+        table
+            .get(id)?
+            .map(|g| decode::<NodeRow>(g.value()))
+            .transpose()
+    }
+
+    /// Every node, by ID.
+    pub fn nodes(&self) -> Result<Vec<(String, NodeRow)>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(NODES)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            out.push((key.value().to_string(), decode::<NodeRow>(value.value())?));
+        }
+        Ok(out)
+    }
+
+    /// A node authenticated a session as `incarnation`.
+    pub fn record_session(&self, id: &str, incarnation: &str, now: u64) -> Result<()> {
+        self.update(id, Durability::Immediate, |row| {
+            row.incarnation = Some(incarnation.to_string());
+            row.last_seen = Some(now);
+        })
+    }
+
+    /// Remove a node: its key is no longer pinned, and a session it opens is refused.
+    /// `Ok(false)` when there was no such node.
+    pub fn remove_node(&self, id: &str) -> Result<bool> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let removed = txn.open_table(NODES)?.remove(id)?.is_some();
+        txn.commit().context("removing a node")?;
+        Ok(removed)
+    }
+
+    pub fn record_inventory(&self, id: &str, inventory: Inventory, now: u64) -> Result<()> {
+        let inventory = display_safe_inventory(inventory);
+        self.update(id, Durability::Immediate, |row| {
+            row.hostname = inventory.hostname.clone();
+            row.inventory = Some(inventory);
+            row.last_seen = Some(now);
+        })
+    }
+
+    pub fn record_heartbeat(&self, id: &str, heartbeat: Heartbeat, now: u64) -> Result<()> {
+        self.update(id, Durability::None, |row| {
+            row.heartbeat = Some(heartbeat);
+            row.heartbeat_at = Some(now);
+            row.last_seen = Some(now);
+        })
     }
 
     /// Record `event`, done by `actor`, in the audit log.
@@ -397,6 +624,29 @@ impl Db {
         }
         Ok(out)
     }
+
+    /// Rewrite one node's row. A node removed meanwhile is an error: its session is then
+    /// one the hub no longer recognizes.
+    fn update(
+        &self,
+        id: &str,
+        durability: Durability,
+        change: impl FnOnce(&mut NodeRow),
+    ) -> Result<()> {
+        let mut txn = self.db.begin_write().context("starting a write")?;
+        txn.set_durability(durability)
+            .context("setting a write's durability")?;
+        {
+            let mut table = txn.open_table(NODES)?;
+            let mut row = match table.get(id)? {
+                Some(g) => decode::<NodeRow>(g.value())?,
+                None => bail!("node {id} is not enrolled"),
+            };
+            change(&mut row);
+            table.insert(id, encode(&row)?.as_slice())?;
+        }
+        txn.commit().context("updating a node")
+    }
 }
 
 /// Append an audit row inside `txn`, dropping the oldest past [`AUDIT_MAX`].
@@ -419,9 +669,40 @@ fn append_audit(txn: &redb::WriteTransaction, actor: &str, event: &str, now: u64
     Ok(())
 }
 
-/// A secret's key in its table.
+/// A token's key in [`TOKENS`], and a sign-in token's or session secret's in its table.
 fn token_key(token: &str) -> String {
     vk_fleet_proto::to_hex(&Sha256::digest(token.as_bytes()))
+}
+
+/// `inventory` with every string in it made [`vk_fleet_proto::display_safe`].
+fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
+    use vk_fleet_proto::display_safe as safe;
+    let clean = |s: &mut String| *s = safe(s);
+    let clean_opt = |s: &mut Option<String>| {
+        if let Some(v) = s.as_mut() {
+            *v = safe(v);
+        }
+    };
+    clean(&mut inventory.hostname);
+    clean_opt(&mut inventory.hardware.cpu_model);
+    for check in &mut inventory.hardware.checks {
+        clean(&mut check.name);
+        clean(&mut check.detail);
+    }
+    for fs in &mut inventory.storage {
+        clean(&mut fs.path);
+        clean(&mut fs.device);
+    }
+    clean(&mut inventory.versions.vk);
+    clean_opt(&mut inventory.versions.guest_kernel);
+    clean(&mut inventory.versions.config_hash);
+    if let Some(runner) = inventory.runner.as_mut() {
+        clean(&mut runner.config);
+        for name in &mut runner.runners {
+            clean(name);
+        }
+    }
+    inventory
 }
 
 fn encode<T: Serialize>(row: &T) -> Result<Vec<u8>> {
@@ -442,6 +723,113 @@ mod tests {
         let txn = db.db.begin_write().unwrap();
         append_audit(&txn, "uid 0", event, at).unwrap();
         txn.commit().unwrap();
+    }
+
+    #[test]
+    fn a_token_enrolls_exactly_one_node() {
+        let db = Db::open_memory().unwrap();
+        let (token, expires) = db.create_token(DAY, 1000).unwrap();
+        assert!(token.starts_with(TOKEN_PREFIX));
+        assert_eq!(expires, 1000 + 86_400);
+        let Enrollment::Enrolled { node_id } = db.enroll(&token, "aa", "ci-1", 1001).unwrap()
+        else {
+            panic!("expected an enrollment");
+        };
+        assert!(vk_fleet_proto::valid_id(&node_id));
+        assert_eq!(
+            db.enroll(&token, "bb", "ci-2", 1002).unwrap(),
+            Enrollment::BadToken
+        );
+        let row = db.node(&node_id).unwrap().unwrap();
+        assert_eq!(
+            (row.public_key.as_str(), row.hostname.as_str()),
+            ("aa", "ci-1")
+        );
+        assert_eq!(db.nodes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_expired_or_unknown_token_enrolls_nothing() {
+        let db = Db::open_memory().unwrap();
+        let (token, expires) = db.create_token(Duration::from_secs(60), 1000).unwrap();
+        assert_eq!(
+            db.enroll(&token, "aa", "h", expires).unwrap(),
+            Enrollment::BadToken
+        );
+        assert_eq!(
+            db.enroll("vkh_nope", "aa", "h", 1000).unwrap(),
+            Enrollment::BadToken
+        );
+        assert!(db.nodes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pinned_key_enrolls_again_as_its_node_and_a_removed_one_anew() {
+        let db = Db::open_memory().unwrap();
+        let (t1, _) = db.create_token(DAY, 0).unwrap();
+        let (t2, _) = db.create_token(DAY, 0).unwrap();
+        let (t3, _) = db.create_token(DAY, 0).unwrap();
+        let Enrollment::Enrolled { node_id } = db.enroll(&t1, "aa", "h", 1).unwrap() else {
+            panic!("expected an enrollment");
+        };
+        assert_eq!(
+            db.enroll(&t2, "aa", "h", 1).unwrap(),
+            Enrollment::Reenrolled {
+                node_id: node_id.clone()
+            }
+        );
+        // The second token is spent by it all the same.
+        assert_eq!(db.enroll(&t2, "bb", "h", 1).unwrap(), Enrollment::BadToken);
+        assert_eq!(db.nodes().unwrap().len(), 1);
+        assert!(db.remove_node(&node_id).unwrap());
+        assert!(!db.remove_node(&node_id).unwrap());
+        let Enrollment::Enrolled { node_id: again } = db.enroll(&t3, "aa", "h", 1).unwrap() else {
+            panic!("expected a new enrollment");
+        };
+        assert_ne!(again, node_id);
+    }
+
+    #[test]
+    fn token_lifetimes_are_bounded_and_expired_tokens_are_swept() {
+        let db = Db::open_memory().unwrap();
+        assert!(db.create_token(Duration::ZERO, 0).is_err());
+        assert!(db.create_token(MAX_TOKEN_TTL + DAY, 0).is_err());
+        db.create_token(Duration::from_secs(10), 0).unwrap();
+        db.create_token(DAY, 20).unwrap();
+        let txn = db.db.begin_read().unwrap();
+        let table = txn.open_table(TOKENS).unwrap();
+        assert_eq!(redb::ReadableTableMetadata::len(&table).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_session_inventory_and_heartbeat_are_recorded() {
+        let db = Db::open_memory().unwrap();
+        let (token, _) = db.create_token(DAY, 0).unwrap();
+        let Enrollment::Enrolled { node_id } = db.enroll(&token, "aa", "h", 1).unwrap() else {
+            panic!("expected an enrollment");
+        };
+        db.record_session(&node_id, "inc", 2).unwrap();
+        let inventory = Inventory {
+            hostname: "renamed\u{1b}[2J".into(),
+            versions: vk_fleet_proto::Versions {
+                vk: "0.80\u{202e}.0".into(),
+                ..Default::default()
+            },
+            ..Inventory::default()
+        };
+        db.record_inventory(&node_id, inventory, 3).unwrap();
+        db.record_heartbeat(&node_id, Heartbeat::default(), 4)
+            .unwrap();
+        let row = db.node(&node_id).unwrap().unwrap();
+        assert_eq!(row.incarnation.as_deref(), Some("inc"));
+        assert_eq!(row.hostname, "renamed[2J");
+        assert_eq!(row.inventory.as_ref().unwrap().versions.vk, "0.80.0");
+        assert_eq!((row.heartbeat_at, row.last_seen), (Some(4), Some(4)));
+        assert!(row.inventory.is_some() && row.heartbeat.is_some());
+        assert!(
+            db.record_heartbeat("0".repeat(32).as_str(), Heartbeat::default(), 5)
+                .is_err()
+        );
     }
 
     #[test]

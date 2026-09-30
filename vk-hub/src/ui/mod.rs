@@ -125,7 +125,7 @@ const SECURE_COOKIE: &str = "__Host-vk-hub";
 /// Serve the web UI on `listener` until the process ends.
 pub async fn serve(listener: TcpListener, ui: Arc<Ui>) -> Result<()> {
     let permits = ui.connections.clone();
-    crate::server::accept(listener, permits, move |io, peer| {
+    crate::server::accept(listener, None, permits, move |io, peer, _| {
         serve_conn(io, ui.clone(), peer)
     })
     .await

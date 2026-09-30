@@ -1,10 +1,12 @@
-//! The admin channel: a unix socket in the hub's state directory, through which
-//! `vk-hub local login`, `sessions` and `logout` reach the running hub.
+//! The admin channel: a unix socket in the hub's data directory, through which `vk-hub token`,
+//! `vk-hub nodes` and `vk-hub local login`, `sessions` and `logout` reach the running hub.
 //!
-//! **Why a socket, and not an HTTP route or the database file.** The socket is where the web
-//! UI's sign-in links are issued, so it must not be reachable through the UI itself. Opening
-//! the database directly is out too: redb holds it exclusively for the life of the server. A
-//! unix socket is reachable from this machine only,
+//! **Why a socket, and not an HTTP route or the database file.** Minting an enrollment token
+//! adds machines to the fleet, so it must not be reachable from the network the node
+//! listener faces — nor from the web UI, whose roles stop short of it: the socket is where
+//! the UI's own sign-in links are issued. Opening the database directly is out too: redb holds
+//! it exclusively for the life of the server, and `nodes` reports which sessions are open,
+//! which only the running server knows. A unix socket is reachable from this machine only,
 //! and gated twice, as `vk-registry`'s accounts socket is: it is `0600` from the moment it
 //! exists ([`vk_fs::bind_private`]), and every peer's `SO_PEERCRED` uid must be the hub's own
 //! or root's. That is the hub user's trust level — the one that could read the database
@@ -26,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::server::Hub;
+use crate::server::{Hub, Reach};
 use crate::store::{Role, UiSession};
 
 /// Bumped only for a change an older peer could misread.
@@ -35,7 +37,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Ceiling on a request: the largest is a few dozen bytes.
 const MAX_REQUEST: u64 = 64 * 1024;
 
-/// Ceiling on a reply, for the client: a runaway guard.
+/// Ceiling on a reply, for the client: a runaway guard, sized for a listing of a fleet far
+/// past its target size.
 const MAX_REPLY: u64 = 16 * 1024 * 1024;
 
 /// How long either side waits on the other. Every operation is a small redb transaction.
@@ -43,9 +46,14 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
-// Named on the wire for what they serve, `ui-login` and the rest.
-#[allow(clippy::enum_variant_names)]
 enum Call {
+    CreateToken {
+        ttl_secs: u64,
+    },
+    ListNodes,
+    RemoveNode {
+        id: String,
+    },
     UiLogin {
         role: Role,
         ttl_secs: u64,
@@ -77,6 +85,29 @@ enum Reply<T> {
     Err(String),
 }
 
+/// A freshly minted enrollment token.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreatedToken {
+    pub token: String,
+    pub expires_at: u64,
+}
+
+/// One row of `vk-hub nodes`: what the database holds about a node, joined with whether it
+/// has a session open now.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeView {
+    pub id: String,
+    pub hostname: String,
+    pub connected: bool,
+    pub last_seen: Option<u64>,
+    pub vk: Option<String>,
+    pub cpus: Option<u32>,
+    pub mem_total_mib: Option<u64>,
+    pub committed_mib: Option<u64>,
+    pub budget_mib: Option<u64>,
+    pub desired_concurrency: Option<u32>,
+}
+
 /// A web UI sign-in link, and when it stops working.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LoginLink {
@@ -99,7 +130,7 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
         ),
         Ok(_) => match std::os::unix::net::UnixStream::connect(path) {
             Ok(_) => bail!(
-                "another vk-hub is already serving {} — only one may use a state directory",
+                "another vk-hub is already serving {} — only one may use a data directory",
                 path.display()
             ),
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
@@ -206,6 +237,15 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
     )?;
     let actor = format!("uid {uid}");
     let value = match envelope.call {
+        Call::CreateToken { ttl_secs } => {
+            let (token, expires_at) = hub
+                .db
+                .create_token(Duration::from_secs(ttl_secs), crate::now_secs())?;
+            // The token itself is never logged: it is the credential.
+            eprintln!("vk-hub: admin: uid {uid} issued an enrollment token valid for {ttl_secs}s");
+            serde_json::to_value(CreatedToken { token, expires_at })?
+        }
+        Call::ListNodes => serde_json::to_value(node_views(hub)?)?,
         Call::UiLogin { role, ttl_secs } => {
             let Some(base) = &hub.ui_url else {
                 bail!("the web UI is not being served");
@@ -239,8 +279,48 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
             }
             serde_json::to_value(ended)?
         }
+        Call::RemoveNode { id } => {
+            let removed = hub.db.remove_node(&id)?;
+            if removed {
+                hub.revoke(&id);
+            }
+            eprintln!(
+                "vk-hub: admin: uid {uid} removed node {} ({})",
+                vk_fleet_proto::display_safe(&id),
+                if removed { "applied" } else { "no such node" }
+            );
+            serde_json::to_value(removed)?
+        }
     };
     Ok(value)
+}
+
+/// Every enrolled node, as `vk-hub nodes` shows it, ordered by hostname.
+fn node_views(hub: &Hub) -> Result<Vec<NodeView>> {
+    let mut views: Vec<NodeView> = hub
+        .db
+        .nodes()?
+        .into_iter()
+        .map(|(id, row)| {
+            let reach = hub.reach(&id);
+            let inventory = row.inventory.as_ref();
+            let admission = row.heartbeat.as_ref().and_then(|h| h.admission.as_ref());
+            NodeView {
+                connected: reach == Reach::Connected,
+                hostname: row.hostname.clone(),
+                last_seen: row.last_seen,
+                vk: inventory.map(|i| i.versions.vk.clone()),
+                cpus: inventory.map(|i| i.hardware.cpus),
+                mem_total_mib: inventory.and_then(|i| i.hardware.mem_total_mib),
+                committed_mib: admission.map(|a| a.committed_mib),
+                budget_mib: admission.and_then(|a| a.budget_mib),
+                desired_concurrency: row.heartbeat.as_ref().and_then(|h| h.desired_concurrency),
+                id,
+            }
+        })
+        .collect();
+    views.sort_by(|a, b| (&a.hostname, &a.id).cmp(&(&b.hostname, &b.id)));
+    Ok(views)
 }
 
 /// The running hub, reached over its admin socket. One short connection per call.
@@ -256,6 +336,21 @@ impl Client {
         Ok(Client {
             path: path.to_path_buf(),
         })
+    }
+
+    pub fn create_token(&self, ttl: Duration) -> Result<CreatedToken> {
+        self.call(Call::CreateToken {
+            ttl_secs: ttl.as_secs(),
+        })
+    }
+
+    pub fn list_nodes(&self) -> Result<Vec<NodeView>> {
+        self.call(Call::ListNodes)
+    }
+
+    /// Whether there was such a node to remove.
+    pub fn remove_node(&self, id: &str) -> Result<bool> {
+        self.call(Call::RemoveNode { id: id.to_string() })
     }
 
     pub fn ui_login(&self, role: Role, ttl: Duration) -> Result<LoginLink> {
@@ -317,6 +412,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tokens_and_nodes_are_served_over_the_socket() {
+        let dir = scratch("admin");
+        let path = dir.join("admin.sock");
+        let hub = Arc::new(Hub::new(Arc::new(Db::open_memory().unwrap())));
+        tokio::spawn(serve(bind(&path).unwrap(), hub.clone()));
+        let client = Client::connect(&path).unwrap();
+        let created = tokio::task::spawn_blocking(move || {
+            client.create_token(Duration::from_secs(60)).unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(created.expires_at > crate::now_secs());
+        hub.db
+            .enroll(&created.token, "aa", "ci-1", crate::now_secs())
+            .unwrap();
+        let client = Client::connect(&path).unwrap();
+        let (nodes, refused, removed) = tokio::task::spawn_blocking(move || {
+            let nodes = client.list_nodes().unwrap();
+            let refused = client.create_token(Duration::ZERO).unwrap_err();
+            let id = nodes[0].id.clone();
+            let removed = (
+                client.remove_node(&id).unwrap(),
+                client.remove_node(&id).unwrap(),
+                client.list_nodes().unwrap().len(),
+            );
+            (nodes, refused, removed)
+        })
+        .await
+        .unwrap();
+        assert_eq!(removed, (true, false, 0));
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].hostname, "ci-1");
+        assert!(!nodes[0].connected);
+        assert!(format!("{refused:#}").contains("lifetime"), "{refused:#}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

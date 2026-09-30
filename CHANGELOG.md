@@ -17,6 +17,13 @@ All notable changes to virtkit will be documented in this file.
   random `vk-….localhost` name, so its session cookie reaches nothing else you serve.
   `vk-hub local login` prints another link; `vk-hub local sessions` and `logout` list and end
   sessions.
+- **Experimental: `vk-hub`, a hub for a fleet of `vk` hosts.** `vk-hub serve --config
+  hub.toml` accepts hosts that enroll with a single-use token from `vk-hub token create`,
+  and keeps what each one reports about itself. `vk-hub nodes` lists them: whether each is
+  connected, when it was last seen, its `vk` version, CPUs and memory, the memory its CI jobs
+  have committed against the budget, and the concurrency it wants; `vk-hub nodes remove`
+  takes one out of the fleet. The hub only observes for now; it does not steer its hosts
+  yet.
 
 ### Changed
 
