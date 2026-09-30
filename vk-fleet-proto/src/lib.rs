@@ -34,11 +34,12 @@
 //!
 //! **Steering.** Once a session is up the node sends a [`Report`] of its observed state —
 //! the desired-state generation it last applied, its [`NodeState`], whether its runner is
-//! taking jobs, its concurrency — and again whenever that changes, along with an ack for
-//! every command whose outcome the hub has not yet recorded. The hub answers each ack with
-//! [`HubMsg::Recorded`], resends desired state to a node whose report shows it behind, and
-//! resends commands that have no final outcome; the node recognizes a command it journaled
-//! by its ID and answers with the outcome it recorded rather than acting twice.
+//! taking jobs, its concurrency, the VMs running on it — and again whenever that changes,
+//! along with an ack for every command whose outcome the hub has not yet recorded. The hub
+//! answers each ack with [`HubMsg::Recorded`], resends desired state to a node whose report
+//! shows it behind, and resends commands that have no final outcome; the node recognizes a
+//! command it journaled by its ID and answers with the outcome it recorded rather than acting
+//! twice.
 //!
 //! Version 1 has not shipped in a release, so these messages are version 1's own. From the
 //! first release on, a message or variant an older peer could not parse takes a new version,
@@ -78,7 +79,7 @@ pub const SHA256_LEN: usize = 32;
 /// The [`WorkloadList`] version this build writes and reads.
 pub const WORKLOADS_VERSION: u32 = 1;
 
-/// The most workloads a [`WorkloadList`] carries.
+/// The most workloads a [`WorkloadList`] or a node's [`Report`] carries.
 pub const MAX_WORKLOADS: usize = 256;
 
 /// The most bytes a [`WorkloadList`]'s workloads take, serialized.
@@ -554,6 +555,11 @@ pub struct Heartbeat {
     pub mem_available_mib: Option<u64>,
     /// Free space on each [`Filesystem`] of the inventory, by role.
     pub storage: Vec<FsUsage>,
+    /// What each of the report's [`Workload`]s holds on the host now, in bytes, by its ID.
+    /// Here rather than on the workload, so a figure that moves every second does not resend
+    /// the report. A workload missing here could not be measured.
+    #[serde(default)]
+    pub workload_mem_bytes: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -639,6 +645,15 @@ pub struct Report {
     /// The update under way, or the last one, with how it ended.
     #[serde(default)]
     pub update: Option<UpdateProgress>,
+    /// The VMs running on the node for its user, oldest first. `None` until the node has
+    /// looked. At most [`MAX_WORKLOADS`] of them, fewer when their strings are long: a node
+    /// keeps its CI jobs first, then its newest VMs, and counts the rest in
+    /// `workloads_omitted`.
+    #[serde(default)]
+    pub workloads: Option<Vec<Workload>>,
+    /// VMs running but left out of `workloads`.
+    #[serde(default)]
+    pub workloads_omitted: u32,
 }
 
 /// How far an [`Operation::Update`] has got.
@@ -803,7 +818,8 @@ pub struct WorkloadList {
 }
 
 /// A VM running on a host. Only what changes when the VM starts or stops: what it holds on
-/// the host now is apart from it ([`WorkloadList::mem_bytes`]).
+/// the host now is apart from it ([`WorkloadList::mem_bytes`], and a node's
+/// [`Heartbeat::workload_mem_bytes`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workload {
     /// Stable while the VM runs, and the same for a VM booted again on the same state dir:
@@ -943,31 +959,6 @@ mod tests {
         }
     }
 
-    /// A workload's shape is pinned here, and a kind from a later `vk` reads as `Other`.
-    #[test]
-    fn workloads_keep_their_wire_shape() {
-        let wire = r#"{"id":"abababababababab","kind":"ci_job","state_dir":"/var/lib/vk/jobs/4242","label":"rust:1.90","project":"acme/web","job_name":"test:unit","job_id":"4242","workspace":null,"environment":null,"pid":1234,"cpus":4,"mem_reserved_mib":8192,"started_at":1800000000}"#;
-        assert_eq!(serde_json::to_string(&workload()).unwrap(), wire);
-        assert_eq!(serde_json::from_str::<Workload>(wire).unwrap(), workload());
-        let later: Workload =
-            serde_json::from_str(r#"{"id":"x","kind":"service","state_dir":"/s","added_later":1}"#)
-                .unwrap();
-        assert_eq!(later.kind, WorkloadKind::Other);
-        assert_eq!((later.pid, later.label), (None, None));
-        let dev = Workload {
-            kind: WorkloadKind::Dev,
-            ssh_alias: Some("vk-w-1".into()),
-            guest_workspace: Some("/workdir".into()),
-            ..workload()
-        };
-        let json = serde_json::to_string(&dev).unwrap();
-        assert!(
-            json.ends_with(r#""ssh_alias":"vk-w-1","guest_workspace":"/workdir"}"#),
-            "{json}"
-        );
-        assert_eq!(serde_json::from_str::<Workload>(&json).unwrap(), dev);
-    }
-
     /// A list from a `vk` that measured nothing and omitted nothing reads all the same.
     #[test]
     fn a_list_reads_without_its_optional_fields() {
@@ -987,6 +978,26 @@ mod tests {
         };
         let json = serde_json::to_string(&list).unwrap();
         assert_eq!(serde_json::from_str::<WorkloadList>(&json).unwrap(), list);
+    }
+
+    fn workload_bare() -> Workload {
+        Workload {
+            id: "cd".repeat(8),
+            kind: WorkloadKind::Dev,
+            state_dir: "/home/u/.local/state/virtkit/dev/w-1".into(),
+            label: None,
+            project: None,
+            job_name: None,
+            job_id: None,
+            workspace: Some("/home/u/w".into()),
+            environment: Some("dev".into()),
+            pid: None,
+            cpus: None,
+            mem_reserved_mib: None,
+            started_at: None,
+            ssh_alias: None,
+            guest_workspace: None,
+        }
     }
 
     #[test]
@@ -1019,6 +1030,7 @@ mod tests {
                     free_inodes: 1000,
                     inodes: 1 << 20,
                 }],
+                workload_mem_bytes: BTreeMap::from([("ab".repeat(8), 1 << 30)]),
             }),
             NodeMsg::Heartbeat(Heartbeat::default()),
             NodeMsg::Ack(CommandAck {
@@ -1058,6 +1070,12 @@ mod tests {
                     phase: UpdatePhase::RolledBack,
                     message: Some("validation failed".into()),
                 }),
+                workloads: Some(vec![workload(), workload_bare()]),
+                workloads_omitted: 3,
+            }),
+            NodeMsg::Report(Report {
+                workloads: Some(Vec::new()),
+                ..Report::default()
             }),
         ] {
             round_trip(&msg);
@@ -1163,6 +1181,53 @@ mod tests {
                 vk_version: "9.9.9".into(),
             }
         );
+    }
+
+    /// Workloads were added to the report and the heartbeat after both shipped in a build a
+    /// node may run: a message without them still reads, as "not looked" and "none measured".
+    /// A workload's own shape is pinned here, and a kind from a later node reads as `Other`.
+    #[test]
+    fn workloads_keep_their_wire_shape() {
+        let report: Report = serde_json::from_str(
+            r#"{"applied_generation":null,"state":"ready","acquisition":"run","runner":"external","runner_state":null,"concurrency":null,"drain":null}"#,
+        )
+        .unwrap();
+        assert_eq!((report.workloads, report.workloads_omitted), (None, 0));
+        let hb: Heartbeat = serde_json::from_str(
+            r#"{"admission":null,"desired_concurrency":null,"mem_available_mib":null,"storage":[]}"#,
+        )
+        .unwrap();
+        assert!(hb.workload_mem_bytes.is_empty());
+
+        let wire = r#"{"id":"abababababababab","kind":"ci_job","state_dir":"/var/lib/vk/jobs/4242","label":"rust:1.90","project":"acme/web","job_name":"test:unit","job_id":"4242","workspace":null,"environment":null,"pid":1234,"cpus":4,"mem_reserved_mib":8192,"started_at":1800000000}"#;
+        assert_eq!(serde_json::to_string(&workload()).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<Workload>(wire).unwrap(), workload());
+        let later: Workload =
+            serde_json::from_str(r#"{"id":"x","kind":"service","state_dir":"/s","added_later":1}"#)
+                .unwrap();
+        assert_eq!(later.kind, WorkloadKind::Other);
+        assert_eq!((later.pid, later.label), (None, None));
+        let hb = Heartbeat {
+            workload_mem_bytes: BTreeMap::from([("abababababababab".into(), 5)]),
+            ..Heartbeat::default()
+        };
+        assert!(
+            serde_json::to_string(&hb)
+                .unwrap()
+                .ends_with(r#""workload_mem_bytes":{"abababababababab":5}}"#)
+        );
+        let dev = Workload {
+            kind: WorkloadKind::Dev,
+            ssh_alias: Some("vk-w-1".into()),
+            guest_workspace: Some("/workdir".into()),
+            ..workload()
+        };
+        let json = serde_json::to_string(&dev).unwrap();
+        assert!(
+            json.ends_with(r#""ssh_alias":"vk-w-1","guest_workspace":"/workdir"}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Workload>(&json).unwrap(), dev);
     }
 
     #[test]

@@ -109,6 +109,7 @@ pub fn heartbeat(cfg: &Config) -> Heartbeat {
                 })
             })
             .collect(),
+        workload_mem_bytes: Default::default(),
     }
 }
 

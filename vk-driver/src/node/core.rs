@@ -284,6 +284,9 @@ impl Core {
             concurrency_error: lock(&self.concurrency_error).clone(),
             drain: *lock(&self.drain),
             update: persisted.update.clone(),
+            // The session's to add: they are gathered off the host, not kept here.
+            workloads: None,
+            workloads_omitted: 0,
         }
     }
 
