@@ -115,7 +115,7 @@ enum Step {
     Newer,
     /// a different version that is not newer: an older release — installable, which is
     /// what naming one on the command line is for — or a tag carrying no version to
-    /// order at all, which [`Tool::smoke_test`] then refuses because the build cannot
+    /// order at all, which [`smoke_test`] then refuses because the build cannot
     /// report the tag's own name as its version.
     Other,
 }
@@ -378,49 +378,13 @@ impl Tool {
         // file any process still holds open for writing (ETXTBSY).
         drop(file);
 
-        self.smoke_test(tmp, version_of(&target.tag))
+        // Before the rename, so a binary that fails this never becomes the installed one.
+        smoke_test(self.name, tmp, version_of(&target.tag))
     }
 
     /// This tool's expected sha256, from the sidecar CI publishes beside its asset.
     async fn digest(&self, client: &reqwest::Client, target: &Target) -> Result<[u8; 32]> {
         digest_at(client, &target.digest_url, self.name).await
-    }
-
-    /// Confirm the downloaded binary runs on this host and is the version we asked for:
-    /// the digest proves the transfer was faithful, not that the release is usable here
-    /// (a foreign architecture hashes fine and cannot exec). Runs before the rename, so
-    /// a binary that fails this never becomes the installed one.
-    fn smoke_test(&self, path: &Path, version: &str) -> Result<()> {
-        let out = run_version(path).map_err(|e| {
-            // Which errno this is decides what went wrong, and the causes are nothing alike:
-            // a release built for another architecture (ENOEXEC), a file some process still
-            // holds open for writing (ETXTBSY, and `run_version` has already waited it out),
-            // a host with no room left to fork (EAGAIN). Only the first two name a cause worth
-            // reporting — offering one for the rest buries the errno under a wrong answer.
-            let hint = match e.raw_os_error() {
-                Some(libc::ENOEXEC) => " (is the release built for this architecture?)",
-                Some(libc::ETXTBSY) => {
-                    " (something is still holding the download open for writing)"
-                }
-                _ => "",
-            };
-            anyhow::Error::new(e).context(format!("running {} --version{hint}", path.display()))
-        })?;
-        // Non-UTF-8 output is not a version string: fall through to the error below with
-        // it empty rather than mangling the bytes to report them.
-        let reported = std::str::from_utf8(&out.stdout).unwrap_or_default();
-        // A whole token, not a substring: `vk --version` prints `vk-driver <version> (<hash>)`,
-        // and `contains` would let a binary reporting `0.30.0` satisfy a request for `0.3`.
-        let named = reported.split_whitespace().any(|t| t == version);
-        if !out.status.success() || !named {
-            bail!(
-                "the downloaded {} did not report version {version} ({}, output: {})",
-                self.name,
-                out.status,
-                reported.trim()
-            );
-        }
-        Ok(())
     }
 
     /// Ask on stderr, read the answer on stdin. Anything but an explicit yes declines,
@@ -441,6 +405,43 @@ impl Tool {
             .context("reading the answer")?;
         Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
     }
+}
+
+/// Confirm that `path`, a download of tool `name` (which only names it in the error), runs
+/// on this host and reports `version` as a whitespace-separated token of its `--version`
+/// output: a digest proves a transfer was faithful, not that the release is usable here (a
+/// foreign architecture hashes fine and cannot exec). It executes `path`: call it only on a
+/// file already checked against its digest, with every write handle to it closed (a file
+/// still open for writing fails with ETXTBSY). Public so a caller that obtains a release
+/// some other way than [`Tool::update`] can hold it to the same gate before installing it.
+pub fn smoke_test(name: &str, path: &Path, version: &str) -> Result<()> {
+    let out = run_version(path).map_err(|e| {
+        // Which errno this is decides what went wrong, and the causes are nothing alike:
+        // a release built for another architecture (ENOEXEC), a file some process still
+        // holds open for writing (ETXTBSY, and `run_version` has already waited it out),
+        // a host with no room left to fork (EAGAIN). Only the first two name a cause worth
+        // reporting — offering one for the rest buries the errno under a wrong answer.
+        let hint = match e.raw_os_error() {
+            Some(libc::ENOEXEC) => " (is the release built for this architecture?)",
+            Some(libc::ETXTBSY) => " (something is still holding the download open for writing)",
+            _ => "",
+        };
+        anyhow::Error::new(e).context(format!("running {} --version{hint}", path.display()))
+    })?;
+    // Non-UTF-8 output is not a version string: fall through to the error below with
+    // it empty rather than mangling the bytes to report them.
+    let reported = std::str::from_utf8(&out.stdout).unwrap_or_default();
+    // A whole token, not a substring: `vk --version` prints `vk-driver <version> (<hash>)`,
+    // and `contains` would let a binary reporting `0.30.0` satisfy a request for `0.3`.
+    let named = reported.split_whitespace().any(|t| t == version);
+    if !out.status.success() || !named {
+        bail!(
+            "the downloaded {name} did not report version {version} ({}, output: {})",
+            out.status,
+            reported.trim()
+        );
+    }
+    Ok(())
 }
 
 /// The API endpoint for a release: the one `tag` names, or the latest published one.
@@ -1384,7 +1385,7 @@ mod tests {
             drop(held);
         });
         let looking = std::time::Instant::now();
-        VK.smoke_test(&s.exe, "0.30.0").unwrap();
+        smoke_test(VK.name, &s.exe, "0.30.0").unwrap();
         assert!(
             looking.elapsed() >= Duration::from_millis(20),
             "the first look succeeded: nothing waited"
@@ -1393,7 +1394,7 @@ mod tests {
         // Held for good: the wait is a budget, not a spin, so a file that never frees up
         // still reports the errno it failed on.
         let _held = OpenOptions::new().write(true).open(&s.exe).unwrap();
-        let err = VK.smoke_test(&s.exe, "0.30.0").unwrap_err();
+        let err = smoke_test(VK.name, &s.exe, "0.30.0").unwrap_err();
         assert_eq!(
             err.downcast_ref::<std::io::Error>()
                 .and_then(|e| e.raw_os_error()),
