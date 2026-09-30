@@ -154,8 +154,8 @@ impl Hub {
         }
     }
 
-    /// Note that something a page shows beyond one node's row may have changed: in local
-    /// mode, the VMs listed.
+    /// Note that something a page shows beyond one node's row may have changed: a rollout, or
+    /// in local mode the VMs listed.
     pub(crate) fn touch(&self) {
         self.changes.send_modify(|n| *n = n.wrapping_add(1));
     }

@@ -769,3 +769,216 @@ async fn a_release_is_served_only_to_a_node_updating_to_it_that_signs_for_it() {
     assert!(!dir.join("releases").join(&sha).exists());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollout_updates_wave_by_wave_and_pauses_on_a_failure() {
+    let dir = std::env::temp_dir().join(format!("vk-hub-rollout-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let hub = Hub::new(Arc::new(Db::open_memory().unwrap())).with_releases(dir.join("releases"));
+    std::fs::write(dir.join("vk"), fake_vk("0.81.0")).unwrap();
+    let release = releases::add(&hub, "uid 0", &dir.join("vk"), "0.81.0", None).unwrap();
+    let node = |name: &str, key: &str| {
+        let (token, _) = hub
+            .db
+            .create_token(Duration::from_secs(60), "uid 0", 0)
+            .unwrap();
+        let store::Enrollment::Enrolled { node_id } = hub.db.enroll(&token, key, name, 1).unwrap()
+        else {
+            panic!("expected an enrollment");
+        };
+        node_id
+    };
+    let (a, b, c) = (node("a", "k1"), node("b", "k2"), node("c", "k3"));
+    let on = |id: &str, sha: &str| {
+        let mut inventory = Inventory {
+            hostname: id.into(),
+            ..Inventory::default()
+        };
+        inventory.versions.vk_sha256 = Some(sha.into());
+        hub.db.record_inventory(id, inventory, 2).unwrap();
+        hub.db
+            .record_report(
+                id,
+                vk_fleet_proto::Report {
+                    runner: vk_fleet_proto::RunnerMode::Managed,
+                    ..vk_fleet_proto::Report::default()
+                },
+                2,
+            )
+            .unwrap();
+    };
+    on(&a, &"00".repeat(32));
+    on(&b, &"00".repeat(32));
+    on(&c, &release.sha256);
+    let plan = ops::RolloutPlan {
+        release: release.sha256[..8].into(),
+        nodes: ops::Selection::All,
+        batch: 1,
+        canary_per_profile: true,
+        max_failures: 1,
+        node_timeout_secs: 600,
+        drain_timeout_secs: 600,
+        force: false,
+    };
+    let rollout = ops::create_rollout(&hub, "uid 0", &plan).unwrap();
+    // One rollout at a time.
+    assert!(ops::create_rollout(&hub, "uid 0", &plan).is_err());
+    let command_of = |id: &str| hub.db.pending_commands(id, now_secs()).unwrap();
+    let advance = || hub.db.advance_rollout(&rollout.id, now_secs()).unwrap();
+    // The canary (all three share a profile; c already runs it): one node at a time.
+    let (_, issued) = advance();
+    assert_eq!(issued.len(), 1);
+    let first = issued[0].clone();
+    let second = if first == a { b.clone() } else { a.clone() };
+    assert!(command_of(&second).is_empty());
+    assert!(advance().1.is_empty());
+    let cmd = command_of(&first).remove(0);
+    hub.db
+        .record_ack(
+            &first,
+            &vk_fleet_proto::CommandAck {
+                id: cmd.id,
+                outcome: vk_fleet_proto::Outcome::Done,
+            },
+            3,
+        )
+        .unwrap();
+    on(&first, &release.sha256);
+    // Updated and back: the next wave starts.
+    assert_eq!(advance().1, std::slice::from_ref(&second));
+    let cmd = command_of(&second).remove(0);
+    hub.db
+        .record_ack(
+            &second,
+            &vk_fleet_proto::CommandAck {
+                id: cmd.id,
+                outcome: vk_fleet_proto::Outcome::Failed {
+                    message: "rolled back: validation failed".into(),
+                },
+            },
+            4,
+        )
+        .unwrap();
+    advance();
+    let (_, row) = hub.db.resolve_rollout(&rollout.id[..6]).unwrap();
+    assert!(
+        matches!(row.state, rollout::RolloutState::Paused { .. }),
+        "{row:?}"
+    );
+    // The release stays while its rollout is not over.
+    assert!(releases::remove(&hub, "uid 0", &release.sha256).is_err());
+    let resumed =
+        ops::steer_rollout(&hub, "uid 0", &rollout.id, store::RolloutAction::Resume).unwrap();
+    assert_eq!(resumed.row.state, rollout::RolloutState::Running);
+    advance();
+    let (_, row) = hub.db.resolve_rollout(&rollout.id).unwrap();
+    assert_eq!(row.state, rollout::RolloutState::Done);
+    let events: Vec<String> = hub
+        .db
+        .audits(None, 100)
+        .unwrap()
+        .into_iter()
+        .map(|r| format!("{}: {}", r.actor, r.event))
+        .collect();
+    for want in [
+        "started rollout",
+        "1 already running it",
+        "updated to vk 0.81.0",
+        "paused: a node failed",
+        "resumed rollout",
+        "done: vk 0.81.0 on 1 node(s), 1 failed, 1 skipped",
+    ] {
+        assert!(
+            events.iter().any(|e| e.contains(want)),
+            "{want}: {events:?}"
+        );
+    }
+    assert!(ops::steer_rollout(&hub, "uid 0", &rollout.id, store::RolloutAction::Pause).is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A hub restarted mid-rollout carries on from its database, and a node the rollout still
+/// has to update takes no update of an operator's meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollout_survives_a_hub_restart() {
+    let dir = std::env::temp_dir().join(format!("vk-hub-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("data").join("hub.db");
+    let open =
+        || Hub::new(Arc::new(Db::open(&db_path).unwrap())).with_releases(dir.join("releases"));
+    let hub = open();
+    std::fs::write(dir.join("vk"), fake_vk("0.81.0")).unwrap();
+    let release = releases::add(&hub, "uid 0", &dir.join("vk"), "0.81.0", None).unwrap();
+    let mut ids = Vec::new();
+    for (name, key) in [("a", "k1"), ("b", "k2")] {
+        let (token, _) = hub
+            .db
+            .create_token(Duration::from_secs(60), "uid 0", 0)
+            .unwrap();
+        let store::Enrollment::Enrolled { node_id } = hub.db.enroll(&token, key, name, 1).unwrap()
+        else {
+            panic!("expected an enrollment");
+        };
+        hub.db
+            .record_report(
+                &node_id,
+                vk_fleet_proto::Report {
+                    runner: vk_fleet_proto::RunnerMode::Managed,
+                    ..vk_fleet_proto::Report::default()
+                },
+                2,
+            )
+            .unwrap();
+        ids.push(node_id);
+    }
+    let plan = ops::RolloutPlan {
+        release: release.sha256.clone(),
+        nodes: ops::Selection::All,
+        batch: 1,
+        canary_per_profile: false,
+        max_failures: 0,
+        node_timeout_secs: 600,
+        drain_timeout_secs: 600,
+        force: false,
+    };
+    let rollout = ops::create_rollout(&hub, "uid 0", &plan).unwrap();
+    let (_, issued) = hub.db.advance_rollout(&rollout.id, now_secs()).unwrap();
+    assert_eq!(issued.len(), 1);
+    let other = ids.iter().find(|id| **id != issued[0]).unwrap().clone();
+    let err = ops::update(&hub, "uid 0", &other, &release.sha256, false).unwrap_err();
+    assert!(format!("{err:#}").contains("rollout"), "{err:#}");
+    // Nothing changed: nothing written.
+    assert_eq!(
+        hub.db.advance_rollout(&rollout.id, now_secs()).unwrap(),
+        (false, vec![])
+    );
+    drop(hub);
+
+    let hub = open();
+    let first = &issued[0];
+    let cmd = hub
+        .db
+        .pending_commands(first, now_secs())
+        .unwrap()
+        .remove(0);
+    hub.db
+        .record_ack(
+            first,
+            &vk_fleet_proto::CommandAck {
+                id: cmd.id,
+                outcome: vk_fleet_proto::Outcome::Done,
+            },
+            3,
+        )
+        .unwrap();
+    let mut inventory = Inventory::default();
+    inventory.versions.vk_sha256 = Some(release.sha256.clone());
+    hub.db.record_inventory(first, inventory, 4).unwrap();
+    assert_eq!(
+        hub.db.advance_rollout(&rollout.id, now_secs()).unwrap().1,
+        std::slice::from_ref(&other)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

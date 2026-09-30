@@ -9,8 +9,9 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use vk_fleet_proto::{Acquisition, Command, DesiredState, Operation, Report};
 
+use crate::rollout::{NodeStatus, Rollout, RolloutNode, RolloutRow, RolloutState};
 use crate::server::{Hub, Reach};
-use crate::store::{NodeRow, Release};
+use crate::store::{NodeRow, Release, RolloutAction};
 
 /// How long an operator's command waits for its node to come and take it. A day covers a
 /// node rebooting or a hub outage; a drain found a week later is not what anyone meant.
@@ -130,8 +131,24 @@ pub fn command(hub: &Hub, actor: &str, id: &str, operation: Operation) -> Result
 
 /// Update node `id` to the release whose sha256 starts with `release`. `force` lets a node
 /// whose runner is external update without draining it.
+///
+/// A node a rollout still has to update is the rollout's: an update of an operator's on the
+/// side would race the one the rollout issues, so it is refused until the rollout is over.
 pub fn update(hub: &Hub, actor: &str, id: &str, release: &str, force: bool) -> Result<Command> {
     let release = hub.db.resolve_release(release)?;
+    for (rollout, row) in hub.db.rollouts()? {
+        if row.state.active()
+            && row.nodes.iter().any(|n| {
+                n.id == id && matches!(n.status, NodeStatus::Pending | NodeStatus::Updating { .. })
+            })
+        {
+            bail!(
+                "node {id} is in rollout {}, still {}; abort it first, or let it finish",
+                crate::rollout::short_id(&rollout),
+                row.state.name()
+            );
+        }
+    }
     issue(hub, actor, id, update_operation(&release, force))
 }
 
@@ -175,4 +192,132 @@ fn desired_changed(hub: &Hub, actor: &str, id: &str, what: &str, changed: Option
         }
         None => eprintln!("vk-hub: node {id}: {actor} {what}: already so"),
     }
+}
+
+/// Which nodes a rollout goes to.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Selection {
+    All,
+    /// Node IDs, or prefixes of at least 8 digits naming one each.
+    Nodes(Vec<String>),
+}
+
+/// How a rollout goes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutPlan {
+    pub release: String,
+    pub nodes: Selection,
+    pub batch: u32,
+    pub canary_per_profile: bool,
+    pub max_failures: u32,
+    pub node_timeout_secs: u64,
+    pub drain_timeout_secs: u64,
+    /// Include nodes whose runner is external, updated without a drain.
+    pub force: bool,
+}
+
+/// Start rolling a release out, as `actor`. Nodes already running it are skipped from the
+/// start, so canaries are picked among those that are not.
+pub fn create_rollout(hub: &Hub, actor: &str, plan: &RolloutPlan) -> Result<Rollout> {
+    if plan.batch == 0 {
+        bail!("a batch is at least one node");
+    }
+    if plan.node_timeout_secs < 60 || plan.drain_timeout_secs < 60 {
+        bail!("a node's drain and its update need at least a minute each");
+    }
+    let release = hub.db.resolve_release(&plan.release)?;
+    let nodes = hub.db.nodes()?;
+    let chosen: Vec<(String, NodeRow)> = match &plan.nodes {
+        Selection::All => nodes,
+        Selection::Nodes(wanted) => {
+            let mut chosen: Vec<(String, NodeRow)> = Vec::new();
+            for want in wanted {
+                let mut found = nodes
+                    .iter()
+                    .filter(|(id, _)| want.len() >= 8 && id.starts_with(want.as_str()));
+                match (found.next(), found.next()) {
+                    (Some(n), None) => {
+                        if !chosen.iter().any(|(id, _)| *id == n.0) {
+                            chosen.push(n.clone());
+                        }
+                    }
+                    (None, _) => bail!("there is no node {want}"),
+                    (Some(_), Some(_)) => bail!("{want} names more than one node"),
+                }
+            }
+            chosen
+        }
+    };
+    if chosen.is_empty() {
+        bail!("there is no node to roll out to");
+    }
+    let (mut already, mut to_do) = (Vec::new(), Vec::new());
+    for (id, row) in chosen {
+        let versions = row.inventory.as_ref().map(|i| &i.versions);
+        let on = match versions.and_then(|v| v.vk_sha256.as_deref()) {
+            Some(sha) => sha == release.sha256,
+            None => versions.is_some_and(|v| v.vk == release.row.version),
+        };
+        let profile = crate::rollout::profile(row.inventory.as_ref());
+        if on {
+            already.push((id, row.hostname, profile));
+        } else {
+            to_do.push((id, row.hostname, profile));
+        }
+    }
+    let mut nodes = crate::rollout::plan(to_do, plan.batch, plan.canary_per_profile);
+    nodes.extend(
+        already
+            .into_iter()
+            .map(|(id, hostname, profile)| RolloutNode {
+                id,
+                hostname,
+                profile,
+                wave: 0,
+                status: NodeStatus::Skipped {
+                    reason: "already runs the release".into(),
+                },
+            }),
+    );
+    let now = crate::now_secs();
+    let row = RolloutRow {
+        release: release.sha256.clone(),
+        version: release.row.version.clone(),
+        created_at: now,
+        created_by: actor.to_string(),
+        batch: plan.batch,
+        canary_per_profile: plan.canary_per_profile,
+        max_failures: plan.max_failures,
+        node_timeout_secs: plan.node_timeout_secs,
+        drain_timeout_secs: plan.drain_timeout_secs,
+        force: plan.force,
+        state: RolloutState::Running,
+        failures: 0,
+        nodes,
+    };
+    let id = crate::random_hex(vk_fleet_proto::ID_BYTES)?;
+    hub.db.create_rollout(&id, &row, actor)?;
+    eprintln!(
+        "vk-hub: {actor} started rollout {} of vk {}",
+        crate::rollout::short_id(&id),
+        row.version
+    );
+    hub.touch();
+    Ok(Rollout { id, row })
+}
+
+/// Pause, resume or abort the rollout whose ID starts with `id`, as `actor`.
+pub fn steer_rollout(hub: &Hub, actor: &str, id: &str, action: RolloutAction) -> Result<Rollout> {
+    let (id, _) = hub.db.resolve_rollout(id)?;
+    let row = hub
+        .db
+        .steer_rollout(&id, action, actor, crate::now_secs())?;
+    eprintln!(
+        "vk-hub: {actor}: rollout {} is now {}",
+        crate::rollout::short_id(&id),
+        row.state.name()
+    );
+    hub.touch();
+    Ok(Rollout { id, row })
 }

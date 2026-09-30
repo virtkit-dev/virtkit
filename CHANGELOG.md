@@ -70,6 +70,14 @@ All notable changes to virtkit will be documented in this file.
   deadline is rolled back to the previous `vk`, and the host returns to the state it was in
   either way. A host whose runner is external updates only when forced, and a host goes back
   to an older `vk` only when its own `[node] allow_downgrade` says it may.
+- **Experimental: `vk-hub rollout` updates a fleet a wave at a time.** `rollout create
+  --release <sha256>` updates the chosen hosts in batches (`--batch`), optionally one host of
+  each hardware profile first (`--canary-per-profile`), each wave only once the last is updated
+  and back to work. A failed host pauses the rollout until `rollout resume`, and too many
+  (`--max-failures`) abort it; `rollout status`, `pause` and `abort` follow and steer it, and
+  a restarted hub carries on where it stopped. A host gets `--drain-timeout` to drain and
+  `--node-timeout` to update after that; hosts with an external runner are left out unless
+  `--force`.
 - **Experimental: signed `vk` releases for a fleet.** `vk release-key generate` makes a
   signing key and `vk release-key sign` signs a binary, on a machine of your choosing;
   `vk-hub release add --signature` passes the signature on. A host with `[node] release_keys`

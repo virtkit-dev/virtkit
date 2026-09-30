@@ -95,6 +95,14 @@ enum Call {
     RemoveRelease {
         release: String,
     },
+    CreateRollout {
+        plan: ops::RolloutPlan,
+    },
+    ListRollouts,
+    SteerRollout {
+        id: String,
+        action: RolloutAction,
+    },
     UiLogin {
         role: Role,
         ttl_secs: u64,
@@ -134,7 +142,8 @@ pub struct CreatedToken {
 }
 
 use crate::ops::NodeView;
-use crate::store::{Release, Role, UiSession};
+use crate::rollout::Rollout;
+use crate::store::{Release, Role, RolloutAction, UiSession};
 
 /// A web UI sign-in link, and when it stops working.
 #[derive(Debug, Serialize, Deserialize)]
@@ -302,6 +311,19 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
             let removed = crate::releases::remove(hub, &actor, &release.sha256)?;
             serde_json::to_value(removed.then_some(release))?
         }
+        Call::CreateRollout { plan } => {
+            serde_json::to_value(ops::create_rollout(hub, &actor, &plan)?)?
+        }
+        Call::ListRollouts => serde_json::to_value(
+            hub.db
+                .rollouts()?
+                .into_iter()
+                .map(|(id, row)| Rollout { id, row })
+                .collect::<Vec<_>>(),
+        )?,
+        Call::SteerRollout { id, action } => {
+            serde_json::to_value(ops::steer_rollout(hub, &actor, &id, action)?)?
+        }
         Call::Audit { node, limit } => {
             serde_json::to_value(hub.db.audits(node.as_deref(), limit)?)?
         }
@@ -439,6 +461,21 @@ impl Client {
     pub fn remove_release(&self, release: &str) -> Result<Option<Release>> {
         self.call(Call::RemoveRelease {
             release: release.to_string(),
+        })
+    }
+
+    pub fn create_rollout(&self, plan: ops::RolloutPlan) -> Result<Rollout> {
+        self.call(Call::CreateRollout { plan })
+    }
+
+    pub fn rollouts(&self) -> Result<Vec<Rollout>> {
+        self.call(Call::ListRollouts)
+    }
+
+    pub fn steer_rollout(&self, id: &str, action: RolloutAction) -> Result<Rollout> {
+        self.call(Call::SteerRollout {
+            id: id.to_string(),
+            action,
         })
     }
 

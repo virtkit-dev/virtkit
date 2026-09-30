@@ -9,8 +9,9 @@ and the hub auditing them (`vk-hub nodes ceiling`, `stop`, `resume`, `drain`, `u
 its steering actions, signed into with links from `vk-hub ui login`; releases held by the
 hub and served to the nodes updating to them (`vk-hub release`, `vk-hub nodes update`), and
 nodes updating to them, on trial, rolling back to the previous binary when the release does
-not pass, and checking the release's signature against keys of their own (`vk release-key`).
-Rollouts, resets, the GitLab API pause and the rest of the web UI are not built yet.
+not pass, and checking the release's signature against keys of their own (`vk release-key`);
+rollouts by wave, with a canary per hardware profile (`vk-hub rollout`). Resets, the GitLab
+API pause and the rest of the web UI are not built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -390,6 +391,40 @@ file, checking that it is an x86-64 ELF of at most 1 GiB that holds the stated v
 string of its own; the version is the operator's to state, and the node's smoke test is what
 proves it. `vk-hub nodes update <id> --release <sha256>` issues the update, which names the
 release by digest and size.
+
+Rollouts: `vk-hub rollout create --release <sha256> [--nodes all|<id>,…] [--batch N]
+[--canary-per-profile] [--max-failures N] [--node-timeout 30m] [--drain-timeout 4h]
+[--force]` puts the chosen nodes into waves — with canaries, wave 0 is one node of each
+hardware profile, and then batches of N in profile and hostname order — and a hub task issues
+each wave's updates once the wave before has finished. A hardware profile is the CPU model,
+the RAM rounded to the nearest power of two in GiB, and the speed classes declared for the job
+and checkout filesystems: what makes hosts behave differently under one `vk`, and nothing a
+heartbeat moves.
+
+A node's update succeeds when its command is `done`, it reports the release's sha256 (its
+version, for a node that reports none), and it is back in the state it was in when the update
+was issued — or `drained`, when an operator drained it meanwhile. It has two windows. The
+drain has `--drain-timeout`, from the issue: it is the command's expiry, so a node that never
+takes the command refuses it as expired, and one still draining then calls the update off.
+The update proper has `--node-timeout`, from the node's report that its drain is over: the
+command carries it, and the node makes it its trial's deadline, rolling back past it. The hub
+counts the node failed two minutes after that — its clock starts on the report, after the
+node's — so an update the rollout has given up on is never kept. A node also fails when its
+command fails or is refused, when it is removed, or when it ends its update quarantined.
+
+A failure pauses the rollout; `rollout resume` carries on past the failed node, and a failure
+past `--max-failures` aborts it instead; a node whose update ends after an abort is recorded
+but not counted. When its wave comes, a node is skipped when it already runs the release, is
+quarantined, removed, has not reported its state yet, is draining or in maintenance of its
+own, or — unless `--force` — has an external runner, which cannot be drained. `rollout status
+[<id>]`, `pause`, `resume` and `abort` steer it; pausing or aborting issues nothing more, and
+updates under way finish and are still recorded. One rollout runs at a time, a release is
+kept while a rollout of it is not over, and `vk-hub nodes update` refuses a node the running
+rollout has still to update. The rollout, its nodes' states and the commands it issues are one
+row in the hub's database, written with the audit lines that describe each step in the same
+transaction, and a pass that changes nothing writes nothing; the hub task advances every
+rollout from the database at start, whenever a node reports, and every five seconds, so a
+restarted hub carries on where it stopped.
 
 A node downloads the release it was told to from the node listener, `GET
 /v1/releases/<sha256>`, with its node ID, the time and a signature over both, the release and

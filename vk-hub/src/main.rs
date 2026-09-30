@@ -26,6 +26,7 @@ mod config;
 mod local;
 mod ops;
 mod releases;
+mod rollout;
 mod server;
 mod session;
 mod store;
@@ -84,6 +85,13 @@ enum Cmd {
         config: ConfigArg,
         #[command(subcommand)]
         cmd: ReleaseCmd,
+    },
+    /// Roll a release out to the fleet, a wave at a time
+    Rollout {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: RolloutCmd,
     },
     /// Show the audit log: operators' actions and what nodes reported of them
     Audit {
@@ -146,6 +154,67 @@ enum ReleaseCmd {
         /// Its sha256, or at least the first 8 hex digits
         release: String,
     },
+}
+
+#[derive(Subcommand)]
+enum RolloutCmd {
+    /// Start updating nodes to a release, a wave at a time
+    ///
+    /// Each wave's nodes are updated and back where they were before the next starts; nodes
+    /// already running the release are skipped. A failed node pauses the rollout, and one
+    /// failure past --max-failures aborts it.
+    Create {
+        /// The release's sha256, or at least its first 8 hex digits
+        #[arg(long)]
+        release: String,
+        /// `all`, or node IDs separated by commas
+        #[arg(long, default_value = "all")]
+        nodes: String,
+        /// Nodes per wave
+        #[arg(long, default_value_t = 1)]
+        batch: u32,
+        /// Update one node of each hardware profile first, on its own
+        ///
+        /// A profile is the CPU model, the RAM rounded to a power of two, and the declared
+        /// speed of the job and checkout filesystems.
+        #[arg(long)]
+        canary_per_profile: bool,
+        /// Failures to absorb, pausing at each, before aborting
+        #[arg(long, default_value_t = 0)]
+        max_failures: u32,
+        /// How long a node's update may take once drained: <n>m or <n>h
+        ///
+        /// The node rolls the release back past it, and the rollout counts the failure.
+        #[arg(long, default_value = "30m", value_parser = parse_node_timeout)]
+        node_timeout: Duration,
+        /// How long a node may take to drain for its update: <n>m or <n>h
+        ///
+        /// A node still draining then calls the update off.
+        #[arg(long, default_value = "4h", value_parser = parse_node_timeout)]
+        drain_timeout: Duration,
+        /// Include nodes whose runner is external, updated without a drain
+        #[arg(long)]
+        force: bool,
+    },
+    /// List the rollouts, or show one node by node
+    Status {
+        /// The rollout's ID, or at least its first 4 hex digits
+        id: Option<String>,
+    },
+    /// Issue no more updates until resumed; those under way finish
+    Pause { id: String },
+    /// Carry on with a paused rollout
+    Resume { id: String },
+    /// End a rollout for good; updates under way finish
+    Abort { id: String },
+}
+
+fn parse_node_timeout(s: &str) -> Result<Duration, String> {
+    let d = parse_ttl(s)?;
+    if d < Duration::from_secs(60) || d > Duration::from_secs(7 * 86_400) {
+        return Err(format!("{s:?}: expected between 1m and 7d"));
+    }
+    Ok(d)
 }
 
 #[derive(Subcommand)]
@@ -384,6 +453,10 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Cmd::Rollout { config, cmd } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            rollout_cmd(client, cmd).await
+        }
         Cmd::Release { config, cmd } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             match cmd {
@@ -506,6 +579,138 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+async fn rollout_cmd(client: admin::Client, cmd: RolloutCmd) -> Result<()> {
+    use store::RolloutAction;
+    match cmd {
+        RolloutCmd::Create {
+            release,
+            nodes,
+            batch,
+            canary_per_profile,
+            max_failures,
+            node_timeout,
+            drain_timeout,
+            force,
+        } => {
+            let nodes = match nodes.as_str() {
+                "all" => ops::Selection::All,
+                list => ops::Selection::Nodes(
+                    list.split(',')
+                        .map(|n| n.trim().to_string())
+                        .filter(|n| !n.is_empty())
+                        .collect(),
+                ),
+            };
+            let plan = ops::RolloutPlan {
+                release,
+                nodes,
+                batch,
+                canary_per_profile,
+                max_failures,
+                node_timeout_secs: node_timeout.as_secs(),
+                drain_timeout_secs: drain_timeout.as_secs(),
+                force,
+            };
+            let r = tokio::task::spawn_blocking(move || client.create_rollout(plan)).await??;
+            println!("{}", r.id);
+            print!("{}", render_rollout(&r, now_secs()));
+        }
+        RolloutCmd::Status { id: None } => {
+            let rollouts = tokio::task::spawn_blocking(move || client.rollouts()).await??;
+            for r in rollouts {
+                println!("{}", rollout_line(&r));
+            }
+        }
+        RolloutCmd::Status { id: Some(id) } => {
+            let rollouts = tokio::task::spawn_blocking(move || client.rollouts()).await??;
+            let mut found = rollouts.iter().filter(|r| r.id.starts_with(id.as_str()));
+            match (found.next(), found.next()) {
+                (Some(r), None) => print!("{}", render_rollout(r, now_secs())),
+                (None, _) => bail!("there is no rollout {id}"),
+                (Some(_), Some(_)) => bail!("{id} names more than one rollout"),
+            }
+        }
+        RolloutCmd::Pause { id } => steer(client, id, RolloutAction::Pause).await?,
+        RolloutCmd::Resume { id } => steer(client, id, RolloutAction::Resume).await?,
+        RolloutCmd::Abort { id } => steer(client, id, RolloutAction::Abort).await?,
+    }
+    Ok(())
+}
+
+async fn steer(client: admin::Client, id: String, action: store::RolloutAction) -> Result<()> {
+    let r = tokio::task::spawn_blocking(move || client.steer_rollout(&id, action)).await??;
+    eprintln!(
+        "vk-hub: rollout {} is {}",
+        rollout::short_id(&r.id),
+        rollout_state(&r.row.state)
+    );
+    Ok(())
+}
+
+/// One line of `vk-hub rollout status`: what it is and how far it has got.
+pub(crate) fn rollout_line(r: &rollout::Rollout) -> String {
+    let counts: Vec<String> = r
+        .counts()
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(name, n)| format!("{n} {name}"))
+        .collect();
+    let wave = match r.wave() {
+        Some(w) if r.row.state.active() => format!(" at wave {w}"),
+        _ => String::new(),
+    };
+    format!(
+        "{}  vk {} ({})  {}{wave}  started {} by {}  {}",
+        r.id,
+        r.row.version,
+        store::short(&r.row.release),
+        rollout_state(&r.row.state),
+        utc(r.row.created_at),
+        r.row.created_by,
+        counts.join(", ")
+    )
+}
+
+pub(crate) fn rollout_state(s: &rollout::RolloutState) -> String {
+    match s {
+        rollout::RolloutState::Paused { reason } | rollout::RolloutState::Aborted { reason } => {
+            format!("{} ({reason})", s.name())
+        }
+        _ => s.name().to_string(),
+    }
+}
+
+/// A node of a rollout, as its status shows it.
+pub(crate) fn rollout_node_status(s: &rollout::NodeStatus, now: u64) -> String {
+    use rollout::NodeStatus;
+    match s {
+        NodeStatus::Pending => "pending".to_string(),
+        NodeStatus::Skipped { reason } => format!("skipped: {reason}"),
+        NodeStatus::Updating { command, since, .. } => format!(
+            "updating for {} (command {command})",
+            human_duration(ago(now, *since))
+        ),
+        NodeStatus::Succeeded { at } => format!("succeeded at {}", utc(*at)),
+        NodeStatus::Failed { reason, .. } => format!("failed: {reason}"),
+    }
+}
+
+/// `vk-hub rollout status <id>`: the rollout, then each node by wave.
+fn render_rollout(r: &rollout::Rollout, now: u64) -> String {
+    let mut out = format!("{}\n", rollout_line(r));
+    for n in &r.row.nodes {
+        out.push_str(&format!(
+            "  wave {}  {}  {:<16}  {}  [{}]\n",
+            n.wave,
+            n.id,
+            n.hostname,
+            rollout_node_status(&n.status, now),
+            n.profile
+        ));
+    }
+    out
+}
+
 async fn acquisition(client: admin::Client, id: String, acquisition: Acquisition) -> Result<()> {
     let changed =
         tokio::task::spawn_blocking(move || client.set_acquisition(&id, acquisition)).await??;
@@ -564,6 +769,7 @@ async fn serve(cfg: HubConfig) -> Result<()> {
     // a token, so a hub without it could never enroll anything.
     let admin = admin::bind(&cfg.admin_socket())?;
     tokio::spawn(admin::serve(admin, hub.clone()));
+    tokio::spawn(rollout::drive(hub.clone()));
     if let Some((listener, tls, ui)) = ui {
         eprintln!(
             "vk-hub: serving the web UI on {}://{} as {}",

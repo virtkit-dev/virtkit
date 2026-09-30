@@ -29,6 +29,8 @@ use vk_fleet_proto::{
     Outcome, Report,
 };
 
+use crate::rollout::{Effect, Facts, NodeStatus, RolloutRow, RolloutState};
+
 /// Key: node ID. Value: JSON [`NodeRow`].
 const NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
 /// Key: `sha256(token)`, hex. Value: JSON [`TokenRow`].
@@ -47,6 +49,8 @@ const UI_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("ui_sessi
 /// Key: a `vk` release's sha256, hex. Value: JSON [`ReleaseRow`]; the binary is a file of
 /// that name in the hub's releases directory.
 const RELEASES: TableDefinition<&str, &[u8]> = TableDefinition::new("releases");
+/// Key: rollout ID. Value: JSON [`RolloutRow`].
+const ROLLOUTS: TableDefinition<&str, &[u8]> = TableDefinition::new("rollouts");
 
 /// The most audit rows kept. Bounded by count rather than age: a quiet fleet keeps its history
 /// for years, and a busy one keeps the newest hundred thousand actions and outcomes — months
@@ -257,6 +261,27 @@ struct TokenRow {
     expires_at: u64,
 }
 
+/// What an operator does to a rollout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutAction {
+    /// Issue no more updates; those under way finish.
+    Pause,
+    Resume,
+    /// End it: nothing more is issued, and it cannot be resumed.
+    Abort,
+}
+
+impl RolloutAction {
+    fn done(self) -> &'static str {
+        match self {
+            RolloutAction::Pause => "paused",
+            RolloutAction::Resume => "resumed",
+            RolloutAction::Abort => "aborted",
+        }
+    }
+}
+
 /// What an enrollment came to.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Enrollment {
@@ -360,6 +385,8 @@ impl Db {
             .context("opening the web UI sessions table")?;
         txn.open_table(RELEASES)
             .context("opening the releases table")?;
+        txn.open_table(ROLLOUTS)
+            .context("opening the rollouts table")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db { db })
     }
@@ -598,6 +625,14 @@ impl Db {
         if let Some(error) = report.concurrency_error.as_mut() {
             *error = vk_fleet_proto::display_safe(error);
         }
+        if let Some(u) = report.update.as_mut() {
+            u.version = vk_fleet_proto::display_safe(&u.version);
+            u.sha256 = vk_fleet_proto::display_safe(&u.sha256);
+            u.command = vk_fleet_proto::display_safe(&u.command);
+            if let Some(m) = u.message.as_mut() {
+                *m = vk_fleet_proto::display_safe(m);
+            }
+        }
         self.update_audited(
             id,
             Durability::Immediate,
@@ -640,37 +675,8 @@ impl Db {
         actor: &str,
         now: u64,
     ) -> Result<Command> {
-        let command = Command {
-            id: crate::random_hex(vk_fleet_proto::ID_BYTES)?,
-            expires_at: now.saturating_add(ttl.as_secs()),
-            op,
-        };
-        let row = CommandRow {
-            node_id: id.to_string(),
-            command: command.clone(),
-            issued_at: now,
-            outcome: None,
-            outcome_at: None,
-        };
         let txn = self.db.begin_write().context("starting a write")?;
-        {
-            if txn.open_table(NODES)?.get(id)?.is_none() {
-                bail!("node {id} is not enrolled");
-            }
-            let mut commands = txn.open_table(COMMANDS)?;
-            let (start, end) = command_range(id);
-            commands.retain_in(start.as_str()..end.as_str(), |_, value| {
-                decode::<CommandRow>(value).map_or(true, |r| !r.settled_before(now, COMMAND_KEEP))
-            })?;
-            let key = format!("{id}/{}", command.id);
-            commands.insert(key.as_str(), encode(&row)?.as_slice())?;
-            let event = format!(
-                "{actor} issued {} (command {})",
-                operation_name(&command.op),
-                command.id
-            );
-            append_audit(&txn, Some(id), actor, &event, now)?;
-        }
+        let command = insert_command(&txn, id, op, ttl, actor, now)?;
         txn.commit().context("issuing a command")?;
         Ok(command)
     }
@@ -1045,6 +1051,17 @@ impl Db {
                     );
                 }
             }
+            for entry in txn.open_table(ROLLOUTS)?.iter()? {
+                let (id, value) = entry?;
+                let row = decode::<RolloutRow>(value.value())?;
+                if row.release == sha256 && row.state.active() {
+                    bail!(
+                        "rollout {} of this release is {}",
+                        crate::rollout::short_id(id.value()),
+                        row.state.name()
+                    );
+                }
+            }
             let removed = txn.open_table(RELEASES)?.remove(sha256)?.is_some();
             if removed {
                 let event = format!("{actor} removed release {}", short(sha256));
@@ -1063,6 +1080,256 @@ impl Db {
             .node_commands(id)?
             .iter()
             .any(|c| c.updates_to(sha256, now)))
+    }
+
+    /// Record rollout `id`, audited as `actor`'s, unless another is still running or paused:
+    /// two rollouts at once would update the same nodes against each other.
+    pub fn create_rollout(&self, id: &str, row: &RolloutRow, actor: &str) -> Result<()> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            // Checked here, in the write: a release removed since it was looked up is gone.
+            if txn
+                .open_table(RELEASES)?
+                .get(row.release.as_str())?
+                .is_none()
+            {
+                bail!("there is no release {}", row.release);
+            }
+            let mut table = txn.open_table(ROLLOUTS)?;
+            for entry in table.iter()? {
+                let (other, value) = entry?;
+                let other_row = decode::<RolloutRow>(value.value())?;
+                if other_row.state.active() {
+                    bail!(
+                        "rollout {} is still {}; abort it, or let it finish, first",
+                        crate::rollout::short_id(other.value()),
+                        other_row.state.name()
+                    );
+                }
+            }
+            table.insert(id, encode(row)?.as_slice())?;
+            let event = format!(
+                "{actor} started rollout {} of vk {} ({}) to {} node(s), {} already running it, \
+                 batches of {}{}, at most {} failure(s)",
+                crate::rollout::short_id(id),
+                row.version,
+                short(&row.release),
+                row.nodes.len(),
+                row.nodes
+                    .iter()
+                    .filter(|n| matches!(n.status, NodeStatus::Skipped { .. }))
+                    .count(),
+                row.batch,
+                if row.canary_per_profile {
+                    " after a canary per profile"
+                } else {
+                    ""
+                },
+                row.max_failures
+            );
+            append_audit(&txn, None, actor, &event, row.created_at)?;
+        }
+        txn.commit().context("recording a rollout")
+    }
+
+    /// Every rollout, newest first.
+    pub fn rollouts(&self) -> Result<Vec<(String, RolloutRow)>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(ROLLOUTS)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            out.push((key.value().to_string(), decode(value.value())?));
+        }
+        out.sort_by(|a: &(String, RolloutRow), b| {
+            (b.1.created_at, &b.0).cmp(&(a.1.created_at, &a.0))
+        });
+        Ok(out)
+    }
+
+    /// The one rollout whose ID starts with `prefix`, of at least 4 hex digits.
+    pub fn resolve_rollout(&self, prefix: &str) -> Result<(String, RolloutRow)> {
+        if prefix.len() < 4
+            || !prefix
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            bail!("{prefix:?}: name a rollout by its ID, or at least its first 4 hex digits");
+        }
+        let mut found = self
+            .rollouts()?
+            .into_iter()
+            .filter(|(id, _)| id.starts_with(prefix));
+        match (found.next(), found.next()) {
+            (Some(r), None) => Ok(r),
+            (None, _) => bail!("there is no rollout {prefix}"),
+            (Some(_), Some(_)) => bail!("{prefix} names more than one rollout; give more digits"),
+        }
+    }
+
+    /// Advance rollout `id` by one [`crate::rollout::step`], in one write: the commands it
+    /// issues, its new state and the audit lines saying so are committed together or not at
+    /// all. Returns whether anything changed, and the nodes it issued an update to.
+    pub fn advance_rollout(&self, id: &str, now: u64) -> Result<(bool, Vec<String>)> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let mut issued = Vec::new();
+        let changed = {
+            let Some(mut row) = txn
+                .open_table(ROLLOUTS)?
+                .get(id)?
+                .map(|g| decode::<RolloutRow>(g.value()))
+                .transpose()?
+            else {
+                return Ok((false, issued));
+            };
+            let before = row.clone();
+            let mut facts = std::collections::HashMap::new();
+            {
+                let nodes = txn.open_table(NODES)?;
+                let commands = txn.open_table(COMMANDS)?;
+                for n in &row.nodes {
+                    let Some(node) = nodes.get(n.id.as_str())? else {
+                        continue;
+                    };
+                    let node = decode::<NodeRow>(node.value())?;
+                    let outcome = match &n.status {
+                        NodeStatus::Updating { command, .. } => commands
+                            .get(format!("{}/{command}", n.id).as_str())?
+                            .map(|g| decode::<CommandRow>(g.value()))
+                            .transpose()?
+                            .and_then(|c| c.outcome),
+                        _ => None,
+                    };
+                    let versions = node.inventory.as_ref().map(|i| &i.versions);
+                    let report = node.report.as_ref();
+                    let phase = match &n.status {
+                        NodeStatus::Updating { command, .. } => report
+                            .and_then(|r| r.update.as_ref())
+                            .filter(|u| u.command == *command)
+                            .map(|u| u.phase),
+                        _ => None,
+                    };
+                    facts.insert(
+                        n.id.clone(),
+                        Facts {
+                            state: report.map(|r| r.state),
+                            vk: versions.map(|v| v.vk.clone()),
+                            vk_sha256: versions.and_then(|v| v.vk_sha256.clone()),
+                            outcome,
+                            phase,
+                            managed: report
+                                .is_some_and(|r| r.runner == vk_fleet_proto::RunnerMode::Managed),
+                        },
+                    );
+                }
+            }
+            let effects = crate::rollout::step(&mut row, &facts, now);
+            let actor = format!("rollout {}", crate::rollout::short_id(id));
+            let release = self.release_in(&txn, &row.release)?;
+            for effect in effects {
+                match effect {
+                    Effect::Audit { node, event } => {
+                        append_audit(&txn, node.as_deref(), &actor, &event, now)?;
+                    }
+                    Effect::Issue { index, resume } => {
+                        let Some(release) = &release else {
+                            bail!("rollout {id}'s release {} is gone", row.release);
+                        };
+                        let Some(node) = row.nodes.get_mut(index) else {
+                            continue;
+                        };
+                        let mut op = crate::ops::update_operation(release, row.force);
+                        if let Operation::Update { within_secs, .. } = &mut op {
+                            *within_secs = Some(row.node_timeout_secs);
+                        }
+                        // The drain's window: past it, a node still draining calls it off.
+                        let ttl = Duration::from_secs(row.drain_timeout_secs);
+                        let command = insert_command(&txn, &node.id, op, ttl, &actor, now)?;
+                        node.status = NodeStatus::Updating {
+                            command: command.id,
+                            since: now,
+                            resume,
+                            drained_at: None,
+                        };
+                        issued.push(node.id.clone());
+                    }
+                }
+            }
+            let changed = row != before;
+            if !changed {
+                // Nothing to write: no commit, which would cost a durable write per pass.
+                txn.abort().context("ending a rollout's read")?;
+                return Ok((false, issued));
+            }
+            txn.open_table(ROLLOUTS)?
+                .insert(id, encode(&row)?.as_slice())?;
+            changed
+        };
+        txn.commit().context("advancing a rollout")?;
+        Ok((changed, issued))
+    }
+
+    fn release_in(&self, txn: &redb::WriteTransaction, sha256: &str) -> Result<Option<Release>> {
+        Ok(txn
+            .open_table(RELEASES)?
+            .get(sha256)?
+            .map(|g| decode::<ReleaseRow>(g.value()))
+            .transpose()?
+            .map(|row| Release {
+                sha256: sha256.to_string(),
+                row,
+            }))
+    }
+
+    /// Pause, resume or abort rollout `id`, audited as `actor`'s. Returns it as it now is.
+    pub fn steer_rollout(
+        &self,
+        id: &str,
+        action: RolloutAction,
+        actor: &str,
+        now: u64,
+    ) -> Result<RolloutRow> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let row = {
+            let mut table = txn.open_table(ROLLOUTS)?;
+            let Some(mut row) = table
+                .get(id)?
+                .map(|g| decode::<RolloutRow>(g.value()))
+                .transpose()?
+            else {
+                bail!("there is no rollout {id}");
+            };
+            let what = match (action, &row.state) {
+                (RolloutAction::Pause, RolloutState::Running) => {
+                    row.state = RolloutState::Paused {
+                        reason: format!("paused by {actor}"),
+                    };
+                    "paused"
+                }
+                (RolloutAction::Resume, RolloutState::Paused { .. }) => {
+                    row.state = RolloutState::Running;
+                    "resumed"
+                }
+                (RolloutAction::Abort, s) if s.active() => {
+                    row.state = RolloutState::Aborted {
+                        reason: format!("aborted by {actor}"),
+                    };
+                    "aborted"
+                }
+                (_, s) => bail!(
+                    "rollout {} is {}; it cannot be {}",
+                    crate::rollout::short_id(id),
+                    s.name(),
+                    action.done()
+                ),
+            };
+            table.insert(id, encode(&row)?.as_slice())?;
+            let event = format!("{actor} {what} rollout {}", crate::rollout::short_id(id));
+            append_audit(&txn, None, actor, &event, now)?;
+            row
+        };
+        txn.commit().context("steering a rollout")?;
+        Ok(row)
     }
 
     /// Rewrite one node's row. A node removed meanwhile is an error: its session is then
@@ -1134,6 +1401,47 @@ fn applied(row: &NodeRow) -> u64 {
         .unwrap_or(0)
 }
 
+/// Issue `op` to node `id` inside `txn`, valid for `ttl`, audited as `actor`'s; see
+/// [`Db::issue_command`].
+fn insert_command(
+    txn: &redb::WriteTransaction,
+    id: &str,
+    op: Operation,
+    ttl: Duration,
+    actor: &str,
+    now: u64,
+) -> Result<Command> {
+    let command = Command {
+        id: crate::random_hex(vk_fleet_proto::ID_BYTES)?,
+        expires_at: now.saturating_add(ttl.as_secs()),
+        op,
+    };
+    let row = CommandRow {
+        node_id: id.to_string(),
+        command: command.clone(),
+        issued_at: now,
+        outcome: None,
+        outcome_at: None,
+    };
+    if txn.open_table(NODES)?.get(id)?.is_none() {
+        bail!("node {id} is not enrolled");
+    }
+    let mut commands = txn.open_table(COMMANDS)?;
+    let (start, end) = command_range(id);
+    commands.retain_in(start.as_str()..end.as_str(), |_, value| {
+        decode::<CommandRow>(value).map_or(true, |r| !r.settled_before(now, COMMAND_KEEP))
+    })?;
+    let key = format!("{id}/{}", command.id);
+    commands.insert(key.as_str(), encode(&row)?.as_slice())?;
+    let event = format!(
+        "{actor} issued {} (command {})",
+        operation_name(&command.op),
+        command.id
+    );
+    append_audit(txn, Some(id), actor, &event, now)?;
+    Ok(command)
+}
+
 /// The key range of node `id`'s commands.
 fn command_range(id: &str) -> (String, String) {
     (format!("{id}/"), format!("{id}0"))
@@ -1197,6 +1505,22 @@ fn report_events(previous: Option<&Report>, report: &Report) -> Vec<String> {
             events.push(format!("cannot comply: {note}"));
         }
     }
+    if let Some(u) = &report.update
+        && previous.is_none_or(|p| {
+            p.update.as_ref().map(|u| (&u.command, u.phase)) != Some((&u.command, u.phase))
+        })
+    {
+        let mut event = format!(
+            "update to vk {} ({}): {}",
+            u.version,
+            short(&u.sha256),
+            update_phase_name(u.phase)
+        );
+        if let Some(message) = &u.message {
+            event.push_str(&format!(": {message}"));
+        }
+        events.push(event);
+    }
     if previous.is_none_or(|p| p.concurrency_error != report.concurrency_error)
         && let Some(error) = &report.concurrency_error
     {
@@ -1213,6 +1537,18 @@ pub(crate) fn state_name(state: NodeState) -> &'static str {
         NodeState::Maintenance => "maintenance",
         NodeState::Validating => "validating",
         NodeState::Quarantined => "quarantined",
+    }
+}
+
+pub(crate) fn update_phase_name(phase: vk_fleet_proto::UpdatePhase) -> &'static str {
+    use vk_fleet_proto::UpdatePhase;
+    match phase {
+        UpdatePhase::Draining => "draining",
+        UpdatePhase::Downloading => "downloading",
+        UpdatePhase::Validating => "validating",
+        UpdatePhase::Done => "done",
+        UpdatePhase::RolledBack => "rolled back",
+        UpdatePhase::Failed => "failed",
     }
 }
 
