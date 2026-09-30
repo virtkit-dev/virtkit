@@ -782,16 +782,25 @@ mod tests {
         assert!(disk.is_symlink(), "the link survived");
         assert_eq!(std::fs::read(&elsewhere).unwrap(), b"precious");
 
-        // A regular backing goes, and the state directory's lock is free again after.
+        // A regular backing goes, and the state directory's lock is free again after. A child
+        // another test forks while reset holds the lock keeps a copy of the descriptor until
+        // it execs (close-on-exec only acts at exec), hence the retries.
         std::fs::remove_file(&disk).unwrap();
         std::fs::write(&disk, b"data").unwrap();
-        let report = rt.block_on(reset(&plan, "runner:/var/wab", true)).unwrap();
+        // The symlinked reset above took the lock too, so a forked copy of it can refuse this
+        // one.
+        let report = crate::dev::testutil::once_released("being booted", || {
+            rt.block_on(reset(&plan, "runner:/var/wab", true))
+        })
+        .unwrap();
         assert!(report.contains("removed"), "{report}");
         assert!(!disk.exists(), "the backing survived the reset");
-        assert!(
-            crate::dev::list::try_lock_state_dir(&plan.state_dir).is_some(),
-            "the lock was handed back"
-        );
+        let freed = crate::dev::testutil::once_released("still held", || {
+            crate::dev::list::try_lock_state_dir(&plan.state_dir)
+                .map(drop)
+                .ok_or_else(|| anyhow::anyhow!("still held"))
+        });
+        assert!(freed.is_ok(), "the lock was not handed back");
     }
 
     #[test]
