@@ -13,6 +13,12 @@ license.workspace = true
 name = "vk-runnerctl"
 path = "src/main.rs"
 
+# The config edit alone, as a library, so unprivileged `vk` can apply the same edit to a
+# runner config its own user owns. The binary links this same code and gains no dependency.
+[lib]
+name = "vk_runnerctl"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true

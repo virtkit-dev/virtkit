@@ -67,7 +67,8 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with seven crates:
 - **`vk-runnerctl/`** — the only component that runs as root, and deliberately the smallest:
   it sets gitlab-runner's `concurrent` from a number unprivileged `vk` leaves in a file,
   clamped into a range only root can configure. It takes no arguments and no paths from its
-  caller, so granting it `NOPASSWD` grants nothing else; all the policy lives in `vk`.
+  caller, so granting it `NOPASSWD` grants nothing else; all the policy lives in `vk`. Its
+  config edit is also a library, for unprivileged `vk` to apply to a runner config it owns.
 
 libkrun is vendored (its own cargo workspace, locally patched) under
 `third_party/libkrun` — see its `VENDOR.md` for the patch list.

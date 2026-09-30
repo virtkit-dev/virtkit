@@ -9,7 +9,65 @@
 //! is done on the text, and the parse is used the other way round: to *check* the result,
 //! by proving that the document changed at exactly one key ([`verify`]).
 
-use anyhow::{Result, bail};
+/// Why an edit was refused. Each says what it found and never quotes the file, which holds
+/// the runner's registration token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditError {
+    /// Two top-level `concurrent` keys: a config gitlab-runner itself would read ambiguously.
+    DuplicateKey,
+    /// The text did not parse as TOML: which side, with the byte span the parser reported
+    /// and its message.
+    Unparsable {
+        side: Side,
+        span: Option<std::ops::Range<usize>>,
+        message: String,
+    },
+    /// The edited text does not read back as `concurrent = <value>`.
+    NotSet(u32),
+    /// The edited text differs from the original somewhere else too.
+    ChangedMore,
+}
+
+/// Which text of an edit [`EditError::Unparsable`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// The runner config as it was read.
+    Config,
+    /// The edited text that would replace it.
+    Edit,
+}
+
+impl std::fmt::Display for Side {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Side::Config => "the runner config does not parse",
+            Side::Edit => "the edit would not parse",
+        })
+    }
+}
+
+impl std::fmt::Display for EditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EditError::DuplicateKey => {
+                f.write_str("two top-level `concurrent` keys — refusing to guess which one counts")
+            }
+            EditError::Unparsable {
+                side,
+                span,
+                message,
+            } => write!(f, "{side} at {span:?}: {message}"),
+            EditError::NotSet(value) => write!(f, "the edit did not set concurrent = {value}"),
+            EditError::ChangedMore => {
+                f.write_str("the edit changed more than `concurrent` — refusing to install it")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EditError {}
+
+pub type Result<T> = std::result::Result<T, EditError>;
 
 /// Set the top-level `concurrent` key in `text` to `value`, returning the new text.
 ///
@@ -36,7 +94,7 @@ pub fn set_concurrent(text: &str, value: u32) -> Result<String> {
         match top_level.then(|| concurrent_value(body)).flatten() {
             Some(comment) => {
                 if edited {
-                    bail!("two top-level `concurrent` keys — refusing to guess which one counts");
+                    return Err(EditError::DuplicateKey);
                 }
                 edited = true;
                 let indent = &body[..body.len() - trimmed.len()];
@@ -97,22 +155,20 @@ pub fn verify(before: &str, after: &str, value: u32) -> Result<()> {
     // The message and the offset, never the offending line. A TOML error's own `Display`
     // quotes the source it failed on, and this file holds the runner's registration token —
     // while whoever reads this program's stderr may be exactly who is not allowed to read it.
-    let quoteless = |what: &str, e: toml::de::Error| {
-        anyhow::anyhow!("{what} at {:?}: {}", e.span(), e.message())
+    let quoteless = |side: Side, e: toml::de::Error| EditError::Unparsable {
+        side,
+        span: e.span(),
+        message: e.message().to_string(),
     };
-    let mut old: toml::Table = before
-        .parse()
-        .map_err(|e| quoteless("the runner config does not parse", e))?;
-    let mut new: toml::Table = after
-        .parse()
-        .map_err(|e| quoteless("the edit would not parse", e))?;
+    let mut old: toml::Table = before.parse().map_err(|e| quoteless(Side::Config, e))?;
+    let mut new: toml::Table = after.parse().map_err(|e| quoteless(Side::Edit, e))?;
     if new.get("concurrent").and_then(|v| v.as_integer()) != Some(i64::from(value)) {
-        bail!("the edit did not set concurrent = {value}");
+        return Err(EditError::NotSet(value));
     }
     old.remove("concurrent");
     new.remove("concurrent");
     if old != new {
-        bail!("the edit changed more than `concurrent` — refusing to install it");
+        return Err(EditError::ChangedMore);
     }
     Ok(())
 }
@@ -204,13 +260,22 @@ check_interval = 3\n\
         // Two top-level keys: gitlab-runner would read one of them, and guessing which is
         // how a tool silently sets the wrong thing.
         let twice = "concurrent = 1\nconcurrent = 2\n";
-        assert!(set_concurrent(twice, 5).is_err());
+        assert_eq!(set_concurrent(twice, 5), Err(EditError::DuplicateKey));
 
         // A key whose value is not a plain integer is left alone, so the insert path runs
         // and the result no longer parses — caught by verify rather than installed.
         let odd = "concurrent = \"4\"\n";
         let out = set_concurrent(odd, 5).unwrap();
-        assert!(verify(odd, &out, 5).is_err(), "{out}");
+        assert!(
+            matches!(
+                verify(odd, &out, 5),
+                Err(EditError::Unparsable {
+                    side: Side::Edit,
+                    ..
+                })
+            ),
+            "{out}"
+        );
     }
 
     /// verify is the backstop for the editor: a rewrite that touched anything else must not
@@ -219,12 +284,13 @@ check_interval = 3\n\
     fn verify_rejects_an_edit_that_changed_anything_else() {
         let sneaky = CONFIG.replace("glrt-SECRET", "glrt-STOLEN");
         let sneaky = set_concurrent(&sneaky, 7).unwrap();
-        let err = verify(CONFIG, &sneaky, 7).unwrap_err().to_string();
-        assert!(err.contains("more than `concurrent`"), "{err}");
+        let err = verify(CONFIG, &sneaky, 7).unwrap_err();
+        assert_eq!(err, EditError::ChangedMore);
+        assert!(err.to_string().contains("more than `concurrent`"), "{err}");
 
         // And a value that did not land is caught too.
         let unchanged = set_concurrent(CONFIG, 4).unwrap();
-        assert!(verify(CONFIG, &unchanged, 7).is_err());
+        assert_eq!(verify(CONFIG, &unchanged, 7), Err(EditError::NotSet(7)));
     }
 
     /// A parse failure is reported to whoever invoked this program — which, under the sudoers
@@ -234,19 +300,24 @@ check_interval = 3\n\
     fn a_parse_failure_does_not_quote_the_config() {
         // An unterminated string on the token line: the offending line *is* the secret.
         let broken = CONFIG.replace("\"glrt-SECRET\"", "\"glrt-SECRET");
-        let err = verify(&broken, &broken, 4).unwrap_err().to_string();
-        assert!(err.contains("does not parse"), "{err}");
-        assert!(
-            !err.contains("glrt-SECRET"),
-            "the error quoted the token: {err}"
-        );
+        // Neither rendering may quote it: a library caller can log either.
+        let err = verify(&broken, &broken, 4).unwrap_err();
+        assert!(err.to_string().contains("does not parse"), "{err}");
+        for shown in [err.to_string(), format!("{err:?}")] {
+            assert!(
+                !shown.contains("glrt-SECRET"),
+                "the error quoted the token: {shown}"
+            );
+        }
 
         // The same for the edited side, which is derived from the same file.
-        let err = verify(CONFIG, &broken, 4).unwrap_err().to_string();
-        assert!(
-            !err.contains("glrt-SECRET"),
-            "the error quoted the token: {err}"
-        );
+        let err = verify(CONFIG, &broken, 4).unwrap_err();
+        for shown in [err.to_string(), format!("{err:?}")] {
+            assert!(
+                !shown.contains("glrt-SECRET"),
+                "the error quoted the token: {shown}"
+            );
+        }
     }
 
     #[test]
