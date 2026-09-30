@@ -20,8 +20,6 @@
 //! gitlab-runner ALL=(root) NOPASSWD: /usr/local/lib/vk/vk-runnerctl ""
 //! ```
 
-mod edit;
-
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -32,6 +30,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+use vk_runnerctl::edit;
 
 /// The only path this program takes on faith, and only once it has checked that root alone
 /// can write it: everything it names is then an administrator's choice rather than the

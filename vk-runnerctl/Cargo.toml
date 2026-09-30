@@ -13,6 +13,12 @@ license.workspace = true
 name = "vk-runnerctl"
 path = "src/main.rs"
 
+# The config edit alone, which `vk node` shares for a runner its own user owns. It adds
+# nothing to the binary: the same module, linked the same way.
+[lib]
+name = "vk_runnerctl"
+path = "src/lib.rs"
+
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true

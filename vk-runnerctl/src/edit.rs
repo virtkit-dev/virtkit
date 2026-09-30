@@ -9,7 +9,47 @@
 //! is done on the text, and the parse is used the other way round: to *check* the result,
 //! by proving that the document changed at exactly one key ([`verify`]).
 
-use anyhow::{Result, bail};
+/// Why an edit was refused. Each says what it found and never quotes the file, which holds
+/// the runner's registration token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditError {
+    /// Two top-level `concurrent` keys: a config gitlab-runner itself would read ambiguously.
+    DuplicateKey,
+    /// The text did not parse as TOML: `what` names which side, with the byte span the
+    /// parser reported and its message.
+    Unparsable {
+        what: &'static str,
+        span: Option<std::ops::Range<usize>>,
+        message: String,
+    },
+    /// The edited text does not read back as `concurrent = <value>`.
+    NotSet(u32),
+    /// The edited text differs from the original somewhere else too.
+    ChangedMore,
+}
+
+impl std::fmt::Display for EditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EditError::DuplicateKey => {
+                f.write_str("two top-level `concurrent` keys — refusing to guess which one counts")
+            }
+            EditError::Unparsable {
+                what,
+                span,
+                message,
+            } => write!(f, "{what} at {span:?}: {message}"),
+            EditError::NotSet(value) => write!(f, "the edit did not set concurrent = {value}"),
+            EditError::ChangedMore => {
+                f.write_str("the edit changed more than `concurrent` — refusing to install it")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EditError {}
+
+pub type Result<T> = std::result::Result<T, EditError>;
 
 /// Set the top-level `concurrent` key in `text` to `value`, returning the new text.
 ///
@@ -36,7 +76,7 @@ pub fn set_concurrent(text: &str, value: u32) -> Result<String> {
         match top_level.then(|| concurrent_value(body)).flatten() {
             Some(comment) => {
                 if edited {
-                    bail!("two top-level `concurrent` keys — refusing to guess which one counts");
+                    return Err(EditError::DuplicateKey);
                 }
                 edited = true;
                 let indent = &body[..body.len() - trimmed.len()];
@@ -97,8 +137,10 @@ pub fn verify(before: &str, after: &str, value: u32) -> Result<()> {
     // The message and the offset, never the offending line. A TOML error's own `Display`
     // quotes the source it failed on, and this file holds the runner's registration token —
     // while whoever reads this program's stderr may be exactly who is not allowed to read it.
-    let quoteless = |what: &str, e: toml::de::Error| {
-        anyhow::anyhow!("{what} at {:?}: {}", e.span(), e.message())
+    let quoteless = |what: &'static str, e: toml::de::Error| EditError::Unparsable {
+        what,
+        span: e.span(),
+        message: e.message().to_string(),
     };
     let mut old: toml::Table = before
         .parse()
@@ -107,12 +149,12 @@ pub fn verify(before: &str, after: &str, value: u32) -> Result<()> {
         .parse()
         .map_err(|e| quoteless("the edit would not parse", e))?;
     if new.get("concurrent").and_then(|v| v.as_integer()) != Some(i64::from(value)) {
-        bail!("the edit did not set concurrent = {value}");
+        return Err(EditError::NotSet(value));
     }
     old.remove("concurrent");
     new.remove("concurrent");
     if old != new {
-        bail!("the edit changed more than `concurrent` — refusing to install it");
+        return Err(EditError::ChangedMore);
     }
     Ok(())
 }
