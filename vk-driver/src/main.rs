@@ -279,7 +279,11 @@ enum NodeCmd {
     ///
     /// Sends the host's inventory at the start and whenever it changes, and a heartbeat every
     /// few seconds; redials with backoff whenever the hub is unreachable. Sets the runner's
-    /// concurrency every half minute, as `vk tune` would, within the hub's ceiling.
+    /// concurrency every half minute, as `vk tune` would, within the hub's ceiling; with
+    /// `[node] runner = "managed"` runs gitlab-runner too, and stops it taking jobs when the
+    /// hub stops acquisition, drains or quarantines the node. SIGTERM or SIGINT stops it,
+    /// after a managed runner has finished its jobs; a second one abandons them. Under
+    /// systemd use `KillMode=mixed`, so the stop reaches the node and not the runner.
     Run,
 }
 

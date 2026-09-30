@@ -5,13 +5,15 @@
 //! hub for as long as it runs — inventory at the start and whenever it changes, a heartbeat
 //! every few seconds — and redials with backoff whenever the session is lost, until SIGTERM
 //! or SIGINT closes it cleanly or the hub refuses it for good. It applies the desired state
-//! and commands the hub sends through its persisted state ([`state`]), and sets the runner's
-//! concurrency every half minute within the hub's ceiling ([`core`]). See
-//! `docs/fleet-design.md`.
+//! and commands the hub sends — a concurrency ceiling, stopping acquisition, drain,
+//! quarantine — through its persisted state ([`state`]), sets the runner's concurrency every
+//! half minute ([`core`]), and in `[node] runner = "managed"` mode runs gitlab-runner itself
+//! ([`runner`]). See `docs/fleet-design.md`.
 //!
 //! Everything the node keeps is under `<state_dir>/node/`, a `0700` directory: `key.pk8`
 //! (the private key, `0600`), `enrollment.json` (the hub's URL and the node ID it assigned),
-//! `state.json` (what the hub asked and the node's own state),
+//! `state.json` (what the hub asked and the node's own state), `runner.pid` (a managed
+//! runner's pid and start time, for a restarted node to find it),
 //! `ca.pem` (the CA the hub is verified against, copied at `join` when one was given) and
 //! `lock`, which one `vk node` process at a time holds. A `join` whose answer was lost keeps
 //! the key it made and joins again with a new token: the hub answers a key it already pinned
@@ -24,6 +26,7 @@
 mod core;
 mod identity;
 mod inventory;
+mod runner;
 mod session;
 mod state;
 
@@ -246,13 +249,43 @@ pub async fn run(cfg: Config) -> Result<()> {
         "vk node: node {} of {}, incarnation {incarnation}",
         enrollment.node_id, enrollment.hub
     );
-    let mut stop = stop_on_signal()?;
+    let (mut stop, abort) = stop_on_signal()?;
+    let managed = cfg.node.runner == vk_fleet_proto::RunnerMode::Managed;
+    let spec = match managed {
+        true => {
+            let config = crate::schedule::runner_config(&cfg).context(
+                "[node] runner = \"managed\" needs [node] runner_config, or HOME for the default",
+            )?;
+            warn_on_executor_config(&cfg, &config);
+            Some(runner::Spec {
+                binary: cfg
+                    .node
+                    .gitlab_runner
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("gitlab-runner")),
+                config,
+                dir: dir.clone(),
+            })
+        }
+        false => None,
+    };
     let issuer = state::Issuer {
         hub: enrollment.hub.clone(),
         node_id: enrollment.node_id.clone(),
     };
-    let core = core::Core::open(&dir, issuer)?;
+    let (runner_tx, runner_state) =
+        tokio::sync::watch::channel(vk_fleet_proto::RunnerState::Stopped);
+    let (core, allowed) = core::Core::open(&dir, managed, issuer, runner_state)?;
     let cfg = Arc::new(cfg);
+    let (halt, halted) = tokio::sync::watch::channel(false);
+    let supervisor = spec.map(|spec| {
+        let signals = runner::Signals {
+            allowed,
+            halt: halted,
+            abort,
+        };
+        tokio::spawn(runner::supervise(spec, signals, runner_tx))
+    });
     tokio::spawn(
         core.clone()
             .control(cfg.clone(), CONTROL_EVERY, stop.clone()),
@@ -264,7 +297,103 @@ pub async fn run(cfg: Config) -> Result<()> {
         incarnation,
         tls,
     };
-    hold_sessions(&node, &core, &mut gatherer, &mut stop).await
+    let ended = hold_sessions(&node, &core, &mut gatherer, &mut stop).await;
+    // Stopping or refused for good, the node quits a managed runner and waits for its jobs to
+    // finish: a node its hub no longer knows should not go on taking the fleet's work, and a
+    // runner left running would be one nothing steers. A second SIGTERM or SIGINT stops the
+    // wait, and the runner is sent SIGTERM, which abandons its jobs.
+    if let Some(supervisor) = supervisor {
+        // `send_replace`: raised whether or not the supervisor still listens.
+        halt.send_replace(true);
+        eprintln!(
+            "vk node: waiting for gitlab-runner to finish its jobs (SIGTERM or SIGINT again \
+             abandons them)"
+        );
+        if let Err(e) = supervisor.await {
+            eprintln!("vk node: the runner supervisor failed: {e}");
+        }
+    }
+    ended
+}
+
+/// Warn when the managed runner's config sends the vk executor to another vk config than
+/// this node's own: the node reads the admission ledger and the job dirs under its own state
+/// dir to tell when a drain is done, and the executor must be keeping them there. Only what
+/// is cheap to read is compared — a `--config` among a custom executor's arguments, or a
+/// `VIRTKIT_CONFIG` in a runner's environment — and only when it names a file.
+fn warn_on_executor_config(cfg: &Config, runner_config: &Path) {
+    let Ok(text) = std::fs::read_to_string(runner_config) else {
+        return;
+    };
+    let ours = cfg
+        .source
+        .as_deref()
+        .and_then(|p| std::fs::canonicalize(p).ok());
+    for (runner, named) in executor_configs(&text) {
+        let theirs = std::fs::canonicalize(&named).ok();
+        if theirs.is_none() || theirs != ours {
+            eprintln!(
+                "vk node: warning: runner {runner:?} in {} runs the vk executor with the config \
+                 {}, while this node reads {}: drains and admission are judged from this \
+                 node's state dir, which the executor must be using too",
+                runner_config.display(),
+                named.display(),
+                ours.as_deref().map_or_else(
+                    || "the built-in defaults".to_string(),
+                    |p| p.display().to_string()
+                ),
+            );
+        }
+    }
+}
+
+/// Each custom-executor runner in a gitlab-runner config that names a vk config: its name and
+/// the file.
+fn executor_configs(text: &str) -> Vec<(String, PathBuf)> {
+    let Ok(table) = toml::from_str::<toml::Table>(text) else {
+        return Vec::new();
+    };
+    let runners = table
+        .get("runners")
+        .and_then(toml::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for runner in runners {
+        if runner.get("executor").and_then(toml::Value::as_str) != Some("custom") {
+            continue;
+        }
+        let name = runner
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let from_env = runner
+            .get("environment")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .filter_map(|e| e.strip_prefix("VIRTKIT_CONFIG="));
+        let from_args = runner
+            .get("custom")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|custom| custom.iter())
+            .filter(|(key, _)| key.ends_with("_args"))
+            .filter_map(|(_, args)| args.as_array())
+            .filter_map(|args| {
+                let args: Vec<&str> = args.iter().filter_map(toml::Value::as_str).collect();
+                args.iter()
+                    .position(|a| *a == "--config")
+                    .and_then(|at| args.get(at + 1).copied())
+            });
+        let mut named: Vec<&str> = from_env.chain(from_args).collect();
+        named.sort_unstable();
+        named.dedup();
+        out.extend(named.into_iter().map(|p| (name.clone(), PathBuf::from(p))));
+    }
+    out
 }
 
 /// Sessions back to back, with backoff between them, until the node is told to stop or the
@@ -302,21 +431,32 @@ async fn hold_sessions(
     }
 }
 
-/// A flag raised by the first SIGTERM or SIGINT, for the session to close on.
-fn stop_on_signal() -> Result<tokio::sync::watch::Receiver<bool>> {
+type Flag = tokio::sync::watch::Receiver<bool>;
+
+/// Two flags: `stop`, raised by the first SIGTERM or SIGINT, for the session to close on and
+/// a managed runner to be quit gracefully; `abort`, raised by the second, to stop waiting for
+/// that runner's jobs.
+///
+/// A service manager that sends SIGTERM to every process of the unit would reach
+/// gitlab-runner too, which takes SIGTERM as abandoning its jobs: a unit running `vk node run`
+/// wants `KillMode=mixed`, so the signal reaches the node alone and the node quits the runner.
+fn stop_on_signal() -> Result<(Flag, Flag)> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).context("handling SIGTERM")?;
     let mut int = signal(SignalKind::interrupt()).context("handling SIGINT")?;
-    let (raise, stop) = tokio::sync::watch::channel(false);
+    let (raise_stop, stop) = tokio::sync::watch::channel(false);
+    let (raise_abort, abort) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = int.recv() => {}
+        for raise in [raise_stop, raise_abort] {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+            // `send_replace`: raised whether or not anything still listens.
+            raise.send_replace(true);
         }
-        // Nobody left to tell only when `run` has already returned.
-        let _ = raise.send(true);
     });
-    Ok(stop)
+    Ok((stop, abort))
 }
 
 /// Hold `<dir>/lock` for as long as the returned file lives: one `vk node` process per state
@@ -526,6 +666,30 @@ mod tests {
         drop(held);
         lock(&dir).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_executor_config_a_runner_names_is_found() {
+        let text = r#"
+concurrent = 4
+[[runners]]
+  name = "vk"
+  executor = "custom"
+  environment = ["VIRTKIT_CONFIG=/etc/virtkit/ci.toml", "OTHER=1"]
+  [runners.custom]
+    prepare_exec = "/usr/local/bin/vk"
+    prepare_args = ["--config", "/etc/virtkit/ci.toml", "gitlab", "prepare"]
+    run_args = ["gitlab", "run"]
+[[runners]]
+  name = "docker"
+  executor = "docker"
+  environment = ["VIRTKIT_CONFIG=/elsewhere.toml"]
+"#;
+        assert_eq!(
+            executor_configs(text),
+            [("vk".to_string(), PathBuf::from("/etc/virtkit/ci.toml"))]
+        );
+        assert!(executor_configs("not toml [").is_empty());
     }
 
     #[test]

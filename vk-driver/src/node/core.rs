@@ -1,9 +1,11 @@
-//! What `vk node run` keeps between its tasks: the persisted state ([`Persisted`]) and the
-//! concurrency its loop last worked out. The session reads a [`Report`] out of it and feeds it
-//! what the hub sends; the control loop ([`Core::control`]) sets the runner's concurrency.
+//! What `vk node run` keeps between its tasks: the persisted state ([`Persisted`]), the
+//! concurrency its loop last worked out, a drain's progress, and the supervised runner's
+//! process state. The session reads a [`Report`] out of it and feeds it what the hub sends;
+//! the runner supervisor follows its `acquire` flag; the control loop ([`Core::control`]) sets
+//! the runner's concurrency and finishes a drain once nothing is left running.
 //!
 //! None of it depends on the hub being there: a node that has lost its session keeps
-//! applying the last desired state it took.
+//! applying the last desired state it took and whatever drain or quarantine it has persisted.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -12,7 +14,8 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::watch;
 use vk_fleet_proto::{
-    Acquisition, Command, CommandAck, Concurrency, DesiredState, Report, RunnerMode,
+    Acquisition, Command, CommandAck, Concurrency, DesiredState, DrainProgress, NodeState, Report,
+    RunnerMode, RunnerState,
 };
 
 use super::state::{Issuer, Persisted};
@@ -20,17 +23,29 @@ use crate::config::Config;
 
 pub struct Core {
     dir: PathBuf,
+    managed: bool,
     persisted: Mutex<Persisted>,
     concurrency: Mutex<Option<Concurrency>>,
     /// Why the last attempt at setting the concurrency failed, if it did.
     concurrency_error: Mutex<Option<String>>,
+    drain: Mutex<Option<DrainProgress>>,
+    runner: watch::Receiver<RunnerState>,
+    /// Whether the runner may take jobs, for the supervisor to follow.
+    acquire: watch::Sender<bool>,
     /// Bumped on every change a report would show.
     changed: watch::Sender<u64>,
 }
 
 impl Core {
     /// Load the state in `dir`, for `issuer` — the hub and node ID the node is enrolled as.
-    pub fn open(dir: &Path, issuer: Issuer) -> Result<Arc<Core>> {
+    /// `runner` is the supervisor's report of its runner, for ever `Stopped` for an external
+    /// one. Returns the flag the supervisor follows beside it.
+    pub fn open(
+        dir: &Path,
+        managed: bool,
+        issuer: Issuer,
+        runner: watch::Receiver<RunnerState>,
+    ) -> Result<(Arc<Core>, watch::Receiver<bool>)> {
         let mut persisted = Persisted::load(dir)?;
         let before = persisted.clone();
         if persisted.adopt_issuer(issuer) {
@@ -43,19 +58,25 @@ impl Core {
         if persisted != before {
             persisted.save(dir)?;
         }
+        let (acquire, allowed) = watch::channel(!persisted.acquisition_stopped());
         let (changed, _) = watch::channel(0);
-        Ok(Arc::new(Core {
+        let core = Core {
             dir: dir.to_path_buf(),
+            managed,
             persisted: Mutex::new(persisted),
             concurrency: Mutex::new(None),
             concurrency_error: Mutex::new(None),
+            drain: Mutex::new(None),
+            runner,
+            acquire,
             changed,
-        }))
+        };
+        Ok((Arc::new(core), allowed))
     }
 
     /// Change the persisted state through `f`: written to disk first, and only then made the
     /// state the rest of the node follows — the journal entry of a command is on disk before
-    /// anything acts on it.
+    /// the runner hears of it.
     fn update<R>(&self, f: impl FnOnce(&mut Persisted) -> R) -> Result<R> {
         let mut persisted = lock(&self.persisted);
         let mut next = persisted.clone();
@@ -63,6 +84,7 @@ impl Core {
         if next != *persisted {
             next.save(&self.dir)?;
             *persisted = next;
+            self.acquire.send_replace(!persisted.acquisition_stopped());
             drop(persisted);
             self.bump();
         }
@@ -82,10 +104,9 @@ impl Core {
         self.update(|p| p.apply_desired(desired))
     }
 
-    /// Journal `command` and carry it out. This node runs no runner of its own, so it cannot
-    /// stop one: a drain or a quarantine is refused.
     pub fn command(&self, command: Command, now: u64) -> Result<CommandAck> {
-        self.update(|p| p.command(command, now))
+        let managed = self.managed;
+        self.update(|p| p.command(command, now, managed))
     }
 
     pub fn recorded(&self, ack: &CommandAck, now: u64) -> Result<()> {
@@ -102,6 +123,10 @@ impl Core {
         lock(&self.persisted).hub_ceiling()
     }
 
+    pub fn state(&self) -> NodeState {
+        lock(&self.persisted).state
+    }
+
     /// Replace the value behind `m`, reporting a change.
     fn set<T: PartialEq>(&self, m: &Mutex<T>, value: T) {
         let mut slot = lock(m);
@@ -115,10 +140,13 @@ impl Core {
     /// The node as it would report itself now.
     pub fn report(&self) -> Report {
         let persisted = lock(&self.persisted).clone();
+        let stopped = persisted.acquisition_stopped();
+        let runner = *self.runner.borrow();
         let mut unsupported = Vec::new();
-        if persisted.acquisition_stopped() {
+        if stopped && !self.managed {
             unsupported.push(
-                "stopping acquisition: the runner is external, so only its concurrency is steered"
+                "stopping acquisition: the runner is external ([node] runner = \"external\"), \
+                 so only its concurrency is steered"
                     .to_string(),
             );
         }
@@ -126,17 +154,27 @@ impl Core {
             applied_generation: persisted.applied.as_ref().map(|d| d.generation),
             unsupported,
             state: persisted.state,
-            acquisition: Acquisition::Run,
-            runner: RunnerMode::External,
-            runner_state: None,
+            // What the runner is doing: stopped only once a managed runner has exited, since
+            // until then it may be one that never heard its signal.
+            acquisition: if stopped && self.managed && runner == RunnerState::Stopped {
+                Acquisition::Stop
+            } else {
+                Acquisition::Run
+            },
+            runner: if self.managed {
+                RunnerMode::Managed
+            } else {
+                RunnerMode::External
+            },
+            runner_state: self.managed.then_some(runner),
             concurrency: *lock(&self.concurrency),
             concurrency_error: lock(&self.concurrency_error).clone(),
-            drain: None,
+            drain: *lock(&self.drain),
         }
     }
 
-    /// Set the runner's concurrency every `every`, and whenever the state changes. Runs until
-    /// `stop`.
+    /// Set the runner's concurrency every `every`, and whenever the state or the runner
+    /// changes; while draining, check whether the drain is complete. Runs until `stop`.
     ///
     /// Only the timer may raise the concurrency: the estimate climbs one step per pass, and
     /// passes a change sets off — every report bumps a change, this loop's own included —
@@ -148,25 +186,35 @@ impl Core {
         mut stop: watch::Receiver<bool>,
     ) {
         let mut changes = self.subscribe();
+        let mut runner = self.runner.clone();
         let mut tick = tokio::time::interval(every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let may_rise = tokio::select! {
                 _ = tick.tick() => true,
                 _ = changes.changed() => false,
+                // The runner's state is in every report, and nothing else marks it changed.
+                _ = runner.changed() => {
+                    self.bump();
+                    false
+                }
                 _ = stop.wait_for(|&s| s) => return,
             };
             let core = self.clone();
             let cfg = cfg.clone();
             // Off the runtime: it reads files and takes the ledger's lock.
-            if let Err(e) = tokio::task::spawn_blocking(move || core.step(&cfg, may_rise)).await {
-                eprintln!("vk node: the concurrency loop failed: {e}");
+            match tokio::task::spawn_blocking(move || core.step(&cfg, may_rise)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("vk node: {e:#}"),
+                Err(e) => eprintln!("vk node: the concurrency loop failed: {e}"),
             }
         }
     }
 
-    /// One pass of the loop. A failure is reported rather than only logged.
-    fn step(&self, cfg: &Config, may_rise: bool) {
+    /// One pass of the loop: the concurrency, then the drain. Each goes on whether or not the
+    /// other failed — a config the concurrency cannot be worked out from must not hold a drain
+    /// open — and the concurrency's failure is reported rather than only logged.
+    fn step(&self, cfg: &Config, may_rise: bool) -> Result<()> {
         let concurrency =
             crate::schedule::decide_with(cfg, self.hub_ceiling(), may_rise).and_then(|decision| {
                 crate::schedule::apply(cfg, &decision)?;
@@ -193,7 +241,35 @@ impl Core {
                 self.set(&self.concurrency_error, Some(message));
             }
         }
+        self.drain_step(cfg)
     }
+
+    fn drain_step(&self, cfg: &Config) -> Result<()> {
+        if self.state() != NodeState::Draining {
+            self.set(&self.drain, None);
+            return Ok(());
+        }
+        let held = crate::admit::committed(&cfg.state_dir().join("admit"))?;
+        let progress = DrainProgress {
+            runner_stopped: *self.runner.borrow() == RunnerState::Stopped,
+            ledger_empty: held.granted == 0 && held.ahead == 0,
+            active_jobs: u32::try_from(crate::vm::live_supervisors(&cfg.state_dir().join("jobs"))?)
+                .unwrap_or(u32::MAX),
+        };
+        self.set(&self.drain, Some(progress));
+        if drained(&progress) && self.update(Persisted::finish_drain)? {
+            eprintln!("vk node: drained");
+            self.set(&self.drain, None);
+        }
+        Ok(())
+    }
+}
+
+/// Whether a drain is complete: the runner has exited — which it does on `SIGQUIT` only once
+/// its jobs, their cleanup stage included, are over — the ledger holds and awaits nothing,
+/// and no job supervisor is left, which catches a job whose cleanup failed and left its VM up.
+pub fn drained(p: &DrainProgress) -> bool {
+    p.runner_stopped && p.ledger_empty && p.active_jobs == 0
 }
 
 /// A lock whose holder panicked still guards whole values — each is replaced in one
@@ -205,12 +281,17 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vk_fleet_proto::{Operation, Outcome};
 
     fn issuer() -> Issuer {
         Issuer {
             hub: "https://hub".into(),
             node_id: "ab".repeat(16),
         }
+    }
+
+    fn stopped() -> watch::Receiver<RunnerState> {
+        watch::channel(RunnerState::Stopped).1
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -231,9 +312,111 @@ mod tests {
     }
 
     #[test]
+    fn a_drain_completes_only_when_every_condition_holds() {
+        let all = DrainProgress {
+            runner_stopped: true,
+            ledger_empty: true,
+            active_jobs: 0,
+        };
+        assert!(drained(&all));
+        for p in [
+            DrainProgress {
+                runner_stopped: false,
+                ..all
+            },
+            DrainProgress {
+                ledger_empty: false,
+                ..all
+            },
+            DrainProgress {
+                active_jobs: 1,
+                ..all
+            },
+        ] {
+            assert!(!drained(&p), "{p:?}");
+        }
+    }
+
+    /// A job dir counts while the process its pidfile names still carries the job dir, and
+    /// not once it is gone or for a dot-directory.
+    #[test]
+    fn only_a_job_with_a_live_supervisor_counts() {
+        let dir = scratch("jobs");
+        let jobs = dir.join("jobs");
+        let job = jobs.join("123");
+        std::fs::create_dir_all(&job).unwrap();
+        std::fs::create_dir_all(jobs.join(".net")).unwrap();
+        assert_eq!(crate::vm::live_supervisors(&jobs).unwrap(), 0);
+        let mut child = std::process::Command::new("sh")
+            // A loop, so the shell itself stays the process — a lone command it would exec
+            // in its place, and the job dir would leave the argument list.
+            .args(["-c", "while :; do sleep 1; done", job.to_str().unwrap()])
+            .spawn()
+            .unwrap();
+        std::fs::write(job.join("supervisor.pid"), child.id().to_string()).unwrap();
+        // Until the child has exec'd, its argument list is still this process's.
+        let cmdline = format!("/proc/{}/cmdline", child.id());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !std::fs::read(&cmdline).is_ok_and(|c| {
+            c.split(|&b| b == 0)
+                .any(|a| a == job.as_os_str().as_encoded_bytes())
+        }) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(crate::vm::live_supervisors(&jobs).unwrap(), 1);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(crate::vm::live_supervisors(&jobs).unwrap(), 0);
+        assert_eq!(crate::vm::live_supervisors(&dir.join("none")).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_drain_waits_for_the_runner_then_finishes() {
+        let dir = scratch("drain");
+        let (runner_tx, runner) = watch::channel(RunnerState::Running);
+        let (core, allowed) = Core::open(&dir, true, issuer(), runner).unwrap();
+        let cfg = cfg(&dir);
+        let ack = core
+            .command(
+                Command {
+                    id: "d".into(),
+                    expires_at: u64::MAX,
+                    op: Operation::Drain,
+                },
+                1,
+            )
+            .unwrap();
+        assert_eq!(ack.outcome, Outcome::Accepted);
+        // The runner is told to stop at once; the drain waits for it to have gone.
+        assert!(!*allowed.borrow());
+        core.step(&cfg, true).unwrap();
+        assert_eq!(core.state(), NodeState::Draining);
+        let drain = core.report().drain.unwrap();
+        assert!(!drain.runner_stopped && drain.ledger_empty && drain.active_jobs == 0);
+        // Quitting is still a runner: not drained, and acquisition not yet reported stopped.
+        runner_tx.send(RunnerState::Quitting).unwrap();
+        core.step(&cfg, true).unwrap();
+        assert_eq!(core.state(), NodeState::Draining);
+        assert_eq!(core.report().acquisition, Acquisition::Run);
+        runner_tx.send(RunnerState::Stopped).unwrap();
+        core.step(&cfg, true).unwrap();
+        assert_eq!(core.state(), NodeState::Drained);
+        assert_eq!(core.unrecorded()[0].outcome, Outcome::Done);
+        assert_eq!(core.report().concurrency.unwrap().effective, Some(3));
+        // Persisted: a restarted node is still drained and still not taking jobs.
+        assert_eq!(core.report().acquisition, Acquisition::Stop);
+        let (again, allowed) = Core::open(&dir, true, issuer(), stopped()).unwrap();
+        assert_eq!(again.state(), NodeState::Drained);
+        assert!(!*allowed.borrow());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_hub_ceiling_binds_and_an_external_runner_says_what_it_cannot_do() {
         let dir = scratch("ceiling");
-        let core = Core::open(&dir, issuer()).unwrap();
+        let (core, allowed) = Core::open(&dir, false, issuer(), stopped()).unwrap();
         let cfg = cfg(&dir);
         core.apply_desired(DesiredState {
             generation: 1,
@@ -241,7 +424,7 @@ mod tests {
             acquisition: Acquisition::Stop,
         })
         .unwrap();
-        core.step(&cfg, true);
+        core.step(&cfg, true).unwrap();
         let report = core.report();
         assert_eq!(report.applied_generation, Some(1));
         assert_eq!(report.concurrency.unwrap().effective, Some(2));
@@ -253,20 +436,33 @@ mod tests {
         assert_eq!(report.acquisition, Acquisition::Run);
         assert_eq!(report.runner_state, None);
         assert_eq!(report.unsupported.len(), 1);
+        assert!(!*allowed.borrow());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn a_concurrency_that_cannot_be_set_is_reported() {
+    fn a_drain_completes_while_the_concurrency_cannot_be_set() {
         let dir = scratch("broken");
-        let cfg: Config = toml::from_str(&format!(
-            "state_dir = {:?}\n[executor.vm]\nmem = \"lots\"\n[executor.schedule]\n\
-             mem_budget = \"32G\"\n",
-            dir.join("state").display().to_string()
-        ))
+        let cfg: Arc<Config> = Arc::new(
+            toml::from_str(&format!(
+                "state_dir = {:?}\n[executor.vm]\nmem = \"lots\"\n[executor.schedule]\n\
+                 mem_budget = \"32G\"\n",
+                dir.join("state").display().to_string()
+            ))
+            .unwrap(),
+        );
+        let (core, _) = Core::open(&dir, true, issuer(), stopped()).unwrap();
+        core.command(
+            Command {
+                id: "d".into(),
+                expires_at: u64::MAX,
+                op: Operation::Drain,
+            },
+            1,
+        )
         .unwrap();
-        let core = Core::open(&dir, issuer()).unwrap();
-        core.step(&cfg, true);
+        core.step(&cfg, true).unwrap();
+        assert_eq!(core.state(), NodeState::Drained);
         let report = core.report();
         assert!(
             report
@@ -275,6 +471,45 @@ mod tests {
                 .contains("[executor.vm] mem")
         );
         assert_eq!(report.concurrency, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plain stop — no drain polling progress — still shows in the report as the runner
+    /// quits and then exits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_runner_transition_changes_the_report() {
+        let dir = scratch("transitions");
+        let (runner_tx, runner) = watch::channel(RunnerState::Running);
+        let (core, _) = Core::open(&dir, true, issuer(), runner).unwrap();
+        let (halt, stop) = watch::channel(false);
+        let task = tokio::spawn(
+            core.clone()
+                .control(cfg(&dir), Duration::from_secs(3600), stop),
+        );
+        core.apply_desired(DesiredState {
+            generation: 1,
+            ceiling: None,
+            acquisition: Acquisition::Stop,
+        })
+        .unwrap();
+        let mut changes = core.subscribe();
+        for state in [RunnerState::Quitting, RunnerState::Stopped] {
+            changes.borrow_and_update();
+            runner_tx.send(state).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), changes.changed())
+                .await
+                .expect("the runner's transition was not reported")
+                .unwrap();
+            let report = core.report();
+            assert_eq!(report.runner_state, Some(state));
+            let want = match state {
+                RunnerState::Stopped => Acquisition::Stop,
+                _ => Acquisition::Run,
+            };
+            assert_eq!(report.acquisition, want);
+        }
+        halt.send(true).unwrap();
+        task.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -300,7 +535,7 @@ mod tests {
                 .parse()
                 .unwrap()
         };
-        let core = Core::open(&dir, issuer()).unwrap();
+        let (core, _) = Core::open(&dir, false, issuer(), stopped()).unwrap();
         let (halt, stop) = watch::channel(false);
         let task = tokio::spawn(
             core.clone()

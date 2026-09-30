@@ -579,14 +579,18 @@ mod tests {
                 incarnation: "cd".repeat(16),
                 tls: Arc::new(tls),
             },
+            // Managed, so a quarantine is carried out; no runner is started here.
             core: Core::open(
                 &dir,
+                true,
                 super::super::state::Issuer {
                     hub: format!("http://{addr}"),
                     node_id: "ab".repeat(16),
                 },
+                watch::channel(vk_fleet_proto::RunnerState::Stopped).1,
             )
-            .unwrap(),
+            .unwrap()
+            .0,
             gatherer: Gatherer::spawn(Arc::new(cfg)),
             stop,
             stopped,
@@ -774,15 +778,13 @@ mod tests {
         let mut f = fixture("steer").await;
         let (node, gatherer, stopped, listener, stop) = f.parts();
         let key = node.0.identity.public_key().to_vec();
-        let drain = vk_fleet_proto::Command {
+        let quarantine = vk_fleet_proto::Command {
             id: "01".repeat(16),
             expires_at: u64::MAX,
-            // Refused, with no runner of its own to stop: still journaled, and its outcome
-            // still repeated until recorded.
-            op: vk_fleet_proto::Operation::Drain,
+            op: vk_fleet_proto::Operation::Quarantine,
         };
         let hub = async {
-            // First session: desired state and a drain; the hub records nothing.
+            // First session: desired state and a quarantine; the hub records nothing.
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, PROTOCOL, PROTOCOL.max).await);
             hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
@@ -797,9 +799,9 @@ mod tests {
                 }),
             )
             .await;
-            hub_send(&mut ws, &HubMsg::Command(drain.clone())).await;
+            hub_send(&mut ws, &HubMsg::Command(quarantine.clone())).await;
             let ack = next_of(&mut ws, ack_of).await;
-            assert!(matches!(ack.outcome, Outcome::Refused { .. }), "{ack:?}");
+            assert_eq!(ack.outcome, Outcome::Done);
             drop(ws);
 
             // Second session: the unrecorded ack comes again unasked, and the command
@@ -809,9 +811,9 @@ mod tests {
             hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
             let report = next_of(&mut ws, report_of).await;
             assert_eq!(report.applied_generation, Some(1));
-            assert_eq!(report.state, vk_fleet_proto::NodeState::Ready);
+            assert_eq!(report.state, vk_fleet_proto::NodeState::Quarantined);
             assert_eq!(next_of(&mut ws, ack_of).await, ack);
-            hub_send(&mut ws, &HubMsg::Command(drain.clone())).await;
+            hub_send(&mut ws, &HubMsg::Command(quarantine.clone())).await;
             hub_send(&mut ws, &HubMsg::Recorded(ack.clone())).await;
             for _ in 0..100 {
                 if node.1.unrecorded().is_empty() {

@@ -48,7 +48,9 @@ A node is any host `vk` already runs on:
 `vk check` is the gate: a node refuses to enroll while it fails. No root is needed at
 runtime and no distribution is assumed. `vk node run` is a foreground process; how it is
 kept running is the host's choice (`vk node install` writes a `systemd --user` unit where
-there is one).
+there is one). A unit running it with a managed runner wants `KillMode=mixed`: gitlab-runner
+takes `SIGTERM` as abandoning its jobs, so the stop signal must reach the node alone, which
+quits the runner and waits for the jobs; a second one sends the runner `SIGTERM`.
 
 The node's gitlab-runner runs as the same user, with its configuration under
 `~/.gitlab-runner/`, so `vk node` edits its `concurrent` directly. A root-managed runner is
@@ -244,6 +246,24 @@ A drain:
 3. waits for gitlab-runner to finish its jobs, the executor's cleanup, and the admission
    ledger to empty;
 4. reports `drained` only once all three hold.
+
+The node tells these from what it can observe. gitlab-runner, sent `SIGQUIT`, exits only
+once its jobs are over, cleanup stage included; the admission ledger holds and awaits
+nothing; and no job supervisor is still alive — a job dir alone proves nothing, since a
+failed cleanup leaves one behind, but its supervisor's pid, checked against the job dir, says
+whether its VM is still up. These are the node's own state dir's ledger and job dirs, so the
+executor its runner runs must use the same vk configuration; the node warns when the
+runner's config names another. Stopping acquisition needs a runner the node runs itself,
+`[node] runner = "managed"`; with an external runner the node refuses a drain and a
+quarantine, and reports a stop of acquisition as something it cannot carry out while it
+still steers the runner's concurrency. gitlab-runner has no way back from `SIGQUIT`: a runner
+told to stop is reported `quitting`, and acquisition as still running, until it has exited,
+and a resume that comes meanwhile starts a new runner once the old one has gone. A runner
+outlives a node killed outright; the next `vk node run` finds it by its recorded pid and start
+time and follows it rather than start a second. `undrain` returns a drained or draining node
+to `ready`; a quarantine stops acquisition from any state and only `release` lifts it,
+returning the node to `drained` if that is where it was quarantined and to `ready` otherwise.
+All of it is persisted on the node, and a restart or a lost hub leaves it where it was.
 
 `validating` runs a boot/exec/network smoke test and, when configured, a synthetic job
 before the node goes back to `ready`.

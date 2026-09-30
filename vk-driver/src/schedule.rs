@@ -156,9 +156,16 @@ pub fn apply(cfg: &Config, decision: &Decision) -> Result<()> {
 }
 
 /// The gitlab-runner config this user owns and `vk` edits directly, if any: `[node]
-/// runner_config`. Unset, the runner is root's, reached through `vk-runnerctl`.
+/// runner_config`, which a managed runner defaults to `~/.gitlab-runner/config.toml`.
+/// Otherwise the runner is root's, reached through `vk-runnerctl`.
 pub fn runner_config(cfg: &Config) -> Option<PathBuf> {
-    cfg.node.runner_config.clone()
+    match (&cfg.node.runner_config, cfg.node.runner) {
+        (Some(path), _) => Some(path.clone()),
+        (None, vk_fleet_proto::RunnerMode::Managed) => std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(|h| PathBuf::from(h).join(".gitlab-runner/config.toml")),
+        (None, vk_fleet_proto::RunnerMode::External) => None,
+    }
 }
 
 /// Measure the host and write what the runner's concurrency should be. Meant to run every

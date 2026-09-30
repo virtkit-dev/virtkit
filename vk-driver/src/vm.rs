@@ -2652,11 +2652,17 @@ pub fn live_supervisor_pid(ctx: &JobCtx) -> Option<i32> {
     pid_running(pid, &ctx.job_dir.to_string_lossy()).then_some(pid)
 }
 
-/// The job dirs under `jobs_dir` whose supervisor is alive, each with its pid: each job dir's
-/// recorded supervisor, counted only while that pid still names the job dir (the pid-reuse
-/// guard [`live_supervisor_pid`] uses). A job dir left behind by a failed cleanup counts only
-/// if its supervisor — and so its VM — is still up; dot-directories are shared state, not
-/// jobs. A directory that cannot be read is an error, never a list of none.
+/// How many job supervisors under `jobs_dir` are alive: each job dir's recorded supervisor,
+/// counted only while that pid still names the job dir (the pid-reuse guard
+/// [`live_supervisor_pid`] uses). A job dir left behind by a failed cleanup counts only if its
+/// supervisor — and so its VM — is still up; dot-directories are shared state, not jobs. A
+/// directory that cannot be read is an error, never a count of none.
+pub(crate) fn live_supervisors(jobs_dir: &Path) -> Result<usize> {
+    Ok(live_job_supervisors(jobs_dir)?.len())
+}
+
+/// The job dirs under `jobs_dir` whose supervisor is alive, each with its pid: what
+/// [`live_supervisors`] counts.
 pub(crate) fn live_job_supervisors(jobs_dir: &Path) -> Result<Vec<(PathBuf, i32)>> {
     let entries = match std::fs::read_dir(jobs_dir) {
         Ok(entries) => entries,
@@ -2800,9 +2806,9 @@ fn read_pidfile(path: &Path) -> Option<i32> {
 }
 
 /// A recorded pid counts as ours only while one of its arguments is exactly the job dir —
-/// guards the kill/wait logic against pid reuse after a crash. Compared as whole arguments
-/// and as bytes: a substring of the command line would also match `/jobs/12` inside
-/// `/jobs/123`.
+/// guards the kill/wait logic, and a drain's count of live jobs, against pid reuse after a
+/// crash. Compared as whole arguments and as bytes: a substring of the command line would
+/// also match `/jobs/12` inside `/jobs/123`.
 fn pid_running(pid: i32, expect_arg: &str) -> bool {
     let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
