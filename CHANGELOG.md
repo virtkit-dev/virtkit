@@ -70,6 +70,11 @@ All notable changes to virtkit will be documented in this file.
   deadline is rolled back to the previous `vk`, and the host returns to the state it was in
   either way. A host whose runner is external updates only when forced, and a host goes back
   to an older `vk` only when its own `[node] allow_downgrade` says it may.
+- **Experimental: signed `vk` releases for a fleet.** `vk release-key generate` makes a
+  signing key and `vk release-key sign` signs a binary, on a machine of your choosing;
+  `vk-hub release add --signature` passes the signature on. A host with `[node] release_keys`
+  updates only to a release one of those keys signed (`require_signed = false` makes that
+  optional).
 - **`vk tune` stands aside on a fleet node** while `vk node run` is up, and otherwise honours
   the ceiling the node last received.
 

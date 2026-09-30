@@ -9,8 +9,8 @@ and the hub auditing them (`vk-hub nodes ceiling`, `stop`, `resume`, `drain`, `u
 its steering actions, signed into with links from `vk-hub ui login`; releases held by the
 hub and served to the nodes updating to them (`vk-hub release`, `vk-hub nodes update`), and
 nodes updating to them, on trial, rolling back to the previous binary when the release does
-not pass. Signed releases, rollouts, resets, the GitLab API pause and the rest of the web UI
-are not built yet.
+not pass, and checking the release's signature against keys of their own (`vk release-key`).
+Rollouts, resets, the GitLab API pause and the rest of the web UI are not built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -304,7 +304,7 @@ rollout survives a hub restart.
 `vk-selfupdate` provides the download, digest check, version smoke test and atomic rename.
 Fleet updates add:
 
-- a signature check against keys pinned in the installed `vk`, before the new binary runs;
+- a signature check against keys pinned on the node, before the new binary runs;
 - the same pinning for the gitlab-runner binary;
 - one `vk` binary per job for the job's whole life: executor stages running during a switch
   must not mix versions, which draining guarantees.
@@ -362,7 +362,23 @@ new `vk` — the one thing draining exists to prevent. It is refused, too, for a
 than the node runs unless the node's own `[node] allow_downgrade = true` allows it, and even
 then for one older than 0.80.0, the first release that takes part in a trial; versions are
 compared as `MAJOR.MINOR.PATCH`, and an older one that is not of that form is refused.
-Signatures and the gitlab-runner binary's pinning are not built yet.
+The gitlab-runner binary's pinning is not built yet.
+
+Signatures are made offline: `vk release-key generate --key <file>` writes an ed25519 key
+(`0600`, never over an existing file) and prints its public half in base64, and `vk
+release-key sign --key <file> --version <v> <binary>` prints the signature of the binary's
+sha256 and version under the label `vk-fleet release v1`. The tool is in `vk`, which every
+node and workstation has and which already links ring, rather than in `vk-hub`: the key must
+not be on the hub, since a signature is what a node trusts when the hub itself may be what
+is compromised. `vk-hub release add --signature <file>` stores one beside the release and
+passes it on in the update. A node's `[node] release_keys` lists the keys it trusts, and
+`require_signed`, true by default when any key is set, makes a signature by one of them a
+condition of an update: checked when the update is received — refused before any drain —
+and again before the release first runs. A signature a release carries is checked whenever
+the node has keys, and one that does not verify is refused even where none is required. The
+keys are pinned in the node's configuration, not in the `vk` binary. Official releases are
+not signed this way yet: that is a step for the release workflow, with the key in CI's
+secrets.
 
 On the hub: `vk-hub release add <file> --version <v>` copies a `vk` binary into
 `<data_dir>/releases/`, named by its sha256, and `release list` and `release remove` show and

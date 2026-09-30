@@ -41,6 +41,8 @@ pub struct Core {
     /// Whether an update may install an older version than this one (`[node]
     /// allow_downgrade`).
     allow_downgrade: std::sync::atomic::AtomicBool,
+    /// What an update's release must be signed with; none required until set.
+    release_policy: std::sync::OnceLock<crate::release_key::Policy>,
 }
 
 impl Core {
@@ -80,6 +82,7 @@ impl Core {
             connected: watch::Sender::new(false),
             exec: super::update::exec,
             allow_downgrade: std::sync::atomic::AtomicBool::new(false),
+            release_policy: std::sync::OnceLock::new(),
         };
         Ok((Arc::new(core), allowed))
     }
@@ -119,20 +122,41 @@ impl Core {
             managed: self.managed,
             // Looked at only for an update: it reads the filesystem.
             update: match &command.op {
-                vk_fleet_proto::Operation::Update { version, .. } => {
+                vk_fleet_proto::Operation::Update {
+                    version,
+                    sha256,
+                    signature,
+                    ..
+                } => {
                     let installed = lock(&self.persisted).installed.clone();
-                    super::update::can_replace(installed.as_deref(), &self.dir).and_then(|()| {
-                        super::update::check_version(
-                            env!("CARGO_PKG_VERSION"),
-                            version,
-                            self.allow_downgrade(),
-                        )
-                    })
+                    super::update::can_replace(installed.as_deref(), &self.dir)
+                        .and_then(|()| {
+                            super::update::check_version(
+                                env!("CARGO_PKG_VERSION"),
+                                version,
+                                self.allow_downgrade(),
+                            )
+                        })
+                        .and_then(|()| {
+                            self.release_policy()
+                                .check(sha256, version, signature.as_deref())
+                        })
                 }
                 _ => Ok(()),
             },
         };
         self.update(|p| p.command_as(command, now, &can))
+    }
+
+    /// Require what `policy` says of every release from now on.
+    pub fn set_release_policy(&self, policy: crate::release_key::Policy) {
+        // Set once, at start: a second call has nothing new to say.
+        let _ = self.release_policy.set(policy);
+    }
+
+    /// What an update's release must be signed with.
+    pub fn release_policy(&self) -> crate::release_key::Policy {
+        self.release_policy.get().cloned().unwrap_or_default()
     }
 
     /// Change the persisted state through `f` and execute `exe` in this process's place,

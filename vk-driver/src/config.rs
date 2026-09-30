@@ -299,6 +299,12 @@ pub struct Node {
     /// or whoever holds it — cannot take the node back to a release with a known flaw. Even
     /// on, nothing older than the first release that takes part in a trial is installed.
     pub allow_downgrade: bool,
+    /// The ed25519 public keys, base64, whose signature an update's release must carry —
+    /// `vk release-key generate` prints one. Unset: releases are not checked.
+    pub release_keys: Vec<String>,
+    /// Whether an update needs a signature by one of `release_keys`. Unset: when any key is
+    /// set. A release that carries a signature is checked whenever there are keys.
+    pub require_signed: Option<bool>,
 }
 
 impl Node {

@@ -65,6 +65,7 @@ mod publish;
 mod qcow2;
 mod registry;
 mod regproxy;
+mod release_key;
 mod run;
 mod schedule;
 mod scratch;
@@ -243,6 +244,27 @@ struct Cli {
     config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum ReleaseKeyCmd {
+    /// Make a release key, and print its public half
+    Generate {
+        /// Where to write the private key (never over an existing file)
+        #[arg(long, value_name = "FILE")]
+        key: PathBuf,
+    },
+    /// Sign a vk binary as a version, and print the signature
+    Sign {
+        /// The private key `generate` wrote
+        #[arg(long, value_name = "FILE")]
+        key: PathBuf,
+        /// The version the binary's `vk --version` prints
+        #[arg(long)]
+        version: String,
+        /// The vk binary
+        binary: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -696,6 +718,16 @@ enum Cmd {
         #[arg(long, value_name = "SECS", default_value_t = 30,
               value_parser = clap::value_parser!(u64).range(1..))]
         mem_secs: u64,
+    },
+    /// Keys that sign vk releases for a fleet's nodes (experimental)
+    ///
+    /// `generate` makes a key and prints the public half for `[node] release_keys`; `sign`
+    /// signs a vk binary as a version, for `vk-hub release add --signature`. Keep the key
+    /// off the hub: a signature is what a node trusts when the hub itself might not be.
+    #[command(hide = true)]
+    ReleaseKey {
+        #[command(subcommand)]
+        cmd: ReleaseKeyCmd,
     },
     /// Membership in a fleet managed by a vk-hub (experimental)
     ///
@@ -2959,6 +2991,23 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Err(e) => fail(&e, 2),
         };
     }
+    if let Cmd::ReleaseKey { cmd } = &cli.cmd {
+        let printed = match cmd {
+            ReleaseKeyCmd::Generate { key } => release_key::generate(key),
+            ReleaseKeyCmd::Sign {
+                key,
+                version,
+                binary,
+            } => release_key::sign(key, binary, version),
+        };
+        return match printed {
+            Ok(line) => {
+                println!("{line}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => fail(&e, 1),
+        };
+    }
     if let Cmd::Gc { idle_secs } = &cli.cmd {
         let override_idle = idle_secs.map(std::time::Duration::from_secs);
         let image_idle = override_idle.unwrap_or_else(|| cfg.image_cache_idle());
@@ -4409,6 +4458,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         | Cmd::Paths { .. }
         | Cmd::Config { .. }
         | Cmd::Gc { .. }
+        | Cmd::ReleaseKey { .. }
         | Cmd::HelpAll
         | Cmd::Registry { .. }
         | Cmd::Switch { .. }

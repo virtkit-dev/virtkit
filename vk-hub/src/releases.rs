@@ -5,6 +5,10 @@
 //! key, so a binary it was handed is only read: hashed, checked to be an x86-64 ELF, and
 //! checked to carry the version the operator states as a string of its own. The node runs
 //! it — `--version`, before anything else — and that is the smoke test that decides.
+//!
+//! **Nor does it check a signature.** A release may carry one, made offline with `vk
+//! release-key sign`; the hub stores it and passes it on, and each node checks it against the
+//! keys in its own configuration. The hub has no key to trust, which is the point.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -54,6 +58,18 @@ pub fn add(
     signature: Option<String>,
 ) -> Result<Release> {
     check_version(version)?;
+    let signature = signature
+        .map(|s| {
+            let s = s.trim().to_string();
+            match vk_fleet_proto::from_base64(&s) {
+                Some(sig) if sig.len() == vk_fleet_proto::SIGNATURE_LEN => Ok(s),
+                _ => Err(anyhow::anyhow!(
+                    "the signature is not an ed25519 signature in base64, as `vk release-key \
+                     sign` prints one"
+                )),
+            }
+        })
+        .transpose()?;
     let dir = hub.releases_dir()?;
     std::fs::DirBuilder::new()
         .recursive(true)

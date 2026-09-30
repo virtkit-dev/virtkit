@@ -685,12 +685,17 @@ async fn a_release_is_served_only_to_a_node_updating_to_it_that_signs_for_it() {
     assert!(releases::add(&hub, "uid 0", &file, "0.81.1", None).is_err());
     std::fs::write(dir.join("script"), b"#!/bin/sh\necho 0.81.0\n").unwrap();
     assert!(releases::add(&hub, "uid 0", &dir.join("script"), "0.81.0", None).is_err());
-    let release = releases::add(&hub, "uid 0", &file, "0.81.0", None).unwrap();
+    // A signature must at least be one, in base64; checking it is each node's to do.
+    assert!(releases::add(&hub, "uid 0", &file, "0.81.0", Some("abc".into())).is_err());
+    let signature = vk_fleet_proto::to_base64(&[5; vk_fleet_proto::SIGNATURE_LEN]);
+    let release = releases::add(&hub, "uid 0", &file, "0.81.0", Some(signature.clone())).unwrap();
+    assert_eq!(release.row.signature, Some(signature.clone()));
     assert_eq!(release.row.size, bin.len() as u64);
     // Added again as the same release — a retry whose answer was lost — it is the same one;
-    // as another version, refused.
-    let again = releases::add(&hub, "uid 0", &file, "0.81.0", None).unwrap();
+    // with another signature, or as another version, refused.
+    let again = releases::add(&hub, "uid 0", &file, "0.81.0", Some(signature)).unwrap();
     assert_eq!(again, release);
+    assert!(releases::add(&hub, "uid 0", &file, "0.81.0", None).is_err());
     let bin2 = fake_vk("0.81.0 0.82.0");
     std::fs::write(&file, &bin2).unwrap();
     let other = releases::add(&hub, "uid 0", &file, "0.82.0", None).unwrap();

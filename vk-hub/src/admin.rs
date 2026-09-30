@@ -88,6 +88,8 @@ enum Call {
     AddRelease {
         path: PathBuf,
         version: String,
+        /// A release key's signature, base64.
+        signature: Option<String>,
     },
     ListReleases,
     RemoveRelease {
@@ -287,9 +289,13 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
         Call::UpdateNode { id, release, force } => {
             serde_json::to_value(ops::update(hub, &actor, &id, &release, force)?)?
         }
-        Call::AddRelease { path, version } => {
-            serde_json::to_value(crate::releases::add(hub, &actor, &path, &version, None)?)?
-        }
+        Call::AddRelease {
+            path,
+            version,
+            signature,
+        } => serde_json::to_value(crate::releases::add(
+            hub, &actor, &path, &version, signature,
+        )?)?,
         Call::ListReleases => serde_json::to_value(hub.db.releases()?)?,
         Call::RemoveRelease { release } => {
             let release = hub.db.resolve_release(&release)?;
@@ -412,10 +418,16 @@ impl Client {
         })
     }
 
-    pub fn add_release(&self, path: &Path, version: &str) -> Result<Release> {
+    pub fn add_release(
+        &self,
+        path: &Path,
+        version: &str,
+        signature: Option<String>,
+    ) -> Result<Release> {
         self.call(Call::AddRelease {
             path: path.to_path_buf(),
             version: version.to_string(),
+            signature,
         })
     }
 

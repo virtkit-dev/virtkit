@@ -483,6 +483,14 @@ async fn prepare(core: &Core, cfg: &Config, node: &Node, job: &Job) -> Result<()
             .await
             .map_err(|_| anyhow!("the download took longer than {DOWNLOAD_TIMEOUT:?}"))??;
     }
+    // Before the release runs at all, --version included.
+    core.release_policy()
+        .check(
+            &release.sha256,
+            &release.version,
+            release.signature.as_deref(),
+        )
+        .map_err(|e| anyhow!(e))?;
     let (path, version) = (next.clone(), release.version.clone());
     blocking(move || vk_selfupdate::smoke_test("vk", &path, &version)).await?;
     let previous = own_sha256();

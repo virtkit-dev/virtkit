@@ -135,6 +135,9 @@ enum ReleaseCmd {
         /// The version its `vk --version` prints
         #[arg(long)]
         version: String,
+        /// A release key's signature of it, as `vk release-key sign` prints one
+        #[arg(long, value_name = "FILE")]
+        signature: Option<PathBuf>,
     },
     /// List the releases the hub holds
     List,
@@ -384,13 +387,28 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Release { config, cmd } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             match cmd {
-                ReleaseCmd::Add { file, version } => {
+                ReleaseCmd::Add {
+                    file,
+                    version,
+                    signature,
+                } => {
+                    let signature = signature
+                        .map(|path| {
+                            use std::io::Read;
+                            let mut text = String::new();
+                            std::fs::File::open(&path)
+                                .and_then(|f| f.take(4096).read_to_string(&mut text))
+                                .with_context(|| format!("reading {}", path.display()))?;
+                            anyhow::Ok(text.trim().to_string())
+                        })
+                        .transpose()?;
                     // Absolute, since the hub resolves it from its own working directory.
                     let file = std::path::absolute(&file)
                         .with_context(|| format!("resolving {}", file.display()))?;
-                    let added =
-                        tokio::task::spawn_blocking(move || client.add_release(&file, &version))
-                            .await??;
+                    let added = tokio::task::spawn_blocking(move || {
+                        client.add_release(&file, &version, signature)
+                    })
+                    .await??;
                     println!("{}", added.sha256);
                     eprintln!(
                         "vk-hub: holding vk {} ({} bytes); `vk-hub nodes update <id> --release {}` \
