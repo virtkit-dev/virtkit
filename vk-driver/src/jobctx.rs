@@ -72,6 +72,10 @@ pub struct JobCtx {
     /// lower-cased, punctuation-folded and cut to 63 characters, so two projects can share
     /// one. The id scopes the history; the slug only makes the directory readable.
     project_id: Option<String>,
+    /// The project's full path (`group/sub/project`), for display only: what the job record
+    /// names the job's project as. From the runner's account of the job, or `CI_PROJECT_PATH`
+    /// where there is none.
+    project_path: Option<String>,
 }
 
 impl JobCtx {
@@ -171,6 +175,10 @@ impl JobCtx {
             project_id: match &response {
                 Some(r) => Some(r.job_info.project_id.to_string()),
                 None => job_var("CI_PROJECT_ID"),
+            },
+            project_path: match &response {
+                Some(r) => Some(r.job_info.project_full_path.clone()),
+                None => job_var("CI_PROJECT_PATH"),
             },
         })
     }
@@ -273,6 +281,7 @@ impl JobCtx {
     pub fn supervisor_log(&self) -> PathBuf {
         self.job_dir.join("supervisor.log")
     }
+
     pub fn console_log(&self) -> PathBuf {
         self.job_dir.join(crate::run::CONSOLE_LOG)
     }
@@ -394,7 +403,47 @@ impl JobCtx {
         p.push(format!("_{port}"));
         PathBuf::from(p)
     }
+
+    /// Record what this job is in its job dir ([`JobRecord`]), for a reader outside the job to
+    /// say what the VM beside it belongs to. `cpus` and `mem` are the size its primary VM
+    /// boots at.
+    pub fn record(&self, cpus: u32, mem: &str) -> Result<()> {
+        let record = JobRecord {
+            job_id: self.job_id.clone(),
+            project: self.project_path.clone(),
+            job_name: self.job_name.clone(),
+            image: self.image_ref.clone(),
+            cpus,
+            mem: mem.to_string(),
+        };
+        let json = serde_json::to_vec(&record)?;
+        // Not synced: after a crash the VM this describes is gone too, so a reader must check
+        // the job is live before trusting it, and treat a record it cannot parse as absent.
+        vk_fs::write_atomic_unsynced(&self.job_dir.join(JOB_RECORD), &json, 0o600)
+    }
 }
+
+/// What `prepare` records of a job in its job dir: the identity the runner gave it (the
+/// `CI_*` variables where there is no job response) and the size its primary VM boots at.
+/// Written once, before the VM exists, and removed with the job dir at cleanup.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct JobRecord {
+    pub job_id: String,
+    /// The project's full path; `None` outside gitlab-runner with no `CI_PROJECT_PATH`.
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub job_name: Option<String>,
+    /// The image reference the job asked for, as it asked.
+    #[serde(default)]
+    pub image: Option<String>,
+    pub cpus: u32,
+    /// The `vm.mem`-style size token the primary VM boots with.
+    pub mem: String,
+}
+
+/// The [`JobRecord`]'s name in a job dir.
+pub const JOB_RECORD: &str = "job.json";
 
 /// A job's own component: its name reduced to a filename, followed by a short digest of the
 /// name as written. The digest is what makes two names that reduce to the same filename —
@@ -619,6 +668,49 @@ mod tests {
         );
     }
 
+    /// A job's record names the project by its full path from the runner's account, and is
+    /// private to the node's user.
+    #[test]
+    fn a_job_record_names_the_job_as_the_runner_does() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vk-job-record-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            state_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let response = JobResponse {
+            id: 7,
+            job_info: JobInfo {
+                name: "test:unit".into(),
+                project_id: 42,
+                project_full_path: "acme/web".into(),
+            },
+        };
+        let ctx = JobCtx::with_response(cfg, "7".into(), Some(response)).unwrap();
+        std::fs::create_dir_all(&ctx.job_dir).unwrap();
+        ctx.record(4, "8G").unwrap();
+        let written = std::fs::read(ctx.job_dir.join(JOB_RECORD)).unwrap();
+        let record: JobRecord = serde_json::from_slice(&written).unwrap();
+        assert_eq!(
+            record,
+            JobRecord {
+                job_id: "7".into(),
+                project: Some("acme/web".into()),
+                job_name: Some("test:unit".into()),
+                image: ctx.image_ref.clone(),
+                cpus: 4,
+                mem: "8G".into(),
+            }
+        );
+        let mode = std::fs::metadata(ctx.job_dir.join(JOB_RECORD))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// The slug is a path component, so the edges matter: a leading or trailing run of
     /// non-alphanumerics must not survive as dots or dashes around the name, and a very long
     /// path is cut where GitLab cuts it.
@@ -702,6 +794,7 @@ mod tests {
             project_slug: "myproj".into(),
             job_name: Some("test:unit 1/3".into()),
             project_id: Some("42".into()),
+            project_path: None,
         }
     }
 
