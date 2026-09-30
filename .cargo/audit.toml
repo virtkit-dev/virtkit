@@ -3,17 +3,14 @@
 # RUSTSEC-2023-0071 — Marvin attack (timing side-channel) on the `rsa` crate. No fixed
 # stable release: the constant-time fixes are split across upstream issue #626 (padding)
 # and PR #680 (the decrypt Ok/Err oracle) and currently exist only in the unreleased rsa
-# 0.10 release candidates. `rsa` enters the tree two ways:
-#   - via russh (vk-agent's optional `ssh` feature): rsa 0.10-rc, which already carries
-#     those fixes; used so the embedded SSH server can verify clients' RSA public keys.
-#   - via jsonwebtoken's `rust_crypto` backend (oci-client, in vk-driver): rsa 0.9.10
-#     (unpatched), but the only call is `insecure_decode`, which parses a registry bearer
-#     token's claims and runs no RSA operation — the vulnerable code is never reached.
+# 0.10 release candidates. `rsa` enters the tree via russh (vk-agent's optional `ssh`
+# feature) as rsa 0.10-rc, which already carries those fixes; used so the embedded SSH
+# server can verify clients' RSA public keys. cargo-audit still flags it because the
+# advisory lists no patched version.
 #
-# Residual risk here is low on both paths: our SSH host key is Ed25519 and the server does
-# RSA signature *verification* (public-key side), not the private-key decryption that is
-# Marvin's sharpest edge; the token-parsing path performs no RSA at all. Revisit and drop
-# this entry when rsa 0.10 ships stable.
+# Residual risk is low: our SSH host key is Ed25519 and the server does RSA signature
+# *verification* (public-key side), not the private-key decryption that is Marvin's
+# sharpest edge. Revisit and drop this entry when rsa 0.10 ships stable.
 #
 # RUSTSEC-2025-0141 — `bincode` is unmaintained (informational, no vulnerability). It
 # enters the tree via imago, the qcow2 image library used by the vendored libkrun's block
