@@ -1,4 +1,4 @@
-//! Reading a recorded job back: the samples in a guest's `atop.log`.
+//! Read a guest's recorded samples from `atop.log` or a finished job's `atop.log.zst`.
 //!
 //! The guest writes what `atop -P` would print (the schema is `vk_core::atop`); this opens
 //! that log and turns its text back into samples, so `vk atop` can account a job that
@@ -27,8 +27,18 @@ use anyhow::{Context, Result, bail};
 use vk_core::atop::{self, Label};
 
 /// The most of a log this reads. The guest owns the directory its log is in and can fill it;
-/// reading one is not worth an unbounded allocation.
+/// reading one is not worth an unbounded allocation. For a compressed log it is the most
+/// that is *decompressed*, which is what bounds a frame crafted to expand without limit.
 const MAX_LOG: u64 = 256 * 1024 * 1024;
+
+/// The on-disk zstd magic identifies compressed recordings regardless of filename, so renamed
+/// copies still read correctly.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+/// The largest zstd window a recording's decoder accepts, as a power of two: the `zstd` CLI's
+/// own default limit (128 MiB), above what any level `vk` compresses at uses, and the most
+/// memory a frame can make a reader allocate for its window.
+const WINDOW_LOG_MAX: u32 = 27;
 
 /// A whole log as text, opened by [`open_log`] and capped at [`MAX_LOG`].
 ///
@@ -36,23 +46,70 @@ const MAX_LOG: u64 = 256 * 1024 * 1024;
 /// writes, so a byte that is not text means a damaged log — and reading what is still there is
 /// exactly what a reader of a possibly-torn file is for.
 pub fn read(path: &Path) -> Result<String> {
+    read_from(path, open_log(path)?.0, MAX_LOG)
+}
+
+/// [`read`] on a log already opened by [`open_log`], plain or compressed.
+pub fn read_opened(path: &Path, file: std::fs::File) -> Result<String> {
+    read_from(path, file, MAX_LOG)
+}
+
+/// The text of `file`, at most `cap` bytes of it, decompressed if it is a zstd recording.
+///
+/// A truncated or damaged compressed log yields the text decoded before the damage, with a
+/// warning. As with a plain log's torn tail, earlier samples remain usable.
+fn read_from(path: &Path, file: std::fs::File, cap: u64) -> Result<String> {
     use std::io::Read;
-    let (file, len) = open_log(path)?;
-    if len > MAX_LOG {
+    let compressed = is_compressed(&file).with_context(|| format!("reading {}", path.display()))?;
+    let source: Box<dyn Read> = match compressed {
+        true => Box::new(decoder(file).with_context(|| format!("reading {}", path.display()))?),
+        false => Box::new(file),
+    };
+    let mut bytes = Vec::new();
+    // Read one extra byte to distinguish an oversized log from one exactly at the cap.
+    match source.take(cap.saturating_add(1)).read_to_end(&mut bytes) {
+        Ok(_) => {}
+        Err(e) if compressed && !bytes.is_empty() => eprintln!(
+            "virtkit: warning: {} stops decoding after {} ({e}) — reading the samples before it",
+            path.display(),
+            crate::usage::fmt_bytes(bytes.len() as u64)
+        ),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    if bytes.len() as u64 > cap {
         // Said out loud rather than silently reading a fraction of the job: anything totalled
         // over what comes back would cover only the part that was read.
         eprintln!(
-            "virtkit: warning: {} is {} — reading its first {}",
+            "virtkit: warning: {} holds more than {} — reading its first {}",
             path.display(),
-            crate::usage::fmt_bytes(len),
-            crate::usage::fmt_bytes(MAX_LOG)
+            crate::usage::fmt_bytes(cap),
+            crate::usage::fmt_bytes(cap)
         );
+        bytes.truncate(usize::try_from(cap).unwrap_or(usize::MAX));
     }
-    let mut bytes = Vec::new();
-    file.take(MAX_LOG)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("reading {}", path.display()))?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Whether `file` is a zstd recording, from its first bytes. Read at an offset, so the
+/// descriptor's own position is left where it was; a file shorter than the magic is plain.
+pub fn is_compressed(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::unix::fs::FileExt;
+    let mut head = [0u8; ZSTD_MAGIC.len()];
+    let mut got = 0;
+    while got < head.len() {
+        match file.read_at(&mut head[got..], got as u64)? {
+            0 => return Ok(false),
+            n => got += n,
+        }
+    }
+    Ok(head == ZSTD_MAGIC)
+}
+
+/// A decoder for a compressed recording, its window bounded by [`WINDOW_LOG_MAX`].
+fn decoder(file: std::fs::File) -> std::io::Result<impl std::io::Read> {
+    let mut decoder = zstd::stream::read::Decoder::new(file)?;
+    decoder.window_log_max(WINDOW_LOG_MAX)?;
+    Ok(decoder)
 }
 
 /// A recording, opened on the descriptor everything that reads it reads from, with its size.
@@ -829,6 +886,29 @@ fn stall(r: &Record, resource: &str) -> Stall {
     }
 }
 
+/// A log of `samples` samples for a test to write, compress and read back: each a CPU record
+/// and a process whose command line varies from one sample to the next, so it compresses the
+/// way a real log does — well, but not to nothing.
+#[cfg(test)]
+pub(crate) fn synthetic_log(samples: usize) -> String {
+    use std::fmt::Write;
+    let mut text = String::from("RESET\n");
+    let mut seed: u64 = 42;
+    for i in 0..samples {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let epoch = 1000 + 10 * i;
+        let _ = write!(
+            text,
+            "CPU runner {epoch} 1970/01/01 00:16:40 10 100 2 {} 3 0 2991 0 0 0 0 0 0 100 0 0\n\
+             PRG runner {epoch} 1970/01/01 00:16:40 10 7 (cc1) S 0 0 7 1 0 900 (cc1 -o {seed:x}.o) \
+             1 1 0 0 0 0 0 0 0 0 0 y 0 0 - N ()\n\
+             SEP\n",
+            seed % 997
+        );
+    }
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1303,5 +1383,78 @@ SEP
         assert_eq!(p.samples.len(), 1);
         assert_eq!(p.dropped, 0);
         assert!(p.samples[0].cpu.is_some());
+    }
+
+    /// A compressed recording reads back as the text it was made from, told apart by its
+    /// content rather than its name; a file too short to hold the magic is plain.
+    #[test]
+    fn a_compressed_log_reads_back_as_its_text() {
+        let dir = std::env::temp_dir().join(format!("vk-atoplog-zst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = synthetic_log(50);
+        let named_anything = dir.join("copy");
+        std::fs::write(
+            &named_anything,
+            zstd::encode_all(text.as_bytes(), 9).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read(&named_anything).unwrap(), text);
+        let short = dir.join("short");
+        std::fs::write(&short, b"SE").unwrap();
+        assert_eq!(read(&short).unwrap(), "SE");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A compressed log cut short — a full disk, a crash — yields the samples that decoded
+    /// before the cut, never a panic and never an error that loses them all.
+    #[test]
+    fn a_truncated_compressed_log_yields_the_samples_before_the_cut() {
+        let dir = std::env::temp_dir().join(format!("vk-atoplog-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = synthetic_log(20_000);
+        let whole = parse(&text).samples;
+        let packed = zstd::encode_all(text.as_bytes(), 9).unwrap();
+        let path = dir.join("atop.log.zst");
+        std::fs::write(&path, &packed[..packed.len() / 2]).unwrap();
+
+        let got = parse(&read(&path).expect("the part before the cut")).samples;
+        assert!(!got.is_empty() && got.len() < whole.len(), "{}", got.len());
+        assert!(
+            got.iter().zip(&whole).all(|(a, b)| a.epoch == b.epoch),
+            "a prefix of the job, in order"
+        );
+        // Cut inside the frame header: nothing decodes, which is an error rather than an
+        // empty recording.
+        std::fs::write(&path, &packed[..5]).unwrap();
+        assert!(read(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A frame that expands without limit is read only as far as the cap; one asking for a
+    /// window past [`WINDOW_LOG_MAX`] is refused before anything is allocated for it.
+    #[test]
+    fn decompression_is_bounded() {
+        let dir = std::env::temp_dir().join(format!("vk-atoplog-bomb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bomb = dir.join("bomb");
+        std::fs::write(
+            &bomb,
+            zstd::encode_all(&vec![b'x'; 8 << 20][..], 19).unwrap(),
+        )
+        .unwrap();
+        let cap = 64 * 1024;
+        let text = read_from(&bomb, open_log(&bomb).unwrap().0, cap).unwrap();
+        assert_eq!(text.len() as u64, cap, "read to the cap and no further");
+
+        let wide = dir.join("wide");
+        let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        enc.window_log(WINDOW_LOG_MAX + 1).unwrap();
+        std::io::Write::write_all(&mut enc, b"SEP\n").unwrap();
+        std::fs::write(&wide, enc.finish().unwrap()).unwrap();
+        assert!(read(&wide).is_err(), "a window past the limit");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

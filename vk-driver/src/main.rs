@@ -1158,7 +1158,8 @@ enum Cmd {
     /// VM booted with `vk run --atop` is already recording itself, so its own recording is
     /// read live instead: the flags answer off that log as it stands, with no attach to
     /// Ctrl-C. Anything else reads a recorded job: with no flag, print the log's path so a
-    /// viewer can be pointed at it (`less $(vk atop 42137)`).
+    /// viewer can be pointed at it (`zstdless $(vk atop 42137)`: a finished job's log is
+    /// zstd-compressed).
     #[command(display_order = 10)]
     Atop {
         /// A running VM's directory, or a recorded job

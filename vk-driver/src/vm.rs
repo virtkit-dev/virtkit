@@ -391,8 +391,9 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         };
         match recorded {
             Ok(dir) => println!(
-                "virtkit: recording guest stats every {interval}s -> {}",
-                dir.join(vk_core::atop::LOG_NAME).display()
+                "virtkit: recording guest stats every {interval}s -> {} ({} once the job ends)",
+                dir.join(vk_core::atop::LOG_NAME).display(),
+                crate::atop::LOG_ZST_NAME
             ),
             Err((e, on_jobs_fs))
                 if atop_failure_is_fatal(storage_full(&e), on_jobs_fs, || {
@@ -2795,6 +2796,8 @@ pub fn cleanup(ctx: &JobCtx) -> Result<()> {
     // After the supervisor is gone, so the freed budget is visible to the next job the
     // moment its entry disappears rather than while its VM is still shutting down.
     crate::admit::release(&ctx.admit_dir(), &ctx.job_id);
+    // Before the job dir goes: the marker naming the archive directory is in it.
+    crate::atop::compress_job_log(ctx);
     match std::fs::remove_dir_all(&ctx.job_dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

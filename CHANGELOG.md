@@ -34,6 +34,10 @@ All notable changes to virtkit will be documented in this file.
 - `vk check --feature gitlab` fails when `[executor] tools_dir` has no executable
   `gitlab-runner` a job can reach: jobs would pass without transferring artifacts, caches
   or dotenv reports.
+- **Finished job recordings are stored compressed.** Once a job's VM is gone its `atop.log`
+  becomes `atop.log.zst`, about twenty times smaller; a log a crashed runner left behind is
+  compressed by a later day's first job, unless it is over 512 MiB. `vk atop` reads both,
+  and `zstdcat atop.log.zst` gives back the text for `grep` and `awk`.
 
 ### Fixed
 

@@ -61,6 +61,8 @@ pub fn view(path: &Path, follow: bool) -> Result<()> {
         );
     }
     let mut tail = Tail::open(path)?;
+    // A compressed log is a finished job's: there is nothing to follow, so none is claimed.
+    let follow = follow && tail.grows();
     let samples = tail.read()?;
     if samples.is_empty() && !follow {
         bail!(
@@ -105,12 +107,25 @@ pub fn view(path: &Path, follow: bool) -> Result<()> {
 }
 
 /// The log as it grows: what has been read, and where to read on from.
-struct Tail {
-    path: PathBuf,
-    file: std::fs::File,
-    /// Bytes of the file already accounted for — always the end of a complete sample, so a
-    /// read resumes on a record boundary.
-    offset: u64,
+///
+/// Follow a plain log through its open descriptor. When the host compresses it after the job
+/// ends, renaming the compressed copy into place and unlinking the plain file, the descriptor
+/// still holds the whole log; it simply stops growing.
+enum Tail {
+    /// A plain log, read on from where the last read ended.
+    Growing {
+        path: PathBuf,
+        file: std::fs::File,
+        /// Bytes of the file already accounted for — always the end of a complete sample, so
+        /// a read resumes on a record boundary.
+        offset: u64,
+    },
+    /// A compressed log: a finished job's, read whole on the first read, with nothing after it
+    /// to follow. `None` once read.
+    Finished {
+        path: PathBuf,
+        file: Option<std::fs::File>,
+    },
 }
 
 impl Tail {
@@ -119,24 +134,46 @@ impl Tail {
         // file accepted. A guest owns the directory its log is in and can swap the log for a
         // FIFO between the moment it was resolved and the moment it is opened.
         let file = crate::atoplog::open_log(path)?.0;
-        Ok(Tail {
-            path: path.to_path_buf(),
-            file,
-            offset: 0,
-        })
+        let path = path.to_path_buf();
+        match crate::atoplog::is_compressed(&file)
+            .with_context(|| format!("reading {}", path.display()))?
+        {
+            true => Ok(Tail::Finished {
+                path,
+                file: Some(file),
+            }),
+            false => Ok(Tail::Growing {
+                path,
+                file,
+                offset: 0,
+            }),
+        }
+    }
+
+    /// Whether there can be samples after the ones already read.
+    fn grows(&self) -> bool {
+        matches!(self, Tail::Growing { .. })
     }
 
     /// Every sample committed since the last read. The tail after the last `SEP` is a sample
     /// the guest is still writing: it stays unread until its own `SEP` arrives.
     fn read(&mut self) -> Result<Vec<Sample>> {
         use std::io::{Read, Seek, SeekFrom};
-        self.file
-            .seek(SeekFrom::Start(self.offset))
-            .with_context(|| format!("seeking in {}", self.path.display()))?;
+        let (path, file, offset) = match self {
+            Tail::Growing { path, file, offset } => (path, file, offset),
+            Tail::Finished { path, file } => {
+                let Some(file) = file.take() else {
+                    return Ok(Vec::new());
+                };
+                let text = crate::atoplog::read_opened(path, file)?;
+                return Ok(crate::atoplog::parse(&text).samples);
+            }
+        };
+        file.seek(SeekFrom::Start(*offset))
+            .with_context(|| format!("seeking in {}", path.display()))?;
         let mut bytes = Vec::new();
-        self.file
-            .read_to_end(&mut bytes)
-            .with_context(|| format!("reading {}", self.path.display()))?;
+        file.read_to_end(&mut bytes)
+            .with_context(|| format!("reading {}", path.display()))?;
         // Resume on a record boundary in the *file*. `Parsed::consumed` counts decoded text,
         // where a byte that is not text widens to three, so adding it to a file offset would
         // walk past the samples — and once past the end, every later read returns nothing and
@@ -146,7 +183,7 @@ impl Tail {
         // damaged log, and what is still there is worth showing.
         let text = String::from_utf8_lossy(bytes.get(..end).unwrap_or_default());
         let parsed = crate::atoplog::parse(&text);
-        self.offset = self.offset.saturating_add(end as u64);
+        *offset = offset.saturating_add(end as u64);
         Ok(parsed.samples)
     }
 }
@@ -1104,7 +1141,7 @@ mod tests {
         let mut tail = Tail::open(&path).expect("a recording");
         assert_eq!(tail.read().unwrap().len(), 1, "the first sample");
         // The offset is where the file's own SEP ended, not where the decoded text did.
-        assert_eq!(tail.offset, one.len() as u64);
+        assert!(matches!(tail, Tail::Growing { offset, .. } if offset == one.len() as u64));
         assert!(
             String::from_utf8_lossy(&one).len() > one.len(),
             "the decoded text really is longer than the file"
@@ -1139,6 +1176,44 @@ mod tests {
         std::os::unix::fs::symlink(&path, &planted).unwrap();
         assert!(Tail::open(&planted).is_err());
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A follower keeps the log it opened when the job ends and the host compresses it: the
+    /// unlinked plain file still holds every sample. Opened afterwards, the compressed log is
+    /// read whole, once, with nothing to follow.
+    #[test]
+    fn a_followed_log_compressed_under_the_follower_still_reads() {
+        let dir = std::env::temp_dir().join(format!("vk-atop-tailzst-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(vk_core::atop::LOG_NAME);
+        let text = crate::atoplog::synthetic_log(3);
+        let split = text.find("SEP\n").unwrap() + 4;
+        std::fs::write(&path, &text[..split]).unwrap();
+        let mut tail = Tail::open(&path).unwrap();
+        assert!(tail.grows());
+        assert_eq!(tail.read().unwrap().len(), 1);
+
+        // The job's last samples land, then cleanup compresses the log away.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&text.as_bytes()[split..])
+            .unwrap();
+        crate::atop::compress_log(&dir, u64::MAX).unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            tail.read().unwrap().len(),
+            2,
+            "the rest, from the unlinked file"
+        );
+
+        let mut finished = Tail::open(&dir.join(crate::atop::LOG_ZST_NAME)).unwrap();
+        assert!(!finished.grows(), "a compressed log is not followed");
+        assert_eq!(finished.read().unwrap().len(), 3);
+        assert!(finished.read().unwrap().is_empty(), "and read once");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

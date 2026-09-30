@@ -334,6 +334,10 @@ a sample to a log the host keeps after the VM is gone.
 <state_dir>/atop/2026-08-11/42137-acme-web-test_unit/atop.log
 ```
 
+Once the job's VM is gone, the host compresses the log with zstd to `atop.log.zst` beside it,
+about twenty times smaller; a runner that died before its job's cleanup leaves the log plain,
+and a later day's first job compresses it — one over 512 MiB stays plain. `vk atop` reads either.
+
 Every job's trace ends with the account of it, in a section GitLab's web UI shows folded — one
 line to open when a job is worth looking into, and out of the way when it is not:
 
@@ -351,8 +355,8 @@ job's name — the newest run answering — printing just the path, so it compos
 reads it. Nothing matching means an empty stdout and a non-zero exit:
 
 ```sh
-vk atop 42137                # that run
-less $(vk atop test_unit)    # the last run of this job
+vk atop 42137                    # that run
+zstdless $(vk atop test_unit)    # the last run of this job, compressed or not
 ```
 
 The name to give is the one in the directory, which is the job's name with anything outside
@@ -499,12 +503,14 @@ The system labels are `CPU`, `cpu` (per processor), `CPL`, `MEM`, `SWP`, `PAG`, 
 `NET`; every process gets a `PRG`, `PRC`, `PRM` and `PRD` line, and so does every task that
 *ended* during the interval — those carry state `E`, the status they exited with and how long
 they lived.
-So the busiest samples of a job are one sort away:
+So the busiest samples of a job are one sort away (`zstdcat` passes a running job's plain
+`atop.log` through unchanged):
 
 ```sh
-awk '$1 == "CPU" { print $5, $9 + $10 }' atop.log | sort -k2 -n | tail   # time, busy ticks
-grep '^PRM ' atop.log | sort -k12 -n | tail   # largest processes (column 12 only while no
-                                              # process name holds a space — see below)
+zstdcat atop.log.zst | awk '$1 == "CPU" { print $5, $9 + $10 }' | sort -k2 -n | tail   # time, busy ticks
+zstdcat atop.log.zst | grep '^PRM ' | sort -k12 -n | tail   # largest processes (column 12 only
+                                                            # while no process name holds a
+                                                            # space — see below)
 ```
 
 Two labels are virtkit's own, which atop-format parsers skip as unknown. `PRW` lists a

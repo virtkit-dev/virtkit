@@ -130,7 +130,7 @@ async fn finalize_atop(ctx: &JobCtx) {
         ),
     )
     .await;
-    report_guest(ctx, &dir.join(vk_core::atop::LOG_NAME));
+    report_guest(ctx, &crate::atop::log_path(&dir));
 }
 
 /// End the trace with what the job's guest did, folded away.
