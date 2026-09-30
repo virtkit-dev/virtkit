@@ -1087,7 +1087,9 @@ Under an allowlist, a name outside `allow_name` resolves to `NXDOMAIN`, reverse 
 lookups included, and a query the gateway cannot parse is `REFUSED`; the job's own
 service aliases still resolve, as do reverse lookups of the job's own addresses. Listing
 `in-addr.arpa` or `ip6.arpa` in `allow_name` reopens reverse lookups as a way to carry
-data out in the names queried.
+data out in the names queried. The gateway rebuilds forwarded queries from their question,
+keeping only the id, RD, AD and CD flags and a bare EDNS record. Queries it cannot rebuild
+are `REFUSED`, or `NOTIMP` for a DNS update or notify.
 
 ### Narrowing from a job
 

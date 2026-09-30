@@ -113,6 +113,13 @@ const DNS_DENIED_MORE: &str = "more names (not recorded)";
 const DNS_REPEATS_FLUSH: Duration = Duration::from_secs(2);
 /// The denial and log label for a query whose question the switch cannot parse.
 const UNPARSABLE_QUERY: &str = "an unparsable question";
+/// The denial and log label for a query an allowlist cannot forward (see [`minimal_query`]).
+const NONSTANDARD_QUERY: &str = "a nonstandard query";
+/// The largest EDNS UDP payload size a query forwarded under an allowlist advertises: the
+/// size DNS Flag Day 2020 settled on, which avoids IP fragmentation on common paths. A
+/// larger answer comes back truncated and is recovered over TCP, then sent to the guest
+/// whole where its own query offered room for it.
+const EDNS_UDP_MAX: u16 = 1232;
 /// The longest DNS name, in wire bytes (RFC 1035 §2.3.4).
 const MAX_DNS_NAME: usize = 255;
 /// The largest response the gateway resolver builds itself (RFC 1035 §4.2.1). It echoes no
@@ -121,6 +128,7 @@ const DNS_UDP_CLASSIC: usize = 512;
 /// Response codes the gateway resolver answers with itself.
 const RCODE_SERVFAIL: u8 = 2;
 const RCODE_NXDOMAIN: u8 = 3;
+const RCODE_NOTIMP: u8 = 4;
 const RCODE_REFUSED: u8 = 5;
 /// First host index handed out by DHCP (.1 is the gateway).
 const FIRST_LEASE: u32 = 2;
@@ -2345,11 +2353,40 @@ async fn handle_dns(
         .first()
         .copied()
         .unwrap_or_else(|| SocketAddr::new(FALLBACK_DNS.into(), DNS_PORT));
+    let restricted = !matches!(*egress.policy_for(client_ip), Egress::AllowAll);
+    let parsed = parse_question(&query);
+    // Under an allowlist the upstream is sent a query rebuilt from the checked question, not
+    // the guest's bytes; `None` where the query has no shape it can be rebuilt from.
+    let minimal = match &parsed {
+        Some((_, _, qend)) if restricted => minimal_query(&query, *qend),
+        _ => None,
+    };
     let response = if let Some(r) = local_answer(&query, &hosts, lan) {
         // A service name, or a reverse lookup of a LAN address: the switch is their
         // authority under any policy, and they are not subject to egress pinning.
         Some(r)
-    } else if let Some((name, qtype, qend)) = parse_question(&query) {
+    } else if let Some((name, _, qend)) = &parsed
+        && restricted
+        && minimal.is_none()
+        && !egress.dry_run
+    {
+        egress.deny_dns(NONSTANDARD_QUERY, || {
+            format!("dns refused (egress allowlist): {NONSTANDARD_QUERY} for {name}")
+        });
+        Some(dns_error(&query, *qend, nonstandard_rcode(&query)))
+    } else if let Some((name, qtype, qend)) = parsed {
+        if restricted && minimal.is_none() {
+            egress.deny_dns(NONSTANDARD_QUERY, || {
+                format!(
+                    "dns would refuse (egress allowlist): {NONSTANDARD_QUERY} for {name} — dry-run, forwarded"
+                )
+            });
+        }
+        // Dry-run forwards the guest's own query, so the job runs unchanged.
+        let upstream_query = match &minimal {
+            Some(minimal) if !egress.dry_run => minimal,
+            _ => &query,
+        };
         // Format the lookup only when reporting a failure.
         let question = || format!("{name} ({})", qtype_name(qtype));
         // Other reverse (PTR) names are held to the allowlist like any other: forwarding
@@ -2373,7 +2410,7 @@ async fn handle_dns(
             }
             // forward, then pin the A-records (scoped to this resolving guest) so its
             // connection is allowed — and only its, not another VM's with a different policy.
-            match resolve_upstream(&query, &upstreams).await {
+            match resolve_upstream(upstream_query, &upstreams).await {
                 Ok(a) => {
                     // A truncated answer is pinned from its TCP-recovered full record set; when
                     // that recovery failed, pinning saw only the partial set, worth a log line.
@@ -2393,7 +2430,7 @@ async fn handle_dns(
                         // later connection from it is counted under the domains summary, not
                         // re-logged as a direct-IP contact.
                         egress.record_dns_ips(client_ip, &ips);
-                        Some(a.reply)
+                        Some(a.for_guest(guest_udp_size(&query, qend)))
                     }
                 }
                 // SERVFAIL rather than silence: the guest's resolver gives up on the lookup
@@ -2414,7 +2451,6 @@ async fn handle_dns(
         // source forwards it, and a dry-run records the would-be denial. Several questions
         // are refused under any policy: no resolver sends them (RFC 9619), and the first
         // could be a name the switch answers itself.
-        let restricted = !matches!(*egress.policy_for(client_ip), Egress::AllowAll);
         let several =
             matches!(query.get(4..6), Some(&[hi, lo]) if u16::from_be_bytes([hi, lo]) > 1);
         let refuse = several || (restricted && !egress.dry_run);
@@ -2488,12 +2524,13 @@ impl std::fmt::Display for UpstreamError {
     }
 }
 
-/// An answer from the host's resolvers. `reply` is the datagram to send the guest — a
-/// UDP-sized answer, truncated (TC) when the full record set did not fit. `full` is that full
-/// set, recovered over TCP, present only when `reply` was truncated and the TCP retry
-/// succeeded: egress pinning reads its A-records so a connection to any returned IP is allowed
-/// even though the guest itself only receives `reply`. `degraded` carries the TCP fault when
-/// that retry failed, for the caller to log — pinning then saw only the truncated answer.
+/// An answer from the host's resolvers. `reply` is the UDP datagram the upstream sent —
+/// truncated (TC) when the full record set did not fit. `full` is that full set, recovered
+/// over TCP, present only when `reply` was truncated and the TCP retry succeeded: egress
+/// pinning reads its A-records so a connection to any returned IP is allowed, and the guest
+/// is sent it where it fits (see [`UpstreamAnswer::for_guest`]). `degraded` carries the TCP
+/// fault when that retry failed, for the caller to log — pinning then saw only the truncated
+/// answer.
 #[derive(Debug)]
 struct UpstreamAnswer {
     reply: Vec<u8>,
@@ -2507,6 +2544,31 @@ impl UpstreamAnswer {
     fn pin_source(&self) -> &[u8] {
         self.full.as_deref().unwrap_or(&self.reply)
     }
+    /// The response for a guest that takes UDP responses of up to `size` bytes: the full TCP
+    /// answer when it fits, since the gateway serves no DNS over TCP for the guest to retry
+    /// on, else the truncated one.
+    fn for_guest(self, size: usize) -> Vec<u8> {
+        match self.full {
+            Some(full) if full.len() <= size => full,
+            _ => self.reply,
+        }
+    }
+}
+
+/// The largest UDP response the guest's `query`, whose question ends at `qend`, says it
+/// takes: the size of an EDNS OPT record standing right after the question, at least 512
+/// (RFC 6891 §6.2.5), else 512. Within what one datagram on the LAN carries.
+fn guest_udp_size(query: &[u8], qend: usize) -> usize {
+    const TYPE_OPT: u8 = 41;
+    let no_other_records = query.get(6..10) == Some(&[0, 0, 0, 0]);
+    let size = match query.get(qend..qend + 5) {
+        Some(&[0, 0, TYPE_OPT, hi, lo]) if no_other_records => {
+            usize::from(u16::from_be_bytes([hi, lo]))
+        }
+        _ => DNS_UDP_CLASSIC,
+    };
+    // Less the IPv4 and UDP headers.
+    size.clamp(DNS_UDP_CLASSIC, usize::from(MTU) - 28)
 }
 
 /// Resolve a guest query against the host's resolvers. A dropped UDP datagram
@@ -2514,8 +2576,8 @@ impl UpstreamAnswer {
 /// rotating across the configured nameservers — each early try bounded by
 /// [`DNS_UPSTREAM_PROBE_TIMEOUT`] for a quick failover, the last waiting out the rest of
 /// [`DNS_UPSTREAM_BUDGET`]. A truncated (TC) answer is re-asked over TCP so pinning sees the
-/// full A-set, while the guest still gets the UDP-sized reply. The last fault is returned only
-/// if every try failed.
+/// full A-set, and the guest gets it where it fits. The last fault is returned only if every
+/// try failed.
 async fn resolve_upstream(
     query: &[u8],
     upstreams: &[SocketAddr],
@@ -2566,8 +2628,8 @@ async fn resolve_upstream_with(
             // Truncated: the answer did not fit a UDP datagram (a CDN name behind a long CNAME
             // chain and many A records). DNS over TCP has no size limit, so the full record set
             // — and thus the pin — is recovered, bounded by whatever budget is left. The guest
-            // still gets the truncated `reply`, which fits the buffer it asked over; a failed
-            // recovery is reported so the operator sees pinning ran on a partial answer.
+            // gets it where it fits the size its own query offered, else the truncated `reply`;
+            // a failed recovery is reported so the operator sees pinning ran on a partial answer.
             Ok(reply) if is_truncated(&reply) => {
                 let tcp_budget = deadline.saturating_duration_since(Instant::now());
                 return Ok(
@@ -2678,13 +2740,22 @@ fn qtype_name(qtype: u16) -> std::borrow::Cow<'static, str> {
 /// Answer a query the switch is the authority for: a known service name (an A record for A
 /// queries, NODATA otherwise so the name never leaks upstream), or the reverse name of an
 /// address on the LAN (the service names at that address as PTR records, NXDOMAIN when there
-/// are none — the host's resolver knows nothing of this subnet). Else None.
+/// are none — the host's resolver knows nothing of this subnet). NOTIMP for either under an
+/// opcode other than QUERY, which the switch has no answer for. Else None.
 fn local_answer(query: &[u8], hosts: &HashMap<String, Ipv4Addr>, lan: Cfg) -> Option<Vec<u8>> {
     let (name, qtype, qend) = parse_question(query)?;
-    if let Some(ip) = hosts.get(&name) {
+    let service = hosts.get(&name);
+    let addr = reverse_v4(&name).filter(|ip| lan.on_lan(*ip));
+    if service.is_none() && addr.is_none() {
+        return None;
+    }
+    if query[2] & 0x78 != 0 {
+        return Some(dns_error(query, qend, RCODE_NOTIMP));
+    }
+    if let Some(ip) = service {
         return Some(dns_response(query, qend, qtype, *ip));
     }
-    let addr = reverse_v4(&name).filter(|ip| lan.on_lan(*ip))?;
+    let addr = addr?;
     let mut names: Vec<&str> = hosts
         .iter()
         .filter(|(_, ip)| **ip == addr)
@@ -2765,6 +2836,70 @@ fn parse_question(msg: &[u8]) -> Option<(String, u16, usize)> {
     Some((name, u16::from_be_bytes([qtype[0], qtype[1]]), i + 4))
 }
 
+/// Rebuild `query` for upstream forwarding under an allowlist. [`parse_question`] has
+/// checked the question ending at `qend`. Keep the id, RD, AD, CD and question, plus only
+/// the UDP size (capped at [`EDNS_UDP_MAX`]) and DO bit from an EDNS OPT record. Other header
+/// bits, records and options can carry bytes the name check never saw.
+/// Return `None` for a response, a non-QUERY opcode, answer or authority records,
+/// additional records other than a single OPT, or trailing bytes.
+fn minimal_query(query: &[u8], qend: usize) -> Option<Vec<u8>> {
+    const TYPE_OPT: u8 = 41;
+    let hdr = query.get(..12)?;
+    let count = |at: usize| u16::from_be_bytes([hdr[at], hdr[at + 1]]);
+    let (ancount, nscount, arcount) = (count(6), count(8), count(10));
+    if hdr[2] & 0xf8 != 0 || ancount != 0 || nscount != 0 || arcount > 1 {
+        return None; // QR set, an opcode other than QUERY, or sections a query has no use for
+    }
+    let mut out = Vec::with_capacity(qend + 11);
+    out.extend_from_slice(&hdr[..2]); // transaction id
+    out.push(hdr[2] & 0x01); // RD
+    out.push(hdr[3] & 0x30); // AD, CD
+    out.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, arcount as u8]);
+    out.extend_from_slice(query.get(12..qend)?);
+    let rest = query.get(qend..)?;
+    if arcount == 0 {
+        return rest.is_empty().then_some(out);
+    }
+    // Root owner, type OPT, the UDP size as its class, extended rcode, version and flags as
+    // its TTL, then RDLENGTH and the options.
+    let (
+        &[
+            0,
+            0,
+            TYPE_OPT,
+            size_hi,
+            size_lo,
+            _,
+            _,
+            flags,
+            _,
+            len_hi,
+            len_lo,
+        ],
+        options,
+    ) = rest.split_first_chunk::<11>()?
+    else {
+        return None;
+    };
+    if options.len() != usize::from(u16::from_be_bytes([len_hi, len_lo])) {
+        return None;
+    }
+    let size = u16::from_be_bytes([size_hi, size_lo]).min(EDNS_UDP_MAX);
+    out.extend_from_slice(&[0, 0, TYPE_OPT]);
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(&[0, 0, flags & 0x80, 0, 0, 0]); // version 0, DO kept, no options
+    Some(out)
+}
+
+/// The rcode refusing a query [`minimal_query`] cannot rebuild: NOTIMP for an opcode other
+/// than QUERY, REFUSED for a query of another shape.
+fn nonstandard_rcode(query: &[u8]) -> u8 {
+    match query.get(2).map(|b| b & 0x78) {
+        Some(0) => RCODE_REFUSED,
+        _ => RCODE_NOTIMP,
+    }
+}
+
 /// Build a DNS response echoing the question: one A record for an A query, else
 /// NODATA (NOERROR, no answers).
 fn dns_response(query: &[u8], qend: usize, qtype: u16, ip: Ipv4Addr) -> Vec<u8> {
@@ -2837,12 +2972,13 @@ fn dns_answers(query: &[u8], qend: usize, rtype: u16, rdatas: &[Vec<u8>]) -> Vec
 
 /// An answerless response echoing the question, carrying `rcode`. AA is set only where the
 /// switch is the name's authority: it owns the allowlist namespace it NXDOMAINs, but a
-/// SERVFAIL means it could not reach the real resolver, so it must not claim authority.
+/// SERVFAIL means it could not reach the real resolver, and a REFUSED or NOTIMP says nothing
+/// of the name, so neither claims authority.
 fn dns_error(query: &[u8], qend: usize, rcode: u8) -> Vec<u8> {
-    let aa = if rcode == RCODE_SERVFAIL { 0 } else { 0x04 };
+    let aa = if rcode == RCODE_NXDOMAIN { 0x04 } else { 0 };
     let mut out = Vec::with_capacity(qend);
     out.extend_from_slice(&query[0..2]); // transaction id
-    out.push(0x80 | aa | (query[2] & 0x01)); // QR=1, AA per authority, RD copied
+    out.push(0x80 | aa | (query[2] & 0x79)); // QR=1, AA per authority, opcode and RD copied
     out.push(0x80 | rcode); // RA=1
     out.extend_from_slice(&[0, 1]); // QDCOUNT
     out.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // ANCOUNT + NSCOUNT + ARCOUNT
@@ -4934,6 +5070,251 @@ mod tests {
         assert_eq!(crate::egress_report::read_since(&log, 0).0, flushed);
         assert!(flushed.iter().all(|d| d.proto == Proto::Dns));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `query` with an EDNS OPT record appended: UDP size `size`, version `version`, the DO
+    /// bit per `dnssec_ok`, and `options` as its RDATA.
+    fn with_opt(
+        mut query: Vec<u8>,
+        size: u16,
+        version: u8,
+        dnssec_ok: bool,
+        options: &[u8],
+    ) -> Vec<u8> {
+        query[11] += 1; // ARCOUNT
+        query.extend_from_slice(&[0, 0, 41]);
+        query.extend_from_slice(&size.to_be_bytes());
+        query.extend_from_slice(&[0, version, if dnssec_ok { 0x80 } else { 0 }, 0]);
+        query.extend_from_slice(&(options.len() as u16).to_be_bytes());
+        query.extend_from_slice(options);
+        query
+    }
+
+    #[test]
+    fn minimal_query_keeps_only_the_question_and_the_edns_basics() {
+        let minimal = |q: &[u8]| minimal_query(q, parse_question(q).unwrap().2);
+        let plain = dns_question(0x1234, "git.corp.example.com", 1);
+        assert_eq!(minimal(&plain), Some(plain.clone()));
+
+        // Header bits other than RD, AD and CD are cleared.
+        let mut bits = plain.clone();
+        bits[2] |= 0x06; // AA, TC
+        bits[3] |= 0x70 | 0x0f; // Z, AD, CD, an rcode
+        let mut expected = plain.clone();
+        expected[3] = 0x30; // AD, CD
+        assert_eq!(minimal(&bits), Some(expected));
+
+        // EDNS: the size clamped, DO kept, the version and the options dropped.
+        let cookie = [0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8];
+        let opt = with_opt(plain.clone(), 4096, 1, true, &cookie);
+        assert_eq!(
+            minimal(&opt),
+            Some(with_opt(plain.clone(), EDNS_UDP_MAX, 0, true, &[]))
+        );
+        let small = with_opt(plain.clone(), 512, 0, false, &[]);
+        assert_eq!(minimal(&small), Some(small.clone()));
+
+        // Anything else has no minimal form.
+        let opcode = |op: u8| {
+            let mut q = plain.clone();
+            q[2] |= op << 3;
+            q
+        };
+        let mut response = plain.clone();
+        response[2] |= 0x80;
+        let mut answer = plain.clone();
+        answer[7] = 1;
+        answer.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 10, 0, 0, 1]);
+        let mut authority = plain.clone();
+        authority[9] = 1;
+        authority.extend_from_slice(&[0, 0, 2, 0, 1, 0, 0, 0, 60, 0, 1, 0]);
+        let mut not_opt = plain.clone();
+        not_opt[11] = 1;
+        not_opt.extend_from_slice(&[0, 0, 16, 0, 1, 0, 0, 0, 60, 0, 2, 1, b'x']);
+        let mut two_opts = with_opt(
+            with_opt(plain.clone(), 1232, 0, false, &[]),
+            1232,
+            0,
+            false,
+            &[],
+        );
+        two_opts[11] = 2;
+        let mut trailing = plain.clone();
+        trailing.push(0);
+        let mut opt_trailing = with_opt(plain.clone(), 1232, 0, false, &[]);
+        opt_trailing.push(0);
+        let mut opt_short = with_opt(plain.clone(), 1232, 0, false, &cookie);
+        opt_short.pop();
+        for (what, q) in [
+            ("NOTIFY", opcode(4)),
+            ("UPDATE", opcode(5)),
+            ("IQUERY", opcode(1)),
+            ("a response", response),
+            ("an answer", answer),
+            ("an authority record", authority),
+            ("an additional record that is not OPT", not_opt),
+            ("two additional records", two_opts),
+            ("trailing bytes", trailing),
+            ("bytes after the OPT", opt_trailing),
+            ("an OPT cut short", opt_short),
+        ] {
+            assert_eq!(minimal(&q), None, "{what}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_allowlist_forwards_only_the_rebuilt_query() {
+        use crate::egress_report::{Denial, Proto};
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let dir = std::env::temp_dir().join(format!("vk-dns-minimal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let allowlist = || Egress::restricted(&[], &["corp.example.com".into()]).unwrap();
+        let ask = |guard: &Arc<EgressGuard>, query: Vec<u8>| {
+            let hosts = HashMap::from([("redis".to_string(), Ipv4Addr::new(192, 168, 231, 9))]);
+            let guard = guard.clone();
+            async move {
+                let (reply, forwarded) = exchange(
+                    &guard,
+                    guest,
+                    query,
+                    hosts,
+                    Ipv4Addr::new(10, 0, 0, 1),
+                    || {},
+                )
+                .await;
+                (reply.map(|r| r[3] & 0x0f), forwarded)
+            }
+        };
+        let plain = dns_question(3, "git.corp.example.com", 1);
+        let opcode = |q: &[u8], op: u8| {
+            let mut q = q.to_vec();
+            q[2] |= op << 3;
+            q
+        };
+        let mut extra = plain.clone();
+        extra[11] = 1;
+        extra.extend_from_slice(&[0, 0, 16, 0, 1, 0, 0, 0, 60, 0, 2, 1, b'x']);
+        let cookie = [0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8];
+        let opt = with_opt(plain.clone(), 4096, 0, true, &cookie);
+        let nonstandard = Denial {
+            proto: Proto::Dns,
+            target: NONSTANDARD_QUERY.into(),
+            count: 1,
+        };
+
+        // Enforced: a plain query goes as it is, an OPT stripped of its options; UPDATE and
+        // NOTIFY are NOTIMP and another shape REFUSED, none of them forwarded and all
+        // recorded — but for a service name, answered NOTIMP by the switch itself.
+        let log = dir.join("enforce.log");
+        let enforce = Arc::new(
+            EgressGuard::new(allowlist(), DNS_TEST_LAN.gateway).with_denied_log(Some(log.clone())),
+        );
+        assert_eq!(
+            ask(&enforce, plain.clone()).await,
+            (Some(0), Some(plain.clone()))
+        );
+        assert_eq!(
+            ask(&enforce, opt.clone()).await,
+            (
+                Some(0),
+                Some(with_opt(plain.clone(), EDNS_UDP_MAX, 0, true, &[]))
+            )
+        );
+        for (q, rcode) in [
+            (opcode(&plain, 5), RCODE_NOTIMP),
+            (opcode(&plain, 4), RCODE_NOTIMP),
+            (opcode(&dns_question(4, "redis", 1), 4), RCODE_NOTIMP),
+            (extra.clone(), RCODE_REFUSED),
+        ] {
+            assert_eq!(ask(&enforce, q).await, (Some(rcode), None));
+        }
+        enforce.flush_dns_denials();
+        let repeats = Denial {
+            count: 2,
+            ..nonstandard.clone()
+        };
+        assert_eq!(
+            crate::egress_report::read_since(&log, 0).0,
+            [nonstandard.clone(), repeats]
+        );
+
+        // Dry-run: the guest's own bytes are forwarded, and the would-be refusal recorded.
+        let log = dir.join("dry.log");
+        let dry = Arc::new(
+            EgressGuard::new(allowlist(), DNS_TEST_LAN.gateway)
+                .with_denied_log(Some(log.clone()))
+                .with_dry_run(true),
+        );
+        assert_eq!(ask(&dry, opt.clone()).await, (Some(0), Some(opt.clone())));
+        assert_eq!(
+            ask(&dry, extra.clone()).await,
+            (Some(0), Some(extra.clone()))
+        );
+        assert_eq!(
+            crate::egress_report::read_since(&log, 0).0,
+            vec![nonstandard]
+        );
+
+        // Unrestricted: forwarded as sent. A NOTIFY for a service name or a reverse name on
+        // the LAN is NOTIMP from the switch under any policy, never forwarded.
+        let open = Arc::new(EgressGuard::new(Egress::AllowAll, DNS_TEST_LAN.gateway));
+        for q in [opt, extra] {
+            assert_eq!(ask(&open, q.clone()).await, (Some(0), Some(q)));
+        }
+        for guard in [&open, &dry, &enforce] {
+            for name in ["redis", "9.231.168.192.in-addr.arpa"] {
+                let notify = opcode(&dns_question(4, name, 1), 4);
+                assert_eq!(
+                    ask(guard, notify).await,
+                    (Some(RCODE_NOTIMP), None),
+                    "{name}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A truncated upstream answer recovered whole over TCP goes to the guest whole where its
+    /// own query offered room for it: the gateway has no TCP resolver to retry on.
+    #[test]
+    fn a_recovered_answer_reaches_the_guest_where_it_fits() {
+        let plain = dns_question(3, "git.corp.example.com", 1);
+        let qend = parse_question(&plain).unwrap().2;
+        let size = |q: &[u8]| guest_udp_size(q, qend);
+        assert_eq!(size(&plain), DNS_UDP_CLASSIC);
+        assert_eq!(size(&with_opt(plain.clone(), 4096, 0, false, &[])), 4096);
+        assert_eq!(size(&with_opt(plain.clone(), 100, 0, false, &[])), 512);
+        assert_eq!(
+            size(&with_opt(plain.clone(), u16::MAX, 0, false, &[])),
+            usize::from(MTU) - 28
+        );
+        let mut answered = with_opt(plain.clone(), 4096, 0, false, &[]);
+        answered[7] = 1; // an answer record where the OPT is looked for
+        assert_eq!(size(&answered), DNS_UDP_CLASSIC);
+
+        let answer = |full: Option<usize>| UpstreamAnswer {
+            reply: vec![1; 1200],
+            full: full.map(|n| vec![2; n]),
+            degraded: None,
+        };
+        assert_eq!(answer(Some(3000)).for_guest(4096), vec![2; 3000]);
+        assert_eq!(answer(Some(3000)).for_guest(1232), vec![1; 1200]);
+        assert_eq!(answer(None).for_guest(4096), vec![1; 1200]);
+    }
+
+    #[test]
+    fn a_refusal_echoes_the_opcode_and_claims_no_authority() {
+        let mut query = dns_question(0xbeef, "x.example", 1);
+        query[2] |= 5 << 3; // UPDATE
+        let (_, _, qend) = parse_question(&query).unwrap();
+        for rcode in [RCODE_NOTIMP, RCODE_REFUSED] {
+            let resp = dns_error(&query, qend, rcode);
+            assert_eq!(resp[2], 0x80 | (5 << 3) | 0x01); // QR, opcode, RD; AA clear
+            assert_eq!(resp[3] & 0x0f, rcode);
+        }
+        assert_eq!(nonstandard_rcode(&query), RCODE_NOTIMP);
+        assert_eq!(nonstandard_rcode(&dns_question(1, "x", 1)), RCODE_REFUSED);
     }
 
     #[test]

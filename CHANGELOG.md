@@ -35,10 +35,13 @@ All notable changes to virtkit will be documented in this file.
   like any other name and resolves to `NXDOMAIN` outside it, and a query the gateway
   cannot read (a compressed name, a label with a dot or a byte outside letters, digits,
   `-` and `_`) is answered `REFUSED`, so a guest can no longer smuggle data out through
-  the queries it sends. In dry-run both still resolve, and are listed among the would-be
-  denials. Under any policy, a reverse lookup of an address on the guests' own network is
-  answered by the gateway itself — with the service names at that address, else
-  `NXDOMAIN` — and a query with several questions is `REFUSED`.
+  the queries it sends. A query that is forwarded is rebuilt from its question, keeping
+  only its id, the RD, AD and CD flags and a bare EDNS record, so no other header bit,
+  record or EDNS option reaches the resolver, and a DNS update, notify or other non-query
+  is refused. In dry-run all of these still resolve, and are listed
+  among the would-be denials. Under any policy, a reverse lookup of an address on the
+  guests' own network is answered by the gateway itself — with the service names at that
+  address, else `NXDOMAIN` — and a query with several questions is `REFUSED`.
 - **A GitLab runner whose `[executor] tools_dir` or `[executor.share] dir` is a symlink
   now shares its target with jobs.** Jobs saw an empty directory: with an empty tools
   directory, artifacts, caches and dotenv reports were not uploaded, and the job still

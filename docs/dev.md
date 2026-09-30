@@ -425,9 +425,11 @@ addresses an allowed name resolved to. Compose service names still resolve, and 
 reverse (PTR) lookups of the environment's own addresses. Other reverse lookups are names
 like any other, so they resolve to nothing unless listed; listing `in-addr.arpa` or
 `ip6.arpa` reopens them as a way to carry data out in the names queried. A query the
-gateway cannot parse is refused. `allow-ip` takes IPv4 CIDRs, each optionally scoped to
-one port, for destinations dialed by address; IPv6 is refused. With both lists empty,
-nothing is allowed. The allowlists are an error without `egress = "restricted"`.
+gateway cannot parse is refused, and one it forwards is rebuilt from its question, keeping
+only its id, the RD, AD and CD flags and a bare EDNS record.
+`allow-ip` takes IPv4 CIDRs, each optionally scoped to one port, for destinations dialed
+by address; IPv6 is refused. With both lists empty, nothing is allowed. The allowlists
+are an error without `egress = "restricted"`.
 
 The environment's own switch enforces this, so it binds its compose services as well.
 It does not govern the host: image pulls, and the `RUN` steps of a `build` source, go out
