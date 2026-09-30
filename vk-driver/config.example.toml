@@ -132,8 +132,9 @@
 #                        # Declared, not measured; unset = not declared
 # checkouts_speed = "fast"  # the same for the host-checkout root ([executor] checkout_dir)
 # runner_config = "/home/ci/.gitlab-runner/config.toml"  # a runner config this user owns:
-#                        # `vk tune` sets its `concurrent` directly instead of leaving the
-#                        # number for the root-side vk-runnerctl
+#                        # `vk tune` — or `vk node run`, on a fleet node — sets its
+#                        # `concurrent` directly instead of leaving the number for the
+#                        # root-side vk-runnerctl
 
 # MICROVM_IMAGE is prefix-based (the prefix names the source): unset = local/default;
 # `local/<name>` = a bundle dir under [local] dir; `virtkit/<name>[:tag|@digest]` =

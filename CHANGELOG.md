@@ -33,6 +33,10 @@ All notable changes to virtkit will be documented in this file.
   reconnects on its own whenever the hub is unreachable, and exits once the hub has removed
   the node. `[node] jobs_speed` and `checkouts_speed` declare how fast those filesystems
   are.
+- **Experimental: a fleet node applies its hub's concurrency ceiling.** `vk node run` sets
+  the runner's concurrency itself every half minute — the smallest of the hub's ceiling, the
+  host's own estimate and `max_concurrency` — and keeps what the hub asked across restarts
+  and while the hub is unreachable.
 
 ### Changed
 

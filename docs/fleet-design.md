@@ -205,9 +205,10 @@ effective = min(local estimate, hub ceiling, local ceiling)
 - **local ceiling** — the administrator's limit in `virtkit.toml`, `[executor.schedule]
   max_concurrency`.
 
-`vk tune` and `vk node run` compute it the same way, in one place; a runner config the node's
-user owns (`[node] runner_config`) has its `concurrent` set directly, and a root-managed one
-still goes through `vk-runnerctl`.
+`vk tune` and `vk node run` compute it the same way, in one place. `vk node run` does so every
+half minute, and whenever its desired state changes; only the half-minute pass may raise it,
+by the estimate's one step. A runner config the node's user owns (`[node] runner_config`) has
+its `concurrent` set directly, and a root-managed one still goes through `vk-runnerctl`.
 
 gitlab-runner has no `concurrent = 0`. **Stop acquisition** is therefore a state, not a
 number: the node sends gitlab-runner `SIGQUIT`, which stops it requesting jobs and lets

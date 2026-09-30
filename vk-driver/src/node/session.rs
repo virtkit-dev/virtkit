@@ -7,6 +7,7 @@
 //! a deadline, and the socket carries keepalives and a `TCP_USER_TIMEOUT`, so a peer that
 //! vanished without a word ends the session rather than wedging it.
 
+use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,10 +20,11 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use vk_fleet_proto::{
-    Channel, CommandAck, Heartbeat, HubMsg, Inventory, NodeMsg, Outcome, PROTOCOL, TLS_EXPORTER_LEN,
+    Channel, Heartbeat, HubMsg, Inventory, NodeMsg, Outcome, PROTOCOL, Report, TLS_EXPORTER_LEN,
 };
 
 use super::Enrollment;
+use super::core::Core;
 use super::identity::Identity;
 use crate::config::Config;
 
@@ -136,6 +138,7 @@ impl Gatherer {
 /// otherwise the error says why it ended, and is a [`Permanent`] when redialing cannot help.
 pub async fn run(
     node: &Node,
+    core: &Arc<Core>,
     gatherer: &mut Gatherer,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<()> {
@@ -157,6 +160,10 @@ pub async fn run(
         heartbeat.as_secs()
     );
 
+    // The node's own state first, so a hub deciding what to resend decides on it.
+    let mut changes = core.subscribe();
+    let mut sent = Sent::default();
+    sent.sync(&mut ws, core, heartbeat).await?;
     gatherer.drain();
     gatherer.request(Ask::Inventory);
     let mut sent_inventory: Option<Inventory> = None;
@@ -178,6 +185,7 @@ pub async fn run(
                 return Ok(());
             }
             _ = beat.tick() => gatherer.request(Ask::Heartbeat),
+            _ = changes.changed() => sent.sync(&mut ws, core, heartbeat).await?,
             _ = recheck.tick() => gatherer.request(Ask::Inventory),
             Some(gathered) = gatherer.answers.recv() => match gathered {
                 Gathered::Heartbeat(hb) => {
@@ -204,7 +212,7 @@ pub async fn run(
                     Some(Ok(Message::Text(text))) => {
                         let msg: HubMsg = serde_json::from_str(text.as_str())
                             .context("the hub sent a message this vk does not understand")?;
-                        handle(&mut ws, msg, heartbeat).await?;
+                        handle(&mut ws, core, &mut sent, msg, heartbeat).await?;
                     }
                     // tungstenite answers pings itself; each one shows the hub is alive.
                     Some(Ok(_)) => {}
@@ -214,29 +222,72 @@ pub async fn run(
     }
 }
 
-/// A message from the hub inside a session. Nothing is applied yet: desired state is noted,
-/// and a command is refused so the hub does not wait on it.
-async fn handle(ws: &mut Ws, msg: HubMsg, within: Duration) -> Result<()> {
+/// What this session has told the hub, so a change is sent once and an ack is repeated only
+/// when its outcome moved on or a new session starts.
+#[derive(Default)]
+struct Sent {
+    report: Option<Report>,
+    acks: HashMap<String, Outcome>,
+}
+
+impl Sent {
+    /// Send the report if it changed, and every ack the hub has not recorded that this session
+    /// has not sent as it stands.
+    async fn sync(&mut self, ws: &mut Ws, core: &Core, within: Duration) -> Result<()> {
+        let report = core.report();
+        if self.report.as_ref() != Some(&report) {
+            send(ws, &NodeMsg::Report(report.clone()), within).await?;
+            self.report = Some(report);
+        }
+        for ack in core.unrecorded() {
+            if self.acks.get(&ack.id) != Some(&ack.outcome) {
+                self.acks.insert(ack.id.clone(), ack.outcome.clone());
+                send(ws, &NodeMsg::Ack(ack), within).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Run `f` on the core off the runtime: it writes the node's state file.
+async fn persist<T: Send + 'static>(
+    core: &Arc<Core>,
+    f: impl FnOnce(&Core) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let core = core.clone();
+    tokio::task::spawn_blocking(move || f(&core))
+        .await
+        .context("persisting the node state")?
+}
+
+/// A message from the hub inside a session. Desired state and commands go through the
+/// node's persisted state before anything follows them; the report and acks that result go
+/// out through [`Sent::sync`].
+async fn handle(
+    ws: &mut Ws,
+    core: &Arc<Core>,
+    sent: &mut Sent,
+    msg: HubMsg,
+    within: Duration,
+) -> Result<()> {
     match msg {
         HubMsg::Desired(desired) => {
-            eprintln!(
-                "vk node: the hub asks for generation {} (ceiling {:?}, acquisition {:?}); this \
-                 vk does not apply desired state yet",
-                desired.generation, desired.ceiling, desired.acquisition
-            );
-            Ok(())
+            let generation = desired.generation;
+            if persist(core, move |core| core.apply_desired(desired)).await? {
+                eprintln!("vk node: applied desired state generation {generation}");
+            }
+            sent.sync(ws, core, within).await
         }
         HubMsg::Command(command) => {
-            let ack = CommandAck {
-                id: command.id,
-                outcome: Outcome::Refused {
-                    reason: "this vk does not run hub operations yet".into(),
-                },
-            };
-            send(ws, &NodeMsg::Ack(ack), within).await
+            if !vk_fleet_proto::valid_id(&command.id) {
+                bail!("the hub sent a command with a malformed ID");
+            }
+            let op = format!("{:?}", command.op);
+            let ack = persist(core, move |core| core.command(command, now_secs())).await?;
+            eprintln!("vk node: command {} ({op}): {:?}", ack.id, ack.outcome);
+            sent.sync(ws, core, within).await
         }
-        // No ack is sent yet, so there is nothing a record could settle.
-        HubMsg::Recorded(_) => Ok(()),
+        HubMsg::Recorded(ack) => persist(core, move |core| core.recorded(&ack, now_secs())).await,
         HubMsg::Refused { code, reason } => Err(refusal(code, &reason)),
         HubMsg::Challenge { .. } | HubMsg::Welcome { .. } => {
             bail!("the hub repeated its handshake inside a session")
@@ -427,6 +478,12 @@ async fn send(ws: &mut Ws, msg: &NodeMsg, within: Duration) -> Result<()> {
         .map_err(|e| anyhow!("sending to the hub: {e}"))
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// The next message of the handshake, within [`CONNECT_TIMEOUT`].
 async fn receive(ws: &mut Ws) -> Result<HubMsg> {
     tokio::time::timeout(CONNECT_TIMEOUT, async {
@@ -451,13 +508,14 @@ async fn receive(ws: &mut Ws) -> Result<HubMsg> {
 mod tests {
     use super::*;
     use tokio_tungstenite::WebSocketStream;
-    use vk_fleet_proto::{RefusalCode, VersionRange};
+    use vk_fleet_proto::{CommandAck, RefusalCode, VersionRange};
 
     type HubSide = WebSocketStream<tokio::net::TcpStream>;
 
     /// A node enrolled with a hub on a loopback port, with a state dir of its own.
     struct Fixture {
         node: Node,
+        core: Arc<Core>,
         gatherer: Gatherer,
         stop: watch::Sender<bool>,
         stopped: watch::Receiver<bool>,
@@ -471,14 +529,14 @@ mod tests {
         fn parts(
             &mut self,
         ) -> (
-            &Node,
+            (&Node, &Arc<Core>),
             &mut Gatherer,
             &mut watch::Receiver<bool>,
             &tokio::net::TcpListener,
             &watch::Sender<bool>,
         ) {
             (
-                &self.node,
+                (&self.node, &self.core),
                 &mut self.gatherer,
                 &mut self.stopped,
                 &self.listener,
@@ -521,6 +579,14 @@ mod tests {
                 incarnation: "cd".repeat(16),
                 tls: Arc::new(tls),
             },
+            core: Core::open(
+                &dir,
+                super::super::state::Issuer {
+                    hub: format!("http://{addr}"),
+                    node_id: "ab".repeat(16),
+                },
+            )
+            .unwrap(),
             gatherer: Gatherer::spawn(Arc::new(cfg)),
             stop,
             stopped,
@@ -598,7 +664,7 @@ mod tests {
     async fn a_session_authenticates_reports_and_closes_cleanly_on_stop() {
         let mut f = fixture("ok").await;
         let (node, gatherer, stopped, listener, stop) = f.parts();
-        let key = node.identity.public_key().to_vec();
+        let key = node.0.identity.public_key().to_vec();
         let hub = async {
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, PROTOCOL, PROTOCOL.max).await);
@@ -608,6 +674,7 @@ mod tests {
                 match hub_receive(&mut ws).await.unwrap() {
                     NodeMsg::Inventory(_) => inventory = true,
                     NodeMsg::Heartbeat(_) => heartbeat = true,
+                    NodeMsg::Report(_) => {}
                     other => panic!("unexpected {other:?}"),
                 }
             }
@@ -621,7 +688,7 @@ mod tests {
                 }
             }
         };
-        let (_, ended) = tokio::join!(hub, run(node, gatherer, stopped));
+        let (_, ended) = tokio::join!(hub, run(node.0, node.1, gatherer, stopped));
         ended.unwrap();
     }
 
@@ -629,7 +696,7 @@ mod tests {
     async fn a_version_other_than_the_highest_common_one_is_refused() {
         let mut f = fixture("version").await;
         let (node, gatherer, stopped, listener, _) = f.parts();
-        let key = node.identity.public_key().to_vec();
+        let key = node.0.identity.public_key().to_vec();
         let hub = async {
             let mut ws = accept(listener).await;
             // The hub claims a range the node shares only version 1 of, and picks another.
@@ -639,7 +706,7 @@ mod tests {
             };
             assert!(!challenge(&mut ws, &key, offered, PROTOCOL.max + 1).await);
         };
-        let (_, ended) = tokio::join!(hub, run(node, gatherer, stopped));
+        let (_, ended) = tokio::join!(hub, run(node.0, node.1, gatherer, stopped));
         let err = ended.unwrap_err();
         assert!(format!("{err:#}").contains("not the highest"), "{err:#}");
         assert!(!err.is::<Permanent>());
@@ -666,18 +733,116 @@ mod tests {
                 )
                 .await;
             };
-            let (_, ended) = tokio::join!(hub, run(node, gatherer, stopped));
+            let (_, ended) = tokio::join!(hub, run(node.0, node.1, gatherer, stopped));
             let err = ended.unwrap_err();
             assert_eq!(err.is::<Permanent>(), permanent, "{code:?}");
             assert!(!format!("{err:#}").contains('\u{1b}'));
         }
     }
 
+    /// The next message of a kind `pick` accepts, skipping the rest.
+    async fn next_of<T>(ws: &mut HubSide, pick: impl Fn(NodeMsg) -> Option<T>) -> T {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), hub_receive(ws))
+                .await
+                .expect("the node went quiet")
+                .expect("the node closed the session");
+            if let Some(t) = pick(msg) {
+                return t;
+            }
+        }
+    }
+
+    fn ack_of(msg: NodeMsg) -> Option<CommandAck> {
+        match msg {
+            NodeMsg::Ack(ack) => Some(ack),
+            _ => None,
+        }
+    }
+
+    fn report_of(msg: NodeMsg) -> Option<Report> {
+        match msg {
+            NodeMsg::Report(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Desired state and a command in one session; the command delivered again after a
+    /// reconnect, and its ack repeated until the hub records it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commands_are_applied_once_and_acked_until_recorded() {
+        let mut f = fixture("steer").await;
+        let (node, gatherer, stopped, listener, stop) = f.parts();
+        let key = node.0.identity.public_key().to_vec();
+        let drain = vk_fleet_proto::Command {
+            id: "01".repeat(16),
+            expires_at: u64::MAX,
+            // Refused, with no runner of its own to stop: still journaled, and its outcome
+            // still repeated until recorded.
+            op: vk_fleet_proto::Operation::Drain,
+        };
+        let hub = async {
+            // First session: desired state and a drain; the hub records nothing.
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, PROTOCOL, PROTOCOL.max).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            let first = next_of(&mut ws, report_of).await;
+            assert_eq!(first.applied_generation, None);
+            hub_send(
+                &mut ws,
+                &HubMsg::Desired(vk_fleet_proto::DesiredState {
+                    generation: 1,
+                    ceiling: Some(2),
+                    acquisition: vk_fleet_proto::Acquisition::Run,
+                }),
+            )
+            .await;
+            hub_send(&mut ws, &HubMsg::Command(drain.clone())).await;
+            let ack = next_of(&mut ws, ack_of).await;
+            assert!(matches!(ack.outcome, Outcome::Refused { .. }), "{ack:?}");
+            drop(ws);
+
+            // Second session: the unrecorded ack comes again unasked, and the command
+            // redelivered is answered with it, not run again.
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, PROTOCOL, PROTOCOL.max).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            let report = next_of(&mut ws, report_of).await;
+            assert_eq!(report.applied_generation, Some(1));
+            assert_eq!(report.state, vk_fleet_proto::NodeState::Ready);
+            assert_eq!(next_of(&mut ws, ack_of).await, ack);
+            hub_send(&mut ws, &HubMsg::Command(drain.clone())).await;
+            hub_send(&mut ws, &HubMsg::Recorded(ack.clone())).await;
+            for _ in 0..100 {
+                if node.1.unrecorded().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            stop.send(true).unwrap();
+            while hub_receive(&mut ws).await.is_some() {}
+        };
+        let node_side = async {
+            let first = run(node.0, node.1, gatherer, stopped).await;
+            assert!(first.is_err(), "the hub dropped the first session");
+            run(node.0, node.1, gatherer, stopped).await
+        };
+        let (_, ended) = tokio::join!(hub, node_side);
+        ended.unwrap();
+        // Recorded, so a third session would have nothing to repeat; applied once.
+        assert!(node.1.unrecorded().is_empty());
+        assert_eq!(node.1.hub_ceiling(), Some(2));
+        let journal = super::super::state::Persisted::load(&f.dir)
+            .unwrap()
+            .journal;
+        assert_eq!(journal.len(), 1);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_silent_hub_ends_the_session() {
         let mut f = fixture("silent").await;
         let (node, gatherer, stopped, listener, _) = f.parts();
-        let key = node.identity.public_key().to_vec();
+        let key = node.0.identity.public_key().to_vec();
         let (quiet_tx, quiet_rx) = tokio::sync::oneshot::channel::<()>();
         let hub = async {
             let mut ws = accept(listener).await;
@@ -689,7 +854,7 @@ mod tests {
         };
         let node = async {
             let started = std::time::Instant::now();
-            let ended = run(node, gatherer, stopped).await;
+            let ended = run(node.0, node.1, gatherer, stopped).await;
             let _ = quiet_tx.send(());
             (ended, started.elapsed())
         };

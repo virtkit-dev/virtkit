@@ -4,11 +4,14 @@
 //! enrolls with the hub using a single-use token; `vk node run` then holds a session with the
 //! hub for as long as it runs — inventory at the start and whenever it changes, a heartbeat
 //! every few seconds — and redials with backoff whenever the session is lost, until SIGTERM
-//! or SIGINT closes it cleanly or the hub refuses it for good. The hub only observes for
-//! now: desired state and commands are not applied. See `docs/fleet-design.md`.
+//! or SIGINT closes it cleanly or the hub refuses it for good. It applies the desired state
+//! and commands the hub sends through its persisted state ([`state`]), and sets the runner's
+//! concurrency every half minute within the hub's ceiling ([`core`]). See
+//! `docs/fleet-design.md`.
 //!
 //! Everything the node keeps is under `<state_dir>/node/`, a `0700` directory: `key.pk8`
 //! (the private key, `0600`), `enrollment.json` (the hub's URL and the node ID it assigned),
+//! `state.json` (what the hub asked and the node's own state),
 //! `ca.pem` (the CA the hub is verified against, copied at `join` when one was given) and
 //! `lock`, which one `vk node` process at a time holds. A `join` whose answer was lost keeps
 //! the key it made and joins again with a new token: the hub answers a key it already pinned
@@ -18,9 +21,11 @@
 //! raw socket a proxy variable cannot reach, and enrollment follows the same route rather
 //! than handing its token to a proxy.
 
+mod core;
 mod identity;
 mod inventory;
 mod session;
+mod state;
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -47,6 +52,10 @@ const BACKOFF: (Duration, Duration) = (Duration::from_secs(1), Duration::from_se
 /// A session that lasted this long was a working one, so the next failure starts the backoff
 /// over rather than continuing it.
 const STABLE_SESSION: Duration = Duration::from_secs(60);
+
+/// How often the node sets its runner's concurrency when nothing prompts it sooner: the
+/// half minute `vk tune`'s timer runs at.
+const CONTROL_EVERY: Duration = Duration::from_secs(30);
 
 /// A token or a CA bundle is a few kilobytes at most; this bounds what a wrong file costs.
 const MAX_INPUT: u64 = 1 << 20;
@@ -238,17 +247,38 @@ pub async fn run(cfg: Config) -> Result<()> {
         enrollment.node_id, enrollment.hub
     );
     let mut stop = stop_on_signal()?;
-    let mut gatherer = session::Gatherer::spawn(Arc::new(cfg));
+    let issuer = state::Issuer {
+        hub: enrollment.hub.clone(),
+        node_id: enrollment.node_id.clone(),
+    };
+    let core = core::Core::open(&dir, issuer)?;
+    let cfg = Arc::new(cfg);
+    tokio::spawn(
+        core.clone()
+            .control(cfg.clone(), CONTROL_EVERY, stop.clone()),
+    );
+    let mut gatherer = session::Gatherer::spawn(cfg);
     let node = session::Node {
         enrollment,
         identity,
         incarnation,
         tls,
     };
+    hold_sessions(&node, &core, &mut gatherer, &mut stop).await
+}
+
+/// Sessions back to back, with backoff between them, until the node is told to stop or the
+/// hub refuses it for good.
+async fn hold_sessions(
+    node: &session::Node,
+    core: &Arc<core::Core>,
+    gatherer: &mut session::Gatherer,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let mut backoff = BACKOFF.0;
     loop {
         let started = Instant::now();
-        match session::run(&node, &mut gatherer, &mut stop).await {
+        match session::run(node, core, gatherer, stop).await {
             Ok(()) => {
                 eprintln!("vk node: stopped");
                 return Ok(());
