@@ -281,7 +281,9 @@ pub struct Auth {
 /// VM; the in-guest agent links each one onto the guest PATH (`/usr/local/bin`), but
 /// only for a tool the job image does not already provide (per-image opt-out, checked
 /// in-guest). Dynamic: the binaries stay on the host and are baked into no bundle, so
-/// updating them needs no re-conversion.
+/// updating them needs no re-conversion. `vk check --feature gitlab` fails a `tools_dir`
+/// without `gitlab-runner`, even for a runner whose job images all ship their own: a job
+/// without one transfers no artifacts, caches or dotenv reports and still passes.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Executor {

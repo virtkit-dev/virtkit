@@ -1092,7 +1092,7 @@ fn gitlab(cfg: &Config) -> Outcome {
         return fail(format!("{e} (per-job state lives there; see state_dir)"));
     }
     if let Some(dir) = &cfg.executor.tools_dir
-        && let Err(e) = readable_root(cfg, dir, crate::vm::ShareRoot::Tools)
+        && let Err(e) = check_tools_dir(cfg, dir)
     {
         return fail(format!("[executor] tools_dir {e}"));
     }
@@ -1151,6 +1151,88 @@ fn readable_root(
     };
     std::fs::read_dir(&root).map_err(|e| format!("{shown} unreadable: {e}"))?;
     Ok((root, shown))
+}
+
+/// Fails unless `[executor] tools_dir` holds a gitlab-runner the guest can run: without one a
+/// job transfers no artifacts, caches or dotenv reports and still passes.
+fn check_tools_dir(cfg: &Config, dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let (root, shown) = readable_root(cfg, dir, crate::vm::ShareRoot::Tools)?;
+    let name = Path::new("gitlab-runner");
+    match std::fs::symlink_metadata(root.join(name)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!(
+                "{shown} has no gitlab-runner (jobs would transfer no artifacts, caches or dotenv \
+                 reports)"
+            ));
+        }
+        Err(e) => return Err(format!("{shown}: gitlab-runner: {e}")),
+        Ok(_) => {}
+    }
+    let meta = follow_in_share(&root, name).map_err(|e| {
+        format!("{shown}: gitlab-runner is a symlink the guest cannot follow ({e})")
+    })?;
+    if !meta.is_file() {
+        return Err(format!("{shown}: gitlab-runner is not a regular file"));
+    }
+    if meta.permissions().mode() & 0o111 == 0 {
+        return Err(format!("{shown}: gitlab-runner is not executable"));
+    }
+    Ok(())
+}
+
+/// Follow `name` within the share `root` and return its target's metadata. The guest resolves
+/// every link, including directory links, so each must be relative and stay inside the root:
+/// an absolute target names a guest path.
+fn follow_in_share(root: &Path, name: &Path) -> Result<std::fs::Metadata, String> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+    // `at` is the link-free path walked so far below the root, `rest` what is left of it, and
+    // `via` the last link followed. `components()` drops a trailing slash, so `slashed` keeps
+    // a last link whose target ended in one: the guest then needs a directory there.
+    let (mut at, mut rest, mut via) = (PathBuf::new(), name.to_path_buf(), String::new());
+    let (mut hops, mut slashed) = (0, None);
+    loop {
+        let mut parts = rest.components();
+        let Some(part) = parts.next() else {
+            let end = root.join(&at);
+            let meta =
+                std::fs::symlink_metadata(&end).map_err(|e| format!("{}: {e}", end.display()))?;
+            if let Some(link) = slashed.filter(|_| !meta.is_dir()) {
+                return Err(format!("{link} ends in a slash but names no directory"));
+            }
+            return Ok(meta);
+        };
+        let tail = parts.as_path().to_path_buf();
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir if at.pop() => {}
+            Component::ParentDir => return Err(format!("{via} leaves the share")),
+            Component::RootDir | Component::Prefix(_) => return Err(format!("{via} is absolute")),
+            Component::Normal(n) => {
+                let path = root.join(&at).join(n);
+                let meta = std::fs::symlink_metadata(&path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                if meta.file_type().is_symlink() {
+                    hops += 1;
+                    if hops > 40 {
+                        return Err("too many levels of symbolic links".into());
+                    }
+                    let target = std::fs::read_link(&path)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    via = format!("{} -> {}", at.join(n).display(), target.display());
+                    if tail.as_os_str().is_empty() && target.as_os_str().as_bytes().ends_with(b"/")
+                    {
+                        slashed = Some(via.clone());
+                    }
+                    rest = target.join(tail);
+                    continue;
+                }
+                at.push(n);
+            }
+        }
+        rest = tail;
+    }
 }
 
 fn share(cfg: &Config) -> Outcome {
@@ -1574,16 +1656,17 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// Resolve tools_dir as the executor does: a link to a real directory passes, a dangling
-    /// one fails.
+    /// Resolve tools_dir as the executor does, and require a gitlab-runner the guest can
+    /// follow to an executable regular file inside it.
     #[test]
-    fn the_gitlab_check_resolves_a_symlinked_tools_dir() {
+    fn the_gitlab_check_requires_a_gitlab_runner_in_tools_dir() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
         let root = std::env::temp_dir().join(format!("vk-check-tools-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let real = root.join("tools.d");
-        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(real.join("bin")).unwrap();
         let link = root.join("tools");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        symlink(&real, &link).unwrap();
         let with = |tools: &Path| Config {
             source: Some(root.join("config.toml")),
             state_dir: Some(root.clone()),
@@ -1593,12 +1676,79 @@ mod tests {
             },
             ..Default::default()
         };
+        let fails = |why: &str, needle: &str| {
+            let out = gitlab(&with(&link));
+            assert_eq!(out.status, Status::Fail, "{why}");
+            assert!(out.detail.contains(needle), "{why}: {}", out.detail);
+        };
+        let passes = || {
+            let out = gitlab(&with(&link));
+            assert_eq!(out.status, Status::Ok, "{}", out.detail);
+        };
+        let runner = real.join("gitlab-runner");
+        let exe = real.join("bin/gitlab-runner");
+        std::fs::write(&exe, "").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let relink = |target: &Path, at: &Path| {
+            let _ = std::fs::remove_file(at);
+            symlink(target, at).unwrap();
+        };
 
-        let out = gitlab(&with(&link));
-        assert_eq!(out.status, Status::Ok, "{}", out.detail);
+        std::fs::write(real.join("git"), "").unwrap();
+        let out = gitlab(&with(&real));
+        assert_eq!(out.status, Status::Fail);
+        assert!(out.detail.contains("no gitlab-runner"), "{}", out.detail);
+
+        std::fs::create_dir(&runner).unwrap();
+        fails("a directory", "is not a regular file");
+        std::fs::remove_dir(&runner).unwrap();
+
+        std::fs::write(&runner, "").unwrap();
+        let resolved = std::fs::canonicalize(&real).unwrap();
+        let named = format!("{} -> {}", link.display(), resolved.display());
+        fails(
+            "no execute bit",
+            &format!("{named}: gitlab-runner is not executable"),
+        );
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        passes();
+
+        relink(&exe, &runner);
+        fails("an absolute target is a guest path", "is absolute");
+        relink(Path::new("../tools.d/bin/gitlab-runner"), &runner);
+        fails(
+            "a target above the root leaves the share",
+            "leaves the share",
+        );
+        relink(Path::new("gitlab-runner"), &runner);
+        fails("a link to itself", "too many levels of symbolic links");
+        relink(Path::new("bin/gitlab-runner/"), &runner);
+        fails(
+            "a trailing slash on a file",
+            "ends in a slash but names no directory",
+        );
+        relink(Path::new("bin/gitlab-runner"), &runner);
+        passes();
+
+        // Every hop is the guest's to follow, not only the first.
+        let hop = real.join("bin/hop");
+        relink(&exe, &hop);
+        relink(Path::new("bin/hop"), &runner);
+        fails("a relative link to an absolute one", "is absolute");
+        let lib = real.join("lib");
+        relink(&real.join("bin"), &lib);
+        relink(Path::new("lib/gitlab-runner"), &runner);
+        fails("an absolute directory link on the way", "is absolute");
+        relink(Path::new("bin"), &lib);
+        relink(Path::new("gitlab-runner"), &hop);
+        relink(Path::new("lib/hop"), &runner);
+        passes();
+        // `..` after a directory link climbs from where the link points, still inside the root.
+        relink(Path::new("../bin/gitlab-runner"), &hop);
+        passes();
 
         let dangling = root.join("dangling");
-        std::os::unix::fs::symlink(root.join("gone"), &dangling).unwrap();
+        symlink(root.join("gone"), &dangling).unwrap();
         let out = gitlab(&with(&dangling));
         assert_eq!(out.status, Status::Fail);
         let gone = format!(
@@ -1624,6 +1774,9 @@ mod tests {
             std::fs::create_dir_all(d).unwrap();
         }
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let runner = real.join("gitlab-runner");
+        std::fs::write(&runner, "").unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
         let swappable = open.join("tools");
         symlink(&real, &swappable).unwrap();
         let planted = work.join("tools");

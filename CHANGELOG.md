@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- `vk check --feature gitlab` fails when `[executor] tools_dir` has no executable
+  `gitlab-runner` a job can reach: jobs would pass without transferring artifacts, caches
+  or dotenv reports.
+
 ### Fixed
 
 - **A GitLab runner whose `[executor] tools_dir` or `[executor.share] dir` is a symlink
