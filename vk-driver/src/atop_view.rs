@@ -117,8 +117,11 @@ enum Tail {
         path: PathBuf,
         file: std::fs::File,
         /// Bytes of the file already accounted for — always the end of a complete sample, so
-        /// a read resumes on a record boundary.
+        /// a read resumes on a record boundary — unless `resync`.
         offset: u64,
+        /// `offset` is not yet on a sample boundary: what comes before the first `SEP` line
+        /// read from it is the end of a sample whose start was never read.
+        resync: bool,
     },
     /// A compressed log: a finished job's, read whole on the first read, with nothing after it
     /// to follow. `None` once read.
@@ -142,11 +145,28 @@ impl Tail {
                 path,
                 file: Some(file),
             }),
-            false => Ok(Tail::Growing {
-                path,
-                file,
-                offset: 0,
-            }),
+            false => {
+                // Its end, as a report keeps one too large to hold: what a follower is there
+                // for. Only the first read is bounded; what the job writes after it is not.
+                // Unlike a report, a follower does not carry the front's state: a process's
+                // wait channels read as unknown until its next record of them.
+                let (offset, boundary) = crate::atoplog::tail_start(&file, crate::atoplog::MAX_LOG)
+                    .with_context(|| format!("reading {}", path.display()))?;
+                if offset > 0 {
+                    eprintln!(
+                        "virtkit: warning: {} holds more than {} — skipping its first {}",
+                        path.display(),
+                        crate::usage::fmt_bytes(crate::atoplog::MAX_LOG),
+                        crate::usage::fmt_bytes(offset)
+                    );
+                }
+                Ok(Tail::Growing {
+                    path,
+                    file,
+                    offset,
+                    resync: !boundary,
+                })
+            }
         }
     }
 
@@ -159,14 +179,18 @@ impl Tail {
     /// the guest is still writing: it stays unread until its own `SEP` arrives.
     fn read(&mut self) -> Result<Vec<Sample>> {
         use std::io::{Read, Seek, SeekFrom};
-        let (path, file, offset) = match self {
-            Tail::Growing { path, file, offset } => (path, file, offset),
+        let (path, file, offset, resync) = match self {
+            Tail::Growing {
+                path,
+                file,
+                offset,
+                resync,
+            } => (path, file, offset, resync),
             Tail::Finished { path, file } => {
                 let Some(file) = file.take() else {
                     return Ok(Vec::new());
                 };
-                let text = crate::atoplog::read_opened(path, file)?;
-                return Ok(crate::atoplog::parse(&text).samples);
+                return Ok(crate::atoplog::read_opened(path, file)?.samples);
             }
         };
         file.seek(SeekFrom::Start(*offset))
@@ -174,6 +198,21 @@ impl Tail {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .with_context(|| format!("reading {}", path.display()))?;
+        if *resync {
+            match crate::atoplog::after_first_sep(&bytes) {
+                Some(at) => {
+                    bytes.drain(..at);
+                    *offset += at as u64;
+                    *resync = false;
+                }
+                // Retain the last bytes: they may begin a `SEP` line completed by a later read.
+                None => {
+                    let lookback = crate::atoplog::SEP_LINE.len() - 1;
+                    *offset += bytes.len().saturating_sub(lookback) as u64;
+                    return Ok(Vec::new());
+                }
+            }
+        }
         // Resume on a record boundary in the *file*. `Parsed::consumed` counts decoded text,
         // where a byte that is not text widens to three, so adding it to a file offset would
         // walk past the samples — and once past the end, every later read returns nothing and
@@ -1176,6 +1215,41 @@ mod tests {
         std::os::unix::fs::symlink(&path, &planted).unwrap();
         assert!(Tail::open(&planted).is_err());
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// When an oversized log's tail has no sample boundary, the follower waits for a `SEP`
+    /// line and reads only subsequent samples, discarding the partial sample it started in.
+    #[test]
+    fn a_follower_started_mid_sample_waits_for_a_boundary() {
+        let dir = std::env::temp_dir().join(format!("vk-atop-resync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(vk_core::atop::LOG_NAME);
+        let text = crate::atoplog::synthetic_log(3);
+        let ends: Vec<usize> = text.match_indices("SEP\n").map(|(at, _)| at + 4).collect();
+        // The file so far ends inside the second sample, before its SEP line.
+        let torn = ends[1] - 10;
+        std::fs::write(&path, &text[..torn]).unwrap();
+        let mut tail = Tail::Growing {
+            path: path.clone(),
+            file: crate::atoplog::open_log(&path).unwrap().0,
+            offset: (torn - 1) as u64,
+            resync: true,
+        };
+        assert!(tail.read().unwrap().is_empty(), "no boundary yet");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&text.as_bytes()[torn..])
+            .unwrap();
+        let got: Vec<i64> = tail.read().unwrap().iter().map(|s| s.epoch).collect();
+        assert_eq!(
+            got,
+            [1020],
+            "the sample after the boundary, not the torn one"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

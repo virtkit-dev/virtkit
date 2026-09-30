@@ -18,10 +18,10 @@
 //! that cannot be represented is dropped rather than trusted, and no arithmetic over one may
 //! panic.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::atoplog::{ExitedUnknown, Parsed, Proc, SECTOR, Sample, Stall};
 use crate::usage::{fmt_bytes, fmt_cpu};
@@ -45,9 +45,17 @@ pub(crate) fn secs_of(v: f64) -> std::time::Duration {
 /// is not a job's: a VM's own recording sits in `<state dir>/atop/`, which names the archive
 /// rather than the VM the samples came from. `None` reads the name off the directory.
 pub fn summarize_as(path: &Path, named: Option<&str>) -> Result<String> {
-    let text = crate::atoplog::read(path)?;
-    let parsed = crate::atoplog::parse(&text);
-    summary(path, named, &parsed).with_context(|| {
+    let mut scan = StallScan::default();
+    let parsed = crate::atoplog::read_folding(path, |s| scan.feed(&s))?;
+    if parsed.samples.is_empty() && parsed.oversized > 0 {
+        bail!(
+            "{} holds no readable sample: each is over {}, the most one sample may span \
+             (a damaged log)",
+            path.display(),
+            fmt_bytes(crate::atoplog::MAX_LOG)
+        );
+    }
+    summary(path, named, &parsed, scan).with_context(|| {
         format!(
             "{} holds no complete sample yet (a job records its first one an interval in)",
             path.display()
@@ -57,15 +65,27 @@ pub fn summarize_as(path: &Path, named: Option<&str>) -> Result<String> {
 
 /// The same account, without the line that says whose it is — for the job trace, where the
 /// section holding it is already headed with the job's name. `None` where there is nothing to
-/// account, which is a job whose guest died before it finished a sample.
+/// account, which is a job whose guest died before it finished a sample; a log whose every
+/// sample is too long to hold says so instead.
 pub(crate) fn trace_body(path: &Path) -> Option<String> {
-    let text = crate::atoplog::read(path).ok()?;
-    body(&crate::atoplog::parse(&text))
+    let mut scan = StallScan::default();
+    let parsed = crate::atoplog::read_folding(path, |s| scan.feed(&s)).ok()?;
+    if parsed.samples.is_empty() && parsed.oversized > 0 {
+        return Some(keyed(
+            "damaged",
+            &format!(
+                "the log holds no readable sample: each is over {}, the most one sample may \
+                 span",
+                fmt_bytes(crate::atoplog::MAX_LOG)
+            ),
+        ));
+    }
+    body(&parsed, scan)
 }
 
 /// The report for one recorded job, or `None` when the log holds no complete sample — a
 /// guest that died before finishing its first one.
-fn summary(path: &Path, named: Option<&str>, parsed: &Parsed) -> Option<String> {
+fn summary(path: &Path, named: Option<&str>, parsed: &Parsed, scan: StallScan) -> Option<String> {
     let job = named.map(str::to_string).unwrap_or_else(|| {
         path.parent()
             .and_then(|p| p.file_name())
@@ -74,12 +94,14 @@ fn summary(path: &Path, named: Option<&str>, parsed: &Parsed) -> Option<String> 
     });
     Some(format!(
         "virtkit: {job} — what its guest did:\n{}",
-        body(parsed)?
+        body(parsed, scan)?
     ))
 }
 
-/// The account itself: everything but the line naming the job it belongs to.
-fn body(parsed: &Parsed) -> Option<String> {
+/// The account itself: everything but the line naming the job it belongs to. `scan` has been
+/// fed the samples a read let go of before `parsed`'s, if any, so a stall is judged over the
+/// whole job.
+fn body(parsed: &Parsed, mut scan: StallScan) -> Option<String> {
     let samples = parsed.samples.as_slice();
     let (first, last) = (samples.first()?, samples.last()?);
     // Rates come from the samples that cover one interval each; the boot sample covers
@@ -91,6 +113,42 @@ fn body(parsed: &Parsed) -> Option<String> {
         "recorded",
         &span(first, last, &paced, samples.len()),
     ));
+    // Right under the span, which they qualify.
+    if parsed.evicted > 0 {
+        out.push_str(&keyed(
+            "cut",
+            &format!(
+                "the log is over {}: every figure here covers only its last samples, leaving \
+                 out the first {} — except the stalls, which cover {}",
+                fmt_bytes(crate::atoplog::MAX_LOG),
+                fmt_bytes(parsed.evicted),
+                match parsed.unread {
+                    true => "all of it that was read",
+                    false => "the whole log",
+                }
+            ),
+        ));
+    }
+    if parsed.unread {
+        out.push_str(&keyed(
+            "unread",
+            &format!(
+                "the log is over {}, the most one read goes through: every figure here, the \
+                 stalls included, ends where it stopped",
+                fmt_bytes(crate::atoplog::MAX_READ)
+            ),
+        ));
+    }
+    if parsed.oversized > 0 {
+        out.push_str(&keyed(
+            "oversized",
+            &format!(
+                "{} of samples are left out, each over {}, the most one sample may span",
+                fmt_bytes(parsed.oversized),
+                fmt_bytes(crate::atoplog::MAX_LOG)
+            ),
+        ));
+    }
     if let Some(line) = hardware(samples) {
         out.push_str(&keyed("guest", &line));
     }
@@ -148,7 +206,10 @@ fn body(parsed: &Parsed) -> Option<String> {
         ));
     }
     out.push_str(&processes(samples));
-    out.push_str(&stalls(samples));
+    for s in samples {
+        scan.feed(s);
+    }
+    out.push_str(&scan.render());
     Some(out)
 }
 
@@ -743,7 +804,7 @@ struct Stuck {
     threads: u64,
     from: i64,
     to: i64,
-    wchans: BTreeMap<String, u32>,
+    wchans: crate::atoplog::Wchans,
     stacks: Vec<crate::atoplog::Stack>,
     /// When the guest wrote `stacks` — at the process's first stall, which need not be this
     /// one — and how many threads it had then.
@@ -751,32 +812,59 @@ struct Stuck {
     stacks_of: u64,
 }
 
-/// The processes that stalled, those the job started first, then longest first: where each
-/// one's threads waited, and the kernel stacks the guest wrote for it. Empty when none did,
-/// or the log records no wait channels.
-fn stalls(samples: &[Sample]) -> String {
-    // Per multi-threaded process (pid, start time): its tracker, fed what the guest fed its
-    // own from the same samples, and when the wait channels it last saw were recorded.
-    let mut tracks: HashMap<(i32, i64), (vk_core::atop::Stall, i64)> = HashMap::new();
-    let mut found: HashMap<(i32, i64), Stuck> = HashMap::new();
-    // The one sample holding a process's dump, found wherever it falls: its time, the
-    // process's threads then, and the stacks.
-    let mut dumps: HashMap<(i32, i64), (i64, u64, &Vec<crate::atoplog::Stack>)> = HashMap::new();
-    // The job's own processes are the ones started after the guest's boot sample; a log
-    // without one says nothing either way.
-    let boot = samples.first().filter(|s| s.boot).map(|s| s.epoch);
-    for s in samples {
+/// The processes that stalled, found by feeding every sample in order to [`StallScan::feed`].
+///
+/// Per multi-threaded process (pid, start time): its tracker, fed what the guest fed its own
+/// from the same samples, and when the wait channels it last saw were recorded. Everything it
+/// keeps from a sample it is fed is owned, so a read can feed it the samples it lets go of.
+///
+/// What it holds is bounded by the processes in one sample, not by the log: a process that has
+/// left the samples settles its stall into the few kept for the report, and its stacks go.
+#[derive(Default)]
+struct StallScan {
+    tracks: HashMap<(i32, i64), (vk_core::atop::Stall, i64)>,
+    /// The stalls of processes still in the samples, their stacks not yet attached.
+    found: HashMap<(i32, i64), Stuck>,
+    /// The stalls of processes gone from the samples: the [`TOP_STALLS`] first by [`rank`],
+    /// and how many there were in all.
+    settled: Vec<Stuck>,
+    settled_count: usize,
+    /// The one sample holding a process's dump, for the processes still in the samples: its
+    /// time, the process's threads then, and the stacks.
+    dumps: HashMap<(i32, i64), (i64, u64, Vec<crate::atoplog::Stack>)>,
+    /// The job's own processes are the ones started after the guest's boot sample; a log
+    /// without one says nothing either way. `None` until a first sample is fed.
+    boot: Option<Option<i64>>,
+}
+
+/// The order stalls are listed in: those the job started first, then the longest, then by pid.
+fn rank(a: &Stuck, b: &Stuck) -> std::cmp::Ordering {
+    b.launched
+        .cmp(&a.launched)
+        .then(
+            b.to.saturating_sub(b.from)
+                .cmp(&a.to.saturating_sub(a.from)),
+        )
+        .then(a.pid.cmp(&b.pid))
+}
+
+impl StallScan {
+    fn feed(&mut self, s: &Sample) {
+        let boot = *self.boot.get_or_insert(s.boot.then_some(s.epoch));
         let mut next = HashMap::new();
+        let mut present = HashSet::with_capacity(s.procs.len());
         for p in &s.procs {
             let key = (p.pid, p.started);
+            present.insert(key);
             if !p.stacks.is_empty() {
-                dumps.insert(key, (s.epoch, p.threads, &p.stacks));
+                self.dumps
+                    .insert(key, (s.epoch, p.threads, p.stacks.clone()));
             }
             let (Some(wchans), Some(since)) = (&p.wchans, p.wchans_since) else {
                 continue;
             };
             let sectors = p.sectors_read.saturating_add(p.sectors_written);
-            let (mut track, before) = match tracks.get(&key) {
+            let (mut track, before) = match self.tracks.get(&key) {
                 Some((track, before)) => (*track, Some(*before)),
                 None => (vk_core::atop::Stall::default(), None),
             };
@@ -788,12 +876,12 @@ fn stalls(samples: &[Sample]) -> String {
                 continue;
             }
             let from = track.from();
-            match found.get_mut(&key) {
+            match self.found.get_mut(&key) {
                 Some(stall) if stall.from == from => stall.to = s.epoch,
                 Some(stall)
                     if stall.to.saturating_sub(stall.from) >= s.epoch.saturating_sub(from) => {}
                 _ => {
-                    found.insert(
+                    self.found.insert(
                         key,
                         Stuck {
                             pid: p.pid,
@@ -802,7 +890,7 @@ fn stalls(samples: &[Sample]) -> String {
                             threads: p.threads,
                             from,
                             to: s.epoch,
-                            wchans: wchans.clone(),
+                            wchans: std::sync::Arc::clone(wchans),
                             stacks: Vec::new(),
                             stacks_at: 0,
                             stacks_of: 0,
@@ -811,39 +899,60 @@ fn stalls(samples: &[Sample]) -> String {
                 }
             }
         }
-        tracks = next;
-    }
-    for (key, stall) in &mut found {
-        if let Some((at, of, stacks)) = dumps.get(key) {
-            stall.stacks.clone_from(stacks);
-            (stall.stacks_at, stall.stacks_of) = (*at, *of);
+        self.tracks = next;
+        // Finalize a stall only when its process leaves the samples. Missing wait channels
+        // alone must preserve the pending stall, so a later, longer stall replaces it
+        // instead of producing a duplicate.
+        let gone: Vec<(i32, i64)> = self
+            .found
+            .keys()
+            .filter(|key| !present.contains(key))
+            .copied()
+            .collect();
+        for key in gone {
+            if let Some(stall) = self.found.remove(&key) {
+                self.settle(key, stall);
+            }
         }
+        self.dumps.retain(|key, _| present.contains(key));
     }
-    if found.is_empty() {
-        return String::new();
-    }
-    let mut stalls: Vec<Stuck> = found.into_values().collect();
-    stalls.sort_by(|a, b| {
-        b.launched
-            .cmp(&a.launched)
-            .then(
-                b.to.saturating_sub(b.from)
-                    .cmp(&a.to.saturating_sub(a.from)),
-            )
-            .then(a.pid.cmp(&b.pid))
-    });
-    let mut out = format!(
-        "\n  stalled — no thread running and none changing what it waits in, for {} or more{}\n",
-        fmt_secs(vk_core::atop::STALL_SECS),
-        match stalls.len() > TOP_STALLS {
-            true => format!("; {TOP_STALLS} of {} shown", stalls.len()),
-            false => String::new(),
+
+    /// Keep a final stall if it is among the first [`TOP_STALLS`], counting it either way.
+    fn settle(&mut self, key: (i32, i64), mut stall: Stuck) {
+        if let Some((at, of, stacks)) = self.dumps.remove(&key) {
+            (stall.stacks_at, stall.stacks_of, stall.stacks) = (at, of, stacks);
         }
-    );
-    for stall in stalls.iter().take(TOP_STALLS) {
-        out.push_str(&stall.render());
+        self.settled_count += 1;
+        self.settled.push(stall);
+        self.settled.sort_by(rank);
+        self.settled.truncate(TOP_STALLS);
     }
-    out
+
+    /// Where each listed stall's threads waited, and the kernel stacks the guest wrote for it.
+    /// Empty when none stalled, or the log records no wait channels.
+    fn render(mut self) -> String {
+        let live: Vec<(i32, i64)> = self.found.keys().copied().collect();
+        for key in live {
+            if let Some(stall) = self.found.remove(&key) {
+                self.settle(key, stall);
+            }
+        }
+        if self.settled.is_empty() {
+            return String::new();
+        }
+        let mut out = format!(
+            "\n  stalled — no thread running and none changing what it waits in, for {} or more{}\n",
+            fmt_secs(vk_core::atop::STALL_SECS),
+            match self.settled_count > TOP_STALLS {
+                true => format!("; {TOP_STALLS} of {} shown", self.settled_count),
+                false => String::new(),
+            }
+        );
+        for stall in &self.settled {
+            out.push_str(&stall.render());
+        }
+        out
+    }
 }
 
 impl Stuck {
@@ -1240,6 +1349,7 @@ mod tests {
             &PathBuf::from("/var/lib/virtkit/atop/2026-08-12/42137-acme-web-test_unit/atop.log"),
             None,
             &parsed,
+            StallScan::default(),
         )
         .expect("a report for a log with samples")
     }
@@ -1350,14 +1460,9 @@ mod tests {
         }
     }
 
-    /// A process that worked and then sat with its threads in the same wait channels, none
-    /// running, for five minutes is reported as stalled — with where they wait and the stacks
-    /// the guest wrote, threads sharing a stack on one line — however much processor time its
-    /// idle threads burn. The job's own processes come before the guest's older ones. One
-    /// whose channels move, whose thread runs, whose stall is shorter, or that has been idle
-    /// since the guest booted, is not reported.
-    #[test]
-    fn a_stalled_process_is_reported_with_its_wait_channels_and_stacks() {
+    /// Forty samples of processes that stall, and some that only look as if they might — the
+    /// log [`a_stalled_process_is_reported_with_its_wait_channels_and_stacks`] reads.
+    fn stall_log() -> String {
         let mut text = String::from("RESET\n");
         for i in 0..40i64 {
             let epoch = 1_000 + i * 10;
@@ -1447,6 +1552,146 @@ mod tests {
             }
             text.push_str("SEP\n");
         }
+        text
+    }
+
+    /// The lines of a report's stalled section.
+    fn stalled_section(out: &str) -> Vec<String> {
+        out.lines()
+            .skip_while(|l| !l.contains("stalled —"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// What the stall scan holds stays at what one sample holds, however many processes a log
+    /// runs through: a process gone from the samples settles into the few kept for the report
+    /// — stacks attached — and the header still counts every one that stalled.
+    #[test]
+    fn the_stall_scan_holds_no_more_than_a_sample() {
+        let mut scan = StallScan::default();
+        let wchans = std::sync::Arc::new(BTreeMap::from([("futex_do_wait".to_string(), 8)]));
+        let (procs, life) = (20, 40);
+        for i in 0..procs * life + 1 {
+            let epoch = 1_000 + 10 * i64::from(i);
+            let (k, at) = (i / life, i % life);
+            let born = 1_000 + 10 * i64::from(k * life);
+            let procs = match k < procs {
+                true => vec![crate::atoplog::Proc {
+                    pid: 100 + k,
+                    started: born,
+                    threads: 9,
+                    // Work in its first sample, then nothing moving.
+                    utime: u64::from(at == 0) * 50,
+                    wchans: Some(std::sync::Arc::clone(&wchans)),
+                    wchans_since: Some(born),
+                    stacks: match at == 35 {
+                        true => vec![crate::atoplog::Stack {
+                            tid: 100 + k,
+                            wchan: Some("futex_do_wait".into()),
+                            frames: vec!["futex_do_wait+0x4e/0x80".into()],
+                        }],
+                        false => Vec::new(),
+                    },
+                    ..Default::default()
+                }],
+                false => Vec::new(),
+            };
+            scan.feed(&Sample {
+                epoch,
+                interval: 10,
+                procs,
+                ..Default::default()
+            });
+            assert!(
+                scan.found.len() <= 1 && scan.dumps.len() <= 1,
+                "at sample {i}"
+            );
+            assert!(scan.settled.len() <= TOP_STALLS);
+        }
+        assert_eq!(scan.settled_count, 20);
+        assert!(
+            scan.settled.iter().all(|s| s.stacks.len() == 1),
+            "stacks attached"
+        );
+        let out = scan.render();
+        assert!(out.contains("; 5 of 20 shown"), "{out}");
+    }
+
+    /// A process that stays in the samples keeps one stall, the longest, however often its
+    /// wait channels drop out between two: a sample without them is not the process leaving.
+    #[test]
+    fn a_process_that_stalls_twice_settles_its_longest_stall_once() {
+        let mut scan = StallScan::default();
+        let wchans = std::sync::Arc::new(BTreeMap::from([("futex_do_wait".to_string(), 8)]));
+        for i in 0..=81i64 {
+            let epoch = 1_000 + 10 * i;
+            let procs = match i {
+                81 => Vec::new(),
+                _ => vec![crate::atoplog::Proc {
+                    pid: 412,
+                    started: 1_000,
+                    threads: 9,
+                    // Work, then 350 s standing still; a sample without wait channels; work
+                    // again, then 430 s standing still.
+                    utime: u64::from(i == 0 || i == 37) * 50,
+                    wchans: (i != 36).then(|| std::sync::Arc::clone(&wchans)),
+                    wchans_since: (i != 36).then_some(1_000),
+                    ..Default::default()
+                }],
+            };
+            scan.feed(&Sample {
+                epoch,
+                interval: 10,
+                procs,
+                ..Default::default()
+            });
+        }
+        assert_eq!(scan.settled_count, 1);
+        let spans: Vec<(i64, i64)> = scan.settled.iter().map(|s| (s.from, s.to)).collect();
+        assert_eq!(spans, [(1_370, 1_800)]);
+    }
+
+    /// Feeding evicted samples into the same scan preserves stalls that began before the
+    /// retained samples: wait channels and stacks recorded only in evicted samples, the
+    /// original start time, and priority for the job's own process all match the whole log.
+    #[test]
+    fn a_stall_that_began_before_the_cut_is_still_reported() {
+        let text = stall_log();
+        let dir = std::env::temp_dir().join(format!("vk-atop-cutstall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("atop.log");
+        std::fs::write(&path, &text).unwrap();
+        // Room for the last five samples only: the PRW records (samples 0–3) and the stacks
+        // (sample 33) are all in what is let go of.
+        let ends: Vec<usize> = text.match_indices("SEP\n").map(|(at, _)| at + 4).collect();
+        let keep = (text.len() - ends[34]) as u64;
+
+        let mut scan = StallScan::default();
+        let parsed = crate::atoplog::read_folding_keeping(&path, keep, |s| scan.feed(&s)).unwrap();
+        assert_eq!(parsed.samples.len(), 5);
+        assert_eq!(parsed.evicted, ends[34] as u64);
+        let whole = stalled_section(&report(&text));
+        let cut = summary(&path, None, &parsed, scan).unwrap();
+        assert_eq!(stalled_section(&cut), whole, "{cut}");
+        assert!(cut.contains("  cut "), "{cut}");
+        assert!(whole.len() > 2, "the whole log has stalls to compare");
+
+        // Without the fold, the kept samples alone have none to report.
+        let alone = summary(&path, None, &parsed, StallScan::default()).unwrap();
+        assert!(stalled_section(&alone).is_empty(), "{alone}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A process that worked and then sat with its threads in the same wait channels, none
+    /// running, for five minutes is reported as stalled — with where they wait and the stacks
+    /// the guest wrote, threads sharing a stack on one line — however much processor time its
+    /// idle threads burn. The job's own processes come before the guest's older ones. One
+    /// whose channels move, whose thread runs, whose stall is shorter, or that has been idle
+    /// since the guest booted, is not reported.
+    #[test]
+    fn a_stalled_process_is_reported_with_its_wait_channels_and_stacks() {
+        let text = stall_log();
         let out = report(&text);
         let section: Vec<&str> = out
             .lines()
@@ -1482,7 +1727,7 @@ mod tests {
             threads: 300,
             from: 1_000,
             to: 1_300,
-            wchans: BTreeMap::from([("futex_do_wait".to_string(), 300)]),
+            wchans: std::sync::Arc::new(BTreeMap::from([("futex_do_wait".to_string(), 300)])),
             stacks: (1..=256)
                 .map(|tid| crate::atoplog::Stack {
                     tid,
@@ -1747,7 +1992,15 @@ mod tests {
     fn a_log_with_no_whole_sample_has_no_report() {
         let text = "RESET\nCPU runner 1000 1970/01/01 00:16:40 40 100 2 1\n";
         let parsed = crate::atoplog::parse(text);
-        assert!(summary(&PathBuf::from("atop.log"), None, &parsed).is_none());
+        assert!(
+            summary(
+                &PathBuf::from("atop.log"),
+                None,
+                &parsed,
+                StallScan::default()
+            )
+            .is_none()
+        );
     }
 
     /// The whole of `--summary` against a file on disk — and against the two things a job's
@@ -1806,7 +2059,13 @@ mod tests {
              SEP\n"
         );
         let parsed = crate::atoplog::parse(&text);
-        let out = summary(&PathBuf::from("atop.log"), None, &parsed).expect("a report");
+        let out = summary(
+            &PathBuf::from("atop.log"),
+            None,
+            &parsed,
+            StallScan::default(),
+        )
+        .expect("a report");
         assert!(out.contains("of cpu time"), "{out}");
     }
 
@@ -1909,5 +2168,17 @@ mod tests {
         assert_eq!(plural(0, "sample"), "samples");
         assert_eq!(truncated("short", 10), "short");
         assert_eq!(truncated("abcdef", 4), "abc…");
+    }
+
+    /// A report over a log read only in part says so under its span, so no total is taken
+    /// for the whole job's.
+    #[test]
+    fn a_report_over_a_cut_log_says_so() {
+        let text = crate::atoplog::synthetic_log(3);
+        let mut parsed = crate::atoplog::parse(&text);
+        assert!(!body(&parsed, StallScan::default()).unwrap().contains("cut"));
+        parsed.evicted = 300 * 1024 * 1024;
+        let out = body(&parsed, StallScan::default()).unwrap();
+        assert!(out.contains("cut") && out.contains("300 MiB"), "{out}");
     }
 }

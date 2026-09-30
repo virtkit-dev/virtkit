@@ -22,14 +22,29 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use vk_core::atop::{self, Label};
 
-/// The most of a log this reads. The guest owns the directory its log is in and can fill it;
-/// reading one is not worth an unbounded allocation. For a compressed log it is the most
-/// that is *decompressed*, which is what bounds a frame crafted to expand without limit.
-const MAX_LOG: u64 = 256 * 1024 * 1024;
+/// Maximum text size of the retained samples, or of any single line or sample. The guest
+/// owns the log directory and can fill it, so retention must be bounded. Evict the oldest
+/// samples as newer ones arrive to keep the end of a hung job.
+pub(crate) const MAX_LOG: u64 = 256 * 1024 * 1024;
+
+/// The most of a log one read goes through — read from a plain log, decoded from a compressed
+/// one. The log is guest input, a sparse file or a zstd frame (which may sit under the plain
+/// name, since a log is told by its magic) can stand for any size at all, and the job-end
+/// report reads it synchronously: this bounds the CPU and I/O one read spends, far past any
+/// real job's log. Memory is bounded apart from it, by what [`MAX_LOG`] of text parses to.
+///
+/// It is an upper bound, not a budget: a guest that fills its log can make the job-end report
+/// parse up to this much before the job is done — a longer job end, accepted as the price of
+/// reading a real log whole.
+pub(crate) const MAX_READ: u64 = 8 * 1024 * 1024 * 1024;
+
+/// How much of a log is read or decoded at a time.
+const CHUNK: usize = 1024 * 1024;
 
 /// The on-disk zstd magic identifies compressed recordings regardless of filename, so renamed
 /// copies still read correctly.
@@ -40,54 +55,324 @@ const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 /// memory a frame can make a reader allocate for its window.
 const WINDOW_LOG_MAX: u32 = 27;
 
-/// A whole log as text, opened by [`open_log`] and capped at [`MAX_LOG`].
-///
-/// Read lossily on purpose: the guest maps a command's own control bytes to spaces as it
-/// writes, so a byte that is not text means a damaged log — and reading what is still there is
-/// exactly what a reader of a possibly-torn file is for.
-pub fn read(path: &Path) -> Result<String> {
-    read_from(path, open_log(path)?.0, MAX_LOG)
+/// A line that closes a sample, with the newline ending the line before it: what a follower
+/// that starts part-way into a log resynchronises on.
+pub(crate) const SEP_LINE: &[u8] = b"\nSEP\n";
+
+/// Every sample of a log, opened by [`open_log`] — or, for one whose samples span more than
+/// [`MAX_LOG`], its last ones (see [`read_folding`]).
+pub fn read(path: &Path) -> Result<Parsed> {
+    read_folding(path, |_| {})
 }
 
 /// [`read`] on a log already opened by [`open_log`], plain or compressed.
-pub fn read_opened(path: &Path, file: std::fs::File) -> Result<String> {
-    read_from(path, file, MAX_LOG)
+pub fn read_opened(path: &Path, file: std::fs::File) -> Result<Parsed> {
+    read_from(path, file, Limits::DEFAULT, &mut |_| {})
 }
 
-/// The text of `file`, at most `cap` bytes of it, decompressed if it is a zstd recording.
+/// [`read`], passing evicted samples to `evicted` in order. Callers detecting stalls and
+/// their start times feed these into the same state as the retained samples.
 ///
-/// A truncated or damaged compressed log yields the text decoded before the damage, with a
-/// warning. As with a plain log's torn tail, earlier samples remain usable.
-fn read_from(path: &Path, file: std::fs::File, cap: u64) -> Result<String> {
+/// Parsing starts at the first byte regardless of log size, preserving boot-sample identity
+/// and wait channels across evictions. Only retained samples stay in memory.
+///
+/// Read lossily on purpose: the guest maps a command's own control bytes to spaces as it
+/// writes, so a byte that is not text means a damaged log — and reading what is still there is
+/// exactly what a reader of a possibly-torn file is for. A compressed log that stops decoding
+/// part-way likewise yields the samples before the damage, with a warning.
+pub fn read_folding(path: &Path, mut evicted: impl FnMut(Sample)) -> Result<Parsed> {
+    read_from(path, open_log(path)?.0, Limits::DEFAULT, &mut evicted)
+}
+
+/// [`read_folding`] with a `keep`-byte retention limit, so tests in other modules can
+/// exercise eviction with small logs.
+#[cfg(test)]
+pub(crate) fn read_folding_keeping(
+    path: &Path,
+    keep: u64,
+    mut evicted: impl FnMut(Sample),
+) -> Result<Parsed> {
+    let limits = Limits {
+        keep,
+        ..Limits::DEFAULT
+    };
+    read_from(path, open_log(path)?.0, limits, &mut evicted)
+}
+
+/// The bounds one read goes by: [`MAX_LOG`], [`MAX_READ`] and [`CHUNK`] outside tests.
+#[derive(Clone, Copy)]
+struct Limits {
+    keep: u64,
+    max_read: u64,
+    chunk: usize,
+}
+
+impl Limits {
+    const DEFAULT: Limits = Limits {
+        keep: MAX_LOG,
+        max_read: MAX_READ,
+        chunk: CHUNK,
+    };
+}
+
+fn read_from(
+    path: &Path,
+    file: std::fs::File,
+    limits: Limits,
+    evicted: &mut dyn FnMut(Sample),
+) -> Result<Parsed> {
     use std::io::Read;
-    let compressed = is_compressed(&file).with_context(|| format!("reading {}", path.display()))?;
-    let source: Box<dyn Read> = match compressed {
-        true => Box::new(decoder(file).with_context(|| format!("reading {}", path.display()))?),
+    let reading = || format!("reading {}", path.display());
+    let compressed = is_compressed(&file).with_context(reading)?;
+    let mut source: Box<dyn Read> = match compressed {
+        true => Box::new(decoder(file).with_context(reading)?),
         false => Box::new(file),
     };
-    let mut bytes = Vec::new();
-    // Read one extra byte to distinguish an oversized log from one exactly at the cap.
-    match source.take(cap.saturating_add(1)).read_to_end(&mut bytes) {
-        Ok(_) => {}
-        Err(e) if compressed && !bytes.is_empty() => eprintln!(
-            "virtkit: warning: {} stops decoding after {} ({e}) — reading the samples before it",
-            path.display(),
-            crate::usage::fmt_bytes(bytes.len() as u64)
-        ),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    let max = limits.max_read;
+    let mut stream = Stream::new(limits.keep, evicted);
+    let mut chunk = vec![0u8; limits.chunk.max(1)];
+    let mut read = 0u64;
+    loop {
+        match source.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                // Strictly past the bound, so a log that decodes to exactly it is not cut.
+                let room = usize::try_from(max - read).unwrap_or(usize::MAX);
+                if n > room {
+                    stream.feed(&chunk[..room]);
+                    stream.unread = true;
+                    eprintln!(
+                        "virtkit: warning: {} holds more than {} — reading no further",
+                        path.display(),
+                        crate::usage::fmt_bytes(max)
+                    );
+                    break;
+                }
+                read += n as u64;
+                stream.feed(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if compressed && read > 0 => {
+                eprintln!(
+                    "virtkit: warning: {} stops decoding after {} ({e}) — reading the samples \
+                     before it",
+                    path.display(),
+                    crate::usage::fmt_bytes(read)
+                );
+                break;
+            }
+            Err(e) => return Err(e).with_context(reading),
+        }
     }
-    if bytes.len() as u64 > cap {
-        // Said out loud rather than silently reading a fraction of the job: anything totalled
-        // over what comes back would cover only the part that was read.
+    let parsed = stream.finish();
+    // Said out loud rather than silently reading a part of the job: anything totalled over
+    // what comes back covers only that part.
+    if parsed.evicted > 0 {
         eprintln!(
-            "virtkit: warning: {} holds more than {} — reading its first {}",
+            "virtkit: warning: {} holds more than {} of samples — keeping its last ones, \
+             leaving out the first {}",
             path.display(),
-            crate::usage::fmt_bytes(cap),
-            crate::usage::fmt_bytes(cap)
+            crate::usage::fmt_bytes(limits.keep),
+            crate::usage::fmt_bytes(parsed.evicted)
         );
-        bytes.truncate(usize::try_from(cap).unwrap_or(usize::MAX));
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    if parsed.oversized > 0 {
+        eprintln!(
+            "virtkit: warning: {} holds samples over {}, the most one may span — leaving out \
+             {} of them",
+            path.display(),
+            crate::usage::fmt_bytes(limits.keep),
+            crate::usage::fmt_bytes(parsed.oversized)
+        );
+    }
+    Ok(parsed)
+}
+
+/// A log parsed as its bytes arrive, holding the newest samples that fit in `keep` bytes of
+/// text and handing the older ones to `evicted`. A line, or a sample, longer than `keep` is
+/// dropped whole rather than held.
+struct Stream<'a> {
+    parser: Parser,
+    keep: u64,
+    evicted: &'a mut dyn FnMut(Sample),
+    /// The line being assembled, and whether it has outgrown `keep` and is being dropped.
+    line: Vec<u8>,
+    overlong: bool,
+    /// Bytes fed so far, and where the sample being read began (just past the last `SEP`).
+    at: u64,
+    sample_start: u64,
+    /// The sample being read has outgrown `keep`: its records are skipped until its `SEP`.
+    abandoned: bool,
+    /// The samples kept, each with the bytes of text it spans, and their sum.
+    kept: std::collections::VecDeque<(Sample, u64)>,
+    kept_bytes: u64,
+    consumed: u64,
+    /// Bytes of the samples let go of at the front, and of those too long to hold.
+    evicted_bytes: u64,
+    oversized: u64,
+    /// The read stopped at [`MAX_READ`].
+    unread: bool,
+}
+
+impl<'a> Stream<'a> {
+    fn new(keep: u64, evicted: &'a mut dyn FnMut(Sample)) -> Stream<'a> {
+        Stream {
+            parser: Parser::default(),
+            keep,
+            evicted,
+            line: Vec::new(),
+            overlong: false,
+            at: 0,
+            sample_start: 0,
+            abandoned: false,
+            kept: Default::default(),
+            kept_bytes: 0,
+            consumed: 0,
+            evicted_bytes: 0,
+            oversized: 0,
+            unread: false,
+        }
+    }
+
+    fn feed(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let (piece, rest, ends) = match bytes.iter().position(|b| *b == b'\n') {
+                Some(nl) => (&bytes[..=nl], &bytes[nl + 1..], true),
+                None => (bytes, &[][..], false),
+            };
+            bytes = rest;
+            if !self.overlong && (self.line.len() + piece.len()) as u64 > self.keep {
+                self.overlong = true;
+                self.at += self.line.len() as u64;
+                self.line = Vec::new();
+            }
+            match self.overlong {
+                true => self.at += piece.len() as u64,
+                false => self.line.extend_from_slice(piece),
+            }
+            if ends {
+                self.end_line();
+            }
+        }
+    }
+
+    /// The line assembled so far is whole (or is the log's torn last one).
+    fn end_line(&mut self) {
+        if std::mem::take(&mut self.overlong) {
+            self.parser.dropped = self.parser.dropped.saturating_add(1);
+            self.line.clear();
+            self.check_size();
+            return;
+        }
+        let mut line = std::mem::take(&mut self.line);
+        self.at += line.len() as u64;
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end_matches(['\n', '\r']);
+        if text == atop::SEP {
+            let sample = self.parser.sep();
+            // With the SEP line itself: a sample whose records fit but whose SEP does not is
+            // still too long to hold.
+            let span = self.at - self.sample_start;
+            match (
+                std::mem::take(&mut self.abandoned) || span > self.keep,
+                sample,
+            ) {
+                (true, _) => self.oversized += span,
+                (false, Some(sample)) => self.keep_sample(sample, span),
+                (false, None) => {}
+            }
+            self.consumed = self.at;
+            self.sample_start = self.at;
+        } else if !self.abandoned || text == atop::RESET {
+            // A `RESET` is honoured even in a sample given up on: the wait channels recorded
+            // before it no longer stand. The boot sample it announces is the one given up on.
+            self.parser.record(text);
+            self.check_size();
+        }
+        line.clear();
+        self.line = line;
+    }
+
+    /// Give up on a sample that has outgrown `keep`, rather than build it.
+    fn check_size(&mut self) {
+        if !self.abandoned && self.at - self.sample_start > self.keep {
+            self.parser.abandon();
+            self.abandoned = true;
+        }
+    }
+
+    fn keep_sample(&mut self, sample: Sample, span: u64) {
+        self.kept.push_back((sample, span));
+        self.kept_bytes += span;
+        while self.kept_bytes > self.keep {
+            let Some((old, span)) = self.kept.pop_front() else {
+                break;
+            };
+            self.kept_bytes -= span;
+            self.evicted_bytes += span;
+            (self.evicted)(old);
+        }
+    }
+
+    fn finish(mut self) -> Parsed {
+        if !self.line.is_empty() || self.overlong {
+            self.end_line();
+        }
+        if self.abandoned {
+            self.oversized += self.at - self.sample_start;
+        }
+        let mut samples = Vec::with_capacity(self.kept.len());
+        samples.extend(self.kept.into_iter().map(|(s, _)| s));
+        Parsed {
+            samples,
+            consumed: usize::try_from(self.consumed).unwrap_or(usize::MAX),
+            len: usize::try_from(self.at).unwrap_or(usize::MAX),
+            dropped: self.parser.dropped,
+            evicted: self.evicted_bytes,
+            oversized: self.oversized,
+            unread: self.unread,
+        }
+    }
+}
+
+/// Where a follower of a plain log starts, and whether that is a sample boundary: the first
+/// boundary at or after `len − keep`, or — where the tail closes no sample — the last bytes a
+/// [`SEP_LINE`] still to come may begin with, for the follower to resynchronise from as the
+/// log grows ([`after_first_sep`]).
+pub(crate) fn tail_start(file: &std::fs::File, keep: u64) -> std::io::Result<(u64, bool)> {
+    tail_start_by(file, keep, 64 * 1024)
+}
+
+fn tail_start_by(file: &std::fs::File, keep: u64, chunk: usize) -> std::io::Result<(u64, bool)> {
+    use std::os::unix::fs::FileExt;
+    let len = file.metadata()?.len();
+    if len <= keep {
+        return Ok((0, true));
+    }
+    // From a pattern's length before the cut, so a `SEP` line ending exactly at the cut — or
+    // one the cut lands in — is found; no match can end before the cut.
+    let mut at = (len - keep).saturating_sub(SEP_LINE.len() as u64);
+    let mut buf = vec![0u8; chunk.max(SEP_LINE.len())];
+    loop {
+        let n = file.read_at(&mut buf, at)?;
+        if let Some(end) = after_first_sep(&buf[..n]) {
+            return Ok((at + end as u64, true));
+        }
+        if n < SEP_LINE.len() {
+            return Ok((len.saturating_sub(SEP_LINE.len() as u64 - 1), false));
+        }
+        // Overlapping by all but one byte of the pattern, so one that straddles two reads is
+        // still found.
+        at += (n - (SEP_LINE.len() - 1)) as u64;
+    }
+}
+
+/// One past the first [`SEP_LINE`] in `bytes`.
+pub(crate) fn after_first_sep(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(SEP_LINE.len())
+        .position(|w| w == SEP_LINE)
+        .map(|at| at + SEP_LINE.len())
 }
 
 /// Whether `file` is a zstd recording, from its first bytes. Read at an offset, so the
@@ -137,17 +422,26 @@ pub fn open_log(path: &Path) -> Result<(std::fs::File, u64)> {
 /// Every complete sample of a log, and how far into the text they reach.
 pub struct Parsed {
     pub samples: Vec<Sample>,
-    /// Bytes of the *decoded text* up to and including the last `SEP` — the end of the last
-    /// complete sample. Not a file offset: a log holding a byte that is not text is decoded
-    /// lossily, and each such byte widens to three.
+    /// Bytes up to and including the last `SEP` — the end of the last complete sample — of
+    /// what this was parsed from: the text [`parse`] was given, or the (decompressed) log
+    /// [`read`] streamed. Not an offset into a file [`parse`] read lossily: each byte that is
+    /// not text widens to three.
     pub consumed: usize,
-    /// How much decoded text this was parsed from, so "is there an unfinished sample after
-    /// the last complete one" is a question `Parsed` can answer by itself.
+    /// How much this was parsed from, so "is there an unfinished sample after the last
+    /// complete one" is a question `Parsed` can answer by itself.
     pub len: usize,
     /// Records dropped for not carrying their label's fields: a torn tail, a command line
     /// this format cannot represent unambiguously, a record a guest mangled, or one whose
     /// label carries a different number of fields than this schema pins.
     pub dropped: usize,
+    /// Bytes of the samples [`read`] let go of at the front of a log whose samples span more
+    /// than [`MAX_LOG`]: every figure over `samples` covers only what followed them.
+    pub evicted: u64,
+    /// Bytes of the samples [`read`] left out anywhere for spanning more than [`MAX_LOG`] each.
+    pub oversized: u64,
+    /// [`read`] stopped at [`MAX_READ`]: nothing after that point is in `samples`, or in what
+    /// was handed over as evicted.
+    pub unread: bool,
 }
 
 impl Parsed {
@@ -392,15 +686,27 @@ pub struct Proc {
     /// histogram only when it changes. `None` for a single-threaded process (whose wait
     /// channel is in PRC) or a log without these records.
     ///
-    /// Carried across samples within one [`parse`]. A reader parsing pieces of a log, such
+    /// Carried across samples within one parse or read. A reader parsing pieces of a log, such
     /// as a follower, sees it only from the first record in each piece.
-    pub wchans: Option<BTreeMap<String, u32>>,
+    ///
+    /// Shared, not copied, from sample to sample: the histogram's size is the guest's to choose,
+    /// and a copy in every later sample would multiply it by the length of the log.
+    #[serde(serialize_with = "shared_wchans")]
+    pub wchans: Option<Wchans>,
     /// When `wchans` was recorded (seconds since the epoch): it has stood unchanged since.
     pub wchans_since: Option<i64>,
     /// The kernel stack of each thread, in the one sample carrying the dump the guest writes
     /// once for a process it finds stalled (see `vk_core::atop::Stall`); empty in every
     /// other. A snapshot of that moment, not the process's current state.
     pub stacks: Vec<Stack>,
+}
+
+/// A process's threads by wait channel, shared by every sample it stands for.
+pub type Wchans = Arc<BTreeMap<String, u32>>;
+
+/// [`Proc::wchans`] as the map it shares.
+fn shared_wchans<S: serde::Serializer>(wchans: &Option<Wchans>, out: S) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(&wchans.as_deref(), out)
 }
 
 /// One thread's kernel stack.
@@ -470,53 +776,77 @@ impl ExitedUnknown {
 
 /// Parse every complete sample in `text`.
 pub fn parse(text: &str) -> Parsed {
-    let mut out = Parsed {
-        samples: Vec::new(),
-        consumed: 0,
-        len: text.len(),
-        dropped: 0,
-    };
-    let mut cur = Builder::default();
-    let mut at = 0usize;
+    let mut parser = Parser::default();
+    let (mut samples, mut consumed, mut at) = (Vec::new(), 0usize, 0usize);
     for line in text.split_inclusive('\n') {
         at = at.saturating_add(line.len());
         let line = line.trim_end_matches(['\n', '\r']);
-        // A sample is only complete at its SEP, and only a whole line is a record: a
-        // truncated tail (no newline) never reaches either.
         if line == atop::SEP {
-            if let Some(sample) = cur.finish() {
-                out.samples.push(sample);
-            }
-            out.consumed = at;
-            continue;
+            samples.extend(parser.sep());
+            consumed = at;
+        } else {
+            parser.record(line);
         }
+    }
+    Parsed {
+        samples,
+        consumed,
+        len: text.len(),
+        dropped: parser.dropped,
+        evicted: 0,
+        oversized: 0,
+        unread: false,
+    }
+}
+
+/// Samples assembled a line at a time — the one state [`parse`] and a [`Stream`] both build on,
+/// so a log reads the same whichever reads it.
+#[derive(Default)]
+struct Parser {
+    cur: Builder,
+    dropped: usize,
+}
+
+impl Parser {
+    /// A `SEP` line: the sample it closes, if it closes one. A sample is only complete at its
+    /// `SEP`.
+    fn sep(&mut self) -> Option<Sample> {
+        self.cur.finish()
+    }
+
+    /// Any other line, without its line ending.
+    fn record(&mut self, line: &str) {
         if line == atop::RESET {
-            cur.boot = true;
+            self.cur.boot = true;
             // The guest writes every process's wait channels afresh after one.
-            cur.known.clear();
-            continue;
+            self.cur.known.clear();
+            return;
         }
         if line.is_empty() {
-            continue;
+            return;
         }
         let cells = atop::cells(line);
         // virtkit's own labels, whose arity is their own to check.
         if cells.first() == Some(&atop::WCHANS) || cells.first() == Some(&atop::STACK) {
-            if !cur.task_record(&cells) {
-                out.dropped = out.dropped.saturating_add(1);
+            if !self.cur.task_record(&cells) {
+                self.dropped = self.dropped.saturating_add(1);
             }
-            continue;
+            return;
         }
         let Some(label) = atop::label_of(&cells) else {
-            continue; // a label this version does not read is not an error
+            return; // a label this version does not read is not an error
         };
         if cells.len() != label.arity() {
-            out.dropped = out.dropped.saturating_add(1);
-            continue;
+            self.dropped = self.dropped.saturating_add(1);
+            return;
         }
-        cur.record(&Record { label, cells });
+        self.cur.record(&Record { label, cells });
     }
-    out
+
+    /// Drop the sample being built, keeping what carries across samples.
+    fn abandon(&mut self) {
+        self.cur.discard();
+    }
 }
 
 /// Write every sample as one JSON object per line, which is what a pipeline reads: `jq` and
@@ -621,7 +951,7 @@ struct Builder {
     /// histogram holds one entry per distinct channel, a handful, so a copy per sample costs
     /// about what the command line beside it does. Stacks are not carried: they are the
     /// largest record in a log, and stay in the one sample that holds them.
-    known: HashMap<(i32, i64), (BTreeMap<String, u32>, i64)>,
+    known: HashMap<(i32, i64), (Wchans, i64)>,
 }
 
 impl Builder {
@@ -648,6 +978,19 @@ impl Builder {
         Some(sample)
     }
 
+    /// Drop the sample being built — its records, wait channels and stacks — and leave what
+    /// carries across samples as it was.
+    fn discard(&mut self) {
+        self.sample = Sample::default();
+        self.procs.clear();
+        self.exited_unknown = ExitedUnknown::default();
+        self.wchans.clear();
+        self.stacks.clear();
+        self.boot = false;
+        self.any = false;
+        self.generic = false;
+    }
+
     /// Attach each process's last recorded wait channels and this sample's stacks. Carry
     /// the wait channels into the next sample, forgetting processes that are gone or now
     /// single-threaded.
@@ -662,11 +1005,11 @@ impl Builder {
             }
             p.stacks = stacks.remove(&p.pid).unwrap_or_default();
             let recorded = match wchans.remove(&p.pid) {
-                Some(w) => Some((w, sample.epoch)),
+                Some(w) => Some((Arc::new(w), sample.epoch)),
                 None => self.known.remove(&key),
             };
             if let Some((w, since)) = recorded {
-                p.wchans = Some(w.clone());
+                p.wchans = Some(Arc::clone(&w));
                 p.wchans_since = Some(since);
                 known.insert(key, (w, since));
             }
@@ -1343,8 +1686,8 @@ SEP
         assert_eq!(p.samples.len(), 1);
         let ruff = &p.samples[0].procs[0];
         assert_eq!(
-            ruff.wchans,
-            Some(BTreeMap::from([
+            ruff.wchans.as_deref(),
+            Some(&BTreeMap::from([
                 ("futex_do_wait".to_string(), 1),
                 ("hrtimer_nanosleep".to_string(), 8),
             ]))
@@ -1385,13 +1728,37 @@ SEP
         assert!(p.samples[0].cpu.is_some());
     }
 
-    /// A compressed recording reads back as the text it was made from, told apart by its
-    /// content rather than its name; a file too short to hold the magic is plain.
-    #[test]
-    fn a_compressed_log_reads_back_as_its_text() {
-        let dir = std::env::temp_dir().join(format!("vk-atoplog-zst-{}", std::process::id()));
+    fn json(samples: &[Sample]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_json(samples, &mut out).unwrap();
+        out
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("vk-atoplog-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `text` written plain and compressed, for a test that reads each the same way.
+    fn both(dir: &Path, text: &str) -> [std::path::PathBuf; 2] {
+        let plain = dir.join("atop.log");
+        std::fs::write(&plain, text).unwrap();
+        let packed = dir.join("atop.log.zst");
+        std::fs::write(&packed, zstd::encode_all(text.as_bytes(), 9).unwrap()).unwrap();
+        [plain, packed]
+    }
+
+    fn read_with(path: &Path, limits: Limits, evicted: &mut dyn FnMut(Sample)) -> Parsed {
+        read_from(path, open_log(path).unwrap().0, limits, evicted).unwrap()
+    }
+
+    /// A compressed recording reads back as the samples of the text it was made from, told
+    /// apart by its content rather than its name; a file too short to hold the magic is plain.
+    #[test]
+    fn a_compressed_log_reads_back_as_its_samples() {
+        let dir = scratch("zst");
         let text = synthetic_log(50);
         let named_anything = dir.join("copy");
         std::fs::write(
@@ -1399,10 +1766,16 @@ SEP
             zstd::encode_all(text.as_bytes(), 9).unwrap(),
         )
         .unwrap();
-        assert_eq!(read(&named_anything).unwrap(), text);
+        let got = read(&named_anything).unwrap();
+        assert_eq!(json(&got.samples), json(&parse(&text).samples));
+        assert_eq!(
+            (got.len, got.consumed, got.evicted + got.oversized),
+            (text.len(), text.len(), 0)
+        );
         let short = dir.join("short");
         std::fs::write(&short, b"SE").unwrap();
-        assert_eq!(read(&short).unwrap(), "SE");
+        let got = read(&short).unwrap();
+        assert!(got.samples.is_empty() && got.ends_mid_sample());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1410,16 +1783,14 @@ SEP
     /// before the cut, never a panic and never an error that loses them all.
     #[test]
     fn a_truncated_compressed_log_yields_the_samples_before_the_cut() {
-        let dir = std::env::temp_dir().join(format!("vk-atoplog-cut-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("cut");
         let text = synthetic_log(20_000);
         let whole = parse(&text).samples;
         let packed = zstd::encode_all(text.as_bytes(), 9).unwrap();
         let path = dir.join("atop.log.zst");
         std::fs::write(&path, &packed[..packed.len() / 2]).unwrap();
 
-        let got = parse(&read(&path).expect("the part before the cut")).samples;
+        let got = read(&path).expect("the part before the cut").samples;
         assert!(!got.is_empty() && got.len() < whole.len(), "{}", got.len());
         assert!(
             got.iter().zip(&whole).all(|(a, b)| a.epoch == b.epoch),
@@ -1432,22 +1803,44 @@ SEP
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A frame that expands without limit is read only as far as the cap; one asking for a
+    /// A frame that expands without limit is decoded only as far as the bound, and held no
+    /// larger than `keep`; one that decodes to exactly the bound is not cut; one asking for a
     /// window past [`WINDOW_LOG_MAX`] is refused before anything is allocated for it.
     #[test]
     fn decompression_is_bounded() {
-        let dir = std::env::temp_dir().join(format!("vk-atoplog-bomb-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("bomb");
         let bomb = dir.join("bomb");
         std::fs::write(
             &bomb,
             zstd::encode_all(&vec![b'x'; 8 << 20][..], 19).unwrap(),
         )
         .unwrap();
-        let cap = 64 * 1024;
-        let text = read_from(&bomb, open_log(&bomb).unwrap().0, cap).unwrap();
-        assert_eq!(text.len() as u64, cap, "read to the cap and no further");
+        let limits = Limits {
+            keep: 64 * 1024,
+            max_read: 1024 * 1024,
+            chunk: CHUNK,
+        };
+        let got = read_with(&bomb, limits, &mut |_| {});
+        assert!(got.samples.is_empty());
+        assert_eq!(
+            got.len as u64, limits.max_read,
+            "decoded to the bound, no further"
+        );
+        assert_eq!(got.oversized, limits.max_read, "a line too long to hold");
+        assert!(got.unread);
+
+        let text = synthetic_log(50);
+        let [_, packed] = both(&dir, &text);
+        let exact = Limits {
+            max_read: text.len() as u64,
+            ..Limits::DEFAULT
+        };
+        let got = read_with(&packed, exact, &mut |_| {});
+        assert_eq!(
+            (got.samples.len(), got.evicted + got.oversized),
+            (50, 0),
+            "exactly the bound is whole"
+        );
 
         let wide = dir.join("wide");
         let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
@@ -1455,6 +1848,284 @@ SEP
         std::io::Write::write_all(&mut enc, b"SEP\n").unwrap();
         std::fs::write(&wide, enc.finish().unwrap()).unwrap();
         assert!(read(&wide).is_err(), "a window past the limit");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The bytes of text each sample of `text` spans: from just past the previous `SEP` to
+    /// the end of its own.
+    fn spans(text: &str) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut from = 0;
+        for (at, _) in text.match_indices("SEP\n") {
+            out.push((at + 4 - from) as u64);
+            from = at + 4;
+        }
+        out
+    }
+
+    /// A log whose samples span more than `keep` keeps the newest that fit, whole — plain or
+    /// compressed, however the reads split its lines — hands the older ones over in order,
+    /// and does not take the first one kept for the boot sample the log started with.
+    #[test]
+    fn an_oversized_log_keeps_its_newest_samples_whole() {
+        let dir = scratch("tail");
+        let text = synthetic_log(500);
+        let whole = parse(&text).samples;
+        assert!(whole[0].boot);
+        let spans = spans(&text);
+        for keep in [16 * 1024, 16 * 1024 + 1, spans[499] + spans[498]] {
+            // The newest samples whose spans fit.
+            let mut fit = 0;
+            let mut sum = 0;
+            while fit < spans.len() && sum + spans[spans.len() - 1 - fit] <= keep {
+                sum += spans[spans.len() - 1 - fit];
+                fit += 1;
+            }
+            for chunk in [7, 4096, CHUNK] {
+                for path in both(&dir, &text) {
+                    let limits = Limits {
+                        keep,
+                        max_read: u64::MAX,
+                        chunk,
+                    };
+                    let mut evicted = Vec::new();
+                    let got = read_with(&path, limits, &mut |s| evicted.push(s.epoch));
+                    let tail = &whole[whole.len() - fit..];
+                    assert_eq!(json(&got.samples), json(tail), "{keep} {chunk} {path:?}");
+                    assert_eq!(got.evicted, text.len() as u64 - sum);
+                    assert!(
+                        !got.samples[0].boot,
+                        "the first kept sample is not the boot's"
+                    );
+                    let front: Vec<i64> =
+                        whole[..whole.len() - fit].iter().map(|s| s.epoch).collect();
+                    assert_eq!(evicted, front, "the rest, handed over in order");
+                }
+            }
+        }
+        // A log that fits is read whole, boot sample and all.
+        let got = read_with(&dir.join("atop.log"), Limits::DEFAULT, &mut |_| {});
+        assert_eq!((got.samples.len(), got.evicted), (500, 0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A sample longer than `keep` is dropped whole, and the samples either side of it still
+    /// read; a log holding nothing but such a sample has no sample to read, and says what it
+    /// left out rather than passing for an empty log.
+    #[test]
+    fn a_sample_too_long_to_hold_is_left_out_whole() {
+        let dir = scratch("huge");
+        let text = synthetic_log(3);
+        let seps: Vec<usize> = text.match_indices("SEP\n").map(|(at, _)| at + 4).collect();
+        let filler = format!(
+            "CPU runner 1015 1970/01/01 00:16:55 10 100 2 {} 3\n",
+            "9".repeat(3000)
+        )
+        .repeat(4);
+        let huge = format!("{}{filler}SEP\n{}", &text[..seps[1]], &text[seps[1]..]);
+        let limits = Limits {
+            keep: 8 * 1024,
+            max_read: u64::MAX,
+            chunk: 1000,
+        };
+        for path in both(&dir, &huge) {
+            let got = read_with(&path, limits, &mut |_| {});
+            let epochs: Vec<i64> = got.samples.iter().map(|s| s.epoch).collect();
+            assert_eq!(epochs, [1000, 1010, 1020], "{path:?}");
+            assert_eq!(got.oversized, (filler.len() + 4) as u64);
+        }
+        for path in both(&dir, &format!("{filler}SEP\n")) {
+            let got = read_with(&path, limits, &mut |_| {});
+            assert!(got.samples.is_empty());
+            assert!(got.oversized > 0, "{path:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ruff's sample at `epoch`, preceded by `before`.
+    fn ruff_sample(epoch: i64, before: &str, extra: &str) -> String {
+        format!("{before}{}", threaded_sample(epoch, extra, true))
+    }
+
+    /// A `RESET` inside a sample given up on still forgets the wait channels before it, and
+    /// the sample after is not taken for the boot sample it announced.
+    #[test]
+    fn a_reset_in_an_abandoned_sample_still_forgets_the_wait_channels() {
+        let dir = scratch("abandonedreset");
+        let text = [
+            threaded_sample(1_000, "{PRW} 412 (ruff) futex_do_wait:9\n", true),
+            // Torn: the guest restarted its sampler mid-write, and the two run together past
+            // what a sample may span.
+            threaded_sample(1_010, &"filler\n".repeat(400), false),
+            "RESET\n".to_string(),
+            threaded_sample(1_020, "", true),
+            threaded_sample(1_030, "", true),
+        ]
+        .concat();
+        let limits = Limits {
+            keep: 2048,
+            max_read: u64::MAX,
+            chunk: 256,
+        };
+        for path in both(&dir, &text) {
+            let got = read_with(&path, limits, &mut |_| {});
+            let epochs: Vec<i64> = got.samples.iter().map(|s| s.epoch).collect();
+            assert_eq!(epochs, [1_000, 1_030], "{path:?}");
+            assert!(got.samples[0].procs[0].wchans.is_some());
+            assert!(!got.samples[1].boot, "{path:?}");
+            assert_eq!(got.samples[1].procs[0].wchans, None, "{path:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A line too long to hold, in the middle of a log, costs its own sample and nothing else:
+    /// the samples after it read, the wait channels recorded before it still carry through it
+    /// — ruff's records come after the long line, in the sample that is dropped — and what was
+    /// left out is counted as oversized, not as a front let go of.
+    #[test]
+    fn an_overlong_line_mid_log_costs_only_its_sample() {
+        let dir = scratch("overlong");
+        let long = format!("{}\n", "x".repeat(9000));
+        let text = [
+            ruff_sample(
+                1_000,
+                "",
+                "{PRW} 412 (ruff) futex_do_wait:1 hrtimer_nanosleep:8\n",
+            ),
+            ruff_sample(1_010, &long, ""),
+            ruff_sample(1_020, "", ""),
+        ]
+        .concat();
+        let limits = Limits {
+            keep: 8 * 1024,
+            max_read: u64::MAX,
+            chunk: 1000,
+        };
+        for path in both(&dir, &text) {
+            let got = read_with(&path, limits, &mut |_| {});
+            let epochs: Vec<i64> = got.samples.iter().map(|s| s.epoch).collect();
+            assert_eq!(epochs, [1_000, 1_020], "{path:?}");
+            let last = &got.samples[1].procs[0];
+            assert_eq!(
+                last.wchans, got.samples[0].procs[0].wchans,
+                "carried through"
+            );
+            assert_eq!(last.wchans_since, Some(1_000));
+            assert_eq!(got.evicted, 0);
+            let dropped = ruff_sample(1_010, &long, "").len() as u64;
+            assert_eq!(got.oversized, dropped);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A sample whose records fit in `keep` but whose `SEP` line does not is too long to hold
+    /// like any other, and is counted as such — not kept, and not let go of as the front.
+    #[test]
+    fn a_sample_over_keep_only_by_its_sep_is_left_out() {
+        let dir = scratch("sepedge");
+        let big = ruff_sample(
+            1_000,
+            "",
+            "{PRW} 412 (ruff) futex_do_wait:1 hrtimer_nanosleep:8\n",
+        );
+        let small = ruff_sample(1_010, "", "");
+        let text = format!("{big}{small}");
+        for keep in [big.len() - 1, big.len() - 2, big.len() - 4] {
+            let limits = Limits {
+                keep: keep as u64,
+                max_read: u64::MAX,
+                chunk: 64,
+            };
+            for path in both(&dir, &text) {
+                let got = read_with(&path, limits, &mut |_| {});
+                let epochs: Vec<i64> = got.samples.iter().map(|s| s.epoch).collect();
+                assert_eq!(epochs, [1_010], "{keep} {path:?}");
+                assert_eq!((got.evicted, got.oversized), (0, big.len() as u64));
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A read stops at its bound, plain or compressed, keeping the samples before it and
+    /// saying it stopped.
+    #[test]
+    fn a_read_stops_at_its_bound() {
+        let dir = scratch("readbound");
+        let text = synthetic_log(50);
+        let limits = Limits {
+            max_read: (text.len() / 2) as u64,
+            ..Limits::DEFAULT
+        };
+        let whole = parse(&text).samples;
+        for path in both(&dir, &text) {
+            let got = read_with(&path, limits, &mut |_| {});
+            assert!(got.unread, "{path:?}");
+            assert_eq!(got.len as u64, limits.max_read);
+            assert!(!got.samples.is_empty() && got.samples.len() < whole.len());
+            assert_eq!(json(&got.samples), json(&whole[..got.samples.len()]));
+        }
+        let got = read_with(&dir.join("atop.log"), Limits::DEFAULT, &mut |_| {});
+        assert!(!got.unread);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Where a follower starts in a log too large to read whole: past the first `SEP` line in
+    /// its last `keep` bytes — found when the line straddles two reads, when the cut lands on
+    /// the newline before it, on its `S`, inside it, or just past it — or, with none there, the
+    /// last bytes a `SEP` line still to come may begin with, marked as not a boundary.
+    #[test]
+    fn a_follower_starts_on_the_first_boundary_past_the_cut() {
+        let dir = scratch("start");
+        let text = synthetic_log(40);
+        let path = dir.join("atop.log");
+        std::fs::write(&path, &text).unwrap();
+        let file = open_log(&path).unwrap().0;
+        let len = text.len() as u64;
+        let ends: Vec<u64> = text
+            .match_indices("\nSEP\n")
+            .map(|(at, _)| (at + 5) as u64)
+            .collect();
+        let sep = ends[30] - 4; // the `S` of a SEP line
+        assert_eq!(
+            tail_start_by(&file, len, 8).unwrap(),
+            (0, true),
+            "a log that fits"
+        );
+        for chunk in [5, 8, 13, 64 * 1024] {
+            for (cut, want) in [
+                (sep - 1, ends[30]),
+                (sep, ends[30]),
+                (sep + 1, ends[30]),
+                (sep + 2, ends[30]),
+                (sep + 3, ends[30]),
+                (sep + 4, ends[30]),
+                (sep + 5, ends[31]),
+            ] {
+                let got = tail_start_by(&file, len - cut, chunk).unwrap();
+                assert_eq!(got, (want, true), "cut at {cut}, reading {chunk} at a time");
+            }
+            // The last SEP line ends the file: that is a boundary, with nothing after it yet.
+            assert_eq!(tail_start_by(&file, 3, chunk).unwrap(), (len, true));
+        }
+        // Past the last SEP line, mid-sample: no boundary to start on.
+        let torn = format!("{text}CPU runner 1400 1970/01/01 00:23:20 10 100 2");
+        std::fs::write(&path, &torn).unwrap();
+        let file = open_log(&path).unwrap().0;
+        let len = torn.len() as u64;
+        assert_eq!(tail_start_by(&file, 20, 8).unwrap(), (len - 4, false));
+        // Torn inside a SEP line: the follower starts early enough to see the whole of it
+        // once the rest arrives.
+        let torn = format!("{torn}\nSE");
+        std::fs::write(&path, &torn).unwrap();
+        let file = open_log(&path).unwrap().0;
+        let len = torn.len() as u64;
+        let (start, boundary) = tail_start_by(&file, 20, 8).unwrap();
+        assert!(!boundary);
+        let grown = format!("{torn}P\n");
+        assert_eq!(
+            after_first_sep(&grown.as_bytes()[start as usize..]).map(|at| start + at as u64),
+            Some(len + 2)
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

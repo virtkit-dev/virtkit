@@ -4517,9 +4517,8 @@ fn read_recording(path: &Path, named: Option<&str>, read: ReadAs) -> ExitCode {
             Err(e) => fail(&e, 1),
         },
         ReadAs::Json => match atoplog::read(path) {
-            Ok(text) => {
+            Ok(parsed) => {
                 use std::io::Write;
-                let parsed = atoplog::parse(&text);
                 // On stderr, never on stdout: stdout is the JSON stream, and a
                 // pipeline must not total a log that lost records as a whole one.
                 if parsed.dropped > 0 {

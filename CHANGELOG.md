@@ -41,6 +41,13 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`vk atop` keeps the end of a very long recording, not its start.** A job log over
+  256 MiB used to be read only up to that size, which left out exactly the hang. Now its
+  newest 256 MiB of samples are kept: `--summary` and the job's trace account say that their
+  figures cover only those, `--json` streams the same samples, and `--view --follow` starts
+  at the log's last 256 MiB of samples, where a process's wait channels read as unknown until
+  the guest next records them. Stalled processes are still judged over the whole log, so a
+  hang that began earlier is reported.
 - **Restricted egress no longer forwards reverse (PTR) or malformed DNS queries to the
   host's resolver.** Under an egress allowlist, a reverse lookup is held to `allow_name`
   like any other name and resolves to `NXDOMAIN` outside it, and a query the gateway

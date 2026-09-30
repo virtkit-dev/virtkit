@@ -1042,10 +1042,16 @@ mod tests {
         log
     }
 
-    fn as_json(path: &Path) -> Vec<u8> {
-        let text = crate::atoplog::read(path).unwrap();
+    fn json_of(text: &str) -> Vec<u8> {
         let mut out = Vec::new();
-        crate::atoplog::write_json(&crate::atoplog::parse(&text).samples, &mut out).unwrap();
+        crate::atoplog::write_json(&crate::atoplog::parse(text).samples, &mut out).unwrap();
+        out
+    }
+
+    fn as_json(path: &Path) -> Vec<u8> {
+        let samples = crate::atoplog::read(path).unwrap().samples;
+        let mut out = Vec::new();
+        crate::atoplog::write_json(&samples, &mut out).unwrap();
         out
     }
 
@@ -1111,7 +1117,7 @@ mod tests {
 
         compress_log(&dir, u64::MAX).unwrap();
         assert_eq!(log_path(&dir), dir.join(LOG_ZST_NAME));
-        assert_eq!(crate::atoplog::read(&log_path(&dir)).unwrap(), text);
+        assert_eq!(as_json(&log_path(&dir)), json_of(&text));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1373,7 +1379,7 @@ mod tests {
         std::fs::write(dir.join(LOG_NAME), &text).unwrap();
         compress_job_log(&ctx);
         assert!(!dir.join(LOG_NAME).exists());
-        assert_eq!(crate::atoplog::read(&dir.join(LOG_ZST_NAME)).unwrap(), text);
+        assert_eq!(as_json(&dir.join(LOG_ZST_NAME)), json_of(&text));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }
