@@ -369,6 +369,12 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // never lapses between the two. After the stale-job teardown above, which frees a
     // predecessor's claim, and before anything is written into the job dir.
     let _reservation = admit(ctx, &mem)?;
+    // What the job is, beside the VM it is about to boot, for a list of the host's VMs to
+    // report. Best-effort, as the VM registry is: a job runs whether or not the host can say
+    // what it is.
+    if let Err(e) = ctx.record(cpus, &mem) {
+        eprintln!("virtkit: warning: could not record the job in its job dir: {e:#}");
+    }
 
     // [executor] atop: give this job somewhere to record what its guest does, and remember
     // where — the supervisor shares that directory into the guest, and the last stage
