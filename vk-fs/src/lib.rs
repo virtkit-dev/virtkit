@@ -16,7 +16,7 @@
 //!   [`dir_admits_only_us`] is the test, and it is the caller's directory that decides.
 //!
 //! [`bind_private`] applies all four to unix sockets; [`write_atomic`] applies the first
-//! three to files. `vk-core` uses it (as [`bind_private_any_length`]) for the agent's exec
+//! three to files (and [`write_atomic_unsynced`] too, without the fsync). `vk-core` uses it (as [`bind_private_any_length`]) for the agent's exec
 //! channel and `vk-registry` for its admin socket; both require the published name to refer
 //! only to a socket already restricted to `0600`.
 //!
@@ -439,13 +439,29 @@ fn open_dir_flags(dir: &Path, extra: libc::c_int) -> Result<OwnedFd, anyhow::Err
 /// costs the rename, not the data. Callers that need the name itself to survive a power cut
 /// want more than this.
 pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<(), anyhow::Error> {
-    write_atomic_from(path, contents, mode, staging_names())
+    write_atomic_from(path, contents, mode, Durability::Synced, staging_names())
+}
+
+/// [`write_atomic`] without the fsync, for a file nothing needs after a crash: a reader still
+/// sees the previous file or the whole new one, but after a power cut the name may hold the
+/// old file, the new one, an empty or partly written one, or nothing — a reader must treat
+/// what it cannot parse as absent.
+pub fn write_atomic_unsynced(path: &Path, contents: &[u8], mode: u32) -> Result<(), anyhow::Error> {
+    write_atomic_from(path, contents, mode, Durability::Unsynced, staging_names())
+}
+
+/// Whether [`write_atomic_from`] fsyncs the staged file before publishing it.
+#[derive(Clone, Copy)]
+enum Durability {
+    Synced,
+    Unsynced,
 }
 
 fn write_atomic_from(
     path: &Path,
     contents: &[u8],
     mode: u32,
+    durability: Durability,
     mut next_name: impl FnMut() -> Result<String, anyhow::Error>,
 ) -> Result<(), anyhow::Error> {
     let Some(final_name) = path.file_name() else {
@@ -477,7 +493,10 @@ fn write_atomic_from(
         // SAFETY: `fd` is a fresh descriptor this call owns.
         let mut staged = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
         let written = std::io::Write::write_all(&mut staged, contents)
-            .and_then(|()| staged.sync_all())
+            .and_then(|()| match durability {
+                Durability::Synced => staged.sync_all(),
+                Durability::Unsynced => Ok(()),
+            })
             .map_err(|e| anyhow!(e).context(format!("writing the staged file for {path:?}")))
             .and_then(|()| {
                 // SAFETY: both descriptors are live and both names are NUL-terminated.
@@ -617,6 +636,13 @@ mod tests {
 
         write_atomic(&path, b"second", 0o600).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"second");
+        // Unsynced, the same file the same way, at the mode asked for this time.
+        write_atomic_unsynced(&path, b"third", 0o640).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"third");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
         let left: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -656,14 +682,14 @@ mod tests {
         std::fs::write(dir.join(".taken"), b"squatter").unwrap();
         let mut names = [".taken", ".free"].into_iter();
         let retry = move || Ok::<_, anyhow::Error>(names.next().unwrap().to_string());
-        write_atomic_from(&path, b"x", 0o600, retry).unwrap();
+        write_atomic_from(&path, b"x", 0o600, Durability::Synced, retry).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"x");
         assert_eq!(std::fs::read(dir.join(".taken")).unwrap(), b"squatter");
 
         // Every candidate taken: no free name, and the squatter is left as it was.
         std::fs::remove_file(&path).unwrap();
         let fixed = || Ok::<_, anyhow::Error>(".taken".to_string());
-        let err = write_atomic_from(&path, b"y", 0o600, fixed).unwrap_err();
+        let err = write_atomic_from(&path, b"y", 0o600, Durability::Synced, fixed).unwrap_err();
         assert!(
             format!("{err:#}").contains("no free staging name"),
             "{err:#}"
@@ -684,7 +710,7 @@ mod tests {
         std::fs::write(target.join("keep"), b"keep").unwrap();
 
         let fixed = || Ok::<_, anyhow::Error>(".stage".to_string());
-        let err = write_atomic_from(&target, b"x", 0o600, fixed).unwrap_err();
+        let err = write_atomic_from(&target, b"x", 0o600, Durability::Synced, fixed).unwrap_err();
         assert!(format!("{err:#}").contains("publishing"), "{err:#}");
         assert!(target.is_dir());
         assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"keep");
