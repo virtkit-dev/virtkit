@@ -51,8 +51,15 @@ rustls.workspace = true
 # feature-unification only (forces oci-client's jsonwebtoken onto rust_crypto, not
 # aws-lc-rs); not referenced in code.
 jsonwebtoken.workspace = true
-# `vk workloads`: the shape of the list it prints, shared with vk-hub, which reads it.
+# `vk workloads` and `vk node`: the shape of the VM list vk-hub reads, the hub↔node wire
+# types, the node's ed25519 identity, and the WebSocket session to the hub — dialed through
+# tokio-rustls (as vk-registry's server uses it, on ring) and verified by the platform
+# verifier (see the workspace Cargo.toml).
 vk-fleet-proto = { path = "../vk-fleet-proto" }
+ring.workspace = true
+tokio-tungstenite.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-platform-verifier.workspace = true
 
 # Bundled vhost-user virtio-fs daemon (the `vk virtiofsd` subcommand) — a default
 # feature, disable with --no-default-features. FUSE requests are served by the

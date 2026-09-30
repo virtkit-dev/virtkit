@@ -2,8 +2,9 @@
 
 Status: proposal, implemented in part and experimental: the list of the VMs a host runs
 (`vk workloads`) and local mode's web UI showing it and acting on it (`vk-hub local`),
-signed into with links it prints; `vk-hub` enrolls nodes and records their inventory and
-heartbeats. Nothing it would steer is built yet.
+signed into with links it prints; enrollment, the node session, inventory and heartbeats
+(`vk-hub serve`, `token create`, `nodes`; `vk node join`, `run`). The hub observes its nodes
+only — nothing it steers is built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -56,7 +57,7 @@ supported through `vk-runnerctl`, as today.
 Enrollment:
 
 ```sh
-vk node join https://hub.example.com --token <enrollment-token>
+vk-hub token create | ssh ci-7 vk node join https://hub.example.com --token -
 ```
 
 generates the node's ed25519 identity, which the hub pins on first contact. The node signs
@@ -123,7 +124,8 @@ Every node reports, keeping hard facts, measured load and operator policy apart:
   inodes, tmpfs or disk, and a speed class the operator declares (`fast`, `slow`);
 - **pressure** — memory available, CPU, memory and I/O PSI, disk latency;
 - **runner** — gitlab-runner version, runner IDs and tags, `concurrent`, jobs preparing,
-  waiting on admission, running, cleaning up;
+  waiting on admission, running, cleaning up. Tags are held by GitLab, not the runner's
+  `config.toml`, so they reach the hub through its GitLab credential;
 - **admission** — memory reserved and budget, disk claimed;
 - **versions** — `vk`, the guest kernel, the effective configuration hash.
 

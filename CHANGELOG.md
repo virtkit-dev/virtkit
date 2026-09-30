@@ -24,6 +24,15 @@ All notable changes to virtkit will be documented in this file.
   have committed against the budget, and the concurrency it wants; `vk-hub nodes remove`
   takes one out of the fleet. The hub only observes for now; it does not steer its hosts
   yet.
+- **Experimental: `vk node join` and `vk node run` make a host a member of a fleet.**
+  `vk node join https://hub --token -` enrolls the host with a `vk-hub` once, reading the
+  token on stdin (or `--token-file`), and refuses while `vk check` fails on KVM, the VMM or
+  the guest kernel; `--ca` pins the hub's CA. `vk node run` then reports the host to the
+  hub — hardware, the job and checkout filesystems, versions, the gitlab-runner
+  configuration, and a heartbeat with admission and free space every few seconds —
+  reconnects on its own whenever the hub is unreachable, and exits once the hub has removed
+  the node. `[node] jobs_speed` and `checkouts_speed` declare how fast those filesystems
+  are.
 
 ### Changed
 
