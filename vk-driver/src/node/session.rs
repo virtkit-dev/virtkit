@@ -84,7 +84,7 @@ enum Ask {
 
 /// What it answers with.
 pub enum Gathered {
-    Inventory(Inventory),
+    Inventory(Box<Inventory>),
     Heartbeat(Heartbeat),
 }
 
@@ -104,7 +104,9 @@ impl Gatherer {
             while let Some(what) = asked.recv().await {
                 let cfg = cfg.clone();
                 let gathered = tokio::task::spawn_blocking(move || match what {
-                    Ask::Inventory => Gathered::Inventory(super::inventory::inventory(&cfg)),
+                    Ask::Inventory => {
+                        Gathered::Inventory(Box::new(super::inventory::inventory(&cfg)))
+                    }
                     Ask::Heartbeat => Gathered::Heartbeat(super::inventory::heartbeat(&cfg)),
                 })
                 .await;
@@ -192,9 +194,9 @@ pub async fn run(
                     send(&mut ws, &NodeMsg::Heartbeat(hb), heartbeat).await?;
                 }
                 Gathered::Inventory(inventory) => {
-                    if sent_inventory.as_ref() != Some(&inventory) {
-                        send(&mut ws, &NodeMsg::Inventory(inventory.clone()), heartbeat).await?;
-                        sent_inventory = Some(inventory);
+                    if sent_inventory.as_ref() != Some(&*inventory) {
+                        send(&mut ws, &NodeMsg::Inventory((*inventory).clone()), heartbeat).await?;
+                        sent_inventory = Some(*inventory);
                     }
                 }
             },

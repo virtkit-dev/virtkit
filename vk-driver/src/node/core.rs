@@ -170,6 +170,7 @@ impl Core {
             concurrency: *lock(&self.concurrency),
             concurrency_error: lock(&self.concurrency_error).clone(),
             drain: *lock(&self.drain),
+            update: None,
         }
     }
 

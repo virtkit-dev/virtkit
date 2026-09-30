@@ -2,7 +2,7 @@
 //! Transport, storage and crypto stay with the sides; this crate is the one place they read
 //! the shapes and the signed payloads from, so they cannot drift apart.
 //!
-//! Three exchanges exist:
+//! Four exchanges exist:
 //!
 //! - **Workloads**: `vk workloads` prints the VMs running on its host for its user as a
 //!   [`WorkloadList`], one JSON document per line; `vk-hub local` reads it. The list's fields
@@ -16,6 +16,10 @@
 //!   and [`HubMsg`] the other. It opens with [`NodeMsg::Hello`] → [`HubMsg::Challenge`] →
 //!   [`NodeMsg::Auth`] → [`HubMsg::Welcome`]; after that the node sends its inventory and
 //!   heartbeats, and the hub may send desired state and commands.
+//! - **A release download**: `GET` [`RELEASE_PATH`]`<sha256>`, which a node makes to fetch the
+//!   `vk` an [`Operation::Update`] names. It carries the node's ID, the time, and the node's
+//!   signature over [`download_message`] in the [`NODE_HEADER`], [`TIME_HEADER`] and
+//!   [`SIGNATURE_HEADER`] headers; the body is the binary.
 //!
 //! **Versioning.** Each side of a session speaks a [`VersionRange`], and the hub picks the
 //! highest version both ranges contain ([`VersionRange::negotiate`]); every message after the
@@ -53,6 +57,23 @@ pub const ENROLL_PATH: &str = "/v1/enroll";
 
 /// Where a node holds its session.
 pub const NODE_PATH: &str = "/v1/node";
+
+/// Where a node downloads a release: this, then the release's sha256 in lowercase hex.
+pub const RELEASE_PATH: &str = "/v1/releases/";
+
+/// A release download's headers: the node's ID, the time it signed at (seconds since the
+/// epoch), and its signature over [`download_message`], hex.
+pub const NODE_HEADER: &str = "vk-node";
+pub const TIME_HEADER: &str = "vk-time";
+pub const SIGNATURE_HEADER: &str = "vk-signature";
+
+/// How far a download's signed time may be from the hub's clock. The signature is bound to
+/// the connection as well, so this bounds only how long a signature made for one connection
+/// could sit before it is used on it.
+pub const DOWNLOAD_SKEW_SECS: u64 = 300;
+
+/// Length of a sha256 digest.
+pub const SHA256_LEN: usize = 32;
 
 /// The [`WorkloadList`] version this build writes and reads.
 pub const WORKLOADS_VERSION: u32 = 1;
@@ -184,11 +205,6 @@ pub fn auth_message(
     version: u32,
     channel: Channel<'_>,
 ) -> Vec<u8> {
-    fn part(m: &mut Vec<u8>, bytes: &[u8]) {
-        let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-        m.extend_from_slice(&len.to_be_bytes());
-        m.extend_from_slice(bytes);
-    }
     let mut m = b"vk-fleet node-auth v1\0".to_vec();
     part(&mut m, challenge);
     part(&mut m, node_id.as_bytes());
@@ -202,14 +218,107 @@ pub fn auth_message(
     ] {
         m.extend_from_slice(&n.to_be_bytes());
     }
+    channel_part(&mut m, channel);
+    m
+}
+
+/// Append `bytes` to `m` behind its length, so no two different inputs encode alike.
+fn part(m: &mut Vec<u8>, bytes: &[u8]) {
+    let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    m.extend_from_slice(&len.to_be_bytes());
+    m.extend_from_slice(bytes);
+}
+
+/// What a node signs to download release `sha256` (hex): its node ID, the release, the time,
+/// and the channel the request arrives on. A signature fetches that one release, on that one
+/// connection, near that time.
+pub fn download_message(node_id: &str, sha256: &str, at: u64, channel: Channel<'_>) -> Vec<u8> {
+    let mut m = b"vk-fleet release-download v1\0".to_vec();
+    part(&mut m, node_id.as_bytes());
+    part(&mut m, sha256.as_bytes());
+    m.extend_from_slice(&at.to_be_bytes());
+    channel_part(&mut m, channel);
+    m
+}
+
+/// What a release key signs: the binary's sha256 and the version it is released as. A
+/// signature vouches for those bytes as that version and for nothing else — not for another
+/// version string a hub might pair them with.
+pub fn release_message(sha256: &[u8], version: &str) -> Vec<u8> {
+    let mut m = b"vk-fleet release v1\0".to_vec();
+    part(&mut m, sha256);
+    part(&mut m, version.as_bytes());
+    m
+}
+
+fn channel_part(m: &mut Vec<u8>, channel: Channel<'_>) {
     match channel {
         Channel::Tls(exported) => {
-            part(&mut m, b"tls-exporter");
-            part(&mut m, exported);
+            part(m, b"tls-exporter");
+            part(m, exported);
         }
-        Channel::Plaintext => part(&mut m, b"plaintext"),
+        Channel::Plaintext => part(m, b"plaintext"),
     }
-    m
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// `bytes` as standard, padded base64 (RFC 4648 §4): how release keys and signatures are
+/// written in configuration and beside a binary.
+pub fn to_base64(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk.first().copied().unwrap_or(0),
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                let index = (n >> (18 - 6 * i)) & 0x3f;
+                out.push(char::from(BASE64[index as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Standard, padded base64 back to bytes; `None` for anything else — a wrong length, a
+/// character outside the alphabet, padding anywhere but the end, or bits the padding says
+/// are not there. Surrounding whitespace is ignored, since the text often comes from a file.
+pub fn from_base64(s: &str) -> Option<Vec<u8>> {
+    fn value(c: u8) -> Option<u32> {
+        BASE64.iter().position(|&b| b == c).map(|v| v as u32)
+    }
+    let s = s.trim().as_bytes();
+    let (quads, rest) = s.as_chunks::<4>();
+    if !rest.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(quads.len() * 3);
+    for (i, quad) in quads.iter().enumerate() {
+        let last = i + 1 == quads.len();
+        let pad = quad.iter().rev().take_while(|&&c| c == b'=').count();
+        if pad > 2 || (pad > 0 && !last) {
+            return None;
+        }
+        let mut n = 0u32;
+        for &c in &quad[..4 - pad] {
+            n = (n << 6) | value(c)?;
+        }
+        n <<= 6 * pad as u32;
+        let bytes = [(n >> 16) as u8, (n >> 8) as u8, n as u8];
+        // Bits below what the padding keeps must be zero: one encoding per input.
+        let keep = 3 - pad;
+        if bytes[keep..].iter().any(|&b| b != 0) {
+            return None;
+        }
+        out.extend_from_slice(&bytes[..keep]);
+    }
+    Some(out)
 }
 
 /// The longest string of a node's that is kept for display.
@@ -420,6 +529,10 @@ pub struct Versions {
     /// A hash of the node's effective configuration, so drift between nodes that should
     /// match shows up.
     pub config_hash: String,
+    /// The sha256 of the running `vk` binary, hex: which release it is, where two builds
+    /// can share a version. `None` when the binary could not be read.
+    #[serde(default)]
+    pub vk_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -482,6 +595,10 @@ pub enum NodeState {
     Ready,
     Draining,
     Drained,
+    /// Drained, and being worked on: an update downloading and switching, a reset clearing.
+    Maintenance,
+    /// Checking itself after maintenance before it goes back to the state it was in.
+    Validating,
     /// Left only by [`Operation::Release`].
     Quarantined,
 }
@@ -519,6 +636,39 @@ pub struct Report {
     pub concurrency_error: Option<String>,
     /// Present while draining: which of the conditions for `drained` hold.
     pub drain: Option<DrainProgress>,
+    /// The update under way, or the last one, with how it ended.
+    #[serde(default)]
+    pub update: Option<UpdateProgress>,
+}
+
+/// How far an [`Operation::Update`] has got.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateProgress {
+    /// The command's ID.
+    pub command: String,
+    pub version: String,
+    pub sha256: String,
+    pub phase: UpdatePhase,
+    /// Why it failed or was rolled back.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdatePhase {
+    /// Waiting for the running jobs to finish.
+    Draining,
+    /// Fetching and checking the release.
+    Downloading,
+    /// Running the new binary on trial, checking it before it is kept.
+    Validating,
+    /// The new binary is installed and the node is back where it was.
+    Done,
+    /// The new binary did not pass its trial; the previous one runs again.
+    RolledBack,
+    /// Given up before the switch; the binary is unchanged.
+    Failed,
 }
 
 /// `effective = min(estimate, hub_ceiling, local_ceiling)`, as the node last worked it out.
@@ -581,8 +731,27 @@ pub enum Operation {
     Quarantine,
     /// Leave a quarantine for [`NodeState::Ready`].
     Release,
+    /// Drain, replace the node's `vk` with release `sha256`, validate it, and return to the
+    /// state the node was in; roll back to the previous binary if it does not pass.
     Update {
+        /// The version the release's `--version` must report.
         version: String,
+        /// The binary's sha256, hex: what it is downloaded by and checked against.
+        sha256: String,
+        /// Its size in bytes; a download longer than this is refused.
+        size: u64,
+        /// A release key's ed25519 signature over [`release_message`], base64.
+        #[serde(default)]
+        signature: Option<String>,
+        /// Update a node whose runner is external, which cannot be drained, while its jobs
+        /// may still be running.
+        #[serde(default)]
+        force: bool,
+        /// How long the update may take once the drain is over: past it, the node rolls the
+        /// release back rather than keep it. A drain still under way at the command's
+        /// `expires_at` calls the update off. `None`: the node's own trial deadline alone.
+        #[serde(default)]
+        within_secs: Option<u64>,
     },
     Reset,
 }
@@ -738,6 +907,7 @@ mod tests {
                 vk: "0.80.0".into(),
                 guest_kernel: Some("6.18.52".into()),
                 config_hash: "ab".repeat(32),
+                vk_sha256: Some("cd".repeat(SHA256_LEN)),
             },
             runner: Some(Runner {
                 config: "/home/ci/.gitlab-runner/config.toml".into(),
@@ -875,6 +1045,13 @@ mod tests {
                     active_jobs: 1,
                 }),
                 concurrency_error: Some("invalid [executor.vm] mem".into()),
+                update: Some(UpdateProgress {
+                    command: id.clone(),
+                    version: "0.81.0".into(),
+                    sha256: "ab".repeat(SHA256_LEN),
+                    phase: UpdatePhase::RolledBack,
+                    message: Some("validation failed".into()),
+                }),
             }),
         ] {
             round_trip(&msg);
@@ -896,6 +1073,11 @@ mod tests {
                 expires_at: 1_800_000_000,
                 op: Operation::Update {
                     version: "0.81.0".into(),
+                    sha256: "ab".repeat(SHA256_LEN),
+                    size: 1 << 26,
+                    signature: Some(to_base64(&[1; SIGNATURE_LEN])),
+                    force: false,
+                    within_secs: Some(1800),
                 },
             }),
             HubMsg::Command(Command {
@@ -1042,6 +1224,53 @@ mod tests {
             auth(&key, "t", "i", r(1, 2), r(1, 2), 2, Channel::Tls(&[1; 32])),
             auth(&key, "t", "i", r(1, 2), r(1, 2), 2, Channel::Tls(&[2; 32])),
         );
+    }
+
+    #[test]
+    fn base64_round_trips_and_rejects_every_other_spelling() {
+        // RFC 4648's test vectors.
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(to_base64(plain.as_bytes()), encoded);
+            assert_eq!(from_base64(encoded).unwrap(), plain.as_bytes());
+        }
+        let bytes: Vec<u8> = (0..=255).collect();
+        assert_eq!(from_base64(&to_base64(&bytes)), Some(bytes));
+        assert_eq!(from_base64(" Zm9v\n"), Some(b"foo".to_vec()));
+        for bad in [
+            "Zg", "Zg=", "Zg===", "Z===", "Zh==", "Zm9=v", "Zg==Zg==", "Zm9-", "Zm 9v",
+        ] {
+            assert_eq!(from_base64(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn release_and_download_payloads_are_labelled_and_bound() {
+        let sha = [7u8; SHA256_LEN];
+        let release = release_message(&sha, "0.81.0");
+        assert!(release.starts_with(b"vk-fleet release v1\0"));
+        assert_ne!(release, release_message(&sha, "0.81.1"));
+        assert_ne!(release, release_message(&[8; SHA256_LEN], "0.81.0"));
+        let hex = to_hex(&sha);
+        let download = |id: &str, at, ch| download_message(id, &hex, at, ch);
+        let base = download("n", 5, Channel::Plaintext);
+        assert!(base.starts_with(b"vk-fleet release-download v1\0"));
+        for other in [
+            download("m", 5, Channel::Plaintext),
+            download("n", 6, Channel::Plaintext),
+            download("n", 5, Channel::Tls(&[1; 32])),
+            download_message("n", &to_hex(&[8; SHA256_LEN]), 5, Channel::Plaintext),
+        ] {
+            assert_ne!(other, base);
+        }
+        assert_ne!(release, base);
     }
 
     #[test]

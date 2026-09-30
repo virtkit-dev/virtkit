@@ -1057,6 +1057,8 @@ pub(crate) fn state_name(state: NodeState) -> &'static str {
         NodeState::Ready => "ready",
         NodeState::Draining => "draining",
         NodeState::Drained => "drained",
+        NodeState::Maintenance => "maintenance",
+        NodeState::Validating => "validating",
         NodeState::Quarantined => "quarantined",
     }
 }
@@ -1067,7 +1069,7 @@ pub(crate) fn operation_name(op: &Operation) -> String {
         Operation::Undrain => "undrain".into(),
         Operation::Quarantine => "quarantine".into(),
         Operation::Release => "release".into(),
-        Operation::Update { version } => {
+        Operation::Update { version, .. } => {
             format!("update to {}", vk_fleet_proto::display_safe(version))
         }
         Operation::Reset => "reset".into(),

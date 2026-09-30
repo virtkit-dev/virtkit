@@ -66,6 +66,7 @@ pub fn inventory(cfg: &Config) -> Inventory {
             vk: env!("CARGO_PKG_VERSION").to_string(),
             guest_kernel: guest_kernel().clone(),
             config_hash: config_hash(cfg),
+            vk_sha256: None,
         },
         runner: runner_config(),
     }

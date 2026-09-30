@@ -183,6 +183,9 @@ impl Persisted {
             }
             (Operation::Drain, NodeState::Draining) => Outcome::Accepted,
             (Operation::Drain, NodeState::Drained) => Outcome::Done,
+            (Operation::Drain, NodeState::Maintenance | NodeState::Validating) => {
+                refused("the node is under maintenance")
+            }
             (Operation::Undrain, _) => {
                 if self.state == NodeState::Draining {
                     self.settle_drains(Outcome::Failed {
