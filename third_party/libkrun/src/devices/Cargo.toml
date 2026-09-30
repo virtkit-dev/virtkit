@@ -36,7 +36,7 @@ virtio-bindings = "0.2.0"
 vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
 zerocopy = { version = "0.8.26", optional = true, features = ["derive"] }
 lru = ">=0.9"
-zstd = "0.13"
+zstd = "0.14"
 # `is_sync` must match the `sync` feature imago (below) is built with, so
 # `#[maybe_async(AFIT)]` in lazy_chunk_storage.rs expands to the same plain sync fns imago's
 # own `Storage` impls use — Cargo unifies this across the graph regardless, since it's the

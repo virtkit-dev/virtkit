@@ -93,7 +93,7 @@ regex = "1"
 # zstd vendors its C (gcc/musl-dev are in the build image), so the binary stays
 # musl-static.
 fastcdc = "5"
-zstd = "0.13"
+zstd = "0.14"
 # .ko.xz kernel-module decompression for `vk run --kernel image` (fullvm): pure Rust,
 # so it needs no C liblzma and the binary stays musl-static (zstd/gz are covered by the
 # crates above).
