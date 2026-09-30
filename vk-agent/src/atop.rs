@@ -23,9 +23,10 @@
 //!
 //! Emitted labels: CPU, cpu, CPL, MEM, SWP, PAG, PSI, DSK, NET (upper + per
 //! interface), PRG, PRC, PRM, PRD. Not emitted: PRN (per-process network needs
-//! netatop even for real atop), PRE/GPU, the NFS/InfiniBand/NUMA/LLC/LVM/MDD labels,
-//! and exited processes (real atop takes those from process accounting; a `/proc`
-//! sweep misses a task that starts and exits inside one interval).
+//! netatop even for real atop), PRE/GPU and the NFS/InfiniBand/NUMA/LLC/LVM/MDD labels.
+//! Exited processes are recorded with state `E` from the kernel's taskstats exit
+//! reports, including processes that start and exit within one interval, unless
+//! listener registration fails or the kernel drops the record (see `Exits`).
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
