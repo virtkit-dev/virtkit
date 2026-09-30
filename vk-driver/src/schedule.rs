@@ -4,7 +4,7 @@
 //!
 //! This is the one place the number is decided: `effective = min(local estimate, hub
 //! ceiling, local ceiling)` ([`decide`]), whether `vk tune` asks or `vk node run`'s own loop
-//! does.
+//! does — and on a node, only the node's loop asks ([`tune`]).
 //!
 //! The admission gate ([`crate::admit`]) is what keeps the host safe — it never lets more
 //! memory be committed than the budget allows. But a job it makes wait has already been
@@ -171,14 +171,27 @@ pub fn runner_config(cfg: &Config) -> Option<PathBuf> {
 /// Measure the host and write what the runner's concurrency should be. Meant to run every
 /// half minute or so from a user timer; each run stands alone, reading its own previous
 /// answer back out of the file it writes.
+///
+/// On a fleet node the node's own loop is the one writer: while `vk node run` holds the
+/// state dir this does nothing, rather than step the concurrency up twice as fast. Otherwise
+/// it applies the hub ceiling the node last persisted, so both give the same answer.
 pub fn tune(cfg: &Config) -> Result<()> {
-    if crate::vm::budget_mib(cfg).is_none() && cfg.executor.schedule.max_concurrency.is_none() {
+    // Held until this pass is done, so no `vk node run` starts writing in the middle of it.
+    let Some(_claim) = crate::node::claim_tuning(cfg)? else {
+        println!("virtkit: `vk node run` sets this runner's concurrency; nothing to do");
+        return Ok(());
+    };
+    let hub_ceiling = crate::node::hub_ceiling(cfg)?;
+    if crate::vm::budget_mib(cfg).is_none()
+        && cfg.executor.schedule.max_concurrency.is_none()
+        && hub_ceiling.is_none()
+    {
         bail!(
             "[executor.schedule] mem_budget is unset: there is no budget to schedule against \
              (see the GitLab CI guide)"
         );
     }
-    let decision = decide(cfg, None)?;
+    let decision = decide(cfg, hub_ceiling)?;
     apply(cfg, &decision)?;
     println!("virtkit: {}", describe(&decision));
     Ok(())

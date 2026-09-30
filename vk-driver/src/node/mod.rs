@@ -48,6 +48,9 @@ const ENROLLMENT_FILE: &str = "enrollment.json";
 const CA_FILE: &str = "ca.pem";
 const LOCK_FILE: &str = "lock";
 
+/// Tries at the lock, 100 ms apart: ten seconds, beyond any `vk tune` pass holding it shared.
+const LOCK_TRIES: u32 = 100;
+
 /// The first redial's delay, and the ceiling doubling reaches. A hub restart brings every
 /// node back within seconds; a hub down for longer is not helped by being dialed more often.
 const BACKOFF: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(60));
@@ -431,6 +434,44 @@ async fn hold_sessions(
     }
 }
 
+/// What `vk tune` holds while it sets the concurrency: a shared lock on the node's state dir,
+/// so a `vk node run` cannot start in the middle of it, or nothing where the host is no node.
+pub struct TuneClaim {
+    _lock: Option<std::fs::File>,
+}
+
+/// Claim the concurrency for `vk tune`, or `None` when a `vk node run` holds this host's node
+/// state dir — the one concurrency writer then, which `vk tune` leaves the job to.
+pub fn claim_tuning(cfg: &Config) -> Result<Option<TuneClaim>> {
+    let path = dir(cfg).join(LOCK_FILE);
+    let file = match std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(TuneClaim { _lock: None }));
+        }
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
+    // SAFETY: the fd is owned by `file`, which outlives the call; flock returns 0 or -1.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        return Ok(Some(TuneClaim { _lock: Some(file) }));
+    }
+    let e = std::io::Error::last_os_error();
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(None);
+    }
+    Err(e).with_context(|| format!("probing {}", path.display()))
+}
+
+/// The concurrency ceiling the hub last set, as this node persisted it; `None` on a host that
+/// is no fleet node or has none.
+pub fn hub_ceiling(cfg: &Config) -> Result<Option<u32>> {
+    Ok(state::Persisted::load(&dir(cfg))?.hub_ceiling())
+}
+
 type Flag = tokio::sync::watch::Receiver<bool>;
 
 /// Two flags: `stop`, raised by the first SIGTERM or SIGINT, for the session to close on and
@@ -472,18 +513,25 @@ fn lock(dir: &Path) -> Result<std::fs::File> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .map_err(|e| anyhow::Error::new(e).context(format!("opening {}", path.display())))?;
-    // SAFETY: the fd is owned by `file`, which outlives the call; flock returns 0 or -1.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::WouldBlock {
-            bail!(
-                "another `vk node` is running on {} — one at a time per state dir",
-                dir.display()
-            );
+    // Retried for a while: `vk tune` holds a shared lock for the length of one pass, which
+    // must not read as another node.
+    for attempt in 0..LOCK_TRIES {
+        // SAFETY: the fd is owned by `file`, which outlives the call; flock returns 0 or -1.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
         }
-        return Err(e).with_context(|| format!("locking {}", path.display()));
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(e).with_context(|| format!("locking {}", path.display()));
+        }
+        if attempt + 1 < LOCK_TRIES {
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
-    Ok(file)
+    bail!(
+        "another `vk node` is running on {} — one at a time per state dir",
+        dir.display()
+    )
 }
 
 /// `d` plus up to a quarter more, so a fleet that lost its hub together does not redial it
@@ -666,6 +714,38 @@ mod tests {
         drop(held);
         lock(&dir).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn vk_tune_sees_a_running_node_and_its_persisted_ceiling() {
+        let root = scratch("running");
+        let cfg: Config =
+            toml::from_str(&format!("state_dir = {:?}\n", root.display().to_string())).unwrap();
+        assert!(claim_tuning(&cfg).unwrap().is_some());
+        assert_eq!(hub_ceiling(&cfg).unwrap(), None);
+        let node = dir(&cfg);
+        create_dir(&node).unwrap();
+        let mut persisted = state::Persisted::default();
+        persisted.apply_desired(vk_fleet_proto::DesiredState {
+            generation: 1,
+            ceiling: Some(3),
+            acquisition: vk_fleet_proto::Acquisition::Run,
+        });
+        persisted.save(&node).unwrap();
+        assert_eq!(hub_ceiling(&cfg).unwrap(), Some(3));
+        let held = lock(&node).unwrap();
+        assert!(claim_tuning(&cfg).unwrap().is_none());
+        drop(held);
+        // A tune pass holds the lock shared, and a node starting meanwhile waits it out.
+        let claim = claim_tuning(&cfg).unwrap().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(claim);
+        });
+        let held = lock(&node).unwrap();
+        release.join().unwrap();
+        drop(held);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
