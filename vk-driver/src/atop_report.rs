@@ -814,15 +814,15 @@ struct Stuck {
 
 /// The processes that stalled, found by feeding every sample in order to [`StallScan::feed`].
 ///
-/// Per multi-threaded process (pid, start time): its tracker, fed what the guest fed its own
-/// from the same samples, and when the wait channels it last saw were recorded. Everything it
-/// keeps from a sample it is fed is owned, so a read can feed it the samples it lets go of.
+/// Keep a tracker and the last wait channels per multi-threaded process (pid, start time),
+/// using the same samples as the guest. Retained data is owned, so the reader can feed samples
+/// before evicting them.
 ///
 /// What it holds is bounded by the processes in one sample, not by the log: a process that has
 /// left the samples settles its stall into the few kept for the report, and its stacks go.
 #[derive(Default)]
 struct StallScan {
-    tracks: HashMap<(i32, i64), (vk_core::atop::Stall, i64)>,
+    tracks: HashMap<(i32, i64), (vk_core::atop::Stall, crate::atoplog::Wchans)>,
     /// The stalls of processes still in the samples, their stacks not yet attached.
     found: HashMap<(i32, i64), Stuck>,
     /// The stalls of processes gone from the samples: the [`TOP_STALLS`] first by [`rank`],
@@ -860,18 +860,19 @@ impl StallScan {
                 self.dumps
                     .insert(key, (s.epoch, p.threads, p.stacks.clone()));
             }
-            let (Some(wchans), Some(since)) = (&p.wchans, p.wchans_since) else {
+            let Some(wchans) = &p.wchans else {
                 continue;
             };
             let sectors = p.sectors_read.saturating_add(p.sectors_written);
-            let (mut track, before) = match self.tracks.get(&key) {
-                Some((track, before)) => (*track, Some(*before)),
-                None => (vk_core::atop::Stall::default(), None),
+            let ticks = p.utime.saturating_add(p.stime);
+            let (mut track, same) = match self.tracks.get(&key) {
+                Some((track, before)) => (*track, vk_core::atop::same_channels(before, wchans)),
+                None => (vk_core::atop::Stall::default(), false),
             };
-            let idle = vk_core::atop::idle(before == Some(since), p.threads_running, sectors);
-            let worked = !s.boot && vk_core::atop::worked(p.utime.saturating_add(p.stime), sectors);
+            let idle = vk_core::atop::idle(same, ticks, p.hertz, s.interval, sectors);
+            let worked = !s.boot && vk_core::atop::worked(ticks, sectors);
             let stalled = track.observe(s.epoch, idle, worked);
-            next.insert(key, (track, since));
+            next.insert(key, (track, std::sync::Arc::clone(wchans)));
             if !stalled {
                 continue;
             }
@@ -941,7 +942,9 @@ impl StallScan {
             return String::new();
         }
         let mut out = format!(
-            "\n  stalled — no thread running and none changing what it waits in, for {} or more{}\n",
+            "\n  stalled — its threads in the same wait channels, under {}% of a cpu and no disk \
+             i/o, for {} or more{}\n",
+            vk_core::atop::IDLE_CPU_PERCENT,
             fmt_secs(vk_core::atop::STALL_SECS),
             match self.settled_count > TOP_STALLS {
                 true => format!("; {TOP_STALLS} of {} shown", self.settled_count),
@@ -1498,9 +1501,10 @@ mod tests {
                     "futex_do_wait:1 hrtimer_nanosleep:7 request_wait_answer:1",
                 ));
             }
-            // java: up since boot, busy in the second sample, then stuck for longer than ruff.
+            // java: up since boot, busy in the second sample, then stuck for longer than ruff,
+            // its counts flickering.
             text.push_str(&prg(900, "java", 900, u32::from(i == 1)));
-            text.push_str(&prc(900, "java", u32::from(i == 1) * 50, 0));
+            text.push_str(&prc(900, "java", u32::from(i == 1) * 500, 0));
             match i {
                 0 => text.push_str(&prw(900, "java", "futex_wait_queue:9")),
                 1 => text.push_str(&prw(900, "java", "futex_wait_queue:8")),
@@ -1513,17 +1517,18 @@ mod tests {
             if i == 0 {
                 text.push_str(&prw(800, "dockerd", "ep_poll:9"));
             }
-            // poexam: its channels move every sample.
+            // poexam: its threads move between channels every sample.
             text.push_str(&prg(500, "poexam", 1_005, 0));
             text.push_str(&prc(500, "poexam", 5, 0));
             text.push_str(&prw(
                 500,
                 "poexam",
-                &format!("futex_wait_queue:{}", 1 + i % 2),
+                ["futex_wait_queue:2", "futex_wait_queue:1 pipe_read:1"][i as usize % 2],
             ));
-            // mypy: a thread runs now and then.
+            // mypy: a pool busy between waits in the same channels, half a cpu, a thread
+            // running now and then.
             text.push_str(&prg(600, "mypy", 1_005, u32::from(i % 20 == 19)));
-            text.push_str(&prc(600, "mypy", 5, 0));
+            text.push_str(&prc(600, "mypy", 500, 0));
             if i == 1 {
                 text.push_str(&prw(600, "mypy", "futex_wait_queue:8"));
             }
@@ -1563,6 +1568,77 @@ mod tests {
             .collect()
     }
 
+    /// The hang the end-to-end run recorded, sample for sample: `python3 /w/hang.py`, one
+    /// thread blocked on a futex for good and seven polling with 10 ms sleeps, sampled every
+    /// 2 s for 400 s. The processor ticks of each sample and the samples where its histogram
+    /// changed are the real log's; a poller caught running drops out of the counts, so the
+    /// histogram changes 49 times while the set of channels never does.
+    fn e2e_hang_log() -> String {
+        const TICKS: &str = "342332334323324243334333643433434333442333422534353334323433122121233342434343432433432323444433343333443344343434343211212433335234443344234335333335433443344343344235333522433343433333434433333443";
+        const CHANGES: &str = "3:7 7:6 8:7 21:5 22:7 23:6 24:7 30:6 31:7 32:5 33:7 35:6 37:7 44:6 45:7 58:6 59:7 61:6 62:7 70:4 71:7 79:6 80:7 90:6 91:7 98:6 99:7 100:5 101:7 114:6 116:7 119:6 120:7 136:6 137:7 140:6 141:7 152:6 154:7 165:6 166:7 168:6 169:7 173:6 174:7 188:6 189:7 190:6 192:7";
+        let changes: HashMap<usize, u32> = CHANGES
+            .split(' ')
+            .map(|c| {
+                let (at, n) = c.split_once(':').unwrap();
+                (at.parse().unwrap(), n.parse().unwrap())
+            })
+            .collect();
+        let mut text = String::from("RESET\n");
+        let mut sleeping = 7;
+        for n in 1..=201usize {
+            let (epoch, interval) = match n {
+                1 => (1_790_759_476, 1),
+                n => (1_790_759_476 + 2 * (n as i64 - 1), 2),
+            };
+            let (d, t) = vk_core::atop::date_time(epoch);
+            let h = |label: &str| format!("{label} vm {epoch} {d} {t} {interval} 67 (python3)");
+            let (threads, ticks, sectors) = match n {
+                1 => (1, 0, 11_824),
+                2 => (1, 197, 1_192),
+                3 => (9, 115, 0),
+                n => (9, u32::from(TICKS.as_bytes()[n - 4] - b'0'), 0),
+            };
+            if let Some(&now) = changes.get(&n) {
+                sleeping = now;
+            }
+            let running = if threads == 1 { 1 } else { 7 - sleeping };
+            text.push_str(&format!(
+                "{} S 0 0 67 {threads} 0 1790759475 (python3 /w/hang.py) 63 {running} {} 0 0 0 0 0 0 0 0 \
+                 y 0 0 - - ()\n",
+                h("PRG"),
+                threads - running
+            ));
+            text.push_str(&format!(
+                "{} S 100 {ticks} 0 0 20 0 0 0 0 67 y 0 (__futex_wait) 0 -3 -3\n",
+                h("PRC")
+            ));
+            text.push_str(&format!("{} S n y 0 {sectors} 0 0 0 67 n y\n", h("PRD")));
+            if changes.contains_key(&n) {
+                text.push_str(&format!(
+                    "{} __futex_wait:2 hrtimer_nanosleep:{sleeping}\n",
+                    h("PRW")
+                ));
+            }
+            text.push_str("SEP\n");
+        }
+        text
+    }
+
+    /// That hang is a stall: its histogram flickers every few samples, and its set of wait
+    /// channels, its processor time and its disk traffic stand still from the moment it hung.
+    #[test]
+    fn the_e2e_hang_with_flickering_counts_is_a_stall() {
+        let text = e2e_hang_log();
+        let parsed = crate::atoplog::parse(&text);
+        assert_eq!((parsed.samples.len(), parsed.dropped), (201, 0));
+        let section = stalled_section(&report(&text));
+        assert_eq!(
+            section.get(1).map(String::as_str),
+            Some("  python3 /w/hang.py (pid 67, 9 threads) for 6m36s from 09:11:20 UTC"),
+            "{section:?}"
+        );
+    }
+
     /// What the stall scan holds stays at what one sample holds, however many processes a log
     /// runs through: a process gone from the samples settles into the few kept for the report
     /// — stacks attached — and the header still counts every one that stalled.
@@ -1581,7 +1657,8 @@ mod tests {
                     started: born,
                     threads: 9,
                     // Work in its first sample, then nothing moving.
-                    utime: u64::from(at == 0) * 50,
+                    hertz: 100,
+                    utime: u64::from(at == 0) * 500,
                     wchans: Some(std::sync::Arc::clone(&wchans)),
                     wchans_since: Some(born),
                     stacks: match at == 35 {
@@ -1633,7 +1710,8 @@ mod tests {
                     threads: 9,
                     // Work, then 350 s standing still; a sample without wait channels; work
                     // again, then 430 s standing still.
-                    utime: u64::from(i == 0 || i == 37) * 50,
+                    hertz: 100,
+                    utime: u64::from(i == 0 || i == 37) * 500,
                     wchans: (i != 36).then(|| std::sync::Arc::clone(&wchans)),
                     wchans_since: (i != 36).then_some(1_000),
                     ..Default::default()
@@ -1683,12 +1761,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A process that worked and then sat with its threads in the same wait channels, none
-    /// running, for five minutes is reported as stalled — with where they wait and the stacks
-    /// the guest wrote, threads sharing a stack on one line — however much processor time its
-    /// idle threads burn. The job's own processes come before the guest's older ones. One
-    /// whose channels move, whose thread runs, whose stall is shorter, or that has been idle
-    /// since the guest booted, is not reported.
+    /// A process that worked and then kept its threads in the same set of wait channels, under
+    /// a tenth of a cpu, for five minutes is reported as stalled — with where they wait and the
+    /// stacks the guest wrote, threads sharing a stack on one line — however its counts
+    /// flicker. The job's own processes come before the guest's older ones. One whose threads
+    /// move between channels, one busy between waits in the same channels, one whose stall is
+    /// shorter, or one idle since the guest booted, is not reported.
     #[test]
     fn a_stalled_process_is_reported_with_its_wait_channels_and_stacks() {
         let text = stall_log();
@@ -1700,14 +1778,14 @@ mod tests {
         assert_eq!(
             section,
             [
-                "  stalled — no thread running and none changing what it waits in, for 5m00s or more",
+                "  stalled — its threads in the same wait channels, under 10% of a cpu and no disk i/o, for 5m00s or more",
                 "  ruff check . (pid 412, 9 threads) for 6m00s from 00:17:10 UTC",
                 "    waiting: 1 in futex_do_wait, 1 in request_wait_answer, 7 in hrtimer_nanosleep",
                 "    stacks at 00:22:10 UTC:",
                 "      1 thread (412): futex_do_wait < __futex_wait",
                 "      1 thread (420): request_wait_answer (no stack)",
                 "      7 threads (413 414 415 …): hrtimer_nanosleep < do_nanosleep",
-                "  java check . (pid 900, 9 threads) for 6m10s from 00:17:00 UTC",
+                "  java check . (pid 900, 9 threads) for 6m20s from 00:16:50 UTC",
                 "    waiting: 9 in futex_wait_queue",
             ],
             "{out}"

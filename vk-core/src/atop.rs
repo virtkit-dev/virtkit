@@ -524,24 +524,42 @@ pub const WCHANS: &str = "PRW";
 /// `/proc/<pid>/task/<tid>/stack` prints it, or `-` where the kernel exposes no stack.
 pub const STACK: &str = "PRK";
 
-/// How long a multi-threaded process's wait channels must stand unchanged, with no thread
-/// running and no disk transfer, before it counts as stalled.
+/// How long a multi-threaded process must stand [`idle`] before it counts as stalled.
 ///
-/// Five minutes: the waits of a CI step that is making progress (a lock, a slow download, a
-/// child finishing) change some thread's channel within seconds, while a hang that runs into
-/// a job's timeout (an hour and up) is caught long before its VM is torn down.
+/// Five minutes: the waits of a CI step that is making progress usually change which channels
+/// its threads wait in within seconds, while a hang that runs into a job's timeout (an hour and
+/// up) is caught long before its VM is torn down. A process that waits longer than this on a
+/// lock or a network-only transfer is reported by design.
 pub const STALL_SECS: u64 = 300;
 
-/// Minimum unchanged samples per stall, so a coarse sampling interval cannot trigger a
-/// verdict after only one or two samples.
+/// The most processor time an [`idle`] process spends over an interval, in percent of one
+/// processor: threads polling a stuck worker cost a hung process 1–3%, real progress far more.
+pub const IDLE_CPU_PERCENT: u64 = 10;
+
+/// Minimum idle samples per stall, preventing a verdict from one or two widely spaced samples.
 pub const STALL_MIN_SAMPLES: u32 = 3;
 
-/// Whether one sample shows a multi-threaded process standing still against the previous
-/// sample it appeared in: the same wait channels recorded, no thread running, and no disk
-/// sectors moved over the interval. Processor time is not part of it: idle threads polling a
-/// stuck worker keep a hung process at a percent or so of a processor.
-pub fn idle(same_wchans: bool, threads_running: u64, sectors: u64) -> bool {
-    same_wchans && threads_running == 0 && sectors == 0
+/// Whether a multi-threaded process is idle since its previous sample: unchanged wait-channel
+/// set ([`same_channels`]), no disk sectors moved, and CPU use below [`IDLE_CPU_PERCENT`]
+/// percent of one processor, measured as `ticks` at `hertz` over `interval_secs`.
+///
+/// The set, not the counts, and not whether a thread runs: a poller caught running, or between
+/// two states, drops out of the counts for a sample, and a hung process with pollers flickers
+/// between histograms every few samples while its set stands still. An unknown tick rate or
+/// interval (0) never counts as idle.
+pub fn idle(same_channels: bool, ticks: u64, hertz: u64, interval_secs: u64, sectors: u64) -> bool {
+    let budget = IDLE_CPU_PERCENT
+        .saturating_mul(hertz)
+        .saturating_mul(interval_secs);
+    same_channels && sectors == 0 && ticks.saturating_mul(100) < budget
+}
+
+/// Whether two wait-channel histograms name the same channels, whatever their counts.
+pub fn same_channels<K: Ord, V>(
+    a: &std::collections::BTreeMap<K, V>,
+    b: &std::collections::BTreeMap<K, V>,
+) -> bool {
+    a.keys().eq(b.keys())
 }
 
 /// Whether one sample's processor ticks and 512-byte sectors, both over its interval, show a
@@ -559,7 +577,7 @@ pub fn worked(ticks: u64, sectors: u64) -> bool {
 /// counts because its figures cover the interval before the stretch; work inside the stretch
 /// is its own idle threads polling. The boot-covering first sample is not work of the job's,
 /// so a daemon that has done nothing since the guest booted never stalls — though one that
-/// worked and then idles with its wait channels frozen does.
+/// worked and then idles in a fixed set of wait channels does.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stall {
     seen: bool,
@@ -991,7 +1009,19 @@ mod tests {
         assert!(!s.observe(secs + 10, true, false));
         assert!(!s.observe(secs + 20, true, false));
         assert!(s.observe(secs + 30, true, false));
-        assert!(idle(true, 0, 0) && !idle(false, 0, 0) && !idle(true, 1, 0) && !idle(true, 0, 1));
+        // Under a tenth of a processor, 100 Hz over 10 s: 99 ticks is idle, 100 is not.
+        assert!(idle(true, 99, 100, 10, 0) && !idle(true, 100, 100, 10, 0));
+        assert!(!idle(false, 0, 100, 10, 0) && !idle(true, 0, 100, 10, 1));
+        assert!(!idle(true, 0, 0, 10, 0) && !idle(true, 0, 100, 0, 0));
+        let hist = |pairs: &[(&str, u32)]| -> std::collections::BTreeMap<String, u32> {
+            pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        };
+        let flicker = hist(&[("__futex_wait", 2), ("hrtimer_nanosleep", 7)]);
+        assert!(same_channels(
+            &flicker,
+            &hist(&[("__futex_wait", 2), ("hrtimer_nanosleep", 5)])
+        ));
+        assert!(!same_channels(&flicker, &hist(&[("__futex_wait", 9)])));
         assert!(worked(1, 0) && worked(0, 1) && !worked(0, 0));
     }
 

@@ -399,18 +399,18 @@ them failed: a build that forks a thousand compilers is a thousand processes no 
 and one row of `cc1plus ×1184` says what a thousand rows of one run each would bury. A process
 the sampler did watch keeps its own row, however many namesakes came and went around it.
 
-A multi-threaded process that did some work and then kept its threads in the same kernel wait
-channels, none of them running and no disk I/O, for five minutes or more gets a `stalled`
-section after the table. Its idle threads may still use a little cpu during the stall, so cpu
-use then does not rule a process out. A process that has done nothing at all since the guest
-booted is left out, but that is the only kind of idle daemon the test excludes: one that
-worked and then went idle with its wait channels frozen (a JVM or Gradle daemon, a `dockerd`
-the job started) is listed too. Processes the job started come first, then the longest
-stalls. The section lists where the threads waited and, when the guest could read them, their
-kernel stacks, one line per distinct stack:
+A multi-threaded process appears in the `stalled` section after the table if it did some work,
+then spent at least five minutes in the same set of kernel wait channels, using under 10% of
+a cpu with no disk I/O. The set is what counts, not how many threads wait in
+each channel: threads polling a stuck worker (a 10 ms sleep loop, say) are caught running now
+and then, which changes the counts every few samples, and cost a hung process a few percent of
+a cpu. A process that has done no work since guest boot is excluded. Other idle daemons in a
+fixed set of channels (a JVM or Gradle daemon, a `dockerd` the job started) are listed too.
+Processes the job started come first, then the longest stalls. The section lists wait channels
+and available kernel stacks, one line per distinct stack:
 
 ```
-  stalled — no thread running and none changing what it waits in, for 5m00s or more
+  stalled — its threads in the same wait channels, under 10% of a cpu and no disk i/o, for 5m00s or more
   ruff check . (pid 412, 9 threads) for 11h58m from 07:22:10 UTC
     waiting: 1 in futex_do_wait, 1 in request_wait_answer, 7 in hrtimer_nanosleep
     stacks at 07:27:10 UTC:

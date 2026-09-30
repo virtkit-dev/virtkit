@@ -242,7 +242,7 @@ fn run(dir: &Path, interval: Duration) -> Result<()> {
             Some(p) => covered_secs(cur.epoch, p.epoch),
             None => uptime_secs().max(1),
         };
-        let (tracks, due) = stalls.advance(&cur, prev.as_ref());
+        let (tracks, due) = stalls.advance(&cur, prev.as_ref(), env.hertz, covered);
         let dumping: Vec<(i32, i64)> = due.iter().map(|p| (p.pid, p.btime)).collect();
         let stacks: Vec<Stack> = due
             .iter()
@@ -401,10 +401,14 @@ impl Stalls {
     /// Advance each multi-threaded process's tracker from `prev`, the last sample on disk,
     /// and return stalled processes not yet dumped. Apply the trackers with [`Stalls::commit`]
     /// only after the sample reaches the log, so the host and guest judge the same samples.
+    /// `hertz` and `interval` match the sample's recorded tick rate and interval, giving the
+    /// host's [`vk_core::atop::idle`] the same inputs.
     fn advance<'a>(
         &self,
         cur: &'a Sys,
         prev: Option<&Sys>,
+        hertz: u64,
+        interval: u64,
     ) -> (HashMap<(i32, i64), Stall>, Vec<&'a Proc>) {
         let before: HashMap<i32, &Proc> = prev
             .map(|p| p.procs.iter().map(|q| (q.pid, q)).collect())
@@ -427,8 +431,13 @@ impl Stalls {
                 ),
                 None => (p.utime.saturating_add(p.stime), sectors),
             };
-            let idle =
-                q.is_some_and(|q| vk_core::atop::idle(p.wchans == q.wchans, p.nthrrun, sectors));
+            let idle = q.is_some_and(|q| {
+                let same = match (&p.wchans, &q.wchans) {
+                    (Some(a), Some(b)) => vk_core::atop::same_channels(a, b),
+                    _ => false,
+                };
+                vk_core::atop::idle(same, ticks, hertz, interval, sectors)
+            });
             // The boot-covering sample's counters are the guest's whole life, not the job's.
             let worked = prev.is_some() && vk_core::atop::worked(ticks, sectors);
             let mut track = self.tracks.get(&key).copied().unwrap_or_default();
@@ -3210,11 +3219,12 @@ mod tests {
         );
     }
 
-    /// A process that worked and then sat with the same wait channels, no thread running and
-    /// no disk transfer for as long as `Stall` asks has its stacks written once — not before,
-    /// not again while it stays stuck. A dump whose sample failed to land is owed to the next
-    /// one. The processor time its idle threads burn during the stretch does not matter either
-    /// way, and neither do syscalls that move no disk sectors.
+    /// A process that worked and then kept its threads in the same set of wait channels, under
+    /// a tenth of a processor and with no disk transfer, for as long as `Stall` asks has its
+    /// stacks written once — not before, not again while it stays stuck. A dump whose sample
+    /// failed to land is owed to the next one. Pollers flickering through the counts, or caught
+    /// running, do not matter, and neither do syscalls that move no disk sectors; a thread pool
+    /// busy in the same channels does.
     #[test]
     fn an_active_then_stuck_process_has_its_stacks_written_once() {
         // Sample `i`, 10s apart: `ticks` of processor time so far, and whether a thread runs.
@@ -3234,7 +3244,7 @@ mod tests {
             let mut prev: Option<&Sys> = None;
             let mut fired = Vec::new();
             for (i, cur) in samples.iter().enumerate() {
-                let (tracks, due) = stalls.advance(cur, prev);
+                let (tracks, due) = stalls.advance(cur, prev, 100, 10);
                 let dumping: Vec<(i32, i64)> = due.iter().map(|p| (p.pid, p.btime)).collect();
                 if !dumping.is_empty() {
                     fired.push(i as i64);
@@ -3249,13 +3259,14 @@ mod tests {
         };
         let k = vk_core::atop::STALL_SECS as i64 / 10;
 
-        // Seen at boot, busy in sample 1, stuck from sample 2 on at a tick an interval: the
-        // stretch starts at sample 1, so the dump is due five minutes after it.
+        // Seen at boot, busy in sample 1 (six tenths of a processor), stuck from sample 2 on at
+        // a tick an interval: the stretch starts at sample 1, so the dump is due five minutes
+        // after it.
         let hung: Vec<Sys> = (0..=60)
             .map(|i| match i {
                 0 => at(0, 100, 0),
-                1 => at(1, 150, 1),
-                i => at(i, 150 + i as u64, 0),
+                1 => at(1, 700, 1),
+                i => at(i, 700 + i as u64, 0),
             })
             .collect();
         assert_eq!(
@@ -3275,12 +3286,30 @@ mod tests {
         started[0].procs.clear();
         assert_eq!(fired(&started), [k + 1, k + 2]);
 
-        // A thread that runs, or a disk transfer, starts the stretch over; syscalls alone
-        // (a heartbeat to a pipe) do not.
+        // A tenth of a processor over an interval, a disk transfer, or a channel no thread
+        // waited in before starts the stretch over; syscalls alone (a heartbeat to a pipe) do
+        // not.
         let mut broken = hung.clone();
-        broken[20].procs[0].nthrrun = 1;
+        for sample in &mut broken[20..] {
+            sample.procs[0].utime += 100;
+        }
         broken[40].procs[0].rsz += 1;
+        broken[55].procs[0].wchans = Some(BTreeMap::from([("pipe_read".to_string(), 2)]));
         assert!(fired(&broken).is_empty());
+        // Pollers caught running drop out of the counts for a sample, as the e2e hang's did
+        // every few samples: the set stands, and so does the stall.
+        let mut flicker = hung.clone();
+        for (i, sample) in flicker.iter_mut().enumerate().skip(2) {
+            let p = &mut sample.procs[0];
+            p.nthrrun = (i % 2) as u64;
+            let waiting = 2 - p.nthrrun as u32;
+            p.wchans = Some(BTreeMap::from([("futex_wait_queue".to_string(), waiting)]));
+        }
+        assert_eq!(fired(&flicker), [k + 1, k + 2]);
+        // A pool whose threads wait in the same channels but burn half a processor between
+        // those waits is working, not hung.
+        let busy: Vec<Sys> = (0..=60).map(|i| at(i, 100 + 500 * i as u64, 0)).collect();
+        assert!(fired(&busy).is_empty());
         let mut chatty = hung.clone();
         for (i, sample) in chatty.iter_mut().enumerate() {
             sample.procs[0].rio += i as u64;
