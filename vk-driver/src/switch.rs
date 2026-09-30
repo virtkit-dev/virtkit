@@ -6990,9 +6990,16 @@ mod tests {
     async fn a_truncated_answer_is_recovered_over_tcp_while_the_guest_keeps_the_udp_reply() {
         use tokio::net::TcpListener;
         // One address answers UDP with a TC-truncated datagram and TCP with the full record set.
-        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = udp.local_addr().unwrap();
-        let tcp = TcpListener::bind(addr).await.unwrap();
+        // A free UDP port can have its TCP twin held by a parallel test: retry on a new one.
+        let (udp, tcp, addr) = loop {
+            let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = udp.local_addr().unwrap();
+            match TcpListener::bind(addr).await {
+                Ok(tcp) => break (udp, tcp, addr),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(e) => panic!("bind {addr}/tcp: {e}"),
+            }
+        };
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             let (n, from) = udp.recv_from(&mut buf).await.unwrap();
