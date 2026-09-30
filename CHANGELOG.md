@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`vk run --state-dir` no longer fails with "state-dir … is in use" when a `vk list` or
+  `vk stop` runs at the moment it starts.**
+
 ## [0.80.0] - 2026-09-30
 
 ### Added

@@ -1270,9 +1270,10 @@ fn build_into_cache(
 /// in the middle of using ([`crate::dev::list`] removes only the idle ones), and what a
 /// second boot names instead of failing on the lock with nothing to say about whose it is.
 ///
-/// Asked of `/proc/locks`, never by taking the lock: a probe that grabbed it, even for the
-/// instant it takes to drop it again, made whatever real [`crate::run::lock_state_dir`] was
-/// running at that moment fail with "state-dir is in use". The trade is that a holder
+/// Asked of `/proc/locks`, never by taking the lock: a probe that grabs it, even for the
+/// instant it takes to drop it again, is one a real [`crate::run::lock_state_dir`] running at
+/// that moment has to wait out (see [`crate::run::STATE_DIR_LOCK_GRACE`]), and this one runs
+/// in a loop. The trade is that a holder
 /// procfs cannot name — a lock over NFS, or a filesystem whose `st_dev` is not the
 /// superblock device the file lists — reads here as nobody, and the boot that follows fails
 /// on the lock itself as it did before this existed.
@@ -2761,7 +2762,7 @@ mod tests {
         ensure_state_dir(&plan).unwrap();
 
         // Probing must not disturb a held lock: a real `lock_state_dir` racing it would
-        // otherwise fail with "state-dir is in use".
+        // otherwise have to wait out the lock grace, or fail if the probe outlasted it.
         for _ in 0..3 {
             assert!(lock_holder(&plan.state_dir).is_none(), "nobody holds it");
         }

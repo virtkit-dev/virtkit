@@ -714,18 +714,32 @@ impl WorkDir {
     }
 }
 
-/// Non-blocking exclusive `flock` on the state dir itself: a second run on the
-/// same `--state-dir` would unlink the live run's sockets and fight over the
-/// binds, so refuse it up front. Advisory and filesystem-local, like the other
-/// locks in the tree.
+/// How long [`lock_state_dir`] keeps retrying a refused lock before calling the dir in use.
+/// Anything that tells a live run from a stale state dir by taking this lock for an instant —
+/// `vk list` and `vk stop` do, through [`crate::vms::alive`] — must not read as a live run to
+/// a run starting on the dir at that moment. A live run holds the lock for its whole
+/// lifetime, so it is still refused.
+pub(crate) const STATE_DIR_LOCK_GRACE: Duration = Duration::from_millis(100);
+/// How often [`lock_state_dir`] retries within [`STATE_DIR_LOCK_GRACE`].
+const STATE_DIR_LOCK_RETRY: Duration = Duration::from_millis(5);
+
+/// Exclusive `flock` on the state dir itself: a second run on the same `--state-dir` would
+/// unlink the live run's sockets and fight over the binds, so refuse it up front, once the
+/// lock has stayed held for [`STATE_DIR_LOCK_GRACE`]. Advisory and filesystem-local, like the
+/// other locks in the tree.
 fn lock_state_dir(dir: &Path) -> Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
     let f = std::fs::File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
+    let deadline = Instant::now() + STATE_DIR_LOCK_GRACE;
     // SAFETY: the fd is owned by `f`, which the caller keeps alive; flock
     // returns 0 or -1/errno and does not block under LOCK_NB.
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    while unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let err = std::io::Error::last_os_error();
         if err.kind() == std::io::ErrorKind::WouldBlock {
+            if Instant::now() < deadline {
+                std::thread::sleep(STATE_DIR_LOCK_RETRY);
+                continue;
+            }
             // The owning run prints its progress to the terminal that started it, not
             // here, so its pid is the only handle this caller gets on it.
             let who = flock_holder(&f).map_or_else(String::new, |h| format!(" ({h})"));
@@ -6249,6 +6263,41 @@ mod tests {
         assert!(child.wait().unwrap().success());
         let out = std::fs::read(spec.serial_log.with_extension("vmm.log")).unwrap();
         assert_eq!(out, b"boot medium");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_state_dir_held_for_an_instant_is_not_in_use() {
+        use std::os::unix::io::AsRawFd;
+
+        let dir = std::env::temp_dir().join(format!("vk-statelock-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A probe like `vms::alive`'s: the lock taken through its own descriptor, held for a
+        // moment well inside the grace, then dropped.
+        let probe = std::fs::File::open(&dir).unwrap();
+        // SAFETY: flock(2) on an fd owned by `probe`, which outlives the call.
+        assert_eq!(
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(STATE_DIR_LOCK_GRACE / 10);
+            drop(probe);
+        });
+        let start = Instant::now();
+        let held = lock_state_dir(&dir);
+        release.join().unwrap();
+        assert!(
+            held.is_ok(),
+            "a probe must not read as a live run: {:#}",
+            held.unwrap_err()
+        );
+        // It met the probe's lock and waited it out, rather than finding it already gone.
+        assert!(start.elapsed() >= STATE_DIR_LOCK_GRACE / 10);
+
+        drop(held);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
