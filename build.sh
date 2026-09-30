@@ -175,9 +175,10 @@ else
   echo "missing $OUT/vmlinux — run ./build-kernel.sh first (or --no-kernel to build a vk without an embedded kernel)" >&2
   exit 1
 fi
-# vk-registry (the standalone central server) and vk-runnerctl (the root-side setter for
-# gitlab-runner's concurrent) embed nothing, so they build plainly (no EMBED_ENV) alongside vk.
-BUILD_CMD="cargo build $CARGO_PROFILE_FLAG -p vk-agent && env $EMBED_ENV cargo build $CARGO_PROFILE_FLAG -p vk-driver && cargo build $CARGO_PROFILE_FLAG -p vk-registry && cargo build $CARGO_PROFILE_FLAG -p vk-runnerctl"
+# vk-registry (the standalone central server), vk-hub (the experimental local web UI) and
+# vk-runnerctl (the root-side setter for gitlab-runner's concurrent) embed nothing, so they
+# build plainly (no EMBED_ENV) alongside vk.
+BUILD_CMD="cargo build $CARGO_PROFILE_FLAG -p vk-agent && env $EMBED_ENV cargo build $CARGO_PROFILE_FLAG -p vk-driver && cargo build $CARGO_PROFILE_FLAG -p vk-registry && cargo build $CARGO_PROFILE_FLAG -p vk-hub && cargo build $CARGO_PROFILE_FLAG -p vk-runnerctl"
 
 compile_start=$SECONDS
 if [ -n "$VK_BIN" ]; then
@@ -248,7 +249,7 @@ mkdir -p "$OUT"
 # Replace atomically (write a temp, then rename): a plain cp truncates the destination and
 # would fail "Text file busy" if the old $OUT/vk is still being executed (e.g. by a
 # previous --use-virtkit / --bootstrap-check run); rename never does.
-for b in vk vk-agent vk-registry vk-runnerctl; do
+for b in vk vk-agent vk-registry vk-hub vk-runnerctl; do
   cp "target/$TARGET/$PROFILE_DIR/$b" "$OUT/.$b.tmp"
   mv -f "$OUT/.$b.tmp" "$OUT/$b"
 done
@@ -258,7 +259,7 @@ done
 #   git checkout <git_commit> && ./build-kernel.sh && ./build.sh &&
 #     ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-runnerctl.sha256 )
 # The sidecars name the binaries bare, so the check runs from inside dist/.
-( cd "$OUT" && sha256sum vk > vk.sha256 && sha256sum vk-agent > vk-agent.sha256 && sha256sum vk-registry > vk-registry.sha256 && sha256sum vk-runnerctl > vk-runnerctl.sha256 )
+( cd "$OUT" && sha256sum vk > vk.sha256 && sha256sum vk-agent > vk-agent.sha256 && sha256sum vk-registry > vk-registry.sha256 && sha256sum vk-hub > vk-hub.sha256 && sha256sum vk-runnerctl > vk-runnerctl.sha256 )
 # The inputs that fix the bytes: the base image digest (.devcontainer/Dockerfile's FROM) and
 # the flake.lock revs of nixpkgs / rust-overlay.
 # The rev flake.lock pins for one input: the first "rev" inside that input's node.

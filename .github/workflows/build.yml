@@ -55,7 +55,7 @@ jobs:
       # These binaries are artifacts to grab from a commit, not releasable ones.
       # '' has to stay the last operand: it is falsy, so swapping the arms would make
       # `||` always fire and hand --no-kernel to the release build too.
-      - name: Build binaries (vk, vk-agent, vk-registry, vk-runnerctl)
+      - name: Build binaries
         if: ${{ !inputs.bootstrap-check }}
         run: ./build.sh ${{ !inputs.build-kernel && '--no-kernel' || '' }}
 
@@ -81,10 +81,12 @@ jobs:
             dist/vk
             dist/vk-agent
             dist/vk-registry
+            dist/vk-hub
             dist/vk-runnerctl
             dist/vk.sha256
             dist/vk-agent.sha256
             dist/vk-registry.sha256
+            dist/vk-hub.sha256
             dist/vk-runnerctl.sha256
             dist/build-info.txt
           retention-days: ${{ inputs.retention-days }}

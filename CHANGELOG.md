@@ -11,7 +11,8 @@ All notable changes to virtkit will be documented in this file.
   runs as you and opens a single-use sign-in link in your browser. It keeps state under
   `~/.local/state/virtkit/hub-local` and serves on loopback at a new random `vk-….localhost`
   address each time it starts; sessions end on restart. `vk-hub local login` prints another
-  link; `vk-hub local sessions` and `logout` list and end sessions.
+  link; `vk-hub local sessions` and `logout` list and end sessions. Not published with
+  releases: `./build.sh` builds it into `dist/`.
 
 ## [0.81.0] - 2026-10-02
 
