@@ -1083,6 +1083,12 @@ The list semantics are the load-bearing part:
   `allow_name` set but `allow_ip` absent, all direct-IP egress is denied — a job
   reaching a host by literal IP needs that IP added to `allow_ip`.
 
+Under an allowlist, a name outside `allow_name` resolves to `NXDOMAIN`, reverse (PTR)
+lookups included, and a query the gateway cannot parse is `REFUSED`; the job's own
+service aliases still resolve, as do reverse lookups of the job's own addresses. Listing
+`in-addr.arpa` or `ip6.arpa` in `allow_name` reopens reverse lookups as a way to carry
+data out in the names queried.
+
 ### Narrowing from a job
 
 A job may **narrow** its egress to a subset of the host cap, never widen it. Each

@@ -15,13 +15,12 @@ All notable changes to virtkit will be documented in this file.
 - **`vk dev` can hold an environment's egress to an allowlist.** `[dev.network] egress =
   "restricted"` with `allow-name` (DNS suffixes) and `allow-ip` (IPv4 CIDRs, optionally
   port-scoped) lets the guest and its compose services reach only those; any other name
-  resolves to nothing (compose service names and reverse lookups still resolve) and any
-  other address is refused, an empty list denying everything.
-  Image pulls and build steps are unaffected. An edit to the lists applies to a running
-  environment when `vk dev up` attaches to it, without a restart and even under
-  `freshness = "reuse"`: names removed stop resolving, and new connections to their
-  addresses (unless a still-allowed name resolved to them) or to removed ranges are refused
-  within about a second; connections already open stay open.
+  resolves to nothing (compose service names still resolve) and any other address is
+  refused, an empty list denying everything. Image pulls and build steps are unaffected.
+  An edit to the lists applies to a running environment when `vk dev up` attaches to it,
+  without a restart and even under `freshness = "reuse"`: names removed stop resolving,
+  and new connections to their addresses (unless a still-allowed name resolved to them) or
+  to removed ranges are refused within about a second; connections already open stay open.
 
 ### Changed
 
@@ -31,6 +30,15 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Restricted egress no longer forwards reverse (PTR) or malformed DNS queries to the
+  host's resolver.** Under an egress allowlist, a reverse lookup is held to `allow_name`
+  like any other name and resolves to `NXDOMAIN` outside it, and a query the gateway
+  cannot read (a compressed name, a label with a dot or a byte outside letters, digits,
+  `-` and `_`) is answered `REFUSED`, so a guest can no longer smuggle data out through
+  the queries it sends. In dry-run both still resolve, and are listed among the would-be
+  denials. Under any policy, a reverse lookup of an address on the guests' own network is
+  answered by the gateway itself — with the service names at that address, else
+  `NXDOMAIN` — and a query with several questions is `REFUSED`.
 - **A GitLab runner whose `[executor] tools_dir` or `[executor.share] dir` is a symlink
   now shares its target with jobs.** Jobs saw an empty directory: with an empty tools
   directory, artifacts, caches and dotenv reports were not uploaded, and the job still

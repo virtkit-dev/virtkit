@@ -98,9 +98,30 @@ const DNS_LOG_WINDOW: Duration = Duration::from_secs(30);
 /// At most one failed-flow line per distinct fault per window: a destination that has stopped
 /// answering fails every flow a guest opens to it, and one line per flow would bury the log.
 const FLOW_LOG_WINDOW: Duration = Duration::from_secs(30);
+/// At most this many DNS denials are logged per [`DNS_LOG_WINDOW`], the rest counted: the
+/// names are the guest's to choose, so one line per query would let it grow switch.log
+/// without bound.
+const DNS_DENIALS_PER_WINDOW: u32 = 32;
+/// The most distinct names DNS denials are recorded under; a denial of any further name is
+/// counted under [`DNS_DENIED_MORE`]. The names are the guest's to choose, and each is held
+/// for the switch's life so its repeats are counted rather than written out one by one.
+const DNS_DENIED_NAMES: usize = 4096;
+/// The target denials past [`DNS_DENIED_NAMES`] are recorded under.
+const DNS_DENIED_MORE: &str = "more names (not recorded)";
+/// How often the repeats of DNS denials already recorded are written out, each name's as one
+/// counted record: a stage's last few seconds of them reach the trace with the next stage.
+const DNS_REPEATS_FLUSH: Duration = Duration::from_secs(2);
+/// The denial and log label for a query whose question the switch cannot parse.
+const UNPARSABLE_QUERY: &str = "an unparsable question";
+/// The longest DNS name, in wire bytes (RFC 1035 §2.3.4).
+const MAX_DNS_NAME: usize = 255;
+/// The largest response the gateway resolver builds itself (RFC 1035 §4.2.1). It echoes no
+/// OPT record, so a larger EDNS size the query offers does not apply (RFC 6891 §7).
+const DNS_UDP_CLASSIC: usize = 512;
 /// Response codes the gateway resolver answers with itself.
 const RCODE_SERVFAIL: u8 = 2;
 const RCODE_NXDOMAIN: u8 = 3;
+const RCODE_REFUSED: u8 = 5;
 /// First host index handed out by DHCP (.1 is the gateway).
 const FIRST_LEASE: u32 = 2;
 /// Host-side connect timeout for a guest egress flow. ipstack completes the guest's
@@ -160,6 +181,14 @@ const TCP_WINDOW: usize = 4 << 20;
 struct Cfg {
     gateway: Ipv4Addr,
     prefix: u8,
+}
+
+impl Cfg {
+    /// Is `ip` on the switch's own subnet?
+    fn on_lan(&self, ip: Ipv4Addr) -> bool {
+        let mask = mask4(self.prefix);
+        u32::from(ip) & mask == u32::from(self.gateway) & mask
+    }
 }
 
 type Mac = [u8; 6];
@@ -498,6 +527,11 @@ struct EgressGuard {
     published: Mutex<(u64, u64)>,
     /// Throttles the upstream-resolver failure log (see `log_dns_upstream`).
     dns_log: LogLimiter,
+    /// Bounds the DNS denials logged (see `deny_dns`).
+    dns_denials: RateLimiter,
+    /// Every name a DNS denial was recorded under, with its repeats not yet written out (see
+    /// `deny_dns`). Empty when nothing is recorded.
+    dns_denied: Mutex<HashMap<String, u64>>,
     /// Throttles the failed-flow log (see `log_flow_failure`).
     flow_log: LogLimiter,
 }
@@ -519,6 +553,8 @@ impl EgressGuard {
             received: AtomicU64::new(0),
             published: Mutex::new((0, 0)),
             dns_log: LogLimiter::new(DNS_LOG_WINDOW),
+            dns_denials: RateLimiter::new(DNS_LOG_WINDOW, DNS_DENIALS_PER_WINDOW),
+            dns_denied: Mutex::new(HashMap::new()),
             flow_log: LogLimiter::new(FLOW_LOG_WINDOW),
         }
     }
@@ -624,6 +660,62 @@ impl EgressGuard {
     fn record_denial(&self, proto: crate::egress_report::Proto, target: &str) {
         if let Some(path) = &self.denied_log {
             crate::egress_report::append(path, proto, target);
+        }
+    }
+    /// Record `target` as a refused (or, in dry-run, would-be refused) DNS lookup, and log
+    /// `line` within the [`DNS_DENIALS_PER_WINDOW`] budget; a line past it carries the count
+    /// of those not logged. Every denial is recorded: a name's first at once, its repeats
+    /// counted and written out by [`EgressGuard::flush_dns_denials`], and past
+    /// [`DNS_DENIED_NAMES`] names under [`DNS_DENIED_MORE`].
+    fn deny_dns(&self, target: &str, line: impl FnOnce() -> String) {
+        if self.denied_log.is_some() {
+            let first = {
+                let mut denied = self.dns_denied.lock().unwrap_or_else(|e| e.into_inner());
+                let key = if denied.contains_key(target) || denied.len() < DNS_DENIED_NAMES {
+                    target
+                } else {
+                    DNS_DENIED_MORE
+                };
+                match denied.get_mut(key) {
+                    Some(repeats) => {
+                        *repeats += 1;
+                        None
+                    }
+                    None => {
+                        denied.insert(key.to_string(), 0);
+                        Some(key.to_string())
+                    }
+                }
+            };
+            if let Some(key) = first {
+                self.record_denial(crate::egress_report::Proto::Dns, &key);
+            }
+        }
+        let Some(dropped) = self.dns_denials.admit(Instant::now()) else {
+            return;
+        };
+        let more = match dropped {
+            0 => String::new(),
+            n => format!(" ({n} more not logged)"),
+        };
+        eprintln!("switch: {}{more}", line());
+    }
+    /// Write out the repeats [`EgressGuard::deny_dns`] counted since the last time, one record
+    /// per name.
+    fn flush_dns_denials(&self) {
+        let Some(path) = &self.denied_log else {
+            return;
+        };
+        let repeats: Vec<(String, u64)> = {
+            let mut denied = self.dns_denied.lock().unwrap_or_else(|e| e.into_inner());
+            denied
+                .iter_mut()
+                .filter(|(_, n)| **n > 0)
+                .map(|(name, n)| (name.clone(), std::mem::take(n)))
+                .collect()
+        };
+        for (name, n) in repeats {
+            crate::egress_report::append_repeats(path, crate::egress_report::Proto::Dns, &name, n);
         }
     }
     /// Name the upstream resolver and the reason it failed a guest's lookup, throttled to
@@ -830,6 +922,12 @@ impl EgressGuard {
             return None;
         }
         let verdict = self.verdict(Some(*syn.src.ip()), SocketAddr::V4(syn.dst));
+        if verdict != Verdict::Allow && syn.dst == SocketAddrV4::new(self.gateway, DNS_PORT) {
+            // The gateway resolver serves UDP only, so this is a resolver's TCP retry, not
+            // egress: refused, as there is nothing to carry it to, but not recorded.
+            eprintln!("switch: no DNS over TCP at {} — sent RST", syn.dst);
+            return tcp_rst_frame(&syn, client_mac);
+        }
         if verdict == Verdict::Deny {
             eprintln!("switch: egress denied (tcp) {} — sent RST", syn.dst);
             self.record_denial(crate::egress_report::Proto::Tcp, &syn.dst.to_string());
@@ -931,6 +1029,42 @@ impl LogLimiter {
                 *last = now;
                 Some(std::mem::take(suppressed))
             }
+        }
+    }
+}
+
+/// Admits up to `budget` events per window and counts the rest, for a log whose keys are the
+/// guest's to choose (a per-key [`LogLimiter`] would grow with them).
+struct RateLimiter {
+    window: Duration,
+    budget: u32,
+    /// When the current window opened, how many it admitted, and how many were refused since
+    /// the last admitted one.
+    state: Mutex<(Instant, u32, u64)>,
+}
+
+impl RateLimiter {
+    fn new(window: Duration, budget: u32) -> Self {
+        RateLimiter {
+            window,
+            budget,
+            state: Mutex::new((Instant::now(), 0, 0)),
+        }
+    }
+    /// Returns how many events were refused since the last admitted one if this one is
+    /// admitted, or `None` to drop it. Passing `now` lets tests run without sleeping.
+    fn admit(&self, now: Instant) -> Option<u64> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (opened, admitted, refused) = &mut *state;
+        if now.saturating_duration_since(*opened) >= self.window {
+            (*opened, *admitted) = (now, 0);
+        }
+        if *admitted < self.budget {
+            *admitted += 1;
+            Some(std::mem::take(refused))
+        } else {
+            *refused += 1;
+            None
         }
     }
 }
@@ -1230,6 +1364,15 @@ pub async fn run(
             }
         }
     });
+    tokio::spawn({
+        let guard = guard.clone();
+        async move {
+            loop {
+                tokio::time::sleep(DNS_REPEATS_FLUSH).await;
+                guard.flush_dns_denials();
+            }
+        }
+    });
     // The way out: hand the host what the guests are owed, then publish once more — which is
     // what makes a `vk run` figure whole, its last flow closing as the guest exits, too late
     // for the beat before teardown. A reader that stops the switch and waits for it therefore
@@ -1253,6 +1396,7 @@ pub async fn run(
                 // The receiver runs dry when the last of them is done.
                 let _ = tokio::time::timeout(DRAIN_DEADLINE, drained.recv()).await;
                 guard.publish_bytes();
+                guard.flush_dns_denials();
                 // `exit` runs no destructors, so the relay main set up is finished here.
                 crate::outrelay::finish();
                 std::process::exit(0);
@@ -1452,10 +1596,10 @@ impl Switch {
                         let mac: Mac = frame[6..12].try_into().unwrap();
                         let hosts = self.hosts.clone();
                         let egress = self.egress.clone();
-                        let (gw, upstreams, query) =
-                            (self.cfg.gateway, self.upstreams.clone(), query.to_vec());
+                        let (lan, upstreams, query) =
+                            (self.cfg, self.upstreams.clone(), query.to_vec());
                         tokio::spawn(handle_dns(
-                            query, hosts, upstreams, gw, cip, src_port, mac, tx, egress,
+                            query, hosts, upstreams, lan, cip, src_port, mac, tx, egress,
                         ));
                     }
                 } else if let Some(rst) = self
@@ -2179,14 +2323,15 @@ fn host_upstreams() -> Vec<SocketAddr> {
         .collect()
 }
 
-/// Resolve a guest DNS query and send the response back to it: service names are
-/// answered from the local map; everything else is forwarded to the host's resolver.
+/// Resolve a guest DNS query and send the response back to it: service names and reverse
+/// lookups on the LAN are answered from the local map; everything else is forwarded to the
+/// host's resolver.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dns(
     query: Vec<u8>,
     hosts: Arc<HashMap<String, Ipv4Addr>>,
     upstreams: Arc<[SocketAddr]>,
-    gateway: Ipv4Addr,
+    lan: Cfg,
     client_ip: Ipv4Addr,
     client_port: u16,
     client_mac: Mac,
@@ -2200,24 +2345,17 @@ async fn handle_dns(
         .first()
         .copied()
         .unwrap_or_else(|| SocketAddr::new(FALLBACK_DNS.into(), DNS_PORT));
-    let response = if let Some(r) = local_answer(&query, &hosts) {
-        Some(r) // service name: on-subnet, not subject to egress pinning
+    let response = if let Some(r) = local_answer(&query, &hosts, lan) {
+        // A service name, or a reverse lookup of a LAN address: the switch is their
+        // authority under any policy, and they are not subject to egress pinning.
+        Some(r)
     } else if let Some((name, qtype, qend)) = parse_question(&query) {
         // Format the lookup only when reporting a failure.
         let question = || format!("{name} ({})", qtype_name(qtype));
+        // Other reverse (PTR) names are held to the allowlist like any other: forwarding
+        // them would carry whatever labels the guest chose to the upstream resolver.
         let name_allowed = egress.name_allowed(client_ip, &name);
-        if is_reverse_dns(&name) {
-            // A PTR lookup resolves an IP to a name; it never opens a flow, so it
-            // needn't be allowlisted. Forward it without pinning (its answer is a
-            // name, not an A-record to admit for egress).
-            match resolve_upstream(&query, &upstreams).await {
-                Ok(a) => Some(a.reply),
-                Err(e) => {
-                    egress.log_dns_upstream(primary, &question(), &e);
-                    Some(dns_servfail(&query, qend))
-                }
-            }
-        } else if name_allowed || egress.dry_run {
+        if name_allowed || egress.dry_run {
             if name_allowed {
                 // Audit: count the guest's A-record lookups as its external contacts (egress
                 // is IPv4, so an A query is what precedes a connection); the paired AAAA query
@@ -2229,10 +2367,9 @@ async fn handle_dns(
                 // Dry-run: the allowlist would refuse this name. Record the would-be denial,
                 // but resolve and pin it below anyway so the guest's connection succeeds and
                 // the job runs unchanged.
-                eprintln!(
-                    "switch: dns would refuse (egress allowlist): {name} — dry-run, resolved"
-                );
-                egress.record_denial(crate::egress_report::Proto::Dns, &name);
+                egress.deny_dns(&name, || {
+                    format!("dns would refuse (egress allowlist): {name} — dry-run, resolved")
+                });
             }
             // forward, then pin the A-records (scoped to this resolving guest) so its
             // connection is allowed — and only its, not another VM's with a different policy.
@@ -2247,8 +2384,9 @@ async fn handle_dns(
                     // `--egress-file` can change the policy while awaiting the upstream: a
                     // name it no longer allows is refused, and its addresses not pinned.
                     if !egress.record_if_allowed(client_ip, &name, &ips, ttl) && !egress.dry_run {
-                        eprintln!("switch: dns refused (egress allowlist, just changed): {name}");
-                        egress.record_denial(crate::egress_report::Proto::Dns, &name);
+                        egress.deny_dns(&name, || {
+                            format!("dns refused (egress allowlist, just changed): {name}")
+                        });
                         Some(dns_nxdomain(&query, qend))
                     } else {
                         // Audit: these IPs are now attributable to `name` for this VM, so a
@@ -2266,21 +2404,42 @@ async fn handle_dns(
                 }
             }
         } else {
-            eprintln!("switch: dns refused (egress allowlist): {name}");
-            egress.record_denial(crate::egress_report::Proto::Dns, &name);
+            egress.deny_dns(&name, || format!("dns refused (egress allowlist): {name}"));
             Some(dns_nxdomain(&query, qend))
         }
     } else {
-        // An unparsable question leaves nothing to echo back, so a failure can only be
-        // dropped — but it is still logged.
-        resolve_upstream(&query, &upstreams)
-            .await
-            .inspect_err(|e| egress.log_dns_upstream(primary, "an unparsable question", e))
-            .ok()
-            .map(|a| a.reply)
+        // A question the switch cannot read (a compressed or malformed name, no question, or
+        // garbage) cannot be checked against the allowlist, and forwarding it would carry
+        // whatever bytes the guest chose to the upstream resolver: only an unrestricted
+        // source forwards it, and a dry-run records the would-be denial. Several questions
+        // are refused under any policy: no resolver sends them (RFC 9619), and the first
+        // could be a name the switch answers itself.
+        let restricted = !matches!(*egress.policy_for(client_ip), Egress::AllowAll);
+        let several =
+            matches!(query.get(4..6), Some(&[hi, lo]) if u16::from_be_bytes([hi, lo]) > 1);
+        let refuse = several || (restricted && !egress.dry_run);
+        if restricted {
+            egress.deny_dns(UNPARSABLE_QUERY, || match refuse {
+                true => format!("dns refused (egress allowlist): {UNPARSABLE_QUERY}"),
+                false => format!(
+                    "dns would refuse (egress allowlist): {UNPARSABLE_QUERY} — dry-run, forwarded"
+                ),
+            });
+        }
+        if refuse {
+            dns_refused_header(&query)
+        } else {
+            // With no question to echo back, an upstream failure can only be dropped — but
+            // it is still logged.
+            resolve_upstream(&query, &upstreams)
+                .await
+                .inspect_err(|e| egress.log_dns_upstream(primary, UNPARSABLE_QUERY, e))
+                .ok()
+                .map(|a| a.reply)
+        }
     };
     if let Some(resp) = response
-        && let Some(frame) = dns_frame(gateway, client_ip, client_port, client_mac, &resp)
+        && let Some(frame) = dns_frame(lan.gateway, client_ip, client_port, client_mac, &resp)
     {
         let _ = tx.send(frame);
     }
@@ -2516,12 +2675,40 @@ fn qtype_name(qtype: u16) -> std::borrow::Cow<'static, str> {
     }
 }
 
-/// If the query's name is a known service name, build the answer locally (an A record
-/// for A queries, NODATA otherwise so the name never leaks upstream); else None.
-fn local_answer(query: &[u8], hosts: &HashMap<String, Ipv4Addr>) -> Option<Vec<u8>> {
+/// Answer a query the switch is the authority for: a known service name (an A record for A
+/// queries, NODATA otherwise so the name never leaks upstream), or the reverse name of an
+/// address on the LAN (the service names at that address as PTR records, NXDOMAIN when there
+/// are none — the host's resolver knows nothing of this subnet). Else None.
+fn local_answer(query: &[u8], hosts: &HashMap<String, Ipv4Addr>, lan: Cfg) -> Option<Vec<u8>> {
     let (name, qtype, qend) = parse_question(query)?;
-    let ip = hosts.get(&name)?;
-    Some(dns_response(query, qend, qtype, *ip))
+    if let Some(ip) = hosts.get(&name) {
+        return Some(dns_response(query, qend, qtype, *ip));
+    }
+    let addr = reverse_v4(&name).filter(|ip| lan.on_lan(*ip))?;
+    let mut names: Vec<&str> = hosts
+        .iter()
+        .filter(|(_, ip)| **ip == addr)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if names.is_empty() {
+        return Some(dns_nxdomain(query, qend));
+    }
+    names.sort_unstable();
+    Some(dns_ptr_response(query, qend, qtype, &names))
+}
+
+/// The address an IPv4 reverse name (`d.c.b.a.in-addr.arpa`) names, in canonical decimal;
+/// `None` for any other name, a partial one (a zone) included.
+fn reverse_v4(name: &str) -> Option<Ipv4Addr> {
+    let mut labels = name.strip_suffix(".in-addr.arpa")?.split('.');
+    let mut octets = [0u8; 4];
+    for octet in octets.iter_mut().rev() {
+        let label = labels.next()?;
+        let canonical =
+            label.bytes().all(|b| b.is_ascii_digit()) && (label == "0" || !label.starts_with('0'));
+        *octet = label.parse().ok().filter(|_| canonical)?;
+    }
+    labels.next().is_none().then_some(Ipv4Addr::from(octets))
 }
 
 /// True if `ip` is a UDP datagram to the gateway's DNS port; returns the guest's
@@ -2538,16 +2725,13 @@ fn dns_query(ip: &[u8], gateway: Ipv4Addr) -> Option<(u16, &[u8])> {
     Some((u16::from_be_bytes([udp[0], udp[1]]), udp.get(8..)?))
 }
 
-/// A reverse-DNS (PTR) query name — IPv4 `*.in-addr.arpa` or IPv6 `*.ip6.arpa`.
-/// `name` is already lowercased and stripped of any trailing dot by `parse_question`.
-fn is_reverse_dns(name: &str) -> bool {
-    name.ends_with(".in-addr.arpa") || name.ends_with(".ip6.arpa")
-}
-
-/// Parse the first DNS question: lowercased name, qtype, and the byte offset just
-/// past the question (where answers begin). Rejects compressed names in the question.
+/// Parse a query's one DNS question: lowercased name, qtype, and the byte offset just
+/// past the question (where answers begin). Rejects a query with no or several questions,
+/// a compressed name, a name longer than [`MAX_DNS_NAME`], and a label outside letters,
+/// digits, `-` and `_`: the allowlist is checked against the name returned, so it must spell
+/// the wire name exactly, and a label holding a `.` would not.
 fn parse_question(msg: &[u8]) -> Option<(String, u16, usize)> {
-    if msg.len() < 12 || u16::from_be_bytes([msg[4], msg[5]]) < 1 {
+    if msg.len() < 12 || u16::from_be_bytes([msg[4], msg[5]]) != 1 {
         return None;
     }
     let mut i = 12;
@@ -2562,35 +2746,92 @@ fn parse_question(msg: &[u8]) -> Option<(String, u16, usize)> {
             return None; // compression pointer in the question: unexpected
         }
         let label = msg.get(i + 1..i + 1 + len)?;
+        if !label
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            return None;
+        }
         if !name.is_empty() {
             name.push('.');
         }
-        name.push_str(&String::from_utf8_lossy(label));
+        name.extend(label.iter().map(|&b| char::from(b.to_ascii_lowercase())));
         i += 1 + len;
     }
-    let qtype = u16::from_be_bytes([*msg.get(i)?, *msg.get(i + 1)?]);
-    Some((name.to_ascii_lowercase(), qtype, i + 4)) // + qtype(2) + qclass(2)
+    if i - 12 > MAX_DNS_NAME {
+        return None;
+    }
+    let qtype = msg.get(i..i + 4)?; // qtype(2) + qclass(2)
+    Some((name, u16::from_be_bytes([qtype[0], qtype[1]]), i + 4))
 }
 
 /// Build a DNS response echoing the question: one A record for an A query, else
 /// NODATA (NOERROR, no answers).
 fn dns_response(query: &[u8], qend: usize, qtype: u16, ip: Ipv4Addr) -> Vec<u8> {
     const TYPE_A: u16 = 1;
+    let answers: &[Vec<u8>] = if qtype == TYPE_A {
+        &[ip.octets().to_vec()]
+    } else {
+        &[]
+    };
+    dns_answers(query, qend, TYPE_A, answers)
+}
+
+/// Build a DNS response echoing a reverse question: a PTR record per name for a PTR query,
+/// else NODATA. A name that cannot be encoded (an empty or overlong label) is left out.
+fn dns_ptr_response(query: &[u8], qend: usize, qtype: u16, names: &[&str]) -> Vec<u8> {
+    const TYPE_PTR: u16 = 12;
+    let answers: Vec<Vec<u8>> = match qtype {
+        TYPE_PTR => names.iter().filter_map(|n| encode_name(n)).collect(),
+        _ => Vec::new(),
+    };
+    dns_answers(query, qend, TYPE_PTR, &answers)
+}
+
+/// `name` in DNS wire form, or `None` when a label is empty or longer than 63 bytes or the
+/// whole exceeds [`MAX_DNS_NAME`].
+fn encode_name(name: &str) -> Option<Vec<u8>> {
+    let mut wire = Vec::with_capacity(name.len() + 2);
+    for label in name.trim_end_matches('.').split('.') {
+        let len = u8::try_from(label.len())
+            .ok()
+            .filter(|len| (1..=63).contains(len))?;
+        wire.push(len);
+        wire.extend_from_slice(label.as_bytes());
+    }
+    wire.push(0);
+    (wire.len() <= MAX_DNS_NAME).then_some(wire)
+}
+
+/// An authoritative NOERROR response echoing the question, with one `rtype` record per
+/// `rdata`, each owned by the question name. Records that would take it past
+/// [`DNS_UDP_CLASSIC`] are left out, without setting TC: the gateway serves no DNS over TCP,
+/// so a resolver retrying there would fail a lookup the records that fit can answer.
+fn dns_answers(query: &[u8], qend: usize, rtype: u16, rdatas: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::with_capacity(qend + 16);
     out.extend_from_slice(&query[0..2]); // transaction id
     out.push(0x84 | (query[2] & 0x01)); // QR=1, AA=1, RD copied
     out.push(0x80); // RA=1, rcode=0
     out.extend_from_slice(&[0, 1]); // QDCOUNT
-    out.extend_from_slice(&(u16::from(qtype == TYPE_A)).to_be_bytes()); // ANCOUNT
+    out.extend_from_slice(&[0, 0]); // ANCOUNT, counted below
     out.extend_from_slice(&[0, 0, 0, 0]); // NSCOUNT + ARCOUNT
     out.extend_from_slice(&query[12..qend]); // echo the question
-    if qtype == TYPE_A {
+    // Capped at 512 bytes, so the count and each length (at most a name's 255) fit a u16.
+    let mut ancount: u16 = 0;
+    for rdata in rdatas {
+        // Owner pointer, type, class, TTL and RDLENGTH, then the data.
+        if out.len() + 12 + rdata.len() > DNS_UDP_CLASSIC {
+            break;
+        }
         out.extend_from_slice(&[0xc0, 0x0c]); // name -> pointer to the question (offset 12)
-        out.extend_from_slice(&[0, 1, 0, 1]); // type A, class IN
+        out.extend_from_slice(&rtype.to_be_bytes());
+        out.extend_from_slice(&[0, 1]); // class IN
         out.extend_from_slice(&300u32.to_be_bytes()); // TTL
-        out.extend_from_slice(&[0, 4]); // RDLENGTH
-        out.extend_from_slice(&ip.octets());
+        out.extend_from_slice(&(rdata.len() as u16).to_be_bytes()); // RDLENGTH
+        out.extend_from_slice(rdata);
+        ancount += 1;
     }
+    out[6..8].copy_from_slice(&ancount.to_be_bytes());
     out
 }
 
@@ -2607,6 +2848,18 @@ fn dns_error(query: &[u8], qend: usize, rcode: u8) -> Vec<u8> {
     out.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // ANCOUNT + NSCOUNT + ARCOUNT
     out.extend_from_slice(&query[12..qend]); // echo the question
     out
+}
+
+/// A question-less REFUSED response for a query whose question could not be parsed:
+/// only its 12-byte header is echoed. `None` when the query is shorter than a header.
+fn dns_refused_header(query: &[u8]) -> Option<Vec<u8>> {
+    let hdr = query.get(..12)?;
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&hdr[0..2]); // transaction id
+    out.push(0x80 | (hdr[2] & 0x79)); // QR=1, opcode and RD copied, AA=0, TC=0
+    out.push(0x80 | RCODE_REFUSED); // RA=1
+    out.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // no sections
+    Some(out)
 }
 
 /// An NXDOMAIN response — refuses a name outside the egress allowlist (the guest sees
@@ -3885,6 +4138,33 @@ mod tests {
         );
     }
 
+    /// A resolver's TCP retry to the gateway resolver, which serves UDP only, is refused
+    /// under an allowlist, dry-run included, and recorded as no egress denial.
+    #[test]
+    fn a_syn_to_the_gateway_resolver_is_refused_unrecorded() {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let client_mac: Mac = [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc];
+        let dir = std::env::temp_dir().join(format!("vk-gw-tcp53-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let denied = dir.join("egress-denied.log");
+        let mut syn = Vec::new();
+        etherparse::PacketBuilder::ipv4(guest.octets(), gw.octets(), 64)
+            .tcp(44444, DNS_PORT, 1, 64240)
+            .syn()
+            .write(&mut syn, &[])
+            .unwrap();
+        for dry_run in [false, true] {
+            let guard = EgressGuard::new(Egress::restricted(&[], &[]).unwrap(), gw)
+                .with_denied_log(Some(denied.clone()))
+                .with_dry_run(dry_run);
+            assert!(guard.reject_denied_syn(&syn, client_mac).is_some());
+        }
+        assert!(crate::egress_report::read_since(&denied, 0).0.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn dry_run_records_a_denied_syn_but_carries_it() {
         let gw = Ipv4Addr::new(192, 168, 231, 1);
@@ -3914,6 +4194,7 @@ mod tests {
             vec![crate::egress_report::Denial {
                 proto: crate::egress_report::Proto::Tcp,
                 target: format!("{denied_dst}:443"),
+                count: 1,
             }],
             "the would-be denial is recorded even in dry-run"
         );
@@ -3980,6 +4261,7 @@ mod tests {
         let denial = |proto| Denial {
             proto,
             target: denied.to_string(),
+            count: 1,
         };
 
         // Dry-run: a denied UDP flow is recorded, then carried, and is not an audited contact.
@@ -4016,17 +4298,17 @@ mod tests {
     }
 
     /// A stub upstream resolver answering its first query with one A record for `answer_ip`,
-    /// after running `on_query`.
+    /// after running `on_query` on the query it received.
     async fn stub_upstream(
         answer_ip: Ipv4Addr,
-        on_query: impl FnOnce() + Send + 'static,
+        on_query: impl FnOnce(&[u8]) + Send + 'static,
     ) -> SocketAddr {
         let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream.local_addr().unwrap();
         tokio::spawn(async move {
             let mut buf = [0u8; 512];
             let (n, from) = upstream.recv_from(&mut buf).await.unwrap();
-            on_query();
+            on_query(&buf[..n]);
             let mut resp = buf[..n].to_vec();
             resp[2..4].copy_from_slice(&[0x81, 0x80]); // QR, RD, RA; NOERROR
             resp[6..8].copy_from_slice(&[0, 1]); // ANCOUNT = 1
@@ -4037,6 +4319,71 @@ mod tests {
         upstream_addr
     }
 
+    /// The LAN the DNS tests' guests sit on.
+    const DNS_TEST_LAN: Cfg = Cfg {
+        gateway: Ipv4Addr::new(192, 168, 231, 1),
+        prefix: 24,
+    };
+
+    /// Send `query` from `guest` through `handle_dns` under `guard`, with `hosts` as the
+    /// service names, against a stub upstream that runs `on_query` and answers `answer_ip`.
+    /// Returns the DNS payload the guest got (`None`: no reply) and the query the upstream
+    /// received (`None`: nothing was forwarded).
+    async fn exchange(
+        guard: &Arc<EgressGuard>,
+        guest: Ipv4Addr,
+        query: Vec<u8>,
+        hosts: HashMap<String, Ipv4Addr>,
+        answer_ip: Ipv4Addr,
+        on_query: impl FnOnce() + Send + 'static,
+    ) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let forwarded = Arc::new(Mutex::new(None));
+        let upstream = stub_upstream(answer_ip, {
+            let forwarded = forwarded.clone();
+            move |q| {
+                *forwarded.lock().unwrap() = Some(q.to_vec());
+                on_query();
+            }
+        })
+        .await;
+        let (tx, mut rx) = unbounded_channel();
+        handle_dns(
+            query,
+            Arc::new(hosts),
+            vec![upstream].into(),
+            DNS_TEST_LAN,
+            guest,
+            40000,
+            [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc],
+            tx,
+            guard.clone(),
+        )
+        .await;
+        // Past the IPv4 and UDP headers.
+        let reply = rx.try_recv().ok().map(|f| f[ETH_HDR + 20 + 8..].to_vec());
+        let forwarded = forwarded.lock().unwrap().take();
+        (reply, forwarded)
+    }
+
+    /// Send `query` from `guest` through `handle_dns` under `guard`, against a stub upstream.
+    /// Returns the reply's RCODE (`None`: no reply) and whether the query reached the upstream.
+    async fn lookup(
+        guard: &Arc<EgressGuard>,
+        guest: Ipv4Addr,
+        query: Vec<u8>,
+    ) -> (Option<u8>, bool) {
+        let (reply, forwarded) = exchange(
+            guard,
+            guest,
+            query,
+            HashMap::new(),
+            Ipv4Addr::new(10, 0, 0, 1),
+            || {},
+        )
+        .await;
+        (reply.map(|r| r[3] & 0x0f), forwarded.is_some())
+    }
+
     /// Run one A query for a name outside the allowlist through `handle_dns`, against a stub
     /// upstream that answers it with `answer_ip`. Returns the DNS payload the guest got, the
     /// guard, and the denied and audit logs.
@@ -4045,35 +4392,24 @@ mod tests {
         dry_run: bool,
         answer_ip: Ipv4Addr,
     ) -> (Vec<u8>, Arc<EgressGuard>, PathBuf, PathBuf) {
-        let gw = Ipv4Addr::new(192, 168, 231, 1);
         let guest = Ipv4Addr::new(192, 168, 231, 2);
         let dir = std::env::temp_dir().join(format!("vk-dns-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let (denied_log, audit_log) = (dir.join("denied.log"), dir.join("audit.log"));
         let guard = Arc::new(
-            EgressGuard::new(Egress::new(&[], &["corp.example.com".into()]).unwrap(), gw)
-                .with_denied_log(Some(denied_log.clone()))
-                .with_audit_log(Some(audit_log.clone()))
-                .with_dry_run(dry_run),
+            EgressGuard::new(
+                Egress::new(&[], &["corp.example.com".into()]).unwrap(),
+                DNS_TEST_LAN.gateway,
+            )
+            .with_denied_log(Some(denied_log.clone()))
+            .with_audit_log(Some(audit_log.clone()))
+            .with_dry_run(dry_run),
         );
-        let upstream_addr = stub_upstream(answer_ip, || {}).await;
-        let (tx, mut rx) = unbounded_channel();
-        handle_dns(
-            dns_question(9, "blocked.example", 1),
-            Arc::new(HashMap::new()),
-            vec![upstream_addr].into(),
-            gw,
-            guest,
-            40000,
-            [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc],
-            tx,
-            guard.clone(),
-        )
-        .await;
-        let frame = rx.try_recv().expect("handle_dns answers the guest");
-        let payload = frame[ETH_HDR + 20 + 8..].to_vec(); // past the IPv4 and UDP headers
-        (payload, guard, denied_log, audit_log)
+        let query = dns_question(9, "blocked.example", 1);
+        let (reply, _) = exchange(&guard, guest, query, HashMap::new(), answer_ip, || {}).await;
+        let reply = reply.expect("handle_dns answers the guest");
+        (reply, guard, denied_log, audit_log)
     }
 
     #[tokio::test]
@@ -4088,6 +4424,7 @@ mod tests {
             vec![crate::egress_report::Denial {
                 proto: crate::egress_report::Proto::Dns,
                 target: "blocked.example".into(),
+                count: 1,
             }]
         );
         assert!(crate::egress_report::read_contacts(&audit_log).is_empty());
@@ -4106,6 +4443,7 @@ mod tests {
             vec![crate::egress_report::Denial {
                 proto: crate::egress_report::Proto::Dns,
                 target: "blocked.example".into(),
+                count: 1,
             }]
         );
         assert!(!guard.allows(guest, SocketAddr::new(ip.into(), 443)));
@@ -4114,7 +4452,6 @@ mod tests {
 
     #[tokio::test]
     async fn dns_refuses_a_name_the_policy_dropped_while_it_was_resolving() {
-        let gw = Ipv4Addr::new(192, 168, 231, 1);
         let guest = Ipv4Addr::new(192, 168, 231, 2);
         let ip = Ipv4Addr::new(10, 20, 30, 40);
         let dir = std::env::temp_dir().join(format!("vk-dns-changed-{}", std::process::id()));
@@ -4124,41 +4461,504 @@ mod tests {
         let guard = Arc::new(
             EgressGuard::new(
                 Egress::restricted(&[], &["corp.example.com".into()]).unwrap(),
-                gw,
+                DNS_TEST_LAN.gateway,
             )
             .with_denied_log(Some(denied_log.clone())),
         );
         // The edit lands while the upstream holds the query.
-        let upstream = stub_upstream(ip, {
+        let edit = {
             let guard = guard.clone();
             move || guard.replace_policy(Egress::restricted(&[], &[]).unwrap())
-        })
-        .await;
-        let (tx, mut rx) = unbounded_channel();
-        handle_dns(
-            dns_question(9, "git.corp.example.com", 1),
-            Arc::new(HashMap::new()),
-            vec![upstream].into(),
-            gw,
-            guest,
-            40000,
-            [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc],
-            tx,
-            guard.clone(),
-        )
-        .await;
-        let frame = rx.try_recv().expect("handle_dns answers the guest");
-        let reply = &frame[ETH_HDR + 20 + 8..];
+        };
+        let query = dns_question(9, "git.corp.example.com", 1);
+        let (reply, _) = exchange(&guard, guest, query, HashMap::new(), ip, edit).await;
+        let reply = reply.expect("handle_dns answers the guest");
         assert_eq!(reply[3] & 0x0f, RCODE_NXDOMAIN, "NXDOMAIN");
         assert_eq!(
             crate::egress_report::read_since(&denied_log, 0).0,
             vec![crate::egress_report::Denial {
                 proto: crate::egress_report::Proto::Dns,
                 target: "git.corp.example.com".into(),
+                count: 1,
             }]
         );
         assert!(!guard.allows(guest, SocketAddr::new(ip.into(), 443)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Send one PTR query from `guest` through `handle_dns` under `guard`, against a stub
+    /// upstream. Returns the reply's RCODE and whether the query reached the upstream.
+    async fn reverse_lookup(guard: &Arc<EgressGuard>, guest: Ipv4Addr) -> (u8, bool) {
+        let query = dns_question(9, "73.65.63.72.65.74.in-addr.arpa", 12);
+        let (rcode, queried) = lookup(guard, guest, query).await;
+        (rcode.expect("handle_dns answers the guest"), queried)
+    }
+
+    #[tokio::test]
+    async fn reverse_lookups_reach_the_upstream_only_where_egress_allows_them() {
+        use crate::egress_report::{Denial, Proto};
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let (guest, open_guest) = (
+            Ipv4Addr::new(192, 168, 231, 2),
+            Ipv4Addr::new(192, 168, 231, 3),
+        );
+        let dir = std::env::temp_dir().join(format!("vk-dns-ptr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let denial = vec![Denial {
+            proto: Proto::Dns,
+            target: "73.65.63.72.65.74.in-addr.arpa".into(),
+            count: 1,
+        }];
+        let allowlist = || Egress::restricted(&[], &["corp.example.com".into()]).unwrap();
+
+        // Unrestricted: forwarded.
+        let open = Arc::new(EgressGuard::new(Egress::AllowAll, gw));
+        assert_eq!(reverse_lookup(&open, guest).await, (0, true));
+
+        // Allowlist: answered NXDOMAIN without reaching the upstream, and recorded.
+        let log = dir.join("enforce.log");
+        let enforce =
+            Arc::new(EgressGuard::new(allowlist(), gw).with_denied_log(Some(log.clone())));
+        assert_eq!(
+            reverse_lookup(&enforce, guest).await,
+            (RCODE_NXDOMAIN, false)
+        );
+        assert_eq!(crate::egress_report::read_since(&log, 0).0, denial);
+
+        // Dry-run: forwarded, and recorded as a would-be denial.
+        let log = dir.join("dry.log");
+        let dry = Arc::new(
+            EgressGuard::new(allowlist(), gw)
+                .with_denied_log(Some(log.clone()))
+                .with_dry_run(true),
+        );
+        assert_eq!(reverse_lookup(&dry, guest).await, (0, true));
+        assert_eq!(crate::egress_report::read_since(&log, 0).0, denial);
+
+        // Per-source: an unrestricted default does not open a restricted source, and a
+        // restricted default does not close an unrestricted one.
+        let per_source = Arc::new(
+            EgressGuard::new(Egress::AllowAll, gw)
+                .with_per_source(HashMap::from([(guest, allowlist())])),
+        );
+        assert_eq!(
+            reverse_lookup(&per_source, guest).await,
+            (RCODE_NXDOMAIN, false)
+        );
+        assert_eq!(reverse_lookup(&per_source, open_guest).await, (0, true));
+        let per_source = Arc::new(
+            EgressGuard::new(allowlist(), gw)
+                .with_per_source(HashMap::from([(open_guest, Egress::AllowAll)])),
+        );
+        assert_eq!(reverse_lookup(&per_source, open_guest).await, (0, true));
+
+        // A replaced default policy governs the next lookup.
+        let reloaded = Arc::new(EgressGuard::new(Egress::AllowAll, gw));
+        reloaded.replace_policy(allowlist());
+        assert_eq!(
+            reverse_lookup(&reloaded, guest).await,
+            (RCODE_NXDOMAIN, false)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn unparsable_queries_reach_the_upstream_only_where_egress_is_unrestricted() {
+        use crate::egress_report::{Denial, Proto};
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let (guest, open_guest) = (
+            Ipv4Addr::new(192, 168, 231, 2),
+            Ipv4Addr::new(192, 168, 231, 3),
+        );
+        let dir = std::env::temp_dir().join(format!("vk-dns-unparsable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A compression pointer as the question name; a label holding a dot, which would
+        // read as the allowed `payload.corp.example.com`; a non-ASCII and a control byte in
+        // a label; a name longer than DNS allows; a question cut short inside its class; and
+        // a bare header with no question.
+        let compressed = || {
+            let mut q = dns_question(7, "x", 1);
+            q.truncate(12);
+            q.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+            q
+        };
+        let with_labels = |labels: &[&[u8]]| {
+            let mut q = dns_question(7, "x", 1);
+            q.truncate(12);
+            for label in labels {
+                q.push(label.len() as u8);
+                q.extend_from_slice(label);
+            }
+            q.extend_from_slice(&[0, 0, 1, 0, 1]);
+            q
+        };
+        let dotted = move || with_labels(&[b"payload.corp.example", b"com"]);
+        let non_ascii = move || with_labels(&[b"caf\xc3\xa9", b"corp", b"example", b"com"]);
+        let control = move || with_labels(&[b"a\nb", b"corp", b"example", b"com"]);
+        let overlong = || {
+            let name = format!("{}.corp.example.com", vec!["a".repeat(63); 4].join("."));
+            dns_question(7, &name, 1)
+        };
+        let cut_short = || {
+            let mut q = dns_question(7, "corp.example.com", 1);
+            q.truncate(q.len() - 1);
+            q
+        };
+        let no_question = || {
+            let mut q = dns_question(7, "x", 1);
+            q.truncate(12);
+            q[5] = 0;
+            q
+        };
+        let queries: [&dyn Fn() -> Vec<u8>; 7] = [
+            &compressed,
+            &dotted,
+            &non_ascii,
+            &control,
+            &overlong,
+            &cut_short,
+            &no_question,
+        ];
+        // A second question carrying the payload after an allowed first one.
+        let two_questions = || {
+            let mut q = dns_question(8, "corp.example.com", 1);
+            q[5] = 2;
+            q.extend_from_slice(&dns_question(0, "73.65.63.72.65.74.example", 1)[12..]);
+            q
+        };
+        let denial = Denial {
+            proto: Proto::Dns,
+            target: UNPARSABLE_QUERY.into(),
+            count: 1,
+        };
+        let allowlist = || Egress::restricted(&[], &["corp.example.com".into()]).unwrap();
+
+        // Unrestricted: forwarded, but for several questions, which are refused under any
+        // policy — even when the first is a service name the switch would answer.
+        let open = Arc::new(EgressGuard::new(Egress::AllowAll, gw));
+        for q in queries {
+            assert_eq!(lookup(&open, guest, q()).await, (Some(0), true));
+        }
+        assert_eq!(
+            lookup(&open, guest, two_questions()).await,
+            (Some(RCODE_REFUSED), false)
+        );
+        let mut service_first = dns_question(8, "redis", 1);
+        service_first[5] = 2;
+        service_first.extend_from_slice(&dns_question(0, "payload.example", 1)[12..]);
+        let hosts = HashMap::from([("redis".to_string(), Ipv4Addr::new(192, 168, 231, 9))]);
+        let (reply, forwarded) = exchange(
+            &open,
+            guest,
+            service_first,
+            hosts,
+            Ipv4Addr::new(10, 0, 0, 1),
+            || {},
+        )
+        .await;
+        assert_eq!(reply.map(|r| r[3] & 0x0f), Some(RCODE_REFUSED));
+        assert!(forwarded.is_none());
+
+        // Allowlist: REFUSED without reaching the upstream, and recorded; a query too short
+        // to answer is dropped.
+        let log = dir.join("enforce.log");
+        let enforce =
+            Arc::new(EgressGuard::new(allowlist(), gw).with_denied_log(Some(log.clone())));
+        for q in queries
+            .into_iter()
+            .chain([&two_questions as &dyn Fn() -> Vec<u8>])
+        {
+            assert_eq!(
+                lookup(&enforce, guest, q()).await,
+                (Some(RCODE_REFUSED), false)
+            );
+        }
+        assert_eq!(lookup(&enforce, guest, vec![0; 11]).await, (None, false));
+        // The first at once, the repeats counted in one record when they are written out.
+        assert_eq!(
+            crate::egress_report::read_since(&log, 0).0,
+            std::slice::from_ref(&denial)
+        );
+        enforce.flush_dns_denials();
+        let repeats = Denial {
+            count: queries.len() as u64 + 1,
+            ..denial.clone()
+        };
+        assert_eq!(
+            crate::egress_report::read_since(&log, 0).0,
+            [denial.clone(), repeats]
+        );
+
+        // Dry-run: forwarded, and recorded as a would-be denial; several questions are still
+        // refused.
+        let log = dir.join("dry.log");
+        let dry = Arc::new(
+            EgressGuard::new(allowlist(), gw)
+                .with_denied_log(Some(log.clone()))
+                .with_dry_run(true),
+        );
+        assert_eq!(lookup(&dry, guest, compressed()).await, (Some(0), true));
+        assert_eq!(
+            lookup(&dry, guest, two_questions()).await,
+            (Some(RCODE_REFUSED), false)
+        );
+        dry.flush_dns_denials();
+        assert_eq!(crate::egress_report::read_since(&log, 0).0, vec![denial; 2]);
+
+        // Per-source and a replaced default policy decide as for names.
+        let per_source = Arc::new(
+            EgressGuard::new(Egress::AllowAll, gw)
+                .with_per_source(HashMap::from([(guest, allowlist())])),
+        );
+        assert_eq!(
+            lookup(&per_source, guest, compressed()).await,
+            (Some(RCODE_REFUSED), false)
+        );
+        assert_eq!(
+            lookup(&per_source, open_guest, compressed()).await,
+            (Some(0), true)
+        );
+        let reloaded = Arc::new(EgressGuard::new(Egress::AllowAll, gw));
+        reloaded.replace_policy(allowlist());
+        assert_eq!(
+            lookup(&reloaded, guest, compressed()).await,
+            (Some(RCODE_REFUSED), false)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_listed_reverse_zone_is_forwarded() {
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let listed = Arc::new(EgressGuard::new(
+            Egress::restricted(&[], &["in-addr.arpa".into()]).unwrap(),
+            DNS_TEST_LAN.gateway,
+        ));
+        assert_eq!(reverse_lookup(&listed, guest).await, (0, true));
+    }
+
+    #[tokio::test]
+    async fn reverse_lookups_on_the_lan_are_answered_locally_under_any_policy() {
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let dir = std::env::temp_dir().join(format!("vk-dns-lan-ptr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("denied.log");
+        let hosts = HashMap::from([
+            ("redis".to_string(), Ipv4Addr::new(192, 168, 231, 3)),
+            ("cache".to_string(), Ipv4Addr::new(192, 168, 231, 3)),
+        ]);
+        let enforce = Arc::new(
+            EgressGuard::new(Egress::restricted(&[], &[]).unwrap(), DNS_TEST_LAN.gateway)
+                .with_denied_log(Some(log.clone())),
+        );
+        let open = Arc::new(EgressGuard::new(Egress::AllowAll, DNS_TEST_LAN.gateway));
+        for guard in [&enforce, &open] {
+            let ask = |name: &str, qtype| {
+                exchange(
+                    guard,
+                    guest,
+                    dns_question(4, name, qtype),
+                    hosts.clone(),
+                    Ipv4Addr::new(10, 0, 0, 1),
+                    || {},
+                )
+            };
+            // A service's address: its names, sorted, as PTR records.
+            let (reply, forwarded) = ask("3.231.168.192.in-addr.arpa", 12).await;
+            let reply = reply.expect("answered");
+            assert!(forwarded.is_none());
+            assert_eq!(reply[3] & 0x0f, 0);
+            assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 2); // ANCOUNT
+            let (_, _, qend) = parse_question(&reply).unwrap();
+            let ptr = |name: &str| {
+                let mut rr = vec![0xc0, 0x0c, 0, 12, 0, 1, 0, 0, 1, 0x2c, 0];
+                rr.push(name.len() as u8 + 2);
+                rr.push(name.len() as u8);
+                rr.extend_from_slice(name.as_bytes());
+                rr.push(0);
+                rr
+            };
+            assert_eq!(reply[qend..], [ptr("cache"), ptr("redis")].concat());
+            // Another type for that name: NODATA.
+            let (reply, forwarded) = ask("3.231.168.192.in-addr.arpa", 1).await;
+            let reply = reply.expect("answered");
+            assert!(forwarded.is_none());
+            assert_eq!((reply[3] & 0x0f, reply[7]), (0, 0));
+            // A LAN address nothing is named at, the gateway's included: NXDOMAIN.
+            for name in ["4.231.168.192.in-addr.arpa", "1.231.168.192.in-addr.arpa"] {
+                let (reply, forwarded) = ask(name, 12).await;
+                assert_eq!(reply.map(|r| r[3] & 0x0f), Some(RCODE_NXDOMAIN));
+                assert!(forwarded.is_none());
+            }
+        }
+        // None of it is a denial; an address off the LAN still is.
+        assert!(crate::egress_report::read_since(&log, 0).0.is_empty());
+        let off_lan = dns_question(4, "3.231.168.10.in-addr.arpa", 12);
+        assert_eq!(
+            lookup(&enforce, guest, off_lan.clone()).await,
+            (Some(RCODE_NXDOMAIN), false)
+        );
+        assert_eq!(crate::egress_report::read_since(&log, 0).0.len(), 1);
+        assert_eq!(lookup(&open, guest, off_lan).await, (Some(0), true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// More service names at one address than fit a 512-byte answer: as many as fit, whole
+    /// records only, and TC never set — the gateway has no TCP resolver to retry against.
+    #[test]
+    fn a_local_ptr_answer_is_capped_at_512_bytes_without_tc() {
+        let addr = Ipv4Addr::new(192, 168, 231, 3);
+        let hosts: HashMap<String, Ipv4Addr> = (0..40)
+            .map(|i| (format!("service-with-a-long-name-{i:02}"), addr))
+            .collect();
+        let q = dns_question(4, "3.231.168.192.in-addr.arpa", 12);
+        let reply = local_answer(&q, &hosts, DNS_TEST_LAN).expect("answered");
+        assert!(reply.len() <= DNS_UDP_CLASSIC, "{} bytes", reply.len());
+        assert_eq!(reply[2] & 0x02, 0, "TC clear");
+        let ancount = u16::from_be_bytes([reply[6], reply[7]]);
+        let (_, _, qend) = parse_question(&reply).unwrap();
+        // Each record: 12 bytes of header, then the name in wire form.
+        let record = 12 + encode_name("service-with-a-long-name-00").unwrap().len();
+        assert_eq!(reply.len(), qend + usize::from(ancount) * record);
+        assert!(
+            reply.len() + record > DNS_UDP_CLASSIC,
+            "no room was left unused"
+        );
+        assert!(ancount > 0 && usize::from(ancount) < hosts.len());
+
+        let few: HashMap<String, Ipv4Addr> = hosts.into_iter().take(3).collect();
+        let reply = local_answer(&q, &few, DNS_TEST_LAN).expect("answered");
+        assert_eq!(reply[2] & 0x02, 0, "TC clear");
+        assert_eq!(u16::from_be_bytes([reply[6], reply[7]]), 3);
+    }
+
+    #[test]
+    fn reverse_v4_reads_only_a_canonical_full_address() {
+        assert_eq!(
+            reverse_v4("3.231.168.192.in-addr.arpa"),
+            Some(Ipv4Addr::new(192, 168, 231, 3))
+        );
+        assert_eq!(
+            reverse_v4("0.0.0.10.in-addr.arpa"),
+            Some(Ipv4Addr::new(10, 0, 0, 0))
+        );
+        for name in [
+            "231.168.192.in-addr.arpa",     // a zone, not an address
+            "1.3.231.168.192.in-addr.arpa", // five octets
+            "03.231.168.192.in-addr.arpa",  // not canonical
+            "256.231.168.192.in-addr.arpa",
+            "3.231.168.192.ip6.arpa",
+            "in-addr.arpa",
+        ] {
+            assert_eq!(reverse_v4(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn parse_question_takes_service_style_names() {
+        let q = dns_question(1, "_sip._tcp.Corp-1.example", 33);
+        assert_eq!(
+            parse_question(&q),
+            Some(("_sip._tcp.corp-1.example".into(), 33, q.len()))
+        );
+        // The longest name DNS allows still parses.
+        let name = format!("{}.{}", vec!["a".repeat(63); 3].join("."), "a".repeat(61));
+        let q = dns_question(1, &name, 1);
+        assert_eq!(parse_question(&q).map(|(n, ..)| n.len()), Some(253));
+    }
+
+    #[test]
+    fn rate_limiter_admits_a_budget_per_window() {
+        let limiter = RateLimiter::new(Duration::from_secs(30), 2);
+        let t0 = Instant::now();
+        assert_eq!(limiter.admit(t0), Some(0));
+        assert_eq!(limiter.admit(t0 + Duration::from_secs(1)), Some(0));
+        assert_eq!(limiter.admit(t0 + Duration::from_secs(2)), None);
+        assert_eq!(limiter.admit(t0 + Duration::from_secs(3)), None);
+        // A new window: admitted again, carrying the count dropped.
+        let t1 = t0 + Duration::from_secs(31);
+        assert_eq!(limiter.admit(t1), Some(2));
+        assert_eq!(limiter.admit(t1), Some(0));
+        assert_eq!(limiter.admit(t1), None);
+    }
+
+    /// Every DNS denial is recorded, however many the guest makes: each name once, its repeats
+    /// counted as they are written out, and names past [`DNS_DENIED_NAMES`] under
+    /// [`DNS_DENIED_MORE`]. Only the log is rate-limited.
+    #[test]
+    fn dns_denials_are_all_recorded_in_bounded_storage() {
+        use crate::egress_report::Proto;
+        let dir = std::env::temp_dir().join(format!("vk-dns-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("denied.log");
+        let guard = EgressGuard::new(Egress::restricted(&[], &[]).unwrap(), DNS_TEST_LAN.gateway)
+            .with_denied_log(Some(log.clone()));
+        let names = DNS_DENIED_NAMES + 10;
+        let round = || {
+            for i in 0..names {
+                guard.deny_dns(&format!("n{i}.example"), || format!("dns refused: n{i}"));
+            }
+        };
+        round();
+        let denials = crate::egress_report::read_since(&log, 0).0;
+        assert_eq!(denials.len(), DNS_DENIED_NAMES + 1);
+        assert_eq!(denials[0].target, "n0.example");
+        assert_eq!(denials[DNS_DENIED_NAMES].target, DNS_DENIED_MORE);
+        assert!(denials.iter().all(|d| d.count == 1));
+        guard.flush_dns_denials();
+        round();
+        round();
+        guard.flush_dns_denials();
+        let flushed = crate::egress_report::read_since(&log, 0).0;
+        let count = |target: &str| -> u64 {
+            flushed
+                .iter()
+                .filter(|d| d.target == target)
+                .map(|d| d.count)
+                .sum()
+        };
+        assert_eq!(count("n0.example"), 3);
+        assert_eq!(count(&format!("n{}.example", DNS_DENIED_NAMES - 1)), 3);
+        assert_eq!(count(&format!("n{DNS_DENIED_NAMES}.example")), 0);
+        assert_eq!(count(DNS_DENIED_MORE), 30);
+        assert_eq!(
+            flushed.iter().map(|d| d.count).sum::<u64>(),
+            3 * names as u64
+        );
+        // Written out once: a flush with nothing new adds nothing.
+        guard.flush_dns_denials();
+        assert_eq!(crate::egress_report::read_since(&log, 0).0, flushed);
+        assert!(flushed.iter().all(|d| d.proto == Proto::Dns));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refused_header_echoes_the_id_opcode_and_rd_only() {
+        let mut q = dns_question(0xbeef, "x", 1);
+        q[2] |= 0x06; // AA and TC set by the guest: not echoed
+        let r = dns_refused_header(&q).unwrap();
+        assert_eq!(
+            r,
+            [
+                0xbe,
+                0xef,
+                0x81,
+                0x80 | RCODE_REFUSED,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            ]
+        );
+        assert!(dns_refused_header(&q[..11]).is_none());
     }
 
     #[test]
@@ -5620,36 +6420,26 @@ mod tests {
 
     #[test]
     fn resolver_answers_service_a_records() {
+        let lan = Cfg {
+            gateway: Ipv4Addr::new(192, 168, 127, 1),
+            prefix: 24,
+        };
         let mut hosts = HashMap::new();
         hosts.insert("redis.lan".to_string(), Ipv4Addr::new(192, 168, 127, 3));
         // A query for a known name -> one A answer with the mapped IP.
-        let resp = local_answer(&dns_question(0x1234, "redis.lan", 1), &hosts).expect("A answer");
+        let resp =
+            local_answer(&dns_question(0x1234, "redis.lan", 1), &hosts, lan).expect("A answer");
         assert_eq!(&resp[0..2], &[0x12, 0x34]); // echoed id
         assert_eq!(resp[2] & 0x80, 0x80); // QR=1
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1); // ANCOUNT
         assert_eq!(&resp[resp.len() - 4..], &[192, 168, 127, 3]); // A rdata
         // case-insensitive match
-        assert!(local_answer(&dns_question(1, "REDIS.LAN", 1), &hosts).is_some());
+        assert!(local_answer(&dns_question(1, "REDIS.LAN", 1), &hosts, lan).is_some());
         // AAAA for a known name -> NODATA (no answers), never forwarded upstream.
-        let aaaa = local_answer(&dns_question(2, "redis.lan", 28), &hosts).expect("NODATA");
+        let aaaa = local_answer(&dns_question(2, "redis.lan", 28), &hosts, lan).expect("NODATA");
         assert_eq!(u16::from_be_bytes([aaaa[6], aaaa[7]]), 0); // ANCOUNT 0
         // unknown name -> not answered locally (caller forwards upstream)
-        assert!(local_answer(&dns_question(3, "github.com", 1), &hosts).is_none());
-    }
-
-    #[test]
-    fn reverse_dns_is_recognized() {
-        // PTR names are forwarded regardless of the allowlist (they open no flow).
-        assert!(is_reverse_dns("68.1.10.10.in-addr.arpa"));
-        assert!(is_reverse_dns(
-            "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa"
-        ));
-        // forward names are not reverse lookups
-        assert!(!is_reverse_dns("repo.maven.apache.org"));
-        assert!(!is_reverse_dns("in-addr.arpa.evil.com"));
-        // the bare zone (no address label) is not a PTR query
-        assert!(!is_reverse_dns("in-addr.arpa"));
-        assert!(!is_reverse_dns("ip6.arpa"));
+        assert!(local_answer(&dns_question(3, "github.com", 1), &hosts, lan).is_none());
     }
 
     #[test]

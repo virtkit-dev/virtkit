@@ -455,7 +455,7 @@
           "enum": ["unrestricted", "restricted"]
         },
         "allow-name": {
-          "description": "`restricted` only: DNS suffixes the guest may resolve and reach, dot-anchored — `debian.org` also allows `deb.debian.org`. Any other name is NXDOMAIN, except compose service names and reverse lookups.",
+          "description": "`restricted` only: DNS suffixes the guest may resolve and reach, dot-anchored — `debian.org` also allows `deb.debian.org`. Any other name, reverse (PTR) lookups included, is NXDOMAIN, except compose service names and reverse lookups of the environment's own addresses.",
           "type": "array",
           "items": { "type": "string" }
         },

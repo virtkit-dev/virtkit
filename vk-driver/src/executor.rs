@@ -204,13 +204,13 @@ fn blocked_header(dry_run: bool, stage: Option<&str>) -> String {
     }
 }
 
-/// Forward the per-job switch's egress refusals into the job trace. The switch
-/// (`net.mode = "switch"`) appends a typed denial record per refusal to its denial channel
-/// (see egress_report), which the running job never sees. This drains only the records
-/// added since the previous stage — a byte offset persisted in the job dir — so each block
-/// is reported once, in the stage during which it happened, then prints them deduplicated
-/// to stderr (gitlab-runner captures it) under a [`blocked_header`] naming `stage`.
-/// Best-effort: no channel (net.mode != "switch") or an IO error is a silent no-op.
+/// Forward egress refusals from the per-job switch (`net.mode = "switch"`) to the job trace.
+/// Its denial channel (see egress_report) is hidden from the job and holds one typed record
+/// per refusal, except DNS repeats, which arrive as counts a few seconds later. Read from
+/// the byte offset saved in the job directory so each record is reported once, in the stage
+/// when it was recorded. Deduplicate and print to stderr, captured by gitlab-runner, under
+/// a [`blocked_header`] naming `stage`. Best-effort: no channel (net.mode != "switch") or an
+/// IO error is a silent no-op.
 fn report_egress_blocks(ctx: &JobCtx, stage: Option<&str>) {
     let pos_file = ctx.job_dir.join("egress-denied.offset");
     let start: u64 = std::fs::read_to_string(&pos_file)
@@ -222,27 +222,33 @@ fn report_egress_blocks(ctx: &JobCtx, stage: Option<&str>) {
         return; // nothing new (and no offset to persist)
     }
 
-    // Unique denials in first-seen order, counting repeats so a retry loop hammering one
-    // blocked host does not flood the trace.
-    let mut seen: Vec<(String, usize)> = Vec::new();
-    for d in &denials {
-        let msg = d.display();
-        match seen.iter_mut().find(|(m, _)| *m == msg) {
-            Some((_, n)) => *n += 1,
-            None => seen.push((msg, 1)),
-        }
-    }
-    if !seen.is_empty() {
+    let lines = blocked_lines(&denials);
+    if !lines.is_empty() {
         eprintln!("{}", blocked_header(ctx.egress_run_dry_run(), stage));
-        for (msg, n) in &seen {
-            if *n > 1 {
-                eprintln!("  {msg} (x{n})");
-            } else {
-                eprintln!("  {msg}");
-            }
+        for line in &lines {
+            eprintln!("  {line}");
         }
     }
     let _ = std::fs::write(&pos_file, new_offset.to_string());
+}
+
+/// Unique denials in first-seen order, with their repeats summed into an `(xN)` so a retry
+/// loop hammering one blocked host does not flood the trace.
+fn blocked_lines(denials: &[crate::egress_report::Denial]) -> Vec<String> {
+    let mut seen: Vec<(String, u64)> = Vec::new();
+    for d in denials {
+        let msg = d.display();
+        match seen.iter_mut().find(|(m, _)| *m == msg) {
+            Some((_, n)) => *n = n.saturating_add(d.count),
+            None => seen.push((msg, d.count)),
+        }
+    }
+    seen.into_iter()
+        .map(|(msg, n)| match n {
+            1 => msg,
+            n => format!("{msg} (x{n})"),
+        })
+        .collect()
 }
 
 /// Print the per-job egress audit summary into the job trace: every external domain the switch
@@ -626,7 +632,7 @@ pub async fn next(
 
 #[cfg(test)]
 mod tests {
-    use super::{blocked_header, parse_mark, section};
+    use super::{blocked_header, blocked_lines, parse_mark, section};
 
     /// The egress-denied block header names its stage and, in dry-run, says nothing was
     /// actually blocked — so a recurring block is not read as a duplicate, and a dry-run
@@ -644,6 +650,32 @@ mod tests {
         assert_eq!(
             blocked_header(true, Some("step_script")),
             "virtkit: egress the allowlist would block (dry-run, not enforced) [step_script]:"
+        );
+    }
+
+    /// Repeats are summed across records, a counted one included, in first-seen order.
+    #[test]
+    fn blocked_lines_sum_the_repeats_of_each_target() {
+        use crate::egress_report::{Denial, Proto};
+        let d = |proto, target: &str, count| Denial {
+            proto,
+            target: target.into(),
+            count,
+        };
+        let denials = [
+            d(Proto::Dns, "a.example", 1),
+            d(Proto::Tcp, "10.0.0.1:443", 1),
+            d(Proto::Dns, "b.example", 1),
+            d(Proto::Tcp, "10.0.0.1:443", 1),
+            d(Proto::Dns, "a.example", 40),
+        ];
+        assert_eq!(
+            blocked_lines(&denials),
+            [
+                "egress denied (dns) a.example (x41)",
+                "egress denied (tcp) 10.0.0.1:443 (x2)",
+                "egress denied (dns) b.example",
+            ]
         );
     }
 

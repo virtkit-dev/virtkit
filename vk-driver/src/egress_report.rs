@@ -38,12 +38,13 @@ impl Proto {
     }
 }
 
-/// One egress request the switch refused: its protocol and destination (an `ip:port` for
-/// tcp/udp, a DNS name for dns).
+/// Egress requests the switch refused: their protocol and destination (an `ip:port` for
+/// tcp/udp, a DNS name for dns), and how many of them one record stands for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Denial {
     pub proto: Proto,
     pub target: String,
+    pub count: u64,
 }
 
 impl Denial {
@@ -60,12 +61,23 @@ impl Denial {
 /// tasks appending at once don't interleave fragments of a line. Best-effort: any IO error
 /// is dropped — a lost denial notice must never disturb the job or the switch's forwarding.
 pub fn append(path: &Path, proto: Proto, target: &str) {
+    append_repeats(path, proto, target, 1);
+}
+
+/// [`append`] for `count` refusals of the same target at once, as a `proto\ttarget\tcount`
+/// record; the count is left off at one. The sanitized target holds no tab, so the count is
+/// unambiguous.
+pub fn append_repeats(path: &Path, proto: Proto, target: &str, count: u64) {
     let target: String = target
         .chars()
         .map(|c| if c.is_control() { '\u{fffd}' } else { c })
         .collect();
+    let line = match count {
+        1 => format!("{}\t{target}\n", proto.as_str()),
+        n => format!("{}\t{target}\t{n}\n", proto.as_str()),
+    };
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = f.write_all(format!("{}\t{}\n", proto.as_str(), target).as_bytes());
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -222,12 +234,20 @@ pub fn read_since(path: &Path, offset: u64) -> (Vec<Denial>, u64) {
     };
     let mut out = Vec::new();
     for line in String::from_utf8_lossy(&buf[..consumed]).lines() {
-        if let Some((p, target)) = line.split_once('\t')
+        if let Some((p, rest)) = line.split_once('\t')
             && let Some(proto) = Proto::parse(p)
         {
+            let (target, count) = match rest.rsplit_once('\t') {
+                Some((target, n)) => match n.parse() {
+                    Ok(n) => (target, n),
+                    Err(_) => continue,
+                },
+                None => (rest, 1),
+            };
             out.push(Denial {
                 proto,
                 target: target.to_string(),
+                count,
             });
         }
     }
@@ -275,11 +295,13 @@ mod tests {
             vec![
                 Denial {
                     proto: Proto::Dns,
-                    target: "wallix.com".into()
+                    target: "wallix.com".into(),
+                    count: 1,
                 },
                 Denial {
                     proto: Proto::Tcp,
-                    target: "93.184.216.34:443".into()
+                    target: "93.184.216.34:443".into(),
+                    count: 1,
                 },
             ]
         );
@@ -287,15 +309,24 @@ mod tests {
         // Nothing new since the recorded offset.
         assert_eq!(read_since(&path, off), (Vec::new(), off));
 
-        // A later append is picked up from the offset alone.
+        // A later append is picked up from the offset alone, repeats with their count.
         append(&path, Proto::Udp, "8.8.8.8:53");
+        append_repeats(&path, Proto::Dns, "wallix.com", 41);
         let (next, _) = read_since(&path, off);
         assert_eq!(
             next,
-            vec![Denial {
-                proto: Proto::Udp,
-                target: "8.8.8.8:53".into()
-            }]
+            vec![
+                Denial {
+                    proto: Proto::Udp,
+                    target: "8.8.8.8:53".into(),
+                    count: 1,
+                },
+                Denial {
+                    proto: Proto::Dns,
+                    target: "wallix.com".into(),
+                    count: 41,
+                },
+            ]
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -401,7 +432,8 @@ mod tests {
             got,
             vec![Denial {
                 proto: Proto::Dns,
-                target: "a.com".into()
+                target: "a.com".into(),
+                count: 1,
             }]
         );
         // The torn line completes; the next read returns only it.
@@ -411,7 +443,8 @@ mod tests {
             got,
             vec![Denial {
                 proto: Proto::Tcp,
-                target: "1.2.3.4:443".into()
+                target: "1.2.3.4:443".into(),
+                count: 1,
             }]
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -431,7 +464,8 @@ mod tests {
             got,
             vec![Denial {
                 proto: Proto::Dns,
-                target: "evil\u{fffd}tcp\u{fffd}10.0.0.1:22\u{fffd}x.com".into()
+                target: "evil\u{fffd}tcp\u{fffd}10.0.0.1:22\u{fffd}x.com".into(),
+                count: 1,
             }]
         );
         let _ = std::fs::remove_dir_all(&dir);

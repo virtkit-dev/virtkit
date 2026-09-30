@@ -421,11 +421,13 @@ allow-ip = ["192.0.2.10/32:22"]
 
 `allow-name` entries are DNS suffixes, dot-anchored: `debian.org` also allows
 `deb.debian.org`. A name outside them resolves to nothing, and the guest may reach the
-addresses an allowed name resolved to. Compose service names still resolve, and reverse
-(PTR) lookups still go to the host's resolver: they name an address, never open a way to
-one. `allow-ip` takes IPv4 CIDRs, each optionally scoped to one port, for destinations
-dialed by address; IPv6 is refused. With both lists empty, nothing is allowed. The
-allowlists are an error without `egress = "restricted"`.
+addresses an allowed name resolved to. Compose service names still resolve, and so do
+reverse (PTR) lookups of the environment's own addresses. Other reverse lookups are names
+like any other, so they resolve to nothing unless listed; listing `in-addr.arpa` or
+`ip6.arpa` reopens them as a way to carry data out in the names queried. A query the
+gateway cannot parse is refused. `allow-ip` takes IPv4 CIDRs, each optionally scoped to
+one port, for destinations dialed by address; IPv6 is refused. With both lists empty,
+nothing is allowed. The allowlists are an error without `egress = "restricted"`.
 
 The environment's own switch enforces this, so it binds its compose services as well.
 It does not govern the host: image pulls, and the `RUN` steps of a `build` source, go out
