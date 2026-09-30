@@ -2718,8 +2718,13 @@ fn prefix_to_netmask(prefix: u32) -> String {
 /// The pid of the job's supervisor, or `None` if the pidfile is absent or unparseable,
 /// or if its pid no longer belongs to this job (`pid_running`'s pid-reuse guard).
 pub fn live_supervisor_pid(ctx: &JobCtx) -> Option<i32> {
-    let pid = read_pidfile(&ctx.supervisor_pidfile())?;
-    pid_running(pid, &ctx.job_dir.to_string_lossy()).then_some(pid)
+    live_supervisor_pid_in(&ctx.job_dir)
+}
+
+/// [`live_supervisor_pid`] of the job in `job_dir`.
+pub fn live_supervisor_pid_in(job_dir: &Path) -> Option<i32> {
+    let pid = read_pidfile(&JobCtx::supervisor_pidfile_in(job_dir))?;
+    pid_running(pid, &job_dir.to_string_lossy()).then_some(pid)
 }
 
 /// Signal the job's supervisor and wait for it to go — everything it owns (the

@@ -264,7 +264,11 @@ impl JobCtx {
     /// itself at startup; cleanup and the stale-state sweep signal it, and
     /// everything else cascades (PDEATHSIG).
     pub fn supervisor_pidfile(&self) -> PathBuf {
-        self.job_dir.join("supervisor.pid")
+        Self::supervisor_pidfile_in(&self.job_dir)
+    }
+    /// [`Self::supervisor_pidfile`] of the job in `job_dir`.
+    pub fn supervisor_pidfile_in(job_dir: &Path) -> PathBuf {
+        job_dir.join("supervisor.pid")
     }
     pub fn supervisor_log(&self) -> PathBuf {
         self.job_dir.join("supervisor.log")
@@ -301,7 +305,11 @@ impl JobCtx {
     /// (`[executor] atop`), for the supervisor and the final stage — separate processes,
     /// which must not each derive a date of their own around midnight.
     pub fn atop_dir_file(&self) -> PathBuf {
-        self.job_dir.join("atop.dir")
+        Self::atop_dir_file_in(&self.job_dir)
+    }
+    /// [`Self::atop_dir_file`] of the job in `job_dir`.
+    pub fn atop_dir_file_in(job_dir: &Path) -> PathBuf {
+        job_dir.join("atop.dir")
     }
     /// Third virtiofsd, read-write, exporting this job's archive directory into the
     /// guest so its sampler can append to the log there.
