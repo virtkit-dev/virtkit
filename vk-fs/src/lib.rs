@@ -20,13 +20,16 @@
 //! channel and `vk-registry` for its admin socket; both require the published name to refer
 //! only to a socket already restricted to `0600`.
 //!
-//! [`open_dir`] and [`open_dir_nofollow`] expose the third rule to callers that anchor their
-//! own `*at()` operations.
+//! [`open_dir`], [`open_dir_nofollow`] and [`open_dir_in`] expose the third rule to callers
+//! that anchor their own `*at()` operations.
+//!
+//! [`entry_in`] exposes the fourth to callers walking a path, links included: it says whether
+//! an entry could have been put there, or swapped since, by another user.
 
 use anyhow::{Context, anyhow, bail};
 use std::ffi::{CString, OsStr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -263,17 +266,120 @@ fn publish_into(
 /// directory is then left in place rather than removed through a name that may have become
 /// someone else's.
 fn dir_admits_only_us(fd: BorrowedFd<'_>) -> bool {
-    // SAFETY: a zeroed `stat` is a valid destination, and `fd` is open for the call.
+    // SAFETY: `stat` is plain old data, for which all-zero bytes are a valid value.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open for the borrow and `st` is a writable `stat`.
     if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
         return false;
     }
     // The *effective* id: it is what the kernel checks when this creates and removes.
     // SAFETY: `geteuid` reads this process's own id and cannot fail.
-    let ours = unsafe { libc::geteuid() };
-    let owned_by_us_or_root = st.st_uid == ours || st.st_uid == 0;
-    owned_by_us_or_root
-        && (st.st_mode & (libc::S_IWGRP | libc::S_IWOTH) == 0 || st.st_mode & libc::S_ISVTX != 0)
+    admits_only(st.st_uid, st.st_mode, None, unsafe { libc::geteuid() })
+}
+
+/// Shared ownership rule for [`dir_admits_only_us`] and [`entry_in`], given the directory's
+/// owner and mode and the effective user `ours`. `entry` is an existing entry's owner, or
+/// `None` for an entry this user will create. In a sticky directory, another user cannot
+/// move this user's entry, but can replace their own.
+fn admits_only(
+    dir_uid: libc::uid_t,
+    dir_mode: libc::mode_t,
+    entry: Option<libc::uid_t>,
+    ours: libc::uid_t,
+) -> bool {
+    let by_us_or_root = |uid| uid == ours || uid == 0;
+    by_us_or_root(dir_uid)
+        && (dir_mode & (libc::S_IWGRP | libc::S_IWOTH) == 0
+            || dir_mode & libc::S_ISVTX != 0 && entry.is_none_or(by_us_or_root))
+}
+
+/// A name [`entry_in`] found.
+#[derive(Debug)]
+pub struct Entry {
+    /// What the entry says, unresolved, when it is a symlink.
+    pub link: Option<PathBuf>,
+    /// Whether no other user can have put the entry there or swap it for another: its
+    /// directory belongs to this user or root and either no one else may write it, or it is
+    /// sticky and the entry belongs to this user or root. `false` means what the name leads
+    /// to is anyone's choice.
+    pub ours: bool,
+}
+
+/// The entry at `name` in the directory `dir`, without following it: whether another user can
+/// have made or swapped it, and, for a symlink, its target. `name` is one name: not empty, `.`
+/// or `..`, and without a `/`.
+///
+/// Type, owner and target all come from one descriptor on the entry itself, so a swap between
+/// the questions cannot pair one link's owner with another's target.
+pub fn entry_in(dir: BorrowedFd<'_>, name: &OsStr) -> Result<Entry, anyhow::Error> {
+    if name == "." || name == ".." {
+        bail!("{name:?} is not an entry of its own");
+    }
+    let c_name = one_name(name)?;
+    // SAFETY: the descriptor is live and the name is NUL-terminated and outlives the call.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(anyhow!(std::io::Error::last_os_error()).context(format!("opening {name:?}")));
+    }
+    // SAFETY: `fd` is a fresh descriptor this call owns.
+    let entry = unsafe { OwnedFd::from_raw_fd(fd) };
+    // SAFETY: `stat` is plain old data, for which all-zero bytes are a valid value.
+    let (mut st, mut dir_st): (libc::stat, libc::stat) = unsafe { std::mem::zeroed() };
+    // SAFETY: `entry` is open and `st` is a writable `stat`.
+    let entry_stat = unsafe { libc::fstat(entry.as_raw_fd(), &mut st) };
+    // SAFETY: `dir` is open for the borrow and `dir_st` is a writable `stat`.
+    if entry_stat != 0 || unsafe { libc::fstat(dir.as_raw_fd(), &mut dir_st) } != 0 {
+        return Err(
+            anyhow!(std::io::Error::last_os_error()).context(format!("inspecting {name:?}"))
+        );
+    }
+    // SAFETY: `geteuid` reads this process's own id and cannot fail.
+    let ours = admits_only(dir_st.st_uid, dir_st.st_mode, Some(st.st_uid), unsafe {
+        libc::geteuid()
+    });
+    if st.st_mode & libc::S_IFMT != libc::S_IFLNK {
+        return Ok(Entry { link: None, ours });
+    }
+    // One byte more than any target the kernel stores, so a full buffer means a truncated one.
+    let mut buf = vec![0u8; 4097];
+    // SAFETY: the descriptor is live, the empty name is NUL-terminated, and `buf` is writable
+    // for its whole length. An empty name reads the link the descriptor itself is on.
+    let n = unsafe {
+        libc::readlinkat(
+            entry.as_raw_fd(),
+            c"".as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    let Ok(n) = usize::try_from(n) else {
+        return Err(
+            anyhow!(std::io::Error::last_os_error()).context(format!("reading the link {name:?}"))
+        );
+    };
+    if n >= buf.len() {
+        bail!("the link {name:?} is longer than a path can be");
+    }
+    buf.truncate(n);
+    Ok(Entry {
+        link: Some(PathBuf::from(std::ffi::OsString::from_vec(buf))),
+        ours,
+    })
+}
+
+/// `name` as a NUL-terminated string, refused unless it is one name: not empty, and without
+/// a `/` that would make the kernel walk further than the directory given.
+fn one_name(name: &OsStr) -> Result<CString, anyhow::Error> {
+    if name.is_empty() || name.as_bytes().contains(&b'/') {
+        bail!("{name:?} is not a single name");
+    }
+    cstr(name)
 }
 
 /// A path as a NUL-terminated string, for the `libc` calls that take one.
@@ -401,8 +507,22 @@ fn write_atomic_from(
     bail!("found no free staging name beside {path:?} in {STAGING_ATTEMPTS} tries")
 }
 
-/// [`open_dir`] for a name under an already-open directory, so the parent is not re-resolved.
+/// [`open_dir_nofollow`] for one name in an already-open directory, so the directory is not
+/// re-resolved: a symlink there is refused, not followed. `..` opens the directory's parent,
+/// as the kernel sees it at the time — across a mount point, the parent of where it is
+/// mounted; `/` is its own. `name` is one name: not empty, and without a `/`.
+pub fn open_dir_in(dir: BorrowedFd<'_>, name: &OsStr) -> Result<OwnedFd, anyhow::Error> {
+    openat_dir_raw(dir, &one_name(name)?)
+        .map_err(|e| anyhow!(e).context(format!("opening {name:?}")))
+}
+
+/// [`open_dir_in`] for the staging directory [`publish_into`] just made.
 fn openat_dir(parent: BorrowedFd<'_>, name: &CString) -> Result<OwnedFd, anyhow::Error> {
+    openat_dir_raw(parent, name)
+        .map_err(|e| anyhow!(e).context(format!("opening the staging directory {name:?}")))
+}
+
+fn openat_dir_raw(parent: BorrowedFd<'_>, name: &CString) -> std::io::Result<OwnedFd> {
     // SAFETY: the descriptor is live and the name is NUL-terminated and outlives the call.
     let fd = unsafe {
         libc::openat(
@@ -412,8 +532,7 @@ fn openat_dir(parent: BorrowedFd<'_>, name: &CString) -> Result<OwnedFd, anyhow:
         )
     };
     if fd < 0 {
-        return Err(anyhow!(std::io::Error::last_os_error())
-            .context(format!("opening the staging directory {name:?}")));
+        return Err(std::io::Error::last_os_error());
     }
     // SAFETY: `fd` is a fresh descriptor this call owns.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
@@ -448,6 +567,37 @@ mod tests {
 
         // The no-follow variant still opens the directory itself.
         open_dir_nofollow(&real).expect("the directory itself still opens");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`open_dir_in`] opens one name under a descriptor, refuses a link there, and takes
+    /// `..` to the parent — `/` being its own.
+    #[test]
+    fn opening_a_name_in_a_directory_never_follows_it() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = scratch("open-dir-in");
+        std::fs::create_dir(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", dir.join("link")).unwrap();
+        let id = |fd: &OwnedFd| {
+            let m = std::fs::metadata(format!("/proc/self/fd/{}", fd.as_raw_fd())).unwrap();
+            (m.dev(), m.ino())
+        };
+        let path_id = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.dev(), m.ino())
+        };
+        let top = open_dir(&dir).unwrap();
+
+        let real = open_dir_in(top.as_fd(), OsStr::new("real")).unwrap();
+        assert_eq!(id(&real), path_id(&dir.join("real")));
+        let err = open_dir_in(top.as_fd(), OsStr::new("link")).unwrap_err();
+        assert!(format!("{err:#}").contains("\"link\""), "{err:#}");
+        assert!(open_dir_in(top.as_fd(), OsStr::new("gone")).is_err());
+        let up = open_dir_in(real.as_fd(), OsStr::new("..")).unwrap();
+        assert_eq!(id(&up), path_id(&dir));
+        let slash = open_dir(Path::new("/")).unwrap();
+        let above = open_dir_in(slash.as_fd(), OsStr::new("..")).unwrap();
+        assert_eq!(id(&above), path_id(Path::new("/")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -830,6 +980,84 @@ mod tests {
         );
 
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every branch of the rule, including the owners a test cannot create: a directory of
+    /// root's or another user's, and another user's entry under the sticky bit.
+    #[test]
+    fn only_a_directory_of_ours_or_roots_keeps_its_names_ours() {
+        let (us, them) = (1000, 1001);
+        let admits = |dir_uid, mode, entry| admits_only(dir_uid, mode, entry, us);
+        assert!(admits(us, 0o755, None) && admits(us, 0o755, Some(them)));
+        assert!(admits(0, 0o755, Some(them)), "root's private directory");
+        assert!(
+            !admits(them, 0o700, Some(us)),
+            "its owner may swap anything in it"
+        );
+        assert!(!admits(us, 0o775, Some(us)) && !admits(us, 0o757, None));
+        assert!(!admits(0, 0o777, Some(0)), "shared and not sticky");
+        assert!(
+            admits(0, 0o1777, None),
+            "a sticky /tmp, for a name this user makes"
+        );
+        assert!(admits(0, 0o1777, Some(us)) && admits(us, 0o1777, Some(0)));
+        assert!(
+            !admits(0, 0o1777, Some(them)),
+            "their entry is theirs to swap"
+        );
+        assert!(
+            !admits(them, 0o1777, Some(us)),
+            "a sticky directory of theirs"
+        );
+    }
+
+    /// [`entry_in`] reads an entry without following it, and trusts it by where it stands,
+    /// a link or not.
+    #[test]
+    fn an_entry_is_ours_only_where_no_one_else_can_swap_it() {
+        let dir = scratch("entry-in");
+        std::fs::create_dir(dir.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", dir.join("link")).unwrap();
+        let read = |mode, name| {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            entry_in(open_dir(&dir).unwrap().as_fd(), OsStr::new(name)).unwrap()
+        };
+
+        let link = read(0o755, "link");
+        assert_eq!(link.link.as_deref(), Some(Path::new("real")));
+        assert!(link.ours, "a private directory");
+        assert!(!read(0o775, "link").ours, "a group-writable directory");
+        assert!(read(0o1777, "link").ours, "sticky, and the link is ours");
+        let real = read(0o755, "real");
+        assert!(real.link.is_none() && real.ours);
+        assert!(
+            !read(0o757, "real").ours,
+            "a directory is swapped like a link"
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let fd = open_dir(&dir).unwrap();
+        assert!(entry_in(fd.as_fd(), OsStr::new("gone")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both walk one name at a time: a `/` would have the kernel walk the rest unchecked.
+    /// [`entry_in`] also refuses `.` and `..`, which name no entry of their own.
+    #[test]
+    fn a_name_in_a_directory_is_one_name() {
+        let dir = scratch("one-name");
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        let fd = open_dir(&dir).unwrap();
+        for name in ["", "a/b", "/", "a/", "/a"] {
+            let err = entry_in(fd.as_fd(), OsStr::new(name)).unwrap_err();
+            assert!(format!("{err:#}").contains("not a single name"), "{err:#}");
+            let err = open_dir_in(fd.as_fd(), OsStr::new(name)).unwrap_err();
+            assert!(format!("{err:#}").contains("not a single name"), "{err:#}");
+        }
+        for name in [".", ".."] {
+            assert!(entry_in(fd.as_fd(), OsStr::new(name)).is_err());
+            assert!(open_dir_in(fd.as_fd(), OsStr::new(name)).is_ok());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
