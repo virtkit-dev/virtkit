@@ -311,10 +311,19 @@ fn load_all_in(dir: &Path) -> Vec<VmEntry> {
 /// dir for its whole lifetime, so if we can take that lock the owner has exited (and the entry
 /// is stale). A missing state dir also counts as dead. Pid-reuse-proof, unlike signalling the
 /// recorded pid blind.
+///
+/// Asked of `/proc/locks` first, as [`crate::dev::lock_holder`] asks it: taking the lock, even
+/// for an instant, fails a `vk run --state-dir` starting on the same dir at that moment, and
+/// `vk list` and `vk stop` ask on every run. Only a lock `/proc/locks` does not list —
+/// nobody's, or one over NFS — is probed by taking it, and that is almost always a dead
+/// entry's.
 pub fn alive(entry: &VmEntry) -> bool {
     let Ok(f) = std::fs::File::open(&entry.state_dir) else {
         return false;
     };
+    if crate::run::flock_holder_pid(&f).is_some() {
+        return true;
+    }
     // SAFETY: the fd is owned by `f` and kept alive across the call; flock returns 0/-1 and
     // does not block under LOCK_NB.
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {

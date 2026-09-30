@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`vk list` and `vk stop` no longer make a `vk run --state-dir` starting at that moment
+  fail with "in use".** Telling a live VM from a stale entry used to take the state dir's
+  lock for an instant; it now reads who holds it instead.
+
 ## [0.79.3] - 2026-09-28
 
 ### Fixed
