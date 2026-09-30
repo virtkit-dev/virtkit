@@ -4,6 +4,22 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A GitLab runner whose `[executor] tools_dir` or `[executor.share] dir` is a symlink
+  now shares its target with jobs.** Jobs saw an empty directory: with an empty tools
+  directory, artifacts, caches and dotenv reports were not uploaded, and the job still
+  passed. The link is followed when each job starts, so re-pointing it takes effect from
+  the next job. Every directory and link on the path, and in the link's target, must sit
+  where no one but the `vk` user or root can replace it: in a directory writable by no one
+  else, or a sticky one where the entry is owned by them. The directory it leads to may
+  neither lie in nor hold a directory jobs can write (a read-write `[executor.share]`, host
+  checkouts, the atop archive); nothing above the link or its target may lie in one.
+  Otherwise the job fails, and so does `vk check`, naming the offending path. This also
+  applies to a root that is not a link: a `tools_dir` or share dir that others could
+  replace, or inside or holding such a directory, now fails the job where it used to be
+  served.
+
 ## [0.79.3] - 2026-09-28
 
 ### Fixed

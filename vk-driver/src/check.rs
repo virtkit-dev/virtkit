@@ -1092,12 +1092,9 @@ fn gitlab(cfg: &Config) -> Outcome {
         return fail(format!("{e} (per-job state lives there; see state_dir)"));
     }
     if let Some(dir) = &cfg.executor.tools_dir
-        && let Err(e) = std::fs::read_dir(dir)
+        && let Err(e) = readable_root(cfg, dir, crate::vm::ShareRoot::Tools)
     {
-        return fail(format!(
-            "[executor] tools_dir {} unreadable: {e}",
-            dir.display()
-        ));
+        return fail(format!("[executor] tools_dir {e}"));
     }
     // `[executor.vm] nested` needs host KVM loaded with nested=1. vm::prepare refuses each job it
     // would boot; failing here too catches the runner before any of them, as the atop
@@ -1138,13 +1135,32 @@ fn gitlab(cfg: &Config) -> Outcome {
     ))
 }
 
+/// Resolve a share root as the executor does, refusing the links and trees it refuses, and
+/// check readability. Display it as `configured -> resolved` when the paths differ.
+fn readable_root(
+    cfg: &Config,
+    dir: &Path,
+    which: crate::vm::ShareRoot,
+) -> Result<(PathBuf, String), String> {
+    let root =
+        crate::vm::share_root(cfg, dir, which).map_err(|e| format!("{}: {e:#}", dir.display()))?;
+    let shown = if root == dir {
+        dir.display().to_string()
+    } else {
+        format!("{} -> {}", dir.display(), root.display())
+    };
+    std::fs::read_dir(&root).map_err(|e| format!("{shown} unreadable: {e}"))?;
+    Ok((root, shown))
+}
+
 fn share(cfg: &Config) -> Outcome {
     let Some(s) = &cfg.executor.share else {
         return skip("[executor.share] not configured");
     };
-    if let Err(e) = std::fs::read_dir(&s.dir) {
-        return fail(format!("share dir {} unreadable: {e}", s.dir.display()));
-    }
+    let shown = match readable_root(cfg, &s.dir, crate::vm::ShareRoot::Workdir) {
+        Ok((_, shown)) => shown,
+        Err(e) => return fail(format!("share dir {e}")),
+    };
     let served = if crate::vmm::libkrun_selected() {
         "virtio-fs built into libkrun".to_string()
     } else if let Some(p) = &cfg.virtiofsd {
@@ -1157,7 +1173,7 @@ fn share(cfg: &Config) -> Outcome {
     } else {
         return fail("no virtiofsd: vk built without the virtiofsd feature and none configured");
     };
-    ok(format!("dir {} readable, {served}", s.dir.display()))
+    ok(format!("dir {shown} readable, {served}"))
 }
 
 fn services(cfg: &Config) -> Outcome {
@@ -1555,6 +1571,102 @@ mod tests {
         assert_eq!(out.status, Status::Fail);
         assert!(out.detail.contains("atop_interval_secs"), "{}", out.detail);
 
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Resolve tools_dir as the executor does: a link to a real directory passes, a dangling
+    /// one fails.
+    #[test]
+    fn the_gitlab_check_resolves_a_symlinked_tools_dir() {
+        let root = std::env::temp_dir().join(format!("vk-check-tools-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let real = root.join("tools.d");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.join("tools");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let with = |tools: &Path| Config {
+            source: Some(root.join("config.toml")),
+            state_dir: Some(root.clone()),
+            executor: Executor {
+                tools_dir: Some(tools.to_path_buf()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let out = gitlab(&with(&link));
+        assert_eq!(out.status, Status::Ok, "{}", out.detail);
+
+        let dangling = root.join("dangling");
+        std::os::unix::fs::symlink(root.join("gone"), &dangling).unwrap();
+        let out = gitlab(&with(&dangling));
+        assert_eq!(out.status, Status::Fail);
+        let gone = format!(
+            "cannot open {} (through the link {})",
+            root.join("gone").display(),
+            dangling.display()
+        );
+        assert!(out.detail.contains(&gone), "{}", out.detail);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Refuse the links a job boot would refuse, with the same reason: one in a directory
+    /// other users can write, and a tools_dir inside a read-write share.
+    #[test]
+    fn the_checks_refuse_a_share_root_a_job_would_refuse() {
+        use crate::config::Share;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = std::env::temp_dir().join(format!("vk-check-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (real, open, work) = (root.join("real"), root.join("open"), root.join("work"));
+        for d in [&real, &open, &work] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let swappable = open.join("tools");
+        symlink(&real, &swappable).unwrap();
+        let planted = work.join("tools");
+        symlink(&real, &planted).unwrap();
+        let with = |tools: &Path, share: &Path| Config {
+            source: Some(root.join("config.toml")),
+            state_dir: Some(root.clone()),
+            executor: Executor {
+                tools_dir: Some(tools.to_path_buf()),
+                share: Some(Share {
+                    dir: share.to_path_buf(),
+                    readonly: false,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let out = gitlab(&with(&swappable, &work));
+        assert_eq!(out.status, Status::Fail);
+        assert!(
+            out.detail.contains("lets other users replace it"),
+            "{}",
+            out.detail
+        );
+        let out = share(&with(&real, &swappable));
+        assert_eq!(out.status, Status::Fail);
+        assert!(
+            out.detail.contains("lets other users replace it"),
+            "{}",
+            out.detail
+        );
+        let out = gitlab(&with(&planted, &work));
+        assert_eq!(out.status, Status::Fail);
+        assert!(
+            out.detail.contains("which job guests can write"),
+            "{}",
+            out.detail
+        );
+        let out = gitlab(&with(&real, &work));
+        assert_eq!(out.status, Status::Ok, "{}", out.detail);
+
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
     }
 

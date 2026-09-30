@@ -1297,14 +1297,20 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // out of the host page cache rather than copying it into its own. Same window for every
     // share here — the tools tree is the one several job VMs read at once.
     let dax = crate::run::dax_share(vm_dax(cfg)?, None, crate::vmm::libkrun_selected());
+    // Computed once, so both shares are judged against the same trees: the tools share against
+    // the directory the workdir share resolved to.
+    let mut guest_writable = GuestWritable::new(cfg);
     if let Some(share) = &cfg.executor.share {
+        let dir = guest_writable
+            .resolve_share(share)
+            .with_context(|| format!("resolving share root {}", share.dir.display()))?;
         let vfsd_sock = ctx.vfsd_sock();
         // libkrun mounts the host dir directly (built-in virtio-fs); only
         // cloud-hypervisor needs an external virtiofsd on the socket.
         if !crate::vmm::libkrun_selected() {
             let mut vfsd = cfg.virtiofsd_command(); // bundled `vk virtiofsd` unless configured
             vfsd.arg(format!("--socket-path={}", vfsd_sock.display()))
-                .arg(format!("--shared-dir={}", share.dir.display()))
+                .arg(format!("--shared-dir={}", dir.display()))
                 .args(["--cache=auto", "--sandbox=none"]);
             if share.readonly {
                 vfsd.arg("--readonly");
@@ -1316,7 +1322,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         shares.push(crate::vmm::FsShare {
             tag: "workdir".into(),
             socket: vfsd_sock,
-            host_dir: share.dir.clone(),
+            host_dir: dir,
             read_only: share.readonly,
             dax,
             uid_map: Vec::new(),
@@ -1329,6 +1335,9 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // in-guest agent links the tools the job image lacks onto its PATH — dynamic,
     // so nothing is baked into the bundle and a host update needs no re-conversion.
     if let Some(dir) = &cfg.executor.tools_dir {
+        let dir = guest_writable
+            .resolve(dir)
+            .with_context(|| format!("resolving share root {}", dir.display()))?;
         let sock = ctx.tools_vfsd_sock();
         if !crate::vmm::libkrun_selected() {
             let mut vfsd = cfg.virtiofsd_command();
@@ -1345,7 +1354,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         shares.push(crate::vmm::FsShare {
             tag: "vktools".into(),
             socket: sock,
-            host_dir: dir.clone(),
+            host_dir: dir,
             read_only: true,
             dax,
             uid_map: Vec::new(),
@@ -2756,6 +2765,383 @@ fn spawn_detached(mut cmd: Command, log: &Path) -> Result<std::process::Child> {
         .spawn()?)
 }
 
+/// The executor share a root is resolved for, which decides the guest-writable trees it must
+/// stay out of.
+#[derive(Clone, Copy)]
+pub(crate) enum ShareRoot {
+    /// `[executor.share] dir`.
+    Workdir,
+    /// `[executor] tools_dir`.
+    Tools,
+}
+
+/// The most symlinks [`resolve_root`] follows, at any depth of a root and of the targets it
+/// leads through, before giving up: the kernel's own limit for one lookup (`MAXSYMLINKS`).
+const ROOT_LINK_HOPS: usize = 40;
+
+/// A directory's identity: `(st_dev, st_ino)`.
+type DirId = (u64, u64);
+
+/// A host tree a job guest can write, in each form a path into it can take.
+struct GuestTree {
+    /// As configured, made absolute.
+    configured: PathBuf,
+    /// Where it resolves to, where it exists.
+    canonical: Option<PathBuf>,
+    /// Its root's identity, which also matches a bind mount of that root elsewhere.
+    id: Option<DirId>,
+}
+
+impl GuestTree {
+    /// A tree as configured: resolved as it stands. One that does not resolve (a checkout root
+    /// no job has made yet) holds nothing a root could resolve into, so it is kept as
+    /// configured.
+    fn new(configured: &Path) -> Self {
+        let canonical = std::fs::canonicalize(configured).ok();
+        let id = canonical.as_deref().and_then(|c| dir_id(c).ok());
+        Self::with(configured, canonical, id)
+    }
+
+    fn with(configured: &Path, canonical: Option<PathBuf>, id: Option<DirId>) -> Self {
+        let configured =
+            std::path::absolute(configured).unwrap_or_else(|_| configured.to_path_buf());
+        GuestTree {
+            configured,
+            canonical,
+            id,
+        }
+    }
+
+    /// Whether the absolute path `p` lies in this tree, by either of its forms.
+    fn holds(&self, p: &Path) -> bool {
+        p.starts_with(&self.configured)
+            || self.canonical.as_deref().is_some_and(|c| p.starts_with(c))
+    }
+
+    /// Whether this tree lies in the canonical directory `root`, by path. A bind mount of the
+    /// tree's root somewhere below `root` is not recognised: that would take walking everything
+    /// under it.
+    fn inside(&self, root: &Path) -> bool {
+        self.configured.starts_with(root)
+            || self
+                .canonical
+                .as_deref()
+                .is_some_and(|c| c.starts_with(root))
+    }
+
+    fn shown(&self) -> std::path::Display<'_> {
+        self.canonical
+            .as_deref()
+            .unwrap_or(&self.configured)
+            .display()
+    }
+}
+
+/// Guest-writable host trees that a share root must neither lie in nor contain: the atop
+/// archive when recording, host checkouts when `host_checkout` is on (the job's author
+/// controls their contents, with or without an overlay), and, for the tools share only,
+/// a read-write `[executor.share]`. Computed once per boot: [`GuestWritable::resolve_share`]
+/// adds the resolved workdir tree, so the tools share is checked against the directory
+/// actually served to the job.
+pub(crate) struct GuestWritable(Vec<GuestTree>);
+
+impl GuestWritable {
+    /// The trees that bar either share: everything but the read-write `[executor.share]`.
+    pub(crate) fn new(cfg: &crate::config::Config) -> Self {
+        let ex = &cfg.executor;
+        let mut trees = Vec::new();
+        if crate::atop::enabled(cfg) {
+            trees.push(GuestTree::new(&crate::atop::archive_root(cfg)));
+        }
+        if ex.host_checkout {
+            trees.push(GuestTree::new(&cfg.checkout_root()));
+        }
+        GuestWritable(trees)
+    }
+
+    /// Resolve the `[executor.share]` root, then, when it is read-write, bar the tools share
+    /// from the directory it resolved to.
+    pub(crate) fn resolve_share(&mut self, share: &crate::config::Share) -> Result<PathBuf> {
+        let (root, id) = resolve_root(&share.dir, &self.0)?;
+        if !share.readonly {
+            self.0
+                .push(GuestTree::with(&share.dir, Some(root.clone()), Some(id)));
+        }
+        Ok(root)
+    }
+
+    /// Resolve a share root against these trees.
+    pub(crate) fn resolve(&self, dir: &Path) -> Result<PathBuf> {
+        Ok(resolve_root(dir, &self.0)?.0)
+    }
+}
+
+/// Resolve a share root as a job boot does, for `vk check`: a tools root is barred from the
+/// read-write `[executor.share]` as it resolves now, or as configured where it does not.
+pub(crate) fn share_root(
+    cfg: &crate::config::Config,
+    dir: &Path,
+    which: ShareRoot,
+) -> Result<PathBuf> {
+    let mut trees = GuestWritable::new(cfg);
+    if let (ShareRoot::Tools, Some(share)) = (which, &cfg.executor.share)
+        && !share.readonly
+        && trees.resolve_share(share).is_err()
+    {
+        trees.0.push(GuestTree::new(&share.dir));
+    }
+    trees.resolve(dir)
+}
+
+/// Resolve a share root before passing it to the VMM, returning it canonical with its
+/// identity. Both directory servers open it with `O_PATH | O_NOFOLLOW`, so a symlink root
+/// serves the link itself and the guest sees an empty share. Resolved at each boot so
+/// repointing a link (an atomic `tools_dir` swap) takes effect from the next job; a running
+/// job keeps the tree it opened.
+///
+/// Whoever can replace a name on the way picks the host directory every later job is served —
+/// writable for a read-write `[executor.share]`. So the path is walked one name at a time from
+/// a descriptor — on `/` for an absolute path, on the working directory for a relative one,
+/// which is trusted like `/` — and every name met, at any depth of the path or of a symlink's
+/// target it leads through, is walked only
+///
+/// - where no other user can have made or swapped it (see [`vk_fs::entry_in`]), a directory as
+///   much as a link, and
+/// - when it is a link, or `..`, from a directory that lies in no guest-writable tree: not by
+///   its path, and neither it nor any directory above it is a tree's root by identity. A link
+///   there is the guest's to point, and a directory there the guest's to move.
+///
+/// `..` goes to the parent of the directory reached, as the kernel has it. The directory the
+/// walk ends at may neither lie in a guest-writable tree, by the same test, nor hold one.
+///
+/// What that directory holds is trusted as configured: its own mode is not checked. A bind
+/// mount of a directory *inside* a guest-writable tree is not detected, nor one of a tree's
+/// root below the resolved root; one of a tree's root at or above a directory tested is. The
+/// VMM reopens the returned path, so this vouches for what the path names now, not for what it
+/// names by then. Directories are named from their descriptors, which needs `/proc` mounted
+/// on the host.
+///
+/// The one place these rules live: the executor calls it at each boot and `vk check` through
+/// [`share_root`], so a check passes exactly the roots a job would boot with.
+fn resolve_root(dir: &Path, trees: &[GuestTree]) -> Result<(PathBuf, DirId)> {
+    use std::os::fd::AsFd;
+    let fd = walk_root(dir, trees)?;
+    let (root, id) = fd_dir(fd.as_fd())?;
+    if let Some(hit) = lies_in(fd.as_fd(), &root, id, trees)? {
+        bail!("it resolves to {}", hit.shown(&root));
+    }
+    if let Some(tree) = trees.iter().find(|t| t.inside(&root)) {
+        bail!(
+            "it resolves to {}, which holds {}, a tree job guests can write",
+            root.display(),
+            tree.shown()
+        );
+    }
+    Ok((root, id))
+}
+
+/// Walk `dir` to the directory it leads to, following links under [`resolve_root`]'s rules,
+/// and return a descriptor on that directory.
+fn walk_root(dir: &Path, trees: &[GuestTree]) -> Result<std::os::fd::OwnedFd> {
+    use std::ffi::{OsStr, OsString};
+    use std::os::fd::AsFd;
+    use std::path::Component;
+    // The names still to walk, the next one last.
+    fn push(todo: &mut Vec<OsString>, path: &Path) {
+        let names: Vec<OsString> = path
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(name) => Some(name.to_os_string()),
+                Component::ParentDir => Some("..".into()),
+                Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+            })
+            .collect();
+        todo.extend(names.into_iter().rev());
+    }
+    let slash = || vk_fs::open_dir(Path::new("/"));
+    // The directory reached, as a descriptor and, for messages, as a path.
+    let (mut fd, mut at) = if dir.is_absolute() {
+        (slash()?, PathBuf::from("/"))
+    } else {
+        let cwd = std::env::current_dir().context("reading the working directory")?;
+        (vk_fs::open_dir(Path::new("."))?, cwd)
+    };
+    let mut todo = Vec::new();
+    push(&mut todo, dir);
+    // The last link followed, to name the hop a failure is on.
+    let mut via: Option<PathBuf> = None;
+    let mut hops = 0;
+    // Why a name was refused: where it stands, the entry there being anyone's to replace.
+    let replaceable = |what: &str, next: &Path, at: &Path| {
+        anyhow!(
+            "refusing to {what} {}: {} lets other users replace it (a path is walked only \
+             through directories writable by no one but this user or root, or sticky ones \
+             where the entry is owned by this user or root)",
+            next.display(),
+            at.display()
+        )
+    };
+    while let Some(name) = todo.pop() {
+        let next = at.join(&name);
+        let cannot = |e: anyhow::Error| match &via {
+            Some(link) => anyhow!(
+                "cannot open {} (through the link {}): {}",
+                next.display(),
+                link.display(),
+                e.root_cause()
+            ),
+            None => anyhow!("cannot open {}: {}", next.display(), e.root_cause()),
+        };
+        if name == ".." {
+            // A directory in a guest-writable tree is the guest's to move, and its parent
+            // with it.
+            if !trees.is_empty() {
+                let (holder, id) = fd_dir(fd.as_fd())?;
+                if let Some(hit) = lies_in(fd.as_fd(), &holder, id, trees)? {
+                    bail!("refusing to take `..` from {}", hit.shown(&holder));
+                }
+            }
+            fd = vk_fs::open_dir_in(fd.as_fd(), OsStr::new("..")).map_err(cannot)?;
+            at.pop();
+            continue;
+        }
+        let entry = vk_fs::entry_in(fd.as_fd(), &name).map_err(cannot)?;
+        let Some(target) = entry.link else {
+            if !entry.ours {
+                return Err(replaceable("walk through", &next, &at));
+            }
+            // Not a link, so a directory or nothing to walk through: `O_NOFOLLOW` refuses a
+            // name that has become a link since, rather than following it unchecked.
+            fd = vk_fs::open_dir_in(fd.as_fd(), &name).map_err(cannot)?;
+            at = next;
+            continue;
+        };
+        hops += 1;
+        if hops > ROOT_LINK_HOPS {
+            bail!(
+                "more than {ROOT_LINK_HOPS} symlinks, the last {}",
+                next.display()
+            );
+        }
+        if !entry.ours {
+            return Err(replaceable("follow the symlink", &next, &at));
+        }
+        if !trees.is_empty() {
+            let (holder, id) = fd_dir(fd.as_fd())?;
+            if let Some(hit) = lies_in(fd.as_fd(), &holder, id, trees)? {
+                bail!(
+                    "refusing to follow the symlink {}: {}",
+                    next.display(),
+                    hit.shown(&holder)
+                );
+            }
+        }
+        if target.as_os_str().is_empty() {
+            bail!("the symlink {} is empty", next.display());
+        }
+        if target.is_absolute() {
+            fd = slash()?;
+            at = PathBuf::from("/");
+        }
+        push(&mut todo, &target);
+        via = Some(next);
+    }
+    Ok(fd)
+}
+
+/// How a directory lies in a guest-writable tree: `above` is `None` when the directory itself
+/// is inside the tree, or the directory above it that is the tree's root by identity.
+struct TreeHit<'t> {
+    tree: &'t GuestTree,
+    above: Option<PathBuf>,
+}
+
+impl TreeHit<'_> {
+    /// The hit, for an error about the directory `dir`.
+    fn shown(&self, dir: &Path) -> String {
+        let (dir, tree) = (dir.display(), self.tree.shown());
+        match &self.above {
+            None => format!("{dir}, inside {tree}, which job guests can write"),
+            Some(above) => format!(
+                "{dir}, inside {tree}, which job guests can write: {} is that tree's root",
+                above.display()
+            ),
+        }
+    }
+}
+
+/// Whether the directory open on `fd`, at `path` with identity `id`, lies in a guest-writable
+/// tree: by path, or with it or a directory above it being a tree's root by identity. The
+/// directories above are reached by `..` from the descriptor, not by the path.
+fn lies_in<'t>(
+    fd: std::os::fd::BorrowedFd<'_>,
+    path: &Path,
+    id: DirId,
+    trees: &'t [GuestTree],
+) -> Result<Option<TreeHit<'t>>> {
+    use std::os::fd::AsFd;
+    if let Some(tree) = trees.iter().find(|t| t.holds(path) || t.id == Some(id)) {
+        return Ok(Some(TreeHit { tree, above: None }));
+    }
+    if trees.iter().all(|t| t.id.is_none()) {
+        return Ok(None);
+    }
+    let up = std::ffi::OsStr::new("..");
+    let mut cur = vk_fs::open_dir_in(fd, up)?;
+    let mut below = id;
+    for above in path.ancestors().skip(1) {
+        let cur_id = fd_id(cur.as_fd())?;
+        // `/` is its own parent.
+        if cur_id == below {
+            break;
+        }
+        if let Some(tree) = trees.iter().find(|t| t.id == Some(cur_id)) {
+            return Ok(Some(TreeHit {
+                tree,
+                above: Some(above.to_path_buf()),
+            }));
+        }
+        below = cur_id;
+        cur = vk_fs::open_dir_in(cur.as_fd(), up)?;
+    }
+    Ok(None)
+}
+
+fn dir_id(path: &Path) -> Result<DirId> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path).with_context(|| format!("inspecting {}", path.display()))?;
+    Ok((m.dev(), m.ino()))
+}
+
+fn fd_proc(fd: std::os::fd::BorrowedFd<'_>) -> PathBuf {
+    use std::os::fd::AsRawFd;
+    PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+}
+
+fn fd_id(fd: std::os::fd::BorrowedFd<'_>) -> Result<DirId> {
+    dir_id(&fd_proc(fd))
+}
+
+/// The path of the directory open on `fd`, and its identity, read from the descriptor through
+/// `/proc`. The path is checked to still name that directory, which also rules out a removed
+/// one.
+fn fd_dir(fd: std::os::fd::BorrowedFd<'_>) -> Result<(PathBuf, DirId)> {
+    let proc = fd_proc(fd);
+    let path = std::fs::read_link(&proc).with_context(|| format!("reading {}", proc.display()))?;
+    let id = dir_id(&proc)?;
+    if dir_id(&path).ok() == Some(id) {
+        return Ok((path, id));
+    }
+    // The kernel names a removed directory by the path it had, with this appended.
+    if let Some(gone) = path.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+        bail!(
+            "{} was removed while it was being resolved",
+            Path::new(std::ffi::OsStr::from_bytes(gone)).display()
+        );
+    }
+    bail!("{} changed while it was being resolved", path.display());
+}
+
 fn wait_for_socket(path: &Path, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while !path.exists() {
@@ -2973,6 +3359,457 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::jobctx::JobCtx;
+
+    /// Resolve share-root symlinks before passing them to the VMM, on every job so a
+    /// swapped link serves the new tree.
+    #[test]
+    fn share_roots_resolve_symlinks_each_time() {
+        let dir = std::env::temp_dir().join(format!("vk-share-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let cfg = Config::default();
+        let root = |p: &Path| share_root(&cfg, p, ShareRoot::Tools);
+        let link = dir.join("tools");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let a = std::fs::canonicalize(&a).unwrap();
+        assert_eq!(root(&link).unwrap(), a);
+        assert_eq!(root(&a).unwrap(), a, "a real directory is its own root");
+
+        let next = dir.join("tools.new");
+        std::os::unix::fs::symlink(&b, &next).unwrap();
+        std::fs::rename(&next, &link).unwrap();
+        assert_eq!(root(&link).unwrap(), std::fs::canonicalize(&b).unwrap());
+
+        std::fs::remove_dir_all(&b).unwrap();
+        let err = format!("{:#}", root(&link).unwrap_err());
+        assert!(err.contains(&link.display().to_string()), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A link at the end of a share root is followed only where no other user can swap it,
+    /// hop by hop: its directory private to us, or sticky with the link ours. The owners a test
+    /// cannot create are covered by vk-fs's own tests of the rule.
+    #[test]
+    fn a_share_root_link_is_followed_only_where_others_cannot_swap_it() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = std::env::temp_dir().join(format!("vk-share-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (real, shared) = (dir.join("real"), dir.join("shared"));
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        let real = std::fs::canonicalize(&real).unwrap();
+        let mode = |m| std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(m));
+        let resolve = |p: &Path| resolve_root(p, &[]).map(|(root, _)| root);
+        let link = shared.join("tools");
+        symlink(&real, &link).unwrap();
+
+        assert_eq!(resolve(&link).unwrap(), real, "a private directory");
+        mode(0o1777).unwrap();
+        assert_eq!(resolve(&link).unwrap(), real, "sticky, link ours");
+        mode(0o775).unwrap();
+        let err = resolve(&link).unwrap_err().to_string();
+        assert!(
+            err.contains(&link.display().to_string()) && err.contains("other users"),
+            "{err}"
+        );
+
+        // A private first hop does not vouch for a second that anyone in the group can swap.
+        let first = dir.join("first");
+        symlink(&link, &first).unwrap();
+        let err = resolve(&first).unwrap_err().to_string();
+        assert!(
+            err.contains("shared/tools") && err.contains("other users"),
+            "{err}"
+        );
+        mode(0o755).unwrap();
+        assert_eq!(resolve(&first).unwrap(), real);
+
+        // A relative target is taken from the directory the link is in, `..` included.
+        std::fs::create_dir_all(dir.join("links")).unwrap();
+        let up = dir.join("links/up");
+        symlink("../real", &up).unwrap();
+        assert_eq!(resolve(&up).unwrap(), real);
+
+        // A link to itself is refused rather than followed forever.
+        let own = dir.join("loop");
+        symlink("loop", &own).unwrap();
+        let err = resolve(&own).unwrap_err().to_string();
+        assert!(err.contains("symlinks"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Up to [`ROOT_LINK_HOPS`] links are followed, and a hop that leads nowhere is named.
+    #[test]
+    fn a_share_root_chain_is_bounded_and_names_a_dangling_hop() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("vk-share-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        // Canonical, as the hops are named from the directories the links are read in.
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let real = dir.join("real");
+        // l1 -> real, l2 -> l1, ..., l9 -> l8: resolving lN follows N links.
+        symlink(&real, dir.join("l1")).unwrap();
+        for n in 2..=ROOT_LINK_HOPS + 1 {
+            symlink(format!("l{}", n - 1), dir.join(format!("l{n}"))).unwrap();
+        }
+        let resolve = |p: &Path| resolve_root(p, &[]).map(|(root, _)| root);
+        let at_bound = dir.join(format!("l{ROOT_LINK_HOPS}"));
+        assert_eq!(resolve(&at_bound).unwrap(), real);
+        let past = dir.join(format!("l{}", ROOT_LINK_HOPS + 1));
+        let err = resolve(&past).unwrap_err().to_string();
+        let last = dir.join("l1");
+        assert!(
+            err.contains("symlinks") && err.ends_with(&format!("the last {}", last.display())),
+            "{err}"
+        );
+
+        let gone = dir.join("gone");
+        symlink(&gone, dir.join("mid")).unwrap();
+        symlink(dir.join("mid"), dir.join("first")).unwrap();
+        let err = format!("{:#}", resolve(&dir.join("first")).unwrap_err());
+        assert_eq!(
+            err,
+            format!(
+                "cannot open {} (through the link {}): No such file or directory (os error 2)",
+                gone.display(),
+                dir.join("mid").display()
+            )
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Neither a link, a directory above one or above the root, nor the root it resolves to
+    /// may lie in a tree job guests write, and the root may not hold one: a read-write
+    /// `[executor.share]` for the tools share, and the atop archive and the host checkouts for
+    /// either share.
+    #[test]
+    fn a_share_root_stays_out_of_guest_writable_trees() {
+        use crate::config::{Executor, Share};
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("vk-share-rw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (work, tools) = (dir.join("work"), dir.join("tools.d"));
+        std::fs::create_dir_all(work.join("tools")).unwrap();
+        std::fs::create_dir_all(&tools).unwrap();
+        let cfg = |readonly, host_checkout, checkout_overlay| Config {
+            state_dir: Some(dir.clone()),
+            executor: Executor {
+                share: Some(Share {
+                    dir: work.clone(),
+                    readonly,
+                }),
+                host_checkout,
+                checkout_overlay,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tools_root = |c: &Config, p: &Path| share_root(c, p, ShareRoot::Tools);
+        let refused = |r: Result<PathBuf>| format!("{:#}", r.unwrap_err());
+        let rw = cfg(false, false, true);
+
+        // A link the guest could repoint, and a tree the guest could fill.
+        let planted = work.join("link");
+        symlink(&tools, &planted).unwrap();
+        let err = refused(tools_root(&rw, &planted));
+        assert!(err.contains("which job guests can write"), "{err}");
+        let err = refused(tools_root(&rw, &work.join("tools")));
+        assert!(err.contains("which job guests can write"), "{err}");
+        let into = dir.join("into");
+        symlink(work.join("tools"), &into).unwrap();
+        let err = refused(tools_root(&rw, &into));
+        assert!(err.contains("which job guests can write"), "{err}");
+        let onto = dir.join("onto");
+        symlink(&work, &onto).unwrap();
+        let err = refused(tools_root(&rw, &onto));
+        assert!(err.contains("resolves to"), "{err}");
+        // A read-only share is no such tree, and a read-write one is its own root.
+        assert!(tools_root(&cfg(true, false, true), &planted).is_ok());
+        assert!(share_root(&rw, &work, ShareRoot::Workdir).is_ok());
+
+        // A directory part-way up: planted by the guest to lead out of the share, or a trusted
+        // link that leads into it.
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("tools")).unwrap();
+        symlink(&elsewhere, work.join("sub")).unwrap();
+        let err = refused(tools_root(&rw, &work.join("sub/tools")));
+        assert!(err.contains("which job guests can write"), "{err}");
+        std::fs::create_dir_all(work.join("real/tools")).unwrap();
+        let via = dir.join("via");
+        symlink(work.join("real"), &via).unwrap();
+        let err = refused(tools_root(&rw, &via.join("tools")));
+        assert!(err.contains("which job guests can write"), "{err}");
+        let hop = dir.join("hop");
+        symlink(via.join("tools"), &hop).unwrap();
+        let err = refused(tools_root(&rw, &hop));
+        assert!(err.contains("which job guests can write"), "{err}");
+        assert!(tools_root(&cfg(true, false, true), &hop).is_ok());
+
+        // A root that holds a guest-writable tree serves what the guest wrote there.
+        let err = refused(tools_root(&rw, &dir));
+        assert!(err.contains("which holds"), "{err}");
+
+        // The atop archive, while recording is on.
+        let archive = crate::atop::archive_root(&rw);
+        std::fs::create_dir_all(archive.join("tools")).unwrap();
+        let err = refused(tools_root(&cfg(true, false, true), &archive.join("tools")));
+        assert!(err.contains("which job guests can write"), "{err}");
+        let mut quiet = cfg(true, false, true);
+        quiet.executor.atop = false;
+        assert!(tools_root(&quiet, &archive.join("tools")).is_ok());
+        let workdir = |c: &Config, p: &Path| share_root(c, p, ShareRoot::Workdir);
+        let err = refused(workdir(&cfg(true, false, true), &archive.join("tools")));
+        assert!(err.contains("which job guests can write"), "{err}");
+        assert!(workdir(&quiet, &dir).is_ok());
+        let err = refused(workdir(&cfg(true, false, true), &dir));
+        assert!(err.contains("which holds"), "{err}");
+
+        // The host checkouts, whether or not the guest sees them through an overlay.
+        let checkouts = dir.join("checkouts");
+        std::fs::create_dir_all(checkouts.join("tools")).unwrap();
+        let inside = checkouts.join("tools");
+        assert!(tools_root(&cfg(true, false, false), &inside).is_ok());
+        // With the overlay too: the job's author picks what the checkout holds.
+        let err = refused(tools_root(&cfg(true, true, true), &inside));
+        assert!(err.contains("which job guests can write"), "{err}");
+        let err = refused(tools_root(&cfg(true, true, false), &inside));
+        assert!(err.contains("which job guests can write"), "{err}");
+        let err = refused(workdir(&cfg(true, true, false), &inside));
+        assert!(err.contains("which job guests can write"), "{err}");
+        let mut holds_checkouts = cfg(true, true, false);
+        holds_checkouts.executor.atop = false;
+        let err = refused(workdir(&holds_checkouts, &dir));
+        assert!(err.contains("which holds"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A tree is also recognised by its root's identity, which is what a bind mount of that
+    /// root elsewhere shares with it (a test cannot mount one, so the tree is given by identity
+    /// alone).
+    #[test]
+    fn a_share_root_under_a_guest_tree_by_identity_is_refused() {
+        let dir = std::env::temp_dir().join(format!("vk-share-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("mount/tools")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let tree = GuestTree {
+            configured: PathBuf::from("/nonexistent/tree"),
+            canonical: None,
+            id: Some(dir_id(&dir.join("mount")).unwrap()),
+        };
+        let err = format!(
+            "{:#}",
+            resolve_root(&dir.join("mount/tools"), &[tree]).unwrap_err()
+        );
+        let root = format!("{} is that tree's root", dir.join("mount").display());
+        assert!(
+            err.contains("which job guests can write") && err.contains(&root),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A link part-way up is checked like one at the end: an operator's link that leads into
+    /// a read-write share does not vouch for a link the guest made on the way.
+    #[test]
+    fn a_share_root_walk_checks_every_link_on_the_way() {
+        use crate::config::{Executor, Share};
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("vk-share-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let (work, somewhere, opt) = (dir.join("work"), dir.join("somewhere"), dir.join("opt"));
+        for d in [&work, &somewhere.join("tools"), &opt] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let rw = Config {
+            state_dir: Some(dir.clone()),
+            executor: Executor {
+                share: Some(Share {
+                    dir: work.clone(),
+                    readonly: false,
+                }),
+                atop: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tools_root = |p: &Path| share_root(&rw, p, ShareRoot::Tools);
+        // The operator's /opt/x -> /w/sub, and the guest's /w/sub -> somewhere of its choosing.
+        symlink(work.join("sub"), opt.join("x")).unwrap();
+        symlink(&somewhere, work.join("sub")).unwrap();
+        let err = format!("{:#}", tools_root(&opt.join("x/tools")).unwrap_err());
+        assert_eq!(
+            err,
+            format!(
+                "refusing to follow the symlink {}: {}, inside {}, which job guests can write",
+                work.join("sub").display(),
+                work.display(),
+                work.display()
+            )
+        );
+        // The same link reached directly, and one hop further down a chain.
+        let err = format!("{:#}", tools_root(&work.join("sub/tools")).unwrap_err());
+        assert!(err.starts_with("refusing to follow the symlink"), "{err}");
+        symlink(opt.join("x/tools"), dir.join("chain")).unwrap();
+        let err = format!("{:#}", tools_root(&dir.join("chain")).unwrap_err());
+        assert!(err.starts_with("refusing to follow the symlink"), "{err}");
+        // Without a read-write share nothing there is the guest's.
+        assert_eq!(
+            share_root(&Config::default(), &opt.join("x/tools"), ShareRoot::Tools).unwrap(),
+            somewhere.join("tools")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `..` is taken from the directory reached, in the root and in a link's target; a relative
+    /// root is walked from the working directory; `/` is a root like any other.
+    #[test]
+    fn a_share_root_walk_takes_dot_dot_from_where_it_is() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("vk-share-dots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let real = dir.join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let resolve = |p: &Path| resolve_root(p, &[]).map(|(root, _)| root);
+
+        assert_eq!(resolve(&real.join("sub/..")).unwrap(), real);
+        symlink("real/sub/..", dir.join("up")).unwrap();
+        assert_eq!(resolve(&dir.join("up")).unwrap(), real);
+        // `..` from where a link led, not from the path as written.
+        symlink(real.join("sub"), dir.join("into")).unwrap();
+        assert_eq!(resolve(&dir.join("into/..")).unwrap(), real);
+
+        // Relative: up from the working directory to `/`, then down to `real`.
+        let cwd = std::env::current_dir().unwrap();
+        let mut rel = PathBuf::new();
+        for _ in cwd.ancestors().skip(1) {
+            rel.push("..");
+        }
+        rel.push(real.strip_prefix("/").unwrap());
+        assert!(rel.is_relative());
+        assert_eq!(resolve(&rel).unwrap(), real);
+
+        assert_eq!(resolve(Path::new("/")).unwrap(), Path::new("/"));
+        let tree = GuestTree::new(&real);
+        let err = format!("{:#}", resolve_root(Path::new("/"), &[tree]).unwrap_err());
+        assert!(err.contains("which holds"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every directory on the way is walked only where no other user can replace it, not just
+    /// every link: a group-writable directory anywhere above the root is refused, a private or
+    /// sticky one (the entry ours) is not. The owners a test cannot create are covered by
+    /// vk-fs's own tests of the rule.
+    #[test]
+    fn a_share_root_walks_only_names_others_cannot_replace() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("vk-share-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("mid/tools")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let mode =
+            |m| std::fs::set_permissions(dir.join("mid"), std::fs::Permissions::from_mode(m));
+        let resolve = |p: &Path| resolve_root(p, &[]).map(|(root, _)| root);
+        let tools = dir.join("mid/tools");
+
+        mode(0o755).unwrap();
+        assert_eq!(resolve(&tools).unwrap(), tools, "a private path");
+        mode(0o1777).unwrap();
+        assert_eq!(resolve(&tools).unwrap(), tools, "sticky, the entry ours");
+        mode(0o775).unwrap();
+        let err = resolve(&tools).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!(
+                "refusing to walk through {}: {} lets other users replace it (a path is walked \
+                 only through directories writable by no one but this user or root, or sticky \
+                 ones where the entry is owned by this user or root)",
+                tools.display(),
+                dir.join("mid").display()
+            )
+        );
+        mode(0o755).unwrap();
+
+        // The layouts a root usually sits in.
+        for p in ["/", "/var/lib", "/tmp", "/home"].map(Path::new) {
+            if p.is_dir() {
+                assert_eq!(resolve(p).unwrap(), p, "{}", p.display());
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `..` is not taken from a directory inside a guest-writable tree: the guest can move that
+    /// directory, and its parent with it.
+    #[test]
+    fn a_share_root_takes_no_dot_dot_inside_a_guest_tree() {
+        use crate::config::{Executor, Share};
+        let dir = std::env::temp_dir().join(format!("vk-share-up-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("work/sub")).unwrap();
+        std::fs::create_dir_all(dir.join("tools")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let work = dir.join("work");
+        let rw = Config {
+            state_dir: Some(dir.clone()),
+            executor: Executor {
+                share: Some(Share {
+                    dir: work.clone(),
+                    readonly: false,
+                }),
+                atop: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = format!(
+            "{:#}",
+            share_root(&rw, &work.join("sub/../../tools"), ShareRoot::Tools).unwrap_err()
+        );
+        assert_eq!(
+            err,
+            format!(
+                "refusing to take `..` from {}, inside {}, which job guests can write",
+                work.join("sub").display(),
+                work.display()
+            )
+        );
+        assert_eq!(
+            share_root(
+                &Config::default(),
+                &work.join("sub/../../tools"),
+                ShareRoot::Tools
+            )
+            .unwrap(),
+            dir.join("tools")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A directory removed under its descriptor is named as removed, not as some other path.
+    #[test]
+    fn a_removed_directory_is_named_as_removed() {
+        use std::os::fd::AsFd;
+        let dir = std::env::temp_dir().join(format!("vk-share-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let fd = vk_fs::open_dir(&dir).unwrap();
+        assert_eq!(fd_dir(fd.as_fd()).unwrap().0, dir);
+        std::fs::remove_dir(&dir).unwrap();
+        let err = fd_dir(fd.as_fd()).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            format!("{} was removed while it was being resolved", dir.display())
+        );
+    }
 
     /// Unset is not "8G": the cloud-hypervisor backend warns only about a window the host
     /// asked for, so "left alone" has to be distinguishable from the default.

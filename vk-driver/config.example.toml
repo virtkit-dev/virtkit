@@ -200,7 +200,14 @@
 # [executor]             # the GitLab custom executor. Nothing below here is read by
 #                        # `vk run` or `vk build` — only by `vk gitlab …`. Its scalar keys
 #                        # (below) must come before the [executor.*] subtables.
-# tools_dir = "/usr/local/lib/vk/ci-tools"  # static tools shared read-only into job VMs
+# tools_dir = "/usr/local/lib/vk/ci-tools"  # static tools shared read-only into job VMs.
+#                        # A symlink is followed at each job start. Every directory and
+#                        # link on the way must sit in a directory writable by no one but
+#                        # this user or root (or sticky, with the entry owned by them).
+#                        # Neither it, its target, nor anything above them may lie in a
+#                        # tree jobs can write (a read-write [executor.share], host
+#                        # checkouts, the atop archive), and the directory it resolves to
+#                        # may not hold one
 # host_checkout = true   # clone the sources on the host and share them at CI_PROJECT_DIR,
 #                        # instead of letting the job clone them in the guest
 # checkout_dir = "/builds"  # host storage for the clones, in a private `vk` subtree of it
@@ -267,7 +274,7 @@
 # Dev only — a guest image that assembles itself from a directory mounted as
 # /workdir. CI images must not share anything from the host.
 # [executor.share]
-# dir = "/path/to/repo"
+# dir = "/path/to/repo"  # resolved under the same rule as tools_dir
 # readonly = true
 
 # [executor.auth]        # host credentials forwarded into job VMs.

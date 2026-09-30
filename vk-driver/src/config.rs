@@ -285,6 +285,14 @@ pub struct Auth {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Executor {
+    /// Resolved at each job start. Every name on the way, a directory or a symlink at any depth,
+    /// must sit where no one but the `vk` user or root can replace it: in a directory writable
+    /// by no one else, or a sticky one where the entry is owned by them. Each symlink is also
+    /// followed only from outside every tree jobs can write: whoever can replace a name on the
+    /// way chooses what host directory every job reads. The directory it leads to may neither
+    /// lie in nor hold such a tree — a link or not: a read-write `[executor.share]`, the host
+    /// checkouts while `host_checkout` is on, and the atop archive while `atop` is on. What
+    /// that directory holds is trusted as configured: its own mode is not checked.
     pub tools_dir: Option<PathBuf>,
     /// Check the job's git sources out on the HOST at prepare and share the tree into the
     /// guest over virtio-fs, instead of the in-guest `get_sources` clone. The job then sets
@@ -737,6 +745,10 @@ impl Registry {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Share {
+    /// Resolved at each job start, under the same rule as `[executor] tools_dir`, the host
+    /// checkouts and the atop archive being the guest-writable trees it must stay out of and
+    /// not hold: whoever can replace a name on the way chooses what host directory jobs read,
+    /// and write unless `readonly`.
     pub dir: PathBuf,
     #[serde(default = "default_true")]
     pub readonly: bool,
