@@ -64,8 +64,10 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with nine crates:
   leads nowhere, a directory resolved once and worked through its descriptor, and a name
   acted on only where it cannot have become another user's. A leaf with no dependencies but
   `libc` and `anyhow`, so every crate here can use it — `vk-runnerctl` included.
-- **`vk-fleet-proto/`** — what `vk` and `vk-hub` exchange: the list of a host's VMs
-  `vk workloads` prints. Types and pure functions only — no runtime, transport or crypto.
+- **`vk-fleet-proto/`** — what `vk`, `vk node` and `vk-hub` exchange: the list of a host's
+  VMs `vk workloads` prints, and for fleet mode (`vk node` ↔ `vk-hub`) enrollment, the
+  session's messages, protocol version negotiation, and the payloads each side signs or
+  verifies. Types and pure functions only — no runtime, transport or crypto.
 - **`vk-hub/`** — the hub (bin, experimental): `vk-hub local` serves a web UI for the VMs of
   the machine it runs on, read from `vk workloads --watch`, with sessions signed into by
   single-use links and an audit log in a redb database. Built like the `vk-registry` server

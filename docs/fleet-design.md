@@ -58,8 +58,9 @@ Enrollment:
 vk node join https://hub.example.com --token <enrollment-token>
 ```
 
-generates the node's ed25519 identity, which the hub pins on first contact. Enrollment tokens
-are single-use and expire. The identity survives `vk` updates; the hub can revoke it.
+generates the node's ed25519 identity, which the hub pins on first contact. The node signs
+the token with that key, so the hub pins only a key the caller holds. Enrollment tokens are
+single-use and expire. The identity survives `vk` updates; the hub can revoke it.
 
 ## Hub ↔ node protocol
 
@@ -70,7 +71,10 @@ registry or GitLab.
 Each connection opens with:
 
 - the protocol version range each side speaks;
-- the node's ID and a signature over a hub-issued challenge, made with the node's key;
+- the node's ID and a signature over a hub-issued challenge, made with the node's key and
+  covering both version ranges, the version the hub chose — the highest both speak, which
+  the node checks — and the TLS connection it arrives on, so it cannot be replayed on another
+  connection or used to steer the session to an older version;
 - the node's **incarnation ID**, new on every `vk node` start, so the hub tells a reconnect
   from a restart;
 - the node's full observed state and the commands it has journaled but not yet reported
@@ -79,7 +83,8 @@ Each connection opens with:
 Then:
 
 - **node → hub**: inventory when it changes, a heartbeat with capacity and job counts every
-  few seconds, command progress and results.
+  few seconds — at an interval the hub sets, since the hub decides when a quiet node counts
+  as unreachable — command progress and results.
 - **hub → node**: desired state, as a document with a generation number; operations
   (`drain`, `update`, `reset`), each with an ID and an expiry.
 
@@ -118,7 +123,10 @@ Every node reports, keeping hard facts, measured load and operator policy apart:
 - **admission** — memory reserved and budget, disk claimed;
 - **versions** — `vk`, the guest kernel, the effective configuration hash.
 
-A transient reading never changes a node's declared capabilities.
+A transient reading never changes a node's declared capabilities. The facts — hardware,
+filesystem identity and size, declared speed class, versions, runner configuration — are the
+inventory, sent when they change; the readings — pressure, free bytes and inodes, admission
+— ride on the heartbeat.
 
 ### Workloads
 
