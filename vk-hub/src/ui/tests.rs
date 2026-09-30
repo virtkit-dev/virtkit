@@ -1587,3 +1587,161 @@ async fn the_fleet_s_pages_load_only_the_embedded_scripts() {
         );
     }
 }
+
+/// A rollout of one node named `hostname`, straight into the database.
+fn rollout_of(hub: &Hub, hostname: &str) -> (String, String) {
+    let node = enrolled_node(hub, hostname);
+    let id = "cd".repeat(16);
+    let row = crate::rollout::RolloutRow {
+        release: "ab".repeat(32),
+        version: "0.81.0".into(),
+        created_at: 1,
+        created_by: "uid 0".into(),
+        batch: 1,
+        canary_per_profile: true,
+        max_failures: 0,
+        node_timeout_secs: 600,
+        drain_timeout_secs: 600,
+        force: false,
+        state: crate::rollout::RolloutState::Running,
+        failures: 0,
+        nodes: vec![crate::rollout::RolloutNode {
+            id: node.clone(),
+            hostname: hostname.into(),
+            profile: format!("{hostname} CPU · 64G · jobs fast"),
+            wave: 0,
+            status: crate::rollout::NodeStatus::Failed {
+                reason: format!("rolled back: {hostname}"),
+                at: 2,
+            },
+        }],
+    };
+    hub.db
+        .add_release(
+            &row.release,
+            &crate::store::ReleaseRow {
+                version: "0.81.0".into(),
+                size: 1,
+                signature: None,
+                added_at: 1,
+                added_by: "uid 0".into(),
+            },
+            "uid 0",
+        )
+        .unwrap();
+    hub.db.create_rollout(&id, &row, "uid 0").unwrap();
+    (id, node)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rollouts_are_shown_live_and_steered_by_an_operator_alone() {
+    let (addr, hub, origin) = start_fleet().await;
+    let hostile = "ci<script>alert(1)</script>";
+    let (id, _) = rollout_of(&hub, hostile);
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/operations", Some(&viewer)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert_secure(&page);
+    assert!(
+        page.body.contains("sse-connect=\"/events/operations\""),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("ci&lt;script&gt;"), "{}", page.body);
+    assert!(!page.body.contains("<script>alert"), "{}", page.body);
+    assert!(!page.body.contains("hx-post"), "{}", page.body);
+
+    let path = format!("/rollout/{id}/action");
+    let origin = format!("Origin: {origin}");
+    let post = |cookie: &str, form: String| {
+        let cookie = format!("Cookie: {cookie}");
+        let (path, origin) = (path.clone(), origin.clone());
+        async move {
+            request(
+                addr,
+                "POST",
+                &path,
+                &[
+                    &cookie,
+                    &origin,
+                    "HX-Request: true",
+                    "Content-Type: application/x-www-form-urlencoded",
+                ],
+                &form,
+            )
+            .await
+        }
+    };
+    let reply = post(&viewer, format!("_csrf={viewer_csrf}&op=pause")).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, "/operations", Some(&operator)).await;
+    assert!(
+        page.body.contains(&format!("hx-post=\"{path}\"")),
+        "{}",
+        page.body
+    );
+    // The fragment carries no token — it is rendered once for every operator — and the page
+    // sets this session's as the header its buttons post with.
+    assert!(
+        page.body
+            .contains(&format!("X-CSRF-Token&quot;:&quot;{csrf}&quot;")),
+        "{}",
+        page.body
+    );
+    let fragment = page.body.split("id=\"operations\"").nth(1).unwrap();
+    assert!(!fragment.contains(&csrf), "{fragment}");
+    let viewer_page = get(addr, "/operations", Some(&viewer)).await;
+    assert!(
+        !viewer_page.body.contains("hx-headers"),
+        "{}",
+        viewer_page.body
+    );
+    assert_eq!(post(&operator, "op=pause".into()).await.status, 403);
+
+    let mut events = Events::open(addr, "/events/operations", &operator).await;
+    let first = events.next().await.unwrap();
+    assert!(first.starts_with("event: operations\ndata: "), "{first}");
+    assert!(first.contains("running"), "{first}");
+
+    let reply = post(&operator, format!("_csrf={csrf}&op=pause")).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(reply.body.contains("is paused"), "{}", reply.body);
+    let (_, row) = hub.db.resolve_rollout(&id).unwrap();
+    assert!(matches!(
+        row.state,
+        crate::rollout::RolloutState::Paused { .. }
+    ));
+    let principal = hub
+        .db
+        .ui_sessions(crate::now_secs())
+        .unwrap()
+        .into_iter()
+        .find(|s| s.role == Role::Operator)
+        .unwrap()
+        .principal();
+    let last = hub.db.audits(None, 1).unwrap().remove(0);
+    assert_eq!(last.actor, principal);
+    // The stream follows.
+    let next = events.next().await.unwrap();
+    assert!(next.contains(">paused<"), "{next}");
+    // Pausing a paused rollout is the operation's own refusal, said to the operator.
+    let reply = post(&operator, format!("_csrf={csrf}&op=pause")).await;
+    assert_eq!(reply.status, 400);
+    assert_eq!(reply.header("hx-reswap"), Some("none"));
+    assert_eq!(
+        post(&operator, format!("_csrf={csrf}&op=wipe"))
+            .await
+            .status,
+        400
+    );
+    let reply = request(
+        addr,
+        "POST",
+        "/rollout/nothex/action",
+        &[&format!("Cookie: {operator}"), &origin],
+        "",
+    )
+    .await;
+    assert_eq!(reply.status, 404);
+}

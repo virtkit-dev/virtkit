@@ -926,6 +926,23 @@ pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 13] {
         .as_ref()
         .map_or((Acquisition::Run, None), |d| (d.acquisition, d.ceiling));
     let mut state = report.map_or_else(dash, |r| store::state_name(r.state).to_string());
+    // An update under way says how far it is; the last one says if it was rolled back, until
+    // the next.
+    if let Some(u) = report.and_then(|r| r.update.as_ref()) {
+        use vk_fleet_proto::UpdatePhase;
+        match u.phase {
+            UpdatePhase::Draining | UpdatePhase::Downloading | UpdatePhase::Validating => state
+                .push_str(&format!(
+                    ", updating to {}: {}",
+                    u.version,
+                    store::update_phase_name(u.phase)
+                )),
+            UpdatePhase::RolledBack => {
+                state.push_str(&format!(", update to {} rolled back", u.version));
+            }
+            UpdatePhase::Done | UpdatePhase::Failed => {}
+        }
+    }
     if n.pending_commands > 0 {
         state.push_str(&format!(", {} pending", n.pending_commands));
     }

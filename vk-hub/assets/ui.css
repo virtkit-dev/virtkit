@@ -67,6 +67,11 @@ table.kv th { color: var(--muted); font-weight: normal; white-space: nowrap; }
 #flash { padding: 0.4rem 0.6rem; margin: 0.5rem 0; background: var(--band); border-left: 3px solid var(--accent); }
 #flash.error { border-left-color: var(--down); }
 button { font: inherit; padding: 0.15rem 0.6rem; cursor: pointer; }
+h3 { font-size: 0.95rem; margin: 1rem 0 0.2rem; }
+.rollout { margin-bottom: 1.5rem; }
+.state { font-weight: 600; margin-left: 0.4rem; }
+.state.paused, .state.aborted, .reason, table.grid tr.failed td { color: var(--down); }
+.rollout .actions { margin: 0.3rem 0; }
 pre {
   font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
   background: var(--band);

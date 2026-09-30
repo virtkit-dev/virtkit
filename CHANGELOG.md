@@ -78,6 +78,10 @@ All notable changes to virtkit will be documented in this file.
   a restarted hub carries on where it stopped. A host gets `--drain-timeout` to drain and
   `--node-timeout` to update after that; hosts with an external runner are left out unless
   `--force`.
+- **Experimental: the web UI shows releases and rollouts.** An operations page lists the
+  releases the hub holds and each rollout's progress, host by host, as it goes; an operator
+  can pause, resume and abort a rollout there. The nodes table shows a host updating, and a
+  host whose last update was rolled back.
 - **Experimental: signed `vk` releases for a fleet.** `vk release-key generate` makes a
   signing key and `vk release-key sign` signs a binary, on a machine of your choosing;
   `vk-hub release add --signature` passes the signature on. A host with `[node] release_keys`

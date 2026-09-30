@@ -5,13 +5,13 @@ workloads`) and local mode's web UI showing it and acting on it (`vk-hub local`)
 into with links it prints; enrollment, the node session, inventory and heartbeats; desired
 state (hub ceiling, stopping acquisition), drain and quarantine, with the node applying them
 and the hub auditing them (`vk-hub nodes ceiling`, `stop`, `resume`, `drain`, `undrain`,
-`quarantine`, `release`, `vk-hub audit`); the web UI's live nodes, node and audit pages and
-its steering actions, signed into with links from `vk-hub ui login`; releases held by the
-hub and served to the nodes updating to them (`vk-hub release`, `vk-hub nodes update`), and
-nodes updating to them, on trial, rolling back to the previous binary when the release does
-not pass, and checking the release's signature against keys of their own (`vk release-key`);
-rollouts by wave, with a canary per hardware profile (`vk-hub rollout`). Resets, the GitLab
-API pause and the rest of the web UI are not built yet.
+`quarantine`, `release`, `vk-hub audit`); the web UI's live nodes, node, operations and
+audit pages and its steering actions, signed into with links from `vk-hub ui login`;
+releases held by the hub (`vk-hub release`), which nodes update to on trial, checking their
+signatures against keys of their own (`vk release-key`) and rolling back to the previous
+binary when one does not pass (`vk-hub nodes update`); rollouts by wave, with a canary per
+hardware profile (`vk-hub rollout`). Resets, the GitLab API pause, gitlab-runner pinning and
+the rest of the web UI are not built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -500,6 +500,22 @@ and often share one proxy or NAT address. An operator's node page carries the st
 actions: a ceiling set or lifted, acquisition stopped or resumed, drain, undrain, quarantine,
 release. Each answers with the node's fragment re-rendered and a line saying what came of it;
 each also works as a plain form. Removing a node stays on the admin socket.
+
+`/operations` lists the releases the hub holds and its ten latest rollouts, each with its
+state, counts and nodes by wave — status, and profile — live over server-sent events like the
+nodes table: rendered once for every viewer's page and once for every operator's, woken by any
+node's change and by every rollout step, at most once a second and sent only when it differs.
+An operator's session gets pause, resume and abort buttons on each rollout still under way;
+as the fragment is shared, it carries no session's token, and the page sets its session's CSRF
+token around it as the header htmx posts it in (`hx-headers`, JSON htmx parses, never
+evaluates). The posts go to `/rollout/<id>/action` with the same origin, CSRF and role checks
+as a node's actions and run the admin socket's operation as the session's principal. The
+buttons need htmx; `vk-hub rollout pause|resume|abort` does the same without it. Adding a
+release and starting a rollout stay on the admin socket: the one takes a file on the hub's
+host, and the other is the decision to change every node's binary, which is left to whoever
+holds the hub's own user. The nodes table and `vk-hub nodes` show an update under way beside the node's state
+— `maintenance, updating to 0.81.0: downloading` — and a rolled-back one until the next; a
+node's page shows the update's phase and why it failed, and the sha256 of the `vk` it runs.
 
 htmx 2.0.7 and htmx-ext-sse 2.2.3 are vendored in `vk-hub/assets/` (`VENDOR.md` gives their
 sources and digests), embedded, and served under a hash of their content with a year's

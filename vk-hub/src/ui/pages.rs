@@ -9,7 +9,9 @@ use super::Auth;
 use super::assets;
 use super::html::Html;
 use crate::ops::NodeView;
+use crate::rollout::{NodeStatus, Rollout, RolloutState};
 use crate::server::HEARTBEAT;
+use crate::store::Release;
 use crate::store::{AuditRow, CommandRow, NodeRow, Role};
 
 /// Audit lines per page of `/audit`.
@@ -17,6 +19,16 @@ pub const AUDIT_PAGE: usize = 100;
 /// A node page's latest commands and audit lines.
 pub const NODE_COMMANDS: usize = 20;
 pub const NODE_AUDIT: usize = 30;
+
+/// Rollouts `/operations` shows, newest first.
+pub const OPERATIONS_ROLLOUTS: usize = 10;
+
+/// What `/operations` shows.
+pub struct Operations {
+    pub releases: Vec<Release>,
+    /// Newest first.
+    pub rollouts: Vec<Rollout>,
+}
 
 /// What a node's page shows.
 pub struct NodeDetail {
@@ -42,7 +54,8 @@ pub fn layout(title: &str, auth: &Auth, main: &Html) -> Html {
 }
 
 /// The fleet's navigation.
-pub const FLEET_NAV: &str = "<a href=\"/\">nodes</a> <a href=\"/audit\">audit</a>";
+pub const FLEET_NAV: &str =
+    "<a href=\"/\">nodes</a> <a href=\"/operations\">operations</a> <a href=\"/audit\">audit</a>";
 
 /// [`layout`], with the site's own navigation, `nav`.
 pub fn frame(title: &str, auth: &Auth, nav: &'static str, main: &Html) -> Html {
@@ -388,6 +401,18 @@ pub fn node_detail(d: &NodeDetail, now: u64) -> Html {
             for note in &r.unsupported {
                 kv_node(&mut h, "cannot comply", note);
             }
+            if let Some(u) = &r.update {
+                h.raw("<tr><th>update</th><td>vk ")
+                    .node(&u.version)
+                    .raw(" (<code>")
+                    .node(crate::store::short(&u.sha256))
+                    .raw("</code>): ")
+                    .raw(crate::store::update_phase_name(u.phase));
+                if let Some(message) = &u.message {
+                    h.raw(": ").node(message);
+                }
+                h.raw("</td></tr>");
+            }
             if let Some(p) = r.drain {
                 kv(
                     &mut h,
@@ -527,6 +552,11 @@ pub fn node_detail(d: &NodeDetail, now: u64) -> Html {
         kv_node(&mut h, "vk", &inv.versions.vk);
         kv_node(
             &mut h,
+            "vk sha256",
+            inv.versions.vk_sha256.as_deref().unwrap_or("-"),
+        );
+        kv_node(
+            &mut h,
             "guest kernel",
             inv.versions.guest_kernel.as_deref().unwrap_or("-"),
         );
@@ -579,6 +609,184 @@ pub fn node_detail(d: &NodeDetail, now: u64) -> Html {
         .text(&v.id)
         .raw("\">the node's whole audit log</a></p></section>");
     h
+}
+
+/// `/operations`: the releases the hub holds and its rollouts, kept live.
+///
+/// The live fragment is rendered once for every viewer and once for every operator
+/// ([`super::sse::feed`]), so it carries no session's CSRF token: an operator's page sets it
+/// as a header on every htmx request from inside the fragment, `hx-headers`, which is how the
+/// rollouts' pause, resume and abort buttons post. Those buttons need htmx;
+/// `vk-hub rollout pause|resume|abort` does the same without it.
+pub fn operations(auth: &Auth, ops: &Operations, now: u64) -> Html {
+    let steer = auth.session.role >= Role::Operator;
+    let mut main = Html::new();
+    main.raw("<h1>Operations</h1>");
+    if steer {
+        // The token is hex, derived by the hub; the header's JSON is htmx's to parse, never
+        // evaluated.
+        main.raw("<div id=\"flash\"></div><div hx-headers=\"{&quot;X-CSRF-Token&quot;:&quot;")
+            .text(&auth.csrf)
+            .raw("&quot;}\">");
+    }
+    main.raw("<div id=\"operations\" hx-ext=\"sse\" sse-connect=\"/events/operations\" ")
+        .raw("sse-swap=\"operations\" sse-close=\"close\">")
+        .html(&operations_fragment(ops, steer, now))
+        .raw("</div>");
+    if steer {
+        main.raw("</div>");
+    }
+    layout("operations", auth, &main)
+}
+
+/// `/operations`' live part. With `steer`, each rollout still under way carries the buttons
+/// that steer it.
+pub fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
+    let mut h = Html::new();
+    h.raw("<section><h2>Releases</h2>");
+    if ops.releases.is_empty() {
+        h.raw("<p class=\"empty\">None: <code>vk-hub release add</code> copies a vk binary ")
+            .raw("into the hub.</p>");
+    } else {
+        h.raw("<table class=\"grid\"><thead><tr><th>sha256</th><th>version</th>")
+            .raw("<th>size</th><th>signed</th><th>added</th><th>by</th></tr></thead><tbody>");
+        for r in &ops.releases {
+            h.raw("<tr><td><code title=\"")
+                .text(&r.sha256)
+                .raw("\">")
+                .text(crate::store::short(&r.sha256))
+                .raw("</code></td><td>")
+                .text(&r.row.version)
+                .raw("</td><td>")
+                .text(bytes(r.row.size))
+                .raw("</td><td>")
+                .raw(if r.row.signature.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                })
+                .raw("</td><td>")
+                .text(crate::utc(r.row.added_at))
+                .raw("</td><td>")
+                .text(&r.row.added_by)
+                .raw("</td></tr>");
+        }
+        h.raw("</tbody></table>");
+    }
+    h.raw("</section><section><h2>Rollouts</h2>");
+    if ops.rollouts.is_empty() {
+        h.raw("<p class=\"empty\">None yet: <code>vk-hub rollout create</code> starts one.</p>");
+    }
+    for r in &ops.rollouts {
+        rollout(&mut h, r, steer, now);
+    }
+    h.raw("</section>");
+    h
+}
+
+fn rollout(h: &mut Html, r: &Rollout, steer: bool, now: u64) {
+    let row = &r.row;
+    h.raw("<div class=\"rollout\"><h3><code>")
+        .text(crate::rollout::short_id(&r.id))
+        .raw("</code> vk ")
+        .text(&row.version)
+        .raw(" <span class=\"state ")
+        .raw(row.state.name())
+        .raw("\">")
+        .raw(row.state.name())
+        .raw("</span></h3><p class=\"sub\">");
+    let counts: Vec<String> = r
+        .counts()
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(name, n)| format!("{n} {name}"))
+        .collect();
+    h.text(counts.join(", "));
+    if let Some(wave) = r.wave().filter(|_| row.state.active()) {
+        h.raw(" · wave ").text(wave);
+    }
+    h.raw(" · release <code>")
+        .text(crate::store::short(&row.release))
+        .raw("</code> · batches of ")
+        .text(row.batch)
+        .raw(if row.canary_per_profile {
+            " after a canary per profile"
+        } else {
+            ""
+        })
+        .raw(" · ")
+        .text(row.failures)
+        .raw(" of at most ")
+        .text(row.max_failures)
+        .raw(" failure(s) · started ")
+        .text(crate::utc(row.created_at))
+        .raw(" by ")
+        .text(&row.created_by)
+        .raw("</p>");
+    if let RolloutState::Paused { reason } | RolloutState::Aborted { reason } = &row.state {
+        // Its failures quote what nodes said.
+        h.raw("<p class=\"reason\">").node(reason).raw("</p>");
+    }
+    if steer && row.state.active() {
+        h.raw("<div class=\"actions\">");
+        let actions: &[(&'static str, &'static str)] = match row.state {
+            RolloutState::Running => &[("pause", "pause"), ("abort", "abort")],
+            _ => &[("resume", "resume"), ("abort", "abort")],
+        };
+        for (op, label) in actions {
+            // The ID is one the hub issued, and the router takes only hex for one.
+            h.raw("<form method=\"post\" action=\"/rollout/")
+                .text(&r.id)
+                .raw("/action\" hx-post=\"/rollout/")
+                .text(&r.id)
+                .raw("/action\" hx-target=\"#operations\">")
+                .raw("<input type=\"hidden\" name=\"op\" value=\"")
+                .raw(op)
+                .raw("\"><button>")
+                .raw(label)
+                .raw("</button></form>");
+        }
+        h.raw("</div>");
+    }
+    h.raw("<table class=\"grid\"><thead><tr><th>wave</th><th>node</th><th>status</th>")
+        .raw("<th>profile</th></tr></thead><tbody>");
+    for n in &row.nodes {
+        h.raw("<tr class=\"")
+            .raw(n.status.name())
+            .raw("\"><td>")
+            .text(n.wave)
+            .raw("</td><td>");
+        if vk_fleet_proto::valid_id(&n.id) {
+            h.raw("<a href=\"/node/")
+                .text(&n.id)
+                .raw("\">")
+                .node(&n.hostname)
+                .raw("</a>");
+        } else {
+            h.node(&n.hostname);
+        }
+        h.raw("</td><td>");
+        match &n.status {
+            NodeStatus::Failed { reason, .. } => {
+                h.raw("failed: ").node(reason);
+            }
+            NodeStatus::Skipped { reason } => {
+                h.raw("skipped: ").node(reason);
+            }
+            NodeStatus::Updating { command, since, .. } => {
+                h.raw("updating, issued ")
+                    .text(age(now, *since))
+                    .raw(" (command <code>")
+                    .text(command)
+                    .raw("</code>)");
+            }
+            other => {
+                h.text(crate::rollout_node_status(other, now));
+            }
+        }
+        h.raw("</td><td>").node(&n.profile).raw("</td></tr>");
+    }
+    h.raw("</tbody></table></div>");
 }
 
 /// `/audit`: the log, newest first, a page at a time, maybe of one node.

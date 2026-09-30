@@ -17,8 +17,9 @@
 //! its `Origin` is the configured `ui_url`, or `Sec-Fetch-Site` says `same-origin` — and carry
 //! the session's CSRF token, derived from its secret, in a form field or header. The fleet's
 //! operations are [`crate::ops`]', the admin socket's, done as the session's principal;
-//! removing a node and issuing tokens stay on the admin socket. Local mode's are `vk`
-//! commands ([`actions`]).
+//! removing a node, issuing tokens, adding a release — a file on the hub's host — and
+//! starting a rollout stay on the admin socket, and an operator pauses, resumes and aborts
+//! rollouts from `/operations`. Local mode's operations are `vk` commands ([`actions`]).
 //!
 //! **Every request** must name `ui_url`'s host in its `Host`, so a page on another name
 //! resolved to this address (DNS rebinding) reaches nothing. **Every response** carries a
@@ -105,6 +106,10 @@ enum Site {
     Fleet {
         /// The nodes table, rendered once for every nodes page ([`sse::feed`]).
         nodes_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+        /// `/operations`' fragment, rendered once for every viewer's page and once for every
+        /// operator's.
+        operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+        steered_operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     },
     /// `vk-hub local`: this machine's VMs.
     Local {
@@ -119,6 +124,16 @@ impl Ui {
     pub fn new(hub: Arc<Hub>, origin: &str) -> Self {
         let site = Site::Fleet {
             nodes_feed: sse::feed(hub.subscribe(), "nodes", render_nodes(hub.clone())),
+            operations_feed: sse::feed(
+                hub.subscribe(),
+                "operations",
+                render_operations(hub.clone(), false),
+            ),
+            steered_operations_feed: sse::feed(
+                hub.subscribe(),
+                "operations",
+                render_operations(hub.clone(), true),
+            ),
         };
         Self::with_site(hub, origin, site)
     }
@@ -274,9 +289,10 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
             }
         }
         (Method::POST, _) => match &ui.site {
-            Site::Fleet { .. } => match action_node(&path) {
-                Some(id) => action(req, ui, id.to_string()).await,
-                None => Ok(message(StatusCode::NOT_FOUND, "No such action.")),
+            Site::Fleet { .. } => match (action_node(&path), action_rollout(&path)) {
+                (Some(id), _) => action(req, ui, id.to_string()).await,
+                (_, Some(id)) => rollout_action(req, ui, id.to_string()).await,
+                _ => Ok(message(StatusCode::NOT_FOUND, "No such action.")),
             },
             Site::Local { local, .. } => match local::action_target(&path) {
                 Some(local::Target::Vm(id)) => actions::vm_action(req, ui, local, &id).await,
@@ -315,11 +331,36 @@ async fn get(path: &str, query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Re
         let nodes = blocking(move || crate::ops::node_views(&hub)).await?;
         return Ok(page(pages::nodes(auth, &nodes, now)));
     }
+    if path == "/operations" {
+        let ops = blocking(move || operations(&hub)).await?;
+        return Ok(page(pages::operations(auth, &ops, now)));
+    }
     let source = match (&ui.site, path.strip_prefix("/events/")) {
-        (Site::Fleet { nodes_feed }, Some("nodes")) => Some(sse::Source::Shared {
+        (Site::Fleet { nodes_feed, .. }, Some("nodes")) => Some(sse::Source::Shared {
             name: "nodes",
             feed: nodes_feed.subscribe(),
             render: render_nodes(hub.clone()),
+        }),
+        (
+            Site::Fleet {
+                steered_operations_feed,
+                ..
+            },
+            Some("operations"),
+        ) if auth.session.role >= Role::Operator => Some(sse::Source::Shared {
+            name: "operations",
+            feed: steered_operations_feed.subscribe(),
+            render: render_operations(hub.clone(), true),
+        }),
+        (
+            Site::Fleet {
+                operations_feed, ..
+            },
+            Some("operations"),
+        ) => Some(sse::Source::Shared {
+            name: "operations",
+            feed: operations_feed.subscribe(),
+            render: render_operations(hub.clone(), false),
         }),
         (_, Some(rest)) => rest
             .strip_prefix("node/")
@@ -397,6 +438,28 @@ fn render_node(hub: &Hub, id: &str) -> Result<String> {
     Ok(match node_detail(hub, id)? {
         Some(detail) => pages::node_detail(&detail, crate::now_secs()).into_string(),
         None => pages::gone().into_string(),
+    })
+}
+
+/// `/operations`' fragment: with the rollouts' buttons for an operator, whose posts carry the
+/// session's CSRF token in the header the page sets around the fragment, or without for a
+/// viewer.
+fn render_operations(hub: Arc<Hub>, steer: bool) -> sse::Render {
+    Arc::new(move || {
+        Ok(pages::operations_fragment(&operations(&hub)?, steer, crate::now_secs()).into_string())
+    })
+}
+
+/// What `/operations` shows.
+fn operations(hub: &Hub) -> Result<pages::Operations> {
+    let mut rollouts = hub.db.rollouts()?;
+    rollouts.truncate(pages::OPERATIONS_ROLLOUTS);
+    Ok(pages::Operations {
+        releases: hub.db.releases()?,
+        rollouts: rollouts
+            .into_iter()
+            .map(|(id, row)| crate::rollout::Rollout { id, row })
+            .collect(),
     })
 }
 
@@ -614,6 +677,72 @@ async fn action(req: Request<Incoming>, ui: &Ui, id: String) -> Result<Response<
     let mut resp = html_response(status, body);
     if error {
         // Only the line: the fragment stays as it is.
+        resp.headers_mut()
+            .insert("hx-reswap", HeaderValue::from_static("none"));
+    }
+    Ok(resp)
+}
+
+/// `/rollout/<id>/action`'s rollout, if `path` is that for a well-formed ID.
+fn action_rollout(path: &str) -> Option<&str> {
+    path.strip_prefix("/rollout/")?
+        .strip_suffix("/action")
+        .filter(|id| vk_fleet_proto::valid_id(id))
+}
+
+/// `POST /rollout/<id>/action`: an operator pausing, resuming or aborting a rollout, through
+/// the admin socket's operation, as the session's principal. Answered as a node's action is:
+/// for htmx the operations fragment and a line saying what came of it, else back to the page.
+async fn rollout_action(req: Request<Incoming>, ui: &Ui, id: String) -> Result<Response<Body>> {
+    use crate::store::RolloutAction;
+    let htmx = req.headers().contains_key("hx-request");
+    let (auth, form) = match check_post(req, ui, Role::Operator).await? {
+        Ok(checked) => checked,
+        Err((status, text)) => return Ok(refused(htmx, status, text)),
+    };
+    let action = match field(&form, "op") {
+        Some("pause") => RolloutAction::Pause,
+        Some("resume") => RolloutAction::Resume,
+        Some("abort") => RolloutAction::Abort,
+        _ => return Ok(refused(htmx, StatusCode::BAD_REQUEST, "No such action.")),
+    };
+    let principal = auth.session.principal();
+    let hub = ui.hub.clone();
+    let (said, ops) = blocking(move || {
+        let said = crate::ops::steer_rollout(&hub, &principal, &id, action)
+            .map(|r| {
+                format!(
+                    "Rollout {} is {}.",
+                    crate::rollout::short_id(&r.id),
+                    r.row.state.name()
+                )
+            })
+            .map_err(|e| format!("{e:#}"));
+        Ok((said, operations(&hub)?))
+    })
+    .await?;
+    if !htmx {
+        return Ok(match said {
+            Ok(_) => {
+                let mut resp = Response::new(Body::default());
+                *resp.status_mut() = StatusCode::SEE_OTHER;
+                resp.headers_mut()
+                    .insert(header::LOCATION, HeaderValue::from_static("/operations"));
+                resp
+            }
+            Err(e) => html_response(StatusCode::BAD_REQUEST, pages::message(&e)),
+        });
+    }
+    let (status, text, error) = match &said {
+        Ok(text) => (StatusCode::OK, text.as_str(), false),
+        Err(e) => (StatusCode::BAD_REQUEST, e.as_str(), true),
+    };
+    let mut body = pages::flash(text, error);
+    if !error {
+        body.html(&pages::operations_fragment(&ops, true, crate::now_secs()));
+    }
+    let mut resp = html_response(status, body);
+    if error {
         resp.headers_mut()
             .insert("hx-reswap", HeaderValue::from_static("none"));
     }
