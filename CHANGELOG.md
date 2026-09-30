@@ -39,6 +39,7 @@ All notable changes to virtkit will be documented in this file.
   becomes `atop.log.zst`, about twenty times smaller; a log a crashed runner left behind is
   compressed by a later day's first job, unless it is over 512 MiB. `vk atop` reads both,
   and `zstdcat atop.log.zst` gives back the text for `grep` and `awk`.
+- The pinned guest kernel is bumped to 6.18.54.
 
 ### Fixed
 
