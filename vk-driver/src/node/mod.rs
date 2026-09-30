@@ -14,7 +14,8 @@
 //! (the private key, `0600`), `enrollment.json` (the hub's URL and the node ID it assigned),
 //! `state.json` (what the hub asked and the node's own state), `runner.pid` (a managed
 //! runner's pid and start time, for a restarted node to find it),
-//! `ca.pem` (the CA the hub is verified against, copied at `join` when one was given) and
+//! `ca.pem` (the CA the hub is verified against, copied at `join` when one was given),
+//! `releases/` (a release being installed, and the binary it replaced; see [`update`]) and
 //! `lock`, which one `vk node` process at a time holds. A `join` whose answer was lost keeps
 //! the key it made and joins again with a new token: the hub answers a key it already pinned
 //! with the node it pinned it to.
@@ -29,6 +30,7 @@ mod inventory;
 mod runner;
 mod session;
 mod state;
+mod update;
 
 use std::io::Read;
 use std::os::fd::AsRawFd;
@@ -240,6 +242,17 @@ pub async fn run(cfg: Config) -> Result<()> {
             e
         }
     })?;
+    // Before anything else: this may be the previous binary of an update on trial, whose
+    // part is to count the attempt and hand over, or to take the node back.
+    match update::on_start(&dir, session::now_secs())? {
+        update::Start::Run => {}
+        update::Start::Exec(path) => {
+            drop(_lock);
+            return Err(update::exec(&path));
+        }
+    }
+    update::arm_trial_deadline(&dir, session::now_secs())?;
+    update::note_installed(&dir)?;
     let identity = Identity::load(&dir).with_context(|| {
         format!(
             "loading the node's identity ({})",
@@ -279,6 +292,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     let (runner_tx, runner_state) =
         tokio::sync::watch::channel(vk_fleet_proto::RunnerState::Stopped);
     let (core, allowed) = core::Core::open(&dir, managed, issuer, runner_state)?;
+    core.set_allow_downgrade(cfg.node.allow_downgrade);
     let cfg = Arc::new(cfg);
     let (halt, halted) = tokio::sync::watch::channel(false);
     let supervisor = spec.map(|spec| {
@@ -293,13 +307,28 @@ pub async fn run(cfg: Config) -> Result<()> {
         core.clone()
             .control(cfg.clone(), CONTROL_EVERY, stop.clone()),
     );
-    let mut gatherer = session::Gatherer::spawn(cfg);
-    let node = session::Node {
+    // Read now, so the first inventory carries it and no session waits on it.
+    if tokio::task::spawn_blocking(update::own_sha256)
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        eprintln!("vk node: warning: cannot read the running vk to report its sha256");
+    }
+    let mut gatherer = session::Gatherer::spawn(cfg.clone());
+    let node = Arc::new(session::Node {
         enrollment,
         identity,
         incarnation,
         tls,
-    };
+    });
+    tokio::spawn(update::maintain(
+        core.clone(),
+        cfg,
+        node.clone(),
+        stop.clone(),
+    ));
     let ended = hold_sessions(&node, &core, &mut gatherer, &mut stop).await;
     // Stopping or refused for good, the node quits a managed runner and waits for its jobs to
     // finish: a node its hub no longer knows should not go on taking the fleet's work, and a

@@ -45,7 +45,9 @@ tokio-util.workspace = true
 toml.workspace = true
 etherparse.workspace = true
 ipstack.workspace = true
-hyper.workspace = true
+# `client`: `vk node` downloading a release from its hub over the connection it signs for
+# (already built for reqwest)
+hyper = { workspace = true, features = ["client"] }
 hyper-util.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true

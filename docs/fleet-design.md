@@ -7,9 +7,10 @@ state (hub ceiling, stopping acquisition), drain and quarantine, with the node a
 and the hub auditing them (`vk-hub nodes ceiling`, `stop`, `resume`, `drain`, `undrain`,
 `quarantine`, `release`, `vk-hub audit`); the web UI's live nodes, node and audit pages and
 its steering actions, signed into with links from `vk-hub ui login`; releases held by the
-hub and served to the nodes updating to them (`vk-hub release`, `vk-hub nodes update`).
-Updates on the node, rollouts, resets, the GitLab API pause and the rest of the web UI are
-not built yet.
+hub and served to the nodes updating to them (`vk-hub release`, `vk-hub nodes update`), and
+nodes updating to them, on trial, rolling back to the previous binary when the release does
+not pass. Signed releases, rollouts, resets, the GitLab API pause and the rest of the web UI
+are not built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -276,6 +277,17 @@ All of it is persisted on the node, and a restart or a lost hub leaves it where 
 `validating` runs a boot/exec/network smoke test and, when configured, a synthetic job
 before the node goes back to `ready`.
 
+Built so far for updates: an update is taken from `ready`, `draining` or `drained` and drains
+the node first (a drain already under way is joined, and the node returns to `drained`
+after); `maintenance` covers the download and the switch, `validating` the release's trial,
+and the node then returns to the state it came from — or enters a quarantine that arrived
+meanwhile, which is in force from the moment it is received since maintenance takes no jobs.
+While the node still drains, `undrain` or `quarantine` call the update off; once maintenance
+has begun, the update runs to its end, a `drain` makes it end `drained`, and another update is
+refused. What `validating` runs is `vk check`'s gate and `[node] validate`, an argv of the
+operator's that must exit 0 within `validate_timeout_secs` (600 by default) — booting a small
+image with `$VK_BINARY`, the release on trial, is the intended use.
+
 A node that stops heartbeating is shown as unreachable, not paused: pausing every
 disconnected node would turn a hub outage into a fleet outage.
 
@@ -297,7 +309,62 @@ Fleet updates add:
 - one `vk` binary per job for the job's whole life: executor stages running during a switch
   must not mix versions, which draining guarantees.
 
-Built so far: `vk-hub release add <file> --version <v>` copies a `vk` binary into
+Built so far, on the node: an update names its release by sha256 and size, and may give a
+time limit, `within_secs`, counted from the end of the drain; a drain still under way when the
+command expires calls the update off. After the drain, the node downloads the release into
+`<state_dir>/node/releases/<sha256>` — a private file renamed into place once it hashes to the
+sha256 and is no longer than the size — runs its `--version` (`vk-selfupdate`'s smoke test),
+keeps the running binary beside it under its own sha256, and executes the release in its own
+place with a trial recorded in its state, flushed to disk: the installed binary's path and its
+device and inode, the attempts, and a deadline — `validate_timeout_secs` plus ten minutes on,
+or the command's limit if that comes first.
+
+The installed binary is the file the last `vk node run` not started from a release executed,
+as the kernel names it — a symlink is followed, and its target is what an update replaces, so
+a `vk` reached through a link into a versioned directory has that directory's file replaced.
+The path is recorded in the node's state, never read off a release running from the releases
+directory, and an update is refused while it is unknown, inside the node's own directory, or
+in a directory the node's user cannot write.
+
+The installed binary is not touched during the trial, so whatever starts `vk node run` next —
+a supervisor restarting a release that crashed or was ended, or a person — starts the previous
+binary, which counts the attempt and hands over to the release again once it still hashes to
+what was downloaded, and past three attempts, past the deadline, or when it no longer hashes
+so ends the update as rolled back and runs on itself. A release that dies before it can count
+anything is counted all the same. The binary that executes a release on trial arms
+`alarm(2)` for the deadline across the exec, and the release arms it again before anything
+else runs, so the kernel ends a release that hangs — even one that is no `vk` at all — and the
+previous binary, restarted, finds the deadline past.
+
+On trial the release validates, waits for a session with the hub, and only then copies itself
+beside the installed binary — checking what it copied against the sha256 — and renames it into
+place, ending the update done; it then executes the installed binary, so the node never goes
+on running from its releases directory. A failure or the deadline ends it as rolled back: the
+release executes the installed binary, or failing that the copy kept of it, whichever still
+hashes to what the release replaced; with neither, it quarantines the node, for an operator,
+rather than run on as ready. An installed binary that is no longer the file the trial started
+from — replaced by hand or a package manager meanwhile — is not overwritten: the update fails,
+and the node runs what is installed. A crash during the download leaves the node in
+`maintenance`, which the next start takes up again; one between recording the trial and
+executing the release is the first attempt counted; one during the install is finished by
+the next start. The update's ack is `done`, or `failed` with the reason — `rolled back: …`
+when the release ran. After an update the release and the binary before it are kept in
+`releases/`, and after a rollback the binary running; everything else there is removed.
+
+A release that validates but cannot reach the hub by the deadline is rolled back: the
+previous binary reached the hub moments before the switch — it downloaded the release from it
+— so the release is taken to be what is wrong, and keeping it could leave a node no hub can
+steer. A hub that is down meanwhile costs a retried update.
+
+An update is refused on a node whose runner is external unless issued with `--force`: such a
+runner cannot be drained, so jobs running across the switch run their later stages with the
+new `vk` — the one thing draining exists to prevent. It is refused, too, for an older version
+than the node runs unless the node's own `[node] allow_downgrade = true` allows it, and even
+then for one older than 0.80.0, the first release that takes part in a trial; versions are
+compared as `MAJOR.MINOR.PATCH`, and an older one that is not of that form is refused.
+Signatures and the gitlab-runner binary's pinning are not built yet.
+
+On the hub: `vk-hub release add <file> --version <v>` copies a `vk` binary into
 `<data_dir>/releases/`, named by its sha256, and `release list` and `release remove` show and
 delete them — a release a node is still updating to stays. Adding the same bytes as the same
 version again answers with the release already held, so an add retried after its answer was
@@ -492,6 +559,10 @@ browser is not built.
   operations local policy allows.
 - Node identities are pinned keys, rotated and revoked from the hub; enrollment tokens are
   short-lived and single-use.
+- A hub chooses which release a node updates to, never whether it may go back: a node refuses
+  an older `vk` than it runs unless its own configuration allows it (`[node] allow_downgrade`),
+  since an override the hub carried would be worth nothing against a compromised hub — which
+  could otherwise take the fleet back to a release with a known flaw, signed or not.
 - Runner authentication tokens stay on their nodes. The hub's GitLab credential is a separate
   one, scoped to managing runners (pause, resume, list).
 - Hub roles: viewer; operator (ceilings, drain, reset, rollouts); admin (enrollment,

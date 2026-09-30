@@ -288,11 +288,27 @@ pub struct Node {
     pub runner: vk_fleet_proto::RunnerMode,
     /// The gitlab-runner binary a managed runner runs. Unset: `gitlab-runner`, on `PATH`.
     pub gitlab_runner: Option<PathBuf>,
+    /// A command an updated node runs, after `vk check`, before it keeps the new `vk`: an
+    /// argv, such as `["sh", "-c", "$VK_BINARY run alpine true"]` to boot a small image with
+    /// the release on trial, which `VK_BINARY` names. It must exit 0 within
+    /// `validate_timeout_secs`. Unset: `vk check` alone.
+    pub validate: Vec<String>,
+    /// How long `validate` may take. Unset: 600.
+    pub validate_timeout_secs: Option<u64>,
+    /// Let an update install an older `vk` than the one running. Off by default, so a hub —
+    /// or whoever holds it — cannot take the node back to a release with a known flaw. Even
+    /// on, nothing older than the first release that takes part in a trial is installed.
+    pub allow_downgrade: bool,
 }
 
 impl Node {
     fn is_default(&self) -> bool {
         *self == Node::default()
+    }
+
+    /// How long `validate` may take.
+    pub fn validate_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.validate_timeout_secs.unwrap_or(600))
     }
 }
 

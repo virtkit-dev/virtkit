@@ -18,7 +18,7 @@ use vk_fleet_proto::{
     RunnerMode, RunnerState,
 };
 
-use super::state::{Issuer, Persisted};
+use super::state::{Abilities, Issuer, Persisted};
 use crate::config::Config;
 
 pub struct Core {
@@ -34,6 +34,13 @@ pub struct Core {
     acquire: watch::Sender<bool>,
     /// Bumped on every change a report would show.
     changed: watch::Sender<u64>,
+    /// Whether a session with the hub is up: what an update on trial waits for.
+    connected: watch::Sender<bool>,
+    /// How [`Core::leave`] executes a binary.
+    exec: fn(&Path) -> anyhow::Error,
+    /// Whether an update may install an older version than this one (`[node]
+    /// allow_downgrade`).
+    allow_downgrade: std::sync::atomic::AtomicBool,
 }
 
 impl Core {
@@ -70,6 +77,9 @@ impl Core {
             runner,
             acquire,
             changed,
+            connected: watch::Sender::new(false),
+            exec: super::update::exec,
+            allow_downgrade: std::sync::atomic::AtomicBool::new(false),
         };
         Ok((Arc::new(core), allowed))
     }
@@ -105,8 +115,87 @@ impl Core {
     }
 
     pub fn command(&self, command: Command, now: u64) -> Result<CommandAck> {
-        let managed = self.managed;
-        self.update(|p| p.command(command, now, managed))
+        let can = Abilities {
+            managed: self.managed,
+            // Looked at only for an update: it reads the filesystem.
+            update: match &command.op {
+                vk_fleet_proto::Operation::Update { version, .. } => {
+                    let installed = lock(&self.persisted).installed.clone();
+                    super::update::can_replace(installed.as_deref(), &self.dir).and_then(|()| {
+                        super::update::check_version(
+                            env!("CARGO_PKG_VERSION"),
+                            version,
+                            self.allow_downgrade(),
+                        )
+                    })
+                }
+                _ => Ok(()),
+            },
+        };
+        self.update(|p| p.command_as(command, now, &can))
+    }
+
+    /// Change the persisted state through `f` and execute `exe` in this process's place,
+    /// holding the state's lock throughout: nothing this process does meanwhile — an ack
+    /// recorded, a runner started for the state `f` leaves — can come between the change on
+    /// disk and the binary that follows it. Returns only on failure, with the change in force
+    /// in this process too.
+    pub fn leave(&self, f: impl FnOnce(&mut Persisted), exe: &Path) -> anyhow::Error {
+        let persisted = lock(&self.persisted);
+        let mut next = persisted.clone();
+        f(&mut next);
+        if let Err(e) = next.save_durable(&self.dir) {
+            return e;
+        }
+        let e = (self.exec)(exe);
+        // Not executed: the change goes back, on disk too — it described a binary that is
+        // not running.
+        if let Err(undo) = persisted.save_durable(&self.dir) {
+            return e.context(format!("and restoring the node state failed: {undo:#}"));
+        }
+        e
+    }
+
+    /// Execute binaries through `exec` rather than for real.
+    #[cfg(test)]
+    pub fn set_exec(&mut self, exec: fn(&Path) -> anyhow::Error) {
+        self.exec = exec;
+    }
+
+    /// Change the persisted state through `f`, as a command would: on disk first.
+    pub fn change<R>(&self, f: impl FnOnce(&mut Persisted) -> R) -> Result<R> {
+        self.update(f)
+    }
+
+    /// The persisted state as it stands.
+    pub fn persisted(&self) -> Persisted {
+        lock(&self.persisted).clone()
+    }
+
+    /// Let updates install older versions, as `[node] allow_downgrade` says.
+    pub fn set_allow_downgrade(&self, allow: bool) {
+        self.allow_downgrade
+            .store(allow, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn allow_downgrade(&self) -> bool {
+        self.allow_downgrade
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The node dir.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Note whether a session with the hub is up.
+    pub fn set_connected(&self, up: bool) {
+        self.connected.send_replace(up);
+    }
+
+    /// Follows whether a session with the hub is up.
+    pub fn connected(&self) -> watch::Receiver<bool> {
+        self.connected.subscribe()
     }
 
     pub fn recorded(&self, ack: &CommandAck, now: u64) -> Result<()> {
@@ -170,7 +259,7 @@ impl Core {
             concurrency: *lock(&self.concurrency),
             concurrency_error: lock(&self.concurrency_error).clone(),
             drain: *lock(&self.drain),
-            update: None,
+            update: persisted.update.clone(),
         }
     }
 
@@ -246,6 +335,10 @@ impl Core {
     }
 
     fn drain_step(&self, cfg: &Config) -> Result<()> {
+        let now = super::session::now_secs();
+        if self.update(|p| p.drain_expired(now))? {
+            eprintln!("vk node: the update's command expired before the drain finished");
+        }
         if self.state() != NodeState::Draining {
             self.set(&self.drain, None);
             return Ok(());
@@ -258,7 +351,7 @@ impl Core {
                 .unwrap_or(u32::MAX),
         };
         self.set(&self.drain, Some(progress));
-        if drained(&progress) && self.update(Persisted::finish_drain)? {
+        if drained(&progress) && self.update(|p| p.finish_drain(now))? {
             eprintln!("vk node: drained");
             self.set(&self.drain, None);
         }

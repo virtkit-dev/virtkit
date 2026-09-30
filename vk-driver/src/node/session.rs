@@ -51,7 +51,7 @@ const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
 
 /// The transport under the WebSocket: TCP, or TLS over it.
-trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
+pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 
 type Ws = WebSocketStream<Box<dyn Io>>;
@@ -156,6 +156,7 @@ pub async fn run(
         opened = opened => opened?,
         _ = stop.wait_for(|&s| s) => return Ok(()),
     };
+    let _up = Connected::mark(core);
     eprintln!(
         "vk node: connected to {} (heartbeat every {}s)",
         node.enrollment.hub,
@@ -221,6 +222,22 @@ pub async fn run(
                 }
             }
         }
+    }
+}
+
+/// Marks the hub reached for as long as it lives: from the welcome to the session's end.
+struct Connected<'a>(&'a Core);
+
+impl<'a> Connected<'a> {
+    fn mark(core: &'a Core) -> Self {
+        core.set_connected(true);
+        Connected(core)
+    }
+}
+
+impl Drop for Connected<'_> {
+    fn drop(&mut self) {
+        self.0.set_connected(false);
     }
 }
 
@@ -384,6 +401,25 @@ async fn connect(
     hub: &str,
     tls: &Arc<rustls::ClientConfig>,
 ) -> Result<(Ws, Option<[u8; TLS_EXPORTER_LEN]>)> {
+    let (io, exported, authority) = dial(hub, tls).await?;
+    let scheme = if exported.is_some() { "wss" } else { "ws" };
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(vk_fleet_proto::MAX_MESSAGE))
+        .max_frame_size(Some(vk_fleet_proto::MAX_MESSAGE));
+    let ws_url = format!("{scheme}://{authority}{}", vk_fleet_proto::NODE_PATH);
+    let (ws, _) = tokio_tungstenite::client_async_with_config(ws_url, io, Some(config))
+        .await
+        .map_err(|e| anyhow!("opening the WebSocket to {hub}: {e}"))?;
+    Ok((ws, exported))
+}
+
+/// A connection to the hub's node listener: TCP, and TLS for an `https` hub. Returns it
+/// with the TLS keying material a signature on it is bound to — `None` on plain TCP — and
+/// the `host:port` it reached.
+pub async fn dial(
+    hub: &str,
+    tls: &Arc<rustls::ClientConfig>,
+) -> Result<(Box<dyn Io>, Option<[u8; TLS_EXPORTER_LEN]>, String)> {
     let url = reqwest::Url::parse(hub).with_context(|| format!("parsing the hub URL {hub:?}"))?;
     // Bracketed for an IPv6 literal, which is the form both the socket address and the
     // WebSocket URL want.
@@ -398,7 +434,7 @@ async fn connect(
     // Heartbeats are small and latency is what a session is judged on.
     tcp.set_nodelay(true).context("setting TCP_NODELAY")?;
     keepalive(&tcp).context("setting TCP keepalives")?;
-    let (io, scheme, exported): (Box<dyn Io>, _, _) = match url.scheme() {
+    let (io, exported): (Box<dyn Io>, _) = match url.scheme() {
         "https" => {
             // An IP literal is verified against the certificate's IP addresses, a name
             // against its DNS names.
@@ -418,19 +454,12 @@ async fn connect(
                 .1
                 .export_keying_material(&mut exported, vk_fleet_proto::TLS_EXPORTER_LABEL, None)
                 .context("exporting TLS keying material")?;
-            (Box::new(stream), "wss", Some(exported))
+            (Box::new(stream), Some(exported))
         }
-        "http" => (Box::new(tcp), "ws", None),
+        "http" => (Box::new(tcp), None),
         other => bail!("the hub URL has scheme {other:?}; expected https (or http on loopback)"),
     };
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(vk_fleet_proto::MAX_MESSAGE))
-        .max_frame_size(Some(vk_fleet_proto::MAX_MESSAGE));
-    let ws_url = format!("{scheme}://{authority}{}", vk_fleet_proto::NODE_PATH);
-    let (ws, _) = tokio_tungstenite::client_async_with_config(ws_url, io, Some(config))
-        .await
-        .map_err(|e| anyhow!("opening the WebSocket to {hub}: {e}"))?;
-    Ok((ws, exported))
+    Ok((io, exported, authority))
 }
 
 /// Keepalives on an idle socket and a bound on unacknowledged data on a busy one, so a hub
@@ -480,7 +509,7 @@ async fn send(ws: &mut Ws, msg: &NodeMsg, within: Duration) -> Result<()> {
         .map_err(|e| anyhow!("sending to the hub: {e}"))
 }
 
-fn now_secs() -> u64 {
+pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
