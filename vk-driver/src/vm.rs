@@ -2249,9 +2249,30 @@ fn service_per_source(
             &format!("service {:?} MICROVM_EGRESS_ALLOW_IP", svc.name),
             &format!("service {:?} MICROVM_EGRESS_ALLOW_NAME", svc.name),
         )?;
-        out.push((svc.addr, ips.unwrap_or_default(), names.unwrap_or_default()));
+        let addrs: Vec<Ipv4Addr> = std::iter::once(svc.addr)
+            .chain(svc.extra_ips.iter().copied())
+            .collect();
+        out.extend(per_address(
+            &addrs,
+            ips.unwrap_or_default(),
+            names.unwrap_or_default(),
+        ));
     }
     Ok(out)
+}
+
+/// One service's policy keyed by every address it can source: the switch admits a guest's
+/// frames from any of its NICs' addresses and picks the policy by the source, so a policy
+/// on the first alone left a service's other NICs on the run's wider one.
+fn per_address(
+    addrs: &[Ipv4Addr],
+    ips: Vec<String>,
+    names: Vec<String>,
+) -> Vec<(Ipv4Addr, Vec<String>, Vec<String>)> {
+    addrs
+        .iter()
+        .map(|a| (*a, ips.clone(), names.clone()))
+        .collect()
 }
 
 /// This job's effective build-phase egress ([`crate::build::BuildNet`]) plus its build-audit
@@ -3442,8 +3463,25 @@ fn log_tail(path: &Path, lines: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::config::Config;
     use crate::jobctx::JobCtx;
+
+    #[test]
+    fn a_service_policy_covers_every_address_it_can_source() {
+        let addrs = [Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(10, 0, 1, 5)];
+        let rows = per_address(
+            &addrs,
+            vec!["10.9.0.0/16".into()],
+            vec!["db.internal".into()],
+        );
+        assert_eq!(rows.len(), 2);
+        for (row, addr) in rows.iter().zip(addrs) {
+            assert_eq!(row.0, addr);
+            assert_eq!(row.1, ["10.9.0.0/16"]);
+            assert_eq!(row.2, ["db.internal"]);
+        }
+    }
 
     /// Resolve share-root symlinks before passing them to the VMM, on every job so a
     /// swapped link serves the new tree.
