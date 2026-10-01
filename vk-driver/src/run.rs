@@ -2440,6 +2440,9 @@ async fn build_and_boot(
             state_dir,
             project_dir: project_dir(args),
             pid: std::process::id(),
+            pid_start_ticks: i32::try_from(std::process::id())
+                .ok()
+                .and_then(crate::usage::proc_starttime),
             label,
             exec_addr: format!("vsock-auto://{}:{VSOCK_PORT}", vsock.display()),
             ssh_addr: args

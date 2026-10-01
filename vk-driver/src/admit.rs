@@ -1423,6 +1423,8 @@ pub struct Held {
     /// What each granted job claimed on the job dirs' filesystem, in bytes, by entry name —
     /// which is its job id, and so the name of its job dir. Only the jobs that asked for disk.
     pub disk: Vec<(OsString, u64)>,
+    /// Each granted job's memory reservation in MiB, keyed by entry name like `disk`.
+    pub mem: Vec<(OsString, u64)>,
 }
 
 /// What this host has committed right now, for a caller with no entry of its own — the
@@ -1433,12 +1435,8 @@ pub struct Held {
 /// cannot be read is an error, though: a scheduler told nothing is committed would offer the
 /// whole budget again, which is the one answer that overcommits the host.
 pub fn committed(dir: &Path) -> Result<Held> {
-    // Not `Path::exists()`: that answers false for a stat that failed for any reason — a
-    // permission error on a parent included — which is exactly the reading this must refuse.
-    match std::fs::metadata(dir) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Held::default()),
-        Err(e) => return Err(e).with_context(|| format!("statting {}", dir.display())),
+    if !ledger_exists(dir)? {
+        return Ok(Held::default());
     }
     let mut anomalies = Vec::new();
     let out = {
@@ -1447,6 +1445,31 @@ pub fn committed(dir: &Path) -> Result<Held> {
     };
     report(&anomalies);
     out
+}
+
+/// Nonblocking [`committed`]: returns `None` while another caller holds the directory lock.
+/// Returns scan anomalies with the reading so the caller can report them or suppress repeats.
+pub fn try_committed(dir: &Path) -> Result<Option<(Held, Vec<String>)>> {
+    if !ledger_exists(dir)? {
+        return Ok(Some((Held::default(), Vec::new())));
+    }
+    let Some(_lock) = try_lock_dir(dir)? else {
+        return Ok(None);
+    };
+    let mut anomalies = Vec::new();
+    let held = tally(dir, "", u128::MAX, &mut anomalies)?;
+    Ok(Some((held, anomalies)))
+}
+
+/// Whether the ledger at `dir` is there; a ledger not there yet holds nothing.
+fn ledger_exists(dir: &Path) -> Result<bool> {
+    // Not `Path::exists()`: that answers false for a stat that failed for any reason — a
+    // permission error on a parent included — which is exactly the reading this must refuse.
+    match std::fs::metadata(dir) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("statting {}", dir.display())),
+    }
 }
 
 /// What the live ledger holds, ignoring `job_id` (the caller's own entry), with how many jobs
@@ -1495,6 +1518,7 @@ fn tally(dir: &Path, job_id: &str, asked: u128, anomalies: &mut Vec<String>) -> 
         if entry.granted {
             out.granted_mib = out.granted_mib.saturating_add(entry.want_mib);
             out.granted = out.granted.saturating_add(1);
+            out.mem.push((name.to_os_string(), entry.want_mib));
             let placed = match entry.node {
                 Some(Place::Node(id)) => Some(out.per_node.entry(id).or_default()),
                 Some(Place::Spread) => Some(&mut out.spread),
@@ -1648,6 +1672,19 @@ fn locked(file: &File) -> bool {
 /// Take the directory's exclusive lock, held until the returned file drops. Blocking: the
 /// critical section is a directory scan, and a waiter is better than a spuriously refused job.
 pub(crate) fn lock_dir(dir: &Path) -> Result<File> {
+    match lock_dir_with(dir, libc::LOCK_EX)? {
+        Some(file) => Ok(file),
+        // A blocking flock waits rather than answer EWOULDBLOCK.
+        None => bail!("locking {}: would block", dir.join(LOCK).display()),
+    }
+}
+
+/// [`lock_dir`], or `None` at once where another holds the lock.
+fn try_lock_dir(dir: &Path) -> Result<Option<File>> {
+    lock_dir_with(dir, libc::LOCK_EX | libc::LOCK_NB)
+}
+
+fn lock_dir_with(dir: &Path, op: libc::c_int) -> Result<Option<File>> {
     let path = dir.join(LOCK);
     let file = File::options()
         .write(true)
@@ -1657,11 +1694,14 @@ pub(crate) fn lock_dir(dir: &Path) -> Result<File> {
         .open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
     // SAFETY: the fd is owned by `file`, which outlives the call; flock returns 0 or -1.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("locking {}", path.display()));
+    if unsafe { libc::flock(file.as_raw_fd(), op) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(e).with_context(|| format!("locking {}", path.display()));
     }
-    Ok(file)
+    Ok(Some(file))
 }
 
 /// Wall-clock seconds, for ageing a job's history: what makes a run old is calendar time,
@@ -2451,10 +2491,35 @@ mod tests {
         assert_eq!(now.granted_mib, 3072, "only the granted count against it");
         assert_eq!(now.granted, 2);
         assert_eq!(now.ahead, 1, "the waiter is counted but not charged");
+        let mut by_job = now.mem.clone();
+        by_job.sort();
+        assert_eq!(by_job, [("one".into(), 2048), ("two".into(), 1024)]);
 
         // The lock file the directory keeps is not a project, so nothing is read out of it.
         assert!(dir.join(LOCK).exists(), "committed took the lock");
         assert!(all_expected(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A poll of the ledger gives way to an admission holding it rather than wait, and hands
+    /// what it found odd back rather than saying it.
+    #[test]
+    fn a_polled_ledger_gives_way_and_hands_back_what_is_odd() {
+        let dir = tmpdir("try-committed");
+        let missing = try_committed(&dir.join("missing")).unwrap();
+        assert_eq!(missing, Some((Held::default(), Vec::new())));
+
+        let _running = held(&dir, "one", 2048, 1, true);
+        let _partial = open_shared(&dir.join("cut")).unwrap();
+        std::fs::write(dir.join("cut"), "want_mib=1").unwrap();
+        {
+            let _admission = lock_dir(&dir).unwrap();
+            assert_eq!(try_committed(&dir).unwrap(), None, "busy: no wait");
+        }
+        let (now, anomalies) = try_committed(&dir).unwrap().unwrap();
+        assert_eq!(now.granted_mib, 2048);
+        assert_eq!(anomalies.len(), 1, "{anomalies:?}");
+        assert!(anomalies[0].contains("cut"), "{anomalies:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

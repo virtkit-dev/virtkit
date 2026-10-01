@@ -89,6 +89,7 @@ mod vm;
 mod vmdk;
 mod vmm;
 mod vms;
+mod workloads;
 mod wsl;
 
 use std::borrow::Cow;
@@ -624,6 +625,30 @@ enum Cmd {
     /// `max_concurrency`.
     #[command(hide = true)]
     Tune,
+    /// plumbing: the VMs running on this host, as JSON for a local UI
+    ///
+    /// One line of JSON: pinned runs and dev environments from the registry `vk list` reads,
+    /// and CI jobs whose supervisor is alive, each with what its process tree holds on the
+    /// host. Its fields are only ever added to.
+    #[command(hide = true)]
+    Workloads {
+        /// keep printing the list each time it changes, a line at a time, until stdin closes
+        ///
+        /// Stdin is expected to be a pipe the reader holds open: the watch ends when it closes.
+        #[arg(long)]
+        watch: bool,
+        /// how often to look again, with --watch
+        #[arg(long, value_name = "SECS", default_value_t = 2,
+              value_parser = clap::value_parser!(u64).range(1..))]
+        interval_secs: u64,
+        /// how often to measure what each VM holds
+        ///
+        /// A walk of every page table of every process of every VM; a VM that appears is
+        /// measured at once.
+        #[arg(long, value_name = "SECS", default_value_t = 30,
+              value_parser = clap::value_parser!(u64).range(1..))]
+        mem_secs: u64,
+    },
     /// GitLab custom executor
     ///
     /// The lifecycle hooks (config / prepare / run / cleanup) and the operator's view of what
@@ -3971,6 +3996,19 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         },
+        Cmd::Workloads {
+            watch,
+            interval_secs,
+            mem_secs,
+        } => match workloads::run(
+            &ctx.cfg,
+            watch,
+            std::time::Duration::from_secs(interval_secs),
+            std::time::Duration::from_secs(mem_secs),
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&e, 1),
+        },
         Cmd::Gitlab { cmd } => match cmd {
             GitlabCmd::Config => {
                 let info = serde_json::json!({
@@ -5832,6 +5870,7 @@ mod tests {
             ssh_addr: None,
             atop_log: None,
             created_secs: 0,
+            pid_start_ticks: None,
             vmm: None,
             vmm_pid: None,
             cpus: None,

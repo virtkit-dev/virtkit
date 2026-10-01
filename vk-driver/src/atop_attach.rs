@@ -314,6 +314,7 @@ mod tests {
             ssh_addr: None,
             atop_log: None,
             created_secs: 0,
+            pid_start_ticks: None,
             vmm: None,
             vmm_pid: None,
             cpus: None,

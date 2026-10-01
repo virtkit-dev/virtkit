@@ -1,0 +1,14 @@
+[package]
+name = "vk-hub-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# Shared definitions for `vk` and local readers: types and pure functions only,
+# with no runtime, transport or crypto.
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -51,6 +51,11 @@ pub struct VmEntry {
     pub atop_log: Option<PathBuf>,
     /// Unix time (seconds) the entry was recorded — the VM's start, for an uptime column.
     pub created_secs: u64,
+    /// When `pid` started, in clock ticks since boot (`/proc/<pid>/stat`'s `starttime`): which
+    /// process the pid is, unmoved by a wall-clock step. `None` on an entry recorded before
+    /// the field existed, or where it could not be read.
+    #[serde(default)]
+    pub pid_start_ticks: Option<u64>,
     /// The VMM backend hosting the guest: `libkrun` or `cloud-hypervisor`. This and the
     /// fields down to `guest_ip` are boot-time facts `vk run` files; each is `None` on an
     /// entry recorded before the field existed.
@@ -252,7 +257,7 @@ pub fn registry_dir() -> Result<PathBuf> {
 
 /// Content-addressed file name for a state dir: a short hash of its path, so distinct state
 /// dirs never collide and the same one always maps to the same file.
-fn slug(state_dir: &Path) -> String {
+pub(crate) fn slug(state_dir: &Path) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(state_dir.as_os_str().as_bytes());
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
@@ -332,12 +337,17 @@ pub fn running() -> Vec<VmEntry> {
     let Ok(dir) = registry_dir() else {
         return Vec::new();
     };
+    running_in(&dir)
+}
+
+/// [`running`], for the registry at `dir`.
+pub(crate) fn running_in(dir: &Path) -> Vec<VmEntry> {
     let mut out = Vec::new();
-    for entry in load_all_in(&dir) {
+    for entry in load_all_in(dir) {
         if alive(&entry) {
             out.push(entry);
         } else {
-            remove_in(&dir, &entry.state_dir);
+            remove_in(dir, &entry.state_dir);
         }
     }
     out.sort_by_key(|e| e.created_secs);
@@ -1663,6 +1673,7 @@ mod tests {
             ssh_addr: None,
             atop_log: None,
             created_secs: unix_now(),
+            pid_start_ticks: None,
             vmm: None,
             vmm_pid: None,
             cpus: None,

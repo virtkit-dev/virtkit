@@ -48,6 +48,8 @@ http-body-util.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+# Shared output format for `vk workloads` and its readers.
+vk-hub-proto = { path = "../vk-hub-proto" }
 
 # Bundled vhost-user virtio-fs daemon (the `vk virtiofsd` subcommand) — a default
 # feature, disable with --no-default-features. FUSE requests are served by the
