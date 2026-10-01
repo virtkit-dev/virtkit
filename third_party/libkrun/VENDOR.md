@@ -396,3 +396,9 @@ refuses the same names (`validate_path_component`). In the server, so the in-pro
 its read-only and id-mapped wrappers and the bundled `vk virtiofsd` all get it. LOOKUP and
 RENAME tests drive the refusal through the server and check that only single components reach
 the filesystem. Search for `entry_name`.
+
+`src/devices/src/virtio/block/lazy_chunk_storage.rs` — a chunk is zstd-decoded no further
+than one byte past the decompressed length its `.vk_ro_img` entry claims, then refused if it
+does not come to exactly that length: a frame that inflates beyond it (the chunks come from a
+registry anyone with push access fills) is no longer held whole in memory first. Search for
+`take(u64::from(chunk.length) + 1)`.

@@ -1108,9 +1108,17 @@ impl VkRoImg {
         let path = self.chunk_path(chunk);
         let raw =
             std::fs::read(&path).with_context(|| format!("reading chunk {}", path.display()))?;
+        // Decode at most the claimed length plus one byte to reject oversized frames
+        // without buffering them whole.
         let data = if chunk.codec == crate::registry::VK_RO_IMG_CODEC_ZSTD {
-            zstd::decode_all(&raw[..])
-                .with_context(|| format!("zstd-decompressing chunk {}", path.display()))?
+            use std::io::Read;
+            // Capacity hint only: capped at the largest chunk, whatever the header claims.
+            let mut data =
+                Vec::with_capacity((chunk.length as usize).min(crate::registry::CDC_MAX));
+            zstd::stream::read::Decoder::new(&raw[..])
+                .and_then(|d| d.take(u64::from(chunk.length) + 1).read_to_end(&mut data))
+                .with_context(|| format!("zstd-decompressing chunk {}", path.display()))?;
+            data
         } else {
             raw
         };
@@ -2265,6 +2273,45 @@ mod tests {
             Some(manifest.as_path())
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reject zstd chunks that decode shorter or longer than their manifest length.
+    #[test]
+    fn vk_ro_img_refuses_a_chunk_of_the_wrong_length() {
+        let dir = std::env::temp_dir().join(format!("vk-ro-img-length-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let chunk = vec![3u8; 100];
+        let digest = fake_digest(1);
+        std::fs::write(
+            dir.join(digest_hex(&digest)),
+            zstd::encode_all(&chunk[..], 3).unwrap(),
+        )
+        .unwrap();
+        let manifest = dir.join("length.vk_ro_img");
+        for claimed in [50u32, 100, 200] {
+            crate::registry::write_vk_ro_img(
+                &manifest,
+                u64::from(claimed),
+                crate::registry::VK_RO_IMG_LAYOUT_FLAT,
+                &dir,
+                &[crate::registry::LazyChunk {
+                    offset: 0,
+                    length: claimed,
+                    codec: crate::registry::VK_RO_IMG_CODEC_ZSTD,
+                    digest,
+                }],
+            )
+            .unwrap();
+            let got = VkRoImg::open(&manifest).unwrap().load_chunk(0);
+            if claimed == 100 {
+                assert_eq!(got.unwrap(), chunk);
+            } else {
+                let err = format!("{:#}", got.unwrap_err());
+                assert!(err.contains("decompressed to"), "{claimed}: {err}");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

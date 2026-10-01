@@ -47,7 +47,7 @@ use vk_registry::{TRANSPARENT_ZSTD_HEADER, ZSTD_LEVEL, zstd_with_size};
 // CDC parameters for runner.ext4 (FastCDC v2020): min 1 MiB, avg 4 MiB, max 16 MiB.
 const CDC_MIN: usize = 1 << 20;
 const CDC_AVG: usize = 4 << 20;
-const CDC_MAX: usize = 16 << 20;
+pub(crate) const CDC_MAX: usize = 16 << 20;
 
 // Media types for the bundle artifact.
 const ARTIFACT_TYPE: &str = "application/vnd.wallix.microvm.bundle";
@@ -529,9 +529,10 @@ async fn try_pull_ext4_lazy_async(
         OciManifest::Image(m) => m,
         OciManifest::ImageIndex(_) => bail!("{name}@{digest} is an image index, not a bundle"),
     };
-    let config = pull_blob_bytes(&client, &dref, &manifest.config).await?;
+    let config = pull_blob_bytes(&client, &dref, &manifest.config, MAX_CONFIG_BLOB).await?;
     let config: BundleConfig =
         serde_json::from_slice(&config).context("parsing the bundle config blob")?;
+    let total_size = config.total_size;
 
     let chunk_layers: Vec<OciDescriptor> = manifest
         .layers
@@ -562,7 +563,9 @@ async fn try_pull_ext4_lazy_async(
             let client = &client;
             let dref = &dref;
             async move {
-                let (offset, length) = chunk_placement(&layer)?;
+                // Bounded here as the eager path's reassembly is: the lazy view decodes each
+                // chunk to exactly this length later, on demand.
+                let (offset, length) = chunk_bounds(&layer, total_size)?;
                 // Ensures the blob is in the local cache (network fetch on a miss) — the
                 // decompress-and-place step the eager path does next is what we skip.
                 pull_chunk(client, dref, &layer, chunks_cache, fetched, reused).await?;
@@ -573,7 +576,7 @@ async fn try_pull_ext4_lazy_async(
                 };
                 Ok(LazyChunk {
                     offset,
-                    length: length as u32,
+                    length: u32::try_from(length).context("chunk length")?,
                     codec,
                     digest: digest_bytes(&layer.digest)?,
                 })
@@ -583,7 +586,7 @@ async fn try_pull_ext4_lazy_async(
         .collect()
         .await;
     let mut chunks: Vec<LazyChunk> = results.into_iter().collect::<Result<_>>()?;
-    chunks.sort_unstable_by_key(|c| c.offset);
+    sort_lazy_chunks(&mut chunks).with_context(|| format!("{name}@{digest}"))?;
 
     write_vk_ro_img(
         dest,
@@ -684,7 +687,7 @@ async fn fetch_chunks_async(
         OciManifest::Image(m) => m,
         OciManifest::ImageIndex(_) => bail!("{name}@{digest} is an image index, not a bundle"),
     };
-    let config = pull_blob_bytes(&client, &dref, &manifest.config).await?;
+    let config = pull_blob_bytes(&client, &dref, &manifest.config, MAX_CONFIG_BLOB).await?;
     let config: BundleConfig =
         serde_json::from_slice(&config).context("parsing the bundle config blob")?;
     let chunks: Vec<OciDescriptor> = manifest
@@ -1544,7 +1547,7 @@ async fn pull_into(
         OciManifest::ImageIndex(_) => bail!("{name}@{digest} is an image index, not a bundle"),
     };
 
-    let config = pull_blob_bytes(client, image, &manifest.config).await?;
+    let config = pull_blob_bytes(client, image, &manifest.config, MAX_CONFIG_BLOB).await?;
     let config: BundleConfig =
         serde_json::from_slice(&config).context("parsing the bundle config blob")?;
 
@@ -1563,6 +1566,7 @@ async fn pull_into(
         .with_context(|| format!("creating {}", ext4.display()))?;
     out.set_len(config.total_size)
         .with_context(|| format!("sizing {}", ext4.display()))?;
+    let total_size = config.total_size;
 
     // Reassemble the chunks concurrently: each in-flight chunk fetches (network or the
     // local cache), then decompresses + writes into its own disjoint slot on a blocking
@@ -1609,17 +1613,12 @@ async fn pull_into(
             let ext4 = ext4.clone();
             let (fetched, reused, chunks_cache) = (&fetched, &reused, &chunks_cache);
             async move {
-                let (offset, _len) = chunk_placement(&layer)?;
+                // Refused before it is fetched or cached; `chunk_bytes` holds it to this.
+                chunk_bounds(&layer, total_size)?;
                 let bytes =
                     pull_chunk(client, image, &layer, chunks_cache, fetched, reused).await?;
-                let digest = layer.digest;
                 tokio::task::spawn_blocking(move || -> Result<()> {
-                    let raw = if compressed {
-                        zstd::decode_all(&bytes[..])
-                            .with_context(|| format!("zstd-decompressing chunk {digest}"))?
-                    } else {
-                        bytes
-                    };
+                    let (offset, raw) = chunk_bytes(&layer, bytes, compressed, total_size)?;
                     write_chunk_sparse(&out, offset, &raw)
                         .with_context(|| format!("writing a chunk into {}", ext4.display()))
                 })
@@ -1647,14 +1646,12 @@ async fn pull_into(
     for layer in &manifest.layers {
         match layer.media_type.as_str() {
             KERNEL_MEDIA_TYPE => {
-                let data = pull_blob_bytes(client, image, layer).await?;
-                std::fs::write(tmp.join("vmlinuz"), data)
-                    .with_context(|| format!("writing {}", tmp.join("vmlinuz").display()))?;
+                pull_blob_to_file(client, image, layer, &tmp.join("vmlinuz"), MAX_BOOT_BLOB)
+                    .await?;
             }
             INITRD_MEDIA_TYPE => {
-                let data = pull_blob_bytes(client, image, layer).await?;
-                std::fs::write(tmp.join("initrd.img"), data)
-                    .with_context(|| format!("writing {}", tmp.join("initrd.img").display()))?;
+                pull_blob_to_file(client, image, layer, &tmp.join("initrd.img"), MAX_BOOT_BLOB)
+                    .await?;
             }
             _ => {}
         }
@@ -1692,7 +1689,8 @@ fn chunks_cache_dir(dir: &Path) -> std::path::PathBuf {
 
 /// Fetch one chunk, preferring the content-addressed local cache. A cache hit is
 /// trusted (the file name IS the verified digest); a miss pulls (oci-client
-/// verifies the blob against the descriptor digest) and stores it.
+/// verifies the blob against the descriptor digest) and stores it. A hit is not
+/// size-capped: the cache is filled only by an earlier, capped pull.
 async fn pull_chunk(
     client: &oci_client::Client,
     image: &OciReference,
@@ -1708,7 +1706,7 @@ async fn pull_chunk(
         reused.fetch_add(1, Ordering::Relaxed);
         return Ok(bytes);
     }
-    let bytes = pull_blob_bytes(client, image, layer).await?;
+    let bytes = pull_blob_bytes(client, image, layer, MAX_CHUNK_BLOB).await?;
     std::fs::create_dir_all(cache).with_context(|| format!("creating {}", cache.display()))?;
     // atomic-ish: write to a tmp sibling then rename, so a killed pull never leaves a
     // truncated file under the digest name (which would then be trusted blindly). The staging
@@ -1729,20 +1727,167 @@ async fn pull_chunk(
     Ok(bytes)
 }
 
-/// Pull a blob fully into memory. oci-client verifies the bytes against the
-/// descriptor digest while streaming, so the returned buffer is digest-checked.
+/// The most a bundle's config blob may be: a few hundred bytes of JSON in practice.
+const MAX_CONFIG_BLOB: u64 = 4 << 20;
+/// The most a chunk's blob may be: a chunk is at most [`CDC_MAX`] raw, and zstd never grows
+/// one by more than a sliver.
+const MAX_CHUNK_BLOB: u64 = 2 * CDC_MAX as u64;
+/// The most a bundle's kernel or initrd may be, streamed to its file.
+const MAX_BOOT_BLOB: u64 = 1 << 30;
+
+/// Pull a blob fully into memory, refusing one over `max` bytes — declared, or as it
+/// arrives. oci-client verifies the bytes against the descriptor digest while streaming, so
+/// the returned buffer is digest-checked. The descriptor is the registry's to write, so its
+/// size is a claim checked against the bound, never a capacity to allocate.
 async fn pull_blob_bytes(
     client: &oci_client::Client,
     image: &OciReference,
     layer: &OciDescriptor,
+    max: u64,
 ) -> Result<Vec<u8>> {
+    check_blob_size(layer, max)?;
     with_transfer_retry(&format!("pulling blob {}", layer.digest), || async move {
-        let mut buf = Vec::with_capacity(layer.size.max(0) as usize);
+        let mut buf = Capped::new(Vec::with_capacity(layer.size.max(0) as usize), max);
         client.pull_blob(image, layer, &mut buf).await?;
-        Ok::<_, OciDistributionError>(buf)
+        Ok::<_, OciDistributionError>(buf.inner)
     })
     .await
     .with_context(|| format!("pulling blob {}", layer.digest))
+}
+
+/// Stream a blob to `path` without buffering it whole, enforcing the same `max` byte
+/// limit as [`pull_blob_bytes`].
+async fn pull_blob_to_file(
+    client: &oci_client::Client,
+    image: &OciReference,
+    layer: &OciDescriptor,
+    path: &Path,
+    max: u64,
+) -> Result<()> {
+    check_blob_size(layer, max)?;
+    with_transfer_retry(&format!("pulling blob {}", layer.digest), || async move {
+        let file = tokio::fs::File::create(path).await?;
+        let mut out = Capped::new(file, max);
+        client.pull_blob(image, layer, &mut out).await?;
+        tokio::io::AsyncWriteExt::flush(&mut out).await?;
+        Ok::<_, OciDistributionError>(())
+    })
+    .await
+    .with_context(|| format!("pulling blob {} into {}", layer.digest, path.display()))
+}
+
+fn check_blob_size(layer: &OciDescriptor, max: u64) -> Result<()> {
+    if layer.size < 0 || layer.size as u64 > max {
+        bail!(
+            "blob {} declares {} bytes, over the {max} accepted for it",
+            layer.digest,
+            layer.size
+        );
+    }
+    Ok(())
+}
+
+/// An `AsyncWrite` that fails once more than `max` bytes are written to it: what keeps a
+/// blob that streams past its declared size from growing without bound before its digest
+/// can be checked.
+struct Capped<W> {
+    inner: W,
+    left: u64,
+}
+
+impl<W> Capped<W> {
+    fn new(inner: W, max: u64) -> Self {
+        Capped { inner, left: max }
+    }
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Capped<W> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        if buf.len() as u64 > self.left {
+            return std::task::Poll::Ready(Err(std::io::Error::other(
+                "blob is larger than accepted",
+            )));
+        }
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &poll {
+            self.left -= *n as u64;
+        }
+        poll
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// A chunk's `(offset, length)`, refused unless it is at most [`CDC_MAX`] long and lies
+/// inside the `total_size` image: the registry writes both the descriptor and the blob.
+fn chunk_bounds(layer: &OciDescriptor, total_size: u64) -> Result<(u64, u64)> {
+    let (offset, len) = chunk_placement(layer)?;
+    if len > CDC_MAX as u64 || offset.checked_add(len).is_none_or(|end| end > total_size) {
+        bail!(
+            "chunk {} claims {len} bytes at {offset}, outside the {total_size}-byte image",
+            layer.digest
+        );
+    }
+    Ok((offset, len))
+}
+
+/// Sort a lazy view's chunks by offset, refusing any two that overlap: the view itself
+/// refuses them only when it is opened.
+fn sort_lazy_chunks(chunks: &mut [LazyChunk]) -> Result<()> {
+    chunks.sort_unstable_by_key(|c| c.offset);
+    if let Some(w) = chunks
+        .windows(2)
+        .find(|w| w[0].offset + u64::from(w[0].length) > w[1].offset)
+    {
+        bail!("chunks at {} and {} overlap", w[0].offset, w[1].offset);
+    }
+    Ok(())
+}
+
+/// A chunk's offset in the image and its raw bytes, held to what its descriptor claims:
+/// exactly its annotated length — at most [`CDC_MAX`] — once decompressed, and placed inside
+/// the `total_size` image. The registry writes both the descriptor and the blob, so a frame
+/// that decompresses past its length is cut off there rather than inflated in memory.
+fn chunk_bytes(
+    layer: &OciDescriptor,
+    blob: Vec<u8>,
+    compressed: bool,
+    total_size: u64,
+) -> Result<(u64, Vec<u8>)> {
+    let (offset, len) = chunk_bounds(layer, total_size)?;
+    let raw = if compressed {
+        let mut raw = Vec::with_capacity(len as usize);
+        zstd::stream::read::Decoder::new(&blob[..])
+            .and_then(|d| d.take(len + 1).read_to_end(&mut raw))
+            .with_context(|| format!("zstd-decompressing chunk {}", layer.digest))?;
+        raw
+    } else {
+        blob
+    };
+    if raw.len() as u64 != len {
+        bail!(
+            "chunk {} holds {} bytes, not the {len} it claims",
+            layer.digest,
+            raw.len()
+        );
+    }
+    Ok((offset, raw))
 }
 
 /// Maximum attempts and initial retry delay; subsequent delays double (2 s, 4 s, 8 s).
@@ -2527,7 +2672,6 @@ mod local {
                 CHUNK_MEDIA_TYPE_RAW => false,
                 _ => return Ok(()),
             };
-            let (offset, _len) = chunk_placement(layer)?;
             let hex = layer.digest.trim_start_matches("sha256:");
             let bytes = store.get_blob(hex)?.with_context(|| {
                 format!(
@@ -2536,12 +2680,7 @@ mod local {
                     root.display()
                 )
             })?;
-            let raw = if compressed {
-                zstd::decode_all(&bytes[..])
-                    .with_context(|| format!("zstd-decompressing chunk {}", layer.digest))?
-            } else {
-                bytes
-            };
+            let (offset, raw) = chunk_bytes(layer, bytes, compressed, config.total_size)?;
             write_chunk_sparse(&out, offset, &raw)
                 .with_context(|| format!("writing a chunk into {}", tmp.display()))
         })?;
@@ -2589,7 +2728,7 @@ mod local {
             ) {
                 continue;
             }
-            let (offset, length) = chunk_placement(layer)?;
+            let (offset, length) = chunk_bounds(layer, config.total_size)?;
             let hex = layer.digest.trim_start_matches("sha256:");
             // Presence + GC-retention mtime touch (this chunk is about to be read, like any
             // other cache hit) — `local_blob_codec` then determines which directory it lives
@@ -2603,12 +2742,12 @@ mod local {
             }
             chunks.push(LazyChunk {
                 offset,
-                length: length as u32,
+                length: u32::try_from(length).context("chunk length")?,
                 codec: local_blob_codec(root, hex)?,
                 digest: digest_bytes(&layer.digest)?,
             });
         }
-        chunks.sort_unstable_by_key(|c| c.offset);
+        sort_lazy_chunks(&mut chunks).with_context(|| format!("{name}@{digest}"))?;
         write_vk_ro_img(
             dest,
             config.total_size,
@@ -3498,6 +3637,107 @@ mod tests {
         });
     }
 
+    /// A chunk is held to its descriptor: exactly its length once decompressed, at most a
+    /// chunk's size, inside the image. A frame that inflates past it is cut off, not held.
+    #[test]
+    fn a_chunk_is_held_to_what_its_descriptor_claims() {
+        let raw = vec![5u8; 4096];
+        let frame = zstd::encode_all(&raw[..], 3).unwrap();
+        let desc = |offset, len| chunk_descriptor(CHUNK_MEDIA_TYPE, "sha256:x", 1, offset, len);
+        assert_eq!(
+            chunk_bytes(&desc(8192, 4096), frame.clone(), true, 1 << 20).unwrap(),
+            (8192, raw.clone())
+        );
+        // Inflates past its length (a bomb, as far as this reader can tell): refused.
+        assert!(chunk_bytes(&desc(0, 100), frame.clone(), true, 1 << 20).is_err());
+        // Short of it: refused.
+        assert!(chunk_bytes(&desc(0, 8192), frame.clone(), true, 1 << 20).is_err());
+        // Outside the image, or larger than any chunk: refused.
+        assert!(chunk_bytes(&desc((1 << 20) - 10, 4096), frame.clone(), true, 1 << 20).is_err());
+        assert!(chunk_bytes(&desc(u64::MAX - 1, 4096), frame, true, u64::MAX).is_err());
+        let huge = CDC_MAX as u64 + 1;
+        assert!(chunk_bytes(&desc(0, huge), vec![0; 1], false, u64::MAX).is_err());
+        // A raw chunk is its own length.
+        assert!(chunk_bytes(&desc(0, 4096), raw.clone(), false, 1 << 20).is_ok());
+        assert!(chunk_bytes(&desc(0, 4095), raw, false, 1 << 20).is_err());
+    }
+
+    /// A lazy view's chunks are sorted by offset; touching chunks pass, overlapping ones don't.
+    #[test]
+    fn lazy_chunks_are_sorted_and_refused_when_they_overlap() {
+        let chunk = |offset, length| LazyChunk {
+            offset,
+            length,
+            codec: VK_RO_IMG_CODEC_RAW,
+            digest: [0; 32],
+        };
+        let mut chunks = vec![chunk(100, 50), chunk(0, 100)];
+        sort_lazy_chunks(&mut chunks).unwrap();
+        assert_eq!(chunks[0].offset, 0);
+        let mut chunks = vec![chunk(100, 50), chunk(0, 101)];
+        assert!(sort_lazy_chunks(&mut chunks).is_err());
+    }
+
+    /// A blob's declared size is a claim against a bound, never an allocation.
+    #[test]
+    fn a_blob_declaring_more_than_its_bound_is_refused_unpulled() {
+        let mut layer = chunk_descriptor(CHUNK_MEDIA_TYPE, "sha256:x", i64::MAX, 0, 1);
+        assert!(check_blob_size(&layer, MAX_CHUNK_BLOB).is_err());
+        layer.size = -1;
+        assert!(check_blob_size(&layer, MAX_CHUNK_BLOB).is_err());
+        layer.size = 100;
+        assert!(check_blob_size(&layer, MAX_CHUNK_BLOB).is_ok());
+    }
+
+    /// The writer under a pull stops at its bound, whatever the stream says.
+    #[test]
+    fn a_capped_writer_refuses_bytes_past_its_bound() {
+        use tokio::io::AsyncWriteExt;
+        let mut w = Capped::new(Vec::new(), 8);
+        block_on(async {
+            w.write_all(b"12345678").await.unwrap();
+            assert!(w.write_all(b"9").await.is_err());
+        });
+        assert_eq!(w.inner, b"12345678");
+    }
+
+    /// Reject oversized streams to memory or a file without retrying the identical response.
+    #[test]
+    fn a_blob_streaming_past_its_bound_is_refused() {
+        install_crypto();
+        let body = "0123456789abcdef";
+        let layer = chunk_descriptor(CHUNK_MEDIA_TYPE, &sha256_hex(body.as_bytes()), 8, 0, 8);
+        let serve = || {
+            let server = FakeServer::start(vec![FakeServer::reply(200, body); 2]);
+            let rg = fake_registry(&server);
+            let (client, _auth) = client(&rg).unwrap();
+            let image = make_ref(&rg, "repo", "tag").unwrap();
+            (server, client, image)
+        };
+
+        let (server, oci, image) = serve();
+        let err = block_on(pull_blob_bytes(&oci, &image, &layer, 8)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("larger than accepted"),
+            "{err:#}"
+        );
+        assert_eq!(server.seen().len(), 1);
+
+        let dir = std::env::temp_dir().join(format!("vk-capped-pull-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (server, oci, image) = serve();
+        let path = dir.join("vmlinuz");
+        let err = block_on(pull_blob_to_file(&oci, &image, &layer, &path, 8)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("larger than accepted"),
+            "{err:#}"
+        );
+        assert_eq!(server.seen().len(), 1);
+        assert!(std::fs::metadata(&path).unwrap().len() <= 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Discard a truncated blob's partial body and return the complete retry response.
     #[test]
     fn a_blob_retry_discards_the_partial_body() {
@@ -3510,7 +3750,7 @@ mod tests {
         let (client, _auth) = client(&rg).unwrap();
         let image = make_ref(&rg, "repo", "tag").unwrap();
         let layer = chunk_descriptor(CHUNK_MEDIA_TYPE, &sha256_hex(b"complete"), 8, 0, 8);
-        let body = block_on(pull_blob_bytes(&client, &image, &layer)).unwrap();
+        let body = block_on(pull_blob_bytes(&client, &image, &layer, MAX_CHUNK_BLOB)).unwrap();
         assert_eq!(body, b"complete");
         let seen = server.seen();
         assert_eq!(seen.len(), 2);
@@ -3526,7 +3766,7 @@ mod tests {
         let (client, _auth) = client(&rg).unwrap();
         let image = make_ref(&rg, "repo", "tag").unwrap();
         let layer = chunk_descriptor(CHUNK_MEDIA_TYPE, &sha256_hex(b"correct"), 7, 0, 7);
-        let err = block_on(pull_blob_bytes(&client, &image, &layer)).unwrap_err();
+        let err = block_on(pull_blob_bytes(&client, &image, &layer, MAX_CHUNK_BLOB)).unwrap_err();
         assert!(!err.is_transport(), "{err:#}");
         assert!(format!("{err:#}").contains("digest"), "{err:#}");
         assert_eq!(server.seen().len(), 1);

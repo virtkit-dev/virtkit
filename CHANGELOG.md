@@ -26,6 +26,9 @@ All notable changes to virtkit will be documented in this file.
   gigabytes** when `vk` reads the image (for a `FROM --kernel=image` stage, or a job's
   `/etc/passwd`): its geometry, links and extents are now checked, and every file read
   from it — kernel and modules after decompression included — has a size cap.
+- **A bundle in a registry can no longer make `vk` allocate unbounded memory when it pulls
+  it**: blob sizes, chunk placement and decompressed chunk lengths are checked against the
+  bundle's manifest and fixed caps; a kernel or initrd is streamed to disk, at most 1 GiB.
 - **Security: a VM on a job's network can no longer pose as another VM or as the gateway**
   (by its MAC, or in ARP) to intercept their traffic.
 - **Security: `vk-registry` no longer lets a client hold a connection open without sending
