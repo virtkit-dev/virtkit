@@ -788,7 +788,7 @@ mod tests {
             "s=$(head -c {} /dev/zero | tr '\\0' x); while true; do sleep 1; done",
             mib * 1024 * 1024
         );
-        Reap(
+        Reap::running_sh(
             std::process::Command::new("sh")
                 .args(["-c", &script])
                 .spawn()
@@ -801,6 +801,27 @@ mod tests {
     struct Reap(std::process::Child);
 
     impl Reap {
+        /// `child`, once its `/proc` entry describes `sh` rather than this process. `spawn`
+        /// goes through a vfork-style clone that shares this process's memory map, and the
+        /// kernel lets the parent go on as the exec releases that map, a moment before the
+        /// child's new one is installed: read in between, the child's `VmHWM` and `VmRSS` are
+        /// this test binary's — measured at 1.3 GB after a run of sibling tests, far above any
+        /// threshold a test waits for — so the wait would end on a figure not the child's.
+        fn running_sh(child: std::process::Child) -> Self {
+            let reap = Reap(child);
+            let started = Instant::now();
+            while !std::fs::read(format!("/proc/{}/cmdline", reap.pid()))
+                .is_ok_and(|cmdline| cmdline.starts_with(b"sh\0"))
+            {
+                assert!(
+                    started.elapsed() < Duration::from_secs(30),
+                    "the child never ran sh"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            reap
+        }
+
         fn pid(&self) -> i32 {
             self.0.id() as i32
         }
@@ -1434,7 +1455,7 @@ mod tests {
             "s=$(head -c {} /dev/zero | tr \"\\0\" x); while true; do sleep 1; done",
             mib * 1024 * 1024
         );
-        NestedHog(Reap(
+        NestedHog(Reap::running_sh(
             std::process::Command::new("sh")
                 .args(["-c", &format!("sh -c '{inner}' & wait")])
                 .process_group(0)
