@@ -499,43 +499,14 @@ fn names_param(query: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (k, v) in query.split('&').filter_map(|p| p.split_once('=')) {
         if k == "name" {
-            let val = percent_decode(v);
+            // Lock names may carry `:` and `/`, percent-encoded.
+            let val = crate::percent_decode(v);
             if seen.insert(val.clone()) {
                 out.push(val);
             }
         }
     }
     out
-}
-
-/// Minimal `%XX` + `+` percent-decode for query values (lock names may carry `:`/`/`).
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'%' if i + 3 <= b.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(v) => {
-                    out.push(v);
-                    i += 3;
-                }
-                Err(_) => {
-                    out.push(b'%');
-                    i += 1;
-                }
-            },
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn header(req: &Request<Incoming>, name: &str) -> Option<String> {
@@ -579,6 +550,16 @@ mod tests {
 
     fn now_plus(d: Duration) -> Instant {
         Instant::now() + d
+    }
+
+    /// A `%` before a multi-byte character is the request's bytes to choose: it must decode
+    /// lossily, not panic the connection's task.
+    #[test]
+    fn names_decode_without_panicking_on_a_split_character() {
+        assert_eq!(
+            names_param("name=a%2Fb&name=%€&name=%a€&name=a%2Fb"),
+            ["a/b", "%€", "%a€"]
+        );
     }
 
     #[tokio::test]
