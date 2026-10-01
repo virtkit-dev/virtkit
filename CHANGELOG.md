@@ -11,6 +11,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- The guest kernel no longer lets unprivileged processes use eBPF (from its next build); root
+  can turn it back on with `sysctl kernel.unprivileged_bpf_disabled=0`.
 - `vk-registry` keeps a user's email only when the identity provider has not marked it
   unverified, and forgets one stored earlier when it does: `accounts grant-admin` by email
   no longer finds such a user. The command now also names the issuer and subject it acted on.
