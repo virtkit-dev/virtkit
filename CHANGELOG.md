@@ -34,6 +34,9 @@ All notable changes to virtkit will be documented in this file.
   value. The cache-key version is bumped, so the first build after upgrading starts cold.
 - **Security: a pull or build no longer waits forever on an image lock another local user
   holds**; it fails, naming that user's uid, or saying the holder does not answer.
+- **Security: the guest's SFTP server hands the logged-in user only files and directories it
+  created**, and no longer changes ownership or modes through a symlink another guest
+  process planted.
 - **Security: a `host_checkout` tree is no longer shared between projects.** Checkouts were
   kept per folded project name, so two projects whose names folded together shared one, and
   the second project's guest could read the first's objects. They are now kept per project

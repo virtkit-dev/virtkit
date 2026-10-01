@@ -7,11 +7,20 @@
 //! as root and chowns every file/dir it CREATES to the logged-in user, so the
 //! VS Code server tree ends up owned by `dev`. NOTE: this means an sftp client can
 //! touch root-owned paths — acceptable for a single-developer dev VM (the user
-//! already has a shell there); running sftp as the user is a follow-up.
+//! already has a shell there); running sftp as the user is a follow-up. What it never
+//! does is hand the user something it did not create, since any process in the guest could
+//! have planted a symlink, a file or a directory where the client is about to write: a file
+//! is chowned only when an exclusive create made it, and a directory only when, opened
+//! without following a link, it is still empty and root's. Ownership and mode changes
+//! refuse a symlink at the final path component; plain opens, TRUNCATE included, follow one
+//! as before, and a symlinked parent directory redirects any of them.
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::path::PathBuf;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 use log::debug;
 use russh::Channel;
@@ -96,11 +105,9 @@ impl SftpFs {
         }
     }
 
-    /// Give a freshly created path to the logged-in user (ssh-serve is root).
-    fn chown(&self, path: &str) {
-        if let Ok(c) = CString::new(path) {
-            unsafe { libc::chown(c.as_ptr(), self.uid, self.gid) };
-        }
+    /// Give the logged-in user ownership of `file`, created by this request.
+    fn chown_open(&self, file: &tokio::fs::File) {
+        give(file.as_raw_fd(), self.uid, self.gid);
     }
 }
 
@@ -114,6 +121,18 @@ impl SftpFs {
         let h = format!("{prefix}{}", self.next);
         self.next += 1;
         h
+    }
+}
+
+/// fchown(2) `fd` to the user. A failure leaves the file root's, which the user can still
+/// read but not change: logged, not fatal to the request.
+fn give(fd: std::os::fd::RawFd, uid: u32, gid: u32) {
+    // SAFETY: fchown(2) on a descriptor the caller keeps open for the call.
+    if unsafe { libc::fchown(fd, uid, gid) } != 0 {
+        debug!(
+            "sftp: chown to {uid}:{gid} failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
@@ -131,7 +150,6 @@ fn attrs_of(meta: &std::fs::Metadata) -> FileAttributes {
 
 /// A minimal `ls -l`-style long name (some clients parse it; VS Code is lenient).
 fn longname(name: &str, meta: &std::fs::Metadata) -> String {
-    use std::os::unix::fs::MetadataExt;
     let kind = if meta.is_dir() { 'd' } else { '-' };
     format!(
         "{kind}--------- 1 {} {} {:>10} {name}",
@@ -217,17 +235,47 @@ impl russh_sftp::server::Handler for SftpFs {
         pflags: OpenFlags,
         _attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
-        let mut opts = tokio::fs::OpenOptions::new();
-        opts.read(pflags.contains(OpenFlags::READ))
-            .write(pflags.contains(OpenFlags::WRITE))
-            .append(pflags.contains(OpenFlags::APPEND))
-            .create(pflags.contains(OpenFlags::CREATE))
-            .truncate(pflags.contains(OpenFlags::TRUNCATE))
-            .create_new(pflags.contains(OpenFlags::EXCLUDE));
-        let file = opts.open(&filename).await.map_err(map_err)?;
-        if pflags.contains(OpenFlags::CREATE) {
-            self.chown(&filename);
-        }
+        let opts = |create_new: bool| {
+            let mut o = tokio::fs::OpenOptions::new();
+            o.read(pflags.contains(OpenFlags::READ))
+                .write(pflags.contains(OpenFlags::WRITE))
+                .append(pflags.contains(OpenFlags::APPEND))
+                .truncate(pflags.contains(OpenFlags::TRUNCATE))
+                .create_new(create_new);
+            o
+        };
+        // Only a file this open creates becomes the user's. Asked of the kernel in one step —
+        // an exclusive create, which neither follows nor replaces a symlink — rather than by
+        // looking first: a link planted between the look and the open would be followed, and
+        // root would hand the user whatever it names. Anything already there keeps its owner.
+        // A dangling symlink is thus an error (no such file), never a way to create its target.
+        let file = if pflags.contains(OpenFlags::CREATE) || pflags.contains(OpenFlags::EXCLUDE) {
+            let mut retried = false;
+            loop {
+                match opts(true).open(&filename).await {
+                    Ok(file) => {
+                        self.chown_open(&file);
+                        break file;
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::AlreadyExists
+                            && !pflags.contains(OpenFlags::EXCLUDE) =>
+                    {
+                        match opts(false).open(&filename).await {
+                            Ok(file) => break file,
+                            // The file disappeared after AlreadyExists; retry creation once.
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !retried => {
+                                retried = true;
+                            }
+                            Err(e) => return Err(map_err(e)),
+                        }
+                    }
+                    Err(e) => return Err(map_err(e)),
+                }
+            }
+        } else {
+            opts(false).open(&filename).await.map_err(map_err)?
+        };
         let handle = self.fresh('f');
         self.files.insert(handle.clone(), file);
         Ok(Handle { id, handle })
@@ -317,8 +365,11 @@ impl russh_sftp::server::Handler for SftpFs {
         path: String,
         _attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
-        tokio::fs::create_dir(&path).await.map_err(map_err)?;
-        self.chown(&path);
+        let (uid, gid) = (self.uid, self.gid);
+        tokio::task::spawn_blocking(move || mkdir_for(Path::new(&path), uid, gid))
+            .await
+            .map_err(|_| StatusCode::Failure)?
+            .map_err(map_err)?;
         Ok(ok_status(id))
     }
 
@@ -383,14 +434,270 @@ fn named(name: &str, meta: &std::fs::Metadata) -> File {
     }
 }
 
-/// Apply the file mode from setstat (VS Code chmods the server binary +x).
+/// Apply the setstat mode through a descriptor that does not follow symlinks, so a
+/// planted link cannot make root chmod its target. VS Code uses this for the server binary +x.
 async fn apply_setstat(path: &std::path::Path, attrs: &FileAttributes) -> Result<(), StatusCode> {
     if let Some(perms) = attrs.permissions {
-        use std::os::unix::fs::PermissionsExt;
         debug!("sftp setstat {} mode {:o}", path.display(), perms);
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(perms))
+        // An O_PATH descriptor names the inode without opening it — so a device node's driver
+        // never runs as root here — and O_NOFOLLOW makes a symlink at `path` an error. Its
+        // mode is then set through the descriptor's /proc link, which reaches that inode.
+        // Not through `OpenOptions::custom_flags`: on musl, std masks O_PATH out of custom
+        // flags (`O_ACCMODE` includes `O_SEARCH == O_PATH`) and would really open the file.
+        let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| StatusCode::BadMessage)?;
+        // SAFETY: the path is NUL-terminated and outlives the call.
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(map_err(std::io::Error::last_os_error()));
+        }
+        // SAFETY: `fd` was just returned by open(2) and nothing else owns it.
+        let pinned = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+        let meta = pinned.metadata().map_err(map_err)?;
+        if meta.file_type().is_symlink() {
+            return Err(StatusCode::PermissionDenied);
+        }
+        let via = format!("/proc/self/fd/{}", pinned.as_raw_fd());
+        tokio::fs::set_permissions(&via, std::fs::Permissions::from_mode(perms))
             .await
             .map_err(map_err)?;
     }
     Ok(())
+}
+
+/// mkdir(2) `path` and give the new directory to the user — only if what then sits at the
+/// name is that directory: opened through the same parent descriptor without following a
+/// link, still owned by us (root), and empty. A directory renamed in at the name since
+/// belongs to whoever made it or holds something, and keeps its owner; a symlink is refused.
+fn mkdir_for(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidInput);
+    let name = path.file_name().ok_or_else(invalid)?;
+    let name = CString::new(name.as_bytes()).map_err(|_| invalid())?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(parent.unwrap_or(Path::new(".")))?;
+    // SAFETY: the descriptor is live and the name is NUL-terminated and outlives the call.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o777) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        debug!("sftp: not chowning {}: {e}", path.display());
+        return Ok(());
+    }
+    // SAFETY: `fd` was just returned by openat(2) and nothing else owns it.
+    let dir = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    match fresh_dir(&dir) {
+        Ok(true) => give(dir.as_raw_fd(), uid, gid),
+        Ok(false) => debug!("sftp: not chowning {}: replaced since", path.display()),
+        Err(e) => debug!("sftp: not chowning {}: {e}", path.display()),
+    }
+    Ok(())
+}
+
+/// Whether the directory open as `dir` can be the one this process just made: ours and empty.
+/// Emptiness is read through the descriptor's /proc link, which reaches that inode; the
+/// link count is no help, as some filesystems report 1 for every directory.
+fn fresh_dir(dir: &std::fs::File) -> std::io::Result<bool> {
+    // SAFETY: geteuid(2) has no preconditions.
+    if dir.metadata()?.uid() != unsafe { libc::geteuid() } {
+        return Ok(false);
+    }
+    let via = format!("/proc/self/fd/{}", dir.as_raw_fd());
+    Ok(std::fs::read_dir(via)?.next().is_none())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mode change lands on the path itself, never through a symlink planted there.
+    #[tokio::test]
+    async fn setstat_does_not_follow_a_symlink() {
+        let dir = std::env::temp_dir().join(format!("vk-sftp-setstat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        std::fs::write(&target, b"x").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let attrs = FileAttributes {
+            permissions: Some(0o777),
+            ..FileAttributes::default()
+        };
+
+        assert!(apply_setstat(&link, &attrs).await.is_err());
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the link's target kept its mode");
+
+        apply_setstat(&target, &attrs).await.unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o777, "the path itself is changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A FIFO (as a device node would be) has its mode set without being opened: an open
+    /// would block on a FIFO and run a device's driver as root.
+    #[tokio::test]
+    async fn setstat_sets_a_fifos_mode_without_opening_it() {
+        let dir = std::env::temp_dir().join(format!("vk-sftp-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo(3) on a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let attrs = FileAttributes {
+            permissions: Some(0o640),
+            ..FileAttributes::default()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            apply_setstat(&fifo, &attrs),
+        )
+        .await
+        .expect("setstat must not block on a FIFO")
+        .unwrap();
+        let mode = std::fs::metadata(&fifo).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CREATE makes a missing file or opens an existing one; only TRUNCATE discards contents.
+    #[tokio::test]
+    async fn open_with_create_takes_an_existing_file_as_it_is() {
+        use russh_sftp::server::Handler;
+        let dir = std::env::temp_dir().join(format!("vk-sftp-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: getuid(2)/getgid(2) have no preconditions.
+        let mut fs = SftpFs::new(unsafe { libc::getuid() }, unsafe { libc::getgid() });
+        let fresh = dir.join("fresh").to_string_lossy().into_owned();
+        let flags = OpenFlags::CREATE | OpenFlags::WRITE;
+        fs.open(1, fresh.clone(), flags, FileAttributes::default())
+            .await
+            .unwrap();
+        assert!(std::path::Path::new(&fresh).is_file());
+
+        let kept = dir.join("kept");
+        std::fs::write(&kept, b"contents").unwrap();
+        fs.open(
+            2,
+            kept.to_string_lossy().into_owned(),
+            flags,
+            FileAttributes::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&kept).unwrap(), b"contents");
+        // EXCLUDE on an existing file is refused.
+        assert!(
+            fs.open(
+                3,
+                kept.to_string_lossy().into_owned(),
+                flags | OpenFlags::EXCLUDE,
+                FileAttributes::default()
+            )
+            .await
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CREATE on a dangling symlink fails rather than creating the file it names.
+    #[tokio::test]
+    async fn open_with_create_refuses_a_dangling_symlink() {
+        use russh_sftp::server::Handler;
+        let dir = std::env::temp_dir().join(format!("vk-sftp-dangling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        // SAFETY: getuid(2)/getgid(2) have no preconditions.
+        let mut fs = SftpFs::new(unsafe { libc::getuid() }, unsafe { libc::getgid() });
+        let flags = OpenFlags::CREATE | OpenFlags::WRITE;
+        let opened = fs
+            .open(
+                1,
+                link.to_string_lossy().into_owned(),
+                flags,
+                FileAttributes::default(),
+            )
+            .await;
+        assert_eq!(opened.err(), Some(StatusCode::NoSuchFile));
+        assert!(!target.exists(), "the link's target was not created");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// mkdir makes the directory and gives it to the user; an existing name is refused.
+    #[tokio::test]
+    async fn mkdir_creates_a_directory_for_the_user() {
+        use russh_sftp::server::Handler;
+        let dir = std::env::temp_dir().join(format!("vk-sftp-mkdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: getuid(2)/getgid(2) have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let mut fs = SftpFs::new(uid, gid);
+        let new = dir.join("new");
+        fs.mkdir(
+            1,
+            new.to_string_lossy().into_owned(),
+            FileAttributes::default(),
+        )
+        .await
+        .unwrap();
+        let meta = std::fs::symlink_metadata(&new).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.uid(), uid);
+        assert!(
+            fs.mkdir(
+                2,
+                new.to_string_lossy().into_owned(),
+                FileAttributes::default()
+            )
+            .await
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A nonempty replacement directory keeps its owner; only an empty one of ours qualifies.
+    #[test]
+    fn fresh_dir_refuses_a_non_empty_directory() {
+        let dir = std::env::temp_dir().join(format!("vk-sftp-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let open = |p: &Path| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY)
+                .open(p)
+                .unwrap()
+        };
+        let empty = dir.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(fresh_dir(&open(&empty)).unwrap());
+        let full = dir.join("full");
+        std::fs::create_dir(&full).unwrap();
+        std::fs::write(full.join("x"), b"").unwrap();
+        assert!(!fresh_dir(&open(&full)).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
