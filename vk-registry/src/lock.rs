@@ -14,7 +14,6 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -91,7 +90,6 @@ pub struct LockManager {
     held: Mutex<HashMap<String, Held>>,
     /// notified on every release so parked `acquire` calls re-check promptly
     freed: Notify,
-    seq: AtomicU64,
     /// build-failure memos, independent of `held` — a domain-specific negative cache, not a
     /// mutual-exclusion primitive, so it never entangles with `task`'s reuse of `/lock/*` for
     /// its own (unrelated) locking. See [`LockManager::record_failure`].
@@ -109,7 +107,6 @@ impl LockManager {
         LockManager {
             held: Mutex::new(HashMap::new()),
             freed: Notify::new(),
-            seq: AtomicU64::new(0),
             failed: Mutex::new(HashMap::new()),
         }
     }
@@ -150,13 +147,11 @@ impl LockManager {
         })
     }
 
-    /// Unique within this process — all the authority a single-process lock needs.
+    /// The batch's owner token: the only proof renew and release ask for, so it must not be
+    /// guessable from one a client was handed — 128 random bits, where a pid and a counter
+    /// gave away every other holder's.
     fn mint_owner(&self) -> String {
-        format!(
-            "{}-{}",
-            std::process::id(),
-            self.seq.fetch_add(1, Ordering::Relaxed)
-        )
+        crate::accounts::random_token(16)
     }
 
     /// Atomically take ALL `names` for `ttl`, or none (reaping lapsed leases first).
@@ -556,6 +551,17 @@ mod tests {
 
     fn now_plus(d: Duration) -> Instant {
         Instant::now() + d
+    }
+
+    /// An owner token says nothing about any other: a client holding one cannot work out
+    /// another batch's, so renew and release stay with the holder.
+    #[test]
+    fn owner_tokens_are_unguessable() {
+        let m = LockManager::new();
+        let (a, b) = (m.mint_owner(), m.mint_owner());
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 32, "128 bits, hex: {a}");
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()), "{a}");
     }
 
     /// A ttl past what an `Instant` can hold is clamped, not added: the addition would panic

@@ -15,6 +15,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: a `vk-registry` lock client can no longer renew or release a lock another
+  client holds.** The owner token a lock is granted with was guessable from any other.
 - **A `vk-registry` lock request with an enormous `ttl` no longer takes down the lock API
   until restart.** Leases and waits are now capped at 24 hours.
 - **Cleaning up a GitLab job whose supervisor had died no longer risks stopping another
