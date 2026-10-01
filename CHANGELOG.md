@@ -57,6 +57,11 @@ All notable changes to virtkit will be documented in this file.
 - **Security: the guest's SFTP server hands the logged-in user only files and directories it
   created**, and no longer changes ownership or modes through a symlink another guest
   process planted.
+- **Security: the build cache no longer serves a COPY snapshot whose sources differed only in
+  modes, ownership or symlinks**, such as a setuid bit or a planted link. A COPY keeps its
+  sources' owner and modes in the image unless it sets `--chown`/`--chmod`, so runners whose
+  checkouts are owned by different users, or made under different umasks, no longer share
+  such COPY cache hits.
 - **Security: a `vk-registry` relay no longer sends an upstream's password in clear.** An
   upstream with a password must be `https://` (or loopback), and a token realm the upstream
   names gets its credentials only over HTTPS (or loopback).

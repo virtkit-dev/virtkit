@@ -1714,7 +1714,13 @@ fn resolve_stages(
             //     holding the *old* source content.
             let content = match &instr {
                 Instruction::Copy(c) => match &c.from {
-                    None => Some(context_files_hash(&stage.context, &c.sources)),
+                    None => {
+                        let meta = SourceMeta {
+                            owner: c.chown.is_none(),
+                            mode: c.chmod.is_none(),
+                        };
+                        Some(context_files_hash(&stage.context, &c.sources, meta))
+                    }
                     Some(r) => source_content_key(plan, &out, r, &c.sources, ex),
                 },
                 Instruction::Run(r) => {
@@ -1734,7 +1740,7 @@ fn resolve_stages(
                                 // Default source matches the executor's bind default (build/exec.rs);
                                 // copy_src_files resolves both "/" and "." to the context root.
                                 let src = m.source.clone().unwrap_or_else(|| "/".into());
-                                Some(context_files_hash(&stage.context, &[src]))
+                                Some(context_files_hash(&stage.context, &[src], SourceMeta::ALL))
                             }
                             None => None,
                         };
@@ -1871,7 +1877,7 @@ fn source_content_key(
     // A named build context is host files like the stage's own context, so it keys on their
     // content rather than on a snapshot key.
     if let Some(dir) = plan.named_context(reference) {
-        return Some(context_files_hash(dir, sources));
+        return Some(context_files_hash(dir, sources, SourceMeta::ALL));
     }
     ex.resolve_base_digest(reference)
         .map(|d| format!("{reference}@{d}"))
@@ -3837,12 +3843,14 @@ fn kv(kvs: &[(String, String)], sep: char) -> String {
         .join(&sep.to_string())
 }
 
-/// sha256 over the (sorted, `.dockerignore`-filtered) content of the context files a set
-/// of sources references — so the cache key tracks the referenced bytes, not just the
-/// instruction text. Drives both a context `COPY` (without `--from`) and a `RUN
+/// sha256 over the (sorted, `.dockerignore`-filtered) context entries a set of sources
+/// references — files' content, directories and symlinks, with each entry's kind, mode,
+/// ownership and link target — so the cache key tracks what the copy reproduces, not just
+/// the instruction text. Drives both a context `COPY` (without `--from`) and a `RUN
 /// --mount=type=bind` from the context. Each source may be a file, a directory (recursed),
 /// or a trailing-segment glob (`dir/*.json`). Unreadable/absent sources contribute a marker.
-fn context_files_hash(context: &Path, sources: &[String]) -> String {
+/// `meta` leaves out the ownership or permission bits a `--chown` or `--chmod` overrides.
+fn context_files_hash(context: &Path, sources: &[String], meta: SourceMeta) -> String {
     use sha2::{Digest, Sha256};
     let ign = vk_core::dockerignore::Ignore::load(context);
     let mut files: Vec<PathBuf> = Vec::new();
@@ -3856,14 +3864,53 @@ fn context_files_hash(context: &Path, sources: &[String]) -> String {
         let rel = f.strip_prefix(context).unwrap_or(f).to_string_lossy();
         h.update(rel.as_bytes());
         h.update(b"\0");
-        // Stream to bound memory use regardless of file size.
-        match sha256_file(f) {
-            Ok(digest) => h.update(digest),
+        match std::fs::symlink_metadata(f) {
+            Ok(md) => {
+                use std::os::unix::fs::MetadataExt;
+                let mode = if meta.mode {
+                    md.mode()
+                } else {
+                    md.mode() & libc::S_IFMT
+                };
+                if meta.owner {
+                    h.update(format!("{mode:o} {} {}\0", md.uid(), md.gid()).as_bytes());
+                } else {
+                    h.update(format!("{mode:o}\0").as_bytes());
+                }
+                if md.file_type().is_symlink() {
+                    match std::fs::read_link(f) {
+                        Ok(target) => h.update(target.as_os_str().as_encoded_bytes()),
+                        Err(_) => h.update(b"?"),
+                    }
+                } else if md.is_file() {
+                    // Stream to bound memory use regardless of file size.
+                    match sha256_file(f) {
+                        Ok(digest) => h.update(digest),
+                        Err(_) => h.update(b"?"),
+                    }
+                }
+            }
             Err(_) => h.update(b"?"),
         }
         h.update(b"\n");
     }
     hex(&h.finalize())
+}
+
+/// Which of its sources' metadata a copy carries into the image: `--chown` replaces every
+/// entry's owner and `--chmod` every entry's permission bits, so a key over the sources
+/// leaves out what those override.
+#[derive(Clone, Copy)]
+struct SourceMeta {
+    owner: bool,
+    mode: bool,
+}
+
+impl SourceMeta {
+    const ALL: Self = SourceMeta {
+        owner: true,
+        mode: true,
+    };
 }
 
 /// ARG values exported to RUN, sorted by name. ENV shadows ARGs of the same name.
@@ -3901,6 +3948,9 @@ fn sha256_file(path: &Path) -> std::io::Result<[u8; 32]> {
 /// leads outside of references nothing. The Dockerfile names these, and every one is read
 /// on the host to be hashed.
 fn copy_src_files(context: &Path, ign: &vk_core::dockerignore::Ignore, src: &str) -> Vec<PathBuf> {
+    // A trailing `/` or `/.` makes the copy resolve a symlinked source and copy what it
+    // leads to; beneath_context drops both.
+    let follow = src.ends_with('/') || src.ends_with("/.");
     let rel = beneath_context(src);
     let rel = rel.to_str().unwrap_or_default();
     let start = if rel.is_empty() {
@@ -3913,11 +3963,22 @@ fn copy_src_files(context: &Path, ign: &vk_core::dockerignore::Ignore, src: &str
         (Some(root), Ok(p)) => p.starts_with(root),
         _ => false,
     };
+    // Without either, a top-level symlink is copied as the link itself: key it on its target,
+    // wherever that points.
+    if !follow
+        && !rel.is_empty()
+        && std::fs::symlink_metadata(&start).is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return match start.parent() {
+            Some(dir) if within(dir) => ign.included_entries(&start, false),
+            _ => Vec::new(),
+        };
+    }
     if start.exists() {
         if !within(&start) {
             return Vec::new();
         }
-        return ign.included_files(&start);
+        return ign.included_entries(&start, follow);
     }
     // glob fallback: split into <dir>/<pattern> and match the dir's entries by name.
     let (dir, pat) = match rel.rsplit_once('/') {
@@ -3935,7 +3996,7 @@ fn copy_src_files(context: &Path, ign: &vk_core::dockerignore::Ignore, src: &str
             if let Some(name) = e.file_name().and_then(|n| n.to_str())
                 && glob_seg(pat, name)
             {
-                out.extend(ign.included_files(&e));
+                out.extend(ign.included_entries(&e, false));
             }
         }
     }
@@ -5829,6 +5890,99 @@ mod tests {
         );
     }
 
+    /// A COPY reproduces modes and links, so the key over its sources follows them too.
+    #[test]
+    fn context_hash_tracks_modes_and_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tmpdir("ctx-meta");
+        let ctx = base.join("ctx");
+        std::fs::create_dir_all(ctx.join("d")).unwrap();
+        std::fs::write(ctx.join("d/tool"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(ctx.join("d/other"), b"x").unwrap();
+        let srcs = vec!["d".to_string()];
+        let h = || context_files_hash(&ctx, &srcs, SourceMeta::ALL);
+
+        let plain = h();
+        std::fs::set_permissions(ctx.join("d/tool"), std::fs::Permissions::from_mode(0o4755))
+            .unwrap();
+        let setuid = h();
+        assert_ne!(plain, setuid, "a mode change");
+        std::os::unix::fs::symlink("tool", ctx.join("d/link")).unwrap();
+        let linked = h();
+        assert_ne!(setuid, linked, "an added symlink");
+        std::fs::remove_file(ctx.join("d/link")).unwrap();
+        std::os::unix::fs::symlink("other", ctx.join("d/link")).unwrap();
+        let retargeted = h();
+        assert_ne!(linked, retargeted, "a retargeted symlink");
+        // The source directory's own mode is not copied: the target keeps its own.
+        std::fs::set_permissions(ctx.join("d"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(retargeted, h(), "the top-level directory's mode");
+        std::fs::create_dir(ctx.join("d/sub")).unwrap();
+        let with_sub = h();
+        assert_ne!(retargeted, with_sub, "an added directory");
+        std::fs::set_permissions(ctx.join("d/sub"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert_ne!(with_sub, h(), "a directory's mode");
+
+        // A top-level link is copied as the link: retargeting it between two paths outside
+        // the context changes the key.
+        let top = vec!["leak".to_string()];
+        std::os::unix::fs::symlink(base.join("a"), ctx.join("leak")).unwrap();
+        let to_a = context_files_hash(&ctx, &top, SourceMeta::ALL);
+        std::fs::remove_file(ctx.join("leak")).unwrap();
+        std::os::unix::fs::symlink(base.join("b"), ctx.join("leak")).unwrap();
+        assert_ne!(
+            to_a,
+            context_files_hash(&ctx, &top, SourceMeta::ALL),
+            "a retargeted top-level symlink"
+        );
+
+        // Spelled `link/` or `link/.`, a symlinked directory is copied as what it leads to.
+        std::os::unix::fs::symlink("d", ctx.join("dlink")).unwrap();
+        for src in ["dlink/", "dlink/."] {
+            let srcs = vec![src.to_string()];
+            let before = context_files_hash(&ctx, &srcs, SourceMeta::ALL);
+            std::fs::write(ctx.join("d/other"), b"y").unwrap();
+            assert_ne!(
+                before,
+                context_files_hash(&ctx, &srcs, SourceMeta::ALL),
+                "{src}"
+            );
+            std::fs::write(ctx.join("d/other"), b"x").unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `--chmod` and `--chown` replace the sources' mode bits and owner, so the key leaves
+    /// those out — and keeps the rest.
+    #[test]
+    fn context_hash_skips_what_chmod_and_chown_override() {
+        use std::os::unix::fs::PermissionsExt;
+        let ctx = tmpdir("ctx-override");
+        std::fs::write(ctx.join("tool"), b"#!/bin/sh\n").unwrap();
+        let srcs = vec!["tool".to_string()];
+        let chmod = SourceMeta {
+            owner: true,
+            mode: false,
+        };
+        let chown = SourceMeta {
+            owner: false,
+            mode: true,
+        };
+        let h = |meta| context_files_hash(&ctx, &srcs, meta);
+
+        let (all, chmodded, chowned) = (h(SourceMeta::ALL), h(chmod), h(chown));
+        assert_ne!(all, chowned, "--chown drops the owner");
+        std::fs::set_permissions(ctx.join("tool"), std::fs::Permissions::from_mode(0o4755))
+            .unwrap();
+        assert_ne!(all, h(SourceMeta::ALL));
+        assert_eq!(chmodded, h(chmod), "--chmod drops the mode bits");
+        assert_ne!(chowned, h(chown), "--chown keeps the mode bits");
+        std::fs::write(ctx.join("tool"), b"changed").unwrap();
+        assert_ne!(chmodded, h(chmod), "--chmod keeps the content");
+        let _ = std::fs::remove_dir_all(&ctx);
+    }
+
     /// A COPY source cannot reach outside the context: `..` stops at its root, and a
     /// symlinked directory leading out references nothing — the host reads every source to
     /// hash it, and the Dockerfile names them.
@@ -5849,15 +6003,22 @@ mod tests {
         let srcs = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         for src in ["../outside/secret", "leak/secret", "leak", "leak/*"] {
-            let before = context_files_hash(&ctx, &srcs(&[src]));
+            let before = context_files_hash(&ctx, &srcs(&[src]), SourceMeta::ALL);
             std::fs::write(outside.join("secret"), b"two").unwrap();
-            assert_eq!(before, context_files_hash(&ctx, &srcs(&[src])), "{src}");
+            assert_eq!(
+                before,
+                context_files_hash(&ctx, &srcs(&[src]), SourceMeta::ALL),
+                "{src}"
+            );
             std::fs::write(outside.join("secret"), b"one").unwrap();
         }
         // Inside still counts.
-        let before = context_files_hash(&ctx, &srcs(&["in.txt"]));
+        let before = context_files_hash(&ctx, &srcs(&["in.txt"]), SourceMeta::ALL);
         std::fs::write(ctx.join("in.txt"), b"changed").unwrap();
-        assert_ne!(before, context_files_hash(&ctx, &srcs(&["in.txt"])));
+        assert_ne!(
+            before,
+            context_files_hash(&ctx, &srcs(&["in.txt"]), SourceMeta::ALL)
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -5869,18 +6030,21 @@ mod tests {
         std::fs::write(dir.join("README.md"), "hi").unwrap();
         std::fs::write(dir.join(".dockerignore"), "*.md\n").unwrap();
         let srcs = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let h1 = context_files_hash(&dir, &srcs(&["."]));
+        let h1 = context_files_hash(&dir, &srcs(&["."]), SourceMeta::ALL);
         // editing a copied source changes the hash
         std::fs::write(dir.join("src/a.rs"), "fn main() { /* x */ }").unwrap();
-        assert_ne!(h1, context_files_hash(&dir, &srcs(&["."])));
+        assert_ne!(h1, context_files_hash(&dir, &srcs(&["."]), SourceMeta::ALL));
         // editing a .dockerignore'd file does NOT change the hash
-        let before = context_files_hash(&dir, &srcs(&["."]));
+        let before = context_files_hash(&dir, &srcs(&["."]), SourceMeta::ALL);
         std::fs::write(dir.join("README.md"), "changed").unwrap();
-        assert_eq!(before, context_files_hash(&dir, &srcs(&["."])));
+        assert_eq!(
+            before,
+            context_files_hash(&dir, &srcs(&["."]), SourceMeta::ALL)
+        );
         // a glob source matches by segment (src/*.rs covers a.rs)
         assert_eq!(
-            context_files_hash(&dir, &srcs(&["src/*.rs"])),
-            context_files_hash(&dir, &srcs(&["src/a.rs"]))
+            context_files_hash(&dir, &srcs(&["src/*.rs"]), SourceMeta::ALL),
+            context_files_hash(&dir, &srcs(&["src/a.rs"]), SourceMeta::ALL)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

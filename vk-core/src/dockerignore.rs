@@ -62,19 +62,34 @@ impl Ignore {
         ex
     }
 
-    /// Collect the non-excluded regular files at or under `start` (within the context
-    /// root) as absolute paths, sorted. Honors the parent-results model, so a `!`
-    /// re-included file beneath an excluded directory is still returned. Used by the
-    /// builder to content-hash a `COPY`'s referenced context files for its cache key.
-    pub fn included_files(&self, start: &Path) -> Vec<std::path::PathBuf> {
+    /// The non-excluded entries a `COPY` of `start` reproduces (within the context root),
+    /// as absolute paths, sorted: regular files, symlinks (listed, never followed) and
+    /// directories, so a cache key over them tracks a link or a directory's mode, not just
+    /// files' bytes. A `start` directory itself is left out, its contents listed: a COPY
+    /// never stamps its own mode or owner on the target. `follow_start` resolves `start`
+    /// itself when it is a symlink, as the copy does for a source spelled `link/`. Honors
+    /// the parent-results model, so a `!` re-included entry beneath an excluded directory
+    /// is still returned.
+    pub fn included_entries(&self, start: &Path, follow_start: bool) -> Vec<std::path::PathBuf> {
         let mut out = Vec::new();
-        self.collect(start, false, &mut out);
+        self.collect(start, false, Some(follow_start), &mut out);
         out.sort();
         out
     }
 
-    fn collect(&self, path: &Path, parent_excluded: bool, out: &mut Vec<std::path::PathBuf>) {
-        let Ok(md) = std::fs::symlink_metadata(path) else {
+    /// `top` is `Some(follow_start)` for `start`, `None` beneath it.
+    fn collect(
+        &self,
+        path: &Path,
+        parent_excluded: bool,
+        top: Option<bool>,
+        out: &mut Vec<std::path::PathBuf>,
+    ) {
+        let md = match top {
+            Some(true) => std::fs::metadata(path),
+            _ => std::fs::symlink_metadata(path),
+        };
+        let Ok(md) = md else {
             return;
         };
         let excluded = self.excluded(path, parent_excluded);
@@ -86,12 +101,16 @@ impl Ignore {
             let Ok(rd) = std::fs::read_dir(path) else {
                 return;
             };
+            // Include traversed directories even when excluded: COPY preserves their metadata.
+            if top.is_none() {
+                out.push(path.to_path_buf());
+            }
             let mut kids: Vec<std::path::PathBuf> = rd.flatten().map(|e| e.path()).collect();
             kids.sort();
             for k in kids {
-                self.collect(&k, excluded, out);
+                self.collect(&k, excluded, None, out);
             }
-        } else if md.is_file() && !excluded {
+        } else if !excluded {
             out.push(path.to_path_buf());
         }
     }
