@@ -22,9 +22,9 @@ pub struct Kill {
     /// The victim's pid — what tells two victims sharing a `comm` apart.
     pub pid: u32,
     /// The victim's `comm` (15 chars at most, as the kernel keeps it). Attacker-chosen
-    /// (`prctl(PR_SET_NAME)`) but safe to print: `/dev/kmsg` escapes every byte below 0x20,
-    /// every byte from 0x7f up, and `\` itself as `\xNN`, so no control or escape sequence
-    /// survives into it.
+    /// (`prctl(PR_SET_NAME)`) and printed into job logs. `/dev/kmsg` escapes control bytes,
+    /// bytes ≥ 0x7f and `\` as `\xNN`, but guest root can replace the agent that relays the
+    /// record, so [`Kill::parse`] refuses a `comm` that is not printable ASCII.
     pub comm: String,
     /// Its *anonymous* RSS in bytes: what killing it gave back. File-backed and shmem pages
     /// are excluded, so a process killed while holding mostly page cache shows a small
@@ -64,7 +64,7 @@ impl Kill {
             _ => return None,
         };
         let comm = f.next()?;
-        if comm.is_empty() {
+        if comm.is_empty() || !comm.bytes().all(|b| b.is_ascii_graphic() || b == b' ') {
             return None;
         }
         Some(Kill {
@@ -116,6 +116,19 @@ mod tests {
             ..kill()
         };
         assert_eq!(Kill::parse(&k.render()), Some(k));
+    }
+
+    /// A record whose `comm` carries a byte /dev/kmsg would have escaped is not one the kernel
+    /// wrote: it is refused rather than printed into a job log.
+    #[test]
+    fn a_comm_that_is_not_printable_ascii_is_no_kill() {
+        for comm in ["\u{1b}[2Jgone", "a\rb", "bell\u{7}", "caf\u{e9}"] {
+            let k = Kill {
+                comm: comm.into(),
+                ..kill()
+            };
+            assert_eq!(Kill::parse(&k.render()), None, "{comm:?}");
+        }
     }
 
     #[test]

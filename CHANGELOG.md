@@ -15,6 +15,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: a guest can no longer put terminal escape sequences into `vk atop --summary` or
+  job logs** through its host, disk or network interface names or an OOM-killed process's
+  name. Such characters are shown as `.`; an OOM record whose process name holds them is
+  dropped.
 - **A guest can no longer exhaust the host's sockets through its network**: a job's network
   carries at most 8192 connections at once and 256 DNS lookups in flight; past that, new
   connections stall or are reset and lookups are dropped for the guest to retry.
