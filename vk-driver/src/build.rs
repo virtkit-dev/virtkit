@@ -1764,6 +1764,19 @@ fn resolve_stages(
                     if scoped != unscoped {
                         parts.push(format!("cmd={scoped}"));
                     }
+                    // Every in-scope ARG is exported into the RUN's shell (below), so a script
+                    // the command runs reads it whether or not the command line names it:
+                    // its value is an input of the step, as Docker keys it. Not
+                    // DOCKER_STAGE_HASH, which is empty while keying and set only to run.
+                    let args = run_args(&vars, &state.env);
+                    let args: Vec<String> = args
+                        .iter()
+                        .filter(|(k, _)| k != DOCKER_STAGE_HASH)
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect();
+                    if !args.is_empty() {
+                        parts.push(format!("args={}", args.join("\u{1f}")));
+                    }
                     (!parts.is_empty()).then(|| parts.join("\n"))
                 }
                 _ => None,
@@ -1777,13 +1790,7 @@ fn resolve_stages(
                     // references resolve there (ENV is already in `st.env`; drop names it
                     // shadows). Kept out of the running `state` so it never leaks into a
                     // child stage or the exported runtime config.
-                    let env_keys: std::collections::BTreeSet<&str> =
-                        st.env.iter().map(|(k, _)| k.as_str()).collect();
-                    st.build_args = vars
-                        .iter()
-                        .filter(|(k, _)| !env_keys.contains(k.as_str()))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
+                    st.build_args = run_args(&vars, &st.env);
                 }
                 steps.push(Step {
                     instr,
@@ -3711,7 +3718,7 @@ fn stage_input_rootfs(
 /// other key from one of those roots, so this alone invalidates a whole cache generation.
 /// An old entry does not need deleting: it simply stops being looked up, and idle GC
 /// reclaims it like any other unused blob.
-const CACHE_KEY_VERSION: &str = "4";
+const CACHE_KEY_VERSION: &str = "5";
 
 /// The namespaces a build-cache key can belong to. One `build-cache` repository holds every
 /// kind of cached artefact, so a key says which kind it is — both to a reader (`/browse`,
@@ -3881,6 +3888,19 @@ fn context_files_hash(context: &Path, sources: &[String]) -> String {
         h.update(b"\n");
     }
     hex(&h.finalize())
+}
+
+/// The ARG values a RUN's shell gets: every in-scope variable `env` does not already set (an
+/// ENV of the same name shadows it), sorted by name.
+fn run_args(vars: &Vars, env: &[(String, String)]) -> Vec<(String, String)> {
+    let env_keys: std::collections::BTreeSet<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+    let mut args: Vec<(String, String)> = vars
+        .iter()
+        .filter(|(k, _)| !env_keys.contains(k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    args.sort();
+    args
 }
 
 /// The sha256 of `path`'s contents, read a buffer at a time.
@@ -6917,6 +6937,34 @@ RUN ship
         let exec_other = resolve_stages(&plan, &order, &ba, &mut ex3, Some("deadbeef")).unwrap();
         let merged_other = merge_exec(&keyed, exec_other);
         assert_eq!(merged_other[&0].steps[0].key, merged[&0].steps[0].key);
+    }
+
+    /// An ARG reaches every RUN's shell, so a script the command runs reads it without the
+    /// command line naming it: the RUN's key must change with the value all the same.
+    #[test]
+    fn a_run_key_follows_the_arg_values_its_shell_gets() {
+        let src = "\
+FROM debian:bookworm
+ARG VERSION=1
+RUN ./install.sh
+";
+        let key = |args: &[(&str, &str)]| {
+            let ba: Vars = args
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let plan = plan_one(src, &ba);
+            let target = plan.resolve_target(None).unwrap();
+            let order = plan.build_order(target).unwrap();
+            let keyed = resolve_stages(&plan, &order, &ba, &mut DryRun::new(), None).unwrap();
+            keyed[&0].steps[0].key.clone()
+        };
+        assert_eq!(
+            key(&[]),
+            key(&[("VERSION", "1")]),
+            "the default is the same value"
+        );
+        assert_ne!(key(&[]), key(&[("VERSION", "2")]));
     }
 
     #[test]

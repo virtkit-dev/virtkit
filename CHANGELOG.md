@@ -15,6 +15,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: the build cache no longer serves a snapshot built from a different
+  `--build-arg`.** A RUN's key ignored the ARG values its shell is given unless the command
+  line named them, so a job building the same Dockerfile with another value stored a
+  snapshot a later build of the original reused. The cache-key version is bumped, so the
+  first build after upgrading starts cold.
 - **A guest-written disk image can no longer crash the host's `vk` or make it allocate
   gigabytes** when `vk` reads the image (for a `FROM --kernel=image` stage, or a job's
   `/etc/passwd`): its geometry, links and sizes are now checked.
