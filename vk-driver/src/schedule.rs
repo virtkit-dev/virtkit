@@ -33,12 +33,18 @@ pub fn desired_file(cfg: &Config) -> PathBuf {
     cfg.state_dir().join("schedule").join("desired-concurrency")
 }
 
-/// The runner's concurrency and what it was worked out from.
+/// The runner's concurrency and what it was worked out from:
+/// `effective = min(estimate, ceiling)`, each term optional.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Decision {
     /// What the host can take, by [`concurrency`]; `None` without a memory budget to measure
-    /// against, which leaves the runner's `concurrent` alone.
+    /// against.
     pub estimate: Option<u32>,
+    /// `[executor.schedule] max_concurrency`.
+    pub ceiling: Option<u32>,
+    /// The smallest term, never below one; `None` when no term applies, which leaves the
+    /// runner's `concurrent` alone.
+    pub effective: Option<u32>,
     /// The figures the estimate rests on, for the report line.
     basis: Option<Basis>,
 }
@@ -52,9 +58,26 @@ struct Basis {
     host: Option<(u64, u64)>,
 }
 
-/// Work the concurrency out from the host and the ledger. The estimate rises from the
-/// previous answer, read back from the file it was written to.
+/// The smallest of the terms that apply, never below one: `concurrent = 0` is not a throttle
+/// gitlab-runner has, and a runner that accepts nothing never picks up again. The config
+/// refuses a zero ceiling already; this is the guard behind it.
+pub(crate) fn effective(estimate: Option<u32>, ceiling: Option<u32>) -> Option<u32> {
+    [estimate, ceiling]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|n| n.max(1))
+}
+
+/// Work the concurrency out from the host, the ledger and the ceiling. The estimate rises
+/// from the previous *effective* answer, so a ceiling that is lifted is climbed back from one
+/// step at a time.
 pub(crate) fn decide(cfg: &Config) -> Result<Decision> {
+    let ceiling = cfg
+        .executor
+        .schedule
+        .max_concurrency
+        .map(std::num::NonZeroU32::get);
     let (estimate, basis) = match crate::vm::budget_mib(cfg) {
         None => (None, None),
         Some(budget) => {
@@ -90,13 +113,18 @@ pub(crate) fn decide(cfg: &Config) -> Result<Decision> {
             (Some(want), Some(basis))
         }
     };
-    Ok(Decision { estimate, basis })
+    Ok(Decision {
+        estimate,
+        ceiling,
+        effective: effective(estimate, ceiling),
+        basis,
+    })
 }
 
 /// Put `decision` where the runner picks it up: the desired-concurrency file `vk-runnerctl`
 /// reads.
 pub(crate) fn apply(cfg: &Config, decision: &Decision) -> Result<()> {
-    match decision.estimate {
+    match decision.effective {
         Some(want) => write_desired(cfg, want),
         None => Ok(()),
     }
@@ -107,10 +135,10 @@ pub(crate) fn apply(cfg: &Config, decision: &Decision) -> Result<()> {
 /// answer back out of the file it writes.
 pub fn tune(cfg: &Config) -> Result<()> {
     let decision = decide(cfg)?;
-    if decision.estimate.is_none() {
+    if decision.effective.is_none() {
         bail!(
-            "[executor.schedule] mem_budget is unset: there is no budget to schedule against \
-             (see the GitLab CI guide)"
+            "neither [executor.schedule] mem_budget nor max_concurrency is set: nothing to \
+             schedule against (see the GitLab CI guide)"
         );
     }
     apply(cfg, &decision)?;
@@ -118,15 +146,20 @@ pub fn tune(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// One line saying what the concurrency is and what it rests on.
+/// One line saying what the concurrency is and which term set it.
 pub(crate) fn describe(d: &Decision) -> String {
-    let Some(want) = d.estimate else {
-        return "runner concurrency left alone: no budget".to_string();
+    let Some(want) = d.effective else {
+        return "runner concurrency left alone: no budget and no ceiling".to_string();
     };
-    let mut line = format!("runner concurrency {want}");
+    let term = |n: Option<u32>| n.map_or_else(|| "none".to_string(), |n| n.to_string());
+    let mut line = format!(
+        "runner concurrency {want} (estimate {}, ceiling {})",
+        term(d.estimate),
+        term(d.ceiling)
+    );
     if let Some(b) = &d.basis {
         line.push_str(&format!(
-            " ({} of {} MiB committed by {} job(s), typical job {} MiB, {})",
+            "; {} of {} MiB committed by {} job(s), typical job {} MiB, {}",
             b.granted_mib,
             b.budget_mib,
             b.running,
@@ -389,6 +422,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn the_smallest_term_binds_and_one_is_the_floor() {
+        // Each term binds when it is the smallest.
+        assert_eq!(effective(Some(3), Some(6)), Some(3));
+        assert_eq!(effective(Some(9), Some(2)), Some(2));
+        // Absent terms do not bind; a ceiling applies without a budget to estimate from.
+        assert_eq!(effective(None, Some(5)), Some(5));
+        assert_eq!(effective(Some(7), None), Some(7));
+        assert_eq!(effective(None, None), None);
+        // Zero is not a throttle gitlab-runner has.
+        assert_eq!(effective(Some(4), Some(0)), Some(1));
+        assert_eq!(effective(None, Some(0)), Some(1));
+    }
+
     fn scratch_cfg(tag: &str, schedule: crate::config::Schedule) -> (Config, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("vk-tune-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -405,13 +452,55 @@ mod tests {
     }
 
     #[test]
+    fn a_decision_combines_the_estimate_with_the_ceiling() {
+        let (cfg, dir) = scratch_cfg(
+            "decide",
+            crate::config::Schedule {
+                mem_budget: Some("32G".into()),
+                max_concurrency: std::num::NonZeroU32::new(3),
+                ..Default::default()
+            },
+        );
+        // The estimate is this host's own reading, so only its relation to the rest is fixed.
+        let d = decide(&cfg).unwrap();
+        assert_eq!(d.ceiling, Some(3));
+        assert!(d.estimate.is_some());
+        assert_eq!(d.effective, Some(d.estimate.unwrap().min(3)));
+        assert!(describe(&d).contains("ceiling 3"), "{}", describe(&d));
+        // No budget: the ceiling alone decides, and the report has no figures to give.
+        let (cfg, dir2) = scratch_cfg(
+            "decide-nobudget",
+            crate::config::Schedule {
+                max_concurrency: std::num::NonZeroU32::new(5),
+                ..Default::default()
+            },
+        );
+        let d = decide(&cfg).unwrap();
+        assert_eq!((d.estimate, d.effective), (None, Some(5)));
+        assert_eq!(
+            describe(&d),
+            "runner concurrency 5 (estimate none, ceiling 5)"
+        );
+        apply(&cfg, &d).unwrap();
+        assert_eq!(std::fs::read_to_string(desired_file(&cfg)).unwrap(), "5\n");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
     fn tune_refuses_with_nothing_to_schedule_against() {
         let (cfg, dir) = scratch_cfg("tune-nothing", crate::config::Schedule::default());
         let d = decide(&cfg).unwrap();
-        assert_eq!(d.estimate, None);
-        assert_eq!(describe(&d), "runner concurrency left alone: no budget");
+        assert_eq!(d.effective, None);
+        assert_eq!(
+            describe(&d),
+            "runner concurrency left alone: no budget and no ceiling"
+        );
         let err = tune(&cfg).unwrap_err().to_string();
-        assert!(err.contains("mem_budget"), "{err}");
+        assert!(
+            err.contains("mem_budget") && err.contains("max_concurrency"),
+            "{err}"
+        );
         assert!(!desired_file(&cfg).exists(), "nothing was written");
         let _ = std::fs::remove_dir_all(&dir);
     }

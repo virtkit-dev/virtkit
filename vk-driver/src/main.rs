@@ -616,10 +616,11 @@ enum Cmd {
     },
     /// Keep gitlab-runner's `concurrent` in step with what this host can hold
     ///
-    /// Measures the memory its jobs have committed and leaves the concurrency that fits where
-    /// the root-side `vk-runnerctl` applies it. Run from a timer every half minute or so (see
-    /// the GitLab CI guide), so it is hidden from the everyday help like `vk gitlab`. Needs
-    /// `[executor.schedule] mem_budget`.
+    /// Measures the memory its jobs have committed and leaves the concurrency that fits, capped
+    /// at `[executor.schedule] max_concurrency`, where the root-side `vk-runnerctl` applies it.
+    /// Run from a timer every half minute or so (see the GitLab CI guide), so it is hidden from
+    /// the everyday help like `vk gitlab`. Needs `[executor.schedule] mem_budget` or
+    /// `max_concurrency`.
     #[command(hide = true)]
     Tune,
     /// GitLab custom executor

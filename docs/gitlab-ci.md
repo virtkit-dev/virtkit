@@ -1029,7 +1029,7 @@ Two pieces do that, split along the privilege line:
 
 | | Runs as | Does |
 | --- | --- | --- |
-| `vk tune` | the runner user | Reads the ledger, works out how many jobs fit, writes that one number to `<state_dir>/schedule/desired-concurrency` |
+| `vk tune` | the runner user | Reads the ledger, works out how many jobs fit, capped at `max_concurrency`, writes that one number to `<state_dir>/schedule/desired-concurrency` |
 | `vk-runnerctl` | root | Reads that number, clamps it into a range **it** configures, edits `concurrent`, puts the file back atomically |
 
 The split is the point: `config.toml` is root's, and granting `vk` the right to write it
@@ -1067,7 +1067,7 @@ The number itself is "the jobs running now, plus what both the budget and the ho
 room for", at the size a job on this host typically reserves:
 
 ```
-virtkit: runner concurrency 2 (6144 of 8192 MiB committed by 1 job(s), typical job 2048 MiB, 23040 of 32768 MiB host memory available)
+virtkit: runner concurrency 2 (estimate 2, ceiling none); 6144 of 8192 MiB committed by 1 job(s), typical job 2048 MiB, 23040 of 32768 MiB host memory available
 ```
 
 It falls the moment the host fills and climbs back one step at a time, because a job that
@@ -1084,6 +1084,12 @@ a time.
 
 A host whose `/proc/meminfo` cannot be read reports `host memory unreadable` and schedules on
 the budget alone.
+
+That estimate is capped by `[executor.schedule] max_concurrency`, and the smaller of the two
+wins. With `max_concurrency` alone and no `mem_budget`, `vk tune` holds the runner at that
+ceiling. It is the runner user's own cap on what it asks for; `vk-runnerctl`'s `min` and
+`max` are the administrator's range and still clamp the result. While the ceiling binds, the
+reported estimate is at most one above it: it climbs from the number last written.
 
 Getting the number wrong is cheap on purpose. It decides what the runner *accepts*, never
 what is committed: too high and the extra jobs queue at the admission gate exactly as

@@ -223,6 +223,9 @@ pub struct Schedule {
     /// Independent of `mem_budget`; shares its queue and `wait_timeout_secs`. Default on;
     /// `false` turns it off.
     pub disk_admission: Option<bool>,
+    /// The most jobs the runner is ever told to accept, whatever the host could take: the
+    /// ceiling in `min(estimate, ceiling)`. At least one. Unset: no ceiling.
+    pub max_concurrency: Option<std::num::NonZeroU32>,
     /// What a job with no history of its own is expected to write into its job dir, as
     /// `"<n>G"`. Set larger than the filesystem, every such job fails at once. Default `"8G"`,
     /// capped at the filesystem's size.
@@ -1409,5 +1412,17 @@ mod tests {
         let cfg: Config = toml::from_str("[build]\njobs = 2\n").unwrap();
         assert_eq!(cfg.build.jobs, NonZeroUsize::new(2));
         assert!(toml::from_str::<Config>("[build]\njobs = 0\n").is_err());
+    }
+
+    /// A concurrency ceiling of zero is refused at load time too: gitlab-runner has no such
+    /// throttle, and quietly running one job instead would hide the mistake.
+    #[test]
+    fn max_concurrency_refuses_zero() {
+        let cfg: Config = toml::from_str("[executor.schedule]\nmax_concurrency = 3\n").unwrap();
+        assert_eq!(
+            cfg.executor.schedule.max_concurrency,
+            std::num::NonZeroU32::new(3)
+        );
+        assert!(toml::from_str::<Config>("[executor.schedule]\nmax_concurrency = 0\n").is_err());
     }
 }

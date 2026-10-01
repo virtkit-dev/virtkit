@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk tune` honours a concurrency ceiling.** `[executor.schedule] max_concurrency` caps what
+  it asks for, and works without a `mem_budget` too.
+
+### Changed
+
+- `vk tune`'s report line names the estimate and the ceiling ahead of the figures behind them.
+
 ### Fixed
 
 - **Cleaning up a GitLab job whose supervisor had died no longer risks stopping another
