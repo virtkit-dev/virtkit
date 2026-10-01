@@ -1117,6 +1117,12 @@ fn refuse_unroutable(proto: &str, dst: SocketAddr) -> bool {
     refused
 }
 
+/// Map each NIC's backend-assigned MAC to its IP address and owning VM.
+fn nic_macs(nics: impl Iterator<Item = (Ipv4Addr, VmId)>) -> HashMap<Mac, (Ipv4Addr, VmId)> {
+    nics.filter_map(|(ip, vm)| Some((parse_mac(&vk_core::net::mac_for_ip(ip))?, (ip, vm))))
+        .collect()
+}
+
 #[derive(Default)]
 struct Inner {
     /// frame sink for each connected VM (its writer task)
@@ -1134,6 +1140,10 @@ struct Inner {
     ip_port: HashMap<Ipv4Addr, PortId>,
     /// address -> owning VM, from the run's listen configuration
     ip_vm: HashMap<Ipv4Addr, VmId>,
+    /// each NIC's MAC (`mac_for_ip` of its address, as both backends assign it) -> that
+    /// address and its owning VM, so no other VM can source frames from it
+    /// ([`Inner::claims_another_vm`]) or be flooded frames meant for it
+    mac_nic: HashMap<Mac, (Ipv4Addr, VmId)>,
     /// connected port -> owning VM, paired with `ip_vm` for anti-spoofing
     port_vm: HashMap<PortId, VmId>,
     /// DHCP: stable lease per client MAC
@@ -1452,6 +1462,7 @@ pub async fn run(
             // Record ownership before any NIC connects so admission does not depend on
             // connection order.
             ip_vm: listen.iter().map(|(_, ip, vm)| (*ip, *vm)).collect(),
+            mac_nic: nic_macs(listen.iter().map(|(_, ip, vm)| (*ip, *vm))),
             ..Inner::default()
         }),
         egress_tx,
@@ -1523,6 +1534,44 @@ pub async fn run(
     Ok(())
 }
 
+impl Inner {
+    /// Does a frame from `port` speak as another VM at layer 2: a sibling NIC's MAC as its
+    /// source, or, in ARP, a sibling's MAC or address as the sender? Either would let a guest
+    /// take the traffic meant for that sibling — learned MACs and ARP caches believe whoever
+    /// spoke last. Any other MAC is left alone: a guest bridging containers sources its own.
+    ///
+    /// The gateway counts as another: a guest answering ARP for its address, or sending from
+    /// its MAC, would have its siblings hand it their egress and DNS.
+    fn claims_another_vm(
+        &self,
+        port: PortId,
+        frame: &[u8],
+        ethertype: u16,
+        gateway: Ipv4Addr,
+    ) -> bool {
+        let Some(vm) = self.port_vm.get(&port) else {
+            return false;
+        };
+        let foreign_mac = |mac: &[u8]| {
+            <[u8; 6]>::try_from(mac).ok().is_some_and(|m| {
+                m == GW_MAC || self.mac_nic.get(&m).is_some_and(|(_, owner)| owner != vm)
+            })
+        };
+        if foreign_mac(&frame[6..12]) {
+            return true;
+        }
+        if ethertype == ETHERTYPE_ARP
+            && let Some(arp) = frame.get(14..14 + 28)
+        {
+            let spa = Ipv4Addr::new(arp[14], arp[15], arp[16], arp[17]);
+            let foreign_ip = spa == gateway
+                || (!spa.is_unspecified() && self.ip_vm.get(&spa).is_some_and(|owner| owner != vm));
+            return foreign_ip || foreign_mac(&arp[8..14]);
+        }
+        false
+    }
+}
+
 impl Switch {
     /// One connected VM: register a port, pump its frames into the switch, and
     /// drain queued frames back to it, until it disconnects.
@@ -1589,6 +1638,9 @@ impl Switch {
         if !admitted {
             return;
         }
+        if inner.claims_another_vm(port, frame, ethertype, self.cfg.gateway) {
+            return;
+        }
         inner.mac_port.insert(src, port);
         if let Some(sip) = sip {
             inner.ip_mac.insert(sip, src);
@@ -1606,10 +1658,20 @@ impl Switch {
             flood(&inner, port, frame);
             return;
         }
-        // Unicast to a known VM -> that port; unknown -> flood.
-        match inner.mac_port.get(&dst).copied() {
-            Some(p) if p != port => send(&inner, p, frame),
-            _ => flood(&inner, port, frame),
+        // Send learned unicast to its port; flood unknown MACs. An unlearned NIC's MAC goes
+        // only to its own port, so a VM impersonating that NIC cannot receive its traffic.
+        match (inner.mac_port.get(&dst).copied(), inner.mac_nic.get(&dst)) {
+            (Some(p), _) if p != port => send(&inner, p, frame),
+            // Learned on the sender's own port: nobody else is meant to see it.
+            (Some(_), _) => {}
+            (None, Some((ip, _))) => {
+                if let Some(&p) = inner.ip_port.get(ip)
+                    && p != port
+                {
+                    send(&inner, p, frame);
+                }
+            }
+            (None, None) => flood(&inner, port, frame),
         }
     }
 
@@ -4387,9 +4449,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A switch with one VM (port 0, `192.168.231.2`), followed by receivers for frames
-    /// sent to that port and packets sent to ipstack.
-    fn one_vm_switch(
+    /// A switch with two VMs (port 0, `192.168.231.2`; port 1, `192.168.231.3`), followed by
+    /// receivers for frames sent to port 0 and packets sent to ipstack.
+    fn two_vm_switch(
         policy: Egress,
     ) -> (
         Switch,
@@ -4406,8 +4468,20 @@ mod tests {
             },
             inner: Mutex::new(Inner {
                 next_idx: FIRST_LEASE,
-                ip_vm: [(Ipv4Addr::new(192, 168, 231, 2), 1)].into_iter().collect(),
-                port_vm: [(0, 1)].into_iter().collect(),
+                ip_vm: [
+                    (Ipv4Addr::new(192, 168, 231, 2), 1),
+                    (Ipv4Addr::new(192, 168, 231, 3), 2),
+                ]
+                .into_iter()
+                .collect(),
+                mac_nic: nic_macs(
+                    [
+                        (Ipv4Addr::new(192, 168, 231, 2), 1),
+                        (Ipv4Addr::new(192, 168, 231, 3), 2),
+                    ]
+                    .into_iter(),
+                ),
+                port_vm: [(0, 1), (1, 2)].into_iter().collect(),
                 ports: [(0, port_tx)].into_iter().collect(),
                 ..Inner::default()
             }),
@@ -4430,11 +4504,196 @@ mod tests {
         frame
     }
 
+    /// A VM cannot speak at layer 2 as its sibling: not from the sibling's MAC, and not in an
+    /// ARP claiming the sibling's address. Its own, or a MAC no NIC has, is left alone.
+    #[test]
+    fn a_vm_cannot_take_a_siblings_mac_or_address() {
+        let (sw, _port0, _egress) = two_vm_switch(Egress::new(&[], &[]).unwrap());
+        let mac = |ip: [u8; 4]| parse_mac(&vk_core::net::mac_for_ip(ip.into())).unwrap();
+        let (mine, sibling) = (mac([192, 168, 231, 2]), mac([192, 168, 231, 3]));
+        let frame = |src: Mac, ethertype: u16, payload: &[u8]| {
+            let mut f = vec![0xff; 6];
+            f.extend_from_slice(&src);
+            f.extend_from_slice(&ethertype.to_be_bytes());
+            f.extend_from_slice(payload);
+            f
+        };
+        let arp = |sha: Mac, spa: [u8; 4]| {
+            let mut a = vec![0, 1, 0x08, 0x00, 6, 4, 0, 2];
+            a.extend_from_slice(&sha);
+            a.extend_from_slice(&spa);
+            a.extend_from_slice(&[0; 6]);
+            a.extend_from_slice(&[192, 168, 231, 1]);
+            a
+        };
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let inner = sw.inner.lock().unwrap();
+        // Its own MAC and address, or a MAC no NIC has (a bridged container): fine.
+        assert!(!inner.claims_another_vm(
+            0,
+            &frame(mine, ETHERTYPE_ARP, &arp(mine, [192, 168, 231, 2])),
+            ETHERTYPE_ARP,
+            gw
+        ));
+        let container = [0x02, 0x42, 0xac, 0x11, 0x00, 0x02];
+        assert!(!inner.claims_another_vm(
+            0,
+            &frame(container, ETHERTYPE_IPV4, &[]),
+            ETHERTYPE_IPV4,
+            gw
+        ));
+        // The sibling's MAC as the source, or the sibling's address or MAC in an ARP: refused.
+        assert!(inner.claims_another_vm(
+            0,
+            &frame(sibling, ETHERTYPE_IPV4, &[]),
+            ETHERTYPE_IPV4,
+            gw
+        ));
+        assert!(inner.claims_another_vm(
+            0,
+            &frame(mine, ETHERTYPE_ARP, &arp(mine, [192, 168, 231, 3])),
+            ETHERTYPE_ARP,
+            gw
+        ));
+        assert!(inner.claims_another_vm(
+            0,
+            &frame(mine, ETHERTYPE_ARP, &arp(sibling, [192, 168, 231, 2])),
+            ETHERTYPE_ARP,
+            gw
+        ));
+        // Nor as the gateway: not its address in an ARP, not its MAC.
+        assert!(inner.claims_another_vm(
+            0,
+            &frame(mine, ETHERTYPE_ARP, &arp(mine, [192, 168, 231, 1])),
+            ETHERTYPE_ARP,
+            gw
+        ));
+        assert!(inner.claims_another_vm(
+            0,
+            &frame(GW_MAC, ETHERTYPE_IPV4, &[]),
+            ETHERTYPE_IPV4,
+            gw
+        ));
+        // And the sibling itself is not refused its own.
+        assert!(!inner.claims_another_vm(
+            1,
+            &frame(sibling, ETHERTYPE_IPV4, &[]),
+            ETHERTYPE_IPV4,
+            gw
+        ));
+    }
+
+    /// The switch drops ARP claiming the gateway and floods ARP for the VM's own address
+    /// to its sibling.
+    #[test]
+    fn a_spoofed_arp_never_reaches_a_sibling() {
+        let (sw, _port0, _egress) = two_vm_switch(Egress::new(&[], &[]).unwrap());
+        let (tx1, mut rx1) = unbounded_channel();
+        sw.inner.lock().unwrap().ports.insert(1, tx1);
+        let mine = parse_mac(&vk_core::net::mac_for_ip(Ipv4Addr::new(192, 168, 231, 2))).unwrap();
+        let arp_from = |spa: [u8; 4]| {
+            let mut f = vec![0xff; 6];
+            f.extend_from_slice(&mine);
+            f.extend_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+            f.extend_from_slice(&[0, 1, 0x08, 0x00, 6, 4, 0, 2]);
+            f.extend_from_slice(&mine);
+            f.extend_from_slice(&spa);
+            f.extend_from_slice(&[0; 6]);
+            f.extend_from_slice(&[192, 168, 231, 3]);
+            f
+        };
+        sw.handle_frame(0, &arp_from([192, 168, 231, 1]));
+        assert!(
+            rx1.try_recv().is_err(),
+            "an ARP claiming the gateway was flooded"
+        );
+        sw.handle_frame(0, &arp_from([192, 168, 231, 2]));
+        assert!(
+            rx1.try_recv().is_ok(),
+            "an ARP for the VM's own address is flooded"
+        );
+    }
+
+    /// Connects ports 1 (the sibling, `192.168.231.3`) and 2 (a third VM, no address) to
+    /// [`two_vm_switch`], returning their receivers.
+    fn with_sibling_and_observer(
+        sw: &Switch,
+    ) -> (UnboundedReceiver<Vec<u8>>, UnboundedReceiver<Vec<u8>>) {
+        let (tx1, rx1) = unbounded_channel();
+        let (tx2, rx2) = unbounded_channel();
+        let mut inner = sw.inner.lock().unwrap();
+        inner.ports.insert(1, tx1);
+        inner.ports.insert(2, tx2);
+        inner.port_vm.insert(2, 3);
+        (rx1, rx2)
+    }
+
+    /// An empty ethernet frame from `src` to `dst`, of an ethertype the gateway ignores.
+    fn l2_frame(dst: Mac, src: Mac) -> Vec<u8> {
+        let mut f = Vec::with_capacity(14);
+        f.extend_from_slice(&dst);
+        f.extend_from_slice(&src);
+        f.extend_from_slice(&0x88b5u16.to_be_bytes());
+        f
+    }
+
+    /// A frame to a sibling NIC whose MAC is not learned yet goes only to that NIC's port, and
+    /// nowhere while it is not connected: never flooded to a VM that could pose as it.
+    #[test]
+    fn a_frame_to_an_unlearned_sibling_is_not_flooded() {
+        let (sw, _port0, _egress) = two_vm_switch(Egress::new(&[], &[]).unwrap());
+        let (mut rx1, mut rx2) = with_sibling_and_observer(&sw);
+        let mac = |ip: [u8; 4]| parse_mac(&vk_core::net::mac_for_ip(ip.into())).unwrap();
+        let (mine, sibling) = (mac([192, 168, 231, 2]), mac([192, 168, 231, 3]));
+
+        sw.handle_frame(0, &l2_frame(sibling, mine));
+        assert!(rx1.try_recv().is_err() && rx2.try_recv().is_err());
+
+        sw.inner
+            .lock()
+            .unwrap()
+            .ip_port
+            .insert(Ipv4Addr::new(192, 168, 231, 3), 1);
+        sw.handle_frame(0, &l2_frame(sibling, mine));
+        assert!(rx1.try_recv().is_ok(), "the sibling's port gets it");
+        assert!(rx2.try_recv().is_err(), "flooded to another VM");
+
+        // A MAC no NIC has is still flooded.
+        let container = [0x02, 0x42, 0xac, 0x11, 0x00, 0x02];
+        sw.handle_frame(0, &l2_frame(container, mine));
+        assert!(rx1.try_recv().is_ok() && rx2.try_recv().is_ok());
+    }
+
+    /// A frame sourced from a sibling's MAC does not move that MAC to the sender's port: the
+    /// sibling's traffic keeps going to the sibling.
+    #[test]
+    fn a_spoofed_source_mac_is_not_learned() {
+        let (sw, mut port0, _egress) = two_vm_switch(Egress::new(&[], &[]).unwrap());
+        let (mut rx1, mut rx2) = with_sibling_and_observer(&sw);
+        let mac = |ip: [u8; 4]| parse_mac(&vk_core::net::mac_for_ip(ip.into())).unwrap();
+        let sibling = mac([192, 168, 231, 3]);
+        let observer = [0x02, 0x42, 0xac, 0x11, 0x00, 0x03];
+
+        // The sibling speaks, so its MAC is learned on port 1.
+        sw.handle_frame(1, &l2_frame(BCAST_MAC, sibling));
+        assert!(port0.try_recv().is_ok() && rx2.try_recv().is_ok());
+        // Port 0 sends as the sibling: dropped, not flooded.
+        sw.handle_frame(0, &l2_frame(BCAST_MAC, sibling));
+        assert!(rx1.try_recv().is_err() && rx2.try_recv().is_err());
+        // Traffic to the sibling still goes to port 1 only.
+        sw.handle_frame(2, &l2_frame(sibling, observer));
+        assert!(rx1.try_recv().is_ok(), "the sibling's frame went astray");
+        assert!(
+            port0.try_recv().is_err(),
+            "the impersonator got the sibling's frame"
+        );
+    }
+
     /// Only a frame whose source the switch could check gets past it: not an IPv6 packet
     /// typed as IPv4, and from 0.0.0.0 nothing but DHCP.
     #[test]
     fn egress_takes_only_a_checked_ipv4_source() {
-        let (sw, mut port, mut egress) = one_vm_switch(Egress::new(&[], &[]).unwrap());
+        let (sw, mut port, mut egress) = two_vm_switch(Egress::new(&[], &[]).unwrap());
         let udp = |src: [u8; 4], dst: [u8; 4], dport: u16, payload: &[u8]| {
             let mut ip = Vec::new();
             etherparse::PacketBuilder::ipv4(src, dst, 64)

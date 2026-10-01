@@ -15,6 +15,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: a VM on a job's network can no longer pose as another VM or as the gateway**
+  (by its MAC, or in ARP) to intercept their traffic.
 - **Security: `vk-registry` no longer lets a client hold a connection open without sending
   a request.** Request headers must arrive within 30 seconds, also on an idle kept-alive
   connection; a TLS handshake must finish within 10 seconds; at most 1024 connections, 256
