@@ -15,6 +15,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: a VM on a job's network can no longer pose as another VM or as the gateway**
+  (by its MAC, or in ARP) to intercept their traffic.
 - The switch drops an IPv4-typed frame that does not carry IPv4, and a non-DHCP datagram from
   `0.0.0.0`; under an egress dry run either could reach any IPv6 address or skip the
   sender's own policy.
