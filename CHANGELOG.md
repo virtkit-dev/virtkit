@@ -11,6 +11,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- An OCI image pull holds each layer in a scratch file beside the build rather than every
+  layer in memory: a large image needs that much free disk there instead of RAM.
 - The guest kernel no longer lets unprivileged processes use eBPF (from its next build); root
   can turn it back on with `sysctl kernel.unprivileged_bpf_disabled=0`.
 - `vk-registry` keeps a user's email only when the identity provider has not marked it

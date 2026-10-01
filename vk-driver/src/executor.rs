@@ -524,8 +524,18 @@ pub fn guest_shell(ctx: &JobCtx) -> Vec<String> {
 /// that merely dropped the handle would leave the task pumping into a socket nobody
 /// closes: the guest never sees stdin EOF, the remote process keeps running, and the
 /// fd plus the whole script buffer leak. Aborting on drop makes every exit path —
-/// including the error ones — tear it down.
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+/// including the error ones — tear it down. Awaiting it awaits the task.
+pub(crate) struct AbortOnDrop<T>(pub(crate) tokio::task::JoinHandle<T>);
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
 
 impl<T> AbortOnDrop<T> {
     fn abort(&self) {
