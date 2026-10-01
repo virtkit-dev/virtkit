@@ -27,14 +27,24 @@ pub fn layout(title: &str, auth: &Auth, main: &Html) -> Html {
     h
 }
 
+/// htmx's configuration: nothing evaluated, no script run from a swapped fragment, no
+/// inline style of its own (the policy would refuse it), requests to this origin only.
+const HTMX_CONFIG: &str = r#"{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"selfRequestsOnly":true}"#;
+
 fn head(h: &mut Html, title: &str) {
     h.raw("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">")
         .raw("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
-        .raw("<title>")
+        .raw("<meta name=\"htmx-config\" content='")
+        .raw(HTMX_CONFIG)
+        .raw("'><title>")
         .node(title)
         .raw(" · vk-hub</title><link rel=\"stylesheet\" href=\"")
         .text(assets::url(assets::CSS))
-        .raw("\"></head>");
+        .raw("\"><script src=\"")
+        .text(assets::url(assets::HTMX))
+        .raw("\"></script><script src=\"")
+        .text(assets::url(assets::SSE))
+        .raw("\"></script></head>");
 }
 
 /// The hidden field carrying the session's CSRF token.
@@ -73,6 +83,14 @@ pub fn signed_in() -> Html {
     h.raw("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">")
         .raw("<meta http-equiv=\"refresh\" content=\"0; url=/\"><title>vk-hub</title></head>")
         .raw("<body><p><a href=\"/\">Signed in; continue</a></p></body></html>");
+    h
+}
+
+/// A live region's last fragment, once its session has ended.
+pub fn signed_out_fragment() -> Html {
+    let mut h = Html::new();
+    h.raw("<p class=\"message\">Signed out: this page no longer updates. ")
+        .raw("<code>vk-hub local login</code> prints a link to sign in again.</p>");
     h
 }
 

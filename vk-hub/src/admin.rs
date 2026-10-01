@@ -228,6 +228,8 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
                 .end_ui_sessions(id.as_deref(), &actor, crate::now_secs())?;
             if ended > 0 {
                 eprintln!("vk-hub: admin: {actor} ended {ended} web UI session(s)");
+                // Their pages' live updates end on it.
+                hub.sessions_changed();
             }
             serde_json::to_value(ended)?
         }

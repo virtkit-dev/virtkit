@@ -464,7 +464,7 @@ fn append_audit(txn: &redb::WriteTransaction, actor: &str, event: &str, now: u64
 }
 
 /// A secret's key in its table.
-fn token_key(token: &str) -> String {
+pub(crate) fn token_key(token: &str) -> String {
     crate::hex::to_hex(&Sha256::digest(token.as_bytes()))
 }
 

@@ -1,15 +1,57 @@
-//! `vk-hub local`'s pages: this machine's VMs, and each one's own page.
+//! `vk-hub local`'s pages: this machine's VMs, and each one's own page, both kept live.
 //!
 //! A VM's ID is the one `vk workloads` derives from its state dir, sixteen hex digits, and the
-//! only value of the host's that goes into a path; the router takes nothing else for one.
+//! only value of the host's that goes into a path or an attribute htmx reads; the router takes
+//! nothing else for one.
 
+use std::sync::Arc;
+
+use bytes::Bytes;
 use hyper::{Response, StatusCode};
+use tokio::sync::watch;
 use vk_hub_proto::Workload;
 
 use super::html::Html;
 use super::pages::{self, dash, end_section, kv, kv_node, section};
+use super::sse::{self, Source};
 use super::{Auth, Body, Ui};
-use crate::local::Listing;
+use crate::local::{Listing, Local};
+use crate::server::Hub;
+
+/// Start the task that renders the VMs table once for every page listing it.
+pub(super) fn feed(hub: &Hub, local: &Arc<Local>) -> watch::Sender<Option<Bytes>> {
+    sse::feed(hub.subscribe(), "vms", render_vms(local.clone()))
+}
+
+fn render_vms(local: Arc<Local>) -> sse::Render {
+    Arc::new(move || Ok(vms_table(&local.listing()).into_string()))
+}
+
+/// What `/events/<event>` streams, if it is one of local mode's.
+pub(super) fn source(event: &str, ui: &Ui) -> Option<Source> {
+    if event == "vms" {
+        return Some(Source::Shared {
+            name: "vms",
+            feed: ui.vms_feed.subscribe(),
+            render: render_vms(ui.local.clone()),
+        });
+    }
+    let id = event
+        .strip_prefix("vm/")
+        .filter(|id| valid_id(id))?
+        .to_string();
+    let local = ui.local.clone();
+    Some(Source::Own {
+        name: "vm",
+        changes: ui.hub.subscribe(),
+        render: Arc::new(move || {
+            Ok(match local.workload(&id) {
+                Some((w, mem)) => vm_detail(&w, mem).into_string(),
+                None => gone().into_string(),
+            })
+        }),
+    })
+}
 
 /// The page for `path`, if it is one of local mode's.
 pub(super) fn get(path: &str, auth: &Auth, ui: &Ui) -> Option<Response<Body>> {
@@ -18,7 +60,7 @@ pub(super) fn get(path: &str, auth: &Auth, ui: &Ui) -> Option<Response<Body>> {
     }
     let id = path.strip_prefix("/vm/").filter(|id| valid_id(id))?;
     Some(match ui.local.workload(id) {
-        Some((w, mem)) => super::page(vm(auth, &w, mem)),
+        Some((w, mem)) => super::page(vm(auth, id, &w, mem)),
         None => super::message(
             StatusCode::NOT_FOUND,
             "No such VM is running on this machine.",
@@ -35,7 +77,10 @@ fn valid_id(id: &str) -> bool {
 fn list(auth: &Auth, listing: &Listing) -> Html {
     let mut main = Html::new();
     main.raw("<h1>VMs on this machine</h1>")
-        .html(&vms_table(listing));
+        .raw("<div id=\"vms\" hx-ext=\"sse\" sse-connect=\"/events/vms\" sse-swap=\"vms\" ")
+        .raw("sse-close=\"close\">")
+        .html(&vms_table(listing))
+        .raw("</div>");
     pages::layout("VMs", auth, &main)
 }
 
@@ -120,14 +165,25 @@ fn cells(w: &Workload, mem: Option<u64>) -> [String; 9] {
     ]
 }
 
-/// `/vm/<id>`: one VM.
-fn vm(auth: &Auth, w: &Workload, mem: Option<u64>) -> Html {
+/// `/vm/<id>`: one VM. `id` goes into `sse-connect`: the router takes only hex for one.
+fn vm(auth: &Auth, id: &str, w: &Workload, mem: Option<u64>) -> Html {
     let mut main = Html::new();
     main.raw("<h1>")
         .node(&crate::workloads::owner(w))
         .raw("</h1>");
-    main.html(&vm_detail(w, mem));
+    main.raw("<div id=\"detail\" hx-ext=\"sse\" sse-connect=\"/events/vm/")
+        .text(id)
+        .raw("\" sse-swap=\"vm\" sse-close=\"close\">")
+        .html(&vm_detail(w, mem))
+        .raw("</div>");
     pages::layout(&crate::workloads::owner(w), auth, &main)
+}
+
+/// A VM page's fragment once the VM has stopped.
+fn gone() -> Html {
+    let mut h = Html::new();
+    h.raw("<p class=\"empty\">This VM is no longer running.</p>");
+    h
 }
 
 /// What the page shows of a VM below its name.

@@ -5,8 +5,9 @@
 //! string a host reported — the VMs `vk` lists, their logs: it is made
 //! [`vk_hub_proto::display_safe`] again before it is escaped, whatever was done before.
 //!
-//! A host's strings go only in text content or quoted plain attributes (`title`, `value`); an
-//! `href` is the hub's own, built from constants and from IDs the router has checked are hex.
+//! A host's strings go only in text content or quoted plain attributes (`title`, `value`),
+//! never in an attribute htmx interprets (`hx-*`, `sse-*`). Those and an `href` are the hub's
+//! own, built from constants and from IDs the router has checked are hex.
 
 use std::fmt::Display;
 
