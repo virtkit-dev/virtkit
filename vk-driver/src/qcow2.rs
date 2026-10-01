@@ -1108,9 +1108,16 @@ impl VkRoImg {
         let path = self.chunk_path(chunk);
         let raw =
             std::fs::read(&path).with_context(|| format!("reading chunk {}", path.display()))?;
+        // Decoded no further than one byte past the length it claims: a frame that inflates
+        // beyond it is refused below rather than held in memory.
         let data = if chunk.codec == crate::registry::VK_RO_IMG_CODEC_ZSTD {
-            zstd::decode_all(&raw[..])
-                .with_context(|| format!("zstd-decompressing chunk {}", path.display()))?
+            use std::io::Read;
+            // A hint only, and the header says it: no more than a chunk can be.
+            let mut data = Vec::with_capacity((chunk.length as usize).min(16 << 20));
+            zstd::stream::read::Decoder::new(&raw[..])
+                .and_then(|d| d.take(u64::from(chunk.length) + 1).read_to_end(&mut data))
+                .with_context(|| format!("zstd-decompressing chunk {}", path.display()))?;
+            data
         } else {
             raw
         };

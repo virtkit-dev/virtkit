@@ -248,12 +248,22 @@ impl LazyChunkStorage {
                 )
             })?;
             let data = match chunk.codec {
-                CODEC_ZSTD => zstd::decode_all(&raw[..]).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("zstd-decompressing chunk {}: {e}", path.display()),
-                    )
-                })?,
+                // No further than one byte past the length the header claims: a frame that
+                // inflates beyond it is refused below rather than held in memory.
+                CODEC_ZSTD => {
+                    use std::io::Read;
+                    // A hint only, and the header says it: no more than a chunk can be.
+                    let mut data = Vec::with_capacity((chunk.length as usize).min(16 << 20));
+                    zstd::stream::read::Decoder::new(&raw[..])
+                        .and_then(|d| d.take(u64::from(chunk.length) + 1).read_to_end(&mut data))
+                        .map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("zstd-decompressing chunk {}: {e}", path.display()),
+                            )
+                        })?;
+                    data
+                }
                 CODEC_RAW => raw,
                 other => {
                     return Err(io::Error::new(
