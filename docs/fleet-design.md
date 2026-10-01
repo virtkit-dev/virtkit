@@ -1,0 +1,459 @@
+# Fleet: a hub and its nodes
+
+Status: proposal. Nothing below is implemented.
+
+A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
+fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
+resets — and shows them in a web UI. It does not take GitLab jobs itself: each node keeps
+its own gitlab-runner with the vk executor, and the hub steers how much work each runner
+accepts. Central placement comes first for generic VM jobs, whose queue the hub owns, and
+reaches GitLab jobs only if measurements show that local acquisition is not good enough.
+
+The target is a fleet of tens of bare-metal hosts, not hundreds: one hub process, one
+embedded database, no replication.
+
+## Components
+
+- **`vk node`** — a `vk` subcommand run as a long-lived supervisor on each node. It links
+  the executor, admission, the concurrency controller and self-update in-process, dials the
+  hub, and applies what the hub asks within what local policy allows.
+- **`vk-hub`** — a new binary: inventory, desired state, operations, audit log, web UI, and
+  later the generic job queue. Its database is `redb`, as `vk-registry`'s accounts store is.
+- **`vk-fleet-proto`** — the hub↔node wire types, versioned. A node and the hub negotiate
+  the protocol version on connect; a rolling update runs mixed versions by definition.
+- **`vk-registry`** — unchanged and operated separately. Nodes pull from it directly; the hub
+  is one of its clients.
+
+Where state lives:
+
+| Owner | State |
+|---|---|
+| GitLab | the CI queue, job status, traces, artifacts, cancellation |
+| hub | inventory, desired state per node, operations in progress, audit log |
+| node | processes, admission ledger, checkouts, caches, job history, drain state, command journal |
+| registry | images and build content |
+
+## Node requirements
+
+A node is any host `vk` already runs on:
+
+- an x86-64 Linux kernel with KVM enabled;
+- a dedicated user with read/write access to `/dev/kvm`;
+- network access to the hub, to GitLab, and to the registries its jobs pull from.
+
+`vk check` is the gate: a node refuses to enroll while it fails. No root is needed at
+runtime and no distribution is assumed. `vk node run` is a foreground process; how it is
+kept running is the host's choice (`vk node install` writes a `systemd --user` unit where
+there is one).
+
+The node's gitlab-runner runs as the same user, with its configuration under
+`~/.gitlab-runner/`, so `vk node` edits its `concurrent` directly. A root-managed runner is
+supported through `vk-runnerctl`, as today.
+
+Enrollment:
+
+```sh
+vk node join https://hub.example.com --token <enrollment-token>
+```
+
+generates the node's ed25519 identity, which the hub pins on first contact. Enrollment tokens
+are single-use and expire. The identity survives `vk` updates; the hub can revoke it.
+
+## Hub ↔ node protocol
+
+The node dials the hub over WebSocket on TLS; nodes need no inbound port. The connection
+carries control and telemetry only — images and artifacts go directly between nodes and the
+registry or GitLab.
+
+Each connection opens with:
+
+- the protocol version range each side speaks;
+- the node's ID and a signature over a hub-issued challenge, made with the node's key;
+- the node's **incarnation ID**, new on every `vk node` start, so the hub tells a reconnect
+  from a restart;
+- the node's full observed state and the commands it has journaled but not yet reported
+  done.
+
+Then:
+
+- **node → hub**: inventory when it changes, a heartbeat with capacity and job counts every
+  few seconds, command progress and results.
+- **hub → node**: desired state, as a document with a generation number; operations
+  (`drain`, `update`, `reset`), each with an ID and an expiry.
+
+A node applies a desired-state generation at most once, and journals every command before
+acting on it, so a command redelivered after a reconnect is recognized and not repeated. A
+lost connection means the node's state is unknown, not that it stopped.
+
+**Losing the hub does not stop the fleet.** A disconnected node keeps running CI under its
+local policy and the last desired state it applied. A drain or quarantine it has persisted
+stays in force.
+
+## Configuration
+
+A node's `virtkit.toml` is authoritative. It sets what the node permits — paths, shares,
+resource ceilings, which operations the hub may run — and all of the executor tuning a host
+like one with a lot of RAM and a slow network disk depends on (tmpfs `checkout_dir`, reused
+host-side checkouts, DAX shares, disk admission).
+
+The hub only ever narrows it: it can lower the node's concurrency ceiling, stop acquisition,
+drain, and choose among versions the node is allowed to run. It never raises a limit local
+policy sets and never pushes `[executor]` settings.
+
+The node reports its effective configuration with a hash, and the UI shows it per node, so
+drift between nodes that should match is visible.
+
+## Inventory
+
+Every node reports, keeping hard facts, measured load and operator policy apart:
+
+- **hardware** — CPU model and count, memory nodes, RAM, `vk check` results;
+- **storage** — for the job-dir and checkout filesystems: identity, size, free bytes and
+  inodes, tmpfs or disk, and a speed class the operator declares (`fast`, `slow`);
+- **pressure** — memory available, CPU, memory and I/O PSI, disk latency;
+- **runner** — gitlab-runner version, runner IDs and tags, `concurrent`, jobs preparing,
+  waiting on admission, running, cleaning up;
+- **admission** — memory reserved and budget, disk claimed;
+- **versions** — `vk`, the guest kernel, the effective configuration hash.
+
+A transient reading never changes a node's declared capabilities.
+
+### Workloads
+
+Not built yet. A node also reports the VMs running on it, so the hub shows what a node is
+doing rather than only how full it is. Each entry carries:
+
+- the kind — CI job, dev environment, pinned run (`vk run --state-dir`), compose service;
+- what it belongs to — project and job for CI, workspace and environment for `vk dev`;
+- pid, vCPUs, memory reserved and memory in use, uptime, state dir.
+
+The sources exist already and are read, not duplicated: the host's VM registry under
+`<data>/vms/`, whose entries are checked against the state dir's lock so a stale entry is not
+reported; the dev state dirs `vk dev list` scans, whose JSON fields are only ever added to;
+the executor's job dirs and their supervisors; the admission ledger for reservations. The
+list rides on the report and changes as VMs start and stop; memory in use rides on the
+heartbeat.
+
+## Load balancing without central acquisition
+
+GitLab gives a job to whichever eligible runner asks first. The lever the fleet has is how
+much work each runner asks for: its `concurrent`. Admission stays the final gate on each
+node — but a job admission makes wait has already been assigned by GitLab, and cannot move
+to an idle node. So the goal is to keep runners from accepting work their host cannot start
+promptly.
+
+Each node computes its own concurrency:
+
+```
+effective = min(local estimate, hub ceiling, local ceiling)
+```
+
+- **local estimate** — the control law `vk tune` applies today: running jobs plus as
+  many typical jobs as fit the memory budget and the host's available memory, keeping 15% of
+  the host back, falling at once and rising one step at a time. Extended with free disk
+  bytes and inodes on the job-dir filesystem, I/O pressure, and jobs accepted but not yet
+  admitted.
+- **hub ceiling** — set by the hub, for a node that is unhealthy, saturated on a resource the
+  local estimate does not see, or whose capacity is being kept for a specialist class.
+- **local ceiling** — the administrator's limit in `virtkit.toml`.
+
+gitlab-runner has no `concurrent = 0`. **Stop acquisition** is therefore a state, not a
+number: the node sends gitlab-runner `SIGQUIT`, which stops it requesting jobs and lets
+running ones finish, and does not restart it until the state is lifted. The hub can also
+pause the runner through the GitLab API, which keeps GitLab from assigning it jobs even if a
+request is already in flight when the node stops it.
+
+The hub adjusts ceilings over tens of seconds with hysteresis: it cuts quickly under
+sustained pressure and raises slowly. It does not aim for equal utilization.
+
+What this achieves is coarse: a node takes no more than it can start, and compatible work
+lands elsewhere. It cannot pick the best node for a given job, and checkout or image
+locality is incidental — the next job of a project may not return to the node holding its
+tree.
+
+Tags are stable workload classes (`vk`, `large-memory`, `docker-vm`, `fast-scratch`),
+assigned per runner by the operator. GitLab requires a runner to have every tag a job asks
+for, so tags decide which runners are eligible; load is never encoded in them. Protected
+and untrusted work are separated by runner registration and project scope, not by tags.
+
+## Node states
+
+```
+ready ─▶ draining ─▶ drained ─▶ maintenance ─▶ validating ─▶ ready
+                                                   │
+quarantined (entered from any state; left only by an operator)
+```
+
+A drain:
+
+1. is persisted on the node before anything else;
+2. stops acquisition, and pauses the runner in GitLab;
+3. waits for gitlab-runner to finish its jobs, the executor's cleanup, and the admission
+   ledger to empty;
+4. reports `drained` only once all three hold.
+
+`validating` runs a boot/exec/network smoke test and, when configured, a synthetic job
+before the node goes back to `ready`.
+
+A node that stops heartbeating is shown as unreachable, not paused: pausing every
+disconnected node would turn a hub outage into a fleet outage.
+
+## Updates
+
+An update is: download the approved release → verify it → drain → switch the binary →
+validate → ready. The previous binary and configuration are kept, and restored if
+validation fails or the node does not reconnect within a deadline.
+
+Rollouts go by hardware profile: one canary per profile, then small batches, each node
+validated before the next batch starts. Rollout state is in the hub's database, so a
+rollout survives a hub restart.
+
+`vk-selfupdate` provides the download, digest check, version smoke test and atomic rename.
+Fleet updates add:
+
+- a signature check against keys pinned in the installed `vk`, before the new binary runs;
+- the same pinning for the gitlab-runner binary;
+- one `vk` binary per job for the job's whole life: executor stages running during a switch
+  must not mix versions, which draining guarantees.
+
+## Resets
+
+| Operation | Effect |
+|---|---|
+| restart | restart `vk node` and gitlab-runner |
+| reset | drain, stop anything the node's user still owns from past jobs, clear chosen caches and scratch, validate |
+| redeploy | reinstall the host (Redfish/IPMI and PXE) — only on [managed nodes](#managed-nodes) |
+
+A node without a BMC integration reports redeploy as unavailable.
+
+## Web UI
+
+Served by the hub on its own listener, server-rendered HTML with no JavaScript build
+toolchain in the release build:
+
+- **htmx** with its SSE extension, both embedded in the `vk-hub` binary. Pages subscribe to
+  server-sent events that carry HTML fragments (`event: nodes` / `data: <table …>`); actions
+  are plain form POSTs. SSE rather than WebSocket: it is ordinary HTTP, reconnects on its
+  own, and is one streamed response body on the hub's hyper server.
+- **A strict Content Security Policy** on every page: `script-src 'self'`, no inline script,
+  no `unsafe-eval`, and htmx configured with `allowEval: false`. The pages show strings nodes
+  send — hostnames, versions, error text — so the policy is what keeps an escaping mistake
+  from becoming script in an operator's session that can drain or redeploy machines.
+- **Not Datastar.** It compiles every `data-*` expression with `Function(...)`, so it runs
+  only under `'unsafe-eval'`; a spike under the policy above rendered nothing.
+
+In order of priority:
+
+1. **nodes** — state, capacity (local estimate, hub ceiling, effective), pressure, admission
+   waits, versions, configuration drift; desired, observed and unknown shown distinctly;
+2. **node detail** — inventory, effective configuration, recent jobs linked to GitLab,
+   atop timelines and egress reports;
+3. **operations** — drain, reset, rollouts and their progress;
+4. **audit** — every operator action and every command's outcome.
+
+Metrics for capacity, admission waits and node states are exported for Prometheus.
+
+## Local mode
+
+Not built yet. `vk-hub local` runs the hub for the one machine it is started on, for a person
+watching and controlling their own VMs — the role virt-manager plays for libvirt:
+
+- no enrollment and no node session: it runs as the user who owns the VMs and reads the
+  [workloads](#workloads) sources directly;
+- the same UI and the same security properties, on loopback, opened in the browser with a
+  sign-in link the way Jupyter does;
+- a state dir of its own under the user's XDG state home, so it never shares a database with
+  a fleet hub.
+
+Its actions run the existing commands as subprocesses rather than reimplementing them:
+
+- dev environments: stop, start again (`vk dev up` in the workspace), clean up stale ones
+  (`vk dev gc`);
+- pinned runs: stop, reboot;
+- every VM: the console log tail, the atop timeline, the egress report;
+- dev environments: an "open in VS Code" link through the SSH alias `vk dev` already
+  configures (`vscode://vscode-remote/ssh-remote+<alias>/<path>`).
+
+A shell in the browser needs a terminal emulator (xterm.js, vendored like htmx) over a
+WebSocket to the VM's exec socket; it fits the CSP and is left for later.
+
+The cookie problem is sharper here than on a fleet hub: a developer's machine serves many
+things on loopback, including the ports `vk dev` itself forwards, and cookies are not
+isolated by port. The local UI is therefore served under a name of its own,
+`vk-<random>.localhost`, so its session cookie is host-scoped to that name and is not sent to
+`localhost` or `127.0.0.1` on any other port. Chromium 153 and Firefox 156 both resolve
+`*.localhost` to loopback and keep a cookie set by `vk-<random>.localhost` (SameSite Lax or
+Strict) off `localhost`, `127.0.0.1` and other `*.localhost` names on every port. It still
+reaches the same name on other ports, which is why the name is random.
+
+## Security
+
+- Nodes accept typed operations only, never a shell command, each checked against the
+  operations local policy allows.
+- Node identities are pinned keys, rotated and revoked from the hub; enrollment tokens are
+  short-lived and single-use.
+- Runner authentication tokens stay on their nodes. The hub's GitLab credential is a separate
+  one, scoped to managing runners (pause, resume, list).
+- Hub roles: viewer; operator (ceilings, drain, reset, rollouts); admin (enrollment,
+  redeploy). BMC credentials are held apart and used only by redeploys.
+- The web UI and the node endpoint are separate listeners with separate authentication.
+- The hub runs on its own host; its database and secrets are backed up, and a restored hub
+  reconciles against the nodes before it sends anything.
+
+## Phase 2: generic jobs and docker-executor VMs
+
+Both need one thing phase 1 does not: **reservations** — the hub asking a node to set a
+resource envelope aside, the node deciding through its admission ledger and answering yes or
+no, and the envelope handed over to the workload's own ledger entry when it starts. All
+workload types on a node — CI job VMs, their services, image builds, generic jobs, docker
+VMs — must be in that one ledger before they share a node.
+
+### Generic jobs
+
+The hub owns their queue, so it can place each one exactly:
+
+```
+Job {
+  kind: vm | compose,
+  image: registry digest,
+  resources: { mem, cpus, disk, numa? },
+  inputs: registry blobs,
+  egress: policy,
+  command | compose file,
+  timeout, retry policy,
+  outputs: log stream, exit status, artifacts to the registry, atop timeline
+}
+```
+
+Placement filters on labels and capabilities, scores on headroom and locality, then takes a
+reservation on the chosen node. A compose group runs whole on one node. Inputs are packaged
+explicitly; nothing refers to a submitter's local paths. A job whose node disconnects is not
+rerun until its first run is known to be over, and only under a retry policy that says its
+side effects can repeat.
+
+### Authentication for submitted jobs
+
+Three kinds of principal submit jobs; nodes never do — a node's key authenticates its session
+and nothing else.
+
+| Principal | Credential | Client side |
+|---|---|---|
+| a person | OIDC login on the hub, exchanged for a short-lived hub session token | `vk hub login https://hub` — the OAuth device flow, so it works over SSH; the token is kept `0600` under `~/.config/virtkit/` |
+| a GitLab CI job | the job's `id_tokens:` JWT with the hub as `aud`, verified against GitLab's JWKS | declared in `.gitlab-ci.yml`, read by `vk submit` from the job's environment; nothing is stored |
+| other automation | a scoped API key: hashed at rest, expiring, revocable | `token_file` in the config, as the registry client does |
+
+CI jobs are the main case: the ID token gives the hub the job's project, ref, whether the ref
+is protected, and the pipeline source, with no secret for anyone to create or rotate.
+
+The hub and `vk-registry` share one identity layer — the registry's accounts machinery, used
+by both — so a person has one login and an API key is issued in one place.
+
+Policy on the hub maps a principal (a user, a group, an API key, or a GitLab project and ref)
+to:
+
+- **pools** — the execution classes and nodes it may use; work from a protected ref gets
+  protected pools, and a job cannot name one its principal is not allowed;
+- **limits** — the largest job, and how many may run at once;
+- **egress** — the widest policy its jobs may have; a job can narrow it, never widen it;
+- **secrets** — a job carries references only; the hub resolves them from a store scoped to
+  the principal and hands them to that job's node alone.
+
+A node pulls a job's image with a short-lived registry token the hub mints for that job:
+read-only, scoped to the image's repository, and issued only if the submitter may read it.
+A node's own registry credential is never used for a submitted image, so no one runs an image
+through the fleet that they could not pull themselves. That check is as strict as the
+registry's read rules, under which every authenticated session reads every repository; they
+need per-user read scopes before it means more.
+
+A job's owner can see and cancel it; operators can see and cancel every job. Each job records
+its principal — user, key, or GitLab project, ref and pipeline — in the audit log.
+
+### Docker-executor VMs
+
+For jobs written for GitLab's docker executor — `image:`, `services:`, docker-in-docker —
+a node boots a disposable microVM carrying dockerd and gitlab-runner, which runs
+`run-single --max-builds 1`, takes one job, and is destroyed after it. The VM's envelope is
+reserved before its runner starts asking for work. The microVM is the isolation boundary, so
+privileged containers are acceptable. A dind job needs no nested KVM; the existing `nested`
+option is only for jobs that boot VMs themselves.
+
+The runner token is the problem: a privileged job inside the VM can read it from the
+runner's memory and use it to take further jobs. A runner registered per VM through the
+GitLab API and deleted afterwards narrows that window without closing it. Closing it takes
+the hub as a proxy for the runner API:
+
+- the VM's runner points at the hub and authenticates with a hub-issued credential valid for
+  one job request;
+- on `POST /api/v4/jobs/request` the hub substitutes the real runner token, carried in the
+  JSON `token` field and the `RUNNER-TOKEN` header;
+- job updates, traces and artifacts carry the per-job token and are forwarded as streams;
+  Git, cache and object-storage traffic goes direct.
+
+That proxy is the only piece of central job handling phase 2 needs, and it is scoped to
+docker VMs.
+
+Before building either, prototype the VM itself end to end: guest startup, cgroup
+delegation, docker storage, DNS and MTU, services, dind, cancellation, artifact upload.
+dockerd's `registry-mirrors` covers Docker Hub only; other registries need their own
+pull-through endpoints.
+
+## Phase 3: central GitLab acquisition, if needed
+
+Phase 1 is measured for what local acquisition leaves on the table: admission-wait
+percentiles, eligible capacity idle while jobs wait, checkout and image cache misses, storage
+saturation, pipeline duration. Central acquisition is built only if those show coarse
+capacity control is materially inadequate.
+
+Two shapes remain candidates:
+
+- **a central stock gitlab-runner with a remote custom executor** — the hub runs
+  gitlab-runner, and each stage runs on a node chosen at `prepare`. The executor already
+  reads each stage's script and streams it into the guest, which is the seam; the remote
+  version needs durable stage identity, resumable ordered output, cancellation, exit-code
+  fidelity and cleanup.
+- **the runner-API proxy of phase 2, extended to every job** — slots on the nodes run
+  `run-single` against the hub.
+
+Either way, GitLab assigns a job when it is requested, not when it starts, so central
+acquisition must request jobs only against capacity already reserved on nodes, and bound the
+jobs acquired but not yet placed. Parallel `run-single` processes all get
+`CI_CONCURRENT_ID=0`, and host checkouts are keyed by it, so each slot needs its own
+identity passed to the executor.
+
+Phase 1 keeps both open by giving workloads IDs of their own rather than GitLab's, keeping
+node-local policy authoritative, versioning the protocol, and keeping GitLab specifics in an
+adapter apart from the fleet core.
+
+## Managed nodes
+
+For hosts the hub owns end to end, a node OS image is available, never required:
+
+- built with `vk build --disk`: a minimal system with a kernel, KVM, a `vk` user and
+  `vk node`;
+- installed by PXE — the hub serves iPXE, the installer kernel and initramfs, and the disk
+  image, the payload `vk export iso` packages for USB installs. The image carries no token:
+  the hub issues a single-use enrollment token per machine at install time;
+- redeployed over Redfish or IPMI: drain, one-time PXE boot, power-cycle, install, re-enroll.
+
+## Prototype first
+
+1. **Acquisition and drain races** — burst submissions against long polls, concurrency cuts,
+   API pause, `SIGQUIT`, runner restarts, hub partitions. Measure jobs accepted but waiting on
+   admission, and show that `drained` is only reported when nothing is left.
+2. **The slow-disk, large-RAM host under real mixed load** — checkout RAM, image builds, disk
+   latency, inode pressure, DAX. Admission does not count image-build guests today, and disk
+   admission predicts bytes without tracking inodes.
+3. **Update recovery** — a crash during download or switch, a failed validation, rollback, a
+   reconnect carrying stale commands.
+4. **Accounting completeness** before phase 2: every workload type in the one ledger.
+
+## Phasing
+
+1. `vk node` and the hub: enrollment, inventory, the capacity controller with hub ceilings
+   and stop-acquisition, node states and drain, signed rollouts, resets, the web UI, the
+   workloads each node reports. Nodes keep their local gitlab-runners. Local mode comes first,
+   its web UI the core the fleet's is built on.
+2. Reservations; generic jobs with central placement; docker-executor VMs behind the runner-API
+   proxy.
+3. Central GitLab acquisition, only if phase 1's measurements call for it.
+4. Managed nodes: the OS image, PXE, Redfish — whenever a host is to be managed end to end.
