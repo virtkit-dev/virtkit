@@ -193,12 +193,14 @@ impl JobCtx {
 
     /// The host directory this job's sources are checked out into, keyed by the runner's
     /// concurrent slot + project so sequential jobs reuse it (a fetch, not a re-clone) while
-    /// concurrent jobs on the same runner stay isolated.
+    /// concurrent jobs on the same runner stay isolated. The project is its id and slug
+    /// ([`JobCtx::usage_project`]): the slug alone folds `a/my.proj` and `a/my-proj` into one
+    /// tree, and the next project's guest would see the last one's objects.
     pub fn host_checkout_dir(&self) -> PathBuf {
         // The slot/project key comes from sanitized env, never a job-controlled absolute path.
         self.host_checkout_root()
             .join(&self.concurrent_id)
-            .join(&self.project_slug)
+            .join(self.usage_project())
     }
 
     /// Where this host remembers what jobs used, keyed by [`JobCtx::usage_key`]. Shared by
@@ -937,7 +939,7 @@ mod tests {
         };
         assert_eq!(
             ctx(cfg).host_checkout_dir(),
-            PathBuf::from("/var/lib/vk/checkouts/0/myproj")
+            PathBuf::from("/var/lib/vk/checkouts/0/42-myproj")
         );
     }
 
@@ -955,7 +957,7 @@ mod tests {
         // The override replaces the `<state_dir>/checkouts` root; the slot/project key is unchanged.
         assert_eq!(
             ctx(cfg).host_checkout_dir(),
-            PathBuf::from("/builds/vk/0/myproj")
+            PathBuf::from("/builds/vk/0/42-myproj")
         );
     }
 }

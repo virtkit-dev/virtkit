@@ -15,6 +15,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: a `host_checkout` tree is no longer shared between projects.** Checkouts were
+  kept per folded project name, so two projects whose names folded together shared one, and
+  the second project's guest could read the first's objects. They are now kept per project
+  id, and one whose remote is another project's is re-cloned; existing checkouts are re-cloned
+  once.
 - **A pull or build no longer waits forever on an image lock another local user holds**; it
   fails, naming that user's uid, or saying the holder does not answer.
 - **Security: the build cache no longer serves a snapshot built from a different

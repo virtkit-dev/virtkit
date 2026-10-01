@@ -331,6 +331,64 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Remove `dest` before it is reused when it is a checkout of another project's remote — two
+/// projects whose slugs fold together — whose objects and refs the next job's guest would see.
+/// A fresh clone follows; called before [`claim`].
+pub(crate) fn discard_if_untrusted(dest: &Path, url: &str) -> Result<()> {
+    let s = sidecars(dest)?;
+    let reason = if dest.exists()
+        && origin_of(dest).as_deref().map(without_userinfo) != Some(without_userinfo(url))
+    {
+        "it is not a checkout of this project's remote"
+    } else {
+        return Ok(());
+    };
+    println!(
+        "virtkit: re-cloning host checkout {}: {reason}",
+        dest.display()
+    );
+    match std::fs::remove_dir_all(dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("removing {}", dest.display())),
+    }
+    retire(&s.used, &s.id);
+    Ok(())
+}
+
+/// The `origin` URL recorded in `dest`'s own `.git/config`, read as a file rather than by
+/// running `git` in the tree. `None` when `.git` is not a real directory there — a symlink or
+/// a `gitdir:` file could send the host's `git` into another repository.
+fn origin_of(dest: &Path) -> Option<String> {
+    let git_dir = dest.join(".git");
+    if !std::fs::symlink_metadata(&git_dir).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    // From `/`, so git finds no repository of its own around the process's cwd to read.
+    let out = Command::new("git")
+        .current_dir("/")
+        .args(["config", "--file"])
+        .arg(git_dir.join("config"))
+        .args(["--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `url` without its `user:token@` userinfo: the token rotates per job, the remote does not.
+fn without_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}://{host}{path}")
+}
+
 /// Clone-or-fetch `url` into the existing `dest` ([`claim`] creates it) and hard-checkout `sha`.
 /// Idempotent: a populated `dest` is fetched and re-pointed at `sha` rather than re-cloned (so a
 /// reused per-slot dir amortises the clone). `ref_name` (the branch/tag) is fetched first so a
@@ -505,6 +563,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn without_userinfo_keeps_the_remote_and_drops_the_token() {
+        assert_eq!(
+            without_userinfo("https://gitlab-ci-token:t0k@gitlab.example.com/g/p.git"),
+            "https://gitlab.example.com/g/p.git"
+        );
+        assert_eq!(
+            without_userinfo("https://gitlab.example.com/g/p.git"),
+            "https://gitlab.example.com/g/p.git"
+        );
+        // An `@` in the path is not userinfo.
+        assert_eq!(
+            without_userinfo("https://h.example/g/p@v1.git"),
+            "https://h.example/g/p@v1.git"
+        );
+    }
+
+    /// A tree of another remote is removed before reuse, and so is one whose `.git` names no
+    /// remote of ours: the host's `git` must run only in this project's checkout.
+    #[test]
+    fn an_untrusted_checkout_is_discarded_before_reuse() {
+        let root = root("untrusted");
+        let dest = root.join("0").join("42-project");
+        let _guard = acquire_use_lock(&dest).unwrap();
+        let url = "https://gitlab-ci-token:a@gitlab.example.com/g/project.git";
+        let init = |origin: &str| {
+            let _ = std::fs::remove_dir_all(&dest);
+            claim(&dest).unwrap();
+            run(
+                Command::new("git").args(["init", "--quiet"]).arg(&dest),
+                "init",
+            )
+            .unwrap();
+            git(&dest, &["remote", "add", "origin", origin], "remote add").unwrap();
+        };
+
+        // Its own remote, under another job's token: kept.
+        init("https://gitlab-ci-token:b@gitlab.example.com/g/project.git");
+        discard_if_untrusted(&dest, url).unwrap();
+        assert!(dest.join(".git").is_dir());
+
+        // Another project's remote: removed.
+        init("https://gitlab-ci-token:b@gitlab.example.com/g/other.git");
+        discard_if_untrusted(&dest, url).unwrap();
+        assert!(!dest.exists());
+
+        // A `.git` that is not a real directory names no remote of ours: removed.
+        init(url);
+        std::fs::remove_dir_all(dest.join(".git")).unwrap();
+        std::os::unix::fs::symlink("/", dest.join(".git")).unwrap();
+        discard_if_untrusted(&dest, url).unwrap();
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn redact_url_strips_the_embedded_token() {
         assert_eq!(
             redact_url("https://gitlab-ci-token:secrettoken@gitlab.example.com/g/p.git"),
@@ -672,6 +785,7 @@ mod tests {
             lock,
             used,
             id,
+            ..
         } = sidecars(&dest).unwrap();
         assert_eq!(dir, root.join(".virtkit").join("0"));
         assert_eq!(lock.parent(), Some(dir.as_path()));

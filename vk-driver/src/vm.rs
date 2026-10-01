@@ -441,6 +441,9 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         // re-clone.
         crate::checkout::gc_idle(&ctx.host_checkout_root(), cfg.checkout_cache_idle());
         println!("virtkit: host checkout of {sha} -> {}", dest.display());
+        // Another project's tree is not reused.
+        crate::checkout::discard_if_untrusted(&dest, url)
+            .with_context(|| format!("checking host checkout {}", dest.display()))?;
         // Bind the external bookkeeping to the destination before the clone fills it, so a
         // prepare killed part-way through leaves a partial tree the idle sweep can still find.
         crate::checkout::claim(&dest)
