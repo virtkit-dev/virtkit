@@ -24,6 +24,9 @@ All notable changes to virtkit will be documented in this file.
   A guest using its own kernel, which a job can supply, could previously use these names
   to read host files outside the share with the VM's host-user permissions, or write them
   through a writable share.
+- **Security: a build's stage guests get a private session directory.** It was created at a
+  predictable name in the shared temp dir and reused as found, so another local user could
+  plant it and take over the guest's exec channel and console log.
 - **Security: a VM without network (`net.mode = "none"`, the default) no longer offers
   libkrun's transparent socket impersonation (TSI).** A guest kernel with the TSI patches,
   which a job can bring, could open, connect and listen on sockets on the host, past the

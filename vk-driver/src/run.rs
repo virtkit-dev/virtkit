@@ -630,6 +630,69 @@ const LONGEST_SOCKET_NAME: &str = "vsock.sock_65535";
 /// longest socket name.
 pub(crate) const STATE_DIR_MAX: usize = SUN_PATH_MAX - 1 - LONGEST_SOCKET_NAME.len();
 
+/// A boot session's own directory under `base` (the temp dir): its guest's exec socket, its
+/// console log and, under cloud-hypervisor, its initramfs and context share socket. The name,
+/// `virtkit-session-<pid>-<stem>`, is predictable and `base` is shared with every local user,
+/// so it is created here, private (0700), and never taken as found: a directory someone else
+/// planted there would hand them the guest's exec channel, and a `console.log` symlink planted
+/// in it would point the VMM's truncating write at a file of their choosing. When the name is
+/// taken — by a planter, or by a session an earlier process with this pid left behind — a
+/// random suffix picks one no one could have planted; under cloud-hypervisor its 17 bytes come
+/// out of the socket-path budget [`check_state_dir_len`] enforces.
+/// `build::sweep_stale_sessions` reads the pid from either form.
+///
+/// The directory is removed when the returned guard drops, until [`SessionDir::keep`] hands it
+/// to the [`VmSession`] that removes it from then on: a boot that fails leaves nothing behind.
+fn private_session_dir(base: &Path, stem: &str) -> Result<SessionDir> {
+    let pid = std::process::id();
+    let mut name = format!("virtkit-session-{pid}-{stem}");
+    for _ in 0..8 {
+        let path = base.join(&name);
+        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => return Ok(SessionDir(Some(path))),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                name = format!(
+                    "virtkit-session-{pid}-{stem}-{}",
+                    crate::scratch::random_nonce().context("naming a boot session dir")?
+                );
+            }
+            Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+        }
+    }
+    bail!(
+        "could not create a private session directory under {}",
+        base.display()
+    )
+}
+
+/// A session directory [`private_session_dir`] created, removed on drop unless kept.
+struct SessionDir(Option<PathBuf>);
+
+impl SessionDir {
+    /// The path, no longer removed on drop: the caller owns the directory now.
+    fn keep(mut self) -> PathBuf {
+        self.0.take().expect("a SessionDir is kept at most once")
+    }
+}
+
+impl std::ops::Deref for SessionDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        self.0
+            .as_deref()
+            .expect("a SessionDir is not used after keep")
+    }
+}
+
+impl Drop for SessionDir {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
 /// Reject long state dirs only under cloud-hypervisor, which receives socket paths on its
 /// command line and binds and connects by name. libkrun runs in our process and uses directory
 /// descriptors ([`vk_core::unixpath`]), as our other socket callers do, without this limit.
@@ -4536,9 +4599,8 @@ pub(crate) async fn boot_session(
 ) -> Result<VmSession> {
     let t_boot = Instant::now();
     let stem = image.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
-    let work = std::env::temp_dir().join(format!("virtkit-session-{}-{stem}", std::process::id()));
+    let work = private_session_dir(&std::env::temp_dir(), stem)?;
     check_state_dir_len(&work)?;
-    std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
     // The agent boots as PID 1 from a minimal initramfs (just `/init`), then pivots into
     // the ext4 root below — so the agent is never written into the built image. With
     // libkrun it is an unlinked scratch fd: `_cpio` keeps it open until the VMM child
@@ -4787,7 +4849,7 @@ pub(crate) async fn boot_session(
         image: image.to_path_buf(),
         switch,
         virtiofsd,
-        work,
+        work: work.keep(),
         scratch_dev,
         dirty_socket,
         cancel,
@@ -6264,6 +6326,57 @@ mod tests {
         let out = std::fs::read(spec.serial_log.with_extension("vmm.log")).unwrap();
         assert_eq!(out, b"boot medium");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session directory is created private, and whatever already holds its predictable
+    /// name — a directory, or a symlink to one someone else controls — is not used.
+    #[test]
+    fn a_session_dir_is_private_and_never_one_planted_for_it() {
+        use std::os::unix::fs::MetadataExt;
+
+        let base = std::env::temp_dir().join(format!("vk-session-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let predicted = base.join(format!("virtkit-session-{}-stage", std::process::id()));
+        let private = |p: &Path| {
+            let m = std::fs::symlink_metadata(p).unwrap();
+            m.file_type().is_dir() && m.mode() & 0o777 == 0o700
+        };
+
+        // Free: created at the predicted name, 0700.
+        let made = private_session_dir(&base, "stage").unwrap().keep();
+        assert_eq!(made, predicted);
+        assert!(private(&made));
+        // Taken (here by an earlier session with this pid; a planter's dir is the same
+        // case): another name, private.
+        let again = private_session_dir(&base, "stage").unwrap().keep();
+        assert_ne!(again, predicted);
+        assert!(private(&again));
+        let name = again.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with(&format!("virtkit-session-{}-stage-", std::process::id())));
+
+        // Planted as a symlink to somewhere the planter controls: not followed.
+        std::fs::remove_dir(&predicted).unwrap();
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &predicted).unwrap();
+        let third = private_session_dir(&base, "stage").unwrap().keep();
+        assert_ne!(third, predicted);
+        assert!(private(&third));
+        assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+        let me = std::fs::metadata(&base).unwrap().uid();
+        assert_eq!(std::fs::metadata(&third).unwrap().uid(), me);
+
+        // Dropped before a session keeps it, as on a failed boot: removed.
+        let dropped = base.join(
+            private_session_dir(&base, "stage")
+                .unwrap()
+                .file_name()
+                .unwrap(),
+        );
+        assert!(!dropped.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

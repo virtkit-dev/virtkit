@@ -92,6 +92,19 @@ pub fn os_pipe() -> Result<(File, File)> {
     Ok((read, write))
 }
 
+/// 64 bits of `/dev/urandom` in hex, for a file or directory name nobody else computes or
+/// could have planted. There is no fallback: a name that is not random puts the collision it
+/// avoids straight back, so an unreadable `/dev/urandom` is an error.
+pub(crate) fn random_nonce() -> Result<String> {
+    use std::io::Read;
+
+    let mut bytes = [0u8; 8];
+    File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .context("reading /dev/urandom")?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

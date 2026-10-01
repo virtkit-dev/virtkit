@@ -613,7 +613,8 @@ pub fn build(opts: &Options) -> Result<Built> {
 /// knowing which process left one behind.
 const SCRATCH_PREFIX: &str = ".build-";
 
-/// 64 random bits in hex, for a scratch dir name.
+/// The scratch dir for a build writing to `out`, unique per run:
+/// `<prefix><pid>-<seq>-<nonce>`, the nonce from [`crate::scratch::random_nonce`].
 ///
 /// Pid and counter alone are not unique where a pid is not: a build in its own PID namespace
 /// (a container sharing the output directory) starts its counter at 0 like everybody else, so
@@ -622,20 +623,6 @@ const SCRATCH_PREFIX: &str = ".build-";
 /// hosts sharing an output directory over a network filesystem collide the same way, which no
 /// namespace-derived identifier would fix either.
 ///
-/// Unlike `ext4`'s UUID this is not a hint, so there is no falling back to a constant: that
-/// would put the collision straight back. A `/dev/urandom` that cannot be read is an error.
-fn scratch_nonce() -> Result<String> {
-    use std::io::Read;
-
-    let mut bytes = [0u8; 8];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .context("reading /dev/urandom for a unique build scratch dir name")?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// The scratch dir for a build writing to `out`, unique per run
-/// (`<prefix><pid>-<seq>-<nonce>`, see [`scratch_nonce`]).
 /// Placed next to `out` so stage ext4s land on the real filesystem the caller chose, not
 /// a small/RAM-backed tmpfs — but always made absolute: stage qcow2 overlays record their
 /// backing image by path, and qcow2 resolves a *relative* backing against the overlay's
@@ -645,7 +632,7 @@ fn build_scratch(out: &Path, seq: u64) -> Result<PathBuf> {
     let rel = out.parent().unwrap_or_else(|| Path::new(".")).join(format!(
         "{SCRATCH_PREFIX}{}-{seq}-{}",
         std::process::id(),
-        scratch_nonce()?
+        crate::scratch::random_nonce().context("naming the build scratch dir")?
     ));
     // Must be absolute (see above); the relative fallback would reintroduce the exact
     // backing-path bug, so surface the error instead of silently using it.
@@ -654,7 +641,7 @@ fn build_scratch(out: &Path, seq: u64) -> Result<PathBuf> {
 
 /// How long [`claim_scratch`] keeps retrying a scratch dir it cannot take. Contention is a
 /// sweep removing the dir we just created — no other build computes this name (see
-/// [`scratch_nonce`]) — which resolves as soon as that removal finishes. But a scratch dir
+/// [`build_scratch`]) — which resolves as soon as that removal finishes. But a scratch dir
 /// holds whole stage images, so "as soon as" is not instant and a tight spin would fail a
 /// build that only had to wait. Long enough to outlast any real removal, short enough that a
 /// dir stuck locked is reported rather than waited on forever.
@@ -3510,8 +3497,8 @@ fn sweep_stale_scratch(dir: &Path, prefix: &str) {
 }
 
 /// Name prefix of a stage guest's session dir: `run::boot_session` creates
-/// `$TMPDIR/virtkit-session-<pid>-<stem>` for the guest's sockets and logs, and removes it
-/// when the session ends.
+/// `$TMPDIR/virtkit-session-<pid>-<stem>[-<nonce>]` for the guest's sockets and logs,
+/// and removes it when the session ends.
 const SESSION_PREFIX: &str = "virtkit-session-";
 
 /// Remove session dirs in `dir` left by builds that died before their stage guests could
