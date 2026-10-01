@@ -22,6 +22,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: a `vk-registry` relay no longer sends an upstream's password in clear.** An
+  upstream with a password must be `https://` (or loopback), and a token realm the upstream
+  names gets its credentials only over HTTPS.
 - **Security: `vk-registry` refuses a write a browser makes on another site's behalf** to
   `/v2/`, `/lock/` or WebDAV, whether the browser holds a session, Basic credentials or, on
   an open server, nothing.

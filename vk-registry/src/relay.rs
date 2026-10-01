@@ -301,6 +301,14 @@ async fn authed(
         .with_context(|| format!("{method} {url} (authenticated)"))
 }
 
+/// Whether the upstream's credentials may go to `realm`. The realm is the upstream's to
+/// name, and following it to another host is how registry token auth works; sending the
+/// password there in clear is not, whoever named it. A loopback realm is the one exception,
+/// as it is for the upstream itself.
+fn realm_may_receive_creds(realm: &str, has_creds: bool) -> bool {
+    !has_creds || realm.starts_with("https://") || crate::config::is_local_url(realm)
+}
+
 /// Fetch a bearer token for a `Bearer realm="…",service="…",scope="…"` challenge.
 /// Returns `None` for a non-Bearer scheme or a token endpoint that declines.
 async fn obtain_token(u: &Upstream, challenge: &str) -> Result<Option<String>> {
@@ -323,6 +331,10 @@ async fn obtain_token(u: &Upstream, challenge: &str) -> Result<Option<String>> {
     let Some(realm) = realm else {
         return Ok(None);
     };
+    let has_creds = u.username.is_some() && u.password.is_some();
+    if !realm_may_receive_creds(&realm, has_creds) {
+        bail!("refusing to send upstream credentials to the non-HTTPS token realm {realm}");
+    }
     let mut req = u.client.get(&realm).query(&params);
     if let (Some(user), Some(pass)) = (&u.username, &u.password) {
         req = req.basic_auth(user, Some(pass));
@@ -353,6 +365,14 @@ fn manifest_head_response(digest: &str, ctype: &str) -> Result<Response<Body>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_go_only_to_an_https_or_loopback_realm() {
+        assert!(realm_may_receive_creds("https://auth.example/token", true));
+        assert!(realm_may_receive_creds("http://127.0.0.1:5001/token", true));
+        assert!(!realm_may_receive_creds("http://auth.example/token", true));
+        assert!(realm_may_receive_creds("http://auth.example/token", false));
+    }
 
     /// Asking upstream for a type we would then relabel is the one drift between these two
     /// lists that nothing else would catch: the request succeeds, and every response of that

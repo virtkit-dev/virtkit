@@ -690,6 +690,15 @@ impl UpstreamSpec {
             ),
             None => None,
         };
+        // The password goes to the token realm and the token it buys to the upstream:
+        // neither in clear past loopback.
+        if password.is_some() && !self.url.starts_with("https://") && !is_local_url(&self.url) {
+            bail!(
+                "upstream {}: refusing to send its password over plain HTTP; use https:// \
+                 (with ca_file for a private CA)",
+                self.url
+            );
+        }
         Ok(Upstream {
             prefix: self.prefix,
             base: self.url,
@@ -767,6 +776,29 @@ fn load_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A relay never sends an upstream's password in clear past loopback.
+    #[test]
+    fn an_upstream_password_needs_https_off_loopback() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("vk-upstream-pw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pw = dir.join("pw");
+        std::fs::write(&pw, "s3cret\n").unwrap();
+        let spec = |url: &str, password: bool| UpstreamSpec {
+            prefix: String::new(),
+            url: url.to_string(),
+            username: password.then(|| "robot".to_string()),
+            password_file: password.then(|| pw.clone()),
+            ca_file: None,
+        };
+        assert!(spec("http://registry.example", true).build().is_err());
+        assert!(spec("https://registry.example", true).build().is_ok());
+        assert!(spec("http://127.0.0.1:5000", true).build().is_ok());
+        assert!(spec("http://registry.example", false).build().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// What a config file states, for a unit built around it: the address and store it
     /// names, and whether it turns TLS on. `None` where it says nothing, which is the part
