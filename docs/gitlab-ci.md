@@ -388,7 +388,7 @@ virtkit: 42137-acme-web-test_unit — what its guest did:
   what ran — the 10 of 61 that used the most cpu
   command                                   pid   cpu  peak rss    read  written
   cc1plus ×1184 (2 failed)                    -  6m12s   184 MiB   1 GiB   96 MiB
-  /init tsi_hijack                            1  0.3s     11 MiB   2 MiB   20 KiB
+  /init                                       1  0.3s     11 MiB   2 MiB   20 KiB
   …
 ```
 
@@ -442,7 +442,7 @@ net   eth0 in 0 B/s out 42 B/s   0 tcp connections, 0 resent
     pid  st      >cpu     memory       disk  command
      65   S      0.1s      1 MiB      8 KiB  sh
     700   E      0.0s    512 KiB      1 KiB  true
-      1   S      0.0s     11 MiB        0 B  /init tsi_hijack
+      1   S      0.0s     11 MiB        0 B  /init
 …
 ←/→ step  home/end jump  c/m/d sort by cpu  a whole job  / filter  q quit
 ```
