@@ -15,6 +15,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: a guest can no longer reach the host's loopback or link-local addresses**,
+  such as services bound to `127.0.0.1` or a cloud's metadata endpoint at `169.254.169.254`.
+  Only a plain TCP SYN was refused there: under the default open egress policy, or through
+  an allowed name resolving there, a SYN with ACK set or any UDP datagram was dialled on the
+  host.
 - **`vk-registry` no longer lets a client hold a connection open without sending a
   request.** Request headers must arrive within 30 seconds, which also closes a kept-alive
   connection idle that long, a TLS handshake must finish within 10, and at most 1024
