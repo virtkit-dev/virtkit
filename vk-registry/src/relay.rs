@@ -41,6 +41,15 @@ application/vnd.docker.distribution.manifest.v2+json,\
 application/vnd.oci.image.index.v1+json,\
 application/vnd.docker.distribution.manifest.list.v2+json";
 
+/// Total deadline for an upstream manifest or token request, body included. The client's
+/// read timeout restarts on every read, so alone it lets an upstream trickling a byte at a
+/// time hold the request indefinitely. Blobs get no total deadline: a large layer may
+/// legitimately take longer.
+const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Largest token response read from a token realm.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 64 << 10;
+
 /// A configured upstream registry this server mirrors.
 pub struct Upstream {
     /// repo-name prefix selecting this upstream (`""` = catch-all)
@@ -91,7 +100,7 @@ pub async fn get_blob(
     };
     let url = format!("{}/v2/{repo}/blobs/{digest}", u.base);
 
-    let resp = match authed(u, RMethod::GET, &url, None).await {
+    let resp = match authed(u, RMethod::GET, &url, None, None).await {
         Ok(resp) => resp,
         Err(e) => return refusal_response(e),
     };
@@ -202,7 +211,15 @@ pub async fn get_manifest(
     };
     let url = format!("{}/v2/{repo}/manifests/{reference}", u.base);
     let method = if head { RMethod::HEAD } else { RMethod::GET };
-    let resp = match authed(u, method, &url, Some(MANIFEST_ACCEPT)).await {
+    let resp = match authed(
+        u,
+        method,
+        &url,
+        Some(MANIFEST_ACCEPT),
+        Some(UPSTREAM_REQUEST_TIMEOUT),
+    )
+    .await
+    {
         Ok(resp) => resp,
         Err(e) => return refusal_response(e),
     };
@@ -234,10 +251,19 @@ pub async fn get_manifest(
         return manifest_head_response(&digest, &ctype);
     }
 
-    let body = resp
-        .bytes()
-        .await
-        .context("reading the upstream manifest")?;
+    // Bounded as a pushed manifest is: the upstream chooses how much it sends.
+    let body = match read_capped(resp, crate::MAX_MANIFEST_BYTES).await {
+        Ok(body) => body,
+        Err(e) if e.is::<OverCap>() => {
+            eprintln!("vk-registry: reading the upstream manifest {url}: {e:#}");
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                "MANIFEST_INVALID",
+                "the upstream manifest is too large",
+            ));
+        }
+        Err(e) => return Err(e.context("reading the upstream manifest")),
+    };
 
     if reference.starts_with("sha256:") {
         // Check before the store rejects a non-object body so the error is attributed
@@ -269,21 +295,26 @@ pub async fn get_manifest(
         .header(hyper::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(hyper::header::CONTENT_TYPE, &ctype)
         .header(hyper::header::CONTENT_LENGTH, body.len().to_string())
-        .body(body_of(Bytes::from(body.to_vec())))
+        .body(body_of(body))
         .map_err(Into::into)
 }
 
 /// Issue a request, transparently doing the Docker bearer-token dance on a 401: parse
 /// the `WWW-Authenticate` challenge, fetch a token from its realm (with this upstream's
-/// Basic credentials, if any), and retry once with the bearer token.
+/// Basic credentials, if any), and retry once with the bearer token. A `deadline` bounds
+/// each attempt, its body included.
 async fn authed(
     u: &Upstream,
     method: RMethod,
     url: &str,
     accept: Option<&str>,
+    deadline: Option<std::time::Duration>,
 ) -> Result<reqwest::Response> {
     let build = |bearer: Option<&str>| {
         let mut r = u.client.request(method.clone(), url);
+        if let Some(d) = deadline {
+            r = r.timeout(d);
+        }
         if let Some(a) = accept {
             r = r.header(reqwest::header::ACCEPT, a);
         }
@@ -314,6 +345,22 @@ async fn authed(
         .send()
         .await
         .with_context(|| format!("{method} {url} (authenticated)"))
+}
+
+/// Read `resp`'s body, returning [`OverCap`] if it exceeds `cap` bytes
+/// without buffering the whole oversized body.
+async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Bytes> {
+    if resp.content_length().is_some_and(|n| n > cap as u64) {
+        return Err(OverCap(cap).into());
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len().saturating_add(chunk.len()) > cap {
+            return Err(OverCap(cap).into());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
 }
 
 /// Credentials require HTTPS or loopback. Registry token auth allows the upstream to
@@ -350,7 +397,11 @@ async fn obtain_token(u: &Upstream, challenge: &str) -> Result<Option<String>> {
     if !realm_may_receive_creds(&realm, has_creds) {
         return Err(RealmRefused(realm).into());
     }
-    let mut req = u.client.get(&realm).query(&params);
+    let mut req = u
+        .client
+        .get(&realm)
+        .query(&params)
+        .timeout(UPSTREAM_REQUEST_TIMEOUT);
     if let (Some(user), Some(pass)) = (&u.username, &u.password) {
         req = req.basic_auth(user, Some(pass));
     }
@@ -363,7 +414,10 @@ async fn obtain_token(u: &Upstream, challenge: &str) -> Result<Option<String>> {
         token: Option<String>,
         access_token: Option<String>,
     }
-    let t: Tok = resp.json().await.context("parsing the token response")?;
+    let body = read_capped(resp, MAX_TOKEN_RESPONSE_BYTES)
+        .await
+        .context("reading the token response")?;
+    let t: Tok = serde_json::from_slice(&body).context("parsing the token response")?;
     Ok(t.token.or(t.access_token))
 }
 
@@ -384,9 +438,30 @@ impl std::fmt::Display for RealmRefused {
 
 impl std::error::Error for RealmRefused {}
 
-/// Log [`RealmRefused`] and return 502; no error propagates for the server to log.
-/// Propagate other errors.
+/// An upstream response body over its cap: an upstream error (502), not an internal
+/// server error (500).
+#[derive(Debug)]
+struct OverCap(usize);
+
+impl std::fmt::Display for OverCap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the response body is over the {}-byte cap", self.0)
+    }
+}
+
+impl std::error::Error for OverCap {}
+
+/// Log [`RealmRefused`] or an oversized token response ([`OverCap`]) and return 502; no
+/// error propagates for the server to log. Propagate other errors.
 fn refusal_response(e: anyhow::Error) -> Result<Response<Body>> {
+    if e.is::<OverCap>() {
+        eprintln!("vk-registry: {e:#}");
+        return Ok(error_response(
+            StatusCode::BAD_GATEWAY,
+            "UNKNOWN",
+            "the upstream's token response is too large",
+        ));
+    }
     if e.is::<RealmRefused>() {
         eprintln!("vk-registry: {e:#}");
         return Ok(error_response(

@@ -28,6 +28,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- A pull-through `vk-registry` gives up on an upstream that stops responding (10 s to
+  connect, 60 s for a manifest or token request, 60 s without data for a blob) and refuses
+  an upstream manifest over 4 MiB, the limit a pushed manifest already has, or a token
+  response over 64 KiB.
 - **Security: `vk-registry` rejects browser writes from another site** to `/v2/`,
   `/lock/` or WebDAV, with session or Basic credentials or without credentials on an
   open server.

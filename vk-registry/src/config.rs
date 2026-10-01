@@ -686,6 +686,11 @@ impl ServerConfig {
     }
 }
 
+/// How long a relay waits to connect to an upstream.
+const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a relay waits for the next bytes of an upstream response.
+const UPSTREAM_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl UpstreamSpec {
     fn build(self) -> Result<Upstream> {
         let mut b = reqwest::Client::builder();
@@ -695,7 +700,13 @@ impl UpstreamSpec {
                 reqwest::Certificate::from_pem(&pem).context("parsing an upstream CA")?,
             );
         }
-        let client = b.build().context("building an upstream HTTP client")?;
+        // The read timeout restarts on every read, so a slow but moving blob transfer is not
+        // cut off; manifest and token requests also get a total deadline (see `relay`).
+        let client = b
+            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+            .read_timeout(UPSTREAM_READ_TIMEOUT)
+            .build()
+            .context("building an upstream HTTP client")?;
         let password = match &self.password_file {
             Some(p) => Some(
                 std::fs::read_to_string(p)

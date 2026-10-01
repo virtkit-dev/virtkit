@@ -1370,6 +1370,109 @@ async fn a_relayed_manifest_that_is_not_a_json_object_is_not_cached() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A relayed manifest is held to the 4 MiB a pushed one is (`MAX_MANIFEST_BYTES`): one byte
+/// over is neither cached nor served, though it is otherwise a valid JSON object, and the
+/// error is attributed to the upstream (502).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relayed_manifest_over_the_cap_is_not_cached() {
+    const MAX_MANIFEST_BYTES: usize = 4 << 20;
+    let mut manifest = br#"{"schemaVersion":2}"#.to_vec();
+    manifest.resize(MAX_MANIFEST_BYTES + 1, b' ');
+    let hex: String = <sha2::Sha256 as sha2::Digest>::digest(&manifest)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mdigest = format!("sha256:{hex}");
+    let up_addr = fixed_upstream(MANIFEST_TYPE, manifest);
+
+    let dir = tmp("relay-overcap");
+    let mirror = mirror_of(up_addr, &dir);
+    let store = mirror.store.clone();
+    let url = spawn(mirror);
+
+    let r = reqwest::Client::new()
+        .get(format!("{url}/v2/app/manifests/{mdigest}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let err: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(err["errors"][0]["code"], "MANIFEST_INVALID");
+    assert!(
+        store.get_manifest("app", &mdigest).unwrap().is_none(),
+        "a manifest over the cap must not be cached"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A token realm is the upstream's to name, and its response is read whole to parse it, so
+/// it is capped (64 KiB); one over the cap is the upstream's fault (502), not this
+/// server's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversized_token_response_is_an_upstream_error() {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use hyper::body::Incoming;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use hyper_util::rt::TokioIo;
+
+    // Every `/v2/` request is challenged with a realm on the same upstream, whose token
+    // response is one byte over the cap.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let up_addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let l = tokio::net::TcpListener::from_std(listener).unwrap();
+            loop {
+                let Ok((stream, _)) = l.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<Incoming>| async move {
+                        let resp = if req.uri().path() == "/token" {
+                            let mut token = br#"{"token":"t"}"#.to_vec();
+                            token.resize((64 << 10) + 1, b' ');
+                            Response::builder()
+                                .header("content-type", "application/json")
+                                .body(Full::new(Bytes::from(token)))
+                        } else {
+                            Response::builder()
+                                .status(401)
+                                .header(
+                                    "www-authenticate",
+                                    format!(r#"Bearer realm="http://{up_addr}/token""#),
+                                )
+                                .body(Full::new(Bytes::new()))
+                        };
+                        Ok::<_, std::convert::Infallible>(resp.unwrap())
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+    });
+
+    let dir = tmp("relay-bigtoken");
+    let url = spawn(mirror_of(up_addr, &dir));
+    let r = reqwest::Client::new()
+        .get(format!("{url}/v2/app/manifests/latest"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_GATEWAY);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A blob `HEAD` is a pusher's dedup probe: the client reads a 200 as "already stored
 /// here, skip the upload". Relaying it answers for the upstream instead, so the client
 /// skips an upload this registry never received and the manifest naming the blob is then
