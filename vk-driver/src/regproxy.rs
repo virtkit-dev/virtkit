@@ -147,6 +147,28 @@ async fn handle(
     }))
 }
 
+/// The upstream URL a guest's request target names, or `None` when, once resolved, it is not
+/// under the upstream's own `/v2/`. Checked after resolving, not on the text: the URL parser
+/// resolves `..` and its percent-encoded spellings (`%2e%2e`), so `/v2/../lock/acquire` starts
+/// with `/v2/` and still reaches `/lock/acquire`, carrying the credential.
+fn upstream_url(upstream: &str, path_and_query: &str) -> Option<reqwest::Url> {
+    if !path_and_query.starts_with("/v2/") {
+        return None;
+    }
+    // An encoded separator stays encoded through the parser, so `/v2/..%2Flock` passes the
+    // check below — and reaches `/lock` through any front proxy that decodes before it
+    // normalizes. No repository or reference has one, so the path may not carry it.
+    let path = path_and_query.split('?').next().unwrap_or_default();
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("%2f") || lower.contains("%5c") || path.contains('\\') {
+        return None;
+    }
+    let base = reqwest::Url::parse(upstream).ok()?;
+    let url = reqwest::Url::parse(&format!("{upstream}{path_and_query}")).ok()?;
+    let api = format!("{}/v2/", base.path().trim_end_matches('/'));
+    (url.origin() == base.origin() && url.path().starts_with(&api)).then_some(url)
+}
+
 /// Headers that must not be copied across the proxy (connection-scoped, credential-bearing,
 /// or ones we set ourselves).
 fn is_skipped(name: &str) -> bool {
@@ -173,7 +195,7 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     // OCI distribution API surface (`/v2/…`). A guest-chosen path outside it — a foreign
     // authority smuggled via `//host`, or the `/lock/` control plane — is refused rather
     // than authenticated on the guest's behalf.
-    if !path_and_query.starts_with("/v2/") {
+    let Some(url) = upstream_url(&cfg.upstream, &path_and_query) else {
         let body = Full::new(Bytes::from_static(
             b"registry proxy: only /v2/ registry paths are proxied",
         ))
@@ -182,13 +204,12 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
         return Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
             .body(body)?);
-    }
-    let url = format!("{}{path_and_query}", cfg.upstream);
+    };
     let method = req.method().clone();
     let bodyful = matches!(method, Method::POST | Method::PUT | Method::PATCH);
     let (parts, incoming) = req.into_parts();
 
-    let mut rb = cfg.client.request(method, &url);
+    let mut rb = cfg.client.request(method, url);
     for (k, v) in parts.headers.iter() {
         if !is_skipped(&k.as_str().to_ascii_lowercase()) {
             rb = rb.header(k, v);
@@ -377,6 +398,77 @@ mod tests {
             seen.lock().unwrap().0,
             "",
             "a non-/v2/ request must not be forwarded upstream"
+        );
+    }
+
+    #[test]
+    fn a_target_is_checked_once_resolved() {
+        let up = "http://reg.example:5000";
+        let ok = |t: &str| upstream_url(up, t).map(|u| u.to_string());
+        assert_eq!(
+            ok("/v2/app/manifests/latest").as_deref(),
+            Some("http://reg.example:5000/v2/app/manifests/latest")
+        );
+        for escape in [
+            "/v2/../lock/acquire?name=x",
+            "/v2/%2e%2e/lock/acquire",
+            "/v2/.%2E/lock/acquire",
+            "/v2/a/../../lock/release",
+            "/v2/..%2Flock/acquire",
+            "/v2/..%2flock/acquire",
+            "/v2/..%5Clock/acquire",
+            "/v2/..\\lock/acquire",
+            "//evil.example/v2/x",
+            "/lock/acquire",
+        ] {
+            assert_eq!(ok(escape), None, "{escape}");
+        }
+        // An upstream mounted under a prefix keeps the guest beneath that prefix's /v2/.
+        let prefixed = |t: &str| upstream_url("https://h.example/reg", t);
+        assert!(prefixed("/v2/app/tags/list").is_some());
+        assert!(prefixed("/v2/../admin").is_none());
+    }
+
+    /// The traversal reaches the proxy as a raw request target, as a guest sends it: no
+    /// client normalizes it first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refuses_a_target_that_resolves_outside_v2() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let cfg = ProxyCfg {
+            upstream: format!("http://{up_addr}"),
+            creds: Creds {
+                username: Some("robot".to_string()),
+                password: Some("s3cret".to_string()),
+                ..Creds::anonymous()
+            },
+            client: reqwest::Client::new(),
+        };
+        let proxy = spawn_blocking(cfg).unwrap();
+        for target in [
+            "/v2/../lock/acquire?name=x",
+            "/v2/%2e%2e/lock/acquire?name=x",
+        ] {
+            let mut conn = tokio::net::TcpStream::connect(proxy).await.unwrap();
+            conn.write_all(
+                format!("GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut reply = Vec::new();
+            conn.read_to_end(&mut reply).await.unwrap();
+            assert!(
+                reply.starts_with(b"HTTP/1.1 403"),
+                "{target}: {:?}",
+                String::from_utf8_lossy(&reply)
+            );
+        }
+        assert_eq!(
+            seen.lock().unwrap().0,
+            "",
+            "a target resolving outside /v2/ must not be forwarded upstream"
         );
     }
 }
