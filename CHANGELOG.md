@@ -15,6 +15,8 @@ All notable changes to virtkit will be documented in this file.
   or revoking an API key, setting a caption or uploading a file writes a
   `vk-registry: accounts web:` line naming the session's identity, as the admin socket's
   `accounts admin:` lines name its peer.
+- The guest kernel no longer lets unprivileged processes use eBPF; root can turn it back on
+  with `sysctl kernel.unprivileged_bpf_disabled=0`.
 - `vk-registry` warns at startup when it serves without authentication on an address other
   than loopback.
 - `vk tune`'s report line names the estimate and the ceiling ahead of the figures behind them.

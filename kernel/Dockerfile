@@ -3,7 +3,7 @@
 # + ext4 + virtio-fs/FUSE + IP autoconfig, all built in, CONFIG_MODULES off) + virtkit's
 # removals overlay (kernel-removals.config — drops options virtkit never uses:
 # Mellanox/VFIO/SGX/NVDIMM-pmem/CIFS/9p/XFS/SCSI/FIPS, debug, exotic netfilter, CPU-freq/
-# thermal/NUMA, and WireGuard/IPsec/VXLAN/tunnels — networking is host-side via the
+# thermal/NUMA, unprivileged eBPF, and WireGuard/IPsec/VXLAN/tunnels — networking is host-side via the
 # switch, and jobs needing those ship their own per-bundle kernel). The result is the
 # pinned vmlinux a generic guest boots — no per-image kernel, initrd or modules.
 #
@@ -95,7 +95,8 @@ RUN export ARCH=x86_64 \
                   CONFIG_KVM CONFIG_KVM_INTEL CONFIG_KVM_AMD CONFIG_KVM_IOAPIC \
                   CONFIG_ACPI CONFIG_ACPI_BUTTON CONFIG_INPUT_EVDEV \
                   CONFIG_DUMMY CONFIG_IPV6 CONFIG_WIREGUARD \
-                  CONFIG_DEBUG_FS CONFIG_LRU_GEN CONFIG_STACKTRACE; do \
+                  CONFIG_DEBUG_FS CONFIG_LRU_GEN CONFIG_STACKTRACE \
+                  CONFIG_BPF_UNPRIV_DEFAULT_OFF; do \
            grep -q "^${opt}=y" .config || { echo "missing ${opt}=y in .config"; exit 1; }; \
        done \
     && for opt in CONFIG_MLX5_CORE CONFIG_VFIO CONFIG_X86_SGX CONFIG_VIRTIO_PMEM \
