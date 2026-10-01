@@ -22,12 +22,12 @@
 //!   uploads/<id>                  in-progress blob uploads (this process only)
 //!   uploads/owners/<id>           the repository that upload session was opened for
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -38,7 +38,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
@@ -2199,10 +2199,102 @@ fn scheme(tls: bool) -> &'static str {
     if tls { "https" } else { "http" }
 }
 
+/// Limits enforced before authentication. Without them, anyone who can reach the port
+/// can hold a task and a descriptor indefinitely without sending a request.
+#[derive(Clone, Copy)]
+struct ConnLimits {
+    /// For a TLS client to finish its handshake.
+    handshake: Duration,
+    /// For a request's headers to arrive whole, counted from when the connection starts
+    /// waiting for them: on connect, and again whenever a kept-alive connection goes idle.
+    headers: Duration,
+    /// Connections served at once; past it, accepting waits for one to close.
+    connections: usize,
+    /// Connections served at once from one client address; past it, a new one is closed
+    /// as soon as it is accepted, so one host cannot take every slot of `connections`.
+    /// An IPv6 client counts by its /64, the block one host is commonly given, and an
+    /// IPv4-mapped IPv6 address as the IPv4 address it maps.
+    per_peer: usize,
+}
+
+const CONN_LIMITS: ConnLimits = ConnLimits {
+    handshake: Duration::from_secs(10),
+    headers: Duration::from_secs(30),
+    connections: 1024,
+    // A quarter of the total: a busy runner host pulling many layers is not throttled.
+    per_peer: 256,
+};
+
+/// Open connections per client address (see [`peer_key`]) and whether the cap was logged
+/// since that address last fell below it.
+type PeerCounts = Arc<Mutex<HashMap<IpAddr, (usize, bool)>>>;
+
+/// The address a client's connections are counted under: its IPv4 address, or its IPv6 /64.
+fn peer_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
+        v4 => v4,
+    }
+}
+
+/// One open connection counted against its client address, uncounted on drop.
+struct PeerSlot {
+    peers: PeerCounts,
+    key: IpAddr,
+    max: usize,
+}
+
+impl PeerSlot {
+    /// Count a connection from `ip`. At `max`, return whether this is the first refusal
+    /// since the address last fell below the cap, so callers log only that refusal.
+    fn acquire(peers: &PeerCounts, ip: IpAddr, max: usize) -> Result<PeerSlot, bool> {
+        let key = peer_key(ip);
+        let mut map = peers.lock().unwrap_or_else(|e| e.into_inner());
+        let (open, warned) = map.entry(key).or_insert((0, false));
+        if *open >= max {
+            let first = !*warned;
+            *warned = true;
+            if *open == 0 {
+                map.remove(&key);
+            }
+            return Err(first);
+        }
+        *open += 1;
+        Ok(PeerSlot {
+            peers: peers.clone(),
+            key,
+            max,
+        })
+    }
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut map = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((open, warned)) = map.get_mut(&self.key) {
+            *open = open.saturating_sub(1);
+            if *open < self.max {
+                *warned = false;
+            }
+            if *open == 0 {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// Serve on an already-bound listener (so the caller can pick an ephemeral port and
 /// learn it first). The store is content-addressed and written atomically, so several
 /// servers may serve the same `root` concurrently.
 pub async fn serve_on(listener: TcpListener, state: Arc<ServerState>) -> Result<()> {
+    serve_limited(listener, state, CONN_LIMITS).await
+}
+
+async fn serve_limited(
+    listener: TcpListener,
+    state: Arc<ServerState>,
+    limits: ConnLimits,
+) -> Result<()> {
     if let Ok(addr) = listener.local_addr() {
         eprintln!(
             "{}",
@@ -2217,29 +2309,93 @@ pub async fn serve_on(listener: TcpListener, state: Arc<ServerState>) -> Result<
     if !state.webdav {
         eprintln!("vk-registry: WebDAV off (webdav = false): /dav/ answers 404");
     }
+    let slots = Arc::new(tokio::sync::Semaphore::new(limits.connections));
+    let peers = PeerCounts::default();
+    // Whether the cap was hit and not yet left: it is logged once per stretch at the cap.
+    let mut full = false;
     loop {
-        let (stream, _peer) = listener.accept().await.context("accept")?;
+        // Held for the connection's life: at the cap, new clients wait in the kernel's
+        // backlog rather than each costing a task here.
+        let slot = match slots.clone().try_acquire_owned() {
+            Ok(slot) => {
+                full = false;
+                slot
+            }
+            Err(_) => {
+                if !full {
+                    full = true;
+                    eprintln!(
+                        "vk-registry: {} connections open, new ones wait",
+                        limits.connections
+                    );
+                }
+                slots
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .context("connection slots")?
+            }
+        };
+        // A failed accept (out of descriptors, a client that reset before it was accepted) is
+        // that one connection's, not the server's: wait a moment and keep serving.
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                eprintln!("vk-registry: accept: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let peer_slot = match PeerSlot::acquire(&peers, peer.ip(), limits.per_peer) {
+            Ok(peer_slot) => peer_slot,
+            Err(first) => {
+                // Log once until the count falls below the cap to prevent a client from
+                // producing a log line for every rejected connection.
+                if first {
+                    eprintln!(
+                        "vk-registry: {} has {} connections open, new ones are closed",
+                        peer.ip(),
+                        limits.per_peer
+                    );
+                }
+                continue;
+            }
+        };
         let state = state.clone();
         tokio::spawn(async move {
+            let _slots = (slot, peer_slot);
             match &state.tls {
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(tls) => serve_conn(TokioIo::new(tls), state.clone()).await,
-                    Err(e) => eprintln!("vk-registry: TLS handshake error: {e}"),
-                },
-                None => serve_conn(TokioIo::new(stream), state.clone()).await,
+                Some(acceptor) => {
+                    match tokio::time::timeout(limits.handshake, acceptor.accept(stream)).await {
+                        Ok(Ok(tls)) => serve_conn(TokioIo::new(tls), state.clone(), limits).await,
+                        Ok(Err(e)) => eprintln!("vk-registry: TLS handshake error: {e}"),
+                        Err(_) => eprintln!("vk-registry: TLS handshake timed out"),
+                    }
+                }
+                None => serve_conn(TokioIo::new(stream), state.clone(), limits).await,
             }
         });
     }
 }
 
 /// Serve one HTTP/1 connection over any transport (plain TCP or TLS).
-async fn serve_conn<I>(io: I, state: Arc<ServerState>)
+async fn serve_conn<I>(io: I, state: Arc<ServerState>, limits: ConnLimits)
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
     let svc = service_fn(move |req| handle(req, state.clone()));
-    if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
-        eprintln!("vk-registry: connection error: {e}");
+    // hyper requires a timer to enforce the header read timeout.
+    match http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.headers)
+        .serve_connection(io, svc)
+        .await
+    {
+        // The header timeout also ends every kept-alive connection left idle, so logging it
+        // would log every pooled client every 30 s.
+        Err(e) if e.is_timeout() => {}
+        Err(e) => eprintln!("vk-registry: connection error: {e}"),
+        Ok(()) => {}
     }
 }
 
@@ -4168,6 +4324,179 @@ pub fn install_service(facts: &UnitFacts) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Start a server with `limits` on an ephemeral port over a fresh store named `tag`.
+    async fn serve_test_limited(tag: &str, limits: ConnLimits) -> (SocketAddr, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = Arc::new(ServerState {
+            store: Arc::new(Store::new(dir.clone()).unwrap()),
+            upstreams: Vec::new(),
+            locks: lock::LockManager::new(),
+            auth: Authenticator::Shared(auth::Auth::None),
+            tls: None,
+            webdav: false,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_limited(listener, state, limits));
+        (addr, dir)
+    }
+
+    /// A client that stops mid-header is dropped once the header timeout passes, and the
+    /// connection cap holds a second client back until a slot frees.
+    #[tokio::test]
+    async fn a_stalled_client_is_dropped_and_connections_are_capped() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let limits = ConnLimits {
+            handshake: Duration::from_secs(1),
+            headers: Duration::from_secs(1),
+            connections: 1,
+            per_peer: 16,
+        };
+        let (addr, dir) = serve_test_limited("limits", limits).await;
+
+        let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stalled.write_all(b"GET /v2/ HTTP/1.1\r\n").await.unwrap();
+        // The one slot is taken: a second client is not served while the first holds it.
+        let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+        second
+            .write_all(b"GET /v2/ HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), second.read(&mut buf))
+                .await
+                .is_err(),
+            "a client past the cap was served"
+        );
+        // The header timeout closes the stalled client without a response.
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut rest = Vec::new();
+            stalled.read_to_end(&mut rest).await.map(|_| rest)
+        })
+        .await
+        .expect("the stalled client was never dropped")
+        .unwrap();
+        assert!(closed.is_empty(), "{closed:?}");
+        // Closing the stalled client frees the slot for the waiting client.
+        let n = tokio::time::timeout(Duration::from_secs(5), second.read(&mut buf))
+            .await
+            .expect("the waiting client was never served")
+            .unwrap();
+        assert!(buf[..n].starts_with(b"HTTP/1.1 200"), "{:?}", &buf[..n]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A kept-alive connection left idle after a request is closed by the header timeout.
+    #[tokio::test]
+    async fn an_idle_kept_alive_connection_is_closed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let limits = ConnLimits {
+            handshake: Duration::from_secs(1),
+            headers: Duration::from_secs(1),
+            connections: 4,
+            per_peer: 4,
+        };
+        let (addr, dir) = serve_test_limited("idle", limits).await;
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /v2/ HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        // The response arrives, then the connection stays open until the timeout ends it.
+        let all = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut all = Vec::new();
+            client.read_to_end(&mut all).await.map(|_| all)
+        })
+        .await
+        .expect("the idle connection was never closed")
+        .unwrap();
+        assert!(all.starts_with(b"HTTP/1.1 200"), "{all:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past its per-address cap, a client's new connection is closed at once, while another
+    /// address is still served.
+    #[tokio::test]
+    async fn connections_are_capped_per_client_address() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let limits = ConnLimits {
+            handshake: Duration::from_secs(5),
+            headers: Duration::from_secs(5),
+            connections: 4,
+            per_peer: 1,
+        };
+        let (addr, dir) = serve_test_limited("perpeer", limits).await;
+
+        let mut held = tokio::net::TcpStream::connect(addr).await.unwrap();
+        held.write_all(b"GET /v2/ HTTP/1.1\r\n").await.unwrap();
+        // Same address, over its cap: closed with nothing read or written.
+        let mut over = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), over.read(&mut buf))
+            .await
+            .expect("a connection past the per-address cap was kept open")
+            .unwrap();
+        assert_eq!(n, 0, "{:?}", &buf[..n]);
+        // Another loopback address has its own count.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+        let mut other = socket.connect(addr).await.unwrap();
+        other
+            .write_all(b"GET /v2/ HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(2), other.read(&mut buf))
+            .await
+            .expect("another address was not served")
+            .unwrap();
+        assert!(buf[..n].starts_with(b"HTTP/1.1 200"), "{:?}", &buf[..n]);
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A connection's per-address count is released when it closes, and the entry with it;
+    /// a refusal is reported as the first only once per stretch at the cap.
+    #[test]
+    fn peer_slots_count_and_release() {
+        let peers = PeerCounts::default();
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let a = PeerSlot::acquire(&peers, ip, 2).unwrap();
+        let b = PeerSlot::acquire(&peers, ip, 2).unwrap();
+        assert!(matches!(PeerSlot::acquire(&peers, ip, 2), Err(true)));
+        assert!(matches!(PeerSlot::acquire(&peers, ip, 2), Err(false)));
+        assert!(PeerSlot::acquire(&peers, "192.0.2.2".parse().unwrap(), 2).is_ok());
+        drop(a);
+        let c = PeerSlot::acquire(&peers, ip, 2).unwrap();
+        // Back at the cap after falling below it: logged again.
+        assert!(matches!(PeerSlot::acquire(&peers, ip, 2), Err(true)));
+        drop((b, c));
+        assert!(peers.lock().unwrap().is_empty());
+    }
+
+    /// IPv6 clients count by /64, and an IPv4-mapped address as its IPv4 address.
+    #[test]
+    fn peers_are_keyed_by_ipv4_address_or_ipv6_64() {
+        let key = |s: &str| peer_key(s.parse().unwrap());
+        assert_eq!(key("192.0.2.1"), key("::ffff:192.0.2.1"));
+        assert_ne!(key("192.0.2.1"), key("192.0.2.2"));
+        assert_eq!(
+            key("2001:db8:1:2::1"),
+            key("2001:db8:1:2:ffff:ffff:ffff:ffff")
+        );
+        assert_eq!(key("2001:db8:1:2::1"), key("2001:db8:1:2::"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+
+        let peers = PeerCounts::default();
+        let _a = PeerSlot::acquire(&peers, "2001:db8::1".parse().unwrap(), 1).unwrap();
+        assert!(PeerSlot::acquire(&peers, "2001:db8::2".parse().unwrap(), 1).is_err());
+    }
 
     /// The URL a server prints is the URL that reaches it: a TLS-configured server says
     /// `https`, a plain one `http`. The scheme is the only part of the line an operator
