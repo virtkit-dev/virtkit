@@ -3588,7 +3588,7 @@ pub(crate) fn percent_encode(s: &str) -> String {
 /// guard, so slicing `s[i + 1..i + 3]` after checking `i + 3 <= s.len()` panics whenever a
 /// `%` is followed by a multi-byte character (`"%€"`). Every caller here feeds it a query
 /// string or a form body, which is exactly where an attacker chooses the bytes.
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     /// One hex digit's value, or `None` — including for a byte that is not one.
     fn hex(c: u8) -> Option<u8> {
         match c {

@@ -20,6 +20,8 @@ All notable changes to virtkit will be documented in this file.
   (such as 12 and 123).
 - **`vk run --state-dir` no longer fails with "state-dir … is in use" when a `vk list` or
   `vk stop` runs at the moment it starts.**
+- `vk-registry`'s lock API no longer drops the connection when a lock name in the query
+  string has a `%` in front of a non-ASCII character.
 
 ## [0.80.0] - 2026-09-30
 
