@@ -2226,11 +2226,12 @@ fn validate_service_egress(cfg: &crate::config::Config, unit: &crate::compose::U
     Ok(())
 }
 
-/// Per-source egress overrides for the switch: one entry per service that set its own
-/// `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME` in its `variables:`, narrowed against the host
-/// `[egress]` cap (a service can restrict itself but not exceed the cap). A declaring service
-/// is always a restricted allowlist (empty = deny); a service that declared nothing gets no
-/// entry and shares the run policy. Returns `(source-ip, allow_ip, allow_name)` per override.
+/// Return `(source-ip, allow_ip, allow_name)` for every address (eth0 and extra NICs) of
+/// services declaring `MICROVM_EGRESS_ALLOW_IP` / `_ALLOW_NAME` in `variables:`. Each
+/// allowlist is narrowed against the host `[egress]` cap and cannot exceed it; empty lists
+/// deny. Services without a declaration share the run policy and get no entries.
+/// The switch selects policies by source address and accepts every NIC's address, so each
+/// address needs an override.
 #[allow(clippy::type_complexity)]
 fn service_per_source(
     cfg: &crate::config::Config,
@@ -2249,7 +2250,10 @@ fn service_per_source(
             &format!("service {:?} MICROVM_EGRESS_ALLOW_IP", svc.name),
             &format!("service {:?} MICROVM_EGRESS_ALLOW_NAME", svc.name),
         )?;
-        out.push((svc.addr, ips.unwrap_or_default(), names.unwrap_or_default()));
+        let (ips, names) = (ips.unwrap_or_default(), names.unwrap_or_default());
+        for addr in std::iter::once(svc.addr).chain(svc.extra_ips.iter().copied()) {
+            out.push((addr, ips.clone(), names.clone()));
+        }
     }
     Ok(out)
 }
@@ -3444,6 +3448,33 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::jobctx::JobCtx;
+
+    #[test]
+    fn a_service_policy_covers_every_address_it_can_source() {
+        let compose = "services:\n  db:\n    image: x\n    x-virtkit: { nics: 2 }\n    \
+                       environment:\n      MICROVM_EGRESS_ALLOW_NAME: db.internal\n";
+        let units = crate::compose::parse(compose, Path::new("/proj"), &|_| None, None).unwrap();
+        let extra = Ipv4Addr::new(192, 168, 127, 200);
+        let svc = crate::units::provisioned(
+            &units[0],
+            PathBuf::from("/tier/db.ext4"),
+            Default::default(),
+            crate::units::Siting {
+                gateway: Ipv4Addr::new(192, 168, 127, 1),
+                prefix: 24,
+                slot: 0,
+                extra_ips: vec![extra],
+            },
+        )
+        .unwrap();
+        let rows = service_per_source(&Config::default(), std::slice::from_ref(&svc)).unwrap();
+        let addrs: Vec<_> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(addrs, [svc.addr, extra]);
+        for (_, ips, names) in &rows {
+            assert!(ips.is_empty());
+            assert_eq!(names, &["db.internal"]);
+        }
+    }
 
     /// Resolve share-root symlinks before passing them to the VMM, on every job so a
     /// swapped link serves the new tree.

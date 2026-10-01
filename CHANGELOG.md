@@ -41,6 +41,8 @@ All notable changes to virtkit will be documented in this file.
 - **Security: a guest can no longer leave its own egress allowlist by sending from `0.0.0.0`**,
   which put the traffic under the network's default allowlist instead. Nor can it reach IPv6
   hosts during an egress dry run.
+- **Security: a service's own `MICROVM_EGRESS_ALLOW_*` now holds on all of its NICs.**
+  Traffic from its second or later NIC (`x-virtkit.nics`) got the job's egress policy instead.
 - **Security: a build's stage guests get a private session directory.** It was created at a
   predictable name in the shared temp dir and reused as found, so another local user could
   plant it and take over the guest's exec channel and console log.

@@ -1489,7 +1489,7 @@ pub async fn run(
             (false, _) => "unrestricted",
         },
         if per_source_count > 0 {
-            format!(" ({per_source_count} per-service override(s))")
+            format!(" ({per_source_count} per-source override(s))")
         } else {
             String::new()
         },
