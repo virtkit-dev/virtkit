@@ -21,6 +21,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: `vk-registry` rejects browser writes from another site** to `/v2/`,
+  `/lock/` or WebDAV, with session or Basic credentials or without credentials on an
+  open server.
 - **Security: `accounts grant-admin` no longer finds a user by an email their identity
   provider marked unverified**; such an email is not stored, and one stored at an earlier
   sign-in is forgotten. The command also prints the issuer and subject of the user it

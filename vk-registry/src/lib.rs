@@ -2512,6 +2512,15 @@ async fn handle(
     }))
 }
 
+/// Whether the browser says another site made this request (`Sec-Fetch-Site`). A browser
+/// that predates the header, and every non-browser client, sends none.
+fn cross_site(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !matches!(v, "same-origin" | "none"))
+}
+
 async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Response<Body>> {
     let path = req.uri().path().to_string();
 
@@ -2537,6 +2546,19 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
     // by route: an HTML page and a login redirect for a person, the JSON envelope and a
     // bare 401 for an OCI/CI client.
     let is_human = is_human_path(&path);
+    // Browsers attach cookies or Basic credentials to cross-site requests and the machine
+    // routes carry no CSRF token, so a cross-site non-GET is refused.
+    if !is_human
+        && !matches!(req.method(), &Method::GET | &Method::HEAD)
+        && cross_site(req.headers())
+    {
+        return Ok(error_response(
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            "a write to this registry cannot come from another site's page",
+        ));
+    }
+
     let principal = match &state.auth {
         Authenticator::Accounts { db, .. } => {
             let resolved = match accounts::resolve_principal(db, &req, state.cookies_are_secure()) {
@@ -4540,6 +4562,25 @@ mod tests {
         assert_eq!(
             banner(root, 2, false, addr),
             "vk-registry: serving /srv/vk-registry [mirror (2 upstream(s))] on http://0.0.0.0:443"
+        );
+    }
+
+    #[test]
+    fn a_cross_site_request_is_told_apart() {
+        let h = |v: Option<&str>| {
+            let mut m = hyper::HeaderMap::new();
+            if let Some(v) = v {
+                m.insert("sec-fetch-site", v.parse().unwrap());
+            }
+            cross_site(&m)
+        };
+        assert!(h(Some("cross-site")));
+        assert!(h(Some("same-site")));
+        assert!(!h(Some("same-origin")));
+        assert!(!h(Some("none")));
+        assert!(
+            !h(None),
+            "a client that sends no header is not judged by it"
         );
     }
 
