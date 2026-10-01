@@ -1637,3 +1637,44 @@ async fn a_blob_larger_than_one_chunk_streams_back_intact() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A 500's body carries no error chain (upstream URL, store paths).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_side_failure_does_not_tell_the_client_why() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("leak");
+    // A port just freed, so nothing listens there: every relayed request fails on this side.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let url = spawn(mirror_of(closed, &dir));
+    let client = reqwest::Client::new();
+
+    let r = client
+        .get(format!("{url}/v2/app/manifests/latest"))
+        .header(reqwest::header::ACCEPT, MANIFEST_TYPE)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("\"INTERNAL\""), "{body}");
+    assert!(!body.contains(&closed.to_string()), "{body}");
+
+    // `uploads/` as a file: starting an upload fails in the store, on a path under `dir`.
+    let uploads = dir.join("uploads");
+    std::fs::remove_dir_all(&uploads).unwrap();
+    std::fs::write(&uploads, b"").unwrap();
+    let r = client
+        .post(format!("{url}/v2/app/blobs/uploads/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("\"INTERNAL\""), "{body}");
+    assert!(!body.contains(&dir.display().to_string()), "{body}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

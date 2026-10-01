@@ -21,6 +21,8 @@ All notable changes to virtkit will be documented in this file.
 - **`vk-registry status` counts an image index's per-platform manifests and their layers as
   referenced by tags**, as `gc` keeps them, instead of reporting them as having no tag
   references. The per-tag sizes on `/browse` include them too.
+- **Security: `vk-registry` keeps internal error details in the server log.** HTTP 500
+  responses no longer expose error chains containing store paths and upstream URLs.
 - **`vk-registry` refuses a manifest push whose body is not a JSON object** (400
   `MANIFEST_INVALID`), so one can no longer stop garbage collection for as long as its tag
   is read.

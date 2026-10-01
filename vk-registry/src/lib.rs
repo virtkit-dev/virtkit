@@ -2320,17 +2320,20 @@ async fn manifests_exist(
         .map_err(Into::into)
 }
 
-/// Wrap `route`, turning any internal error into a 500 (a handler never fails the
-/// connection).
+/// Wrap `route`, turning any internal error into a 500: the error chain goes to stderr, the
+/// client gets a bare `INTERNAL` (a handler never fails the connection).
 async fn handle(
     req: Request<Incoming>,
     state: Arc<ServerState>,
 ) -> Result<Response<Body>, Infallible> {
+    // Kept for the log line; `route` consumes the request.
+    let (method, path) = (req.method().clone(), req.uri().path().to_string());
     Ok(route(req, state).await.unwrap_or_else(|e| {
+        eprintln!("vk-registry: {method} {path}: {e:#}");
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL",
-            &format!("{e:#}"),
+            "internal error (details in the server log)",
         )
     }))
 }
