@@ -11,6 +11,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- `vk-registry` sends `Strict-Transport-Security` (one year) when it serves TLS itself;
+  browsers then use HTTPS for that host name on every port.
 - An OCI image pull holds each layer in a scratch file beside the build rather than every
   layer in memory: a large image needs that much free disk there instead of RAM.
 - The guest kernel no longer lets unprivileged processes use eBPF (from its next build); root

@@ -2383,12 +2383,14 @@ async fn handle(
 ) -> Result<Response<Body>, Infallible> {
     // Taken before `route` consumes the request: what the log line says the failure was on.
     let (method, path) = (req.method().clone(), req.uri().path().to_string());
-    Ok(route(req, state).await.unwrap_or_else(|e| {
+    let tls = state.tls.is_some();
+    let resp = route(req, state).await.unwrap_or_else(|e| {
         // The chain names store paths and upstream URLs, which are the operator's to read,
         // not the client's: the detail goes to the log, the client gets that it failed.
         eprintln!("vk-registry: {method} {path}: {e:#}");
         internal_error()
-    }))
+    });
+    Ok(with_hsts(resp, tls))
 }
 
 /// Whether the browser says another site made this request (`Sec-Fetch-Site`). A browser
@@ -2398,6 +2400,20 @@ fn cross_site(headers: &hyper::HeaderMap) -> bool {
         .get("sec-fetch-site")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| !matches!(v, "same-origin" | "none"))
+}
+
+/// `resp`, telling browsers to reach this server over HTTPS only from now on when it serves
+/// TLS itself. A year, the usual value; without it the first request of a visit can be sent
+/// in clear to whoever answers for the name. HSTS applies to the host name on every port, so
+/// a host serving plain HTTP elsewhere under the same name loses that for browsers.
+fn with_hsts(mut resp: Response<Body>, tls: bool) -> Response<Body> {
+    if tls {
+        resp.headers_mut().insert(
+            hyper::header::STRICT_TRANSPORT_SECURITY,
+            hyper::header::HeaderValue::from_static("max-age=31536000"),
+        );
+    }
+    resp
 }
 
 /// The answer to a request that failed on this server's side, saying nothing of why.
@@ -4358,6 +4374,21 @@ mod tests {
         assert!(
             !h(None),
             "a client that sends no header is not judged by it"
+        );
+    }
+
+    #[test]
+    fn hsts_is_sent_only_over_tls() {
+        let resp = || error_response(StatusCode::OK, "X", "y");
+        assert!(
+            with_hsts(resp(), true)
+                .headers()
+                .contains_key(hyper::header::STRICT_TRANSPORT_SECURITY)
+        );
+        assert!(
+            !with_hsts(resp(), false)
+                .headers()
+                .contains_key(hyper::header::STRICT_TRANSPORT_SECURITY)
         );
     }
 
