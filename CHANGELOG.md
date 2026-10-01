@@ -15,6 +15,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: a guest can no longer reach host files outside a shared directory.** The
+  virtio-fs server, used for every share on both backends, took any name a guest kernel sent:
+  `..` or a path with `/` walked out of the share to whatever the VM's host user could read
+  or, on a writable share, write. A guest running its own kernel, which a job can bring,
+  could do this. Such names are now refused.
 - **Security: a VM without network (`net.mode = "none"`, the default) no longer offers
   libkrun's transparent socket impersonation (TSI).** A guest kernel with the TSI patches,
   which a job can bring, could have the VMM open, connect and listen on host sockets past

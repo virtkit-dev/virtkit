@@ -193,6 +193,9 @@ impl<F: FileSystem + Sync> Server<F> {
         r.read_exact(&mut buf).map_err(Error::DecodeMessage)?;
 
         let name = bytes_to_cstr(buf.as_ref())?;
+        if let Err(e) = entry_name(name) {
+            return reply_error(e, in_header.unique, w);
+        }
 
         match self
             .fs
@@ -308,11 +311,17 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let extensions = get_extensions(options, name.len() + linkname.len(), buf.as_slice())?;
 
+        // The target is the link's contents, not a name in this directory: it is never
+        // resolved here, so it is not a component and is not checked as one.
+        let name = bytes_to_cstr(name)?;
+        if let Err(e) = entry_name(name) {
+            return reply_error(e, in_header.unique, w);
+        }
         match self.fs.symlink(
             Context::from(in_header),
             bytes_to_cstr(linkname)?,
             in_header.nodeid.into(),
-            bytes_to_cstr(name)?,
+            name,
             extensions,
         ) {
             Ok(entry) => {
@@ -343,10 +352,14 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let extensions = get_extensions(options, name.len(), buf.as_slice())?;
 
+        let name = bytes_to_cstr(name)?;
+        if let Err(e) = entry_name(name) {
+            return reply_error(e, in_header.unique, w);
+        }
         match self.fs.mknod(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(name)?,
+            name,
             mode,
             rdev,
             umask,
@@ -378,10 +391,14 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let extensions = get_extensions(options, name.len(), buf.as_slice())?;
 
+        let name = bytes_to_cstr(name)?;
+        if let Err(e) = entry_name(name) {
+            return reply_error(e, in_header.unique, w);
+        }
         match self.fs.mkdir(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(name)?,
+            name,
             mode,
             umask,
             extensions,
@@ -403,11 +420,14 @@ impl<F: FileSystem + Sync> Server<F> {
 
         r.read_exact(&mut name).map_err(Error::DecodeMessage)?;
 
-        match self.fs.unlink(
-            Context::from(in_header),
-            in_header.nodeid.into(),
-            bytes_to_cstr(&name)?,
-        ) {
+        let name = bytes_to_cstr(&name)?;
+        if let Err(e) = entry_name(name) {
+            return reply_error(e, in_header.unique, w);
+        }
+        match self
+            .fs
+            .unlink(Context::from(in_header), in_header.nodeid.into(), name)
+        {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }
@@ -421,11 +441,14 @@ impl<F: FileSystem + Sync> Server<F> {
 
         r.read_exact(&mut name).map_err(Error::DecodeMessage)?;
 
-        match self.fs.rmdir(
-            Context::from(in_header),
-            in_header.nodeid.into(),
-            bytes_to_cstr(&name)?,
-        ) {
+        let name = bytes_to_cstr(&name)?;
+        if let Err(e) = entry_name(name) {
+            return reply_error(e, in_header.unique, w);
+        }
+        match self
+            .fs
+            .rmdir(Context::from(in_header), in_header.nodeid.into(), name)
+        {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
             Err(e) => reply_error(e, in_header.unique, w),
         }
@@ -456,13 +479,17 @@ impl<F: FileSystem + Sync> Server<F> {
             .ok_or(Error::MissingParameter)?;
 
         let (oldname, newname) = buf.split_at(split_pos);
+        let (oldname, newname) = (bytes_to_cstr(oldname)?, bytes_to_cstr(newname)?);
+        if let Err(e) = entry_name(oldname).and_then(|()| entry_name(newname)) {
+            return reply_error(e, in_header.unique, w);
+        }
 
         match self.fs.rename(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(oldname)?,
+            oldname,
             newdir.into(),
-            bytes_to_cstr(newname)?,
+            newname,
             flags,
         ) {
             Ok(()) => reply_ok(None::<u8>, None, in_header.unique, w),
@@ -496,11 +523,15 @@ impl<F: FileSystem + Sync> Server<F> {
 
         r.read_exact(&mut name).map_err(Error::DecodeMessage)?;
 
+        let name = bytes_to_cstr(&name)?;
+        if let Err(e) = entry_name(name) {
+            return reply_error(e, in_header.unique, w);
+        }
         match self.fs.link(
             Context::from(in_header),
             oldnodeid.into(),
             in_header.nodeid.into(),
-            bytes_to_cstr(&name)?,
+            name,
         ) {
             Ok(entry) => {
                 let out = EntryOut::from(entry);
@@ -1135,10 +1166,14 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let kill_priv = open_flags & OPEN_KILL_SUIDGID != 0;
 
+        let name = bytes_to_cstr(name)?;
+        if let Err(e) = entry_name(name) {
+            return reply_error(e, in_header.unique, w);
+        }
         match self.fs.create(
             Context::from(in_header),
             in_header.nodeid.into(),
-            bytes_to_cstr(name)?,
+            name,
             mode,
             kill_priv,
             flags,
@@ -1493,6 +1528,19 @@ fn reply_error(e: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
     Ok(w.bytes_written())
 }
 
+/// A name the guest gives for an entry of a directory must be exactly one component of it.
+/// The filesystems below resolve it with `*at()` against the parent's descriptor, so `..`
+/// would step out of the shared tree and a `/` would walk any path beneath or above it:
+/// a guest kernel need not be one that never sends them, and a job can bring its own.
+/// Refused with `EINVAL`, as upstream virtiofsd does, before any filesystem sees the name.
+fn entry_name(name: &CStr) -> io::Result<()> {
+    let b = name.to_bytes();
+    if b.is_empty() || b == b"." || b == b".." || b.contains(&b'/') {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    Ok(())
+}
+
 fn bytes_to_cstr(buf: &[u8]) -> Result<&CStr> {
     // Convert to a `CStr` first so that we can drop the '\0' byte at the end
     // and make sure there are no interior '\0' bytes.
@@ -1683,11 +1731,18 @@ mod tests {
     struct DirFs {
         looked_up: Mutex<Vec<u64>>,
         forgotten: Mutex<Vec<(u64, u64)>>,
+        /// Every name a LOOKUP reached the filesystem with.
+        names: Mutex<Vec<Vec<u8>>>,
     }
 
     impl FileSystem for DirFs {
         type Inode = u64;
         type Handle = u64;
+
+        fn lookup(&self, _ctx: Context, _parent: u64, name: &CStr) -> io::Result<Entry> {
+            self.names.lock().unwrap().push(name.to_bytes().to_vec());
+            Err(io::Error::from_raw_os_error(libc::ENOENT))
+        }
 
         fn forget(&self, _ctx: Context, inode: u64, count: u64) {
             self.forgotten.lock().unwrap().push((inode, count));
@@ -1792,5 +1847,80 @@ mod tests {
             vec![(2, 1)],
             "the entry the guest never sees must be forgotten, and only that one"
         );
+    }
+
+    /// Send one LOOKUP of `name` under the root and return the errno the reply carries.
+    fn lookup_errno(server: &Server<DirFs>, name: &[u8]) -> i32 {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let buf = GuestAddress(0x1000);
+        let mut cname = name.to_vec();
+        cname.push(0);
+        let req_len = (size_of::<InHeader>() + cname.len()) as u32;
+        let chain = create_descriptor_chain(
+            &mem,
+            GuestAddress(0),
+            buf,
+            vec![
+                (DescriptorType::Readable, req_len),
+                (DescriptorType::Writable, 0x1000),
+            ],
+            0,
+        )
+        .unwrap();
+        let in_header = InHeader {
+            len: req_len,
+            opcode: Opcode::Lookup as u32,
+            unique: 1,
+            nodeid: ROOT_ID,
+            ..Default::default()
+        };
+        mem.write_slice(in_header.as_slice(), buf).unwrap();
+        mem.write_slice(&cname, buf.unchecked_add(size_of::<InHeader>() as u64))
+            .unwrap();
+        server
+            .handle_message(
+                Reader::new(&mem, chain.clone()).unwrap(),
+                Writer::new(&mem, chain).unwrap(),
+                &None,
+                &Arc::new(AtomicI32::new(0)),
+            )
+            .unwrap();
+        let out: OutHeader = mem.read_obj(buf.unchecked_add(u64::from(req_len))).unwrap();
+        -out.error
+    }
+
+    /// A name that is not one component of the directory never reaches the filesystem,
+    /// which would resolve it against the parent's descriptor and walk out of the share.
+    #[test]
+    fn a_name_that_is_not_one_component_is_refused_before_the_filesystem() {
+        let server = Server::new(DirFs::default());
+        for name in [&b".."[..], b".", b"../secret", b"a/b", b"/etc/passwd"] {
+            assert_eq!(
+                lookup_errno(&server, name),
+                libc::EINVAL,
+                "{:?}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        assert_eq!(lookup_errno(&server, b"..."), libc::ENOENT);
+        assert_eq!(lookup_errno(&server, b"entry"), libc::ENOENT);
+        assert_eq!(
+            *server.fs.names.lock().unwrap(),
+            vec![b"...".to_vec(), b"entry".to_vec()],
+            "only the single components reached the filesystem"
+        );
+    }
+
+    #[test]
+    fn an_entry_name_is_exactly_one_component() {
+        let ok = |n: &[u8]| entry_name(CStr::from_bytes_with_nul(n).unwrap()).is_ok();
+        assert!(ok(b"file\0"));
+        assert!(ok(b"...\0"));
+        assert!(ok(b".hidden\0"));
+        assert!(!ok(b"\0"));
+        assert!(!ok(b".\0"));
+        assert!(!ok(b"..\0"));
+        assert!(!ok(b"a/b\0"));
+        assert!(!ok(b"/\0"));
     }
 }
