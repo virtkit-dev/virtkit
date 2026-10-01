@@ -15,7 +15,7 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use http_body_util::combinators::BoxBody;
@@ -46,6 +46,16 @@ impl ProxyCfg {
     /// Build from the `vk run --registry-proxy` flags: `upstream` is the full base URL
     /// (`scheme://host`), `creds` both what to inject and what TLS to trust.
     pub fn from_parts(upstream: &str, creds: Creds) -> Result<Self> {
+        // `--insecure` means plain HTTP on every other OCI path. Read as "accept any
+        // certificate" here, it sent the credential down a TLS link anyone in between could
+        // terminate; a private CA is what `--ca` is for.
+        if creds.insecure && upstream.starts_with("https://") {
+            bail!(
+                "--registry-proxy {upstream} with --insecure: --insecure means a plain HTTP \
+                 registry, so give an http:// upstream, or --ca for a TLS one signed by a \
+                 private CA"
+            );
+        }
         Self::build(upstream.trim_end_matches('/').to_string(), creds)
     }
 
@@ -69,10 +79,6 @@ impl ProxyCfg {
             b = b.add_root_certificate(
                 reqwest::Certificate::from_pem(pem).context("parsing the registry CA")?,
             );
-        }
-        if creds.insecure {
-            // match the other OCI paths' `--insecure`: accept the upstream's cert as-is.
-            b = b.danger_accept_invalid_certs(true);
         }
         Ok(ProxyCfg {
             upstream,
@@ -470,5 +476,21 @@ mod tests {
             "",
             "a target resolving outside /v2/ must not be forwarded upstream"
         );
+    }
+
+    /// `--insecure` is plain HTTP, as everywhere else: it never turns certificate checks off.
+    #[test]
+    fn insecure_is_plain_http_and_never_unverified_tls() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let insecure = Creds {
+            insecure: true,
+            ..Creds::anonymous()
+        };
+        let err = ProxyCfg::from_parts("https://reg.example", insecure.clone())
+            .err()
+            .expect("an https upstream with --insecure is refused")
+            .to_string();
+        assert!(err.contains("--ca"), "{err}");
+        assert!(ProxyCfg::from_parts("http://reg.example:5000", insecure).is_ok());
     }
 }

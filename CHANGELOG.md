@@ -15,6 +15,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: `vk run --registry-proxy https://… --insecure` is refused** instead of sending
+  the registry credential over TLS whose certificate was not checked. `--insecure` means a
+  plain HTTP registry, as it does everywhere else; use `--ca` for a private CA.
 - **Security: the guest registry proxy (`proxy_guests`) no longer lends the runner's
   credential to paths outside `/v2/`.** A request target such as `/v2/../lock/acquire`
   passed the check and reached the registry's lock API once resolved.
