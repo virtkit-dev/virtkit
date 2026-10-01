@@ -4,12 +4,15 @@
 //! only value of the host's that goes into a path or an attribute htmx reads; the router takes
 //! nothing else for one.
 
+use std::ffi::OsStr;
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use hyper::{Response, StatusCode};
 use tokio::sync::watch;
-use vk_fleet_proto::Workload;
+use vk_fleet_proto::{Workload, WorkloadKind};
 
 use super::html::Html;
 use super::pages::{self, dash, end_section, kv, kv_node, section};
@@ -54,19 +57,90 @@ pub(super) fn source(event: &str, ui: &Ui) -> Option<Source> {
 }
 
 /// The page for `path`, if it is one of local mode's.
-pub(super) fn get(path: &str, auth: &Auth, ui: &Ui) -> Option<Response<Body>> {
+pub(super) async fn get(path: &str, auth: &Auth, ui: &Ui) -> Option<Response<Body>> {
     let now = crate::now_secs();
     if path == "/" {
         return Some(super::page(list(auth, &ui.local.listing(), now)));
     }
     let id = path.strip_prefix("/vm/").filter(|id| valid_id(id))?;
-    Some(match ui.local.workload(id) {
-        Some((w, mem)) => super::page(vm(auth, id, &w, mem)),
-        None => super::message(
+    let Some((w, mem)) = ui.local.workload(id) else {
+        return Some(super::message(
             StatusCode::NOT_FOUND,
             "No such VM is running on this machine.",
-        ),
-    })
+        ));
+    };
+    let views = views(&ui.local, &w).await;
+    Some(super::page(vm(auth, id, &w, mem, &views)))
+}
+
+/// How long a view of a VM may take to read: a page waits on it.
+const VIEW_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How many of the console's last lines a VM's page shows.
+const CONSOLE_LINES: &str = "100";
+
+/// What a VM's page shows beside its live fragment, each read by the `vk` command a shell
+/// would use: its console's tail, what atop recorded of it, what its switch recorded of its
+/// egress.
+struct Views {
+    console: View,
+    atop: View,
+    egress: View,
+}
+
+enum View {
+    Text(String),
+    /// Nothing to show, and why, in the hub's words.
+    None(&'static str),
+    /// The command failed: how, and what it said.
+    Failed(String),
+}
+
+async fn views(local: &Local, w: &Workload) -> Views {
+    let dir = OsStr::new(&w.state_dir);
+    let run = |args: Vec<&'static str>| {
+        let mut all: Vec<&OsStr> = args.into_iter().map(OsStr::new).collect();
+        all.push(dir);
+        async move { view(local.run(&all, VIEW_TIMEOUT).await) }
+    };
+    // A VM records atop of itself only when booted to (`vk run --atop`, a CI job's
+    // `[executor] atop`); asking `vk atop` of one that does not would attach a sampler.
+    let recording = Path::new(&w.state_dir).join("atop/atop.log").is_file();
+    let atop = async {
+        if recording {
+            run(vec!["atop", "--summary"]).await
+        } else {
+            View::None(
+                "Not recording: a VM records itself when booted with `vk run --atop`, and \
+                 `vk atop <dir>` attaches a sampler to one that does not.",
+            )
+        }
+    };
+    let egress = async {
+        if w.kind == WorkloadKind::CiJob {
+            match run(vec!["egress-report"]).await {
+                View::Text(t) if t.trim().is_empty() => View::None("Nothing recorded."),
+                v => v,
+            }
+        } else {
+            View::None("Only a CI job's switch records its egress.")
+        }
+    };
+    let (console, atop, egress) =
+        tokio::join!(run(vec!["logs", "-n", CONSOLE_LINES]), atop, egress);
+    Views {
+        console,
+        atop,
+        egress,
+    }
+}
+
+fn view(out: anyhow::Result<crate::local::Output>) -> View {
+    match out {
+        Ok(out) if out.ok => View::Text(out.stdout),
+        Ok(out) => View::Failed(format!("{}: {}", out.status, out.stderr.trim())),
+        Err(e) => View::Failed(format!("{e:#}")),
+    }
 }
 
 /// Whether `id` is a VM's ID as `vk workloads` writes one: sixteen lowercase hex digits.
@@ -157,7 +231,7 @@ fn vms_table(listing: &Listing, now: u64) -> Html {
 }
 
 /// `/vm/<id>`: one VM. `id` goes into `sse-connect`: the router takes only hex for one.
-fn vm(auth: &Auth, id: &str, w: &Workload, mem: Option<u64>) -> Html {
+fn vm(auth: &Auth, id: &str, w: &Workload, mem: Option<u64>, views: &Views) -> Html {
     let mut main = Html::new();
     main.raw("<h1>")
         .node(&crate::workloads::owner(w))
@@ -167,7 +241,41 @@ fn vm(auth: &Auth, id: &str, w: &Workload, mem: Option<u64>) -> Html {
         .raw("\" sse-swap=\"vm\" sse-close=\"close\">")
         .html(&vm_detail(w, mem))
         .raw("</div>");
+    for (title, view) in [
+        ("Console", &views.console),
+        ("atop", &views.atop),
+        ("Egress", &views.egress),
+    ] {
+        main.raw("<section><h2>").raw(title).raw("</h2>");
+        match view {
+            View::Text(text) => text_block(&mut main, text),
+            View::None(why) => {
+                main.raw("<p class=\"empty\">").text(why).raw("</p>");
+            }
+            View::Failed(why) => {
+                main.raw("<p class=\"notes\">").node(why).raw("</p>");
+            }
+        }
+        main.raw("</section>");
+    }
+    main.raw("<p class=\"sub\">The console, atop and egress are read as the page loads; ")
+        .raw("<a href=\"/vm/")
+        .text(id)
+        .raw("\">reload</a> for newer.</p>");
     pages::layout(&crate::workloads::owner(w), auth, &main)
+}
+
+/// What a command printed, a line at a time, each made display-safe.
+fn text_block(h: &mut Html, text: &str) {
+    if text.trim().is_empty() {
+        h.raw("<p class=\"empty\">nothing</p>");
+        return;
+    }
+    h.raw("<pre>");
+    for line in text.lines() {
+        h.node(line).raw("\n");
+    }
+    h.raw("</pre>");
 }
 
 /// A VM page's fragment once the VM has stopped.

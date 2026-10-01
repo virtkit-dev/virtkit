@@ -169,6 +169,31 @@ pub fn ip_contacts_summary(path: &Path, header: &str) -> Option<String> {
     summary(&read_ip_contacts(path), header)
 }
 
+/// What `dir` — a CI job's dir, where the switch keeps both channels — recorded of its
+/// guest's egress: the refusals, each once with its count, then the domains and the IPs it
+/// reached, each most-contacted first. `None` when neither channel holds anything.
+pub fn report(dir: &Path) -> Option<String> {
+    let (denials, _) = read_since(&dir.join("egress-denied.log"), 0);
+    let mut seen: Vec<(String, usize)> = Vec::new();
+    for d in &denials {
+        let line = d.display();
+        match seen.iter_mut().find(|(l, _)| *l == line) {
+            Some((_, n)) => *n += 1,
+            None => seen.push((line, 1)),
+        }
+    }
+    let audit = dir.join("egress-audit.log");
+    let blocks: Vec<String> = [
+        summary(&seen, "egress refused"),
+        contacts_summary(&audit, "external domains contacted"),
+        ip_contacts_summary(&audit, "external IPs/ports contacted"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!blocks.is_empty()).then(|| blocks.join("\n"))
+}
+
 /// The bytes the switch has forwarded, as it last published them: `(sent, received)` from
 /// the guests' side. `None` when there is no file — no switch, or one that has not published
 /// yet. Payload only, and egress only: the framing around it, the retransmits under it and
@@ -257,6 +282,27 @@ mod tests {
         // A line torn by a switch killed mid-write counts for nothing rather than wrongly.
         std::fs::write(&path, "100 2000\n7").unwrap();
         assert_eq!(read_net_bytes(&path), Some((100, 2000)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dir_reports_its_refusals_and_contacts_or_nothing() {
+        let dir = std::env::temp_dir().join(format!("vk-egress-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(report(&dir), None);
+        append(&dir.join("egress-denied.log"), Proto::Dns, "evil.example");
+        append(&dir.join("egress-denied.log"), Proto::Dns, "evil.example");
+        append_contact(&dir.join("egress-audit.log"), "crates.io");
+        let text = report(&dir).unwrap();
+        assert!(
+            text.starts_with("virtkit: egress refused:\n  egress denied (dns) evil.example  (x2)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("external domains contacted:\n  crates.io  (x1)"),
+            "{text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

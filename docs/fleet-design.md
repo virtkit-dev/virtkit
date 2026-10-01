@@ -379,8 +379,10 @@ directory, so the token never sits in a command line another local user can read
 serves, starting it again with a backoff when it ends, and shows the list it prints, each VM
 with a page of its own, both kept live. A child rather than a command run again every few
 seconds, so the memory figures keep their own cadence; a list of a version the hub cannot
-read is refused rather than misread. Actions, the console log, atop and egress views are not
-built yet.
+read is refused rather than misread. A VM's page also shows its console's last hundred lines
+(`vk logs`), atop's account of a VM that records itself (`vk atop --summary`; one that does
+not is not attached to), and what a CI job's switch recorded of its egress (`vk
+egress-report`, plumbing), each read as the page loads. Actions are not built yet.
 
 ## Security
 

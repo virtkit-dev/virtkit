@@ -8,7 +8,8 @@ All notable changes to virtkit will be documented in this file.
 
 - **Experimental: `vk-hub local`, a web UI for the VMs on your machine.** It lists your pinned
   `vk run`s, dev environments and CI jobs with what each holds in memory, each with a page of
-  its own, kept up to date as VMs start and stop, and opens itself in your browser with a single-use sign-in link. It runs as you,
+  its own — with its console's tail, its atop summary when it records one, and a CI job's
+  egress report — kept up to date as VMs start and stop, and opens itself in your browser with a single-use sign-in link. It runs as you,
   keeps its state under `~/.local/state/virtkit/hub-local`, and serves on loopback under a
   random `vk-….localhost` name, so its session cookie reaches nothing else you serve.
   `vk-hub local login` prints another link; `vk-hub local sessions` and `logout` list and end

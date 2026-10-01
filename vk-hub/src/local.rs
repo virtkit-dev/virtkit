@@ -164,6 +164,74 @@ impl Local {
     }
 }
 
+/// The most of a command's output kept: a page shows its tail.
+const MAX_OUTPUT: u64 = 256 * 1024;
+
+/// What a `vk` command printed, and how it ended.
+pub struct Output {
+    pub ok: bool,
+    /// How it ended, as `exit status: 1` or the reason it was not waited for.
+    pub status: String,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl Local {
+    /// Run `vk` with `args`, its stdin closed, for at most `timeout`; killed past it. Each
+    /// stream's first [`MAX_OUTPUT`] bytes are kept. What `vk` prints is the host's: a page
+    /// shows it through [`crate::ui::html::Html::node`].
+    pub async fn run(&self, args: &[&std::ffi::OsStr], timeout: Duration) -> Result<Output> {
+        let mut child = tokio::process::Command::new(&self.vk)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("running {}", self.vk.display()))?;
+        let mut stdout = child.stdout.take().context("taking the child's stdout")?;
+        let mut stderr = child.stderr.take().context("taking the child's stderr")?;
+        let read = async {
+            let (out, err) = tokio::join!(read_capped(&mut stdout), read_capped(&mut stderr));
+            std::io::Result::Ok((out?, err?))
+        };
+        let ran = tokio::time::timeout(timeout, async {
+            let (out, err) = read.await?;
+            let status = child.wait().await?;
+            std::io::Result::Ok((status, out, err))
+        })
+        .await;
+        // Shown, never parsed: a byte that is not UTF-8 reads as a terminal would show it.
+        Ok(match ran {
+            Ok(Ok((status, out, err))) => Output {
+                ok: status.success(),
+                status: status.to_string(),
+                stdout: String::from_utf8_lossy(&out).into_owned(),
+                stderr: String::from_utf8_lossy(&err).into_owned(),
+            },
+            Ok(Err(e)) => return Err(e).context("reading its output"),
+            Err(_) => Output {
+                ok: false,
+                status: format!(
+                    "killed after {}",
+                    crate::human_duration(Duration::from_secs(timeout.as_secs()))
+                ),
+                stdout: String::new(),
+                stderr: String::new(),
+            },
+        })
+    }
+}
+
+/// The first [`MAX_OUTPUT`] bytes `r` gives, and the rest read and dropped, so a writer is
+/// never left blocked on a full pipe.
+async fn read_capped(r: &mut (impl tokio::io::AsyncRead + Unpin)) -> std::io::Result<Vec<u8>> {
+    let mut kept = Vec::new();
+    (&mut *r).take(MAX_OUTPUT).read_to_end(&mut kept).await?;
+    tokio::io::copy(r, &mut tokio::io::sink()).await?;
+    Ok(kept)
+}
+
 /// Keep `local`'s listing current from `vk workloads --watch` for as long as the hub runs,
 /// starting it again, with a backoff, whenever it ends.
 pub async fn watch(local: Arc<Local>, hub: Arc<Hub>) {

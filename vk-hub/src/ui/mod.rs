@@ -271,7 +271,7 @@ async fn get(path: &str, query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Re
         };
         return Ok(sse::stream(ui.hub.clone(), auth, source, slot));
     }
-    if let Some(resp) = local::get(path, auth, ui) {
+    if let Some(resp) = local::get(path, auth, ui).await {
         return Ok(resp);
     }
     Ok(message(StatusCode::NOT_FOUND, "There is no such page."))

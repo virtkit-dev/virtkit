@@ -623,6 +623,15 @@ enum Cmd {
     /// `[executor.schedule] mem_budget`.
     #[command(hide = true)]
     Tune,
+    /// plumbing: what a CI job's guest did on the network, for `vk-hub local`
+    ///
+    /// The refusals and the contacts the job's switch recorded in its dir, as the job's
+    /// trace reports them; nothing when it recorded none.
+    #[command(hide = true)]
+    EgressReport {
+        /// a CI job's dir
+        dir: PathBuf,
+    },
     /// plumbing: the VMs running on this host, as JSON for `vk-hub local`
     ///
     /// One line of JSON: pinned runs and dev environments from the registry `vk list` reads,
@@ -3963,6 +3972,12 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         },
+        Cmd::EgressReport { dir } => {
+            if let Some(report) = egress_report::report(&dir) {
+                println!("{report}");
+            }
+            ExitCode::SUCCESS
+        }
         Cmd::Workloads {
             watch,
             interval_secs,

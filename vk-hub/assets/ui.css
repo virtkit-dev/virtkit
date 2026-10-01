@@ -67,3 +67,11 @@ table.kv th { color: var(--muted); font-weight: normal; white-space: nowrap; }
 #flash { padding: 0.4rem 0.6rem; margin: 0.5rem 0; background: var(--band); border-left: 3px solid var(--accent); }
 #flash.error { border-left-color: var(--down); }
 button { font: inherit; padding: 0.15rem 0.6rem; cursor: pointer; }
+pre {
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--band);
+  padding: 0.5rem 0.75rem;
+  overflow: auto;
+  max-height: 40rem;
+  margin: 0.3rem 0;
+}

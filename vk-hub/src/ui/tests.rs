@@ -26,12 +26,20 @@ async fn start_as(origin: Option<&str>) -> (SocketAddr, Arc<Hub>, String) {
 /// [`start_as`], with the machine whose VMs it shows: no `vk` is run, so its listing is the
 /// test's to set.
 async fn start_local(origin: Option<&str>) -> (SocketAddr, Arc<Hub>, String, Arc<Local>) {
+    start_with_vk(origin, "/nonexistent/vk".into()).await
+}
+
+/// [`start_local`], running `vk` for what it runs.
+async fn start_with_vk(
+    origin: Option<&str>,
+    vk: std::path::PathBuf,
+) -> (SocketAddr, Arc<Hub>, String, Arc<Local>) {
     let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let origin = origin.map_or_else(|| format!("http://{addr}"), str::to_string);
     let hub =
         Arc::new(Hub::new(Arc::new(Db::open_memory().unwrap())).with_ui_url(Some(origin.clone())));
-    let local = Arc::new(Local::new("/nonexistent/vk".into()));
+    let local = Arc::new(Local::new(vk));
     let ui = Arc::new(Ui::new(hub.clone(), &origin, local.clone()));
     tokio::spawn(serve(listener, ui));
     (addr, hub, origin, local)
@@ -863,4 +871,72 @@ async fn pages_load_only_the_embedded_scripts() {
             usize::from(path != "/audit")
         );
     }
+}
+
+/// A `vk` that is a shell script: `body` runs with the arguments it was given.
+fn stub_vk(tag: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("vk-hub-stub-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let vk = dir.join("vk");
+    std::fs::write(&vk, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&vk, std::fs::Permissions::from_mode(0o755)).unwrap();
+    vk
+}
+
+/// A VM's page shows its console's tail, atop's account of it when it records one, and a CI
+/// job's egress, each read by the `vk` command for it, as text.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vm_s_page_shows_its_console_atop_and_egress() {
+    let vk = stub_vk(
+        "views",
+        r#"case "$1" in
+logs) echo "console of $4 <b>bold</b>"; echo "second line" ;;
+atop) echo "atop of $3" ;;
+egress-report) echo "virtkit: egress refused:"; echo "  egress denied (dns) evil.example  (x2)" ;;
+*) echo "unexpected $*" >&2; exit 3 ;;
+esac"#,
+    );
+    let (addr, hub, _, local) = start_with_vk(None, vk.clone()).await;
+    let state = vk.parent().unwrap().join("state");
+    std::fs::create_dir_all(state.join("atop")).unwrap();
+    let mut run = workload("0123456789abcdef", "alpine:3.20");
+    run.state_dir = state.display().to_string();
+    let mut job = workload("fedcba9876543210", "rust:1.90");
+    job.kind = vk_fleet_proto::WorkloadKind::CiJob;
+    local.set_listing(listed(vec![run, job]), &hub);
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+
+    let page = get(addr, "/vm/0123456789abcdef", Some(&cookie)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let console = format!(
+        "console of {} &lt;b&gt;bold&lt;/b&gt;\nsecond line",
+        state.display()
+    );
+    assert!(page.body.contains(&console), "{}", page.body);
+    assert!(page.body.contains("Not recording"), "{}", page.body);
+    assert!(page.body.contains("Only a CI job"), "{}", page.body);
+    // Recording itself, atop is asked; a CI job's egress is.
+    std::fs::write(state.join("atop/atop.log"), b"").unwrap();
+    let page = get(addr, "/vm/0123456789abcdef", Some(&cookie)).await;
+    assert!(
+        page.body.contains(&format!("atop of {}", state.display())),
+        "{}",
+        page.body
+    );
+    let page = get(addr, "/vm/fedcba9876543210", Some(&cookie)).await;
+    assert!(
+        page.body.contains("egress denied (dns) evil.example"),
+        "{}",
+        page.body
+    );
+    // A failing command says how it failed, and the page still shows.
+    let (addr, hub, _, local) = start_local(None).await;
+    local.set_listing(listed(vec![workload("0123456789abcdef", "x")]), &hub);
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/vm/0123456789abcdef", Some(&cookie)).await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("/nonexistent/vk"), "{}", page.body);
+    let _ = std::fs::remove_dir_all(vk.parent().unwrap());
 }
