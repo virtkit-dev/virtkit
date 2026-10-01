@@ -218,6 +218,8 @@
 #                        # `vk gc`; unset inherits image_cache_idle_secs
 # checkout_overlay = true  # build on a guest tmpfs overlay over the read-only host tree,
 #                        # so writes run at guest speed and the guest cannot touch the host
+#                        # tree; false shares it read-write, and the checkout is re-cloned
+#                        # for every job rather than fetched
 # checkout_overlay_size = "80%"  # how much of the VM's memory that layer may take ("80%",
 #                        # "12G"). The cap a build tree has to fit under: too low fails a job
 #                        # with ENOSPC that the VM had the memory for, too near 100% starves

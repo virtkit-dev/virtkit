@@ -1394,6 +1394,12 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             .context("host_checkout is set but CI_PROJECT_DIR is unset")?;
         let host_dir = ctx.host_checkout_dir();
         let sock = ctx.job_dir.join("cibuild-vfsd.sock");
+        // Mark the read-write export under the use lock before the guest can write, so the
+        // next job re-clones instead of running host `git` in this tree.
+        if !overlay {
+            crate::checkout::mark_guest_writable(&host_dir)
+                .with_context(|| format!("marking host checkout {}", host_dir.display()))?;
+        }
 
         // The checkout tree is 0700 and owned by the user vk runs as (protects the embedded
         // git token at rest). Map the guest job user 1:1 onto that host owner, both ways: the

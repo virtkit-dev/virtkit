@@ -16,10 +16,13 @@
 //! tmpfs, where an abandoned tree costs host RAM that the runner's own concurrency is measured
 //! against.
 
+use std::ffi::OsString;
 use std::io::Write;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, bail};
@@ -214,9 +217,9 @@ fn tree_at(dest: &Path, id: &Path) -> Tree {
 /// belonging to another GitLab executor.
 pub(crate) fn gc_idle(root: &Path, idle: Duration) {
     let now = SystemTime::now();
-    for (dest, Sidecars { lock, used, id, .. }) in checkouts(root) {
-        crate::cachelock::try_reclaim(&lock, &used, idle, now, || {
-            match tree_at(&dest, &id) {
+    for (dest, s) in checkouts(root) {
+        crate::cachelock::try_reclaim(&s.lock, &s.used, idle, now, || {
+            match tree_at(&dest, &s.id) {
                 // Not the tree this bookkeeping dates, so removing it is not ours to do — and
                 // nothing ties the markers to the stranger standing in its place, so retiring
                 // them on its account would be a guess of the same kind. Both stay.
@@ -225,13 +228,13 @@ pub(crate) fn gc_idle(root: &Path, idle: Duration) {
                 // the same race the `NotFound` arm below covers on the far side of the check.
                 // Nothing is left to protect, so retire the markers as our own removal would.
                 Tree::Gone => {
-                    retire(&used, &id);
+                    retire(&s);
                     return;
                 }
                 Tree::Same => {}
             }
             println!("virtkit: evicting idle host checkout {}", dest.display());
-            let removed = match std::fs::remove_dir_all(&dest) {
+            let removed = match remove_tree(&dest) {
                 Ok(()) => true,
                 Err(e) => e.kind() == std::io::ErrorKind::NotFound,
             };
@@ -242,25 +245,24 @@ pub(crate) fn gc_idle(root: &Path, idle: Duration) {
             // later sweep can find. The lock stays either way: it is the inode a new user of this
             // destination blocks on.
             if removed {
-                retire(&used, &id);
+                retire(&s);
             }
         });
     }
 }
 
-/// Drop the markers that date a destination, keeping the lock a new user blocks on. Called
-/// with the destination locked against reclaim: under the sweep's exclusive lock, or under a
-/// use lock whose guard re-stamps `.used` on release.
-fn retire(used: &Path, id: &Path) {
-    let _ = std::fs::remove_file(used);
-    let _ = std::fs::remove_file(id);
+/// Remove the deleted tree's usage, identity and guest-writable markers, keeping the lock a
+/// new user blocks on. Called under the sweep's exclusive lock or a use lock whose guard
+/// re-stamps `.used` on release, so the destination cannot be reclaimed meanwhile.
+fn retire(s: &Sidecars) {
+    let _ = std::fs::remove_file(&s.used);
+    let _ = std::fs::remove_file(&s.id);
+    let _ = std::fs::remove_file(&s.guest_rw);
 }
 
-/// A checkout's bookkeeping, at
-/// `<root>/.virtkit/<slot>/<project>.{inuse,used,tree-id}`. It sits in the root's own metadata
-/// tree rather than inside the checkout, so a sweep can lock a destination before its first clone
-/// ever exists, and can remove the whole tree without unlinking the inode the next user will
-/// synchronize on.
+/// A checkout's bookkeeping, at `<root>/.virtkit/<slot>/<project>.{inuse,used,tree-id,guest-rw}`.
+/// Stored outside the checkout so a sweep can lock the destination before its first clone
+/// and remove the tree without unlinking the lock inode the next user will use.
 struct Sidecars {
     /// The private per-slot directory holding them.
     dir: PathBuf,
@@ -268,6 +270,8 @@ struct Sidecars {
     used: PathBuf,
     /// Names the filesystem identity of the checkout this bookkeeping dates.
     id: PathBuf,
+    /// Present once the tree has been shared read-write with a guest ([`mark_guest_writable`]).
+    guest_rw: PathBuf,
 }
 
 fn sidecars(dest: &Path) -> Result<Sidecars> {
@@ -293,6 +297,7 @@ fn sidecars(dest: &Path) -> Result<Sidecars> {
         lock: sidecar(".inuse"),
         used: sidecar(".used"),
         id: sidecar(".tree-id"),
+        guest_rw: sidecar(".guest-rw"),
         dir,
     })
 }
@@ -332,12 +337,38 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Remove `dest` if its origin differs or `.git` is not a real directory, so the next job's
-/// guest cannot read another remote's objects and refs. This also covers id-less runs whose
-/// slugs fold together. Called before [`claim`]; a fresh clone follows.
+/// Mark `dest` before sharing it read-write with a job's guest (`checkout_overlay = false`).
+/// The marker stays outside the tree, beyond the guest's reach. The guest can rewrite
+/// everything under `dest`, including `.git`, so [`discard_if_untrusted`] prevents later
+/// jobs from running host `git` in it.
+pub(crate) fn mark_guest_writable(dest: &Path) -> Result<()> {
+    let s = sidecars(dest)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&s.guest_rw)
+        .map(drop)
+        .with_context(|| format!("writing {}", s.guest_rw.display()))
+}
+
+/// Remove `dest` if it was shared read-write with an earlier job's guest, whose `.git` config,
+/// hooks and attributes would run on the host the moment `fetch`, `reset` or `clean` read them;
+/// or if its origin differs or `.git` is not a real directory, so the next job's guest cannot
+/// read another remote's objects and refs. This also covers id-less runs whose slugs fold
+/// together. Called before [`claim`]; a fresh clone follows.
 pub(crate) fn discard_if_untrusted(dest: &Path, url: &str) -> Result<()> {
     let s = sidecars(dest)?;
-    let reason = if dest.exists()
+    // A mark that cannot be checked is taken as present: re-cloning costs a fetch's worth of
+    // time, trusting a tree the guest wrote costs the host.
+    let marked = !matches!(
+        s.guest_rw.symlink_metadata(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    let reason = if marked {
+        "it was shared read-write with a guest"
+    } else if dest.exists()
         && origin_of(dest).as_deref().map(without_userinfo) != Some(without_userinfo(url))
     {
         "it is not a checkout of this project's remote"
@@ -348,13 +379,68 @@ pub(crate) fn discard_if_untrusted(dest: &Path, url: &str) -> Result<()> {
         "virtkit: re-cloning host checkout {}: {reason}",
         dest.display()
     );
-    match std::fs::remove_dir_all(dest) {
+    match remove_tree(dest) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("removing {}", dest.display())),
     }
-    retire(&s.used, &s.id);
+    retire(&s);
     Ok(())
+}
+
+/// `remove_dir_all`, retried once after giving the owner full access to every directory in the
+/// tree: a guest that had it read-write can leave a directory its user cannot list or unlink
+/// from (`chmod 000`), which would otherwise fail every later job on the slot.
+fn remove_tree(dest: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dest) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            open_up_dirs(dest);
+            std::fs::remove_dir_all(dest)
+        }
+        r => r,
+    }
+}
+
+/// Add `u+rwx` to `root` and every directory below it. Each directory is reached by an
+/// `O_NOFOLLOW` descriptor opened relative to its parent's, and changed and listed through that
+/// descriptor, so a guest that swaps a directory for a symlink mid-walk sends it nowhere else.
+/// Iterative, since the guest chose the depth; a directory is opened only when popped, and its
+/// parent's descriptor lives only while children of it wait on the stack.
+fn open_up_dirs(root: &Path) {
+    let Ok(root) = vk_fs::open_dir_nofollow(root) else {
+        return;
+    };
+    let mut stack: Vec<(Rc<OwnedFd>, OsString)> = Vec::new();
+    let visit = |dir: OwnedFd, stack: &mut Vec<(Rc<OwnedFd>, OsString)>| {
+        // An `O_PATH` descriptor cannot be `fchmod`ed or listed itself; its `/proc` link names
+        // the very inode it holds, never a path to re-resolve.
+        let at = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+        let Ok(md) = std::fs::metadata(&at) else {
+            return;
+        };
+        let mode = md.permissions().mode() & 0o7777;
+        if mode & 0o700 != 0o700 {
+            let _ = std::fs::set_permissions(&at, std::fs::Permissions::from_mode(mode | 0o700));
+        }
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            return;
+        };
+        let dir = Rc::new(dir);
+        stack.extend(
+            entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| (Rc::clone(&dir), e.file_name())),
+        );
+    };
+    visit(root, &mut stack);
+    while let Some((parent, name)) = stack.pop() {
+        let child = vk_fs::open_dir_in(parent.as_fd(), &name);
+        drop(parent);
+        if let Ok(child) = child {
+            visit(child, &mut stack);
+        }
+    }
 }
 
 /// The `origin` URL recorded in `dest`'s own `.git/config`, read as a file rather than by
@@ -580,8 +666,8 @@ mod tests {
         );
     }
 
-    /// A tree of another remote is removed before reuse, and so is one whose `.git` names no
-    /// remote of ours: the host's `git` must run only in this project's checkout.
+    /// A tree shared read-write with a guest, or one of another remote, is removed before
+    /// reuse: the host's `git` must never run in a repository a guest could configure.
     #[test]
     fn an_untrusted_checkout_is_discarded_before_reuse() {
         let root = root("untrusted");
@@ -609,12 +695,41 @@ mod tests {
         discard_if_untrusted(&dest, url).unwrap();
         assert!(!dest.exists());
 
-        // A `.git` that is not a real directory names no remote of ours: removed.
+        // Shared read-write with a guest, whatever its remote now says: removed, once.
         init(url);
+        mark_guest_writable(&dest).unwrap();
+        discard_if_untrusted(&dest, url).unwrap();
+        assert!(!dest.exists());
+        init(url);
+        discard_if_untrusted(&dest, url).unwrap();
+        assert!(dest.exists(), "the mark goes with the tree it dated");
+
+        // A `.git` that is not a real directory names no remote of ours: removed.
         std::fs::remove_dir_all(dest.join(".git")).unwrap();
         std::os::unix::fs::symlink("/", dest.join(".git")).unwrap();
         discard_if_untrusted(&dest, url).unwrap();
         assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_tree_a_guest_locked_itself_out_of_is_still_discarded() {
+        // With `checkout_overlay = false` the guest can leave a directory its owner cannot list
+        // or unlink from; failing the removal would fail every later job on the slot.
+        let root = root("locked-out");
+        let dest = root.join("0").join("project");
+        let _guard = acquire_use_lock(&dest).unwrap();
+        let sealed = dest.join("a").join("sealed");
+        std::fs::create_dir_all(sealed.join("inner")).unwrap();
+        std::fs::write(sealed.join("inner").join("f"), b"x").unwrap();
+        std::fs::set_permissions(sealed.join("inner"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        mark_guest_writable(&dest).unwrap();
+
+        discard_if_untrusted(&dest, "https://h/p.git").unwrap();
+        assert!(!dest.exists());
+        assert!(!sidecars(&dest).unwrap().guest_rw.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -786,7 +901,7 @@ mod tests {
             lock,
             used,
             id,
-            ..
+            guest_rw,
         } = sidecars(&dest).unwrap();
         assert_eq!(dir, root.join(".virtkit").join("0"));
         assert_eq!(lock.parent(), Some(dir.as_path()));
@@ -803,6 +918,7 @@ mod tests {
             std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
             0o700
         );
+        mark_guest_writable(&dest).unwrap();
         drop(guard);
 
         evict_eventually(&root, &dest);
@@ -811,6 +927,10 @@ mod tests {
         // forever — and the reclaimed tree is not a candidate again either way.
         assert!(!used.exists());
         assert!(!id.exists());
+        assert!(
+            !guest_rw.exists(),
+            "the guest-writable mark goes with its tree"
+        );
         assert!(checkouts(&root).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -938,25 +1058,25 @@ mod tests {
 
     #[test]
     fn a_tree_that_cannot_be_removed_stays_a_candidate() {
-        // A job can leave a directory its own user cannot unlink from — a build tool that drops
-        // read-only output, with `checkout_overlay = false` so guest writes reach the host tree.
-        // The eviction then fails part-way, and the remnant has to stay reclaimable: dropping its
-        // marker would hide it, and the host memory it holds, from every later sweep.
+        // An eviction can fail part-way where opening up the tree's own directories does not
+        // help — here the slot directory above it is read-only, so the emptied tree cannot be
+        // unlinked. The remnant has to stay reclaimable: dropping its marker would hide it, and
+        // the host memory it holds, from every later sweep.
         if unsafe { libc::geteuid() } == 0 {
             return; // root ignores the write bit, so there would be no failure to observe
         }
         let root = root("stuck");
-        let dest = root.join("0").join("project");
-        let stuck = dest.join("build-output");
-        std::fs::create_dir_all(&stuck).unwrap();
-        std::fs::write(stuck.join("artifact"), b"x").unwrap();
-        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let slot = root.join("0");
+        let dest = slot.join("project");
+        std::fs::create_dir_all(dest.join("build-output")).unwrap();
+        std::fs::write(dest.join("build-output").join("artifact"), b"x").unwrap();
         let guard = acquire_use_lock(&dest).unwrap();
         claim(&dest).unwrap();
         drop(guard);
+        std::fs::set_permissions(&slot, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         gc_idle(&root, Duration::ZERO);
-        assert!(stuck.exists(), "the unremovable directory is still there");
+        assert!(dest.exists(), "the unremovable directory is still there");
         let s = sidecars(&dest).unwrap();
         assert!(s.used.is_file(), "the markers outlive a failed removal");
         assert!(s.id.is_file());
@@ -967,7 +1087,7 @@ mod tests {
         );
 
         // Once the obstruction is gone the next sweep finishes the job.
-        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&slot, std::fs::Permissions::from_mode(0o755)).unwrap();
         evict_eventually(&root, &dest);
         assert!(!s.used.exists());
         assert!(!s.id.exists());

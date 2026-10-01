@@ -28,6 +28,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: a `host_checkout` tree a guest could write is no longer reused.** With
+  `checkout_overlay = false` a job's guest could rewrite the checkout's `.git` config and have
+  the next job's host `git` run its commands; such a tree is now re-cloned. A tree shared
+  before upgrading carries no record of it, so with `checkout_overlay = false` empty the
+  checkout root (`checkout_dir`, by default `<state_dir>/checkouts`) once after upgrading.
 - A pull-through `vk-registry` gives up on an upstream that stops responding (10 s to
   connect, 60 s for a manifest or token request, 60 s without data for a blob) and refuses
   an upstream manifest over 4 MiB, the limit a pushed manifest already has, or a token

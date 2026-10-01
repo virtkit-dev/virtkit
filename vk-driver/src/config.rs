@@ -323,7 +323,8 @@ pub struct Executor {
     /// `checkout_overlay_size`; raise MICROVM_MEM if a job needs more) and are discarded with
     /// the VM, which prepare's re-clean of the checkout did anyway. `false` restores the
     /// direct read-write mount — a rw virtio-fs share into an untrusted job guest is added
-    /// host-side attack surface.
+    /// host-side attack surface, and the checkout is re-cloned for every job rather than
+    /// fetched.
     pub checkout_overlay: bool,
     /// How much of the VM's memory the `checkout_overlay` layer may take, as a tmpfs `size=`:
     /// a percentage (`"80%"`, the default) or an absolute `"12G"`/`"512M"`.
