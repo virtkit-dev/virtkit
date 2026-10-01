@@ -305,6 +305,10 @@ pub struct Node {
     /// Whether an update needs a signature by one of `release_keys`. Unset: when any key is
     /// set. A release that carries a signature is checked whenever there are keys.
     pub require_signed: Option<bool>,
+    /// How often the memory each VM on the host holds is measured for the hub: a walk of
+    /// every process of every VM, which on a large VMM takes a while. New VMs are measured
+    /// when they appear; heartbeats in between repeat the last figures. Unset: 30.
+    pub workload_mem_secs: Option<u64>,
 }
 
 impl Node {
@@ -315,6 +319,11 @@ impl Node {
     /// How long `validate` may take.
     pub fn validate_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.validate_timeout_secs.unwrap_or(600))
+    }
+
+    /// How often workloads' memory is measured, at least a second.
+    pub fn workload_mem_every(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.workload_mem_secs.unwrap_or(30).max(1))
     }
 }
 

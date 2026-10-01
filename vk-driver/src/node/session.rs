@@ -1,15 +1,15 @@
 //! One session with the hub: dial, authenticate, then inventory and heartbeats until the
 //! connection fails or the process is told to stop. [`super::run`] redials.
 //!
-//! Nothing in the session loop waits on the host: the inventory and heartbeat are gathered
-//! by a [`Gatherer`] task of their own, since a hung mount's `statvfs` or a held ledger lock
-//! would otherwise stop the loop from noticing that the hub has gone quiet. Every send has
-//! a deadline, and the socket carries keepalives and a `TCP_USER_TIMEOUT`, so a peer that
-//! vanished without a word ends the session rather than wedging it.
+//! Nothing in the session loop waits on the host: the inventory, heartbeat and workloads are
+//! gathered by a [`Gatherer`] task of their own, since a hung mount's `statvfs` or a held
+//! ledger lock would otherwise stop the loop from noticing that the hub has gone quiet. Every
+//! send has a deadline, and the socket carries keepalives and a `TCP_USER_TIMEOUT`, so a peer
+//! that vanished without a word ends the session rather than wedging it.
 
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -27,6 +27,7 @@ use super::Enrollment;
 use super::core::Core;
 use super::identity::Identity;
 use crate::config::Config;
+use crate::workloads::{Listed, Meter};
 
 /// How long dialing, TLS and the WebSocket handshake may take together, and how long each
 /// handshake message may take to arrive.
@@ -85,7 +86,8 @@ enum Ask {
 /// What it answers with.
 pub enum Gathered {
     Inventory(Box<Inventory>),
-    Heartbeat(Heartbeat),
+    /// The heartbeat, and the workloads its memory readings are for.
+    Heartbeat(Heartbeat, Listed),
 }
 
 /// The task that reads the host for the session, for the life of `vk node run`. Asked
@@ -94,20 +96,30 @@ pub enum Gathered {
 pub struct Gatherer {
     ask: mpsc::Sender<Ask>,
     answers: mpsc::Receiver<Gathered>,
+    /// The workloads last gathered, which a new session reports until it gathers its own.
+    workloads: Option<Listed>,
 }
 
 impl Gatherer {
     pub fn spawn(cfg: Arc<Config>) -> Self {
         let (ask, mut asked) = mpsc::channel::<Ask>(2);
         let (answer, answers) = mpsc::channel(4);
+        // Kept across asks, for its cadence and its last figures: one heartbeat is gathered at
+        // a time, so the lock is never contended.
+        let meter = Arc::new(Mutex::new(Meter::new(cfg.node.workload_mem_every())));
         tokio::spawn(async move {
             while let Some(what) = asked.recv().await {
                 let cfg = cfg.clone();
+                let meter = meter.clone();
                 let gathered = tokio::task::spawn_blocking(move || match what {
                     Ask::Inventory => {
                         Gathered::Inventory(Box::new(super::inventory::inventory(&cfg)))
                     }
-                    Ask::Heartbeat => Gathered::Heartbeat(super::inventory::heartbeat(&cfg)),
+                    Ask::Heartbeat => {
+                        let mut meter = meter.lock().unwrap_or_else(PoisonError::into_inner);
+                        let (heartbeat, workloads) = super::inventory::heartbeat(&cfg, &mut meter);
+                        Gathered::Heartbeat(heartbeat, workloads)
+                    }
                 })
                 .await;
                 match gathered {
@@ -120,7 +132,11 @@ impl Gatherer {
                 }
             }
         });
-        Gatherer { ask, answers }
+        Gatherer {
+            ask,
+            answers,
+            workloads: None,
+        }
     }
 
     /// Ask, unless as much is already asked: a gatherer still busy with the last request is
@@ -165,7 +181,10 @@ pub async fn run(
 
     // The node's own state first, so a hub deciding what to resend decides on it.
     let mut changes = core.subscribe();
-    let mut sent = Sent::default();
+    let mut sent = Sent {
+        workloads: gatherer.workloads.clone(),
+        ..Sent::default()
+    };
     sent.sync(&mut ws, core, heartbeat).await?;
     gatherer.drain();
     gatherer.request(Ask::Inventory);
@@ -191,7 +210,13 @@ pub async fn run(
             _ = changes.changed() => sent.sync(&mut ws, core, heartbeat).await?,
             _ = recheck.tick() => gatherer.request(Ask::Inventory),
             Some(gathered) = gatherer.answers.recv() => match gathered {
-                Gathered::Heartbeat(hb) => {
+                Gathered::Heartbeat(hb, workloads) => {
+                    // The report first, so the heartbeat's readings land on the list they are for.
+                    if sent.workloads.as_ref() != Some(&workloads) {
+                        gatherer.workloads = Some(workloads.clone());
+                        sent.workloads = Some(workloads);
+                        sent.sync(&mut ws, core, heartbeat).await?;
+                    }
                     send(&mut ws, &NodeMsg::Heartbeat(hb), heartbeat).await?;
                 }
                 Gathered::Inventory(inventory) => {
@@ -247,13 +272,20 @@ impl Drop for Connected<'_> {
 struct Sent {
     report: Option<Report>,
     acks: HashMap<String, Outcome>,
+    /// The workloads the report carries: gathered off the host, where the rest of it is the
+    /// core's.
+    workloads: Option<Listed>,
 }
 
 impl Sent {
     /// Send the report if it changed, and every ack the hub has not recorded that this session
     /// has not sent as it stands.
     async fn sync(&mut self, ws: &mut Ws, core: &Core, within: Duration) -> Result<()> {
-        let report = core.report();
+        let report = Report {
+            workloads: self.workloads.as_ref().map(|l| l.workloads.clone()),
+            workloads_omitted: self.workloads.as_ref().map_or(0, |l| l.omitted),
+            ..core.report()
+        };
         if self.report.as_ref() != Some(&report) {
             send(ws, &NodeMsg::Report(report.clone()), within).await?;
             self.report = Some(report);
@@ -704,15 +736,17 @@ mod tests {
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, PROTOCOL, PROTOCOL.max).await);
             hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
-            let (mut inventory, mut heartbeat) = (false, false);
+            let (mut inventory, mut heartbeat, mut workloads) = (false, false, false);
             while !(inventory && heartbeat) {
                 match hub_receive(&mut ws).await.unwrap() {
                     NodeMsg::Inventory(_) => inventory = true,
                     NodeMsg::Heartbeat(_) => heartbeat = true,
-                    NodeMsg::Report(_) => {}
+                    NodeMsg::Report(r) => workloads |= r.workloads.is_some(),
                     other => panic!("unexpected {other:?}"),
                 }
             }
+            // The first heartbeat's workloads went out on a report ahead of it.
+            assert!(workloads);
             stop.send(true).unwrap();
             // A close frame, not a dropped socket.
             loop {
@@ -722,6 +756,37 @@ mod tests {
                     other => panic!("expected a close frame, got {other:?}"),
                 }
             }
+        };
+        let (_, ended) = tokio::join!(hub, run(node.0, node.1, gatherer, stopped));
+        ended.unwrap();
+    }
+
+    /// The workloads go out on a report once, and not again with every heartbeat while
+    /// they stay the same.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workloads_are_reported_once_while_they_stay_the_same() {
+        let mut f = fixture("workloads").await;
+        let (node, gatherer, stopped, listener, stop) = f.parts();
+        let key = node.0.identity.public_key().to_vec();
+        let hub = async {
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, PROTOCOL, PROTOCOL.max).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            let (mut heartbeats, mut with_workloads) = (0, 0);
+            while heartbeats < 4 {
+                match next_of(&mut ws, Some).await {
+                    NodeMsg::Heartbeat(_) => {
+                        heartbeats += 1;
+                        // As a hub pings, so the node does not give the session up as silent.
+                        ws.send(Message::Ping(Vec::new().into())).await.unwrap();
+                    }
+                    NodeMsg::Report(r) if r.workloads.is_some() => with_workloads += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(with_workloads, 1);
+            stop.send(true).unwrap();
+            while hub_receive(&mut ws).await.is_some() {}
         };
         let (_, ended) = tokio::join!(hub, run(node.0, node.1, gatherer, stopped));
         ended.unwrap();

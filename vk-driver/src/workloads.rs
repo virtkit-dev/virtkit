@@ -1,5 +1,6 @@
-//! The VMs running on this host for its user, as `vk workloads` lists them: pinned `vk run`s
-//! and `vk dev` environments from the VM registry, CI jobs from the executor's job dirs.
+//! The VMs running on this host for its user, as `vk workloads` lists them and `vk node`
+//! reports them: pinned `vk run`s and `vk dev` environments from the VM registry, CI jobs from
+//! the executor's job dirs.
 //!
 //! Everything is read from what those already keep, never kept apart: the registry's entries,
 //! checked against their state-dir locks as `vk list` checks them (and pruned as it prunes

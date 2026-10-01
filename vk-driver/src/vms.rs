@@ -314,9 +314,9 @@ fn load_all_in(dir: &Path) -> Vec<VmEntry> {
 ///
 /// Asked of `/proc/locks` first, as [`crate::dev::lock_holder`] asks it: taking the lock, even
 /// for an instant, fails a `vk run --state-dir` starting on the same dir at that moment, and
-/// `vk list` and `vk stop` ask on every run, `vk workloads --watch` every couple of seconds.
-/// Only a lock `/proc/locks` does not list — nobody's, or one over NFS — is probed by taking
-/// it, and that is almost always a dead entry's.
+/// `vk list` and `vk stop` ask on every run, `vk workloads --watch` and `vk node` every few
+/// seconds. Only a lock `/proc/locks` does not list — nobody's, or one over NFS — is probed by
+/// taking it, and that is almost always a dead entry's.
 pub fn alive(entry: &VmEntry) -> bool {
     let Ok(f) = std::fs::File::open(&entry.state_dir) else {
         return false;
