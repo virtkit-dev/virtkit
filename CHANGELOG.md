@@ -18,6 +18,9 @@ All notable changes to virtkit will be documented in this file.
 - **`vk-registry gc` collects a store that holds a tagged image index**, such as a
   multi-arch image pulled through the relay. It used to refuse the whole pass; it now keeps
   the index's per-platform manifests and their layers.
+- **`vk-registry status` counts an image index's per-platform manifests and their layers as
+  referenced by tags**, as `gc` keeps them, instead of reporting them as having no tag
+  references. The per-tag sizes on `/browse` include them too.
 - **`vk-registry` refuses a manifest push whose body is not a JSON object** (400
   `MANIFEST_INVALID`), so one can no longer stop garbage collection for as long as its tag
   is read.

@@ -885,6 +885,15 @@ impl Store {
         };
         let file =
             std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        if !is_zstd
+            && file
+                .metadata()
+                .with_context(|| format!("reading {}", path.display()))?
+                .len()
+                > cap as u64
+        {
+            return Ok(None);
+        }
         let mut bytes = Vec::new();
         let limit = cap as u64 + 1;
         if is_zstd {
@@ -1175,35 +1184,33 @@ impl Store {
             .collect()
     }
 
-    /// The distinct blobs a manifest occupies on disk — the manifest blob itself and each
-    /// config/layer it references — as `(hex, on-disk bytes)`, deduped within the one
-    /// manifest and sized in whichever storage form is present. `None` if the manifest blob
-    /// is gone. Lock-free best-effort, like the rest of the `/browse` reads: a blob a
-    /// concurrent gc removes mid-walk is sized 0 rather than failing the page, and an image
-    /// index (no config/layers) accounts only for its own bytes — the same reference set
+    /// The distinct blobs a manifest occupies on disk — the manifest blob itself, each
+    /// config/layer it references, and an index's child manifests and theirs, as the gc mark
+    /// walks them — as `(hex, on-disk bytes)`, deduped within the one manifest and sized in
+    /// whichever storage form is present. `None` if the manifest blob is gone. Lock-free
+    /// best-effort, like the rest of the `/browse` reads: a blob a concurrent gc removes
+    /// mid-walk is sized 0 rather than failing the page. The same reference set
     /// [`Store::stats`] sizes.
     fn manifest_ondisk_blobs(&self, hex: &str) -> Option<Vec<(String, u64)>> {
-        let (mpath, _) = self.find_blob(hex)?;
-        let mut out = vec![(
-            hex.to_string(),
-            std::fs::metadata(&mpath).map(|m| m.len()).unwrap_or(0),
-        )];
-        let mut seen: HashSet<String> = HashSet::from([hex.to_string()]);
-        // The raw manifest bytes parse as JSON because a manifest is always stored
-        // uncompressed (`put_manifest` writes it straight to `blob_path`, never the zstd
-        // pool); an unparseable body references no further blobs.
-        if let Ok(bytes) = std::fs::read(&mpath) {
-            for (dhex, _) in manifest_blob_sizes(&bytes) {
-                if !seen.insert(dhex.clone()) {
-                    continue;
-                }
+        self.find_blob(hex)?;
+        let mut out = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut add = |h: &str| {
+            if seen.insert(h.to_string()) {
                 let size = self
-                    .find_blob(&dhex)
+                    .find_blob(h)
                     .map(|(p, _)| std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0))
                     .unwrap_or(0);
-                out.push((dhex, size));
+                out.push((h.to_string(), size));
             }
-        }
+        };
+        // Not strict, so the walk cannot fail: what it could not read references nothing.
+        let _ = self.walk_manifests(&HashSet::from([hex.to_string()]), false, |m, manifest| {
+            add(m);
+            for (b, _) in manifest.into_iter().flat_map(|(_, refs)| &refs.blobs) {
+                add(b);
+            }
+        });
         Some(out)
     }
 
@@ -1365,7 +1372,10 @@ impl Store {
                     // sweeping the blobs it still references.
                     let d = std::fs::read_to_string(&tag)
                         .with_context(|| format!("reading the tag {}", tag.display()))?;
-                    roots.insert(d.trim().trim_start_matches("sha256:").to_string());
+                    let hex = d.trim().trim_start_matches("sha256:");
+                    if is_blob_hex(hex) {
+                        roots.insert(hex.to_string());
+                    }
                 }
             }
         }
@@ -1402,39 +1412,16 @@ impl Store {
 
         // mark every blob a root manifest references, through an index's child manifests
         // too. A root that does not parse aborts: sweeping with incomplete marks would delete
-        // live data. A child is different: an index may name any blob the pusher can read, so
-        // one that does not read as a manifest — a layer, or anything over a manifest's size —
-        // is kept and references nothing. Aborting on it, or reading it whole, would hand any
-        // pusher a way to stop collection or exhaust memory.
+        // live data. A child that does not read as a manifest is kept and references nothing
+        // (see `walk_manifests`).
         let mut marked: HashSet<String> = HashSet::new();
-        let mut walked: HashSet<String> = HashSet::new();
-        let mut pending: Vec<(String, bool)> = roots.iter().map(|h| (h.clone(), true)).collect();
-        while let Some((hex, root)) = pending.pop() {
-            // A root reached first as some index's child is still read as a root: whole,
-            // and strictly.
-            let root = root || roots.contains(&hex);
-            marked.insert(hex.clone());
-            if !walked.insert(hex.clone()) {
-                continue;
+        self.walk_manifests(&roots, true, |hex, manifest| {
+            marked.insert(hex.to_string());
+            if let Some((_, refs)) = manifest {
+                marked.extend(refs.blobs.iter().map(|(h, _)| h.clone()));
             }
-            let refs = if root {
-                let Some(bytes) = self.get_blob(&hex)? else {
-                    continue; // dangling tag: nothing left to keep alive
-                };
-                manifest_references(&bytes)
-                    .with_context(|| format!("parsing manifest {hex} for the gc mark"))?
-            } else {
-                match self.read_blob_capped(&hex, MAX_MANIFEST_BYTES)? {
-                    Some(bytes) => match manifest_references(&bytes) {
-                        Ok(refs) => refs,
-                        Err(_) => continue,
-                    },
-                    None => continue,
-                }
-            };
-            marked.extend(refs.blobs);
-            pending.extend(refs.manifests.into_iter().map(|m| (m, false)));
-        }
+        })
+        .context("walking the manifests the gc mark keeps")?;
 
         // sweep unmarked blobs idle past the grace window, in both storage forms, noting
         // every hex that keeps at least one form: that — not what is still on disk — is
@@ -1523,14 +1510,69 @@ impl Store {
         Ok(report)
     }
 
+    /// Walk manifests reachable from `roots`, including nested image indexes, once each.
+    /// Call `visit(hex, manifest)` for each digest with its bytes and references if it parses,
+    /// or `None` otherwise. Shared by gc and size reports to count the references gc keeps.
+    ///
+    /// Read roots whole, even when first reached as index children. Cap child reads at
+    /// [`MAX_MANIFEST_BYTES`]; an unparseable child references nothing. An index can name any
+    /// blob its pusher can read, so failing on such children or reading them whole would let
+    /// pushers stop collection or exhaust memory. With `strict` (gc), read errors and root
+    /// parse errors fail the walk. Reports delete nothing, so they visit those as `None`
+    /// and under-report instead.
+    fn walk_manifests(
+        &self,
+        roots: &HashSet<String>,
+        strict: bool,
+        mut visit: impl FnMut(&str, Option<(&[u8], &ManifestReferences)>),
+    ) -> Result<()> {
+        let mut walked: HashSet<String> = HashSet::new();
+        let mut pending: Vec<String> = roots.iter().cloned().collect();
+        while let Some(hex) = pending.pop() {
+            if !walked.insert(hex.clone()) {
+                continue;
+            }
+            let root = roots.contains(&hex);
+            let read = if root {
+                self.get_blob(&hex)
+            } else {
+                self.read_blob_capped(&hex, MAX_MANIFEST_BYTES)
+            };
+            let bytes = match read {
+                Ok(bytes) => bytes,
+                Err(e) if strict => return Err(e),
+                Err(_) => None,
+            };
+            let Some(bytes) = bytes else {
+                visit(&hex, None); // gone, or a child over a manifest's size
+                continue;
+            };
+            match manifest_references(&bytes) {
+                Ok(refs) => {
+                    visit(&hex, Some((&bytes, &refs)));
+                    pending.extend(refs.manifests);
+                }
+                Err(e) if strict && root => {
+                    return Err(e.context(format!("parsing manifest {hex}")));
+                }
+                Err(_) => visit(&hex, None),
+            }
+        }
+        Ok(())
+    }
+
     /// Read-only usage snapshot: on-disk blob totals (both storage forms), in-flight
     /// uploads, and a per-repository breakdown — each repo's tag count, latest tag (by
     /// mtime), and logical size (the blobs its tagged manifests reference, counted once
     /// per repo). `logical_naive` (every reference, no dedup) over `referenced_ondisk`
     /// (the distinct referenced blobs' actual on-disk bytes) is the combined dedup+zstd
-    /// packing factor. The size and packing figures cover tag-reachable manifests only;
-    /// `total_manifests` counts every manifest sidecar, tagged or digest-pinned. Taken
-    /// under the shared lock, so it never reads a store a gc is mid-sweep on.
+    /// packing factor. The size and packing figures cover only the manifests reachable from
+    /// tags, through image indexes, walked per repository as the gc mark walks them (so a
+    /// manifest tagged in one repository but listed by an index in another is read capped
+    /// in the other's walk, which affects only its `logical_bytes`); `total_manifests`
+    /// counts every manifest sidecar, tagged or digest-pinned. Taken under the shared lock,
+    /// so it never reads a store a gc is mid-sweep on. A manifest it cannot read counts
+    /// nothing behind it rather than failing the snapshot.
     pub fn stats(&self) -> Result<StoreStats> {
         let _lock = self.lock_shared()?;
         let mut s = StoreStats::default();
@@ -1603,7 +1645,7 @@ impl Store {
                 })
                 .count();
             // distinct manifests reachable from this repo's tags, and the latest tag.
-            let mut manifest_hexes: BTreeSet<String> = BTreeSet::new();
+            let mut manifest_hexes: HashSet<String> = HashSet::new();
             let mut stage_hexes = Vec::new();
             let mut latest: Option<(SystemTime, String)> = None;
             for tag in dir_files(&repo_dir.join("tags")) {
@@ -1618,10 +1660,12 @@ impl Store {
                 }
                 if let Ok(digest) = std::fs::read_to_string(&tag) {
                     let hex = digest.trim().trim_start_matches("sha256:").to_string();
-                    if stage {
-                        stage_hexes.push(hex.clone());
+                    if is_blob_hex(&hex) {
+                        if stage {
+                            stage_hexes.push(hex.clone());
+                        }
+                        manifest_hexes.insert(hex);
                     }
-                    manifest_hexes.insert(hex);
                 }
                 if let Some(n) = tag.file_name().and_then(|n| n.to_str()) {
                     let m = std::fs::metadata(&tag)
@@ -1633,27 +1677,29 @@ impl Store {
                 }
             }
             r.latest_tag = latest.map(|(_, n)| n);
-            // logical (uncompressed) size of the blobs those manifests reference, deduped
-            // within the repo; `logical_naive`/`referenced_ondisk` accumulate globally.
+            // logical (uncompressed) size of the blobs those manifests reference, through
+            // an index's child manifests as the gc mark walks them, deduped within the repo;
+            // `logical_naive`/`referenced_ondisk` accumulate globally.
             let mut repo_seen: HashSet<String> = HashSet::new();
-            for hex in &manifest_hexes {
+            // Not strict, so the walk cannot fail: what it could not read references nothing.
+            let _ = self.walk_manifests(&manifest_hexes, false, |hex, manifest| {
                 ondisk(hex, &mut s, &mut referenced);
-                let Some(bytes) = self.get_blob(hex)? else {
-                    continue;
+                let Some((bytes, refs)) = manifest else {
+                    return;
                 };
                 // the manifest blob is in `referenced_ondisk` (above), so its own bytes
                 // count toward the logical total too — keeps the packing ratio symmetric.
                 s.logical_naive += bytes.len() as u64;
-                for (dhex, size) in manifest_blob_sizes(&bytes) {
+                for (dhex, size) in &refs.blobs {
                     s.logical_naive += size;
-                    ondisk(&dhex, &mut s, &mut referenced);
-                    if repo_seen.insert(dhex) {
+                    ondisk(dhex, &mut s, &mut referenced);
+                    if repo_seen.insert(dhex.clone()) {
                         r.logical_bytes += size;
                     }
                 }
-            }
+            });
             for hex in stage_hexes {
-                if let Some(bytes) = self.get_blob(&hex)?
+                if let Ok(Some(bytes)) = self.get_blob(&hex)
                     && let Some(size) = stage_data_size(&bytes)
                     && let Some(total) = s.stage_data_bytes.checked_add(size)
                 {
@@ -1890,8 +1936,8 @@ pub struct RepoStat {
 
 /// A manifest's referenced descriptors, in order: its config (if any) then each layer,
 /// as `(label, descriptor)`. Structural, so it needs no OCI types and tolerates media
-/// types it does not know — the one walk [`manifest_references`], [`manifest_blob_sizes`]
-/// and `/browse`'s detail page all read the referenced blobs out of.
+/// types it does not know — the one walk [`manifest_references`] and `/browse`'s detail
+/// page both read the referenced blobs out of.
 pub(crate) fn manifest_descriptors(
     manifest: &serde_json::Value,
 ) -> Vec<(&'static str, &serde_json::Value)> {
@@ -1968,10 +2014,11 @@ fn is_json_object(body: &[u8]) -> bool {
 }
 
 /// What a manifest keeps alive, read structurally so the gc mark needs no OCI types and
-/// tolerates media types it doesn't know: its config and every layer (`blobs`), and an
-/// index's child manifests (`manifests`), which the mark walks in turn.
+/// tolerates media types it doesn't know: its config and every layer (`blobs`, each with
+/// its descriptor's `size`, 0 if missing), and an index's child manifests (`manifests`),
+/// which the mark walks in turn.
 struct ManifestReferences {
-    blobs: Vec<String>,
+    blobs: Vec<(String, u64)>,
     manifests: Vec<String>,
 }
 
@@ -1979,42 +2026,19 @@ fn manifest_references(manifest: &[u8]) -> Result<ManifestReferences> {
     let v: serde_json::Value = serde_json::from_slice(manifest).context("not JSON")?;
     // Only `sha256:<lowercase hex>`, as [`manifest_child_hexes`] reads them: anything else
     // names nothing this store holds, and as a path component it could name anything at all.
-    fn hexes<'a>(ds: impl Iterator<Item = Option<&'a serde_json::Value>>) -> Vec<String> {
-        ds.filter_map(|d| d?.as_str()?.strip_prefix("sha256:"))
-            .filter(|h| is_blob_hex(h))
-            .map(str::to_string)
-            .collect()
+    fn hex(d: &serde_json::Value) -> Option<String> {
+        let h = d.pointer("/digest")?.as_str()?.strip_prefix("sha256:")?;
+        is_blob_hex(h).then(|| h.to_string())
     }
+    let size = |d: &serde_json::Value| d.pointer("/size").and_then(|s| s.as_u64()).unwrap_or(0);
     let children = v.pointer("/manifests").and_then(|m| m.as_array());
     Ok(ManifestReferences {
-        blobs: hexes(
-            manifest_descriptors(&v)
-                .into_iter()
-                .map(|(_, d)| d.pointer("/digest")),
-        ),
-        manifests: hexes(children.into_iter().flatten().map(|m| m.pointer("/digest"))),
+        blobs: manifest_descriptors(&v)
+            .into_iter()
+            .filter_map(|(_, d)| Some((hex(d)?, size(d))))
+            .collect(),
+        manifests: children.into_iter().flatten().filter_map(hex).collect(),
     })
-}
-
-/// `(digest hex, descriptor size)` for a manifest's config and every layer, read
-/// structurally like [`manifest_references`]. Tolerant: an unparseable blob yields
-/// nothing (a status read must not fail on one odd manifest), and a missing `size`
-/// counts as 0.
-fn manifest_blob_sizes(manifest: &[u8]) -> Vec<(String, u64)> {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(manifest) else {
-        return Vec::new();
-    };
-    manifest_descriptors(&v)
-        .into_iter()
-        .filter_map(|(_, d)| {
-            let hex = d.pointer("/digest").and_then(|x| x.as_str())?;
-            let size = d
-                .pointer("/size")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            Some((hex.trim_start_matches("sha256:").to_string(), size))
-        })
-        .collect()
 }
 
 /// [`dir_files`] for the directories [`Store::gc`] decides removals against, where a
@@ -5143,6 +5167,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An index may list another index: the mark, and `status`, follow the nesting down to the
+    /// leaf manifest's blobs.
+    #[test]
+    fn gc_and_stats_follow_an_index_of_an_index() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcnested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let config = store.put_blob(b"{}").unwrap();
+        let layer = store.put_blob(&[8u8; 4096]).unwrap();
+        let stray = store.put_blob(&[9u8; 4096]).unwrap();
+        let by_digest = |body: &[u8], media: &str| {
+            store
+                .put_manifest(
+                    "repo",
+                    &format!("sha256:{}", sha256_hex_raw(body)),
+                    media,
+                    body,
+                )
+                .unwrap()
+        };
+        let index_of = |child: &str| {
+            serde_json::json!({
+                "schemaVersion": 2,
+                "manifests": [{"mediaType": DEFAULT_MANIFEST_TYPE, "digest": child, "size": 1}],
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let leaf = by_digest(&manifest_body(&config, &[&layer]), DEFAULT_MANIFEST_TYPE);
+        let inner = by_digest(&index_of(&leaf), "application/vnd.oci.image.index.v1+json");
+        store
+            .put_manifest(
+                "repo",
+                "nested",
+                "application/vnd.oci.image.index.v1+json",
+                &index_of(&inner),
+            )
+            .unwrap();
+
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+        touch(&store.tag_path("repo", "nested"));
+        store.gc(DAY * 30, DAY, false).unwrap();
+        for kept in [&inner, &leaf, &config, &layer] {
+            assert!(store.find_blob(&hex(kept)).is_some(), "{kept} was swept");
+        }
+        assert!(
+            store.find_blob(&hex(&stray)).is_none(),
+            "the stray survived"
+        );
+
+        let s = store.stats().unwrap();
+        assert_eq!(s.referenced_ondisk, s.identity_bytes + s.zstd_bytes);
+        assert_eq!(s.repos[0].logical_bytes, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A tagged manifest that a tagged index also lists is read as the root it is, however
     /// the mark reaches it first: as a child it would be capped at a manifest's size, and
     /// one larger (stored before that cap, or through the relay) would lose its layers.
@@ -6453,18 +6535,6 @@ mod tests {
         assert_eq!(human_bytes(1 << 30), "1.0 GiB");
     }
 
-    #[test]
-    fn manifest_blob_sizes_reads_config_and_layers() {
-        let m = br#"{"config":{"digest":"sha256:aa","size":10},
-                     "layers":[{"digest":"sha256:bb","size":20},
-                               {"digest":"sha256:cc","size":30}]}"#;
-        assert_eq!(
-            manifest_blob_sizes(m),
-            vec![("aa".into(), 10), ("bb".into(), 20), ("cc".into(), 30),]
-        );
-        assert!(manifest_blob_sizes(b"not json").is_empty());
-    }
-
     /// The repository total dedups a blob shared between two tags, while each per-tag figure
     /// counts that tag's whole footprint — so the per-tag figures overcount the total by
     /// exactly the shared blob, and the total is every distinct blob once.
@@ -6595,6 +6665,89 @@ mod tests {
         // on disk: the three distinct blobs (compressed) + the manifest, each once.
         assert!(s.referenced_ondisk > 0 && s.referenced_ondisk < raw);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tagged image index's child manifests, and what they reference, count as referenced
+    /// in `status` and on `/browse`, as the gc mark keeps them: nothing the gc would keep is
+    /// reported as reclaimable.
+    #[test]
+    fn stats_counts_an_index_child_as_referenced() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-statsidx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let config = store.put_blob(b"{}").unwrap();
+        let layer = store.put_blob(&[8u8; 4096]).unwrap();
+        let body = manifest_body(&config, &[&layer]);
+        let child = store
+            .put_manifest(
+                "repo",
+                &format!("sha256:{}", sha256_hex_raw(&body)),
+                DEFAULT_MANIFEST_TYPE,
+                &body,
+            )
+            .unwrap();
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [{"mediaType": DEFAULT_MANIFEST_TYPE, "digest": child, "size": body.len()}],
+        })
+        .to_string()
+        .into_bytes();
+        store
+            .put_manifest(
+                "repo",
+                "multi",
+                "application/vnd.oci.image.index.v1+json",
+                &index,
+            )
+            .unwrap();
+
+        let s = store.stats().unwrap();
+        assert_eq!(s.referenced_ondisk, s.identity_bytes + s.zstd_bytes);
+        assert_eq!(s.logical_naive, (index.len() + body.len() + 1 + 1) as u64);
+        assert_eq!(s.repos[0].logical_bytes, 2);
+        let (per, total) = store.repo_size_report("repo", &["multi".into()]);
+        assert_eq!(per, vec![Some(total)]);
+        assert_eq!(total, s.referenced_ondisk);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `status` sizes only what the gc mark would keep: a digest that is not
+    /// `sha256:<lowercase hex>` — uppercase, or shaped like a path out of the store — names
+    /// nothing here and counts for nothing.
+    #[test]
+    fn stats_ignores_a_digest_that_names_no_blob() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-statsodd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let layer = store.put_blob(&[8u8; 4096]).unwrap();
+        // A file outside the store a path-shaped digest leads to.
+        let outside_name = format!("vk-stats-outside-{}", std::process::id());
+        let outside = dir.parent().unwrap().join(&outside_name);
+        std::fs::write(&outside, [5u8; 8192]).unwrap();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"digest": format!("sha256:../../../{outside_name}"), "size": 1000},
+            "layers": [
+                {"digest": layer, "size": 1},
+                {"digest": layer.to_uppercase().replace("SHA256:", "sha256:"), "size": 2000},
+            ],
+        })
+        .to_string()
+        .into_bytes();
+        store
+            .put_manifest("repo", "odd", DEFAULT_MANIFEST_TYPE, &manifest)
+            .unwrap();
+
+        let s = store.stats().unwrap();
+        assert_eq!(s.repos[0].logical_bytes, 1);
+        assert_eq!(s.logical_naive, manifest.len() as u64 + 1);
+        assert_eq!(s.referenced_ondisk, s.identity_bytes + s.zstd_bytes);
+
+        let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

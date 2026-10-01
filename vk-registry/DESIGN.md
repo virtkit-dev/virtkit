@@ -571,9 +571,10 @@ service; an operator can still stop the server and use direct database access.
 ## Garbage collection and reporting
 
 `status` reports stored blob bytes split by whether tags reference them, with in-progress
-uploads counted separately. The repository table lists tag counts. Bytes without tag
-references are not a prediction of what `gc` will reclaim: its retention and grace windows
-still apply.
+uploads counted separately. A blob counts as referenced when the `gc` mark would reach it
+from a tag, image indexes included. The repository table lists tag counts. Bytes without
+tag references are not a prediction of what `gc` will reclaim: its retention and grace
+windows still apply.
 
 `Stage data` is the uncompressed data in recorded completed build stages, including builder
 stages but excluding intermediate instruction checkpoints. It sums the chunk placement
