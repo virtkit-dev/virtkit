@@ -4618,6 +4618,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "vk-hub"
+version = "0.79.3"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "jemallocator",
+ "libc",
+ "redb",
+ "ring",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "vk-fleet-proto",
+ "vk-fs",
+]
+
+[[package]]
 name = "vk-registry"
 version = "0.79.3"
 dependencies = [

@@ -1,0 +1,69 @@
+/* vk-hub web UI. Loaded as a file: the policy allows no inline style. */
+:root {
+  --fg: #1d2125;
+  --muted: #5e6873;
+  --line: #d9dee3;
+  --bg: #ffffff;
+  --band: #f4f6f8;
+  --down: #a33a2a;
+  --accent: #1f5fa8;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e3e6e9;
+    --muted: #9aa4ae;
+    --line: #3a4148;
+    --bg: #16191c;
+    --band: #1f2327;
+    --down: #e0705f;
+    --accent: #7fb0ea;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem 1rem;
+  background: var(--band);
+  border-bottom: 1px solid var(--line);
+}
+nav a { margin-right: 1rem; font-weight: 600; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+main { padding: 1rem; max-width: 110rem; }
+h1 { font-size: 1.3rem; margin: 0 0 0.75rem; }
+h2 { font-size: 1rem; margin: 1.25rem 0 0.4rem; }
+code { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.who { color: var(--muted); display: flex; gap: 0.5rem; align-items: center; margin: 0; }
+.sub, .empty { color: var(--muted); }
+.message { max-width: 40rem; margin: 3rem auto; font-size: 1rem; }
+table { border-collapse: collapse; }
+table.grid { width: 100%; }
+table.grid th, table.grid td {
+  text-align: left;
+  padding: 0.3rem 0.6rem;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+table.grid th { color: var(--muted); font-weight: 600; }
+table.grid tr.down td { color: var(--down); }
+table.kv th, table.kv td { text-align: left; padding: 0.15rem 1rem 0.15rem 0; vertical-align: top; }
+table.kv th { color: var(--muted); font-weight: normal; white-space: nowrap; }
+.notes { color: var(--down); padding-left: 1.2rem; }
+.filter { margin-bottom: 0.75rem; }
+.actions { display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; align-items: center; }
+.actions form { display: flex; gap: 0.4rem; align-items: center; margin: 0; }
+.actions input[type="number"] { width: 5rem; }
+#flash:empty { display: none; }
+#flash { padding: 0.4rem 0.6rem; margin: 0.5rem 0; background: var(--band); border-left: 3px solid var(--accent); }
+#flash.error { border-left-color: var(--down); }
+button { font: inherit; padding: 0.15rem 0.6rem; cursor: pointer; }

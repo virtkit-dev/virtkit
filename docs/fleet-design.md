@@ -1,7 +1,8 @@
 # Fleet: a hub and its nodes
 
 Status: proposal, implemented in part and experimental: the list of the VMs a host runs
-(`vk workloads`). Everything else below is not built yet.
+(`vk workloads`), and local mode's web UI showing it (`vk-hub local`), signed into with links
+it prints. Everything else below is not built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -283,9 +284,40 @@ In order of priority:
 
 Metrics for capacity, admission waits and node states are exported for Prometheus.
 
+Built so far, in [local mode](#local-mode): the server-rendered pages, their sign-in and the
+policy above, with the listener's timeouts on everything before a request is authenticated.
+
+### Signing in
+
+A person signs in with a single-use link — `<origin>/login?t=<token>` — that the hub prints,
+or issues over its admin socket: `vk-hub local login [--role viewer|operator] [--ttl 10m]`.
+The token is short-lived and stored hashed. Opening the link shows a "Sign in" button, and
+only the `POST` it makes — from the sign-in page itself, by `Sec-Fetch-Site` — spends the
+token, so a mail scanner or a chat's link preview fetching the link leaves it unused. The
+post opens a session: a random secret set as a cookie (`HttpOnly`, `SameSite=Strict`,
+`Path=/`, and `Secure` with the `__Host-` prefix over https), kept hashed in the database
+with its role, and valid for 12 hours. The page it answers moves on to `/` itself, so the
+token never stays in the address bar. `vk-hub local sessions` lists the sessions, `vk-hub
+local logout <id>|--all` ends them.
+
+Browsers keep cookies apart by host, not by port. On plain http — which the UI serves only
+on loopback — the session cookie therefore goes to every other http service on that host,
+and any of them can set a cookie of the same name. The hub treats a request carrying two
+session cookies as signed in with neither, but cannot stop the first from being read: a UI
+on plain http is served under a name of its own (see [Local mode](#local-mode)).
+
+Every state-changing request is a `POST` from the UI's own origin — its `Origin`, or
+`Sec-Fetch-Site: same-origin` — carrying a CSRF token derived from the session's secret, and
+is done as the session's principal, `ui session <id> (<role>)`, which is what the audit log
+records.
+
+Links stand in for a login until people sign in through OIDC, with the identity layer the
+hub shares with `vk-registry` ([Authentication for submitted jobs](#authentication-for-submitted-jobs)),
+which then replaces them; the session and its role stay as they are.
+
 ## Local mode
 
-Not built yet. `vk-hub local` runs the hub for the one machine it is started on, for a person
+`vk-hub local` runs the hub for the one machine it is started on, for a person
 watching and controlling their own VMs — the role virt-manager plays for libvirt:
 
 - no enrollment and no node session: it runs as the user who owns the VMs and reads the
@@ -316,6 +348,18 @@ isolated by port. The local UI is therefore served under a name of its own,
 Strict) off `localhost`, `127.0.0.1` and other `*.localhost` names on every port. It still
 reaches the same name on other ports, which is why the name is random.
 
+Built so far: `vk-hub local [--port N] [--no-browser] [--vk PATH]` keeps its database, admin
+socket and name — `vk-<16 hex digits>.localhost`, drawn once — in
+`$XDG_STATE_HOME/virtkit/hub-local` (or `--state-dir`), serves on `127.0.0.1` (a port the
+system picks unless `--port`), and prints an operator's sign-in link valid for an hour;
+unless `--no-browser` it opens the link with `xdg-open` through a page in that private
+directory, so the token never sits in a command line another local user can read. It runs
+`vk workloads --watch` — the `vk` beside it, else the one on `PATH` — for as long as it
+serves, starting it again with a backoff when it ends, and shows the list it prints, each VM
+with a page of its own. A child rather than a command run again every few seconds, so the
+memory figures keep their own cadence; a list of a version the hub cannot read is refused
+rather than misread. Actions, the console log, atop and egress views are not built yet.
+
 ## Security
 
 - Nodes accept typed operations only, never a shell command, each checked against the
@@ -327,6 +371,13 @@ reaches the same name on other ports, which is why the name is random.
 - Hub roles: viewer; operator (ceilings, drain, reset, rollouts); admin (enrollment,
   redeploy). BMC credentials are held apart and used only by redeploys.
 - The web UI and the node endpoint are separate listeners with separate authentication.
+  Every UI response carries `Content-Security-Policy: default-src 'self'; script-src 'self';
+  style-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none';
+  form-action 'self'; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`,
+  `Referrer-Policy: same-origin` and, over https, `Strict-Transport-Security`; pages are
+  `no-store`. A request whose `Host` is not the UI's own is refused with 421, so a page on
+  another name that resolves to the UI's address reaches nothing (DNS rebinding); a reverse
+  proxy in front of the UI must pass the `Host` it was asked for.
 - The hub runs on its own host; its database and secrets are backed up, and a restored hub
   reconciles against the nodes before it sends anything.
 

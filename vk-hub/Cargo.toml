@@ -1,0 +1,35 @@
+[package]
+name = "vk-hub"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# A web UI for vk's VMs: `vk-hub local` serves the machine it runs on. Built like
+# `vk-registry`'s server — hyper over tokio, a redb database — so the two daemons share their
+# operational shape.
+[[bin]]
+name = "vk-hub"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+# `process`: the `vk` commands local mode runs
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util", "sync", "process"] }
+redb.workspace = true
+ring.workspace = true
+sha2.workspace = true
+libc.workspace = true
+# the admin socket's private bind
+vk-fs = { path = "../vk-fs" }
+vk-fleet-proto = { path = "../vk-fleet-proto" }
+
+[target.'cfg(target_env = "musl")'.dependencies]
+jemallocator.workspace = true

@@ -20,8 +20,8 @@ Skip badges on restatements, tool output, and descriptions of your own next step
 ## Project Overview
 
 virtkit — a rootless microVM toolkit shipped as static-musl binaries (`vk` + the
-embedded `vk-agent`, plus the optional `vk-registry` central server and the
-`vk-runnerctl` runner throttle), with the VMM built in. It boots OCI/Docker images as fast microVMs on its embedded
+embedded `vk-agent`, plus the optional `vk-registry` central server, the
+`vk-runnerctl` runner throttle and the experimental `vk-hub` web UI), with the VMM built in. It boots OCI/Docker images as fast microVMs on its embedded
 [libkrun](https://github.com/containers/libkrun) VMM ([Cloud Hypervisor](https://www.cloudhypervisor.org/)
 stays available as an external backend via `VIRTKIT_VMM=cloud-hypervisor`), gives
 them a shared LAN with egress over ordinary host sockets (no tap, no bridge, no
@@ -31,7 +31,7 @@ The same codebase powers local compose-service VMs and a GitLab custom executor.
 
 ## Architecture
 
-A Cargo workspace (`Cargo.toml`, edition 2024) with eight crates:
+A Cargo workspace (`Cargo.toml`, edition 2024) with nine crates:
 
 - **`vk-core/`** — the shared host↔guest library: the wire protocol (`messages`,
   `framing`, `addr`, `net`, `status`, `fleetctl`), the formats both sides speak (`atop`,
@@ -66,6 +66,10 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with eight crates:
   `libc` and `anyhow`, so every crate here can use it — `vk-runnerctl` included.
 - **`vk-fleet-proto/`** — what `vk` and `vk-hub` exchange: the list of a host's VMs
   `vk workloads` prints. Types and pure functions only — no runtime, transport or crypto.
+- **`vk-hub/`** — the hub (bin, experimental): `vk-hub local` serves a web UI for the VMs of
+  the machine it runs on, read from `vk workloads --watch`, with sessions signed into by
+  single-use links and an audit log in a redb database. Built like the `vk-registry` server
+  (hyper on tokio); its admin socket is private to its user. See `docs/fleet-design.md`.
 - **`vk-runnerctl/`** — the only component that runs as root, and deliberately the smallest:
   it sets gitlab-runner's `concurrent` from a number unprivileged `vk` leaves in a file,
   clamped into a range only root can configure. It takes no arguments and no paths from its
