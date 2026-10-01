@@ -33,10 +33,10 @@ use anyhow::{Context, Result, bail};
 // >= 0 on success, a negative errno on failure.
 use krun::{
     KRUN_EXIT_GUEST_RESET, krun_add_disk3, krun_add_net_tap, krun_add_net_unixstream2,
-    krun_add_virtiofs7, krun_add_vsock_port2, krun_create_ctx, krun_disable_balloon,
-    krun_disable_implicit_init, krun_get_shutdown_eventfd, krun_init_log,
-    krun_set_block_dirty_socket, krun_set_console_output, krun_set_kernel, krun_set_nested_virt,
-    krun_set_pmu, krun_set_vm_config, krun_start_enter,
+    krun_add_virtiofs7, krun_add_vsock, krun_add_vsock_port2, krun_create_ctx,
+    krun_disable_balloon, krun_disable_implicit_init, krun_disable_implicit_vsock,
+    krun_get_shutdown_eventfd, krun_init_log, krun_set_block_dirty_socket, krun_set_console_output,
+    krun_set_kernel, krun_set_nested_virt, krun_set_pmu, krun_set_vm_config, krun_start_enter,
 };
 
 use crate::vmm::{Disk, Net, VmSpec};
@@ -159,6 +159,17 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         let ctx = krun_create_ctx();
         ck("krun_create_ctx", ctx)?;
         let ctx = ctx as u32;
+
+        // An explicit vsock with no TSI. Left implicit, libkrun turns on TSI's inet hijack
+        // whenever the VM has no NIC — `net.mode = "none"`, the default — and TSI lets the
+        // guest have the VMM open, connect and *listen on* host sockets, past the switch and
+        // every egress policy. Only a guest kernel with the TSI patches can ask, and a job can
+        // bring its own kernel. The port maps below still ride this device.
+        ck(
+            "krun_disable_implicit_vsock",
+            krun_disable_implicit_vsock(ctx),
+        )?;
+        ck("krun_add_vsock", krun_add_vsock(ctx, 0))?;
 
         // libkrun's API takes a u8 vCPU count; refuse rather than silently wrap
         // (e.g. `--cpus host` on a 256-core machine would truncate to 0).

@@ -15,6 +15,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: a VM without network (`net.mode = "none"`, the default) no longer offers
+  libkrun's transparent socket impersonation (TSI).** A guest kernel with the TSI patches,
+  which a job can bring, could have the VMM open, connect and listen on host sockets past
+  the switch and every egress policy.
 - **Security: a guest can no longer reach the host's loopback or link-local addresses**,
   such as services bound to `127.0.0.1` or a cloud's metadata endpoint at `169.254.169.254`.
   Only a plain TCP SYN was refused there: under the default open egress policy, or through
