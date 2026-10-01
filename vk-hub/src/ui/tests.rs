@@ -373,10 +373,10 @@ async fn the_vms_are_listed_each_with_a_page() {
     let reply = get(addr, "/", Some(&cookie)).await;
     assert_eq!(reply.status, 200);
     assert!(reply.body.contains("Asking"), "{}", reply.body);
-    local.set_listing(Listing::Failed("it exited (exit status: 1)".into()));
+    local.set_listing(Listing::Failed("it exited (exit status: 1)".into()), &hub);
     let reply = get(addr, "/", Some(&cookie)).await;
     assert!(reply.body.contains("exit status: 1"), "{}", reply.body);
-    local.set_listing(listed(Vec::new()));
+    local.set_listing(listed(Vec::new()), &hub);
     assert!(
         get(addr, "/", Some(&cookie))
             .await
@@ -385,7 +385,7 @@ async fn the_vms_are_listed_each_with_a_page() {
     );
 
     let id = "0123456789abcdef";
-    local.set_listing(listed(vec![workload(id, "alpine:3.20")]));
+    local.set_listing(listed(vec![workload(id, "alpine:3.20")]), &hub);
     let reply = get(addr, "/", Some(&cookie)).await;
     assert!(
         reply.body.contains(&format!("href=\"/vm/{id}\"")),
@@ -419,7 +419,7 @@ async fn a_hostile_vm_is_shown_as_text() {
     w.workspace = Some(format!("{hostile}\u{202e}"));
     let mut odd = workload(hostile, "x");
     odd.state_dir = hostile.into();
-    local.set_listing(listed(vec![w, odd]));
+    local.set_listing(listed(vec![w, odd]), &hub);
     hub.db
         .create_login(
             Role::Viewer,
@@ -639,4 +639,228 @@ async fn a_form_too_large_or_too_slow_is_refused() {
         String::from_utf8_lossy(&resp)
     );
     assert_eq!(hub.db.ui_sessions(crate::now_secs()).unwrap().len(), 1);
+}
+
+/// An event stream's response, read by hand through its chunked framing.
+struct Events {
+    stream: tokio::net::TcpStream,
+    head: String,
+    buf: Vec<u8>,
+    /// Decoded body not yet returned.
+    body: String,
+    /// The last chunk has been read.
+    ended: bool,
+}
+
+impl Events {
+    async fn open(addr: SocketAddr, path: &str, cookie: &str) -> Events {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nCookie: {cookie}\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut events = Events {
+            stream,
+            head: String::new(),
+            buf: Vec::new(),
+            body: String::new(),
+            ended: false,
+        };
+        while !events.buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            assert!(events.fill().await, "no response head");
+        }
+        let split = events
+            .buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap();
+        events.head = String::from_utf8(events.buf[..split].to_vec()).unwrap();
+        events.buf.drain(..split + 4);
+        events
+    }
+
+    /// Read more; `false` at the end of the connection.
+    async fn fill(&mut self) -> bool {
+        let mut chunk = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(10), self.stream.read(&mut chunk))
+            .await
+            .expect("the stream went quiet")
+            .unwrap();
+        self.buf.extend_from_slice(&chunk[..n]);
+        n > 0
+    }
+
+    /// The next event, comments skipped; `None` once the stream has ended.
+    async fn next(&mut self) -> Option<String> {
+        loop {
+            // Whole chunks into `body`.
+            while let Some(line_end) = self.buf.windows(2).position(|w| w == b"\r\n") {
+                let size =
+                    usize::from_str_radix(std::str::from_utf8(&self.buf[..line_end]).unwrap(), 16)
+                        .unwrap();
+                if size == 0 {
+                    self.ended = true;
+                    break;
+                }
+                if self.buf.len() < line_end + 2 + size + 2 {
+                    break;
+                }
+                let data = self.buf[line_end + 2..line_end + 2 + size].to_vec();
+                self.body.push_str(&String::from_utf8(data).unwrap());
+                self.buf.drain(..line_end + 2 + size + 2);
+            }
+            while let Some(end) = self.body.find("\n\n") {
+                let event: String = self.body.drain(..end + 2).collect();
+                if !event.starts_with(':') {
+                    return Some(event);
+                }
+            }
+            if self.ended || !self.fill().await {
+                return None;
+            }
+        }
+    }
+}
+
+/// The stream's next event containing `want`, within a few.
+async fn next_with(events: &mut Events, want: &str) -> String {
+    for _ in 0..5 {
+        let event = events.next().await.unwrap();
+        if event.contains(want) {
+            return event;
+        }
+    }
+    panic!("no event with {want:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_page_is_kept_live_over_server_sent_events() {
+    let (addr, hub, origin, local) = start_local(None).await;
+    let id = "0123456789abcdef";
+    local.set_listing(listed(vec![workload(id, "alpine:3.20")]), &hub);
+    assert_eq!(get(addr, "/events/vms", None).await.status, 401);
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let mut events = Events::open(addr, "/events/vms", &cookie).await;
+    let head = events.head.to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("content-type: text/event-stream"), "{head}");
+    assert!(head.contains("cache-control: no-store"), "{head}");
+    assert!(
+        head.contains(&format!("content-security-policy: {CSP}")),
+        "{head}"
+    );
+    // The current table at once, as a single `vms` event.
+    let first = events.next().await.unwrap();
+    assert!(first.starts_with("event: vms\ndata: <table"), "{first}");
+    assert!(first.contains("alpine:3.20"), "{first}");
+
+    // A VM starting wakes the stream; what `vk` says of it arrives as text, however it is
+    // written.
+    let hostile = "app<script>alert(1)</script>\n\nevent: evil\ndata: <img src=x onerror=alert(2)>";
+    local.set_listing(
+        listed(vec![
+            workload(id, "alpine:3.20"),
+            workload("fedcba9876543210", hostile),
+        ]),
+        &hub,
+    );
+    let next = next_with(&mut events, "app&lt;script&gt;").await;
+    assert!(next.starts_with("event: vms\ndata: "), "{next}");
+    assert!(
+        !next.contains("<script") && !next.contains("<img"),
+        "{next}"
+    );
+    assert!(!next.contains("\nevent: evil"), "{next}");
+
+    // A VM's page streams its own fragment, and says when the VM is gone.
+    let mut detail = Events::open(addr, &format!("/events/vm/{id}"), &cookie).await;
+    let first = detail.next().await.unwrap();
+    assert!(first.starts_with("event: vm\ndata: "), "{first}");
+    assert!(first.contains("/s/alpine:3.20"), "{first}");
+    local.set_listing(listed(Vec::new()), &hub);
+    next_with(&mut detail, "no longer running").await;
+    next_with(&mut events, "No VM is running").await;
+    assert_eq!(get(addr, "/events/vm/zz", Some(&cookie)).await.status, 404);
+
+    // Signed out: each stream says so in its region, closes, and ends.
+    let reply = request(
+        addr,
+        "POST",
+        "/logout",
+        &[&format!("Cookie: {cookie}"), &format!("Origin: {origin}")],
+        &format!("_csrf={csrf}"),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    for (stream, name) in [(&mut events, "vms"), (&mut detail, "vm")] {
+        let last = next_with(stream, "Signed out").await;
+        assert!(last.starts_with(&format!("event: {name}\n")), "{last}");
+        assert_eq!(
+            stream.next().await.as_deref(),
+            Some("event: close\ndata: \n\n")
+        );
+        assert_eq!(stream.next().await, None);
+    }
+    assert_eq!(get(addr, "/events/vms", Some(&cookie)).await.status, 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn live_pages_are_capped_per_session_and_in_all() {
+    let (addr, hub, _) = start().await;
+    let (first, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let (second, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let mut open = Vec::new();
+    for _ in 0..sse::MAX_SESSION_STREAMS {
+        let mut stream = Events::open(addr, "/events/vms", &first).await;
+        assert!(stream.head.starts_with("HTTP/1.1 200"), "{}", stream.head);
+        stream.next().await.unwrap();
+        open.push(stream);
+    }
+    let over = get(addr, "/events/vms", Some(&first)).await;
+    assert_eq!(over.status, 429);
+    assert_eq!(over.header("retry-after"), Some("5"));
+    for _ in sse::MAX_SESSION_STREAMS..sse::MAX_STREAMS {
+        let mut stream = Events::open(addr, "/events/vms", &second).await;
+        stream.next().await.unwrap();
+        open.push(stream);
+    }
+    assert_eq!(get(addr, "/events/vms", Some(&second)).await.status, 503);
+    // Pages and posts still find a connection.
+    assert_eq!(get(addr, "/", Some(&second)).await.status, 200);
+    // A stream gone gives its place back.
+    drop(open.pop());
+    let mut again = None;
+    for _ in 0..100 {
+        let stream = Events::open(addr, "/events/vms", &second).await;
+        if stream.head.starts_with("HTTP/1.1 200") {
+            again = Some(stream);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(again.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pages_load_only_the_embedded_scripts() {
+    let (addr, hub, _, local) = start_local(None).await;
+    let id = "0123456789abcdef";
+    local.set_listing(listed(vec![workload(id, "alpine:3.20")]), &hub);
+    let (cookie, _) = sign_in(addr, &hub, Role::Operator).await;
+    for path in ["/".to_string(), format!("/vm/{id}"), "/audit".to_string()] {
+        let body = get(addr, &path, Some(&cookie)).await.body;
+        assert!(body.contains("\"allowEval\":false"), "{body}");
+        assert!(body.contains("\"selfRequestsOnly\":true"), "{body}");
+        assert_eq!(body.matches("<script").count(), 2, "{body}");
+        assert_eq!(body.matches("<script src=\"/assets/").count(), 2, "{body}");
+        assert!(!body.contains(" style="), "{body}");
+        // No event handler attribute: ` on<letters>=`.
+        let handler = body.split(" on").skip(1).any(|rest| {
+            let name = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
+            name > 0 && rest.as_bytes().get(name) == Some(&b'=')
+        });
+        assert!(!handler, "{body}");
+        assert_eq!(
+            body.matches("sse-close=\"close\"").count(),
+            usize::from(path != "/audit")
+        );
+    }
 }

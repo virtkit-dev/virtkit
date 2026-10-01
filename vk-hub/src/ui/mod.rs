@@ -28,8 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::server::conn::http1;
@@ -48,8 +47,9 @@ mod assets;
 pub mod html;
 mod local;
 mod pages;
+mod sse;
 
-type Body = Full<Bytes>;
+use sse::Body;
 
 /// Where a sign-in link points.
 pub const LOGIN_PATH: &str = "/login";
@@ -61,7 +61,8 @@ const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; conn
                    frame-ancestors 'none'";
 
 /// Connections at once. Far past what the few people using the UI keep open, and what bounds
-/// what an unauthenticated peer can hold.
+/// what an unauthenticated peer can hold. Live pages' streams take at most
+/// [`sse::MAX_STREAMS`] of them, so pages and posts always find one.
 const MAX_CONNECTIONS: usize = 128;
 
 /// The largest form a page posts: a few short fields.
@@ -85,6 +86,10 @@ pub struct Ui {
     /// Whether browsers reach the UI over https, so its cookie may say `Secure`.
     secure: bool,
     connections: Arc<Semaphore>,
+    /// The live pages' streams open.
+    streams: sse::Streams,
+    /// The VMs table, rendered once for every page listing it ([`sse::feed`]).
+    vms_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
 }
 
 impl Ui {
@@ -95,12 +100,14 @@ impl Ui {
             .map_or(origin, |(_, rest)| rest)
             .to_string();
         Ui {
+            vms_feed: local::feed(&hub, &local),
             hub,
             local,
             origin: origin.to_string(),
             authority,
             secure: origin.starts_with("https://"),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            streams: sse::Streams::new(),
         }
     }
 
@@ -126,11 +133,13 @@ pub async fn serve(listener: TcpListener, ui: Arc<Ui>) -> Result<()> {
 async fn serve_conn(io: Io, ui: Arc<Ui>, peer: SocketAddr) {
     let svc = service_fn(move |req| handle(req, ui.clone(), peer));
     // The header timeout also closes a kept-alive connection gone idle, since hyper runs it
-    // while waiting for the next request.
+    // while waiting for the next request. Nothing bounds the connection as a whole: a page's
+    // live updates are one response that lasts as long as the page is open.
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(PRE_AUTH_TIMEOUT)
         .serve_connection(io, svc);
+    // A browser leaving a live page closes its stream mid-response: nothing to report.
     if let Err(e) = conn.await
         && !e.is_timeout()
         && !e.is_incomplete_message()
@@ -247,6 +256,21 @@ async fn get(path: &str, query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Re
         let rows = blocking(move || hub.db.audit_page(before, pages::AUDIT_PAGE)).await?;
         return Ok(page(pages::audit(auth, &rows)));
     }
+    if let Some(source) = path
+        .strip_prefix("/events/")
+        .and_then(|e| local::source(e, ui))
+    {
+        let slot = match ui.streams.take(&auth.session.id) {
+            Ok(slot) => slot,
+            Err((status, text)) => {
+                let mut resp = message(status, text);
+                resp.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+                return Ok(resp);
+            }
+        };
+        return Ok(sse::stream(ui.hub.clone(), auth, source, slot));
+    }
     if let Some(resp) = local::get(path, auth, ui) {
         return Ok(resp);
     }
@@ -296,6 +320,7 @@ async fn login(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
         return Ok(message(StatusCode::FORBIDDEN, SPENT_LINK));
     };
     eprintln!("vk-hub: ui: {} signed in", session.principal());
+    ui.hub.sessions_changed();
     let mut resp = html_response(StatusCode::OK, pages::signed_in());
     let cookie = format!(
         "{}={secret}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
@@ -324,6 +349,8 @@ async fn logout(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     })
     .await?;
     eprintln!("vk-hub: ui: {} signed out", auth.session.principal());
+    // Its pages' live updates end on it.
+    ui.hub.sessions_changed();
     let mut resp = message(StatusCode::OK, "Signed out.");
     let cookie = format!(
         "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
@@ -342,6 +369,8 @@ pub struct Auth {
     pub session: UiSession,
     /// The session's CSRF token, for the forms its pages carry.
     pub csrf: String,
+    /// The cookie: what a live update checks the session by on every render.
+    secret: String,
 }
 
 /// The session the request's cookie names if it is live, or why there is none.
@@ -353,9 +382,14 @@ async fn authenticate(headers: &HeaderMap, ui: &Ui) -> Result<Result<Auth, &'sta
     };
     let hub = ui.hub.clone();
     let csrf = csrf_token(&secret);
-    let session = blocking(move || hub.db.ui_session(&secret, crate::now_secs())).await?;
+    let key = secret.clone();
+    let session = blocking(move || hub.db.ui_session(&key, crate::now_secs())).await?;
     Ok(session
-        .map(|session| Auth { session, csrf })
+        .map(|session| Auth {
+            session,
+            csrf,
+            secret,
+        })
         .ok_or(SIGNED_OUT))
 }
 

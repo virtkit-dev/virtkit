@@ -131,9 +131,17 @@ impl Local {
         self.lock().clone()
     }
 
-    /// Replace the listing.
-    pub fn set_listing(&self, listing: Listing) {
-        *self.lock() = listing;
+    /// Replace the listing, telling the pages when it changed.
+    pub fn set_listing(&self, listing: Listing, hub: &Hub) {
+        let changed = {
+            let mut held = self.lock();
+            let changed = *held != listing;
+            *held = listing;
+            changed
+        };
+        if changed {
+            hub.touch();
+        }
     }
 
     /// The workload listed as `id`, with what it holds.
@@ -158,16 +166,16 @@ impl Local {
 
 /// Keep `local`'s listing current from `vk workloads --watch` for as long as the hub runs,
 /// starting it again, with a backoff, whenever it ends.
-pub async fn watch(local: Arc<Local>) {
+pub async fn watch(local: Arc<Local>, hub: Arc<Hub>) {
     let mut backoff = Duration::from_secs(1);
     loop {
         let started = Instant::now();
-        let why = match follow(&local).await {
+        let why = match follow(&local, &hub).await {
             Ok(()) => "ended".to_string(),
             Err(e) => format!("{e:#}"),
         };
         eprintln!("vk-hub: `{} workloads --watch`: {why}", local.vk.display());
-        local.set_listing(Listing::Failed(why));
+        local.set_listing(Listing::Failed(why), &hub);
         if started.elapsed() > MAX_BACKOFF * 2 {
             backoff = Duration::from_secs(1);
         }
@@ -177,7 +185,7 @@ pub async fn watch(local: Arc<Local>) {
 }
 
 /// Run `vk workloads --watch` and take each list it prints, until it ends.
-async fn follow(local: &Local) -> Result<()> {
+async fn follow(local: &Local, hub: &Hub) -> Result<()> {
     let mut child = tokio::process::Command::new(&local.vk)
         .args(["workloads", "--watch"])
         // Held open for as long as lists are wanted: its end is the child's signal to go,
@@ -205,7 +213,7 @@ async fn follow(local: &Local) -> Result<()> {
             bail!("it printed a line longer than {MAX_LINE} bytes");
         }
         let list = parse(&line)?;
-        local.set_listing(Listing::Listed(list));
+        local.set_listing(Listing::Listed(list), hub);
     }
     let status = child.wait().await.context("waiting for it")?;
     bail!("it exited ({status})")
@@ -258,7 +266,7 @@ pub async fn serve(opts: Options) -> Result<()> {
     let admin = crate::admin::bind(&state.join(ADMIN_SOCKET))?;
     tokio::spawn(crate::admin::serve(admin, hub.clone()));
     let local = Arc::new(Local::new(vk_binary(opts.vk)));
-    tokio::spawn(watch(local.clone()));
+    tokio::spawn(watch(local.clone(), hub.clone()));
 
     // SAFETY: `geteuid` takes no arguments, touches no memory and cannot fail.
     let actor = format!("uid {}", unsafe { libc::geteuid() });
@@ -367,9 +375,13 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&vk, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()));
         let local = Local::new(vk);
-        let err = follow(&local).await.unwrap_err();
+        let mut changes = hub.subscribe();
+        let err = follow(&local, &hub).await.unwrap_err();
         assert!(format!("{err:#}").contains("exited"), "{err:#}");
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
         match local.listing() {
             Listing::Listed(list) => assert_eq!(list.omitted, 4),
             other => panic!("{other:?}"),

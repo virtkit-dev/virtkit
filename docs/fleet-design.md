@@ -287,6 +287,27 @@ Metrics for capacity, admission waits and node states are exported for Prometheu
 Built so far, in [local mode](#local-mode): the server-rendered pages, their sign-in and the
 policy above, with the listener's timeouts on everything before a request is authenticated.
 
+Pages stay live over server-sent events. A fragment the same for everyone — the VMs table —
+is rendered by one task on a change and every page showing it is sent that one rendering; a
+page of one thing renders its own, woken by the changes it follows. A fragment is rendered at
+most once a second, and every five seconds regardless, and sent only when it differs, so a
+page with nothing new to show is sent nothing but a keep-alive comment every 15 seconds. When
+its session ends, a stream sends a fragment saying so and a `close` event, on which htmx's SSE
+extension (`sse-close`) stops reconnecting.
+
+Streams hold connections — the listener speaks HTTP/1.1 only, HTTP/2 not being in the build —
+so at most 96 of its 128 are streams and at most 6 belong to one session; past either a
+stream is refused with 429 or 503, which the SSE extension retries with its backoff, doubling
+from half a second to a minute. There is no per-address cap: the people using the UI are few
+and often share one proxy or NAT address.
+
+htmx 2.0.7 and htmx-ext-sse 2.2.3 are vendored in `vk-hub/assets/` (`VENDOR.md` gives their
+sources and digests), embedded, and served under a hash of their content with a year's
+caching. htmx runs with `allowEval`, `allowScriptTags` and `includeIndicatorStyles` off and
+`selfRequestsOnly` on; the pages have no inline script or style for the policy to refuse.
+IDs the hub checks as hex are the only values in an attribute htmx reads; what the host
+reports goes only into text and plain attributes, escaped.
+
 ### Signing in
 
 A person signs in with a single-use link — `<origin>/login?t=<token>` — that the hub prints,
@@ -356,9 +377,10 @@ unless `--no-browser` it opens the link with `xdg-open` through a page in that p
 directory, so the token never sits in a command line another local user can read. It runs
 `vk workloads --watch` — the `vk` beside it, else the one on `PATH` — for as long as it
 serves, starting it again with a backoff when it ends, and shows the list it prints, each VM
-with a page of its own. A child rather than a command run again every few seconds, so the
-memory figures keep their own cadence; a list of a version the hub cannot read is refused
-rather than misread. Actions, the console log, atop and egress views are not built yet.
+with a page of its own, both kept live. A child rather than a command run again every few
+seconds, so the memory figures keep their own cadence; a list of a version the hub cannot
+read is refused rather than misread. Actions, the console log, atop and egress views are not
+built yet.
 
 ## Security
 

@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Result;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 
 use crate::store::Db;
 
@@ -25,17 +25,46 @@ pub struct Hub {
     pub db: Arc<Db>,
     /// The web UI's origin, which its sign-in links start with; `None` with the UI off.
     pub ui_url: Option<String>,
+    /// Bumped whenever anything a page shows may have changed, for its live updates.
+    changes: watch::Sender<u64>,
+    /// Bumped when a web UI session opens or ends.
+    sessions: watch::Sender<u64>,
 }
 
 impl Hub {
     pub fn new(db: Arc<Db>) -> Self {
-        Hub { db, ui_url: None }
+        Hub {
+            db,
+            ui_url: None,
+            changes: watch::Sender::new(0),
+            sessions: watch::Sender::new(0),
+        }
     }
 
     /// This hub with its web UI at `url`.
     pub fn with_ui_url(mut self, url: Option<String>) -> Self {
         self.ui_url = url;
         self
+    }
+
+    /// Note that something a page shows may have changed.
+    pub(crate) fn touch(&self) {
+        self.changes.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Wake on the next [`Hub::touch`].
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    /// Note that a web UI session opened or ended.
+    pub(crate) fn sessions_changed(&self) {
+        self.sessions.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Wake on the next [`Hub::sessions_changed`].
+    pub(crate) fn subscribe_sessions(&self) -> watch::Receiver<u64> {
+        self.sessions.subscribe()
     }
 }
 
