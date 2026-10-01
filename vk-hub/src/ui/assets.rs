@@ -1,6 +1,6 @@
 //! The files pages load, embedded in the binary and served under a path carrying a hash of
 //! their content, so a browser may keep each for good: a new build that changes one changes
-//! its path.
+//! its path. `assets/VENDOR.md` says where the vendored ones come from.
 
 use std::sync::LazyLock;
 
@@ -17,12 +17,26 @@ pub struct Asset {
 }
 
 pub const CSS: &str = "ui.css";
+pub const HTMX: &str = "htmx.min.js";
+pub const SSE: &str = "sse.min.js";
 
-static FILES: [Asset; 1] = [Asset {
-    name: CSS,
-    content_type: "text/css; charset=utf-8",
-    bytes: include_bytes!("../../assets/ui.css"),
-}];
+static FILES: [Asset; 3] = [
+    Asset {
+        name: CSS,
+        content_type: "text/css; charset=utf-8",
+        bytes: include_bytes!("../../assets/ui.css"),
+    },
+    Asset {
+        name: HTMX,
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../../assets/htmx.min.js"),
+    },
+    Asset {
+        name: SSE,
+        content_type: "text/javascript; charset=utf-8",
+        bytes: include_bytes!("../../assets/sse.min.js"),
+    },
+];
 
 /// Each file with its path, `/assets/<hash>/<name>`, and its quoted ETag.
 static SERVED: LazyLock<Vec<(String, String, &'static Asset)>> = LazyLock::new(|| {

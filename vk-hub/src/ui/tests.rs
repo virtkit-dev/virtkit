@@ -490,6 +490,20 @@ async fn assets_are_served_for_good_under_their_hash() {
     let etag = reply.header("etag").unwrap().to_string();
     let reply = request(addr, "GET", path, &[&format!("If-None-Match: {etag}")], "").await;
     assert_eq!(reply.status, 304);
+    for (name, script) in [
+        (assets::HTMX, include_str!("../../assets/htmx.min.js")),
+        (assets::SSE, include_str!("../../assets/sse.min.js")),
+    ] {
+        let reply = get(addr, assets::url(name), None).await;
+        assert_eq!(reply.status, 200);
+        assert!(
+            reply
+                .header("content-type")
+                .unwrap()
+                .starts_with("text/javascript")
+        );
+        assert_eq!(reply.body, script);
+    }
     // Another hash is no asset: pages need a session.
     assert_eq!(get(addr, "/assets/0000/ui.css", None).await.status, 401);
 }
