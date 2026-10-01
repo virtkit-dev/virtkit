@@ -384,3 +384,15 @@ at least 16 KiB skip the staging buffer when nothing is staged in front of them,
 costing about as much as the send it would save. Socket-pair tests cover coalescing and order,
 both bounds, resuming inside a frame and inside a length prefix, a blocked socket refusing
 frames, and a jumbo frame sent directly and truncated. Search for `send_staged`.
+
+`src/devices/src/virtio/fs/server.rs` — a directory-entry name from the guest must be exactly
+one component. `LOOKUP`, `MKNOD`, `MKDIR`, `SYMLINK` (its new name, not the target), `UNLINK`,
+`RMDIR`, `RENAME`/`RENAME2` (both names), `LINK` and `CREATE` answer `EINVAL` for an empty name,
+`.`, `..` or one containing `/`, before any filesystem sees it. The passthrough engines
+resolve names with `*at()` against the parent's `O_PATH` descriptor and relied on the guest
+kernel never sending such a name, so a guest kernel that did — and a job can bring its own —
+walked out of the share to anything the VMM's user can read or write. Upstream virtiofsd
+refuses the same names (`validate_path_component`). In the server, so the in-process engine,
+its read-only and id-mapped wrappers and the bundled `vk virtiofsd` all get it. LOOKUP and
+RENAME tests drive the refusal through the server and check that only single components reach
+the filesystem. Search for `entry_name`.

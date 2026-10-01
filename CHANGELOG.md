@@ -19,6 +19,11 @@ All notable changes to virtkit will be documented in this file.
   a request.** Request headers must arrive within 30 seconds, also on an idle kept-alive
   connection; a TLS handshake must finish within 10 seconds; at most 1024 connections, 256
   per client address (an IPv6 /64), are served at once.
+- **Security: a guest can no longer reach host files outside a shared directory.** On both
+  backends, the virtio-fs server now rejects names such as `..` and paths containing `/`.
+  A guest using its own kernel, which a job can supply, could previously use these names
+  to read host files outside the share with the VM's host-user permissions, or write them
+  through a writable share.
 - **Security: a VM without network (`net.mode = "none"`, the default) no longer offers
   libkrun's transparent socket impersonation (TSI).** A guest kernel with the TSI patches,
   which a job can bring, could open, connect and listen on sockets on the host, past the
