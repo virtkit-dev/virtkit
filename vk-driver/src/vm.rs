@@ -2777,15 +2777,17 @@ fn read_pidfile(path: &Path) -> Option<i32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// A recorded pid counts as ours only while its cmdline still references the job
-/// dir — guards the kill/wait logic against pid reuse after a crash.
-fn pid_running(pid: i32, expect_in_cmdline: &str) -> bool {
+/// A recorded pid counts as ours only while one of its arguments is exactly the job dir —
+/// guards the kill/wait logic against pid reuse after a crash. Compared as whole arguments
+/// and as bytes: a substring of the command line would also match `/jobs/12` inside
+/// `/jobs/123`.
+fn pid_running(pid: i32, expect_arg: &str) -> bool {
     let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
-    String::from_utf8_lossy(&cmdline)
-        .replace('\0', " ")
-        .contains(expect_in_cmdline)
+    cmdline
+        .split(|&b| b == 0)
+        .any(|arg| arg == expect_arg.as_bytes())
 }
 
 fn wait_gone(pid: i32, expect_in_cmdline: &str, timeout: Duration) -> bool {
@@ -3032,11 +3034,15 @@ mod tests {
         std::fs::write(ctx.supervisor_pidfile(), std::process::id().to_string()).unwrap();
         assert_eq!(live_supervisor_pid(&ctx), None);
 
-        // Positive control for that guard: the same pid does match a tag its cmdline
-        // carries, so the None above is the tag mismatch and not an unreadable /proc.
-        let exe = std::env::current_exe().unwrap();
-        let exe_name = exe.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(pid_running(std::process::id() as i32, &exe_name));
+        // Positive control for that guard: the same pid does match an argument it carries,
+        // so the None above is the tag mismatch and not an unreadable /proc. Only a whole
+        // argument matches.
+        let argv0 = std::env::args().next().unwrap();
+        assert!(pid_running(std::process::id() as i32, &argv0));
+        assert!(!pid_running(
+            std::process::id() as i32,
+            &argv0[..argv0.len() - 1]
+        ));
 
         // An unparseable pidfile yields None, like an absent one.
         std::fs::write(ctx.supervisor_pidfile(), "not-a-pid").unwrap();
