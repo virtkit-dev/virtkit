@@ -11,6 +11,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- `vk-registry` warns at startup when it serves without authentication on an address other
+  than loopback.
 - `vk tune`'s report line names the estimate and the ceiling ahead of the figures behind them.
 
 ### Fixed
