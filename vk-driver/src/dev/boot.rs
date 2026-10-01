@@ -448,8 +448,12 @@ fn checked_alias(plan: &Plan) -> Result<String> {
 /// already a readable workspace name plus a digest, so two workspaces never answer to one
 /// alias and the name survives a reboot.
 pub fn alias(plan: &Plan) -> String {
-    let name = plan
-        .state_dir
+    alias_for(&plan.state_dir)
+}
+
+/// [`alias`], for the environment whose state directory is `state_dir`.
+pub fn alias_for(state_dir: &Path) -> String {
+    let name = state_dir
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "workspace".into());

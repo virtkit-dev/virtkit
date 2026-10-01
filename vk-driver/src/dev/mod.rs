@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dev::config::Freshness;
 
-pub(crate) use boot::lock_holder;
+pub(crate) use boot::{alias_for, lock_holder};
 pub use boot::{boot, build, task_args};
 pub(crate) use hooks::{Where, run_hook};
 pub use identity::plan_diff;

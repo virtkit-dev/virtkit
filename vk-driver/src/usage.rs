@@ -407,9 +407,23 @@ fn descendants(root: i32, skip: &HashSet<i32>) -> Vec<i32> {
     if skip.contains(&root) || stat(root).is_none() {
         return Vec::new();
     }
-    // Without the kernel's child lists the links have to come from every process's ppid:
-    // derive them once for the whole host rather than per process visited.
-    let scanned = (!kernel_lists_children()).then(ppid_links);
+    descendants_in(root, skip, &Links::read())
+}
+
+/// How the walk from a process to its children goes: the kernel's own child lists, or —
+/// without them — the parent → children links of every process on the host, derived once
+/// from their ppids and shared by every walk made over one reading.
+pub(crate) struct Links(Option<HashMap<i32, Vec<i32>>>);
+
+impl Links {
+    pub(crate) fn read() -> Links {
+        Links((!kernel_lists_children()).then(ppid_links))
+    }
+}
+
+/// [`descendants`] over `links`, for a `root` known to exist.
+fn descendants_in(root: i32, skip: &HashSet<i32>, links: &Links) -> Vec<i32> {
+    let scanned = &links.0;
     let mut out = vec![root];
     let mut next = 0;
     while next < out.len() {
@@ -698,7 +712,13 @@ pub(crate) fn allocated_bytes(dir: &std::path::Path) -> Option<u64> {
 /// Processes that exit during the walk are skipped. Returns `None` when `root` is gone
 /// or no process has a readable memory measurement.
 pub(crate) fn tree_resident(root: i32) -> Option<u64> {
-    let pids = descendants(root, &HashSet::new());
+    tree_resident_in(root, &Links::read())
+}
+
+/// [`tree_resident`] over process links already read, for several trees measured together.
+pub(crate) fn tree_resident_in(root: i32, links: &Links) -> Option<u64> {
+    stat(root)?;
+    let pids = descendants_in(root, &HashSet::new(), links);
     if pids.is_empty() {
         return None;
     }

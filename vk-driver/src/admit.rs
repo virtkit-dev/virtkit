@@ -1423,6 +1423,8 @@ pub struct Held {
     /// What each granted job claimed on the job dirs' filesystem, in bytes, by entry name —
     /// which is its job id, and so the name of its job dir. Only the jobs that asked for disk.
     pub disk: Vec<(OsString, u64)>,
+    /// What each granted job holds of the memory budget, in MiB, by entry name as `disk` is.
+    pub mem: Vec<(OsString, u64)>,
 }
 
 /// What this host has committed right now, for a caller with no entry of its own — the
@@ -1495,6 +1497,7 @@ fn tally(dir: &Path, job_id: &str, asked: u128, anomalies: &mut Vec<String>) -> 
         if entry.granted {
             out.granted_mib = out.granted_mib.saturating_add(entry.want_mib);
             out.granted = out.granted.saturating_add(1);
+            out.mem.push((name.to_os_string(), entry.want_mib));
             let placed = match entry.node {
                 Some(Place::Node(id)) => Some(out.per_node.entry(id).or_default()),
                 Some(Place::Spread) => Some(&mut out.spread),
@@ -2451,6 +2454,9 @@ mod tests {
         assert_eq!(now.granted_mib, 3072, "only the granted count against it");
         assert_eq!(now.granted, 2);
         assert_eq!(now.ahead, 1, "the waiter is counted but not charged");
+        let mut by_job = now.mem.clone();
+        by_job.sort();
+        assert_eq!(by_job, [("one".into(), 2048), ("two".into(), 1024)]);
 
         // The lock file the directory keeps is not a project, so nothing is read out of it.
         assert!(dir.join(LOCK).exists(), "committed took the lock");

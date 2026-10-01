@@ -51,6 +51,8 @@ rustls.workspace = true
 # feature-unification only (forces oci-client's jsonwebtoken onto rust_crypto, not
 # aws-lc-rs); not referenced in code.
 jsonwebtoken.workspace = true
+# `vk workloads`: the shape of the list it prints, shared with vk-hub, which reads it.
+vk-fleet-proto = { path = "../vk-fleet-proto" }
 
 # Bundled vhost-user virtio-fs daemon (the `vk virtiofsd` subcommand) — a default
 # feature, disable with --no-default-features. FUSE requests are served by the

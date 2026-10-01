@@ -277,8 +277,9 @@ impl JobCtx {
         self.job_dir.join("supervisor.log")
     }
 
-    /// Record what this job is in its job dir ([`JobRecord`]), for a reader outside the job to
-    /// say what the VM beside it belongs to. `cpus` and `mem` are the size it boots at.
+    /// Record what this job is in its job dir ([`JobRecord`]), for a reader outside the job
+    /// — `vk workloads` — to say what the VM beside it belongs to. `cpus` and `mem` are the
+    /// size it boots at.
     pub fn record(&self, cpus: u32, mem: &str) -> Result<()> {
         let record = JobRecord {
             job_id: self.job_id.clone(),
@@ -427,6 +428,24 @@ pub struct JobRecord {
 
 /// The [`JobRecord`]'s name in a job dir.
 pub const JOB_RECORD: &str = "job.json";
+
+/// The largest job record read back: a few hundred bytes are written.
+const JOB_RECORD_MAX: u64 = 64 * 1024;
+
+impl JobRecord {
+    /// The record in `job_dir`, or `None` where there is none that parses — a job prepared by
+    /// a `vk` from before records were written, or one still waiting on admission.
+    pub fn read(job_dir: &Path) -> Option<JobRecord> {
+        use std::io::Read;
+        let mut text = Vec::new();
+        std::fs::File::open(job_dir.join(JOB_RECORD))
+            .ok()?
+            .take(JOB_RECORD_MAX)
+            .read_to_end(&mut text)
+            .ok()?;
+        serde_json::from_slice(&text).ok()
+    }
+}
 
 /// A job's own component: its name reduced to a filename, followed by a short digest of the
 /// name as written. The digest is what makes two names that reduce to the same filename —
@@ -691,6 +710,11 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(JobRecord::read(&ctx.job_dir), Some(record));
+        // Garbage is no record, not an error, and so is none at all.
+        std::fs::write(ctx.job_dir.join(JOB_RECORD), "{").unwrap();
+        assert_eq!(JobRecord::read(&ctx.job_dir), None);
+        assert_eq!(JobRecord::read(&dir), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

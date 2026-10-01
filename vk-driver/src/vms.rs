@@ -252,7 +252,7 @@ pub fn registry_dir() -> Result<PathBuf> {
 
 /// Content-addressed file name for a state dir: a short hash of its path, so distinct state
 /// dirs never collide and the same one always maps to the same file.
-fn slug(state_dir: &Path) -> String {
+pub(crate) fn slug(state_dir: &Path) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(state_dir.as_os_str().as_bytes());
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
@@ -314,9 +314,9 @@ fn load_all_in(dir: &Path) -> Vec<VmEntry> {
 ///
 /// Asked of `/proc/locks` first, as [`crate::dev::lock_holder`] asks it: taking the lock, even
 /// for an instant, fails a `vk run --state-dir` starting on the same dir at that moment, and
-/// `vk list` and `vk stop` ask on every run. Only a lock `/proc/locks` does not list —
-/// nobody's, or one over NFS — is probed by taking it, and that is almost always a dead
-/// entry's.
+/// `vk list` and `vk stop` ask on every run, `vk workloads --watch` every couple of seconds.
+/// Only a lock `/proc/locks` does not list — nobody's, or one over NFS — is probed by taking
+/// it, and that is almost always a dead entry's.
 pub fn alive(entry: &VmEntry) -> bool {
     let Ok(f) = std::fs::File::open(&entry.state_dir) else {
         return false;
@@ -341,12 +341,17 @@ pub fn running() -> Vec<VmEntry> {
     let Ok(dir) = registry_dir() else {
         return Vec::new();
     };
+    running_in(&dir)
+}
+
+/// [`running`], for the registry at `dir`.
+pub(crate) fn running_in(dir: &Path) -> Vec<VmEntry> {
     let mut out = Vec::new();
-    for entry in load_all_in(&dir) {
+    for entry in load_all_in(dir) {
         if alive(&entry) {
             out.push(entry);
         } else {
-            remove_in(&dir, &entry.state_dir);
+            remove_in(dir, &entry.state_dir);
         }
     }
     out.sort_by_key(|e| e.created_secs);

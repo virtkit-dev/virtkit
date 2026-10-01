@@ -6,6 +6,7 @@ members = [
     "vk-agent",
     "vk-fs",
     "vk-registry",
+    "vk-fleet-proto",
     "vk-runnerctl",
     "vk-selfupdate",
     "bench",

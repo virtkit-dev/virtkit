@@ -4591,6 +4591,7 @@ dependencies = [
  "virtio-bindings",
  "virtio-queue",
  "vk-core",
+ "vk-fleet-proto",
  "vk-fs",
  "vk-registry",
  "vk-selfupdate",
@@ -4598,6 +4599,14 @@ dependencies = [
  "vm-memory 0.18.0",
  "vmm-sys-util 0.15.0",
  "zstd",
+]
+
+[[package]]
+name = "vk-fleet-proto"
+version = "0.79.3"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

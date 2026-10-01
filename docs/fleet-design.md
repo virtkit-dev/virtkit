@@ -1,6 +1,7 @@
 # Fleet: a hub and its nodes
 
-Status: proposal. Nothing below is implemented.
+Status: proposal, implemented in part and experimental: the list of the VMs a host runs
+(`vk workloads`). Everything else below is not built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -120,19 +121,48 @@ A transient reading never changes a node's declared capabilities.
 
 ### Workloads
 
-Not built yet. A node also reports the VMs running on it, so the hub shows what a node is
-doing rather than only how full it is. Each entry carries:
+A node also reports the VMs running on it for its user, so the hub shows what a node is
+doing rather than only how full it is; [local mode](#local-mode) shows the same list for the
+machine it runs on. Each entry carries:
 
-- the kind — CI job, dev environment, pinned run (`vk run --state-dir`), compose service;
-- what it belongs to — project and job for CI, workspace and environment for `vk dev`;
-- pid, vCPUs, memory reserved and memory in use, uptime, state dir.
+- the kind — CI job, dev environment, pinned run (`vk run --state-dir`);
+- what it belongs to — project, job name and job ID for CI; workspace and environment for
+  `vk dev`; the image and project directory for a run;
+- the pid of the process managing it — the `vk run`, or the job's supervisor — its vCPUs,
+  the memory reserved for it, when it started, and its state dir. The reservation is the
+  admission ledger's for a CI job, and the memory the VM booted with otherwise.
 
 The sources exist already and are read, not duplicated: the host's VM registry under
 `<data>/vms/`, whose entries are checked against the state dir's lock so a stale entry is not
-reported; the dev state dirs `vk dev list` scans, whose JSON fields are only ever added to;
-the executor's job dirs and their supervisors; the admission ledger for reservations. The
-list rides on the report and changes as VMs start and stop; memory in use rides on the
-heartbeat.
+reported (and is pruned, as `vk list` prunes it); the identities of the running dev
+environments, read as `vk dev list` reads them, whose JSON fields are only ever added to; the
+executor's job dirs whose supervisor is alive, and the `job.json` `prepare` writes into each —
+the job's ID, project, name, image and size; the admission ledger for reservations. A job
+prepared by an older `vk` has no record and is reported by its job ID alone.
+
+Only what runs is read. A stopped dev environment's state dir and any environment's workspace
+are left alone, so a share nobody is using is not mounted, or kept mounted, by whoever lists
+the VMs. A state dir's lock is asked of `/proc/locks` rather than taken: taking it, even for
+an instant, fails a `vk run` starting on that dir at that moment. A registry entry whose pid
+now names a process started after the entry was written — its lock outlived the run in a
+child — is reported without the pid.
+
+Compose services are not listed on their own: whether a declared service is up takes a
+question to its run's control socket, and what a running one holds is counted in its
+primary's figure.
+
+Built so far: `vk workloads`, plumbing, which prints the list as one line of JSON and, with
+`--watch`, a new line each time it changes. It holds at most 256 entries and 256 KiB — CI jobs
+first, then the newest of the rest — with every string cut to 256 characters, and counts the
+VMs it leaves out. Beside the list, by each entry's ID, derived from its state dir, is what
+each holds on the host: the managing process's whole process tree — the guest, its compose
+services, the switch, virtiofsd — counted proportionally (`Pss` from `smaps_rollup`), the
+figure `vk list` and `vk dev list` show, so the UI and a shell agree. Reading it walks every
+page table of every process, so it is measured every `--mem-secs` (30 by default) and as a VM
+appears, and the lines between repeat the last figures — as does a measurement within a
+sixteenth of the last one; a VM's pages move more slowly than that matters to anyone
+watching. A dev environment's entry also names its SSH alias, when it has an SSH setup, and
+the guest directory its workspace is at.
 
 ## Load balancing without central acquisition
 

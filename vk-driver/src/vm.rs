@@ -369,9 +369,9 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // never lapses between the two. After the stale-job teardown above, which frees a
     // predecessor's claim, and before anything is written into the job dir.
     let _reservation = admit(ctx, &mem)?;
-    // What the job is, beside the VM it is about to boot, for a list of the host's VMs to
-    // report. Best-effort, as the VM registry is: a job runs whether or not the host can say
-    // what it is.
+    // What the job is, beside the VM it is about to boot, for `vk workloads` to report.
+    // Best-effort, as the VM registry is: a job runs whether or not the host can say what it
+    // is.
     if let Err(e) = ctx.record(cpus, &mem) {
         eprintln!("virtkit: warning: could not record the job in its job dir: {e:#}");
     }
@@ -2650,6 +2650,28 @@ fn prefix_to_netmask(prefix: u32) -> String {
 pub fn live_supervisor_pid(ctx: &JobCtx) -> Option<i32> {
     let pid = read_pidfile(&ctx.supervisor_pidfile())?;
     pid_running(pid, &ctx.job_dir.to_string_lossy()).then_some(pid)
+}
+
+/// The job dirs under `jobs_dir` whose supervisor is alive, each with its pid: each job dir's
+/// recorded supervisor, counted only while that pid still names the job dir (the pid-reuse
+/// guard [`live_supervisor_pid`] uses). A job dir left behind by a failed cleanup counts only
+/// if its supervisor — and so its VM — is still up; dot-directories are shared state, not
+/// jobs. A directory that cannot be read is an error, never a list of none.
+pub(crate) fn live_job_supervisors(jobs_dir: &Path) -> Result<Vec<(PathBuf, i32)>> {
+    let entries = match std::fs::read_dir(jobs_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", jobs_dir.display())),
+    };
+    Ok(entries
+        .filter_map(Result::ok)
+        .filter(|e| !e.file_name().as_encoded_bytes().starts_with(b"."))
+        .filter_map(|e| {
+            let dir = e.path();
+            let pid = read_pidfile(&dir.join("supervisor.pid"))?;
+            pid_running(pid, &dir.to_string_lossy()).then_some((dir, pid))
+        })
+        .collect())
 }
 
 /// Signal the job's supervisor and wait for it to go — everything it owns (the

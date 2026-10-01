@@ -1,0 +1,14 @@
+[package]
+name = "vk-fleet-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# What `vk` and `vk-hub` exchange: types and pure functions only — no runtime, no transport
+# and no crypto — so both sides link the same definitions and nothing else.
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -96,6 +96,8 @@ pub struct Row {
     pub dir: PathBuf,
     /// the workspace the identity records; `None` when nothing was recorded
     pub workspace: Option<PathBuf>,
+    /// the guest directory standing for the workspace, as the boot recorded it
+    pub workspace_folder: Option<String>,
     pub environment: Option<String>,
     pub status: Status,
     /// the `vk` that booted it, as it recorded itself
@@ -146,13 +148,26 @@ pub fn scan(base: &Path, running: &[Running], sizes: bool) -> Vec<Row> {
     let mut rows: Vec<Row> = entries
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .map(|e| row(&e.path(), running, sizes))
+        .map(|e| row(&e.path(), running, sizes, true))
         .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
     rows
 }
 
-fn row(dir: &Path, running: &[Running], sizes: bool) -> Row {
+/// The rows of the environments under `base` that are running, as [`scan`] would give them
+/// but without their flags or sizes: only the running state dirs are read, and no workspace
+/// is looked at — an automounted share stays unmounted, and a hung one cannot stall the caller
+/// over an environment that is not even up.
+pub fn running_rows(base: &Path, running: &[Running]) -> Vec<Row> {
+    let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    running
+        .iter()
+        .filter(|r| r.state_dir.parent() == Some(base.as_path()))
+        .map(|r| row(&r.state_dir, running, false, false))
+        .collect()
+}
+
+fn row(dir: &Path, running: &[Running], sizes: bool, flags: bool) -> Row {
     let identity = std::fs::read(dir.join("dev.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<crate::dev::Identity>(&b).ok());
@@ -166,10 +181,12 @@ fn row(dir: &Path, running: &[Running], sizes: bool) -> Row {
     let live = running
         .iter()
         .find(|r| r.state_dir == dir || r.state_dir == canonical);
+    let want_flags = flags;
     let mut flags = Vec::new();
     // Require the workspace's parent to exist: an unmounted share or unplugged disk must
     // not make its environments stale and let `gc --all-stale --yes` destroy their storage.
-    if let Some(w) = &workspace
+    if want_flags
+        && let Some(w) = &workspace
         && !w.exists()
         && w.parent().is_some_and(Path::exists)
     {
@@ -177,7 +194,7 @@ fn row(dir: &Path, running: &[Running], sizes: bool) -> Row {
     }
     // Use the identity, as `status` does. An unreadable `dev.json` also leaves no record
     // and must remain collectable.
-    if identity.is_none() {
+    if want_flags && identity.is_none() {
         flags.push(Flag::Ephemeral);
     }
     let booted_secs = identity.as_ref().map(|i| i.booted_secs);
@@ -185,6 +202,7 @@ fn row(dir: &Path, running: &[Running], sizes: bool) -> Row {
         name: dir.file_name().unwrap_or_default().to_string_lossy().into(),
         dir: dir.to_path_buf(),
         workspace,
+        workspace_folder: manifest("workspace_folder"),
         environment: manifest("environment"),
         status: match (live.is_some(), identity.is_some()) {
             (true, _) => Status::Running,
@@ -545,6 +563,32 @@ mod tests {
         assert_eq!(live.created_by.as_deref(), Some("vk 0.62.0 (abcdef)"));
         assert!(!live.stale());
         assert!(live.size_bytes.is_some_and(|n| n > 0));
+    }
+
+    /// Only the running environments are read, and none is flagged: a stopped one, or one
+    /// whose workspace is gone, is not looked at.
+    #[test]
+    fn running_rows_read_only_the_running_environments() {
+        let tmp = scratch("running-rows");
+        let base = tmp.0.join("state");
+        std::fs::create_dir_all(&base).unwrap();
+        let up = booted(&base, "gone-aaaa", &tmp.0.join("removed"), "vk 0.80.0");
+        booted(&base, "down-bbbb", &tmp.0.join("repo"), "vk 0.80.0");
+        let elsewhere = tmp.0.join("not-dev");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let running = |dir: &Path| Running {
+            state_dir: std::fs::canonicalize(dir).unwrap(),
+            mem_used: None,
+            mem: Some("2G".into()),
+        };
+        let rows = running_rows(&base, &[running(&up), running(&elsewhere)]);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(row.name, "gone-aaaa");
+        assert_eq!(row.status, Status::Running);
+        assert_eq!(row.environment.as_deref(), Some("dev"));
+        assert_eq!(row.flags, [], "the missing workspace is not looked at");
+        assert_eq!(row.size_bytes, None);
     }
 
     #[test]
