@@ -97,7 +97,11 @@ async fn delete(
     match store.delete_tag(&repo, &tag) {
         // Land back on the repository page whether or not the tag was still there: one
         // someone else deleted first is simply already gone, which is the same outcome.
-        Ok(_) => see_other(&format!("/browse/{repo}")),
+        Ok(true) => {
+            accounts::audit(user, format_args!("deleted tag {repo}:{tag}"));
+            see_other(&format!("/browse/{repo}"))
+        }
+        Ok(false) => see_other(&format!("/browse/{repo}")),
         Err(e) => {
             eprintln!("vk-registry: deleting the tag {repo}:{tag}: {e:#}");
             Ok(server_error(db, user, session_id.as_deref()))

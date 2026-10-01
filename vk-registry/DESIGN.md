@@ -646,6 +646,9 @@ layers. The feature is opt-in and requires guest networking.
 - Expired sessions are removed when presented, not by a periodic sweep.
 - Sessions are read-all with administrator-only write. Per-user session scopes are not
   implemented.
-- The server has no durable request audit log. Administration mutations are logged, but OCI
-  reads and writes are not persisted as audit records.
+- The server has no durable request audit log. Administrative changes are logged to stderr:
+  `accounts admin: <peer>:` identifies the admin socket peer; `accounts web: <identity>:`
+  identifies the session for browse and settings changes (tag deletion, API key minting and
+  revocation, captions, uploads). Writes through `/v2/` and WebDAV, including tag removal
+  and replacement, are not audited.
 - OIDC trusts platform roots only and caches discovery until restart.

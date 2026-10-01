@@ -11,6 +11,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **`vk-registry` logs who changes the registry from its web pages.** Deleting a tag, minting
+  or revoking an API key, setting a caption or uploading a file writes a
+  `vk-registry: accounts web:` line naming the session's identity, as the admin socket's
+  `accounts admin:` lines name its peer.
 - `vk-registry` warns at startup when it serves without authentication on an address other
   than loopback.
 - `vk tune`'s report line names the estimate and the ceiling ahead of the figures behind them.

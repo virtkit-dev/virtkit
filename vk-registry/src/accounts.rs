@@ -1177,6 +1177,37 @@ fn from_secs(secs: i64) -> SystemTime {
         .unwrap_or(UNIX_EPOCH)
 }
 
+/// Log a web administrative change and its session identity, like the admin socket's
+/// `accounts admin:` lines.
+pub(crate) fn audit(user: &User, what: std::fmt::Arguments<'_>) {
+    eprintln!("{}", audit_line(user, what));
+}
+
+/// Format [`audit`]'s line, escaping the provider-supplied identity. A missing email is a
+/// bare `-`, distinct from any quoted email.
+fn audit_line(user: &User, what: std::fmt::Arguments<'_>) -> String {
+    let email = user
+        .email
+        .as_deref()
+        .map_or_else(|| "-".to_string(), |e| format!("{e:?}"));
+    format!(
+        "vk-registry: accounts web: {email} ({:?} at {:?}): {what}",
+        user.oidc_subject, user.oidc_issuer
+    )
+}
+
+/// What a key may do, for an audit line: every grant, or that it has none.
+pub(crate) fn scope_summary(scopes: &[Scope]) -> String {
+    if scopes.is_empty() {
+        return "no scopes".to_string();
+    }
+    let grants: Vec<String> = scopes
+        .iter()
+        .map(|s| format!("{:?} {:?}", s.action, s.repo_pattern))
+        .collect();
+    format!("scopes [{}]", grants.join(", "))
+}
+
 /// `n` cryptographically random bytes, hex-encoded — the one token-generation primitive
 /// shared by session ids, csrf secrets, API key secrets, and `oidc.rs`'s login state and
 /// PKCE verifier.
@@ -1192,6 +1223,51 @@ mod tests {
     use redb::ReadableTableMetadata;
 
     use super::*;
+
+    /// An audit line names who acted, escaped, and what they did.
+    #[test]
+    fn an_audit_line_names_the_session_escaped() {
+        let user = User {
+            id: "https://issuer\u{1f}sub-1".to_string(),
+            oidc_issuer: "https://issuer".to_string(),
+            oidc_subject: "sub-1".to_string(),
+            email: Some("a@corp\u{1b}[2J".to_string()),
+            display_name: None,
+            is_admin: true,
+            created_at: SystemTime::UNIX_EPOCH,
+            last_login_at: SystemTime::UNIX_EPOCH,
+        };
+        let line = audit_line(&user, format_args!("deleted tag team/app:v1"));
+        assert!(line.contains("deleted tag team/app:v1"), "{line}");
+        assert!(
+            line.contains("sub-1") && line.contains("https://issuer"),
+            "{line}"
+        );
+        assert!(!line.contains('\u{1b}'), "{line}");
+    }
+
+    /// No email reads as a bare `-`, never as an email that is literally `-`.
+    #[test]
+    fn an_audit_line_without_an_email_is_unquoted() {
+        let mut user = User {
+            id: "https://issuer\u{1f}sub-1".to_string(),
+            oidc_issuer: "https://issuer".to_string(),
+            oidc_subject: "sub-1".to_string(),
+            email: None,
+            display_name: None,
+            is_admin: false,
+            created_at: SystemTime::UNIX_EPOCH,
+            last_login_at: SystemTime::UNIX_EPOCH,
+        };
+        let line = audit_line(&user, format_args!("x"));
+        assert!(line.starts_with("vk-registry: accounts web: - ("), "{line}");
+        user.email = Some("-".to_string());
+        let line = audit_line(&user, format_args!("x"));
+        assert!(
+            line.starts_with("vk-registry: accounts web: \"-\" ("),
+            "{line}"
+        );
+    }
 
     fn scope(action: Action, repo_pattern: &str) -> Scope {
         Scope {

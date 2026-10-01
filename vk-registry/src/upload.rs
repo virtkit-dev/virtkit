@@ -284,17 +284,21 @@ async fn submit(
         );
     };
 
-    if let Err(e) = store_upload(store, &name, &tag, &file_bytes, file_name.as_deref()) {
-        // The chain names store paths; it goes to the log, not to the browser.
-        eprintln!("vk-registry: storing an upload of {name}:{tag}: {e:#}");
-        return Ok(html::error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Some(principal),
-            csrf_of(db, session_id.as_deref()).as_deref(),
-            "That upload could not be stored",
-            "Try again, or ask an operator to check the server log.",
-        ));
-    }
+    let digest = match store_upload(store, &name, &tag, &file_bytes, file_name.as_deref()) {
+        Ok(digest) => digest,
+        Err(e) => {
+            // The chain names store paths; it goes to the log, not to the browser.
+            eprintln!("vk-registry: storing an upload of {name}:{tag}: {e:#}");
+            return Ok(html::error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some(principal),
+                csrf_of(db, session_id.as_deref()).as_deref(),
+                "That upload could not be stored",
+                "Try again, or ask an operator to check the server log.",
+            ));
+        }
+    };
+    accounts::audit(user, format_args!("uploaded {name}:{tag} as {digest}"));
     // 303 to the page that shows what landed, so a refresh re-reads it rather than
     // uploading the file a second time.
     Response::builder()
@@ -309,14 +313,14 @@ async fn submit(
 }
 
 /// Store the blob, then write the shared empty config and single-layer manifest through
-/// [`Store::put_raw_file`], as a `/v2/` push does.
+/// [`Store::put_raw_file`], as a `/v2/` push does. Returns the manifest digest.
 fn store_upload(
     store: &Store,
     name: &str,
     tag: &str,
     file_bytes: &[u8],
     file_name: Option<&str>,
-) -> Result<()> {
+) -> Result<String> {
     let _lock = store.lock_shared()?;
     let layer_digest = store.put_blob(file_bytes)?;
     // Only when the browser actually sent one; `put_raw_file` drops an empty one.
@@ -328,8 +332,7 @@ fn store_upload(
         layer_digest.trim_start_matches("sha256:"),
         size,
         title.as_deref(),
-    )?;
-    Ok(())
+    )
 }
 
 fn bad(

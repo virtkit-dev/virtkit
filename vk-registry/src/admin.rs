@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::accounts::{ApiKey, Db, Scope, User};
+use crate::accounts::{ApiKey, Db, Scope, User, scope_summary};
 
 /// The envelope version. Bumped only for a change an older peer could misread; adding a
 /// `Call` variant does not need one, since an unknown operation is already reported as
@@ -566,18 +566,6 @@ fn dispatch(body: &[u8], db: &Db, peer: Peer) -> Result<serde_json::Value> {
             })
         }
     }
-}
-
-/// What a key may do, for the audit line: every grant, or that it has none.
-fn scope_summary(scopes: &[Scope]) -> String {
-    if scopes.is_empty() {
-        return "no scopes".to_string();
-    }
-    let grants: Vec<String> = scopes
-        .iter()
-        .map(|s| format!("{:?} {:?}", s.action, s.repo_pattern))
-        .collect();
-    format!("scopes [{}]", grants.join(", "))
 }
 
 /// One line for one change, on the server that made it.

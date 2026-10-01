@@ -109,7 +109,10 @@ async fn set(
         );
     }
     match db.set_repo_caption(&repo, &caption) {
-        Ok(()) => see_other(&format!("/browse/{repo}")),
+        Ok(()) => {
+            accounts::audit(user, format_args!("set the caption of {repo}"));
+            see_other(&format!("/browse/{repo}"))
+        }
         Err(e) => {
             eprintln!("vk-registry: writing a repository caption: {e:#}");
             Ok(server_error(db, user, session_id.as_deref()))
