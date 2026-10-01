@@ -2174,6 +2174,21 @@ fn banner(root: &Path, upstreams: usize, tls: bool, addr: SocketAddr) -> String 
     )
 }
 
+/// The warning a server open to anyone prints when it listens beyond loopback, `None` when it
+/// is either authenticated or loopback-only. No credentials is a supported mode, documented as
+/// open, and the default address is loopback; served on a network address it means anyone who
+/// can reach the port may push, take build locks and write through WebDAV.
+fn open_server_warning(open: bool, addr: SocketAddr) -> Option<String> {
+    // Canonical first: `[::ffff:127.0.0.1]` is loopback, though not as an IPv6 address.
+    (open && !addr.ip().to_canonical().is_loopback()).then(|| {
+        format!(
+            "vk-registry: WARNING: no authentication is configured and {addr} is not loopback: \
+             anyone who can reach it may read, push and delete. Set token_file or \
+             username/password_file, or mode = \"accounts\", unless that is intended."
+        )
+    })
+}
+
 /// The URL scheme a server with (or without) TLS is reached over. One place, because every
 /// line that prints a virtkit registry's own URL has to agree with the acceptor it has.
 fn scheme(tls: bool) -> &'static str {
@@ -2222,6 +2237,10 @@ async fn serve_limited(
                 addr
             )
         );
+        let open = matches!(&state.auth, Authenticator::Shared(a) if !a.enabled());
+        if let Some(warning) = open_server_warning(open, addr) {
+            eprintln!("{warning}");
+        }
     }
     if !state.webdav {
         eprintln!("vk-registry: WebDAV off (webdav = false): /dav/ answers 404");
@@ -4295,6 +4314,27 @@ mod tests {
             banner(root, 2, false, addr),
             "vk-registry: serving /srv/vk-registry [mirror (2 upstream(s))] on http://0.0.0.0:443"
         );
+    }
+
+    /// An open server says so when it is reachable beyond loopback, and only then.
+    #[test]
+    fn an_open_server_off_loopback_warns() {
+        let lan: SocketAddr = "0.0.0.0:5000".parse().unwrap();
+        let lo: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        assert!(open_server_warning(true, lan).is_some_and(|w| w.contains("WARNING")));
+        assert!(open_server_warning(true, lo).is_none());
+        assert!(open_server_warning(false, lan).is_none());
+        for (addr, warns) in [
+            ("[::]:5000", true),
+            ("[::1]:5000", false),
+            ("[::ffff:127.0.0.1]:5000", false),
+        ] {
+            assert_eq!(
+                open_server_warning(true, addr.parse().unwrap()).is_some(),
+                warns,
+                "{addr}"
+            );
+        }
     }
 
     /// A system unit runs the server as an account of its own, may write only the store,
