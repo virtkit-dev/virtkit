@@ -1666,9 +1666,8 @@ fn resolve_stages(
         let mut vars: Vars = state.env.iter().cloned().collect();
         let mut steps: Vec<Step> = Vec::new();
         for raw in &stage.instructions {
-            // ARG only feeds the interpolation scope; it does not chain into the key, and
-            // is a cache input only through the instructions that reference it (once
-            // expanded).
+            // ARG enters the interpolation scope without chaining into the key. RUN keys on
+            // every exported ARG value; other instructions key only on values they reference.
             if let Instruction::Arg { name: arg, default } = raw {
                 // DOCKER_STAGE_HASH is a reserved, auto-injected arg: its value is the
                 // declaring ancestor's stage_key (see [`drive`]). It is forced empty while
@@ -1741,15 +1740,18 @@ fn resolve_stages(
                         };
                         parts.extend(part);
                     }
-                    // The command is keyed raw via `canonical` (it executes verbatim). Fold
-                    // in its interpolated form only when the in-scope vars actually change it
-                    // — i.e. it references an ARG/ENV — so a change to a referenced value
-                    // busts the cache, while a RUN using only shell-local variables keeps the
-                    // key it would have with no scope at all.
-                    let scoped = interp::interpolate_cmdline(&r.cmd, &vars);
-                    let unscoped = interp::interpolate_cmdline(&r.cmd, &interp::Vars::new());
-                    if scoped != unscoped {
-                        parts.push(format!("cmd={scoped}"));
+                    // `canonical` keys the raw command; the shell resolves `$VAR` using ENV
+                    // (already in the chain) and exported ARGs. Scripts can read ARGs absent
+                    // from the command line, so key every exported value, as Docker does.
+                    // Exclude DOCKER_STAGE_HASH: it is empty while keying and set only to run.
+                    // Length-prefix each name and value to prevent ambiguous pairs.
+                    let args: String = run_args(&vars, &state.env)
+                        .iter()
+                        .filter(|(k, _)| k != DOCKER_STAGE_HASH)
+                        .map(|(k, v)| format!("{}:{k}{}:{v}", k.len(), v.len()))
+                        .collect();
+                    if !args.is_empty() {
+                        parts.push(format!("args={args}"));
                     }
                     (!parts.is_empty()).then(|| parts.join("\n"))
                 }
@@ -1764,13 +1766,7 @@ fn resolve_stages(
                     // references resolve there (ENV is already in `st.env`; drop names it
                     // shadows). Kept out of the running `state` so it never leaks into a
                     // child stage or the exported runtime config.
-                    let env_keys: std::collections::BTreeSet<&str> =
-                        st.env.iter().map(|(k, _)| k.as_str()).collect();
-                    st.build_args = vars
-                        .iter()
-                        .filter(|(k, _)| !env_keys.contains(k.as_str()))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
+                    st.build_args = run_args(&vars, &st.env);
                 }
                 steps.push(Step {
                     instr,
@@ -3698,7 +3694,7 @@ fn stage_input_rootfs(
 /// other key from one of those roots, so this alone invalidates a whole cache generation.
 /// An old entry does not need deleting: it simply stops being looked up, and idle GC
 /// reclaims it like any other unused blob.
-const CACHE_KEY_VERSION: &str = "4";
+const CACHE_KEY_VERSION: &str = "5";
 
 /// The namespaces a build-cache key can belong to. One `build-cache` repository holds every
 /// kind of cached artefact, so a key says which kind it is — both to a reader (`/browse`,
@@ -3868,6 +3864,18 @@ fn context_files_hash(context: &Path, sources: &[String]) -> String {
         h.update(b"\n");
     }
     hex(&h.finalize())
+}
+
+/// ARG values exported to RUN, sorted by name. ENV shadows ARGs of the same name.
+fn run_args(vars: &Vars, env: &[(String, String)]) -> Vec<(String, String)> {
+    let env_keys: std::collections::BTreeSet<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
+    let mut args: Vec<(String, String)> = vars
+        .iter()
+        .filter(|(k, _)| !env_keys.contains(k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    args.sort();
+    args
 }
 
 /// SHA-256 of `path`'s contents, read in chunks.
@@ -6902,6 +6910,54 @@ RUN ship
         let exec_other = resolve_stages(&plan, &order, &ba, &mut ex3, Some("deadbeef")).unwrap();
         let merged_other = merge_exec(&keyed, exec_other);
         assert_eq!(merged_other[&0].steps[0].key, merged[&0].steps[0].key);
+    }
+
+    /// Scripts can read exported ARGs absent from the command line, so their values must
+    /// affect the RUN key.
+    #[test]
+    fn a_run_key_follows_the_arg_values_its_shell_gets() {
+        // The key of the last step of the only stage of `src`, with `dsh` as the injected
+        // DOCKER_STAGE_HASH (None: the key pass).
+        let key = |src: &str, args: &[(&str, &str)], dsh: Option<&str>| {
+            let ba: Vars = args
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let plan = plan_one(src, &ba);
+            let target = plan.resolve_target(None).unwrap();
+            let order = plan.build_order(target).unwrap();
+            let keyed = resolve_stages(&plan, &order, &ba, &mut DryRun::new(), dsh).unwrap();
+            keyed[&0].steps.last().unwrap().key.clone()
+        };
+        let src = "FROM debian:bookworm\nARG VERSION=1\nRUN ./install.sh\n";
+        assert_eq!(
+            key(src, &[], None),
+            key(src, &[("VERSION", "1")], None),
+            "the default is the same value"
+        );
+        assert_ne!(key(src, &[], None), key(src, &[("VERSION", "2")], None));
+
+        // A value cannot pose as another pair: A=1,B=2 differs from A="1<US>B=2" without B.
+        let two = key(
+            "FROM debian:bookworm\nARG A\nARG B\nRUN ./s\n",
+            &[("A", "1"), ("B", "2")],
+            None,
+        );
+        let one = key(
+            "FROM debian:bookworm\nARG A\nRUN ./s\n",
+            &[("A", "1\u{1f}B=2")],
+            None,
+        );
+        assert_ne!(two, one);
+
+        // An ENV of the same name shadows the ARG in the shell, so its value is no input.
+        let src = "FROM debian:bookworm\nARG V\nENV V=x\nRUN ./s\n";
+        assert_eq!(key(src, &[("V", "1")], None), key(src, &[("V", "2")], None));
+
+        // DOCKER_STAGE_HASH is empty while keying and set only to run: the exec pass keys
+        // the step the same.
+        let src = "FROM debian:bookworm\nARG DOCKER_STAGE_HASH\nRUN ./s\n";
+        assert_eq!(key(src, &[], None), key(src, &[], Some("snap-abc")));
     }
 
     #[test]

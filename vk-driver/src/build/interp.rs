@@ -180,17 +180,6 @@ fn expand_cmd(cmd: &Cmdline, vars: &Vars) -> Cmdline {
     }
 }
 
-/// The interpolated form of a command line, flattened to a single string. A `RUN`'s
-/// command is executed raw (the shell expands it), so this is used only to fold the
-/// *values* of the ARG/ENV it references into the cache key — a change to a referenced
-/// variable's value must still bust the cache even though the executed text is unchanged.
-pub fn interpolate_cmdline(cmd: &Cmdline, vars: &Vars) -> String {
-    match expand_cmd(cmd, vars) {
-        Cmdline::Shell(s) => s,
-        Cmdline::Exec(v) => v.join("\u{1f}"),
-    }
-}
-
 fn expand_mount(m: &parser::Mount, vars: &Vars) -> parser::Mount {
     parser::Mount {
         typ: m.typ.clone(),
@@ -279,8 +268,7 @@ mod tests {
     #[test]
     fn expand_run_and_copy() {
         let v = vars(&[("UID", "1000"), ("D", "bookworm")]);
-        // A RUN command is left raw for the guest shell (its --mount fields do expand);
-        // interpolate_cmdline gives the interpolated form used only for keying.
+        // A RUN command is left raw for the guest shell (its --mount fields do expand).
         let run = Instruction::Run(parser::Run {
             cmd: Cmdline::Shell("useradd -u ${UID} dev".into()),
             mounts: vec![parser::Mount {
@@ -302,7 +290,6 @@ mod tests {
             Instruction::Run(r) => {
                 assert_eq!(r.cmd, Cmdline::Shell("useradd -u ${UID} dev".into())); // raw
                 assert_eq!(r.mounts[0].source.as_deref(), Some("/src-bookworm")); // mount expands
-                assert_eq!(interpolate_cmdline(&r.cmd, &v), "useradd -u 1000 dev"); // keying form
             }
             _ => panic!(),
         }

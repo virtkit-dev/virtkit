@@ -28,6 +28,10 @@ All notable changes to virtkit will be documented in this file.
 - **A guest can no longer exhaust the host's sockets through its network**: a job's network
   carries at most 8192 connections at once and 256 DNS lookups in flight; past that, new
   connections stall or are reset and lookups are dropped for the guest to retry.
+- **Security: the build cache no longer serves a snapshot built with a different
+  `--build-arg` value.** A RUN step was reused across builds that passed different values
+  for an ARG it did not name on its command line, although its scripts could read that
+  value. The cache-key version is bumped, so the first build after upgrading starts cold.
 - **A guest-written disk image can no longer crash the host's `vk` or make it allocate
   gigabytes** when `vk` reads the image (for a `FROM --kernel=image` stage, or a job's
   `/etc/passwd`): its geometry, links and extents are now checked, and every file read
