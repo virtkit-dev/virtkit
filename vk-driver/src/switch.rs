@@ -829,6 +829,8 @@ impl EgressGuard {
     /// and only that guest's, not another VM's. Returns whether `src`'s policy allows `name`
     /// now, which is checked and pinned under one read of the policy so an edit landing in
     /// between cannot leave a pin for a name it removed; dry-run pins a refused name too.
+    /// An [`unroutable`] answer is never pinned: whoever controls an allowed name's zone would
+    /// otherwise open every port of the host's loopback or a cloud's metadata address.
     fn record_if_allowed(&self, src: Ipv4Addr, name: &str, ips: &[Ipv4Addr], ttl: u32) -> bool {
         let default = self.policy.read().unwrap();
         let policy = self.per_source.get(&src).unwrap_or(&*default);
@@ -838,7 +840,7 @@ impl EgressGuard {
         }
         let until = Instant::now() + Duration::from_secs(u64::from(ttl).max(30) + 60);
         let mut pinned = self.pinned.lock().unwrap();
-        for ip in ips {
+        for ip in ips.iter().filter(|ip| !unroutable(**ip)) {
             pinned.entry((src, *ip)).or_default().extend(name, until);
         }
         allowed
@@ -5652,6 +5654,19 @@ mod tests {
         // a different source does NOT inherit src's pin (per-source isolation)
         let other = Ipv4Addr::new(192, 168, 231, 3);
         assert!(!g.allows(other, corp));
+        // An allowed name answering loopback or link-local pins neither: its zone's owner
+        // must not open the host's own ports by pointing a record at them.
+        assert!(g.record_if_allowed(
+            src,
+            "evil.corp.example.com",
+            &[
+                Ipv4Addr::new(127, 0, 0, 1),
+                Ipv4Addr::new(169, 254, 169, 254)
+            ],
+            300
+        ));
+        assert!(!g.allows(src, "127.0.0.1:2375".parse().unwrap()));
+        assert!(!g.allows(src, "169.254.169.254:80".parse().unwrap()));
         // unrestricted guard allows anything
         let any = EgressGuard::new(Egress::AllowAll, gw);
         assert!(any.allows(src, "8.8.8.8:443".parse().unwrap()));
@@ -5721,15 +5736,15 @@ mod tests {
             Egress::restricted(&[], &names(&["debian.org", "github.com"])).unwrap(),
             gw,
         );
-        let deb: SocketAddr = "198.51.100.1:443".parse().unwrap();
-        let gh: SocketAddr = "198.51.100.2:443".parse().unwrap();
+        let deb: SocketAddr = "93.184.216.1:443".parse().unwrap();
+        let gh: SocketAddr = "93.184.216.2:443".parse().unwrap();
         assert!(g.record_if_allowed(
             src,
             "deb.debian.org",
-            &[Ipv4Addr::new(198, 51, 100, 1)],
+            &[Ipv4Addr::new(93, 184, 216, 1)],
             300
         ));
-        assert!(g.record_if_allowed(src, "github.com", &[Ipv4Addr::new(198, 51, 100, 2)], 300));
+        assert!(g.record_if_allowed(src, "github.com", &[Ipv4Addr::new(93, 184, 216, 2)], 300));
 
         // An addition leaves every address already resolved reachable.
         g.replace_policy(
@@ -5751,8 +5766,8 @@ mod tests {
             Egress::restricted(&[], &names(&["a.com", "b.com"])).unwrap(),
             gw,
         );
-        let shared: SocketAddr = "198.51.100.7:443".parse().unwrap();
-        let ip = [Ipv4Addr::new(198, 51, 100, 7)];
+        let shared: SocketAddr = "93.184.216.7:443".parse().unwrap();
+        let ip = [Ipv4Addr::new(93, 184, 216, 7)];
         assert!(g.record_if_allowed(src, "a.com", &ip, 300));
         assert!(g.record_if_allowed(src, "b.com", &ip, 300));
         // b.com last resolved to it, but a.com still vouches for it.
