@@ -2,8 +2,8 @@
 //! demand over the virtctl control protocol (`vk_core::fleetctl`). The owner
 //! (`run`) declares every unit up front — image materialized, address and
 //! CID assigned — and the manager boots/kills them; the control server answers
-//! one request per connection on a hybrid-vsock control socket, so only VMs on
-//! the owner's LAN can reach the control plane.
+//! requests on the owner's hybrid-vsock control socket, so only its guest reaches
+//! the control plane, and on a host-only socket beside it for `vk` itself.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -440,7 +440,7 @@ impl Manager {
             return Reply::err(format!("no such unit {name:?}"));
         };
         let console = st.dir.join(crate::run::CONSOLE_LOG);
-        match std::fs::read_to_string(&console) {
+        match console_tail(&console, MAX_LOGS_TAIL) {
             Ok(text) => {
                 let mut tail: Vec<&str> = text.lines().rev().take(lines).collect();
                 tail.reverse();
@@ -449,6 +449,47 @@ impl Manager {
             Err(e) => Reply::err(format!("reading {}: {e}", console.display())),
         }
     }
+}
+
+/// Control connections a guest may hold open at once. The host's own clients (`vk list`,
+/// `vk dev`) dial [`host_control_socket`] instead, so a guest at this bound locks out only
+/// itself.
+const MAX_CONTROL_CONNECTIONS: usize = 16;
+
+/// How long a control connection may sit between requests before the manager drops it. A
+/// request in progress (a `Start` building on demand) is not idle; the guest's client
+/// reconnects on its next request.
+const CONTROL_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The most of a unit's console `logs` reads: the end of it, which is where its last lines
+/// are. The console grows without bound and the guest writes it, so reading it whole would
+/// let a guest asking for its own logs make the host hold all of it.
+///
+/// An eighth of a control message: lossy decoding turns each invalid byte into three and JSON
+/// escapes a control character into six, so the reply carrying the tail still fits.
+const MAX_LOGS_TAIL: u64 = vk_core::fleetctl::MAX_MSG / 8;
+
+/// The whole lines in the last `max` bytes of `path`, as text — lossy, since the guest writes
+/// it. A line the cut lands inside is dropped rather than shown from its middle.
+fn console_tail(path: &Path, max: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    if len <= max {
+        // Still bounded: the guest may be writing past `len` meanwhile.
+        let mut bytes = Vec::new();
+        f.take(max).read_to_end(&mut bytes)?;
+        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    // From one byte before the cut, so a cut right after a newline keeps the line it starts.
+    f.seek(SeekFrom::Start(len - max - 1))?;
+    let mut bytes = Vec::new();
+    f.take(max + 1).read_to_end(&mut bytes)?;
+    let whole = bytes
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(&[][..], |nl| &bytes[nl + 1..]);
+    Ok(String::from_utf8_lossy(whole).into_owned())
 }
 
 /// Build a unit's agent exec address from its runtime directory.
@@ -472,30 +513,88 @@ fn state_of(st: &mut UnitState) -> &'static str {
     }
 }
 
-/// Accept control connections on a VM's hybrid-vsock control socket and serve
-/// the control protocol (a session of request/reply pairs per connection —
-/// the guest's /run/vk/services bridge keeps one connection open across operations).
-pub async fn control_server(listen: &Path, mgr: Arc<Manager>) -> Result<()> {
+/// The host-only control socket of a run whose guest-facing one sits on hybrid-vsock base
+/// `vsock`. The VMM forwards guest connections to `<vsock>_<CONTROL_PORT>` only, so a guest
+/// cannot reach this one, nor fill its connections.
+pub fn host_control_socket(vsock: &Path) -> PathBuf {
+    let mut socket =
+        vk_core::net::hybrid_socket(vsock, vk_core::fleetctl::CONTROL_PORT).into_os_string();
+    socket.push(".host");
+    socket.into()
+}
+
+/// Serve the control protocol (a session of request/reply pairs per connection — the guest's
+/// /run/vk/services bridge keeps one connection open across operations) on both of a VM's
+/// control sockets: the guest's, on hybrid-vsock base `vsock`, holding at most
+/// [`MAX_CONTROL_CONNECTIONS`]; and the host's own, [`host_control_socket`].
+pub async fn control_server(vsock: &Path, mgr: Arc<Manager>) -> Result<()> {
+    control_server_idling(vsock, mgr, CONTROL_IDLE).await
+}
+
+/// [`control_server`], dropping a connection after `idle` between requests.
+async fn control_server_idling(
+    vsock: &Path,
+    mgr: Arc<Manager>,
+    idle: std::time::Duration,
+) -> Result<()> {
+    let guest = bind_control(&vk_core::net::hybrid_socket(
+        vsock,
+        vk_core::fleetctl::CONTROL_PORT,
+    ))?;
+    let host = bind_control(&host_control_socket(vsock))?;
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONTROL_CONNECTIONS));
+    tokio::try_join!(
+        serve_control(guest, Some(slots), mgr.clone(), idle),
+        serve_control(host, None, mgr, idle),
+    )?;
+    Ok(())
+}
+
+fn bind_control(listen: &Path) -> Result<tokio::net::UnixListener> {
     let _ = std::fs::remove_file(listen);
-    let listener = vk_core::unixpath::bind_tokio(listen)
-        .with_context(|| format!("control: bind {}", listen.display()))?;
+    vk_core::unixpath::bind_tokio(listen)
+        .with_context(|| format!("control: bind {}", listen.display()))
+}
+
+/// Accept on `listener`, holding a slot per connection when `slots` is given.
+/// When all slots are held, wait for a connection to close before accepting another.
+async fn serve_control(
+    listener: tokio::net::UnixListener,
+    slots: Option<Arc<tokio::sync::Semaphore>>,
+    mgr: Arc<Manager>,
+    idle: std::time::Duration,
+) -> Result<()> {
     loop {
+        let slot = match &slots {
+            Some(slots) => Some(slots.clone().acquire_owned().await?),
+            None => None,
+        };
         let (conn, _) = listener.accept().await?;
         let mgr = mgr.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_control(conn, mgr).await {
+            let _slot = slot;
+            if let Err(e) = handle_control(conn, mgr, idle).await {
                 eprintln!("virtkit: control request: {e:#}");
             }
         });
     }
 }
 
-async fn handle_control(conn: tokio::net::UnixStream, mgr: Arc<Manager>) -> Result<()> {
+async fn handle_control(
+    conn: tokio::net::UnixStream,
+    mgr: Arc<Manager>,
+    idle: std::time::Duration,
+) -> Result<()> {
     let (rd, mut wr) = conn.into_split();
     let mut rd = tokio::io::BufReader::new(rd);
     loop {
-        // the peer hanging up between requests is the normal end of a session
-        let Ok(req) = vk_core::fleetctl::read_msg::<_, Request>(&mut rd).await else {
+        // The peer hanging up or idling between requests is the normal end of a session. A
+        // request is a unit name and an operation: bounded to that, not to a reply's size.
+        let read = vk_core::fleetctl::read_msg_capped::<_, Request>(
+            &mut rd,
+            vk_core::fleetctl::MAX_REQUEST,
+        );
+        let Ok(Ok(req)) = tokio::time::timeout(idle, read).await else {
             return Ok(());
         };
         match req {
@@ -566,6 +665,89 @@ async fn stream_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fresh directory for one test, under a name no other run computes.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let nonce = crate::scratch::random_nonce().unwrap();
+        let dir = std::env::temp_dir().join(format!("vk-manager-{name}-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Only the end of a long console is read, and only its whole lines.
+    #[test]
+    fn a_console_is_read_from_its_end_in_whole_lines() {
+        let dir = scratch_dir("console-tail");
+        let path = dir.join("console.log");
+        std::fs::write(&path, b"first line\nsecond\nthird\n").unwrap();
+        assert_eq!(
+            console_tail(&path, 1 << 20).unwrap(),
+            "first line\nsecond\nthird\n"
+        );
+        // A cut inside "second" drops what is left of it.
+        assert_eq!(console_tail(&path, 9).unwrap(), "third\n");
+        // A cut right after a newline keeps the whole line it starts.
+        assert_eq!(console_tail(&path, 13).unwrap(), "second\nthird\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A guest holding every connection it may, idle, leaves the host's clients served at once
+    /// on their own socket while its own next connection waits for a slot, and its idle
+    /// connections are dropped. Real time with a short idle bound: under a paused clock, every
+    /// wait on socket readiness would advance it to the idle timeout and free the slots.
+    #[tokio::test]
+    async fn a_guest_at_its_connection_bound_leaves_the_host_served() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::UnixStream;
+        use tokio::time::{Instant, timeout};
+        const IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+        let dir = scratch_dir("control");
+        let vsock = dir.join("vsock.sock");
+        let mgr = Arc::new(manager_over_two_units());
+        tokio::spawn({
+            let vsock = vsock.clone();
+            async move { control_server_idling(&vsock, mgr, IDLE).await }
+        });
+        let guest = vk_core::net::hybrid_socket(&vsock, vk_core::fleetctl::CONTROL_PORT);
+        let host = host_control_socket(&vsock);
+        while !host.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let held = Instant::now();
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CONTROL_CONNECTIONS {
+            idle.push(UnixStream::connect(&guest).await.unwrap());
+        }
+        let list = async |socket: &Path| {
+            let (rd, mut wr) = UnixStream::connect(socket).await.unwrap().into_split();
+            let mut rd = tokio::io::BufReader::new(rd);
+            vk_core::fleetctl::write_msg(&mut wr, &Request::List)
+                .await
+                .unwrap();
+            let Frame::Done(reply) = vk_core::fleetctl::read_msg(&mut rd).await.unwrap() else {
+                panic!("a list answers with Done");
+            };
+            reply
+        };
+
+        // One guest connection past the bound is not served while the slots stay held.
+        let mut over = std::pin::pin!(list(&guest));
+        assert!(
+            timeout(IDLE / 2, &mut over).await.is_err(),
+            "a guest connection past the bound was served"
+        );
+        let reply = list(&host).await;
+        assert!(reply.ok, "{}", reply.message);
+        assert!(held.elapsed() < IDLE, "the host waited for a slot");
+
+        for conn in &mut idle {
+            assert_eq!(conn.read(&mut [0u8; 1]).await.unwrap(), 0);
+        }
+        assert!(held.elapsed() >= IDLE, "an idle connection closed early");
+        // With the idle connections dropped, the waiting one is served.
+        assert!(over.await.ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A manager over one `build:` unit and one `image:` unit, provisioned as `plan_services`
     /// would leave them: each addressed, neither built.

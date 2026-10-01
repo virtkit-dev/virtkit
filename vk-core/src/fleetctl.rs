@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 /// vsock port the fleet manager accepts control connections on.
 pub const CONTROL_PORT: u32 = 1099;
@@ -96,14 +96,37 @@ pub async fn write_msg<W: AsyncWriteExt + Unpin, T: Serialize>(w: &mut W, msg: &
     Ok(())
 }
 
-/// Read one newline-delimited JSON message.
+/// The longest control message either side reads: well past any reply, a unit's log tail
+/// included, and a bound on what the guest's end of a request can make the host buffer.
+pub const MAX_MSG: u64 = 16 << 20;
+
+/// The longest request the service manager reads from a guest: a unit name and an
+/// operation, a few hundred bytes at most.
+pub const MAX_REQUEST: u64 = 64 << 10;
+
+/// Read one newline-delimited JSON message, of at most [`MAX_MSG`] bytes.
 pub async fn read_msg<R, T>(r: &mut R) -> Result<T>
 where
     R: AsyncBufReadExt + Unpin,
     T: for<'de> Deserialize<'de>,
 {
-    let mut line = String::new();
-    if r.read_line(&mut line).await? == 0 {
+    read_msg_capped(r, MAX_MSG).await
+}
+
+/// [`read_msg`] with a `max`-byte limit for smaller messages, such as guest requests.
+pub async fn read_msg_capped<R, T>(r: &mut R, max: u64) -> Result<T>
+where
+    R: AsyncBufReadExt + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
+    // Buffer bytes so a cut inside a multibyte character reports overflow, not invalid UTF-8.
+    // Read one extra byte to distinguish a line of exactly `max` bytes from a longer one.
+    let mut line = Vec::new();
+    let n = (&mut *r).take(max + 1).read_until(b'\n', &mut line).await?;
+    if n as u64 > max {
+        anyhow::bail!("control message over {max} bytes");
+    }
+    if n == 0 {
         // A clean EOF: report it as an io::Error so callers can classify a peer hangup by
         // kind rather than by matching this string.
         return Err(std::io::Error::new(
@@ -112,6 +135,7 @@ where
         )
         .into());
     }
+    let line = std::str::from_utf8(&line).context("decoding control message")?;
     serde_json::from_str(line.trim_end()).context("decoding control message")
 }
 
@@ -207,6 +231,60 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer that never ends its line is cut off at the bound rather than buffered without end.
+    #[tokio::test]
+    async fn a_request_is_held_to_its_own_bound() {
+        let long = vec![b'x'; MAX_REQUEST as usize + 2];
+        let mut rd = BufReader::new(&long[..]);
+        assert!(
+            read_msg_capped::<_, Request>(&mut rd, MAX_REQUEST)
+                .await
+                .is_err()
+        );
+    }
+
+    /// A request filling the bound exactly, newline included, is read; one byte more is not.
+    #[tokio::test]
+    async fn a_request_of_exactly_the_bound_is_accepted() {
+        let req = serde_json::to_string(&Request::List).unwrap();
+        let max = req.len() as u64 + 1;
+        let line = format!("{req}\n");
+        let mut rd = BufReader::new(line.as_bytes());
+        assert!(matches!(
+            read_msg_capped::<_, Request>(&mut rd, max).await.unwrap(),
+            Request::List
+        ));
+        let line = format!("{req} \n");
+        let mut rd = BufReader::new(line.as_bytes());
+        let err = read_msg_capped::<_, Request>(&mut rd, max)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("over"), "{err}");
+    }
+
+    /// A cut landing inside a multibyte character is reported as over the bound.
+    #[tokio::test]
+    async fn a_cut_inside_a_character_is_over_the_bound() {
+        let mut rd = BufReader::new("xé\n".as_bytes());
+        let err = read_msg_capped::<_, Request>(&mut rd, 1)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("over"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_endless_message_is_refused_at_the_bound() {
+        let endless = vec![b'x'; MAX_MSG as usize + 2];
+        let mut rd = BufReader::new(&endless[..]);
+        let err = read_msg::<_, Request>(&mut rd)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("over"), "{err}");
+    }
 
     /// A frame stream — interim `Progress` lines then the terminal `Done` — forwards every
     /// progress line in order and returns the `Done` reply, stopping at `Done`.

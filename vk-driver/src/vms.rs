@@ -736,17 +736,24 @@ fn query_units(ctl: &Path) -> Result<Vec<UnitStatus>> {
     Ok(reply.units)
 }
 
-/// The host end of a compose run's service control plane — the hybrid-vsock socket its
-/// manager listens on — or `None` for a run without services.
+/// The manager's host-only control socket, or `None` for a run without services.
+/// Fall back to the guest's hybrid-vsock socket for runs started by an older `vk`.
 pub fn control_socket(entry: &VmEntry) -> Option<PathBuf> {
     if entry.services.is_empty() {
         return None;
     }
     match vk_core::addr::SocketAddr::from_str(&entry.exec_addr) {
-        Ok(vk_core::addr::SocketAddr::VsockAuto { path, .. }) => Some(vk_core::net::hybrid_socket(
-            &path,
-            vk_core::fleetctl::CONTROL_PORT,
-        )),
+        Ok(vk_core::addr::SocketAddr::VsockAuto { path, .. }) => {
+            let host = crate::manager::host_control_socket(&path);
+            if host.exists() {
+                Some(host)
+            } else {
+                Some(vk_core::net::hybrid_socket(
+                    &path,
+                    vk_core::fleetctl::CONTROL_PORT,
+                ))
+            }
+        }
         _ => None,
     }
 }

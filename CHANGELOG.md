@@ -32,6 +32,10 @@ All notable changes to virtkit will be documented in this file.
   `--insecure` is intended for the image pull. This prevents sending the registry credential
   over TLS without certificate checks. As elsewhere, `--insecure` means plain HTTP;
   use `--ca` for a private CA.
+- **Security: a guest can no longer exhaust the host's `vk` through its service control
+  channel.** A request is capped at 64 KiB, a guest holds at most 16 control connections at
+  once and an idle one is dropped after 60 seconds, and `vk list` and `vk dev` no longer
+  share those connections with the guest. A unit's `logs` reads the last 2 MiB of its console.
 - **Security: a build's stage guests get a private session directory.** It was created at a
   predictable name in the shared temp dir and reused as found, so another local user could
   plant it and take over the guest's exec channel and console log.

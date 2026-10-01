@@ -621,9 +621,11 @@ pub(crate) fn default_scratch_base() -> Result<PathBuf> {
 
 pub(crate) use vk_core::unixpath::SUN_PATH_MAX;
 
-/// The longest socket name bound directly in a state dir — the vsock socket of the highest
-/// port a bridged or published port can take; a virtiofsd volume socket (`vfsd-vol<i>.sock`)
-/// only overtakes it past 1000 volumes.
+/// The longest socket name the VMM itself binds or dials in a state dir — the vsock socket of
+/// the highest port a bridged or published port can take; a virtiofsd volume socket
+/// (`vfsd-vol<i>.sock`) only overtakes it past 1000 volumes. The host-only control socket
+/// (`vsock.sock_1099.host`) is longer, but only `vk` binds and dials it, through the
+/// `/proc/self/fd` fallback of `vk_core::unixpath`.
 const LONGEST_SOCKET_NAME: &str = "vsock.sock_65535";
 
 /// State directory byte limit under cloud-hypervisor, reserving room for the separator and
@@ -2312,12 +2314,13 @@ async fn build_and_boot(
         numa: args.numa.clone(),
     };
     // Control server on the primary's hybrid-vsock control socket — only the
-    // primary's guest can reach it, so the control plane is scoped to this run.
+    // primary's guest can reach it, so the control plane is scoped to this run —
+    // and on the host-only socket beside it.
     if let Some(mgr) = &manager {
-        let ctl = crate::vmm::hybrid_socket(&vsock, vk_core::fleetctl::CONTROL_PORT);
+        let vsock = vsock.clone();
         let mgr = mgr.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::manager::control_server(&ctl, mgr).await {
+            if let Err(e) = crate::manager::control_server(&vsock, mgr).await {
                 eprintln!("virtkit: control server exited: {e:#}");
             }
         });
