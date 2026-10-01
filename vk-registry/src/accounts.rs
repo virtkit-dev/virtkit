@@ -1177,6 +1177,23 @@ fn from_secs(secs: i64) -> SystemTime {
         .unwrap_or(UNIX_EPOCH)
 }
 
+/// Log an administrative change made over HTTP, naming the session that made it — the
+/// counterpart of the admin socket's own `accounts admin:` lines, so what changes a
+/// registry's tags, keys and captions is on record whichever door it came through.
+pub(crate) fn audit(user: &User, what: std::fmt::Arguments<'_>) {
+    eprintln!("{}", audit_line(user, what));
+}
+
+/// [`audit`]'s line. The identity is the IdP's to write, so it is printed escaped.
+fn audit_line(user: &User, what: std::fmt::Arguments<'_>) -> String {
+    format!(
+        "vk-registry: audit: {:?} ({:?} at {:?}): {what}",
+        user.email.as_deref().unwrap_or("-"),
+        user.oidc_subject,
+        user.oidc_issuer
+    )
+}
+
 /// `n` cryptographically random bytes, hex-encoded — the one token-generation primitive
 /// shared by session ids, csrf secrets, API key secrets, and `oidc.rs`'s login state and
 /// PKCE verifier.
@@ -1192,6 +1209,28 @@ mod tests {
     use redb::ReadableTableMetadata;
 
     use super::*;
+
+    /// An audit line names who acted, escaped, and what they did.
+    #[test]
+    fn an_audit_line_names_the_session_escaped() {
+        let user = User {
+            id: "https://issuer\u{1f}sub-1".to_string(),
+            oidc_issuer: "https://issuer".to_string(),
+            oidc_subject: "sub-1".to_string(),
+            email: Some("a@corp\u{1b}[2J".to_string()),
+            display_name: None,
+            is_admin: true,
+            created_at: SystemTime::UNIX_EPOCH,
+            last_login_at: SystemTime::UNIX_EPOCH,
+        };
+        let line = audit_line(&user, format_args!("deleted tag team/app:v1"));
+        assert!(line.contains("deleted tag team/app:v1"), "{line}");
+        assert!(
+            line.contains("sub-1") && line.contains("https://issuer"),
+            "{line}"
+        );
+        assert!(!line.contains('\u{1b}'), "{line}");
+    }
 
     fn scope(action: Action, repo_pattern: &str) -> Scope {
         Scope {

@@ -156,13 +156,23 @@ async fn create(
     if let Err(e) = accounts::validate_key_input(&name, &scopes) {
         return bad(&format!("{e}"));
     }
-    let (_, token) = match db.create_api_key(Some(&user.id), &name, &scopes, expires_at) {
+    let (key, token) = match db.create_api_key(Some(&user.id), &name, &scopes, expires_at) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("vk-registry: creating an API key: {e:#}");
             return Ok(server_error(db, user, session_id.as_deref()));
         }
     };
+    // Never the token: the line names the key, as a listing does.
+    accounts::audit(
+        user,
+        format_args!(
+            "created API key {:?} ({}) with {}",
+            name,
+            key.id,
+            crate::admin::scope_summary(&scopes)
+        ),
+    );
     Ok(respond(
         StatusCode::OK,
         &page(
@@ -199,7 +209,10 @@ async fn revoke(
     // a key that does not exist are answered identically: an id from a listing must not
     // tell its holder anything about anyone else's keys.
     match db.revoke_api_key(&user.id, id) {
-        Ok(true) => see_other("/settings/keys"),
+        Ok(true) => {
+            accounts::audit(user, format_args!("revoked API key {id}"));
+            see_other("/settings/keys")
+        }
         Ok(false) => Ok(html::error(
             StatusCode::NOT_FOUND,
             Some(&Principal::Session(user.clone())),

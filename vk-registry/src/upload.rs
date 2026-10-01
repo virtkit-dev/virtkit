@@ -295,6 +295,7 @@ async fn submit(
             "Try again, or ask an operator to check the server log.",
         ));
     }
+    accounts::audit(user, format_args!("uploaded {name}:{tag}"));
     // 303 to the page that shows what landed, so a refresh re-reads it rather than
     // uploading the file a second time.
     Response::builder()

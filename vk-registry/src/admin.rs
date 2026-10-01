@@ -569,7 +569,7 @@ fn dispatch(body: &[u8], db: &Db, peer: Peer) -> Result<serde_json::Value> {
 }
 
 /// What a key may do, for the audit line: every grant, or that it has none.
-fn scope_summary(scopes: &[Scope]) -> String {
+pub(crate) fn scope_summary(scopes: &[Scope]) -> String {
     if scopes.is_empty() {
         return "no scopes".to_string();
     }
