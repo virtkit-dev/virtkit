@@ -385,16 +385,21 @@ async fn overlay_mark(ctx: &JobCtx) -> Option<(u64, u64)> {
         return None;
     }
     let (out, sink) = stdout_capture();
-    let asked = exec_script(
-        &vsock_addr(ctx),
-        &[crate::run::GUEST_AGENT.to_string(), "fsmark".to_string()],
-        Vec::new(),
-        None,
-        &sink,
-        None,
+    // Bounded like the other marks: the binary answering is whatever the guest put at that
+    // path, and an answer that never comes must not hold the job's last stage.
+    let asked = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        exec_script(
+            &vsock_addr(ctx),
+            &[crate::run::GUEST_AGENT.to_string(), "fsmark".to_string()],
+            Vec::new(),
+            None,
+            &sink,
+            None,
+        ),
     )
     .await;
-    if !matches!(asked, Ok(r) if r.code == Some(0)) {
+    if !matches!(asked, Ok(Ok(r)) if r.code == Some(0)) {
         return None;
     }
     parse_mark(&out.lock().ok()?)
