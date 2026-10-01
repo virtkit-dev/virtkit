@@ -912,6 +912,11 @@ impl Store {
         if reference.starts_with("sha256:") && reference != digest {
             bail!("manifest body hashes to {digest}, not the requested {reference}");
         }
+        // The gc mark parses every rooted manifest and aborts on one that will not parse, so
+        // storing such bytes would stall collection for as long as their tag is read.
+        if !is_json_object(body) {
+            bail!("manifest body is not a JSON object");
+        }
         let hex = &digest[7..];
         let dest = self.blob_path(hex);
         if dest.exists() {
@@ -1913,6 +1918,11 @@ fn manifest_child_hexes(manifest: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Whether `body` parses as a JSON object, the least every manifest media type is.
+fn is_json_object(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v.is_object())
+}
+
 /// The digest hexes a manifest references: its config and every layer, read
 /// structurally (`config.digest`, `layers[].digest`) so the gc mark needs no OCI
 /// types and tolerates media types it doesn't know. An image index (`manifests[]`)
@@ -2902,8 +2912,6 @@ fn put_manifest(
     ctype: &str,
     body: &[u8],
 ) -> Result<Response<Body>> {
-    // shared store lock for the write (vs. an exclusive gc); see lock_shared.
-    let _lock = store.lock_shared()?;
     // A digest reference that does not match the body is the client's error, not this
     // server's, so it is the spec's 400 rather than `handle`'s JSON 500.
     if reference.starts_with("sha256:") && reference != format!("sha256:{}", sha256_hex_raw(body)) {
@@ -2913,6 +2921,15 @@ fn put_manifest(
             &format!("the manifest body does not hash to {reference}"),
         ));
     }
+    if !is_json_object(body) {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "MANIFEST_INVALID",
+            "the manifest body is not a JSON object",
+        ));
+    }
+    // shared store lock for the write (vs. an exclusive gc); see lock_shared.
+    let _lock = store.lock_shared()?;
     match authorize_and_mount_manifest_blobs(authz, store, name, body)? {
         Mount::Done => {}
         Mount::Unreadable(hex) => {
@@ -4654,6 +4671,42 @@ mod tests {
         .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A body that is not a JSON object is refused before anything is written: the gc mark
+    /// parses every rooted manifest and stops on one it cannot.
+    #[tokio::test]
+    async fn a_manifest_that_is_not_a_json_object_is_refused() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-notjson-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        for body in [&b"not json"[..], b"[]", b"\"a string\""] {
+            let res = put_manifest(
+                &Authz::NoScopes,
+                &store,
+                "img",
+                "v1",
+                DEFAULT_MANIFEST_TYPE,
+                body,
+            )
+            .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            let err: serde_json::Value =
+                serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(err["errors"][0]["code"], "MANIFEST_INVALID");
+            assert!(
+                store
+                    .put_manifest("img", "v1", DEFAULT_MANIFEST_TYPE, body)
+                    .is_err()
+            );
+        }
+        assert!(store.get_manifest("img", "v1").unwrap().is_none());
+        assert!(
+            !store.tag_path("img", "v1").exists(),
+            "a refused push leaves no tag"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

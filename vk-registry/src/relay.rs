@@ -234,6 +234,15 @@ pub async fn get_manifest(
         .context("reading the upstream manifest")?;
 
     if reference.starts_with("sha256:") {
+        // Check before the store rejects a non-object body so the error is attributed
+        // to the upstream (502) rather than this server (500).
+        if !crate::is_json_object(&body) {
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                "MANIFEST_INVALID",
+                "the upstream manifest is not a JSON object",
+            ));
+        }
         // immutable: persist (a digest reference writes no tag) and serve canonically.
         // Under the shared store lock, as the blob path is: the write puts the bytes and
         // the sidecar that makes them readable here, and an exclusive `gc` in between

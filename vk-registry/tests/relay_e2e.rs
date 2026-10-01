@@ -1177,18 +1177,77 @@ async fn browse_belongs_to_accounts_mode_and_redirects_a_signed_out_browser() {
     let _ = std::fs::remove_dir_all(&acc_dir);
 }
 
-/// An upstream's `Content-Type` is as caller-supplied as a pusher's: the relay caches a
-/// digest-pinned manifest and then serves it from *this* origin — the one that serves
-/// `/browse` and holds the session cookie. Whatever the upstream labelled it, the mirror
-/// must answer one of the four manifest types, and must not let a browser sniff past that.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_relayed_manifests_content_type_is_held_to_a_manifest_type() {
+/// An upstream that answers every request with `body`, labelled `ctype`: whatever a real
+/// registry would serve, the mirror cannot depend on it.
+fn fixed_upstream(ctype: &'static str, body: Vec<u8>) -> std::net::SocketAddr {
     use bytes::Bytes;
     use http_body_util::Full;
     use hyper::body::Incoming;
     use hyper::service::service_fn;
     use hyper::{Request, Response};
     use hyper_util::rt::TokioIo;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let l = tokio::net::TcpListener::from_std(listener).unwrap();
+            loop {
+                let Ok((stream, _)) = l.accept().await else {
+                    return;
+                };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let svc = service_fn(move |_req: Request<Incoming>| {
+                        let body = body.clone();
+                        async move {
+                            Ok::<_, std::convert::Infallible>(
+                                Response::builder()
+                                    .header("content-type", ctype)
+                                    .body(Full::new(Bytes::from(body)))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+    });
+    addr
+}
+
+/// A mirror whose only upstream is `up_addr`, storing under `dir`.
+fn mirror_of(up_addr: std::net::SocketAddr, dir: &std::path::Path) -> Arc<ServerState> {
+    Arc::new(ServerState {
+        store: Arc::new(Store::new(dir.to_path_buf()).unwrap()),
+        upstreams: vec![Upstream {
+            prefix: String::new(),
+            base: format!("http://{up_addr}"),
+            username: None,
+            password: None,
+            client: reqwest::Client::new(),
+        }],
+        locks: LockManager::new(),
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+        tls: None,
+        webdav: true,
+    })
+}
+
+/// An upstream's `Content-Type` is as caller-supplied as a pusher's: the relay caches a
+/// digest-pinned manifest and then serves it from *this* origin — the one that serves
+/// `/browse` and holds the session cookie. Whatever the upstream labelled it, the mirror
+/// must answer one of the four manifest types, and must not let a browser sniff past that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relayed_manifests_content_type_is_held_to_a_manifest_type() {
     use sha2::{Digest, Sha256};
 
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1202,60 +1261,10 @@ async fn a_relayed_manifests_content_type_is_held_to_a_manifest_type() {
 
     // An upstream that labels a manifest `text/html` — a real one would not, which is the
     // point: the mirror cannot depend on it not doing so.
-    let up_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    up_listener.set_nonblocking(true).unwrap();
-    let up_addr = up_listener.local_addr().unwrap();
-    {
-        let manifest = manifest.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                let l = tokio::net::TcpListener::from_std(up_listener).unwrap();
-                loop {
-                    let Ok((stream, _)) = l.accept().await else {
-                        return;
-                    };
-                    let manifest = manifest.clone();
-                    tokio::spawn(async move {
-                        let svc = service_fn(move |_req: Request<Incoming>| {
-                            let manifest = manifest.clone();
-                            async move {
-                                Ok::<_, std::convert::Infallible>(
-                                    Response::builder()
-                                        .header("content-type", "text/html")
-                                        .body(Full::new(Bytes::from(manifest)))
-                                        .unwrap(),
-                                )
-                            }
-                        });
-                        let _ = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(TokioIo::new(stream), svc)
-                            .await;
-                    });
-                }
-            });
-        });
-    }
+    let up_addr = fixed_upstream("text/html", manifest.clone());
 
     let dir = tmp("relay-ctype");
-    let mirror = Arc::new(ServerState {
-        store: Arc::new(Store::new(dir.clone()).unwrap()),
-        upstreams: vec![Upstream {
-            prefix: String::new(),
-            base: format!("http://{up_addr}"),
-            username: None,
-            password: None,
-            client: reqwest::Client::new(),
-        }],
-        locks: LockManager::new(),
-        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
-        tls: None,
-        webdav: true,
-    });
-    let url = spawn(mirror);
+    let url = spawn(mirror_of(up_addr, &dir));
     let http = reqwest::Client::new();
 
     let r = http
@@ -1317,6 +1326,39 @@ async fn a_relayed_manifests_content_type_is_held_to_a_manifest_type() {
             .get("x-content-type-options")
             .and_then(|v| v.to_str().ok()),
         Some("nosniff")
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Like the store, the digest-pinned relay rejects non-object manifests.
+/// It neither caches nor serves them and attributes the error to the upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relayed_manifest_that_is_not_a_json_object_is_not_cached() {
+    let manifest = b"[]".to_vec();
+    let hex: String = <sha2::Sha256 as sha2::Digest>::digest(&manifest)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mdigest = format!("sha256:{hex}");
+    let up_addr = fixed_upstream(MANIFEST_TYPE, manifest);
+
+    let dir = tmp("relay-notjson");
+    let mirror = mirror_of(up_addr, &dir);
+    let store = mirror.store.clone();
+    let url = spawn(mirror);
+
+    let r = reqwest::Client::new()
+        .get(format!("{url}/v2/app/manifests/{mdigest}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let err: serde_json::Value = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
+    assert_eq!(err["errors"][0]["code"], "MANIFEST_INVALID");
+    assert!(
+        store.get_manifest("app", &mdigest).unwrap().is_none(),
+        "upstream bytes that are not a manifest must not be cached"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
