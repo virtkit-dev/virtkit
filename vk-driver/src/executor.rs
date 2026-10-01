@@ -17,6 +17,7 @@ use vk_core::addr::SocketAddr;
 use vk_core::messages::{CmdExec, CmdResult, Fd, Message, RunMode};
 
 use crate::jobctx::JobCtx;
+use crate::task::AbortOnDrop;
 
 const STDIN_CHUNK: usize = 4096;
 
@@ -516,27 +517,6 @@ pub fn guest_shell(ctx: &JobCtx) -> Vec<String> {
     }
 }
 
-/// A [`tokio::spawn`]ed task aborted when its handle goes out of scope.
-///
-/// [`exec_script`]'s stdin feeder owns the connection's write half, so an early `?`
-/// that merely dropped the handle would leave the task pumping into a socket nobody
-/// closes: the guest never sees stdin EOF, the remote process keeps running, and the
-/// fd plus the whole script buffer leak. Aborting on drop makes every exit path —
-/// including the error ones — tear it down.
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
-
-impl<T> AbortOnDrop<T> {
-    fn abort(&self) {
-        self.0.abort();
-    }
-}
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 /// Run guest commands as root regardless of the image's USER.
 /// Numeric uid 0 also works without a `root` passwd entry.
 pub(crate) const GUEST_ROOT: &str = "0";
@@ -582,7 +562,10 @@ pub async fn exec_script(
 
     // The guest interleaves stdin consumption with output: pump the script in
     // concurrently with the output loop, or a chatty script would deadlock both
-    // sides on full buffers.
+    // sides on full buffers. The feeder owns the connection's write half, so an early `?`
+    // that merely dropped its handle would leave it pumping into a socket nobody closes:
+    // the guest never sees stdin EOF, the remote process keeps running, and the fd plus
+    // the whole script buffer leak. Hence abort on drop.
     let feed_stdin = AbortOnDrop(tokio::spawn(async move {
         for chunk in script.chunks(STDIN_CHUNK) {
             sink.send(Message::Data {

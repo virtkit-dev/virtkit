@@ -1790,13 +1790,13 @@ fn check_blob_size(layer: &OciDescriptor, max: u64) -> Result<()> {
 /// An `AsyncWrite` that fails once more than `max` bytes are written to it: what keeps a
 /// blob that streams past its declared size from growing without bound before its digest
 /// can be checked.
-struct Capped<W> {
+pub(crate) struct Capped<W> {
     inner: W,
     left: u64,
 }
 
 impl<W> Capped<W> {
-    fn new(inner: W, max: u64) -> Self {
+    pub(crate) fn new(inner: W, max: u64) -> Self {
         Capped { inner, left: max }
     }
 }

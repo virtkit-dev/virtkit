@@ -17,6 +17,9 @@ All notable changes to virtkit will be documented in this file.
   `accounts admin:` lines name its peer.
 - The guest kernel no longer lets unprivileged processes use eBPF; root can turn it back on
   with `sysctl kernel.unprivileged_bpf_disabled=0`.
+- **An OCI image pull keeps downloaded layers on disk, not in memory.** They sit next to the
+  output: a large image needs free disk there (up to four layers plus the flattened image)
+  rather than RAM.
 - `vk-registry` warns at startup when it serves without authentication on an address other
   than loopback.
 - `vk tune`'s report line names the estimate and the ceiling ahead of the figures behind them.

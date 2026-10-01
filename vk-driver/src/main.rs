@@ -77,6 +77,7 @@ mod sshagent;
 mod sshclient;
 mod sshconf;
 mod switch;
+mod task;
 mod term;
 mod timing;
 mod toolchain;

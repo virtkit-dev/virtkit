@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use flate2::read::GzDecoder;
 use oci_client::Reference;
 use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol};
@@ -499,6 +499,9 @@ pub async fn pull_flatten(
     Ok(())
 }
 
+/// Layers downloaded at once by [`pull_merged`], each into its own scratch file.
+const LAYER_DOWNLOADS: usize = 4;
+
 /// Pull `reference` and flatten its layers into a [`Merger`] (spilled to an unlinked
 /// scratch file in `scratch_dir`), plus the layer count. The caller picks the output
 /// form: `finish` to a tar file, or `finish_to` a writer to stream with no
@@ -514,23 +517,82 @@ pub(crate) async fn pull_merged(
         .with_context(|| format!("parsing OCI reference {reference:?}"))?;
     let client = creds.client();
     let auth = creds.auth();
-    let accepted = vec![
+    let accepted = [
         manifest::IMAGE_LAYER_GZIP_MEDIA_TYPE,
         manifest::IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE,
         manifest::IMAGE_LAYER_MEDIA_TYPE,
         manifest::IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
     ];
     note(&format!("virtkit: pulling OCI image {reference} ..."));
-    let image = client
-        .pull(&reference, &auth, accepted)
+    let (manifest, _digest) = client
+        .pull_image_manifest(&reference, &auth)
         .await
-        .with_context(|| format!("pulling {reference}"))?;
-
-    let mut merger = Merger::new(crate::scratch::scratch(scratch_dir, "oci-spill")?.file);
-    for layer in &image.layers {
-        merger.apply_layer(&layer.data[..], &layer.media_type)?;
+        .with_context(|| format!("pulling the manifest of {reference}"))?;
+    if let Some(layer) = manifest
+        .layers
+        .iter()
+        .find(|l| !accepted.contains(&l.media_type.as_str()))
+    {
+        bail!(
+            "{reference}: layer {} has media type {}, not one this puller reads",
+            layer.digest,
+            layer.media_type
+        );
     }
-    Ok((merger, image.layers.len()))
+    ensure!(
+        !manifest.layers.is_empty(),
+        "{reference}: image has no layers"
+    );
+
+    // Flatten from unlinked scratch files: a job-chosen image can exceed host RAM.
+    // Files use O_TMPFILE on `scratch_dir`'s filesystem, falling back to memfd.
+    // At most LAYER_DOWNLOADS layers occupy scratch space beside the merge;
+    // layers and errors are processed in order. Separate download tasks continue
+    // while gunzip and copy run on a blocking thread.
+    use futures::StreamExt;
+    let layers = manifest.layers.len();
+    let mut pulls = futures::stream::iter(manifest.layers)
+        .map(|layer| {
+            let (client, reference) = (client.clone(), reference.clone());
+            let dir = scratch_dir.to_path_buf();
+            // Aborted when dropped: a pull that fails, or is dropped itself, stops the
+            // downloads it started rather than leaving them filling scratch files.
+            crate::task::AbortOnDrop(tokio::spawn(async move {
+                let spill = crate::scratch::scratch(&dir, "oci-layer")?;
+                // Capped at the declared size: a registry streaming past it is refused before
+                // it can fill the disk, not only once the digest check fails at the end.
+                let size = u64::try_from(layer.size).with_context(|| {
+                    format!("layer {} declares {} bytes", layer.digest, layer.size)
+                })?;
+                let mut out = crate::registry::Capped::new(
+                    tokio::fs::File::from_std(
+                        spill
+                            .file
+                            .try_clone()
+                            .context("cloning a layer's scratch file")?,
+                    ),
+                    size,
+                );
+                client
+                    .pull_blob(&reference, &layer, &mut out)
+                    .await
+                    .with_context(|| format!("pulling layer {} of {reference}", layer.digest))?;
+                Ok::<_, anyhow::Error>((spill.file, layer.media_type))
+            }))
+        })
+        .buffered(LAYER_DOWNLOADS);
+    let mut merger = Merger::new(crate::scratch::scratch(scratch_dir, "oci-spill")?.file);
+    while let Some(pulled) = pulls.next().await {
+        let (mut file, media_type) = pulled.context("a layer download panicked")??;
+        merger = tokio::task::spawn_blocking(move || -> Result<Merger> {
+            std::io::Seek::rewind(&mut file).context("rewinding a pulled layer")?;
+            merger.apply_layer(std::io::BufReader::new(file), &media_type)?;
+            Ok(merger)
+        })
+        .await
+        .context("flattening a layer panicked")??;
+    }
+    Ok((merger, layers))
 }
 
 struct Entry {
