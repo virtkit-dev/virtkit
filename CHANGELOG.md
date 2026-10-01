@@ -28,6 +28,10 @@ All notable changes to virtkit will be documented in this file.
   no longer lends the runner's credential to paths outside `/v2/`.** A request target such
   as `/v2/../lock/acquire` passed the check and reached the registry's lock API once
   resolved. A path carrying an encoded `/` or `\` (`%2F`, `%5C`) is now refused too.
+- **Security: `vk run --registry-proxy https://… --insecure` is refused**, even when
+  `--insecure` is intended for the image pull. This prevents sending the registry credential
+  over TLS without certificate checks. As elsewhere, `--insecure` means plain HTTP;
+  use `--ca` for a private CA.
 - **Security: a build's stage guests get a private session directory.** It was created at a
   predictable name in the shared temp dir and reused as found, so another local user could
   plant it and take over the guest's exec channel and console log.
