@@ -28,6 +28,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: the build cache no longer serves a COPY snapshot whose sources differed only in
+  modes, ownership or symlinks**, such as a setuid bit or a planted link. A COPY keeps its
+  sources' owner in the image, so runners whose checkouts are owned by different users, or
+  made under different umasks, no longer share COPY cache hits.
 - **Security: a `vk-registry` relay no longer sends an upstream's password in clear.** An
   upstream with a password must be `https://` (or loopback), and a token realm the upstream
   names gets its credentials only over HTTPS.

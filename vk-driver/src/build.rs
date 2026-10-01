@@ -3880,9 +3880,26 @@ fn context_files_hash(context: &Path, sources: &[String]) -> String {
         let rel = f.strip_prefix(context).unwrap_or(f).to_string_lossy();
         h.update(rel.as_bytes());
         h.update(b"\0");
-        // Streamed rather than read whole: a context file can be any size at all.
-        match sha256_file(f) {
-            Ok(digest) => h.update(digest),
+        // What a COPY reproduces of the entry, beyond a file's bytes: its kind, mode and
+        // ownership, and a symlink's target. Leaving them out keyed a setuid bit or a planted
+        // link the same as their absence, and a later build reused the other's snapshot.
+        match std::fs::symlink_metadata(f) {
+            Ok(md) => {
+                use std::os::unix::fs::MetadataExt;
+                h.update(format!("{:o} {} {}\0", md.mode(), md.uid(), md.gid()).as_bytes());
+                if md.file_type().is_symlink() {
+                    match std::fs::read_link(f) {
+                        Ok(target) => h.update(target.as_os_str().as_encoded_bytes()),
+                        Err(_) => h.update(b"?"),
+                    }
+                } else if md.is_file() {
+                    // Streamed rather than read whole: a context file can be any size.
+                    match sha256_file(f) {
+                        Ok(digest) => h.update(digest),
+                        Err(_) => h.update(b"?"),
+                    }
+                }
+            }
             Err(_) => h.update(b"?"),
         }
         h.update(b"\n");
@@ -3943,7 +3960,7 @@ fn copy_src_files(context: &Path, ign: &vk_core::dockerignore::Ignore, src: &str
         if !within(&start) {
             return Vec::new();
         }
-        return ign.included_files(&start);
+        return ign.included_entries(&start);
     }
     // glob fallback: split into <dir>/<pattern> and match the dir's entries by name.
     let (dir, pat) = match rel.rsplit_once('/') {
@@ -3961,7 +3978,7 @@ fn copy_src_files(context: &Path, ign: &vk_core::dockerignore::Ignore, src: &str
             if let Some(name) = e.file_name().and_then(|n| n.to_str())
                 && glob_seg(pat, name)
             {
-                out.extend(ign.included_files(&e));
+                out.extend(ign.included_entries(&e));
             }
         }
     }
@@ -5853,6 +5870,32 @@ mod tests {
                 ..scratch()
             }))
         );
+    }
+
+    /// A COPY reproduces modes and links, so the key over its sources follows them too.
+    #[test]
+    fn context_hash_tracks_modes_and_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let ctx = std::env::temp_dir().join(format!("vk-ctx-meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ctx);
+        std::fs::create_dir_all(ctx.join("d")).unwrap();
+        std::fs::write(ctx.join("d/tool"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(ctx.join("d/other"), b"x").unwrap();
+        let srcs = vec!["d".to_string()];
+        let h = || context_files_hash(&ctx, &srcs);
+
+        let plain = h();
+        std::fs::set_permissions(ctx.join("d/tool"), std::fs::Permissions::from_mode(0o4755))
+            .unwrap();
+        let setuid = h();
+        assert_ne!(plain, setuid, "a mode change");
+        std::os::unix::fs::symlink("tool", ctx.join("d/link")).unwrap();
+        let linked = h();
+        assert_ne!(setuid, linked, "an added symlink");
+        std::fs::remove_file(ctx.join("d/link")).unwrap();
+        std::os::unix::fs::symlink("other", ctx.join("d/link")).unwrap();
+        assert_ne!(linked, h(), "a retargeted symlink");
+        let _ = std::fs::remove_dir_all(&ctx);
     }
 
     /// A COPY source cannot reach outside the context: `..` stops at its root, and a

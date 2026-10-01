@@ -68,12 +68,29 @@ impl Ignore {
     /// builder to content-hash a `COPY`'s referenced context files for its cache key.
     pub fn included_files(&self, start: &Path) -> Vec<std::path::PathBuf> {
         let mut out = Vec::new();
-        self.collect(start, false, &mut out);
+        self.collect(start, false, false, &mut out);
         out.sort();
         out
     }
 
-    fn collect(&self, path: &Path, parent_excluded: bool, out: &mut Vec<std::path::PathBuf>) {
+    /// [`Ignore::included_files`] plus the non-excluded directories and symlinks — everything
+    /// a `COPY` of `start` reproduces, so a cache key over it can track an added link, a
+    /// retargeted one or a directory's mode, not just regular files' bytes. A symlink is
+    /// listed, never followed.
+    pub fn included_entries(&self, start: &Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        self.collect(start, false, true, &mut out);
+        out.sort();
+        out
+    }
+
+    fn collect(
+        &self,
+        path: &Path,
+        parent_excluded: bool,
+        all: bool,
+        out: &mut Vec<std::path::PathBuf>,
+    ) {
         let Ok(md) = std::fs::symlink_metadata(path) else {
             return;
         };
@@ -86,12 +103,15 @@ impl Ignore {
             let Ok(rd) = std::fs::read_dir(path) else {
                 return;
             };
+            if all && !excluded {
+                out.push(path.to_path_buf());
+            }
             let mut kids: Vec<std::path::PathBuf> = rd.flatten().map(|e| e.path()).collect();
             kids.sort();
             for k in kids {
-                self.collect(&k, excluded, out);
+                self.collect(&k, excluded, all, out);
             }
-        } else if md.is_file() && !excluded {
+        } else if (md.is_file() || (all && md.file_type().is_symlink())) && !excluded {
             out.push(path.to_path_buf());
         }
     }
