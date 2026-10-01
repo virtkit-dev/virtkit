@@ -265,9 +265,11 @@ fn hardware(samples: &[Sample]) -> Option<String> {
         0 => "no swap".to_string(),
         total => format!("{} swap", fmt_bytes(total)),
     };
+    // The host name, disk and interface names below are the guest's to write: printed through
+    // `plain`, as command lines are, so none can carry an escape sequence to the terminal.
     Some(format!(
         "{} on {} {}, {} memory, {swap}",
-        last.host,
+        plain(&last.host),
         cpu.cpus,
         plural(cpu.cpus as u64, "cpu"),
         fmt_bytes(mem.bytes(mem.physmem))
@@ -537,7 +539,11 @@ fn disk_line(samples: &[Sample]) -> Option<String> {
     }
     let mut line = format!("{} read, {} written", fmt_bytes(read), fmt_bytes(written));
     if let Some((name, ms)) = busiest {
-        line.push_str(&format!(" — {name} busiest, {} busy", fmt_millis(ms)));
+        line.push_str(&format!(
+            " — {} busiest, {} busy",
+            plain(name),
+            fmt_millis(ms)
+        ));
     }
     Some(line)
 }
@@ -568,7 +574,8 @@ fn network_line(samples: &[Sample]) -> Option<String> {
         .iter()
         .map(|(name, in_, out)| {
             format!(
-                "{name} received {}, sent {}",
+                "{} received {}, sent {}",
+                plain(name),
                 fmt_bytes(*in_),
                 fmt_bytes(*out)
             )
@@ -1355,6 +1362,19 @@ mod tests {
             StallScan::default(),
         )
         .expect("a report for a log with samples")
+    }
+
+    /// The host, disk and interface names are the guest's to write, so none reaches the
+    /// operator's terminal with an escape sequence in it.
+    #[test]
+    fn guest_written_names_cannot_reach_the_terminal_raw() {
+        let text = log()
+            .replace(" runner ", " evil\u{1b}]0;pwn\u{7} ")
+            .replace(" vda ", " vd\u{1b}[2J ")
+            .replace(" eth0 ", " eth\u{1b}[31m ");
+        let out = report(&text);
+        assert!(!out.contains('\u{1b}') && !out.contains('\u{7}'), "{out:?}");
+        assert!(out.contains("evil.]0;pwn."), "{out}");
     }
 
     /// The report is what an operator reads instead of the log, so every figure in it is
