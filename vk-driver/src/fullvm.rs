@@ -103,7 +103,7 @@ pub fn prepare(
         let dep_path = format!("/lib/modules/{ver}/modules.dep");
         let dep_text = String::from_utf8(
             reader
-                .read_file(&dep_path)
+                .read_file(&dep_path, MAX_TEXT_BYTES)
                 .with_context(|| format!("reading {dep_path}"))?,
         )
         .with_context(|| format!("{dep_path} is not UTF-8"))?;
@@ -111,7 +111,7 @@ pub fn prepare(
 
         for rel in &rel_paths {
             let abs_in_image = format!("/lib/modules/{ver}/{rel}");
-            let raw = match reader.read_file(&abs_in_image) {
+            let raw = match reader.read_file(&abs_in_image, MAX_MODULE_BYTES) {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     eprintln!("virtkit: skipping module {abs_in_image} (unreadable: {e:#})");
@@ -171,11 +171,18 @@ fn kernel_version(reader: &Ext4Reader) -> Result<String> {
     }
 }
 
+/// The most read out of an image for its kernel, each module, and `modules.dep`: far past any
+/// real one, and a bound on what an image — possibly a guest-written disk — can make the host
+/// allocate by saying how large a file is.
+const MAX_KERNEL_BYTES: u64 = 256 << 20;
+const MAX_MODULE_BYTES: u64 = 64 << 20;
+const MAX_TEXT_BYTES: u64 = 16 << 20;
+
 /// The image's raw kernel image bytes: `/boot/vmlinuz-<ver>`, falling back to the
 /// sole `vmlinuz-*` regular file under `/boot`.
 fn read_kernel(reader: &Ext4Reader, ver: &str) -> Result<Vec<u8>> {
     let exact = format!("/boot/vmlinuz-{ver}");
-    if let Ok(bytes) = reader.read_file(&exact) {
+    if let Ok(bytes) = reader.read_file(&exact, MAX_KERNEL_BYTES) {
         return Ok(bytes);
     }
     let candidates: Vec<String> = reader
@@ -189,7 +196,7 @@ fn read_kernel(reader: &Ext4Reader, ver: &str) -> Result<Vec<u8>> {
         1 => {
             let path = format!("/boot/{}", candidates[0]);
             reader
-                .read_file(&path)
+                .read_file(&path, MAX_KERNEL_BYTES)
                 .with_context(|| format!("reading kernel {path}"))
         }
         0 => bail!("no {exact} and no vmlinuz-* under /boot"),

@@ -15,6 +15,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A guest-written disk image can no longer crash the host's `vk` or make it allocate
+  gigabytes** when `vk` reads the image (for a `FROM --kernel=image` stage, or a job's
+  `/etc/passwd`): its geometry, links and sizes are now checked.
 - **A guest can no longer exhaust the host's sockets through its network**: a job's switch
   carries at most 8192 flows and 256 DNS lookups at once.
 - **Security: a VM on a job's network can no longer pose as another VM or as the gateway**

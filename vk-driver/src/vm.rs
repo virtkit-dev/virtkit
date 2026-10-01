@@ -109,9 +109,11 @@ fn guest_run_user_ids(user: &str, rootfs: &Path) -> Option<(u32, u32)> {
     };
     // Read a file out of the guest rootfs without mounting it, for name resolution.
     let read_rootfs = |path: &str| -> Option<Vec<u8>> {
+        // An account database, read from an image the job chose: a few KiB, never more
+        // than this.
         crate::ext4_read::Ext4Reader::open(rootfs)
             .ok()?
-            .read_file(path)
+            .read_file(path, 4 << 20)
             .ok()
     };
     let (uid, mut gid) = match user_part.parse::<u32>() {
