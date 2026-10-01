@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use vk_registry::accounts::{Action, Db, Scope};
+use vk_registry::accounts::{Action, Db, EmailUpdate, Scope};
 use vk_registry::admin;
 use vk_registry::config::{AuthMode, OidcSpec, UpstreamSpec};
 use vk_registry::lock::LockManager;
@@ -94,7 +94,7 @@ async fn accounts_mode_gates_v2_and_browse_by_scope() {
     let db = accounts_db(&state);
 
     let admin = db
-        .upsert_user("https://issuer", "admin", None, None)
+        .upsert_user("https://issuer", "admin", EmailUpdate::Keep, None)
         .unwrap();
     db.set_admin(&admin.id, true).unwrap();
     let admin_session = db
@@ -102,7 +102,7 @@ async fn accounts_mode_gates_v2_and_browse_by_scope() {
         .unwrap();
 
     let plain_user = db
-        .upsert_user("https://issuer", "plain", None, None)
+        .upsert_user("https://issuer", "plain", EmailUpdate::Keep, None)
         .unwrap();
     let plain_session = db
         .create_session(&plain_user.id, Duration::from_secs(3600))
@@ -431,7 +431,7 @@ async fn settings_captions_are_admin_only_and_show_up_on_the_page() {
         .unwrap();
 
     let plain = db
-        .upsert_user("https://issuer", "plain", None, None)
+        .upsert_user("https://issuer", "plain", EmailUpdate::Keep, None)
         .unwrap();
     let plain_session = db
         .create_session(&plain.id, Duration::from_secs(3600))
@@ -439,7 +439,7 @@ async fn settings_captions_are_admin_only_and_show_up_on_the_page() {
     let plain_csrf = db.session_csrf(&plain_session).unwrap().unwrap();
 
     let admin = db
-        .upsert_user("https://issuer", "admin", None, None)
+        .upsert_user("https://issuer", "admin", EmailUpdate::Keep, None)
         .unwrap();
     assert!(db.set_admin(&admin.id, true).unwrap());
     let admin_session = db
@@ -615,7 +615,9 @@ async fn settings_keys_round_trips_create_and_revoke_with_csrf() {
     let dir = tmp("keys");
     let state = accounts_state(&dir);
     let db = accounts_db(&state);
-    let user = db.upsert_user("https://issuer", "u", None, None).unwrap();
+    let user = db
+        .upsert_user("https://issuer", "u", EmailUpdate::Keep, None)
+        .unwrap();
     // this test mints a write-scoped key on purpose, which only an admin session may do
     assert!(db.set_admin(&user.id, true).unwrap());
     let user = db.get_user(&user.id).unwrap().unwrap();
@@ -669,7 +671,7 @@ async fn settings_keys_round_trips_create_and_revoke_with_csrf() {
     // Revoking someone else's key is refused — and answered the same way a key that does
     // not exist is, so a listing's ids tell a caller nothing about other people's keys.
     let other = db
-        .upsert_user("https://issuer", "other", None, None)
+        .upsert_user("https://issuer", "other", EmailUpdate::Keep, None)
         .unwrap();
     let other_session = db
         .create_session(&other.id, Duration::from_secs(3600))
@@ -815,7 +817,7 @@ async fn a_non_admin_session_cannot_mint_a_write_scoped_key() {
     let state = accounts_state(&dir);
     let db = accounts_db(&state);
     let user = db
-        .upsert_user("https://issuer", "plain", None, None)
+        .upsert_user("https://issuer", "plain", EmailUpdate::Keep, None)
         .unwrap();
     assert!(!user.is_admin);
     let session = db
@@ -886,13 +888,15 @@ async fn a_scoped_key_cannot_read_another_teams_blobs_by_digest() {
     let db = accounts_db(&state);
 
     let admin = db
-        .upsert_user("https://issuer", "admin", None, None)
+        .upsert_user("https://issuer", "admin", EmailUpdate::Keep, None)
         .unwrap();
     assert!(db.set_admin(&admin.id, true).unwrap());
     let admin_session = db
         .create_session(&admin.id, Duration::from_secs(3600))
         .unwrap();
-    let user = db.upsert_user("https://issuer", "ci", None, None).unwrap();
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
     let team_a = Scope {
         action: Action::Write,
         repo_pattern: "team-a/*".to_string(),
@@ -1039,7 +1043,9 @@ async fn dedup_still_works_within_a_keys_own_scope() {
     let state = accounts_state(&dir);
     let store = state.store.clone();
     let db = accounts_db(&state);
-    let user = db.upsert_user("https://issuer", "ci", None, None).unwrap();
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
     let scope = Scope {
         action: Action::Write,
         repo_pattern: "team-a/*".to_string(),
@@ -1113,7 +1119,9 @@ async fn a_pushed_blob_is_readable_through_the_repo_it_was_pushed_to() {
     let state = accounts_state(&dir);
     let store = state.store.clone();
     let db = accounts_db(&state);
-    let user = db.upsert_user("https://issuer", "ci", None, None).unwrap();
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
     let scope = Scope {
         action: Action::Write,
         repo_pattern: "team-a/*".to_string(),
@@ -1212,7 +1220,9 @@ async fn browse_cannot_show_another_teams_manifest_by_digest() {
     let state = accounts_state(&dir);
     let store = state.store.clone();
     let db = accounts_db(&state);
-    let user = db.upsert_user("https://issuer", "ci", None, None).unwrap();
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
     let scope = Scope {
         action: Action::Read,
         repo_pattern: "team-a/*".to_string(),
@@ -1359,7 +1369,9 @@ async fn a_relayed_blob_becomes_a_member_of_the_repo_it_was_fetched_for() {
     );
     let store = state.store.clone();
     let db = accounts_db(&state);
-    let user = db.upsert_user("https://issuer", "ci", None, None).unwrap();
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
     let (_, key) = db
         .create_api_key(
             Some(&user.id),
@@ -1518,7 +1530,12 @@ async fn admin_socket_changes_decide_the_next_request() {
     let dir = tmp("adminsock");
     let state = accounts_state(&dir);
     let seeded = accounts_db(&state)
-        .upsert_user("https://issuer", "u", Some("u@example.com"), None)
+        .upsert_user(
+            "https://issuer",
+            "u",
+            EmailUpdate::Set("u@example.com"),
+            None,
+        )
         .unwrap();
     let session = accounts_db(&state)
         .create_session(&seeded.id, Duration::from_secs(3600))
@@ -1629,7 +1646,7 @@ async fn the_admin_operations_are_not_reachable_over_http() {
     let dir = tmp("nohttp");
     let state = accounts_state(&dir);
     let admin_user = accounts_db(&state)
-        .upsert_user("https://issuer", "admin", None, None)
+        .upsert_user("https://issuer", "admin", EmailUpdate::Keep, None)
         .unwrap();
     assert!(accounts_db(&state).set_admin(&admin_user.id, true).unwrap());
     let session = accounts_db(&state)
@@ -1740,7 +1757,7 @@ async fn settings_tags_delete_is_admin_only_and_drops_the_pointer() {
     );
 
     let plain = db
-        .upsert_user("https://issuer", "plain", None, None)
+        .upsert_user("https://issuer", "plain", EmailUpdate::Keep, None)
         .unwrap();
     let plain_session = db
         .create_session(&plain.id, Duration::from_secs(3600))
@@ -1748,7 +1765,7 @@ async fn settings_tags_delete_is_admin_only_and_drops_the_pointer() {
     let plain_csrf = db.session_csrf(&plain_session).unwrap().unwrap();
 
     let admin = db
-        .upsert_user("https://issuer", "admin", None, None)
+        .upsert_user("https://issuer", "admin", EmailUpdate::Keep, None)
         .unwrap();
     assert!(db.set_admin(&admin.id, true).unwrap());
     let admin_session = db

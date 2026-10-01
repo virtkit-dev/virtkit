@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use vk_registry::accounts::EmailUpdate;
 use vk_registry::config::{AuthMode, OidcSpec};
 use vk_registry::lock::LockManager;
 use vk_registry::relay::Upstream;
@@ -819,7 +820,12 @@ async fn accounts_auth_gates_everything_including_the_probe() {
     let state = accounts_state(&dir);
     let db = accounts_db(&state);
     let user = db
-        .upsert_user("https://issuer", "sub-1", Some("a@example.com"), None)
+        .upsert_user(
+            "https://issuer",
+            "sub-1",
+            EmailUpdate::Set("a@example.com"),
+            None,
+        )
         .unwrap();
     let session = db
         .create_session(&user.id, std::time::Duration::from_secs(3600))
@@ -1096,7 +1102,7 @@ async fn browse_belongs_to_accounts_mode_and_redirects_a_signed_out_browser() {
     let acc = accounts_state(&acc_dir);
     let db = accounts_db(&acc);
     let user = db
-        .upsert_user("https://issuer", "sub-1", None, None)
+        .upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)
         .unwrap();
     let session = db
         .create_session(&user.id, std::time::Duration::from_secs(3600))

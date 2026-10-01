@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use vk_registry::accounts::Db;
+use vk_registry::accounts::{Db, EmailUpdate};
 use vk_registry::config::{AuthMode, OidcSpec};
 use vk_registry::{Authenticator, ServerConfig, ServerState};
 
@@ -99,7 +99,7 @@ async fn upload_round_trips_through_the_shared_store_and_dedups() {
     let store = state.store.clone();
     let db = accounts_db(&state);
     let admin = db
-        .upsert_user("https://issuer", "admin", None, None)
+        .upsert_user("https://issuer", "admin", EmailUpdate::Keep, None)
         .unwrap();
     db.set_admin(&admin.id, true).unwrap();
     let admin_session = db
@@ -108,7 +108,7 @@ async fn upload_round_trips_through_the_shared_store_and_dedups() {
     let csrf = db.session_csrf(&admin_session).unwrap().unwrap();
 
     let plain = db
-        .upsert_user("https://issuer", "plain", None, None)
+        .upsert_user("https://issuer", "plain", EmailUpdate::Keep, None)
         .unwrap();
     let plain_session = db
         .create_session(&plain.id, Duration::from_secs(3600))

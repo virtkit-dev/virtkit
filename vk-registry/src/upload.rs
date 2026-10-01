@@ -652,6 +652,7 @@ fn form_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accounts::EmailUpdate;
     use std::time::Duration;
 
     fn memdb() -> Db {
@@ -664,7 +665,7 @@ mod tests {
     fn csrf_requires_a_live_session_and_a_matching_token() {
         let db = memdb();
         let user = db
-            .upsert_user("https://issuer", "sub-1", None, None)
+            .upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)
             .unwrap();
         let session = db
             .create_session(&user.id, Duration::from_secs(3600))

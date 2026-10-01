@@ -549,9 +549,14 @@ environment variable. An explicitly selected admin socket identifies the server 
 administer; in that case the local database path is only the fallback. With no selector,
 the CLI uses the default shared store.
 
-Users are selected by email using ASCII case-insensitive comparison. If more than one issuer
-has asserted the same email, the command requires `--issuer`. API keys are selected by the
-full hash identifier printed by `list-keys`.
+Users are selected by email using ASCII case-insensitive comparison. Only an email the
+provider has not marked unverified (`email_verified: false`) is stored, and one marked so at
+a later sign-in clears the stored value; a provider that sends no `email_verified` at all is
+taken at its word, so selecting by email is only as sound as the provider's own checks. A
+user promoted while their email stood keeps `is_admin` once it is cleared. The commands
+print the issuer and subject of the user they act on. If more than one issuer has asserted
+the same email, the command requires `--issuer`. API keys are selected by the full hash
+identifier printed by `list-keys`.
 
 The administration channel is not HTTP and is never part of the public route table. By
 default, the socket is `admin.sock` beside the accounts database. It is published with mode

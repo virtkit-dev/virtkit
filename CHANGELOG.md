@@ -21,6 +21,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: `accounts grant-admin` no longer finds a user by an email their identity
+  provider marked unverified**; such an email is not stored, and one stored at an earlier
+  sign-in is forgotten. The command also prints the issuer and subject of the user it
+  promoted.
 - **Security: the build cache no longer stores a base image under a digest it does not
   have.** A FROM image's tag moved during a build could put the new image in the shared
   cache under the old digest, where a build pinned to that digest would pick it up.

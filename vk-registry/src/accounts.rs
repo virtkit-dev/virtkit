@@ -126,6 +126,18 @@ struct ApiKeyRow {
     revoked_at: Option<i64>,
 }
 
+/// Email update from a sign-in, for [`Db::upsert_user`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmailUpdate<'a> {
+    /// An address to store.
+    Set(&'a str),
+    /// No `email` claim: the stored one, if any, stays.
+    Keep,
+    /// Store no email and clear any prior value because the provider marks it unverified.
+    /// Operators select users by email.
+    Clear,
+}
+
 /// A signed-in human (`sub`/`email` from an OIDC provider). `id` is the stable
 /// `"{issuer}\x1f{subject}"` key — there is no separate autoincrement id.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -333,12 +345,13 @@ impl Db {
     ///
     /// `is_admin` is never lowered here: it is set out of band (the `accounts` CLI, an
     /// admin UI), and a re-login must not silently revoke it. An absent optional claim is
-    /// likewise treated as "the provider did not say", not "clear it".
+    /// likewise treated as "the provider did not say", not "clear it"; only
+    /// [`EmailUpdate::Clear`] removes a stored email, in this same write.
     pub fn upsert_user(
         &self,
         issuer: &str,
         subject: &str,
-        email: Option<&str>,
+        email: EmailUpdate<'_>,
         display_name: Option<&str>,
     ) -> Result<User> {
         validate_identity(issuer, subject)?;
@@ -361,10 +374,13 @@ impl Db {
                 // `filter`, because clamping can empty a claim entirely (a `name` of
                 // nothing but control characters), and an empty one must not overwrite a
                 // good stored value any more than an absent one does.
-                email: email
-                    .map(clamp_claim)
-                    .filter(|s| !s.is_empty())
-                    .or(prior_email),
+                email: match email {
+                    EmailUpdate::Set(e) => Some(clamp_claim(e))
+                        .filter(|s| !s.is_empty())
+                        .or(prior_email),
+                    EmailUpdate::Keep => prior_email,
+                    EmailUpdate::Clear => None,
+                },
                 display_name: display_name
                     .map(clamp_claim)
                     .filter(|s| !s.is_empty())
@@ -1224,6 +1240,22 @@ mod tests {
 
     use super::*;
 
+    /// Clearing an email removes it from lookup; a later sign-in without email keeps it cleared.
+    #[test]
+    fn a_cleared_email_stays_cleared() -> Result<()> {
+        let db = Db::open_memory()?;
+        let addr = "admin@corp.example";
+        db.upsert_user("https://issuer", "s", EmailUpdate::Set(addr), None)?;
+        assert_eq!(db.find_users_by_email(addr)?.len(), 1);
+        let cleared = db.upsert_user("https://issuer", "s", EmailUpdate::Clear, None)?;
+        assert_eq!(cleared.email, None);
+        assert!(db.find_users_by_email(addr)?.is_empty());
+        let again = db.upsert_user("https://issuer", "s", EmailUpdate::Keep, None)?;
+        assert_eq!(again.email, None);
+        assert!(db.find_users_by_email(addr)?.is_empty());
+        Ok(())
+    }
+
     /// An audit line names who acted, escaped, and what they did.
     #[test]
     fn an_audit_line_names_the_session_escaped() {
@@ -1380,13 +1412,18 @@ mod tests {
     #[test]
     fn set_admin_survives_a_relogin() -> Result<()> {
         let db = Db::open_memory()?;
-        let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let user = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
         assert!(!user.is_admin);
         assert!(db.set_admin(&user.id, true)?);
         assert!(db.get_user(&user.id)?.unwrap().is_admin);
 
         // a re-login (upsert_user again) must not silently drop the admin grant
-        let relogin = db.upsert_user("https://issuer", "sub-1", Some("a@example.com"), None)?;
+        let relogin = db.upsert_user(
+            "https://issuer",
+            "sub-1",
+            EmailUpdate::Set("a@example.com"),
+            None,
+        )?;
         assert!(relogin.is_admin);
 
         assert!(db.set_admin(&user.id, false)?);
@@ -1401,12 +1438,17 @@ mod tests {
     #[test]
     fn user_upsert_is_idempotent_and_updates_claims() -> Result<()> {
         let db = Db::open_memory()?;
-        let u1 = db.upsert_user("https://issuer", "sub-1", Some("a@example.com"), Some("A"))?;
+        let u1 = db.upsert_user(
+            "https://issuer",
+            "sub-1",
+            EmailUpdate::Set("a@example.com"),
+            Some("A"),
+        )?;
         assert!(!u1.is_admin);
         let u2 = db.upsert_user(
             "https://issuer",
             "sub-1",
-            Some("new@example.com"),
+            EmailUpdate::Set("new@example.com"),
             Some("New Name"),
         )?;
         assert_eq!(u1.id, u2.id);
@@ -1427,7 +1469,7 @@ mod tests {
         let u = db.upsert_user(
             "https://issuer",
             "sub-1",
-            Some(&long),
+            EmailUpdate::Set(&long),
             Some("A\nvk-registry: not a log line\r\tB"),
         )?;
         assert_eq!(u.email.as_deref().map(str::len), Some(MAX_CLAIM_LEN));
@@ -1438,7 +1480,12 @@ mod tests {
         );
         // a claim that clamps away to nothing must not blank a good stored one, any more
         // than an absent claim does
-        let again = db.upsert_user("https://issuer", "sub-1", Some("\u{7f}"), Some("\u{7f}"))?;
+        let again = db.upsert_user(
+            "https://issuer",
+            "sub-1",
+            EmailUpdate::Set("\u{7f}"),
+            Some("\u{7f}"),
+        )?;
         assert_eq!(again.email.as_deref().map(str::len), Some(MAX_CLAIM_LEN));
         assert_eq!(
             again.display_name.as_deref(),
@@ -1447,7 +1494,7 @@ mod tests {
 
         // an identity, unlike a claim, is a key: it is refused rather than truncated
         assert!(
-            db.upsert_user("https://issuer", "sub\n1", None, None)
+            db.upsert_user("https://issuer", "sub\n1", EmailUpdate::Keep, None)
                 .is_err()
         );
         Ok(())
@@ -1458,10 +1505,15 @@ mod tests {
     #[test]
     fn upsert_preserves_admin_and_known_claims() -> Result<()> {
         let db = Db::open_memory()?;
-        let u = db.upsert_user("https://issuer", "sub-1", Some("a@example.com"), Some("A"))?;
+        let u = db.upsert_user(
+            "https://issuer",
+            "sub-1",
+            EmailUpdate::Set("a@example.com"),
+            Some("A"),
+        )?;
         promote(&db, &u.id)?;
 
-        let again = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let again = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
         assert!(again.is_admin, "a re-login must not demote an admin");
         assert_eq!(again.email, Some("a@example.com".to_string()));
         assert_eq!(again.display_name, Some("A".to_string()));
@@ -1478,11 +1530,20 @@ mod tests {
             user_key("iss\u{1f}a", "b"),
             "the collision this validation exists to prevent"
         );
-        assert!(db.upsert_user("iss", "a\u{1f}b", None, None).is_err());
-        assert!(db.upsert_user("iss\u{1f}a", "b", None, None).is_err());
-        assert!(db.upsert_user("", "sub", None, None).is_err());
-        assert!(db.upsert_user("iss", "", None, None).is_err());
-        assert!(db.upsert_user("iss\n", "sub", None, None).is_err());
+        assert!(
+            db.upsert_user("iss", "a\u{1f}b", EmailUpdate::Keep, None)
+                .is_err()
+        );
+        assert!(
+            db.upsert_user("iss\u{1f}a", "b", EmailUpdate::Keep, None)
+                .is_err()
+        );
+        assert!(db.upsert_user("", "sub", EmailUpdate::Keep, None).is_err());
+        assert!(db.upsert_user("iss", "", EmailUpdate::Keep, None).is_err());
+        assert!(
+            db.upsert_user("iss\n", "sub", EmailUpdate::Keep, None)
+                .is_err()
+        );
         Ok(())
     }
 
@@ -1575,7 +1636,7 @@ mod tests {
     #[test]
     fn session_round_trips_and_resolves_as_a_principal() -> Result<()> {
         let db = Db::open_memory()?;
-        let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let user = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
         let session_id = db.create_session(&user.id, Duration::from_secs(3600))?;
         let resolved = db.get_session_user(&session_id)?;
         assert_eq!(resolved, Some(user.clone()));
@@ -1612,7 +1673,7 @@ mod tests {
     #[test]
     fn a_session_id_is_stored_only_as_its_hash() -> Result<()> {
         let db = Db::open_memory()?;
-        let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let user = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
         let session_id = db.create_session(&user.id, Duration::from_secs(3600))?;
 
         let txn = db.db.begin_read()?;
@@ -1631,7 +1692,7 @@ mod tests {
     #[test]
     fn expired_session_does_not_resolve_and_is_swept() -> Result<()> {
         let db = Db::open_memory()?;
-        let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let user = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
         let session_id = db.create_session(&user.id, Duration::ZERO)?;
         assert_eq!(db.get_session_user(&session_id)?, None);
         assert_eq!(db.session_csrf(&session_id)?, None);
@@ -1645,7 +1706,7 @@ mod tests {
     #[test]
     fn a_session_ttl_that_cannot_be_represented_is_an_error() -> Result<()> {
         let db = Db::open_memory()?;
-        let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let user = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
         assert!(db.create_session(&user.id, Duration::MAX).is_err());
         Ok(())
     }
@@ -1655,8 +1716,8 @@ mod tests {
     #[test]
     fn deleting_a_users_sessions_leaves_other_users_signed_in() -> Result<()> {
         let db = Db::open_memory()?;
-        let alice = db.upsert_user("https://issuer", "sub-1", None, None)?;
-        let bob = db.upsert_user("https://issuer", "sub-2", None, None)?;
+        let alice = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
+        let bob = db.upsert_user("https://issuer", "sub-2", EmailUpdate::Keep, None)?;
         let alice_first = db.create_session(&alice.id, Duration::from_secs(3600))?;
         let alice_second = db.create_session(&alice.id, Duration::from_secs(3600))?;
         let bobs = db.create_session(&bob.id, Duration::from_secs(3600))?;
@@ -1685,7 +1746,7 @@ mod tests {
     #[test]
     fn revoking_sweeps_expired_and_undecodable_rows_without_counting_them() -> Result<()> {
         let db = Db::open_memory()?;
-        let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let user = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
         let live = db.create_session(&user.id, Duration::from_secs(3600))?;
         db.create_session(&user.id, Duration::ZERO)?;
         {
@@ -1704,7 +1765,7 @@ mod tests {
     #[test]
     fn api_key_round_trips_and_rejects_revoked_or_unknown() -> Result<()> {
         let db = Db::open_memory()?;
-        let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let user = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
         let scopes = vec![scope(Action::Write, "team-a/*")];
         let (key, token) = db.create_api_key(Some(&user.id), "ci key", &scopes, None)?;
         assert!(token.starts_with("vkr_"));
@@ -1730,8 +1791,8 @@ mod tests {
     #[test]
     fn revoke_is_scoped_to_the_owner_and_reports_what_it_did() -> Result<()> {
         let db = Db::open_memory()?;
-        let alice = db.upsert_user("https://issuer", "alice", None, None)?;
-        let bob = db.upsert_user("https://issuer", "bob", None, None)?;
+        let alice = db.upsert_user("https://issuer", "alice", EmailUpdate::Keep, None)?;
+        let bob = db.upsert_user("https://issuer", "bob", EmailUpdate::Keep, None)?;
         let (key, token) = db.create_api_key(Some(&alice.id), "alice's key", &[], None)?;
 
         assert!(!db.revoke_api_key(&bob.id, &key.id)?, "not bob's to revoke");
@@ -1757,7 +1818,7 @@ mod tests {
     #[test]
     fn an_ownerless_key_resolves_and_only_admin_can_revoke_it() -> Result<()> {
         let db = Db::open_memory()?;
-        let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let user = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
         let (key, token) = db.create_api_key(None, "system key", &[], None)?;
         assert_eq!(key.owner_user_id, None);
         assert!(db.get_api_key_by_token(&token)?.is_some());
@@ -1772,7 +1833,7 @@ mod tests {
     #[test]
     fn api_key_expiry_is_enforced() -> Result<()> {
         let db = Db::open_memory()?;
-        let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let user = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
         // `expires_at == now` and the check is `<=`, so this is already past
         let (_, token) =
             db.create_api_key(Some(&user.id), "short-lived", &[], Some(SystemTime::now()))?;
@@ -1783,7 +1844,7 @@ mod tests {
     #[test]
     fn api_key_input_is_bounded() -> Result<()> {
         let db = Db::open_memory()?;
-        let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let user = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
         assert!(db.create_api_key(Some(&user.id), "", &[], None).is_err());
         assert!(
             db.create_api_key(Some(&user.id), &"n".repeat(MAX_KEY_NAME_LEN + 1), &[], None)
@@ -1839,9 +1900,9 @@ mod tests {
     #[test]
     fn list_api_keys_is_scoped_to_owner_and_newest_first() -> Result<()> {
         let db = Db::open_memory()?;
-        let alice = db.upsert_user("https://issuer", "alice", None, None)?;
-        let bob = db.upsert_user("https://issuer", "bob", None, None)?;
-        let carol = db.upsert_user("https://issuer", "carol", None, None)?;
+        let alice = db.upsert_user("https://issuer", "alice", EmailUpdate::Keep, None)?;
+        let bob = db.upsert_user("https://issuer", "bob", EmailUpdate::Keep, None)?;
+        let carol = db.upsert_user("https://issuer", "carol", EmailUpdate::Keep, None)?;
         let (older, _) = db.create_api_key(Some(&alice.id), "older", &[], None)?;
         let (newer, _) = db.create_api_key(Some(&alice.id), "newer", &[], None)?;
         db.create_api_key(Some(&bob.id), "bob's key", &[], None)?;
@@ -1862,7 +1923,7 @@ mod tests {
     #[test]
     fn bearer_token_is_preferred_over_a_session_cookie() -> Result<()> {
         let db = Db::open_memory()?;
-        let user = db.upsert_user("https://issuer", "sub-1", None, None)?;
+        let user = db.upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)?;
         let session_id = db.create_session(&user.id, Duration::from_secs(3600))?;
         let (key, token) = db.create_api_key(Some(&user.id), "ci key", &[], None)?;
 
@@ -2048,8 +2109,13 @@ mod tests {
 
         let user_id = {
             let db = Db::open(&path)?;
-            db.upsert_user("https://issuer", "sub-1", Some("a@example.com"), None)?
-                .id
+            db.upsert_user(
+                "https://issuer",
+                "sub-1",
+                EmailUpdate::Set("a@example.com"),
+                None,
+            )?
+            .id
         };
 
         #[cfg(unix)]

@@ -734,7 +734,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::accounts::Action;
+    use crate::accounts::{Action, EmailUpdate};
 
     use super::*;
 
@@ -764,7 +764,7 @@ mod tests {
                 .upsert_user(
                     "https://issuer",
                     "sub-1",
-                    Some("alice@example.com"),
+                    EmailUpdate::Set("alice@example.com"),
                     Some("Alice"),
                 )
                 .unwrap();

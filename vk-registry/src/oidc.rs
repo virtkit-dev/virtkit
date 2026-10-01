@@ -45,6 +45,7 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use sha2::{Digest, Sha256};
 
+use crate::accounts::EmailUpdate;
 use crate::html;
 use crate::{Body, body_of};
 use crate::{ServerState, accounts, percent_encode, query_param};
@@ -583,7 +584,7 @@ async fn callback(
     // Claims are provider-supplied, stored, and rendered back into a page. `upsert_user`
     // bounds them, the way an API key's name is bounded where it enters the store — so
     // every caller gets that, not just this one.
-    let email = claims.get("email").and_then(|v| v.as_str());
+    let email = email_claim(&claims);
     let name = claims.get("name").and_then(|v| v.as_str());
     let session = db
         .upsert_user(client.issuer(), subject, email, name)
@@ -853,9 +854,31 @@ fn b64url(bytes: &[u8]) -> String {
     out
 }
 
+/// What a sign-in says of the user's email. Operators promote a user by email (`accounts
+/// grant-admin`), so an address the provider marks unverified (`email_verified: false`, or
+/// `"false"` as some spell it) clears the stored one: where anyone can claim an address
+/// before proving it, the first to sign in as `admin@corp` would otherwise be the one
+/// promoted. A provider that sends no `email_verified` at all is taken at its word, so
+/// providers that never send the claim keep working; that also means one that lets users
+/// change their address unverified without saying so (the "nOAuth" pattern) is trusted,
+/// which is why the promotion commands name the issuer and subject they act on.
+fn email_claim(claims: &serde_json::Value) -> EmailUpdate<'_> {
+    let unverified = match claims.get("email_verified") {
+        Some(serde_json::Value::Bool(b)) => !b,
+        Some(serde_json::Value::String(s)) => s.eq_ignore_ascii_case("false"),
+        _ => false,
+    };
+    match claims.get("email").and_then(|v| v.as_str()) {
+        _ if unverified => EmailUpdate::Clear,
+        Some(e) => EmailUpdate::Set(e),
+        None => EmailUpdate::Keep,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::convert::Infallible;
     use std::net::SocketAddr;
 
@@ -863,6 +886,38 @@ mod tests {
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn an_unverified_email_is_not_kept() {
+        use serde_json::json;
+        let email = "admin@corp.example";
+        let set = EmailUpdate::Set(email);
+        assert_eq!(email_claim(&json!({"email": email})), set);
+        assert_eq!(
+            email_claim(&json!({"email": email, "email_verified": true})),
+            set
+        );
+        // Neither a bool nor a string: not a "false", so the address is kept.
+        assert_eq!(
+            email_claim(&json!({"email": email, "email_verified": null})),
+            set
+        );
+        assert_eq!(
+            email_claim(&json!({"email": email, "email_verified": 0})),
+            set
+        );
+        let clear = EmailUpdate::Clear;
+        assert_eq!(
+            email_claim(&json!({"email": email, "email_verified": false})),
+            clear
+        );
+        assert_eq!(
+            email_claim(&json!({"email": email, "email_verified": "false"})),
+            clear
+        );
+        assert_eq!(email_claim(&json!({"email_verified": false})), clear);
+        assert_eq!(email_claim(&json!({})), EmailUpdate::Keep);
+    }
 
     /// The validator is what stands between `?target=` and an open redirect, so the
     /// bypasses a denylist would have let through are the point of this test.

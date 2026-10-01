@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use sha2::Digest as _;
-use vk_registry::accounts::{Action, Db, Scope};
+use vk_registry::accounts::{Action, Db, EmailUpdate, Scope};
 use vk_registry::config::{AuthMode, OidcSpec};
 use vk_registry::{Authenticator, ServerConfig, ServerState};
 
@@ -645,7 +645,9 @@ async fn the_dav_tree_is_gated_and_scoped_like_every_other_family() {
     let adir = dir.join("accounts");
     let state = accounts_state(&adir);
     let db = accounts_db(&state);
-    let user = db.upsert_user("https://issuer", "ci", None, None).unwrap();
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
     let key = |name: &str, action: Action, pattern: &str| {
         db.create_api_key(
             Some(&user.id),
@@ -1470,7 +1472,9 @@ async fn a_nested_key_needs_a_grant_on_its_own_repository() {
     let dir = tmp("nested-scope");
     let state = accounts_state(&dir);
     let db = accounts_db(&state);
-    let user = db.upsert_user("https://issuer", "ci", None, None).unwrap();
+    let user = db
+        .upsert_user("https://issuer", "ci", EmailUpdate::Keep, None)
+        .unwrap();
     let key = |name: &str, action: Action, pattern: &str| {
         db.create_api_key(
             Some(&user.id),

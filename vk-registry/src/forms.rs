@@ -104,6 +104,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::accounts::EmailUpdate;
 
     /// A store of this test's own. Unit tests run as threads in one process, so the pid
     /// alone does not separate two of them — the caller's tag does.
@@ -117,7 +118,7 @@ mod tests {
     fn csrf_ok_requires_this_sessions_token() {
         let db = store_for("csrf");
         let user = db
-            .upsert_user("https://issuer", "sub-1", None, None)
+            .upsert_user("https://issuer", "sub-1", EmailUpdate::Keep, None)
             .unwrap();
         let session = db
             .create_session(&user.id, Duration::from_secs(3600))
@@ -138,7 +139,7 @@ mod tests {
 
         // and a token minted for a different session does not carry over
         let other = db
-            .upsert_user("https://issuer", "sub-2", None, None)
+            .upsert_user("https://issuer", "sub-2", EmailUpdate::Keep, None)
             .unwrap();
         let other_session = db
             .create_session(&other.id, Duration::from_secs(3600))

@@ -166,9 +166,12 @@ pub fn set_admin(
     if !ops.set_admin(&user.id, admin)? {
         bail!("user {email:?} disappeared while granting admin; try again");
     }
+    // Show the promoted identity's issuer and subject: the email is a provider assertion.
     println!(
-        "vk-registry accounts: {} is now {}",
+        "vk-registry accounts: {} (subject {:?} at {}) is now {}",
         email,
+        user.oidc_subject,
+        user.oidc_issuer,
         if admin {
             "an admin"
         } else {
@@ -463,6 +466,8 @@ fn relative(now: SystemTime, t: SystemTime) -> String {
 mod tests {
     use std::time::Duration;
 
+    use vk_registry::accounts::EmailUpdate;
+
     use super::*;
 
     #[test]
@@ -502,8 +507,18 @@ mod tests {
         let db = tmp.open()?;
         assert!(resolve_user(&db, "nobody@example.com", None).is_err());
 
-        db.upsert_user("https://issuer-a", "sub", Some("dup@example.com"), None)?;
-        db.upsert_user("https://issuer-b", "sub", Some("dup@example.com"), None)?;
+        db.upsert_user(
+            "https://issuer-a",
+            "sub",
+            EmailUpdate::Set("dup@example.com"),
+            None,
+        )?;
+        db.upsert_user(
+            "https://issuer-b",
+            "sub",
+            EmailUpdate::Set("dup@example.com"),
+            None,
+        )?;
         let err = resolve_user(&db, "dup@example.com", None)
             .unwrap_err()
             .to_string();
@@ -523,7 +538,12 @@ mod tests {
     fn an_unrepresentable_expiry_is_refused_rather_than_wrapping() -> Result<()> {
         let tmp = TempDb::new();
         let db = tmp.open()?;
-        db.upsert_user("https://issuer", "sub", Some("a@example.com"), None)?;
+        db.upsert_user(
+            "https://issuer",
+            "sub",
+            EmailUpdate::Set("a@example.com"),
+            None,
+        )?;
         let scope = [parse_scope("read:*")?];
         // 0 is the other end of the same typo: it mints a token already past its expiry
         for days in [0, u64::MAX, u64::MAX / 86_400, 200_000_000_000_000] {
@@ -541,7 +561,12 @@ mod tests {
     fn a_scope_the_store_refuses_is_refused_here_too() -> Result<()> {
         let tmp = TempDb::new();
         let db = tmp.open()?;
-        db.upsert_user("https://issuer", "sub", Some("a@example.com"), None)?;
+        db.upsert_user(
+            "https://issuer",
+            "sub",
+            EmailUpdate::Set("a@example.com"),
+            None,
+        )?;
         // `parse_scope` accepts the syntax; the store's own check rejects the shape, and
         // `main` runs that check before it opens the db so a typo is a usage error
         let bare_star = parse_scope("write:team-a*")?;
@@ -563,10 +588,15 @@ mod tests {
     fn a_keys_owner_is_named_by_something_an_operator_can_read() -> Result<()> {
         let tmp = TempDb::new();
         let db = tmp.open()?;
-        let u = db.upsert_user("https://issuer", "sub-1", Some("a@example.com"), None)?;
+        let u = db.upsert_user(
+            "https://issuer",
+            "sub-1",
+            EmailUpdate::Set("a@example.com"),
+            None,
+        )?;
         db.create_api_key(Some(&u.id), "ci", &[], None)?;
         // no email on the row: the subject the provider knows them by, still not the id
-        let v = db.upsert_user("https://issuer", "sub-2", None, None)?;
+        let v = db.upsert_user("https://issuer", "sub-2", EmailUpdate::Keep, None)?;
         db.create_api_key(Some(&v.id), "ci2", &[], None)?;
         // and one with no owner at all
         db.create_api_key(None, "system", &[], None)?;
@@ -600,7 +630,12 @@ mod tests {
             sys.contains("owner=-") && sys.contains("[system key]"),
             "{sys}"
         );
-        let spoof = db.upsert_user("https://issuer", "sub-3", Some("(system)"), None)?;
+        let spoof = db.upsert_user(
+            "https://issuer",
+            "sub-3",
+            EmailUpdate::Set("(system)"),
+            None,
+        )?;
         db.create_api_key(Some(&spoof.id), "spoof", &[], None)?;
         let keys2 = db.list_all_api_keys()?;
         let owners2 = owner_labels(&db, &keys2)?;
@@ -637,7 +672,7 @@ mod tests {
         db.upsert_user(
             "https://issuer",
             "alice-sub",
-            Some("alice@example.com"),
+            EmailUpdate::Set("alice@example.com"),
             Some("Alice"),
         )?;
         list_users(&db, &path.display())?; // must not error on a real row

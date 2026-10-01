@@ -818,6 +818,8 @@ fn restart_hint() {
 
 #[cfg(test)]
 mod tests {
+    use vk_registry::accounts::EmailUpdate;
+
     use super::*;
 
     // `vk-registry update` CLI shape: the version is an optional positional (absent =
@@ -1536,8 +1538,13 @@ mod tests {
         let db_path = vk_registry::config::default_accounts_db(&dir);
         let socket = vk_registry::config::default_admin_socket(&db_path);
         let db = std::sync::Arc::new(vk_registry::accounts::Db::open(&db_path).unwrap());
-        db.upsert_user("https://issuer", "sub-1", Some("a@example.com"), None)
-            .unwrap();
+        db.upsert_user(
+            "https://issuer",
+            "sub-1",
+            EmailUpdate::Set("a@example.com"),
+            None,
+        )
+        .unwrap();
         let listener = vk_registry::admin::bind(&socket).unwrap();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
