@@ -95,6 +95,9 @@ pub async fn run_stage(ctx: &JobCtx, script_path: &Path, stage: Option<&str>) ->
     result
 }
 
+/// Time limit for each guest-agent query in the job's final stage.
+const MARK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// End this job's statistics log on a whole sample and say where it is (`[executor] atop`).
 ///
 /// The guest sampler takes SIGUSR2 as "one last sample, then exit", so asking for that here —
@@ -114,7 +117,7 @@ async fn finalize_atop(ctx: &JobCtx) {
     // Output discarded: the guest side has nothing to say that belongs in a job's trace.
     let quiet = OutputSink::Routed(Arc::new(|_fd, _msg| {}));
     let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        MARK_BUDGET,
         exec_script(
             &vsock_addr(ctx),
             &[
@@ -380,22 +383,27 @@ async fn report_resource_usage(ctx: &JobCtx) {
 /// `None` where there is no such layer to ask about, so a host that mounts the checkout
 /// read-write costs no round-trip at all. A guest whose agent predates the subcommand answers
 /// non-zero and reads the same way: unmeasured, which is not a layer that stayed empty.
+/// A query that exceeds [`MARK_BUDGET`] also counts as unmeasured.
 async fn overlay_mark(ctx: &JobCtx) -> Option<(u64, u64)> {
     let ex = &ctx.cfg.executor;
     if !(ex.host_checkout && ex.checkout_overlay) {
         return None;
     }
     let (out, sink) = stdout_capture();
-    let asked = exec_script(
-        &vsock_addr(ctx),
-        &[crate::run::GUEST_AGENT.to_string(), "fsmark".to_string()],
-        Vec::new(),
-        None,
-        &sink,
-        None,
+    // The binary answering is whatever the guest put at that path.
+    let asked = tokio::time::timeout(
+        MARK_BUDGET,
+        exec_script(
+            &vsock_addr(ctx),
+            &[crate::run::GUEST_AGENT.to_string(), "fsmark".to_string()],
+            Vec::new(),
+            None,
+            &sink,
+            None,
+        ),
     )
     .await;
-    if !matches!(asked, Ok(r) if r.code == Some(0)) {
+    if !matches!(asked, Ok(Ok(r)) if r.code == Some(0)) {
         return None;
     }
     parse_mark(&out.lock().ok()?)
