@@ -930,6 +930,9 @@ enum Cmd {
         /// Target each accepted connection is spliced to
         #[arg(long)]
         to: SocketAddr,
+        /// Splice at most N connections concurrently, closing any beyond
+        #[arg(long, value_name = "N")]
+        max_conns: Option<std::num::NonZeroUsize>,
     },
     /// Work in the environment a project's .virtkit/config.toml describes
     ///
@@ -4260,10 +4263,16 @@ async fn cli_main(cli: Cli) -> ExitCode {
         }
         // run_forward only returns on a bind error; otherwise it serves until the
         // process is killed (cleanup tears the detached child down).
-        Cmd::Forward { listen, to } => {
+        Cmd::Forward {
+            listen,
+            to,
+            max_conns,
+        } => {
             // A forward logs into a file, as the switch does (see outrelay).
             let _relay = outrelay::relay();
-            match vk_core::forward::run_forward(&listen, &to, None).await {
+            match vk_core::forward::run_forward(&listen, &to, None, max_conns.map(|n| n.get()))
+                .await
+            {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e, 1),
             }

@@ -111,8 +111,8 @@ impl KernelSource {
 const VSOCK_PORT: u32 = 4444;
 /// vsock port the guest SSH-agent forwarder dials; the host splices it to `$SSH_AUTH_SOCK`.
 pub(crate) const SSH_AGENT_VSOCK_PORT: u32 = 2223;
-/// Upper bound on guest connections the ssh-agent forward relays concurrently. Each holds a
-/// connection to the user's agent; an ssh client uses one at a time.
+/// Upper bound on guest connections the ssh-agent forward (filtered or not) relays
+/// concurrently. Each holds a connection to the user's agent; an ssh client uses one at a time.
 pub(crate) const SSH_AGENT_MAX_CONNS: usize = 32;
 /// Guest path the forwarded agent socket binds at — must match vk-agent's `SSH_AGENT_SOCK`
 /// (vk-agent/src/init.rs). Emitted as `IdentityAgent` in generated `~/.ssh/config`.
@@ -3509,8 +3509,9 @@ pub(crate) fn compose_build_units(
 }
 
 /// Spawn the host side of the SSH-agent forward: `vk forward` binds the VMM's per-port
-/// vsock socket (`<vsock.sock>_<port>`) and splices every guest connection to the host's
-/// `$SSH_AUTH_SOCK`. Long-lived for the VM's lifetime; the caller kills it on teardown.
+/// vsock socket (`<vsock.sock>_<port>`) and splices each guest connection, at most
+/// [`SSH_AGENT_MAX_CONNS`] at once, to the host's `$SSH_AUTH_SOCK`. Long-lived for the VM's
+/// lifetime; the caller kills it on teardown.
 fn spawn_ssh_agent_forward(vsock: &Path, host_sock: &OsStr, work: &Path) -> Result<Child> {
     let mut listen = vsock.to_path_buf().into_os_string();
     listen.push(format!("_{SSH_AGENT_VSOCK_PORT}"));
@@ -3522,6 +3523,8 @@ fn spawn_ssh_agent_forward(vsock: &Path, host_sock: &OsStr, work: &Path) -> Resu
         .arg(&listen)
         .arg("--to")
         .arg(host_sock)
+        .arg("--max-conns")
+        .arg(SSH_AGENT_MAX_CONNS.to_string())
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);

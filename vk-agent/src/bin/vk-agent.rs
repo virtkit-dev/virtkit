@@ -425,7 +425,7 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                 }
                 None => None,
             };
-            if let Err(e) = vk_core::forward::run_forward(&listen, &socket, chown).await {
+            if let Err(e) = vk_core::forward::run_forward(&listen, &socket, chown, None).await {
                 error!("forward: {e:#}");
                 std::process::exit(1)
             }

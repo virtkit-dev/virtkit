@@ -1898,7 +1898,9 @@ fn ssh_agent_forward_command(ctx: &JobCtx) -> Result<Option<Command>> {
         .arg("--listen")
         .arg(&listen)
         .arg("--to")
-        .arg(&host_sock);
+        .arg(&host_sock)
+        .arg("--max-conns")
+        .arg(crate::run::SSH_AGENT_MAX_CONNS.to_string());
     Ok(Some(fwd))
 }
 

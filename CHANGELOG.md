@@ -42,6 +42,9 @@ All notable changes to virtkit will be documented in this file.
 - **Security: a guest can no longer exhaust host threads and ssh-agent connections through
   `--ssh-host` agent forwarding.** The key-filtering proxy relays at most 32 connections at
   once and closes any beyond that.
+- **Security: a guest can no longer exhaust host ssh-agent connections through unfiltered
+  agent forwarding** (`--ssh-agent`, `[executor.auth] ssh_agent`). The forward relays at most
+  32 connections at once and closes any beyond that.
 - **A guest-written disk image can no longer crash the host's `vk` or make it allocate
   gigabytes** when `vk` reads the image (for a `FROM --kernel=image` stage, or a job's
   `/etc/passwd`): its geometry, links and extents are now checked, and every file read
