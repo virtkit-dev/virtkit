@@ -876,6 +876,29 @@ impl Store {
         Ok(())
     }
 
+    /// Return a blob's decompressed bytes, or `None` if absent or larger than `cap`.
+    /// Bounds gc reads of index children, whose blobs the pusher chooses.
+    fn read_blob_capped(&self, hex: &str, cap: usize) -> Result<Option<Vec<u8>>> {
+        use std::io::Read;
+        let Some((path, is_zstd)) = self.find_blob(hex) else {
+            return Ok(None);
+        };
+        let file =
+            std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+        let mut bytes = Vec::new();
+        let limit = cap as u64 + 1;
+        if is_zstd {
+            zstd::stream::read::Decoder::new(file)
+                .context("decompressing a stored blob")?
+                .take(limit)
+                .read_to_end(&mut bytes)
+        } else {
+            file.take(limit).read_to_end(&mut bytes)
+        }
+        .with_context(|| format!("reading {}", path.display()))?;
+        Ok((bytes.len() <= cap).then_some(bytes))
+    }
+
     /// The canonical bytes of a blob (decompressing the zstd form), `None` if absent.
     pub fn get_blob(&self, hex: &str) -> Result<Option<Vec<u8>>> {
         let Some((path, is_zstd)) = self.find_blob(hex) else {
@@ -1352,8 +1375,8 @@ impl Store {
         // until after the blob sweep below, because a sidecar is a manifest's membership
         // record: dropping one whose blob the same pass then decides to keep would make a
         // live manifest permanently unreadable through its repository, with nothing left to
-        // rebuild it from. (An image index does exactly that: the mark aborts on it, so
-        // anything removed before the mark is removed on a pass that never sweeps.)
+        // rebuild it from. (An index child is exactly that: no tag roots it, so its sidecar is a
+        // candidate here, and only the mark below finds it live.)
         let mut sidecar_candidates: Vec<(PathBuf, String)> = Vec::new();
         for man_dir in man_dirs {
             for sidecar in root_dir_files(&man_dir)? {
@@ -1377,19 +1400,40 @@ impl Store {
             }
         }
 
-        // mark every blob a root manifest references. A parse failure aborts:
-        // sweeping with incomplete marks would delete live data.
+        // mark every blob a root manifest references, through an index's child manifests
+        // too. A root that does not parse aborts: sweeping with incomplete marks would delete
+        // live data. A child is different: an index may name any blob the pusher can read, so
+        // one that does not read as a manifest — a layer, or anything over a manifest's size —
+        // is kept and references nothing. Aborting on it, or reading it whole, would hand any
+        // pusher a way to stop collection or exhaust memory.
         let mut marked: HashSet<String> = HashSet::new();
-        for hex in &roots {
-            let Some(bytes) = self.get_blob(hex)? else {
-                continue; // dangling tag: nothing left to keep alive
-            };
-            for child in manifest_digest_hexes(&bytes)
-                .with_context(|| format!("parsing manifest {hex} for the gc mark"))?
-            {
-                marked.insert(child);
-            }
+        let mut walked: HashSet<String> = HashSet::new();
+        let mut pending: Vec<(String, bool)> = roots.iter().map(|h| (h.clone(), true)).collect();
+        while let Some((hex, root)) = pending.pop() {
+            // A root reached first as some index's child is still read as a root: whole,
+            // and strictly.
+            let root = root || roots.contains(&hex);
             marked.insert(hex.clone());
+            if !walked.insert(hex.clone()) {
+                continue;
+            }
+            let refs = if root {
+                let Some(bytes) = self.get_blob(&hex)? else {
+                    continue; // dangling tag: nothing left to keep alive
+                };
+                manifest_references(&bytes)
+                    .with_context(|| format!("parsing manifest {hex} for the gc mark"))?
+            } else {
+                match self.read_blob_capped(&hex, MAX_MANIFEST_BYTES)? {
+                    Some(bytes) => match manifest_references(&bytes) {
+                        Ok(refs) => refs,
+                        Err(_) => continue,
+                    },
+                    None => continue,
+                }
+            };
+            marked.extend(refs.blobs);
+            pending.extend(refs.manifests.into_iter().map(|m| (m, false)));
         }
 
         // sweep unmarked blobs idle past the grace window, in both storage forms, noting
@@ -1846,8 +1890,8 @@ pub struct RepoStat {
 
 /// A manifest's referenced descriptors, in order: its config (if any) then each layer,
 /// as `(label, descriptor)`. Structural, so it needs no OCI types and tolerates media
-/// types it does not know — the one walk [`manifest_blob_sizes`] and `/browse`'s detail
-/// page both read the referenced blobs out of.
+/// types it does not know — the one walk [`manifest_references`], [`manifest_blob_sizes`]
+/// and `/browse`'s detail page all read the referenced blobs out of.
 pub(crate) fn manifest_descriptors(
     manifest: &serde_json::Value,
 ) -> Vec<(&'static str, &serde_json::Value)> {
@@ -1879,8 +1923,8 @@ fn is_blob_hex(s: &str) -> bool {
 }
 
 /// Every digest a manifest references, tolerantly: its config and layers, *and* an image
-/// index's child manifests. Unlike [`manifest_digest_hexes`] — whose caller is the gc
-/// mark, which must refuse what it cannot fully walk — this is for recording membership,
+/// index's child manifests. Unlike [`manifest_references`], which fails on bytes that are
+/// not JSON so that the gc mark can refuse such a root, this is for recording membership,
 /// where an unparseable or unfamiliar manifest should contribute what it can rather than
 /// fail a push.
 ///
@@ -1923,26 +1967,37 @@ fn is_json_object(body: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v.is_object())
 }
 
-/// The digest hexes a manifest references: its config and every layer, read
-/// structurally (`config.digest`, `layers[].digest`) so the gc mark needs no OCI
-/// types and tolerates media types it doesn't know. An image index (`manifests[]`)
-/// is an error: its children live behind another level of manifests the mark
-/// doesn't walk, so the gc must refuse rather than sweep them.
-fn manifest_digest_hexes(manifest: &[u8]) -> Result<Vec<String>> {
+/// What a manifest keeps alive, read structurally so the gc mark needs no OCI types and
+/// tolerates media types it doesn't know: its config and every layer (`blobs`), and an
+/// index's child manifests (`manifests`), which the mark walks in turn.
+struct ManifestReferences {
+    blobs: Vec<String>,
+    manifests: Vec<String>,
+}
+
+fn manifest_references(manifest: &[u8]) -> Result<ManifestReferences> {
     let v: serde_json::Value = serde_json::from_slice(manifest).context("not JSON")?;
-    if v.pointer("/manifests").is_some() {
-        bail!("image indexes are not supported");
+    // Only `sha256:<lowercase hex>`, as [`manifest_child_hexes`] reads them: anything else
+    // names nothing this store holds, and as a path component it could name anything at all.
+    fn hexes<'a>(ds: impl Iterator<Item = Option<&'a serde_json::Value>>) -> Vec<String> {
+        ds.filter_map(|d| d?.as_str()?.strip_prefix("sha256:"))
+            .filter(|h| is_blob_hex(h))
+            .map(str::to_string)
+            .collect()
     }
-    let layers = v.pointer("/layers").and_then(|l| l.as_array());
-    Ok(std::iter::once(v.pointer("/config/digest"))
-        .chain(layers.into_iter().flatten().map(|l| l.pointer("/digest")))
-        .filter_map(|d| d?.as_str())
-        .map(|d| d.trim_start_matches("sha256:").to_string())
-        .collect())
+    let children = v.pointer("/manifests").and_then(|m| m.as_array());
+    Ok(ManifestReferences {
+        blobs: hexes(
+            manifest_descriptors(&v)
+                .into_iter()
+                .map(|(_, d)| d.pointer("/digest")),
+        ),
+        manifests: hexes(children.into_iter().flatten().map(|m| m.pointer("/digest"))),
+    })
 }
 
 /// `(digest hex, descriptor size)` for a manifest's config and every layer, read
-/// structurally like [`manifest_digest_hexes`]. Tolerant: an unparseable blob yields
+/// structurally like [`manifest_references`]. Tolerant: an unparseable blob yields
 /// nothing (a status read must not fail on one odd manifest), and a missing `size`
 /// counts as 0.
 fn manifest_blob_sizes(manifest: &[u8]) -> Vec<(String, u64)> {
@@ -4784,7 +4839,7 @@ mod tests {
     }
 
     /// A minimal OCI-shaped manifest body referencing `config` and `layers`
-    /// (`sha256:` digests) — the structure `manifest_digest_hexes` marks from.
+    /// (`sha256:` digests) — the structure `manifest_references` marks from.
     fn manifest_body(config: &str, layers: &[&str]) -> Vec<u8> {
         let layers: Vec<_> = layers
             .iter()
@@ -4979,16 +5034,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The gc mark refuses image indexes (`manifests[]`): their blobs live behind
-    /// nested manifests the mark doesn't walk, so a rooted index aborts the pass
-    /// — nothing sweeps — instead of collecting data the index still references.
+    /// An index may name any blob as a child. One that is not a manifest — a layer, a digest
+    /// shaped like a path — neither stops the pass nor is read beyond a manifest's size or
+    /// outside the store; what is named and held is kept.
     #[test]
-    fn gc_refuses_image_indexes() {
+    fn gc_survives_an_index_naming_what_is_not_a_manifest() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-gcbadidx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        // A layer far over a manifest's size, named as a child manifest.
+        let layer = store
+            .put_blob(&vec![7u8; MAX_MANIFEST_BYTES + 4096])
+            .unwrap();
+        let stray = store.put_blob(&[9u8; 4096]).unwrap();
+        // A manifest outside the store that keeps `stray`, named by a digest that is a path
+        // from `blobs/sha256` to it: following it would keep `stray` alive.
+        let outside_name = format!("vk-gc-outside-{}", std::process::id());
+        let outside = dir.parent().unwrap().join(&outside_name);
+        std::fs::write(&outside, manifest_body(&stray, &[&stray])).unwrap();
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [
+                {"mediaType": DEFAULT_MANIFEST_TYPE, "digest": layer, "size": 1},
+                {"mediaType": DEFAULT_MANIFEST_TYPE, "digest": format!("sha256:../../../{outside_name}"), "size": 1},
+            ],
+        })
+        .to_string()
+        .into_bytes();
+        store
+            .put_manifest(
+                "repo",
+                "odd",
+                "application/vnd.oci.image.index.v1+json",
+                &index,
+            )
+            .unwrap();
+
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+        touch(&store.tag_path("repo", "odd"));
+        store.gc(DAY * 30, DAY, false).unwrap();
+        assert!(
+            store.find_blob(&hex(&layer)).is_some(),
+            "a named layer is kept"
+        );
+        assert!(
+            store.find_blob(&hex(&stray)).is_none(),
+            "the stray is still swept"
+        );
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rooted image index keeps its child manifests and everything they reference; an
+    /// unreferenced blob idle as long is still swept.
+    #[test]
+    fn gc_marks_through_an_image_index() {
         let dir = std::env::temp_dir().join(format!("vk-regserve-gcidx-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = Store::new(dir.clone()).unwrap();
 
-        let child = store.put_blob(&[8u8; 4096]).unwrap();
+        let config = store.put_blob(b"{}").unwrap();
+        let layer = store.put_blob(&[8u8; 4096]).unwrap();
+        let stray = store.put_blob(&[9u8; 4096]).unwrap();
+        let child = store
+            .put_manifest(
+                "repo",
+                &format!(
+                    "sha256:{}",
+                    sha256_hex_raw(&manifest_body(&config, &[&layer]))
+                ),
+                DEFAULT_MANIFEST_TYPE,
+                &manifest_body(&config, &[&layer]),
+            )
+            .unwrap();
         let index = serde_json::json!({
             "schemaVersion": 2,
             "manifests": [{
@@ -4996,6 +5115,56 @@ mod tests {
                 "digest": child,
                 "size": 1,
             }],
+        })
+        .to_string()
+        .into_bytes();
+        let index_digest = store
+            .put_manifest(
+                "repo",
+                "multi",
+                "application/vnd.oci.image.index.v1+json",
+                &index,
+            )
+            .unwrap();
+
+        // age everything past retention and grace, then keep only the index's tag live.
+        backdate_all(&dir, SystemTime::now() - DAY * 100);
+        touch(&store.tag_path("repo", "multi"));
+
+        store.gc(DAY * 30, DAY, false).unwrap();
+        for kept in [&index_digest, &child, &config, &layer] {
+            assert!(store.find_blob(&hex(kept)).is_some(), "{kept} was swept");
+        }
+        assert!(
+            store.find_blob(&hex(&stray)).is_none(),
+            "the stray survived"
+        );
+        assert!(store.get_manifest("repo", &child).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tagged manifest that a tagged index also lists is read as the root it is, however
+    /// the mark reaches it first: as a child it would be capped at a manifest's size, and
+    /// one larger (stored before that cap, or through the relay) would lose its layers.
+    #[test]
+    fn gc_reads_a_root_listed_by_an_index_as_a_root() {
+        let dir =
+            std::env::temp_dir().join(format!("vk-regserve-gcidxroot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+
+        let config = store.put_blob(b"{}").unwrap();
+        let layer = store.put_blob(&[8u8; 4096]).unwrap();
+        let mut big: serde_json::Value =
+            serde_json::from_slice(&manifest_body(&config, &[&layer])).unwrap();
+        big["annotations"] = serde_json::json!({ "pad": "x".repeat(MAX_MANIFEST_BYTES) });
+        let big = big.to_string().into_bytes();
+        let child = store
+            .put_manifest("repo", "big", DEFAULT_MANIFEST_TYPE, &big)
+            .unwrap();
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [{"mediaType": DEFAULT_MANIFEST_TYPE, "digest": child, "size": 1}],
         })
         .to_string()
         .into_bytes();
@@ -5008,19 +5177,18 @@ mod tests {
             )
             .unwrap();
 
-        // age everything past retention, then keep only the index's tag live: the
-        // rooted index must abort the mark before the sweep reaches the old blob.
         backdate_all(&dir, SystemTime::now() - DAY * 100);
+        touch(&store.tag_path("repo", "big"));
         touch(&store.tag_path("repo", "multi"));
-
-        assert!(
-            store.gc(DAY * 30, DAY, false).is_err(),
-            "a rooted index must abort the gc"
-        );
-        assert!(
-            store.find_blob(&hex(&child)).is_some(),
-            "an aborted pass must sweep nothing"
-        );
+        // The roots' visiting order follows a randomly seeded HashSet: repeat until the
+        // index has, with overwhelming likelihood, come first at least once.
+        for _ in 0..16 {
+            store.gc(DAY * 30, DAY, false).unwrap();
+            assert!(
+                store.find_blob(&hex(&layer)).is_some(),
+                "the tagged manifest's layer was swept"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5564,9 +5732,9 @@ mod tests {
     }
 
     /// A manifest's Content-Type sidecar is its membership record, so the gc must not drop
-    /// one whose bytes the same pass keeps. An image index is the case that bites: the mark
-    /// aborts on it, so anything removed before the mark is removed on a pass that then
-    /// sweeps nothing — and the index's children would be left permanently unreadable.
+    /// one whose bytes the same pass keeps. Only the mark's index traversal finds live
+    /// children, so dropping their sidecars before marking would leave them permanently
+    /// unreadable through their repository.
     #[test]
     fn gc_keeps_the_membership_of_a_manifest_whose_blob_it_keeps() {
         let dir = std::env::temp_dir().join(format!("vk-regserve-memidx-{}", std::process::id()));
@@ -5602,19 +5770,15 @@ mod tests {
         }
 
         // A retention window that keeps the tag (so the index is a root and the mark
-        // reaches it) with no grace on the blobs (so the children are sweep candidates).
-        // The mark refuses an index, so the pass aborts — and nothing may have been
-        // revoked on the way there.
-        assert!(
-            store
-                .gc(Duration::from_secs(3600), Duration::ZERO, false)
-                .is_err(),
-            "the gc mark still refuses an image index"
-        );
+        // reaches it) with no grace on the blobs (so the children are sweep candidates, and
+        // only the mark's walk through the index keeps them).
+        store
+            .gc(Duration::from_secs(3600), Duration::ZERO, false)
+            .unwrap();
         for hex in &children {
             assert!(
                 store.repo_has_manifest("team-a/app", hex),
-                "an aborted pass must not have dropped a child's membership"
+                "a kept child must keep its membership"
             );
             assert!(
                 store
