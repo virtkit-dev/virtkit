@@ -9,8 +9,9 @@
 //! Values that came from the host environment — `${localEnv:…}`, where a token would come
 //! from — are marked and redacted when a plan is printed or recorded.
 //!
-//! A config is as trusted as the checkout it comes from: a mount source may not walk out of
-//! the project, but `wrapper` and `compose` are resolved wherever they point.
+//! A config is as trusted as the checkout it comes from: a mount source, relative ones
+//! included (`..` is folded against the project), may name any host path, and `wrapper` and
+//! `compose` are resolved wherever they point.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
