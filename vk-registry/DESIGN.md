@@ -599,10 +599,11 @@ Membership markers are not roots. After sweeping blobs, `gc` removes markers and
 sidecars whose content no longer exists. Repository traversal does not follow symlinks and
 is bounded by the same repository-depth limit enforced on writes.
 
-Garbage collection currently refuses to process a rooted OCI image index because its mark
-phase does not traverse child manifests. The pass aborts before deleting anything. Image
-indexes can be stored and mounted, but a store containing a live tagged index cannot be
-collected until the mark phase supports that graph.
+The mark phase follows a rooted OCI image index into its child manifests, through any
+nesting, and keeps everything they reference. A root manifest it cannot parse aborts the
+pass before deleting anything. A child that does not read as a manifest — a layer an index
+names, or anything larger than a manifest may be — is kept and references nothing, so no
+push can stop collection.
 
 The `/dav/files/` objects are tags and blobs under `files/` and need no pass of their own:
 `gc` and `status` treat them as the repositories they are.
