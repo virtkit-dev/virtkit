@@ -400,7 +400,12 @@ async fn overlay_mark(ctx: &JobCtx) -> Option<(u64, u64)> {
     parse_mark(&out.lock().ok()?)
 }
 
-/// Capture a guest command's stdout into a shared buffer, discarding its stderr.
+/// The most of a guest command's stdout [`stdout_capture`] keeps. Every caller asks the agent
+/// for a few lines of figures; the guest decides what answers, so past this it is not one.
+const MAX_CAPTURE: usize = 1 << 20;
+
+/// Capture a guest command's stdout into a shared buffer, discarding its stderr. At most
+/// `MAX_CAPTURE + 1` bytes are kept; [`capture_overran`] reports a buffer that hit the bound.
 ///
 /// Agent mark commands return figures on stdout and diagnostics on stderr.
 pub(crate) fn stdout_capture() -> (Arc<std::sync::Mutex<Vec<u8>>>, OutputSink) {
@@ -411,11 +416,18 @@ pub(crate) fn stdout_capture() -> (Arc<std::sync::Mutex<Vec<u8>>>, OutputSink) {
             if matches!(fd, Fd::Stdout)
                 && let Ok(mut buf) = out.lock()
             {
-                buf.extend_from_slice(bytes);
+                let room = (MAX_CAPTURE + 1).saturating_sub(buf.len());
+                buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
             }
         }))
     };
     (out, sink)
+}
+
+/// Whether a [`stdout_capture`] buffer exceeded its limit and holds truncated output
+/// rather than a complete answer.
+pub(crate) fn capture_overran(buf: &[u8]) -> bool {
+    buf.len() > MAX_CAPTURE
 }
 
 /// Parse the exact `<used> <total>` byte pair printed by `vk-agent fsmark` and `memmark`.
@@ -632,7 +644,25 @@ pub async fn next(
 
 #[cfg(test)]
 mod tests {
-    use super::{blocked_header, blocked_lines, parse_mark, section};
+    use super::{
+        Fd, MAX_CAPTURE, OutputSink, blocked_header, blocked_lines, parse_mark, section,
+        stdout_capture,
+    };
+
+    /// A guest answering a mark with far more than a mark is kept to the bound.
+    #[test]
+    fn a_capture_holds_no_more_than_its_bound() {
+        let (out, sink) = stdout_capture();
+        let OutputSink::Routed(route) = &sink else {
+            panic!("a capture routes its output");
+        };
+        let chunk = vec![b'7'; 64 << 10];
+        for _ in 0..(2 * MAX_CAPTURE / chunk.len()) {
+            route(Fd::Stdout, &chunk);
+        }
+        assert_eq!(out.lock().unwrap().len(), MAX_CAPTURE + 1);
+        assert_eq!(parse_mark(&out.lock().unwrap()), None);
+    }
 
     /// The egress-denied block header names its stage and, in dry-run, says nothing was
     /// actually blocked — so a recurring block is not read as a duplicate, and a dry-run
