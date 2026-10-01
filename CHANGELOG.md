@@ -20,6 +20,8 @@ All notable changes to virtkit will be documented in this file.
 - **An OCI image pull keeps downloaded layers on disk, not in memory.** They sit next to the
   output: a large image needs free disk there (up to four layers plus the flattened image)
   rather than RAM.
+- `vk-registry` sends `Strict-Transport-Security` (one year) when it terminates TLS itself;
+  browsers then use HTTPS for that host name on every port. Behind a proxy, set it there.
 - `vk-registry` warns at startup when it serves without authentication on an address other
   than loopback.
 - `vk tune`'s report line names the estimate and the ceiling ahead of the figures behind them.

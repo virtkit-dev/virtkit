@@ -2502,14 +2502,16 @@ async fn handle(
 ) -> Result<Response<Body>, Infallible> {
     // Kept for the log line; `route` consumes the request.
     let (method, path) = (req.method().clone(), req.uri().path().to_string());
-    Ok(route(req, state).await.unwrap_or_else(|e| {
+    let tls = state.tls.is_some();
+    let resp = route(req, state).await.unwrap_or_else(|e| {
         eprintln!("vk-registry: {method} {path}: {e:#}");
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL",
             "internal error (details in the server log)",
         )
-    }))
+    });
+    Ok(with_hsts(resp, tls))
 }
 
 /// Whether the browser says another site made this request (`Sec-Fetch-Site`). A browser
@@ -2519,6 +2521,18 @@ fn cross_site(headers: &hyper::HeaderMap) -> bool {
         .get("sec-fetch-site")
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| !matches!(v, "same-origin" | "none"))
+}
+
+/// `resp`, with HSTS when this server terminates TLS: a browser that has seen it uses HTTPS
+/// for this host name, on every port, for a year.
+fn with_hsts(mut resp: Response<Body>, tls: bool) -> Response<Body> {
+    if tls {
+        resp.headers_mut().insert(
+            hyper::header::STRICT_TRANSPORT_SECURITY,
+            hyper::header::HeaderValue::from_static("max-age=31536000"),
+        );
+    }
+    resp
 }
 
 async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Response<Body>> {
@@ -4582,6 +4596,70 @@ mod tests {
             !h(None),
             "a client that sends no header is not judged by it"
         );
+    }
+
+    /// A TLS server sends HSTS even on internal errors (500) and cross-site rejections (403);
+    /// a plain HTTP server never does. The test uses a cleartext connection and no certificate:
+    /// `handle` only checks whether TLS is configured.
+    #[tokio::test]
+    async fn hsts_is_sent_on_every_answer_only_over_tls() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn ask(tls: bool, request: &str) -> String {
+            let dir = std::env::temp_dir().join(format!(
+                "vk-regserve-hsts-{tls}-{}-{}",
+                request.len(),
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            let store = Store::new(dir.clone()).unwrap();
+            // Make opening an upload session fail on the server.
+            std::fs::remove_dir_all(dir.join("uploads/owners")).unwrap();
+            std::fs::write(dir.join("uploads/owners"), b"").unwrap();
+            let acceptor = tls.then(|| {
+                let sc = rustls::ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_cert_resolver(
+                        Arc::new(rustls::server::ResolvesServerCertUsingSni::new()),
+                    );
+                tokio_rustls::TlsAcceptor::from(Arc::new(sc))
+            });
+            let state = Arc::new(ServerState {
+                store: Arc::new(store),
+                upstreams: Vec::new(),
+                locks: lock::LockManager::new(),
+                auth: Authenticator::Shared(auth::Auth::None),
+                tls: acceptor,
+                webdav: false,
+            });
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_conn(TokioIo::new(stream), state, CONN_LIMITS).await;
+            });
+            let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+            conn.write_all(request.as_bytes()).await.unwrap();
+            let mut resp = String::new();
+            conn.read_to_string(&mut resp).await.unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            resp.to_ascii_lowercase()
+        }
+
+        let probe = "GET /v2/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        let failing = "POST /v2/r/blobs/uploads/ HTTP/1.1\r\nHost: x\r\n\
+                       Content-Length: 0\r\nConnection: close\r\n\r\n";
+        let cross_site = "DELETE /v2/r/manifests/t HTTP/1.1\r\nHost: x\r\n\
+                          Sec-Fetch-Site: cross-site\r\nConnection: close\r\n\r\n";
+        let hsts = "strict-transport-security: max-age=31536000";
+        for (request, status) in [(probe, "200"), (failing, "500"), (cross_site, "403")] {
+            let resp = ask(true, request).await;
+            assert!(resp.starts_with(&format!("http/1.1 {status}")), "{resp}");
+            assert!(resp.contains(hsts), "{resp}");
+            let resp = ask(false, request).await;
+            assert!(resp.starts_with(&format!("http/1.1 {status}")), "{resp}");
+            assert!(!resp.contains("strict-transport-security"), "{resp}");
+        }
     }
 
     /// An open server says so when it is reachable beyond loopback, and only then.
