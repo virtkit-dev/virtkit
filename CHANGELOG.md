@@ -28,6 +28,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- `vk-registry`'s relay gives up on a stalled upstream (10 s to connect, 60 s with nothing
+  read) and refuses a relayed manifest over 4 MiB.
 - **Security: the build cache no longer serves a COPY snapshot whose sources differed only in
   modes, ownership or symlinks**, such as a setuid bit or a planted link. A COPY keeps its
   sources' owner in the image, so runners whose checkouts are owned by different users, or

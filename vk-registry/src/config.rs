@@ -680,7 +680,14 @@ impl UpstreamSpec {
                 reqwest::Certificate::from_pem(&pem).context("parsing an upstream CA")?,
             );
         }
-        let client = b.build().context("building an upstream HTTP client")?;
+        // Bounded so a stalled upstream cannot hold a relayed request, and the task serving
+        // it, open for as long as it likes; a read timeout is per read, so a slow but moving
+        // blob transfer is not cut off.
+        let client = b
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(60))
+            .build()
+            .context("building an upstream HTTP client")?;
         let password = match &self.password_file {
             Some(p) => Some(
                 std::fs::read_to_string(p)

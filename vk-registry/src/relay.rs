@@ -228,8 +228,8 @@ pub async fn get_manifest(
         return manifest_head_response(&digest, &ctype);
     }
 
-    let body = resp
-        .bytes()
+    // Bounded as a pushed manifest is: the upstream chooses how much it sends.
+    let body = read_capped(resp, crate::MAX_MANIFEST_BYTES)
         .await
         .context("reading the upstream manifest")?;
 
@@ -299,6 +299,18 @@ async fn authed(
         .send()
         .await
         .with_context(|| format!("{method} {url} (authenticated)"))
+}
+
+/// `resp`'s body, refused once it passes `cap` bytes rather than held whole.
+async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Bytes> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len().saturating_add(chunk.len()) > cap {
+            bail!("the response is over {cap} bytes");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(buf))
 }
 
 /// Whether the upstream's credentials may go to `realm`. The realm is the upstream's to
