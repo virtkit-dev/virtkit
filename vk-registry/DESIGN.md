@@ -355,11 +355,13 @@ All lock operations use `POST` and repeat names as `?name=` parameters:
 | Endpoint | Required input | Result |
 |---|---|---|
 | `/lock/acquire` | `ttl`, `wait`, `X-Vk-Lock-Holder` | owner token or blockers |
-| `/lock/renew` | `ttl`, `X-Vk-Lock-Owner` | renewed count |
+| `/lock/renew` | `ttl`, `X-Vk-Lock-Owner` | renewed count and granted ttl |
 | `/lock/release` | `X-Vk-Lock-Owner` | released count |
 | `/lock/status` | names | current holders |
 | `/lock/fail` | `ttl`, `X-Vk-Lock-Pipeline`, reason body | records a failed build |
 | `/lock/fail-status` | `X-Vk-Lock-Pipeline` | recent matching failure |
+
+Lease `ttl` and `acquire` long-poll `wait` are capped at 24 hours.
 
 Acquiring multiple names is atomic and all-or-nothing under one mutex. A batch cannot
 deadlock through inconsistent client lock ordering, and all names share one owner token.

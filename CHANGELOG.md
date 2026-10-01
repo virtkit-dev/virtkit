@@ -15,6 +15,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A `vk-registry` lock request with an enormous `ttl` no longer takes down the lock API
+  until restart.** Leases and waits are now capped at 24 hours.
 - **Cleaning up a GitLab job whose supervisor had died no longer risks stopping another
   job's microVM** that reused its process id, when one job id is a prefix of the other
   (such as 12 and 123).

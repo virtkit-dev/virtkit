@@ -34,11 +34,18 @@ const DEFAULT_WAIT: u64 = 3600;
 /// generous, on the order of a slow pipeline's whole lifetime.
 const DEFAULT_FAIL_TTL: u64 = 6 * 3600;
 /// Longest a client may ask a failure record to live for — a memo blocks every build of
-/// this key across the whole pipeline until it expires or the pipeline restarts, so unlike
-/// `/lock/acquire`'s lease (30s default, reclaimed fast on a miss), an unbounded `?ttl=`
-/// here has an outsized blast radius. Generous enough for any real pipeline, not a cap
-/// meant to bind tightly.
+/// this key across the whole pipeline until it expires or the pipeline restarts, so an
+/// unbounded `?ttl=` here has an outsized blast radius. Generous enough for any real
+/// pipeline, not a cap meant to bind tightly.
 const MAX_FAIL_TTL: u64 = 24 * 3600;
+/// Longest lease `/lock/acquire` and `/lock/renew` grant, whatever `?ttl=` asks: a holder
+/// heartbeats well inside it, so the cap never binds a real client. Unclamped, a huge ttl
+/// parks a lock for decades, and one past what an `Instant` can hold panics while the lock
+/// table's mutex is held — poisoning it, so every later lock request fails until restart.
+const MAX_LEASE_TTL: Duration = Duration::from_secs(24 * 3600);
+/// Longest `/lock/acquire` long-polls, whatever `?wait=` asks; past it the client gets the
+/// blockers and asks again.
+const MAX_WAIT: Duration = Duration::from_secs(24 * 3600);
 /// `/lock/fail`'s reason body is free text for a log/error message, not a payload; cap it
 /// well above anything reasonable so a client can't park an unbounded buffer server-side.
 const MAX_FAIL_REASON: usize = 4096;
@@ -186,7 +193,7 @@ impl LockManager {
                 Held {
                     owner: owner.clone(),
                     holder: holder.to_string(),
-                    expires: now + ttl,
+                    expires: now + lease(ttl),
                 },
             );
         }
@@ -247,7 +254,7 @@ impl LockManager {
                 && h.owner == owner
                 && h.expires > now
             {
-                h.expires = now + ttl;
+                h.expires = now + lease(ttl);
                 n += 1;
             }
         }
@@ -314,7 +321,7 @@ impl LockManager {
 ///
 /// - `POST /lock/acquire?name=…&ttl=&wait=` (`X-Vk-Lock-Holder`) → 200 `{owner, names, ttl}`
 ///   | 409 `{blockers:[{name, holder}]}`
-/// - `POST /lock/renew?name=…&ttl=`         (`X-Vk-Lock-Owner`)  → `{renewed, of}`
+/// - `POST /lock/renew?name=…&ttl=`         (`X-Vk-Lock-Owner`)  → `{renewed, of, ttl}`
 /// - `POST /lock/release?name=…`            (`X-Vk-Lock-Owner`)  → `{released}`
 /// - `POST /lock/status?name=…`                                  → `{holders:[{name, holder}]}`
 ///
@@ -349,12 +356,13 @@ pub async fn route(mgr: &LockManager, req: Request<Incoming>) -> Result<Response
         // acquire the whole set atomically (all-or-nothing), long-polling until free.
         "/lock/acquire" => {
             let ttl = Duration::from_secs(qparam(&query, "ttl").unwrap_or(DEFAULT_TTL));
-            let wait = Duration::from_secs(qparam(&query, "wait").unwrap_or(DEFAULT_WAIT));
-            let deadline = Instant::now() + wait;
-            match mgr.acquire_all(&names, ttl, &holder, deadline).await {
+            match mgr
+                .acquire_all(&names, ttl, &holder, acquire_deadline(&query))
+                .await
+            {
                 Ok(owner) => {
                     let body = serde_json::json!({
-                        "owner": owner, "names": names, "ttl": ttl.as_secs(),
+                        "owner": owner, "names": names, "ttl": lease(ttl).as_secs(),
                     });
                     Ok(json(StatusCode::OK, &body.to_string()))
                 }
@@ -378,7 +386,9 @@ pub async fn route(mgr: &LockManager, req: Request<Incoming>) -> Result<Response
                 ));
             };
             let n = mgr.renew_all(&names, &owner, ttl);
-            let body = serde_json::json!({"renewed": n, "of": names.len()});
+            let body = serde_json::json!({
+                "renewed": n, "of": names.len(), "ttl": lease(ttl).as_secs(),
+            });
             let status = if n == names.len() {
                 StatusCode::OK
             } else {
@@ -525,9 +535,20 @@ fn qparam(query: &str, key: &str) -> Option<u64> {
         .and_then(|(_, v)| v.parse().ok())
 }
 
+/// Requested lease `ttl`, clamped to [`MAX_LEASE_TTL`].
+fn lease(ttl: Duration) -> Duration {
+    ttl.min(MAX_LEASE_TTL)
+}
+
+/// `/lock/acquire`'s long-poll deadline: now plus the client's `?wait=` (or
+/// [`DEFAULT_WAIT`]), clamped to [`MAX_WAIT`] so a huge wait can't overflow the `Instant`.
+fn acquire_deadline(query: &str) -> Instant {
+    let wait = Duration::from_secs(qparam(query, "wait").unwrap_or(DEFAULT_WAIT));
+    Instant::now() + wait.min(MAX_WAIT)
+}
+
 /// `/lock/fail`'s effective ttl: the client's `?ttl=` (or [`DEFAULT_FAIL_TTL`]), clamped to
-/// [`MAX_FAIL_TTL`] — see that constant's doc for why this endpoint clamps where
-/// `/lock/acquire`'s lease does not.
+/// [`MAX_FAIL_TTL`] — see that constant's doc for why.
 fn fail_ttl(query: &str) -> Duration {
     Duration::from_secs(
         qparam(query, "ttl")
@@ -550,6 +571,32 @@ mod tests {
 
     fn now_plus(d: Duration) -> Instant {
         Instant::now() + d
+    }
+
+    /// A ttl past what an `Instant` can hold is clamped, not added: the addition would panic
+    /// with the lock table's mutex held and poison it for every later request.
+    #[tokio::test]
+    async fn an_outsized_ttl_is_clamped_rather_than_poisoning_the_table() {
+        let m = LockManager::new();
+        let names = ["k".to_string()];
+        let huge = Duration::from_secs(u64::MAX);
+        let Ok(owner) = m
+            .acquire_all(&names, huge, "a", now_plus(Duration::ZERO))
+            .await
+        else {
+            panic!("a free name must be granted");
+        };
+        assert_eq!(m.renew_all(&names, &owner, huge), 1);
+        assert_eq!(m.release_all(&names, &owner), 1);
+        let again = m
+            .acquire_all(
+                &names,
+                Duration::from_secs(30),
+                "b",
+                now_plus(Duration::ZERO),
+            )
+            .await;
+        assert!(again.is_ok());
     }
 
     /// The client chooses these bytes: a `%` before a multi-byte character decodes literally
@@ -820,6 +867,19 @@ mod tests {
             Duration::from_secs(MAX_FAIL_TTL),
             "an oversized ttl must be clamped to MAX_FAIL_TTL"
         );
+    }
+
+    #[test]
+    fn acquire_deadline_defaults_and_clamps_an_outsized_wait() {
+        let before = Instant::now();
+        let d = acquire_deadline("");
+        assert!(d >= before + Duration::from_secs(DEFAULT_WAIT));
+        assert!(d <= Instant::now() + Duration::from_secs(DEFAULT_WAIT));
+        // u64::MAX seconds overflows `Instant + Duration`; clamped, it must not panic.
+        let before = Instant::now();
+        let d = acquire_deadline("wait=18446744073709551615");
+        assert!(d >= before + MAX_WAIT);
+        assert!(d <= Instant::now() + MAX_WAIT);
     }
 
     #[tokio::test]
