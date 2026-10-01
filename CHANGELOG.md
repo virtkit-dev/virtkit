@@ -15,6 +15,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A guest can no longer make the host's `vk` hold unbounded memory through its service
+  control channel** or the answers of the agent's status commands. A unit's `logs` now reads
+  the last 2 MiB of its console.
 - **Security: `vk run --registry-proxy https://… --insecure` is refused** instead of sending
   the registry credential over TLS whose certificate was not checked. `--insecure` means a
   plain HTTP registry, as it does everywhere else; use `--ca` for a private CA.

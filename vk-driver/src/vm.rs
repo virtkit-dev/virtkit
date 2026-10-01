@@ -1950,6 +1950,9 @@ async fn report_tools_share(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
     let Ok(out) = out.lock() else {
         return;
     };
+    if crate::executor::capture_overran(&out) {
+        return;
+    }
     let Some(why) = tools_problem(&out) else {
         return;
     };

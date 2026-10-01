@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 /// vsock port the fleet manager accepts control connections on.
 pub const CONTROL_PORT: u32 = 1099;
@@ -96,14 +96,37 @@ pub async fn write_msg<W: AsyncWriteExt + Unpin, T: Serialize>(w: &mut W, msg: &
     Ok(())
 }
 
-/// Read one newline-delimited JSON message.
+/// The longest control message either side reads: well past any reply, a unit's log tail
+/// included, and a bound on what the guest's end of a request can make the host buffer.
+pub const MAX_MSG: u64 = 16 << 20;
+
+/// The longest request the service manager reads from a guest: a unit name and an
+/// operation, a few hundred bytes at most.
+pub const MAX_REQUEST: u64 = 64 << 10;
+
+/// Read one newline-delimited JSON message, of at most [`MAX_MSG`] bytes.
 pub async fn read_msg<R, T>(r: &mut R) -> Result<T>
 where
     R: AsyncBufReadExt + Unpin,
     T: for<'de> Deserialize<'de>,
 {
+    read_msg_capped(r, MAX_MSG).await
+}
+
+/// [`read_msg`] with a bound of `max` bytes, for a reader that knows what it expects to be
+/// small — the manager reading a guest's request, say.
+pub async fn read_msg_capped<R, T>(r: &mut R, max: u64) -> Result<T>
+where
+    R: AsyncBufReadExt + Unpin,
+    T: for<'de> Deserialize<'de>,
+{
     let mut line = String::new();
-    if r.read_line(&mut line).await? == 0 {
+    // One byte past the bound, so a line of exactly `max` is told from a longer one.
+    let n = (&mut *r).take(max + 1).read_line(&mut line).await?;
+    if n as u64 > max {
+        anyhow::bail!("control message over {max} bytes");
+    }
+    if n == 0 {
         // A clean EOF: report it as an io::Error so callers can classify a peer hangup by
         // kind rather than by matching this string.
         return Err(std::io::Error::new(
@@ -207,6 +230,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer that never ends its line is cut off at the bound rather than buffered without end.
+    #[tokio::test]
+    async fn a_request_is_held_to_its_own_bound() {
+        let long = vec![b'x'; MAX_REQUEST as usize + 2];
+        let mut rd = BufReader::new(&long[..]);
+        assert!(
+            read_msg_capped::<_, Request>(&mut rd, MAX_REQUEST)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_endless_message_is_refused_at_the_bound() {
+        let endless = vec![b'x'; MAX_MSG as usize + 2];
+        let mut rd = BufReader::new(&endless[..]);
+        let err = read_msg::<_, Request>(&mut rd)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("over"), "{err}");
+    }
 
     /// A frame stream — interim `Progress` lines then the terminal `Done` — forwards every
     /// progress line in order and returns the `Done` reply, stopping at `Done`.

@@ -35,6 +35,9 @@ pub(crate) async fn fetch(
         return None;
     }
     let buf = out.lock().ok()?;
+    if crate::executor::capture_overran(&buf) {
+        return None;
+    }
     Some(Kill::parse_all(std::str::from_utf8(&buf).ok()?, MAX))
 }
 

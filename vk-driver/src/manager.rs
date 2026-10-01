@@ -440,7 +440,7 @@ impl Manager {
             return Reply::err(format!("no such unit {name:?}"));
         };
         let console = st.dir.join(crate::run::CONSOLE_LOG);
-        match std::fs::read_to_string(&console) {
+        match console_tail(&console, MAX_LOGS_TAIL) {
             Ok(text) => {
                 let mut tail: Vec<&str> = text.lines().rev().take(lines).collect();
                 tail.reverse();
@@ -449,6 +449,36 @@ impl Manager {
             Err(e) => Reply::err(format!("reading {}: {e}", console.display())),
         }
     }
+}
+
+/// Control connections a guest may hold open at once.
+const MAX_CONTROL_CONNECTIONS: usize = 16;
+
+/// The most of a unit's console `logs` reads: the end of it, which is where its last lines
+/// are. The console grows without bound and the guest writes it, so reading it whole would
+/// let a guest asking for its own logs make the host hold all of it.
+///
+/// An eighth of a control message: lossy decoding turns each invalid byte into three and JSON
+/// escapes a control character into six, so the reply carrying the tail still fits.
+const MAX_LOGS_TAIL: u64 = vk_core::fleetctl::MAX_MSG / 8;
+
+/// The whole lines in the last `max` bytes of `path`, as text — lossy, since the guest writes
+/// it. A line the cut lands inside is dropped rather than shown from its middle.
+fn console_tail(path: &Path, max: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let start = f.metadata()?.len().saturating_sub(max);
+    f.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    f.take(max).read_to_end(&mut bytes)?;
+    let whole = match start {
+        0 => &bytes[..],
+        _ => bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(&[][..], |nl| &bytes[nl + 1..]),
+    };
+    Ok(String::from_utf8_lossy(whole).into_owned())
 }
 
 /// Build a unit's agent exec address from its runtime directory.
@@ -479,10 +509,15 @@ pub async fn control_server(listen: &Path, mgr: Arc<Manager>) -> Result<()> {
     let _ = std::fs::remove_file(listen);
     let listener = vk_core::unixpath::bind_tokio(listen)
         .with_context(|| format!("control: bind {}", listen.display()))?;
+    // The guest opens these, so their number is bounded too: past it, accepting waits for one
+    // to close. The guest's bridge keeps a single connection open across operations.
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONTROL_CONNECTIONS));
     loop {
+        let slot = slots.clone().acquire_owned().await?;
         let (conn, _) = listener.accept().await?;
         let mgr = mgr.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             if let Err(e) = handle_control(conn, mgr).await {
                 eprintln!("virtkit: control request: {e:#}");
             }
@@ -495,7 +530,13 @@ async fn handle_control(conn: tokio::net::UnixStream, mgr: Arc<Manager>) -> Resu
     let mut rd = tokio::io::BufReader::new(rd);
     loop {
         // the peer hanging up between requests is the normal end of a session
-        let Ok(req) = vk_core::fleetctl::read_msg::<_, Request>(&mut rd).await else {
+        // A request is a unit name and an operation: bounded to that, not to a reply's size.
+        let Ok(req) = vk_core::fleetctl::read_msg_capped::<_, Request>(
+            &mut rd,
+            vk_core::fleetctl::MAX_REQUEST,
+        )
+        .await
+        else {
             return Ok(());
         };
         match req {
@@ -566,6 +607,23 @@ async fn stream_start(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the end of a long console is read, and only its whole lines.
+    #[test]
+    fn a_console_is_read_from_its_end_in_whole_lines() {
+        let dir = std::env::temp_dir().join(format!("vk-console-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("console.log");
+        std::fs::write(&path, b"first line\nsecond\nthird\n").unwrap();
+        assert_eq!(
+            console_tail(&path, 1 << 20).unwrap(),
+            "first line\nsecond\nthird\n"
+        );
+        // A cut inside "second" drops what is left of it.
+        assert_eq!(console_tail(&path, 9).unwrap(), "third\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A manager over one `build:` unit and one `image:` unit, provisioned as `plan_services`
     /// would leave them: each addressed, neither built.
