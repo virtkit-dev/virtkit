@@ -3873,8 +3873,9 @@ fn context_files_hash(context: &Path, sources: &[String]) -> String {
         let rel = f.strip_prefix(context).unwrap_or(f).to_string_lossy();
         h.update(rel.as_bytes());
         h.update(b"\0");
-        match std::fs::read(f) {
-            Ok(bytes) => h.update(Sha256::digest(&bytes)),
+        // Streamed rather than read whole: a context file can be any size at all.
+        match sha256_file(f) {
+            Ok(digest) => h.update(digest),
             Err(_) => h.update(b"?"),
         }
         h.update(b"\n");
@@ -3882,17 +3883,46 @@ fn context_files_hash(context: &Path, sources: &[String]) -> String {
     hex(&h.finalize())
 }
 
+/// The sha256 of `path`'s contents, read a buffer at a time.
+fn sha256_file(path: &Path) -> std::io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        match file.read(&mut buf)? {
+            0 => return Ok(h.finalize().into()),
+            n => h.update(&buf[..n]),
+        }
+    }
+}
+
 /// The context files one `COPY` source references (absolute, `.dockerignore`-filtered): a
 /// literal file/dir (recursed), else a trailing-segment glob matched against its dir.
+///
+/// Confined to the context, as the guest's view of it is: `..` is resolved lexically and
+/// stops at the context root, as BuildKit's does, and a source that a symlinked directory
+/// leads outside of references nothing. The Dockerfile names these, and every one is read
+/// on the host to be hashed.
 fn copy_src_files(context: &Path, ign: &vk_core::dockerignore::Ignore, src: &str) -> Vec<PathBuf> {
-    let rel = src.trim_start_matches('/');
-    let rel = rel.strip_prefix("./").unwrap_or(rel);
-    let start = if rel.is_empty() || rel == "." {
+    let rel = beneath_context(src);
+    let rel = rel.to_str().unwrap_or_default();
+    let start = if rel.is_empty() {
         context.to_path_buf()
     } else {
         context.join(rel)
     };
+    let within = |p: &Path| {
+        let (Ok(root), Ok(p)) = (context.canonicalize(), p.canonicalize()) else {
+            return false;
+        };
+        p.starts_with(root)
+    };
     if start.exists() {
+        if !within(&start) {
+            return Vec::new();
+        }
         return ign.included_files(&start);
     }
     // glob fallback: split into <dir>/<pattern> and match the dir's entries by name.
@@ -3901,6 +3931,9 @@ fn copy_src_files(context: &Path, ign: &vk_core::dockerignore::Ignore, src: &str
         None => (context.to_path_buf(), rel),
     };
     let mut out = Vec::new();
+    if !within(&dir) {
+        return out;
+    }
     if let Ok(rd) = std::fs::read_dir(&dir) {
         let mut entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
         entries.sort();
@@ -3910,6 +3943,22 @@ fn copy_src_files(context: &Path, ign: &vk_core::dockerignore::Ignore, src: &str
             {
                 out.extend(ign.included_files(&e));
             }
+        }
+    }
+    out
+}
+
+/// `src` as a path relative to the context root, with `.` dropped and `..` resolved lexically
+/// against what precedes it — clamped at the root, never above it.
+fn beneath_context(src: &str) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in Path::new(src).components() {
+        match c {
+            std::path::Component::Normal(n) => out.push(n),
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            _ => {}
         }
     }
     out
@@ -5784,6 +5833,39 @@ mod tests {
                 ..scratch()
             }))
         );
+    }
+
+    /// A COPY source cannot reach outside the context: `..` stops at its root, and a
+    /// symlinked directory leading out references nothing — the host reads every source to
+    /// hash it, and the Dockerfile names them.
+    #[test]
+    fn context_sources_stay_inside_the_context() {
+        assert_eq!(beneath_context("../../etc/passwd"), Path::new("etc/passwd"));
+        assert_eq!(beneath_context("./a/../b/./c"), Path::new("b/c"));
+        assert_eq!(beneath_context("/"), Path::new(""));
+
+        let base = std::env::temp_dir().join(format!("vk-ctx-confine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let ctx = base.join("ctx");
+        std::fs::create_dir_all(&ctx).unwrap();
+        std::fs::write(ctx.join("in.txt"), b"in").unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"one").unwrap();
+        std::os::unix::fs::symlink(&outside, ctx.join("leak")).unwrap();
+        let srcs = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        for src in ["../outside/secret", "leak/secret", "leak", "leak/*"] {
+            let before = context_files_hash(&ctx, &srcs(&[src]));
+            std::fs::write(outside.join("secret"), b"two").unwrap();
+            assert_eq!(before, context_files_hash(&ctx, &srcs(&[src])), "{src}");
+            std::fs::write(outside.join("secret"), b"one").unwrap();
+        }
+        // Inside still counts.
+        let before = context_files_hash(&ctx, &srcs(&["in.txt"]));
+        std::fs::write(ctx.join("in.txt"), b"changed").unwrap();
+        assert_ne!(before, context_files_hash(&ctx, &srcs(&["in.txt"])));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
