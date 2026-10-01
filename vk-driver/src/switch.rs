@@ -875,7 +875,8 @@ impl EgressGuard {
     fn verdict(&self, src: Option<Ipv4Addr>, dst: SocketAddr) -> Verdict {
         if src.is_some_and(|s| self.allows(s, dst)) {
             Verdict::Allow
-        } else if self.dry_run {
+        } else if self.dry_run && src.is_some() {
+            // Only soften denials for guest flows: no IPv4 source means no policy.
             Verdict::WouldDeny
         } else {
             Verdict::Deny
@@ -1566,19 +1567,24 @@ impl Switch {
         let sip = (ethertype == ETHERTYPE_IPV4)
             .then(|| ipv4_src(&frame[14..]))
             .flatten();
-        // Admit only unspecified pre-configuration sources (such as DHCP's 0.0.0.0) or an
-        // address owned by this port's VM. The socket supplies the VM identity, so accepted
-        // sources are safe inputs to `policy_for` and `route_in`; a guest cannot borrow a
-        // sibling's policy or steal its replies.
+        // Admit DHCP from 0.0.0.0, or a source address owned by this port's VM. The socket
+        // supplies the VM identity, so accepted sources are safe inputs to `policy_for` and
+        // `route_in`; a guest cannot borrow a sibling's policy or steal its replies. Anything
+        // else from 0.0.0.0 would fall to the default policy rather than the sender's own.
+        //
+        // A frame typed IPv4 that does not carry IPv4 has no source to check, and ipstack
+        // would accept an IPv6 packet in it past every check below.
         //
         // Scope ownership by VM rather than port because Linux owns addresses at host scope:
         // it may answer ARP for one NIC through another and route the reply through either.
         // Per-port ownership would reject valid multi-homed traffic, and guest configuration
         // cannot be trusted to prevent it.
-        if let Some(sip) = sip
-            && !sip.is_unspecified()
-            && inner.ip_vm.get(&sip) != inner.port_vm.get(&port)
-        {
+        let admitted = match sip {
+            None => ethertype != ETHERTYPE_IPV4,
+            Some(sip) if sip.is_unspecified() => is_dhcp(&frame[14..]),
+            Some(sip) => inner.ip_vm.get(&sip) == inner.port_vm.get(&port),
+        };
+        if !admitted {
             return;
         }
         inner.mac_port.insert(src, port);
@@ -4379,6 +4385,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A switch with one VM (port 0, `192.168.231.2`), followed by receivers for frames
+    /// sent to that port and packets sent to ipstack.
+    fn one_vm_switch(
+        policy: Egress,
+    ) -> (
+        Switch,
+        UnboundedReceiver<Vec<u8>>,
+        UnboundedReceiver<Vec<u8>>,
+    ) {
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let (egress_tx, egress_rx) = unbounded_channel();
+        let (port_tx, port_rx) = unbounded_channel();
+        let sw = Switch {
+            cfg: Cfg {
+                gateway: gw,
+                prefix: 24,
+            },
+            inner: Mutex::new(Inner {
+                next_idx: FIRST_LEASE,
+                ip_vm: [(Ipv4Addr::new(192, 168, 231, 2), 1)].into_iter().collect(),
+                port_vm: [(0, 1)].into_iter().collect(),
+                ports: [(0, port_tx)].into_iter().collect(),
+                ..Inner::default()
+            }),
+            egress_tx,
+            next_port: AtomicU32::new(1),
+            hosts: Arc::new(HashMap::new()),
+            upstreams: Vec::new().into(),
+            egress: Arc::new(EgressGuard::new(policy, gw)),
+        };
+        (sw, port_rx, egress_rx)
+    }
+
+    /// `ip` in an ethernet frame to the gateway, typed `ethertype`.
+    fn to_gw(ip: &[u8], ethertype: u16) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(14 + ip.len());
+        frame.extend_from_slice(&GW_MAC);
+        frame.extend_from_slice(&[0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc]);
+        frame.extend_from_slice(&ethertype.to_be_bytes());
+        frame.extend_from_slice(ip);
+        frame
+    }
+
+    /// Only a frame whose source the switch could check gets past it: not an IPv6 packet
+    /// typed as IPv4, and from 0.0.0.0 nothing but DHCP.
+    #[test]
+    fn egress_takes_only_a_checked_ipv4_source() {
+        let (sw, mut port, mut egress) = one_vm_switch(Egress::new(&[], &[]).unwrap());
+        let udp = |src: [u8; 4], dst: [u8; 4], dport: u16, payload: &[u8]| {
+            let mut ip = Vec::new();
+            etherparse::PacketBuilder::ipv4(src, dst, 64)
+                .udp(4000, dport)
+                .write(&mut ip, payload)
+                .unwrap();
+            ip
+        };
+        // The guest's own address: carried.
+        let own = udp([192, 168, 231, 2], [1, 1, 1, 1], 9, b"x");
+        sw.handle_frame(0, &to_gw(&own, ETHERTYPE_IPV4));
+        assert!(
+            egress.try_recv().is_ok(),
+            "the guest's own datagram is carried"
+        );
+
+        // An IPv6 packet in an IPv4-typed frame: dropped.
+        let mut v6 = Vec::new();
+        let dst6: std::net::Ipv6Addr = "2001:db8::1".parse().unwrap();
+        etherparse::PacketBuilder::ipv6([0xfe; 16], dst6.octets(), 64)
+            .udp(4000, 9)
+            .write(&mut v6, b"x")
+            .unwrap();
+        sw.handle_frame(0, &to_gw(&v6, ETHERTYPE_IPV4));
+        assert!(
+            egress.try_recv().is_err(),
+            "IPv6 dressed as IPv4 is dropped"
+        );
+
+        // 0.0.0.0 that is not DHCP, off-subnet or a DNS query to the gateway: dropped.
+        let stray = udp([0, 0, 0, 0], [1, 1, 1, 1], 9, b"x");
+        sw.handle_frame(0, &to_gw(&stray, ETHERTYPE_IPV4));
+        let dns = udp([0, 0, 0, 0], [192, 168, 231, 1], 53, &[0; 12]);
+        sw.handle_frame(0, &to_gw(&dns, ETHERTYPE_IPV4));
+        assert!(
+            egress.try_recv().is_err() && port.try_recv().is_err(),
+            "a non-DHCP datagram from 0.0.0.0 is dropped"
+        );
+
+        // A DHCP DISCOVER from 0.0.0.0: answered.
+        let mut discover = vec![0u8; 240];
+        discover[0] = 1; // BOOTREQUEST
+        discover[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        discover.extend_from_slice(&[53, 1, 1, 255]);
+        let mut ip = Vec::new();
+        etherparse::PacketBuilder::ipv4([0, 0, 0, 0], [255, 255, 255, 255], 64)
+            .udp(68, DHCP_SERVER_PORT)
+            .write(&mut ip, &discover)
+            .unwrap();
+        sw.handle_frame(0, &to_gw(&ip, ETHERTYPE_IPV4));
+        assert!(port.try_recv().is_ok(), "a DHCP DISCOVER is answered");
+    }
+
     #[test]
     fn verdict_softens_a_denial_only_in_dry_run() {
         let gw = Ipv4Addr::new(192, 168, 231, 1);
@@ -4395,7 +4502,7 @@ mod tests {
         let dry = EgressGuard::new(policy(), gw).with_dry_run(true);
         assert_eq!(dry.verdict(guest, allowed), Verdict::Allow);
         assert_eq!(dry.verdict(guest, denied), Verdict::WouldDeny);
-        assert_eq!(dry.verdict(None, allowed), Verdict::WouldDeny);
+        assert_eq!(dry.verdict(None, allowed), Verdict::Deny);
 
         // Unrestricted: nothing to soften.
         let open = EgressGuard::new(Egress::AllowAll, gw).with_dry_run(true);

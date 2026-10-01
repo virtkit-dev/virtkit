@@ -38,6 +38,9 @@ All notable changes to virtkit will be documented in this file.
   share those connections with the guest. A unit's `logs` reads the last 2 MiB of its console.
 - **Security: a guest's answer to `vk`'s status probes (CI jobs and build stages) is capped
   at 1 MiB.** A larger answer is discarded rather than held in the host's `vk`.
+- **Security: a guest can no longer leave its own egress allowlist by sending from `0.0.0.0`**,
+  which put the traffic under the network's default allowlist instead. Nor can it reach IPv6
+  hosts during an egress dry run.
 - **Security: a build's stage guests get a private session directory.** It was created at a
   predictable name in the shared temp dir and reused as found, so another local user could
   plant it and take over the guest's exec channel and console log.
