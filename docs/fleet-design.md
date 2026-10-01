@@ -200,7 +200,12 @@ effective = min(local estimate, hub ceiling, local ceiling)
   admitted.
 - **hub ceiling** — set by the hub, for a node that is unhealthy, saturated on a resource the
   local estimate does not see, or whose capacity is being kept for a specialist class.
-- **local ceiling** — the administrator's limit in `virtkit.toml`.
+- **local ceiling** — the administrator's limit in `virtkit.toml`, `[executor.schedule]
+  max_concurrency`.
+
+`vk tune` and `vk node run` compute it the same way, in one place; a runner config the node's
+user owns (`[node] runner_config`) has its `concurrent` set directly, and a root-managed one
+still goes through `vk-runnerctl`.
 
 gitlab-runner has no `concurrent = 0`. **Stop acquisition** is therefore a state, not a
 number: the node sends gitlab-runner `SIGQUIT`, which stops it requesting jobs and lets

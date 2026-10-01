@@ -24,6 +24,9 @@ vk-fs = { path = "../vk-fs" }
 vk-registry = { path = "../vk-registry" }
 # `vk update`: the release-install path, shared with the vk-registry binary.
 vk-selfupdate = { path = "../vk-selfupdate" }
+# the surgical `concurrent` edit vk-runnerctl applies as root, reused for a runner config this
+# user owns so both paths share the one editor and its proof that nothing else changed.
+vk-runnerctl = { path = "../vk-runnerctl" }
 # thread-pool: the virtiofsd daemon's optional request worker pool
 futures = { workspace = true, features = ["thread-pool"] }
 libc.workspace = true

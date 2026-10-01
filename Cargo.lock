@@ -4626,6 +4626,7 @@ dependencies = [
  "vk-fleet-proto",
  "vk-fs",
  "vk-registry",
+ "vk-runnerctl",
  "vk-selfupdate",
  "vm-memory 0.17.1",
  "vm-memory 0.18.0",

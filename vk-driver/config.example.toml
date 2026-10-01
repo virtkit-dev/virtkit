@@ -131,6 +131,9 @@
 # jobs_speed = "slow"    # the filesystem holding <state_dir>/jobs: "fast" or "slow".
 #                        # Declared, not measured; unset = not declared
 # checkouts_speed = "fast"  # the same for the host-checkout root ([executor] checkout_dir)
+# runner_config = "/home/ci/.gitlab-runner/config.toml"  # a runner config this user owns:
+#                        # `vk tune` sets its `concurrent` directly instead of leaving the
+#                        # number for the root-side vk-runnerctl
 
 # MICROVM_IMAGE is prefix-based (the prefix names the source): unset = local/default;
 # `local/<name>` = a bundle dir under [local] dir; `virtkit/<name>[:tag|@digest]` =
@@ -310,4 +313,4 @@
 #                        # Unset: 8G, capped at the filesystem's size; set larger than the
 #                        # filesystem, such jobs fail at once
 # max_concurrency = 12   # the most jobs `vk tune` ever asks the runner to accept, whatever the
-#                        # budget would allow. Unset: no ceiling of the host's own
+#                        # budget or a fleet hub would allow. Unset: no ceiling of the host's own

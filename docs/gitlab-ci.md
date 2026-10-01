@@ -1020,7 +1020,7 @@ The number itself is "the jobs running now, plus what both the budget and the ho
 room for", at the size a job on this host typically reserves:
 
 ```
-virtkit: runner concurrency 2 (estimate 2, local ceiling none); 6144 of 8192 MiB committed by 1 job(s), typical job 2048 MiB, 23040 of 32768 MiB host memory available
+virtkit: runner concurrency 2 (estimate 2, hub ceiling none, local ceiling none); 6144 of 8192 MiB committed by 1 job(s), typical job 2048 MiB, 23040 of 32768 MiB host memory available
 ```
 
 It falls the moment the host fills and climbs back one step at a time, because a job that
@@ -1038,9 +1038,14 @@ a time.
 A host whose `/proc/meminfo` cannot be read reports `host memory unreadable` and schedules on
 the budget alone.
 
-That estimate is capped by `[executor.schedule] max_concurrency`, the host's own limit, and the
-smaller of the two wins. With `max_concurrency` alone and no `mem_budget`, `vk tune` holds the
-runner at that ceiling.
+That estimate is capped by two ceilings, and the smallest of the three wins: `[executor.schedule]
+max_concurrency`, the host's own limit, and — on a fleet node — the ceiling its hub sets. With
+`max_concurrency` alone and no `mem_budget`, `vk tune` holds the runner at that ceiling.
+
+A runner that runs as the same user as `vk`, with its own `~/.gitlab-runner/config.toml`, needs
+no `vk-runnerctl`: name the file as `[node] runner_config` and `vk tune` sets its `concurrent`
+itself, with the same one-line edit and the same proof that nothing else changed. It refuses a
+file another user owns.
 
 Getting the number wrong is cheap on purpose. It decides what the runner *accepts*, never
 what is committed: too high and the extra jobs queue at the admission gate exactly as

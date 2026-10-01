@@ -227,8 +227,9 @@ pub struct Schedule {
     /// Independent of `mem_budget`; shares its queue and `wait_timeout_secs`. Default on;
     /// `false` turns it off.
     pub disk_admission: Option<bool>,
-    /// The most jobs the runner is ever told to accept, whatever the host could take: the
-    /// local ceiling in `min(estimate, local ceiling)`. Unset: no ceiling of the host's own.
+    /// The most jobs the runner is ever told to accept, whatever the host could take or a
+    /// fleet hub allows: the local ceiling in `min(estimate, hub ceiling, local ceiling)`.
+    /// Unset: no ceiling of the host's own.
     pub max_concurrency: Option<u32>,
     /// What a job with no history of its own is expected to write into its job dir, as
     /// `"<n>G"`. Set larger than the filesystem, every such job fails at once. Default `"8G"`,
@@ -275,6 +276,9 @@ pub struct Node {
     pub jobs_speed: Option<vk_fleet_proto::SpeedClass>,
     /// The same for the host-checkout root ([`Config::checkout_root`]).
     pub checkouts_speed: Option<vk_fleet_proto::SpeedClass>,
+    /// A gitlab-runner config this user owns, whose `concurrent` `vk` sets directly rather
+    /// than leaving the number for `vk-runnerctl`. Unset: the runner is root's.
+    pub runner_config: Option<PathBuf>,
 }
 
 impl Node {

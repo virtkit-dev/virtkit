@@ -1,8 +1,10 @@
 //! Keeping gitlab-runner's appetite in step with the host: works out how many jobs this
-//! runner should be accepting and leaves that number where `vk-runnerctl` can apply it.
+//! runner should be accepting and leaves that number where `vk-runnerctl` can apply it, or
+//! sets it in a runner config this user owns.
 //!
-//! This is the one place the number is decided: `effective = min(local estimate, local
-//! ceiling)` ([`decide`]).
+//! This is the one place the number is decided: `effective = min(local estimate, hub
+//! ceiling, local ceiling)` ([`decide`]), whether `vk tune` asks or `vk node run`'s own loop
+//! does.
 //!
 //! The admission gate ([`crate::admit`]) is what keeps the host safe — it never lets more
 //! memory be committed than the budget allows. But a job it makes wait has already been
@@ -17,7 +19,7 @@
 //! a crude control law the right one.
 
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -37,12 +39,14 @@ pub fn desired_file(cfg: &Config) -> PathBuf {
 }
 
 /// The runner's concurrency and what it was worked out from:
-/// `effective = min(local estimate, local ceiling)`, each term optional.
+/// `effective = min(local estimate, hub ceiling, local ceiling)`, each term optional.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
     /// What the host can take, by [`concurrency`]; `None` without a memory budget to measure
     /// against.
     pub estimate: Option<u32>,
+    /// The cap a fleet hub set, from the node's applied desired state.
+    pub hub_ceiling: Option<u32>,
     /// `[executor.schedule] max_concurrency`.
     pub local_ceiling: Option<u32>,
     /// The smallest term, never below one; `None` when no term applies, which leaves the
@@ -64,18 +68,29 @@ struct Basis {
 /// The smallest of the terms that apply, never below one: `concurrent = 0` is not a throttle
 /// gitlab-runner has, so a ceiling of zero means one — stopping acquisition is a state of its
 /// own, not a number.
-pub fn effective(estimate: Option<u32>, local_ceiling: Option<u32>) -> Option<u32> {
-    [estimate, local_ceiling]
+pub fn effective(
+    estimate: Option<u32>,
+    hub_ceiling: Option<u32>,
+    local_ceiling: Option<u32>,
+) -> Option<u32> {
+    [estimate, hub_ceiling, local_ceiling]
         .into_iter()
         .flatten()
         .min()
         .map(|n| n.max(1))
 }
 
-/// Work the concurrency out from the host, the ledger and the local ceiling. The estimate
-/// rises from the previous *effective* answer, so a ceiling that is lifted is climbed back
-/// from one step at a time.
-pub fn decide(cfg: &Config) -> Result<Decision> {
+/// Work the concurrency out from the host, the ledger, `hub_ceiling` and the local ceiling.
+/// The estimate rises from the previous *effective* answer, so a ceiling that is lifted is
+/// climbed back from one step at a time.
+pub fn decide(cfg: &Config, hub_ceiling: Option<u32>) -> Result<Decision> {
+    decide_with(cfg, hub_ceiling, true)
+}
+
+/// [`decide`], letting the estimate rise only when `may_rise`: its one step up is a step per
+/// *period*, so a caller that also decides between periods — on a change that can only call
+/// for less — passes false, and the estimate can then fall but not climb.
+pub fn decide_with(cfg: &Config, hub_ceiling: Option<u32>, may_rise: bool) -> Result<Decision> {
     let local_ceiling = cfg.executor.schedule.max_concurrency;
     let (estimate, basis) = match crate::vm::budget_mib(cfg) {
         None => (None, None),
@@ -102,6 +117,10 @@ pub fn decide(cfg: &Config) -> Result<Decision> {
                 host,
                 previous,
             });
+            let want = match previous {
+                Some(prev) if !may_rise => want.min(prev),
+                _ => want,
+            };
             let basis = Basis {
                 budget_mib,
                 granted_mib: held.granted_mib,
@@ -114,19 +133,32 @@ pub fn decide(cfg: &Config) -> Result<Decision> {
     };
     Ok(Decision {
         estimate,
+        hub_ceiling,
         local_ceiling,
-        effective: effective(estimate, local_ceiling),
+        effective: effective(estimate, hub_ceiling, local_ceiling),
         basis,
     })
 }
 
 /// Put `decision` where the runner picks it up: the desired-concurrency file `vk-runnerctl`
-/// reads.
+/// reads for a root-managed runner — always, since it is also this host's record of what it
+/// asked for — and, when this user's own runner config is named ([`runner_config`]), that
+/// file's `concurrent` itself.
 pub fn apply(cfg: &Config, decision: &Decision) -> Result<()> {
-    match decision.effective {
-        Some(want) => write_desired(cfg, want),
-        None => Ok(()),
+    let Some(want) = decision.effective else {
+        return Ok(());
+    };
+    write_desired(cfg, want)?;
+    if let Some(path) = runner_config(cfg) {
+        set_runner_concurrent(&path, want)?;
     }
+    Ok(())
+}
+
+/// The gitlab-runner config this user owns and `vk` edits directly, if any: `[node]
+/// runner_config`. Unset, the runner is root's, reached through `vk-runnerctl`.
+pub fn runner_config(cfg: &Config) -> Option<PathBuf> {
+    cfg.node.runner_config.clone()
 }
 
 /// Measure the host and write what the runner's concurrency should be. Meant to run every
@@ -139,7 +171,7 @@ pub fn tune(cfg: &Config) -> Result<()> {
              (see the GitLab CI guide)"
         );
     }
-    let decision = decide(cfg)?;
+    let decision = decide(cfg, None)?;
     apply(cfg, &decision)?;
     println!("virtkit: {}", describe(&decision));
     Ok(())
@@ -152,8 +184,9 @@ pub fn describe(d: &Decision) -> String {
     };
     let term = |n: Option<u32>| n.map_or_else(|| "none".to_string(), |n| n.to_string());
     let mut line = format!(
-        "runner concurrency {want} (estimate {}, local ceiling {})",
+        "runner concurrency {want} (estimate {}, hub ceiling {}, local ceiling {})",
         term(d.estimate),
+        term(d.hub_ceiling),
         term(d.local_ceiling)
     );
     if let Some(b) = &d.basis {
@@ -204,6 +237,161 @@ fn write_desired(cfg: &Config, want: u32) -> Result<()> {
         .with_context(|| format!("writing {}", tmp.display()))?;
     drop(file);
     std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))
+}
+
+/// Set `concurrent` in the gitlab-runner config at `path`, which this user must own, with
+/// `vk-runnerctl`'s editor: the one line rewritten, and the result proven to differ from the
+/// original at that key alone before it replaces it. gitlab-runner notices the change itself.
+/// Returns whether the file changed; a file that already says `value` is not rewritten.
+///
+/// gitlab-runner saves this file itself too — rewriting it in place, `os.WriteFile`, when it
+/// rotates a runner's token — so the file is checked again just before the edit replaces it:
+/// the same inode, size and mtime it was read with, or the edit starts over from what is
+/// there now. Every step works relative to the directory, opened once, so the name checked
+/// is the name replaced. What remains is the instant between that check and the rename.
+pub fn set_runner_concurrent(path: &Path, value: u32) -> Result<bool> {
+    set_runner_concurrent_checked(path, value, || {})
+}
+
+/// How many times an edit starts over on a config that changed under it.
+const EDIT_ATTEMPTS: u32 = 5;
+
+/// [`set_runner_concurrent`], calling `before_publish` between staging the edit and checking
+/// the file again — the window a concurrent writer has, which a test fills.
+fn set_runner_concurrent_checked(
+    path: &Path,
+    value: u32,
+    mut before_publish: impl FnMut(),
+) -> Result<bool> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = path
+        .file_name()
+        .with_context(|| format!("{} names no file", path.display()))?;
+    let c_name = CString::new(name.as_bytes()).context("a runner config path with a NUL")?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let dir = vk_fs::open_dir(parent.unwrap_or(Path::new(".")))?;
+    let staged = CString::new(format!(
+        ".{}.vk-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ))
+    .context("a runner config name with a NUL")?;
+    // SAFETY (all four helpers): the directory descriptor is live, the names are
+    // NUL-terminated and outlive each call, and a descriptor a call returns is handed
+    // straight to `OwnedFd`.
+    let open_at = |cname: &CString, flags: libc::c_int, mode: libc::c_uint| {
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), cname.as_ptr(), flags, mode) };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+        }
+    };
+    let stat_at = || {
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let rc = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+                st.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fstatat filled the struct, on success only.
+        Ok(unsafe { st.assume_init() })
+    };
+    let unlink_staged = || unsafe { libc::unlinkat(dir.as_raw_fd(), staged.as_ptr(), 0) };
+
+    for _ in 0..EDIT_ATTEMPTS {
+        let mut file = open_at(
+            &c_name,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+        .with_context(|| format!("opening {}", path.display()))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("statting {}", path.display()))?;
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        if meta.uid() != uid {
+            bail!(
+                "{} belongs to uid {}, not this user: a runner config vk does not own is set \
+                 through vk-runnerctl",
+                path.display(),
+                meta.uid()
+            );
+        }
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if vk_runnerctl::edit::current_concurrent(&text) == Some(value) {
+            return Ok(false);
+        }
+        let edited = vk_runnerctl::edit::set_concurrent(&text, value)
+            .with_context(|| format!("editing {}", path.display()))?;
+        vk_runnerctl::edit::verify(&text, &edited, value)
+            .with_context(|| format!("editing {}", path.display()))?;
+
+        // Created private and exclusively — a leftover from a killed run is cleared first —
+        // then given the config's own mode through the descriptor, before anyone can open it
+        // by name.
+        unlink_staged();
+        let mut out = open_at(
+            &staged,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+        .with_context(|| format!("staging the edit of {}", path.display()))?;
+        let written = out
+            .write_all(edited.as_bytes())
+            .and_then(|()| {
+                out.set_permissions(std::fs::Permissions::from_mode(meta.mode() & 0o7777))
+            })
+            .and_then(|()| out.sync_all());
+        if let Err(e) = written {
+            unlink_staged();
+            return Err(e).with_context(|| format!("staging the edit of {}", path.display()));
+        }
+        drop(out);
+
+        before_publish();
+        let now = stat_at().with_context(|| format!("statting {}", path.display()))?;
+        let unchanged = now.st_dev == meta.dev()
+            && now.st_ino == meta.ino()
+            && u64::try_from(now.st_size).ok() == Some(meta.size())
+            && now.st_mtime == meta.mtime()
+            && now.st_mtime_nsec == meta.mtime_nsec();
+        if !unchanged {
+            unlink_staged();
+            continue;
+        }
+        // SAFETY: as above.
+        let rc = unsafe {
+            libc::renameat(
+                dir.as_raw_fd(),
+                staged.as_ptr(),
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            unlink_staged();
+            return Err(e).with_context(|| format!("installing {}", path.display()));
+        }
+        return Ok(true);
+    }
+    bail!(
+        "{} kept changing while its `concurrent` was being set; left for the next pass",
+        path.display()
+    )
 }
 
 /// What this host's `/proc/meminfo` says, in MiB.
@@ -424,14 +612,15 @@ mod tests {
     #[test]
     fn the_smallest_term_binds_and_one_is_the_floor() {
         // Each term binds when it is the smallest.
-        assert_eq!(effective(Some(3), Some(6)), Some(3));
-        assert_eq!(effective(Some(9), Some(2)), Some(2));
+        assert_eq!(effective(Some(3), Some(8), Some(6)), Some(3));
+        assert_eq!(effective(Some(9), Some(4), Some(6)), Some(4));
+        assert_eq!(effective(Some(9), Some(8), Some(2)), Some(2));
         // Absent terms do not bind; a ceiling applies without a budget to estimate from.
-        assert_eq!(effective(None, Some(5)), Some(5));
-        assert_eq!(effective(Some(7), None), Some(7));
-        assert_eq!(effective(None, None), None);
+        assert_eq!(effective(None, Some(5), None), Some(5));
+        assert_eq!(effective(Some(7), None, None), Some(7));
+        assert_eq!(effective(None, None, None), None);
         // Zero is not a throttle gitlab-runner has.
-        assert_eq!(effective(Some(4), Some(0)), Some(1));
+        assert_eq!(effective(Some(4), Some(0), None), Some(1));
     }
 
     fn scratch_cfg(tag: &str, schedule: crate::config::Schedule) -> (Config, std::path::PathBuf) {
@@ -450,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn a_decision_combines_the_estimate_with_the_ceiling() {
+    fn a_decision_combines_the_estimate_with_both_ceilings() {
         let (cfg, dir) = scratch_cfg(
             "decide",
             crate::config::Schedule {
@@ -460,11 +649,14 @@ mod tests {
             },
         );
         // The estimate is this host's own reading, so only its relation to the rest is fixed.
-        let d = decide(&cfg).unwrap();
-        assert_eq!(d.local_ceiling, Some(3));
+        let d = decide(&cfg, Some(2)).unwrap();
+        assert_eq!((d.hub_ceiling, d.local_ceiling), (Some(2), Some(3)));
         assert!(d.estimate.is_some());
+        assert_eq!(d.effective, effective(d.estimate, Some(2), Some(3)));
+        assert!(d.effective <= Some(2));
+        assert!(describe(&d).contains("hub ceiling 2"), "{}", describe(&d));
+        let d = decide(&cfg, None).unwrap();
         assert_eq!(d.effective, Some(d.estimate.unwrap().min(3)));
-        assert!(describe(&d).contains("local ceiling 3"), "{}", describe(&d));
         // No budget: the local ceiling alone decides.
         let (cfg, dir2) = scratch_cfg(
             "decide-nobudget",
@@ -473,12 +665,111 @@ mod tests {
                 ..Default::default()
             },
         );
-        let d = decide(&cfg).unwrap();
+        let d = decide(&cfg, None).unwrap();
         assert_eq!((d.estimate, d.effective), (None, Some(5)));
-        apply(&cfg, &d).unwrap();
-        assert_eq!(std::fs::read_to_string(desired_file(&cfg)).unwrap(), "5\n");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn a_runner_config_this_user_owns_is_edited_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut cfg, dir) = scratch_cfg(
+            "edit",
+            crate::config::Schedule {
+                max_concurrency: Some(4),
+                ..Default::default()
+            },
+        );
+        let path = dir.join("config.toml");
+        let original =
+            "# ops\nconcurrent = 9  # keep\n\n[[runners]]\n  name = \"a\"\n  token = \"glrt-x\"\n";
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        cfg.node.runner_config = Some(path.clone());
+        apply(&cfg, &decide(&cfg, None).unwrap()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, original.replace("concurrent = 9", "concurrent = 4"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read_to_string(desired_file(&cfg)).unwrap(), "4\n");
+        // Nothing to change is not a rewrite.
+        assert!(!set_runner_concurrent(&path, 4).unwrap());
+        // A link in the config's place is not followed.
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(set_runner_concurrent(&link, 5).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gitlab-runner rewrites its config in place when it saves a rotated token. One that
+    /// does so between the edit's read and its rename is not overwritten: the edit starts
+    /// again from what is there.
+    #[test]
+    fn a_config_rewritten_during_the_edit_is_edited_afresh() {
+        let dir = std::env::temp_dir().join(format!("vk-tune-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "concurrent = 9\n\n[[runners]]\n  token = \"old\"\n").unwrap();
+        let mut rewrites = 0;
+        let changed = set_runner_concurrent_checked(&path, 3, || {
+            if rewrites == 0 {
+                // In place, as `os.WriteFile` does: same inode, new size and mtime.
+                std::fs::write(
+                    &path,
+                    "concurrent = 9\n\n[[runners]]\n  token = \"rotated\"\n",
+                )
+                .unwrap();
+            }
+            rewrites += 1;
+        })
+        .unwrap();
+        assert!(changed);
+        assert_eq!(rewrites, 2);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "concurrent = 3\n\n[[runners]]\n  token = \"rotated\"\n"
+        );
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["config.toml"].map(std::ffi::OsString::from));
+        // One that never stops changing is left alone, with nothing staged left behind.
+        let err = set_runner_concurrent_checked(&path, 5, || {
+            std::fs::write(&path, format!("concurrent = 3\n# {}\n", rand_suffix())).unwrap();
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("kept changing"), "{err:#}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A different string each call, so each rewrite changes the file's size or content.
+    fn rand_suffix() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        "x".repeat(usize::try_from(N.fetch_add(1, Ordering::Relaxed)).unwrap() + 1)
+    }
+
+    #[test]
+    fn between_periods_the_estimate_can_fall_but_not_climb() {
+        let (cfg, dir) = scratch_cfg(
+            "rise",
+            crate::config::Schedule {
+                mem_budget: Some("1000G".into()),
+                ..Default::default()
+            },
+        );
+        let path = desired_file(&cfg);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "1\n").unwrap();
+        let held = decide_with(&cfg, None, false).unwrap();
+        assert!(held.estimate <= Some(1), "{held:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

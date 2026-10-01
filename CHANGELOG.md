@@ -36,9 +36,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
-- **`vk tune` honours a concurrency ceiling.** `[executor.schedule] max_concurrency` caps what
-  it asks for, and works without a `mem_budget` too. The report line now names the estimate
-  and the ceiling.
+- **`vk tune` honours a concurrency ceiling, and can edit a runner config you own.**
+  `[executor.schedule] max_concurrency` caps what it asks for, and works without a
+  `mem_budget` too. A gitlab-runner that runs as your own user no longer needs
+  `vk-runnerctl`: name its config as `[node] runner_config` and `vk tune` sets `concurrent`
+  there itself, touching nothing else in the file. The report line now names the estimate and
+  both ceilings.
 
 ### Fixed
 
