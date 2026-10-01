@@ -630,6 +630,45 @@ const LONGEST_SOCKET_NAME: &str = "vsock.sock_65535";
 /// longest socket name.
 pub(crate) const STATE_DIR_MAX: usize = SUN_PATH_MAX - 1 - LONGEST_SOCKET_NAME.len();
 
+/// A boot session's own directory under `base` (the temp dir): its guest's exec socket, its
+/// console log and, under cloud-hypervisor, its initramfs and context share socket. The name,
+/// `virtkit-session-<pid>-<stem>`, is predictable and `base` is shared with every local user,
+/// so it is created here, private (0700), and never taken as found: a directory someone else
+/// planted there would hand them the guest's exec channel, and a planted `console.log` symlink
+/// a file the VMM truncates. When the name is taken — by a planter, or by a session an earlier
+/// process with this pid left behind — a random suffix picks one no one could have planted.
+/// `build::sweep_stale_sessions` still reads the pid from either form.
+fn private_session_dir(base: &Path, stem: &str) -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let pid = std::process::id();
+    let mut name = format!("virtkit-session-{pid}-{stem}");
+    for _ in 0..8 {
+        let path = base.join(&name);
+        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                name = format!("virtkit-session-{pid}-{stem}-{}", random_suffix()?);
+            }
+            Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
+        }
+    }
+    bail!(
+        "could not create a private session directory under {}",
+        base.display()
+    )
+}
+
+/// 64 bits of `/dev/urandom`, hex: a name nobody could have planted ahead of us.
+fn random_suffix() -> Result<String> {
+    use std::io::Read;
+    let mut bytes = [0u8; 8];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .context("reading /dev/urandom")?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Reject long state dirs only under cloud-hypervisor, which receives socket paths on its
 /// command line and binds and connects by name. libkrun runs in our process and uses directory
 /// descriptors ([`vk_core::unixpath`]), as our other socket callers do, without this limit.
@@ -4536,9 +4575,8 @@ pub(crate) async fn boot_session(
 ) -> Result<VmSession> {
     let t_boot = Instant::now();
     let stem = image.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
-    let work = std::env::temp_dir().join(format!("virtkit-session-{}-{stem}", std::process::id()));
+    let work = private_session_dir(&std::env::temp_dir(), stem)?;
     check_state_dir_len(&work)?;
-    std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
     // The agent boots as PID 1 from a minimal initramfs (just `/init`), then pivots into
     // the ext4 root below — so the agent is never written into the built image. With
     // libkrun it is an unlinked scratch fd: `_cpio` keeps it open until the VMM child
@@ -6264,6 +6302,54 @@ mod tests {
         let out = std::fs::read(spec.serial_log.with_extension("vmm.log")).unwrap();
         assert_eq!(out, b"boot medium");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session directory someone else could have planted at the predictable name is not
+    /// used: not one that others can enter, and not a symlink to one.
+    #[test]
+    fn a_session_dir_is_private_and_never_one_planted_for_it() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let base = std::env::temp_dir().join(format!("vk-session-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let predicted = base.join(format!("virtkit-session-{}-stage", std::process::id()));
+        let private = |p: &Path| {
+            let m = std::fs::symlink_metadata(p).unwrap();
+            m.file_type().is_dir() && m.mode() & 0o777 == 0o700
+        };
+
+        // Free: created at the predicted name, 0700.
+        let made = private_session_dir(&base, "stage").unwrap();
+        assert_eq!(made, predicted);
+        assert!(private(&made));
+        // Left there by an earlier process with this pid: not taken either.
+        let again = private_session_dir(&base, "stage").unwrap();
+        assert_ne!(again, predicted);
+        assert!(private(&again));
+
+        // Planted open to everyone: another name, private.
+        std::fs::set_permissions(&predicted, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let other = private_session_dir(&base, "stage").unwrap();
+        assert_ne!(other, predicted);
+        assert!(private(&other));
+        let name = other.file_name().unwrap().to_str().unwrap().to_string();
+        assert!(name.starts_with(&format!("virtkit-session-{}-stage-", std::process::id())));
+
+        // Planted as a symlink to somewhere the planter controls: not followed.
+        std::fs::remove_dir(&predicted).unwrap();
+        let elsewhere = base.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &predicted).unwrap();
+        let third = private_session_dir(&base, "stage").unwrap();
+        assert_ne!(third, predicted);
+        assert!(private(&third));
+        assert!(std::fs::read_dir(&elsewhere).unwrap().next().is_none());
+        // SAFETY: geteuid(2) has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        assert_eq!(std::fs::metadata(&third).unwrap().uid(), me);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

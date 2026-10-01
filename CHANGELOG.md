@@ -15,6 +15,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: a build's stage guests get a private session directory.** It was created at a
+  predictable name in the shared temp dir and reused as found, so another local user could
+  plant it and take over the guest's exec channel and console log.
 - **Security: a guest can no longer reach host files outside a shared directory.** The
   virtio-fs server, used for every share on both backends, took any name a guest kernel sent:
   `..` or a path with `/` walked out of the share to whatever the VM's host user could read
