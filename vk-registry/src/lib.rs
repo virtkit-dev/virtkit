@@ -2307,13 +2307,23 @@ async fn handle(
     req: Request<Incoming>,
     state: Arc<ServerState>,
 ) -> Result<Response<Body>, Infallible> {
+    // Taken before `route` consumes the request: what the log line says the failure was on.
+    let (method, path) = (req.method().clone(), req.uri().path().to_string());
     Ok(route(req, state).await.unwrap_or_else(|e| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL",
-            &format!("{e:#}"),
-        )
+        // The chain names store paths and upstream URLs, which are the operator's to read,
+        // not the client's: the detail goes to the log, the client gets that it failed.
+        eprintln!("vk-registry: {method} {path}: {e:#}");
+        internal_error()
     }))
+}
+
+/// The answer to a request that failed on this server's side, saying nothing of why.
+fn internal_error() -> Response<Body> {
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "INTERNAL",
+        "internal error (details in the server log)",
+    )
 }
 
 async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Response<Body>> {

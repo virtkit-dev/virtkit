@@ -1595,3 +1595,44 @@ async fn a_blob_larger_than_one_chunk_streams_back_intact() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A failure on the server's side names the store's paths and the upstream's URL in its
+/// error chain; those go to the server's log, and the client is told only that it failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_side_failure_does_not_tell_the_client_why() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("leak");
+    // A port just freed, so nothing listens there: every relayed request fails on this side.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let upstream = format!("http://127.0.0.1:{closed}/private-upstream-path");
+    let state = Arc::new(ServerState {
+        store: Arc::new(Store::new(dir.clone()).unwrap()),
+        upstreams: vec![Upstream {
+            prefix: String::new(),
+            base: upstream,
+            username: None,
+            password: None,
+            client: reqwest::Client::new(),
+        }],
+        locks: LockManager::new(),
+        auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+        tls: None,
+        webdav: true,
+    });
+    let url = spawn(state);
+    let r = reqwest::Client::new()
+        .get(format!("{url}/v2/app/manifests/latest"))
+        .header(reqwest::header::ACCEPT, MANIFEST_TYPE)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    let body = r.text().await.unwrap();
+    assert!(!body.contains("private-upstream-path"), "{body}");
+    assert!(!body.contains(&dir.display().to_string()), "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
