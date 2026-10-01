@@ -2731,7 +2731,7 @@ pub fn live_supervisor_pid(ctx: &JobCtx) -> Option<i32> {
 /// [`live_supervisor_pid`] of the job in `job_dir`.
 pub fn live_supervisor_pid_in(job_dir: &Path) -> Option<i32> {
     let pid = read_pidfile(&JobCtx::supervisor_pidfile_in(job_dir))?;
-    pid_running(pid, &job_dir.to_string_lossy()).then_some(pid)
+    pid_running(pid, job_dir).then_some(pid)
 }
 
 /// Signal the job's supervisor and wait for it to go — everything it owns (the
@@ -2742,15 +2742,14 @@ pub fn stop_supervisor(ctx: &JobCtx) {
     let Some(pid) = live_supervisor_pid(ctx) else {
         return;
     };
-    let tag = ctx.job_dir.to_string_lossy().into_owned();
     unsafe { libc::kill(pid, libc::SIGTERM) };
     // the supervisor's own teardown runs the graceful guest shutdown; give it
     // that budget, the switch drain, and margin for the VMM fallback shutdown steps.
     let grace = Duration::from_secs(ctx.cfg.executor.vm.shutdown_timeout_secs + 15)
         + crate::run::SWITCH_STOP;
-    if !wait_gone(pid, &tag, grace) {
+    if !wait_gone(pid, &ctx.job_dir, grace) {
         unsafe { libc::kill(pid, libc::SIGKILL) };
-        wait_gone(pid, &tag, Duration::from_secs(3));
+        wait_gone(pid, &ctx.job_dir, Duration::from_secs(3));
     }
 }
 
@@ -3238,20 +3237,22 @@ fn read_pidfile(path: &Path) -> Option<i32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// A recorded pid counts as ours only while its cmdline still references the job
-/// dir — guards the kill/wait logic against pid reuse after a crash.
-fn pid_running(pid: i32, expect_in_cmdline: &str) -> bool {
+/// A recorded pid counts as ours only while one of its arguments is exactly the job dir —
+/// guards the kill/wait logic against pid reuse after a crash. Compared as whole arguments
+/// and as bytes: a substring of the command line would also match `/jobs/12` inside
+/// `/jobs/123`.
+fn pid_running(pid: i32, job_dir: &Path) -> bool {
     let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
-    String::from_utf8_lossy(&cmdline)
-        .replace('\0', " ")
-        .contains(expect_in_cmdline)
+    cmdline
+        .split(|&b| b == 0)
+        .any(|arg| arg == job_dir.as_os_str().as_bytes())
 }
 
-fn wait_gone(pid: i32, expect_in_cmdline: &str, timeout: Duration) -> bool {
+fn wait_gone(pid: i32, job_dir: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
-    while pid_running(pid, expect_in_cmdline) {
+    while pid_running(pid, job_dir) {
         if Instant::now() >= deadline {
             return false;
         }
@@ -3962,11 +3963,41 @@ mod tests {
         std::fs::write(ctx.supervisor_pidfile(), std::process::id().to_string()).unwrap();
         assert_eq!(live_supervisor_pid(&ctx), None);
 
-        // Positive control for that guard: the same pid does match a tag its cmdline
-        // carries, so the None above is the tag mismatch and not an unreadable /proc.
-        let exe = std::env::current_exe().unwrap();
-        let exe_name = exe.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(pid_running(std::process::id() as i32, &exe_name));
+        // Positive control for that guard: the same pid does match an argument it carries,
+        // so the None above is the tag mismatch and not an unreadable /proc. Only a whole
+        // argument matches.
+        let argv0 = std::env::args_os().next().unwrap();
+        let me = std::process::id() as i32;
+        assert!(pid_running(me, Path::new(&argv0)));
+        let cut = &argv0.as_bytes()[..argv0.len().saturating_sub(1)];
+        assert!(!pid_running(
+            me,
+            Path::new(std::ffi::OsStr::from_bytes(cut))
+        ));
+
+        // A live process naming a job dir that merely starts with this one's (`42` and
+        // `420`) is another job's, not this one's. A stand-in supervisor shows it; not a lone
+        // `sleep`, which a shell may exec in its own place, dropping the argument.
+        let other = ctx.job_dir.with_file_name("420");
+        let mut stand_in = Command::new("sh")
+            .args(["-c", "sleep 30; :", "sh"])
+            .arg(&other)
+            .spawn()
+            .unwrap();
+        let pid = stand_in.id() as i32;
+        // /proc/<pid>/cmdline reads empty until the new image's argv is set up.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pid_running(pid, &other) {
+            assert!(
+                Instant::now() < deadline,
+                "the stand-in never named its job dir"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::fs::write(ctx.supervisor_pidfile(), pid.to_string()).unwrap();
+        assert_eq!(live_supervisor_pid(&ctx), None);
+        stand_in.kill().unwrap();
+        stand_in.wait().unwrap();
 
         // An unparseable pidfile yields None, like an absent one.
         std::fs::write(ctx.supervisor_pidfile(), "not-a-pid").unwrap();

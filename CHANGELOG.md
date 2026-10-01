@@ -6,6 +6,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Cleaning up a GitLab job whose supervisor had died no longer risks stopping another
+  job's microVM** that reused its process id, when one job id is a prefix of the other
+  (such as 12 and 123).
 - **`vk run --state-dir` no longer fails with "state-dir … is in use" when a `vk list` or
   `vk stop` runs at the moment it starts.**
 
