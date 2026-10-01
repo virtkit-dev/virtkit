@@ -56,7 +56,7 @@ Pick one lowercase scope matching the component touched. Common scopes here:
 
 - `vk-core`, `vk-driver`, `vk-agent` — the three crates (use a module subscope for precision, e.g. `vk-driver/net:`).
 - `kernel` — the guest kernel config / build.
-- `ci` — GitHub Actions or GitLab CI.
+- `ci` — GitHub Actions.
 - A script's basename when the change is to that script, e.g. `build.sh:`, `build-kernel.sh:`, `update-kernel.sh:`.
 - `doc` — documentation. `tests` — test-only changes. `rust` — cross-cutting language/toolchain or dependency updates.
 

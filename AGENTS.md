@@ -190,13 +190,12 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
   against the built `vk`, then fast-forward `main`, push the `v*` tag and publish
   the GitHub release; see
   [`docs/releasing.md`](docs/releasing.md)), with reusable `quality.yml` (lint + test +
-  audit) and `build.yml`.
+  audit) and `build.yml`. A release is attested by rebuilding it from scratch in a `vk`
+  microVM and checking it matches the Docker build byte for byte (`build.sh --bootstrap-check`).
 - **End-to-end suite** (`tests/`): `VK=./dist/vk tests/release-e2e.sh` runs it against a
   local build — it needs KVM, e2fsprogs and network — and naming scripts narrows the run.
   Every other `tests/*.sh` is picked up by its glob, so adding one gates the next release
   with no registration step.
-- **GitLab** (`.gitlab-ci.yml`): reproducible build + independent rebuild attestation +
-  keyless Sigstore signing.
 
 Reproducibility is load-bearing: the binaries are baked into microVM images. Keep
 builds byte-deterministic (pinned toolchain/base image, `SOURCE_DATE_EPOCH`, path
