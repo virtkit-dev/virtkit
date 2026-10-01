@@ -1166,6 +1166,8 @@ struct Switch {
     upstreams: Arc<[SocketAddr]>,
     /// egress policy + the DNS-pinned IP set (shared with the ipstack egress tasks)
     egress: Arc<EgressGuard>,
+    /// gateway DNS lookups in flight, at most [`MAX_DNS_IN_FLIGHT`]
+    dns_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// How a consumer spawns its switch: the listen sockets (one per VM on the LAN),
@@ -1469,6 +1471,7 @@ pub async fn run(
         hosts: Arc::new(hosts),
         upstreams: upstreams.into(),
         egress: guard,
+        dns_slots: Arc::new(tokio::sync::Semaphore::new(MAX_DNS_IN_FLIGHT)),
     });
 
     // ipstack egress replies -> the owning VM port.
@@ -1692,9 +1695,17 @@ impl Switch {
                         let egress = self.egress.clone();
                         let (lan, upstreams, query) =
                             (self.cfg, self.upstreams.clone(), query.to_vec());
-                        tokio::spawn(handle_dns(
-                            query, hosts, upstreams, lan, cip, src_port, mac, tx, egress,
-                        ));
+                        // At the cap the query is dropped, as a lossy network would; the
+                        // resolver asks again.
+                        if let Ok(slot) = self.dns_slots.clone().try_acquire_owned() {
+                            tokio::spawn(async move {
+                                handle_dns(
+                                    query, hosts, upstreams, lan, cip, src_port, mac, tx, egress,
+                                )
+                                .await;
+                                drop(slot);
+                            });
+                        }
                     }
                 } else if let Some(rst) = self
                     .egress
@@ -1840,23 +1851,45 @@ impl Drain {
     }
 }
 
+/// The most guest flows one switch — one job's network — carries at once. Each holds a task
+/// and a host socket, a UDP one an ephemeral port too, so without a bound one guest could
+/// exhaust the host's ports and descriptors. Far past what a build or a test suite opens; a
+/// bound across all of a host's jobs is not this switch's to keep.
+const MAX_FLOWS: usize = 8192;
+
+/// The most gateway DNS lookups in flight at once: each holds upstream sockets for up to
+/// [`DNS_UPSTREAM_BUDGET`]. A query past it is dropped, which a resolver retries.
+const MAX_DNS_IN_FLIGHT: usize = 256;
+
 /// ipstack's accept loop: each guest flow becomes a host-side proxy, gated by the
 /// egress policy (static IP allowlist + DNS-pinned IPs).
 async fn accept_loop(mut ip_stack: IpStack, egress: Arc<EgressGuard>, drain: Arc<Drain>) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_FLOWS));
+    let mut refused: u64 = 0;
     loop {
-        match ip_stack.accept().await {
-            Ok(IpStackStream::Tcp(tcp)) => {
-                tokio::spawn(proxy_tcp(tcp, egress.clone(), drain.clone()));
-            }
-            Ok(IpStackStream::Udp(udp)) => {
-                tokio::spawn(proxy_udp(udp, egress.clone()));
-            }
-            Ok(_) => {} // UnknownTransport (ICMP, ...) / UnknownNetwork: dropped
+        let flow: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = match ip_stack.accept().await
+        {
+            Ok(IpStackStream::Tcp(tcp)) => Box::pin(proxy_tcp(tcp, egress.clone(), drain.clone())),
+            Ok(IpStackStream::Udp(udp)) => Box::pin(proxy_udp(udp, egress.clone())),
+            Ok(_) => continue, // UnknownTransport (ICMP, ...) / UnknownNetwork: dropped
             Err(e) => {
                 eprintln!("switch: ipstack accept: {e}");
                 return;
             }
-        }
+        };
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            // The flow is dropped unpolled, which resets it: the guest's connect fails, as
+            // on a host out of sockets.
+            if refused.is_multiple_of(1024) {
+                eprintln!("switch: {MAX_FLOWS} flows open — refusing new ones");
+            }
+            refused += 1;
+            continue;
+        };
+        tokio::spawn(async move {
+            flow.await;
+            drop(slot);
+        });
     }
 }
 
@@ -4476,6 +4509,7 @@ mod tests {
             hosts: Arc::new(HashMap::new()),
             upstreams: Vec::new().into(),
             egress: Arc::new(EgressGuard::new(policy, gw)),
+            dns_slots: Arc::new(tokio::sync::Semaphore::new(MAX_DNS_IN_FLIGHT)),
         };
         (sw, egress_rx)
     }
@@ -4488,6 +4522,31 @@ mod tests {
         frame.extend_from_slice(&ethertype.to_be_bytes());
         frame.extend_from_slice(ip);
         frame
+    }
+
+    /// A gateway DNS query past the in-flight cap is dropped, as a lossy network would; one
+    /// within it is answered.
+    #[tokio::test]
+    async fn dns_past_the_in_flight_cap_is_dropped() {
+        let ask = |slots: usize| async move {
+            let (mut sw, _egress) = one_vm_switch(Egress::new(&[], &[]).unwrap());
+            sw.hosts = Arc::new([("db".to_string(), Ipv4Addr::new(192, 168, 231, 9))].into());
+            sw.dns_slots = Arc::new(tokio::sync::Semaphore::new(slots));
+            let (tx, mut rx) = unbounded_channel();
+            sw.inner.lock().unwrap().ports.insert(0, tx);
+            let mut ip = Vec::new();
+            etherparse::PacketBuilder::ipv4([192, 168, 231, 2], [192, 168, 231, 1], 64)
+                .udp(5353, DNS_PORT)
+                .write(&mut ip, &dns_question(7, "db", 1))
+                .unwrap();
+            sw.handle_frame(0, &to_gw(&ip, ETHERTYPE_IPV4));
+            tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .ok()
+                .flatten()
+        };
+        assert!(ask(1).await.is_some(), "a query within the cap is answered");
+        assert!(ask(0).await.is_none(), "a query past the cap is dropped");
     }
 
     /// A VM cannot speak at layer 2 as its sibling: not from the sibling's MAC, and not in an

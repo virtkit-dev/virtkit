@@ -15,6 +15,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A guest can no longer exhaust the host's sockets through its network**: a job's switch
+  carries at most 8192 flows and 256 DNS lookups at once.
 - **Security: a VM on a job's network can no longer pose as another VM or as the gateway**
   (by its MAC, or in ARP) to intercept their traffic.
 - The switch drops an IPv4-typed frame that does not carry IPv4, and a non-DHCP datagram from
