@@ -28,6 +28,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: a `host_checkout` tree a guest could write is no longer reused.** With
+  `checkout_overlay = false` a job's guest could rewrite the checkout's `.git` config and have
+  the next job's host `git` run its commands; such a tree is now re-cloned.
 - `vk-registry`'s relay gives up on a stalled upstream (10 s to connect, 60 s with nothing
   read) and refuses a relayed manifest over 4 MiB.
 - **Security: the build cache no longer serves a COPY snapshot whose sources differed only in

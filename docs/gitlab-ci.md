@@ -248,7 +248,9 @@ Because that checkout is read-only for the job's life, the guest caches its path
 misses and directory listings for the whole job: `git status` or a build tool's dependency check
 walks the tree against the host once, and every later pass is answered from the guest's own
 cache. With `checkout_overlay = false` the share is read-write and keeps close-to-open
-consistency (attributes re-fetched after 5 s).
+consistency (attributes re-fetched after 5 s). Its tree, `.git` included, is then the guest's
+to rewrite, so the next job on the slot clones afresh rather than running the host's `git` in
+it: the read-write mode gives up the fetch-instead-of-clone reuse.
 
 Caching the paths is not the same as caching the files: a file the job reads still crosses
 virtio-fs once, and a tree of 100k small files costs about 20 s per pass that way. So with

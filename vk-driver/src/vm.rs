@@ -441,7 +441,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
         // re-clone.
         crate::checkout::gc_idle(&ctx.host_checkout_root(), cfg.checkout_cache_idle());
         println!("virtkit: host checkout of {sha} -> {}", dest.display());
-        // Another project's tree is not reused.
+        // A tree an earlier guest could write, or another project's, is not reused.
         crate::checkout::discard_if_untrusted(&dest, url)
             .with_context(|| format!("checking host checkout {}", dest.display()))?;
         // Bind the external bookkeeping to the destination before the clone fills it, so a
@@ -450,6 +450,10 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
             .with_context(|| format!("claiming host checkout {}", dest.display()))?;
         crate::checkout::ensure(url, ctx.ci_commit_ref.as_deref().unwrap_or(""), sha, &dest)
             .context("host checkout")?;
+        if !cfg.executor.checkout_overlay {
+            crate::checkout::mark_guest_writable(&dest)
+                .with_context(|| format!("marking host checkout {}", dest.display()))?;
+        }
         Some(guard)
     } else {
         None

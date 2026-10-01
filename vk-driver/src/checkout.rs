@@ -267,6 +267,8 @@ struct Sidecars {
     used: PathBuf,
     /// Names the filesystem identity of the checkout this bookkeeping dates.
     id: PathBuf,
+    /// Present once the tree has been shared read-write with a guest ([`mark_guest_writable`]).
+    guest_rw: PathBuf,
 }
 
 fn sidecars(dest: &Path) -> Result<Sidecars> {
@@ -292,6 +294,7 @@ fn sidecars(dest: &Path) -> Result<Sidecars> {
         lock: sidecar(".inuse"),
         used: sidecar(".used"),
         id: sidecar(".tree-id"),
+        guest_rw: sidecar(".guest-rw"),
         dir,
     })
 }
@@ -331,12 +334,32 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Remove `dest` before it is reused when it is a checkout of another project's remote — two
-/// projects whose slugs fold together — whose objects and refs the next job's guest would see.
-/// A fresh clone follows; called before [`claim`].
+/// Record that `dest` is about to be shared read-write with a job's guest
+/// (`checkout_overlay = false`). Kept beside the tree, where the guest cannot reach it: from
+/// here on everything under `dest`, `.git` included, is the guest's to rewrite, and
+/// [`discard_if_untrusted`] will not let a later job's host `git` run in it.
+pub(crate) fn mark_guest_writable(dest: &Path) -> Result<()> {
+    let s = sidecars(dest)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&s.guest_rw)
+        .map(drop)
+        .with_context(|| format!("writing {}", s.guest_rw.display()))
+}
+
+/// Remove `dest` before it is reused, when it is not a tree the host may run `git` in: one
+/// shared read-write with an earlier job's guest, whose `.git` config, hooks and attributes
+/// would run on the host the moment `fetch`, `reset` or `clean` read them; or a checkout of
+/// another project's remote — two projects whose slugs fold together — whose objects and refs
+/// the next job's guest would see. A fresh clone follows; called before [`claim`].
 pub(crate) fn discard_if_untrusted(dest: &Path, url: &str) -> Result<()> {
     let s = sidecars(dest)?;
-    let reason = if dest.exists()
+    let reason = if s.guest_rw.exists() {
+        "it was shared read-write with a guest"
+    } else if dest.exists()
         && origin_of(dest).as_deref().map(without_userinfo) != Some(without_userinfo(url))
     {
         "it is not a checkout of this project's remote"
@@ -353,6 +376,7 @@ pub(crate) fn discard_if_untrusted(dest: &Path, url: &str) -> Result<()> {
         Err(e) => return Err(e).with_context(|| format!("removing {}", dest.display())),
     }
     retire(&s.used, &s.id);
+    let _ = std::fs::remove_file(&s.guest_rw);
     Ok(())
 }
 
@@ -579,8 +603,8 @@ mod tests {
         );
     }
 
-    /// A tree of another remote is removed before reuse, and so is one whose `.git` names no
-    /// remote of ours: the host's `git` must run only in this project's checkout.
+    /// A tree shared read-write with a guest, or one of another remote, is removed before
+    /// reuse: the host's `git` must never run in a repository a guest could configure.
     #[test]
     fn an_untrusted_checkout_is_discarded_before_reuse() {
         let root = root("untrusted");
@@ -608,8 +632,16 @@ mod tests {
         discard_if_untrusted(&dest, url).unwrap();
         assert!(!dest.exists());
 
-        // A `.git` that is not a real directory names no remote of ours: removed.
+        // Shared read-write with a guest, whatever its remote now says: removed, once.
         init(url);
+        mark_guest_writable(&dest).unwrap();
+        discard_if_untrusted(&dest, url).unwrap();
+        assert!(!dest.exists());
+        init(url);
+        discard_if_untrusted(&dest, url).unwrap();
+        assert!(dest.exists(), "the mark goes with the tree it dated");
+
+        // A `.git` that is not a real directory names no remote of ours: removed.
         std::fs::remove_dir_all(dest.join(".git")).unwrap();
         std::os::unix::fs::symlink("/", dest.join(".git")).unwrap();
         discard_if_untrusted(&dest, url).unwrap();
