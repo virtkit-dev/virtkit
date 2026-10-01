@@ -481,8 +481,8 @@ pub async fn serve(opts: Options) -> Result<()> {
     if opts.open_browser {
         open_browser(&state, &link);
     }
-    let ui = Arc::new(crate::ui::Ui::new(hub, &origin, local));
-    crate::ui::serve(listener, ui).await
+    let ui = Arc::new(crate::ui::Ui::local(hub, &origin, local));
+    crate::ui::serve(listener, None, ui).await
 }
 
 /// Open `link` in the desktop's browser, as Jupyter does: through a page in the private state

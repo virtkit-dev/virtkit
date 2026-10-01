@@ -30,6 +30,13 @@ All notable changes to virtkit will be documented in this file.
   when it reconnects. `vk-hub nodes` shows what the hub asked beside what each host reports,
   which hosts have not caught up, and what a host says it cannot do; `vk-hub audit` lists
   every operator action and what the hosts made of it.
+- **Experimental: `vk-hub` has a web UI.** With `ui_addr` in its config, `vk-hub serve`
+  also serves live pages listing the fleet, each host's inventory, reports and commands, and
+  the audit log. An operator can set or lift a host's ceiling, stop and resume it taking
+  jobs, drain and undrain it, and quarantine and release it from its page, each recorded in
+  the audit log under the operator's session. `vk-hub ui login` prints a single-use link that
+  signs a browser in, as a viewer or with `--role operator`, for 12 hours; `vk-hub ui
+  sessions` and `vk-hub ui logout` list and end sessions.
 - **Experimental: `vk node join` and `vk node run` make a host a member of a fleet.**
   `vk node join https://hub --token -` enrolls the host with a `vk-hub` once, reading the
   token on stdin (or `--token-file`), and refuses while `vk check` fails on KVM, the VMM or

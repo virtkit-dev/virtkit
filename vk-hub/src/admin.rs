@@ -1,11 +1,12 @@
 //! The admin channel: a unix socket in the hub's data directory, through which `vk-hub token`,
-//! `vk-hub nodes` and `vk-hub local login`, `sessions` and `logout` reach the running hub.
+//! `vk-hub nodes`, `vk-hub ui` and `vk-hub local login`, `sessions` and `logout` reach the
+//! running hub.
 //!
 //! **Why a socket, and not an HTTP route or the database file.** Minting an enrollment token
 //! adds machines to the fleet, so it must not be reachable from the network the node
 //! listener faces — nor from the web UI, whose roles stop short of it: the socket is where
-//! the UI's own sign-in links are issued. Opening the database directly is out too: redb holds
-//! it exclusively for the life of the server, and `nodes` reports which sessions are open,
+//! the UI's own sign-in links are issued. Opening the database directly is out too: redb holds it
+//! exclusively for the life of the server, and `nodes` reports which sessions are open,
 //! which only the running server knows. A unix socket is reachable from this machine only,
 //! and gated twice, as `vk-registry`'s accounts socket is: it is `0600` from the moment it
 //! exists ([`vk_fs::bind_private`]), and every peer's `SO_PEERCRED` uid must be the hub's own
@@ -30,7 +31,6 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::ops;
 use crate::server::Hub;
-use crate::store::{Role, UiSession};
 use vk_fleet_proto::{Acquisition, Command, DesiredState, Operation};
 
 /// Bumped only for a change an older peer could misread.
@@ -112,6 +112,7 @@ pub struct CreatedToken {
 }
 
 use crate::ops::NodeView;
+use crate::store::{Role, UiSession};
 
 /// A web UI sign-in link, and when it stops working.
 #[derive(Debug, Serialize, Deserialize)]
@@ -268,7 +269,7 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
         }
         Call::UiLogin { role, ttl_secs } => {
             let Some(base) = &hub.ui_url else {
-                bail!("the web UI is not being served");
+                bail!("the web UI is off; set ui_addr in the hub's config to turn it on");
             };
             let (token, expires_at) = hub.db.create_login(
                 role,
@@ -276,7 +277,7 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
                 &actor,
                 crate::now_secs(),
             )?;
-            // The link is the credential and is never logged.
+            // Like an enrollment token, the link is the credential and is never logged.
             eprintln!(
                 "vk-hub: admin: {actor} issued a sign-in link for the {} role, valid for \
                  {ttl_secs}s",
@@ -521,7 +522,7 @@ mod tests {
         let call = br#"{"v":1,"call":{"op":"ui-login","role":"operator","ttl_secs":60}}"#;
         let hub = Hub::new(Arc::new(Db::open_memory().unwrap()));
         let err = dispatch(call, &hub, 0).unwrap_err();
-        assert!(format!("{err:#}").contains("not being served"), "{err:#}");
+        assert!(format!("{err:#}").contains("web UI is off"), "{err:#}");
         let hub = hub.with_ui_url(Some("https://hub.example".into()));
         let link: LoginLink = serde_json::from_value(dispatch(call, &hub, 1000).unwrap()).unwrap();
         let token = link

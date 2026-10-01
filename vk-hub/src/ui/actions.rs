@@ -15,6 +15,7 @@
 
 use std::ffi::OsString;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -26,7 +27,7 @@ use vk_fleet_proto::{Workload, WorkloadKind};
 
 use super::html::Html;
 use super::pages::{self, csrf_field};
-use super::{Auth, Body, Ui};
+use super::{Auth, Body, Ui, refused};
 use crate::local::{Action, Local};
 use crate::store::Role;
 
@@ -94,13 +95,18 @@ fn vm_command(w: &Workload, op: &str) -> Option<Vec<OsString>> {
 }
 
 /// `POST /vm/<id>/action`.
-pub(super) async fn vm_action(req: Request<Incoming>, ui: &Ui, id: &str) -> Result<Response<Body>> {
+pub(super) async fn vm_action(
+    req: Request<Incoming>,
+    ui: &Ui,
+    local: &Arc<Local>,
+    id: &str,
+) -> Result<Response<Body>> {
     let htmx = req.headers().contains_key("hx-request");
     let (auth, form) = match super::check_post(req, ui, Role::Operator).await? {
         Ok(checked) => checked,
         Err((status, text)) => return Ok(refused(htmx, status, text)),
     };
-    let Some((w, _)) = ui.local.workload(id) else {
+    let Some((w, _)) = local.workload(id) else {
         return Ok(refused(
             htmx,
             StatusCode::NOT_FOUND,
@@ -119,7 +125,14 @@ pub(super) async fn vm_action(req: Request<Incoming>, ui: &Ui, id: &str) -> Resu
         };
         return Ok(confirm(htmx, &auth, &format!("{back}/action"), op, what));
     }
-    run(ui, htmx, &auth, &key(&w), args, STOP_TIMEOUT, &back)
+    run(
+        ui,
+        local,
+        htmx,
+        &auth,
+        (&key(&w), args, STOP_TIMEOUT),
+        &back,
+    )
 }
 
 /// One row of `vk dev list --json`: the fields this page reads, whose names are that
@@ -225,8 +238,8 @@ async fn dev_rows(local: &Local) -> Result<Vec<DevRow>, String> {
 }
 
 /// `GET /dev`.
-pub(super) async fn dev_page(auth: &Auth, ui: &Ui) -> Response<Body> {
-    let rows = dev_rows(&ui.local).await;
+pub(super) async fn dev_page(auth: &Auth, local: &Local) -> Response<Body> {
+    let rows = dev_rows(local).await;
     let mut main = Html::new();
     main.raw("<h1>Dev environments</h1>");
     let steer = auth.session.role >= Role::Operator;
@@ -240,10 +253,10 @@ pub(super) async fn dev_page(auth: &Auth, ui: &Ui) -> Response<Body> {
         Ok(rows) if rows.is_empty() => {
             main.raw("<p class=\"empty\">This host keeps no dev environment.</p>");
         }
-        Ok(rows) => dev_table(&mut main, &rows, &ui.local, steer.then_some(auth)),
+        Ok(rows) => dev_table(&mut main, &rows, local, steer.then_some(auth)),
     }
     main.raw("<p class=\"sub\">Read as the page loads; <a href=\"/dev\">reload</a> for newer.</p>");
-    super::page(pages::layout("dev environments", auth, &main))
+    super::page(super::local::layout("dev environments", auth, &main))
 }
 
 fn dev_table(h: &mut Html, rows: &[DevRow], local: &Local, steer: Option<&Auth>) {
@@ -288,6 +301,7 @@ fn dev_table(h: &mut Html, rows: &[DevRow], local: &Local, steer: Option<&Auth>)
 pub(super) async fn dev_action(
     req: Request<Incoming>,
     ui: &Ui,
+    local: &Arc<Local>,
     name: &str,
 ) -> Result<Response<Body>> {
     let htmx = req.headers().contains_key("hx-request");
@@ -298,7 +312,7 @@ pub(super) async fn dev_action(
     let op = super::field(&form, "op").unwrap_or("").to_string();
     // As `vk dev list` has it now, so a start goes to its recorded workspace and a removal
     // only to one that is still stale.
-    let row = match dev_rows(&ui.local).await {
+    let row = match dev_rows(local).await {
         Ok(rows) => rows.into_iter().find(|r| r.name == name),
         Err(why) => {
             eprintln!("vk-hub: ui: {why}");
@@ -342,22 +356,28 @@ pub(super) async fn dev_action(
             what,
         ));
     }
-    run(ui, htmx, &auth, &dev_key(name), args, timeout, "/dev")
+    run(
+        ui,
+        local,
+        htmx,
+        &auth,
+        (&dev_key(name), args, timeout),
+        "/dev",
+    )
 }
 
 /// Start `args` as the session's action on `key`, and answer: for htmx, a line saying it
 /// started, swapped into the flash; else back to `back`.
 fn run(
     ui: &Ui,
+    local: &Arc<Local>,
     htmx: bool,
     auth: &Auth,
-    key: &str,
-    args: Vec<OsString>,
-    timeout: Duration,
+    (key, args, timeout): (&str, Vec<OsString>, Duration),
     back: &str,
 ) -> Result<Response<Body>> {
     let principal = auth.session.principal();
-    let started = ui.local.start(&ui.hub, key, args, timeout, &principal);
+    let started = local.start(&ui.hub, key, args, timeout, &principal);
     let command = match started {
         Ok(command) => command,
         Err(why) => return Ok(refused(htmx, StatusCode::CONFLICT, why)),
@@ -407,19 +427,7 @@ fn confirm(htmx: bool, auth: &Auth, path: &str, op: &str, what: &str) -> Respons
         .text(what)
         .raw("</p>")
         .html(&form);
-    super::page(pages::layout("confirm", auth, &main))
-}
-
-/// A refused action: for htmx, the line saying why, swapped in on its own.
-fn refused(htmx: bool, status: StatusCode, text: &'static str) -> Response<Body> {
-    if !htmx {
-        return super::message(status, text);
-    }
-    let mut h = Html::new();
-    h.raw("<div id=\"flash\" hx-swap-oob=\"true\" class=\"error\">")
-        .text(text)
-        .raw("</div>");
-    swap_none(super::html_response(status, h))
+    super::page(super::local::layout("confirm", auth, &main))
 }
 
 /// `resp` swapped out of band only: the page around the flash stays as it is.

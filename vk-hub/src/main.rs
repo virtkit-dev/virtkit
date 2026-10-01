@@ -9,7 +9,9 @@
 //!
 //! Experimental. The hub steers its nodes only within what each node's own configuration
 //! allows: a concurrency ceiling, stopping and resuming acquisition, drain and quarantine —
-//! all issued over the admin socket, audited, and resent to a node until it has them.
+//! all issued over the admin socket, audited, and resent to a node until it has them. A web
+//! UI on a listener of its own shows the fleet to people signed in with links the admin
+//! socket issues.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -50,7 +52,8 @@ struct Cli {
 /// directory whose admin socket they dial.
 #[derive(clap::Args)]
 struct ConfigArg {
-    /// hub.toml: addr, tls_cert, tls_key, data_dir [default: built-in defaults]
+    /// hub.toml: addr, tls_cert, tls_key, data_dir, ui_addr, ui_url, ui_tls_cert,
+    /// ui_tls_key [default: built-in defaults]
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 }
@@ -85,6 +88,13 @@ enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Sign in to the web UI, and see or end its sessions
+    Ui {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: UiCmd,
+    },
     /// Serve a web UI for this machine's VMs, signed into with a link it prints
     ///
     /// Runs as you and shows the VMs you run: pinned `vk run`s, dev environments and CI jobs.
@@ -104,6 +114,31 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum UiCmd {
+    /// Print a single-use link that opens a web UI session
+    ///
+    /// The link is a credential until it is used or expires: open it yourself, or hand it
+    /// only to whoever the session is for.
+    Login {
+        /// viewer (read only) or operator (also steers nodes)
+        #[arg(long, default_value = "viewer", value_parser = parse_role)]
+        role: store::Role,
+        /// How long the link stays valid: <n>s, <n>m or <n>h (at most 24h)
+        #[arg(long, default_value = "10m", value_parser = parse_ttl)]
+        ttl: Duration,
+    },
+    /// List the open web UI sessions
+    Sessions,
+    /// End a web UI session, as `vk-hub ui sessions` lists it, or every one
+    Logout {
+        #[arg(required_unless_present = "all")]
+        id: Option<String>,
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+    },
+}
+
 #[derive(clap::Args)]
 struct LocalArgs {
     /// The loopback port to serve on [default: one the system picks]
@@ -117,6 +152,7 @@ struct LocalArgs {
     vk: Option<std::path::PathBuf>,
 }
 
+/// `vk-hub local`'s own sign-in commands: `vk-hub ui`'s, for the local hub.
 #[derive(Subcommand)]
 enum LocalCmd {
     /// Print another single-use link that opens a session on the running `vk-hub local`
@@ -139,6 +175,16 @@ enum LocalCmd {
         #[arg(long, conflicts_with = "id")]
         all: bool,
     },
+}
+
+impl From<LocalCmd> for UiCmd {
+    fn from(cmd: LocalCmd) -> Self {
+        match cmd {
+            LocalCmd::Login { role, ttl } => UiCmd::Login { role, ttl },
+            LocalCmd::Sessions => UiCmd::Sessions,
+            LocalCmd::Logout { id, all } => UiCmd::Logout { id, all },
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -276,6 +322,13 @@ async fn run(cli: Cli) -> Result<()> {
                 Some(NodesCmd::Release { id }) => command(client, id, Operation::Release).await,
             }
         }
+        Cmd::Ui { config, cmd } => {
+            ui_cmd(
+                admin_client(&HubConfig::load(config.config.as_deref())?)?,
+                cmd,
+            )
+            .await
+        }
         Cmd::Local {
             state_dir,
             args,
@@ -299,7 +352,11 @@ async fn run(cli: Cli) -> Result<()> {
                 None => local::state_dir()?,
             };
             let socket = state_dir.join(local::ADMIN_SOCKET);
-            ui_cmd(admin_client_at(&socket, "vk-hub local` running")?, cmd).await
+            ui_cmd(
+                admin_client_at(&socket, "vk-hub local` running")?,
+                cmd.into(),
+            )
+            .await
         }
         Cmd::Audit {
             config,
@@ -353,7 +410,7 @@ fn report_desired(changed: Option<&vk_fleet_proto::DesiredState>) {
     }
 }
 
-fn acquisition_name(a: Acquisition) -> &'static str {
+pub(crate) fn acquisition_name(a: Acquisition) -> &'static str {
     match a {
         Acquisition::Run => "run",
         Acquisition::Stop => "stop",
@@ -363,12 +420,34 @@ fn acquisition_name(a: Acquisition) -> &'static str {
 async fn serve(cfg: HubConfig) -> Result<()> {
     let listener = server::listen(cfg.addr).with_context(|| format!("binding {}", cfg.addr))?;
     let tls = cfg.build_tls()?;
+    let ui = match &cfg.ui {
+        Some(ui) => Some((
+            server::listen(ui.addr).with_context(|| format!("binding ui_addr {}", ui.addr))?,
+            ui.build_tls()?,
+            ui,
+        )),
+        None => None,
+    };
     let db = Arc::new(store::Db::open(&cfg.db_path())?);
-    let hub = Arc::new(server::Hub::new(db));
+    let hub = Arc::new(server::Hub::new(db).with_ui_url(cfg.ui.as_ref().map(|ui| ui.url.clone())));
     // Fatal, unlike the registry's optional admin socket: here it is the only way to issue
     // a token, so a hub without it could never enroll anything.
     let admin = admin::bind(&cfg.admin_socket())?;
     tokio::spawn(admin::serve(admin, hub.clone()));
+    if let Some((listener, tls, ui)) = ui {
+        eprintln!(
+            "vk-hub: serving the web UI on {}://{} as {}",
+            if tls.is_some() { "https" } else { "http" },
+            ui.addr,
+            ui.url
+        );
+        let ui = Arc::new(ui::Ui::new(hub.clone(), &ui.url));
+        tokio::spawn(async move {
+            if let Err(e) = ui::serve(listener, tls, ui).await {
+                eprintln!("vk-hub: the web UI stopped: {e:#}");
+            }
+        });
+    }
     eprintln!(
         "vk-hub: serving nodes on {}://{} (data in {})",
         if tls.is_some() { "https" } else { "http" },
@@ -378,52 +457,47 @@ async fn serve(cfg: HubConfig) -> Result<()> {
     server::serve(listener, tls, hub).await
 }
 
-/// `vk-hub local login|sessions|logout`, over the running hub's admin socket.
-async fn ui_cmd(client: admin::Client, cmd: LocalCmd) -> Result<()> {
+/// `vk-hub ui login|sessions|logout`, and `vk-hub local`'s, over the running hub's admin
+/// socket.
+async fn ui_cmd(client: admin::Client, cmd: UiCmd) -> Result<()> {
     match cmd {
-        LocalCmd::Login { role, ttl } => {
+        UiCmd::Login { role, ttl } => {
             let link = tokio::task::spawn_blocking(move || client.ui_login(role, ttl)).await??;
-            // The link alone on stdout, so `$(vk-hub local login)` captures just it.
             println!("{}", link.url);
             eprintln!(
-                "vk-hub: single-use, valid for {}, signs a browser in as {}",
+                "vk-hub: single-use {} sign-in link, valid for {}; the session it opens \
+                 lasts {}",
+                role.name(),
                 human_duration(ttl),
-                role.name()
+                human_duration(store::UI_SESSION_TTL)
             );
         }
-        LocalCmd::Sessions => {
+        UiCmd::Sessions => {
             let sessions = tokio::task::spawn_blocking(move || client.ui_sessions()).await??;
-            print!("{}", render_sessions(&sessions));
+            let now = now_secs();
+            for s in sessions {
+                println!(
+                    "{}  {:<8}  signed in {}  expires in {}  link from {}",
+                    s.id,
+                    s.role.name(),
+                    utc(s.created_at),
+                    human_duration(ago(s.expires_at, now)),
+                    s.issued_by
+                );
+            }
         }
-        LocalCmd::Logout { id, all } => {
-            let id = if all { None } else { id };
+        UiCmd::Logout { id, all: _ } => {
+            // `--all` is `id` absent: clap requires one or the other.
+            let which = id.clone();
             let ended =
-                tokio::task::spawn_blocking(move || client.ui_logout(id.as_deref())).await??;
-            eprintln!("vk-hub: ended {ended} session(s)");
+                tokio::task::spawn_blocking(move || client.ui_logout(which.as_deref())).await??;
+            match (id, ended) {
+                (Some(id), 0) => bail!("there is no web UI session {id}"),
+                _ => eprintln!("vk-hub: ended {ended} web UI session(s)"),
+            }
         }
     }
     Ok(())
-}
-
-fn render_sessions(sessions: &[store::UiSession]) -> String {
-    if sessions.is_empty() {
-        return "no open sessions\n".to_string();
-    }
-    let mut out = format!(
-        "{:<14} {:<9} {:<21} {:<21} ISSUED BY\n",
-        "ID", "ROLE", "SINCE", "UNTIL"
-    );
-    for s in sessions {
-        out.push_str(&format!(
-            "{:<14} {:<9} {:<21} {:<21} {}\n",
-            s.id,
-            s.role.name(),
-            utc(s.created_at),
-            utc(s.expires_at),
-            s.issued_by
-        ));
-    }
-    out
 }
 
 /// The running fleet hub's admin socket.
@@ -475,108 +549,137 @@ fn parse_ttl(s: &str) -> Result<Duration, String> {
     Ok(ttl)
 }
 
-/// `vk-hub nodes`' table: what each node is, and for what the hub steers, what it wants beside
-/// what the node last reported.
-fn render_nodes(nodes: &[ops::NodeView], now: u64) -> String {
-    const HEADER: [&str; 13] = [
-        "ID",
-        "NAME",
-        "REACH",
-        "STATE",
-        "ACQUIRE",
-        "CEILING",
-        "CONC",
-        "SYNC",
-        "LAST SEEN",
-        "VK",
-        "CPUS",
-        "RAM",
-        "ADMITTED",
-    ];
+pub(crate) fn human_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        _ if s >= 86_400 && s.is_multiple_of(86_400) => format!("{}d", s / 86_400),
+        _ if s >= 3600 && s.is_multiple_of(3600) => format!("{}h", s / 3600),
+        _ if s >= 60 && s.is_multiple_of(60) => format!("{}m", s / 60),
+        _ => format!("{s}s"),
+    }
+}
+
+/// The columns of `vk-hub nodes`, and of the web UI's nodes table.
+pub(crate) const NODE_COLUMNS: [&str; 13] = [
+    "ID",
+    "NAME",
+    "REACH",
+    "STATE",
+    "ACQUIRE",
+    "CEILING",
+    "CONC",
+    "SYNC",
+    "LAST SEEN",
+    "VK",
+    "CPUS",
+    "RAM",
+    "ADMITTED",
+];
+
+/// One node's cells under [`NODE_COLUMNS`]: what it is, and for what the hub steers, what it
+/// wants beside what the node last reported.
+pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 13] {
     let gib = |mib: u64| format!("{}G", mib / 1024);
     let dash = || "-".to_string();
     let count = |n: Option<u32>| n.map_or_else(dash, |c| c.to_string());
-    let rows: Vec<[String; 13]> = nodes
+    let report = n.report.as_ref();
+    let concurrency = report.and_then(|r| r.concurrency);
+    // The hub's side, or its defaults when it has asked nothing.
+    let (want_acquisition, want_ceiling) = n
+        .desired
+        .as_ref()
+        .map_or((Acquisition::Run, None), |d| (d.acquisition, d.ceiling));
+    let mut state = report.map_or_else(dash, |r| store::state_name(r.state).to_string());
+    if n.pending_commands > 0 {
+        state.push_str(&format!(", {} pending", n.pending_commands));
+    }
+    let mut acquire = acquisition_name(want_acquisition).to_string();
+    if let Some(r) = report {
+        // A runner told to stop is still taking jobs until it has exited.
+        let quitting = r.runner_state == Some(vk_fleet_proto::RunnerState::Quitting);
+        if r.acquisition != want_acquisition || quitting {
+            acquire.push_str(&format!(
+                " (node: {}{})",
+                acquisition_name(r.acquisition),
+                if quitting { ", quitting" } else { "" }
+            ));
+        }
+    }
+    let mut ceiling = count(want_ceiling);
+    if let Some(c) = concurrency
+        && c.hub_ceiling != want_ceiling
+    {
+        ceiling.push_str(&format!(" (node: {})", count(c.hub_ceiling)));
+    }
+    let sync = match (&n.desired, report) {
+        (None, _) => dash(),
+        (Some(_), None) => "unknown".to_string(),
+        (Some(d), Some(r)) if r.applied_generation == Some(d.generation) => "ok".to_string(),
+        // A node that took a generation this hub never issued: the hub re-issues past it on
+        // the node's next report.
+        (Some(d), Some(r)) if r.applied_generation > Some(d.generation) => format!(
+            "ahead ({}>{})",
+            r.applied_generation.unwrap_or(0),
+            d.generation
+        ),
+        (Some(d), Some(r)) => format!(
+            "behind ({}<{})",
+            r.applied_generation.unwrap_or(0),
+            d.generation
+        ),
+    };
+    [
+        n.id.clone(),
+        n.hostname.clone(),
+        if n.connected {
+            "connected"
+        } else {
+            "unreachable"
+        }
+        .to_string(),
+        state,
+        acquire,
+        ceiling,
+        count(concurrency.and_then(|c| c.effective)),
+        sync,
+        match n.last_seen {
+            Some(t) => format!("{} ago", human_duration(ago(now, t))),
+            None => "never".to_string(),
+        },
+        n.vk.clone().unwrap_or_else(dash),
+        count(n.cpus),
+        n.mem_total_mib.map_or_else(dash, gib),
+        match (n.committed_mib, n.budget_mib) {
+            (Some(c), Some(b)) => format!("{}/{}", gib(c), gib(b)),
+            (Some(c), None) => format!("{}/-", gib(c)),
+            (None, _) => dash(),
+        },
+    ]
+}
+
+/// What a node says it cannot do: sentences, not cells.
+pub(crate) fn node_notes(n: &ops::NodeView) -> Vec<String> {
+    let Some(report) = &n.report else {
+        return Vec::new();
+    };
+    let mut notes: Vec<String> = report
+        .unsupported
         .iter()
-        .map(|n| {
-            let report = n.report.as_ref();
-            let concurrency = report.and_then(|r| r.concurrency);
-            // The hub's side, or its defaults when it has asked nothing.
-            let (want_acquisition, want_ceiling) = n
-                .desired
-                .as_ref()
-                .map_or((Acquisition::Run, None), |d| (d.acquisition, d.ceiling));
-            let mut state = report.map_or_else(dash, |r| store::state_name(r.state).to_string());
-            if n.pending_commands > 0 {
-                state.push_str(&format!(", {} pending", n.pending_commands));
-            }
-            let mut acquire = acquisition_name(want_acquisition).to_string();
-            if let Some(r) = report {
-                // A runner told to stop is still taking jobs until it has exited.
-                let quitting = r.runner_state == Some(vk_fleet_proto::RunnerState::Quitting);
-                if r.acquisition != want_acquisition || quitting {
-                    acquire.push_str(&format!(
-                        " (node: {}{})",
-                        acquisition_name(r.acquisition),
-                        if quitting { ", quitting" } else { "" }
-                    ));
-                }
-            }
-            let mut ceiling = count(want_ceiling);
-            if let Some(c) = concurrency
-                && c.hub_ceiling != want_ceiling
-            {
-                ceiling.push_str(&format!(" (node: {})", count(c.hub_ceiling)));
-            }
-            let sync = match (&n.desired, report) {
-                (None, _) => dash(),
-                (Some(_), None) => "unknown".to_string(),
-                (Some(d), Some(r)) if r.applied_generation == Some(d.generation) => {
-                    "ok".to_string()
-                }
-                // A node that took a generation this hub never issued: the hub re-issues past it
-                // on the node's next report.
-                (Some(d), Some(r)) if r.applied_generation > Some(d.generation) => format!(
-                    "ahead ({}>{})",
-                    r.applied_generation.unwrap_or(0),
-                    d.generation
-                ),
-                (Some(d), Some(r)) => format!(
-                    "behind ({}<{})",
-                    r.applied_generation.unwrap_or(0),
-                    d.generation
-                ),
-            };
-            [
-                n.id.clone(),
-                n.hostname.clone(),
-                if n.connected {
-                    "connected"
-                } else {
-                    "unreachable"
-                }
-                .to_string(),
-                state,
-                acquire,
-                ceiling,
-                count(concurrency.and_then(|c| c.effective)),
-                sync,
-                match n.last_seen {
-                    Some(t) => format!("{} ago", human_duration(ago(now, t))),
-                    None => "never".to_string(),
-                },
-                n.vk.clone().unwrap_or_else(dash),
-                count(n.cpus),
-                n.mem_total_mib.map_or_else(dash, gib),
-                match (n.committed_mib, n.budget_mib) {
-                    (Some(c), Some(b)) => format!("{}/{}", gib(c), gib(b)),
-                    (Some(c), None) => format!("{}/-", gib(c)),
-                    (None, _) => dash(),
-                },
-            ]
-        })
+        .map(|note| format!("{}: cannot comply: {note}", n.hostname))
         .collect();
-    let mut widths = HEADER.map(str::len);
+    if let Some(error) = &report.concurrency_error {
+        notes.push(format!(
+            "{}: cannot set its concurrency: {error}",
+            n.hostname
+        ));
+    }
+    notes
+}
+
+/// `vk-hub nodes`' table, with each node's notes under it.
+fn render_nodes(nodes: &[ops::NodeView], now: u64) -> String {
+    let rows: Vec<[String; 13]> = nodes.iter().map(|n| node_cells(n, now)).collect();
+    let mut widths = NODE_COLUMNS.map(str::len);
     for row in &rows {
         for (w, cell) in widths.iter_mut().zip(row) {
             *w = (*w).max(cell.chars().count());
@@ -595,36 +698,17 @@ fn render_nodes(nodes: &[ops::NodeView], now: u64) -> String {
         out.push_str(l.trim_end());
         out.push('\n');
     };
-    line(&HEADER);
+    line(&NODE_COLUMNS);
     for row in &rows {
         line(&row.each_ref().map(String::as_str));
     }
-    // What a node says it cannot do, under the table: sentences, not cells.
     for n in nodes {
-        let Some(report) = &n.report else {
-            continue;
-        };
-        for note in &report.unsupported {
-            out.push_str(&format!("{}: cannot comply: {note}\n", n.hostname));
-        }
-        if let Some(error) = &report.concurrency_error {
-            out.push_str(&format!(
-                "{}: cannot set its concurrency: {error}\n",
-                n.hostname
-            ));
+        for note in node_notes(n) {
+            out.push_str(&note);
+            out.push('\n');
         }
     }
     out
-}
-
-pub(crate) fn human_duration(d: Duration) -> String {
-    let s = d.as_secs();
-    match s {
-        _ if s >= 86_400 && s.is_multiple_of(86_400) => format!("{}d", s / 86_400),
-        _ if s >= 3600 && s.is_multiple_of(3600) => format!("{}h", s / 3600),
-        _ if s >= 60 && s.is_multiple_of(60) => format!("{}m", s / 60),
-        _ => format!("{s}s"),
-    }
 }
 
 /// `secs` since the epoch as `YYYY-MM-DDTHH:MM:SSZ`.

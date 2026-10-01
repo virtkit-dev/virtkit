@@ -5,8 +5,9 @@ Status: proposal, implemented in part and experimental: the list of the VMs a ho
 signed into with links it prints; enrollment, the node session, inventory and heartbeats;
 desired state (hub ceiling, stopping acquisition), drain and quarantine, with the node
 applying them and the hub auditing them (`vk-hub nodes ceiling`, `stop`, `resume`, `drain`,
-`undrain`, `quarantine`, `release`, `vk-hub audit`). Updates, resets, the GitLab API pause and
-the fleet's web UI are not built yet.
+`undrain`, `quarantine`, `release`, `vk-hub audit`); the web UI's live nodes, node and audit
+pages and its steering actions, signed into with links from `vk-hub ui login`. Updates,
+resets, the GitLab API pause and the rest of the web UI are not built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -331,53 +332,68 @@ In order of priority:
 
 Metrics for capacity, admission waits and node states are exported for Prometheus.
 
-Built so far, in [local mode](#local-mode): the server-rendered pages, their sign-in and the
-policy above, with the listener's timeouts on everything before a request is authenticated.
+Built so far: `ui_addr` in `hub.toml` turns the listener on — with its own `ui_tls_cert` and
+`ui_tls_key` or the node listener's pair, plain HTTP only on loopback, and the node
+listener's timeouts on everything before a request is authenticated. It serves the nodes
+table with the columns of `vk-hub nodes`, each node's inventory, report, desired state,
+commands and audit lines, and the audit log, filtered by node and paged. `ui_url` is the
+address browsers reach it at: sign-in links start with it, and a state-changing request's
+`Origin` must be it.
 
-Pages stay live over server-sent events. A fragment the same for everyone — the VMs table —
-is rendered by one task on a change and every page showing it is sent that one rendering; a
-page of one thing renders its own, woken by the changes it follows. A fragment is rendered at
-most once a second, and every five seconds regardless, and sent only when it differs, so a
-page with nothing new to show is sent nothing but a keep-alive comment every 15 seconds. When
-its session ends, a stream sends a fragment saying so and a `close` event, on which htmx's SSE
+The nodes table and a node's page stay live over server-sent events. The hub notes every
+heartbeat, report, session and command outcome and every desired-state change, by node. The
+nodes table is the same for everyone, so one task renders it on a change and every nodes page
+is sent that one rendering; a node's page is woken by changes to that node alone. A fragment
+is rendered at most once a second, and every heartbeat interval regardless — a node going
+quiet sends nothing — and sent only when it differs. Ages on the pages move in steps of a
+heartbeat, so a fleet with nothing new to report sends nothing but a keep-alive comment every
+15 seconds, and a node reporting faster than that changes nothing about the rate. When its
+session ends, a stream sends a fragment saying so and a `close` event, on which htmx's SSE
 extension (`sse-close`) stops reconnecting.
 
 Streams hold connections — the listener speaks HTTP/1.1 only, HTTP/2 not being in the build —
 so at most 96 of its 128 are streams and at most 6 belong to one session; past either a
 stream is refused with 429 or 503, which the SSE extension retries with its backoff, doubling
 from half a second to a minute. There is no per-address cap: the people using the UI are few
-and often share one proxy or NAT address.
+and often share one proxy or NAT address. An operator's node page carries the steering
+actions: a ceiling set or lifted, acquisition stopped or resumed, drain, undrain, quarantine,
+release. Each answers with the node's fragment re-rendered and a line saying what came of it;
+each also works as a plain form. Removing a node stays on the admin socket.
 
 htmx 2.0.7 and htmx-ext-sse 2.2.3 are vendored in `vk-hub/assets/` (`VENDOR.md` gives their
 sources and digests), embedded, and served under a hash of their content with a year's
 caching. htmx runs with `allowEval`, `allowScriptTags` and `includeIndicatorStyles` off and
 `selfRequestsOnly` on; the pages have no inline script or style for the policy to refuse.
-IDs the hub checks as hex are the only values in an attribute htmx reads; what the host
-reports goes only into text and plain attributes, escaped.
+Node IDs, issued by the hub and checked as hex — and in local mode the VM IDs `vk workloads`
+derives, checked the same way — are the only values in an attribute htmx reads; what nodes
+or the host send goes only into text and plain attributes, escaped.
 
 ### Signing in
 
-A person signs in with a single-use link — `<origin>/login?t=<token>` — that the hub prints,
-or issues over its admin socket: `vk-hub local login [--role viewer|operator] [--ttl 10m]`.
-The token is short-lived and stored hashed. Opening the link shows a "Sign in" button, and
-only the `POST` it makes — from the sign-in page itself, by `Sec-Fetch-Site` — spends the
-token, so a mail scanner or a chat's link preview fetching the link leaves it unused. The
-post opens a session: a random secret set as a cookie (`HttpOnly`, `SameSite=Strict`,
-`Path=/`, and `Secure` with the `__Host-` prefix over https), kept hashed in the database
-with its role, and valid for 12 hours. The page it answers moves on to `/` itself, so the
-token never stays in the address bar. `vk-hub local sessions` lists the sessions, `vk-hub
-local logout <id>|--all` ends them.
+A person signs in with a link `vk-hub ui login [--role viewer|operator] [--ttl 10m]` prints
+over the admin socket — `<ui_url>/login?t=<token>`; `vk-hub local` prints one as it starts,
+and `vk-hub local login` more. The token is single-use, short-lived and stored hashed, like
+an enrollment token. Opening the link shows a "Sign in" button, and only the `POST` it makes
+— from the sign-in page itself, by `Sec-Fetch-Site` — spends the token, so a mail scanner or
+a chat's link preview fetching the link leaves it unused. The post opens a session: a random
+secret set as a cookie (`HttpOnly`, `SameSite=Strict`, `Path=/`, and `Secure` with the
+`__Host-` prefix over https), kept hashed in the database with its role, and valid for 12
+hours. The page it answers moves on to `/` itself, so the token never stays in the address
+bar. `vk-hub ui sessions` (`vk-hub local sessions`) lists the sessions, `vk-hub ui logout
+<id>|--all` ends them.
 
 Browsers keep cookies apart by host, not by port. On plain http — which the UI serves only
 on loopback — the session cookie therefore goes to every other http service on that host,
 and any of them can set a cookie of the same name. The hub treats a request carrying two
-session cookies as signed in with neither, but cannot stop the first from being read: a UI
-on plain http is served under a name of its own (see [Local mode](#local-mode)).
+session cookies as signed in with neither, but cannot stop the first from being read: when
+anything else is served on the machine the UI is used from, give the UI TLS even on
+loopback (the hub's own certificate will do). Local mode serves under a name of its own
+instead (see [Local mode](#local-mode)).
 
 Every state-changing request is a `POST` from the UI's own origin — its `Origin`, or
 `Sec-Fetch-Site: same-origin` — carrying a CSRF token derived from the session's secret, and
 is done as the session's principal, `ui session <id> (<role>)`, which is what the audit log
-records.
+records. The operations are the admin socket's own, run by the same code.
 
 Links stand in for a login until people sign in through OIDC, with the identity layer the
 hub shares with `vk-registry` ([Authentication for submitted jobs](#authentication-for-submitted-jobs)),
@@ -424,12 +440,13 @@ unless `--no-browser` it opens the link with `xdg-open` through a page in that p
 directory, so the token never sits in a command line another local user can read. It runs
 `vk workloads --watch` — the `vk` beside it, else the one on `PATH` — for as long as it
 serves, starting it again with a backoff when it ends, and shows the list it prints, each VM
-with a page of its own, both kept live. A child rather than a command run again every few
-seconds, so the memory figures keep their own cadence; a list of a version the hub cannot
-read is refused rather than misread. A VM's page also shows its console's last hundred lines
-(`vk logs`), atop's account of a VM that records itself (`vk atop --summary`; one that does
-not is not attached to), and what a CI job's switch recorded of its egress (`vk
-egress-report`, plumbing), each read as the page loads.
+with a page of its own, both kept live the way the fleet's pages are, woken by each list. A
+child rather than a command run again every few seconds, so the memory figures keep their
+own cadence; a list of a version the hub cannot read is refused rather than misread. A VM's
+page also shows its console's last hundred lines (`vk logs`), atop's account of a VM that
+records itself (`vk atop --summary`; one that does not is not attached to), and what a CI
+job's switch recorded of its egress (`vk egress-report`, plumbing), each read as the page
+loads.
 
 An operator's session acts on them by running `vk` as a shell would: a pinned run is stopped
 (`vk stop`) or rebooted (`vk reboot`), named by the pid of its `vk run` — `vk stop <dir>`
@@ -455,15 +472,17 @@ browser is not built.
 - Runner authentication tokens stay on their nodes. The hub's GitLab credential is a separate
   one, scoped to managing runners (pause, resume, list).
 - Hub roles: viewer; operator (ceilings, drain, reset, rollouts); admin (enrollment,
-  redeploy). BMC credentials are held apart and used only by redeploys.
+  redeploy). BMC credentials are held apart and used only by redeploys. Admin is the admin
+  socket's: whoever runs as the hub's user or root, who also issues the web UI's sign-in
+  links; a web UI session is a viewer or an operator.
 - The web UI and the node endpoint are separate listeners with separate authentication.
   Every UI response carries `Content-Security-Policy: default-src 'self'; script-src 'self';
   style-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none';
   form-action 'self'; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`,
   `Referrer-Policy: same-origin` and, over https, `Strict-Transport-Security`; pages are
-  `no-store`. A request whose `Host` is not the UI's own is refused with 421, so a page on
-  another name that resolves to the UI's address reaches nothing (DNS rebinding); a reverse
-  proxy in front of the UI must pass the `Host` it was asked for.
+  `no-store`. A request whose `Host` is not `ui_url`'s — local mode's own name — is refused
+  with 421, so a page on another name that resolves to the UI's address reaches nothing (DNS
+  rebinding); a reverse proxy in front of the UI must pass the `Host` it was asked for.
 - The hub runs on its own host; its database and secrets are backed up, and a restored hub
   reconciles against the nodes before it sends anything: it sends desired state only in
   answer to a node's report of the generation it applied, and a node that reports one newer

@@ -71,10 +71,10 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with nine crates:
 - **`vk-hub/`** — the hub (bin, experimental). `vk-hub serve` is the fleet hub: it enrolls
   `vk node`s with single-use tokens, pins each node's ed25519 key, holds their WebSocket
   sessions and keeps their inventory and heartbeats in a redb database, along with the
-  desired state and commands it sends them. `vk-hub local` serves a web UI for the VMs of the
-  machine it runs on, read from `vk workloads --watch`, with sessions signed into by
-  single-use links. Either keeps an audit log. Built like the `vk-registry` server (hyper,
-  rustls on ring); operators reach it through a private unix socket. See
+  desired state and commands it sends them and an audit log. `vk-hub local` serves the same
+  web UI for the VMs of the machine it runs on, read from `vk workloads --watch`. Built like
+  the `vk-registry` server (hyper, rustls on ring); operators reach it through a private
+  unix socket and the web UI. See `docs/fleet-design.md`.
   `docs/fleet-design.md`.
 - **`vk-runnerctl/`** — the only component that runs as root, and deliberately the smallest:
   it sets gitlab-runner's `concurrent` from a number unprivileged `vk` leaves in a file,

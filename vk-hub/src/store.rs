@@ -6,8 +6,8 @@
 //! Consuming a token and pinning the node's key happen in one write transaction: a token
 //! enrolls exactly one node even with two enrollments racing on it. A token is looked up in a
 //! read transaction first, so an unauthenticated caller guessing at tokens costs the hub
-//! reads, never a durable write. The web UI's sign-in tokens and session cookies are kept the
-//! same way: by hash, a sign-in token spent in the write that opens its session.
+//! reads, never a durable write. The web UI's sign-in tokens and session cookies are kept
+//! the same way: by hash, a sign-in token spent in the write that opens its session.
 //!
 //! Every string a node or the host's `vk` reports is stored through
 //! [`vk_fleet_proto::display_safe`]: the database is where it crosses into the operator's
@@ -40,7 +40,6 @@ const COMMANDS: TableDefinition<&str, &[u8]> = TableDefinition::new("commands");
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 /// Key: `(node id, sequence number)` of each node's audit rows, so one node's log is a range.
 const AUDIT_BY_NODE: TableDefinition<(&str, u64), ()> = TableDefinition::new("audit_by_node");
-
 /// Key: `sha256(sign-in token)`, hex. Value: JSON [`LoginRow`].
 const UI_LOGINS: TableDefinition<&str, &[u8]> = TableDefinition::new("ui_logins");
 /// Key: `sha256(session secret)`, hex. Value: JSON [`UiSessionRow`].
@@ -64,8 +63,7 @@ const TOKEN_PREFIX: &str = "vkh_";
 /// a machine to the fleet; one that outlives its purpose by months is one somebody finds.
 pub const MAX_TOKEN_TTL: Duration = Duration::from_secs(30 * 86_400);
 
-/// Every web UI sign-in token starts with this, so one pasted into the wrong place is
-/// recognizable.
+/// Every web UI sign-in token starts with this.
 pub(crate) const LOGIN_PREFIX: &str = "vkl_";
 
 /// The longest-lived sign-in link: it is meant to be opened right away, by whoever asked
@@ -75,8 +73,8 @@ pub const MAX_LOGIN_TTL: Duration = Duration::from_secs(86_400);
 /// How long a web UI session lasts from sign-in: a working day, then a new link.
 pub const UI_SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 
-/// How many hex digits of a session's key name it: in `vk-hub local sessions`, and in the
-/// audit log as the principal of what it did.
+/// How many hex digits of a session's key name it: in `vk-hub ui sessions`, and in the audit
+/// log as the principal of what it did.
 const SESSION_ID_LEN: usize = 12;
 
 /// What a web UI session may do.
@@ -85,7 +83,8 @@ const SESSION_ID_LEN: usize = 12;
 pub enum Role {
     /// Read everything.
     Viewer,
-    /// And act: stop, start, reboot and remove VMs.
+    /// And act: steer nodes — ceilings, acquisition, drains, quarantines — or, in local
+    /// mode, stop, start, reboot and remove VMs.
     Operator,
 }
 
@@ -113,7 +112,7 @@ struct UiSessionRow {
     expires_at: u64,
 }
 
-/// A web UI session, as the UI and `vk-hub local sessions` see it.
+/// A web UI session, as the UI and `vk-hub ui sessions` see it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiSession {
     /// The start of its key, the hash of its secret: what names it, and no use as the
@@ -767,7 +766,8 @@ impl Db {
 
     /// Spend sign-in token `token` on a new web UI session. Returns the session's secret — the
     /// cookie, stored only as its hash — and the session, or `None` for a token that is
-    /// unknown, spent or expired. Looked up in a read first, so a guess costs no write.
+    /// unknown, spent or expired. Looked up in a read first, as an enrollment token is, so a
+    /// guess costs no write.
     pub fn redeem_login(&self, token: &str, now: u64) -> Result<Option<(String, UiSession)>> {
         let key = token_key(token);
         {
@@ -885,15 +885,34 @@ impl Db {
     }
 
     /// Up to `limit` audit lines older than sequence number `before` — all of them for
-    /// `None` — newest first, each with its sequence number for the next page.
-    pub fn audit_page(&self, before: Option<u64>, limit: usize) -> Result<Vec<(u64, AuditRow)>> {
+    /// `None` — of one node or of all, newest first, each with its sequence number for the
+    /// next page.
+    pub fn audit_page(
+        &self,
+        node: Option<&str>,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<(u64, AuditRow)>> {
         let before = before.unwrap_or(u64::MAX);
         let txn = self.db.begin_read().context("starting a read")?;
         let table = txn.open_table(AUDIT)?;
         let mut out = Vec::new();
-        for entry in table.range(..before)?.rev().take(limit) {
-            let (seq, value) = entry?;
-            out.push((seq.value(), decode::<AuditRow>(value.value())?));
+        match node {
+            None => {
+                for entry in table.range(..before)?.rev().take(limit) {
+                    let (seq, value) = entry?;
+                    out.push((seq.value(), decode::<AuditRow>(value.value())?));
+                }
+            }
+            Some(node) => {
+                let index = txn.open_table(AUDIT_BY_NODE)?;
+                for entry in index.range((node, 0)..(node, before))?.rev().take(limit) {
+                    let seq = entry?.0.value().1;
+                    if let Some(row) = table.get(seq)? {
+                        out.push((seq, decode::<AuditRow>(row.value())?));
+                    }
+                }
+            }
         }
         Ok(out)
     }
@@ -1114,12 +1133,6 @@ mod tests {
     use super::*;
 
     const DAY: Duration = Duration::from_secs(86_400);
-
-    fn audit(db: &Db, event: &str, at: u64) {
-        let txn = db.db.begin_write().unwrap();
-        append_audit(&txn, None, "uid 0", event, at).unwrap();
-        txn.commit().unwrap();
-    }
 
     #[test]
     fn a_token_enrolls_exactly_one_node() {
@@ -1518,15 +1531,20 @@ mod tests {
     fn the_audit_log_pages_back_newest_first() {
         let db = Db::open_memory().unwrap();
         for i in 0..5u64 {
-            audit(&db, &format!("event {i}"), i);
+            let node = if i % 2 == 0 { Some("a") } else { Some("b") };
+            let txn = db.db.begin_write().unwrap();
+            append_audit(&txn, node, "uid 0", &format!("event {i}"), i).unwrap();
+            txn.commit().unwrap();
         }
         let events = |rows: Vec<(u64, AuditRow)>| -> Vec<(u64, String)> {
             rows.into_iter().map(|(s, r)| (s, r.event)).collect()
         };
-        let first = events(db.audit_page(None, 2).unwrap());
+        let first = events(db.audit_page(None, None, 2).unwrap());
         assert_eq!(first, [(4, "event 4".into()), (3, "event 3".into())]);
-        let next = events(db.audit_page(Some(3), 2).unwrap());
+        let next = events(db.audit_page(None, Some(3), 2).unwrap());
         assert_eq!(next, [(2, "event 2".into()), (1, "event 1".into())]);
+        let a = events(db.audit_page(Some("a"), Some(4), 10).unwrap());
+        assert_eq!(a, [(2, "event 2".into()), (0, "event 0".into())]);
     }
 
     #[test]

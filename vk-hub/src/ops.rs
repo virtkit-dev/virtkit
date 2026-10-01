@@ -1,6 +1,7 @@
 //! What an operator does to the fleet, whichever way they reach the hub. Each operation takes
-//! the actor it is done as — `uid <n>` on the admin socket — which the store writes into the
-//! audit log beside the change, so every front end runs the same code and is audited alike.
+//! the actor it is done as — `uid <n>` on the admin socket, `ui session <id> (<role>)` in the
+//! web UI — which the store writes into the audit log beside the change, so every front end
+//! runs the same code and is audited alike.
 
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use vk_fleet_proto::{Acquisition, Command, DesiredState, Operation, Report};
 
 use crate::server::{Hub, Reach};
+use crate::store::NodeRow;
 
 /// How long an operator's command waits for its node to come and take it. A day covers a
 /// node rebooting or a hub outage; a drain found a week later is not what anyone meant.
@@ -41,31 +43,33 @@ pub fn node_views(hub: &Hub) -> Result<Vec<NodeView>> {
         .db
         .nodes()?
         .into_iter()
-        .map(|(id, row)| {
-            let reach = hub.reach(&id);
-            let inventory = row.inventory.as_ref();
-            let admission = row.heartbeat.as_ref().and_then(|h| h.admission.as_ref());
-            NodeView {
-                connected: reach == Reach::Connected,
-                hostname: row.hostname.clone(),
-                last_seen: row.last_seen,
-                vk: inventory.map(|i| i.versions.vk.clone()),
-                cpus: inventory.map(|i| i.hardware.cpus),
-                mem_total_mib: inventory.and_then(|i| i.hardware.mem_total_mib),
-                committed_mib: admission.map(|a| a.committed_mib),
-                budget_mib: admission.and_then(|a| a.budget_mib),
-                desired: row.desired.clone(),
-                report: row.report.clone(),
-                pending_commands: hub
-                    .db
-                    .pending_commands(&id, crate::now_secs())
-                    .map_or(0, |c| c.len()),
-                id,
-            }
-        })
+        .map(|(id, row)| node_view(hub, id, &row))
         .collect();
     views.sort_by(|a, b| (&a.hostname, &a.id).cmp(&(&b.hostname, &b.id)));
     Ok(views)
+}
+
+/// Node `id`'s row as `vk-hub nodes` shows it.
+pub fn node_view(hub: &Hub, id: String, row: &NodeRow) -> NodeView {
+    let inventory = row.inventory.as_ref();
+    let admission = row.heartbeat.as_ref().and_then(|h| h.admission.as_ref());
+    NodeView {
+        connected: hub.reach(&id) == Reach::Connected,
+        hostname: row.hostname.clone(),
+        last_seen: row.last_seen,
+        vk: inventory.map(|i| i.versions.vk.clone()),
+        cpus: inventory.map(|i| i.hardware.cpus),
+        mem_total_mib: inventory.and_then(|i| i.hardware.mem_total_mib),
+        committed_mib: admission.map(|a| a.committed_mib),
+        budget_mib: admission.and_then(|a| a.budget_mib),
+        desired: row.desired.clone(),
+        report: row.report.clone(),
+        pending_commands: hub
+            .db
+            .pending_commands(&id, crate::now_secs())
+            .map_or(0, |c| c.len()),
+        id,
+    }
 }
 
 /// Cap node `id`'s concurrency at `ceiling`, or lift the cap with `None`. The new desired
@@ -132,6 +136,7 @@ pub fn command(hub: &Hub, actor: &str, id: &str, operation: Operation) -> Result
         command.id
     );
     hub.kick(id);
+    hub.changed(id);
     Ok(command)
 }
 
@@ -145,6 +150,7 @@ fn desired_changed(hub: &Hub, actor: &str, id: &str, what: &str, changed: Option
                 desired.generation
             );
             hub.kick(id);
+            hub.changed(id);
         }
         None => eprintln!("vk-hub: node {id}: {actor} {what}: already so"),
     }

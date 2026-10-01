@@ -345,19 +345,27 @@ async fn record(
     let now = crate::now_secs();
     match msg {
         NodeMsg::Inventory(inventory) => {
-            tokio::task::spawn_blocking(move || db.record_inventory(&id, inventory, now)).await?
+            tokio::task::spawn_blocking(move || db.record_inventory(&id, inventory, now)).await??;
+            hub.changed(&node.id);
+            Ok(())
         }
         NodeMsg::Heartbeat(heartbeat) => {
-            tokio::task::spawn_blocking(move || db.record_heartbeat(&id, heartbeat, now)).await?
+            tokio::task::spawn_blocking(move || db.record_heartbeat(&id, heartbeat, now)).await??;
+            hub.changed(&node.id);
+            Ok(())
         }
         NodeMsg::Report(report) => {
             steer.applied = Some(report.applied_generation);
             tokio::task::spawn_blocking(move || db.record_report(&id, report, now)).await??;
+            hub.changed(&node.id);
             steer.sync(ws, hub, node).await
         }
         NodeMsg::Ack(ack) => {
             let recorded = ack.clone();
-            tokio::task::spawn_blocking(move || db.record_ack(&id, &ack, now)).await??;
+            let news = tokio::task::spawn_blocking(move || db.record_ack(&id, &ack, now)).await??;
+            if news {
+                hub.changed(&node.id);
+            }
             // Answered whether or not the command is one this hub issued: an ack for an unknown
             // one would otherwise be repeated for ever.
             send(ws, &HubMsg::Recorded(recorded)).await
