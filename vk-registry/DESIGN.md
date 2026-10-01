@@ -361,6 +361,9 @@ All lock operations use `POST` and repeat names as `?name=` parameters:
 | `/lock/fail` | `ttl`, `X-Vk-Lock-Pipeline`, reason body | records a failed build |
 | `/lock/fail-status` | `X-Vk-Lock-Pipeline` | recent matching failure |
 
+A lease is granted for at most 24 hours and `acquire` long-polls for at most 24 hours,
+whatever `ttl` and `wait` ask.
+
 Acquiring multiple names is atomic and all-or-nothing under one mutex. A batch cannot
 deadlock through inconsistent client lock ordering, and all names share one owner token.
 Contended acquisition long-polls until the names become available or the wait expires.
