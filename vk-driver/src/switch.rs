@@ -1078,17 +1078,40 @@ impl RateLimiter {
 }
 
 /// A destination no network carries, decided from the address alone: RFC 5737 documentation
-/// ranges, `0.0.0.0/8`, loopback, link-local, multicast and broadcast. Forwarding such a SYN
-/// only buys the guest a handshake ipstack completes locally and a host dial that fails a
-/// few seconds later — a connect that wrongly succeeds, where a real network refuses at once.
+/// ranges, `0.0.0.0/8`, loopback, link-local, multicast and broadcast. Most of these only buy
+/// the guest a handshake ipstack completes locally and a host dial that fails a few seconds
+/// later. Loopback and link-local are worse: the host dials them as its own, so a guest would
+/// reach the host's localhost services and a cloud's metadata endpoint (169.254.169.254).
+/// Refused whatever the egress policy, for TCP and UDP alike ([`refuse_unroutable`]).
 /// Private ranges are deliberately absent: a guest reaching the host's LAN is ordinary.
 fn unroutable(dst: Ipv4Addr) -> bool {
     dst.is_documentation()
-        || dst.is_unspecified()
+        || dst.octets()[0] == 0
         || dst.is_loopback()
         || dst.is_link_local()
         || dst.is_multicast()
         || dst.is_broadcast()
+}
+
+/// Refuse [`unroutable`] destinations before the host dials. IPv6 checks cover loopback,
+/// unspecified, multicast, link-local (`fe80::/10`), and IPv4-mapped unroutable addresses
+/// as defence in depth: egress is IPv4-only. Log refusals without recording denials,
+/// since these are not policy decisions.
+fn refuse_unroutable(proto: &str, dst: SocketAddr) -> bool {
+    let refused = match dst.ip() {
+        IpAddr::V4(v4) => unroutable(v4),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unicast_link_local()
+                || v6.to_ipv4_mapped().is_some_and(unroutable)
+        }
+    };
+    if refused {
+        eprintln!("switch: unroutable destination ({proto}) {dst} — dropped");
+    }
+    refused
 }
 
 #[derive(Default)]
@@ -1806,6 +1829,7 @@ fn proxy_tcp(
         // own host service, and it never touches the guest's credentials).
         let target = match egress.registry_proxy {
             Some((sentinel, host)) if dst.ip() == IpAddr::V4(sentinel) => host,
+            _ if refuse_unroutable("tcp", dst) => return,
             // Fallback deny path: a denied SYN is normally RST'd earlier in
             // `reject_denied_syn` before ipstack completes the handshake, so a denial here only
             // fires for a flow that slipped through (e.g. a DNS pin expiring between the SYN
@@ -2221,7 +2245,9 @@ fn set_sock_opt(
 async fn proxy_udp(mut guest: ipstack::IpStackUdpStream, egress: Arc<EgressGuard>) {
     let dst = guest.peer_addr();
     let src = guest_src(guest.local_addr());
-    if !egress.admit_flow(crate::egress_report::Proto::Udp, src, dst) {
+    if refuse_unroutable("udp", dst)
+        || !egress.admit_flow(crate::egress_report::Proto::Udp, src, dst)
+    {
         return;
     }
     let bind: SocketAddr = if dst.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }
@@ -3086,16 +3112,17 @@ struct TcpSyn {
 }
 
 /// Parse `ip` (an IPv4 packet, no ethernet header) as a connection-opening TCP
-/// segment. `Some` only for a pure SYN (SYN set, ACK clear) — the packet that
-/// opens a connection; SYN-ACKs, retransmits carrying ACK, and mid-flow segments
-/// return `None` so only the initial handshake is ever rejected.
+/// segment: `Some` for any segment with SYN set, whatever else is. ipstack opens a session —
+/// and the host dials — for any SYN it sees, ACK or not, and nothing beyond the gateway ever
+/// sends the guest a SYN for it to answer, so a SYN-ACK from the guest is an opening too and
+/// must meet the same policy. Mid-flow segments return `None`.
 fn parse_tcp_syn(ip: &[u8]) -> Option<TcpSyn> {
     let v4 = etherparse::Ipv4Slice::from_slice(ip).ok()?;
     if v4.header().protocol() != etherparse::IpNumber::TCP {
         return None;
     }
     let tcp = etherparse::TcpHeaderSlice::from_slice(v4.payload().payload).ok()?;
-    if !tcp.syn() || tcp.ack() {
+    if !tcp.syn() {
         return None;
     }
     Some(TcpSyn {
@@ -4173,7 +4200,7 @@ mod tests {
         let a = Ipv4Addr::new(192, 168, 231, 2);
         let b = Ipv4Addr::new(10, 10, 140, 49);
 
-        // A SYN-ACK (handshake reply) does not open a connection from the guest.
+        // ipstack accepts SYN with ACK set, so SYN-ACKs need the same gate as SYNs.
         let mut synack = Vec::new();
         etherparse::PacketBuilder::ipv4(a.octets(), b.octets(), 64)
             .tcp(44444, 443, 1, 64240)
@@ -4181,7 +4208,7 @@ mod tests {
             .ack(99)
             .write(&mut synack, &[])
             .unwrap();
-        assert!(parse_tcp_syn(&synack).is_none(), "SYN-ACK is not rejected");
+        assert!(parse_tcp_syn(&synack).is_some(), "SYN-ACK is an opening");
 
         // A plain ACK (mid-flow segment) is ignored.
         let mut ack = Vec::new();
@@ -5343,6 +5370,39 @@ mod tests {
     }
 
     #[test]
+    fn the_host_is_never_dialled_at_loopback_or_link_local() {
+        let refused = |s: &str| refuse_unroutable("test", s.parse().unwrap());
+        assert!(refused("127.0.0.1:2375"));
+        assert!(refused("169.254.169.254:80"));
+        assert!(refused("169.254.169.254:53"));
+        assert!(refused("[::1]:22"));
+        assert!(refused("[fe80::1]:22"));
+        assert!(refused("[::ffff:127.0.0.1]:22"));
+        assert!(refused("[::]:53"));
+        assert!(!refused("10.1.2.3:443"));
+        assert!(!refused("[2001:db8::1]:443"));
+        assert!(!refused("1.1.1.1:53"));
+
+        // Under the default open policy, a loopback SYN-ACK gets a RST just like a SYN.
+        let gw = Ipv4Addr::new(192, 168, 231, 1);
+        let guest = Ipv4Addr::new(192, 168, 231, 2);
+        let guard = EgressGuard::new(Egress::new(&[], &[]).unwrap(), gw);
+        let mut synack = Vec::new();
+        etherparse::PacketBuilder::ipv4(guest.octets(), [127, 0, 0, 1], 64)
+            .tcp(44444, 2375, 1, 64240)
+            .syn()
+            .ack(99)
+            .write(&mut synack, &[])
+            .unwrap();
+        assert!(
+            guard
+                .reject_denied_syn(&synack, [0x52, 0x54, 0x00, 0xaa, 0xbb, 0xcc])
+                .is_some(),
+            "a SYN-ACK to loopback must be refused"
+        );
+    }
+
+    #[test]
     fn unroutable_covers_reserved_space_but_not_the_lan() {
         let u = |s: &str| unroutable(s.parse().unwrap());
         // RFC 5737 documentation ranges — what a test dials when it wants nowhere.
@@ -5350,6 +5410,7 @@ mod tests {
         assert!(u("198.51.100.1"));
         assert!(u("203.0.113.1"));
         assert!(u("0.0.0.0"));
+        assert!(u("0.1.2.3"));
         assert!(u("127.0.0.1"));
         assert!(u("169.254.1.1"));
         assert!(u("224.0.0.1"));

@@ -19,6 +19,10 @@ All notable changes to virtkit will be documented in this file.
   a request.** Request headers must arrive within 30 seconds, also on an idle kept-alive
   connection; a TLS handshake must finish within 10 seconds; at most 1024 connections, 256
   per client address (an IPv6 /64), are served at once.
+- **Security: a guest can no longer reach the host's loopback or link-local addresses**,
+  such as services bound to `127.0.0.1` or a cloud's metadata endpoint at `169.254.169.254`,
+  whatever the egress policy allows. Some TCP connections and all UDP traffic could reach
+  them before.
 - **`vk-registry gc` collects a store that holds a tagged image index**, such as a
   multi-arch image pulled through the relay. It used to refuse the whole pass; it now keeps
   the index's per-platform manifests and their layers.
