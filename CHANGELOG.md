@@ -34,6 +34,11 @@ All notable changes to virtkit will be documented in this file.
   value. The cache-key version is bumped, so the first build after upgrading starts cold.
 - **Security: a pull or build no longer waits forever on an image lock another local user
   holds**; it fails, naming that user's uid, or saying the holder does not answer.
+- **Security: a `host_checkout` tree is no longer shared between projects.** Checkouts were
+  kept per folded project name, so two projects whose names folded together shared one, and
+  the second project's guest could read the first's objects. They are now kept per project
+  id, and one whose remote is another project's is re-cloned; existing checkouts are re-cloned
+  once, and the old ones are reclaimed after the idle window.
 - **A guest-written disk image can no longer crash the host's `vk` or make it allocate
   gigabytes** when `vk` reads the image (for a `FROM --kernel=image` stage, or a job's
   `/etc/passwd`): its geometry, links and extents are now checked, and every file read
