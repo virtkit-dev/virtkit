@@ -34,8 +34,12 @@ type ProxyBody = BoxBody<Bytes, std::io::Error>;
 
 /// What the proxy forwards to and injects.
 pub struct ProxyCfg {
-    /// upstream base URL, `scheme://authority` (no trailing slash)
-    pub upstream: String,
+    /// The upstream's base URL, optionally with a path prefix (no trailing slash).
+    upstream: String,
+    /// The parsed upstream, whose origin every forwarded request must keep
+    base: reqwest::Url,
+    /// `base`'s path followed by `/v2/`: the prefix every forwarded path must start with
+    api: String,
     /// The credential injected into every forwarded request, so the job stays
     /// credential-free — and the trust anchor `client` was built against.
     pub creds: Creds,
@@ -43,8 +47,8 @@ pub struct ProxyCfg {
 }
 
 impl ProxyCfg {
-    /// Build from the `vk run --registry-proxy` flags: `upstream` is the full base URL
-    /// (`scheme://host`), `creds` both what to inject and what TLS to trust.
+    /// Build from the `vk run --registry-proxy` flags: `upstream` is the base URL,
+    /// optionally with a path prefix, `creds` both what to inject and what TLS to trust.
     pub fn from_parts(upstream: &str, creds: Creds) -> Result<Self> {
         Self::build(upstream.trim_end_matches('/').to_string(), creds)
     }
@@ -64,6 +68,16 @@ impl ProxyCfg {
     }
 
     fn build(upstream: String, creds: Creds) -> Result<Self> {
+        let base = reqwest::Url::parse(&upstream)
+            .with_context(|| format!("parsing the registry proxy upstream {upstream:?}"))?;
+        anyhow::ensure!(
+            matches!(base.scheme(), "http" | "https")
+                && base.has_host()
+                && base.query().is_none()
+                && base.fragment().is_none(),
+            "the registry proxy upstream {upstream:?} is not an http(s) URL"
+        );
+        let api = format!("{}/v2/", base.path().trim_end_matches('/'));
         let mut b = reqwest::Client::builder();
         if let Some(pem) = &creds.ca_pem {
             b = b.add_root_certificate(
@@ -76,6 +90,8 @@ impl ProxyCfg {
         }
         Ok(ProxyCfg {
             upstream,
+            base,
+            api,
             creds,
             client: b.build().context("building the registry proxy client")?,
         })
@@ -147,6 +163,30 @@ async fn handle(
     }))
 }
 
+/// The upstream URL a guest's request target names, or `None` when, once resolved, it is not
+/// under the upstream's own `/v2/`. Checked after resolving, not on the text: the URL parser
+/// resolves `..` and its percent-encoded spellings (`%2e%2e`), so `/v2/../lock/acquire` starts
+/// with `/v2/` and still reaches `/lock/acquire`, carrying the credential.
+fn upstream_url(cfg: &ProxyCfg, path_and_query: &str) -> Option<reqwest::Url> {
+    if !path_and_query.starts_with("/v2/") {
+        return None;
+    }
+    // An encoded separator stays encoded through the parser, so `/v2/..%2Flock` passes the
+    // check below — and reaches `/lock` through a front proxy that decodes `%2F`/`%5C` once
+    // before normalizing. No repository or reference has one, so the path may not carry it.
+    // A raw `\` is already read as `/` for http(s) and caught below; refusing it here too is
+    // belt-and-braces for a front proxy that sees the text before that.
+    let path = path_and_query
+        .split_once('?')
+        .map_or(path_and_query, |(p, _)| p);
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("%2f") || lower.contains("%5c") || path.contains('\\') {
+        return None;
+    }
+    let url = reqwest::Url::parse(&format!("{}{path_and_query}", cfg.upstream)).ok()?;
+    (url.origin() == cfg.base.origin() && url.path().starts_with(&cfg.api)).then_some(url)
+}
+
 /// Headers that must not be copied across the proxy (connection-scoped, credential-bearing,
 /// or ones we set ourselves).
 fn is_skipped(name: &str) -> bool {
@@ -173,7 +213,7 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
     // OCI distribution API surface (`/v2/…`). A guest-chosen path outside it — a foreign
     // authority smuggled via `//host`, or the `/lock/` control plane — is refused rather
     // than authenticated on the guest's behalf.
-    if !path_and_query.starts_with("/v2/") {
+    let Some(url) = upstream_url(cfg, &path_and_query) else {
         let body = Full::new(Bytes::from_static(
             b"registry proxy: only /v2/ registry paths are proxied",
         ))
@@ -182,13 +222,12 @@ async fn forward(req: Request<Incoming>, cfg: &ProxyCfg) -> Result<Response<Prox
         return Ok(Response::builder()
             .status(StatusCode::FORBIDDEN)
             .body(body)?);
-    }
-    let url = format!("{}{path_and_query}", cfg.upstream);
+    };
     let method = req.method().clone();
     let bodyful = matches!(method, Method::POST | Method::PUT | Method::PATCH);
     let (parts, incoming) = req.into_parts();
 
-    let mut rb = cfg.client.request(method, &url);
+    let mut rb = cfg.client.request(method, url);
     for (k, v) in parts.headers.iter() {
         if !is_skipped(&k.as_str().to_ascii_lowercase()) {
             rb = rb.header(k, v);
@@ -279,21 +318,25 @@ mod tests {
         (addr, seen)
     }
 
+    /// A proxy to the upstream at `up_addr` that injects the Basic pair `robot:s3cret`.
+    fn basic_cfg(up_addr: SocketAddr) -> ProxyCfg {
+        ProxyCfg::build(
+            format!("http://{up_addr}"),
+            Creds {
+                username: Some("robot".to_string()),
+                password: Some("s3cret".to_string()),
+                ..Creds::anonymous()
+            },
+        )
+        .unwrap()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn injects_basic_auth_and_forwards_path() {
         // reqwest (rustls-no-provider) needs a crypto provider before a client builds.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (up_addr, seen) = fake_upstream();
-        let cfg = ProxyCfg {
-            upstream: format!("http://{up_addr}"),
-            creds: Creds {
-                username: Some("robot".to_string()),
-                password: Some("s3cret".to_string()),
-                ..Creds::anonymous()
-            },
-            client: reqwest::Client::new(),
-        };
-        let proxy = spawn_blocking(cfg).unwrap();
+        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
 
         // the "guest" hits the proxy with NO credentials.
         let r = reqwest::Client::new()
@@ -307,7 +350,7 @@ mod tests {
         let (auth, path) = seen.lock().unwrap().clone();
         assert_eq!(
             path, "/v2/app/manifests/latest",
-            "path must be forwarded verbatim"
+            "path must be forwarded as resolved"
         );
         // Basic base64("robot:s3cret") = cm9ib3Q6czNjcmV0
         assert_eq!(
@@ -323,17 +366,17 @@ mod tests {
     async fn injects_a_bearer_token_ahead_of_the_basic_pair() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (up_addr, seen) = fake_upstream();
-        let cfg = ProxyCfg {
-            upstream: format!("http://{up_addr}"),
-            creds: Creds {
+        let cfg = ProxyCfg::build(
+            format!("http://{up_addr}"),
+            Creds {
                 // Both set: the token wins, as it does on every other client path.
                 username: Some("robot".to_string()),
                 password: Some("s3cret".to_string()),
                 token: Some("vkr_x".to_string()),
                 ..Creds::anonymous()
             },
-            client: reqwest::Client::new(),
-        };
+        )
+        .unwrap();
         let proxy = spawn_blocking(cfg).unwrap();
 
         let r = reqwest::Client::new()
@@ -354,16 +397,7 @@ mod tests {
     async fn refuses_paths_outside_v2() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let (up_addr, seen) = fake_upstream();
-        let cfg = ProxyCfg {
-            upstream: format!("http://{up_addr}"),
-            creds: Creds {
-                username: Some("robot".to_string()),
-                password: Some("s3cret".to_string()),
-                ..Creds::anonymous()
-            },
-            client: reqwest::Client::new(),
-        };
-        let proxy = spawn_blocking(cfg).unwrap();
+        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
 
         // a path outside /v2/ (here the lock control plane) is refused with 403 and never
         // reaches the upstream — the host credential is never lent to it.
@@ -377,6 +411,87 @@ mod tests {
             seen.lock().unwrap().0,
             "",
             "a non-/v2/ request must not be forwarded upstream"
+        );
+    }
+
+    #[test]
+    fn a_target_is_checked_once_resolved() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cfg = |up: &str| ProxyCfg::build(up.to_string(), Creds::anonymous()).unwrap();
+        let up = cfg("http://reg.example:5000");
+        let ok = |t: &str| upstream_url(&up, t).map(|u| u.to_string());
+        assert_eq!(
+            ok("/v2/app/manifests/latest").as_deref(),
+            Some("http://reg.example:5000/v2/app/manifests/latest")
+        );
+        for escape in [
+            "/v2/../lock/acquire?name=x",
+            "/v2/%2e%2e/lock/acquire",
+            "/v2/.%2E/lock/acquire",
+            "/v2/a/../../lock/release",
+            "/v2/..%2Flock/acquire",
+            "/v2/..%2flock/acquire",
+            "/v2/..%5Clock/acquire",
+            "/v2/..\\lock/acquire",
+            "//evil.example/v2/x",
+            "/lock/acquire",
+        ] {
+            assert_eq!(ok(escape), None, "{escape}");
+        }
+        // An upstream mounted under a prefix keeps the guest beneath that prefix's /v2/.
+        let reg = cfg("https://h.example/reg");
+        let prefixed = |t: &str| upstream_url(&reg, t);
+        assert!(prefixed("/v2/app/tags/list").is_some());
+        assert!(prefixed("/v2/../admin").is_none());
+    }
+
+    #[test]
+    fn a_bad_upstream_fails_at_construction() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for bad in [
+            "reg.example:5000",
+            "ftp://reg.example",
+            "unix:/run/reg.sock",
+            "http://reg.example/reg?x=1",
+            "http://reg.example/reg#x",
+        ] {
+            assert!(
+                ProxyCfg::build(bad.to_string(), Creds::anonymous()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Send the guest's raw request target without client-side normalization.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refuses_a_target_that_resolves_outside_v2() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (up_addr, seen) = fake_upstream();
+        let proxy = spawn_blocking(basic_cfg(up_addr)).unwrap();
+        for target in [
+            "/v2/../lock/acquire?name=x",
+            "/v2/%2e%2e/lock/acquire?name=x",
+        ] {
+            let mut conn = tokio::net::TcpStream::connect(proxy).await.unwrap();
+            conn.write_all(
+                format!("GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut reply = Vec::new();
+            conn.read_to_end(&mut reply).await.unwrap();
+            assert!(
+                reply.starts_with(b"HTTP/1.1 403"),
+                "{target}: {:?}",
+                String::from_utf8_lossy(&reply)
+            );
+        }
+        assert_eq!(
+            seen.lock().unwrap().0,
+            "",
+            "a target resolving outside /v2/ must not be forwarded upstream"
         );
     }
 }

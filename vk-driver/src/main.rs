@@ -1605,9 +1605,9 @@ enum Cmd {
         build_audit_egress: bool,
         /// Run a host-local credential-injecting proxy to this upstream registry
         ///
-        /// Takes the upstream's base URL (scheme://host); the guest reaches the proxy
-        /// credential-free at `registry.vk`, which injects `--username`/`--password`/`--ca`.
-        /// Needs `--net`. The job never sees the credentials.
+        /// Takes the upstream's base URL (`scheme://host[:port][/prefix]`); the guest reaches
+        /// the proxy credential-free at `registry.vk`, which injects
+        /// `--username`/`--password`/`--ca`. Needs `--net`. The job never sees the credentials.
         #[arg(long = "registry-proxy", value_name = "URL", help_heading = "Network")]
         registry_proxy: Option<String>,
         /// boot this compose file's services as sibling microVMs (implies --net)

@@ -24,6 +24,10 @@ All notable changes to virtkit will be documented in this file.
   A guest using its own kernel, which a job can supply, could previously use these names
   to read host files outside the share with the VM's host-user permissions, or write them
   through a writable share.
+- **Security: the guest registry proxy (`vk run --registry-proxy`, `[registry] proxy_guests`)
+  no longer lends the runner's credential to paths outside `/v2/`.** A request target such
+  as `/v2/../lock/acquire` passed the check and reached the registry's lock API once
+  resolved. A path carrying an encoded `/` or `\` (`%2F`, `%5C`) is now refused too.
 - **Security: a build's stage guests get a private session directory.** It was created at a
   predictable name in the shared temp dir and reused as found, so another local user could
   plant it and take over the guest's exec channel and console log.
