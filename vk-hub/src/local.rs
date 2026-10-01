@@ -18,6 +18,8 @@
 //! loopback and whose cookies they keep off `localhost`, `127.0.0.1` and every other name; the
 //! name is drawn once and kept in the state directory, so a session survives a restart.
 
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -102,10 +104,34 @@ fn valid_host_name(name: &str) -> bool {
         })
 }
 
-/// What the UI shows of this machine: the latest list, and the `vk` that makes it.
+/// What the UI shows of this machine: the latest list, the `vk` that makes it, and what the
+/// UI has run.
 pub struct Local {
     pub vk: PathBuf,
     listing: Mutex<Listing>,
+    /// The last action on each thing acted on — a VM's state dir, a dev environment's name —
+    /// under way or ended.
+    actions: Mutex<HashMap<String, Action>>,
+}
+
+/// A `vk` command the UI ran.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Action {
+    /// As a shell would show it: `vk stop /path`.
+    pub command: String,
+    /// The session's principal.
+    pub by: String,
+    pub started_at: u64,
+    /// `None` while it runs.
+    pub ended: Option<Ended>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ended {
+    pub at: u64,
+    pub ok: bool,
+    /// How it ended, with the last line it printed.
+    pub said: String,
 }
 
 /// The VMs as last listed, or why there is no list.
@@ -123,6 +149,7 @@ impl Local {
         Local {
             vk,
             listing: Mutex::new(Listing::Waiting),
+            actions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -156,11 +183,111 @@ impl Local {
         }
     }
 
+    /// The last action on `key`.
+    pub fn action(&self, key: &str) -> Option<Action> {
+        self.lock_actions().get(key).cloned()
+    }
+
+    /// Run `vk args` in the background as `by`'s action on `key`, unless one is under way on
+    /// it: started and ended in the audit log, and shown on the pages meanwhile. Returns the
+    /// command as it is shown.
+    pub fn start(
+        self: &Arc<Self>,
+        hub: &Arc<Hub>,
+        key: &str,
+        args: Vec<OsString>,
+        timeout: Duration,
+        by: &str,
+    ) -> Result<String, &'static str> {
+        let command = std::iter::once("vk".into())
+            .chain(args.iter().map(|a| a.to_string_lossy().into_owned()))
+            .collect::<Vec<String>>()
+            .join(" ");
+        {
+            let mut actions = self.lock_actions();
+            if actions.get(key).is_some_and(|a| a.ended.is_none()) {
+                return Err(
+                    "Refused: something is already being done to it; wait for that to end.",
+                );
+            }
+            actions.insert(
+                key.to_string(),
+                Action {
+                    command: command.clone(),
+                    by: by.to_string(),
+                    started_at: crate::now_secs(),
+                    ended: None,
+                },
+            );
+        }
+        let (local, hub, key, by, shown) = (
+            self.clone(),
+            hub.clone(),
+            key.to_string(),
+            by.to_string(),
+            command.clone(),
+        );
+        hub.touch();
+        tokio::spawn(async move {
+            audit(&hub, &by, format!("{by} ran `{shown}`")).await;
+            let argv: Vec<&OsStr> = args.iter().map(OsString::as_os_str).collect();
+            let (ok, said) = match local.run(&argv, timeout).await {
+                Ok(out) => {
+                    let last = |text: &str| {
+                        text.lines()
+                            .rev()
+                            .map(str::trim)
+                            .find(|l| !l.is_empty())
+                            .map(str::to_string)
+                    };
+                    let said = last(&out.stderr)
+                        .or_else(|| last(&out.stdout))
+                        .map_or_else(|| out.status.clone(), |l| format!("{}: {l}", out.status));
+                    (out.ok, said)
+                }
+                Err(e) => (false, format!("{e:#}")),
+            };
+            let event = format!(
+                "`{shown}` {} ({said})",
+                if ok { "succeeded" } else { "failed" }
+            );
+            audit(&hub, &by, event).await;
+            if let Some(action) = local.lock_actions().get_mut(&key) {
+                action.ended = Some(Ended {
+                    at: crate::now_secs(),
+                    ok,
+                    said,
+                });
+            }
+            hub.touch();
+        });
+        Ok(command)
+    }
+
+    fn lock_actions(&self) -> std::sync::MutexGuard<'_, HashMap<String, Action>> {
+        // Entries replaced whole: nothing half-written for a panic to leave behind.
+        self.actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Listing> {
         // Replaced whole: nothing half-written for a panic to leave behind.
         self.listing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Write an audit line off the runtime; a failure to is logged, and the action goes on.
+async fn audit(hub: &Arc<Hub>, actor: &str, event: String) {
+    let (hub, actor) = (hub.clone(), actor.to_string());
+    let written =
+        tokio::task::spawn_blocking(move || hub.db.audit(&actor, &event, crate::now_secs())).await;
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("vk-hub: writing the audit log: {e:#}"),
+        Err(e) => eprintln!("vk-hub: writing the audit log: {e}"),
     }
 }
 
@@ -180,7 +307,7 @@ impl Local {
     /// Run `vk` with `args`, its stdin closed, for at most `timeout`; killed past it. Each
     /// stream's first [`MAX_OUTPUT`] bytes are kept. What `vk` prints is the host's: a page
     /// shows it through [`crate::ui::html::Html::node`].
-    pub async fn run(&self, args: &[&std::ffi::OsStr], timeout: Duration) -> Result<Output> {
+    pub async fn run(&self, args: &[&OsStr], timeout: Duration) -> Result<Output> {
         let mut child = tokio::process::Command::new(&self.vk)
             .args(args)
             .stdin(std::process::Stdio::null())

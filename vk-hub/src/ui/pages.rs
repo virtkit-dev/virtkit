@@ -14,7 +14,8 @@ pub const AUDIT_PAGE: usize = 100;
 pub fn layout(title: &str, auth: &Auth, main: &Html) -> Html {
     let mut h = Html::new();
     head(&mut h, title);
-    h.raw("<body><header><nav><a href=\"/\">VMs</a> <a href=\"/audit\">audit</a></nav>")
+    h.raw("<body><header><nav><a href=\"/\">VMs</a> <a href=\"/dev\">dev environments</a> ")
+        .raw("<a href=\"/audit\">audit</a></nav>")
         .raw("<form class=\"who\" method=\"post\" action=\"/logout\"><span>")
         .text(auth.session.principal())
         .raw(", until ")

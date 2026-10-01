@@ -1,8 +1,8 @@
 # Fleet: a hub and its nodes
 
 Status: proposal, implemented in part and experimental: the list of the VMs a host runs
-(`vk workloads`), and local mode's web UI showing it (`vk-hub local`), signed into with links
-it prints. Everything else below is not built yet.
+(`vk workloads`), and local mode's web UI showing it and acting on it (`vk-hub local`),
+signed into with links it prints. Everything else below is not built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -382,7 +382,22 @@ seconds, so the memory figures keep their own cadence; a list of a version the h
 read is refused rather than misread. A VM's page also shows its console's last hundred lines
 (`vk logs`), atop's account of a VM that records itself (`vk atop --summary`; one that does
 not is not attached to), and what a CI job's switch recorded of its egress (`vk
-egress-report`, plumbing), each read as the page loads. Actions are not built yet.
+egress-report`, plumbing), each read as the page loads.
+
+An operator's session acts on them by running `vk` as a shell would: a pinned run is stopped
+(`vk stop`) or rebooted (`vk reboot`), named by the pid of its `vk run` — `vk stop <dir>`
+would take the VMs of every directory below too — and a dev environment stopped (`vk dev
+stop`). `/dev` lists every environment `vk dev list` knows, stopped ones included, read as the
+page loads: a stopped one is started again in its recorded workspace (`vk dev up --workspace
+… --environment …`), and one that is stale — its workspace gone, or no boot recorded —
+removed (`vk dev gc --yes`). A CI job is its runner's and has no action. A stop, a reboot and a
+removal are asked again on a form of their own before they run. Each runs in the background,
+one at a time on each thing acted on, with a time limit; the pages show it under way and how
+it ended, with the last line it printed, and the audit log records it, as the session's
+principal, as it starts and as it ends. A dev environment with an SSH setup has an "open in
+VS Code" link through its alias, which the user's own SSH config must reach (`vk dev
+ssh-config` prints the stanza); `vk dev code` in the workspace needs none. A shell in the
+browser is not built.
 
 ## Security
 

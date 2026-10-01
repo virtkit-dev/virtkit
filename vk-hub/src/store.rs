@@ -202,6 +202,13 @@ impl Db {
         Ok(Db { db })
     }
 
+    /// Record `event`, done by `actor`, in the audit log.
+    pub fn audit(&self, actor: &str, event: &str, now: u64) -> Result<()> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        append_audit(&txn, actor, event, now)?;
+        txn.commit().context("writing an audit line")
+    }
+
     /// The last `limit` audit lines, oldest first.
     #[cfg(test)]
     pub fn audits(&self, limit: usize) -> Result<Vec<AuditRow>> {

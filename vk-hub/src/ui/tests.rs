@@ -940,3 +940,302 @@ esac"#,
     assert!(page.body.contains("/nonexistent/vk"), "{}", page.body);
     let _ = std::fs::remove_dir_all(vk.parent().unwrap());
 }
+
+/// Post `form` to `path` as an operator's page would, by htmx or not.
+async fn post_action(
+    addr: SocketAddr,
+    origin: &str,
+    cookie: &str,
+    path: &str,
+    form: &str,
+    htmx: bool,
+) -> Reply {
+    let cookie = format!("Cookie: {cookie}");
+    let origin = format!("Origin: {origin}");
+    let mut headers = vec![cookie.as_str(), origin.as_str()];
+    if htmx {
+        headers.push("HX-Request: true");
+    }
+    request(addr, "POST", path, &headers, form).await
+}
+
+/// Wait for the audit log to hold a line containing `want`.
+async fn audited(hub: &Hub, want: &str) -> Vec<String> {
+    for _ in 0..200 {
+        let events: Vec<String> = hub
+            .db
+            .audits(50)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        if events.iter().any(|e| e.contains(want)) {
+            return events;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no audit line with {want:?}");
+}
+
+/// A VM is stopped and rebooted by running `vk`, as an operator alone, once confirmed; the
+/// command and how it ended are audited and shown, and a second waits for the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_stops_a_vm_once_confirmed() {
+    let vk = stub_vk(
+        "actions",
+        r#"case "$1" in
+stop) echo "$*" >> "$(dirname "$0")/ran"; echo "virtkit: stopped pid $2" >&2 ;;
+reboot) echo "$*" >> "$(dirname "$0")/ran"; sleep 2; echo "no agent" >&2; exit 1 ;;
+logs|atop|egress-report) ;;
+*) exit 3 ;;
+esac"#,
+    );
+    let ran = vk.parent().unwrap().join("ran");
+    let (addr, hub, origin, local) = start_with_vk(None, vk.clone()).await;
+    let id = "0123456789abcdef";
+    let mut job = workload("fedcba9876543210", "rust:1.90");
+    job.kind = vk_fleet_proto::WorkloadKind::CiJob;
+    local.set_listing(listed(vec![workload(id, "alpine:3.20"), job]), &hub);
+    let path = format!("/vm/{id}/action");
+
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let reply = post_action(
+        addr,
+        &origin,
+        &viewer,
+        &path,
+        &format!("_csrf={viewer_csrf}&op=stop&confirm=yes"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let page = get(addr, &format!("/vm/{id}"), Some(&viewer)).await;
+    assert!(!page.body.contains("name=\"op\""), "{}", page.body);
+
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, &format!("/vm/{id}"), Some(&cookie)).await;
+    assert!(page.body.contains("value=\"reboot\""), "{}", page.body);
+    // Asked first, and nothing run.
+    let reply = post_action(
+        addr,
+        &origin,
+        &cookie,
+        &path,
+        &format!("_csrf={csrf}&op=stop"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    assert_eq!(reply.header("hx-reswap"), Some("none"));
+    assert!(
+        reply.body.contains("name=\"confirm\" value=\"yes\""),
+        "{}",
+        reply.body
+    );
+    assert!(!ran.exists());
+    let reply = post_action(
+        addr,
+        &origin,
+        &cookie,
+        &path,
+        &format!("_csrf={csrf}&op=stop"),
+        false,
+    )
+    .await;
+    assert!(reply.body.contains("<h1>Confirm</h1>"), "{}", reply.body);
+    // Confirmed: run as `vk stop <pid>`, audited as it starts and as it ends.
+    let reply = post_action(
+        addr,
+        &origin,
+        &cookie,
+        &path,
+        &format!("_csrf={csrf}&op=stop&confirm=yes"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Started <code>vk stop 4242</code>"),
+        "{}",
+        reply.body
+    );
+    let events = audited(&hub, "`vk stop 4242` succeeded").await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.ends_with("(operator) ran `vk stop 4242`")),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e.contains("(exit status: 0: virtkit: stopped pid 4242)")),
+        "{events:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), "stop 4242\n");
+    let page = get(addr, &format!("/vm/{id}"), Some(&cookie)).await;
+    assert!(
+        page.body.contains("<code>vk stop 4242</code> succeeded"),
+        "{}",
+        page.body
+    );
+
+    // A plain form goes back to the page; a second action waits for the first to end, and a
+    // failure says how.
+    let reply = post_action(
+        addr,
+        &origin,
+        &cookie,
+        &path,
+        &format!("_csrf={csrf}&op=reboot&confirm=yes"),
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 303);
+    assert_eq!(
+        reply.header("location"),
+        Some(path.trim_end_matches("/action"))
+    );
+    let reply = post_action(
+        addr,
+        &origin,
+        &cookie,
+        &path,
+        &format!("_csrf={csrf}&op=stop&confirm=yes"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    audited(&hub, "`vk reboot 4242` failed (exit status: 1: no agent)").await;
+
+    // A CI job is its runner's; an unknown action or VM is no action.
+    for (target, op) in [
+        ("fedcba9876543210", "stop"),
+        (id, "format"),
+        ("1111111111111111", "stop"),
+    ] {
+        let reply = post_action(
+            addr,
+            &origin,
+            &cookie,
+            &format!("/vm/{target}/action"),
+            &format!("_csrf={csrf}&op={op}&confirm=yes"),
+            true,
+        )
+        .await;
+        assert!(
+            reply.status == 400 || reply.status == 404,
+            "{target} {op}: {}",
+            reply.status
+        );
+    }
+    let _ = std::fs::remove_dir_all(vk.parent().unwrap());
+}
+
+/// `/dev` lists what `vk dev list` lists, stopped environments too: a stopped one starts in
+/// its workspace with no question, and only a stale one is offered for removal.
+#[tokio::test(flavor = "multi_thread")]
+async fn dev_environments_are_started_and_cleaned_up() {
+    let vk = stub_vk(
+        "dev",
+        r#"echo "$*" >> "$(dirname "$0")/ran"
+case "$1 $2" in
+"dev list") cat <<'JSON'
+[{"name":"app-1111","dir":"/s/app-1111","workspace":"/src/app","environment":"dev","status":"stopped","created_by":null,"booted_secs":1790755279,"age_secs":5,"mem_used_bytes":null,"mem":null,"flags":[]},
+ {"name":"old-2222","dir":"/s/old-2222","workspace":"/gone/old","environment":"dev","status":"stopped","created_by":null,"booted_secs":null,"age_secs":null,"mem_used_bytes":null,"mem":null,"flags":["workspace-missing"]},
+ {"name":"../evil","dir":"/x","workspace":null,"environment":null,"status":"stopped","flags":[]}]
+JSON
+;;
+"dev up"|"dev gc") ;;
+*) exit 3 ;;
+esac"#,
+    );
+    let ran = vk.parent().unwrap().join("ran");
+    let (addr, hub, origin, _) = start_with_vk(None, vk.clone()).await;
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, "/dev", Some(&cookie)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("app-1111") && page.body.contains("workspace-missing"));
+    assert!(!page.body.contains("evil"), "{}", page.body);
+    assert!(
+        page.body.contains("action=\"/dev/app-1111/action\""),
+        "{}",
+        page.body
+    );
+    assert_eq!(
+        page.body.matches("value=\"gc\"").count(),
+        1,
+        "{}",
+        page.body
+    );
+
+    let reply = post_action(
+        addr,
+        &origin,
+        &cookie,
+        "/dev/app-1111/action",
+        &format!("_csrf={csrf}&op=start"),
+        true,
+    )
+    .await;
+    assert!(
+        reply
+            .body
+            .contains("Started <code>vk dev up --workspace /src/app --environment dev</code>"),
+        "{}",
+        reply.body
+    );
+    audited(
+        &hub,
+        "`vk dev up --workspace /src/app --environment dev` succeeded",
+    )
+    .await;
+    // Not stale: no removal, however asked.
+    let reply = post_action(
+        addr,
+        &origin,
+        &cookie,
+        "/dev/app-1111/action",
+        &format!("_csrf={csrf}&op=gc&confirm=yes"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    let reply = post_action(
+        addr,
+        &origin,
+        &cookie,
+        "/dev/old-2222/action",
+        &format!("_csrf={csrf}&op=gc"),
+        true,
+    )
+    .await;
+    assert!(reply.body.contains("cannot be undone"), "{}", reply.body);
+    let reply = post_action(
+        addr,
+        &origin,
+        &cookie,
+        "/dev/old-2222/action",
+        &format!("_csrf={csrf}&op=gc&confirm=yes"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    audited(&hub, "`vk dev gc --yes old-2222` succeeded").await;
+    assert_eq!(
+        post_action(
+            addr,
+            &origin,
+            &cookie,
+            "/dev/../action",
+            &format!("_csrf={csrf}&op=gc"),
+            true
+        )
+        .await
+        .status,
+        404
+    );
+    let ran = std::fs::read_to_string(&ran).unwrap();
+    assert!(!ran.contains("evil"), "{ran}");
+    let _ = std::fs::remove_dir_all(vk.parent().unwrap());
+}
