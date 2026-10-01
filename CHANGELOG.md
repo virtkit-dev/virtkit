@@ -15,6 +15,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`vk-registry` no longer lets a client hold a connection open without sending a
+  request.** Request headers must arrive within 30 seconds, which also closes a kept-alive
+  connection idle that long, a TLS handshake must finish within 10, and at most 1024
+  connections are served at once.
 - **`vk-registry gc` collects a store that holds a tagged image index**, such as a
   multi-arch image pulled through the relay. It used to refuse the whole pass; it now keeps
   the index's per-platform manifests and their layers.

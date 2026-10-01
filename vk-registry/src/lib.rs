@@ -38,7 +38,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
@@ -2180,10 +2180,38 @@ fn scheme(tls: bool) -> &'static str {
     if tls { "https" } else { "http" }
 }
 
+/// What one client connection may hold of the server before it has said anything: every
+/// bound here is spent before authentication, so without them anyone who can reach the
+/// port holds a task and a descriptor for as long as they like.
+#[derive(Clone, Copy)]
+struct ConnLimits {
+    /// For a TLS client to finish its handshake.
+    handshake: Duration,
+    /// For a request's headers to arrive whole, counted from when the connection starts
+    /// waiting for them: on connect, and again whenever a kept-alive connection goes idle.
+    headers: Duration,
+    /// Connections served at once; past it, accepting waits for one to close.
+    connections: usize,
+}
+
+const CONN_LIMITS: ConnLimits = ConnLimits {
+    handshake: Duration::from_secs(10),
+    headers: Duration::from_secs(30),
+    connections: 1024,
+};
+
 /// Serve on an already-bound listener (so the caller can pick an ephemeral port and
 /// learn it first). The store is content-addressed and written atomically, so several
 /// servers may serve the same `root` concurrently.
 pub async fn serve_on(listener: TcpListener, state: Arc<ServerState>) -> Result<()> {
+    serve_limited(listener, state, CONN_LIMITS).await
+}
+
+async fn serve_limited(
+    listener: TcpListener,
+    state: Arc<ServerState>,
+    limits: ConnLimits,
+) -> Result<()> {
     if let Ok(addr) = listener.local_addr() {
         eprintln!(
             "{}",
@@ -2198,28 +2226,55 @@ pub async fn serve_on(listener: TcpListener, state: Arc<ServerState>) -> Result<
     if !state.webdav {
         eprintln!("vk-registry: WebDAV off (webdav = false): /dav/ answers 404");
     }
+    let slots = Arc::new(tokio::sync::Semaphore::new(limits.connections));
     loop {
-        let (stream, _peer) = listener.accept().await.context("accept")?;
+        // Held for the connection's life: at the cap, new clients wait in the kernel's
+        // backlog rather than each costing a task here.
+        let slot = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .context("connection slots")?;
+        // A failed accept (out of descriptors, a client that reset before it was accepted) is
+        // that one connection's, not the server's: wait a moment and keep serving.
+        let (stream, _peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                eprintln!("vk-registry: accept: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let state = state.clone();
         tokio::spawn(async move {
+            let _slot = slot;
             match &state.tls {
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(tls) => serve_conn(TokioIo::new(tls), state.clone()).await,
-                    Err(e) => eprintln!("vk-registry: TLS handshake error: {e}"),
-                },
-                None => serve_conn(TokioIo::new(stream), state.clone()).await,
+                Some(acceptor) => {
+                    match tokio::time::timeout(limits.handshake, acceptor.accept(stream)).await {
+                        Ok(Ok(tls)) => serve_conn(TokioIo::new(tls), state.clone(), limits).await,
+                        Ok(Err(e)) => eprintln!("vk-registry: TLS handshake error: {e}"),
+                        Err(_) => eprintln!("vk-registry: TLS handshake timed out"),
+                    }
+                }
+                None => serve_conn(TokioIo::new(stream), state.clone(), limits).await,
             }
         });
     }
 }
 
 /// Serve one HTTP/1 connection over any transport (plain TCP or TLS).
-async fn serve_conn<I>(io: I, state: Arc<ServerState>)
+async fn serve_conn<I>(io: I, state: Arc<ServerState>, limits: ConnLimits)
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
     let svc = service_fn(move |req| handle(req, state.clone()));
-    if let Err(e) = http1::Builder::new().serve_connection(io, svc).await {
+    // hyper only enforces a header read timeout with a timer to measure it by.
+    if let Err(e) = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(limits.headers)
+        .serve_connection(io, svc)
+        .await
+    {
         eprintln!("vk-registry: connection error: {e}");
     }
 }
@@ -4156,6 +4211,64 @@ pub fn install_service(facts: &UnitFacts) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client that stops mid-header is dropped once the header timeout passes, and the
+    /// connection cap holds a second client back until a slot frees.
+    #[tokio::test]
+    async fn a_stalled_client_is_dropped_and_connections_are_capped() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = std::env::temp_dir().join(format!("vk-regserve-limits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = Arc::new(ServerState {
+            store: Arc::new(Store::new(dir.clone()).unwrap()),
+            upstreams: Vec::new(),
+            locks: lock::LockManager::new(),
+            auth: Authenticator::Shared(auth::Auth::None),
+            tls: None,
+            webdav: false,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let limits = ConnLimits {
+            handshake: Duration::from_secs(1),
+            headers: Duration::from_secs(1),
+            connections: 1,
+        };
+        tokio::spawn(serve_limited(listener, state, limits));
+
+        let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stalled.write_all(b"GET /v2/ HTTP/1.1\r\n").await.unwrap();
+        // The one slot is taken: a second client is not served while the first holds it.
+        let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+        second
+            .write_all(b"GET /v2/ HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), second.read(&mut buf))
+                .await
+                .is_err(),
+            "a client past the cap was served"
+        );
+        // The stalled one is closed by the header timeout, with no request served…
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut rest = Vec::new();
+            stalled.read_to_end(&mut rest).await.map(|_| rest)
+        })
+        .await
+        .expect("the stalled client was never dropped")
+        .unwrap();
+        assert!(!closed.starts_with(b"HTTP/1.1 200"), "{closed:?}");
+        // …which frees the slot for the one waiting.
+        let n = tokio::time::timeout(Duration::from_secs(5), second.read(&mut buf))
+            .await
+            .expect("the waiting client was never served")
+            .unwrap();
+        assert!(buf[..n].starts_with(b"HTTP/1.1 200"), "{:?}", &buf[..n]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The URL a server prints is the URL that reaches it: a TLS-configured server says
     /// `https`, a plain one `http`. The scheme is the only part of the line an operator
