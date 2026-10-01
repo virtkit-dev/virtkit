@@ -22,6 +22,10 @@ All notable changes to virtkit will be documented in this file.
 - **A guest can no longer exhaust the host's sockets through its network**: a job's network
   carries at most 8192 connections at once and 256 DNS lookups in flight; past that, new
   connections stall or are reset and lookups are dropped for the guest to retry.
+- **A guest-written disk image can no longer crash the host's `vk` or make it allocate
+  gigabytes** when `vk` reads the image (for a `FROM --kernel=image` stage, or a job's
+  `/etc/passwd`): its geometry, links and extents are now checked, and every file read
+  from it — kernel and modules after decompression included — has a size cap.
 - **Security: a VM on a job's network can no longer pose as another VM or as the gateway**
   (by its MAC, or in ARP) to intercept their traffic.
 - **Security: `vk-registry` no longer lets a client hold a connection open without sending

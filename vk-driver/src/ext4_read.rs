@@ -39,8 +39,16 @@ const S_IFLNK: u16 = 0xA000;
 /// (fast symlink). The writer uses inline storage iff the target is < 60 bytes.
 const FAST_SYMLINK_MAX: u64 = 60;
 
-/// Cap on symlink hops while resolving a path, to bound loops.
-const MAX_SYMLINK_HOPS: u32 = 8;
+/// The most a directory's entries are read to: far past any real directory (a million
+/// entries), and what an image can make the host allocate for one.
+const MAX_DIR_BYTES: u64 = 64 << 20;
+/// The most a symlink's target may be: the kernel's own `PATH_MAX`.
+const MAX_SYMLINK_TARGET: u64 = 4096;
+
+/// Cap on symlink hops while resolving a path, counted across the whole resolution — every
+/// nested target included, as the kernel's own 40 are — so links that point through each
+/// other end in an error rather than in unbounded recursion.
+const MAX_SYMLINK_HOPS: u32 = 40;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FileType {
@@ -165,6 +173,14 @@ impl Ext4Reader {
         let blocks_count = rd32(&sb, 0x04) as u64;
         let blocks_per_group = rd32(&sb, 0x20) as u64;
         let inodes_per_group = rd32(&sb, 0x28);
+        // Inode lookup divides by this guest-controlled value; reject zero to avoid a panic.
+        // The inode bitmap occupies one block, which bounds the count.
+        if inodes_per_group == 0 || u64::from(inodes_per_group) > BLOCK * 8 {
+            bail!(
+                "{}: unsupported inodes-per-group {inodes_per_group}",
+                path.display()
+            );
+        }
         // The writer emits a fixed geometry; validate it so a corrupt superblock
         // can't drive `groups` (and the GDT allocation below) to an absurd size.
         if blocks_per_group != BLOCKS_PER_GROUP {
@@ -299,7 +315,12 @@ impl Ext4Reader {
         }
     }
 
-    fn read_inode_data(&self, info: &InodeInfo) -> Result<Vec<u8>> {
+    /// Read inode data, rejecting sizes above the caller's `max` bytes.
+    /// Guest-controlled sizes are untrusted.
+    fn read_inode_data(&self, info: &InodeInfo, max: u64) -> Result<Vec<u8>> {
+        if info.size > max {
+            bail!("inode of {} bytes, over the {max} read here", info.size);
+        }
         // Reject a corrupt `i_size` larger than the logical image before it can request a
         // gigabyte-scale allocation. For qcow2, use the virtual size rather than the
         // smaller host file; this bound is only as tight as the run-controlled geometry.
@@ -308,7 +329,17 @@ impl Ext4Reader {
             bail!("inode size {} exceeds image size {image_len}", info.size);
         }
         let mut out = vec![0u8; info.size as usize];
+        // Extents must map ascending, disjoint ranges, as any writer lays them out; so each
+        // logical block is read at most once and the work is bounded by the size.
+        let mut next_logical = 0;
         for ex in &info.extents {
+            if ex.logical < next_logical {
+                bail!(
+                    "extent at logical block {} overlaps or is out of order",
+                    ex.logical
+                );
+            }
+            next_logical = ex.logical + ex.len;
             for i in 0..ex.len {
                 let logical = ex.logical + i;
                 let start = logical * BLOCK;
@@ -332,7 +363,7 @@ impl Ext4Reader {
         info: &InodeInfo,
         mut f: impl FnMut(u32, u8, &str) -> Result<()>,
     ) -> Result<()> {
-        let data = self.read_inode_data(info)?;
+        let data = self.read_inode_data(info, MAX_DIR_BYTES)?;
         // Entries never straddle a 4 KiB block, so walk block by block.
         let mut blk = 0usize;
         while blk < data.len() {
@@ -374,7 +405,7 @@ impl Ext4Reader {
         let bytes = if info.is_fast_symlink {
             info.i_block[..info.size as usize].to_vec()
         } else {
-            self.read_inode_data(info)?
+            self.read_inode_data(info, MAX_SYMLINK_TARGET)?
         };
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
@@ -383,6 +414,12 @@ impl Ext4Reader {
     /// directory symlinks are followed (usrmerge); a trailing symlink is left
     /// unresolved so callers can inspect it. Returns None if any component is missing.
     pub fn lookup(&self, path: &str) -> Result<Option<u32>> {
+        let mut hops = MAX_SYMLINK_HOPS;
+        self.lookup_within(path, &mut hops)
+    }
+
+    /// [`Ext4Reader::lookup`] with a symlink hop budget shared by nested resolutions.
+    fn lookup_within(&self, path: &str, hops: &mut u32) -> Result<Option<u32>> {
         let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         let mut cur = ROOT_INO;
         for (i, comp) in comps.iter().enumerate() {
@@ -399,31 +436,33 @@ impl Ext4Reader {
             }
             // Intermediate component: follow a symlink so the walk can continue
             // into the real directory.
-            cur = self.follow_if_symlink(child, path)?;
+            cur = self.follow_if_symlink(child, path, hops)?;
         }
         // The empty path (or "/") is the root.
         Ok(Some(cur))
     }
 
     /// If `ino` is a symlink, resolve its target (relative to the fs root or its
-    /// containing dir) to an inode; otherwise return `ino` unchanged. Bounded by
-    /// `MAX_SYMLINK_HOPS`.
-    fn follow_if_symlink(&self, ino: u32, context_path: &str) -> Result<u32> {
+    /// containing dir) to an inode; otherwise return `ino` unchanged. Each hop, including
+    /// those inside the targets' own resolution, is paid from `hops`.
+    fn follow_if_symlink(&self, ino: u32, context_path: &str, hops: &mut u32) -> Result<u32> {
         let mut cur = ino;
-        for _ in 0..MAX_SYMLINK_HOPS {
+        loop {
             let info = self.read_inode(cur)?;
             if info.file_type() != FileType::Symlink {
                 return Ok(cur);
             }
+            if *hops == 0 {
+                bail!("too many symlink hops resolving {context_path}");
+            }
+            *hops -= 1;
             let target = self.symlink_target(&info)?;
             // usrmerge links are relative (e.g. "usr/lib"); resolve them against the
             // filesystem root, which is where the writer places them.
-            let resolved = self.lookup(&target)?.with_context(|| {
+            cur = self.lookup_within(&target, hops)?.with_context(|| {
                 format!("symlink target {target:?} not found (resolving {context_path})")
             })?;
-            cur = resolved;
         }
-        bail!("too many symlink hops resolving {context_path}");
     }
 
     /// The type at an absolute path (a trailing symlink is NOT followed), or None
@@ -449,11 +488,12 @@ impl Ext4Reader {
 
     /// List a directory's entries (name, type), excluding "." and "..".
     pub fn list_dir(&self, path: &str) -> Result<Vec<(String, FileType)>> {
+        let mut hops = MAX_SYMLINK_HOPS;
         let ino = self
-            .lookup(path)?
+            .lookup_within(path, &mut hops)?
             .with_context(|| format!("{path}: not found"))?;
         // Follow a trailing symlink to the directory it points at.
-        let ino = self.follow_if_symlink(ino, path)?;
+        let ino = self.follow_if_symlink(ino, path, &mut hops)?;
         let info = self.read_inode(ino)?;
         if info.file_type() != FileType::Dir {
             bail!("{path}: not a directory");
@@ -469,17 +509,20 @@ impl Ext4Reader {
     }
 
     /// Read a regular file's full contents by absolute path (follows a trailing
-    /// symlink to a regular file). Errors if missing or not a regular file.
-    pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
+    /// symlink to a regular file). Errors if missing, not a regular file, or larger than
+    /// `max` bytes, since guest-controlled sizes are untrusted.
+    pub fn read_file(&self, path: &str, max: u64) -> Result<Vec<u8>> {
+        let mut hops = MAX_SYMLINK_HOPS;
         let ino = self
-            .lookup(path)?
+            .lookup_within(path, &mut hops)?
             .with_context(|| format!("{path}: not found"))?;
-        let ino = self.follow_if_symlink(ino, path)?;
+        let ino = self.follow_if_symlink(ino, path, &mut hops)?;
         let info = self.read_inode(ino)?;
         if info.file_type() != FileType::Regular {
             bail!("{path}: not a regular file");
         }
-        self.read_inode_data(&info)
+        self.read_inode_data(&info, max)
+            .with_context(|| format!("reading {path}"))
     }
 }
 
@@ -527,6 +570,7 @@ fn filetype_from_dirent(ft: u8) -> FileType {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::os::unix::fs::FileExt;
 
     /// A unique scratch dir we create and remove ourselves (no tempfile dep).
     struct Scratch {
@@ -605,9 +649,9 @@ mod tests {
         let r = Ext4Reader::open(&img).unwrap();
 
         // exact bytes for the small and large files
-        assert_eq!(r.read_file("/top.txt").unwrap(), top);
-        assert_eq!(r.read_file("/a/b/nested.txt").unwrap(), nested);
-        let read_big = r.read_file("/big.bin").unwrap();
+        assert_eq!(r.read_file("/top.txt", u64::MAX).unwrap(), top);
+        assert_eq!(r.read_file("/a/b/nested.txt", u64::MAX).unwrap(), nested);
+        let read_big = r.read_file("/big.bin", u64::MAX).unwrap();
         assert_eq!(read_big.len(), big.len());
         assert_eq!(
             read_big, big,
@@ -638,8 +682,8 @@ mod tests {
         assert_eq!(r.file_type("/lib").unwrap(), Some(FileType::Symlink));
 
         // reading THROUGH an intermediate symlinked dir resolves (lib -> usr/lib)
-        assert_eq!(r.read_file("/lib/libx.txt").unwrap(), libfile);
-        assert_eq!(r.read_file("/usr/lib/libx.txt").unwrap(), libfile);
+        assert_eq!(r.read_file("/lib/libx.txt", u64::MAX).unwrap(), libfile);
+        assert_eq!(r.read_file("/usr/lib/libx.txt", u64::MAX).unwrap(), libfile);
 
         // list_dir follows a trailing symlink to the directory
         let libdir: std::collections::HashMap<String, FileType> =
@@ -647,7 +691,7 @@ mod tests {
         assert_eq!(libdir.get("libx.txt"), Some(&FileType::Regular));
 
         // read_file follows a trailing symlink to a regular file
-        assert_eq!(r.read_file("/link-to-top").unwrap(), top);
+        assert_eq!(r.read_file("/link-to-top", u64::MAX).unwrap(), top);
 
         // missing paths are None
         assert_eq!(r.lookup("/nope").unwrap(), None);
@@ -678,12 +722,145 @@ mod tests {
         crate::ext4::build_from_dir(&src, &img).unwrap();
         assert!(Ext4Reader::open(&img).is_ok());
 
-        use std::os::unix::fs::FileExt;
         let f = std::fs::OpenOptions::new().write(true).open(&img).unwrap();
         f.write_all_at(&1u32.to_le_bytes(), SB_OFFSET + 0x20)
             .unwrap();
         drop(f);
         assert!(Ext4Reader::open(&img).is_err());
+    }
+
+    /// A guest-written image is not trusted for its geometry, its links or its sizes: a zero
+    /// inodes-per-group is an error rather than a division by zero, links that point through
+    /// each other end in an error rather than a stack overflow, and a read stops at its cap.
+    #[test]
+    fn a_hostile_image_errors_rather_than_crashing() {
+        let scratch = Scratch::new();
+        let src = scratch.path.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f.txt"), b"twelve bytes").unwrap();
+        std::os::unix::fs::symlink("b/x", src.join("a")).unwrap();
+        std::os::unix::fs::symlink("a/x", src.join("b")).unwrap();
+        let img = scratch.path.join("fs.img");
+        crate::ext4::build_from_dir(&src, &img).unwrap();
+
+        let r = Ext4Reader::open(&img).unwrap();
+        assert!(
+            r.lookup("/a/x").is_err(),
+            "mutual links must not recurse forever"
+        );
+        assert!(
+            r.read_file("/f.txt", 11).is_err(),
+            "a read stops at its cap"
+        );
+        assert_eq!(r.read_file("/f.txt", 12).unwrap(), b"twelve bytes");
+
+        let f = std::fs::OpenOptions::new().write(true).open(&img).unwrap();
+        f.write_all_at(&0u32.to_le_bytes(), SB_OFFSET + 0x28)
+            .unwrap();
+        drop(f);
+        assert!(Ext4Reader::open(&img).is_err(), "zero inodes per group");
+        let f = std::fs::OpenOptions::new().write(true).open(&img).unwrap();
+        f.write_all_at(&(BLOCK as u32 * 8 + 1).to_le_bytes(), SB_OFFSET + 0x28)
+            .unwrap();
+        drop(f);
+        assert!(
+            Ext4Reader::open(&img).is_err(),
+            "more inodes per group than a bitmap block holds"
+        );
+    }
+
+    /// A link to itself ends in an error, through every entry point that follows links.
+    #[test]
+    fn a_self_link_errors() {
+        let scratch = Scratch::new();
+        let src = scratch.path.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::os::unix::fs::symlink("x", src.join("x")).unwrap();
+        let img = scratch.path.join("fs.img");
+        crate::ext4::build_from_dir(&src, &img).unwrap();
+
+        let r = Ext4Reader::open(&img).unwrap();
+        assert!(r.read_file("/x", u64::MAX).is_err());
+        assert!(r.list_dir("/x").is_err());
+        assert!(r.lookup("/x/y").is_err());
+    }
+
+    /// The hop budget spans a whole call: links followed to reach the last component and
+    /// those followed from it draw on the same 40.
+    #[test]
+    fn hops_are_counted_across_the_whole_call() {
+        let scratch = Scratch::new();
+        let src = scratch.path.join("src");
+        std::fs::create_dir_all(src.join("d")).unwrap();
+        std::fs::write(src.join("d/f"), b"f").unwrap();
+        // /a<n>-0 -> ... -> /d and /d/t<n>-0 -> ... -> /d/f, `n` hops each.
+        let chain = |n: usize| {
+            for i in 0..n {
+                let next = if i + 1 == n {
+                    "d".into()
+                } else {
+                    format!("a{n}-{}", i + 1)
+                };
+                std::os::unix::fs::symlink(next, src.join(format!("a{n}-{i}"))).unwrap();
+                let next = if i + 1 == n {
+                    "d/f".into()
+                } else {
+                    format!("d/t{n}-{}", i + 1)
+                };
+                std::os::unix::fs::symlink(next, src.join(format!("d/t{n}-{i}"))).unwrap();
+            }
+        };
+        chain(20);
+        chain(21);
+        let img = scratch.path.join("fs.img");
+        crate::ext4::build_from_dir(&src, &img).unwrap();
+
+        let r = Ext4Reader::open(&img).unwrap();
+        assert_eq!(r.read_file("/a20-0/t20-0", u64::MAX).unwrap(), b"f");
+        assert!(r.read_file("/a21-0/t21-0", u64::MAX).is_err());
+    }
+
+    /// Directory and symlink-target reads stop at their caps, and extents that overlap or
+    /// run backwards are refused rather than read over and over.
+    #[test]
+    fn inode_reads_are_bounded() {
+        let scratch = Scratch::new();
+        let src = scratch.path.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("f.bin"), pseudo_bytes(3 * BLOCK as usize)).unwrap();
+        let img = scratch.path.join("fs.img");
+        crate::ext4::build_from_dir(&src, &img).unwrap();
+        let r = Ext4Reader::open(&img).unwrap();
+        let ino = r.lookup("/f.bin").unwrap().unwrap();
+        let f = r.read_inode(ino).unwrap();
+        let phys = f.extents[0].phys_start;
+        let with = |mode: u16, size: u64, extents: Vec<Extent>| InodeInfo {
+            mode,
+            size,
+            i_block: f.i_block,
+            is_fast_symlink: false,
+            extents,
+        };
+        let ex = |logical, len| Extent {
+            logical,
+            phys_start: phys,
+            len,
+        };
+
+        let dir = with(S_IFDIR, MAX_DIR_BYTES + 1, vec![ex(0, 1)]);
+        assert!(r.for_each_dirent(&dir, |_, _, _| Ok(())).is_err());
+        let link = with(S_IFLNK, MAX_SYMLINK_TARGET + 1, vec![ex(0, 2)]);
+        assert!(r.symlink_target(&link).is_err());
+
+        let size = 3 * BLOCK;
+        assert!(
+            r.read_inode_data(&with(S_IFREG, size, vec![ex(0, 2), ex(2, 1)]), size)
+                .is_ok()
+        );
+        let overlapping = with(S_IFREG, size, vec![ex(0, 2), ex(1, 2)]);
+        assert!(r.read_inode_data(&overlapping, size).is_err());
+        let backwards = with(S_IFREG, size, vec![ex(2, 1), ex(0, 2)]);
+        assert!(r.read_inode_data(&backwards, size).is_err());
     }
 
     #[test]
@@ -709,8 +886,8 @@ mod tests {
         std::fs::remove_file(&raw).unwrap();
 
         let r = Ext4Reader::open(&qcow).unwrap();
-        assert_eq!(r.read_file("/top.txt").unwrap(), top);
-        assert_eq!(r.read_file("/big.bin").unwrap(), big);
+        assert_eq!(r.read_file("/top.txt", u64::MAX).unwrap(), top);
+        assert_eq!(r.read_file("/big.bin", u64::MAX).unwrap(), big);
         assert_eq!(r.file_type("/top.txt").unwrap(), Some(FileType::Regular));
     }
 }

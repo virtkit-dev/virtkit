@@ -92,6 +92,10 @@ fn group_lookup(group: &[u8], name: &str) -> Option<u32> {
     None
 }
 
+/// The most an account database (`/etc/passwd`, `/etc/group`) is read to, out of an image
+/// the job chose: a real one is a few KiB.
+const MAX_ACCOUNT_FILE_BYTES: u64 = 4 << 20;
+
 /// The guest job user's (uid, gid) for the `cibuild` host_checkout share. Accepts the Docker
 /// `User` forms `name`, `uid`, `name:group`, and `uid:gid` (either half may be a name). The user
 /// half gives the uid and a default primary gid — numeric, else resolved against the guest rootfs
@@ -111,7 +115,7 @@ fn guest_run_user_ids(user: &str, rootfs: &Path) -> Option<(u32, u32)> {
     let read_rootfs = |path: &str| -> Option<Vec<u8>> {
         crate::ext4_read::Ext4Reader::open(rootfs)
             .ok()?
-            .read_file(path)
+            .read_file(path, MAX_ACCOUNT_FILE_BYTES)
             .ok()
     };
     let (uid, mut gid) = match user_part.parse::<u32>() {

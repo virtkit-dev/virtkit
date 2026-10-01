@@ -101,17 +101,13 @@ pub fn prepare(
         // Resolve the boot-critical module basenames to their in-image relative paths
         // (under /lib/modules/<ver>) via modules.dep, then read each .ko out.
         let dep_path = format!("/lib/modules/{ver}/modules.dep");
-        let dep_text = String::from_utf8(
-            reader
-                .read_file(&dep_path)
-                .with_context(|| format!("reading {dep_path}"))?,
-        )
-        .with_context(|| format!("{dep_path} is not UTF-8"))?;
+        let dep_text = String::from_utf8(reader.read_file(&dep_path, MAX_TEXT_BYTES)?)
+            .with_context(|| format!("{dep_path} is not UTF-8"))?;
         let rel_paths = resolve_module_paths(&dep_text, WANTED_MODULES);
 
         for rel in &rel_paths {
             let abs_in_image = format!("/lib/modules/{ver}/{rel}");
-            let raw = match reader.read_file(&abs_in_image) {
+            let raw = match reader.read_file(&abs_in_image, MAX_MODULE_BYTES) {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     eprintln!("virtkit: skipping module {abs_in_image} (unreadable: {e:#})");
@@ -121,7 +117,7 @@ pub fn prepare(
             // Modern distros ship compressed modules (Debian .ko.xz, others .ko.zst /
             // .ko.gz). The agent insmods raw .ko, so decompress here and store the module
             // under its plain .ko name (both in the initramfs and the load list).
-            let (ko_rel, bytes) = match decompress_module(rel, raw) {
+            let (ko_rel, bytes) = match decompress_module(rel, raw, MAX_MODULE_BYTES) {
                 Ok(pair) => pair,
                 Err(e) => {
                     eprintln!("virtkit: skipping module {abs_in_image} ({e:#})");
@@ -171,11 +167,23 @@ fn kernel_version(reader: &Ext4Reader) -> Result<String> {
     }
 }
 
+// Caps on what an image — possibly a guest-written disk — can make the host allocate, by the
+// size it gives a file or by what that file decompresses to. Each is far past any real one.
+/// Maximum size of a kernel image, and separately of its decompressed payload.
+const MAX_KERNEL_BYTES: u64 = 256 << 20;
+/// Maximum size of a module, and separately of its decompressed output.
+const MAX_MODULE_BYTES: u64 = 64 << 20;
+/// Maximum `modules.dep` size.
+const MAX_TEXT_BYTES: u64 = 16 << 20;
+/// The most compressed-payload candidates tried in a kernel image, each a codec process: a real
+/// bzImage holds one payload and few stray magics before it.
+const MAX_PAYLOAD_CANDIDATES: usize = 16;
+
 /// The image's raw kernel image bytes: `/boot/vmlinuz-<ver>`, falling back to the
 /// sole `vmlinuz-*` regular file under `/boot`.
 fn read_kernel(reader: &Ext4Reader, ver: &str) -> Result<Vec<u8>> {
     let exact = format!("/boot/vmlinuz-{ver}");
-    if let Ok(bytes) = reader.read_file(&exact) {
+    if let Ok(bytes) = reader.read_file(&exact, MAX_KERNEL_BYTES) {
         return Ok(bytes);
     }
     let candidates: Vec<String> = reader
@@ -188,9 +196,7 @@ fn read_kernel(reader: &Ext4Reader, ver: &str) -> Result<Vec<u8>> {
     match candidates.len() {
         1 => {
             let path = format!("/boot/{}", candidates[0]);
-            reader
-                .read_file(&path)
-                .with_context(|| format!("reading kernel {path}"))
+            reader.read_file(&path, MAX_KERNEL_BYTES)
         }
         0 => bail!("no {exact} and no vmlinuz-* under /boot"),
         _ => bail!("{exact} not found and multiple vmlinuz-* under /boot: {candidates:?}"),
@@ -225,11 +231,19 @@ fn extract_vmlinux(image: &[u8]) -> Result<Vec<u8>> {
         (&[0x42, 0x5a, 0x68], &["bzip2", "-dc"]),
     ];
     let mut tried_any = false;
+    let mut candidates = 0;
     for (magic, argv) in CODECS {
         let mut from = 0;
         while let Some(off) = find_subslice(&image[from..], magic) {
+            if candidates == MAX_PAYLOAD_CANDIDATES {
+                bail!(
+                    "no ELF vmlinux among the first {MAX_PAYLOAD_CANDIDATES} compressed \
+                     payloads found in the kernel image"
+                );
+            }
+            candidates += 1;
             let at = from + off;
-            match pipe_through(argv, &image[at..]) {
+            match pipe_through(argv, &image[at..], MAX_KERNEL_BYTES) {
                 Ok(out) if out.starts_with(ELF_MAGIC) => return Ok(out),
                 Ok(_) => {}
                 Err(PipeError::Spawn) => break, // codec not installed: skip this magic
@@ -258,12 +272,13 @@ enum PipeError {
     Run,
 }
 
-/// Run `argv` (argv[0] = program), feeding `input` on stdin and returning stdout.
-/// The decompressor's exit status is ignored — a bzImage's compressed stream is
-/// followed by a small trailer, so a codec that flags trailing data still emits the
-/// full vmlinux (matching `extract-vmlinux`); the caller validates the ELF magic.
-fn pipe_through(argv: &[&str], input: &[u8]) -> std::result::Result<Vec<u8>, PipeError> {
-    use std::io::Write;
+/// Run `argv` (argv[0] = program), feeding `input` on stdin and returning stdout, killing
+/// the program once stdout passes `max` bytes. The decompressor's exit status is ignored — a
+/// bzImage's compressed stream is followed by a small trailer, so a codec that flags trailing
+/// data still emits the full vmlinux (matching `extract-vmlinux`); the caller validates the
+/// ELF magic.
+fn pipe_through(argv: &[&str], input: &[u8], max: u64) -> std::result::Result<Vec<u8>, PipeError> {
+    use std::io::{Read, Write};
     use std::process::{Command, Stdio};
 
     let mut child = Command::new(argv[0])
@@ -281,12 +296,24 @@ fn pipe_through(argv: &[&str], input: &[u8]) -> std::result::Result<Vec<u8>, Pip
         let _ = stdin.write_all(&input);
         // drop closes the pipe (EOF for the child)
     });
-    let out = child.wait_with_output().map_err(|_| PipeError::Run)?;
+    let mut out = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .expect("stdout piped")
+        .take(max.saturating_add(1))
+        .read_to_end(&mut out);
+    let over = out.len() as u64 > max;
+    if over {
+        let _ = child.kill();
+    }
+    // Reaped whatever happened; the writer then sees EOF or EPIPE and returns.
+    let _ = child.wait();
     let _ = writer.join();
-    if out.stdout.is_empty() {
+    if read.is_err() || over || out.is_empty() {
         return Err(PipeError::Run);
     }
-    Ok(out.stdout)
+    Ok(out)
 }
 
 /// First offset of `needle` within `haystack`, if any.
@@ -305,23 +332,61 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// The handled suffixes must stay in sync with the accepted list in
 /// `resolve_module_paths`; a suffix accepted there but not here falls through as a
 /// plain `.ko` and fails to load.
-fn decompress_module(rel: &str, raw: Vec<u8>) -> Result<(String, Vec<u8>)> {
-    use std::io::Read;
+///
+/// Errors once the output passes `max` bytes: a few compressed bytes can claim gigabytes.
+fn decompress_module(rel: &str, raw: Vec<u8>, max: u64) -> Result<(String, Vec<u8>)> {
     if let Some(stem) = rel.strip_suffix(".xz") {
-        let mut out = Vec::new();
+        let mut out = CappedWriter {
+            buf: Vec::new(),
+            max,
+        };
         lzma_rs::xz_decompress(&mut &raw[..], &mut out).context("xz-decompressing module")?;
-        Ok((stem.to_string(), out))
+        Ok((stem.to_string(), out.buf))
     } else if let Some(stem) = rel.strip_suffix(".zst") {
-        let out = zstd::decode_all(&raw[..]).context("zstd-decompressing module")?;
+        let dec =
+            zstd::stream::read::Decoder::new(&raw[..]).context("zstd-decompressing module")?;
+        let out = read_capped(dec, max).context("zstd-decompressing module")?;
         Ok((stem.to_string(), out))
     } else if let Some(stem) = rel.strip_suffix(".gz") {
-        let mut out = Vec::new();
-        flate2::read::GzDecoder::new(&raw[..])
-            .read_to_end(&mut out)
+        let out = read_capped(flate2::read::GzDecoder::new(&raw[..]), max)
             .context("gunzipping module")?;
         Ok((stem.to_string(), out))
     } else {
         Ok((rel.to_string(), raw))
+    }
+}
+
+/// All of `r`, or an error once it passes `max` bytes.
+fn read_capped(r: impl std::io::Read, max: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    r.take(max.saturating_add(1)).read_to_end(&mut out)?;
+    if out.len() as u64 > max {
+        bail!("decompresses to over {max} bytes");
+    }
+    Ok(out)
+}
+
+/// A `Vec` sink that fails a write taking it past `max` bytes.
+struct CappedWriter {
+    buf: Vec<u8>,
+    max: u64,
+}
+
+impl std::io::Write for CappedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if (self.buf.len() + data.len()) as u64 > self.max {
+            return Err(std::io::Error::other(format!(
+                "decompresses to over {} bytes",
+                self.max
+            )));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -447,7 +512,7 @@ kernel/net/vmw_vsock/vsock.ko.gz:
     #[test]
     fn decompress_module_plain_passthrough() {
         let raw = b"raw .ko bytes".to_vec();
-        let (rel, out) = decompress_module("kernel/x/foo.ko", raw.clone()).unwrap();
+        let (rel, out) = decompress_module("kernel/x/foo.ko", raw.clone(), u64::MAX).unwrap();
         assert_eq!(rel, "kernel/x/foo.ko");
         assert_eq!(out, raw);
     }
@@ -459,7 +524,8 @@ kernel/net/vmw_vsock/vsock.ko.gz:
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(&plain).unwrap();
         let (rel, out) =
-            decompress_module("kernel/fs/ext4/ext4.ko.gz", enc.finish().unwrap()).unwrap();
+            decompress_module("kernel/fs/ext4/ext4.ko.gz", enc.finish().unwrap(), u64::MAX)
+                .unwrap();
         assert_eq!(rel, "kernel/fs/ext4/ext4.ko");
         assert_eq!(out, plain);
     }
@@ -468,7 +534,7 @@ kernel/net/vmw_vsock/vsock.ko.gz:
     fn decompress_module_zst_roundtrips() {
         let plain = b"fake vsock.ko payload".to_vec();
         let z = zstd::encode_all(&plain[..], 0).unwrap();
-        let (rel, out) = decompress_module("kernel/net/vsock.ko.zst", z).unwrap();
+        let (rel, out) = decompress_module("kernel/net/vsock.ko.zst", z, u64::MAX).unwrap();
         assert_eq!(rel, "kernel/net/vsock.ko");
         assert_eq!(out, plain);
     }
@@ -480,9 +546,54 @@ kernel/net/vmw_vsock/vsock.ko.gz:
         let plain = b"fake virtio_blk.ko payload".to_vec();
         let mut xz = Vec::new();
         lzma_rs::xz_compress(&mut &plain[..], &mut xz).unwrap();
-        let (rel, out) = decompress_module("kernel/drivers/block/virtio_blk.ko.xz", xz).unwrap();
+        let (rel, out) =
+            decompress_module("kernel/drivers/block/virtio_blk.ko.xz", xz, u64::MAX).unwrap();
         assert_eq!(rel, "kernel/drivers/block/virtio_blk.ko");
         assert_eq!(out, plain);
+    }
+
+    /// Every compressed module format accepts output at the cap and rejects output above it.
+    #[test]
+    fn decompress_module_stops_at_its_cap() {
+        use std::io::Write;
+        let plain = vec![0u8; 64 << 10];
+        let max = plain.len() as u64;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&plain).unwrap();
+        let gz = gz.finish().unwrap();
+        let zst = zstd::encode_all(&plain[..], 0).unwrap();
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut &plain[..], &mut xz).unwrap();
+        for (rel, raw) in [("m.ko.gz", gz), ("m.ko.zst", zst), ("m.ko.xz", xz)] {
+            assert_eq!(
+                decompress_module(rel, raw.clone(), max).unwrap().1,
+                plain,
+                "{rel} at its cap"
+            );
+            assert!(
+                decompress_module(rel, raw, max - 1).is_err(),
+                "{rel} past its cap"
+            );
+        }
+    }
+
+    /// A codec whose output passes the cap is killed and its output refused.
+    #[test]
+    fn pipe_through_stops_at_its_cap() {
+        let input = vec![b'x'; 64 << 10];
+        let max = input.len() as u64;
+        assert_eq!(
+            pipe_through(&["cat"], &input, max).ok(),
+            Some(input.clone())
+        );
+        assert!(matches!(
+            pipe_through(&["cat"], &input, max - 1),
+            Err(PipeError::Run)
+        ));
+        assert!(matches!(
+            pipe_through(&["yes"], b"", max),
+            Err(PipeError::Run)
+        ));
     }
 
     #[test]
