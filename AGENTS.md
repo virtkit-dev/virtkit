@@ -195,8 +195,6 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
   local build — it needs KVM, e2fsprogs and network — and naming scripts narrows the run.
   Every other `tests/*.sh` is picked up by its glob, so adding one gates the next release
   with no registration step.
-- **GitLab** (`.gitlab-ci.yml`): reproducible build + independent rebuild attestation +
-  keyless Sigstore signing.
 
 Reproducibility is load-bearing: the binaries are baked into microVM images. Keep
 builds byte-deterministic (pinned toolchain/base image, `SOURCE_DATE_EPOCH`, path
