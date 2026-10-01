@@ -11,6 +11,8 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 
@@ -87,17 +89,47 @@ fn parse_identities(answer: &[u8]) -> Result<Vec<Identity>> {
     Ok(out)
 }
 
+/// Upper bound on guest connections relayed concurrently. Each holds a thread here and a
+/// connection to the user's agent; an ssh client uses one at a time.
+const MAX_CLIENTS: usize = crate::run::SSH_AGENT_MAX_CONNS;
+
+/// Whether a connection past [`MAX_CLIENTS`] has been reported (once per process).
+static REJECTION_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// One of [`MAX_CLIENTS`] slots, released on drop even if the handler panics.
+struct Slot(Arc<AtomicUsize>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Serve the filtering proxy on `listen`, relaying to the real agent at `upstream`, exposing
-/// only keys in `allow`. One thread per client connection; runs until the socket is removed.
+/// only keys in `allow`. One thread per client connection, at most [`MAX_CLIENTS`]
+/// concurrently (further connections are closed immediately); runs until the socket is
+/// removed.
 pub fn run_proxy(listen: &Path, upstream: &Path, allow: &[Vec<u8>]) -> Result<()> {
     let _ = std::fs::remove_file(listen);
     let l = vk_core::unixpath::bind(listen)
         .with_context(|| format!("binding ssh-agent proxy at {}", listen.display()))?;
+    let open = Arc::new(AtomicUsize::new(0));
     for conn in l.incoming() {
         let Ok(client) = conn else { continue };
+        if open.fetch_add(1, Ordering::Relaxed) >= MAX_CLIENTS {
+            open.fetch_sub(1, Ordering::Relaxed);
+            if !REJECTION_LOGGED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "virtkit: ssh-agent filter: {MAX_CLIENTS} connections open, closing new ones"
+                );
+            }
+            continue;
+        }
         let upstream = upstream.to_path_buf();
         let allow = allow.to_vec();
+        let slot = Slot(Arc::clone(&open));
         std::thread::spawn(move || {
+            let _slot = slot;
             if let Err(e) = handle_conn(client, &upstream, &allow) {
                 eprintln!("virtkit: ssh-agent filter: connection ended ({e:#})");
             }
@@ -274,6 +306,70 @@ pub(crate) fn b64_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest cannot make the proxy hold more than its bound of threads and agent
+    /// connections: a connection past it is closed at once, the others stay served.
+    #[test]
+    fn connections_past_the_bound_are_closed() {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("vk-agent-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (listen, upstream) = (dir.join("proxy.sock"), dir.join("agent.sock"));
+        // A fake agent answering every REQUEST_IDENTITIES with zero keys. It and the proxy
+        // below never return; their threads are deliberately leaked.
+        let agent = std::os::unix::net::UnixListener::bind(&upstream).unwrap();
+        std::thread::spawn(move || {
+            for c in agent.incoming() {
+                let Ok(mut c) = c else { continue };
+                std::thread::spawn(move || {
+                    let mut req = [0u8; 5];
+                    while c.read_exact(&mut req).is_ok() && req == [0, 0, 0, 1, 11] {
+                        if c.write_all(&[0, 0, 0, 5, 12, 0, 0, 0, 0]).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        {
+            let (listen, upstream) = (listen.clone(), upstream.clone());
+            std::thread::spawn(move || run_proxy(&listen, &upstream, &[]));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !listen.exists() {
+            assert!(Instant::now() < deadline, "the proxy never bound");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let clients: Vec<UnixStream> = (0..MAX_CLIENTS)
+            .map(|_| UnixStream::connect(&listen).unwrap())
+            .collect();
+        let mut extra = UnixStream::connect(&listen).unwrap();
+        extra
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(
+            extra.read(&mut [0u8; 1]).unwrap(),
+            0,
+            "past the bound: closed"
+        );
+        let mut first = &clients[0];
+        first
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        first
+            .write_all(&[0, 0, 0, 1, SSH_AGENTC_REQUEST_IDENTITIES])
+            .unwrap();
+        let mut answer = [0u8; 9];
+        first.read_exact(&mut answer).unwrap();
+        assert_eq!(
+            answer,
+            [0, 0, 0, 5, SSH_AGENT_IDENTITIES_ANSWER, 0, 0, 0, 0],
+            "within the bound: still served"
+        );
+        drop(clients);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn ident_answer(keys: &[(&[u8], &[u8])]) -> Vec<u8> {
         let mut out = vec![SSH_AGENT_IDENTITIES_ANSWER];

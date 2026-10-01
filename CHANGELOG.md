@@ -39,6 +39,9 @@ All notable changes to virtkit will be documented in this file.
   the second project's guest could read the first's objects. They are now kept per project
   id, and one whose remote is another project's is re-cloned; existing checkouts are re-cloned
   once, and the old ones are reclaimed after the idle window.
+- **Security: a guest can no longer exhaust host threads and ssh-agent connections through
+  `--ssh-host` agent forwarding.** The key-filtering proxy relays at most 32 connections at
+  once and closes any beyond that.
 - **A guest-written disk image can no longer crash the host's `vk` or make it allocate
   gigabytes** when `vk` reads the image (for a `FROM --kernel=image` stage, or a job's
   `/etc/passwd`): its geometry, links and extents are now checked, and every file read

@@ -111,6 +111,9 @@ impl KernelSource {
 const VSOCK_PORT: u32 = 4444;
 /// vsock port the guest SSH-agent forwarder dials; the host splices it to `$SSH_AUTH_SOCK`.
 pub(crate) const SSH_AGENT_VSOCK_PORT: u32 = 2223;
+/// Upper bound on guest connections the ssh-agent forward relays concurrently. Each holds a
+/// connection to the user's agent; an ssh client uses one at a time.
+pub(crate) const SSH_AGENT_MAX_CONNS: usize = 32;
 /// Guest path the forwarded agent socket binds at — must match vk-agent's `SSH_AGENT_SOCK`
 /// (vk-agent/src/init.rs). Emitted as `IdentityAgent` in generated `~/.ssh/config`.
 pub const GUEST_SSH_AGENT_SOCK: &str = "/run/virtkit-ssh-agent.sock";
