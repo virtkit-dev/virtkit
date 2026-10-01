@@ -140,7 +140,7 @@ const KEYS: &[Key] = &[
     Key {
         table: Table::Upstream,
         name: "password_file",
-        help: "file holding that password",
+        help: "file holding that password, sent only over https:// (or loopback)",
     },
     Key {
         table: Table::Upstream,

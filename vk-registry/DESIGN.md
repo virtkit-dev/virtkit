@@ -125,8 +125,9 @@ prefix = "ghcr.io"
 url = "https://ghcr.io"
 ```
 
-An omitted prefix is a catch-all. Upstreams may specify Basic credentials and an additional
-CA certificate. Bearer challenges from upstream registries are handled by the OCI client.
+An omitted prefix is a catch-all. Upstreams may specify Basic credentials, sent only over
+`https://` (or loopback), and an additional CA certificate. Bearer challenges from upstream
+registries are handled by the OCI client.
 
 | Request | Behavior on a local miss | Persisted locally |
 |---|---|---|

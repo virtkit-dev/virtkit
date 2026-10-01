@@ -465,7 +465,8 @@ impl ServerConfig {
 
     /// Auth over plain HTTP on a routable address would put the bearer token / Basic
     /// password (or, in accounts mode, a session cookie / API key) on the wire in
-    /// cleartext; refuse it rather than silently expose creds. Split out of
+    /// cleartext; refuse it rather than silently expose creds, and likewise an upstream
+    /// password the relay would send over plain HTTP. Split out of
     /// [`ServerConfig::into_state`] for the same reason as [`Self::check_auth_exclusions`]:
     /// a config file can then be held to it without a store or a listening socket.
     fn check_no_cleartext_creds(&self) -> Result<()> {
@@ -480,6 +481,20 @@ impl ServerConfig {
                  would be sent in cleartext; set tls_cert/tls_key or bind a loopback address",
                 self.addr
             );
+        }
+        // The relay sends passwords to token realms and bearer tokens to upstreams;
+        // both require HTTPS outside loopback. Match the relay's credential check
+        // without reading the password file.
+        for u in &self.upstreams {
+            let has_creds =
+                u.username.as_ref().is_some_and(|n| !n.is_empty()) && u.password_file.is_some();
+            if has_creds && !u.url.starts_with("https://") && !is_local_url(&u.url) {
+                bail!(
+                    "upstream {}: refusing to send its password over plain HTTP; use https:// \
+                     (with ca_file for a private CA)",
+                    u.url
+                );
+            }
         }
         Ok(())
     }
@@ -767,6 +782,28 @@ fn load_key(path: &Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A relay never sends an upstream's password in clear past loopback.
+    #[test]
+    fn an_upstream_password_needs_https_off_loopback() {
+        let check = |url: &str, username: &str, password: bool| {
+            let mut cfg = ServerConfig::local(DEFAULT_ADDR, PathBuf::from("/nonexistent"));
+            cfg.upstreams.push(UpstreamSpec {
+                prefix: String::new(),
+                url: url.to_string(),
+                username: Some(username.to_string()),
+                password_file: password.then(|| PathBuf::from("/nonexistent/pw")),
+                ca_file: None,
+            });
+            cfg.check_no_cleartext_creds()
+        };
+        assert!(check("http://registry.example", "robot", true).is_err());
+        assert!(check("https://registry.example", "robot", true).is_ok());
+        assert!(check("http://127.0.0.1:5000", "robot", true).is_ok());
+        assert!(check("http://registry.example", "robot", false).is_ok());
+        // No username: the relay sends nothing, so there is nothing to protect.
+        assert!(check("http://registry.example", "", true).is_ok());
+    }
 
     /// What a config file states, for a unit built around it: the address and store it
     /// names, and whether it turns TLS on. `None` where it says nothing, which is the part

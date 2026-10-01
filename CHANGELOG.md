@@ -50,6 +50,9 @@ All notable changes to virtkit will be documented in this file.
 - **Security: the guest's SFTP server hands the logged-in user only files and directories it
   created**, and no longer changes ownership or modes through a symlink another guest
   process planted.
+- **Security: a `vk-registry` relay no longer sends an upstream's password in clear.** An
+  upstream with a password must be `https://` (or loopback), and a token realm the upstream
+  names gets its credentials only over HTTPS (or loopback).
 - **Security: a `host_checkout` tree is no longer shared between projects.** Checkouts were
   kept per folded project name, so two projects whose names folded together shared one, and
   the second project's guest could read the first's objects. They are now kept per project

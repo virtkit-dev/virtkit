@@ -91,7 +91,10 @@ pub async fn get_blob(
     };
     let url = format!("{}/v2/{repo}/blobs/{digest}", u.base);
 
-    let resp = authed(u, RMethod::GET, &url, None).await?;
+    let resp = match authed(u, RMethod::GET, &url, None).await {
+        Ok(resp) => resp,
+        Err(e) => return refusal_response(e),
+    };
     if !resp.status().is_success() {
         return Ok(error_response(
             StatusCode::NOT_FOUND,
@@ -199,7 +202,10 @@ pub async fn get_manifest(
     };
     let url = format!("{}/v2/{repo}/manifests/{reference}", u.base);
     let method = if head { RMethod::HEAD } else { RMethod::GET };
-    let resp = authed(u, method, &url, Some(MANIFEST_ACCEPT)).await?;
+    let resp = match authed(u, method, &url, Some(MANIFEST_ACCEPT)).await {
+        Ok(resp) => resp,
+        Err(e) => return refusal_response(e),
+    };
     if !resp.status().is_success() {
         return Ok(error_response(
             StatusCode::NOT_FOUND,
@@ -310,6 +316,12 @@ async fn authed(
         .with_context(|| format!("{method} {url} (authenticated)"))
 }
 
+/// Credentials require HTTPS or loopback. Registry token auth allows the upstream to
+/// name a realm on another host, but not to send credentials there in cleartext.
+fn realm_may_receive_creds(realm: &str, has_creds: bool) -> bool {
+    !has_creds || realm.starts_with("https://") || crate::config::is_local_url(realm)
+}
+
 /// Fetch a bearer token for a `Bearer realm="…",service="…",scope="…"` challenge.
 /// Returns `None` for a non-Bearer scheme or a token endpoint that declines.
 async fn obtain_token(u: &Upstream, challenge: &str) -> Result<Option<String>> {
@@ -332,6 +344,12 @@ async fn obtain_token(u: &Upstream, challenge: &str) -> Result<Option<String>> {
     let Some(realm) = realm else {
         return Ok(None);
     };
+    // `UpstreamSpec::build` drops empty usernames, so this matches the credential check
+    // for the upstream's URL in the config.
+    let has_creds = u.username.is_some() && u.password.is_some();
+    if !realm_may_receive_creds(&realm, has_creds) {
+        return Err(RealmRefused(realm).into());
+    }
     let mut req = u.client.get(&realm).query(&params);
     if let (Some(user), Some(pass)) = (&u.username, &u.password) {
         req = req.basic_auth(user, Some(pass));
@@ -349,6 +367,37 @@ async fn obtain_token(u: &Upstream, challenge: &str) -> Result<Option<String>> {
     Ok(t.token.or(t.access_token))
 }
 
+/// A token realm that cannot receive credentials: an upstream error (502), not an
+/// internal server error (500).
+#[derive(Debug)]
+struct RealmRefused(String);
+
+impl std::fmt::Display for RealmRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to send upstream credentials to the non-HTTPS token realm {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for RealmRefused {}
+
+/// Log [`RealmRefused`] and return 502; no error propagates for the server to log.
+/// Propagate other errors.
+fn refusal_response(e: anyhow::Error) -> Result<Response<Body>> {
+    if e.is::<RealmRefused>() {
+        eprintln!("vk-registry: {e:#}");
+        return Ok(error_response(
+            StatusCode::BAD_GATEWAY,
+            "UNKNOWN",
+            "the upstream's token realm is not HTTPS",
+        ));
+    }
+    Err(e)
+}
+
 fn manifest_head_response(digest: &str, ctype: &str) -> Result<Response<Body>> {
     Response::builder()
         .status(StatusCode::OK)
@@ -362,6 +411,22 @@ fn manifest_head_response(digest: &str, ctype: &str) -> Result<Response<Body>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_go_only_to_an_https_or_loopback_realm() {
+        assert!(realm_may_receive_creds("https://auth.example/token", true));
+        assert!(realm_may_receive_creds("http://127.0.0.1:5001/token", true));
+        assert!(!realm_may_receive_creds("http://auth.example/token", true));
+        assert!(realm_may_receive_creds("http://auth.example/token", false));
+    }
+
+    /// The upstream's misconfiguration, so a 502; anything else stays an internal error.
+    #[test]
+    fn a_refused_realm_is_a_bad_gateway() {
+        let refused = refusal_response(RealmRefused("http://auth.example".into()).into());
+        assert_eq!(refused.unwrap().status(), StatusCode::BAD_GATEWAY);
+        assert!(refusal_response(anyhow::anyhow!("disk full")).is_err());
+    }
 
     /// Asking upstream for a type we would then relabel is the one drift between these two
     /// lists that nothing else would catch: the request succeeds, and every response of that
