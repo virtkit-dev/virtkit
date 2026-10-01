@@ -15,6 +15,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A pull or build no longer waits forever on an image lock another local user holds**; it
+  fails, naming that user's uid, or saying the holder does not answer.
 - **Security: the build cache no longer serves a snapshot built from a different
   `--build-arg`.** A RUN's key ignored the ARG values its shell is given unless the command
   line named them, so a job building the same Dockerfile with another value stored a

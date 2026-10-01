@@ -205,16 +205,102 @@ fn pull_lock_addr(h: u64) -> std::io::Result<SocketAddr> {
     SocketAddr::from_abstract_name(format!("virtkit-pull-{h:016x}"))
 }
 
+/// Connect to the abstract socket `addr` without waiting: a holder that never accepts, its
+/// backlog full, refuses at once (`EAGAIN`) rather than hanging the waiter. The stream is
+/// returned blocking. `None` when it cannot connect now.
+fn connect_nonblocking(addr: &SocketAddr) -> Option<UnixStream> {
+    use std::os::fd::FromRawFd;
+    let (sa, len) = abstract_sockaddr(addr)?;
+    // SAFETY: socket(2) has no memory preconditions; the descriptor is owned below.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` is a fresh socket owned by nothing else.
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    // SAFETY: `sa` is a valid sockaddr_un and `len` covers exactly what was filled in.
+    let rc = unsafe { libc::connect(fd, (&raw const sa).cast(), len as libc::socklen_t) };
+    if rc != 0 {
+        return None;
+    }
+    stream.set_nonblocking(false).ok()?;
+    Some(stream)
+}
+
+/// `addr`'s abstract name as a `sockaddr_un` and its length: the leading NUL that marks the
+/// abstract namespace, then the name, unterminated.
+fn abstract_sockaddr(addr: &SocketAddr) -> Option<(libc::sockaddr_un, usize)> {
+    let name = addr.as_abstract_name()?;
+    // SAFETY: an all-zero sockaddr_un is valid; the name is copied after the leading NUL, and
+    // the length check keeps it inside sun_path.
+    let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if name.len() + 1 > sa.sun_path.len() {
+        return None;
+    }
+    for (dst, src) in sa.sun_path[1..].iter_mut().zip(name) {
+        *dst = *src as libc::c_char;
+    }
+    Some((
+        sa,
+        std::mem::size_of::<libc::sa_family_t>() + 1 + name.len(),
+    ))
+}
+
+/// Who answers on the lock's abstract socket. The name is in a namespace every local user
+/// shares and has no permissions, so anyone can bind it first; `uid` is the binder's, from the
+/// kernel, and `who` what its responder said it is.
+struct Holder {
+    uid: Option<u32>,
+    who: Option<String>,
+}
+
 /// Ask the current lock holder who it is, over the same abstract socket it holds: the
-/// holder's responder answers each connection with its `jobctx::job_identity()`. None if nothing
-/// answers in time (holder crashed, or racing our connect) — best-effort diagnostics.
-fn query_holder(addr: &SocketAddr) -> Option<String> {
-    let mut s = UnixStream::connect_addr(addr).ok()?;
+/// holder's responder answers each connection with its `jobctx::job_identity()`, and the
+/// kernel says which user bound it. None if nothing answers (holder gone, or racing our
+/// connect). What the holder says goes into job logs, so only printable ASCII of it is kept,
+/// and at most 200 bytes.
+fn query_holder(addr: &SocketAddr) -> Option<Holder> {
+    use std::os::fd::AsRawFd;
+    let s = connect_nonblocking(addr)?;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: SO_PEERCRED writes one `ucred` through a pointer to a local of that size, and
+    // the descriptor is `s`'s, live for the call.
+    let uid = (unsafe {
+        libc::getsockopt(
+            s.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &mut len,
+        )
+    } == 0)
+        .then_some(cred.uid);
     let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(1)));
-    let mut buf = String::new();
-    s.read_to_string(&mut buf).ok()?;
-    let who = buf.trim();
-    (!who.is_empty()).then(|| who.to_string())
+    let mut buf = Vec::new();
+    let _ = (&s).take(4096).read_to_end(&mut buf);
+    let who: String = buf
+        .iter()
+        .map(|&b| char::from(b))
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(200)
+        .collect();
+    let who = who.trim();
+    Some(Holder {
+        uid,
+        who: (!who.is_empty()).then(|| who.to_string()),
+    })
 }
 
 /// FNV-1a over concatenated byte slices (cache keys and lock names, not
@@ -258,12 +344,42 @@ pub(crate) fn acquire_pull_lock(
 ) -> Result<PullLock> {
     let addr = pull_lock_addr(pull_lock_hash(dir))?;
     let mut waiting = false;
+    let mut polls: u32 = 0;
+    // Queries in a row nothing answered while the name stayed bound. Our own holder always
+    // accepts, so a holder that never does — its backlog full — is not a pull of ours.
+    let mut unanswered: u32 = 0;
     loop {
+        polls = polls.wrapping_add(1);
         match UnixListener::bind_addr(&addr) {
             Ok(lock) => return Ok(spawn_holder(lock)),
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // Asked again every 5 s, not only at the first refusal: the holder can go and
+            // another user's process take the name while this one waits.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::AddrInUse
+                    && (!waiting || polls.is_multiple_of(25)) =>
+            {
+                let holder = query_holder(&addr);
+                unanswered = if holder.is_some() { 0 } else { unanswered + 1 };
+                if unanswered >= 3 {
+                    bail!(
+                        "the {verb} lock for {name}@{digest} is held by a process that does \
+                         not answer, not by a virtkit — refusing to wait on it"
+                    );
+                }
+                // SAFETY: geteuid(2) has no preconditions and cannot fail.
+                let me = unsafe { libc::geteuid() };
+                if let Some(uid) = holder.as_ref().and_then(|h| h.uid)
+                    && uid != me
+                {
+                    // Not a concurrent pull of ours: another user holds the name, and would
+                    // hold this pull forever.
+                    bail!(
+                        "the {verb} lock for {name}@{digest} is held by uid {uid}, not by a \
+                         virtkit of this user — refusing to wait on it"
+                    );
+                }
                 if !waiting {
-                    match query_holder(&addr) {
+                    match holder.and_then(|h| h.who) {
                         Some(who) => println!(
                             "virtkit: waiting for a concurrent {verb} of {name}@{digest} \
                              (held by {who}) ..."
@@ -272,8 +388,11 @@ pub(crate) fn acquire_pull_lock(
                             "virtkit: waiting for a concurrent {verb} of {name}@{digest} ..."
                         ),
                     }
-                    waiting = true;
                 }
+                waiting = true;
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
             Err(e) => return Err(e).context("binding the pull-lock socket"),
@@ -632,14 +751,83 @@ mod tests {
         }
     }
 
+    /// A squatter that never accepts, its backlog full, cannot hang a waiter: the query gives
+    /// up at once instead of blocking in connect.
+    #[test]
+    fn a_holder_that_never_accepts_does_not_hang_the_query() {
+        let dir = std::env::temp_dir().join(format!("virtkit-test-full-{}", std::process::id()));
+        use std::os::fd::FromRawFd;
+        let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
+        // A listener with no backlog, which a connection or two fills — not one with the
+        // default backlog, which would take thousands of descriptors to fill.
+        let (sa, len) = abstract_sockaddr(&addr).unwrap();
+        // SAFETY: plain socket calls on a fresh descriptor, owned by `squatter` below; `sa`
+        // and `len` describe exactly the address filled in.
+        let squatter = unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            assert!(fd >= 0);
+            assert_eq!(
+                libc::bind(fd, (&raw const sa).cast(), len as libc::socklen_t),
+                0
+            );
+            assert_eq!(libc::listen(fd, 0), 0);
+            UnixListener::from_raw_fd(fd)
+        };
+        // Fill its backlog with connections it never accepts.
+        let mut held = Vec::new();
+        while let Some(c) = connect_nonblocking(&addr) {
+            held.push(c);
+            assert!(held.len() < 8, "a backlog of 0 never filled");
+        }
+        let started = std::time::Instant::now();
+        assert!(query_holder(&addr).is_none());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        // And a waiter gives up on it, a few unanswered queries in, rather than waiting
+        // forever on a name no pull of ours holds.
+        let err = acquire_pull_lock(&dir, "pull", "img", "sha256:x")
+            .err()
+            .expect("a holder that never answers is refused")
+            .to_string();
+        assert!(err.contains("does not answer"), "{err}");
+        drop((held, squatter));
+    }
+
+    /// What a holder says of itself lands in job logs: control bytes are dropped, and it is
+    /// cut short. Any local user can bind the name, so it may say anything.
+    #[test]
+    fn a_holders_self_description_is_kept_printable() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("virtkit-test-evil-{}", std::process::id()));
+        let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
+        let squatter = UnixListener::bind_addr(&addr).unwrap();
+        let answer = std::thread::spawn(move || {
+            let (mut s, _) = squatter.accept().unwrap();
+            let mut say = b"\x1b[2Jevil\x07 job".to_vec();
+            say.extend(std::iter::repeat_n(b'x', 1000));
+            let _ = s.write_all(&say);
+        });
+        let holder = query_holder(&addr).expect("the squatter answers");
+        answer.join().unwrap();
+        let who = holder.who.unwrap();
+        assert!(who.starts_with("[2Jevil job"), "{who:?}");
+        assert!(who.chars().all(|c| c.is_ascii_graphic() || c == ' '));
+        assert!(who.len() <= 200);
+    }
+
     #[test]
     fn pull_lock_answers_holder_identity_then_releases() {
         let dir = std::env::temp_dir().join(format!("virtkit-test-holder-{}", std::process::id()));
         let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
         let lock = acquire_pull_lock(&dir, "build", "myimg", "sha256:x").unwrap();
         // a waiter reads the holder's identity over the lock socket (pid fallback, no CI env)
-        let who = query_holder(&addr).expect("the holder should answer");
-        assert!(!who.trim().is_empty());
+        let holder = query_holder(&addr).expect("the holder should answer");
+        assert!(holder.who.is_some_and(|w| !w.trim().is_empty()));
+        // SAFETY: geteuid(2) has no preconditions and cannot fail.
+        assert_eq!(
+            holder.uid,
+            Some(unsafe { libc::geteuid() }),
+            "the kernel names the binder"
+        );
         // released on drop: the addr binds again (retry for fork-inherited fd races)
         drop(lock);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
