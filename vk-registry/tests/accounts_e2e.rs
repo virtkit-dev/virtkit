@@ -1875,3 +1875,52 @@ async fn settings_tags_delete_is_admin_only_and_drops_the_pointer() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A browser cannot be made to write through the machine routes by another site's page:
+/// the browser says so in `Sec-Fetch-Site`, and such a write is refused. The same request
+/// from the registry's own pages, or from a client that sends no such header, is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_site_write_cannot_ride_a_session() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let dir = tmp("crosssite");
+    let state = accounts_state(&dir);
+    let db = accounts_db(&state);
+    let admin = db
+        .upsert_user("https://issuer", "admin", None, None)
+        .unwrap();
+    db.set_admin(&admin.id, true).unwrap();
+    let session = db
+        .create_session(&admin.id, Duration::from_secs(3600))
+        .unwrap();
+    let url = spawn(state.clone());
+    let client = no_redirect_client();
+    let acquire = |site: Option<&'static str>| {
+        let mut req = client
+            .post(format!("{url}/lock/acquire?name=k&wait=0"))
+            .header("Cookie", format!("__Host-vk_session={session}"));
+        if let Some(site) = site {
+            req = req.header("Sec-Fetch-Site", site);
+        }
+        req.send()
+    };
+    for site in ["cross-site", "same-site"] {
+        let resp = acquire(Some(site)).await.unwrap();
+        assert_eq!(resp.status(), 403, "{site}");
+    }
+    for site in [Some("same-origin"), None] {
+        let resp = acquire(site).await.unwrap();
+        assert_eq!(resp.status(), 200, "{site:?}");
+        let owner = resp.json::<serde_json::Value>().await.unwrap()["owner"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        client
+            .post(format!("{url}/lock/release?name=k"))
+            .header("Cookie", format!("__Host-vk_session={session}"))
+            .header("x-vk-lock-owner", owner)
+            .send()
+            .await
+            .unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

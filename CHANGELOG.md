@@ -22,6 +22,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: `vk-registry` refuses a write a browser makes on another site's behalf** to
+  `/v2/`, `/lock/` or WebDAV, whether the browser holds a session, Basic credentials or, on
+  an open server, nothing.
 - **Security: the guest's SFTP server hands the logged-in user only files it created**, and
   no longer changes ownership or modes through a symlink another guest process planted.
 - **Security: a `host_checkout` tree is no longer shared between projects.** Checkouts were

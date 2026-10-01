@@ -2391,6 +2391,15 @@ async fn handle(
     }))
 }
 
+/// Whether the browser says another site made this request (`Sec-Fetch-Site`). A browser
+/// that predates the header, and every non-browser client, sends none.
+fn cross_site(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| !matches!(v, "same-origin" | "none"))
+}
+
 /// The answer to a request that failed on this server's side, saying nothing of why.
 fn internal_error() -> Response<Body> {
     error_response(
@@ -2475,6 +2484,23 @@ async fn route(req: Request<Incoming>, state: Arc<ServerState>) -> Result<Respon
         (Authenticator::Accounts { .. }, None) => return Ok(accounts::challenge()),
         (Authenticator::Shared(_), _) => Authz::NoScopes,
     };
+
+    // A browser attaches what it holds for this server to every request it makes, including
+    // one a page on another site makes it send: a session cookie, Basic credentials it was
+    // once prompted for (both challenges here are Basic), or nothing at all, which is enough
+    // for an open server. The forms carry CSRF tokens; the machine routes do not, so a write
+    // there is refused when the browser says another site asked for it. Clients that are not
+    // browsers never send the header.
+    if !is_human
+        && !matches!(req.method(), &Method::GET | &Method::HEAD)
+        && cross_site(req.headers())
+    {
+        return Ok(error_response(
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            "a write to this registry cannot come from another site's page",
+        ));
+    }
 
     if is_browse {
         // `/browse` is part of accounts mode and nothing else. It is the only surface
@@ -4313,6 +4339,25 @@ mod tests {
         assert_eq!(
             banner(root, 2, false, addr),
             "vk-registry: serving /srv/vk-registry [mirror (2 upstream(s))] on http://0.0.0.0:443"
+        );
+    }
+
+    #[test]
+    fn a_cross_site_request_is_told_apart() {
+        let h = |v: Option<&str>| {
+            let mut m = hyper::HeaderMap::new();
+            if let Some(v) = v {
+                m.insert("sec-fetch-site", v.parse().unwrap());
+            }
+            cross_site(&m)
+        };
+        assert!(h(Some("cross-site")));
+        assert!(h(Some("same-site")));
+        assert!(!h(Some("same-origin")));
+        assert!(!h(Some("none")));
+        assert!(
+            !h(None),
+            "a client that sends no header is not judged by it"
         );
     }
 
