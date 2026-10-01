@@ -303,3 +303,5 @@
 # disk_default = "8G"    # what a job with no history is expected to write into its job dir.
 #                        # Unset: 8G, capped at the filesystem's size; set larger than the
 #                        # filesystem, such jobs fail at once
+# max_concurrency = 12   # the most jobs `vk tune` ever asks the runner to accept, whatever the
+#                        # budget would allow. Unset: no ceiling of the host's own

@@ -1,6 +1,9 @@
 //! Keeping gitlab-runner's appetite in step with the host: works out how many jobs this
 //! runner should be accepting and leaves that number where `vk-runnerctl` can apply it.
 //!
+//! This is the one place the number is decided: `effective = min(local estimate, local
+//! ceiling)` ([`decide`]).
+//!
 //! The admission gate ([`crate::admit`]) is what keeps the host safe — it never lets more
 //! memory be committed than the budget allows. But a job it makes wait has already been
 //! assigned by GitLab: it holds one of the runner's slots and its own timeout runs while it
@@ -33,41 +36,145 @@ pub fn desired_file(cfg: &Config) -> PathBuf {
     cfg.state_dir().join("schedule").join("desired-concurrency")
 }
 
+/// The runner's concurrency and what it was worked out from:
+/// `effective = min(local estimate, local ceiling)`, each term optional.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decision {
+    /// What the host can take, by [`concurrency`]; `None` without a memory budget to measure
+    /// against.
+    pub estimate: Option<u32>,
+    /// `[executor.schedule] max_concurrency`.
+    pub local_ceiling: Option<u32>,
+    /// The smallest term, never below one; `None` when no term applies, which leaves the
+    /// runner's `concurrent` alone.
+    pub effective: Option<u32>,
+    /// The figures the estimate rests on, for the report line.
+    basis: Option<Basis>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Basis {
+    budget_mib: u64,
+    granted_mib: u64,
+    running: usize,
+    typical_mib: u64,
+    host: Option<(u64, u64)>,
+}
+
+/// The smallest of the terms that apply, never below one: `concurrent = 0` is not a throttle
+/// gitlab-runner has, so a ceiling of zero means one — stopping acquisition is a state of its
+/// own, not a number.
+pub fn effective(estimate: Option<u32>, local_ceiling: Option<u32>) -> Option<u32> {
+    [estimate, local_ceiling]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|n| n.max(1))
+}
+
+/// Work the concurrency out from the host, the ledger and the local ceiling. The estimate
+/// rises from the previous *effective* answer, so a ceiling that is lifted is climbed back
+/// from one step at a time.
+pub fn decide(cfg: &Config) -> Result<Decision> {
+    let local_ceiling = cfg.executor.schedule.max_concurrency;
+    let (estimate, basis) = match crate::vm::budget_mib(cfg) {
+        None => (None, None),
+        Some(budget) => {
+            let budget_mib = budget?;
+            // Propagated, not defaulted: a reading of "nothing committed" would offer the whole
+            // budget again, which is the one answer that overcommits the host.
+            let held = crate::admit::committed(&cfg.state_dir().join("admit"))?;
+            let declared_mib = crate::vm::parse_gib(&cfg.executor.vm.mem)
+                .context("invalid [executor.vm] mem")?
+                .checked_mul(1024)
+                .context("[executor.vm] mem is absurdly large")?;
+            let typical = typical_job_mib(cfg, declared_mib);
+            let previous = std::fs::read_to_string(desired_file(cfg))
+                .ok()
+                .and_then(|t| t.trim().parse::<u32>().ok());
+            // Read once: the figures the decision rests on are the ones reported below it.
+            let host = host_memory();
+            let want = concurrency(Inputs {
+                budget_mib,
+                granted_mib: held.granted_mib,
+                running: held.granted as u64,
+                typical_mib: typical,
+                host,
+                previous,
+            });
+            let basis = Basis {
+                budget_mib,
+                granted_mib: held.granted_mib,
+                running: held.granted,
+                typical_mib: typical,
+                host: host.map(|h| (h.available_mib, h.total_mib)),
+            };
+            (Some(want), Some(basis))
+        }
+    };
+    Ok(Decision {
+        estimate,
+        local_ceiling,
+        effective: effective(estimate, local_ceiling),
+        basis,
+    })
+}
+
+/// Put `decision` where the runner picks it up: the desired-concurrency file `vk-runnerctl`
+/// reads.
+pub fn apply(cfg: &Config, decision: &Decision) -> Result<()> {
+    match decision.effective {
+        Some(want) => write_desired(cfg, want),
+        None => Ok(()),
+    }
+}
+
 /// Measure the host and write what the runner's concurrency should be. Meant to run every
 /// half minute or so from a user timer; each run stands alone, reading its own previous
 /// answer back out of the file it writes.
 pub fn tune(cfg: &Config) -> Result<()> {
-    let Some(budget) = crate::vm::budget_mib(cfg) else {
+    if crate::vm::budget_mib(cfg).is_none() && cfg.executor.schedule.max_concurrency.is_none() {
         bail!(
             "[executor.schedule] mem_budget is unset: there is no budget to schedule against \
              (see the GitLab CI guide)"
         );
+    }
+    let decision = decide(cfg)?;
+    apply(cfg, &decision)?;
+    println!("virtkit: {}", describe(&decision));
+    Ok(())
+}
+
+/// One line saying what the concurrency is and which term set it.
+pub fn describe(d: &Decision) -> String {
+    let Some(want) = d.effective else {
+        return "runner concurrency left alone: no budget and no ceiling".to_string();
     };
-    let budget_mib = budget?;
-    // Propagated, not defaulted: a reading of "nothing committed" would offer the whole
-    // budget again, which is the one answer that overcommits the host.
-    let held = crate::admit::committed(&cfg.state_dir().join("admit"))?;
-    let declared_mib = crate::vm::parse_gib(&cfg.executor.vm.mem)
-        .context("invalid [executor.vm] mem")?
-        .checked_mul(1024)
-        .context("[executor.vm] mem is absurdly large")?;
-    let typical = typical_job_mib(cfg, declared_mib);
+    let term = |n: Option<u32>| n.map_or_else(|| "none".to_string(), |n| n.to_string());
+    let mut line = format!(
+        "runner concurrency {want} (estimate {}, local ceiling {})",
+        term(d.estimate),
+        term(d.local_ceiling)
+    );
+    if let Some(b) = &d.basis {
+        line.push_str(&format!(
+            "; {} of {} MiB committed by {} job(s), typical job {} MiB, {}",
+            b.granted_mib,
+            b.budget_mib,
+            b.running,
+            b.typical_mib,
+            match b.host {
+                Some((available, total)) =>
+                    format!("{available} of {total} MiB host memory available"),
+                None => "host memory unreadable".to_string(),
+            },
+        ));
+    }
+    line
+}
 
+fn write_desired(cfg: &Config, want: u32) -> Result<()> {
     let path = desired_file(cfg);
-    let previous = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| t.trim().parse::<u32>().ok());
-    // Read once: the figures the decision rests on are the ones reported below it.
-    let host = host_memory();
-    let want = concurrency(Inputs {
-        budget_mib,
-        granted_mib: held.granted_mib,
-        running: held.granted as u64,
-        typical_mib: typical,
-        host,
-        previous,
-    });
-
     if let Some(parent) = path.parent() {
         // 0700 like the ledger's, and for the same reason: a root process reads what is left
         // here, so no other local user may plant or rewrite it.
@@ -96,21 +203,7 @@ pub fn tune(cfg: &Config) -> Result<()> {
     file.write_all(format!("{want}\n").as_bytes())
         .with_context(|| format!("writing {}", tmp.display()))?;
     drop(file);
-    std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))?;
-    println!(
-        "virtkit: runner concurrency {want} ({} of {budget_mib} MiB committed by {} job(s), \
-         typical job {typical} MiB, {})",
-        held.granted_mib,
-        held.granted,
-        match host {
-            Some(h) => format!(
-                "{} of {} MiB host memory available",
-                h.available_mib, h.total_mib
-            ),
-            None => "host memory unreadable".to_string(),
-        },
-    );
-    Ok(())
+    std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))
 }
 
 /// What this host's `/proc/meminfo` says, in MiB.
@@ -326,6 +419,66 @@ mod tests {
             .collect();
         assert_eq!(left, ["desired-concurrency"].map(std::ffi::OsString::from));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_smallest_term_binds_and_one_is_the_floor() {
+        // Each term binds when it is the smallest.
+        assert_eq!(effective(Some(3), Some(6)), Some(3));
+        assert_eq!(effective(Some(9), Some(2)), Some(2));
+        // Absent terms do not bind; a ceiling applies without a budget to estimate from.
+        assert_eq!(effective(None, Some(5)), Some(5));
+        assert_eq!(effective(Some(7), None), Some(7));
+        assert_eq!(effective(None, None), None);
+        // Zero is not a throttle gitlab-runner has.
+        assert_eq!(effective(Some(4), Some(0)), Some(1));
+    }
+
+    fn scratch_cfg(tag: &str, schedule: crate::config::Schedule) -> (Config, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("vk-tune-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = Config {
+            state_dir: Some(dir.clone()),
+            executor: crate::config::Executor {
+                schedule,
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        (cfg, dir)
+    }
+
+    #[test]
+    fn a_decision_combines_the_estimate_with_the_ceiling() {
+        let (cfg, dir) = scratch_cfg(
+            "decide",
+            crate::config::Schedule {
+                mem_budget: Some("32G".into()),
+                max_concurrency: Some(3),
+                ..Default::default()
+            },
+        );
+        // The estimate is this host's own reading, so only its relation to the rest is fixed.
+        let d = decide(&cfg).unwrap();
+        assert_eq!(d.local_ceiling, Some(3));
+        assert!(d.estimate.is_some());
+        assert_eq!(d.effective, Some(d.estimate.unwrap().min(3)));
+        assert!(describe(&d).contains("local ceiling 3"), "{}", describe(&d));
+        // No budget: the local ceiling alone decides.
+        let (cfg, dir2) = scratch_cfg(
+            "decide-nobudget",
+            crate::config::Schedule {
+                max_concurrency: Some(5),
+                ..Default::default()
+            },
+        );
+        let d = decide(&cfg).unwrap();
+        assert_eq!((d.estimate, d.effective), (None, Some(5)));
+        apply(&cfg, &d).unwrap();
+        assert_eq!(std::fs::read_to_string(desired_file(&cfg)).unwrap(), "5\n");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]

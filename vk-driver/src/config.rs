@@ -223,6 +223,9 @@ pub struct Schedule {
     /// Independent of `mem_budget`; shares its queue and `wait_timeout_secs`. Default on;
     /// `false` turns it off.
     pub disk_admission: Option<bool>,
+    /// The most jobs the runner is ever told to accept, whatever the host could take: the
+    /// local ceiling in `min(estimate, local ceiling)`. Unset: no ceiling of the host's own.
+    pub max_concurrency: Option<u32>,
     /// What a job with no history of its own is expected to write into its job dir, as
     /// `"<n>G"`. Set larger than the filesystem, every such job fails at once. Default `"8G"`,
     /// capped at the filesystem's size.

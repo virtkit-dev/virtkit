@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`vk tune` honours a concurrency ceiling.** `[executor.schedule] max_concurrency` caps what
+  it asks for, and works without a `mem_budget` too. The report line now names the estimate
+  and the ceiling.
+
 ### Fixed
 
 - **`vk list` and `vk stop` no longer make a `vk run --state-dir` starting at that moment
