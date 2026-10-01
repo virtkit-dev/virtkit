@@ -15,6 +15,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Security: the build cache no longer stores a base image under a digest it does not
+  have.** A FROM image's tag moved during a build could put the new image in the shared
+  cache under the old digest, where a build pinned to that digest would pick it up.
 - **Security: a guest can no longer put terminal escape sequences into `vk atop --summary` or
   job logs** through its host, disk or network interface names or an OOM-killed process's
   name. Such characters are shown as `.`; an OOM record whose process name holds them is
