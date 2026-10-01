@@ -1167,6 +1167,8 @@ struct Switch {
     upstreams: Arc<[SocketAddr]>,
     /// egress policy + the DNS-pinned IP set (shared with the ipstack egress tasks)
     egress: Arc<EgressGuard>,
+    /// gateway DNS lookups in flight, at most [`MAX_DNS_IN_FLIGHT`]
+    dns_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// How a consumer spawns its switch: the listen sockets (one per VM on the LAN),
@@ -1396,7 +1398,12 @@ pub async fn run(
         tokio::spawn(follow_egress_file(guard.clone(), path, applied));
     }
     let (drain, mut drained) = Drain::new();
-    tokio::spawn(accept_loop(ip_stack, guard.clone(), drain.clone()));
+    tokio::spawn(accept_loop(
+        ip_stack,
+        guard.clone(),
+        drain.clone(),
+        MAX_FLOWS,
+    ));
     // The totals go out on a timer, so a reader that cannot stop the switch first — the job
     // trace, read while the job is still running — is at most a beat behind.
     tokio::spawn({
@@ -1470,6 +1477,7 @@ pub async fn run(
         hosts: Arc::new(hosts),
         upstreams: upstreams.into(),
         egress: guard,
+        dns_slots: Arc::new(tokio::sync::Semaphore::new(MAX_DNS_IN_FLIGHT)),
     });
 
     // ipstack egress replies -> the owning VM port.
@@ -1699,9 +1707,17 @@ impl Switch {
                         let egress = self.egress.clone();
                         let (lan, upstreams, query) =
                             (self.cfg, self.upstreams.clone(), query.to_vec());
-                        tokio::spawn(handle_dns(
-                            query, hosts, upstreams, lan, cip, src_port, mac, tx, egress,
-                        ));
+                        // At the cap the query is dropped, as a lossy network would; the
+                        // resolver asks again after its timeout (glibc's default: 5 s).
+                        if let Ok(slot) = self.dns_slots.clone().try_acquire_owned() {
+                            tokio::spawn(async move {
+                                handle_dns(
+                                    query, hosts, upstreams, lan, cip, src_port, mac, tx, egress,
+                                )
+                                .await;
+                                drop(slot);
+                            });
+                        }
                     }
                 } else if let Some(rst) = self
                     .egress
@@ -1847,23 +1863,53 @@ impl Drain {
     }
 }
 
+/// The most guest flows one switch — one job's network — carries at once. Each holds a task
+/// and a host socket, a UDP one an ephemeral port too, so without a bound one guest could
+/// exhaust the host's ports and descriptors. Far past what a build or a test suite opens; a
+/// bound across all of a host's jobs is not this switch's to keep.
+const MAX_FLOWS: usize = 8192;
+
+/// The most gateway DNS lookups in flight at once: each holds upstream sockets for up to
+/// [`DNS_UPSTREAM_BUDGET`]. A query past it is dropped, which a resolver retries.
+const MAX_DNS_IN_FLIGHT: usize = 256;
+
 /// ipstack's accept loop: each guest flow becomes a host-side proxy, gated by the
-/// egress policy (static IP allowlist + DNS-pinned IPs).
-async fn accept_loop(mut ip_stack: IpStack, egress: Arc<EgressGuard>, drain: Arc<Drain>) {
+/// egress policy (static IP allowlist + DNS-pinned IPs). At most `cap` flows run at once.
+async fn accept_loop(
+    mut ip_stack: IpStack,
+    egress: Arc<EgressGuard>,
+    drain: Arc<Drain>,
+    cap: usize,
+) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(cap));
+    let refusals = RateLimiter::new(FLOW_LOG_WINDOW, 1);
     loop {
-        match ip_stack.accept().await {
-            Ok(IpStackStream::Tcp(tcp)) => {
-                tokio::spawn(proxy_tcp(tcp, egress.clone(), drain.clone()));
-            }
-            Ok(IpStackStream::Udp(udp)) => {
-                tokio::spawn(proxy_udp(udp, egress.clone()));
-            }
-            Ok(_) => {} // UnknownTransport (ICMP, ...) / UnknownNetwork: dropped
+        let flow: Pin<Box<dyn Future<Output = ()> + Send>> = match ip_stack.accept().await {
+            Ok(IpStackStream::Tcp(tcp)) => Box::pin(proxy_tcp(tcp, egress.clone(), drain.clone())),
+            Ok(IpStackStream::Udp(udp)) => Box::pin(proxy_udp(udp, egress.clone())),
+            Ok(_) => continue, // UnknownTransport (ICMP, ...) / UnknownNetwork: dropped
             Err(e) => {
                 eprintln!("switch: ipstack accept: {e}");
                 return;
             }
-        }
+        };
+        let Ok(slot) = slots.clone().try_acquire_owned() else {
+            // Dropping it unpolled resets it if ipstack already answered the SYN; otherwise
+            // the SYN goes unanswered and the guest retries it, as against a host whose
+            // accept queue is full.
+            if let Some(dropped) = refusals.admit(Instant::now()) {
+                let more = match dropped {
+                    0 => String::new(),
+                    n => format!(" ({n} more since the last line)"),
+                };
+                eprintln!("switch: {cap} flows open — dropping new ones{more}");
+            }
+            continue;
+        };
+        tokio::spawn(async move {
+            flow.await;
+            drop(slot);
+        });
     }
 }
 
@@ -4161,6 +4207,69 @@ mod tests {
         );
     }
 
+    /// A flow past the switch's cap is not proxied: the host never sees its connect, while
+    /// the flow within the cap stays up.
+    #[tokio::test]
+    async fn a_flow_past_the_cap_is_not_proxied() {
+        use etherparse::{PacketBuilder, PacketHeaders, TransportHeader};
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let (tx, rx) = unbounded_channel();
+            let (reply_tx, mut replies) = unbounded_channel();
+            let stack = IpStack::new(ip_stack_config(), ChannelDevice { rx, tx: reply_tx });
+            let guard = EgressGuard::new(Egress::AllowAll, Ipv4Addr::new(192, 168, 127, 1))
+                .with_registry_proxy(Some((FLOW_REMOTE.into(), listener.local_addr().unwrap())));
+            let (drain, _drained) = Drain::new();
+            tokio::spawn(accept_loop(stack, Arc::new(guard), drain, 1));
+            // The guest opens a flow from `port`: SYN, then an ACK of the SYN-ACK if one comes.
+            let mut open = async |port: u16| {
+                let mut syn = Vec::new();
+                PacketBuilder::ipv4(FLOW_GUEST, FLOW_REMOTE, 64)
+                    .tcp(port, 443, 1000, 64240)
+                    .syn()
+                    .write(&mut syn, &[])
+                    .unwrap();
+                tx.send(syn).unwrap();
+                let synack = tokio::time::timeout(Duration::from_millis(500), async {
+                    loop {
+                        let reply = replies.recv().await.unwrap();
+                        if let Some(TransportHeader::Tcp(tcp)) =
+                            PacketHeaders::from_ip_slice(reply_ip(&reply))
+                                .unwrap()
+                                .transport
+                            && tcp.destination_port == port
+                            && tcp.syn
+                            && tcp.ack
+                        {
+                            return tcp;
+                        }
+                    }
+                })
+                .await;
+                if let Ok(synack) = synack {
+                    let mut ack = Vec::new();
+                    PacketBuilder::ipv4(FLOW_GUEST, FLOW_REMOTE, 64)
+                        .tcp(port, 443, 1001, 64240)
+                        .ack(synack.sequence_number.wrapping_add(1))
+                        .write(&mut ack, &[])
+                        .unwrap();
+                    tx.send(ack).unwrap();
+                }
+            };
+            open(40000).await;
+            let (_host, _) = listener.accept().await.unwrap();
+            open(40001).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                    .await
+                    .is_err(),
+                "a flow past the cap reached the host"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_drain_settles_only_after_guest_bytes_stop_arriving() {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -4490,6 +4599,7 @@ mod tests {
             hosts: Arc::new(HashMap::new()),
             upstreams: Vec::new().into(),
             egress: Arc::new(EgressGuard::new(policy, gw)),
+            dns_slots: Arc::new(tokio::sync::Semaphore::new(MAX_DNS_IN_FLIGHT)),
         };
         (sw, port_rx, egress_rx)
     }
@@ -4502,6 +4612,29 @@ mod tests {
         frame.extend_from_slice(&ethertype.to_be_bytes());
         frame.extend_from_slice(ip);
         frame
+    }
+
+    /// A gateway DNS query past the in-flight cap is dropped, as a lossy network would; one
+    /// within it is answered.
+    #[tokio::test]
+    async fn dns_past_the_in_flight_cap_is_dropped() {
+        let ask = |slots: usize| async move {
+            let (mut sw, mut rx, _egress) = two_vm_switch(Egress::new(&[], &[]).unwrap());
+            sw.hosts = Arc::new([("db".to_string(), Ipv4Addr::new(192, 168, 231, 9))].into());
+            sw.dns_slots = Arc::new(tokio::sync::Semaphore::new(slots));
+            let mut ip = Vec::new();
+            etherparse::PacketBuilder::ipv4([192, 168, 231, 2], [192, 168, 231, 1], 64)
+                .udp(5353, DNS_PORT)
+                .write(&mut ip, &dns_question(7, "db", 1))
+                .unwrap();
+            sw.handle_frame(0, &to_gw(&ip, ETHERTYPE_IPV4));
+            tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .ok()
+                .flatten()
+        };
+        assert!(ask(1).await.is_some(), "a query within the cap is answered");
+        assert!(ask(0).await.is_none(), "a query past the cap is dropped");
     }
 
     /// A VM cannot speak at layer 2 as its sibling: not from the sibling's MAC, and not in an
