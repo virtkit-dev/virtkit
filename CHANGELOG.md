@@ -11,6 +11,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- `vk-registry` keeps a user's email only when the identity provider has not marked it
+  unverified, and forgets one stored earlier when it does: `accounts grant-admin` by email
+  no longer finds such a user. The command now also names the issuer and subject it acted on.
 - `vk-registry` logs who deletes a tag, creates or revokes an API key, sets a caption or
   uploads a file from its web pages.
 - `vk-registry` warns at startup when it serves without authentication on an address other

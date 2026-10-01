@@ -583,11 +583,17 @@ async fn callback(
     // Claims are provider-supplied, stored, and rendered back into a page. `upsert_user`
     // bounds them, the way an API key's name is bounded where it enters the store — so
     // every caller gets that, not just this one.
-    let email = claims.get("email").and_then(|v| v.as_str());
+    let email = email_claim(&claims);
     let name = claims.get("name").and_then(|v| v.as_str());
     let session = db
-        .upsert_user(client.issuer(), subject, email, name)
-        .and_then(|user| db.create_session(&user.id, accounts::SESSION_TTL));
+        .upsert_user(client.issuer(), subject, email.address(), name)
+        .and_then(|user| {
+            // An unverified address must not survive from an earlier sign-in either.
+            if matches!(email, EmailClaim::Unverified) {
+                db.clear_email(&user.id)?;
+            }
+            db.create_session(&user.id, accounts::SESSION_TTL)
+        });
     let session_id = match session {
         Ok(id) => id,
         Err(e) => {
@@ -853,9 +859,73 @@ fn b64url(bytes: &[u8]) -> String {
     out
 }
 
+/// What a sign-in says of the user's email. Operators promote a user by email (`accounts
+/// grant-admin`), and where a provider lets anyone claim an address before proving it, the
+/// first to sign in as `admin@corp` would be the one promoted.
+#[derive(Debug, PartialEq, Eq)]
+enum EmailClaim<'a> {
+    /// An address the provider did not mark unverified: stored, as before.
+    Given(&'a str),
+    /// The provider says it is unverified (`email_verified: false`, or `"false"` as some spell
+    /// it): not stored, and one stored from an earlier sign-in is cleared.
+    Unverified,
+    /// No `email` claim: the stored one, if any, is kept.
+    Absent,
+}
+
+impl<'a> EmailClaim<'a> {
+    fn address(&self) -> Option<&'a str> {
+        match self {
+            EmailClaim::Given(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// The sign-in's [`EmailClaim`]. A provider that sends no `email_verified` at all is taken at
+/// its word, so providers that never send the claim keep working; that also means one that
+/// lets users change their address unverified without saying so (the "nOAuth" pattern) is
+/// trusted, which is why the promotion commands name the issuer and subject they act on.
+fn email_claim(claims: &serde_json::Value) -> EmailClaim<'_> {
+    let unverified = match claims.get("email_verified") {
+        Some(serde_json::Value::Bool(b)) => !b,
+        Some(serde_json::Value::String(s)) => s.eq_ignore_ascii_case("false"),
+        _ => false,
+    };
+    match claims.get("email").and_then(|v| v.as_str()) {
+        _ if unverified => EmailClaim::Unverified,
+        Some(e) => EmailClaim::Given(e),
+        None => EmailClaim::Absent,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unverified_email_is_not_kept() {
+        let c = |v: serde_json::Value| format!("{:?}", email_claim(&v));
+        let email = "admin@corp.example";
+        assert_eq!(
+            c(serde_json::json!({"email": email})),
+            format!("Given({email:?})")
+        );
+        assert_eq!(
+            c(serde_json::json!({"email": email, "email_verified": true})),
+            format!("Given({email:?})")
+        );
+        assert_eq!(
+            c(serde_json::json!({"email": email, "email_verified": false})),
+            "Unverified"
+        );
+        assert_eq!(
+            c(serde_json::json!({"email": email, "email_verified": "false"})),
+            "Unverified"
+        );
+        assert_eq!(c(serde_json::json!({})), "Absent");
+    }
+
     use std::convert::Infallible;
     use std::net::SocketAddr;
 

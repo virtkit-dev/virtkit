@@ -406,6 +406,30 @@ impl Db {
         Ok(found)
     }
 
+    /// Forget a user's stored email: what the provider now says is unverified must not keep
+    /// standing in for them, since operators select users by email. False when no such user.
+    pub fn clear_email(&self, user_id: &str) -> Result<bool> {
+        let found;
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            let mut table = txn.open_table(USERS)?;
+            let existing = table
+                .get(user_id)?
+                .map(|g| decode::<UserRow>(g.value()))
+                .transpose()?;
+            match existing {
+                Some(mut row) => {
+                    row.email = None;
+                    table.insert(user_id, encode(&row)?.as_slice())?;
+                    found = true;
+                }
+                None => found = false,
+            }
+        }
+        txn.commit().context("clearing a user's email")?;
+        Ok(found)
+    }
+
     pub fn get_user(&self, id: &str) -> Result<Option<User>> {
         let txn = self.db.begin_read().context("starting a read")?;
         let table = txn.open_table(USERS)?;
@@ -1209,6 +1233,32 @@ mod tests {
     use redb::ReadableTableMetadata;
 
     use super::*;
+
+    /// A stored email is cleared on request, and a later sign-in with none keeps it cleared.
+    #[test]
+    fn a_cleared_email_stays_cleared() {
+        let dir = std::env::temp_dir().join(format!("vk-acct-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("accounts.redb")).unwrap();
+        let u = db
+            .upsert_user("https://issuer", "s", Some("admin@corp.example"), None)
+            .unwrap();
+        assert_eq!(
+            db.find_users_by_email("admin@corp.example").unwrap().len(),
+            1
+        );
+        assert!(db.clear_email(&u.id).unwrap());
+        let again = db.upsert_user("https://issuer", "s", None, None).unwrap();
+        assert_eq!(again.email, None);
+        assert!(
+            db.find_users_by_email("admin@corp.example")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!db.clear_email("nobody").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// An audit line names who acted, escaped, and what they did.
     #[test]

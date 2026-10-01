@@ -166,9 +166,13 @@ pub fn set_admin(
     if !ops.set_admin(&user.id, admin)? {
         bail!("user {email:?} disappeared while granting admin; try again");
     }
+    // Named by issuer and subject as well: the email is the provider's to assert, and the
+    // operator should see exactly which identity was promoted.
     println!(
-        "vk-registry accounts: {} is now {}",
+        "vk-registry accounts: {} (subject {:?} at {}) is now {}",
         email,
+        user.oidc_subject,
+        user.oidc_issuer,
         if admin {
             "an admin"
         } else {

@@ -550,7 +550,11 @@ environment variable. An explicitly selected admin socket identifies the server 
 administer; in that case the local database path is only the fallback. With no selector,
 the CLI uses the default shared store.
 
-Users are selected by email using ASCII case-insensitive comparison. If more than one issuer
+Users are selected by email using ASCII case-insensitive comparison. Only an email the
+provider has not marked unverified (`email_verified: false`) is stored, and one marked so at
+a later sign-in clears the stored value; a provider that sends no `email_verified` at all is
+taken at its word, so selecting by email is only as sound as the provider's own checks. The
+commands print the issuer and subject of the user they act on. If more than one issuer
 has asserted the same email, the command requires `--issuer`. API keys are selected by the
 full hash identifier printed by `list-keys`.
 
