@@ -18,6 +18,9 @@ All notable changes to virtkit will be documented in this file.
 - **Security: the build cache no longer stores a base image under a digest it does not
   have.** A FROM image's tag moved during a build could put the new image in the shared
   cache under the old digest, where a build pinned to that digest would pick it up.
+- **Security: a build's COPY or bind-mount source can no longer make the host read files
+  outside the build context.** A `..` in a source stops at the context root, as with
+  BuildKit, and a symlinked directory leading out of the context counts as empty.
 - **Security: a guest can no longer put terminal escape sequences into `vk atop --summary` or
   job logs** through its host, disk or network interface names or an OOM-killed process's
   name. Such characters are shown as `.`; an OOM record whose process name holds them is
