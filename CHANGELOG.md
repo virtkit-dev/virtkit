@@ -15,6 +15,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- The switch drops an IPv4-typed frame that does not carry IPv4, and a non-DHCP datagram from
+  `0.0.0.0`; under an egress dry run either could reach any IPv6 address or skip the
+  sender's own policy.
 - **A guest can no longer make the host's `vk` hold unbounded memory through its service
   control channel** or the answers of the agent's status commands. A unit's `logs` now reads
   the last 2 MiB of its console.
