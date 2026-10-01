@@ -15,6 +15,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`vk-registry` refuses a manifest push whose body is not a JSON object** (400
+  `MANIFEST_INVALID`), so one can no longer stop garbage collection for as long as its tag
+  is read.
 - **Security: a `vk-registry` lock client can no longer renew or release a lock another
   client holds.** The owner token a lock is granted with was guessable from any other.
 - **A `vk-registry` lock request with an enormous `ttl` no longer takes down the lock API

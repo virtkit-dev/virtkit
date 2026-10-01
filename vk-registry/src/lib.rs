@@ -912,6 +912,11 @@ impl Store {
         if reference.starts_with("sha256:") && reference != digest {
             bail!("manifest body hashes to {digest}, not the requested {reference}");
         }
+        // The gc mark parses every rooted manifest and stops on one it cannot, so bytes that
+        // are not one would stall collection for as long as their tag is read.
+        if !is_json_object(body) {
+            bail!("manifest body is not a JSON object");
+        }
         let hex = &digest[7..];
         let dest = self.blob_path(hex);
         if dest.exists() {
@@ -1913,6 +1918,11 @@ fn manifest_child_hexes(manifest: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Whether `body` parses as a JSON object, the least every manifest media type is.
+fn is_json_object(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|v| v.is_object())
+}
+
 /// The digest hexes a manifest references: its config and every layer, read
 /// structurally (`config.digest`, `layers[].digest`) so the gc mark needs no OCI
 /// types and tolerates media types it doesn't know. An image index (`manifests[]`)
@@ -2911,6 +2921,13 @@ fn put_manifest(
             StatusCode::BAD_REQUEST,
             "DIGEST_INVALID",
             &format!("the manifest body does not hash to {reference}"),
+        ));
+    }
+    if !is_json_object(body) {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "MANIFEST_INVALID",
+            "the manifest body is not a JSON object",
         ));
     }
     match authorize_and_mount_manifest_blobs(authz, store, name, body)? {
@@ -4654,6 +4671,38 @@ mod tests {
         .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A body that is not a JSON object is refused before anything is written: the gc mark
+    /// parses every rooted manifest and stops on one it cannot.
+    #[test]
+    fn a_manifest_that_is_not_a_json_object_is_refused() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-notjson-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::new(dir.clone()).unwrap();
+        for body in [&b"not json"[..], b"[]", b"\"a string\""] {
+            let res = put_manifest(
+                &Authz::NoScopes,
+                &store,
+                "img",
+                "v1",
+                DEFAULT_MANIFEST_TYPE,
+                body,
+            )
+            .unwrap();
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+            assert!(
+                store
+                    .put_manifest("img", "v1", DEFAULT_MANIFEST_TYPE, body)
+                    .is_err()
+            );
+        }
+        assert!(store.get_manifest("img", "v1").unwrap().is_none());
+        assert!(
+            !store.tag_path("img", "v1").exists(),
+            "a refused push leaves no tag"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -383,8 +383,8 @@ fn manifest_detail(
     // Not `unwrap_or(Null)`: that renders "no referenced blobs", which is what a valid
     // manifest with no blobs also renders — one that will not parse must not be
     // indistinguishable from an intact one, and nobody would see it in the log either.
-    // Reachable without any corruption, note: the manifest PUT stores the body without
-    // parsing it, so this is also what a push of `{not json` renders.
+    // A push can no longer store one, so it takes a damaged store or one written before
+    // pushes were checked.
     let manifest: serde_json::Value = match serde_json::from_slice(&data) {
         Ok(v) => v,
         Err(e) => {
@@ -992,13 +992,15 @@ mod tests {
     }
 
     /// A stored manifest that will not parse is a failure, not a manifest with no blobs —
-    /// the two must not render the same page.
+    /// the two must not render the same page. A push can no longer store one, so the bytes
+    /// are planted under a pushed manifest's digest, as a damaged or older store holds them.
     #[tokio::test]
     async fn an_unparseable_manifest_is_an_error_not_an_empty_one() {
         let (dir, store) = store_in("corrupt");
-        store
-            .put_manifest("team-a/app", "v1", MANIFEST_TYPE, b"{not json")
+        let digest = store
+            .put_manifest("team-a/app", "v1", MANIFEST_TYPE, b"{}")
             .unwrap();
+        std::fs::write(store.blob_path(&digest[7..]), b"{not json").unwrap();
         let res = page_at(
             &store,
             "/browse/team-a/app/manifests/v1",
