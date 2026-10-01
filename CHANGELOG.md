@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Experimental: `vk-hub local`, a web UI for the VMs on your machine.** View your pinned
+  `vk run`s, dev environments and CI jobs with their memory usage and a page per VM. The hub
+  runs as you and opens a single-use sign-in link in your browser. It keeps state under
+  `~/.local/state/virtkit/hub-local` and serves on loopback at a new random `vk-….localhost`
+  address each time it starts; sessions end on restart. `vk-hub local login` prints another
+  link; `vk-hub local sessions` and `logout` list and end sessions.
+
 ## [0.81.0] - 2026-10-02
 
 ### Added

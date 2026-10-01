@@ -780,6 +780,7 @@ vk-core/         shared host/guest protocol and runtime helpers
 vk-driver/       host driver, builder, VMM, networking, compose, and GitLab executor
 vk-agent/        guest PID 1 and exec server
 vk-registry/     optional central OCI store and distribution server
+vk-hub/          experimental local web UI for this machine's VMs
 vk-runnerctl/    optional root-side GitLab concurrency helper
 vk-selfupdate/   shared self-update implementation for vk and vk-registry
 vk-fs/           filesystem objects created private and published whole
