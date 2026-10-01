@@ -10,8 +10,9 @@ audit pages and its steering actions, signed into with links from `vk-hub ui log
 releases held by the hub (`vk-hub release`), which nodes update to on trial, checking their
 signatures against keys of their own (`vk release-key`) and rolling back to the previous
 binary when one does not pass (`vk-hub nodes update`); rollouts by wave, with a canary per
-hardware profile (`vk-hub rollout`); resets (`vk-hub nodes reset`). Restart, redeploy, the
-GitLab API pause, gitlab-runner pinning and the rest of the web UI are not built yet.
+hardware profile (`vk-hub rollout`); resets (`vk-hub nodes reset`); the VMs each node runs
+(`vk-hub workloads`). Restart, redeploy, the GitLab API pause, gitlab-runner pinning and the
+rest of the web UI are not built yet.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
@@ -178,18 +179,25 @@ Compose services are not listed on their own: whether a declared service is up t
 question to its run's control socket, and what a running one holds is counted in its
 primary's figure.
 
-Built so far: `vk workloads`, plumbing, which prints the list as one line of JSON and, with
-`--watch`, a new line each time it changes. It holds at most 256 entries and 256 KiB — CI jobs
-first, then the newest of the rest — with every string cut to 256 characters, and counts the
-VMs it leaves out. Beside the list, by each entry's ID, derived from its state dir, is what
-each holds on the host: the managing process's whole process tree — the guest, its compose
-services, the switch, virtiofsd — counted proportionally (`Pss` from `smaps_rollup`), the
-figure `vk list` and `vk dev list` show, so the UI and a shell agree. Reading it walks every
-page table of every process, so it is measured every `--mem-secs` (30 by default) and as a VM
-appears, and the lines between repeat the last figures — as does a measurement within a
-sixteenth of the last one; a VM's pages move more slowly than that matters to anyone
-watching. A dev environment's entry also names its SSH alias, when it has an SSH setup, and
-the guest directory its workspace is at.
+`vk workloads`, plumbing, prints the list as one line of JSON and, with `--watch`, a new line
+each time it changes; a node's list rides on the report and is sent again when a VM starts or
+stops. It holds at most 256 entries and 256 KiB — CI jobs first, then the newest of the rest —
+with every string cut to 256 characters; it counts the VMs it leaves out, and the hub shows
+the count. What each holds on the host goes beside it — on a node, on the heartbeat — by the
+entry's ID, derived from its state dir: the managing process's whole process tree — the
+guest, its compose services, the switch, virtiofsd — counted proportionally (`Pss` from
+`smaps_rollup`), the figure `vk list` and `vk dev list` show, so the hub and a shell on the
+host agree. Reading it walks every page table of every process, so it is measured every
+`[node] workload_mem_secs` (`--mem-secs` for `vk workloads`; 30 by default) and as a VM
+appears, and the heartbeats or lines between repeat the last figures — as does a measurement
+within a sixteenth of the last one; a VM's pages move more slowly than that matters to anyone
+watching. The hub keeps the latest list per node, not its history, apart from the node's row
+and written without an fsync — the node sends it again on every session — with a count on the
+row. It shows the list on the node's page, with when each VM started rather than an uptime
+that would move the page on every minute, the count in the nodes table, and both in `vk-hub
+workloads [--node ID|HOSTNAME]`. A dev environment's entry also names its SSH alias, when it
+has an SSH setup, and the guest directory its workspace is at. Nothing acts on a node's
+workloads yet; local mode acts on its own (see [Local mode](#local-mode)).
 
 ## Load balancing without central acquisition
 
@@ -497,9 +505,9 @@ Metrics for capacity, admission waits and node states are exported for Prometheu
 Built so far: `ui_addr` in `hub.toml` turns the listener on — with its own `ui_tls_cert` and
 `ui_tls_key` or the node listener's pair, plain HTTP only on loopback, and the node
 listener's timeouts on everything before a request is authenticated. It serves the nodes
-table with the columns of `vk-hub nodes`, each node's inventory, report, desired state,
-commands and audit lines, and the audit log, filtered by node and paged. `ui_url` is the
-address browsers reach it at: sign-in links start with it, and a state-changing request's
+table with the columns of `vk-hub nodes`, each node's inventory, report, workloads, desired
+state, commands and audit lines, and the audit log, filtered by node and paged. `ui_url` is
+the address browsers reach it at: sign-in links start with it, and a state-changing request's
 `Origin` must be it.
 
 The nodes table and a node's page stay live over server-sent events. The hub notes every

@@ -474,6 +474,7 @@ fn node_detail(hub: &Hub, id: &str) -> Result<Option<pages::NodeDetail>> {
     Ok(Some(pages::NodeDetail {
         view: crate::ops::node_view(hub, id.to_string(), &row),
         audit: hub.db.audit_page(Some(id), None, pages::NODE_AUDIT)?,
+        workloads: hub.db.workloads(id)?,
         commands,
         row,
     }))

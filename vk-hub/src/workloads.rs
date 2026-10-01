@@ -1,8 +1,9 @@
-//! How a workload reads in a table: its kind's name, what it belongs to, its figures.
+//! How a workload reads in a table — `vk-hub workloads`, a node's page, local mode's list:
+//! its kind's name, what it belongs to, its figures.
 
 use vk_fleet_proto::{Workload, WorkloadKind};
 
-/// The columns a table of workloads has.
+/// The columns a table of workloads has; `vk-hub workloads` puts the node's before them.
 pub(crate) const COLUMNS: [&str; 9] = [
     "KIND",
     "ID",

@@ -91,6 +91,12 @@ All notable changes to virtkit will be documented in this file.
   `vk-hub release add --signature` passes the signature on. A host with `[node] release_keys`
   updates only to a release one of those keys signed (`require_signed = false` makes that
   optional).
+- **Experimental: `vk-hub` shows what each host is running.** Every host reports its CI
+  jobs, `vk dev` environments and pinned `vk run`s: what each belongs to (project and job,
+  workspace and environment, image), its vCPUs, the memory reserved for it and the memory it
+  holds now, and how long it has been up. `vk-hub workloads` lists them — `--node` takes a
+  host's ID or name — a host's page shows them live, and the nodes table counts them.
+  `[node] workload_mem_secs` sets how often their memory is measured.
 - **`vk tune` stands aside on a fleet node** while `vk node run` is up, and otherwise honours
   the ceiling the node last received.
 

@@ -4673,6 +4673,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "toml",
+ "unicode-width",
  "vk-fleet-proto",
  "vk-fs",
 ]

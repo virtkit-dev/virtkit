@@ -93,6 +93,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RolloutCmd,
     },
+    /// List the VMs running on the nodes: CI jobs, dev environments, pinned runs
+    Workloads {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Only this node's: its ID, or a hostname only it has
+        #[arg(long, value_name = "ID")]
+        node: Option<String>,
+    },
     /// Show the audit log: operators' actions and what nodes reported of them
     Audit {
         #[command(flatten)]
@@ -570,6 +578,13 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Cmd::Workloads { config, node } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            let nodes =
+                tokio::task::spawn_blocking(move || client.workloads(node.as_deref())).await??;
+            print!("{}", render_workloads(&nodes, now_secs()));
+            Ok(())
+        }
         Cmd::Audit {
             config,
             node,
@@ -909,7 +924,7 @@ pub(crate) fn human_duration(d: Duration) -> String {
 }
 
 /// The columns of `vk-hub nodes`, and of the web UI's nodes table.
-pub(crate) const NODE_COLUMNS: [&str; 13] = [
+pub(crate) const NODE_COLUMNS: [&str; 14] = [
     "ID",
     "NAME",
     "REACH",
@@ -923,11 +938,12 @@ pub(crate) const NODE_COLUMNS: [&str; 13] = [
     "CPUS",
     "RAM",
     "ADMITTED",
+    "VMS",
 ];
 
 /// One node's cells under [`NODE_COLUMNS`]: what it is, and for what the hub steers, what it
 /// wants beside what the node last reported.
-pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 13] {
+pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 14] {
     let gib = |mib: u64| format!("{}G", mib / 1024);
     let dash = || "-".to_string();
     let count = |n: Option<u32>| n.map_or_else(dash, |c| c.to_string());
@@ -1020,6 +1036,7 @@ pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 13] {
             (Some(c), None) => format!("{}/-", gib(c)),
             (None, _) => dash(),
         },
+        n.workloads.map_or_else(dash, |w| w.to_string()),
     ]
 }
 
@@ -1044,35 +1061,74 @@ pub(crate) fn node_notes(n: &ops::NodeView) -> Vec<String> {
 
 /// `vk-hub nodes`' table, with each node's notes under it.
 fn render_nodes(nodes: &[ops::NodeView], now: u64) -> String {
-    let rows: Vec<[String; 13]> = nodes.iter().map(|n| node_cells(n, now)).collect();
-    let mut widths = NODE_COLUMNS.map(str::len);
-    for row in &rows {
+    let rows: Vec<[String; 14]> = nodes.iter().map(|n| node_cells(n, now)).collect();
+    let mut out = table(&NODE_COLUMNS, &rows);
+    for n in nodes {
+        for note in node_notes(n) {
+            out.push_str(&note);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `headers` and `rows` as columns two spaces apart, each as wide as its widest cell is on a
+/// terminal.
+fn table<const N: usize>(headers: &[&str; N], rows: &[[String; N]]) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let mut widths = headers.map(|h| h.width());
+    for row in rows {
         for (w, cell) in widths.iter_mut().zip(row) {
-            *w = (*w).max(cell.chars().count());
+            *w = (*w).max(cell.width());
         }
     }
     let mut out = String::new();
     let mut line = |cells: &[&str]| {
         let mut l = String::new();
         for (i, (cell, w)) in cells.iter().zip(widths).enumerate() {
-            if i + 1 == cells.len() {
-                l.push_str(cell);
-            } else {
-                l.push_str(&format!("{cell:<w$}  "));
+            l.push_str(cell);
+            if i + 1 < cells.len() {
+                l.push_str(&" ".repeat(w.saturating_sub(cell.width()) + 2));
             }
         }
         out.push_str(l.trim_end());
         out.push('\n');
     };
-    line(&NODE_COLUMNS);
-    for row in &rows {
+    line(headers);
+    for row in rows {
         line(&row.each_ref().map(String::as_str));
     }
+    out
+}
+
+/// `vk-hub workloads`' table, each node's VMs under its name, and a line for each node that
+/// has not reported any or left some out.
+fn render_workloads(nodes: &[ops::NodeWorkloads], now: u64) -> String {
+    let mut rows: Vec<[String; 10]> = Vec::new();
+    let mut notes = Vec::new();
     for n in nodes {
-        for note in node_notes(n) {
-            out.push_str(&note);
-            out.push('\n');
+        let Some(workloads) = &n.workloads else {
+            notes.push(format!("{}: has not reported its workloads", n.hostname));
+            continue;
+        };
+        for w in &workloads.listed {
+            let [a, b, c, d, e, f, g, h, i] =
+                workloads::cells(w, workloads.mem_bytes.get(&w.id).copied(), now);
+            rows.push([n.hostname.clone(), a, b, c, d, e, f, g, h, i]);
         }
+        if workloads.omitted > 0 {
+            notes.push(format!(
+                "{}: {} more running, not listed",
+                n.hostname, workloads.omitted
+            ));
+        }
+    }
+    let mut headers = ["NODE"; 10];
+    headers[1..].copy_from_slice(&workloads::COLUMNS);
+    let mut out = table(&headers, &rows);
+    for note in notes {
+        out.push_str(&note);
+        out.push('\n');
     }
     out
 }

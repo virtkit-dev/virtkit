@@ -33,6 +33,8 @@ futures.workspace = true
 redb.workspace = true
 ring.workspace = true
 sha2.workspace = true
+# column widths in the CLI's tables
+unicode-width.workspace = true
 libc.workspace = true
 # the admin socket's private bind
 vk-fs = { path = "../vk-fs" }

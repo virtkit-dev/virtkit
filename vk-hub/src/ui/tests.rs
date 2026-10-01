@@ -1411,6 +1411,92 @@ async fn the_fleet_s_pages_are_kept_live_over_server_sent_events() {
     assert_eq!(get(addr, "/events/nodes", Some(&cookie)).await.status, 401);
 }
 
+fn ci_workload(id: &str, owner: &str) -> vk_fleet_proto::Workload {
+    vk_fleet_proto::Workload {
+        id: id.into(),
+        kind: vk_fleet_proto::WorkloadKind::CiJob,
+        state_dir: format!("/jobs/{owner}"),
+        label: None,
+        project: Some(owner.into()),
+        job_name: Some("test".into()),
+        job_id: Some("7".into()),
+        workspace: None,
+        environment: None,
+        pid: Some(4321),
+        cpus: Some(2),
+        mem_reserved_mib: Some(2048),
+        started_at: Some(crate::now_secs()),
+        ssh_alias: None,
+        guest_workspace: None,
+    }
+}
+
+/// A node's workloads are on its page and counted in the nodes table, kept live, and what
+/// the node says of them is text.
+#[tokio::test(flavor = "multi_thread")]
+async fn workloads_are_shown_live_and_as_text() {
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let hostile = "acme<script>alert(1)</script>\n\nevent: evil\ndata: <img src=x>";
+    let report = |workloads| vk_fleet_proto::Report {
+        workloads: Some(workloads),
+        ..Default::default()
+    };
+    hub.db
+        .record_report(&node, report(vec![ci_workload("aaaa", hostile)]), 2)
+        .unwrap();
+    hub.db
+        .record_heartbeat(
+            &node,
+            vk_fleet_proto::Heartbeat {
+                workload_mem_bytes: [("aaaa".to_string(), 3 << 30)].into(),
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap();
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, &format!("/node/{node}"), Some(&cookie)).await;
+    assert_eq!(page.status, 200);
+    for want in [
+        "<h2>Workloads</h2>",
+        "<td>ci-job</td>",
+        "acme&lt;script&gt;alert(1)&lt;/script&gt;",
+        "<td>4321</td>",
+        "<td>2.0 GiB</td>",
+        "<td>3.0 GiB</td>",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    assert!(!page.body.contains("<script>alert") && !page.body.contains("<img"));
+
+    let mut nodes = Events::open(addr, "/events/nodes", &cookie).await;
+    let first = nodes.next().await.unwrap();
+    assert!(first.contains("<th>VMS</th>"), "{first}");
+    assert!(first.contains("<td>1</td></tr>"), "{first}");
+
+    let mut detail = Events::open(addr, &format!("/events/node/{node}"), &cookie).await;
+    let first = detail.next().await.unwrap();
+    assert!(first.contains("acme&lt;script&gt;"), "{first}");
+    assert!(!first.contains("<script") && !first.contains("\nevent: evil"));
+    // A VM starting on the node reaches both pages; one stopping leaves them.
+    hub.db
+        .record_report(
+            &node,
+            report(vec![ci_workload("bbbb", "second-project")]),
+            3,
+        )
+        .unwrap();
+    hub.changed(&node);
+    let next = next_with(&mut detail, "second-project").await;
+    assert!(next.starts_with("event: node\ndata: "), "{next}");
+    assert!(!next.contains("acme"), "{next}");
+    hub.db.record_report(&node, report(Vec::new()), 4).unwrap();
+    hub.changed(&node);
+    next_with(&mut detail, "none running").await;
+    next_with(&mut nodes, "<td>0</td></tr>").await;
+}
+
 /// A node's page follows that node alone.
 #[tokio::test]
 async fn a_node_change_wakes_that_node_s_followers_only() {

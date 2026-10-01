@@ -38,6 +38,8 @@ pub struct NodeDetail {
     pub commands: Vec<CommandRow>,
     /// Newest first, with their sequence numbers.
     pub audit: Vec<(u64, AuditRow)>,
+    /// `None` until the node has listed any.
+    pub workloads: Option<crate::store::Workloads>,
 }
 
 /// One page of `/audit`.
@@ -335,6 +337,15 @@ fn age(now: u64, then: u64) -> String {
     }
 }
 
+/// When something started, to the minute: fixed, where an uptime would move the page on for
+/// every workload as each of them turned another minute.
+pub fn started(secs: u64) -> String {
+    let mut at = crate::utc(secs);
+    // `YYYY-MM-DDTHH:MM:SSZ` without the seconds.
+    at.replace_range(16..19, "");
+    at
+}
+
 /// A node page's fragment once the node has been removed.
 pub fn gone() -> Html {
     let mut h = Html::new();
@@ -490,7 +501,8 @@ pub fn node_detail(d: &NodeDetail, now: u64) -> Html {
             kv(
                 &mut h,
                 "memory available",
-                &hb.mem_available_mib.map_or_else(dash, mib),
+                &hb.mem_available_mib
+                    .map_or_else(dash, |m| rough_bytes(m.saturating_mul(1 << 20))),
             );
             kv(
                 &mut h,
@@ -500,6 +512,8 @@ pub fn node_detail(d: &NodeDetail, now: u64) -> Html {
         }
     }
     end_section(&mut h);
+
+    workloads(&mut h, d.workloads.as_ref(), now);
 
     let inventory = d.row.inventory.as_ref();
     section(&mut h, "Hardware");
@@ -564,9 +578,13 @@ pub fn node_detail(d: &NodeDetail, now: u64) -> Html {
                     .raw("</td><td>")
                     .text(usage.map_or_else(dash, |u| {
                         if u.inodes == 0 {
-                            u.free_inodes.to_string()
+                            rough_count(u.free_inodes)
                         } else {
-                            format!("{} of {}", u.free_inodes, u.inodes)
+                            format!(
+                                "{} of {}",
+                                rough_count(u.free_inodes),
+                                rough_count(u.inodes)
+                            )
                         }
                     }))
                     .raw("</td></tr>");
@@ -636,6 +654,55 @@ pub fn node_detail(d: &NodeDetail, now: u64) -> Html {
         .text(&v.id)
         .raw("\">the node's whole audit log</a></p></section>");
     h
+}
+
+/// The VMs the node reports running, with what each holds from the last heartbeat. Every
+/// cell is the node's but the kind and the figures the hub formats.
+fn workloads(h: &mut Html, workloads: Option<&crate::store::Workloads>, now: u64) {
+    h.raw("<section><h2>Workloads</h2>");
+    let Some(workloads) = workloads else {
+        h.raw("<p class=\"empty\">not reported yet</p></section>");
+        return;
+    };
+    let list = &workloads.listed;
+    if list.is_empty() && workloads.omitted == 0 {
+        h.raw("<p class=\"empty\">none running</p></section>");
+        return;
+    }
+    h.raw("<table class=\"grid\"><thead><tr>");
+    for column in crate::workloads::COLUMNS {
+        let column = if column == "UP" { "STARTED" } else { column };
+        h.raw("<th>").text(column).raw("</th>");
+    }
+    h.raw("</tr></thead><tbody>");
+    for w in list {
+        let mem = workloads.mem_bytes.get(&w.id).copied();
+        let mut cells = crate::workloads::cells(w, mem, now);
+        // The page's own units for the figures, as elsewhere on it; what a VM holds, which
+        // moves all the time, to two figures, so the page changes only when it has moved.
+        cells[5] = w.mem_reserved_mib.map_or_else(dash, mib);
+        cells[6] = mem.map_or_else(dash, rough_bytes);
+        cells[7] = w.started_at.map_or_else(dash, started);
+        h.raw("<tr>");
+        for (i, cell) in cells.iter().enumerate() {
+            h.raw("<td>");
+            match i {
+                // Of the hub's making: the kind's name and the figures.
+                0 | 3..=7 => h.text(cell),
+                1 => h.raw("<code>").node(cell).raw("</code>"),
+                _ => h.node(cell),
+            };
+            h.raw("</td>");
+        }
+        h.raw("</tr>");
+    }
+    h.raw("</tbody></table>");
+    if workloads.omitted > 0 {
+        h.raw("<p class=\"empty\">and ")
+            .text(workloads.omitted)
+            .raw(" more running, not listed by the node</p>");
+    }
+    h.raw("</section>");
 }
 
 /// `/operations`: the releases the hub holds and its rollouts, kept live.
@@ -963,15 +1030,6 @@ pub fn bytes(n: u64) -> String {
     }
 }
 
-/// When something started, to the minute: fixed, where an uptime would move the page on for
-/// every workload as each of them turned another minute.
-pub fn started(secs: u64) -> String {
-    let mut at = crate::utc(secs);
-    // `YYYY-MM-DDTHH:MM:SSZ` without the seconds.
-    at.replace_range(16..19, "");
-    at
-}
-
 /// `n` bytes in binary units to two significant figures: for a reading that moves by the
 /// second, which would otherwise change its page on every look.
 pub fn rough_bytes(n: u64) -> String {
@@ -984,6 +1042,22 @@ pub fn rough_bytes(n: u64) -> String {
     }
     let name = UNITS.get(unit).unwrap_or(&"B");
     format!("{} {name}", two_figures(value))
+}
+
+/// A count that moves by the second — free inodes — to two significant figures, in
+/// thousands, millions and so on past a hundred.
+fn rough_count(n: u64) -> String {
+    const UNITS: [&str; 6] = ["", "k", "M", "G", "T", "P"];
+    if n < 100 {
+        return n.to_string();
+    }
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    format!("{}{}", two_figures(value), UNITS.get(unit).unwrap_or(&""))
 }
 
 /// `value`, below a thousand, to two significant figures.
@@ -1016,6 +1090,11 @@ mod tests {
     /// What moves by the second is shown in steps coarse enough that an idle page stays put.
     #[test]
     fn readings_are_shown_to_two_figures_and_start_times_to_the_minute() {
+        assert_eq!(rough_count(7), "7");
+        assert_eq!(rough_count(1234), "1.2k");
+        assert_eq!(rough_count(54_501_783), "55M");
+        assert_eq!(rough_count(54_501_781), rough_count(54_501_783));
+        assert_eq!(rough_count(62_316_544), "62M");
         assert_eq!(rough_bytes(197 << 20), "200 MiB");
         assert_eq!(rough_bytes(3 << 30), "3.0 GiB");
         assert_eq!(started(1_790_755_279), "2026-09-30T08:01Z");
