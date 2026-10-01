@@ -32,6 +32,8 @@ All notable changes to virtkit will be documented in this file.
   `--build-arg` value.** A RUN step was reused across builds that passed different values
   for an ARG it did not name on its command line, although its scripts could read that
   value. The cache-key version is bumped, so the first build after upgrading starts cold.
+- **Security: a pull or build no longer waits forever on an image lock another local user
+  holds**; it fails, naming that user's uid, or saying the holder does not answer.
 - **A guest-written disk image can no longer crash the host's `vk` or make it allocate
   gigabytes** when `vk` reads the image (for a `FROM --kernel=image` stage, or a job's
   `/etc/passwd`): its geometry, links and extents are now checked, and every file read
