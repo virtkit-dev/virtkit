@@ -446,8 +446,14 @@ impl Executor for Planner {
         if let Some(c) = self.configs.get(image) {
             return Ok(c.clone());
         }
+        // By the digest the cache key uses, so the ENV/USER/WORKDIR a stage inherits come from
+        // the image that key names, and the config cache keys on it too.
+        let fetch = match self.resolve_base_digest(image) {
+            Some(d) => crate::oci::pinned_ref(image, &d)?,
+            None => image.to_string(),
+        };
         let c = block_on(crate::oci::pull_config(
-            image,
+            &fetch,
             &crate::oci::Creds::anonymous(),
         ))?;
         self.configs.insert(image.to_string(), c.clone());
@@ -1768,8 +1774,14 @@ impl MicroVm {
         // are now in the store, an instruction snapshot on a cold build dedups its unchanged
         // base region against them, so only the RUN's diff is compressed and uploaded.
         // Digest-keyed so a moved tag is not served a stale base (matching the chain-key seed).
-        let base_id = match self.resolve_base_digest(image) {
+        let digest = self.resolve_base_digest(image);
+        let base_id = match &digest {
             Some(d) => format!("{image}@{d}"),
+            None => image.to_string(),
+        };
+        // What is fetched is what the key names: by the digest when there is one.
+        let fetch = match &digest {
+            Some(d) => crate::oci::pinned_ref(image, d)?,
             None => image.to_string(),
         };
         let base_key = base_cache_key(&base_id);
@@ -1797,7 +1809,7 @@ impl MicroVm {
         // (a raw write would corrupt its cursor accounting) and already shows this
         // stage's FROM step, so the "pulling …"/"flattened …" notes are redundant here.
         block_on(crate::oci::pull_flatten(
-            image,
+            &fetch,
             &crate::oci::Creds::anonymous(),
             &tar,
             &|_| {},
@@ -2989,8 +3001,12 @@ impl Executor for MicroVm {
     }
 
     fn base_config(&mut self, image: &str) -> Result<crate::oci::ImageConfig> {
+        let fetch = match self.resolve_base_digest(image) {
+            Some(d) => crate::oci::pinned_ref(image, &d)?,
+            None => image.to_string(),
+        };
         block_on(crate::oci::pull_config(
-            image,
+            &fetch,
             &crate::oci::Creds::anonymous(),
         ))
     }

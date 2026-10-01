@@ -281,6 +281,17 @@ pub async fn resolve_digest(reference: &str) -> Result<String> {
         .with_context(|| format!("resolving manifest digest for {reference}"))
 }
 
+/// `reference` pinned to `digest`: the same image fetched by its manifest digest, the tag
+/// dropped. A fetch by tag reads whatever the tag names at that moment, so content keyed by
+/// a digest resolved earlier must be fetched by that digest — which the client then checks
+/// the manifest against — or a tag moved in between is stored under the old digest's key.
+pub(crate) fn pinned_ref(reference: &str, digest: &str) -> Result<String> {
+    let parsed: Reference = reference
+        .parse()
+        .with_context(|| format!("parsing OCI reference {reference:?}"))?;
+    Ok(parsed.clone_with_digest(digest.to_string()).whole())
+}
+
 /// Resolve `reference` to its manifest digest against an authenticated/TLS registry —
 /// the executor keys its per-image cache on the digest, and a digest-pinned ref returns
 /// without a round-trip. Mirrors [`resolve_digest`] but carries the `[docker]` creds so a
@@ -976,6 +987,23 @@ mod tests {
         let ok = Creds::from_files(files(&token)).unwrap();
         assert_eq!(ok.token.as_deref(), Some("vkr_x"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pinned_ref_fetches_by_digest_and_drops_the_tag() {
+        let d = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(
+            pinned_ref("alpine:3", &d).unwrap(),
+            format!("docker.io/library/alpine@{d}")
+        );
+        assert_eq!(
+            pinned_ref("reg.example:5000/team/app:v1", &d).unwrap(),
+            format!("reg.example:5000/team/app@{d}")
+        );
+        let pinned = pinned_ref("reg.example:5000/team/app:v1", &d).unwrap();
+        let back: Reference = pinned.parse().unwrap();
+        assert_eq!(back.digest(), Some(d.as_str()));
+        assert_eq!(back.tag(), None);
     }
 
     #[test]
