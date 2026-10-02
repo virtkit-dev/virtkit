@@ -128,6 +128,12 @@ impl Fs {
         self.gid_map = gid_map;
     }
 
+    /// The passthrough options of a share backed by a host path (`None` for a null share),
+    /// to adjust before activation. Local patch, see VENDOR.md.
+    pub fn passthrough_config_mut(&mut self) -> Option<&mut passthrough::Config> {
+        self.passthrough_cfg.as_mut()
+    }
+
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
         self.shm_region = Some(shm_region);
     }

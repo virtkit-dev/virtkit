@@ -16,6 +16,8 @@ use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Mutex};
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+use std::time::Duration;
 
 use crate::vmm::Vmm;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -29,6 +31,8 @@ use devices::legacy::IrqChip;
 use devices::virtio::block::{DiskFormat, SyncMode};
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::fs::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent};
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub use devices::virtio::passthrough::CachePolicy as FsCachePolicy;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 use devices::virtio::passthrough::PermissionSemantics;
 use devices::virtio::{PortDescription, VirtioDevice, VirtioShmRegion, VmmExitObserver, port_io};
@@ -627,6 +631,121 @@ impl<'a> FsDevice<'a> {
     /// no DAX window is allocated.
     pub fn set_dax_window_size(&mut self, bytes: u64) {
         self.shm_size = Some(bytes as usize);
+    }
+}
+
+/// Share options beyond upstream's (local patch, see VENDOR.md). Each takes effect when the
+/// device activates; the passthrough setters refuse a null share, which has no host tree.
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+impl<'a> FsDevice<'a> {
+    /// Map the guest's UIDs and GIDs through virtiofsd-style `--uid-map`/`--gid-map` rules
+    /// (`map:<guest>:<host>:<count>`, `squash-guest:…`, `forbid-guest:…`), one rule per
+    /// element: an empty element is a bad rule, not a no-op. Empty maps, the default, serve
+    /// ids unchanged. Rules are parsed at activation, so a bad one fails the device then.
+    pub fn set_id_maps(&mut self, uid_map: Vec<String>, gid_map: Vec<String>) {
+        self.inner.lock().unwrap().set_id_maps(uid_map, gid_map);
+    }
+
+    /// How long the guest may cache data, entries, attributes and failed lookups.
+    /// `negative_timeout` zero (the default) caches no miss; it applies on Linux hosts only
+    /// and is ignored elsewhere.
+    pub fn set_cache(
+        &mut self,
+        policy: FsCachePolicy,
+        entry_timeout: Duration,
+        attr_timeout: Duration,
+        negative_timeout: Duration,
+    ) -> Result<(), VmmError> {
+        self.with_passthrough(|cfg| {
+            cfg.cache_policy = policy;
+            cfg.entry_timeout = entry_timeout;
+            cfg.attr_timeout = attr_timeout;
+            #[cfg(target_os = "linux")]
+            {
+                cfg.negative_timeout = negative_timeout;
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = negative_timeout;
+        })
+    }
+
+    /// Whether the share serves extended attributes at all (default true). Off, every xattr
+    /// request answers ENOSYS and the guest stops sending them for the mount.
+    pub fn set_xattr(&mut self, enabled: bool) -> Result<(), VmmError> {
+        self.with_passthrough(|cfg| cfg.xattr = enabled)
+    }
+
+    /// Offer the guest writeback caching (default false).
+    pub fn set_writeback(&mut self, enabled: bool) -> Result<(), VmmError> {
+        self.with_passthrough(|cfg| cfg.writeback = enabled)
+    }
+
+    /// Decline FLUSH, FSYNC and FSYNCDIR (default false), for a tree nothing needs durable.
+    #[cfg(not(target_os = "windows"))]
+    pub fn set_no_sync(&mut self, enabled: bool) -> Result<(), VmmError> {
+        self.with_passthrough(|cfg| cfg.no_sync = enabled)
+    }
+
+    /// Per-inode DAX: mark regular files of at least `min` bytes for DAX, so a guest mounted
+    /// `dax=inode` maps only those through the window; `Some(0)` marks every regular file.
+    /// `None` (the default) marks none. Linux hosts only.
+    #[cfg(target_os = "linux")]
+    pub fn set_dax_inode_min(&mut self, min: Option<u64>) -> Result<(), VmmError> {
+        self.with_passthrough(|cfg| cfg.dax_inode_min = min)
+    }
+
+    fn with_passthrough(
+        &mut self,
+        f: impl FnOnce(&mut devices::virtio::passthrough::Config),
+    ) -> Result<(), VmmError> {
+        let mut fs = self.inner.lock().unwrap();
+        let cfg = fs
+            .passthrough_config_mut()
+            .ok_or_else(VmmError::InvalidParam)?;
+        f(cfg);
+        Ok(())
+    }
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    not(any(feature = "tee", feature = "aws-nitro"))
+))]
+mod fs_option_tests {
+    use super::*;
+
+    #[test]
+    fn a_null_share_refuses_the_passthrough_options() {
+        let mut fs = FsDevice::new_null("t").unwrap();
+        let d = Duration::from_secs(1);
+        assert!(fs.set_cache(FsCachePolicy::Always, d, d, d).is_err());
+        assert!(fs.set_xattr(false).is_err());
+        assert!(fs.set_writeback(true).is_err());
+        assert!(fs.set_no_sync(true).is_err());
+        assert!(fs.set_dax_inode_min(Some(1)).is_err());
+    }
+
+    #[test]
+    fn the_passthrough_options_reach_the_device_config() {
+        let mut fs = FsDevice::new("t", "/").unwrap();
+        let (e, a, n) = (
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+        );
+        fs.set_cache(FsCachePolicy::Always, e, a, n).unwrap();
+        fs.set_xattr(false).unwrap();
+        fs.set_writeback(true).unwrap();
+        fs.set_no_sync(true).unwrap();
+        fs.set_dax_inode_min(Some(7)).unwrap();
+        let mut dev = fs.inner.lock().unwrap();
+        let cfg = dev.passthrough_config_mut().unwrap();
+        assert!(matches!(cfg.cache_policy, FsCachePolicy::Always));
+        assert_eq!((cfg.entry_timeout, cfg.attr_timeout), (e, a));
+        assert_eq!(cfg.negative_timeout, n);
+        assert!(!cfg.xattr && cfg.writeback && cfg.no_sync);
+        assert_eq!(cfg.dax_inode_min, Some(7));
     }
 }
 

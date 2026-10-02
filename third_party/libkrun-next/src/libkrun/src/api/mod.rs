@@ -25,6 +25,8 @@ pub use device_builders::BalloonDevice;
 #[cfg(feature = "blk")]
 pub use device_builders::BlockDevice;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
+pub use device_builders::FsCachePolicy;
+#[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use device_builders::FsDevice;
 #[cfg(not(any(feature = "tee", feature = "aws-nitro")))]
 pub use device_builders::FsOverlay;

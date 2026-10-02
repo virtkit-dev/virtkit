@@ -131,3 +131,19 @@ map would translate, or let past `forbid-guest`, in place of the caller's ids. T
 tree's public `IdMap`/`IdMapFs`/`IdTable` re-exports are not carried. Covered by
 `idmap::tests` and `a_mapped_share_never_offers_allow_idmap`. A single-file share ignores
 the maps.
+
+### Share-option setters
+
+`src/devices/src/virtio/fs/device.rs` — `Fs::passthrough_config_mut` lets the API configure
+a host-backed share before activation without adding parameters to `Fs::new`.
+
+`src/libkrun/src/api/{device_builders.rs,mod.rs}` — `FsDevice` setters for the share options
+the 1.19 tree's `krun_add_virtiofs7` carried: `set_id_maps`, `set_cache` (policy,
+entry/attr/negative validity; `FsCachePolicy` re-exports the passthrough `CachePolicy`),
+`set_xattr`, `set_writeback`, `set_no_sync` (not on Windows) and `set_dax_inode_min` (Linux
+only; `set_cache`'s negative validity is ignored elsewhere). With upstream's
+`set_dax_window_size` and `new_read_only` they cover every `krun_add_virtiofs7` argument.
+Two differ from 1.19: the passthrough setters refuse a null share with `InvalidParam`, where
+1.19 dropped the options, and `set_dax_inode_min(Some(0))` marks every regular file, where
+1.19 took a floor of 0 as off. Rust-only (no `ffier` export). Additive: a device built
+without them behaves as upstream's. Covered by `fs_option_tests`.
