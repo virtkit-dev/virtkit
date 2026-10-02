@@ -109,13 +109,13 @@ components reach the filesystem. Search for `entry_name`.
 ### Single-file shares (forward-ported from the 1.19 tree)
 
 `src/devices/src/virtio/fs/{single_file.rs (new),mod.rs,worker.rs}` — on Linux, a share whose
-root is a regular file serves that file alone, never its parent directory (a single-file
-bind mount, which `vk run -v host-file:guest-file` asks for). `SingleFileFs` exposes a root directory
-holding the one file, read-only or read-write as the share is; a guest create or rename
-stages vk-named scratch files in the host parent directory, reclaimed on drop. It has no
-`AugmentFs` wrapper or virtual entries. Elsewhere a file root still fails in
-`PassthroughFs::new`. The 1.19 tree's public `single_file` module is private here. Covered
-by `single_file::tests`.
+root is a regular file serves that file alone, never its parent directory (a single-file bind
+mount, which `vk run -v host-file:guest-file` asks for). `SingleFileFs` exposes a root
+directory holding the one file, read-only or read-write as the share is; a guest create or
+rename stages vk-named scratch files in the host parent directory, reclaimed on drop. It has
+no `AugmentFs` wrapper or virtual entries. Elsewhere a file root still fails in
+`PassthroughFs::new`. The 1.19 tree's public `single_file` module is private here. Covered by
+`single_file::tests`.
 
 ### Id-mapped shares (forward-ported from the 1.19 tree)
 
@@ -147,3 +147,51 @@ Two differ from 1.19: the passthrough setters refuse a null share with `InvalidP
 1.19 dropped the options, and `set_dax_inode_min(Some(0))` marks every regular file, where
 1.19 took a floor of 0 as off. Rust-only (no `ffier` export). Additive: a device built
 without them behaves as upstream's. Covered by `fs_option_tests`.
+
+### virtio-blk (forward-ported from the 1.19 tree)
+
+`src/devices/Cargo.toml` — imago is virtkit's vendored `third_party/imago` (0.2.4 plus its
+local patches, see its VENDOR.md), by path, still `sync` + `vm-memory`. The lazy chunk storage
+below adds `zstd`, `lru` (until now a macOS-only dependency) and `maybe-async` (`is_sync`).
+
+`src/devices/src/virtio/block/{device.rs,file_traits.rs}` — serve reads from read-only raw disks
+out of an `mmap` of the image (`DiskMmap`) instead of a `pread` per request: such an image
+(a build stage's `COPY --from` source, a read-only root) is immutable and its block offset is
+its file offset. qcow2 and `direct_io` keep the imago path; a failed `mmap` falls back to it,
+and so does every disk off Unix hosts.
+
+`src/devices/src/virtio/block/{device.rs,worker.rs}` — the image sits behind an `RwLock`, and
+the worker pops up to `IO_PARALLELISM` requests and runs each on a scoped thread, since imago's
+`readv`/`writev` need only `&self`; write-zeroes and the dirty-control commands take the write
+lock. Interrupts are raised once per batch that completed anything.
+
+`src/devices/src/virtio/block/{device.rs,worker.rs}` + `src/libkrun/src/api/device_builders.rs` —
+track guest-written clusters and drain them on demand, so virtkit's build backend captures only
+a checkpoint's delta. The worker records every write, discard and write-zeroes in a per-disk
+`DirtyRanges` (64 KiB clusters); with `BlockDevice::set_dirty_control_socket`,
+`Block::spawn_dirty_control` serves `b'D'` (flush, then reply the written and discarded ranges
+since the last drain: `u32 count` then `count × (u64 offset, u64 len)`, little-endian) and
+`b'F'` (flush only). Consumed by virtkit's `VmSession::drain_dirty` and `flush_disk`. Unix
+hosts only: elsewhere the socket is ignored with a warning. The setter is Rust-only (no
+`ffier` export).
+
+`src/devices/src/virtio/block/device.rs` + `src/libkrun/src/api/device_builders.rs` —
+`VmmExitObserver for Block` flushes a write-back cache on a clean power-off, and `BlockDevice`
+registers it: the VMM `_exit`s, so without it imago's cached metadata could stay unwritten and
+the image end truncated (an L2 entry past EOF).
+
+`src/devices/src/virtio/block/{lazy_chunk_storage.rs (new),device.rs,mod.rs}` — read a cached
+build-stage image lazily out of its compressed chunks. A `.vk_ro_img` manifest (written by
+vk-driver's `registry.rs`, layout documented on the module) lists the content-addressed chunks
+tiling an image and the local directory holding them; `LazyChunkStorage` is a read-only
+`imago::Storage` that decompresses a chunk the first time a read touches it. Attached directly
+as `DiskFormat::VkLazyChunks` (= 3), and resolved as a backing file at any depth of a qcow2
+chain by `LazyAwareOpenGate`, which swaps in the lazy storage for an implicitly opened
+`*.vk_ro_img` file. Keying on the host-chosen extension rather than the magic keeps a
+guest-writable image from ever being promoted into a manifest naming a host directory.
+
+A disk with neither option set, and no manifest in its chain, behaves as upstream's except for
+the batched requests behind the `RwLock`, the mmap reads of a read-only raw image and the
+flush of a write-back cache on power-off, which every disk gets. Covered by
+`block::device::tests` (mmap, concurrency, backing chains), `block::device::dirty_tests` and
+`block::lazy_chunk_storage::tests`.

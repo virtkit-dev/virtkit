@@ -4,6 +4,8 @@
 #[cfg(feature = "blk")]
 pub mod device;
 #[cfg(feature = "blk")]
+mod lazy_chunk_storage;
+#[cfg(feature = "blk")]
 mod worker;
 
 #[cfg(feature = "blk")]
@@ -46,6 +48,12 @@ pub enum DiskFormat {
     Raw = 0,
     Qcow2 = 1,
     Vmdk = 2,
+    /// A `.vk_ro_img` manifest: a read-only view over content-addressed, zstd-compressed
+    /// chunks (see `lazy_chunk_storage`), decompressed on demand as the guest reads. Always
+    /// read-only. As a qcow2 *backing* file it is not named by this variant at all:
+    /// `lazy_chunk_storage::LazyAwareOpenGate` resolves it from the `.vk_ro_img` extension
+    /// whenever imago implicitly opens a chain member, at any depth. Local patch.
+    VkLazyChunks = 3,
 }
 
 pub type ImageType = DiskFormat;
@@ -58,6 +66,7 @@ impl TryFrom<u32> for DiskFormat {
             0 => Ok(DiskFormat::Raw),
             1 => Ok(DiskFormat::Qcow2),
             2 => Ok(DiskFormat::Vmdk),
+            3 => Ok(DiskFormat::VkLazyChunks),
             _ => {
                 // Do not continue if the user cannot specify a valid disk format
                 Err(())

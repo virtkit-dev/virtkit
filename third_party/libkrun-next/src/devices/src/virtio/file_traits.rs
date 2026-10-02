@@ -589,12 +589,39 @@ impl FileReadWriteAtVolatile for DiskProperties {
             return Ok(0);
         }
 
+        // Read-only raw disks are mmap'd: copy straight from the host page cache into the
+        // guest buffers, one memcpy per descriptor instead of a `pread` syscall.
+        if let Some(mmap) = &self.mmap {
+            let data = mmap.as_slice();
+            let mut off = offset as usize;
+            let mut total = 0usize;
+            for s in bufs {
+                let guard = s.ptr_guard_mut();
+                let len = guard.len();
+                if len == 0 {
+                    continue;
+                }
+                let end = off
+                    .checked_add(len)
+                    .filter(|&e| e <= data.len())
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::UnexpectedEof, "read past end of disk image")
+                    })?;
+                // SAFETY: the guard keeps the guest slice mapped for this copy of `len` bytes.
+                let dst = unsafe { std::slice::from_raw_parts_mut(guard.as_ptr(), len) };
+                dst.copy_from_slice(&data[off..end]);
+                off = end;
+                total += len;
+            }
+            return Ok(total);
+        }
+
         let (iovec, _guard) = IoVectorMut::from_volatile_slice(bufs);
         let full_length = iovec
             .len()
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        self.file.lock().unwrap().readv(iovec, offset)?;
+        self.file.read().unwrap().readv(iovec, offset)?;
         Ok(full_length)
     }
 
@@ -612,7 +639,7 @@ impl FileReadWriteAtVolatile for DiskProperties {
             .len()
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-        self.file.lock().unwrap().writev(iovec, offset)?;
+        self.file.read().unwrap().writev(iovec, offset)?;
         Ok(full_length)
     }
 }

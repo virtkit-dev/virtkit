@@ -42,7 +42,14 @@ arch = { package = "krun-arch", version = "=0.1.0-2.0.0-dev", path = "../arch" }
 utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
 polly = { package = "krun-polly", version = "=0.1.0-2.0.0-dev", path = "../polly" }
 rutabaga_gfx = { version = "0.1.85", features = ["virgl_renderer"], optional = true }
-imago = { version = "0.2.4", default-features = false, features = ["sync", "vm-memory"] }
+# virtkit's vendored imago (third_party/imago, 0.2.4 plus local patches), not the crates.io one.
+imago = { path = "../../../imago", default-features = false, features = ["sync", "vm-memory"] }
+# The lazy chunk storage behind `DiskFormat::VkLazyChunks` (block/lazy_chunk_storage.rs).
+# `is_sync` matches the `sync` feature imago is built with, so `#[maybe_async(AFIT)]` there
+# expands to the same plain sync fns imago's own `Storage` impls use.
+lru = ">=0.9"
+zstd = "0.13"
+maybe-async = { version = "0.2", features = ["is_sync"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs", "uio"] }
@@ -50,7 +57,6 @@ vm-memory = { version = "0.18", default-features = false, features = ["backend-m
 
 [target.'cfg(target_os = "macos")'.dependencies]
 hvf = { package = "krun-hvf", version = "=0.1.0-2.0.0-dev", path = "../hvf" }
-lru = ">=0.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rutabaga_gfx = { version = "0.1.85", features = ["virgl_renderer"], optional = true }

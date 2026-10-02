@@ -1495,6 +1495,7 @@ pub struct BlockDevice {
     is_read_only: bool,
     direct_io: bool,
     sync_mode: SyncMode,
+    dirty_control_socket: Option<String>,
 }
 
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
@@ -1512,6 +1513,7 @@ impl BlockDevice {
             is_read_only: false,
             direct_io: false,
             sync_mode: SyncMode::default(),
+            dirty_control_socket: None,
         })
     }
 
@@ -1534,6 +1536,17 @@ impl BlockDevice {
     }
 }
 
+/// Local patch, see VENDOR.md.
+#[cfg(feature = "blk")]
+impl BlockDevice {
+    /// Track the clusters the guest writes and serve them on a host control socket at `path`
+    /// (`D` drains the written and discarded ranges since the previous drain, `F` flushes the
+    /// write-back cache to the image), so a checkpoint reads only its delta.
+    pub fn set_dirty_control_socket(&mut self, path: &str) {
+        self.dirty_control_socket = Some(path.to_string());
+    }
+}
+
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"blk\""))]
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "blk"))]
 impl<'a> AttachDevice<'a> for BlockDevice {
@@ -1550,10 +1563,14 @@ impl<'a> AttachDevice<'a> for BlockDevice {
             self.is_read_only,
             self.direct_io,
             self.sync_mode,
+            self.dirty_control_socket,
         )
         .map_err(|e| VmmError::Internal(format!("block: {e}")))?;
 
         let inner = Arc::new(Mutex::new(block));
+        // Flush the write-back cache on a clean power-off: the VMM `_exit`s, so nothing else
+        // would (local patch, see `VmmExitObserver for Block`).
+        ctx.push_exit_observer(inner.clone());
         let id = inner.lock().unwrap().id().to_string();
         ctx.register(&id, inner)
     }
