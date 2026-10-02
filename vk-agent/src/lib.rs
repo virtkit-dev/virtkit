@@ -3,8 +3,8 @@
 //! the writable layer's high-water mark (`fsmark`), the guest's peak memory demand
 //! (`memmark`), the OOM kills the guest kernel made (`oomkills`), whether a CI job has its
 //! gitlab-runner (`tools`), the line the marks publish (`mark`), guest statistics in atop's
-//! parseable format (`atop`, with the exited tasks `taskstats` reports), networking (`tap`,
-//! `netcfg`) and the embedded SSH server (`ssh`/`sftp`, feature `ssh`). The shared host↔guest
+//! parseable format (`atop`, with the exited tasks `taskstats` reports), networking
+//! (`netcfg`) and the embedded SSH server (`ssh`/`sftp`, feature `ssh`). The shared host↔guest
 //! protocol and runtime helpers live in the `vk-core` crate.
 
 pub mod atop;
@@ -24,6 +24,5 @@ pub mod reclaim;
 pub mod sftp;
 #[cfg(feature = "ssh")]
 pub mod ssh;
-pub mod tap;
 pub mod taskstats;
 pub mod tools;

@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn a_line_read_in_pieces_is_classified_by_its_first() {
         let mut pieces = Pieces::default();
-        let first = pieces.classify("13:46:39 [WARN] vk-agent net: xxx");
+        let first = pieces.classify("13:46:39 [WARN] vk-agent init: xxx");
         assert_eq!(
             (first.source, first.level),
             (Source::Agent, Some(Level::Warn))

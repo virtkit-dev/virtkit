@@ -15,7 +15,7 @@ use tokio_vsock::{VMADDR_CID_ANY, VMADDR_CID_HOST, VsockAddr, VsockListener, Vso
 /// stuck server / VMM — running commands have no deadline, but connecting does.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Link MTU shared by the switch, virtio NICs and guest TAP bridges.
+/// Link MTU shared by the switch and its virtio NICs.
 pub const SWITCH_MTU: u16 = 65500;
 
 /// Client side: open a connection to a virtkit-agent server.
@@ -61,7 +61,7 @@ pub fn hybrid_socket(base: &Path, port: u32) -> PathBuf {
 /// low three IPv4 octets distinguish every address in subnets up to a /8.
 ///
 /// The host keys the switch's DHCP reservation on this MAC, and it is the NIC's hardware
-/// address either way: the VMM sets it on a virtio-net device, the guest agent on a tap.
+/// address: the VMM sets it on the virtio-net device.
 pub fn mac_for_ip(ip: Ipv4Addr) -> String {
     let o = ip.octets();
     format!("52:54:00:{:02x}:{:02x}:{:02x}", o[1], o[2], o[3])

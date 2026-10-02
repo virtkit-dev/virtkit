@@ -25,7 +25,7 @@ struct Cli {
     /// systemd:// is socket activation (serve only); vsock://[cid:]port; vsock-mux://path:port
     /// is the hybrid vsock unix socket of a Cloud Hypervisor / Firecracker VMM, and
     /// vsock-auto://path:port picks the best host→guest path to a guest port (both connect
-    /// only). tcp://host:port carries raw bytes only — a forward end, `connect`, `net` or
+    /// only). tcp://host:port carries raw bytes only — a forward end, `connect` or
     /// `ssh-serve` — and the agent protocol refuses it.
     #[arg(short, long, value_name = "ADDR")]
     socket: SocketAddr,
@@ -123,25 +123,6 @@ enum Commands {
     /// sshd reached over the hybrid vsock-mux, so VS Code Remote-SSH attaches to the microVM
     /// with no guest network: `ProxyCommand vk-agent -s vsock-mux://…/vsock.sock:2222 connect`.
     Connect,
-    /// Bridge a guest tap NIC to a host network backend (gvproxy) over --socket
-    ///
-    /// Uses the qemu vhost framing (BE32 length + ethernet frame), so the guest gets a real L2
-    /// interface on the shared LAN with no host privileges: the backend runs unprivileged on
-    /// the host and egresses via host sockets. Addressing (IP/route/DNS) is configured
-    /// separately. E.g. `vk-agent -s vsock://1024 net --iface eth0`.
-    Net {
-        /// tap interface to create and bring up
-        #[arg(long, default_value = "eth0")]
-        iface: String,
-        /// hardware address to assign the tap (aa:bb:cc:dd:ee:ff)
-        ///
-        /// Lets the vk switch match a per-MAC DHCP reservation; omit for a kernel-random MAC.
-        #[arg(long)]
-        mac: Option<String>,
-        /// link MTU (omit to keep the kernel default)
-        #[arg(long, value_parser = clap::value_parser!(u16).range(68..=65521))]
-        mtu: Option<u16>,
-    },
     /// Run an SSH server (russh) on --socket, so the image needs no sshd
     ///
     /// Pubkey auth, pty/shell + exec, so a stock ssh client (hence VS Code Remote-SSH) reaches
@@ -297,9 +278,9 @@ fn main() {
         .block_on(async_main(socket, cli_args.command));
 }
 
-/// Configure logging for PID 1 and the long-running `serve`, `forward`, `net`, and
-/// `ssh-serve` subcommands. They write to stdout: the guest console is captured in the
-/// host's `console.log`, while the host-side `--host-exec` server writes to a dedicated log.
+/// Configure logging for PID 1 and the long-running `serve`, `forward` and `ssh-serve`
+/// subcommands. They write to stdout: the guest console is captured in the host's
+/// `console.log`, while the host-side `--host-exec` server writes to a dedicated log.
 ///
 /// The default format starts with `HH:MM:SS [LEVEL] ` in UTC. Debug records then add the
 /// thread ID and module. Force uncoloured output because the guest console is a terminal but
@@ -439,13 +420,6 @@ async fn async_main(socket: SocketAddr, command: Commands) {
                 std::process::exit(1)
             }
         }
-        Commands::Net { iface, mac, mtu } => {
-            install_console_logger(LevelFilter::Info);
-            if let Err(e) = vk_agent::tap::run_net(&socket, &iface, mac.as_deref(), mtu).await {
-                error!("net: {e:#}");
-                std::process::exit(1)
-            }
-        }
         #[cfg(feature = "ssh")]
         Commands::SshServe {
             authorized_keys,
@@ -499,31 +473,6 @@ async fn execute(
 #[cfg(test)]
 mod tests {
     use super::Cli;
-
-    #[test]
-    fn net_mtu_is_optional_and_bounded_by_the_frame_buffer() {
-        use clap::Parser;
-        let cli = Cli::try_parse_from(["vk-agent", "--socket", "vsock://1024", "net"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            super::Commands::Net { mtu: None, .. }
-        ));
-        for mtu in ["68", "65500", "65521"] {
-            let cli =
-                Cli::try_parse_from(["vk-agent", "--socket", "vsock://1024", "net", "--mtu", mtu])
-                    .unwrap();
-            assert!(matches!(
-                cli.command,
-                super::Commands::Net { mtu: Some(_), .. }
-            ));
-        }
-        for mtu in ["0", "67", "65522", "65535"] {
-            assert!(
-                Cli::try_parse_from(["vk-agent", "--socket", "vsock://1024", "net", "--mtu", mtu])
-                    .is_err()
-            );
-        }
-    }
 
     // `-h` is a summary: a short line per command, per flag and per possible value, with
     // the detail in the doc comment's second paragraph (which clap shows as `--help`). A

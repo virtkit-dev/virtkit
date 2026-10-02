@@ -1688,7 +1688,6 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 &[guest_ip],
                 prefix,
                 gateway,
-                crate::vmm::libkrun_selected(),
             );
             cmdline.push_str(&attach.cmdline);
             job_attach = Some(attach);
@@ -1767,9 +1766,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         &ctx.vsock_sock(),
         cfg.executor.vm.vsock_port,
     )];
-    let nics = job_attach
-        .map(|attach| attach.apply(&mut vsock_ports))
-        .unwrap_or_default();
+    let nics = job_attach.map(|attach| attach.nics).unwrap_or_default();
     if ssh_agent_forwarding(cfg) {
         vsock_ports.push(crate::vmm::VsockPort::bridge(
             &ctx.vsock_sock(),

@@ -121,7 +121,7 @@ pub const GUEST_SSH_AGENT_SOCK: &str = "/run/virtkit-ssh-agent.sock";
 /// agent's `SSH_VSOCK_PORT`.
 const SSH_VSOCK_PORT: u32 = 2222;
 /// Base of the switch's per-NIC port range: interface i is served on `NET_VSOCK_PORT + i`,
-/// backing its virtio-net device (libkrun) or dialed by its tap bridge (cloud-hypervisor).
+/// backing its virtio-net device.
 const NET_VSOCK_PORT: u32 = 1024;
 /// Switch VM id for the primary guest. Siblings use higher ids, and all NICs of a guest share
 /// one id so `switch::handle_frame` accepts its addresses on any of its interfaces.
@@ -2227,12 +2227,9 @@ async fn build_and_boot(
     let vmm = crate::vmm::selected(&args.cloud_hypervisor);
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
     println!("virtkit: booting {} (cpus={cpus}, mem={mem})", vmm.name());
-    // exec channel always; the switch NICs/bridges and the ssh-agent bridge only when set
-    // up above.
+    // exec channel always; the switch NICs and the ssh-agent bridge only when set up above.
     let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
-    let nics = net_attach
-        .map(|attach| attach.apply(&mut vsock_ports))
-        .unwrap_or_default();
+    let nics = net_attach.map(|attach| attach.nics).unwrap_or_default();
     // Bridge each guest forwarder to its host-side `vk forward`.
     for port in &socket_ports {
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, *port));
@@ -4492,14 +4489,7 @@ async fn spawn_vm_switch(
     // eth0 first, then the NICs after it, in the order the switch ports were bound above.
     let mut addrs = vec![guest_ip];
     addrs.extend_from_slice(primary_extra_ips);
-    let attach = crate::vmm::switch_attach(
-        vsock,
-        net_port,
-        &addrs,
-        prefix,
-        gw,
-        crate::vmm::libkrun_selected(),
-    );
+    let attach = crate::vmm::switch_attach(vsock, net_port, &addrs, prefix, gw);
     Ok((child, attach))
 }
 
@@ -4783,10 +4773,8 @@ pub(crate) async fn boot_session(
         net_attach = Some(attach);
     }
 
-    let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
-    let nics = net_attach
-        .map(|attach| attach.apply(&mut vsock_ports))
-        .unwrap_or_default();
+    let vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
+    let nics = net_attach.map(|attach| attach.nics).unwrap_or_default();
     // virtio-fs (the context share) requires shared guest memory (shared_mem).
     // --kernel=image boots the extracted image kernel; otherwise the pinned build kernel.
     let boot_kernel = image_kernel.map(|(k, _)| k).unwrap_or(kernel);

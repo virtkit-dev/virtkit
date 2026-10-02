@@ -674,14 +674,7 @@ pub fn boot_unit(
     // the sibling's name) to an image whose own systemd DHCPs eth0.
     let mut addrs = vec![svc.addr];
     addrs.extend_from_slice(&svc.extra_ips);
-    let attach = crate::vmm::switch_attach(
-        &vsock,
-        net_port,
-        &addrs,
-        svc.prefix,
-        gateway,
-        crate::vmm::libkrun_selected(),
-    );
+    let attach = crate::vmm::switch_attach(&vsock, net_port, &addrs, svc.prefix, gateway);
 
     // Build and spawn the VMM. On any failure, kill the virtiofsd children already
     // spawned above before returning — Child's Drop does not kill, so a soft error
@@ -778,7 +771,7 @@ pub fn boot_unit(
         // readiness. libkrun needs explicit per-port listeners; cloud-hypervisor derives
         // them from the base socket and ignores these entries.
         let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
-        let nics = attach.apply(&mut vsock_ports);
+        let nics = attach.nics;
         for port in &socket_ports {
             vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, *port));
         }
