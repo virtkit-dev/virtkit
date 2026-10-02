@@ -31,6 +31,7 @@ pub struct VmmBuilder<'a> {
     serial_consoles: Vec<SerialConsoleConfig>,
     kernel_console: Option<String>,
     nested_virt: bool,
+    pmu: bool,
     split_irqchip: bool,
     acpi: bool,
     smbios_oem_strings: Vec<String>,
@@ -102,6 +103,15 @@ impl<'a> VmmBuilder<'a> {
 
     pub fn nested_virt(mut self, enabled: bool) -> Self {
         self.nested_virt = enabled;
+        self
+    }
+
+    /// Expose the guest PMU (local patch, see VENDOR.md): keep Intel's CPUID leaf 0xA as KVM
+    /// reports it instead of zeroing it, so KVM's vPMU backs in-guest hardware counters. Off
+    /// by default: host counters widen the side-channel surface, so only for trusted guests.
+    /// It gates leaf 0xA only: on AMD the vPMU stays as KVM exposes it either way.
+    pub fn pmu(mut self, enabled: bool) -> Self {
+        self.pmu = enabled;
         self
     }
 
@@ -413,6 +423,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     vm_resources.kernel_cmdline.prolog = Some(payload.cmdline);
 
     vm_resources.nested_enabled = builder_cfg.nested_virt;
+    vm_resources.pmu_enabled = builder_cfg.pmu;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;
     if !builder_cfg.smbios_oem_strings.is_empty() {

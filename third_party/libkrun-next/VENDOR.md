@@ -287,3 +287,18 @@ under fd or memory exhaustion) resets the guest's connect instead of panicking t
 thread, poisoning the queue mutex and wedging the VM's whole vsock. The muxer RX queue grows
 from 256 to 1024 slots; a full queue drops host->guest packets, including a connect's
 `OP_RESPONSE`.
+
+### Guest PMU (forward-ported from the 1.19 tree)
+
+`src/cpuid/src/transformer/{mod.rs,intel.rs}` + `src/libkrun/src/vmm/{resources.rs,
+linux/vstate.rs,builder.rs}` + `src/libkrun/src/api/vmm_builder.rs` — `VmmBuilder::pmu(true)`
+keeps CPUID leaf 0xA as KVM reports it instead of zeroing it (`VmSpec::with_pmu_enabled`,
+carried by `VcpuConfig::pmu_enabled`), so KVM's vPMU backs in-guest `perf` hardware events.
+Off by default, as upstream: host counters widen the side-channel surface. For `vk run --pmu`
+once vk-driver moves onto this tree.
+
+Known gap, as in the 1.19 tree: the switch only gates Intel's leaf 0xA. On AMD, KVM's vPMU
+(the legacy counters, `PERFCTR_CORE` in 0x80000001 ECX) stays exposed whatever the flag, and
+2.0 no longer clamps the largest extended leaf to 0x8000001f, so PerfMonV2 (0x80000022) is
+visible too. Turning the vPMU off at VM level (`KVM_CAP_PMU_CAPABILITY`) would close it on
+both vendors.

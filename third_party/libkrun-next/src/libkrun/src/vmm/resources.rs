@@ -114,6 +114,8 @@ pub struct VmResources {
     pub smbios_oem_strings: Option<Vec<String>>,
     /// Whether to enable nested virtualization.
     pub nested_enabled: bool,
+    /// Whether to expose the guest PMU (local patch, see VENDOR.md).
+    pub pmu_enabled: bool,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
@@ -138,6 +140,8 @@ impl VmResources {
             cpu_template: self.vm_config().cpu_template,
             #[cfg(target_os = "linux")]
             nested_enabled: self.nested_enabled,
+            #[cfg(target_os = "linux")]
+            pmu_enabled: self.pmu_enabled,
         }
     }
 
@@ -264,6 +268,7 @@ mod tests {
             external_kernel: None,
             smbios_oem_strings: None,
             nested_enabled: false,
+            pmu_enabled: false,
             split_irqchip: false,
             acpi_enabled: false,
             serial_consoles: Vec::new(),
@@ -273,7 +278,9 @@ mod tests {
 
     #[test]
     fn test_vcpu_config() {
-        let vm_resources = default_vm_resources();
+        let mut vm_resources = default_vm_resources();
+        // Not the default, so a `vcpu_config` that dropped the flag would fail here.
+        vm_resources.pmu_enabled = true;
         let expected_vcpu_config = VcpuConfig {
             vcpu_count: vm_resources.vm_config().vcpu_count.unwrap(),
             #[cfg(not(target_os = "windows"))]
@@ -282,6 +289,8 @@ mod tests {
             cpu_template: vm_resources.vm_config().cpu_template,
             #[cfg(target_os = "linux")]
             nested_enabled: vm_resources.nested_enabled,
+            #[cfg(target_os = "linux")]
+            pmu_enabled: true,
         };
 
         let vcpu_config = vm_resources.vcpu_config();

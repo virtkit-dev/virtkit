@@ -102,9 +102,15 @@ fn update_power_management_entry(
     Ok(())
 }
 
-fn update_perf_mon_entry(entry: &mut kvm_cpuid_entry2, _vm_spec: &VmSpec) -> Result<(), Error> {
+fn update_perf_mon_entry(entry: &mut kvm_cpuid_entry2, vm_spec: &VmSpec) -> Result<(), Error> {
     // Architectural Performance Monitor Leaf
-    // Disable PMU
+    // Disable PMU by default: exposing host performance counters to the guest
+    // widens the side-channel surface. `VmmBuilder::pmu(true)` (local patch,
+    // see VENDOR.md) keeps the leaf as KVM reports it, so KVM's vPMU virtualizes
+    // the counters for in-guest `perf` hardware events.
+    if vm_spec.pmu_enabled() {
+        return Ok(());
+    }
     entry.eax = 0;
     entry.ebx = 0;
     entry.ecx = 0;
@@ -258,6 +264,19 @@ mod tests {
         assert_eq!(entry.ebx, 0);
         assert_eq!(entry.ecx, 0);
         assert_eq!(entry.edx, 0);
+
+        // With the PMU exposed the leaf is left as KVM reported it.
+        let vm_spec = vm_spec.with_pmu_enabled(true);
+        let mut entry = kvm_cpuid_entry2 {
+            function: leaf_0xa::LEAF_NUM,
+            eax: 1,
+            ebx: 2,
+            ecx: 3,
+            edx: 4,
+            ..Default::default()
+        };
+        assert!(update_perf_mon_entry(&mut entry, &vm_spec).is_ok());
+        assert_eq!((entry.eax, entry.ebx, entry.ecx, entry.edx), (1, 2, 3, 4));
     }
 
     fn check_update_deterministic_cache_entry(
