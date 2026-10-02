@@ -173,8 +173,8 @@ impl NetBackend for Unixgram {
         false
     }
 
-    fn try_finish_write(&mut self, _hdr_len: usize, _buf: &[u8]) -> Result<(), WriteError> {
-        // The unixgram backend doesn't do partial writes.
+    fn flush_frames(&mut self) -> Result<(), WriteError> {
+        // The unixgram backend sends every frame as its own datagram and holds none back.
         Ok(())
     }
 

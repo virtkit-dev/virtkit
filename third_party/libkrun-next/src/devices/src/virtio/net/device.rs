@@ -25,7 +25,7 @@ use std::cmp;
 use std::io::Write;
 use std::mem::size_of;
 use std::path::PathBuf;
-use virtio_bindings::virtio_net::VIRTIO_NET_F_MAC;
+use virtio_bindings::virtio_net::{VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_MTU};
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
 
@@ -53,12 +53,15 @@ pub enum TxError {
     QueueError(QueueError),
 }
 
+/// The device config space, in the layout the virtio spec fixes for virtio-net. `mtu` is
+/// only meaningful to a driver that negotiated `VIRTIO_NET_F_MTU`; it reads it at offset 10.
 #[derive(Copy, Clone, Debug, Default)]
 #[repr(C, packed)]
 struct VirtioNetConfig {
     mac: [u8; 6],
     status: u16,
     max_virtqueue_pairs: u16,
+    mtu: u16,
 }
 
 // Safe because it only has data and has no implicit padding.
@@ -91,23 +94,44 @@ pub struct Net {
     config: VirtioNetConfig,
 }
 
+/// The features an MTU brings: the MTU itself, and on Unix hosts mergeable receive buffers. The
+/// Windows worker never writes `num_buffers`, so it must not offer them.
+fn mtu_features() -> u64 {
+    let features = 1 << VIRTIO_NET_F_MTU;
+    #[cfg(unix)]
+    let features = features | (1 << VIRTIO_NET_F_MRG_RXBUF);
+    features
+}
+
 impl Net {
-    /// Create a new virtio network device using the backend
+    /// Create a new virtio network device using the backend.
+    ///
+    /// `mtu` is the link MTU the driver should adopt (`MIN_MTU..=MAX_MTU`, validated by the
+    /// caller), and on Unix hosts brings mergeable receive buffers with it. `None` leaves both features
+    /// unadvertised, so the driver keeps its own default of 1500 and one buffer per frame.
     pub fn new(
         id: String,
         cfg_backend: VirtioNetBackend,
         mac: [u8; 6],
         features: u32,
+        mtu: Option<u16>,
     ) -> Result<Self> {
-        let avail_features = features as u64
+        let mut avail_features = features as u64
             | (1 << VIRTIO_NET_F_MAC)
             | (1 << VIRTIO_RING_F_EVENT_IDX)
             | (1 << VIRTIO_F_VERSION_1);
+        if mtu.is_some() {
+            // Mergeable receive buffers come with the MTU: on a link wide enough to be worth
+            // setting, a driver that has to size every posted buffer for the largest frame
+            // spends nearly all of them on packets nowhere near it.
+            avail_features |= mtu_features();
+        }
 
         let config = VirtioNetConfig {
             mac,
             status: 0,
             max_virtqueue_pairs: 0,
+            mtu: mtu.unwrap_or(0),
         };
 
         Ok(Net {
@@ -120,6 +144,17 @@ impl Net {
             device_state: DeviceState::Inactive,
             config,
         })
+    }
+
+    /// Set or clear the advertised link MTU before activation, as `new`'s `mtu` does.
+    pub fn set_mtu(&mut self, mtu: Option<u16>) {
+        let bits = mtu_features();
+        if mtu.is_some() {
+            self.avail_features |= bits;
+        } else {
+            self.avail_features &= !bits;
+        }
+        self.config.mtu = mtu.unwrap_or(0);
     }
 
     /// Provides the ID of this net device.
@@ -220,5 +255,52 @@ impl VirtioDevice for Net {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    const MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+
+    fn net(mtu: Option<u16>) -> Net {
+        Net::new(
+            "eth0".into(),
+            VirtioNetBackend::UnixstreamFd(-1),
+            MAC,
+            0,
+            mtu,
+        )
+        .unwrap()
+    }
+
+    /// The driver reads the MTU at offset 10 of the config space, after mac[6], status and
+    /// max_virtqueue_pairs, as a little-endian u16.
+    #[test]
+    fn mtu_sits_at_config_offset_10() {
+        let dev = net(Some(65500));
+        let mut cfg = [0u8; 12];
+        dev.read_config(0, &mut cfg);
+        assert_eq!(&cfg[..6], &MAC);
+        assert_eq!(u16::from_le_bytes([cfg[10], cfg[11]]), 65500);
+
+        let mut field = [0u8; 2];
+        dev.read_config(10, &mut field);
+        assert_eq!(u16::from_le_bytes(field), 65500);
+    }
+
+    /// VIRTIO_NET_F_MTU and the mergeable receive buffers that come with it are offered only
+    /// when an MTU was configured; without one the field stays zero and no driver is
+    /// entitled to read it.
+    #[test]
+    fn mtu_features_are_offered_only_with_an_mtu() {
+        let bits = (1u64 << VIRTIO_NET_F_MTU) | (1u64 << VIRTIO_NET_F_MRG_RXBUF);
+        assert_eq!(net(Some(1500)).avail_features() & bits, bits);
+        assert_eq!(net(None).avail_features() & bits, 0);
+
+        let mut field = [0xffu8; 2];
+        net(None).read_config(10, &mut field);
+        assert_eq!(u16::from_le_bytes(field), 0);
     }
 }

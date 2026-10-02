@@ -229,3 +229,41 @@ yet in the 1.19 tree.
 whatever the caller asks: its manifest opens read-only and the guest sees `VIRTIO_BLK_F_RO`,
 where the 1.19 tree offered a writable disk whose every write failed. Not yet in the 1.19
 tree.
+
+### virtio-net (forward-ported from the 1.19 tree)
+
+`src/devices/src/virtio/net/{mod.rs,device.rs}` + `src/libkrun/src/api/device_builders.rs` — a
+configurable link MTU. `VirtioNetConfig` gains the `mtu` field at offset 10; `Net::new` takes an
+`Option<u16>` (`Net::set_mtu` sets it later) and advertises `VIRTIO_NET_F_MTU` only when one is
+set. `NetDevice::set_mtu` validates it against `MIN_MTU..=MAX_MTU` (68..=65535, the ceiling
+being what still fits `MAX_BUFFER_SIZE` once the virtio-net and ethernet headers are counted,
+tied by a static assertion). Used by virtkit for switch NICs on a 65500-byte link.
+
+`src/devices/src/virtio/net/{device.rs,worker/unix.rs}` + `src/devices/src/virtio/queue.rs` —
+`VIRTIO_NET_F_MRG_RXBUF` on a NIC with an MTU, so one frame may span several descriptor chains:
+without it the driver sizes every buffer for the largest frame (17-page chains at MTU 65500,
+56 per 1024-descriptor ring). `write_frame_to_chains` takes whole chains until they hold the
+frame before writing, so a frame without room yet is retried with the queue untouched; the
+count goes in `num_buffers` of the first header. `Queue::add_used` is split into `write_used`
++ `publish_used` so a frame's chains reach the used ring before the index naming them moves,
+and `enable_notification_at` arms a refill notification at an observed available index (it
+keeps upstream's bus-master check).
+
+`src/devices/src/virtio/net/{backend.rs,tap.rs,unixgram.rs,worker/unix.rs}` — the unix
+`NetBackend` trait replaces `try_finish_write` with `flush_frames`: `write_frame` may batch
+frames, and the worker flushes after draining the transmit queue and on a writable socket.
+The Windows backend and worker remain upstream's; setting an MTU on Windows does not enable
+mergeable receive buffers.
+
+`src/devices/src/virtio/net/unixstream/{mod.rs,unix.rs}` — the unix network-proxy backend is
+virtkit's rewrite (the Windows one stays upstream's). Reads go through a 128 KiB buffer so one
+`recv` collects several queued frames; buffered bytes and the saved payload length survive
+`NothingRead`; payloads of 8 KiB or more read straight into the caller's buffer when nothing is
+buffered; EOF and oversized lengths fail the read. Writes are staged: `write_frame` copies the
+length-prefixed frame and returns, `flush_frames` sends the batch (up to 256 KiB or 256
+frames), a short send only advances the start of what is left, and frames of 16 KiB or more
+skip staging when nothing is staged ahead of them.
+
+Covered by `virtio::net::device::tests`, `virtio::net::worker::unix::tests` (their interrupt
+checks now count through a test `InterruptHandler`, upstream having dropped the status word),
+`virtio::queue::tests` and the socket-pair tests in `unixstream::unix`.

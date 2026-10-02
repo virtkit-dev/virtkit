@@ -1744,11 +1744,27 @@ impl NetDevice {
         features: u32,
     ) -> Result<Self, VmmError> {
         let mac: [u8; 6] = mac.try_into().map_err(|_| VmmError::InvalidParam())?;
-        let net = devices::virtio::Net::new(id.to_string(), backend, mac, features)
+        let net = devices::virtio::Net::new(id.to_string(), backend, mac, features, None)
             .map_err(|e| VmmError::Internal(format!("net: {e:?}")))?;
         Ok(Self {
             inner: Arc::new(Mutex::new(net)),
         })
+    }
+}
+
+/// Local patch, see VENDOR.md.
+#[cfg(feature = "net")]
+impl NetDevice {
+    /// Advertise a link MTU over `VIRTIO_NET_F_MTU` (with mergeable receive buffers), so the
+    /// guest link comes up at it and posts buffers for frames that size. `MIN_MTU..=MAX_MTU`
+    /// (68..=65535); without it the device advertises none, as upstream's.
+    pub fn set_mtu(&mut self, mtu: u16) -> Result<(), VmmError> {
+        use devices::virtio::net::{MAX_MTU, MIN_MTU};
+        if !(MIN_MTU..=MAX_MTU).contains(&mtu) {
+            return Err(VmmError::OutOfRange());
+        }
+        self.inner.lock().unwrap().set_mtu(Some(mtu));
+        Ok(())
     }
 }
 

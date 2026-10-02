@@ -117,8 +117,8 @@ impl NetBackend for Tap {
         false
     }
 
-    fn try_finish_write(&mut self, _hdr_len: usize, _buf: &[u8]) -> Result<(), WriteError> {
-        // The tap backend doesn't do partial writes.
+    fn flush_frames(&mut self) -> Result<(), WriteError> {
+        // The tap backend writes every frame whole and holds none back.
         Ok(())
     }
 
