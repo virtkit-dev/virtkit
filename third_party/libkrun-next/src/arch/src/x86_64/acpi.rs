@@ -138,7 +138,10 @@ fn build_dsdt(virtio_mmio_devices: &[(u64, u32)], pci_host: Option<&PciHostInfo>
         let hid = Name::new(Path::new("_HID"), &"LNRO0005");
         let uid = Name::new(Path::new("_UID"), &(i as u32));
         let mem = Memory32Fixed::new(true, mmio_base as u32, 0x1000);
-        let irq_res = Interrupt::new(true, false, false, false, irq);
+        // Edge-triggered: each interrupt is a one-shot KVM irqfd pulse with no resample fd.
+        // Declared level, the IOAPIC drops a pulse that lands while the previous one awaits
+        // its EOI, and a busy guest waits forever on I/O that already completed (local patch).
+        let irq_res = Interrupt::new(true, true, false, false, irq);
         let crs = Name::new(
             Path::new("_CRS"),
             &ResourceTemplate::new(vec![&mem, &irq_res]),
@@ -522,6 +525,19 @@ mod tests {
         assert_eq!(u64_at(132), 0x000e_1000, "X_FIRMWARE_CTRL (FACS)");
         assert_eq!(u64_at(152), u64::from(ACPI_PM_BASE), "X_PM1a_EVT_BLK");
         assert_eq!(u64_at(176), u64::from(ACPI_PM_BASE) + 4, "X_PM1a_CNT_BLK");
+    }
+
+    #[test]
+    fn virtio_mmio_interrupts_are_edge_triggered() {
+        let bytes = build_dsdt(&[(0xd000_0000u64, 17u32)], None);
+        // Extended interrupt descriptor: 0x89, length 6, flags, count 1, the GSI.
+        let irq = 17u32.to_le_bytes();
+        let desc = bytes
+            .windows(9)
+            .find(|w| w[0] == 0x89 && w[1] == 6 && w[4] == 1 && w[5..9] == irq)
+            .expect("the device's interrupt descriptor");
+        assert_ne!(desc[3] & 0b10, 0, "edge-triggered");
+        assert_eq!(desc[3] & 0b100, 0, "active high");
     }
 
     #[test]
