@@ -18,8 +18,6 @@ pub const DEFAULT_PATH: &str = "/etc/virtkit/config.toml";
 pub struct Config {
     /// Per-job state lives under <state_dir>/jobs/<job id>/
     pub state_dir: Option<PathBuf>,
-    /// Path of the cloud-hypervisor binary (a bare name resolves through PATH)
-    pub cloud_hypervisor: Option<PathBuf>,
     /// VMM backend. Only `libkrun`, embedded in `vk`, remains: `cloud-hypervisor` is still
     /// parsed so an old config loads, but it boots on libkrun after a warning.
     pub vmm: Option<VmmBackend>,
@@ -76,8 +74,9 @@ pub struct Config {
     pub source: Option<PathBuf>,
 }
 
-/// VMM backend selector for the `vmm` config key. Accepts the same spellings the
-/// `VIRTKIT_VMM` env var does (`cloud_hypervisor`, `ch`), so a typo fails at parse time.
+/// VMM backend selector for the `vmm` config key. `cloud-hypervisor` and its old aliases
+/// (`cloud_hypervisor`, `ch`) still parse so an old config loads, then warn at startup; a
+/// typo still fails at parse time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VmmBackend {
@@ -96,8 +95,6 @@ pub enum VmmBackend {
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Build {
-    /// cloud-hypervisor for the build guest (default: the top-level `cloud_hypervisor`).
-    pub cloud_hypervisor: Option<PathBuf>,
     /// the build guest kernel (the pinned vmlinux with virtio + ext4 built in).
     pub kernel: Option<PathBuf>,
     /// the virtkit-agent injected into the build guest as PID 1.
@@ -537,9 +534,7 @@ pub struct Vm {
     /// guest address space, avoiding a copy per VM. A bare size maps only regular files of
     /// 1M and more (`dax=inode`): a mapping costs a host mmap per 2M range whatever the
     /// file's size, which a source tree's small files never repay; `:always` maps every
-    /// file, `:inode=` sets the floor. Reserves address space, not memory; libkrun only.
-    /// Unset by default so cloud-hypervisor can distinguish an explicit request for
-    /// unsupported DAX from the default.
+    /// file, `:inode=` sets the floor. Reserves address space, not memory.
     pub dax: Option<String>,
     /// Ceilings for the per-job MICROVM_CPUS/MICROVM_MEM variables; unset =
     /// jobs cannot request more than the cpus/mem defaults above
@@ -553,7 +548,7 @@ pub struct Vm {
     pub nested: bool,
     /// Appended verbatim to the kernel command line
     pub cmdline_extra: String,
-    /// prepare: max seconds from cloud-hypervisor spawn to a vk-agent status reply
+    /// prepare: max seconds from the VMM spawn to a vk-agent status reply
     pub boot_timeout_secs: u64,
     /// cleanup: seconds granted to the ACPI poweroff before escalating
     pub shutdown_timeout_secs: u64,
@@ -799,15 +794,13 @@ pub struct Net {
     /// "none"; "tap" (pre-created persistent tap; one VM at a time per tap);
     /// "pool" (a leased tap from the host pool — the hardened host networking);
     /// or "switch" (an unprivileged per-job userspace switch: a socket-backed virtio-net
-    /// device under libkrun or an agent-bridged vsock tap under cloud-hypervisor, with
-    /// `[egress]` enforced by the switch).
+    /// device, with `[egress]` enforced by the switch).
     pub mode: String,
     pub tap: String,
     pub mac: String,
     /// mode = "switch": base of the per-NIC port range. Interface i uses `net_port + i`
     /// at `<vsock.sock>_<net_port + i>`: libkrun backs its virtio-net device with that
-    /// socket; under cloud-hypervisor the agent dials host CID 2 and CH surfaces the
-    /// bridge there. Must differ from the services port.
+    /// socket. Must differ from the services port.
     pub net_port: u32,
     /// Static guest config passed on the kernel command line (the kernel `ip=`
     /// autoconfig param + VIRTKIT_VM_DNS); ip is CIDR ("172.18.0.250/16")
@@ -909,13 +902,19 @@ fn reject_migrated_keys(table: &toml::Table) -> Result<()> {
 /// `deny_unknown_fields`. Unlike [`reject_migrated_keys`], these keys have no replacements:
 /// the caller warns and continues.
 fn strip_removed_keys(table: &mut toml::Table) -> Vec<&'static str> {
-    // `virtiofsd`: the daemon served cloud-hypervisor's shares; libkrun serves them itself.
-    const REMOVED: &[&str] = &["virtiofsd"];
-    REMOVED
+    // libkrun serves shares itself and needs neither virtiofsd nor an external VMM binary.
+    const REMOVED: &[&str] = &["virtiofsd", "cloud_hypervisor"];
+    let mut removed: Vec<&'static str> = REMOVED
         .iter()
         .copied()
         .filter(|key| table.remove(*key).is_some())
-        .collect()
+        .collect();
+    if let Some(toml::Value::Table(build)) = table.get_mut("build")
+        && build.remove("cloud_hypervisor").is_some()
+    {
+        removed.push("build.cloud_hypervisor");
+    }
+    removed
 }
 
 impl Config {
@@ -980,12 +979,6 @@ impl Config {
                 .checkout_cache_idle_secs
                 .unwrap_or_else(|| self.image_cache_idle().as_secs()),
         )
-    }
-
-    pub fn cloud_hypervisor(&self) -> &Path {
-        self.cloud_hypervisor
-            .as_deref()
-            .unwrap_or(Path::new("cloud-hypervisor"))
     }
 }
 
@@ -1128,9 +1121,15 @@ mod tests {
 
     #[test]
     fn a_removed_key_is_stripped_and_named() {
-        let mut table: toml::Table =
-            toml::from_str("virtiofsd = \"/usr/bin/virtiofsd\"\nstate_dir = \"/s\"\n").unwrap();
-        assert_eq!(strip_removed_keys(&mut table), vec!["virtiofsd"]);
+        let mut table: toml::Table = toml::from_str(
+            "virtiofsd = \"/usr/bin/virtiofsd\"\nstate_dir = \"/s\"\n\
+             cloud_hypervisor = \"ch\"\n[build]\ncloud_hypervisor = \"ch\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            strip_removed_keys(&mut table),
+            vec!["virtiofsd", "cloud_hypervisor", "build.cloud_hypervisor"]
+        );
         let cfg: Config = table.try_into().unwrap();
         assert_eq!(cfg.state_dir(), Path::new("/s"));
         assert!(strip_removed_keys(&mut toml::Table::new()).is_empty());

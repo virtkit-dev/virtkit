@@ -1,10 +1,9 @@
-//! microVM lifecycle: prepare (overlay + cloud-hypervisor + wait for the in-guest
+//! microVM lifecycle: prepare (overlay + VMM + wait for the in-guest
 //! agent) and cleanup (ACPI poweroff, escalation, state removal). One VM per job.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::Ipv4Addr;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -765,7 +764,6 @@ fn build_git_image(
         build_contexts,
         build_args,
         kernel: cfg.build.kernel.clone(),
-        cloud_hypervisor: Some(cfg.cloud_hypervisor().to_path_buf()),
         agent: cfg.build.agent.clone(),
         cache_registry: cache.registry,
         cache_insecure: cache.insecure,
@@ -1173,7 +1171,6 @@ fn build_compose_unit(
         // executor-global build-arg channel.
         build_args: vec![],
         kernel: kernel.path.clone(),
-        cloud_hypervisor: cfg.cloud_hypervisor().to_path_buf(),
         agent: agent.path.clone(),
         cache_registry: cache.registry,
         cache_insecure: cache.insecure,
@@ -1309,7 +1306,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // `[executor.vm] dax`: the window each directory share gets, so the guest reads a shared tree
     // out of the host page cache rather than copying it into its own. Same window for every
     // share here — the tools tree is the one several job VMs read at once.
-    let dax = crate::run::dax_share(vm_dax(cfg)?, None, crate::vmm::libkrun_selected());
+    let dax = crate::run::dax_share(vm_dax(cfg)?, None);
     // Computed once, so both shares are judged against the same trees: the tools share against
     // the directory the workdir share resolved to.
     let mut guest_writable = GuestWritable::new(cfg);
@@ -1586,7 +1583,6 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                     svc,
                     &dir,
                     &kernel.path,
-                    cfg.cloud_hypervisor(),
                     &agent.path,
                     cfg.net.net_port,
                     gateway,
@@ -1715,7 +1711,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         nested: crate::run::effective_nested(cfg.executor.vm.nested, primary_nested),
         // libkrun has no API socket (it is driven as a subprocess); cloud-hypervisor
         // uses one for graceful shutdown in graceful_vmm_stop.
-        api_socket: (!crate::vmm::libkrun_selected()).then(|| ctx.api_sock()),
+        api_socket: None,
         pass_fds: Vec::new(),
         // The CI job runs in its own process (no `--vm-name`), so the default template
         // applies: `vk:<hostname>`.
@@ -1733,7 +1729,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                 .context("spawning the ssh-agent forward")?,
         );
     }
-    let vmm = crate::vmm::selected(cfg.cloud_hypervisor());
+    let vmm = crate::vmm::selected();
     // The one VMM spawn shared with `vk run`/`vk build`: it clears CLOEXEC on the
     // embedded-kernel (and any pass-fd) so those fds survive the exec into the VMM
     // subprocess — open-coding a plain spawn here silently dropped them.
@@ -2705,30 +2701,14 @@ pub fn stop_supervisor(ctx: &JobCtx) {
     }
 }
 
-/// Gracefully stop the supervisor's own VMM child: ACPI power-button over the API
-/// socket, then vm.shutdown, then SIGTERM/SIGKILL — each step only if the previous
-/// one did not end the process. libkrun has no API socket: TERM then KILL.
+/// Gracefully stop the supervisor's own VMM child: SIGTERM, which the libkrun boot child
+/// turns into an ACPI power-button press, then SIGKILL once the timeout passes.
 fn graceful_vmm_stop(ctx: &JobCtx, child: &mut std::process::Child) {
     let timeout = Duration::from_secs(ctx.cfg.executor.vm.shutdown_timeout_secs);
-    if crate::vmm::libkrun_selected() {
-        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-        if !wait_child_gone(child, timeout) {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        return;
-    }
-    let api = ctx.api_sock();
-    let _ = ch_api_put(&api, "vm.power-button");
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     if !wait_child_gone(child, timeout) {
-        let _ = ch_api_put(&api, "vm.shutdown");
-        if !wait_child_gone(child, Duration::from_secs(5)) {
-            unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-            if !wait_child_gone(child, Duration::from_secs(3)) {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -3200,29 +3180,6 @@ fn wait_gone(pid: i32, job_dir: &Path, timeout: Duration) -> bool {
         std::thread::sleep(Duration::from_millis(200));
     }
     true
-}
-
-/// Minimal HTTP PUT on the Cloud Hypervisor API socket (same calls as
-/// shutdown.sh's `curl --unix-socket`); not worth an HTTP client dependency.
-fn ch_api_put(sock: &Path, endpoint: &str) -> Result<()> {
-    let mut stream = UnixStream::connect(sock)?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
-    write!(
-        stream,
-        "PUT /api/v1/{endpoint} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
-    )?;
-    let mut buf = [0u8; 256];
-    let n = stream.read(&mut buf)?;
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    if resp.starts_with("HTTP/1.1 2") {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "{endpoint}: {}",
-            resp.lines().next().unwrap_or("no response")
-        ))
-    }
 }
 
 /// Free space under which the job dirs' filesystem counts as full: the overlay's metadata and

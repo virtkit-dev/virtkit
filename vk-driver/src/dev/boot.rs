@@ -262,7 +262,6 @@ fn run_args(
         ssh_client: true,
         ssh_alias: checked_alias(plan)?,
         ssh_user: plan.user.clone().unwrap_or_else(|| "root".into()),
-        cloud_hypervisor: cfg.cloud_hypervisor().to_path_buf(),
         detach: true,
         detach_log: Some(plan.state_dir.join("boot.log")),
         ..Default::default()

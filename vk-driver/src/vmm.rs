@@ -1,13 +1,11 @@
 //! VMM abstraction. A [`Vmm`] turns a [`VmSpec`] — everything needed to boot one
 //! microVM, expressed independently of the hypervisor — into a configured
-//! [`Command`]. cloud-hypervisor is the sole implementation today.
+//! [`Command`]. [`Libkrun`] is the implementation: it re-execs this binary as the VMM.
 //!
 //! The command is returned un-spawned: each caller owns its own lifecycle (the CI
-//! path spawns it detached with a pidfile and shuts it down over the CH API
-//! socket; the dev `run`/build paths hold the `Child` and kill it). Running
-//! every VMM as a subprocess keeps the per-VM crash/seccomp boundary and lets an
-//! in-process VMM (e.g. libkrun) plug in later as a self-subcommand without
-//! touching callers.
+//! path spawns it detached with a pidfile; the dev `run`/build paths hold the `Child`
+//! and kill it). Running every VMM as a subprocess keeps the per-VM crash/seccomp
+//! boundary.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -73,7 +71,7 @@ pub enum DiskFormat {
     Qcow2,
     /// A `.vk_ro_img` manifest: a read-only, on-demand-decompressing view over a cached
     /// build-stage image's chunks (libkrun only — see `third_party/libkrun`'s
-    /// `lazy_chunk_storage`). Never valid under cloud-hypervisor.
+    /// `lazy_chunk_storage`).
     VkLazyChunks,
 }
 
@@ -179,28 +177,11 @@ impl Disk {
         self.sync = DiskSync::None;
         self
     }
-
-    /// cloud-hypervisor `--disk` value. A qcow2 disk carries `image_type=qcow2,backing_files=on`
-    /// so CH resolves any backing chain (a root overlay's forked stages); a disk-volume qcow2
-    /// has no chain, and the flag is then a harmless no-op. A raw disk omits both keys (CH
-    /// defaults to raw). `VkLazyChunks` never reaches here — it is only attached under libkrun.
-    fn ch_value(&self) -> String {
-        let mut v = format!(
-            "path={},readonly={}",
-            self.path.display(),
-            if self.readonly { "on" } else { "off" }
-        );
-        if self.format == DiskFormat::Qcow2 {
-            v.push_str(",image_type=qcow2,backing_files=on");
-        }
-        v
-    }
 }
 
 /// A virtio-fs DAX window maps shared files into guest address space for direct access to
 /// the host page cache, avoiding a second copy through FUSE. `off` disables the window.
 ///
-/// Only the libkrun backend has a window; cloud-hypervisor's virtio-fs has no DAX path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dax {
     /// No window: file data is copied into the guest's page cache on every read.
@@ -461,7 +442,6 @@ const KRUN_CACHE_AUTO: u32 = 1;
 const KRUN_CACHE_ALWAYS: u32 = 2;
 const KRUN_TIMEOUT_DEFAULT_MS: u32 = 5_000;
 
-#[cfg(feature = "libkrun")]
 const _: () = {
     assert!(KRUN_CACHE_AUTO == krun::KRUN_FS_CACHE_AUTO);
     assert!(KRUN_CACHE_ALWAYS == krun::KRUN_FS_CACHE_ALWAYS);
@@ -527,8 +507,8 @@ impl ShareCache {
 /// do not fit use slower ordinary mounts without failing the boot.
 pub fn apply_dax_budget(shares: &mut [FsShare], mem: &str) {
     // A guest whose RAM reaches into the span is given no span at all, so every window is
-    // refused rather than the ones past the ceiling. An unparseable size is a
-    // cloud-hypervisor one, where no share has a window to lose.
+    // refused rather than the ones past the ceiling. An unparseable size gives no RAM figure
+    // to hold the span against, so the windows are left to libkrun's own placement.
     if crate::run::parse_mem_mib(mem).is_some_and(|mib| mib > DAX_MAX_GUEST_MIB) {
         if shares.iter().any(|s| s.dax.is_some()) {
             eprintln!(
@@ -653,9 +633,7 @@ fn net_extra_ips_env(extra_ips: &[std::net::Ipv4Addr], prefix: u8) -> Option<Str
 }
 
 /// A guest vsock port mapped to a host-side unix socket. This is how the libkrun
-/// backend is told about vsock channels; cloud-hypervisor derives the same wiring
-/// from its hybrid `--vsock` socket plus the `_<port>` suffix convention and ignores
-/// this list.
+/// backend is told about vsock channels.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct VsockPort {
     pub port: u32,
@@ -670,9 +648,7 @@ pub struct VsockPort {
 impl VsockPort {
     /// Exec-style channel (host→guest): libkrun listens on `<base>_<port>` and
     /// forwards host connections to guest `port` — the raw, relay-free path a
-    /// `vsock-auto://<base>:<port>` client prefers. Cloud-hypervisor ignores the
-    /// entry (its hybrid socket at `base` serves every port behind the CONNECT
-    /// handshake, which is the same client's fallback).
+    /// `vsock-auto://<base>:<port>` client prefers.
     pub fn exec(base: &Path, port: u32) -> Self {
         VsockPort {
             port,
@@ -720,15 +696,13 @@ pub struct VmSpec {
     pub mem: String,
     pub shared_mem: bool,
     pub net: Net,
-    /// Switch-mode NICs as virtio-net devices (libkrun; see [`switch_attach`]). Empty for
-    /// cloud-hypervisor, whose switch guests ride a vsock bridge in `vsock_ports` instead.
+    /// Switch-mode NICs as virtio-net devices (see [`switch_attach`]).
     #[serde(default)]
     pub nics: Vec<Nic>,
     /// virtio-balloon with free-page reporting: the guest hands pages it frees back to
-    /// the host mid-run, so concurrent VMs can overcommit safely. Honored by both
-    /// backends — cloud-hypervisor gates its `--balloon` argument on it, and the libkrun
-    /// backend, which attaches a balloon by default, opts out through the vendored
-    /// `krun_disable_balloon`. Costs one virtio-pci slot on libkrun.
+    /// the host mid-run, so concurrent VMs can overcommit safely. libkrun attaches a
+    /// balloon by default; `false` opts out through the vendored `krun_disable_balloon`.
+    /// Costs one virtio-pci slot.
     pub balloon: bool,
     /// Serial console log file (`--serial file=…`).
     pub serial_log: PathBuf,
@@ -741,15 +715,12 @@ pub struct VmSpec {
     /// Expose the guest PMU (`vk run --pmu`): the libkrun backend leaves CPUID
     /// leaf 0xA as KVM reports it (vendored `krun_set_pmu` patch), so in-guest
     /// perf gets hardware counters via KVM's vPMU. Default off — host counters
-    /// are a side-channel surface, for trusted dev VMs only. cloud-hypervisor
-    /// has no equivalent; that backend warns and boots without.
+    /// are a side-channel surface, for trusted dev VMs only.
     #[serde(default)]
     pub pmu: bool,
     /// Expose VMX/SVM to the guest (`vk run --nested`) so it can run KVM guests of
     /// its own — `vk` inside `vk`. The libkrun backend keeps the host's CPUID bit
-    /// (`krun_set_nested_virt`), which it otherwise masks; cloud-hypervisor has no
-    /// such knob and passes the host's bit through whatever this says, so its guests
-    /// nest whenever the host allows it. Default off: nesting widens the guest's
+    /// (`krun_set_nested_virt`), which it otherwise masks. Default off: nesting widens the guest's
     /// attack surface on host KVM, and the host must allow it
     /// ([`host_nesting_enabled`]).
     #[serde(default)]
@@ -765,8 +736,7 @@ pub struct VmSpec {
     pub pass_fds: Vec<i32>,
     /// Process name for the VMM subprocess: sets `comm` (top/htop, 15-char capped) and
     /// argv[0] (`ps aux`). Derived from `--vm-name` (default `vk:{name}`) via
-    /// [`resolve_proc_name`]. Only the libkrun backend applies it — cloud-hypervisor keeps
-    /// its own binary name.
+    /// [`resolve_proc_name`].
     #[serde(default = "default_proc_name")]
     pub proc_name: String,
     /// Reboot the VM in place on a guest reset instead of ending the process. The
@@ -794,92 +764,12 @@ pub trait Vmm: Send {
     fn name(&self) -> &'static str;
 }
 
-/// cloud-hypervisor: boots `spec` as an external `cloud-hypervisor` process.
-pub struct CloudHypervisor {
-    pub bin: PathBuf,
-}
-
-impl Vmm for CloudHypervisor {
-    fn command(&self, spec: &VmSpec) -> Command {
-        // No CH equivalent of libkrun's krun_set_pmu (x86 CH exposes no vPMU knob):
-        // boot without rather than fail, but say so — otherwise the user only sees
-        // `<not supported>` from perf inside the guest.
-        if spec.pmu {
-            eprintln!(
-                "virtkit: warning: --pmu is not supported by the cloud-hypervisor backend; \
-                 booting without a guest PMU"
-            );
-        }
-        let mut cmd = Command::new(&self.bin);
-        if let Some(api) = &spec.api_socket {
-            cmd.arg("--api-socket").arg(api);
-        }
-        cmd.arg("--kernel").arg(&spec.kernel);
-        for disk in &spec.disks {
-            cmd.arg("--disk").arg(disk.ch_value());
-        }
-        if let Some(initramfs) = &spec.initramfs {
-            cmd.arg("--initramfs").arg(initramfs);
-        }
-        for share in &spec.shares {
-            cmd.arg("--fs").arg(format!(
-                "tag={},socket={}",
-                share.tag,
-                share.socket.display()
-            ));
-        }
-        let mem = if spec.shared_mem {
-            format!("size={},shared=on", spec.mem)
-        } else {
-            format!("size={}", spec.mem)
-        };
-        cmd.arg("--vsock")
-            .arg(format!(
-                "cid={},socket={}",
-                spec.vsock_cid,
-                spec.vsock_socket.display()
-            ))
-            .arg("--cpus")
-            .arg(format!("boot={}", spec.cpus))
-            .arg("--memory")
-            .arg(mem)
-            .arg("--serial")
-            .arg(format!("file={}", spec.serial_log.display()))
-            .arg("--console")
-            .arg("off")
-            .arg("--cmdline")
-            .arg(&spec.cmdline);
-        if let Net::Tap { tap, mac } = &spec.net {
-            cmd.arg("--net").arg(format!("tap={tap},mac={mac}"));
-        }
-        // `nics` is a libkrun-only attach, and cloud-hypervisor can no longer be selected,
-        // so a populated list here is a caller bug, not a configuration a user can reach.
-        debug_assert!(
-            spec.nics.is_empty(),
-            "cloud-hypervisor cannot attach switch NICs"
-        );
-        if spec.balloon {
-            // size=0: no static balloon, just give freed guest pages back to the
-            // host so concurrent jobs overcommit safely (guest CONFIG_PAGE_REPORTING).
-            cmd.arg("--balloon")
-                .arg("size=0,deflate_on_oom=on,free_page_reporting=on");
-        }
-        cmd
-    }
-
-    fn name(&self) -> &'static str {
-        "cloud-hypervisor"
-    }
-}
-
 /// libkrun: boots `spec` by re-execing this binary as a per-VM subprocess that links
 /// libkrun and drives its C API (see [`crate::libkrun_sys`]). Running it as a subprocess
-/// keeps the same lifecycle as [`CloudHypervisor`] (held `Child` / `spawn_tied`), with no
-/// in-process VMM in the orchestrator.
-#[cfg(feature = "libkrun")]
+/// keeps the VM's lifecycle a held `Child` (`spawn_tied`), with no in-process VMM in the
+/// orchestrator.
 pub struct Libkrun;
 
-#[cfg(feature = "libkrun")]
 impl Vmm for Libkrun {
     fn command(&self, spec: &VmSpec) -> Command {
         use std::os::unix::process::CommandExt;
@@ -903,32 +793,17 @@ impl Vmm for Libkrun {
     }
 }
 
-/// The `[vmm]` config choice, set once in `cli_main` from the loaded config. `None` (not
-/// yet set, or the key was absent) asks for nothing.
-static CONFIG_BACKEND: std::sync::OnceLock<Option<crate::config::VmmBackend>> =
-    std::sync::OnceLock::new();
-
-/// Record `vmm` for [`libkrun_selected`]'s cloud-hypervisor warning.
+/// Warn about ignored cloud-hypervisor requests in config `vmm` or `VIRTKIT_VMM`.
+/// The backend is removed; every VM boots on libkrun.
 /// Called once after config loading, before any boot.
-pub fn set_config_backend(backend: Option<crate::config::VmmBackend>) {
-    let _ = CONFIG_BACKEND.set(backend);
-}
-
-/// Always select libkrun when compiled with the `libkrun` feature. Requests for
-/// cloud-hypervisor via `VIRTKIT_VMM` or config `vmm` boot on libkrun with one warning
-/// per process.
-pub fn libkrun_selected() -> bool {
-    if !cfg!(feature = "libkrun") {
-        return false;
-    }
-    let asked = cloud_hypervisor_requested(
-        std::env::var("VIRTKIT_VMM").ok().as_deref(),
-        CONFIG_BACKEND.get().copied().flatten(),
-    );
+pub fn warn_if_cloud_hypervisor_requested(config: Option<crate::config::VmmBackend>) {
+    let asked = cloud_hypervisor_requested(std::env::var("VIRTKIT_VMM").ok().as_deref(), config);
     if let Some(fix) = asked {
-        warn_cloud_hypervisor_removed(fix);
+        eprintln!(
+            "virtkit: warning: the cloud-hypervisor backend has been removed; VMs boot on \
+             libkrun ({fix})"
+        );
     }
-    true
 }
 
 /// What to drop when `VIRTKIT_VMM` (`env`) or the config `vmm` key (`config`) still asks
@@ -947,24 +822,9 @@ fn cloud_hypervisor_requested(
     }
 }
 
-/// Warn once per process when a cloud-hypervisor request is ignored.
-/// Every boot site calls [`libkrun_selected`], so an unguarded warning would repeat.
-fn warn_cloud_hypervisor_removed(fix: &str) {
-    static WARNED: std::sync::Once = std::sync::Once::new();
-    WARNED.call_once(|| {
-        eprintln!(
-            "virtkit: warning: the cloud-hypervisor backend has been removed; booting on \
-             libkrun ({fix})"
-        );
-    });
-}
-
 /// Whether the host lets a guest run guests of its own — `kvm_intel`/`kvm_amd`'s
-/// `nested` module parameter. Backend-agnostic on purpose: libkrun's own
-/// `krun_check_nested_virt` reads these same two files (and is compiled out of a
-/// cloud-hypervisor-only build), while cloud-hypervisor has no nesting knob at all —
-/// it passes the host's VMX/SVM CPUID bit through — so this is what decides nesting
-/// on either backend.
+/// `nested` module parameter — the same two files libkrun's own `krun_check_nested_virt`
+/// reads.
 pub fn host_nesting_enabled() -> bool {
     nesting_enabled_in(Path::new("/sys/module"))
 }
@@ -979,15 +839,9 @@ fn nesting_enabled_in(sys_module: &Path) -> bool {
     })
 }
 
-/// The selected VMM backend for a boot.
-pub fn selected(cloud_hypervisor: &Path) -> Box<dyn Vmm> {
-    #[cfg(feature = "libkrun")]
-    if libkrun_selected() {
-        return Box::new(Libkrun);
-    }
-    Box::new(CloudHypervisor {
-        bin: cloud_hypervisor.to_path_buf(),
-    })
+/// The VMM backend for a boot.
+pub fn selected() -> Box<dyn Vmm> {
+    Box::new(Libkrun)
 }
 
 /// The exec-channel connect address: `vsock-auto://<base>:<port>` on every
@@ -1038,12 +892,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    fn args(cmd: &Command) -> Vec<String> {
-        cmd.get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect()
     }
 
     #[test]
@@ -1136,16 +984,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // Raw ext4 has no leading magic because its superblock starts at offset 1024. Attach
-        // it without Cloud Hypervisor image-type or backing-file keys for compatibility.
+        // Raw ext4 has no leading magic because its superblock starts at offset 1024.
         let raw = dir.join("old.ext4");
         std::fs::write(&raw, [0u8; 4096]).unwrap();
         let d = Disk::for_image(raw, false).unwrap();
         assert!(d.format == DiskFormat::Raw, "a zero-magic file is raw");
-        assert!(!d.ch_value().contains("image_type"), "{}", d.ch_value());
 
-        // A new volume sniffs as qcow2 and takes the Cloud Hypervisor qcow2 path. It has no
-        // backing chain, so backing_files=on is a no-op.
+        // A new volume sniffs as qcow2.
         let q = dir.join("vol.qcow2");
         crate::qcow2::Qcow2Writer::create(&q, 1 << 20, 0o600)
             .unwrap()
@@ -1153,11 +998,6 @@ mod tests {
             .unwrap();
         let d = Disk::for_image(q, true).unwrap();
         assert!(d.format == DiskFormat::Qcow2, "the qcow2 magic is qcow2");
-        assert!(
-            d.ch_value().contains("image_type=qcow2,backing_files=on"),
-            "{}",
-            d.ch_value()
-        );
 
         // A lazy manifest is a chunk view, not a disk, and must not fall back to raw.
         let lazy = dir.join("view.vk_ro_img");
@@ -1357,154 +1197,9 @@ mod tests {
         let mut s = shares();
         apply_dax_budget(&mut s, &format!("{}M", DAX_MAX_GUEST_MIB + 1));
         assert_eq!(s[0].dax, None);
-        // A size this parser does not know is cloud-hypervisor's, where no share has a
-        // window to lose anyway.
+        // A size this parser does not know leaves the windows alone.
         let mut s = shares();
         apply_dax_budget(&mut s, "64G@0");
         assert_eq!(s[0].dax.map(|d| d.window), window(DAX_DEFAULT));
-    }
-
-    /// The CI path: API socket (graceful shutdown), a rw qcow2 overlay root,
-    /// a virtio-fs share, a leased tap, balloon, shared memory.
-    #[test]
-    fn ci_disk_with_tap_balloon_api() {
-        let ch = CloudHypervisor {
-            bin: "cloud-hypervisor".into(),
-        };
-        let spec = VmSpec {
-            kernel: "/k/vmlinux".into(),
-            cmdline: "console=ttyS0 root=/dev/vda".into(),
-            disks: vec![Disk::overlay("/job/overlay.qcow2".into())],
-            initramfs: None,
-            shares: vec![FsShare {
-                tag: "workdir".into(),
-                socket: "/job/vfsd.sock".into(),
-                host_dir: "/host/workdir".into(),
-                read_only: false,
-                dax: None,
-                uid_map: Vec::new(),
-                gid_map: Vec::new(),
-                cache: ShareCache::Auto,
-            }],
-            vsock_cid: 3,
-            vsock_socket: "/job/vsock.sock".into(),
-            vsock_ports: vec![],
-            cpus: 4,
-            mem: "8G".into(),
-            shared_mem: true,
-            nics: Vec::new(),
-            net: Net::Tap {
-                tap: "civtap0".into(),
-                mac: "52:54:00:d2:f0:01".into(),
-            },
-            balloon: true,
-            serial_log: "/job/console.log".into(),
-            console_serial: false,
-            pmu: false,
-            nested: false,
-            api_socket: Some("/job/api.sock".into()),
-            pass_fds: Vec::new(),
-            proc_name: "vk:ci".into(),
-            reboot: false,
-            numa: crate::numa::Numa::Auto,
-        };
-        assert_eq!(
-            args(&ch.command(&spec)),
-            vec![
-                "--api-socket",
-                "/job/api.sock",
-                "--kernel",
-                "/k/vmlinux",
-                "--disk",
-                "path=/job/overlay.qcow2,readonly=off,image_type=qcow2,backing_files=on",
-                "--fs",
-                "tag=workdir,socket=/job/vfsd.sock",
-                "--vsock",
-                "cid=3,socket=/job/vsock.sock",
-                "--cpus",
-                "boot=4",
-                "--memory",
-                "size=8G,shared=on",
-                "--serial",
-                "file=/job/console.log",
-                "--console",
-                "off",
-                "--cmdline",
-                "console=ttyS0 root=/dev/vda",
-                "--net",
-                "tap=civtap0,mac=52:54:00:d2:f0:01",
-                "--balloon",
-                "size=0,deflate_on_oom=on,free_page_reporting=on",
-            ]
-        );
-    }
-
-    /// A minimal guest: agent initramfs + a rw qcow2 stage disk + a read-only raw
-    /// source disk (COPY --from style), with API/net/balloon off and unshared memory —
-    /// the balloon-off spelling `[executor.vm] balloon = false` selects, gating `--balloon` away.
-    #[test]
-    fn build_session_initramfs_and_source_disks() {
-        let ch = CloudHypervisor {
-            bin: "/usr/bin/cloud-hypervisor".into(),
-        };
-        let spec = VmSpec {
-            kernel: "/k/vmlinux".into(),
-            cmdline: "console=ttyS0 rdinit=/init".into(),
-            disks: vec![
-                Disk::overlay("/w/stage.qcow2".into()),
-                Disk {
-                    path: "/w/source.ext4".into(),
-                    format: DiskFormat::Raw,
-                    readonly: true,
-                    dirty_control_socket: None,
-                    sync: DiskSync::Full,
-                },
-            ],
-            initramfs: Some("/w/initramfs.cpio".into()),
-            shares: vec![],
-            vsock_cid: 3,
-            vsock_socket: "/w/vsock.sock".into(),
-            vsock_ports: vec![],
-            cpus: 2,
-            mem: "2G".into(),
-            shared_mem: false,
-            nics: Vec::new(),
-            net: Net::None,
-            balloon: false,
-            serial_log: "/w/console.log".into(),
-            console_serial: false,
-            pmu: false,
-            nested: false,
-            api_socket: None,
-            pass_fds: Vec::new(),
-            proc_name: "vk:build".into(),
-            reboot: false,
-            numa: crate::numa::Numa::Auto,
-        };
-        assert_eq!(
-            args(&ch.command(&spec)),
-            vec![
-                "--kernel",
-                "/k/vmlinux",
-                "--disk",
-                "path=/w/stage.qcow2,readonly=off,image_type=qcow2,backing_files=on",
-                "--disk",
-                "path=/w/source.ext4,readonly=on",
-                "--initramfs",
-                "/w/initramfs.cpio",
-                "--vsock",
-                "cid=3,socket=/w/vsock.sock",
-                "--cpus",
-                "boot=2",
-                "--memory",
-                "size=2G",
-                "--serial",
-                "file=/w/console.log",
-                "--console",
-                "off",
-                "--cmdline",
-                "console=ttyS0 rdinit=/init",
-            ]
-        );
     }
 }

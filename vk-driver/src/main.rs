@@ -48,7 +48,6 @@ mod image;
 mod initramfs;
 mod iso9660;
 mod jobctx;
-#[cfg(feature = "libkrun")]
 mod libkrun_sys;
 mod local;
 mod manager;
@@ -854,15 +853,6 @@ enum Cmd {
         /// parse + plan + print the build order and primitives; build nothing
         #[arg(long = "print-plan", help_heading = "Output")]
         print_plan: bool,
-        /// cloud-hypervisor binary, used only with VIRTKIT_VMM=cloud-hypervisor
-        ///
-        /// The default libkrun backend is embedded in `vk` and needs none.
-        #[arg(
-            long = "cloud-hypervisor",
-            value_name = "PATH",
-            help_heading = "Build environment"
-        )]
-        cloud_hypervisor: Option<PathBuf>,
         /// guest kernel the RUN steps boot
         ///
         /// Default: `[build] kernel`, else the one embedded in `vk`.
@@ -1549,15 +1539,14 @@ enum Cmd {
         ///
         /// Cycles, instructions and the rest, via KVM's vPMU. SECURITY: host performance
         /// counters are a side-channel surface — enable only for trusted guests (a dev VM),
-        /// never untrusted CI jobs. libkrun backend only; default off.
+        /// never untrusted CI jobs. Default off.
         #[arg(long, help_heading = "Guest")]
         pmu: bool,
         /// expose VMX/SVM for `vk` inside `vk` — trusted guests only
         ///
         /// Needs nested virtualization enabled on the host (kvm_intel.nested / kvm_amd.nested).
-        /// SECURITY: the guest reaches host KVM's nested paths — for trusted guests only. Only
-        /// the libkrun backend gates this; cloud-hypervisor guests nest whenever the host
-        /// allows it. Default off.
+        /// SECURITY: the guest reaches host KVM's nested paths — for trusted guests only.
+        /// Default off.
         #[arg(long, help_heading = "Guest")]
         nested: bool,
         /// static (musl) vk-agent injected as PID 1
@@ -1565,11 +1554,6 @@ enum Cmd {
         /// Default: the copy embedded in `vk`.
         #[arg(long = "agent", value_name = "PATH", help_heading = "Guest")]
         agent: Option<PathBuf>,
-        /// cloud-hypervisor binary, used only with VIRTKIT_VMM=cloud-hypervisor
-        ///
-        /// Default: the config's top-level `cloud_hypervisor`, else `cloud-hypervisor` on PATH.
-        #[arg(long, value_name = "PATH", help_heading = "Guest")]
-        cloud_hypervisor: Option<PathBuf>,
         /// vCPUs: a number, or `host` for the host's logical CPU count
         ///
         /// Default 2, or the --primary service's own x-virtkit.cpus.
@@ -2378,7 +2362,6 @@ fn main() -> ExitCode {
     // backend re-execs this binary per VM, passing the spec in BOOT_SPEC_ENV so argv is
     // free for the VM's process name). Dispatched before the CLI on that env var; it links
     // libkrun and blocks in krun_start_enter until the guest powers off.
-    #[cfg(feature = "libkrun")]
     if let Ok(json) = std::env::var(vmm::BOOT_SPEC_ENV) {
         let spec: vmm::VmSpec = match serde_json::from_str(&json) {
             Ok(spec) => spec,
@@ -2885,10 +2868,9 @@ async fn cli_main(cli: Cli) -> ExitCode {
         Ok(cfg) => cfg,
         Err(e) => return fail(&e, 2),
     };
-    // Apply `[build]` tuning process-wide before any build or boot, and record `vmm`
-    // so boots can warn about cloud-hypervisor requests.
+    // Apply the host's `[build]` tuning process-wide, before any build or boot path runs.
     build::set_tuning(&cfg.build);
-    vmm::set_config_backend(cfg.vmm);
+    vmm::warn_if_cloud_hypervisor_requested(cfg.vmm);
     numa::set_policy(cfg.numa.mode);
     if let Cmd::Config {
         example: false,
@@ -3025,7 +3007,6 @@ async fn cli_main(cli: Cli) -> ExitCode {
         password,
         insecure,
         agent,
-        cloud_hypervisor,
         cpus,
         mem,
         numa,
@@ -3208,12 +3189,6 @@ async fn cli_main(cli: Cli) -> ExitCode {
             pmu: *pmu,
             nested: *nested,
             agent: agent.clone(),
-            // CLI flag wins; else the config's top-level cloud_hypervisor (bare
-            // "cloud-hypervisor" when unset). `[build] cloud_hypervisor` sizes the build
-            // guest, not the run's.
-            cloud_hypervisor: cloud_hypervisor
-                .clone()
-                .unwrap_or_else(|| cfg.cloud_hypervisor().to_path_buf()),
             source: *source,
             ca: ca.clone(),
             username: username.clone(),
@@ -3565,7 +3540,6 @@ async fn cli_main(cli: Cli) -> ExitCode {
         tag,
         disk,
         print_plan,
-        cloud_hypervisor,
         kernel,
         agent,
         cache_registry,
@@ -3609,9 +3583,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
             },
             None => cfg.build.build_cache,
         };
-        // CLI flag wins; otherwise fall back to [build] config (and the top-level
-        // cloud_hypervisor for the build guest's VMM). bool flags are opt-in, so a set
-        // flag or a config `true` enables them.
+        // CLI flag wins; otherwise fall back to [build] config. bool flags are opt-in, so a
+        // set flag or a config `true` enables them.
         let b = &cfg.build;
         // Canonicalize --disk like `vk run --disk` (run.rs), so a relative path resolves
         // against the caller's cwd and a missing/inaccessible file fails clearly up front
@@ -3673,10 +3646,6 @@ async fn cli_main(cli: Cli) -> ExitCode {
             out: tag_out.clone().or_else(|| out.clone()),
             out_disk,
             print_plan: *print_plan,
-            cloud_hypervisor: cloud_hypervisor
-                .clone()
-                .or_else(|| b.cloud_hypervisor.clone())
-                .or_else(|| cfg.cloud_hypervisor.clone()),
             kernel: kernel.clone().or_else(|| b.kernel.clone()),
             agent: agent.clone().or_else(|| b.agent.clone()),
             cache_registry: cache.registry,

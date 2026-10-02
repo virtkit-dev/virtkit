@@ -276,7 +276,6 @@ pub struct RunArgs {
     pub nested: bool,
     /// `None` uses the vk-agent embedded in `vk` (or the on-disk default).
     pub agent: Option<PathBuf>,
-    pub cloud_hypervisor: PathBuf,
     /// where the rootfs comes from for an image boot (registry pull / docker export / auto)
     pub source: SourceMode,
     pub ca: Option<PathBuf>,
@@ -463,7 +462,6 @@ impl Default for RunArgs {
             pmu: false,
             nested: false,
             agent: None,
-            cloud_hypervisor: PathBuf::from("cloud-hypervisor"),
             source: SourceMode::Auto,
             ca: None,
             username: None,
@@ -631,20 +629,18 @@ pub(crate) use vk_core::unixpath::SUN_PATH_MAX;
 /// `/proc/self/fd` fallback of `vk_core::unixpath`.
 const LONGEST_SOCKET_NAME: &str = "vsock.sock_65535";
 
-/// State directory byte limit under cloud-hypervisor, reserving room for the separator and
-/// longest socket name.
+/// State directory byte limit for binding sockets by name, reserving room for the
+/// separator and longest socket name.
 pub(crate) const STATE_DIR_MAX: usize = SUN_PATH_MAX - 1 - LONGEST_SOCKET_NAME.len();
 
 /// A boot session's own directory under `base` (the temp dir): its guest's exec socket, its
-/// console log and, under cloud-hypervisor, its initramfs and context share socket. The name,
-/// `virtkit-session-<pid>-<stem>`, is predictable and `base` is shared with every local user,
-/// so it is created here, private (0700), and never taken as found: a directory someone else
-/// planted there would hand them the guest's exec channel, and a `console.log` symlink planted
-/// in it would point the VMM's truncating write at a file of their choosing. When the name is
-/// taken — by a planter, or by a session an earlier process with this pid left behind — a
-/// random suffix picks one no one could have planted; under cloud-hypervisor its 17 bytes come
-/// out of the socket-path budget [`check_state_dir_len`] enforces.
-/// `build::sweep_stale_sessions` reads the pid from either form.
+/// console log and its overlay's dirty-tracking socket. The name, `virtkit-session-<pid>-<stem>`,
+/// is predictable and `base` is shared with every local user, so it is created here, private
+/// (0700), and never taken as found: a directory someone else planted there would hand them
+/// the guest's exec channel, and a `console.log` symlink planted in it would point the VMM's
+/// truncating write at a file of their choosing. When the name is taken — by a planter, or by
+/// a session an earlier process with this pid left behind — a random suffix picks one no one
+/// could have planted. `build::sweep_stale_sessions` reads the pid from either form.
 ///
 /// The directory is removed when the returned guard drops, until [`SessionDir::keep`] hands it
 /// to the [`VmSession`] that removes it from then on: a boot that fails leaves nothing behind.
@@ -698,35 +694,6 @@ impl Drop for SessionDir {
     }
 }
 
-/// Reject long state dirs only under cloud-hypervisor, which receives socket paths on its
-/// command line and binds and connects by name. libkrun runs in our process and uses directory
-/// descriptors ([`vk_core::unixpath`]), as our other socket callers do, without this limit.
-pub(crate) fn check_state_dir_len(dir: &Path) -> Result<()> {
-    if crate::vmm::libkrun_selected() {
-        return Ok(());
-    }
-    check_state_dir_fits_sockets(dir)
-}
-
-/// The length check itself. Measure the path as supplied for binding; canonicalizing it
-/// would measure a different string.
-fn check_state_dir_fits_sockets(dir: &Path) -> Result<()> {
-    let len = dir.as_os_str().len();
-    let or_libkrun = if cfg!(feature = "libkrun") {
-        ", or the default libkrun backend"
-    } else {
-        ""
-    };
-    ensure!(
-        len <= STATE_DIR_MAX,
-        "state directory {} is {len} bytes long, {STATE_DIR_MAX} is the most it may be: \
-         cloud-hypervisor binds the VM's sockets under it and a unix socket path holds at \
-         most {SUN_PATH_MAX} bytes. Use a shorter path{or_libkrun}.",
-        dir.display()
-    );
-    Ok(())
-}
-
 /// A launch's named scratch dir — sockets, logs, and a `-f` build's ext4 live here
 /// (an image boot's media are unlinked scratch fds). Removed on drop, so error and
 /// panic unwinds clean it up too; only a signal kill can leak it.
@@ -749,7 +716,6 @@ struct WorkDir {
 
 impl WorkDir {
     fn create(path: PathBuf) -> Result<WorkDir> {
-        check_state_dir_len(&path)?;
         std::fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
         Ok(WorkDir {
             path,
@@ -760,7 +726,6 @@ impl WorkDir {
 
     /// Create-or-reuse a caller-pinned scratch dir (`--state-dir`).
     fn pinned(path: PathBuf) -> Result<WorkDir> {
-        check_state_dir_len(&path)?;
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -1444,18 +1409,13 @@ async fn build_and_boot(
         ok
     });
 
-    // 2. assemble the boot medium (virtkit-agent injected as PID 1). With the libkrun
-    // backend the media are unlinked scratch fds — `media` keeps them open (their
-    // /proc/self/fd paths must resolve until the VMM child has spawned), `pass_fds`
-    // hands them across the exec — so a killed run cannot leak them. The external
-    // cloud-hypervisor keeps named files in `work`.
+    // 2. assemble the boot medium (virtkit-agent injected as PID 1). The media are unlinked
+    // scratch fds — `media` keeps them open (their /proc/self/fd paths must resolve until
+    // the VMM child has spawned), `pass_fds` hands them across the exec — so a killed run
+    // cannot leak them.
     let mut media: Vec<crate::scratch::ScratchFile> = Vec::new();
     let mut pass_fds: Vec<i32> = Vec::new();
-    let anon = crate::vmm::libkrun_selected();
     let mut medium = |name: &str| -> Result<PathBuf> {
-        if !anon {
-            return Ok(work.join(name));
-        }
         let s = crate::scratch::scratch(work, name)?;
         let path = s.path.clone();
         pass_fds.push(s.fd());
@@ -1897,7 +1857,6 @@ async fn build_and_boot(
     } else {
         Some(std::sync::Arc::new(crate::manager::Manager::new(
             kernel.to_path_buf(),
-            args.cloud_hypervisor.clone(),
             NET_VSOCK_PORT,
             gw,
             agent.to_path_buf(),
@@ -1936,7 +1895,7 @@ async fn build_and_boot(
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     // The DAX window each directory share gets: the guest maps the host page cache through
     // it instead of copying file data into its own, so a tree read twice is read once.
-    let dax = dax_share(marker_dax, args.dax, crate::vmm::libkrun_selected());
+    let dax = dax_share(marker_dax, args.dax);
     // Host-side helpers killed by `teardown_run`: the socket forwarders.
     let mut aux_children: Vec<Child> = Vec::new();
     let mut virtiofs = String::new();
@@ -2186,7 +2145,7 @@ async fn build_and_boot(
 
     // 3. boot
     let console = work.join(CONSOLE_LOG);
-    let vmm = crate::vmm::selected(&args.cloud_hypervisor);
+    let vmm = crate::vmm::selected();
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
     println!("virtkit: booting {} (cpus={cpus}, mem={mem})", vmm.name());
     // exec channel always; the switch NICs and the ssh-agent bridge only when set up above.
@@ -2805,30 +2764,11 @@ pub(crate) fn effective_dax(
 
 /// What each guest directory share is served with: its DAX window and file-size floor;
 /// `None` for no window.
-///
-/// Only libkrun supports DAX; cloud-hypervisor serves shares the ordinary way. Warn once
-/// for an explicit window request so the unsupported setting is visible; defaults stay
-/// silent.
-/// Pass `libkrun` explicitly because tests cannot set the process-global backend selection.
 pub(crate) fn dax_share(
     declared: Option<crate::vmm::Dax>,
     fallback: Option<crate::vmm::Dax>,
-    libkrun: bool,
 ) -> Option<crate::vmm::DaxShare> {
-    let share = effective_dax(declared, fallback).share();
-    if libkrun {
-        return share;
-    }
-    if share.is_some() && declared.or(fallback).is_some() {
-        static SAID: std::sync::Once = std::sync::Once::new();
-        SAID.call_once(|| {
-            eprintln!(
-                "virtkit: warning: DAX windows are not supported by the cloud-hypervisor \
-                 backend; virtio-fs shares are served without one"
-            );
-        });
-    }
-    None
+    effective_dax(declared, fallback).share()
 }
 
 /// The `VIRTKIT_VIRTIOFS_DAX` value for these shares: the tags that got a window, which is
@@ -3065,9 +3005,7 @@ fn plan_services(
         let unit = &units[i];
         let dir = work.join(format!("svc-{}", unit.name));
         // The switch binds each service's vsock socket under this dir at startup, and the
-        // boot writes the overlay/console here — so it must exist before either runs, and
-        // under cloud-hypervisor its own path has to leave room for those sockets.
-        check_state_dir_len(&dir)?;
+        // boot writes the overlay/console here — so it must exist before either runs.
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         sited.push(Sited { unit: i, dir, slot });
         slot += 1;
@@ -3246,7 +3184,6 @@ async fn compose_up(
     let (gw, prefix, _) = crate::net::switch_addrs(RUN_SUBNET)?;
     let mgr = std::sync::Arc::new(crate::manager::Manager::new(
         kernel.to_path_buf(),
-        args.cloud_hypervisor.clone(),
         NET_VSOCK_PORT,
         gw,
         agent.to_path_buf(),
@@ -3316,7 +3253,6 @@ fn manager_build_opts(args: &RunArgs, kernel: &Path, agent: &Path) -> crate::uni
     crate::units::BuildOpts {
         build_args: args.build_args.clone(),
         kernel: kernel.to_path_buf(),
-        cloud_hypervisor: args.cloud_hypervisor.clone(),
         agent: agent.to_path_buf(),
         cache_registry: args.cache.registry.clone(),
         cache_insecure: args.cache.insecure,
@@ -3345,7 +3281,6 @@ pub(crate) fn service_build_options(
         out: None,
         out_disk: None,
         print_plan: false,
-        cloud_hypervisor: Some(args.cloud_hypervisor.clone()),
         kernel: Some(kernel.to_path_buf()),
         agent: Some(agent.to_path_buf()),
         cache_registry: args.cache.registry.clone(),
@@ -4242,16 +4177,9 @@ pub(crate) fn spawn_vmm(
     Ok(child)
 }
 
-/// Report a VMM that exited during boot: name the backend that actually ran (libkrun
-/// by default, else cloud-hypervisor) and show the tails of both the guest serial log
-/// and the VMM's own stdout/stderr (`<serial>.vmm.log`) — libkrun prints its abort
-/// reason there, so surfacing it is what makes a failed boot legible.
+/// Report a VMM exit during boot with guest serial and VMM stdout/stderr tails.
+/// libkrun writes its abort reason to `<serial>.vmm.log`.
 fn boot_failure(console: &Path, status: std::process::ExitStatus) -> String {
-    let vmm = if crate::vmm::libkrun_selected() {
-        "libkrun"
-    } else {
-        "cloud-hypervisor"
-    };
     let vmm_log = console.with_extension("vmm.log");
     // Read once for both the tail and the complaints to avoid rereading a large guest log
     // when reporting a boot failure.
@@ -4284,7 +4212,7 @@ fn boot_failure(console: &Path, status: std::process::ExitStatus) -> String {
         ""
     };
     format!(
-        "{vmm} exited during boot ({status})\n{problems}--- serial ({}) ---\n{}\n--- vmm ({}) ---\n{}{hint}",
+        "libkrun exited during boot ({status})\n{problems}--- serial ({}) ---\n{}\n--- vmm ({}) ---\n{}{hint}",
         console.display(),
         serial,
         vmm_log.display(),
@@ -4520,7 +4448,6 @@ fn build_guest_cmdline(tmp_dev: Option<&str>, image_kernel: bool) -> String {
 /// proxy), restricted to `net`'s allowlist if it has one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn boot_session(
-    cloud_hypervisor: &Path,
     kernel: &Path,
     agent: &Path,
     image: &Path,
@@ -4561,10 +4488,9 @@ pub(crate) async fn boot_session(
     let t_boot = Instant::now();
     let stem = image.file_stem().and_then(|s| s.to_str()).unwrap_or("disk");
     let work = private_session_dir(&std::env::temp_dir(), stem)?;
-    check_state_dir_len(&work)?;
     // The agent boots as PID 1 from a minimal initramfs (just `/init`), then pivots into
-    // the ext4 root below — so the agent is never written into the built image. With
-    // libkrun it is an unlinked scratch fd: `_cpio` keeps it open until the VMM child
+    // the ext4 root below — so the agent is never written into the built image. It is an
+    // unlinked scratch fd: `_cpio` keeps it open until the VMM child
     // (which inherits the fd via pass_fds below) has spawned, i.e. past spawn_vmm.
     let mut pass_fds: Vec<i32> = Vec::new();
     let mut _cpio: Option<crate::scratch::ScratchFile> = None;
@@ -4572,14 +4498,12 @@ pub(crate) async fn boot_session(
         // --kernel=image: fullvm already built the preinit initramfs (agent as /init +
         // the boot-critical modules) from the image; use it as-is.
         initramfs.to_path_buf()
-    } else if crate::vmm::libkrun_selected() {
+    } else {
         let s = crate::scratch::scratch(&work, "initramfs.cpio")?;
         let path = s.path.clone();
         pass_fds.push(s.fd());
         _cpio = Some(s);
         path
-    } else {
-        work.join("initramfs.cpio")
     };
     if image_kernel.is_none() {
         let t_ir = Instant::now();
@@ -4591,10 +4515,9 @@ pub(crate) async fn boot_session(
     // becomes the stage's result — no separate boot overlay, no commit. (A raw-rw disk
     // does not present as /dev/vda, which is why every stage image is a qcow2.)
     // Dirty-block tracking for the O(delta) checkpoint capture: the writable stage overlay
-    // serves a drain protocol on this socket (libkrun only; cloud-hypervisor lacks the hook and
-    // falls back to a full capture + content_diff). `checkpoint_dirty` connects here at each
+    // serves a drain protocol on this socket. `checkpoint_dirty` connects here at each
     // commit. The socket lives in the per-session work dir, out of the guest's reach.
-    let dirty_socket = crate::vmm::libkrun_selected().then(|| work.join("dirty.sock"));
+    let dirty_socket = Some(work.join("dirty.sock"));
     let overlay = match &dirty_socket {
         Some(sock) => {
             crate::vmm::Disk::overlay(image.to_path_buf()).with_dirty_control(sock.clone())
@@ -4757,7 +4680,7 @@ pub(crate) async fn boot_session(
         reboot: false,
         numa: crate::numa::Numa::Auto,
     };
-    let vmm = crate::vmm::selected(cloud_hypervisor);
+    let vmm = crate::vmm::selected();
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
     let t_spawn = Instant::now();
     let mut ch = spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Build)?;
@@ -5172,7 +5095,6 @@ mod tests {
     fn bare_args() -> RunArgs {
         RunArgs {
             source: SourceMode::Oci,
-            cloud_hypervisor: PathBuf::new(),
             boot_timeout_secs: 0,
             vm_name: String::new(),
             ssh_user: String::new(),
@@ -5341,16 +5263,12 @@ mod tests {
             ""
         );
 
-        // The window exists only under the built-in VMM; cloud-hypervisor's virtio-fs has
-        // no DAX path, so every share there is served the ordinary way whatever was asked.
-        assert_eq!(dax_share(None, None, true), crate::vmm::DAX_DEFAULT.share());
-        assert_eq!(dax_share(Some(Dax::Off), None, true), None);
+        assert_eq!(dax_share(None, None), crate::vmm::DAX_DEFAULT.share());
+        assert_eq!(dax_share(Some(Dax::Off), None), None);
         assert_eq!(
-            dax_share(Some(Dax::Window(1 << 30)), None, true).map(|d| d.window),
+            dax_share(Some(Dax::Window(1 << 30)), None).map(|d| d.window),
             Some(1 << 30)
         );
-        assert_eq!(dax_share(None, None, false), None);
-        assert_eq!(dax_share(Some(Dax::Window(1 << 30)), None, false), None);
     }
 
     #[test]
@@ -6080,30 +5998,6 @@ mod tests {
     }
 
     #[test]
-    fn a_state_dir_is_refused_once_cloud_hypervisor_could_not_bind_its_sockets() {
-        // 90 bytes: `<dir>/vsock.sock_65535` is exactly the 107 a unix socket path holds.
-        let fits = PathBuf::from(format!("/{}", "d".repeat(STATE_DIR_MAX - 1)));
-        assert_eq!(fits.as_os_str().len(), STATE_DIR_MAX);
-        assert_eq!(
-            fits.join(LONGEST_SOCKET_NAME).as_os_str().len(),
-            SUN_PATH_MAX
-        );
-        check_state_dir_fits_sockets(&fits).unwrap();
-
-        let over = PathBuf::from(format!("/{}", "d".repeat(STATE_DIR_MAX)));
-        let err = check_state_dir_fits_sockets(&over).unwrap_err().to_string();
-        assert!(err.contains(over.to_str().unwrap()), "{err}");
-        assert!(err.contains(&STATE_DIR_MAX.to_string()), "{err}");
-        assert!(err.contains("cloud-hypervisor"), "{err}");
-
-        // libkrun has no such limit.
-        assert_eq!(
-            check_state_dir_len(&over).is_ok(),
-            crate::vmm::libkrun_selected()
-        );
-    }
-
-    #[test]
     fn remove_stale_sockets_spares_caller_files() {
         let dir = std::env::temp_dir().join(format!("virtkit-stale-{}", std::process::id()));
         let svc = dir.join("svc-db");
@@ -6138,15 +6032,14 @@ mod tests {
     /// Boot a session with a read-only source disk, mount it in the guest with the
     /// agent's native `mount`, and read a file from it — the COPY --from primitive.
     /// Heavy (boots a microVM); run with the runtime paths:
-    ///   VIRTKIT_T_CH=… VIRTKIT_T_KERNEL=… VIRTKIT_T_AGENT=… \
+    ///   VIRTKIT_T_KERNEL=… VIRTKIT_T_AGENT=… \
     ///   VIRTKIT_T_ROOT=<bootable ext4> VIRTKIT_T_DATA=<ext4 with /payload.txt> \
     ///   cargo test --target x86_64-unknown-linux-gnu -- --ignored mount_source_disk
     #[test]
     #[ignore]
     fn mount_source_disk() {
         let p = |k: &str| std::env::var_os(k).map(PathBuf::from).expect(k);
-        let (ch, kernel, agent, root, data) = (
-            p("VIRTKIT_T_CH"),
+        let (kernel, agent, root, data) = (
             p("VIRTKIT_T_KERNEL"),
             p("VIRTKIT_T_AGENT"),
             p("VIRTKIT_T_ROOT"),
@@ -6158,7 +6051,6 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let s = boot_session(
-                &ch,
                 &kernel,
                 &agent,
                 &root,

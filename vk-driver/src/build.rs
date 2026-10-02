@@ -274,9 +274,6 @@ pub struct Options {
     pub out_disk: Option<PathBuf>,
     /// Parse + plan + print the build order and primitives, build nothing.
     pub print_plan: bool,
-    /// cloud-hypervisor binary, only used when `VIRTKIT_VMM=cloud-hypervisor` selects
-    /// that backend (the default libkrun backend is embedded and needs none).
-    pub cloud_hypervisor: Option<PathBuf>,
     pub kernel: Option<PathBuf>,
     pub agent: Option<PathBuf>,
     /// instruction-cache destination: a registry repo (e.g. a `vk-registry` at
@@ -575,8 +572,7 @@ fn load_inputs(dockerfiles: &[PathBuf], contexts: &[PathBuf]) -> Result<Vec<Plan
             // Resolve to an absolute path: the microVM backend shares the context into the
             // guest over virtio-fs, and libkrun's in-process server mounts the host dir
             // directly — an empty or cwd-relative path serves nothing, so a context `COPY`
-            // fails inside the guest with `Connection refused` (os error 111). (cloud-hypervisor
-            // masked this: its virtiofsd resolves a relative/empty dir against its own cwd.)
+            // fails inside the guest with `Connection refused` (os error 111).
             let context = std::path::absolute(&context)
                 .with_context(|| format!("resolving build context {}", context.display()))?;
             Ok(PlanInput {
@@ -747,8 +743,7 @@ fn resolve_kernel_agent(
     Ok((kernel, agent))
 }
 
-/// Build the microVM backend for a build: its instruction-cache registry (if any), the
-/// cloud-hypervisor binary (only needed when `VIRTKIT_VMM` selects that backend), and the
+/// Build the microVM backend for a build: its instruction-cache registry (if any) and the
 /// `MicroVm` itself over `scratch`. Shared by the single-target [`build_backend`] and the
 /// unified multi-unit [`build_units`], so the two construct the backend identically.
 fn make_microvm(
@@ -771,20 +766,9 @@ fn make_microvm(
             None,
         )
     });
-    // cloud-hypervisor is only needed when VIRTKIT_VMM selects it; the default libkrun
-    // backend is embedded in `vk` and drives no external VMM binary.
-    let ch = if crate::vmm::libkrun_selected() {
-        opts.cloud_hypervisor.clone().unwrap_or_default()
-    } else {
-        opts.cloud_hypervisor.clone().context(
-            "the cloud-hypervisor backend (VIRTKIT_VMM=cloud-hypervisor) needs \
-             --cloud-hypervisor",
-        )?
-    };
     let cpus = exec::resolve_build_cpus(configured_build_cpus(), exec::host_cpus());
     let mem = exec::resolve_build_mem(configured_build_mem().as_deref());
     Ok(MicroVm::new(
-        ch,
         kernel.to_path_buf(),
         agent.to_path_buf(),
         scratch.to_path_buf(),
@@ -6673,7 +6657,6 @@ ENTRYPOINT run me
             out: Some(out),
             out_disk: None,
             print_plan: false,
-            cloud_hypervisor: None,
             kernel: None,
             agent: None,
             cache_registry: Some("none".into()),
@@ -6746,7 +6729,6 @@ ENTRYPOINT run me
             out: Some(out.clone()),
             out_disk: None,
             print_plan: false,
-            cloud_hypervisor: None,
             kernel: None,
             agent: None,
             cache_registry: Some("none".into()),
@@ -6798,7 +6780,6 @@ ENTRYPOINT run me
             out: Some(out.clone()),
             out_disk: None,
             print_plan: false,
-            cloud_hypervisor: None,
             kernel: None,
             agent: None,
             cache_registry: Some("none".into()),
@@ -6847,7 +6828,6 @@ ENTRYPOINT run me
             out: Some(out.clone()),
             out_disk: None,
             print_plan: false,
-            cloud_hypervisor: None,
             kernel: None,
             agent: None,
             cache_registry: Some("none".into()),
@@ -6903,7 +6883,6 @@ ENTRYPOINT run me
             out: Some(tmp.clone()),
             out_disk: None,
             print_plan: false,
-            cloud_hypervisor: None,
             kernel: None,
             agent: None,
             cache_registry: Some("none".into()),
@@ -6976,7 +6955,6 @@ ENTRYPOINT run me
             out: Some(out.clone()),
             out_disk: None,
             print_plan: false,
-            cloud_hypervisor: None,
             kernel: None,
             agent: None,
             cache_registry: Some("none".into()),
@@ -8145,7 +8123,6 @@ RUN ship
             out: None,
             out_disk: None,
             print_plan: false,
-            cloud_hypervisor: None,
             kernel: None,
             agent: None,
             cache_registry: None,

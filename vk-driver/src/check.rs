@@ -23,7 +23,7 @@ use crate::embed::Asset;
 pub enum Feature {
     /// rw access to /dev/kvm (KVM API sanity-checked)
     Kvm,
-    /// the selected VMM backend can run (built-in libkrun, or cloud-hypervisor)
+    /// the VMM can run (libkrun, built into vk)
     Vmm,
     /// a guest kernel and vk-agent are available (embedded or on disk)
     Kernel,
@@ -485,7 +485,7 @@ fn default_sweep() -> Vec<Feature> {
 fn evaluate(cfg: &Config, feature: Feature) -> Outcome {
     match feature {
         Feature::Kvm => kvm(),
-        Feature::Vmm => vmm(cfg),
+        Feature::Vmm => vmm(),
         Feature::Kernel => kernel(),
         Feature::Net => net(cfg),
         Feature::Docker => docker(cfg),
@@ -867,17 +867,8 @@ fn kvm_ready(dev: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn vmm(cfg: &Config) -> Outcome {
-    if crate::vmm::libkrun_selected() {
-        return ok("libkrun (built into vk)");
-    }
-    match resolve_bin(cfg.cloud_hypervisor()) {
-        Some(p) => ok(format!("cloud-hypervisor: {}", p.display())),
-        None => fail(format!(
-            "cloud-hypervisor not runnable: {} (install it, or set `cloud_hypervisor` in the config)",
-            cfg.cloud_hypervisor().display()
-        )),
-    }
+fn vmm() -> Outcome {
+    ok("libkrun (built into vk)")
 }
 
 /// Where an asset comes from — `embedded`, or the path it was found at — or `None` when it is
@@ -1243,9 +1234,6 @@ fn share(cfg: &Config) -> Outcome {
         Ok((_, shown)) => shown,
         Err(e) => return fail(format!("share dir {e}")),
     };
-    if !crate::vmm::libkrun_selected() {
-        return fail("vk was built without libkrun, whose virtio-fs serves the share");
-    }
     ok(format!(
         "dir {shown} readable, virtio-fs built into libkrun"
     ))
@@ -1282,17 +1270,6 @@ fn access_ok(path: &Path, mode: libc::c_int) -> bool {
     };
     // SAFETY: `c` is a valid NUL-terminated path.
     unsafe { libc::access(c.as_ptr(), mode) == 0 }
-}
-
-/// Resolve a binary the way spawning it would: a path with a separator is used
-/// as-is, a bare name is searched through PATH; `None` if not executable.
-fn resolve_bin(bin: &Path) -> Option<PathBuf> {
-    if bin.components().count() > 1 {
-        return access_ok(bin, libc::X_OK).then(|| bin.to_path_buf());
-    }
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join(bin))
-        .find(|p| access_ok(p, libc::X_OK))
 }
 
 /// Whether the current user can create files in `dir` (created if missing),
@@ -1583,16 +1560,6 @@ mod tests {
         assert_eq!(evaluate(&cfg, Feature::Net).status, Status::Ok);
         cfg.net.mode = "bridge".into();
         assert_eq!(evaluate(&cfg, Feature::Net).status, Status::Fail);
-    }
-
-    // resolve_bin: bare names go through PATH, paths with a separator are taken
-    // as-is; both report an unrunnable target as None.
-    #[test]
-    fn resolve_bin_searches_path() {
-        assert!(resolve_bin(Path::new("sh")).is_some());
-        assert!(resolve_bin(Path::new("/bin/sh")).is_some());
-        assert!(resolve_bin(Path::new("vk-no-such-binary")).is_none());
-        assert!(resolve_bin(Path::new("./vk-no-such-binary")).is_none());
     }
 
     /// The executor check reports what the host will record and whether it can: a setting

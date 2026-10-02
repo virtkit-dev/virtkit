@@ -64,7 +64,7 @@ unicode-width.workspace = true
 [target.'cfg(target_env = "musl")'.dependencies]
 jemallocator.workspace = true
 
-# libkrun VMM backend (the `libkrun` feature), an rlib crate dep so it shares
+# libkrun, the VMM, an rlib crate dep so it shares
 # vk's std — no double-std / broken-unwinding that a static libkrun.a link
 # hits. Vendored under third_party/libkrun (rev 9a8fedc, stable-1.19.x with PR #728)
 # and locally patched so the passthrough fs device no longer needs libc's musl statx
@@ -76,21 +76,15 @@ path = "../third_party/libkrun/src/libkrun"
 package = "libkrun"
 default-features = false
 features = ["blk", "net"]
-optional = true
 
 [features]
-default = ["libkrun", "embed"]
+default = ["embed"]
 # Embed the guest kernel (vmlinux) and vk-agent into the `vk` binary so it runs
 # self-contained (no --kernel/--agent, no files under /usr/local/lib/vk). build.rs
 # reads VK_EMBED_KERNEL / VK_EMBED_AGENT at compile time; when unset (a plain dev
 # `cargo build`) it embeds nothing and the runtime falls back to those flags. See
 # src/embed.rs. build.sh sets the two vars for a real, shippable self-contained `vk`.
 embed = []
-# the libkrun VMM backend, driven by the `__libkrun-boot` subcommand. libkrun is
-# reached via its C ABI; we always pass our own kernel (krun_set_kernel) so it
-# never loads libkrunfw. On by default: libkrun is the only backend that can be
-# selected (see vmm::libkrun_selected).
-libkrun = ["dep:krun"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

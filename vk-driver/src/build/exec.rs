@@ -505,7 +505,6 @@ impl Executor for Planner {
 /// is attached read-only as its own disk for the instructions that read it. Each stage's ext4
 /// lives under `scratch`.
 pub struct MicroVm {
-    cloud_hypervisor: PathBuf,
     kernel: PathBuf,
     /// virtkit-agent binary, injected as PID 1 into each stage's ext4 so the guest
     /// can boot and serve the exec channel.
@@ -1227,7 +1226,6 @@ pub(crate) fn resolve_build_mem(cfg: Option<&str>) -> String {
 impl MicroVm {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        cloud_hypervisor: PathBuf,
         kernel: PathBuf,
         agent: PathBuf,
         scratch: PathBuf,
@@ -1241,7 +1239,6 @@ impl MicroVm {
         timings: Arc<Timings>,
     ) -> Self {
         MicroVm {
-            cloud_hypervisor,
             kernel,
             agent,
             scratch,
@@ -1368,7 +1365,6 @@ impl MicroVm {
     /// Config (kernel/agent/net/…) is cheap to clone per worker.
     pub fn worker(&self) -> MicroVm {
         MicroVm {
-            cloud_hypervisor: self.cloud_hypervisor.clone(),
             kernel: self.kernel.clone(),
             agent: self.agent.clone(),
             scratch: self.scratch.clone(),
@@ -1558,7 +1554,6 @@ impl MicroVm {
         // scratch the workers share — which is where the build reads it back from.
         let bytes_log = self.scratch.join(crate::run::NET_BYTES);
         let s = block_on(crate::run::boot_session(
-            &self.cloud_hypervisor,
             &self.kernel,
             &self.agent,
             &ext4,
@@ -1594,7 +1589,7 @@ impl MicroVm {
     /// only at the eager path it substituted in. [`Self::verify_lazy_view`] materializes the view
     /// instead, so the check covers what the build really restores.
     fn lazy_restore_enabled(&self) -> bool {
-        crate::vmm::libkrun_selected()
+        true
     }
     /// `--debug`: verify a lazily restored `.vk_ro_img` view — the chunks it names, reassembled
     /// through the host-side reader — as [`Self::verify_ext4`] does for a raw restore. Writes a
@@ -3410,7 +3405,6 @@ mod tests {
             None,
         );
         let mut ex = MicroVm::new(
-            PathBuf::new(),
             PathBuf::new(),
             PathBuf::new(),
             dir.clone(),

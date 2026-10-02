@@ -52,7 +52,6 @@ pub struct ManagerDirs {
 /// A stop can hold it for `shutdown::STOP_GRACE`, so requests run outside the runtime threads.
 pub struct Manager {
     kernel: PathBuf,
-    cloud_hypervisor: PathBuf,
     net_port: u32,
     gateway: Ipv4Addr,
     /// the vk-agent every service boot's initramfs carries (the owner holds the
@@ -74,7 +73,6 @@ impl Manager {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         kernel: PathBuf,
-        cloud_hypervisor: PathBuf,
         net_port: u32,
         gateway: Ipv4Addr,
         agent: PathBuf,
@@ -86,7 +84,6 @@ impl Manager {
     ) -> Manager {
         Manager {
             kernel,
-            cloud_hypervisor,
             net_port,
             gateway,
             agent,
@@ -280,7 +277,6 @@ impl Manager {
             &st.svc,
             &st.dir,
             &self.kernel,
-            &self.cloud_hypervisor,
             &self.agent,
             self.net_port,
             self.gateway,
@@ -781,14 +777,12 @@ mod tests {
             .collect();
         Manager::new(
             "/nonexistent".into(),
-            "/nonexistent".into(),
             1024,
             gw,
             "/nonexistent".into(),
             crate::units::BuildOpts {
                 build_args: vec![],
                 kernel: "/nonexistent".into(),
-                cloud_hypervisor: "/nonexistent".into(),
                 agent: "/nonexistent".into(),
                 cache_registry: None,
                 cache_insecure: false,

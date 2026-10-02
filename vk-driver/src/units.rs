@@ -109,7 +109,6 @@ pub struct BuildOpts {
     /// ARG overrides applied to every `build:` unit (compose `args:` add per unit)
     pub build_args: Vec<(String, String)>,
     pub kernel: PathBuf,
-    pub cloud_hypervisor: PathBuf,
     pub agent: PathBuf,
     pub cache_registry: Option<String>,
     pub cache_insecure: bool,
@@ -156,7 +155,6 @@ fn build_recipe(
         build_contexts: build_contexts.clone(),
         build_args,
         kernel: build.map(|b| b.kernel.clone()),
-        cloud_hypervisor: build.map(|b| b.cloud_hypervisor.clone()),
         agent: build.map(|b| b.agent.clone()),
         cache_registry: build.and_then(|b| b.cache_registry.clone()),
         cache_insecure: build.is_some_and(|b| b.cache_insecure),
@@ -465,7 +463,6 @@ pub fn boot_unit(
     svc: &Provisioned,
     dir: &Path,
     kernel: &Path,
-    cloud_hypervisor: &Path,
     agent: &Path,
     net_port: u32,
     gateway: Ipv4Addr,
@@ -549,7 +546,7 @@ pub fn boot_unit(
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     // The DAX window each of this service's shares gets (its own `x-virtkit.dax`, else the
     // run-wide default already folded in before provisioning).
-    let dax = crate::run::dax_share(svc.dax, None, crate::vmm::libkrun_selected());
+    let dax = crate::run::dax_share(svc.dax, None);
     let mut virtiofs = String::new();
     // Tags the agent should mount behind a tmpfs-backed overlay (`host:guest:overlay`),
     // exactly as the primary's own `-v`/compose volumes do in `run::build_and_boot` — a
@@ -796,7 +793,7 @@ pub fn boot_unit(
             reboot: true,
             numa: crate::numa::Numa::Auto,
         };
-        let vmm = crate::vmm::selected(cloud_hypervisor);
+        let vmm = crate::vmm::selected();
         // The one VMM spawn shared with `vk run`/`vk build`/the job VM: tied (PDEATHSIG)
         // so a service VMM dies with its owner, and clears CLOEXEC on the embedded-kernel
         // and pass-fds so they survive the exec into the VMM subprocess.
@@ -887,7 +884,6 @@ mod tests {
         let opts = BuildOpts {
             build_args: vec![],
             kernel: "/nonexistent".into(),
-            cloud_hypervisor: "/nonexistent".into(),
             agent: "/nonexistent".into(),
             cache_registry: Some("none".into()),
             cache_insecure: false,

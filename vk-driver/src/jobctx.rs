@@ -260,9 +260,6 @@ impl JobCtx {
     pub fn overlay(&self) -> PathBuf {
         self.job_dir.join("overlay.qcow2")
     }
-    pub fn api_sock(&self) -> PathBuf {
-        self.job_dir.join("api.sock")
-    }
     pub fn vsock_sock(&self) -> PathBuf {
         self.job_dir.join("vsock.sock")
     }
