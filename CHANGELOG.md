@@ -17,8 +17,8 @@ All notable changes to virtkit will be documented in this file.
   random `vk-….localhost` address each time it starts; sessions end on restart. `vk-hub local
   login` prints another link; `vk-hub local sessions` and `logout` list and end sessions. A
   sign-in link is an operator's, who can act on the VMs, unless `vk-hub local login --role
-  viewer` prints one that can only look. Not published with releases: `./build.sh` builds it
-  into `dist/`.
+  viewer` prints one that can only look. Published with each release, with its `.sha256`, and
+  locked by `vk toolchain lock` with the other binaries.
 
 ### Fixed
 

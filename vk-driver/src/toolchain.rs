@@ -28,7 +28,14 @@ use crate::dev::config::LOCK_FILE;
 ///
 /// `.github/workflows/release.yml` publishes exactly this list, and `quality.yml` checks
 /// that the two still agree.
-const DEFAULT_ARTIFACTS: [&str; 5] = ["vk", "vk-agent", "vk-registry", "vk-runnerctl", "vmlinux"];
+const DEFAULT_ARTIFACTS: [&str; 6] = [
+    "vk",
+    "vk-agent",
+    "vk-registry",
+    "vk-hub",
+    "vk-runnerctl",
+    "vmlinux",
+];
 
 /// Written above the lock's TOML. It is a tracked file people open, so it records what
 /// wrote it and how to change it.

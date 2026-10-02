@@ -633,6 +633,7 @@ local store. The central server and storage model are documented in
 | `vk` | Host CLI, VMM, image builder, userspace network, compose runner, and GitLab executor. It embeds the default guest kernel and `vk-agent`. |
 | `vk-agent` | Guest PID 1 and command server. It configures mounts, networking, hostname, shared directories, optional SSH, and host-driven execution over vsock. |
 | `vk-registry` | Optional OCI-distribution server with a pull-through cache, a WebDAV view of the store with a plain-file area for compiler caches, and build-once locking. |
+| `vk-hub` | Experimental web UI for the VMs on this machine: `vk-hub local` serves it on loopback. |
 | `vk-runnerctl` | Optional root-side helper that adjusts GitLab runner concurrency within an administrator-configured range. |
 
 ## Architecture
@@ -730,7 +731,7 @@ Build the pinned guest kernel first, then the static binaries:
 
 ```sh
 ./build-kernel.sh  # dist/vmlinux
-./build.sh         # dist/{vk,vk-agent,vk-registry,vk-runnerctl,...}
+./build.sh         # dist/{vk,vk-agent,vk-registry,vk-hub,vk-runnerctl,...}
 ```
 
 The scripts use a `vk` found on `PATH` to build inside a microVM; otherwise they use

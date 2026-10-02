@@ -25,12 +25,13 @@ name: Release
 # scratch in a vk microVM and requiring an exact match. e2e then boots microVMs with the
 # vk that build produced (tests/release-e2e.sh). publish runs once all of them have
 # passed. Each binary ships with its own .sha256 sidecar (vk.sha256, vk-agent.sha256,
-# vk-registry.sha256, vk-runnerctl.sha256, vmlinux.sha256) so users can verify just the
-# file they downloaded without fetching a combined manifest. The repository's install.sh
-# is published alongside them — it is the documented bootstrap for a host with no vk, so
-# it has to be fetchable from the release itself. It is uploaded from the checkout rather
-# than from dist/, so unlike every other asset it is outside the reproducible-build
-# attestation; it is a tracked script the tag names, and it carries no sidecar.
+# vk-registry.sha256, vk-hub.sha256, vk-runnerctl.sha256, vmlinux.sha256) so users can
+# verify just the file they downloaded without fetching a combined manifest. The
+# repository's install.sh is published alongside them — it is the documented bootstrap for
+# a host with no vk, so it has to be fetchable from the release itself. It is uploaded from
+# the checkout rather than from dist/, so unlike every other asset it is outside the
+# reproducible-build attestation; it is a tracked script the tag names, and it carries no
+# sidecar.
 
 on:
   push:
@@ -150,7 +151,7 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
           E2E_BUDGET: 6300
         run: |
-          chmod +x dist/vk dist/vk-agent dist/vk-registry dist/vk-runnerctl
+          chmod +x dist/vk dist/vk-agent dist/vk-registry dist/vk-hub dist/vk-runnerctl
           df -h /
           VK=dist/vk tests/release-e2e.sh
 
@@ -258,6 +259,8 @@ jobs:
             dist/vk-agent.sha256 \
             dist/vk-registry \
             dist/vk-registry.sha256 \
+            dist/vk-hub \
+            dist/vk-hub.sha256 \
             dist/vk-runnerctl \
             dist/vk-runnerctl.sha256 \
             dist/vmlinux \

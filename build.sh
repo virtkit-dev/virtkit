@@ -257,7 +257,7 @@ done
 # Reproducibility manifest: the pinned inputs and the artifact hashes. Anyone can
 # rebuild from the same commit + inputs and confirm byte-for-byte:
 #   git checkout <git_commit> && ./build-kernel.sh && ./build.sh &&
-#     ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-runnerctl.sha256 )
+#     ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
 # The sidecars name the binaries bare, so the check runs from inside dist/.
 ( cd "$OUT" && sha256sum vk > vk.sha256 && sha256sum vk-agent > vk-agent.sha256 && sha256sum vk-registry > vk-registry.sha256 && sha256sum vk-hub > vk-hub.sha256 && sha256sum vk-runnerctl > vk-runnerctl.sha256 )
 # The inputs that fix the bytes: the base image digest (.devcontainer/Dockerfile's FROM) and
@@ -283,11 +283,11 @@ elif [ -n "$NO_KERNEL" ]; then
   # Same trap as --fast, one step removed: the bytes are release-profile but kernel-less,
   # so the release recipe — which embeds the kernel — rebuilds something else entirely.
   manifest_header="# virtkit build manifest (--no-kernel) — no embedded kernel, not a release artifact
-# Verify: git checkout <git_commit> && ./build.sh --no-kernel && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && ./build.sh --no-kernel && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
 profile:         release"
 else
   manifest_header="# virtkit reproducible build manifest
-# Verify: git checkout <git_commit> && ./build-kernel.sh && ./build.sh && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && ./build-kernel.sh && ./build.sh && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
 profile:         release"
 fi
 cat > "$OUT/build-info.txt" <<EOF
