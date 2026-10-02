@@ -29,8 +29,10 @@ pub fn layout(title: &str, auth: &Auth, main: &Html) -> Html {
 }
 
 /// htmx's configuration: nothing evaluated, no script run from a swapped fragment, no
-/// inline style of its own (the policy would refuse it), requests to this origin only.
-const HTMX_CONFIG: &str = r#"{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"selfRequestsOnly":true}"#;
+/// inline style of its own (the policy would refuse it), requests to this origin only — and
+/// a refusal (4xx, 5xx) swapped rather than dropped, so the line saying why shows, without
+/// logging it as an error.
+const HTMX_CONFIG: &str = r#"{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"selfRequestsOnly":true,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"4..","swap":true,"error":false},{"code":"5..","swap":true,"error":false},{"code":"...","swap":false,"error":true}]}"#;
 
 fn head(h: &mut Html, title: &str) {
     h.raw("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">")

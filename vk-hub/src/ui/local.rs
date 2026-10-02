@@ -21,6 +21,7 @@ use super::sse::{self, Source};
 use super::{Auth, Body, Ui};
 use crate::local::{Keep, Listing, Local};
 use crate::server::Hub;
+use crate::store::Role;
 
 /// Start the task that renders the VMs table once for every page listing it.
 pub(super) fn feed(hub: &Hub, local: &Arc<Local>) -> watch::Sender<Option<Bytes>> {
@@ -50,11 +51,30 @@ pub(super) fn source(event: &str, ui: &Ui) -> Option<Source> {
         changes: ui.hub.subscribe(),
         render: Arc::new(move || {
             Ok(match local.workload(&id) {
-                Some((w, mem)) => vm_detail(&w, mem).into_string(),
+                Some((w, mem)) => vm_detail(&w, mem, &local).into_string(),
                 None => gone().into_string(),
             })
         }),
     })
+}
+
+/// What a `POST` acts on.
+pub(super) enum Target {
+    /// `/vm/<id>/action`
+    Vm(String),
+    /// `/dev/<name>/action`
+    Dev(String),
+}
+
+/// What `path` acts on, if it is an action's, with its ID or name checked.
+pub(super) fn action_target(path: &str) -> Option<Target> {
+    let rest = path.strip_suffix("/action")?;
+    if let Some(id) = rest.strip_prefix("/vm/").filter(|id| valid_id(id)) {
+        return Some(Target::Vm(id.to_string()));
+    }
+    rest.strip_prefix("/dev/")
+        .filter(|name| super::dev::valid_dev_name(name))
+        .map(|name| Target::Dev(name.to_string()))
 }
 
 /// The page for `path`, if it is one of local mode's.
@@ -73,7 +93,7 @@ pub(super) async fn get(path: &str, auth: &Auth, ui: &Ui) -> Option<Response<Bod
         ));
     };
     let views = ui.views.get(&ui.local, &w).await;
-    Some(super::page(vm(auth, id, &w, mem, &views)))
+    Some(super::page(vm(auth, id, &w, mem, &ui.local, &views)))
 }
 
 /// How long a view of a VM may take to read: a page waits on it.
@@ -428,15 +448,25 @@ fn cells(w: &Workload, mem: Option<u64>) -> [String; 9] {
 }
 
 /// `/vm/<id>`: one VM. `id` goes into `sse-connect`: the router takes only hex for one.
-fn vm(auth: &Auth, id: &str, w: &Workload, mem: Option<u64>, views: &Views) -> Html {
+fn vm(auth: &Auth, id: &str, w: &Workload, mem: Option<u64>, local: &Local, views: &Views) -> Html {
     let mut main = Html::new();
     main.raw("<h1>")
         .node(&crate::workloads::owner(w))
         .raw("</h1>");
+    let ops = super::actions::vm_ops(w);
+    if auth.session.role >= Role::Operator && !ops.is_empty() {
+        // Outside the live fragment, so an update never clears a form or the flash.
+        main.raw("<section><div class=\"actions\">");
+        let path = format!("/vm/{id}/action");
+        for (op, label) in ops {
+            super::actions::op_form(&mut main, auth, &path, op, label);
+        }
+        main.raw("</div><div id=\"flash\"></div></section>");
+    }
     main.raw("<div id=\"detail\" hx-ext=\"sse\" sse-connect=\"/events/vm/")
         .text(id)
         .raw("\" sse-swap=\"vm\" sse-close=\"close\">")
-        .html(&vm_detail(w, mem))
+        .html(&vm_detail(w, mem, local))
         .raw("</div>");
     for (title, view) in [
         ("Console", &views.console),
@@ -487,7 +517,7 @@ fn gone() -> Html {
 }
 
 /// What the page shows of a VM below its name.
-fn vm_detail(w: &Workload, mem: Option<u64>) -> Html {
+fn vm_detail(w: &Workload, mem: Option<u64>, local: &Local) -> Html {
     let mut h = Html::new();
     section(&mut h, "VM");
     kv(&mut h, "kind", crate::workloads::kind_name(w.kind));
@@ -529,6 +559,9 @@ fn vm_detail(w: &Workload, mem: Option<u64>) -> Html {
         "started",
         &w.started_at.map_or_else(dash, pages::started),
     );
+    h.raw("<tr><th>last action</th><td>");
+    super::actions::action_line(&mut h, local.action(&super::actions::key(w)).as_ref());
+    h.raw("</td></tr>");
     end_section(&mut h);
     h
 }

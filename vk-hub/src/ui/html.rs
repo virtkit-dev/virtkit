@@ -8,7 +8,8 @@
 //!
 //! A host's strings go only in text content or quoted plain attributes (`title`, `value`),
 //! never in an attribute htmx interprets (`hx-*`, `sse-*`). Those and an `href` are the hub's
-//! own, built from constants and from IDs the router has checked are hex.
+//! own, built from constants, from IDs the router has checked are hex, and from dev
+//! environment names checked to be `[A-Za-z0-9._-]` not starting with `.` or `-`.
 
 use std::fmt::Display;
 

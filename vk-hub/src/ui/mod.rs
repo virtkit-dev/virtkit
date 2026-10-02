@@ -47,6 +47,7 @@ use crate::local::Local;
 use crate::server::{Hub, Io, PRE_AUTH_TIMEOUT};
 use crate::store::{self, Role, UiSession};
 
+mod actions;
 mod assets;
 mod body;
 mod dev;
@@ -101,6 +102,8 @@ pub struct Ui {
     views: local::ViewCache,
     /// What `/dev` last read.
     dev_list: dev::DevList,
+    /// The questions actions asked first, unanswered.
+    questions: actions::Questions,
 }
 
 impl Ui {
@@ -120,6 +123,7 @@ impl Ui {
             streams: sse::Streams::new(),
             views: local::ViewCache::new(local::VIEWS_FRESH),
             dev_list: dev::DevList::new(),
+            questions: actions::Questions::new(),
         }
     }
 }
@@ -261,7 +265,11 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
             };
             get(&path, req.uri().query(), &auth, ui).await
         }
-        (Method::POST, _) => Ok(message(StatusCode::NOT_FOUND, "No such action.")),
+        (Method::POST, _) => match local::action_target(&path) {
+            Some(local::Target::Vm(id)) => actions::vm_action(req, ui, &id).await,
+            Some(local::Target::Dev(name)) => actions::dev_action(req, ui, &name).await,
+            None => Ok(message(StatusCode::NOT_FOUND, "No such action.")),
+        },
         _ => Ok(message(
             StatusCode::METHOD_NOT_ALLOWED,
             "Pages are read with GET and changed with POST.",

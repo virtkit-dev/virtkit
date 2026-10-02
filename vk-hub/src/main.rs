@@ -74,7 +74,7 @@ enum LocalCmd {
     /// The link is a credential until it is used or expires: open it yourself, pasting it into
     /// the browser rather than passing it on a command line, which other local users can read.
     Login {
-        /// viewer or operator
+        /// viewer (read only) or operator (also acts on the VMs)
         #[arg(long, default_value = "operator", value_parser = parse_role)]
         role: store::Role,
         /// How long the link stays valid: <n>s, <n>m, <n>h or <n>d (at most 24h)

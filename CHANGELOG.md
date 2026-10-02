@@ -10,11 +10,15 @@ All notable changes to virtkit will be documented in this file.
   `vk run`s, dev environments and CI jobs with their memory usage, kept up to date as VMs
   start and stop, and a page per VM with its console's tail, its atop summary when it records
   one, and the egress its switch recorded. A page lists every dev environment, stopped ones
-  too. The hub runs as you and opens a single-use sign-in link in your browser. It keeps
-  state under `~/.local/state/virtkit/hub-local` and serves on loopback at a new random
-  `vk-….localhost` address each time it starts; sessions end on restart. `vk-hub local login`
-  prints another link; `vk-hub local sessions` and `logout` list and end sessions. Not
-  published with releases: `./build.sh` builds it into `dist/`.
+  too. Stop and reboot a pinned run; stop a dev environment, start a stopped one again or
+  remove a stale one. Each action is confirmed before anything is lost and recorded in the
+  hub's audit log. The hub runs as you and opens a single-use sign-in link in your browser.
+  It keeps state under `~/.local/state/virtkit/hub-local` and serves on loopback at a new
+  random `vk-….localhost` address each time it starts; sessions end on restart. `vk-hub local
+  login` prints another link; `vk-hub local sessions` and `logout` list and end sessions. A
+  sign-in link is an operator's, who can act on the VMs, unless `vk-hub local login --role
+  viewer` prints one that can only look. Not published with releases: `./build.sh` builds it
+  into `dist/`.
 
 ### Fixed
 

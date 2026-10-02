@@ -51,7 +51,9 @@ const SESSION_ID_LEN: usize = 12;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
+    /// Read everything.
     Viewer,
+    /// And act: stop, start, reboot and remove VMs.
     Operator,
 }
 
@@ -199,6 +201,13 @@ impl Db {
             .context("opening the web UI sessions table")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db { db })
+    }
+
+    /// Record `event`, done by `actor`, in the audit log.
+    pub fn audit(&self, actor: &str, event: &str, now: u64) -> Result<()> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        append_audit(&txn, actor, event, now)?;
+        txn.commit().context("writing an audit line")
     }
 
     /// The last `limit` audit lines, oldest first.
