@@ -53,6 +53,8 @@ pub struct Fs {
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
+    uid_map: Vec<String>,
+    gid_map: Vec<String>,
     virtual_entries: Vec<VirtualDirEntry<'static>>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
@@ -103,6 +105,8 @@ impl Fs {
             shm_region: None,
             passthrough_cfg: fs_cfg,
             read_only,
+            uid_map: Vec::new(),
+            gid_map: Vec::new(),
             virtual_entries,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
@@ -114,6 +118,14 @@ impl Fs {
 
     pub fn id(&self) -> &str {
         defs::FS_DEV_ID
+    }
+
+    /// Map the guest's UIDs and GIDs through virtiofsd-style `--uid-map`/`--gid-map` rules
+    /// (`map:`, `squash-guest:`, `forbid-guest:`, …; see `idmap`). Empty maps, the default,
+    /// serve ids unchanged. Takes effect at activation. Local patch, see VENDOR.md.
+    pub fn set_id_maps(&mut self, uid_map: Vec<String>, gid_map: Vec<String>) {
+        self.uid_map = uid_map;
+        self.gid_map = gid_map;
     }
 
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
@@ -228,6 +240,8 @@ impl VirtioDevice for Fs {
             self.shm_region.clone(),
             self.passthrough_cfg.clone(),
             self.read_only,
+            self.uid_map.clone(),
+            self.gid_map.clone(),
             virtual_entries,
             self.worker_stopfd.try_clone().unwrap(),
             self.exit_code.clone(),

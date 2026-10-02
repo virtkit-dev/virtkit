@@ -3,6 +3,8 @@ mod device;
 #[allow(dead_code)]
 mod filesystem;
 pub mod fuse;
+// UID/GID mapping (local patch, see VENDOR.md).
+mod idmap;
 mod inode_alloc;
 #[allow(dead_code)]
 mod multikey;

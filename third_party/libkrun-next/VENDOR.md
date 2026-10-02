@@ -101,10 +101,10 @@ resolve names with `*at()` against the parent's `O_PATH` descriptor and relied o
 kernel never sending such a name, so a guest kernel that did — and a job can bring its own —
 walked out of the share to anything the VMM's user can read or write. Upstream virtiofsd
 refuses the same names (`validate_path_component`). In the server, so the in-process engines
-and their read-only and `AugmentFs` wrappers all get it. Unix hosts only: the Windows engine
-joins names onto a `PathBuf`, where `\` and drive prefixes are separators too. LOOKUP and
-RENAME tests drive the refusal through the server and check that only single components
-reach the filesystem. Search for `entry_name`.
+and their read-only, id-mapped and `AugmentFs` wrappers all get it. Unix hosts only: the
+Windows engine joins names onto a `PathBuf`, where `\` and drive prefixes are separators
+too. LOOKUP and RENAME tests drive the refusal through the server and check that only single
+components reach the filesystem. Search for `entry_name`.
 
 ### Single-file shares (forward-ported from the 1.19 tree)
 
@@ -116,3 +116,18 @@ stages vk-named scratch files in the host parent directory, reclaimed on drop. I
 `AugmentFs` wrapper or virtual entries. Elsewhere a file root still fails in
 `PassthroughFs::new`. The 1.19 tree's public `single_file` module is private here. Covered
 by `single_file::tests`.
+
+### Id-mapped shares (forward-ported from the 1.19 tree)
+
+`src/devices/src/virtio/fs/{idmap.rs (new),mod.rs,worker.rs,device.rs}` — UID/GID mapping for
+virtio-fs shares. `idmap` parses virtiofsd-compatible `--uid-map`/`--gid-map` rules (`map:`,
+`squash-guest:`, `forbid-guest:`, …) and `IdMapFs` applies them at the `FileSystem` boundary,
+wrapped inside `AugmentFs` when a map is set (`Fs::set_id_maps`). virtkit squashes a CI job's
+checkout share onto the host runner user with it, so a non-root job can write it. Unmapped
+shares have no wrapper and are served exactly as upstream. A mapped share does not offer
+`FUSE_ALLOW_IDMAP` (2.0 offers it under `LinuxComplete`, 1.19 always): with it the guest
+kernel sends `FUSE_INVALID_UIDGID` for every request but the creating ones, which the soft
+map would translate, or let past `forbid-guest`, in place of the caller's ids. The 1.19
+tree's public `IdMap`/`IdMapFs`/`IdTable` re-exports are not carried. Covered by
+`idmap::tests` and `a_mapped_share_never_offers_allow_idmap`. A single-file share ignores
+the maps.
