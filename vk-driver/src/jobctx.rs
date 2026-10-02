@@ -366,14 +366,23 @@ impl JobCtx {
     /// Typed egress-denial records the switch appends and each `run` stage drains into the
     /// job trace (see egress_report). Separate from the human `switch.log`.
     pub fn egress_denied_log(&self) -> PathBuf {
-        self.job_dir.join("egress-denied.log")
+        Self::egress_denied_log_in(&self.job_dir)
+    }
+    /// [`Self::egress_denied_log`] of the job in `job_dir`.
+    pub fn egress_denied_log_in(job_dir: &Path) -> PathBuf {
+        job_dir.join("egress-denied.log")
     }
     /// Audit channel: every allowed external domain the switch saw this job's guest
     /// resolve, appended one-per-line and drained into the end-of-job "domains contacted"
     /// summary (see egress_report). Written for every job, audit or not: the standing list of
     /// names a job contacts is read from it too (see sites).
     pub fn egress_audit_log(&self) -> PathBuf {
-        self.job_dir.join("egress-audit.log")
+        Self::egress_audit_log_in(&self.job_dir)
+    }
+    /// [`Self::egress_audit_log`] of the job in `job_dir` — named as a `vk run --audit-egress`
+    /// names its own in its state dir.
+    pub fn egress_audit_log_in(job_dir: &Path) -> PathBuf {
+        job_dir.join(crate::run::AUDIT_LOG)
     }
     /// Whether this job audits its run-phase egress: the host `[egress] audit` toggle or the
     /// job's own `MICROVM_EGRESS_AUDIT` request (either enables it — audit only observes).

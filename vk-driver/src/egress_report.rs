@@ -119,6 +119,11 @@ fn read_audit(path: &Path, kind: &str) -> Vec<(String, usize)> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
+    count_audit(&text, kind)
+}
+
+/// The `kind` contacts in the audit records `text`, counted and ranked as [`read_audit`] says.
+fn count_audit(text: &str, kind: &str) -> Vec<(String, usize)> {
     let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for value in text.lines().filter_map(|l| {
         l.split_once('\t')
@@ -147,9 +152,9 @@ pub fn read_ip_contacts(path: &Path) -> Vec<(String, usize)> {
 }
 
 /// Format `contacts` as a job-trace block: the line `virtkit: {header}:` followed by one
-/// indented `value (xN)` line per contact, counts aligned, most-contacted first. `None` when
+/// indented `value (xN)` line per contact, counts aligned, in the order given. `None` when
 /// there is nothing to report, so the caller prints nothing.
-fn summary(contacts: &[(String, usize)], header: &str) -> Option<String> {
+fn summary(contacts: &[(String, impl std::fmt::Display)], header: &str) -> Option<String> {
     if contacts.is_empty() {
         return None;
     }
@@ -179,6 +184,113 @@ pub fn contacts_summary(path: &Path, header: &str) -> Option<String> {
 /// summary cannot show. Same shape and phase-header convention as [`contacts_summary`].
 pub fn ip_contacts_summary(path: &Path, header: &str) -> Option<String> {
     summary(&read_ip_contacts(path), header)
+}
+
+/// How much of the end of each channel [`report`] reads: a guest retrying in a loop fills
+/// them with the same few lines, which their last MiB holds as well as the whole.
+const REPORT_TAIL: u64 = 1 << 20;
+
+/// Format unique denials in first-seen order for the job trace and [`report`]. Sum record
+/// counts, including DNS repeats, and append `(xN)` when the total exceeds one, so a retry
+/// loop against one host produces one line.
+pub fn denial_lines(denials: &[Denial]) -> Vec<String> {
+    let mut seen: Vec<(String, u64)> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for d in denials {
+        let line = d.display();
+        match index.get(&line) {
+            Some(&i) => {
+                if let Some((_, n)) = seen.get_mut(i) {
+                    *n = n.saturating_add(d.count);
+                }
+            }
+            None => {
+                index.insert(line.clone(), seen.len());
+                seen.push((line, d.count));
+            }
+        }
+    }
+    seen.into_iter()
+        .map(|(msg, n)| match n {
+            1 => msg,
+            n => format!("{msg} (x{n})"),
+        })
+        .collect()
+}
+
+/// What `dir` — a CI job's dir, or a `vk run`'s state dir, where the switch keeps its channels
+/// — recorded of its guest's egress, from the last [`REPORT_TAIL`] bytes of each channel: the
+/// refusals as the job's trace lists them, then the domains and the IPs it reached, each
+/// most-contacted first. A header says when a channel was longer. `None` when neither holds
+/// anything. The dir does not record whether a job's allowlist was dry-run, so the refusals'
+/// header names both cases.
+pub fn report(dir: &Path) -> Option<String> {
+    use crate::jobctx::JobCtx;
+    let header = |what: &str, cut: bool| {
+        if cut {
+            format!("{what} (the log's last MiB)")
+        } else {
+            what.to_string()
+        }
+    };
+    let (denied, denied_cut) = read_tail(&JobCtx::egress_denied_log_in(dir), REPORT_TAIL);
+    let refused = denial_lines(&parse(&denied).0);
+    let refused = (!refused.is_empty()).then(|| {
+        let mut s = format!(
+            "virtkit: {}:",
+            header("egress refused, or flagged under dry-run", denied_cut)
+        );
+        for line in &refused {
+            s.push_str(&format!("\n  {line}"));
+        }
+        s
+    });
+    let (audit, audit_cut) = read_tail(&JobCtx::egress_audit_log_in(dir), REPORT_TAIL);
+    let audit = String::from_utf8_lossy(&audit);
+    let blocks: Vec<String> = [
+        refused,
+        summary(
+            &count_audit(&audit, "name"),
+            &header("external domains contacted", audit_cut),
+        ),
+        summary(
+            &count_audit(&audit, "ip"),
+            &header("external IPs/ports contacted", audit_cut),
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!blocks.is_empty()).then(|| blocks.join("\n"))
+}
+
+/// The whole lines in the last `max` bytes of `path` as it was when opened, and whether that
+/// left any out. Begun mid-file, the read starts a byte early and drops everything through the
+/// first newline, so a line cut by the start is dropped whole — and one that begins exactly at
+/// it is kept. A missing or unreadable file holds nothing.
+fn read_tail(path: &Path, max: u64) -> (Vec<u8>, bool) {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return (Vec::new(), false);
+    };
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return (Vec::new(), false);
+    };
+    let from = len.saturating_sub(max);
+    let start = from.saturating_sub(1);
+    let mut buf = Vec::new();
+    // To the length stated, not past it into what was appended since.
+    if f.seek(SeekFrom::Start(start)).is_err() || f.take(len - start).read_to_end(&mut buf).is_err()
+    {
+        return (Vec::new(), from > 0);
+    }
+    if from > 0 {
+        let first = buf
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(buf.len(), |nl| nl + 1);
+        buf.drain(..first);
+    }
+    (buf, from > 0)
 }
 
 /// The bytes the switch has forwarded, as it last published them: `(sent, received)` from
@@ -227,10 +339,16 @@ pub fn read_since(path: &Path, offset: u64) -> (Vec<Denial>, u64) {
     if f.read_to_end(&mut buf).is_err() {
         return (Vec::new(), start);
     }
-    // Consume only through the last newline; a partial trailing line stays unread.
+    let (out, consumed) = parse(&buf);
+    (out, start + consumed as u64)
+}
+
+/// Parse records through the last newline in `buf` and return the number of bytes consumed.
+/// Ignore incomplete trailing lines and malformed records.
+fn parse(buf: &[u8]) -> (Vec<Denial>, usize) {
     let consumed = match buf.iter().rposition(|&b| b == b'\n') {
         Some(nl) => nl + 1,
-        None => return (Vec::new(), start),
+        None => return (Vec::new(), 0),
     };
     let mut out = Vec::new();
     for line in String::from_utf8_lossy(&buf[..consumed]).lines() {
@@ -251,7 +369,7 @@ pub fn read_since(path: &Path, offset: u64) -> (Vec<Denial>, u64) {
             });
         }
     }
-    (out, start + consumed as u64)
+    (out, consumed)
 }
 
 #[cfg(test)]
@@ -278,6 +396,145 @@ mod tests {
         std::fs::write(&path, "100 2000\n7").unwrap();
         assert_eq!(read_net_bytes(&path), Some((100, 2000)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dir_reports_its_refusals_and_contacts_or_nothing() {
+        let dir = std::env::temp_dir().join(format!("vk-egress-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(report(&dir), None);
+        append(&dir.join("egress-denied.log"), Proto::Dns, "evil.example");
+        append(&dir.join("egress-denied.log"), Proto::Dns, "evil.example");
+        // The switch's later count of the same name's repeats.
+        append_repeats(
+            &dir.join("egress-denied.log"),
+            Proto::Dns,
+            "evil.example",
+            40,
+        );
+        append_contact(&dir.join("egress-audit.log"), "crates.io");
+        let text = report(&dir).unwrap();
+        assert!(
+            text.starts_with(
+                "virtkit: egress refused, or flagged under dry-run:\n  \
+                 egress denied (dns) evil.example (x42)\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("external domains contacted:\n  crates.io  (x1)"),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only the log's end is read, the record its start cuts dropped whole, and repeats
+    /// counted once.
+    #[test]
+    fn a_long_refusal_log_is_read_from_its_end() {
+        let dir = std::env::temp_dir().join(format!("vk-egress-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("egress-denied.log");
+        append(&path, Proto::Dns, "early.example");
+        let (line, last) = ("tcp\t10.0.0.1:443\n", "udp\t10.0.0.2:5353\n");
+        let tail = usize::try_from(REPORT_TAIL).unwrap() - last.len();
+        // The tail starts inside a tcp record, which is not counted.
+        assert_ne!(tail % line.len(), 0);
+        let whole = tail / line.len();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(line.repeat(whole + 2).as_bytes()).unwrap();
+        f.write_all(last.as_bytes()).unwrap();
+        drop(f);
+        let text = report(&dir).unwrap();
+        assert!(
+            text.starts_with(
+                "virtkit: egress refused, or flagged under dry-run (the log's last MiB):\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("early.example"), "{text}");
+        // Refused once, it is listed with no count, as a job's trace lists it.
+        assert!(
+            text.lines()
+                .any(|l| l == "  egress denied (udp) 10.0.0.2:5353"),
+            "{text}"
+        );
+        let tcp = text.lines().find(|l| l.contains("(tcp)")).unwrap();
+        assert!(tcp.ends_with(&format!("(x{whole})")), "{tcp} of {whole}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tail that begins exactly at a line keeps it; one that begins a byte into it drops it.
+    #[test]
+    fn a_tail_keeps_the_line_it_begins_at() {
+        let dir = std::env::temp_dir().join(format!("vk-egress-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("d.log");
+        std::fs::write(&path, b"dns\ta\ndns\tb\n").unwrap();
+        assert_eq!(read_tail(&path, 6), (b"dns\tb\n".to_vec(), true));
+        assert_eq!(read_tail(&path, 5), (Vec::new(), true));
+        assert_eq!(read_tail(&path, 100), (b"dns\ta\ndns\tb\n".to_vec(), false));
+        assert!(!read_tail(&path, 12).1);
+        assert_eq!(read_tail(&dir.join("none"), 6), (Vec::new(), false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A long audit log is read from its end too, its headers saying so.
+    #[test]
+    fn a_long_audit_log_is_read_from_its_end() {
+        let dir = std::env::temp_dir().join(format!("vk-egress-audit-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("egress-audit.log");
+        append_contact(&path, "early.example");
+        let line = "name\tcrates.io\n";
+        let n = usize::try_from(REPORT_TAIL).unwrap() / line.len() + 2;
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(line.repeat(n).as_bytes()).unwrap();
+        drop(f);
+        append_ip_contact(&path, "10.0.0.1:443");
+        let text = report(&dir).unwrap();
+        assert!(!text.contains("early.example"), "{text}");
+        assert!(
+            text.starts_with("virtkit: external domains contacted (the log's last MiB):\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "virtkit: external IPs/ports contacted (the log's last MiB):\n  10.0.0.1:443  (x1)"
+            ),
+            "{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Repeats are summed across records, a counted one included, in first-seen order, and a
+    /// target refused once carries no count.
+    #[test]
+    fn denial_lines_sum_the_repeats_of_each_target() {
+        let d = |proto, target: &str, count| Denial {
+            proto,
+            target: target.into(),
+            count,
+        };
+        let denials = [
+            d(Proto::Dns, "a.example", 1),
+            d(Proto::Tcp, "10.0.0.1:443", 1),
+            d(Proto::Dns, "b.example", 1),
+            d(Proto::Tcp, "10.0.0.1:443", 1),
+            d(Proto::Dns, "a.example", 40),
+        ];
+        assert_eq!(
+            denial_lines(&denials),
+            [
+                "egress denied (dns) a.example (x41)",
+                "egress denied (tcp) 10.0.0.1:443 (x2)",
+                "egress denied (dns) b.example",
+            ]
+        );
     }
 
     #[test]

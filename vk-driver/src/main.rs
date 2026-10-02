@@ -625,6 +625,16 @@ enum Cmd {
     /// `max_concurrency`.
     #[command(hide = true)]
     Tune,
+    /// plumbing: what a VM's guest did on the network, for a local UI
+    ///
+    /// The refusals and the contacts its switch recorded in its dir — a CI job's, or the
+    /// state dir of a `vk run --audit-egress` — as a job's trace reports them; nothing when
+    /// it recorded none.
+    #[command(hide = true)]
+    EgressReport {
+        /// a CI job's dir, or a `vk run`'s state dir
+        dir: PathBuf,
+    },
     /// plumbing: the VMs running on this host, as JSON for a local UI
     ///
     /// One line of JSON: pinned runs and dev environments from the registry `vk list` reads,
@@ -3997,6 +4007,15 @@ async fn cli_main(cli: Cli) -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         },
+        Cmd::EgressReport { dir } => {
+            if !dir.is_dir() {
+                return fail(&anyhow::anyhow!("{}: not a directory", dir.display()), 2);
+            }
+            match egress_report::report(&dir) {
+                Some(report) => write_report(&format!("{report}\n")),
+                None => ExitCode::SUCCESS,
+            }
+        }
         Cmd::Workloads {
             watch,
             interval_secs,
