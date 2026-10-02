@@ -336,7 +336,8 @@ from a power-off and relaunch the VM; a shared `reset_flag` carries the distinct
 device-driven paths. `linux/vstate.rs` is shared, so aarch64 Linux's triple fault and PSCI
 `SYSTEM_RESET` exit 154 too. A reset outranks a guest-set exit code, and a guest kernel panic
 under `reboot=k panic=-1` is a reset: a supervisor that relaunches on 154 relaunches a panicking
-guest. Nothing consumes 154 yet.
+guest. `src/libkrun/src/api/mod.rs` re-exports `KRUN_EXIT_GUEST_RESET` for a supervisor to
+match on.
 
 ### virtio-pci parity with the 1.19 tree (on top of PR #875)
 
