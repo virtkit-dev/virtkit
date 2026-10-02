@@ -28,6 +28,9 @@ pub mod gpu;
 pub mod input;
 pub mod linux_errno;
 mod mmio;
+// MSI-X table, PBA and delivery for the virtio-pci transport (local patch, see VENDOR.md).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod msix;
 #[cfg(feature = "net")]
 pub mod net;
 mod pci;
