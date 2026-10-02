@@ -716,8 +716,7 @@ pub fn main(args: &[String]) -> i32 {
             eprintln!("vk-agent: {e:#}");
             // ECONNREFUSED/ENOTCONN from a filesystem op means the host-side virtio-fs server
             // backing a share stopped responding — most often the build context at
-            // CONTEXT_MOUNT. That server is a HOST component (a virtiofsd process for
-            // cloud-hypervisor, or in-process inside the libkrun VMM), never a guest process.
+            // CONTEXT_MOUNT. That server is the libkrun VMM itself, never a guest process.
             // The bare errno ("Connection refused") is opaque; name the real cause. It stops
             // responding when the host kills/starves it or it hits a resource limit (open
             // files, memory) — all aggravated by running many build-stage microVMs at once.
@@ -735,7 +734,7 @@ pub fn main(args: &[String]) -> i32 {
 
 /// Whether an error chain carries a virtio-fs transport failure: `ECONNREFUSED`/`ENOTCONN`
 /// from a filesystem op, which the guest sees once the host-side share server (libkrun's
-/// in-process virtio-fs, or a `virtiofsd` for cloud-hypervisor) dies.
+/// in-process virtio-fs) dies.
 fn virtiofs_backend_gone(e: &anyhow::Error) -> bool {
     e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>()

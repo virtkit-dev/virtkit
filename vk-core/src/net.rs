@@ -45,7 +45,7 @@ async fn connect_inner(socket: &SocketAddr) -> Result<(SerStream, DeSink), anyho
     }
 }
 
-/// The host-side socket of guest `port` on the hybrid-vsock suffix convention:
+/// The host-side per-port socket of guest `port`:
 /// `<base>_<port>` — the single spelling of that suffix, shared by the VMM, the
 /// bridge forwards, and `vsock-auto://`.
 pub fn hybrid_socket(base: &Path, port: u32) -> PathBuf {

@@ -549,8 +549,7 @@ fn publish() -> Outcome {
 /// `entrypoint`/`publish`: it is a property of the binary, and a `vk` too old to have the
 /// axis rejects the feature name outright rather than reaching here.
 ///
-/// Extra NICs still require the agent. The VMM creates them under libkrun; the agent creates
-/// taps under cloud-hypervisor. In both cases the agent addresses them from
+/// Extra NICs still require the agent. The VMM creates them; the agent addresses them from
 /// `VIRTKIT_NET_EXTRA_IPS`, so `vk` cannot bring them up without an embedded or external
 /// agent.
 fn nics() -> Outcome {

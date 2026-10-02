@@ -17,9 +17,9 @@
 //! The command returns as soon as the shutdown is under way; the host waits for the VMM to
 //! exit, and kills it after a grace period when it does not.
 //!
-//! Every guest now has ACPI (cloud-hypervisor always did; libkrun gained it), so a power-off
-//! (ACPI S5) ends the VM and a reset (ACPI reset register) restarts it — which the host's VMM
-//! keeper relaunches in place. See [`end_machine`].
+//! Every guest has ACPI, so a power-off (ACPI S5) ends the VM and a reset (ACPI reset
+//! register) restarts it — which the host's VMM keeper relaunches in place.
+//! See [`end_machine`].
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;

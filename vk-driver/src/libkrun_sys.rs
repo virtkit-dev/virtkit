@@ -3,11 +3,10 @@
 //! it shares virtkit's std — no static-`libkrun.a` double-std to reconcile.
 //!
 //! libkrun runs as a per-VM subprocess (the [`crate::vmm::Libkrun`] impl re-execs this
-//! binary with the spec in `VIRTKIT_BOOT_SPEC`), so it slots into the same lifecycle as the
-//! cloud-hypervisor backend — held `Child` / `spawn_tied`, no in-process VMM in
-//! the orchestrator. We always supply our own kernel via `krun_set_kernel`, so
-//! libkrun never loads libkrunfw (see lib.rs:2848 upstream): the bundled-kernel
-//! `.so` is neither linked nor needed.
+//! binary with the spec in `VIRTKIT_BOOT_SPEC`), so the orchestrator manages it like any
+//! other child — held `Child` / `spawn_tied`, no in-process VMM in the orchestrator. We
+//! always supply our own kernel via `krun_set_kernel`, so libkrun never loads libkrunfw
+//! (see lib.rs:2848 upstream): the bundled-kernel `.so` is neither linked nor needed.
 //!
 //! Boots a disk/initramfs guest with our kernel + cmdline-`init=` (PID 1): virtio-blk
 //! disks (qcow2 backing chains), built-in virtio-fs shares, per-port vsock, switch NICs
@@ -81,10 +80,11 @@ fn detect_kernel_format(data: &[u8]) -> Option<u32> {
 }
 
 /// Normalise the guest cmdline's console token. The embedded kernel has virtio_console built
-/// in (hvc0) from early boot, so by default CH's `console=ttyS0` is rewritten to `console=hvc0`
-/// (the safe, pre-patch behaviour). A BYO/stock distro kernel has virtio_console as a module and
-/// only emits early output on the legacy serial, so `keep_serial` (`vk run --console-serial`)
-/// leaves `console=ttyS0` in place, served by the COM1 patch in the vendored builder.rs.
+/// in (hvc0) from early boot, so by default the cmdline's `console=ttyS0` is rewritten to
+/// `console=hvc0` (the safe, pre-patch behaviour). A BYO/stock distro kernel has
+/// virtio_console as a module and only emits early output on the legacy serial, so
+/// `keep_serial` (`vk run --console-serial`) leaves `console=ttyS0` in place, served by the
+/// COM1 patch in the vendored builder.rs.
 fn console_cmdline(cmdline: &str, keep_serial: bool) -> String {
     if keep_serial {
         cmdline.to_string()
@@ -120,7 +120,7 @@ fn cstr(s: &str) -> CString {
 }
 
 /// Parse a memory size token into MiB for `krun_set_vm_config`, accepting the same
-/// forms as the CLI and cloud-hypervisor (`<n>G`, `<n>M`, plain MiB — see
+/// forms as the CLI (`<n>G`, `<n>M`, plain MiB — see
 /// `run::parse_mem_mib`).
 fn mem_mib(mem: &str) -> Result<u32> {
     crate::run::parse_mem_mib(mem)
@@ -190,22 +190,21 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         // Nested virt (`vk run --nested`): libkrun masks the host's VMX/SVM CPUID bit
         // unless asked, and without it the guest's kvm_intel/kvm_amd never registers
         // /dev/kvm. The host is already known to allow nesting — `run::spawn_vmm`
-        // refused this spec otherwise, on either backend.
+        // refused this spec otherwise.
         if spec.nested {
             ck("krun_set_nested_virt", krun_set_nested_virt(ctx, true))?;
         }
 
-        // virtio-balloon, the same axis CH spells `--balloon …,free_page_reporting=on`:
-        // libkrun attaches one by default, so only the opt-out needs a call (the
-        // vendored krun_disable_balloon patch).
+        // virtio-balloon: libkrun attaches one by default, so only the opt-out needs a
+        // call (the vendored krun_disable_balloon patch).
         if !spec.balloon {
             ck("krun_disable_balloon", krun_disable_balloon(ctx))?;
         }
 
-        // Guest console -> the serial-log file, matching CH's `--serial file=`; the
-        // orchestrator reads that file for diagnostics. libkrun routes both its
-        // implicit virtio-console (hvc0) and (with the virtkit early-console patch in
-        // builder.rs) the legacy 16550 COM1 (ttyS0) to this file.
+        // Guest console -> the serial-log file; the orchestrator reads that file for
+        // diagnostics. libkrun routes both its implicit virtio-console (hvc0) and (with
+        // the virtkit early-console patch in builder.rs) the legacy 16550 COM1 (ttyS0)
+        // to this file.
         //
         // Console plan:
         //   - Embedded kernel (default): virtio_console is built in, so hvc0 works from
@@ -255,8 +254,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         }
 
         // virtio-fs shares. libkrun has no external vhost-user-fs, so it mounts the host
-        // directory directly with its built-in virtio-fs; no separate virtiofsd runs
-        // (the boot sites skip it when libkrun is selected).
+        // directory directly with its built-in virtio-fs; no separate daemon runs.
         for share in &spec.shares {
             let tag = cstr(&share.tag);
             let dir = cstr(&share.host_dir.to_string_lossy());
@@ -294,9 +292,9 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
             )?;
         }
 
-        // Networking. Net::Tap attaches a host tap by name (like CH's `--net tap=,mac=`);
-        // the guest gets a static address from the cmdline. Switch-mode guests carry no
-        // `Net` device but one `Nic` per switch port below.
+        // Networking. Net::Tap attaches a host tap by name; the guest gets a static
+        // address from the cmdline. Switch-mode guests carry no `Net` device but one
+        // `Nic` per switch port below.
         match &spec.net {
             Net::None => {}
             Net::Tap { tap, mac } => {
@@ -345,8 +343,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         // (the exec channel; `vsock-auto://` clients dial it directly — nothing
         // listens on the base path itself under libkrun). listen=false: the guest
         // dials the port and libkrun forwards to the host socket, where the host
-        // already listens (the switch and ssh-agent bridges). cloud-hypervisor
-        // gets the equivalent wiring from its single hybrid socket.
+        // already listens (the switch and ssh-agent bridges).
         for vp in &spec.vsock_ports {
             let path = socket_cstr(&vp.socket, &mut sockets)?;
             ck(

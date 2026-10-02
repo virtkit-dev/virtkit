@@ -4,10 +4,10 @@
 //! wrote a full image per instruction (the dominant disk IO of cache-on); reading the qcow2
 //! natively eliminates it.
 //!
-//! Scope: the qcow2 images this tool itself produces (the cloud-hypervisor rw overlays it
-//! creates natively) — version 2/3, 64 KiB clusters, no compression, no encryption,
-//! no extended L2, standard refcounts. Anything outside that is rejected rather than
-//! mis-read. Overlay creation is native too (`create_overlay`) — no `qemu-img` at runtime.
+//! Scope: the qcow2 images this tool itself produces (the rw overlays it creates natively)
+//! — version 2/3, 64 KiB clusters, no compression, no encryption, no extended L2, standard
+//! refcounts. Anything outside that is rejected rather than mis-read. Overlay creation is
+//! native too (`create_overlay`) — no `qemu-img` at runtime.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -316,8 +316,8 @@ impl Qcow2 {
 
 /// Create an empty qcow2 v3 overlay at `path` backed by `backing` — the native replacement
 /// for `qemu-img create -f qcow2 -F <fmt> -b <backing>`. No data clusters are allocated
-/// (cloud-hypervisor writes those at boot); just a valid header + backing reference +
-/// refcount metadata + a zeroed L1 table, laid out exactly like qemu-img's so CH and
+/// (the VMM writes those at boot); just a valid header + backing reference +
+/// refcount metadata + a zeroed L1 table, laid out exactly like qemu-img's so libkrun and
 /// qemu-img both accept and grow it. The overlay's virtual size matches the backing's.
 pub fn create_overlay(path: &Path, backing: &Path) -> Result<()> {
     const CB: u32 = 16;
@@ -830,7 +830,7 @@ pub fn materialize_to_raw(view: &Path, out: &Path) -> Result<()> {
 
 /// Debug check (VIRTKIT_QCOW2_VERIFY): flatten `path` with `qemu-img convert` and compare
 /// the native reader against it, reporting the first mismatching offset. Used to validate
-/// the reader against real (cloud-hypervisor-written) captures during a build.
+/// the reader against real (VMM-written) captures during a build.
 pub fn verify_against_convert(path: &Path) -> Result<()> {
     use std::io::Read;
     let flat = path.with_extension("verify.raw");

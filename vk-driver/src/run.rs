@@ -3,8 +3,8 @@
 //! `docker export`, chosen by `--source`); it is turned into a cpio initramfs (RAM) or a
 //! native ext4 disk, with the static virtkit-agent injected as PID 1; and booted on
 //! an all-built-in kernel (the pinned `vmlinux`) — no modules, and no initrd
-//! for the disk path (virtio-blk + ext4 are built in). docker/cloud-hypervisor
-//! aside (docker only with `--source docker`/`auto`), nothing else is needed.
+//! for the disk path (virtio-blk + ext4 are built in). docker aside (only with
+//! `--source docker`/`auto`), nothing else is needed.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt};
@@ -609,7 +609,7 @@ pub(crate) fn default_data_base() -> Result<PathBuf> {
 /// real disk sits idle. Cache semantics fit (transient, regenerable, removed on drop); the
 /// durable instruction store lives under `$XDG_DATA_HOME` instead. `--state-dir` overrides
 /// this with a caller-chosen path. The short `launch-<pid>` leaf keeps the AF_UNIX socket
-/// paths created under here within the 108-byte limit cloud-hypervisor needs them to fit.
+/// paths created under here within the 108-byte `sun_path` limit.
 /// Shared with the build path (`build_units`), which anchors a cache-only build's scratch
 /// here for the same reason.
 pub(crate) fn default_scratch_base() -> Result<PathBuf> {
@@ -876,15 +876,14 @@ impl Drop for WorkDir {
     }
 }
 
-/// Unlink a previous run's socket files (`vsock.sock`, `vsock.sock_<port>`,
-/// virtio-fs share sockets, …) from a reused `--state-dir`, one level deep (the
-/// per-service `svc-*` dirs hold their own). A stale unix socket file makes the
-/// next bind fail, so this must run before anything listens; everything else in
-/// the directory is left alone — it may be the caller's. Safe here specifically
-/// because the whole run — the switch included — is what's restarting; a single
-/// sibling's own reboot (`units::boot_unit`) must NOT reuse this on its own
-/// `svc-*` dir, since the switch there is a long-lived peer, not something this
-/// call is also about to restart (see `boot_unit`'s own, narrower cleanup).
+/// Unlink a previous run's socket files (`vsock.sock`, `vsock.sock_<port>`, …) from a
+/// reused `--state-dir`, one level deep (the per-service `svc-*` dirs hold their own). A
+/// stale unix socket file makes the next bind fail, so this must run before anything
+/// listens; everything else in the directory is left alone — it may be the caller's. Safe
+/// here specifically because the whole run — the switch included — is what's restarting; a
+/// single sibling's own reboot (`units::boot_unit`) must NOT reuse this on its own `svc-*`
+/// dir, since the switch there is a long-lived peer, not something this call is also about
+/// to restart (see `boot_unit`'s own, narrower cleanup).
 fn remove_stale_sockets(dir: &Path) -> Result<()> {
     let mut walk = vec![dir.to_path_buf()];
     while let Some(d) = walk.pop() {
@@ -1780,8 +1779,7 @@ async fn build_and_boot(
     }
 
     // Networking: a userspace `vk switch` gives the guest egress — attached as virtio-net
-    // NICs under libkrun, or a vsock bridge the agent's tap rides under cloud-hypervisor;
-    // the agent takes the static address from the cmdline fragment either way.
+    // NICs; the agent takes the static address from the cmdline fragment.
     // With services it also pre-listens on their sockets and answers their aliases.
     let mut net_attach: Option<crate::vmm::SwitchAttach> = None;
     let mut switch = if args.net {
@@ -2149,10 +2147,8 @@ async fn build_and_boot(
     if ssh.is_some() {
         vsock_ports.push(crate::vmm::VsockPort::bridge(&vsock, SSH_AGENT_VSOCK_PORT));
     }
-    // --ssh, host→guest: registered on the base socket like the exec channel, so
-    // the connect address is `vsock-auto://<vsock.sock>:2222` on either backend
-    // (libkrun gets a per-port listener; cloud-hypervisor ignores the entry —
-    // its hybrid socket serves every port).
+    // --ssh, host→guest: an exec-style per-port listener libkrun keeps at
+    // `<vsock.sock>_2222`, so the connect address is `vsock-auto://<vsock.sock>:2222`.
     if args.ssh {
         vsock_ports.push(crate::vmm::VsockPort::exec(&vsock, SSH_VSOCK_PORT));
     }
@@ -2221,7 +2217,7 @@ async fn build_and_boot(
         reboot: true,
         numa: args.numa.clone(),
     };
-    // Control server on the primary's hybrid-vsock control socket — only the
+    // Control server on the primary's per-port control socket — only the
     // primary's guest can reach it, so the control plane is scoped to this run —
     // and on the host-only socket beside it.
     if let Some(mgr) = &manager {
@@ -2407,7 +2403,7 @@ async fn build_and_boot(
     }
 
     // Host side of the SSH-agent forward: the guest dials vsock port SSH_AGENT_VSOCK_PORT,
-    // surfaced by cloud-hypervisor as <vsock.sock>_<port>. `allow_pub` None splices the whole
+    // forwarded by libkrun to <vsock.sock>_<port>. `allow_pub` None splices the whole
     // agent through; Some(keys) runs a filtering proxy exposing only those keys.
     let ssh_forward_result = match &ssh {
         Some(s) => match &s.allow_pub {
@@ -4063,8 +4059,7 @@ pub(crate) fn spawn_vmm(
     prio: crate::prio::Prio,
 ) -> Result<Child> {
     // Every boot funnels through here, so this is where a nesting request meets the host,
-    // whichever spec asked and whichever backend serves it: libkrun would mask VMX/SVM
-    // back out and cloud-hypervisor cannot mask it at all, so either would otherwise hand
+    // whichever spec asked: libkrun would mask VMX/SVM back out, so it would otherwise hand
     // the guest a /dev/kvm that never appears. `vk run` refuses earlier, before the pull,
     // for its own flag.
     if spec.nested && !crate::vmm::host_nesting_enabled() {
@@ -4206,7 +4201,8 @@ fn boot_failure(console: &Path, status: std::process::ExitStatus) -> String {
 }
 
 /// Parse a `--mem` value into MiB: `<n>G`, `<n>M`, or a plain MiB count. `None` for
-/// anything else (e.g. cloud-hypervisor's richer syntax) — callers skip their check.
+/// anything else; the boot path (`libkrun_sys::mem_mib`) rejects it, and advisory callers
+/// skip their check.
 pub(crate) fn parse_mem_mib(mem: &str) -> Option<u64> {
     if let Some(g) = mem.strip_suffix(['G', 'g']) {
         // Checked: this now parses Dockerfile text (`# vk: mem=…`), so an absurd figure is
@@ -4365,9 +4361,9 @@ async fn spawn_vm_switch(
     Ok((child, attach))
 }
 
-/// The qemu/cloud-hypervisor disk format of a stage image, by extension: forked stages
-/// are `.qcow2` (a copy-on-write overlay over their parent), bases are raw `.ext4`, and
-/// (libkrun, lazy restore) a cached base can be a `.vk_ro_img` chunk view.
+/// The disk format of a stage image, by extension: forked stages are `.qcow2` (a
+/// copy-on-write overlay over their parent), bases are raw `.ext4`, and (lazy restore) a
+/// cached base can be a `.vk_ro_img` chunk view.
 pub(crate) fn disk_format(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("qcow2") => "qcow2",
@@ -4515,7 +4511,7 @@ pub(crate) async fn boot_session(
     // Source stages for COPY --from / RUN --mount=from, attached read-only as the next
     // virtio-blk disks (vdb, vdc, … in order) for the guest to mount and read. A forked
     // source is a qcow2 over its parent (its backing chain is resolved); a base source is
-    // a plain raw ext4, or (libkrun, lazy restore) a `.vk_ro_img` chunk view.
+    // a plain raw ext4, or (lazy restore) a `.vk_ro_img` chunk view.
     for src in sources {
         let format = match disk_format(src) {
             "qcow2" => crate::vmm::DiskFormat::Qcow2,
@@ -4901,8 +4897,8 @@ impl VmSession {
     /// are already persisted in place — there is nothing to commit, only to make durable before
     /// the kill.
     ///
-    /// One path for every backend: quiesce the guest fs (so the image is a consistent
-    /// point-in-time), flush the block device's write-back cache to the host image, then kill.
+    /// Quiesce the guest fs (so the image is a consistent point-in-time), flush the block
+    /// device's write-back cache to the host image, then kill.
     /// libkrun keeps guest writes in that cache until an explicit flush, so a bare SIGKILL would
     /// truncate the stage qcow2 (an L2 entry past EOF a later native read rejects) — [`flush_disk`]
     /// makes it durable first, over the stage's control socket.

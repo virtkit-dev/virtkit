@@ -1,5 +1,4 @@
-//! gitlab-runner custom executor running each CI job in a throwaway Cloud Hypervisor
-//! microVM.
+//! gitlab-runner custom executor running each CI job in a throwaway libkrun microVM.
 //!
 //! Wire-up in /etc/gitlab-runner/config.toml:
 //!   [runners.custom]
@@ -109,9 +108,9 @@ const VK: vk_selfupdate::Tool = vk_selfupdate::Tool {
 };
 
 /// clap value parser for `--cpus`: a number, or `host` for the host's CPU count
-/// (`available_parallelism`, which honours cgroup/affinity limits). libkrun and
-/// cloud-hypervisor both take a flat vCPU count, so this matches the host's logical
-/// CPUs; it does not replicate SMT/socket topology (libkrun exposes no such knob).
+/// (`available_parallelism`, which honours cgroup/affinity limits). libkrun takes a flat
+/// vCPU count, so this matches the host's logical CPUs; it does not replicate SMT/socket
+/// topology (libkrun exposes no such knob).
 fn parse_cpus(s: &str) -> Result<u32, String> {
     if s == "host" {
         std::thread::available_parallelism()
@@ -1309,7 +1308,7 @@ enum Cmd {
     },
     /// Userspace L2 network gateway for microVM(s) — replaces gvproxy
     ///
-    /// Accepts the qemu vhost transport on each VM's hybrid-vsock guest-port socket, answers
+    /// Accepts the qemu vhost transport on each VM's per-port guest socket, answers
     /// ARP + serves DHCP, and proxies guest TCP/UDP out through the host's own sockets — no
     /// host privileges, multi-VM on one LAN.
     #[command(hide = true)]

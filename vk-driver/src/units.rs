@@ -400,11 +400,10 @@ pub fn nth_static_ip(gateway: Ipv4Addr, prefix: u8, n: u32) -> Result<Ipv4Addr> 
 pub use vk_core::net::mac_for_ip;
 
 /// The most NICs one guest may ask for (compose `x-virtkit.nics`, `vk run --nics`).
-/// Each NIC consumes a static address, switch port, and either a libkrun virtio-pci slot or
-/// a cloud-hypervisor vsock port and tap process. Eight NICs plus a service guest's fixed
-/// devices (rootfs, console, vsock, rng, and balloon) leave 18 of PCI bus 0's 31 usable
-/// slots for virtiofs shares and disks. No current appliance needs more; reject larger
-/// values explicitly instead of exhausting the LAN.
+/// Each NIC consumes a static address, switch port, and a libkrun virtio-pci slot. Eight
+/// NICs plus a service guest's fixed devices (rootfs, console, vsock, rng, and balloon)
+/// leave 18 of PCI bus 0's 31 usable slots for virtiofs shares and disks. No current
+/// appliance needs more; reject larger values explicitly instead of exhausting the LAN.
 pub const MAX_NICS: u32 = 8;
 
 /// Hands out the static addresses of the NICs after eth0, continuing the same top-down
@@ -745,8 +744,7 @@ pub fn boot_unit(
         }
 
         // Attach network and socket-volume bridges plus the exec channel polled for service
-        // readiness. libkrun needs explicit per-port listeners; cloud-hypervisor derives
-        // them from the base socket and ignores these entries.
+        // readiness. libkrun needs explicit per-port listeners.
         let mut vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
         let nics = attach.nics;
         for port in &socket_ports {
@@ -798,7 +796,7 @@ pub fn boot_unit(
     }
 }
 
-/// Unlink `vsock` (the base hybrid-vsock socket) and its exec-port suffix
+/// Unlink `vsock` (the base path, a stale file from an older `vk`) and its exec-port suffix
 /// (`vsock.sock_<VSOCK_PORT>`) before a boot rebinds them — a repeat `vk service up`
 /// after a `down` reuses the same `dir`, and a stale file left over from the
 /// previous boot makes libkrun's `krun_add_vsock_port2` fail (EEXIST) even though

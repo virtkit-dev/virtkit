@@ -56,14 +56,14 @@ pub struct VmEntry {
     /// the field existed, or where it could not be read.
     #[serde(default)]
     pub pid_start_ticks: Option<u64>,
-    /// The VMM backend hosting the guest: `libkrun` or `cloud-hypervisor`. This and the
-    /// fields down to `guest_ip` are boot-time facts `vk run` files; each is `None` on an
-    /// entry recorded before the field existed.
+    /// The VMM backend hosting the guest, as `vk run` names it (`libkrun` for every new
+    /// entry). This and the fields down to `guest_ip` are boot-time facts `vk run` files; each
+    /// is `None` on an entry recorded before the field existed.
     #[serde(default)]
     pub vmm: Option<String>,
     /// The pid to inspect or signal when the managing `vk run` itself is unresponsive: the
     /// libkrun boot subprocess (with `--reboot`, the keeper that relaunches the guest in
-    /// place, so the pid is stable across reboots) or the external `cloud-hypervisor` process.
+    /// place, so the pid is stable across reboots).
     #[serde(default)]
     pub vmm_pid: Option<u32>,
     /// The vCPU count the guest booted with: `--cpus`, a `--primary` service's marker, or
@@ -747,7 +747,7 @@ fn query_units(ctl: &Path) -> Result<Vec<UnitStatus>> {
 }
 
 /// The manager's host-only control socket, or `None` for a run without services.
-/// Fall back to the guest's hybrid-vsock socket for runs started by an older `vk`.
+/// Fall back to the guest-facing per-port control socket for runs started by an older `vk`.
 pub fn control_socket(entry: &VmEntry) -> Option<PathBuf> {
     if entry.services.is_empty() {
         return None;

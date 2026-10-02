@@ -14,7 +14,7 @@
 //! parser) → [`plan`] (stages + cross-stage deps + toposort) → [`exec`] (a backend
 //! applies each stage). Backends: [`exec::DryRun`] (records the build, for tests +
 //! `--print-plan`), [`exec::Host`] (`FROM scratch` + `COPY`, pure-Rust ext4), and
-//! [`exec::MicroVm`] (`FROM <image>` + `RUN` in a CH guest, exported as a clean ext4).
+//! [`exec::MicroVm`] (`FROM <image>` + `RUN` in a microVM guest, exported as a clean ext4).
 //!
 //! Instruction-level cache: each instruction advances a chained content key; for a
 //! filesystem-changing instruction (RUN/COPY) the resulting ext4 snapshot is pushed
@@ -7462,7 +7462,7 @@ RUN ship
 
     #[test]
     fn the_build_footprint_is_the_whole_process_tree() {
-        // The guests are children, not `/proc/self`: both backends run a VM in its own
+        // The guests are children, not `/proc/self`: each VM runs in its own
         // process (libkrun re-execs this binary), so a reading that stopped at self would
         // miss every guest and charge each one twice — once here, once in `held_mib`.
         let proc = tmpdir("rss-tree");

@@ -1557,10 +1557,9 @@ pub fn require_shareable(host: &Path) -> Result<bool> {
     if !link.is_symlink() {
         return shape(&link);
     }
-    // Both backends choose their server from symlink-following metadata, so a file symlink
-    // works as a single-file bind. A directory symlink fails because the directory server
-    // opens the root with `O_PATH | O_NOFOLLOW` and receives the link itself, making every
-    // lookup fail.
+    // The server is chosen from symlink-following metadata, so a file symlink works as a
+    // single-file bind. A directory symlink fails because the directory server opens the
+    // root with `O_PATH | O_NOFOLLOW` and receives the link itself, making every lookup fail.
     let target = match std::fs::metadata(host) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

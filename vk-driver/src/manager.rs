@@ -2,7 +2,7 @@
 //! demand over the virtctl control protocol (`vk_core::fleetctl`). The owner
 //! (`run`) declares every unit up front — image materialized, address
 //! assigned — and the manager boots/kills them; the control server answers
-//! requests on the owner's hybrid-vsock control socket, so only its guest reaches
+//! requests on the owner's per-port control socket, so only its guest reaches
 //! the control plane, and on a host-only socket beside it for `vk` itself.
 
 use std::collections::HashMap;
@@ -509,8 +509,8 @@ fn state_of(st: &mut UnitState) -> &'static str {
     }
 }
 
-/// The host-only control socket of a run whose guest-facing one sits on hybrid-vsock base
-/// `vsock`. The VMM forwards guest connections to `<vsock>_<CONTROL_PORT>` only, so a guest
+/// The host-only control socket of a run whose guest-facing one is the per-port socket of
+/// base `vsock`. The VMM forwards guest connections to `<vsock>_<CONTROL_PORT>` only, so a guest
 /// cannot reach this one, nor fill its connections.
 pub fn host_control_socket(vsock: &Path) -> PathBuf {
     let mut socket =
@@ -521,7 +521,7 @@ pub fn host_control_socket(vsock: &Path) -> PathBuf {
 
 /// Serve the control protocol (a session of request/reply pairs per connection — the guest's
 /// /run/vk/services bridge keeps one connection open across operations) on both of a VM's
-/// control sockets: the guest's, on hybrid-vsock base `vsock`, holding at most
+/// control sockets: the guest's, the per-port socket of base `vsock`, holding at most
 /// [`MAX_CONTROL_CONNECTIONS`]; and the host's own, [`host_control_socket`].
 pub async fn control_server(vsock: &Path, mgr: Arc<Manager>) -> Result<()> {
     control_server_idling(vsock, mgr, CONTROL_IDLE).await

@@ -1548,11 +1548,10 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         }
         "switch" => {
             // Per-job userspace switch, no kernel `ip=`: the agent sets the static
-            // address on eth0 — a virtio-net device backed by the switch's socket under
-            // libkrun, a tap the agent bridges over vsock under cloud-hypervisor. Spawn
-            // the switch (with the egress allowlist) so it is listening before the VMM or
-            // the guest dials it; then point the agent at it. The same shared LAN/egress
-            // core `run --compose` uses.
+            // address on eth0 — a virtio-net device backed by the switch's socket. Spawn
+            // the switch (with the egress allowlist) so it is listening before the VMM
+            // dials it; then point the agent at it. The same shared LAN/egress core
+            // `run --compose` uses.
             let (gateway, prefix, guest_ip) = crate::net::switch_addrs(&cfg.net.subnet)?;
             // Every service's guard lands directly in `use_guards` inside `plan_services`: a
             // git-defined/`build:` service's the moment its build promotes it, an `image:`
@@ -2341,10 +2340,9 @@ fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
 /// file's — the same reason the executor never hands a job the PMU. Once granted, the
 /// marker is honoured, so a fleet can put its nesting builder wherever it belongs instead
 /// of only in the primary. Ungranted it is refused rather than quietly cleared: a fleet
-/// that asked for a nesting builder must not look like it got one, and on the
-/// cloud-hypervisor backend clearing the flag would not mask VMX/SVM anyway. Checked where
-/// the fleet loads, so it covers the primary as well as the siblings and the error reaches
-/// the job from `prepare` rather than only the supervisor's log.
+/// that asked for a nesting builder must not look like it got one. Checked where the fleet
+/// loads, so it covers the primary as well as the siblings and the error reaches the job
+/// from `prepare` rather than only the supervisor's log.
 fn refuse_job_nesting(granted: bool, unit: &crate::compose::Unit) -> Result<()> {
     if unit.nested && !granted {
         bail!(
@@ -3819,8 +3817,7 @@ mod tests {
         assert_eq!(tools_problem(long.as_bytes()).unwrap().len(), 200);
     }
 
-    /// Unset is not "8G": the cloud-hypervisor backend warns only about a window the host
-    /// asked for, so "left alone" has to be distinguishable from the default.
+    /// Unset parses to no explicit policy, so the default applies where the share is built.
     #[test]
     fn vm_dax_is_unset_by_default_and_names_its_key_when_misspelt() {
         let mut cfg = Config::default();

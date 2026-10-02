@@ -380,9 +380,8 @@ impl JobCtx {
                 && self.cfg.egress.allow_name.is_none())
     }
     /// The host unix socket the switch listens on for host vsock port `port`
-    /// (`<vsock.sock>_<port>`). Under libkrun the guest's virtio-net backend dials
-    /// it directly; under Cloud Hypervisor it is where CH surfaces the in-guest
-    /// agent's eth0 bridge.
+    /// (`<vsock.sock>_<port>`). The guest's virtio-net backend in libkrun dials it
+    /// directly.
     pub fn net_vsock_sock(&self, port: u32) -> PathBuf {
         let mut p = self.vsock_sock().into_os_string();
         p.push(format!("_{port}"));

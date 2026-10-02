@@ -669,9 +669,8 @@ fn mount_api_filesystems() -> Result<()> {
     // root-only and there is no udev here to widen it, so an unprivileged in-guest
     // process (a `vk exec --user` shell, a CI job) could not boot a microVM of its own.
     // Absent on a guest whose CPUID carries no VMX/SVM — its kvm module then registers
-    // no node, which is the NotFound below. Present even unasked on cloud-hypervisor,
-    // which cannot mask the host's bit; harmless, because the isolation boundary is the
-    // VM around this and no host access is handed out here.
+    // no node, which is the NotFound below. Widening it is harmless: the isolation
+    // boundary is the VM around this and no host access is handed out here.
     {
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = std::fs::set_permissions("/dev/kvm", std::fs::Permissions::from_mode(0o666))

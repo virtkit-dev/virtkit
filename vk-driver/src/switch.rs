@@ -2,8 +2,7 @@
 //!
 //! Each VM port has one listening host unix socket carrying qemu vhost framing: a 4-byte
 //! big-endian length followed by one ethernet frame. libkrun backs the guest's virtio-net
-//! device with that socket. Under Cloud Hypervisor, virtkit-agent bridges a tap over hybrid
-//! vsock: the guest dials host CID 2 and CH connects to `<vsock.sock>_<port>`.
+//! device with that socket.
 //!
 //! With no host privileges we are both:
 //!   - an L2 switch — VMs share one segment, so they reach each other directly

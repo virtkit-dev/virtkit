@@ -371,9 +371,8 @@ pub struct FsShare {
     /// window as `krun_add_virtiofs5`'s `shm_size` and the floor as its `dax_inode_min`.
     #[serde(default)]
     pub dax: Option<DaxShare>,
-    /// virtiofsd-style UID id-map spec strings (`type:from:to[:count]`) applied at the
-    /// guest↔host boundary; empty = identity, passed to `krun_add_virtiofs5`. `gid_map` is
-    /// the same for GIDs.
+    /// UID id-map spec strings (`type:from:to[:count]`) applied at the guest↔host boundary;
+    /// empty = identity, passed to `krun_add_virtiofs5`. `gid_map` is the same for GIDs.
     #[serde(default)]
     pub uid_map: Vec<String>,
     #[serde(default)]
@@ -432,8 +431,8 @@ pub enum ShareCache {
 const IMMUTABLE_TIMEOUT_MS: u32 = 86_400_000;
 
 /// libkrun's `krun_add_virtiofs7` cache ABI (`krun::KRUN_FS_CACHE_*`,
-/// `krun::KRUN_FS_TIMEOUT_DEFAULT_MS`), mirrored for share helpers and tests without the
-/// optional `libkrun` feature. The assertion below fails the build if they drift.
+/// `krun::KRUN_FS_TIMEOUT_DEFAULT_MS`), mirrored as local constants. The assertion below
+/// fails the build if they drift from krun's.
 const KRUN_CACHE_AUTO: u32 = 1;
 const KRUN_CACHE_ALWAYS: u32 = 2;
 const KRUN_TIMEOUT_DEFAULT_MS: u32 = 5_000;
@@ -655,7 +654,7 @@ impl VsockPort {
 
     /// Guest→host bridge (switch, ssh-agent): the guest dials `port` and the VMM
     /// forwards to the host listener at `<base>_<port>` — the same `_<port>` suffix
-    /// the hybrid-vsock host sockets already use.
+    /// every per-port socket uses.
     pub fn bridge(base: &Path, port: u32) -> Self {
         VsockPort {
             port,
@@ -665,9 +664,8 @@ impl VsockPort {
     }
 }
 
-/// The host-side socket for guest `port` on the hybrid-vsock convention:
-/// `<base>_<port>`. Re-exported from vk-core, where `vsock-auto://` resolution
-/// shares the single spelling of that suffix.
+/// The host-side per-port socket for guest `port`: `<base>_<port>`. Re-exported from
+/// vk-core, where `vsock-auto://` resolution shares the single spelling of that suffix.
 pub use vk_core::net::hybrid_socket;
 
 /// Everything needed to boot one microVM, independent of the VMM.
@@ -735,8 +733,8 @@ pub struct VmSpec {
     pub reboot: bool,
     /// Guest RAM and vCPU placement, applied before exec by [`crate::run::spawn_vmm`] and
     /// inherited by the VMM's threads. Defaults to [`crate::numa::Numa::Auto`], which lets
-    /// the boot path choose under the host's `[numa] mode`. Applies to every backend without
-    /// changing the VMM's arguments.
+    /// the boot path choose under the host's `[numa] mode`. Applies without changing the VMM's
+    /// arguments.
     #[serde(default)]
     pub numa: crate::numa::Numa,
 }
@@ -1111,7 +1109,7 @@ mod tests {
         assert!(ShareCache::Ephemeral.writeback() && ShareCache::Ephemeral.no_sync());
         assert!(!ShareCache::Auto.writeback() && !ShareCache::Auto.no_sync());
         assert!(!ShareCache::Immutable.writeback() && !ShareCache::Immutable.no_sync());
-        // Specs predating `cache` retain its default policy; their vhost-user `socket`
+        // Specs predating `cache` retain its default policy; the removed vhost-user `socket`
         // field is ignored.
         let spec: FsShare =
             serde_json::from_str(r#"{"tag":"t","socket":"/s","host_dir":"/h","read_only":true}"#)

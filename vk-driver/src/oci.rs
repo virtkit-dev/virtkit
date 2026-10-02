@@ -1,8 +1,7 @@
 //! Pull an OCI image's rootfs straight from a registry (no docker daemon) and
 //! flatten its layers — applying whiteouts — into a single rootfs tar, the same
 //! shape `docker export` produces, which the ext4/cpio builders consume. With
-//! the native ext4 writer this lets the whole pipeline drop docker, leaving
-//! cloud-hypervisor as the only external dependency.
+//! the native ext4 writer this lets the whole pipeline drop docker.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom, Write};
