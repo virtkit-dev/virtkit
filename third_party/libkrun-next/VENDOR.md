@@ -41,3 +41,52 @@ unchanged; a const assertion pins the struct at the UAPI's 256 bytes.
 the slices handed to the callback total `<= count`, but it pushed the last descriptor whole,
 so a vectored disk read (`Writer::write_from_at`) filled past `count` into guest memory the
 driver never asked for. Covered by `write_from_at_must_not_overread_past_count`.
+
+### virtio-fs passthrough (forward-ported from the 1.19 tree)
+
+`src/devices/src/virtio/fs/{linux,macos}/passthrough.rs` — share options the passthrough
+`Config` did not carry (`no_sync` on both hosts, the rest on Linux): `negative_timeout` (a
+missed lookup answers a zero-inode entry with that validity instead of ENOENT, so the guest
+caches the miss; zero, the default, keeps the error),
+`no_sync` (FLUSH, FSYNC and FSYNCDIR answer ENOSYS, which the FUSE client takes as "never
+again" for the mount; on macOS the errno goes through `linux_error`, since the host's ENOSYS
+is not Linux's) and `dax_inode_min` (per-inode DAX by size: INIT takes `HAS_INODE_DAX`
+when the guest offers it, a `dax=inode` mount, and entries of regular files at or above the
+floor carry `ATTR_DAX`, added to `fuse.rs`). Defaults leave behaviour unchanged.
+
+`src/devices/src/virtio/fs/{linux,macos}/passthrough.rs` — `do_open` on a directory under
+`CachePolicy::Always` replies `FOPEN_CACHE_DIR | FOPEN_KEEP_CACHE`: `fuse_dir_open` drops the
+readdir cache on every `opendir` without `FOPEN_KEEP_CACHE`, so every directory was re-read on
+every pass over the tree. On Linux a `CachePolicy::Always` share also serves directories
+without `opendir`: INIT takes `ZERO_MESSAGE_OPENDIR` and `opendir` answers ENOSYS, which sets
+`fc->no_opendir`; READDIR, READDIRPLUS and FSYNCDIR then arrive without a handle and go
+through a descriptor opened from the inode for that request. `auto`/`never` keep `opendir`.
+
+`src/devices/src/virtio/fs/linux/passthrough.rs` — `setupmapping` serves a DAX window from an
+fd already open on the inode (matched by inode and access mode), reopening through
+`/proc/self/fd` only when none is. The guest passes `fh = u64::MAX` with every DAX mapping, and
+a reopen re-derives access from the inode's current mode: a file opened writable then chmod'd
+0444 (git's temp pack, rewritten in place on an incremental fetch) could no longer be mapped
+writable, turning in-place writes into EACCES or SIGBUS. `removemapping` merges the adjacent
+ranges of a batch into one mmap (`merge_mappings`).
+
+`src/devices/src/virtio/fs/read_only.rs` — on Linux, REMOVEMAPPING on a read-only share keeps
+the DAX mapping in place, bounds still checked: a guest reading a source tree reclaims a range
+for nearly every file once its window is full, each costing an mmap and a KVM invalidation,
+and a kept read-only mapping is replaced by the next SETUPMAPPING (MAP_FIXED). On macOS it
+still delegates: there the inner removemapping releases the host mmap, and the next
+SETUPMAPPING maps afresh, so a kept mapping would leak.
+
+`src/devices/src/virtio/fs/server.rs` — READDIRPLUS forgets an entry that did not fit the
+reply. Its lookup took an inode reference the guest never counted, so no FORGET released it
+and the O_PATH fd stayed open for the life of the mount (362 pinned inodes on a 37k-entry
+tree). Upstream virtiofsd does the same.
+
+Covered by the passthrough `negative_lookup_*`, `no_sync_*`, `setupmapping_*`,
+`removemapping_*` and `lookup_marks_large_regular_files_for_dax` tests,
+`removemapping_keeps_the_mapping_but_checks_bounds`,
+`readdirplus_forgets_the_entry_that_did_not_fit`, and `unknown_ioctl_returns_enotty` (the
+1.19 tree's guard on an ENOTTY reply 2.0 already gives).
+
+Not carried over: the 1.19 tree's `Reader/Writer::from_volatile_slices` constructors and
+public `filesystem`/`read_only` modules, which only virtkit's removed vhost-user daemon used.

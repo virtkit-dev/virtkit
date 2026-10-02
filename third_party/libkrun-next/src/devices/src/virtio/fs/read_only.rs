@@ -306,14 +306,35 @@ impl FileSystem for PassthroughFsRo {
         shm_size: u64,
         #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
-        self.inner.removemapping(
-            ctx,
-            requests,
-            host_shm_base,
-            shm_size,
-            #[cfg(target_os = "macos")]
-            map_sender,
-        )
+        // On macOS the inner removemapping is what releases the host mmap and its window
+        // entry, and the next SETUPMAPPING maps afresh rather than in place: keeping the
+        // mapping would leak it, so delegate.
+        #[cfg(target_os = "macos")]
+        {
+            self.inner
+                .removemapping(ctx, requests, host_shm_base, shm_size, map_sender)
+        }
+        // On Linux a read-only share keeps its DAX mappings in place. Tearing one down is an
+        // mmap over the window and a KVM invalidation of that span, and the guest reclaims a
+        // range for nearly every small file it reads once its window is full — tens of
+        // thousands of calls over a source tree, none of which buys anything here: the mapping
+        // is a read-only view of a file the guest may read anyway, the next SETUPMAPPING
+        // replaces it in place (MAP_FIXED), and the file cannot be written through it. Only
+        // the request's bounds are still checked, so a malformed batch is refused as before.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (ctx, host_shm_base);
+            for req in &requests {
+                if req
+                    .moffset
+                    .checked_add(req.len)
+                    .is_none_or(|end| end > shm_size)
+                {
+                    return Err(linux_errno::einval());
+                }
+            }
+            Ok(())
+        }
     }
 
     fn ioctl(
@@ -517,5 +538,78 @@ mod tests {
         let err = read_only_open_flags((libc::O_RDONLY | libc::O_TRUNC) as u32).unwrap_err();
 
         assert_eq!(err.raw_os_error(), linux_errno::erofs().raw_os_error());
+    }
+
+    /// REMOVEMAPPING on a read-only share leaves the DAX mapping in place — the window still
+    /// reads the file afterwards — while a request past the window is still refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn removemapping_keeps_the_mapping_but_checks_bounds() {
+        use super::super::filesystem::{Context, FileSystem, FsOptions};
+        use super::super::fuse;
+        use super::super::inode_alloc::InodeAllocator;
+        use super::super::passthrough::Config;
+        use super::PassthroughFsRo;
+        use std::sync::Arc;
+
+        let root = std::env::temp_dir().join(format!("vk-ro-dax-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let page = 4096usize;
+        std::fs::write(root.join("f"), vec![0x5Au8; page]).unwrap();
+        let cfg = Config {
+            root_dir: root.to_str().unwrap().to_string(),
+            ..Default::default()
+        };
+        let fs = PassthroughFsRo::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+        let ctx = Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        };
+        let entry = fs.lookup(ctx, fuse::ROOT_ID, c"f").unwrap();
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(!std::ptr::eq(base, libc::MAP_FAILED));
+        fs.setupmapping(
+            ctx,
+            entry.inode,
+            u64::MAX,
+            0,
+            page as u64,
+            0,
+            0,
+            base as u64,
+            page as u64,
+        )
+        .unwrap();
+        assert_eq!(
+            unsafe { *(base as *const u8) },
+            0x5A,
+            "the window maps the file"
+        );
+        let one = |moffset, len| vec![fuse::RemovemappingOne { moffset, len }];
+        fs.removemapping(ctx, one(0, page as u64), base as u64, page as u64)
+            .unwrap();
+        assert_eq!(
+            unsafe { *(base as *const u8) },
+            0x5A,
+            "the mapping stays: no PROT_NONE remap"
+        );
+        let err = fs
+            .removemapping(ctx, one(0, page as u64 + 1), base as u64, page as u64)
+            .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+        unsafe { libc::munmap(base, page) };
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

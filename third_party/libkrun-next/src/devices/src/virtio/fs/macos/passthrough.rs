@@ -580,6 +580,15 @@ pub struct Config {
     /// The default value for this option is `false`.
     pub writeback: bool,
 
+    /// Whether the share needs no durability: `flush`, `fsync` and `fsyncdir` are declined
+    /// with `ENOSYS`, which the FUSE client takes as "not supported" and never sends again
+    /// for the life of the mount — so a close or an `fsync` costs no round trip at all. Use
+    /// it for a tree discarded when the VM exits (a CI job's scratch), where a host crash
+    /// loses nothing worth keeping and each of those round trips is pure cost.
+    ///
+    /// The default value for this option is `false`.
+    pub no_sync: bool,
+
     /// The path of the root directory.
     ///
     /// The default is `/`.
@@ -617,6 +626,7 @@ impl Default for Config {
             attr_timeout: Duration::from_secs(5),
             cache_policy: Default::default(),
             writeback: false,
+            no_sync: false,
             root_dir: String::from("/"),
             xattr: true,
             proc_sfd_rawfd: None,
@@ -895,7 +905,11 @@ impl PassthroughFs {
                 if flags & libc::O_DIRECTORY == 0 {
                     opts |= OpenOptions::KEEP_CACHE;
                 } else {
-                    opts |= OpenOptions::CACHE_DIR;
+                    // FOPEN_KEEP_CACHE as well: `fuse_dir_open` (fs/fuse/dir.c) drops the
+                    // directory's page cache on every opendir without it, which is where the
+                    // FOPEN_CACHE_DIR readdir cache lives, so every directory would be
+                    // re-read from the host on every pass over the tree.
+                    opts |= OpenOptions::CACHE_DIR | OpenOptions::KEEP_CACHE;
                 }
             }
             _ => {}
@@ -2212,6 +2226,11 @@ impl FileSystem for PassthroughFs {
         handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
+        // ENOSYS makes the guest stop sending FLUSH for the life of the mount (`fc->no_flush`);
+        // a plain success would still cost a round trip per close.
+        if self.cfg.no_sync {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
         let data = self
             .handles
             .read()
@@ -2245,6 +2264,11 @@ impl FileSystem for PassthroughFs {
         _datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
+        // As in `flush`: ENOSYS sets `fc->no_fsync`, so the guest never asks again. `fsyncdir`
+        // delegates here, so it stops sending FSYNCDIR too.
+        if self.cfg.no_sync {
+            return Err(linux_error(io::Error::from_raw_os_error(libc::ENOSYS)));
+        }
         let data = self
             .handles
             .read()

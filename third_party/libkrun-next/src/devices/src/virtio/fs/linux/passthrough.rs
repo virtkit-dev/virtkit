@@ -171,6 +171,23 @@ fn einval() -> io::Error {
     io::Error::from_raw_os_error(libc::EINVAL)
 }
 
+fn fsync_fd(fd: RawFd, datasync: bool) -> io::Result<()> {
+    // Safe because this doesn't modify any memory and we check the return value.
+    let res = unsafe {
+        if datasync {
+            libc::fdatasync(fd)
+        } else {
+            libc::fsync(fd)
+        }
+    };
+
+    if res == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn stat(f: &File) -> io::Result<libc::stat64> {
     let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
@@ -375,6 +392,13 @@ pub struct Config {
     /// The default value for this option is 5 seconds.
     pub attr_timeout: Duration,
 
+    /// How long the FUSE client may cache a failed (ENOENT) lookup. Zero (the default)
+    /// disables caching: every miss is a round-trip, which build tools that probe many
+    /// nonexistent paths (compiler include search) pay thousands of times. A nonzero
+    /// value bounds how long a host-created file can stay invisible to the guest after
+    /// a miss on the same name.
+    pub negative_timeout: Duration,
+
     /// The caching policy the file system should use. See the documentation of `CachePolicy` for
     /// more details.
     pub cache_policy: CachePolicy,
@@ -393,6 +417,15 @@ pub struct Config {
     ///
     /// The default value for this option is `false`.
     pub writeback: bool,
+
+    /// Whether the share needs no durability: `flush`, `fsync` and `fsyncdir` are declined
+    /// with `ENOSYS`, which the FUSE client takes as "not supported" and never sends again
+    /// for the life of the mount — so a close or an `fsync` costs no round trip at all. Use
+    /// it for a tree discarded when the VM exits (a CI job's scratch), where a host crash
+    /// loses nothing worth keeping and each of those round trips is pure cost.
+    ///
+    /// The default value for this option is `false`.
+    pub no_sync: bool,
 
     /// The path of the root directory.
     ///
@@ -419,6 +452,11 @@ pub struct Config {
     /// Table of exported FDs to share with other subsystems.
     pub export_table: Option<ExportTable>,
 
+    /// Per-inode DAX: `Some(bytes)` marks regular files at least this large for DAX
+    /// (`ATTR_DAX` on their entries, `HAS_INODE_DAX` at INIT) so a guest mounted
+    /// `dax=inode` maps only those; `None` leaves DAX to the mount option alone.
+    pub dax_inode_min: Option<u64>,
+
     /// The permission semantics to be emulated. See the documentation for `PermissionSemantics` for
     /// more details.
     pub semantics: PermissionSemantics,
@@ -429,13 +467,16 @@ impl Default for Config {
         Config {
             entry_timeout: Duration::from_secs(5),
             attr_timeout: Duration::from_secs(5),
+            negative_timeout: Duration::ZERO,
             cache_policy: Default::default(),
             writeback: false,
+            no_sync: false,
             root_dir: String::from("/"),
             xattr: true,
             proc_sfd_rawfd: None,
             export_fsid: 0,
             export_table: None,
+            dax_inode_min: None,
             semantics: PermissionSemantics::LinuxComplete,
         }
     }
@@ -469,6 +510,12 @@ pub struct PassthroughFs {
     // `cfg.writeback` is true and `init` was called with `FsOptions::WRITEBACK_CACHE`.
     writeback: AtomicBool,
     announce_submounts: AtomicBool,
+
+    // Whether the guest was told to skip OPENDIR and RELEASEDIR. Set in `init` for a
+    // cache=always share only; directory requests then arrive with no handle and are served
+    // through an fd opened for the request alone.
+    zero_message_opendir: AtomicBool,
+
     my_uid: Option<libc::uid_t>,
     my_gid: Option<libc::gid_t>,
     cap_fowner: bool,
@@ -539,6 +586,7 @@ impl PassthroughFs {
 
             writeback: AtomicBool::new(false),
             announce_submounts: AtomicBool::new(false),
+            zero_message_opendir: AtomicBool::new(false),
             my_uid,
             my_gid,
             cap_fowner,
@@ -634,14 +682,24 @@ impl PassthroughFs {
             return Ok(());
         }
 
-        let data = self
-            .handles
-            .read()
-            .unwrap()
-            .get(&handle)
-            .filter(|hd| hd.inode == inode)
-            .cloned()
-            .ok_or_else(ebadf)?;
+        let data = if self.zero_message_opendir.load(Ordering::Relaxed) {
+            // The guest never sent an OPENDIR, so there is no handle to read through. The
+            // request carries the offset the kernel wants, so an fd opened for this request
+            // alone answers it.
+            Arc::new(HandleData {
+                inode,
+                file: RwLock::new(self.open_inode(inode, libc::O_RDONLY | libc::O_DIRECTORY)?),
+                exported: Default::default(),
+            })
+        } else {
+            self.handles
+                .read()
+                .unwrap()
+                .get(&handle)
+                .filter(|hd| hd.inode == inode)
+                .cloned()
+                .ok_or_else(ebadf)?
+        };
 
         let mut buf = vec![0; size as usize];
 
@@ -772,7 +830,11 @@ impl PassthroughFs {
                 if flags & (libc::O_DIRECTORY as u32) == 0 {
                     opts |= OpenOptions::KEEP_CACHE;
                 } else {
-                    opts |= OpenOptions::CACHE_DIR;
+                    // FOPEN_KEEP_CACHE as well: `fuse_dir_open` (fs/fuse/dir.c) drops the
+                    // directory's page cache on every opendir without it, which is where the
+                    // FOPEN_CACHE_DIR readdir cache lives, so every directory would be
+                    // re-read from the host on every pass over the tree.
+                    opts |= OpenOptions::CACHE_DIR | OpenOptions::KEEP_CACHE;
                 }
             }
             _ => {}
@@ -908,6 +970,27 @@ fn forget_one(
     }
 }
 
+/// Coalesce the `(moffset, len)` window ranges of a REMOVEMAPPING batch: sorted by offset,
+/// touching or overlapping ranges merged, so each run costs one mmap. Zero-length ranges drop
+/// out. Callers bounds-check `moffset + len` against the window first; the `saturating_add`
+/// only keeps an unchecked caller from overflowing.
+pub(crate) fn merge_mappings(requests: &[fuse::RemovemappingOne]) -> Vec<(u64, u64)> {
+    let mut ranges: Vec<(u64, u64)> = requests
+        .iter()
+        .filter(|r| r.len > 0)
+        .map(|r| (r.moffset, r.moffset.saturating_add(r.len)))
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some((_, last_end)) if start <= *last_end => *last_end = (*last_end).max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged.into_iter().map(|(s, e)| (s, e - s)).collect()
+}
+
 impl FileSystem for PassthroughFs {
     type Inode = Inode;
     type Handle = Handle;
@@ -964,9 +1047,27 @@ impl FileSystem for PassthroughFs {
             self.writeback.store(true, Ordering::Relaxed);
         }
 
+        // The guest offers HAS_INODE_DAX when mounted `dax=inode`; taking it is what makes it
+        // honour ATTR_DAX on the entries below. Without a floor configured, decline it and the
+        // mount option alone decides (`always` maps every file, `inode` none).
+        if self.cfg.dax_inode_min.is_some() && capable.contains(FsOptions::HAS_INODE_DAX) {
+            opts |= FsOptions::HAS_INODE_DAX;
+        }
         if capable.contains(FsOptions::SUBMOUNTS) {
             opts |= FsOptions::SUBMOUNTS;
             self.announce_submounts.store(true, Ordering::Relaxed);
+        }
+
+        // A cache=always share's tree cannot change behind the guest's back, so let it skip
+        // OPENDIR and RELEASEDIR for every directory and use the kernel's own
+        // FOPEN_KEEP_CACHE|FOPEN_CACHE_DIR defaults — two fewer round trips per directory per
+        // pass over the tree. cache=auto keeps them: the OPENDIR is where the kernel drops a
+        // directory's cached listing.
+        if matches!(self.cfg.cache_policy, CachePolicy::Always)
+            && capable.contains(FsOptions::ZERO_MESSAGE_OPENDIR)
+        {
+            opts |= FsOptions::ZERO_MESSAGE_OPENDIR;
+            self.zero_message_opendir.store(true, Ordering::Relaxed);
         }
 
         Ok(opts)
@@ -1016,7 +1117,24 @@ impl FileSystem for PassthroughFs {
             )
         };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            // A zero-inode entry with a timeout lets the FUSE client cache the
+            // ENOENT (the kernel sends no FORGET for nodeid 0); a plain error
+            // reply creates a negative dentry the client must revalidate on
+            // every touch.
+            if !self.cfg.negative_timeout.is_zero() && err.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(Entry {
+                    inode: 0,
+                    generation: 0,
+                    // Safe: a fully-zeroed stat64 is a valid value of the C
+                    // struct; the client ignores attrs on a negative entry.
+                    attr: unsafe { std::mem::zeroed() },
+                    attr_flags: 0,
+                    attr_timeout: Duration::ZERO,
+                    entry_timeout: self.cfg.negative_timeout,
+                });
+            }
+            return Err(err);
         }
 
         // Safe because we just opened this fd.
@@ -1031,6 +1149,16 @@ impl FileSystem for PassthroughFs {
             && (st.st_dev != p.dev || mnt_id != p.mnt_id)
         {
             attr_flags |= fuse::ATTR_SUBMOUNT;
+        }
+        // Per-inode DAX by size: mapping a 2 MiB range costs the same for a 2 KiB file as for
+        // a large one, and only the large one repays it. The kernel decides DAX for an inode
+        // from the entry that instantiates it, and every entry-creating path (lookup,
+        // readdirplus, create) comes through here.
+        if let Some(min) = self.cfg.dax_inode_min
+            && st.st_mode & libc::S_IFMT == libc::S_IFREG
+            && u64::try_from(st.st_size).is_ok_and(|size| size >= min)
+        {
+            attr_flags |= fuse::ATTR_DAX;
         }
 
         let altkey = InodeAltKey {
@@ -1100,6 +1228,12 @@ impl FileSystem for PassthroughFs {
         inode: Inode,
         flags: u32,
     ) -> io::Result<(Option<Handle>, OpenOptions)> {
+        if self.zero_message_opendir.load(Ordering::Relaxed) {
+            // Declining OPENDIR is what actually stops it: `fuse_file_open` (fs/fuse/file.c)
+            // sets `fc->no_opendir` on ENOSYS and sends no further OPENDIR or RELEASEDIR on
+            // this connection. Advertising FUSE_NO_OPENDIR_SUPPORT only says we may do so.
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
         self.do_open(inode, false, flags | (libc::O_DIRECTORY as u32))
     }
 
@@ -1110,6 +1244,9 @@ impl FileSystem for PassthroughFs {
         _flags: u32,
         handle: Handle,
     ) -> io::Result<()> {
+        if self.zero_message_opendir.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         self.do_release(inode, handle)
     }
 
@@ -1697,6 +1834,11 @@ impl FileSystem for PassthroughFs {
         handle: Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
+        // ENOSYS makes the guest stop sending FLUSH for the life of the mount (`fc->no_flush`);
+        // a plain success would still cost a round trip per close.
+        if self.cfg.no_sync {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
         let data = self
             .handles
             .read()
@@ -1724,6 +1866,10 @@ impl FileSystem for PassthroughFs {
     }
 
     fn fsync(&self, _ctx: Context, inode: Inode, datasync: bool, handle: Handle) -> io::Result<()> {
+        // As in `flush`: ENOSYS sets `fc->no_fsync`, so the guest never asks again.
+        if self.cfg.no_sync {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
         let data = self
             .handles
             .read()
@@ -1735,20 +1881,7 @@ impl FileSystem for PassthroughFs {
 
         let fd = data.file.write().unwrap().as_raw_fd();
 
-        // Safe because this doesn't modify any memory and we check the return value.
-        let res = unsafe {
-            if datasync {
-                libc::fdatasync(fd)
-            } else {
-                libc::fsync(fd)
-            }
-        };
-
-        if res == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        fsync_fd(fd, datasync)
     }
 
     fn fsyncdir(
@@ -1758,6 +1891,15 @@ impl FileSystem for PassthroughFs {
         datasync: bool,
         handle: Handle,
     ) -> io::Result<()> {
+        // As in `flush`: ENOSYS sets `fc->no_fsyncdir`, so the guest never asks again.
+        if self.cfg.no_sync {
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+        }
+        if self.zero_message_opendir.load(Ordering::Relaxed) {
+            // No OPENDIR, so no handle: reach the directory through the inode instead.
+            let dir = self.open_inode(inode, libc::O_RDONLY | libc::O_DIRECTORY)?;
+            return fsync_fd(dir.as_raw_fd(), datasync);
+        }
         self.fsync(ctx, inode, datasync, handle)
     }
 
@@ -2116,13 +2258,8 @@ impl FileSystem for PassthroughFs {
         host_shm_base: u64,
         shm_size: u64,
     ) -> io::Result<()> {
-        let open_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
-            libc::O_RDWR
-        } else {
-            libc::O_RDONLY
-        };
-
-        let prot_flags = if (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0 {
+        let want_write = (flags & fuse::SetupmappingFlags::WRITE.bits()) != 0;
+        let prot_flags = if want_write {
             libc::PROT_READ | libc::PROT_WRITE
         } else {
             libc::PROT_READ
@@ -2136,8 +2273,55 @@ impl FileSystem for PassthroughFs {
 
         debug!("setupmapping: ino {inode:?} addr={addr:x} len={len}");
 
-        let file = self.open_inode(inode, open_flags)?;
-        let fd = file.as_raw_fd();
+        // The guest passes fh = u64::MAX (no handle) for DAX mappings, so serve the
+        // window from an fd already open on this inode rather than reopening it by
+        // path. A reopen re-derives access from the inode's current mode bits, so a
+        // file the guest opened writable and then chmod'd read-only (0444) can no
+        // longer be mapped writable — the reopen fails with EACCES even though the
+        // open fd is still valid, which POSIX keeps working. git's incremental fetch
+        // is exactly this: it rewrites its 0444 temp pack's header through an O_RDWR
+        // fd it keeps open, and under DAX that in-place write is serviced through a
+        // writable mapping — the reopen turned it into EACCES (and a guest MAP_SHARED
+        // store into SIGBUS). Any open fd of the right access mode for the inode
+        // establishes the same page-cache mapping; reopen only when none is open
+        // (e.g. a read mapping after the file was closed), where O_RDONLY is fine.
+        let open_handle = {
+            let handles = self.handles.read().unwrap();
+            handles
+                .values()
+                .find(|hd| {
+                    if hd.inode != inode {
+                        return false;
+                    }
+                    let fd = hd.file.read().unwrap().as_raw_fd();
+                    // On an F_GETFL error (-1) acc is O_ACCMODE, matching neither arm below,
+                    // so this handle is passed over and the reopen fallback takes it.
+                    let acc = unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_ACCMODE;
+                    if want_write {
+                        acc == libc::O_RDWR
+                    } else {
+                        acc == libc::O_RDONLY || acc == libc::O_RDWR
+                    }
+                })
+                .cloned()
+        };
+        let reopened;
+        let fd = match &open_handle {
+            // The File lives in the Arc for the rest of this call, so the fd from the
+            // dropped read guard stays valid across the mmap.
+            Some(hd) => hd.file.read().unwrap().as_raw_fd(),
+            None => {
+                reopened = self.open_inode(
+                    inode,
+                    if want_write {
+                        libc::O_RDWR
+                    } else {
+                        libc::O_RDONLY
+                    },
+                )?;
+                reopened.as_raw_fd()
+            }
+        };
 
         let ret = unsafe {
             libc::mmap(
@@ -2163,16 +2347,25 @@ impl FileSystem for PassthroughFs {
         host_shm_base: u64,
         shm_size: u64,
     ) -> io::Result<()> {
-        for req in requests {
-            let addr = host_shm_base + req.moffset;
-            if (req.moffset + req.len) > shm_size {
+        for req in &requests {
+            if req
+                .moffset
+                .checked_add(req.len)
+                .is_none_or(|end| end > shm_size)
+            {
                 return Err(einval());
             }
-            debug!("removemapping: addr={:x} len={:?}", addr, req.len);
+        }
+        // The guest reclaims DAX ranges in batches; each range torn down is one mmap over
+        // the window and one KVM invalidation of that guest-physical span. Adjacent ranges
+        // in a batch are torn down with a single call.
+        for (moffset, len) in merge_mappings(&requests) {
+            let addr = host_shm_base + moffset;
+            debug!("removemapping: addr={addr:x} len={len}");
             let ret = unsafe {
                 libc::mmap(
                     addr as *mut libc::c_void,
-                    req.len as usize,
+                    len as usize,
                     libc::PROT_NONE,
                     libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_FIXED,
                     -1,
@@ -2351,5 +2544,391 @@ mod tests {
              the server uid (the scoped_cred Drop regressed to restoring euid 0)"
         );
         Ok(())
+    }
+
+    #[test]
+    fn unknown_ioctl_returns_enotty() {
+        let fs = PassthroughFs::new(Config::default(), Arc::new(InodeAllocator::new())).unwrap();
+        let exit_code = Arc::new(AtomicI32::new(0));
+        let err = fs
+            .ioctl(
+                Context {
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                },
+                0,
+                0,
+                0,
+                u32::MAX,
+                0,
+                0,
+                0,
+                &exit_code,
+            )
+            .unwrap_err();
+
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTTY));
+    }
+
+    fn tmp_root() -> String {
+        // Unique per call: the tests run in parallel and each roots its own dir.
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "vk-ptf-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.to_str().unwrap().to_owned()
+    }
+
+    fn ctx() -> Context {
+        Context {
+            uid: 0,
+            gid: 0,
+            pid: 0,
+        }
+    }
+
+    // Returns the fs alongside its root path so the caller can remove the temp dir.
+    fn rooted_fs(negative_timeout: Duration) -> (PassthroughFs, String) {
+        let root_dir = tmp_root();
+        let cfg = Config {
+            root_dir: root_dir.clone(),
+            negative_timeout,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
+        // init() registers the root inode that lookup() traverses from.
+        fs.init(FsOptions::empty()).unwrap();
+        (fs, root_dir)
+    }
+
+    #[test]
+    fn negative_lookup_caches_miss_when_timeout_set() {
+        let timeout = Duration::from_millis(500);
+        let (fs, root) = rooted_fs(timeout);
+
+        let entry = fs
+            .lookup(
+                ctx(),
+                fuse::ROOT_ID,
+                &CString::new("does-not-exist").unwrap(),
+            )
+            .unwrap();
+
+        // A zero-inode entry carrying the timeout tells the client to cache the miss.
+        assert_eq!(entry.inode, 0);
+        assert_eq!(entry.entry_timeout, timeout);
+        assert_eq!(entry.attr_timeout, Duration::ZERO);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn negative_lookup_errors_when_timeout_zero() {
+        let (fs, root) = rooted_fs(Duration::ZERO);
+
+        // Entry isn't Debug, so match rather than unwrap_err().
+        match fs.lookup(
+            ctx(),
+            fuse::ROOT_ID,
+            &CString::new("does-not-exist").unwrap(),
+        ) {
+            Ok(_) => panic!("expected ENOENT, got a cached negative entry"),
+            Err(err) => assert_eq!(err.raw_os_error(), Some(libc::ENOENT)),
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // A `no_sync` share declines flush/fsync/fsyncdir with ENOSYS, so the guest kernel marks
+    // them unsupported (`fc->no_flush`/`no_fsync`/`no_fsyncdir`) and stops sending them.
+    #[test]
+    fn no_sync_declines_flush_and_fsync_with_enosys() {
+        let root_dir = tmp_root();
+        let cfg = Config {
+            root_dir: root_dir.clone(),
+            no_sync: true,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::new(cfg, Arc::new(InodeAllocator::new())).unwrap();
+        fs.init(FsOptions::empty()).unwrap();
+
+        let (entry, handle, _) = fs
+            .create(
+                ctx(),
+                fuse::ROOT_ID,
+                &CString::new("f").unwrap(),
+                0o644,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let handle = handle.expect("create returned a handle");
+
+        assert_eq!(
+            fs.flush(ctx(), entry.inode, handle, 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOSYS),
+        );
+        assert_eq!(
+            fs.fsync(ctx(), entry.inode, false, handle)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOSYS),
+        );
+        // fsyncdir returns before it touches the handle, so the root inode is fine here.
+        assert_eq!(
+            fs.fsyncdir(ctx(), fuse::ROOT_ID, false, handle)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOSYS),
+        );
+
+        std::fs::remove_dir_all(&root_dir).ok();
+    }
+
+    // A writable DAX mapping of a file that is mode 0444 on disk but is held open
+    // writable must succeed and reach the file. The guest passes no handle
+    // (fh = u64::MAX) with a DAX mapping, so setupmapping locates an open fd for the
+    // inode; reopening the inode by path instead re-derives access from the 0444 mode
+    // and fails O_RDWR with EACCES, turning every such in-place write under
+    // `dax=always` into EACCES/SIGBUS. git's `odb_mkstemp` is exactly this file: an
+    // O_RDWR fd kept open on a 0444 temp pack whose header it rewrites in place on an
+    // incremental fetch.
+    #[test]
+    fn setupmapping_write_uses_open_fd_not_current_mode() {
+        let (fs, root) = rooted_fs(Duration::ZERO);
+        let page = 4096usize;
+
+        // Read-only on disk, but with a writable (O_RDWR) handle — as create with a
+        // 0444 mode and an O_RDWR flag yields.
+        let (entry, handle, _) = fs
+            .create(
+                ctx(),
+                fuse::ROOT_ID,
+                &CString::new("pack").unwrap(),
+                0o444,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let handle = handle.expect("create returned a handle");
+
+        // The guard condition behind the old bug: a fresh O_RDWR open of the 0444
+        // file is denied, so the reopen the mapping used to do could not work. Root
+        // bypasses the mode bits (CAP_DAC_OVERRIDE), so only assert this unprivileged
+        // — the harness runs the tests as a non-root uid.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(
+                fs.open_inode(entry.inode, libc::O_RDWR)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EACCES),
+            );
+        }
+
+        // Give the mapping a page of file to back it (ftruncate via the handle).
+        let mut attr: libc::stat64 = unsafe { mem::zeroed() };
+        attr.st_size = page as libc::off64_t;
+        fs.setattr(ctx(), entry.inode, attr, Some(handle), SetattrValid::SIZE)
+            .unwrap();
+
+        // A host shm window, as the DAX path supplies to setupmapping.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(!std::ptr::eq(base, libc::MAP_FAILED));
+
+        // u64::MAX: the guest passes no handle for a DAX mapping.
+        fs.setupmapping(
+            ctx(),
+            entry.inode,
+            u64::MAX,
+            0,
+            page as u64,
+            fuse::SetupmappingFlags::WRITE.bits(),
+            0,
+            base as u64,
+            page as u64,
+        )
+        .expect("writable mapping of a 0444-but-open-writable file must succeed");
+
+        // The mapping is the file and is writable: a store lands in the file.
+        unsafe { (base as *mut u8).write(0xAB) };
+        let on_disk = std::fs::read(std::path::Path::new(&root).join("pack")).unwrap();
+        assert_eq!(on_disk.first(), Some(&0xAB));
+
+        unsafe { libc::munmap(base, page) };
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // A read mapping when the inode has no fd open (and the guest passes no handle)
+    // must fall back to an O_RDONLY reopen and map, not fail with EBADF.
+    #[test]
+    fn setupmapping_read_falls_back_to_reopen_when_no_fd_open() {
+        use std::os::unix::fs::FileExt;
+
+        let (fs, root) = rooted_fs(Duration::ZERO);
+        let page = 4096usize;
+
+        let (entry, handle, _) = fs
+            .create(
+                ctx(),
+                fuse::ROOT_ID,
+                &CString::new("rf").unwrap(),
+                0o644,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                Extensions::default(),
+            )
+            .unwrap();
+        let handle = handle.expect("create returned a handle");
+
+        // A page of file with a known first byte, so the read mapping has something to
+        // verify. setattr zero-fills to length; the marker goes in via the same inode.
+        let mut attr: libc::stat64 = unsafe { mem::zeroed() };
+        attr.st_size = page as libc::off64_t;
+        fs.setattr(ctx(), entry.inode, attr, Some(handle), SetattrValid::SIZE)
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(std::path::Path::new(&root).join("rf"))
+            .unwrap()
+            .write_at(&[0xCD], 0)
+            .unwrap();
+
+        // Close the only handle, so the inode has no open fd and the mapping must reopen.
+        fs.release(ctx(), entry.inode, 0, handle, false, false, None)
+            .unwrap();
+
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page,
+                libc::PROT_READ,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(!std::ptr::eq(base, libc::MAP_FAILED));
+
+        // u64::MAX: the guest passes no handle for a DAX mapping.
+        fs.setupmapping(
+            ctx(),
+            entry.inode,
+            u64::MAX,
+            0,
+            page as u64,
+            fuse::SetupmappingFlags::READ.bits(),
+            0,
+            base as u64,
+            page as u64,
+        )
+        .expect("read mapping must fall back to a reopen, not fail");
+
+        assert_eq!(unsafe { (base as *const u8).read() }, 0xCD);
+
+        unsafe { libc::munmap(base, page) };
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Touching and overlapping window ranges of one REMOVEMAPPING batch collapse into single
+    /// runs, in offset order; zero-length entries drop out.
+    #[test]
+    fn removemapping_batches_merge_adjacent_ranges() {
+        let r = |moffset, len| fuse::RemovemappingOne { moffset, len };
+        let two_mib = 2u64 << 20;
+        let merged = merge_mappings(&[
+            r(4 * two_mib, two_mib),
+            r(0, two_mib),
+            r(two_mib, two_mib),
+            r(9 * two_mib, 0),
+            r(4 * two_mib + 4096, two_mib),
+        ]);
+        assert_eq!(
+            merged,
+            vec![(0, 2 * two_mib), (4 * two_mib, two_mib + 4096)]
+        );
+        assert!(merge_mappings(&[]).is_empty());
+    }
+
+    /// With a size floor, lookup marks the regular files at or above it for DAX and nothing
+    /// else, and INIT takes HAS_INODE_DAX only from a guest that offers it.
+    #[test]
+    fn lookup_marks_large_regular_files_for_dax() {
+        let root_dir = tmp_root();
+        let root = std::path::Path::new(&root_dir);
+        std::fs::write(root.join("small"), vec![0u8; 4095]).unwrap();
+        std::fs::write(root.join("exact"), vec![0u8; 4096]).unwrap();
+        std::fs::write(root.join("large"), vec![0u8; 65536]).unwrap();
+        std::fs::create_dir(root.join("dir")).unwrap();
+        let with_floor = |floor: Option<u64>| {
+            PassthroughFs::new(
+                Config {
+                    root_dir: root_dir.clone(),
+                    dax_inode_min: floor,
+                    ..Default::default()
+                },
+                Arc::new(InodeAllocator::new()),
+            )
+            .unwrap()
+        };
+        let fs = with_floor(Some(4096));
+        let taken = fs
+            .init(FsOptions::HAS_INODE_DAX | FsOptions::SUBMOUNTS)
+            .unwrap();
+        assert!(taken.contains(FsOptions::HAS_INODE_DAX));
+        let flags = |name: &CStr| fs.lookup(ctx(), fuse::ROOT_ID, name).unwrap().attr_flags;
+        assert_eq!(flags(c"small") & fuse::ATTR_DAX, 0, "under the floor");
+        assert_eq!(
+            flags(c"exact") & fuse::ATTR_DAX,
+            fuse::ATTR_DAX,
+            "at the floor"
+        );
+        assert_eq!(flags(c"large") & fuse::ATTR_DAX, fuse::ATTR_DAX);
+        assert_eq!(
+            flags(c"dir") & fuse::ATTR_DAX,
+            0,
+            "directories are never DAX"
+        );
+        // A guest mounted `dax=always` offers no HAS_INODE_DAX; the server must not claim it.
+        let fs2 = with_floor(Some(4096));
+        assert!(
+            !fs2.init(FsOptions::SUBMOUNTS)
+                .unwrap()
+                .contains(FsOptions::HAS_INODE_DAX)
+        );
+        // Without a floor the flag is neither taken nor set, whatever the guest offers.
+        let fs3 = with_floor(None);
+        assert!(
+            !fs3.init(FsOptions::HAS_INODE_DAX)
+                .unwrap()
+                .contains(FsOptions::HAS_INODE_DAX)
+        );
+        assert_eq!(
+            fs3.lookup(ctx(), fuse::ROOT_ID, c"large")
+                .unwrap()
+                .attr_flags
+                & fuse::ATTR_DAX,
+            0
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 }
