@@ -16,11 +16,15 @@ use virtio_bindings::virtio_config::VIRTIO_F_VERSION_1;
 use vm_memory::{Address, GuestAddress, GuestMemoryMmap};
 
 use super::device::{InterruptHandler, InterruptType, VirtioTransportState};
+use super::msix::{MSIX_TABLE_ENTRY_SIZE, MsixConfig, NUM_VECTORS};
 use super::{InterruptTransport, VirtioDevice, device_status};
+use crate::legacy::GsiRoutes;
+use utils::eventfd::EventFd;
 
 const PCI_VENDOR_ID_VIRTIO: u16 = 0x1af4;
 const PCI_DEVICE_ID_VIRTIO_MODERN: u16 = 0x1040;
 const PCI_CAPABILITY_ID_VENDOR_SPECIFIC: u8 = 0x09;
+const PCI_CAPABILITY_ID_MSIX: u8 = 0x11;
 const PCI_CAPABILITY_LIST_STATUS: u16 = 1 << 4;
 const PCI_STATUS_INTERRUPT: u16 = 1 << 3;
 const PCI_COMMAND_MEMORY: u16 = 1 << 1;
@@ -72,6 +76,19 @@ const COMMON_CFG_DWORD_SIZE: u64 = size_of::<u32>() as u64;
 const VIRTIO_ISR_QUEUE: u8 = 1;
 const VIRTIO_ISR_CONFIG: u8 = 2;
 const VIRTIO_MSI_NO_VECTOR: u16 = 0xffff;
+
+// MSI-X (local patch, see VENDOR.md): the table and PBA live in BAR0 after the device
+// config, which they bound to 0x1000 bytes.
+const MSIX_CAPABILITY_LENGTH: u8 = 12;
+const MSIX_TABLE_OFFSET: u64 = 0x4000;
+const MSIX_PBA_OFFSET: u64 = 0x5000;
+const MSIX_PBA_LEN: u64 = 8;
+const MSIX_TABLE_LEN: u64 = MSIX_TABLE_ENTRY_SIZE * NUM_VECTORS as u64;
+const MSIX_MSG_CTL_ENABLE: u16 = 1 << 15;
+const MSIX_MSG_CTL_FUNCTION_MASK: u16 = 1 << 14;
+const MSIX_MSG_CTL_OFFSET: usize = 2;
+const MSIX_TABLE_OFFSET_FIELD: usize = 4;
+const MSIX_PBA_OFFSET_FIELD: usize = 8;
 
 mod pci_config {
     pub const VENDOR_ID: usize = 0x00;
@@ -172,6 +189,28 @@ struct PciInterruptInner {
     state: Mutex<PciInterruptState>,
     line: Arc<dyn PciIntxLine>,
     log_target: String,
+    /// MSI-X delivery, used instead of INTx once the driver enables it.
+    msix: Arc<Mutex<MsixConfig>>,
+    /// The vectors the driver chose for configuration changes and for the queues.
+    vectors: Mutex<MsixVectors>,
+}
+
+/// The MSI-X vectors the driver programmed. The device signals "used queue" without naming
+/// the queue, so every queue is delivered on the first queue vector the driver set: with the
+/// two-entry table that is the shared vector drivers fall back to anyway.
+#[derive(Clone, Copy)]
+struct MsixVectors {
+    config: u16,
+    queue: u16,
+}
+
+impl Default for MsixVectors {
+    fn default() -> Self {
+        Self {
+            config: VIRTIO_MSI_NO_VECTOR,
+            queue: VIRTIO_MSI_NO_VECTOR,
+        }
+    }
 }
 
 struct PciInterruptState {
@@ -183,7 +222,7 @@ struct PciInterruptState {
 struct PciInterrupt(Arc<PciInterruptInner>);
 
 impl PciInterrupt {
-    fn new(line: Arc<dyn PciIntxLine>, log_target: String) -> Self {
+    fn new(line: Arc<dyn PciIntxLine>, log_target: String, msix: Arc<Mutex<MsixConfig>>) -> Self {
         Self(Arc::new(PciInterruptInner {
             state: Mutex::new(PciInterruptState {
                 isr: 0,
@@ -191,7 +230,13 @@ impl PciInterrupt {
             }),
             line,
             log_target,
+            msix,
+            vectors: Mutex::new(MsixVectors::default()),
         }))
+    }
+
+    fn set_vectors(&self, vectors: MsixVectors) {
+        *self.0.vectors.lock().unwrap() = vectors;
     }
 
     fn read_isr(&self) -> u8 {
@@ -236,6 +281,23 @@ impl PciInterrupt {
     }
 
     fn signal(&self, bit: u8) -> Result<(), crate::Error> {
+        {
+            let mut msix = self.0.msix.lock().unwrap();
+            if msix.enabled() {
+                let vectors = *self.0.vectors.lock().unwrap();
+                let vector = if bit == VIRTIO_ISR_QUEUE {
+                    vectors.queue
+                } else {
+                    vectors.config
+                };
+                // With MSI-X on, an event the driver mapped to no vector is not delivered at
+                // all (virtio 1.2 § 4.1.4.3), never over INTx.
+                if vector != VIRTIO_MSI_NO_VECTOR {
+                    msix.signal(usize::from(vector));
+                }
+                return Ok(());
+            }
+        }
         let mut state = self.0.state.lock().unwrap();
         let was_pending = state.isr != 0;
         state.isr |= bit;
@@ -274,6 +336,7 @@ struct PciQueueRegisters {
     size: u16,
     enabled: bool,
     notification_pending: bool,
+    msix_vector: u16,
 }
 
 impl PciQueueRegisters {
@@ -282,6 +345,7 @@ impl PciQueueRegisters {
             size: max_size,
             enabled: false,
             notification_pending: false,
+            msix_vector: VIRTIO_MSI_NO_VECTOR,
         }
     }
 }
@@ -348,6 +412,9 @@ pub struct VirtioPciTransport {
     device_config_len: u32,
     queue_registers: Vec<PciQueueRegisters>,
     bus_master_enabled: Arc<AtomicBool>,
+    msix: Arc<Mutex<MsixConfig>>,
+    msix_cap_offset: usize,
+    msix_config_vector: u16,
 }
 
 impl VirtioPciTransport {
@@ -379,7 +446,7 @@ impl VirtioPciTransport {
         }
         let device_config_len =
             device_config_len.ok_or(CreatePciTransportError::UnknownDeviceConfigLength)?;
-        if u64::from(device_config_len) > VIRTIO_PCI_BAR0_SIZE - DEVICE_CFG_OFFSET {
+        if u64::from(device_config_len) > MSIX_TABLE_OFFSET - DEVICE_CFG_OFFSET {
             return Err(CreatePciTransportError::DeviceConfigTooLarge(
                 device_config_len,
             ));
@@ -399,9 +466,14 @@ impl VirtioPciTransport {
             .iter()
             .map(|queue| PciQueueRegisters::new(queue.size))
             .collect();
-        let interrupt = PciInterrupt::new(intx_line, format!("{}[{device_name}]", module_path!()));
+        let msix = Arc::new(Mutex::new(MsixConfig::new()));
+        let interrupt = PciInterrupt::new(
+            intx_line,
+            format!("{}[{device_name}]", module_path!()),
+            msix.clone(),
+        );
         let device_interrupt = InterruptTransport::from_handler(Arc::new(interrupt.clone()));
-        let (config, capabilities, pci_cfg_cap_offset) =
+        let (config, capabilities, pci_cfg_cap_offset, msix_cap_offset) =
             Self::build_config(device_type, device_config_len, interrupt_line);
 
         Ok(Self {
@@ -416,6 +488,9 @@ impl VirtioPciTransport {
             device_config_len,
             queue_registers,
             bus_master_enabled,
+            msix,
+            msix_cap_offset,
+            msix_config_vector: VIRTIO_MSI_NO_VECTOR,
         })
     }
 
@@ -423,11 +498,69 @@ impl VirtioPciTransport {
         self.state.device()
     }
 
+    /// The per-vector MSI-X eventfds, in vector order, for the VMM to register as irqfds
+    /// against the MSI GSIs it then passes to [`Self::set_msix_gsis`] (local patch).
+    pub fn msix_irqfds(&self) -> Vec<Arc<EventFd>> {
+        self.msix.lock().unwrap().vector_irqfds()
+    }
+
+    /// The KVM MSI GSIs of the MSI-X vectors, in vector order, and the routing table they
+    /// are programmed through when the driver writes a vector's message (local patch).
+    pub fn set_msix_gsis(&self, gsis: &[u32], routes: Arc<Mutex<GsiRoutes>>) {
+        let mut msix = self.msix.lock().unwrap();
+        for (index, &gsi) in gsis.iter().enumerate() {
+            msix.set_gsi(index, gsi);
+        }
+        msix.set_routes(routes);
+    }
+
+    /// The guest-physical address of each queue's notification register in BAR0 and the
+    /// eventfd a write there kicks, so the VMM can serve notifications with ioeventfds
+    /// instead of trapping them (local patch).
+    pub fn queue_notify_ioevents(&self) -> Vec<(u64, Arc<EventFd>)> {
+        self.state
+            .queue_evts()
+            .iter()
+            .enumerate()
+            .map(|(index, event)| {
+                (
+                    u64::from(self.bar_base)
+                        + NOTIFY_CFG_OFFSET
+                        + index as u64 * u64::from(NOTIFY_OFF_MULTIPLIER),
+                    event.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Push the driver's vector choices to the interrupt path.
+    fn sync_msix_vectors(&self) {
+        let queue = self
+            .queue_registers
+            .iter()
+            .map(|registers| registers.msix_vector)
+            .find(|&vector| vector != VIRTIO_MSI_NO_VECTOR)
+            .unwrap_or(VIRTIO_MSI_NO_VECTOR);
+        self.interrupt.set_vectors(MsixVectors {
+            config: self.msix_config_vector,
+            queue,
+        });
+    }
+
+    /// A vector the driver may select: one of the table's, or none.
+    fn valid_vector(vector: u16) -> u16 {
+        if vector < NUM_VECTORS {
+            vector
+        } else {
+            VIRTIO_MSI_NO_VECTOR
+        }
+    }
+
     fn build_config(
         device_type: u32,
         device_config_len: u32,
         interrupt_line: u8,
-    ) -> (PciConfigSpace, Vec<Capability>, Option<usize>) {
+    ) -> (PciConfigSpace, Vec<Capability>, Option<usize>, usize) {
         let mut config = PciConfigSpace::default();
         let mut capabilities = vec![
             Capability {
@@ -526,7 +659,29 @@ impl VirtioPciTransport {
             }
         }
 
-        (config, capabilities, pci_cfg_cap_offset)
+        // The MSI-X capability closes the list: table and PBA in BAR0, disabled and unmasked,
+        // the table size encoded as N-1 (local patch, see VENDOR.md).
+        let msix_cap_offset = next_offset;
+        if let Some(last) = capabilities.last() {
+            config.write_u8(
+                usize::from(last.offset) + vendor_cap::NEXT,
+                msix_cap_offset as u8,
+            );
+        }
+        config.write_u8(msix_cap_offset, PCI_CAPABILITY_ID_MSIX);
+        config.write_u8(msix_cap_offset + 1, 0);
+        config.write_u16(msix_cap_offset + MSIX_MSG_CTL_OFFSET, NUM_VECTORS - 1);
+        config.write_u32(
+            msix_cap_offset + MSIX_TABLE_OFFSET_FIELD,
+            MSIX_TABLE_OFFSET as u32 | u32::from(PCI_BAR0_INDEX),
+        );
+        config.write_u32(
+            msix_cap_offset + MSIX_PBA_OFFSET_FIELD,
+            MSIX_PBA_OFFSET as u32 | u32::from(PCI_BAR0_INDEX),
+        );
+        debug_assert!(msix_cap_offset + usize::from(MSIX_CAPABILITY_LENGTH) <= PCI_CONFIG_SIZE);
+
+        (config, capabilities, pci_cfg_cap_offset, msix_cap_offset)
     }
 
     fn config_status(&self) -> u16 {
@@ -621,6 +776,23 @@ impl VirtioPciTransport {
                 .read_config(offset - DEVICE_CFG_OFFSET, data);
             return PciBarAccess::Handled;
         }
+        if offset >= MSIX_TABLE_OFFSET
+            && offset + data.len() as u64 <= MSIX_TABLE_OFFSET + MSIX_TABLE_LEN
+        {
+            self.msix
+                .lock()
+                .unwrap()
+                .read_table(offset - MSIX_TABLE_OFFSET, data);
+            return PciBarAccess::Handled;
+        }
+        if offset >= MSIX_PBA_OFFSET && offset + data.len() as u64 <= MSIX_PBA_OFFSET + MSIX_PBA_LEN
+        {
+            self.msix
+                .lock()
+                .unwrap()
+                .read_pba(offset - MSIX_PBA_OFFSET, data);
+            return PciBarAccess::Handled;
+        }
         data.fill(PCI_UNIMPLEMENTED_READ_BYTE);
         PciBarAccess::Unhandled
     }
@@ -644,6 +816,23 @@ impl VirtioPciTransport {
                     .locked_device()
                     .write_config(offset - DEVICE_CFG_OFFSET, data);
             }
+            return PciBarAccess::Handled;
+        }
+        if offset >= MSIX_TABLE_OFFSET
+            && offset + data.len() as u64 <= MSIX_TABLE_OFFSET + MSIX_TABLE_LEN
+        {
+            self.msix
+                .lock()
+                .unwrap()
+                .write_table(offset - MSIX_TABLE_OFFSET, data);
+            return PciBarAccess::Handled;
+        }
+        if offset >= MSIX_PBA_OFFSET && offset + data.len() as u64 <= MSIX_PBA_OFFSET + MSIX_PBA_LEN
+        {
+            self.msix
+                .lock()
+                .unwrap()
+                .write_pba(offset - MSIX_PBA_OFFSET, data);
             return PciBarAccess::Handled;
         }
         PciBarAccess::Unhandled
@@ -676,7 +865,7 @@ impl VirtioPciTransport {
                 data.copy_from_slice(&features.to_le_bytes());
             }
             (common_cfg::MSIX_CONFIG, WORD_SIZE) => {
-                data.copy_from_slice(&VIRTIO_MSI_NO_VECTOR.to_le_bytes());
+                data.copy_from_slice(&self.msix_config_vector.to_le_bytes());
             }
             (common_cfg::NUMBER_OF_QUEUES, WORD_SIZE) => {
                 data.copy_from_slice(&(self.state.queue_config.len() as u16).to_le_bytes());
@@ -698,7 +887,11 @@ impl VirtioPciTransport {
                 data.copy_from_slice(&size.to_le_bytes());
             }
             (common_cfg::QUEUE_MSIX_VECTOR, WORD_SIZE) => {
-                data.copy_from_slice(&VIRTIO_MSI_NO_VECTOR.to_le_bytes());
+                let vector = self
+                    .queue_registers
+                    .get(queue_select as usize)
+                    .map_or(VIRTIO_MSI_NO_VECTOR, |registers| registers.msix_vector);
+                data.copy_from_slice(&vector.to_le_bytes());
             }
             (common_cfg::QUEUE_ENABLE, WORD_SIZE) => {
                 let enabled = self
@@ -786,6 +979,8 @@ impl VirtioPciTransport {
             ) {
                 self.interrupt.reset();
                 self.reset_queue_registers();
+                self.msix_config_vector = VIRTIO_MSI_NO_VECTOR;
+                self.sync_msix_vectors();
             } else if !was_activated && self.state.locked_device().is_activated() {
                 self.replay_pending_queue_notifications();
             }
@@ -814,6 +1009,20 @@ impl VirtioPciTransport {
             }
             (common_cfg::QUEUE_SELECT, WORD_SIZE) => {
                 self.state.queue_select = u16::from_le_bytes(data.try_into().unwrap()) as u32
+            }
+            // A vector the table does not have reads back as NO_VECTOR, which is how a
+            // driver learns the mapping failed (virtio 1.2 § 4.1.5.1.2).
+            (common_cfg::MSIX_CONFIG, WORD_SIZE) => {
+                self.msix_config_vector =
+                    Self::valid_vector(u16::from_le_bytes(data.try_into().unwrap()));
+                self.sync_msix_vectors();
+            }
+            (common_cfg::QUEUE_MSIX_VECTOR, WORD_SIZE) => {
+                let vector = Self::valid_vector(u16::from_le_bytes(data.try_into().unwrap()));
+                if let Some(registers) = self.queue_registers.get_mut(queue_select as usize) {
+                    registers.msix_vector = vector;
+                }
+                self.sync_msix_vectors();
             }
             (common_cfg::QUEUE_SIZE, WORD_SIZE) if self.can_configure_queue(queue_select) => {
                 let size = u16::from_le_bytes(data.try_into().unwrap());
@@ -1049,6 +1258,25 @@ impl PciFunction for VirtioPciTransport {
                         *byte = value;
                     }
                     self.bar_base = u32::from_le_bytes(bytes) & VIRTIO_PCI_BAR0_ADDRESS_MASK;
+                }
+                // MSI-X message control: only the enable and function-mask bits are
+                // writable; the table size is fixed.
+                register
+                    if (self.msix_cap_offset + MSIX_MSG_CTL_OFFSET
+                        ..self.msix_cap_offset + MSIX_MSG_CTL_OFFSET + WORD_SIZE)
+                        .contains(&register) =>
+                {
+                    let ctl_offset = self.msix_cap_offset + MSIX_MSG_CTL_OFFSET;
+                    let mut bytes = self
+                        .config
+                        .read_u16(ctl_offset)
+                        .expect("MSI-X message control fits in configuration space")
+                        .to_le_bytes();
+                    bytes[register - ctl_offset] = value;
+                    let writable = MSIX_MSG_CTL_ENABLE | MSIX_MSG_CTL_FUNCTION_MASK;
+                    let ctl = (u16::from_le_bytes(bytes) & writable) | (NUM_VECTORS - 1);
+                    self.config.write_u16(ctl_offset, ctl);
+                    self.msix.lock().unwrap().set_msg_ctl(ctl);
                 }
                 _ => {
                     if let Some(cap_offset) = self.pci_cfg_cap_offset {
@@ -1296,6 +1524,131 @@ mod tests {
         );
     }
 
+    fn enable_msix(transport: &mut VirtioPciTransport) {
+        let ctl = transport.msix_cap_offset + MSIX_MSG_CTL_OFFSET;
+        write_config(transport, ctl as u16, &MSIX_MSG_CTL_ENABLE.to_le_bytes());
+    }
+
+    /// Unmask table entry `vector` with an arbitrary message.
+    fn program_vector(transport: &mut VirtioPciTransport, base: u64, vector: u16) {
+        let entry = MSIX_TABLE_OFFSET + u64::from(vector) * MSIX_TABLE_ENTRY_SIZE;
+        write_bar(transport, base, entry, &0xfee0_0000u32.to_le_bytes());
+        write_bar(transport, base, entry + 8, &0x4021u32.to_le_bytes());
+        write_bar(transport, base, entry + 12, &0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn msix_capability_points_at_the_table_and_pba_in_bar0() {
+        let transport = transport();
+        let cap = transport.msix_cap_offset;
+        assert_eq!(transport.config.read_u8(cap), Some(PCI_CAPABILITY_ID_MSIX));
+        assert_eq!(
+            transport.config.read_u16(cap + MSIX_MSG_CTL_OFFSET),
+            Some(NUM_VECTORS - 1),
+            "table size N-1, disabled"
+        );
+        assert_eq!(
+            transport.config.read_u32(cap + MSIX_TABLE_OFFSET_FIELD),
+            Some(MSIX_TABLE_OFFSET as u32)
+        );
+        assert_eq!(
+            transport.config.read_u32(cap + MSIX_PBA_OFFSET_FIELD),
+            Some(MSIX_PBA_OFFSET as u32)
+        );
+        assert!(cap + usize::from(MSIX_CAPABILITY_LENGTH) <= PCI_CONFIG_SIZE);
+    }
+
+    #[test]
+    fn msix_vectors_read_back_and_unknown_ones_read_no_vector() {
+        let mut transport = transport();
+        let base = enable_memory_bar(&mut transport);
+        write_bar(
+            &mut transport,
+            base,
+            common_cfg::MSIX_CONFIG,
+            &0u16.to_le_bytes(),
+        );
+        let mut value = [0; WORD_SIZE];
+        read_bar(&mut transport, base + common_cfg::MSIX_CONFIG, &mut value);
+        assert_eq!(u16::from_le_bytes(value), 0);
+
+        write_bar(
+            &mut transport,
+            base,
+            common_cfg::QUEUE_MSIX_VECTOR,
+            &7u16.to_le_bytes(),
+        );
+        read_bar(
+            &mut transport,
+            base + common_cfg::QUEUE_MSIX_VECTOR,
+            &mut value,
+        );
+        assert_eq!(u16::from_le_bytes(value), VIRTIO_MSI_NO_VECTOR);
+
+        write_bar(
+            &mut transport,
+            base,
+            common_cfg::QUEUE_MSIX_VECTOR,
+            &1u16.to_le_bytes(),
+        );
+        read_bar(
+            &mut transport,
+            base + common_cfg::QUEUE_MSIX_VECTOR,
+            &mut value,
+        );
+        assert_eq!(u16::from_le_bytes(value), 1);
+    }
+
+    #[test]
+    fn with_msix_enabled_a_used_queue_interrupt_goes_to_its_vector_not_intx() {
+        let (mut transport, line) = transport_with_line();
+        let base = enable_memory_bar(&mut transport);
+        enable_msix(&mut transport);
+        program_vector(&mut transport, base, 1);
+        write_bar(
+            &mut transport,
+            base,
+            common_cfg::QUEUE_MSIX_VECTOR,
+            &1u16.to_le_bytes(),
+        );
+
+        transport
+            .interrupt
+            .try_signal(InterruptType::UsedQueue)
+            .unwrap();
+        assert_eq!(transport.msix_irqfds()[1].read().unwrap(), 1);
+        assert!(!line.0.load(Ordering::SeqCst), "INTx stays deasserted");
+
+        // A config change the driver mapped to no vector is not delivered at all.
+        transport
+            .interrupt
+            .try_signal(InterruptType::ConfigChange)
+            .unwrap();
+        assert!(!line.0.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn without_msix_the_interrupt_falls_back_to_intx() {
+        let (mut transport, line) = transport_with_line();
+        enable_memory_bar(&mut transport);
+        transport
+            .interrupt
+            .try_signal(InterruptType::UsedQueue)
+            .unwrap();
+        assert!(line.0.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn queue_notify_ioevents_follow_the_notify_layout() {
+        let (transport, _) = transport_with_queue_config(&MULTI_QUEUE_CONFIG);
+        let ioevents = transport.queue_notify_ioevents();
+        assert_eq!(ioevents.len(), 2);
+        assert_eq!(
+            ioevents[1].0,
+            u64::from(transport.bar_base) + NOTIFY_CFG_OFFSET + u64::from(NOTIFY_OFF_MULTIPLIER)
+        );
+    }
+
     #[test]
     fn advertises_modern_virtio_identity_and_capabilities() {
         let mut transport = transport();
@@ -1314,16 +1667,21 @@ mod tests {
             .read_u8(pci_config::CAPABILITY_POINTER)
             .unwrap();
         let mut cfg_types = Vec::new();
+        let mut last_id = 0;
         while pointer != 0 {
             let offset = usize::from(pointer);
-            cfg_types.push(
-                transport
-                    .config
-                    .read_u8(offset + vendor_cap::CONFIG_TYPE)
-                    .unwrap(),
-            );
+            last_id = transport.config.read_u8(offset).unwrap();
+            if last_id == PCI_CAPABILITY_ID_VENDOR_SPECIFIC {
+                cfg_types.push(
+                    transport
+                        .config
+                        .read_u8(offset + vendor_cap::CONFIG_TYPE)
+                        .unwrap(),
+                );
+            }
             pointer = transport.config.read_u8(offset + vendor_cap::NEXT).unwrap();
         }
+        assert_eq!(last_id, PCI_CAPABILITY_ID_MSIX, "MSI-X closes the list");
         assert_eq!(
             cfg_types,
             [
