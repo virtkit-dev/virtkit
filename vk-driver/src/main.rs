@@ -1070,8 +1070,9 @@ enum Cmd {
         service: Option<String>,
         /// show the last N lines (after filtering); 0 streams the whole log
         ///
-        /// The log is read a line at a time and only N are held, so a bound costs no more
-        /// memory on a console that has grown for days than on a fresh one.
+        /// The log is read back from its end and only N lines are held — a line over a MiB
+        /// counts as one a MiB — so a bound costs no more on a console that has grown for days
+        /// than on a fresh one, unless a filter matches rarely and reads further back.
         #[arg(short = 'n', long, default_value_t = 50, value_name = "N")]
         lines: usize,
         /// only lines at least this severe: error, warn, info, debug, trace
@@ -4677,6 +4678,9 @@ const REGISTRY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 /// as it stands.
 const MAX_PARTIAL_LINE: usize = 1 << 20;
 
+/// The first window [`console_tail`] reads back from a console's end.
+const TAIL_WINDOW: u64 = 1 << 20;
+
 /// Print `path`'s console lines from `sources` (all when empty) at least `level` severe, the
 /// last `lines` of them (all when 0); with `follow`, keep printing what is appended until
 /// Ctrl-C, until the VM this console belongs to leaves the registry, or until the reader
@@ -4690,50 +4694,43 @@ async fn show_console_log(
     follow: bool,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
-    use std::io::{BufRead, Write};
+    use std::io::Write;
     let mut file =
         std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    // Streamed, not slurped: a long-lived guest's console grows without bound and nothing
-    // rotates it, while all that is printed is the last `lines` of it. Read a line at a time
-    // as bytes — the console is written by whatever the guest runs, so it is not text — and
-    // decoded lossily per line, for the reason `vk atop` reads its own log lossily: one
-    // stray byte must not cost the reader the whole log.
-    let mut reader = std::io::BufReader::new(&mut file);
-    let mut offset = 0u64;
-    let mut raw = Vec::new();
-    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut out = std::io::stdout().lock();
-    loop {
-        raw.clear();
-        let n = reader
-            .read_until(b'\n', &mut raw)
-            .with_context(|| format!("reading {}", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        offset = offset.saturating_add(n as u64);
-        let Some(line) = consolelog::select(&String::from_utf8_lossy(&raw), sources, level).next()
-        else {
-            continue;
-        };
+    let reading = || format!("reading {}", path.display());
+    let (mut offset, mut pieces) = if lines == 0 {
         // With no bound asked for, print as we go and hold nothing.
-        if lines == 0 {
-            if broken_pipe(writeln!(out, "{}", line.text))? {
+        let mut pieces = consolelog::Pieces::default();
+        let mut stopped = None;
+        let offset = scan_console(&mut file, 0, &mut pieces, |line| {
+            if !consolelog::wanted(&line, sources, level) {
+                return true;
+            }
+            match broken_pipe(writeln!(out, "{}", line.text)) {
+                Ok(false) => true,
+                // The reader closed (`Ok(true)`), or the write failed.
+                r => {
+                    stopped = Some(r);
+                    false
+                }
+            }
+        })
+        .with_context(reading)?;
+        if let Some(r) = stopped {
+            return r.map(|_| ());
+        }
+        (offset, pieces)
+    } else {
+        let (tail, offset, pieces) =
+            console_tail(&mut file, sources, level, lines, TAIL_WINDOW).with_context(reading)?;
+        for l in &tail {
+            if broken_pipe(writeln!(out, "{l}"))? {
                 return Ok(());
             }
-            continue;
         }
-        if tail.len() == lines {
-            tail.pop_front();
-        }
-        tail.push_back(line.text);
-    }
-    for l in &tail {
-        if broken_pipe(writeln!(out, "{l}"))? {
-            return Ok(());
-        }
-    }
-    drop(tail);
+        (offset, pieces)
+    };
     if !follow {
         return broken_pipe(out.flush()).map(|_| ());
     }
@@ -4773,6 +4770,7 @@ async fn show_console_log(
             // Truncated (a reboot in place rewrites it): start over from the top.
             offset = 0;
             pending.clear();
+            pieces = consolelog::Pieces::default();
         }
         if len == offset {
             continue;
@@ -4790,8 +4788,9 @@ async fn show_console_log(
             None if pending.len() >= MAX_PARTIAL_LINE => std::mem::take(&mut pending),
             None => continue,
         };
-        for l in consolelog::select(&complete, sources, level) {
-            if broken_pipe(writeln!(out, "{}", l.text))? {
+        for piece in complete.split_inclusive('\n') {
+            let l = pieces.classify(piece);
+            if consolelog::wanted(&l, sources, level) && broken_pipe(writeln!(out, "{}", l.text))? {
                 return Ok(());
             }
         }
@@ -4799,6 +4798,98 @@ async fn show_console_log(
             return Ok(());
         }
     }
+}
+
+/// The last `lines` (at least one) console lines of `file` from `sources` at least `level`
+/// severe, with the offset read to and the classifier's state there. Read back from the end:
+/// from the first line that starts in the last `window` bytes, the window doubled while it
+/// holds fewer than `lines` of them and does not reach the start. A bound thus costs no more
+/// on a console that has grown for days than on a fresh one — unless a filter matches
+/// rarely, which reads further back, up to the whole console. A line longer than
+/// [`MAX_PARTIAL_LINE`] counts a line a piece, so at most `lines` pieces of
+/// `MAX_PARTIAL_LINE` bytes each are held (more once invalid UTF-8 is decoded lossily).
+fn console_tail(
+    file: &mut std::fs::File,
+    sources: &[consolelog::Source],
+    level: Option<consolelog::Level>,
+    lines: usize,
+    mut window: u64,
+) -> std::io::Result<(std::collections::VecDeque<String>, u64, consolelog::Pieces)> {
+    use std::io::{BufRead, Seek};
+    let len = file.metadata()?.len();
+    loop {
+        let back = len.saturating_sub(window);
+        // The first line that starts at `back` or after: a read begun a byte early, through
+        // the first newline. A line holding the whole window leaves none, and a wider one.
+        let from = match back.checked_sub(1) {
+            None => 0,
+            Some(before) => {
+                file.seek(std::io::SeekFrom::Start(before))?;
+                let skipped = std::io::BufReader::new(&mut *file).skip_until(b'\n')?;
+                before.saturating_add(skipped as u64)
+            }
+        };
+        let mut tail = std::collections::VecDeque::new();
+        let mut pieces = consolelog::Pieces::default();
+        let offset = scan_console(file, from, &mut pieces, |line| {
+            if consolelog::wanted(&line, sources, level) {
+                if tail.len() == lines {
+                    tail.pop_front();
+                }
+                tail.push_back(line.text);
+            }
+            true
+        })?;
+        if tail.len() >= lines || back == 0 {
+            return Ok((tail, offset, pieces));
+        }
+        window = window.saturating_mul(2);
+    }
+}
+
+/// Classify the console lines of `file` from byte `from`, a line's start, to its end, handing
+/// each to `each` until it returns `false`, and return the offset read to. Streamed, not
+/// slurped: a long-lived guest's console grows without bound and nothing rotates it. Read a
+/// line at a time as bytes — the console is written by whatever the guest runs, so it is not
+/// text — and decoded lossily per line, for the reason `vk atop` reads its own log lossily:
+/// one stray byte must not cost the reader the whole log.
+fn scan_console(
+    file: &mut std::fs::File,
+    from: u64,
+    pieces: &mut consolelog::Pieces,
+    mut each: impl FnMut(consolelog::Line) -> bool,
+) -> std::io::Result<u64> {
+    use std::io::Seek;
+    file.seek(std::io::SeekFrom::Start(from))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut offset = from;
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        let n = read_console_line(&mut reader, &mut raw)?;
+        if n == 0 {
+            return Ok(offset);
+        }
+        offset = offset.saturating_add(n as u64);
+        if !each(pieces.classify(&String::from_utf8_lossy(&raw))) {
+            return Ok(offset);
+        }
+    }
+}
+
+/// Read one console line into `raw`, its newline included — or, of one longer than
+/// [`MAX_PARTIAL_LINE`], that many bytes, the rest left for the next read, as a follow prints
+/// it — so a guest that never writes a newline cannot grow this process without bound.
+/// `Ok(0)` at the end.
+fn read_console_line(
+    reader: &mut impl std::io::BufRead,
+    raw: &mut Vec<u8>,
+) -> std::io::Result<usize> {
+    use std::io::{BufRead, Read};
+    reader
+        .by_ref()
+        .take(MAX_PARTIAL_LINE as u64)
+        .read_until(b'\n', raw)
 }
 
 /// Return `Ok(true)` for a closed reader (`vk logs | head`), a normal command exit.
@@ -5905,6 +5996,94 @@ mod tests {
         assert!(!broken_pipe(Ok(())).unwrap());
         assert!(broken_pipe(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))).unwrap());
         assert!(broken_pipe(Err(std::io::Error::from(std::io::ErrorKind::StorageFull))).is_err());
+    }
+
+    /// A console of `lines`, in a scratch file.
+    fn console_file(tag: &str, lines: &str) -> (PathBuf, std::fs::File) {
+        let dir = std::env::temp_dir().join(format!("vk-console-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("console.log"), lines).unwrap();
+        let file = std::fs::File::open(dir.join("console.log")).unwrap();
+        (dir, file)
+    }
+
+    // The last lines are read back from the end, a window that holds too few of them widened
+    // until it does, whatever the filter.
+    #[test]
+    fn a_console_tail_is_read_back_from_the_end() {
+        use consolelog::{Level, Source};
+        let mut text = String::new();
+        for i in 0..200 {
+            if i % 50 == 0 {
+                text.push_str(&format!("12:00:00 [WARN] vk-agent w{i}\n"));
+            } else {
+                text.push_str(&format!("guest {i}\n"));
+            }
+        }
+        text.push_str("torn");
+        let (dir, mut file) = console_file("tail", &text);
+        let len = text.len() as u64;
+        // A window cutting a line in two, then lines that are all within reach.
+        let (tail, offset, _) = console_tail(&mut file, &[], None, 3, 20).unwrap();
+        assert_eq!(tail, ["guest 198", "guest 199", "torn"]);
+        assert_eq!(offset, len);
+        // Rare matches: read back until there are enough, or to the start.
+        let (tail, offset, _) = console_tail(&mut file, &[], Some(Level::Warn), 3, 20).unwrap();
+        assert_eq!(
+            tail,
+            [
+                "12:00:00 [WARN] vk-agent w50",
+                "12:00:00 [WARN] vk-agent w100",
+                "12:00:00 [WARN] vk-agent w150"
+            ]
+        );
+        assert_eq!(offset, len);
+        let (tail, _, _) = console_tail(&mut file, &[Source::Agent], None, 10, 20).unwrap();
+        assert_eq!(tail.len(), 4);
+        // A window wider than the console reads it whole.
+        let (tail, _, _) = console_tail(&mut file, &[], None, 1000, 1 << 30).unwrap();
+        assert_eq!(tail.len(), 201);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The pieces of a line too long to hold at once are all the line's: selected by its
+    // prefix, each counting as one of the last lines.
+    #[test]
+    fn a_long_line_s_pieces_are_classified_by_its_start() {
+        use consolelog::Level;
+        let long = format!("12:00:00 [WARN] vk-agent {}", "x".repeat(MAX_PARTIAL_LINE));
+        let text = format!("12:00:00 [WARN] vk-agent before\n{long}\nguest after\n");
+        let (dir, mut file) = console_file("pieces", &text);
+        let (tail, _, _) = console_tail(&mut file, &[], Some(Level::Warn), 10, 64).unwrap();
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0], "12:00:00 [WARN] vk-agent before");
+        assert_eq!(tail[1].len() + tail[2].len(), long.len());
+        assert!(tail[2].bytes().all(|b| b == b'x'));
+        let (tail, _, _) = console_tail(&mut file, &[], None, 2, 64).unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[1], "guest after");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A console line is read a bounded piece at a time, its newline ending the last piece.
+    #[test]
+    fn a_console_line_is_read_at_most_a_bound_at_once() {
+        let long = "x".repeat(MAX_PARTIAL_LINE + 5);
+        let mut reader = std::io::Cursor::new(format!("a\n{long}\nb").into_bytes());
+        let mut pieces = Vec::new();
+        loop {
+            let mut raw = Vec::new();
+            if read_console_line(&mut reader, &mut raw).unwrap() == 0 {
+                break;
+            }
+            pieces.push(raw);
+        }
+        assert_eq!(pieces.len(), 4);
+        assert_eq!(pieces[0], b"a\n");
+        assert_eq!(pieces[1], long.as_bytes()[..MAX_PARTIAL_LINE]);
+        assert_eq!(pieces[2], b"xxxxx\n");
+        assert_eq!(pieces[3], b"b");
     }
 
     // `vk logs` on a directory the registry does not know reads its console anyway — a VM

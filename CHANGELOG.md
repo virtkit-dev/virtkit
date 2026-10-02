@@ -14,6 +14,13 @@ All notable changes to virtkit will be documented in this file.
   `vk-hub local login` prints another link; `vk-hub local sessions` and `logout` list and end
   sessions. Not published with releases: `./build.sh` builds it into `dist/`.
 
+### Fixed
+
+- **`vk logs -n` reads only the end of a long console, and never holds a whole line.** It read
+  the console from its start, so on one grown over days every call took longer, and a guest
+  writing without newlines made it hold the entire console as one line. The last lines are
+  now read back from the end, in bounded pieces, as `vk logs -f` already read new ones.
+
 ## [0.81.0] - 2026-10-02
 
 ### Added

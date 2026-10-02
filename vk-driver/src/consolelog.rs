@@ -201,14 +201,40 @@ pub fn select<'a>(
     sources: &'a [Source],
     min_level: Option<Level>,
 ) -> impl Iterator<Item = Line> + 'a {
-    text.lines().map(classify).filter(move |l| {
-        (sources.is_empty() || sources.contains(&l.source))
-            && match (min_level, l.level) {
-                (None, _) => true,
-                (Some(min), Some(level)) => level <= min,
-                (Some(_), None) => false,
-            }
-    })
+    text.lines()
+        .map(classify)
+        .filter(move |l| wanted(l, sources, min_level))
+}
+
+/// Whether `line` is from `sources` (any, when empty) and at least as severe as `min_level`,
+/// as [`select`] picks lines.
+pub fn wanted(line: &Line, sources: &[Source], min_level: Option<Level>) -> bool {
+    (sources.is_empty() || sources.contains(&line.source))
+        && match (min_level, line.level) {
+            (None, _) => true,
+            (Some(min), Some(level)) => level <= min,
+            (Some(_), None) => false,
+        }
+}
+
+/// Classify console lines read in pieces. Continuation pieces have no prefix of their own,
+/// so they inherit the first piece's classification until the line ends.
+#[derive(Debug, Default)]
+pub struct Pieces {
+    carry: Option<(Source, Option<Level>)>,
+}
+
+impl Pieces {
+    /// Classify `piece`: a whole line, its newline included, or as much of one as was read.
+    pub fn classify(&mut self, piece: &str) -> Line {
+        let mut line = classify(piece);
+        if let Some((source, level)) = self.carry {
+            line.source = source;
+            line.level = level;
+        }
+        self.carry = (!piece.ends_with('\n')).then_some((line.source, line.level));
+        line
+    }
 }
 
 /// The most complaints [`problems`] returns. A boot failure is spliced into an error string
@@ -248,6 +274,28 @@ mod tests {
         assert_eq!((a.source, a.level), (Source::Agent, Some(Level::Info)));
         let g = classify("Killed");
         assert_eq!((g.source, g.level), (Source::Guest, None));
+    }
+
+    /// The pieces of a line read in several are classified by its first; the next line by
+    /// its own.
+    #[test]
+    fn a_line_read_in_pieces_is_classified_by_its_first() {
+        let mut pieces = Pieces::default();
+        let first = pieces.classify("13:46:39 [WARN] vk-agent net: xxx");
+        assert_eq!(
+            (first.source, first.level),
+            (Source::Agent, Some(Level::Warn))
+        );
+        let rest = pieces.classify("xxx");
+        assert_eq!(
+            (rest.source, rest.level),
+            (Source::Agent, Some(Level::Warn))
+        );
+        let end = pieces.classify("xxx\n");
+        assert_eq!((end.source, end.level), (Source::Agent, Some(Level::Warn)));
+        let next = pieces.classify("Killed\n");
+        assert_eq!((next.source, next.level), (Source::Guest, None));
+        assert_eq!(next.text, "Killed");
     }
 
     #[test]
