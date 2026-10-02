@@ -104,10 +104,18 @@ pub const FIRMWARE_START: u64 = 0xffff_0000;
 /// The size of the firmware.
 pub const FIRMWARE_SIZE: u64 = 65536;
 
-/// The start of the memory area reserved for MMIO devices.
+/// The start of the memory area reserved for MMIO devices: the 32-bit hole below 4 GiB, which
+/// guest RAM skips. 1 GiB, from 3 GiB, as cloud-hypervisor lays it out: UEFI firmware built for
+/// it (OVMF's CloudHv) assigns PCI BARs from 3 GiB up, so RAM must end there (local patch, see
+/// VENDOR.md).
 pub const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
-pub const MEM_32BIT_GAP_SIZE: u64 = 768 << 20;
+pub const MEM_32BIT_GAP_SIZE: u64 = 1 << 30;
 pub const MMIO_MEM_START: u64 = FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE;
+/// The low part of the hole, where firmware moves PCI BARs; the BAR window covers it too.
+pub const PCI_MMIO32_LOW_START: u64 = MMIO_MEM_START;
+pub const PCI_MMIO32_LOW_END: u64 = 0xd000_0000;
+/// Where virtio-mmio devices are placed, above the firmware's BARs.
+pub const MMIO_DEVICES_START: u64 = PCI_MMIO32_LOW_END;
 
 /// Start of the PCI Express ECAM window for bus 0.
 pub const PCI_ECAM_START: u64 = 0xe000_0000;

@@ -34,7 +34,10 @@ const PCI_INTERRUPT_PIN_INTA: u8 = 1;
 const PCI_REVISION_MODERN: u8 = 1;
 const PCI_HEADER_TYPE_ENDPOINT: u8 = 0;
 const PCI_BAR0_INDEX: u8 = 0;
-const PCI_SUBSYSTEM_DEVICE_ID_BASE: u16 = 0x40;
+/// The subsystem device ID of every virtio function: QEMU's, which the virtio-win INFs name in
+/// their hardware IDs (`SUBSYS_11001AF4`). Windows Setup only installs onto a disk whose
+/// controller matches one of those exactly (local patch).
+const PCI_SUBSYSTEM_DEVICE_ID: u16 = 0x1100;
 const VIRTIO_PCI_CAPABILITY_LENGTH: u8 = 16;
 const VIRTIO_PCI_NOTIFY_CAPABILITY_LENGTH: u8 = 20;
 const PCI_CFG_DATA_SIZE: usize = size_of::<u32>();
@@ -688,10 +691,7 @@ impl VirtioPciTransport {
         config.write_u8(pci_config::REVISION_ID, PCI_REVISION_MODERN);
         config.write_u8(pci_config::HEADER_TYPE, PCI_HEADER_TYPE_ENDPOINT);
         config.write_u16(pci_config::SUBSYSTEM_VENDOR_ID, PCI_VENDOR_ID_VIRTIO);
-        config.write_u16(
-            pci_config::SUBSYSTEM_DEVICE_ID,
-            PCI_SUBSYSTEM_DEVICE_ID_BASE.wrapping_add(device_type as u16),
-        );
+        config.write_u16(pci_config::SUBSYSTEM_DEVICE_ID, PCI_SUBSYSTEM_DEVICE_ID);
         config.write_u8(
             pci_config::CAPABILITY_POINTER,
             capabilities
@@ -1197,10 +1197,18 @@ impl VirtioPciTransport {
                 if u16::from_le_bytes(data.try_into().unwrap()) == VIRTIO_QUEUE_READY
                     && self.can_configure_queue(queue_select) =>
             {
-                if self
-                    .state
-                    .with_queue_mut(queue_select, |queue| queue.ready = true)
-                    && let Some(registers) = self.queue_registers.get_mut(queue_select as usize)
+                // queue_size resets to the maximum and a driver may enable the queue without
+                // writing it (edk2 does), so the queue takes whatever size the register shows.
+                let size = self
+                    .queue_registers
+                    .get(queue_select as usize)
+                    .map(|registers| registers.size);
+                if self.state.with_queue_mut(queue_select, |queue| {
+                    if let Some(size) = size {
+                        queue.size = size;
+                    }
+                    queue.ready = true;
+                }) && let Some(registers) = self.queue_registers.get_mut(queue_select as usize)
                 {
                     registers.enabled = true;
                 }
@@ -2165,6 +2173,14 @@ mod tests {
             u16::from_le_bytes(device_id),
             PCI_DEVICE_ID_VIRTIO_MODERN.wrapping_add(TEST_DEVICE_TYPE as u16)
         );
+        // virtio-win's INFs match `SUBSYS_11001AF4`, QEMU's subsystem IDs.
+        let mut subsystem = [0; 2 * WORD_SIZE];
+        read_config(
+            &mut transport,
+            pci_config::SUBSYSTEM_VENDOR_ID as u16,
+            &mut subsystem,
+        );
+        assert_eq!(subsystem, [0xf4, 0x1a, 0x00, 0x11]);
 
         let mut pointer = transport
             .config
@@ -2488,6 +2504,37 @@ mod tests {
             &mut queue_enable,
         );
         assert_eq!(u16::from_le_bytes(queue_enable), 0);
+    }
+
+    #[test]
+    fn a_queue_enabled_without_a_size_write_keeps_the_maximum_size() {
+        let mut transport = transport();
+        let bar_base = enable_memory_bar(&mut transport);
+        for status in [
+            device_status::ACKNOWLEDGE,
+            device_status::ACKNOWLEDGE | device_status::DRIVER,
+            device_status::ACKNOWLEDGE | device_status::DRIVER | device_status::FEATURES_OK,
+        ] {
+            write_bar(
+                &mut transport,
+                bar_base,
+                common_cfg::DEVICE_STATUS,
+                &[status as u8],
+            );
+        }
+        write_bar(
+            &mut transport,
+            bar_base,
+            common_cfg::QUEUE_ENABLE,
+            &VIRTIO_QUEUE_READY.to_le_bytes(),
+        );
+
+        assert_eq!(
+            transport
+                .state
+                .with_queue(0, 0, |queue| queue.actual_size()),
+            TEST_QUEUE_SIZE
+        );
     }
 
     #[test]

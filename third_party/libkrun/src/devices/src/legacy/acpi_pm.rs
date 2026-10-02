@@ -10,12 +10,15 @@
 //     if the guest enabled it, raises the SCI so the guest's fixed-feature power
 //     button driver runs an orderly shutdown.
 //
-// There is no PM timer and no GPE block. SCI_EN reads back as 1 (the system is
-// always in ACPI mode: FADT SMI_CMD is 0), so the guest never tries to enable it.
+// It also serves the ACPI PM timer: a free-running 32-bit counter at 3.579545 MHz, which
+// UEFI firmware and Windows use for their delays and calibration. There is no GPE block.
+// SCI_EN reads back as 1 (the system is always in ACPI mode: FADT SMI_CMD is 0), so the
+// guest never tries to enable it.
 
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
@@ -33,6 +36,9 @@ use crate::bus::BusDevice;
 const PM1_STS: u64 = 0x00; // 2 bytes
 const PM1_EN: u64 = 0x02; // 2 bytes
 const PM1_CNT: u64 = 0x04; // 2 bytes
+const PM_TMR: u64 = 0x08; // 4 bytes, read-only
+/// The ACPI PM timer's fixed frequency (ACPI 6.x § 4.8.3.3).
+const PM_TIMER_HZ: u128 = 3_579_545;
 const RESET_REG: u64 = (ACPI_RESET_REG - ACPI_PM_BASE) as u64; // 1 byte
 
 // PM1 status/enable: only the power-button bit is modelled.
@@ -59,6 +65,8 @@ pub struct AcpiPm {
     sci_evt: EventFd,
     /// Host-side power-button trigger. `None` when the host exposes no button.
     shutdown_efd: Option<EventFd>,
+    /// The PM timer counts from here.
+    timer_start: Instant,
 }
 
 impl AcpiPm {
@@ -75,7 +83,14 @@ impl AcpiPm {
             reset_flag,
             sci_evt,
             shutdown_efd,
+            timer_start: Instant::now(),
         }
+    }
+
+    /// The PM timer's current value: ticks of 3.579545 MHz since the device was created,
+    /// wrapping at 32 bits (the FADT sets TMR_VAL_EXT).
+    fn pm_timer(&self) -> u32 {
+        (self.timer_start.elapsed().as_nanos() * PM_TIMER_HZ / 1_000_000_000) as u32
     }
 
     fn raise_sci_if_pending(&self) {
@@ -98,6 +113,14 @@ impl AcpiPm {
 
 impl BusDevice for AcpiPm {
     fn read(&mut self, _vcpuid: u64, offset: u64, data: &mut [u8]) {
+        if (PM_TMR..PM_TMR + 4).contains(&offset) {
+            let bytes = self.pm_timer().to_le_bytes();
+            let start = (offset - PM_TMR) as usize;
+            for (i, b) in data.iter_mut().enumerate() {
+                *b = bytes.get(start + i).copied().unwrap_or(0);
+            }
+            return;
+        }
         let val: u16 = match offset {
             PM1_STS => self.pm1_sts,
             PM1_EN => self.pm1_en,
@@ -237,5 +260,24 @@ mod tests {
         let mut buf = [0u8; 2];
         pm.read(0, PM1_CNT, &mut buf);
         assert_eq!(u16::from_le_bytes(buf), SCI_EN);
+    }
+
+    fn read_timer(pm: &mut AcpiPm) -> u32 {
+        let mut data = [0u8; 4];
+        pm.read(0, PM_TMR, &mut data);
+        u32::from_le_bytes(data)
+    }
+
+    #[test]
+    fn the_pm_timer_counts_at_3_58_mhz() {
+        let mut pm = pm();
+        let before = read_timer(&mut pm);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let ticks = read_timer(&mut pm).wrapping_sub(before);
+        // 20 ms is about 71,600 ticks; allow for a slow scheduler, never for a stopped clock.
+        assert!(
+            (70_000..1_000_000).contains(&ticks),
+            "{ticks} ticks in 20 ms"
+        );
     }
 }

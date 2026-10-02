@@ -435,3 +435,64 @@ macOS build stopped compiling once they came in. Its bus-master gate is gated wi
 `src/arch/src/x86_64/linux/regs.rs` — `test_setup_sregs` gives its vCPU KVM's supported CPUID
 before setting long-mode sregs: KVM refuses `EFER.LME` (`EINVAL`) on a vCPU whose CPUID lacks
 long mode, as a fresh vCPU's does, so the test failed where the VMM itself works.
+
+### UEFI firmware and Windows guests
+
+`src/devices/src/legacy/acpi_pm.rs` + `src/arch/src/x86_64/acpi.rs` — the ACPI PM timer: a
+free-running 32-bit counter at 3.579545 MHz at `ACPI_PM_BASE + 8` (0x608), declared in the FADT
+(`PM_TMR_BLK`, `X_PM_TMR_BLK`, `TMR_VAL_EXT`). UEFI firmware's delays poll it (edk2's
+`AcpiTimerLib`), and Windows calibrates against it. Covered by
+`the_pm_timer_counts_at_3_58_mhz` and the FADT test.
+
+`src/devices/src/pci.rs` + `src/libkrun/src/vmm/device_manager/kvm/pci.rs` — a host bridge at
+00:00.0 (`PciHostBridge`, 8086:0d57, class 06/00/00, cloud-hypervisor's IDs). OVMF's CloudHv
+platform library identifies the platform by that function's device ID and stops in a dead
+loop on any other, or none; with it, `CLOUDHV.fd` (cloud-hypervisor's edk2 build, booted as a
+PVH ELF) reaches its boot manager. Covered by
+`the_host_bridge_identifies_itself_and_ignores_config_writes`.
+
+`src/arch/src/x86_64/{layout.rs,acpi.rs}` + `src/libkrun/src/vmm/{builder.rs,
+device_manager/kvm/pci.rs}` — the 32-bit hole starts at 3 GiB (1 GiB, as cloud-hypervisor lays
+it out) instead of 3.25 GiB. CloudHv firmware reassigns PCI BARs from 3 GiB up, where
+they landed on guest RAM (which reached 3.25 GiB) or, past it, on addresses nothing routed. The
+range 3 GiB–3.25 GiB is now a second BAR window (`PCI_MMIO32_LOW_*`), declared in the host
+bridge's `_CRS`, and virtio-mmio devices start above it (`MMIO_DEVICES_START`). Covered by
+`the_host_bridge_declares_the_low_bar_window`.
+
+`src/devices/src/legacy/x86_64/cmos.rs` — an MC146818 RTC on every host; upstream emulated it
+only on Windows hosts and served plain NVRAM elsewhere. Time fields read the host clock plus a
+guest-set offset. Register B selects BCD or binary and 12- or 24-hour mode; its SET bit holds
+the clock during field writes. Register A shows an update in progress in each second's last
+244 µs, C reads 0 and D reads valid-RAM-and-time. edk2's `PcRtc` reported "Device Error" against
+plain NVRAM and stopped the boot; Windows also reads and sets the clock through it. Memory-size
+bytes remain read-only. Covered by the tests in that file.
+
+`src/devices/src/virtio/pci.rs` — enabling a queue copies its size from `queue_size`, which
+resets to the maximum. edk2 leaves that register unchanged; the queue itself started at size 0,
+so requests remained pending, none could be popped and the block worker spun. Linux always
+writes the size, hiding the fault. Covered by
+`a_queue_enabled_without_a_size_write_keeps_the_maximum_size`.
+
+`src/arch/src/x86_64/acpi.rs` — the XSDT lists the FACS as well as the FADT pointing at it. edk2's
+CloudHv platform rebuilds the tables from the XSDT entries (plus the FADT's DSDT); a FACS it never
+saw makes its table driver zero the FADT's `FIRMWARE_CTRL`, and Windows stops on
+`ACPI_BIOS_ERROR (0x11, 3)`. Linux logs the FACS twice and is otherwise unaffected. Covered by
+`setup_acpi_places_an_aligned_facs` and `setup_acpi_adds_mcfg_to_xsdt`.
+
+`src/devices/src/virtio/console/device.rs` — reopening a running port is a no-op. Its queues
+move into its I/O threads on first open and keep running after a guest close. A second open
+found no queues and panicked the VMM ("port rx queue should exist"); Windows' qemu-ga closes
+and reopens its port. Covered by `a_port_the_guest_closes_and_reopens_keeps_running`.
+
+`src/arch/src/x86_64/acpi.rs` — the DSDT declares COM1 and COM2 only. COM3 and COM4 are still
+emulated (as sinks) but share COM1's and COM2's ISA IRQs, and Windows marks every port of a
+shared pair as conflicting (code 12), COM1 — the EMS console — included. QEMU declares the same
+two. Covered by `dsdt_declares_only_com1_and_com2`.
+
+`src/devices/src/virtio/pci.rs` — every virtio function has QEMU's subsystem IDs, `1AF4:1100`,
+instead of `1AF4:0040 + type`. virtio-win's INFs list `SUBSYS_11001AF4` hardware IDs; Windows
+binds its drivers through the generic ID anyway, but Windows Setup only installs onto a disk
+whose controller matches an exact hardware ID of the driver it was given, and refused a
+virtio-blk disk ("Windows needs the driver for device Red Hat VirtIO SCSI controller").
+Linux takes a modern device's type from its device ID and ignores the subsystem. Covered by
+`advertises_modern_virtio_identity_and_capabilities`.
