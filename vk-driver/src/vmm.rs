@@ -218,7 +218,7 @@ pub const DAX_TOTAL_MAX: u64 = 64 << 30;
 /// Most guest RAM, in MiB, that still leaves the span reachable. The span starts at a fixed
 /// `SHM_MEM_START` (64 GiB, same layout file as [`DAX_TOTAL_MAX`]) and a guest whose RAM
 /// reaches into it is given no span at all — its RAM would be where the windows go. The
-/// 512 MiB below 64 GiB is the 32-bit MMIO hole libkrun leaves under 4 GiB, which the guest's
+/// 768 MiB below 64 GiB is the 32-bit MMIO hole libkrun leaves under 4 GiB, which the guest's
 /// RAM is pushed above.
 pub const DAX_MAX_GUEST_MIB: u64 = 64768;
 
@@ -349,11 +349,11 @@ pub struct FsShare {
     pub host_dir: PathBuf,
     pub read_only: bool,
     /// This share's DAX window and file-size floor; `None` = no window. libkrun takes the
-    /// window as `krun_add_virtiofs5`'s `shm_size` and the floor as its `dax_inode_min`.
+    /// window as `FsDevice::set_dax_window_size` and the floor as `set_dax_inode_min`.
     #[serde(default)]
     pub dax: Option<DaxShare>,
     /// UID id-map spec strings (`type:from:to[:count]`) applied at the guest↔host boundary;
-    /// empty = identity, passed to `krun_add_virtiofs5`. `gid_map` is the same for GIDs.
+    /// empty = identity, passed to `FsDevice::set_id_maps`. `gid_map` is the same for GIDs.
     #[serde(default)]
     pub uid_map: Vec<String>,
     #[serde(default)]
@@ -524,7 +524,7 @@ pub enum Net {
 
 /// A libkrun virtio-net device backed by one switch-port unix stream. The switch natively
 /// speaks its qemu/passt framing: a 4-byte big-endian length followed by one ethernet frame.
-/// Attached with `krun_add_net_unixstream`. Attach order sets interface order.
+/// Attached with `NetDevice::new_unixstream_path`. Attach order sets interface order.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Nic {
     pub socket: PathBuf,
@@ -659,9 +659,8 @@ pub struct VmSpec {
     #[serde(default)]
     pub nics: Vec<Nic>,
     /// virtio-balloon with free-page reporting: the guest hands pages it frees back to
-    /// the host mid-run, so concurrent VMs can overcommit safely. libkrun attaches a
-    /// balloon by default; `false` opts out through the vendored `krun_disable_balloon`.
-    /// Costs one virtio-pci slot.
+    /// the host mid-run, so concurrent VMs can overcommit safely. Attached only when
+    /// set. Costs one virtio-pci slot.
     pub balloon: bool,
     /// Serial console log file (`--serial file=…`).
     pub serial_log: PathBuf,
@@ -672,14 +671,14 @@ pub struct VmSpec {
     #[serde(default)]
     pub console_serial: bool,
     /// Expose the guest PMU (`vk run --pmu`): the libkrun backend leaves CPUID
-    /// leaf 0xA as KVM reports it (vendored `krun_set_pmu` patch), so in-guest
+    /// leaf 0xA as KVM reports it (vendored `VmmBuilder::pmu` patch), so in-guest
     /// perf gets hardware counters via KVM's vPMU. Default off — host counters
     /// are a side-channel surface, for trusted dev VMs only.
     #[serde(default)]
     pub pmu: bool,
     /// Expose VMX/SVM to the guest (`vk run --nested`) so it can run KVM guests of
     /// its own — `vk` inside `vk`. The libkrun backend keeps the host's CPUID bit
-    /// (`krun_set_nested_virt`), which it otherwise masks. Default off: nesting widens the guest's
+    /// (`VmmBuilder::nested_virt`), which it otherwise masks. Default off: nesting widens the guest's
     /// attack surface on host KVM, and the host must allow it
     /// ([`host_nesting_enabled`]).
     #[serde(default)]
@@ -721,7 +720,7 @@ pub trait Vmm: Send {
 }
 
 /// libkrun: boots `spec` by re-execing this binary as a per-VM subprocess that links
-/// libkrun and drives its C API (see [`crate::libkrun_sys`]). Running it as a subprocess
+/// libkrun and drives its Rust API (see [`crate::libkrun_sys`]). Running it as a subprocess
 /// keeps the VM's lifecycle a held `Child` (`spawn_tied`), with no in-process VMM in the
 /// orchestrator.
 pub struct Libkrun;

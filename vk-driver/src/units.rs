@@ -799,7 +799,7 @@ pub fn boot_unit(
 /// Unlink `vsock` (the base path, a stale file from an older `vk`) and its exec-port suffix
 /// (`vsock.sock_<VSOCK_PORT>`) before a boot rebinds them — a repeat `vk service up`
 /// after a `down` reuses the same `dir`, and a stale file left over from the
-/// previous boot makes libkrun's `krun_add_vsock_port2` fail (EEXIST) even though
+/// previous boot makes libkrun's vsock port bind fail (EEXIST) even though
 /// nothing is listening on it any more.
 ///
 /// Deliberately narrower than `run::remove_stale_sockets`: it must NOT touch the
@@ -810,7 +810,7 @@ pub fn boot_unit(
 /// switch is never coming back to redial a path this unit's own restart erased.
 fn remove_stale_exec_socket(vsock: &Path) {
     // Best-effort: absent is the common case (first boot), and any file this fails
-    // to remove surfaces immediately as EEXIST from `krun_add_vsock_port2` on bind.
+    // to remove surfaces immediately as EEXIST from libkrun's vsock bind.
     let _ = std::fs::remove_file(vsock);
     let _ = std::fs::remove_file(vk_core::net::hybrid_socket(vsock, VSOCK_PORT));
 }
