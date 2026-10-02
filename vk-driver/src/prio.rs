@@ -27,7 +27,7 @@
 //!   still at the driver's own priority. [`lower_this_thread`] debug-asserts that it has.
 //!
 //! What is deferred, then: the stage guests (a VMM subprocess, so its vCPU threads with it)
-//! and the switch and virtiofsd serving them, and the parallel stage workers, whose own
+//! and the switch serving them, and the parallel stage workers, whose own
 //! [`crate::blockrt`] calls — the image pulls and cache pushes — inherit it. What is not: the
 //! driver's own orchestration, including the final ext4 export, which runs on the thread that
 //! drove the stages and goes on to boot a `vk run -f Dockerfile`'s guest; the threads those
@@ -138,7 +138,7 @@ pub(crate) fn lower_this_thread() {
 /// [`crate::spawn::spawn_tied`] goes through, and the shared runtime behind
 /// [`crate::blockrt`]. Both are shared with the paths a user waits on, and a thread born
 /// inside a deferred build would carry that priority, with no way back, to every `vk run`
-/// guest, switch and virtiofsd of a `vk run -f Dockerfile` that builds first and boots after.
+/// guest and switch of a `vk run -f Dockerfile` that builds first and boots after.
 ///
 /// Call it once, before any thread defers itself — [`crate::build`] does, on the thread that
 /// spawns the stage workers, which is the only place [`lower_this_thread`] is reached from
@@ -336,7 +336,7 @@ mod tests {
     /// Every helper is forked from the one shared spawner thread, so what a deferred build
     /// worker asks for must not follow the *next* caller's helper out. A `vk run -f
     /// Dockerfile` builds and then boots in one process: its stage helpers go through that
-    /// thread first, and the guest's own switch, virtiofsd and VMM must still come up
+    /// thread first, and the guest's own switch and VMM must still come up
     /// undeferred. Spawned from inside the deferred thread, which is where a worker spawns
     /// them and where an unpinned spawner thread would be born.
     #[test]

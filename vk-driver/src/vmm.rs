@@ -455,8 +455,8 @@ pub enum ShareCache {
 const IMMUTABLE_TIMEOUT_MS: u32 = 86_400_000;
 
 /// libkrun's `krun_add_virtiofs7` cache ABI (`krun::KRUN_FS_CACHE_*`,
-/// `krun::KRUN_FS_TIMEOUT_DEFAULT_MS`), mirrored so the virtiofsd path can name these codes
-/// without the optional `libkrun` feature. The assertion below fails the build if they drift.
+/// `krun::KRUN_FS_TIMEOUT_DEFAULT_MS`), mirrored for share helpers and tests without the
+/// optional `libkrun` feature. The assertion below fails the build if they drift.
 const KRUN_CACHE_AUTO: u32 = 1;
 const KRUN_CACHE_ALWAYS: u32 = 2;
 const KRUN_TIMEOUT_DEFAULT_MS: u32 = 5_000;
@@ -516,25 +516,6 @@ impl ShareCache {
     /// guest stops sending them. Only for a tree discarded with the VM.
     pub fn no_sync(self) -> bool {
         matches!(self, ShareCache::Ephemeral)
-    }
-
-    /// Arguments for the bundled `vk virtiofsd` to serve this cache mode.
-    pub fn virtiofsd_args(self) -> Vec<String> {
-        let (entry, attr, negative) = self.timeouts_ms();
-        let policy = match self {
-            ShareCache::Auto => "auto",
-            ShareCache::Immutable | ShareCache::Ephemeral => "always",
-        };
-        let mut args = vec![
-            format!("--cache={policy}"),
-            format!("--entry-timeout-ms={entry}"),
-            format!("--attr-timeout-ms={attr}"),
-            format!("--negative-timeout-ms={negative}"),
-        ];
-        if !self.xattr() {
-            args.push("--no-xattr".to_string());
-        }
-        args
     }
 }
 
@@ -1293,22 +1274,9 @@ mod tests {
     fn an_immutable_share_is_served_cache_always_with_day_long_validity() {
         assert_eq!(ShareCache::Auto.krun_policy(), KRUN_CACHE_AUTO);
         assert_eq!(ShareCache::Auto.timeouts_ms(), (5_000, 5_000, 0));
-        assert_eq!(
-            ShareCache::Auto.virtiofsd_args(),
-            [
-                "--cache=auto",
-                "--entry-timeout-ms=5000",
-                "--attr-timeout-ms=5000",
-                "--negative-timeout-ms=0"
-            ]
-        );
         assert_eq!(ShareCache::Immutable.krun_policy(), KRUN_CACHE_ALWAYS);
         let day = 86_400_000;
         assert_eq!(ShareCache::Immutable.timeouts_ms(), (day, day, day));
-        assert_eq!(
-            ShareCache::Immutable.virtiofsd_args()[0..2],
-            ["--cache=always", "--entry-timeout-ms=86400000"]
-        );
         assert!(ShareCache::Auto.xattr());
         assert!(!ShareCache::Immutable.xattr());
         // An ephemeral share caches like an immutable one and adds the write-side savings.
@@ -1318,16 +1286,6 @@ mod tests {
         assert!(ShareCache::Ephemeral.writeback() && ShareCache::Ephemeral.no_sync());
         assert!(!ShareCache::Auto.writeback() && !ShareCache::Auto.no_sync());
         assert!(!ShareCache::Immutable.writeback() && !ShareCache::Immutable.no_sync());
-        assert!(
-            !ShareCache::Auto
-                .virtiofsd_args()
-                .contains(&"--no-xattr".to_string())
-        );
-        assert!(
-            ShareCache::Immutable
-                .virtiofsd_args()
-                .contains(&"--no-xattr".to_string())
-        );
         // Specs predating the cache field retain the default caching policy.
         let spec: FsShare =
             serde_json::from_str(r#"{"tag":"t","socket":"/s","host_dir":"/h","read_only":true}"#)

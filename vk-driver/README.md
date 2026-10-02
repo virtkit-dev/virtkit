@@ -119,7 +119,6 @@ vk registry pull runner:20260625
 | `forward` | Accept on `--listen`, splice to `--to` (opaque byte forwarder). |
 | `launch` | Dev: boot any Docker/OCI image as a microVM in one command. |
 | `docker-hash` | Compute a content hash for each Dockerfile stage. |
-| `virtiofsd` | The bundled vhost-user virtio-fs daemon (passed through to Cloud Hypervisor). |
 
 ---
 

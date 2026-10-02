@@ -42,9 +42,7 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with nine crates:
   (OCI → ext4/initramfs), the compose service runner + control plane, the GitLab executor,
   the userspace L2 network switch (ARP/DHCP/DNS + transparent TCP/UDP egress via
   `ipstack`), the libkrun VMM backend (`vmm`/`libkrun_sys`, default; the pinned guest
-  kernel and vk-agent are embedded so `vk` runs self-contained), and a bundled
-  virtio-fs daemon (`virtiofsd`, serving cloud-hypervisor shares with the vendored
-  libkrun fs engine).
+  kernel and vk-agent are embedded so `vk` runs self-contained).
 - **`vk-agent/`** — the guest PID 1 / agent (depends on `vk-core`): brings a systemd-less
   guest up (mounts, networking, hostname, virtio-fs, optional SSH) and serves an exec
   channel over `vsock` so the host can run commands inside the VM.

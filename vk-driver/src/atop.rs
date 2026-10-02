@@ -441,7 +441,7 @@ pub fn compress_job_log(ctx: &JobCtx) {
     if crate::vm::live_supervisor_pid(ctx).is_some() {
         return;
     }
-    // A SIGKILLed supervisor's virtiofsd and VMM get their `PDEATHSIG` asynchronously, so a last
+    // A SIGKILLed supervisor's VMM gets its `PDEATHSIG` asynchronously, so a last
     // guest write can land after this point: one while the log is read breaks the pledged size
     // and leaves it plain; one after its end is read and before the unlink is lost. The signals
     // land within moments of the supervisor's exit; that is the whole window.

@@ -84,8 +84,6 @@ mod timing;
 mod toolchain;
 mod units;
 mod usage;
-#[cfg(feature = "virtiofsd")]
-mod virtiofsd;
 mod vm;
 mod vmdk;
 mod vmm;
@@ -315,7 +313,7 @@ enum GitlabCmd {
     },
     /// internal: the detached per-job supervisor prepare spawns
     ///
-    /// It owns the job's switch/virtiofsds/forwards/VMM as tied children until cleanup
+    /// It owns the job's switch/forwards/VMM as tied children until cleanup
     /// SIGTERMs it.
     #[command(hide = true)]
     Supervise {
@@ -2339,9 +2337,6 @@ enum Cmd {
         label: Option<String>,
     },
     /// List the advanced/plumbing commands `vk --help` hides, with the everyday ones
-    ///
-    /// (`vk virtiofsd` dispatches on raw argv before this CLI and appears in neither help; see
-    /// the README.)
     #[command(hide = true)]
     HelpAll,
     /// Dev: pull an OCI image from a registry (no docker) and flatten it to a rootfs tar
@@ -2376,23 +2371,8 @@ fn main() -> ExitCode {
     // else: vk serves each guest's virtio-fs shares in-process (libkrun's built-in fs opens
     // a host fd per accessed shared file — and this same binary re-execs as the libkrun
     // boot child to run the VMM), so a heavy build (`cargo`/`make -j` on a shared workdir) needs far
-    // more than a login shell's default soft limit, else the guest sees EMFILE. The separate
-    // virtiofsd path already does this (see the virtiofsd module); the built-in path did not.
+    // more than a login shell's default soft limit, else the guest sees EMFILE.
     raise_nofile();
-
-    // `vk virtiofsd …` — the bundled vhost-user virtio-fs daemon. Dispatched
-    // before the clap CLI / config load (it takes virtiofsd's own flags and needs no
-    // executor config); the spawned daemon blocks until the VMM disconnects.
-    #[cfg(feature = "virtiofsd")]
-    {
-        let args: Vec<String> = std::env::args().collect();
-        if args.get(1).map(String::as_str) == Some("virtiofsd") {
-            return match virtiofsd::run(args[1..].to_vec()) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(&e, 1),
-            };
-        }
-    }
 
     // libkrun boot child — internal: boot one microVM under libkrun (the Libkrun Vmm
     // backend re-execs this binary per VM, passing the spec in BOOT_SPEC_ENV so argv is

@@ -16,7 +16,7 @@ use vk_core::addr::SocketAddr;
 use vk_core::fleetctl::{Frame, Reply, Request, UnitStatus};
 
 /// A declared service unit, its runtime dir (sockets/overlay/console), its running
-/// VMM child (if started), and the virtiofsd children backing its volume shares.
+/// VMM child (if started), and the socket-forward children backing its socket volumes.
 struct UnitState {
     svc: crate::units::Provisioned,
     dir: PathBuf,
@@ -374,7 +374,7 @@ impl Manager {
                 &mut child,
             )]);
         }
-        // tear down the unit's virtiofsd backers (workdir units), if any
+        // tear down the unit's socket forwards, if any
         for mut a in st.aux.drain(..) {
             let _ = a.kill();
             let _ = a.wait();

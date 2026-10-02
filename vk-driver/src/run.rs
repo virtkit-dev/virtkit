@@ -625,7 +625,7 @@ pub(crate) fn default_scratch_base() -> Result<PathBuf> {
 pub(crate) use vk_core::unixpath::SUN_PATH_MAX;
 
 /// The longest socket name the VMM itself binds or dials in a state dir — the vsock socket of
-/// the highest port a bridged or published port can take; a virtiofsd volume socket
+/// the highest port a bridged or published port can take; a virtio-fs volume socket
 /// (`vfsd-vol<i>.sock`) only overtakes it past 1000 volumes. The host-only control socket
 /// (`vsock.sock_1099.host`) is longer, but only `vk` binds and dials it, through the
 /// `/proc/self/fd` fallback of `vk_core::unixpath`.
@@ -913,7 +913,7 @@ impl Drop for WorkDir {
 }
 
 /// Unlink a previous run's socket files (`vsock.sock`, `vsock.sock_<port>`,
-/// virtiofsd sockets, …) from a reused `--state-dir`, one level deep (the
+/// virtio-fs share sockets, …) from a reused `--state-dir`, one level deep (the
 /// per-service `svc-*` dirs hold their own). A stale unix socket file makes the
 /// next bind fail, so this must run before anything listens; everything else in
 /// the directory is left alone — it may be the caller's. Safe here specifically
@@ -1929,7 +1929,7 @@ async fn build_and_boot(
     }
 
     // Working directory: share a host dir read-write over virtiofs at WORKDIR_MOUNT (no uid
-    // map — virtiofsd's `--sandbox=none` writes back as the host
+    // map — the in-process virtio-fs writes back as the host
     // user), so the guest command reads/writes the live tree and its outputs land on the
     // host. The command then runs with its cwd there (see `drive`). virtio-fs needs shared
     // guest memory, so `mem` gains `shared=on`.
@@ -1937,7 +1937,7 @@ async fn build_and_boot(
     // The DAX window each directory share gets: the guest maps the host page cache through
     // it instead of copying file data into its own, so a tree read twice is read once.
     let dax = dax_share(marker_dax, args.dax, crate::vmm::libkrun_selected());
-    // Host-side helpers killed by `teardown_run`: virtiofsd and socket forwarders.
+    // Host-side helpers killed by `teardown_run`: the socket forwarders.
     let mut aux_children: Vec<Child> = Vec::new();
     let mut virtiofs = String::new();
     if let Some(host_dir) = &args.workdir {
@@ -1947,19 +1947,6 @@ async fn build_and_boot(
             bail!("{}: the host path is a file, not a directory", at());
         }
         let sock = work.join("workdir.fs.sock");
-        // libkrun mounts host_dir directly (built-in virtio-fs); only cloud-hypervisor
-        // needs the external virtiofsd on `sock`.
-        if !crate::vmm::libkrun_selected() {
-            aux_children.push(crate::spawn::spawn_virtiofsd(
-                &sock,
-                host_dir,
-                false,
-                &[],
-                &[],
-                args.workdir_cache,
-                crate::prio::Prio::Normal,
-            )?);
-        }
         virtiofs.push_str(&format!("work:{WORKDIR_MOUNT}"));
         shares.push(crate::vmm::FsShare {
             tag: "work".into(),
@@ -2040,20 +2027,6 @@ async fn build_and_boot(
         }
         let tag = format!("vol{i}");
         let sock = work.join(format!("vfsd-{tag}.sock"));
-        // cloud-hypervisor serves each share through an external virtiofsd (libkrun serves in
-        // process). Single-file binds work on both: the single-file fs runs in-process under
-        // libkrun and inside `vk virtiofsd` over vhost-user under cloud-hypervisor.
-        if !crate::vmm::libkrun_selected() {
-            aux_children.push(crate::spawn::spawn_virtiofsd(
-                &sock,
-                &vol.host,
-                vol.read_only,
-                &[],
-                &[],
-                vol.cache(),
-                crate::prio::Prio::Normal,
-            )?);
-        }
         let mount_at = if vol.is_file {
             // virtio-fs shares a directory, so mount the single-file share at a hidden dir and
             // symlink the guest target to the file inside it.
@@ -2144,17 +2117,6 @@ async fn build_and_boot(
             }
             _atop_lock = held;
             let sock = work.join("atop.fs.sock");
-            if !crate::vmm::libkrun_selected() {
-                aux_children.push(crate::spawn::spawn_virtiofsd(
-                    &sock,
-                    &dir,
-                    false,
-                    &[],
-                    &[],
-                    crate::vmm::ShareCache::Auto,
-                    crate::prio::Prio::Normal,
-                )?);
-            }
             shares.push(crate::vmm::FsShare {
                 tag: vk_core::atop::TAG.into(),
                 socket: sock,
@@ -2334,10 +2296,9 @@ async fn build_and_boot(
     }
     let mut ch = match spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal) {
         Ok(ch) => ch,
-        // The --net switch and the aux children (--workdir plus any --primary compose
-        // volumes) are already spawned; kill them so a failed boot does not leak
-        // host-side children (a leaked `vk virtiofsd` would, e.g., hold this binary's
-        // file busy for the next build).
+        // The --net switch and the aux children (socket forwards) are already spawned; kill
+        // them so a failed boot does not leak host-side children (a leaked `vk forward`
+        // would, e.g., hold this binary's file busy for the next build).
         Err(e) => {
             if let Some(mgr) = &manager {
                 mgr.stop_all();
@@ -2698,7 +2659,7 @@ impl<'a> PowerOff<'a> {
 /// Tear down every host-side child a run spawned — the VMM, the service manager, the
 /// --net switch and the aux children, and the ssh-agent / host-exec forwards.
 /// Used on both a clean exit and any error after the VMM is live, so a failed run leaks no
-/// children (a leaked `vk virtiofsd` would hold this binary's file busy for the next build).
+/// children (a leaked `vk forward` would hold this binary's file busy for the next build).
 ///
 /// Unless `primary` is [`PowerOff::Skip`], power the primary off as far as it has not been
 /// and wait until the `shutdown::STOP_GRACE` deadline before killing it. The services power
@@ -4384,8 +4345,6 @@ pub(crate) struct VmSession {
     /// IS the stage's result (no separate boot overlay to commit back).
     image: PathBuf,
     switch: Option<Child>,
-    /// virtiofsd serving the build context (for `COPY` from the context), if any.
-    virtiofsd: Option<Child>,
     work: PathBuf,
     /// Guest device of the ephemeral `--mount=from=scratch` disk (e.g. `/dev/vde`), when one
     /// was attached; `None` = this guest has no writable scratch disk. The executor mounts it
@@ -4709,20 +4668,8 @@ pub(crate) async fn boot_session(
     // Build context for COPY from the context: served read-only over virtiofs and
     // mounted by the agent at CONTEXT_MOUNT (it reads VIRTKIT_VIRTIOFS at boot).
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
-    let mut virtiofsd: Option<Child> = None;
     if let Some(ctx) = context {
         let sock = work.join("context.fs.sock");
-        if !crate::vmm::libkrun_selected() {
-            virtiofsd = Some(crate::spawn::spawn_virtiofsd(
-                &sock,
-                ctx,
-                true,
-                &[],
-                &[],
-                crate::vmm::ShareCache::Auto,
-                crate::prio::Prio::Build,
-            )?);
-        }
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS=context:{CONTEXT_MOUNT}"));
         shares.push(crate::vmm::FsShare {
             tag: "context".into(),
@@ -4830,7 +4777,7 @@ pub(crate) async fn boot_session(
         if Instant::now() >= deadline {
             let _ = ch.kill();
             let _ = ch.wait();
-            for c in [switch.as_mut(), virtiofsd.as_mut()].into_iter().flatten() {
+            if let Some(c) = switch.as_mut() {
                 let _ = c.kill();
                 let _ = c.wait();
             }
@@ -4848,7 +4795,6 @@ pub(crate) async fn boot_session(
         addr,
         image: image.to_path_buf(),
         switch,
-        virtiofsd,
         work: work.keep(),
         scratch_dev,
         dirty_socket,
@@ -5110,10 +5056,6 @@ impl VmSession {
         if let Some(c) = self.switch.take() {
             stop_switch(c);
         }
-        if let Some(c) = self.virtiofsd.as_mut() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
         let _ = std::fs::remove_dir_all(&self.work);
         Ok(())
     }
@@ -5129,10 +5071,6 @@ impl Drop for VmSession {
         // in the channel, and the build reads the channel after every stage has gone.
         if let Some(c) = self.switch.take() {
             stop_switch(c);
-        }
-        if let Some(c) = self.virtiofsd.as_mut() {
-            let _ = c.kill();
-            let _ = c.wait();
         }
         let _ = std::fs::remove_dir_all(&self.work);
     }

@@ -513,7 +513,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
 
     // ONE detached process owns the job from here (the runner protocol requires
     // this stage to exit — ready is signaled by exiting 0): the supervisor spawns
-    // the switch/virtiofsds/forwards/VMM as tied children, supervises them, and
+    // the switch/forwards/VMM as tied children, supervises them, and
     // tears everything down on SIGTERM (cleanup) or by dying. The job dir on its
     // cmdline is the pid-reuse guard for the later signal.
     let mut sup_cmd = Command::new(crate::spawn::self_exe());
@@ -1193,7 +1193,7 @@ fn build_compose_unit(
 }
 
 /// The detached job supervisor (`vk gitlab supervise <job_dir>`, spawned by
-/// prepare): assembles and boots everything the job needs — switch, virtiofsds,
+/// prepare): assembles and boots everything the job needs — switch,
 /// forwards, the VMM — as tied children (PDEATHSIG), then supervises. SIGTERM
 /// (cleanup, or the stale-state sweep) shuts the guest down gracefully and exits;
 /// the children cascade. Readiness is prepare's business (it polls the agent).
@@ -1318,20 +1318,6 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             .resolve_share(share)
             .with_context(|| format!("resolving share root {}", share.dir.display()))?;
         let vfsd_sock = ctx.vfsd_sock();
-        // libkrun mounts the host dir directly (built-in virtio-fs); only
-        // cloud-hypervisor needs an external virtiofsd on the socket.
-        if !crate::vmm::libkrun_selected() {
-            let mut vfsd = cfg.virtiofsd_command(); // bundled `vk virtiofsd` unless configured
-            vfsd.arg(format!("--socket-path={}", vfsd_sock.display()))
-                .arg(format!("--shared-dir={}", dir.display()))
-                .args(["--cache=auto", "--sandbox=none"]);
-            if share.readonly {
-                vfsd.arg("--readonly");
-            }
-            children.push(spawn_tied_logged(vfsd, &ctx.vfsd_log()).context("spawning virtiofsd")?);
-            wait_for_socket(&vfsd_sock, Duration::from_secs(5))
-                .context("virtiofsd did not create its socket")?;
-        }
         shares.push(crate::vmm::FsShare {
             tag: "workdir".into(),
             socket: vfsd_sock,
@@ -1354,18 +1340,6 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         // Best-effort: without it the report names only the configured tools_dir.
         let _ = std::fs::write(ctx.tools_root_file(), dir.as_os_str().as_bytes());
         let sock = ctx.tools_vfsd_sock();
-        if !crate::vmm::libkrun_selected() {
-            let mut vfsd = cfg.virtiofsd_command();
-            vfsd.arg(format!("--socket-path={}", sock.display()))
-                .arg(format!("--shared-dir={}", dir.display()))
-                .args(["--cache=auto", "--sandbox=none", "--readonly"]);
-            children.push(
-                spawn_tied_logged(vfsd, &ctx.tools_vfsd_log())
-                    .context("spawning the tools virtiofsd")?,
-            );
-            wait_for_socket(&sock, Duration::from_secs(5))
-                .context("the tools virtiofsd did not create its socket")?;
-        }
         shares.push(crate::vmm::FsShare {
             tag: "vktools".into(),
             socket: sock,
@@ -1467,28 +1441,6 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             None
         };
 
-        if !crate::vmm::libkrun_selected() {
-            let mut vfsd = cfg.virtiofsd_command();
-            vfsd.arg(format!("--socket-path={}", sock.display()))
-                .arg(format!("--shared-dir={}", host_dir.display()))
-                .args(cache.virtiofsd_args())
-                .arg("--sandbox=none");
-            if overlay {
-                vfsd.arg("--readonly");
-            }
-            for m in &uid_map {
-                vfsd.arg(format!("--uid-map={m}"));
-            }
-            for m in &gid_map {
-                vfsd.arg(format!("--gid-map={m}"));
-            }
-            children.push(
-                spawn_tied_logged(vfsd, &ctx.job_dir.join("cibuild-vfsd.log"))
-                    .context("spawning the checkout virtiofsd")?,
-            );
-            wait_for_socket(&sock, Duration::from_secs(5))
-                .context("the checkout virtiofsd did not create its socket")?;
-        }
         shares.push(crate::vmm::FsShare {
             tag: CIBUILD_TAG.into(),
             socket: sock,
@@ -1502,19 +1454,6 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         // Keep the tar outside the checkout, on a private read-only share removed with the job.
         if let Some(seed_dir) = &seed_dir {
             let sock = ctx.job_dir.join("cicheckout-vfsd.sock");
-            if !crate::vmm::libkrun_selected() {
-                let mut vfsd = cfg.virtiofsd_command();
-                vfsd.arg(format!("--socket-path={}", sock.display()))
-                    .arg(format!("--shared-dir={}", seed_dir.display()))
-                    .args(crate::vmm::ShareCache::Immutable.virtiofsd_args())
-                    .args(["--sandbox=none", "--readonly"]);
-                children.push(
-                    spawn_tied_logged(vfsd, &ctx.job_dir.join("cicheckout-vfsd.log"))
-                        .context("spawning the checkout seed virtiofsd")?,
-                );
-                wait_for_socket(&sock, Duration::from_secs(5))
-                    .context("the checkout seed virtiofsd did not create its socket")?;
-            }
             shares.push(crate::vmm::FsShare {
                 tag: CICHECKOUT_TAG.into(),
                 socket: sock,
@@ -1540,47 +1479,22 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // knob on the cmdline is what starts the sampler at all.
     if let Some(dir) = crate::atop::job_archive_dir(ctx) {
         let sock = ctx.atop_vfsd_sock();
-        // Recording is optional and on by default, so a share that will not start costs the
-        // job its statistics and nothing else — it must never be the reason a job fails.
-        let mut recording = true;
-        if !crate::vmm::libkrun_selected() {
-            let mut vfsd = cfg.virtiofsd_command();
-            vfsd.arg(format!("--socket-path={}", sock.display()))
-                .arg(format!("--shared-dir={}", dir.display()))
-                .args(["--cache=auto", "--sandbox=none"]);
-            match spawn_tied_logged(vfsd, &ctx.atop_vfsd_log()) {
-                Ok(child) => children.push(child),
-                Err(e) => {
-                    eprintln!("virtkit: warning: not recording guest stats: {e:#}");
-                    recording = false;
-                }
-            }
-            if recording && let Err(e) = wait_for_socket(&sock, Duration::from_secs(5)) {
-                eprintln!(
-                    "virtkit: warning: not recording guest stats: the stats virtiofsd did not \
-                     create its socket: {e:#}"
-                );
-                recording = false;
-            }
-        }
         // Both together or neither: the share with no knob mounts an archive nothing writes
         // to, and the knob with no share starts a sampler with nowhere to write.
-        if recording {
-            shares.push(crate::vmm::FsShare {
-                tag: vk_core::atop::TAG.into(),
-                socket: sock,
-                host_dir: dir,
-                read_only: false,
-                dax: None,
-                uid_map: Vec::new(),
-                gid_map: Vec::new(),
-                cache: crate::vmm::ShareCache::Auto,
-            });
-            crate::run::push_knob(
-                &mut cmdline,
-                &vk_core::atop::cmdline_knob(crate::atop::interval_secs(cfg)?),
-            );
-        }
+        shares.push(crate::vmm::FsShare {
+            tag: vk_core::atop::TAG.into(),
+            socket: sock,
+            host_dir: dir,
+            read_only: false,
+            dax: None,
+            uid_map: Vec::new(),
+            gid_map: Vec::new(),
+            cache: crate::vmm::ShareCache::Auto,
+        });
+        crate::run::push_knob(
+            &mut cmdline,
+            &vk_core::atop::cmdline_knob(crate::atop::interval_secs(cfg)?),
+        );
     }
 
     // Charged before the tag list is built: a share whose window will not fit must not be
@@ -1843,8 +1757,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
                     stop_helpers(children, switch_pid);
                     bail!("{} exited ({status})", vmm.name());
                 }
-                // any owned helper dying (the switch, a service VM, a virtiofsd,
-                // a forward) leaves a broken job: fail loudly rather than limp.
+                // any owned helper dying (the switch, a service VM, a forward) leaves a
+                // broken job: fail loudly rather than limp.
                 for c in &mut children {
                     if let Some(status) = c.try_wait()? {
                         graceful_vmm_stop(ctx, &mut vmm_child);
@@ -2773,7 +2687,7 @@ pub(crate) fn live_job_supervisors(jobs_dir: &Path) -> Result<Vec<(PathBuf, i32)
 }
 
 /// Signal the job's supervisor and wait for it to go — everything it owns (the
-/// switch, virtiofsds, forwards, the VMM after its graceful guest shutdown)
+/// switch, forwards, the VMM after its graceful guest shutdown)
 /// follows, by its TERM handler or by PDEATHSIG. Idempotent: tolerates a missing
 /// or stale pidfile (the job-dir cmdline tag guards against pid reuse).
 pub fn stop_supervisor(ctx: &JobCtx) {
@@ -3258,17 +3172,6 @@ fn fd_dir(fd: std::os::fd::BorrowedFd<'_>) -> Result<(PathBuf, DirId)> {
         );
     }
     bail!("{} changed while it was being resolved", path.display());
-}
-
-fn wait_for_socket(path: &Path, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    while !path.exists() {
-        if Instant::now() >= deadline {
-            bail!("{} did not appear within {timeout:?}", path.display());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Ok(())
 }
 
 fn read_pidfile(path: &Path) -> Option<i32> {

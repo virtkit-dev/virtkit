@@ -144,7 +144,7 @@ out is counted, and the hub shows the count.
 
 Each VM's host memory travels beside the list — on a node, on the heartbeat — keyed by the
 entry's ID, which derives from its state dir. It is the managing process's whole tree — guest,
-compose services, switch, virtiofsd — counted proportionally (`Pss` from `smaps_rollup`, else
+compose services, switch, forwards — counted proportionally (`Pss` from `smaps_rollup`, else
 `VmRSS`), the figure `vk list` and `vk dev list` show. Reading it walks every page table of
 every process, so it is measured as a VM appears and every `[node] workload_mem_secs`
 (`--mem-secs` for `vk workloads`; 30 by default). Between measurements, and while a new

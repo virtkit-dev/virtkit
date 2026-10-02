@@ -446,9 +446,9 @@ PID    UPTIME  MEM       NAME                SERVICES            PROJECT  PUBLIS
 ```
 
 MEM is what the VM is costing the host now over the size it booted with: the resident
-memory of its whole process tree — the guest, its service VMs, the switch, the virtiofsds
-and the forwards — counted proportionally so a page several of them map is charged once,
-over the `--mem` token as the run recorded it. When proportional usage is unavailable,
+memory of its whole process tree — the guest, its service VMs, the switch and the
+forwards — counted proportionally so a page several of them map is charged once, over the
+`--mem` token as the run recorded it. When proportional usage is unavailable,
 resident usage is used instead and may count shared pages more than once. The total includes
 service VMs and helpers, so it is not the primary guest's memory utilization.
 Either half is `-` on its own when unknown,
@@ -677,7 +677,7 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 
 Advanced commands are listed by `vk help-all`. They include the stdio/vsock connector,
 network forwarding processes, SSH agent proxy, path inspection, OCI/ext4 conversion
-tools, image fingerprinting, and the bundled Cloud Hypervisor `virtiofsd`.
+tools, and image fingerprinting.
 
 ## Configuration
 

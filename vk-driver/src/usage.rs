@@ -4,7 +4,7 @@
 //! Each phase is measured the way its own processes allow:
 //!
 //! - a **job's** microVM ([`tree`]) is a live process tree — the VMM, the service VMs, the
-//!   switch, the virtiofsds, the forwards, all tied children of the job supervisor — read
+//!   switch, the forwards, all tied children of the job supervisor — read
 //!   from `/proc` while it runs. The supervisor is detached and no `run` stage waits for
 //!   it, so there is no `rusage` to collect; by the time it is reaped (cleanup) the job
 //!   trace is already closed.
@@ -701,7 +701,7 @@ pub(crate) fn allocated_bytes(dir: &std::path::Path) -> Option<u64> {
 
 /// The memory a process tree holds *now*, in bytes — `root` and every process descending
 /// from it, which for a VM is the guest, its compose service VMs, the switch, the
-/// virtiofsds and the forwards. The live figure [`Usage::peak_rss`] deliberately is not:
+/// forwards. The live figure [`Usage::peak_rss`] deliberately is not:
 /// `vk list` reports what a VM is costing the host at this moment, not the demand it once
 /// passed through.
 ///

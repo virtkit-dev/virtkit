@@ -270,7 +270,7 @@ impl JobCtx {
         self.job_dir.join("vfsd.sock")
     }
     /// The job supervisor — the ONE detached process owning every helper (switch,
-    /// virtiofsds, forwards, the VMM) as tied children. It writes this pidfile
+    /// forwards, the VMM) as tied children. It writes this pidfile
     /// itself at startup; cleanup and the stale-state sweep signal it, and
     /// everything else cascades (PDEATHSIG).
     pub fn supervisor_pidfile(&self) -> PathBuf {
@@ -295,17 +295,11 @@ impl JobCtx {
     pub fn net_lease(&self) -> PathBuf {
         self.job_dir.join("net.lease")
     }
-    pub fn vfsd_log(&self) -> PathBuf {
-        self.job_dir.join("vfsd.log")
-    }
-    /// Second virtiofsd, read-only, exporting the `[executor] tools_dir` CI tools into the
-    /// job VM (the agent links them onto the guest PATH). Separate socket/pid/log
-    /// from the dev `[executor.share]` virtiofsd.
+    /// Read-only share exporting the `[executor] tools_dir` CI tools into the job VM (the
+    /// agent links them onto the guest PATH), with its own socket, apart from the
+    /// `[executor.share]` one.
     pub fn tools_vfsd_sock(&self) -> PathBuf {
         self.job_dir.join("tools-vfsd.sock")
-    }
-    pub fn tools_vfsd_log(&self) -> PathBuf {
-        self.job_dir.join("tools-vfsd.log")
     }
     /// The directory `[executor] tools_dir` resolved to at boot, recorded by the supervisor.
     /// Prepare runs separately and must report that directory even if the link is repointed.
@@ -322,13 +316,10 @@ impl JobCtx {
     pub fn atop_dir_file_in(job_dir: &Path) -> PathBuf {
         job_dir.join("atop.dir")
     }
-    /// Third virtiofsd, read-write, exporting this job's archive directory into the
-    /// guest so its sampler can append to the log there.
+    /// Read-write share exporting this job's archive directory into the guest so its
+    /// sampler can append to the log there.
     pub fn atop_vfsd_sock(&self) -> PathBuf {
         self.job_dir.join("atop-vfsd.sock")
-    }
-    pub fn atop_vfsd_log(&self) -> PathBuf {
-        self.job_dir.join("atop-vfsd.log")
     }
     /// This job's directory inside a day of the statistics archive:
     /// `<job id>-<project>-<job name>`. The id leads because it is unique per CI run — two

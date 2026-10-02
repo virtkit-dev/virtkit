@@ -8,8 +8,10 @@ All notable changes to virtkit will be documented in this file.
 
 - **Breaking: cloud-hypervisor can no longer be selected.** Every VM boots on the embedded
   libkrun VMM, so guests it cannot boot (e.g. Windows) are no longer supported.
-  `VIRTKIT_VMM=cloud-hypervisor` and the config's `vmm = "cloud-hypervisor"` are ignored
-  with a warning; drop them. Upgrade with no cloud-hypervisor jobs in flight.
+  `VIRTKIT_VMM=cloud-hypervisor`, the config's `vmm = "cloud-hypervisor"` and its
+  `virtiofsd` key are ignored with a warning; drop them. The bundled `vk virtiofsd` daemon
+  and the `virtiofsd` build feature are removed. Upgrade with no cloud-hypervisor jobs in
+  flight.
 
 ## [0.83.0] - 2026-10-05
 

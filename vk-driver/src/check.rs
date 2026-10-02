@@ -35,7 +35,7 @@ pub enum Feature {
     Registry,
     /// gitlab executor: state and tools dirs usable, guest stats and nesting supported
     Gitlab,
-    /// [executor.share]: shared dir readable, a virtiofsd available when needed
+    /// [executor.share]: shared dir readable, and served over virtio-fs
     Share,
     /// CI `services:`: the shared image cache they pull into is writable
     Services,
@@ -1243,19 +1243,12 @@ fn share(cfg: &Config) -> Outcome {
         Ok((_, shown)) => shown,
         Err(e) => return fail(format!("share dir {e}")),
     };
-    let served = if crate::vmm::libkrun_selected() {
-        "virtio-fs built into libkrun".to_string()
-    } else if let Some(p) = &cfg.virtiofsd {
-        match resolve_bin(p) {
-            Some(p) => format!("virtiofsd: {}", p.display()),
-            None => return fail(format!("virtiofsd not runnable: {}", p.display())),
-        }
-    } else if cfg!(feature = "virtiofsd") {
-        "bundled virtiofsd".to_string()
-    } else {
-        return fail("no virtiofsd: vk built without the virtiofsd feature and none configured");
-    };
-    ok(format!("dir {shown} readable, {served}"))
+    if !crate::vmm::libkrun_selected() {
+        return fail("vk was built without libkrun, whose virtio-fs serves the share");
+    }
+    ok(format!(
+        "dir {shown} readable, virtio-fs built into libkrun"
+    ))
 }
 
 fn services(cfg: &Config) -> Outcome {

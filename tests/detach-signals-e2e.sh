@@ -8,7 +8,7 @@
 # cannot be the terminal's foreground group, and the kernel discards SIGTSTP for an orphaned
 # group.
 #
-# `setsid` moves only its caller. The VMM/switch/virtiofsd the child spawns before readiness
+# `setsid` moves only its caller. The VMM/switch the child spawns before readiness
 # must therefore leave the terminal's group at spawn (vk-driver/src/spawn.rs, keyed on
 # `detach::is_child`): left in it, a Ctrl-C aimed at that group after the run detached —
 # `vk dev`'s post-boot work in the parent, a script run without job control — kills the VM.
@@ -184,10 +184,9 @@ if csid != bash_sid:
     fail(f"build child is not in the shell's session (sid={csid}, shell sid={bash_sid}) — "
          "it detached during the build, so terminal ^C/^Z cannot reach it")
 
-# (1b) structural, the other way round: the helpers the child spawned (stage VMM, switch,
-#      virtiofsd) must each lead a session of their own. The child `setsid`s alone at
-#      readiness, so a helper left in the terminal's group would keep taking its ^C/^Z long
-#      after the run detached.
+# (1b) Each helper (stage VMM, switch) must lead its own session. Only the child moves
+#      sessions at readiness; a helper left in the terminal's group would keep taking
+#      its ^C/^Z after the run detached.
 ps = all_stats()
 helpers = descendants(child, ps)
 if not helpers:

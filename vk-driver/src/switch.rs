@@ -1232,7 +1232,7 @@ const BYTES_PUBLISH: Duration = Duration::from_millis(500);
 
 /// Spawn the switch as a tied child of this process (this binary's `switch`
 /// subcommand). Every consumer — `run`, the gitlab job supervisor —
-/// owns its LAN the way it owns its VMMs and virtiofsds: a child that dies with
+/// owns its LAN the way it owns its VMMs: a child that dies with
 /// it (PDEATHSIG), with its own pid and log to inspect when the LAN misbehaves.
 /// Returns once every listen socket is bound, so a guest never dials a
 /// not-yet-listening switch.

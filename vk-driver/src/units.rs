@@ -459,7 +459,7 @@ pub const VSOCK_PORT: u32 = 4444;
 /// its clean ext4, booted through the agent initramfs which also carries the unit's
 /// merged runtime config — VIRTKIT_MODE=service then forks its argv. Static address,
 /// attached to the owner's switch over vsock; compose volumes are virtiofs bind
-/// mounts. Returns the VMM child plus any virtiofsd children — all tied to the
+/// mounts. Returns the VMM child plus any socket-forward children — all tied to the
 /// calling process.
 pub fn boot_unit(
     svc: &Provisioned,
@@ -612,17 +612,6 @@ pub fn boot_unit(
         }
         let tag = format!("vol{i}");
         let sock = dir.join(format!("vfsd-{tag}.sock"));
-        if !crate::vmm::libkrun_selected() {
-            aux.push(crate::spawn::spawn_virtiofsd(
-                &sock,
-                &vol.host,
-                vol.read_only,
-                &[],
-                &[],
-                vol.cache(),
-                crate::prio::Prio::Normal,
-            )?);
-        }
         let mount_at = if vol.is_file {
             let base = vol
                 .host
@@ -676,7 +665,7 @@ pub fn boot_unit(
     addrs.extend_from_slice(&svc.extra_ips);
     let attach = crate::vmm::switch_attach(&vsock, net_port, &addrs, svc.prefix, gateway);
 
-    // Build and spawn the VMM. On any failure, kill the virtiofsd children already
+    // Build and spawn the VMM. On any failure, kill the socket-forward children already
     // spawned above before returning — Child's Drop does not kill, so a soft error
     // return would otherwise orphan them for the owner's lifetime.
     let spawn_vmm = move || -> Result<Child> {

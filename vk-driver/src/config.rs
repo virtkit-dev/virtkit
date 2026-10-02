@@ -20,8 +20,6 @@ pub struct Config {
     pub state_dir: Option<PathBuf>,
     /// Path of the cloud-hypervisor binary (a bare name resolves through PATH)
     pub cloud_hypervisor: Option<PathBuf>,
-    /// virtiofsd binary, only needed when [executor.share] is set
-    pub virtiofsd: Option<PathBuf>,
     /// VMM backend. Only `libkrun`, embedded in `vk`, remains: `cloud-hypervisor` is still
     /// parsed so an old config loads, but it boots on libkrun after a warning.
     pub vmm: Option<VmmBackend>,
@@ -867,9 +865,15 @@ fn load_resolved(explicit: Option<PathBuf>, fallbacks: &[PathBuf]) -> Result<Con
     };
     let text =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let table: toml::Table =
+    let mut table: toml::Table =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     reject_migrated_keys(&table).with_context(|| format!("parsing {}", path.display()))?;
+    for key in strip_removed_keys(&mut table) {
+        eprintln!(
+            "virtkit: warning: {}: ignoring `{key}`, which no longer has any effect; remove it",
+            path.display()
+        );
+    }
     let mut cfg: Config = table
         .try_into()
         .with_context(|| format!("parsing {}", path.display()))?;
@@ -899,6 +903,19 @@ fn reject_migrated_keys(table: &toml::Table) -> Result<()> {
         anyhow::bail!("{}", hints.join("\n"));
     }
     Ok(())
+}
+
+/// Remove obsolete top-level keys and return their names so old configs load under
+/// `deny_unknown_fields`. Unlike [`reject_migrated_keys`], these keys have no replacements:
+/// the caller warns and continues.
+fn strip_removed_keys(table: &mut toml::Table) -> Vec<&'static str> {
+    // `virtiofsd`: the daemon served cloud-hypervisor's shares; libkrun serves them itself.
+    const REMOVED: &[&str] = &["virtiofsd"];
+    REMOVED
+        .iter()
+        .copied()
+        .filter(|key| table.remove(*key).is_some())
+        .collect()
 }
 
 impl Config {
@@ -969,20 +986,6 @@ impl Config {
         self.cloud_hypervisor
             .as_deref()
             .unwrap_or(Path::new("cloud-hypervisor"))
-    }
-
-    /// The command that runs virtiofsd. With no `[virtiofsd]` configured it is the
-    /// bundled daemon — this executable's `virtiofsd` subcommand (built in by the
-    /// default `virtiofsd` feature); set the config path to use an external binary.
-    pub fn virtiofsd_command(&self) -> std::process::Command {
-        match &self.virtiofsd {
-            Some(path) => std::process::Command::new(path),
-            None => {
-                let mut c = std::process::Command::new(crate::spawn::self_exe());
-                c.arg("virtiofsd");
-                c
-            }
-        }
     }
 }
 
@@ -1064,6 +1067,14 @@ mod tests {
         assert!(err.contains("[executor.vm]"), "{err}");
     }
 
+    /// File loading strips `virtiofsd` rather than rejecting it under `deny_unknown_fields`.
+    #[test]
+    fn load_ignores_a_removed_key() {
+        let dir = Dir::new("removed");
+        let old = dir.file("old.toml", "virtiofsd = \"/x\"\n");
+        load_resolved(Some(old), &[]).unwrap();
+    }
+
     // `vk config` serializes the effective config to TOML; the defaults must
     // round-trip, and a scalar like image_cache_idle_secs must stay ahead of the
     // `[section]` tables (a value emitted after a table would re-parse into it).
@@ -1113,6 +1124,16 @@ mod tests {
                 .vm
                 .nested
         );
+    }
+
+    #[test]
+    fn a_removed_key_is_stripped_and_named() {
+        let mut table: toml::Table =
+            toml::from_str("virtiofsd = \"/usr/bin/virtiofsd\"\nstate_dir = \"/s\"\n").unwrap();
+        assert_eq!(strip_removed_keys(&mut table), vec!["virtiofsd"]);
+        let cfg: Config = table.try_into().unwrap();
+        assert_eq!(cfg.state_dir(), Path::new("/s"));
+        assert!(strip_removed_keys(&mut toml::Table::new()).is_empty());
     }
 
     #[test]

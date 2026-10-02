@@ -14,7 +14,7 @@
 //! the controlling terminal's foreground group, so a child that detached at fork was an
 //! orphaned group the kernel *discards* SIGTSTP for (Ctrl-Z did nothing) and that terminal
 //! signals never reached. It also means only the child changes group at readiness — `setsid`
-//! moves its caller, not the caller's children — so the VMM/switch/virtiofsd it spawns before
+//! moves its caller, not the caller's children — so the VMM/switch it spawns before
 //! then get sessions of their own at spawn ([`crate::spawn::spawn_tied`], keyed on
 //! [`is_child`]). Left in the foreground group, they would keep taking the terminal's
 //! Ctrl-C/Ctrl-Z after the run detached: `vk dev` goes on working in that group, and so does
@@ -265,7 +265,7 @@ pub fn signal_ready(log: Option<&Path>) {
     // freed terminal's hang-up never reaches the VM we hold — but only now, having stayed in
     // the foreground through the build/boot so Ctrl-C/Ctrl-Z reached it. Safe: a forked child
     // is never its own group's leader, so `setsid` succeeds. It moves this process alone: the
-    // VMM/switch/virtiofsd already spawned left the terminal's group at spawn (`spawn_tied`)
+    // VMM/switch already spawned left the terminal's group at spawn (`spawn_tied`)
     // and stay our PDEATHSIG-tied children.
     unsafe { libc::setsid() };
     use std::io::Write;

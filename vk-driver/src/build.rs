@@ -7502,7 +7502,7 @@ RUN ship
         write(1, 0, 100 * 1024); // init: not ours
         write(me, 1, 3 * 1024); // the driver itself
         write(me + 1, me, 4096 * 1024); // a stage guest
-        write(me + 2, me + 1, 8 * 1024); // its virtiofsd, a grandchild
+        write(me + 2, me + 1, 8 * 1024); // a helper of that guest, a grandchild
         write(me + 3, 1, 9999 * 1024); // someone else's, sharing the host
         // Not a number, and a directory with no status: neither derails the scan.
         std::fs::create_dir_all(proc.join("self")).unwrap();

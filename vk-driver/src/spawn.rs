@@ -1,6 +1,6 @@
 //! Tied helper subprocesses: children the kernel SIGTERMs when their owning
 //! virtkit process dies (PR_SET_PDEATHSIG), so a crashed or kill -9'd owner
-//! never leaks a switch, virtiofsd, or VMM. Used by every foreground owner
+//! never leaks a switch, forward or VMM. Used by every foreground owner
 //! (`run` and the build path) and the CI job supervisor.
 //!
 //! What the kernel cannot tie down — a build scratch dir, a staged chunk file — is
@@ -10,11 +10,10 @@
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
-/// Path to this executable for re-execing its own subcommands (switch, virtiofsd,
+/// Path to this executable for re-execing its own subcommands (switch,
 /// VMM, forwards). Unlike `std::env::current_exe()`, which returns the *pathname*
 /// (and hands back a `…/vk (deleted)` string that fails to exec once the on-disk
 /// binary is replaced), `/proc/self/exe` is a magic link the kernel resolves to
@@ -56,7 +55,7 @@ pub(crate) fn spawn_socket_forward(
 
 /// Spawn a foreground-owned helper tied to this process: a pre-exec hook asks the kernel to
 /// SIGTERM the child when its parent dies, so a crashed or `kill -9`'d virtkit cannot leak it
-/// (a stuck virtiofsd would, e.g., keep this binary's file busy for the next build). For any
+/// (a stuck forward would, e.g., keep this binary's file busy for the next build). For any
 /// process that owns its helpers for its whole lifetime — the `run`/build VMs, and the CI job
 /// supervisor (itself the one detached process that outlives the short `prepare`, tying every
 /// helper to its own death).
@@ -126,68 +125,10 @@ fn spawner() -> &'static std::sync::mpsc::Sender<(Command, Reply)> {
 /// Create the spawner thread now, from a caller still at the driver's own priority. Every
 /// helper is forked from it, so a child inherits its scheduling priority rather than the
 /// caller's — and a thread first created from inside a deferred build would hand that
-/// priority, unrecoverably, to the switch, virtiofsd and VMM of every `vk run` guest booted
+/// priority, unrecoverably, to the switch and VMM of every `vk run` guest booted
 /// afterwards in the same process. Called from [`crate::prio::pin_shared_threads`].
 pub(crate) fn pin_spawner() {
     let _ = spawner();
-}
-
-/// Start the bundled virtiofsd (this executable's `vk virtiofsd` subcommand) on
-/// `shared_dir` (optionally read-only) and wait for its socket to appear. A read-only
-/// share is a host-side guarantee the guest can never write back to the shared tree.
-/// `uid_maps` / `gid_maps` are soft_idmap spec strings (`type:from:to[:count]`) forwarded
-/// as `--uid-map` / `--gid-map` to virtiofsd; empty slices = identity (no remapping). `cache`
-/// sets the share's cache policy (`ShareCache`). `prio` says whether the share
-/// serves a build stage, which only the cloud-hypervisor backend reaches — libkrun serves a
-/// build's context in-process.
-pub(crate) fn spawn_virtiofsd(
-    sock: &Path,
-    shared_dir: &Path,
-    readonly: bool,
-    uid_maps: &[String],
-    gid_maps: &[String],
-    cache: crate::vmm::ShareCache,
-    prio: crate::prio::Prio,
-) -> Result<Child> {
-    let _ = std::fs::remove_file(sock);
-    let mut cmd = Command::new(self_exe());
-    cmd.arg("virtiofsd")
-        .arg(format!("--socket-path={}", sock.display()))
-        .arg(format!("--shared-dir={}", shared_dir.display()))
-        .args(cache.virtiofsd_args())
-        .arg("--sandbox=none");
-    if readonly {
-        cmd.arg("--readonly");
-    }
-    for m in uid_maps {
-        cmd.arg(format!("--uid-map={m}"));
-    }
-    for m in gid_maps {
-        cmd.arg(format!("--gid-map={m}"));
-    }
-    // self-reap if virtkit dies before the normal teardown runs (spawn_tied). stderr → a log
-    // next to the socket so a daemon crash leaves a trace instead of vanishing (a silent
-    // /dev/null made a worker panic look like an unexplained guest hang).
-    let errlog = sock.with_extension("stderr.log");
-    let (out, err) = match std::fs::File::create(&errlog) {
-        Ok(f) => (
-            f.try_clone()
-                .map(Stdio::from)
-                .unwrap_or_else(|_| Stdio::null()),
-            Stdio::from(f),
-        ),
-        Err(_) => (Stdio::null(), Stdio::null()),
-    };
-    cmd.stdin(Stdio::null()).stdout(out).stderr(err);
-    prio.apply(&mut cmd);
-    let child = spawn_tied(cmd).context("spawning the bundled virtiofsd (vk virtiofsd)")?;
-    for _ in 0..50 {
-        if sock.exists() {
-            return Ok(child);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    bail!("virtiofsd socket {} never appeared", sock.display());
 }
 
 /// Whether `pid` is a live process. `kill(pid, 0)` sends no signal — it only reports
