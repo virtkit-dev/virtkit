@@ -347,5 +347,10 @@ if [ -t 0 ] && [ -t 1 ]; then
   exec_args+=(-t)
 fi
 for entry in "${DEV_ENV[@]}"; do exec_args+=(--env "$entry"); done
+# /work is shared with cache=auto, which trusts cached attributes for 5 s: a host edit
+# inside that window (git rebase --exec picks the next commit in under a second) is read
+# from the guest's stale page cache. Drop dentries, inodes and pages so every run starts
+# from the host's tree. Root is needed, hence a separate exec without --user.
+"$VK" exec "$STATE_DIR" -- sh -c 'echo 3 >/proc/sys/vm/drop_caches'
 echo "dev.sh: $what in the development VM" >&2
 exec "$VK" exec "$STATE_DIR" "${exec_args[@]}" -- "${guest_cmd[@]}"
