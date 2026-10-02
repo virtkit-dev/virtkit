@@ -446,7 +446,7 @@ impl VirtioPciTransport {
     pub fn new(
         mem: GuestMemoryMmap,
         device: Arc<Mutex<dyn VirtioDevice>>,
-        interrupt_line: u8,
+        interrupt_line: Option<u8>,
         intx_line: Arc<dyn PciIntxLine>,
         bar_base: u32,
     ) -> Result<Self, CreatePciTransportError> {
@@ -595,7 +595,7 @@ impl VirtioPciTransport {
     fn build_config(
         device_type: u32,
         device_config_len: u32,
-        interrupt_line: u8,
+        interrupt_line: Option<u8>,
         shm: Option<(u64, u64)>,
     ) -> (PciConfigSpace, Vec<Capability>, Option<usize>, usize) {
         let mut config = PciConfigSpace::default();
@@ -663,8 +663,15 @@ impl VirtioPciTransport {
                 .first()
                 .map_or(0, |capability| capability.offset),
         );
-        config.write_u8(pci_config::INTERRUPT_LINE, interrupt_line);
-        config.write_u8(pci_config::INTERRUPT_PIN, PCI_INTERRUPT_PIN_INTA);
+        // No INTx (the VMM ran out of GSIs): interrupt pin 0, line 0xff ("unknown"), and the
+        // driver uses MSI-X (local patch, see VENDOR.md).
+        match interrupt_line {
+            Some(line) => {
+                config.write_u8(pci_config::INTERRUPT_LINE, line);
+                config.write_u8(pci_config::INTERRUPT_PIN, PCI_INTERRUPT_PIN_INTA);
+            }
+            None => config.write_u8(pci_config::INTERRUPT_LINE, 0xff),
+        }
 
         let mut pci_cfg_cap_offset = None;
         for (index, capability) in capabilities.iter().enumerate() {
@@ -1583,7 +1590,7 @@ mod tests {
                 queue_config,
                 shm: None,
             })),
-            5,
+            Some(5),
             intx_line.clone(),
             0,
         )
@@ -1775,7 +1782,7 @@ mod tests {
                     size,
                 }),
             })),
-            5,
+            Some(5),
             Arc::new(DummyIntxLine::default()),
             0,
         )
@@ -1838,6 +1845,30 @@ mod tests {
         assert_eq!(
             transport.config.read_u32(cap + 0x14),
             Some((size >> 32) as u32)
+        );
+    }
+
+    #[test]
+    fn a_device_without_intx_has_no_interrupt_pin() {
+        let mem =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), TEST_GUEST_MEMORY_SIZE)]).unwrap();
+        let transport = VirtioPciTransport::new(
+            mem,
+            Arc::new(Mutex::new(DummyDevice {
+                acked_features: 0,
+                activated: false,
+                queue_config: &QUEUE_CONFIG,
+                shm: None,
+            })),
+            None,
+            Arc::new(DummyIntxLine::default()),
+            0,
+        )
+        .unwrap();
+        assert_eq!(transport.config.read_u8(pci_config::INTERRUPT_PIN), Some(0));
+        assert_eq!(
+            transport.config.read_u8(pci_config::INTERRUPT_LINE),
+            Some(0xff)
         );
     }
 

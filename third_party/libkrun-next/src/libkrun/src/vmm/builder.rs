@@ -507,7 +507,10 @@ impl Display for StartMicrovmError {
             PciRequiresAcpi => write!(f, "PCI devices require ACPI to be enabled"),
             #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "gpu"))]
             PciSharedMemoryNotSupported => {
-                write!(f, "the GPU shared-memory region is not supported over PCI yet")
+                write!(
+                    f,
+                    "the GPU shared-memory region is not supported over PCI yet"
+                )
             }
             SecureVirtAttest(ref err) => {
                 let mut err_msg = format!("{err}");

@@ -62,13 +62,17 @@ pub struct PciHostManager {
 
 struct KvmPciIntxLine {
     vm: Arc<VmFd>,
-    gsi: u32,
+    /// `None` for a device past the INTx GSIs, which interrupts over MSI-X only.
+    gsi: Option<u32>,
 }
 
 impl PciIntxLine for KvmPciIntxLine {
     fn set_level(&self, asserted: bool) -> std::io::Result<()> {
+        let Some(gsi) = self.gsi else {
+            return Ok(());
+        };
         self.vm
-            .set_irq_line(self.gsi, asserted)
+            .set_irq_line(gsi, asserted)
             .map_err(|err| std::io::Error::from_raw_os_error(err.errno()))
     }
 }
@@ -117,12 +121,15 @@ impl PciHostManager {
         vm: Arc<VmFd>,
         guest_memory: GuestMemoryMmap,
         device: Arc<Mutex<dyn VirtioDevice>>,
-    ) -> Result<arch::x86_64::PciFunctionInfo> {
-        if self.irq > arch::x86_64::layout::IRQ_MAX || self.next_device > 31 {
+    ) -> Result<Option<arch::x86_64::PciFunctionInfo>> {
+        // Bus 0 has 31 device slots. The IOAPIC's GSIs run out sooner, so a device past them
+        // gets no INTx and interrupts over MSI-X alone, which every virtio-pci driver uses
+        // when offered (local patch, see VENDOR.md).
+        if self.next_device > 31 {
             return Err(Error::IrqsExhausted);
         }
 
-        let irq = self.irq;
+        let intx_gsi = (self.irq <= arch::x86_64::layout::IRQ_MAX).then_some(self.irq);
         let address = PciAddress::new(PCI_BUS0, self.next_device, 0);
         let bar_base = arch::x86_64::layout::PCI_BAR_START
             + u64::from(self.next_device - 1) * VIRTIO_PCI_BAR0_SIZE;
@@ -131,11 +138,16 @@ impl PciHostManager {
         }
         let intx_line = Arc::new(KvmPciIntxLine {
             vm: vm.clone(),
-            gsi: irq,
+            gsi: intx_gsi,
         });
-        let transport =
-            VirtioPciTransport::new(guest_memory, device, irq as u8, intx_line, bar_base as u32)
-                .map_err(Error::CreateTransport)?;
+        let transport = VirtioPciTransport::new(
+            guest_memory,
+            device,
+            intx_gsi.map(|gsi| gsi as u8),
+            intx_line,
+            bar_base as u32,
+        )
+        .map_err(Error::CreateTransport)?;
 
         // MSI-X: one MSI GSI per vector, raised by its irqfd; the transport programs the
         // GSI's route when the driver writes the vector's message. Queue notifications go
@@ -165,19 +177,23 @@ impl PciHostManager {
             .insert(address, function)
             .map_err(Error::PciRoot)?;
 
+        self.next_device += 1;
+        // Only a device with INTx has a routing entry (the DSDT's _PRT) and uses up a GSI.
+        let Some(gsi) = intx_gsi else {
+            return Ok(None);
+        };
         let info = arch::x86_64::PciFunctionInfo {
             device: address.device,
             function: address.function,
-            gsi: irq,
+            gsi,
         };
         self.functions.push(info);
-        self.next_device += 1;
         self.irq += 1;
         // GSI 9 carries the ACPI SCI (local patch, see VENDOR.md).
         if self.irq == arch::x86_64::layout::SCI_GSI {
             self.irq += 1;
         }
-        Ok(info)
+        Ok(Some(info))
     }
 
     pub fn acpi_info(&self) -> arch::x86_64::PciHostInfo {
