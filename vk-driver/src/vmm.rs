@@ -360,14 +360,11 @@ impl std::fmt::Display for Dax {
     }
 }
 
-/// A virtio-fs share: the tag the guest mounts by, plus the two ways a backend
-/// serves it. cloud-hypervisor connects to an external virtiofsd on `socket`; libkrun
-/// has no external vhost-user-fs, so it mounts `host_dir` directly with its built-in
-/// virtio-fs (and no separate virtiofsd is spawned — see the boot sites).
+/// A virtio-fs share: the tag the guest mounts by and the host directory libkrun's
+/// built-in virtio-fs serves under it.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct FsShare {
     pub tag: String,
-    pub socket: PathBuf,
     pub host_dir: PathBuf,
     pub read_only: bool,
     /// This share's DAX window and file-size floor; `None` = no window. libkrun takes the
@@ -375,9 +372,8 @@ pub struct FsShare {
     #[serde(default)]
     pub dax: Option<DaxShare>,
     /// virtiofsd-style UID id-map spec strings (`type:from:to[:count]`) applied at the
-    /// guest↔host boundary; empty = identity. Under cloud-hypervisor these become
-    /// `--uid-map` args to the bundled virtiofsd; under libkrun they go to
-    /// `krun_add_virtiofs5`. `gid_map` is the same for GIDs.
+    /// guest↔host boundary; empty = identity, passed to `krun_add_virtiofs5`. `gid_map` is
+    /// the same for GIDs.
     #[serde(default)]
     pub uid_map: Vec<String>,
     #[serde(default)]
@@ -685,16 +681,11 @@ pub struct VmSpec {
     /// image's own initrd. `None` when the kernel mounts a disk root directly.
     pub initramfs: Option<PathBuf>,
     pub shares: Vec<FsShare>,
-    pub vsock_cid: u32,
-    pub vsock_socket: PathBuf,
-    /// Per-port vsock map for the libkrun backend (see [`VsockPort`]);
-    /// cloud-hypervisor ignores it and uses `vsock_socket` + the `_<port>` convention.
+    /// Per-port vsock map (see [`VsockPort`]).
     pub vsock_ports: Vec<VsockPort>,
     pub cpus: u32,
-    /// Memory size token, e.g. `"8G"`. [`Self::shared_mem`] appends `,shared=on`,
-    /// which virtio-fs requires (and is harmless without).
+    /// Memory size token, e.g. `"8G"`.
     pub mem: String,
-    pub shared_mem: bool,
     pub net: Net,
     /// Switch-mode NICs as virtio-net devices (see [`switch_attach`]).
     #[serde(default)]
@@ -725,9 +716,6 @@ pub struct VmSpec {
     /// ([`host_nesting_enabled`]).
     #[serde(default)]
     pub nested: bool,
-    /// CH API socket for graceful shutdown (the detached CI VM). `None` = no API
-    /// socket (the held-`Child` paths kill the process directly).
-    pub api_socket: Option<PathBuf>,
     /// Fds backing unlinked boot media (`scratch::ScratchFile`), whose
     /// `/proc/self/fd/<n>` paths appear in `kernel`/`initramfs`/`disks` — or in a
     /// qcow2 backing reference. `run::spawn_vmm` clears CLOEXEC on each for the VMM
@@ -1126,7 +1114,8 @@ mod tests {
         assert!(ShareCache::Ephemeral.writeback() && ShareCache::Ephemeral.no_sync());
         assert!(!ShareCache::Auto.writeback() && !ShareCache::Auto.no_sync());
         assert!(!ShareCache::Immutable.writeback() && !ShareCache::Immutable.no_sync());
-        // Specs predating the cache field retain the default caching policy.
+        // Specs predating `cache` retain its default policy; their vhost-user `socket`
+        // field is ignored.
         let spec: FsShare =
             serde_json::from_str(r#"{"tag":"t","socket":"/s","host_dir":"/h","read_only":true}"#)
                 .unwrap();
@@ -1136,7 +1125,6 @@ mod tests {
     fn dax_share(tag: &str, dax: Option<u64>) -> FsShare {
         FsShare {
             tag: tag.into(),
-            socket: PathBuf::new(),
             host_dir: PathBuf::new(),
             read_only: false,
             dax: dax.map(|window| DaxShare {

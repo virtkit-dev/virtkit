@@ -1,7 +1,7 @@
 //! The service manager: a set of declared compose units, started/stopped on
 //! demand over the virtctl control protocol (`vk_core::fleetctl`). The owner
-//! (`run`) declares every unit up front — image materialized, address and
-//! CID assigned — and the manager boots/kills them; the control server answers
+//! (`run`) declares every unit up front — image materialized, address
+//! assigned — and the manager boots/kills them; the control server answers
 //! requests on the owner's hybrid-vsock control socket, so only its guest reaches
 //! the control plane, and on a host-only socket beside it for `vk` itself.
 

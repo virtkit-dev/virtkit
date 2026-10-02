@@ -36,7 +36,6 @@ pub struct Provisioned {
     pub addr: Ipv4Addr,
     /// Prefix from [`Self::ip`], shared by every NIC on the LAN.
     pub prefix: u8,
-    pub cid: u32,
     pub config: RunConfig,
     pub volumes: Vec<crate::compose::Volume>,
     /// Who runs as PID 1 in this unit's guest (its compose `x-virtkit.init`): the
@@ -299,7 +298,7 @@ pub fn provision(
 }
 
 /// Assemble a [`Provisioned`] from an already-resolved image + merged config: assign the
-/// static address (`slot`) and CID, and carry the unit's volumes + init/kernel axes. Shared by
+/// static address (`slot`), and carry the unit's volumes + init/kernel axes. Shared by
 /// `provision` and the CI executor's git-defined-service path (which resolves its image its own
 /// way but addresses it identically).
 pub fn provisioned(
@@ -333,7 +332,6 @@ pub fn provisioned(
         ip: format!("{ip}/{prefix}"),
         addr: ip,
         prefix,
-        cid: FIRST_SERVICE_CID + slot,
         config,
         volumes: unit.volumes.clone(),
         init: unit.init,
@@ -441,10 +439,6 @@ impl ExtraNics {
             .collect()
     }
 }
-
-/// First vsock CID handed to services — clear of the reserved CIDs (0-2) and the
-/// primary VM's default (3).
-pub const FIRST_SERVICE_CID: u32 = 100;
 
 /// vsock port each sibling's `vk-agent serve` listens on — a preinit boot's reparented
 /// serve (its `VIRTKIT_VSOCK_PORT`) or the default service boot's `VIRTKIT_SERVE=1`
@@ -608,7 +602,6 @@ pub fn boot_unit(
             continue;
         }
         let tag = format!("vol{i}");
-        let sock = dir.join(format!("vfsd-{tag}.sock"));
         let mount_at = if vol.is_file {
             let base = vol
                 .host
@@ -641,7 +634,6 @@ pub fn boot_unit(
         }
         shares.push(crate::vmm::FsShare {
             tag,
-            socket: sock,
             host_dir: vol.host.clone(),
             read_only: vol.read_only,
             // A single-file bind is served by a filesystem with no DAX path of its own.
@@ -651,7 +643,6 @@ pub fn boot_unit(
             cache: vol.cache(),
         });
     }
-    let shared_mem = !shares.is_empty();
 
     // How this sibling joins the switch: eth0 then its NICs after it, on `net_port` + the
     // interface index (the ports the switch bound for it), all sharing eth0's prefix — one
@@ -767,12 +758,9 @@ pub fn boot_unit(
             disks,
             initramfs: Some(cpio),
             shares,
-            vsock_cid: svc.cid,
-            vsock_socket: vsock,
             vsock_ports,
             cpus: svc.cpus.unwrap_or(DEFAULT_CPUS),
             mem,
-            shared_mem,
             net: crate::vmm::Net::None,
             nics,
             // Like the job VM: freed guest pages go back to the host, so a service
@@ -786,7 +774,6 @@ pub fn boot_unit(
             // This service's own `x-virtkit.nested` — a sibling that is itself a
             // hypervisor gets VMX/SVM; every other one keeps it masked.
             nested: svc.nested,
-            api_socket: None,
             pass_fds: Vec::new(),
             proc_name: crate::vmm::resolve_proc_name(&svc.name),
             // A compose service reboots in place on a guest reset (see keep()).

@@ -1314,10 +1314,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         let dir = guest_writable
             .resolve_share(share)
             .with_context(|| format!("resolving share root {}", share.dir.display()))?;
-        let vfsd_sock = ctx.vfsd_sock();
         shares.push(crate::vmm::FsShare {
             tag: "workdir".into(),
-            socket: vfsd_sock,
             host_dir: dir,
             read_only: share.readonly,
             dax,
@@ -1336,10 +1334,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             .with_context(|| format!("resolving share root {}", dir.display()))?;
         // Best-effort: without it the report names only the configured tools_dir.
         let _ = std::fs::write(ctx.tools_root_file(), dir.as_os_str().as_bytes());
-        let sock = ctx.tools_vfsd_sock();
         shares.push(crate::vmm::FsShare {
             tag: "vktools".into(),
-            socket: sock,
             host_dir: dir,
             read_only: true,
             dax,
@@ -1363,7 +1359,6 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             .as_deref()
             .context("host_checkout is set but CI_PROJECT_DIR is unset")?;
         let host_dir = ctx.host_checkout_dir();
-        let sock = ctx.job_dir.join("cibuild-vfsd.sock");
         // Mark the read-write export under the use lock before the guest can write, so the
         // next job re-clones instead of running host `git` in this tree.
         if !overlay {
@@ -1440,7 +1435,6 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
 
         shares.push(crate::vmm::FsShare {
             tag: CIBUILD_TAG.into(),
-            socket: sock,
             host_dir,
             read_only: overlay,
             dax,
@@ -1450,10 +1444,8 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         });
         // Keep the tar outside the checkout, on a private read-only share removed with the job.
         if let Some(seed_dir) = &seed_dir {
-            let sock = ctx.job_dir.join("cicheckout-vfsd.sock");
             shares.push(crate::vmm::FsShare {
                 tag: CICHECKOUT_TAG.into(),
-                socket: sock,
                 host_dir: seed_dir.clone(),
                 read_only: true,
                 dax,
@@ -1475,12 +1467,10 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // job guest must be able to write. Only its own directory is exported, and the
     // knob on the cmdline is what starts the sampler at all.
     if let Some(dir) = crate::atop::job_archive_dir(ctx) {
-        let sock = ctx.atop_vfsd_sock();
         // Both together or neither: the share with no knob mounts an archive nothing writes
         // to, and the knob with no share starts a sampler with nowhere to write.
         shares.push(crate::vmm::FsShare {
             tag: vk_core::atop::TAG.into(),
-            socket: sock,
             host_dir: dir,
             read_only: false,
             dax: None,
@@ -1667,11 +1657,10 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     // qcow2 metadata writeback, for data nobody keeps.
     let disks = vec![crate::vmm::Disk::overlay(overlay.clone()).ephemeral()];
 
-    // shared=on (set via shared_mem): required by virtio-fs, harmless without.
     // vsock ports the guest uses: the exec channel always, plus the switch bridge in
     // `switch` net mode (guest egress over the userspace switch) and the ssh-agent
     // bridge when agent forwarding is on. Tap/pool networking uses a virtio-net device,
-    // not vsock. Only the libkrun backend consumes this; cloud-hypervisor derives it.
+    // not vsock.
     let mut vsock_ports = vec![crate::vmm::VsockPort::exec(
         &ctx.vsock_sock(),
         cfg.executor.vm.vsock_port,
@@ -1690,12 +1679,9 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         disks,
         initramfs,
         shares,
-        vsock_cid: 3,
-        vsock_socket: ctx.vsock_sock(),
         vsock_ports,
         cpus,
         mem: mem.clone(),
-        shared_mem: true,
         net,
         nics,
         balloon: cfg.executor.vm.balloon,
@@ -1709,9 +1695,6 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         // what let that marker past `refuse_job_nesting`, so today the OR only ever agrees
         // with the grant — it is here so the two paths cannot drift apart.
         nested: crate::run::effective_nested(cfg.executor.vm.nested, primary_nested),
-        // libkrun has no API socket (it is driven as a subprocess); cloud-hypervisor
-        // uses one for graceful shutdown in graceful_vmm_stop.
-        api_socket: None,
         pass_fds: Vec::new(),
         // The CI job runs in its own process (no `--vm-name`), so the default template
         // applies: `vk:<hostname>`.

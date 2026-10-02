@@ -623,8 +623,7 @@ pub(crate) fn default_scratch_base() -> Result<PathBuf> {
 pub(crate) use vk_core::unixpath::SUN_PATH_MAX;
 
 /// The longest socket name the VMM itself binds or dials in a state dir — the vsock socket of
-/// the highest port a bridged or published port can take; a virtio-fs volume socket
-/// (`vfsd-vol<i>.sock`) only overtakes it past 1000 volumes. The host-only control socket
+/// the highest port a bridged or published port can take. The host-only control socket
 /// (`vsock.sock_1099.host`) is longer, but only `vk` binds and dials it, through the
 /// `/proc/self/fd` fallback of `vk_core::unixpath`.
 const LONGEST_SOCKET_NAME: &str = "vsock.sock_65535";
@@ -1890,8 +1889,7 @@ async fn build_and_boot(
     // Working directory: share a host dir read-write over virtiofs at WORKDIR_MOUNT (no uid
     // map — the in-process virtio-fs writes back as the host
     // user), so the guest command reads/writes the live tree and its outputs land on the
-    // host. The command then runs with its cwd there (see `drive`). virtio-fs needs shared
-    // guest memory, so `mem` gains `shared=on`.
+    // host. The command then runs with its cwd there (see `drive`).
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     // The DAX window each directory share gets: the guest maps the host page cache through
     // it instead of copying file data into its own, so a tree read twice is read once.
@@ -1905,11 +1903,9 @@ async fn build_and_boot(
         if crate::compose::require_shareable(host_dir).with_context(at)? {
             bail!("{}: the host path is a file, not a directory", at());
         }
-        let sock = work.join("workdir.fs.sock");
         virtiofs.push_str(&format!("work:{WORKDIR_MOUNT}"));
         shares.push(crate::vmm::FsShare {
             tag: "work".into(),
-            socket: sock,
             host_dir: host_dir.clone(),
             read_only: false,
             dax,
@@ -1985,7 +1981,6 @@ async fn build_and_boot(
             continue;
         }
         let tag = format!("vol{i}");
-        let sock = work.join(format!("vfsd-{tag}.sock"));
         let mount_at = if vol.is_file {
             // virtio-fs shares a directory, so mount the single-file share at a hidden dir and
             // symlink the guest target to the file inside it.
@@ -2022,7 +2017,6 @@ async fn build_and_boot(
         }
         shares.push(crate::vmm::FsShare {
             tag,
-            socket: sock,
             host_dir: vol.host.clone(),
             read_only: vol.read_only,
             // A single-file bind is served by a filesystem with no DAX path of its own.
@@ -2075,10 +2069,8 @@ async fn build_and_boot(
                 );
             }
             _atop_lock = held;
-            let sock = work.join("atop.fs.sock");
             shares.push(crate::vmm::FsShare {
                 tag: vk_core::atop::TAG.into(),
-                socket: sock,
                 host_dir: dir,
                 read_only: false,
                 // The atop archive is a write log the guest appends to, not a tree it reads;
@@ -2141,7 +2133,6 @@ async fn build_and_boot(
     if !socket_specs.is_empty() {
         cmdline.push_str(&format!(" VIRTKIT_SOCKETS={}", socket_specs.join(",")));
     }
-    let shared_mem = !shares.is_empty();
 
     // 3. boot
     let console = work.join(CONSOLE_LOG);
@@ -2214,12 +2205,9 @@ async fn build_and_boot(
         disks,
         initramfs,
         shares,
-        vsock_cid: 3,
-        vsock_socket: vsock.clone(),
         vsock_ports,
         cpus,
         mem: mem.clone(),
-        shared_mem,
         net: crate::vmm::Net::None,
         nics,
         balloon: true,
@@ -2227,7 +2215,6 @@ async fn build_and_boot(
         console_serial: args.console_serial,
         pmu: args.pmu,
         nested,
-        api_socket: None,
         pass_fds,
         proc_name: crate::vmm::resolve_proc_name(&unit_name),
         // A `vk run` session reboots in place on a guest reset (see keep()).
@@ -4592,11 +4579,9 @@ pub(crate) async fn boot_session(
     // mounted by the agent at CONTEXT_MOUNT (it reads VIRTKIT_VIRTIOFS at boot).
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     if let Some(ctx) = context {
-        let sock = work.join("context.fs.sock");
         cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS=context:{CONTEXT_MOUNT}"));
         shares.push(crate::vmm::FsShare {
             tag: "context".into(),
-            socket: sock,
             host_dir: ctx.to_path_buf(),
             read_only: true,
             // Build stages are left out, as they are for reclaim: a stage guest reads the
@@ -4645,7 +4630,6 @@ pub(crate) async fn boot_session(
 
     let vsock_ports = vec![crate::vmm::VsockPort::exec(&vsock, VSOCK_PORT)];
     let nics = net_attach.map(|attach| attach.nics).unwrap_or_default();
-    // virtio-fs (the context share) requires shared guest memory (shared_mem).
     // --kernel=image boots the extracted image kernel; otherwise the pinned build kernel.
     let boot_kernel = image_kernel.map(|(k, _)| k).unwrap_or(kernel);
     let spec = crate::vmm::VmSpec {
@@ -4654,12 +4638,9 @@ pub(crate) async fn boot_session(
         disks,
         initramfs: Some(cpio),
         shares,
-        vsock_cid: 3,
-        vsock_socket: vsock.clone(),
         vsock_ports,
         cpus,
         mem: mem.to_string(),
-        shared_mem: context.is_some(),
         net: crate::vmm::Net::None,
         // The switch NIC (libkrun): a PCI slot MAX_SOURCE_DISKS accounts for.
         nics,
@@ -4672,7 +4653,6 @@ pub(crate) async fn boot_session(
         console_serial: false,
         pmu: false,
         nested: false,
-        api_socket: None,
         pass_fds,
         // `stem` is the stage ext4's name — the closest identity this build VM has.
         proc_name: crate::vmm::resolve_proc_name(stem),
@@ -5240,7 +5220,6 @@ mod tests {
         // share mounted `dax=always` without one would fall back on every boot.
         let share = |tag: &str, dax: Option<Dax>| crate::vmm::FsShare {
             tag: tag.into(),
-            socket: PathBuf::new(),
             host_dir: PathBuf::new(),
             read_only: false,
             dax: dax.and_then(Dax::share),
@@ -6132,12 +6111,9 @@ mod tests {
             }],
             initramfs: None,
             shares: Vec::new(),
-            vsock_cid: 3,
-            vsock_socket: dir.join("vsock.sock"),
             vsock_ports: Vec::new(),
             cpus: 1,
             mem: "1G".into(),
-            shared_mem: false,
             net: crate::vmm::Net::None,
             nics: Vec::new(),
             balloon: false,
@@ -6145,7 +6121,6 @@ mod tests {
             console_serial: false,
             pmu: false,
             nested: false,
-            api_socket: None,
             pass_fds: vec![medium.fd()],
             proc_name: "vk:test".into(),
             reboot: false,
