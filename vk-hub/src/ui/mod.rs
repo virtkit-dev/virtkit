@@ -49,6 +49,7 @@ use crate::store::{self, Role, UiSession};
 
 mod assets;
 mod body;
+mod dev;
 pub mod html;
 mod local;
 mod pages;
@@ -98,6 +99,8 @@ pub struct Ui {
     vms_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     /// What VM pages last read of their VMs.
     views: local::ViewCache,
+    /// What `/dev` last read.
+    dev_list: dev::DevList,
 }
 
 impl Ui {
@@ -116,6 +119,7 @@ impl Ui {
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             streams: sse::Streams::new(),
             views: local::ViewCache::new(local::VIEWS_FRESH),
+            dev_list: dev::DevList::new(),
         }
     }
 }

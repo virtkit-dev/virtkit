@@ -1331,3 +1331,80 @@ async fn a_cut_view_says_so() {
     assert!(page.body.contains("line 29999\n</pre>"), "{}", page.body);
     let _ = std::fs::remove_dir_all(vk.parent().unwrap());
 }
+
+/// `/dev` lists what `vk dev list` lists, stopped environments too, and no row whose name is
+/// not one.
+#[tokio::test(flavor = "multi_thread")]
+async fn dev_environments_are_listed() {
+    let vk = stub_vk(
+        "dev",
+        r#"case "$1 $2" in
+"dev list") cat <<'JSON'
+[{"name":"app-1111","dir":"/s/app-1111","workspace":"/src/app","environment":"dev","status":"stopped","created_by":null,"booted_secs":1790755279,"age_secs":5,"mem_used_bytes":null,"mem":null,"flags":[]},
+ {"name":"old-2222","dir":"/s/old-2222","workspace":"/gone/old","environment":"dev","status":"stopped","created_by":null,"booted_secs":null,"age_secs":null,"mem_used_bytes":null,"mem":null,"flags":["workspace-missing"]},
+ {"name":"../evil","dir":"/x","workspace":null,"environment":null,"status":"stopped","flags":[]}]
+JSON
+;;
+*) exit 3 ;;
+esac"#,
+    );
+    let (addr, hub, _, _) = start_with_vk(None, vk.clone(), local::VIEWS_FRESH).await;
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/dev", Some(&cookie)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body
+            .contains("<td>app-1111</td><td>stopped</td><td>/src/app</td>")
+    );
+    assert!(page.body.contains("2026-09-30T08:01Z"), "{}", page.body);
+    assert!(page.body.contains("workspace-missing"), "{}", page.body);
+    assert!(!page.body.contains("evil"), "{}", page.body);
+    assert!(page.body.contains("<a href=\"/dev\">dev environments</a>"));
+    let _ = std::fs::remove_dir_all(vk.parent().unwrap());
+}
+
+/// Loads of `/dev` close together share one `vk dev list`.
+#[tokio::test(flavor = "multi_thread")]
+async fn loads_of_dev_close_together_share_one_list() {
+    let vk = stub_vk(
+        "devlist",
+        r#"echo "$*" >> "$(dirname "$0")/ran"; sleep 0.5; echo '[]'"#,
+    );
+    let ran = vk.parent().unwrap().join("ran");
+    let (addr, hub, _, _) = start_with_vk(None, vk.clone(), local::VIEWS_FRESH).await;
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let (a, b) = tokio::join!(
+        get(addr, "/dev", Some(&cookie)),
+        get(addr, "/dev", Some(&cookie))
+    );
+    for page in [a, b] {
+        assert!(
+            page.body.contains("keeps no dev environment"),
+            "{}",
+            page.body
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&ran).unwrap().lines().count(), 1);
+    let _ = std::fs::remove_dir_all(vk.parent().unwrap());
+}
+
+/// A `vk dev list` that failed is not shown again: the next load lists anew.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_dev_list_is_not_kept() {
+    let vk = stub_vk(
+        "devfail",
+        r#"d=$(dirname "$0")
+if [ -e "$d/failed" ]; then echo '[]'; else touch "$d/failed"; echo 'no state' >&2; exit 1; fi"#,
+    );
+    let (addr, hub, _, _) = start_with_vk(None, vk.clone(), local::VIEWS_FRESH).await;
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/dev", Some(&cookie)).await;
+    assert!(page.body.contains("no state"), "{}", page.body);
+    let page = get(addr, "/dev", Some(&cookie)).await;
+    assert!(
+        page.body.contains("keeps no dev environment"),
+        "{}",
+        page.body
+    );
+    let _ = std::fs::remove_dir_all(vk.parent().unwrap());
+}

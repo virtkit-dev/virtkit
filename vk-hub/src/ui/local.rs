@@ -62,6 +62,9 @@ pub(super) async fn get(path: &str, auth: &Auth, ui: &Ui) -> Option<Response<Bod
     if path == "/" {
         return Some(super::page(list(auth, &ui.local.listing())));
     }
+    if path == "/dev" {
+        return Some(super::dev::page(auth, ui).await);
+    }
     let id = path.strip_prefix("/vm/").filter(|id| valid_id(id))?;
     let Some((w, mem)) = ui.local.workload(id) else {
         return Some(super::message(
