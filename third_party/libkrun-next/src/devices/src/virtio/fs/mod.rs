@@ -9,6 +9,9 @@ mod multikey;
 mod null_fs;
 mod read_only;
 mod server;
+// Single-file shares (local patch, see VENDOR.md).
+#[cfg(target_os = "linux")]
+mod single_file;
 pub mod virtual_entry;
 mod worker;
 

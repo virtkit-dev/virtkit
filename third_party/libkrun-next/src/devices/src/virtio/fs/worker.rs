@@ -32,6 +32,10 @@ enum FsServer {
     ReadWrite(Server<AugmentFs<PassthroughFs>>),
     ReadOnly(Server<AugmentFs<PassthroughFsRo>>),
     Null(Server<AugmentFs<NullFs>>),
+    // A share whose root is a single host file: serves only that file, never its parent
+    // (a single-file bind mount). No AugmentFs — it injects no virtual entries.
+    #[cfg(target_os = "linux")]
+    SingleFile(Server<super::single_file::SingleFileFs>),
 }
 
 impl FsServer {
@@ -64,6 +68,16 @@ impl FsServer {
                 map_sender,
             ),
             FsServer::Null(s) => s.handle_message(
+                r,
+                w,
+                allow_idmap,
+                shm_region,
+                exit_code,
+                #[cfg(target_os = "macos")]
+                map_sender,
+            ),
+            #[cfg(target_os = "linux")]
+            FsServer::SingleFile(s) => s.handle_message(
                 r,
                 w,
                 allow_idmap,
@@ -108,6 +122,18 @@ impl FsWorker {
     ) -> Result<Self, io::Error> {
         let inode_alloc = Arc::new(InodeAllocator::new());
         let server = match passthrough_cfg {
+            // A share rooted at a regular file → serve just that file (single-file bind),
+            // never opening or exposing its parent directory. Linux only: elsewhere a file
+            // root keeps failing in `PassthroughFs::new`.
+            #[cfg(target_os = "linux")]
+            Some(cfg)
+                if std::fs::metadata(&cfg.root_dir)
+                    .map(|m| m.is_file())
+                    .unwrap_or(false) =>
+            {
+                let fs = super::single_file::SingleFileFs::new(cfg.root_dir.into(), read_only)?;
+                FsServer::SingleFile(Server::new(fs))
+            }
             Some(cfg) if read_only => {
                 let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
                 FsServer::ReadOnly(Server::new(AugmentFs::new(

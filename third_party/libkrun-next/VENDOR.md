@@ -105,3 +105,14 @@ and their read-only and `AugmentFs` wrappers all get it. Unix hosts only: the Wi
 joins names onto a `PathBuf`, where `\` and drive prefixes are separators too. LOOKUP and
 RENAME tests drive the refusal through the server and check that only single components
 reach the filesystem. Search for `entry_name`.
+
+### Single-file shares (forward-ported from the 1.19 tree)
+
+`src/devices/src/virtio/fs/{single_file.rs (new),mod.rs,worker.rs}` — on Linux, a share whose
+root is a regular file serves that file alone, never its parent directory (a single-file
+bind mount, which `vk run -v host-file:guest-file` asks for). `SingleFileFs` exposes a root directory
+holding the one file, read-only or read-write as the share is; a guest create or rename
+stages vk-named scratch files in the host parent directory, reclaimed on drop. It has no
+`AugmentFs` wrapper or virtual entries. Elsewhere a file root still fails in
+`PassthroughFs::new`. The 1.19 tree's public `single_file` module is private here. Covered
+by `single_file::tests`.
