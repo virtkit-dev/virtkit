@@ -7,16 +7,19 @@ use std::fmt::{Display, Formatter};
 use std::sync::{Arc, Mutex};
 
 use devices::Bus;
+use devices::legacy::GsiRoutes;
 use devices::pci::{
     BarWindow, ConfigMechanism1, Ecam, PciAddress, PciFunction, PciIntxLine, PciRootError,
 };
 use devices::virtio::{
     CreatePciTransportError, VIRTIO_PCI_BAR0_SIZE, VirtioDevice, VirtioPciTransport,
 };
-use kvm_ioctls::VmFd;
+use kvm_ioctls::{IoEventAddress, NoDatamatch, VmFd};
 use vm_memory::GuestMemoryMmap;
 
 const PCI_BUS0: u8 = 0;
+/// GSIs below this are the IOAPIC's pins (and their PIC aliases).
+const IOAPIC_NUM_PINS: u32 = arch::x86_64::layout::IRQ_MAX + 1;
 
 #[derive(Debug)]
 pub enum Error {
@@ -24,6 +27,8 @@ pub enum Error {
     CreateTransport(CreatePciTransportError),
     IrqsExhausted,
     PciRoot(PciRootError),
+    RegisterIoEvent(kvm_ioctls::Error),
+    RegisterIrqFd(kvm_ioctls::Error),
 }
 
 impl Display for Error {
@@ -33,6 +38,8 @@ impl Display for Error {
             Self::CreateTransport(err) => write!(f, "failed to create virtio-pci transport: {err}"),
             Self::IrqsExhausted => write!(f, "no more GSIs are available for PCI INTx"),
             Self::PciRoot(err) => write!(f, "failed to register PCI function: {err}"),
+            Self::RegisterIoEvent(err) => write!(f, "failed to register queue ioeventfd: {err}"),
+            Self::RegisterIrqFd(err) => write!(f, "failed to register MSI-X irqfd: {err}"),
         }
     }
 }
@@ -45,6 +52,12 @@ pub struct PciHostManager {
     next_device: u8,
     irq: u32,
     functions: Vec<arch::x86_64::PciFunctionInfo>,
+    /// The next KVM GSI for an MSI-X vector: above the IOAPIC's pins, which keep their
+    /// default routes (local patch, see VENDOR.md).
+    next_msi_gsi: u32,
+    /// The VM's GSI routing table, shared by every transport's MSI-X state. Created with the
+    /// first device, when the VM fd is known.
+    msi_routes: Option<Arc<Mutex<GsiRoutes>>>,
 }
 
 struct KvmPciIntxLine {
@@ -67,6 +80,8 @@ impl PciHostManager {
             next_device: 1,
             irq: arch::x86_64::layout::IRQ_BASE,
             functions: Vec::new(),
+            next_msi_gsi: IOAPIC_NUM_PINS,
+            msi_routes: None,
         }
     }
 
@@ -114,10 +129,34 @@ impl PciHostManager {
         if bar_base + VIRTIO_PCI_BAR0_SIZE > arch::x86_64::layout::PCI_BAR_END {
             return Err(Error::IrqsExhausted);
         }
-        let intx_line = Arc::new(KvmPciIntxLine { vm, gsi: irq });
+        let intx_line = Arc::new(KvmPciIntxLine {
+            vm: vm.clone(),
+            gsi: irq,
+        });
         let transport =
             VirtioPciTransport::new(guest_memory, device, irq as u8, intx_line, bar_base as u32)
                 .map_err(Error::CreateTransport)?;
+
+        // MSI-X: one MSI GSI per vector, raised by its irqfd; the transport programs the
+        // GSI's route when the driver writes the vector's message. Queue notifications go
+        // straight to the device's queue eventfds through ioeventfds instead of trapping.
+        let routes = self
+            .msi_routes
+            .get_or_insert_with(|| Arc::new(Mutex::new(GsiRoutes::new(vm.clone()))))
+            .clone();
+        let mut gsis = Vec::new();
+        for irqfd in transport.msix_irqfds() {
+            let gsi = self.next_msi_gsi;
+            vm.register_irqfd(&irqfd, gsi)
+                .map_err(Error::RegisterIrqFd)?;
+            gsis.push(gsi);
+            self.next_msi_gsi += 1;
+        }
+        transport.set_msix_gsis(&gsis, routes);
+        for (address, event) in transport.queue_notify_ioevents() {
+            vm.register_ioevent(&event, &IoEventAddress::Mmio(address), NoDatamatch)
+                .map_err(Error::RegisterIoEvent)?;
+        }
 
         let function: Arc<Mutex<dyn PciFunction>> = Arc::new(Mutex::new(transport));
         self.root
