@@ -51,7 +51,7 @@ Run the host preflight before debugging a failed boot:
 vk check
 ```
 
-It checks KVM access, the selected VMM backend, the guest kernel and agent, and the
+It checks KVM access, the embedded VMM, the guest kernel and agent, and the
 host-side requirements for configured features. Scripts can require a release with
 `vk check --min-version 0.45`, which exits non-zero on an older `vk`.
 
@@ -291,9 +291,8 @@ invalidation per 2 MiB range whatever the file's size, so by default only regula
 through the guest's page cache as without DAX; `<size>:always` maps every file, and
 `<size>:inode=<min>` moves the floor. Each guest supports 64G of windows — eight at the
 default size, with further shares served without DAX. Guests with more than 63.25G of RAM
-have no room for windows and receive none. DAX requires the built-in VMM. Under
-`VIRTKIT_VMM=cloud-hypervisor`, and for single-file binds and `vk build` stage guests,
-shares are served the ordinary way.
+have no room for windows and receive none. Single-file binds and `vk build` stage guests
+are served the ordinary way.
 
 A guest gets one interface, `eth0`, by default. `nics` gives it more — `eth1` upward, each
 with its own address on the same LAN — for an appliance that assigns services to separate
@@ -526,7 +525,7 @@ vk list . --field pid                   # the pid to hand to vk stop
 vk list . --field guest_ip              # the VM's address on the --net LAN
 vk list . --field label --field services.0.ip
 vk list . --field published.0.listen    # where the first published port listens
-vk list --json | jq '.[] | select(.vmm == "cloud-hypervisor")'
+vk list --json | jq '.[] | select(.label == "ci")'
 ```
 
 `--stale` adds a column to the table, and a `STALE` row to a full record, reading `yes`,
@@ -638,9 +637,8 @@ local store. The central server and storage model are documented in
 
 ## Architecture
 
-The default VMM is the embedded [libkrun](https://github.com/containers/libkrun). An
-external [Cloud Hypervisor](https://www.cloudhypervisor.org/) binary can be selected with
-the `vmm` configuration key or `VIRTKIT_VMM=cloud-hypervisor`.
+The VMM is the embedded [libkrun](https://github.com/containers/libkrun); `vk` needs no
+external VMM binary.
 
 The host converts OCI layers to native ext4 images in userspace. Build inputs identify
 cached disks and instruction snapshots. Guests communicate with the host over vsock for
@@ -704,7 +702,6 @@ The small environment-variable surface is:
 | Variable | Effect |
 | --- | --- |
 | `VIRTKIT_CONFIG` | Select a configuration file. |
-| `VIRTKIT_VMM` | Override the VMM backend; currently useful for `cloud-hypervisor`. |
 | `VIRTKIT_DEBUG=1` | Enable verbose VMM and guest logging. |
 | `VK_SWITCH_LOG=debug` | Set the userspace network switch's log level in `switch.log` (default: `warn`). |
 | `VIRTKIT_TIMING=1` | Print per-phase build and boot timing. |

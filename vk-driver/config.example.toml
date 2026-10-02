@@ -3,8 +3,6 @@
 # Example targeting a bootable guest bundle; every key is optional.
 
 # state_dir = "/var/lib/virtkit"          # job state: <state_dir>/jobs/<job id>/
-# vmm = "libkrun"                          # or "cloud-hypervisor"; VIRTKIT_VMM overrides
-# cloud_hypervisor = "/usr/local/bin/cloud-hypervisor"
 # image_cache_idle_secs = 1800   # a materialized image base (registry/docker) left idle
 #                                # this many seconds is evicted at the next fresh pull into
 #                                # that tier; a base under a live overlay is never evicted. 30 min.
@@ -61,7 +59,6 @@
 # keeps its own. A service that sets neither shares the run policy.
 
 # [build]                # defaults for `vk build` (a CLI flag always overrides).
-# cloud_hypervisor = "/usr/local/bin/cloud-hypervisor"  # default: top-level cloud_hypervisor
 # kernel = "/usr/local/lib/vk/vmlinux"             # build guest kernel
 # agent = "/usr/local/lib/vk/vk-agent"        # injected as PID 1
 # cache_registry = "127.0.0.1:5000"
@@ -265,8 +262,7 @@
 #                      # Guests above 63.25G RAM get none. A bare size maps only regular
 #                      # files of 1M and more (each mapping costs a host mmap per 2M range,
 #                      # which a small file never repays); "8G:always" maps every file,
-#                      # "8G:inode=64K" moves the floor. "off" disables it; ignored by
-#                      # cloud-hypervisor, which has no DAX path
+#                      # "8G:inode=64K" moves the floor. "off" disables it
 # max_cpus = 32        # ceilings for the per-job MICROVM_CPUS/MICROVM_MEM
 # max_mem = "128G"     # variables (unset = jobs cannot exceed cpus/mem above)
 # nested = false       # let jobs boot microVMs of their own (vk inside vk); needs

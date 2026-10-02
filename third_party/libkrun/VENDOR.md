@@ -22,8 +22,7 @@ that a static `libkrun.a` link hits.
 shares. A new `idmap` module (soft, virtiofsd `--uid-map`/`--gid-map`-compatible: `map:`,
 `squash-guest:`, `forbid-guest:`, …) wraps `PassthroughFs` inside `AugmentFs` when a map is
 configured; `FsDeviceConfig` carries the maps and `krun_add_virtiofs4(…, uid_map, gid_map)`
-sets them (`krun_add_virtiofs3` delegates with none). The `idmap` module is the same engine
-the bundled `vk virtiofsd` uses (moved here from vk-driver so both backends share it).
+sets them (`krun_add_virtiofs3` delegates with none).
 Additive: with no map, behaviour is unchanged. Used by virtkit to squash the GitLab
 `host_checkout` share onto the host runner user so a non-root job can write it.
 
@@ -67,8 +66,8 @@ expose the fs engine to external transports: `Reader/Writer::from_volatile_slice
 constructors (build a FUSE request view from buffers collected by another virtio
 transport, e.g. vhost-user) and public `filesystem`/`read_only` modules plus `pub use`
 of `Server` and `InodeAllocator`. Additive only — nothing upstream changes behaviour.
-Used by virtkit's bundled `vk virtiofsd` daemon (vk-driver/src/virtiofsd), which serves
-cloud-hypervisor's vhost-user shares with this fs engine instead of the virtiofsd crate.
+No longer used: virtkit's vhost-user `vk virtiofsd` daemon, which served cloud-hypervisor's
+shares with this fs engine, is gone; the patch goes when the vendored tree is next replaced.
 
 `src/arch/src/x86_64/mod.rs` — place the initrd below 4 GiB. It was placed at the top
 of all guest RAM, but the boot protocol's `setup_header` here has no `ext_ramdisk_image`
@@ -234,10 +233,10 @@ Additive: without the call, behaviour is unchanged. Used by `vk run --pmu`.
 `src/vmm/src/resources.rs` + `src/vmm/src/builder.rs` + `src/libkrun/src/lib.rs` — make the
 virtio-balloon device opt-out: `krun_disable_balloon(ctx)` sets `VmResources.disable_balloon`,
 which `build_microvm` checks before attaching it. Upstream always attaches one, so a caller
-could not boot without free-page reporting or reclaim the virtio-pci slot it spends — and
-virtkit's own `VmSpec::balloon` axis was silently ignored on this backend while
-cloud-hypervisor honored it. Spelled as a disable (like `disable_implicit_console`) so the
-`Default` keeps attaching a balloon. Additive: without the call, behaviour is unchanged.
+could not boot without free-page reporting or reclaim the virtio-pci slot it spends, and
+virtkit's own `VmSpec::balloon` axis was silently ignored. Spelled as a disable (like
+`disable_implicit_console`) so the `Default` keeps attaching a balloon. Additive: without the
+call, behaviour is unchanged.
 Search for `disable_balloon`.
 
 `src/devices/src/virtio/block/{lazy_chunk_storage.rs (new),device.rs,mod.rs}` +
@@ -392,8 +391,8 @@ one component. `LOOKUP`, `MKNOD`, `MKDIR`, `SYMLINK` (its new name, not the targ
 resolve names with `*at()` against the parent's `O_PATH` descriptor and relied on the guest
 kernel never sending such a name, so a guest kernel that did — and a job can bring its own —
 walked out of the share to anything the VMM's user can read or write. Upstream virtiofsd
-refuses the same names (`validate_path_component`). In the server, so the in-process engine,
-its read-only and id-mapped wrappers and the bundled `vk virtiofsd` all get it. LOOKUP and
+refuses the same names (`validate_path_component`). In the server, so the in-process engine
+and its read-only and id-mapped wrappers all get it. LOOKUP and
 RENAME tests drive the refusal through the server and check that only single components reach
 the filesystem. Search for `entry_name`.
 

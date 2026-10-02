@@ -65,10 +65,7 @@ one that also runs fork merge requests.
 
 The host must be loaded with `kvm_intel.nested=1` / `kvm_amd.nested=1`;
 `vk check --feature gitlab` reports when it is not, and `prepare` refuses the
-job rather than booting a guest that cannot nest — on either backend. The
-setting itself is the libkrun backend's: under `VIRTKIT_VMM=cloud-hypervisor`
-nothing masks VMX/SVM, so a job nests whenever the host allows it, setting or
-no setting.
+job rather than booting a guest that cannot nest.
 
 ### Host-side checkouts
 
@@ -711,8 +708,7 @@ windows — eight at the default size, with further shares served without DAX. G
 more than 63.25G of RAM have no room for windows and receive none.
 Mappings are 4 KiB-granular, so the benefit is avoiding a tools tree's memory cost per
 VM, not per-fault latency. Compose services inherit the job VM's
-setting unless they declare `x-virtkit.dax`. DAX requires the built-in VMM;
-cloud-hypervisor has no DAX path and serves shares the ordinary way whatever this says.
+setting unless they declare `x-virtkit.dax`.
 
 ### Keeping the host inside its memory
 
@@ -942,11 +938,11 @@ To measure what it is worth on a given host, run the same job (or the same `vk b
 once with `mode = "off"` and once with `mode = "auto"`, and compare the wall time the trace
 reports. The kernel's own counters say whether the difference is the placement: while the VM
 runs, `numastat -p <vmm>` breaks that VMM's resident memory down per node. `-p` takes a
-process-name pattern as well as a pid, which is the easier handle on a job: under libkrun the
-job's VMM is named `vk:<hostname>` (`[executor.vm] hostname`), under cloud-hypervisor it is
-`cloud-hypervisor`. `numastat` with no arguments counts the allocations that did not land on
-the node that asked, `numa_miss` and `other_node`. A placed VM concentrates its pages on one
-node and stops growing `other_node`; an interleaved one splits them evenly. Check the
+process-name pattern as well as a pid, which is the easier handle on a job: the job's VMM is
+named `vk:<hostname>` (`[executor.vm] hostname`). `numastat` with no arguments counts the
+allocations that did not land on the node that asked, `numa_miss` and `other_node`. A placed
+VM concentrates its pages on one node and stops growing `other_node`; an interleaved one
+splits them evenly. Check the
 `virtkit: NUMA:` line first when a run measures the same either way: a VM wider than a node is
 interleaved in both, and interleaving is not what the comparison is testing.
 

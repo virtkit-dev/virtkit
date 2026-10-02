@@ -205,7 +205,7 @@ Canaries must pass this validation and a configured observation window before th
 Where representative job results are used, require an explicit minimum number of successes;
 a quiet node does not satisfy the gate merely by waiting. Persist the evidence and the window
 with the rollout so a hub restart does not bypass them. Allow operator-defined canary groups
-for material configuration differences, such as VMM backend, kernel and executor settings,
+for material configuration differences, such as VMM version, kernel and executor settings,
 alongside the hardware profile. Show uncovered groups before starting a rollout. This gate is
 not built, nor are updates and rollouts.
 

@@ -21,11 +21,11 @@ Skip badges on restatements, tool output, and descriptions of your own next step
 
 virtkit — a rootless microVM toolkit shipped as static-musl binaries (`vk` + the
 embedded `vk-agent`, plus the optional `vk-registry` central server, the
-`vk-runnerctl` runner throttle and the experimental `vk-hub` fleet hub and local web UI), with the VMM built in. It boots OCI/Docker images as fast microVMs on its embedded
-[libkrun](https://github.com/containers/libkrun) VMM ([Cloud Hypervisor](https://www.cloudhypervisor.org/)
-stays available as an external backend via `VIRTKIT_VMM=cloud-hypervisor`), gives
-them a shared LAN with egress over ordinary host sockets (no tap, no bridge, no
-`CAP_NET_ADMIN`, no root), and drives commands into them over `vsock`.
+`vk-runnerctl` runner throttle and the experimental `vk-hub` fleet hub and local web UI).
+It boots OCI/Docker images as fast microVMs on its embedded
+[libkrun](https://github.com/containers/libkrun) VMM, gives them a shared LAN with egress
+over ordinary host sockets (no tap, no bridge, no `CAP_NET_ADMIN`, no root), and drives
+commands into them over `vsock`.
 The same codebase powers local compose-service VMs and a GitLab custom executor. See
 [`README.md`](README.md) for the full feature tour.
 
@@ -41,8 +41,8 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with nine crates:
 - **`vk-driver/`** — the host driver (depends on `vk-core`): image building/conversion
   (OCI → ext4/initramfs), the compose service runner + control plane, the GitLab executor,
   the userspace L2 network switch (ARP/DHCP/DNS + transparent TCP/UDP egress via
-  `ipstack`), the libkrun VMM backend (`vmm`/`libkrun_sys`, default; the pinned guest
-  kernel and vk-agent are embedded so `vk` runs self-contained).
+  `ipstack`), and the libkrun VMM (`vmm`/`libkrun_sys`; the pinned guest kernel and
+  vk-agent are embedded so `vk` runs self-contained).
 - **`vk-agent/`** — the guest PID 1 / agent (depends on `vk-core`): brings a systemd-less
   guest up (mounts, networking, hostname, virtio-fs, optional SSH) and serves an exec
   channel over `vsock` so the host can run commands inside the VM.

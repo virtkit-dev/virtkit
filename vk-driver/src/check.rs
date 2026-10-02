@@ -1,5 +1,5 @@
 //! `vk check`: host preflight. Verifies the current user can actually boot
-//! microVMs (/dev/kvm access, the selected VMM backend, a guest kernel + agent)
+//! microVMs (/dev/kvm access, the embedded VMM, a guest kernel + agent)
 //! and that each feature the config enables has its host side in place (net.mode
 //! taps, [docker] credentials, [registry] store/credentials, ...). Some features
 //! are checked only when named with `--feature`: the CI-executor ones (gitlab,
