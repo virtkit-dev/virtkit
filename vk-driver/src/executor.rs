@@ -486,8 +486,7 @@ fn report_project_usage(ctx: &JobCtx) {
     }
 }
 
-/// The exec-channel connect address for this job's VM, matching the selected backend
-/// (hybrid vsock-mux for cloud-hypervisor, a plain unix socket for libkrun).
+/// The exec-channel connect address for this job's VM: libkrun's per-port socket.
 pub fn vsock_addr(ctx: &JobCtx) -> SocketAddr {
     crate::vmm::exec_addr(&ctx.vsock_sock(), ctx.cfg.executor.vm.vsock_port)
 }

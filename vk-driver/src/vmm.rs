@@ -832,11 +832,8 @@ pub fn selected() -> Box<dyn Vmm> {
     Box::new(Libkrun)
 }
 
-/// The exec-channel connect address: `vsock-auto://<base>:<port>` on every
-/// backend. The client resolves the best path at connect time — libkrun's
-/// dedicated per-port listener (raw, no relay) when it answers, else the CONNECT
-/// handshake on Cloud Hypervisor's hybrid base socket. One address form, no
-/// backend knowledge anywhere.
+/// The exec-channel connect address: `vsock-auto://<base>:<port>`, libkrun's dedicated
+/// per-port listener (raw, no relay).
 pub fn exec_addr(vsock_socket: &Path, port: u32) -> SocketAddr {
     SocketAddr::VsockAuto {
         path: vsock_socket.to_path_buf(),

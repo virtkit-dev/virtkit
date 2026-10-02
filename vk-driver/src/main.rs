@@ -1064,8 +1064,8 @@ enum Cmd {
     /// plumbing: splice stdio to the target address — the SSH `ProxyCommand` shape
     ///
     /// ssh hands its protocol stream on stdio; we relay it to the guest's ssh-serve (`run
-    /// --ssh` prints the full invocation). Addresses: a unix path, vsock-mux://<path>:<port>,
-    /// vsock-auto://<path>:<port> (best path per backend), tcp://host:port.
+    /// --ssh` prints the full invocation). Addresses: a unix path, vsock-auto://<path>:<port>
+    /// (the VMM's per-port socket), tcp://host:port.
     #[command(hide = true)]
     Connect {
         /// Target address to dial
@@ -4680,15 +4680,9 @@ fn write_path(path: &Path) -> ExitCode {
 /// to tell an explicit `vsock-auto://…` from a directory selector — a bare path otherwise parses
 /// as a `unix:` address, so scheme-matching is the only reliable split.
 fn is_agent_addr(s: &str) -> bool {
-    [
-        "systemd://",
-        "vsock://",
-        "vsock-mux://",
-        "vsock-auto://",
-        "tcp://",
-    ]
-    .iter()
-    .any(|scheme| s.starts_with(scheme))
+    ["systemd://", "vsock://", "vsock-auto://", "tcp://"]
+        .iter()
+        .any(|scheme| s.starts_with(scheme))
 }
 
 /// The console log of the VM `target` selects (a project directory, default cwd), or of its
@@ -4701,7 +4695,7 @@ fn console_log_path(target: Option<&Path>, service: Option<&str>) -> anyhow::Res
             None => entry.state_dir,
             // `vsock-auto://<svc-dir>/vsock.sock:4444`: the directory is the socket's parent.
             Some(name) => match resolve_service_addr(&entry, name)? {
-                SocketAddr::VsockAuto { path, .. } | SocketAddr::VsockMux { path, .. } => path
+                SocketAddr::VsockAuto { path, .. } => path
                     .parent()
                     .map(Path::to_path_buf)
                     .ok_or_else(|| anyhow::anyhow!("service {name:?}: odd exec address"))?,

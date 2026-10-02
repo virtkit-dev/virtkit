@@ -25,9 +25,9 @@ use crate::net::{raw_connect, raw_listen};
 /// but the local end is the process's own stdin/stdout instead of a listener —
 /// the shape an SSH `ProxyCommand` needs. ssh hands us its protocol stream on
 /// stdio and we relay it to `target` (e.g. the guest sshd reached over the
-/// hybrid vsock-mux), so VS Code Remote-SSH attaches to the microVM with no
-/// guest network. Nothing may log to stdout while this runs — it is the SSH byte
-/// stream.
+/// VMM's per-port vsock socket), so VS Code Remote-SSH attaches to the microVM
+/// with no guest network. Nothing may log to stdout while this runs — it is the
+/// SSH byte stream.
 pub async fn run_connect(target: &SocketAddr) -> Result<()> {
     let mut conn = raw_connect(target)
         .await

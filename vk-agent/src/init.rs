@@ -104,7 +104,7 @@
 //!   VIRTKIT_MODE=service fork the boot config's entrypoint; the agent stays as PID 1
 //!                        and reaps orphans. A systemd image hands off via its entrypoint.
 //!   VIRTKIT_SERVE=1      (service) also start the vsock exec server (port 4444) for
-//!                        live debugging: `vk-agent -s vsock-mux://<vsock.sock>:4444 exec`
+//!                        live debugging: `vk-agent -s vsock-auto://<vsock.sock>:4444 exec`
 //!   VIRTKIT_DEBUG=1      (service) fork+wait the entrypoint, then hold the VM on exit
 //!                        for post-mortem inspection (overrides VIRTKIT_SERVE)
 //!
@@ -2682,7 +2682,7 @@ fn run_service(cmdline: &HashMap<String, String>, config: Option<&RunConfig>) ->
     wait_for_exposed_ports(cmdline, &cfg, service_pid);
 
     // VIRTKIT_SERVE=1: start the vsock exec server — the readiness signal prepare polls, also a
-    // live-debugging channel: vk-agent -s vsock-mux://<vsock.sock>:4444 exec -- <cmd>
+    // live-debugging channel: vk-agent -s vsock-auto://<vsock.sock>:4444 exec -- <cmd>
     let serve_pid = if cmdline.get("VIRTKIT_SERVE").map(String::as_str) == Some("1") {
         let socket = socket_from_cmdline();
         match spawn_serve(&socket, None) {

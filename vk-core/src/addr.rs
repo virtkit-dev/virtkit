@@ -7,13 +7,8 @@ use anyhow::anyhow;
 /// - `systemd://`: socket activation, unix or vsock listeners (serve only)
 /// - `vsock://[cid:]port`: AF_VSOCK; without a cid, serve binds any cid and
 ///   connect targets the host (cid 2)
-/// - `vsock-mux://path:port`: "hybrid vsock" of Cloud Hypervisor / Firecracker —
-///   the unix socket the VMM exposes on the host, multiplexing guest vsock ports
-///   behind a `CONNECT <port>` handshake (connect only)
-/// - `vsock-auto://path:port`: resolve the best host→guest path for a guest port
-///   at connect time — the dedicated per-port socket `<path>_<port>` (raw, no
-///   relay) when one answers, else the `CONNECT` handshake on `<path>` — so one
-///   address works on every VMM backend (connect only)
+/// - `vsock-auto://path:port`: the VMM's dedicated host→guest socket
+///   `<path>_<port>` (connect only)
 /// - `tcp://host:port`: AF_INET(6); the only kind a stock TCP client (e.g. a
 ///   guest dockerd talking to a forwarded registry) can use as an endpoint
 /// - anything else: path of a unix socket
@@ -22,7 +17,6 @@ pub enum SocketAddr {
     Systemd,
     Unix(PathBuf),
     Vsock { cid: Option<u32>, port: u32 },
-    VsockMux { path: PathBuf, port: u32 },
     VsockAuto { path: PathBuf, port: u32 },
     Tcp(std::net::SocketAddr),
 }
@@ -42,14 +36,12 @@ impl std::str::FromStr for SocketAddr {
                 cid,
                 port: parse_num(port, "port")?,
             })
-        } else if let Some(rest) = s.strip_prefix("vsock-mux://") {
-            let (path, port) = rest
-                .rsplit_once(':')
-                .ok_or_else(|| anyhow!("vsock-mux:// expects <path>:<port>"))?;
-            Ok(SocketAddr::VsockMux {
-                path: path.into(),
-                port: parse_num(port, "port")?,
-            })
+        } else if s.starts_with("vsock-mux://") {
+            // Otherwise this parses as a unix socket path and fails later with a less helpful error.
+            Err(anyhow!(
+                "vsock-mux:// is no longer supported (cloud-hypervisor was removed); \
+                 use vsock-auto://<path>:<port>"
+            ))
         } else if let Some(rest) = s.strip_prefix("vsock-auto://") {
             let (path, port) = rest
                 .rsplit_once(':')
@@ -103,9 +95,6 @@ impl fmt::Display for SocketAddr {
                 cid: Some(cid),
                 port,
             } => write!(f, "vsock://{cid}:{port}"),
-            SocketAddr::VsockMux { path, port } => {
-                write!(f, "vsock-mux://{}:{port}", path.display())
-            }
             SocketAddr::VsockAuto { path, port } => {
                 write!(f, "vsock-auto://{}:{port}", path.display())
             }
@@ -181,15 +170,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_vsock_mux() {
-        assert_eq!(
-            parse("vsock-mux:///tmp/vsock.sock:4444"),
-            SocketAddr::VsockMux {
-                path: "/tmp/vsock.sock".into(),
-                port: 4444
-            }
-        );
-        assert!("vsock-mux:///tmp/vsock.sock".parse::<SocketAddr>().is_err());
+    fn vsock_mux_is_refused_by_name() {
+        let err = "vsock-mux:///tmp/vsock.sock:4444"
+            .parse::<SocketAddr>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("vsock-auto://"), "{err}");
     }
 
     #[test]
@@ -225,7 +211,6 @@ mod tests {
             "/tmp/x.socket",
             "vsock://4444",
             "vsock://3:4444",
-            "vsock-mux:///tmp/vsock.sock:4444",
             "vsock-auto:///tmp/vsock.sock:4444",
             "tcp://127.0.0.1:5000",
         ] {

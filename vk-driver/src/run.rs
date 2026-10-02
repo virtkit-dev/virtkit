@@ -2381,8 +2381,7 @@ async fn build_and_boot(
             args.ssh_alias
         );
     } else if args.ssh {
-        // vsock-auto: the ProxyCommand picks the best path itself — the per-port
-        // listener when the backend has one, else the CONNECT handshake.
+        // vsock-auto: the ProxyCommand dials the VMM's per-port listener.
         let target = format!("vsock-auto://{}:{SSH_VSOCK_PORT}", vsock.display());
         let exe = match std::env::current_exe().context("locating the virtkit binary") {
             Ok(exe) => exe,
@@ -3795,8 +3794,7 @@ async fn wait_ssh_serving(
 }
 
 /// Dial the guest's SSH port and read the identification prefix. The timeout includes
-/// `raw_connect` because its mux handshake waits for the VMM's status line; a stalled VMM
-/// must not prevent the caller from reaching its deadline.
+/// `raw_connect`, so a stalled VMM socket cannot keep the caller past its deadline.
 async fn ssh_greets(addr: &SocketAddr, budget: Duration) -> Result<()> {
     tokio::time::timeout(budget, async {
         let mut conn = vk_core::net::raw_connect(addr).await?;

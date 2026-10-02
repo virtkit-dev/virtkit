@@ -7,12 +7,11 @@ use log::{debug, info};
 use std::net::Ipv4Addr;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio_vsock::{VMADDR_CID_ANY, VMADDR_CID_HOST, VsockAddr, VsockListener, VsockStream};
 
-/// Establishing a connection (including the vsock-mux handshake) must not hang on a
-/// stuck server / VMM — running commands have no deadline, but connecting does.
+/// Bound connection setup against a stuck server / VMM; running commands have no deadline.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Link MTU shared by the switch and its virtio NICs.
@@ -41,15 +40,14 @@ async fn connect_inner(socket: &SocketAddr) -> Result<(SerStream, DeSink), anyho
                 .with_context(|| format!("connecting to vsock {addr:?}"))?;
             Ok(wrap_stream(stream))
         }
-        SocketAddr::VsockMux { path, port } => Ok(wrap_stream(connect_mux(path, *port).await?)),
         SocketAddr::VsockAuto { path, port } => Ok(wrap_stream(connect_auto(path, *port).await?)),
         SocketAddr::Tcp(_) => bail!("tcp:// is for `forward` only, not the virtkit-agent protocol"),
     }
 }
 
 /// The host-side socket of guest `port` on the hybrid-vsock suffix convention:
-/// `<base>_<port>` — the single spelling of that suffix, shared by the VMM
-/// backends, the bridge forwards, and `vsock-auto://` resolution.
+/// `<base>_<port>` — the single spelling of that suffix, shared by the VMM, the
+/// bridge forwards, and `vsock-auto://`.
 pub fn hybrid_socket(base: &Path, port: u32) -> PathBuf {
     let mut socket = base.as_os_str().to_owned();
     socket.push(format!("_{port}"));
@@ -67,61 +65,17 @@ pub fn mac_for_ip(ip: Ipv4Addr) -> String {
     format!("52:54:00:{:02x}:{:02x}:{:02x}", o[1], o[2], o[3])
 }
 
-/// `vsock-auto://`: resolve the best host→guest path for a guest port at connect
-/// time. A dedicated per-port listener at `<base>_<port>` (libkrun) is raw and
-/// relay-free, so it is preferred; anything short of a connected socket falls
-/// back to the `CONNECT` handshake on `<base>` (Cloud Hypervisor's hybrid
-/// socket). One address form for every backend.
+/// `vsock-auto://`: the dedicated per-port listener the VMM keeps at `<base>_<port>` for a
+/// host→guest port — raw and relay-free.
 ///
 /// Only meaningful for host→guest ports: a guest→host bridge port puts a *host*
-/// listener on the same `<base>_<port>` path, which this resolution would
-/// connect to instead of the guest.
+/// listener on the same `<base>_<port>` path, which this would connect to instead of
+/// the guest.
 async fn connect_auto(path: &Path, port: u32) -> Result<UnixStream, anyhow::Error> {
     let per_port = hybrid_socket(path, port);
-    let direct_err = match unixpath::connect_tokio(&per_port).await {
-        Ok(stream) => return Ok(stream),
-        Err(e) => e,
-    };
-    connect_mux(path, port).await.with_context(|| {
-        format!(
-            "vsock-auto: per-port socket {} unusable ({direct_err}), and the mux handshake failed",
-            per_port.display()
-        )
-    })
-}
-
-/// "Hybrid vsock" (Cloud Hypervisor, Firecracker): connect to the unix socket the VMM
-/// exposes on the host and ask it to forward to a guest vsock port: send
-/// `CONNECT <port>\n`, the VMM answers `OK <local port>\n` once the guest accepts, and
-/// from there the stream is raw end-to-end.
-async fn connect_mux(path: &Path, port: u32) -> Result<UnixStream, anyhow::Error> {
-    let mut stream = unixpath::connect_tokio(path)
+    unixpath::connect_tokio(&per_port)
         .await
-        .with_context(|| format!("connecting to vsock mux {}", path.display()))?;
-    stream
-        .write_all(format!("CONNECT {port}\n").as_bytes())
-        .await?;
-    // Read the status line one byte at a time: anything past the '\n' already belongs
-    // to the virtkit-agent protocol and must not be consumed here.
-    let mut line = Vec::new();
-    loop {
-        let b = stream
-            .read_u8()
-            .await
-            .with_context(|| format!("vsock mux: guest port {port} unreachable"))?;
-        if b == b'\n' {
-            break;
-        }
-        line.push(b);
-        if line.len() > 64 {
-            bail!("vsock mux: invalid response (not a CONNECT status line)");
-        }
-    }
-    let line = String::from_utf8_lossy(&line);
-    if !line.starts_with("OK ") {
-        bail!("vsock mux: connection to guest port {port} refused ({line})");
-    }
-    Ok(stream)
+        .with_context(|| format!("vsock-auto: connecting to {}", per_port.display()))
 }
 
 pub enum Listener {
@@ -201,10 +155,8 @@ pub fn listen(socket: &SocketAddr) -> Result<Listeners, anyhow::Error> {
             );
             Ok(Listeners(vec![Listener::Vsock(listener)]))
         }
-        SocketAddr::VsockMux { .. } | SocketAddr::VsockAuto { .. } => {
-            bail!(
-                "cannot listen on vsock-mux:// / vsock-auto:// (host side of the VMM, connect only)"
-            )
+        SocketAddr::VsockAuto { .. } => {
+            bail!("cannot listen on vsock-auto:// (host side of the VMM, connect only)")
         }
         SocketAddr::Tcp(_) => bail!("tcp:// is for `forward` only, not the virtkit-agent protocol"),
     }
@@ -347,8 +299,8 @@ pub async fn resolve_connect_target(target: &str) -> Result<Vec<SocketAddr>, any
     Ok(resolved)
 }
 
-/// Open a raw stream to `target`: tcp, unix, vsock, or hybrid vsock-mux (the
-/// CONNECT handshake runs, then the stream is raw). systemd:// is serve-only.
+/// Open a raw stream to `target`: tcp, unix, vsock, or a VMM's per-port socket
+/// (`vsock-auto://`). systemd:// is serve-only.
 pub async fn raw_connect(target: &SocketAddr) -> Result<RawConn, anyhow::Error> {
     Ok(match target {
         SocketAddr::Tcp(addr) => RawConn::Tcp(
@@ -369,7 +321,6 @@ pub async fn raw_connect(target: &SocketAddr) -> Result<RawConn, anyhow::Error> 
                     .with_context(|| format!("connecting to vsock {addr:?}"))?,
             )
         }
-        SocketAddr::VsockMux { path, port } => RawConn::Unix(connect_mux(path, *port).await?),
         SocketAddr::VsockAuto { path, port } => RawConn::Unix(connect_auto(path, *port).await?),
         SocketAddr::Systemd => bail!("cannot connect to systemd:// (serve only)"),
     })
@@ -433,9 +384,7 @@ pub async fn raw_listen(local: &SocketAddr) -> Result<RawListener, anyhow::Error
                 VsockListener::bind(addr).with_context(|| format!("binding vsock {addr:?}"))?,
             )
         }
-        SocketAddr::VsockMux { .. } | SocketAddr::VsockAuto { .. } => {
-            bail!("cannot listen on vsock-mux:// / vsock-auto:// (connect only)")
-        }
+        SocketAddr::VsockAuto { .. } => bail!("cannot listen on vsock-auto:// (connect only)"),
         SocketAddr::Systemd => bail!("raw_listen does not support systemd://"),
     })
 }
@@ -488,6 +437,7 @@ impl RawListener {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// The MAC contains the QEMU-style prefix and low three IPv4 octets.
     #[test]
@@ -669,11 +619,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// vsock-auto prefers the dedicated per-port socket: the stream is raw (the
-    /// listener sees the payload bytes, no CONNECT line) even though a mux-style
-    /// listener also sits on the base path.
+    /// vsock-auto dials the dedicated per-port socket: the listener sees the raw payload
+    /// bytes, even with a listener on the base path.
     #[tokio::test]
-    async fn vsock_auto_prefers_the_per_port_socket() {
+    async fn vsock_auto_dials_the_per_port_socket() {
         let dir = scratch("auto-direct");
         let base = dir.join("vsock.sock");
         // decoy on the base path: if the client wrongly dials it, direct.accept()
@@ -690,8 +639,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A VM's sockets under a directory deeper than `sun_path` holds are reached all the
-    /// same, the exec channel's per-port socket as well as the mux.
+    /// With no per-port socket, vsock-auto fails naming it rather than dialing the base path.
+    #[tokio::test]
+    async fn vsock_auto_without_a_per_port_socket_names_it() {
+        let dir = scratch("auto-missing");
+        let base = dir.join("vsock.sock");
+        let _decoy = UnixListener::bind(&base).unwrap();
+        let err = format!("{:#}", connect_auto(&base, 4444).await.unwrap_err());
+        assert!(
+            err.contains(&hybrid_socket(&base, 4444).display().to_string()),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A VM's per-port socket remains reachable beyond the `sun_path` limit.
     #[tokio::test]
     async fn vsock_auto_reaches_sockets_past_the_sun_path_limit() {
         let dir = scratch("auto-deep");
@@ -706,46 +668,6 @@ mod tests {
         let mut buf = [0u8; 9];
         served.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"raw-bytes");
-
-        let mux = crate::unixpath::bind_tokio(&base).unwrap();
-        let server = tokio::spawn(async move {
-            let (mut s, _) = mux.accept().await.unwrap();
-            let mut line = [0u8; 13];
-            s.read_exact(&mut line).await.unwrap();
-            assert_eq!(&line, b"CONNECT 5555\n");
-            s.write_all(b"OK 5555\n").await.unwrap();
-        });
-        connect_auto(&base, 5555).await.unwrap();
-        server.await.unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Without a per-port socket, vsock-auto falls back to the CONNECT handshake
-    /// on the base path — the Cloud Hypervisor form.
-    #[tokio::test]
-    async fn vsock_auto_falls_back_to_the_mux_handshake() {
-        let dir = scratch("auto-mux");
-        let base = dir.join("vsock.sock");
-        let mux = UnixListener::bind(&base).unwrap();
-        let server = tokio::spawn(async move {
-            let (mut s, _) = mux.accept().await.unwrap();
-            let mut line = Vec::new();
-            loop {
-                let b = s.read_u8().await.unwrap();
-                if b == b'\n' {
-                    break;
-                }
-                line.push(b);
-            }
-            assert_eq!(line, b"CONNECT 4444");
-            s.write_all(b"OK 4444\n").await.unwrap();
-            let mut buf = [0u8; 9];
-            s.read_exact(&mut buf).await.unwrap();
-            assert_eq!(&buf, b"raw-bytes");
-        });
-        let mut conn = connect_auto(&base, 4444).await.unwrap();
-        conn.write_all(b"raw-bytes").await.unwrap();
-        server.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,18 +1,16 @@
-//! End-to-end tests over a unix socket, and hybrid-vsock (vsock-mux://) handshake
-//! tests against a fake VMM mux. Real AF_VSOCK needs a VM (or the vsock_loopback
+//! End-to-end tests over a unix socket. Real AF_VSOCK needs a VM (or the vsock_loopback
 //! module), so the vsock:// transport itself is not covered here.
 
 use futures::{SinkExt, StreamExt};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixListener};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use vk_core::addr::SocketAddr;
 use vk_core::exec::client::{Stdin, client_run_connect};
 use vk_core::exec::server::run_server;
-use vk_core::framing::wrap_stream;
-use vk_core::messages::{CmdExec, Fd, Message, RunMode, Status, Tty};
+use vk_core::messages::{CmdExec, Fd, Message, RunMode, Tty};
 use vk_core::net::connect;
 use vk_core::status::get_status;
 
@@ -691,58 +689,6 @@ async fn unix_status() {
         .await
         .unwrap()
         .unwrap();
-}
-
-/// Fake VMM mux: accept one connection, expect `CONNECT <port>\n`, send back
-/// `response`, then (if ok) answer one status request like the real server.
-async fn fake_mux(listener: UnixListener, expected_port: u32, response: &str, then_serve: bool) {
-    let (mut stream, _) = listener.accept().await.unwrap();
-    let mut buf = [0u8; 64];
-    let n = stream.read(&mut buf).await.unwrap();
-    assert_eq!(&buf[..n], format!("CONNECT {expected_port}\n").as_bytes());
-    stream.write_all(response.as_bytes()).await.unwrap();
-    if !then_serve {
-        return;
-    }
-    let (mut stream, mut sink) = wrap_stream(stream);
-    assert!(matches!(
-        stream.next().await.unwrap().unwrap(),
-        Message::CmdStatus
-    ));
-    sink.send(Message::RespStatus {
-        status: Status::default(),
-    })
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn vsock_mux_handshake() {
-    let path = tmp_socket_path("mux");
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).unwrap();
-    tokio::spawn(fake_mux(listener, 4444, "OK 1024\n", true));
-
-    let addr = SocketAddr::VsockMux { path, port: 4444 };
-    timeout(Duration::from_secs(10), get_status(&addr))
-        .await
-        .unwrap()
-        .unwrap();
-}
-
-#[tokio::test]
-async fn vsock_mux_refused() {
-    let path = tmp_socket_path("mux-refused");
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path).unwrap();
-    tokio::spawn(fake_mux(listener, 4444, "FAIL\n", false));
-
-    let addr = SocketAddr::VsockMux { path, port: 4444 };
-    let err = timeout(Duration::from_secs(10), get_status(&addr))
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert!(err.to_string().contains("refused"), "got: {err}");
 }
 
 /// Exercise [`Stdin::Closed`] across multiple commands. The client must signal end-of-input

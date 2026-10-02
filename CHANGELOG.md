@@ -12,7 +12,8 @@ All notable changes to virtkit will be documented in this file.
   `vmm = "cloud-hypervisor"` and its `cloud_hypervisor`, `[build] cloud_hypervisor` and
   `virtiofsd` keys are ignored with a warning; drop them. The `--cloud-hypervisor` option
   of `vk run` and `vk build`, the bundled `vk virtiofsd` daemon and the `virtiofsd` and
-  `libkrun` build features are removed. Upgrade with no cloud-hypervisor jobs in flight.
+  `libkrun` build features are removed, and a `vsock-mux://` address is refused: use
+  `vsock-auto://`. Upgrade with no cloud-hypervisor jobs in flight.
 
 ## [0.83.0] - 2026-10-05
 

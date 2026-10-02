@@ -1,7 +1,7 @@
 //! Minimal russh SSH server embedded in virtkit-agent. It makes a microVM
 //! reachable by stock SSH clients, including VS Code Remote-SSH, without sshd
 //! or connecting through guest networking. It listens on vsock, and the host
-//! connects through the hybrid vsock mux with `vk connect` (or
+//! connects through the VMM's per-port vsock socket with `vk connect` (or
 //! `vk-agent connect`) as ProxyCommand.
 //!
 //! It authenticates OpenSSH public keys passed to `ssh-serve` on the kernel

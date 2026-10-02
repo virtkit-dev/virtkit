@@ -22,11 +22,9 @@ use vk_core::status::get_status;
 struct Cli {
     /// Socket address: a unix socket path, or a systemd://, vsock*:// or tcp:// URL
     ///
-    /// systemd:// is socket activation (serve only); vsock://[cid:]port; vsock-mux://path:port
-    /// is the hybrid vsock unix socket of a Cloud Hypervisor / Firecracker VMM, and
-    /// vsock-auto://path:port picks the best host→guest path to a guest port (both connect
-    /// only). tcp://host:port carries raw bytes only — a forward end, `connect` or
-    /// `ssh-serve` — and the agent protocol refuses it.
+    /// systemd:// is socket activation (serve only); vsock://[cid:]port; vsock-auto://path:port
+    /// is a VMM's per-port socket for a guest port (connect only). tcp://host:port carries raw
+    /// bytes only — a forward end, `connect` or `ssh-serve` — and the agent protocol refuses it.
     #[arg(short, long, value_name = "ADDR")]
     socket: SocketAddr,
 
@@ -120,8 +118,9 @@ enum Commands {
     /// Splice stdin/stdout to the --socket target, raw bytes — an SSH `ProxyCommand`
     ///
     /// The stdio sibling of `forward`, with no virtkit-agent protocol. Tunnels ssh to a guest
-    /// sshd reached over the hybrid vsock-mux, so VS Code Remote-SSH attaches to the microVM
-    /// with no guest network: `ProxyCommand vk-agent -s vsock-mux://…/vsock.sock:2222 connect`.
+    /// sshd reached over the VMM's per-port vsock socket, so VS Code Remote-SSH attaches to the
+    /// microVM with no guest network: `ProxyCommand vk-agent -s vsock-auto://…/vsock.sock:2222
+    /// connect`.
     Connect,
     /// Run an SSH server (russh) on --socket, so the image needs no sshd
     ///
