@@ -337,3 +337,51 @@ device-driven paths. `linux/vstate.rs` is shared, so aarch64 Linux's triple faul
 `SYSTEM_RESET` exit 154 too. A reset outranks a guest-set exit code, and a guest kernel panic
 under `reboot=k panic=-1` is a reset: a supervisor that relaunches on 154 relaunches a panicking
 guest. Nothing consumes 154 yet.
+
+### virtio-pci parity with the 1.19 tree (on top of PR #875)
+
+`src/devices/src/virtio/{msix.rs (new),mod.rs,pci.rs}` + `src/devices/src/legacy/{gsi.rs (new),
+mod.rs}` + `src/libkrun/src/vmm/device_manager/kvm/pci.rs` — MSI-X for the PR #875 transport,
+which only had INTx. An MSI-X capability closes the capability list, with a two-vector table
+at BAR0 0x4000 and its PBA at 0x5000 (device config is now bounded to 0x1000 bytes). The common
+config keeps the vectors the driver picks, an unknown one reading back as NO_VECTOR; once MSI-X
+is enabled an interrupt goes to the driver's vector (every queue on the first queue vector set,
+the device not naming the queue) and never to INTx. `MsixConfig` and `GsiRoutes` are the 1.19
+tree's: each vector has an eventfd registered as a KVM irqfd on its own MSI GSI above the IOAPIC
+pins, and a message write re-commits the full `KVM_SET_GSI_ROUTING` table (default IOAPIC/PIC
+routes plus the MSI ones). Each queue's notification register gets an ioeventfd on the queue
+eventfd, so a kick no longer traps to the VMM thread; the trapping path stays for a relocated
+BAR0, whose ioeventfds are not moved.
+
+`src/arch/src/x86_64/{layout.rs,mod.rs,acpi.rs}` + `src/libkrun/src/vmm/{device_manager/shm.rs,
+builder.rs}` + `src/devices/src/virtio/pci.rs` — shared-memory regions (virtio-fs DAX windows)
+over virtio-pci. Regions are carved from a fixed span (`SHM_MEM_START`, 64 GiB at 64 GiB) that
+the DSDT declares as a 64-bit window of the PCI host bridge, each with a power-of-two size of at
+least 2 MiB and a base aligned to it, so a BAR describes it exactly. A guest whose RAM reaches
+the span, on either transport, fails to boot (`ShmCreate(OutOfSpace)`) if it asks for a window;
+vk-driver drops windows past `DAX_MAX_GUEST_MIB` first. The transport pins BAR2/BAR3 (64-bit,
+prefetchable memory) on the region, answering size probes, and describes it with a
+`VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` capability (`virtio_pci_cap64`, region id 0); only virtio-fs
+may carry a region. The builder's refusal of shared memory over PCI now applies to the GPU
+region only.
+
+Known gaps, kept for a follow-up: the DSDT declares the span even for a guest whose RAM
+overlaps it; the virtio-mmio path also places regions in the span and rounds them to a power of
+two; and with MSI-X every queue signals the first queue vector, a pending INTx is not
+deasserted when MSI-X is enabled, and a device reset leaves pending PBA bits.
+
+`src/libkrun/src/vmm/device_manager/kvm/pci.rs` + `src/devices/src/virtio/pci.rs` — devices
+past the INTx GSIs (5–23 less the SCI's 9) get interrupt pin 0, line 0xff and no `_PRT` entry
+and interrupt over MSI-X alone, so bus 0's 31 slots are the limit.
+
+Covered by the `virtio::pci::tests` (`msix_*`, `with_msix_enabled_*`, `without_msix_*`,
+`queue_notify_ioevents_*`, `a_shared_memory_region_*`, `a_device_without_intx_*`), the
+`virtio::msix` and `legacy::gsi` tests.
+
+### Interrupt trigger mode
+
+`src/arch/src/x86_64/acpi.rs` — the DSDT declares virtio-mmio interrupts edge-triggered.
+Each one is a one-shot KVM irqfd pulse with no resample fd; declared level (upstream), the
+IOAPIC drops a pulse that arrives while the previous one awaits its EOI, and a busy guest then
+waits forever on I/O that already completed. Covered by
+`virtio_mmio_interrupts_are_edge_triggered`.
