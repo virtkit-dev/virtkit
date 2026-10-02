@@ -22,9 +22,8 @@ pub struct Config {
     pub cloud_hypervisor: Option<PathBuf>,
     /// virtiofsd binary, only needed when [executor.share] is set
     pub virtiofsd: Option<PathBuf>,
-    /// VMM backend: `libkrun` (the default, embedded in `vk`) or `cloud-hypervisor` (an
-    /// external binary — e.g. for Windows guests, which libkrun cannot boot). The
-    /// `VIRTKIT_VMM` environment variable overrides this key. Unset = libkrun.
+    /// VMM backend. Only `libkrun`, embedded in `vk`, remains: `cloud-hypervisor` is still
+    /// parsed so an old config loads, but it boots on libkrun after a warning.
     pub vmm: Option<VmmBackend>,
     /// Materialized image bases (`<state_dir>/{registry,docker}/…/runner.ext4`) that have
     /// sat idle this many seconds — no VM overlaying them — are evicted the next time that

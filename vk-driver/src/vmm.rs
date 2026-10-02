@@ -952,34 +952,59 @@ impl Vmm for Libkrun {
 }
 
 /// The `[vmm]` config choice, set once in `cli_main` from the loaded config. `None` (not
-/// yet set, or the key was absent) leaves the backend to the env var / libkrun default.
+/// yet set, or the key was absent) asks for nothing.
 static CONFIG_BACKEND: std::sync::OnceLock<Option<crate::config::VmmBackend>> =
     std::sync::OnceLock::new();
 
-/// Record the config's `vmm` key so [`libkrun_selected`] can consult it. Called once after
-/// the config loads, before any boot. The `VIRTKIT_VMM` env var still takes precedence.
+/// Record `vmm` for [`libkrun_selected`]'s cloud-hypervisor warning.
+/// Called once after config loading, before any boot.
 pub fn set_config_backend(backend: Option<crate::config::VmmBackend>) {
     let _ = CONFIG_BACKEND.set(backend);
 }
 
-/// Whether the libkrun backend is selected. libkrun is the default when it is compiled
-/// in (the `libkrun` feature). The precedence is `VIRTKIT_VMM` (read on each call so every
-/// CI phase — prepare/run/cleanup, separate processes sharing gitlab-runner's environment —
-/// agrees), then the config `vmm` key, then libkrun. Set `cloud-hypervisor` to opt out —
-/// e.g. for Windows guests, which libkrun cannot boot.
+/// Always select libkrun when compiled with the `libkrun` feature. Requests for
+/// cloud-hypervisor via `VIRTKIT_VMM` or config `vmm` boot on libkrun with one warning
+/// per process.
 pub fn libkrun_selected() -> bool {
     if !cfg!(feature = "libkrun") {
         return false;
     }
-    match std::env::var("VIRTKIT_VMM").ok().as_deref() {
-        Some("cloud-hypervisor") | Some("cloud_hypervisor") | Some("ch") => return false,
-        Some("libkrun") => return true,
-        _ => {}
-    }
-    !matches!(
+    let asked = cloud_hypervisor_requested(
+        std::env::var("VIRTKIT_VMM").ok().as_deref(),
         CONFIG_BACKEND.get().copied().flatten(),
-        Some(crate::config::VmmBackend::CloudHypervisor)
-    )
+    );
+    if let Some(fix) = asked {
+        warn_cloud_hypervisor_removed(fix);
+    }
+    true
+}
+
+/// What to drop when `VIRTKIT_VMM` (`env`) or the config `vmm` key (`config`) still asks
+/// for cloud-hypervisor, or `None` when neither does.
+fn cloud_hypervisor_requested(
+    env: Option<&str>,
+    config: Option<crate::config::VmmBackend>,
+) -> Option<&'static str> {
+    let env = matches!(env, Some("cloud-hypervisor" | "cloud_hypervisor" | "ch"));
+    let config = config == Some(crate::config::VmmBackend::CloudHypervisor);
+    match (env, config) {
+        (true, true) => Some("unset VIRTKIT_VMM and drop the config `vmm` key"),
+        (true, false) => Some("unset VIRTKIT_VMM"),
+        (false, true) => Some("drop the config `vmm` key"),
+        (false, false) => None,
+    }
+}
+
+/// Warn once per process when a cloud-hypervisor request is ignored.
+/// Every boot site calls [`libkrun_selected`], so an unguarded warning would repeat.
+fn warn_cloud_hypervisor_removed(fix: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "virtkit: warning: the cloud-hypervisor backend has been removed; booting on \
+             libkrun ({fix})"
+        );
+    });
 }
 
 /// Whether the host lets a guest run guests of its own — `kvm_intel`/`kvm_amd`'s
@@ -1028,6 +1053,40 @@ pub fn exec_addr(vsock_socket: &Path, port: u32) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_hypervisor_requests_name_only_their_source() {
+        use crate::config::VmmBackend::{CloudHypervisor, Libkrun};
+        for env in ["cloud-hypervisor", "cloud_hypervisor", "ch"] {
+            assert_eq!(
+                cloud_hypervisor_requested(Some(env), None),
+                Some("unset VIRTKIT_VMM"),
+                "{env}"
+            );
+            assert_eq!(
+                cloud_hypervisor_requested(Some(env), Some(CloudHypervisor)),
+                Some("unset VIRTKIT_VMM and drop the config `vmm` key"),
+                "{env}"
+            );
+        }
+        assert_eq!(
+            cloud_hypervisor_requested(None, Some(CloudHypervisor)),
+            Some("drop the config `vmm` key")
+        );
+        assert_eq!(
+            cloud_hypervisor_requested(Some("libkrun"), Some(CloudHypervisor)),
+            Some("drop the config `vmm` key")
+        );
+        for env in [None, Some("libkrun"), Some(""), Some("qemu")] {
+            for config in [None, Some(Libkrun)] {
+                assert_eq!(
+                    cloud_hypervisor_requested(env, config),
+                    None,
+                    "{env:?} {config:?}"
+                );
+            }
+        }
+    }
 
     fn args(cmd: &Command) -> Vec<String> {
         cmd.get_args()

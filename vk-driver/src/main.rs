@@ -2905,8 +2905,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
         Ok(cfg) => cfg,
         Err(e) => return fail(&e, 2),
     };
-    // Apply the host's `[build]` tuning and VMM-backend choice process-wide, before any
-    // build or boot path runs (VIRTKIT_VMM still overrides the config key).
+    // Apply `[build]` tuning process-wide before any build or boot, and record `vmm`
+    // so boots can warn about cloud-hypervisor requests.
     build::set_tuning(&cfg.build);
     vmm::set_config_backend(cfg.vmm);
     numa::set_policy(cfg.numa.mode);

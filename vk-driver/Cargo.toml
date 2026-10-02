@@ -128,9 +128,8 @@ virtiofsd = [
 # reached via its C ABI; we always pass our own kernel (krun_set_kernel) so it
 # never loads libkrunfw. Its rust-vmm deps (vm-memory 0.17, …) coexist with the
 # bundled virtiofsd's (0.16) — independent subsystems, so no version unification.
-# On by default: libkrun is the default backend (selection is env-driven, see
-# vmm::libkrun_selected); VIRTKIT_VMM=cloud-hypervisor opts out, and jobs libkrun
-# cannot serve (e.g. uid/gid-mapped shares) refuse with a pointer to that switch.
+# On by default: libkrun is the only backend that can be selected (see
+# vmm::libkrun_selected).
 libkrun = ["dep:krun"]
 
 [dev-dependencies]
