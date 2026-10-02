@@ -98,6 +98,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
     // Before any thread exists, so every thread libkrun spawns inherits the mask and the
     // signal stays pending for the power-button thread.
     block_sigterm();
+    set_process_name(&spec.proc_name);
 
     // libkrun logs to stderr (captured to the VMM log). Debug fires on the block and
     // virtio-fs I/O paths and slows a build, so only under VIRTKIT_DEBUG=1.
@@ -304,6 +305,17 @@ fn fs_device(share: &FsShare) -> Result<FsDevice<'static>> {
     fs.set_no_sync(share.cache.no_sync())
         .map_err(krun("virtio-fs no_sync"))?;
     Ok(fs)
+}
+
+/// Name the process after its VM (`vk:<unit>`, see [`crate::vmm::resolve_proc_name`]) for
+/// `ps`, `top` and the tests that find a VM's VMM by its `comm`, which the kernel caps at 15
+/// bytes. The 1.19 tree did this in `krun_start_enter`.
+fn set_process_name(name: &str) {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return;
+    };
+    // SAFETY: PR_SET_NAME reads a NUL-terminated string, truncated to 15 bytes.
+    unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
 }
 
 fn sigterm_set() -> libc::sigset_t {
