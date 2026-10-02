@@ -12,8 +12,7 @@
 //!     and run each `RUN` inside a microVM guest (a rw qcow2 overlay over the
 //!     ext4, committed back so writes persist; egress via a `vk switch` so
 //!     `apt`/`apk` work; root remounted read-only before teardown so the exported ext4
-//!     is clean). Needs KVM; the VMM is the embedded libkrun by default (or an external
-//!     cloud-hypervisor when `VIRTKIT_VMM=cloud-hypervisor`), plus the guest kernel.
+//!     is clean). Needs KVM; the VMM is the embedded libkrun, plus the guest kernel.
 //!     `COPY --from=<stage>` and `RUN --mount=type=bind,from=<stage>` work by attaching
 //!     the source stage's ext4 read-only and copying / bind-mounting inside the guest;
 //!     `COPY` from the build context copies from the context shared over virtiofs,
@@ -604,12 +603,11 @@ pub struct MicroVm {
     /// This per-stage handoff relies on the session-per-stage invariant (`stage_end`
     /// tears the guest down) — a session outliving its stage would keep a stale share.
     context: Option<PathBuf>,
-    /// the in-flight cache push (run on a background thread) and the snapshot raw it reads.
+    /// the in-flight cache push (run on a background thread) and the snapshot it reads.
     /// At most one runs at a time: it is spawned at the end of an instruction's `cache_save`
     /// and joined at the start of the next one — so the push (chunk + manifest + upload, the
     /// IO-bound bulk of cache-on overhead) overlaps the next instruction's RUN instead of
-    /// serializing after it. Its snapshot also serves as the previous baseline the next
-    /// instruction's `content_diff` reads, so it is freed only after that join.
+    /// serializing after it.
     inflight: Option<PushInflight>,
     /// terminal pushes handed off at `stage_end`, awaiting a fork's adoption or the build-wide
     /// drain. Shared across workers (the base executor holds the last reference). See
@@ -672,8 +670,7 @@ type CapturedDelta = (PathBuf, Vec<(u64, u64)>, Vec<(u64, u64)>, u64);
 
 struct PushInflight {
     handle: std::thread::JoinHandle<PushOutput>,
-    /// the snapshot raw the push reads; freed after it is joined (and used as the next
-    /// instruction's `content_diff` baseline).
+    /// the snapshot (a qcow2 copy) the push reads; freed after it is joined.
     snap: PathBuf,
     completed_stage: Option<CompletedStage>,
 }
@@ -775,78 +772,31 @@ impl Drop for PushPool {
 const GUEST_AGENT: &str = "/proc/self/exe";
 
 /// The byte ranges where `cur` differs from `prev`, examined only within `within`. Both are
-/// captured overlay qcow2s, read natively (resolving unchanged clusters through their backing).
-/// This recovers a single instruction's delta from two consecutive cumulative snapshots, so a
-/// diff push re-chunks only what changed (not everything written so far).
-///
-/// With `skip_new_is_dirty`, reads are avoided where `prev`'s allocation map already decides the
-/// outcome: a block that `cur` allocates but `prev` does not is new to this interval and dirty by
-/// construction — no read needed (over `prev`'s backing it could only match by coincidence, which
-/// chunk dedup collapses on upload anyway). Only blocks allocated in *both* need the byte compare:
-/// an in-place rewrite reuses the same qcow2 cluster, invisible to the allocation map, so only the
-/// data reveals it. This is sound only when `within` is confined to `cur`'s own allocation (the
-/// diff-push path); a caller that passes a `within` spanning regions `cur` does not allocate (the
-/// full-image reassembly localizer) must clear the flag to force a true logical byte-compare over
-/// every block.
-fn content_diff(
-    prev: &Path,
-    cur: &Path,
-    within: &[(u64, u64)],
-    skip_new_is_dirty: bool,
-) -> Result<Vec<(u64, u64)>> {
+/// overlay qcow2s, read natively through their backing chains. Every block is byte-compared,
+/// so base-identical holes neither overlay wrote stay clean. The reassembly localizer uses
+/// this logical diff to find where a pulled image differs from the live one.
+fn content_diff(prev: &Path, cur: &Path, within: &[(u64, u64)]) -> Result<Vec<(u64, u64)>> {
     let mut a = crate::qcow2::Qcow2::open(prev)?;
     let mut b = crate::qcow2::Qcow2::open(cur)?;
-    // `prev`'s own allocated clusters (sorted, non-overlapping) — the blocks whose bytes must
-    // actually be compared; anything in `within` outside this set is new in `cur`. Only needed
-    // for the read-skip; a full byte-compare leaves it empty and compares every block.
-    let prev_alloc = if skip_new_is_dirty {
-        a.data_extents()?
-    } else {
-        Vec::new()
-    };
     const BLK: usize = 256 * 1024; // comparison + dirty-extent granularity
     let mut ba = vec![0u8; BLK];
     let mut bb = vec![0u8; BLK];
     let mut out: Vec<(u64, u64)> = Vec::new();
-    // Cursor into `prev_alloc`, advanced monotonically: `within` and `prev_alloc` are both
-    // sorted, and `pos` only increases, so each extent is visited at most once.
-    let mut pi = 0usize;
     for &(off, len) in within {
         let mut pos = off;
         let end = off + len;
         while pos < end {
             let n = ((end - pos) as usize).min(BLK);
-            let block_end = pos + n as u64;
-            // Compare the block unless the read-skip decides it dirty from allocation alone: with
-            // the skip off, `prev_alloc` is empty so `in_prev` is always true — a full logical
-            // diff over every block, holes included.
-            let in_prev = if skip_new_is_dirty {
-                // Drop `prev_alloc` extents that end at/before this block — they can't cover it or
-                // any later block.
-                while pi < prev_alloc.len() && prev_alloc[pi].0 + prev_alloc[pi].1 <= pos {
-                    pi += 1;
-                }
-                // Allocated in `prev` iff the next surviving extent starts before the block ends
-                // (it already ends after `pos` by the loop above).
-                pi < prev_alloc.len() && prev_alloc[pi].0 < block_end
-            } else {
-                true
-            };
-            let changed = if in_prev {
-                a.read_at(pos, &mut ba[..n])?;
-                b.read_at(pos, &mut bb[..n])?;
-                ba[..n] != bb[..n]
-            } else {
-                true // new in `cur` this interval — dirty without reading.
-            };
-            if changed {
+            a.read_at(pos, &mut ba[..n])?;
+            b.read_at(pos, &mut bb[..n])?;
+            if ba[..n] != bb[..n] {
                 // coalesce with the previous extent when contiguous.
                 match out.last_mut() {
                     Some(last) if last.0 + last.1 == pos => last.1 += n as u64,
                     _ => out.push((pos, n as u64)),
                 }
             }
-            pos = block_end;
+            pos += n as u64;
         }
     }
     Ok(out)
@@ -1460,19 +1410,17 @@ impl MicroVm {
             // Freeze first so the guest flushes its page cache to the block device (the set only
             // records writes that actually reached virtio-blk), then thaw so the `finish()` below
             // quiesces the image normally rather than shutting down a still-frozen fs.
-            if session.supports_dirty() {
-                let frozen = block_on(session.freeze());
-                match session.drain_dirty() {
-                    Ok(newer) => {
-                        let carry = self.dirty_carry.entry(fs.label.clone()).or_default();
-                        *carry = merge_dirty(std::mem::take(carry), newer);
-                    }
-                    Err(e) => {
-                        eprintln!("virtkit: carrying the dirty set across a reboot failed ({e:#})")
-                    }
+            let frozen = block_on(session.freeze());
+            match session.drain_dirty() {
+                Ok(newer) => {
+                    let carry = self.dirty_carry.entry(fs.label.clone()).or_default();
+                    *carry = merge_dirty(std::mem::take(carry), newer);
                 }
-                block_on(session.thaw(frozen));
+                Err(e) => {
+                    eprintln!("virtkit: carrying the dirty set across a reboot failed ({e:#})")
+                }
             }
+            block_on(session.thaw(frozen));
             let t_fin = std::time::Instant::now();
             block_on(session.finish())?;
             self.timings.probe("reboot.finish", t_fin.elapsed());
@@ -1581,25 +1529,14 @@ impl MicroVm {
         self.session = Some(s);
         Ok(())
     }
-    /// Whether a cache restore should write a lazy `.vk_ro_img` view instead of eagerly
-    /// decompressing the whole cached image to a raw ext4: only libkrun's virtio-blk knows
-    /// how to read one (`LazyChunkStorage` in `third_party/libkrun`).
-    ///
-    /// `--debug` deliberately does *not* turn this off: it used to, which left the check looking
-    /// only at the eager path it substituted in. [`Self::verify_lazy_view`] materializes the view
-    /// instead, so the check covers what the build really restores.
-    fn lazy_restore_enabled(&self) -> bool {
-        true
-    }
     /// `--debug`: verify a lazily restored `.vk_ro_img` view — the chunks it names, reassembled
-    /// through the host-side reader — as [`Self::verify_ext4`] does for a raw restore. Writes a
-    /// throwaway raw (the whole point of the lazy path is not to, so this is `--debug`-only) and
-    /// discards it. No-op unless `--debug` is set.
+    /// through the host-side reader — as [`Self::verify_ext4`] does for a freshly built ext4.
+    /// Writes a throwaway raw (the whole point of the lazy path is not to, so this is
+    /// `--debug`-only) and discards it. No-op unless `--debug` is set.
     ///
     /// What it covers is the manifest and the chunks behind it, not libkrun's own reader of them
-    /// (`LazyChunkStorage`), which only a booted guest exercises. And with `--debug` no longer
-    /// forcing the eager path, the eager reassembly is checked by [`Self::verify_reassembly`]
-    /// and by a cloud-hypervisor build, rather than at this boundary.
+    /// (`LazyChunkStorage`), which only a booted guest exercises. The eager reassembly is
+    /// checked by [`Self::verify_reassembly`].
     fn verify_lazy_view(&self, view: &Path, context: &str) -> Result<()> {
         if !self.debug {
             return Ok(());
@@ -1702,9 +1639,8 @@ impl MicroVm {
             let overlay = pulled.with_extension("cmp.qcow2");
             let localize = (|| -> Result<String> {
                 crate::qcow2::create_overlay(&overlay, &pulled)?;
-                // Full logical byte-compare: `within` spans the whole image (holes included),
-                // not `overlay`'s own allocation, so the read-skip would misreport — disable it.
-                let diffs = content_diff(snap, &overlay, &[(0, total_size)], false)?;
+                // Full logical byte-compare over the whole image (holes included).
+                let diffs = content_diff(snap, &overlay, &[(0, total_size)])?;
                 let missed: Vec<(u64, u64)> = diffs
                     .iter()
                     .copied()
@@ -1738,8 +1674,8 @@ impl MicroVm {
     fn image_path(&self, stage: &str) -> PathBuf {
         self.scratch.join(format!("{}.ext4", label_slug(stage)))
     }
-    /// Where a lazy cache restore (see [`Self::lazy_restore_enabled`]) writes its
-    /// `.vk_ro_img` manifest instead of a fully reassembled ext4.
+    /// Where a cache restore writes its `.vk_ro_img` manifest — a lazy view libkrun's
+    /// virtio-blk reads chunk by chunk (`LazyChunkStorage`) instead of a reassembled ext4.
     fn lazy_image_path(&self, stage: &str) -> PathBuf {
         self.scratch
             .join(format!("{}.vk_ro_img", label_slug(stage)))
@@ -1782,19 +1718,12 @@ impl MicroVm {
         if let Some(rg) = self.cache.clone()
             && crate::registry::exists(&rg, CACHE_REPO, &base_key)
         {
-            if self.lazy_restore_enabled() {
-                let lazy = self.lazy_image_path(label);
-                if let Some(digest) =
-                    crate::registry::try_pull_ext4_lazy(&rg, CACHE_REPO, &base_key, &lazy, image)?
-                {
-                    self.verify_lazy_view(&lazy, &format!("cached image {image} (after load)"))?;
-                    return Ok((lazy, Some(digest)));
-                }
-            } else if let Some(digest) =
-                crate::registry::try_pull_ext4(&rg, CACHE_REPO, &base_key, &ext4, image)?
+            let lazy = self.lazy_image_path(label);
+            if let Some(digest) =
+                crate::registry::try_pull_ext4_lazy(&rg, CACHE_REPO, &base_key, &lazy, image)?
             {
-                self.verify_ext4(&ext4, &format!("cached image {image} (after load)"))?;
-                return Ok((ext4, Some(digest)));
+                self.verify_lazy_view(&lazy, &format!("cached image {image} (after load)"))?;
+                return Ok((lazy, Some(digest)));
             }
         }
         // pull + flatten the OCI image to a rootfs tar (no docker), then build the ext4.
@@ -2744,33 +2673,17 @@ impl Executor for MicroVm {
         let Some(rg) = self.cache.clone() else {
             bail!("cache_restore with no cache registry");
         };
-        // pull the snapshot's ext4 (chunk-cached, byte-exact) — or, when lazy restore
-        // applies, a `.vk_ro_img` view over it — then wrap it in a rw qcow2 so any remaining
-        // instructions can boot it directly and write into the overlay.
-        let (base, digest) = if self.lazy_restore_enabled() {
-            let lazy = self.lazy_image_path(&fs.label);
-            let Some(digest) =
-                crate::registry::try_pull_ext4_lazy(&rg, CACHE_REPO, key, &lazy, &fs.label)?
-            else {
-                bail!("cached instruction {key} vanished from the registry");
-            };
-            // Same check the eager branch runs below, against the view the guest will read.
-            self.verify_lazy_view(&lazy, &format!("cached instruction {key} (after load)"))?;
-            (lazy, digest)
-        } else {
-            let ext4 = self.image_path(&fs.label);
-            let Some(digest) =
-                crate::registry::try_pull_ext4(&rg, CACHE_REPO, key, &ext4, &fs.label)?
-            else {
-                bail!("cached instruction {key} vanished from the registry");
-            };
-            // `--debug`: a reassembled snapshot must be a clean ext4 before the build boots
-            // or forks it — else a corrupt cache entry (bad chunks / a poisoned push)
-            // silently becomes a corrupt image or an EUCLEAN mid-build.
-            self.verify_ext4(&ext4, &format!("cached instruction {key} (after load)"))?;
-            (ext4, digest)
+        // pull a `.vk_ro_img` view over the snapshot's ext4 (chunk-cached, byte-exact), then
+        // wrap it in a rw qcow2 so any remaining instructions can boot it directly and write
+        // into the overlay.
+        let lazy = self.lazy_image_path(&fs.label);
+        let Some(digest) =
+            crate::registry::try_pull_ext4_lazy(&rg, CACHE_REPO, key, &lazy, &fs.label)?
+        else {
+            bail!("cached instruction {key} vanished from the registry");
         };
-        self.wrap_base(&fs.label, &base)?;
+        self.verify_lazy_view(&lazy, &format!("cached instruction {key} (after load)"))?;
+        self.wrap_base(&fs.label, &lazy)?;
         // Record the restored digest under the stage label; `parent_for_push` only checks this
         // map. Restores are byte-exact and forks write to their own overlays, so these chunks
         // exactly back the child's first diff.
@@ -2812,161 +2725,84 @@ impl Executor for MicroVm {
                 .push_snapshot_sync(&rg, fs, key, &boot_kind, &img, &data, &holes, total_size);
         }
 
-        // Live guest with block-level dirty tracking (libkrun): freeze the fs, drain the clusters
-        // the block device recorded this interval (folding in any carried across mid-stage
-        // reboots), and push exactly those on a background thread — the per-interval delta, no
-        // whole-stage re-chunk. Same async shape as cloud-hypervisor, so the guest is only frozen
-        // for the (delta-sized) copy. The delta is guarded by the allocation map: every cluster
-        // newly allocated this interval must be in the dirty set (a write can't reach the disk
-        // without allocating its cluster), else it is a dropped write and the build aborts —
-        // FATAL, so a lossy set can never cache a stale delta.
-        if self.session.as_ref().is_some_and(|s| s.supports_dirty()) {
-            // Discard blocks freed since the last checkpoint *before* quiescing (a frozen fs
-            // rejects the discard), so the allocation map below lists only live data — a file
-            // created and deleted within this interval never enters the delta.
-            block_on(self.session.as_ref().unwrap().trim());
-            let frozen = block_on(self.session.as_ref().unwrap().freeze());
-            // Drain + gap-check + copy while frozen; defer any error past the thaw so the guest is
-            // never left frozen on a failure.
-            let prepared = (|| -> Result<CapturedDelta> {
-                let (image, written, discarded, cumulative, total_size) = {
-                    let session = self.session.as_ref().unwrap();
-                    let (written, discarded) = session.drain_dirty()?;
-                    let image = session.image().to_path_buf();
-                    let mut q = crate::qcow2::Qcow2::open(&image)?;
-                    // The overlay's allocated clusters — ground truth for what the guest wrote,
-                    // since a write cannot reach the disk without allocating its cluster.
-                    let cumulative = q.data_extents()?;
-                    (image, written, discarded, cumulative, q.virtual_size())
-                };
-                // Fold in anything drained across mid-stage reboots since the last checkpoint
-                // (last-operation-wins), then reset the carry — so the set is per-checkpoint, not
-                // per-VM-boot. `written` is read and pushed as data; `discarded` becomes holes.
-                let carried = self.dirty_carry.remove(&fs.label).unwrap_or_default();
-                let (written, discarded) = merge_dirty(carried, (written, discarded));
-                // Guard the delta: every cluster newly allocated this interval (`cumulative -
-                // prev`) MUST have been touched (written or discarded), since a mutation cannot
-                // reach the disk without allocating its cluster. Any that wasn't is a write the
-                // side-channel dropped — pushing then would cache a stale delta, so abort loudly.
-                let touched = coalesce_ranges([written.clone(), discarded.clone()].concat());
-                let prev = self
-                    .stage_prev_extents
-                    .get(&fs.label)
-                    .cloned()
-                    .unwrap_or_default();
-                let missed = subtract_ranges(&subtract_ranges(&cumulative, &prev), &touched);
-                if !missed.is_empty() {
-                    let bytes: u64 = missed.iter().map(|&(_, l)| l).sum();
-                    bail!(
-                        "dirty-tracking gap at {key}: {} newly-allocated extent(s) ({bytes} bytes) \
-                         were written but absent from the block device's dirty set. First: {:?}",
-                        missed.len(),
-                        missed.iter().take(6).collect::<Vec<_>>()
-                    );
-                }
-                // Data to read and push: written clusters the snapshot still holds. Clamping to
-                // the allocation map drops a written-then-freed cluster (deallocated, so a read
-                // would fail) and keeps the delta to what actually changed. A discarded cluster is
-                // never read — it is pushed as a hole below, so the reassembly clears the parent's
-                // stale bytes there instead of reusing them.
-                let delta = intersect_ranges(&written, &cumulative);
-                let holes = subtract_ranges(&discarded, &delta);
-                self.stage_prev_extents.insert(fs.label.clone(), cumulative);
-                // A stable, standalone copy the background push reads after the guest resumes.
-                self.push_seq += 1;
-                let snap = self.image_path(&format!("{}.{}.cap.qcow2", fs.label, self.push_seq));
-                std::fs::copy(&image, &snap).with_context(|| {
-                    format!("copying {} -> {}", image.display(), snap.display())
-                })?;
-                self.verify_snapshot(&snap, &format!("snapshot of {key} (before upload)"))?;
-                Ok((snap, delta, holes, total_size))
-            })();
-            block_on(self.session.as_ref().unwrap().thaw(frozen));
-            let (snap, delta, holes, total_size) = prepared?;
+        // Live guest with block-level dirty tracking: freeze the fs, drain the clusters the block
+        // device recorded this interval (folding in any carried across mid-stage reboots), and
+        // push exactly those on a background thread — the per-interval delta, no whole-stage
+        // re-chunk, and the guest is only frozen for the (delta-sized) copy. The delta is
+        // guarded by the allocation map: every cluster newly allocated this interval must be in
+        // the dirty set (a write can't reach the disk without allocating its cluster), else it
+        // is a dropped write and the build aborts — FATAL, so a lossy set can never cache a
+        // stale delta.
+        //
+        // Discard blocks freed since the last checkpoint *before* quiescing (a frozen fs
+        // rejects the discard), so the allocation map below lists only live data — a file
+        // created and deleted within this interval never enters the delta.
+        block_on(self.session.as_ref().unwrap().trim());
+        let frozen = block_on(self.session.as_ref().unwrap().freeze());
+        // Drain + gap-check + copy while frozen; defer any error past the thaw so the guest is
+        // never left frozen on a failure.
+        let prepared = (|| -> Result<CapturedDelta> {
+            let (image, written, discarded, cumulative, total_size) = {
+                let session = self.session.as_ref().unwrap();
+                let (written, discarded) = session.drain_dirty()?;
+                let image = session.image().to_path_buf();
+                let mut q = crate::qcow2::Qcow2::open(&image)?;
+                // The overlay's allocated clusters — ground truth for what the guest wrote,
+                // since a write cannot reach the disk without allocating its cluster.
+                let cumulative = q.data_extents()?;
+                (image, written, discarded, cumulative, q.virtual_size())
+            };
+            // Fold in anything drained across mid-stage reboots since the last checkpoint
+            // (last-operation-wins), then reset the carry — so the set is per-checkpoint, not
+            // per-VM-boot. `written` is read and pushed as data; `discarded` becomes holes.
+            let carried = self.dirty_carry.remove(&fs.label).unwrap_or_default();
+            let (written, discarded) = merge_dirty(carried, (written, discarded));
+            // Every cluster newly allocated this interval (`cumulative - prev`) must be
+            // written or discarded: a mutation cannot reach the disk without allocating its
+            // cluster. An absent cluster is a write the side-channel dropped; abort before
+            // caching a stale delta.
+            let touched = coalesce_ranges([written.clone(), discarded.clone()].concat());
+            let prev = self
+                .stage_prev_extents
+                .get(&fs.label)
+                .cloned()
+                .unwrap_or_default();
+            let missed = subtract_ranges(&subtract_ranges(&cumulative, &prev), &touched);
+            if !missed.is_empty() {
+                let bytes: u64 = missed.iter().map(|&(_, l)| l).sum();
+                bail!(
+                    "dirty-tracking gap at {key}: {} newly-allocated extent(s) ({bytes} bytes) \
+                     were written but absent from the block device's dirty set. First: {:?}",
+                    missed.len(),
+                    missed.iter().take(6).collect::<Vec<_>>()
+                );
+            }
+            // Data to read and push: written clusters the snapshot still holds. Clamping to
+            // the allocation map drops a written-then-freed cluster (deallocated, so a read
+            // would fail) and keeps the delta to what actually changed. A discarded cluster is
+            // never read — it is pushed as a hole below, so the reassembly clears the parent's
+            // stale bytes there instead of reusing them.
+            let delta = intersect_ranges(&written, &cumulative);
+            let holes = subtract_ranges(&discarded, &delta);
+            self.stage_prev_extents.insert(fs.label.clone(), cumulative);
+            // A stable, standalone copy the background push reads after the guest resumes.
+            self.push_seq += 1;
+            let snap = self.image_path(&format!("{}.{}.cap.qcow2", fs.label, self.push_seq));
+            std::fs::copy(&image, &snap)
+                .with_context(|| format!("copying {} -> {}", image.display(), snap.display()))?;
+            self.verify_snapshot(&snap, &format!("snapshot of {key} (before upload)"))?;
+            Ok((snap, delta, holes, total_size))
+        })();
+        block_on(self.session.as_ref().unwrap().thaw(frozen));
+        let (snap, delta, holes, total_size) = prepared?;
 
-            // Push on a background thread; it overlaps the next instruction's RUN. Ordering +
-            // parent chaining as in the cloud-hypervisor path below.
-            self.harvest_prev_push(&fs.label);
-            let (parent_layers, parent_total) = self.parent_for_push(&rg, total_size);
-            let snap_push = snap.clone();
-            let key_s = key.to_string();
-            let boot_kind = boot_kind.clone();
-            let rg = rg.clone();
-            let timings = Arc::clone(&self.timings);
-            let handle = std::thread::spawn(move || -> PushOutput {
-                let t = std::time::Instant::now();
-                let (layers, total, digest) = crate::registry::push_ext4_diff(
-                    &rg,
-                    CACHE_REPO,
-                    &key_s,
-                    &snap_push,
-                    &boot_kind,
-                    parent_total,
-                    &delta,
-                    &holes,
-                    &parent_layers,
-                )?;
-                timings.probe("cache.push", t.elapsed());
-                Ok(((layers, total), digest))
-            });
-            self.inflight = Some(PushInflight {
-                handle,
-                snap,
-                completed_stage: None,
-            });
-            return Ok(());
-        }
-
-        // Cloud-hypervisor (no dirty hook): capture a stable point-in-time copy of the live
-        // overlay (freeze + copy, to a qcow2), then diff + push it on a background thread that
-        // overlaps the next instruction's RUN. The copy is the only synchronous part — the live
-        // overlay keeps moving once the next RUN starts, so it must happen now; the diff/push read
-        // the copy natively, off this thread. (Session borrow scoped so the `&mut self` is free.)
-        self.push_seq += 1;
-        let snap = self.image_path(&format!("{}.{}.cap.qcow2", fs.label, self.push_seq));
-        // Discard blocks freed since the last checkpoint before capturing (a frozen fs rejects
-        // the discard, so this runs ahead of `capture`'s freeze), so a file created and deleted
-        // within this interval is released to holes and never enters the delta.
-        block_on(self.session.as_ref().expect("session present").trim());
-        block_on(
-            self.session
-                .as_ref()
-                .expect("session present")
-                .capture(&snap, &self.timings),
-        )?;
-        self.verify_snapshot(&snap, &format!("snapshot of {key} (before upload)"))?;
-        // Native qcow2 read: the overlay's own clusters (cumulative dirty) and its size. Unlike
-        // the libkrun path, this keeps explicit-zero clusters in the dirty set. Without a dirty
-        // log there is nothing to intersect them with, so a trimmed guest still makes this path
-        // walk its free space; the chunker drops the zero chunks it produces.
-        let (cumulative, total_size) = {
-            let mut q = crate::qcow2::Qcow2::open(&snap)?;
-            (q.data_extents()?, q.virtual_size())
-        };
-        // Per-instruction delta: diff this capture against the previous one (the in-flight
-        // push's qcow2) within the cumulative bound — the overlay is cumulative, so this
-        // recovers just what this instruction changed.
-        let dirty = match &self.inflight {
-            // `within` is `snap`'s own allocation, so a block new to `snap` is dirty by
-            // construction — the read-skip is sound here.
-            Some(inf) => content_diff(&inf.snap, &snap, &cumulative, true)?,
-            None => cumulative,
-        };
-
-        // Reap the previous push (it ran during this instruction's RUN + capture, so it is
-        // usually already done): harvest its layers as the in-memory parent and free its
-        // capture — content_diff above was its last reader.
+        // The background push overlaps the next instruction's RUN. Each stage joins its push
+        // before spawning the next, keeping its parent-layer chain ordered. Concurrent stages
+        // can push safely: the store is content-addressed and writes atomically (temp + rename).
+        // A dependent `FROM <stage>` fork joins the stage's push (join_pending) before fetching
+        // its chunks.
         self.harvest_prev_push(&fs.label);
-
         let (parent_layers, parent_total) = self.parent_for_push(&rg, total_size);
-
-        // Spawn the push on a background thread; it overlaps the next instruction's RUN.
-        // Within a stage only one push runs at a time (joined above before the next is
-        // spawned), so this stage's parent-layer chain stays ordered. Across concurrent
-        // stages (the parallel driver) several pushes may hit the store at once; that is
-        // safe — the store is content-addressed and writes atomically (temp + rename), and a
-        // dependent that reads a stage's chunks (a `FROM <stage>` fork) joins that stage's
-        // push (join_pending) before it fetches them.
         let snap_push = snap.clone();
         let key_s = key.to_string();
         let timings = Arc::clone(&self.timings);
@@ -2979,8 +2815,8 @@ impl Executor for MicroVm {
                 &snap_push,
                 &boot_kind,
                 parent_total,
-                &dirty,
-                &[],
+                &delta,
+                &holes,
                 &parent_layers,
             )?;
             timings.probe("cache.push", t.elapsed());
@@ -3071,7 +2907,7 @@ impl Executor for MicroVm {
             self.record_stage_usage(&fs.label, &session);
             let t_fin = std::time::Instant::now();
             block_on(session.quiesce_for_shutdown());
-            if cleanup_changes_image && session.supports_dirty() {
+            if cleanup_changes_image {
                 drained_dirty = session
                     .drain_dirty()
                     .inspect_err(|e| {
@@ -4105,79 +3941,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// `content_diff` reports exactly this interval's changed extents between two overlay
-    /// captures: an unchanged shared cluster is skipped, an in-place-rewritten shared cluster
-    /// is dirty (caught by the byte compare), and a cluster new to `cur` is dirty by its
-    /// allocation alone — the read-skipping path must not miss or misreport any of them.
-    #[test]
-    fn content_diff_reports_rewritten_and_new_clusters() {
-        fn have(tool: &str) -> bool {
-            std::process::Command::new(tool)
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        }
-        if !have("qemu-img") || !have("qemu-io") {
-            eprintln!("skipping: qemu-img/qemu-io not available");
-            return;
-        }
-        let dir = tmpdir("content-diff");
-        let base = dir.join("base.raw");
-        let prev = dir.join("prev.qcow2");
-        let cur = dir.join("cur.qcow2");
-        // 512 KiB base (eight 64 KiB clusters) of 0xAA.
-        std::fs::write(&base, vec![0xAAu8; 512 * 1024]).unwrap();
-        let overlay = |img: &std::path::Path| {
-            assert!(
-                std::process::Command::new("qemu-img")
-                    .args(["create", "-q", "-f", "qcow2", "-F", "raw", "-b"])
-                    .arg(&base)
-                    .arg(img)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        };
-        let write = |img: &std::path::Path, spec: &str| {
-            assert!(
-                std::process::Command::new("qemu-io")
-                    .args(["-c", spec])
-                    .arg(img)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        };
-        // prev: cluster 1 = 0xBB, cluster 3 = 0xDD.
-        overlay(&prev);
-        write(&prev, "write -P 0xBB 65536 65536");
-        write(&prev, "write -P 0xDD 196608 65536");
-        // cur: cluster 1 = 0xBB (unchanged), cluster 3 = 0xEE (rewritten), cluster 5 = 0xCC (new).
-        overlay(&cur);
-        write(&cur, "write -P 0xBB 65536 65536");
-        write(&cur, "write -P 0xEE 196608 65536");
-        write(&cur, "write -P 0xCC 327680 65536");
-
-        let within = crate::qcow2::Qcow2::open(&cur)
-            .unwrap()
-            .data_extents()
-            .unwrap();
-        let dirty = content_diff(&prev, &cur, &within, true).unwrap();
-        assert_eq!(
-            dirty,
-            vec![(196608, 65536), (327680, 65536)],
-            "only the rewritten (cluster 3) and new (cluster 5) clusters are dirty; the \
-             unchanged shared cluster 1 is skipped"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// With the read-skip off, `content_diff` is a true logical byte-compare over the whole
-    /// `within` — base-identical regions that neither overlay wrote (holes) come back clean.
-    /// This is the reassembly-localizer contract; the read-skip (valid only when `within` is
-    /// `cur`'s own allocation) would instead flag every hole outside `prev`'s allocation, so
-    /// the two flag values are asserted to diverge on exactly this shape.
+    /// The reassembly-localizer contract: `content_diff` byte-compares all of `within`, leaves
+    /// base-identical holes neither overlay wrote clean, and catches in-place rewrites.
     #[test]
     fn content_diff_full_compare_leaves_holes_clean() {
         fn have(tool: &str) -> bool {
@@ -4228,24 +3993,23 @@ mod tests {
 
         let whole = [(0u64, 1024 * 1024u64)];
         // Full compare: only the two blocks that actually differ, at 256 KiB granularity.
-        let full = content_diff(&prev, &cur, &whole, false).unwrap();
+        let full = content_diff(&prev, &cur, &whole).unwrap();
         assert_eq!(
             full,
             vec![(0, 262144), (524288, 262144)],
             "full compare flags only the blocks whose bytes differ; base-identical holes are clean"
         );
-        // Read-skip on this shape over-reports: blocks 1 and 3 are holes `prev` never allocated,
-        // so they are flagged dirty without a compare — strictly more bytes than the true diff.
-        let skipped: u64 = content_diff(&prev, &cur, &whole, true)
-            .unwrap()
-            .iter()
-            .map(|&(_, l)| l)
-            .sum();
-        let truth: u64 = full.iter().map(|&(_, l)| l).sum();
-        assert!(
-            skipped > truth,
-            "read-skip must over-report when within spans holes cur does not allocate \
-             (skipped {skipped} > truth {truth})"
+        // A cluster both overlays allocate with the same bytes is clean.
+        write(&cur, "write -P 0xBB 131072 65536");
+        assert_eq!(
+            content_diff(&prev, &cur, &whole).unwrap(),
+            vec![(524288, 262144)]
+        );
+        // An in-place rewrite is caught by the bytes alone.
+        write(&cur, "write -P 0xEE 131072 65536");
+        assert_eq!(
+            content_diff(&prev, &cur, &whole).unwrap(),
+            vec![(0, 262144), (524288, 262144)]
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

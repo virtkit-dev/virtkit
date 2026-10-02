@@ -4265,9 +4265,9 @@ pub(crate) struct VmSession {
     /// was attached; `None` = this guest has no writable scratch disk. The executor mounts it
     /// on demand for a `RUN --mount=type=bind,from=scratch,rw` step.
     scratch_dev: Option<String>,
-    /// Unix socket the stage overlay's dirty-drain control listener serves on (libkrun build
-    /// stages only). `checkpoint_dirty` connects here; `None` = full-capture fallback.
-    dirty_socket: Option<PathBuf>,
+    /// Unix socket the stage overlay's dirty-drain control listener serves on.
+    /// `drain_dirty` and `flush_disk` connect here.
+    dirty_socket: PathBuf,
     /// build-wide cancellation: when the parallel driver aborts a build (a stage failed),
     /// a RUN still executing in this guest is interrupted rather than run to completion.
     /// `None` outside the parallel build (a plain `vk run`).
@@ -4502,15 +4502,11 @@ pub(crate) async fn boot_session(
     // becomes the stage's result — no separate boot overlay, no commit. (A raw-rw disk
     // does not present as /dev/vda, which is why every stage image is a qcow2.)
     // Dirty-block tracking for the O(delta) checkpoint capture: the writable stage overlay
-    // serves a drain protocol on this socket. `checkpoint_dirty` connects here at each
+    // serves a drain protocol on this socket. `drain_dirty` connects here at each
     // commit. The socket lives in the per-session work dir, out of the guest's reach.
-    let dirty_socket = Some(work.join("dirty.sock"));
-    let overlay = match &dirty_socket {
-        Some(sock) => {
-            crate::vmm::Disk::overlay(image.to_path_buf()).with_dirty_control(sock.clone())
-        }
-        None => crate::vmm::Disk::overlay(image.to_path_buf()),
-    };
+    let dirty_socket = work.join("dirty.sock");
+    let overlay =
+        crate::vmm::Disk::overlay(image.to_path_buf()).with_dirty_control(dirty_socket.clone());
     let mut disks: Vec<crate::vmm::Disk> = vec![overlay];
     // `vk build --disk`: the caller-owned target disk, attached read-write immediately after
     // the rootfs so it is always /dev/vdb for the stage's RUNs (before the sources below).
@@ -4757,27 +4753,6 @@ impl VmSession {
         )
     }
 
-    /// Capture a consistent point-in-time copy of the live stage image (a qcow2) to `out`,
-    /// for the cache push to read directly via the native qcow2 reader — no `qemu-img
-    /// convert` to a flat raw (that wrote a whole image per instruction, the dominant disk
-    /// IO of cache-on).
-    ///
-    /// The guest fs is quiesced first so the copy is consistent: the agent's built-in
-    /// `fsfreeze` is preferred (it flushes + marks the ext4 clean), falling back to a plain
-    /// `sync`. The freeze MUST be thawed afterwards (even on copy failure) or the guest
-    /// hangs. cloud-hypervisor holds an advisory write lock on the live image that a plain
-    /// `std::fs::copy` ignores; the copy keeps the same backing reference (opened
-    /// read-only), so the reader resolves unchanged clusters through it.
-    pub(crate) async fn capture(&self, out: &Path, timings: &Timings) -> Result<()> {
-        let t = Instant::now();
-        let frozen = self.freeze().await;
-        let copied = std::fs::copy(&self.image, out);
-        self.thaw(frozen).await;
-        copied.with_context(|| format!("copying {} -> {}", self.image.display(), out.display()))?;
-        timings.probe("snap.capture", t.elapsed());
-        Ok(())
-    }
-
     /// Quiesce the guest fs so the live image is a consistent point-in-time source: `fsfreeze`
     /// (flushes + marks the ext4 clean) when the guest supports it, else a plain `sync`.
     /// Returns whether the freeze took (so [`Self::thaw`] knows to unfreeze). The freeze MUST
@@ -4820,25 +4795,14 @@ impl VmSession {
         &self.image
     }
 
-    /// Whether this guest's block device tracks dirty clusters (libkrun build stages). When
-    /// true, [`Self::drain_dirty`] yields the O(delta) changed extents instead of a whole-image
-    /// diff.
-    pub(crate) fn supports_dirty(&self) -> bool {
-        self.dirty_socket.is_some()
-    }
-
     /// Drain the block device's dirty-cluster set over the control socket: the guest-logical
     /// byte ranges mutated since the previous drain, split into `(written, discarded)` — clusters
     /// whose last touch put data there vs. clusters freed or zeroed (to hole, not read). Also
     /// flushes the device's writes to the image file, so a subsequent host-side read of `image()`
-    /// sees them. Freeze the guest first (so no write races the drain). Errs if dirty tracking is
-    /// disabled.
+    /// sees them. Freeze the guest first (so no write races the drain).
     pub(crate) fn drain_dirty(&self) -> Result<DrainedDirty> {
         use std::io::{Read, Write};
-        let sock = self
-            .dirty_socket
-            .as_ref()
-            .context("drain_dirty: dirty tracking not enabled for this guest")?;
+        let sock = &self.dirty_socket;
         let mut conn = vk_core::unixpath::connect(sock)
             .with_context(|| format!("connecting dirty-control socket {}", sock.display()))?;
         conn.write_all(b"D").context("dirty-control: send DRAIN")?;
@@ -4875,15 +4839,11 @@ impl VmSession {
     }
 
     /// Flush the stage disk's write-back cache to the host image over the block-control socket,
-    /// so a later host read (export / cache) sees a complete image once the VMM is killed. A
-    /// no-op when the guest has no control socket — a plain run (whose image is discarded) or
-    /// cloud-hypervisor (which writes through). Best-effort: an error is logged and the caller
-    /// kills the VMM regardless.
+    /// so a later host read (export / cache) sees a complete image once the VMM is killed.
+    /// Best-effort: an error is logged and the caller kills the VMM regardless.
     fn flush_disk(&self) {
         use std::io::{Read, Write};
-        let Some(sock) = self.dirty_socket.as_ref() else {
-            return;
-        };
+        let sock = &self.dirty_socket;
         let flush = || -> Result<()> {
             let mut conn = vk_core::unixpath::connect(sock)
                 .with_context(|| format!("connecting block-control socket {}", sock.display()))?;
@@ -4947,8 +4907,7 @@ impl VmSession {
     /// point-in-time), flush the block device's write-back cache to the host image, then kill.
     /// libkrun keeps guest writes in that cache until an explicit flush, so a bare SIGKILL would
     /// truncate the stage qcow2 (an L2 entry past EOF a later native read rejects) — [`flush_disk`]
-    /// makes it durable first. cloud-hypervisor writes through and a plain run discards its image,
-    /// so both have no control socket and the flush is a no-op.
+    /// makes it durable first, over the stage's control socket.
     pub(crate) async fn finish(mut self) -> Result<()> {
         self.quiesce_for_shutdown().await;
         let _ = self.ch.kill();
