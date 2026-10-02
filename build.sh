@@ -33,6 +33,10 @@
 # but unoptimized + unstripped and NOT reproducible, so not a release artifact (cannot
 # combine with --bootstrap-check). The dev profile also trims debuginfo to line tables,
 # cutting the edit-rebuild loop further without touching the release profile.
+#
+# --features=<list>: extra cargo features for vk-driver (comma-separated; repeats add up).
+# Such a vk is not the release artifact, so this cannot combine with --bootstrap-check, and
+# its manifest says so.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -53,6 +57,7 @@ FAST=""              # --fast/--debug: build the debug profile (much faster to c
                      # unoptimized + unstripped) for iteration — NOT a release artifact
 NO_KERNEL=""         # --no-kernel: build vk without embedding dist/vmlinux
 KERNEL_FROM=""       # --kernel-from=<tag>: dist/vmlinux is that release's kernel
+FEATURES=""          # --features=<list>: extra vk-driver cargo features
 for arg in "$@"; do
   case "$arg" in
     --use-virtkit=*) USE_VIRTKIT="${arg#*=}" ;;
@@ -61,6 +66,7 @@ for arg in "$@"; do
     --fast|--debug) FAST=1 ;;
     --no-kernel) NO_KERNEL=1 ;;
     --kernel-from=?*) KERNEL_FROM="${arg#*=}" ;;
+    --features=?*) FEATURES="${FEATURES:+$FEATURES,}${arg#*=}" ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -68,6 +74,14 @@ done
 # artifact nor reproducible — it cannot back the reproducibility check.
 if [ -n "$FAST" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
   echo "--fast builds the debug profile; it cannot be combined with --bootstrap-check" >&2
+  exit 2
+fi
+# Spliced unquoted into BUILD_CMD: only a plain comma-separated feature list gets through.
+case "$FEATURES" in
+  *[!A-Za-z0-9_,/-]*) echo "--features takes a comma-separated list of cargo features" >&2; exit 2 ;;
+esac
+if [ -n "$FEATURES" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
+  echo "--features builds a non-release vk; it cannot be combined with --bootstrap-check" >&2
   exit 2
 fi
 # The rebuild boots a microVM on the vk this build produces, which takes its kernel from
@@ -177,7 +191,7 @@ fi
 # vk-registry (the standalone central server), vk-hub (the experimental local web UI) and
 # vk-runnerctl (the root-side setter for gitlab-runner's concurrent) embed nothing, so they
 # build plainly (no EMBED_ENV) alongside vk.
-BUILD_CMD="cargo build $CARGO_PROFILE_FLAG -p vk-agent && env $EMBED_ENV cargo build $CARGO_PROFILE_FLAG -p vk-driver && cargo build $CARGO_PROFILE_FLAG -p vk-registry && cargo build $CARGO_PROFILE_FLAG -p vk-hub && cargo build $CARGO_PROFILE_FLAG -p vk-runnerctl"
+BUILD_CMD="cargo build $CARGO_PROFILE_FLAG -p vk-agent && env $EMBED_ENV cargo build $CARGO_PROFILE_FLAG -p vk-driver${FEATURES:+ --features $FEATURES} && cargo build $CARGO_PROFILE_FLAG -p vk-registry && cargo build $CARGO_PROFILE_FLAG -p vk-hub && cargo build $CARGO_PROFILE_FLAG -p vk-runnerctl"
 
 compile_start=$SECONDS
 if [ -n "$VK_BIN" ]; then
@@ -260,8 +274,15 @@ toolchain=$(sed -nE 's/^channel = "(.*)"$/\1/p' rust-toolchain.toml)
 # manifest so its hashes are never mistaken for a release artifact — the release "Verify"
 # recipe would rebuild the release profile and fail sha256sum -c against these debug bytes.
 if [ -n "$FAST" ]; then
-  manifest_header="# virtkit DEBUG build manifest (--fast${NO_KERNEL:+ --no-kernel}) — NOT reproducible, not a release artifact
+  manifest_header="# virtkit DEBUG build manifest (--fast${NO_KERNEL:+ --no-kernel}${FEATURES:+ --features=$FEATURES}) — NOT reproducible, not a release artifact
 profile:         debug"
+elif [ -n "$FEATURES" ]; then
+  # Release-profile bytes, but of a vk with extra features: the release recipe rebuilds the
+  # default feature set, so it would fail against these hashes.
+  manifest_header="# virtkit build manifest (--features=${FEATURES}) — extra features, not a release artifact
+# Verify: git checkout <git_commit> && ./build.sh --features=${FEATURES}${NO_KERNEL:+ --no-kernel}${KERNEL_FROM:+ --kernel-from=$KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
+profile:         release
+features:        ${FEATURES}"
 elif [ -n "$NO_KERNEL" ]; then
   # Same trap as --fast, one step removed: the bytes are release-profile but kernel-less,
   # so the release recipe — which embeds the kernel — rebuilds something else entirely.
