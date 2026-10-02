@@ -440,6 +440,8 @@ pub struct VirtioPciTransport {
     /// its two dwords is being size-probed.
     shm: Option<(u64, u64)>,
     shm_bar_probe: [bool; 2],
+    /// The driver asked for a reset the device cannot perform (see `write_common_config`).
+    reset_unsupported: bool,
 }
 
 impl VirtioPciTransport {
@@ -527,6 +529,7 @@ impl VirtioPciTransport {
             msix_config_vector: VIRTIO_MSI_NO_VECTOR,
             shm,
             shm_bar_probe: [false; 2],
+            reset_unsupported: false,
         })
     }
 
@@ -964,7 +967,12 @@ impl VirtioPciTransport {
                 data.copy_from_slice(&(self.state.queue_config.len() as u16).to_le_bytes());
             }
             (common_cfg::DEVICE_STATUS, BYTE_SIZE) => {
-                data.copy_from_slice(&[self.state.device_status as u8]);
+                let status = if self.reset_unsupported {
+                    0
+                } else {
+                    self.state.device_status as u8
+                };
+                data.copy_from_slice(&[status]);
             }
             (common_cfg::CONFIG_GENERATION, BYTE_SIZE) => {
                 data.copy_from_slice(&[self.state.config_generation as u8]);
@@ -1074,6 +1082,22 @@ impl VirtioPciTransport {
                 self.reset_queue_registers();
                 self.msix_config_vector = VIRTIO_MSI_NO_VECTOR;
                 self.sync_msix_vectors();
+            } else if status == 0 {
+                // The device refused the reset (net, vsock and balloon cannot). A virtio-pci
+                // driver polls the status until it reads 0 (Linux does when it resets a
+                // device at reboot or power-off, in `vp_modern_set_status`), so it would wait
+                // forever: report the reset done, and drop the transport's own state as a
+                // reset does. The device stays failed underneath, its workers still running:
+                // a later re-initialization reads status 0 and gives up (Linux at
+                // FEATURES_OK) instead of activating it twice, but a driver that re-inits in
+                // the same process must not reuse the rings the device may still write. The
+                // status reads 0 from then on, hiding FAILED (local patch).
+                warn!("virtio-pci: the device cannot reset; reporting it reset anyway");
+                self.interrupt.reset();
+                self.reset_queue_registers();
+                self.msix_config_vector = VIRTIO_MSI_NO_VECTOR;
+                self.sync_msix_vectors();
+                self.reset_unsupported = true;
             } else if !was_activated && self.state.locked_device().is_activated() {
                 self.replay_pending_queue_notifications();
             }
@@ -1505,6 +1529,7 @@ mod tests {
         activated: bool,
         queue_config: &'static [QueueConfig],
         shm: Option<crate::virtio::VirtioShmRegion>,
+        resettable: bool,
     }
 
     impl VirtioDevice for DummyDevice {
@@ -1571,8 +1596,10 @@ mod tests {
         }
 
         fn reset(&mut self) -> bool {
-            self.activated = false;
-            true
+            if self.resettable {
+                self.activated = false;
+            }
+            self.resettable
         }
     }
 
@@ -1589,6 +1616,7 @@ mod tests {
                 activated: false,
                 queue_config,
                 shm: None,
+                resettable: true,
             })),
             Some(5),
             intx_line.clone(),
@@ -1781,6 +1809,7 @@ mod tests {
                     guest_addr,
                     size,
                 }),
+                resettable: true,
             })),
             Some(5),
             Arc::new(DummyIntxLine::default()),
@@ -1849,6 +1878,74 @@ mod tests {
     }
 
     #[test]
+    fn a_reset_the_device_cannot_do_still_reads_back_as_done() {
+        let mem =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), TEST_GUEST_MEMORY_SIZE)]).unwrap();
+        let mut transport = VirtioPciTransport::new(
+            mem,
+            Arc::new(Mutex::new(DummyDevice {
+                acked_features: 0,
+                activated: true,
+                queue_config: &QUEUE_CONFIG,
+                shm: None,
+                resettable: false,
+            })),
+            Some(5),
+            Arc::new(DummyIntxLine::default()),
+            0,
+        )
+        .unwrap();
+        let base = enable_memory_bar(&mut transport);
+        write_bar(&mut transport, base, common_cfg::DEVICE_STATUS, &[0]);
+        let mut status = [0xff];
+        read_bar(
+            &mut transport,
+            base + common_cfg::DEVICE_STATUS,
+            &mut status,
+        );
+        assert_eq!(
+            status,
+            [0],
+            "a driver polling for the reset must see it done"
+        );
+        // The device is still failed underneath: a new initialization cannot get it going.
+        write_bar(
+            &mut transport,
+            base,
+            common_cfg::DEVICE_STATUS,
+            &[device_status::ACKNOWLEDGE as u8],
+        );
+        assert_ne!(transport.state.device_status & device_status::FAILED, 0);
+        read_bar(
+            &mut transport,
+            base + common_cfg::DEVICE_STATUS,
+            &mut status,
+        );
+        assert_eq!(status, [0], "re-initialization sees no progress");
+    }
+
+    #[test]
+    fn a_driver_written_failed_is_cleared_by_a_reset() {
+        let (mut transport, _) = transport_with_line();
+        let base = enable_memory_bar(&mut transport);
+        let ack = device_status::ACKNOWLEDGE as u8;
+        write_bar(&mut transport, base, common_cfg::DEVICE_STATUS, &[ack]);
+        // A probe error: the driver marks the device failed, then resets it.
+        let failed = ack | device_status::FAILED as u8;
+        write_bar(&mut transport, base, common_cfg::DEVICE_STATUS, &[failed]);
+        write_bar(&mut transport, base, common_cfg::DEVICE_STATUS, &[0]);
+        assert!(!transport.reset_unsupported);
+        write_bar(&mut transport, base, common_cfg::DEVICE_STATUS, &[ack]);
+        let mut status = [0];
+        read_bar(
+            &mut transport,
+            base + common_cfg::DEVICE_STATUS,
+            &mut status,
+        );
+        assert_eq!(status, [ack], "the device initializes again");
+    }
+
+    #[test]
     fn a_device_without_intx_has_no_interrupt_pin() {
         let mem =
             GuestMemoryMmap::from_ranges(&[(GuestAddress(0), TEST_GUEST_MEMORY_SIZE)]).unwrap();
@@ -1859,6 +1956,7 @@ mod tests {
                 activated: false,
                 queue_config: &QUEUE_CONFIG,
                 shm: None,
+                resettable: true,
             })),
             None,
             Arc::new(DummyIntxLine::default()),

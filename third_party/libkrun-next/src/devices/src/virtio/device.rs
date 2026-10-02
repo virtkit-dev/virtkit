@@ -260,11 +260,12 @@ impl VirtioTransportState {
                 if device_activated {
                     debug!("reset device while it's still in active state");
                 }
+                // Only a device that cannot reset stays failed. A FAILED the driver wrote
+                // itself (a probe error) is cleared by the reset like the rest of the status
+                // (local patch, see VENDOR.md).
                 if device_activated && !self.locked_device().reset() {
                     self.device_status |= FAILED;
-                }
-
-                if self.device_status & FAILED == 0 {
+                } else {
                     self.reset();
                     return true;
                 }

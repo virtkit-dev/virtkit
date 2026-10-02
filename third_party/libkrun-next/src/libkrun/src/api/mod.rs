@@ -20,6 +20,8 @@ pub(crate) use export_bitflags;
 
 #[cfg(feature = "aws-nitro")]
 pub use crate::NitroConfig;
+/// The process exit code of a VM whose guest reset itself (local patch, see VENDOR.md).
+pub use crate::vmm::KRUN_EXIT_GUEST_RESET;
 #[cfg(not(feature = "tee"))]
 pub use device_builders::BalloonDevice;
 #[cfg(feature = "blk")]
@@ -57,8 +59,6 @@ pub use error::VmmError;
 pub use logging::{LogLevel, LogOptions, LogStyle, init_log};
 pub use payload::{KernelFormat, Payload};
 pub use vmm_builder::{Vmm, VmmBuilder, VmmHandle, check_nested_virt};
-/// The process exit code of a VM whose guest reset itself (local patch, see VENDOR.md).
-pub use crate::vmm::KRUN_EXIT_GUEST_RESET;
 
 #[cfg(feature = "net")]
 pub use devices::virtio::net::device::VirtioNetBackend;
