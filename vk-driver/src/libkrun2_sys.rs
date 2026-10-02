@@ -17,9 +17,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use krun2::{
-    BalloonDevice, BlockDevice, ConsoleDevice, DiskFormat, FsCachePolicy, FsDevice, KernelFormat,
-    LogLevel, LogOptions, LogStyle, MmioDeviceManager, NetDevice, NetFlags, Payload, RngDevice,
-    SyncMode, TsiFlags, VmmBuilder, VmmError, VmmHandle, VsockDevice, port_io,
+    AttachDevice, BalloonDevice, BlockDevice, ConsoleDevice, DiskFormat, FsCachePolicy, FsDevice,
+    KernelFormat, LogLevel, LogOptions, LogStyle, MmioDeviceManager, NetDevice, NetFlags, Payload,
+    PciDeviceManager, RngDevice, SyncMode, TsiFlags, VmmBuilder, VmmError, VmmHandle, VsockDevice,
+    port_io,
 };
 use vk_core::unixpath::SocketPath;
 
@@ -32,6 +33,41 @@ use crate::vmm::{Disk, DiskSync, FsShare, Net, ShareCache, VmSpec};
 
 /// The guest's vsock CID, the one libkrun 1.19's implicit vsock device gave it.
 const GUEST_CID: u64 = 3;
+
+/// The transport the devices sit on: virtio-mmio, or virtio-pci with MSI-X
+/// (`VIRTKIT_KRUN2_PCI=1` until it serves shared-memory regions, which DAX shares need).
+enum Devices<'a> {
+    Mmio(MmioDeviceManager<'a>),
+    Pci(PciDeviceManager<'a>),
+}
+
+impl<'a> Devices<'a> {
+    fn new() -> Self {
+        if std::env::var("VIRTKIT_KRUN2_PCI").as_deref() == Ok("1") {
+            Devices::Pci(PciDeviceManager::new())
+        } else {
+            Devices::Mmio(MmioDeviceManager::new())
+        }
+    }
+
+    fn add(&mut self, device: impl AttachDevice<'a>) {
+        match self {
+            Devices::Mmio(m) => {
+                m.add(device);
+            }
+            Devices::Pci(p) => {
+                p.add(device);
+            }
+        }
+    }
+
+    fn attach(self, builder: VmmBuilder<'a>) -> VmmBuilder<'a> {
+        match self {
+            Devices::Mmio(m) => builder.devices(m),
+            Devices::Pci(p) => builder.devices(p),
+        }
+    }
+}
 
 /// A libkrun error as an `anyhow` one, naming what was being set up.
 fn krun(what: &'static str) -> impl FnOnce(VmmError) -> anyhow::Error {
@@ -75,7 +111,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
     // libkrun binds and dials these sockets once the VM runs, a vsock port's peer only on
     // the guest's first connect, so they are held until the process ends.
     let mut sockets = Vec::new();
-    let mut devices = MmioDeviceManager::new();
+    let mut devices = Devices::new();
 
     // Send hvc0 and legacy COM1 to the serial log for orchestrator diagnostics.
     // COM1 covers modular virtio_console (`vk run --console-serial`, an image kernel).
@@ -178,7 +214,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         .cpus
         .try_into()
         .map_err(|_| anyhow!("libkrun supports at most 255 vCPUs (got {})", spec.cpus))?;
-    let vmm = VmmBuilder::new()
+    let builder = VmmBuilder::new()
         .vcpus(cpus)
         .map_err(krun("vCPUs"))?
         .ram_mib(mem_mib(&spec.mem)?)
@@ -192,8 +228,9 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         .map_err(krun("ACPI"))?
         .shutdown_support(true)
         .add_serial_console(None, Some(log.as_fd()))
-        .map_err(krun("serial console"))?
-        .devices(devices)
+        .map_err(krun("serial console"))?;
+    let vmm = devices
+        .attach(builder)
         .build()
         .map_err(krun("building the VM"))?;
     press_power_button_on_sigterm(vmm.handle().map_err(krun("VM handle"))?)?;
