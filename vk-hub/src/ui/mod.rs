@@ -96,6 +96,8 @@ pub struct Ui {
     streams: sse::Streams,
     /// The VMs table, rendered once for every page listing it ([`sse::feed`]).
     vms_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+    /// What VM pages last read of their VMs.
+    views: local::ViewCache,
 }
 
 impl Ui {
@@ -113,6 +115,7 @@ impl Ui {
             authority,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             streams: sse::Streams::new(),
+            views: local::ViewCache::new(local::VIEWS_FRESH),
         }
     }
 }
@@ -325,7 +328,7 @@ async fn get(path: &str, query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Re
         };
         return Ok(sse::stream(ui.hub.clone(), auth, source, slot));
     }
-    if let Some(resp) = local::get(path, auth, ui) {
+    if let Some(resp) = local::get(path, auth, ui).await {
         return Ok(resp);
     }
     Ok(message(StatusCode::NOT_FOUND, "There is no such page."))
@@ -598,11 +601,11 @@ fn field<'a>(form: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
-/// Run `f`, a database call, off the async runtime.
+/// Run a blocking database or filesystem call off the async runtime.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(f)
         .await
-        .context("running a database call")?
+        .context("running a blocking call")?
 }
 
 fn html_response(status: StatusCode, html: html::Html) -> Response<Body> {

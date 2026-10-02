@@ -26,6 +26,16 @@ async fn start_as(origin: Option<&str>) -> (SocketAddr, Arc<Hub>, String) {
 /// [`start_as`], with the machine whose VMs it shows: no `vk` is run, so its listing is the
 /// test's to set.
 async fn start_local(origin: Option<&str>) -> (SocketAddr, Arc<Hub>, String, Arc<Local>) {
+    start_with_vk(origin, "/nonexistent/vk".into(), local::VIEWS_FRESH).await
+}
+
+/// [`start_local`], running `vk` for what it runs, and showing what a VM's page read again
+/// for `fresh`.
+async fn start_with_vk(
+    origin: Option<&str>,
+    vk: std::path::PathBuf,
+    fresh: Duration,
+) -> (SocketAddr, Arc<Hub>, String, Arc<Local>) {
     let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let origin = origin.map_or_else(|| format!("http://{addr}"), str::to_string);
@@ -33,9 +43,10 @@ async fn start_local(origin: Option<&str>) -> (SocketAddr, Arc<Hub>, String, Arc
         Arc::new(Db::open_memory().unwrap()),
         origin.clone(),
     ));
-    let local = Arc::new(Local::new("/nonexistent/vk".into()));
-    let ui = Arc::new(Ui::new(hub.clone(), &origin, local.clone()));
-    tokio::spawn(serve(listener, ui));
+    let local = Arc::new(Local::new(vk));
+    let mut ui = Ui::new(hub.clone(), &origin, local.clone());
+    ui.views = local::ViewCache::new(fresh);
+    tokio::spawn(serve(listener, Arc::new(ui)));
     (addr, hub, origin, local)
 }
 
@@ -997,4 +1008,326 @@ async fn pages_load_only_the_embedded_scripts() {
             usize::from(path != "/audit")
         );
     }
+}
+
+/// A `vk` that is a shell script: `body` runs with the arguments it was given.
+fn stub_vk(tag: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("vk-hub-stub-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let vk = dir.join("vk");
+    // Written by `cp`, not here: a file this process holds open for writing, as a child
+    // another test forks meanwhile inherits it, cannot be run (ETXTBSY).
+    let source = vk.with_extension("sh");
+    std::fs::write(&source, format!("#!/bin/sh\n{body}\n")).unwrap();
+    let copied = std::process::Command::new("cp")
+        .arg(&source)
+        .arg(&vk)
+        .status();
+    assert!(copied.unwrap().success());
+    std::fs::set_permissions(&vk, std::fs::Permissions::from_mode(0o755)).unwrap();
+    vk
+}
+
+/// The ID `vk workloads` derives from a state dir.
+fn id_of(dir: &str) -> String {
+    use sha2::{Digest, Sha256};
+    crate::hex::to_hex(&Sha256::digest(dir.as_bytes())[..8])
+}
+
+/// A VM's page shows its console's tail, atop's account of it when it records one, and its
+/// egress report, each read by the `vk` command for it, as text — and none of them for a VM
+/// whose state dir the list could not show as it is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vm_s_page_shows_its_console_atop_and_egress() {
+    let vk = stub_vk(
+        "views",
+        r#"echo "$*" >> "$(dirname "$0")/ran"
+case "$1" in
+logs) printf 'console of %s <b>bold</b>\n\033[0;32msecond\tline\033[0m\n' "$6" ;;
+atop) echo "atop of $4" ;;
+egress-report) echo "virtkit: egress refused:"; echo "  egress denied (dns) evil.example  (x2)" ;;
+*) echo "unexpected $*" >&2; exit 3 ;;
+esac"#,
+    );
+    let (addr, hub, _, local) = start_with_vk(None, vk.clone(), local::VIEWS_FRESH).await;
+    let scratch = vk.parent().unwrap();
+    let (state, recording) = (scratch.join("state"), scratch.join("recording"));
+    std::fs::create_dir_all(state.join("atop")).unwrap();
+    std::fs::create_dir_all(recording.join("atop")).unwrap();
+    std::fs::write(recording.join("atop/atop.log"), b"").unwrap();
+    let (run, recorder) = (run_of(&state), run_of(&recording));
+    // A CI job's recording is in the archive its job dir names, compressed once it ends.
+    let (job_dir, archive) = (scratch.join("job"), scratch.join("archive"));
+    std::fs::create_dir_all(&job_dir).unwrap();
+    std::fs::create_dir_all(&archive).unwrap();
+    std::fs::write(archive.join("atop.log.zst"), b"").unwrap();
+    std::fs::write(
+        job_dir.join("atop.dir"),
+        archive.as_os_str().as_encoded_bytes(),
+    )
+    .unwrap();
+    let mut job = run_of(&job_dir);
+    job.kind = vk_hub_proto::WorkloadKind::CiJob;
+    // A job dir naming a relative archive is not read from.
+    let relative = scratch.join("relative");
+    std::fs::create_dir_all(&relative).unwrap();
+    std::fs::write(relative.join("atop.dir"), b"archive\n").unwrap();
+    let mut relative = run_of(&relative);
+    relative.kind = vk_hub_proto::WorkloadKind::CiJob;
+    // Nor one naming an archive `vk atop` cannot be given, a path that is not text.
+    let binary = scratch.join("binary");
+    std::fs::create_dir_all(&binary).unwrap();
+    std::fs::write(binary.join("atop.dir"), b"/archive/\xff\n").unwrap();
+    let mut binary = run_of(&binary);
+    binary.kind = vk_hub_proto::WorkloadKind::CiJob;
+    // Nor one too long to be a path, rather than one cut to look like it.
+    let long = scratch.join("long");
+    std::fs::create_dir_all(&long).unwrap();
+    std::fs::write(long.join("atop.dir"), format!("/{}", "a".repeat(5000))).unwrap();
+    let mut long = run_of(&long);
+    long.kind = vk_hub_proto::WorkloadKind::CiJob;
+    // Listed as `vk workloads` lists a path with a byte that is not UTF-8: decoded lossily,
+    // so it no longer hashes to its ID.
+    let mut altered = workload("0123456789abcdef", "a\u{fffd}b");
+    altered.state_dir = format!("{}/a\u{fffd}b", scratch.display());
+    let ids = [
+        &run.id,
+        &recorder.id,
+        &job.id,
+        &relative.id,
+        &binary.id,
+        &long.id,
+    ]
+    .map(|id| id.clone());
+    local.set_listing(
+        listed(vec![run, recorder, job, relative, binary, long, altered]),
+        &hub,
+    );
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+
+    let ran = scratch.join("ran");
+    let page = get(addr, &format!("/vm/{}", ids[0]), Some(&cookie)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    // Escaped, and its terminal sequences dropped whole, its tab kept.
+    let console = format!(
+        "console of {} &lt;b&gt;bold&lt;/b&gt;\nsecond\tline\n",
+        state.display()
+    );
+    assert!(page.body.contains(&console), "{}", page.body);
+    assert!(page.body.contains("Not recording"), "{}", page.body);
+    // A run's own state dir is asked of its egress too.
+    assert!(
+        page.body.contains("egress denied (dns) evil.example"),
+        "{}",
+        page.body
+    );
+    let before = std::fs::read_to_string(&ran).unwrap();
+    assert!(
+        before.contains(&format!("logs --exact -n 100 -- {}\n", state.display())),
+        "{before}"
+    );
+    // Read again within moments: what was read is shown again, nothing is run.
+    let page = get(addr, &format!("/vm/{}", ids[0]), Some(&cookie)).await;
+    assert!(page.body.contains(&console), "{}", page.body);
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), before);
+    // Recording itself, atop is asked.
+    let page = get(addr, &format!("/vm/{}", ids[1]), Some(&cookie)).await;
+    assert!(
+        page.body
+            .contains(&format!("atop of {}/atop", recording.display())),
+        "{}",
+        page.body
+    );
+    let page = get(addr, &format!("/vm/{}", ids[2]), Some(&cookie)).await;
+    assert!(
+        page.body.contains("egress denied (dns) evil.example"),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body
+            .contains(&format!("atop of {}", archive.display())),
+        "{}",
+        page.body
+    );
+    let page = get(addr, &format!("/vm/{}", ids[3]), Some(&cookie)).await;
+    assert!(
+        page.body.contains("names no absolute path"),
+        "{}",
+        page.body
+    );
+    let page = get(addr, &format!("/vm/{}", ids[4]), Some(&cookie)).await;
+    assert!(page.body.contains("is not UTF-8"), "{}", page.body);
+    let page = get(addr, &format!("/vm/{}", ids[5]), Some(&cookie)).await;
+    assert!(page.body.contains("too long to be a path"), "{}", page.body);
+    // Its state dir shown altered: nothing is read of it, rather than of another directory.
+    let before = std::fs::read_to_string(&ran).unwrap();
+    let page = get(addr, "/vm/0123456789abcdef", Some(&cookie)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("Not read"), "{}", page.body);
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), before);
+    // A failing command says how it failed, and the page still shows.
+    let (addr, hub, _, local) = start_local(None).await;
+    let id = id_of("/s/x");
+    local.set_listing(listed(vec![workload(&id, "x")]), &hub);
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, &format!("/vm/{id}"), Some(&cookie)).await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("/nonexistent/vk"), "{}", page.body);
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+/// A workload listed as `vk workloads` lists a pinned run with state dir `dir`.
+fn run_of(dir: &std::path::Path) -> vk_hub_proto::Workload {
+    let dir = dir.display().to_string();
+    let mut run = workload(&id_of(&dir), "alpine:3.20");
+    run.state_dir = dir;
+    run
+}
+
+/// What a failing command printed is shown as text: its markup escaped, its terminal
+/// sequences dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_view_shows_what_it_said_as_text() {
+    let vk = stub_vk(
+        "failed",
+        r#"printf '<script>alert(1)</script> & \033[31mred\033[0m "q"\n' >&2; exit 4"#,
+    );
+    let (addr, hub, _, local) = start_with_vk(None, vk.clone(), local::VIEWS_FRESH).await;
+    let state = vk.parent().unwrap().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let w = run_of(&state);
+    let id = w.id.clone();
+    local.set_listing(listed(vec![w]), &hub);
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, &format!("/vm/{id}"), Some(&cookie)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("exit status: 4"), "{}", page.body);
+    assert!(
+        page.body
+            .contains("&lt;script&gt;alert(1)&lt;/script&gt; &amp; red &quot;q&quot;\n"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("<script>alert"), "{}", page.body);
+    assert!(!page.body.contains('\u{1b}'), "{}", page.body);
+    let _ = std::fs::remove_dir_all(vk.parent().unwrap());
+}
+
+/// Past its freshness window, what a page read is read again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_past_its_window_is_read_again() {
+    let vk = stub_vk("expiry", r#"echo "$1" >> "$(dirname "$0")/ran""#);
+    let (addr, hub, _, local) = start_with_vk(None, vk.clone(), Duration::ZERO).await;
+    let state = vk.parent().unwrap().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let w = run_of(&state);
+    let id = w.id.clone();
+    local.set_listing(listed(vec![w]), &hub);
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let ran = vk.parent().unwrap().join("ran");
+    let logs = || {
+        std::fs::read_to_string(&ran)
+            .unwrap()
+            .lines()
+            .filter(|l| *l == "logs")
+            .count()
+    };
+    get(addr, &format!("/vm/{id}"), Some(&cookie)).await;
+    assert_eq!(logs(), 1);
+    get(addr, &format!("/vm/{id}"), Some(&cookie)).await;
+    assert_eq!(logs(), 2);
+    let _ = std::fs::remove_dir_all(vk.parent().unwrap());
+}
+
+/// Pages of one VM loaded while it is being read share that read: its commands run once.
+#[tokio::test(flavor = "multi_thread")]
+async fn loads_of_one_vm_at_once_share_one_read() {
+    // Each command holds until the test lets it go, so the later loads are sent while the
+    // first one's read is under way.
+    let vk = stub_vk(
+        "coalesce",
+        r#"dir="$(dirname "$0")"; echo "$1" >> "$dir/ran"
+while [ ! -e "$dir/go" ]; do sleep 0.05; done
+echo "read by $$""#,
+    );
+    // Nothing read is shown again: a load that did not join the read would run its own.
+    let (addr, hub, _, local) = start_with_vk(None, vk.clone(), Duration::ZERO).await;
+    let scratch = vk.parent().unwrap().to_path_buf();
+    let state = scratch.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let w = run_of(&state);
+    let id = w.id.clone();
+    local.set_listing(listed(vec![w]), &hub);
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let load = || {
+        let (path, cookie) = (format!("/vm/{id}"), cookie.clone());
+        tokio::spawn(async move { get(addr, &path, Some(&cookie)).await })
+    };
+    let ran = scratch.join("ran");
+    let logs_run = || {
+        std::fs::read_to_string(&ran)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| *l == "logs")
+            .count()
+    };
+    let first = load();
+    for _ in 0..200 {
+        if logs_run() > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(logs_run(), 1);
+    let (second, third) = (load(), load());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!first.is_finished() && !second.is_finished() && !third.is_finished());
+    std::fs::write(scratch.join("go"), b"").unwrap();
+    let pages = [
+        first.await.unwrap(),
+        second.await.unwrap(),
+        third.await.unwrap(),
+    ];
+    let ran = std::fs::read_to_string(&ran).unwrap();
+    assert_eq!(ran.lines().filter(|l| *l == "logs").count(), 1, "{ran}");
+    assert_eq!(
+        ran.lines().filter(|l| *l == "egress-report").count(),
+        1,
+        "{ran}"
+    );
+    for page in &pages {
+        assert_eq!(page.status, 200, "{}", page.body);
+        assert!(page.body.contains("read by"), "{}", page.body);
+    }
+    let _ = std::fs::remove_dir_all(vk.parent().unwrap());
+}
+
+/// A command whose output is cut says so beside what is shown, and nothing more of how it
+/// ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_view_says_so() {
+    let vk = stub_vk(
+        "cut",
+        "i=0; while [ $i -lt 30000 ]; do echo \"line $i\"; i=$((i+1)); done",
+    );
+    let (addr, hub, _, local) = start_with_vk(None, vk.clone(), local::VIEWS_FRESH).await;
+    let state = vk.parent().unwrap().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let w = run_of(&state);
+    let id = w.id.clone();
+    local.set_listing(listed(vec![w]), &hub);
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, &format!("/vm/{id}"), Some(&cookie)).await;
+    assert!(
+        page.body.contains("(output cut at 256 KiB)"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("exit status"), "{}", page.body);
+    // The console keeps its end.
+    assert!(page.body.contains("line 29999\n</pre>"), "{}", page.body);
+    let _ = std::fs::remove_dir_all(vk.parent().unwrap());
 }

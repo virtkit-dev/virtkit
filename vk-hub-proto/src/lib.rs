@@ -27,39 +27,41 @@ pub const MAX_WORKLOADS_BYTES: usize = 256 * 1024;
 /// The longest string of a host's that is kept for display.
 pub const MAX_DISPLAY: usize = 256;
 
-/// `s` made safe to print, cut to [`MAX_DISPLAY`] characters. Dropped: control characters,
-/// the line and paragraph separators, and the invisible format characters — bidirectional
-/// marks, overrides and isolates, zero-width and blank fillers, variation selectors, the
-/// byte-order mark, tags — any of which can rewrite or hide what a terminal or a page shows
-/// around it.
+/// `s` made safe to print, cut to [`MAX_DISPLAY`] characters. Dropped: control characters
+/// and the [`invisible`] ones.
 pub fn display_safe(s: &str) -> String {
     s.chars()
-        .filter(|&c| {
-            !c.is_control()
-                && !matches!(
-                    c,
-                    '\u{00ad}'
-                        | '\u{034f}'
-                        | '\u{061c}'
-                        | '\u{115f}'
-                        | '\u{1160}'
-                        | '\u{17b4}'
-                        | '\u{17b5}'
-                        | '\u{180e}'
-                        | '\u{200b}'..='\u{200f}'
-                        | '\u{2028}'..='\u{202e}'
-                        | '\u{2060}'..='\u{206f}'
-                        | '\u{3164}'
-                        | '\u{fe00}'..='\u{fe0f}'
-                        | '\u{feff}'
-                        | '\u{ffa0}'
-                        | '\u{fff9}'..='\u{fffb}'
-                        | '\u{e0000}'..='\u{e007f}'
-                        | '\u{e0100}'..='\u{e01ef}'
-                )
-        })
+        .filter(|&c| !c.is_control() && !invisible(c))
         .take(MAX_DISPLAY)
         .collect()
+}
+
+/// Whether `c` is one of the characters that can rewrite or hide what a terminal or a page
+/// shows around it without showing itself: the line and paragraph separators, and the
+/// invisible format characters — bidirectional marks, overrides and isolates, zero-width and
+/// blank fillers, variation selectors, the byte-order mark, tags.
+pub fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{061c}'
+            | '\u{115f}'
+            | '\u{1160}'
+            | '\u{17b4}'
+            | '\u{17b5}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{feff}'
+            | '\u{ffa0}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e007f}'
+            | '\u{e0100}'..='\u{e01ef}'
+    )
 }
 
 /// The VMs running on a host, as `vk workloads` prints them.

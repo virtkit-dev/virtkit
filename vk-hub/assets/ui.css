@@ -44,7 +44,7 @@ h1 { font-size: 1.3rem; margin: 0 0 0.75rem; }
 h2 { font-size: 1rem; margin: 1.25rem 0 0.4rem; }
 code { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .who { color: var(--muted); display: flex; gap: 0.5rem; align-items: center; margin: 0; }
-.empty { color: var(--muted); }
+.sub, .empty { color: var(--muted); }
 .message { max-width: 40rem; margin: 3rem auto; font-size: 1rem; }
 table { border-collapse: collapse; }
 table.grid { width: 100%; }
@@ -59,3 +59,11 @@ table.kv th, table.kv td { text-align: left; padding: 0.15rem 1rem 0.15rem 0; ve
 table.kv th { color: var(--muted); font-weight: normal; white-space: nowrap; }
 .notes { color: var(--down); padding-left: 1.2rem; }
 button { font: inherit; padding: 0.15rem 0.6rem; cursor: pointer; }
+pre {
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--band);
+  padding: 0.5rem 0.75rem;
+  overflow: auto;
+  max-height: 40rem;
+  margin: 0.3rem 0;
+}

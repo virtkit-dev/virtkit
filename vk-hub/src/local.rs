@@ -1,7 +1,8 @@
 //! `vk-hub local`: the hub for the one machine it is started on, run by the person whose VMs
 //! they are — the role virt-manager plays for libvirt. There is no enrollment and no node:
 //! the VMs come from `vk workloads --watch`, a `vk` child of the hub's that prints the list
-//! each time it changes.
+//! each time it changes, and what a VM's page shows of one beyond the list it reads by
+//! running `vk` commands.
 //!
 //! **Why a child, not a library.** The list is `vk`'s to make — its registry, its locks, its
 //! dev environments' state — and `vk-hub` is a separate binary that does not link `vk`. A
@@ -241,6 +242,274 @@ impl Local {
         self.listing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The most of a command's stdout kept, from the end [`Keep`] says: a view shows it whole, and
+/// what the views run prints well below it.
+const MAX_STDOUT: usize = 256 * 1024;
+
+/// The most of its stderr kept, from its end, where a command says why it failed.
+const MAX_STDERR: usize = 64 * 1024;
+
+/// How long its output is still read once it has ended, for what a process it left behind
+/// holding the pipes still prints.
+const DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// What a `vk` command printed, and how it ended.
+pub struct Output {
+    pub ok: bool,
+    /// How it ended, as `exit status: 1` or `killed after 20s`, and whether its stdout was cut.
+    pub status: String,
+    /// Whether more of its stdout was printed than is kept.
+    pub cut: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Which end of a command's stdout is kept past [`MAX_STDOUT`]: the start of a report, the
+/// end of a log.
+#[derive(Clone, Copy, Debug)]
+pub enum Keep {
+    Head,
+    Tail,
+}
+
+impl Local {
+    /// Run `vk` with `args`, its stdin closed, for at most `timeout`, in a process group of its
+    /// own, killed whole once it ends — the command and whatever it started. [`MAX_STDOUT`] of
+    /// its stdout is kept, from the end `stdout` says, and its stderr's last [`MAX_STDERR`],
+    /// the rest read and dropped so it is never left blocked on a full pipe. What `vk` prints
+    /// is the host's: a page shows it through [`crate::ui::html::Html::output`].
+    pub async fn run(
+        &self,
+        args: &[&std::ffi::OsStr],
+        timeout: Duration,
+        stdout: Keep,
+    ) -> Result<Output> {
+        let mut child = tokio::process::Command::new(&self.vk)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // Its own group: killed with what it started, and out of reach of the signals a
+            // terminal sends the hub's.
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("running {}", self.vk.display()))?;
+        // Killed as this returns, or as the page waiting on it goes away: nothing the command
+        // left behind outlives it.
+        let group = child
+            .id()
+            .and_then(|pid| libc::pid_t::try_from(pid).ok())
+            .map(GroupKill);
+        let mut out_pipe = child.stdout.take().context("taking the child's stdout")?;
+        let mut err_pipe = child.stderr.take().context("taking the child's stderr")?;
+        let mut out = match stdout {
+            Keep::Head => Kept::head(MAX_STDOUT),
+            Keep::Tail => Kept::tail(MAX_STDOUT),
+        };
+        let mut err = Kept::tail(MAX_STDERR);
+        let (status, cut_short) = {
+            let reading = async {
+                let (a, b) =
+                    tokio::join!(pump(&mut out_pipe, &mut out), pump(&mut err_pipe, &mut err));
+                a.and(b)
+            };
+            tokio::pin!(reading);
+            let deadline = tokio::time::sleep(timeout);
+            tokio::pin!(deadline);
+            // Read as it runs, and waited for at once: its end is not its pipes' end, which a
+            // process it left behind may hold for as long as it lives.
+            let mut read = None;
+            let status = loop {
+                tokio::select! {
+                    status = child.wait() => break Some(status.context("waiting for it")?),
+                    r = &mut reading, if read.is_none() => read = Some(r),
+                    () = &mut deadline => break None,
+                }
+            };
+            if status.is_none() {
+                if let Some(group) = &group {
+                    group.kill();
+                }
+                let _ = tokio::time::timeout(DRAIN_GRACE, child.wait()).await;
+            }
+            if read.is_none() {
+                read = tokio::time::timeout(DRAIN_GRACE, &mut reading).await.ok();
+            }
+            match read {
+                Some(Err(e)) => return Err(e).context("reading its output"),
+                Some(Ok(())) => (status, false),
+                None => (status, true),
+            }
+        };
+        drop(group);
+        let ok = status.is_some_and(|s| s.success());
+        let mut status = match status {
+            Some(status) => status.to_string(),
+            None => format!(
+                "killed after {}",
+                crate::human_duration(Duration::from_secs(timeout.as_secs()))
+            ),
+        };
+        if cut_short {
+            status.push_str(", its output cut short: a process it left running held it");
+        }
+        // Shown, never parsed: a byte that is not UTF-8 reads as a terminal would show it.
+        let (stdout, cut) = out.into_text();
+        if cut {
+            status.push_str(&format!(" ({})", cut_note()));
+        }
+        Ok(Output {
+            ok,
+            status,
+            cut,
+            stdout,
+            stderr: err.into_text().0,
+        })
+    }
+}
+
+/// What a command's [`Output::status`] adds when its stdout was cut.
+pub fn cut_note() -> String {
+    format!("output cut at {} KiB", MAX_STDOUT / 1024)
+}
+
+/// A process group, killed whole as this is dropped.
+struct GroupKill(libc::pid_t);
+
+impl GroupKill {
+    fn kill(&self) {
+        // SAFETY: a plain syscall. The ID is the group's for as long as any of it lives, and
+        // one left empty is handed out again only once the kernel has cycled through the
+        // others.
+        unsafe { libc::kill(-self.0, libc::SIGKILL) };
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// What is kept of a stream: its first bytes, or its last.
+struct Kept {
+    bytes: Vec<u8>,
+    cap: usize,
+    from_end: bool,
+    /// Whether any byte was dropped.
+    cut: bool,
+}
+
+impl Kept {
+    fn head(cap: usize) -> Self {
+        Kept {
+            bytes: Vec::new(),
+            cap,
+            from_end: false,
+            cut: false,
+        }
+    }
+
+    fn tail(cap: usize) -> Self {
+        Kept {
+            bytes: Vec::new(),
+            cap,
+            from_end: true,
+            cut: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if self.from_end {
+            self.bytes.extend_from_slice(chunk);
+            // Cut down in bulk, so each byte is moved a bounded number of times.
+            if self.bytes.len() > 2 * self.cap {
+                self.bytes.drain(..self.bytes.len() - self.cap);
+                self.cut = true;
+            }
+        } else {
+            let room = self.cap.saturating_sub(self.bytes.len());
+            self.cut |= chunk.len() > room;
+            self.bytes
+                .extend_from_slice(&chunk[..chunk.len().min(room)]);
+        }
+    }
+
+    /// What was kept, decoded lossily, and whether any of the stream was dropped. A cut
+    /// through a character drops the rest of it rather than showing it as `U+FFFD`, and the
+    /// text is at most the cap long, however many bytes decode to a wider `U+FFFD`.
+    fn into_text(mut self) -> (String, bool) {
+        if self.bytes.len() > self.cap {
+            self.bytes.drain(..self.bytes.len() - self.cap);
+            self.cut = true;
+        }
+        if self.cut {
+            if self.from_end {
+                let torn = self
+                    .bytes
+                    .iter()
+                    .take(3)
+                    .take_while(|&&b| continuation(b))
+                    .count();
+                self.bytes.drain(..torn);
+            } else {
+                let keep = self.bytes.len() - torn_end(&self.bytes);
+                self.bytes.truncate(keep);
+            }
+        }
+        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
+        if text.len() > self.cap {
+            self.cut = true;
+            if self.from_end {
+                let start = (text.len() - self.cap..text.len())
+                    .find(|&i| text.is_char_boundary(i))
+                    .unwrap_or(text.len());
+                text.drain(..start);
+            } else {
+                let end = (0..=self.cap)
+                    .rev()
+                    .find(|&i| text.is_char_boundary(i))
+                    .unwrap_or(0);
+                text.truncate(end);
+            }
+        }
+        (text, self.cut)
+    }
+}
+
+/// Whether `b` continues a UTF-8 sequence rather than begins one.
+fn continuation(b: u8) -> bool {
+    b & 0xc0 == 0x80
+}
+
+/// How many bytes at the end of `bytes` begin a UTF-8 sequence they do not finish.
+fn torn_end(bytes: &[u8]) -> usize {
+    for (back, &b) in bytes.iter().rev().take(4).enumerate() {
+        if !continuation(b) {
+            let len = match b {
+                0xc0..=0xdf => 2,
+                0xe0..=0xef => 3,
+                0xf0..=0xf7 => 4,
+                _ => 1,
+            };
+            return if len > back + 1 { back + 1 } else { 0 };
+        }
+    }
+    0
+}
+
+/// Read `r` to its end into `kept`.
+async fn pump(r: &mut (impl tokio::io::AsyncRead + Unpin), kept: &mut Kept) -> std::io::Result<()> {
+    let mut buf = vec![0; 16 * 1024];
+    loop {
+        match r.read(&mut buf).await? {
+            0 => return Ok(()),
+            n => kept.push(&buf[..n]),
+        }
     }
 }
 
@@ -590,6 +859,224 @@ mod tests {
         assert!(vk_binary(Some(PathBuf::from("vk-hub-no-such-binary"))).is_err());
         assert!(vk_binary(Some(PathBuf::from("./vk-hub-no-such-binary"))).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A `vk` that is the shell script `body`.
+    fn fake_vk(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let vk = dir.join("vk");
+        // Written by `cp`, not here: a file this process holds open for writing, as a child
+        // another test forks meanwhile inherits it, cannot be run (ETXTBSY).
+        let source = vk.with_extension("sh");
+        std::fs::write(&source, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let copied = std::process::Command::new("cp")
+            .arg(&source)
+            .arg(&vk)
+            .status();
+        assert!(copied.unwrap().success());
+        std::fs::set_permissions(&vk, std::fs::Permissions::from_mode(0o755)).unwrap();
+        vk
+    }
+
+    fn alive(pid: i32) -> bool {
+        // A zombie has ended; only its parent, gone, would reap it.
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|stat| !stat.rsplit(')').next().unwrap_or("").starts_with(" Z"))
+    }
+
+    /// The process a fake `vk` left running and named in `pid_file`, killed as this is dropped
+    /// should the command under test have failed to, so a failing test leaves nothing behind.
+    struct LeftBehind(PathBuf);
+
+    impl LeftBehind {
+        fn pid(&self) -> i32 {
+            std::fs::read_to_string(&self.0)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        }
+
+        /// Whether it has ended, given a moment to.
+        async fn ended(&self) -> bool {
+            let pid = self.pid();
+            for _ in 0..50 {
+                if !alive(pid) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        }
+    }
+
+    impl Drop for LeftBehind {
+        fn drop(&mut self) {
+            if let Some(pid) = std::fs::read_to_string(&self.0)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                // SAFETY: a plain syscall on the test's own child's child.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+
+    /// Past its time limit the command is killed with what it started, which held its pipes,
+    /// and what it printed so far is kept.
+    #[tokio::test]
+    async fn a_command_past_its_time_is_killed_with_its_group() {
+        let dir = scratch("group");
+        let left = LeftBehind(dir.join("pid"));
+        let vk = fake_vk(
+            &dir,
+            &format!(
+                "sleep 600 & echo $! > '{}'\necho started\nsleep 600",
+                left.0.display()
+            ),
+        );
+        let local = Local::new(vk);
+        let began = Instant::now();
+        let out = local
+            .run(&[], Duration::from_secs(1), Keep::Head)
+            .await
+            .unwrap();
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
+        assert!(!out.ok);
+        assert_eq!(out.status, "killed after 1s");
+        assert_eq!(out.stdout, "started\n");
+        assert!(
+            left.ended().await,
+            "pid {} outlived its group's kill",
+            left.pid()
+        );
+        drop(left);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Its stderr's end is kept, where a failure says why, and its stdout's start, or its end
+    /// when asked.
+    #[tokio::test]
+    async fn stderr_keeps_its_tail_and_stdout_the_end_asked_for() {
+        let dir = scratch("tail");
+        let vk = fake_vk(
+            &dir,
+            "echo first; i=0; while [ $i -lt 8000 ]; do \
+             echo \"line $i of what came before the failure\"; \
+             echo \"line $i of what came before the failure\" >&2; i=$((i+1)); done\n\
+             echo last; echo 'the reason it failed' >&2\nexit 3",
+        );
+        let local = Local::new(vk);
+        let out = local
+            .run(&[], Duration::from_secs(30), Keep::Head)
+            .await
+            .unwrap();
+        assert!(!out.ok);
+        assert_eq!(out.status, "exit status: 3 (output cut at 256 KiB)");
+        assert!(out.cut);
+        assert!(
+            out.stderr.ends_with("the reason it failed\n"),
+            "{:?}",
+            out.stderr.get(..80)
+        );
+        assert!(out.stderr.len() <= MAX_STDERR);
+        assert!(out.stderr.len() > MAX_STDERR - 64);
+        assert!(out.stdout.starts_with("first\n"));
+        assert_eq!(out.stdout.len(), MAX_STDOUT);
+        let out = local
+            .run(&[], Duration::from_secs(30), Keep::Tail)
+            .await
+            .unwrap();
+        assert!(out.cut);
+        assert!(
+            out.stdout.ends_with("failure\nlast\n"),
+            "{:?}",
+            out.stdout.get(..80)
+        );
+        assert_eq!(out.stdout.len(), MAX_STDOUT);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A command that ends while something it left running holds its pipes is waited for at
+    /// its end, its output read for a moment longer, and what it left killed.
+    #[tokio::test]
+    async fn a_command_is_done_when_it_exits_not_when_its_pipes_close() {
+        let dir = scratch("drain");
+        let left = LeftBehind(dir.join("pid"));
+        let vk = fake_vk(
+            &dir,
+            &format!("sleep 600 & echo $! > '{}'\necho done", left.0.display()),
+        );
+        let began = Instant::now();
+        let out = Local::new(vk)
+            .run(&[], Duration::from_secs(60), Keep::Head)
+            .await
+            .unwrap();
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            began.elapsed()
+        );
+        assert!(out.ok);
+        assert!(
+            out.status.contains("its output cut short"),
+            "{}",
+            out.status
+        );
+        assert!(!out.cut);
+        assert_eq!(out.stdout, "done\n");
+        assert!(
+            left.ended().await,
+            "pid {} outlived its command",
+            left.pid()
+        );
+        drop(left);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn kept_bytes_are_bounded_at_either_end() {
+        let mut head = Kept::head(4);
+        let mut tail = Kept::tail(4);
+        for chunk in [&b"ab"[..], b"cdef", b"", b"ghij"] {
+            head.push(chunk);
+            tail.push(chunk);
+        }
+        assert_eq!(head.into_text(), ("abcd".into(), true));
+        assert_eq!(tail.into_text(), ("ghij".into(), true));
+        let mut short = Kept::tail(4);
+        short.push(b"xy");
+        assert_eq!(short.into_text(), ("xy".into(), false));
+        let mut exact = Kept::head(4);
+        exact.push(b"wxyz");
+        assert_eq!(exact.into_text(), ("wxyz".into(), false));
+    }
+
+    /// A cut through a character drops what is left of it, and bytes that are no UTF-8 still
+    /// decode to no more than the cap.
+    #[test]
+    fn kept_text_is_cut_at_a_character() {
+        // "é" is two bytes, "€" three: a cap of 4 cuts either.
+        let mut head = Kept::head(4);
+        head.push("aé€".as_bytes());
+        assert_eq!(head.into_text(), ("aé".into(), true));
+        let mut tail = Kept::tail(4);
+        tail.push("€aé".as_bytes());
+        assert_eq!(tail.into_text(), ("aé".into(), true));
+        let mut tail = Kept::tail(4);
+        tail.push("x€é".as_bytes());
+        assert_eq!(tail.into_text(), ("é".into(), true));
+        let mut bad = Kept::tail(4);
+        bad.push(&[0xff; 4]);
+        let (text, cut) = bad.into_text();
+        assert_eq!((text.as_str(), cut), ("\u{fffd}", true));
+        let mut whole = Kept::head(8);
+        whole.push("é€".as_bytes());
+        assert_eq!(whole.into_text(), ("é€".into(), false));
     }
 
     #[test]
