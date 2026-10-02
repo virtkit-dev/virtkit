@@ -1,0 +1,45 @@
+[package]
+name = "krun-arch"
+version = "0.1.0-2.0.0-dev"
+authors = ["The libkrun Authors"]
+edition = "2024"
+description = "Architecture-specific VM support for libkrun"
+license = "Apache-2.0"
+repository = "https://github.com/containers/libkrun"
+
+[features]
+tee = []
+amd-sev = [ "tee" ]
+tdx = [ "tee", "dep:tdx" ]
+
+[dependencies]
+acpi_tables = "0.2.1"
+libc = ">=0.2.39"
+vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap"] }
+vmm-sys-util = "0.15"
+zerocopy = "0.8.26"
+
+arch_gen = { package = "krun-arch-gen", version = "=0.1.0-2.0.0-dev", path = "../arch_gen" }
+utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+smbios = { package = "krun-smbios", version = "=0.1.0-2.0.0-dev", path = "../smbios" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-bindings = { version = "0.14.1", features = ["fam-wrappers"] }
+kvm-ioctls = "0.25"
+tdx = { version = "0.1.2", optional = true }
+
+[target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
+linux-loader = { version = "0.14.0", features = ["elf"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+whp = { package = "krun-whp", version = "=0.1.0-2.0.0-dev", path = "../whp" }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Hypervisor",
+    "Win32_System_SystemInformation",
+] }
+
+[dev-dependencies]
+utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }

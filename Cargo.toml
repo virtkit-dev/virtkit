@@ -13,12 +13,19 @@ members = [
     "bench",
 ]
 # third_party/libkrun is upstream libkrun's own cargo workspace, vendored and locally
-# patched (see third_party/libkrun/VENDOR.md). vk-driver will depend on its `libkrun`
+# patched (see third_party/libkrun/VENDOR.md). vk-driver depends on its `libkrun`
 # crate by path; excluding it here keeps the two workspaces from merging.
+# third_party/libkrun-next is libkrun's 2.0 development branch, vendored the same way (see
+# its VENDOR.md) while virtkit moves onto its Rust API — excluded for the same reason.
 #
 # third_party/imago is a single vendored leaf crate (see third_party/imago/VENDOR.md), a
 # dependency of third_party/libkrun's block device — excluded for the same reason.
-exclude = ["third_party/libkrun", "third_party/imago", "third_party/ipstack"]
+exclude = [
+    "third_party/libkrun",
+    "third_party/libkrun-next",
+    "third_party/imago",
+    "third_party/ipstack",
+]
 
 [workspace.package]
 version = "0.83.0"
