@@ -19,6 +19,10 @@
 //! [`keep`] wraps the boot in a relaunch loop so a guest reset (`KRUN_EXIT_GUEST_RESET`)
 //! reboots the VM in place — same pid and vsock socket for the supervisor.
 
+// Under `krun2` only the shared helpers and the reboot loop are used; the 1.19 boot path
+// stays until that feature becomes the default.
+#![cfg_attr(feature = "krun2", allow(dead_code))]
+
 use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -45,10 +49,10 @@ use vk_core::unixpath::SocketPath;
 // libkrun loads a raw ELF `vmlinux` directly (ELF), or scans an "Image" for a compression magic,
 // decompresses it, and ELF-loads the result — which is exactly what a distro `bzImage`'s payload
 // decompresses to. So a stock gzip/zstd/bzip2 `bzImage` boots via the matching IMAGE_* tag.
-const KRUN_KERNEL_FORMAT_ELF: u32 = 1;
-const KRUN_KERNEL_FORMAT_IMAGE_BZ2: u32 = 3;
-const KRUN_KERNEL_FORMAT_IMAGE_GZ: u32 = 4;
-const KRUN_KERNEL_FORMAT_IMAGE_ZSTD: u32 = 5;
+pub(crate) const KRUN_KERNEL_FORMAT_ELF: u32 = 1;
+pub(crate) const KRUN_KERNEL_FORMAT_IMAGE_BZ2: u32 = 3;
+pub(crate) const KRUN_KERNEL_FORMAT_IMAGE_GZ: u32 = 4;
+pub(crate) const KRUN_KERNEL_FORMAT_IMAGE_ZSTD: u32 = 5;
 const KRUN_DISK_FORMAT_RAW: u32 = 0;
 const KRUN_DISK_FORMAT_QCOW2: u32 = 1;
 /// Matches `ImageType::VkLazyChunks` in `third_party/libkrun`'s block device (`mod.rs`).
@@ -85,7 +89,7 @@ fn detect_kernel_format(data: &[u8]) -> Option<u32> {
 /// virtio_console as a module and only emits early output on the legacy serial, so
 /// `keep_serial` (`vk run --console-serial`) leaves `console=ttyS0` in place, served by the
 /// COM1 patch in the vendored builder.rs.
-fn console_cmdline(cmdline: &str, keep_serial: bool) -> String {
+pub(crate) fn console_cmdline(cmdline: &str, keep_serial: bool) -> String {
     if keep_serial {
         cmdline.to_string()
     } else {
@@ -95,7 +99,7 @@ fn console_cmdline(cmdline: &str, keep_serial: bool) -> String {
 
 /// The `krun_set_kernel` format tag for the kernel at `path`, or a clear error if libkrun cannot
 /// load it. Reads the file to sniff its magic (the same bytes libkrun itself scans).
-fn kernel_format(path: &std::path::Path) -> Result<u32> {
+pub(crate) fn kernel_format(path: &std::path::Path) -> Result<u32> {
     let data = std::fs::read(path).with_context(|| format!("reading kernel {}", path.display()))?;
     detect_kernel_format(&data).with_context(|| {
         format!(
@@ -122,7 +126,7 @@ fn cstr(s: &str) -> CString {
 /// Parse a memory size token into MiB for `krun_set_vm_config`, accepting the same
 /// forms as the CLI (`<n>G`, `<n>M`, plain MiB — see
 /// `run::parse_mem_mib`).
-fn mem_mib(mem: &str) -> Result<u32> {
+pub(crate) fn mem_mib(mem: &str) -> Result<u32> {
     crate::run::parse_mem_mib(mem)
         .and_then(|n| u32::try_from(n).ok())
         .ok_or_else(|| anyhow::anyhow!("memory size {mem:?} is not <n>G, <n>M or a MiB count"))
@@ -265,8 +269,9 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
             // shm_size is the share's DAX window, guest address space reserved above RAM
             // (0 = none). `vmm::apply_dax_budget` has already dropped the windows that do
             // not fit the guest's span, so whatever is here is placeable. dax_inode_min is
-            // the smallest regular file the server marks for DAX (0 = every file): the
-            // guest mounts such a share `dax=inode` and maps only the files so marked.
+            // the smallest regular file the server marks for DAX (0 = none, as with no
+            // floor): the guest mounts such a share `dax=inode` and maps only the files so
+            // marked.
             let shm_size = share.dax.map_or(0, |d| d.window);
             let dax_inode_min = share.dax.and_then(|d| d.inode_min).unwrap_or(0);
             let (entry_ms, attr_ms, negative_ms) = share.cache.timeouts_ms();
@@ -376,7 +381,17 @@ static SHUTDOWN_FD: AtomicI32 = AtomicI32::new(-1);
 /// Seconds the guest gets to act on the power button before the boot child gives up
 /// and lets SIGALRM terminate it — a backstop for a guest that ignores the button, so
 /// the child never outlives whatever spawned it. The host escalates to SIGKILL well before.
-const POWER_BUTTON_GRACE_SECS: libc::c_uint = 70;
+/// The drive letter of the `index`th disk (`a` for vda), refused past `z`.
+pub(crate) fn disk_letter(index: usize) -> Result<char> {
+    u8::try_from(index)
+        .ok()
+        .and_then(|i| b'a'.checked_add(i))
+        .filter(u8::is_ascii_lowercase)
+        .map(char::from)
+        .with_context(|| format!("too many disks: no virtio-blk letter for disk {index}"))
+}
+
+pub(crate) const POWER_BUTTON_GRACE_SECS: libc::c_uint = 70;
 
 /// SIGTERM handler: press the ACPI power button and arm a backstop alarm. Async-signal-safe
 /// (an eventfd `write` of 8 bytes and `alarm`).
@@ -418,6 +433,13 @@ unsafe fn install_power_button_on_sigterm(ctx: u32) {
 /// reset (SIGUSR1), boots it again. A host SIGTERM is forwarded to the child (its ACPI
 /// power button) and stops the loop. Returns the process exit code to use.
 pub fn keep(spec: &VmSpec) -> Result<i32> {
+    keep_with(spec, boot)
+}
+
+/// [`keep`] with either this module's boot function or `crate::libkrun2_sys::boot`
+/// (`krun2`). Both `_exit` with the guest's code and report resets as
+/// [`KRUN_EXIT_GUEST_RESET`].
+pub(crate) fn keep_with(spec: &VmSpec, boot: fn(&VmSpec) -> Result<()>) -> Result<i32> {
     if !spec.reboot {
         // No in-place reboot: boot once. `boot` execs libkrun and never returns on a
         // normal end (libkrun `_exit`s with the guest's code), so this is effectively
@@ -594,7 +616,7 @@ unsafe fn add_disk(
     disk: &Disk,
     sockets: &mut Vec<SocketPath>,
 ) -> Result<()> {
-    let block_id = cstr(&format!("vd{}", (b'a' + index as u8) as char));
+    let block_id = cstr(&format!("vd{}", disk_letter(index)?));
     let path = cstr(&disk.path.to_string_lossy());
     let format = match disk.format {
         crate::vmm::DiskFormat::Raw => KRUN_DISK_FORMAT_RAW,
@@ -629,8 +651,16 @@ unsafe fn add_disk(
 mod tests {
     use super::{
         KRUN_KERNEL_FORMAT_ELF, KRUN_KERNEL_FORMAT_IMAGE_BZ2, KRUN_KERNEL_FORMAT_IMAGE_GZ,
-        KRUN_KERNEL_FORMAT_IMAGE_ZSTD, console_cmdline, detect_kernel_format, mem_mib,
+        KRUN_KERNEL_FORMAT_IMAGE_ZSTD, console_cmdline, detect_kernel_format, disk_letter, mem_mib,
     };
+
+    #[test]
+    fn disks_are_lettered_up_to_z() {
+        assert_eq!(disk_letter(0).unwrap(), 'a');
+        assert_eq!(disk_letter(25).unwrap(), 'z');
+        assert!(disk_letter(26).is_err());
+        assert!(disk_letter(usize::MAX).is_err());
+    }
 
     #[test]
     fn kernel_format_detection() {

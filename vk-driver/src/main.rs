@@ -47,6 +47,8 @@ mod image;
 mod initramfs;
 mod iso9660;
 mod jobctx;
+#[cfg(feature = "krun2")]
+mod libkrun2_sys;
 mod libkrun_sys;
 mod local;
 mod manager;
@@ -2366,7 +2368,11 @@ fn main() -> ExitCode {
             Ok(spec) => spec,
             Err(e) => return fail(&anyhow::anyhow!("libkrun boot: bad spec: {e}"), 2),
         };
-        return match libkrun_sys::keep(&spec) {
+        #[cfg(not(feature = "krun2"))]
+        let kept = libkrun_sys::keep(&spec);
+        #[cfg(feature = "krun2")]
+        let kept = libkrun_sys::keep_with(&spec, libkrun2_sys::boot);
+        return match kept {
             Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
             Err(e) => fail(&e, 1),
         };

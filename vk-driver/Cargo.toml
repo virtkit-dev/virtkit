@@ -77,6 +77,15 @@ package = "libkrun"
 default-features = false
 features = ["blk", "net"]
 
+# Opt-in libkrun 2.0-dev Rust API (third_party/libkrun-next; see its VENDOR.md).
+# With `krun2`, the boot child uses src/libkrun2_sys.rs instead of the 1.19 C API.
+[dependencies.krun2]
+path = "../third_party/libkrun-next/src/libkrun"
+package = "libkrun"
+default-features = false
+features = ["blk", "net"]
+optional = true
+
 [features]
 default = ["embed"]
 # Embed the guest kernel (vmlinux) and vk-agent into the `vk` binary so it runs
@@ -85,6 +94,8 @@ default = ["embed"]
 # `cargo build`) it embeds nothing and the runtime falls back to those flags. See
 # src/embed.rs. build.sh sets the two vars for a real, shippable self-contained `vk`.
 embed = []
+# Boot VMs with libkrun 2.0 (src/libkrun2_sys.rs) instead of the 1.19 tree. Not shipped yet.
+krun2 = ["dep:krun2"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
