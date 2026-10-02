@@ -22,7 +22,7 @@ use std::os::fd::{AsFd, BorrowedFd, FromRawFd};
 use std::os::windows::io::AsHandle;
 #[cfg(windows)]
 use std::os::windows::io::BorrowedHandle;
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
@@ -1060,9 +1060,15 @@ pub fn build_microvm(
         .map_err(Error::EventFd)
         .map_err(StartMicrovmError::Internal)?;
 
+    // Set by the devices that reset the guest (i8042, ACPI reset register) before they fire
+    // the exit event, so the Vmm reports a reset rather than a power-off (local patch).
+    let reset_flag = Arc::new(AtomicBool::new(false));
+
     #[cfg(target_arch = "x86_64")]
     // Safe to unwrap 'serial_device' as it's always 'Some' on x86_64.
-    // x86_64 uses the i8042 reset event as the Vmm exit event.
+    // x86_64 uses the i8042 reset event as the Vmm exit event, and the ACPI PM device fires
+    // it too, for a power-off or a reset. Its SCI is an irqfd on SCI_GSI (registered with
+    // the legacy devices below) and its power button the host's shutdown eventfd.
     let mut pio_device_manager = PortIODeviceManager::new(
         Arc::new(Mutex::new(Cmos::new(
             arch_memory_info.ram_below_gap,
@@ -1071,6 +1077,16 @@ pub fn build_microvm(
         serial_devices,
         exit_evt
             .try_clone()
+            .map_err(Error::EventFd)
+            .map_err(StartMicrovmError::Internal)?,
+        reset_flag.clone(),
+        EventFd::new(utils::eventfd::EFD_NONBLOCK)
+            .map_err(Error::EventFd)
+            .map_err(StartMicrovmError::Internal)?,
+        _shutdown_efd
+            .as_ref()
+            .map(EventFd::try_clone)
+            .transpose()
             .map_err(Error::EventFd)
             .map_err(StartMicrovmError::Internal)?,
     )
@@ -1134,6 +1150,10 @@ pub fn build_microvm(
             &mut mmio_device_manager,
             Some(intc.clone()),
         )?;
+        // The ACPI PM device waits on the host power-button eventfd.
+        event_manager
+            .add_subscriber(pio_device_manager.acpi_pm.clone())
+            .map_err(StartMicrovmError::RegisterEvent)?;
 
         let kernel_boot = vm_resources.firmware_config.is_none() && !cfg!(feature = "tee");
 
@@ -1306,6 +1326,7 @@ pub fn build_microvm(
         exit_evt,
         exit_observers: Vec::new(),
         exit_code: exit_code.clone(),
+        reset_flag,
         #[cfg(not(target_os = "windows"))]
         vm,
         mmio_device_manager,
@@ -2222,6 +2243,7 @@ fn attach_legacy_devices(
     register_irqfd_evt!(com_evt_3, 4);
     register_irqfd_evt!(com_evt_4, 3);
     register_irqfd_evt!(kbd_evt, 1);
+    register_irqfd_evt!(sci_evt, arch::x86_64::layout::SCI_GSI);
     Ok(())
 }
 

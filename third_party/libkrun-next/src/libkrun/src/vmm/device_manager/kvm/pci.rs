@@ -134,6 +134,10 @@ impl PciHostManager {
         self.functions.push(info);
         self.next_device += 1;
         self.irq += 1;
+        // GSI 9 carries the ACPI SCI (local patch, see VENDOR.md).
+        if self.irq == arch::x86_64::layout::SCI_GSI {
+            self.irq += 1;
+        }
         Ok(info)
     }
 

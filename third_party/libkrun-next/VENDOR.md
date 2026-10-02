@@ -302,3 +302,38 @@ Known gap, as in the 1.19 tree: the switch only gates Intel's leaf 0xA. On AMD, 
 2.0 no longer clamps the largest extended leaf to 0x8000001f, so PerfMonV2 (0x80000022) is
 visible too. Turning the vPMU off at VM level (`KVM_CAP_PMU_CAPABILITY`) would close it on
 both vendors.
+
+### ACPI power-off, power button and reset (forward-ported from the 1.19 tree)
+
+`src/arch/src/x86_64/{acpi.rs,layout.rs}` + `src/arch/Cargo.toml` — with ACPI enabled, the
+tables describe fixed hardware instead of a HW-reduced platform. The FADT carries the PM1 event
+and control blocks at `ACPI_PM_BASE` (0x600), the SCI on `SCI_GSI` (9), the reset register
+(0x60C, value 1), `SLP_BUTTON` and `RESET_REG_SUP`, and points at a 64-byte-aligned FACS.
+The DSDT defines `\_S5`; the MADT's interrupt source override sets the SCI to edge/high,
+matching its irqfd. No PM timer, GPE block or SMI command port. arch's `zerocopy` enables
+`derive` for the override structure, which `acpi_tables` lacks. Covered by `x86_64::acpi::tests`.
+
+`src/devices/src/legacy/{acpi_pm.rs (new),mod.rs}` + `src/libkrun/src/vmm/{builder.rs,
+device_manager/legacy.rs}` — the `AcpiPm` PIO device serves that block. An S5 write to PM1a_CNT
+fires the Vmm exit event for power-off; writing the reset value to the reset register fires
+it for reset. The host's shutdown eventfd latches PWRBTN_STS and raises the SCI (an irqfd on
+GSI 9, reserved by the MMIO and PCI IRQ allocators) so the guest's fixed-feature power button
+driver runs an orderly shutdown. `VmmBuilder::shutdown_support(true)` also creates that
+eventfd on x86_64 Linux, and `VmmHandle::shutdown` writes it. Building with shutdown support
+on x86_64 Linux requires `acpi(true)`; otherwise shutdown would do nothing.
+Covered by `acpi_pm::tests`.
+
+The fixed-hardware FADT is built on every x86_64 host, but `AcpiPm` and the SCI irqfd exist on
+Linux only: a Windows (WHP) guest with ACPI on is told about a PM1 block, SCI and reset
+register nothing serves, so its S5 power-off goes nowhere. virtkit only boots Linux hosts.
+2.0's other table choices stay: no `IAPC_VGA_NOT_PRESENT`, MADT `PCAT_COMPAT` clear, and no
+Local APIC NMI entry. `0xcf9` (PCI reset control) is not served, as in the 1.19 tree.
+
+`src/libkrun/src/vmm/{mod.rs,linux/vstate.rs}` + `src/devices/src/legacy/i8042.rs` — a guest
+reset (triple fault, `KVM_SYSTEM_EVENT_RESET`, the i8042 `0xFE` command or the ACPI reset
+register) exits with `KRUN_EXIT_GUEST_RESET` (154) instead of 0, so a supervisor can tell a reboot
+from a power-off and relaunch the VM; a shared `reset_flag` carries the distinction for the
+device-driven paths. `linux/vstate.rs` is shared, so aarch64 Linux's triple fault and PSCI
+`SYSTEM_RESET` exit 154 too. A reset outranks a guest-set exit code, and a guest kernel panic
+under `reboot=k panic=-1` is a reset: a supervisor that relaunches on 154 relaunches a panicking
+guest. Nothing consumes 154 yet.

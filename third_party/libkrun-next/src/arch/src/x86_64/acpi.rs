@@ -3,12 +3,13 @@
 
 use std::result;
 
-use acpi_tables::Aml;
 use acpi_tables::aml::{
     AddressSpace, AddressSpaceCacheable, Device, EISAName, IO, Interrupt, Memory32Fixed, Name,
-    PackageBuilder, Path, ResourceTemplate, Scope, ZERO,
+    Package, PackageBuilder, Path, ResourceTemplate, Scope, ZERO,
 };
+use acpi_tables::facs::FACS;
 use acpi_tables::fadt::{FADTBuilder, Flags};
+use acpi_tables::gas::{AccessSize, AddressSpace as GasSpace, GAS};
 use acpi_tables::madt::{
     EnabledStatus, IoApic, LocalInterruptController, MADT, ProcessorLocalApic,
 };
@@ -16,11 +17,15 @@ use acpi_tables::mcfg::MCFG;
 use acpi_tables::rsdp::Rsdp;
 use acpi_tables::sdt::Sdt;
 use acpi_tables::xsdt::XSDT;
+use acpi_tables::{Aml, AmlSink};
 use vm_memory::Bytes;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, Permissions};
-use zerocopy::IntoBytes;
+use zerocopy::byteorder::{LE, U16, U32};
+use zerocopy::{Immutable, IntoBytes};
 
-use crate::x86_64::layout::{HIMEM_START, RSDP_ADDR};
+use crate::x86_64::layout::{
+    ACPI_PM_BASE, ACPI_RESET_REG, ACPI_RESET_VALUE, HIMEM_START, RSDP_ADDR, SCI_GSI,
+};
 
 /// Standard local APIC physical base address.
 const LOCAL_APIC_DEFAULT_PHYS_BASE: u32 = 0xfee0_0000;
@@ -31,6 +36,47 @@ const IO_APIC_DEFAULT_PHYS_BASE: u32 = 0xfec0_0000;
 const MAX_SUPPORTED_CPUS: u32 = 254;
 /// IAPC_BOOT_ARCH bit 1: 8042 present on ports 0x60/0x64 (`ACPI_FADT_8042`).
 const IAPC_BOOT_ARCH_8042: u16 = 1 << 1;
+
+/// PM1 event block (status + enable) and control block lengths, in bytes.
+const PM1_EVT_LEN: u8 = 4;
+const PM1_CNT_LEN: u8 = 2;
+const PM1A_CNT_PORT: u16 = ACPI_PM_BASE + 0x04;
+
+/// MADT Interrupt Source Override (type 2, ACPI 6.x § 5.2.12.5): ISA IRQ `source` arrives on
+/// `gsi` with `flags` polarity/trigger. `acpi_tables` has no such structure.
+#[repr(C, packed)]
+#[derive(Clone, Copy, IntoBytes, Immutable)]
+struct InterruptSourceOverride {
+    r#type: u8,
+    length: u8,
+    bus: u8,
+    source: u8,
+    gsi: U32<LE>,
+    flags: U16<LE>,
+}
+
+impl InterruptSourceOverride {
+    fn new(source: u8, gsi: u32, flags: u16) -> Self {
+        Self {
+            r#type: 2,
+            length: std::mem::size_of::<Self>() as u8,
+            bus: 0,
+            source,
+            gsi: gsi.into(),
+            flags: flags.into(),
+        }
+    }
+}
+
+impl Aml for InterruptSourceOverride {
+    fn to_aml_bytes(&self, sink: &mut dyn AmlSink) {
+        sink.vec(self.as_bytes());
+    }
+}
+
+/// MPS INTI flags: polarity 01 (active high), trigger 01 (edge). The SCI is delivered by a
+/// one-shot KVM irqfd with no resample fd, so it is programmed edge/high.
+const MADT_INT_EDGE_HIGH: u16 = 0b0101;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PciFunctionInfo {
@@ -141,21 +187,49 @@ fn build_dsdt(virtio_mmio_devices: &[(u64, u32)], pci_host: Option<&PciHostInfo>
 
     let scope_bytes = Scope::raw(Path::new("\\_SB_"), aml_body);
 
+    // \_S5: the SLP_TYP values (PM1a, PM1b) Linux writes to PM1a_CNT for a power-off, served
+    // by the `AcpiPm` device (local patch).
+    let mut s5 = Vec::new();
+    Name::new(
+        Path::new("\\_S5_"),
+        &Package::new(vec![&5u8, &0u8, &0u8, &0u8]),
+    )
+    .to_aml_bytes(&mut s5);
+
     let mut dsdt = Sdt::new(*b"DSDT", 36, 2, *b"LIBKRN", *b"KRUNDSDT", 1);
+    dsdt.append_slice(&s5);
     dsdt.append_slice(&scope_bytes);
     dsdt.as_slice().to_vec()
 }
 
-/// Builds a minimal ACPI 6.x FADT pointing at the given DSDT address.
-/// HW_REDUCED_ACPI is set: all devices are described in the DSDT via
-/// extended interrupt descriptors, so no legacy PIC or PM hardware is
-/// needed. IAPC_BOOT_ARCH advertises the emulated i8042; Linux treats a
-/// clear `ACPI_FADT_8042` bit on FADT revision >= 2 as firmware-absent.
-fn build_fadt(dsdt_addr: u64) -> Vec<u8> {
+/// Builds an ACPI 6.x FADT pointing at the given FACS and DSDT addresses.
+/// It describes the fixed hardware the `AcpiPm` device serves (local patch, see VENDOR.md)
+/// instead of a HW-reduced platform: the PM1 event and control blocks at `ACPI_PM_BASE`, the
+/// SCI on `SCI_GSI`, and the reset register, so a guest can power off through `\_S5`, take a
+/// fixed-feature power button, and reset. There is no PM timer, no GPE block and no SMI
+/// command port (the platform is always in ACPI mode). IAPC_BOOT_ARCH advertises the emulated
+/// i8042; Linux treats a clear `ACPI_FADT_8042` bit on FADT revision >= 2 as firmware-absent.
+fn build_fadt(facs_addr: u64, dsdt_addr: u64) -> Vec<u8> {
+    let io = |port: u16, len: u8, access: AccessSize| {
+        GAS::new(GasSpace::SystemIo, len * 8, 0, access, u64::from(port))
+    };
     let mut builder = FADTBuilder::new(*b"LIBKRN", *b"KRUNFADT", 1)
+        .firmware_ctrl_64(facs_addr)
         .dsdt_64(dsdt_addr)
-        .flag(Flags::HwReducedAcpi);
+        .flag(Flags::Wbinvd)
+        .flag(Flags::SlpButton)
+        .flag(Flags::ResetRegSup)
+        .flag(Flags::Headless);
     builder.iapc_boot_arch = IAPC_BOOT_ARCH_8042.into();
+    builder.sci_int = (SCI_GSI as u16).into();
+    builder.pm1a_evt_blk = u32::from(ACPI_PM_BASE).into();
+    builder.pm1a_cnt_blk = u32::from(PM1A_CNT_PORT).into();
+    builder.pm1_evt_len = PM1_EVT_LEN;
+    builder.pm1_cnt_len = PM1_CNT_LEN;
+    builder.x_pm1a_evt_blk = io(ACPI_PM_BASE, PM1_EVT_LEN, AccessSize::WordAccess);
+    builder.x_pm1a_cnt_blk = io(PM1A_CNT_PORT, PM1_CNT_LEN, AccessSize::WordAccess);
+    builder.reset_reg = io(ACPI_RESET_REG, 1, AccessSize::ByteAccess);
+    builder.reset_value = ACPI_RESET_VALUE;
     let fadt = builder.finalize();
     let mut bytes = Vec::new();
     fadt.to_aml_bytes(&mut bytes);
@@ -181,6 +255,12 @@ fn build_madt(num_cpus: u8) -> Vec<u8> {
     }
 
     madt.add_structure(IoApic::new(num_cpus + 1, IO_APIC_DEFAULT_PHYS_BASE, 0));
+    // The SCI's polarity and trigger, which otherwise default to level/low for ISA IRQ 9.
+    madt.add_structure(InterruptSourceOverride::new(
+        SCI_GSI as u8,
+        SCI_GSI,
+        MADT_INT_EDGE_HIGH,
+    ));
 
     let mut bytes = Vec::new();
     madt.to_aml_bytes(&mut bytes);
@@ -239,16 +319,23 @@ pub fn setup_acpi(
     const RSDP_SIZE: u64 = 36;
     let xsdt_entries = 2 + if mcfg.is_some() { 1 } else { 0 };
     let xsdt_size = 36 + xsdt_entries * 8;
-    let fadt_size_placeholder = build_fadt(0).len() as u64;
+    let fadt_size_placeholder = build_fadt(0, 0).len() as u64;
+    let facs = {
+        let mut bytes = Vec::new();
+        FACS::new().to_aml_bytes(&mut bytes);
+        bytes
+    };
 
     let rsdp_addr = RSDP_ADDR;
     let xsdt_addr = rsdp_addr + RSDP_SIZE;
     let fadt_addr = xsdt_addr + xsdt_size as u64;
-    let dsdt_addr = fadt_addr + fadt_size_placeholder;
+    // The FACS must sit on a 64-byte boundary (ACPI 6.x § 5.2.10).
+    let facs_addr = (fadt_addr + fadt_size_placeholder).next_multiple_of(64);
+    let dsdt_addr = facs_addr + facs.len() as u64;
     let madt_addr = dsdt_addr + dsdt.len() as u64;
     let mcfg_addr = madt_addr + madt.len() as u64;
 
-    let fadt = build_fadt(dsdt_addr);
+    let fadt = build_fadt(facs_addr, dsdt_addr);
     let mut xsdt_entries = vec![fadt_addr, madt_addr];
     if mcfg.is_some() {
         xsdt_entries.push(mcfg_addr);
@@ -256,12 +343,7 @@ pub fn setup_acpi(
     let xsdt = build_xsdt(&xsdt_entries);
     let rsdp = build_rsdp(xsdt_addr);
 
-    let total_size = rsdp.len() as u64
-        + xsdt.len() as u64
-        + fadt.len() as u64
-        + dsdt.len() as u64
-        + madt.len() as u64
-        + mcfg.as_ref().map_or(0, |table| table.len() as u64);
+    let total_size = mcfg_addr + mcfg.as_ref().map_or(0, |table| table.len() as u64) - rsdp_addr;
     if rsdp_addr + total_size > HIMEM_START
         || !mem.check_range(
             GuestAddress(rsdp_addr),
@@ -277,6 +359,8 @@ pub fn setup_acpi(
     mem.write_slice(&xsdt, GuestAddress(xsdt_addr))
         .map_err(|_| Error::WriteFailed)?;
     mem.write_slice(&fadt, GuestAddress(fadt_addr))
+        .map_err(|_| Error::WriteFailed)?;
+    mem.write_slice(&facs, GuestAddress(facs_addr))
         .map_err(|_| Error::WriteFailed)?;
     mem.write_slice(&dsdt, GuestAddress(dsdt_addr))
         .map_err(|_| Error::WriteFailed)?;
@@ -307,18 +391,21 @@ mod tests {
         let mut offset = 44usize;
         let mut lapic_count = 0;
         let mut ioapic_count = 0;
+        let mut override_count = 0;
         while offset < bytes.len() {
             let entry_type = bytes[offset];
             let entry_len = bytes[offset + 1] as usize;
             match entry_type {
                 0 => lapic_count += 1,
                 1 => ioapic_count += 1,
+                2 => override_count += 1,
                 t => panic!("unexpected MADT entry type {t}"),
             }
             offset += entry_len;
         }
         assert_eq!(lapic_count, num_cpus as usize);
         assert_eq!(ioapic_count, 1);
+        assert_eq!(override_count, 1, "the SCI override");
     }
 
     #[test]
@@ -413,18 +500,48 @@ mod tests {
     }
 
     #[test]
-    fn fadt_has_hw_reduced_flag() {
-        let bytes = build_fadt(0x000e_1100);
+    fn fadt_describes_the_pm1_block_sci_and_reset_register() {
+        let bytes = build_fadt(0x000e_1000, 0x000e_1100);
+        let u16_at = |o: usize| u16::from_le_bytes(bytes[o..o + 2].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+        let u64_at = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
 
-        // FADT flags field is at byte offset 112 (per ACPI 6.x spec)
-        let flags = u32::from_le_bytes(bytes[112..116].try_into().unwrap());
-        // HW_REDUCED_ACPI is bit 20
-        assert_ne!(flags & (1 << 20), 0, "HW_REDUCED_ACPI must be set");
+        // Offsets per the ACPI 6.x FADT layout.
+        let flags = u32_at(112);
+        assert_eq!(flags & (1 << 20), 0, "not a HW-reduced platform");
+        assert_ne!(flags & (1 << 10), 0, "RESET_REG_SUP");
+        assert_eq!(flags & (1 << 4), 0, "fixed-feature power button");
+        assert_eq!(u16_at(46), SCI_GSI as u16, "SCI_INT");
+        assert_eq!(u32_at(48), 0, "no SMI_CMD: always in ACPI mode");
+        assert_eq!(u32_at(56), u32::from(ACPI_PM_BASE), "PM1a_EVT_BLK");
+        assert_eq!(u32_at(64), u32::from(ACPI_PM_BASE) + 4, "PM1a_CNT_BLK");
+        assert_eq!((bytes[88], bytes[89]), (PM1_EVT_LEN, PM1_CNT_LEN));
+        assert_eq!(bytes[116], 1, "reset register in system I/O space");
+        assert_eq!(u64_at(120), u64::from(ACPI_RESET_REG));
+        assert_eq!(bytes[128], ACPI_RESET_VALUE);
+        assert_eq!(u64_at(132), 0x000e_1000, "X_FIRMWARE_CTRL (FACS)");
+        assert_eq!(u64_at(152), u64::from(ACPI_PM_BASE), "X_PM1a_EVT_BLK");
+        assert_eq!(u64_at(176), u64::from(ACPI_PM_BASE) + 4, "X_PM1a_CNT_BLK");
+    }
+
+    #[test]
+    fn dsdt_declares_s5() {
+        let bytes = build_dsdt(&[], None);
+        assert!(bytes.windows(4).any(|w| w == b"_S5_"));
+    }
+
+    #[test]
+    fn madt_overrides_the_sci_to_edge_high() {
+        let bytes = build_madt(1);
+        let expected = InterruptSourceOverride::new(SCI_GSI as u8, SCI_GSI, MADT_INT_EDGE_HIGH);
+        assert!(bytes.windows(10).any(|w| w == expected.as_bytes()));
+        let sum: u8 = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        assert_eq!(sum, 0);
     }
 
     #[test]
     fn fadt_layout_and_checksum() {
-        let bytes = build_fadt(0x000e_1100);
+        let bytes = build_fadt(0x000e_1000, 0x000e_1100);
         assert_eq!(&bytes[0..4], b"FACP");
         let sum: u8 = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
         assert_eq!(sum, 0);
@@ -464,6 +581,27 @@ mod tests {
             buf
         };
         assert_eq!(&rsdp, b"RSD PTR ");
+    }
+
+    #[test]
+    fn setup_acpi_places_an_aligned_facs() {
+        let window_size = (HIMEM_START - RSDP_ADDR) as usize;
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
+        setup_acpi(&mem, 2, &[], None).unwrap();
+
+        let read_u64 = |addr: u64| {
+            let mut buf = [0u8; 8];
+            mem.read_slice(&mut buf, GuestAddress(addr)).unwrap();
+            u64::from_le_bytes(buf)
+        };
+        // RSDP -> XSDT (offset 24) -> first entry, the FADT -> X_FIRMWARE_CTRL (offset 132).
+        let xsdt = read_u64(RSDP_ADDR + 24);
+        let fadt = read_u64(xsdt + 36);
+        let facs = read_u64(fadt + 132);
+        assert_eq!(facs % 64, 0, "FACS at {facs:#x} must be 64-byte aligned");
+        let mut sig = [0u8; 4];
+        mem.read_slice(&mut sig, GuestAddress(facs)).unwrap();
+        assert_eq!(&sig, b"FACS");
     }
 
     #[test]

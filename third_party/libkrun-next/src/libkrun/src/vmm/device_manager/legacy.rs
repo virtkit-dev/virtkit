@@ -7,8 +7,11 @@
 #![cfg(target_arch = "x86_64")]
 
 use std::fmt;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "linux")]
+use arch::x86_64::layout::{ACPI_PM_BASE, ACPI_PM_LEN};
 use devices;
 use utils::eventfd::EventFd;
 
@@ -42,6 +45,9 @@ pub struct PortIODeviceManager {
     pub cmos: Arc<Mutex<devices::legacy::Cmos>>,
     pub stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
     pub i8042: Arc<Mutex<devices::legacy::I8042Device>>,
+    /// The ACPI PM1 block and reset register (local patch, see VENDOR.md).
+    #[cfg(target_os = "linux")]
+    pub acpi_pm: Arc<Mutex<devices::legacy::AcpiPm>>,
 
     #[cfg(not(windows))]
     pub com_evt_1: EventFd,
@@ -50,14 +56,27 @@ pub struct PortIODeviceManager {
     pub com_evt_4: EventFd,
     #[cfg(not(windows))]
     pub kbd_evt: EventFd,
+    /// Raises the ACPI SCI; an irqfd on `SCI_GSI`.
+    #[cfg(target_os = "linux")]
+    pub sci_evt: EventFd,
 }
 
 impl PortIODeviceManager {
-    /// Create a new DeviceManager handling legacy devices (uart, i8042).
+    /// Create a new DeviceManager handling legacy devices (uart, i8042, ACPI PM).
+    ///
+    /// `exit_evt` is the Vmm exit event, fired by the i8042 CPU-reset command and by the ACPI
+    /// power-off and reset registers. `reset_flag` is shared with those devices and the Vmm so
+    /// a reset is told from a power-off. `sci_evt` raises the ACPI SCI and `shutdown_efd` is
+    /// the host's power button (both ignored outside Linux).
     pub fn new(
         cmos: Arc<Mutex<devices::legacy::Cmos>>,
         stdio_serial: Vec<Arc<Mutex<devices::legacy::Serial>>>,
-        i8042_reset_evfd: EventFd,
+        exit_evt: EventFd,
+        reset_flag: Arc<AtomicBool>,
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] sci_evt: EventFd,
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] shutdown_efd: Option<
+            EventFd,
+        >,
     ) -> Result<Self> {
         let io_bus = devices::Bus::new();
         let mut evts: Vec<EventFd> = Vec::new();
@@ -77,8 +96,17 @@ impl PortIODeviceManager {
         let kbd_evt = EventFd::new(utils::eventfd::EFD_NONBLOCK).map_err(Error::EventFd)?;
 
         let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
-            i8042_reset_evfd,
+            exit_evt.try_clone().map_err(Error::EventFd)?,
+            reset_flag.clone(),
             kbd_evt.try_clone().map_err(Error::EventFd)?,
+        )));
+
+        #[cfg(target_os = "linux")]
+        let acpi_pm = Arc::new(Mutex::new(devices::legacy::AcpiPm::new(
+            exit_evt,
+            reset_flag,
+            sci_evt.try_clone().map_err(Error::EventFd)?,
+            shutdown_efd,
         )));
 
         Ok(PortIODeviceManager {
@@ -86,6 +114,8 @@ impl PortIODeviceManager {
             cmos,
             stdio_serial,
             i8042,
+            #[cfg(target_os = "linux")]
+            acpi_pm,
             #[cfg(not(windows))]
             com_evt_1: evts[0].try_clone().map_err(Error::EventFd)?,
             com_evt_2: evts[1].try_clone().map_err(Error::EventFd)?,
@@ -93,6 +123,8 @@ impl PortIODeviceManager {
             com_evt_4: evts[3].try_clone().map_err(Error::EventFd)?,
             #[cfg(not(windows))]
             kbd_evt,
+            #[cfg(target_os = "linux")]
+            sci_evt,
         })
     }
 
@@ -146,6 +178,10 @@ impl PortIODeviceManager {
         self.io_bus
             .insert(self.i8042.clone(), 0x060, 0x5)
             .map_err(Error::BusError)?;
+        #[cfg(target_os = "linux")]
+        self.io_bus
+            .insert(self.acpi_pm.clone(), u64::from(ACPI_PM_BASE), ACPI_PM_LEN)
+            .map_err(Error::BusError)?;
         Ok(())
     }
 }
@@ -163,6 +199,9 @@ mod tests {
             Arc::new(Mutex::new(cmos)),
             vec![Arc::new(Mutex::new(serial))],
             EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            None,
         );
         assert!(ldm.is_ok());
         assert!(&ldm.unwrap().register_devices().is_ok());

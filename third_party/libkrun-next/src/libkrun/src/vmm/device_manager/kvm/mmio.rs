@@ -118,6 +118,16 @@ impl MMIODeviceManager {
         Ok(())
     }
 
+    /// Advance the IRQ cursor, skipping the pin reserved for the ACPI SCI on x86_64 (local
+    /// patch, see VENDOR.md).
+    fn advance_irq(&mut self) {
+        self.irq += 1;
+        #[cfg(target_arch = "x86_64")]
+        if self.irq == arch::x86_64::layout::SCI_GSI {
+            self.irq += 1;
+        }
+    }
+
     /// Register an already created MMIO device to be used via MMIO transport.
     pub fn register_mmio_device(
         &mut self,
@@ -157,7 +167,7 @@ impl MMIODeviceManager {
             },
         );
         self.mmio_base += MMIO_LEN;
-        self.irq += 1;
+        self.advance_irq();
 
         Ok(ret)
     }
@@ -230,7 +240,7 @@ impl MMIODeviceManager {
         );
 
         self.mmio_base += MMIO_LEN;
-        self.irq += 1;
+        self.advance_irq();
 
         Ok(())
     }
@@ -263,7 +273,7 @@ impl MMIODeviceManager {
         );
 
         self.mmio_base += MMIO_LEN;
-        self.irq += 1;
+        self.advance_irq();
 
         Ok(())
     }
@@ -455,7 +465,11 @@ mod tests {
 
         let mut cmdline = kernel_cmdline::Cmdline::new(4096);
 
-        for _i in arch::IRQ_BASE..=arch::IRQ_MAX {
+        // GSI 9 is the ACPI SCI on x86_64, skipped by the allocator.
+        let usable = (arch::IRQ_BASE..=arch::IRQ_MAX)
+            .filter(|&irq| !cfg!(target_arch = "x86_64") || irq != 9)
+            .count();
+        for _i in 0..usable {
             device_manager
                 .register_virtio_device(
                     vm.fd(),
