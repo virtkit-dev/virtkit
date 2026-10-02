@@ -103,21 +103,6 @@ pub enum DiskSync {
     None,
 }
 
-/// libkrun's `krun_add_disk3` sync-mode codes (`SyncMode::try_from` in the vendored block
-/// device's `mod.rs`): 0 = none, 1 = relaxed, 2 = full.
-const KRUN_DISK_SYNC_NONE: u32 = 0;
-const KRUN_DISK_SYNC_FULL: u32 = 2;
-
-impl DiskSync {
-    /// libkrun's `krun_add_disk3` sync-mode code for this setting.
-    pub fn krun_code(self) -> u32 {
-        match self {
-            DiskSync::None => KRUN_DISK_SYNC_NONE,
-            DiskSync::Full => KRUN_DISK_SYNC_FULL,
-        }
-    }
-}
-
 impl Disk {
     /// A rw CoW overlay (qcow2 over a backing base) — the common boot disk.
     pub fn overlay(path: PathBuf) -> Self {
@@ -430,32 +415,21 @@ pub enum ShareCache {
 /// longer than any VM here lives, and a bound the kernel keeps in jiffies without overflow.
 const IMMUTABLE_TIMEOUT_MS: u32 = 86_400_000;
 
-/// libkrun's `krun_add_virtiofs7` cache ABI (`krun::KRUN_FS_CACHE_*`,
-/// `krun::KRUN_FS_TIMEOUT_DEFAULT_MS`), mirrored as local constants. The assertion below
-/// fails the build if they drift from krun's.
-const KRUN_CACHE_AUTO: u32 = 1;
-const KRUN_CACHE_ALWAYS: u32 = 2;
-const KRUN_TIMEOUT_DEFAULT_MS: u32 = 5_000;
-
-const _: () = {
-    assert!(KRUN_CACHE_AUTO == krun::KRUN_FS_CACHE_AUTO);
-    assert!(KRUN_CACHE_ALWAYS == krun::KRUN_FS_CACHE_ALWAYS);
-    assert!(KRUN_TIMEOUT_DEFAULT_MS == krun::KRUN_FS_TIMEOUT_DEFAULT_MS);
-};
+/// The virtio-fs default validity of entries and attributes, which a [`ShareCache::Auto`]
+/// share keeps: libkrun's own, hardcoded in its `devices/src/virtio/fs/device.rs`.
+const DEFAULT_TIMEOUT_MS: u32 = 5_000;
 
 impl ShareCache {
-    /// libkrun's `krun_add_virtiofs7` cache-policy code for this mode.
-    pub fn krun_policy(self) -> u32 {
-        match self {
-            ShareCache::Auto => KRUN_CACHE_AUTO,
-            ShareCache::Immutable | ShareCache::Ephemeral => KRUN_CACHE_ALWAYS,
-        }
+    /// Whether the guest may cache file data across opens (libkrun's `always` cache policy)
+    /// rather than revalidate it on each (`auto`).
+    pub fn caches_always(self) -> bool {
+        !matches!(self, ShareCache::Auto)
     }
 
     /// Entry, attribute and negative-lookup validity in ms, in that order.
     pub fn timeouts_ms(self) -> (u32, u32, u32) {
         match self {
-            ShareCache::Auto => (KRUN_TIMEOUT_DEFAULT_MS, KRUN_TIMEOUT_DEFAULT_MS, 0),
+            ShareCache::Auto => (DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, 0),
             ShareCache::Immutable | ShareCache::Ephemeral => (
                 IMMUTABLE_TIMEOUT_MS,
                 IMMUTABLE_TIMEOUT_MS,
@@ -1095,15 +1069,15 @@ mod tests {
 
     #[test]
     fn an_immutable_share_is_served_cache_always_with_day_long_validity() {
-        assert_eq!(ShareCache::Auto.krun_policy(), KRUN_CACHE_AUTO);
+        assert!(!ShareCache::Auto.caches_always());
         assert_eq!(ShareCache::Auto.timeouts_ms(), (5_000, 5_000, 0));
-        assert_eq!(ShareCache::Immutable.krun_policy(), KRUN_CACHE_ALWAYS);
+        assert!(ShareCache::Immutable.caches_always());
         let day = 86_400_000;
         assert_eq!(ShareCache::Immutable.timeouts_ms(), (day, day, day));
         assert!(ShareCache::Auto.xattr());
         assert!(!ShareCache::Immutable.xattr());
         // An ephemeral share caches like an immutable one and adds the write-side savings.
-        assert_eq!(ShareCache::Ephemeral.krun_policy(), KRUN_CACHE_ALWAYS);
+        assert!(ShareCache::Ephemeral.caches_always());
         assert_eq!(ShareCache::Ephemeral.timeouts_ms(), (day, day, day));
         assert!(!ShareCache::Ephemeral.xattr());
         assert!(ShareCache::Ephemeral.writeback() && ShareCache::Ephemeral.no_sync());

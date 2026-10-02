@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **VMs boot on libkrun 2.0.** The embedded VMM moves from libkrun 1.19 to the 2.0
+  development branch. Guests see the same devices — virtio-pci with MSI-X, virtio-fs shares
+  with DAX, the switch NICs, vsock, ACPI power-off, power button and reset — and `vk`
+  behaves as before.
+
 ### Removed
 
 - **Breaking: the cloud-hypervisor backend is removed.** Every VM boots on the embedded

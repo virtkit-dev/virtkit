@@ -47,8 +47,6 @@ mod image;
 mod initramfs;
 mod iso9660;
 mod jobctx;
-#[cfg(feature = "krun2")]
-mod libkrun2_sys;
 mod libkrun_sys;
 mod local;
 mod manager;
@@ -2362,17 +2360,13 @@ fn main() -> ExitCode {
     // libkrun boot child — internal: boot one microVM under libkrun (the Libkrun Vmm
     // backend re-execs this binary per VM, passing the spec in BOOT_SPEC_ENV so argv is
     // free for the VM's process name). Dispatched before the CLI on that env var; it links
-    // libkrun and blocks in krun_start_enter until the guest powers off.
+    // libkrun and blocks in the VM's event loop until the guest powers off.
     if let Ok(json) = std::env::var(vmm::BOOT_SPEC_ENV) {
         let spec: vmm::VmSpec = match serde_json::from_str(&json) {
             Ok(spec) => spec,
             Err(e) => return fail(&anyhow::anyhow!("libkrun boot: bad spec: {e}"), 2),
         };
-        #[cfg(not(feature = "krun2"))]
-        let kept = libkrun_sys::keep(&spec);
-        #[cfg(feature = "krun2")]
-        let kept = libkrun_sys::keep_with(&spec, libkrun2_sys::boot);
-        return match kept {
+        return match libkrun_sys::keep(&spec) {
             Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
             Err(e) => fail(&e, 1),
         };

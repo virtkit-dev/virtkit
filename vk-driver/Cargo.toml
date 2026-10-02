@@ -64,27 +64,16 @@ unicode-width.workspace = true
 [target.'cfg(target_env = "musl")'.dependencies]
 jemallocator.workspace = true
 
-# libkrun, the VMM, an rlib crate dep so it shares
-# vk's std — no double-std / broken-unwinding that a static libkrun.a link
-# hits. Vendored under third_party/libkrun (rev 9a8fedc, stable-1.19.x with PR #728)
-# and locally patched so the passthrough fs device no longer needs libc's musl statx
-# bindings (dropped after 0.2.183) — letting the whole tree build on a modern libc.
-# See third_party/libkrun/VENDOR.md. default-features off drops the init-blob (we use
-# disable_implicit_init); blk (krun_add_disk2) + net.
+# libkrun, the VMM, an rlib crate dep so it shares vk's std — no double-std / broken
+# unwinding that a static libkrun.a link hits. Vendored under third_party/libkrun-next
+# (libkrun 2.0-dev and PR #875, locally patched; see its VENDOR.md) and driven through its
+# Rust API (src/libkrun_sys.rs). default-features off drops the init blob (we supply our own
+# init); blk + net.
 [dependencies.krun]
-path = "../third_party/libkrun/src/libkrun"
-package = "libkrun"
-default-features = false
-features = ["blk", "net"]
-
-# Opt-in libkrun 2.0-dev Rust API (third_party/libkrun-next; see its VENDOR.md).
-# With `krun2`, the boot child uses src/libkrun2_sys.rs instead of the 1.19 C API.
-[dependencies.krun2]
 path = "../third_party/libkrun-next/src/libkrun"
 package = "libkrun"
 default-features = false
 features = ["blk", "net"]
-optional = true
 
 [features]
 default = ["embed"]
@@ -94,8 +83,6 @@ default = ["embed"]
 # `cargo build`) it embeds nothing and the runtime falls back to those flags. See
 # src/embed.rs. build.sh sets the two vars for a real, shippable self-contained `vk`.
 embed = []
-# Boot VMs with libkrun 2.0 (src/libkrun2_sys.rs) instead of the 1.19 tree. Not shipped yet.
-krun2 = ["dep:krun2"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

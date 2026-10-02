@@ -1,81 +1,57 @@
-//! libkrun backend: the boot child drives libkrun's C API to boot a [`VmSpec`] in
-//! this process. libkrun is the vendored `krun` rlib crate (third_party/libkrun), so
-//! it shares virtkit's std — no static-`libkrun.a` double-std to reconcile.
+//! libkrun backend: the boot child builds a [`VmSpec`] into a VM through libkrun's Rust API
+//! (`VmmBuilder`, a `Payload` and typed devices) and runs it in this process. libkrun is the
+//! vendored `krun` rlib crate (third_party/libkrun), so it shares virtkit's std.
 //!
 //! libkrun runs as a per-VM subprocess (the [`crate::vmm::Libkrun`] impl re-execs this
 //! binary with the spec in `VIRTKIT_BOOT_SPEC`), so the orchestrator manages it like any
 //! other child — held `Child` / `spawn_tied`, no in-process VMM in the orchestrator. We
-//! always supply our own kernel via `krun_set_kernel`, so libkrun never loads libkrunfw
-//! (see lib.rs:2848 upstream): the bundled-kernel `.so` is neither linked nor needed.
+//! always supply our own kernel, so libkrun never loads libkrunfw.
 //!
-//! Boots a disk/initramfs guest with our kernel + cmdline-`init=` (PID 1): virtio-blk
-//! disks (qcow2 backing chains), built-in virtio-fs shares, per-port vsock, switch NICs
-//! as unixstream-backed virtio-net devices, optional tap networking, and the console on
-//! the serial-log file.
+//! Boots a disk/initramfs guest with our kernel + cmdline-`init=` (PID 1): virtio-blk disks
+//! (qcow2 backing chains), built-in virtio-fs shares, per-port vsock, switch NICs as
+//! unixstream-backed virtio-net devices, optional tap networking, and the console on the
+//! serial-log file. Devices sit on virtio-pci with MSI-X behind an ACPI host bridge.
 //!
-//! With ACPI now present on x86_64 (vendored patch), the boot child installs a SIGTERM
-//! handler that presses the guest's ACPI power button (`krun_get_shutdown_eventfd`), so
-//! a host `SIGTERM` becomes an orderly guest power-off. When the spec allows reboot,
-//! [`keep`] wraps the boot in a relaunch loop so a guest reset (`KRUN_EXIT_GUEST_RESET`)
-//! reboots the VM in place — same pid and vsock socket for the supervisor.
+//! [`boot`] never returns once the guest runs: libkrun `_exit`s with its code. A host SIGTERM
+//! presses the guest's ACPI power button: SIGTERM is blocked before any thread exists and a
+//! dedicated thread waits for it and calls `VmmHandle::shutdown`, so nothing runs in a signal
+//! handler. When the spec allows reboot, [`keep`] wraps the boot in a relaunch loop so a guest
+//! reset (`KRUN_EXIT_GUEST_RESET`) reboots the VM in place — same pid and vsock socket for the
+//! supervisor.
 
-// Under `krun2` only the shared helpers and the reboot loop are used; the 1.19 boot path
-// stays until that feature becomes the default.
-#![cfg_attr(feature = "krun2", allow(dead_code))]
-
-use std::ffi::CString;
-use std::os::fd::RawFd;
-use std::os::unix::ffi::OsStrExt;
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsFd;
+use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-
-// libkrun's C-ABI entry points, called directly from the linked `krun` crate
-// (rlib -> shares virtkit's std; compiler-checked signatures). Every call returns
-// >= 0 on success, a negative errno on failure.
+use anyhow::{Context, Result, anyhow, bail};
 use krun::{
-    KRUN_EXIT_GUEST_RESET, krun_add_disk3, krun_add_net_tap, krun_add_net_unixstream2,
-    krun_add_virtiofs7, krun_add_vsock, krun_add_vsock_port2, krun_create_ctx,
-    krun_disable_balloon, krun_disable_implicit_init, krun_disable_implicit_vsock,
-    krun_get_shutdown_eventfd, krun_init_log, krun_set_block_dirty_socket, krun_set_console_output,
-    krun_set_kernel, krun_set_nested_virt, krun_set_pmu, krun_set_vm_config, krun_start_enter,
+    AttachDevice, BalloonDevice, BlockDevice, ConsoleDevice, DiskFormat, FsCachePolicy, FsDevice,
+    KRUN_EXIT_GUEST_RESET, KernelFormat, LogLevel, LogOptions, LogStyle, MmioDeviceManager,
+    NetDevice, NetFlags, Payload, PciDeviceManager, RngDevice, SyncMode, TsiFlags, VmmBuilder,
+    VmmError, VmmHandle, VsockDevice, port_io,
 };
-
-use crate::vmm::{Disk, Net, VmSpec};
 use vk_core::unixpath::SocketPath;
 
-// `krun_set_kernel` kernel-format tags (see the vendored libkrun `KernelFormat`). On x86_64
-// libkrun loads a raw ELF `vmlinux` directly (ELF), or scans an "Image" for a compression magic,
-// decompresses it, and ELF-loads the result — which is exactly what a distro `bzImage`'s payload
-// decompresses to. So a stock gzip/zstd/bzip2 `bzImage` boots via the matching IMAGE_* tag.
-pub(crate) const KRUN_KERNEL_FORMAT_ELF: u32 = 1;
-pub(crate) const KRUN_KERNEL_FORMAT_IMAGE_BZ2: u32 = 3;
-pub(crate) const KRUN_KERNEL_FORMAT_IMAGE_GZ: u32 = 4;
-pub(crate) const KRUN_KERNEL_FORMAT_IMAGE_ZSTD: u32 = 5;
-const KRUN_DISK_FORMAT_RAW: u32 = 0;
-const KRUN_DISK_FORMAT_QCOW2: u32 = 1;
-/// Matches `ImageType::VkLazyChunks` in `third_party/libkrun`'s block device (`mod.rs`).
-const KRUN_DISK_FORMAT_VK_LAZY_CHUNKS: u32 = 3;
+use crate::vmm::{Disk, DiskSync, FsShare, Net, VmSpec};
 
-/// Pick the `krun_set_kernel` format tag for `data` (a kernel image). A raw ELF `vmlinux` is
-/// `ELF`; anything else is treated as an "Image" whose payload libkrun decompresses then ELF-loads
-/// — so we return the tag for the compression whose magic appears EARLIEST, mirroring libkrun's own
-/// first-occurrence scan (a stock `bzImage` carries its real payload after the boot setup, and the
-/// earliest magic is that payload). Returns `None` for a format libkrun can't load (e.g. xz/lz4, or
-/// a raw uncompressed non-ELF), so the caller can point the user at `scripts/extract-vmlinux`.
-fn detect_kernel_format(data: &[u8]) -> Option<u32> {
+/// The `KernelFormat` libkrun should load `data` (a kernel image) as. A raw ELF `vmlinux` is
+/// `Elf`; anything else is treated as an "Image" whose payload libkrun decompresses then
+/// ELF-loads — so we return the format of the compression whose magic appears EARLIEST,
+/// mirroring libkrun's own first-occurrence scan (a stock `bzImage` carries its real payload
+/// after the boot setup, and the earliest magic is that payload). Returns `None` for a format
+/// libkrun can't load (e.g. xz/lz4, or a raw uncompressed non-ELF), so the caller can point the
+/// user at `scripts/extract-vmlinux`.
+fn detect_kernel_format(data: &[u8]) -> Option<KernelFormat> {
     if data.starts_with(b"\x7fELF") {
-        return Some(KRUN_KERNEL_FORMAT_ELF);
+        return Some(KernelFormat::Elf);
     }
     let first = |needle: &[u8]| data.windows(needle.len()).position(|w| w == needle);
     [
-        (
-            first(&[0x28, 0xb5, 0x2f, 0xfd]),
-            KRUN_KERNEL_FORMAT_IMAGE_ZSTD,
-        ), // zstd
-        (first(&[0x1f, 0x8b, 0x08]), KRUN_KERNEL_FORMAT_IMAGE_GZ), // gzip
-        (first(b"BZh"), KRUN_KERNEL_FORMAT_IMAGE_BZ2),             // bzip2
+        (first(&[0x28, 0xb5, 0x2f, 0xfd]), KernelFormat::ImageZstd), // zstd
+        (first(&[0x1f, 0x8b, 0x08]), KernelFormat::ImageGz),         // gzip
+        (first(b"BZh"), KernelFormat::ImageBz2),                     // bzip2
     ]
     .into_iter()
     .filter_map(|(pos, fmt)| pos.map(|p| (p, fmt)))
@@ -88,8 +64,8 @@ fn detect_kernel_format(data: &[u8]) -> Option<u32> {
 /// `console=hvc0` (the safe, pre-patch behaviour). A BYO/stock distro kernel has
 /// virtio_console as a module and only emits early output on the legacy serial, so
 /// `keep_serial` (`vk run --console-serial`) leaves `console=ttyS0` in place, served by the
-/// COM1 patch in the vendored builder.rs.
-pub(crate) fn console_cmdline(cmdline: &str, keep_serial: bool) -> String {
+/// legacy COM1 serial `boot` adds.
+fn console_cmdline(cmdline: &str, keep_serial: bool) -> String {
     if keep_serial {
         cmdline.to_string()
     } else {
@@ -97,9 +73,9 @@ pub(crate) fn console_cmdline(cmdline: &str, keep_serial: bool) -> String {
     }
 }
 
-/// The `krun_set_kernel` format tag for the kernel at `path`, or a clear error if libkrun cannot
+/// The format of the kernel at `path`, or a clear error if libkrun cannot
 /// load it. Reads the file to sniff its magic (the same bytes libkrun itself scans).
-pub(crate) fn kernel_format(path: &std::path::Path) -> Result<u32> {
+fn kernel_format(path: &Path) -> Result<KernelFormat> {
     let data = std::fs::read(path).with_context(|| format!("reading kernel {}", path.display()))?;
     detect_kernel_format(&data).with_context(|| {
         format!(
@@ -111,278 +87,24 @@ pub(crate) fn kernel_format(path: &std::path::Path) -> Result<u32> {
     })
 }
 
-/// Check a libkrun call's return: `>= 0` ok, negative errno on failure.
-fn ck(what: &str, rc: i32) -> Result<()> {
-    if rc < 0 {
-        bail!("{what} failed: rc={rc} (errno {})", -rc);
-    }
-    Ok(())
-}
-
-fn cstr(s: &str) -> CString {
-    CString::new(s).expect("nul byte in libkrun argument")
-}
-
-/// Parse a memory size token into MiB for `krun_set_vm_config`, accepting the same
+/// Parse a memory size token into MiB for `VmmBuilder::ram_mib`, accepting the same
 /// forms as the CLI (`<n>G`, `<n>M`, plain MiB — see
 /// `run::parse_mem_mib`).
-pub(crate) fn mem_mib(mem: &str) -> Result<u32> {
+fn mem_mib(mem: &str) -> Result<u32> {
     crate::run::parse_mem_mib(mem)
         .and_then(|n| u32::try_from(n).ok())
         .ok_or_else(|| anyhow::anyhow!("memory size {mem:?} is not <n>G, <n>M or a MiB count"))
 }
 
-/// Convert a socket path for libkrun, keeping it within `sun_path`.
-/// Store its [`SocketPath`] in `held` for later binds and connects throughout the boot.
-/// For long paths, the descriptor pins the directory even if its pathname is replaced.
-fn socket_cstr(path: &std::path::Path, held: &mut Vec<SocketPath>) -> Result<CString> {
-    let socket = SocketPath::new(path).with_context(|| format!("socket {}", path.display()))?;
-    let c = CString::new(socket.as_path().as_os_str().as_bytes())
-        .with_context(|| format!("socket {}", path.display()))?;
-    held.push(socket);
-    Ok(c)
-}
+/// The guest's vsock CID: 3, the one vk's guests have always had.
+const GUEST_CID: u64 = 3;
 
-/// Boot `spec` under libkrun in this process. Returns only when the guest powers
-/// off (or never, until then) — the caller is the libkrun boot subprocess.
-pub fn boot(spec: &VmSpec) -> Result<()> {
-    // libkrun binds and dials these sockets once the VM runs — a vsock port's peer only on
-    // the guest's first connect — so their descriptors outlive `krun_start_enter`.
-    let mut sockets = Vec::new();
-    unsafe {
-        // libkrun logs to stderr (captured to the VMM log). Its debug level fires on the
-        // block / virtio-fs I/O hot path and measurably slows a build, so default to warn
-        // and only raise to debug under VIRTKIT_DEBUG=1. (2 = warn, 4 = debug.)
-        let level = if std::env::var("VIRTKIT_DEBUG").as_deref() == Ok("1") {
-            4
-        } else {
-            2
-        };
-        krun_init_log(2, level, 0, 0);
+/// Seconds the guest gets to act on the power button before SIGALRM ends the boot child —
+/// a backstop for a guest that ignores it. The host escalates to SIGKILL well before.
+const POWER_BUTTON_GRACE_SECS: libc::c_uint = 70;
 
-        let ctx = krun_create_ctx();
-        ck("krun_create_ctx", ctx)?;
-        let ctx = ctx as u32;
-
-        // Disable TSI: implicit vsock enables inet hijack on VMs without a NIC
-        // (`net.mode = "none"`). A job-supplied TSI-patched kernel could open,
-        // connect and listen on host sockets, bypassing the switch and egress
-        // policy. The port maps below use this explicit vsock device.
-        ck(
-            "krun_disable_implicit_vsock",
-            krun_disable_implicit_vsock(ctx),
-        )?;
-        ck("krun_add_vsock", krun_add_vsock(ctx, 0))?;
-
-        // libkrun's API takes a u8 vCPU count; refuse rather than silently wrap
-        // (e.g. `--cpus host` on a 256-core machine would truncate to 0).
-        let cpus: u8 = spec.cpus.try_into().map_err(|_| {
-            anyhow::anyhow!("libkrun supports at most 255 vCPUs (got {})", spec.cpus)
-        })?;
-        ck(
-            "krun_set_vm_config",
-            krun_set_vm_config(ctx, cpus, mem_mib(&spec.mem)?),
-        )?;
-
-        // Guest PMU (`vk run --pmu`, trusted guests only): the vendored patch keeps
-        // CPUID leaf 0xA as KVM reports it, so KVM's vPMU backs in-guest hardware
-        // counters. Off by default — see VmSpec::pmu.
-        if spec.pmu {
-            ck("krun_set_pmu", krun_set_pmu(ctx, true))?;
-        }
-
-        // Nested virt (`vk run --nested`): libkrun masks the host's VMX/SVM CPUID bit
-        // unless asked, and without it the guest's kvm_intel/kvm_amd never registers
-        // /dev/kvm. The host is already known to allow nesting — `run::spawn_vmm`
-        // refused this spec otherwise.
-        if spec.nested {
-            ck("krun_set_nested_virt", krun_set_nested_virt(ctx, true))?;
-        }
-
-        // virtio-balloon: libkrun attaches one by default, so only the opt-out needs a
-        // call (the vendored krun_disable_balloon patch).
-        if !spec.balloon {
-            ck("krun_disable_balloon", krun_disable_balloon(ctx))?;
-        }
-
-        // Guest console -> the serial-log file; the orchestrator reads that file for
-        // diagnostics. libkrun routes both its implicit virtio-console (hvc0) and (with
-        // the virtkit early-console patch in builder.rs) the legacy 16550 COM1 (ttyS0)
-        // to this file.
-        //
-        // Console plan:
-        //   - Embedded kernel (default): virtio_console is built in, so hvc0 works from
-        //     early boot -> rewrite console=ttyS0 -> console=hvc0 (the safe default;
-        //     preserves the pre-patch behaviour).
-        //   - BYO/stock distro kernel (e.g. modular Debian): virtio_console is a module,
-        //     so early output only appears on the legacy serial -> `vk run --console-serial`
-        //     (spec.console_serial) keeps console=ttyS0 (served by the COM1 patch).
-        let serial_log = cstr(&spec.serial_log.to_string_lossy());
-        ck(
-            "krun_set_console_output",
-            krun_set_console_output(ctx, serial_log.as_ptr()),
-        )?;
-
-        // our own kernel + cmdline; PID 1 is chosen by `init=` on the cmdline. The format is
-        // sniffed from the image so a custom (e.g. stock distro) kernel boots, not just our ELF.
-        let kformat = kernel_format(&spec.kernel)?;
-        let kernel = cstr(&spec.kernel.to_string_lossy());
-        // An image kernel (VIRTKIT_KERNEL=image) is a stock, modular kernel whose
-        // virtio_console (hvc0) is not loaded in the preinit, so it must keep the
-        // always-present legacy COM1 (ttyS0, served by the early-console patch) — else
-        // the guest console is dead early and the agent stalls before the serve is up.
-        // The pinned kernel has hvc0, so kernel==default keeps the hvc0 rewrite.
-        let keep_serial = spec.console_serial
-            || spec
-                .cmdline
-                .split_whitespace()
-                .any(|t| t == "VIRTKIT_KERNEL=image");
-        let cmdline_str = console_cmdline(&spec.cmdline, keep_serial);
-        let cmdline = cstr(&cmdline_str);
-        let initramfs = spec.initramfs.as_ref().map(|p| cstr(&p.to_string_lossy()));
-        ck(
-            "krun_set_kernel",
-            krun_set_kernel(
-                ctx,
-                kernel.as_ptr(),
-                kformat,
-                initramfs.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-                cmdline.as_ptr(),
-            ),
-        )?;
-
-        // virtio-blk disks in order (first = /dev/vda). qcow2 overlays resolve their
-        // backing chain (KRUN_DISK_FORMAT_QCOW2); raw bases use KRUN_DISK_FORMAT_RAW.
-        for (i, disk) in spec.disks.iter().enumerate() {
-            add_disk(ctx, i, disk, &mut sockets)?;
-        }
-
-        // virtio-fs shares. libkrun has no external vhost-user-fs, so it mounts the host
-        // directory directly with its built-in virtio-fs; no separate daemon runs.
-        for share in &spec.shares {
-            let tag = cstr(&share.tag);
-            let dir = cstr(&share.host_dir.to_string_lossy());
-            // The id-map rules for this share, joined by ',' as krun_add_virtiofs7 expects;
-            // an empty map yields an empty string, which the FFI treats as an identity map.
-            let uid_map = cstr(&share.uid_map.join(","));
-            let gid_map = cstr(&share.gid_map.join(","));
-            // shm_size is the share's DAX window, guest address space reserved above RAM
-            // (0 = none). `vmm::apply_dax_budget` has already dropped the windows that do
-            // not fit the guest's span, so whatever is here is placeable. dax_inode_min is
-            // the smallest regular file the server marks for DAX (0 = none, as with no
-            // floor): the guest mounts such a share `dax=inode` and maps only the files so
-            // marked.
-            let shm_size = share.dax.map_or(0, |d| d.window);
-            let dax_inode_min = share.dax.and_then(|d| d.inode_min).unwrap_or(0);
-            let (entry_ms, attr_ms, negative_ms) = share.cache.timeouts_ms();
-            ck(
-                "krun_add_virtiofs7",
-                krun_add_virtiofs7(
-                    ctx,
-                    tag.as_ptr(),
-                    dir.as_ptr(),
-                    shm_size,
-                    share.read_only,
-                    uid_map.as_ptr(),
-                    gid_map.as_ptr(),
-                    dax_inode_min,
-                    share.cache.krun_policy(),
-                    entry_ms,
-                    attr_ms,
-                    negative_ms,
-                    share.cache.xattr(),
-                    share.cache.writeback(),
-                    share.cache.no_sync(),
-                ),
-            )?;
-        }
-
-        // Networking. Net::Tap attaches a host tap by name; the guest gets a static
-        // address from the cmdline. Switch-mode guests carry no `Net` device but one
-        // `Nic` per switch port below.
-        match &spec.net {
-            Net::None => {}
-            Net::Tap { tap, mac } => {
-                let tap_c = cstr(tap);
-                let mac = crate::switch::parse_mac(mac)
-                    .ok_or_else(|| anyhow::anyhow!("invalid MAC {mac:?}"))?;
-                ck(
-                    "krun_add_net_tap",
-                    krun_add_net_tap(ctx, tap_c.as_ptr(), mac.as_ptr(), 0, 0),
-                )?;
-            }
-        }
-        // Switch NICs: one virtio-net device per switch port, libkrun dialing the host
-        // socket the switch already listens on (fd -1 = connect to `path`) and speaking the
-        // switch's own 4-byte-length framing. No offload features and no flags: the switch
-        // terminates TCP itself and expects complete checksums, and the guest is addressed
-        // from the cmdline, not by libkrun's DHCP client. Every NIC carries the switch LAN's
-        // MTU, which libkrun advertises over VIRTIO_NET_F_MTU: the guest link comes up at it
-        // with nothing configured inside the guest, and posts receive buffers big enough for
-        // a frame that size. Attach order is the guest's interface order (eth0, eth1, …):
-        // virtio-pci probes the slots in the order they were added, so `nics[i]` is `eth<i>`.
-        // The agent never has to trust that — every NIC carries the MAC its address derives
-        // from, so an interface can always be matched back to its address.
-        for (i, nic) in spec.nics.iter().enumerate() {
-            let path = socket_cstr(&nic.socket, &mut sockets)?;
-            let (socket, want) = (nic.socket.display(), &nic.mac);
-            let mac = crate::switch::parse_mac(want).ok_or_else(|| {
-                anyhow::anyhow!("switch nic {i} ({socket}): invalid MAC {want:?}")
-            })?;
-            ck(
-                "krun_add_net_unixstream2",
-                krun_add_net_unixstream2(
-                    ctx,
-                    path.as_ptr(),
-                    -1,
-                    mac.as_ptr(),
-                    0,
-                    0,
-                    crate::switch::MTU,
-                ),
-            )?;
-        }
-
-        // vsock ports, each on its own `<base>_<port>` host socket. listen=true:
-        // libkrun listens there and forwards host connections to the guest port
-        // (the exec channel; `vsock-auto://` clients dial it directly — nothing
-        // listens on the base path itself under libkrun). listen=false: the guest
-        // dials the port and libkrun forwards to the host socket, where the host
-        // already listens (the switch and ssh-agent bridges).
-        for vp in &spec.vsock_ports {
-            let path = socket_cstr(&vp.socket, &mut sockets)?;
-            ck(
-                "krun_add_vsock_port2",
-                krun_add_vsock_port2(ctx, vp.port, path.as_ptr(), vp.listen),
-            )?;
-        }
-
-        // our cmdline's init= is PID 1; don't let libkrun inject /init.krun.
-        ck(
-            "krun_disable_implicit_init",
-            krun_disable_implicit_init(ctx),
-        )?;
-
-        // A host SIGTERM presses the ACPI power button (see the module docs) rather
-        // than cutting power. Best-effort: if the fd is unavailable, we just lose the
-        // orderly-shutdown-on-SIGTERM path and the host's SIGKILL still stops the VM.
-        install_power_button_on_sigterm(ctx);
-
-        // blocks until the guest powers off or resets.
-        ck("krun_start_enter", krun_start_enter(ctx))?;
-    }
-    drop(sockets);
-    Ok(())
-}
-
-/// Fd the SIGTERM handler writes to press the guest's ACPI power button. -1 until set.
-static SHUTDOWN_FD: AtomicI32 = AtomicI32::new(-1);
-
-/// Seconds the guest gets to act on the power button before the boot child gives up
-/// and lets SIGALRM terminate it — a backstop for a guest that ignores the button, so
-/// the child never outlives whatever spawned it. The host escalates to SIGKILL well before.
 /// The drive letter of the `index`th disk (`a` for vda), refused past `z`.
-pub(crate) fn disk_letter(index: usize) -> Result<char> {
+fn disk_letter(index: usize) -> Result<char> {
     u8::try_from(index)
         .ok()
         .and_then(|i| b'a'.checked_add(i))
@@ -391,38 +113,321 @@ pub(crate) fn disk_letter(index: usize) -> Result<char> {
         .with_context(|| format!("too many disks: no virtio-blk letter for disk {index}"))
 }
 
-pub(crate) const POWER_BUTTON_GRACE_SECS: libc::c_uint = 70;
+/// The transport the devices sit on: virtio-pci with MSI-X, or virtio-mmio under
+/// `VIRTKIT_KRUN_MMIO=1` (to rule the transport out when debugging).
+enum Devices<'a> {
+    Mmio(MmioDeviceManager<'a>),
+    Pci(PciDeviceManager<'a>),
+}
 
-/// SIGTERM handler: press the ACPI power button and arm a backstop alarm. Async-signal-safe
-/// (an eventfd `write` of 8 bytes and `alarm`).
-extern "C" fn press_power_button(_sig: libc::c_int) {
-    let fd = SHUTDOWN_FD.load(Ordering::SeqCst);
-    if fd >= 0 {
-        let one: u64 = 1;
-        // SAFETY: write(2) is async-signal-safe; an 8-byte write to an eventfd.
-        unsafe {
-            libc::write(fd, &one as *const u64 as *const libc::c_void, 8);
-            libc::alarm(POWER_BUTTON_GRACE_SECS);
+impl<'a> Devices<'a> {
+    fn new() -> Self {
+        if std::env::var("VIRTKIT_KRUN_MMIO").as_deref() == Ok("1") {
+            Devices::Mmio(MmioDeviceManager::new())
+        } else {
+            Devices::Pci(PciDeviceManager::new())
+        }
+    }
+
+    fn add(&mut self, device: impl AttachDevice<'a>) {
+        match self {
+            Devices::Mmio(m) => {
+                m.add(device);
+            }
+            Devices::Pci(p) => {
+                p.add(device);
+            }
+        }
+    }
+
+    fn attach(self, builder: VmmBuilder<'a>) -> VmmBuilder<'a> {
+        match self {
+            Devices::Mmio(m) => builder.devices(m),
+            Devices::Pci(p) => builder.devices(p),
         }
     }
 }
 
-/// Install the SIGTERM power-button handler, if libkrun exposes a shutdown eventfd.
-///
-/// # Safety
-/// Call once, before `krun_start_enter`, with a valid `ctx`.
-unsafe fn install_power_button_on_sigterm(ctx: u32) {
-    let fd = krun_get_shutdown_eventfd(ctx);
-    if fd < 0 {
+/// A libkrun error as an `anyhow` one, naming what was being set up.
+fn krun(what: &'static str) -> impl FnOnce(VmmError) -> anyhow::Error {
+    move |e| anyhow!("libkrun: {what}: {e}")
+}
+
+/// `path` as the `&str` libkrun's builders take.
+fn path_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))
+}
+
+/// Boot `spec` under libkrun in this process. Returns only if setup fails; once the
+/// guest runs, libkrun ends the process with its exit code.
+pub fn boot(spec: &VmSpec) -> Result<()> {
+    // Before any thread exists, so every thread libkrun spawns inherits the mask and the
+    // signal stays pending for the power-button thread.
+    block_sigterm();
+    set_process_name(&spec.proc_name);
+
+    // libkrun logs to stderr (captured to the VMM log). Debug fires on the block and
+    // virtio-fs I/O paths and slows a build, so only under VIRTKIT_DEBUG=1.
+    let level = if std::env::var("VIRTKIT_DEBUG").as_deref() == Ok("1") {
+        LogLevel::Debug
+    } else {
+        LogLevel::Warn
+    };
+    krun::init_log(None, level, LogStyle::Auto, LogOptions::empty()).map_err(krun("logging"))?;
+
+    // libkrun binds and dials these sockets once the VM runs, a vsock port's peer only on
+    // the guest's first connect, so they are held until the process ends.
+    let mut sockets = Vec::new();
+    let mut devices = Devices::new();
+
+    // Send hvc0 and legacy COM1 to the serial log for orchestrator diagnostics.
+    // COM1 covers modular virtio_console (`vk run --console-serial`, an image kernel).
+    // Leak the file: libkrun borrows it for COM1 throughout the VM's lifetime.
+    let log: &'static File = Box::leak(Box::new(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&spec.serial_log)
+            .with_context(|| format!("opening serial log {}", spec.serial_log.display()))?,
+    ));
+    let mut console = ConsoleDevice::builder();
+    console.add_console_port(
+        "",
+        port_io::output_file(log.try_clone().context("duplicating the serial log")?)
+            .map_err(|e| anyhow!("libkrun: console output: {e}"))?,
+    );
+    devices.add(console.build().map_err(krun("console"))?);
+
+    for (i, disk) in spec.disks.iter().enumerate() {
+        devices.add(block_device(i, disk, &mut sockets)?);
+    }
+    for share in &spec.shares {
+        devices.add(fs_device(share)?);
+    }
+    match &spec.net {
+        Net::None => {}
+        Net::Tap { tap, mac } => {
+            let mac =
+                crate::switch::parse_mac(mac).ok_or_else(|| anyhow!("invalid MAC {mac:?}"))?;
+            devices.add(NetDevice::new_tap("eth0", tap, &mac, 0).map_err(krun("tap NIC"))?);
+        }
+    }
+    // Switch NICs: one virtio-net device per switch port, dialing the socket the switch
+    // listens on and speaking its 4-byte-length framing, with no offloads (the switch
+    // terminates TCP and wants complete checksums) and the switch LAN's MTU, so the guest
+    // link comes up at it unconfigured. Attach order is interface order (eth0, eth1, …).
+    for (i, nic) in spec.nics.iter().enumerate() {
+        let socket = SocketPath::new(&nic.socket)
+            .with_context(|| format!("switch nic {i}: socket {}", nic.socket.display()))?;
+        let mac = crate::switch::parse_mac(&nic.mac)
+            .ok_or_else(|| anyhow!("switch nic {i}: invalid MAC {:?}", nic.mac))?;
+        let mut net = NetDevice::new_unixstream_path(
+            &format!("eth{i}"),
+            path_str(socket.as_path())?,
+            &mac,
+            0,
+            NetFlags::empty(),
+        )
+        .map_err(krun("switch NIC"))?;
+        net.set_mtu(crate::switch::MTU)
+            .map_err(krun("switch NIC MTU"))?;
+        devices.add(net);
+        sockets.push(socket);
+    }
+    // vsock ports, each on its own `<base>_<port>` host socket: libkrun listens there and
+    // forwards host connections to the guest port (listen), or forwards the guest's
+    // connections to a host listener (the switch and ssh-agent bridges).
+    // Attached only when there are ports; the agent's exec channel always is one. No TSI: a
+    // job-supplied TSI-patched kernel could otherwise open, connect and listen on host
+    // sockets, bypassing the switch and egress policy.
+    if !spec.vsock_ports.is_empty() {
+        let mut vsock = VsockDevice::new(GUEST_CID, TsiFlags::empty()).map_err(krun("vsock"))?;
+        for vp in &spec.vsock_ports {
+            let socket = SocketPath::new(&vp.socket).with_context(|| {
+                format!("vsock port {}: socket {}", vp.port, vp.socket.display())
+            })?;
+            vsock.add_unix_port(vp.port, path_str(socket.as_path())?, vp.listen);
+            sockets.push(socket);
+        }
+        devices.add(vsock);
+    }
+    // virtio-rng: the guest's /dev/hwrng and early entropy.
+    devices.add(RngDevice::new().map_err(krun("rng"))?);
+    // virtio-balloon with free-page reporting; libkrun 2.0 attaches nothing implicitly.
+    if spec.balloon {
+        devices.add(BalloonDevice::new().map_err(krun("balloon"))?);
+    }
+
+    // Our own kernel and cmdline; PID 1 is chosen by `init=`. An image kernel
+    // (VIRTKIT_KERNEL=image) is a stock modular one whose hvc0 is not up early, so it keeps
+    // the legacy console, as `--console-serial` asks.
+    let keep_serial = spec.console_serial
+        || spec
+            .cmdline
+            .split_whitespace()
+            .any(|t| t == "VIRTKIT_KERNEL=image");
+    let cmdline = console_cmdline(&spec.cmdline, keep_serial);
+    let initramfs = spec.initramfs.as_deref().map(path_str).transpose()?;
+    let payload = Payload::load_external(
+        path_str(&spec.kernel)?,
+        kernel_format(&spec.kernel)?,
+        initramfs,
+        &cmdline,
+    )
+    .map_err(krun("kernel"))?;
+
+    // libkrun takes a u8 vCPU count; refuse rather than wrap (`--cpus host` on a 256-core
+    // machine would truncate to 0).
+    let cpus: u8 = spec
+        .cpus
+        .try_into()
+        .map_err(|_| anyhow!("libkrun supports at most 255 vCPUs (got {})", spec.cpus))?;
+    let builder = VmmBuilder::new()
+        .vcpus(cpus)
+        .map_err(krun("vCPUs"))?
+        .ram_mib(mem_mib(&spec.mem)?)
+        .map_err(krun("memory"))?
+        .payload(payload)
+        // `vk run --pmu` (trusted guests only) and `--nested`; the host was checked for
+        // nesting before this spec was handed over.
+        .pmu(spec.pmu)
+        .nested_virt(spec.nested)
+        .acpi(true)
+        .map_err(krun("ACPI"))?
+        .shutdown_support(true)
+        .add_serial_console(None, Some(log.as_fd()))
+        .map_err(krun("serial console"))?;
+    let vmm = devices
+        .attach(builder)
+        .build()
+        .map_err(krun("building the VM"))?;
+    press_power_button_on_sigterm(vmm.handle().map_err(krun("VM handle"))?)?;
+
+    // Blocks until the guest powers off or resets; libkrun `_exit`s with its code. It returns
+    // only when the event loop fails, which must not read as a clean power-off.
+    vmm.run();
+    drop(sockets);
+    bail!("libkrun: the VM event loop ended before the guest exited")
+}
+
+fn block_device(index: usize, disk: &Disk, sockets: &mut Vec<SocketPath>) -> Result<BlockDevice> {
+    let id = format!("vd{}", disk_letter(index)?);
+    let format = match disk.format {
+        crate::vmm::DiskFormat::Raw => DiskFormat::Raw,
+        crate::vmm::DiskFormat::Qcow2 => DiskFormat::Qcow2,
+        crate::vmm::DiskFormat::VkLazyChunks => DiskFormat::VkLazyChunks,
+    };
+    let mut block =
+        BlockDevice::new(&id, path_str(&disk.path)?, format).map_err(krun("block device"))?;
+    block.set_read_only(disk.readonly);
+    // The host page cache (no direct I/O), and the disk's FLUSH handling: a throwaway
+    // overlay offers the guest none.
+    block.set_sync_mode(match disk.sync {
+        DiskSync::Full => SyncMode::Full,
+        DiskSync::None => SyncMode::None,
+    });
+    // Dirty-cluster tracking (build stages): a checkpoint drains only its delta.
+    if let Some(path) = &disk.dirty_control_socket {
+        let socket = SocketPath::new(path)
+            .with_context(|| format!("{id}: dirty-control socket {}", path.display()))?;
+        block.set_dirty_control_socket(path_str(socket.as_path())?);
+        sockets.push(socket);
+    }
+    Ok(block)
+}
+
+fn fs_device(share: &FsShare) -> Result<FsDevice<'static>> {
+    let dir = path_str(&share.host_dir)?;
+    let mut fs = if share.read_only {
+        FsDevice::new_read_only(&share.tag, dir)
+    } else {
+        FsDevice::new(&share.tag, dir)
+    }
+    .map_err(krun("virtio-fs share"))?;
+    fs.set_id_maps(share.uid_map.clone(), share.gid_map.clone());
+    // The DAX window is guest address space reserved above RAM; `vmm::apply_dax_budget`
+    // already dropped the windows the guest's span cannot place. With a floor, the guest
+    // mounts `dax=inode` and maps only regular files at least that large.
+    if let Some(dax) = share.dax {
+        fs.set_dax_window_size(dax.window);
+        fs.set_dax_inode_min(dax.inode_min)
+            .map_err(krun("virtio-fs DAX"))?;
+    }
+    let (entry, attr, negative) = share.cache.timeouts_ms();
+    let ms = |ms: u32| Duration::from_millis(ms.into());
+    fs.set_cache(
+        if share.cache.caches_always() {
+            FsCachePolicy::Always
+        } else {
+            FsCachePolicy::Auto
+        },
+        ms(entry),
+        ms(attr),
+        ms(negative),
+    )
+    .map_err(krun("virtio-fs cache"))?;
+    fs.set_xattr(share.cache.xattr())
+        .map_err(krun("virtio-fs xattr"))?;
+    fs.set_writeback(share.cache.writeback())
+        .map_err(krun("virtio-fs writeback"))?;
+    fs.set_no_sync(share.cache.no_sync())
+        .map_err(krun("virtio-fs no_sync"))?;
+    Ok(fs)
+}
+
+/// Name the process after its VM (`vk:<unit>`, see [`crate::vmm::resolve_proc_name`]) for
+/// `ps`, `top` and the tests that find a VM's VMM by its `comm`, which the kernel caps at 15
+/// bytes.
+fn set_process_name(name: &str) {
+    let Ok(name) = std::ffi::CString::new(name) else {
         return;
-    }
-    SHUTDOWN_FD.store(fd as RawFd, Ordering::SeqCst);
+    };
+    // SAFETY: PR_SET_NAME reads a NUL-terminated string, truncated to 15 bytes.
+    unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
+}
+
+fn sigterm_set() -> libc::sigset_t {
+    // SAFETY: sigemptyset initializes the set before sigaddset reads it.
     unsafe {
-        libc::signal(
-            libc::SIGTERM,
-            press_power_button as *const () as libc::sighandler_t,
-        );
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        set
     }
+}
+
+fn block_sigterm() {
+    // An inherited SIG_IGN would discard SIGTERM even while blocked, so sigwait never woke.
+    // SAFETY: resetting a disposition to its default has no preconditions.
+    unsafe { libc::signal(libc::SIGTERM, libc::SIG_DFL) };
+    let set = sigterm_set();
+    // SAFETY: a valid set; only the calling thread's mask changes.
+    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
+}
+
+/// Handle SIGTERM on a dedicated thread: press the guest's ACPI power button and arm
+/// a backstop alarm so the boot child never outlives its parent.
+fn press_power_button_on_sigterm(handle: VmmHandle) -> Result<()> {
+    std::thread::Builder::new()
+        .name("vk-power-button".into())
+        .spawn(move || {
+            let set = sigterm_set();
+            loop {
+                let mut sig = 0;
+                // SAFETY: a valid set, blocked in every thread; sigwait only reports which.
+                if unsafe { libc::sigwait(&set, &mut sig) } != 0 || sig != libc::SIGTERM {
+                    continue;
+                }
+                if let Err(e) = handle.shutdown() {
+                    eprintln!("virtkit: pressing the power button: {e}");
+                }
+                // SAFETY: alarm(2) has no memory-safety preconditions.
+                unsafe { libc::alarm(POWER_BUTTON_GRACE_SECS) };
+            }
+        })
+        .context("spawning the power-button thread")?;
+    Ok(())
 }
 
 /// Boot `spec`, relaunching the VM in place on a guest reset when `spec.reboot` is set.
@@ -433,13 +438,6 @@ unsafe fn install_power_button_on_sigterm(ctx: u32) {
 /// reset (SIGUSR1), boots it again. A host SIGTERM is forwarded to the child (its ACPI
 /// power button) and stops the loop. Returns the process exit code to use.
 pub fn keep(spec: &VmSpec) -> Result<i32> {
-    keep_with(spec, boot)
-}
-
-/// [`keep`] with either this module's boot function or `crate::libkrun2_sys::boot`
-/// (`krun2`). Both `_exit` with the guest's code and report resets as
-/// [`KRUN_EXIT_GUEST_RESET`].
-pub(crate) fn keep_with(spec: &VmSpec, boot: fn(&VmSpec) -> Result<()>) -> Result<i32> {
     if !spec.reboot {
         // No in-place reboot: boot once. `boot` execs libkrun and never returns on a
         // normal end (libkrun `_exit`s with the guest's code), so this is effectively
@@ -610,49 +608,9 @@ fn wait_for(pid: i32) -> Wait {
     }
 }
 
-unsafe fn add_disk(
-    ctx: u32,
-    index: usize,
-    disk: &Disk,
-    sockets: &mut Vec<SocketPath>,
-) -> Result<()> {
-    let block_id = cstr(&format!("vd{}", disk_letter(index)?));
-    let path = cstr(&disk.path.to_string_lossy());
-    let format = match disk.format {
-        crate::vmm::DiskFormat::Raw => KRUN_DISK_FORMAT_RAW,
-        crate::vmm::DiskFormat::Qcow2 => KRUN_DISK_FORMAT_QCOW2,
-        crate::vmm::DiskFormat::VkLazyChunks => KRUN_DISK_FORMAT_VK_LAZY_CHUNKS,
-    };
-    // Use the host page cache (no direct I/O) and the disk's sync mode. Throwaway overlays
-    // offer the guest no FLUSH.
-    ck("krun_add_disk3", unsafe {
-        krun_add_disk3(
-            ctx,
-            block_id.as_ptr(),
-            path.as_ptr(),
-            format,
-            disk.readonly,
-            false,
-            disk.sync.krun_code(),
-        )
-    })?;
-    // Dirty-block tracking (build stages): serve the drain protocol on the given socket so a
-    // checkpoint captures only the delta. Set only on the writable stage overlay.
-    if let Some(sock) = &disk.dirty_control_socket {
-        let sock = socket_cstr(sock, sockets)?;
-        ck("krun_set_block_dirty_socket", unsafe {
-            krun_set_block_dirty_socket(ctx, block_id.as_ptr(), sock.as_ptr())
-        })?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        KRUN_KERNEL_FORMAT_ELF, KRUN_KERNEL_FORMAT_IMAGE_BZ2, KRUN_KERNEL_FORMAT_IMAGE_GZ,
-        KRUN_KERNEL_FORMAT_IMAGE_ZSTD, console_cmdline, detect_kernel_format, disk_letter, mem_mib,
-    };
+    use super::{KernelFormat, console_cmdline, detect_kernel_format, disk_letter, mem_mib};
 
     #[test]
     fn disks_are_lettered_up_to_z() {
@@ -667,32 +625,26 @@ mod tests {
         // A raw ELF vmlinux (our embedded kernel) → ELF.
         assert_eq!(
             detect_kernel_format(b"\x7fELF\x02\x01\x01"),
-            Some(KRUN_KERNEL_FORMAT_ELF)
+            Some(KernelFormat::Elf)
         );
         // A bzImage: an `MZ` PE header + boot setup, then the real compressed payload. The
         // earliest compression magic is the payload; pick its format (matching libkrun's scan).
         let mut zst = b"MZ".to_vec();
         zst.extend(std::iter::repeat_n(0u8, 4096)); // stand-in for the boot setup
         zst.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd]); // zstd payload
-        assert_eq!(
-            detect_kernel_format(&zst),
-            Some(KRUN_KERNEL_FORMAT_IMAGE_ZSTD)
-        );
+        assert_eq!(detect_kernel_format(&zst), Some(KernelFormat::ImageZstd));
         let mut gz = b"MZ\x00\x00".to_vec();
         gz.extend_from_slice(&[0x1f, 0x8b, 0x08]);
-        assert_eq!(detect_kernel_format(&gz), Some(KRUN_KERNEL_FORMAT_IMAGE_GZ));
+        assert_eq!(detect_kernel_format(&gz), Some(KernelFormat::ImageGz));
         assert_eq!(
             detect_kernel_format(b"MZ....BZh9"),
-            Some(KRUN_KERNEL_FORMAT_IMAGE_BZ2)
+            Some(KernelFormat::ImageBz2)
         );
         // Earliest magic wins: a real zstd payload before a spurious later gzip byte-sequence.
         let mut mixed = vec![0u8; 200];
         mixed.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd]); // zstd first
         mixed.extend_from_slice(&[0x1f, 0x8b, 0x08]); // spurious gzip later
-        assert_eq!(
-            detect_kernel_format(&mixed),
-            Some(KRUN_KERNEL_FORMAT_IMAGE_ZSTD)
-        );
+        assert_eq!(detect_kernel_format(&mixed), Some(KernelFormat::ImageZstd));
         // Unsupported: xz-compressed or an unrecognized blob → None (caller errors with guidance).
         assert_eq!(
             detect_kernel_format(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]),
