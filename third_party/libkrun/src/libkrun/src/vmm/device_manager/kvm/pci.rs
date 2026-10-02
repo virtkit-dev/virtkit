@@ -88,8 +88,16 @@ impl PciIntxLine for KvmPciIntxLine {
 
 impl PciHostManager {
     pub fn new() -> Self {
+        let root = devices::pci::PciRoot::shared();
+        root.lock()
+            .expect("Poisoned PCI root lock")
+            .insert(
+                PciAddress::new(PCI_BUS0, 0, 0),
+                Arc::new(Mutex::new(devices::pci::PciHostBridge::new())),
+            )
+            .expect("an empty PCI root has a free 00:00.0");
         Self {
-            root: devices::pci::PciRoot::shared(),
+            root,
             next_device: 1,
             irq: arch::x86_64::layout::IRQ_BASE,
             functions: Vec::new(),
@@ -121,6 +129,16 @@ impl PciHostManager {
             ))),
             arch::x86_64::layout::PCI_BAR_START,
             arch::x86_64::layout::PCI_BAR_END - arch::x86_64::layout::PCI_BAR_START,
+        )
+        .map_err(Error::Bus)?;
+        // UEFI firmware reassigns BARs from the bottom of the 32-bit hole (local patch).
+        bus.insert(
+            Arc::new(Mutex::new(BarWindow::new(
+                self.root.clone(),
+                arch::x86_64::layout::PCI_MMIO32_LOW_START,
+            ))),
+            arch::x86_64::layout::PCI_MMIO32_LOW_START,
+            arch::x86_64::layout::PCI_MMIO32_LOW_END - arch::x86_64::layout::PCI_MMIO32_LOW_START,
         )
         .map_err(Error::Bus)
     }

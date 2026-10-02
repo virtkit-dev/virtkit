@@ -260,6 +260,14 @@ impl Console {
             let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
             let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
 
+            // A port keeps running when the guest closes it, so on a reopen (Windows' qemu-ga
+            // closes and reopens its port) its queues are already with its I/O threads and
+            // there is nothing to start (local patch).
+            if self.queues[rx_idx].is_none() || self.queues[tx_idx].is_none() {
+                log::debug!("Port {port_id} reopened; already running");
+                continue;
+            }
+
             // Take ownership of port queues - they are moved to the port.
             let rx_queue = self.queues[rx_idx]
                 .take()
@@ -372,5 +380,98 @@ impl VmmExitObserver for Console {
     fn on_vmm_exit(&mut self) {
         self.reset();
         log::trace!("Console on_vmm_exit finished");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vm_memory::GuestAddress;
+
+    use super::*;
+    use crate::virtio::Queue;
+    use crate::virtio::device::{InterruptHandler, InterruptType};
+    use crate::virtio::queue::tests::VirtQueue;
+
+    struct NoIrq;
+
+    impl InterruptHandler for NoIrq {
+        fn try_signal(&self, _interrupt: InterruptType) -> Result<(), crate::Error> {
+            Ok(())
+        }
+    }
+
+    const CONTROL_BUF: u64 = 0x1000;
+
+    /// Has the guest send `(event, value)` control messages for port 0 and the device
+    /// process them.
+    fn send_control(console: &mut Console, vq: &VirtQueue, messages: &[(u16, u16)]) {
+        for &(event, value) in messages {
+            let slot = vq.avail.idx.get();
+            let addr = CONTROL_BUF + u64::from(slot) * size_of::<VirtioConsoleControl>() as u64;
+            let DeviceState::Activated(ref mem, _) = console.device_state else {
+                unreachable!()
+            };
+            mem.write_obj(
+                VirtioConsoleControl {
+                    id: 0,
+                    event,
+                    value,
+                },
+                GuestAddress(addr),
+            )
+            .unwrap();
+            vq.dtable[slot as usize].set(addr, size_of::<VirtioConsoleControl>() as u32, 0, 0);
+            vq.avail.ring[slot as usize].set(slot);
+            vq.avail.idx.set(slot + 1);
+        }
+        console.process_control_tx();
+    }
+
+    #[test]
+    fn a_port_the_guest_closes_and_reopens_keeps_running() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+        let mut console = Console::new(vec![PortDescription {
+            name: "org.qemu.guest_agent.0".into(),
+            input: None,
+            output: None,
+            terminal: None,
+        }])
+        .unwrap();
+        let queue = |queue: Queue| DeviceQueue::new(queue, Arc::new(EventFd::new(0).unwrap()));
+        let queues = (0..num_queues(1))
+            .map(|index| match index {
+                CONTROL_TXQ_INDEX => queue(vq.create_queue()),
+                _ => queue(Queue::new(QUEUE_SIZE)),
+            })
+            .collect();
+        console
+            .activate(
+                mem.clone(),
+                InterruptTransport::from_handler(Arc::new(NoIrq)),
+                queues,
+            )
+            .unwrap();
+        let rx = port_id_to_queue_idx(QueueDirection::Rx, 0);
+        let tx = port_id_to_queue_idx(QueueDirection::Tx, 0);
+
+        send_control(
+            &mut console,
+            &vq,
+            &[(control_event::VIRTIO_CONSOLE_PORT_OPEN, 1)],
+        );
+        assert!(console.queues[rx].is_none() && console.queues[tx].is_none());
+
+        send_control(
+            &mut console,
+            &vq,
+            &[
+                (control_event::VIRTIO_CONSOLE_PORT_OPEN, 0),
+                (control_event::VIRTIO_CONSOLE_PORT_OPEN, 1),
+            ],
+        );
+        assert_eq!(vq.used.idx.get(), 3);
+        // The port's queues stay with its I/O threads.
+        assert!(console.queues[rx].is_none() && console.queues[tx].is_none());
     }
 }

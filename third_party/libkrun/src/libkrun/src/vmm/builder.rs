@@ -1116,11 +1116,13 @@ pub fn build_microvm(
     // Instantiate the MMIO device manager.
     // 'mmio_base' address has to be an address which is protected by the kernel
     // and is architectural specific.
+    #[cfg(target_arch = "x86_64")]
+    let mut mmio_base = arch::x86_64::layout::MMIO_DEVICES_START;
+    #[cfg(not(target_arch = "x86_64"))]
+    let mut mmio_base = arch::MMIO_MEM_START;
     #[allow(unused_mut)]
-    let mut mmio_device_manager = MMIODeviceManager::new(
-        &mut (arch::MMIO_MEM_START.clone()),
-        (arch::IRQ_BASE, arch::IRQ_MAX),
-    );
+    let mut mmio_device_manager =
+        MMIODeviceManager::new(&mut mmio_base, (arch::IRQ_BASE, arch::IRQ_MAX));
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if let Some(pci) = &pci_device_manager {

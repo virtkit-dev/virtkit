@@ -24,8 +24,8 @@ use zerocopy::byteorder::{LE, U16, U32};
 use zerocopy::{Immutable, IntoBytes};
 
 use crate::x86_64::layout::{
-    ACPI_PM_BASE, ACPI_RESET_REG, ACPI_RESET_VALUE, HIMEM_START, RSDP_ADDR, SCI_GSI, SHM_MEM_SIZE,
-    SHM_MEM_START,
+    ACPI_PM_BASE, ACPI_RESET_REG, ACPI_RESET_VALUE, HIMEM_START, PCI_MMIO32_LOW_END,
+    PCI_MMIO32_LOW_START, RSDP_ADDR, SCI_GSI, SHM_MEM_SIZE, SHM_MEM_START,
 };
 
 /// Standard local APIC physical base address.
@@ -42,6 +42,8 @@ const IAPC_BOOT_ARCH_8042: u16 = 1 << 1;
 const PM1_EVT_LEN: u8 = 4;
 const PM1_CNT_LEN: u8 = 2;
 const PM1A_CNT_PORT: u16 = ACPI_PM_BASE + 0x04;
+const PM_TMR_PORT: u16 = ACPI_PM_BASE + 0x08;
+const PM_TMR_LEN: u8 = 4;
 
 /// MADT Interrupt Source Override (type 2, ACPI 6.x § 5.2.12.5): ISA IRQ `source` arrives on
 /// `gsi` with `flags` polarity/trigger. `acpi_tables` has no such structure.
@@ -106,13 +108,10 @@ fn build_rsdp(xsdt_addr: u64) -> Vec<u8> {
 fn build_dsdt(virtio_mmio_devices: &[(u64, u32)], pci_host: Option<&PciHostInfo>) -> Vec<u8> {
     let mut aml_body = Vec::new();
 
-    // (io_base, irq, acpi_device_name) — PC/AT standard COM port assignments
-    const COM_PORTS: [(u16, u32, &str); 4] = [
-        (0x3F8, 4, "COM1"),
-        (0x2F8, 3, "COM2"),
-        (0x3E8, 4, "COM3"),
-        (0x2E8, 3, "COM4"),
-    ];
+    // (io_base, irq, acpi_device_name) — PC/AT standard COM port assignments. COM3 and COM4
+    // stay emulated but undeclared, as on QEMU: they would share COM1's and COM2's ISA IRQs,
+    // which Windows refuses for all four (code 12, a resource conflict) (local patch).
+    const COM_PORTS: [(u16, u32, &str); 2] = [(0x3F8, 4, "COM1"), (0x2F8, 3, "COM2")];
     for (i, &(io_base, irq, name)) in COM_PORTS.iter().enumerate() {
         let hid = Name::new(Path::new("_HID"), &EISAName::new("PNP0501"));
         let uid = Name::new(Path::new("_UID"), &(i as u32));
@@ -178,7 +177,15 @@ fn build_dsdt(virtio_mmio_devices: &[(u64, u32)], pci_host: Option<&PciHostInfo>
             SHM_MEM_START + SHM_MEM_SIZE - 1,
             None,
         );
-        let mut resources: Vec<&dyn Aml> = vec![&buses, &memory];
+        // The low part of the 32-bit hole, where UEFI firmware reassigns BARs (local patch).
+        let low = AddressSpace::new_memory(
+            AddressSpaceCacheable::NotCacheable,
+            true,
+            PCI_MMIO32_LOW_START as u32,
+            (PCI_MMIO32_LOW_END - 1) as u32,
+            None,
+        );
+        let mut resources: Vec<&dyn Aml> = vec![&buses, &low, &memory];
         if pci_host.shm_window {
             resources.push(&shm);
         }
@@ -225,9 +232,10 @@ fn build_dsdt(virtio_mmio_devices: &[(u64, u32)], pci_host: Option<&PciHostInfo>
 /// It describes the fixed hardware the `AcpiPm` device serves (local patch, see VENDOR.md)
 /// instead of a HW-reduced platform: the PM1 event and control blocks at `ACPI_PM_BASE`, the
 /// SCI on `SCI_GSI`, and the reset register, so a guest can power off through `\_S5`, take a
-/// fixed-feature power button, and reset. There is no PM timer, no GPE block and no SMI
-/// command port (the platform is always in ACPI mode). IAPC_BOOT_ARCH advertises the emulated
-/// i8042; Linux treats a clear `ACPI_FADT_8042` bit on FADT revision >= 2 as firmware-absent.
+/// fixed-feature power button, and reset, plus the 32-bit PM timer. There is no GPE block and
+/// no SMI command port (the platform is always in ACPI mode). IAPC_BOOT_ARCH advertises the
+/// emulated i8042; Linux treats a clear `ACPI_FADT_8042` bit on FADT revision >= 2 as
+/// firmware-absent.
 fn build_fadt(facs_addr: u64, dsdt_addr: u64) -> Vec<u8> {
     let io = |port: u16, len: u8, access: AccessSize| {
         GAS::new(GasSpace::SystemIo, len * 8, 0, access, u64::from(port))
@@ -238,13 +246,17 @@ fn build_fadt(facs_addr: u64, dsdt_addr: u64) -> Vec<u8> {
         .flag(Flags::Wbinvd)
         .flag(Flags::SlpButton)
         .flag(Flags::ResetRegSup)
+        .flag(Flags::TmrValExt)
         .flag(Flags::Headless);
     builder.iapc_boot_arch = IAPC_BOOT_ARCH_8042.into();
     builder.sci_int = (SCI_GSI as u16).into();
     builder.pm1a_evt_blk = u32::from(ACPI_PM_BASE).into();
     builder.pm1a_cnt_blk = u32::from(PM1A_CNT_PORT).into();
+    builder.pm_tmr_blk = u32::from(PM_TMR_PORT).into();
     builder.pm1_evt_len = PM1_EVT_LEN;
     builder.pm1_cnt_len = PM1_CNT_LEN;
+    builder.pm_tmr_len = PM_TMR_LEN;
+    builder.x_pm_tmr_blk = io(PM_TMR_PORT, PM_TMR_LEN, AccessSize::DwordAccess);
     builder.x_pm1a_evt_blk = io(ACPI_PM_BASE, PM1_EVT_LEN, AccessSize::WordAccess);
     builder.x_pm1a_cnt_blk = io(PM1A_CNT_PORT, PM1_CNT_LEN, AccessSize::WordAccess);
     builder.reset_reg = io(ACPI_RESET_REG, 1, AccessSize::ByteAccess);
@@ -336,7 +348,7 @@ pub fn setup_acpi(
     let mcfg = pci_host.map(build_mcfg);
 
     const RSDP_SIZE: u64 = 36;
-    let xsdt_entries = 2 + if mcfg.is_some() { 1 } else { 0 };
+    let xsdt_entries = 3 + if mcfg.is_some() { 1 } else { 0 };
     let xsdt_size = 36 + xsdt_entries * 8;
     let fadt_size_placeholder = build_fadt(0, 0).len() as u64;
     let facs = {
@@ -359,6 +371,11 @@ pub fn setup_acpi(
     if mcfg.is_some() {
         xsdt_entries.push(mcfg_addr);
     }
+    // The FADT already points at the FACS; the XSDT lists it too because UEFI firmware rebuilds
+    // the tables from the XSDT alone (edk2's CloudHv platform) and, finding no FACS there,
+    // zeroes the FADT's pointer, which Windows refuses (ACPI_BIOS_ERROR). ACPICA skips the
+    // entry's checksum and takes the FACS from the FADT as usual.
+    xsdt_entries.push(facs_addr);
     let xsdt = build_xsdt(&xsdt_entries);
     let rsdp = build_rsdp(xsdt_addr);
 
@@ -460,6 +477,16 @@ mod tests {
     }
 
     #[test]
+    fn dsdt_declares_only_com1_and_com2() {
+        let bytes = build_dsdt(&[], None);
+        let names: Vec<&[u8]> = [&b"COM1"[..], b"COM2", b"COM3", b"COM4"]
+            .into_iter()
+            .filter(|name| bytes.windows(4).any(|w| w == *name))
+            .collect();
+        assert_eq!(names, [&b"COM1"[..], b"COM2"]);
+    }
+
+    #[test]
     fn dsdt_empty_devices() {
         let bytes = build_dsdt(&[], None);
 
@@ -515,6 +542,30 @@ mod tests {
     }
 
     #[test]
+    fn the_host_bridge_declares_the_low_bar_window() {
+        let pci_host = PciHostInfo {
+            ecam_base: 0xe000_0000,
+            bar_start: 0xe010_0000,
+            bar_size: 0x1eb0_0000,
+            functions: Vec::new(),
+            shm_window: false,
+        };
+        let bytes = build_dsdt(&[], Some(&pci_host));
+        // A DWord memory address-space descriptor (0x87, resource type 0): min at 10, max at 14.
+        let min = (PCI_MMIO32_LOW_START as u32).to_le_bytes();
+        let max = ((PCI_MMIO32_LOW_END - 1) as u32).to_le_bytes();
+        assert_eq!(
+            (PCI_MMIO32_LOW_START, PCI_MMIO32_LOW_END),
+            (0xc000_0000, 0xd000_0000)
+        );
+        assert!(
+            bytes
+                .windows(26)
+                .any(|w| w[0] == 0x87 && w[3] == 0 && w[10..14] == min && w[14..18] == max)
+        );
+    }
+
+    #[test]
     fn mcfg_contains_bus_zero_ecam_and_valid_checksum() {
         let pci_host = PciHostInfo {
             ecam_base: 0xe000_0000,
@@ -562,6 +613,10 @@ mod tests {
         assert_eq!(u64_at(132), 0x000e_1000, "X_FIRMWARE_CTRL (FACS)");
         assert_eq!(u64_at(152), u64::from(ACPI_PM_BASE), "X_PM1a_EVT_BLK");
         assert_eq!(u64_at(176), u64::from(ACPI_PM_BASE) + 4, "X_PM1a_CNT_BLK");
+        assert_eq!(u32_at(76), u32::from(ACPI_PM_BASE) + 8, "PM_TMR_BLK");
+        assert_eq!(u64_at(212), u64::from(ACPI_PM_BASE) + 8, "X_PM_TMR_BLK");
+        assert_eq!(bytes[91], 4, "PM_TMR_LEN");
+        assert_ne!(flags & (1 << 8), 0, "TMR_VAL_EXT: a 32-bit timer");
     }
 
     #[test]
@@ -655,6 +710,11 @@ mod tests {
         let mut sig = [0u8; 4];
         mem.read_slice(&mut sig, GuestAddress(facs)).unwrap();
         assert_eq!(&sig, b"FACS");
+        // UEFI firmware that rebuilds the tables from the XSDT must find it there too.
+        let mut len = [0u8; 4];
+        mem.read_slice(&mut len, GuestAddress(xsdt + 4)).unwrap();
+        let entries = (u32::from_le_bytes(len) as u64 - 36) / 8;
+        assert!((0..entries).any(|i| read_u64(xsdt + 36 + i * 8) == facs));
     }
 
     #[test]
@@ -678,9 +738,9 @@ mod tests {
         mem.read_slice(&mut xsdt_header, GuestAddress(xsdt_addr))
             .unwrap();
         let xsdt_len = u32::from_le_bytes(xsdt_header[4..8].try_into().unwrap()) as usize;
-        assert_eq!((xsdt_len - 36) / 8, 3);
+        assert_eq!((xsdt_len - 36) / 8, 4);
 
-        let mut entries = [0; 24];
+        let mut entries = [0; 32];
         mem.read_slice(&mut entries, GuestAddress(xsdt_addr + 36))
             .unwrap();
         let mcfg_addr = u64::from_le_bytes(entries[16..24].try_into().unwrap());
@@ -688,6 +748,10 @@ mod tests {
         mem.read_slice(&mut signature, GuestAddress(mcfg_addr))
             .unwrap();
         assert_eq!(&signature, b"MCFG");
+        let facs_addr = u64::from_le_bytes(entries[24..32].try_into().unwrap());
+        mem.read_slice(&mut signature, GuestAddress(facs_addr))
+            .unwrap();
+        assert_eq!(&signature, b"FACS");
     }
 
     #[test]

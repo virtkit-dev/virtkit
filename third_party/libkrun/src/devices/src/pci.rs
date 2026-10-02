@@ -113,6 +113,58 @@ impl Display for PciRootError {
 
 impl std::error::Error for PciRootError {}
 
+/// The host bridge at 00:00.0: a type-0 function that decodes nothing and only identifies the
+/// platform. It carries cloud-hypervisor's IDs (Intel vendor, device 0x0d57), the host bridge
+/// OVMF's CloudHv platform library expects there (any other ID, or none, stops the firmware in
+/// a dead loop); guest kernels take any host bridge (local patch, see VENDOR.md).
+pub struct PciHostBridge {
+    config: [u8; PCI_CONVENTIONAL_CONFIG_SPACE_SIZE],
+}
+
+impl PciHostBridge {
+    pub const VENDOR_ID: u16 = 0x8086;
+    pub const DEVICE_ID: u16 = 0x0d57;
+
+    pub fn new() -> Self {
+        let mut config = [0u8; PCI_CONVENTIONAL_CONFIG_SPACE_SIZE];
+        config[0x00..0x02].copy_from_slice(&Self::VENDOR_ID.to_le_bytes());
+        config[0x02..0x04].copy_from_slice(&Self::DEVICE_ID.to_le_bytes());
+        // Class: bridge (0x06), host bridge (0x00), programming interface 0.
+        config[0x0b] = 0x06;
+        config[0x0a] = 0x00;
+        Self { config }
+    }
+}
+
+impl Default for PciHostBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PciFunction for PciHostBridge {
+    fn read_config(&mut self, offset: u16, data: &mut [u8]) {
+        let start = usize::from(offset);
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = self
+                .config
+                .get(start + i)
+                .copied()
+                .unwrap_or(PCI_UNIMPLEMENTED_READ_BYTE);
+        }
+    }
+
+    fn write_config(&mut self, _offset: u16, _data: &[u8]) {}
+
+    fn read_bar(&mut self, _address: u64, _data: &mut [u8]) -> PciBarAccess {
+        PciBarAccess::Unhandled
+    }
+
+    fn write_bar(&mut self, _address: u64, _data: &[u8]) -> PciBarAccess {
+        PciBarAccess::Unhandled
+    }
+}
+
 #[derive(Default)]
 pub struct PciRoot {
     functions: BTreeMap<PciAddress, Arc<Mutex<dyn PciFunction>>>,
@@ -500,5 +552,29 @@ mod tests {
             value,
             [PCI_UNIMPLEMENTED_READ_BYTE; std::mem::size_of::<u32>()]
         );
+    }
+
+    #[test]
+    fn the_host_bridge_identifies_itself_and_ignores_config_writes() {
+        let root = PciRoot::shared();
+        let host_bridge = PciAddress::new(0, 0, 0);
+        root.lock()
+            .unwrap()
+            .insert(host_bridge, Arc::new(Mutex::new(PciHostBridge::new())))
+            .unwrap();
+        let mut ecam = Ecam::new(root);
+        let read = |ecam: &mut Ecam| {
+            let mut header = [0; 12];
+            ecam.read(0, host_bridge.ecam_offset(0), &mut header);
+            header
+        };
+
+        let header = read(&mut ecam);
+        assert_eq!(header[0..4], [0x86, 0x80, 0x57, 0x0d], "8086:0d57");
+        assert_eq!(header[9..12], [0x00, 0x00, 0x06], "class 06/00/00");
+
+        ecam.write(0, host_bridge.ecam_offset(0), &[0xff; 4]);
+        ecam.write(0, host_bridge.ecam_offset(8), &[0xff; 4]);
+        assert_eq!(read(&mut ecam), header);
     }
 }
