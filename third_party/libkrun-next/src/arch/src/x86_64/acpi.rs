@@ -24,7 +24,8 @@ use zerocopy::byteorder::{LE, U16, U32};
 use zerocopy::{Immutable, IntoBytes};
 
 use crate::x86_64::layout::{
-    ACPI_PM_BASE, ACPI_RESET_REG, ACPI_RESET_VALUE, HIMEM_START, RSDP_ADDR, SCI_GSI,
+    ACPI_PM_BASE, ACPI_RESET_REG, ACPI_RESET_VALUE, HIMEM_START, RSDP_ADDR, SCI_GSI, SHM_MEM_SIZE,
+    SHM_MEM_START,
 };
 
 /// Standard local APIC physical base address.
@@ -163,9 +164,19 @@ fn build_dsdt(virtio_mmio_devices: &[(u64, u32)], pci_host: Option<&PciHostInfo>
             pci_host.bar_start + pci_host.bar_size - 1,
             None,
         );
+        // The shared-memory span, where virtio-fs DAX windows live as 64-bit prefetchable BARs
+        // (RAM-backed, so cacheable): Linux keeps a BAR only where a bridge window covers it.
+        // Local patch, see VENDOR.md.
+        let shm = AddressSpace::new_memory(
+            AddressSpaceCacheable::Cacheable,
+            true,
+            SHM_MEM_START,
+            SHM_MEM_START + SHM_MEM_SIZE - 1,
+            None,
+        );
         let crs = Name::new(
             Path::new("_CRS"),
-            &ResourceTemplate::new(vec![&buses, &memory]),
+            &ResourceTemplate::new(vec![&buses, &memory, &shm]),
         );
 
         let mut prt = PackageBuilder::new();

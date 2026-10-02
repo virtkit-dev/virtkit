@@ -51,6 +51,17 @@ const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 const VIRTIO_PCI_CAP_PCI_CFG: u8 = 5;
+const VIRTIO_PCI_CAP_SHARED_MEMORY_CFG: u8 = 8;
+/// `struct virtio_pci_cap64`: the 16-byte capability plus the high halves of offset and length.
+const VIRTIO_PCI_CAP64_LENGTH: u8 = 24;
+/// The 64-bit memory BAR (BAR2 + BAR3) a shared-memory region is exposed through, and the
+/// region's id: virtio-fs's DAX cache window (`VIRTIO_FS_SHMCAP_ID_CACHE`). Local patch.
+const PCI_SHM_BAR_INDEX: u8 = 2;
+const VIRTIO_SHM_REGION_ID: u8 = 0;
+const PCI_BAR2_OFFSET: usize = 0x18;
+const PCI_BAR3_END: usize = 0x1f;
+/// A 64-bit, prefetchable memory BAR: the window is RAM-backed host memory, mapped cacheable.
+const PCI_BAR_MEMORY_64: u32 = 0b1100;
 
 const PCI_CONFIG_SIZE: usize = PCI_CONVENTIONAL_CONFIG_SPACE_SIZE;
 const PCI_BAR0_OFFSET: usize = pci_config::BAR0;
@@ -150,7 +161,12 @@ pub enum CreatePciTransportError {
     InvalidBarBase(u32),
     MissingVersion1,
     UnknownDeviceConfigLength,
-    SharedMemoryNotSupported,
+    /// A shared-memory region a BAR cannot describe: its size is not a power of two or its
+    /// base is not aligned to it.
+    UnalignedSharedMemory(u64, u64),
+    /// A shared-memory region on a device other than virtio-fs, whose region id the
+    /// capability would misreport.
+    UnsupportedSharedMemory(u32),
 }
 
 impl Display for CreatePciTransportError {
@@ -176,9 +192,14 @@ impl Display for CreatePciTransportError {
                     "virtio device did not report its configuration space length"
                 )
             }
-            Self::SharedMemoryNotSupported => {
-                write!(f, "virtio-pci shared-memory regions are not supported")
-            }
+            Self::UnalignedSharedMemory(base, size) => write!(
+                f,
+                "shared-memory region 0x{base:x}+0x{size:x} is not a naturally aligned power of two"
+            ),
+            Self::UnsupportedSharedMemory(device_type) => write!(
+                f,
+                "virtio device type {device_type} has a shared-memory region; only virtio-fs's is supported"
+            ),
         }
     }
 }
@@ -415,6 +436,10 @@ pub struct VirtioPciTransport {
     msix: Arc<Mutex<MsixConfig>>,
     msix_cap_offset: usize,
     msix_config_vector: u16,
+    /// The shared-memory region (guest base, size) BAR2 is pinned to, and whether each of
+    /// its two dwords is being size-probed.
+    shm: Option<(u64, u64)>,
+    shm_bar_probe: [bool; 2],
 }
 
 impl VirtioPciTransport {
@@ -425,7 +450,7 @@ impl VirtioPciTransport {
         intx_line: Arc<dyn PciIntxLine>,
         bar_base: u32,
     ) -> Result<Self, CreatePciTransportError> {
-        let (device_type, device_name, avail_features, device_config_len, has_shm) = {
+        let (device_type, device_name, avail_features, device_config_len, shm) = {
             let locked = device.try_lock().expect(
                 "Mutex of VirtioDevice should not be locked when creating virtio-pci transport",
             );
@@ -434,15 +459,24 @@ impl VirtioPciTransport {
                 locked.device_name().to_string(),
                 locked.avail_features(),
                 locked.config_len(),
-                locked.shm_region().is_some(),
+                locked
+                    .shm_region()
+                    .map(|region| (region.guest_addr, region.size as u64)),
             )
         };
 
         if avail_features & (1u64 << VIRTIO_F_VERSION_1) == 0 {
             return Err(CreatePciTransportError::MissingVersion1);
         }
-        if has_shm {
-            return Err(CreatePciTransportError::SharedMemoryNotSupported);
+        if shm.is_some() && device_type != super::fs::TYPE_FS {
+            return Err(CreatePciTransportError::UnsupportedSharedMemory(
+                device_type,
+            ));
+        }
+        if let Some((base, size)) = shm
+            && (!size.is_power_of_two() || base % size != 0)
+        {
+            return Err(CreatePciTransportError::UnalignedSharedMemory(base, size));
         }
         let device_config_len =
             device_config_len.ok_or(CreatePciTransportError::UnknownDeviceConfigLength)?;
@@ -474,7 +508,7 @@ impl VirtioPciTransport {
         );
         let device_interrupt = InterruptTransport::from_handler(Arc::new(interrupt.clone()));
         let (config, capabilities, pci_cfg_cap_offset, msix_cap_offset) =
-            Self::build_config(device_type, device_config_len, interrupt_line);
+            Self::build_config(device_type, device_config_len, interrupt_line, shm);
 
         Ok(Self {
             state,
@@ -491,6 +525,8 @@ impl VirtioPciTransport {
             msix,
             msix_cap_offset,
             msix_config_vector: VIRTIO_MSI_NO_VECTOR,
+            shm,
+            shm_bar_probe: [false; 2],
         })
     }
 
@@ -560,6 +596,7 @@ impl VirtioPciTransport {
         device_type: u32,
         device_config_len: u32,
         interrupt_line: u8,
+        shm: Option<(u64, u64)>,
     ) -> (PciConfigSpace, Vec<Capability>, Option<usize>, usize) {
         let mut config = PciConfigSpace::default();
         let mut capabilities = vec![
@@ -681,6 +718,29 @@ impl VirtioPciTransport {
         );
         debug_assert!(msix_cap_offset + usize::from(MSIX_CAPABILITY_LENGTH) <= PCI_CONFIG_SIZE);
 
+        // A shared-memory region: a `virtio_pci_cap64` naming BAR2, which covers it exactly.
+        if let Some((_, size)) = shm {
+            let offset = msix_cap_offset + usize::from(MSIX_CAPABILITY_LENGTH);
+            config.write_u8(msix_cap_offset + 1, offset as u8);
+            config.write_u8(
+                offset + vendor_cap::VENDOR_SPECIFIC_CAPABILITY_ID,
+                PCI_CAPABILITY_ID_VENDOR_SPECIFIC,
+            );
+            config.write_u8(offset + vendor_cap::NEXT, 0);
+            config.write_u8(offset + vendor_cap::LENGTH, VIRTIO_PCI_CAP64_LENGTH);
+            config.write_u8(
+                offset + vendor_cap::CONFIG_TYPE,
+                VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
+            );
+            config.write_u8(offset + vendor_cap::BAR, PCI_SHM_BAR_INDEX);
+            config.write_u8(offset + vendor_cap::REGION_ID, VIRTIO_SHM_REGION_ID);
+            config.write_u32(offset + vendor_cap::REGION_OFFSET, 0);
+            config.write_u32(offset + vendor_cap::REGION_LENGTH, size as u32);
+            config.write_u32(offset + 0x10, 0);
+            config.write_u32(offset + 0x14, (size >> 32) as u32);
+            debug_assert!(offset + usize::from(VIRTIO_PCI_CAP64_LENGTH) <= PCI_CONFIG_SIZE);
+        }
+
         (config, capabilities, pci_cfg_cap_offset, msix_cap_offset)
     }
 
@@ -704,8 +764,34 @@ impl VirtioPciTransport {
         }
     }
 
+    /// BAR2 (low) or BAR3 (high) of the shared-memory BAR: the pinned region's address, or
+    /// its size mask while the driver probes it; 0 for a device without one.
+    fn shm_bar_dword(&self, high: bool) -> u32 {
+        let Some((base, size)) = self.shm else {
+            return 0;
+        };
+        let (value, probing) = if high {
+            ((base >> 32) as u32, self.shm_bar_probe[1])
+        } else {
+            (base as u32 | PCI_BAR_MEMORY_64, self.shm_bar_probe[0])
+        };
+        if !probing {
+            return value;
+        }
+        let mask = !(size - 1);
+        if high {
+            (mask >> 32) as u32
+        } else {
+            (mask as u32 & PCI_BAR_ADDRESS_MASK) | PCI_BAR_MEMORY_64
+        }
+    }
+
     fn config_byte(&self, offset: usize) -> u8 {
         match offset {
+            PCI_BAR2_OFFSET..=PCI_BAR3_END => {
+                let high = offset >= PCI_BAR2_OFFSET + DWORD_SIZE;
+                self.shm_bar_dword(high).to_le_bytes()[(offset - PCI_BAR2_OFFSET) % DWORD_SIZE]
+            }
             pci_config::STATUS..=PCI_STATUS_LAST_BYTE => self
                 .config_status()
                 .to_le_bytes()
@@ -1233,6 +1319,17 @@ impl PciFunction for VirtioPciTransport {
             }
         }
 
+        // The shared-memory BAR is pinned to the region, which is guest memory already: an
+        // all-ones write starts a size probe of that dword, anything else ends it.
+        if (PCI_BAR2_OFFSET..=PCI_BAR3_END).contains(&start) {
+            if self.shm.is_some() && data.len() == DWORD_SIZE {
+                let dword = (start - PCI_BAR2_OFFSET) / DWORD_SIZE;
+                self.shm_bar_probe[dword] =
+                    u32::from_le_bytes(data.try_into().unwrap()) == PCI_BAR_PROBE_VALUE;
+            }
+            return;
+        }
+
         if start == pci_config::BAR0 && data.len() == PCI_BAR0_SIZE {
             let value = u32::from_le_bytes(data.try_into().unwrap());
             if value == PCI_BAR_PROBE_VALUE {
@@ -1400,6 +1497,7 @@ mod tests {
         acked_features: u64,
         activated: bool,
         queue_config: &'static [QueueConfig],
+        shm: Option<crate::virtio::VirtioShmRegion>,
     }
 
     impl VirtioDevice for DummyDevice {
@@ -1416,7 +1514,12 @@ mod tests {
         }
 
         fn device_type(&self) -> u32 {
-            TEST_DEVICE_TYPE
+            // A shared-memory region is only accepted on virtio-fs.
+            if self.shm.is_some() {
+                crate::virtio::fs::TYPE_FS
+            } else {
+                TEST_DEVICE_TYPE
+            }
         }
 
         fn device_name(&self) -> &str {
@@ -1456,6 +1559,10 @@ mod tests {
             self.activated
         }
 
+        fn shm_region(&self) -> Option<&crate::virtio::VirtioShmRegion> {
+            self.shm.as_ref()
+        }
+
         fn reset(&mut self) -> bool {
             self.activated = false;
             true
@@ -1474,6 +1581,7 @@ mod tests {
                 acked_features: 0,
                 activated: false,
                 queue_config,
+                shm: None,
             })),
             5,
             intx_line.clone(),
@@ -1647,6 +1755,102 @@ mod tests {
             ioevents[1].0,
             u64::from(transport.bar_base) + NOTIFY_CFG_OFFSET + u64::from(NOTIFY_OFF_MULTIPLIER)
         );
+    }
+
+    fn transport_with_shm(
+        guest_addr: u64,
+        size: usize,
+    ) -> Result<VirtioPciTransport, CreatePciTransportError> {
+        let mem =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), TEST_GUEST_MEMORY_SIZE)]).unwrap();
+        VirtioPciTransport::new(
+            mem,
+            Arc::new(Mutex::new(DummyDevice {
+                acked_features: 0,
+                activated: false,
+                queue_config: &QUEUE_CONFIG,
+                shm: Some(crate::virtio::VirtioShmRegion {
+                    host_addr: 0,
+                    guest_addr,
+                    size,
+                }),
+            })),
+            5,
+            Arc::new(DummyIntxLine::default()),
+            0,
+        )
+    }
+
+    #[test]
+    fn a_shared_memory_region_is_a_pinned_64_bit_bar2_with_its_capability() {
+        let base = 64u64 << 30;
+        let size = 8usize << 30;
+        let mut transport = transport_with_shm(base, size).unwrap();
+
+        let mut bar = [0; DWORD_SIZE];
+        read_config(&mut transport, PCI_BAR2_OFFSET as u16, &mut bar);
+        assert_eq!(u32::from_le_bytes(bar), base as u32 | PCI_BAR_MEMORY_64);
+        read_config(&mut transport, PCI_BAR2_OFFSET as u16 + 4, &mut bar);
+        assert_eq!(u32::from_le_bytes(bar), (base >> 32) as u32);
+
+        // A size probe of both dwords reads the size mask, then the BAR stays where it was.
+        let ones = u32::MAX.to_le_bytes();
+        write_config(&mut transport, PCI_BAR2_OFFSET as u16, &ones);
+        write_config(&mut transport, PCI_BAR2_OFFSET as u16 + 4, &ones);
+        read_config(&mut transport, PCI_BAR2_OFFSET as u16, &mut bar);
+        let lo = u32::from_le_bytes(bar);
+        read_config(&mut transport, PCI_BAR2_OFFSET as u16 + 4, &mut bar);
+        let hi = u32::from_le_bytes(bar);
+        let mask = (u64::from(hi) << 32) | u64::from(lo & PCI_BAR_ADDRESS_MASK);
+        assert_eq!(!mask + 1, size as u64);
+        write_config(
+            &mut transport,
+            PCI_BAR2_OFFSET as u16,
+            &(base as u32).to_le_bytes(),
+        );
+        write_config(
+            &mut transport,
+            PCI_BAR2_OFFSET as u16 + 4,
+            &((base >> 32) as u32).to_le_bytes(),
+        );
+        read_config(&mut transport, PCI_BAR2_OFFSET as u16 + 4, &mut bar);
+        assert_eq!(u32::from_le_bytes(bar), (base >> 32) as u32);
+
+        let cap = usize::from(
+            transport
+                .config
+                .read_u8(transport.msix_cap_offset + 1)
+                .unwrap(),
+        );
+        assert_ne!(cap, 0, "the shared-memory capability follows MSI-X");
+        assert_eq!(
+            transport.config.read_u8(cap + vendor_cap::CONFIG_TYPE),
+            Some(VIRTIO_PCI_CAP_SHARED_MEMORY_CFG)
+        );
+        assert_eq!(
+            transport.config.read_u8(cap + vendor_cap::BAR),
+            Some(PCI_SHM_BAR_INDEX)
+        );
+        assert_eq!(
+            transport.config.read_u32(cap + vendor_cap::REGION_LENGTH),
+            Some(0)
+        );
+        assert_eq!(
+            transport.config.read_u32(cap + 0x14),
+            Some((size >> 32) as u32)
+        );
+    }
+
+    #[test]
+    fn a_shared_memory_region_a_bar_cannot_describe_is_refused() {
+        assert!(matches!(
+            transport_with_shm(64 << 30, 3 << 20),
+            Err(CreatePciTransportError::UnalignedSharedMemory(..))
+        ));
+        assert!(matches!(
+            transport_with_shm((64 << 30) + (1 << 20), 2 << 20),
+            Err(CreatePciTransportError::UnalignedSharedMemory(..))
+        ));
     }
 
     #[test]

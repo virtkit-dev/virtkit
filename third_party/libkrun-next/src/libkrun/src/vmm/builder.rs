@@ -226,8 +226,8 @@ pub enum StartMicrovmError {
     /// PCI devices require ACPI discovery.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     PciRequiresAcpi,
-    /// PCI shared-memory capabilities are not implemented yet.
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    /// The GPU's shared-memory region cannot be exposed over virtio-pci yet.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "gpu"))]
     PciSharedMemoryNotSupported,
     /// Cannot attest the VM in the Secure Virtualization context.
     SecureVirtAttest(VstateError),
@@ -505,9 +505,9 @@ impl Display for StartMicrovmError {
             RegisterPciDevice(ref err) => write!(f, "Cannot register PCI device: {err}"),
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             PciRequiresAcpi => write!(f, "PCI devices require ACPI to be enabled"),
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "gpu"))]
             PciSharedMemoryNotSupported => {
-                write!(f, "PCI shared-memory regions are not supported yet")
+                write!(f, "the GPU shared-memory region is not supported over PCI yet")
             }
             SecureVirtAttest(ref err) => {
                 let mut err_msg = format!("{err}");
@@ -744,14 +744,8 @@ pub fn build_microvm(
     };
 
     let requirements = device_manager.requirements();
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    if pci_enabled
-        && requirements
-            .iter()
-            .any(|requirements| requirements.shm_size.is_some())
-    {
-        return Err(StartMicrovmError::PciSharedMemoryNotSupported);
-    }
+    // virtio-fs windows are placed where a PCI BAR can describe them (ShmManager); the GPU
+    // region is not, so it stays MMIO-only (local patch, see VENDOR.md).
     #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "gpu"))]
     if pci_enabled
         && requirements
