@@ -35,3 +35,9 @@ pins libc 0.2.183; the patch is for the root workspace's lock (0.2.189 when vend
 builds the tree once vk-driver links it. `struct statx` is fixed by the kernel UAPI, so the
 module mirrors it and calls `SYS_statx`; behaviour, including the returned `stx_mnt_id`, is
 unchanged; a const assertion pins the struct at the UAPI's 256 bytes.
+
+`src/devices/src/virtio/descriptor_utils.rs` — clamp the final descriptor in
+`DescriptorChainConsumer::consume`, forward-ported from the 1.19 tree. Its contract is that
+the slices handed to the callback total `<= count`, but it pushed the last descriptor whole,
+so a vectored disk read (`Writer::write_from_at`) filled past `count` into guest memory the
+driver never asked for. Covered by `write_from_at_must_not_overread_past_count`.
