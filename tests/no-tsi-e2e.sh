@@ -6,10 +6,6 @@ set -euo pipefail
 
 VK=$(command -v "${VK:-./dist/vk}" || true)
 [ -n "$VK" ] && [ -x "$VK" ] || { echo "no usable vk (build one: ./build.sh --fast)"; exit 2; }
-if [ "${VIRTKIT_VMM:-libkrun}" != "libkrun" ]; then
-  echo "SKIP: TSI is libkrun-only (VIRTKIT_VMM=${VIRTKIT_VMM:-})"
-  exit 0
-fi
 IMAGE=${IMAGE:-docker.io/library/alpine:3.21}
 timeout -k 30 300 "$VK" run "$IMAGE" -- \
   sh -ec 'cat /proc/cmdline; ! grep -qw tsi_hijack /proc/cmdline'

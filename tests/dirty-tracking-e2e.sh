@@ -16,7 +16,7 @@
 #      case that surfaced the original corruption) and fsck clean.
 #
 # A dropped write surfaces as the fatal gap abort or a corrupt restored ext4 — either fails
-# this test. Dirty tracking is libkrun-only; the check is a no-op on cloud-hypervisor.
+# this test.
 #
 # VK must be a `vk` built from the current tree with an embedded kernel/agent (a dev build
 # has neither — build one, or use ./dist/vk once refreshed):
@@ -34,10 +34,6 @@ CTX="$WORK/ctx"
 trap 'rm -rf "$WORK"' EXIT
 
 command -v e2fsck >/dev/null || { echo "need e2fsck (e2fsprogs)"; exit 2; }
-if [ "${VIRTKIT_VMM:-libkrun}" != "libkrun" ]; then
-  echo "SKIP: dirty-tracking is libkrun-only (VIRTKIT_VMM=${VIRTKIT_VMM:-})"
-  exit 0
-fi
 
 fsck_clean() { # <ext4> <label>
   if ! e2fsck -fn "$1" > "$WORK/fsck.log" 2>&1; then

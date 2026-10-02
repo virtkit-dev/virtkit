@@ -24,10 +24,6 @@ CACHE="$WORK/cache"
 trap 'rm -rf "$WORK"' EXIT
 
 command -v e2fsck >/dev/null || { echo "need e2fsck (e2fsprogs)"; exit 2; }
-if [ "${VIRTKIT_VMM:-libkrun}" != "libkrun" ]; then
-  echo "SKIP: dirty-tracking is libkrun-only (VIRTKIT_VMM=${VIRTKIT_VMM:-})"
-  exit 0
-fi
 
 # write -> delete -> reallocate, so each checkpoint's fstrim discards the previous step's file
 # (a large freed region) that the next step reallocates. `sync` inside each RUN pushes the writes

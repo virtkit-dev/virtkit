@@ -20,11 +20,6 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/vk-dirty-reboot.XXXXXX")
 CACHE="$WORK/cache"
 trap 'rm -rf "$WORK"' EXIT
 
-if [ "${VIRTKIT_VMM:-libkrun}" != "libkrun" ]; then
-  echo "SKIP: dirty-tracking is libkrun-only (VIRTKIT_VMM=${VIRTKIT_VMM:-})"
-  exit 0
-fi
-
 {
   echo "FROM debian:bookworm-slim AS base"
   for i in $(seq 1 "$SRC"); do

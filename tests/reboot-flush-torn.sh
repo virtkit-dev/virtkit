@@ -24,10 +24,6 @@ CACHE="$WORK/cache"
 trap 'rm -rf "$WORK"' EXIT
 
 command -v e2fsck >/dev/null || { echo "need e2fsck (e2fsprogs)"; exit 2; }
-if [ "${VIRTKIT_VMM:-libkrun}" != "libkrun" ]; then
-  echo "SKIP: libkrun-only (VIRTKIT_VMM=${VIRTKIT_VMM:-})"
-  exit 0
-fi
 
 {
   echo "FROM debian:bookworm-slim AS base"

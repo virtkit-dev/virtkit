@@ -15,10 +15,6 @@
 set -euo pipefail
 
 VK="${VK:-vk}"
-if [ "${VIRTKIT_VMM:-libkrun}" != "libkrun" ]; then
-  echo "SKIP: full-VM boot is libkrun-only (VIRTKIT_VMM=${VIRTKIT_VMM:-})"
-  exit 0
-fi
 here="$(cd "$(dirname "$0")" && pwd)"
 df="$here/entrypoint-init/Dockerfile"
 ctx="$here/entrypoint-init"

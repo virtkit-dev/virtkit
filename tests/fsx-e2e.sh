@@ -6,8 +6,6 @@
 #   - libkrun, dax=off   — the in-process fs engine, plain FUSE_READ/WRITE.
 #   - libkrun, dax=8G    — the same engine with a DAX window: reads and in-place writes go
 #                          through host mappings set up per inode (FUSE_SETUPMAPPING).
-#   - cloud-hypervisor   — the same engine behind the bundled `vk virtiofsd` vhost-user
-#                          daemon (no DAX). Skipped when no cloud-hypervisor binary is found.
 #
 # The two programs:
 #   - fsxmini: random pwrite / pread / mmap-write / mmap-read / ftruncate against an
@@ -199,14 +197,14 @@ guest="/work/perm /work/pk && /work/fsxmini 1 $FSX_OPS $FSX_MAXLEN /work/tf"
 names=()
 results=()
 failed=0
-mode() { # <label> <env assignment or ''> <extra vk run args...>
-  local label=$1 envassign=$2
-  shift 2
+mode() { # <label> <extra vk run args...>
+  local label=$1
+  shift
   names+=("$label")
   echo
   echo "################ $label"
   rm -f "$work"/tf "$work"/pk
-  if timeout -k 30 "$STEP_TIMEOUT" env ${envassign:+"$envassign"} "$VK" run "$FSX_IMAGE" \
+  if timeout -k 30 "$STEP_TIMEOUT" "$VK" run "$FSX_IMAGE" \
       --workdir "$work" "$@" -- sh -c "$guest"; then
     results+=("ok")
   else
@@ -215,16 +213,8 @@ mode() { # <label> <env assignment or ''> <extra vk run args...>
   fi
 }
 
-mode "libkrun dax=off"  ""                 --dax off
-mode "libkrun dax=8G"   ""                 --dax 8G
-if command -v cloud-hypervisor >/dev/null 2>&1; then
-  mode "cloud-hypervisor" "VIRTKIT_VMM=ch"
-else
-  names+=("cloud-hypervisor")
-  results+=("skip: no cloud-hypervisor on PATH")
-  echo
-  echo "################ cloud-hypervisor — skipped (no cloud-hypervisor on PATH)"
-fi
+mode "libkrun dax=off" --dax off
+mode "libkrun dax=8G"  --dax 8G
 
 echo
 echo "################ results"
