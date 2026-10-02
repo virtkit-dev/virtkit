@@ -2,11 +2,13 @@
 use crossbeam_channel::Sender;
 use std::cmp;
 use std::io::Write;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::mem::size_of;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
 use virtio_bindings::{virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX};
@@ -16,12 +18,13 @@ use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, FsError, QueueConfig, VirtioDevice,
     VirtioShmRegion,
 };
+use super::ExportTable;
 use super::passthrough;
 use super::virtual_entry::VirtualDirEntry;
 use super::worker::FsWorker;
-use super::ExportTable;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
+use crate::virtio::passthrough::PermissionSemantics;
 
 #[derive(Copy, Clone)]
 #[repr(C, packed)]
@@ -46,12 +49,13 @@ pub struct Fs {
     acked_features: u64,
     device_state: DeviceState,
     config: VirtioFsConfig,
+    allow_idmap: bool,
     shm_region: Option<VirtioShmRegion>,
     passthrough_cfg: Option<passthrough::Config>,
     read_only: bool,
     uid_map: Vec<String>,
     gid_map: Vec<String>,
-    virtual_entries: Vec<VirtualDirEntry>,
+    virtual_entries: Vec<VirtualDirEntry<'static>>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
     exit_code: Arc<AtomicI32>,
@@ -60,23 +64,13 @@ pub struct Fs {
 }
 
 impl Fs {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         fs_id: String,
+        semantics: PermissionSemantics,
         shared_dir: Option<String>,
         exit_code: Arc<AtomicI32>,
         read_only: bool,
-        uid_map: Vec<String>,
-        gid_map: Vec<String>,
-        virtual_entries: Vec<VirtualDirEntry>,
-        cache_policy: passthrough::CachePolicy,
-        entry_timeout_ms: u32,
-        attr_timeout_ms: u32,
-        negative_timeout_ms: u32,
-        xattr: bool,
-        dax_inode_min: Option<u64>,
-        writeback: bool,
-        no_sync: bool,
+        virtual_entries: Vec<VirtualDirEntry<'static>>,
     ) -> super::Result<Fs> {
         let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_RING_F_EVENT_IDX);
 
@@ -85,29 +79,34 @@ impl Fs {
         config.tag[..tag.len()].copy_from_slice(tag.as_slice());
         config.num_request_queues = 1;
 
+        let attr_timeout = if matches!(semantics, PermissionSemantics::LinuxSimplified) {
+            // As uid/gid are context-dependent, attributes can't be cached.
+            Duration::from_secs(0)
+        } else {
+            // The value defined as default in virtio-fs.
+            Duration::from_secs(5)
+        };
+
         let fs_cfg = shared_dir.map(|root_dir| passthrough::Config {
             root_dir,
-            cache_policy,
-            entry_timeout: std::time::Duration::from_millis(entry_timeout_ms.into()),
-            attr_timeout: std::time::Duration::from_millis(attr_timeout_ms.into()),
-            negative_timeout: std::time::Duration::from_millis(negative_timeout_ms.into()),
-            xattr,
-            dax_inode_min,
-            writeback,
-            no_sync,
+            semantics,
+            attr_timeout,
             ..Default::default()
         });
+
+        let allow_idmap = matches!(semantics, PermissionSemantics::LinuxComplete);
 
         Ok(Fs {
             avail_features,
             acked_features: 0,
             device_state: DeviceState::Inactive,
             config,
+            allow_idmap,
             shm_region: None,
             passthrough_cfg: fs_cfg,
             read_only,
-            uid_map,
-            gid_map,
+            uid_map: Vec::new(),
+            gid_map: Vec::new(),
             virtual_entries,
             worker_thread: None,
             worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(FsError::EventFd)?,
@@ -119,6 +118,20 @@ impl Fs {
 
     pub fn id(&self) -> &str {
         defs::FS_DEV_ID
+    }
+
+    /// Map the guest's UIDs and GIDs through virtiofsd-style `--uid-map`/`--gid-map` rules
+    /// (`map:`, `squash-guest:`, `forbid-guest:`, …; see `idmap`). Empty maps, the default,
+    /// serve ids unchanged. Takes effect at activation. Local patch, see VENDOR.md.
+    pub fn set_id_maps(&mut self, uid_map: Vec<String>, gid_map: Vec<String>) {
+        self.uid_map = uid_map;
+        self.gid_map = gid_map;
+    }
+
+    /// The passthrough options of a share backed by a host path (`None` for a null share),
+    /// to adjust before activation. Local patch, see VENDOR.md.
+    pub fn passthrough_config_mut(&mut self) -> Option<&mut passthrough::Config> {
+        self.passthrough_cfg.as_mut()
     }
 
     pub fn set_shm_region(&mut self, shm_region: VirtioShmRegion) {
@@ -138,6 +151,14 @@ impl Fs {
         cfg.export_table = Some(export_table);
 
         cfg.export_fsid
+    }
+
+    pub fn add_virtual_entry(&mut self, entry: VirtualDirEntry<'static>) {
+        self.virtual_entries.push(entry);
+    }
+
+    pub fn set_exit_code(&mut self, exit_code: Arc<AtomicI32>) {
+        self.exit_code = exit_code;
     }
 
     #[cfg(target_os = "macos")]
@@ -169,6 +190,10 @@ impl VirtioDevice for Fs {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &defs::QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<VirtioFsConfig>() as u32)
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
@@ -217,6 +242,7 @@ impl VirtioDevice for Fs {
             queue_evts,
             interrupt.clone(),
             mem.clone(),
+            self.allow_idmap,
             self.shm_region.clone(),
             self.passthrough_cfg.clone(),
             self.read_only,

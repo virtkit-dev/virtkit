@@ -1,9 +1,12 @@
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
+#[cfg(target_os = "windows")]
+use utils::windows::AsRawFd;
 
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 
-use super::device::{Rng, REQ_INDEX};
+use super::device::{REQ_INDEX, Rng};
 use crate::virtio::device::VirtioDevice;
 
 impl Rng {

@@ -14,10 +14,10 @@ depends on it by path instead of the crates.io release.
 ## Feature selection
 
 `third_party/libkrun/src/devices` builds imago with `default-features = false, features =
-["sync"]`, not the default `async` (+ `sync-wrappers` for a blocking API on top of it). The
-virtio-blk worker (`block/worker.rs`) is a single-threaded epoll loop that pulls one virtqueue
-descriptor at a time and blocks on it synchronously — there is no batching or queue depth, so
-nothing in that path benefits from async scheduling. `sync-wrappers` (what the code used before)
+["sync", "vm-memory"]`, not the default `async` (+ `sync-wrappers` for a blocking API on top
+of it). The virtio-blk worker (`block/worker.rs`) runs each request of a batch on a scoped
+thread that blocks on imago synchronously, so nothing in that path benefits from async
+scheduling. `sync-wrappers` (what the code used before)
 still built the full `async` implementation and drove every `readv`/`writev` through a
 `tokio::runtime::Runtime::block_on()` call — pure per-request overhead for zero concurrency
 gain. `sync` (`maybe-async/is_sync`) compiles the same logic as plain, non-async `fn`s with no
@@ -39,11 +39,10 @@ instead. Every `_sync`-suffixed method (`open_sync`, `open_image_sync`,
 runtime — so the call sites that used to have a trailing `?` after `SyncFormatAccess::new(...)`
 lost it.
 
-`third_party/libkrun-next/src/devices` also enables `vm-memory`, which `Cargo.toml` (a local
-patch) narrows from `>=0.16, <0.19` to `0.18`: its `IoVector::from_volatile_slice` calls need
-0.18's `VolatileSlice`. Once vk-driver links that tree, the wide range would unify with the
-0.17.1 `third_party/libkrun` pins for its own use, and the 2.0 block device would not compile
-inside vk-driver.
+`vm-memory` is narrowed by `Cargo.toml` (a local patch) from `>=0.16, <0.19` to `0.18`: the
+block device's `IoVector::from_volatile_slice` calls need 0.18's `VolatileSlice`. The removed
+1.19 tree pinned 0.17.1, which the wide range let the root workspace unify down to; the
+narrowing stays so no future pin can do that again.
 
 ## Local patches
 

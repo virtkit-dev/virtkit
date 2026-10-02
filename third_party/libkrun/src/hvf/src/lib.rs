@@ -1,6 +1,8 @@
 // Copyright 2021 Red Hat, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg(target_os = "macos")]
+
 #[allow(non_camel_case_types)]
 #[allow(improper_ctypes)]
 #[allow(dead_code)]
@@ -16,17 +18,19 @@ use bindings::*;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::asm;
+use std::cell::Cell;
 
 use std::convert::TryInto;
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use arch::ArchMemoryInfo;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-use arch::aarch64::sysreg::{sys_reg_name, SYSREG_MASK};
+use arch::aarch64::sysreg::{SYSREG_MASK, sys_reg_name};
 use log::debug;
 
-extern "C" {
+unsafe extern "C" {
     pub fn mach_absolute_time() -> u64;
 }
 
@@ -104,6 +108,10 @@ const EC_AA64_BKPT: u64 = 0x3c;
 pub enum Error {
     EnableEL2,
     FindSymbol(libloading::Error),
+    IpaGetDefault,
+    IpaGetMaximum,
+    IpaSet,
+    IpaTooLow,
     MemoryMap,
     MemoryUnmap,
     NestedCheck,
@@ -126,7 +134,14 @@ impl Display for Error {
 
         match self {
             EnableEL2 => write!(f, "Error enabling EL2 mode in HVF"),
-            FindSymbol(ref err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
+            FindSymbol(err) => write!(f, "Couldn't find symbol in HVF library: {err}"),
+            IpaGetDefault => write!(f, "Error getting IPA default value"),
+            IpaGetMaximum => write!(f, "Error getting IPA maximum value"),
+            IpaSet => write!(f, "Error setting IPA value"),
+            IpaTooLow => write!(
+                f,
+                "The VM requires an IPA larger than the maximum supported in this system"
+            ),
             MemoryMap => write!(f, "Error registering memory region in HVF"),
             MemoryUnmap => write!(f, "Error unregistering memory region in HVF"),
             NestedCheck => write!(
@@ -238,7 +253,7 @@ static HVF: LazyLock<libloading::Library> = LazyLock::new(|| unsafe {
 });
 
 impl HvfVm {
-    pub fn new(nested_enabled: bool) -> Result<Self, Error> {
+    pub fn new(arch_mem_info: &mut ArchMemoryInfo, nested_enabled: bool) -> Result<Self, Error> {
         let config = unsafe { hv_vm_config_create() };
         if nested_enabled {
             let set_el2_enabled: libloading::Symbol<
@@ -253,6 +268,36 @@ impl HvfVm {
             if ret != HV_SUCCESS {
                 return Err(Error::EnableEL2);
             }
+        }
+
+        let mut ipa_size_default: u32 = 0;
+        let ret = unsafe { hv_vm_config_get_default_ipa_size(&mut ipa_size_default as *mut _) };
+        if ret != HV_SUCCESS {
+            return Err(Error::IpaGetDefault);
+        }
+
+        let mut ipa_size_max: u32 = 0;
+        let ret = unsafe { hv_vm_config_get_max_ipa_size(&mut ipa_size_max as *mut _) };
+        if ret != HV_SUCCESS {
+            return Err(Error::IpaGetMaximum);
+        }
+
+        let mut ipa_size = ipa_size_default;
+        // If the guest's last address is beyond the 64GB line, we need a 40-bit (or larger) IPA.
+        if arch_mem_info.guest_last_addr > 64 * 1024 * 1024 * 1024 {
+            if ipa_size_max < 40 {
+                return Err(Error::IpaTooLow);
+            }
+            ipa_size = ipa_size_max;
+        }
+
+        let ret = unsafe { hv_vm_config_set_ipa_size(config, ipa_size) };
+        if ret != HV_SUCCESS {
+            return Err(Error::IpaSet);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            arch_mem_info.ipa_size = ipa_size;
         }
 
         let ret = unsafe { hv_vm_create(config) };
@@ -328,12 +373,15 @@ pub struct HvfVcpu<'a> {
     pending_advance_pc: bool,
     vtimer_masked: bool,
     nested_enabled: bool,
+    // Cached copy of the HVF vtimer offset (0 until a live pause advances it),
+    // so the WFE deadline check doesn't issue a syscall on every wait.
+    vtimer_offset: Cell<u64>,
 }
 
 impl HvfVcpu<'_> {
     pub fn new(mpidr: u64, nested_enabled: bool) -> Result<Self, Error> {
         let mut vcpuid: hv_vcpu_t = 0;
-        let vcpu_exit_ptr: *mut hv_vcpu_exit_t = std::ptr::null_mut();
+        let mut vcpu_exit_ptr: *mut hv_vcpu_exit_t = std::ptr::null_mut();
 
         #[cfg(target_arch = "aarch64")]
         let cntfrq = {
@@ -349,7 +397,7 @@ impl HvfVcpu<'_> {
         let ret = unsafe {
             hv_vcpu_create(
                 &mut vcpuid,
-                &vcpu_exit_ptr as *const _ as *mut *mut _,
+                &mut vcpu_exit_ptr as *mut *mut _,
                 std::ptr::null_mut(),
             )
         };
@@ -375,10 +423,49 @@ impl HvfVcpu<'_> {
             pending_advance_pc: false,
             vtimer_masked: false,
             nested_enabled,
+            vtimer_offset: Cell::new(0),
         })
     }
 
-    pub fn set_initial_state(&self, entry_addr: u64, fdt_addr: u64) -> Result<(), Error> {
+    pub fn set_initial_state(
+        &self,
+        ipa_size: u32,
+        entry_addr: u64,
+        fdt_addr: u64,
+    ) -> Result<(), Error> {
+        // Set IPA size on MMFR0
+        let ipa_index: u8 = match ipa_size {
+            36 => 1,
+            40 => 2,
+            42 => 3,
+            44 => 4,
+            48 => 5,
+            52 => 6,
+            56 => 7,
+            _ => return Err(Error::VcpuInitialRegisters),
+        };
+        let mut val: u64 = 0;
+        let ret = unsafe {
+            hv_vcpu_get_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64MMFR0_EL1,
+                &mut val as *mut _,
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuInitialRegisters);
+        }
+        let ret = unsafe {
+            hv_vcpu_set_sys_reg(
+                self.vcpuid,
+                hv_sys_reg_t_HV_SYS_REG_ID_AA64MMFR0_EL1,
+                (val & !0xf) | (ipa_index as u64),
+            )
+        };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuInitialRegisters);
+        }
+
         if self.nested_enabled {
             let ret = unsafe {
                 hv_vcpu_set_reg(self.vcpuid, hv_reg_t_HV_REG_CPSR, PSTATE_EL2_FAULT_BITS_64)
@@ -406,12 +493,12 @@ impl HvfVcpu<'_> {
             }
 
             // Enable EL2 and GICv3 in ID_AA64PFR0_EL1
-            let val: u64 = 0;
+            let mut val: u64 = 0;
             let ret = unsafe {
                 hv_vcpu_get_sys_reg(
                     self.vcpuid,
                     hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR0_EL1,
-                    &val as *const _ as *mut _,
+                    &mut val as *mut _,
                 )
             };
             if ret != HV_SUCCESS {
@@ -430,12 +517,12 @@ impl HvfVcpu<'_> {
 
             // If SME is enabled in ID_AA64PFR1_EL1 in the VM, the guest will
             // break after enabling the MMU. Mask it out.
-            let val: u64 = 0;
+            let mut val: u64 = 0;
             let ret = unsafe {
                 hv_vcpu_get_sys_reg(
                     self.vcpuid,
                     hv_sys_reg_t_HV_SYS_REG_ID_AA64PFR1_EL1,
-                    &val as *const _ as *mut _,
+                    &mut val as *mut _,
                 )
             };
             if ret != HV_SUCCESS {
@@ -478,8 +565,8 @@ impl HvfVcpu<'_> {
     }
 
     fn read_reg(&self, reg: u32) -> Result<u64, Error> {
-        let val: u64 = 0;
-        let ret = unsafe { hv_vcpu_get_reg(self.vcpuid, reg, &val as *const _ as *mut _) };
+        let mut val: u64 = 0;
+        let ret = unsafe { hv_vcpu_get_reg(self.vcpuid, reg, &mut val as *mut _) };
         if ret != HV_SUCCESS {
             Err(Error::VcpuReadRegister)
         } else {
@@ -497,13 +584,29 @@ impl HvfVcpu<'_> {
     }
 
     fn read_sys_reg(&self, reg: u16) -> Result<u64, Error> {
-        let val: u64 = 0;
-        let ret = unsafe { hv_vcpu_get_sys_reg(self.vcpuid, reg, &val as *const _ as *mut _) };
+        let mut val: u64 = 0;
+        let ret = unsafe { hv_vcpu_get_sys_reg(self.vcpuid, reg, &mut val as *mut _) };
         if ret != HV_SUCCESS {
             Err(Error::VcpuReadSystemRegister)
         } else {
             Ok(val)
         }
+    }
+
+    /// Freeze the guest's CNTVCT across a live pause. The guest virtual counter
+    /// is `mach_absolute_time() - vtimer_offset`; while paused the host counter
+    /// keeps advancing, so on resume we add the ticks spent paused to the offset.
+    /// The guest's counter then resumes where it stopped and armed deadlines stay
+    /// in the near future instead of firing en masse to catch up the gap.
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    pub fn advance_vtimer_offset(&self, paused_ticks: u64) -> Result<(), Error> {
+        let offset = self.vtimer_offset.get().wrapping_add(paused_ticks);
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.vcpuid, offset) };
+        if ret != HV_SUCCESS {
+            return Err(Error::VcpuSetRegister);
+        }
+        self.vtimer_offset.set(offset);
+        Ok(())
     }
 
     fn hvf_sync_vtimer(&mut self, vcpu_list: Arc<dyn Vcpus>) {
@@ -553,21 +656,21 @@ impl HvfVcpu<'_> {
     pub fn run(&mut self, vcpu_list: Arc<dyn Vcpus>) -> Result<VcpuExit<'_>, Error> {
         let pending_irq = vcpu_list.has_pending_irq(self.vcpuid);
 
-        if let Some(mmio_read) = self.pending_mmio_read.take() {
-            if mmio_read.srt < 31 {
-                let val = match mmio_read.len {
-                    1 => u8::from_le_bytes(self.mmio_buf[0..1].try_into().unwrap()) as u64,
-                    2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
-                    4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
-                    8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
-                    _ => panic!(
-                        "unsupported mmio pa={} len={}",
-                        mmio_read.addr, mmio_read.len
-                    ),
-                };
+        if let Some(mmio_read) = self.pending_mmio_read.take()
+            && mmio_read.srt < 31
+        {
+            let val = match mmio_read.len {
+                1 => u8::from_le_bytes(self.mmio_buf[0..1].try_into().unwrap()) as u64,
+                2 => u16::from_le_bytes(self.mmio_buf[0..2].try_into().unwrap()) as u64,
+                4 => u32::from_le_bytes(self.mmio_buf[0..4].try_into().unwrap()) as u64,
+                8 => u64::from_le_bytes(self.mmio_buf[0..8].try_into().unwrap()),
+                _ => panic!(
+                    "unsupported mmio pa={} len={}",
+                    mmio_read.addr, mmio_read.len
+                ),
+            };
 
-                self.write_reg(mmio_read.srt, val)?;
-            }
+            self.write_reg(mmio_read.srt, val)?;
         }
 
         if self.pending_advance_pc {
@@ -712,7 +815,15 @@ impl HvfVcpu<'_> {
 
                 // Also CNTV_CVAL & CNTV_CVAL_EL0
                 let cval = self.read_sys_reg(hv_sys_reg_t_HV_SYS_REG_CNTV_CVAL_EL0)?;
-                let now = unsafe { mach_absolute_time() };
+                // The guest's deadline `cval` is in the CNTVCT domain, where
+                // CNTVCT = mach_absolute_time() - vtimer_offset. The offset is 0
+                // on a fresh boot but nonzero after a live pause (it keeps CNTVCT
+                // continuous across the paused interval). Compare against the
+                // corrected counter, not raw mach time — otherwise after a pause
+                // `now` runs ahead of every armed deadline and the vCPU busy-loops
+                // on WaitForEventExpired instead of parking, so the guest's virtual
+                // timer never fires and timed sleeps hang.
+                let now = unsafe { mach_absolute_time() }.saturating_sub(self.vtimer_offset.get());
                 if now > cval {
                     return Ok(VcpuExit::WaitForEventExpired);
                 }

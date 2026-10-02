@@ -1,388 +1,98 @@
-# Vendored libkrun
+# Vendored libkrun 2.0 (development branch)
 
-Source: https://github.com/containers/libkrun
-Revision: `9a8fedc7fa425a36ae978d529a6c0dc7124efe7d` (stable-1.19.x, carries PR #728)
+Source: https://github.com/libkrun/libkrun (formerly `containers/libkrun`)
+Revision: `97a914ee06210fa2553b2ab75493bf6e8888910e` (`main`, version 2.0.0-dev), plus
+upstream PR #875 (modern virtio-pci transport and the PCI host bridge in ACPI) at `cfb03d6`
+(base `e66cad1`), its eight commits cherry-picked onto that revision.
 
-Only the Rust sources are vendored: `Cargo.toml`, `Cargo.lock`, `LICENSE`, and
-`src/`. Everything else upstream is dropped (the `libkrun` crate does not need it for
-the `blk` + `net` Linux build virtkit uses). Note that this includes `init/`, the C
-sources compiled by the build script of the `init-blob` default feature — so the crate
-builds only with `--no-default-features --features blk,net`; a plain `cargo build` in
-this workspace fails in `init_blob`'s build script.
-
-This is its own cargo workspace, excluded from the root virtkit workspace. The host
-crate will depend on `src/libkrun` (package `libkrun`, lib name `krun`) as a path
-dependency, so it shares virtkit's `std` — avoiding the double-std / broken-unwinding
-that a static `libkrun.a` link hits.
+vk-driver drives it through the 2.0 Rust API (`src/libkrun_sys.rs`). It replaced a
+stable-1.19.x tree (`9a8fedc` with PR #728) whose patches are carried forward below, or listed
+under "Not carried from the 1.19 tree". Only the Rust sources are vendored: `Cargo.toml`,
+`Cargo.lock`, `LICENSE` and `src/`. It is its own cargo workspace, excluded from the root
+virtkit workspace.
 
 ## Local patches
 
-`src/devices/src/virtio/fs/{idmap.rs,mod.rs,worker.rs}` + `src/vmm/src/vmm_config/fs.rs`
-+ `src/vmm/src/builder.rs` + `src/libkrun/src/lib.rs` — UID/GID mapping for virtio-fs
-shares. A new `idmap` module (soft, virtiofsd `--uid-map`/`--gid-map`-compatible: `map:`,
-`squash-guest:`, `forbid-guest:`, …) wraps `PassthroughFs` inside `AugmentFs` when a map is
-configured; `FsDeviceConfig` carries the maps and `krun_add_virtiofs4(…, uid_map, gid_map)`
-sets them (`krun_add_virtiofs3` delegates with none).
-Additive: with no map, behaviour is unchanged. Used by virtkit to squash the GitLab
-`host_checkout` share onto the host runner user so a non-root job can write it.
+`Cargo.toml` (workspace) — drop the `init/init-blob` and `bindings/*` members, which are not
+vendored and depend on the `ffier` git crate, and the `examples/gtk_display` and
+`init/init-binary` excludes, which are not vendored either. Exclude `src/display` and
+`src/input` from the members: they stay reachable as optional path dependencies of the
+`gpu`/`input`/`vhost-user` features, but as members a plain workspace build or clippy would
+run their bindgen.
 
-`src/vmm/src/vmm_config/fs.rs` + `src/devices/src/virtio/fs/device.rs` + `src/vmm/src/builder.rs`
-+ `src/libkrun/src/lib.rs` — per-share cache policy and validity. `FsDeviceConfig` carries
-`cache_policy` (the passthrough engine's `never`/`auto`/`always`) and `entry_timeout_ms` /
-`attr_timeout_ms` beside the existing `negative_timeout_ms`, and `Fs::new` puts them into the
-passthrough `Config` that until now always used its defaults (auto, 5 s, 5 s).
-`FsDeviceConfig` also carries `xattr`, the passthrough option that decides whether the share
-serves extended attributes at all (`false` answers every xattr request `ENOSYS`, and
-`fuse_getxattr`/`fuse_listxattr` in fs/fuse/xattr.c then set `no_getxattr`/`no_listxattr` and
-send no more for the life of the mount).
-`krun_add_virtiofs6(…, cache_policy, entry_timeout_ms, attr_timeout_ms, negative_timeout_ms,
-xattr)` sets them (`KRUN_FS_CACHE_*` codes); `krun_add_virtiofs5` delegates with the defaults,
-so every earlier entry point behaves as before. Used by virtkit for shares whose host tree is
-read-only for the VM's life (a job's checkout behind its overlay): `always` with day-long
-validity, so a tree-wide pass round-trips once.
+`src/libkrun/Cargo.toml` + `src/devices/Cargo.toml` — drop the `ffier`/`ffier-builtins` git
+dependencies: Cargo locks optional dependencies too, so they would fetch a git repository
+into an offline, reproducible build. `devices`' `ffi` feature stays, empty, and `libkrun`'s
+keeps its non-ffier members (`serde_json`, `devices/ffi`), so the code they gate still parses
+as a known cfg; nothing enables them, and enabling them no longer builds. `crate-type` is
+`lib` only.
 
-`src/devices/src/virtio/fs/{linux,macos}/passthrough.rs` — `do_open` on a directory under
-`CachePolicy::Always` replies `FOPEN_CACHE_DIR | FOPEN_KEEP_CACHE` instead of `FOPEN_CACHE_DIR`
-alone. The kernel's readdir cache lives in the directory inode's page cache, and
-`fuse_dir_open` (fs/fuse/dir.c) drops those pages on every `opendir` unless `FOPEN_KEEP_CACHE`
-is set, so without it every directory was re-read (a full `READDIRPLUS`, one host lookup per
-entry) on every pass over the tree, whatever the entry timeouts said. Upstream virtiofsd has
-the same omission. `auto`/`never` are untouched.
+`src/libkrun/build.rs` — drop the `cdylib` soname link arguments (no cdylib is built).
 
-`src/devices/src/virtio/fs/linux/passthrough.rs` — a `CachePolicy::Always` share serves its
-directories without `opendir`. `init` advertises `FUSE_NO_OPENDIR_SUPPORT` and `opendir`
-answers `ENOSYS`, which is what actually sets `fc->no_opendir` (`fuse_file_open`,
-fs/fuse/file.c): the guest then sends no `OPENDIR` or `RELEASEDIR` for the life of the mount
-and uses the kernel's own `FOPEN_KEEP_CACHE|FOPEN_CACHE_DIR` defaults, removing the last
-per-directory round trip of a pass over the tree. `READDIR`/`READDIRPLUS` and `FSYNCDIR` then
-carry no handle, and are served through a descriptor opened from the inode for that request
-alone — the offset comes from the request, so nothing is lost with the handle. `auto`/`never`
-keep `opendir`: it is where the kernel drops a directory's cached listing. The macOS
-passthrough is untouched; its readdir reads through a per-handle cached `DIR*` stream rather
-than a request-scoped `getdents64`, so it has no cheap handle-less path.
-
-`src/devices/src/virtio/descriptor_utils.rs` + `src/devices/src/virtio/fs/mod.rs` —
-expose the fs engine to external transports: `Reader/Writer::from_volatile_slices`
-constructors (build a FUSE request view from buffers collected by another virtio
-transport, e.g. vhost-user) and public `filesystem`/`read_only` modules plus `pub use`
-of `Server` and `InodeAllocator`. Additive only — nothing upstream changes behaviour.
-No longer used: virtkit's vhost-user `vk virtiofsd` daemon, which served cloud-hypervisor's
-shares with this fs engine, is gone; the patch goes when the vendored tree is next replaced.
-
-`src/arch/src/x86_64/mod.rs` — place the initrd below 4 GiB. It was placed at the top
-of all guest RAM, but the boot protocol's `setup_header` here has no `ext_ramdisk_image`
-field, so the address is passed only through the 32-bit `ramdisk_image`. Once the guest
-has more than ~3 GiB, the top of RAM is above 4 GiB and the address truncated, so the
-kernel could not find the initrd and panicked (`Unable to mount root fs`). The initrd is
-now placed at the top of the sub-gap (below-4 GiB) RAM region. Search for `initrd_addr`.
-
-`src/libkrun/Cargo.toml` + `src/libkrun/build.rs` — dropped `cdylib` from the crate's
-`crate-type` (now just `lib`). virtkit links the crate as an rlib path dependency; the
-upstream `cdylib` (`libkrun.so`, for C consumers) is never built and is unsupported on
-the static-PIE musl target, so cargo emitted a "dropping unsupported crate type
-`cdylib`" warning on every build. The build script did nothing but set the
-`libkrun.so`/`.dylib` soname via `cargo:rustc-cdylib-link-arg` (itself warned about
-with no cdylib target), so it is now a no-op.
-
-`src/arch/src/x86_64/layout.rs` + `src/arch/src/x86_64/mptable.rs` — raise the
-virtio-mmio IRQ ceiling to the full single IOAPIC. Upstream caps `IRQ_MAX` at 15 and
-the MPTABLE routes only the 16 legacy ISA INTSRC pins, while the emulated IOAPIC
-(`devices/legacy/ioapic.rs`) already exposes 24 pins. `IRQ_MAX` is now
-`IOAPIC_NUM_PINS - 1` (23) and the MPTABLE routes and sizes all 24 pins, so a guest can
-wire virtio-mmio devices landing on the high pins (19 usable IRQs instead of 11). A
-`mptable::tests::intsrc_entry_count` test locks the routed-pin count to `IOAPIC_NUM_PINS`.
-Search for `IOAPIC_NUM_PINS`.
-
-`src/devices/src/virtio/fs/linux/passthrough.rs` — the passthrough fs device called
-`libc::statx` with `libc::STATX_BASIC_STATS | libc::STATX_MNT_ID`. libc dropped its
-musl `statx` struct/fn/constants after 0.2.183, but virtkit needs a newer libc (its
-dependency tree pulls libc >= 0.2.186). `struct statx` is defined by the kernel UAPI
-to be architecture-independent, so the patch reproduces exactly the fields the device
-reads and issues the raw `SYS_statx` syscall. Behaviour is identical, including the
-returned `stx_mnt_id`. Search for `mod statx_compat` in that file.
+`src/devices/src/virtio/fs/linux/passthrough.rs` — `statx` through the raw syscall
+(`mod statx_compat`): libc no longer exports its musl `statx` struct, function and `STATX_*`
+constants, and virtkit builds for `x86_64-unknown-linux-musl`. This tree's own `Cargo.lock`
+pins libc 0.2.183; the patch is for the root workspace's lock (0.2.189 when vendored), which
+builds this tree (vk-driver links it). `struct statx` is fixed by the kernel UAPI, so the
+module mirrors it and calls `SYS_statx`; behaviour, including the returned `stx_mnt_id`, is
+unchanged; a const assertion pins the struct at the UAPI's 256 bytes.
 
 `src/devices/src/virtio/descriptor_utils.rs` — clamp the final descriptor in
-`DescriptorChainConsumer::consume`. It documents that the combined length of the slices
-handed to the callback is `<= count`, but pushed the last descriptor whole and only
-clamped the byte counter, so a vectored disk read (`Writer::write_from_at` ->
-`DiskProperties::read_vectored_at_volatile`) filled the entire final descriptor and
-over-read past `count` into guest memory the guest never requested — a read-path
-corruption whose trigger depends on the guest's per-request descriptor layout. The final
-slice is now `subslice`d to the remaining count, matching the byte-copy `write()` path
-that already clamps. Covered by the `write_from_at_must_not_overread_past_count` test.
-Search for `subslice` in `consume`.
+`DescriptorChainConsumer::consume`, forward-ported from the 1.19 tree. Its contract is that
+the slices handed to the callback total `<= count`, but it pushed the last descriptor whole,
+so a vectored disk read (`Writer::write_from_at`) filled past `count` into guest memory the
+driver never asked for. Covered by `write_from_at_must_not_overread_past_count`.
 
-`src/devices/src/virtio/vsock/unix.rs` — `UnixProxy::release` shuts the host socket down
-and stops polling it. A guest `OP_RST` on a host-initiated connection (its port has no
-listener yet, the usual case for a readiness probe during boot) only deferred the proxy's
-removal, so the host peer read EOF when the reaper dropped the proxy 5 s later; it now
-reads it at once. Search for `release: shutdown failed`.
+### virtio-fs passthrough (forward-ported from the 1.19 tree)
 
-`src/devices/src/virtio/vsock/muxer.rs` + `.../vsock/mod.rs` — harden the TSI muxer against
-host memory/fd pressure. On a guest connect to a bridged host port, `process_op_request` built the
-`UnixProxy` with `.unwrap()`, so a host `socket()` failing under fd or `ENOMEM` exhaustion panicked
-the device thread and poisoned the queue mutex, wedging that VM's whole vsock until restart; it now
-resets the guest's connect instead, exactly as the listening-socket branch already does. Separately
-the muxer RX queue silently drops host->guest packets when full — a connect's `OP_RESPONSE` among
-them, seen as a reset when the guest is slow to repost RX buffers under swap — so its cap is raised
-from 256 to 1024 slots for headroom. Search for `creating a proxy for port` and `MUXER_RXQ_SIZE`.
+`src/devices/src/virtio/fs/{linux,macos}/passthrough.rs` — share options the passthrough
+`Config` did not carry (`no_sync` on both hosts, the rest on Linux): `negative_timeout` (a
+missed lookup answers a zero-inode entry with that validity instead of ENOENT, so the guest
+caches the miss; zero, the default, keeps the error),
+`no_sync` (FLUSH, FSYNC and FSYNCDIR answer ENOSYS, which the FUSE client takes as "never
+again" for the mount; on macOS the errno goes through `linux_error`, since the host's ENOSYS
+is not Linux's) and `dax_inode_min` (per-inode DAX by size: INIT takes `HAS_INODE_DAX`
+when the guest offers it, a `dax=inode` mount, and entries of regular files at or above the
+floor carry `ATTR_DAX`, added to `fuse.rs`). Defaults leave behaviour unchanged.
 
-`src/devices/src/virtio/block/device.rs` + `src/devices/src/virtio/file_traits.rs` —
-serve reads from read-only raw disks out of an `mmap` of the backing file instead of a
-`pread` per request. Upstream reads every block through imago's positioned-I/O file
-storage; a read-only raw image (a build stage's `COPY --from` source, a read-only root)
-is immutable and its guest block offset is its file offset, so it is mapped once
-(`PROT_READ`, `MAP_SHARED`) and each guest read becomes a copy straight from the host
-page cache. qcow2 (needs format translation) and `direct_io` (asks to bypass the cache)
-keep the imago path, and a failed `mmap` falls back to it rather than aborting the boot.
-Covered by the `block::device::tests` mmap tests. Search for `DiskMmap`.
-
-`src/devices/src/virtio/block/{device.rs,worker.rs}` + `src/libkrun/src/lib.rs` +
-`src/vmm/src/vmm_config/block.rs` — track guest-written clusters and drain them on demand,
-so virtkit's build backend can capture only a stage checkpoint's delta instead of the whole
-cumulative overlay. The block worker records every write/discard/write-zeroes into a
-per-disk `DirtyRanges` (64 KiB cluster granularity); when `dirty_control_socket` is set on a
-block device, `Block::spawn_dirty_control` serves a Unix-socket protocol (`b'D'` DRAIN →
-flush + reply the coalesced ranges since the last drain, encoded `u32 count` then
-`count × (u64 offset, u64 len)` little-endian). Exposed to C consumers via
-`krun_set_block_dirty_socket`. Additive only — no upstream behaviour changes when the socket
-is unset. Consumed by virtkit's `VmSession::drain_dirty` (vk-driver/src/run.rs). Covered by
-the `block::device::dirty_tests`. Search for `DirtyRanges`.
-
-`src/vmm/src/builder.rs` — feed an early 16550 COM1 serial from `console_output` on non-EFI
-x86_64 boots. Upstream builds the legacy serial only for EFI/firmware boots, so a stock modular
-distro kernel (virtio_console as a module, hvc0) emits no early boot output — a BYO-kernel boot is
-impossible to observe. When `serial_devices` is empty, the implicit console is enabled, and
-`console_output` is set, a serial is added writing (append) to that file so COM1 (0x3f8, IRQ 4)
-carries early boot. Additive only; the embedded kernel keeps `console=hvc0` and never triggers it.
-Search for `virtkit: give the guest an early 16550 COM1 console`.
-
-`src/devices/src/legacy/pci.rs` (new) + `src/devices/src/legacy/mod.rs` +
-`src/vmm/src/device_manager/legacy.rs` — a minimal legacy PCI host bridge so a guest kernel
-enumerates a PCI bus, the foundation for virtio-pci support. `PciConfigIo` implements the type-1
-config mechanism on the PIO bus at 0xcf8 (CONFIG_ADDRESS latch) / 0xcfc (CONFIG_DATA window),
-with the BDF/register decode adapted from cloud-hypervisor's `PciConfigIo`; a `PciBus` holds a
-single host-bridge `PciDevice` at 00:00.0 (vendor 0x1b36 / device 0x0008, class 0x060000, header
-type 0). Registered by `PortIODeviceManager`. x86_64 only; additive — no upstream behaviour
-change until PCI devices are attached later. Covered by `legacy::pci` unit tests.
-Search for `PciConfigIo`.
-
-`src/devices/src/virtio/pci.rs` (new) + `src/devices/src/legacy/pci.rs` +
-`src/arch/src/x86_64/{mod.rs,mptable.rs}` + `src/vmm/src/device_manager/kvm/mmio.rs` +
-`src/vmm/src/builder.rs` — a modern virtio-pci transport over legacy INTx.
-`VirtioPciDevice` wraps a `VirtioDevice` and serves the virtio common /
-ISR / device / notify structures out of a single 64-bit BAR0 on the MMIO bus, with a vendor
-capability list pointing a driver at each structure; `PciDevice` gains a type-0 endpoint
-header, 64-bit memory-BAR sizing, and capability-list assembly. Interrupts use legacy INTx
-routed through an MP-table PCI-bus INTSRC entry (KVM irqfd, single-pulse). The block device now
-attaches over virtio-pci instead of virtio-mmio on x86_64 (00:01.0 for the first device). MSI-X
-and multi-device slot allocation are out of scope here (added separately). x86_64 only; additive.
-Covered by `legacy::pci` unit tests. Search for `VirtioPciDevice`.
-
-`src/devices/src/virtio/msix.rs` (new) + `src/devices/src/legacy/gsi.rs` (new) +
-`src/devices/src/virtio/{pci.rs,mmio.rs}` + `src/devices/src/legacy/pci.rs` +
-`src/vmm/src/device_manager/kvm/mmio.rs` + `src/vmm/src/builder.rs` +
-`src/vmm/src/linux/vstate.rs` — MSI-X for the virtio-pci transport, so many virtio devices
-can be attached without exhausting the scarce IOAPIC pins.
-Each virtio-pci device advertises a two-vector MSI-X capability (vector 0 = config, vector 1 =
-shared across all virtqueues, since libkrun's `InterruptTransport` carries no queue index); the
-`MsixConfig` table/PBA live in BAR0 while the capability's message-control (enable/mask) lives
-in config space, both sharing one `Arc<Mutex<MsixConfig>>`. Interrupts are delivered by writing
-a per-vector eventfd registered with `KVM_IRQFD` against a dedicated MSI GSI (>= 24); a
-`GsiRoutes` manager owns `KVM_SET_GSI_ROUTING`, re-supplying the default IOAPIC/PIC routes
-(0..=23) on every commit because the ioctl replaces the whole table. INTx is retained as a
-fallback on a single shared, shareable GSI (PCI INTx is level-shareable), so it no longer
-consumes one pin per device. `Vm.fd` became `Arc<VmFd>` so routing ioctls can run off the
-config-write path. x86_64 only; additive — the virtio-mmio transport, other arches, and the
-INTx path when the guest leaves MSI-X disabled are unchanged. Covered by `virtio::msix`,
-`legacy::gsi`, and `legacy::pci` unit tests. Search for `MsixConfig` and `GsiRoutes`.
-
-`src/devices/src/virtio/pci.rs` + `src/devices/src/legacy/pci.rs` +
-`src/vmm/src/device_manager/shm.rs` + `src/vmm/src/builder.rs` +
-`src/arch/src/x86_64/{layout.rs,mod.rs,acpi.rs,dsdt.asl}` — advertise a device's shared-memory
-region over virtio-pci, so virtio-fs DAX works on x86_64. The transport carried only BAR0 and
-the capabilities pointing into it, and the region was reachable only through the virtio-mmio
-transport (which x86_64 never uses), so a guest saw no DAX window however large a `shm_size`
-the caller asked for. A device that has a region now also gets a 64-bit memory BAR2/BAR3 at it
-plus a `virtio_pci_cap64` shared-memory capability (cfg_type 8, shmid 0). The window is guest
-memory registered with KVM at a fixed address, not an emulated MMIO range, so the BAR cannot
-follow a write: the guest has to leave it where it is, and nothing enforces that. Two things
-make it — `SHM_MEM_START` fixes the regions' base at 64 GiB and the DSDT's `_CRS` declares
-exactly that 64 GiB span as a PCI host-bridge window (Linux drops a BAR no bridge window
-covers, and reassigns nothing inside one), and `place_fs_region` rounds each region to a power
-of two at a naturally aligned base, 2 MiB at the least, so the BAR describes it exactly. A
-virtio-fs window that does not fit the span (a guest whose RAM reaches into it, or one share
-too many) costs that share its DAX, not the boot; a gpu region that does not fit still fails
-the boot, as upstream has it. Additive — a device with no shm region gets the same
-config space as before, and the sizing, the alignment and the span are all x86_64-only, so the
-virtio-mmio transport is untouched. `set_memory_bar_64` now takes the BAR *number* the
-capability names rather than a pair index, so BAR2 is register 6 and not register 8. Covered by
-`arch::x86_64::acpi`, `vmm::device_manager::shm`, `virtio::pci` and `legacy::pci` tests. Search
-for `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` and `SHM_MEM_START`.
-
-`src/cpuid/src/transformer/{mod.rs,intel.rs}` + `src/vmm/src/linux/vstate.rs` +
-`src/vmm/src/resources.rs` + `src/vmm/src/builder.rs` + `src/libkrun/src/lib.rs` —
-opt-in guest PMU: `krun_set_pmu(ctx, enabled)` (mirroring `krun_set_nested_virt`)
-plumbs `VmResources.pmu_enabled` through `VcpuConfig` into the cpuid `VmSpec`, and
-`update_perf_mon_entry` then leaves leaf 0xA as KVM reports it instead of zeroing
-it, so KVM's vPMU backs in-guest `perf` hardware counters (cycles, instructions).
-Default remains off — host performance counters are a side-channel surface, so
-only trusted guests (dev VMs) should enable this, never untrusted CI jobs.
-Additive: without the call, behaviour is unchanged. Used by `vk run --pmu`.
-
-`src/vmm/src/resources.rs` + `src/vmm/src/builder.rs` + `src/libkrun/src/lib.rs` — make the
-virtio-balloon device opt-out: `krun_disable_balloon(ctx)` sets `VmResources.disable_balloon`,
-which `build_microvm` checks before attaching it. Upstream always attaches one, so a caller
-could not boot without free-page reporting or reclaim the virtio-pci slot it spends, and
-virtkit's own `VmSpec::balloon` axis was silently ignored. Spelled as a disable (like
-`disable_implicit_console`) so the `Default` keeps attaching a balloon. Additive: without the
-call, behaviour is unchanged.
-Search for `disable_balloon`.
-
-`src/devices/src/virtio/block/{lazy_chunk_storage.rs (new),device.rs,mod.rs}` +
-`src/devices/Cargo.toml` — read a cached build-stage image lazily out of its compressed chunks
-instead of a reassembled raw file. A `.vk_ro_img` manifest (written by vk-driver,
-`registry.rs`; byte layout documented on the module) lists the content-addressed chunks tiling
-an image plus the local cache directory holding them;
-`LazyChunkStorage` is a read-only `imago::Storage` that decompresses each chunk the first time
-a guest read touches it, so a cache restore costs only the parts a stage's steps actually read.
-Attached directly as `ImageType::VkLazyChunks`, and — since a stage forked from a restored one
-is a qcow2 over a qcow2 over the manifest — resolved as a *backing* file at any depth of a
-chain by `LazyAwareOpenGate`, an `ImplicitOpenGate` that swaps in the lazy storage for any
-implicitly opened file named `*.vk_ro_img` (imago still picks the format layer from the
-parent's recorded `backing_format`, which must be `raw`). Keying on the host-chosen extension
-rather than sniffing the magic is deliberate: it keeps a guest-writable image from ever being
-promoted into a manifest and thereby naming an arbitrary host directory as its chunk cache.
-Local-disk-only (`std::fs::read` + zstd decode), so no network or async runtime enters
-libkrun; the crate gains `zstd`, `lru` and `maybe-async` for it. Additive — no upstream
-behaviour changes for a disk that is not a manifest and has none in its chain. Covered by
-`block::lazy_chunk_storage::tests` and the backing-chain tests in `block::device::tests`.
-Search for `LazyChunkStorage`.
-
-`src/arch/src/x86_64/{acpi.rs (new),dsdt.asl (new),mod.rs,layout.rs}` +
-`src/arch_gen/src/x86/bootparam.rs` + `src/devices/src/legacy/{acpi_pm.rs (new),mod.rs,i8042.rs}` +
-`src/vmm/src/device_manager/{legacy.rs,kvm/mmio.rs}` + `src/vmm/src/{builder.rs,lib.rs,linux/vstate.rs}` +
-`src/libkrun/src/lib.rs` — minimal ACPI on x86_64, so a guest can power off, take a host power
-button, and reboot. `acpi::setup_acpi` writes an RSDP/XSDT/FADT/FACS/MADT and a precompiled DSDT
-(`dsdt.asl`, `iasl`-compiled: `\_S5` + a PCI0 root bridge) into low RAM and points the guest at it
-via `boot_params.acpi_rsdp_addr` (the old bindgen's `_pad3` is split to expose that field). A new
-`AcpiPm` PIO device at `0x600` serves the PM1 block (S5 power-off fires the Vmm exit event), the
-FADT reset register (`0x60C`), and a fixed-feature power button raised over the SCI (GSI 9, an
-irqfd kept out of the virtio IRQ allocator's range); its host trigger is the existing
-`shutdown_efd`, now created on x86_64/Linux too and reachable through `krun_get_shutdown_eventfd`.
-A guest reset — triple fault, `KVM_SYSTEM_EVENT_RESET`, the i8042 `0xFE` command, or the ACPI reset
-register — now exits with `KRUN_EXIT_GUEST_RESET` (154) instead of 0, so a supervisor can tell a
-reboot from a power-off and relaunch the VM; a shared reset flag carries the distinction for the
-device-driven paths. The ACPI tables and the `AcpiPm`/i8042 paths are x86_64 only, but the
-triple-fault and `KVM_SYSTEM_EVENT_RESET` handling lives in the shared `linux/vstate.rs`, so an
-aarch64 Linux guest reset now exits 154 as well. No caller consumes 154 yet, so a reboot currently
-surfaces as a non-zero exit until the host wires it in. The MP table is retained (used with
-`acpi=off`); additive — a guest that ignores ACPI still boots via the MP table. Covered by
-`x86_64::acpi::tests`. Search for `setup_acpi`, `AcpiPm`, `reset_flag`, and `KRUN_EXIT_GUEST_RESET`.
+`src/devices/src/virtio/fs/{linux,macos}/passthrough.rs` — `do_open` on a directory under
+`CachePolicy::Always` replies `FOPEN_CACHE_DIR | FOPEN_KEEP_CACHE`: `fuse_dir_open` drops the
+readdir cache on every `opendir` without `FOPEN_KEEP_CACHE`, so every directory was re-read on
+every pass over the tree. On Linux a `CachePolicy::Always` share also serves directories
+without `opendir`: INIT takes `ZERO_MESSAGE_OPENDIR` and `opendir` answers ENOSYS, which sets
+`fc->no_opendir`; READDIR, READDIRPLUS and FSYNCDIR then arrive without a handle and go
+through a descriptor opened from the inode for that request. `auto`/`never` keep `opendir`.
 
 `src/devices/src/virtio/fs/linux/passthrough.rs` — `setupmapping` serves a DAX window from an
-fd already open on the inode (matched by inode and access mode), reopening the inode by
-`/proc/self/fd` path only when none is open. The guest passes `fh = u64::MAX` (no handle) with
-every DAX mapping, so the fd cannot be found by handle; the original code reopened, which
-re-derives write access from the inode's *current* mode bits, so a file the guest opened
-writable and then chmod'd to 0444 could no longer be mapped — the reopen failed with EACCES
-even though the still-open fd is valid, which POSIX requires to keep working. With `dax=always`
-every in-place write inside `i_size` is serviced through a writable DAX mapping, so that reopen
-turned such writes into EACCES (and a guest `MAP_SHARED` store into SIGBUS); an incremental
-`git fetch`, which rewrites the 12-byte header of its mode-0444 temp pack through an fd it keeps
-open, hit it on every pull. Any open fd of the right access mode for the inode establishes the
-same page-cache mapping, and mmap still enforces that a writable mapping needs a writable fd.
-The reopen fallback stays for a mapping whose inode has no open fd (a read after close). The
-lookup keys on the inode and access mode, not on the guest's handle, which is absent for DAX.
-Covered by the `setupmapping_*` tests. Search for `The guest passes fh = u64::MAX`.
+fd already open on the inode (matched by inode and access mode), reopening through
+`/proc/self/fd` only when none is. The guest passes `fh = u64::MAX` with every DAX mapping, and
+a reopen re-derives access from the inode's current mode: a file opened writable then chmod'd
+0444 (git's temp pack, rewritten in place on an incremental fetch) could no longer be mapped
+writable, turning in-place writes into EACCES or SIGBUS. `removemapping` merges the adjacent
+ranges of a batch into one mmap (`merge_mappings`).
 
-`src/devices/src/virtio/fs/read_only.rs` + `src/devices/src/virtio/fs/linux/passthrough.rs` —
-REMOVEMAPPING on a read-only share keeps the DAX mapping in place (bounds still checked):
-tearing a range down was one mmap over the window plus a KVM invalidation, and a guest reading
-a source tree reclaims a range for nearly every file once its window is full — 30k files cost
-57k host mmaps, 47% of them removals. The next SETUPMAPPING replaces a kept mapping with
-MAP_FIXED, and a read-only share cannot be written through it. The read-write path merges the
-adjacent ranges of a batch into one mmap (`merge_mappings`). Covered by
-`removemapping_keeps_the_mapping_but_checks_bounds` and
-`removemapping_batches_merge_adjacent_ranges`.
+`src/devices/src/virtio/fs/read_only.rs` — on Linux, REMOVEMAPPING on a read-only share keeps
+the DAX mapping in place, bounds still checked: a guest reading a source tree reclaims a range
+for nearly every file once its window is full, each costing an mmap and a KVM invalidation,
+and a kept read-only mapping is replaced by the next SETUPMAPPING (MAP_FIXED). On macOS it
+still delegates: there the inner removemapping releases the host mmap, and the next
+SETUPMAPPING maps afresh, so a kept mapping would leak.
 
-`src/libkrun/src/lib.rs` + `src/vmm/src/vmm_config/fs.rs` + `src/devices/src/virtio/fs/`
-(`device.rs`, `fuse.rs`, `linux/passthrough.rs`) — per-inode DAX by file size.
-`krun_add_virtiofs5(…, dax_inode_min)` (`krun_add_virtiofs4` delegates with 0) carries a size
-floor to the passthrough filesystem, which then answers INIT with `HAS_INODE_DAX` when the
-guest offers it (a `dax=inode` mount) and sets `ATTR_DAX` on the entries of regular files at or
-above the floor, so only those are mapped through the window. Every DAX mapping costs a host
-mmap and a guest EPT invalidation per 2 MiB range whatever the file's size; a source tree's
-small files never repay it. Covered by `lookup_marks_large_regular_files_for_dax`.
+`src/devices/src/virtio/fs/server.rs` — READDIRPLUS forgets an entry that did not fit the
+reply. Its lookup took an inode reference the guest never counted, so no FORGET released it
+and the O_PATH fd stayed open for the life of the mount (362 pinned inodes on a 37k-entry
+tree). Upstream virtiofsd does the same.
 
-`src/devices/src/virtio/net/{mod.rs,device.rs}` + `src/vmm/src/vmm_config/net.rs` +
-`src/libkrun/src/lib.rs` — a configurable link MTU on a virtio-net NIC. `VirtioNetConfig`
-gains the `mtu` field the virtio spec puts at offset 10 and `Net::new` takes an
-`Option<u16>`, advertising `VIRTIO_NET_F_MTU` only when one is set, so a driver reads the
-link MTU off the device instead of assuming 1500. `krun_add_net_unixstream2(…, mtu)` carries
-it from a C caller and validates it against `MIN_MTU..=MAX_MTU` (68..=65535, the ceiling
-being what still fits the device's `MAX_BUFFER_SIZE` frame buffers once the virtio-net and
-ethernet headers are counted — a static assertion ties the two together). An MTU above 1500
-also makes the Linux driver post receive buffers sized for a frame that large, which is what
-lets a backend hand the guest one in a single piece. `krun_add_net_unixstream` delegates with 0 and
-every other entry point passes `None`, so nothing advertises an MTU unless asked. Additive.
-Used by virtkit to put switch-attached NICs on a 65500-byte link. Covered by
-`virtio::net::device::tests`.
+Covered by the passthrough `negative_lookup_*`, `no_sync_*`, `setupmapping_*`,
+`removemapping_*` and `lookup_marks_large_regular_files_for_dax` tests,
+`removemapping_keeps_the_mapping_but_checks_bounds`,
+`readdirplus_forgets_the_entry_that_did_not_fit`, and `unknown_ioctl_returns_enotty` (the
+1.19 tree's guard on an ENOTTY reply 2.0 already gives).
 
-`src/devices/src/virtio/net/{device.rs,worker.rs}` + `src/devices/src/virtio/queue.rs` —
-`VIRTIO_NET_F_MRG_RXBUF` on a NIC that
-carries an MTU, so one frame may be received across several descriptor chains. Upstream writes
-each frame into a single chain, which forces the Linux driver to size every posted buffer for
-the largest frame: at MTU 65500 it posts 17-page chains of 18 descriptors, and a
-1024-descriptor queue then holds 56 of them whatever the traffic — 56 packets of depth, and a
-17-page allocation per refill, for packets mostly nowhere near that size. With the feature the
-driver posts one page fragment per buffer (1024 in the same ring, the same ~4 MiB) and the
-device spreads a frame over as many chains as it needs, putting the count in `num_buffers` of
-the first one's header (virtio 1.1 § 5.1.6.4). `write_frame_to_chains` takes whole chains until
-they hold the frame before writing anything, so a frame the driver has not posted room for yet
-is left for a retry with the queue as it was rather than half-written; chains that can never
-hold it are still handed back used-but-empty, as upstream does. `Queue::add_used` is split into
-`write_used` + `publish_used` so a frame's chains reach the used ring before the index that
-names them moves: a driver polling the ring must not read `num_buffers` off the first chain and
-find the rest missing. Advertised only with an MTU, so a NIC without one keeps upstream's
-one-chain-per-frame behaviour, and `add_used` still publishes per chain for every other device.
-Refill notifications use the observed available index even when chains were put back, with
-a race check after arming. Deferred deliveries and empty error completions still interrupt
-the guest. A full descriptor table that cannot fit the frame is returned empty, and any
-copy failure returns all participating chains empty. Covered by `virtio::net::worker::tests`
-and `queue::tests`. Search for `NUM_BUFFERS_OFFSET`.
+Not carried over: the 1.19 tree's `Reader/Writer::from_volatile_slices` constructors and
+public `filesystem`/`read_only` modules, which only virtkit's removed vhost-user daemon used.
 
-`src/devices/src/virtio/fs/server.rs` — READDIRPLUS forgets an entry that did not fit the reply.
-The filesystem has to look an entry up before the server can tell whether it fits, and that
-lookup takes a reference on the inode; an entry the guest never receives is one the kernel never
-counted, so no FORGET ever releases it and `PassthroughFs` keeps its O_PATH fd for the life of
-the mount. Upstream virtiofsd forgets it there; upstream libkrun does not. On a 37k-entry source
-tree, 362 inodes stayed pinned after the guest had dropped every cached dentry. Covered by
-`readdirplus_forgets_the_entry_that_did_not_fit`.
-
-`src/devices/src/virtio/net/unixstream.rs` — the network proxy's stream is read through a
-128 KiB buffer, allowing one `recv` to collect multiple queued frames. Buffered bytes and
-the saved payload length survive `NothingRead`, so a retry resumes the current frame.
-Payloads of at least 8 KiB go directly into the caller's buffer only when no payload bytes
-are buffered. EOF fails the read, including a partial direct read, and an oversized length
-is rejected before slicing. Socket-pair tests cover queued frames, split headers and
-payloads, retries, compaction, large frames, invalid lengths and EOF. The queued-frame test
-checks that all three small frames from one socket write arrive in the initial refill;
-it is a batching check, not a throughput measurement. Search for `read_buffered`.
-
-`src/devices/src/virtio/net/unixstream.rs` — guest frames reach the network proxy a batch at
-a time. `write_frame` copies the length-prefixed frame into a staging buffer and returns, so
-a descriptor chain is used once its bytes are held rather than once they are on the socket;
-`NetBackend::flush_frames` replaces `try_finish_write` and sends the batch, called by the
-worker when it has drained the transmit queue and again on a writable socket. A batch ends at
-256 KiB or 256 frames, whichever comes first, and a frame offered when the socket cannot take
-the batch is refused with `NothingWritten`, which puts the chain back on the queue. The socket
-is a stream, so a short send only advances the start of what is left: the tail keeps its place
-and the bytes on the wire are the sequence an unbatched sender would have produced. Frames of
-at least 16 KiB skip the staging buffer when nothing is staged in front of them, the copy
-costing about as much as the send it would save. Socket-pair tests cover coalescing and order,
-both bounds, resuming inside a frame and inside a length prefix, a blocked socket refusing
-frames, and a jumbo frame sent directly and truncated. Search for `send_staged`.
+### Directory-entry names (forward-ported from the 1.19 tree)
 
 `src/devices/src/virtio/fs/server.rs` — a directory-entry name from the guest must be exactly
 one component. `LOOKUP`, `MKNOD`, `MKDIR`, `SYMLINK` (its new name, not the target), `UNLINK`,
@@ -391,13 +101,312 @@ one component. `LOOKUP`, `MKNOD`, `MKDIR`, `SYMLINK` (its new name, not the targ
 resolve names with `*at()` against the parent's `O_PATH` descriptor and relied on the guest
 kernel never sending such a name, so a guest kernel that did — and a job can bring its own —
 walked out of the share to anything the VMM's user can read or write. Upstream virtiofsd
-refuses the same names (`validate_path_component`). In the server, so the in-process engine
-and its read-only and id-mapped wrappers all get it. LOOKUP and
-RENAME tests drive the refusal through the server and check that only single components reach
-the filesystem. Search for `entry_name`.
+refuses the same names (`validate_path_component`). In the server, so the in-process engines
+and their read-only, id-mapped and `AugmentFs` wrappers all get it. Unix hosts only: the
+Windows engine joins names onto a `PathBuf`, where `\` and drive prefixes are separators
+too. LOOKUP and RENAME tests drive the refusal through the server and check that only single
+components reach the filesystem. Search for `entry_name`.
+
+### Single-file shares (forward-ported from the 1.19 tree)
+
+`src/devices/src/virtio/fs/{single_file.rs (new),mod.rs,worker.rs}` — on Linux, a share whose
+root is a regular file serves that file alone, never its parent directory (a single-file bind
+mount, which `vk run -v host-file:guest-file` asks for). `SingleFileFs` exposes a root
+directory holding the one file, read-only or read-write as the share is; a guest create or
+rename stages vk-named scratch files in the host parent directory, reclaimed on drop. It has
+no `AugmentFs` wrapper or virtual entries. Elsewhere a file root still fails in
+`PassthroughFs::new`. The 1.19 tree's public `single_file` module is private here. Covered by
+`single_file::tests`.
+
+### Id-mapped shares (forward-ported from the 1.19 tree)
+
+`src/devices/src/virtio/fs/{idmap.rs (new),mod.rs,worker.rs,device.rs}` — UID/GID mapping for
+virtio-fs shares. `idmap` parses virtiofsd-compatible `--uid-map`/`--gid-map` rules (`map:`,
+`squash-guest:`, `forbid-guest:`, …) and `IdMapFs` applies them at the `FileSystem` boundary,
+wrapped inside `AugmentFs` when a map is set (`Fs::set_id_maps`). virtkit squashes a CI job's
+checkout share onto the host runner user with it, so a non-root job can write it. Unmapped
+shares have no wrapper and are served exactly as upstream. A mapped share does not offer
+`FUSE_ALLOW_IDMAP` (2.0 offers it under `LinuxComplete`, 1.19 always): with it the guest
+kernel sends `FUSE_INVALID_UIDGID` for every request but the creating ones, which the soft
+map would translate, or let past `forbid-guest`, in place of the caller's ids. The 1.19
+tree's public `IdMap`/`IdMapFs`/`IdTable` re-exports are not carried. Covered by
+`idmap::tests` and `a_mapped_share_never_offers_allow_idmap`. A single-file share ignores
+the maps.
+
+### Share-option setters
+
+`src/devices/src/virtio/fs/device.rs` — `Fs::passthrough_config_mut` lets the API configure
+a host-backed share before activation without adding parameters to `Fs::new`.
+
+`src/libkrun/src/api/{device_builders.rs,mod.rs}` — `FsDevice` setters for the share options
+the 1.19 tree's `krun_add_virtiofs7` carried: `set_id_maps`, `set_cache` (policy,
+entry/attr/negative validity; `FsCachePolicy` re-exports the passthrough `CachePolicy`),
+`set_xattr`, `set_writeback`, `set_no_sync` (not on Windows) and `set_dax_inode_min` (Linux
+only; `set_cache`'s negative validity is ignored elsewhere). With upstream's
+`set_dax_window_size` and `new_read_only` they cover every `krun_add_virtiofs7` argument.
+Two differ from 1.19: the passthrough setters refuse a null share with `InvalidParam`, where
+1.19 dropped the options, and `set_dax_inode_min(Some(0))` marks every regular file, where
+1.19 took a floor of 0 as off. Rust-only (no `ffier` export). Additive: a device built
+without them behaves as upstream's. Covered by `fs_option_tests`.
+
+### virtio-blk (forward-ported from the 1.19 tree)
+
+`src/devices/Cargo.toml` — imago is virtkit's vendored `third_party/imago` (0.2.4 plus its
+local patches, see its VENDOR.md), by path, still `sync` + `vm-memory`. The lazy chunk storage
+below adds `zstd`, `lru` (until now a macOS-only dependency) and `maybe-async` (`is_sync`).
+
+`src/devices/src/virtio/block/{device.rs,file_traits.rs}` — serve reads from read-only raw disks
+out of an `mmap` of the image (`DiskMmap`) instead of a `pread` per request: such an image
+(a build stage's `COPY --from` source, a read-only root) is immutable and its block offset is
+its file offset. qcow2 and `direct_io` keep the imago path; a failed `mmap` falls back to it,
+and so does every disk off Unix hosts.
+
+`src/devices/src/virtio/block/{device.rs,worker.rs}` — the image sits behind an `RwLock`, and
+the worker pops up to `IO_PARALLELISM` requests and runs each on a scoped thread, since imago's
+`readv`/`writev` need only `&self`; write-zeroes and the dirty-control commands take the write
+lock. Interrupts are raised once per batch that completed anything.
+
+`src/devices/src/virtio/block/{device.rs,worker.rs}` + `src/libkrun/src/api/device_builders.rs` —
+track guest-written clusters and drain them on demand, so virtkit's build backend captures only
+a checkpoint's delta. With `BlockDevice::set_dirty_control_socket` bound, the worker records
+every write, discard and write-zeroes in a per-disk `DirtyRanges` (64 KiB clusters), and
+`Block::spawn_dirty_control` serves `b'D'` (flush, then reply the written and discarded ranges
+since the last drain: `u32 count` then `count × (u64 offset, u64 len)`, little-endian) and
+`b'F'` (flush only). Consumed by virtkit's `VmSession::drain_dirty` and `flush_disk`. Unix
+hosts only: elsewhere the socket is ignored with a warning. The setter is Rust-only (no
+`ffier` export).
+
+`src/devices/src/virtio/block/device.rs` + `src/libkrun/src/api/device_builders.rs` —
+`VmmExitObserver for Block` flushes a write-back cache on a clean power-off, and `BlockDevice`
+registers it: the VMM `_exit`s, so without it imago's cached metadata could stay unwritten and
+the image end truncated (an L2 entry past EOF).
+
+`src/devices/src/virtio/block/{lazy_chunk_storage.rs (new),device.rs,mod.rs}` — read a cached
+build-stage image lazily out of its compressed chunks. A `.vk_ro_img` manifest (written by
+vk-driver's `registry.rs`, layout documented on the module) lists the content-addressed chunks
+tiling an image and the local directory holding them; `LazyChunkStorage` is a read-only
+`imago::Storage` that decompresses a chunk the first time a read touches it. Attached directly
+as `DiskFormat::VkLazyChunks` (= 3), and resolved as a backing file at any depth of a qcow2
+chain by `LazyAwareOpenGate`, which swaps in the lazy storage for an implicitly opened
+`*.vk_ro_img` file. Keying on the host-chosen extension rather than the magic keeps a
+guest-writable image from ever being promoted into a manifest naming a host directory.
+
+A disk with neither option set, and no manifest in its chain, behaves as upstream's except for
+the batched requests behind the `RwLock`, the mmap reads of a read-only raw image and the
+flush of a write-back cache on power-off, which every disk gets. Covered by
+`block::device::tests` (mmap, concurrency, backing chains), `block::device::dirty_tests` and
+`block::lazy_chunk_storage::tests`.
 
 `src/devices/src/virtio/block/lazy_chunk_storage.rs` — a chunk is zstd-decoded no further
 than one byte past the decompressed length its `.vk_ro_img` entry claims, then refused if it
 does not come to exactly that length: a frame that inflates beyond it (the chunks come from a
-registry anyone with push access fills) is no longer held whole in memory first. Search for
-`take(u64::from(chunk.length) + 1)`.
+registry anyone with push access fills) is no longer held whole in memory first. Forward-ported
+from the 1.19 tree. Search for `take(u64::from(chunk.length) + 1)`.
+
+`src/devices/src/virtio/block/{device.rs,worker.rs}` — a write-zeroes records the partial
+clusters at its ends as written, not only its whole clusters as holes. The 1.19 tree recorded
+it as a discard, which rounds inward, so the zeroed bytes of a partial head or tail cluster
+reached neither set and a checkpoint kept that cluster's old contents. New in this tree.
+Covered by `a_partial_cluster_write_zeroes_reads_its_edges_whole`.
+
+`src/devices/src/virtio/block/device.rs` — a disk tracks dirty clusters only when it has a
+dirty-control socket it could bind. The 1.19 tree recorded every write of every disk into
+sets nothing but that socket drains, so a disk without one grew them for the life of the VM,
+up to one entry per 64 KiB of distinct disk written. New in this tree.
+
+`src/devices/src/virtio/block/worker.rs` — a read, write, discard or write-zeroes whose byte
+range does not fit the disk answers IOERR before it reaches imago or the dirty tracker. The
+1.19 tree multiplied the guest's sector unchecked, wrapping in release builds and panicking
+the worker in debug ones, and recorded writes past the end as dirty. New in this tree.
+
+`src/devices/src/virtio/block/device.rs` — the dirty-control socket is owner-only (0600) and
+waits at most 5 s on a connection's command byte or reply, since connections are served one at
+a time. The mode is set after the bind, so the caller still puts the socket in a private
+directory. The 1.19 tree left it at the process umask and blocked on a stalled client. New in
+this tree.
+
+`src/devices/src/virtio/block/device.rs` — a `DiskFormat::VkLazyChunks` disk is read-only
+whatever the caller asks: its manifest opens read-only and the guest sees `VIRTIO_BLK_F_RO`,
+where the 1.19 tree offered a writable disk whose every write failed. New in this tree.
+
+### virtio-net (forward-ported from the 1.19 tree)
+
+`src/devices/src/virtio/net/{mod.rs,device.rs}` + `src/libkrun/src/api/device_builders.rs` — a
+configurable link MTU. `VirtioNetConfig` gains the `mtu` field at offset 10; `Net::new` takes an
+`Option<u16>` (`Net::set_mtu` sets it later) and advertises `VIRTIO_NET_F_MTU` only when one is
+set. `NetDevice::set_mtu` validates it against `MIN_MTU..=MAX_MTU` (68..=65535, the ceiling
+being what still fits `MAX_BUFFER_SIZE` once the virtio-net and ethernet headers are counted,
+tied by a static assertion). Used by virtkit for switch NICs on a 65500-byte link.
+
+`src/devices/src/virtio/net/{device.rs,worker/unix.rs}` + `src/devices/src/virtio/queue.rs` —
+`VIRTIO_NET_F_MRG_RXBUF` on a NIC with an MTU, so one frame may span several descriptor chains:
+without it the driver sizes every buffer for the largest frame (17-page chains at MTU 65500,
+56 per 1024-descriptor ring). `write_frame_to_chains` takes whole chains until they hold the
+frame before writing, so a frame without room yet is retried with the queue untouched; the
+count goes in `num_buffers` of the first header. `Queue::add_used` is split into `write_used`
++ `publish_used` so a frame's chains reach the used ring before the index naming them moves,
+and `enable_notification_at` arms a refill notification at an observed available index (it
+keeps upstream's bus-master check).
+
+`src/devices/src/virtio/net/{backend.rs,tap.rs,unixgram.rs,worker/unix.rs}` — the unix
+`NetBackend` trait replaces `try_finish_write` with `flush_frames`: `write_frame` may batch
+frames, and the worker flushes after draining the transmit queue and on a writable socket.
+The Windows backend and worker remain upstream's; setting an MTU on Windows does not enable
+mergeable receive buffers.
+
+`src/devices/src/virtio/net/unixstream/{mod.rs,unix.rs}` — the unix network-proxy backend is
+virtkit's rewrite (the Windows one stays upstream's). Reads go through a 128 KiB buffer so one
+`recv` collects several queued frames; buffered bytes and the saved payload length survive
+`NothingRead`; payloads of 8 KiB or more read straight into the caller's buffer when nothing is
+buffered; EOF and oversized lengths fail the read. Writes are staged: `write_frame` copies the
+length-prefixed frame and returns, `flush_frames` sends the batch (up to 256 KiB or 256
+frames), a short send only advances the start of what is left, and frames of 16 KiB or more
+skip staging when nothing is staged ahead of them.
+
+Covered by `virtio::net::device::tests`, `virtio::net::worker::unix::tests` (their interrupt
+checks now count through a test `InterruptHandler`, upstream having dropped the status word),
+`virtio::queue::tests` and the socket-pair tests in `unixstream::unix`.
+
+`src/devices/src/virtio/net/worker/unix.rs` — a TX chain holding no more than the virtio-net
+header (short, or all write-only) is returned used without a frame. Upstream and the 1.19
+tree handed it to the backend, whose `write_frame` asserts on it, so a guest could panic the
+net worker. Covered by `a_header_only_transmit_chain_is_returned_without_a_frame`.
+
+### virtio-vsock (forward-ported from the 1.19 tree)
+
+`src/devices/src/virtio/vsock/unix_proxy/unix.rs` — `release` shuts down the host socket and
+stops polling on an established connection's guest `OP_RST` or bidirectional `OP_SHUTDOWN`.
+Removal stays deferred; otherwise the host peer reads EOF only when the reaper drops the
+proxy 5 s later. Upstream already removes not-yet-connected proxies immediately. The 1.19
+patch originally covered those connections (a readiness probe during boot). Unix hosts
+only; Windows `release` remains upstream's.
+
+`src/devices/src/virtio/vsock/{muxer.rs,mod.rs}` — `UnixProxy::new` failure (host `socket()`
+under fd or memory exhaustion) resets the guest's connect instead of panicking the device
+thread, poisoning the queue mutex and wedging the VM's whole vsock. The muxer RX queue grows
+from 256 to 1024 slots; a full queue drops host->guest packets, including a connect's
+`OP_RESPONSE`.
+
+### Guest PMU (forward-ported from the 1.19 tree)
+
+`src/cpuid/src/transformer/{mod.rs,intel.rs}` + `src/libkrun/src/vmm/{resources.rs,
+linux/vstate.rs,builder.rs}` + `src/libkrun/src/api/vmm_builder.rs` — `VmmBuilder::pmu(true)`
+keeps CPUID leaf 0xA as KVM reports it instead of zeroing it (`VmSpec::with_pmu_enabled`,
+carried by `VcpuConfig::pmu_enabled`), so KVM's vPMU backs in-guest `perf` hardware events.
+Off by default, as upstream: host counters widen the side-channel surface. Used by `vk run --pmu`.
+
+Known gap, as in the 1.19 tree: the switch only gates Intel's leaf 0xA. On AMD, KVM's vPMU
+(the legacy counters, `PERFCTR_CORE` in 0x80000001 ECX) stays exposed whatever the flag, and
+2.0 no longer clamps the largest extended leaf to 0x8000001f, so PerfMonV2 (0x80000022) is
+visible too. Turning the vPMU off at VM level (`KVM_CAP_PMU_CAPABILITY`) would close it on
+both vendors.
+
+### ACPI power-off, power button and reset (forward-ported from the 1.19 tree)
+
+`src/arch/src/x86_64/{acpi.rs,layout.rs}` + `src/arch/Cargo.toml` — with ACPI enabled, the
+tables describe fixed hardware instead of a HW-reduced platform. The FADT carries the PM1 event
+and control blocks at `ACPI_PM_BASE` (0x600), the SCI on `SCI_GSI` (9), the reset register
+(0x60C, value 1), `SLP_BUTTON` and `RESET_REG_SUP`, and points at a 64-byte-aligned FACS.
+The DSDT defines `\_S5`; the MADT's interrupt source override sets the SCI to edge/high,
+matching its irqfd. No PM timer, GPE block or SMI command port. arch's `zerocopy` enables
+`derive` for the override structure, which `acpi_tables` lacks. Covered by `x86_64::acpi::tests`.
+
+`src/devices/src/legacy/{acpi_pm.rs (new),mod.rs}` + `src/libkrun/src/vmm/{builder.rs,
+device_manager/legacy.rs}` — the `AcpiPm` PIO device serves that block. An S5 write to PM1a_CNT
+fires the Vmm exit event for power-off; writing the reset value to the reset register fires
+it for reset. The host's shutdown eventfd latches PWRBTN_STS and raises the SCI (an irqfd on
+GSI 9, reserved by the MMIO and PCI IRQ allocators) so the guest's fixed-feature power button
+driver runs an orderly shutdown. `VmmBuilder::shutdown_support(true)` also creates that
+eventfd on x86_64 Linux, and `VmmHandle::shutdown` writes it. Building with shutdown support
+on x86_64 Linux requires `acpi(true)`; otherwise shutdown would do nothing.
+Covered by `acpi_pm::tests`.
+
+The fixed-hardware FADT is built on every x86_64 host, but `AcpiPm` and the SCI irqfd exist on
+Linux only: a Windows (WHP) guest with ACPI on is told about a PM1 block, SCI and reset
+register nothing serves, so its S5 power-off goes nowhere. virtkit only boots Linux hosts.
+2.0's other table choices stay: no `IAPC_VGA_NOT_PRESENT`, MADT `PCAT_COMPAT` clear, and no
+Local APIC NMI entry. `0xcf9` (PCI reset control) is not served, as in the 1.19 tree.
+
+`src/libkrun/src/vmm/{mod.rs,linux/vstate.rs}` + `src/devices/src/legacy/i8042.rs` — a guest
+reset (triple fault, `KVM_SYSTEM_EVENT_RESET`, the i8042 `0xFE` command or the ACPI reset
+register) exits with `KRUN_EXIT_GUEST_RESET` (154) instead of 0, so a supervisor can tell a reboot
+from a power-off and relaunch the VM; a shared `reset_flag` carries the distinction for the
+device-driven paths. `linux/vstate.rs` is shared, so aarch64 Linux's triple fault and PSCI
+`SYSTEM_RESET` exit 154 too. A reset outranks a guest-set exit code, and a guest kernel panic
+under `reboot=k panic=-1` is a reset: a supervisor that relaunches on 154 relaunches a panicking
+guest. `src/libkrun/src/api/mod.rs` re-exports `KRUN_EXIT_GUEST_RESET` for a supervisor to
+match on.
+
+### virtio-pci parity with the 1.19 tree (on top of PR #875)
+
+`src/devices/src/virtio/{msix.rs (new),mod.rs,pci.rs}` + `src/devices/src/legacy/{gsi.rs (new),
+mod.rs}` + `src/libkrun/src/vmm/device_manager/kvm/pci.rs` — MSI-X for the PR #875 transport,
+which only had INTx. An MSI-X capability closes the capability list, with a two-vector table at
+BAR0 0x4000 and its PBA at 0x5000 (device config is now bounded to 0x1000 bytes). The common
+config keeps the vectors the driver picks, an unknown one reading back as NO_VECTOR; once MSI-X
+is enabled an interrupt goes to the driver's vectors (a queue event to every distinct vector a
+queue is mapped to, the device not naming the queue) and never to INTx; enabling MSI-X
+deasserts an INTx left pending, and a device reset drops pending PBA bits. Only naturally
+aligned 4- and 8-byte table and PBA accesses reach the MSI-X state; others read all ones.
+`MsixConfig` and `GsiRoutes` are the 1.19 tree's: each vector has an eventfd registered as a
+KVM irqfd on its own MSI GSI above the IOAPIC pins, and a message write re-commits the full
+`KVM_SET_GSI_ROUTING` table (default IOAPIC/PIC routes plus the MSI ones). Each queue's
+notification register gets an ioeventfd on the queue eventfd, so a kick no longer traps to the
+VMM thread; the trapping path stays for a relocated BAR0, whose ioeventfds are not moved.
+
+`src/arch/src/x86_64/{layout.rs,mod.rs,acpi.rs}` + `src/libkrun/src/vmm/{device_manager/shm.rs,
+builder.rs}` + `src/devices/src/virtio/pci.rs` — shared-memory regions (virtio-fs DAX windows)
+over virtio-pci. Regions are carved from a fixed span (`SHM_MEM_START`, 64 GiB at 64 GiB) that
+the DSDT declares as a 64-bit window of the PCI host bridge, each with a power-of-two size of at
+least 2 MiB and a base aligned to it, so a BAR describes it exactly. A guest whose RAM reaches
+the span, on either transport, fails to boot (`ShmCreate(OutOfSpace)`) if it asks for a window;
+vk-driver drops windows past `DAX_MAX_GUEST_MIB` first. The transport pins BAR2/BAR3 (64-bit,
+prefetchable memory) on the region, answering size probes, and describes it with a
+`VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` capability (`virtio_pci_cap64`, region id 0); only virtio-fs
+may carry a region. The builder's refusal of shared memory over PCI now applies to the GPU
+region only.
+
+Known gaps: the DSDT declares the span even for a guest whose RAM overlaps it, and the
+virtio-mmio path also places regions in the span and rounds them to a power of two.
+
+`src/libkrun/src/vmm/device_manager/kvm/pci.rs` + `src/devices/src/virtio/pci.rs` — devices
+past the INTx GSIs (5–23 less the SCI's 9) get interrupt pin 0, line 0xff and no `_PRT` entry
+and interrupt over MSI-X alone, so bus 0's 31 slots are the limit.
+
+Covered by the `virtio::pci::tests` (`msix_*`, `with_msix_enabled_*`, `without_msix_*`,
+`queue_notify_ioevents_*`, `a_shared_memory_region_*`, `a_device_without_intx_*`), the
+`virtio::msix` and `legacy::gsi` tests.
+
+### Interrupt trigger mode
+
+`src/arch/src/x86_64/acpi.rs` — the DSDT declares virtio-mmio interrupts edge-triggered.
+Each one is a one-shot KVM irqfd pulse with no resample fd; declared level (upstream), the
+IOAPIC drops a pulse that arrives while the previous one awaits its EOI, and a busy guest then
+waits forever on I/O that already completed. Covered by
+`virtio_mmio_interrupts_are_edge_triggered`.
+
+`src/devices/src/virtio/{pci.rs,device.rs}` — a reset the device cannot perform (net, vsock and
+balloon implement none) reads back as done. Linux's virtio-pci driver polls the status until it
+reads 0 after writing 0 (`vp_modern_set_status`), which recent kernels do to every device at
+reboot and power-off, so the guest hung there and never reached its ACPI reset or S5. The
+transport drops its own state as for a reset, but the device stays failed underneath, its
+workers running, and the status reads 0 from then on (hiding FAILED): a later
+re-initialization gets no further than its first write and gives up (Linux at FEATURES_OK)
+rather than activating it twice. vk relaunches the VM on a reset, so nothing reuses the rings.
+A FAILED the driver wrote itself is now cleared by a reset, as the spec has it, instead of
+making a resettable device look like one that cannot reset. Covered by
+`a_reset_the_device_cannot_do_still_reads_back_as_done` and
+`a_driver_written_failed_is_cleared_by_a_reset`.
+
+### Not carried from the 1.19 tree
+
+- Initrd placement below 4 GiB: upstream in 2.0.
+- `IRQ_MAX` 23: upstream. The MP table's routing of all 24 IOAPIC pins is not carried: the MP
+  table only matters with `acpi=off`, which vk never sets.
+- The early 16550 COM1 console in `builder.rs`: superseded by `VmmBuilder::add_serial_console`.
+- The legacy PCI host bridge, virtio-pci INTx transport and per-slot allocation: PR #875.
+- `krun_disable_balloon`: 2.0 attaches no implicit balloon; vk adds one when it wants it.
+- The `krun_*` C entry points (`krun_add_virtiofs*`, `krun_set_pmu`, `krun_set_block_dirty_socket`,
+  …): replaced by the Rust builder setters above.
+- The VM name for the 15-byte `comm` (`krun_start_enter` reading `VIRTKIT_VM_NAME`): vk-driver
+  sets it itself.

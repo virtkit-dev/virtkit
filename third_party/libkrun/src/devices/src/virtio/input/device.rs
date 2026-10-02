@@ -1,20 +1,21 @@
 use std::cmp;
 use std::io::Write;
+use std::mem::size_of;
 use std::thread::JoinHandle;
 
 use log::{debug, error};
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use vm_memory::GuestMemoryMmap;
 
 use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice,
 };
 use super::worker::InputWorker;
-use super::{defs, defs::uapi, InputError};
+use super::{InputError, defs, defs::uapi};
 
+use crate::virtio::InterruptTransport;
 use crate::virtio::input::defs::config_select;
 use crate::virtio::input::defs::config_select::VIRTIO_INPUT_CFG_UNSET;
-use crate::virtio::InterruptTransport;
 use krun_input::{
     InputAbsInfo, InputConfigBackend, InputConfigInstance, InputDeviceIds,
     InputEventProviderBackend, InputQueryConfig,
@@ -178,6 +179,10 @@ impl VirtioDevice for Input {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &defs::QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<InputConfigRepr>() as u32)
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {

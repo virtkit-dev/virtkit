@@ -37,6 +37,27 @@ pub const LINUX_FALLOC_FL_PUNCH_HOLE: libc::c_int = 2;
 pub type stat64 = libc::stat;
 #[cfg(target_os = "linux")]
 pub use libc::stat64;
+#[cfg(target_os = "windows")]
+// We create a custom stat64 type for Windows because the Windows C-Runtime still use 16-bit for the inode field.
+#[repr(C)]
+pub struct stat64 {
+    pub st_ino: u64,
+    pub st_size: i64,
+    pub st_atime: i64,
+    pub st_mtime: i64,
+    pub st_ctime: i64,
+    pub st_mode: u32,
+    pub st_nlink: u32,
+    pub st_uid: u32,
+    pub st_gid: u32,
+    pub st_rdev: u32,
+    pub st_dev: u32,
+    pub st_atime_nsec: u32,
+    pub st_mtime_nsec: u32,
+    pub st_ctime_nsec: u32,
+    pub st_blksize: i64,
+    pub st_blocks: i64,
+}
 
 #[cfg(target_os = "macos")]
 pub type off64_t = libc::off_t;
@@ -47,11 +68,29 @@ pub use libc::off64_t;
 pub type statvfs64 = libc::statvfs;
 #[cfg(target_os = "linux")]
 pub use libc::statvfs64;
+#[cfg(target_os = "windows")]
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct statvfs64 {
+    pub f_bsize: u64,
+    pub f_frsize: u64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_favail: u64,
+    pub f_fsid: u64,
+    pub f_flag: u64,
+    pub f_namemax: u64,
+}
 
 #[cfg(target_os = "macos")]
 pub type ino64_t = libc::ino_t;
 #[cfg(target_os = "linux")]
 pub use libc::ino64_t;
+#[cfg(target_os = "windows")]
+pub type ino64_t = u64;
 
 #[cfg(target_os = "linux")]
 pub unsafe fn pread64(
@@ -60,7 +99,7 @@ pub unsafe fn pread64(
     count: libc::size_t,
     offset: off64_t,
 ) -> libc::ssize_t {
-    libc::pread64(fd, buf, count, offset)
+    unsafe { libc::pread64(fd, buf, count, offset) }
 }
 #[cfg(target_os = "macos")]
 pub unsafe fn pread64(
@@ -69,7 +108,7 @@ pub unsafe fn pread64(
     count: libc::size_t,
     offset: off64_t,
 ) -> libc::ssize_t {
-    libc::pread(fd, buf, count, offset)
+    unsafe { libc::pread(fd, buf, count, offset) }
 }
 
 #[cfg(target_os = "linux")]
@@ -79,7 +118,7 @@ pub unsafe fn preadv64(
     iovcnt: libc::c_int,
     offset: off64_t,
 ) -> libc::ssize_t {
-    libc::preadv64(fd, iov, iovcnt, offset)
+    unsafe { libc::preadv64(fd, iov, iovcnt, offset) }
 }
 #[cfg(target_os = "macos")]
 pub unsafe fn preadv64(
@@ -88,7 +127,7 @@ pub unsafe fn preadv64(
     iovcnt: libc::c_int,
     offset: off64_t,
 ) -> libc::ssize_t {
-    libc::preadv(fd, iov, iovcnt, offset)
+    unsafe { libc::preadv(fd, iov, iovcnt, offset) }
 }
 
 #[cfg(target_os = "linux")]
@@ -98,7 +137,7 @@ pub unsafe fn pwrite64(
     count: libc::size_t,
     offset: off64_t,
 ) -> libc::ssize_t {
-    libc::pwrite64(fd, buf, count, offset)
+    unsafe { libc::pwrite64(fd, buf, count, offset) }
 }
 #[cfg(target_os = "macos")]
 pub unsafe fn pwrite64(
@@ -107,7 +146,7 @@ pub unsafe fn pwrite64(
     count: libc::size_t,
     offset: off64_t,
 ) -> libc::ssize_t {
-    libc::pwrite(fd, buf, count, offset)
+    unsafe { libc::pwrite(fd, buf, count, offset) }
 }
 
 #[cfg(target_os = "linux")]
@@ -117,7 +156,7 @@ pub unsafe fn pwritev64(
     iovcnt: libc::c_int,
     offset: off64_t,
 ) -> libc::ssize_t {
-    libc::pwritev64(fd, iov, iovcnt, offset)
+    unsafe { libc::pwritev64(fd, iov, iovcnt, offset) }
 }
 #[cfg(target_os = "macos")]
 pub unsafe fn pwritev64(
@@ -126,7 +165,7 @@ pub unsafe fn pwritev64(
     iovcnt: libc::c_int,
     offset: off64_t,
 ) -> libc::ssize_t {
-    libc::pwritev(fd, iov, iovcnt, offset)
+    unsafe { libc::pwritev(fd, iov, iovcnt, offset) }
 }
 
 #[cfg(target_os = "linux")]
@@ -136,7 +175,7 @@ pub unsafe fn fstatat64(
     buf: *mut stat64,
     flags: libc::c_int,
 ) -> libc::c_int {
-    libc::fstatat64(dirfd, pathname, buf, flags)
+    unsafe { libc::fstatat64(dirfd, pathname, buf, flags) }
 }
 #[cfg(target_os = "macos")]
 pub unsafe fn fstatat64(
@@ -145,7 +184,7 @@ pub unsafe fn fstatat64(
     buf: *mut stat64,
     flags: libc::c_int,
 ) -> libc::c_int {
-    libc::fstatat(dirfd, pathname, buf, flags)
+    unsafe { libc::fstatat(dirfd, pathname, buf, flags) }
 }
 
 #[cfg(target_os = "linux")]
@@ -155,7 +194,7 @@ pub unsafe fn fallocate64(
     offset: off64_t,
     len: off64_t,
 ) -> libc::c_int {
-    libc::fallocate64(fd, mode, offset, len)
+    unsafe { libc::fallocate64(fd, mode, offset, len) }
 }
 #[cfg(target_os = "macos")]
 pub unsafe fn fallocate64(
@@ -169,34 +208,34 @@ pub unsafe fn fallocate64(
 
 #[cfg(target_os = "linux")]
 pub unsafe fn ftruncate64(fd: libc::c_int, length: off64_t) -> libc::c_int {
-    libc::ftruncate64(fd, length)
+    unsafe { libc::ftruncate64(fd, length) }
 }
 #[cfg(target_os = "macos")]
 pub unsafe fn ftruncate64(fd: libc::c_int, length: off64_t) -> libc::c_int {
-    libc::ftruncate(fd, length)
+    unsafe { libc::ftruncate(fd, length) }
 }
 
 #[cfg(target_os = "linux")]
 pub unsafe fn lseek64(fd: libc::c_int, offset: off64_t, whence: libc::c_int) -> off64_t {
-    libc::lseek64(fd, offset, whence)
+    unsafe { libc::lseek64(fd, offset, whence) }
 }
 #[cfg(target_os = "macos")]
 pub unsafe fn lseek64(fd: libc::c_int, offset: off64_t, whence: libc::c_int) -> off64_t {
-    libc::lseek(fd, offset, whence)
+    unsafe { libc::lseek(fd, offset, whence) }
 }
 
 #[cfg(target_os = "macos")]
 pub unsafe fn statvfs64(path: *const libc::c_char, buf: *mut statvfs64) -> libc::c_int {
-    libc::statvfs(path, buf)
+    unsafe { libc::statvfs(path, buf) }
 }
 
 #[cfg(target_os = "linux")]
 pub unsafe fn fstatvfs64(fd: libc::c_int, buf: *mut statvfs64) -> libc::c_int {
-    libc::fstatvfs64(fd, buf)
+    unsafe { libc::fstatvfs64(fd, buf) }
 }
 #[cfg(target_os = "macos")]
 pub unsafe fn fstatvfs64(fd: libc::c_int, buf: *mut statvfs64) -> libc::c_int {
-    libc::fstatvfs(fd, buf)
+    unsafe { libc::fstatvfs(fd, buf) }
 }
 
 #[cfg(target_os = "linux")]
@@ -206,7 +245,7 @@ pub unsafe fn mknodat(
     mode: libc::mode_t,
     dev: libc::dev_t,
 ) -> libc::c_int {
-    libc::mknodat(dirfd, pathname, mode, dev)
+    unsafe { libc::mknodat(dirfd, pathname, mode, dev) }
 }
 #[cfg(target_os = "macos")]
 pub unsafe fn mknodat(

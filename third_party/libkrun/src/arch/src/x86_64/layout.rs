@@ -22,44 +22,52 @@ pub const INITRD_SEV_START: u64 = 0xa00000;
 /// Start of the high memory.
 pub const HIMEM_START: u64 = 0x0010_0000; //1 MB.
 
-/// Number of interrupt pins on the guest's single IOAPIC. Must match the
-/// emulated IOAPIC (devices/legacy/ioapic.rs) and the pins the MPTABLE routes
-/// (mptable.rs): the guest can only use an IRQ that all three agree exists.
-pub const IOAPIC_NUM_PINS: u32 = 24;
-
-/// First usable IRQ ID for virtio device interrupts on x86_64. Pins 0-4 are
-/// reserved for legacy devices (timer, keyboard, PIC cascade, the serial ports),
-/// so virtio devices start at pin 5.
+// The I/O APIC has 24 pins (0-23). ISA IRQs 0-4 are reserved for
+// legacy devices, leaving GSIs 5-23 for virtio-mmio devices.
+/// First usable IRQ ID for virtio device interrupts on x86_64.
 pub const IRQ_BASE: u32 = 5;
-/// Last usable IRQ ID for virtio device interrupts on x86_64. Legacy virtio-mmio
-/// has one interrupt line per device (no MSI multiplexing), so each device claims
-/// one IOAPIC pin and the ceiling is the single IOAPIC's last pin (pin 23).
-pub const IRQ_MAX: u32 = IOAPIC_NUM_PINS - 1;
+/// Last usable IRQ ID for virtio device interrupts on x86_64.
+pub const IRQ_MAX: u32 = 23;
 
 /// Address for the TSS setup.
 pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;
 
-/// Where the ACPI tables (RSDP, XSDT, FADT, FACS, MADT, DSDT) are written. This
-/// sits in the legacy 0xA0000-0xFFFFF segment: backed by guest RAM region 0 but
-/// outside the E820 RAM map, the conventional home for firmware tables. The RSDP
-/// is both pointed to by `boot_params.acpi_rsdp_addr` and findable by the legacy
-/// 0xE0000-0xFFFFF scan.
-pub const ACPI_TABLES_START: u64 = 0xe0000;
-/// Highest address available to the ACPI tables (end of the 1 MiB segment).
-pub const ACPI_TABLES_END: u64 = 0x100000;
+/// Base of the guest-physical span shared-memory regions (virtio-fs DAX windows) are carved
+/// from, and its size. Fixed, and above any guest's RAM, so the DSDT can declare exactly this
+/// span as a 64-bit PCI host-bridge window: the virtio-pci transport exposes each region as a
+/// memory BAR, and Linux keeps a BAR only where a bridge window covers it. It ends at 128 GiB,
+/// so reaching it needs 37 physical address bits, which the guest gets from the host's
+/// CPUID leaf 0x80000008 as KVM reports it.
+pub const SHM_MEM_START: u64 = 64 << 30;
+pub const SHM_MEM_SIZE: u64 = 64 << 30;
 
-/// Base of the ACPI PM1 register block (PM1a_EVT at +0, PM1a_CNT at +4) and the
-/// ACPI reset register (+0xC), served by the `AcpiPm` PIO device.
+/// Base of the ACPI PM1 register block (PM1a_EVT at +0, PM1a_CNT at +4) and the ACPI reset
+/// register (+0xC), served by the `AcpiPm` PIO device (local patch, see VENDOR.md).
 pub const ACPI_PM_BASE: u16 = 0x600;
 /// Length of the `AcpiPm` PIO window.
 pub const ACPI_PM_LEN: u64 = 0x10;
-/// ACPI reset register, as an offset from `ACPI_PM_BASE` and as an absolute port.
+/// ACPI reset register, as an absolute port.
 pub const ACPI_RESET_REG: u16 = ACPI_PM_BASE + 0x0c;
 /// Value the guest writes to `ACPI_RESET_REG` to request a reset.
 pub const ACPI_RESET_VALUE: u8 = 1;
-/// IOAPIC GSI carrying the ACPI SCI (power-button events). Fixed; skipped by
-/// the virtio IRQ allocator.
+/// IOAPIC GSI carrying the ACPI SCI (power-button events). Fixed; skipped by the virtio IRQ
+/// allocators.
 pub const SCI_GSI: u32 = 9;
+
+/// Address of the hvm_start_info struct used in PVH boot.
+/// Mutually exclusive with SNP_CPUID_START (TEE only).
+pub const PVH_INFO_START: u64 = 0x6000;
+
+/// Starting address of array of modules of hvm_modlist_entry type.
+/// Used to enable initrd support using the PVH boot ABI.
+pub const MODLIST_START: u64 = 0x6040;
+
+/// Address of memory map table used in PVH boot. Can overlap
+/// with the zero page address since they are mutually exclusive.
+pub const MEMMAP_START: u64 = 0x7000;
+
+/// Location of RSDP pointer in x86 machines.
+pub const RSDP_ADDR: u64 = 0x000e_0000;
 
 /// The 'zero page', a.k.a linux kernel bootparams.
 pub const ZERO_PAGE_START: u64 = 0x7000;
@@ -90,18 +98,17 @@ pub const FIRMWARE_START: u64 = 0xffff_0000;
 /// The size of the firmware.
 pub const FIRMWARE_SIZE: u64 = 65536;
 
-/// Base of the guest-physical span virtio-fs DAX windows are carved from, and its size.
-///
-/// Fixed, and far above any guest's RAM, so the DSDT can declare exactly this span as a
-/// 64-bit PCI host-bridge memory window: the virtio-pci transport exposes each window as a
-/// memory BAR, and Linux keeps a BAR only where a bridge window covers it. It ends at
-/// 128 GiB, so reaching it needs 37 physical address bits — libkrun passes the host's
-/// MAXPHYADDR through unmodified, so that is what the guest has to have.
-/// (Local patch — see ../../../VENDOR.md.)
-pub const SHM_MEM_START: u64 = 64 << 30;
-pub const SHM_MEM_SIZE: u64 = 64 << 30;
-
 /// The start of the memory area reserved for MMIO devices.
 pub const FIRST_ADDR_PAST_32BITS: u64 = 1 << 32;
 pub const MEM_32BIT_GAP_SIZE: u64 = 768 << 20;
 pub const MMIO_MEM_START: u64 = FIRST_ADDR_PAST_32BITS - MEM_32BIT_GAP_SIZE;
+
+/// Start of the PCI Express ECAM window for bus 0.
+pub const PCI_ECAM_START: u64 = 0xe000_0000;
+/// ECAM exposes 4 KiB of configuration space for each of 256 PCI buses.
+/// This VM exposes bus 0 only.
+pub const PCI_ECAM_SIZE: u64 = 1 << 20;
+/// Start of the PCI memory BAR allocation window.
+pub const PCI_BAR_START: u64 = PCI_ECAM_START + PCI_ECAM_SIZE;
+/// Exclusive end of the PCI memory BAR allocation window, below the IOAPIC.
+pub const PCI_BAR_END: u64 = 0xfec0_0000;

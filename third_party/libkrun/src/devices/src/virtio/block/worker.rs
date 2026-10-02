@@ -1,15 +1,19 @@
 use crate::virtio::descriptor_utils::{Reader, Writer};
 
 use super::super::DeviceQueue;
-use super::device::{write_zeroes_exclusive, CacheType, DiskProperties};
+use super::SECTOR_SHIFT;
+use super::device::{CacheType, DiskProperties, write_zeroes_exclusive};
 
 use crate::virtio::{DescriptorChain, InterruptTransport};
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::result;
 use std::thread;
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
+#[cfg(target_os = "windows")]
+use utils::windows::AsRawFd;
 use virtio_bindings::virtio_blk::*;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
@@ -20,6 +24,7 @@ pub enum RequestError {
     DiscardingToZero(io::Error),
     FlushingToDisk(io::Error),
     InvalidDataLength,
+    InvalidOffset,
     ReadingFromDescriptor(io::Error),
     WritingToDescriptor(io::Error),
     WritingZeroes(io::Error),
@@ -108,7 +113,7 @@ impl BlockWorker {
         let virtq_ev_fd = self.device_queue.event.as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
-        let epoll = Epoll::new().unwrap();
+        let mut epoll = Epoll::new().unwrap();
 
         let _ = epoll.ctl(
             ControlOperation::Add,
@@ -122,8 +127,8 @@ impl BlockWorker {
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
         );
 
+        let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
-            let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
@@ -212,10 +217,11 @@ impl BlockWorker {
                 completed_any = true;
             }
 
-            if completed_any && self.device_queue.queue.needs_notification(mem).unwrap() {
-                if let Err(e) = self.interrupt.try_signal_used_queue() {
-                    error!("error signalling queue: {e:?}");
-                }
+            if completed_any
+                && self.device_queue.queue.needs_notification(mem).unwrap()
+                && let Err(e) = self.interrupt.try_signal_used_queue()
+            {
+                error!("error signalling queue: {e:?}");
             }
         }
     }
@@ -266,6 +272,17 @@ impl BlockWorker {
         Some((head.index, len))
     }
 
+    /// The byte offset of a `len`-byte request at guest `sector`, refused (IOERR) unless the
+    /// whole range fits the disk's `capacity` bytes: a guest-chosen sector must neither wrap
+    /// (release) nor panic the worker (debug), and a write past the end must not reach the
+    /// dirty tracker.
+    fn request_offset(capacity: u64, sector: u64, len: u64) -> result::Result<u64, RequestError> {
+        sector
+            .checked_mul(512)
+            .filter(|off| off.checked_add(len).is_some_and(|end| end <= capacity))
+            .ok_or(RequestError::InvalidOffset)
+    }
+
     fn process_request(
         disk: &DiskProperties,
         request_header: RequestHeader,
@@ -278,8 +295,13 @@ impl BlockWorker {
                 if !data_len.is_multiple_of(512) {
                     Err(RequestError::InvalidDataLength)
                 } else {
+                    let offset = Self::request_offset(
+                        disk.nsectors() << SECTOR_SHIFT,
+                        request_header.sector,
+                        data_len as u64,
+                    )?;
                     writer
-                        .write_from_at(disk, data_len, request_header.sector * 512)
+                        .write_from_at(disk, data_len, offset)
                         .map_err(RequestError::WritingToDescriptor)
                 }
             }
@@ -288,10 +310,15 @@ impl BlockWorker {
                 if !data_len.is_multiple_of(512) {
                     Err(RequestError::InvalidDataLength)
                 } else {
+                    let offset = Self::request_offset(
+                        disk.nsectors() << SECTOR_SHIFT,
+                        request_header.sector,
+                        data_len as u64,
+                    )?;
                     let written = reader
-                        .read_to_at(disk, data_len, request_header.sector * 512)
+                        .read_to_at(disk, data_len, offset)
                         .map_err(RequestError::ReadingFromDescriptor)?;
-                    disk.record_write(request_header.sector * 512, data_len as u64);
+                    disk.record_write(offset, data_len as u64);
                     Ok(written)
                 }
             }
@@ -320,55 +347,80 @@ impl BlockWorker {
                 let discard_write_data: DiscardWriteData = reader
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
+                let offset = Self::request_offset(
+                    disk.nsectors() << SECTOR_SHIFT,
+                    discard_write_data.sector,
+                    discard_write_data.num_sectors as u64 * 512,
+                )?;
                 // `&mut` op (allocation bookkeeping): takes the write lock, briefly excluding
                 // the rest of the batch.
                 let mut diskfile = disk.file.write().unwrap();
                 diskfile
-                    .discard_to_any(
-                        discard_write_data.sector * 512,
-                        discard_write_data.num_sectors as u64 * 512,
-                    )
+                    .discard_to_any(offset, discard_write_data.num_sectors as u64 * 512)
                     .map_err(RequestError::Discarding)?;
                 drop(diskfile);
-                disk.record_discard(
-                    discard_write_data.sector * 512,
-                    discard_write_data.num_sectors as u64 * 512,
-                );
+                // A discard's partial edge clusters stay out of the written set: what the format
+                // layer zeroes inside them is content DISCARD leaves undefined anyway.
+                disk.record_discard(offset, discard_write_data.num_sectors as u64 * 512);
                 Ok(0)
             }
             VIRTIO_BLK_T_WRITE_ZEROES => {
                 let discard_write_data: DiscardWriteData = reader
                     .read_obj()
                     .map_err(RequestError::ReadingFromDescriptor)?;
+                let offset = Self::request_offset(
+                    disk.nsectors() << SECTOR_SHIFT,
+                    discard_write_data.sector,
+                    discard_write_data.num_sectors as u64 * 512,
+                )?;
                 let unmap = (discard_write_data.flags & VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP) != 0;
                 if unmap {
                     // `&mut` op, same as discard above: write lock.
                     disk.file
                         .write()
                         .unwrap()
-                        .discard_to_zero(
-                            discard_write_data.sector * 512,
-                            discard_write_data.num_sectors as u64 * 512,
-                        )
+                        .discard_to_zero(offset, discard_write_data.num_sectors as u64 * 512)
                         .map_err(RequestError::DiscardingToZero)?;
                 } else {
                     // Write lock like the unmap case above, for a different reason — see
                     // `write_zeroes_exclusive`.
                     write_zeroes_exclusive(
                         &disk.file,
-                        discard_write_data.sector * 512,
+                        offset,
                         discard_write_data.num_sectors as u64 * 512,
                     )
                     .map_err(RequestError::WritingZeroes)?;
                 }
-                // Freed or zeroed either way — record as a discard so the checkpoint holes it.
-                disk.record_discard(
-                    discard_write_data.sector * 512,
-                    discard_write_data.num_sectors as u64 * 512,
-                );
+                // Zeroed either way: whole clusters are holed, a partial one at an end is read
+                // whole.
+                disk.record_zeroes(offset, discard_write_data.num_sectors as u64 * 512);
                 Ok(0)
             }
             _ => Err(RequestError::UnknownRequest),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlockWorker, RequestError};
+
+    #[test]
+    fn a_request_must_fit_the_disk() {
+        let cap = 4096;
+        assert_eq!(BlockWorker::request_offset(cap, 3, 512).ok(), Some(1536));
+        assert_eq!(BlockWorker::request_offset(cap, 7, 512).ok(), Some(3584));
+        // Ends past the disk, starts past it, or overflows on the way: all refused.
+        for (sector, len) in [
+            (7, 1024),
+            (9, 0),
+            (u64::MAX / 512 + 1, 0),
+            (u64::MAX / 512, 1024),
+        ] {
+            assert!(matches!(
+                BlockWorker::request_offset(cap, sector, len),
+                Err(RequestError::InvalidOffset)
+            ));
         }
     }
 }

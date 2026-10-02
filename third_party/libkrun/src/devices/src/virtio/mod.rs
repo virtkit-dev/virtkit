@@ -15,7 +15,6 @@ pub mod balloon;
 #[allow(dead_code)]
 #[allow(non_camel_case_types)]
 pub mod bindings;
-#[cfg(feature = "blk")]
 pub mod block;
 pub mod console;
 pub mod descriptor_utils;
@@ -29,17 +28,17 @@ pub mod gpu;
 pub mod input;
 pub mod linux_errno;
 mod mmio;
-#[cfg(target_arch = "x86_64")]
-mod msix;
+// MSI-X table, PBA and delivery for the virtio-pci transport (local patch, see VENDOR.md).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod msix;
 #[cfg(feature = "net")]
 pub mod net;
-#[cfg(target_arch = "x86_64")]
 mod pci;
 mod queue;
 #[cfg(not(feature = "tee"))]
 pub mod rng;
-#[cfg(feature = "snd")]
-pub mod snd;
+#[cfg(feature = "vhost-user")]
+pub mod vhost_user;
 pub mod vsock;
 
 #[cfg(not(feature = "tee"))]
@@ -53,17 +52,14 @@ pub use self::fs::*;
 #[cfg(feature = "gpu")]
 pub use self::gpu::*;
 pub use self::mmio::*;
-#[cfg(target_arch = "x86_64")]
-pub use self::msix::MsixConfig;
 #[cfg(feature = "net")]
 pub use self::net::Net;
-#[cfg(target_arch = "x86_64")]
-pub use self::pci::{VirtioPciDevice, CAPABILITY_BAR_SIZE};
+pub use self::pci::*;
 pub use self::queue::{Descriptor, DescriptorChain, Queue};
 #[cfg(not(feature = "tee"))]
 pub use self::rng::*;
-#[cfg(feature = "snd")]
-pub use self::snd::Snd;
+#[cfg(feature = "vhost-user")]
+pub use self::vhost_user::VhostUserDevice;
 pub use self::vsock::*;
 
 /// When the driver initializes the device, it lets the device know about the

@@ -12,9 +12,7 @@ use std::slice;
 use libc::c_char;
 
 use arch_gen::x86::mpspec;
-use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
-
-use crate::x86_64::layout::IOAPIC_NUM_PINS;
+use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
 // This is a workaround to the Rust enforcement specifying that any implementation of a foreign
 // trait (in this case `ByteValued`) where:
@@ -46,7 +44,7 @@ unsafe impl ByteValued for MpcLintsrcWrapper {}
 unsafe impl ByteValued for MpfIntelWrapper {}
 
 // MPTABLE, describing VCPUS.
-const MPTABLE_START: u64 = 0x9fc00;
+pub const MPTABLE_START: u64 = 0x9fc00;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Error {
@@ -83,7 +81,7 @@ pub const MAX_SUPPORTED_CPUS: u32 = 254;
 
 // Convenience macro for making arrays of diverse character types.
 macro_rules! char_array {
-    ($t:ty; $( $c:expr ),*) => ( [ $( $c as $t ),* ] )
+    ($t:ty; $( $c:expr_2021 ),*) => ( [ $( $c as $t ),* ] )
 }
 
 // Most of these variables are sourced from the Intel MP Spec 1.4.
@@ -93,13 +91,6 @@ const MPC_SPEC: i8 = 4;
 const MPC_OEM: [c_char; 8] = char_array!(c_char; 'F', 'C', ' ', ' ', ' ', ' ', ' ', ' ');
 const MPC_PRODUCT_ID: [c_char; 12] = ['0' as c_char; 12];
 const BUS_TYPE_ISA: [u8; 6] = char_array!(u8; b'I', b'S', b'A', b' ', b' ', b' ');
-const BUS_TYPE_PCI: [u8; 6] = char_array!(u8; b'P', b'C', b'I', b' ', b' ', b' ');
-/// MP bus ids. The PCI bus id MUST equal the PCI bus number the guest enumerates
-/// (0000:00 -> bus 0): Linux correlates an MP_INTSRC's `srcbus` with a device's
-/// PCI bus number directly when resolving INTx routing, so the PCI bus takes id
-/// 0 and the ISA bus is given id 1.
-const PCI_BUS_ID: u8 = 0;
-const ISA_BUS_ID: u8 = 1;
 const IO_APIC_DEFAULT_PHYS_BASE: u32 = 0xfec0_0000; // source: linux/arch/x86/include/asm/apicdef.h
 const APIC_DEFAULT_PHYS_BASE: u32 = 0xfee0_0000; // source: linux/arch/x86/include/asm/apicdef.h
 const APIC_VERSION: u8 = 0x14;
@@ -122,25 +113,18 @@ fn mpf_intel_compute_checksum(v: &mpspec::mpf_intel) -> u8 {
     (!checksum).wrapping_add(1)
 }
 
-fn compute_mp_size(num_cpus: u8, num_pci_irqs: usize) -> usize {
+fn compute_mp_size(num_cpus: u8) -> usize {
     mem::size_of::<MpfIntelWrapper>()
         + mem::size_of::<MpcTableWrapper>()
         + mem::size_of::<MpcCpuWrapper>() * (num_cpus as usize)
         + mem::size_of::<MpcIoapicWrapper>()
-        // ISA bus + PCI bus.
-        + mem::size_of::<MpcBusWrapper>() * 2
-        + mem::size_of::<MpcIntsrcWrapper>() * (IOAPIC_NUM_PINS as usize)
-        // One PCI INTSRC per routed PCI interrupt.
-        + mem::size_of::<MpcIntsrcWrapper>() * num_pci_irqs
+        + mem::size_of::<MpcBusWrapper>()
+        + mem::size_of::<MpcIntsrcWrapper>() * 16
         + mem::size_of::<MpcLintsrcWrapper>() * 2
 }
 
 /// Performs setup of the MP table for the given `num_cpus`.
-pub fn setup_mptable(
-    mem: &GuestMemoryMmap,
-    num_cpus: u8,
-    pci_irqs: &[(u8, u8, u32)],
-) -> Result<()> {
+pub fn setup_mptable(mem: &GuestMemoryMmap, num_cpus: u8) -> Result<()> {
     if u32::from(num_cpus) > MAX_SUPPORTED_CPUS {
         return Err(Error::TooManyCpus);
     }
@@ -148,7 +132,7 @@ pub fn setup_mptable(
     // Used to keep track of the next base pointer into the MP table.
     let mut base_mp = GuestAddress(MPTABLE_START);
 
-    let mp_size = compute_mp_size(num_cpus, pci_irqs.len());
+    let mp_size = compute_mp_size(num_cpus);
 
     let mut checksum: u8 = 0;
     let ioapicid: u8 = num_cpus + 1;
@@ -210,21 +194,8 @@ pub fn setup_mptable(
         let size = mem::size_of::<MpcBusWrapper>() as u64;
         let mut mpc_bus = MpcBusWrapper(mpspec::mpc_bus::default());
         mpc_bus.0.type_ = mpspec::MP_BUS as u8;
-        mpc_bus.0.busid = ISA_BUS_ID;
+        mpc_bus.0.busid = 0;
         mpc_bus.0.bustype = BUS_TYPE_ISA;
-        mem.write_obj(mpc_bus, base_mp)
-            .map_err(|_| Error::WriteMpcBus)?;
-        base_mp = base_mp.unchecked_add(size);
-        checksum = checksum.wrapping_add(compute_checksum(&mpc_bus.0));
-    }
-    {
-        // PCI bus, so the guest can resolve virtio-pci INTx routing (INT A/B/C/D)
-        // from the MP_INTSRC entries emitted below.
-        let size = mem::size_of::<MpcBusWrapper>() as u64;
-        let mut mpc_bus = MpcBusWrapper(mpspec::mpc_bus::default());
-        mpc_bus.0.type_ = mpspec::MP_BUS as u8;
-        mpc_bus.0.busid = PCI_BUS_ID;
-        mpc_bus.0.bustype = BUS_TYPE_PCI;
         mem.write_obj(mpc_bus, base_mp)
             .map_err(|_| Error::WriteMpcBus)?;
         base_mp = base_mp.unchecked_add(size);
@@ -243,44 +214,17 @@ pub fn setup_mptable(
         base_mp = base_mp.unchecked_add(size);
         checksum = checksum.wrapping_add(compute_checksum(&mpc_ioapic.0));
     }
-    // Route every IOAPIC pin, not just the legacy ISA range: the IRQ allocator
-    // hands out pins up to IRQ_MAX (IOAPIC_NUM_PINS - 1), and without an INTSRC
-    // entry the guest cannot wire a virtio-mmio device landing on a high pin.
-    // Per kvm_setup_default_irq_routing() in kernel.
-    for i in 0..IOAPIC_NUM_PINS as u8 {
+    // Per kvm_setup_default_irq_routing() in kernel
+    for i in 0..16 {
         let size = mem::size_of::<MpcIntsrcWrapper>() as u64;
         let mut mpc_intsrc = MpcIntsrcWrapper(mpspec::mpc_intsrc::default());
         mpc_intsrc.0.type_ = mpspec::MP_INTSRC as u8;
         mpc_intsrc.0.irqtype = mpspec::mp_irq_source_types_mp_INT as u8;
         mpc_intsrc.0.irqflag = mpspec::MP_IRQDIR_DEFAULT as u16;
-        mpc_intsrc.0.srcbus = ISA_BUS_ID;
+        mpc_intsrc.0.srcbus = 0;
         mpc_intsrc.0.srcbusirq = i;
         mpc_intsrc.0.dstapic = ioapicid;
         mpc_intsrc.0.dstirq = i;
-        mem.write_obj(mpc_intsrc, base_mp)
-            .map_err(|_| Error::WriteMpcIntsrc)?;
-        base_mp = base_mp.unchecked_add(size);
-        checksum = checksum.wrapping_add(compute_checksum(&mpc_intsrc.0));
-    }
-    // PCI INTx routing: one MP_INTSRC per (device, pin) -> GSI. The PCI source
-    // bus IRQ encodes (device << 2) | (pin - 1) as per the MP spec, and the
-    // destination IOAPIC pin is the GSI the device asserts.
-    // Edge-triggered, active-high polarity (irqflag bits: polarity 01, trigger
-    // 01). PCI INTx is conventionally level/active-low, but we deliver it via a
-    // one-shot `KVM_IRQFD` without a resample eventfd; programming the IOAPIC
-    // pin as edge-triggered matches that one-pulse-per-signal delivery. (MSI-X
-    // later removes the per-device INTx pin.)
-    const MP_IRQ_EDGE_HIGH: u16 = 0b0101;
-    for &(device, pin, gsi) in pci_irqs {
-        let size = mem::size_of::<MpcIntsrcWrapper>() as u64;
-        let mut mpc_intsrc = MpcIntsrcWrapper(mpspec::mpc_intsrc::default());
-        mpc_intsrc.0.type_ = mpspec::MP_INTSRC as u8;
-        mpc_intsrc.0.irqtype = mpspec::mp_irq_source_types_mp_INT as u8;
-        mpc_intsrc.0.irqflag = MP_IRQ_EDGE_HIGH;
-        mpc_intsrc.0.srcbus = PCI_BUS_ID;
-        mpc_intsrc.0.srcbusirq = (device << 2) | (pin.saturating_sub(1) & 0x3);
-        mpc_intsrc.0.dstapic = ioapicid;
-        mpc_intsrc.0.dstirq = gsi as u8;
         mem.write_obj(mpc_intsrc, base_mp)
             .map_err(|_| Error::WriteMpcIntsrc)?;
         base_mp = base_mp.unchecked_add(size);
@@ -362,11 +306,11 @@ mod tests {
         let num_cpus = 4;
         let mem = GuestMemoryMmap::from_ranges(&[(
             GuestAddress(MPTABLE_START),
-            compute_mp_size(num_cpus, 0),
+            compute_mp_size(num_cpus),
         )])
         .unwrap();
 
-        setup_mptable(&mem, num_cpus, &[]).unwrap();
+        setup_mptable(&mem, num_cpus).unwrap();
     }
 
     #[test]
@@ -374,11 +318,11 @@ mod tests {
         let num_cpus = 4;
         let mem = GuestMemoryMmap::from_ranges(&[(
             GuestAddress(MPTABLE_START),
-            compute_mp_size(num_cpus, 0) - 1,
+            compute_mp_size(num_cpus) - 1,
         )])
         .unwrap();
 
-        assert!(setup_mptable(&mem, num_cpus, &[]).is_err());
+        assert!(setup_mptable(&mem, num_cpus).is_err());
     }
 
     #[test]
@@ -386,11 +330,11 @@ mod tests {
         let num_cpus = 1;
         let mem = GuestMemoryMmap::from_ranges(&[(
             GuestAddress(MPTABLE_START),
-            compute_mp_size(num_cpus, 0),
+            compute_mp_size(num_cpus),
         )])
         .unwrap();
 
-        setup_mptable(&mem, num_cpus, &[]).unwrap();
+        setup_mptable(&mem, num_cpus).unwrap();
 
         let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
 
@@ -405,11 +349,11 @@ mod tests {
         let num_cpus = 4;
         let mem = GuestMemoryMmap::from_ranges(&[(
             GuestAddress(MPTABLE_START),
-            compute_mp_size(num_cpus, 0),
+            compute_mp_size(num_cpus),
         )])
         .unwrap();
 
-        setup_mptable(&mem, num_cpus, &[]).unwrap();
+        setup_mptable(&mem, num_cpus).unwrap();
 
         let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
         let mpc_offset = GuestAddress(u64::from(mpf_intel.0.physptr));
@@ -432,7 +376,7 @@ mod tests {
         let mut buf: Vec<u8> = vec![0; mpc_table.0.length as usize];
         mem.write_volatile_to(mpc_offset, &mut buf, mpc_table.0.length as usize)
             .unwrap();
-        sum.write(&buf).unwrap();
+        sum.write_all(&buf).unwrap();
         assert_eq!(sum.0, 0);
     }
 
@@ -440,12 +384,12 @@ mod tests {
     fn cpu_entry_count() {
         let mem = GuestMemoryMmap::from_ranges(&[(
             GuestAddress(MPTABLE_START),
-            compute_mp_size(MAX_SUPPORTED_CPUS as u8, 0),
+            compute_mp_size(MAX_SUPPORTED_CPUS as u8),
         )])
         .unwrap();
 
         for i in 0..MAX_SUPPORTED_CPUS as u8 {
-            setup_mptable(&mem, i, &[]).unwrap();
+            setup_mptable(&mem, i).unwrap();
 
             let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
             let mpc_offset = GuestAddress(u64::from(mpf_intel.0.physptr));
@@ -473,52 +417,15 @@ mod tests {
     }
 
     #[test]
-    fn intsrc_entry_count() {
-        // The INTSRC loop bound and compute_mp_size must stay in lockstep: the
-        // table routes one MP_INTSRC per IOAPIC pin, so the count the guest sees
-        // must equal IOAPIC_NUM_PINS (drift would leave high pins unroutable).
-        let mem = GuestMemoryMmap::from_ranges(&[(
-            GuestAddress(MPTABLE_START),
-            compute_mp_size(MAX_SUPPORTED_CPUS as u8, 0),
-        )])
-        .unwrap();
-
-        setup_mptable(&mem, 1, &[]).unwrap();
-
-        let mpf_intel: MpfIntelWrapper = mem.read_obj(GuestAddress(MPTABLE_START)).unwrap();
-        let mpc_offset = GuestAddress(u64::from(mpf_intel.0.physptr));
-        let mpc_table: MpcTableWrapper = mem.read_obj(mpc_offset).unwrap();
-        let mpc_end = mpc_offset
-            .checked_add(u64::from(mpc_table.0.length))
-            .unwrap();
-
-        let mut entry_offset = mpc_offset
-            .checked_add(mem::size_of::<MpcTableWrapper>() as u64)
-            .unwrap();
-        let mut intsrc_count: u32 = 0;
-        while entry_offset < mpc_end {
-            let entry_type: u8 = mem.read_obj(entry_offset).unwrap();
-            entry_offset = entry_offset
-                .checked_add(table_entry_size(entry_type) as u64)
-                .unwrap();
-            assert!(entry_offset <= mpc_end);
-            if u32::from(entry_type) == mpspec::MP_INTSRC {
-                intsrc_count += 1;
-            }
-        }
-        assert_eq!(intsrc_count, IOAPIC_NUM_PINS);
-    }
-
-    #[test]
     fn cpu_entry_count_max() {
         let cpus = MAX_SUPPORTED_CPUS + 1;
         let mem = GuestMemoryMmap::from_ranges(&[(
             GuestAddress(MPTABLE_START),
-            compute_mp_size(cpus as u8, 0),
+            compute_mp_size(cpus as u8),
         )])
         .unwrap();
 
-        let result = setup_mptable(&mem, cpus as u8, &[]).unwrap_err();
+        let result = setup_mptable(&mem, cpus as u8).unwrap_err();
         assert_eq!(result, Error::TooManyCpus);
     }
 }

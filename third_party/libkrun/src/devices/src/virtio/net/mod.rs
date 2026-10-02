@@ -13,8 +13,9 @@ const ETH_HDR_LEN: usize = 14;
 /// virtio-net spec and the Linux driver (`ETH_MIN_MTU`) enforce.
 pub const MIN_MTU: u16 = 68;
 /// Largest link MTU a caller may configure. The config field is a `u16`, and the frame it
-/// describes plus the virtio-net header has to fit [`MAX_BUFFER_SIZE`] — the assertion below
-/// ties the two together so a buffer-size change cannot silently outgrow the frame buffers.
+/// describes (untagged: no room is left for an 802.1Q tag) plus the virtio-net header has to
+/// fit [`MAX_BUFFER_SIZE`] — the assertion below ties the two together so a buffer-size change
+/// cannot silently outgrow the frame buffers.
 pub const MAX_MTU: u16 = u16::MAX;
 const _: () = assert!(MAX_BUFFER_SIZE >= VNET_HDR_LEN + ETH_HDR_LEN + MAX_MTU as usize);
 pub const NUM_QUEUES: usize = 2;
@@ -24,6 +25,7 @@ mod backend;
 pub mod device;
 #[cfg(target_os = "linux")]
 mod tap;
+#[cfg(unix)]
 mod unixgram;
 mod unixstream;
 mod worker;
@@ -32,6 +34,7 @@ mod worker;
 const VNET_HDR_LEN: usize = mem::size_of::<virtio_net_hdr_v1>();
 
 // This initializes to all 0 the virtio_net_hdr part of a buf and return the length of the header
+#[cfg(unix)]
 fn write_virtio_net_hdr(buf: &mut [u8]) -> usize {
     buf[0..VNET_HDR_LEN].fill(0);
     VNET_HDR_LEN

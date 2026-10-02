@@ -5,7 +5,7 @@ pub mod amd;
 pub mod common;
 pub mod intel;
 
-pub use kvm_bindings::{kvm_cpuid_entry2, CpuId};
+pub use kvm_bindings::{CpuId, kvm_cpuid_entry2};
 
 use crate::brand_string::BrandString;
 use crate::brand_string::Reg as BsReg;
@@ -24,7 +24,7 @@ pub struct VmSpec {
     /// Specifies whether nested virtualization is enabled.
     nested_enabled: bool,
     /// Specifies whether the guest PMU is exposed (leaf 0xA left as KVM reports
-    /// it) instead of zeroed. virtkit patch, default false — see VENDOR.md.
+    /// it) instead of zeroed. local patch, default false — see VENDOR.md.
     pmu_enabled: bool,
     /// The desired brand string for the guest.
     brand_string: BrandString,
@@ -52,14 +52,14 @@ impl VmSpec {
         })
     }
 
-    /// Expose the guest PMU (virtkit patch): keep CPUID leaf 0xA as KVM reports
+    /// Expose the guest PMU (local patch): keep CPUID leaf 0xA as KVM reports
     /// it instead of zeroing it, so KVM's vPMU backs in-guest hardware counters.
     pub fn with_pmu_enabled(mut self, enabled: bool) -> Self {
         self.pmu_enabled = enabled;
         self
     }
 
-    /// Returns whether the guest PMU is exposed (virtkit patch)
+    /// Returns whether the guest PMU is exposed (local patch)
     pub fn pmu_enabled(&self) -> bool {
         self.pmu_enabled
     }
@@ -148,9 +148,11 @@ mod tests {
         let mut cpuid = CpuId::new(num_entries).unwrap();
         let vm_spec = VmSpec::new(0, 1, false, false);
         cpuid.as_mut_slice()[0].function = PROCESSED_FN;
-        assert!(MockCpuidTransformer {}
-            .process_cpuid(&mut cpuid, &vm_spec.unwrap())
-            .is_ok());
+        assert!(
+            MockCpuidTransformer {}
+                .process_cpuid(&mut cpuid, &vm_spec.unwrap())
+                .is_ok()
+        );
 
         assert!(cpuid.as_mut_slice().len() == num_entries);
         for entry in cpuid.as_mut_slice().iter() {

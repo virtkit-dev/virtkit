@@ -30,8 +30,8 @@ use std::io;
 use std::mem;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::filesystem::{
@@ -869,12 +869,14 @@ mod tests {
     fn read_only_rejects_write_open() {
         let p = tmp_with(b"x");
         let fs = SingleFileFs::new(p.clone(), true).unwrap();
-        assert!(fs
-            .open(ctx(), FILE_INODE, false, libc::O_WRONLY as u32)
-            .is_err());
-        assert!(fs
-            .open(ctx(), FILE_INODE, false, libc::O_RDONLY as u32)
-            .is_ok());
+        assert!(
+            fs.open(ctx(), FILE_INODE, false, libc::O_WRONLY as u32)
+                .is_err()
+        );
+        assert!(
+            fs.open(ctx(), FILE_INODE, false, libc::O_RDONLY as u32)
+                .is_ok()
+        );
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }
 
@@ -946,9 +948,10 @@ mod tests {
         let after = std::fs::read(&p).unwrap();
         assert_eq!(after, small);
         // and the temp is gone from the namespace and the parent dir
-        assert!(fs
-            .lookup(ctx(), fuse::ROOT_ID, &cs("secret.json.tmp"))
-            .is_err());
+        assert!(
+            fs.lookup(ctx(), fuse::ROOT_ID, &cs("secret.json.tmp"))
+                .is_err()
+        );
         assert!(fs.temps.read().unwrap().is_empty());
         std::fs::remove_dir_all(p.parent().unwrap()).ok();
     }

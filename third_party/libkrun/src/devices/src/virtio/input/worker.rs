@@ -9,8 +9,8 @@ use virtio_bindings::virtio_input;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::DeviceQueue;
-use crate::virtio::descriptor_utils::{Reader, Writer};
 use crate::virtio::InterruptTransport;
+use crate::virtio::descriptor_utils::{Reader, Writer};
 use krun_input::{InputEventProviderBackend, InputEventProviderInstance, InputEventsImpl};
 
 // Create a wrapper type to work around orphan rules
@@ -76,7 +76,7 @@ impl InputWorker {
         const EVENTQ_USER: u64 = 3;
         const QUIT: u64 = 4;
         // Set up epoll to wait for events
-        let epoll = Epoll::new().expect("Failed to create epoll");
+        let mut epoll = Epoll::new().expect("Failed to create epoll");
 
         let ready_fd = match events_instance.get_read_notify_fd() {
             Ok(fd) => fd,
@@ -240,7 +240,7 @@ impl InputWorker {
             let mut buffer: [u8; size_of::<virtio_input::virtio_input_event>()] =
                 [0; size_of::<virtio_input::virtio_input_event>()];
             reader.read_exact(&mut buffer)?;
-            debug!("Not implemented status queue request: {:?}", &buffer);
+            debug!("Not implemented status queue request: {buffer:?}");
             // For now, we don't send events back to the input source
             // This would be used for things like setting LEDs on keyboards, haptic feedback, etc.
         }

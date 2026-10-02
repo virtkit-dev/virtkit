@@ -1,20 +1,23 @@
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+#[cfg(windows)]
+use utils::windows::RawFd;
 
 use super::super::Queue as VirtQueue;
-use super::muxer::{push_packet, MuxerRx, ProxyMap};
+use super::muxer::{MuxerRx, ProxyMap, push_packet};
 use super::muxer_rxq::MuxerRxQ;
 use super::proxy::{NewProxyType, Proxy, ProxyRemoval, ProxyUpdate};
 use super::tsi_stream::TsiStreamProxy;
 
-use crate::virtio::vsock::defs;
-use crate::virtio::vsock::unix::{UnixAcceptorProxy, UnixProxy};
 use crate::virtio::InterruptTransport;
+use crate::virtio::vsock::defs;
+use crate::virtio::vsock::unix_proxy::{UnixAcceptorProxy, UnixProxy};
 use crossbeam_channel::Sender;
-use rand::{rng, rngs::ThreadRng, Rng};
+use rand::{RngExt, rng, rngs::ThreadRng};
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vm_memory::GuestMemoryMmap;
 
@@ -70,13 +73,28 @@ impl MuxerThread {
 
     pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {
         debug!("update_polling id={id} fd={fd:?} evset={evset:?}");
-        let _ = self
-            .epoll
-            .ctl(ControlOperation::Delete, fd, &EpollEvent::default());
-        if !evset.is_empty() {
+        #[cfg(unix)]
+        {
             let _ = self
                 .epoll
-                .ctl(ControlOperation::Add, fd, &EpollEvent::new(evset, id));
+                .ctl(ControlOperation::Delete, fd, &EpollEvent::default());
+            if !evset.is_empty() {
+                let _ = self
+                    .epoll
+                    .ctl(ControlOperation::Add, fd, &EpollEvent::new(evset, id));
+            }
+        }
+        #[cfg(windows)]
+        {
+            let sock = fd as windows_sys::Win32::Networking::WinSock::SOCKET;
+            let _ = self
+                .epoll
+                .ctl_socket(ControlOperation::Delete, sock, &EpollEvent::default());
+            if !evset.is_empty() {
+                let _ =
+                    self.epoll
+                        .ctl_socket(ControlOperation::Add, sock, &EpollEvent::new(evset, id));
+            }
         }
     }
 
@@ -149,7 +167,7 @@ impl MuxerThread {
         }
     }
 
-    fn create_lisening_ipc_sockets(&self) {
+    fn create_listening_ipc_sockets(&self) {
         for (port, (path, do_listen)) in &self.unix_ipc_port_map {
             if !do_listen {
                 continue;
@@ -172,18 +190,18 @@ impl MuxerThread {
         }
     }
 
-    fn work(self) {
+    fn work(mut self) {
         let mut thread_rng = rng();
-        self.create_lisening_ipc_sockets();
+        self.create_listening_ipc_sockets();
+        let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
-            let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match self
                 .epoll
                 .wait(epoll_events.len(), -1, epoll_events.as_mut_slice())
             {
                 Ok(ev_cnt) => {
                     for ev in &epoll_events[0..ev_cnt] {
-                        debug!("Event: ev.data={} ev.fd={}", ev.data(), ev.fd());
+                        debug!("Event: ev.data={} ev.fd={:?}", ev.data(), ev.fd());
                         let evset = EventSet::from_bits(ev.events).unwrap();
                         let id = ev.data();
 

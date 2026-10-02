@@ -11,7 +11,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::{io, result};
 
 use nix::errno::Errno;
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::unistd::{dup, pipe, read, write};
 
 pub const EFD_NONBLOCK: i32 = 1;
@@ -38,7 +38,7 @@ impl EventFd {
     pub fn new(flag: i32) -> result::Result<EventFd, io::Error> {
         let (read_fd, write_fd) = pipe()?;
 
-        if flag == EFD_NONBLOCK {
+        if flag & EFD_NONBLOCK != 0 {
             set_nonblock(&read_fd)?;
             set_nonblock(&write_fd)?;
         }

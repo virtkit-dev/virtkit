@@ -18,10 +18,10 @@ pub use self::macos::*;
 use std::fmt::Debug;
 
 use crate::{
+    ArchMemoryInfo,
     aarch64::layout::{
         DRAM_MEM_MAX_SIZE, DRAM_MEM_START_EFI, DRAM_MEM_START_KERNEL, FIRMWARE_START,
     },
-    ArchMemoryInfo,
 };
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 use vmm_sys_util::align_upwards;
@@ -70,10 +70,14 @@ pub fn arch_memory_regions(
         ram_start_addr,
         ram_last_addr,
         shm_start_addr,
+        // To be filled later using GuestMemory.
+        guest_last_addr: 0,
         page_size,
         fdt_addr,
         initrd_addr: fdt_addr - initrd_size,
         firmware_addr: FIRMWARE_START,
+        #[cfg(target_os = "macos")]
+        ipa_size: 0,
     };
     let regions = if let Some(firmware_size) = firmware_size {
         vec![

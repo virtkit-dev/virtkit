@@ -18,10 +18,13 @@ mod reaper;
 mod timesync;
 mod tsi_dgram;
 mod tsi_stream;
-mod unix;
+mod unix_proxy;
 
-pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
+#[cfg(target_os = "windows")]
+mod windows;
+
 pub use self::defs::TsiFlags;
+pub use self::defs::uapi::VIRTIO_ID_VSOCK as TYPE_VSOCK;
 pub use self::device::Vsock;
 
 use bitflags::bitflags;
@@ -73,7 +76,7 @@ mod defs {
     /// Size of the muxer RX packet queue. On overflow the muxer silently drops host->guest
     /// packets (the connect OP_RESPONSE among them), so a guest that is slow to repost RX
     /// buffers under memory pressure sees control connections reset. Sized for headroom
-    /// through such a stall; each slot is a small `MuxerRx`.
+    /// through such a stall; each slot is a small `MuxerRx` (local patch).
     pub const MUXER_RXQ_SIZE: usize = 1024;
 
     // Kernel side doesn't play nice with us supporting so many bytes

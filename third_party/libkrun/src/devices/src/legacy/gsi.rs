@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use kvm_bindings::{
-    kvm_irq_routing_entry, kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip,
-    kvm_irq_routing_msi, KvmIrqRouting, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
-    KVM_IRQCHIP_PIC_SLAVE, KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI,
+    KVM_IRQ_ROUTING_IRQCHIP, KVM_IRQ_ROUTING_MSI, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER,
+    KVM_IRQCHIP_PIC_SLAVE, KvmIrqRouting, kvm_irq_routing_entry,
+    kvm_irq_routing_entry__bindgen_ty_1, kvm_irq_routing_irqchip, kvm_irq_routing_msi,
 };
 use kvm_ioctls::VmFd;
 

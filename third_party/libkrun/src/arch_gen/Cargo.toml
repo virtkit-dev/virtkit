@@ -1,8 +1,8 @@
 [package]
 name = "krun-arch-gen"
-version = "0.1.0-1.19.0"
+version = "0.1.0-2.0.0-dev"
 authors = ["The libkrun Authors"]
-edition = "2021"
+edition = "2024"
 description = "Generated architecture-specific definitions for libkrun"
 license = "Apache-2.0"
 repository = "https://github.com/containers/libkrun"

@@ -2,8 +2,11 @@ use std::cmp;
 use std::io::Write;
 use std::iter::zip;
 use std::mem::{size_of, size_of_val};
+#[cfg(unix)]
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use utils::windows::{AsRawFd, RawFd};
 
 use utils::eventfd::EventFd;
 use vm_memory::{ByteValued, Bytes, GuestMemoryMmap};
@@ -18,7 +21,7 @@ use crate::virtio::console::console_control::{
 use crate::virtio::console::defs::QUEUE_SIZE;
 use crate::virtio::console::port::Port;
 use crate::virtio::console::port_queue_mapping::{
-    num_queues, port_id_to_queue_idx, QueueDirection,
+    QueueDirection, num_queues, port_id_to_queue_idx,
 };
 use crate::virtio::{InterruptTransport, PortDescription, VmmExitObserver};
 
@@ -178,10 +181,10 @@ impl Console {
                 Ok(cmd) => cmd,
                 Err(e) => {
                     log::error!(
-                    "Failed to read VirtioConsoleControl struct: {e:?}, struct len = {len}, head.len = {head_len}",
-                    len = size_of::<VirtioConsoleControl>(),
-                    head_len = head.len,
-                );
+                        "Failed to read VirtioConsoleControl struct: {e:?}, struct len = {len}, head.len = {head_len}",
+                        len = size_of::<VirtioConsoleControl>(),
+                        head_len = head.len,
+                    );
                     continue;
                 }
             };
@@ -303,6 +306,10 @@ impl VirtioDevice for Console {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &self.queue_config
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<VirtioConsoleConfig>() as u32)
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {

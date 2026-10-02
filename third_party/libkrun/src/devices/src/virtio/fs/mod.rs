@@ -1,22 +1,19 @@
 mod augment_fs;
 mod device;
-// filesystem + read_only are public (local patch, see VENDOR.md): an external
-// vhost-user daemon drives the fs engine through the FileSystem trait types.
 #[allow(dead_code)]
-pub mod filesystem;
+mod filesystem;
 pub mod fuse;
-// public (local patch, see VENDOR.md): the virtiofsd-compatible soft UID/GID id-map
-// wrapper, usable by both the in-process virtio-fs device and the external `vk virtiofsd`.
-pub mod idmap;
+// UID/GID mapping (local patch, see VENDOR.md).
+mod idmap;
 mod inode_alloc;
 #[allow(dead_code)]
 mod multikey;
 mod null_fs;
-pub mod read_only;
+mod read_only;
 mod server;
-// public (local patch): the single-file bind primitive, usable by both the in-process
-// virtio-fs device and the external `vk virtiofsd`.
-pub mod single_file;
+// Single-file shares (local patch, see VENDOR.md).
+#[cfg(target_os = "linux")]
+mod single_file;
 pub mod virtual_entry;
 mod worker;
 
@@ -32,6 +29,12 @@ pub mod macos;
 pub use macos::fs_utils;
 #[cfg(target_os = "macos")]
 pub use macos::passthrough;
+#[cfg(target_os = "windows")]
+pub mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::fs_utils;
+#[cfg(target_os = "windows")]
+pub use windows::passthrough;
 
 use super::bindings;
 use super::descriptor_utils;
@@ -39,13 +42,6 @@ use super::descriptor_utils;
 pub use self::defs::uapi::VIRTIO_ID_FS as TYPE_FS;
 pub use self::device::Fs;
 pub use self::filesystem::ExportTable;
-// Local patch (see VENDOR.md): expose the transport-agnostic FUSE server pieces so an
-// external vhost-user daemon can drive PassthroughFs without this crate's Fs device.
-pub use self::filesystem::FileSystem;
-// Local patch (see VENDOR.md): expose the soft id-map wrapper and its parsed tables.
-pub use self::idmap::{IdMap, IdMapFs, IdTable};
-pub use self::inode_alloc::InodeAllocator;
-pub use self::server::Server;
 
 mod defs {
     use super::super::QueueConfig;

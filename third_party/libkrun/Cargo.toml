@@ -1,9 +1,6 @@
 [workspace]
 members = [
     "src/libkrun",
-    "src/init_blob",
-    "src/input",
-    "src/display",
     "src/utils",
     "src/arch_gen",
     "src/cpuid",
@@ -13,11 +10,10 @@ members = [
     "src/arch",
     "src/hvf",
     "src/devices",
-    "src/vmm",
     "src/aws_nitro",
-    "src/rutabaga_gfx",
+    "src/whp",
 ]
-exclude = ["examples/gtk_display"]
+exclude = ["src/input", "src/display"]
 resolver = "2"
 
 [profile.dev]

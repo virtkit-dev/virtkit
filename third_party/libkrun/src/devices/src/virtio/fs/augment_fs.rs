@@ -29,7 +29,9 @@ use super::filesystem::{
 };
 use super::fuse;
 use super::inode_alloc::InodeAllocator;
-use super::virtual_entry::{VirtualDirEntry, VirtualEntry, VirtualEntryContent, VIRTUAL_BLKSIZE};
+use super::virtual_entry::{VIRTUAL_BLKSIZE, VirtualDirEntry, VirtualEntry, VirtualEntryContent};
+#[cfg(target_os = "windows")]
+use super::windows::fs_utils;
 use crate::virtio::bindings;
 use crate::virtio::linux_errno;
 
@@ -53,7 +55,7 @@ pub struct AugmentFs<T> {
     name_to_inode: RwLock<HashMap<(Inode, CString), Inode>>,
     /// Maps virtual inode number → (mode, inode data). One-shot entries are
     /// removed from this map on release.
-    inodes: RwLock<HashMap<Inode, VirtualEntry>>,
+    inodes: RwLock<HashMap<Inode, VirtualEntry<'static>>>,
 }
 
 impl<T: FileSystem<Inode = Inode, Handle = Handle>> AugmentFs<T> {
@@ -62,7 +64,11 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> AugmentFs<T> {
     /// `entries` are registered as virtual inodes in the root directory.
     /// Inode numbers are obtained from `inode_alloc`, the same allocator
     /// used by the inner filesystem.
-    pub fn new(inner: T, inode_alloc: &InodeAllocator, entries: Vec<VirtualDirEntry>) -> Self {
+    pub fn new(
+        inner: T,
+        inode_alloc: &InodeAllocator,
+        entries: Vec<VirtualDirEntry<'static>>,
+    ) -> Self {
         let mut name_to_inode = HashMap::new();
         let mut inodes = HashMap::new();
 
@@ -83,10 +89,10 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> AugmentFs<T> {
 
     fn register_entries(
         parent: Inode,
-        entries: Vec<VirtualDirEntry>,
+        entries: Vec<VirtualDirEntry<'static>>,
         inode_alloc: &InodeAllocator,
         name_to_inode: &mut HashMap<(Inode, CString), Inode>,
-        inodes: &mut HashMap<Inode, VirtualEntry>,
+        inodes: &mut HashMap<Inode, VirtualEntry<'static>>,
     ) {
         for entry in entries {
             let ino = inode_alloc.next();
@@ -313,7 +319,11 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
                 if vnode.is_dir() {
                     return Err(linux_errno::eisdir());
                 }
-                if (flags as i32 & libc::O_ACCMODE) != libc::O_RDONLY {
+                #[cfg(not(target_os = "windows"))]
+                let acc_mode = libc::O_ACCMODE;
+                #[cfg(target_os = "windows")]
+                let acc_mode = fs_utils::O_ACCMODE;
+                if (flags as i32 & acc_mode) != libc::O_RDONLY {
                     return Err(linux_errno::eacces());
                 }
                 return Ok((Some(VIRTUAL_HANDLE), OpenOptions::empty()));
@@ -553,7 +563,11 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
 
     fn access(&self, ctx: Context, inode: Inode, mask: u32) -> io::Result<()> {
         if self.is_virtual(inode) {
-            if mask & (libc::W_OK as u32) != 0 {
+            #[cfg(not(target_os = "windows"))]
+            let w_ok = libc::W_OK;
+            #[cfg(target_os = "windows")]
+            let w_ok = fs_utils::W_OK;
+            if mask & (w_ok as u32) != 0 {
                 return Err(linux_errno::eacces());
             }
             return Ok(());
@@ -574,15 +588,19 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
             if let Some(vnode) = inodes.get(&inode) {
                 let size = vnode.data().ok_or_else(linux_errno::eisdir)?.len() as u64;
                 // FUSE lseek is only called for SEEK_DATA/SEEK_HOLE.
+                #[cfg(not(target_os = "windows"))]
+                let (seek_data, seek_hole) = (libc::SEEK_DATA, libc::SEEK_HOLE);
+                #[cfg(target_os = "windows")]
+                let (seek_data, seek_hole) = (fs_utils::SEEK_DATA, fs_utils::SEEK_HOLE);
                 return match whence as i32 {
-                    libc::SEEK_DATA => {
+                    w if w == seek_data => {
                         if offset < size {
                             Ok(offset)
                         } else {
                             Err(linux_errno::enxio())
                         }
                     }
-                    libc::SEEK_HOLE => {
+                    w if w == seek_hole => {
                         if offset < size {
                             Ok(size)
                         } else {
@@ -676,7 +694,7 @@ impl<T: FileSystem<Inode = Inode, Handle = Handle>> FileSystem for AugmentFs<T> 
                 // TODO: implement DAX for virtual files on macOS.
                 // Needs a shared memory region manager (see setupmapping
                 // in macos/passthrough.rs for the real-file DAX path).
-                #[cfg(target_os = "macos")]
+                #[cfg(not(target_os = "linux"))]
                 {
                     let _ = data;
                     return Err(linux_errno::enosys());

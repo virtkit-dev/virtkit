@@ -21,10 +21,6 @@ use vk_core::net::mac_for_ip;
 /// boot-child path in `main` (no positional subcommand needed).
 pub const BOOT_SPEC_ENV: &str = "VIRTKIT_BOOT_SPEC";
 
-/// Env var carrying the VM process name to the libkrun boot child; the vendored libkrun
-/// reads it for the 15-char `comm` (see `krun_start_enter` in third_party/libkrun).
-pub const VM_NAME_ENV: &str = "VIRTKIT_VM_NAME";
-
 /// Default `--vm-name` template. `{name}` expands to the per-VM unit name (a Dockerfile
 /// stage, an image, or a compose service).
 pub const DEFAULT_VM_NAME_TEMPLATE: &str = "vk:{name}";
@@ -740,11 +736,9 @@ impl Vmm for Libkrun {
         let mut cmd = Command::new(crate::spawn::self_exe());
         // Present as the VM's process name (e.g. `vk:myapp`) rather than
         // `vk __libkrun-boot <json>`: argv[0] carries the name (`ps aux`), the spec rides
-        // BOOT_SPEC_ENV off argv (so `ps` stays clean), and VM_NAME_ENV feeds libkrun's
-        // 15-char `comm`. `main` dispatches on BOOT_SPEC_ENV's presence.
-        cmd.arg0(&spec.proc_name)
-            .env(BOOT_SPEC_ENV, json)
-            .env(VM_NAME_ENV, &spec.proc_name);
+        // BOOT_SPEC_ENV off argv (so `ps` stays clean), and the boot child sets its 15-char
+        // `comm` from the spec's `proc_name`. `main` dispatches on BOOT_SPEC_ENV's presence.
+        cmd.arg0(&spec.proc_name).env(BOOT_SPEC_ENV, json);
         cmd
     }
 

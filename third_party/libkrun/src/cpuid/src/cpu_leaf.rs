@@ -50,6 +50,8 @@ pub mod leaf_0x1 {
         // PDCM = Perfmon and Debug Capability
         pub const PDCM_BITINDEX: u32 = 15;
         // 18 = DCA Direct Cache Access (prefetch data from a memory mapped device)
+        #[cfg(feature = "tdx")]
+        pub const X2APIC_BITINDEX: u32 = 21;
         pub const MOVBE_BITINDEX: u32 = 22;
         pub const TSC_DEADLINE_TIMER_BITINDEX: u32 = 24;
         pub const OSXSAVE_BITINDEX: u32 = 27;

@@ -7,8 +7,8 @@
 
 use std::fmt;
 use std::num::Wrapping;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, result};
 use utils::eventfd::EventFd;
 
@@ -220,10 +220,10 @@ impl BusDevice for I8042Device {
                 // Check if we still have data in the internal buffer. If so, we need to trigger
                 // another interrupt, to let the guest know they need to issue another read from
                 // port 0x60.
-                if (self.status & SB_OUT_DATA_AVAIL) != 0 {
-                    if let Err(Error::KbdInterruptFailure(err)) = self.trigger_kbd_interrupt() {
-                        warn!("Failed to trigger i8042 kbd interrupt {err:?}");
-                    }
+                if (self.status & SB_OUT_DATA_AVAIL) != 0
+                    && let Err(Error::KbdInterruptFailure(err)) = self.trigger_kbd_interrupt()
+                {
+                    warn!("Failed to trigger i8042 kbd interrupt {err:?}");
                 }
             }
             _ => {}
@@ -241,8 +241,8 @@ impl BusDevice for I8042Device {
                 // The guest wants to assert the CPU reset line. We handle that by triggering
                 // our exit event fd. Meaning Firecracker will be exiting as soon as the VMM
                 // thread wakes up to handle this event.
-                // virtkit: flag it as a reset first, so the Vmm reports a guest reset rather
-                // than a clean exit (reset_flag, see VENDOR.md).
+                // Flag it as a reset first, so the Vmm reports a guest reset rather than a
+                // clean exit (`reset_flag`; local patch, see VENDOR.md).
                 self.reset_flag.store(true, Ordering::SeqCst);
                 if let Err(e) = self.reset_evt.write(1) {
                     error!("Failed to trigger i8042 reset event: {e:?}");

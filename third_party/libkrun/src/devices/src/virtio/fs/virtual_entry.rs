@@ -7,24 +7,24 @@ pub const VIRTUAL_BLKSIZE: i64 = 4096;
 
 /// A synthetic filesystem entry that exists only in memory.
 #[derive(Clone, Debug)]
-pub struct VirtualEntry {
+pub struct VirtualEntry<'a> {
     /// Permission bits. File type bits (S_IFMT) are ignored — the type
     /// is derived from the `content` variant.
     pub mode: u32,
     /// If true, the entry can only be looked up once.
     pub one_shot: bool,
-    pub content: VirtualEntryContent,
+    pub content: VirtualEntryContent<'a>,
 }
 
 #[derive(Clone, Debug)]
-pub enum VirtualEntryContent {
-    /// A read-only file backed by a static byte slice.
-    File { data: &'static [u8] },
+pub enum VirtualEntryContent<'a> {
+    /// A read-only file backed by a borrowed byte slice.
+    File { data: &'a [u8] },
     /// A directory containing other virtual entries.
-    Dir { children: Vec<VirtualDirEntry> },
+    Dir { children: Vec<VirtualDirEntry<'a>> },
 }
 
-impl VirtualEntry {
+impl<'a> VirtualEntry<'a> {
     pub fn is_dir(&self) -> bool {
         matches!(self.content, VirtualEntryContent::Dir { .. })
     }
@@ -40,7 +40,7 @@ impl VirtualEntry {
         file_type | (self.mode & !(libc::S_IFMT as u32))
     }
 
-    pub fn data(&self) -> Option<&'static [u8]> {
+    pub fn data(&self) -> Option<&'a [u8]> {
         match &self.content {
             VirtualEntryContent::File { data } => Some(data),
             VirtualEntryContent::Dir { .. } => None,
@@ -50,7 +50,7 @@ impl VirtualEntry {
 
 /// A named entry in a virtual directory.
 #[derive(Clone, Debug)]
-pub struct VirtualDirEntry {
+pub struct VirtualDirEntry<'a> {
     pub name: CString,
-    pub entry: VirtualEntry,
+    pub entry: VirtualEntry<'a>,
 }

@@ -14,8 +14,8 @@
 // always in ACPI mode: FADT SMI_CMD is 0), so the guest never tries to enable it.
 
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
@@ -79,10 +79,10 @@ impl AcpiPm {
     }
 
     fn raise_sci_if_pending(&self) {
-        if self.pm1_sts & self.pm1_en & PWRBTN != 0 {
-            if let Err(e) = self.sci_evt.write(1) {
-                error!("acpi_pm: failed to raise SCI: {e:?}");
-            }
+        if self.pm1_sts & self.pm1_en & PWRBTN != 0
+            && let Err(e) = self.sci_evt.write(1)
+        {
+            error!("acpi_pm: failed to raise SCI: {e:?}");
         }
     }
 
@@ -166,5 +166,76 @@ impl Subscriber for AcpiPm {
             Some(efd) => vec![EpollEvent::new(EventSet::IN, efd.as_raw_fd() as u64)],
             None => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use utils::eventfd::EFD_NONBLOCK;
+
+    fn pm() -> AcpiPm {
+        AcpiPm::new(
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            Arc::new(AtomicBool::new(false)),
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            None,
+        )
+    }
+
+    fn fired(efd: &EventFd) -> bool {
+        efd.read().is_ok()
+    }
+
+    fn word(pm: &mut AcpiPm, offset: u64, val: u16) {
+        pm.write(0, offset, &val.to_le_bytes());
+    }
+
+    #[test]
+    fn s5_powers_off_and_other_sleep_types_do_nothing() {
+        let mut pm = pm();
+        word(&mut pm, PM1_CNT, (3 << SLP_TYP_SHIFT) | SLP_EN);
+        word(&mut pm, PM1_CNT, S5_SLP_TYP << SLP_TYP_SHIFT);
+        assert!(!fired(&pm.exit_evt));
+        word(&mut pm, PM1_CNT, (S5_SLP_TYP << SLP_TYP_SHIFT) | SLP_EN);
+        assert!(fired(&pm.exit_evt));
+        assert!(!pm.reset_flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn only_the_reset_value_resets() {
+        let mut pm = pm();
+        pm.write(0, RESET_REG, &[RESET_VALUE.wrapping_add(1)]);
+        assert!(!fired(&pm.exit_evt));
+        pm.write(0, RESET_REG, &[RESET_VALUE]);
+        assert!(fired(&pm.exit_evt));
+        assert!(pm.reset_flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn the_power_button_raises_the_sci_once_enabled_and_clears_by_write() {
+        let mut pm = pm();
+        // Latched before the guest enabled it: no SCI until PWRBTN_EN is set.
+        pm.pm1_sts |= PWRBTN;
+        pm.raise_sci_if_pending();
+        assert!(!fired(&pm.sci_evt));
+        word(&mut pm, PM1_EN, PWRBTN);
+        assert!(fired(&pm.sci_evt));
+        // Status is write-1-to-clear: writing 0 keeps it, writing the bit clears it.
+        word(&mut pm, PM1_STS, 0);
+        let mut buf = [0u8; 2];
+        pm.read(0, PM1_STS, &mut buf);
+        assert_eq!(u16::from_le_bytes(buf), PWRBTN);
+        word(&mut pm, PM1_STS, PWRBTN);
+        pm.read(0, PM1_STS, &mut buf);
+        assert_eq!(u16::from_le_bytes(buf), 0);
+    }
+
+    #[test]
+    fn pm1_cnt_reads_sci_enabled() {
+        let mut pm = pm();
+        let mut buf = [0u8; 2];
+        pm.read(0, PM1_CNT, &mut buf);
+        assert_eq!(u16::from_le_bytes(buf), SCI_EN);
     }
 }

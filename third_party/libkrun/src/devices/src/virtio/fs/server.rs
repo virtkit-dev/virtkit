@@ -12,8 +12,8 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::mem::size_of;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 use vm_memory::ByteValued;
 
@@ -28,6 +28,9 @@ use super::fs_utils::einval;
 use super::fuse::*;
 use super::{FsError as Error, Result};
 use crate::virtio::VirtioShmRegion;
+
+#[cfg(windows)]
+use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
 const MAX_BUFFER_SIZE: u32 = 1 << 20;
 const BUFFER_HEADER_SIZE: u32 = 0x1000;
@@ -83,6 +86,7 @@ impl<F: FileSystem + Sync> Server<F> {
         &self,
         mut r: Reader,
         w: Writer,
+        allow_idmap: bool,
         shm_region: &Option<VirtioShmRegion>,
         exit_code: &Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
@@ -121,7 +125,7 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::Listxattr as u32 => self.listxattr(in_header, r, w),
             x if x == Opcode::Removexattr as u32 => self.removexattr(in_header, r, w),
             x if x == Opcode::Flush as u32 => self.flush(in_header, r, w),
-            x if x == Opcode::Init as u32 => self.init(in_header, r, w),
+            x if x == Opcode::Init as u32 => self.init(in_header, r, w, allow_idmap),
             x if x == Opcode::Opendir as u32 => self.opendir(in_header, r, w),
             x if x == Opcode::Readdir as u32 => self.readdir(in_header, r, w),
             x if x == Opcode::Releasedir as u32 => self.releasedir(in_header, r, w),
@@ -145,7 +149,7 @@ impl<F: FileSystem + Sync> Server<F> {
             x if x == Opcode::CopyFileRange as u32 => self.copyfilerange(in_header, r, w),
             x if (x == Opcode::SetupMapping as u32) && shm_region.is_some() => {
                 let shm = shm_region.as_ref().unwrap();
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 let shm_base_addr = shm.host_addr;
                 #[cfg(target_os = "macos")]
                 let shm_base_addr = shm.guest_addr;
@@ -161,7 +165,7 @@ impl<F: FileSystem + Sync> Server<F> {
             }
             x if (x == Opcode::RemoveMapping as u32) && shm_region.is_some() => {
                 let shm = shm_region.as_ref().unwrap();
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 let shm_base_addr = shm.host_addr;
                 #[cfg(target_os = "macos")]
                 let shm_base_addr = shm.guest_addr;
@@ -870,7 +874,13 @@ impl<F: FileSystem + Sync> Server<F> {
         }
     }
 
-    fn init(&self, in_header: InHeader, mut r: Reader, w: Writer) -> Result<usize> {
+    fn init(
+        &self,
+        in_header: InHeader,
+        mut r: Reader,
+        w: Writer,
+        allow_idmap: bool,
+    ) -> Result<usize> {
         let InitInCompat {
             major,
             minor,
@@ -926,8 +936,11 @@ impl<F: FileSystem + Sync> Server<F> {
             | FsOptions::MAX_PAGES
             | FsOptions::SUBMOUNTS
             | FsOptions::HANDLE_KILLPRIV_V2
-            | FsOptions::INIT_EXT
-            | FsOptions::ALLOW_IDMAP;
+            | FsOptions::INIT_EXT;
+
+        if allow_idmap {
+            supported |= FsOptions::ALLOW_IDMAP;
+        }
 
         if cfg!(target_os = "macos") {
             supported |= FsOptions::SECURITY_CTX;
@@ -936,7 +949,18 @@ impl<F: FileSystem + Sync> Server<F> {
         let flags_64 = ((flags2 as u64) << 32) | (flags as u64);
         let capable = FsOptions::from_bits_truncate(flags_64);
 
-        let page_size: u32 = unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() };
+        let page_size: u32 = {
+            #[cfg(unix)]
+            unsafe {
+                libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap()
+            }
+            #[cfg(windows)]
+            unsafe {
+                let mut info: SYSTEM_INFO = std::mem::zeroed();
+                GetSystemInfo(&mut info);
+                info.dwPageSize
+            }
+        };
         let max_pages = ((MAX_BUFFER_SIZE - 1) / page_size) + 1;
 
         match self.fs.init(capable) {
@@ -1536,7 +1560,7 @@ fn reply_error(e: io::Error, unique: u64, mut w: Writer) -> Result<usize> {
 fn entry_name(name: &CStr) -> io::Result<()> {
     let b = name.to_bytes();
     if b.is_empty() || b == b"." || b == b".." || b.contains(&b'/') {
-        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        return Err(linux_error(io::Error::from_raw_os_error(libc::EINVAL)));
     }
     Ok(())
 }
@@ -1720,7 +1744,7 @@ fn get_extensions(options: FsOptions, skip: usize, request_bytes: &[u8]) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtio::descriptor_utils::{create_descriptor_chain, DescriptorType};
+    use crate::virtio::descriptor_utils::{DescriptorType, create_descriptor_chain};
     use std::sync::Mutex;
     use std::time::Duration;
     use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
@@ -1792,7 +1816,7 @@ mod tests {
                 let dirent = DirEntry {
                     ino: inode,
                     offset: inode,
-                    type_: u32::from(libc::DT_REG),
+                    type_: 8, // DT_REG
                     name: name.as_bytes(),
                 };
                 if add_entry(dirent, entry)? == 0 {
@@ -1864,8 +1888,11 @@ mod tests {
             .handle_message(
                 Reader::new(&mem, chain.clone()).unwrap(),
                 Writer::new(&mem, chain).unwrap(),
+                false,
                 &None,
                 &Arc::new(AtomicI32::new(0)),
+                #[cfg(target_os = "macos")]
+                &None,
             )
             .unwrap();
         let out: OutHeader = mem.read_obj(buf.unchecked_add(u64::from(req_len))).unwrap();

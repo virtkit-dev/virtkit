@@ -65,12 +65,12 @@ unicode-width.workspace = true
 jemallocator.workspace = true
 
 # libkrun, the VMM, an rlib crate dep so it shares vk's std — no double-std / broken
-# unwinding that a static libkrun.a link hits. Vendored under third_party/libkrun-next
+# unwinding that a static libkrun.a link hits. Vendored under third_party/libkrun
 # (libkrun 2.0-dev and PR #875, locally patched; see its VENDOR.md) and driven through its
 # Rust API (src/libkrun_sys.rs). default-features off drops the init blob (we supply our own
 # init); blk + net.
 [dependencies.krun]
-path = "../third_party/libkrun-next/src/libkrun"
+path = "../third_party/libkrun/src/libkrun"
 package = "libkrun"
 default-features = false
 features = ["blk", "net"]

@@ -2,17 +2,17 @@ use krun_input::{
     InputAbsInfo, InputBackendError, InputDeviceIds, InputEvent, InputEventsImpl, InputQueryConfig,
     ObjectNew,
 };
-use nix::fcntl::{fcntl, OFlag, F_GETFL, F_SETFL};
+use nix::fcntl::{F_GETFL, F_SETFL, OFlag, fcntl};
 use nix::{errno::Errno, ioctl_read, ioctl_read_buf, unistd};
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 
 /// Internal passthrough input backend that forwards host /dev/input/* devices
-pub struct PassthroughInputBackend {
-    fd: BorrowedFd<'static>,
+pub struct PassthroughInputBackend<'a> {
+    fd: BorrowedFd<'a>,
 }
 
-impl InputQueryConfig for PassthroughInputBackend {
+impl InputQueryConfig for PassthroughInputBackend<'_> {
     fn query_serial_name(&self, serial_buf: &mut [u8]) -> Result<u8, InputBackendError> {
         match unsafe { eviocguniq(self.fd.as_raw_fd(), serial_buf) } {
             Ok(len) => Ok(len as u8),
@@ -99,8 +99,8 @@ impl InputQueryConfig for PassthroughInputBackend {
     }
 }
 
-impl ObjectNew<BorrowedFd<'static>> for PassthroughInputBackend {
-    fn new(userdata: Option<&BorrowedFd<'static>>) -> Self {
+impl<'a> ObjectNew<BorrowedFd<'a>> for PassthroughInputBackend<'a> {
+    fn new(userdata: Option<&BorrowedFd<'a>>) -> Self {
         let fd = userdata
             .copied()
             .expect("Missing argument for PassthroughInputBackend::new");
@@ -111,7 +111,7 @@ impl ObjectNew<BorrowedFd<'static>> for PassthroughInputBackend {
     }
 }
 
-impl InputEventsImpl for PassthroughInputBackend {
+impl InputEventsImpl for PassthroughInputBackend<'_> {
     fn get_read_notify_fd(&self) -> Result<BorrowedFd<'_>, InputBackendError> {
         Ok(self.fd)
     }
@@ -175,7 +175,7 @@ ioctl_read_buf!(eviocgprop, b'E', 0x09, u8);
 unsafe fn eviocgbit(fd: RawFd, evt: u8, buf: &mut [u8]) -> Result<u32, Errno> {
     let ioctl_num = nix::request_code_read!(b'E', 0x20 + evt, buf.len());
 
-    let n = libc::ioctl(fd, ioctl_num as _, buf.as_mut_ptr());
+    let n = unsafe { libc::ioctl(fd, ioctl_num as _, buf.as_mut_ptr()) };
     if n < 0 {
         return Err(Errno::last());
     }
@@ -185,7 +185,7 @@ unsafe fn eviocgbit(fd: RawFd, evt: u8, buf: &mut [u8]) -> Result<u32, Errno> {
 unsafe fn eviocgabs(fd: RawFd, axis: u8, abs_info: &mut LinuxAbsInfo) -> Result<u32, Errno> {
     let ioctl_num = nix::request_code_read!(b'E', 0x40 + axis, size_of::<LinuxAbsInfo>());
 
-    let n = libc::ioctl(fd, ioctl_num as _, abs_info as *mut _);
+    let n = unsafe { libc::ioctl(fd, ioctl_num as _, abs_info as *mut _) };
     if n < 0 {
         return Err(Errno::last());
     }

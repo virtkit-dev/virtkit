@@ -5,7 +5,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod acpi_pm;
 pub mod aia;
 pub mod gic;
@@ -17,8 +17,12 @@ mod gsi;
 mod hvfgicv3;
 #[cfg(target_arch = "x86_64")]
 mod i8042;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 mod ioapic;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+mod ioapic_kvm;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+mod ioapic_whp;
 mod irqchip;
 #[cfg(all(target_os = "linux", target_arch = "riscv64"))]
 mod kvmaia;
@@ -28,8 +32,6 @@ mod kvmgicv2;
 mod kvmgicv3;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod kvmioapic;
-#[cfg(target_arch = "x86_64")]
-mod pci;
 #[cfg(target_arch = "aarch64")]
 mod rtc_pl031;
 #[cfg(target_os = "macos")]
@@ -51,7 +53,7 @@ mod riscv64;
 #[cfg(target_arch = "riscv64")]
 use riscv64::serial;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use self::acpi_pm::AcpiPm;
 #[cfg(target_arch = "x86_64")]
 pub use self::cmos::Cmos;
@@ -66,7 +68,9 @@ pub use self::hvfgicv3::HvfGicV3;
 #[cfg(target_arch = "x86_64")]
 pub use self::i8042::{Error as I8042DeviceError, I8042Device};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub use self::ioapic::IoApic;
+pub use self::ioapic_kvm::IoApic;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub use self::ioapic_whp::WhpIoapic;
 #[cfg(any(test, feature = "test_utils"))]
 pub use self::irqchip::test_utils::DummyIrqChip;
 pub use self::irqchip::{IrqChip, IrqChipDevice, IrqChipT};
@@ -78,8 +82,6 @@ pub use self::kvmgicv2::KvmGicV2;
 pub use self::kvmgicv3::KvmGicV3;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::kvmioapic::KvmIoapic;
-#[cfg(target_arch = "x86_64")]
-pub use self::pci::{PciBus, PciConfigIo, PciDevice};
 #[cfg(target_arch = "aarch64")]
 pub use self::rtc_pl031::RTC;
 pub use self::serial::Serial;
@@ -90,8 +92,14 @@ pub use self::vcpu::VcpuList;
 // which is a composition of the desired bounds. In this case, io::Read and AsRawFd.
 // Run `rustc --explain E0225` for more details.
 /// Trait that composes the `std::io::Read` and `std::os::unix::io::AsRawFd` traits.
+#[cfg(unix)]
 pub trait ReadableFd: std::io::Read + std::os::fd::AsRawFd {}
+#[cfg(unix)]
+impl ReadableFd for std::fs::File {}
 
+#[cfg(windows)]
+pub trait ReadableFd: std::io::Read + utils::windows::AsRawFd {}
+#[cfg(windows)]
 impl ReadableFd for std::fs::File {}
 
 #[cfg(target_os = "linux")]

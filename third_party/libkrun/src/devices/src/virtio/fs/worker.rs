@@ -4,10 +4,13 @@ use crossbeam_channel::Sender;
 use utils::worker_message::WorkerMessage;
 
 use std::io;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
 use std::thread;
+#[cfg(windows)]
+use utils::windows::AsRawFd;
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
@@ -36,6 +39,7 @@ enum FsServer {
     Null(Server<AugmentFs<NullFs>>),
     // A share whose root is a single host file: serves only that file, never its parent
     // (a single-file bind mount). No AugmentFs — it injects no virtual entries.
+    #[cfg(target_os = "linux")]
     SingleFile(Server<super::single_file::SingleFileFs>),
 }
 
@@ -44,6 +48,7 @@ impl FsServer {
         &self,
         r: Reader,
         w: Writer,
+        allow_idmap: bool,
         shm_region: &Option<VirtioShmRegion>,
         exit_code: &Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
@@ -52,6 +57,7 @@ impl FsServer {
             FsServer::ReadWrite(s) => s.handle_message(
                 r,
                 w,
+                allow_idmap,
                 shm_region,
                 exit_code,
                 #[cfg(target_os = "macos")]
@@ -60,6 +66,7 @@ impl FsServer {
             FsServer::ReadOnly(s) => s.handle_message(
                 r,
                 w,
+                allow_idmap,
                 shm_region,
                 exit_code,
                 #[cfg(target_os = "macos")]
@@ -68,6 +75,7 @@ impl FsServer {
             FsServer::ReadWriteMapped(s) => s.handle_message(
                 r,
                 w,
+                allow_idmap,
                 shm_region,
                 exit_code,
                 #[cfg(target_os = "macos")]
@@ -76,6 +84,7 @@ impl FsServer {
             FsServer::ReadOnlyMapped(s) => s.handle_message(
                 r,
                 w,
+                allow_idmap,
                 shm_region,
                 exit_code,
                 #[cfg(target_os = "macos")]
@@ -84,14 +93,17 @@ impl FsServer {
             FsServer::Null(s) => s.handle_message(
                 r,
                 w,
+                allow_idmap,
                 shm_region,
                 exit_code,
                 #[cfg(target_os = "macos")]
                 map_sender,
             ),
+            #[cfg(target_os = "linux")]
             FsServer::SingleFile(s) => s.handle_message(
                 r,
                 w,
+                allow_idmap,
                 shm_region,
                 exit_code,
                 #[cfg(target_os = "macos")]
@@ -106,12 +118,20 @@ pub struct FsWorker {
     queue_evts: Vec<Arc<EventFd>>,
     interrupt: InterruptTransport,
     mem: GuestMemoryMmap,
+    allow_idmap: bool,
     shm_region: Option<VirtioShmRegion>,
     server: FsServer,
     stop_fd: EventFd,
     exit_code: Arc<AtomicI32>,
     #[cfg(target_os = "macos")]
     map_sender: Option<Sender<WorkerMessage>>,
+}
+
+/// Whether INIT offers FUSE_ALLOW_IDMAP. A mapped share does not: with it the guest kernel
+/// sends FUSE_INVALID_UIDGID for every request but the creating ones, which the soft map
+/// would then translate (or let past `forbid-guest`) instead of the caller's ids.
+fn offer_idmap(allow_idmap: bool, mapped: bool) -> bool {
+    allow_idmap && !mapped
 }
 
 impl FsWorker {
@@ -121,12 +141,13 @@ impl FsWorker {
         queue_evts: Vec<Arc<EventFd>>,
         interrupt: InterruptTransport,
         mem: GuestMemoryMmap,
+        allow_idmap: bool,
         shm_region: Option<VirtioShmRegion>,
         passthrough_cfg: Option<passthrough::Config>,
         read_only: bool,
         uid_map: Vec<String>,
         gid_map: Vec<String>,
-        virtual_entries: Vec<VirtualDirEntry>,
+        virtual_entries: Vec<VirtualDirEntry<'static>>,
         stop_fd: EventFd,
         exit_code: Arc<AtomicI32>,
         #[cfg(target_os = "macos")] map_sender: Option<Sender<WorkerMessage>>,
@@ -145,12 +166,15 @@ impl FsWorker {
         let uid_table = parse(uid_map)?;
         let gid_table = parse(gid_map)?;
         let mapped = !uid_table.is_empty() || !gid_table.is_empty();
+        let allow_idmap = offer_idmap(allow_idmap, mapped);
 
         let inode_alloc = Arc::new(InodeAllocator::new());
         let server = match passthrough_cfg {
             // A share rooted at a regular file → serve just that file (single-file bind),
             // never opening or exposing its parent directory. The single-file server does
-            // not apply id maps; a caller wanting one must use a directory share.
+            // not apply id maps; a caller wanting one must use a directory share. Linux only:
+            // elsewhere a file root keeps failing in `PassthroughFs::new`.
+            #[cfg(target_os = "linux")]
             Some(cfg)
                 if std::fs::metadata(&cfg.root_dir)
                     .map(|m| m.is_file())
@@ -168,18 +192,18 @@ impl FsWorker {
                     virtual_entries,
                 )))
             }
-            Some(cfg) if read_only => {
-                let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
-                FsServer::ReadOnly(Server::new(AugmentFs::new(
+            Some(cfg) if mapped => {
+                let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
+                let inner = IdMapFs::new(inner, uid_table, gid_table);
+                FsServer::ReadWriteMapped(Server::new(AugmentFs::new(
                     inner,
                     &inode_alloc,
                     virtual_entries,
                 )))
             }
-            Some(cfg) if mapped => {
-                let inner = PassthroughFs::new(cfg, inode_alloc.clone())?;
-                let inner = IdMapFs::new(inner, uid_table, gid_table);
-                FsServer::ReadWriteMapped(Server::new(AugmentFs::new(
+            Some(cfg) if read_only => {
+                let inner = PassthroughFsRo::new(cfg, inode_alloc.clone())?;
+                FsServer::ReadOnly(Server::new(AugmentFs::new(
                     inner,
                     &inode_alloc,
                     virtual_entries,
@@ -204,6 +228,7 @@ impl FsWorker {
             queue_evts,
             interrupt,
             mem,
+            allow_idmap,
             shm_region,
             server,
             stop_fd,
@@ -225,7 +250,7 @@ impl FsWorker {
         let virtq_req_ev_fd = self.queue_evts[REQ_INDEX].as_raw_fd();
         let stop_ev_fd = self.stop_fd.as_raw_fd();
 
-        let epoll = Epoll::new().unwrap();
+        let mut epoll = Epoll::new().unwrap();
 
         let _ = epoll.ctl(
             ControlOperation::Add,
@@ -243,8 +268,8 @@ impl FsWorker {
             &EpollEvent::new(EventSet::IN, stop_ev_fd as u64),
         );
 
+        let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
         loop {
-            let mut epoll_events = vec![EpollEvent::new(EventSet::empty(), 0); 32];
             match epoll.wait(epoll_events.len(), -1, epoll_events.as_mut_slice()) {
                 Ok(ev_cnt) => {
                     for event in &epoll_events[0..ev_cnt] {
@@ -312,6 +337,7 @@ impl FsWorker {
             let len = match self.server.handle_message(
                 reader,
                 writer,
+                self.allow_idmap,
                 &self.shm_region,
                 &self.exit_code,
                 #[cfg(target_os = "macos")]
@@ -332,5 +358,18 @@ impl FsWorker {
                 self.interrupt.signal_used_queue();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::offer_idmap;
+
+    #[test]
+    fn a_mapped_share_never_offers_allow_idmap() {
+        assert!(offer_idmap(true, false));
+        assert!(!offer_idmap(true, true));
+        assert!(!offer_idmap(false, false));
+        assert!(!offer_idmap(false, true));
     }
 }

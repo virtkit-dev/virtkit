@@ -3,14 +3,14 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use utils::eventfd::EventFd;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
 use rutabaga_gfx::{
-    ResourceCreate3D, ResourceCreateBlob, RutabagaFence, Transfer3D,
-    RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D,
+    RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D, ResourceCreate3D,
+    ResourceCreateBlob, RutabagaFence, Transfer3D,
 };
 #[cfg(target_os = "macos")]
 use utils::worker_message::WorkerMessage;
@@ -19,10 +19,10 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 use super::super::descriptor_utils::{Reader, Writer};
 use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
 use super::protocol::{
-    virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry, GpuCommand, GpuResponse, VirtioGpuResult,
+    GpuCommand, GpuResponse, VirtioGpuResult, virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry,
 };
 use super::virtio_gpu::VirtioGpu;
-use crate::virtio::display::DisplayInfo;
+use crate::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::{VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX};
 use crate::virtio::gpu::virtio_gpu::VirtioGpuRing;
@@ -105,10 +105,10 @@ impl Worker {
                 error!("Failed to read control_evt: {e:?}");
                 continue;
             }
-            if self.process_queue(&mut virtio_gpu, &self.control_queue.clone()) {
-                if let Err(e) = self.interrupt.try_signal_used_queue() {
-                    error!("Error signaling queue: {e:?}");
-                }
+            if self.process_queue(&mut virtio_gpu, &self.control_queue.clone())
+                && let Err(e) = self.interrupt.try_signal_used_queue()
+            {
+                error!("Error signaling queue: {e:?}");
             }
         }
     }
@@ -162,7 +162,13 @@ impl Worker {
             }
             GpuCommand::TransferToHost2d(info) => {
                 let resource_id = info.resource_id;
-                let transfer = Transfer3D::new_2d(info.r.x, info.r.y, info.r.width, info.r.height);
+                let transfer = Transfer3D::new_2d(
+                    info.r.x,
+                    info.r.y,
+                    info.r.width,
+                    info.r.height,
+                    info.offset,
+                );
                 virtio_gpu.transfer_write(0, resource_id, transfer)
             }
             GpuCommand::ResourceAttachBacking(info) => {

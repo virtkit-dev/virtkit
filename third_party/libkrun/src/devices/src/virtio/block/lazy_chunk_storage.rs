@@ -555,7 +555,7 @@ pub(super) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{fake_digest, write_manifest, Fixture};
+    use super::test_support::{Fixture, fake_digest, write_manifest};
     use super::*;
 
     /// Two chunks — one zstd, one raw — laid out flat (remote-registry style): reads

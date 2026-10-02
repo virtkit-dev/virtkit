@@ -17,9 +17,9 @@ use super::super::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, Queue as VirtQueue, QueueConfig,
     VirtioDevice,
 };
+use super::TsiFlags;
 use super::muxer::VsockMuxer;
 use super::packet::VsockPacket;
-use super::TsiFlags;
 use super::{defs, defs::uapi};
 use crate::virtio::InterruptTransport;
 
@@ -203,6 +203,10 @@ impl VirtioDevice for Vsock {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &defs::QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(8)
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {

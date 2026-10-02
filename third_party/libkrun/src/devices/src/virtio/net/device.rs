@@ -4,21 +4,26 @@
 // Portions Copyright 2017 The Chromium OS Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
+use crate::Error as DeviceError;
 use crate::virtio::net::Result;
 use crate::virtio::net::{NUM_QUEUES, QUEUE_CONFIG};
 use crate::virtio::queue::Error as QueueError;
 use crate::virtio::{
     ActivateError, ActivateResult, DeviceQueue, DeviceState, InterruptTransport, QueueConfig,
-    VirtioDevice, TYPE_NET,
+    TYPE_NET, VirtioDevice,
 };
-use crate::Error as DeviceError;
 
 use super::backend::{ReadError, WriteError};
 use super::worker::NetWorker;
 
+#[cfg(unix)]
+use std::os::fd::RawFd;
+#[cfg(windows)]
+use std::os::windows::io::RawSocket;
+
 use std::cmp;
 use std::io::Write;
-use std::os::fd::RawFd;
+use std::mem::size_of;
 use std::path::PathBuf;
 use virtio_bindings::virtio_net::{VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_MTU};
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
@@ -64,9 +69,14 @@ unsafe impl ByteValued for VirtioNetConfig {}
 
 #[derive(Clone)]
 pub enum VirtioNetBackend {
+    #[cfg(unix)]
     UnixstreamFd(RawFd),
+    #[cfg(windows)]
+    UnixstreamFd(RawSocket),
     UnixstreamPath(PathBuf),
+    #[cfg(unix)]
     UnixgramFd(RawFd),
+    #[cfg(unix)]
     UnixgramPath(PathBuf, bool),
     #[cfg(target_os = "linux")]
     Tap(String),
@@ -84,11 +94,20 @@ pub struct Net {
     config: VirtioNetConfig,
 }
 
+/// The features an MTU brings: the MTU itself, and on Unix hosts mergeable receive buffers. The
+/// Windows worker never writes `num_buffers`, so it must not offer them.
+fn mtu_features() -> u64 {
+    let features = 1 << VIRTIO_NET_F_MTU;
+    #[cfg(unix)]
+    let features = features | (1 << VIRTIO_NET_F_MRG_RXBUF);
+    features
+}
+
 impl Net {
     /// Create a new virtio network device using the backend.
     ///
     /// `mtu` is the link MTU the driver should adopt (`MIN_MTU..=MAX_MTU`, validated by the
-    /// caller), and brings mergeable receive buffers with it. `None` leaves both features
+    /// caller), and on Unix hosts brings mergeable receive buffers with it. `None` leaves both features
     /// unadvertised, so the driver keeps its own default of 1500 and one buffer per frame.
     pub fn new(
         id: String,
@@ -105,7 +124,7 @@ impl Net {
             // Mergeable receive buffers come with the MTU: on a link wide enough to be worth
             // setting, a driver that has to size every posted buffer for the largest frame
             // spends nearly all of them on packets nowhere near it.
-            avail_features |= (1 << VIRTIO_NET_F_MTU) | (1 << VIRTIO_NET_F_MRG_RXBUF);
+            avail_features |= mtu_features();
         }
 
         let config = VirtioNetConfig {
@@ -125,6 +144,17 @@ impl Net {
             device_state: DeviceState::Inactive,
             config,
         })
+    }
+
+    /// Set or clear the advertised link MTU before activation, as `new`'s `mtu` does.
+    pub fn set_mtu(&mut self, mtu: Option<u16>) {
+        let bits = mtu_features();
+        if mtu.is_some() {
+            self.avail_features |= bits;
+        } else {
+            self.avail_features &= !bits;
+        }
+        self.config.mtu = mtu.unwrap_or(0);
     }
 
     /// Provides the ID of this net device.
@@ -161,6 +191,10 @@ impl VirtioDevice for Net {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<VirtioNetConfig>() as u32)
     }
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
@@ -224,7 +258,7 @@ impl VirtioDevice for Net {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

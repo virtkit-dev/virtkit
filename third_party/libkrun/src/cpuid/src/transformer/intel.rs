@@ -23,14 +23,8 @@ pub fn update_feature_info_entry(
         vm_spec.nested_enabled() && entry.ecx.read_bit(ecx::VMX_BITINDEX),
     );
 
-    // enable X2APIC bit
     #[cfg(feature = "tdx")]
-    if entry.index == 0x1 {
-        println!("adjusting 0x1 index feature");
-        entry.ecx &= 1 << 21;
-    }
-
-    entry.ecx.write_bit(ecx::TSC_DEADLINE_TIMER_BITINDEX, true);
+    entry.ecx.write_bit(ecx::X2APIC_BITINDEX, true);
 
     Ok(())
 }
@@ -111,7 +105,7 @@ fn update_power_management_entry(
 fn update_perf_mon_entry(entry: &mut kvm_cpuid_entry2, vm_spec: &VmSpec) -> Result<(), Error> {
     // Architectural Performance Monitor Leaf
     // Disable PMU by default: exposing host performance counters to the guest
-    // widens the side-channel surface. `krun_set_pmu(ctx, true)` (virtkit patch,
+    // widens the side-channel surface. `VmmBuilder::pmu(true)` (local patch,
     // see VENDOR.md) keeps the leaf as KVM reports it, so KVM's vPMU virtualizes
     // the counters for in-guest `perf` hardware events.
     if vm_spec.pmu_enabled() {
@@ -246,6 +240,8 @@ mod tests {
         assert!(update_feature_info_entry(&mut entry, &vm_spec).is_ok());
 
         assert!(entry.ecx.read_bit(ecx::TSC_DEADLINE_TIMER_BITINDEX));
+        #[cfg(feature = "tdx")]
+        assert!(entry.ecx.read_bit(ecx::X2APIC_BITINDEX));
     }
 
     #[test]
@@ -268,6 +264,19 @@ mod tests {
         assert_eq!(entry.ebx, 0);
         assert_eq!(entry.ecx, 0);
         assert_eq!(entry.edx, 0);
+
+        // With the PMU exposed the leaf is left as KVM reported it.
+        let vm_spec = vm_spec.with_pmu_enabled(true);
+        let mut entry = kvm_cpuid_entry2 {
+            function: leaf_0xa::LEAF_NUM,
+            eax: 1,
+            ebx: 2,
+            ecx: 3,
+            edx: 4,
+            ..Default::default()
+        };
+        assert!(update_perf_mon_entry(&mut entry, &vm_spec).is_ok());
+        assert_eq!((entry.eax, entry.ebx, entry.ecx, entry.edx), (1, 2, 3, 4));
     }
 
     fn check_update_deterministic_cache_entry(

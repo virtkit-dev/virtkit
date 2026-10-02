@@ -15,7 +15,7 @@
 # RUSTSEC-2025-0141 — `bincode` is unmaintained (informational, no vulnerability). It
 # enters the tree via imago, the qcow2 image library used by the vendored libkrun's block
 # devices, which uses it for fixed-layout big-endian (de)serialization of qcow2 metadata
-# structs. imago 0.2.3 (latest) still depends on it, so there is no upstream fix to take.
+# structs. imago 0.2.4 (the vendored release) still depends on it, so there is no upstream fix to take.
 # bincode 2 is pure safe Rust and the usage is internal struct coding, not a network-facing
 # format. Revisit and drop this entry when imago releases a version off bincode.
 #

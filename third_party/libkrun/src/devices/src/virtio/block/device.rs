@@ -8,7 +8,9 @@
 use std::cmp;
 use std::convert::From;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
+use std::mem::size_of;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt;
@@ -20,26 +22,35 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 
 use imago::{
-    file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk, DynStorage, FormatAccess,
-    FormatDriverBuilder, Storage, StorageOpenOptions,
+    DynStorage, FormatAccess, FormatDriverBuilder, Storage, StorageOpenOptions,
+    file::File as ImagoFile, qcow2::Qcow2, raw::Raw, vmdk::Vmdk,
 };
 use log::{error, warn};
-use utils::eventfd::{EventFd, EFD_NONBLOCK};
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::{
     virtio_blk::*, virtio_config::VIRTIO_F_VERSION_1, virtio_ring::VIRTIO_RING_F_EVENT_IDX,
 };
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
+#[cfg(target_os = "windows")]
+use std::mem::MaybeUninit;
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawHandle;
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+};
+
 use super::lazy_chunk_storage::{LazyAwareOpenGate, LazyChunkStorage};
 use super::worker::BlockWorker;
 use super::{
-    super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, VirtioDevice, TYPE_BLOCK},
+    super::{ActivateResult, DeviceQueue, DeviceState, QueueConfig, TYPE_BLOCK, VirtioDevice},
     Error, NUM_QUEUES, QUEUE_CONFIG, SECTOR_SHIFT, SECTOR_SIZE,
 };
 
 use crate::virtio::{
-    block::{ImageType, SyncMode},
     ActivateError, InterruptTransport, VmmExitObserver,
+    block::{DiskFormat, SyncMode},
 };
 
 /// Configuration options for disk caching.
@@ -72,6 +83,7 @@ impl CacheType {
 /// for read-only raw images (a stage's `COPY --from` source or a read-only root), where the
 /// guest block offset is the file offset; qcow2 needs format translation and `direct_io`
 /// asks to bypass the page cache, so both keep the imago read path.
+#[cfg(unix)]
 pub(crate) struct DiskMmap {
     ptr: *mut libc::c_void,
     /// length handed to `mmap`/`munmap` (the file size; the tail of the final page reads as
@@ -79,11 +91,25 @@ pub(crate) struct DiskMmap {
     len: usize,
 }
 
+/// Never constructed off Unix: there every disk keeps the imago read path.
+#[cfg(not(unix))]
+pub(crate) struct DiskMmap;
+
+#[cfg(not(unix))]
+impl DiskMmap {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &[]
+    }
+}
+
 // SAFETY: the mapping is `PROT_READ` and the image is immutable for the mapping's lifetime,
 // so the raw pointer is sound to read from any thread.
+#[cfg(unix)]
 unsafe impl Send for DiskMmap {}
+#[cfg(unix)]
 unsafe impl Sync for DiskMmap {}
 
+#[cfg(unix)]
 impl DiskMmap {
     fn open(path: &str) -> io::Result<Self> {
         let file = File::open(path)?;
@@ -119,6 +145,7 @@ impl DiskMmap {
     }
 }
 
+#[cfg(unix)]
 impl Drop for DiskMmap {
     fn drop(&mut self) {
         // SAFETY: `ptr`/`len` are exactly what `open` passed to `mmap`.
@@ -131,20 +158,27 @@ impl Drop for DiskMmap {
 /// aligns to whole clusters.
 const DIRTY_CLUSTER: u64 = 64 * 1024;
 
+/// How long the dirty-control listener waits on a connection's command byte or its reply.
+#[cfg(unix)]
+const DIRTY_CONTROL_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Guest-logical clusters mutated since the last drain, split so the virtkit build backend can
 /// capture only a checkpoint's delta instead of the whole cumulative overlay. `written` holds
-/// clusters any write touched (to read and push as data); `discarded` holds clusters any discard
-/// or write-zeroes touched. A write wins over a discard at the 64 KiB cluster granularity: a
-/// cluster present in both was only partly freed, so it must be read whole (the overlay reflects
-/// the true content, zeroed sub-parts included) rather than holed — [`Self::take`] subtracts the
-/// written set out of the discarded one. A host-side control connection (see
+/// clusters any write, or the partial edge of a write-zeroes, touched (to read and push as
+/// data); `discarded` holds clusters a discard or write-zeroes fully covered. A write wins over
+/// a discard at the 64 KiB cluster granularity: a cluster freed and then written, or written
+/// and then freed, must be read whole (the overlay reflects its true content) rather than holed
+/// — [`Self::take`] subtracts the written set out of the discarded one. A host-side control connection (see
 /// [`Block::spawn_dirty_control`]) drains both at each checkpoint.
+// Off Unix nothing constructs one: no control socket, so no tracking.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Default)]
 pub(crate) struct DirtyRanges {
     written: std::collections::BTreeSet<u64>,
     discarded: std::collections::BTreeSet<u64>,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 impl DirtyRanges {
     /// Record that `[offset, offset+len)` was written, at cluster granularity.
     fn record_write(&mut self, offset: u64, len: u64) {
@@ -153,10 +187,10 @@ impl DirtyRanges {
         }
     }
 
-    /// Record that `[offset, offset+len)` was freed or zeroed (discard / write-zeroes). Only
-    /// whole clusters *fully* inside the range become holes — a partial cluster at either end
-    /// may still hold live data (an ext4 block freed next to live ones in the same 64 KiB
-    /// cluster), so rounding a hole outward would zero that data. Writes round outward instead
+    /// Record that `[offset, offset+len)` was freed (discard, or the middle of a write-zeroes;
+    /// see [`Self::record_zeroes`]). Only whole clusters *fully* inside the range become holes —
+    /// a partial cluster at either end may still hold live data (an ext4 block freed next to live
+    /// ones in the same 64 KiB cluster), so rounding a hole outward would zero that data. Writes round outward instead
     /// (see [`cluster_range`]): touching any part of a cluster keeps it read whole.
     fn record_discard(&mut self, offset: u64, len: u64) {
         if len == 0 {
@@ -169,9 +203,34 @@ impl DirtyRanges {
         }
     }
 
+    /// Record that `[offset, offset+len)` now reads as zeroes (write-zeroes). Whole clusters
+    /// inside the range become holes as for a discard; a partial cluster at either end keeps
+    /// live data beside the zeroed bytes, so it is recorded written — read whole — rather than
+    /// left out of both sets, where the checkpoint would keep its old contents.
+    fn record_zeroes(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let end = offset + len;
+        let first = offset.div_ceil(DIRTY_CLUSTER) * DIRTY_CLUSTER;
+        let last = end / DIRTY_CLUSTER * DIRTY_CLUSTER;
+        if first >= last {
+            self.record_write(offset, len);
+            return;
+        }
+        if offset < first {
+            self.record_write(offset, first - offset);
+        }
+        if last < end {
+            self.record_write(last, end - last);
+        }
+        self.record_discard(first, last - first);
+    }
+
     /// Take the written clusters and the purely-discarded ones (discarded minus written) as
     /// coalesced byte ranges (clamped to `size`), clearing both sets.
-    fn take(&mut self, size: u64) -> (Vec<(u64, u64)>, Vec<(u64, u64)>) {
+    #[cfg(any(unix, test))]
+    fn take(&mut self, size: u64) -> (ByteRanges, ByteRanges) {
         let written = std::mem::take(&mut self.written);
         let discarded = &std::mem::take(&mut self.discarded) - &written;
         (
@@ -180,6 +239,10 @@ impl DirtyRanges {
         )
     }
 }
+
+/// `(offset, len)` byte ranges, coalesced and in offset order.
+#[cfg(any(unix, test))]
+type ByteRanges = Vec<(u64, u64)>;
 
 /// The whole clusters `[offset, offset+len)` spans, as a half-open cluster range, rounded
 /// outward — the mirror of [`DirtyRanges::record_discard`]'s inward rounding. The zero-length
@@ -196,6 +259,7 @@ fn cluster_range(offset: u64, len: u64) -> std::ops::Range<u64> {
 
 /// Coalesce a cluster set into byte ranges clamped to `size`; adjacent clusters merge so the
 /// caller reads/pushes contiguously.
+#[cfg(any(unix, test))]
 fn clusters_to_ranges(clusters: std::collections::BTreeSet<u64>, size: u64) -> Vec<(u64, u64)> {
     let mut out: Vec<(u64, u64)> = Vec::new();
     for c in clusters {
@@ -215,6 +279,7 @@ fn clusters_to_ranges(clusters: std::collections::BTreeSet<u64>, size: u64) -> V
 /// Encode a drain reply on the dirty-control wire: `u32 count` then `count × (u64 offset,
 /// u64 len)`, all little-endian. The host side (virtkit's `VmSession::drain_dirty`) decodes
 /// this exact layout; keep the two in lockstep — `encode_decode_round_trips` pins the format.
+#[cfg(any(unix, test))]
 fn encode_dirty_reply(ranges: &[(u64, u64)]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + ranges.len() * 16);
     buf.extend_from_slice(&(ranges.len() as u32).to_le_bytes());
@@ -234,7 +299,7 @@ fn flush_sync(df: &FormatAccess<Box<dyn DynStorage>>) -> io::Result<()> {
 
 #[cfg(test)]
 mod dirty_tests {
-    use super::{encode_dirty_reply, DirtyRanges, DIRTY_CLUSTER};
+    use super::{DIRTY_CLUSTER, DirtyRanges, encode_dirty_reply};
 
     #[test]
     fn coalesces_adjacent_and_gaps() {
@@ -288,6 +353,38 @@ mod dirty_tests {
         let (written, discarded) = d.take(10 * DIRTY_CLUSTER);
         assert!(written.is_empty());
         assert_eq!(discarded, vec![(DIRTY_CLUSTER, 2 * DIRTY_CLUSTER)]);
+    }
+
+    #[test]
+    fn a_partial_cluster_write_zeroes_reads_its_edges_whole() {
+        // Zeroing [half of cluster 0 .. half of cluster 3): clusters 1 and 2 are holes, and
+        // the zeroed halves of 0 and 3 must reach the checkpoint, so those are written.
+        let mut d = DirtyRanges::default();
+        d.record_zeroes(DIRTY_CLUSTER / 2, 3 * DIRTY_CLUSTER);
+        let (written, discarded) = d.take(10 * DIRTY_CLUSTER);
+        assert_eq!(
+            written,
+            vec![(0, DIRTY_CLUSTER), (3 * DIRTY_CLUSTER, DIRTY_CLUSTER)]
+        );
+        assert_eq!(discarded, vec![(DIRTY_CLUSTER, 2 * DIRTY_CLUSTER)]);
+        // Inside one cluster: no hole, the cluster is written.
+        d.record_zeroes(4096, 4096);
+        assert_eq!(
+            d.take(10 * DIRTY_CLUSTER),
+            (vec![(0, DIRTY_CLUSTER)], vec![])
+        );
+        // Two partial clusters with no whole one between: both written, no hole.
+        d.record_zeroes(48 * 1024, 32 * 1024);
+        assert_eq!(
+            d.take(10 * DIRTY_CLUSTER),
+            (vec![(0, 2 * DIRTY_CLUSTER)], vec![])
+        );
+        // Cluster-aligned: holes only.
+        d.record_zeroes(DIRTY_CLUSTER, DIRTY_CLUSTER);
+        assert_eq!(
+            d.take(10 * DIRTY_CLUSTER),
+            (vec![], vec![(DIRTY_CLUSTER, DIRTY_CLUSTER)])
+        );
     }
 
     #[test]
@@ -369,9 +466,10 @@ pub(crate) struct DiskProperties {
     pub(crate) mmap: Option<Arc<DiskMmap>>,
     nsectors: u64,
     image_id: Vec<u8>,
-    /// Clusters written since the last drain; shared with the dirty-control listener. Only
-    /// populated for a writable disk that opted into tracking (`spawn_dirty_control`).
-    dirty: Arc<Mutex<DirtyRanges>>,
+    /// Clusters written since the last drain; shared with the dirty-control listener. `None`
+    /// unless the disk has a control socket to drain it (`spawn_dirty_control`): nothing else
+    /// empties the sets.
+    dirty: Option<Arc<Mutex<DirtyRanges>>>,
 }
 
 impl DiskProperties {
@@ -380,7 +478,7 @@ impl DiskProperties {
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
         mmap: Option<Arc<DiskMmap>>,
-        dirty: Arc<Mutex<DirtyRanges>>,
+        dirty: Option<Arc<Mutex<DirtyRanges>>>,
     ) -> io::Result<Self> {
         let disk_size = disk_image.read().unwrap().size();
 
@@ -410,14 +508,25 @@ impl DiskProperties {
     /// Record a guest write for the dirty tracker (no-op unless tracking was enabled).
     /// Called by the block worker after each data-writing request.
     pub(crate) fn record_write(&self, offset: u64, len: u64) {
-        self.dirty.lock().unwrap().record_write(offset, len);
+        if let Some(dirty) = &self.dirty {
+            dirty.lock().unwrap().record_write(offset, len);
+        }
     }
 
-    /// Record a guest discard / write-zeroes for the dirty tracker (no-op unless tracking was
-    /// enabled). Called by the block worker after each request that frees or zeroes clusters,
-    /// so the checkpoint represents them as holes rather than reading or reusing stale data.
+    /// Record a guest discard for the dirty tracker (no-op unless tracking was enabled).
+    /// Called by the block worker after each request that frees clusters, so the checkpoint
+    /// represents them as holes rather than reading or reusing stale data.
     pub(crate) fn record_discard(&self, offset: u64, len: u64) {
-        self.dirty.lock().unwrap().record_discard(offset, len);
+        if let Some(dirty) = &self.dirty {
+            dirty.lock().unwrap().record_discard(offset, len);
+        }
+    }
+
+    /// See [`DirtyRanges::record_zeroes`] (no-op unless tracking was enabled).
+    pub(crate) fn record_zeroes(&self, offset: u64, len: u64) {
+        if let Some(dirty) = &self.dirty {
+            dirty.lock().unwrap().record_zeroes(offset, len);
+        }
     }
 
     pub fn image_id(&self) -> &[u8] {
@@ -425,31 +534,59 @@ impl DiskProperties {
     }
 
     fn build_device_id(disk_file: &File) -> result::Result<String, Error> {
-        let blk_metadata = disk_file.metadata().map_err(Error::GetFileMetadata)?;
         // This is how kvmtool does it.
-        let device_id = format!(
-            "{}{}{}",
-            blk_metadata.st_dev(),
-            blk_metadata.st_rdev(),
-            blk_metadata.st_ino()
-        );
+        #[cfg(unix)]
+        let device_id = {
+            let blk_metadata = disk_file.metadata().map_err(Error::GetFileMetadata)?;
+            format!(
+                "{}{}{}",
+                blk_metadata.st_dev(),
+                blk_metadata.st_rdev(),
+                blk_metadata.st_ino()
+            )
+        };
+        #[cfg(target_os = "windows")]
+        let device_id = {
+            let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+            let ret =
+                unsafe { GetFileInformationByHandle(disk_file.as_raw_handle(), info.as_mut_ptr()) };
+            if ret != 0 {
+                let info = unsafe { info.assume_init() };
+                format!(
+                    "{}{}{}",
+                    info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
+                )
+            } else {
+                return Err(Error::GetFileMetadata(io::Error::last_os_error()));
+            }
+        };
         Ok(device_id)
     }
 
-    fn build_disk_image_id(disk_file: &File) -> Vec<u8> {
+    fn build_disk_image_id(disk_file: &File, block_id: &str) -> Vec<u8> {
         let mut default_id = vec![0; VIRTIO_BLK_ID_BYTES as usize];
-        match Self::build_device_id(disk_file) {
-            Err(_) => {
-                warn!("Could not generate device id. We'll use a default.");
+
+        // The public libkrun disk API accepts a caller-provided block_id. Make
+        // that the virtio-blk GET_ID value so Linux can expose it as
+        // /sys/block/<dev>/serial. Fall back to the historical backing-file
+        // derived id only for callers that pass an empty block_id.
+        let disk_id = if block_id.is_empty() {
+            match Self::build_device_id(disk_file) {
+                Err(_) => {
+                    warn!("Could not generate device id. We'll use a default.");
+                    return default_id;
+                }
+                Ok(m) => m,
             }
-            Ok(m) => {
-                // The kernel only knows to read a maximum of VIRTIO_BLK_ID_BYTES.
-                // This will also zero out any leftover bytes.
-                let disk_id = m.as_bytes();
-                let bytes_to_copy = cmp::min(disk_id.len(), VIRTIO_BLK_ID_BYTES as usize);
-                default_id[..bytes_to_copy].clone_from_slice(&disk_id[..bytes_to_copy])
-            }
-        }
+        } else {
+            block_id.to_string()
+        };
+
+        // The kernel only knows to read a maximum of VIRTIO_BLK_ID_BYTES.
+        // This will also zero out any leftover bytes.
+        let disk_id = disk_id.as_bytes();
+        let bytes_to_copy = cmp::min(disk_id.len(), VIRTIO_BLK_ID_BYTES as usize);
+        default_id[..bytes_to_copy].clone_from_slice(&disk_id[..bytes_to_copy]);
         default_id
     }
 
@@ -550,9 +687,9 @@ pub struct Block {
     mmap: Option<Arc<DiskMmap>>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
-    /// Dirty-cluster tracker, shared with the block worker and (if tracking was enabled) the
-    /// host-side control listener. Empty and unused unless a control socket was configured.
-    dirty: Arc<Mutex<DirtyRanges>>,
+    /// Dirty-cluster tracker, shared with the block worker and the host-side control listener;
+    /// `None` unless a control socket was configured.
+    dirty: Option<Arc<Mutex<DirtyRanges>>>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -577,23 +714,30 @@ impl Block {
         partuuid: Option<String>,
         cache_type: CacheType,
         disk_image_path: String,
-        disk_image_format: ImageType,
+        disk_image_format: DiskFormat,
         is_disk_read_only: bool,
         direct_io: bool,
         sync_mode: SyncMode,
         dirty_control_socket: Option<String>,
     ) -> io::Result<Block> {
+        // A chunk view has no writable form: open it read-only and say so to the guest,
+        // rather than offer a disk whose every write fails.
+        let is_disk_read_only =
+            is_disk_read_only || matches!(disk_image_format, DiskFormat::VkLazyChunks);
         let disk_image = OpenOptions::new()
             .read(true)
             .write(!is_disk_read_only)
             .open(PathBuf::from(&disk_image_path))?;
 
-        let disk_image_id = DiskProperties::build_disk_image_id(&disk_image);
+        let disk_image_id = DiskProperties::build_disk_image_id(&disk_image, &id);
 
-        // Read-only raw images are served from an mmap (see [`DiskMmap`]); a failed map
-        // falls back to the buffered imago read path rather than aborting the boot.
+        // Read-only raw images are served from an mmap (see [`DiskMmap`]) on Unix hosts; a
+        // failed map falls back to the buffered imago read path rather than aborting the boot.
+        #[cfg(not(unix))]
+        let mmap: Option<Arc<DiskMmap>> = None;
+        #[cfg(unix)]
         let mmap =
-            if is_disk_read_only && !direct_io && matches!(&disk_image_format, ImageType::Raw) {
+            if is_disk_read_only && !direct_io && matches!(&disk_image_format, DiskFormat::Raw) {
                 match DiskMmap::open(&disk_image_path) {
                     Ok(m) => Some(Arc::new(m)),
                     Err(e) => {
@@ -614,20 +758,20 @@ impl Block {
         let file_opts = file_opts.relaxed_sync(sync_mode == SyncMode::Relaxed);
 
         let (disk_image, discard_alignment) = match disk_image_format {
-            ImageType::Qcow2 => {
+            DiskFormat::Qcow2 => {
                 let file = ImagoFile::open(file_opts)?;
                 let discard_alignment = file.discard_align();
                 let qcow2 = open_qcow2_chain(Box::new(file), !is_disk_read_only)?;
                 (FormatAccess::new(qcow2), discard_alignment)
             }
-            ImageType::Raw => {
+            DiskFormat::Raw => {
                 let file = ImagoFile::open(file_opts)?;
                 let discard_alignment = file.discard_align();
                 let raw =
                     Raw::<Box<dyn DynStorage>>::open_image(Box::new(file), !is_disk_read_only)?;
                 (FormatAccess::new(raw), discard_alignment)
             }
-            ImageType::Vmdk => {
+            DiskFormat::Vmdk => {
                 let file = ImagoFile::open(file_opts)?;
                 let discard_alignment = file.discard_align();
                 let vmdk = Vmdk::<Box<dyn DynStorage>, Arc<imago::FormatAccess<_>>>::builder(
@@ -636,10 +780,11 @@ impl Block {
                 .open(LazyAwareOpenGate)?;
                 (FormatAccess::new(vmdk), discard_alignment)
             }
-            ImageType::VkLazyChunks => {
-                // Always read-only (enforced right here, independent of `is_disk_read_only`),
-                // so discard/write-zeroes granularity is moot; the storage's own default (1) is
-                // fine, and there is no real host file to probe an alignment from anyway.
+            DiskFormat::VkLazyChunks => {
+                // Always read-only (`is_disk_read_only` is forced above, and the storage is
+                // read-only regardless), so discard/write-zeroes granularity is moot; the
+                // storage's own default (1) is fine, and there is no real host file to probe an
+                // alignment from anyway.
                 let lazy = LazyChunkStorage::open(file_opts)?;
                 let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(lazy), false)?;
                 (FormatAccess::new(raw), 1usize)
@@ -648,7 +793,17 @@ impl Block {
 
         let disk_image = Arc::new(RwLock::new(disk_image));
 
-        let dirty = Arc::new(Mutex::new(DirtyRanges::default()));
+        // Tracked only once a control socket is bound to drain it; otherwise it would only grow.
+        #[cfg(unix)]
+        let dirty_listener = dirty_control_socket
+            .as_deref()
+            .and_then(Self::bind_dirty_control);
+        #[cfg(unix)]
+        let dirty = dirty_listener
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(DirtyRanges::default())));
+        #[cfg(not(unix))]
+        let dirty = None;
 
         let disk_properties = DiskProperties::new(
             disk_image.clone(),
@@ -661,8 +816,13 @@ impl Block {
         // Host-side dirty-drain control (virtkit build backend): serve a DRAIN protocol on the
         // configured socket so a checkpoint captures only the delta. Spawned once here — the
         // worker (re)constructs its own `DiskProperties` from the shared `dirty` Arc on activate.
-        if let Some(socket) = dirty_control_socket {
-            Self::spawn_dirty_control(socket, disk_image.clone(), dirty.clone());
+        #[cfg(unix)]
+        if let (Some(listener), Some(dirty)) = (dirty_listener, &dirty) {
+            Self::spawn_dirty_control(listener, disk_image.clone(), dirty.clone());
+        }
+        #[cfg(not(unix))]
+        if dirty_control_socket.is_some() {
+            warn!("virtio-blk: dirty-control socket ignored: needs a Unix host");
         }
 
         let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
@@ -711,7 +871,29 @@ impl Block {
         })
     }
 
-    /// Spawn the host-side dirty-drain control listener on `socket_path`. On each connection it
+    /// Bind the dirty-control socket at `socket_path`, replacing a stale one, owner-only
+    /// (0600): a client can drain the disk's dirty set and force its flushes. The mode is set
+    /// after the bind, so the caller still has to put the socket in a private directory (vk
+    /// uses its 0700 session dir). `None` (logged) when it cannot be bound, so the disk then
+    /// tracks nothing.
+    #[cfg(unix)]
+    fn bind_dirty_control(socket_path: &str) -> Option<std::os::unix::net::UnixListener> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _ = std::fs::remove_file(socket_path);
+        std::os::unix::net::UnixListener::bind(socket_path)
+            .and_then(|l| {
+                std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+                    .inspect_err(|_| {
+                        let _ = std::fs::remove_file(socket_path);
+                    })?;
+                Ok(l)
+            })
+            .inspect_err(|e| error!("virtio-blk: dirty-control bind {socket_path} failed: {e}"))
+            .ok()
+    }
+
+    /// Serve the host-side dirty-drain control protocol on `listener`. On each connection it
     /// reads a one-byte command:
     /// - `b'D'` (DRAIN) flushes the disk image to its backing file and replies with the clusters
     ///   mutated since the previous drain as two back-to-back blocks — written clusters, then
@@ -727,21 +909,14 @@ impl Block {
     ///
     /// Errors are logged and the listener keeps serving; a dead socket just means no checkpoints
     /// (the build falls back correctly on the virtkit side).
+    #[cfg(unix)]
     fn spawn_dirty_control(
-        socket_path: String,
+        listener: std::os::unix::net::UnixListener,
         disk_image: Arc<RwLock<FormatAccess<Box<dyn DynStorage>>>>,
         dirty: Arc<Mutex<DirtyRanges>>,
     ) {
-        use std::os::unix::net::UnixListener;
+        use std::io::Read;
 
-        let _ = std::fs::remove_file(&socket_path);
-        let listener = match UnixListener::bind(&socket_path) {
-            Ok(l) => l,
-            Err(e) => {
-                error!("virtio-blk: dirty-control bind {socket_path} failed: {e}");
-                return;
-            }
-        };
         std::thread::Builder::new()
             .name("blk dirty-control".into())
             .spawn(move || {
@@ -753,6 +928,16 @@ impl Block {
                             continue;
                         }
                     };
+                    // Connections are served one at a time: a client that sends nothing, or
+                    // reads no reply, must not hold off every later drain. A drain whose reply
+                    // is lost this way loses its delta, so that caller's checkpoint fails.
+                    if let Err(e) = conn
+                        .set_read_timeout(Some(DIRTY_CONTROL_IO_TIMEOUT))
+                        .and_then(|()| conn.set_write_timeout(Some(DIRTY_CONTROL_IO_TIMEOUT)))
+                    {
+                        error!("virtio-blk: dirty-control timeout setup failed: {e}");
+                        continue;
+                    }
                     let mut cmd = [0u8; 1];
                     if conn.read_exact(&mut cmd).is_err() {
                         continue;
@@ -881,6 +1066,10 @@ impl VirtioDevice for Block {
         &QUEUE_CONFIG
     }
 
+    fn config_len(&self) -> Option<u32> {
+        Some(size_of::<VirtioBlkConfig>() as u32)
+    }
+
     fn avail_features(&self) -> u64 {
         self.avail_features
     }
@@ -937,7 +1126,7 @@ impl VirtioDevice for Block {
                 self.disk_image_id.clone(),
                 self.cache_type,
                 self.mmap.clone(),
-                Arc::clone(&self.dirty),
+                self.dirty.clone(),
             )
             .map_err(|_| ActivateError::BadActivate)?,
         };
@@ -970,9 +1159,9 @@ impl VirtioDevice for Block {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtio::descriptor_utils::{create_descriptor_chain, DescriptorType, Writer};
+    use crate::virtio::descriptor_utils::{DescriptorType, Writer, create_descriptor_chain};
     use crate::virtio::file_traits::FileReadWriteAtVolatile;
-    use vm_memory::{Bytes, GuestAddress, GuestMemory};
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend};
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("blk-mmap-{tag}-{}", std::process::id()));
@@ -1003,6 +1192,7 @@ mod tests {
 
     /// A read-only raw [`DiskProperties`] backed by `path`, with the mmap read path enabled —
     /// the same wiring `Block::new` produces for a read-only raw image.
+    #[cfg(unix)]
     fn mmap_disk(path: &std::path::Path) -> DiskProperties {
         let p = path.to_str().unwrap().to_string();
         let ifile = ImagoFile::open(StorageOpenOptions::new().filename(p.clone())).unwrap();
@@ -1013,12 +1203,13 @@ mod tests {
             vec![0u8; VIRTIO_BLK_ID_BYTES as usize],
             CacheType::Unsafe,
             Some(Arc::new(DiskMmap::open(&p).unwrap())),
-            Arc::new(Mutex::new(DirtyRanges::default())),
+            None,
         )
         .unwrap()
     }
 
     /// `DiskMmap::as_slice` exposes exactly the file's bytes.
+    #[cfg(unix)]
     #[test]
     fn diskmmap_maps_file_contents() {
         let dir = temp_dir("unit");
@@ -1035,6 +1226,7 @@ mod tests {
     /// Serving a guest read from the mmap must fill exactly `count` bytes with the disk's
     /// contents and leave the rest of the descriptor untouched — the same contract the
     /// buffered `pread` path honors (see `write_from_at_must_not_overread_past_count`).
+    #[cfg(unix)]
     #[test]
     fn mmap_read_serves_disk_bytes_and_respects_count() {
         use DescriptorType::*;
@@ -1076,6 +1268,7 @@ mod tests {
 
     /// A request that would read past the end of the mapping is rejected rather than
     /// faulting on out-of-bounds memory.
+    #[cfg(unix)]
     #[test]
     fn mmap_read_past_end_errors() {
         let dir = temp_dir("eof");
@@ -1095,6 +1288,7 @@ mod tests {
 
     /// A read spanning several descriptors must copy sequential file bytes into each in
     /// order — exercises the per-slice `off` advance in the mmap branch.
+    #[cfg(unix)]
     #[test]
     fn mmap_read_spans_multiple_descriptors() {
         use DescriptorType::*;
@@ -1226,7 +1420,7 @@ mod tests {
     #[test]
     fn a_vk_ro_img_backing_resolves_at_every_depth_of_the_chain() {
         use super::super::lazy_chunk_storage::test_support::{
-            blob_name, fake_digest, write_manifest, Fixture, CODEC_RAW, CODEC_ZSTD, LAYOUT_FLAT,
+            CODEC_RAW, CODEC_ZSTD, Fixture, LAYOUT_FLAT, blob_name, fake_digest, write_manifest,
         };
 
         const CHUNK: usize = 64 * 1024;
@@ -1286,7 +1480,7 @@ mod tests {
     #[test]
     fn an_overlay_write_takes_precedence_over_the_manifest_beneath_it() {
         use super::super::lazy_chunk_storage::test_support::{
-            blob_name, fake_digest, write_manifest, Fixture, CODEC_RAW, LAYOUT_FLAT,
+            CODEC_RAW, Fixture, LAYOUT_FLAT, blob_name, fake_digest, write_manifest,
         };
         use imago::io_buffers::IoVector;
         use std::io::IoSlice;
@@ -1343,7 +1537,7 @@ mod tests {
     #[test]
     fn a_backing_file_without_the_extension_is_read_as_a_plain_raw_file() {
         use super::super::lazy_chunk_storage::test_support::{
-            blob_name, fake_digest, write_manifest, Fixture, CODEC_RAW, LAYOUT_FLAT,
+            CODEC_RAW, Fixture, LAYOUT_FLAT, blob_name, fake_digest, write_manifest,
         };
 
         const CHUNK: usize = 64 * 1024;
@@ -1611,5 +1805,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    use utils::tempfile::TempFile;
+
+    #[test]
+    fn disk_image_id_prefers_supplied_block_id() {
+        let backing = TempFile::new().expect("create backing file");
+        backing
+            .as_file()
+            .set_len(SECTOR_SIZE)
+            .expect("size backing file");
+
+        let image_id = DiskProperties::build_disk_image_id(backing.as_file(), "workload-rootfs");
+
+        assert_eq!(image_id.len(), VIRTIO_BLK_ID_BYTES as usize);
+        assert_eq!(&image_id[..b"workload-rootfs".len()], b"workload-rootfs");
+        assert!(
+            image_id[b"workload-rootfs".len()..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+    }
+
+    #[test]
+    fn disk_image_id_truncates_supplied_block_id_to_virtio_limit() {
+        let backing = TempFile::new().expect("create backing file");
+        backing
+            .as_file()
+            .set_len(SECTOR_SIZE)
+            .expect("size backing file");
+        let long_id = "volume-name-that-is-longer-than-virtio-limit";
+
+        let image_id = DiskProperties::build_disk_image_id(backing.as_file(), long_id);
+
+        assert_eq!(image_id.len(), VIRTIO_BLK_ID_BYTES as usize);
+        assert_eq!(
+            &image_id,
+            &long_id.as_bytes()[..VIRTIO_BLK_ID_BYTES as usize]
+        );
+    }
+
+    #[test]
+    fn disk_image_id_accepts_empty_block_id() {
+        let backing = TempFile::new().expect("create backing file");
+        backing
+            .as_file()
+            .set_len(SECTOR_SIZE)
+            .expect("size backing file");
+
+        let image_id = DiskProperties::build_disk_image_id(backing.as_file(), "");
+
+        assert_eq!(image_id.len(), VIRTIO_BLK_ID_BYTES as usize);
     }
 }

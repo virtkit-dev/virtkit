@@ -1,5 +1,4 @@
-//! Soft UID/GID mapping for virtio-fs, shared by libkrun's built-in device and the
-//! bundled `vk virtiofsd` daemon.
+//! Soft UID/GID mapping for libkrun's virtio-fs device.
 //!
 //! Unprivileged translation of ownership between guest and host, compatible with
 //! virtiofsd's `--uid-map`/`--gid-map` internal-idmap syntax (`type:args…`):
@@ -20,12 +19,17 @@
 //! boundary translation it does not rewrite ids stored *inside* file data or
 //! POSIX-ACL xattr values (same as unprivileged cosmetic mapping in general).
 
+#[cfg(target_os = "macos")]
+use crossbeam_channel::Sender;
 use std::ffi::CStr;
 use std::io;
 use std::str::FromStr;
-use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
 use std::time::Duration;
+
+#[cfg(target_os = "macos")]
+use utils::worker_message::WorkerMessage;
 
 use crate::virtio::bindings;
 use crate::virtio::fs::filesystem::{
@@ -708,6 +712,7 @@ impl<F: FileSystem<Inode = Inode, Handle = Handle> + Sync> FileSystem for IdMapF
         moffset: u64,
         host_shm_base: u64,
         shm_size: u64,
+        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
         self.inner.setupmapping(
             self.ctx(ctx)?,
@@ -719,6 +724,8 @@ impl<F: FileSystem<Inode = Inode, Handle = Handle> + Sync> FileSystem for IdMapF
             moffset,
             host_shm_base,
             shm_size,
+            #[cfg(target_os = "macos")]
+            map_sender,
         )
     }
 
@@ -728,9 +735,16 @@ impl<F: FileSystem<Inode = Inode, Handle = Handle> + Sync> FileSystem for IdMapF
         requests: Vec<fuse::RemovemappingOne>,
         host_shm_base: u64,
         shm_size: u64,
+        #[cfg(target_os = "macos")] map_sender: &Option<Sender<WorkerMessage>>,
     ) -> io::Result<()> {
-        self.inner
-            .removemapping(self.ctx(ctx)?, requests, host_shm_base, shm_size)
+        self.inner.removemapping(
+            self.ctx(ctx)?,
+            requests,
+            host_shm_base,
+            shm_size,
+            #[cfg(target_os = "macos")]
+            map_sender,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

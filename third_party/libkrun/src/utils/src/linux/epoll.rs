@@ -7,9 +7,9 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use bitflags::bitflags;
 use libc::{
-    epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLLERR, EPOLLET, EPOLLEXCLUSIVE, EPOLLHUP,
-    EPOLLIN, EPOLLONESHOT, EPOLLOUT, EPOLLPRI, EPOLLRDHUP, EPOLLWAKEUP, EPOLL_CLOEXEC,
-    EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD,
+    EPOLL_CLOEXEC, EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLERR, EPOLLET, EPOLLEXCLUSIVE,
+    EPOLLHUP, EPOLLIN, EPOLLONESHOT, EPOLLOUT, EPOLLPRI, EPOLLRDHUP, EPOLLWAKEUP, epoll_create1,
+    epoll_ctl, epoll_event, epoll_wait,
 };
 
 use crate::syscall::SyscallReturnCode;
@@ -185,7 +185,7 @@ impl Epoll {
     /// * `events` points to a memory area that will be used for storing the events
     ///   returned by `epoll_wait()` call.
     pub fn wait(
-        &self,
+        &mut self,
         max_events: usize,
         timeout: i32,
         events: &mut [EpollEvent],
@@ -249,7 +249,7 @@ mod tests {
         const EVENT_BUFFER_SIZE: usize = 128;
         const MAX_EVENTS: usize = 10;
 
-        let epoll = Epoll::new().unwrap();
+        let mut epoll = Epoll::new().unwrap();
         assert_eq!(epoll.epoll_fd, epoll.as_raw_fd());
 
         // Let's test different scenarios for `epoll_ctl()` and `epoll_wait()` functionality.
@@ -266,35 +266,43 @@ mod tests {
 
         // For EPOLL_CTL_ADD behavior we will try to add some fds with different event masks into
         // the interest list of epoll instance.
-        assert!(epoll
-            .ctl(ControlOperation::Add, event_fd_1.as_raw_fd(), &event_1)
-            .is_ok());
+        assert!(
+            epoll
+                .ctl(ControlOperation::Add, event_fd_1.as_raw_fd(), &event_1)
+                .is_ok()
+        );
 
         // We can't add twice the same fd to epoll interest list.
-        assert!(epoll
-            .ctl(ControlOperation::Add, event_fd_1.as_raw_fd(), &event_1)
-            .is_err());
+        assert!(
+            epoll
+                .ctl(ControlOperation::Add, event_fd_1.as_raw_fd(), &event_1)
+                .is_err()
+        );
 
         let event_fd_2 = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         event_fd_2.write(1).unwrap();
-        assert!(epoll
-            .ctl(
-                ControlOperation::Add,
-                event_fd_2.as_raw_fd(),
-                // For this fd, we want an Event instance that has `data` field set to other
-                // value than the value of the fd and `events` without EPOLLIN type set.
-                &EpollEvent::new(EventSet::OUT, 10)
-            )
-            .is_ok());
+        assert!(
+            epoll
+                .ctl(
+                    ControlOperation::Add,
+                    event_fd_2.as_raw_fd(),
+                    // For this fd, we want an Event instance that has `data` field set to other
+                    // value than the value of the fd and `events` without EPOLLIN type set.
+                    &EpollEvent::new(EventSet::OUT, 10)
+                )
+                .is_ok()
+        );
 
         // For the following eventfd we won't write anything to its counter, so we expect EPOLLIN
         // event to not be available for this fd, even if we say that we want to monitor this type
         // of event via EPOLL_CTL_ADD operation.
         let event_fd_3 = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         let event_3 = EpollEvent::new(EventSet::OUT | EventSet::IN, event_fd_3.as_raw_fd() as u64);
-        assert!(epoll
-            .ctl(ControlOperation::Add, event_fd_3.as_raw_fd(), &event_3)
-            .is_ok());
+        assert!(
+            epoll
+                .ctl(ControlOperation::Add, event_fd_3.as_raw_fd(), &event_3)
+                .is_ok()
+        );
 
         // Let's check `epoll_wait()` behavior for our epoll instance.
         let mut ready_events = vec![EpollEvent::default(); EVENT_BUFFER_SIZE];
@@ -328,19 +336,23 @@ mod tests {
         // We create here a new Event with some events, other than those previously set,
         // that we want to monitor this time on event_fd_1.
         event_1 = EpollEvent::new(EventSet::OUT, 20);
-        assert!(epoll
-            .ctl(ControlOperation::Modify, event_fd_1.as_raw_fd(), &event_1)
-            .is_ok());
+        assert!(
+            epoll
+                .ctl(ControlOperation::Modify, event_fd_1.as_raw_fd(), &event_1)
+                .is_ok()
+        );
 
         let event_fd_4 = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         // Can't modify a fd that wasn't added to epoll interest list.
-        assert!(epoll
-            .ctl(
-                ControlOperation::Modify,
-                event_fd_4.as_raw_fd(),
-                &EpollEvent::default()
-            )
-            .is_err());
+        assert!(
+            epoll
+                .ctl(
+                    ControlOperation::Modify,
+                    event_fd_4.as_raw_fd(),
+                    &EpollEvent::default()
+                )
+                .is_err()
+        );
 
         let _ = epoll
             .wait(MAX_EVENTS, DEFAULT__TIMEOUT, &mut ready_events[..])
@@ -352,13 +364,15 @@ mod tests {
         assert_eq!(ready_events[0].events(), EventSet::OUT.bits());
 
         // Now let's set for a fd to not have any events monitored.
-        assert!(epoll
-            .ctl(
-                ControlOperation::Modify,
-                event_fd_1.as_raw_fd(),
-                &EpollEvent::default()
-            )
-            .is_ok());
+        assert!(
+            epoll
+                .ctl(
+                    ControlOperation::Modify,
+                    event_fd_1.as_raw_fd(),
+                    &EpollEvent::default()
+                )
+                .is_ok()
+        );
 
         // In this particular case we expect to remain only with 2 fds in the ready list.
         ev_count = epoll
@@ -367,13 +381,15 @@ mod tests {
         assert_eq!(ev_count, 2);
 
         // Let's also delete a fd from the interest list.
-        assert!(epoll
-            .ctl(
-                ControlOperation::Delete,
-                event_fd_2.as_raw_fd(),
-                &EpollEvent::default()
-            )
-            .is_ok());
+        assert!(
+            epoll
+                .ctl(
+                    ControlOperation::Delete,
+                    event_fd_2.as_raw_fd(),
+                    &EpollEvent::default()
+                )
+                .is_ok()
+        );
 
         // We expect to have only one fd remained in the ready list (event_fd_3).
         ev_count = epoll
@@ -385,12 +401,14 @@ mod tests {
         assert_eq!(ready_events[0].events(), EventSet::OUT.bits());
 
         // If we try to remove a fd from epoll interest list that wasn't added before it will fail.
-        assert!(epoll
-            .ctl(
-                ControlOperation::Delete,
-                event_fd_4.as_raw_fd(),
-                &EpollEvent::default()
-            )
-            .is_err());
+        assert!(
+            epoll
+                .ctl(
+                    ControlOperation::Delete,
+                    event_fd_4.as_raw_fd(),
+                    &EpollEvent::default()
+                )
+                .is_err()
+        );
     }
 }

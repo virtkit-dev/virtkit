@@ -1,4 +1,4 @@
-use rand::{rngs::OsRng, TryRngCore};
+use rand::{TryRng, rngs::SysRng};
 use utils::eventfd::EventFd;
 use vm_memory::{Bytes, GuestMemoryMmap};
 
@@ -60,7 +60,7 @@ impl Rng {
             let mut written = 0;
             for desc in head.into_iter() {
                 let mut rand_bytes = vec![0u8; desc.len as usize];
-                if let Err(e) = OsRng.try_fill_bytes(&mut rand_bytes) {
+                if let Err(e) = SysRng.try_fill_bytes(&mut rand_bytes) {
                     error!("Failed to fill buffer with random data: {e:?}");
                     queues[REQ_INDEX].queue.go_to_previous_position();
                     break;
@@ -106,6 +106,10 @@ impl VirtioDevice for Rng {
 
     fn queue_config(&self) -> &[QueueConfig] {
         &defs::QUEUE_CONFIG
+    }
+
+    fn config_len(&self) -> Option<u32> {
+        Some(0)
     }
 
     fn read_config(&self, _offset: u64, _data: &mut [u8]) {

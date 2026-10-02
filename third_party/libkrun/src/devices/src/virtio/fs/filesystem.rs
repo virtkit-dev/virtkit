@@ -163,7 +163,7 @@ pub trait ZeroCopyReader {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "failed to fill whole buffer",
-                    ))
+                    ));
                 }
                 Ok(n) => {
                     count -= n;
@@ -253,7 +253,7 @@ pub trait ZeroCopyWriter {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "failed to write whole buffer",
-                    ))
+                    ));
                 }
                 Ok(n) => {
                     // No need for checked math here because we verified that `off + count` will not
@@ -305,6 +305,7 @@ impl<W: ZeroCopyWriter> ZeroCopyWriter for &mut W {
 }
 
 /// Additional context associated with requests.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 pub struct Context {
     /// The user ID of the calling process.
@@ -315,6 +316,19 @@ pub struct Context {
 
     /// The thread group ID of the calling process.
     pub pid: libc::pid_t,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub struct Context {
+    /// The user ID of the calling process.
+    pub uid: u32,
+
+    /// The group ID of the calling process.
+    pub gid: u32,
+
+    /// The thread group ID of the calling process.
+    pub pid: i32,
 }
 
 impl From<fuse::InHeader> for Context {

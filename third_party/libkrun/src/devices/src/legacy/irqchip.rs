@@ -1,11 +1,11 @@
 use std::sync::{Arc, Mutex};
 
+use crate::Error as DeviceError;
 use crate::bus::BusDevice;
 #[cfg(target_arch = "riscv64")]
 use crate::legacy::aia::AIADevice;
 #[cfg(target_arch = "aarch64")]
 use crate::legacy::gic::GICDevice;
-use crate::Error as DeviceError;
 
 use utils::eventfd::EventFd;
 
@@ -158,8 +158,8 @@ pub mod test_utils {
         }
     }
 
-    impl Into<IrqChip> for DummyIrqChip {
-        fn into(self) -> IrqChip {
+    impl From<DummyIrqChip> for IrqChip {
+        fn from(_val: DummyIrqChip) -> Self {
             Arc::new(Mutex::new(IrqChipDevice::new(
                 Box::new(DummyIrqChip::new()),
             )))
