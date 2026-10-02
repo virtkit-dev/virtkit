@@ -1104,6 +1104,12 @@ enum Cmd {
         /// keep printing new lines as the guest writes them (until Ctrl-C or the VM ends)
         #[arg(short = 'f', long)]
         follow: bool,
+        /// plumbing: read the console in the state dir or CI job dir TARGET names, exactly
+        ///
+        /// Without it a directory also selects the VM whose project lies under it, for a
+        /// person at a shell; a program that has the dir in hand wants that dir's console only.
+        #[arg(long, hide = true, requires = "target", conflicts_with_all = ["service", "follow"])]
+        exact: bool,
     },
     /// Run a command in a live guest, or open an interactive shell in it
     ///
@@ -4254,6 +4260,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             agent,
             guest,
             follow,
+            exact,
         } => {
             let mut sources = Vec::new();
             if kernel {
@@ -4265,7 +4272,11 @@ async fn cli_main(cli: Cli) -> ExitCode {
             if guest {
                 sources.push(consolelog::Source::Guest);
             }
-            match console_log_path(target.as_deref(), service.as_deref()) {
+            let path = match (exact, &target) {
+                (true, Some(dir)) => exact_console_log_path(dir),
+                _ => console_log_path(target.as_deref(), service.as_deref()),
+            };
+            match path {
                 Ok(path) => {
                     match show_console_log(&path, target.as_deref(), &sources, level, lines, follow)
                         .await
@@ -4681,6 +4692,15 @@ fn console_log_path(target: Option<&Path>, service: Option<&str>) -> anyhow::Res
         }
     };
     Ok(dir.join(run::CONSOLE_LOG))
+}
+
+/// Find the console log in the named state or CI job `dir` without consulting the registry.
+fn exact_console_log_path(dir: &Path) -> anyhow::Result<PathBuf> {
+    let path = dir.join(run::CONSOLE_LOG);
+    if !path.is_file() {
+        anyhow::bail!("{}: no console log there", dir.display());
+    }
+    Ok(path)
 }
 
 /// How often a follow looks for appended bytes, and how long a partial line may sit
@@ -6103,6 +6123,25 @@ mod tests {
         assert_eq!(pieces[1], long.as_bytes()[..MAX_PARTIAL_LINE]);
         assert_eq!(pieces[2], b"xxxxx\n");
         assert_eq!(pieces[3], b"b");
+    }
+
+    // `vk logs --exact` reads the named dir's console, and only that.
+    #[test]
+    fn an_exact_console_is_the_named_dir_s() {
+        let dir = std::env::temp_dir().join(format!("vk-logs-exact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(exact_console_log_path(&dir).is_err());
+        std::fs::write(dir.join(run::CONSOLE_LOG), b"").unwrap();
+        assert_eq!(
+            exact_console_log_path(&dir).unwrap(),
+            dir.join(run::CONSOLE_LOG)
+        );
+        let cli = Cli::try_parse_from(["vk", "logs", "--exact", "-n", "5", "--", "/x"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Logs { exact: true, .. }));
+        assert!(Cli::try_parse_from(["vk", "logs", "--exact"]).is_err());
+        assert!(Cli::try_parse_from(["vk", "logs", "--exact", "-f", "/x"]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // `vk logs` on a directory the registry does not know reads its console anyway — a VM
