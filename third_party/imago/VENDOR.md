@@ -39,6 +39,12 @@ instead. Every `_sync`-suffixed method (`open_sync`, `open_image_sync`,
 runtime — so the call sites that used to have a trailing `?` after `SyncFormatAccess::new(...)`
 lost it.
 
+`third_party/libkrun-next/src/devices` also enables `vm-memory`, which `Cargo.toml` (a local
+patch) narrows from `>=0.16, <0.19` to `0.18`: its `IoVector::from_volatile_slice` calls need
+0.18's `VolatileSlice`. Once vk-driver links that tree, the wide range would unify with the
+0.17.1 `third_party/libkrun` pins for its own use, and the 2.0 block device would not compile
+inside vk-driver.
+
 ## Local patches
 
 **Bug:** `ensure_data_mapping()` allocates (or COWs) a cluster and commits it to the L2 table
