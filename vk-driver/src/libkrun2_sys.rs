@@ -6,7 +6,7 @@
 //! `_exit`ing with the guest's code (154 for a reset, which [`crate::libkrun_sys::keep_with`]
 //! relaunches on).
 //!
-//! Devices sit on virtio-mmio, described to the guest in ACPI. A host SIGTERM presses the
+//! Devices sit on virtio-pci with MSI-X behind an ACPI host bridge. A host SIGTERM presses the
 //! guest's ACPI power button: SIGTERM is blocked before any thread exists and a dedicated
 //! thread waits for it and calls `VmmHandle::shutdown`, so nothing runs in a signal handler.
 
@@ -34,8 +34,8 @@ use crate::vmm::{Disk, DiskSync, FsShare, Net, ShareCache, VmSpec};
 /// The guest's vsock CID, the one libkrun 1.19's implicit vsock device gave it.
 const GUEST_CID: u64 = 3;
 
-/// The transport the devices sit on: virtio-mmio, or virtio-pci with MSI-X
-/// (`VIRTKIT_KRUN2_PCI=1` until it serves shared-memory regions, which DAX shares need).
+/// The transport the devices sit on: virtio-pci with MSI-X, as the 1.19 tree used, or
+/// virtio-mmio under `VIRTKIT_KRUN2_MMIO=1` (to rule the transport out when debugging).
 enum Devices<'a> {
     Mmio(MmioDeviceManager<'a>),
     Pci(PciDeviceManager<'a>),
@@ -43,10 +43,10 @@ enum Devices<'a> {
 
 impl<'a> Devices<'a> {
     fn new() -> Self {
-        if std::env::var("VIRTKIT_KRUN2_PCI").as_deref() == Ok("1") {
-            Devices::Pci(PciDeviceManager::new())
-        } else {
+        if std::env::var("VIRTKIT_KRUN2_MMIO").as_deref() == Ok("1") {
             Devices::Mmio(MmioDeviceManager::new())
+        } else {
+            Devices::Pci(PciDeviceManager::new())
         }
     }
 
