@@ -605,15 +605,6 @@ fn mounts_of(
                 true => PathBuf::from(source),
                 false => in_workspace(workspace, &source),
             });
-        if source
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
-        {
-            bail!(
-                "[{key}] source {} escapes upward; write the path it means",
-                source.display()
-            );
-        }
         let to = guest_path(&to).with_context(|| format!("[{key}] to"))?;
         if !names.insert(mname.clone()) {
             bail!("[{key}] {mname} is the name of a mount vk makes itself; choose another");
