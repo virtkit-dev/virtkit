@@ -272,3 +272,18 @@ checks now count through a test `InterruptHandler`, upstream having dropped the 
 header (short, or all write-only) is returned used without a frame. Upstream and the 1.19
 tree handed it to the backend, whose `write_frame` asserts on it, so a guest could panic the
 net worker. Covered by `a_header_only_transmit_chain_is_returned_without_a_frame`.
+
+### virtio-vsock (forward-ported from the 1.19 tree)
+
+`src/devices/src/virtio/vsock/unix_proxy/unix.rs` — `release` shuts down the host socket and
+stops polling on an established connection's guest `OP_RST` or bidirectional `OP_SHUTDOWN`.
+Removal stays deferred; otherwise the host peer reads EOF only when the reaper drops the
+proxy 5 s later. Upstream already removes not-yet-connected proxies immediately. The 1.19
+patch originally covered those connections (a readiness probe during boot). Unix hosts
+only; Windows `release` remains upstream's.
+
+`src/devices/src/virtio/vsock/{muxer.rs,mod.rs}` — `UnixProxy::new` failure (host `socket()`
+under fd or memory exhaustion) resets the guest's connect instead of panicking the device
+thread, poisoning the queue mutex and wedging the VM's whole vsock. The muxer RX queue grows
+from 256 to 1024 slots; a full queue drops host->guest packets, including a connect's
+`OP_RESPONSE`.

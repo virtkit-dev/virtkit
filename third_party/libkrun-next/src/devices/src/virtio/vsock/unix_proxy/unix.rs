@@ -336,8 +336,23 @@ pub(crate) fn release(proxy: &mut super::UnixProxy) -> ProxyUpdate {
         ProxyStatus::ReverseInit | ProxyStatus::Connecting => ProxyRemoval::Immediate,
         _ => ProxyRemoval::Deferred,
     };
+    if !matches!(remove_proxy, ProxyRemoval::Deferred) {
+        return ProxyUpdate {
+            remove_proxy,
+            ..Default::default()
+        };
+    }
+
+    // The guest reset or fully shut down an established connection. Tell the host peer now:
+    // with the socket left open it would only read EOF once the reaper drops this proxy, 5 s
+    // from now (local patch).
+    if let Err(e) = shutdown(proxy.fd.as_raw_fd(), Shutdown::Both) {
+        debug!("release: shutdown failed: {e}");
+    }
+    proxy.status = ProxyStatus::Closed;
 
     ProxyUpdate {
+        polling: Some((proxy.id, proxy.fd.as_raw_fd(), EventSet::empty())),
         remove_proxy,
         ..Default::default()
     }
