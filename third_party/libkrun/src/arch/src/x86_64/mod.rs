@@ -299,6 +299,8 @@ pub fn setup_mptable_for_tdshim(guest_mem: &GuestMemoryMmap, num_cpus: u8) -> su
 /// * `num_cpus` - Number of virtual CPUs the guest will have.
 /// * `pvh` - Whether to use the PVH boot protocol.
 /// * `pci_host` - The PCI host configuration if enabled.
+/// * `vm_generation_id` - The VM generation ID to declare in the DSDT, if any (local patch).
+/// * `windows_platform` - Shape the DSDT for Windows, see [`acpi::setup_acpi`] (local patch).
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn configure_system(
     guest_mem: &GuestMemoryMmap,
@@ -311,10 +313,19 @@ pub fn configure_system(
     acpi_enabled: bool,
     virtio_mmio_devices: &[(u64, u32)],
     pci_host: Option<&PciHostInfo>,
+    vm_generation_id: Option<&[u8; 16]>,
+    windows_platform: bool,
 ) -> super::Result<()> {
     if acpi_enabled {
-        acpi::setup_acpi(guest_mem, num_cpus, virtio_mmio_devices, pci_host)
-            .map_err(Error::AcpiSetup)?;
+        acpi::setup_acpi(
+            guest_mem,
+            num_cpus,
+            virtio_mmio_devices,
+            pci_host,
+            vm_generation_id,
+            windows_platform,
+        )
+        .map_err(Error::AcpiSetup)?;
     } else {
         // Note that this puts the mptable at the last 1k of Linux's 640k base RAM
         #[cfg(not(feature = "tee"))]
@@ -648,6 +659,8 @@ mod tests {
             false,
             &[],
             None,
+            None,
+            false,
         );
         assert!(config_err.is_err());
         #[cfg(not(feature = "tee"))]
@@ -672,6 +685,8 @@ mod tests {
             false,
             &[],
             None,
+            None,
+            false,
         )
         .unwrap();
 
@@ -691,6 +706,8 @@ mod tests {
             false,
             &[],
             None,
+            None,
+            false,
         )
         .unwrap();
 
@@ -710,6 +727,8 @@ mod tests {
             false,
             &[],
             None,
+            None,
+            false,
         )
         .unwrap();
     }

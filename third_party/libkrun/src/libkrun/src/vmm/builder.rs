@@ -1428,6 +1428,9 @@ pub fn build_microvm(
         vm_resources.acpi_enabled,
         &virtio_mmio_devices,
         payload_config.pvh,
+        vm_resources.vm_generation_id.as_ref(),
+        // The Windows platform: a guest with Hyper-V enlightenments is a Windows guest.
+        vm_resources.hyperv_enabled,
     )
     .map_err(StartMicrovmError::Internal)?;
 

@@ -1703,6 +1703,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         numa: placement,
         guest_agent: None,
         hyperv: false,
+        vm_generation_id: None,
     };
     // passive listeners the guest dials once up: safe (and simplest) to start before
     // the VMM, and intentionally not bind-waited — they bind long before the guest

@@ -182,6 +182,15 @@ impl PortIODeviceManager {
         self.io_bus
             .insert(self.acpi_pm.clone(), u64::from(ACPI_PM_BASE), ACPI_PM_LEN)
             .map_err(Error::BusError)?;
+        // pvpanic: a crashing guest says so (local patch, see VENDOR.md).
+        #[cfg(target_os = "linux")]
+        self.io_bus
+            .insert(
+                Arc::new(Mutex::new(devices::legacy::PvPanic)),
+                u64::from(arch::x86_64::layout::PVPANIC_PORT),
+                1,
+            )
+            .map_err(Error::BusError)?;
         Ok(())
     }
 }

@@ -33,6 +33,9 @@ pub(crate) const FIRMWARE_ENV: &str = "VIRTKIT_UEFI_FIRMWARE";
 /// The run directory's qemu-ga socket ([`crate::qga`]).
 pub(crate) const GUEST_AGENT_SOCKET: &str = "qga.sock";
 
+/// The run directory's VM generation ID, beside the disk overlays it belongs to.
+const GENERATION_ID: &str = "vmgenid";
+
 /// A VMM that exits within this long of its spawn failed to boot; past it, the guest is up
 /// as far as a detached run's parent cares (Windows has no agent to answer earlier).
 const BOOT_SETTLE: Duration = Duration::from_secs(3);
@@ -204,6 +207,33 @@ fn refuse_unsupported(args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// The VM generation ID for the disks in `work`: created on first boot, kept across boots,
+/// new for fresh overlays (a copy of the bundle's disk). Only a missing ID is created;
+/// an unreadable or malformed ID is an error, since a silently changed ID makes a
+/// Windows domain controller reset its invocation ID and RID pool.
+fn generation_id(work: &Path) -> Result<[u8; 16]> {
+    use std::io::Read;
+
+    let path = work.join(GENERATION_ID);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            return <[u8; 16]>::try_from(bytes.as_slice())
+                .map_err(|_| anyhow::anyhow!("{}: {} bytes, not 16", path.display(), bytes.len()));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    let mut id = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut id))
+        .context("reading /dev/urandom")?;
+    // Whole or not at all: a torn file would be replaced, changing the ID.
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, id).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(id)
+}
+
 /// Boot `bundle` and hold it until the guest powers off or the run is stopped.
 pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<()> {
     refuse_unsupported(args)?;
@@ -275,6 +305,7 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
         numa: args.numa.clone(),
         guest_agent: Some(work.join(GUEST_AGENT_SOCKET)),
         hyperv: true,
+        vm_generation_id: Some(generation_id(work)?),
     };
     let vmm = crate::vmm::selected();
     let mut ch = match crate::run::spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal) {
@@ -482,6 +513,25 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn the_generation_id_is_made_once_per_run_directory() {
+        let a = Scratch::new("genid-a");
+        let b = Scratch::new("genid-b");
+        let first = generation_id(a.path()).unwrap();
+        assert_eq!(generation_id(a.path()).unwrap(), first);
+        assert_ne!(generation_id(b.path()).unwrap(), first);
+    }
+
+    #[test]
+    fn a_malformed_generation_id_is_an_error_not_replaced() {
+        let work = Scratch::new("genid-bad");
+        let path = work.path().join(GENERATION_ID);
+        std::fs::write(&path, [0u8; 15]).unwrap();
+        let err = generation_id(work.path()).unwrap_err();
+        assert!(err.to_string().contains("15 bytes"), "{err:#}");
+        assert_eq!(std::fs::read(&path).unwrap(), [0u8; 15]);
     }
 
     #[test]
