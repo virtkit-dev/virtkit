@@ -91,6 +91,7 @@ mod vm;
 mod vmdk;
 mod vmm;
 mod vms;
+mod winexec;
 mod workloads;
 mod wsl;
 
@@ -1233,6 +1234,9 @@ enum Cmd {
     /// client the in-guest agent embeds, so a host reaches a running VM with `vk` alone,
     /// no separate `vk-agent` binary. `vk` exits with the command's own status. The
     /// command goes after `--`; the optional token before it selects the VM.
+    ///
+    /// A Windows (UEFI) guest runs it through its qemu-ga, as SYSTEM, its arguments passed
+    /// verbatim; a cmd built-in such as `call` expands `%` in them again.
     #[command(arg_required_else_help = true, display_order = 3)]
     Exec {
         /// which VM: a directory, or a raw agent address
@@ -1270,6 +1274,22 @@ enum Cmd {
         /// Command to run and its arguments, after `--` (e.g. `vk exec -- ls -la`)
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    /// Copy a file into or out of a live Windows (UEFI) guest
+    ///
+    /// Goes through the guest's qemu-ga, as SYSTEM. The guest side is the path after a
+    /// leading `:` (`vk cp setup.ps1 :C:/vk/setup.ps1`, `vk cp :C:/Windows/Panther/setupact.log
+    /// .`); exactly one side is the guest's, and it must be a file's full path, not a
+    /// directory. A host destination that is a directory gets the guest file's name.
+    #[command(display_order = 3)]
+    Cp {
+        /// the file to copy: a host path, or `:` and a guest path
+        source: String,
+        /// where to copy it: a host path, or `:` and a guest path
+        destination: String,
+        /// which VM: a directory (default: the current directory), as `vk exec` resolves it
+        #[arg(long, value_name = "DIR")]
+        target: Option<String>,
     },
     /// Publish a port on the guest's own network to the host
     ///
@@ -4516,6 +4536,40 @@ async fn cli_main(cli: Cli) -> ExitCode {
             user,
             command,
         } => {
+            // A Windows (UEFI) guest has no vk-agent: its qemu-ga runs the command instead. A
+            // target that does not resolve falls through to the vk-agent path, which reports it.
+            if service.is_none()
+                && !target.as_deref().is_some_and(is_agent_addr)
+                && let Ok(entry) = vms::resolve_one(target.as_deref().map(Path::new))
+                && let Some(socket) = entry.guest_agent
+            {
+                if tty || user.is_some() || clear_env {
+                    return fail(
+                        &anyhow::anyhow!(
+                            "--tty, --user and --clear-env need vk-agent; a Windows guest runs \
+                             commands through qemu-ga, as SYSTEM"
+                        ),
+                        2,
+                    );
+                }
+                let env = match winexec::parse_env(&env) {
+                    Ok(env) => env,
+                    Err(e) => return fail(&e, 2),
+                };
+                if let Err(e) = winexec::check_command(&command, dir.as_deref()) {
+                    return fail(&e, 2);
+                }
+                let ran = tokio::task::spawn_blocking(move || {
+                    winexec::exec(&socket, &command, &env, dir.as_deref(), background)
+                })
+                .await;
+                return match ran {
+                    // A Windows exit code past 255 (an NTSTATUS) still reads as a failure.
+                    Ok(Ok(code)) => u8::try_from(code).map_or(ExitCode::FAILURE, ExitCode::from),
+                    Ok(Err(e)) => fail(&e, 1),
+                    Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
+                };
+            }
             // Resolution/usage errors exit 2, matching `vk status`/`vk list`/`vk stop` and
             // clap's own usage-error exit. Any vk-chosen code can collide with the remote
             // command's status vk reproduces below; 2 matches what the old CLI returned
@@ -4543,6 +4597,60 @@ async fn cli_main(cli: Cli) -> ExitCode {
             {
                 Ok(result) => exec::exit(result),
                 Err(e) => fail(&e, 1),
+            }
+        }
+        Cmd::Cp {
+            source,
+            destination,
+            target,
+        } => {
+            let socket = match vms::resolve_one(target.as_deref().map(Path::new)).and_then(|e| {
+                e.guest_agent.ok_or_else(|| {
+                    anyhow::anyhow!("vk cp copies to a Windows (UEFI) guest; this VM runs vk-agent")
+                })
+            }) {
+                Ok(s) => s,
+                Err(e) => return fail(&e, 2),
+            };
+            let guest_side = source.strip_prefix(':').or(destination.strip_prefix(':'));
+            if guest_side.is_some_and(|p| p.is_empty() || p.ends_with(['/', '\\'])) {
+                return fail(
+                    &anyhow::anyhow!(
+                        "the guest side must be a file's full path, not a directory: vk cp \
+                         copies one file"
+                    ),
+                    2,
+                );
+            }
+            let copied = match (source.strip_prefix(':'), destination.strip_prefix(':')) {
+                (None, Some(remote)) => {
+                    let (local, remote) = (PathBuf::from(&source), remote.to_string());
+                    tokio::task::spawn_blocking(move || winexec::copy_in(&socket, &local, &remote))
+                        .await
+                }
+                (Some(remote), None) => {
+                    let remote = remote.to_string();
+                    let mut local = PathBuf::from(&destination);
+                    if local.is_dir() {
+                        let name = remote.rsplit(['\\', '/']).next().unwrap_or(&remote);
+                        local.push(name);
+                    }
+                    tokio::task::spawn_blocking(move || winexec::copy_out(&socket, &remote, &local))
+                        .await
+                }
+                _ => {
+                    return fail(
+                        &anyhow::anyhow!(
+                            "exactly one of the two paths must be the guest's (a leading `:`)"
+                        ),
+                        2,
+                    );
+                }
+            };
+            match copied {
+                Ok(Ok(_)) => ExitCode::SUCCESS,
+                Ok(Err(e)) => fail(&e, 1),
+                Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
             }
         }
         // run_forward only returns on a bind error; otherwise it serves until the
@@ -6249,6 +6357,7 @@ mod tests {
                 exec_addr: "vsock-auto:///state/app/svc-db/vsock.sock:4444".into(),
                 stale_recipe: None,
             }],
+            guest_agent: None,
         };
         assert_eq!(
             resolve_service_addr(&entry, "db").unwrap(),
@@ -6420,6 +6529,7 @@ mod tests {
                 "atop",
                 "build",
                 "check",
+                "cp",
                 "dev",
                 "exec",
                 "export",

@@ -182,7 +182,7 @@ fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>) -> Result<()> {
         Some(socket) => {
             let (port, host) =
                 std::os::unix::net::UnixStream::pair().context("guest agent socketpair")?;
-            crate::qga::serve(socket, host)?;
+            crate::qga::serve(socket, host, "vk-qga")?;
             Some(port)
         }
         None => None,

@@ -36,6 +36,10 @@ pub(crate) const GUEST_AGENT_SOCKET: &str = "qga.sock";
 /// The run directory's VM generation ID, beside the disk overlays it belongs to.
 const GENERATION_ID: &str = "vmgenid";
 
+/// How long a guest has to answer the ACPI power button before vk asks its qemu-ga to shut it
+/// down instead (a Windows guest can be set to ignore the button).
+const BUTTON_GRACE: Duration = Duration::from_secs(20);
+
 /// A VMM that exits within this long of its spawn failed to boot; past it, the guest is up
 /// as far as a detached run's parent cares (Windows has no agent to answer earlier).
 const BOOT_SETTLE: Duration = Duration::from_secs(3);
@@ -345,26 +349,39 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
         guest_ip,
         stale_recipe: None,
         services: Vec::new(),
+        guest_agent: Some(work.join(GUEST_AGENT_SOCKET)),
     });
 
     let result = hold(&mut ch, &console, args.detach_log.as_deref()).await;
     if ch.try_wait().ok().flatten().is_none() {
-        // Stopped: press the power button, then kill when the grace expires or on a second
-        // Ctrl-C.
+        // Stopped: press the power button; past BUTTON_GRACE, ask qemu-ga to shut down; kill
+        // when STOP_GRACE expires or on a second Ctrl-C.
         let pressed = Instant::now();
-        crate::shutdown::press_power_button(&ch);
         let deadline = pressed + crate::shutdown::STOP_GRACE;
+        let socket = work.join(GUEST_AGENT_SOCKET);
         let powered_off = async {
-            loop {
-                // An unreadable status is taken as alive: the deadline bounds the wait.
-                if ch.try_wait().ok().flatten().is_some() {
-                    return true;
-                }
-                if Instant::now() >= deadline {
-                    return false;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
+            let button = crate::shutdown::press_power_button(&ch);
+            if button && exited_by(&mut ch, pressed + BUTTON_GRACE).await {
+                return true;
             }
+            // Off the runtime: the agent's sync blocks for up to its timeout.
+            let asked = tokio::task::spawn_blocking(move || {
+                crate::qga::Client::connect(&socket, Duration::from_secs(5))?.shutdown()
+            })
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r);
+            match asked {
+                Ok(()) if button => eprintln!(
+                    "virtkit: guest still up {}s after the power button; asked qemu-ga to shut down",
+                    BUTTON_GRACE.as_secs()
+                ),
+                Ok(()) => {
+                    eprintln!("virtkit: no power button to press; asked qemu-ga to shut down")
+                }
+                Err(e) => eprintln!("virtkit: qemu-ga shutdown: {e:#}"),
+            }
+            exited_by(&mut ch, deadline).await
         };
         tokio::select! {
             off = powered_off => match off {
@@ -386,6 +403,20 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
         crate::run::stop_switch(child);
     }
     result
+}
+
+/// Whether the VMM `ch` exits by `deadline`. An unreadable status is taken as alive: the
+/// deadline bounds the wait.
+async fn exited_by(ch: &mut Child, deadline: Instant) -> bool {
+    loop {
+        if ch.try_wait().ok().flatten().is_some() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Wait for the VMM to exit or the run to be stopped. A VMM gone within [`BOOT_SETTLE`] is a
