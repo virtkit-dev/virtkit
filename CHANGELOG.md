@@ -26,7 +26,10 @@ All notable changes to virtkit will be documented in this file.
   bundle from a reboot. `vk exec` runs a command in the guest through its qemu-ga, as SYSTEM,
   streaming its output and exiting with its code (`--env`, `--dir` and `--background`
   apply); `vk cp` copies one file in or out, the guest side a file's full path (`vk cp
-  setup.ps1 :C:/vk/setup.ps1`).
+  setup.ps1 :C:/vk/setup.ps1`). `vk console` attaches to the guest's serial console, where
+  Windows serves its Special Administration Console (SAC), when qemu-ga does not answer.
+  Keystrokes are paced, as SAC drops fast input. The console survives guest reboots; one
+  console attaches at a time (the newest wins).
 
 ## [0.85.0] - 2026-10-07
 
