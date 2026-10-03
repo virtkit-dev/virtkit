@@ -20,7 +20,7 @@
 //! supervisor.
 
 use std::fs::{File, OpenOptions};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd, IntoRawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
@@ -182,8 +182,21 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         Some(socket) => {
             let (port, host) =
                 std::os::unix::net::UnixStream::pair().context("guest agent socketpair")?;
-            crate::qga::serve(socket, host, "vk-qga")?;
+            crate::relay::serve_socket(socket, host, "vk-qga")?;
             Some(port)
+        }
+        None => None,
+    };
+    // COM1's input for `vk console`: one socketpair end goes to libkrun, which takes
+    // ownership of a serial console's fd when the VM is built; the other is relayed to the
+    // spec's socket.
+    let serial_input = match &spec.serial_input {
+        Some(socket) => {
+            let (port, host) =
+                std::os::unix::net::UnixStream::pair().context("serial input socketpair")?;
+            crate::relay::serve_socket(socket, host, "vk-console")?;
+            // SAFETY: the fd is open and, once released here, owned by libkrun alone.
+            Some(unsafe { BorrowedFd::borrow_raw(port.into_raw_fd()) })
         }
         None => None,
     };
@@ -318,7 +331,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         .acpi(true)
         .map_err(krun("ACPI"))?
         .shutdown_support(true)
-        .add_serial_console(None, Some(log.as_fd()))
+        .add_serial_console(serial_input, Some(log.as_fd()))
         .map_err(krun("serial console"))?
         .vm_generation_id(spec.vm_generation_id)
         .map_err(krun("VM generation ID"))?;
