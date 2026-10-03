@@ -5,7 +5,9 @@
 //! by directory or displayed pid without searching the process table. Only pinned (`--state-dir`) runs are
 //! tracked: they expose a stable exec socket for external tooling and hold an advisory `flock`
 //! on the state dir as a pid-reuse-proof liveness signal. Ephemeral runs have a temporary state
-//! dir and no attachable socket, so they are deliberately not recorded.
+//! dir and no attachable socket, so they are deliberately not recorded. A UEFI bundle run is
+//! the exception: its qemu-ga socket is in its directory, temporary or not, and it locks that
+//! directory as a pinned run does.
 //!
 //! The registry is advisory. An entry can outlive its VM if the run was `SIGKILL`ed before its
 //! removal ran, so readers reconcile liveness by probing the state-dir lock (`alive`) and prune
@@ -269,6 +271,13 @@ pub fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// This process's [`VmEntry::pid_start_ticks`], for the entry its run registers.
+pub(crate) fn own_start_ticks() -> Option<u64> {
+    i32::try_from(std::process::id())
+        .ok()
+        .and_then(crate::usage::proc_starttime)
 }
 
 fn record_in(dir: &Path, entry: &VmEntry) -> Result<()> {

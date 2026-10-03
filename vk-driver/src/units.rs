@@ -802,6 +802,7 @@ pub fn boot_unit(
             // A compose service reboots in place on a guest reset (see keep()).
             reboot: true,
             numa: crate::numa::Numa::Auto,
+            guest_agent: None,
         };
         let vmm = crate::vmm::selected();
         // The one VMM spawn shared with `vk run`/`vk build`/the job VM: tied (PDEATHSIG)

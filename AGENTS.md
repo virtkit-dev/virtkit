@@ -106,6 +106,7 @@ fast edit loop below is deliberately `vk`-only and never invokes Docker.
 
 ```bash
 ./build-kernel.sh [--no-cache]      # guest kernel vmlinux -> dist/ (vk or Docker; slow) — run first
+./build-firmware.sh [--docker|--no-cache]  # UEFI firmware CLOUDHV.fd -> dist/ (optional; embedded by build.sh)
 ./build.sh                          # static-musl binaries -> dist/ (vk or Docker)
 ./build.sh --fast                   # same, but the debug profile -> much faster iteration
 ./dev.sh check                      # type/borrow checking, whole workspace, every target
