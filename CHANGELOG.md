@@ -16,13 +16,17 @@ All notable changes to virtkit will be documented in this file.
   on the run's LAN; `--cpus`/`--mem` override the bundle's values. Flags that need vk-agent
   (a command, `--volume`, `--env`, `--ssh`, ...) are refused. A `--state-dir` run appears in
   `vk list`; `vk reboot` hard-resets it. `vk stop` (or Ctrl-C) presses the ACPI power button
-  and waits up to a minute for power-off; a second Ctrl-C kills it immediately. The guest's
-  qemu-ga answers on `qga.sock` in the run's directory, one client at a time, across guest
+  and waits up to a minute for power-off, asking the guest's qemu-ga to shut down after 20
+  seconds; a second Ctrl-C kills it immediately. The guest's qemu-ga answers on `qga.sock` in
+  the run's directory, one client at a time (a new one replaces the last), across guest
   reboots. The guest gets KVM's Hyper-V enlightenments (reference TSC page, synthetic
   timers, TLB-flush and IPI hypercalls), ACPI processor objects, a pvpanic device (as every
   VM now has: a guest crash is logged to the run's `console.vmm.log`) and a VM generation ID
   kept with the disk overlays, so a Windows domain controller tells a fresh copy of the
-  bundle from a reboot.
+  bundle from a reboot. `vk exec` runs a command in the guest through its qemu-ga, as SYSTEM,
+  streaming its output and exiting with its code (`--env`, `--dir` and `--background`
+  apply); `vk cp` copies one file in or out, the guest side a file's full path (`vk cp
+  setup.ps1 :C:/vk/setup.ps1`).
 
 ## [0.84.0] - 2026-10-05
 

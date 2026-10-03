@@ -2361,6 +2361,7 @@ async fn build_and_boot(
             guest_ip: args.net.then_some(primary_ip),
             stale_recipe,
             services: service_entries,
+            guest_agent: None,
         })
     });
 

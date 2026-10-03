@@ -323,6 +323,7 @@ mod tests {
             guest_ip: None,
             stale_recipe: None,
             services: Vec::new(),
+            guest_agent: None,
         }
     }
 
