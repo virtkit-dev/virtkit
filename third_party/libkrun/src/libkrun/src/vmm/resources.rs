@@ -118,6 +118,8 @@ pub struct VmResources {
     pub pmu_enabled: bool,
     /// Whether to present Hyper-V enlightenments (local patch, see VENDOR.md).
     pub hyperv_enabled: bool,
+    /// The VM generation ID the DSDT declares, if any (local patch, see VENDOR.md).
+    pub vm_generation_id: Option<[u8; 16]>,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
@@ -274,6 +276,7 @@ mod tests {
             nested_enabled: false,
             pmu_enabled: false,
             hyperv_enabled: false,
+            vm_generation_id: None,
             split_irqchip: false,
             acpi_enabled: false,
             serial_consoles: Vec::new(),

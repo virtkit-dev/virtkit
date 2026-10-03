@@ -36,6 +36,7 @@ pub struct VmmBuilder<'a> {
     nested_virt: bool,
     pmu: bool,
     hyperv: bool,
+    vm_generation_id: Option<[u8; 16]>,
     split_irqchip: bool,
     acpi: bool,
     smbios_oem_strings: Vec<String>,
@@ -129,6 +130,19 @@ impl<'a> VmmBuilder<'a> {
             return Err(VmmError::InvalidParam());
         }
         self.hyperv = enabled;
+        Ok(self)
+    }
+
+    /// Declare a VM generation ID (local patch, see VENDOR.md): the DSDT gets Microsoft's
+    /// `VM_Gen_Counter` device pointing at these 16 bytes in reserved memory. A guest that
+    /// tracks it (a Windows domain controller) treats a changed ID as the VM having been
+    /// restored or cloned, so keep it across the boots of one disk and change it for a copy.
+    /// x86_64 only, and building without [`VmmBuilder::acpi`] is refused.
+    pub fn vm_generation_id(mut self, id: Option<[u8; 16]>) -> Result<Self, VmmError> {
+        if id.is_some() && !cfg!(target_arch = "x86_64") {
+            return Err(VmmError::InvalidParam());
+        }
+        self.vm_generation_id = id;
         Ok(self)
     }
 
@@ -394,7 +408,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         .device_manager
         .as_ref()
         .is_some_and(|manager| manager.uses_pci());
-    if pci_enabled && !builder_cfg.acpi {
+    if (pci_enabled || builder_cfg.vm_generation_id.is_some()) && !builder_cfg.acpi {
         return Err(VmmError::InvalidParam());
     }
     // On x86_64 Linux the shutdown device is the ACPI power button: without ACPI the guest
@@ -472,6 +486,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     vm_resources.nested_enabled = builder_cfg.nested_virt;
     vm_resources.pmu_enabled = builder_cfg.pmu;
     vm_resources.hyperv_enabled = builder_cfg.hyperv;
+    vm_resources.vm_generation_id = builder_cfg.vm_generation_id;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;
     if !builder_cfg.smbios_oem_strings.is_empty() {

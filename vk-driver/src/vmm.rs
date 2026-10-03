@@ -715,6 +715,10 @@ pub struct VmSpec {
     /// reference TSC page, synthetic timers and the TLB-flush/IPI hypercalls.
     #[serde(default)]
     pub hyperv: bool,
+    /// The VM generation ID (`VmmBuilder::vm_generation_id`): stable across boots of one disk,
+    /// new for a copy, so a Windows domain controller can tell a clone or a restore from a reboot.
+    #[serde(default)]
+    pub vm_generation_id: Option<[u8; 16]>,
 }
 
 /// A virtual machine monitor that can boot a [`VmSpec`]. `Send` so a boxed `dyn Vmm`

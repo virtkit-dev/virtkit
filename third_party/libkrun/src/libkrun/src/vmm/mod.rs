@@ -331,6 +331,8 @@ impl Vmm {
         _acpi_enabled: bool,
         _virtio_mmio_devices: &[(u64, u32)],
         _pvh: bool,
+        _vm_generation_id: Option<&[u8; 16]>,
+        _windows_platform: bool,
     ) -> Result<()> {
         #[cfg(target_arch = "x86_64")]
         {
@@ -360,6 +362,8 @@ impl Vmm {
                 _acpi_enabled,
                 _virtio_mmio_devices,
                 pci_host_info.as_ref(),
+                _vm_generation_id,
+                _windows_platform,
             )
             .map_err(Error::ConfigureSystem)?;
         }

@@ -75,6 +75,13 @@ pub const MEMMAP_START: u64 = 0x7000;
 /// Location of RSDP pointer in x86 machines.
 pub const RSDP_ADDR: u64 = 0x000e_0000;
 
+/// The pvpanic device's I/O port, QEMU's (local patch).
+pub const PVPANIC_PORT: u16 = 0x505;
+
+/// The 16-byte VM generation ID the DSDT's VGEN device points at: the last page of the
+/// reserved window below 1 MiB, past the ACPI tables (local patch).
+pub const VMGENID_ADDR: u64 = 0x000f_f000;
+
 /// The 'zero page', a.k.a linux kernel bootparams.
 pub const ZERO_PAGE_START: u64 = 0x7000;
 
