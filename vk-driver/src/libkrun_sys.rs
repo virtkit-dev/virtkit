@@ -319,6 +319,8 @@ fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>) -> Result<()> {
         // nesting before this spec was handed over.
         .pmu(spec.pmu)
         .nested_virt(spec.nested)
+        .hyperv(spec.hyperv)
+        .map_err(krun("Hyper-V"))?
         .acpi(true)
         .map_err(krun("ACPI"))?
         .shutdown_support(true)

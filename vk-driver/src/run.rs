@@ -2299,6 +2299,7 @@ async fn build_and_boot(
         reboot: true,
         numa: args.numa.clone(),
         guest_agent: None,
+        hyperv: false,
     };
     // Control server on the primary's per-port control socket — only the
     // primary's guest can reach it, so the control plane is scoped to this run —
@@ -4817,6 +4818,7 @@ pub(crate) async fn boot_session(
         reboot: false,
         numa: crate::numa::Numa::Auto,
         guest_agent: None,
+        hyperv: false,
     };
     let vmm = crate::vmm::selected();
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
@@ -6346,6 +6348,7 @@ mod tests {
             reboot: false,
             numa: crate::numa::Numa::Auto,
             guest_agent: None,
+            hyperv: false,
         };
         let mut child = spawn_vmm(&CatVmm, &spec, crate::prio::Prio::Normal).unwrap();
         assert!(child.wait().unwrap().success());

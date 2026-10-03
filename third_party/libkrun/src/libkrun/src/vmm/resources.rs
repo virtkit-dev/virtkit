@@ -116,6 +116,8 @@ pub struct VmResources {
     pub nested_enabled: bool,
     /// Whether to expose the guest PMU (local patch, see VENDOR.md).
     pub pmu_enabled: bool,
+    /// Whether to present Hyper-V enlightenments (local patch, see VENDOR.md).
+    pub hyperv_enabled: bool,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
@@ -142,6 +144,8 @@ impl VmResources {
             nested_enabled: self.nested_enabled,
             #[cfg(target_os = "linux")]
             pmu_enabled: self.pmu_enabled,
+            #[cfg(target_os = "linux")]
+            hyperv_enabled: self.hyperv_enabled,
         }
     }
 
@@ -269,6 +273,7 @@ mod tests {
             smbios_oem_strings: None,
             nested_enabled: false,
             pmu_enabled: false,
+            hyperv_enabled: false,
             split_irqchip: false,
             acpi_enabled: false,
             serial_consoles: Vec::new(),
@@ -291,6 +296,8 @@ mod tests {
             nested_enabled: vm_resources.nested_enabled,
             #[cfg(target_os = "linux")]
             pmu_enabled: true,
+            #[cfg(target_os = "linux")]
+            hyperv_enabled: vm_resources.hyperv_enabled,
         };
 
         let vcpu_config = vm_resources.vcpu_config();

@@ -496,3 +496,18 @@ whose controller matches an exact hardware ID of the driver it was given, and re
 virtio-blk disk ("Windows needs the driver for device Red Hat VirtIO SCSI controller").
 Linux takes a modern device's type from its device ID and ignores the subsystem. Covered by
 `advertises_modern_virtio_identity_and_capabilities`.
+
+`src/arch/src/x86_64/linux/hyperv.rs` + `src/libkrun/src/{api/vmm_builder.rs,vmm/resources.rs,
+vmm/linux/vstate.rs}` — `VmmBuilder::hyperv(true)` presents KVM's Hyper-V enlightenments: the
+leaves `KVM_GET_SUPPORTED_HV_CPUID` recommends take 0x40000000 and KVM's own leaves move to
+0x40000100, the SynIC is enabled per vCPU (`KVM_CAP_HYPERV_SYNIC2`; without it the synthetic
+timers are hidden), and the guest crash MSRs, the extended hypercalls and the synthetic debugger
+(leaves 0x40000080–0x40000082 and its feature bit, as QEMU without `hv-syndbg`) stay hidden. A
+KVM built without Hyper-V emulation (`CONFIG_KVM_HYPERV` off, an option since Linux 6.8) fails
+`KVM_GET_SUPPORTED_HV_CPUID`: the guest then keeps the plain KVM CPUID, with a warning. The vCPU
+loop accepts `KVM_EXIT_HYPERV`: a SynIC exit needs nothing without VMBus, a hypercall left to
+userspace gets `HV_STATUS_INVALID_HYPERCALL_CODE`. `KVM_CAP_HYPERV_ENFORCE_CPUID` stays off, so
+the hidden features remain reachable to a guest that ignores CPUID; Windows follows CPUID, and
+every `KVM_EXIT_HYPERV` is answered. Windows then enables its SynIC on every vCPU and takes the
+reference TSC page, synthetic timers and the TLB-flush/IPI hypercalls. Covered by the merge tests
+in `hyperv.rs` and, against the host's KVM, `test_configure_vcpu_with_hyperv` in `vstate.rs`.

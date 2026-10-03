@@ -275,6 +275,7 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
         reboot: true,
         numa: args.numa.clone(),
         guest_agent: Some(work.join(GUEST_AGENT_SOCKET)),
+        hyperv: true,
     };
     let vmm = crate::vmm::selected();
     let mut ch = match crate::run::spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal) {

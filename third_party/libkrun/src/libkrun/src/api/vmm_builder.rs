@@ -35,6 +35,7 @@ pub struct VmmBuilder<'a> {
     kernel_console: Option<String>,
     nested_virt: bool,
     pmu: bool,
+    hyperv: bool,
     split_irqchip: bool,
     acpi: bool,
     smbios_oem_strings: Vec<String>,
@@ -116,6 +117,19 @@ impl<'a> VmmBuilder<'a> {
     pub fn pmu(mut self, enabled: bool) -> Self {
         self.pmu = enabled;
         self
+    }
+
+    /// Present the Hyper-V enlightenments KVM supports (local patch, see VENDOR.md): CPUID
+    /// leaves 0x40000000+ as `KVM_GET_SUPPORTED_HV_CPUID` recommends them, with the SynIC
+    /// enabled, so a Windows guest takes the paravirtual paths (reference TSC page, synthetic
+    /// timers, hypercall TLB flushes and IPIs, relaxed timing). KVM's own leaves move to
+    /// 0x40000100. Off by default: Linux guests use KVM's leaves. x86_64 Linux hosts only.
+    pub fn hyperv(mut self, enabled: bool) -> Result<Self, VmmError> {
+        if enabled && !cfg!(target_arch = "x86_64") {
+            return Err(VmmError::InvalidParam());
+        }
+        self.hyperv = enabled;
+        Ok(self)
     }
 
     pub fn split_irqchip(mut self, enabled: bool) -> Result<Self, VmmError> {
@@ -457,6 +471,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
 
     vm_resources.nested_enabled = builder_cfg.nested_virt;
     vm_resources.pmu_enabled = builder_cfg.pmu;
+    vm_resources.hyperv_enabled = builder_cfg.hyperv;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;
     if !builder_cfg.smbios_oem_strings.is_empty() {

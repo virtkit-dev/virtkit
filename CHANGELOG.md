@@ -18,7 +18,8 @@ All notable changes to virtkit will be documented in this file.
   `vk list`; `vk reboot` hard-resets it. `vk stop` (or Ctrl-C) presses the ACPI power button
   and waits up to a minute for power-off; a second Ctrl-C kills it immediately. The guest's
   qemu-ga answers on `qga.sock` in the run's directory, one client at a time, across guest
-  reboots.
+  reboots. The guest gets KVM's Hyper-V enlightenments (reference TSC page, synthetic
+  timers, TLB-flush and IPI hypercalls).
 
 ## [0.85.0] - 2026-10-07
 
