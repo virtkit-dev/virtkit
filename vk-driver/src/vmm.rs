@@ -719,6 +719,10 @@ pub struct VmSpec {
     /// new for a copy, so a Windows domain controller can tell a clone or a restore from a reboot.
     #[serde(default)]
     pub vm_generation_id: Option<[u8; 16]>,
+    /// A Unix socket whose bytes become the first serial port's input (`vk console`): the
+    /// boot child relays it to COM1 as it does the guest agent ([`crate::relay::serve_socket`]).
+    #[serde(default)]
+    pub serial_input: Option<PathBuf>,
 }
 
 /// A virtual machine monitor that can boot a [`VmSpec`]. `Send` so a boxed `dyn Vmm`

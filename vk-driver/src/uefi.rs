@@ -33,6 +33,9 @@ pub(crate) const FIRMWARE_ENV: &str = "VIRTKIT_UEFI_FIRMWARE";
 /// The run directory's qemu-ga socket ([`crate::qga`]).
 pub(crate) const GUEST_AGENT_SOCKET: &str = "qga.sock";
 
+/// The run directory's socket for COM1's input (`vk console`).
+pub(crate) const CONSOLE_SOCKET: &str = "console.sock";
+
 /// The run directory's VM generation ID, beside the disk overlays it belongs to.
 const GENERATION_ID: &str = "vmgenid";
 
@@ -310,6 +313,7 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
         guest_agent: Some(work.join(GUEST_AGENT_SOCKET)),
         hyperv: true,
         vm_generation_id: Some(generation_id(work)?),
+        serial_input: Some(work.join(CONSOLE_SOCKET)),
     };
     let vmm = crate::vmm::selected();
     let mut ch = match crate::run::spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal) {

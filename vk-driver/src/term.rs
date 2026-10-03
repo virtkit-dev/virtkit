@@ -33,6 +33,10 @@ pub(crate) fn can_draw() -> bool {
 /// entered: a handler may touch nothing that is not already there.
 static ON_SIGNAL: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
 
+/// Whether an [`AltScreen`] is held, so a signal handler also leaves it and shows the cursor.
+static ON_SIGNAL_ALT_SCREEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// This terminal's settings as they stand, or `None` where stdin is not one.
 pub(crate) fn current_termios(fd: libc::c_int) -> Option<libc::termios> {
     // SAFETY: tcgetattr only fills the termios it is given.
@@ -55,14 +59,17 @@ extern "C" fn restore_and_reraise(sig: libc::c_int) {
     const RESTORE: &[u8] = b"\x1b[?25h\x1b[?1049l";
     // SAFETY: writing a fixed buffer to a raw fd.
     unsafe {
-        libc::write(libc::STDOUT_FILENO, RESTORE.as_ptr().cast(), RESTORE.len());
+        if ON_SIGNAL_ALT_SCREEN.load(std::sync::atomic::Ordering::Relaxed) {
+            libc::write(libc::STDOUT_FILENO, RESTORE.as_ptr().cast(), RESTORE.len());
+        }
         libc::signal(sig, libc::SIG_DFL);
         libc::raise(sig);
     }
 }
 
-/// Catch the signals that would otherwise end a panel without unwinding. SIGINT is not among
-/// them: raw mode clears ISIG, so Ctrl-C arrives as a byte and leaves through the loop.
+/// Catch the signals that would otherwise end a raw-mode caller without unwinding, restoring
+/// `saved` and, while an [`AltScreen`] is held, the main screen and the cursor. SIGINT is not
+/// among them: raw mode clears ISIG, so Ctrl-C arrives as a byte the caller handles.
 pub(crate) fn catch_terminating_signals(saved: libc::termios) {
     if let Ok(mut slot) = ON_SIGNAL.lock() {
         *slot = Some(saved);
@@ -247,12 +254,14 @@ impl AltScreen {
         out.write_all(b"\x1b[?1049h\x1b[?25l")
             .context("switching to the alternate screen")?;
         out.flush().context("switching to the alternate screen")?;
+        ON_SIGNAL_ALT_SCREEN.store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(AltScreen)
     }
 }
 
 impl Drop for AltScreen {
     fn drop(&mut self) {
+        ON_SIGNAL_ALT_SCREEN.store(false, std::sync::atomic::Ordering::Relaxed);
         let mut out = std::io::stdout();
         let _ = out.write_all(b"\x1b[?25h\x1b[?1049l");
         let _ = out.flush();

@@ -28,6 +28,7 @@ mod check;
 mod checkout;
 mod compose;
 mod config;
+mod console;
 mod consolelog;
 mod cpio;
 mod detach;
@@ -64,6 +65,7 @@ mod qcow2;
 mod qga;
 mod registry;
 mod regproxy;
+mod relay;
 mod run;
 mod schedule;
 mod scratch;
@@ -1197,6 +1199,18 @@ enum Cmd {
         /// Command to run and its arguments, after `--` (e.g. `vk exec -- ls -la`)
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    /// Attach to the serial console of a live Windows (UEFI) guest
+    ///
+    /// Windows serves its Special Administration Console (SAC) there: `cmd` opens a command
+    /// channel, `ch -si 1` switches to it, then log in. Keystrokes are paced (3 bytes every
+    /// 180 ms) because SAC drops what arrives faster; Ctrl-] leaves. Input may be piped. It
+    /// survives guest reboots. One console at a time: the newest wins, and the one it replaces
+    /// ends.
+    #[command(display_order = 3)]
+    Console {
+        /// which VM: a directory (default: the current directory), as `vk exec` resolves it
+        target: Option<String>,
     },
     /// Copy a file into or out of a live Windows (UEFI) guest
     ///
@@ -4422,6 +4436,25 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 Err(e) => fail(&e, 1),
             }
         }
+        Cmd::Console { target } => {
+            let entry = match vms::resolve_one(target.as_deref().map(Path::new)) {
+                Ok(e) if e.guest_agent.is_some() => e,
+                Ok(_) => {
+                    return fail(
+                        &anyhow::anyhow!(
+                            "vk console attaches to a Windows (UEFI) guest; for this VM use `vk logs -f`"
+                        ),
+                        2,
+                    );
+                }
+                Err(e) => return fail(&e, 2),
+            };
+            match tokio::task::spawn_blocking(move || console::run(&entry)).await {
+                Ok(Ok(())) => ExitCode::SUCCESS,
+                Ok(Err(e)) => fail(&e, 1),
+                Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
+            }
+        }
         Cmd::Cp {
             source,
             destination,
@@ -5772,6 +5805,23 @@ mod tests {
         assert!(Cli::try_parse_from(["vk", "exec", "ls", "-la"]).is_err());
     }
 
+    #[test]
+    fn console_cli_takes_an_optional_target() {
+        let cli = Cli::try_parse_from(["vk", "console"]).unwrap();
+        let Cmd::Console { target } = cli.cmd else {
+            panic!("expected Cmd::Console")
+        };
+        assert_eq!(target, None);
+
+        let cli = Cli::try_parse_from(["vk", "console", "/run/win"]).unwrap();
+        let Cmd::Console { target } = cli.cmd else {
+            panic!("expected Cmd::Console")
+        };
+        assert_eq!(target.as_deref(), Some("/run/win"));
+
+        assert!(Cli::try_parse_from(["vk", "console", "a", "b"]).is_err());
+    }
+
     /// `vk publish` names the dialing sibling `--via`, and still answers to `--service`.
     #[test]
     fn publish_takes_via_under_either_spelling() {
@@ -6324,6 +6374,7 @@ mod tests {
                 "atop",
                 "build",
                 "check",
+                "console",
                 "cp",
                 "dev",
                 "exec",
