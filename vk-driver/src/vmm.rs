@@ -711,6 +711,10 @@ pub struct VmSpec {
     /// running vk-agent.
     #[serde(default)]
     pub guest_agent: Option<PathBuf>,
+    /// Present Hyper-V enlightenments (`VmmBuilder::hyperv`): a Windows guest then uses the
+    /// reference TSC page, synthetic timers and the TLB-flush/IPI hypercalls.
+    #[serde(default)]
+    pub hyperv: bool,
 }
 
 /// A virtual machine monitor that can boot a [`VmSpec`]. `Send` so a boxed `dyn Vmm`

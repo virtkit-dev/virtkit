@@ -109,6 +109,9 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Error configuring the MSR registers
     MSRSConfiguration(arch::x86_64::msr::Error),
+    /// Presenting the Hyper-V enlightenments failed (local patch).
+    #[cfg(target_arch = "x86_64")]
+    HyperV(arch::x86_64::linux::hyperv::Error),
     /// The number of configured slots is bigger than the maximum reported by KVM.
     NotEnoughMemorySlots,
     #[cfg(target_arch = "aarch64")]
@@ -311,6 +314,8 @@ impl Display for Error {
             ),
             #[cfg(target_arch = "x86_64")]
             MSRSConfiguration(e) => write!(f, "Error configuring the MSR registers: {e:?}"),
+            #[cfg(target_arch = "x86_64")]
+            HyperV(e) => write!(f, "Error presenting the Hyper-V enlightenments: {e}"),
             #[cfg(target_arch = "aarch64")]
             REGSConfiguration(e) => write!(
                 f,
@@ -961,6 +966,8 @@ pub struct VcpuConfig {
     pub nested_enabled: bool,
     /// Expose the guest PMU in the CPUID configuration (local patch, see VENDOR.md).
     pub pmu_enabled: bool,
+    /// Present Hyper-V enlightenments (local patch, see VENDOR.md).
+    pub hyperv_enabled: bool,
 }
 
 // Using this for easier explicit type-casting to help IDEs interpret the code.
@@ -1243,6 +1250,27 @@ impl Vcpu {
                 CpuFeaturesTemplate::C3 => {
                     c3::set_cpuid_entries(&mut self.cpuid, &cpuid_vm_spec).map_err(Error::CpuId)?
                 }
+            }
+        }
+
+        if vcpu_config.hyperv_enabled {
+            use arch::x86_64::linux::hyperv;
+            let off = match hyperv::apply(&self.fd, &mut self.cpuid) {
+                Ok(true) => None,
+                Ok(false) => {
+                    Some("Hyper-V SynIC unavailable on this host: synthetic timers off".to_string())
+                }
+                // A KVM built without Hyper-V emulation (CONFIG_KVM_HYPERV off): the guest
+                // keeps the plain KVM CPUID.
+                Err(hyperv::Error::SupportedHvCpuid(e)) => Some(format!(
+                    "Hyper-V unavailable on this host ({e}): enlightenments off"
+                )),
+                Err(e) => return Err(Error::HyperV(e)),
+            };
+            if self.id == 0
+                && let Some(msg) = off
+            {
+                warn!("{msg}");
             }
         }
 
@@ -1577,6 +1605,22 @@ impl Vcpu {
                 VcpuExit::MmioWrite(addr, data) => {
                     if let Some(ref mmio_bus) = self.mmio_bus {
                         mmio_bus.write(0, addr, data);
+                    }
+                    Ok(VcpuEmulation::Handled)
+                }
+                // The SynIC's MSR writes and the Hyper-V hypercalls KVM leaves to userspace
+                // (local patch). With no VMBus there is nothing to set up for the former; a
+                // hypercall is refused as one the hypervisor does not implement.
+                #[cfg(target_arch = "x86_64")]
+                VcpuExit::Hyperv => {
+                    let run = self.fd.get_kvm_run();
+                    // SAFETY: on KVM_EXIT_HYPERV the `hyperv` member of the exit union is the
+                    // one KVM filled in.
+                    let hyperv = unsafe { &mut run.__bindgen_anon_1.hyperv };
+                    debug!("vcpu {}: Hyper-V exit, type {}", self.id, hyperv.type_);
+                    if hyperv.type_ == kvm_bindings::KVM_EXIT_HYPERV_HCALL {
+                        hyperv.u.hcall.result =
+                            arch::x86_64::linux::hyperv::HV_STATUS_INVALID_HYPERCALL_CODE;
                     }
                     Ok(VcpuEmulation::Handled)
                 }
@@ -1985,6 +2029,7 @@ mod tests {
             cpu_template: None,
             nested_enabled: false,
             pmu_enabled: false,
+            hyperv_enabled: false,
         };
 
         assert!(
@@ -2004,6 +2049,72 @@ mod tests {
         assert!(
             vcpu.configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true, false)
                 .is_ok()
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_configure_vcpu_with_hyperv() {
+        use arch::x86_64::linux::hyperv;
+        let (_vm, mut vcpu, vm_mem) = setup_vcpu(0x10000);
+        let vcpu_config = VcpuConfig {
+            vcpu_count: 1,
+            ht_enabled: false,
+            cpu_template: None,
+            nested_enabled: false,
+            pmu_enabled: false,
+            hyperv_enabled: true,
+        };
+        vcpu.configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true, false)
+            .unwrap();
+
+        let cpuid = vcpu.fd.get_cpuid2(KVM_MAX_CPUID_ENTRIES).unwrap();
+        let leaf = |function| cpuid.as_slice().iter().find(|e| e.function == function);
+        let signature = |e: &kvm_bindings::kvm_cpuid_entry2| {
+            [e.ebx, e.ecx, e.edx]
+                .iter()
+                .flat_map(|r| r.to_le_bytes())
+                .collect::<Vec<u8>>()
+        };
+        // A KVM built without Hyper-V emulation keeps its own leaves at the base.
+        if signature(leaf(hyperv::HYPERVISOR_BASE).unwrap()).starts_with(b"KVMKVMKVM") {
+            eprintln!("skipped: this KVM offers no Hyper-V");
+            return;
+        }
+        // KVM names itself; Windows checks the interface signature in 0x40000001.
+        let base = leaf(hyperv::HYPERVISOR_BASE).unwrap();
+        assert_eq!(signature(base), b"Linux KVM Hv");
+        assert!(
+            base.eax < *hyperv::HV_SYNDBG_LEAVES.start(),
+            "max leaf below the synthetic debugger's"
+        );
+        assert_eq!(
+            &leaf(hyperv::HYPERVISOR_BASE + 1).unwrap().eax.to_le_bytes(),
+            b"Hv#1"
+        );
+        assert_eq!(
+            &signature(leaf(hyperv::KVM_RELOCATED_BASE).unwrap())[..9],
+            b"KVMKVMKVM"
+        );
+        let features = leaf(hyperv::HV_FEATURES).unwrap();
+        assert_eq!(
+            features.ebx & hyperv::HV_ENABLE_EXTENDED_HYPERCALLS,
+            0,
+            "extended hypercalls hidden"
+        );
+        assert_eq!(
+            features.edx & hyperv::HV_FEATURE_GUEST_CRASH_MSR_AVAILABLE,
+            0,
+            "crash MSRs hidden"
+        );
+        assert_eq!(
+            features.edx & hyperv::HV_FEATURE_DEBUG_MSRS_AVAILABLE,
+            0,
+            "synthetic debugger hidden"
+        );
+        assert!(
+            leaf(*hyperv::HV_SYNDBG_LEAVES.start()).is_none(),
+            "synthetic debugger leaves dropped"
         );
     }
 
