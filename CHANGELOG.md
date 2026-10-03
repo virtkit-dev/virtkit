@@ -19,7 +19,10 @@ All notable changes to virtkit will be documented in this file.
   and waits up to a minute for power-off; a second Ctrl-C kills it immediately. The guest's
   qemu-ga answers on `qga.sock` in the run's directory, one client at a time, across guest
   reboots. The guest gets KVM's Hyper-V enlightenments (reference TSC page, synthetic
-  timers, TLB-flush and IPI hypercalls).
+  timers, TLB-flush and IPI hypercalls), ACPI processor objects, a pvpanic device (as every
+  VM now has: a guest crash is logged to the run's `console.vmm.log`) and a VM generation ID
+  kept with the disk overlays, so a Windows domain controller tells a fresh copy of the
+  bundle from a reboot.
 
 ## [0.85.0] - 2026-10-07
 

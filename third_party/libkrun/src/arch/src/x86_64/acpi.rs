@@ -4,8 +4,8 @@
 use std::result;
 
 use acpi_tables::aml::{
-    AddressSpace, AddressSpaceCacheable, Device, EISAName, IO, Interrupt, Memory32Fixed, Name,
-    Package, PackageBuilder, Path, ResourceTemplate, Scope, ZERO,
+    AddressSpace, AddressSpaceCacheable, Device, EISAName, IO, Interrupt, Memory32Fixed, Method,
+    Name, Package, PackageBuilder, Path, ResourceTemplate, Return, Scope, ZERO,
 };
 use acpi_tables::facs::FACS;
 use acpi_tables::fadt::{FADTBuilder, Flags};
@@ -24,8 +24,8 @@ use zerocopy::byteorder::{LE, U16, U32};
 use zerocopy::{Immutable, IntoBytes};
 
 use crate::x86_64::layout::{
-    ACPI_PM_BASE, ACPI_RESET_REG, ACPI_RESET_VALUE, HIMEM_START, PCI_MMIO32_LOW_END,
-    PCI_MMIO32_LOW_START, RSDP_ADDR, SCI_GSI, SHM_MEM_SIZE, SHM_MEM_START,
+    ACPI_PM_BASE, ACPI_RESET_REG, ACPI_RESET_VALUE, PCI_MMIO32_LOW_END, PCI_MMIO32_LOW_START,
+    PVPANIC_PORT, RSDP_ADDR, SCI_GSI, SHM_MEM_SIZE, SHM_MEM_START, VMGENID_ADDR,
 };
 
 /// Standard local APIC physical base address.
@@ -105,8 +105,55 @@ fn build_rsdp(xsdt_addr: u64) -> Vec<u8> {
     Rsdp::new(*b"LIBKRN", xsdt_addr).as_bytes().to_vec()
 }
 
-fn build_dsdt(virtio_mmio_devices: &[(u64, u32)], pci_host: Option<&PciHostInfo>) -> Vec<u8> {
+/// What the DSDT declares beyond the devices every guest gets (local patch).
+#[derive(Clone, Copy, Default)]
+struct DsdtOptions {
+    /// vCPUs to declare processor objects for, on the Windows platform.
+    num_cpus: u8,
+    /// See [`setup_acpi`].
+    windows_platform: bool,
+    /// Declare the VM generation ID's `VGEN` device.
+    vm_generation_id: bool,
+}
+
+fn build_dsdt(
+    virtio_mmio_devices: &[(u64, u32)],
+    pci_host: Option<&PciHostInfo>,
+    opts: DsdtOptions,
+) -> Vec<u8> {
     let mut aml_body = Vec::new();
+
+    // On the Windows platform, one processor object per MADT processor, `_UID` its ACPI
+    // processor id (local patch, see `setup_acpi`).
+    if opts.windows_platform {
+        for cpu in 0..opts.num_cpus {
+            let hid = Name::new(Path::new("_HID"), &"ACPI0007");
+            let uid = Name::new(Path::new("_UID"), &u32::from(cpu));
+            Device::new(Path::new(&format!("C{cpu:03X}")), vec![&hid, &uid])
+                .to_aml_bytes(&mut aml_body);
+        }
+    }
+
+    // pvpanic, QEMU's ISA device a crashing guest writes (local patch).
+    {
+        let hid = Name::new(Path::new("_HID"), &"QEMU0001");
+        let io = IO::new(PVPANIC_PORT, PVPANIC_PORT, 0x01, 0x01);
+        let crs = Name::new(Path::new("_CRS"), &ResourceTemplate::new(vec![&io]));
+        Device::new(Path::new("PEVT"), vec![&hid, &crs]).to_aml_bytes(&mut aml_body);
+    }
+
+    // The VM generation ID (Microsoft's "Virtual Machine Generation ID" spec, QEMU's device
+    // names): `ADDR` returns where the 16-byte ID sits, as two DWORDs (local patch).
+    if opts.vm_generation_id {
+        let hid = Name::new(Path::new("_HID"), &"QEMUVGID");
+        let cid = Name::new(Path::new("_CID"), &"VM_Gen_Counter");
+        let ddn = Name::new(Path::new("_DDN"), &"VM_Gen_Counter");
+        let (lo, hi) = (VMGENID_ADDR as u32, (VMGENID_ADDR >> 32) as u32);
+        let addr = Package::new(vec![&lo, &hi]);
+        let ret = Return::new(&addr);
+        let method = Method::new(Path::new("ADDR"), 0, false, vec![&ret]);
+        Device::new(Path::new("VGEN"), vec![&hid, &cid, &ddn, &method]).to_aml_bytes(&mut aml_body);
+    }
 
     // (io_base, irq, acpi_device_name) — PC/AT standard COM port assignments. COM3 and COM4
     // stay emulated but undeclared, as on QEMU: they would share COM1's and COM2's ISA IRQs,
@@ -124,7 +171,10 @@ fn build_dsdt(virtio_mmio_devices: &[(u64, u32)], pci_host: Option<&PciHostInfo>
         Device::new(Path::new(name), vec![&hid, &uid, &crs]).to_aml_bytes(&mut aml_body);
     }
 
-    {
+    // The PS/2 keyboard, left out on the Windows platform (local patch, see `setup_acpi`). The
+    // i8042 itself stays, and so does IAPC_BOOT_ARCH_8042 in the FADT: it still serves the reset
+    // fallback through port 0x64.
+    if !opts.windows_platform {
         let hid = Name::new(Path::new("_HID"), &EISAName::new("PNP0303"));
         let uid = Name::new(Path::new("_UID"), &0u32);
         let io_data = IO::new(0x0060, 0x0060, 0x01, 0x01);
@@ -320,7 +370,7 @@ fn build_mcfg(pci_host: &PciHostInfo) -> Vec<u8> {
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Error {
-    /// The reserved ACPI window (RSDP_ADDR..HIMEM_START) is too small to
+    /// The reserved ACPI window (RSDP_ADDR..VMGENID_ADDR) is too small to
     /// hold the generated tables.
     NotEnoughMemory,
     /// Failed to write a table into guest memory.
@@ -332,18 +382,34 @@ pub enum Error {
 pub type Result<T> = result::Result<T, Error>;
 
 /// Builds and writes RSDP, XSDT, FADT, DSDT, MCFG (if PCI is enabled) and MADT into guest memory
-/// starting at `RSDP_ADDR`.
+/// starting at `RSDP_ADDR`, and the VM generation ID, if any, at `VMGENID_ADDR`.
+///
+/// `windows_platform` (local patch, see VENDOR.md) changes the DSDT in two ways:
+/// - processor objects (`ACPI0007`), which Windows binds its processor driver to; a Linux kernel
+///   without cpufreq warns about each, so other guests go without;
+/// - no PS/2 keyboard (`KBD0`): Windows' i8042prt resets it and our i8042 answers with an ACK but
+///   no self-test result, so every boot waited out a timeout of about ten seconds.
 pub fn setup_acpi(
     mem: &GuestMemoryMmap,
     num_cpus: u8,
     virtio_mmio_devices: &[(u64, u32)],
     pci_host: Option<&PciHostInfo>,
+    vm_generation_id: Option<&[u8; 16]>,
+    windows_platform: bool,
 ) -> Result<()> {
     if u32::from(num_cpus) > MAX_SUPPORTED_CPUS {
         return Err(Error::TooManyCpus);
     }
 
-    let dsdt = build_dsdt(virtio_mmio_devices, pci_host);
+    let dsdt = build_dsdt(
+        virtio_mmio_devices,
+        pci_host,
+        DsdtOptions {
+            num_cpus,
+            windows_platform,
+            vm_generation_id: vm_generation_id.is_some(),
+        },
+    );
     let madt = build_madt(num_cpus);
     let mcfg = pci_host.map(build_mcfg);
 
@@ -380,7 +446,8 @@ pub fn setup_acpi(
     let rsdp = build_rsdp(xsdt_addr);
 
     let total_size = mcfg_addr + mcfg.as_ref().map_or(0, |table| table.len() as u64) - rsdp_addr;
-    if rsdp_addr + total_size > HIMEM_START
+    // The tables end before the VM generation ID's page.
+    if rsdp_addr + total_size > VMGENID_ADDR
         || !mem.check_range(
             GuestAddress(rsdp_addr),
             total_size as usize,
@@ -406,6 +473,10 @@ pub fn setup_acpi(
         mem.write_slice(&mcfg, GuestAddress(mcfg_addr))
             .map_err(|_| Error::WriteFailed)?;
     }
+    if let Some(id) = vm_generation_id {
+        mem.write_slice(id, GuestAddress(VMGENID_ADDR))
+            .map_err(|_| Error::WriteFailed)?;
+    }
 
     Ok(())
 }
@@ -413,6 +484,7 @@ pub fn setup_acpi(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::x86_64::layout::HIMEM_START;
 
     #[test]
     fn madt_has_one_lapic_entry_per_cpu() {
@@ -463,7 +535,7 @@ mod tests {
     #[test]
     fn dsdt_contains_device_nodes() {
         let devices = vec![(0xd000_0000u64, 5u32), (0xd000_1000, 6)];
-        let bytes = build_dsdt(&devices, None);
+        let bytes = build_dsdt(&devices, None, DsdtOptions::default());
 
         assert_eq!(&bytes[..4], b"DSDT");
 
@@ -476,9 +548,66 @@ mod tests {
         assert!(bytes.len() > 100);
     }
 
+    fn has(bytes: &[u8], what: &[u8]) -> bool {
+        bytes.windows(what.len()).any(|w| w == what)
+    }
+
+    #[test]
+    fn the_windows_platform_gets_processor_objects_and_no_ps2_keyboard() {
+        let windows = |windows_platform| DsdtOptions {
+            num_cpus: 3,
+            windows_platform,
+            ..Default::default()
+        };
+        let bytes = build_dsdt(&[], None, windows(true));
+        for name in [&b"C000"[..], b"C001", b"C002", b"ACPI0007"] {
+            assert!(has(&bytes, name), "{}", String::from_utf8_lossy(name));
+        }
+        assert!(!has(&bytes, b"C003"));
+        assert!(!has(&bytes, b"KBD0"));
+
+        let bytes = build_dsdt(&[], None, windows(false));
+        assert!(!has(&bytes, b"ACPI0007"));
+        assert!(has(&bytes, b"KBD0"));
+    }
+
+    #[test]
+    fn dsdt_declares_pvpanic_and_on_request_the_generation_id() {
+        let bytes = build_dsdt(&[], None, DsdtOptions::default());
+        assert!(has(&bytes, b"PEVT"));
+        assert!(has(&bytes, b"QEMU0001"));
+        assert!(!has(&bytes, b"VGEN"));
+
+        let opts = DsdtOptions {
+            vm_generation_id: true,
+            ..Default::default()
+        };
+        let bytes = build_dsdt(&[], None, opts);
+        for name in [&b"VGEN"[..], b"QEMUVGID", b"VM_Gen_Counter", b"ADDR"] {
+            assert!(has(&bytes, name), "{}", String::from_utf8_lossy(name));
+        }
+        // `ADDR` returns Package (2) { DWord VMGENID_ADDR, Zero }.
+        let mut ret = vec![0xa4, 0x12, 0x08, 0x02, 0x0c];
+        ret.extend_from_slice(&(VMGENID_ADDR as u32).to_le_bytes());
+        ret.push(0x00);
+        assert!(has(&bytes, &ret));
+    }
+
+    #[test]
+    fn setup_acpi_writes_the_generation_id_past_the_tables() {
+        let window_size = (HIMEM_START - RSDP_ADDR) as usize;
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
+        let id: [u8; 16] = *b"0123456789abcdef";
+        setup_acpi(&mem, 2, &[], None, Some(&id), false).unwrap();
+        let mut got = [0u8; 16];
+        mem.read_slice(&mut got, GuestAddress(VMGENID_ADDR))
+            .unwrap();
+        assert_eq!(got, id);
+    }
+
     #[test]
     fn dsdt_declares_only_com1_and_com2() {
-        let bytes = build_dsdt(&[], None);
+        let bytes = build_dsdt(&[], None, DsdtOptions::default());
         let names: Vec<&[u8]> = [&b"COM1"[..], b"COM2", b"COM3", b"COM4"]
             .into_iter()
             .filter(|name| bytes.windows(4).any(|w| w == *name))
@@ -488,7 +617,7 @@ mod tests {
 
     #[test]
     fn dsdt_empty_devices() {
-        let bytes = build_dsdt(&[], None);
+        let bytes = build_dsdt(&[], None, DsdtOptions::default());
 
         assert_eq!(&bytes[..4], b"DSDT");
         let sum: u8 = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
@@ -512,7 +641,7 @@ mod tests {
             }],
             shm_window: true,
         };
-        let bytes = build_dsdt(&[], Some(&pci_host));
+        let bytes = build_dsdt(&[], Some(&pci_host), DsdtOptions::default());
 
         assert!(bytes.windows(4).any(|part| part == b"PCI0"));
         assert!(bytes.windows(4).any(|part| part == b"_PRT"));
@@ -537,8 +666,10 @@ mod tests {
                 .windows(22)
                 .any(|w| w[0] == 0x8a && w[14..22] == SHM_MEM_START.to_le_bytes())
         };
-        assert!(declares(&build_dsdt(&[], Some(&pci_host(true)))));
-        assert!(!declares(&build_dsdt(&[], Some(&pci_host(false)))));
+        let dsdt =
+            |shm_window| build_dsdt(&[], Some(&pci_host(shm_window)), DsdtOptions::default());
+        assert!(declares(&dsdt(true)));
+        assert!(!declares(&dsdt(false)));
     }
 
     #[test]
@@ -550,7 +681,7 @@ mod tests {
             functions: Vec::new(),
             shm_window: false,
         };
-        let bytes = build_dsdt(&[], Some(&pci_host));
+        let bytes = build_dsdt(&[], Some(&pci_host), DsdtOptions::default());
         // A DWord memory address-space descriptor (0x87, resource type 0): min at 10, max at 14.
         let min = (PCI_MMIO32_LOW_START as u32).to_le_bytes();
         let max = ((PCI_MMIO32_LOW_END - 1) as u32).to_le_bytes();
@@ -621,7 +752,7 @@ mod tests {
 
     #[test]
     fn virtio_mmio_interrupts_are_edge_triggered() {
-        let bytes = build_dsdt(&[(0xd000_0000u64, 17u32)], None);
+        let bytes = build_dsdt(&[(0xd000_0000u64, 17u32)], None, DsdtOptions::default());
         // Extended interrupt descriptor: 0x89, length 6, flags, count 1, the GSI.
         let irq = 17u32.to_le_bytes();
         let desc = bytes
@@ -634,7 +765,7 @@ mod tests {
 
     #[test]
     fn dsdt_declares_s5() {
-        let bytes = build_dsdt(&[], None);
+        let bytes = build_dsdt(&[], None, DsdtOptions::default());
         assert!(bytes.windows(4).any(|w| w == b"_S5_"));
     }
 
@@ -681,7 +812,7 @@ mod tests {
         let window_size = (HIMEM_START - RSDP_ADDR) as usize;
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
 
-        setup_acpi(&mem, 4, &[], None).unwrap();
+        setup_acpi(&mem, 4, &[], None, None, false).unwrap();
 
         let rsdp: [u8; 8] = {
             let mut buf = [0u8; 8];
@@ -695,7 +826,7 @@ mod tests {
     fn setup_acpi_places_an_aligned_facs() {
         let window_size = (HIMEM_START - RSDP_ADDR) as usize;
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
-        setup_acpi(&mem, 2, &[], None).unwrap();
+        setup_acpi(&mem, 2, &[], None, None, false).unwrap();
 
         let read_u64 = |addr: u64| {
             let mut buf = [0u8; 8];
@@ -729,7 +860,7 @@ mod tests {
             shm_window: true,
         };
 
-        setup_acpi(&mem, 1, &[], Some(&pci_host)).unwrap();
+        setup_acpi(&mem, 1, &[], Some(&pci_host), None, false).unwrap();
 
         let mut rsdp = [0; 36];
         mem.read_slice(&mut rsdp, GuestAddress(RSDP_ADDR)).unwrap();
@@ -757,7 +888,7 @@ mod tests {
     #[test]
     fn setup_acpi_fails_if_window_too_small() {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), 8)]).unwrap();
-        assert!(setup_acpi(&mem, 4, &[], None).is_err());
+        assert!(setup_acpi(&mem, 4, &[], None, None, false).is_err());
     }
 
     #[test]
@@ -765,6 +896,9 @@ mod tests {
         let window_size = (HIMEM_START - RSDP_ADDR) as usize;
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
 
-        assert_eq!(setup_acpi(&mem, 255, &[], None), Err(Error::TooManyCpus));
+        assert_eq!(
+            setup_acpi(&mem, 255, &[], None, None, false),
+            Err(Error::TooManyCpus)
+        );
     }
 }

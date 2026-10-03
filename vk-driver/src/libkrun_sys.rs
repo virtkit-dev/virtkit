@@ -325,7 +325,9 @@ fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>) -> Result<()> {
         .map_err(krun("ACPI"))?
         .shutdown_support(true)
         .add_serial_console(None, Some(log.as_fd()))
-        .map_err(krun("serial console"))?;
+        .map_err(krun("serial console"))?
+        .vm_generation_id(spec.vm_generation_id)
+        .map_err(krun("VM generation ID"))?;
     let vmm = devices
         .attach(builder)
         .build()

@@ -511,3 +511,24 @@ the hidden features remain reachable to a guest that ignores CPUID; Windows foll
 every `KVM_EXIT_HYPERV` is answered. Windows then enables its SynIC on every vCPU and takes the
 reference TSC page, synthetic timers and the TLB-flush/IPI hypercalls. Covered by the merge tests
 in `hyperv.rs` and, against the host's KVM, `test_configure_vcpu_with_hyperv` in `vstate.rs`.
+
+`src/arch/src/x86_64/{acpi.rs,layout.rs,mod.rs}` + `src/devices/src/legacy/x86_64/pvpanic.rs` +
+`src/libkrun/src/{api/vmm_builder.rs,vmm/*}` — the ACPI devices a Windows guest expects:
+- pvpanic, for every x86_64 guest with ACPI: QEMU's ISA device at port 0x505 (`QEMU0001` in the
+  DSDT); a guest's write of PANICKED / CRASH_LOADED is logged. virtio-win's driver binds it
+  ("QEMU PVPanic Device").
+- `VmmBuilder::vm_generation_id`: Microsoft's VM generation ID, the 16 bytes at
+  `VMGENID_ADDR` (the last page of the reserved window below 1 MiB, past the tables) behind a
+  `VGEN` device (`QEMUVGID`, `_CID "VM_Gen_Counter"`, `ADDR`); Windows binds its "Hyper-V
+  Generation Counter". The caller keeps the ID across boots of one disk.
+- The Windows platform (`setup_acpi`'s `windows_platform`, set with the Hyper-V
+  enlightenments) shapes the DSDT for Windows:
+  - processor objects (`ACPI0007`, `_UID` = MADT id), which Windows binds its processor driver
+    to. Not for others: a Linux kernel without cpufreq warns about each.
+  - no PS/2 keyboard (`KBD0`, PNP0303). Windows' i8042prt resets the keyboard and our i8042
+    answers with an ACK but no self-test result, so every boot waited out a timeout of about
+    ten seconds. A headless Windows has no use for the keyboard and resets through the FADT
+    reset register. qemu-ga now answers 15.5 s after `vk run` on average over 50 boots,
+    instead of 22 s.
+
+Covered by the DSDT and `setup_acpi` tests in `acpi.rs` and the pvpanic test.
