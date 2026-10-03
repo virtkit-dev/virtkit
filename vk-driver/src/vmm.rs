@@ -706,6 +706,11 @@ pub struct VmSpec {
     /// arguments.
     #[serde(default)]
     pub numa: crate::numa::Numa,
+    /// A qemu-ga port for an agent-less guest (Windows): the boot child serves the guest
+    /// agent's virtio-console port on this Unix socket ([`crate::qga`]). `None` for a guest
+    /// running vk-agent.
+    #[serde(default)]
+    pub guest_agent: Option<PathBuf>,
 }
 
 /// A virtual machine monitor that can boot a [`VmSpec`]. `Send` so a boxed `dyn Vmm`

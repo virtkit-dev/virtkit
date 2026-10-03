@@ -150,6 +150,11 @@ impl Qcow2 {
         })
     }
 
+    /// The resolved path of the immediate backing image, if any.
+    pub fn backing_path(&self) -> Option<&Path> {
+        self.backing_path.as_deref()
+    }
+
     pub fn virtual_size(&self) -> u64 {
         self.virtual_size
     }

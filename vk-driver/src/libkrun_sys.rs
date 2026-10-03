@@ -176,6 +176,17 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
     };
     krun::init_log(None, level, LogStyle::Auto, LogOptions::empty()).map_err(krun("logging"))?;
 
+    // qemu-ga's port for an agent-less guest: libkrun dups one socketpair end; the other
+    // is relayed to the spec's socket. Created before the devices, which borrow it.
+    let guest_agent = match &spec.guest_agent {
+        Some(socket) => {
+            let (port, host) =
+                std::os::unix::net::UnixStream::pair().context("guest agent socketpair")?;
+            crate::qga::serve(socket, host)?;
+            Some(port)
+        }
+        None => None,
+    };
     // libkrun binds and dials these sockets once the VM runs, a vsock port's peer only on
     // the guest's first connect, so they are held until the process ends.
     let mut sockets = Vec::new();
@@ -197,6 +208,15 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         port_io::output_file(log.try_clone().context("duplicating the serial log")?)
             .map_err(|e| anyhow!("libkrun: console output: {e}"))?,
     );
+    if let Some(port) = &guest_agent {
+        console
+            .add_inout_port(
+                crate::qga::PORT_NAME,
+                Some(port.as_fd()),
+                Some(port.as_fd()),
+            )
+            .map_err(krun("guest agent port"))?;
+    }
     devices.add(console.build().map_err(krun("console"))?);
 
     for (i, disk) in spec.disks.iter().enumerate() {

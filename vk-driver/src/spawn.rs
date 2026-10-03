@@ -73,18 +73,29 @@ pub(crate) fn spawn_socket_forward(
 /// taking the terminal's Ctrl-C/Ctrl-Z after the run detached — `vk dev` goes on working in
 /// that group, and so does a script run without job control — and a VMM ends on SIGINT. Off
 /// the terminal from the start, the helper hears nothing from it; PDEATHSIG still ties it
-/// to this process.
+/// to this process. So does a process that called [`isolate_helpers`].
 pub(crate) fn spawn_tied(mut cmd: Command) -> std::io::Result<Child> {
+    let isolate = crate::detach::is_child() || ISOLATE.load(std::sync::atomic::Ordering::Relaxed);
     // SAFETY: `tie`'s hook calls only async-signal-safe functions, so it is valid in a
     // pre-exec hook (which runs in the forked child between fork and exec).
     unsafe {
-        cmd.pre_exec(tie(crate::detach::is_child()));
+        cmd.pre_exec(tie(isolate));
     }
     let (rtx, rrx) = std::sync::mpsc::channel();
     spawner()
         .send((cmd, rtx))
         .expect("vk-helper-spawner thread alive");
     rrx.recv().expect("vk-helper-spawner thread replied")
+}
+
+/// Set by [`isolate_helpers`].
+static ISOLATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Give each future helper its own session off the terminal, as a `--detach` child does.
+/// The run handles terminal Ctrl-C by stopping its guest in order; a VMM killed by the same
+/// SIGINT would prevent that shutdown.
+pub(crate) fn isolate_helpers() {
+    ISOLATE.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The pre-exec hook of a tied helper: PR_SET_PDEATHSIG, and its own session when `isolate`.
