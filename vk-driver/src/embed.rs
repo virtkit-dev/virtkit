@@ -1,4 +1,4 @@
-//! The guest kernel and vk-agent, optionally embedded into the `vk` binary.
+//! The guest kernel, vk-agent and UEFI firmware, optionally embedded into the `vk` binary.
 //!
 //! The shipped `vk` is self-contained: build.sh compiles it with the `embed`
 //! feature and points build.rs at a freshly built vk-agent and the pinned vmlinux.
@@ -29,6 +29,8 @@ use anyhow::{Context, Result};
 pub enum Asset {
     Kernel,
     Agent,
+    /// The UEFI firmware a UEFI guest (Windows) boots (`CLOUDHV.fd`, build-firmware.sh).
+    Firmware,
 }
 
 impl Asset {
@@ -37,6 +39,7 @@ impl Asset {
         match self {
             Asset::Kernel => "vmlinux",
             Asset::Agent => "vk-agent",
+            Asset::Firmware => "CLOUDHV.fd",
         }
     }
 
@@ -45,6 +48,7 @@ impl Asset {
         match self {
             Asset::Kernel => "/usr/local/lib/vk/vmlinux",
             Asset::Agent => "/usr/local/lib/vk/vk-agent",
+            Asset::Firmware => "/usr/local/lib/vk/CLOUDHV.fd",
         }
     }
 
@@ -52,11 +56,12 @@ impl Asset {
         match self {
             Asset::Kernel => kernel(),
             Asset::Agent => agent(),
+            Asset::Firmware => firmware(),
         }
     }
 }
 
-// The two blobs, spliced into `.rodata` by the linker. Each `.incbin` is bracketed
+// The blobs, spliced into `.rodata` by the linker. Each `.incbin` is bracketed
 // by start/end symbols so the runtime can recover the byte range; an empty placeholder
 // file (the no-asset dev build) makes start == end, i.e. a zero-length blob.
 #[cfg(feature = "embed")]
@@ -72,6 +77,8 @@ mod blob {
         env!("VK_EMBED_KERNEL_STAMP"),
         " ",
         env!("VK_EMBED_AGENT_STAMP"),
+        " ",
+        env!("VK_EMBED_FIRMWARE_STAMP"),
         "\n",
         ".section .rodata.vk_embed_kernel,\"a\",@progbits\n",
         ".globl VK_EMBED_KERNEL_START\n",
@@ -89,6 +96,14 @@ mod blob {
         "\"\n",
         ".globl VK_EMBED_AGENT_END\n",
         "VK_EMBED_AGENT_END:\n",
+        ".section .rodata.vk_embed_firmware,\"a\",@progbits\n",
+        ".globl VK_EMBED_FIRMWARE_START\n",
+        "VK_EMBED_FIRMWARE_START:\n",
+        ".incbin \"",
+        env!("VK_EMBED_FIRMWARE_PATH"),
+        "\"\n",
+        ".globl VK_EMBED_FIRMWARE_END\n",
+        "VK_EMBED_FIRMWARE_END:\n",
     ));
 
     unsafe extern "C" {
@@ -96,6 +111,8 @@ mod blob {
         pub static VK_EMBED_KERNEL_END: u8;
         pub static VK_EMBED_AGENT_START: u8;
         pub static VK_EMBED_AGENT_END: u8;
+        pub static VK_EMBED_FIRMWARE_START: u8;
+        pub static VK_EMBED_FIRMWARE_END: u8;
     }
 
     /// The bytes between two linker symbols (`None` if empty). The symbols bound a
@@ -120,6 +137,13 @@ mod blob {
             &raw const VK_EMBED_AGENT_END,
         )
     }
+
+    pub fn firmware() -> Option<&'static [u8]> {
+        between(
+            &raw const VK_EMBED_FIRMWARE_START,
+            &raw const VK_EMBED_FIRMWARE_END,
+        )
+    }
 }
 
 #[cfg(feature = "embed")]
@@ -132,6 +156,11 @@ fn agent() -> Option<&'static [u8]> {
     blob::agent()
 }
 
+#[cfg(feature = "embed")]
+fn firmware() -> Option<&'static [u8]> {
+    blob::firmware()
+}
+
 #[cfg(not(feature = "embed"))]
 fn kernel() -> Option<&'static [u8]> {
     None
@@ -139,6 +168,11 @@ fn kernel() -> Option<&'static [u8]> {
 
 #[cfg(not(feature = "embed"))]
 fn agent() -> Option<&'static [u8]> {
+    None
+}
+
+#[cfg(not(feature = "embed"))]
+fn firmware() -> Option<&'static [u8]> {
     None
 }
 
@@ -219,7 +253,7 @@ mod tests {
 
     #[test]
     fn no_flag_uses_embedded_else_default() {
-        for asset in [Asset::Kernel, Asset::Agent] {
+        for asset in [Asset::Kernel, Asset::Agent, Asset::Firmware] {
             let r = resolve(asset, None).unwrap();
             if asset.embedded().is_some() {
                 assert!(r.is_embedded());

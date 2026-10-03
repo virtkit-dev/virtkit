@@ -271,6 +271,13 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// This process's [`VmEntry::pid_start_ticks`], for the entry its run registers.
+pub(crate) fn own_start_ticks() -> Option<u64> {
+    i32::try_from(std::process::id())
+        .ok()
+        .and_then(crate::usage::proc_starttime)
+}
+
 fn record_in(dir: &Path, entry: &VmEntry) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(format!("{}.json", slug(&entry.state_dir)));

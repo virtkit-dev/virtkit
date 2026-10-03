@@ -61,6 +61,7 @@ mod ova;
 mod prio;
 mod publish;
 mod qcow2;
+mod qga;
 mod registry;
 mod regproxy;
 mod run;
@@ -82,6 +83,7 @@ mod term;
 mod testutil;
 mod timing;
 mod toolchain;
+mod uefi;
 mod units;
 mod usage;
 mod vm;
@@ -1421,7 +1423,8 @@ enum Cmd {
         /// Image to boot, e.g. `alpine:3.20`
         ///
         /// A docker ref, or an OCI reference with `--source oci`. Omit when booting a
-        /// Dockerfile target with `--file`.
+        /// Dockerfile target with `--file`. A directory holding `vm.json` and the disks it
+        /// names is a bundle, booted as a UEFI guest (Windows) without vk-agent.
         image: Option<String>,
         /// Boot a Dockerfile target instead of an image
         ///

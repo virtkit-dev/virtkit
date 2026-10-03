@@ -3,7 +3,8 @@
 #
 # edk2's OvmfPkg/CloudHv platform, from nixpkgs at the rev the devcontainer's flake.lock pins
 # (firmware/Dockerfile). Separate from build.sh, like build-kernel.sh: the firmware changes
-# only on a lock bump. --no-cache forces a clean Docker rebuild.
+# only on a lock bump. build.sh embeds dist/CLOUDHV.fd into `vk` when it is there.
+# --no-cache forces a clean Docker rebuild.
 set -euo pipefail
 cd "$(dirname "$0")"
 

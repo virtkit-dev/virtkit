@@ -122,7 +122,7 @@ pub const GUEST_SSH_AGENT_SOCK: &str = "/run/virtkit-ssh-agent.sock";
 const SSH_VSOCK_PORT: u32 = 2222;
 /// Base of the switch's per-NIC port range: interface i is served on `NET_VSOCK_PORT + i`,
 /// backing its virtio-net device.
-const NET_VSOCK_PORT: u32 = 1024;
+pub(crate) const NET_VSOCK_PORT: u32 = 1024;
 /// Switch VM id for the primary guest. Siblings use higher ids, and all NICs of a guest share
 /// one id so `switch::handle_frame` accepts its addresses on any of its interfaces.
 const PRIMARY_VM: u32 = 0;
@@ -151,7 +151,7 @@ pub(crate) fn socket_volume_port(n: usize, guest: &str) -> Result<u32> {
     Ok(SOCKET_VOLUME_PORT_BASE + n as u32)
 }
 /// The run LAN: gateway .1, the run VM .2, services from the top down.
-const RUN_SUBNET: &str = "192.168.127.0/24";
+pub(crate) const RUN_SUBNET: &str = "192.168.127.0/24";
 /// Default run VM hostname; compose primaries use their service's hostname.
 const PRIMARY_HOSTNAME: &str = "vm";
 
@@ -543,6 +543,10 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     // by a signal leaves its `launch-<pid>` behind for a recycled pid to find. Cleared here so
     // this run reports its own traffic rather than every earlier run's on top of it.
     let _ = std::fs::remove_file(work.path.join(NET_BYTES));
+    // A local bundle directory (`vm.json` + disks) boots a UEFI guest: no agent, no kernel.
+    if let Some(bundle) = crate::uefi::Bundle::detect(&args.image)? {
+        return crate::uefi::run(args, &work.path, bundle).await;
+    }
     // Resolve the agent and kernel: an explicit flag wins, else the copy embedded
     // in `vk` (served from a memfd), else the on-disk default.
     // Held for the VM's lifetime: an embedded asset lives in a memfd whose
@@ -1014,13 +1018,13 @@ fn primary_nested_marker(
 /// run given a relative `--state-dir` and a reader arriving by another path agree on the key.
 /// Both the entry itself and the service-image correction the manager makes to it go through
 /// here, so the two cannot disagree about which file they mean.
-fn registry_key(work: &Path) -> PathBuf {
+pub(crate) fn registry_key(work: &Path) -> PathBuf {
     crate::vms::canonical(work)
 }
 
 /// Canonical project directory used by `vk list` and directory selectors: `--workspace`,
 /// then `--workdir`, then the launch directory. `None` only when the cwd is unavailable.
-fn project_dir(args: &RunArgs) -> Option<PathBuf> {
+pub(crate) fn project_dir(args: &RunArgs) -> Option<PathBuf> {
     args.workspace
         .as_deref()
         .or(args.workdir.as_deref())
@@ -2228,6 +2232,7 @@ async fn build_and_boot(
         // A `vk run` session reboots in place on a guest reset (see keep()).
         reboot: true,
         numa: args.numa.clone(),
+        guest_agent: None,
     };
     // Control server on the primary's per-port control socket — only the
     // primary's guest can reach it, so the control plane is scoped to this run —
@@ -2265,21 +2270,8 @@ async fn build_and_boot(
         }
     };
 
-    // `vk reboot --force` SIGUSR1s this managing process; forward it to the VMM keeper,
-    // which hard-resets the guest and relaunches it in place. The keeper pid is stable
-    // across reboots, so one forwarder covers the whole run.
-    if let (true, Ok(keeper_pid)) = (spec.reboot, i32::try_from(ch.id())) {
-        tokio::spawn(async move {
-            let Ok(mut sig) =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
-            else {
-                return;
-            };
-            while sig.recv().await.is_some() {
-                // SAFETY: kill(2) with a plain signal number; worst case ESRCH if the pid is gone.
-                unsafe { libc::kill(keeper_pid, libc::SIGUSR1) };
-            }
-        });
+    if spec.reboot {
+        forward_hard_resets(&ch);
     }
 
     // Pre-declared so every post-VMM error site can route through teardown_run,
@@ -2352,9 +2344,7 @@ async fn build_and_boot(
             state_dir,
             project_dir: project_dir(args),
             pid: std::process::id(),
-            pid_start_ticks: i32::try_from(std::process::id())
-                .ok()
-                .and_then(crate::usage::proc_starttime),
+            pid_start_ticks: crate::vms::own_start_ticks(),
             label,
             exec_addr: format!("vsock-auto://{}:{VSOCK_PORT}", vsock.display()),
             ssh_addr: args
@@ -4169,9 +4159,29 @@ pub(crate) fn spawn_vmm(
     Ok(child)
 }
 
+/// `vk reboot --force` (or a `vk reboot` no agent answers) SIGUSR1s the managing `vk run`:
+/// forward it to the VMM keeper `keeper`, which hard-resets the guest and relaunches it in
+/// place. The keeper pid is stable across reboots, so one forwarder covers the whole run.
+pub(crate) fn forward_hard_resets(keeper: &Child) {
+    let Ok(keeper_pid) = i32::try_from(keeper.id()) else {
+        return;
+    };
+    tokio::spawn(async move {
+        let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        else {
+            return;
+        };
+        while sig.recv().await.is_some() {
+            // SAFETY: kill(2) with a plain signal number; worst case ESRCH if the pid is gone.
+            unsafe { libc::kill(keeper_pid, libc::SIGUSR1) };
+        }
+    });
+}
+
 /// Report a VMM exit during boot with guest serial and VMM stdout/stderr tails.
 /// libkrun writes its abort reason to `<serial>.vmm.log`.
-fn boot_failure(console: &Path, status: std::process::ExitStatus) -> String {
+pub(crate) fn boot_failure(console: &Path, status: std::process::ExitStatus) -> String {
     let vmm_log = console.with_extension("vmm.log");
     // Read once for both the tail and the complaints to avoid rereading a large guest log
     // when reporting a boot failure.
@@ -4291,7 +4301,7 @@ pub(crate) const CONTEXT_MOUNT: &str = "/run/virtkit-context";
 /// attaches to it (its NICs or vsock bridges, plus the agent's cmdline fragment). Waits for
 /// the switch to bind.
 #[allow(clippy::too_many_arguments)]
-async fn spawn_vm_switch(
+pub(crate) async fn spawn_vm_switch(
     vsock: &Path,
     work: &Path,
     net_port: u32,
@@ -4661,6 +4671,7 @@ pub(crate) async fn boot_session(
         // A build stage VM ends on a guest reset rather than rebooting in place.
         reboot: false,
         numa: crate::numa::Numa::Auto,
+        guest_agent: None,
     };
     let vmm = crate::vmm::selected();
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
@@ -6090,6 +6101,7 @@ mod tests {
             proc_name: "vk:test".into(),
             reboot: false,
             numa: crate::numa::Numa::Auto,
+            guest_agent: None,
         };
         let mut child = spawn_vmm(&CatVmm, &spec, crate::prio::Prio::Normal).unwrap();
         assert!(child.wait().unwrap().success());

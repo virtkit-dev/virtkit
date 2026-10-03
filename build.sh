@@ -14,7 +14,8 @@
 # mount the repo at /work and pass identical flags, so the bytes match either way.
 #
 # Needs the guest kernel: `vk` embeds ./dist/vmlinux, so run ./build-kernel.sh first
-# (it changes rarely — one build serves every later build.sh run).
+# (it changes rarely — one build serves every later build.sh run). `vk` also embeds the UEFI
+# firmware ./dist/CLOUDHV.fd when ./build-firmware.sh has made it (optional: UEFI guests only).
 #
 # --no-kernel: build a `vk` with no embedded kernel — the only way to build without a
 # dist/vmlinux. That vk takes --kernel at runtime, so it is not a shippable binary.
@@ -173,8 +174,9 @@ BUILD_ENV=(
   "VK_GIT_COMMIT=$commit"
 )
 # `vk` embeds the guest kernel and vk-agent, so the compile is two phases: build
-# vk-agent first, then build vk with VK_EMBED_* pointing at that agent and the
-# pinned vmlinux (both under /work, where the repo is mounted in either backend).
+# vk-agent first, then build vk with VK_EMBED_* pointing at that agent, the pinned
+# vmlinux and, when present, dist/CLOUDHV.fd (all under /work, where the repo is mounted in
+# either backend).
 # A missing kernel is an error rather than a quietly non-self-contained vk: it is the
 # shippable binary's defining property, and the build that drops it is the one nobody
 # notices until the vk fails to boot anything. --no-kernel asks for that vk explicitly.
@@ -187,6 +189,15 @@ elif [ -e "$OUT/vmlinux" ]; then
 else
   echo "missing $OUT/vmlinux — run ./build-kernel.sh first (or --no-kernel to build a vk without an embedded kernel)" >&2
   exit 1
+fi
+# The UEFI firmware for UEFI (Windows) guests, when ./build-firmware.sh has produced it. A vk
+# without it still boots every Linux guest; a UEFI guest then needs VIRTKIT_UEFI_FIRMWARE.
+EMBED_FIRMWARE=""
+if [ -e "$OUT/CLOUDHV.fd" ]; then
+  EMBED_FIRMWARE=1
+  EMBED_ENV="$EMBED_ENV VK_EMBED_FIRMWARE=/work/$OUT/CLOUDHV.fd"
+else
+  echo "build.sh: no $OUT/CLOUDHV.fd — the vk built here embeds no UEFI firmware (./build-firmware.sh)" >&2
 fi
 # vk-registry (the standalone central server), vk-hub (the experimental local web UI) and
 # vk-runnerctl (the root-side setter for gitlab-runner's concurrent) embed nothing, so they
@@ -268,6 +279,14 @@ base_image=$(sed -nE 's/^FROM ([^ ]+).*$/\1/p' .devcontainer/Dockerfile | head -
 nix_pins="nixpkgs:         $(lock_rev nixpkgs)
 rust_overlay:    $(lock_rev rust-overlay)"
 toolchain=$(sed -nE 's/^channel = "(.*)"$/\1/p' rust-toolchain.toml)
+# vk's bytes depend on the embedded firmware: a rebuild must rebuild it first.
+if [ -n "$EMBED_FIRMWARE" ]; then
+  firmware_step="./build-firmware.sh && "
+  firmware_line=$(cd "$OUT" && sha256sum CLOUDHV.fd)
+else
+  firmware_step=""
+  firmware_line="firmware:        none"
+fi
 # $commit was resolved above (before the compile) and threaded into the build as
 # VK_GIT_COMMIT, so the embedded `vk --version` stamp and this manifest agree.
 # --fast produces the debug profile: unoptimized, unstripped, not reproducible. Stamp the
@@ -280,25 +299,25 @@ elif [ -n "$FEATURES" ]; then
   # Release-profile bytes, but of a vk with extra features: the release recipe rebuilds the
   # default feature set, so it would fail against these hashes.
   manifest_header="# virtkit build manifest (--features=${FEATURES}) — extra features, not a release artifact
-# Verify: git checkout <git_commit> && ./build.sh --features=${FEATURES}${NO_KERNEL:+ --no-kernel}${KERNEL_FROM:+ --kernel-from=$KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && ${firmware_step}./build.sh --features=${FEATURES}${NO_KERNEL:+ --no-kernel}${KERNEL_FROM:+ --kernel-from=$KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
 profile:         release
 features:        ${FEATURES}"
 elif [ -n "$NO_KERNEL" ]; then
   # Same trap as --fast, one step removed: the bytes are release-profile but kernel-less,
   # so the release recipe — which embeds the kernel — rebuilds something else entirely.
   manifest_header="# virtkit build manifest (--no-kernel) — no embedded kernel, not a release artifact
-# Verify: git checkout <git_commit> && ./build.sh --no-kernel && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && ${firmware_step}./build.sh --no-kernel && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
 profile:         release"
 elif [ -n "$KERNEL_FROM" ]; then
   # The kernel was built at the release's commit, not git_commit: the vk that embeds it is
   # not git_commit's release build.
   manifest_header="# virtkit CI build manifest — embeds ${KERNEL_FROM}'s guest kernel, not a release artifact
-# Verify: git checkout <git_commit> && gh release download ${KERNEL_FROM} -p vmlinux -p vmlinux.sha256 -D dist && ( cd dist && sha256sum -c vmlinux.sha256 ) && ./build.sh --kernel-from=${KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && gh release download ${KERNEL_FROM} -p vmlinux -p vmlinux.sha256 -D dist && ( cd dist && sha256sum -c vmlinux.sha256 ) && ${firmware_step}./build.sh --kernel-from=${KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
 profile:         release
 kernel_from:     ${KERNEL_FROM}"
 else
   manifest_header="# virtkit reproducible build manifest
-# Verify: git checkout <git_commit> && ./build-kernel.sh && ./build.sh && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && ./build-kernel.sh && ${firmware_step}./build.sh && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
 profile:         release"
 fi
 cat > "$OUT/build-info.txt" <<EOF
@@ -310,6 +329,7 @@ ${nix_pins}
 
 $(cat "$OUT/vk.sha256")
 $(cat "$OUT/vk-agent.sha256")
+${firmware_line}
 EOF
 
 echo
@@ -333,10 +353,14 @@ if [ -n "$BOOTSTRAP_CHECK" ]; then
   # Clean working-tree copy (no target/.git/dist) so the rebuild can't reuse this build's
   # target/ and is a genuine from-scratch compile.
   tar -c --exclude=./.git --exclude=./target --exclude="./$OUT" . | tar -x -C "$boot_tmp"
-  # `vk` embeds the kernel, so the rebuild must see the same vmlinux at dist/vmlinux
-  # (the tree copy above excludes dist/); without it the two vk binaries would differ.
+  # `vk` embeds the kernel and any UEFI firmware, so the rebuild must see the same
+  # dist/vmlinux and dist/CLOUDHV.fd (the tree copy above excludes dist/); without them the
+  # two vk binaries would differ.
   mkdir -p "$boot_tmp/$OUT"
   cp "$boot_dist/vmlinux" "$boot_tmp/$OUT/vmlinux"
+  if [ -n "$EMBED_FIRMWARE" ]; then
+    cp "$boot_dist/CLOUDHV.fd" "$boot_tmp/$OUT/CLOUDHV.fd"
+  fi
   rebuild_start=$SECONDS
   # Thread the commit in: the copy has no .git.
   ( cd "$boot_tmp" && VK_GIT_COMMIT="$commit" ./build.sh \

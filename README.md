@@ -727,8 +727,9 @@ recognize `VK_REGISTRY_CONFIG`, `VK_REGISTRY_ROOT`, and
 Build the pinned guest kernel first, then the static binaries:
 
 ```sh
-./build-kernel.sh  # dist/vmlinux
-./build.sh         # dist/{vk,vk-agent,vk-registry,vk-hub,vk-runnerctl,...}
+./build-kernel.sh    # dist/vmlinux
+./build-firmware.sh  # dist/CLOUDHV.fd: UEFI firmware (optional; embedded by build.sh)
+./build.sh           # dist/{vk,vk-agent,vk-registry,vk-hub,vk-runnerctl,...}
 ```
 
 The scripts use a `vk` found on `PATH` to build inside a microVM; otherwise they use
@@ -786,11 +787,13 @@ vk-hub-proto/    the VM list `vk workloads` prints, and the hub↔node protocol
 third_party/     vendored libkrun and local patches
 .devcontainer/   pinned build image (nixos/nix base + nix/flake.nix and flake.lock toolchain)
 kernel/          pinned guest-kernel configuration and build inputs
+firmware/        UEFI firmware (edk2 CloudHv) build inputs
 docs/            operational guides and the fleet design
 examples/        annotated compose file exercising every compose feature
 tests/           end-to-end scripts run against a built vk; release-e2e.sh gates a release
 build.sh         reproducible binary build
 build-kernel.sh  reproducible guest-kernel build
+build-firmware.sh  UEFI firmware build, for UEFI (Windows) guests
 dev.sh           check/fmt/lint/test environment in a reusable development VM
 ```
 
