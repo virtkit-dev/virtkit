@@ -778,6 +778,7 @@ pub fn boot_unit(
             reboot: true,
             numa: crate::numa::Numa::Auto,
             guest_agent: None,
+            hyperv: false,
         };
         let vmm = crate::vmm::selected();
         // The one VMM spawn shared with `vk run`/`vk build`/the job VM: tied (PDEATHSIG)
