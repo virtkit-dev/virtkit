@@ -94,6 +94,10 @@ pub struct VmEntry {
     /// `build:` service's image into the freshness check.
     #[serde(default)]
     pub services: Vec<ServiceEntry>,
+    /// The qemu-ga socket of an agent-less guest (a UEFI bundle: Windows), which `vk exec` and
+    /// `vk cp` use instead of `exec_addr`; `None` for a guest running vk-agent.
+    #[serde(default)]
+    pub guest_agent: Option<PathBuf>,
 }
 
 /// A sibling compose service declared alongside the primary VM.
@@ -1691,6 +1695,7 @@ mod tests {
             guest_ip: None,
             stale_recipe: None,
             services: Vec::new(),
+            guest_agent: None,
         }
     }
 
