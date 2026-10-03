@@ -1,8 +1,8 @@
 {
   # The build toolchain: the closures .devcontainer/Dockerfile (`buildEnv`) and
-  # kernel/Dockerfile (`kernelBuildEnv`) install. Lives under .devcontainer/nix/ so it sits
-  # inside the Docker/vk build CONTEXT (.devcontainer): the Dockerfile's `COPY nix /src/nix`
-  # resolves here.
+  # kernel/Dockerfile (`kernelBuildEnv`) install, and the UEFI firmware (`firmware`) that
+  # firmware/Dockerfile extracts. Its .devcontainer/nix/ location puts it inside the Docker/vk
+  # build context (.devcontainer), where the Dockerfile's `COPY nix /src/nix` resolves.
   #
   # `buildEnv` provides, for the static-musl release build:
   #   - Rust (channel pinned inline — ./update.sh keeps it in step with rust-toolchain.toml;
@@ -176,5 +176,10 @@
             cacert python3                # TLS roots + kernel build scripts
           ];
         };
+
+        # The UEFI firmware a Windows (UEFI) guest boots: edk2's OvmfPkg/CloudHv platform,
+        # an ELF with a PVH entry point that libkrun loads like a kernel and hands the memory
+        # map and ACPI tables. firmware/Dockerfile copies its CLOUDHV.fd into dist/.
+        packages.firmware = pkgs.OVMF-cloud-hypervisor.fd;
       });
 }
