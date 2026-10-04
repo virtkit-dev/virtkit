@@ -36,6 +36,9 @@ pub(crate) const GUEST_AGENT_SOCKET: &str = "qga.sock";
 /// The run directory's socket for COM1's input (`vk console`).
 pub(crate) const CONSOLE_SOCKET: &str = "console.sock";
 
+/// The run directory's socket for VM control (pause, resume): [`crate::vmmctl`].
+pub(crate) const CONTROL_SOCKET: &str = "vmm.sock";
+
 /// The run directory's VM generation ID, beside the disk overlays it belongs to.
 pub(crate) const GENERATION_ID: &str = "vmgenid";
 
@@ -283,6 +286,7 @@ pub(crate) fn guest_spec(
         hyperv: true,
         vm_generation_id: Some(generation_id(work)?),
         serial_input: Some(work.join(CONSOLE_SOCKET)),
+        control: Some(work.join(CONTROL_SOCKET)),
     })
 }
 
@@ -571,6 +575,7 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
         stale_recipe: None,
         services: Vec::new(),
         guest_agent: Some(work.join(GUEST_AGENT_SOCKET)),
+        control: Some(work.join(CONTROL_SOCKET)),
     });
 
     let result = hold(&mut ch, &console, args.detach_log.as_deref()).await;

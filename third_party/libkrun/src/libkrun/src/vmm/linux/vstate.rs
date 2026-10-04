@@ -1769,8 +1769,13 @@ impl Vcpu {
                 // Move to 'running' state.
                 StateMachine::next(Self::running)
             }
-            // All other events have no effect on current 'paused' state.
-            Ok(_) => StateMachine::next(Self::paused),
+            // Already paused: say so, so a second pause is answered rather than left waiting.
+            Ok(VcpuEvent::Pause) => {
+                self.response_sender
+                    .send(VcpuResponse::Paused)
+                    .expect("failed to send pause status");
+                StateMachine::next(Self::paused)
+            }
             // Unhandled exit of the other end.
             Err(_) => {
                 // Move to 'exited' state.
@@ -1844,7 +1849,7 @@ pub struct VcpuState {
 
 // Allow currently unused Pause and Exit events. These will be used by the vmm later on.
 #[allow(unused)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// List of events that the Vcpu can receive.
 pub enum VcpuEvent {
     /// Pause the Vcpu.
@@ -2247,6 +2252,43 @@ mod tests {
         handle.join().expect("failed to join thread");
         // Verify that the Vcpu saw its kvm immediate-exit as set.
         assert!(success.load(Ordering::Acquire));
+    }
+
+    /// Pause and Resume each get their answer, from a parked vCPU as from a running one, and
+    /// a second Pause in a row is answered too.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_vcpu_pause_resume() {
+        Vcpu::register_kick_signal_handler();
+        let (_vm, vcpu, mem) = setup_vcpu(0x1000);
+        // A guest spinning at 0 (`jmp $`): a running vCPU leaves KVM_RUN only when kicked.
+        vm_memory::Bytes::write_slice(&mem, &[0xeb, 0xfe], GuestAddress(0)).unwrap();
+        let mut sregs = vcpu.fd.get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        vcpu.fd.set_sregs(&sregs).unwrap();
+        let mut regs = vcpu.fd.get_regs().unwrap();
+        regs.rip = 0;
+        regs.rflags = 2;
+        vcpu.fd.set_regs(&regs).unwrap();
+
+        let handle = vcpu.start_threaded().unwrap();
+        let ask = |event, want| {
+            handle.send_event(event).unwrap();
+            let got = handle
+                .response_receiver()
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(got, want);
+        };
+        // A vCPU starts parked.
+        ask(VcpuEvent::Pause, VcpuResponse::Paused);
+        ask(VcpuEvent::Resume, VcpuResponse::Resumed);
+        // Running the guest now.
+        ask(VcpuEvent::Pause, VcpuResponse::Paused);
+        ask(VcpuEvent::Pause, VcpuResponse::Paused);
+        ask(VcpuEvent::Resume, VcpuResponse::Resumed);
+        ask(VcpuEvent::Pause, VcpuResponse::Paused);
     }
 
     #[test]

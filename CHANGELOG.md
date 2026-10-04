@@ -32,6 +32,10 @@ All notable changes to virtkit will be documented in this file.
   copy boots with its own name and SID (generalizing again an image built from a generalized
   one runs sysprep again, which Windows allows only a limited number of times); every step
   first waits for Windows to finish setting itself up.
+- **`vk pause` and `vk resume`.** A running UEFI guest (a `vk run` of a bundle) can be frozen
+  in place and run again: its vCPUs stop at an instruction boundary, memory and devices kept,
+  and its clock is right on resume. Linux guests and Windows compose services cannot be paused
+  (yet).
 - **Compose `secrets:`.** A top-level secret with a `file:` source is given to each service
   that lists it (by name, or `{source, target}`), as Docker places it: a Linux guest reads it at
   `/run/secrets/<target>` through a read-only bind, a Windows guest gets a copy at
