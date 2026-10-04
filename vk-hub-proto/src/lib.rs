@@ -24,15 +24,15 @@
 //! ([`auth_message`]), so a peer in the middle cannot steer a session down to an older
 //! version. The hello, the challenge and a refusal are read before a version is agreed, so
 //! their shapes are frozen: a later version may add optional fields to them and nothing else.
-//! Enrollment is versioned by its `/v1/` path.
+//! Enrollment is versioned by its `/v1/` path. Version 1, first released in 0.83.0, is
+//! frozen: a message or variant an older peer could not parse takes a new version, and only
+//! optional fields are added within one. Enrollment's `/v1/` request and response fall under
+//! the same rule, and [`TLS_EXPORTER_LABEL`] and the signed payloads' layout are part of
+//! version 1 too. Tests pin every message's JSON and the signed payloads' bytes.
 //!
 //! **Display.** Every string a host reports is the host's to choose; whoever prints one to a
 //! terminal, a log or a page passes it through [`display_safe`] first. Escaping it for the
 //! markup it lands in — HTML, say — stays the printer's job.
-//!
-//! Version 1 has not shipped in a release, so these messages are version 1's own. From the
-//! first release on, a message or variant an older peer could not parse takes a new version,
-//! and only optional fields are added within one.
 //!
 //! Node IDs and incarnations are 16 random bytes as lowercase hex ([`valid_id`]): the node ID
 //! the hub assigns at enrollment and the incarnation a node draws each time `vk node run`
@@ -366,8 +366,6 @@ pub enum RefusalCode {
     Superseded,
     /// The node broke the protocol or took too long.
     Protocol,
-    /// Too many connections are in their handshake; try again later.
-    Busy,
     /// Something failed on the hub.
     Internal,
     /// A code from a later hub; never permanent.
@@ -672,6 +670,8 @@ pub fn bound_workloads<T>(found: Vec<(Workload, T)>) -> (Vec<(Workload, T)>, u32
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     fn round_trip<T>(value: &T)
@@ -790,6 +790,26 @@ mod tests {
         }
     }
 
+    fn heartbeat() -> Heartbeat {
+        Heartbeat {
+            admission: Some(Admission {
+                committed_mib: 4096,
+                budget_mib: Some(400_000),
+                running: 1,
+                waiting: 2,
+            }),
+            desired_concurrency: Some(9),
+            mem_available_mib: Some(300_000),
+            storage: vec![FsUsage {
+                role: StorageRole::Jobs,
+                free_bytes: 1 << 30,
+                free_inodes: 1000,
+                inodes: 1 << 20,
+            }],
+            workload_mem_bytes: BTreeMap::from([("ab".repeat(8), 1 << 30)]),
+        }
+    }
+
     #[test]
     fn every_message_round_trips() {
         let id = "0123456789abcdef0123456789abcdef".to_string();
@@ -805,23 +825,7 @@ mod tests {
             },
             NodeMsg::Inventory(inventory()),
             NodeMsg::Inventory(Inventory::default()),
-            NodeMsg::Heartbeat(Heartbeat {
-                admission: Some(Admission {
-                    committed_mib: 4096,
-                    budget_mib: Some(400_000),
-                    running: 1,
-                    waiting: 2,
-                }),
-                desired_concurrency: Some(9),
-                mem_available_mib: Some(300_000),
-                storage: vec![FsUsage {
-                    role: StorageRole::Jobs,
-                    free_bytes: 1 << 30,
-                    free_inodes: 1000,
-                    inodes: 1 << 20,
-                }],
-                workload_mem_bytes: BTreeMap::from([("ab".repeat(8), 1 << 30)]),
-            }),
+            NodeMsg::Heartbeat(heartbeat()),
             NodeMsg::Heartbeat(Heartbeat::default()),
             NodeMsg::Report(Report::default()),
             NodeMsg::Report(Report {
@@ -900,6 +904,274 @@ mod tests {
                 vk_version: "9.9.9".into(),
             }
         );
+        pinned(
+            &msg,
+            json!({
+                "type": "hello",
+                "versions": {"min": 1, "max": 3},
+                "node_id": "n",
+                "incarnation": "i",
+                "vk_version": "9.9.9",
+            }),
+        );
+        pinned(
+            &HubMsg::Challenge {
+                version: 2,
+                versions: VersionRange { min: 1, max: 2 },
+                nonce: "ab".into(),
+            },
+            json!({
+                "type": "challenge",
+                "version": 2,
+                "versions": {"min": 1, "max": 2},
+                "nonce": "ab",
+            }),
+        );
+    }
+
+    fn pinned<T>(value: &T, wire: serde_json::Value)
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        assert_eq!(serde_json::to_value(value).unwrap(), wire);
+        assert_eq!(&serde_json::from_value::<T>(wire).unwrap(), value);
+    }
+
+    /// Every version 1 message as it goes on the wire. The hello and the challenge are pinned
+    /// with the pre-negotiation messages, a workload with the workloads, and the signed
+    /// payloads with their bytes. A new optional field is added to the literals here; any other
+    /// change that breaks this test needs a new protocol version.
+    #[test]
+    fn version_1_keeps_its_wire_shape() {
+        pinned(
+            &NodeMsg::Auth {
+                signature: "ab".into(),
+            },
+            json!({"type": "auth", "signature": "ab"}),
+        );
+        pinned(
+            &HubMsg::Welcome { heartbeat_secs: 5 },
+            json!({"type": "welcome", "heartbeat_secs": 5}),
+        );
+        for (code, wire) in [
+            (RefusalCode::NotEnrolled, "not_enrolled"),
+            (RefusalCode::BadSignature, "bad_signature"),
+            (RefusalCode::Revoked, "revoked"),
+            (RefusalCode::Version, "version"),
+            (RefusalCode::Superseded, "superseded"),
+            (RefusalCode::Protocol, "protocol"),
+            (RefusalCode::Internal, "internal"),
+            (RefusalCode::Other, "other"),
+        ] {
+            pinned(
+                &HubMsg::Refused {
+                    code,
+                    reason: "r".into(),
+                },
+                json!({"type": "refused", "code": wire, "reason": "r"}),
+            );
+        }
+
+        let mut inv = inventory();
+        inv.storage.push(Filesystem {
+            role: StorageRole::Jobs,
+            path: "/var/lib/vk".into(),
+            device: "8:1".into(),
+            size_bytes: 1 << 40,
+            tmpfs: false,
+            speed: Some(SpeedClass::Slow),
+        });
+        inv.storage.push(Filesystem {
+            role: StorageRole::Jobs,
+            path: "/scratch".into(),
+            device: "8:2".into(),
+            size_bytes: 1 << 30,
+            tmpfs: false,
+            speed: None,
+        });
+        pinned(
+            &NodeMsg::Inventory(inv),
+            json!({
+                "type": "inventory",
+                "hostname": "ci-7",
+                "hardware": {
+                    "cpus": 64,
+                    "cpu_model": "AMD EPYC 7543",
+                    "mem_total_mib": 515_000,
+                    "memory_nodes": [
+                        {"id": 0, "cpus": 32, "mem_total_mib": 257_000},
+                        {"id": 1, "cpus": 32, "mem_total_mib": 258_000},
+                    ],
+                    "checks": [{"name": "kvm", "ok": true, "detail": ""}],
+                },
+                "storage": [
+                    {
+                        "role": "checkouts",
+                        "path": "/builds/vk",
+                        "device": "0:45",
+                        "size_bytes": 1_u64 << 37,
+                        "tmpfs": true,
+                        "speed": "fast",
+                    },
+                    {
+                        "role": "jobs",
+                        "path": "/var/lib/vk",
+                        "device": "8:1",
+                        "size_bytes": 1_u64 << 40,
+                        "tmpfs": false,
+                        "speed": "slow",
+                    },
+                    {
+                        "role": "jobs",
+                        "path": "/scratch",
+                        "device": "8:2",
+                        "size_bytes": 1_u64 << 30,
+                        "tmpfs": false,
+                        "speed": null,
+                    },
+                ],
+                "versions": {
+                    "vk": "0.80.0",
+                    "guest_kernel": "6.18.52",
+                    "config_hash": "ab".repeat(32),
+                },
+                "runner": {
+                    "config": "/home/ci/.gitlab-runner/config.toml",
+                    "concurrent": 8,
+                    "runners": ["ci-7"],
+                },
+            }),
+        );
+        pinned(
+            &NodeMsg::Heartbeat(heartbeat()),
+            json!({
+                "type": "heartbeat",
+                "admission": {
+                    "committed_mib": 4096,
+                    "budget_mib": 400_000,
+                    "running": 1,
+                    "waiting": 2,
+                },
+                "desired_concurrency": 9,
+                "mem_available_mib": 300_000,
+                "storage": [{
+                    "role": "jobs",
+                    "free_bytes": 1_u64 << 30,
+                    "free_inodes": 1000,
+                    "inodes": 1_u64 << 20,
+                }],
+                "workload_mem_bytes": {"abababababababab": 1_u64 << 30},
+            }),
+        );
+        pinned(
+            &NodeMsg::Inventory(Inventory::default()),
+            json!({
+                "type": "inventory",
+                "hostname": "",
+                "hardware": {
+                    "cpus": 0,
+                    "cpu_model": null,
+                    "mem_total_mib": null,
+                    "memory_nodes": [],
+                    "checks": [],
+                },
+                "storage": [],
+                "versions": {"vk": "", "guest_kernel": null, "config_hash": ""},
+                "runner": null,
+            }),
+        );
+        pinned(
+            &NodeMsg::Heartbeat(Heartbeat::default()),
+            json!({
+                "type": "heartbeat",
+                "admission": null,
+                "desired_concurrency": null,
+                "mem_available_mib": null,
+                "storage": [],
+                "workload_mem_bytes": {},
+            }),
+        );
+        pinned(
+            &NodeMsg::Heartbeat(Heartbeat {
+                admission: Some(Admission {
+                    committed_mib: 0,
+                    budget_mib: None,
+                    running: 0,
+                    waiting: 0,
+                }),
+                ..Heartbeat::default()
+            }),
+            json!({
+                "type": "heartbeat",
+                "admission": {"committed_mib": 0, "budget_mib": null, "running": 0, "waiting": 0},
+                "desired_concurrency": null,
+                "mem_available_mib": null,
+                "storage": [],
+                "workload_mem_bytes": {},
+            }),
+        );
+        pinned(
+            &NodeMsg::Report(Report {
+                workloads: Some(vec![workload(), workload_bare()]),
+                workloads_omitted: 3,
+            }),
+            json!({
+                "type": "report",
+                "workloads": [
+                    serde_json::to_value(workload()).unwrap(),
+                    {
+                        "id": "cdcdcdcdcdcdcdcd",
+                        "kind": "dev",
+                        "state_dir": "/home/u/.local/state/virtkit/dev/w-1",
+                        "label": null,
+                        "project": null,
+                        "job_name": null,
+                        "job_id": null,
+                        "workspace": "/home/u/w",
+                        "environment": "dev",
+                        "pid": null,
+                        "cpus": null,
+                        "mem_reserved_mib": null,
+                        "started_at": null,
+                    },
+                ],
+                "workloads_omitted": 3,
+            }),
+        );
+        for (kind, wire) in [
+            (WorkloadKind::CiJob, "ci_job"),
+            (WorkloadKind::Dev, "dev"),
+            (WorkloadKind::Run, "run"),
+            (WorkloadKind::Other, "other"),
+        ] {
+            pinned(&kind, json!(wire));
+        }
+        pinned(
+            &NodeMsg::Report(Report::default()),
+            json!({"type": "report", "workloads": null, "workloads_omitted": 0}),
+        );
+
+        pinned(
+            &EnrollRequest {
+                token: "vkh_x".into(),
+                public_key: "22".into(),
+                signature: "33".into(),
+                hostname: "ci-7".into(),
+            },
+            json!({
+                "token": "vkh_x",
+                "public_key": "22",
+                "signature": "33",
+                "hostname": "ci-7",
+            }),
+        );
+        pinned(
+            &EnrollResponse {
+                node_id: "n".into(),
+            },
+            json!({"node_id": "n"}),
+        );
+        pinned(&ErrorBody { error: "e".into() }, json!({"error": "e"}));
     }
 
     /// A report and a heartbeat without workloads still read, as "not looked" and "none
@@ -1051,6 +1323,8 @@ mod tests {
     /// different builds.
     #[test]
     fn signed_payloads_keep_their_bytes() {
+        assert_eq!(TLS_EXPORTER_LABEL, b"EXPERIMENTAL-vk-fleet-node-auth");
+        assert_eq!((ENROLL_PATH, NODE_PATH), ("/v1/enroll", "/v1/node"));
         assert_eq!(
             enroll_message("tok", b"KEY"),
             b"vk-fleet enroll v1\0\

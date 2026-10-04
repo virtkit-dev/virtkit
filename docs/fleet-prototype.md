@@ -69,6 +69,9 @@ label of its own, and every variable-length part carries a big-endian `u64` leng
 Keys, signatures, nonces and IDs are strict lowercase hex. A proxy in front of the hub must
 pass TLS through: terminating it breaks the binding, and the hub refuses the signature.
 
+From 0.83.0, hubs and nodes of different releases interoperate: protocol version 1 and
+enrollment at `/v1/` are frozen, though the fleet remains experimental.
+
 The hub admits at most 256 connections that have not authenticated, each step of which (TLS,
 request headers, an enrollment body, a handshake message) has 10 seconds. One past that is
 closed at once. At most 256 handshakes run at once; past that the upgrade is answered HTTP

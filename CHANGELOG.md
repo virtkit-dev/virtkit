@@ -19,7 +19,8 @@ All notable changes to virtkit will be documented in this file.
   gitlab-runner's concurrency and runner names, and a heartbeat with admission and free
   space every few seconds — reconnects on its own whenever the hub is unreachable, and
   exits once the hub has removed the node. `[node] jobs_speed` and `checkouts_speed`
-  declare how fast those filesystems are.
+  declare how fast those filesystems are. Hubs and nodes of different releases work
+  together from this release on.
 - **Experimental: `vk-hub` shows what each host is running.** Every host reports its CI
   jobs, `vk dev` environments and pinned `vk run`s: what each belongs to (project and job,
   workspace and environment, image), its vCPUs, the memory reserved for it and the memory it
