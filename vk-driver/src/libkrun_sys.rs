@@ -347,6 +347,10 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         Some(path) => builder.uefi_vars(path.clone()),
         None => builder,
     };
+    let builder = match &spec.tpm_state {
+        Some(path) => builder.tpm_state(path.clone()),
+        None => builder,
+    };
     let vmm = devices
         .attach(builder)
         .build()

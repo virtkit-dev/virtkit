@@ -4,8 +4,9 @@
 use std::result;
 
 use acpi_tables::aml::{
-    AddressSpace, AddressSpaceCacheable, Device, EISAName, IO, Interrupt, Memory32Fixed, Method,
-    Name, Notify, Package, PackageBuilder, Path, ResourceTemplate, Return, Scope, ZERO,
+    AddressSpace, AddressSpaceCacheable, Arg, BufferData, Device, EISAName, Equal, IO, If,
+    Interrupt, Memory32Fixed, Method, Name, Notify, Package, PackageBuilder, Path,
+    ResourceTemplate, Return, Scope, Uuid, ZERO,
 };
 use acpi_tables::facs::FACS;
 use acpi_tables::fadt::{FADTBuilder, Flags};
@@ -26,7 +27,7 @@ use zerocopy::{Immutable, IntoBytes};
 use crate::x86_64::layout::{
     ACPI_GPE0_BLK, ACPI_GPE0_BLK_LEN, ACPI_PM_BASE, ACPI_RESET_REG, ACPI_RESET_VALUE,
     PCI_MMIO32_LOW_END, PCI_MMIO32_LOW_START, PVPANIC_PORT, RSDP_ADDR, SCI_GSI, SHM_MEM_SIZE,
-    SHM_MEM_START, SMBIOS_START, VMGENID_ADDR, VMGENID_GPE,
+    SHM_MEM_START, SMBIOS_START, TPM_CRB_SIZE, TPM_CRB_START, VMGENID_ADDR, VMGENID_GPE,
 };
 
 /// Standard local APIC physical base address.
@@ -115,6 +116,8 @@ struct DsdtOptions {
     windows_platform: bool,
     /// Declare the VM generation ID's `VGEN` device, and the GPE that notifies its change.
     vm_generation_id: bool,
+    /// Declare the TPM's CRB device (`MSFT0101`).
+    tpm: bool,
 }
 
 fn build_dsdt(
@@ -154,6 +157,17 @@ fn build_dsdt(
         let ret = Return::new(&addr);
         let method = Method::new(Path::new("ADDR"), 0, false, vec![&ret]);
         Device::new(Path::new("VGEN"), vec![&hid, &cid, &ddn, &method]).to_aml_bytes(&mut aml_body);
+    }
+
+    // The TPM's CRB interface, as QEMU declares its tpm-crb device (local patch).
+    if opts.tpm {
+        let hid = Name::new(Path::new("_HID"), &"MSFT0101");
+        let cid = Name::new(Path::new("_CID"), &"MSFT0101");
+        let sta = Name::new(Path::new("_STA"), &0x0fu8);
+        let mem = Memory32Fixed::new(true, TPM_CRB_START as u32, TPM_CRB_SIZE as u32);
+        let crs = Name::new(Path::new("_CRS"), &ResourceTemplate::new(vec![&mem]));
+        Device::new(Path::new("TPM_"), vec![&hid, &cid, &sta, &crs, &TpmDsm])
+            .to_aml_bytes(&mut aml_body);
     }
 
     // (io_base, irq, acpi_device_name) — PC/AT standard COM port assignments. COM3 and COM4
@@ -383,6 +397,88 @@ fn build_xsdt(entry_addrs: &[u64]) -> Vec<u8> {
     bytes
 }
 
+/// The TPM's `_DSM`, modelled on QEMU's, which Windows' TPM driver evaluates and fails without
+/// (event 15, STATUS_OBJECT_NAME_NOT_FOUND): TCG Physical Presence Interface 1.3, with no
+/// operation pending and none to queue (the requests report "not implemented"), and the TCG
+/// Platform Reset Attack Mitigation (memory clear) interface (local patch).
+///
+/// A stub: there is no PPI memory region for the firmware to act on, and a memory clear
+/// request is accepted and does nothing, which is harmless here: a guest reboot ends the VMM
+/// (`KRUN_EXIT_GUEST_RESET`), and the process its embedder relaunches starts with zeroed RAM.
+fn tpm_dsm(sink: &mut dyn AmlSink) {
+    const PPI: &str = "3dddfaa6-361b-4eb4-a424-8d10089d1653";
+    const MOR: &str = "376054ed-cc13-4675-901c-4756d7f2d45d";
+    let (uuid, function) = (Arg(0), Arg(2));
+    let numbers: [u8; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+    let is: Vec<Equal> = numbers.iter().map(|n| Equal::new(&function, n)).collect();
+    let empty = BufferData::new(vec![0]);
+    let ret_empty = Return::new(&empty);
+
+    // PPI: functions 0-8 are answered; the two that queue an operation are not implemented.
+    let ppi_functions = BufferData::new(vec![0xff, 0x01]);
+    let (not_implemented, reboot, language_unsupported) = (1u8, 2u8, 3u8);
+    let none_pending = Package::new(vec![&ZERO, &ZERO]);
+    let no_last_request = Package::new(vec![&ZERO, &ZERO, &ZERO]);
+    let answers = [
+        Return::new(&ppi_functions),
+        Return::new(&"1.3"),
+        Return::new(&not_implemented),
+        Return::new(&none_pending),
+        Return::new(&reboot),
+        Return::new(&no_last_request),
+        Return::new(&language_unsupported),
+        Return::new(&not_implemented),
+        // No operation can be confirmed: not implemented.
+        Return::new(&ZERO),
+    ];
+    let ppi_ifs: Vec<If> = is
+        .iter()
+        .zip(&answers)
+        .map(|(is, answer)| If::new(is, vec![answer]))
+        .collect();
+    let mut ppi_body: Vec<&dyn Aml> = ppi_ifs.iter().map(|i| i as &dyn Aml).collect();
+    ppi_body.push(&ret_empty);
+    let ppi_uuid = Uuid::new(PPI);
+    let is_ppi = Equal::new(&uuid, &ppi_uuid);
+    let ppi = If::new(&is_ppi, ppi_body);
+
+    // Memory clear: functions 0-1; setting the request succeeds.
+    let mor_functions = BufferData::new(vec![0x03]);
+    let ret_mor_functions = Return::new(&mor_functions);
+    let set_ok = Return::new(&ZERO);
+    let mor_0 = If::new(&is[0], vec![&ret_mor_functions]);
+    let mor_1 = If::new(&is[1], vec![&set_ok]);
+    let mor_uuid = Uuid::new(MOR);
+    let is_mor = Equal::new(&uuid, &mor_uuid);
+    let mor = If::new(&is_mor, vec![&mor_0, &mor_1, &ret_empty]);
+
+    Method::new(Path::new("_DSM"), 4, true, vec![&ppi, &mor, &ret_empty]).to_aml_bytes(sink);
+}
+
+/// [`tpm_dsm`] as a child of a device.
+struct TpmDsm;
+
+impl Aml for TpmDsm {
+    fn to_aml_bytes(&self, sink: &mut dyn AmlSink) {
+        tpm_dsm(sink);
+    }
+}
+
+/// TPM2 table (TCG ACPI spec, revision 4): a client platform's TPM started through its CRB
+/// interface (start method 7), whose control area is the CRB's CTRL_REQ register. No event log
+/// area: the firmware hands Windows its log through the EFI TCG2 protocol (local patch).
+fn build_tpm2() -> Vec<u8> {
+    let mut tpm2 = Sdt::new(*b"TPM2", 36, 4, *b"LIBKRN", *b"KRUNTPM2", 1);
+    tpm2.append_slice(&0u16.to_le_bytes()); // platform class: client
+    tpm2.append_slice(&0u16.to_le_bytes()); // reserved
+    tpm2.append_slice(&(TPM_CRB_START + 0x40).to_le_bytes()); // control area
+    tpm2.append_slice(&7u32.to_le_bytes()); // start method: CRB
+    tpm2.append_slice(&[0u8; 12]); // start method parameters
+    tpm2.append_slice(&0u32.to_le_bytes()); // log area minimum length
+    tpm2.append_slice(&0u64.to_le_bytes()); // log area start address
+    tpm2.as_slice().to_vec()
+}
+
 fn build_mcfg(pci_host: &PciHostInfo) -> Vec<u8> {
     let mut mcfg = MCFG::new(*b"LIBKRN", *b"KRUNMCFG", 1);
     mcfg.add_ecam(pci_host.ecam_base, 0, 0, 0);
@@ -412,6 +508,8 @@ pub type Result<T> = result::Result<T, Error>;
 ///   without cpufreq warns about each, so other guests go without;
 /// - no PS/2 keyboard (`KBD0`): Windows' i8042prt resets it and our i8042 answers with an ACK but
 ///   no self-test result, so every boot waited out a timeout of about ten seconds.
+///
+/// `tpm` declares the TPM's CRB device in the DSDT and adds a TPM2 table (local patch).
 pub fn setup_acpi(
     mem: &GuestMemoryMmap,
     num_cpus: u8,
@@ -419,6 +517,7 @@ pub fn setup_acpi(
     pci_host: Option<&PciHostInfo>,
     vm_generation_id: Option<&[u8; 16]>,
     windows_platform: bool,
+    tpm: bool,
 ) -> Result<()> {
     if u32::from(num_cpus) > MAX_SUPPORTED_CPUS {
         return Err(Error::TooManyCpus);
@@ -431,13 +530,15 @@ pub fn setup_acpi(
             num_cpus,
             windows_platform,
             vm_generation_id: vm_generation_id.is_some(),
+            tpm,
         },
     );
     let madt = build_madt(num_cpus);
     let mcfg = pci_host.map(build_mcfg);
+    let tpm2 = tpm.then(build_tpm2);
 
     const RSDP_SIZE: u64 = 36;
-    let xsdt_entries = 3 + if mcfg.is_some() { 1 } else { 0 };
+    let xsdt_entries = 3 + usize::from(mcfg.is_some()) + usize::from(tpm2.is_some());
     let xsdt_size = 36 + xsdt_entries * 8;
     let fadt_size_placeholder = build_fadt(0, 0, false).len() as u64;
     let facs = {
@@ -454,11 +555,15 @@ pub fn setup_acpi(
     let dsdt_addr = facs_addr + facs.len() as u64;
     let madt_addr = dsdt_addr + dsdt.len() as u64;
     let mcfg_addr = madt_addr + madt.len() as u64;
+    let tpm2_addr = mcfg_addr + mcfg.as_ref().map_or(0, |table| table.len() as u64);
 
     let fadt = build_fadt(facs_addr, dsdt_addr, vm_generation_id.is_some());
     let mut xsdt_entries = vec![fadt_addr, madt_addr];
     if mcfg.is_some() {
         xsdt_entries.push(mcfg_addr);
+    }
+    if tpm2.is_some() {
+        xsdt_entries.push(tpm2_addr);
     }
     // The FADT already points at the FACS; the XSDT lists it too because UEFI firmware rebuilds
     // the tables from the XSDT alone (edk2's CloudHv platform) and, finding no FACS there,
@@ -468,7 +573,7 @@ pub fn setup_acpi(
     let xsdt = build_xsdt(&xsdt_entries);
     let rsdp = build_rsdp(xsdt_addr);
 
-    let total_size = mcfg_addr + mcfg.as_ref().map_or(0, |table| table.len() as u64) - rsdp_addr;
+    let total_size = tpm2_addr + tpm2.as_ref().map_or(0, |table| table.len() as u64) - rsdp_addr;
     // The tables end before the SMBIOS tables, and so before the VM generation ID's page.
     if rsdp_addr + total_size > SMBIOS_START
         || !mem.check_range(
@@ -494,6 +599,10 @@ pub fn setup_acpi(
         .map_err(|_| Error::WriteFailed)?;
     if let Some(mcfg) = mcfg {
         mem.write_slice(&mcfg, GuestAddress(mcfg_addr))
+            .map_err(|_| Error::WriteFailed)?;
+    }
+    if let Some(tpm2) = tpm2 {
+        mem.write_slice(&tpm2, GuestAddress(tpm2_addr))
             .map_err(|_| Error::WriteFailed)?;
     }
     if let Some(id) = vm_generation_id {
@@ -662,11 +771,57 @@ mod tests {
         let window_size = (HIMEM_START - RSDP_ADDR) as usize;
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
         let id: [u8; 16] = *b"0123456789abcdef";
-        setup_acpi(&mem, 2, &[], None, Some(&id), false).unwrap();
+        setup_acpi(&mem, 2, &[], None, Some(&id), false, false).unwrap();
         let mut got = [0u8; 16];
         mem.read_slice(&mut got, GuestAddress(VMGENID_ADDR))
             .unwrap();
         assert_eq!(got, id);
+    }
+
+    #[test]
+    fn a_tpm_gets_its_crb_device_and_a_tpm2_table_in_the_xsdt() {
+        assert!(!has(
+            &build_dsdt(&[], None, DsdtOptions::default()),
+            b"MSFT0101"
+        ));
+        let opts = DsdtOptions {
+            tpm: true,
+            ..Default::default()
+        };
+        let dsdt = build_dsdt(&[], None, opts);
+        assert!(has(&dsdt, b"MSFT0101"));
+        assert!(has(&dsdt, b"_DSM"));
+        let tpm2 = build_tpm2();
+        assert_eq!(&tpm2[0..4], b"TPM2");
+        assert_eq!(tpm2.len(), 76);
+        assert_eq!(tpm2[8], 4, "revision 4");
+        assert_eq!(tpm2.iter().fold(0u8, |a, b| a.wrapping_add(*b)), 0);
+        assert_eq!(
+            u64::from_le_bytes(tpm2[40..48].try_into().unwrap()),
+            TPM_CRB_START + 0x40
+        );
+        assert_eq!(u32::from_le_bytes(tpm2[48..52].try_into().unwrap()), 7);
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10_0000)]).unwrap();
+        setup_acpi(&mem, 2, &[], None, None, true, true).unwrap();
+        let read_u64 = |addr: u64| {
+            let mut b = [0u8; 8];
+            mem.read_slice(&mut b, GuestAddress(addr)).unwrap();
+            u64::from_le_bytes(b)
+        };
+        let xsdt = read_u64(RSDP_ADDR + 24);
+        let mut len = [0u8; 4];
+        mem.read_slice(&mut len, GuestAddress(xsdt + 4)).unwrap();
+        let entries = (u64::from(u32::from_le_bytes(len)) - 36) / 8;
+        let signatures: Vec<[u8; 4]> = (0..entries)
+            .map(|i| {
+                let mut sig = [0u8; 4];
+                mem.read_slice(&mut sig, GuestAddress(read_u64(xsdt + 36 + i * 8)))
+                    .unwrap();
+                sig
+            })
+            .collect();
+        assert!(signatures.contains(b"TPM2"), "{signatures:?}");
     }
 
     #[test]
@@ -876,7 +1031,7 @@ mod tests {
         let window_size = (HIMEM_START - RSDP_ADDR) as usize;
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
 
-        setup_acpi(&mem, 4, &[], None, None, false).unwrap();
+        setup_acpi(&mem, 4, &[], None, None, false, false).unwrap();
 
         let rsdp: [u8; 8] = {
             let mut buf = [0u8; 8];
@@ -890,7 +1045,7 @@ mod tests {
     fn setup_acpi_places_an_aligned_facs() {
         let window_size = (HIMEM_START - RSDP_ADDR) as usize;
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
-        setup_acpi(&mem, 2, &[], None, None, false).unwrap();
+        setup_acpi(&mem, 2, &[], None, None, false, false).unwrap();
 
         let read_u64 = |addr: u64| {
             let mut buf = [0u8; 8];
@@ -924,7 +1079,7 @@ mod tests {
             shm_window: true,
         };
 
-        setup_acpi(&mem, 1, &[], Some(&pci_host), None, false).unwrap();
+        setup_acpi(&mem, 1, &[], Some(&pci_host), None, false, false).unwrap();
 
         let mut rsdp = [0; 36];
         mem.read_slice(&mut rsdp, GuestAddress(RSDP_ADDR)).unwrap();
@@ -952,7 +1107,7 @@ mod tests {
     #[test]
     fn setup_acpi_fails_if_window_too_small() {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), 8)]).unwrap();
-        assert!(setup_acpi(&mem, 4, &[], None, None, false).is_err());
+        assert!(setup_acpi(&mem, 4, &[], None, None, false, false).is_err());
     }
 
     #[test]
@@ -961,7 +1116,7 @@ mod tests {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
 
         assert_eq!(
-            setup_acpi(&mem, 255, &[], None, None, false),
+            setup_acpi(&mem, 255, &[], None, None, false, false),
             Err(Error::TooManyCpus)
         );
     }

@@ -39,6 +39,7 @@ pub struct VmmBuilder<'a> {
     vm_generation_id: Option<[u8; 16]>,
     system_uuid: Option<[u8; 16]>,
     uefi_vars: Option<std::path::PathBuf>,
+    tpm_state: Option<std::path::PathBuf>,
     restore_from: Option<std::path::PathBuf>,
     split_irqchip: bool,
     acpi: bool,
@@ -166,6 +167,17 @@ impl<'a> VmmBuilder<'a> {
     /// across boots. x86_64 only.
     pub fn uefi_vars(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.uefi_vars = Some(path.into());
+        self
+    }
+
+    /// Give the guest a TPM 2.0 (local patch, see VENDOR.md, `tpm` feature): libtpms behind a
+    /// CRB interface at [`arch::x86_64::layout::TPM_CRB_START`], declared in the ACPI tables,
+    /// its permanent state in `path` (a new TPM, manufactured on first use, when the file is
+    /// missing; one that cannot be read fails the TPM). Keep the file with the machine's disks;
+    /// a [`VmmBuilder::restore_from`] writes the snapshot's permanent state to it. x86_64 only.
+    #[cfg(feature = "tpm")]
+    pub fn tpm_state(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.tpm_state = Some(path.into());
         self
     }
 
@@ -556,6 +568,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     vm_resources.vm_generation_id = builder_cfg.vm_generation_id;
     vm_resources.system_uuid = builder_cfg.system_uuid;
     vm_resources.uefi_vars = builder_cfg.uefi_vars;
+    vm_resources.tpm_state = builder_cfg.tpm_state;
     vm_resources.restore_from = builder_cfg.restore_from;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;

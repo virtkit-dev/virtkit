@@ -49,6 +49,8 @@ pub(crate) const UEFI_VARS: &str = "uefi-vars.fd";
 /// The firmware's variable store flash length. Every store vk boots, including templates and
 /// bundle stores, must match this length for the firmware's flash layout.
 const UEFI_VARS_LEN: u64 = 0x84000;
+/// The machine's permanent TPM state, kept in its run directory beside its disks.
+pub(crate) const TPM_STATE: &str = "tpm-state";
 
 /// How long a guest has to answer the ACPI power button before vk asks its qemu-ga to shut it
 /// down instead (a Windows guest can be set to ignore the button).
@@ -84,6 +86,11 @@ pub(crate) struct Manifest {
     /// variable store of its own).
     #[serde(default)]
     pub secure_boot: bool,
+    /// The machine's TPM 2.0 (`# vk: tpm=on`), with state in the run directory
+    /// ([`TPM_STATE`]). Each machine gets a new TPM; snapshot restore uses the saved state,
+    /// which libkrun writes there.
+    #[serde(default)]
+    pub tpm: bool,
     /// Set for a snapshot (`vk snapshot`): the bundle also holds the VM's state and memory,
     /// which a run starts from instead of booting.
     #[serde(default)]
@@ -303,12 +310,16 @@ fn refuse_unsupported(args: &RunArgs) -> Result<()> {
 }
 
 /// Prepare `bundle`'s disk overlays ([`overlays`]) and variable store ([`seed_uefi_vars`]) in
-/// `work`. `fresh` first removes the previous overlays and store to start from the bundle.
+/// `work`. `fresh` first removes the previous overlays, store and TPM state to start from the
+/// bundle (a TPM then starts new, or on a snapshot's state).
 pub(crate) fn machine_files(work: &Path, bundle: &Bundle, fresh: bool) -> Result<Vec<Disk>> {
     let bundle_disks = bundle.disks()?;
     if fresh {
         let kept = (0..bundle_disks.len()).map(|i| format!("disk{i}.qcow2"));
-        remove_files(work, kept.chain([UEFI_VARS.to_string()]))?;
+        remove_files(
+            work,
+            kept.chain([UEFI_VARS.to_string(), TPM_STATE.to_string()]),
+        )?;
     }
     let disks = overlays(&bundle_disks, work)?;
     seed_uefi_vars(work, bundle)?;
@@ -404,9 +415,17 @@ fn write_vars(path: &Path, bytes: &[u8]) -> Result<()> {
             bytes.len()
         );
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+    write_atomic(path, bytes)
+}
+
+/// Write `bytes` to `path` atomically and durably, readable only by its owner.
+/// Sync the directory after renaming the file.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    vk_fs::write_atomic(path, bytes, 0o600)?;
+    let dir = path.parent().context("a file in a directory")?;
+    std::fs::File::open(dir)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("syncing {}", dir.display()))
 }
 
 /// Refuse the variable store `path` unless it is [`UEFI_VARS_LEN`] long.
@@ -499,6 +518,12 @@ fn random_uuid_v4() -> Result<[u8; 16]> {
     Ok(uuid)
 }
 
+/// The TPM state file in `work` for `manifest`, if the machine has a TPM.
+/// Otherwise its [`guest_spec`] has none.
+pub(crate) fn tpm_state(work: &Path, manifest: &Manifest) -> Option<PathBuf> {
+    manifest.tpm.then(|| work.join(TPM_STATE))
+}
+
 /// The spec of a UEFI guest named `name` booting `firmware` on `disks`, its console log, qemu-ga
 /// and COM1 input sockets and VM generation ID in `work`; no network. With `restore`, the guest
 /// starts from the snapshot in that directory instead of booting, under a new VM generation ID
@@ -555,6 +580,8 @@ pub(crate) fn guest_spec(
         vm_generation_id: Some(vm_generation_id),
         system_uuid: Some(system_uuid),
         uefi_vars,
+        // A TPM only for a machine that asks for one ([`tpm_state`]).
+        tpm_state: None,
         serial_input: Some(work.join(CONSOLE_SOCKET)),
         control: Some(work.join(CONTROL_SOCKET)),
         restore_from: restore.map(Path::to_path_buf),
@@ -677,7 +704,7 @@ pub(crate) struct Guest {
 
 impl Guest {
     /// Boot `disks` as the guest `name`, with `work` as its run directory and `nics` on a
-    /// switch (none: no network).
+    /// switch (none: no network). No TPM: a build's guests run without one.
     pub(crate) fn boot(
         work: &Path,
         name: &str,
@@ -771,8 +798,8 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
         None
     };
     check_restore(&bundle.manifest, args.cpus, args.mem.as_deref(), guest_ip)?;
-    // A snapshot's memory goes with its disks and variable store as they were: never with a
-    // previous run's.
+    // A snapshot's memory goes with its disks, variable store and TPM state as they were:
+    // never with a previous run's.
     let disks = machine_files(work, &bundle, restore)?;
     let name = bundle.name();
     let cpus = args.cpus.or(bundle.manifest.cpus).unwrap_or(2);
@@ -816,6 +843,7 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
     let mut spec = guest_spec(&firmware.path, work, &name, disks, cpus, &mem, restore_from)?;
     spec.nics = nics;
     spec.numa = args.numa.clone();
+    spec.tpm_state = tpm_state(work, &bundle.manifest);
     let vmm = crate::vmm::selected();
     let mut ch = match crate::run::spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal) {
         Ok(ch) => ch,
@@ -1118,6 +1146,14 @@ mod tests {
         assert!(!bundle.manifest.secure_boot);
         seed_uefi_vars(&work, &bundle).unwrap();
         assert_eq!(std::fs::read(work.join(UEFI_VARS)).unwrap(), store(b'b'));
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(work.join(UEFI_VARS))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         // The machine's own store, once it has one, is never replaced; the bundle's is never
         // written.
         std::fs::write(work.join(UEFI_VARS), store(b'm')).unwrap();
@@ -1140,10 +1176,23 @@ mod tests {
         );
         let work = tmp.path().join("run");
         std::fs::write(work.join(UEFI_VARS), store(b's')).unwrap();
+        std::fs::write(work.join(TPM_STATE), "tpm").unwrap();
         machine_files(&work, &bundle, false).unwrap();
         assert_eq!(std::fs::read(work.join(UEFI_VARS)).unwrap(), store(b's'));
+        assert!(work.join(TPM_STATE).exists());
         machine_files(&work, &bundle, true).unwrap();
         assert_eq!(std::fs::read(work.join(UEFI_VARS)).unwrap(), store(b'b'));
+        // Nor with the run's TPM: a new one, or the snapshot's, which libkrun writes there.
+        assert!(!work.join(TPM_STATE).exists());
+    }
+
+    #[test]
+    fn only_a_machine_whose_manifest_asks_for_a_tpm_gets_one() {
+        let work = Path::new("/run/x");
+        let plain = manifest(r#"{"firmware": "uefi", "disks": ["d"]}"#).unwrap();
+        assert_eq!(tpm_state(work, &plain), None);
+        let tpm = manifest(r#"{"firmware": "uefi", "disks": ["d"], "tpm": true}"#).unwrap();
+        assert_eq!(tpm_state(work, &tpm), Some(work.join(TPM_STATE)));
     }
 
     #[test]

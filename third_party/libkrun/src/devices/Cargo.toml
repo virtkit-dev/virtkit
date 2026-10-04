@@ -24,6 +24,8 @@ vhost-user = ["vhost", "vmm-sys-util", "krun_display"]
 ffi = []
 # Serializable device state, for snapshots.
 snapshot = ["dep:serde"]
+# A TPM 2.0 (libtpms, linked statically from VK_LIBTPMS_DIR) behind a CRB interface.
+tpm = []
 
 [dependencies]
 bitflags = "1.2.0"

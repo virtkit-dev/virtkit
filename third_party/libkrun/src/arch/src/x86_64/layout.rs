@@ -94,6 +94,11 @@ pub const SMBIOS_START: u64 = 0x000f_0000;
 pub const UEFI_VARS_FLASH_START: u64 = 0xffc0_0000;
 pub const UEFI_VARS_FLASH_BLOCK: usize = 0x1000;
 
+/// The TPM's CRB interface (local patch): the TCG PC Client address, where edk2 and the ACPI
+/// tables look for it, and locality 0's size (registers and command/response buffer).
+pub const TPM_CRB_START: u64 = 0xfed4_0000;
+pub const TPM_CRB_SIZE: u64 = 0x1000;
+
 /// The 16-byte VM generation ID the DSDT's VGEN device points at: the last page of the
 /// reserved window below 1 MiB, past the ACPI tables (local patch).
 pub const VMGENID_ADDR: u64 = 0x000f_f000;
