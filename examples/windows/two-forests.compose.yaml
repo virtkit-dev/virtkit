@@ -1,0 +1,152 @@
+# Two forests and a two-way forest trust: corp.lab (lab.Dockerfile's DC) and partner.lab
+# (forests.Dockerfile), each with its users made by an accounts job, a member server (Windows
+# Server 2025) and a workstation (Windows 11, win11.Dockerfile). Every member reads its own
+# forest's users and the other forest's, across the trust. Build the images first (see
+# forests.Dockerfile and win11.Dockerfile), then
+#   vk run --compose two-forests.compose.yaml
+# partner.lab's DC makes the trust once corp.lab's DC answers; the members start once the trust
+# and both forests' users are there. About 15 GiB of guest memory.
+secrets:
+  join_password:
+    file: ./secrets/join-password
+  user_password:
+    file: ./secrets/user-password
+
+services:
+  # corp.lab
+  dc:
+    image: ./dc-out
+    environment:
+      LAB_FORWARDERS: partner.lab:dcpartner
+    secrets: [join_password]
+    healthcheck:
+      test: ["CMD", "nltest", "/dsgetdc:corp.lab"]
+      interval: 5s
+      timeout: 30s
+      retries: 60
+    x-virtkit:
+      mem: 2560M
+  accounts:
+    build:
+      context: .
+      dockerfile: accounts.Dockerfile
+    depends_on:
+      dc:
+        condition: service_healthy
+    environment:
+      LAB_DC: dc
+      LAB_USERS: alice bob
+    secrets: [join_password, user_password]
+
+  # partner.lab, which makes the trust with corp.lab.
+  dcpartner:
+    image: ./dc-partner-out
+    depends_on:
+      dc:
+        condition: service_healthy
+    environment:
+      LAB_TRUST_DOMAIN: corp.lab
+      LAB_TRUST_NETBIOS: CORP
+      LAB_TRUST_DC: dc
+      LAB_TRUST_DIRECTION: Bidirectional
+    secrets: [join_password]
+    healthcheck:
+      test: ["CMD", "nltest", "/dsgetdc:partner.lab"]
+      interval: 5s
+      timeout: 30s
+      retries: 60
+    x-virtkit:
+      mem: 2560M
+  accounts-partner:
+    build:
+      context: .
+      dockerfile: accounts.Dockerfile
+    depends_on:
+      dcpartner:
+        condition: service_healthy
+    environment:
+      LAB_DC: dcpartner
+      LAB_NETBIOS: PARTNER
+      LAB_USERS: carol dave
+    secrets: [join_password, user_password]
+
+  # The members: a server and a workstation in each forest.
+  srv-corp:
+    image: ./srv-corp-out
+    depends_on: &members-wait
+      dcpartner:
+        condition: service_healthy
+      accounts:
+        condition: service_completed_successfully
+      accounts-partner:
+        condition: service_completed_successfully
+    environment:
+      LAB_DC: dc
+      LAB_USERS: alice bob
+      LAB_REMOTE_DOMAIN: partner.lab
+      LAB_REMOTE_USERS: carol dave
+    secrets: [join_password]
+    x-virtkit:
+      mem: 1536M
+  ws-corp:
+    image: ./ws-corp-out
+    # After the servers it probes over RDP (rdp-probe.ps1), which wait for the DCs and jobs.
+    depends_on: [srv-corp, srv-partner]
+    environment:
+      LAB_DC: dc
+      LAB_USERS: alice bob
+      LAB_REMOTE_DOMAIN: partner.lab
+      LAB_REMOTE_USERS: carol dave
+      LAB_CHECK: rdp-probe.ps1
+      RDP_SERVERS: srv-corp dc srv-partner
+    secrets: [join_password]
+    x-virtkit:
+      mem: 3584M
+  srv-partner:
+    image: ./srv-partner-out
+    depends_on: *members-wait
+    environment:
+      LAB_DC: dcpartner
+      LAB_DOMAIN: partner.lab
+      LAB_NETBIOS: PARTNER
+      LAB_USERS: carol dave
+      LAB_REMOTE_DOMAIN: corp.lab
+      LAB_REMOTE_USERS: alice bob
+    secrets: [join_password]
+    x-virtkit:
+      mem: 1536M
+  ws-partner:
+    image: ./ws-partner-out
+    # After the servers it probes over RDP (rdp-probe.ps1), which wait for the DCs and jobs.
+    depends_on: [srv-corp, srv-partner]
+    environment:
+      LAB_DC: dcpartner
+      LAB_DOMAIN: partner.lab
+      LAB_NETBIOS: PARTNER
+      LAB_USERS: carol dave
+      LAB_REMOTE_DOMAIN: corp.lab
+      LAB_REMOTE_USERS: alice bob
+      LAB_CHECK: rdp-probe.ps1
+      RDP_SERVERS: srv-partner dcpartner srv-corp
+    secrets: [join_password]
+    x-virtkit:
+      mem: 3584M
+
+  # RDP sign-in to every machine as its domain's admin, and across the trust as a user of the
+  # other forest.
+  rdp-check:
+    build:
+      context: .
+      dockerfile: rdp-check.Dockerfile
+    depends_on: [srv-corp, ws-corp, srv-partner, ws-partner]
+    environment:
+      RDP_TARGETS: >-
+        dc:CORP\vkjoin
+        srv-corp:CORP\vkjoin
+        ws-corp:CORP\vkjoin
+        dcpartner:PARTNER\vkjoin
+        srv-partner:PARTNER\vkjoin
+        ws-partner:PARTNER\vkjoin
+        srv-partner:CORP\alice
+        srv-corp:PARTNER\carol
+    secrets: [join_password, user_password]

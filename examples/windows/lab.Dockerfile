@@ -25,23 +25,9 @@ RUN Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' fD
 FROM base AS dc
 SHELL ["powershell", "-NoLogo", "-NoProfile", "-Command", "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue';"]
 RUN Install-WindowsFeature AD-Domain-Services,DNS -IncludeManagementTools | Format-Table -AutoSize
-# Promotion wants a configured network adapter. About one in six attempts fails as NTDS first
-# starts (event 1168, error 1327) and rolls back cleanly; the next attempt goes through.
-# The DSRM password is an example value, as are secrets/: change them beyond a throwaway lab.
-RUN --network=default Import-Module ADDSDeployment; \
-    for ($i = 1; ; $i++) { \
-      try { \
-        $r = Install-ADDSForest -DomainName corp.lab -DomainNetbiosName CORP -InstallDns \
-          -SafeModeAdministratorPassword (ConvertTo-SecureString 'Vk-Dsrm-2025!' -AsPlainText -Force) \
-          -NoRebootOnCompletion -Force -WarningAction SilentlyContinue; \
-        if ($r.Status -eq 'Success') { break }; \
-        throw $r.Message \
-      } catch { \
-        if ($i -ge 3) { throw }; \
-        ('promotion attempt {0} failed, retrying: {1}' -f $i, $_) \
-      } \
-    }; \
-    exit 3010
+# Promote it (promote.ps1), with the restart that takes.
+COPY promote.ps1 C:/vk/
+RUN --network=default C:\vk\promote.ps1 corp.lab CORP; exit $LASTEXITCODE
 # Active Directory Web Services starts last after a boot.
 RUN --network=default for ($i = 0; ; $i++) { \
       try { Get-ADDomain | Format-List DNSRoot,NetBIOSName,PDCEmulator; break } \

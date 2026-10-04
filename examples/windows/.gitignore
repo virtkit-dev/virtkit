@@ -1,2 +1,4 @@
 *.iso
 *-out/
+run/
+rdp-out/
