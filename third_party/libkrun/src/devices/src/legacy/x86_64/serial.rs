@@ -72,7 +72,48 @@ pub struct Serial {
     input: Option<Box<dyn ReadableFd + Send>>,
 }
 
+/// [`Serial::save_state`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "snapshot", derive(serde::Serialize, serde::Deserialize))]
+pub struct SerialState {
+    pub interrupt_enable: u8,
+    pub interrupt_identification: u8,
+    pub line_control: u8,
+    pub line_status: u8,
+    pub modem_control: u8,
+    pub modem_status: u8,
+    pub scratch: u8,
+    pub baud_divisor: u16,
+}
+
 impl Serial {
+    /// What a snapshot keeps: the UART's registers; bytes not yet read are dropped (local
+    /// patch).
+    pub fn save_state(&self) -> SerialState {
+        SerialState {
+            interrupt_enable: self.interrupt_enable,
+            interrupt_identification: self.interrupt_identification,
+            line_control: self.line_control,
+            line_status: self.line_status,
+            modem_control: self.modem_control,
+            modem_status: self.modem_status,
+            scratch: self.scratch,
+            baud_divisor: self.baud_divisor,
+        }
+    }
+
+    /// Put back what [`Serial::save_state`] returned.
+    pub fn restore_state(&mut self, state: &SerialState) {
+        self.interrupt_enable = state.interrupt_enable;
+        self.interrupt_identification = state.interrupt_identification;
+        self.line_control = state.line_control;
+        self.line_status = state.line_status;
+        self.modem_control = state.modem_control;
+        self.modem_status = state.modem_status;
+        self.scratch = state.scratch;
+        self.baud_divisor = state.baud_divisor;
+    }
+
     pub fn new(
         interrupt_evt: EventFd,
         out: Option<Box<dyn io::Write + Send>>,
@@ -559,5 +600,33 @@ mod tests {
         let mut data = [0u8];
         serial.read(0, u64::from(SCR), &mut data[..]);
         assert_eq!(data[0], 0x12_u8);
+    }
+
+    #[test]
+    fn the_registers_survive_save_and_restore() {
+        let evt = || EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new_sink(evt());
+        serial.write(0, u64::from(LCR), &[LCR_DLAB_BIT]);
+        serial.write(0, u64::from(DLAB_LOW), &[0x12]);
+        serial.write(0, u64::from(DLAB_HIGH), &[0x34]);
+        serial.write(0, u64::from(LCR), &[0x03]);
+        serial.write(0, u64::from(IER), &[IER_RECV_BIT]);
+        serial.write(0, u64::from(MCR), &[0x0b]);
+        serial.write(0, u64::from(SCR), &[0x5a]);
+
+        let mut back = Serial::new_sink(evt());
+        back.restore_state(&serial.save_state());
+        assert_eq!(back.save_state(), serial.save_state());
+        let read = |serial: &mut Serial, reg: u8| {
+            let mut data = [0u8];
+            serial.read(0, u64::from(reg), &mut data);
+            data[0]
+        };
+        for (reg, want) in [(LCR, 0x03), (IER, IER_RECV_BIT), (MCR, 0x0b), (SCR, 0x5a)] {
+            assert_eq!(read(&mut back, reg), want, "register {reg}");
+        }
+        back.write(0, u64::from(LCR), &[LCR_DLAB_BIT | 0x03]);
+        assert_eq!(read(&mut back, DLAB_LOW), 0x12);
+        assert_eq!(read(&mut back, DLAB_HIGH), 0x34);
     }
 }

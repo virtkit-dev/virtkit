@@ -1879,6 +1879,7 @@ dependencies = [
  "maybe-async",
  "nix 0.30.1",
  "rand",
+ "serde",
  "virtio-bindings",
  "vm-fdt",
  "vm-memory",
@@ -1947,7 +1948,9 @@ version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11cf0ca75d59e9d298647c59cf6c5286fa048120caa77972a7a504a0824d234f"
 dependencies = [
+ "serde",
  "vmm-sys-util",
+ "zerocopy",
 ]
 
 [[package]]
@@ -1994,6 +1997,8 @@ dependencies = [
  "log",
  "nix 0.30.1",
  "once_cell",
+ "serde",
+ "serde_json",
  "thiserror",
  "vm-memory",
  "vmm-sys-util",

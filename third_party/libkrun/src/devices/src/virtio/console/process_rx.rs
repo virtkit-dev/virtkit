@@ -30,6 +30,7 @@ pub(crate) fn process_rx(
 
         let head_index = head.index;
         let mut bytes_read = 0;
+        let writing = crate::virtio::device_writes();
         for chain in head.into_iter().writable() {
             match read_to_desc(chain, input.as_mut(), &mut eof) {
                 Ok(0) => {
@@ -50,6 +51,7 @@ pub(crate) fn process_rx(
                 error!("failed to add used elements to the queue: {e:?}");
             }
         }
+        drop(writing);
 
         // We signal_used_queue only when we get WouldBlock or EOF
         if eof {

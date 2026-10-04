@@ -120,6 +120,8 @@ pub struct VmResources {
     pub hyperv_enabled: bool,
     /// The VM generation ID the DSDT declares, if any (local patch, see VENDOR.md).
     pub vm_generation_id: Option<[u8; 16]>,
+    /// A snapshot directory to start the VM from instead of booting (local patch).
+    pub restore_from: Option<std::path::PathBuf>,
     /// Whether to enable split irqchip
     pub split_irqchip: bool,
     /// Whether to expose ACPI tables (x86_64). When disabled, virtio-mmio devices are
@@ -277,6 +279,7 @@ mod tests {
             pmu_enabled: false,
             hyperv_enabled: false,
             vm_generation_id: None,
+            restore_from: None,
             split_irqchip: false,
             acpi_enabled: false,
             serial_consoles: Vec::new(),

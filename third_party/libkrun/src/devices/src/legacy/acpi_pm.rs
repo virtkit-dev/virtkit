@@ -11,7 +11,8 @@
 //     button driver runs an orderly shutdown.
 //
 // It also serves the ACPI PM timer: a free-running 32-bit counter at 3.579545 MHz, which
-// UEFI firmware and Windows use for their delays and calibration. There is no GPE block.
+// UEFI firmware and Windows use for their delays and calibration. And a GPE0 block, whose only
+// event is the host's: a new VM generation ID after a restore (`raise_gpe`), as QEMU's vmgenid.
 // SCI_EN reads back as 1 (the system is always in ACPI mode: FADT SMI_CMD is 0), so the
 // guest never tries to enable it.
 
@@ -24,7 +25,9 @@ use polly::event_manager::{EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 
-use arch::x86_64::layout::{ACPI_PM_BASE, ACPI_RESET_REG, ACPI_RESET_VALUE};
+use arch::x86_64::layout::{
+    ACPI_GPE0_BLK, ACPI_GPE0_BLK_LEN, ACPI_PM_BASE, ACPI_RESET_REG, ACPI_RESET_VALUE,
+};
 
 use crate::bus::BusDevice;
 
@@ -40,6 +43,10 @@ const PM_TMR: u64 = 0x08; // 4 bytes, read-only
 /// The ACPI PM timer's fixed frequency (ACPI 6.x § 4.8.3.3).
 const PM_TIMER_HZ: u128 = 3_579_545;
 const RESET_REG: u64 = (ACPI_RESET_REG - ACPI_PM_BASE) as u64; // 1 byte
+/// GPE0_STS then GPE0_EN, each half the block; byte-addressable, as GPE registers are.
+const GPE0_STS: u64 = (ACPI_GPE0_BLK - ACPI_PM_BASE) as u64;
+const GPE0_EN: u64 = GPE0_STS + ACPI_GPE0_BLK_LEN as u64 / 2;
+const GPE0_END: u64 = GPE0_STS + ACPI_GPE0_BLK_LEN as u64;
 
 // PM1 status/enable: only the power-button bit is modelled.
 const PWRBTN: u16 = 1 << 8;
@@ -56,6 +63,8 @@ const RESET_VALUE: u8 = ACPI_RESET_VALUE;
 pub struct AcpiPm {
     pm1_sts: u16,
     pm1_en: u16,
+    gpe0_sts: u16,
+    gpe0_en: u16,
     /// The Vmm exit event: written to end the VM (power-off or reset).
     exit_evt: EventFd,
     /// Set (before firing `exit_evt`) when the exit is a reset, so the Vmm reports
@@ -69,7 +78,42 @@ pub struct AcpiPm {
     timer_start: Instant,
 }
 
+/// [`AcpiPm::save_state`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "snapshot", derive(serde::Serialize, serde::Deserialize))]
+pub struct AcpiPmState {
+    pub pm1_sts: u16,
+    pub pm1_en: u16,
+    pub gpe0_sts: u16,
+    pub gpe0_en: u16,
+    pub timer_ns: u64,
+}
+
 impl AcpiPm {
+    /// What a snapshot keeps: the PM1 and GPE0 status and enable registers (the power
+    /// button's and the VM generation ID's enables among them) and how far the PM timer had
+    /// counted (local patch).
+    pub fn save_state(&self) -> AcpiPmState {
+        AcpiPmState {
+            pm1_sts: self.pm1_sts,
+            pm1_en: self.pm1_en,
+            gpe0_sts: self.gpe0_sts,
+            gpe0_en: self.gpe0_en,
+            timer_ns: self.timer_start.elapsed().as_nanos() as u64,
+        }
+    }
+
+    /// Put back what [`AcpiPm::save_state`] returned: the timer carries on from its count.
+    pub fn restore_state(&mut self, state: &AcpiPmState) {
+        self.pm1_sts = state.pm1_sts;
+        self.pm1_en = state.pm1_en;
+        self.gpe0_sts = state.gpe0_sts;
+        self.gpe0_en = state.gpe0_en;
+        self.timer_start = Instant::now()
+            .checked_sub(std::time::Duration::from_nanos(state.timer_ns))
+            .unwrap_or_else(Instant::now);
+    }
+
     pub fn new(
         exit_evt: EventFd,
         reset_flag: Arc<AtomicBool>,
@@ -79,6 +123,8 @@ impl AcpiPm {
         AcpiPm {
             pm1_sts: 0,
             pm1_en: 0,
+            gpe0_sts: 0,
+            gpe0_en: 0,
             exit_evt,
             reset_flag,
             sci_evt,
@@ -93,10 +139,15 @@ impl AcpiPm {
         (self.timer_start.elapsed().as_nanos() * PM_TIMER_HZ / 1_000_000_000) as u32
     }
 
+    /// Latch general-purpose event `gpe` and raise the SCI if the guest enabled it.
+    pub fn raise_gpe(&mut self, gpe: u8) {
+        self.gpe0_sts |= 1 << gpe;
+        self.raise_sci_if_pending();
+    }
+
     fn raise_sci_if_pending(&self) {
-        if self.pm1_sts & self.pm1_en & PWRBTN != 0
-            && let Err(e) = self.sci_evt.write(1)
-        {
+        let pending = self.pm1_sts & self.pm1_en & PWRBTN != 0 || self.gpe0_sts & self.gpe0_en != 0;
+        if pending && let Err(e) = self.sci_evt.write(1) {
             error!("acpi_pm: failed to raise SCI: {e:?}");
         }
     }
@@ -121,6 +172,16 @@ impl BusDevice for AcpiPm {
             }
             return;
         }
+        if (GPE0_STS..GPE0_END).contains(&offset) {
+            let [s0, s1] = self.gpe0_sts.to_le_bytes();
+            let [e0, e1] = self.gpe0_en.to_le_bytes();
+            let block = [s0, s1, e0, e1];
+            let start = (offset - GPE0_STS) as usize;
+            for (i, b) in data.iter_mut().enumerate() {
+                *b = block.get(start + i).copied().unwrap_or(0);
+            }
+            return;
+        }
         let val: u16 = match offset {
             PM1_STS => self.pm1_sts,
             PM1_EN => self.pm1_en,
@@ -140,6 +201,21 @@ impl BusDevice for AcpiPm {
             if data.first().copied() == Some(RESET_VALUE) {
                 self.fire_exit(true);
             }
+            return;
+        }
+
+        if (GPE0_STS..GPE0_END).contains(&offset) {
+            for (i, &b) in data.iter().enumerate() {
+                let at = offset + i as u64;
+                if at < GPE0_EN {
+                    // Status bits are write-1-to-clear.
+                    self.gpe0_sts &= !(u16::from(b) << (8 * (at - GPE0_STS)));
+                } else if at < GPE0_END {
+                    let shift = 8 * (at - GPE0_EN);
+                    self.gpe0_en = (self.gpe0_en & !(0xff << shift)) | (u16::from(b) << shift);
+                }
+            }
+            self.raise_sci_if_pending();
             return;
         }
 
@@ -260,6 +336,81 @@ mod tests {
         let mut buf = [0u8; 2];
         pm.read(0, PM1_CNT, &mut buf);
         assert_eq!(u16::from_le_bytes(buf), SCI_EN);
+    }
+
+    fn gpe0(pm: &mut AcpiPm) -> [u8; 4] {
+        let mut block = [0u8; 4];
+        pm.read(0, GPE0_STS, &mut block);
+        block
+    }
+
+    #[test]
+    fn the_gpe0_block_sits_where_the_fadt_says() {
+        assert_eq!(ACPI_PM_BASE as u64 + GPE0_STS, 0x610);
+        assert_eq!(GPE0_EN - GPE0_STS, 2);
+        assert_eq!(GPE0_END, arch::x86_64::layout::ACPI_PM_LEN);
+    }
+
+    #[test]
+    fn a_gpe_raises_the_sci_once_enabled_and_clears_by_writing_one() {
+        let mut pm = pm();
+        // Latched before the guest enabled it: no SCI until its enable bit is set.
+        pm.raise_gpe(5);
+        assert!(!fired(&pm.sci_evt));
+        assert_eq!(gpe0(&mut pm), [0x20, 0, 0, 0]);
+        // GPE registers are byte-wide: GPE0_EN's first byte.
+        pm.write(0, GPE0_EN, &[0x20]);
+        assert!(fired(&pm.sci_evt));
+        assert_eq!(gpe0(&mut pm), [0x20, 0, 0x20, 0]);
+        // Write-1-to-clear: a zero, or another bit, keeps it.
+        pm.write(0, GPE0_STS, &[0x00]);
+        pm.write(0, GPE0_STS, &[0x01]);
+        pm.write(0, GPE0_STS + 1, &[0x20]);
+        assert_eq!(gpe0(&mut pm), [0x20, 0, 0x20, 0]);
+        // (Those writes raised the still-pending SCI again.)
+        let _ = fired(&pm.sci_evt);
+        pm.write(0, GPE0_STS, &[0x20]);
+        assert_eq!(gpe0(&mut pm), [0, 0, 0x20, 0]);
+        assert!(!fired(&pm.sci_evt));
+        // Enabled, a GPE raises the SCI at once; a GPE in the second byte too.
+        pm.raise_gpe(5);
+        assert!(fired(&pm.sci_evt));
+        pm.write(0, GPE0_EN + 1, &[0x01]);
+        pm.raise_gpe(8);
+        assert!(fired(&pm.sci_evt));
+        assert_eq!(gpe0(&mut pm), [0x20, 0x01, 0x20, 0x01]);
+        // A word access covers both bytes.
+        pm.write(0, GPE0_STS, &0x0120u16.to_le_bytes());
+        assert_eq!(gpe0(&mut pm), [0, 0, 0x20, 0x01]);
+    }
+
+    #[test]
+    fn the_registers_survive_save_and_restore() {
+        let mut live = pm();
+        word(&mut live, PM1_EN, PWRBTN);
+        live.pm1_sts |= PWRBTN;
+        live.write(0, GPE0_EN, &[0x20]);
+        live.raise_gpe(5);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let saved = live.save_state();
+        assert_eq!(
+            (saved.pm1_sts, saved.pm1_en, saved.gpe0_sts, saved.gpe0_en),
+            (PWRBTN, PWRBTN, 0x20, 0x20)
+        );
+        let mut back = pm();
+        back.restore_state(&saved);
+        assert_eq!(gpe0(&mut back), [0x20, 0, 0x20, 0]);
+        let mut buf = [0u8; 2];
+        back.read(0, PM1_EN, &mut buf);
+        assert_eq!(u16::from_le_bytes(buf), PWRBTN);
+        // The timer carries on from its count, not from zero.
+        let ticks_5ms = (PM_TIMER_HZ / 200) as u32;
+        assert!(read_timer(&mut back) >= ticks_5ms);
+        let again = back.save_state();
+        assert_eq!(
+            (again.pm1_sts, again.gpe0_en),
+            (saved.pm1_sts, saved.gpe0_en)
+        );
     }
 
     fn read_timer(pm: &mut AcpiPm) -> u32 {

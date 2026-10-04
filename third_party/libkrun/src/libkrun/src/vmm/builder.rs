@@ -245,6 +245,9 @@ pub enum StartMicrovmError {
     TdShimError(String),
     /// The TEE specified is not supported.
     InvalidTee,
+    /// Cannot bring the VM to the snapshot it starts from (local patch).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+    Restore(String),
 }
 
 /// It's convenient to automatically convert `kernel::cmdline::Error`s
@@ -558,6 +561,8 @@ impl Display for StartMicrovmError {
             InvalidTee => {
                 write!(f, "TEE selected is not currently supported")
             }
+            #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+            Restore(ref err) => write!(f, "Cannot restore {err}"),
         }
     }
 }
@@ -1348,6 +1353,15 @@ pub fn build_microvm(
         vm_ctl_rx,
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         paused: false,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+        legacy_devices: Some(crate::vmm::snapshot::LegacyDevices {
+            cmos: pio_device_manager.cmos.clone(),
+            serials: pio_device_manager.stdio_serial.clone(),
+            i8042: pio_device_manager.i8042.clone(),
+            acpi_pm: pio_device_manager.acpi_pm.clone(),
+        }),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+        vm_generation_id: vm_resources.vm_generation_id,
         #[cfg(target_os = "macos")]
         paused_at: 0,
     };
@@ -1469,6 +1483,18 @@ pub fn build_microvm(
         println!("Starting TEE/microVM.");
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+    if let Some(dir) = &vm_resources.restore_from {
+        vmm.start_vcpus_paused(vcpus)
+            .map_err(StartMicrovmError::Internal)?;
+        vmm.restore(dir).map_err(|e| {
+            StartMicrovmError::Restore(format!("the snapshot in {}: {e}", dir.display()))
+        })?;
+    } else {
+        vmm.start_vcpus(vcpus)
+            .map_err(StartMicrovmError::Internal)?;
+    }
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot")))]
     vmm.start_vcpus(vcpus)
         .map_err(StartMicrovmError::Internal)?;
 

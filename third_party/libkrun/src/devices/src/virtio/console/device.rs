@@ -163,7 +163,7 @@ impl Console {
 
     pub(crate) fn process_control_tx(&mut self) -> bool {
         log::trace!("process_control_tx");
-        let DeviceState::Activated(ref mem, ref interrupt) = self.device_state else {
+        let DeviceState::Activated(ref mem, _) = self.device_state else {
             unreachable!()
         };
 
@@ -255,7 +255,18 @@ impl Console {
             }
         }
 
-        for port_id in ports_to_start {
+        self.start_ports(&ports_to_start);
+
+        raise_irq
+    }
+
+    /// Start the I/O of `port_ids`: their queues move to the ports' threads.
+    fn start_ports(&mut self, port_ids: &[usize]) {
+        let DeviceState::Activated(ref mem, ref interrupt) = self.device_state else {
+            return;
+        };
+        let (mem, interrupt) = (mem.clone(), interrupt.clone());
+        for &port_id in port_ids {
             log::trace!("Starting port io for port {port_id}");
             let rx_idx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
             let tx_idx = port_id_to_queue_idx(QueueDirection::Tx, port_id);
@@ -286,8 +297,6 @@ impl Console {
                 self.control.clone(),
             );
         }
-
-        raise_irq
     }
 }
 
@@ -362,6 +371,27 @@ impl VirtioDevice for Console {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    /// The ports whose I/O the guest started (their queues are with their threads).
+    fn save_state(&self) -> Vec<u32> {
+        (0..self.ports.len())
+            .filter(|&port_id| {
+                let rx = port_id_to_queue_idx(QueueDirection::Rx, port_id);
+                matches!(self.queues.get(rx), Some(None))
+            })
+            .map(|port_id| port_id as u32)
+            .collect()
+    }
+
+    /// Start the ports the guest had started: it will not open them again.
+    fn restore_state(&mut self, state: &[u32]) {
+        let ports: Vec<usize> = state
+            .iter()
+            .map(|&id| id as usize)
+            .filter(|&id| id < self.ports.len())
+            .collect();
+        self.start_ports(&ports);
     }
 
     fn reset(&mut self) -> bool {

@@ -162,6 +162,7 @@ impl BlockWorker {
         if let Err(e) = self.device_queue.event.read() {
             error!("Failed to get queue event: {e:?}");
         } else {
+            let _writing = crate::virtio::device_writes();
             self.process_virtio_queues();
         }
     }
