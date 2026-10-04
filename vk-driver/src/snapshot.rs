@@ -6,7 +6,8 @@
 //! through the VM's control socket ([`crate::vmmctl`]). Taking one ends the VM: its disk
 //! overlays are linked into the bundle before the snapshot, so its last flush lands in them
 //! too, then unlinked from the run once it has ended, so nothing writes them again. A run from
-//! it gives the guest a new VM generation ID ([`crate::uefi::guest_spec`]).
+//! it gives the guest a new VM generation ID and keeps the snapshot's system UUID
+//! ([`crate::uefi::guest_spec`]).
 //!
 //! The overlays keep their backing files' paths: a snapshot needs the bundle its VM ran (and
 //! any snapshot that one was taken from) to stay where it is, unchanged.
@@ -80,6 +81,10 @@ fn save(
             })?;
             names.push(name);
         }
+        // The guest restored from it keeps its system UUID ([`crate::uefi::guest_spec`]).
+        let uuid = control.with_file_name(crate::uefi::SYSTEM_UUID);
+        std::fs::copy(&uuid, out.join(crate::uefi::SYSTEM_UUID))
+            .with_context(|| format!("copying {} into the snapshot", uuid.display()))?;
         crate::vmmctl::snapshot(control, &out)?;
         let machine = machine(&out)?;
         let manifest = serde_json::json!({
@@ -321,6 +326,7 @@ mod tests {
             std::fs::create_dir_all(&work).unwrap();
             std::fs::write(work.join("disk0.qcow2"), "0").unwrap();
             std::fs::write(work.join("disk1.qcow2"), "1").unwrap();
+            std::fs::write(work.join(crate::uefi::SYSTEM_UUID), [7u8; 16]).unwrap();
             let control = work.join(crate::uefi::CONTROL_SOCKET);
             let asked = Arc::new(Mutex::new(Vec::new()));
             let fake = Fake {
@@ -371,6 +377,10 @@ mod tests {
         assert_eq!(run.asked(), ["snapshot", "quit"]);
         assert!(!run.has_disks());
         assert_eq!(std::fs::read(out.join("disk1.qcow2")).unwrap(), b"1");
+        assert_eq!(
+            std::fs::read(out.join(crate::uefi::SYSTEM_UUID)).unwrap(),
+            [7u8; 16]
+        );
         assert!(!out.join("vm.tmp").exists());
         let bundle = crate::uefi::Bundle::open(&out).unwrap();
         assert_eq!(bundle.manifest.cpus, Some(2));

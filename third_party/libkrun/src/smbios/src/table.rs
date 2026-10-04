@@ -164,6 +164,17 @@ impl SystemInfo {
             ..Default::default()
         }
     }
+
+    /// This system with the UUID `uuid`, given in RFC 4122 byte order, which SMBIOS 2.6 and later
+    /// encode with its first three fields little-endian (local patch).
+    pub fn with_uuid(mut self, uuid: &[u8; 16]) -> Self {
+        let mut encoded = *uuid;
+        encoded[0..4].reverse();
+        encoded[4..6].reverse();
+        encoded[6..8].reverse();
+        self.uuid = encoded;
+        self
+    }
 }
 
 // OEM Strings (Type 11)

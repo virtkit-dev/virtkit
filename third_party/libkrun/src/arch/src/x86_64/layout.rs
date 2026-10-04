@@ -84,6 +84,11 @@ pub const RSDP_ADDR: u64 = 0x000e_0000;
 /// The pvpanic device's I/O port, QEMU's (local patch).
 pub const PVPANIC_PORT: u16 = 0x505;
 
+/// The SMBIOS 3.0 entry point and tables of the Windows platform, where edk2's CloudHv
+/// firmware looks for them (its SmbiosPlatformDxe reads them from this address, as
+/// cloud-hypervisor writes them) and installs them for the OS (local patch).
+pub const SMBIOS_START: u64 = 0x000f_0000;
+
 /// The 16-byte VM generation ID the DSDT's VGEN device points at: the last page of the
 /// reserved window below 1 MiB, past the ACPI tables (local patch).
 pub const VMGENID_ADDR: u64 = 0x000f_f000;

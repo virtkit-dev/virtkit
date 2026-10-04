@@ -42,6 +42,8 @@ pub(crate) const CONTROL_SOCKET: &str = "vmm.sock";
 
 /// The run directory's VM generation ID, beside the disk overlays it belongs to.
 pub(crate) const GENERATION_ID: &str = "vmgenid";
+/// The SMBIOS system UUID of a run directory's disks, kept as the generation ID is.
+pub(crate) const SYSTEM_UUID: &str = "system-uuid";
 
 /// How long a guest has to answer the ACPI power button before vk asks its qemu-ga to shut it
 /// down instead (a Windows guest can be set to ignore the button).
@@ -277,25 +279,60 @@ fn refuse_unsupported(args: &RunArgs) -> Result<()> {
 /// an unreadable or malformed ID is an error, since a silently changed ID makes a
 /// Windows domain controller reset its invocation ID and RID pool.
 fn generation_id(work: &Path) -> Result<[u8; 16]> {
-    let path = work.join(GENERATION_ID);
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            return <[u8; 16]>::try_from(bytes.as_slice())
-                .map_err(|_| anyhow::anyhow!("{}: {} bytes, not 16", path.display(), bytes.len()));
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    read_or_create(&work.join(GENERATION_ID), random_id)
+}
+
+/// The SMBIOS system UUID of the disks in `work`, a random UUID kept as the generation ID is.
+fn system_uuid(work: &Path) -> Result<[u8; 16]> {
+    read_or_create(&work.join(SYSTEM_UUID), random_uuid_v4)
+}
+
+/// The system UUID in `snapshot`, kept by the restored guest and saved in `work` so later
+/// snapshots keep it too.
+fn restored_uuid(snapshot: &Path, work: &Path) -> Result<[u8; 16]> {
+    let path = snapshot.join(SYSTEM_UUID);
+    let uuid = read_id(&path)?.with_context(|| {
+        format!(
+            "{} is missing: the snapshot predates system UUIDs; take it again",
+            path.display()
+        )
+    })?;
+    write_id(&work.join(SYSTEM_UUID), &uuid)?;
+    Ok(uuid)
+}
+
+/// The 16 bytes in `path`, or `fresh()` written there if it is missing. Only a missing file is
+/// created: an unreadable or malformed one is an error.
+fn read_or_create(path: &Path, fresh: impl FnOnce() -> Result<[u8; 16]>) -> Result<[u8; 16]> {
+    if let Some(id) = read_id(path)? {
+        return Ok(id);
     }
-    let id = new_generation_id()?;
-    // Whole or not at all: a torn file would be replaced, changing the ID.
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, id).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    let id = fresh()?;
+    write_id(path, &id)?;
     Ok(id)
 }
 
-/// A random VM generation ID.
-fn new_generation_id() -> Result<[u8; 16]> {
+/// The 16 bytes in `path`; None if it is missing. An unreadable or malformed file is an error.
+fn read_id(path: &Path) -> Result<Option<[u8; 16]>> {
+    match std::fs::read(path) {
+        Ok(bytes) => <[u8; 16]>::try_from(bytes.as_slice())
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("{}: {} bytes, not 16", path.display(), bytes.len())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// Write `id` to `path` through a temporary file and a rename, so a crash never leaves a torn
+/// ID, which would fail every later boot.
+fn write_id(path: &Path, id: &[u8; 16]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, id).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))
+}
+
+/// 16 random bytes.
+fn random_id() -> Result<[u8; 16]> {
     use std::io::Read;
 
     let mut id = [0u8; 16];
@@ -305,12 +342,20 @@ fn new_generation_id() -> Result<[u8; 16]> {
     Ok(id)
 }
 
+/// A random (version 4) UUID, in RFC 4122 byte order.
+fn random_uuid_v4() -> Result<[u8; 16]> {
+    let mut uuid = random_id()?;
+    uuid[6] = uuid[6] & 0x0f | 0x40;
+    uuid[8] = uuid[8] & 0x3f | 0x80;
+    Ok(uuid)
+}
+
 /// The spec of a UEFI guest named `name` booting `firmware` on `disks`, its console log, qemu-ga
 /// and COM1 input sockets and VM generation ID in `work`; no network. With `restore`, the guest
 /// starts from the snapshot in that directory instead of booting, under a new VM generation ID
 /// that `work` does not keep: it is a copy of the snapshotted guest, which it must not pass
 /// for (a domain controller then resets its invocation ID and RID pool), and libkrun refuses
-/// to restore a guest that had one without a new one.
+/// to restore a guest that had one without a new one. It keeps the snapshot's system UUID.
 pub(crate) fn guest_spec(
     firmware: &Path,
     work: &Path,
@@ -320,9 +365,9 @@ pub(crate) fn guest_spec(
     mem: &str,
     restore: Option<&Path>,
 ) -> Result<VmSpec> {
-    let vm_generation_id = match restore {
-        Some(_) => new_generation_id()?,
-        None => generation_id(work)?,
+    let (vm_generation_id, system_uuid) = match restore {
+        Some(snapshot) => (random_id()?, restored_uuid(snapshot, work)?),
+        None => (generation_id(work)?, system_uuid(work)?),
     };
     Ok(VmSpec {
         kernel: firmware.to_path_buf(),
@@ -349,6 +394,7 @@ pub(crate) fn guest_spec(
         guest_agent: Some(work.join(GUEST_AGENT_SOCKET)),
         hyperv: true,
         vm_generation_id: Some(vm_generation_id),
+        system_uuid: Some(system_uuid),
         serial_input: Some(work.join(CONSOLE_SOCKET)),
         control: Some(work.join(CONTROL_SOCKET)),
         restore_from: restore.map(Path::to_path_buf),
@@ -948,6 +994,31 @@ mod tests {
         let err = generation_id(work.path()).unwrap_err();
         assert!(err.to_string().contains("15 bytes"), "{err:#}");
         assert_eq!(std::fs::read(&path).unwrap(), [0u8; 15]);
+    }
+
+    #[test]
+    fn the_system_uuid_is_a_version_4_uuid_made_once_per_run_directory() {
+        let a = Scratch::new("uuid-a");
+        let uuid = system_uuid(a.path()).unwrap();
+        assert_eq!(system_uuid(a.path()).unwrap(), uuid);
+        assert_ne!(uuid, generation_id(a.path()).unwrap());
+        assert_eq!(uuid[6] >> 4, 4);
+        assert_eq!(uuid[8] >> 6, 0b10);
+    }
+
+    #[test]
+    fn a_restore_keeps_the_snapshots_system_uuid_in_its_run_directory() {
+        let snapshot = Scratch::new("uuid-snap");
+        let work = Scratch::new("uuid-work");
+        let err = restored_uuid(snapshot.path(), work.path()).unwrap_err();
+        assert!(err.to_string().contains("predates system UUIDs"), "{err:#}");
+        std::fs::write(snapshot.path().join(SYSTEM_UUID), [7u8; 16]).unwrap();
+        system_uuid(work.path()).unwrap();
+        assert_eq!(
+            restored_uuid(snapshot.path(), work.path()).unwrap(),
+            [7u8; 16]
+        );
+        assert_eq!(system_uuid(work.path()).unwrap(), [7u8; 16]);
     }
 
     #[test]

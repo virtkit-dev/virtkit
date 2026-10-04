@@ -26,7 +26,7 @@ use zerocopy::{Immutable, IntoBytes};
 use crate::x86_64::layout::{
     ACPI_GPE0_BLK, ACPI_GPE0_BLK_LEN, ACPI_PM_BASE, ACPI_RESET_REG, ACPI_RESET_VALUE,
     PCI_MMIO32_LOW_END, PCI_MMIO32_LOW_START, PVPANIC_PORT, RSDP_ADDR, SCI_GSI, SHM_MEM_SIZE,
-    SHM_MEM_START, VMGENID_ADDR, VMGENID_GPE,
+    SHM_MEM_START, SMBIOS_START, VMGENID_ADDR, VMGENID_GPE,
 };
 
 /// Standard local APIC physical base address.
@@ -393,7 +393,7 @@ fn build_mcfg(pci_host: &PciHostInfo) -> Vec<u8> {
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Error {
-    /// The reserved ACPI window (RSDP_ADDR..VMGENID_ADDR) is too small to
+    /// The reserved ACPI window (RSDP_ADDR..SMBIOS_START) is too small to
     /// hold the generated tables.
     NotEnoughMemory,
     /// Failed to write a table into guest memory.
@@ -469,8 +469,8 @@ pub fn setup_acpi(
     let rsdp = build_rsdp(xsdt_addr);
 
     let total_size = mcfg_addr + mcfg.as_ref().map_or(0, |table| table.len() as u64) - rsdp_addr;
-    // The tables end before the VM generation ID's page.
-    if rsdp_addr + total_size > VMGENID_ADDR
+    // The tables end before the SMBIOS tables, and so before the VM generation ID's page.
+    if rsdp_addr + total_size > SMBIOS_START
         || !mem.check_range(
             GuestAddress(rsdp_addr),
             total_size as usize,

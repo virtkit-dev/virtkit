@@ -640,3 +640,17 @@ refuses a VM with any other virtio device (vsock, virtio-fs, GPU, input, vhost-u
 threads write guest memory ungated) or with virtio-mmio devices, which it does not save.
 Checked by snapshotting a Windows guest while it downloads and writes files: after the
 restore every file matches its logged hash and the guest carries on.
+
+`src/arch/{Cargo.toml,src/x86_64/{mod.rs,layout.rs,acpi.rs}}` + `src/smbios/src/{lib.rs,table.rs}` +
+`src/libkrun/src/{api/vmm_builder.rs,vmm/{builder,mod,resources}.rs}` — the Windows platform
+gets SMBIOS 3.0 tables (BIOS and system information, OEM strings, from the `smbios` crate the
+aarch64 side already uses) at `SMBIOS_START` (0xF0000), where edk2's CloudHv firmware's
+SmbiosPlatformDxe looks for them, as cloud-hypervisor writes them; the ACPI tables now end below
+that address. Windows reports a vendor and model (`Libkrun`, `libkrun Virtual Machine`) and
+`SMBIOSPresent` instead of finding no SMBIOS at all; `VmmBuilder::add_smbios_oem_string` reaches
+it too. `krun-smbios` becomes an unconditional dependency of `krun-arch` (it was non-Windows
+only), and `smbios::Error` derives `PartialEq` for the arch error type.
+`VmmBuilder::system_uuid` gives the system information a UUID (RFC 4122 byte order in, SMBIOS's
+little-endian first three fields out: `smbios::setup_smbios_with_uuid`,
+`SystemInfo::with_uuid`), nil otherwise; Windows reports it as
+`Win32_ComputerSystemProduct.UUID`. Covered by a configuration test.

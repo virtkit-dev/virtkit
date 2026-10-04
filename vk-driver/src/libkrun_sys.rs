@@ -345,6 +345,10 @@ fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>) -> Result<()> {
         Some(dir) => builder.restore_from(dir.clone()),
         None => builder,
     };
+    let builder = match spec.system_uuid {
+        Some(uuid) => builder.system_uuid(uuid),
+        None => builder,
+    };
     let vmm = devices
         .attach(builder)
         .build()
