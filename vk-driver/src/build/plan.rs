@@ -118,6 +118,12 @@ impl Plan {
             let mut file_args: Vars = Vars::new();
             let mut file_has_stage = false;
             for instr in &input.dockerfile.instructions {
+                if let Some((kw, name)) = unsupported_flag(instr) {
+                    bail!(
+                        "{}: {kw} --{name} is not supported for Linux builds",
+                        input.origin.display()
+                    );
+                }
                 match instr {
                     Instruction::From(f) => {
                         // expand ${ARG} in the image ref against this file's global args.
@@ -449,6 +455,18 @@ impl Plan {
     }
 }
 
+/// The first flag of `instr` that a Linux build does not honour, as (keyword, flag name):
+/// one the parser keeps unmodelled for a Windows build (`FROM --edition`, `RUN --reboot`).
+/// Docker rejects them too, so refusing beats building something else silently.
+fn unsupported_flag(instr: &Instruction) -> Option<(&'static str, &str)> {
+    let (kw, flags) = match instr {
+        Instruction::From(f) => ("FROM", &f.extra_flags),
+        Instruction::Run(r) => ("RUN", &r.extra_flags),
+        _ => return None,
+    };
+    flags.first().map(|(name, _)| (kw, name.as_str()))
+}
+
 /// Whether `path` (a `--from` source, so relative to the source stage's root) lands under
 /// the ephemeral `/tmp` disk — after stripping a leading `/` or `./`.
 fn is_ephemeral_tmp(path: &str) -> bool {
@@ -486,6 +504,34 @@ mod tests {
 
     fn plan(src: &str) -> Plan {
         plan_args(src, &Vars::new()).unwrap()
+    }
+
+    #[test]
+    fn a_linux_build_refuses_the_flags_it_does_not_honour() {
+        for (src, want) in [
+            (
+                "FROM --tpm=on base\n",
+                "FROM --tpm is not supported for Linux builds",
+            ),
+            (
+                "FROM base --edition=x AS b\n",
+                "FROM --edition is not supported",
+            ),
+            (
+                "FROM base\nRUN --reboot=never x\n",
+                "RUN --reboot is not supported",
+            ),
+            (
+                "FROM base\nRUN --timeout=30m x\n",
+                "RUN --timeout is not supported",
+            ),
+        ] {
+            let err = plan_args(src, &Vars::new()).unwrap_err().to_string();
+            assert!(err.contains(want), "{src:?}: {err}");
+        }
+        plan(
+            "FROM --platform=linux/amd64 base --kernel=image\nRUN --network=none --security=insecure x\n",
+        );
     }
 
     #[test]

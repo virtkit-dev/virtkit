@@ -5821,6 +5821,7 @@ mod tests {
                 mounts: vec![],
                 network: None,
                 security: None,
+                extra_flags: Vec::new(),
             })
         };
         // an explicit, deliberate string (not the Debug repr)
@@ -5842,6 +5843,7 @@ mod tests {
                 mounts: vec![m],
                 network: None,
                 security: None,
+                extra_flags: Vec::new(),
             })
         };
         let scratch = || Mount {
@@ -8275,6 +8277,7 @@ RUN ship
             mounts: vec![],
             network: None,
             security: None,
+            extra_flags: Vec::new(),
         });
         let root = hash_key("FROM scratch");
         let chained = chain_key(&root, &run, None);

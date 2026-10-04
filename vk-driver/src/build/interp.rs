@@ -142,6 +142,7 @@ pub fn expand_instruction(instr: &Instruction, vars: &Vars) -> Instruction {
             mounts: r.mounts.iter().map(|m| expand_mount(m, vars)).collect(),
             network: r.network.clone(),
             security: r.security.clone(),
+            extra_flags: r.extra_flags.clone(),
         }),
         Instruction::Copy(c) => Instruction::Copy(parser::Copy {
             sources: c.sources.iter().map(|s| e(s)).collect(),
@@ -285,6 +286,7 @@ mod tests {
             }],
             network: None,
             security: None,
+            extra_flags: Vec::new(),
         });
         match expand_instruction(&run, &v) {
             Instruction::Run(r) => {
