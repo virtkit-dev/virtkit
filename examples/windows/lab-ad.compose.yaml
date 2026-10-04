@@ -1,0 +1,47 @@
+# Active Directory lab: a corp.lab domain controller and two joined members, all Windows
+# guests on the run's LAN. Build the images first (see lab.Dockerfile), then
+#   vk run --compose lab-ad.compose.yaml
+# A Windows service is up after provisioning. Members wait for the DC's healthcheck
+# (Active Directory answering); the run reports ready once both have joined.
+# secrets/ holds committed example passwords: change them beyond a throwaway lab.
+# join_password is vkjoin's, a Domain Admin.
+secrets:
+  join_password:
+    file: ./secrets/join-password
+  user_password:
+    file: ./secrets/user-password
+
+services:
+  dc:
+    image: ./dc-out
+    environment: &lab
+      LAB_DC: dc
+      LAB_USERS: alice bob
+    secrets: [join_password, user_password]
+    # Healthy once the DC locator finds it (DNS, an LDAP ping, Netlogon): a native tool, so a
+    # check does not wait on PowerShell loading the AD module.
+    healthcheck:
+      test: ["CMD", "nltest", "/dsgetdc:corp.lab"]
+      interval: 5s
+      timeout: 30s
+      retries: 60
+    x-virtkit:
+      mem: 3G
+  member1:
+    image: ./member-out
+    depends_on:
+      dc:
+        condition: service_healthy
+    environment: *lab
+    secrets: [join_password]
+    x-virtkit:
+      mem: 2G
+  member2:
+    image: ./member-out
+    depends_on:
+      dc:
+        condition: service_healthy
+    environment: *lab
+    secrets: [join_password]
+    x-virtkit:
+      mem: 2G

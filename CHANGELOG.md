@@ -36,6 +36,7 @@ All notable changes to virtkit will be documented in this file.
   Windows 10 or 11, or the ISO installs as a server and Setup stops at its TPM check): WinPE
   sets Microsoft's `LabConfig` keys so Setup skips its TPM and Secure Boot checks. Windows now
   sees SMBIOS tables and a system UUID per machine.
+  `examples/windows` builds an Active Directory lab this way (`tests/windows-ad-e2e.sh`).
 - **Windows machines keep their UEFI variables and can have Secure Boot and a TPM 2.0.** The
   firmware's variable store is a flash device backed by `uefi-vars.fd` in the run directory,
   kept with the machine's disks and carried by `vk snapshot`, so boot entries and keys survive a
