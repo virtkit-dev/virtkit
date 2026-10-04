@@ -486,6 +486,7 @@ fn install(
         ],
         cpus,
         mem,
+        Vec::new(),
     )?;
     let started = Instant::now();
     loop {
@@ -542,6 +543,7 @@ fn settle(dir: &Path, disk: &Path, cpus: u32, mem: &str) -> Result<String> {
         vec![Disk::overlay(disk.to_path_buf())],
         cpus,
         mem,
+        Vec::new(),
     )?;
     let mut attempts = 0;
     loop {

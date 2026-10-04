@@ -4932,6 +4932,7 @@ async fn windows_build(cmd: &Cmd) -> ExitCode {
         stage_mem,
         stage_cpus,
         debug,
+        build_net,
         ..
     } = cmd
     else {
@@ -4969,6 +4970,11 @@ async fn windows_build(cmd: &Cmd) -> ExitCode {
             2,
         );
     }
+    // Allow lists are refused above; --build-net controls whether a step may request a network.
+    let no_network = match build::BuildNet::from_flags(build_net, &[], &[]) {
+        Ok(net) => matches!(net, build::BuildNet::None),
+        Err(e) => return fail(&e, 2),
+    };
     let dockerfile = &file[0];
     let Some(out) = out.clone() else {
         return fail(
@@ -4993,6 +4999,7 @@ async fn windows_build(cmd: &Cmd) -> ExitCode {
         out,
         cpus: build::configured_build_cpus().unwrap_or(4),
         mem: build::configured_build_mem().unwrap_or_else(|| "4G".to_string()),
+        no_network,
     };
     match tokio::task::spawn_blocking(move || winbuild::build(&opts)).await {
         Ok(Ok(())) => ExitCode::SUCCESS,

@@ -20,10 +20,12 @@ All notable changes to virtkit will be documented in this file.
   `<SHELL> <text>` as Docker runs it on Windows (`cmd /S /C` by default), exit code 3010 or
   1641 restarts the guest (`--reboot=auto|always|never`), `ENV` also becomes a machine
   variable, `WORKDIR` (created as in Docker) and `SHELL` apply; `USER` (steps run as SYSTEM),
-  `ARG`, `ADD` and `COPY --from` are refused. `--out <dir>` writes a bundle `vk run` boots,
-  with the password in `admin-password`; every image built on the same cached install shares
-  that password. Another Windows Dockerfile can start `FROM` that bundle's directory and
-  reuses its cached layers; this works only on the machine whose build cache made the bundle.
+  `ARG`, `ADD` and `COPY --from` are refused. A step has no network unless its `RUN` says
+  `--network=default` (a domain controller's promotion wants one; `--build-net none` refuses
+  it). `CMD` is recorded in the bundle as the image's provisioning; `ENTRYPOINT` is refused.
+  `--out <dir>` writes a bundle `vk run` boots, with the password in `admin-password`; every
+  image built on the same cached install shares that password. Another Windows Dockerfile can
+  start `FROM` that bundle's directory and reuses its cached layers; this works only on the machine whose build cache made the bundle.
   `# vk: disk=60G` above a `winiso:` stage's `FROM` sizes the install (20G or more; changing
   it installs Windows again), and `# vk: generalize=on` ends the stage with sysprep, so each
   copy boots with its own name and SID (generalizing again an image built from a generalized
