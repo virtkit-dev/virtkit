@@ -9,13 +9,16 @@ name: CI
 # A build job runs after quality — deliberately gated on lint, test and audit, so a
 # push that cannot pass them never spends a build — and uploads the binaries as a
 # GitHub Actions artifact (retention: 1 day). This lets you grab a build from any
-# commit without waiting for a release. The guest kernel is excluded — it compiles
-# a full Linux kernel (tens of minutes) and changes infrequently; use release.yml
-# or build-kernel.sh locally when you need a new vmlinux.
+# commit without waiting for a release. The guest kernel is not built — it compiles
+# a full Linux kernel (tens of minutes) and changes infrequently: vk embeds the
+# latest release's, unless the kernel inputs changed since, when it is built after all.
 #
 # The kernel is built (and embedded into vk) when the workflow is triggered
 # manually (workflow_dispatch), for testing kernel config changes without cutting
 # a release.
+#
+# fleet-e2e then runs the fleet's end-to-end tests (tests/fleet-*.sh) against that
+# build: a hub and its nodes booted as microVMs on the runner's KVM.
 
 on:
   push:
@@ -38,4 +41,37 @@ jobs:
     with:
       artifact-prefix: ci
       build-kernel: ${{ github.event_name == 'workflow_dispatch' }}
+      release-kernel: true
       retention-days: 1
+
+  # The scripts also run before every release, with the rest of tests/ (release.yml).
+  fleet-e2e:
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ci-binaries-${{ github.sha }}
+          path: dist
+
+      - name: Enable KVM for the runner user
+        uses: ./.github/actions/enable-kvm
+
+      # An artifact keeps no permission bits. Every script runs, each capped, and the job
+      # fails if any did.
+      - name: Run the fleet end-to-end tests against the built vk
+        run: |
+          chmod +x dist/vk dist/vk-hub
+          failed=0
+          for t in tests/fleet-*.sh; do
+            echo "::group::$t"
+            start=$SECONDS
+            VK=dist/vk timeout -k 30 900 bash "$t" || { echo "::error::$t failed"; failed=1; }
+            echo "$t: $((SECONDS - start))s"
+            echo "::endgroup::"
+          done
+          exit "$failed"
