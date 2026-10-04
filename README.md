@@ -633,7 +633,7 @@ local store. The central server and storage model are documented in
 | `vk` | Host CLI, VMM, image builder, userspace network, compose runner, and GitLab executor. It embeds the default guest kernel and `vk-agent`. |
 | `vk-agent` | Guest PID 1 and command server. It configures mounts, networking, hostname, shared directories, optional SSH, and host-driven execution over vsock. |
 | `vk-registry` | Optional OCI-distribution server with a pull-through cache, a WebDAV view of the store with a plain-file area for compiler caches, and build-once locking. |
-| `vk-hub` | Experimental hub for a fleet of `vk node` hosts, and a web UI for the VMs on this machine: `vk-hub local` serves it on loopback. |
+| `vk-hub` | Experimental hub for a fleet of `vk node` hosts, and a web UI for the VMs on this machine: `vk-hub local` serves it on loopback. See the [fleet design](docs/fleet-design.md) and [prototype reference](docs/fleet-prototype.md). |
 | `vk-runnerctl` | Optional root-side helper that adjusts GitLab runner concurrency within an administrator-configured range. |
 
 ## Architecture
@@ -789,7 +789,7 @@ vk-hub-proto/    the VM list `vk workloads` prints, and the hub↔node protocol
 third_party/     vendored libkrun and local patches
 .devcontainer/   pinned build image (nixos/nix base + nix/flake.nix and flake.lock toolchain)
 kernel/          pinned guest-kernel configuration and build inputs
-docs/            operational guides
+docs/            operational guides and the fleet design
 examples/        annotated compose file exercising every compose feature
 tests/           end-to-end scripts run against a built vk; release-e2e.sh gates a release
 build.sh         reproducible binary build

@@ -9,7 +9,8 @@
 //! The database stores only its hash. Only this `POST` spends the token; link scanners and
 //! chat previews leave it unused. Sessions have a viewer or operator role and last
 //! [`store::UI_SESSION_TTL`]. Links stand in for a login until people sign in through OIDC,
-//! with the identity layer the hub is to share with `vk-registry`.
+//! with the identity layer the hub is to share with `vk-registry` (`docs/fleet-design.md`,
+//! "Authentication for submitted jobs").
 //!
 //! **State-changing requests** are `POST`s, and each must come from this UI's own pages —
 //! its `Origin` is the UI's own (a fleet hub's `ui_url`), or `Sec-Fetch-Site` says

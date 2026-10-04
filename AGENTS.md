@@ -75,7 +75,8 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with nine crates:
   serves a web UI of the fleet when `ui_addr` is set; `vk-hub local` serves the same UI for
   the VMs of the machine it runs on, read from `vk workloads --watch`. Both sign people in
   with single-use links and keep an audit log. Built like the `vk-registry` server (hyper,
-  rustls on ring); operators reach it through a private unix socket and the web UI.
+  rustls on ring); operators reach it through a private unix socket and the web UI. See
+  `docs/fleet-design.md` and `docs/fleet-prototype.md`.
 - **`vk-runnerctl/`** — the only component that runs as root, and deliberately the smallest:
   it sets gitlab-runner's `concurrent` from a number unprivileged `vk` leaves in a file,
   clamped into a range only root can configure. It takes no arguments and no paths from its

@@ -1,11 +1,11 @@
 //! `vk-hub` — the fleet hub. Nodes running `vk node` enroll with it, hold a session to it,
 //! and report their inventory and heartbeats; operators issue enrollment tokens and list the
-//! fleet.
+//! fleet. See `docs/fleet-design.md` and `docs/fleet-prototype.md`.
 //!
 //! `vk-hub local` serves a web UI for the VMs of the machine it runs on instead, as the user
-//! who owns them, on a loopback name of its own. People
-//! sign in with single-use links the hub prints, or issues over a unix socket only its own
-//! user reaches; what they do is recorded in an audit log.
+//! who owns them, on a loopback name of its own ("Local mode" in the prototype's reference).
+//! People sign in with single-use links the hub prints, or issues over a unix socket only its
+//! own user reaches; what they do is recorded in an audit log.
 //!
 //! Experimental. A web UI on a listener of its own shows the fleet to people signed in with
 //! links the admin socket issues.

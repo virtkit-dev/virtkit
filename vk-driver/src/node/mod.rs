@@ -5,7 +5,7 @@
 //! hub for as long as it runs — inventory at the start and whenever it changes, a heartbeat
 //! every few seconds — and redials with backoff whenever the session is lost, until SIGTERM
 //! or SIGINT closes it (cleanly unless a send to the hub is stuck) or the hub refuses it for
-//! good.
+//! good. See `docs/fleet-prototype.md`, "Hub and node".
 //!
 //! Everything the node keeps is under `<state_dir>/node/`, a `0700` directory: `key.pk8`
 //! (the private key, `0600`), `enrollment.json` (the hub's URL and the node ID it assigned),
