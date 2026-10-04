@@ -60,14 +60,17 @@ dir=$(dirname "$VK")
 base=$(basename "$VK")
 [ -f "$dir/$base.sha256" ] || { echo "release-e2e: no $base.sha256 beside the binary" >&2; exit 1; }
 ( cd "$dir" && sha256sum -c ./*.sha256 )
-# A release's vk embeds the UEFI firmware. This checks the build manifest, not vk's bytes:
-# build-info.txt lists CLOUDHV.fd's sha256 when it was embedded, "firmware: none" otherwise.
+# A release's vk embeds the UEFI firmware and its variable store templates. This checks the
+# build manifest, not vk's bytes: build-info.txt lists each one's sha256 when it was embedded,
+# "firmware: none" otherwise.
 if [ -n "${RELEASE_TAG:-}" ]; then
   [ -f "$dir/build-info.txt" ] || { echo "release-e2e: no build-info.txt beside the binary" >&2; exit 1; }
-  grep -q ' CLOUDHV\.fd$' "$dir/build-info.txt" || {
-    echo "release-e2e: $dir/build-info.txt records no embedded UEFI firmware" >&2
-    exit 1
-  }
+  for fd in CLOUDHV.fd CLOUDHV_VARS.fd CLOUDHV_VARS.ms.fd; do
+    grep -q " ${fd//./\\.}\$" "$dir/build-info.txt" || {
+      echo "release-e2e: $dir/build-info.txt records no embedded $fd" >&2
+      exit 1
+    }
+  done
 fi
 
 # `vk --version` prints `<crate> <version> (<commit>)`. Match the version as a whitespace

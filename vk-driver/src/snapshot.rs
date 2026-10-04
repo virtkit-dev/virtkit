@@ -48,8 +48,17 @@ pub fn snapshot_vm(
     if disks.is_empty() {
         bail!("the VM's disks are not in {}", work.display());
     }
+    let vars = Some(work.join(crate::uefi::UEFI_VARS)).filter(|p| p.is_file());
     create_private_dir(out)?;
-    let result = save(control, &disks, out, machine, ended, if_paused);
+    let result = save(
+        control,
+        &disks,
+        vars.as_deref(),
+        out,
+        machine,
+        ended,
+        if_paused,
+    );
     if result.is_err() {
         let _ = std::fs::remove_dir_all(out);
     }
@@ -60,6 +69,7 @@ pub fn snapshot_vm(
 fn save(
     control: &Path,
     disks: &[PathBuf],
+    vars: Option<&Path>,
     out: &Path,
     machine: impl FnOnce(&Path) -> Result<Machine>,
     ended: impl Fn() -> bool,
@@ -81,6 +91,12 @@ fn save(
             })?;
             names.push(name);
         }
+        // Keep the UEFI variable store with the disks: the snapshot's memory holds what the
+        // guest read from it.
+        if let Some(vars) = vars {
+            std::fs::hard_link(vars, out.join(crate::uefi::UEFI_VARS))
+                .with_context(|| format!("linking {} into the snapshot", vars.display()))?;
+        }
         // The guest restored from it keeps its system UUID ([`crate::uefi::guest_spec`]).
         let uuid = control.with_file_name(crate::uefi::SYSTEM_UUID);
         std::fs::copy(&uuid, out.join(crate::uefi::SYSTEM_UUID))
@@ -92,6 +108,7 @@ fn save(
             "cpus": machine.cpus,
             "mem": machine.mem,
             "disks": names,
+            "uefi_vars": vars.map(|_| crate::uefi::UEFI_VARS),
             "snapshot": crate::uefi::SnapshotInfo { addr: machine.addr },
         });
         std::fs::write(&manifest_tmp, serde_json::to_string_pretty(&manifest)?)
@@ -116,9 +133,9 @@ fn save(
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    for disk in disks {
-        std::fs::remove_file(disk)
-            .with_context(|| format!("unlinking {} from the run", disk.display()))?;
+    for file in disks.iter().map(PathBuf::as_path).chain(vars) {
+        std::fs::remove_file(file)
+            .with_context(|| format!("unlinking {} from the run", file.display()))?;
     }
     // Last: a bundle with its `vm.json` is whole.
     std::fs::rename(&manifest_tmp, &manifest)
@@ -327,6 +344,7 @@ mod tests {
             std::fs::write(work.join("disk0.qcow2"), "0").unwrap();
             std::fs::write(work.join("disk1.qcow2"), "1").unwrap();
             std::fs::write(work.join(crate::uefi::SYSTEM_UUID), [7u8; 16]).unwrap();
+            std::fs::write(work.join(crate::uefi::UEFI_VARS), "vars").unwrap();
             let control = work.join(crate::uefi::CONTROL_SOCKET);
             let asked = Arc::new(Mutex::new(Vec::new()));
             let fake = Fake {
@@ -381,8 +399,17 @@ mod tests {
             std::fs::read(out.join(crate::uefi::SYSTEM_UUID)).unwrap(),
             [7u8; 16]
         );
+        assert_eq!(
+            std::fs::read(out.join(crate::uefi::UEFI_VARS)).unwrap(),
+            b"vars"
+        );
+        assert!(!run.dir.join("run").join(crate::uefi::UEFI_VARS).exists());
         assert!(!out.join("vm.tmp").exists());
         let bundle = crate::uefi::Bundle::open(&out).unwrap();
+        assert_eq!(
+            bundle.manifest.uefi_vars.as_deref(),
+            Some(Path::new(crate::uefi::UEFI_VARS))
+        );
         assert_eq!(bundle.manifest.cpus, Some(2));
         assert_eq!(bundle.manifest.mem.as_deref(), Some("4G"));
         assert_eq!(

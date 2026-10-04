@@ -60,21 +60,7 @@ pub(crate) fn boot(
     gateway: Ipv4Addr,
 ) -> Result<(Child, crate::embed::Resolved)> {
     let bundle = Bundle::open(&svc.ext4)?;
-    let disks = bundle.disks()?;
-    // A new machine every start: drop the last start's overlays, generation ID and UUID.
-    let stale = (0..disks.len())
-        .map(|i| format!("disk{i}.qcow2"))
-        .chain([crate::uefi::GENERATION_ID, crate::uefi::SYSTEM_UUID].map(String::from));
-    for name in stale {
-        let path = dir.join(name);
-        match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(e).with_context(|| format!("removing {}", path.display()));
-            }
-            _ => {}
-        }
-    }
-    let disks = crate::uefi::overlays(&disks, dir)?;
+    let disks = new_machine(dir, &bundle)?;
     let cpus = svc.cpus.or(bundle.manifest.cpus).unwrap_or(DEFAULT_CPUS);
     let mem = svc
         .mem
@@ -107,6 +93,13 @@ pub(crate) fn boot(
     let vmm = crate::vmm::selected();
     let child = crate::run::spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal)?;
     Ok((child, firmware))
+}
+
+/// Start a new machine every start: remove the previous overlays, generation ID, UUID and
+/// UEFI variables from `dir`, then recreate the overlays and variable store from `bundle`.
+fn new_machine(dir: &Path, bundle: &Bundle) -> Result<Vec<crate::vmm::Disk>> {
+    crate::uefi::remove_files(dir, [crate::uefi::GENERATION_ID, crate::uefi::SYSTEM_UUID])?;
+    crate::uefi::machine_files(dir, bundle, true)
 }
 
 /// What one start's provisioning runs, gathered so it can run without the units lock.
@@ -513,5 +506,36 @@ mod tests {
             assert!(result.is_err(), "{failing}");
             assert!(opened.is_empty(), "{failing}");
         }
+    }
+
+    #[test]
+    fn a_new_start_drops_the_last_machines_variable_store_and_ids() {
+        let base = std::env::temp_dir().join(format!(
+            "vk-winsvc-new-{}",
+            crate::scratch::random_nonce().unwrap()
+        ));
+        let (img, dir) = (base.join("img"), base.join("run"));
+        std::fs::create_dir_all(&img).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            img.join(crate::uefi::MANIFEST),
+            r#"{"firmware": "uefi", "disks": ["d"]}"#,
+        )
+        .unwrap();
+        std::fs::write(img.join("d"), vec![0u8; 1 << 20]).unwrap();
+        for kept in [
+            crate::uefi::UEFI_VARS,
+            crate::uefi::GENERATION_ID,
+            crate::uefi::SYSTEM_UUID,
+        ] {
+            std::fs::write(dir.join(kept), "last start's").unwrap();
+        }
+        let disks = new_machine(&dir, &Bundle::open(&img).unwrap()).unwrap();
+        assert_eq!(disks.len(), 1);
+        // The bundle has no store of its own: the boot makes one from the empty template.
+        assert!(!dir.join(crate::uefi::UEFI_VARS).exists());
+        assert!(!dir.join(crate::uefi::GENERATION_ID).exists());
+        assert!(!dir.join(crate::uefi::SYSTEM_UUID).exists());
+        let _ = std::fs::remove_dir_all(base);
     }
 }

@@ -127,6 +127,8 @@ pub enum StartMicrovmError {
     FirmwareInvalidAddress(vm_memory::GuestMemoryError),
     /// Cannot read firmware contents from file.
     FirmwareRead(io::Error),
+    /// Cannot set up the UEFI variable store flash from its file (local patch).
+    UefiVars(io::Error),
     /// Memory regions are overlapping or mmap fails.
     GuestMemoryMmap(String),
     /// The BZIP2 decoder couldn't decompress the kernel.
@@ -293,6 +295,9 @@ impl Display for StartMicrovmError {
             }
             FirmwareRead(ref err) => {
                 write!(f, "Cannot read firmware contents from file: {err}")
+            }
+            UefiVars(ref err) => {
+                write!(f, "Cannot set up the UEFI variable store flash: {err}")
             }
             GuestMemoryMmap(ref err) => {
                 // Remove imbricated quotes from error message.
@@ -1141,6 +1146,11 @@ pub fn build_microvm(
         Arc::new(VcpuList::new(cpu_count as u64))
     };
 
+    // Held for the snapshot's legacy devices; the MMIO bus keeps the device itself.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg_attr(not(feature = "snapshot"), allow(unused_variables))]
+    let uefi_vars_flash =
+        attach_uefi_vars_flash(vm_resources.uefi_vars.as_deref(), &mut mmio_device_manager)?;
     let vcpus;
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
@@ -1359,6 +1369,7 @@ pub fn build_microvm(
             serials: pio_device_manager.stdio_serial.clone(),
             i8042: pio_device_manager.i8042.clone(),
             acpi_pm: pio_device_manager.acpi_pm.clone(),
+            flash: uefi_vars_flash,
         }),
         #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
         vm_generation_id: vm_resources.vm_generation_id,
@@ -2244,6 +2255,36 @@ pub fn setup_serial_device(
         warn!("Could not add serial input event to epoll: {e:?}");
     }
     Ok(serial)
+}
+
+/// The UEFI variable store flash over `path`, on the MMIO bus where the firmware looks for it
+/// (local patch, see VENDOR.md); none without a file.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn attach_uefi_vars_flash(
+    path: Option<&std::path::Path>,
+    mmio_device_manager: &mut MMIODeviceManager,
+) -> std::result::Result<Option<Arc<Mutex<devices::legacy::Flash>>>, StartMicrovmError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(StartMicrovmError::UefiVars)?;
+    let flash = devices::legacy::Flash::new(file, arch::x86_64::layout::UEFI_VARS_FLASH_BLOCK)
+        .map_err(StartMicrovmError::UefiVars)?;
+    let len = flash.len();
+    let flash = Arc::new(Mutex::new(flash));
+    mmio_device_manager
+        .bus
+        .insert(
+            flash.clone(),
+            arch::x86_64::layout::UEFI_VARS_FLASH_START,
+            len,
+        )
+        .map_err(|e| StartMicrovmError::UefiVars(io::Error::other(format!("{e:?}"))))?;
+    Ok(Some(flash))
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

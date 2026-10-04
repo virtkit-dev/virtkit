@@ -90,6 +90,8 @@ pub use self::serial::SerialState;
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub use self::x86_64::flash::{Flash, FlashMode, FlashState};
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use self::x86_64::pvpanic::PvPanic;
 
 // Cannot use multiple types as bounds for a trait object, so we define our own trait

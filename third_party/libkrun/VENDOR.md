@@ -648,3 +648,17 @@ only), and `smbios::Error` derives `PartialEq` for the arch error type.
 little-endian first three fields out: `smbios::setup_smbios_with_uuid`,
 `SystemInfo::with_uuid`), nil otherwise; Windows reports it as
 `Win32_ComputerSystemProduct.UUID`. Covered by a configuration test.
+
+`src/devices/src/legacy/x86_64/flash.rs` + `src/libkrun/src/vmm/{builder.rs,resources.rs,
+snapshot.rs}` + `src/libkrun/src/api/vmm_builder.rs` + `src/arch/src/x86_64/layout.rs` — a UEFI
+variable store flash: `VmmBuilder::uefi_vars(path)` maps a CFI flash device over the file at
+`UEFI_VARS_FLASH_START` (0xFFC00000, below the TSS KVM keeps under 4 GiB), where vk's CloudHv
+firmware build looks for its variable store. The device implements the part of Intel's command
+set edk2's QEMU flash driver uses (byte program, block erase, read/clear status, read array) and
+answers its probe as a writable flash; programs and erases go straight to the file, synced when
+the firmware ends them with the read array command, so the firmware's UEFI variables persist
+across boots. Every access traps: the variable driver reads the store once and works from its
+cache. A snapshot keeps the device's mode and status in its `state.json`, and a restore refuses a
+VM that has no flash where the snapshot had one, or the reverse; its contents are the file's,
+which the embedder keeps with the snapshot like the disks. Covered by tests replaying edk2's
+probe and its program and erase sequences.
