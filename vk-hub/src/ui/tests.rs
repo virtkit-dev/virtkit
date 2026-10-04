@@ -1034,7 +1034,7 @@ fn stub_vk(tag: &str, body: &str) -> std::path::PathBuf {
 /// The ID `vk workloads` derives from a state dir.
 fn id_of(dir: &str) -> String {
     use sha2::{Digest, Sha256};
-    crate::hex::to_hex(&Sha256::digest(dir.as_bytes())[..8])
+    vk_hub_proto::to_hex(&Sha256::digest(dir.as_bytes())[..8])
 }
 
 /// A VM's page shows its console's tail, atop's account of it when it records one, and its

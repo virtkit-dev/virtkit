@@ -474,7 +474,7 @@ fn append_audit(txn: &redb::WriteTransaction, actor: &str, event: &str, now: u64
 
 /// A secret's key in its table.
 pub(crate) fn token_key(token: &str) -> String {
-    crate::hex::to_hex(&Sha256::digest(token.as_bytes()))
+    vk_hub_proto::to_hex(&Sha256::digest(token.as_bytes()))
 }
 
 fn encode<T: Serialize>(row: &T) -> Result<Vec<u8>> {

@@ -350,7 +350,7 @@ async fn get(path: &str, query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Re
 fn well_formed_login(token: &str) -> bool {
     token
         .strip_prefix(store::LOGIN_PREFIX)
-        .is_some_and(|hex| hex.len() == 64 && crate::hex::from_hex(hex).is_some())
+        .is_some_and(|hex| hex.len() == 64 && vk_hub_proto::from_hex(hex).is_some())
 }
 
 /// `GET /login?t=<token>`: a button that posts the token back. Nothing is spent here, so
@@ -439,7 +439,7 @@ pub struct Auth {
 /// The session the request's cookie names if it is live, or why there is none.
 async fn authenticate(headers: &HeaderMap, ui: &Ui) -> Result<Result<Auth, &'static str>> {
     let secret = match session_cookie(headers) {
-        Ok(Some(s)) if s.len() == 64 && crate::hex::from_hex(s).is_some() => s.to_string(),
+        Ok(Some(s)) if s.len() == 64 && vk_hub_proto::from_hex(s).is_some() => s.to_string(),
         Ok(_) => return Ok(Err(SIGNED_OUT)),
         Err(()) => return Ok(Err(CONFLICTING_COOKIES)),
     };
@@ -562,7 +562,7 @@ fn csrf_token(secret: &str) -> String {
     let mut h = Sha256::new();
     h.update(b"vk-hub ui csrf\0");
     h.update(secret.as_bytes());
-    crate::hex::to_hex(&h.finalize())
+    vk_hub_proto::to_hex(&h.finalize())
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

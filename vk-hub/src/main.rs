@@ -12,7 +12,6 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 
 mod admin;
-mod hex;
 mod local;
 mod server;
 mod store;
@@ -294,7 +293,7 @@ pub(crate) fn random_bytes(n: usize) -> Result<Vec<u8>> {
 
 /// `n` random bytes as hex: tokens, session secrets.
 pub(crate) fn random_hex(n: usize) -> Result<String> {
-    Ok(crate::hex::to_hex(&random_bytes(n)?))
+    Ok(vk_hub_proto::to_hex(&random_bytes(n)?))
 }
 
 /// Warn when `path` has any of the `forbidden` mode bits. Advisory: the caller carries on.

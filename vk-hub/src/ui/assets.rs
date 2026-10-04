@@ -43,7 +43,7 @@ static SERVED: LazyLock<Vec<(String, String, &'static Asset)>> = LazyLock::new(|
     FILES
         .iter()
         .map(|asset| {
-            let hash = crate::hex::to_hex(&Sha256::digest(asset.bytes));
+            let hash = vk_hub_proto::to_hex(&Sha256::digest(asset.bytes));
             let hash = hash.get(..16).unwrap_or(&hash).to_string();
             (
                 format!("/assets/{hash}/{}", asset.name),
