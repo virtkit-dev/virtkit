@@ -1,0 +1,26 @@
+# A real Remote Desktop session into a standalone Windows Server: rdp-server, no domain, with a
+# local account; a Linux client that signs in over RDP with FreeRDP, keeps the session open and
+# captures the remote desktop (rdp-session.sh). Build the server first (rdp.Dockerfile), then
+#   vk run --compose rdp-session.compose.yaml
+# tests/windows-rdp-e2e.sh checks from the server's side that the session is there.
+secrets:
+  user_password:
+    file: ./secrets/user-password
+
+services:
+  rdp-server:
+    image: ./rdp-server-out
+    secrets: [user_password]
+    x-virtkit:
+      mem: 2G
+  rdp-client:
+    build:
+      context: .
+      dockerfile: rdp-session.Dockerfile
+    depends_on: [rdp-server]
+    environment:
+      RDP_SERVER: rdp-server
+      RDP_USER: rdpuser
+    secrets: [user_password]
+    volumes:
+      - ./rdp-out:/out

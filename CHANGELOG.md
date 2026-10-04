@@ -36,7 +36,9 @@ All notable changes to virtkit will be documented in this file.
   Windows 10 or 11, or the ISO installs as a server and Setup stops at its TPM check): WinPE
   sets Microsoft's `LabConfig` keys so Setup skips its TPM and Secure Boot checks. Windows now
   sees SMBIOS tables and a system UUID per machine.
-  `examples/windows` builds an Active Directory lab this way (`tests/windows-ad-e2e.sh`).
+  `examples/windows` builds labs this way: an Active Directory lab (`tests/windows-ad-e2e.sh`),
+  an IIS server with a Linux client, two forests with a trust, a red forest administering a
+  production one, and an RDP session to a standalone server (`tests/windows-rdp-e2e.sh`).
 - **Windows machines keep their UEFI variables and can have Secure Boot and a TPM 2.0.** The
   firmware's variable store is a flash device backed by `uefi-vars.fd` in the run directory,
   kept with the machine's disks and carried by `vk snapshot`, so boot entries and keys survive a
@@ -51,6 +53,8 @@ All notable changes to virtkit will be documented in this file.
   `# vk: tpm=on`, or `"tpm": true`, gives each machine a TPM 2.0 of its own: libtpms runs inside
   `vk` (no swtpm on the host), its state in `tpm-state` beside the disks, carried by snapshots;
   BitLocker and Windows 11's checks see a ready, owned TPM. Build steps run without one.
+  `examples/windows/win11.Dockerfile` makes a member (with a TPM and Secure Boot) that joins the
+  lab's domain.
 - **`vk snapshot` saves a running Windows VM, and `vk run` starts it again from there.**
   `vk snapshot <pid> --out <dir>` writes a bundle holding the VM's memory (a sparse image),
   its CPU and device state and its disks as they were, and ends the VM; `vk run <dir>` (with
@@ -65,8 +69,8 @@ All notable changes to virtkit will be documented in this file.
   works the same way: `vk snapshot --run-dir <state dir> --out <dir>` pauses every Windows
   service of the run, then saves each into `<dir>/<service>`, and `vk run --compose …
   --from-snapshot <dir>` resumes each from there, skipping its provisioning (the lab's
-  Linux services boot as usual): the AD lab of `examples/windows` (a DC and two joined
-  members) is back in 15 s, Kerberos working.
+  Linux services boot as usual): the AD lab of `examples/windows` (a DC, two joined
+  members and two Linux jobs) is back in 8 s, Kerberos working.
 - **`vk pause` and `vk resume`.** A running UEFI guest (a `vk run` of a bundle) can be frozen
   in place and run again: its vCPUs stop at an instruction boundary, memory and devices kept,
   and its clock is right on resume. Linux guests and Windows compose services cannot be paused

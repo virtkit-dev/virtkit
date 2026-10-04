@@ -1,0 +1,157 @@
+# A red forest (ESAE, the enhanced security admin environment): admin.lab is the bastion forest
+# that holds the tier-0 admins (t0admin, in T0-Admins); corp.lab, production, trusts it one way
+# and makes T0-Admins administrators of its domain. Each forest has a member server (Windows
+# Server 2025) and a workstation (Windows 11, win11.Dockerfile); the bastion's workstation is the
+# privileged access workstation (paw), from which t0admin administers production. Build the
+# images first (see forests.Dockerfile and win11.Dockerfile), then
+#   vk run --compose red-forest.compose.yaml
+# The paw's provisioning checks the model: t0admin creates and deletes an account in corp.lab,
+# and alice, a corp.lab user, cannot sign in to admin.lab. About 15 GiB of guest memory.
+secrets:
+  join_password:
+    file: ./secrets/join-password
+  user_password:
+    file: ./secrets/user-password
+
+services:
+  # admin.lab, the bastion
+  dcadmin:
+    image: ./dc-admin-out
+    environment:
+      LAB_FORWARDERS: corp.lab:dc
+    secrets: [join_password]
+    healthcheck:
+      test: ["CMD", "nltest", "/dsgetdc:admin.lab"]
+      interval: 5s
+      timeout: 30s
+      retries: 60
+    x-virtkit:
+      mem: 2560M
+  accounts-admin:
+    build:
+      context: .
+      dockerfile: accounts.Dockerfile
+    depends_on:
+      dcadmin:
+        condition: service_healthy
+    environment:
+      LAB_DC: dcadmin
+      LAB_NETBIOS: ADMIN
+      LAB_USERS: t0admin
+      LAB_GROUPS: T0-Admins:t0admin
+    secrets: [join_password, user_password]
+
+  # corp.lab, production: trusts the bastion (Outbound, from here) and gives its T0-Admins the
+  # domain.
+  dc:
+    image: ./dc-out
+    depends_on:
+      accounts-admin:
+        condition: service_completed_successfully
+    environment:
+      LAB_TRUST_DOMAIN: admin.lab
+      LAB_TRUST_NETBIOS: ADMIN
+      LAB_TRUST_DC: dcadmin
+      LAB_TRUST_DIRECTION: Outbound
+      LAB_TRUST_ADMINS: T0-Admins
+    secrets: [join_password]
+    healthcheck:
+      test: ["CMD", "nltest", "/dsgetdc:corp.lab"]
+      interval: 5s
+      timeout: 30s
+      retries: 60
+    x-virtkit:
+      mem: 2560M
+  accounts:
+    build:
+      context: .
+      dockerfile: accounts.Dockerfile
+    depends_on:
+      dc:
+        condition: service_healthy
+    environment:
+      LAB_DC: dc
+      LAB_USERS: alice
+    secrets: [join_password, user_password]
+
+  # The bastion's members: a server, and the privileged access workstation, which runs the
+  # checks. A bastion member reads production's users across the trust.
+  srv-admin:
+    image: ./srv-admin-out
+    depends_on: &members-wait
+      dc:
+        condition: service_healthy
+      accounts:
+        condition: service_completed_successfully
+    environment: &admin-member
+      LAB_DC: dcadmin
+      LAB_DOMAIN: admin.lab
+      LAB_NETBIOS: ADMIN
+      LAB_USERS: t0admin
+      LAB_REMOTE_DOMAIN: corp.lab
+      LAB_REMOTE_USERS: alice
+    secrets: [join_password]
+    x-virtkit:
+      mem: 1536M
+  paw:
+    image: ./paw-out
+    # After the servers it probes over RDP (rdp-probe.ps1), which wait for the DCs and jobs.
+    depends_on: [srv-admin, srv-corp]
+    environment:
+      LAB_DC: dcadmin
+      LAB_DOMAIN: admin.lab
+      LAB_NETBIOS: ADMIN
+      LAB_USERS: t0admin
+      LAB_REMOTE_DOMAIN: corp.lab
+      LAB_REMOTE_USERS: alice
+      LAB_CHECK: red-forest-check.ps1 rdp-probe.ps1
+      RDP_SERVERS: dc srv-corp srv-admin
+      LAB_TIER0_USER: t0admin
+      LAB_PROD_DOMAIN: corp.lab
+      LAB_PROD_NETBIOS: CORP
+      LAB_PROD_USER: alice
+    secrets: [join_password, user_password]
+    x-virtkit:
+      mem: 3584M
+
+  # Production's members: they only see their own forest (it trusts the bastion, not the
+  # other way round).
+  srv-corp:
+    image: ./srv-corp-out
+    depends_on: *members-wait
+    environment:
+      LAB_DC: dc
+      LAB_USERS: alice
+    secrets: [join_password]
+    x-virtkit:
+      mem: 1536M
+  ws-corp:
+    image: ./ws-corp-out
+    # After the servers it probes over RDP (rdp-probe.ps1), which wait for the DCs and jobs.
+    depends_on: [srv-corp]
+    environment:
+      LAB_DC: dc
+      LAB_USERS: alice
+      LAB_CHECK: rdp-probe.ps1
+      RDP_SERVERS: srv-corp dc
+    secrets: [join_password]
+    x-virtkit:
+      mem: 3584M
+
+  # RDP sign-in to every machine as its domain's admin, and to production's DC as the bastion's
+  # t0admin (a tier-0 admin of production, across the one-way trust).
+  rdp-check:
+    build:
+      context: .
+      dockerfile: rdp-check.Dockerfile
+    depends_on: [srv-admin, paw, srv-corp, ws-corp]
+    environment:
+      RDP_TARGETS: >-
+        dcadmin:ADMIN\vkjoin
+        srv-admin:ADMIN\vkjoin
+        paw:ADMIN\vkjoin
+        dc:CORP\vkjoin
+        srv-corp:CORP\vkjoin
+        ws-corp:CORP\vkjoin
+        dc:ADMIN\t0admin
+    secrets: [join_password, user_password]
