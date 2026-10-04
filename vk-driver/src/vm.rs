@@ -1048,8 +1048,8 @@ fn load_compose_fleet(ctx: &JobCtx, spec: &str) -> Result<ComposeFleet> {
     }
     enabled[primary] = true;
     // Confine every booting unit's job-authored `build:` and `env_file` paths to the
-    // checkout before the host reads them. Reject `volumes:` because a bind mount would
-    // expose a host path to the untrusted guest.
+    // checkout before the host reads them. Reject `volumes:` and `secrets:` because they hand host
+    // files to the untrusted guest.
     let root = checkout
         .canonicalize()
         .with_context(|| format!("resolving the checkout {}", checkout.display()))?;
@@ -1058,13 +1058,7 @@ fn load_compose_fleet(ctx: &JobCtx, spec: &str) -> Result<ComposeFleet> {
         if !enabled[i] {
             continue;
         }
-        if !unit.volumes.is_empty() {
-            bail!(
-                "compose service {:?}: volumes: are not supported on the GitLab executor — a \
-                 bind mount would expose a host path across the microVM boundary",
-                unit.name
-            );
-        }
+        refuse_job_host_files(unit)?;
         refuse_job_nesting(ctx.cfg.executor.vm.nested, unit)?;
         resolve_job_env_files(&root, unit)?;
         if let crate::compose::Source::Build {
@@ -2357,6 +2351,26 @@ fn vm_size(ctx: &JobCtx) -> Result<(u32, String)> {
         }
     };
     Ok((cpus, mem))
+}
+
+/// A job-authored fleet cannot hand its guests host files: no `volumes:`, no `secrets:`.
+fn refuse_job_host_files(unit: &crate::compose::Unit) -> Result<()> {
+    // Check secrets before `volumes:`: Linux secrets also appear there as binds.
+    if !unit.secrets.is_empty() {
+        bail!(
+            "compose service {:?}: secrets: are not supported on the GitLab executor — a \
+             secret is a host file handed to the guest",
+            unit.name
+        );
+    }
+    if !unit.volumes.is_empty() {
+        bail!(
+            "compose service {:?}: volumes: are not supported on the GitLab executor — a \
+             bind mount would expose a host path across the microVM boundary",
+            unit.name
+        );
+    }
+    Ok(())
 }
 
 /// A compose file may ask a service to nest only where the runner granted nesting
@@ -4369,6 +4383,33 @@ mod tests {
             refuse_job_nesting(granted, &service("    x-virtkit: { nested: false }\n")).unwrap();
             refuse_job_nesting(granted, &service("")).unwrap();
         }
+    }
+
+    #[test]
+    fn a_fleet_may_not_hand_its_guests_secrets_or_volumes() {
+        let dir = std::env::temp_dir().join(format!("vk-vm-secrets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pw"), "s3cret").unwrap();
+        let unit = |yaml: &str| {
+            crate::compose::parse(
+                &format!("services:\n  db:\n    image: x\n{yaml}"),
+                &dir,
+                &|_| None,
+                None,
+            )
+            .unwrap()
+            .pop()
+            .unwrap()
+        };
+        let secret = unit("    secrets: [pw]\nsecrets:\n  pw:\n    file: ./pw\n");
+        let volume = unit("    volumes: [\"./pw:/etc/pw\"]\n");
+        let plain = unit("");
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = refuse_job_host_files(&secret).unwrap_err().to_string();
+        assert!(err.contains("secrets: are not supported"), "{err}");
+        let err = refuse_job_host_files(&volume).unwrap_err().to_string();
+        assert!(err.contains("volumes: are not supported"), "{err}");
+        refuse_job_host_files(&plain).unwrap();
     }
 
     /// The runner may grant nesting, but only where host KVM will actually nest — asking

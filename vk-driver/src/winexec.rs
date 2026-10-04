@@ -271,9 +271,14 @@ fn open_if_present(ga: &mut Client, path: &str) -> Result<Option<i64>> {
 /// goes as its own argument and must need no quoting (qemu-ga's quoting is not cmd.exe's):
 /// vk's paths under [`RUN_DIR`] have no blanks.
 pub(crate) fn cmd(ga: &mut Client, words: &[&str]) -> Result<i32> {
-    let mut args = ["/d", "/v:off", "/c"].map(String::from).to_vec();
-    args.extend(words.iter().map(|w| w.to_string()));
-    let pid = ga.exec("cmd.exe", &args, false)?;
+    run_program(ga, "cmd.exe", &[&["/d", "/v:off", "/c"], words].concat())
+}
+
+/// Run the guest program `path` with `args` and wait for it; returns its exit code. qemu-ga
+/// quotes each argument, so no shell sees them.
+pub(crate) fn run_program(ga: &mut Client, path: &str, args: &[&str]) -> Result<i32> {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let pid = ga.exec(path, &args, false)?;
     loop {
         let status = ga.exec_status(pid)?;
         if status.exited {

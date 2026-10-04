@@ -34,6 +34,9 @@ pub(crate) const STOP_GRACE: Duration = Duration::from_secs(3 * 60);
 /// How many restarts one start's provisioning may ask for.
 const MAX_RESTARTS: u32 = 4;
 
+/// Where a Windows service reads its compose secrets, as Docker puts them on Windows.
+pub(crate) const SECRETS_DIR: &str = r"C:\ProgramData\Docker\secrets";
+
 /// The provisioning's output, in the unit's runtime dir.
 pub(crate) const PROVISION_LOG: &str = "provision.log";
 
@@ -94,6 +97,8 @@ pub(crate) struct Provisioning {
     pub command: Option<String>,
     pub workdir: Option<String>,
     pub env: Vec<(String, String)>,
+    /// copied into [`SECRETS_DIR`] before the provisioning runs
+    pub secrets: Vec<crate::compose::Secret>,
 }
 
 impl Provisioning {
@@ -138,6 +143,7 @@ impl Provisioning {
             command,
             workdir: record.workdir,
             env,
+            secrets: unit.secrets.clone(),
         })
     }
 
@@ -155,6 +161,7 @@ impl Provisioning {
             log_path.display()
         );
         let mut ga = crate::uefi::wait_started(&socket, &console, START_TIMEOUT, running)?;
+        self.put_secrets(&mut ga)?;
         let Some(command) = &self.command else {
             return Ok(());
         };
@@ -188,6 +195,57 @@ impl Provisioning {
                 ),
             }
         }
+    }
+
+    /// Copy the service's secrets into a fresh [`SECRETS_DIR`] that only SYSTEM and
+    /// administrators can read or own. `C:\ProgramData` lets every user create in it and read
+    /// what it holds, so whatever stands at that path (a directory a user made, or a junction
+    /// to one) is removed first, and the new directory drops its inherited entries before any
+    /// secret goes in; the files inherit the rest. Any step failing fails the start.
+    fn put_secrets(&self, ga: &mut crate::qga::Client) -> Result<()> {
+        use crate::winexec::{cmd, run_program};
+        if self.secrets.is_empty() {
+            return Ok(());
+        }
+        // `rd` may exit 0 having removed nothing; `mkdir` then fails on what is left.
+        let code = cmd(
+            ga,
+            &["if", "exist", SECRETS_DIR, "rd", "/s", "/q", SECRETS_DIR],
+        )?;
+        if code != 0 {
+            bail!("removing the old {SECRETS_DIR}: rd exited {code}");
+        }
+        let code = cmd(ga, &["mkdir", SECRETS_DIR])?;
+        if code != 0 {
+            bail!("mkdir {SECRETS_DIR} exited {code}");
+        }
+        // SIDs, not names, which Windows translates. `/setowner` is a form of its own.
+        let restrict: [&[&str]; 2] = [
+            &[
+                SECRETS_DIR,
+                "/inheritance:r",
+                "/grant:r",
+                "*S-1-5-18:(OI)(CI)F",
+                "*S-1-5-32-544:(OI)(CI)F",
+                "/Q",
+            ],
+            &[SECRETS_DIR, "/setowner", "*S-1-5-32-544", "/Q"],
+        ];
+        for args in restrict {
+            let code = run_program(ga, "icacls.exe", args)?;
+            if code != 0 {
+                bail!(
+                    "restricting {SECRETS_DIR} to SYSTEM and administrators: icacls exited {code}"
+                );
+            }
+        }
+        for secret in &self.secrets {
+            let file = std::fs::File::open(&secret.file)
+                .with_context(|| format!("reading {}", secret.file.display()))?;
+            crate::winexec::write_from(ga, &format!(r"{SECRETS_DIR}\{}", secret.target), file)
+                .with_context(|| format!("copying the secret {} in", secret.target))?;
+        }
+        Ok(())
     }
 }
 
@@ -300,5 +358,117 @@ mod tests {
             panic!("a quote in a variable is refused");
         };
         assert!(format!("{err:#}").contains("cannot hold quotes"), "{err:#}");
+    }
+
+    #[test]
+    fn a_secret_reaches_the_provisioning_of_a_windows_service() {
+        let base = std::env::temp_dir().join(format!("vk-winsvc-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("pw.txt"), "s3cret").unwrap();
+        let p =
+            provisioning_of("    secrets: [pw]\nsecrets:\n  pw:\n    file: ./pw.txt\n").unwrap();
+        assert_eq!(
+            p.secrets,
+            [crate::compose::Secret {
+                target: "pw".into(),
+                file: base.join("./pw.txt"),
+            }]
+        );
+    }
+
+    /// Run [`Provisioning::put_secrets`] against an agent whose program exit codes come from
+    /// `exit(command_line)`; return the result, command lines run and guest files opened.
+    fn put_secrets_with(
+        exit: impl Fn(&str) -> i32 + Send + 'static,
+    ) -> (Result<()>, Vec<String>, Vec<String>) {
+        use crate::qga::tests::{client, synced};
+        use std::sync::{Arc, Mutex};
+        let dir = std::env::temp_dir().join(format!(
+            "vk-winsvc-put-{}",
+            crate::scratch::random_nonce().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pw.txt"), "s3cret").unwrap();
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let (seen_runs, seen_opened) = (runs.clone(), opened.clone());
+        let mut ga = client(move |request| {
+            let args = &request["arguments"];
+            let reply = match request["execute"].as_str() {
+                Some("guest-sync-delimited") => return synced(request),
+                Some("guest-exec") => {
+                    let mut line = vec![args["path"].as_str().unwrap().to_string()];
+                    line.extend(
+                        args["arg"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|a| a.as_str().unwrap().to_string()),
+                    );
+                    let mut runs = seen_runs.lock().unwrap();
+                    runs.push(line.join(" "));
+                    serde_json::json!({ "pid": runs.len() })
+                }
+                Some("guest-exec-status") => {
+                    let line =
+                        &seen_runs.lock().unwrap()[args["pid"].as_u64().unwrap() as usize - 1];
+                    serde_json::json!({ "exited": true, "exitcode": exit(line) })
+                }
+                Some("guest-file-open") => {
+                    let path = args["path"].as_str().unwrap().to_string();
+                    seen_opened.lock().unwrap().push(path);
+                    serde_json::json!(1)
+                }
+                Some("guest-file-write") => serde_json::json!({ "count": 6, "eof": false }),
+                _ => serde_json::json!({}),
+            };
+            format!("{}\n", serde_json::json!({ "return": reply })).into_bytes()
+        });
+        let p = Provisioning {
+            name: "dc".into(),
+            dir: dir.clone(),
+            command: None,
+            workdir: None,
+            env: Vec::new(),
+            secrets: vec![crate::compose::Secret {
+                target: "join".into(),
+                file: dir.join("pw.txt"),
+            }],
+        };
+        let result = p.put_secrets(&mut ga);
+        let _ = std::fs::remove_dir_all(&dir);
+        let runs = runs.lock().unwrap().clone();
+        let opened = opened.lock().unwrap().clone();
+        (result, runs, opened)
+    }
+
+    #[test]
+    fn secrets_go_into_a_fresh_directory_only_system_and_administrators_can_read() {
+        let (result, runs, opened) = put_secrets_with(|_| 0);
+        result.unwrap();
+        let dir = SECRETS_DIR;
+        assert_eq!(
+            runs,
+            [
+                format!("cmd.exe /d /v:off /c if exist {dir} rd /s /q {dir}"),
+                format!("cmd.exe /d /v:off /c mkdir {dir}"),
+                format!(
+                    "icacls.exe {dir} /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F \
+                     *S-1-5-32-544:(OI)(CI)F /Q"
+                ),
+                format!("icacls.exe {dir} /setowner *S-1-5-32-544 /Q"),
+            ]
+        );
+        assert_eq!(opened, [format!(r"{dir}\join")]);
+    }
+
+    #[test]
+    fn no_secret_is_copied_unless_every_step_succeeds() {
+        for failing in [" rd ", "mkdir", "/grant:r", "/setowner"] {
+            let fail = move |line: &str| i32::from(line.contains(failing));
+            let (result, _, opened) = put_secrets_with(fail);
+            assert!(result.is_err(), "{failing}");
+            assert!(opened.is_empty(), "{failing}");
+        }
     }
 }

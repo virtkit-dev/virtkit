@@ -84,6 +84,7 @@ pub fn to_units(services: Vec<Service>) -> Vec<crate::compose::Unit> {
             nics: 1,
             persist_root_backing: None,
             tap: None,
+            secrets: Vec::new(),
         })
         .collect()
 }
