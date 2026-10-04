@@ -13,6 +13,7 @@
 //! guest on the run's switch, whose DHCP reserves the run address for the NIC's MAC. The run
 //! lasts until the guest powers off; a stop presses the ACPI power button.
 
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
@@ -68,6 +69,53 @@ pub(crate) struct Manifest {
     pub mem: Option<String>,
     /// Disk images in attach order, relative to the bundle directory.
     pub disks: Vec<PathBuf>,
+    /// Set for a snapshot (`vk snapshot`): the bundle also holds the VM's state and memory,
+    /// which a run starts from instead of booting.
+    #[serde(default)]
+    pub snapshot: Option<SnapshotInfo>,
+}
+
+/// What a snapshot bundle's run must match: the VM it was taken of.
+#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SnapshotInfo {
+    /// The VM's address on its run's network, which its NIC's MAC derives from and the guest
+    /// keeps using; None: it had no network.
+    pub addr: Option<Ipv4Addr>,
+}
+
+/// Refuse to restore the snapshot `manifest` describes (if it is one) with other vCPUs `cpus`,
+/// memory `mem` or address `addr` than it was taken with: its saved CPU, memory and NIC state
+/// fit only those. `cpus` and `mem` are overrides (None: the manifest's); `addr` is the
+/// guest's address on its run's network (None: no network).
+pub(crate) fn check_restore(
+    manifest: &Manifest,
+    cpus: Option<u32>,
+    mem: Option<&str>,
+    addr: Option<Ipv4Addr>,
+) -> Result<()> {
+    let Some(snapshot) = manifest.snapshot else {
+        return Ok(());
+    };
+    match (snapshot.addr, addr) {
+        (Some(_), None) => bail!("this snapshot was taken on a network: run it with --net"),
+        (None, Some(_)) => bail!("this snapshot was taken without a network: run it without --net"),
+        (Some(taken), Some(addr)) if taken != addr => {
+            bail!("this snapshot was taken at {taken}, not {addr}")
+        }
+        _ => {}
+    }
+    let mib = |mem: &str| crate::run::parse_mem_mib(mem);
+    if cpus.is_some_and(|c| Some(c) != manifest.cpus)
+        || mem.is_some_and(|m| mib(m) != manifest.mem.as_deref().and_then(mib))
+    {
+        bail!(
+            "this snapshot runs only with the {} vCPUs and {} of memory it was taken with",
+            manifest.cpus.map_or("?".to_string(), |c| c.to_string()),
+            manifest.mem.as_deref().unwrap_or("?")
+        );
+    }
+    Ok(())
 }
 
 /// A bundle directory and its parsed manifest.
@@ -228,8 +276,6 @@ fn refuse_unsupported(args: &RunArgs) -> Result<()> {
 /// an unreadable or malformed ID is an error, since a silently changed ID makes a
 /// Windows domain controller reset its invocation ID and RID pool.
 fn generation_id(work: &Path) -> Result<[u8; 16]> {
-    use std::io::Read;
-
     let path = work.join(GENERATION_ID);
     match std::fs::read(&path) {
         Ok(bytes) => {
@@ -239,10 +285,7 @@ fn generation_id(work: &Path) -> Result<[u8; 16]> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     }
-    let mut id = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut id))
-        .context("reading /dev/urandom")?;
+    let id = new_generation_id()?;
     // Whole or not at all: a torn file would be replaced, changing the ID.
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, id).with_context(|| format!("writing {}", tmp.display()))?;
@@ -250,8 +293,23 @@ fn generation_id(work: &Path) -> Result<[u8; 16]> {
     Ok(id)
 }
 
+/// A random VM generation ID.
+fn new_generation_id() -> Result<[u8; 16]> {
+    use std::io::Read;
+
+    let mut id = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut id))
+        .context("reading /dev/urandom")?;
+    Ok(id)
+}
+
 /// The spec of a UEFI guest named `name` booting `firmware` on `disks`, its console log, qemu-ga
-/// and COM1 input sockets and VM generation ID in `work`; no network.
+/// and COM1 input sockets and VM generation ID in `work`; no network. With `restore`, the guest
+/// starts from the snapshot in that directory instead of booting, under a new VM generation ID
+/// that `work` does not keep: it is a copy of the snapshotted guest, which it must not pass
+/// for (a domain controller then resets its invocation ID and RID pool), and libkrun refuses
+/// to restore a guest that had one without a new one.
 pub(crate) fn guest_spec(
     firmware: &Path,
     work: &Path,
@@ -259,7 +317,12 @@ pub(crate) fn guest_spec(
     disks: Vec<Disk>,
     cpus: u32,
     mem: &str,
+    restore: Option<&Path>,
 ) -> Result<VmSpec> {
+    let vm_generation_id = match restore {
+        Some(_) => new_generation_id()?,
+        None => generation_id(work)?,
+    };
     Ok(VmSpec {
         kernel: firmware.to_path_buf(),
         cmdline: String::new(),
@@ -284,9 +347,10 @@ pub(crate) fn guest_spec(
         numa: crate::numa::Numa::Auto,
         guest_agent: Some(work.join(GUEST_AGENT_SOCKET)),
         hyperv: true,
-        vm_generation_id: Some(generation_id(work)?),
+        vm_generation_id: Some(vm_generation_id),
         serial_input: Some(work.join(CONSOLE_SOCKET)),
         control: Some(work.join(CONTROL_SOCKET)),
+        restore_from: restore.map(Path::to_path_buf),
     })
 }
 
@@ -416,7 +480,7 @@ impl Guest {
         nics: Vec<crate::vmm::Nic>,
     ) -> Result<Guest> {
         let firmware = firmware()?;
-        let mut spec = guest_spec(&firmware.path, work, name, disks, cpus, mem)?;
+        let mut spec = guest_spec(&firmware.path, work, name, disks, cpus, mem, None)?;
         spec.nics = nics;
         let vmm = crate::vmm::selected();
         let ch = crate::run::spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal)?;
@@ -493,7 +557,21 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
     let firmware = match bundle.manifest.firmware {
         Firmware::Uefi => firmware()?,
     };
-    let disks = overlays(&bundle.disks()?, work)?;
+    let bundle_disks = bundle.disks()?;
+    let restore = bundle.manifest.snapshot.is_some();
+    let guest_ip = if args.net {
+        Some(crate::net::switch_addrs(crate::run::RUN_SUBNET)?.2)
+    } else {
+        None
+    };
+    check_restore(&bundle.manifest, args.cpus, args.mem.as_deref(), guest_ip)?;
+    if restore {
+        // Its memory goes with its disks as they were: never with a previous run's overlays.
+        for i in 0..bundle_disks.len() {
+            let _ = std::fs::remove_file(work.join(format!("disk{i}.qcow2")));
+        }
+    }
+    let disks = overlays(&bundle_disks, work)?;
     let name = bundle.name();
     let cpus = args.cpus.or(bundle.manifest.cpus).unwrap_or(2);
     let mem = args
@@ -509,7 +587,6 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
     crate::spawn::isolate_helpers();
     let mut switch = None;
     let mut nics = Vec::new();
-    let mut guest_ip = None;
     if args.net {
         let (child, attach) = crate::run::spawn_vm_switch(
             &vsock,
@@ -531,10 +608,10 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
         .await?;
         switch = Some(child);
         nics = attach.nics;
-        guest_ip = Some(crate::net::switch_addrs(crate::run::RUN_SUBNET)?.2);
     }
 
-    let mut spec = guest_spec(&firmware.path, work, &name, disks, cpus, &mem)?;
+    let restore_from = restore.then_some(bundle.dir.as_path());
+    let mut spec = guest_spec(&firmware.path, work, &name, disks, cpus, &mem, restore_from)?;
     spec.nics = nics;
     spec.numa = args.numa.clone();
     let vmm = crate::vmm::selected();
@@ -550,10 +627,18 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
     // `vk reboot` hard-resets the guest: there is no agent to ask.
     crate::run::forward_hard_resets(&ch);
     println!(
-        "virtkit: {name}: UEFI guest booting ({cpus} vCPU, {mem}{}); console {}",
+        "virtkit: {name}: UEFI guest {} ({cpus} vCPU, {mem}{}); console {}",
+        if restore {
+            "restored from its snapshot"
+        } else {
+            "booting"
+        },
         guest_ip.map_or(String::new(), |ip| format!(", {ip}")),
         console.display()
     );
+    if restore {
+        set_clock_when_up(work.join(GUEST_AGENT_SOCKET));
+    }
 
     let _registration = crate::vms::register(crate::vms::VmEntry {
         state_dir: crate::run::registry_key(work),
@@ -615,6 +700,39 @@ async fn exited_by(ch: &mut Child, deadline: Instant) -> bool {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Set the guest's clock through qemu-ga `socket` to the host's once its agent answers, on a
+/// separate thread: a restored guest resumes at the time its snapshot was taken.
+fn set_clock_when_up(socket: PathBuf) {
+    let set = move || -> Result<()> {
+        set_clock(&mut crate::qga::Client::connect(
+            &socket,
+            Duration::from_secs(60),
+        )?)
+    };
+    let _ = std::thread::Builder::new()
+        .name("vk-set-clock".into())
+        .spawn(move || match set() {
+            Ok(()) => println!("virtkit: guest clock set to the host's"),
+            Err(e) => eprintln!(
+                "virtkit: warning: the restored guest's clock is not set, so Kerberos may fail \
+                 until it is: {e:#}"
+            ),
+        });
+}
+
+/// Set the clock of the guest behind `ga` to the host's.
+pub(crate) fn set_clock(ga: &mut crate::qga::Client) -> Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos() as u64;
+    ga.call(
+        "guest-set-time",
+        Some(serde_json::json!({ "time": now })),
+        crate::qga::DEFAULT_TIMEOUT,
+    )?;
+    Ok(())
 }
 
 /// Wait for the VMM to exit or the run to be stopped. A VMM gone within [`BOOT_SETTLE`] is a
@@ -680,6 +798,70 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn manifest(json: &str) -> serde_json::Result<Manifest> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn a_snapshot_manifest_records_the_address_and_refuses_unknown_fields() {
+        let m = manifest(
+            r#"{"firmware": "uefi", "disks": ["d"], "snapshot": {"addr": "192.168.127.2"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            m.snapshot,
+            Some(SnapshotInfo {
+                addr: Some(Ipv4Addr::new(192, 168, 127, 2))
+            })
+        );
+        let m = manifest(r#"{"firmware": "uefi", "disks": ["d"], "snapshot": {"addr": null}}"#)
+            .unwrap();
+        assert_eq!(m.snapshot, Some(SnapshotInfo { addr: None }));
+        assert!(
+            manifest(r#"{"firmware": "uefi", "disks": ["d"]}"#)
+                .unwrap()
+                .snapshot
+                .is_none()
+        );
+        assert!(
+            manifest(
+                r#"{"firmware": "uefi", "disks": ["d"], "snapshot": {"addr": null, "net": true}}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_snapshot_restores_only_on_the_network_vcpus_and_memory_it_was_taken_with() {
+        let ip = |last| Some(Ipv4Addr::new(192, 168, 127, last));
+        let m = manifest(
+            r#"{"firmware": "uefi", "cpus": 2, "mem": "4G", "disks": ["d"],
+                "snapshot": {"addr": "192.168.127.2"}}"#,
+        )
+        .unwrap();
+        check_restore(&m, None, None, ip(2)).unwrap();
+        check_restore(&m, Some(2), Some("4096M"), ip(2)).unwrap();
+        check_restore(&m, Some(2), Some("4096"), ip(2)).unwrap();
+        let err =
+            |cpus, mem, addr| format!("{:#}", check_restore(&m, cpus, mem, addr).unwrap_err());
+        assert!(err(None, None, None).contains("with --net"));
+        assert!(err(None, None, ip(3)).contains("taken at 192.168.127.2, not 192.168.127.3"));
+        let resized = "runs only with the 2 vCPUs and 4G of memory";
+        assert!(err(Some(4), None, ip(2)).contains(resized));
+        assert!(err(None, Some("2G"), ip(2)).contains(resized));
+        let offline = manifest(
+            r#"{"firmware": "uefi", "cpus": 2, "mem": "4G", "disks": ["d"],
+                "snapshot": {"addr": null}}"#,
+        )
+        .unwrap();
+        check_restore(&offline, None, None, None).unwrap();
+        let err = check_restore(&offline, None, None, ip(2)).unwrap_err();
+        assert!(format!("{err:#}").contains("without --net"));
+        // A bundle that is not a snapshot boots with anything.
+        let boot = manifest(r#"{"firmware": "uefi", "disks": ["d"]}"#).unwrap();
+        check_restore(&boot, Some(8), Some("1G"), None).unwrap();
     }
 
     #[test]

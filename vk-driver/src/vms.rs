@@ -1681,6 +1681,35 @@ fn pause_line(entry: &VmEntry, req: PauseRequest) -> (String, bool) {
     }
 }
 
+/// Snapshot the UEFI VM selected by a pid or project directory (the current directory by
+/// default) into the new bundle `out`, ending the VM ([`crate::snapshot`]).
+pub fn snapshot_cmd(target: Option<Selector>, out: &Path) -> Result<String> {
+    let entry = match select_vms(target, false)? {
+        Selection::Matched(mut v) if v.len() == 1 => v.remove(0),
+        Selection::Matched(_) => bail!("more than one VM matches; name one by its pid"),
+        Selection::Empty(out, _) => bail!("{}", out.trim()),
+    };
+    let control = entry
+        .control
+        .as_ref()
+        .with_context(|| format!("{} (pid {}) cannot be snapshotted", entry.label, entry.pid))?;
+    let machine = |_: &Path| {
+        Ok(crate::snapshot::Machine {
+            cpus: entry.cpus,
+            mem: entry.mem.clone(),
+            addr: entry.guest_ip,
+        })
+    };
+    let if_paused = format!("`vk resume {}` runs it again", entry.pid);
+    crate::snapshot::snapshot_vm(control, out, machine, || !alive(&entry), &if_paused)?;
+    Ok(format!(
+        "snapshotted {} (pid {}) into {}\n",
+        entry.label,
+        entry.pid,
+        out.display()
+    ))
+}
+
 /// Bind a control socket that answers the first request line with `frames`, in order.
 /// `None` closes the connection without answering.
 #[cfg(test)]
@@ -3171,6 +3200,14 @@ PUBLISHED     -
 
         fn resume(&self) -> Result<()> {
             bail!("vcpu 1 exited")
+        }
+
+        fn snapshot(&self, _: &Path) -> Result<()> {
+            unreachable!()
+        }
+
+        fn quit(&self) -> Result<()> {
+            unreachable!()
         }
     }
 
