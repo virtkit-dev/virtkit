@@ -93,7 +93,9 @@ mod vm;
 mod vmdk;
 mod vmm;
 mod vms;
+mod winbuild;
 mod winexec;
+mod winiso;
 mod workloads;
 mod wsl;
 
@@ -3760,6 +3762,24 @@ async fn cli_main(cli: Cli) -> ExitCode {
         debug,
     } = &cli.cmd
     {
+        // A Windows Dockerfile (`FROM winiso:`, or a windows platform) builds a bundle of
+        // qcow2 layers through qemu-ga instead of an ext4.
+        let mut windows = false;
+        if compose.is_none() {
+            for f in file {
+                // An unreadable file is the Linux build's to report.
+                let Ok(text) = std::fs::read_to_string(f) else {
+                    continue;
+                };
+                match winbuild::is_windows(&text) {
+                    Ok(w) => windows |= w,
+                    Err(e) => return fail(&e.context(format!("{}", f.display())), 2),
+                }
+            }
+        }
+        if windows {
+            return windows_build(&cli.cmd).await;
+        }
         // each --build-arg is NAME=VALUE; a bare NAME means an empty value.
         let build_args: Vec<(String, String)> = build_arg
             .iter()
@@ -4870,6 +4890,109 @@ fn host_policy_cmd(policy: &str, workspace: &Path, argv: &[String]) -> ExitCode 
             eprintln!("vk host-policy: {program}: {e}");
             exit_code(127)
         }
+    }
+}
+
+/// `vk build` of a Windows Dockerfile: a bundle of qcow2 layers made through qemu-ga
+/// ([`winbuild`]) instead of an ext4, refusing the flags only the Linux build reads.
+async fn windows_build(cmd: &Cmd) -> ExitCode {
+    let Cmd::Build {
+        file,
+        target,
+        context,
+        build_context,
+        out,
+        tag,
+        disk,
+        print_plan,
+        kernel,
+        agent,
+        cache_registry,
+        cache_insecure,
+        build_cache,
+        no_journal,
+        build_tmp_tmpfs,
+        build_arg,
+        build_allow_ip,
+        build_allow_name,
+        build_audit_egress,
+        require_cached,
+        build_jobs,
+        stage_mem,
+        stage_cpus,
+        debug,
+        ..
+    } = cmd
+    else {
+        unreachable!("windows_build of a build command");
+    };
+    // What only the Linux build reads.
+    let linux_only = [
+        (file.len() > 1, "a second --file"),
+        (target.len() > 1, "a second --target"),
+        (context.len() > 1, "a second --context"),
+        (!build_context.is_empty(), "--build-context"),
+        (tag.is_some(), "--tag"),
+        (disk.is_some(), "--disk"),
+        (*print_plan, "--print-plan"),
+        (kernel.is_some(), "--kernel"),
+        (agent.is_some(), "--agent"),
+        (cache_registry.is_some(), "--cache-registry"),
+        (*cache_insecure, "--cache-insecure"),
+        (build_cache.is_some(), "--build-cache"),
+        (*no_journal, "--no-journal"),
+        (*build_tmp_tmpfs, "--build-tmp-tmpfs"),
+        (!build_arg.is_empty(), "--build-arg"),
+        (!build_allow_ip.is_empty(), "--build-allow-ip"),
+        (!build_allow_name.is_empty(), "--build-allow-name"),
+        (*build_audit_egress, "--build-audit-egress"),
+        (*require_cached, "--require-cached"),
+        (build_jobs.is_some(), "--build-jobs"),
+        (!stage_mem.is_empty(), "--stage-mem"),
+        (!stage_cpus.is_empty(), "--stage-cpus"),
+        (*debug, "--debug"),
+    ];
+    if let Some((_, flag)) = linux_only.iter().find(|(given, _)| *given) {
+        return fail(
+            &anyhow::anyhow!("{flag} does not apply to a Windows build"),
+            2,
+        );
+    }
+    let dockerfile = &file[0];
+    let Some(out) = out.clone() else {
+        return fail(
+            &anyhow::anyhow!("a Windows build writes a bundle directory: pass --out <dir>"),
+            2,
+        );
+    };
+    let context = context
+        .first()
+        .cloned()
+        .unwrap_or_else(|| match dockerfile.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from("."),
+        });
+    let context = match context.canonicalize() {
+        Ok(c) => c,
+        Err(e) => {
+            return fail(
+                &anyhow::anyhow!("build context {}: {e}", context.display()),
+                2,
+            );
+        }
+    };
+    let opts = winbuild::Options {
+        dockerfile: dockerfile.clone(),
+        context,
+        target: target.first().cloned(),
+        out,
+        cpus: build::configured_build_cpus().unwrap_or(4),
+        mem: build::configured_build_mem().unwrap_or_else(|| "4G".to_string()),
+    };
+    match tokio::task::spawn_blocking(move || winbuild::build(&opts)).await {
+        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Err(e)) => fail(&e, 1),
+        Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
     }
 }
 

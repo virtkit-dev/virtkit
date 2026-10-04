@@ -65,16 +65,10 @@ pub fn quote_arg(arg: &str) -> String {
     out
 }
 
-/// The batch-file line that runs `argv`: each argument quoted with [`quote_arg`], then made
-/// literal for cmd.exe — `%` doubled (a batch file would expand it) and, wherever cmd sees the
-/// text outside quotes, its operators escaped with `^`, which cmd removes before starting the
-/// program.
-pub fn cmd_line(argv: &[String]) -> String {
-    let line = argv
-        .iter()
-        .map(|a| quote_arg(a))
-        .collect::<Vec<_>>()
-        .join(" ");
+/// Escape a command line for a batch file so the program receives it verbatim: double `%`
+/// to prevent batch expansion and escape cmd's operators outside quotes with `^`, which cmd
+/// removes before starting the program.
+pub fn batch_escape(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut quoted = false;
     for c in line.chars() {
@@ -163,7 +157,7 @@ pub fn wrapper(bat: &str, seg: &str) -> String {
 /// with the command's code, or 1 when `dir` does not exist. The redirections come first: an
 /// argument with an odd number of quotes leaves cmd.exe reading the rest of its line as quoted.
 pub fn script(
-    argv: &[String],
+    command_line: &str,
     env: &[(String, String)],
     dir: Option<&str>,
     log: Option<&str>,
@@ -181,7 +175,7 @@ pub fn script(
         let dir = dir.replace('%', "%%");
         s.push_str(&format!("{redirect} cd /d \"{dir}\" && "));
     }
-    s.push_str(&format!("{redirect} {}\r\n", cmd_line(argv)));
+    s.push_str(&format!("{redirect} {}\r\n", batch_escape(command_line)));
     s.push_str("(goto) 2>nul & del \"%~f0\" & exit /b %ERRORLEVEL%\r\n");
     s
 }
@@ -211,20 +205,34 @@ pub fn check_command(argv: &[String], dir: Option<&str>) -> Result<()> {
     if let Some(arg) = argv.iter().find(|a| a.contains(['\r', '\n'])) {
         bail!("{arg:?}: a Windows guest's command line cannot hold newlines");
     }
+    check_dir(dir, "--dir")
+}
+
+/// Refuse a command line or working directory a batch file cannot carry.
+fn check_line(command_line: &str, dir: Option<&str>) -> Result<()> {
+    if command_line.contains(['\r', '\n']) {
+        bail!("{command_line:?}: a Windows guest's command line cannot hold newlines");
+    }
+    check_dir(dir, "WORKDIR")
+}
+
+/// Refuse a working directory (`what`) a batch file cannot carry: a quote ends its `cd`
+/// argument, a newline its line.
+fn check_dir(dir: Option<&str>, what: &str) -> Result<()> {
     if let Some(dir) = dir.filter(|d| d.contains(['"', '\r', '\n'])) {
-        bail!("--dir {dir:?}: a Windows guest's directory cannot hold quotes or newlines");
+        bail!("{what} {dir:?}: a Windows guest's directory cannot hold quotes or newlines");
     }
     Ok(())
 }
 
 /// Write `bytes` to the guest file `path`, creating or truncating it.
-fn put(ga: &mut Client, path: &str, bytes: &[u8]) -> Result<()> {
+pub(crate) fn put(ga: &mut Client, path: &str, bytes: &[u8]) -> Result<()> {
     write_from(ga, path, bytes).map(drop)
 }
 
 /// Write what `src` holds to the guest file `path`, creating or truncating it, one
 /// [`CHUNK`] at a time; returns the bytes written.
-fn write_from(ga: &mut Client, path: &str, mut src: impl Read) -> Result<u64> {
+pub(crate) fn write_from(ga: &mut Client, path: &str, mut src: impl Read) -> Result<u64> {
     let handle = ga
         .file_open(path, "wb")
         .with_context(|| format!("opening {path} for writing in the guest"))?;
@@ -273,6 +281,74 @@ fn cmd(ga: &mut Client, words: &[&str]) -> Result<i32> {
     }
 }
 
+/// Write `body` to the guest file `path` under [`RUN_DIR`], making the directory first if
+/// this is the guest's first command.
+fn put_run_file(ga: &mut Client, path: &str, body: &[u8]) -> Result<()> {
+    if put(ga, path, body).is_err() {
+        let code = cmd(ga, &["if", "not", "exist", RUN_DIR, "mkdir", RUN_DIR])?;
+        if code != 0 {
+            bail!("vk exec assumes Windows in C:\\Windows (mkdir {RUN_DIR} exited {code})");
+        }
+        put(ga, path, body)?;
+    }
+    Ok(())
+}
+
+/// Run PowerShell `script` through `ga` and return its exit code. On a nonzero exit, print
+/// its output with each line prefixed by `what`. Write the script as a `.ps1` under [`RUN_DIR`]
+/// and delete it afterward: a command line would cap it at cmd's 8191 characters. Only SYSTEM
+/// and administrators can read the file; a fixed-size [`run_ps1_command_line`] runs it.
+pub(crate) fn powershell(ga: &mut Client, script: &str, what: &str) -> Result<i32> {
+    let path = format!(r"{RUN_DIR}\{}.ps1", crate::scratch::random_nonce()?);
+    // With a BOM: without one, Windows PowerShell reads the file in the ANSI code page.
+    put_run_file(ga, &path, format!("\u{feff}{script}").as_bytes())?;
+    let mut out = Vec::new();
+    let ran = exec_command_line(ga, &run_ps1_command_line(&path), &[], None, &mut out);
+    // Best effort, as for a command's own files.
+    let _ = cmd(ga, &["del", "/q", &path]);
+    let code = ran?;
+    if code != 0 {
+        for line in String::from_utf8_lossy(&out).lines() {
+            eprintln!("virtkit: {what}: {line}");
+        }
+    }
+    Ok(code)
+}
+
+/// The command line running the `.ps1` at `path` as `-EncodedCommand`, the way vk's other
+/// PowerShell runs: under qemu-ga a script started with `-File` never starts, and a script
+/// block made from the file's text needs no execution policy. An `exit` in the script ends
+/// PowerShell with its code, as at the top level of the command.
+fn run_ps1_command_line(path: &str) -> String {
+    let path = path.replace('\'', "''");
+    let stub = format!("& ([scriptblock]::Create([IO.File]::ReadAllText('{path}')))");
+    format!(
+        "powershell.exe -NoProfile -NonInteractive -EncodedCommand {}",
+        encoded_command(&stub)
+    )
+}
+
+/// How long [`restart`] waits for the guest's agent to stop answering.
+const RESTART_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Restart the guest through `ga` and wait until its agent stops answering, so that the next
+/// connection reaches the agent of the restarted guest rather than syncing with this one;
+/// `running` tells whether the guest is still up.
+pub(crate) fn restart(ga: &mut Client, running: &mut dyn FnMut() -> bool) -> Result<()> {
+    ga.exec("shutdown.exe", &["/r", "/t", "0"].map(String::from), false)?;
+    let deadline = Instant::now() + RESTART_TIMEOUT;
+    while ga.call("guest-ping", None, Duration::from_secs(5)).is_ok() {
+        if !running() {
+            bail!("the guest powered off instead of restarting");
+        }
+        if Instant::now() >= deadline {
+            bail!("the guest did not restart within {RESTART_TIMEOUT:?}");
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Ok(())
+}
+
 /// Run `argv` in the guest behind `socket`, stream its output to stdout and return its exit
 /// code. With `background`, log output beside the batch file, print the log path to stderr
 /// and return 0 once the command starts.
@@ -283,11 +359,51 @@ pub fn exec(
     dir: Option<&str>,
     background: bool,
 ) -> Result<i32> {
+    let line = argv
+        .iter()
+        .map(|a| quote_arg(a))
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut ga = Client::connect(socket, CONNECT_TIMEOUT)?;
+    run_line(
+        &mut ga,
+        &line,
+        env,
+        dir,
+        background,
+        &mut std::io::stdout().lock(),
+    )
+}
+
+/// Run the Windows command line `command_line` (a program and its arguments as
+/// `CreateProcess` takes them) through `ga`, its output streamed to `out`, and return its exit
+/// code. A newline in it, or a quote or newline in the working directory `dir`, is refused: a
+/// batch file cannot carry them. A shell-form line (`cmd /S /C <text>`) keeps cmd's operators
+/// for the inner shell: [`batch_escape`] makes them literal to the batch file only.
+pub fn exec_command_line(
+    ga: &mut Client,
+    command_line: &str,
+    env: &[(String, String)],
+    dir: Option<&str>,
+    out: &mut impl Write,
+) -> Result<i32> {
+    check_line(command_line, dir)?;
+    run_line(ga, command_line, env, dir, false, out)
+}
+
+/// Run `command_line` as [`exec`] does, through `ga`, its output streamed to `out`.
+fn run_line(
+    ga: &mut Client,
+    command_line: &str,
+    env: &[(String, String)],
+    dir: Option<&str>,
+    background: bool,
+    out: &mut impl Write,
+) -> Result<i32> {
     let base = format!(r"{RUN_DIR}\{}", crate::scratch::random_nonce()?);
     let log = format!("{base}.log");
-    let body = script(argv, env, dir, background.then_some(log.as_str()));
-    match run(&mut ga, &base, body.as_bytes(), background) {
+    let body = script(command_line, env, dir, background.then_some(log.as_str()));
+    match run(ga, &base, body.as_bytes(), background, out) {
         Ok(None) => {
             eprintln!("virtkit: started in the background; its output goes to {log} in the guest");
             Ok(0)
@@ -295,7 +411,7 @@ pub fn exec(
         ran => {
             // Its segments, exit file, and the batch file if it never ran. Best effort; a
             // leftover stays where only SYSTEM and administrators can read it.
-            let _ = cmd(&mut ga, &["del", "/q", &format!("{base}.*")]);
+            let _ = cmd(ga, &["del", "/q", &format!("{base}.*")]);
             ran.map(Option::unwrap_or_default)
         }
     }
@@ -303,17 +419,16 @@ pub fn exec(
 
 /// Write `body` as the batch file `<base>.cmd` and run it: `None` once a background command
 /// has started, otherwise the command's exit code once it has ended, its output streamed to
-/// stdout.
-fn run(ga: &mut Client, base: &str, body: &[u8], background: bool) -> Result<Option<i32>> {
+/// `out`.
+fn run(
+    ga: &mut Client,
+    base: &str,
+    body: &[u8],
+    background: bool,
+    out: &mut impl Write,
+) -> Result<Option<i32>> {
     let bat = format!("{base}.cmd");
-    if put(ga, &bat, body).is_err() {
-        // First command in this guest: make the directory, then try again.
-        let code = cmd(ga, &["if", "not", "exist", RUN_DIR, "mkdir", RUN_DIR])?;
-        if code != 0 {
-            bail!("vk exec assumes Windows in C:\\Windows (mkdir {RUN_DIR} exited {code})");
-        }
-        put(ga, &bat, body)?;
-    }
+    put_run_file(ga, &bat, body)?;
     if background {
         ga.exec(
             "cmd.exe",
@@ -335,7 +450,7 @@ fn run(ga: &mut Client, base: &str, body: &[u8], background: bool) -> Result<Opt
         .map(String::from),
         true,
     )?;
-    follow(ga, pid, base, &mut std::io::stdout().lock()).map(Some)
+    follow(ga, pid, base, out).map(Some)
 }
 
 /// Copy the output of the wrapper `pid`, published as `<base>.<n>.seg`, to `out` as it
@@ -445,6 +560,17 @@ mod tests {
         assert_eq!(quote_arg(r#"a\"b"#), r#""a\\\"b""#);
     }
 
+    /// The batch-file line that runs `argv`.
+    fn cmd_line(argv: &[String]) -> String {
+        batch_escape(
+            &argv
+                .iter()
+                .map(|a| quote_arg(a))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
+
     #[test]
     fn cmd_operators_stay_literal_outside_quotes_and_percent_is_doubled() {
         let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -461,7 +587,7 @@ mod tests {
     #[test]
     fn the_script_sets_the_environment_and_directory_then_logs_the_command() {
         let script = script(
-            &["hostname".to_string()],
+            "hostname",
             &[("A%".into(), "1%".into())],
             Some(r"C:\Users"),
             Some(r"C:\log.txt"),
@@ -477,7 +603,7 @@ mod tests {
     #[test]
     fn an_odd_quote_cannot_swallow_the_redirections() {
         // cmd.exe reads everything after the third quote as quoted.
-        let script = script(&["echo".into(), "5\"".into()], &[], None, None);
+        let script = script(r#"echo "5\"""#, &[], None, None);
         assert_eq!(
             script,
             "@echo off\r\nchcp 65001 >nul\r\n2>&1 echo \"5\\\"\"\r\n\
@@ -494,6 +620,18 @@ mod tests {
         assert!(check_command(&argv("a"), Some("C:\\x\r")).is_err());
         assert!(check_command(&argv("a"), Some("C:\\\"x")).is_err());
         assert!(check_command(&argv("a"), Some("C:\\x\n")).is_err());
+    }
+
+    #[test]
+    fn a_shell_form_line_keeps_its_operators_for_the_inner_shell() {
+        assert_eq!(
+            batch_escape(r#"cmd /S /C echo %A% & echo "x | y" > out"#),
+            r#"cmd /S /C echo %%A%% ^& echo "x | y" ^> out"#
+        );
+        assert!(check_line("cmd /S /C echo a & echo b", Some(r"C:\a b")).is_ok());
+        assert!(check_line("cmd /S /C echo a\r\necho b", None).is_err());
+        assert!(check_line("cmd /S /C echo a\nb", None).is_err());
+        assert!(check_line("x", Some("C:\\\"x")).is_err());
     }
 
     #[test]
@@ -565,6 +703,53 @@ mod tests {
     fn a_failed_wrapper_reports_its_errors() {
         let (code, _) = follow_with(&[], "boom\r\n");
         assert!(code.unwrap_err().to_string().ends_with(": boom"));
+    }
+
+    #[test]
+    fn a_restart_waits_for_the_agent_to_stop_answering() {
+        use crate::qga::tests::{client, synced};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let agent = |answered: usize| {
+            let pings = Arc::new(AtomicUsize::new(0));
+            let seen = pings.clone();
+            let ga = client(move |request| match request["execute"].as_str() {
+                Some("guest-sync-delimited") => synced(request),
+                Some("guest-exec") => b"{\"return\": {\"pid\": 1}}\n".to_vec(),
+                Some("guest-ping") if seen.fetch_add(1, Ordering::SeqCst) < answered => {
+                    b"{\"return\": {}}\n".to_vec()
+                }
+                _ => b"{\"error\": {\"class\": \"GenericError\", \"desc\": \"gone\"}}\n".to_vec(),
+            });
+            (ga, pings)
+        };
+        // The old agent answers twice more, then is gone.
+        let (mut ga, pings) = agent(2);
+        restart(&mut ga, &mut || true).unwrap();
+        assert_eq!(pings.load(Ordering::SeqCst), 3);
+        // A guest that powers off instead is no restart.
+        let (mut ga, _) = agent(usize::MAX);
+        let err = restart(&mut ga, &mut || false).unwrap_err();
+        assert!(err.to_string().contains("powered off"), "{err}");
+    }
+
+    #[test]
+    fn a_ps1_runs_from_a_fixed_size_encoded_stub() {
+        let line = run_ps1_command_line(r"C:\t\a'b.ps1");
+        let (head, b64) = line.rsplit_once(' ').unwrap();
+        assert_eq!(
+            head,
+            "powershell.exe -NoProfile -NonInteractive -EncodedCommand"
+        );
+        let utf16: Vec<u16> = crate::sshagent::b64_decode(b64)
+            .unwrap()
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(
+            String::from_utf16(&utf16).unwrap(),
+            r"& ([scriptblock]::Create([IO.File]::ReadAllText('C:\t\a''b.ps1')))"
+        );
     }
 
     #[test]

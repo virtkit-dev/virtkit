@@ -242,6 +242,170 @@ fn generation_id(work: &Path) -> Result<[u8; 16]> {
     Ok(id)
 }
 
+/// The spec of a UEFI guest named `name` booting `firmware` on `disks`, its console log, qemu-ga
+/// and COM1 input sockets and VM generation ID in `work`; no network.
+pub(crate) fn guest_spec(
+    firmware: &Path,
+    work: &Path,
+    name: &str,
+    disks: Vec<Disk>,
+    cpus: u32,
+    mem: &str,
+) -> Result<VmSpec> {
+    Ok(VmSpec {
+        kernel: firmware.to_path_buf(),
+        cmdline: String::new(),
+        disks,
+        initramfs: None,
+        shares: Vec::new(),
+        vsock_ports: Vec::new(),
+        cpus,
+        mem: mem.to_string(),
+        net: Net::None,
+        nics: Vec::new(),
+        // Windows has no balloon driver unless the image installs one.
+        balloon: false,
+        serial_log: work.join(crate::run::CONSOLE_LOG),
+        // The firmware and Windows' EMS console write COM1.
+        console_serial: true,
+        pmu: false,
+        nested: false,
+        pass_fds: Vec::new(),
+        proc_name: crate::vmm::resolve_proc_name(name),
+        reboot: true,
+        numa: crate::numa::Numa::Auto,
+        guest_agent: Some(work.join(GUEST_AGENT_SOCKET)),
+        hyperv: true,
+        vm_generation_id: Some(generation_id(work)?),
+        serial_input: Some(work.join(CONSOLE_SOCKET)),
+    })
+}
+
+/// Stop the guest behind `ch`, with run directory `work`: press the ACPI power button, then
+/// request qemu-ga shutdown after [`BUTTON_GRACE`]. Return the elapsed time since the button,
+/// or `None` after [`crate::shutdown::STOP_GRACE`] if still running; the caller then kills it.
+async fn power_off(ch: &mut Child, work: &Path) -> Option<Duration> {
+    let pressed = Instant::now();
+    let deadline = pressed + crate::shutdown::STOP_GRACE;
+    let socket = work.join(GUEST_AGENT_SOCKET);
+    let button = crate::shutdown::press_power_button(ch);
+    if button && exited_by(ch, pressed + BUTTON_GRACE).await {
+        return Some(pressed.elapsed());
+    }
+    // Off the runtime: the agent's sync blocks for up to its timeout.
+    let asked = tokio::task::spawn_blocking(move || {
+        crate::qga::Client::connect(&socket, Duration::from_secs(5))?.shutdown()
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|r| r);
+    match asked {
+        Ok(()) if button => eprintln!(
+            "virtkit: guest still up {}s after the power button; asked qemu-ga to shut down",
+            BUTTON_GRACE.as_secs()
+        ),
+        Ok(()) => eprintln!("virtkit: no power button to press; asked qemu-ga to shut down"),
+        Err(e) => eprintln!("virtkit: qemu-ga shutdown: {e:#}"),
+    }
+    exited_by(ch, deadline).await.then(|| pressed.elapsed())
+}
+
+/// A UEFI guest a build boots: no network and no registry entry, in a run directory of its
+/// own. Dropping it kills a guest still running.
+pub(crate) struct Guest {
+    ch: Child,
+    work: PathBuf,
+    /// Holds an embedded firmware's memfd open for the VMM.
+    _firmware: crate::embed::Resolved,
+}
+
+impl Guest {
+    /// Boot `disks` as the guest `name`, with `work` as its run directory.
+    pub(crate) fn boot(
+        work: &Path,
+        name: &str,
+        disks: Vec<Disk>,
+        cpus: u32,
+        mem: &str,
+    ) -> Result<Guest> {
+        let firmware = firmware()?;
+        let spec = guest_spec(&firmware.path, work, name, disks, cpus, mem)?;
+        let vmm = crate::vmm::selected();
+        let ch = crate::run::spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal)?;
+        Ok(Guest {
+            ch,
+            work: work.to_path_buf(),
+            _firmware: firmware,
+        })
+    }
+
+    /// The guest's qemu-ga socket.
+    pub(crate) fn agent_socket(&self) -> PathBuf {
+        self.work.join(GUEST_AGENT_SOCKET)
+    }
+
+    /// The guest's serial console log.
+    pub(crate) fn console(&self) -> PathBuf {
+        self.work.join(crate::run::CONSOLE_LOG)
+    }
+
+    /// Whether the guest is still running.
+    pub(crate) fn running(&mut self) -> bool {
+        self.ch.try_wait().ok().flatten().is_none()
+    }
+
+    /// Wait up to `timeout` for the guest to power off by itself (a reboot does not end it):
+    /// `true` once it has, `false` if it is still running. A VMM that fails is an error.
+    pub(crate) fn wait_poweroff(&mut self, timeout: Duration) -> Result<bool> {
+        let end = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.ch.try_wait().context("waiting for the VMM")? {
+                if status.success() {
+                    return Ok(true);
+                }
+                bail!("{}", crate::run::boot_failure(&self.console(), status));
+            }
+            if Instant::now() >= end {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Stop the guest as `vk stop` does. Return an error if killed: its disk may hold a torn
+    /// write. Blocks; call outside async tasks (builds run on a blocking thread).
+    pub(crate) fn shutdown(mut self) -> Result<Duration> {
+        if !self.running() {
+            return Ok(Duration::ZERO);
+        }
+        let stop = power_off(&mut self.ch, &self.work);
+        let off = match tokio::runtime::Handle::try_current() {
+            Ok(rt) => rt.block_on(stop),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("starting a runtime to stop the guest")?
+                .block_on(stop),
+        };
+        match off {
+            Some(after) => Ok(after),
+            None => bail!(
+                "the guest did not power off within {}s and was killed",
+                crate::shutdown::STOP_GRACE.as_secs()
+            ),
+        }
+    }
+}
+
+impl Drop for Guest {
+    fn drop(&mut self) {
+        if self.running() {
+            let _ = self.ch.kill();
+        }
+        let _ = self.ch.wait();
+    }
+}
+
 /// Boot `bundle` and hold it until the guest powers off or the run is stopped.
 pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<()> {
     refuse_unsupported(args)?;
@@ -289,33 +453,9 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
         guest_ip = Some(crate::net::switch_addrs(crate::run::RUN_SUBNET)?.2);
     }
 
-    let spec = VmSpec {
-        kernel: firmware.path.clone(),
-        cmdline: String::new(),
-        disks,
-        initramfs: None,
-        shares: Vec::new(),
-        vsock_ports: Vec::new(),
-        cpus,
-        mem: mem.clone(),
-        net: Net::None,
-        nics,
-        // Windows has no balloon driver unless the image installs one.
-        balloon: false,
-        serial_log: console.clone(),
-        // The firmware and Windows' EMS console write COM1.
-        console_serial: true,
-        pmu: false,
-        nested: false,
-        pass_fds: Vec::new(),
-        proc_name: crate::vmm::resolve_proc_name(&name),
-        reboot: true,
-        numa: args.numa.clone(),
-        guest_agent: Some(work.join(GUEST_AGENT_SOCKET)),
-        hyperv: true,
-        vm_generation_id: Some(generation_id(work)?),
-        serial_input: Some(work.join(CONSOLE_SOCKET)),
-    };
+    let mut spec = guest_spec(&firmware.path, work, &name, disks, cpus, &mem)?;
+    spec.nics = nics;
+    spec.numa = args.numa.clone();
     let vmm = crate::vmm::selected();
     let mut ch = match crate::run::spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal) {
         Ok(ch) => ch,
@@ -358,42 +498,14 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
 
     let result = hold(&mut ch, &console, args.detach_log.as_deref()).await;
     if ch.try_wait().ok().flatten().is_none() {
-        // Stopped: press the power button; past BUTTON_GRACE, ask qemu-ga to shut down; kill
-        // when STOP_GRACE expires or on a second Ctrl-C.
-        let pressed = Instant::now();
-        let deadline = pressed + crate::shutdown::STOP_GRACE;
-        let socket = work.join(GUEST_AGENT_SOCKET);
-        let powered_off = async {
-            let button = crate::shutdown::press_power_button(&ch);
-            if button && exited_by(&mut ch, pressed + BUTTON_GRACE).await {
-                return true;
-            }
-            // Off the runtime: the agent's sync blocks for up to its timeout.
-            let asked = tokio::task::spawn_blocking(move || {
-                crate::qga::Client::connect(&socket, Duration::from_secs(5))?.shutdown()
-            })
-            .await
-            .map_err(anyhow::Error::from)
-            .and_then(|r| r);
-            match asked {
-                Ok(()) if button => eprintln!(
-                    "virtkit: guest still up {}s after the power button; asked qemu-ga to shut down",
-                    BUTTON_GRACE.as_secs()
-                ),
-                Ok(()) => {
-                    eprintln!("virtkit: no power button to press; asked qemu-ga to shut down")
-                }
-                Err(e) => eprintln!("virtkit: qemu-ga shutdown: {e:#}"),
-            }
-            exited_by(&mut ch, deadline).await
-        };
+        // Stopped: the power button, then qemu-ga's shutdown; the kill once STOP_GRACE runs
+        // out or on a second Ctrl-C.
         tokio::select! {
-            off = powered_off => match off {
-                true => println!(
-                    "virtkit: guest powered off ({:.0?} after the power button)",
-                    pressed.elapsed()
-                ),
-                false => eprintln!(
+            off = power_off(&mut ch, work) => match off {
+                Some(after) => {
+                    println!("virtkit: guest powered off ({after:.0?} after the power button)")
+                }
+                None => eprintln!(
                     "virtkit: guest still up {}s after the power button; killed",
                     crate::shutdown::STOP_GRACE.as_secs()
                 ),
