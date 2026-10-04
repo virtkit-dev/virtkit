@@ -21,7 +21,7 @@ Skip badges on restatements, tool output, and descriptions of your own next step
 
 virtkit — a rootless microVM toolkit shipped as static-musl binaries (`vk` + the
 embedded `vk-agent`, plus the optional `vk-registry` central server, the
-`vk-runnerctl` runner throttle and the experimental `vk-hub` web UI), with the VMM built in. It boots OCI/Docker images as fast microVMs on its embedded
+`vk-runnerctl` runner throttle and the experimental `vk-hub` fleet hub and local web UI), with the VMM built in. It boots OCI/Docker images as fast microVMs on its embedded
 [libkrun](https://github.com/containers/libkrun) VMM ([Cloud Hypervisor](https://www.cloudhypervisor.org/)
 stays available as an external backend via `VIRTKIT_VMM=cloud-hypervisor`), gives
 them a shared LAN with egress over ordinary host sockets (no tap, no bridge, no
@@ -69,10 +69,13 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with nine crates:
   in fleet mode: enrollment, the session's messages, protocol version negotiation, and the
   payloads each side signs or verifies. Types and pure functions only — no runtime,
   transport or crypto.
-- **`vk-hub/`** — the hub (bin, experimental): `vk-hub local` serves a web UI for the VMs of
-  the machine it runs on, read from `vk workloads --watch`, with sessions signed into by
-  single-use links and an audit log in a redb database. Built like the `vk-registry` server
-  (hyper on tokio); its admin socket is private to its user.
+- **`vk-hub/`** — the hub (bin, experimental). `vk-hub serve` is the fleet hub: it enrolls
+  `vk node`s with single-use tokens, pins each node's ed25519 key, holds their WebSocket
+  sessions and keeps their inventory and heartbeats in a redb database. `vk-hub local`
+  serves a web UI for the VMs of the machine it runs on, read from `vk workloads --watch`,
+  with sessions signed into by single-use links and an audit log. Built like the
+  `vk-registry` server (hyper, rustls on ring); operators reach it through a private unix
+  socket.
 - **`vk-runnerctl/`** — the only component that runs as root, and deliberately the smallest:
   it sets gitlab-runner's `concurrent` from a number unprivileged `vk` leaves in a file,
   clamped into a range only root can configure. It takes no arguments and no paths from its

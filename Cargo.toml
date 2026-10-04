@@ -149,6 +149,16 @@ tokio-util = { version = "0", features = ["codec"] }
 tokio-vsock = "0.7"
 # the messagepack codec tokio-serde uses, to assert the on-wire Status layout
 rmp-serde = "1"
+# fleet identities: `vk node` signs with an ed25519 key and `vk-hub` verifies against the
+# pinned public half. Already in the tree as the one crypto backend rustls and russh use, so
+# nothing new is linked.
+ring = "0.17"
+# the hub↔node WebSocket (`vk node` ↔ `vk-hub`). Handshake only — no `connect` or TLS
+# features: the hub takes the socket from hyper's upgrade and the node dials through
+# tokio-rustls itself, so TLS stays on the ring-backed rustls above and no second TLS stack
+# (or aws-lc-rs) comes in. Pure Rust; its handshake deps (http, httparse, sha1) are small
+# and mostly in the tree already.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # musl builds use jemalloc instead of the default musl allocator (same approach as ripgrep)
 jemallocator = "0.5"
 # vk-registry accounts.rs: an embedded users/sessions/API-keys store, alongside the

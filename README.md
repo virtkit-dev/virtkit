@@ -633,7 +633,7 @@ local store. The central server and storage model are documented in
 | `vk` | Host CLI, VMM, image builder, userspace network, compose runner, and GitLab executor. It embeds the default guest kernel and `vk-agent`. |
 | `vk-agent` | Guest PID 1 and command server. It configures mounts, networking, hostname, shared directories, optional SSH, and host-driven execution over vsock. |
 | `vk-registry` | Optional OCI-distribution server with a pull-through cache, a WebDAV view of the store with a plain-file area for compiler caches, and build-once locking. |
-| `vk-hub` | Experimental web UI for the VMs on this machine: `vk-hub local` serves it on loopback. |
+| `vk-hub` | Experimental hub for a fleet of `vk node` hosts, and a web UI for the VMs on this machine: `vk-hub local` serves it on loopback. |
 | `vk-runnerctl` | Optional root-side helper that adjusts GitLab runner concurrency within an administrator-configured range. |
 
 ## Architecture
@@ -781,7 +781,7 @@ vk-core/         shared host/guest protocol and runtime helpers
 vk-driver/       host driver, builder, VMM, networking, compose, and GitLab executor
 vk-agent/        guest PID 1 and exec server
 vk-registry/     optional central OCI store and distribution server
-vk-hub/          experimental local web UI for this machine's VMs
+vk-hub/          experimental fleet hub, and local web UI for this machine's VMs
 vk-runnerctl/    optional root-side GitLab concurrency helper
 vk-selfupdate/   shared self-update implementation for vk and vk-registry
 vk-fs/           filesystem objects created private and published whole

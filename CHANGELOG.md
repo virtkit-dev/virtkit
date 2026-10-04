@@ -4,6 +4,14 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Experimental: `vk-hub`, a hub for a fleet of `vk` hosts.** `vk-hub serve --config
+  hub.toml` accepts hosts that enroll with a single-use token from `vk-hub token create`,
+  and keeps what each one reports about itself. `vk-hub nodes` lists them: whether each is
+  connected, when it was last seen, its `vk` version, CPUs and memory, and the memory its CI
+  jobs have committed against the budget; `vk-hub nodes remove` takes one out of the fleet.
+
 ### Fixed
 
 - `vk-registry` now announces connection closure when refusing a request with a body,
