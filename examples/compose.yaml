@@ -53,6 +53,10 @@ services:
       POSTGRES_DB: appliance
       PGDATA: /var/lib/postgresql/data
     user: postgres
+    healthcheck:                         # probed for a dependent waiting on service_healthy
+      test: ["CMD", "pg_isready", "-q"]  # or ["CMD-SHELL", "line"], or a string (shell form)
+      interval: 2s
+      retries: 30
     x-virtkit:
       mem: 2G
     volumes:
@@ -87,4 +91,5 @@ services:
     command: sleep infinity
     depends_on:
       db:
-        condition: service_started       # the only condition: start ordering, no readiness wait
+        condition: service_healthy       # waits for db's healthcheck to pass (service_started:
+                                         # start order alone; service_completed_successfully)

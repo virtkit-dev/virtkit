@@ -52,6 +52,17 @@ All notable changes to virtkit will be documented in this file.
   in place and run again: its vCPUs stop at an instruction boundary, memory and devices kept,
   and its clock is right on resume. Linux guests and Windows compose services cannot be paused
   (yet).
+- **Compose `healthcheck` and `depends_on` conditions.** A service's `healthcheck` (`test` as
+  `["CMD", …]`, `["CMD-SHELL", "…"]` or a string, with `interval`, `timeout`, `retries` and
+  `start_period`, Docker's defaults otherwise or for a zero; `disable: true` or `["NONE"]` for
+  none; `start_interval` ignored) runs in its guest, through vk-agent in a Linux one (as the
+  service's `user`) and qemu-ga in a Windows one. A service whose `depends_on` names a
+  dependency with `condition: service_healthy` starts once that dependency's check passes,
+  probed once per start of the dependency, and with `service_completed_successfully` once that
+  dependency's guest has ended successfully (a job; for a Linux guest, its service's exit code
+  is 0); `service_started` keeps meaning start order alone. An unknown condition, `required:
+  false`, or waiting for the health of a service without a healthcheck is refused when the file
+  is read; `restart:` is ignored.
 - **Compose `secrets:`.** A top-level secret with a `file:` source is given to each service
   that lists it (by name, or `{source, target}`), as Docker places it: a Linux guest reads it at
   `/run/secrets/<target>` through a read-only bind, a Windows guest gets a copy at

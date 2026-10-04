@@ -38,6 +38,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -60,7 +61,8 @@ pub struct Unit {
     /// `None` for a [`Source::Bundle`], which carries its command line itself.
     pub command: Option<Vec<String>>,
     pub user: Option<String>,
-    /// services that must be started before this one (ordering only)
+    /// services that must start before this one; [`Self::wait_for`] adds their conditions
+    /// beyond start ordering
     pub depends_on: Vec<String>,
     pub volumes: Vec<Volume>,
     /// compose profiles: a service with any profile assigned is declared but NOT
@@ -117,6 +119,41 @@ pub struct Unit {
     /// `C:\ProgramData\Docker\secrets\<target>`, readable by SYSTEM and administrators only,
     /// before its provisioning runs.
     pub secrets: Vec<Secret>,
+    /// How to tell the service is healthy (compose `healthcheck`), for a service that waits
+    /// on it with `depends_on: {condition: service_healthy}`.
+    pub healthcheck: Option<HealthCheck>,
+    /// The dependencies this service waits on beyond their start (`depends_on` conditions
+    /// `service_healthy` and `service_completed_successfully`).
+    pub wait_for: Vec<(String, Condition)>,
+}
+
+/// A compose `healthcheck`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthCheck {
+    pub test: HealthTest,
+    pub interval: Duration,
+    pub timeout: Duration,
+    /// Failures in a row past `start_period` that make the service unhealthy (at least 1).
+    pub retries: u32,
+    /// How long failures do not count, from when a dependent starts waiting (Docker counts
+    /// from the container's start).
+    pub start_period: Duration,
+}
+
+/// A healthcheck's test: a program and its arguments, or a shell command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealthTest {
+    Exec(Vec<String>),
+    Shell(String),
+}
+
+/// What a service waits for in a dependency before it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Condition {
+    /// Its healthcheck passes.
+    Healthy,
+    /// It ran to completion and ended successfully.
+    CompletedSuccessfully,
 }
 
 /// A secret a service is given: the host file behind it and the name the guest reads it under.
@@ -823,6 +860,23 @@ pub fn parse(
                 .with_context(|| format!("service {name:?}"))?,
         );
     }
+    for unit in &units {
+        for (dependency, condition) in &unit.wait_for {
+            let waits_on_health = *condition == Condition::Healthy;
+            match units.iter().find(|u| &u.name == dependency) {
+                None => bail!(
+                    "service {:?}: depends_on {dependency:?}, which is not declared",
+                    unit.name
+                ),
+                Some(dep) if waits_on_health && dep.healthcheck.is_none() => bail!(
+                    "service {:?}: waits for {dependency:?} to be healthy, which declares \
+                     no healthcheck",
+                    unit.name
+                ),
+                Some(_) => {}
+            }
+        }
+    }
     Ok(units)
 }
 
@@ -958,13 +1012,19 @@ fn map_service(
             vol.persist_backing = Some(persist_backing_path(&anchor, name, &vol.guest));
         }
     }
-    let depends_on = match svc.depends_on {
+    let (depends_on, wait_for) = match svc.depends_on {
         Some(d) => {
-            d.validate()?;
-            d.into_names()
+            let wait_for = d.conditions()?;
+            (d.into_names(), wait_for)
         }
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
+    let healthcheck = svc
+        .healthcheck
+        .map(ComposeHealthcheck::into_check)
+        .transpose()
+        .context("healthcheck")?
+        .flatten();
     // The hostname lands unquoted in the switch's `--host <name>=<ip>` and the guest
     // cmdline, so it gets the same DNS-label gate as the service name.
     let hostname = match svc.hostname {
@@ -1070,6 +1130,12 @@ fn map_service(
             persist_backing: None,
         }));
     }
+    // A Windows guest runs a shell-form test from a batch file, which a newline would end.
+    if let (Source::Bundle { .. }, Some(HealthTest::Shell(line))) =
+        (&source, healthcheck.as_ref().map(|c| &c.test))
+    {
+        crate::winexec::check_line(line, None).context("healthcheck")?;
+    }
     Ok(Unit {
         name: name.to_string(),
         hostname,
@@ -1093,6 +1159,8 @@ fn map_service(
         persist_root_backing,
         tap,
         secrets,
+        healthcheck,
+        wait_for,
     })
 }
 
@@ -2030,6 +2098,7 @@ struct ComposeService {
     user: Option<String>,
     hostname: Option<String>,
     depends_on: Option<DependsOn>,
+    healthcheck: Option<ComposeHealthcheck>,
     #[serde(default)]
     volumes: Vec<String>,
     #[serde(default)]
@@ -2331,9 +2400,9 @@ impl Cmd {
     }
 }
 
-/// compose depends_on: a name list, or a map with per-dependency conditions —
-/// only start-ordering is supported, so `service_started` (the default) passes
-/// and anything else (e.g. `service_healthy`) errors.
+/// compose depends_on: a name list, or a map with per-dependency conditions:
+/// `service_started` (the default, start ordering alone), `service_healthy` or
+/// `service_completed_successfully`.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum DependsOn {
@@ -2341,10 +2410,16 @@ enum DependsOn {
     Map(BTreeMap<String, DependsCondition>),
 }
 
+/// One `depends_on` map entry. `restart` (restart the dependent along with its dependency) is
+/// accepted and ignored; `required: false` (start anyway when the dependency is missing) is
+/// refused: a dependency that is declared is always started.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DependsCondition {
     condition: Option<String>,
+    required: Option<bool>,
+    #[serde(rename = "restart")]
+    _restart: Option<serde::de::IgnoredAny>,
 }
 
 impl DependsOn {
@@ -2355,20 +2430,119 @@ impl DependsOn {
         }
     }
 
-    fn validate(&self) -> Result<()> {
-        if let DependsOn::Map(m) = self {
-            for (name, c) in m {
-                match c.condition.as_deref() {
-                    None | Some("service_started") => {}
-                    Some(other) => bail!(
-                        "depends_on {name:?}: condition {other:?} is not supported \
-                         (start ordering only)"
-                    ),
+    /// Dependencies and conditions waited on beyond start ordering.
+    fn conditions(&self) -> Result<Vec<(String, Condition)>> {
+        let DependsOn::Map(m) = self else {
+            return Ok(Vec::new());
+        };
+        let mut waits = Vec::new();
+        for (name, c) in m {
+            if c.required == Some(false) {
+                bail!("depends_on {name:?}: `required: false` is not supported");
+            }
+            match c.condition.as_deref() {
+                None | Some("service_started") => {}
+                Some("service_healthy") => waits.push((name.clone(), Condition::Healthy)),
+                Some("service_completed_successfully") => {
+                    waits.push((name.clone(), Condition::CompletedSuccessfully))
                 }
+                Some(other) => bail!("depends_on {name:?}: unknown condition {other:?}"),
             }
         }
-        Ok(())
+        Ok(waits)
     }
+}
+
+/// A service's compose `healthcheck`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComposeHealthcheck {
+    test: Option<Cmd>,
+    interval: Option<String>,
+    timeout: Option<String>,
+    retries: Option<Scalar>,
+    start_period: Option<String>,
+    /// ignored: vk probes at `interval` throughout
+    #[serde(rename = "start_interval")]
+    _start_interval: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    disable: bool,
+}
+
+impl ComposeHealthcheck {
+    /// The check, with Docker's defaults (30 s interval and timeout, 3 retries, no start
+    /// period), which a zero value also stands for; `None` for a disabled one.
+    fn into_check(self) -> Result<Option<HealthCheck>> {
+        let test = match self.test {
+            _ if self.disable => return Ok(None),
+            None => bail!("needs a `test`"),
+            Some(Cmd::Str(line)) => HealthTest::Shell(line),
+            Some(Cmd::List(argv)) => match argv.split_first() {
+                Some((kind, rest)) if kind == "CMD" && !rest.is_empty() => {
+                    HealthTest::Exec(rest.to_vec())
+                }
+                Some((kind, [line])) if kind == "CMD-SHELL" => HealthTest::Shell(line.clone()),
+                Some((kind, [])) if kind == "NONE" => return Ok(None),
+                _ => bail!("`test` is [\"CMD\", …], [\"CMD-SHELL\", \"…\"] or [\"NONE\"]"),
+            },
+        };
+        let duration = |value: Option<String>, default: u64| -> Result<Duration> {
+            let value = value.map(|v| compose_duration(&v)).transpose()?;
+            Ok(value
+                .filter(|d| !d.is_zero())
+                .unwrap_or(Duration::from_secs(default)))
+        };
+        let retries = match self.retries.map(Scalar::into_string) {
+            Some(r) => r
+                .parse()
+                .with_context(|| format!("retries {r:?}: not a count"))?,
+            None => 0,
+        };
+        Ok(Some(HealthCheck {
+            test,
+            interval: duration(self.interval, 30)?,
+            timeout: duration(self.timeout, 30)?,
+            retries: if retries == 0 { 3 } else { retries },
+            start_period: duration(self.start_period, 0)?,
+        }))
+    }
+}
+
+/// A compose duration: numbers with units, `1m30s`, `500ms`, `2h` (units `h`, `m`, `s`, `ms`,
+/// `us` or `µs`, `ns`).
+fn compose_duration(text: &str) -> Result<Duration> {
+    let mut total = Duration::ZERO;
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        bail!("empty duration");
+    }
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .with_context(|| format!("duration {text:?}: a number without a unit"))?;
+        let value: f64 = rest[..digits]
+            .parse()
+            .with_context(|| format!("duration {text:?}"))?;
+        rest = &rest[digits..];
+        let unit = rest
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let seconds = match &rest[..unit] {
+            "h" => 3600.0,
+            "m" => 60.0,
+            "s" => 1.0,
+            "ms" => 1e-3,
+            "us" | "µs" => 1e-6,
+            "ns" => 1e-9,
+            other => bail!("duration {text:?}: unknown unit {other:?}"),
+        };
+        total = Duration::try_from_secs_f64(value * seconds)
+            .ok()
+            .and_then(|part| total.checked_add(part))
+            .with_context(|| format!("duration {text:?}: out of range"))?;
+        rest = &rest[unit..];
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -2631,6 +2805,109 @@ mod tests {
             .unwrap_err();
             assert!(format!("{err:#}").contains(key), "{key}: {err:#}");
         }
+    }
+
+    #[test]
+    fn a_healthcheck_and_the_conditions_waiting_on_it_are_read() {
+        let units = parse(
+            "services:\n  dc:\n    image: x\n    healthcheck:\n      test: [\"CMD\", \"check\", \"-q\"]\n\
+             \x20     interval: 1m30s\n      timeout: 500ms\n      retries: 5\n      start_period: 2m\n\
+             \x20 seed:\n    image: x\n    depends_on:\n      dc:\n        condition: service_healthy\n\
+             \x20 member:\n    image: x\n    healthcheck:\n      test: nc -z dc 389\n\
+             \x20   depends_on:\n      dc:\n        condition: service_started\n\
+             \x20     seed:\n        condition: service_completed_successfully\n",
+            Path::new("/base"),
+        )
+        .unwrap();
+        let by = |name: &str| units.iter().find(|u| u.name == name).unwrap();
+        let dc = by("dc").healthcheck.clone().unwrap();
+        assert_eq!(dc.test, HealthTest::Exec(vec!["check".into(), "-q".into()]));
+        assert_eq!(dc.interval, std::time::Duration::from_secs(90));
+        assert_eq!(dc.timeout, std::time::Duration::from_millis(500));
+        assert_eq!((dc.retries, dc.start_period.as_secs()), (5, 120));
+        assert_eq!(
+            by("seed").wait_for,
+            vec![("dc".to_string(), Condition::Healthy)]
+        );
+        let member = by("member");
+        assert_eq!(
+            member.healthcheck.as_ref().unwrap().test,
+            HealthTest::Shell("nc -z dc 389".into())
+        );
+        // Docker's defaults.
+        assert_eq!(
+            member.healthcheck.as_ref().unwrap().interval,
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            member.wait_for,
+            vec![("seed".to_string(), Condition::CompletedSuccessfully)]
+        );
+        let mut deps = member.depends_on.clone();
+        deps.sort();
+        assert_eq!(deps, ["dc", "seed"]);
+    }
+
+    #[test]
+    fn waiting_for_health_needs_a_healthcheck_and_a_disabled_one_is_none() {
+        let err = parse(
+            "services:\n  dc:\n    image: x\n  seed:\n    image: x\n    depends_on:\n\
+             \x20     dc:\n        condition: service_healthy\n",
+            Path::new("/base"),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("declares no healthcheck"),
+            "{err:#}"
+        );
+        let u = one(
+            "services:\n  dc:\n    image: x\n    healthcheck:\n      test: [\"CMD\", \"x\"]\n\
+             \x20     disable: true\n",
+        );
+        assert!(u.healthcheck.is_none());
+        let u = one("services:\n  dc:\n    image: x\n    healthcheck:\n      test: [\"NONE\"]\n");
+        assert!(u.healthcheck.is_none());
+    }
+
+    #[test]
+    fn durations_take_docker_units_and_refuse_what_overflows() {
+        let ms = |text| compose_duration(text).unwrap().as_nanos();
+        assert_eq!(ms("1h2m3s"), 3_723_000_000_000);
+        assert_eq!(ms("1.5s"), 1_500_000_000);
+        assert_eq!(
+            (ms("7ms"), ms("7us"), ms("7µs"), ms("7ns")),
+            (7_000_000, 7_000, 7_000, 7)
+        );
+        for bad in ["5", "5x", "", "m", "1e400h", "9999999999999999999h"] {
+            assert!(compose_duration(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn zero_values_and_ignored_keys_mean_dockers_defaults() {
+        let u = one(
+            "services:\n  dc:\n    image: x\n    healthcheck:\n      test: [\"CMD\", \"x\"]\n\
+             \x20     interval: 0s\n      timeout: 0s\n      retries: 0\n      start_interval: 1s\n",
+        );
+        let check = u.healthcheck.unwrap();
+        assert_eq!(check.interval, Duration::from_secs(30));
+        assert_eq!(check.timeout, Duration::from_secs(30));
+        assert_eq!((check.retries, check.start_period), (3, Duration::ZERO));
+    }
+
+    #[test]
+    fn depends_on_ignores_restart_and_refuses_an_optional_dependency() {
+        let file = |extra: &str| {
+            format!(
+                "services:\n  a:\n    image: x\n    depends_on:\n      b:\n        \
+                 condition: service_started\n        {extra}\n  b:\n    image: y\n"
+            )
+        };
+        for ok in ["restart: true", "required: true"] {
+            assert!(parse(&file(ok), Path::new("/b")).is_ok(), "{ok}");
+        }
+        let err = parse(&file("required: false"), Path::new("/b")).unwrap_err();
+        assert!(format!("{err:#}").contains("not supported"), "{err:#}");
     }
 
     #[test]
@@ -3587,7 +3864,7 @@ mod tests {
     }
 
     #[test]
-    fn depends_on_orders_and_rejects_health_conditions() {
+    fn depends_on_orders_and_rejects_unknown_or_unmet_conditions() {
         let units = parse(
             "services:\n  a:\n    image: x\n    depends_on: [b]\n  b:\n    image: y\n",
             Path::new("/b"),
@@ -3609,10 +3886,16 @@ mod tests {
         )
         .unwrap();
         assert!(boot_order(&cycle).is_err());
-        // condition map: started ok, healthy rejected
+        // condition map: healthy needs the dependency's healthcheck; an unknown one is refused
         let healthy = "services:\n  a:\n    image: x\n    depends_on:\n      b:\n        condition: service_healthy\n  b:\n    image: y\n";
         let err = parse(healthy, Path::new("/b")).unwrap_err();
-        assert!(format!("{err:#}").contains("service_healthy"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("declares no healthcheck"),
+            "{err:#}"
+        );
+        let unknown = healthy.replace("service_healthy", "service_happy");
+        let err = parse(&unknown, Path::new("/b")).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown condition"), "{err:#}");
     }
 
     #[test]
