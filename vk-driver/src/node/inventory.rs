@@ -1,7 +1,7 @@
 //! What `vk node` reports: the inventory — hardware, storage, versions, runner — and the
-//! heartbeat's readings. Everything comes from what the rest of `vk` already measures: the
-//! admission ledger, the scheduler's desired-concurrency file, the memory budget, the NUMA
-//! topology and `vk check`.
+//! heartbeat's readings, with the workloads read alongside them. Everything comes from what
+//! the rest of `vk` already measures: the admission ledger, the scheduler's
+//! desired-concurrency file, the memory budget, the NUMA topology and `vk check`.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ use vk_hub_proto::{
 
 use crate::check::Feature;
 use crate::config::Config;
+use crate::workloads::{Ledger, Listed, Lister};
 
 /// The `vk check` features a node must pass to enroll, and reports in its inventory: the
 /// ones every VM this host boots depends on.
@@ -83,35 +84,33 @@ pub fn inventory(cfg: &Config) -> Inventory {
 pub struct Readings {
     /// The admission as last read, standing in while an admission holds the ledger.
     admission: Option<Admission>,
-    ledger_said: Once,
-    anomalies_said: Once,
+    /// The VM registry the workloads are read from; `None` for the user's own.
+    registry: Option<PathBuf>,
+    /// The workloads' lister, for its measuring cadence and last figures; made on the first
+    /// heartbeat.
+    lister: Option<Lister>,
 }
 
-/// A note said once for as long as it stays the same.
-#[derive(Default)]
-struct Once(Option<String>);
-
-impl Once {
-    /// Say `note` unless it was the last one said; `None` is all clear.
-    fn say(&mut self, note: Option<String>) {
-        if note != self.0 {
-            if let Some(note) = &note {
-                say!("{note}");
-            }
-            self.0 = note;
+impl Readings {
+    /// Readings of the VMs in `registry`, or the user's own registry's when `None`.
+    pub fn new(registry: Option<PathBuf>) -> Self {
+        Readings {
+            registry,
+            ..Readings::default()
         }
     }
 }
 
-pub fn heartbeat(cfg: &Config, readings: &mut Readings) -> Heartbeat {
+/// The heartbeat, and the workloads its memory readings are for: both read off one look at
+/// the admission ledger.
+pub fn heartbeat(cfg: &Config, readings: &mut Readings) -> (Heartbeat, Listed) {
+    let lister = readings.lister.get_or_insert_with(|| {
+        Lister::new(cfg.node.workload_mem_every(), readings.registry.clone())
+    });
     // Do not wait for the admission's ledger lock: that would delay the heartbeat.
     // Reuse the last admission reading until the lock is free.
-    match crate::admit::try_committed(&cfg.state_dir().join("admit")) {
-        Ok(Some((held, anomalies))) => {
-            readings.ledger_said.say(None);
-            readings
-                .anomalies_said
-                .say((!anomalies.is_empty()).then(|| anomalies.join("\n")));
+    match lister.read_ledger(cfg) {
+        Ledger::Read(held) => {
             readings.admission = Some(Admission {
                 committed_mib: held.granted_mib,
                 // An unresolvable budget (a percentage on a host whose memory cannot be
@@ -122,15 +121,11 @@ pub fn heartbeat(cfg: &Config, readings: &mut Readings) -> Heartbeat {
                 waiting: u32::try_from(held.ahead).unwrap_or(u32::MAX),
             });
         }
-        Ok(None) => {}
-        Err(e) => {
-            readings
-                .ledger_said
-                .say(Some(format!("cannot read the admission ledger: {e:#}")));
-            readings.admission = None;
-        }
+        Ledger::Busy => {}
+        Ledger::Unreadable => readings.admission = None,
     }
-    Heartbeat {
+    let (workloads, workload_mem_bytes) = lister.look(cfg);
+    let heartbeat = Heartbeat {
         admission: readings.admission.clone(),
         desired_concurrency: std::fs::read_to_string(crate::schedule::desired_file(cfg))
             .ok()
@@ -148,8 +143,9 @@ pub fn heartbeat(cfg: &Config, readings: &mut Readings) -> Heartbeat {
                 })
             })
             .collect(),
-        workload_mem_bytes: Default::default(),
-    }
+        workload_mem_bytes,
+    };
+    (heartbeat, workloads)
 }
 
 /// The filesystems a node reports: the job dirs always, host checkouts when the executor
@@ -379,7 +375,10 @@ mod tests {
         assert_eq!(fs.speed, Some(vk_hub_proto::SpeedClass::Slow));
         assert!(fs.size_bytes > 0);
         assert!(fs.path.ends_with("vk-node-no-such-state/jobs"));
-        let hb = heartbeat(&cfg, &mut Readings::default());
+        // The VMs from a registry with none in it, not this host's.
+        let registry = std::env::temp_dir().join("vk-node-no-such-registry");
+        let (hb, listed) = heartbeat(&cfg, &mut Readings::new(Some(registry)));
+        assert_eq!(listed, Default::default());
         assert_eq!(hb.storage.len(), 1);
         // No ledger at all is a fresh host, not a failure.
         assert_eq!(hb.admission.map(|a| a.committed_mib), Some(0));

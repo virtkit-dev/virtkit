@@ -1,11 +1,11 @@
 //! One session with the hub: dial, authenticate, then inventory and heartbeats until the
 //! connection fails or the process is told to stop. [`super::run`] redials.
 //!
-//! Nothing in the session loop waits on the host: the inventory and heartbeat are gathered
-//! by a [`Gatherer`] task of their own, since a hung mount's `statvfs` or a held ledger lock
-//! would otherwise stop the loop from noticing that the hub has gone quiet. Every send has
-//! a deadline, and the socket carries keepalives and a `TCP_USER_TIMEOUT`, so a peer that
-//! vanished without a word ends the session rather than wedging it.
+//! Nothing in the session loop waits on the host: the inventory, heartbeat and workloads are
+//! gathered by a [`Gatherer`] task of their own, since a hung mount's `statvfs` or a held
+//! ledger lock would otherwise stop the loop from noticing that the hub has gone quiet. Every
+//! send has a deadline, and the socket carries keepalives and a `TCP_USER_TIMEOUT`, so a peer
+//! that vanished without a word ends the session rather than wedging it.
 
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -20,11 +20,14 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use vk_hub_proto::{Channel, Heartbeat, HubMsg, Inventory, NodeMsg, PROTOCOL, TLS_EXPORTER_LEN};
+use vk_hub_proto::{
+    Channel, Heartbeat, HubMsg, Inventory, NodeMsg, PROTOCOL, Report, TLS_EXPORTER_LEN,
+};
 
 use super::Enrollment;
 use super::identity::Identity;
 use crate::config::Config;
+use crate::workloads::Listed;
 
 /// How long dialing, TLS and the WebSocket handshake may take together, and how long each
 /// handshake message may take to arrive.
@@ -100,8 +103,9 @@ enum Ask {
 
 /// What it answers with.
 pub enum Gathered {
-    Inventory(Inventory),
-    Heartbeat(Heartbeat),
+    Inventory(Box<Inventory>),
+    /// The heartbeat, and the workloads its memory readings are for.
+    Heartbeat(Heartbeat, Listed),
 }
 
 /// What is asked and not yet taken up: one flag per kind, so asking again while the gatherer
@@ -123,11 +127,18 @@ pub struct Gatherer {
 
 impl Gatherer {
     pub fn spawn(cfg: Arc<Config>) -> Self {
+        Gatherer::spawn_in(cfg, None)
+    }
+
+    /// [`Gatherer::spawn`], reading the VMs from `registry`, or the user's own registry when
+    /// `None`.
+    fn spawn_in(cfg: Arc<Config>, registry: Option<PathBuf>) -> Self {
         let asked = Arc::new(Asked::default());
         let (answer, answers) = mpsc::channel(4);
         let pending = asked.clone();
         tokio::spawn(async move {
-            let mut readings = super::inventory::Readings::default();
+            let fresh = || super::inventory::Readings::new(registry.clone());
+            let mut readings = fresh();
             loop {
                 let what = if pending.inventory.swap(false, Ordering::AcqRel) {
                     Ask::Inventory
@@ -143,13 +154,17 @@ impl Gatherer {
                 let cfg = cfg.clone();
                 // Handed to the read and back, so a lasting complaint is said once; a read
                 // that panicked starts it over.
-                let held = std::mem::take(&mut readings);
+                let held = std::mem::replace(&mut readings, fresh());
                 let gathered = tokio::task::spawn_blocking(move || {
                     let mut readings = held;
                     let g = match what {
-                        Ask::Inventory => Gathered::Inventory(super::inventory::inventory(&cfg)),
+                        Ask::Inventory => {
+                            Gathered::Inventory(Box::new(super::inventory::inventory(&cfg)))
+                        }
                         Ask::Heartbeat => {
-                            Gathered::Heartbeat(super::inventory::heartbeat(&cfg, &mut readings))
+                            let (heartbeat, workloads) =
+                                super::inventory::heartbeat(&cfg, &mut readings);
+                            Gathered::Heartbeat(heartbeat, workloads)
                         }
                     };
                     (g, readings)
@@ -220,6 +235,8 @@ pub async fn run(
     gatherer.drain();
     gatherer.request(Ask::Inventory);
     let mut sent_inventory: Option<Inventory> = None;
+    // The workloads this session has reported: the first heartbeat's go out on a report.
+    let mut sent_workloads: Option<Listed> = None;
     let mut deadline = tokio::time::Instant::now() + quiet;
     let mut beat = tokio::time::interval(heartbeat);
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -239,20 +256,31 @@ pub async fn run(
             _ = beat.tick() => gatherer.request(Ask::Heartbeat),
             _ = recheck.tick() => gatherer.request(Ask::Inventory),
             Some(gathered) = gatherer.answers.recv() => {
-                let msg = match gathered {
-                    Gathered::Heartbeat(hb) => NodeMsg::Heartbeat(hb),
-                    Gathered::Inventory(inventory)
-                        if sent_inventory.as_ref() == Some(&inventory) => continue,
-                    Gathered::Inventory(inventory) => {
-                        sent_inventory = Some(inventory.clone());
-                        NodeMsg::Inventory(inventory)
+                let mut msgs = Vec::with_capacity(2);
+                match gathered {
+                    Gathered::Heartbeat(hb, workloads) => {
+                        // The report first, so the heartbeat's readings land on the list
+                        // they are for.
+                        if sent_workloads.as_ref() != Some(&workloads) {
+                            msgs.push(NodeMsg::Report(Report {
+                                workloads: Some(workloads.workloads.clone()),
+                                workloads_omitted: workloads.omitted,
+                            }));
+                            sent_workloads = Some(workloads);
+                        }
+                        msgs.push(NodeMsg::Heartbeat(hb));
                     }
-                };
-                // A hub slow to take the message does not hold up a stop; a close cannot
-                // follow a frame cut off midway, so none is sent.
-                tokio::select! {
-                    sent = send(&mut ws, &msg, heartbeat) => sent?,
-                    () = stopped(stop) => return Ok(()),
+                    Gathered::Inventory(inventory)
+                        if sent_inventory.as_ref() == Some(&*inventory) => continue,
+                    Gathered::Inventory(inventory) => {
+                        sent_inventory = Some((*inventory).clone());
+                        msgs.push(NodeMsg::Inventory(*inventory));
+                    }
+                }
+                for msg in &msgs {
+                    if !send_unless_stopped(&mut ws, msg, heartbeat, stop).await? {
+                        return Ok(());
+                    }
                 }
             }
             () = tokio::time::sleep_until(deadline) => {
@@ -280,6 +308,21 @@ pub async fn run(
 /// otherwise.
 pub async fn stopped(stop: &mut watch::Receiver<bool>) {
     let _ = stop.wait_for(|&s| s).await;
+}
+
+/// Send `msg` within `within`, or give it up once `stop` is raised: `false` when stopped. A
+/// hub slow to take the message does not hold up a stop; a close cannot follow a frame cut
+/// off midway, so none is sent.
+async fn send_unless_stopped(
+    ws: &mut Ws,
+    msg: &NodeMsg,
+    within: Duration,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<bool> {
+    tokio::select! {
+        sent = send(ws, msg, within) => sent.map(|()| true),
+        () = stopped(stop) => Ok(false),
+    }
 }
 
 /// A message from the hub inside a session.
@@ -620,7 +663,8 @@ mod tests {
                 incarnation: "cd".repeat(16),
                 tls: Arc::new(tls),
             },
-            gatherer: Gatherer::spawn(Arc::new(cfg)),
+            // A registry of its own, with no VM in it, not this host's.
+            gatherer: Gatherer::spawn_in(Arc::new(cfg), Some(dir.join("vms"))),
             stop,
             stopped,
             listener,
@@ -704,14 +748,17 @@ mod tests {
             // The first heartbeat goes out at once, the next not for a minute: none is
             // being sent when the stop comes.
             hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
-            let (mut inventory, mut heartbeat) = (false, false);
+            let (mut inventory, mut heartbeat, mut workloads) = (false, false, false);
             while !(inventory && heartbeat) {
                 match hub_receive(&mut ws).await.unwrap() {
                     NodeMsg::Inventory(_) => inventory = true,
                     NodeMsg::Heartbeat(_) => heartbeat = true,
+                    NodeMsg::Report(r) => workloads |= r.workloads.is_some(),
                     other => panic!("unexpected {other:?}"),
                 }
             }
+            // The first heartbeat's workloads went out on a report ahead of it.
+            assert!(workloads);
             stop.send(true).unwrap();
             // A close frame, not a dropped socket.
             loop {
@@ -745,7 +792,11 @@ mod tests {
                     hostname: format!("{i}-{}", "x".repeat(256 * 1024)),
                     ..Default::default()
                 };
-                if feed.send(Gathered::Inventory(inventory)).await.is_err() {
+                if feed
+                    .send(Gathered::Inventory(Box::new(inventory)))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -775,6 +826,37 @@ mod tests {
         let (_, ended) = tokio::join!(hub, node);
         feeder.abort();
         ended.expect("the session outlived its stop").unwrap();
+    }
+
+    /// The workloads go out on a report once, and not again with every heartbeat while
+    /// they stay the same.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workloads_are_reported_once_while_they_stay_the_same() {
+        let mut f = fixture("workloads").await;
+        let (node, gatherer, stopped, listener, stop) = f.parts();
+        let key = node.identity.public_key().to_vec();
+        let hub = async {
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, PROTOCOL, PROTOCOL.max).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            let (mut heartbeats, mut with_workloads) = (0, 0);
+            while heartbeats < 4 {
+                match next_of(&mut ws, Some).await {
+                    NodeMsg::Heartbeat(_) => {
+                        heartbeats += 1;
+                        // As a hub pings, so the node does not give the session up as silent.
+                        ws.send(Message::Ping(Vec::new().into())).await.unwrap();
+                    }
+                    NodeMsg::Report(r) if r.workloads.is_some() => with_workloads += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(with_workloads, 1);
+            stop.send(true).unwrap();
+            while hub_receive(&mut ws).await.is_some() {}
+        };
+        let (_, ended) = tokio::join!(hub, run(node, gatherer, stopped));
+        ended.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -861,6 +943,19 @@ mod tests {
         let err = ended.unwrap_err();
         assert!(!err.is::<Permanent>());
         assert!(format!("{err:#}").contains("busy"), "{err:#}");
+    }
+
+    /// The next message of a kind `pick` accepts, skipping the rest.
+    async fn next_of<T>(ws: &mut HubSide, pick: impl Fn(NodeMsg) -> Option<T>) -> T {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), hub_receive(ws))
+                .await
+                .expect("the node went quiet")
+                .expect("the node closed the session");
+            if let Some(t) = pick(msg) {
+                return t;
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

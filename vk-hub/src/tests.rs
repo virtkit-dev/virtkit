@@ -824,6 +824,7 @@ fn the_nodes_table_lines_up_and_marks_what_is_unknown() {
             mem_total_mib: Some(512 * 1024),
             committed_mib: Some(8 * 1024),
             budget_mib: Some(400 * 1024),
+            ..ops::NodeView::default()
         },
         ops::NodeView {
             id: "b".repeat(32),
@@ -841,6 +842,7 @@ fn the_nodes_table_lines_up_and_marks_what_is_unknown() {
         ("REACH", "connected"),
         ("LAST SEEN", "5s ago"),
         ("ADMITTED", "8G/400G"),
+        ("VMS", "-"),
     ] {
         assert_eq!(cell(header, a, column), want, "{column}\n{table}");
     }
@@ -848,6 +850,225 @@ fn the_nodes_table_lines_up_and_marks_what_is_unknown() {
         assert_eq!(cell(header, b, column), want, "{column}\n{table}");
     }
     assert_eq!(ago(10_000, 10_000 - 7300), Duration::from_secs(7200));
+}
+
+/// `vk-hub workloads`: each node's VMs under its name, what each belongs to in words, the
+/// memory it holds from the heartbeat, and a line for a node that has not said.
+#[test]
+fn the_workloads_table_names_what_each_vm_is_for() {
+    use vk_hub_proto::{Workload, WorkloadKind};
+    let bare = |id: &str, kind| Workload {
+        id: id.into(),
+        kind,
+        state_dir: format!("/s/{id}"),
+        label: None,
+        project: None,
+        job_name: None,
+        job_id: None,
+        workspace: None,
+        environment: None,
+        pid: None,
+        cpus: None,
+        mem_reserved_mib: None,
+        started_at: None,
+        ssh_alias: None,
+        guest_workspace: None,
+    };
+    let job = Workload {
+        project: Some("acme/web".into()),
+        job_name: Some("test:unit".into()),
+        job_id: Some("4242".into()),
+        pid: Some(77),
+        cpus: Some(4),
+        mem_reserved_mib: Some(6144),
+        started_at: Some(880),
+        ..bare("aaaa", WorkloadKind::CiJob)
+    };
+    let dev = Workload {
+        workspace: Some("/src/app".into()),
+        environment: Some("dev".into()),
+        mem_reserved_mib: Some(512),
+        ..bare("bbbb", WorkloadKind::Dev)
+    };
+    let run = Workload {
+        label: Some("alpine:3.20".into()),
+        ..bare("cccc", WorkloadKind::Run)
+    };
+    let nodes = [
+        ops::NodeWorkloads {
+            id: "a".repeat(32),
+            hostname: "ci-1".into(),
+            connected: true,
+            workloads: Some(store::Workloads {
+                listed: vec![job, dev, run],
+                omitted: 2,
+                mem_bytes: [("aaaa".to_string(), 3 << 30)].into(),
+            }),
+            ..Default::default()
+        },
+        ops::NodeWorkloads {
+            id: "b".repeat(32),
+            hostname: "ci-2".into(),
+            ..Default::default()
+        },
+    ];
+    let table = render_workloads(&nodes);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines.len(), 6, "{table}");
+    assert!(lines[0].starts_with("NODE  KIND    ID    FOR"), "{table}");
+    let words = |l: &str| {
+        l.split("  ")
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(String::from)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        words(lines[1]),
+        [
+            "ci-1",
+            "ci-job",
+            "aaaa",
+            "acme/web test:unit #4242",
+            "77",
+            "4",
+            "6G",
+            "3G",
+            "1970-01-01T00:14:40Z",
+            "/s/aaaa"
+        ],
+        "{table}"
+    );
+    assert!(
+        lines[2].contains("/src/app (dev)") && lines[2].contains("512M"),
+        "{table}"
+    );
+    assert!(lines[3].contains("alpine:3.20"), "{table}");
+    assert_eq!(lines[4], "ci-1: 2 more running, not listed");
+    assert_eq!(lines[5], "ci-2: has not reported its workloads");
+    // Wide characters take the columns they take on a terminal.
+    let wide = crate::table(
+        &["A", "B"],
+        &[["漢字".into(), "x".into()], ["ab".into(), "y".into()]],
+    );
+    assert_eq!(wide, "A     B\n漢字  x\nab    y\n");
+    // A list from a node not connected is told apart, and one left out of the reply says
+    // where to find it.
+    let stale = render_workloads(&[ops::NodeWorkloads {
+        id: "c".repeat(32),
+        hostname: "ci-3".into(),
+        last_seen: Some(60),
+        workloads: Some(store::Workloads::default()),
+        withheld: 4,
+        ..Default::default()
+    }]);
+    assert!(
+        stale.contains("ci-3: not connected; as last seen at 1970-01-01T00:01:00Z\n"),
+        "{stale}"
+    );
+    assert!(
+        stale.contains(&format!(
+            "ci-3: 4 listed, too many to show with every node's: see `vk-hub workloads --node {}`",
+            "c".repeat(32)
+        )),
+        "{stale}"
+    );
+}
+
+/// `vk-hub workloads --node` takes an ID, or a hostname only one node has.
+#[test]
+fn workloads_are_selected_by_id_or_unambiguous_hostname() {
+    let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+    let enroll = |host: &str| {
+        let (token, _) = hub
+            .db
+            .create_token(Duration::from_secs(60), "uid 0", 1)
+            .unwrap();
+        match hub
+            .db
+            .enroll(&token, &host.repeat(64), host, "peer p", 1)
+            .unwrap()
+        {
+            store::Enrollment::Enrolled { node_id } => node_id,
+            _ => panic!("expected an enrollment"),
+        }
+    };
+    let (a, b, c) = (enroll("a"), enroll("b"), enroll("c"));
+    hub.db
+        .record_inventory(
+            &c,
+            vk_hub_proto::Inventory {
+                hostname: "b".into(),
+                ..Default::default()
+            },
+            true,
+            2,
+        )
+        .unwrap();
+    let ids = |sel: Option<&str>| -> Vec<String> {
+        ops::workloads(&hub, sel, usize::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect()
+    };
+    assert_eq!(ids(Some("a")), std::slice::from_ref(&a));
+    assert_eq!(ids(Some(&b)), std::slice::from_ref(&b));
+    assert_eq!(ids(None).len(), 3);
+    let ambiguous = ops::workloads(&hub, Some("b"), usize::MAX).unwrap_err();
+    assert!(format!("{ambiguous}").contains("several"), "{ambiguous}");
+    assert!(ops::workloads(&hub, Some("nope"), usize::MAX).is_err());
+    assert!(
+        ops::workloads(&hub, None, usize::MAX)
+            .unwrap()
+            .iter()
+            .all(|n| n.workloads.is_none())
+    );
+
+    // Every node's together past the limit come as counts; one node's still whole.
+    let listed: Vec<vk_hub_proto::Workload> = (0..3)
+        .map(|i| vk_hub_proto::Workload {
+            id: format!("{i:016x}"),
+            kind: vk_hub_proto::WorkloadKind::Run,
+            state_dir: format!("/s/{i}"),
+            label: None,
+            project: None,
+            job_name: None,
+            job_id: None,
+            workspace: None,
+            environment: None,
+            pid: None,
+            cpus: None,
+            mem_reserved_mib: None,
+            started_at: Some(i),
+            ssh_alias: None,
+            guest_workspace: None,
+        })
+        .collect();
+    hub.db
+        .record_report(
+            &a,
+            vk_hub_proto::Report {
+                workloads: Some(listed),
+                workloads_omitted: 0,
+            },
+            3,
+        )
+        .unwrap();
+    let all = ops::workloads(&hub, None, usize::MAX).unwrap();
+    let of_a = |all: &[ops::NodeWorkloads]| all.iter().find(|n| n.id == a).unwrap().clone();
+    assert_eq!(of_a(&all).workloads.unwrap().listed.len(), 3);
+    let counted = ops::workloads(&hub, None, 100).unwrap();
+    let n = of_a(&counted);
+    assert_eq!((n.withheld, n.workloads.unwrap().listed.len()), (3, 0));
+    let one = ops::workloads(&hub, Some(&a), 100).unwrap();
+    assert_eq!(
+        (
+            one[0].withheld,
+            one[0].workloads.as_ref().unwrap().listed.len()
+        ),
+        (0, 3)
+    );
 }
 
 #[test]

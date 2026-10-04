@@ -9,6 +9,4 @@ license.workspace = true
 # pure functions only, with no runtime, transport or crypto.
 [dependencies]
 serde.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true

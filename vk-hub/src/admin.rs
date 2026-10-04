@@ -35,8 +35,12 @@ pub const PROTOCOL_VERSION: u32 = 1;
 const MAX_REQUEST: u64 = 64 * 1024;
 
 /// Ceiling on a reply, for the client: a runaway guard, sized for a listing of a fleet far
-/// past its target size.
+/// past its target size. Every node's workloads, which can pass it, are sent as counts
+/// instead when they would ([`ops::workloads`]).
 const MAX_REPLY: u64 = 16 * 1024 * 1024;
+
+/// What of [`MAX_REPLY`] a reply's value may take, leaving the rest to its envelope.
+const MAX_REPLY_VALUE: usize = (MAX_REPLY - 64 * 1024) as usize;
 
 /// How long either side waits on the other. Every operation is a small redb transaction.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -48,6 +52,10 @@ enum Call {
         ttl_secs: u64,
     },
     ListNodes,
+    /// Every node's workloads, or one node's: by ID, or by a hostname only it has.
+    Workloads {
+        node: Option<String>,
+    },
     RemoveNode {
         id: String,
     },
@@ -227,6 +235,9 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
             serde_json::to_value(CreatedToken { token, expires_at })?
         }
         Call::ListNodes => serde_json::to_value(ops::node_views(hub)?)?,
+        Call::Workloads { node } => {
+            serde_json::to_value(ops::workloads(hub, node.as_deref(), MAX_REPLY_VALUE)?)?
+        }
         Call::UiLogin { role, ttl_secs } => {
             let Some(base) = &hub.ui_url else {
                 bail!("the web UI is not being served");
@@ -299,6 +310,12 @@ impl Client {
 
     pub fn list_nodes(&self) -> Result<Vec<NodeView>> {
         self.call(Call::ListNodes)
+    }
+
+    pub fn workloads(&self, node: Option<&str>) -> Result<Vec<ops::NodeWorkloads>> {
+        self.call(Call::Workloads {
+            node: node.map(str::to_string),
+        })
     }
 
     /// Whether there was such a node to remove.

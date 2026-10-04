@@ -126,11 +126,13 @@
 #                        # above one node's CPU count interleaves every build stage instead of
 #                        # placing it. The default (2-4 vCPUs a stage) fits any node.
 
-# [node]                 # what `vk node` (experimental fleet membership) declares to its
-#                        # hub about this host, beyond what it measures.
-# jobs_speed = "slow"    # the filesystem holding <state_dir>/jobs: "fast" or "slow".
-#                        # Declared, not measured; unset = not declared
+# [node]                    # what `vk node` (experimental fleet membership) declares to its
+#                           # hub about this host, beyond what it measures.
+# jobs_speed = "slow"       # the filesystem holding <state_dir>/jobs: "fast" or "slow".
+#                           # Declared, not measured; unset = not declared
 # checkouts_speed = "fast"  # the same for the host-checkout root ([executor] checkout_dir)
+# workload_mem_secs = 30    # how often the memory each VM on the host holds is measured
+#                           # for the hub; new VMs are measured as they appear
 
 # MICROVM_IMAGE is prefix-based (the prefix names the source): unset = local/default;
 # `local/<name>` = a bundle dir under [local] dir; `virtkit/<name>[:tag|@digest]` =

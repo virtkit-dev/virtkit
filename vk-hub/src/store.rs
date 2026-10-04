@@ -14,9 +14,13 @@
 //!
 //! Heartbeats are written at [`Durability::None`]: one arrives from every node every few
 //! seconds, and losing the last few to a crash costs nothing — the next one replaces them.
-//! One a minute is durable all the same ([`HEARTBEAT_SYNC_SECS`]). Everything else is
-//! durable.
+//! One a minute is durable all the same ([`HEARTBEAT_SYNC_SECS`]). A node's workloads are
+//! written at [`Durability::None`] too, since the node sends them again on every session;
+//! they change with every CI job started or ended, so they are kept apart from the node's
+//! row, which every heartbeat rewrites, and their memory readings apart from them.
+//! Everything else is durable.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -25,7 +29,7 @@ use anyhow::{Context, Result, bail};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use vk_hub_proto::{Heartbeat, Inventory};
+use vk_hub_proto::{Heartbeat, Inventory, Report, Workload};
 
 /// Key: node ID. Value: JSON [`NodeRow`].
 const NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
@@ -39,6 +43,10 @@ const AUDIT_BY_NODE: TableDefinition<(&str, u64), ()> = TableDefinition::new("au
 const UI_LOGINS: TableDefinition<&str, &[u8]> = TableDefinition::new("ui_logins");
 /// Key: `sha256(session secret)`, hex. Value: JSON [`UiSessionRow`].
 const UI_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("ui_sessions");
+/// Each node's latest [`Workloads`], by node ID: the list, without its memory readings.
+const WORKLOADS: TableDefinition<&str, &[u8]> = TableDefinition::new("workloads");
+/// What each node's workloads hold, by node ID: a map of workload ID to bytes.
+const WORKLOAD_MEM: TableDefinition<&str, &[u8]> = TableDefinition::new("workload_mem");
 
 /// The most audit rows kept. Bounded by count rather than age: a quiet fleet keeps its history
 /// for years, and a busy one keeps the newest hundred thousand actions and outcomes — months
@@ -55,10 +63,6 @@ const HEARTBEAT_SYNC_SECS: u64 = 60;
 /// inventory: far above what a host reports, and a bound on the row a node can make the hub
 /// store and every listing read back.
 const MAX_INVENTORY_ITEMS: usize = 64;
-
-/// Bytes in a workload's ID ([`vk_hub_proto::Workload::id`]), which `vk` writes as
-/// lowercase hex.
-const WORKLOAD_ID_BYTES: usize = 8;
 
 /// Every enrollment token starts with this, so one pasted into the wrong place is
 /// recognizable.
@@ -169,6 +173,21 @@ pub struct NodeRow {
     pub heartbeat: Option<Heartbeat>,
     #[serde(default)]
     pub heartbeat_at: Option<u64>,
+    /// How many VMs the node last said it runs, listed or not; `None` until it has said.
+    #[serde(default)]
+    pub workloads: Option<u32>,
+}
+
+/// What a node last said runs on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Workloads {
+    pub listed: Vec<Workload>,
+    /// Running, but left out of `listed` by the node or cut by the hub.
+    #[serde(default)]
+    pub omitted: u32,
+    /// What each listed one holds on the host, in bytes, by its ID, from the latest heartbeat.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mem_bytes: BTreeMap<String, u64>,
 }
 
 /// One line of the audit log.
@@ -303,6 +322,10 @@ impl Db {
             .context("opening the sign-in links table")?;
         txn.open_table(UI_SESSIONS)
             .context("opening the web UI sessions table")?;
+        txn.open_table(WORKLOADS)
+            .context("opening the workloads table")?;
+        txn.open_table(WORKLOAD_MEM)
+            .context("opening the workload memory table")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db {
             db,
@@ -433,20 +456,7 @@ impl Db {
     /// Every node, by ID.
     pub fn nodes(&self) -> Result<Vec<(String, NodeRow)>> {
         let txn = self.db.begin_read().context("starting a read")?;
-        let table = txn.open_table(NODES)?;
-        let mut out = Vec::new();
-        for entry in table.iter()? {
-            let (key, value) = entry?;
-            // One that does not decode is left out rather than failing the whole listing.
-            match decode::<NodeRow>(value.value()) {
-                Ok(row) => out.push((key.value().to_string(), row)),
-                Err(e) => eprintln!(
-                    "vk-hub: warning: skipping node {}: {e:#}",
-                    vk_hub_proto::display_safe(key.value())
-                ),
-            }
-        }
-        Ok(out)
+        nodes_in(&txn)
     }
 
     /// A node authenticated a session as `incarnation`, recorded only if `current` still
@@ -482,6 +492,8 @@ impl Db {
                 &format!("{actor} removed node {id}"),
                 now,
             )?;
+            txn.open_table(WORKLOADS)?.remove(id)?;
+            txn.open_table(WORKLOAD_MEM)?.remove(id)?;
         }
         txn.commit().context("removing a node")?;
         Ok(removed)
@@ -520,11 +532,24 @@ impl Db {
         } else {
             Durability::None
         };
-        let heartbeat = bound_heartbeat(heartbeat);
-        self.update(id, durability, |row| {
+        let mut heartbeat = bound_heartbeat(heartbeat);
+        // Kept apart from the row, as a lookup for the listed workloads.
+        let mem = std::mem::take(&mut heartbeat.workload_mem_bytes);
+        self.update_txn(now, id, |row, txn| {
             row.heartbeat = Some(heartbeat);
             row.heartbeat_at = Some(now);
             row.last_seen = Some(now);
+            // Written only when it moved: a node repeats its figures between measurements.
+            let mut table = txn.open_table(WORKLOAD_MEM)?;
+            // One that does not decode is as good as none: this one replaces it.
+            let stored = match table.get(id)? {
+                Some(g) => decode::<BTreeMap<String, u64>>(g.value()).ok(),
+                None => Some(BTreeMap::new()),
+            };
+            if stored.as_ref() != Some(&mem) {
+                table.insert(id, encode(&mem)?.as_slice())?;
+            }
+            Ok(((), Vec::new(), durability))
         })
     }
 
@@ -545,6 +570,56 @@ impl Db {
         let txn = self.db.begin_write().context("starting a write")?;
         append_audit(&txn, None, actor, event, now)?;
         txn.commit().context("writing an audit line")
+    }
+
+    /// Node `id`'s workloads, with their memory readings; `None` until a report listed them.
+    #[cfg(test)]
+    pub fn workloads(&self, id: &str) -> Result<Option<Workloads>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        workloads_in(&txn, id)
+    }
+
+    /// The nodes `pick` keeps of every node, by ID, each with its workloads as
+    /// [`Db::workloads`] has them: all read at one moment, and only the picked ones' workloads
+    /// read. Rows that do not decode are left out as [`Db::nodes`] leaves them out.
+    pub fn nodes_with_workloads(
+        &self,
+        pick: impl FnOnce(Vec<(String, NodeRow)>) -> Result<Vec<(String, NodeRow)>>,
+    ) -> Result<Vec<(String, NodeRow, Option<Workloads>)>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        pick(nodes_in(&txn)?)?
+            .into_iter()
+            .map(|(id, row)| {
+                let workloads = workloads_in(&txn, &id)?;
+                Ok((id, row, workloads))
+            })
+            .collect()
+    }
+
+    /// Store node `id`'s report. One that has not listed workloads yet changes nothing.
+    pub fn record_report(&self, id: &str, report: Report, now: u64) -> Result<()> {
+        let Some(listed) = report.workloads else {
+            return Ok(());
+        };
+        // Bounded again, as the node bounds them: what it sends is not trusted to be.
+        let (kept, cut) =
+            vk_hub_proto::bound_workloads(listed.into_iter().map(|w| (w, ())).collect());
+        let workloads = Workloads {
+            listed: kept.into_iter().map(|(w, ())| w).collect(),
+            omitted: report.workloads_omitted.saturating_add(cut),
+            mem_bytes: BTreeMap::new(),
+        };
+        // Kept apart from the row, which carries their count.
+        self.update_txn(now, id, |row, txn| {
+            let total = u32::try_from(workloads.listed.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(workloads.omitted);
+            row.workloads = Some(total);
+            row.last_seen = Some(now);
+            txn.open_table(WORKLOADS)?
+                .insert(id, encode(&workloads)?.as_slice())?;
+            Ok(((), Vec::new(), Durability::None))
+        })
     }
 
     /// The last `limit` audit lines, oldest first, of one node or of all.
@@ -822,42 +897,10 @@ impl Db {
         Ok(out)
     }
 
-    /// Rewrite one node's row. A node removed meanwhile is an error: its session is then
-    /// one the hub no longer recognizes.
-    fn update(
-        &self,
-        id: &str,
-        durability: Durability,
-        change: impl FnOnce(&mut NodeRow),
-    ) -> Result<()> {
-        self.update_audited(
-            id,
-            durability,
-            |row| {
-                change(row);
-                ((), Vec::new())
-            },
-            0,
-        )
-    }
-
-    /// [`Db::update`], with the audit rows `change` returns — `(actor, event)` pairs — written
-    /// in the same transaction as the change they describe.
-    fn update_audited<R>(
-        &self,
-        id: &str,
-        durability: Durability,
-        change: impl FnOnce(&mut NodeRow) -> (R, Vec<(String, String)>),
-        now: u64,
-    ) -> Result<R> {
-        self.update_txn(now, id, |row, _| {
-            let (out, events) = change(row);
-            Ok((out, events, durability))
-        })
-    }
-
-    /// [`Db::update_audited`], with the transaction for `change` to write other tables in and
-    /// the durability `change` decides on.
+    /// Rewrite a node's row and append the `(actor, event)` audit pairs returned by `change`
+    /// in one transaction. `change` can write other tables and selects the durability.
+    /// Return [`NotEnrolled`] if the node was removed: the hub no longer recognizes its
+    /// session.
     fn update_txn<R>(
         &self,
         now: u64,
@@ -886,6 +929,54 @@ impl Db {
         txn.commit().context("updating a node")?;
         Ok(out)
     }
+}
+
+/// Every node in `txn`, by ID.
+fn nodes_in(txn: &redb::ReadTransaction) -> Result<Vec<(String, NodeRow)>> {
+    let table = txn.open_table(NODES)?;
+    let mut out = Vec::new();
+    for entry in table.iter()? {
+        let (key, value) = entry?;
+        // One that does not decode is left out rather than failing the whole listing.
+        match decode::<NodeRow>(value.value()) {
+            Ok(row) => out.push((key.value().to_string(), row)),
+            Err(e) => eprintln!(
+                "vk-hub: warning: skipping node {}: {e:#}",
+                vk_hub_proto::display_safe(key.value())
+            ),
+        }
+    }
+    Ok(out)
+}
+
+/// Node `id`'s workloads in `txn`, with their memory readings; `None` until a report listed
+/// them.
+fn workloads_in(txn: &redb::ReadTransaction, id: &str) -> Result<Option<Workloads>> {
+    let Some(listed) = txn.open_table(WORKLOADS)?.get(id)? else {
+        return Ok(None);
+    };
+    // One that does not decode is left out rather than failing the whole listing, as
+    // [`nodes_in`] leaves out a node's row.
+    let warn = |what: &str, e: anyhow::Error| {
+        eprintln!(
+            "vk-hub: warning: skipping node {}'s {what}: {e:#}",
+            vk_hub_proto::display_safe(id)
+        );
+    };
+    let mut workloads: Workloads = match decode(listed.value()) {
+        Ok(w) => w,
+        Err(e) => {
+            warn("workloads", e);
+            return Ok(None);
+        }
+    };
+    if let Some(mem) = txn.open_table(WORKLOAD_MEM)?.get(id)? {
+        match decode(mem.value()) {
+            Ok(mem) => workloads.mem_bytes = mem,
+            Err(e) => warn("workload memory readings", e),
+        }
+    }
+    Ok(Some(workloads))
 }
 
 /// Append an audit row inside `txn`, dropping the oldest past [`AUDIT_MAX`].
@@ -983,7 +1074,7 @@ fn bound_heartbeat(mut heartbeat: Heartbeat) -> Heartbeat {
     let mem = std::mem::take(&mut heartbeat.workload_mem_bytes);
     heartbeat.workload_mem_bytes = mem
         .into_iter()
-        .filter(|(id, _)| vk_hub_proto::from_hex_lower::<WORKLOAD_ID_BYTES>(id).is_some())
+        .filter(|(id, _)| vk_hub_proto::is_workload_id(id))
         .take(vk_hub_proto::MAX_WORKLOADS)
         .collect();
     heartbeat
@@ -1191,15 +1282,18 @@ mod tests {
             workload_mem_bytes: mem,
             ..Heartbeat::default()
         };
+        // Memory readings are shown with a listed workload.
+        let listed = Report {
+            workloads: Some(Vec::new()),
+            ..Report::default()
+        };
+        db.record_report(&node_id, listed, 2).unwrap();
         db.record_heartbeat(&node_id, heartbeat, 2).unwrap();
         let kept = db.node(&node_id).unwrap().unwrap().heartbeat.unwrap();
         assert_eq!(kept.storage.len(), MAX_INVENTORY_ITEMS);
-        assert_eq!(kept.workload_mem_bytes.len(), vk_hub_proto::MAX_WORKLOADS);
-        assert!(
-            kept.workload_mem_bytes
-                .keys()
-                .all(|id| vk_hub_proto::from_hex_lower::<WORKLOAD_ID_BYTES>(id).is_some())
-        );
+        let mem = db.workloads(&node_id).unwrap().unwrap().mem_bytes;
+        assert_eq!(mem.len(), vk_hub_proto::MAX_WORKLOADS);
+        assert!(mem.keys().all(|id| vk_hub_proto::is_workload_id(id)));
     }
 
     #[test]
@@ -1302,6 +1396,177 @@ mod tests {
             db.record_heartbeat("0".repeat(32).as_str(), Heartbeat::default(), 5)
                 .is_err()
         );
+    }
+
+    /// A node's workloads are its report's latest, cut to the cap with every string made
+    /// display-safe, kept apart from its row with a count on it; their memory readings are a
+    /// bounded lookup; and neither is audited.
+    #[test]
+    fn workloads_are_stored_latest_only_bounded_and_display_safe() {
+        use vk_hub_proto::{MAX_WORKLOADS, WorkloadKind};
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        assert_eq!(db.workloads(&id).unwrap(), None);
+        let hostile = "a\u{1b}[2J\u{202e}<b>";
+        let workload = |i: usize| Workload {
+            id: format!("{i:016x}"),
+            kind: WorkloadKind::CiJob,
+            state_dir: hostile.into(),
+            label: Some(hostile.into()),
+            project: Some(hostile.into()),
+            job_name: Some(hostile.into()),
+            job_id: Some(hostile.into()),
+            workspace: Some(hostile.into()),
+            environment: Some(hostile.into()),
+            pid: Some(1),
+            cpus: Some(2),
+            mem_reserved_mib: Some(1024),
+            started_at: Some(5),
+            ssh_alias: Some(hostile.into()),
+            guest_workspace: Some(hostile.into()),
+        };
+        let report = |n: usize, omitted| Report {
+            workloads: Some((0..n).map(workload).collect()),
+            workloads_omitted: omitted,
+        };
+        db.record_report(&id, report(MAX_WORKLOADS + 5, 7), 2)
+            .unwrap();
+        let row = db.node(&id).unwrap().unwrap();
+        // The row keeps the count, those cut counted as left out.
+        assert_eq!(row.workloads, Some(MAX_WORKLOADS as u32 + 12));
+        let stored = db.workloads(&id).unwrap().unwrap();
+        assert_eq!((stored.listed.len(), stored.omitted), (MAX_WORKLOADS, 12));
+        let w = &stored.listed[0];
+        for s in [
+            &w.state_dir,
+            w.label.as_ref().unwrap(),
+            w.project.as_ref().unwrap(),
+            w.job_name.as_ref().unwrap(),
+            w.job_id.as_ref().unwrap(),
+            w.workspace.as_ref().unwrap(),
+            w.environment.as_ref().unwrap(),
+        ] {
+            assert_eq!(s, "a[2J<b>");
+        }
+        // What a link is built of is dropped rather than altered.
+        assert_eq!((&w.ssh_alias, &w.guest_workspace), (&None, &None));
+        // The next report replaces the list; a node stopping its VMs empties it; a report
+        // that has not looked yet leaves the last one.
+        db.record_report(&id, report(0, 0), 3).unwrap();
+        db.record_report(&id, Report::default(), 4).unwrap();
+        assert_eq!(db.node(&id).unwrap().unwrap().workloads, Some(0));
+        assert_eq!(db.workloads(&id).unwrap().unwrap().listed, Vec::new());
+        // Past the bytes a node may list, the rest are counted as left out.
+        let long = || Some("x".repeat(vk_hub_proto::MAX_DISPLAY));
+        let big = |i: usize| Workload {
+            label: long(),
+            project: long(),
+            job_name: long(),
+            job_id: long(),
+            workspace: long(),
+            environment: long(),
+            ssh_alias: long(),
+            guest_workspace: long(),
+            ..workload(i)
+        };
+        let n = MAX_WORKLOADS;
+        db.record_report(
+            &id,
+            Report {
+                workloads: Some((0..n).map(big).collect()),
+                workloads_omitted: 1,
+            },
+            4,
+        )
+        .unwrap();
+        let stored = db.workloads(&id).unwrap().unwrap();
+        assert!(stored.listed.len() < n);
+        assert_eq!(stored.listed.len() as u32 + stored.omitted, n as u32 + 1);
+        assert!(
+            serde_json::to_vec(&stored.listed).unwrap().len() <= vk_hub_proto::MAX_WORKLOADS_BYTES
+        );
+        assert!(
+            db.audits(Some(&id), 100)
+                .unwrap()
+                .iter()
+                .all(|a| !a.event.contains("a[2J")),
+        );
+
+        let mut mem: BTreeMap<String, u64> = (0..MAX_WORKLOADS + 5)
+            .map(|i| (format!("{i:016x}"), 1))
+            .collect();
+        mem.insert("x".repeat(1000), 1);
+        db.record_heartbeat(
+            &id,
+            Heartbeat {
+                workload_mem_bytes: mem,
+                ..Heartbeat::default()
+            },
+            4,
+        )
+        .unwrap();
+        let kept = db.workloads(&id).unwrap().unwrap().mem_bytes;
+        assert_eq!(kept.len(), MAX_WORKLOADS);
+        assert!(kept.keys().all(|k| k.len() == 16));
+        // Not on the row, which every heartbeat rewrites.
+        let row = db.node(&id).unwrap().unwrap();
+        assert!(row.heartbeat.unwrap().workload_mem_bytes.is_empty());
+        // A removed node takes its workloads with it.
+        assert!(db.remove_node(&id, "uid 0", 5).unwrap());
+        assert_eq!(db.workloads(&id).unwrap(), None);
+    }
+
+    /// A stored list or set of memory readings that does not decode does not fail a listing,
+    /// nor the heartbeat that replaces the readings.
+    #[test]
+    fn undecodable_workloads_are_skipped_and_replaced() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        let listed = Report {
+            workloads: Some(Vec::new()),
+            ..Report::default()
+        };
+        db.record_report(&id, listed.clone(), 2).unwrap();
+        let garble = |table: TableDefinition<&str, &[u8]>| {
+            let txn = db.db.begin_write().unwrap();
+            txn.open_table(table)
+                .unwrap()
+                .insert(id.as_str(), b"{not json".as_slice())
+                .unwrap();
+            txn.commit().unwrap();
+        };
+        garble(WORKLOAD_MEM);
+        assert_eq!(
+            db.workloads(&id).unwrap().unwrap().mem_bytes,
+            BTreeMap::new()
+        );
+        let mem = BTreeMap::from([("ab".repeat(8), 5)]);
+        db.record_heartbeat(
+            &id,
+            Heartbeat {
+                workload_mem_bytes: mem.clone(),
+                ..Heartbeat::default()
+            },
+            3,
+        )
+        .unwrap();
+        assert_eq!(db.workloads(&id).unwrap().unwrap().mem_bytes, mem);
+        garble(WORKLOADS);
+        assert_eq!(db.workloads(&id).unwrap(), None);
+        let all = db.nodes_with_workloads(Ok).unwrap();
+        assert_eq!((all.len(), &all[0].2), (1, &None));
+        // The next report replaces it.
+        db.record_report(&id, listed, 4).unwrap();
+        assert!(db.workloads(&id).unwrap().is_some());
+    }
+
+    fn enrolled(db: &Db) -> String {
+        let (token, _) = db.create_token(DAY, "uid 0", 0).unwrap();
+        let Enrollment::Enrolled { node_id } = db.enroll(&token, "aa", "h", "peer p", 1).unwrap()
+        else {
+            panic!("expected an enrollment");
+        };
+        node_id
     }
 
     #[test]

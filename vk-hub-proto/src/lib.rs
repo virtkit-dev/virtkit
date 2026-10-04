@@ -595,6 +595,81 @@ pub enum WorkloadKind {
     Other,
 }
 
+/// Bytes in a workload's ID ([`Workload::id`]), which `vk` writes as lowercase hex.
+pub const WORKLOAD_ID_BYTES: usize = 8;
+
+/// Whether `id` has the shape `vk` gives a workload's ID: [`WORKLOAD_ID_BYTES`] in lowercase
+/// hex.
+pub fn is_workload_id(id: &str) -> bool {
+    from_hex_lower::<WORKLOAD_ID_BYTES>(id).is_some()
+}
+
+/// Make `w` fit to show: every string [`display_safe`], except the SSH alias and guest
+/// workspace, which are put into a link as they are and so are dropped rather than altered
+/// when not display-safe already. `false` when its ID is not one `vk` gives
+/// ([`is_workload_id`]): such a workload is not to be listed.
+pub fn make_display_safe(w: &mut Workload) -> bool {
+    if !is_workload_id(&w.id) {
+        return false;
+    }
+    w.state_dir = display_safe(&w.state_dir);
+    for s in [
+        &mut w.label,
+        &mut w.project,
+        &mut w.job_name,
+        &mut w.job_id,
+        &mut w.workspace,
+        &mut w.environment,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        *s = display_safe(s);
+    }
+    for s in [&mut w.ssh_alias, &mut w.guest_workspace] {
+        if s.as_deref().is_some_and(|v| display_safe(v) != v) {
+            *s = None;
+        }
+    }
+    true
+}
+
+/// Sanitize `found` with [`make_display_safe`] and limit its JSON array to [`MAX_WORKLOADS`]
+/// and [`MAX_WORKLOADS_BYTES`], preserving each workload's attached caller data.
+/// Keep CI jobs first because they guide host capacity, then the newest other workloads.
+/// Stop at the first that does not fit; never skip it for a lower-priority workload.
+/// Return retained workloads oldest first and an omitted count, including invalid IDs.
+pub fn bound_workloads<T>(found: Vec<(Workload, T)>) -> (Vec<(Workload, T)>, u32) {
+    let total = found.len();
+    let mut found: Vec<(Workload, T)> = found
+        .into_iter()
+        .filter_map(|(mut w, t)| make_display_safe(&mut w).then_some((w, t)))
+        .collect();
+    found.sort_by(|(a, _), (b, _)| {
+        let key = |w: &Workload| {
+            (
+                w.kind != WorkloadKind::CiJob,
+                std::cmp::Reverse(w.started_at),
+            )
+        };
+        key(a).cmp(&key(b)).then_with(|| a.id.cmp(&b.id))
+    });
+    // The array's brackets, and a comma before every item but the first: 1 + Σ(len + 1).
+    let mut bytes = 1usize;
+    let mut kept = Vec::new();
+    for (w, t) in found {
+        let size = serde_json::to_vec(&w).map_or(usize::MAX, |j| j.len().saturating_add(1));
+        if kept.len() == MAX_WORKLOADS || bytes.saturating_add(size) > MAX_WORKLOADS_BYTES {
+            break;
+        }
+        bytes = bytes.saturating_add(size);
+        kept.push((w, t));
+    }
+    let omitted = u32::try_from(total - kept.len()).unwrap_or(u32::MAX);
+    kept.sort_by(|(a, _), (b, _)| (a.started_at, &a.id).cmp(&(b.started_at, &b.id)));
+    (kept, omitted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1021,5 +1096,131 @@ mod tests {
         );
         assert_eq!(display_safe("héllo ✓"), "héllo ✓");
         assert_eq!(display_safe(&"x".repeat(1000)).len(), MAX_DISPLAY);
+    }
+
+    /// What is shown is made display-safe; what a link is built of is kept as it is or
+    /// dropped; a workload whose ID `vk` cannot have given is not listed.
+    #[test]
+    fn a_workload_is_made_fit_to_show() {
+        let hostile = "a\u{1b}[2J\u{202e}<b>";
+        let mut w = Workload {
+            state_dir: hostile.into(),
+            label: Some(hostile.into()),
+            workspace: Some(hostile.into()),
+            ssh_alias: Some(hostile.into()),
+            guest_workspace: Some("/workdir".into()),
+            ..workload_bare()
+        };
+        assert!(make_display_safe(&mut w));
+        assert_eq!(w.state_dir, "a[2J<b>");
+        assert_eq!(w.label.as_deref(), Some("a[2J<b>"));
+        assert_eq!(w.workspace.as_deref(), Some("a[2J<b>"));
+        assert_eq!(w.ssh_alias, None);
+        assert_eq!(w.guest_workspace.as_deref(), Some("/workdir"));
+        for id in ["ABABABABABABABAB", "abab", "x\u{1b}", &"ab".repeat(16)] {
+            let mut w = Workload {
+                id: id.into(),
+                ..workload()
+            };
+            assert!(!make_display_safe(&mut w), "{id:?}");
+        }
+        let (kept, omitted) = bound_workloads(vec![
+            (
+                Workload {
+                    id: "nope".into(),
+                    ..workload()
+                },
+                1,
+            ),
+            (workload_bare(), 2),
+        ]);
+        assert_eq!((kept.len(), kept[0].1, omitted), (1, 2, 1));
+    }
+
+    /// CI jobs are kept first, then the newest; what is kept comes back oldest first.
+    #[test]
+    fn the_cut_keeps_ci_jobs_then_the_newest() {
+        let at = |i: usize, kind| Workload {
+            id: format!("{i:016x}"),
+            kind,
+            started_at: Some(i as u64),
+            ..workload_bare()
+        };
+        let mut all: Vec<_> = (0..MAX_WORKLOADS + 3)
+            .map(|i| (at(i, WorkloadKind::Run), ()))
+            .collect();
+        all.push((at(MAX_WORKLOADS + 10, WorkloadKind::CiJob), ()));
+        all[0].0.kind = WorkloadKind::CiJob;
+        let (kept, omitted) = bound_workloads(all);
+        assert_eq!((kept.len(), omitted), (MAX_WORKLOADS, 4));
+        let started: Vec<u64> = kept.iter().map(|(w, _)| w.started_at.unwrap()).collect();
+        assert_eq!(started[0], 0, "the oldest, but a CI job");
+        assert_eq!(started[1], 5);
+        assert!(started.windows(2).all(|p| p[0] <= p[1]));
+    }
+
+    /// A list exactly as long as the budget, as a JSON array, is kept whole; a byte more and
+    /// the last is cut.
+    #[test]
+    fn the_byte_budget_is_the_json_array_s() {
+        // A workload whose strings take `lens` bytes, each of one- and two-byte characters
+        // and at most MAX_DISPLAY of them.
+        let with = |i: usize, lens: [usize; 7]| {
+            let text = |b: usize| {
+                let wide = b.saturating_sub(MAX_DISPLAY);
+                "é".repeat(wide) + &"x".repeat(b - 2 * wide)
+            };
+            Workload {
+                id: format!("{i:016x}"),
+                kind: WorkloadKind::Run,
+                state_dir: text(lens[0]),
+                label: Some(text(lens[1])),
+                project: Some(text(lens[2])),
+                job_name: Some(text(lens[3])),
+                job_id: Some(text(lens[4])),
+                workspace: Some(text(lens[5])),
+                environment: Some(text(lens[6])),
+                // As many digits for every one, so each full one is as long as the next.
+                started_at: Some(1_000_000 + i as u64),
+                ..workload_bare()
+            }
+        };
+        let size = |w: &Workload| serde_json::to_vec(w).unwrap().len();
+        let unit = size(&with(1, [MAX_DISPLAY; 7]));
+        let bare = size(&with(0, [0; 7]));
+        // One of `bytes`, the oldest and so the last considered.
+        let sized = |bytes: usize| {
+            let mut left = bytes - bare;
+            let lens = [(); 7].map(|()| {
+                let b = left.min(2 * MAX_DISPLAY);
+                left -= b;
+                b
+            });
+            let w = with(0, lens);
+            assert_eq!(size(&w), bytes);
+            w
+        };
+        // `k` like the first, and one of `rest` bytes: brackets, items and the commas between
+        // come to the budget exactly.
+        let mut k = (MAX_WORKLOADS_BYTES - 2) / (unit + 1);
+        let mut rest = MAX_WORKLOADS_BYTES - 2 - k * (unit + 1);
+        if rest < bare {
+            k -= 1;
+            rest += unit + 1;
+        }
+        let list = |last: Workload| {
+            let mut all: Vec<_> = (1..=k).map(|i| (with(i, [MAX_DISPLAY; 7]), ())).collect();
+            all.push((last, ()));
+            all
+        };
+        let exact = list(sized(rest));
+        let array: Vec<&Workload> = exact.iter().map(|(w, _)| w).collect();
+        assert_eq!(
+            serde_json::to_vec(&array).unwrap().len(),
+            MAX_WORKLOADS_BYTES
+        );
+        assert_eq!(bound_workloads(exact).1, 0);
+        let over = bound_workloads(list(sized(rest + 1)));
+        assert_eq!((over.0.len(), over.1), (k, 1));
     }
 }

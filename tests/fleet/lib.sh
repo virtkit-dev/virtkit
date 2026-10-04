@@ -5,7 +5,8 @@
 # The tests drive the hub's CLI with `vk exec` into the primary, and start and stop node
 # services from there through /run/vk/services. Node guests nest, so each passes `vk check`
 # and enrolls itself with `vk node join`; its root persists, so it keeps its identity across
-# restarts.
+# restarts. `fleet_kvm_node` runs one more node on the test host itself, enrolled through the
+# hub's port published on loopback.
 #
 # Source it, then call fleet_up; everything is torn down on exit.
 #
@@ -30,6 +31,8 @@ command -v openssl >/dev/null || { echo "fleet: need openssl, for the hub's cert
 FLEET=$(mktemp -d "${TMPDIR:-/tmp}/vk-fleet.XXXXXX")
 RUN=$FLEET/run
 HUB_CONFIG=/etc/vk-hub/hub.toml
+HUB_PORT=
+KVM_NODE_PID=
 
 fail() {
   echo "FAIL: $*"
@@ -53,7 +56,10 @@ fleet_down() {
     echo "== evidence =="
     "$VK" exec "$RUN" -- sh -c 'tail -n 40 /var/log/vk-hub.log; for s in /run/vk/services/*; do
       echo "-- ${s##*/}: $(cat "$s/state")"; tail -n 20 "$s/log"; done' 2>&1 || true
+    [ -f "$FLEET/kvm/node.log" ] && { echo "-- kvm node"; tail -n 20 "$FLEET/kvm/node.log"; }
   fi
+  [ -z "$KVM_NODE_PID" ] || kill "$KVM_NODE_PID" 2>/dev/null || true
+  "$VK" publish stop "$RUN" >/dev/null 2>&1 || true
   # Every VM under the fleet's directory: the group, and any a test started beside it.
   "$VK" stop "$FLEET" >/dev/null 2>&1 || true
   rm -rf "$FLEET"
@@ -61,7 +67,8 @@ fleet_down() {
 }
 trap fleet_down EXIT
 
-# A CA for the run, and the hub's certificate under it, by its compose name.
+# A CA for the run, and the hub's certificate under it: by its compose name for the nodes in
+# the group, by loopback for the ones on the test host.
 fleet_certs() {
   local d=$FLEET/hub
   mkdir -p "$d"
@@ -70,14 +77,15 @@ fleet_certs() {
     -addext basicConstraints=critical,CA:TRUE -addext keyUsage=critical,keyCertSign 2>/dev/null
   openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=hub \
     -keyout "$d/key.pem" -out "$FLEET/hub.csr" 2>/dev/null
-  printf '%s\n' 'subjectAltName=DNS:hub' \
+  printf '%s\n' 'subjectAltName=DNS:hub,DNS:localhost,IP:127.0.0.1' \
     'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature' \
     'extendedKeyUsage=serverAuth' >"$FLEET/hub.ext"
   openssl x509 -req -in "$FLEET/hub.csr" -CA "$FLEET/ca.pem" -CAkey "$FLEET/ca.key" \
     -CAcreateserial -days 2 -extfile "$FLEET/hub.ext" -out "$d/cert.pem" 2>/dev/null
 }
 
-# fleet_up <node service>...: boot the group, the hub in its primary.
+# fleet_up <node service>...: boot the group, the hub in its primary, and publish the hub on
+# a loopback port of the test host.
 fleet_up() {
   fleet_certs
   cat >"$FLEET/hub/hub.toml" <<EOF
@@ -118,6 +126,19 @@ EOF
     --detach --inactivity-timeout 0 >"$FLEET/run.log" 2>&1) ||
     { cat "$FLEET/run.log"; fail "the fleet did not boot"; }
   hub_start
+  local port rc
+  for port in $(shuf -i 20000-60000 -n 20); do
+    rc=0
+    "$VK" publish ensure --name hub --listen "tcp://127.0.0.1:$port" \
+      --to tcp://127.0.0.1:8443 "$RUN" >"$FLEET/publish.log" 2>&1 || rc=$?
+    # 4: the port is taken; try another. Anything else will not go away.
+    case $rc in
+      0) HUB_PORT=$port && break ;;
+      4) ;;
+      *) cat "$FLEET/publish.log"; fail "could not publish the hub (exit $rc)" ;;
+    esac
+  done
+  [ -n "$HUB_PORT" ] || fail "could not publish the hub on a loopback port"
 }
 
 # `vk-hub <args>` in the primary, against the hub's config.
@@ -135,19 +156,38 @@ hub_kill() {
   "$VK" exec "$RUN" -- sh -c 'kill -9 $(pidof vk-hub)'
 }
 
-# node_join <name> [token]: enroll node service <name> from its guest, with a new token or
-# the one given.
+# `vk node <args>` on the test host, as node <name>: its own config and state dir.
+host_vk() {
+  local name=$1
+  shift
+  mkdir -p "$FLEET/$name"
+  [ -f "$FLEET/$name/config.toml" ] ||
+    printf 'state_dir = "%s"\n' "$FLEET/$name/state" >"$FLEET/$name/config.toml"
+  VIRTKIT_CONFIG=$FLEET/$name/config.toml "$VK" "$@"
+}
+
+# node_join <name> [token]: enroll node <name> with a new token, or the one given — from
+# its guest for a node service, on the test host for `kvm`.
 node_join() {
   local name=$1 token=${2:-}
   [ -n "$token" ] || token=$(hub token create) || return 1
-  in_node "$name" sh -c "printf '%s\n' '$token' |
-    vk node join https://hub:8443 --token - --ca /seed/ca.pem"
+  if [ "$name" = kvm ]; then
+    printf '%s\n' "$token" |
+      host_vk kvm node join "https://127.0.0.1:$HUB_PORT" --token - --ca "$FLEET/ca.pem"
+  else
+    in_node "$name" sh -c "printf '%s\n' '$token' |
+      vk node join https://hub:8443 --token - --ca /seed/ca.pem"
+  fi
 }
 
 # The ID node <name> was enrolled as.
 node_id() {
   local enrollment
-  enrollment=$(in_node "$1" cat /var/lib/virtkit/node/enrollment.json)
+  if [ "$1" = kvm ]; then
+    enrollment=$(cat "$FLEET/kvm/state/node/enrollment.json")
+  else
+    enrollment=$(in_node "$1" cat /var/lib/virtkit/node/enrollment.json)
+  fi
   sed -n 's/.*"node_id": *"\([0-9a-f]*\)".*/\1/p' <<<"$enrollment"
 }
 
@@ -209,4 +249,11 @@ node_reported() {
 # node_is <id> <connected|unreachable>
 node_is() {
   node_row "$1" | grep -qw -- "$2"
+}
+
+# Start a node on the test host, with its KVM: enrolled as `kvm`, logging to kvm/node.log.
+fleet_kvm_node() {
+  node_join kvm >/dev/null || fail "the test host's node could not join"
+  VIRTKIT_CONFIG=$FLEET/kvm/config.toml "$VK" node run >"$FLEET/kvm/node.log" 2>&1 &
+  KVM_NODE_PID=$!
 }

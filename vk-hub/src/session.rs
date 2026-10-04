@@ -1,5 +1,6 @@
 //! One node's WebSocket session: the hello/challenge/auth handshake against the key pinned at
-//! enrollment, then inventory and heartbeats into the database until the node goes away.
+//! enrollment, then inventory, heartbeats and reports into the database until the node goes
+//! away.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use vk_hub_proto::{
     CHALLENGE_LEN, Channel, Heartbeat, HubMsg, Inventory, NodeMsg, PROTOCOL, PUBLIC_KEY_LEN,
-    RefusalCode, SIGNATURE_LEN, from_hex_lower,
+    RefusalCode, Report, SIGNATURE_LEN, from_hex_lower,
 };
 
 use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS};
@@ -322,10 +323,15 @@ async fn serve(
                     .await
                     .map_err(|_| anyhow!("the node is not reading"))?
                     .map_err(|e| anyhow!("pinging: {e}"))?;
-                if let Some(heartbeat) = pace.held(Instant::now())
-                    && let Some(why) = store(ws, hub, node, Write::Heartbeat(heartbeat)).await?
-                {
-                    return Ok(why);
+                let now = Instant::now();
+                let held = [
+                    pace.held_report(now).map(Write::Report),
+                    pace.held(now).map(Write::Heartbeat),
+                ];
+                for write in held.into_iter().flatten() {
+                    if let Some(why) = store(ws, hub, node, write).await? {
+                        return Ok(why);
+                    }
                 }
             }
             () = tokio::time::sleep_until(deadline) => {
@@ -358,7 +364,7 @@ async fn serve(
                         Some(Write::Inventory(inventory, pace.inventory_durable(now)))
                     }
                     NodeMsg::Heartbeat(heartbeat) => pace.heartbeat(heartbeat, now).map(Write::Heartbeat),
-                    NodeMsg::Report(_) => None,
+                    NodeMsg::Report(report) => pace.report(report, now).map(Write::Report),
                     NodeMsg::Hello { .. } | NodeMsg::Auth { .. } => {
                         bail!("the node repeated its handshake inside a session")
                     }
@@ -374,38 +380,75 @@ async fn serve(
 }
 
 /// How much of what its node reports a session writes. A node heartbeats every
-/// [`HEARTBEAT`] and sends an inventory when something changed; one doing either faster only
-/// costs writes. Heartbeats are stored at most one per half heartbeat, the latest of those
-/// held back stored at the next ping, so the stored one is never staler than that. An
-/// inventory is durable at most once a heartbeat; one sooner is stored all the same, and
-/// made durable by the next durable write.
+/// [`HEARTBEAT`], and sends an inventory or a report when something changed; one doing any
+/// of it faster only costs writes. Heartbeats and reports are each stored at most one per
+/// half heartbeat, the latest of those held back stored at the next ping, so the stored one
+/// is never staler than that. An inventory is durable at most once a heartbeat; one sooner
+/// is stored all the same, and made durable by the next durable write.
 #[derive(Default)]
 struct Pace {
-    heartbeat_at: Option<Instant>,
-    held: Option<Heartbeat>,
+    heartbeat: Paced<Heartbeat>,
+    report: Paced<Report>,
     durable_inventory_at: Option<Instant>,
+}
+
+/// One kind of message stored at most once per half heartbeat.
+struct Paced<T> {
+    stored_at: Option<Instant>,
+    held: Option<T>,
+}
+
+impl<T> Default for Paced<T> {
+    fn default() -> Self {
+        Paced {
+            stored_at: None,
+            held: None,
+        }
+    }
+}
+
+impl<T> Paced<T> {
+    /// `msg` arrived at `now`: it, to store now, or `None` with it held back.
+    fn offer(&mut self, msg: T, now: Instant) -> Option<T> {
+        if self
+            .stored_at
+            .is_some_and(|t| now.duration_since(t) < HEARTBEAT / 2)
+        {
+            self.held = Some(msg);
+            return None;
+        }
+        self.held = None;
+        self.stored_at = Some(now);
+        Some(msg)
+    }
+
+    /// The one held back, to store at `now`.
+    fn held(&mut self, now: Instant) -> Option<T> {
+        let msg = self.held.take()?;
+        self.stored_at = Some(now);
+        Some(msg)
+    }
 }
 
 impl Pace {
     /// `heartbeat` arrived at `now`: it, to store now, or `None` with it held back.
     fn heartbeat(&mut self, heartbeat: Heartbeat, now: Instant) -> Option<Heartbeat> {
-        if self
-            .heartbeat_at
-            .is_some_and(|t| now.duration_since(t) < HEARTBEAT / 2)
-        {
-            self.held = Some(heartbeat);
-            return None;
-        }
-        self.held = None;
-        self.heartbeat_at = Some(now);
-        Some(heartbeat)
+        self.heartbeat.offer(heartbeat, now)
     }
 
     /// The heartbeat held back, to store at `now`.
     fn held(&mut self, now: Instant) -> Option<Heartbeat> {
-        let heartbeat = self.held.take()?;
-        self.heartbeat_at = Some(now);
-        Some(heartbeat)
+        self.heartbeat.held(now)
+    }
+
+    /// `report` arrived at `now`: it, to store now, or `None` with it held back.
+    fn report(&mut self, report: Report, now: Instant) -> Option<Report> {
+        self.report.offer(report, now)
+    }
+
+    /// The report held back, to store at `now`.
+    fn held_report(&mut self, now: Instant) -> Option<Report> {
+        self.report.held(now)
     }
 
     /// Whether an inventory arriving at `now` is written durably.
@@ -425,6 +468,7 @@ enum Write {
     /// An inventory, and whether to write it durably.
     Inventory(Inventory, bool),
     Heartbeat(Heartbeat),
+    Report(Report),
 }
 
 /// Write `write` for `node`. `Some` carries why the session ends: the node was removed since
@@ -436,6 +480,7 @@ async fn store(ws: &mut Ws, hub: &Hub, node: &Node, write: Write) -> Result<Opti
     let written = tokio::task::spawn_blocking(move || match write {
         Write::Inventory(inventory, durable) => db.record_inventory(&id, inventory, durable, now),
         Write::Heartbeat(heartbeat) => db.record_heartbeat(&id, heartbeat, now),
+        Write::Report(report) => db.record_report(&id, report, now),
     })
     .await?;
     match written {
@@ -501,6 +546,23 @@ mod tests {
         // One on time is stored, and replaces any held back.
         assert_eq!(pace.heartbeat(beat(5), t + HEARTBEAT * 2), Some(beat(5)));
         assert_eq!(pace.held(t + HEARTBEAT * 3), None);
+    }
+
+    #[test]
+    fn reports_are_paced_apart_from_heartbeats() {
+        let mut pace = Pace::default();
+        let t = Instant::now();
+        let report = |n| Report {
+            workloads_omitted: n,
+            ..Report::default()
+        };
+        assert_eq!(pace.heartbeat(beat(1), t), Some(beat(1)));
+        // A heartbeat just stored does not hold a report back, nor the other way round.
+        assert_eq!(pace.report(report(1), t), Some(report(1)));
+        assert_eq!(pace.report(report(2), t + HEARTBEAT / 4), None);
+        assert_eq!(pace.held(t + HEARTBEAT), None);
+        assert_eq!(pace.held_report(t + HEARTBEAT), Some(report(2)));
+        assert_eq!(pace.held_report(t + HEARTBEAT), None);
     }
 
     #[test]

@@ -1,5 +1,6 @@
-//! The VMs running on this host for its user, as `vk workloads` lists them: pinned `vk run`s
-//! and `vk dev` environments from the VM registry, CI jobs from the executor's job dirs.
+//! The VMs running on this host for its user, as `vk workloads` lists them and `vk node`
+//! reports them: pinned `vk run`s and `vk dev` environments from the VM registry, CI jobs from
+//! the executor's job dirs.
 //!
 //! Everything is read from what those already keep, never kept apart: the registry's entries,
 //! checked against their state-dir locks as `vk list` checks them (and pruned as it prunes
@@ -25,7 +26,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use vk_hub_proto::{MAX_WORKLOADS, MAX_WORKLOADS_BYTES, Workload, WorkloadKind, WorkloadList};
+use vk_hub_proto::{Workload, WorkloadKind, WorkloadList, bound_workloads};
 
 use crate::config::Config;
 use crate::dev::list::Row;
@@ -67,16 +68,20 @@ struct Sources {
 }
 
 impl Sources {
-    /// Read this host's. `reserved_mib` is the admission ledger's reservations as [`Lister`]
-    /// last read them; a job dir listing that fails is said to `jobs_said`, a dev state base
-    /// that cannot be found to `dev_said`.
+    /// Read this host's, its VMs from `registry` or the user's own. `reserved_mib` is the
+    /// admission ledger's reservations as [`Lister`] last read them; a job dir listing that
+    /// fails is said to `jobs_said`, a dev state base that cannot be found to `dev_said`.
     fn read(
         cfg: &Config,
+        registry: Option<&Path>,
         reserved_mib: HashMap<OsString, u64>,
         jobs_said: &mut Once,
         dev_said: &mut Once,
     ) -> Sources {
-        let vms = crate::vms::running();
+        let vms = match registry {
+            Some(dir) => crate::vms::running_in(dir),
+            None => crate::vms::running(),
+        };
         let dev =
             dev_rows(&vms).map_err(|e| format!("virtkit: cannot find the dev environments: {e:#}"));
         dev_said.say(dev.as_ref().err().cloned());
@@ -223,67 +228,6 @@ fn workloads(sources: &Sources) -> Vec<(Workload, Option<i32>)> {
     out
 }
 
-/// Make strings display-safe and enforce [`MAX_WORKLOADS`] and [`MAX_WORKLOADS_BYTES`].
-/// Keep CI jobs first because they guide host capacity, then the newest other workloads.
-/// Stop at the first that does not fit; never skip it to keep a lower-priority workload.
-/// Return the retained workloads oldest first, with the omitted count.
-fn bound(found: Vec<(Workload, Option<i32>)>) -> (Vec<(Workload, Option<i32>)>, u32) {
-    let mut found: Vec<(Workload, Option<i32>)> = found
-        .into_iter()
-        .map(|(w, root)| (display_safe(w), root))
-        .collect();
-    found.sort_by(|(a, _), (b, _)| {
-        let key = |w: &Workload| {
-            (
-                w.kind != WorkloadKind::CiJob,
-                std::cmp::Reverse(w.started_at),
-            )
-        };
-        key(a).cmp(&key(b)).then_with(|| a.id.cmp(&b.id))
-    });
-    let total = found.len();
-    let mut bytes = 0usize;
-    let mut kept = Vec::new();
-    for (w, root) in found {
-        // With the comma that parts it from the next.
-        let size = serde_json::to_vec(&w).map_or(usize::MAX, |j| j.len().saturating_add(1));
-        if kept.len() == MAX_WORKLOADS || bytes.saturating_add(size) > MAX_WORKLOADS_BYTES {
-            break;
-        }
-        bytes = bytes.saturating_add(size);
-        kept.push((w, root));
-    }
-    let omitted = u32::try_from(total.saturating_sub(kept.len())).unwrap_or(u32::MAX);
-    kept.sort_by(|(a, _), (b, _)| (a.started_at, &a.id).cmp(&(b.started_at, &b.id)));
-    (kept, omitted)
-}
-
-fn display_safe(mut w: Workload) -> Workload {
-    use vk_hub_proto::display_safe as safe;
-    w.id = safe(&w.id);
-    w.state_dir = safe(&w.state_dir);
-    for s in [
-        &mut w.label,
-        &mut w.project,
-        &mut w.job_name,
-        &mut w.job_id,
-        &mut w.workspace,
-        &mut w.environment,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        *s = safe(s);
-    }
-    // Put into a link as they are, not only shown: left out rather than altered.
-    for s in [&mut w.ssh_alias, &mut w.guest_workspace] {
-        if s.as_deref().is_some_and(|v| safe(v) != v) {
-            *s = None;
-        }
-    }
-    w
-}
-
 /// The share of a workload's last figure its memory must move by before a new one is sent.
 const SETTLE: u64 = 16;
 
@@ -352,16 +296,36 @@ impl Once {
     fn say(&mut self, note: Option<String>) {
         if note != self.0 {
             if let Some(note) = &note {
-                eprintln!("{note}");
+                // Nowhere left to report a failed write to.
+                let _ = writeln!(std::io::stderr(), "{note}");
             }
             self.0 = note;
         }
     }
 }
 
+/// The workloads a list carries, and how many running ones it leaves out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Listed {
+    pub(crate) workloads: Vec<Workload>,
+    pub(crate) omitted: u32,
+}
+
+/// What a look at the admission ledger found.
+pub(crate) enum Ledger {
+    Read(crate::admit::Held),
+    /// Held by an admission: the last reading stands in.
+    Busy,
+    /// Said once, for as long as it stays so.
+    Unreadable,
+}
+
 /// What listing the host's workloads keeps from one look to the next.
-struct Lister {
+pub(crate) struct Lister {
     meter: Meter,
+    /// The VM registry the running VMs are read from; `None` for the user's own
+    /// ([`crate::vms::registry_dir`]).
+    registry: Option<PathBuf>,
     /// The ledger's reservations as last read; `None` where it could not be.
     reserved_mib: Option<HashMap<OsString, u64>>,
     ledger_said: Once,
@@ -371,9 +335,11 @@ struct Lister {
 }
 
 impl Lister {
-    fn new(mem_every: Duration) -> Self {
+    /// A lister of the VMs in `registry`, or the user's own registry's when `None`.
+    pub(crate) fn new(mem_every: Duration, registry: Option<PathBuf>) -> Self {
         Lister {
             meter: Meter::new(mem_every),
+            registry,
             reserved_mib: None,
             ledger_said: Once::default(),
             anomalies_said: Once::default(),
@@ -382,36 +348,55 @@ impl Lister {
         }
     }
 
-    /// The host's workloads now, bounded as [`bound`] bounds them, with what each holds on
-    /// the host by ID as the meter last measured it. A ledger that cannot be read leaves the
-    /// CI jobs unreserved.
+    /// The host's workloads now, bounded as [`bound_workloads`] bounds them, with what each
+    /// holds on the host by ID as the meter last measured it. A ledger that cannot be read
+    /// leaves the CI jobs unreserved.
     fn list(&mut self, cfg: &Config) -> WorkloadList {
-        // Not waited for: an admission holding the ledger gets on with it rather than queue
-        // behind, or ahead of, a poll every interval, and the reservations last read stand in
-        // until the next look finds it free. They are as fresh as an admission could make
-        // them anyway: a job's own changes only as it is admitted.
+        self.read_ledger(cfg);
+        let (listed, mem_bytes) = self.look(cfg);
+        WorkloadList {
+            version: vk_hub_proto::WORKLOADS_VERSION,
+            workloads: listed.workloads,
+            omitted: listed.omitted,
+            mem_bytes,
+        }
+    }
+
+    /// Read the admission ledger for the reservations [`Lister::look`] gives the CI jobs,
+    /// saying what goes wrong once. Not waited for: an admission holding the ledger gets on
+    /// with it rather than queue behind, or ahead of, a poll every interval, and the
+    /// reservations last read stand in until the next look finds it free. They are as fresh
+    /// as an admission could make them anyway: a job's own changes only as it is admitted.
+    pub(crate) fn read_ledger(&mut self, cfg: &Config) -> Ledger {
         match crate::admit::try_committed(&cfg.state_dir().join("admit")) {
             Ok(Some((held, anomalies))) => {
                 self.ledger_said.say(None);
                 self.anomalies_said
                     .say((!anomalies.is_empty()).then(|| anomalies.join("\n")));
-                self.reserved_mib = Some(held.mem.into_iter().collect());
+                self.reserved_mib = Some(held.mem.iter().cloned().collect());
+                Ledger::Read(held)
             }
-            Ok(None) => {}
+            Ok(None) => Ledger::Busy,
             Err(e) => {
                 self.ledger_said.say(Some(format!(
                     "virtkit: cannot read the admission ledger: {e:#}"
                 )));
                 self.reserved_mib = None;
+                Ledger::Unreadable
             }
         }
+    }
+
+    /// The workloads with the reservations last read, and what each holds by ID.
+    pub(crate) fn look(&mut self, cfg: &Config) -> (Listed, BTreeMap<String, u64>) {
         let sources = Sources::read(
             cfg,
+            self.registry.as_deref(),
             self.reserved_mib.clone().unwrap_or_default(),
             &mut self.jobs_said,
             &mut self.dev_said,
         );
-        let (found, omitted) = bound(workloads(&sources));
+        let (found, omitted) = bound_workloads(workloads(&sources));
         // Read once for every tree measured, and only when one is: without the kernel's child
         // lists it is a scan of every process on the host.
         let mut links = None;
@@ -419,12 +404,11 @@ impl Lister {
             let links = links.get_or_insert_with(crate::usage::Links::read);
             crate::usage::tree_resident_in(root, links)
         });
-        WorkloadList {
-            version: vk_hub_proto::WORKLOADS_VERSION,
+        let listed = Listed {
             workloads: found.into_iter().map(|(w, _)| w).collect(),
             omitted,
-            mem_bytes,
-        }
+        };
+        (listed, mem_bytes)
     }
 }
 
@@ -432,7 +416,7 @@ impl Lister {
 /// it changes, looking every `every`, until stdin closes or stdout's reader goes. The memory
 /// figures are measured every `mem_every` and as a VM appears.
 pub fn run(cfg: &Config, watch: bool, every: Duration, mem_every: Duration) -> Result<()> {
-    let mut lister = Lister::new(mem_every);
+    let mut lister = Lister::new(mem_every, None);
     // The reader holds stdin open for as long as it wants lists: its end is ours, even when
     // nothing changes and there is no write to fail.
     let done = watch.then(|| {
@@ -485,6 +469,7 @@ fn emit(
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    use vk_hub_proto::{MAX_WORKLOADS, MAX_WORKLOADS_BYTES};
 
     struct Scratch(PathBuf);
     impl Drop for Scratch {
@@ -620,7 +605,7 @@ mod tests {
         let tmp = scratch("jobs");
         let recorded = tmp.0.join("4242");
         let bare = tmp.0.join("77");
-        let (found, omitted) = bound(workloads(&Sources {
+        let (found, omitted) = bound_workloads(workloads(&Sources {
             jobs: vec![
                 Job {
                     dir: recorded.clone(),
@@ -799,15 +784,18 @@ mod tests {
             .map(|i| vm(i, WorkloadKind::Run))
             .collect();
         all.push(vm(0, WorkloadKind::CiJob));
-        all[0].0.id = "oldest-run".into();
-        let (kept, omitted) = bound(all);
+        let (kept, omitted) = bound_workloads(all);
         assert_eq!((kept.len(), omitted), (MAX_WORKLOADS, 11));
         assert_eq!(
             kept[0].0.kind,
             WorkloadKind::CiJob,
             "the oldest, but a CI job"
         );
-        assert!(kept.iter().all(|(w, _)| w.id != "oldest-run"));
+        assert!(
+            kept.iter()
+                .all(|(w, _)| w.kind == WorkloadKind::CiJob || w.started_at != Some(0)),
+            "the oldest run is left out"
+        );
         assert_eq!(kept[1].0.started_at, Some(11));
         assert!(
             kept.windows(2)
@@ -828,7 +816,7 @@ mod tests {
                 w
             })
             .collect();
-        let (kept, omitted) = bound(all);
+        let (kept, omitted) = bound_workloads(all);
         assert!(omitted > 0 && !kept.is_empty());
         assert_eq!(kept.len() + omitted as usize, MAX_WORKLOADS);
         let w = &kept[0].0;
@@ -861,7 +849,9 @@ mod tests {
 
     /// What `w` takes of the budget.
     fn cost(w: &Workload) -> usize {
-        serde_json::to_vec(&display_safe(w.clone())).unwrap().len() + 1
+        let mut w = w.clone();
+        assert!(vk_hub_proto::make_display_safe(&mut w));
+        serde_json::to_vec(&w).unwrap().len() + 1
     }
 
     /// The budget stops the list at the first workload past it: an older one that would
@@ -874,19 +864,21 @@ mod tests {
         };
         let unit = cost(&big(0).0);
         let small = vm(1, WorkloadKind::Run);
-        let mut n = MAX_WORKLOADS_BYTES / unit;
-        if MAX_WORKLOADS_BYTES - n * unit < cost(&small.0) {
+        // Less the byte the array's brackets take over the commas `cost` counts.
+        let budget = MAX_WORKLOADS_BYTES - 1;
+        let mut n = budget / unit;
+        if budget - n * unit < cost(&small.0) {
             n -= 1;
         }
         let (huge, root) = vm(500, WorkloadKind::Run);
         let huge = (filled(huge, '𝄞'), root);
         // The newest fill all but room for the small one, which the huge one overruns.
-        assert!(n * unit + cost(&small.0) <= MAX_WORKLOADS_BYTES);
-        assert!(n * unit + cost(&huge.0) > MAX_WORKLOADS_BYTES);
+        assert!(n * unit + cost(&small.0) <= budget);
+        assert!(n * unit + cost(&huge.0) > budget);
         let mut all: Vec<_> = (0..n).map(big).collect();
         all.push(huge);
         all.push(small);
-        let (kept, omitted) = bound(all);
+        let (kept, omitted) = bound_workloads(all);
         assert_eq!((kept.len(), omitted), (n, 2));
         assert!(kept.iter().all(|(w, _)| w.started_at >= Some(1000)));
     }
@@ -897,11 +889,11 @@ mod tests {
         let (mut w, root) = vm(0, WorkloadKind::Dev);
         w.ssh_alias = Some("vk-app".into());
         w.guest_workspace = Some("/work\u{202e}dir".into());
-        let (kept, _) = bound(vec![(w.clone(), root)]);
+        let (kept, _) = bound_workloads(vec![(w.clone(), root)]);
         assert_eq!(kept[0].0.ssh_alias.as_deref(), Some("vk-app"));
         assert_eq!(kept[0].0.guest_workspace, None);
         w.guest_workspace = Some("/workdir".into());
-        let (kept, _) = bound(vec![(w, root)]);
+        let (kept, _) = bound_workloads(vec![(w, root)]);
         assert_eq!(kept[0].0.guest_workspace.as_deref(), Some("/workdir"));
     }
 

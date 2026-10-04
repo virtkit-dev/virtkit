@@ -71,6 +71,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<NodesCmd>,
     },
+    /// List the VMs running on the nodes: CI jobs, dev environments, pinned runs
+    Workloads {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Only this node's: its ID, or a hostname only it has
+        #[arg(long, value_name = "NODE")]
+        node: Option<String>,
+    },
     /// Serve a web UI for this machine's VMs, signed into with a link it prints
     ///
     /// Runs as you and shows the VMs you run: pinned `vk run`s, dev environments and CI jobs.
@@ -231,6 +239,13 @@ async fn run(cli: Cli) -> Result<()> {
             let socket = state_dir.join(local::ADMIN_SOCKET);
             ui_cmd(admin_client_at(&socket, "vk-hub local` running")?, cmd).await
         }
+        Cmd::Workloads { config, node } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            let nodes =
+                tokio::task::spawn_blocking(move || client.workloads(node.as_deref())).await??;
+            print!("{}", render_workloads(&nodes));
+            Ok(())
+        }
     }
 }
 
@@ -379,7 +394,7 @@ pub(crate) fn human_duration(d: Duration) -> String {
 }
 
 /// The columns of `vk-hub nodes`.
-pub(crate) const NODE_COLUMNS: [&str; 8] = [
+pub(crate) const NODE_COLUMNS: [&str; 9] = [
     "ID",
     "NAME",
     "REACH",
@@ -388,10 +403,11 @@ pub(crate) const NODE_COLUMNS: [&str; 8] = [
     "CPUS",
     "RAM",
     "ADMITTED",
+    "VMS",
 ];
 
 /// One node's cells under [`NODE_COLUMNS`]: what it is.
-pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 8] {
+pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 9] {
     let gib = |mib: u64| format!("{}G", mib / 1024);
     let dash = || "-".to_string();
     let count = |n: Option<u32>| n.map_or_else(dash, |c| c.to_string());
@@ -416,12 +432,13 @@ pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 8] {
             (Some(c), None) => format!("{}/-", gib(c)),
             (None, _) => dash(),
         },
+        n.workloads.map_or_else(dash, |w| w.to_string()),
     ]
 }
 
 /// `vk-hub nodes`' table.
 fn render_nodes(nodes: &[ops::NodeView], now: u64) -> String {
-    let rows: Vec<[String; 8]> = nodes.iter().map(|n| node_cells(n, now)).collect();
+    let rows: Vec<[String; 9]> = nodes.iter().map(|n| node_cells(n, now)).collect();
     table(&NODE_COLUMNS, &rows)
 }
 
@@ -450,6 +467,51 @@ fn table<const N: usize>(headers: &[&str; N], rows: &[[String; N]]) -> String {
     line(headers);
     for row in rows {
         line(&row.each_ref().map(String::as_str));
+    }
+    out
+}
+
+/// `vk-hub workloads`' table, each node's VMs under its name, and a line for each node that
+/// has not reported any, left some out, had them left out of the reply, or is not connected.
+fn render_workloads(nodes: &[ops::NodeWorkloads]) -> String {
+    let mut rows: Vec<[String; 10]> = Vec::new();
+    let mut notes = Vec::new();
+    for n in nodes {
+        let Some(workloads) = &n.workloads else {
+            notes.push(format!("{}: has not reported its workloads", n.hostname));
+            continue;
+        };
+        if !n.connected {
+            notes.push(match n.last_seen {
+                Some(at) => format!("{}: not connected; as last seen at {}", n.hostname, utc(at)),
+                None => format!("{}: not connected", n.hostname),
+            });
+        }
+        if n.withheld > 0 {
+            notes.push(format!(
+                "{}: {} listed, too many to show with every node's: see \
+                 `vk-hub workloads --node {}`",
+                n.hostname, n.withheld, n.id
+            ));
+        }
+        for w in &workloads.listed {
+            let [a, b, c, d, e, f, g, h, i] =
+                workloads::cells(w, workloads.mem_bytes.get(&w.id).copied());
+            rows.push([n.hostname.clone(), a, b, c, d, e, f, g, h, i]);
+        }
+        if workloads.omitted > 0 {
+            notes.push(format!(
+                "{}: {} more running, not listed",
+                n.hostname, workloads.omitted
+            ));
+        }
+    }
+    let mut headers = ["NODE"; 10];
+    headers[1..].copy_from_slice(&workloads::COLUMNS);
+    let mut out = table(&headers, &rows);
+    for note in notes {
+        out.push_str(&note);
+        out.push('\n');
     }
     out
 }
