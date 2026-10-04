@@ -298,7 +298,9 @@ async fn power_off(ch: &mut Child, work: &Path, grace: Duration) -> Option<Durat
     if button && exited_by(ch, pressed + BUTTON_GRACE).await {
         return Some(pressed.elapsed());
     }
-    // Off the runtime: the agent's sync blocks for up to its timeout.
+    // Off the runtime: the agent's sync blocks for up to its timeout. That sync waits its turn
+    // behind other clients' requests (see `relay::serve_agent_socket`): when they hold the agent
+    // longer, the request is not made and the kill at the end of `grace` stops the guest.
     let asked = tokio::task::spawn_blocking(move || {
         crate::qga::Client::connect(&socket, Duration::from_secs(5))?.shutdown()
     })
