@@ -1049,7 +1049,7 @@ pub async fn serve(opts: Options) -> Result<()> {
     let now = crate::now_secs();
     end_access(&db, now)?;
     let origin = format!("http://{name}:{port}");
-    let hub = Arc::new(Hub::new(db, origin.clone()));
+    let hub = Arc::new(Hub::new(db, Some(origin.clone())));
     let admin = crate::admin::bind(&state.join(ADMIN_SOCKET))?;
     tokio::spawn(crate::admin::serve(admin, hub.clone()));
     eprintln!("vk-hub: running {}", vk.display());
@@ -1524,7 +1524,7 @@ mod tests {
         let local = Arc::new(Local::new(dir.join("vk"), dir.join("actions")));
         let hub = Arc::new(Hub::new(
             Arc::new(Db::open_memory().unwrap()),
-            "http://h".into(),
+            Some("http://h".into()),
         ));
         let unended = |key: &str| {
             local.lock_actions().insert(
@@ -1742,7 +1742,7 @@ mod tests {
         std::fs::set_permissions(&vk, std::fs::Permissions::from_mode(0o755)).unwrap();
         let hub = Hub::new(
             Arc::new(Db::open_memory().unwrap()),
-            "http://hub.example".into(),
+            Some("http://hub.example".into()),
         );
         let local = Local::new(vk, dir.join("actions"));
         let changes = hub.subscribe();

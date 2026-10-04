@@ -204,6 +204,9 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
     let actor = format!("uid {uid}");
     let value = match envelope.call {
         Call::UiLogin { role, ttl_secs } => {
+            let Some(base) = &hub.ui_url else {
+                bail!("the web UI is not being served");
+            };
             let (token, expires_at) = hub.db.create_login(
                 role,
                 Duration::from_secs(ttl_secs),
@@ -217,7 +220,7 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
                 role.name()
             );
             serde_json::to_value(LoginLink {
-                url: format!("{}{}?t={token}", hub.ui_url, crate::ui::LOGIN_PATH),
+                url: format!("{base}{}?t={token}", crate::ui::LOGIN_PATH),
                 expires_at,
             })?
         }
@@ -345,10 +348,7 @@ mod tests {
 
     #[test]
     fn a_version_mismatch_says_so() {
-        let hub = Hub::new(
-            Arc::new(Db::open_memory().unwrap()),
-            "http://hub.example".into(),
-        );
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
         let err = dispatch(br#"{"v":99,"call":{"op":"ui-sessions"}}"#, &hub, 0).unwrap_err();
         assert!(format!("{err:#}").contains("v99"), "{err:#}");
         let err = dispatch(br#"{"v":1,"call":{"op":"format-disks"}}"#, &hub, 0).unwrap_err();
@@ -356,11 +356,14 @@ mod tests {
     }
 
     #[test]
-    fn a_sign_in_link_starts_with_the_web_ui_s_url() {
+    fn a_sign_in_link_needs_the_web_ui_and_starts_with_its_url() {
         let call = br#"{"v":1,"call":{"op":"ui-login","role":"operator","ttl_secs":60}}"#;
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+        let err = dispatch(call, &hub, 0).unwrap_err();
+        assert!(format!("{err:#}").contains("not being served"), "{err:#}");
         let hub = Hub::new(
             Arc::new(Db::open_memory().unwrap()),
-            "http://hub.example".into(),
+            Some("http://hub.example".into()),
         );
         let link: LoginLink = serde_json::from_value(dispatch(call, &hub, 1000).unwrap()).unwrap();
         let token = link

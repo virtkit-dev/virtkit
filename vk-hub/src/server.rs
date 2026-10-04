@@ -9,22 +9,23 @@ use anyhow::Result;
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
+use tokio_rustls::TlsAcceptor;
 
 use crate::store::Db;
 
 /// Accept backlog.
 const LISTEN_BACKLOG: u32 = 1024;
 
-/// How long a client has for each step before it has authenticated: its request headers, a
-/// form's body. A browser needs milliseconds for any of them; a peer that holds a connection
-/// open without finishing one is only holding it.
+/// How long a client has for each step before it has authenticated: the TLS handshake, its
+/// request headers, a form's body. A browser needs milliseconds for any of them; a peer that
+/// holds a connection open without finishing one is only holding it.
 pub const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What every connection shares.
 pub struct Hub {
     pub db: Arc<Db>,
-    /// The web UI's origin, which its sign-in links start with.
-    pub ui_url: String,
+    /// The web UI's origin, which its sign-in links start with; `None` with the UI off.
+    pub ui_url: Option<String>,
     /// Bumped whenever anything a page shows may have changed, for its live updates.
     changes: watch::Sender<u64>,
     /// Bumped when a web UI session ends.
@@ -32,8 +33,8 @@ pub struct Hub {
 }
 
 impl Hub {
-    /// The hub keeping its state in `db`, with its web UI at `ui_url`.
-    pub fn new(db: Arc<Db>, ui_url: String) -> Self {
+    /// The hub keeping its state in `db`, with its web UI at `ui_url` if it serves one.
+    pub fn new(db: Arc<Db>, ui_url: Option<String>) -> Self {
         Hub {
             db,
             ui_url,
@@ -75,7 +76,11 @@ pub fn listen(addr: SocketAddr) -> std::io::Result<TcpListener> {
     socket.listen(LISTEN_BACKLOG)
 }
 
-/// A connection's byte stream, as one type, so one accept loop serves every listener.
+/// The TLS keying material a session's auth is bound to ([`vk_hub_proto::Channel`]), or
+/// `None` on plain TCP.
+pub(crate) type Exported = Option<[u8; vk_hub_proto::TLS_EXPORTER_LEN]>;
+
+/// A connection's byte stream, TLS or plain, as one type, so one accept loop serves both.
 pub(crate) trait Stream:
     tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send
 {
@@ -83,15 +88,17 @@ pub(crate) trait Stream:
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for T {}
 pub(crate) type Io = TokioIo<Box<dyn Stream>>;
 
-/// Accept on `listener` until the process ends and pass each connection to `conn`, holding
-/// a permit for its lifetime. Close excess connections immediately.
+/// Accept on `listener` until the process ends. Complete any TLS handshake within
+/// [`PRE_AUTH_TIMEOUT`] before calling `conn`, holding a permit for the connection's
+/// lifetime. Close excess connections immediately.
 pub(crate) async fn accept<F, Fut>(
     listener: TcpListener,
+    tls: Option<TlsAcceptor>,
     permits: Arc<Semaphore>,
     conn: F,
 ) -> Result<()>
 where
-    F: Fn(Io, SocketAddr) -> Fut + Send + Sync + 'static,
+    F: Fn(Io, SocketAddr, Exported) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let conn = Arc::new(conn);
@@ -110,10 +117,34 @@ where
             drop(stream);
             continue;
         };
+        let tls = tls.clone();
         let conn = conn.clone();
         tokio::spawn(async move {
-            let io: Box<dyn Stream> = Box::new(stream);
-            conn(TokioIo::new(io), peer).await;
+            match tls {
+                Some(acceptor) => {
+                    match tokio::time::timeout(PRE_AUTH_TIMEOUT, acceptor.accept(stream)).await {
+                        Ok(Ok(stream)) => {
+                            let mut exported = [0u8; vk_hub_proto::TLS_EXPORTER_LEN];
+                            if let Err(e) = stream.get_ref().1.export_keying_material(
+                                &mut exported,
+                                vk_hub_proto::TLS_EXPORTER_LABEL,
+                                None,
+                            ) {
+                                eprintln!("vk-hub: {peer}: exporting TLS keying material: {e}");
+                                return;
+                            }
+                            let io: Box<dyn Stream> = Box::new(stream);
+                            conn(TokioIo::new(io), peer, Some(exported)).await;
+                        }
+                        Ok(Err(e)) => eprintln!("vk-hub: {peer}: TLS handshake error: {e}"),
+                        Err(_) => eprintln!("vk-hub: {peer}: TLS handshake timed out"),
+                    }
+                }
+                None => {
+                    let io: Box<dyn Stream> = Box::new(stream);
+                    conn(TokioIo::new(io), peer, None).await;
+                }
+            }
             drop(permit);
         });
     }

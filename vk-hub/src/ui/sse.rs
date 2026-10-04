@@ -453,7 +453,7 @@ mod tests {
     fn signed_in() -> (Arc<Hub>, Auth) {
         let hub = Arc::new(Hub::new(
             Arc::new(Db::open_memory().unwrap()),
-            "http://hub.example".into(),
+            Some("http://hub.example".into()),
         ));
         let now = crate::now_secs();
         let (token, _) = hub

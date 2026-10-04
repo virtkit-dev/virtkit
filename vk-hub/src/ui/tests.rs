@@ -41,7 +41,7 @@ async fn start_with_vk(
     let origin = origin.map_or_else(|| format!("http://{addr}"), str::to_string);
     let hub = Arc::new(Hub::new(
         Arc::new(Db::open_memory().unwrap()),
-        origin.clone(),
+        Some(origin.clone()),
     ));
     let logs = vk.with_file_name("actions");
     let local = Arc::new(Local::new(vk, logs));
