@@ -43,6 +43,7 @@ mod executor;
 mod ext4;
 mod ext4_read;
 mod fullvm;
+mod health;
 mod hostpolicy;
 mod image;
 mod initramfs;

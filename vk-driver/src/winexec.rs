@@ -298,6 +298,23 @@ pub(crate) fn run_program(ga: &mut Client, path: &str, args: &[&str]) -> Result<
     }
 }
 
+/// Start the command line `command_line` the way [`exec_command_line`] runs it, from a batch
+/// file, but straight under cmd.exe, its output dropped: no PowerShell wrapper to wait for.
+/// Returns its pid, waiting at most `timeout` for the agent to start it, and the batch file,
+/// which deletes itself as it ends.
+pub(crate) fn start_line(
+    ga: &mut Client,
+    command_line: &str,
+    timeout: Duration,
+) -> Result<(i64, String)> {
+    check_line(command_line, None)?;
+    let bat = format!(r"{RUN_DIR}\{}.cmd", crate::scratch::random_nonce()?);
+    put_run_file(ga, &bat, script(command_line, &[], None, None).as_bytes())?;
+    let args = ["/d", "/v:off", "/c", &bat].map(String::from);
+    let pid = ga.exec_within("cmd.exe", &args, timeout)?;
+    Ok((pid, bat))
+}
+
 /// Write `body` to the guest file `path` under [`RUN_DIR`], making the directory first if
 /// this is the guest's first command.
 fn put_run_file(ga: &mut Client, path: &str, body: &[u8]) -> Result<()> {
