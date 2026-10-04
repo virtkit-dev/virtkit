@@ -723,6 +723,9 @@ pub struct VmSpec {
     /// boot child relays it to COM1 as it does the guest agent ([`crate::relay::serve_socket`]).
     #[serde(default)]
     pub serial_input: Option<PathBuf>,
+    /// A Unix socket the boot child answers VM control requests on ([`crate::vmmctl`]).
+    #[serde(default)]
+    pub control: Option<PathBuf>,
 }
 
 /// A virtual machine monitor that can boot a [`VmSpec`]. `Send` so a boxed `dyn Vmm`

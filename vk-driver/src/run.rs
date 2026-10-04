@@ -2277,6 +2277,7 @@ async fn build_and_boot(
         hyperv: false,
         vm_generation_id: None,
         serial_input: None,
+        control: None,
     };
     // Control server on the primary's per-port control socket — only the
     // primary's guest can reach it, so the control plane is scoped to this run —
@@ -2404,6 +2405,7 @@ async fn build_and_boot(
             stale_recipe,
             services: service_entries,
             guest_agent: None,
+            control: None,
         })
     });
 
@@ -4786,6 +4788,7 @@ pub(crate) async fn boot_session(
         hyperv: false,
         vm_generation_id: None,
         serial_input: None,
+        control: None,
     };
     let vmm = crate::vmm::selected();
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
@@ -6295,6 +6298,7 @@ mod tests {
             hyperv: false,
             vm_generation_id: None,
             serial_input: None,
+            control: None,
         };
         let mut child = spawn_vmm(&CatVmm, &spec, crate::prio::Prio::Normal).unwrap();
         assert!(child.wait().unwrap().success());

@@ -91,6 +91,7 @@ mod usage;
 mod vm;
 mod vmdk;
 mod vmm;
+mod vmmctl;
 mod vms;
 mod winbuild;
 mod winexec;
@@ -2154,6 +2155,30 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Freeze a running UEFI VM's vCPUs
+    ///
+    /// The guest stops where it is, its memory and devices kept, until `vk resume`. Selects
+    /// the VM whose project is the current directory by default; pass a pid or a project
+    /// directory, or `--all`.
+    #[command(display_order = 8)]
+    Pause {
+        /// the VM to pause: a PID or a project directory (default: the current directory)
+        #[arg(value_name = "PID|DIR")]
+        target: Option<std::ffi::OsString>,
+        /// pause every running vk VM that can be
+        #[arg(long, conflicts_with = "target")]
+        all: bool,
+    },
+    /// Run a VM `vk pause` froze again
+    #[command(display_order = 8)]
+    Resume {
+        /// the VM to resume: a PID or a project directory (default: the current directory)
+        #[arg(value_name = "PID|DIR")]
+        target: Option<std::ffi::OsString>,
+        /// resume every paused vk VM
+        #[arg(long, conflicts_with = "target")]
+        all: bool,
+    },
     /// Replace this `vk` with a GitHub release build
     ///
     /// Installs the latest release, or the VERSION given. Prints what it is about to
@@ -2964,36 +2989,18 @@ async fn cli_main(cli: Cli) -> ExitCode {
         timeout,
     } = &cli.cmd
     {
-        let selector = match target.as_deref().map(vms::Selector::parse).transpose() {
-            Ok(sel) => sel,
-            Err(e) => {
-                eprintln!("vk: {e:#}");
-                return exit_code(2);
-            }
-        };
-        return match vms::stop_cmd(selector, *all, *timeout) {
-            Ok((report, all_down)) => match write_report(&report) {
-                ExitCode::SUCCESS if !all_down => exit_code(1),
-                code => code,
-            },
-            Err(e) => fail(&e, 2),
-        };
+        return act_on_vms(target.as_deref(), |sel| vms::stop_cmd(sel, *all, *timeout));
     }
     if let Cmd::Reboot { target, all, force } = &cli.cmd {
-        let selector = match target.as_deref().map(vms::Selector::parse).transpose() {
-            Ok(sel) => sel,
-            Err(e) => {
-                eprintln!("vk: {e:#}");
-                return exit_code(2);
-            }
+        return act_on_vms(target.as_deref(), |sel| vms::reboot_cmd(sel, *all, *force));
+    }
+    if let Cmd::Pause { target, all } | Cmd::Resume { target, all } = &cli.cmd {
+        let req = if matches!(cli.cmd, Cmd::Pause { .. }) {
+            vms::PauseRequest::Pause
+        } else {
+            vms::PauseRequest::Resume
         };
-        return match vms::reboot_cmd(selector, *all, *force) {
-            Ok((report, all_ok)) => match write_report(&report) {
-                ExitCode::SUCCESS if !all_ok => exit_code(1),
-                code => code,
-            },
-            Err(e) => fail(&e, 2),
-        };
+        return act_on_vms(target.as_deref(), |sel| vms::pause_cmd(sel, *all, req));
     }
     if let Cmd::Gc { idle_secs } = &cli.cmd {
         let override_idle = idle_secs.map(std::time::Duration::from_secs);
@@ -4604,6 +4611,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
         | Cmd::List { .. }
         | Cmd::Stop { .. }
         | Cmd::Reboot { .. }
+        | Cmd::Pause { .. }
+        | Cmd::Resume { .. }
         | Cmd::Update { .. }
         | Cmd::Toolchain { .. }
         | Cmd::HostPolicy { .. }
@@ -4828,6 +4837,28 @@ async fn windows_build(cmd: &Cmd) -> ExitCode {
         Ok(Ok(())) => ExitCode::SUCCESS,
         Ok(Err(e)) => fail(&e, 1),
         Err(e) => fail(&anyhow::anyhow!("{e}"), 1),
+    }
+}
+
+/// Run a `vk stop`-like command on the VMs its TARGET selects: print its report, and exit 1
+/// unless every VM did it, 2 on a bad TARGET or an error.
+fn act_on_vms(
+    target: Option<&std::ffi::OsStr>,
+    run: impl FnOnce(Option<vms::Selector>) -> anyhow::Result<(String, bool)>,
+) -> ExitCode {
+    let selector = match target.map(vms::Selector::parse).transpose() {
+        Ok(sel) => sel,
+        Err(e) => {
+            eprintln!("vk: {e:#}");
+            return exit_code(2);
+        }
+    };
+    match run(selector) {
+        Ok((report, all_ok)) => match write_report(&report) {
+            ExitCode::SUCCESS if !all_ok => exit_code(1),
+            code => code,
+        },
+        Err(e) => fail(&e, 2),
     }
 }
 
@@ -6339,6 +6370,7 @@ mod tests {
                 stale_recipe: None,
             }],
             guest_agent: None,
+            control: None,
         };
         assert_eq!(
             resolve_service_addr(&entry, "db").unwrap(),
@@ -6518,8 +6550,10 @@ mod tests {
                 "gc",
                 "list",
                 "logs",
+                "pause",
                 "publish",
                 "reboot",
+                "resume",
                 "run",
                 "ssh",
                 "ssh-config",

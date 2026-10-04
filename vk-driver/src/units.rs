@@ -790,6 +790,7 @@ pub fn boot_unit(
             hyperv: false,
             vm_generation_id: None,
             serial_input: None,
+            control: None,
         };
         let vmm = crate::vmm::selected();
         // The one VMM spawn shared with `vk run`/`vk build`/the job VM: tied (PDEATHSIG)
