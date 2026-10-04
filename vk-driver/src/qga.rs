@@ -1,11 +1,10 @@
 //! The qemu-ga channel of an agent-less guest (Windows): the guest agent reads and writes a
 //! named virtio-console port, which the boot child bridges to a Unix socket on the host.
 //!
-//! The port is one end of a socketpair; [`crate::relay::serve_socket`] relays the other end to
-//! whichever client is connected to the socket, one at a time, the newest winning. What the
-//! guest writes with no client connected is dropped, and the agent's protocol carries no
-//! session, so a client starts with `guest-sync-delimited` to discard what an earlier client
-//! left in flight.
+//! The port is one end of a socketpair; [`crate::relay::serve_agent_socket`] shares the other
+//! end among the socket's clients, one request at a time. The agent's protocol carries no
+//! session, so a client starts with `guest-sync-delimited`, which also skips an answer still
+//! in flight for an earlier one.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -24,6 +23,65 @@ pub struct Client {
     buf: Vec<u8>,
     /// a request timed out: its late answer may still come, so resynchronize before the next
     stale: bool,
+    /// the socket it was connected through, for [`Client::reconnect`]
+    socket: std::path::PathBuf,
+}
+
+/// The connection to the agent failed: closed, broken, or unanswered in time. Unlike an
+/// [`AgentError`], the agent did not answer the request, which a new connection may retry.
+#[derive(Debug)]
+pub struct Lost;
+
+impl std::fmt::Display for Lost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("lost the guest agent connection")
+    }
+}
+
+impl std::error::Error for Lost {}
+
+/// `e`, marked as a [`Lost`] connection.
+fn lost(e: impl Into<anyhow::Error>) -> anyhow::Error {
+    e.into().context(Lost)
+}
+
+/// A `guest-sync-delimited` id unlikely to be another connection's, so that an answer to an
+/// earlier sync cannot pass for the answer to this one.
+pub(crate) fn sync_id() -> u64 {
+    let id = (std::process::id() as u64) << 32
+        | std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos() as u64);
+    // JSON numbers are exact up to 2^53.
+    id & ((1 << 53) - 1)
+}
+
+/// The request line of a `guest-sync-delimited` with `id`. Its leading 0xFF makes the agent
+/// drop any partial request; the answer comes after a 0xFF of its own.
+pub(crate) fn sync_request(id: u64) -> Vec<u8> {
+    let mut line = vec![0xff];
+    line.extend(
+        serde_json::json!({ "execute": "guest-sync-delimited", "arguments": { "id": id } })
+            .to_string()
+            .bytes(),
+    );
+    line.push(b'\n');
+    line
+}
+
+/// The JSON object on an answer line from the agent, if any. What precedes a 0xFF is an earlier
+/// client's leftover, never valid JSON text (0xFF is not UTF-8).
+pub(crate) fn answer(line: &[u8]) -> Option<serde_json::Value> {
+    let line = match line.iter().rposition(|&b| b == 0xff) {
+        Some(ff) => &line[ff + 1..],
+        None => line,
+    };
+    serde_json::from_slice(line).ok()
+}
+
+/// Whether `line` answers the `guest-sync-delimited` with `id`.
+pub(crate) fn is_synced(line: &[u8], id: u64) -> bool {
+    answer(line).and_then(|a| a.get("return")?.as_u64()) == Some(id)
 }
 
 /// How long a request may wait for its answer unless the caller says otherwise.
@@ -67,44 +125,42 @@ impl std::error::Error for AgentError {}
 impl Client {
     /// Connect to the agent behind `socket` and resynchronize, waiting up to `timeout` for
     /// it to answer: the socket appears once the VMM is up, the agent once the guest has
-    /// booted.
+    /// booted. Connects again when the relay drops the connection, as it does a sync left
+    /// unanswered while the guest boots.
     pub fn connect(socket: &Path, timeout: std::time::Duration) -> Result<Client> {
         let deadline = std::time::Instant::now() + timeout;
-        let stream = loop {
-            match vk_core::unixpath::connect(socket) {
-                Ok(stream) => break stream,
+        loop {
+            let attempt = vk_core::unixpath::connect(socket)
+                .with_context(|| format!("connecting to the guest agent at {}", socket.display()))
+                .and_then(|stream| {
+                    let mut client = Client {
+                        stream,
+                        buf: Vec::new(),
+                        stale: false,
+                        socket: socket.to_path_buf(),
+                    };
+                    client.sync(deadline.saturating_duration_since(std::time::Instant::now()))?;
+                    Ok(client)
+                });
+            match attempt {
+                Ok(client) => return Ok(client),
                 Err(_) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("connecting to the guest agent at {}", socket.display())
-                    });
-                }
+                Err(e) => return Err(e),
             }
-        };
-        let mut client = Client {
-            stream,
-            buf: Vec::new(),
-            stale: false,
-        };
-        client.sync(deadline.saturating_duration_since(std::time::Instant::now()))?;
-        Ok(client)
+        }
+    }
+
+    /// Connect again through the same socket, as [`Client::connect`] does.
+    pub fn reconnect(&mut self, timeout: std::time::Duration) -> Result<()> {
+        *self = Client::connect(&self.socket, timeout)?;
+        Ok(())
     }
 
     fn sync(&mut self, timeout: std::time::Duration) -> Result<()> {
-        // A per-connection id, so an answer to an earlier client's sync cannot pass for ours.
-        let id = (std::process::id() as u64) << 32
-            | std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.subsec_nanos() as u64);
-        let id = id & ((1 << 53) - 1);
-        // 0xFF makes the agent drop any partial request; the answer comes after a 0xFF of its own.
-        self.stream.write_all(&[0xff])?;
-        self.send(
-            "guest-sync-delimited",
-            Some(serde_json::json!({ "id": id })),
-        )?;
+        let id = sync_id();
+        self.stream.write_all(&sync_request(id)).map_err(lost)?;
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let reply = self
@@ -124,50 +180,39 @@ impl Client {
         }
         let mut line = serde_json::to_vec(&request)?;
         line.push(b'\n');
-        self.stream
-            .write_all(&line)
-            .context("writing to the guest agent")
+        self.stream.write_all(&line).map_err(lost)
     }
 
-    /// The next JSON object the agent sends, by `deadline`. The agent ends each with a newline
-    /// and, answering a sync, puts a 0xFF before it: what precedes that is an earlier
-    /// client's leftover, never valid JSON text (0xFF is not UTF-8).
+    /// The next JSON object the agent sends, by `deadline`: each ends with a newline.
     fn receive(&mut self, deadline: std::time::Instant) -> Result<serde_json::Value> {
         loop {
-            if let Some(end) = self.buf.iter().position(|&b| b == b'\n') {
-                let mut line: Vec<u8> = self.buf.drain(..=end).collect();
-                if let Some(ff) = line.iter().rposition(|&b| b == 0xff) {
-                    line.drain(..=ff);
-                }
-                let text = String::from_utf8_lossy(&line);
-                if text.trim().is_empty() {
-                    continue;
-                }
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+            while let Some(end) = self.buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=end).collect();
+                if let Some(value) = answer(&line) {
                     return Ok(value);
                 }
-                continue;
             }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
-                anyhow::bail!("timed out waiting for the guest agent");
+                return Err(lost(anyhow::anyhow!("no answer in time")));
             }
-            self.stream.set_read_timeout(Some(left))?;
+            self.stream.set_read_timeout(Some(left)).map_err(lost)?;
             let mut chunk = [0u8; 64 * 1024];
             match self.stream.read(&mut chunk) {
-                Ok(0) => anyhow::bail!("the guest agent connection closed"),
+                Ok(0) => return Err(lost(anyhow::anyhow!("closed"))),
                 Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
                 Err(e)
                     if matches!(
                         e.kind(),
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) => {}
-                Err(e) => return Err(e).context("reading from the guest agent"),
+                Err(e) => return Err(lost(e)),
             }
         }
     }
 
-    /// Run `command` and return its `return` value, or the agent's error.
+    /// Run `command` and return its `return` value, or the agent's error. `timeout` includes
+    /// waiting for the relay's turn. A request that times out may still run in the guest.
     pub fn call(
         &mut self,
         command: &str,
@@ -202,7 +247,7 @@ impl Client {
     }
 
     /// Ask the guest to power off (`guest-shutdown`). The agent answers by acting, not with a
-    /// reply, so this only sends the request.
+    /// reply, so this only sends the request; the relay ignores an error the agent answers.
     pub fn shutdown(&mut self) -> Result<()> {
         self.send(
             "guest-shutdown",
@@ -229,6 +274,8 @@ impl Client {
             .context("guest-exec returned no pid")
     }
 
+    /// The status of the command `pid`. The agent forgets a command once it has said it exited,
+    /// so when that answer is lost (it came too late), asking again gets an [`AgentError`].
     pub fn exec_status(&mut self, pid: i64) -> Result<ExecStatus> {
         let reply = self.call(
             "guest-exec-status",
@@ -266,6 +313,16 @@ impl Client {
             );
         }
         Ok((bytes, read.eof))
+    }
+
+    /// Move `handle`'s position to `offset` bytes from the start of the file.
+    pub fn file_seek(&mut self, handle: i64, offset: u64) -> Result<()> {
+        self.call(
+            "guest-file-seek",
+            Some(serde_json::json!({ "handle": handle, "offset": offset, "whence": "set" })),
+            DEFAULT_TIMEOUT,
+        )
+        .map(drop)
     }
 
     pub fn file_write(&mut self, handle: i64, bytes: &[u8]) -> Result<()> {
@@ -309,16 +366,64 @@ pub(crate) mod tests {
             let mut byte = [0u8; 1];
             while port.read_exact(&mut byte).is_ok() {
                 match byte[0] {
-                    0xff => line.clear(),
+                    // As qemu-ga, which answers a 0xFF it reads as a parse error.
+                    0xff => {
+                        line.clear();
+                        if port.write_all(STRAY_FF).is_err() {
+                            return;
+                        }
+                    }
                     b'\n' => {
                         let request = serde_json::from_slice(&line).unwrap_or_default();
                         line.clear();
-                        if port.write_all(&respond(&request)).is_err() {
+                        let reply = respond(&request);
+                        if reply == HANG_UP || port.write_all(&reply).is_err() {
                             return;
                         }
                     }
                     b => line.push(b),
                 }
+            }
+        });
+    }
+
+    /// What qemu-ga answers a 0xFF with.
+    pub(crate) const STRAY_FF: &[u8] =
+        b"{\"error\": {\"class\": \"GenericError\", \"desc\": \"JSON parse error, stray '\\uFFFD'\"}}\n";
+
+    /// What a fake agent's `respond` returns to close the connection instead of answering.
+    pub(crate) const HANG_UP: &[u8] = b"\0hang up\0";
+
+    /// A temporary directory, removed when dropped.
+    pub(crate) struct TempDir(pub std::path::PathBuf);
+
+    impl TempDir {
+        pub(crate) fn new(name: &str) -> TempDir {
+            let dir = std::env::temp_dir().join(format!("vk-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A socket at `path` where each connection gets a fake agent running `respond`, as a
+    /// guest agent reached through a relay that may drop a connection.
+    pub(crate) fn agent_socket(
+        path: &Path,
+        respond: impl Fn(&serde_json::Value) -> Vec<u8> + Send + Sync + 'static,
+    ) {
+        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+        let respond = std::sync::Arc::new(respond);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let respond = respond.clone();
+                fake_agent(stream.unwrap(), move |request| respond(request));
             }
         });
     }
@@ -340,9 +445,61 @@ pub(crate) mod tests {
             stream,
             buf: Vec::new(),
             stale: false,
+            socket: std::path::PathBuf::new(),
         };
         client.sync(std::time::Duration::from_secs(5)).unwrap();
         client
+    }
+
+    #[test]
+    fn clients_share_the_agent_request_by_request() {
+        let dir = TempDir::new("qga-share");
+        let sock = dir.0.join("qga.sock");
+        let (port, host) = UnixStream::pair().unwrap();
+        crate::relay::serve_agent_socket(&sock, host, "vk-qga-test").unwrap();
+        // Echoes each request's arguments.
+        fake_agent(port, |request| match request["execute"].as_str() {
+            Some("guest-sync-delimited") => synced(request),
+            _ => format!(
+                "{}\n",
+                serde_json::json!({ "return": request["arguments"] })
+            )
+            .into_bytes(),
+        });
+
+        // One that connects and never asks blocks no one.
+        let _idle = vk_core::unixpath::connect(&sock).unwrap();
+        let clients: Vec<_> = (0..2)
+            .map(|client| {
+                let sock = sock.clone();
+                std::thread::spawn(move || {
+                    let mut ga = Client::connect(&sock, DEFAULT_TIMEOUT).unwrap();
+                    for n in 0..50 {
+                        let asked = serde_json::json!({ "client": client, "n": n });
+                        let answer = ga.call("echo", Some(asked.clone()), DEFAULT_TIMEOUT);
+                        assert_eq!(answer.unwrap(), asked);
+                    }
+                })
+            })
+            .collect();
+        for client in clients {
+            client.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_dropped_connection_is_lost_and_an_agent_error_is_not() {
+        let mut ga = client(|request| match request["execute"].as_str() {
+            Some("guest-sync-delimited") => synced(request),
+            Some("refused") => {
+                b"{\"error\": {\"class\": \"GenericError\", \"desc\": \"no\"}}\n".to_vec()
+            }
+            _ => HANG_UP.to_vec(),
+        });
+        let refused = ga.call("refused", None, DEFAULT_TIMEOUT).unwrap_err();
+        assert!(refused.downcast_ref::<Lost>().is_none());
+        let dropped = ga.call("guest-ping", None, DEFAULT_TIMEOUT).unwrap_err();
+        assert!(dropped.downcast_ref::<Lost>().is_some(), "{dropped:#}");
     }
 
     #[test]
@@ -405,5 +562,139 @@ pub(crate) mod tests {
         assert!(ga.call("slow", None, short).is_err());
         let reply = ga.call("fast", None, DEFAULT_TIMEOUT).unwrap();
         assert_eq!(reply, "fast");
+    }
+
+    /// A qemu-ga of the host's own, listening on a socket in a directory of the test's.
+    struct RealAgent {
+        child: std::process::Child,
+        socket: std::path::PathBuf,
+    }
+
+    impl Drop for RealAgent {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// qemu-ga started in `dir`, with the commands that stop or freeze the host blocked; `None`
+    /// when it is not installed or does not start.
+    fn real_agent(dir: &Path) -> Option<RealAgent> {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let bin = std::env::split_paths(&path)
+            .chain(["/usr/sbin".into(), "/sbin".into()])
+            .map(|dir| dir.join("qemu-ga"))
+            .find(|bin| bin.is_file())?;
+        let conf = dir.join("qemu-ga.conf");
+        std::fs::write(&conf, "").ok()?;
+        let socket = dir.join("ga.sock");
+        let child = std::process::Command::new(bin)
+            .arg("--config")
+            .arg(&conf)
+            .args(["--method", "unix-listen", "--path"])
+            .arg(&socket)
+            .arg("--pidfile")
+            .arg(dir.join("ga.pid"))
+            .arg("--statedir")
+            .arg(dir)
+            .arg("--logfile")
+            .arg(dir.join("ga.log"))
+            .arg(
+                "--block-rpcs=guest-shutdown,guest-suspend-disk,guest-suspend-ram,\
+                 guest-suspend-hybrid,guest-fsfreeze-freeze,guest-fsfreeze-freeze-list,\
+                 guest-set-time",
+            )
+            .spawn()
+            .ok()?;
+        let agent = RealAgent { child, socket };
+        for _ in 0..50 {
+            if UnixStream::connect(&agent.socket).is_ok() {
+                return Some(agent);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        None
+    }
+
+    #[test]
+    fn a_real_qemu_ga_serves_clients_through_the_relay() {
+        let dir = TempDir::new("qga-real");
+        let Some(agent) = real_agent(&dir.0) else {
+            eprintln!("skipped: no qemu-ga to run");
+            return;
+        };
+        let pong = serde_json::json!({});
+        // Directly: qemu-ga answers the 0xFF leading a sync with an error line of its own.
+        let mut direct = Client::connect(&agent.socket, DEFAULT_TIMEOUT).unwrap();
+        assert_eq!(
+            direct.call("guest-ping", None, DEFAULT_TIMEOUT).unwrap(),
+            pong
+        );
+        drop(direct);
+
+        // qemu-ga takes a connection once the previous one has closed.
+        let guest = UnixStream::connect(&agent.socket).unwrap();
+        let relay = dir.0.join("qga.sock");
+        crate::relay::serve_agent_socket(&relay, guest, "vk-qga-real").unwrap();
+        let clients: Vec<_> = (0..2)
+            .map(|n| {
+                let relay = relay.clone();
+                let file = dir.0.join(format!("file{n}"));
+                let pong = pong.clone();
+                std::thread::spawn(move || {
+                    let mut ga = Client::connect(&relay, DEFAULT_TIMEOUT).unwrap();
+                    for _ in 0..20 {
+                        assert_eq!(ga.call("guest-ping", None, DEFAULT_TIMEOUT).unwrap(), pong);
+                    }
+                    let handle = ga.file_open(file.to_str().unwrap(), "w+").unwrap();
+                    ga.file_write(handle, b"hello, agent").unwrap();
+                    ga.file_seek(handle, 7).unwrap();
+                    assert_eq!(ga.file_read(handle, 64).unwrap(), (b"agent".to_vec(), true));
+                    ga.file_close(handle).unwrap();
+
+                    let script = format!("echo {n} >&2; exit {n}");
+                    let pid = ga.exec("/bin/sh", &["-c".into(), script], true).unwrap();
+                    let status = loop {
+                        let status = ga.exec_status(pid).unwrap();
+                        if status.exited {
+                            break status;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    };
+                    assert_eq!(status.exitcode, Some(n));
+                    let stderr = crate::sshagent::b64_decode(&status.err_data.unwrap()).unwrap();
+                    assert_eq!(stderr, format!("{n}\n").as_bytes());
+                })
+            })
+            .collect();
+        for client in clients {
+            client.join().unwrap();
+        }
+
+        // vk's own helpers, where they are not Windows' alone.
+        let mut ga = Client::connect(&relay, DEFAULT_TIMEOUT).unwrap();
+        let code = crate::winexec::run_program(&mut ga, "/bin/sh", &["-c", "exit 3"]).unwrap();
+        assert_eq!(code, 3);
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let (local, remote, back) = (
+            dir.0.join("local"),
+            dir.0.join("remote"),
+            dir.0.join("back"),
+        );
+        std::fs::write(&local, &bytes).unwrap();
+        let remote = remote.to_str().unwrap();
+        assert_eq!(
+            crate::winexec::copy_in(&relay, &local, remote).unwrap(),
+            200_000
+        );
+        assert_eq!(
+            crate::winexec::copy_out(&relay, remote, &back).unwrap(),
+            200_000
+        );
+        assert_eq!(std::fs::read(&back).unwrap(), bytes);
+
+        // A shutdown the agent refuses (blocked here) leaves no answer to misroute.
+        ga.shutdown().unwrap();
+        assert_eq!(ga.call("guest-ping", None, DEFAULT_TIMEOUT).unwrap(), pong);
     }
 }

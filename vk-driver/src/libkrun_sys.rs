@@ -182,7 +182,7 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         Some(socket) => {
             let (port, host) =
                 std::os::unix::net::UnixStream::pair().context("guest agent socketpair")?;
-            crate::relay::serve_socket(socket, host, "vk-qga")?;
+            crate::relay::serve_agent_socket(socket, host, "vk-qga")?;
             Some(port)
         }
         None => None,

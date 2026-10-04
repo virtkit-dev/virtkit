@@ -36,6 +36,16 @@ const CHUNK: usize = 48 * 1024;
 /// has not started it yet.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How many times following one command reconnects to the agent before giving up.
+const MAX_RECONNECTS: u32 = 3;
+
+/// The pause before such a reconnect.
+const RECONNECT_PAUSE: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_secs(2)
+};
+
 /// `arg` quoted for `CommandLineToArgvW` / the MSVC runtime, which is how a Windows program
 /// splits its command line: bare when it has no blank or quote, otherwise in quotes with each
 /// quote escaped and the backslashes before a quote (or the closing one) doubled.
@@ -479,29 +489,72 @@ fn run(
     follow(ga, pid, base, out).map(Some)
 }
 
+/// How far [`follow`] has got, kept across reconnects.
+#[derive(Default)]
+struct Progress {
+    /// the segment being copied
+    segment: u64,
+    /// how many of its bytes are already in `out`
+    offset: u64,
+    /// the guest file open, to close after a reconnect
+    open: Option<i64>,
+    /// the command's status once it has exited: qemu-ga forgets a command once it has said so
+    exited: Option<crate::qga::ExecStatus>,
+}
+
 /// Copy the output of the wrapper `pid`, published as `<base>.<n>.seg`, to `out` as it
-/// appears, until it exits; returns the command's exit code.
+/// appears, until it exits; returns the command's exit code. Reconnect up to [`MAX_RECONNECTS`]
+/// times after a lost connection, resuming at the byte reached: the relay drops clients whose
+/// answers are slow to come.
 fn follow(ga: &mut Client, pid: i64, base: &str, out: &mut impl Write) -> Result<i32> {
-    let mut next = 0u64;
-    let status = loop {
+    let mut progress = Progress::default();
+    let mut reconnects = 0;
+    loop {
+        let e = match follow_from(ga, pid, base, &mut progress, out) {
+            Ok(code) => return Ok(code),
+            Err(e) => e,
+        };
+        if e.downcast_ref::<crate::qga::Lost>().is_none() || reconnects == MAX_RECONNECTS {
+            if let Some(handle) = progress.open {
+                let _ = ga.file_close(handle);
+            }
+            return Err(e);
+        }
+        reconnects += 1;
+        eprintln!("virtkit: {e:#}; reconnecting to follow the command");
+        std::thread::sleep(RECONNECT_PAUSE);
+        ga.reconnect(CONNECT_TIMEOUT)?;
+        // The agent keeps its handles across connections; this one's position is unknown.
+        if let Some(handle) = progress.open.take() {
+            let _ = ga.file_close(handle);
+        }
+    }
+}
+
+/// [`follow`] from `progress` on, with one connection.
+fn follow_from(
+    ga: &mut Client,
+    pid: i64,
+    base: &str,
+    progress: &mut Progress,
+    out: &mut impl Write,
+) -> Result<i32> {
+    while progress.exited.is_none() {
         // Status first: once it reads exited, every segment is already published.
         let status = ga.exec_status(pid)?;
-        while let Some(handle) = open_if_present(ga, &format!("{base}.{next}.seg"))? {
-            let read = drain(ga, handle, out);
-            ga.file_close(handle)?;
-            read?;
-            next += 1;
-        }
+        copy_segments(ga, base, progress, out)?;
         out.flush()?;
         if status.exited {
-            break status;
+            progress.exited = Some(status);
+        } else {
+            std::thread::sleep(POLL);
         }
-        std::thread::sleep(POLL);
-    };
+    }
     let Some(handle) = open_if_present(ga, &format!("{base}.exit"))? else {
-        let stderr = status
-            .err_data
-            .as_deref()
+        let stderr = progress
+            .exited
+            .as_ref()
+            .and_then(|status| status.err_data.as_deref())
             .and_then(crate::sshagent::b64_decode);
         let stderr = String::from_utf8_lossy(stderr.as_deref().unwrap_or_default());
         let stderr = stderr.trim();
@@ -510,10 +563,11 @@ fn follow(ga: &mut Client, pid: i64, base: &str, out: &mut impl Write) -> Result
             if stderr.is_empty() { "" } else { ": " }
         );
     };
+    progress.open = Some(handle);
     let mut exit = Vec::new();
-    let read = drain(ga, handle, &mut exit);
+    drain(ga, handle, &mut exit, &mut 0)?;
+    progress.open = None;
     ga.file_close(handle)?;
-    read?;
     let exit = String::from_utf8_lossy(&exit);
     let Some((code, published)) = exit
         .trim()
@@ -522,21 +576,44 @@ fn follow(ga: &mut Client, pid: i64, base: &str, out: &mut impl Write) -> Result
     else {
         bail!("the guest reported the exit {exit:?} (expected \"<code> <segments>\")");
     };
-    if next != published {
-        bail!("read {next} of the command's {published} output segments: the rest is lost");
+    if progress.segment != published {
+        bail!(
+            "read {} of the command's {published} output segments: the rest is lost",
+            progress.segment
+        );
     }
     Ok(code)
 }
 
-/// Copy the guest file behind `handle` to `out`, to its end.
-fn drain(ga: &mut Client, handle: i64, out: &mut impl Write) -> Result<u64> {
-    let mut copied = 0u64;
+/// Copy the segments published since `progress` to `out`.
+fn copy_segments(
+    ga: &mut Client,
+    base: &str,
+    progress: &mut Progress,
+    out: &mut impl Write,
+) -> Result<()> {
+    while let Some(handle) = open_if_present(ga, &format!("{base}.{}.seg", progress.segment))? {
+        progress.open = Some(handle);
+        if progress.offset > 0 {
+            ga.file_seek(handle, progress.offset)?;
+        }
+        drain(ga, handle, out, &mut progress.offset)?;
+        progress.open = None;
+        ga.file_close(handle)?;
+        progress.segment += 1;
+        progress.offset = 0;
+    }
+    Ok(())
+}
+
+/// Copy the guest file behind `handle` to `out`, to its end, counting the bytes in `copied`.
+fn drain(ga: &mut Client, handle: i64, out: &mut impl Write, copied: &mut u64) -> Result<()> {
     loop {
         let (bytes, eof) = ga.file_read(handle, CHUNK)?;
         out.write_all(&bytes)?;
-        copied += bytes.len() as u64;
+        *copied += bytes.len() as u64;
         if eof || bytes.is_empty() {
-            return Ok(copied);
+            return Ok(());
         }
     }
 }
@@ -564,8 +641,10 @@ pub fn copy_out(socket: &Path, remote: &str, local: &Path) -> Result<u64> {
     let read = std::fs::File::create(local)
         .with_context(|| format!("creating {}", local.display()))
         .and_then(|mut file| {
-            drain(&mut ga, handle, &mut file)
-                .with_context(|| format!("copying {remote} from the guest"))
+            let mut copied = 0;
+            drain(&mut ga, handle, &mut file, &mut copied)
+                .with_context(|| format!("copying {remote} from the guest"))?;
+            Ok(copied)
         });
     ga.file_close(handle)?;
     read
@@ -729,6 +808,147 @@ mod tests {
     fn a_failed_wrapper_reports_its_errors() {
         let (code, _) = follow_with(&[], "boom\r\n");
         assert!(code.unwrap_err().to_string().ends_with(": boom"));
+    }
+
+    /// A fake agent behind a socket in `dir`, whose wrapper prints "hello world" five bytes
+    /// per read into `b.0.seg` and exits 7, running `hang_up` on each request first: a true
+    /// closes the connection instead of answering. [`follow`]'s result against it with what
+    /// it wrote, and the handles closed.
+    fn follow_dropped(
+        dir: &std::path::Path,
+        hang_up: impl Fn(&serde_json::Value) -> bool + Send + Sync + 'static,
+        out: &mut impl Write,
+    ) -> (Result<i32>, Vec<i64>) {
+        use crate::qga::tests::{HANG_UP, agent_socket, synced};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Guest {
+            statuses: u32,
+            // handle -> (body, position)
+            open: HashMap<i64, (&'static str, usize)>,
+            next: i64,
+            closed: Vec<i64>,
+        }
+        let guest = Arc::new(Mutex::new(Guest::default()));
+        let state = guest.clone();
+        let sock = dir.join("qga.sock");
+        agent_socket(&sock, move |request| {
+            let args = &request["arguments"];
+            if request["execute"] == "guest-sync-delimited" {
+                return synced(request);
+            }
+            if hang_up(request) {
+                return HANG_UP.to_vec();
+            }
+            let mut guest = state.lock().unwrap();
+            let reply = match request["execute"].as_str().unwrap() {
+                "guest-exec-status" => {
+                    guest.statuses += 1;
+                    serde_json::json!({ "exited": guest.statuses > 1, "exitcode": 0 })
+                }
+                "guest-file-open" => {
+                    let body = match args["path"].as_str().unwrap() {
+                        "b.0.seg" => "hello world",
+                        "b.exit" => "7 1",
+                        _ => {
+                            return b"{\"error\": {\"class\": \"GenericError\", \"desc\": \"no\"}}\n"
+                                .to_vec();
+                        }
+                    };
+                    guest.next += 1;
+                    let handle = guest.next;
+                    guest.open.insert(handle, (body, 0));
+                    serde_json::json!(handle)
+                }
+                "guest-file-seek" => {
+                    let file = guest
+                        .open
+                        .get_mut(&args["handle"].as_i64().unwrap())
+                        .unwrap();
+                    file.1 = args["offset"].as_u64().unwrap() as usize;
+                    serde_json::json!({ "position": file.1, "eof": false })
+                }
+                "guest-file-read" => {
+                    let (body, at) = guest
+                        .open
+                        .get_mut(&args["handle"].as_i64().unwrap())
+                        .unwrap();
+                    let bytes = &body.as_bytes()[*at..body.len().min(*at + 5)];
+                    *at += bytes.len();
+                    let b64 = crate::sshagent::b64_encode(bytes);
+                    serde_json::json!({ "count": bytes.len(), "buf-b64": b64, "eof": *at == body.len() })
+                }
+                "guest-file-close" => {
+                    let handle = args["handle"].as_i64().unwrap();
+                    guest.closed.push(handle);
+                    serde_json::json!({})
+                }
+                other => panic!("unexpected {other}"),
+            };
+            format!("{}\n", serde_json::json!({ "return": reply })).into_bytes()
+        });
+        let mut ga = Client::connect(&sock, Duration::from_secs(5)).unwrap();
+        let code = follow(&mut ga, 1, "b", out);
+        let closed = guest.lock().unwrap().closed.clone();
+        (code, closed)
+    }
+
+    #[test]
+    fn follow_resumes_a_dropped_segment_where_it_was() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let dir = crate::qga::tests::TempDir::new("winexec-resume");
+        // The second read, of " worl", is lost with the connection.
+        let reads = AtomicU32::new(0);
+        let mut out = Vec::new();
+        let (code, closed) = follow_dropped(
+            &dir.0,
+            move |request| {
+                request["execute"] == "guest-file-read" && reads.fetch_add(1, Ordering::SeqCst) == 1
+            },
+            &mut out,
+        );
+        assert_eq!((code.unwrap(), out.as_slice()), (7, &b"hello world"[..]));
+        // The stale handle too.
+        assert_eq!(closed, [1, 2, 3]);
+    }
+
+    #[test]
+    fn follow_gives_up_after_its_reconnects() {
+        let dir = crate::qga::tests::TempDir::new("winexec-give-up");
+        let (code, _) = follow_dropped(&dir.0, |_| true, &mut Vec::new());
+        let e = code.unwrap_err();
+        assert!(e.downcast_ref::<crate::qga::Lost>().is_some(), "{e:#}");
+    }
+
+    #[test]
+    fn follow_does_not_retry_a_failed_write_to_its_output() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = crate::qga::tests::TempDir::new("winexec-epipe");
+        let requests = Arc::new(AtomicU32::new(0));
+        let counted = requests.clone();
+        let (code, closed) = follow_dropped(
+            &dir.0,
+            move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                false
+            },
+            &mut Closed,
+        );
+        assert!(code.is_err());
+        // Status, open, read, then the close of the segment: no second status.
+        assert_eq!(requests.load(Ordering::SeqCst), 4);
+        assert_eq!(closed, [1]);
     }
 
     #[test]

@@ -70,8 +70,11 @@ All notable changes to virtkit will be documented in this file.
   `vk list`; `vk reboot` hard-resets it. `vk stop` (or Ctrl-C) presses the ACPI power button
   and waits up to a minute for power-off, asking the guest's qemu-ga to shut down after 20
   seconds; a second Ctrl-C kills it immediately. The guest's qemu-ga answers on `qga.sock` in
-  the run's directory, one client at a time (a new one replaces the last), across guest
-  reboots. The guest gets KVM's Hyper-V enlightenments (reference TSC page, synthetic
+  the run's directory, across guest reboots; its clients share it request by request, so a
+  `vk exec`, a Windows service's start and its other clients run side by side, and a client
+  whose answer takes over 30 seconds loses its connection (a `vk exec` following a command
+  reconnects and picks its output up where it was). The guest gets KVM's Hyper-V
+  enlightenments (reference TSC page, synthetic
   timers, TLB-flush and IPI hypercalls), ACPI processor objects, a pvpanic device (as every
   VM now has: a guest crash is logged to the run's `console.vmm.log`) and a VM generation ID
   kept with the disk overlays, so a Windows domain controller tells a fresh copy of the
