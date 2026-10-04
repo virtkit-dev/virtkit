@@ -34,8 +34,19 @@ All notable changes to virtkit will be documented in this file.
   first waits for Windows to finish setting itself up. Windows 11 installs too
   (`--edition="Windows 11 Enterprise Evaluation"`, about 70 minutes; the edition must name
   Windows 10 or 11, or the ISO installs as a server and Setup stops at its TPM check), without
-  a TPM or Secure Boot, which vk does not emulate yet: WinPE sets Microsoft's `LabConfig` keys
-  so Setup skips those checks. Windows now sees SMBIOS tables and a system UUID per machine.
+  a TPM, which vk does not emulate yet: WinPE sets Microsoft's `LabConfig` keys so Setup skips
+  its TPM and Secure Boot checks. Windows now sees SMBIOS tables and a system UUID per machine.
+- **Windows machines keep their UEFI variables and can boot with Secure Boot.** The firmware's
+  variable store is a flash device backed by `uefi-vars.fd` in the run directory, kept with the
+  machine's disks and carried by `vk snapshot`, so boot entries and keys survive a reboot and
+  a new run. Built images do not carry the build guest's variables: each machine starts from
+  the firmware's template. `# vk: firmware=uefi-secboot` in a Windows stage, or
+  `"secure_boot": true` in a bundle's `vm.json`, starts each machine with Microsoft's Secure Boot
+  keys enrolled. **Secure Boot is experimental:** a variable write Windows authenticates at run
+  time (e.g. its Secure Boot update task writing db or dbx) is known to crash the guest
+  (bug check 0x1E in the firmware's runtime services; root cause under investigation). It only
+  guards the boot chain below the kernel: without SMM the guest's kernel can rewrite the
+  variable store directly, replacing PK, KEK, db or dbx or turning Secure Boot off for good.
 - **`vk snapshot` saves a running Windows VM, and `vk run` starts it again from there.**
   `vk snapshot <pid> --out <dir>` writes a bundle holding the VM's memory (a sparse image),
   its CPU and device state and its disks as they were, and ends the VM; `vk run <dir>` (with

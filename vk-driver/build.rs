@@ -1,8 +1,10 @@
-//! Embed the guest kernel, vk-agent and UEFI firmware into the `vk` binary.
+//! Embed the guest kernel, vk-agent, UEFI firmware and its variable store templates into the
+//! `vk` binary.
 //!
 //! With the `embed` feature (on by default), src/embed.rs pulls the blobs in
 //! via `.incbin "${env!(...)}"`. This script sets those env vars to the paths
-//! given by VK_EMBED_KERNEL / VK_EMBED_AGENT / VK_EMBED_FIRMWARE (build.sh supplies them).
+//! given by VK_EMBED_KERNEL / VK_EMBED_AGENT / VK_EMBED_FIRMWARE / VK_EMBED_VARS /
+//! VK_EMBED_VARS_MS (build.sh supplies them).
 //! When a var is unset — a plain dev `cargo build` — it points the include at an
 //! empty file, which the runtime treats as "not embedded" and falls back to
 //! --kernel/--agent.
@@ -12,6 +14,8 @@ fn main() {
     embed("VK_EMBED_KERNEL", "VK_EMBED_KERNEL_PATH");
     embed("VK_EMBED_AGENT", "VK_EMBED_AGENT_PATH");
     embed("VK_EMBED_FIRMWARE", "VK_EMBED_FIRMWARE_PATH");
+    embed("VK_EMBED_VARS", "VK_EMBED_VARS_PATH");
+    embed("VK_EMBED_VARS_MS", "VK_EMBED_VARS_MS_PATH");
     emit_git_hash();
 }
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# build-firmware.sh — build the UEFI firmware (CLOUDHV.fd) a Windows guest boots into ./dist.
+# build-firmware.sh — build the UEFI firmware (CLOUDHV.fd) a Windows guest boots, and its
+# variable store templates (CLOUDHV_VARS.fd, CLOUDHV_VARS.ms.fd), into ./dist.
 #
 # edk2's OvmfPkg/CloudHv platform, from nixpkgs at the rev the devcontainer's flake.lock pins
 # (firmware/Dockerfile). Separate from build.sh, like build-kernel.sh: the firmware changes
-# only on a lock bump. build.sh embeds dist/CLOUDHV.fd into `vk` when it is there.
+# only on a lock bump or a firmware/ change. build.sh embeds dist/CLOUDHV*.fd into `vk` when
+# they are there.
 # --no-cache forces a clean Docker rebuild.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -29,7 +31,8 @@ if [ -z "$FORCE_DOCKER" ] && command -v vk >/dev/null 2>&1; then
     -f .devcontainer/Dockerfile -f firmware/Dockerfile \
     --target build \
     --workdir "$PWD" --cpus host --mem 4G \
-    -- cp /build/CLOUDHV.fd /build/CLOUDHV.fd.storepath "$OUT/"
+    -- cp /build/CLOUDHV.fd /build/CLOUDHV_VARS.fd /build/CLOUDHV_VARS.ms.fd \
+    /build/CLOUDHV.fd.storepath "$OUT/"
 else
   export DOCKER_BUILDKIT=1
   echo "-- building the build image (virtkit-build) ..."
@@ -37,11 +40,12 @@ else
   echo "-- building the UEFI firmware (CLOUDHV.fd) ..."
   docker build ${NOCACHE:+$NOCACHE} --target artifact -o "type=local,dest=$OUT" firmware
 fi
-store_path=$(cat "$OUT/CLOUDHV.fd.storepath")
+# The firmware's store path, then its variable stores'.
+{ read -r store_path && read -r vars_store_path; } < "$OUT/CLOUDHV.fd.storepath"
 rm "$OUT/CLOUDHV.fd.storepath"
 
 echo
-echo "built $OUT/CLOUDHV.fd"
+echo "built $OUT/CLOUDHV.fd and its variable store templates"
 file "$OUT/CLOUDHV.fd" 2>/dev/null || true
 
 # Reproducibility manifest, like build-kernel.sh's. The sidecar names the file bare, so the
@@ -58,8 +62,8 @@ commit=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 [ -n "$(git status --porcelain 2>/dev/null)" ] && commit="$commit (dirty)"
 
 cd "$OUT"
-sha256sum CLOUDHV.fd > CLOUDHV.fd.sha256
-echo "recorded CLOUDHV.fd in $OUT/CLOUDHV.fd.sha256"
+sha256sum CLOUDHV.fd CLOUDHV_VARS.fd CLOUDHV_VARS.ms.fd > CLOUDHV.fd.sha256
+echo "recorded CLOUDHV.fd and its variable stores in $OUT/CLOUDHV.fd.sha256"
 
 cat > firmware-build-info.txt <<EOF
 # virtkit UEFI firmware build manifest
@@ -68,6 +72,7 @@ git_commit:      ${commit}
 base_image:      ${base_image}
 nixpkgs:         ${nixpkgs_rev}
 store_path:      ${store_path}
+vars_store_path: ${vars_store_path}
 
 $(cat CLOUDHV.fd.sha256)
 EOF

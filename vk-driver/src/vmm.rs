@@ -723,6 +723,10 @@ pub struct VmSpec {
     /// generation ID, so each machine made from one image is told apart by its UUID.
     #[serde(default)]
     pub system_uuid: Option<[u8; 16]>,
+    /// The file backing the UEFI variable store flash (`VmmBuilder::uefi_vars`), kept with
+    /// the machine's disks.
+    #[serde(default)]
+    pub uefi_vars: Option<PathBuf>,
     /// A Unix socket whose bytes become the first serial port's input (`vk console`): the
     /// boot child relays it to COM1 as it does the guest agent ([`crate::relay::serve_socket`]).
     #[serde(default)]

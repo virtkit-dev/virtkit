@@ -179,7 +179,21 @@
 
         # The UEFI firmware a Windows (UEFI) guest boots: edk2's OvmfPkg/CloudHv platform,
         # an ELF with a PVH entry point that libkrun loads like a kernel and hands the memory
-        # map and ACPI tables. firmware/Dockerfile copies its CLOUDHV.fd into dist/.
-        packages.firmware = pkgs.OVMF-cloud-hypervisor.fd;
+        # map and ACPI tables. firmware/Dockerfile copies its CLOUDHV.fd into dist/. Built
+        # with Secure Boot (without SMM, which libkrun lacks) and its variable store on a
+        # flash device of its own (firmware/cloudhv-flash-variables.patch), which libkrun
+        # backs with a file per machine.
+        packages.firmware =
+          ((pkgs.OVMF-cloud-hypervisor.override {
+            secureBoot = true;
+            systemManagementModeRequired = false;
+          }).overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ [ ./firmware/cloudhv-flash-variables.patch ];
+          })).fd;
+
+        # Variable store templates for that flash, from the QEMU OVMF build of the same
+        # edk2 (same 4 MiB layout): OVMF_VARS.fd empty, OVMF_VARS.ms.fd with Microsoft's
+        # Secure Boot keys enrolled. firmware/Dockerfile copies both into dist/.
+        packages.firmwareVars = pkgs.OVMFFull.fd;
       });
 }
