@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The answer file of a `FROM winiso:` install under vk (winiso.rs). WinPE gets the virtio
+     drivers from boot.wim (X:\vk\drivers); the system is virtio-blk disk 0. The first logon
+     installs virtio-win and qemu-ga from C:\vk (copied there from the medium's $OEM$), puts the
+     SAC on COM1, keeps automatic repair from taking over after a power cut, files unidentified
+     networks as private, and powers off. The Administrator password here only serves the
+     install's own logon: vk replaces it before the image is used. -->
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-PnpCustomizationsWinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <DriverPaths>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="1"><Path>X:\vk\drivers\viostor</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="2"><Path>X:\vk\drivers\NetKVM</Path></PathAndCredentials>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="3"><Path>X:\vk\drivers\vioserial</Path></PathAndCredentials>
+      </DriverPaths>
+    </component>
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+      <InputLocale>en-US</InputLocale><SystemLocale>en-US</SystemLocale><UILanguage>en-US</UILanguage><UserLocale>en-US</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add"><Order>1</Order><Type>EFI</Type><Size>260</Size></CreatePartition>
+            <CreatePartition wcm:action="add"><Order>2</Order><Type>MSR</Type><Size>16</Size></CreatePartition>
+            <CreatePartition wcm:action="add"><Order>3</Order><Type>Primary</Type><Extend>true</Extend></CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add"><Order>1</Order><PartitionID>1</PartitionID><Format>FAT32</Format><Label>System</Label></ModifyPartition>
+            <ModifyPartition wcm:action="add"><Order>2</Order><PartitionID>3</PartitionID><Format>NTFS</Format><Label>Windows</Label></ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom><MetaData wcm:action="add"><Key>@IMAGE_KEY@</Key><Value>@IMAGE_VALUE@</Value></MetaData></InstallFrom>
+          <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
+        </OSImage>
+      </ImageInstall>
+      <UserData><AcceptEula>true</AcceptEula><FullName>vk</FullName><Organization>vk</Organization></UserData>
+    </component>
+  </settings>
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <ComputerName>vkwin</ComputerName>
+      <TimeZone>UTC</TimeZone>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <UserAccounts>
+        <AdministratorPassword><Value>@INSTALL_PASSWORD@</Value><PlainText>true</PlainText></AdministratorPassword>
+      </UserAccounts>
+      <AutoLogon><Enabled>true</Enabled><Username>Administrator</Username><Password><Value>@INSTALL_PASSWORD@</Value><PlainText>true</PlainText></Password><LogonCount>1</LogonCount></AutoLogon>
+      <OOBE><HideEULAPage>true</HideEULAPage><ProtectYourPC>3</ProtectYourPC><SkipMachineOOBE>true</SkipMachineOOBE></OOBE>
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add"><Order>1</Order><CommandLine>msiexec /i C:\vk\virtio-win-gt-x64.msi /qn /norestart</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>2</Order><CommandLine>msiexec /i C:\vk\qemu-ga-x86_64.msi /qn /norestart</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>3</Order><CommandLine>bcdedit /ems {current} on</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>4</Order><CommandLine>bcdedit /emssettings EMSPORT:1 EMSBAUDRATE:115200</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>5</Order><CommandLine>bcdedit /set {current} recoveryenabled no</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>6</Order><CommandLine>bcdedit /set {current} bootstatuspolicy ignoreallfailures</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>7</Order><CommandLine>reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\010103000F0000F0010000000F0000F0C967A3643C3AD745950DA7859209176EF5B87C875FA20DF21951640E807D7C24" /v Category /t REG_DWORD /d 1 /f</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>8</Order><CommandLine>cmd /c echo vk-install-done &gt; C:\vk\install-done.txt</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>9</Order><CommandLine>shutdown /s /t 5 /f</CommandLine></SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+</unattend>

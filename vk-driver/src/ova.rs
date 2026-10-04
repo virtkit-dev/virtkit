@@ -14,6 +14,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use sha2::Digest;
 
+use crate::build::hex;
+
 /// Firmware the appliance boots with. `Bios` matches a grub-pc/MBR disk (the
 /// runner image); `Efi` is for a disk carrying an ESP + grub-efi.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -113,14 +115,6 @@ pub fn write_ova(disk: &Path, out: &Path, spec: &OvaSpec) -> Result<crate::vmdk:
     let mut inner = tar.into_inner().context("finishing the OVA tar")?;
     inner.flush().context("flushing the OVA")?;
     Ok(info)
-}
-
-fn hex(digest: &[u8]) -> String {
-    use std::fmt::Write;
-    digest.iter().fold(String::with_capacity(64), |mut s, b| {
-        write!(s, "{b:02x}").unwrap();
-        s
-    })
 }
 
 /// One tar member with neutral metadata (root-owned, 0644, epoch mtime), so the
