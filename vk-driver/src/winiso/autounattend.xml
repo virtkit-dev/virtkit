@@ -57,8 +57,8 @@
       <AutoLogon><Enabled>true</Enabled><Username>Administrator</Username><Password><Value>@INSTALL_PASSWORD@</Value><PlainText>true</PlainText></Password><LogonCount>1</LogonCount></AutoLogon>
       <OOBE><HideEULAPage>true</HideEULAPage><ProtectYourPC>3</ProtectYourPC><SkipMachineOOBE>true</SkipMachineOOBE></OOBE>
       <FirstLogonCommands>
-        <SynchronousCommand wcm:action="add"><Order>1</Order><CommandLine>msiexec /i C:\vk\virtio-win-gt-x64.msi /qn /norestart</CommandLine></SynchronousCommand>
-        <SynchronousCommand wcm:action="add"><Order>2</Order><CommandLine>msiexec /i C:\vk\qemu-ga-x86_64.msi /qn /norestart</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>1</Order><CommandLine>msiexec /i C:\vk\@FIRST_MSI@ /qn /norestart</CommandLine></SynchronousCommand>
+        <SynchronousCommand wcm:action="add"><Order>2</Order><CommandLine>msiexec /i C:\vk\@SECOND_MSI@ /qn /norestart</CommandLine></SynchronousCommand>
         <SynchronousCommand wcm:action="add"><Order>3</Order><CommandLine>bcdedit /ems {current} on</CommandLine></SynchronousCommand>
         <SynchronousCommand wcm:action="add"><Order>4</Order><CommandLine>bcdedit /emssettings EMSPORT:1 EMSBAUDRATE:115200</CommandLine></SynchronousCommand>
         <SynchronousCommand wcm:action="add"><Order>5</Order><CommandLine>bcdedit /set {current} recoveryenabled no</CommandLine></SynchronousCommand>

@@ -29,6 +29,9 @@ pub(crate) const SCHEME: &str = "winiso:";
 
 const ANSWER_TEMPLATE: &str = include_str!("winiso/autounattend.xml");
 const SETUP_CMD: &str = include_str!("winiso/setup.cmd");
+/// The installers the first logon runs, from `C:\vk`.
+const VIRTIO_WIN_MSI: &str = "virtio-win-gt-x64.msi";
+const QEMU_GA_MSI: &str = "qemu-ga-x86_64.msi";
 const WINPESHL: &str = include_str!("winiso/winpeshl.ini");
 const MEDIA_SH: &str = include_str!("winiso/media.sh");
 const HELPER_DOCKERFILE: &str = include_str!("winiso/Dockerfile");
@@ -258,7 +261,7 @@ impl Source {
                 &self.drivers.sha256,
                 self.driver_dir(),
                 &self.answer_file(),
-                SETUP_CMD,
+                &self.setup_cmd(),
                 WINPESHL,
                 MEDIA_SH,
                 HELPER_DOCKERFILE,
@@ -268,13 +271,49 @@ impl Source {
         ))
     }
 
+    /// Whether this is a Windows 10 or 11 client edition.
+    fn is_client(&self) -> bool {
+        matches!(self.driver_dir(), "w11" | "w10")
+    }
+
+    /// WinPE's script for this install. Windows 11 Setup refuses a machine without TPM 2.0 and
+    /// Secure Boot, which vk does not emulate (yet): for a client edition the script sets
+    /// Microsoft's `LabConfig` keys first, so Setup skips those checks (and the RAM, CPU and
+    /// disk-size ones). A server's script carries none, unchanged.
+    fn setup_cmd(&self) -> String {
+        let labconfig = if self.is_client() {
+            ["TPM", "SecureBoot", "RAM", "CPU", "Storage"]
+                .iter()
+                .map(|check| {
+                    format!(
+                        "reg add HKLM\\SYSTEM\\Setup\\LabConfig /v Bypass{check}Check /t REG_DWORD /d 1 /f >nul\r\n"
+                    )
+                })
+                .collect::<String>()
+        } else {
+            String::new()
+        };
+        SETUP_CMD.replace("@LABCONFIG@\r\n", &labconfig)
+    }
+
     /// The answer file for this install.
     fn answer_file(&self) -> String {
         let (key, value) = match &self.edition {
             Some(name) => ("/IMAGE/NAME", xml_escape(name)),
             None => ("/IMAGE/INDEX", "1".to_string()),
         };
+        // The first logon installs virtio-win and qemu-ga. On a client the virtio-win package
+        // updates drivers that only take over after a restart, the serial port's among them,
+        // and qemu-ga's installer then waits on a service that cannot start: there qemu-ga
+        // goes first, on the drivers Setup installed.
+        let (first, second) = if self.is_client() {
+            (QEMU_GA_MSI, VIRTIO_WIN_MSI)
+        } else {
+            (VIRTIO_WIN_MSI, QEMU_GA_MSI)
+        };
         ANSWER_TEMPLATE
+            .replace("@FIRST_MSI@", first)
+            .replace("@SECOND_MSI@", second)
             .replace("@IMAGE_KEY@", key)
             .replace("@IMAGE_VALUE@", &value)
             .replace("@INSTALL_PASSWORD@", INSTALL_PASSWORD)
@@ -402,6 +441,7 @@ pub(crate) fn base(
 /// The install medium of `source`, from `cache` or built there in a helper VM.
 fn media(source: &Source, cache: &Path) -> Result<PathBuf> {
     let answer = source.answer_file();
+    let setup_cmd = source.setup_cmd();
     let dir = cache.join("media").join(source.media_key());
     if dir.join("complete").exists() {
         return Ok(dir.join("media.img"));
@@ -414,7 +454,7 @@ fn media(source: &Source, cache: &Path) -> Result<PathBuf> {
         ("Dockerfile", HELPER_DOCKERFILE),
         ("media.sh", MEDIA_SH),
         ("autounattend.xml", answer.as_str()),
-        ("setup.cmd", SETUP_CMD),
+        ("setup.cmd", setup_cmd.as_str()),
         ("winpeshl.ini", WINPESHL),
     ] {
         std::fs::write(assets.join(name), body)?;
@@ -710,6 +750,41 @@ mod tests {
         assert!(err.to_string().contains("unknown flag --editon"), "{err}");
         assert!(Pinned::parse("ws.iso@sha256:abc", Path::new("/")).is_err());
         assert!(Pinned::parse("ws.iso", Path::new("/")).is_err());
+    }
+
+    #[test]
+    fn only_a_client_install_skips_setups_hardware_checks() {
+        let pinned =
+            |name: &str| Pinned::parse(&format!("{name}@sha256:{DIGEST}"), Path::new("/")).unwrap();
+        let source = |edition: &str| Source {
+            iso: pinned("a.iso"),
+            drivers: pinned("b.iso"),
+            edition: Some(edition.into()),
+        };
+        // Server scripts match the file before the placeholder was added.
+        let server = source("Windows Server 2025 Standard Evaluation").setup_cmd();
+        assert_eq!(server, SETUP_CMD.replace("@LABCONFIG@\r\n", ""));
+        assert!(!server.contains("LabConfig"));
+        let client = source("Windows 11 Enterprise Evaluation").setup_cmd();
+        for check in ["TPM", "SecureBoot", "RAM", "CPU", "Storage"] {
+            assert!(
+                client.contains(&format!(
+                    "LabConfig /v Bypass{check}Check /t REG_DWORD /d 1"
+                )),
+                "{check}"
+            );
+        }
+        // The keys are set before Setup starts.
+        assert!(client.find("LabConfig").unwrap() < client.find("setup.exe").unwrap());
+        // Clients install qemu-ga first; servers keep virtio-win first, preserving cached installs.
+        let order =
+            |answer: &str| answer.find(QEMU_GA_MSI).unwrap() < answer.find(VIRTIO_WIN_MSI).unwrap();
+        assert!(order(
+            &source("Windows 11 Enterprise Evaluation").answer_file()
+        ));
+        assert!(!order(
+            &source("Windows Server 2025 Standard Evaluation").answer_file()
+        ));
     }
 
     #[test]
