@@ -2511,7 +2511,20 @@ async fn handle(
             "internal error (details in the server log)",
         )
     });
-    Ok(with_hsts(resp, tls))
+    Ok(with_hsts(closing_if_unread(resp), tls))
+}
+
+/// `resp`, with `Connection: close` when it is a 413: those answer before the request body
+/// is read through, and hyper then drops the connection. Without the header a client pools
+/// it and sees its next request reset.
+fn closing_if_unread(mut resp: Response<Body>) -> Response<Body> {
+    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        resp.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+    }
+    resp
 }
 
 /// Whether the browser says another site made this request (`Sec-Fetch-Site`). A browser

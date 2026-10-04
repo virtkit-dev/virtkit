@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `vk-registry` closes the connection after refusing a request body as too large, and says
+  so, so a client's next request no longer fails with a reset connection.
+
 ## [0.82.0] - 2026-10-04
 
 ### Added
