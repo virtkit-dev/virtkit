@@ -32,6 +32,13 @@ All notable changes to virtkit will be documented in this file.
   copy boots with its own name and SID (generalizing again an image built from a generalized
   one runs sysprep again, which Windows allows only a limited number of times); every step
   first waits for Windows to finish setting itself up.
+- **Compose `secrets:`.** A top-level secret with a `file:` source is given to each service
+  that lists it (by name, or `{source, target}`), as Docker places it: a Linux guest reads it at
+  `/run/secrets/<target>` through a read-only bind, a Windows guest gets a copy at
+  `C:\ProgramData\Docker\secrets\<target>`, readable by SYSTEM and administrators only,
+  before its provisioning runs. The target is a plain file name: an absolute target is
+  refused, as are `uid`, `gid` and `mode`, an `environment:` source, and secrets in a GitLab CI
+  job.
 - **Compose services can be Windows machines.** A service whose `image:` is a path to a
   bundle (`image: ./dc-out`) boots it as a UEFI guest on the run's LAN, at the address its
   service name resolves to. Each start is a new machine (fresh disk overlays, a new VM
