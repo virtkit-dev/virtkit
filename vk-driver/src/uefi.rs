@@ -312,8 +312,57 @@ async fn power_off(ch: &mut Child, work: &Path, grace: Duration) -> Option<Durat
     exited_by(ch, deadline).await.then(|| pressed.elapsed())
 }
 
-/// A UEFI guest a build boots: no network and no registry entry, in a run directory of its
-/// own. Dropping it kills a guest still running.
+/// Wait until the Windows guest behind the qemu-ga `socket` has finished starting — on the
+/// first boot of a generalized image, specialize and OOBE restart it once its agent is already
+/// up — and return a connection to its qemu-ga. `running` says whether the guest is still up;
+/// `console` is its serial log, for the error.
+pub(crate) fn wait_started(
+    socket: &Path,
+    console: &Path,
+    timeout: Duration,
+    running: &mut dyn FnMut() -> bool,
+) -> Result<crate::qga::Client> {
+    const STATE: &str =
+        r#"reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State" /v ImageState"#;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !running() {
+            bail!(
+                "the guest powered off while starting; see {}",
+                console.display()
+            );
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!(
+                "Windows did not finish starting within {}s; see {}",
+                timeout.as_secs(),
+                console.display()
+            );
+        }
+        // In short slices, so a guest that dies is noticed.
+        let Ok(mut ga) = crate::qga::Client::connect(socket, left.min(Duration::from_secs(30)))
+        else {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        let mut out = Vec::new();
+        match crate::winexec::exec_command_line(&mut ga, STATE, &[], None, false, &mut out) {
+            // Setup done, or no such key (reg exits 1): an image past its first boot. Anything
+            // else, an empty answer included, is a guest still on its way, whose restart out
+            // of OOBE would kill the caller's command.
+            Ok(0) if String::from_utf8_lossy(&out).contains("IMAGE_STATE_COMPLETE") => {
+                return Ok(ga);
+            }
+            Ok(1) => return Ok(ga),
+            // Still in specialize or OOBE, or restarting out of them.
+            Ok(_) | Err(_) => std::thread::sleep(Duration::from_secs(5)),
+        }
+    }
+}
+
+/// A UEFI guest a build boots: no registry entry, and a network only through `nics`, in a run
+/// directory of its own. Dropping it kills a guest still running.
 pub(crate) struct Guest {
     ch: Child,
     work: PathBuf,
@@ -322,16 +371,19 @@ pub(crate) struct Guest {
 }
 
 impl Guest {
-    /// Boot `disks` as the guest `name`, with `work` as its run directory.
+    /// Boot `disks` as the guest `name`, with `work` as its run directory and `nics` on a
+    /// switch (none: no network).
     pub(crate) fn boot(
         work: &Path,
         name: &str,
         disks: Vec<Disk>,
         cpus: u32,
         mem: &str,
+        nics: Vec<crate::vmm::Nic>,
     ) -> Result<Guest> {
         let firmware = firmware()?;
-        let spec = guest_spec(&firmware.path, work, name, disks, cpus, mem)?;
+        let mut spec = guest_spec(&firmware.path, work, name, disks, cpus, mem)?;
+        spec.nics = nics;
         let vmm = crate::vmm::selected();
         let ch = crate::run::spawn_vmm(vmm.as_ref(), &spec, crate::prio::Prio::Normal)?;
         Ok(Guest {
