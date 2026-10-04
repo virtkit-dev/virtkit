@@ -228,6 +228,26 @@ fn guest_status(result: vk_core::messages::CmdResult) -> Result<()> {
     }
 }
 
+/// A stop signal (its number) that ended the run during the services' starts. [`run`] then
+/// exits as the signal's default action would have, with 128 + its number, so a `--detach`
+/// parent reports the failure.
+#[derive(Debug, PartialEq)]
+struct Stopped(i32);
+
+impl Stopped {
+    fn exit_code(&self) -> i32 {
+        128 + self.0
+    }
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stopped by signal {}", self.0)
+    }
+}
+
+impl std::error::Error for Stopped {}
+
 pub struct RunArgs {
     /// Image to boot (a docker ref or an OCI reference). Ignored when `dockerfile` is set
     /// — the rootfs is then built from the Dockerfile target.
@@ -584,13 +604,24 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
 
     // No primary (no image, no -f, no --primary) + a compose file = compose up:
     // services only, held until ctrl-c.
-    if args.image.is_empty() && args.dockerfiles.is_empty() && args.primary.is_none() {
+    let result = if args.image.is_empty() && args.dockerfiles.is_empty() && args.primary.is_none() {
         if args.atop.is_some() {
             bail!("--atop records the primary VM, and a services-only compose run boots none");
         }
-        return compose_up(args, cfg, &state_dir, &work.path, &agent.path, &kernel.path).await;
+        compose_up(args, cfg, &state_dir, &work.path, &agent.path, &kernel.path).await
+    } else {
+        build_and_boot(args, cfg, &state_dir, &work.path, &agent.path, &kernel.path).await
+    };
+    if let Some(stopped) = result
+        .as_ref()
+        .err()
+        .and_then(|e| e.downcast_ref::<Stopped>())
+    {
+        let code = stopped.exit_code();
+        drop(work);
+        std::process::exit(code);
     }
-    build_and_boot(args, cfg, &state_dir, &work.path, &agent.path, &kernel.path).await
+    result
 }
 
 /// Default base for `vk run`'s durable shared image cache: `$XDG_DATA_HOME/virtkit`, else
@@ -1778,7 +1809,7 @@ async fn build_and_boot(
                         root_ext4: prov.ext4.clone(),
                     })
                 }
-                crate::compose::Source::Image(_) => None,
+                crate::compose::Source::Image(_) | crate::compose::Source::Bundle { .. } => None,
             };
             crate::vms::ServiceEntry {
                 name: prov.name.clone(),
@@ -1885,19 +1916,29 @@ async fn build_and_boot(
             planned.units,
         )))
     };
-    if let Some(mgr) = &manager {
-        for name in &planned.start {
-            let reply = mgr.start(name);
-            if !reply.ok {
-                mgr.stop_all();
-                if let Some(mut c) = switch.take() {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
-                bail!("booting service {name}: {}", reply.message);
-            }
-            println!("virtkit: service {name}: {}", reply.message);
+    // `vk stop` and the `--detach` parent's relay of an external kill send SIGTERM; a Ctrl-C
+    // reaches a `--detach` child as SIGINT (it shares the terminal's foreground group until
+    // the guest is ready). Either signal's default action would end the run at once, leaving
+    // the guests to the VMM's parent-death signal and skipping the host-side teardown (the
+    // poweroff request, the registry and mount cleanup, the summaries). Both are heard from
+    // here on, through the services' starts, and routed through teardown.
+    let signals = || async {
+        tokio::select! {
+            _ = crate::shutdown::terminate_signal() => Stopped(libc::SIGTERM),
+            _ = crate::detach::interrupt() => Stopped(libc::SIGINT),
         }
+    };
+    let signalled = signals();
+    tokio::pin!(signalled);
+    if let Some(mgr) = &manager
+        && let Err(e) = start_eager(mgr, &planned.start, signalled.as_mut(), signals()).await
+    {
+        mgr.stop_all();
+        if let Some(mut c) = switch.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        return Err(e);
     }
 
     // Working directory: share a host dir read-write over virtiofs at WORKDIR_MOUNT (no uid
@@ -2463,19 +2504,12 @@ async fn build_and_boot(
     let ssh_probe = args
         .ssh
         .then(|| crate::vmm::exec_addr(&vsock, SSH_VSOCK_PORT));
-    // `vk stop` and the `--detach` parent's relay of an external kill send SIGTERM; a Ctrl-C
-    // reaches a `--detach` child as SIGINT (it shares the terminal's foreground group until
-    // the guest is ready). Either signal's default action would end the run at once, leaving
-    // the guests to the VMM's parent-death signal and skipping the host-side teardown (the
-    // poweroff request, the registry and mount cleanup, the summaries). Route both through
-    // teardown instead.
+    // The signals heard since the services' starts (see `signalled`) end the run through
+    // teardown.
     let stopping = CancellationToken::new();
     let power_off = std::cell::Cell::new(PowerOff::of(persistent, &addr));
     let stop = async {
-        tokio::select! {
-            _ = crate::shutdown::terminate_signal() => {}
-            _ = crate::detach::interrupt() => {}
-        }
+        signalled.await;
         println!("virtkit: stopping ...");
         stopping.cancel();
         if !persistent {
@@ -2573,6 +2607,59 @@ async fn build_and_boot(
         );
     }
     result
+}
+
+/// Start the eager services `names` through `mgr`, in order. The starts run on a blocking
+/// thread — a Windows service's start waits for its provisioning, minutes — so that `stop`,
+/// resolving meanwhile, stops the services rather than leaving them to its signal's default
+/// action. `Ok` only once every start completed; a stop ends in its [`Stopped`] error, a
+/// failed start in its own. On any error the caller must call `stop_all` again: a start under
+/// way at this function's own `stop_all` may boot its guest after it. `again`, a further
+/// signal during that stop, exits at once — a Windows guest takes up to three minutes to power
+/// off — and leaves the VMMs to their parent-death signal.
+async fn start_eager(
+    mgr: &std::sync::Arc<crate::manager::Manager>,
+    names: &[String],
+    stop: impl std::future::Future<Output = Stopped>,
+    again: impl std::future::Future<Output = Stopped>,
+) -> Result<()> {
+    let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut starts = tokio::task::spawn_blocking({
+        let (mgr, names, stopping) = (mgr.clone(), names.to_vec(), stopping.clone());
+        move || -> Result<()> {
+            for name in &names {
+                if stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let reply = mgr.start(name);
+                if !reply.ok {
+                    bail!("booting service {name}: {}", reply.message);
+                }
+                println!("virtkit: service {name}: {}", reply.message);
+            }
+            Ok(())
+        }
+    });
+    // Biased: a stop that comes with the last start still reports the stop.
+    let stopped = tokio::select! {
+        biased;
+        stopped = stop => stopped,
+        started = &mut starts => return started.context("starting the services")?,
+    };
+    println!("virtkit: stopping ...");
+    stopping.store(true, std::sync::atomic::Ordering::Relaxed);
+    // The start under way ends once its guest is stopped (a Windows provisioning gives up as
+    // its guest goes).
+    let mgr = mgr.clone();
+    let stop_all = async move {
+        let _ = tokio::task::spawn_blocking(move || mgr.stop_all()).await;
+        let _ = starts.await;
+    };
+    tokio::select! {
+        () = stop_all => {}
+        again = again => std::process::exit(again.exit_code()),
+    }
+    Err(stopped.into())
 }
 
 /// The primary's power-off state when [`teardown_run`] takes over.
@@ -2822,7 +2909,7 @@ pub(crate) fn push_knob(cmdline: &mut String, knob: &str) {
 /// Resolve a `--primary` service name to its index in `units`, erroring with the list of
 /// declared services when it isn't found — so the build and run paths report the same message.
 fn resolve_primary(units: &[crate::compose::Unit], name: &str) -> Result<usize> {
-    units.iter().position(|u| u.name == name).ok_or_else(|| {
+    let idx = units.iter().position(|u| u.name == name).ok_or_else(|| {
         anyhow::anyhow!(
             "--primary {name:?}: no such compose service (declared: {})",
             units
@@ -2831,7 +2918,11 @@ fn resolve_primary(units: &[crate::compose::Unit], name: &str) -> Result<usize> 
                 .collect::<Vec<_>>()
                 .join(", ")
         )
-    })
+    })?;
+    if let crate::compose::Source::Bundle { .. } = units[idx].source {
+        bail!("--primary {name:?}: a Windows service boots as a sibling only");
+    }
+    Ok(idx)
 }
 
 /// Apply `--service-cpus`, `--service-mem`, and `--service-nics` to the loaded units'
@@ -2865,6 +2956,9 @@ fn apply_service_overrides(
     }
     for (name, n) in nics {
         let i = find(units, "--service-nics", name)?;
+        if *n != 1 && matches!(units[i].source, crate::compose::Source::Bundle { .. }) {
+            bail!("--service-nics {name}={n}: a Windows service has one NIC");
+        }
         units[i].nics = *n;
     }
     Ok(())
@@ -3146,10 +3240,18 @@ async fn compose_up(
     // front here (siblings resolve/build via plan_services + the manager).
     let planned = plan_services(args, cfg, state_dir, work, &units, None, None)?;
 
+    // The run answers Ctrl-C by stopping its services, a Windows one with its power button, so
+    // their VMMs and switch must not take the same SIGINT and die first.
+    if units
+        .iter()
+        .any(|u| matches!(u.source, crate::compose::Source::Bundle { .. }))
+    {
+        crate::spawn::isolate_helpers();
+    }
     // The switch binds every unit's socket; no VM ever dials the base socket
     // (there is no primary), it is just the switch's canonical listen path.
     let vsock = work.join("vsock.sock");
-    let (mut switch, _attach) = spawn_vm_switch(
+    let (switch, _attach) = spawn_vm_switch(
         &vsock,
         work,
         NET_VSOCK_PORT,
@@ -3185,15 +3287,21 @@ async fn compose_up(
         Duration::from_secs(args.boot_timeout_secs),
         planned.units,
     ));
-    for name in &planned.start {
-        let reply = mgr.start(name);
-        if !reply.ok {
-            mgr.stop_all();
-            let _ = switch.kill();
-            let _ = switch.wait();
-            bail!("booting service {name}: {}", reply.message);
+    // Unlike `build_and_boot`, which leaves a foreground Ctrl-C to SIGINT's default (its guest
+    // command and helpers take it too), this run hears it always: Ctrl-C is how a
+    // services-only run is ended, so it goes through `stop_all` (see `isolate_helpers` above).
+    let signals = || async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => Stopped(libc::SIGINT),
+            _ = crate::shutdown::terminate_signal() => Stopped(libc::SIGTERM),
         }
-        println!("virtkit: service {name}: {}", reply.message);
+    };
+    let stop = signals();
+    tokio::pin!(stop);
+    if let Err(e) = start_eager(&mgr, &planned.start, stop.as_mut(), signals()).await {
+        mgr.stop_all();
+        stop_switch(switch);
+        return Err(e);
     }
     println!(
         "virtkit: compose up on {gw}/{prefix}; {} of {} service(s) started — ctrl-c stops everything",
@@ -3205,10 +3313,7 @@ async fn compose_up(
     if args.detach {
         crate::detach::signal_ready(args.detach_log.as_deref());
     }
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = crate::shutdown::terminate_signal() => {}
-    }
+    stop.await;
     println!("virtkit: stopping ...");
     mgr.stop_all();
     stop_switch(switch);
@@ -3387,6 +3492,8 @@ pub(crate) fn compose_build_units(
                 build_args: global_build_args.to_vec(),
                 targets: vec![target(None)],
             }),
+            // Built already: `vk build` made the bundle.
+            crate::compose::Source::Bundle { .. } => {}
         }
     }
     result
@@ -5110,6 +5217,54 @@ mod tests {
         assert!(e.to_string().contains("killed by signal 9"), "{e}");
     }
 
+    fn no_units() -> std::sync::Arc<crate::manager::Manager> {
+        std::sync::Arc::new(crate::manager::Manager::new(
+            "/nonexistent".into(),
+            1024,
+            std::net::Ipv4Addr::new(10, 0, 2, 1),
+            "/nonexistent".into(),
+            crate::units::BuildOpts {
+                build_args: vec![],
+                kernel: "/nonexistent".into(),
+                agent: "/nonexistent".into(),
+                cache_registry: None,
+                cache_insecure: false,
+                cache_auth: Default::default(),
+                net: crate::build::BuildNet::All,
+                audit: false,
+            },
+            crate::manager::ManagerDirs {
+                cache: PathBuf::from("/cache"),
+                run: None,
+            },
+            Duration::from_secs(1800),
+            Duration::from_secs(1),
+            Vec::new(),
+        ))
+    }
+
+    // A stop during the services' starts must fail the run with the signal's exit code — a
+    // `--detach` parent reads an exit 0 as a ready run — and only completed starts are `Ok`.
+    #[tokio::test]
+    async fn a_stop_during_the_eager_starts_fails_the_run_with_the_signals_code() {
+        let mgr = no_units();
+        for (signal, code) in [(libc::SIGINT, 130), (libc::SIGTERM, 143)] {
+            let e = start_eager(
+                &mgr,
+                &[],
+                std::future::ready(Stopped(signal)),
+                std::future::pending(),
+            )
+            .await
+            .unwrap_err();
+            let stopped = e.downcast_ref::<Stopped>().expect("a stop is a Stopped");
+            assert_eq!(stopped.exit_code(), code);
+        }
+        start_eager(&mgr, &[], std::future::pending(), std::future::pending())
+            .await
+            .expect("every start completed");
+    }
+
     // The three reclaim knobs resolve in one order everywhere: a service's own
     // `x-virtkit.reclaim` wins, then the run's `--reclaim`, then `auto`. The primary's
     // marker is what a `--reclaim`-less run gives the primary guest.
@@ -5634,6 +5789,34 @@ mod tests {
         );
         let err = apply_service_overrides(&mut units, &[], &[], &[("nope".into(), 2)]).unwrap_err();
         assert!(format!("{err:#}").contains("--service-nics"), "{err:#}");
+        // A Windows service has its one NIC only.
+        let db = units.iter().position(|u| u.name == "db").unwrap();
+        units[db].source = crate::compose::Source::Bundle {
+            dir: PathBuf::from("/b/win"),
+            command: None,
+        };
+        apply_service_overrides(&mut units, &[], &[], &[("db".into(), 1)]).unwrap();
+        let err = apply_service_overrides(&mut units, &[], &[], &[("db".into(), 2)]).unwrap_err();
+        assert!(format!("{err:#}").contains("one NIC"), "{err:#}");
+    }
+
+    #[test]
+    fn a_windows_service_is_no_primary() {
+        let mut units = crate::compose::parse(
+            "services:\n  win:\n    image: w\n  web:\n    image: x\n",
+            Path::new("/b"),
+            &|_| None,
+            None,
+        )
+        .unwrap();
+        let win = units.iter().position(|u| u.name == "win").unwrap();
+        units[win].source = crate::compose::Source::Bundle {
+            dir: PathBuf::from("/b/win"),
+            command: None,
+        };
+        assert!(resolve_primary(&units, "web").is_ok());
+        let err = resolve_primary(&units, "win").unwrap_err();
+        assert!(format!("{err:#}").contains("sibling only"), "{err:#}");
     }
 
     #[test]

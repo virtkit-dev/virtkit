@@ -31,6 +31,12 @@ struct UnitState {
     /// held while the unit runs so the idle GC never evicts a base under a live overlay.
     /// Acquired at boot, dropped on stop.
     guard: Option<crate::cachelock::Guard>,
+    /// The UEFI firmware a Windows unit's VMM boots, held while it runs (an embedded copy is
+    /// a memfd).
+    firmware: Option<crate::embed::Resolved>,
+    /// Windows boot count: provisioning runs without the units lock and must not drive
+    /// a guest replaced by a later start.
+    boots: u64,
 }
 
 type UnitsGuard<'a> = std::sync::MutexGuard<'a, HashMap<String, UnitState>>;
@@ -49,7 +55,8 @@ pub struct ManagerDirs {
 
 /// The manager owns the declared service units. Because `units::boot_unit` is synchronous,
 /// the lock is held only during synchronous boot and stop operations, never across an await.
-/// A stop can hold it for `shutdown::STOP_GRACE`, so requests run outside the runtime threads.
+/// A stop can hold it for `shutdown::STOP_GRACE` (`winsvc::STOP_GRACE` for a Windows unit), so
+/// requests run outside the runtime threads.
 pub struct Manager {
     kernel: PathBuf,
     net_port: u32,
@@ -105,6 +112,8 @@ impl Manager {
                                 exited: None,
                                 aux: Vec::new(),
                                 guard: None,
+                                firmware: None,
+                                boots: 0,
                             },
                         )
                     })
@@ -252,6 +261,17 @@ impl Manager {
             // one took, which is right — the winner holds its own on the same entry.
             return Reply::ok(format!("{name} already running ({})", st.svc.ip));
         }
+        if let crate::compose::Source::Bundle { .. } = &st.unit.source {
+            // Booted under the lock, provisioned without it: minutes, during which
+            // `list`/`status` must still answer.
+            let ip = st.svc.ip.clone();
+            let booted = self.boot_windows(st);
+            drop(u);
+            return match booted {
+                Ok((provisioning, boot)) => self.provision_windows(name, &ip, &provisioning, boot),
+                Err(e) => Reply::err(format!("starting {name}: {e:#}")),
+            };
+        }
         // Reference the shared-cache base for the unit's running lifetime, so the idle GC
         // never evicts a base under this live overlay. A `build:` unit carries its guard
         // straight from the build that just promoted its entry (see `ensure_unit_build_sync`)
@@ -293,6 +313,47 @@ impl Manager {
         }
     }
 
+    /// Boot the Windows unit `st` and return its provisioning, with the boot it is for.
+    fn boot_windows(&self, st: &mut UnitState) -> Result<(crate::winsvc::Provisioning, u64)> {
+        let provisioning =
+            crate::winsvc::Provisioning::of(&st.svc, &st.unit, &st.dir, self.gateway)?;
+        let (child, firmware) = crate::winsvc::boot(&st.svc, &st.dir, self.net_port, self.gateway)?;
+        st.child = Some(child);
+        st.exited = None;
+        st.firmware = Some(firmware);
+        st.boots += 1;
+        Ok((provisioning, st.boots))
+    }
+
+    /// Provision Windows unit `name`'s boot `boot`, then reply. Failure leaves the guest
+    /// running, as for a Linux unit whose agent never answers.
+    fn provision_windows(
+        &self,
+        name: &str,
+        ip: &str,
+        provisioning: &crate::winsvc::Provisioning,
+        boot: u64,
+    ) -> Reply {
+        match provisioning.run(&mut || self.boot_running(name, boot)) {
+            Ok(()) => Reply::ok(format!("started {name} ({ip})")),
+            Err(e) => Reply::err(format!("starting {name}: {e:#}")),
+        }
+    }
+
+    /// Whether Windows unit `name`'s boot `boot` still runs. Provisioning must not drive
+    /// a replacement guest from a later stop and start.
+    fn boot_running(&self, name: &str, boot: u64) -> bool {
+        // As in `still_running`: a busy lock's holder is the one changing the state. So while a
+        // stop or restart holds it (a stop, up to its grace), this boot still reads as running
+        // and the provisioning keeps waiting on a guest that is going; the first check after
+        // the lock frees sees it gone.
+        let Some(mut u) = self.try_units_guard() else {
+            return true;
+        };
+        u.get_mut(name)
+            .is_some_and(|st| st.boots == boot && state_of(st) == "running")
+    }
+
     /// Point each recorded service at the image it booted. The registry entry is filed after
     /// the run's eager starts, and every `build:` sibling materializes at its first start
     /// (`build_compose_images` builds only the primary) — so those adoptions happen before
@@ -314,6 +375,10 @@ impl Manager {
     /// Images with `EXPOSE`d ports delay the channel until those ports accept connections,
     /// which the CI executor also relies on when waiting for services.
     async fn wait_ready(&self, name: &str, dir: &Path) -> Result<()> {
+        // A Windows unit's start already waited for its provisioning; it runs no vk-agent.
+        if self.is_windows(name) {
+            return Ok(());
+        }
         let console = dir.join(crate::run::CONSOLE_LOG);
         let still_up = || std::future::ready(self.still_running(name, &console));
         match crate::vms::await_agent(&unit_addr(dir), self.boot_timeout, still_up).await? {
@@ -327,6 +392,13 @@ impl Manager {
                 crate::run::tail(&console, 20)
             ),
         }
+    }
+
+    /// Whether `name` is a Windows unit (a bundle `image:`).
+    fn is_windows(&self, name: &str) -> bool {
+        self.units_guard()
+            .get(name)
+            .is_some_and(|st| matches!(st.unit.source, crate::compose::Source::Bundle { .. }))
     }
 
     /// [`Self::wait_ready`]'s check between probes: `Ok(false)` once `name`'s VMM has exited
@@ -354,8 +426,8 @@ impl Manager {
     }
 
     /// Power off a unit's guest, then kill and reap its VMM and helpers. Hold the units lock
-    /// for up to `shutdown::STOP_GRACE` so another start cannot race the stopping guest for its
-    /// overlay and sockets.
+    /// for up to `shutdown::STOP_GRACE` (`winsvc::STOP_GRACE` for a Windows unit) so another
+    /// start cannot race the stopping guest for its overlay and sockets.
     pub fn stop(&self, name: &str) -> Reply {
         let mut u = self.units_guard();
         let Some(st) = u.get_mut(name) else {
@@ -364,11 +436,17 @@ impl Manager {
         let was_running = state_of(st) == "running";
         let mut killed = Vec::new();
         if let Some(mut child) = st.child.take() {
-            killed = crate::shutdown::power_off_then_kill(&mut [(
-                name,
-                &unit_addr(&st.dir),
-                &mut child,
-            )]);
+            if let crate::compose::Source::Bundle { .. } = &st.unit.source {
+                if !crate::winsvc::stop(name, &mut child, &st.dir) {
+                    killed.push(name.to_string());
+                }
+            } else {
+                killed = crate::shutdown::power_off_then_kill(&mut [(
+                    name,
+                    &unit_addr(&st.dir),
+                    &mut child,
+                )]);
+            }
         }
         // tear down the unit's socket forwards, if any
         for mut a in st.aux.drain(..) {
@@ -377,6 +455,7 @@ impl Manager {
         }
         // release the shared-cache base reference now the overlay is gone
         st.guard = None;
+        st.firmware = None;
         Reply::ok(match (was_running, killed.is_empty()) {
             (false, _) => format!("{name} not running"),
             (true, true) => format!("stopped {name}"),
@@ -398,7 +477,11 @@ impl Manager {
         let Some(child) = st.child.as_ref() else {
             return Reply::err(format!("{name} not running"));
         };
-        if crate::shutdown::request_reboot(&unit_addr(&st.dir)) {
+        let asked = match st.unit.source {
+            crate::compose::Source::Bundle { .. } => crate::winsvc::reboot(&st.dir),
+            _ => crate::shutdown::request_reboot(&unit_addr(&st.dir)),
+        };
+        if asked {
             Reply::ok(format!("rebooting {name}"))
         } else {
             crate::shutdown::hard_reset(child);
@@ -406,20 +489,41 @@ impl Manager {
         }
     }
 
-    /// Power off all guests concurrently within one `shutdown::STOP_GRACE`, then kill and reap their
-    /// VMMs and helpers.
+    /// Power off all guests concurrently within one `shutdown::STOP_GRACE` (`winsvc::STOP_GRACE`
+    /// for the Windows units), then kill and reap their VMMs and helpers.
     pub fn stop_all(&self) {
         let mut units = self.units_guard();
         // Compute addresses while borrowing the map immutably. It is unchanged before `iter_mut`,
         // so both iterators have the same order and `zip` aligns.
         let addrs: Vec<_> = units.values().map(|st| unit_addr(&st.dir)).collect();
-        let mut vmms: Vec<(&str, &SocketAddr, &mut Child)> = units
-            .iter_mut()
-            .zip(&addrs)
-            .filter_map(|((name, st), addr)| st.child.as_mut().map(|c| (name.as_str(), addr, c)))
-            .collect();
-        // Report each kill and its reason immediately.
-        crate::shutdown::power_off_then_kill(&mut vmms);
+        let mut vmms: Vec<(&str, &SocketAddr, &mut Child)> = Vec::new();
+        // Windows units answer the power button, not the agent's poweroff: each is stopped on
+        // a thread of its own, alongside the others.
+        let mut windows: Vec<(&str, &Path, &mut Child)> = Vec::new();
+        for ((name, st), addr) in units.iter_mut().zip(&addrs) {
+            let Some(child) = st.child.as_mut() else {
+                continue;
+            };
+            if let crate::compose::Source::Bundle { .. } = st.unit.source {
+                windows.push((name.as_str(), st.dir.as_path(), child));
+            } else {
+                vmms.push((name.as_str(), addr, child));
+            }
+        }
+        std::thread::scope(|scope| {
+            for (name, dir, child) in windows {
+                scope.spawn(move || {
+                    if !crate::winsvc::stop(name, child, dir) {
+                        eprintln!(
+                            "virtkit: {name}: killed (the guest did not power off within {}s)",
+                            crate::winsvc::STOP_GRACE.as_secs()
+                        );
+                    }
+                });
+            }
+            // Report each kill and its reason immediately.
+            crate::shutdown::power_off_then_kill(&mut vmms);
+        });
         for st in units.values_mut() {
             st.child = None; // killed and reaped above
             for mut a in st.aux.drain(..) {
@@ -427,6 +531,7 @@ impl Manager {
                 let _ = a.wait();
             }
             st.guard = None;
+            st.firmware = None;
         }
     }
 
@@ -490,7 +595,10 @@ fn console_tail(path: &Path, max: u64) -> std::io::Result<String> {
 
 /// Build a unit's agent exec address from its runtime directory.
 fn unit_addr(dir: &Path) -> SocketAddr {
-    crate::vmm::exec_addr(&dir.join("vsock.sock"), crate::units::VSOCK_PORT)
+    crate::vmm::exec_addr(
+        &dir.join(crate::units::VSOCK_SOCKET),
+        crate::units::VSOCK_PORT,
+    )
 }
 
 /// "running" if the unit's child is alive, else "stopped". Reaps a child that has
@@ -937,6 +1045,37 @@ mod tests {
             err.contains("cache stopped before its agent answered"),
             "{err}"
         );
+    }
+
+    /// Provisioning drives only its own boot's guest, never a stopped or replacement guest.
+    #[test]
+    fn a_provisioning_drives_only_the_boot_it_is_for() {
+        let mgr = manager_over_two_units();
+        let set = |child: Option<std::process::Child>, boots: u64| {
+            let mut u = mgr.units_guard();
+            let st = u.get_mut("cache").unwrap();
+            if let Some(mut old) = std::mem::replace(&mut st.child, child) {
+                let _ = old.kill();
+                let _ = old.wait();
+            }
+            st.boots = boots;
+        };
+        let sleeper = || {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap()
+        };
+        set(Some(sleeper()), 1);
+        assert!(mgr.boot_running("cache", 1));
+        // Stopped: its guest is gone.
+        set(None, 1);
+        assert!(!mgr.boot_running("cache", 1));
+        // Started again: the guest up is the next boot's.
+        set(Some(sleeper()), 2);
+        assert!(!mgr.boot_running("cache", 1));
+        assert!(mgr.boot_running("cache", 2));
+        set(None, 2);
     }
 
     #[tokio::test]

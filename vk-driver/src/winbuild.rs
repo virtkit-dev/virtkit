@@ -428,6 +428,29 @@ fn build_stage(
 /// the record names a layer, not a file, so a bundle cannot have the build back its layers
 /// with a disk the cache did not make.
 fn bundle_layer(dir: &Path, cache: &Path) -> Result<Layer> {
+    let mut layer = read_layer(dir)?;
+    let step = cache.join("layers").join(&layer.key);
+    layer.disk = if step.join("complete").exists() {
+        step.join("disk.qcow2")
+    } else if let Some(disk) = crate::winiso::cached_base(&cache.join("winiso"), &layer.key) {
+        disk
+    } else {
+        bail!(
+            "its layer {} is gone from the build cache; build it again",
+            &layer.key[..12]
+        );
+    };
+    let password = dir.join("admin-password");
+    layer.password = std::fs::read_to_string(&password)
+        .with_context(|| format!("reading {}", password.display()))?
+        .trim()
+        .to_string();
+    Ok(layer)
+}
+
+/// The layer the bundle `dir` records ([`LAYER_RECORD`]), checked but without its disk or
+/// password.
+fn read_layer(dir: &Path) -> Result<Layer> {
     let record = dir.join(LAYER_RECORD);
     let value = layer_record(dir).with_context(|| format!("{}: no layer", record.display()))?;
     if value["version"].as_u64() != Some(LAYER_RECORD_VERSION) {
@@ -437,7 +460,7 @@ fn bundle_layer(dir: &Path, cache: &Path) -> Result<Layer> {
             value["version"]
         );
     }
-    let mut layer: Layer =
+    let layer: Layer =
         serde_json::from_value(value).with_context(|| format!("{}", record.display()))?;
     if layer.key.len() != 64
         || !layer
@@ -458,23 +481,31 @@ fn bundle_layer(dir: &Path, cache: &Path) -> Result<Layer> {
             record.display()
         );
     }
-    let step = cache.join("layers").join(&layer.key);
-    layer.disk = if step.join("complete").exists() {
-        step.join("disk.qcow2")
-    } else if let Some(disk) = crate::winiso::cached_base(&cache.join("winiso"), &layer.key) {
-        disk
-    } else {
-        bail!(
-            "its layer {} is gone from the build cache; build it again",
-            &layer.key[..12]
-        );
-    };
-    let password = dir.join("admin-password");
-    layer.password = std::fs::read_to_string(&password)
-        .with_context(|| format!("reading {}", password.display()))?
-        .trim()
-        .to_string();
     Ok(layer)
+}
+
+/// What a service needs from a bundle's layer record: the image's provisioning and the
+/// directory it runs in.
+#[derive(Debug, Default)]
+pub(crate) struct Provisioning {
+    pub provision: Option<String>,
+    pub workdir: Option<String>,
+}
+
+/// The provisioning the bundle at `dir` records; none for a bundle without a layer record (one
+/// not made by `vk build`).
+pub(crate) fn provisioning(dir: &Path) -> Result<Provisioning> {
+    let path = dir.join(LAYER_RECORD);
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Provisioning::default()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        Ok(_) => {}
+    }
+    let layer = read_layer(dir)?;
+    Ok(Provisioning {
+        provision: layer.provision,
+        workdir: layer.workdir,
+    })
 }
 
 /// Read [`LAYER_RECORD`] from bundle `dir` only if it has a `version`, so a stray
@@ -564,7 +595,7 @@ fn run_step(layer: &mut Layer, run: &parser::Run, what: &str, steps: &Steps) -> 
         };
         if restart {
             eprintln!("virtkit: {what} restarting the guest");
-            restart_guest(ga, vm)?;
+            restart_guest(ga, code, vm)?;
         }
         Ok(())
     })
@@ -814,9 +845,9 @@ fn make_dirs<'a>(ga: &mut Client, files: impl Iterator<Item = &'a str>) -> Resul
     }
 }
 
-/// Restart the guest in place and wait for its agent.
-fn restart_guest(ga: &mut Client, guest: &mut crate::uefi::Guest) -> Result<()> {
-    crate::winexec::restart(ga, &mut || guest.running())?;
+/// Restart the guest in place, after a step that exited `code`, and wait for its agent.
+fn restart_guest(ga: &mut Client, code: i32, guest: &mut crate::uefi::Guest) -> Result<()> {
+    crate::winexec::restart(ga, code, &mut || guest.running())?;
     *ga = Client::connect(&guest.agent_socket(), AGENT_TIMEOUT)
         .context("qemu-ga did not come back after the restart")?;
     Ok(())
@@ -1246,6 +1277,35 @@ mod tests {
             Some(r#"setup.cmd "a \"b\" c""#)
         );
         assert_eq!(provision(&powershell, &cmd("CMD []")), None);
+    }
+
+    #[test]
+    fn a_service_reads_its_provisioning_from_the_layer_record() {
+        let dir = scratch("prov");
+        let none = provisioning(&dir).unwrap();
+        assert_eq!((none.provision, none.workdir), (None, None));
+        let mut record = serde_json::to_value(Layer {
+            key: "c".repeat(64),
+            workdir: Some(r"C:\vk".into()),
+            provision: Some(command_line(
+                &["powershell".into(), "-Command".into()],
+                &Cmdline::Shell(r"C:\vk\join.ps1".into()),
+            )),
+            ..layer()
+        })
+        .unwrap();
+        record["version"] = LAYER_RECORD_VERSION.into();
+        std::fs::write(dir.join(LAYER_RECORD), record.to_string()).unwrap();
+        let read = provisioning(&dir).unwrap();
+        assert_eq!(
+            read.provision.as_deref(),
+            Some(r"powershell -Command C:\vk\join.ps1")
+        );
+        assert_eq!(read.workdir.as_deref(), Some(r"C:\vk"));
+        // A record this vk does not read is an error, not an image without provisioning.
+        std::fs::write(dir.join(LAYER_RECORD), "{}").unwrap();
+        assert!(provisioning(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
