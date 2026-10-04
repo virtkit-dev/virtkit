@@ -727,6 +727,10 @@ pub struct VmSpec {
     /// the machine's disks.
     #[serde(default)]
     pub uefi_vars: Option<PathBuf>,
+    /// The guest's TPM 2.0, its permanent state in this file (`VmmBuilder::tpm_state`), kept
+    /// with the machine's disks.
+    #[serde(default)]
+    pub tpm_state: Option<PathBuf>,
     /// A Unix socket whose bytes become the first serial port's input (`vk console`): the
     /// boot child relays it to COM1 as it does the guest agent ([`crate::relay::serve_socket`]).
     #[serde(default)]

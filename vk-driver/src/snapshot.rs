@@ -92,7 +92,7 @@ fn save(
             names.push(name);
         }
         // Keep the UEFI variable store with the disks: the snapshot's memory holds what the
-        // guest read from it.
+        // guest read from it. A TPM's state is in the snapshot's own state.
         if let Some(vars) = vars {
             std::fs::hard_link(vars, out.join(crate::uefi::UEFI_VARS))
                 .with_context(|| format!("linking {} into the snapshot", vars.display()))?;
@@ -103,12 +103,15 @@ fn save(
             .with_context(|| format!("copying {} into the snapshot", uuid.display()))?;
         crate::vmmctl::snapshot(control, &out)?;
         let machine = machine(&out)?;
+        // The VM a run restores it in must have the TPM it had.
+        let tpm = !snapshot_state(&out)?["legacy"]["tpm"].is_null();
         let manifest = serde_json::json!({
             "firmware": "uefi",
             "cpus": machine.cpus,
             "mem": machine.mem,
             "disks": names,
             "uefi_vars": vars.map(|_| crate::uefi::UEFI_VARS),
+            "tpm": tpm,
             "snapshot": crate::uefi::SnapshotInfo { addr: machine.addr },
         });
         std::fs::write(&manifest_tmp, serde_json::to_string_pretty(&manifest)?)
@@ -137,6 +140,9 @@ fn save(
         std::fs::remove_file(file)
             .with_context(|| format!("unlinking {} from the run", file.display()))?;
     }
+    // The machine's TPM went with it: the next machine of the run starts with a new one.
+    let work = control.parent().context("the VM's run directory")?;
+    crate::uefi::remove_files(work, [crate::uefi::TPM_STATE])?;
     // Last: a bundle with its `vm.json` is whole.
     std::fs::rename(&manifest_tmp, &manifest)
         .with_context(|| format!("writing {}", manifest.display()))
@@ -157,14 +163,19 @@ fn create_private_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("creating {}", dir.display()))
 }
 
+/// The `state.json` libkrun wrote in `snapshot`.
+fn snapshot_state(snapshot: &Path) -> Result<serde_json::Value> {
+    let path = snapshot.join("state.json");
+    serde_json::from_reader(std::io::BufReader::new(
+        std::fs::File::open(&path).with_context(|| format!("reading {}", path.display()))?,
+    ))
+    .with_context(|| format!("parsing {}", path.display()))
+}
+
 /// Read a compose service's vCPU count and RAM (the sum of its RAM regions) from `snapshot`,
 /// and its address from runtime dir `dir` ([`crate::winsvc::ADDRESS`]).
 fn service_machine(snapshot: &Path, dir: &Path) -> Result<Machine> {
-    let path = snapshot.join("state.json");
-    let state: serde_json::Value = serde_json::from_reader(std::io::BufReader::new(
-        std::fs::File::open(&path).with_context(|| format!("reading {}", path.display()))?,
-    ))
-    .with_context(|| format!("parsing {}", path.display()))?;
+    let state = snapshot_state(snapshot)?;
     let cpus = state["cpu"]["vcpus"].as_array().map(|v| v.len() as u32);
     let bytes: u64 = state["memory"]
         .as_array()
@@ -319,6 +330,8 @@ mod tests {
             if self.fail {
                 bail!("no space left");
             }
+            // A VM with a TPM, whose state libkrun keeps in the snapshot's own.
+            std::fs::write(dir.join("state.json"), r#"{"legacy": {"tpm": {}}}"#)?;
             Ok(())
         }
 
@@ -345,6 +358,7 @@ mod tests {
             std::fs::write(work.join("disk1.qcow2"), "1").unwrap();
             std::fs::write(work.join(crate::uefi::SYSTEM_UUID), [7u8; 16]).unwrap();
             std::fs::write(work.join(crate::uefi::UEFI_VARS), "vars").unwrap();
+            std::fs::write(work.join(crate::uefi::TPM_STATE), "tpm").unwrap();
             let control = work.join(crate::uefi::CONTROL_SOCKET);
             let asked = Arc::new(Mutex::new(Vec::new()));
             let fake = Fake {
@@ -403,13 +417,18 @@ mod tests {
             std::fs::read(out.join(crate::uefi::UEFI_VARS)).unwrap(),
             b"vars"
         );
-        assert!(!run.dir.join("run").join(crate::uefi::UEFI_VARS).exists());
+        // The machine's TPM goes with it, in the snapshot's state.json, not as a file.
+        assert!(!out.join(crate::uefi::TPM_STATE).exists());
+        for kept in [crate::uefi::UEFI_VARS, crate::uefi::TPM_STATE] {
+            assert!(!run.dir.join("run").join(kept).exists());
+        }
         assert!(!out.join("vm.tmp").exists());
         let bundle = crate::uefi::Bundle::open(&out).unwrap();
         assert_eq!(
             bundle.manifest.uefi_vars.as_deref(),
             Some(Path::new(crate::uefi::UEFI_VARS))
         );
+        assert!(bundle.manifest.tpm);
         assert_eq!(bundle.manifest.cpus, Some(2));
         assert_eq!(bundle.manifest.mem.as_deref(), Some("4G"));
         assert_eq!(

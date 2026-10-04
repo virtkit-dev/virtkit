@@ -662,3 +662,28 @@ cache. A snapshot keeps the device's mode and status in its `state.json`, and a 
 VM that has no flash where the snapshot had one, or the reverse; its contents are the file's,
 which the embedder keeps with the snapshot like the disks. Covered by tests replaying edk2's
 probe and its program and erase sequences.
+
+`src/devices/src/legacy/x86_64/tpm.rs` + `src/devices/build.rs` + `src/arch/src/x86_64/{acpi.rs,
+layout.rs,mod.rs}` + `src/libkrun/src/vmm/{builder.rs,resources.rs,snapshot.rs,mod.rs}` +
+`src/libkrun/src/api/vmm_builder.rs` — a TPM 2.0 (`tpm` feature): libtpms, linked statically
+from `VK_LIBTPMS_DIR` (libtpms.a and the libcrypto.a it computes with), behind the TCG CRB
+interface at `TPM_CRB_START` (0xFED40000), as QEMU presents swtpm, so the host needs no swtpm.
+`VmmBuilder::tpm_state(path)` attaches it, with its permanent state in `path` (written whenever
+the TPM changes it, owner-only, through a synced rename; only a missing file is a new TPM,
+manufactured on first use with libtpms' `default-v1` profile, and one that cannot be read or is
+empty fails the TPM rather than replace it), and the ACPI tables declare it: an MSFT0101 device
+in the DSDT and a TPM2 table (revision 4, start method 7, no log area: the firmware gives Windows
+its event log through the EFI TCG2 protocol). Commands run on the vCPU that starts them, and
+only once the driver holds locality 0 and has made the interface ready, as on QEMU. libtpms is
+one TPM per process: a second VM in the process gets one only once the first `Vmm` is dropped.
+A snapshot keeps the CRB registers and buffer and the TPM's permanent and volatile state
+(`TPMLIB_GetState`), so it is whole without the file; a restore starts the TPM on them
+(`TPMLIB_SetState`, before `TPMLIB_MainInit`), writing the permanent state to `path` for the
+machine's next start. A restore refuses a VM without the TPM the snapshot has (a build without
+the feature included), or with one it has not. Covered by a test driving the CRB registers
+through TPM2_Startup and TPM2_GetRandom, the state file and a snapshot round trip, and by ACPI
+tests. The TPM device has a `_DSM` modelled on QEMU's, which Windows' TPM driver evaluates and
+otherwise fails on (event 15, STATUS_OBJECT_NAME_NOT_FOUND, `Get-Tpm` then errors): TCG Physical
+Presence 1.3 with nothing pending and the requests that would queue an operation not
+implemented, and the memory clear interface, accepted as a no-op (a guest reboot relaunches the
+VMM, with zeroed RAM). Windows Server 2025 then reports the TPM present, ready and owned.

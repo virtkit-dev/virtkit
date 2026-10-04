@@ -104,6 +104,12 @@ struct Layer {
     /// db or dbx) is known to bug-check 0x1E in the firmware's runtime services.
     #[serde(default)]
     secure_boot: bool,
+    /// `# vk: tpm=on`: the image's machines have a TPM 2.0, each its own. The build's guests
+    /// have none: Windows could seal something to a TPM that ends with its step (Windows 11's
+    /// automatic device encryption does, leaving an image no machine can boot). Inherited by a
+    /// stage built on this one.
+    #[serde(default)]
+    tpm: bool,
     /// Variables set by `ENV` since the last step, still to be made machine-wide.
     #[serde(skip)]
     unsaved_env: Vec<(String, String)>,
@@ -216,6 +222,10 @@ fn check_stage(stage: &Stage, context: &Path, no_network: bool) -> Result<()> {
                 bail!("`# vk: firmware={value}`: expected uefi or uefi-secboot")
             }
             "firmware" => {}
+            "tpm" if !matches!(value.as_str(), "on" | "off") => {
+                bail!("`# vk: tpm={value}`: expected on or off")
+            }
+            "tpm" => {}
             // Parsed for the Windows build, which does not act on them yet.
             _ => bail!("`# vk: {key}` is not supported yet"),
         }
@@ -369,6 +379,7 @@ fn build_stage(
             workdir: None,
             provision: None,
             secure_boot: false,
+            tpm: false,
             unsaved_env: Vec::new(),
             unmade_workdir: false,
             generalized: false,
@@ -387,9 +398,7 @@ fn build_stage(
             stage.from.image
         );
     };
-    if let Some(firmware) = stage.directive("firmware") {
-        layer.secure_boot = firmware == "uefi-secboot";
-    }
+    machine_directives(stage, &mut layer);
     let steps = Steps {
         cpus,
         mem: &mem,
@@ -524,6 +533,17 @@ pub(crate) fn provisioning(dir: &Path) -> Result<Provisioning> {
         provision: layer.provision,
         workdir: layer.workdir,
     })
+}
+
+/// Apply `stage`'s directives for the image's machines (`firmware`, `tpm`) to `layer`, whose
+/// stages built on it inherit them.
+fn machine_directives(stage: &Stage, layer: &mut Layer) {
+    if let Some(firmware) = stage.directive("firmware") {
+        layer.secure_boot = firmware == "uefi-secboot";
+    }
+    if let Some(tpm) = stage.directive("tpm") {
+        layer.tpm = tpm == "on";
+    }
 }
 
 /// Read [`LAYER_RECORD`] from bundle `dir` only if it has a `version`, so a stray
@@ -876,7 +896,8 @@ fn restart_guest(ga: &mut Client, code: i32, guest: &mut crate::uefi::Guest) -> 
 fn step_key(layer: &Layer, material: &str) -> String {
     let workdir = layer.workdir.as_deref().filter(|_| layer.unmade_workdir);
     // Include Secure Boot in the key because a step's drivers may not load under it.
-    // Keys without Secure Boot retain the existing cache format.
+    // Keys without Secure Boot retain the existing cache format. The TPM is not in it: steps
+    // run without one.
     let firmware = if layer.secure_boot {
         "\0uefi-secboot"
     } else {
@@ -1079,6 +1100,7 @@ fn write_bundle(layer: &Layer, cpus: u32, mem: &str, out: &Path) -> Result<()> {
             "mem": mem,
             "disks": ["disk.qcow2"],
             "secure_boot": layer.secure_boot,
+            "tpm": layer.tpm,
         }))?,
     )?;
     let password = out.join("admin-password");
@@ -1127,6 +1149,7 @@ mod tests {
             workdir: None,
             provision: None,
             secure_boot: false,
+            tpm: false,
             unsaved_env: Vec::new(),
             unmade_workdir: false,
             generalized: false,
@@ -1238,7 +1261,8 @@ mod tests {
             assert!(err.contains(want), "{body}: {err}");
         }
         let directives = [
-            ("tpm=on", "`# vk: tpm` is not supported yet"),
+            ("hyperv=on", "`# vk: hyperv` is not supported yet"),
+            ("tpm=yes", "expected on or off"),
             ("generalize=yes", "expected on or off"),
             ("firmware=bios", "expected uefi or uefi-secboot"),
             ("disk=10G", "at least 20G"),
@@ -1255,6 +1279,18 @@ mod tests {
         for firmware in ["uefi", "uefi-secboot"] {
             let stage = parsed(&format!("# vk: firmware={firmware}\n{WINISO}"));
             check_stage(&stage[0], Path::new("/ctx"), false).unwrap();
+        }
+        // A TPM is the image's machines', kept by the stages built on it until one says off.
+        let mut built = layer();
+        for (directives, tpm) in [
+            ("# vk: tpm=on\n", true),
+            ("", true),
+            ("# vk: tpm=off\n", false),
+        ] {
+            let stage = parsed(&format!("{directives}{WINISO}"));
+            check_stage(&stage[0], Path::new("/ctx"), false).unwrap();
+            machine_directives(&stage[0], &mut built);
+            assert_eq!(built.tpm, tpm, "{directives}");
         }
         assert_eq!(disk_size("60G").unwrap(), 60 << 30);
         let err = refusal("FROM base --drivers=x\n");
@@ -1543,9 +1579,12 @@ mod tests {
         built.workdir = Some("C:\\app".into());
         built.generalized = true;
         built.provision = Some("cmd /S /C setup.cmd".into());
+        built.tpm = true;
         std::fs::create_dir_all(cache.join("layers").join(&key)).unwrap();
         std::fs::write(&built.disk, vec![0; 1 << 20]).unwrap();
         write_bundle(&built, 2, "4G", &bundle).unwrap();
+        let manifest = crate::uefi::Bundle::open(&bundle).unwrap().manifest;
+        assert!(manifest.tpm, "the image's machines have a TPM");
         let record = std::fs::read_to_string(bundle.join(LAYER_RECORD)).unwrap();
         assert!(
             !record.contains("secret") && !record.contains("disk.qcow2"),

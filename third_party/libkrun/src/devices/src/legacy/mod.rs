@@ -93,6 +93,8 @@ pub use self::vcpu::VcpuList;
 pub use self::x86_64::flash::{Flash, FlashMode, FlashState};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use self::x86_64::pvpanic::PvPanic;
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "tpm"))]
+pub use self::x86_64::tpm::{TPM_CRB_SIZE, TpmCrb, TpmState};
 
 // Cannot use multiple types as bounds for a trait object, so we define our own trait
 // which is a composition of the desired bounds. In this case, io::Read and AsRawFd.

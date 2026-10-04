@@ -82,6 +82,7 @@ pub(crate) fn boot(
     let restore = bundle.manifest.snapshot.map(|_| bundle.dir.as_path());
     let mut spec =
         crate::uefi::guest_spec(&firmware.path, dir, &svc.name, disks, cpus, &mem, restore)?;
+    spec.tpm_state = crate::uefi::tpm_state(dir, &bundle.manifest);
     spec.nics = crate::vmm::switch_attach(
         &dir.join(crate::units::VSOCK_SOCKET),
         net_port,
@@ -95,8 +96,9 @@ pub(crate) fn boot(
     Ok((child, firmware))
 }
 
-/// Start a new machine every start: remove the previous overlays, generation ID, UUID and
-/// UEFI variables from `dir`, then recreate the overlays and variable store from `bundle`.
+/// Start a new machine every start: remove the previous overlays, generation ID, UUID, UEFI
+/// variables and TPM state from `dir`, then recreate the overlays and variable store from
+/// `bundle`.
 fn new_machine(dir: &Path, bundle: &Bundle) -> Result<Vec<crate::vmm::Disk>> {
     crate::uefi::remove_files(dir, [crate::uefi::GENERATION_ID, crate::uefi::SYSTEM_UUID])?;
     crate::uefi::machine_files(dir, bundle, true)
