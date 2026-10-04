@@ -74,7 +74,21 @@ pub struct GuestHint {
     pub mem: Option<String>,
     /// Guest vCPUs.
     pub cpus: Option<u32>,
+    /// A Windows stage's directives (`disk`, `firmware`, `tpm`, `hyperv`, `generalize`,
+    /// `warm`, `qga`), raw: the Windows build refuses each until it acts on it.
+    pub windows: Vec<(String, String)>,
 }
+
+/// The `# vk:` keys only a Windows stage reads.
+const WINDOWS_HINTS: [&str; 7] = [
+    "disk",
+    "firmware",
+    "tpm",
+    "hyperv",
+    "generalize",
+    "warm",
+    "qga",
+];
 
 /// The comment prefix a stage's sizing line carries. Mid-file and stage-scoped, so it cannot
 /// collide with buildkit's file-scoped `# syntax=` / `# check=` parser directives, and any
@@ -178,7 +192,7 @@ pub fn parse(src: &str) -> Result<Dockerfile> {
 }
 
 /// The keyword a parsed instruction came from, for diagnostics.
-fn keyword_of(instr: &Instruction) -> &str {
+pub(crate) fn keyword_of(instr: &Instruction) -> &str {
     match instr {
         Instruction::From(_) => "FROM",
         Instruction::Run(_) => "RUN",
@@ -224,7 +238,16 @@ fn parse_guest_hints(lines: &[String]) -> Result<GuestHint> {
                     })?;
                     hint.cpus = Some(n);
                 }
-                _ => bail!("`# {HINT_PREFIX}`: unknown key {key:?} (want mem, cpus)"),
+                key if WINDOWS_HINTS.contains(&key) => {
+                    if hint.windows.iter().any(|(k, _)| k == key) {
+                        bail!("`# {HINT_PREFIX}`: {key} given twice");
+                    }
+                    hint.windows.push((key.to_string(), value.to_string()));
+                }
+                _ => bail!(
+                    "`# {HINT_PREFIX}`: unknown key {key:?} (want mem, cpus, or for Windows {})",
+                    WINDOWS_HINTS.join(", ")
+                ),
             }
         }
     }
@@ -646,6 +669,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_vk_comment_carries_a_windows_stage_s_directives() {
+        let df = parse("# vk: cpus=4 disk=60G generalize=on\nFROM base AS g\n").unwrap();
+        let Instruction::From(f) = &df.instructions[0] else {
+            unreachable!()
+        };
+        assert_eq!(f.guest.cpus, Some(4));
+        assert_eq!(
+            f.guest.windows,
+            vec![
+                ("disk".to_string(), "60G".to_string()),
+                ("generalize".to_string(), "on".to_string())
+            ]
+        );
+        assert!(parse("# vk: disk=1G disk=2G\nFROM x\n").is_err());
+        assert!(parse("# vk: colour=blue\nFROM x\n").is_err());
+    }
+
+    #[test]
     fn from_keeps_the_flags_it_does_not_model_before_or_after_the_image() {
         let df = parse(
             "FROM winiso:./ws2025.iso@sha256:abc \\\n\
@@ -771,6 +812,7 @@ mod tests {
             GuestHint {
                 mem: Some("8G".into()),
                 cpus: Some(16),
+                windows: Vec::new(),
             }
         );
         // One key per line reads better for a stage that sets both; they fold together.

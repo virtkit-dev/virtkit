@@ -66,16 +66,29 @@ impl std::error::Error for AgentError {}
 
 impl Client {
     /// Connect to the agent behind `socket` and resynchronize, waiting up to `timeout` for
-    /// it to answer (it is not up until the guest has booted).
+    /// it to answer: the socket appears once the VMM is up, the agent once the guest has
+    /// booted.
     pub fn connect(socket: &Path, timeout: std::time::Duration) -> Result<Client> {
-        let stream = vk_core::unixpath::connect(socket)
-            .with_context(|| format!("connecting to the guest agent at {}", socket.display()))?;
+        let deadline = std::time::Instant::now() + timeout;
+        let stream = loop {
+            match vk_core::unixpath::connect(socket) {
+                Ok(stream) => break stream,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("connecting to the guest agent at {}", socket.display())
+                    });
+                }
+            }
+        };
         let mut client = Client {
             stream,
             buf: Vec::new(),
             stale: false,
         };
-        client.sync(timeout)?;
+        client.sync(deadline.saturating_duration_since(std::time::Instant::now()))?;
         Ok(client)
     }
 

@@ -6,6 +6,22 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **`vk build` builds Windows images from Microsoft's ISO.** A Dockerfile stage `FROM
+  winiso:<iso>@sha256:<digest> --drivers=<virtio-win.iso>@sha256:<digest>
+  [--edition=<name>]` installs Windows unattended under vk, without AHCI emulation or another
+  VMM: vk builds a FAT32 install disk whose WinPE loads the virtio drivers (in a Linux helper
+  VM, cached by the ISOs), installs onto a 40 GB virtio disk, puts virtio-win and qemu-ga in,
+  waits out the first boots' servicing, turns on the serial console, turns off automatic
+  repair, files the lab network as Private and gives the Administrator a random password. The
+  install takes about 20 minutes and is cached; the first build also needs the network (the
+  helper VM installs its tools) and about 15 GB of disk for the cache. Without `--edition` the
+  ISO's first image installs, taken to be Windows Server 2025. Each later `RUN` and `COPY` is a
+  cached qcow2 layer made through qemu-ga; a shell-form `RUN` is `<SHELL> <text>` as Docker
+  runs it on Windows (`cmd /S /C` by default), exit code 3010 or 1641 restarts the guest
+  (`--reboot=auto|always|never`), `ENV` also becomes a machine variable, `WORKDIR` (created as
+  in Docker) and `SHELL` apply; `USER` (steps run as SYSTEM), `ARG`, `ADD` and `COPY --from`
+  are refused. `--out <dir>` writes a bundle `vk run` boots, with the password in
+  `admin-password`; every image built on the same cached install shares that password.
 - **`vk run` boots a UEFI guest, such as an installed Windows Server, from a local bundle.**
   A directory holding `vm.json` (`{"firmware": "uefi", "cpus": 2, "mem": "4G", "disks":
   ["disk.qcow2"]}`) and its named disks boots with embedded UEFI firmware and no vk-agent.

@@ -38,7 +38,7 @@
 
 mod exec;
 mod interp;
-mod parser;
+pub(crate) mod parser;
 
 // Disk-device naming (0 = vda, 1 = vdb, …) — also used by `run::boot_session` to name the
 // build guest's ephemeral /tmp scratch disk.
@@ -4016,7 +4016,8 @@ fn glob_seg(pat: &str, s: &str) -> bool {
     m(pat.as_bytes(), s.as_bytes())
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// `bytes` as lowercase hex, as digests are spelled.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));
@@ -7389,6 +7390,7 @@ RUN ship
             parser::GuestHint {
                 mem: Some("8G".into()),
                 cpus: None,
+                windows: Vec::new(),
             },
         )]);
         let mut matched = HashSet::new();
