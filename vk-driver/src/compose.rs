@@ -36,7 +36,7 @@
 //! merged by [`merged_config`] and handed to the guest at boot. Changing an
 //! override never rebuilds an image.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -107,6 +107,19 @@ pub struct Unit {
     /// directories. Settled in [`map_service`], the one place that knows both the compose dir
     /// and the service name.
     pub persist_root_backing: Option<PathBuf>,
+    /// The service's `secrets:`, resolved against the top-level declarations. A Linux guest
+    /// reads each at `/run/secrets/<target>` through a read-only
+    /// single-file bind in [`Self::volumes`]; a Windows one gets a copy at
+    /// `C:\ProgramData\Docker\secrets\<target>`, readable by SYSTEM and administrators only,
+    /// before its provisioning runs.
+    pub secrets: Vec<Secret>,
+}
+
+/// A secret a service is given: the host file behind it and the name the guest reads it under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Secret {
+    pub target: String,
+    pub file: PathBuf,
 }
 
 /// Where a unit's image comes from.
@@ -784,10 +797,23 @@ pub fn parse(
         bail!("no services declared");
     }
     let anchor = builtins.and_then(|b| b.persist_anchor.as_deref());
+    let mut secrets = BTreeMap::new();
+    for (name, secret) in file.secrets {
+        let path = match (secret.file, secret.environment) {
+            (Some(file), None) => base.join(file),
+            (None, Some(_)) => bail!("secret {name:?}: only a `file:` source is supported"),
+            (Some(_), Some(_)) => {
+                bail!("secret {name:?}: give `file:`, not both `file:` and `environment:`")
+            }
+            (None, None) => bail!("secret {name:?}: give `file:`"),
+        };
+        secrets.insert(name, path);
+    }
     let mut units = Vec::new();
     for (name, svc) in file.services {
         units.push(
-            map_service(&name, svc, base, anchor).with_context(|| format!("service {name:?}"))?,
+            map_service(&name, svc, base, anchor, &secrets)
+                .with_context(|| format!("service {name:?}"))?,
         );
     }
     Ok(units)
@@ -817,6 +843,32 @@ fn interpolate_values(
         _ => {}
     }
     Ok(())
+}
+
+/// A secret target both guests can take as one file name: `/run/secrets/<target>` on Linux,
+/// `C:\ProgramData\Docker\secrets\<target>` on Windows, which must stay under `MAX_PATH`
+/// (260, its NUL included). Letters, digits, `.`, `_` and `-`, not starting or ending with
+/// `.`, and not a Windows device name (`NUL`, `COM1.txt`...), which would write to the device
+/// rather than the directory.
+fn is_secret_target(target: &str) -> bool {
+    const DEVICES: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    let stem = target
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let numbered = (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && stem.len() == 4
+        && stem.as_bytes()[3].is_ascii_digit();
+    !target.is_empty()
+        && crate::winsvc::SECRETS_DIR.len() + 1 + target.len() < 260
+        && !target.starts_with('.')
+        && !target.ends_with('.')
+        && target
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && !DEVICES.contains(&stem.as_str())
+        && !numbered
 }
 
 /// A service name becomes a LAN hostname, so it must be a valid RFC-1123 DNS
@@ -856,6 +908,7 @@ fn map_service(
     svc: ComposeService,
     base: &Path,
     persist_anchor: Option<&Path>,
+    declared_secrets: &BTreeMap<String, PathBuf>,
 ) -> Result<Unit> {
     if !is_dns_label(name) {
         bail!(
@@ -953,6 +1006,7 @@ fn map_service(
         environment.retain(|(name, _)| name != &k);
         environment.push((k, v));
     }
+    let secrets = service_secrets(svc.secrets, declared_secrets)?;
     let command = match &mut source {
         Source::Bundle { command, .. } => {
             let unsupported = [
@@ -985,6 +1039,22 @@ fn map_service(
         }
         _ => svc.command.map(Cmd::into_argv).transpose()?,
     };
+    // A Linux guest reads its secrets through read-only single-file binds.
+    if !matches!(source, Source::Bundle { .. }) {
+        volumes.extend(secrets.iter().map(|secret| Volume {
+            host: secret.file.clone(),
+            guest: format!("/run/secrets/{}", secret.target),
+            read_only: true,
+            overlay: false,
+            persist: false,
+            is_file: true,
+            disk: false,
+            socket: false,
+            immutable: false,
+            disk_size_mib: None,
+            persist_backing: None,
+        }));
+    }
     Ok(Unit {
         name: name.to_string(),
         hostname,
@@ -1006,7 +1076,57 @@ fn map_service(
         nested,
         nics,
         persist_root_backing,
+        secrets,
     })
+}
+
+/// Resolve a service's `secrets:` entries against the top-level `declared` ones.
+fn service_secrets(
+    entries: Vec<ServiceSecret>,
+    declared: &BTreeMap<String, PathBuf>,
+) -> Result<Vec<Secret>> {
+    let mut targets = HashSet::new();
+    let mut secrets = Vec::new();
+    for entry in entries {
+        let (source, target) = match entry {
+            ServiceSecret::Name(name) => (name.clone(), name),
+            ServiceSecret::Long(l) => {
+                for (key, given) in [("uid", &l.uid), ("gid", &l.gid), ("mode", &l.mode)] {
+                    if given.is_some() {
+                        bail!("secret {:?}: `{key}` is not supported", l.source);
+                    }
+                }
+                let target = l.target.unwrap_or_else(|| l.source.clone());
+                (l.source, target)
+            }
+        };
+        let file = declared
+            .get(&source)
+            .with_context(|| format!("secret {source:?} is not declared under `secrets:`"))?;
+        if !is_secret_target(&target) {
+            bail!(
+                "secret {source:?}: target {target:?} must be a plain file name \
+                 (letters, digits, `.`, `_`, `-`; not a Windows device name)"
+            );
+        }
+        if !file.is_file() {
+            bail!("secret {source:?}: {} is not a file", file.display());
+        }
+        if !file_bind_name_ok(file) {
+            bail!(
+                "secret {source:?}: the file name of {} may not contain ',', ':' or whitespace",
+                file.display()
+            );
+        }
+        if !targets.insert(target.clone()) {
+            bail!("two secrets have the target {target:?}");
+        }
+        secrets.push(Secret {
+            target,
+            file: file.clone(),
+        });
+    }
+    Ok(secrets)
 }
 
 fn map_build(build: serde_yaml_ng::Value, base: &Path) -> Result<Source> {
@@ -1086,6 +1206,14 @@ pub fn normalized_guest(path: &str) -> PathBuf {
 /// Callers validate ':' according to their field format.
 fn cmdline_safe(s: &str) -> bool {
     !s.contains(',') && !s.contains(char::is_whitespace)
+}
+
+/// Whether a single-file bind's host file name is safe in `VIRTKIT_SYMLINKS`
+/// (`src:dest[,src:dest]`), whose `src` ends with that name.
+fn file_bind_name_ok(host: &Path) -> bool {
+    host.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| cmdline_safe(n) && !n.contains(':'))
 }
 
 /// Parse a bind mount:
@@ -1247,6 +1375,12 @@ pub fn parse_volume(spec: &str, base: &Path) -> Result<Option<Volume>> {
     let is_file = !disk && meta.as_ref().map(|m| m.is_file()).unwrap_or(false);
     if overlay && is_file {
         bail!("volume {spec:?}: overlay mode needs a directory source, not a single file");
+    }
+    if is_file && !(file_bind_name_ok(&host) && cmdline_safe(guest)) {
+        bail!(
+            "volume {spec:?}: a single-file bind's host file name and guest path may not \
+             contain ',' or whitespace"
+        );
     }
     if disk && meta.as_ref().is_ok_and(|m| m.is_dir()) {
         bail!("volume {spec:?}: disk mode needs a file source (or none yet), not a directory");
@@ -1764,6 +1898,36 @@ struct ComposeFile {
     version: Option<String>,
     #[serde(default)]
     services: BTreeMap<String, ComposeService>,
+    #[serde(default)]
+    secrets: BTreeMap<String, ComposeSecret>,
+}
+
+/// A top-level compose secret. Only the `file:` source is supported.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComposeSecret {
+    file: Option<String>,
+    environment: Option<String>,
+}
+
+/// A service's `secrets:` entry: the secret's name, or `{source, target}`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ServiceSecret {
+    Name(String),
+    Long(ServiceSecretLong),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceSecretLong {
+    source: String,
+    target: Option<String>,
+    // Accepted only to be refused by name: an untagged enum reports any unknown key as "did
+    // not match any variant".
+    uid: Option<serde::de::IgnoredAny>,
+    gid: Option<serde::de::IgnoredAny>,
+    mode: Option<serde::de::IgnoredAny>,
 }
 
 /// A service's `env_file`: one path, or a list of paths and `{path, required}` entries.
@@ -1854,6 +2018,8 @@ struct ComposeService {
     volumes: Vec<String>,
     #[serde(default)]
     profiles: Vec<String>,
+    #[serde(default)]
+    secrets: Vec<ServiceSecret>,
     /// vk extension: per-service init/kernel axes (compose `x-*` extension key).
     /// Only `x-virtkit` is recognized; any other `x-*` key still errors like any
     /// unsupported key (deny_unknown_fields), matching the strict-parse contract.
@@ -2229,6 +2395,154 @@ mod tests {
             Some(r#""C:\Program Files\x.exe" /q"#)
         );
         assert!(matches!(&by("web").source, Source::Image(i) if i == "nginx"));
+    }
+
+    #[test]
+    fn a_secret_is_a_read_only_file_bind_for_linux_and_a_copy_for_windows() {
+        let base = BundleDir::new("secrets");
+        std::fs::write(base.0.join("pw.txt"), "s3cret").unwrap();
+        let units = parse(
+            "secrets:\n  join:\n    file: ./pw.txt\n\
+             services:\n  web:\n    image: nginx\n    secrets: [join]\n\
+             \x20 dc:\n    image: ./win\n    secrets:\n      - source: join\n        target: join_password\n",
+            &base.0,
+        )
+        .unwrap();
+        let by = |name: &str| units.iter().find(|u| u.name == name).unwrap();
+        let file = base.0.join("./pw.txt");
+        let web = by("web");
+        assert_eq!(
+            web.secrets,
+            vec![Secret {
+                target: "join".into(),
+                file: file.clone()
+            }]
+        );
+        let bind = web
+            .volumes
+            .iter()
+            .find(|v| v.guest == "/run/secrets/join")
+            .unwrap();
+        assert!(bind.read_only && bind.is_file);
+        assert_eq!(bind.host, file);
+        let dc = by("dc");
+        assert_eq!(dc.secrets[0].target, "join_password");
+        assert!(
+            dc.volumes.is_empty(),
+            "a Windows guest gets a copy, not a bind"
+        );
+    }
+
+    #[test]
+    fn a_secret_that_is_undeclared_missing_or_named_like_a_path_is_refused() {
+        let base = BundleDir::new("secrets-refused");
+        std::fs::write(base.0.join("pw.txt"), "s3cret").unwrap();
+        std::fs::write(base.0.join("a,b"), "s3cret").unwrap();
+        for (yaml, why) in [
+            (
+                "services:\n  web:\n    image: nginx\n    secrets: [nope]\n",
+                "not declared",
+            ),
+            (
+                "secrets:\n  s:\n    file: ./absent\nservices:\n  web:\n    image: nginx\n    secrets: [s]\n",
+                "is not a file",
+            ),
+            (
+                "secrets:\n  s:\n    environment: PW\nservices:\n  web:\n    image: nginx\n",
+                "only a `file:` source",
+            ),
+            (
+                "secrets:\n  s:\n    file: ./pw.txt\nservices:\n  web:\n    image: nginx\n    secrets:\n      - source: s\n        target: ../etc/x\n",
+                "plain file name",
+            ),
+            (
+                "secrets:\n  s:\n    file: ./pw.txt\nservices:\n  web:\n    image: nginx\n    secrets:\n      - source: s\n        target: NUL.txt\n",
+                "plain file name",
+            ),
+            (
+                "secrets:\n  s:\n    file: ./pw.txt\nservices:\n  web:\n    image: nginx\n    secrets:\n      - source: s\n        target: com1\n",
+                "plain file name",
+            ),
+            (
+                "secrets:\n  s:\n    file: ./pw.txt\nservices:\n  web:\n    image: nginx\n    secrets:\n      - source: s\n        target: x.\n",
+                "plain file name",
+            ),
+            (
+                "secrets:\n  s:\n    file: ./pw.txt\nservices:\n  web:\n    image: nginx\n    secrets:\n      - source: s\n        target: a b\n",
+                "plain file name",
+            ),
+            (
+                "secrets:\n  s:\n    file: ./pw.txt\nservices:\n  web:\n    image: nginx\n    secrets:\n      - source: s\n        target: \"a\\nb\"\n",
+                "plain file name",
+            ),
+            (
+                "secrets:\n  s:\n    file: ./pw.txt\n  t:\n    file: ./pw.txt\nservices:\n  web:\n    image: nginx\n    secrets:\n      - s\n      - source: t\n        target: s\n",
+                "two secrets have the target",
+            ),
+            (
+                "secrets:\n  s:\n    file: ./pw.txt\n    environment: PW\nservices:\n  web:\n    image: nginx\n",
+                "not both `file:` and `environment:`",
+            ),
+            (
+                "secrets:\n  s:\n    file: ./pw.txt\nservices:\n  web:\n    image: nginx\n    secrets:\n      - source: s\n        mode: 0400\n",
+                "`mode` is not supported",
+            ),
+            (
+                "secrets:\n  s:\n    file: ./pw.txt\nservices:\n  web:\n    image: nginx\n    secrets:\n      - source: s\n        target: /etc/pw\n",
+                "plain file name",
+            ),
+            (
+                "secrets:\n  s:\n    file: ./a,b\nservices:\n  web:\n    image: nginx\n    secrets: [s]\n",
+                "may not contain",
+            ),
+        ] {
+            let err = parse(yaml, &base.0).unwrap_err();
+            assert!(format!("{err:#}").contains(why), "{yaml}: {err:#}");
+        }
+        // The Windows path must stay under MAX_PATH: 229 characters is the longest target.
+        let with_target = |len: usize| {
+            parse(
+                &format!(
+                    "secrets:\n  s:\n    file: ./pw.txt\nservices:\n  web:\n    image: nginx\n    \
+                     secrets:\n      - source: s\n        target: {}\n",
+                    "a".repeat(len)
+                ),
+                &base.0,
+            )
+        };
+        with_target(229).unwrap();
+        assert!(format!("{:#}", with_target(230).unwrap_err()).contains("plain file name"));
+    }
+
+    #[test]
+    fn a_long_syntax_secret_without_a_target_is_read_under_its_name() {
+        let base = BundleDir::new("secrets-long");
+        std::fs::write(base.0.join("pw.txt"), "s3cret").unwrap();
+        let units = parse(
+            "secrets:\n  join:\n    file: ./pw.txt\n\
+             services:\n  web:\n    image: nginx\n    secrets:\n      - source: join\n",
+            &base.0,
+        )
+        .unwrap();
+        assert_eq!(units[0].secrets[0].target, "join");
+        assert!(
+            units[0]
+                .volumes
+                .iter()
+                .any(|v| v.guest == "/run/secrets/join")
+        );
+    }
+
+    #[test]
+    fn a_single_file_bind_whose_name_would_break_the_cmdline_is_refused() {
+        let base = BundleDir::new("filebind-name");
+        std::fs::write(base.0.join("a b"), "").unwrap();
+        std::fs::write(base.0.join("ok"), "").unwrap();
+        for spec in ["./a b:/etc/x", "./ok:/etc/a,b"] {
+            let err = parse_volume(spec, &base.0).unwrap_err().to_string();
+            assert!(err.contains("may not contain"), "{spec}: {err}");
+        }
+        parse_volume("./ok:/etc/x", &base.0).unwrap();
     }
 
     #[test]
