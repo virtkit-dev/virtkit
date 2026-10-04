@@ -31,7 +31,11 @@ All notable changes to virtkit will be documented in this file.
   it installs Windows again), and `# vk: generalize=on` ends the stage with sysprep, so each
   copy boots with its own name and SID (generalizing again an image built from a generalized
   one runs sysprep again, which Windows allows only a limited number of times); every step
-  first waits for Windows to finish setting itself up.
+  first waits for Windows to finish setting itself up. Windows 11 installs too
+  (`--edition="Windows 11 Enterprise Evaluation"`, about 70 minutes; the edition must name
+  Windows 10 or 11, or the ISO installs as a server and Setup stops at its TPM check), without
+  a TPM or Secure Boot, which vk does not emulate yet: WinPE sets Microsoft's `LabConfig` keys
+  so Setup skips those checks.
 - **`vk snapshot` saves a running Windows VM, and `vk run` starts it again from there.**
   `vk snapshot <pid> --out <dir>` writes a bundle holding the VM's memory (a sparse image),
   its CPU and device state and its disks as they were, and ends the VM; `vk run <dir>` (with
