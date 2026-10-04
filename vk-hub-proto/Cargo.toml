@@ -5,8 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
-# Shared definitions for `vk` and local readers: types and pure functions only,
-# with no runtime, transport or crypto.
+# Shared definitions for `vk`, its local readers, and the fleet's hub and nodes: types and
+# pure functions only, with no runtime, transport or crypto.
 [dependencies]
 serde.workspace = true
 

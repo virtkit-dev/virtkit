@@ -785,7 +785,7 @@ vk-hub/          experimental local web UI for this machine's VMs
 vk-runnerctl/    optional root-side GitLab concurrency helper
 vk-selfupdate/   shared self-update implementation for vk and vk-registry
 vk-fs/           filesystem objects created private and published whole
-vk-hub-proto/    the VM list `vk workloads` prints, shared with its readers
+vk-hub-proto/    the VM list `vk workloads` prints, and the hub↔node protocol
 third_party/     vendored libkrun and local patches
 .devcontainer/   pinned build image (nixos/nix base + nix/flake.nix and flake.lock toolchain)
 kernel/          pinned guest-kernel configuration and build inputs

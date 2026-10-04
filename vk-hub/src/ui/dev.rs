@@ -242,7 +242,7 @@ pub(super) mod tests {
     /// The ID `vk workloads` derives from a state dir.
     pub(in crate::ui) fn id_of(dir: &str) -> String {
         use sha2::{Digest, Sha256};
-        crate::hex::to_hex(&Sha256::digest(dir.as_bytes())[..8])
+        vk_hub_proto::to_hex(&Sha256::digest(dir.as_bytes())[..8])
     }
 
     /// `app-1234` as `vk workloads` lists it running.

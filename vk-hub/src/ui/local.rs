@@ -347,7 +347,7 @@ fn view(out: anyhow::Result<crate::local::Output>) -> View {
 pub(super) fn exact_state_dir(w: &Workload) -> Option<&Path> {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(w.state_dir.as_bytes());
-    (crate::hex::to_hex(&digest[..8]) == w.id).then(|| Path::new(&w.state_dir))
+    (vk_hub_proto::to_hex(&digest[..8]) == w.id).then(|| Path::new(&w.state_dir))
 }
 
 /// Whether `id` is a VM's ID as `vk workloads` writes one: sixteen lowercase hex digits.
