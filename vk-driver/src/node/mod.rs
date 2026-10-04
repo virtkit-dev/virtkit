@@ -4,7 +4,7 @@
 //! enrolls with the hub using a single-use token; `vk node run` then holds a session with the
 //! hub for as long as it runs — inventory at the start and whenever it changes, a heartbeat
 //! every few seconds — and redials with backoff whenever the session is lost, until SIGTERM
-//! or SIGINT closes it cleanly or the hub refuses it for good.
+//! or SIGINT closes it cleanly or the hub refuses it for good. See `docs/fleet-design.md`.
 //!
 //! Everything the node keeps is under `<state_dir>/node/`, a `0700` directory: `key.pk8`
 //! (the private key, `0600`), `enrollment.json` (the hub's URL and the node ID it assigned),

@@ -1,7 +1,8 @@
 //! `vk-hub local`: the hub for the one machine it is started on, run by the person whose VMs
 //! they are — the role virt-manager plays for libvirt. There is no enrollment and no node:
 //! the VMs come from `vk workloads --watch`, a `vk` child of the hub's that prints the list
-//! each time it changes. The UI runs `vk` commands to read VM details and act on VMs.
+//! each time it changes. The UI runs `vk` commands to read VM details and act on VMs. See
+//! `docs/fleet-design.md`, "Local mode".
 //!
 //! **Why a child, not a library.** The list is `vk`'s to make — its registry, its locks, its
 //! dev environments' state — and `vk-hub` is a separate binary that does not link `vk`. A
