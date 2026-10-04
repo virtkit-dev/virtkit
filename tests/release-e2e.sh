@@ -13,12 +13,14 @@
 #   VK=./dist/vk tests/release-e2e.sh                     # a local build, every script
 #   VK=./dist/vk tests/release-e2e.sh tests/systemd-boot-e2e.sh  # the smoke checks + these
 #   RELEASE_TAG=v0.61.0 VK=dist/vk tests/release-e2e.sh     # what release.yml runs
+#   ISO_DIR=~/.cache/vk-windows VK=./dist/vk tests/release-e2e.sh   # the Windows tests too
 #
 # Needs: KVM, network for the image pulls the scripts do, e2fsprogs, and GNU coreutils
 # (busybox `timeout` signals only its child, so a killed step would leak the microVMs it
-# started). E2E_TIMEOUT caps each step, in seconds (default 1800), so
-# a hung microVM fails the gate instead of holding it; E2E_BUDGET caps the run as a whole
-# (default 0, no cap) so the results table still prints inside a CI job timeout.
+# started). E2E_TIMEOUT caps each step, in seconds (default 1800, and 7200 for the windows-*
+# tests, whose first run installs Windows), so a hung microVM fails the gate instead of holding
+# it; E2E_BUDGET caps the run as a whole (default 0, no cap) so the results table still prints
+# inside a CI job timeout.
 set -euo pipefail
 
 usage() {
@@ -28,6 +30,7 @@ usage() {
 
 here="$(cd "$(dirname "$0")" && pwd)"
 self=$(basename "$0")
+windows_timeout=${E2E_TIMEOUT:-7200}
 E2E_TIMEOUT=${E2E_TIMEOUT:-1800}
 E2E_BUDGET=${E2E_BUDGET:-0}
 # 0 would mean "no limit" to timeout, which is the one thing this cap exists to prevent.
@@ -95,11 +98,13 @@ fi
 names=()
 results=()
 failed=0
+not_run=0
 started=$SECONDS
 # Record each step's outcome and stream its output unchanged.
 step() { # <name> <command...>
   local name=$1 rc=0 cap=$E2E_TIMEOUT left
   shift
+  [[ $name != windows-* ]] || cap=$windows_timeout
   names+=("$name")
   if [ "$E2E_BUDGET" -ne 0 ]; then
     left=$((E2E_BUDGET - (SECONDS - started)))
@@ -165,6 +170,15 @@ fi
 for script in "${scripts[@]}"; do
   name=$(basename "$script")
   [ "$name" != "$self" ] || continue   # never recurse, however this script was reached
+  # The Windows tests install Windows from Microsoft's evaluation ISOs, which no one may
+  # redistribute and a CI runner does not hold: run them when ISO_DIR names where they are,
+  # list them as not run otherwise (named on the command line, they run regardless).
+  if [ "$#" -eq 0 ] && [[ $name == windows-* ]] && [ -z "${ISO_DIR:-}" ]; then
+    names+=("$name")
+    results+=("not run (needs ISO_DIR, the Windows ISOs)")
+    not_run=$((not_run + 1))
+    continue
+  fi
   step "$name" bash "$script"
 done
 
@@ -177,4 +191,4 @@ if [ "$failed" -ne 0 ]; then
   echo "FAIL: $failed of ${#names[@]} steps failed"
   exit 1
 fi
-echo "PASS: all ${#names[@]} steps passed"
+echo "PASS: $((${#names[@]} - not_run)) passed, $not_run not run"
