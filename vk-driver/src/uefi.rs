@@ -43,6 +43,9 @@ const GENERATION_ID: &str = "vmgenid";
 /// down instead (a Windows guest can be set to ignore the button).
 const BUTTON_GRACE: Duration = Duration::from_secs(20);
 
+/// How long a build guest has to power off before it is killed.
+const BUILD_STOP_GRACE: Duration = Duration::from_secs(10 * 60);
+
 /// A VMM that exits within this long of its spawn failed to boot; past it, the guest is up
 /// as far as a detached run's parent cares (Windows has no agent to answer earlier).
 const BOOT_SETTLE: Duration = Duration::from_secs(3);
@@ -282,10 +285,10 @@ pub(crate) fn guest_spec(
 
 /// Stop the guest behind `ch`, with run directory `work`: press the ACPI power button, then
 /// request qemu-ga shutdown after [`BUTTON_GRACE`]. Return the elapsed time since the button,
-/// or `None` after [`crate::shutdown::STOP_GRACE`] if still running; the caller then kills it.
-async fn power_off(ch: &mut Child, work: &Path) -> Option<Duration> {
+/// or `None` after `grace` if still running; the caller then kills it.
+async fn power_off(ch: &mut Child, work: &Path, grace: Duration) -> Option<Duration> {
     let pressed = Instant::now();
-    let deadline = pressed + crate::shutdown::STOP_GRACE;
+    let deadline = pressed + grace;
     let socket = work.join(GUEST_AGENT_SOCKET);
     let button = crate::shutdown::press_power_button(ch);
     if button && exited_by(ch, pressed + BUTTON_GRACE).await {
@@ -371,13 +374,15 @@ impl Guest {
         }
     }
 
-    /// Stop the guest as `vk stop` does. Return an error if killed: its disk may hold a torn
-    /// write. Blocks; call outside async tasks (builds run on a blocking thread).
+    /// Stop the guest as `vk stop` does, with [`BUILD_STOP_GRACE`] before the kill (a build
+    /// layer must close cleanly, and a Windows that has just changed roles takes its time).
+    /// Return an error if killed: its disk may hold a torn write. Blocks; call outside async
+    /// tasks (builds run on a blocking thread).
     pub(crate) fn shutdown(mut self) -> Result<Duration> {
         if !self.running() {
             return Ok(Duration::ZERO);
         }
-        let stop = power_off(&mut self.ch, &self.work);
+        let stop = power_off(&mut self.ch, &self.work, BUILD_STOP_GRACE);
         let off = match tokio::runtime::Handle::try_current() {
             Ok(rt) => rt.block_on(stop),
             Err(_) => tokio::runtime::Builder::new_current_thread()
@@ -390,7 +395,7 @@ impl Guest {
             Some(after) => Ok(after),
             None => bail!(
                 "the guest did not power off within {}s and was killed",
-                crate::shutdown::STOP_GRACE.as_secs()
+                BUILD_STOP_GRACE.as_secs()
             ),
         }
     }
@@ -500,7 +505,7 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
         // Stopped: the power button, then qemu-ga's shutdown; the kill once STOP_GRACE runs
         // out or on a second Ctrl-C.
         tokio::select! {
-            off = power_off(&mut ch, work) => match off {
+            off = power_off(&mut ch, work, crate::shutdown::STOP_GRACE) => match off {
                 Some(after) => {
                     println!("virtkit: guest powered off ({after:.0?} after the power button)")
                 }

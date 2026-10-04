@@ -1,8 +1,12 @@
-//! `vk build` of a Windows Dockerfile: a stage starts from `FROM winiso:` ([`crate::winiso`]) or
-//! an earlier stage, and each `RUN` or `COPY` is a layer — a qcow2 overlay over the one before,
-//! cached by its parent and the instruction — made by booting the guest on it, acting through
-//! qemu-ga ([`crate::winexec`]) and powering it off cleanly. `ENV`, `WORKDIR` and `SHELL` shape
-//! the `RUN` steps after them. The result is a bundle `vk run` boots.
+//! `vk build` of a Windows Dockerfile: a stage starts from `FROM winiso:` ([`crate::winiso`]), an
+//! earlier stage or a bundle an earlier build wrote, and each `RUN` or `COPY` is a layer — a
+//! qcow2 overlay over the one before, cached by its parent and the instruction — made by booting
+//! the guest on it, acting through qemu-ga ([`crate::winexec`]) and powering it off cleanly.
+//! `ENV`, `WORKDIR` and `SHELL` shape the `RUN` steps after them. `# vk: disk=` sizes a
+//! `winiso:` stage's install, and `# vk: generalize=on` ends the stage with sysprep. The result
+//! is a bundle `vk run` boots, which records its layer so another Dockerfile can build `FROM` it
+//! against the same build cache: the record names the layer, and only the cache that made it
+//! holds its disk.
 //!
 //! As Docker does on Windows, a shell-form `RUN` is the program line `<SHELL> <text>` (by
 //! default `cmd /S /C <text>`), and runs as qemu-ga does, as SYSTEM. Its exit code 3010 or 1641
@@ -32,15 +36,26 @@ const DEFAULT_DISK: u64 = 40 << 30;
 /// How long a booting guest has for its qemu-ga to answer.
 const AGENT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// Whether `text` is a Dockerfile for Windows: one of its stages installs from `winiso:` or
-/// names the Windows platform.
-pub(crate) fn is_windows(text: &str) -> Result<bool> {
+/// How long sysprep has to generalize the image and power the guest off.
+const SYSPREP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// A bundle's record of the layer it boots.
+const LAYER_RECORD: &str = "layer.json";
+
+/// The version of the [`LAYER_RECORD`] format this build writes and reads.
+const LAYER_RECORD_VERSION: u64 = 1;
+
+/// Whether `text` is a Dockerfile for Windows: one of its stages installs from `winiso:`,
+/// names the Windows platform, or starts from a bundle a Windows build wrote (relative to
+/// `context`).
+pub(crate) fn is_windows(text: &str, context: &Path) -> Result<bool> {
     Ok(parser::parse(text)?.instructions.iter().any(|i| match i {
         Instruction::From(f) => {
             f.image.starts_with(crate::winiso::SCHEME)
                 || f.platform
                     .as_deref()
                     .is_some_and(|p| p.starts_with("windows"))
+                || layer_record(&context.join(&f.image)).is_some()
         }
         _ => false,
     }))
@@ -57,19 +72,29 @@ pub(crate) struct Options {
     pub mem: String,
 }
 
-/// A stage as it builds: its current layer and what its later `RUN`s inherit.
-#[derive(Clone, Debug)]
+/// A stage as it builds: its current layer and what its later `RUN`s inherit. A bundle
+/// records it (`layer.json`) so another Dockerfile can build `FROM` the bundle: its key, shell,
+/// `ENV` and `WORKDIR`; the disk is the cache's for that key, and the password is the bundle's
+/// `admin-password`. The bundle builds only against the cache that made it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Layer {
+    #[serde(skip)]
     disk: PathBuf,
     key: String,
+    #[serde(skip)]
     password: String,
     shell: Vec<String>,
     env: Vec<(String, String)>,
     workdir: Option<String>,
     /// Variables set by `ENV` since the last step, still to be made machine-wide.
+    #[serde(skip)]
     unsaved_env: Vec<(String, String)>,
     /// `WORKDIR` changed since the last step: the directory is still to be created.
+    #[serde(skip)]
     unmade_workdir: bool,
+    /// Sysprep made this layer: its next step deletes the answer file the generalize step left.
+    #[serde(default)]
+    generalized: bool,
 }
 
 struct Stage {
@@ -83,6 +108,16 @@ impl Stage {
             .as_name
             .clone()
             .unwrap_or_else(|| index.to_string())
+    }
+
+    /// The value of the `# vk:` Windows directive `name` above the stage's `FROM`.
+    fn directive(&self, name: &str) -> Option<&str> {
+        self.from
+            .guest
+            .windows
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
     }
 }
 
@@ -147,13 +182,23 @@ pub(crate) fn build(opts: &Options) -> Result<()> {
 /// Refuse what `stage` asks for that a Windows build does not do, before anything boots.
 fn check_stage(stage: &Stage, context: &Path) -> Result<()> {
     let from = &stage.from;
-    // Parsed for the Windows build, which does not act on them yet.
-    if let Some((key, _)) = from.guest.windows.first() {
-        bail!("`# vk: {key}` is not supported yet");
+    let winiso =
+        crate::winiso::Source::of_stage(&from.image, &from.extra_flags, context)?.is_some();
+    for (key, value) in &from.guest.windows {
+        match key.as_str() {
+            "disk" if !winiso => bail!("`# vk: disk` sizes a winiso: stage's install only"),
+            "disk" => {
+                disk_size(value)?;
+            }
+            "generalize" if !matches!(value.as_str(), "on" | "off") => {
+                bail!("`# vk: generalize={value}`: expected on or off")
+            }
+            "generalize" => {}
+            // Parsed for the Windows build, which does not act on them yet.
+            _ => bail!("`# vk: {key}` is not supported yet"),
+        }
     }
-    if crate::winiso::Source::of_stage(&from.image, &from.extra_flags, context)?.is_none()
-        && let Some((name, _)) = from.extra_flags.first()
-    {
+    if !winiso && let Some((name, _)) = from.extra_flags.first() {
         bail!(
             "FROM {}: --{name} applies to a winiso: stage only",
             from.image
@@ -197,6 +242,14 @@ fn check_stage(stage: &Stage, context: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The install disk `# vk: disk=<size>` asks for, in bytes: 20G or more.
+fn disk_size(size: &str) -> Result<u64> {
+    crate::run::parse_mem_mib(size)
+        .filter(|&mib| mib >= 20 << 10)
+        .and_then(|mib| mib.checked_mul(1 << 20))
+        .with_context(|| format!("`# vk: disk={size}`: expected a size of at least 20G"))
 }
 
 /// Refuse a `$` variable reference in `text`, which Docker would substitute and a Windows
@@ -261,10 +314,15 @@ fn build_stage(
     let label = stage.label(index);
     check_stage(stage, &opts.context).with_context(|| format!("stage {label}"))?;
     let (cpus, mem) = guest_size(stage, opts);
+    let bundle = opts.context.join(&stage.from.image);
     let mut layer = if let Some(source) =
         crate::winiso::Source::of_stage(&stage.from.image, &stage.from.extra_flags, &opts.context)?
     {
-        let base = crate::winiso::base(&source, DEFAULT_DISK, cpus, &mem, &cache.join("winiso"))?;
+        let disk = match stage.directive("disk") {
+            Some(size) => disk_size(size)?,
+            None => DEFAULT_DISK,
+        };
+        let base = crate::winiso::base(&source, disk, cpus, &mem, &cache.join("winiso"))?;
         Layer {
             disk: base.disk,
             key: base.key,
@@ -274,15 +332,19 @@ fn build_stage(
             workdir: None,
             unsaved_env: Vec::new(),
             unmade_workdir: false,
+            generalized: false,
         }
     } else if let Some(parent) = stages[..index]
         .iter()
         .position(|s| s.from.as_name.as_deref() == Some(stage.from.image.as_str()))
     {
         build_stage(stages, parent, opts, cache, built)?
+    } else if layer_record(&bundle).is_some() {
+        bundle_layer(&bundle, cache).with_context(|| format!("FROM {}", stage.from.image))?
     } else {
         bail!(
-            "FROM {}: a Windows stage starts from winiso: or an earlier stage",
+            "FROM {}: a Windows stage starts from winiso:, an earlier stage or a bundle a \
+             Windows build wrote",
             stage.from.image
         );
     };
@@ -312,14 +374,142 @@ fn build_stage(
             _ => {}
         }
     }
-    // As Docker keeps a stage's last ENV and WORKDIR in its image.
-    if !layer.unsaved_env.is_empty() || layer.unmade_workdir {
+    if stage.directive("generalize") == Some("on") {
+        // Its step also makes the stage's last ENV and WORKDIR. Generalizing an image built
+        // FROM a generalized one runs sysprep again, which Windows allows a limited number of
+        // times (its rearm count).
+        eprintln!("virtkit: [{label}] generalize (sysprep)");
+        // The key includes the answer and password: each bundle supplies its own password,
+        // so different passwords produce different layers.
+        let answer = generalize_answer(&layer.password);
+        step(
+            &mut layer,
+            &format!("GENERALIZE\0{answer}"),
+            &steps,
+            |ga, _, vm| generalize(ga, &answer, vm),
+        )?;
+        layer.generalized = true;
+    } else if !layer.unsaved_env.is_empty() || layer.unmade_workdir {
+        // As Docker keeps a stage's last ENV and WORKDIR in its image.
         eprintln!("virtkit: [{label}] saving ENV and WORKDIR");
         step(&mut layer, "SAVE", &steps, |_, _, _| Ok(()))?;
     }
     built.insert(index, layer.clone());
     Ok(layer)
 }
+
+/// The layer the bundle `dir` records ([`LAYER_RECORD`]), its disk found in `cache` by its key:
+/// the record names a layer, not a file, so a bundle cannot have the build back its layers
+/// with a disk the cache did not make.
+fn bundle_layer(dir: &Path, cache: &Path) -> Result<Layer> {
+    let record = dir.join(LAYER_RECORD);
+    let value = layer_record(dir).with_context(|| format!("{}: no layer", record.display()))?;
+    if value["version"].as_u64() != Some(LAYER_RECORD_VERSION) {
+        bail!(
+            "{}: version {} is not one this vk reads",
+            record.display(),
+            value["version"]
+        );
+    }
+    let mut layer: Layer =
+        serde_json::from_value(value).with_context(|| format!("{}", record.display()))?;
+    if layer.key.len() != 64
+        || !layer
+            .key
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!("{}: not a layer key: {:?}", record.display(), layer.key);
+    }
+    // Steps pass ENV to batch files, as `vk exec --env` does.
+    if let Some((k, v)) = layer
+        .env
+        .iter()
+        .find(|(k, v)| !crate::winexec::valid_var(k, v))
+    {
+        bail!(
+            "{}: ENV {k}={v:?}: a Windows guest's variables cannot hold quotes or newlines",
+            record.display()
+        );
+    }
+    let step = cache.join("layers").join(&layer.key);
+    layer.disk = if step.join("complete").exists() {
+        step.join("disk.qcow2")
+    } else if let Some(disk) = crate::winiso::cached_base(&cache.join("winiso"), &layer.key) {
+        disk
+    } else {
+        bail!(
+            "its layer {} is gone from the build cache; build it again",
+            &layer.key[..12]
+        );
+    };
+    let password = dir.join("admin-password");
+    layer.password = std::fs::read_to_string(&password)
+        .with_context(|| format!("reading {}", password.display()))?
+        .trim()
+        .to_string();
+    Ok(layer)
+}
+
+/// Read [`LAYER_RECORD`] from bundle `dir` only if it has a `version`, so a stray
+/// `layer.json` does not make a Dockerfile a Windows one.
+fn layer_record(dir: &Path) -> Option<serde_json::Value> {
+    let text = std::fs::read_to_string(dir.join(LAYER_RECORD)).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .filter(|record| record.get("version").is_some())
+}
+
+/// Where a generalize step writes its answer file, as [`SYSPREP`] names it. The next step on the
+/// generalized layer deletes it (see [`make_step`]), as it holds the Administrator password; a
+/// bundle of the generalized layer itself still has it.
+const GENERALIZE_ANSWER: &str = r"C:\vk\generalize.xml";
+
+/// Generalize the image and power off; its next boot runs [`GENERALIZE_XML`].
+const SYSPREP: &str = r"C:\Windows\System32\Sysprep\sysprep.exe /generalize /oobe /shutdown /quiet /unattend:C:\vk\generalize.xml";
+
+/// [`GENERALIZE_XML`] with the Administrator password `password`.
+fn generalize_answer(password: &str) -> String {
+    GENERALIZE_XML.replace("@PASSWORD@", &crate::winiso::xml_escape(password))
+}
+
+/// Write the answer file `answer` through `ga`, start sysprep and wait for it to power `vm` off.
+fn generalize(ga: &mut Client, answer: &str, vm: &mut crate::uefi::Guest) -> Result<()> {
+    crate::winexec::put(ga, GENERALIZE_ANSWER, answer.as_bytes())?;
+    // Sysprep powers the guest off when it is done; nothing to wait for but that.
+    crate::winexec::exec_command_line(ga, SYSPREP, &[], None, true, &mut std::io::sink())?;
+    if !vm.wait_poweroff(SYSPREP_TIMEOUT)? {
+        bail!(
+            "sysprep did not power the guest off within {}s",
+            SYSPREP_TIMEOUT.as_secs()
+        );
+    }
+    Ok(())
+}
+
+/// The answer file a generalized image's first boot runs: a fresh computer name, no OOBE
+/// pages, the image's Administrator password (`@PASSWORD@`).
+const GENERALIZE_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <ComputerName>*</ComputerName>
+      <TimeZone>UTC</TimeZone>
+    </component>
+  </settings>
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <InputLocale>en-US</InputLocale><SystemLocale>en-US</SystemLocale><UILanguage>en-US</UILanguage><UserLocale>en-US</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <UserAccounts>
+        <AdministratorPassword><Value>@PASSWORD@</Value><PlainText>true</PlainText></AdministratorPassword>
+      </UserAccounts>
+      <OOBE><HideEULAPage>true</HideEULAPage><ProtectYourPC>3</ProtectYourPC><SkipMachineOOBE>true</SkipMachineOOBE></OOBE>
+    </component>
+  </settings>
+</unattend>
+"#;
 
 /// What a stage's steps boot: its guests' size and the layer cache.
 struct Steps<'a> {
@@ -342,6 +532,7 @@ fn run_step(layer: &mut Layer, run: &parser::Run, what: &str, steps: &Steps) -> 
             &line,
             &l.env,
             l.workdir.as_deref(),
+            false,
             &mut std::io::stderr().lock(),
         )?;
         let Some(restart) = wants_restart(reboot, code) else {
@@ -641,6 +832,7 @@ fn step(
     layer.key = key;
     layer.unsaved_env.clear();
     layer.unmade_workdir = false;
+    layer.generalized = false;
     Ok(())
 }
 
@@ -679,8 +871,11 @@ fn make_step(
         steps.cpus,
         steps.mem,
     )?;
-    let mut ga = Client::connect(&vm.agent_socket(), AGENT_TIMEOUT)
-        .with_context(|| format!("qemu-ga did not answer; see {}", vm.console().display()))?;
+    let mut ga = setup_complete(&mut vm)?;
+    if layer.generalized {
+        // Best effort: the answer file only matters for the password it holds.
+        let _ = crate::winexec::cmd(&mut ga, &["del", "/f", "/q", GENERALIZE_ANSWER]);
+    }
     let workdir = layer.workdir.as_deref().filter(|_| layer.unmade_workdir);
     if let Some(script) = prepare_script(&layer.unsaved_env, workdir) {
         match crate::winexec::powershell(&mut ga, &script, "ENV/WORKDIR")? {
@@ -692,6 +887,47 @@ fn make_step(
     drop(ga);
     vm.shutdown()?;
     Ok(())
+}
+
+/// Wait until Windows has finished setting itself up — on the first boot of a generalized
+/// image, specialize and OOBE restart it after its agent is already up — and return a
+/// connection to its qemu-ga.
+fn setup_complete(vm: &mut crate::uefi::Guest) -> Result<Client> {
+    const STATE: &str =
+        r#"reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State" /v ImageState"#;
+    let deadline = Instant::now() + AGENT_TIMEOUT;
+    loop {
+        if !vm.running() {
+            bail!(
+                "the guest powered off while starting; see {}",
+                vm.console().display()
+            );
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!(
+                "Windows did not finish starting within {}s; see {}",
+                AGENT_TIMEOUT.as_secs(),
+                vm.console().display()
+            );
+        }
+        let Ok(mut ga) = Client::connect(&vm.agent_socket(), left) else {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        let mut out = Vec::new();
+        match crate::winexec::exec_command_line(&mut ga, STATE, &[], None, false, &mut out) {
+            // Setup done, or no such key (reg exits 1): an image past its first boot. Anything
+            // else, an empty answer included, is a guest still on its way, whose restart out
+            // of OOBE would kill the step's command.
+            Ok(0) if String::from_utf8_lossy(&out).contains("IMAGE_STATE_COMPLETE") => {
+                return Ok(ga);
+            }
+            Ok(1) => return Ok(ga),
+            // Still in specialize or OOBE, or restarting out of them.
+            Ok(_) | Err(_) => std::thread::sleep(Duration::from_secs(5)),
+        }
+    }
 }
 
 /// The PowerShell making `vars` machine-wide environment variables, as Docker persists `ENV` in
@@ -716,9 +952,12 @@ fn prepare_script(vars: &[(String, String)], workdir: Option<&str>) -> Option<St
 }
 
 /// Write the bundle `vk run` boots into `out`: `vm.json` (`cpus` and `mem`), an overlay over
-/// the built layer, and the Administrator password.
+/// the built layer, the Administrator password and, last, its record ([`LAYER_RECORD`]).
 fn write_bundle(layer: &Layer, cpus: u32, mem: &str, out: &Path) -> Result<()> {
     std::fs::create_dir_all(out)?;
+    // Gone until the rest is written, so a bundle half rewritten names no layer.
+    let record = out.join(LAYER_RECORD);
+    let _ = std::fs::remove_file(&record);
     let disk = out.join("disk.qcow2");
     let _ = std::fs::remove_file(&disk);
     crate::qcow2::create_overlay(&disk, &layer.disk)?;
@@ -739,6 +978,11 @@ fn write_bundle(layer: &Layer, cpus: u32, mem: &str, out: &Path) -> Result<()> {
         .mode(0o600)
         .open(&password)?;
     writeln!(file, "{}", layer.password)?;
+    let mut value = serde_json::to_value(layer)?;
+    value["version"] = LAYER_RECORD_VERSION.into();
+    let tmp = out.join(format!("{LAYER_RECORD}.tmp"));
+    std::fs::write(&tmp, serde_json::to_string_pretty(&value)?)?;
+    std::fs::rename(&tmp, &record)?;
     Ok(())
 }
 
@@ -772,18 +1016,34 @@ mod tests {
             workdir: None,
             unsaved_env: Vec::new(),
             unmade_workdir: false,
+            generalized: false,
         }
     }
 
     #[test]
+    fn sysprep_reads_the_answer_file_a_generalize_step_writes() {
+        assert!(SYSPREP.ends_with(&format!("/unattend:{GENERALIZE_ANSWER}")));
+    }
+
+    #[test]
     fn a_dockerfile_is_windows_when_a_stage_installs_or_targets_windows() {
+        let ctx = scratch("is-windows");
+        let windows = |text: &str| is_windows(text, &ctx);
         assert!(
-            is_windows("FROM winiso:ws.iso@sha256:aa --drivers=v.iso@sha256:bb AS base\nRUN x\n")
+            windows("FROM winiso:ws.iso@sha256:aa --drivers=v.iso@sha256:bb AS base\nRUN x\n")
                 .unwrap()
         );
-        assert!(is_windows("FROM --platform=windows/amd64 base\n").unwrap());
-        assert!(!is_windows("FROM alpine:3.20\nRUN apk add curl\n").unwrap());
-        assert!(is_windows("FROM\n").is_err());
+        assert!(windows("FROM --platform=windows/amd64 base\n").unwrap());
+        assert!(!windows("FROM alpine:3.20\nRUN apk add curl\n").unwrap());
+        assert!(windows("FROM\n").is_err());
+        std::fs::create_dir_all(ctx.join("base-out")).unwrap();
+        assert!(!windows("FROM base-out\n").unwrap());
+        // A stray layer.json, without the record's version, leaves the build a Linux one.
+        std::fs::write(ctx.join("base-out").join(LAYER_RECORD), "{}").unwrap();
+        assert!(!windows("FROM base-out\n").unwrap());
+        std::fs::write(ctx.join("base-out").join(LAYER_RECORD), r#"{"version":1}"#).unwrap();
+        assert!(windows("FROM base-out\n").unwrap());
+        let _ = std::fs::remove_dir_all(&ctx);
     }
 
     #[test]
@@ -853,11 +1113,21 @@ mod tests {
             let err = refusal(&format!("{WINISO}{body}"));
             assert!(err.contains(want), "{body}: {err}");
         }
-        let err = refusal(&format!("# vk: generalize=on\n{WINISO}"));
-        assert!(
-            err.contains("`# vk: generalize` is not supported yet"),
-            "{err}"
-        );
+        let directives = [
+            ("tpm=on", "`# vk: tpm` is not supported yet"),
+            ("generalize=yes", "expected on or off"),
+            ("disk=10G", "at least 20G"),
+            ("disk=lots", "at least 20G"),
+        ];
+        for (line, want) in directives {
+            let err = refusal(&format!("# vk: {line}\n{WINISO}"));
+            assert!(err.contains(want), "{line}: {err}");
+        }
+        let err = refusal("# vk: disk=60G\nFROM base\n");
+        assert!(err.contains("a winiso: stage's install only"), "{err}");
+        let sized = parsed(&format!("# vk: disk=60G generalize=on\n{WINISO}"));
+        check_stage(&sized[0], Path::new("/ctx")).unwrap();
+        assert_eq!(disk_size("60G").unwrap(), 60 << 30);
         let err = refusal("FROM base --drivers=x\n");
         assert!(
             err.contains("--drivers applies to a winiso: stage only"),
@@ -1046,5 +1316,92 @@ mod tests {
         std::fs::write(ctx.join("a.txt"), "b").unwrap();
         assert_ne!(dir_key, plan("C:/app/", None).1);
         let _ = std::fs::remove_dir_all(&ctx);
+    }
+
+    #[test]
+    fn a_bundle_names_its_layer_and_the_cache_supplies_the_disk() {
+        let root = scratch("bundle");
+        let (bundle, cache) = (root.join("out"), root.join("cache"));
+        let key = "a".repeat(64);
+        let mut built = layer();
+        built.key = key.clone();
+        built.disk = cache.join("layers").join(&key).join("disk.qcow2");
+        built.password = "secret".into();
+        built.env = vec![("A".into(), "1".into())];
+        built.workdir = Some("C:\\app".into());
+        built.generalized = true;
+        std::fs::create_dir_all(cache.join("layers").join(&key)).unwrap();
+        std::fs::write(&built.disk, vec![0; 1 << 20]).unwrap();
+        write_bundle(&built, 2, "4G", &bundle).unwrap();
+        let record = std::fs::read_to_string(bundle.join(LAYER_RECORD)).unwrap();
+        assert!(
+            !record.contains("secret") && !record.contains("disk.qcow2"),
+            "{record}"
+        );
+        assert!(!bundle.join(format!("{LAYER_RECORD}.tmp")).exists());
+        let err = format!("{:#}", bundle_layer(&bundle, &cache).unwrap_err());
+        assert!(err.contains("gone from the build cache"), "{err}");
+        let step = cache.join("layers").join(&key);
+        std::fs::write(step.join("complete"), "").unwrap();
+        let loaded = bundle_layer(&bundle, &cache).unwrap();
+        assert_eq!(loaded.disk, step.join("disk.qcow2"));
+        assert_eq!(loaded.password, "secret");
+        assert!(loaded.generalized);
+        // A step on it keys as one on the layer the bundle recorded.
+        assert_eq!(step_key(&loaded, "RUN\0x"), step_key(&built, "RUN\0x"));
+        assert_eq!((loaded.env, loaded.workdir), (built.env, built.workdir));
+        let refused = [
+            (record.replace(&key, "../../etc"), "not a layer key"),
+            (
+                record.replace("\"version\": 1", "\"version\": 2"),
+                "version 2",
+            ),
+            (record.replace("\"1\"", "\"a\\\"b\""), "cannot hold quotes"),
+            (
+                record.replace("\"1\"", "\"a\\r\\nb\""),
+                "cannot hold quotes",
+            ),
+        ];
+        for (forged, want) in refused {
+            assert_ne!(forged, record, "{want}");
+            std::fs::write(bundle.join(LAYER_RECORD), forged).unwrap();
+            let err = format!("{:#}", bundle_layer(&bundle, &cache).unwrap_err());
+            assert!(err.contains(want), "{want}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bundle_on_the_installed_base_finds_its_disk_in_the_winiso_cache() {
+        let root = scratch("bundle-base");
+        let (bundle, cache) = (root.join("out"), root.join("cache"));
+        let key = "b".repeat(64);
+        let settled = cache.join("winiso").join("settled").join(&key);
+        std::fs::create_dir_all(&settled).unwrap();
+        std::fs::write(settled.join("base.json"), "{}").unwrap();
+        std::fs::create_dir_all(&bundle).unwrap();
+        let mut record = serde_json::to_value(layer()).unwrap();
+        record["key"] = key.into();
+        record["version"] = LAYER_RECORD_VERSION.into();
+        std::fs::write(bundle.join(LAYER_RECORD), record.to_string()).unwrap();
+        std::fs::write(bundle.join("admin-password"), "pw\n").unwrap();
+        let loaded = bundle_layer(&bundle, &cache).unwrap();
+        assert_eq!(loaded.disk, settled.join("disk.qcow2"));
+        assert_eq!(loaded.password, "pw");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_generalize_answer_carries_the_password_escaped_and_keys_the_step() {
+        let answer = generalize_answer("a&<b");
+        assert!(answer.contains("<Value>a&amp;&lt;b</Value>"), "{answer}");
+        let key = |password: &str| {
+            step_key(
+                &layer(),
+                &format!("GENERALIZE\0{}", generalize_answer(password)),
+            )
+        };
+        assert_ne!(key("one"), key("two"));
+        assert_eq!(key("one"), key("one"));
     }
 }

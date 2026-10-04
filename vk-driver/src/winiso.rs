@@ -289,6 +289,14 @@ pub(crate) struct Base {
     pub key: String,
 }
 
+/// The disk of the base layer `key` if `cache` holds it.
+pub(crate) fn cached_base(cache: &Path, key: &str) -> Option<PathBuf> {
+    let dir = cache.join("settled").join(key);
+    dir.join("base.json")
+        .is_file()
+        .then(|| dir.join("disk.qcow2"))
+}
+
 /// The virtio-win directory of the Windows `edition` names, if vk knows it.
 fn edition_dir(edition: &str) -> Option<&'static str> {
     let edition = edition.to_ascii_lowercase();
@@ -610,7 +618,7 @@ fn random_password() -> Result<String> {
     Ok(format!("Vk-{body}-9a"))
 }
 
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
