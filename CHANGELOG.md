@@ -22,7 +22,8 @@ All notable changes to virtkit will be documented in this file.
   variable, `WORKDIR` (created as in Docker) and `SHELL` apply; `USER` (steps run as SYSTEM),
   `ARG`, `ADD` and `COPY --from` are refused. A step has no network unless its `RUN` says
   `--network=default` (a domain controller's promotion wants one; `--build-net none` refuses
-  it). `CMD` is recorded in the bundle as the image's provisioning; `ENTRYPOINT` is refused.
+  it). `CMD` is recorded in the bundle as the image's provisioning, the command a compose service
+  runs at each start; `ENTRYPOINT` is refused.
   `--out <dir>` writes a bundle `vk run` boots, with the password in `admin-password`; every
   image built on the same cached install shares that password. Another Windows Dockerfile can
   start `FROM` that bundle's directory and reuses its cached layers; this works only on the machine whose build cache made the bundle.
@@ -31,6 +32,25 @@ All notable changes to virtkit will be documented in this file.
   copy boots with its own name and SID (generalizing again an image built from a generalized
   one runs sysprep again, which Windows allows only a limited number of times); every step
   first waits for Windows to finish setting itself up.
+- **Compose services can be Windows machines.** A service whose `image:` is a path to a
+  bundle (`image: ./dc-out`) boots it as a UEFI guest on the run's LAN, at the address its
+  service name resolves to. Each start is a new machine (fresh disk overlays, a new VM
+  generation ID) and is up once its provisioning has run: the compose `command:` (a Windows
+  command line), else the image's `CMD`, run as SYSTEM with `VK_HOSTNAME`, `VK_IP`,
+  `VK_PREFIX` and `VK_GATEWAY` set ahead of the service's `environment:`, which can override
+  them. Its exit code 3010 or 1641 restarts Windows and runs it again, so a script that
+  renames the machine or joins a domain finishes after the restart; a service that
+  `depends_on` it starts after that. Stopping the run, `vk service stop` and `vk service
+  restart` press the guest's power button and give it three minutes to power off (a domain
+  controller is slow to). The guest gets 2 vCPUs and 4G unless `vm.json`, `x-virtkit.cpus`/
+  `mem` or `--service-cpus`/`--service-mem` say otherwise; volumes, `entrypoint`, `user`,
+  every other `x-virtkit` key and `--service-nics` above 1 are refused, and a Windows service
+  is a sibling only (not `--primary`, not in CI jobs). A Ctrl-C stops a services-only run's
+  Windows guests with their power button, during their starts too, where a second Ctrl-C
+  ends `vk` at once. In a foreground run with a primary VM, Ctrl-C kills every guest at once; `vk stop`
+  powers them off. A SIGTERM, or a `--detach` run's Ctrl-C, during the services' starts (Linux
+  ones too) now goes through the run's teardown instead of ending it at once; the exit code is
+  unchanged (130 or 143).
 - **`vk run` boots a UEFI guest, such as an installed Windows Server, from a local bundle.**
   A directory holding `vm.json` (`{"firmware": "uefi", "cpus": 2, "mem": "4G", "disks":
   ["disk.qcow2"]}`) and its named disks boots with embedded UEFI firmware and no vk-agent.

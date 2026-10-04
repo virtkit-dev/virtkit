@@ -566,7 +566,7 @@ fn settle(dir: &Path, disk: &Path, cpus: u32, mem: &str) -> Result<String> {
             ),
             Ok((mut ga, 3010)) if attempts < SETTLE_ATTEMPTS => {
                 eprintln!("virtkit: winiso: servicing wants a restart");
-                crate::winexec::restart(&mut ga, &mut || guest.running())?;
+                crate::winexec::restart(&mut ga, 3010, &mut || guest.running())?;
             }
             Ok((_, code)) => bail!(
                 "settling the install failed ({code}); see {}",

@@ -37,7 +37,7 @@ pub(crate) const GUEST_AGENT_SOCKET: &str = "qga.sock";
 pub(crate) const CONSOLE_SOCKET: &str = "console.sock";
 
 /// The run directory's VM generation ID, beside the disk overlays it belongs to.
-const GENERATION_ID: &str = "vmgenid";
+pub(crate) const GENERATION_ID: &str = "vmgenid";
 
 /// How long a guest has to answer the ACPI power button before vk asks its qemu-ga to shut it
 /// down instead (a Windows guest can be set to ignore the button).
@@ -79,15 +79,18 @@ impl Bundle {
     /// anything else (an image reference goes on to the OCI path).
     pub fn detect(image: &str) -> Result<Option<Bundle>> {
         let dir = Path::new(image);
-        let manifest = dir.join(MANIFEST);
-        if !dir.is_dir() || !manifest.is_file() {
+        if !dir.is_dir() || !dir.join(MANIFEST).is_file() {
             return Ok(None);
         }
-        let dir = std::fs::canonicalize(dir).with_context(|| format!("bundle {image}"))?;
-        Ok(Some(Bundle {
-            manifest: Self::parse(&manifest)?,
-            dir,
-        }))
+        Self::open(dir).map(Some)
+    }
+
+    /// The bundle at `dir`, a directory holding a `vm.json`.
+    pub(crate) fn open(dir: &Path) -> Result<Bundle> {
+        Ok(Bundle {
+            manifest: Self::parse(&dir.join(MANIFEST))?,
+            dir: std::fs::canonicalize(dir).with_context(|| format!("bundle {}", dir.display()))?,
+        })
     }
 
     fn parse(path: &Path) -> Result<Manifest> {
@@ -105,7 +108,7 @@ impl Bundle {
     }
 
     /// The bundle's disks as absolute paths, each checked to exist.
-    fn disks(&self) -> Result<Vec<PathBuf>> {
+    pub(crate) fn disks(&self) -> Result<Vec<PathBuf>> {
         self.manifest
             .disks
             .iter()
@@ -130,7 +133,7 @@ impl Bundle {
 /// The firmware image to boot: [`FIRMWARE_ENV`], else the copy embedded in `vk` (a memfd the
 /// VMM inherits, held open by the returned [`crate::embed::Resolved`]), else the on-disk
 /// default.
-fn firmware() -> Result<crate::embed::Resolved> {
+pub(crate) fn firmware() -> Result<crate::embed::Resolved> {
     let explicit = std::env::var_os(FIRMWARE_ENV)
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
@@ -146,7 +149,7 @@ fn firmware() -> Result<crate::embed::Resolved> {
 
 /// One overlay per bundle disk in `work`, reused when it is already there (a `--state-dir`
 /// run picks up the guest's disk where the last one left it) and over the same disk.
-fn overlays(disks: &[PathBuf], work: &Path) -> Result<Vec<Disk>> {
+pub(crate) fn overlays(disks: &[PathBuf], work: &Path) -> Result<Vec<Disk>> {
     disks
         .iter()
         .enumerate()
@@ -312,6 +315,31 @@ async fn power_off(ch: &mut Child, work: &Path, grace: Duration) -> Option<Durat
     exited_by(ch, deadline).await.then(|| pressed.elapsed())
 }
 
+/// [`power_off`] from synchronous code, on a thread of its own (so it can block whether or not
+/// the caller is inside a runtime). A guest already off counts as off at once. Each call costs
+/// a thread and a runtime: `Manager::stop_all` makes one per Windows unit, a handful at most.
+pub(crate) fn power_off_blocking(
+    ch: &mut Child,
+    work: &Path,
+    grace: Duration,
+) -> Result<Option<Duration>> {
+    if ch.try_wait().ok().flatten().is_some() {
+        return Ok(Some(Duration::ZERO));
+    }
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                Ok(tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("starting a runtime to stop the guest")?
+                    .block_on(power_off(ch, work, grace)))
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("stopping the guest panicked"))?
+    })
+}
+
 /// Wait until the Windows guest behind the qemu-ga `socket` has finished starting — on the
 /// first boot of a generalized image, specialize and OOBE restart it once its agent is already
 /// up — and return a connection to its qemu-ga. `running` says whether the guest is still up;
@@ -434,16 +462,7 @@ impl Guest {
         if !self.running() {
             return Ok(Duration::ZERO);
         }
-        let stop = power_off(&mut self.ch, &self.work, BUILD_STOP_GRACE);
-        let off = match tokio::runtime::Handle::try_current() {
-            Ok(rt) => rt.block_on(stop),
-            Err(_) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("starting a runtime to stop the guest")?
-                .block_on(stop),
-        };
-        match off {
+        match power_off_blocking(&mut self.ch, &self.work, BUILD_STOP_GRACE)? {
             Some(after) => Ok(after),
             None => bail!(
                 "the guest did not power off within {}s and was killed",

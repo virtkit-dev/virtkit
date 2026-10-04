@@ -203,6 +203,7 @@ pub fn unit_image_id(
         crate::compose::Source::Build { .. } => {
             build_unit_ext4(state_dir, global_build_args, unit)?
         }
+        crate::compose::Source::Bundle { dir, .. } => dir.clone(),
     };
     Ok(path.to_string_lossy().into_owned())
 }
@@ -226,7 +227,7 @@ pub fn ensure_unit_build_sync(
     build: &BuildOpts,
     sink: Option<crate::build::ProgressSink>,
 ) -> Result<(PathBuf, RunConfig, crate::cachelock::Guard)> {
-    if let crate::compose::Source::Image(_) = &unit.source {
+    if let crate::compose::Source::Image(_) | crate::compose::Source::Bundle { .. } = &unit.source {
         anyhow::bail!(
             "on-demand start of the image: service {:?} is not supported — \
              image services are materialized up front",
@@ -293,6 +294,11 @@ pub fn provision(
                 crate::compose::merged_config(&RunConfig::default(), unit),
             )
         }
+        // A Windows unit: `ext4` is its bundle directory, which `winsvc` boots.
+        crate::compose::Source::Bundle { dir, .. } => (
+            dir.clone(),
+            crate::compose::merged_config(&RunConfig::default(), unit),
+        ),
     };
     provisioned(unit, ext4, config, siting)
 }
@@ -445,6 +451,9 @@ impl ExtraNics {
 /// to gate on each service's readiness. Mirrors the primary path's port.
 pub const VSOCK_PORT: u32 = 4444;
 
+/// A unit's base vsock socket, in its runtime dir: the VMM's, and the switch's for its NICs.
+pub(crate) const VSOCK_SOCKET: &str = "vsock.sock";
+
 /// Boot one unit in `dir` (its runtime state: overlay, sockets, console, boot
 /// initramfs — distinct from where the image lives): a throwaway CoW overlay over
 /// its clean ext4, booted through the agent initramfs which also carries the unit's
@@ -471,7 +480,7 @@ pub fn boot_unit(
             svc.name
         );
     }
-    let vsock = dir.join("vsock.sock");
+    let vsock = dir.join(VSOCK_SOCKET);
     let console = dir.join(crate::run::CONSOLE_LOG);
 
     // The image's content identity keys every persistence this unit opted into (its root, its

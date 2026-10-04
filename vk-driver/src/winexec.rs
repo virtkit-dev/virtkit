@@ -211,7 +211,7 @@ pub fn check_command(argv: &[String], dir: Option<&str>) -> Result<()> {
 }
 
 /// Refuse a command line or working directory a batch file cannot carry.
-fn check_line(command_line: &str, dir: Option<&str>) -> Result<()> {
+pub(crate) fn check_line(command_line: &str, dir: Option<&str>) -> Result<()> {
     if command_line.contains(['\r', '\n']) {
         bail!("{command_line:?}: a Windows guest's command line cannot hold newlines");
     }
@@ -333,13 +333,31 @@ fn run_ps1_command_line(path: &str) -> String {
 /// How long [`restart`] waits for the guest's agent to stop answering.
 const RESTART_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// Restart the guest through `ga` and wait until its agent stops answering, so that the next
-/// connection reaches the agent of the restarted guest rather than syncing with this one;
-/// `running` tells whether the guest is still up.
-pub(crate) fn restart(ga: &mut Client, running: &mut dyn FnMut() -> bool) -> Result<()> {
-    ga.exec("shutdown.exe", &["/r", "/t", "0"].map(String::from), false)?;
+/// The exit code of a command that has started Windows restarting
+/// (`ERROR_SUCCESS_REBOOT_INITIATED`).
+pub(crate) const RESTART_INITIATED: i32 = 1641;
+
+/// Restart the guest through `ga`, after a command that exited `code`, and wait until its agent
+/// stops answering, so that the next connection reaches the agent of the restarted guest rather
+/// than syncing with this one; `running` tells whether the guest is still up. After
+/// [`RESTART_INITIATED`], Windows is restarting already: its agent may refuse the restart asked
+/// on top, which is no failure.
+pub(crate) fn restart(ga: &mut Client, code: i32, running: &mut dyn FnMut() -> bool) -> Result<()> {
+    let asked = ga.exec("shutdown.exe", &["/r", "/t", "0"].map(String::from), false);
+    if code != RESTART_INITIATED {
+        asked?;
+    }
     let deadline = Instant::now() + RESTART_TIMEOUT;
-    while ga.call("guest-ping", None, Duration::from_secs(5)).is_ok() {
+    // Gone after two missed pings in a row: a busy guest can miss one.
+    let mut missed = 0;
+    loop {
+        missed = match ga.call("guest-ping", None, Duration::from_secs(5)) {
+            Ok(_) => 0,
+            Err(_) => missed + 1,
+        };
+        if missed == 2 {
+            return Ok(());
+        }
         if !running() {
             bail!("the guest powered off instead of restarting");
         }
@@ -348,7 +366,6 @@ pub(crate) fn restart(ga: &mut Client, running: &mut dyn FnMut() -> bool) -> Res
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-    Ok(())
 }
 
 /// Run `argv` in the guest behind `socket`, stream its output to stdout and return its exit
@@ -714,26 +731,37 @@ mod tests {
         use crate::qga::tests::{client, synced};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let agent = |answered: usize| {
+        // Answer pings according to `answers`; refuse `guest-exec` unless `exec`.
+        let agent = |answers: fn(usize) -> bool, exec: bool| {
             let pings = Arc::new(AtomicUsize::new(0));
             let seen = pings.clone();
+            let refused = b"{\"error\": {\"class\": \"GenericError\", \"desc\": \"gone\"}}\n";
             let ga = client(move |request| match request["execute"].as_str() {
                 Some("guest-sync-delimited") => synced(request),
-                Some("guest-exec") => b"{\"return\": {\"pid\": 1}}\n".to_vec(),
-                Some("guest-ping") if seen.fetch_add(1, Ordering::SeqCst) < answered => {
+                Some("guest-exec") if exec => b"{\"return\": {\"pid\": 1}}\n".to_vec(),
+                Some("guest-ping") if answers(seen.fetch_add(1, Ordering::SeqCst)) => {
                     b"{\"return\": {}}\n".to_vec()
                 }
-                _ => b"{\"error\": {\"class\": \"GenericError\", \"desc\": \"gone\"}}\n".to_vec(),
+                _ => refused.to_vec(),
             });
             (ga, pings)
         };
-        // The old agent answers twice more, then is gone.
-        let (mut ga, pings) = agent(2);
-        restart(&mut ga, &mut || true).unwrap();
-        assert_eq!(pings.load(Ordering::SeqCst), 3);
+        // The old agent answers twice more, then is gone: two missed pings tell.
+        let (mut ga, pings) = agent(|n| n < 2, true);
+        restart(&mut ga, 3010, &mut || true).unwrap();
+        assert_eq!(pings.load(Ordering::SeqCst), 4);
+        // One missed ping between answers is not the agent gone.
+        let (mut ga, pings) = agent(|n| n != 1 && n < 3, true);
+        restart(&mut ga, 3010, &mut || true).unwrap();
+        assert_eq!(pings.load(Ordering::SeqCst), 5);
+        // A refused restart fails, unless Windows is restarting already.
+        let (mut ga, _) = agent(|_| false, false);
+        assert!(restart(&mut ga, 3010, &mut || true).is_err());
+        let (mut ga, _) = agent(|_| false, false);
+        restart(&mut ga, RESTART_INITIATED, &mut || true).unwrap();
         // A guest that powers off instead is no restart.
-        let (mut ga, _) = agent(usize::MAX);
-        let err = restart(&mut ga, &mut || false).unwrap_err();
+        let (mut ga, _) = agent(|_| true, true);
+        let err = restart(&mut ga, 3010, &mut || false).unwrap_err();
         assert!(err.to_string().contains("powered off"), "{err}");
     }
 

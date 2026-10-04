@@ -1103,11 +1103,20 @@ fn compose_service_units(fleet: &ComposeFleet) -> Result<Vec<crate::compose::Uni
         .collect())
 }
 
+/// Why a CI job does not boot the Windows service `unit`.
+fn windows_service_refused(unit: &crate::compose::Unit) -> anyhow::Error {
+    anyhow!(
+        "service {}: a Windows bundle runs under `vk run --compose`, not in a CI job",
+        unit.name
+    )
+}
+
 /// Resolve one compose unit to boot media: a `build:` unit is built into the shared build tier
 /// (from the host checkout), an `image:` unit resolves through the shared image cache. Its
 /// compose `environment`/`user` overrides are merged into the boot config either way.
 fn compose_unit_media(ctx: &JobCtx, unit: &crate::compose::Unit) -> Result<BootPlan> {
     match &unit.source {
+        crate::compose::Source::Bundle { .. } => Err(windows_service_refused(unit)),
         crate::compose::Source::Build { .. } => {
             let (rootfs, config, guard) = build_compose_unit(ctx, unit)?;
             Ok(BootPlan {
@@ -1892,12 +1901,14 @@ fn tools_problem(out: &[u8]) -> Option<String> {
     )
 }
 
-/// Where a CI service's image comes from — the three-way choice [`plan_services`] makes.
+/// Where a CI service's image comes from — the choice [`plan_services`] makes.
 #[derive(Debug, PartialEq, Eq)]
 enum ServiceMedia<'a> {
     Git(&'a str),
     Build,
     Image,
+    /// a Windows bundle, which a CI job does not boot
+    Bundle,
 }
 
 /// [`ServiceMedia`] for one unit's source. Split out so the choice itself is testable:
@@ -1910,6 +1921,7 @@ fn service_media(source: &crate::compose::Source) -> ServiceMedia<'_> {
             None => ServiceMedia::Image,
         },
         crate::compose::Source::Build { .. } => ServiceMedia::Build,
+        crate::compose::Source::Bundle { .. } => ServiceMedia::Bundle,
     }
 }
 
@@ -1954,6 +1966,7 @@ fn plan_services(
             extra_ips,
         };
         let prov = match service_media(&unit.source) {
+            ServiceMedia::Bundle => return Err(windows_service_refused(&unit)),
             ServiceMedia::Git(spec) => {
                 let (ext4, config, guard) =
                     build_git_image(ctx, spec).with_context(|| format!("service {}", unit.name))?;
@@ -4767,6 +4780,14 @@ mod tests {
         assert_eq!(
             service_media(&Source::Image("alpine:3.21".into())),
             ServiceMedia::Image
+        );
+        // A Windows bundle is a media of its own, which `plan_services` refuses.
+        assert_eq!(
+            service_media(&Source::Bundle {
+                dir: PathBuf::from("/b/win"),
+                command: None,
+            }),
+            ServiceMedia::Bundle
         );
     }
 
