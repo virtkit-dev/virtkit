@@ -150,6 +150,9 @@ pub enum Source {
         /// the compose `command:` as a Windows command line (`CreateProcess`'s), which
         /// replaces the image's provisioning
         command: Option<String>,
+        /// `dir` is the service's snapshot (`vk run --compose --from-snapshot`), which resumes
+        /// provisioned already
+        snapshot: bool,
     },
 }
 
@@ -927,7 +930,11 @@ fn map_service(
         .unwrap_or_else(|| virtkit_dir(base));
     let mut source = match (svc.image, svc.build) {
         (Some(image), None) => match bundle_image(&image, base)? {
-            Some(dir) => Source::Bundle { dir, command: None },
+            Some(dir) => Source::Bundle {
+                dir,
+                command: None,
+                snapshot: false,
+            },
             None => Source::Image(image),
         },
         (None, Some(build)) => map_build(build, base)?,
@@ -2426,7 +2433,7 @@ mod tests {
         let bundle = std::fs::canonicalize(base.0.join("win")).unwrap();
         let by = |name: &str| units.iter().find(|u| u.name == name).unwrap();
         let command_line = |name: &str| match &by(name).source {
-            Source::Bundle { dir, command } => {
+            Source::Bundle { dir, command, .. } => {
                 assert_eq!(*dir, bundle);
                 assert_eq!(by(name).command, None);
                 command.clone()

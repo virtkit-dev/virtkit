@@ -32,6 +32,22 @@ All notable changes to virtkit will be documented in this file.
   copy boots with its own name and SID (generalizing again an image built from a generalized
   one runs sysprep again, which Windows allows only a limited number of times); every step
   first waits for Windows to finish setting itself up.
+- **`vk snapshot` saves a running Windows VM, and `vk run` starts it again from there.**
+  `vk snapshot <pid> --out <dir>` writes a bundle holding the VM's memory (a sparse image),
+  its CPU and device state and its disks as they were, and ends the VM; `vk run <dir>` (with
+  `--net` if it was on the network) restores it instead of booting, on fresh overlays each
+  time, so one snapshot serves any number of runs. `--out` must be on the run's filesystem
+  (the disks are hard-linked, not copied), and a snapshot depends on the bundle it was taken
+  from (and that one's own base, for a snapshot of a snapshot): moving or deleting it breaks
+  the snapshot. The restored guest carries on where it was, without rebooting, under a new VM
+  generation ID (so a domain controller knows it is a copy), and its clock is set to the
+  host's through qemu-ga (Kerberos may fail until it is). A Windows Server 2025
+  guest snapshots in about 4 s and answers again 2.6 s after `vk run`. A whole compose run
+  works the same way: `vk snapshot --run-dir <state dir> --out <dir>` pauses every Windows
+  service of the run, then saves each into `<dir>/<service>`, and `vk run --compose …
+  --from-snapshot <dir>` resumes each from there, skipping its provisioning (the lab's
+  Linux services boot as usual): the AD lab of `examples/windows` (a DC and two joined
+  members) is back in 15 s, Kerberos working.
 - **`vk pause` and `vk resume`.** A running UEFI guest (a `vk run` of a bundle) can be frozen
   in place and run again: its vCPUs stop at an instruction boundary, memory and devices kept,
   and its clock is right on resume. Linux guests and Windows compose services cannot be paused

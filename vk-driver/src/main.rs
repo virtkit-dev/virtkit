@@ -74,6 +74,7 @@ mod services;
 mod shell;
 mod shutdown;
 mod sites;
+mod snapshot;
 mod source;
 mod spawn;
 mod sshagent;
@@ -1894,6 +1895,18 @@ enum Cmd {
             help_heading = "Compose services"
         )]
         primary: Option<String>,
+        /// start each Windows service from its snapshot in this directory
+        ///
+        /// A directory `vk snapshot --run-dir` wrote: a Windows service with a bundle there
+        /// resumes from it instead of booting and provisioning; the others boot as usual. Each
+        /// must get the address, vCPUs and memory it was snapshotted with.
+        #[arg(
+            long,
+            value_name = "DIR",
+            requires = "compose",
+            help_heading = "Compose services"
+        )]
+        from_snapshot: Option<PathBuf>,
         /// override a compose service's vCPU count (repeatable)
         ///
         /// Wins over its x-virtkit.cpus declaration.
@@ -2290,6 +2303,31 @@ enum Cmd {
         /// pause every running vk VM that can be
         #[arg(long, conflicts_with = "target")]
         all: bool,
+    },
+    /// Snapshot a running UEFI VM, or a compose run's Windows services, ending them
+    ///
+    /// The bundle at `--out` holds the VM's memory, its CPU and device state and its disks as
+    /// they were; `vk run <bundle>` starts from there instead of booting, as often as wanted,
+    /// each time on fresh overlays. Selects the VM whose project is the current directory by
+    /// default; pass a pid or a project directory. With `--run-dir`, every Windows service of
+    /// the compose run with that state directory is paused, then saved into `--out/<service>`,
+    /// for `vk run --compose … --from-snapshot`.
+    ///
+    /// A snapshot's disks are overlays of the bundle the VM ran (and of any snapshot that one
+    /// came from), named by path: moving or deleting that bundle breaks the snapshot. A
+    /// restored guest's clock is set through qemu-ga once it answers; until then, or if that
+    /// fails, Kerberos may fail.
+    #[command(display_order = 8)]
+    Snapshot {
+        /// the VM to snapshot: a PID or a project directory (default: the current directory)
+        #[arg(value_name = "PID|DIR", conflicts_with = "run_dir")]
+        target: Option<std::ffi::OsString>,
+        /// snapshot the Windows services of the compose run with this state directory
+        #[arg(long, value_name = "DIR")]
+        run_dir: Option<PathBuf>,
+        /// the bundle directory to create, on the run's filesystem
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
     },
     /// Run a VM `vk pause` froze again
     #[command(display_order = 8)]
@@ -3134,6 +3172,30 @@ async fn cli_main(cli: Cli) -> ExitCode {
     if let Cmd::Reboot { target, all, force } = &cli.cmd {
         return act_on_vms(target.as_deref(), |sel| vms::reboot_cmd(sel, *all, *force));
     }
+    if let Cmd::Snapshot {
+        run_dir: Some(run_dir),
+        out,
+        ..
+    } = &cli.cmd
+    {
+        return match snapshot::snapshot_run(run_dir, out) {
+            Ok(report) => write_report(&report),
+            Err(e) => fail(&e, 1),
+        };
+    }
+    if let Cmd::Snapshot { target, out, .. } = &cli.cmd {
+        let selector = match target.as_deref().map(vms::Selector::parse).transpose() {
+            Ok(sel) => sel,
+            Err(e) => {
+                eprintln!("vk: {e:#}");
+                return exit_code(2);
+            }
+        };
+        return match vms::snapshot_cmd(selector, out) {
+            Ok(report) => write_report(&report),
+            Err(e) => fail(&e, 1),
+        };
+    }
     if let Cmd::Pause { target, all } | Cmd::Resume { target, all } = &cli.cmd {
         let req = if matches!(cli.cmd, Cmd::Pause { .. }) {
             vms::PauseRequest::Pause
@@ -3217,6 +3279,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         compose,
         profile,
         primary,
+        from_snapshot,
         service_cpus,
         service_mem,
         reclaim,
@@ -3431,6 +3494,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             compose: compose.clone(),
             profiles: profile.clone(),
             primary: primary.clone(),
+            from_snapshot: from_snapshot.clone(),
             build_net: bnet,
             ssh_agent: *ssh_agent,
             ssh_hosts: ssh_host.clone(),
@@ -4791,6 +4855,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         | Cmd::Reboot { .. }
         | Cmd::Pause { .. }
         | Cmd::Resume { .. }
+        | Cmd::Snapshot { .. }
         | Cmd::Update { .. }
         | Cmd::Toolchain { .. }
         | Cmd::HostPolicy { .. }
@@ -6760,6 +6825,7 @@ mod tests {
                 "reboot",
                 "resume",
                 "run",
+                "snapshot",
                 "ssh",
                 "ssh-config",
                 "status",
