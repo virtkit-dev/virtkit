@@ -57,6 +57,7 @@ pub struct Unit {
     /// [`resolve_env_files`] reads them after untrusted callers have vetted the paths.
     pub env_files: Vec<(PathBuf, bool)>,
     pub entrypoint: Option<Vec<String>>,
+    /// `None` for a [`Source::Bundle`], which carries its command line itself.
     pub command: Option<Vec<String>>,
     pub user: Option<String>,
     /// services that must be started before this one (ordering only)
@@ -128,6 +129,14 @@ pub enum Source {
         build_contexts: Vec<(String, PathBuf)>,
         target: Option<String>,
         args: Vec<(String, String)>,
+    },
+    /// A UEFI bundle directory (`vm.json` + disks — what `vk build` makes of a Windows
+    /// Dockerfile), named by an `image:` path; booted by [`crate::winsvc`].
+    Bundle {
+        dir: PathBuf,
+        /// the compose `command:` as a Windows command line (`CreateProcess`'s), which
+        /// replaces the image's provisioning
+        command: Option<String>,
     },
 }
 
@@ -826,6 +835,26 @@ fn is_dns_label(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// The bundle directory an `image:` names, resolved against the compose dir: a path (it starts
+/// with `.` or `/`, which no image reference does) to a directory holding `vm.json`. `None`
+/// for an image reference; an error for a path that is not a bundle.
+fn bundle_image(image: &str, base: &Path) -> Result<Option<PathBuf>> {
+    if !image.starts_with('.') && !image.starts_with('/') {
+        return Ok(None);
+    }
+    let dir = base.join(image);
+    if !dir.join(crate::uefi::MANIFEST).is_file() {
+        bail!(
+            "image {image:?} is a path but {} holds no {}",
+            dir.display(),
+            crate::uefi::MANIFEST
+        );
+    }
+    std::fs::canonicalize(&dir)
+        .map(Some)
+        .with_context(|| format!("image {image:?}"))
+}
+
 fn map_service(
     name: &str,
     svc: ComposeService,
@@ -843,8 +872,11 @@ fn map_service(
     let anchor = persist_anchor
         .map(Path::to_path_buf)
         .unwrap_or_else(|| virtkit_dir(base));
-    let source = match (svc.image, svc.build) {
-        (Some(image), None) => Source::Image(image),
+    let mut source = match (svc.image, svc.build) {
+        (Some(image), None) => match bundle_image(&image, base)? {
+            Some(dir) => Source::Bundle { dir, command: None },
+            None => Source::Image(image),
+        },
         (None, Some(build)) => map_build(build, base)?,
         (Some(_), Some(_)) => bail!("give either image: or build:, not both"),
         (None, None) => bail!("needs image: or build:"),
@@ -928,6 +960,39 @@ fn map_service(
         environment.retain(|(name, _)| name != &k);
         environment.push((k, v));
     }
+    let command = match &mut source {
+        Source::Bundle { command, .. } => {
+            let unsupported = [
+                (!volumes.is_empty(), "volumes"),
+                (svc.entrypoint.is_some(), "entrypoint"),
+                (svc.user.is_some(), "user"),
+                (init != crate::run::InitSource::Default, "x-virtkit.init"),
+                (
+                    kernel != crate::run::KernelSource::Default,
+                    "x-virtkit.kernel",
+                ),
+                (reclaim.is_some(), "x-virtkit.reclaim"),
+                (dax.is_some(), "x-virtkit.dax"),
+                (nested, "x-virtkit.nested"),
+                (nics != 1, "x-virtkit.nics"),
+                (tap.is_some(), "x-virtkit.tap"),
+                (persist_root, "x-virtkit.persist_root"),
+            ];
+            if let Some((_, key)) = unsupported.iter().find(|(set, _)| *set) {
+                bail!("service {name:?} boots a Windows bundle, which takes no `{key}`");
+            }
+            *command = svc.command.map(|cmd| match cmd {
+                Cmd::Str(line) => line,
+                Cmd::List(argv) => argv
+                    .iter()
+                    .map(|a| crate::winexec::quote_arg(a))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            });
+            None
+        }
+        _ => svc.command.map(Cmd::into_argv).transpose()?,
+    };
     Ok(Unit {
         name: name.to_string(),
         hostname,
@@ -935,7 +1000,7 @@ fn map_service(
         environment,
         env_files,
         entrypoint: svc.entrypoint.map(Cmd::into_argv).transpose()?,
-        command: svc.command.map(Cmd::into_argv).transpose()?,
+        command,
         user: svc.user,
         depends_on,
         volumes,
@@ -2159,6 +2224,92 @@ mod tests {
 
     fn one(yaml: &str) -> Unit {
         parse(yaml, Path::new("/base")).unwrap().pop().unwrap()
+    }
+
+    /// A compose dir holding the bundle `win` (a `vm.json` and nothing else), removed when
+    /// dropped.
+    struct BundleDir(PathBuf);
+
+    impl BundleDir {
+        fn new(name: &str) -> BundleDir {
+            let dir =
+                std::env::temp_dir().join(format!("vk-compose-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("win")).unwrap();
+            std::fs::write(dir.join("win").join(crate::uefi::MANIFEST), "{}").unwrap();
+            BundleDir(dir)
+        }
+    }
+
+    impl Drop for BundleDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn an_image_path_to_a_bundle_is_a_windows_service_and_its_command_a_command_line() {
+        let base = BundleDir::new("bundle");
+        let units = parse(
+            "services:\n  dc:\n    image: ./win\n    command: powershell -File C:\\vk\\dc.ps1\n\
+             \x20 member:\n    image: ./win\n    command: [\"C:\\\\Program Files\\\\x.exe\", \"/q\"]\n\
+             \x20 web:\n    image: nginx\n",
+            &base.0,
+        )
+        .unwrap();
+        let bundle = std::fs::canonicalize(base.0.join("win")).unwrap();
+        let by = |name: &str| units.iter().find(|u| u.name == name).unwrap();
+        let command_line = |name: &str| match &by(name).source {
+            Source::Bundle { dir, command } => {
+                assert_eq!(*dir, bundle);
+                assert_eq!(by(name).command, None);
+                command.clone()
+            }
+            other => panic!("{name}: {other:?}"),
+        };
+        // The string form is the command line as written; backslashes are not escapes.
+        assert_eq!(
+            command_line("dc").as_deref(),
+            Some(r"powershell -File C:\vk\dc.ps1")
+        );
+        assert_eq!(
+            command_line("member").as_deref(),
+            Some(r#""C:\Program Files\x.exe" /q"#)
+        );
+        assert!(matches!(&by("web").source, Source::Image(i) if i == "nginx"));
+    }
+
+    #[test]
+    fn an_image_path_without_a_bundle_or_a_bundle_with_linux_keys_is_refused() {
+        let base = BundleDir::new("bundle-refused");
+        let err = parse("services:\n  dc:\n    image: ./nothing\n", &base.0).unwrap_err();
+        assert!(format!("{err:#}").contains("holds no vm.json"), "{err:#}");
+        for (key, yaml) in [
+            ("volumes", "    volumes: [\"./x:/x\"]\n"),
+            ("entrypoint", "    entrypoint: [\"x\"]\n"),
+            ("user", "    user: admin\n"),
+            ("x-virtkit.init", "    x-virtkit:\n      init: image\n"),
+            ("x-virtkit.kernel", "    x-virtkit:\n      kernel: image\n"),
+            ("x-virtkit.reclaim", "    x-virtkit:\n      reclaim: auto\n"),
+            ("x-virtkit.dax", "    x-virtkit:\n      dax: off\n"),
+            ("x-virtkit.nested", "    x-virtkit:\n      nested: true\n"),
+            ("x-virtkit.nics", "    x-virtkit:\n      nics: 2\n"),
+            (
+                "x-virtkit.tap",
+                "    x-virtkit:\n      tap: { name: vkdev0 }\n",
+            ),
+            (
+                "x-virtkit.persist_root",
+                "    x-virtkit:\n      persist_root: true\n",
+            ),
+        ] {
+            let err = parse(
+                &format!("services:\n  dc:\n    image: ./win\n{yaml}"),
+                &base.0,
+            )
+            .unwrap_err();
+            assert!(format!("{err:#}").contains(key), "{key}: {err:#}");
+        }
     }
 
     #[test]

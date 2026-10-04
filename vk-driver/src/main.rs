@@ -96,6 +96,7 @@ mod vms;
 mod winbuild;
 mod winexec;
 mod winiso;
+mod winsvc;
 mod workloads;
 mod wsl;
 
