@@ -49,6 +49,12 @@ pub struct From {
     /// (the preinit boot `vk run --kernel image` uses), not vk's embedded build kernel — so
     /// a RUN can partition disks, mkfs.btrfs, etc. The base must already carry a kernel.
     pub image_kernel: bool,
+    /// Unmodelled `(name, value)` flags: before the image, as Docker
+    /// writes them, or between the image and `AS`, where a long `FROM winiso:` puts its
+    /// `--edition`/`--drivers` on continuation lines. A Windows build reads them; a Linux
+    /// build refuses them. Not in the Linux cache key: a flag the Linux build starts
+    /// honouring moves to a field of its own, keyed by `canonical()`.
+    pub extra_flags: Vec<(String, String)>,
     /// How big a guest this stage's RUN steps want, from a `# vk:` line above its `FROM`.
     /// Sizing only: it never reaches a cache key, so the same stage built at 2G and at 8G
     /// is the same stage.
@@ -91,6 +97,11 @@ pub struct Run {
     pub mounts: Vec<Mount>,
     pub network: Option<String>,
     pub security: Option<String>,
+    /// Unmodelled `(name, value)` flags (a Windows build's
+    /// `--reboot` and `--timeout`). A Linux build refuses them. Not in the Linux cache key:
+    /// a flag the Linux build starts honouring moves to a field of its own, keyed by
+    /// `canonical()`.
+    pub extra_flags: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -353,51 +364,61 @@ fn parse_instruction(line: &str) -> Result<Instruction> {
 }
 
 fn parse_from(rest: &str) -> Result<From> {
-    let (flags, words) = split_flags(rest);
+    // [--flag=value ...] <image> [--flag=value ...] [AS <name>]
+    let (mut flags, words) = split_flags(rest)?;
+    let mut it = words.into_iter().peekable();
+    let image = it.next().context_msg("FROM needs an image")?;
+    while let Some(tok) = it.next_if(|w| w.starts_with("--")) {
+        flags.push(flag_kv(&tok)?);
+    }
+    let as_name = match it.next_if(|w| w.eq_ignore_ascii_case("as")) {
+        Some(_) => Some(it.next().context_msg("FROM ... AS needs a stage name")?),
+        None => None,
+    };
+    if let Some(w) = it.next() {
+        bail!("FROM: unexpected `{w}` after `FROM <image> [AS <name>]`; use --flag=value");
+    }
+    if image.is_empty() {
+        bail!("FROM needs an image");
+    }
     let mut platform = None;
     // `--kernel=image`: run this stage's RUNs on the base image's own kernel (the preinit
     // boot). Mirrors the `vk run --kernel image` CLI. Only `image` is accepted for now.
     let mut image_kernel = false;
+    let mut extra_flags = Vec::new();
     for (k, v) in flags {
         match k.as_str() {
+            // Docker rejects a repeated flag; a valid --kernel always sets image_kernel.
+            "platform" if platform.is_some() => bail!("FROM: --platform given twice"),
+            "kernel" if image_kernel => bail!("FROM: --kernel given twice"),
             "platform" => platform = Some(v),
             "kernel" if v.eq_ignore_ascii_case("image") => image_kernel = true,
             "kernel" => bail!("FROM --kernel: expected `image`, got {v:?}"),
-            _ => {} // ignore unknown FROM flags, as before
+            _ => extra_flags.push((k, v)),
         }
-    }
-    // <image> [AS <name>]
-    let mut it = words.into_iter();
-    let image = it.next().context_msg("FROM needs an image")?;
-    let mut as_name = None;
-    if let Some(w) = it.next()
-        && w.eq_ignore_ascii_case("as")
-    {
-        as_name = it.next();
-    }
-    if image.is_empty() {
-        bail!("FROM needs an image");
     }
     Ok(From {
         image,
         as_name,
         platform,
         image_kernel,
+        extra_flags,
         guest: GuestHint::default(),
     })
 }
 
 fn parse_run(rest: &str) -> Result<Run> {
-    let (flags, _words) = split_flags(rest);
+    let (flags, _words) = split_flags(rest)?;
     let mut mounts = Vec::new();
     let mut network = None;
     let mut security = None;
+    let mut extra_flags = Vec::new();
     for (k, v) in &flags {
         match k.as_str() {
             "mount" => mounts.push(parse_mount(v)),
             "network" => network = Some(v.clone()),
             "security" => security = Some(v.clone()),
-            _ => {}
+            _ => extra_flags.push((k.clone(), v.clone())),
         }
     }
     // the command is everything after the leading flags, verbatim (shell form) or a
@@ -408,11 +429,12 @@ fn parse_run(rest: &str) -> Result<Run> {
         mounts,
         network,
         security,
+        extra_flags,
     })
 }
 
 fn parse_copy(rest: &str) -> Result<Copy> {
-    let (flags, words) = split_flags(rest);
+    let (flags, words) = split_flags(rest)?;
     let mut from = None;
     let mut chown = None;
     let mut chmod = None;
@@ -483,38 +505,57 @@ fn parse_cmdline(rest: &str) -> Cmdline {
 }
 
 /// Parse leading `--key=value` flags off the front; return (flags, remaining words).
-fn split_flags(rest: &str) -> (Vec<(String, String)>, Vec<String>) {
+fn split_flags(rest: &str) -> Result<(Vec<Flag>, Vec<String>)> {
     let mut flags = Vec::new();
     let mut words = Vec::new();
     let mut seen_nonflag = false;
     for tok in tokenize(rest) {
         if !seen_nonflag && tok.starts_with("--") {
-            let kv = &tok[2..];
-            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            flags.push((k.to_string(), v.to_string()));
+            flags.push(flag_kv(&tok)?);
         } else {
             seen_nonflag = true;
             words.push(tok);
         }
     }
-    (flags, words)
+    Ok((flags, words))
+}
+
+/// A flag as `(name, value)`.
+type Flag = (String, String);
+
+/// A `--name[=value]` token as `(name, value)`; a bare `--name` has an empty value.
+fn flag_kv(tok: &str) -> Result<Flag> {
+    let kv = tok.strip_prefix("--").unwrap_or(tok);
+    let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+    if k.is_empty() {
+        bail!("`{tok}`: a flag needs a name");
+    }
+    Ok((k.to_string(), v.to_string()))
 }
 
 /// The substring after the leading `--flag` tokens (for verbatim command bodies).
 fn strip_leading_flags(rest: &str) -> &str {
     let mut s = rest.trim_start();
-    while let Some(stripped) = s.strip_prefix("--") {
-        // advance past one flag token
-        let end = stripped
-            .find(char::is_whitespace)
-            .map(|i| i + 2)
-            .unwrap_or(s.len());
-        let after = s[end..].trim_start();
-        // only treat as a flag if it looked like --k or --k=v
-        if s[..end].contains(' ') {
-            break;
-        }
-        s = after;
+    while s.starts_with("--") {
+        // one flag token ends at the first whitespace outside quotes, as `tokenize` splits
+        let mut quote = None;
+        let end = s
+            .char_indices()
+            .find(|&(_, c)| match quote {
+                Some(q) => {
+                    if c == q {
+                        quote = None;
+                    }
+                    false
+                }
+                None if c == '"' || c == '\'' => {
+                    quote = Some(c);
+                    false
+                }
+                None => c.is_whitespace(),
+            })
+            .map_or(s.len(), |(i, _)| i);
+        s = s[end..].trim_start();
     }
     s
 }
@@ -603,6 +644,108 @@ impl<T> ContextMsg<T> for Option<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_keeps_the_flags_it_does_not_model_before_or_after_the_image() {
+        let df = parse(
+            "FROM winiso:./ws2025.iso@sha256:abc \\\n\
+             \x20   --edition=\"Windows Server 2025 Standard Evaluation\" \\\n\
+             \x20   --drivers=./virtio-win.iso@sha256:def AS base\n\
+             FROM --platform=windows/amd64 --tpm=on base AS next\n",
+        )
+        .unwrap();
+        let Instruction::From(f) = &df.instructions[0] else {
+            unreachable!()
+        };
+        assert_eq!(f.image, "winiso:./ws2025.iso@sha256:abc");
+        assert_eq!(f.as_name.as_deref(), Some("base"));
+        assert_eq!(
+            f.extra_flags,
+            vec![
+                (
+                    "edition".to_string(),
+                    "Windows Server 2025 Standard Evaluation".to_string()
+                ),
+                (
+                    "drivers".to_string(),
+                    "./virtio-win.iso@sha256:def".to_string()
+                ),
+            ]
+        );
+        let Instruction::From(f) = &df.instructions[1] else {
+            unreachable!()
+        };
+        assert_eq!(f.platform.as_deref(), Some("windows/amd64"));
+        assert_eq!(f.extra_flags, vec![("tpm".to_string(), "on".to_string())]);
+        assert_eq!(f.as_name.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn from_honours_a_modelled_flag_after_the_image() {
+        let Instruction::From(f) =
+            parse_instruction("FROM base --kernel=image --platform=linux/arm64 AS x").unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(f.image_kernel);
+        assert_eq!(f.platform.as_deref(), Some("linux/arm64"));
+        assert!(f.extra_flags.is_empty());
+        assert_eq!(f.as_name.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn from_rejects_a_stray_word_or_a_nameless_flag() {
+        for bad in [
+            "FROM base x",
+            "FROM base AS x y",
+            "FROM base AS",
+            "FROM -- base",
+            "FROM base -- AS x",
+        ] {
+            assert!(parse_instruction(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn from_rejects_a_repeated_modelled_flag() {
+        for bad in [
+            "FROM --platform=linux/amd64 base --platform=linux/arm64",
+            "FROM --kernel=image base --kernel=image",
+        ] {
+            let err = parse_instruction(bad).unwrap_err().to_string();
+            assert!(err.contains("given twice"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn run_keeps_the_flags_it_does_not_model_and_the_command_after_them() {
+        let Instruction::Run(r) =
+            parse_instruction("RUN --reboot=never --timeout=30m --network=none echo hi").unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            r.extra_flags,
+            vec![
+                ("reboot".to_string(), "never".to_string()),
+                ("timeout".to_string(), "30m".to_string()),
+            ]
+        );
+        assert_eq!(r.network.as_deref(), Some("none"));
+        assert_eq!(r.cmd, Cmdline::Shell("echo hi".into()));
+        // a quoted value with a space is one flag, not the start of the command
+        let Instruction::Run(r) =
+            parse_instruction("RUN --timeout=\"30 m\" --network=none echo hi").unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            r.extra_flags,
+            vec![("timeout".to_string(), "30 m".to_string())]
+        );
+        assert_eq!(r.cmd, Cmdline::Shell("echo hi".into()));
+        assert!(parse_instruction("RUN -- echo hi").is_err());
+    }
 
     #[test]
     fn a_vk_comment_sizes_the_stage_it_precedes() {
@@ -715,6 +858,7 @@ mod tests {
                 as_name: Some("base".into()),
                 platform: None,
                 image_kernel: false,
+                extra_flags: Vec::new(),
                 guest: GuestHint::default(),
             })
         );
@@ -725,6 +869,7 @@ mod tests {
                 as_name: None,
                 platform: None,
                 image_kernel: false,
+                extra_flags: Vec::new(),
                 guest: GuestHint::default(),
             })
         );
@@ -740,6 +885,7 @@ mod tests {
                 as_name: Some("disk".into()),
                 platform: None,
                 image_kernel: true,
+                extra_flags: Vec::new(),
                 guest: GuestHint::default(),
             })
         );

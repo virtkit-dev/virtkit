@@ -31,6 +31,14 @@ All notable changes to virtkit will be documented in this file.
   Keystrokes are paced, as SAC drops fast input. The console survives guest reboots; one
   console attaches at a time (the newest wins).
 
+### Changed
+
+- **`vk build` refuses Dockerfile flags it does not honour.** A `FROM` flag other than
+  `--platform` and `--kernel`, or a `RUN` flag other than `--mount`, `--network` and
+  `--security`, now fails the build instead of being ignored, as does a stray word after
+  `FROM <image> [AS <name>]`. `--platform` and `--kernel` after the image now apply, as they
+  do before it.
+
 ## [0.84.0] - 2026-10-05
 
 ### Changed
