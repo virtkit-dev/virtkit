@@ -120,6 +120,53 @@ fn merge(base: &[kvm_cpuid_entry2], hv: &[kvm_cpuid_entry2], synic: bool) -> Vec
     merged
 }
 
+/// The Hyper-V MSRs a vCPU snapshot keeps, in the order a restore must write them: the guest
+/// OS ID before the hypercall page (KVM drops the page's enable bit while no OS ID is set), the
+/// reference TSC page, the vCPU's own pages, then the SynIC (its control before its pages and
+/// interrupt sources) and the synthetic timers (configurations before counts). KVM lists only a
+/// few of them in `KVM_GET_MSR_INDEX_LIST`; one this host's KVM does not implement is skipped
+/// when the snapshot is taken. Read-only ones (`SVERSION`, `TIME_REF_COUNT`, frequencies) are
+/// left out.
+pub const SNAPSHOT_MSRS: &[u32] = &[
+    0x4000_0000, // GUEST_OS_ID
+    0x4000_0001, // HYPERCALL
+    0x4000_0021, // REFERENCE_TSC
+    0x4000_0002, // VP_INDEX
+    0x4000_0010, // VP_RUNTIME
+    0x4000_0073, // VP_ASSIST_PAGE
+    0x4000_0106, // REENLIGHTENMENT_CONTROL
+    0x4000_0107, // TSC_EMULATION_CONTROL
+    0x4000_0108, // TSC_EMULATION_STATUS
+    0x4000_0118, // TSC_INVARIANT_CONTROL
+    0x4000_0080, // SCONTROL
+    0x4000_0082, // SIEFP
+    0x4000_0083, // SIMP
+    0x4000_0090, // SINT0
+    0x4000_0091,
+    0x4000_0092,
+    0x4000_0093,
+    0x4000_0094,
+    0x4000_0095,
+    0x4000_0096,
+    0x4000_0097,
+    0x4000_0098,
+    0x4000_0099,
+    0x4000_009a,
+    0x4000_009b,
+    0x4000_009c,
+    0x4000_009d,
+    0x4000_009e,
+    0x4000_009f, // SINT15
+    0x4000_00b0, // STIMER0_CONFIG
+    0x4000_00b2, // STIMER1_CONFIG
+    0x4000_00b4, // STIMER2_CONFIG
+    0x4000_00b6, // STIMER3_CONFIG
+    0x4000_00b1, // STIMER0_COUNT
+    0x4000_00b3, // STIMER1_COUNT
+    0x4000_00b5, // STIMER2_COUNT
+    0x4000_00b7, // STIMER3_COUNT
+];
+
 /// Present KVM's Hyper-V enlightenments in `cpuid`, the set about to be given to `vcpu`.
 /// Returns whether the SynIC (and so the synthetic timers) is on: a host whose KVM refuses
 /// it still gets the other enlightenments.

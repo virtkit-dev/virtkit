@@ -13,7 +13,7 @@ use super::{ActivateResult, Queue, device_status};
 use crate::virtio::AsAny;
 use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
-use vm_memory::GuestMemoryMmap;
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 
 /// Configuration for a single virtqueue.
 /// This is used by devices to declare their queue requirements,
@@ -89,11 +89,36 @@ pub(crate) struct VirtioTransportState {
     pub(crate) queue_select: u32,
     pub(crate) device_status: u32,
     pub(crate) config_generation: u32,
-    mem: GuestMemoryMmap,
+    pub(crate) mem: GuestMemoryMmap,
     pub(crate) queues: Option<Vec<Queue>>,
     queue_evts: Vec<Arc<EventFd>>,
     pub(crate) queue_config: Vec<QueueConfig>,
     bus_master_gate: Option<Arc<AtomicBool>>,
+    /// The queues as the driver set them up, kept when activation hands them to the device so
+    /// a snapshot can tell what the driver wrote (local patch).
+    pub(crate) activated_queues: Vec<QueueSetup>,
+}
+
+/// A queue's setup by its driver: what a snapshot keeps and a restore writes again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct QueueSetup {
+    pub size: u16,
+    pub ready: bool,
+    pub desc_table: GuestAddress,
+    pub avail_ring: GuestAddress,
+    pub used_ring: GuestAddress,
+}
+
+impl QueueSetup {
+    pub(crate) fn of(queue: &Queue) -> Self {
+        Self {
+            size: queue.size,
+            ready: queue.ready,
+            desc_table: queue.desc_table,
+            avail_ring: queue.avail_ring,
+            used_ring: queue.used_ring,
+        }
+    }
 }
 
 impl VirtioTransportState {
@@ -121,6 +146,7 @@ impl VirtioTransportState {
             queue_evts,
             queue_config,
             bus_master_gate: None,
+            activated_queues: Vec::new(),
         })
     }
 
@@ -158,6 +184,23 @@ impl VirtioTransportState {
                 queue.set_bus_master_gate(gate.clone());
             }
         }
+    }
+
+    /// The driver's setup of every queue: as activation found it, or as it stands.
+    pub(crate) fn queue_setups(&self) -> Vec<QueueSetup> {
+        match &self.queues {
+            Some(queues) => queues.iter().map(QueueSetup::of).collect(),
+            None => self.activated_queues.clone(),
+        }
+    }
+
+    /// The index the device last published in the used ring at `used_ring`: with no request
+    /// in flight, where both of its positions in the queue stand.
+    pub(crate) fn used_index(&self, used_ring: GuestAddress) -> Option<u16> {
+        self.mem
+            .read_obj::<u16>(used_ring.checked_add(2)?)
+            .ok()
+            .map(u16::from_le)
     }
 
     pub(crate) fn queue_max_size(&self, queue_select: u32) -> u16 {
@@ -212,6 +255,7 @@ impl VirtioTransportState {
         let Some(queues) = self.queues.take() else {
             return;
         };
+        self.activated_queues = queues.iter().map(QueueSetup::of).collect();
 
         let mut device_queues: Vec<DeviceQueue> = queues
             .into_iter()
@@ -409,6 +453,15 @@ pub trait VirtioDevice: AsAny + Send {
     fn reset(&mut self) -> bool {
         false
     }
+
+    /// The device's own state beyond its queues and configuration, for a snapshot: what
+    /// [`VirtioDevice::restore_state`] needs to carry on. Most devices have none (local patch).
+    fn save_state(&self) -> Vec<u32> {
+        Vec::new()
+    }
+
+    /// Put back, on the activated device, what [`VirtioDevice::save_state`] returned.
+    fn restore_state(&mut self, _state: &[u32]) {}
 
     /// Get base and size of the SHM region
     fn shm_region(&self) -> Option<&VirtioShmRegion> {

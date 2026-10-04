@@ -58,7 +58,8 @@ fn from_bcd(value: u8) -> u8 {
 
 /// A broken-down UTC date and time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DateTime {
+#[cfg_attr(feature = "snapshot", derive(serde::Serialize, serde::Deserialize))]
+pub struct DateTime {
     year: i64,
     month: u8,
     day: u8,
@@ -131,7 +132,39 @@ pub struct Cmos {
     rtc_offset: i64,
 }
 
+/// [`Cmos::save_state`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "snapshot", derive(serde::Serialize, serde::Deserialize))]
+pub struct CmosState {
+    pub index: u8,
+    pub data: Vec<u8>,
+    pub rtc_offset: i64,
+    /// The time being written under register B's SET bit ([`Cmos`]'s `pending`).
+    #[cfg_attr(feature = "snapshot", serde(default))]
+    pub pending: Option<DateTime>,
+}
+
 impl Cmos {
+    /// What a snapshot keeps: the selected index, the NVRAM, the clock's offset from the
+    /// host's and a time being set (local patch).
+    pub fn save_state(&self) -> CmosState {
+        CmosState {
+            index: self.index,
+            data: self.data.to_vec(),
+            rtc_offset: self.rtc_offset,
+            pending: self.pending,
+        }
+    }
+
+    /// Put back what [`Cmos::save_state`] returned.
+    pub fn restore_state(&mut self, state: &CmosState) {
+        self.index = state.index;
+        let len = state.data.len().min(DATA_LEN);
+        self.data[..len].copy_from_slice(&state.data[..len]);
+        self.rtc_offset = state.rtc_offset;
+        self.pending = state.pending;
+    }
+
     pub fn new(mem_below_4g: u64, mem_above_4g: u64) -> Cmos {
         debug!("cmos: mem_below_4g={mem_below_4g} mem_above_4g={mem_above_4g}");
 
@@ -418,6 +451,24 @@ mod tests {
         assert_eq!(read(&mut cmos, RTC_MONTH), 3);
         assert_eq!(read(&mut cmos, RTC_DAY_OF_MONTH), 31);
         assert_eq!(read(&mut cmos, RTC_YEAR), 26);
+    }
+
+    #[test]
+    fn a_time_being_set_survives_save_and_restore() {
+        let mut cmos = Cmos::new(1 << 30, 0);
+        write(
+            &mut cmos,
+            RTC_REG_B,
+            REG_B_SET | REG_B_24H | REG_B_DM_BINARY,
+        );
+        write(&mut cmos, RTC_DAY_OF_MONTH, 31);
+        write(&mut cmos, RTC_MONTH, 2);
+        let mut back = Cmos::new(1 << 30, 0);
+        back.restore_state(&cmos.save_state());
+        write(&mut back, RTC_MONTH, 3);
+        write(&mut back, RTC_REG_B, REG_B_24H | REG_B_DM_BINARY);
+        assert_eq!(read(&mut back, RTC_MONTH), 3);
+        assert_eq!(read(&mut back, RTC_DAY_OF_MONTH), 31);
     }
 
     #[test]

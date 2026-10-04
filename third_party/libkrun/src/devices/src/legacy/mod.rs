@@ -54,9 +54,9 @@ mod riscv64;
 use riscv64::serial;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub use self::acpi_pm::AcpiPm;
+pub use self::acpi_pm::{AcpiPm, AcpiPmState};
 #[cfg(target_arch = "x86_64")]
-pub use self::cmos::Cmos;
+pub use self::cmos::{Cmos, CmosState};
 #[cfg(target_os = "macos")]
 pub use self::gicv3::GicV3;
 #[cfg(target_arch = "aarch64")]
@@ -66,7 +66,7 @@ pub use self::gsi::GsiRoutes;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub use self::hvfgicv3::HvfGicV3;
 #[cfg(target_arch = "x86_64")]
-pub use self::i8042::{Error as I8042DeviceError, I8042Device};
+pub use self::i8042::{Error as I8042DeviceError, I8042Device, I8042State};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::ioapic_kvm::IoApic;
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
@@ -85,6 +85,8 @@ pub use self::kvmioapic::KvmIoapic;
 #[cfg(target_arch = "aarch64")]
 pub use self::rtc_pl031::RTC;
 pub use self::serial::Serial;
+#[cfg(target_arch = "x86_64")]
+pub use self::serial::SerialState;
 #[cfg(target_os = "macos")]
 pub use self::vcpu::VcpuList;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

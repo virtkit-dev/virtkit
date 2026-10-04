@@ -49,10 +49,10 @@ use cpuid::{VmSpec, c3, filter_cpuid, t2};
 use kvm_bindings::kvm_userspace_memory_region;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
-    CpuId, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC, KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE,
-    KVM_MAX_CPUID_ENTRIES, MsrList, Msrs, kvm_clock_data, kvm_debugregs, kvm_irqchip,
-    kvm_lapic_state, kvm_mp_state, kvm_pit_state2, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs,
-    kvm_xsave,
+    CpuId, KVM_CLOCK_HOST_TSC, KVM_CLOCK_REALTIME, KVM_CLOCK_TSC_STABLE, KVM_IRQCHIP_IOAPIC,
+    KVM_IRQCHIP_PIC_MASTER, KVM_IRQCHIP_PIC_SLAVE, KVM_MAX_CPUID_ENTRIES, MsrList, Msrs,
+    kvm_clock_data, kvm_cpuid_entry2, kvm_debugregs, kvm_irqchip, kvm_lapic_state, kvm_mp_state,
+    kvm_msr_entry, kvm_pit_state2, kvm_regs, kvm_sregs, kvm_vcpu_events, kvm_xcrs, kvm_xsave,
 };
 use kvm_bindings::{KVM_API_VERSION, KVM_SYSTEM_EVENT_RESET, KVM_SYSTEM_EVENT_SHUTDOWN};
 #[cfg(feature = "tee")]
@@ -200,6 +200,10 @@ pub enum Error {
     #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu msrs.
     VcpuSetMsrs(kvm_ioctls::Error),
+    /// KVM took only part of a restored MSR list: the first one it refused.
+    VcpuSetMsrsRefused(u32),
+    /// A saved MSR or CPUID list too long for KVM's.
+    VcpuFam(vmm_sys_util::fam::Error),
     #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu regs.
     VcpuSetRegs(kvm_ioctls::Error),
@@ -365,6 +369,8 @@ impl Display for Error {
             VcpuSetMpState(e) => write!(f, "Failed to set KVM vcpu mp state: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetMsrs(e) => write!(f, "Failed to set KVM vcpu msrs: {e}"),
+            VcpuSetMsrsRefused(index) => write!(f, "KVM refused to restore MSR {index:#x}"),
+            VcpuFam(e) => write!(f, "Building a KVM MSR or CPUID list: {e:?}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetRegs(e) => write!(f, "Failed to set KVM vcpu regs: {e}"),
             #[cfg(target_arch = "x86_64")]
@@ -885,8 +891,11 @@ impl Vm {
         let pitstate = self.fd.get_pit2().map_err(Error::VmGetPit2)?;
 
         let mut clock = self.fd.get_clock().map_err(Error::VmGetClock)?;
-        // This bit is not accepted in SET_CLOCK, clear it.
-        clock.flags &= !KVM_CLOCK_TSC_STABLE;
+        // SET_CLOCK refuses TSC_STABLE. With REALTIME (and HOST_TSC), which a newer kernel
+        // reports, it would advance the clock by the host time since the snapshot; without
+        // them the guest's clock resumes where the snapshot froze it, on any kernel (local
+        // patch, see VENDOR.md).
+        clock.flags &= !(KVM_CLOCK_TSC_STABLE | KVM_CLOCK_REALTIME | KVM_CLOCK_HOST_TSC);
 
         let mut pic_master = kvm_irqchip {
             chip_id: KVM_IRQCHIP_PIC_MASTER,
@@ -942,9 +951,11 @@ impl Vm {
     }
 }
 
-#[allow(unused)]
 #[cfg(target_arch = "x86_64")]
 /// Structure holding VM kvm state.
+#[derive(Debug)]
+#[cfg_attr(feature = "snapshot", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(test, derive(Default))]
 pub struct VmState {
     pitstate: kvm_pit_state2,
     clock: kvm_clock_data,
@@ -988,6 +999,9 @@ pub struct Vcpu {
     cpuid: CpuId,
     #[cfg(target_arch = "x86_64")]
     msr_list: MsrList,
+    /// Whether the guest sees Hyper-V, whose MSRs a snapshot then keeps too.
+    #[cfg(target_arch = "x86_64")]
+    hyperv: bool,
     #[cfg(target_arch = "x86_64")]
     kernel_enomem_workaround: bool,
 
@@ -1132,6 +1146,7 @@ impl Vcpu {
             io_bus,
             cpuid,
             msr_list,
+            hyperv: false,
             kernel_enomem_workaround,
             event_receiver,
             event_sender: Some(event_sender),
@@ -1256,9 +1271,12 @@ impl Vcpu {
         if vcpu_config.hyperv_enabled {
             use arch::x86_64::linux::hyperv;
             let off = match hyperv::apply(&self.fd, &mut self.cpuid) {
-                Ok(true) => None,
-                Ok(false) => {
-                    Some("Hyper-V SynIC unavailable on this host: synthetic timers off".to_string())
+                Ok(synic) => {
+                    // Enlightened: a snapshot keeps the Hyper-V MSRs too.
+                    self.hyperv = true;
+                    (!synic).then(|| {
+                        "Hyper-V SynIC unavailable on this host: synthetic timers off".to_string()
+                    })
                 }
                 // A KVM built without Hyper-V emulation (CONFIG_KVM_HYPERV off): the guest
                 // keeps the plain KVM CPUID.
@@ -1397,9 +1415,47 @@ impl Vcpu {
         ))
     }
 
-    #[allow(unused)]
+    /// The values of the MSRs `indices` that this vCPU's KVM implements: `KVM_GET_MSRS` stops
+    /// at the first one it refuses, which is left out.
     #[cfg(target_arch = "x86_64")]
-    fn save_state(&self) -> Result<VcpuState> {
+    fn read_msrs(&self, indices: &[u32]) -> Result<Vec<kvm_msr_entry>> {
+        let mut read = Vec::with_capacity(indices.len());
+        let mut rest = indices;
+        while !rest.is_empty() {
+            let entries: Vec<kvm_msr_entry> = rest
+                .iter()
+                .map(|&index| kvm_msr_entry {
+                    index,
+                    ..Default::default()
+                })
+                .collect();
+            let mut msrs = Msrs::from_entries(&entries).map_err(Error::VcpuFam)?;
+            let n = self.fd.get_msrs(&mut msrs).map_err(Error::VcpuGetMsrs)?;
+            read.extend_from_slice(&msrs.as_slice()[..n]);
+            // Skip the one refused, if any, and carry on past it.
+            rest = &rest[(n + 1).min(rest.len())..];
+        }
+        Ok(read)
+    }
+
+    /// Write `entries` in order, every one of which KVM must take.
+    #[cfg(target_arch = "x86_64")]
+    fn write_msrs(&self, entries: &[kvm_msr_entry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let msrs = Msrs::from_entries(entries).map_err(Error::VcpuFam)?;
+        let n = self.fd.set_msrs(&msrs).map_err(Error::VcpuSetMsrs)?;
+        match entries.get(n) {
+            Some(refused) => Err(Error::VcpuSetMsrsRefused(refused.index)),
+            None => Ok(()),
+        }
+    }
+
+    /// This vCPU's state, to rebuild it with [`Vcpu::restore_state`]. The vCPU must not be
+    /// running, nor any other vCPU of the VM.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn save_state(&self) -> Result<VcpuState> {
         /*
          * Ordering requirements:
          *
@@ -1423,17 +1479,6 @@ impl Vcpu {
          * meaningful. For SET_MSRS it will then contain good data.
          */
 
-        // Build the list of MSRs we want to save.
-        let num_msrs = self.msr_list.as_fam_struct_ref().nmsrs as usize;
-        let mut msrs = Msrs::new(num_msrs).unwrap();
-        {
-            let indices = self.msr_list.as_slice();
-            let msr_entries = msrs.as_mut_slice();
-            assert_eq!(indices.len(), msr_entries.len());
-            for (pos, index) in indices.iter().enumerate() {
-                msr_entries[pos].index = *index;
-            }
-        }
         let mp_state = self.fd.get_mp_state().map_err(Error::VcpuGetMpState)?;
         let regs = self.fd.get_regs().map_err(Error::VcpuGetRegs)?;
         let sregs = self.fd.get_sregs().map_err(Error::VcpuGetSregs)?;
@@ -1441,15 +1486,20 @@ impl Vcpu {
         let xcrs = self.fd.get_xcrs().map_err(Error::VcpuGetXcrs)?;
         let debug_regs = self.fd.get_debug_regs().map_err(Error::VcpuGetDebugRegs)?;
         let lapic = self.fd.get_lapic().map_err(Error::VcpuGetLapic)?;
-        let nmsrs = self.fd.get_msrs(&mut msrs).map_err(Error::VcpuGetMsrs)?;
-        assert_eq!(nmsrs, num_msrs);
+        let msrs = self.read_msrs(self.msr_list.as_slice())?;
+        let hyperv_msrs = if self.hyperv {
+            self.read_msrs(arch::x86_64::linux::hyperv::SNAPSHOT_MSRS)?
+        } else {
+            Vec::new()
+        };
         let vcpu_events = self
             .fd
             .get_vcpu_events()
             .map_err(Error::VcpuGetVcpuEvents)?;
         Ok(VcpuState {
-            cpuid: self.cpuid.clone(),
+            cpuid: self.cpuid.as_slice().to_vec(),
             msrs,
+            hyperv_msrs,
             debug_regs,
             lapic,
             mp_state,
@@ -1461,9 +1511,10 @@ impl Vcpu {
         })
     }
 
-    #[allow(unused)]
+    /// Put back the state [`Vcpu::save_state`] took, on a vCPU configured as the saved one was
+    /// (its CPUID, Hyper-V and SynIC included).
     #[cfg(target_arch = "x86_64")]
-    fn restore_state(&self, state: VcpuState) -> Result<()> {
+    pub(crate) fn restore_state(&self, state: &VcpuState) -> Result<()> {
         /*
          * Ordering requirements:
          *
@@ -1486,9 +1537,8 @@ impl Vcpu {
          * SET_LAPIC must come before SET_MSRS, because the TSC deadline MSR
          * only restores successfully, when the LAPIC is correctly configured.
          */
-        self.fd
-            .set_cpuid2(&state.cpuid)
-            .map_err(Error::VcpuSetCpuid)?;
+        let cpuid = CpuId::from_entries(&state.cpuid).map_err(Error::VcpuFam)?;
+        self.fd.set_cpuid2(&cpuid).map_err(Error::VcpuSetCpuid)?;
         self.fd
             .set_mp_state(state.mp_state)
             .map_err(Error::VcpuSetMpState)?;
@@ -1508,7 +1558,9 @@ impl Vcpu {
         self.fd
             .set_lapic(&state.lapic)
             .map_err(Error::VcpuSetLapic)?;
-        self.fd.set_msrs(&state.msrs).map_err(Error::VcpuSetMsrs)?;
+        self.write_msrs(&state.msrs)?;
+        // In their own order, after the rest: see `SNAPSHOT_MSRS`.
+        self.write_msrs(&state.hyperv_msrs)?;
         self.fd
             .set_vcpu_events(&state.vcpu_events)
             .map_err(Error::VcpuSetVcpuEvents)?;
@@ -1745,6 +1797,13 @@ impl Vcpu {
                     .send(VcpuResponse::Resumed)
                     .expect("failed to send resume status");
             }
+            // A running vCPU's state is not consistent: pause it first.
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::SaveState | VcpuEvent::RestoreState(_)) => {
+                self.response_sender
+                    .send(VcpuResponse::Error("the vcpu is running".into()))
+                    .expect("failed to send the vcpu state status");
+            }
             // Unhandled exit of the other end.
             Err(TryRecvError::Disconnected) => {
                 // Move to 'exited' state.
@@ -1774,6 +1833,29 @@ impl Vcpu {
                 self.response_sender
                     .send(VcpuResponse::Paused)
                     .expect("failed to send pause status");
+                StateMachine::next(Self::paused)
+            }
+            // Only a paused vCPU's state is consistent: the others are paused too by then.
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::SaveState) => {
+                let response = match self.save_state() {
+                    Ok(state) => VcpuResponse::State(Box::new(state)),
+                    Err(e) => VcpuResponse::Error(e.to_string()),
+                };
+                self.response_sender
+                    .send(response)
+                    .expect("failed to send the vcpu state");
+                StateMachine::next(Self::paused)
+            }
+            #[cfg(target_arch = "x86_64")]
+            Ok(VcpuEvent::RestoreState(state)) => {
+                let response = match self.restore_state(&state) {
+                    Ok(()) => VcpuResponse::Restored,
+                    Err(e) => VcpuResponse::Error(e.to_string()),
+                };
+                self.response_sender
+                    .send(response)
+                    .expect("failed to send the vcpu restore status");
                 StateMachine::next(Self::paused)
             }
             // Unhandled exit of the other end.
@@ -1834,9 +1916,14 @@ impl Drop for Vcpu {
 
 #[cfg(target_arch = "x86_64")]
 /// Structure holding VCPU kvm state.
+#[derive(Debug)]
+#[cfg_attr(feature = "snapshot", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(test, derive(Default))]
 pub struct VcpuState {
-    cpuid: CpuId,
-    msrs: Msrs,
+    cpuid: Vec<kvm_cpuid_entry2>,
+    msrs: Vec<kvm_msr_entry>,
+    /// Restored after `msrs`, in the order of [`arch::x86_64::linux::hyperv::SNAPSHOT_MSRS`].
+    hyperv_msrs: Vec<kvm_msr_entry>,
     debug_regs: kvm_debugregs,
     lapic: kvm_lapic_state,
     mp_state: kvm_mp_state,
@@ -1856,10 +1943,16 @@ pub enum VcpuEvent {
     Pause,
     /// Event that should resume the Vcpu.
     Resume,
+    /// Report the paused vCPU's state ([`VcpuResponse::State`]).
+    #[cfg(target_arch = "x86_64")]
+    SaveState,
+    /// Put this state back into the paused vCPU ([`VcpuResponse::Restored`]).
+    #[cfg(target_arch = "x86_64")]
+    RestoreState(Arc<VcpuState>),
     // Serialize and Deserialize to follow after we get the support from kvm-ioctls.
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 #[allow(dead_code)]
 /// List of responses that the Vcpu reports.
 pub enum VcpuResponse {
@@ -1869,6 +1962,13 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// The paused vCPU's state.
+    #[cfg(target_arch = "x86_64")]
+    State(Box<VcpuState>),
+    /// The paused vCPU took the state it was given.
+    Restored,
+    /// A state request failed.
+    Error(String),
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
@@ -2123,6 +2223,132 @@ mod tests {
         );
     }
 
+    /// A configured vCPU, with Hyper-V enlightenments or not.
+    #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
+    fn configured_vcpu(hyperv: bool) -> (Vm, Vcpu, GuestMemoryMmap) {
+        let config = VcpuConfig {
+            vcpu_count: 1,
+            ht_enabled: false,
+            cpu_template: None,
+            nested_enabled: false,
+            pmu_enabled: false,
+            hyperv_enabled: hyperv,
+        };
+        let (vm, mut vcpu, mem) = setup_vcpu(0x10000);
+        vcpu.configure_x86_64(&mem, GuestAddress(0), &config, true, false)
+            .unwrap();
+        (vm, vcpu, mem)
+    }
+
+    /// `saved` through JSON into a fresh vCPU configured alike, and that vCPU's state back.
+    #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
+    fn through_json_into_a_fresh_vcpu(saved: &VcpuState, hyperv: bool) -> VcpuState {
+        let back: VcpuState = serde_json::from_str(&serde_json::to_string(saved).unwrap()).unwrap();
+        let (_vm, fresh, _mem) = configured_vcpu(hyperv);
+        fresh.restore_state(&back).unwrap();
+        fresh.save_state().unwrap()
+    }
+
+    /// KVM structs compared through their serialized form: not all of them are `PartialEq`.
+    #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
+    fn json<T: serde::Serialize>(value: &T) -> serde_json::Value {
+        serde_json::to_value(value).unwrap()
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
+    fn msr(index: u32, data: u64) -> kvm_msr_entry {
+        kvm_msr_entry {
+            index,
+            data,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
+    #[test]
+    fn a_vcpu_state_survives_serialization_into_a_fresh_vcpu() {
+        let (_vm, vcpu, _mem) = configured_vcpu(false);
+        let mut regs = vcpu.fd.get_regs().unwrap();
+        regs.rax = 0x1122_3344_5566_7788;
+        regs.rip = 0x1234;
+        vcpu.fd.set_regs(&regs).unwrap();
+        // LSTAR, the syscall entry point a guest kernel sets.
+        vcpu.write_msrs(&[msr(0xc000_0082, 0xffff_8000_0000_1000)])
+            .unwrap();
+        let saved = vcpu.save_state().unwrap();
+        assert!(saved.hyperv_msrs.is_empty());
+
+        let again = through_json_into_a_fresh_vcpu(&saved, false);
+        assert_eq!(again.regs.rax, 0x1122_3344_5566_7788);
+        assert_eq!(again.regs.rip, 0x1234);
+        let lstar = |state: &VcpuState| {
+            state
+                .msrs
+                .iter()
+                .find(|m| m.index == 0xc000_0082)
+                .map(|m| m.data)
+        };
+        assert_eq!(lstar(&again), Some(0xffff_8000_0000_1000));
+        assert_eq!(json(&again.regs), json(&saved.regs));
+        assert_eq!(json(&again.sregs), json(&saved.sregs));
+        assert_eq!(json(&again.lapic), json(&saved.lapic));
+        assert_eq!(json(&again.xcrs), json(&saved.xcrs));
+        assert_eq!(json(&again.cpuid), json(&saved.cpuid));
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
+    #[test]
+    fn a_hyperv_vcpu_state_survives_serialization_into_a_fresh_vcpu() {
+        let (_vm, vcpu, _mem) = configured_vcpu(true);
+        // A KVM built without Hyper-V emulation (CONFIG_KVM_HYPERV off) keeps its own leaves
+        // at the base, and has no Hyper-V MSRs to test.
+        let cpuid = vcpu.fd.get_cpuid2(KVM_MAX_CPUID_ENTRIES).unwrap();
+        let base = cpuid
+            .as_slice()
+            .iter()
+            .find(|e| e.function == arch::x86_64::linux::hyperv::HYPERVISOR_BASE)
+            .unwrap();
+        if base.ebx.to_le_bytes() == *b"KVMK" {
+            eprintln!("skipped: this KVM offers no Hyper-V");
+            return;
+        }
+        // What a Windows guest sets up early: its OS ID, the hypercall page, the SynIC.
+        vcpu.write_msrs(&[
+            msr(0x4000_0000, 0x8100_0a00_0000_4f7c),
+            msr(0x4000_0001, 0x1001),
+            msr(0x4000_0080, 1),
+        ])
+        .unwrap();
+        let saved = vcpu.save_state().unwrap();
+        let hv = |state: &VcpuState, index| {
+            state
+                .hyperv_msrs
+                .iter()
+                .find(|m| m.index == index)
+                .map(|m| m.data)
+        };
+        assert_eq!(hv(&saved, 0x4000_0001), Some(0x1001));
+        assert_eq!(hv(&saved, 0x4000_0080), Some(1));
+
+        let again = through_json_into_a_fresh_vcpu(&saved, true);
+        assert_eq!(json(&again.hyperv_msrs), json(&saved.hyperv_msrs));
+        assert_eq!(json(&again.regs), json(&saved.regs));
+        assert_eq!(json(&again.sregs), json(&saved.sregs));
+        assert_eq!(json(&again.lapic), json(&saved.lapic));
+    }
+
+    #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
+    #[test]
+    fn a_vm_state_freezes_the_clock_at_the_snapshot() {
+        let (vm, _vcpu, _mem) = setup_vcpu(0x1000);
+        let saved = vm.save_state().unwrap();
+        let unaccepted = KVM_CLOCK_TSC_STABLE | KVM_CLOCK_REALTIME | KVM_CLOCK_HOST_TSC;
+        assert_eq!(saved.clock.flags & unaccepted, 0);
+        let back: VmState = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        let (fresh, _vcpu, _mem) = setup_vcpu(0x1000);
+        fresh.restore_state(&back).unwrap();
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn test_configure_vcpu() {
@@ -2279,7 +2505,11 @@ mod tests {
                 .response_receiver()
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
-            assert_eq!(got, want);
+            assert_eq!(
+                std::mem::discriminant(&got),
+                std::mem::discriminant(&want),
+                "{got:?}"
+            );
         };
         // A vCPU starts parked.
         ask(VcpuEvent::Pause, VcpuResponse::Paused);

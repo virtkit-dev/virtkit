@@ -18,6 +18,8 @@ pub mod resources;
 /// Signal handling utilities.
 #[cfg(target_os = "linux")]
 pub mod signal_handler;
+#[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+pub mod snapshot;
 /// Wrappers over structures used to configure the VMM.
 pub mod vmm_config;
 
@@ -187,8 +189,25 @@ pub struct Vmm {
     pub(crate) vm_ctl_rx: PollableChannelReciever<VmCtl>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) paused: bool,
+    /// The legacy devices a snapshot keeps (local patch).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+    pub(crate) legacy_devices: Option<snapshot::LegacyDevices>,
+    /// The VM generation ID the DSDT declares, which a restore puts back in place of the
+    /// snapshot's (local patch).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+    pub(crate) vm_generation_id: Option<[u8; 16]>,
     #[cfg(target_os = "macos")]
     pub(crate) paused_at: u64,
+}
+
+/// A paused VM's CPU state: its vCPUs' and its in-kernel devices'.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Debug)]
+#[cfg_attr(feature = "snapshot", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(test, derive(Default))]
+pub struct CpuState {
+    pub vm: vstate::VmState,
+    pub vcpus: Vec<vstate::VcpuState>,
 }
 
 /// Out-of-band request to the running VM's event loop.
@@ -199,6 +218,13 @@ pub enum VmCtl {
     Pause(Sender<std::result::Result<(), String>>),
     /// Resume the VM; the outcome comes back on the sender.
     Resume(Sender<std::result::Result<(), String>>),
+    /// Pause the VM and write its snapshot to this directory; the VM stays paused. The result
+    /// comes back on the sender.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+    Snapshot(std::path::PathBuf, Sender<std::result::Result<(), String>>),
+    /// End the VM as a guest power-off does (devices flush on the way out).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+    Quit,
 }
 
 impl Vmm {
@@ -220,6 +246,20 @@ impl Vmm {
         // The vcpus start off in the `Paused` state, let them run.
         self.resume_vcpus()?;
 
+        Ok(())
+    }
+
+    /// Start the vCPU threads but leave them paused, for a restore to set them up first.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+    pub fn start_vcpus_paused(&mut self, mut vcpus: Vec<Vcpu>) -> Result<()> {
+        Vcpu::register_kick_signal_handler();
+        self.vcpus_handles.reserve(vcpus.len());
+        for mut vcpu in vcpus.drain(..) {
+            vcpu.set_mmio_bus(self.mmio_device_manager.bus.clone());
+            self.vcpus_handles
+                .push(vcpu.start_threaded().map_err(Error::VcpuHandle)?);
+        }
+        self.paused = true;
         Ok(())
     }
 
@@ -356,6 +396,200 @@ impl Vmm {
         Ok(())
     }
 
+    /// The state of the paused VM's vCPUs and of its in-kernel devices (irqchip, PIT, clock),
+    /// for [`Vmm::restore_cpu_state`].
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub fn save_cpu_state(&mut self) -> std::result::Result<CpuState, String> {
+        if !self.paused {
+            return Err("the VM is not paused".into());
+        }
+        let all: Vec<usize> = (0..self.vcpus_handles.len()).collect();
+        let (states, res) = self.exchange_vcpus(
+            &all,
+            "SaveState",
+            |_| VcpuEvent::SaveState,
+            |got| match got {
+                VcpuResponse::State(state) => Ok(*state),
+                other => Err(other),
+            },
+        );
+        res?;
+        let vcpus = states.into_iter().map(|(_, state)| state).collect();
+        let vm = self
+            .vm
+            .save_state()
+            .map_err(|e| format!("saving the VM: {e}"))?;
+        Ok(CpuState { vm, vcpus })
+    }
+
+    /// Put back into the paused VM the state [`Vmm::save_cpu_state`] took, on vCPUs
+    /// configured as the saved ones were.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub fn restore_cpu_state(&mut self, state: CpuState) -> std::result::Result<(), String> {
+        if !self.paused {
+            return Err("the VM is not paused".into());
+        }
+        if state.vcpus.len() != self.vcpus_handles.len() {
+            return Err(format!(
+                "the state has {} vcpus, the VM {}",
+                state.vcpus.len(),
+                self.vcpus_handles.len()
+            ));
+        }
+        // The VM's clock and interrupt controllers first, as the vCPUs' timers read them.
+        self.vm
+            .restore_state(&state.vm)
+            .map_err(|e| format!("restoring the VM: {e}"))?;
+        let vcpus: Vec<Arc<vstate::VcpuState>> = state.vcpus.into_iter().map(Arc::new).collect();
+        let all: Vec<usize> = (0..vcpus.len()).collect();
+        self.exchange_vcpus(
+            &all,
+            "RestoreState",
+            |i| VcpuEvent::RestoreState(vcpus[i].clone()),
+            |got| match got {
+                VcpuResponse::Restored => Ok(()),
+                other => Err(other),
+            },
+        )
+        .1
+    }
+
+    /// Pause the VM and write its snapshot to `dir` ([`snapshot`]): its CPU state, its legacy
+    /// and virtio-pci devices' and its RAM. The VM stays paused; its disks are the snapshot's
+    /// once it ends. Refused for a VM with devices a snapshot cannot quiesce or keep.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+    pub fn snapshot(&mut self, dir: &std::path::Path) -> std::result::Result<(), String> {
+        use std::os::unix::fs::DirBuilderExt;
+
+        self.check_snapshot_devices()?;
+        self.pause()?;
+        // The devices' threads finish what they are writing to guest memory (a disk batch, a
+        // received frame) and write nothing more until the snapshot is taken.
+        let _quiet = devices::virtio::quiesce_devices(Duration::from_secs(10))
+            .ok_or("the devices did not finish writing guest memory within 10 s")?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        let cpu = self.save_cpu_state()?;
+        let legacy = self
+            .legacy_devices
+            .as_ref()
+            .ok_or("the VM has no legacy devices to snapshot")?
+            .save();
+        let pci = self
+            .pci_device_manager
+            .as_ref()
+            .map(|pci| {
+                pci.transports()
+                    .iter()
+                    .map(|t| t.lock().unwrap().save_state())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let memory =
+            snapshot::ram_regions(&self.guest_memory, self.arch_memory_info.shm_start_addr);
+        let mut saved =
+            snapshot::new_snapshot(cpu, legacy, pci, memory, self.vm_generation_id.is_some());
+        snapshot::write(dir, &self.guest_memory, &mut saved)
+            .map_err(|e| format!("writing the snapshot: {e}"))
+    }
+
+    /// Refuse a VM with a device a snapshot would not keep (virtio-mmio) or whose threads it
+    /// cannot keep off guest memory ([`devices::virtio::QUIESCED_DEVICE_TYPES`]).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+    fn check_snapshot_devices(&self) -> std::result::Result<(), String> {
+        if !self.mmio_device_manager.virtio_mmio_devices().is_empty() {
+            return Err("a snapshot does not keep virtio-mmio devices".into());
+        }
+        for transport in self
+            .pci_device_manager
+            .as_ref()
+            .map_or(&[][..], |pci| pci.transports())
+        {
+            let device_type = transport
+                .lock()
+                .unwrap()
+                .device()
+                .lock()
+                .unwrap()
+                .device_type();
+            if !devices::virtio::QUIESCED_DEVICE_TYPES.contains(&device_type) {
+                return Err(format!(
+                    "a snapshot cannot quiesce virtio device type {device_type}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Bring this VM, built on the configuration of the snapshot in `dir` and its vCPUs
+    /// started paused, to that snapshot, then run it: memory first (the devices read their
+    /// queues' positions from it), then the legacy and virtio-pci devices, then the vCPUs and
+    /// the in-kernel devices, and only then wake the virtio devices and the guest. A guest
+    /// with a VM generation ID gets this VM's, and the notification that it changed.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+    pub fn restore(&mut self, dir: &std::path::Path) -> std::result::Result<(), String> {
+        use vm_memory::{Bytes, GuestAddress};
+
+        let saved = snapshot::read_state(dir).map_err(|e| format!("reading the snapshot: {e}"))?;
+        match (saved.vm_generation_id, self.vm_generation_id) {
+            (true, None) => {
+                return Err(
+                    "the snapshot's guest has a VM generation ID: restoring it needs a new one"
+                        .into(),
+                );
+            }
+            (false, Some(_)) => {
+                return Err("the snapshot's guest has no VM generation ID to change".into());
+            }
+            _ => {}
+        }
+        let memory =
+            snapshot::ram_regions(&self.guest_memory, self.arch_memory_info.shm_start_addr);
+        if memory != saved.memory {
+            return Err("the snapshot's memory layout is not this VM's".into());
+        }
+        let image = snapshot::memory_image(dir, &saved).map_err(|e| e.to_string())?;
+        snapshot::load_memory(&self.guest_memory, &memory, &image)
+            .map_err(|e| format!("loading the memory image: {e}"))?;
+        // The restored RAM holds the snapshot's ID.
+        if let Some(id) = &self.vm_generation_id {
+            self.guest_memory
+                .write_slice(id, GuestAddress(arch::x86_64::layout::VMGENID_ADDR))
+                .map_err(|e| format!("writing the VM generation ID: {e}"))?;
+        }
+        let legacy = self
+            .legacy_devices
+            .clone()
+            .ok_or("the VM has no legacy devices to restore")?;
+        legacy
+            .restore(&saved.legacy)
+            .map_err(|e| format!("restoring the devices: {e}"))?;
+        let transports = self
+            .pci_device_manager
+            .as_ref()
+            .map(|pci| pci.transports().to_vec())
+            .unwrap_or_default();
+        snapshot::restore_transports(&transports, &saved.pci)
+            .map_err(|e| format!("restoring the devices: {e}"))?;
+        self.restore_cpu_state(saved.cpu)?;
+        for transport in &transports {
+            transport.lock().unwrap().kick_restored();
+        }
+        self.resume()?;
+        // As QEMU's vmgenid: the guest re-reads the ID on the GPE's Notify.
+        if self.vm_generation_id.is_some() {
+            legacy
+                .acpi_pm
+                .lock()
+                .unwrap()
+                .raise_gpe(arch::x86_64::layout::VMGENID_GPE);
+        }
+        Ok(())
+    }
+
     /// Ask every vCPU `request` and wait for each to answer. If one does not, `undo` is asked
     /// of those that did, which leaves the VM as it was.
     #[cfg(target_os = "linux")]
@@ -375,55 +609,48 @@ impl Vmm {
         }
     }
 
-    /// Send `event` to the vCPUs `ids` and wait up to 5 s for each to answer `want`: the ids of
-    /// those that did, and the first failure. A vCPU that exits instead leaves its code in
-    /// `vcpu_exit_code` for the `exit_evt` handler.
+    /// Send `event` to the vCPUs `ids` and wait for each to answer `want`: the ids of those
+    /// that did, and the first failure ([`Vmm::exchange_vcpus`]).
     #[cfg(target_os = "linux")]
     fn ask_vcpus(
         &mut self,
         ids: &[usize],
         (event, want): (VcpuEvent, VcpuResponse),
     ) -> (Vec<usize>, std::result::Result<(), String>) {
-        // Answers an earlier, timed-out request left behind would read as this one's.
-        for h in &self.vcpus_handles {
-            while let Ok(stale) = h.response_receiver().try_recv() {
-                if let VcpuResponse::Exited(code) = stale {
-                    self.vcpu_exit_code = Some(code);
+        let what = format!("{event:?}");
+        let (answered, res) = self.exchange_vcpus(
+            ids,
+            &what,
+            |_| event.clone(),
+            |got| {
+                if std::mem::discriminant(&got) == std::mem::discriminant(&want) {
+                    Ok(())
+                } else {
+                    Err(got)
                 }
-            }
-        }
-        let mut failure = None;
-        let mut sent = Vec::new();
-        for &i in ids {
-            match self.vcpus_handles[i].send_event(event.clone()) {
-                Ok(()) => sent.push(i),
-                Err(e) => {
-                    failure = Some(format!("vcpu {i} {event:?} event: {e:?}"));
-                    break;
-                }
-            }
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut answered = Vec::new();
-        for i in sent {
-            let err = match self.vcpus_handles[i]
-                .response_receiver()
-                .recv_deadline(deadline)
-            {
-                Ok(got) if got == want => {
-                    answered.push(i);
-                    continue;
-                }
-                Ok(VcpuResponse::Exited(code)) => {
-                    self.vcpu_exit_code = Some(code);
-                    format!("vcpu {i} exited")
-                }
-                Ok(other) => format!("unexpected vcpu {i} response: {other:?}"),
-                Err(e) => format!("vcpu {i} response to {event:?}: {e}"),
-            };
-            failure.get_or_insert(err);
-        }
-        (answered, failure.map_or(Ok(()), Err))
+            },
+        );
+        (answered.into_iter().map(|(i, ())| i).collect(), res)
+    }
+
+    /// Send each of the vCPUs `ids` the event `event(id)` and wait up to 5 s for its answer,
+    /// which `take` accepts or hands back ([`exchange`]).
+    #[cfg(target_os = "linux")]
+    fn exchange_vcpus<T>(
+        &mut self,
+        ids: &[usize],
+        what: &str,
+        event: impl Fn(usize) -> VcpuEvent,
+        take: impl FnMut(VcpuResponse) -> std::result::Result<T, VcpuResponse>,
+    ) -> (Vec<(usize, T)>, std::result::Result<(), String>) {
+        exchange(
+            &self.vcpus_handles,
+            &mut self.vcpu_exit_code,
+            ids,
+            what,
+            event,
+            take,
+        )
     }
 
     /// Configures the system for boot.
@@ -576,6 +803,65 @@ fn answer(
     res
 }
 
+/// Send each of the vCPUs `ids` of `handles` the event `event(id)` and wait up to 5 s for its
+/// answer, which `take` accepts or hands back: the accepted answers by vCPU id, and the first
+/// failure. A vCPU that exits instead leaves its code in `exit_code` for the `exit_evt`
+/// handler.
+#[cfg(target_os = "linux")]
+fn exchange<T>(
+    handles: &[VcpuHandle],
+    exit_code: &mut Option<u8>,
+    ids: &[usize],
+    what: &str,
+    event: impl Fn(usize) -> VcpuEvent,
+    mut take: impl FnMut(VcpuResponse) -> std::result::Result<T, VcpuResponse>,
+) -> (Vec<(usize, T)>, std::result::Result<(), String>) {
+    // Answers an earlier, timed-out request left behind would read as this one's.
+    for h in handles {
+        while let Ok(stale) = h.response_receiver().try_recv() {
+            if let VcpuResponse::Exited(code) = stale {
+                *exit_code = Some(code);
+            }
+        }
+    }
+    let mut failure = None;
+    let mut sent = Vec::new();
+    for &i in ids {
+        match handles[i].send_event(event(i)) {
+            Ok(()) => sent.push(i),
+            Err(e) => {
+                failure = Some(format!("vcpu {i} {what} event: {e:?}"));
+                break;
+            }
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut answered = Vec::new();
+    for i in sent {
+        let got = match handles[i].response_receiver().recv_deadline(deadline) {
+            Ok(got) => take(got),
+            Err(e) => {
+                failure.get_or_insert(format!("vcpu {i} response to {what}: {e}"));
+                continue;
+            }
+        };
+        let err = match got {
+            Ok(v) => {
+                answered.push((i, v));
+                continue;
+            }
+            Err(VcpuResponse::Exited(code)) => {
+                *exit_code = Some(code);
+                format!("vcpu {i} exited")
+            }
+            Err(VcpuResponse::Error(e)) => format!("vcpu {i} {what}: {e}"),
+            Err(other) => format!("unexpected vcpu {i} response: {other:?}"),
+        };
+        failure.get_or_insert(err);
+    }
+    (answered, failure.map_or(Ok(()), Err))
+}
+
 impl Subscriber for Vmm {
     /// Handle a read event (EPOLLIN).
     fn process(&mut self, event: &EpollEvent, _: &mut EventManager) {
@@ -588,6 +874,13 @@ impl Subscriber for Vmm {
                 let res = match req {
                     VmCtl::Pause(ref reply) => answer(reply, self.pause()),
                     VmCtl::Resume(ref reply) => answer(reply, self.resume()),
+                    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+                    VmCtl::Snapshot(ref dir, ref reply) => answer(reply, self.snapshot(dir)),
+                    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+                    VmCtl::Quit => {
+                        self.stop(FC_EXIT_CODE_OK as i32);
+                        Ok(())
+                    }
                 };
                 if let Err(e) = res {
                     error!("vm {req:?} failed: {e}");
@@ -651,5 +944,48 @@ impl Subscriber for Vmm {
             self.vm_ctl_rx.as_raw_fd() as u64,
         ));
         list
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// A vCPU thread that answers every event with `answer`.
+    fn fake_vcpu(answer: fn() -> VcpuResponse) -> VcpuHandle {
+        let (event_tx, event_rx) = crossbeam_channel::unbounded::<VcpuEvent>();
+        let (response_tx, response_rx) = crossbeam_channel::unbounded();
+        let thread = std::thread::spawn(move || {
+            while event_rx.recv().is_ok() {
+                response_tx.send(answer()).unwrap();
+            }
+        });
+        VcpuHandle::new(event_tx, response_rx, thread)
+    }
+
+    #[test]
+    fn exchange_reports_a_vcpus_error_and_keeps_the_others_answers() {
+        Vcpu::register_kick_signal_handler();
+        let handles = [
+            fake_vcpu(|| VcpuResponse::Restored),
+            fake_vcpu(|| VcpuResponse::Error("the vcpu is running".into())),
+            fake_vcpu(|| VcpuResponse::Exited(3)),
+        ];
+        let mut exit_code = None;
+        let (answered, res) = exchange(
+            &handles,
+            &mut exit_code,
+            &[0, 1, 2],
+            "SaveState",
+            |_| VcpuEvent::Pause,
+            |got| match got {
+                VcpuResponse::Restored => Ok(()),
+                other => Err(other),
+            },
+        );
+        assert_eq!(answered, [(0, ())]);
+        assert_eq!(res, Err("vcpu 1 SaveState: the vcpu is running".into()));
+        // The exit is recorded for the exit handler even though an earlier failure is reported.
+        assert_eq!(exit_code, Some(3));
     }
 }

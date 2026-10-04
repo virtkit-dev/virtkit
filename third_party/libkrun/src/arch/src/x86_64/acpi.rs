@@ -5,7 +5,7 @@ use std::result;
 
 use acpi_tables::aml::{
     AddressSpace, AddressSpaceCacheable, Device, EISAName, IO, Interrupt, Memory32Fixed, Method,
-    Name, Package, PackageBuilder, Path, ResourceTemplate, Return, Scope, ZERO,
+    Name, Notify, Package, PackageBuilder, Path, ResourceTemplate, Return, Scope, ZERO,
 };
 use acpi_tables::facs::FACS;
 use acpi_tables::fadt::{FADTBuilder, Flags};
@@ -24,8 +24,9 @@ use zerocopy::byteorder::{LE, U16, U32};
 use zerocopy::{Immutable, IntoBytes};
 
 use crate::x86_64::layout::{
-    ACPI_PM_BASE, ACPI_RESET_REG, ACPI_RESET_VALUE, PCI_MMIO32_LOW_END, PCI_MMIO32_LOW_START,
-    PVPANIC_PORT, RSDP_ADDR, SCI_GSI, SHM_MEM_SIZE, SHM_MEM_START, VMGENID_ADDR,
+    ACPI_GPE0_BLK, ACPI_GPE0_BLK_LEN, ACPI_PM_BASE, ACPI_RESET_REG, ACPI_RESET_VALUE,
+    PCI_MMIO32_LOW_END, PCI_MMIO32_LOW_START, PVPANIC_PORT, RSDP_ADDR, SCI_GSI, SHM_MEM_SIZE,
+    SHM_MEM_START, VMGENID_ADDR, VMGENID_GPE,
 };
 
 /// Standard local APIC physical base address.
@@ -112,7 +113,7 @@ struct DsdtOptions {
     num_cpus: u8,
     /// See [`setup_acpi`].
     windows_platform: bool,
-    /// Declare the VM generation ID's `VGEN` device.
+    /// Declare the VM generation ID's `VGEN` device, and the GPE that notifies its change.
     vm_generation_id: bool,
 }
 
@@ -275,6 +276,22 @@ fn build_dsdt(
     let mut dsdt = Sdt::new(*b"DSDT", 36, 2, *b"LIBKRN", *b"KRUNDSDT", 1);
     dsdt.append_slice(&s5);
     dsdt.append_slice(&scope_bytes);
+
+    // The VM generation ID's change, as QEMU's vmgenid: its GPE's method notifies `VGEN`,
+    // whose driver then reads the new ID (local patch).
+    if opts.vm_generation_id {
+        let vgen = Path::new("\\_SB_.VGEN");
+        let notify = Notify::new(&vgen, &0x80u8);
+        let method = Method::new(
+            Path::new(&format!("_E{VMGENID_GPE:02X}")),
+            0,
+            false,
+            vec![&notify],
+        );
+        let mut gpe = Vec::new();
+        Scope::new(Path::new("\\_GPE"), vec![&method]).to_aml_bytes(&mut gpe);
+        dsdt.append_slice(&gpe);
+    }
     dsdt.as_slice().to_vec()
 }
 
@@ -282,11 +299,12 @@ fn build_dsdt(
 /// It describes the fixed hardware the `AcpiPm` device serves (local patch, see VENDOR.md)
 /// instead of a HW-reduced platform: the PM1 event and control blocks at `ACPI_PM_BASE`, the
 /// SCI on `SCI_GSI`, and the reset register, so a guest can power off through `\_S5`, take a
-/// fixed-feature power button, and reset, plus the 32-bit PM timer. There is no GPE block and
-/// no SMI command port (the platform is always in ACPI mode). IAPC_BOOT_ARCH advertises the
+/// fixed-feature power button, and reset, plus the 32-bit PM timer. With `gpe0`, the GPE0 block
+/// the VM generation ID's change is signalled through. There is no SMI command port (the
+/// platform is always in ACPI mode). IAPC_BOOT_ARCH advertises the
 /// emulated i8042; Linux treats a clear `ACPI_FADT_8042` bit on FADT revision >= 2 as
 /// firmware-absent.
-fn build_fadt(facs_addr: u64, dsdt_addr: u64) -> Vec<u8> {
+fn build_fadt(facs_addr: u64, dsdt_addr: u64, gpe0: bool) -> Vec<u8> {
     let io = |port: u16, len: u8, access: AccessSize| {
         GAS::new(GasSpace::SystemIo, len * 8, 0, access, u64::from(port))
     };
@@ -311,6 +329,11 @@ fn build_fadt(facs_addr: u64, dsdt_addr: u64) -> Vec<u8> {
     builder.x_pm1a_cnt_blk = io(PM1A_CNT_PORT, PM1_CNT_LEN, AccessSize::WordAccess);
     builder.reset_reg = io(ACPI_RESET_REG, 1, AccessSize::ByteAccess);
     builder.reset_value = ACPI_RESET_VALUE;
+    if gpe0 {
+        builder.gpe0_blk = u32::from(ACPI_GPE0_BLK).into();
+        builder.gpe0_blk_len = ACPI_GPE0_BLK_LEN;
+        builder.x_gpe0_blk = io(ACPI_GPE0_BLK, ACPI_GPE0_BLK_LEN, AccessSize::ByteAccess);
+    }
     let fadt = builder.finalize();
     let mut bytes = Vec::new();
     fadt.to_aml_bytes(&mut bytes);
@@ -416,7 +439,7 @@ pub fn setup_acpi(
     const RSDP_SIZE: u64 = 36;
     let xsdt_entries = 3 + if mcfg.is_some() { 1 } else { 0 };
     let xsdt_size = 36 + xsdt_entries * 8;
-    let fadt_size_placeholder = build_fadt(0, 0).len() as u64;
+    let fadt_size_placeholder = build_fadt(0, 0, false).len() as u64;
     let facs = {
         let mut bytes = Vec::new();
         FACS::new().to_aml_bytes(&mut bytes);
@@ -432,7 +455,7 @@ pub fn setup_acpi(
     let madt_addr = dsdt_addr + dsdt.len() as u64;
     let mcfg_addr = madt_addr + madt.len() as u64;
 
-    let fadt = build_fadt(facs_addr, dsdt_addr);
+    let fadt = build_fadt(facs_addr, dsdt_addr, vm_generation_id.is_some());
     let mut xsdt_entries = vec![fadt_addr, madt_addr];
     if mcfg.is_some() {
         xsdt_entries.push(mcfg_addr);
@@ -594,6 +617,47 @@ mod tests {
     }
 
     #[test]
+    fn dsdt_notifies_the_generation_id_change_on_gpe_5_as_qemu() {
+        // Scope (\_GPE) { Method (_E05, 0, NotSerialized) { Notify (\_SB.VGEN, 0x80) } }
+        let mut gpe = vec![0x10, 0x1a, b'\\', b'_', b'G', b'P', b'E'];
+        gpe.extend_from_slice(&[0x14, 0x13, b'_', b'E', b'0', b'5', 0x00]);
+        gpe.extend_from_slice(&[0x86, b'\\', 0x2e, b'_', b'S', b'B', b'_']);
+        gpe.extend_from_slice(&[b'V', b'G', b'E', b'N', 0x0a, 0x80]);
+        let opts = DsdtOptions {
+            vm_generation_id: true,
+            ..Default::default()
+        };
+        assert!(has(&build_dsdt(&[], None, opts), &gpe));
+        assert!(!has(
+            &build_dsdt(&[], None, DsdtOptions::default()),
+            b"_GPE"
+        ));
+    }
+
+    #[test]
+    fn fadt_declares_the_gpe0_block_on_request() {
+        let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let bytes = build_fadt(0x000e_1000, 0x000e_1100, true);
+        // Offsets per the ACPI 6.x FADT layout.
+        assert_eq!(u32_at(&bytes, 80), 0x610, "GPE0_BLK");
+        assert_eq!(
+            bytes[92], 4,
+            "GPE0_BLK_LEN: GPE0_STS and GPE0_EN, 2 bytes each"
+        );
+        assert_eq!(u32_at(&bytes, 84), 0, "no GPE1_BLK");
+        assert_eq!(bytes[93], 0, "GPE1_BLK_LEN");
+        // X_GPE0_BLK: system I/O, 32 bits, offset 0, byte access, at 0x610.
+        assert_eq!(bytes[220..224], [1, 32, 0, 1]);
+        assert_eq!(bytes[224..232], 0x610u64.to_le_bytes());
+        let sum: u8 = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
+        assert_eq!(sum, 0);
+
+        let bytes = build_fadt(0x000e_1000, 0x000e_1100, false);
+        assert_eq!((u32_at(&bytes, 80), bytes[92]), (0, 0), "no GPE0 block");
+        assert_eq!(bytes[220..232], [0; 12]);
+    }
+
+    #[test]
     fn setup_acpi_writes_the_generation_id_past_the_tables() {
         let window_size = (HIMEM_START - RSDP_ADDR) as usize;
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(RSDP_ADDR), window_size)]).unwrap();
@@ -723,7 +787,7 @@ mod tests {
 
     #[test]
     fn fadt_describes_the_pm1_block_sci_and_reset_register() {
-        let bytes = build_fadt(0x000e_1000, 0x000e_1100);
+        let bytes = build_fadt(0x000e_1000, 0x000e_1100, false);
         let u16_at = |o: usize| u16::from_le_bytes(bytes[o..o + 2].try_into().unwrap());
         let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
         let u64_at = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
@@ -780,7 +844,7 @@ mod tests {
 
     #[test]
     fn fadt_layout_and_checksum() {
-        let bytes = build_fadt(0x000e_1000, 0x000e_1100);
+        let bytes = build_fadt(0x000e_1000, 0x000e_1100, false);
         assert_eq!(&bytes[0..4], b"FACP");
         let sum: u8 = bytes.iter().fold(0u8, |a, &b| a.wrapping_add(b));
         assert_eq!(sum, 0);
