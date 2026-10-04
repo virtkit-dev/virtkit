@@ -5,7 +5,7 @@ use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestMemoryMmap};
 
 mod table;
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum Error {
     /// The size of the SMBIOS table is too big.
     SmBiosOverflow,
@@ -46,6 +46,17 @@ pub fn setup_smbios(
     start_addr: u64,
     oem_strings: &Option<Vec<String>>,
 ) -> Result<u64> {
+    setup_smbios_with_uuid(mem, start_addr, oem_strings, None)
+}
+
+/// [`setup_smbios`], the system information carrying `uuid` (RFC 4122 byte order) when given,
+/// a nil UUID otherwise (local patch).
+pub fn setup_smbios_with_uuid(
+    mem: &GuestMemoryMmap,
+    start_addr: u64,
+    oem_strings: &Option<Vec<String>>,
+    uuid: Option<&[u8; 16]>,
+) -> Result<u64> {
     let start_addr = GuestAddress(start_addr);
     let table_starting_addr = start_addr
         .checked_add(mem::size_of::<Entrypoint30>() as u64)
@@ -58,7 +69,7 @@ pub fn setup_smbios(
     next_write_addr = write_type_0_table(mem, next_write_addr)?;
 
     // System Information (Type 1)
-    next_write_addr = write_type_1_table(mem, next_write_addr)?;
+    next_write_addr = write_type_1_table(mem, next_write_addr, uuid)?;
 
     // OEM Strings (Type 11)
     next_write_addr = write_type_11_table(mem, next_write_addr, oem_strings)?;
@@ -105,10 +116,17 @@ fn write_type_0_table(mem: &GuestMemoryMmap, mut current: GuestAddress) -> Resul
     Ok(current)
 }
 
-fn write_type_1_table(mem: &GuestMemoryMmap, mut current: GuestAddress) -> Result<GuestAddress> {
+fn write_type_1_table(
+    mem: &GuestMemoryMmap,
+    mut current: GuestAddress,
+    uuid: Option<&[u8; 16]>,
+) -> Result<GuestAddress> {
     // Manufacturer and Product Name strings are non-null. One and only one structure
     // is present in the structure-table.
-    let sysinfo = SystemInfo::new(1, 2);
+    let mut sysinfo = SystemInfo::new(1, 2);
+    if let Some(uuid) = uuid {
+        sysinfo = sysinfo.with_uuid(uuid);
+    }
 
     current = write_obj(mem, sysinfo, current)?;
     current = write_string(mem, "Libkrun", current)?;

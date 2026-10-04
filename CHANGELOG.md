@@ -35,7 +35,7 @@ All notable changes to virtkit will be documented in this file.
   (`--edition="Windows 11 Enterprise Evaluation"`, about 70 minutes; the edition must name
   Windows 10 or 11, or the ISO installs as a server and Setup stops at its TPM check), without
   a TPM or Secure Boot, which vk does not emulate yet: WinPE sets Microsoft's `LabConfig` keys
-  so Setup skips those checks.
+  so Setup skips those checks. Windows now sees SMBIOS tables and a system UUID per machine.
 - **`vk snapshot` saves a running Windows VM, and `vk run` starts it again from there.**
   `vk snapshot <pid> --out <dir>` writes a bundle holding the VM's memory (a sparse image),
   its CPU and device state and its disks as they were, and ends the VM; `vk run <dir>` (with

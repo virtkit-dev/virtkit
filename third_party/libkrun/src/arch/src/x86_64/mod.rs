@@ -73,6 +73,8 @@ pub enum Error {
     ZeroPageSetup,
     /// Failed to compute initrd address.
     InitrdAddress,
+    /// Error writing the SMBIOS tables.
+    SmbiosSetup(smbios::Error),
 }
 
 #[cfg(unix)]
@@ -300,7 +302,10 @@ pub fn setup_mptable_for_tdshim(guest_mem: &GuestMemoryMmap, num_cpus: u8) -> su
 /// * `pvh` - Whether to use the PVH boot protocol.
 /// * `pci_host` - The PCI host configuration if enabled.
 /// * `vm_generation_id` - The VM generation ID to declare in the DSDT, if any (local patch).
-/// * `windows_platform` - Shape the DSDT for Windows, see [`acpi::setup_acpi`] (local patch).
+/// * `windows_platform` - Shape the DSDT for Windows, see [`acpi::setup_acpi`], and write the
+///   SMBIOS tables (local patch).
+/// * `system_uuid` - The SMBIOS system UUID of the Windows platform, if any (local patch).
+/// * `smbios_oem_strings` - The SMBIOS OEM strings of the Windows platform, if any (local patch).
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn configure_system(
     guest_mem: &GuestMemoryMmap,
@@ -315,7 +320,20 @@ pub fn configure_system(
     pci_host: Option<&PciHostInfo>,
     vm_generation_id: Option<&[u8; 16]>,
     windows_platform: bool,
+    system_uuid: Option<&[u8; 16]>,
+    smbios_oem_strings: &Option<Vec<String>>,
 ) -> super::Result<()> {
+    // The Windows platform gets SMBIOS tables, which Windows reads for the machine's identity
+    // and otherwise reports missing (local patch).
+    if windows_platform {
+        smbios::setup_smbios_with_uuid(
+            guest_mem,
+            layout::SMBIOS_START,
+            smbios_oem_strings,
+            system_uuid,
+        )
+        .map_err(Error::SmbiosSetup)?;
+    }
     if acpi_enabled {
         acpi::setup_acpi(
             guest_mem,
@@ -661,6 +679,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            &None,
         );
         assert!(config_err.is_err());
         #[cfg(not(feature = "tee"))]
@@ -687,6 +707,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            &None,
         )
         .unwrap();
 
@@ -708,6 +730,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            &None,
         )
         .unwrap();
 
@@ -729,8 +753,78 @@ mod tests {
             None,
             None,
             false,
+            None,
+            &None,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn the_windows_platform_gets_smbios_tables_below_the_vm_generation_id() {
+        // 00112233-4455-6677-8899-aabbccddeeff
+        const UUID: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let (arch_mem_info, arch_mem_regions) =
+            arch_memory_regions(128 << 20, Some(KERNEL_LOAD_ADDR), KERNEL_SIZE, 0, None);
+        let gm = GuestMemoryMmap::from_ranges(&arch_mem_regions).unwrap();
+        let anchor = |gm: &GuestMemoryMmap| {
+            let mut anchor = [0u8; 5];
+            gm.read_slice(&mut anchor, GuestAddress(layout::SMBIOS_START))
+                .unwrap();
+            anchor
+        };
+        let oem_strings = Some(vec!["vk-oem".to_string()]);
+        let configure = |windows_platform| {
+            configure_system(
+                &gm,
+                &arch_mem_info,
+                GuestAddress(0),
+                0,
+                &None,
+                4,
+                true,
+                true,
+                &[],
+                None,
+                Some(&[7; 16]),
+                windows_platform,
+                Some(&UUID),
+                &oem_strings,
+            )
+            .unwrap()
+        };
+
+        configure(false);
+        assert_eq!(&anchor(&gm), &[0; 5]);
+        configure(true);
+        assert_eq!(&anchor(&gm), b"_SM3_");
+        // The 3.0 entry point: the tables' size at offset 12, their address at 16.
+        let table_max_size: u32 = gm
+            .read_obj(GuestAddress(layout::SMBIOS_START + 12))
+            .unwrap();
+        let table_addr: u64 = gm
+            .read_obj(GuestAddress(layout::SMBIOS_START + 16))
+            .unwrap();
+        assert_eq!(table_addr, layout::SMBIOS_START + 24);
+        let mut tables = vec![0u8; table_max_size as usize];
+        gm.read_slice(&mut tables, GuestAddress(table_addr))
+            .unwrap();
+        // They end with the end-of-table structure: type 127, length 4, handle 0x7f00, no strings.
+        assert!(tables.ends_with(&[127, 4, 0x00, 0x7f, 0, 0]));
+        assert!(table_addr + u64::from(table_max_size) <= layout::VMGENID_ADDR);
+        // The system information carries the UUID, its first three fields little-endian.
+        let encoded = [
+            0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        assert!(tables.windows(16).any(|w| w == encoded));
+        assert!(tables.windows(7).any(|w| w == b"vk-oem\0"));
+        let mut id = [0u8; 16];
+        gm.read_slice(&mut id, GuestAddress(layout::VMGENID_ADDR))
+            .unwrap();
+        assert_eq!(id, [7; 16]);
     }
 
     #[cfg(feature = "tee")]

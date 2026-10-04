@@ -37,6 +37,7 @@ pub struct VmmBuilder<'a> {
     pmu: bool,
     hyperv: bool,
     vm_generation_id: Option<[u8; 16]>,
+    system_uuid: Option<[u8; 16]>,
     restore_from: Option<std::path::PathBuf>,
     split_irqchip: bool,
     acpi: bool,
@@ -145,6 +146,16 @@ impl<'a> VmmBuilder<'a> {
         }
         self.vm_generation_id = id;
         Ok(self)
+    }
+
+    /// Give the system the UUID `uuid`, in RFC 4122 byte order (local patch, see VENDOR.md):
+    /// the SMBIOS system information of the Windows platform (Hyper-V enlightenments on)
+    /// carries it, a nil UUID otherwise. Windows and management tools identify the machine by
+    /// it, so keep it across the boots of one disk, and across a restore, and change it for a
+    /// copy that boots fresh. x86_64 only.
+    pub fn system_uuid(mut self, uuid: [u8; 16]) -> Self {
+        self.system_uuid = Some(uuid);
+        self
     }
 
     /// Start the VM from the snapshot in `dir` ([`VmmHandle::snapshot`]) instead of booting
@@ -532,6 +543,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     vm_resources.pmu_enabled = builder_cfg.pmu;
     vm_resources.hyperv_enabled = builder_cfg.hyperv;
     vm_resources.vm_generation_id = builder_cfg.vm_generation_id;
+    vm_resources.system_uuid = builder_cfg.system_uuid;
     vm_resources.restore_from = builder_cfg.restore_from;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;

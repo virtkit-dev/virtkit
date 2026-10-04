@@ -666,6 +666,7 @@ impl Vmm {
         _pvh: bool,
         _vm_generation_id: Option<&[u8; 16]>,
         _windows_platform: bool,
+        _system_uuid: Option<&[u8; 16]>,
     ) -> Result<()> {
         #[cfg(target_arch = "x86_64")]
         {
@@ -697,6 +698,8 @@ impl Vmm {
                 pci_host_info.as_ref(),
                 _vm_generation_id,
                 _windows_platform,
+                _system_uuid,
+                _smbios_oem_strings,
             )
             .map_err(Error::ConfigureSystem)?;
         }

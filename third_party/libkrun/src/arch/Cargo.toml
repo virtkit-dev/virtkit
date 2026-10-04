@@ -21,8 +21,6 @@ zerocopy = { version = "0.8.26", features = ["derive"] }
 
 arch_gen = { package = "krun-arch-gen", version = "=0.1.0-2.0.0-dev", path = "../arch_gen" }
 utils = { package = "krun-utils", version = "=0.1.0-2.0.0-dev", path = "../utils" }
-
-[target.'cfg(not(target_os = "windows"))'.dependencies]
 smbios = { package = "krun-smbios", version = "=0.1.0-2.0.0-dev", path = "../smbios" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
