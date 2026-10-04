@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.82.0] - 2026-10-04
+
 ### Added
 
 - **Experimental: `vk-hub local`, a web UI for the VMs on your machine.** View your pinned
@@ -3439,7 +3441,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.81.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.82.0...HEAD
+[0.82.0]: https://github.com/virtkit-dev/virtkit/compare/v0.81.0...v0.82.0
 [0.81.0]: https://github.com/virtkit-dev/virtkit/compare/v0.80.0...v0.81.0
 [0.80.0]: https://github.com/virtkit-dev/virtkit/compare/v0.79.3...v0.80.0
 [0.79.3]: https://github.com/virtkit-dev/virtkit/compare/v0.79.2...v0.79.3
