@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::vmm::VmCtl;
 use crate::vmm::Vmm as InnerVmm;
 #[cfg(unix)]
@@ -17,7 +17,7 @@ use polly::event_manager::EventManager;
     all(target_arch = "x86_64", target_os = "linux")
 ))]
 use utils::eventfd::EventFd;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use utils::pollable_channel::PollableChannelSender;
 
 use super::device_builders::DeviceManager;
@@ -219,7 +219,7 @@ pub struct Vmm<'a> {
 // so that run() returns a RunningVmm with wait(). Then this handle
 // can be obtained from RunningVmm instead of requiring a pre-run call.
 pub struct VmmHandle {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     vm_ctl_tx: PollableChannelSender<VmCtl>,
     #[cfg(any(
         all(target_arch = "aarch64", target_os = "macos"),
@@ -231,7 +231,7 @@ pub struct VmmHandle {
 impl Clone for VmmHandle {
     fn clone(&self) -> Self {
         Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             vm_ctl_tx: self.vm_ctl_tx.clone(),
             #[cfg(any(
                 all(target_arch = "aarch64", target_os = "macos"),
@@ -247,25 +247,23 @@ impl Clone for VmmHandle {
 
 #[cfg_attr(feature = "ffi", ffier::export)]
 impl VmmHandle {
+    /// Pause the VM; returns once its vCPUs are parked, or with why they are not.
     pub fn pause(&self) -> Result<(), VmmError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            self.vm_ctl_tx
-                .send(VmCtl::Pause)
-                .map_err(|e| VmmError::Internal(format!("pause: {e}")))
+            self.vm_ctl("pause", VmCtl::Pause)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         Err(VmmError::FeatureDisabled())
     }
 
+    /// Resume a paused VM; returns once its vCPUs run, or with why they do not.
     pub fn resume(&self) -> Result<(), VmmError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            self.vm_ctl_tx
-                .send(VmCtl::Resume)
-                .map_err(|e| VmmError::Internal(format!("resume: {e}")))
+            self.vm_ctl("resume", VmCtl::Resume)
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         Err(VmmError::FeatureDisabled())
     }
 
@@ -298,6 +296,25 @@ impl VmmHandle {
     }
 }
 
+impl VmmHandle {
+    /// Send the event loop the request `make` builds around a reply channel, and wait for
+    /// its outcome.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn vm_ctl(
+        &self,
+        what: &str,
+        make: impl FnOnce(crossbeam_channel::Sender<Result<(), String>>) -> VmCtl,
+    ) -> Result<(), VmmError> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.vm_ctl_tx
+            .send(make(tx))
+            .map_err(|e| VmmError::Internal(format!("{what}: {e}")))?;
+        rx.recv()
+            .map_err(|e| VmmError::Internal(format!("{what}: {e}")))?
+            .map_err(VmmError::Internal)
+    }
+}
+
 #[cfg_attr(feature = "ffi", ffier::export)]
 impl<'a> Vmm<'a> {
     /// Obtain a thread-safe handle to the inner VMM.
@@ -307,7 +324,7 @@ impl<'a> Vmm<'a> {
     pub fn handle(&self) -> Result<VmmHandle, VmmError> {
         match &self.inner {
             VmmInner::Vmm {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 vmm,
                 #[cfg(any(
                     all(target_arch = "aarch64", target_os = "macos"),
@@ -316,7 +333,7 @@ impl<'a> Vmm<'a> {
                 shutdown_efd,
                 ..
             } => Ok(VmmHandle {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
                 vm_ctl_tx: vmm.lock().unwrap().vm_ctl_sender(),
                 #[cfg(any(
                     all(target_arch = "aarch64", target_os = "macos"),
@@ -580,4 +597,38 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
         },
         _lifetime: PhantomData,
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    /// `pause` and `resume` wait for the event loop's answer, and return its error.
+    #[test]
+    fn pause_and_resume_return_the_event_loops_answer() {
+        let (tx, rx) = utils::pollable_channel::pollable_channel().unwrap();
+        let handle = VmmHandle {
+            vm_ctl_tx: tx,
+            #[cfg(target_arch = "x86_64")]
+            shutdown_efd: None,
+        };
+        let event_loop = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let req = loop {
+                    if let Some(req) = rx.try_recv().unwrap() {
+                        break req;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                };
+                match req {
+                    VmCtl::Pause(reply) => reply.send(Ok(())).unwrap(),
+                    VmCtl::Resume(reply) => reply.send(Err("vcpu 1 exited".into())).unwrap(),
+                }
+            }
+        });
+        handle.pause().unwrap();
+        let err = handle.resume().unwrap_err();
+        assert!(format!("{err:?}").contains("vcpu 1 exited"), "{err:?}");
+        event_loop.join().unwrap();
+    }
 }

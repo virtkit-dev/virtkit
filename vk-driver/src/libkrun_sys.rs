@@ -345,7 +345,11 @@ fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>) -> Result<()> {
         .attach(builder)
         .build()
         .map_err(krun("building the VM"))?;
-    press_power_button_on_sigterm(vmm.handle().map_err(krun("VM handle"))?)?;
+    let handle = vmm.handle().map_err(krun("VM handle"))?;
+    if let Some(socket) = &spec.control {
+        crate::vmmctl::serve(socket, handle.clone())?;
+    }
+    press_power_button_on_sigterm(handle)?;
 
     // Blocks until the guest powers off or resets; libkrun `_exit`s with its code. It returns
     // only when the event loop fails, which must not read as a clean power-off.
@@ -449,8 +453,18 @@ fn block_sigterm() {
     unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
 }
 
-/// Handle SIGTERM on a dedicated thread: press the guest's ACPI power button and arm
-/// a backstop alarm so the boot child never outlives its parent.
+impl crate::vmmctl::Control for VmmHandle {
+    fn pause(&self) -> Result<()> {
+        VmmHandle::pause(self).map_err(|e| anyhow::anyhow!("pausing the VM: {e}"))
+    }
+
+    fn resume(&self) -> Result<()> {
+        VmmHandle::resume(self).map_err(|e| anyhow::anyhow!("resuming the VM: {e}"))
+    }
+}
+
+/// Handle SIGTERM on a dedicated thread: resume a paused guest, press its ACPI power button,
+/// and arm a backstop alarm so the boot child never outlives its parent.
 fn press_power_button_on_sigterm(handle: VmmHandle) -> Result<()> {
     std::thread::Builder::new()
         .name("vk-power-button".into())
@@ -462,11 +476,17 @@ fn press_power_button_on_sigterm(handle: VmmHandle) -> Result<()> {
                 if unsafe { libc::sigwait(&set, &mut sig) } != 0 || sig != libc::SIGTERM {
                     continue;
                 }
+                // Armed first: resuming waits on the event loop.
+                // SAFETY: alarm(2) has no memory-safety preconditions.
+                unsafe { libc::alarm(POWER_BUTTON_GRACE_SECS) };
+                // A paused guest (`vk pause`) would not see the button; a running one is
+                // left as it is.
+                if let Err(e) = handle.resume() {
+                    eprintln!("virtkit: resuming the VM to power it off: {e}");
+                }
                 if let Err(e) = handle.shutdown() {
                     eprintln!("virtkit: pressing the power button: {e}");
                 }
-                // SAFETY: alarm(2) has no memory-safety preconditions.
-                unsafe { libc::alarm(POWER_BUTTON_GRACE_SECS) };
             }
         })
         .context("spawning the power-button thread")?;

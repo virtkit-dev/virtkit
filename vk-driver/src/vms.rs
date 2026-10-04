@@ -98,6 +98,10 @@ pub struct VmEntry {
     /// `vk cp` use instead of `exec_addr`; `None` for a guest running vk-agent.
     #[serde(default)]
     pub guest_agent: Option<PathBuf>,
+    /// The VM's control socket ([`crate::vmmctl`]), which `vk pause` and `vk resume` use;
+    /// `None` for a VM without one.
+    #[serde(default)]
+    pub control: Option<PathBuf>,
 }
 
 /// A sibling compose service declared alongside the primary VM.
@@ -1614,6 +1618,69 @@ pub fn reboot_cmd(target: Option<Selector>, all: bool, force: bool) -> Result<(S
     Ok((out, ok))
 }
 
+/// What `vk pause` or `vk resume` asks of each VM's control socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PauseRequest {
+    Pause,
+    Resume,
+}
+
+impl PauseRequest {
+    fn request(self) -> &'static str {
+        match self {
+            PauseRequest::Pause => "pause",
+            PauseRequest::Resume => "resume",
+        }
+    }
+
+    fn done(self) -> &'static str {
+        match self {
+            PauseRequest::Pause => "paused",
+            PauseRequest::Resume => "resumed",
+        }
+    }
+}
+
+/// Pause or resume VMs through their control sockets. Select by `--all`, pid or project
+/// directory; default to the current directory. `--all` skips VMs without a control socket.
+/// Return the summary and whether every VM acted on succeeded.
+pub fn pause_cmd(target: Option<Selector>, all: bool, req: PauseRequest) -> Result<(String, bool)> {
+    let selected = match select_vms(target, all)? {
+        Selection::Matched(v) => v,
+        Selection::Empty(out, ok) => return Ok((out, ok)),
+    };
+    let mut out = String::new();
+    let mut ok = true;
+    for e in selected.iter().filter(|e| !all || e.control.is_some()) {
+        let (line, done) = pause_line(e, req);
+        out.push_str(&line);
+        ok &= done;
+    }
+    if out.is_empty() {
+        out.push_str("no running vk VM can be paused (only UEFI guests can)\n");
+    }
+    Ok((out, ok))
+}
+
+/// Send `req` to the VM in `entry`, as [`pause_cmd`] does for each VM.
+/// Return the report line and whether the request succeeded.
+fn pause_line(entry: &VmEntry, req: PauseRequest) -> (String, bool) {
+    let vm = format!("{} (pid {})", entry.label, entry.pid);
+    if !alive(entry) {
+        return (format!("{vm} is not running\n"), false);
+    }
+    let Some(socket) = &entry.control else {
+        return (
+            format!("{vm} has no control socket (only UEFI guests can be paused)\n"),
+            false,
+        );
+    };
+    match crate::vmmctl::request(socket, req.request()) {
+        Ok(()) => (format!("{} {vm}\n", req.done()), true),
+        Err(e) => (format!("{vm}: {e:#}\n"), false),
+    }
+}
+
 /// Bind a control socket that answers the first request line with `frames`, in order.
 /// `None` closes the connection without answering.
 #[cfg(test)]
@@ -1696,6 +1763,7 @@ mod tests {
             stale_recipe: None,
             services: Vec::new(),
             guest_agent: None,
+            control: None,
         }
     }
 
@@ -3090,6 +3158,64 @@ PUBLISHED     -
         assert!(run.alive(), "the entry's run was signalled");
         assert!(relay.alive(), "its relay was stopped");
         assert!(dir.join("publish/web.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A VM control that pauses and refuses to resume.
+    struct PauseOnly;
+
+    impl crate::vmmctl::Control for PauseOnly {
+        fn pause(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn resume(&self) -> Result<()> {
+            bail!("vcpu 1 exited")
+        }
+    }
+
+    /// Pause and resume require a running VM with a control socket; report the socket's error.
+    #[test]
+    fn pause_line_reports_each_vm() {
+        let dir = tmpdir("pause");
+        let sock = dir.join("vmm.sock");
+        crate::vmmctl::serve(&sock, PauseOnly).unwrap();
+        let mut e = entry(dir.clone(), None);
+        e.control = Some(sock);
+        let (line, ok) = pause_line(&e, PauseRequest::Pause);
+        assert_eq!(
+            line,
+            format!("devcontainer (pid {}) is not running\n", e.pid)
+        );
+        assert!(!ok);
+
+        // The run holds its state dir's lock.
+        let lock = std::fs::File::open(&dir).unwrap();
+        // SAFETY: the fd is owned by `lock`, which outlives the call.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let (line, ok) = pause_line(&e, PauseRequest::Pause);
+        assert_eq!(line, format!("paused devcontainer (pid {})\n", e.pid));
+        assert!(ok);
+        let (line, ok) = pause_line(&e, PauseRequest::Resume);
+        assert_eq!(
+            line,
+            format!("devcontainer (pid {}): vcpu 1 exited\n", e.pid)
+        );
+        assert!(!ok);
+
+        e.control = None;
+        let (line, ok) = pause_line(&e, PauseRequest::Pause);
+        assert_eq!(
+            line,
+            format!(
+                "devcontainer (pid {}) has no control socket (only UEFI guests can be paused)\n",
+                e.pid
+            )
+        );
+        assert!(!ok);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

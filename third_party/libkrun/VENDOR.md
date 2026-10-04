@@ -532,3 +532,18 @@ in `hyperv.rs` and, against the host's KVM, `test_configure_vcpu_with_hyperv` in
     instead of 22 s.
 
 Covered by the DSDT and `setup_acpi` tests in `acpi.rs` and the pvpanic test.
+
+`src/libkrun/src/{api/vmm_builder.rs,vmm/builder.rs,vmm/mod.rs,vmm/linux/vstate.rs}` —
+`VmmHandle::pause`/`resume` on Linux/KVM, which upstream implements on macOS only (Linux
+returned `FeatureDisabled`). The same `VmCtl` channel reaches the event loop, which sends
+`Pause`/`Resume` to every vCPU and waits for each to answer: the vCPU's kick signal sets
+`immediate_exit`, so `KVM_RUN` completes a pending I/O and returns, and the thread parks.
+`VmCtl::Pause`/`Resume` carry a reply channel, so `pause`/`resume` return the outcome rather
+than once the request is queued (macOS too). If a vCPU fails to answer, those that did are
+switched back, so the VM stays as it was; a vCPU that exits meanwhile leaves its code for the
+`exit_evt` handler. A paused vCPU now answers a second `Pause` instead of leaving it
+unanswered. The guest's clock is the TSC, which runs on, so a Windows guest's time is right on
+resume. The `KVM_KVMCLOCK_CTRL` TODO in `Vcpu::running` matters only to a Linux guest's
+kvmclock (its soft-lockup watchdog), and virtkit pauses only UEFI guests. Covered by
+`test_vcpu_pause_resume` in `vstate.rs` and `pause_and_resume_return_the_event_loops_answer`
+in `vmm_builder.rs`.

@@ -324,6 +324,7 @@ mod tests {
             stale_recipe: None,
             services: Vec::new(),
             guest_agent: None,
+            control: None,
         }
     }
 
