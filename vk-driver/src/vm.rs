@@ -1709,6 +1709,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         vm_generation_id: None,
         serial_input: None,
         control: None,
+        restore_from: None,
     };
     // passive listeners the guest dials once up: safe (and simplest) to start before
     // the VMM, and intentionally not bind-waited — they bind long before the guest
@@ -4828,6 +4829,7 @@ mod tests {
             service_media(&Source::Bundle {
                 dir: PathBuf::from("/b/win"),
                 command: None,
+                snapshot: false,
             }),
             ServiceMedia::Bundle
         );

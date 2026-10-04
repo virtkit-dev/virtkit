@@ -726,6 +726,9 @@ pub struct VmSpec {
     /// A Unix socket the boot child answers VM control requests on ([`crate::vmmctl`]).
     #[serde(default)]
     pub control: Option<PathBuf>,
+    /// A snapshot directory ([`crate::vmmctl`]) the VM starts from instead of booting.
+    #[serde(default)]
+    pub restore_from: Option<PathBuf>,
 }
 
 /// A virtual machine monitor that can boot a [`VmSpec`]. `Send` so a boxed `dyn Vmm`

@@ -376,6 +376,9 @@ pub struct RunArgs {
     /// activated compose profiles (profiled services stay down unless activated
     /// or depended on)
     pub profiles: Vec<String>,
+    /// A fleet snapshot (`vk snapshot --run-dir`): each Windows service with a bundle there
+    /// starts from it.
+    pub from_snapshot: Option<PathBuf>,
     /// boot this compose service as the PRIMARY run VM (`docker compose run`):
     /// its image is the rootfs, its merged config the command's env (and, with no
     /// trailing command, its entrypoint+cmd the command); only its depends_on
@@ -511,6 +514,7 @@ impl Default for RunArgs {
             compose: None,
             profiles: Vec::new(),
             primary: None,
+            from_snapshot: None,
             build_net: crate::build::BuildNet::All,
             ssh_agent: false,
             ssh_hosts: Vec::new(),
@@ -2278,6 +2282,7 @@ async fn build_and_boot(
         vm_generation_id: None,
         serial_input: None,
         control: None,
+        restore_from: None,
     };
     // Control server on the primary's per-port control socket — only the
     // primary's guest can reach it, so the control plane is scoped to this run —
@@ -3109,7 +3114,11 @@ fn plan_services(
     // so no two guests — nor the primary, which draws from the same one — can be handed the
     // same address, and every service's eth0 keeps the address its slot alone decides.
     for s in sited {
-        let unit = &units[s.unit];
+        let mut unit = units[s.unit].clone();
+        if let Some(from) = &args.from_snapshot {
+            use_snapshot(&mut unit, from);
+        }
+        let unit = &unit;
         let extra_ips = extra.take(gw, prefix, unit.nics.saturating_sub(1))?;
         let prov = crate::units::provision(
             cfg,
@@ -3165,6 +3174,17 @@ fn plan_services(
     }
     push_primary_hosts(&mut planned.hosts, units, primary_idx, primary_ip);
     Ok(planned)
+}
+
+/// Start the Windows unit `unit` from its snapshot in the fleet snapshot `from`
+/// (`--from-snapshot`), if it has one there.
+fn use_snapshot(unit: &mut crate::compose::Unit, from: &Path) {
+    if let crate::compose::Source::Bundle { dir, snapshot, .. } = &mut unit.source
+        && let Some(bundle) = crate::snapshot::service_snapshot(from, &unit.name)
+    {
+        *dir = bundle;
+        *snapshot = true;
+    }
 }
 
 /// Append resolver entries for the run VM, which boots outside the sibling loop.
@@ -4789,6 +4809,7 @@ pub(crate) async fn boot_session(
         vm_generation_id: None,
         serial_input: None,
         control: None,
+        restore_from: None,
     };
     let vmm = crate::vmm::selected();
     let addr = crate::vmm::exec_addr(&vsock, VSOCK_PORT);
@@ -5797,10 +5818,50 @@ mod tests {
         units[db].source = crate::compose::Source::Bundle {
             dir: PathBuf::from("/b/win"),
             command: None,
+            snapshot: false,
         };
         apply_service_overrides(&mut units, &[], &[], &[("db".into(), 1)]).unwrap();
         let err = apply_service_overrides(&mut units, &[], &[], &[("db".into(), 2)]).unwrap_err();
         assert!(format!("{err:#}").contains("one NIC"), "{err:#}");
+    }
+
+    #[test]
+    fn from_snapshot_starts_a_windows_service_with_a_snapshot_from_it() {
+        let from = std::env::temp_dir().join(format!("vk-run-from-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&from);
+        std::fs::create_dir_all(from.join("dc")).unwrap();
+        std::fs::write(from.join("dc").join(crate::uefi::MANIFEST), "{}").unwrap();
+        let mut units = crate::compose::parse(
+            "services:\n  dc:\n    image: w\n  member:\n    image: w\n  web:\n    image: x\n",
+            Path::new("/b"),
+            &|_| None,
+            None,
+        )
+        .unwrap();
+        for unit in units.iter_mut().filter(|u| u.name != "web") {
+            unit.source = crate::compose::Source::Bundle {
+                dir: PathBuf::from("/b/win"),
+                command: None,
+                snapshot: false,
+            };
+        }
+        for unit in &mut units {
+            use_snapshot(unit, &from);
+        }
+        let source = |name: &str| &units.iter().find(|u| u.name == name).unwrap().source;
+        let crate::compose::Source::Bundle { dir, snapshot, .. } = source("dc") else {
+            panic!("{:?}", source("dc"));
+        };
+        assert_eq!(*dir, std::fs::canonicalize(from.join("dc")).unwrap());
+        assert!(*snapshot);
+        // No snapshot of its own: it boots its image.
+        let crate::compose::Source::Bundle { dir, snapshot, .. } = source("member") else {
+            panic!("{:?}", source("member"));
+        };
+        assert_eq!(*dir, PathBuf::from("/b/win"));
+        assert!(!*snapshot);
+        assert!(matches!(source("web"), crate::compose::Source::Image(_)));
+        let _ = std::fs::remove_dir_all(&from);
     }
 
     #[test]
@@ -5816,6 +5877,7 @@ mod tests {
         units[win].source = crate::compose::Source::Bundle {
             dir: PathBuf::from("/b/win"),
             command: None,
+            snapshot: false,
         };
         assert!(resolve_primary(&units, "web").is_ok());
         let err = resolve_primary(&units, "win").unwrap_err();
@@ -6299,6 +6361,7 @@ mod tests {
             vm_generation_id: None,
             serial_input: None,
             control: None,
+            restore_from: None,
         };
         let mut child = spawn_vmm(&CatVmm, &spec, crate::prio::Prio::Normal).unwrap();
         assert!(child.wait().unwrap().success());

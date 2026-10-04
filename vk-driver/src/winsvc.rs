@@ -12,6 +12,9 @@
 //! `VK_IP`, `VK_PREFIX` and `VK_GATEWAY` ahead of the service's environment. It runs at every
 //! start, so it must be safe to run again; its exit code 3010 or 1641 restarts Windows and runs
 //! it once more, up to [`MAX_RESTARTS`] times.
+//!
+//! A service started from its snapshot (`vk run --compose --from-snapshot`) resumes instead of
+//! booting, provisioned already: it is up once its qemu-ga answers, and its clock is then set.
 
 use std::io::Write;
 use std::net::Ipv4Addr;
@@ -39,6 +42,10 @@ pub(crate) const SECRETS_DIR: &str = r"C:\ProgramData\Docker\secrets";
 
 /// The provisioning's output, in the unit's runtime dir.
 pub(crate) const PROVISION_LOG: &str = "provision.log";
+
+/// The unit's address on its run's LAN, in its runtime dir: what `vk snapshot --run-dir`
+/// records, so a restore can check it gets the same one.
+pub(crate) const ADDRESS: &str = "address";
 
 /// What a bundle unit boots with when neither its compose `x-virtkit` nor its `vm.json` sizes it.
 const DEFAULT_CPUS: u32 = 2;
@@ -74,8 +81,21 @@ pub(crate) fn boot(
         .clone()
         .or_else(|| bundle.manifest.mem.clone())
         .unwrap_or_else(|| DEFAULT_MEM.to_string());
+    crate::uefi::check_restore(
+        &bundle.manifest,
+        svc.cpus,
+        svc.mem.as_deref(),
+        Some(svc.addr),
+    )
+    .with_context(|| format!("service {}", svc.name))?;
+    let address = dir.join(ADDRESS);
+    std::fs::write(&address, svc.addr.to_string())
+        .with_context(|| format!("writing {}", address.display()))?;
     let firmware = crate::uefi::firmware()?;
-    let mut spec = crate::uefi::guest_spec(&firmware.path, dir, &svc.name, disks, cpus, &mem)?;
+    // A snapshot (`vk run --compose --from-snapshot`) resumes instead of booting.
+    let restore = bundle.manifest.snapshot.map(|_| bundle.dir.as_path());
+    let mut spec =
+        crate::uefi::guest_spec(&firmware.path, dir, &svc.name, disks, cpus, &mem, restore)?;
     spec.nics = crate::vmm::switch_attach(
         &dir.join(crate::units::VSOCK_SOCKET),
         net_port,
@@ -99,6 +119,8 @@ pub(crate) struct Provisioning {
     pub env: Vec<(String, String)>,
     /// copied into [`SECRETS_DIR`] before the provisioning runs
     pub secrets: Vec<crate::compose::Secret>,
+    /// The service resumes from a snapshot, provisioned already: only its clock is set.
+    pub restored: bool,
 }
 
 impl Provisioning {
@@ -111,6 +133,10 @@ impl Provisioning {
         gateway: Ipv4Addr,
     ) -> Result<Provisioning> {
         let record = crate::winbuild::provisioning(&svc.ext4)?;
+        let restored = matches!(
+            unit.source,
+            crate::compose::Source::Bundle { snapshot: true, .. }
+        );
         let command = match &unit.source {
             crate::compose::Source::Bundle {
                 command: Some(line),
@@ -144,6 +170,7 @@ impl Provisioning {
             workdir: record.workdir,
             env,
             secrets: unit.secrets.clone(),
+            restored,
         })
     }
 
@@ -155,6 +182,21 @@ impl Provisioning {
         let log_path = self.dir.join(PROVISION_LOG);
         let mut log = std::fs::File::create(&log_path)
             .with_context(|| format!("creating {}", log_path.display()))?;
+        if self.restored {
+            println!("virtkit: service {}: resuming from its snapshot", self.name);
+            // Its setup finished before the snapshot: its agent answering is enough.
+            let mut ga = crate::qga::Client::connect(&socket, START_TIMEOUT)
+                .context("the restored guest's agent did not answer")?;
+            // It resumes at the time its snapshot was taken.
+            if let Err(e) = crate::uefi::set_clock(&mut ga) {
+                eprintln!(
+                    "virtkit: service {}: warning: its clock is not set, so Kerberos may fail \
+                     until it is: {e:#}",
+                    self.name
+                );
+            }
+            return Ok(());
+        }
         println!(
             "virtkit: service {}: waiting for Windows, then its provisioning (log {})",
             self.name,
@@ -434,6 +476,7 @@ mod tests {
                 target: "join".into(),
                 file: dir.join("pw.txt"),
             }],
+            restored: false,
         };
         let result = p.put_secrets(&mut ga);
         let _ = std::fs::remove_dir_all(&dir);

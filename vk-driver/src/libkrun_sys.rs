@@ -335,6 +335,10 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
         .map_err(krun("serial console"))?
         .vm_generation_id(spec.vm_generation_id)
         .map_err(krun("VM generation ID"))?;
+    let builder = match &spec.restore_from {
+        Some(dir) => builder.restore_from(dir.clone()),
+        None => builder,
+    };
     let vmm = devices
         .attach(builder)
         .build()
@@ -454,6 +458,14 @@ impl crate::vmmctl::Control for VmmHandle {
 
     fn resume(&self) -> Result<()> {
         VmmHandle::resume(self).map_err(|e| anyhow::anyhow!("resuming the VM: {e}"))
+    }
+
+    fn snapshot(&self, dir: &std::path::Path) -> Result<()> {
+        VmmHandle::snapshot(self, dir).map_err(|e| anyhow::anyhow!("snapshotting the VM: {e}"))
+    }
+
+    fn quit(&self) -> Result<()> {
+        VmmHandle::quit(self).map_err(|e| anyhow::anyhow!("ending the VM: {e}"))
     }
 }
 
