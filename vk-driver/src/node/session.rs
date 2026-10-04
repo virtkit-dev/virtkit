@@ -1,14 +1,14 @@
 //! One session with the hub: dial, authenticate, then inventory and heartbeats until the
 //! connection fails or the process is told to stop. [`super::run`] redials.
 //!
-//! Nothing in the session loop waits on the host: the inventory and heartbeat are gathered
-//! by a [`Gatherer`] task of their own, since a hung mount's `statvfs` or a held ledger lock
-//! would otherwise stop the loop from noticing that the hub has gone quiet. Every send has
-//! a deadline, and the socket carries keepalives and a `TCP_USER_TIMEOUT`, so a peer that
-//! vanished without a word ends the session rather than wedging it.
+//! Nothing in the session loop waits on the host: the inventory, heartbeat and workloads are
+//! gathered by a [`Gatherer`] task of their own, since a hung mount's `statvfs` or a held
+//! ledger lock would otherwise stop the loop from noticing that the hub has gone quiet. Every
+//! send has a deadline, and the socket carries keepalives and a `TCP_USER_TIMEOUT`, so a peer
+//! that vanished without a word ends the session rather than wedging it.
 
 use std::os::fd::AsRawFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -18,11 +18,14 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use vk_hub_proto::{Channel, Heartbeat, HubMsg, Inventory, NodeMsg, PROTOCOL, TLS_EXPORTER_LEN};
+use vk_hub_proto::{
+    Channel, Heartbeat, HubMsg, Inventory, NodeMsg, PROTOCOL, Report, TLS_EXPORTER_LEN,
+};
 
 use super::Enrollment;
 use super::identity::Identity;
 use crate::config::Config;
+use crate::workloads::{Listed, Lister};
 
 /// How long dialing, TLS and the WebSocket handshake may take together, and how long each
 /// handshake message may take to arrive.
@@ -80,8 +83,9 @@ enum Ask {
 
 /// What it answers with.
 pub enum Gathered {
-    Inventory(Inventory),
-    Heartbeat(Heartbeat),
+    Inventory(Box<Inventory>),
+    /// The heartbeat, and the workloads its memory readings are for.
+    Heartbeat(Heartbeat, Listed),
 }
 
 /// The task that reads the host for the session, for the life of `vk node run`. Asked
@@ -90,18 +94,30 @@ pub enum Gathered {
 pub struct Gatherer {
     ask: mpsc::Sender<Ask>,
     answers: mpsc::Receiver<Gathered>,
+    /// The workloads last gathered, which a new session reports until it gathers its own.
+    workloads: Option<Listed>,
 }
 
 impl Gatherer {
     pub fn spawn(cfg: Arc<Config>) -> Self {
         let (ask, mut asked) = mpsc::channel::<Ask>(2);
         let (answer, answers) = mpsc::channel(4);
+        // Kept across asks, for its cadence and its last figures: one heartbeat is gathered at
+        // a time, so the lock is never contended.
+        let lister = Arc::new(Mutex::new(Lister::new(cfg.node.workload_mem_every())));
         tokio::spawn(async move {
             while let Some(what) = asked.recv().await {
                 let cfg = cfg.clone();
+                let lister = lister.clone();
                 let gathered = tokio::task::spawn_blocking(move || match what {
-                    Ask::Inventory => Gathered::Inventory(super::inventory::inventory(&cfg)),
-                    Ask::Heartbeat => Gathered::Heartbeat(super::inventory::heartbeat(&cfg)),
+                    Ask::Inventory => {
+                        Gathered::Inventory(Box::new(super::inventory::inventory(&cfg)))
+                    }
+                    Ask::Heartbeat => {
+                        let mut lister = lister.lock().unwrap_or_else(PoisonError::into_inner);
+                        let (heartbeat, workloads) = super::inventory::heartbeat(&cfg, &mut lister);
+                        Gathered::Heartbeat(heartbeat, workloads)
+                    }
                 })
                 .await;
                 match gathered {
@@ -114,7 +130,11 @@ impl Gatherer {
                 }
             }
         });
-        Gatherer { ask, answers }
+        Gatherer {
+            ask,
+            answers,
+            workloads: None,
+        }
     }
 
     /// Ask, unless as much is already asked: a gatherer still busy with the last request is
@@ -155,6 +175,11 @@ pub async fn run(
         heartbeat.as_secs()
     );
 
+    let mut sent = Sent {
+        workloads: gatherer.workloads.clone(),
+        ..Sent::default()
+    };
+    sent.sync(&mut ws, heartbeat).await?;
     gatherer.drain();
     gatherer.request(Ask::Inventory);
     let mut sent_inventory: Option<Inventory> = None;
@@ -178,13 +203,19 @@ pub async fn run(
             _ = beat.tick() => gatherer.request(Ask::Heartbeat),
             _ = recheck.tick() => gatherer.request(Ask::Inventory),
             Some(gathered) = gatherer.answers.recv() => match gathered {
-                Gathered::Heartbeat(hb) => {
+                Gathered::Heartbeat(hb, workloads) => {
+                    // The report first, so the heartbeat's readings land on the list they are for.
+                    if sent.workloads.as_ref() != Some(&workloads) {
+                        gatherer.workloads = Some(workloads.clone());
+                        sent.workloads = Some(workloads);
+                        sent.sync(&mut ws, heartbeat).await?;
+                    }
                     send(&mut ws, &NodeMsg::Heartbeat(hb), heartbeat).await?;
                 }
                 Gathered::Inventory(inventory) => {
-                    if sent_inventory.as_ref() != Some(&inventory) {
-                        send(&mut ws, &NodeMsg::Inventory(inventory.clone()), heartbeat).await?;
-                        sent_inventory = Some(inventory);
+                    if sent_inventory.as_ref() != Some(&*inventory) {
+                        send(&mut ws, &NodeMsg::Inventory((*inventory).clone()), heartbeat).await?;
+                        sent_inventory = Some(*inventory);
                     }
                 }
             },
@@ -209,6 +240,29 @@ pub async fn run(
                 }
             }
         }
+    }
+}
+
+/// What this session has told the hub, so a change is sent once.
+#[derive(Default)]
+struct Sent {
+    report: Option<Report>,
+    /// The workloads the report carries.
+    workloads: Option<Listed>,
+}
+
+impl Sent {
+    /// Send the report if it changed.
+    async fn sync(&mut self, ws: &mut Ws, within: Duration) -> Result<()> {
+        let report = Report {
+            workloads: self.workloads.as_ref().map(|l| l.workloads.clone()),
+            workloads_omitted: self.workloads.as_ref().map_or(0, |l| l.omitted),
+        };
+        if self.report.as_ref() != Some(&report) {
+            send(ws, &NodeMsg::Report(report.clone()), within).await?;
+            self.report = Some(report);
+        }
+        Ok(())
     }
 }
 
@@ -593,14 +647,17 @@ mod tests {
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, PROTOCOL, PROTOCOL.max).await);
             hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
-            let (mut inventory, mut heartbeat) = (false, false);
+            let (mut inventory, mut heartbeat, mut workloads) = (false, false, false);
             while !(inventory && heartbeat) {
                 match hub_receive(&mut ws).await.unwrap() {
                     NodeMsg::Inventory(_) => inventory = true,
                     NodeMsg::Heartbeat(_) => heartbeat = true,
+                    NodeMsg::Report(r) => workloads |= r.workloads.is_some(),
                     other => panic!("unexpected {other:?}"),
                 }
             }
+            // The first heartbeat's workloads went out on a report ahead of it.
+            assert!(workloads);
             stop.send(true).unwrap();
             // A close frame, not a dropped socket.
             loop {
@@ -610,6 +667,37 @@ mod tests {
                     other => panic!("expected a close frame, got {other:?}"),
                 }
             }
+        };
+        let (_, ended) = tokio::join!(hub, run(node, gatherer, stopped));
+        ended.unwrap();
+    }
+
+    /// The workloads go out on a report once, and not again with every heartbeat while
+    /// they stay the same.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workloads_are_reported_once_while_they_stay_the_same() {
+        let mut f = fixture("workloads").await;
+        let (node, gatherer, stopped, listener, stop) = f.parts();
+        let key = node.identity.public_key().to_vec();
+        let hub = async {
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, PROTOCOL, PROTOCOL.max).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            let (mut heartbeats, mut with_workloads) = (0, 0);
+            while heartbeats < 4 {
+                match next_of(&mut ws, Some).await {
+                    NodeMsg::Heartbeat(_) => {
+                        heartbeats += 1;
+                        // As a hub pings, so the node does not give the session up as silent.
+                        ws.send(Message::Ping(Vec::new().into())).await.unwrap();
+                    }
+                    NodeMsg::Report(r) if r.workloads.is_some() => with_workloads += 1,
+                    _ => {}
+                }
+            }
+            assert_eq!(with_workloads, 1);
+            stop.send(true).unwrap();
+            while hub_receive(&mut ws).await.is_some() {}
         };
         let (_, ended) = tokio::join!(hub, run(node, gatherer, stopped));
         ended.unwrap();
@@ -660,6 +748,19 @@ mod tests {
             let err = ended.unwrap_err();
             assert_eq!(err.is::<Permanent>(), permanent, "{code:?}");
             assert!(!format!("{err:#}").contains('\u{1b}'));
+        }
+    }
+
+    /// The next message of a kind `pick` accepts, skipping the rest.
+    async fn next_of<T>(ws: &mut HubSide, pick: impl Fn(NodeMsg) -> Option<T>) -> T {
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(10), hub_receive(ws))
+                .await
+                .expect("the node went quiet")
+                .expect("the node closed the session");
+            if let Some(t) = pick(msg) {
+                return t;
+            }
         }
     }
 

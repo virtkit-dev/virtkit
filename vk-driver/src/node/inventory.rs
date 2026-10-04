@@ -1,7 +1,7 @@
 //! What `vk node` reports: the inventory — hardware, storage, versions, runner — and the
-//! heartbeat's readings. Everything comes from what the rest of `vk` already measures: the
-//! admission ledger, the scheduler's desired-concurrency file, the memory budget, the NUMA
-//! topology and `vk check`.
+//! heartbeat's readings, with the workloads read alongside them. Everything comes from what
+//! the rest of `vk` already measures: the admission ledger, the scheduler's
+//! desired-concurrency file, the memory budget, the NUMA topology and `vk check`.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -71,26 +71,33 @@ pub fn inventory(cfg: &Config) -> Inventory {
     }
 }
 
-pub fn heartbeat(cfg: &Config) -> Heartbeat {
+/// The heartbeat, and the workloads its memory readings are for: both read off one pass over
+/// the admission ledger.
+pub fn heartbeat(
+    cfg: &Config,
+    lister: &mut crate::workloads::Lister,
+) -> (Heartbeat, crate::workloads::Listed) {
     // `committed` takes the ledger's exclusive lock, as `vk tune` does: every entry is
     // rewritten under it, so a reader without it could catch a line half-written, and the
     // dead entries it prunes on the way would otherwise go on counting. The lock is held for
     // one directory scan.
-    let admission = match crate::admit::committed(&cfg.state_dir().join("admit")) {
-        Ok(held) => Some(Admission {
-            committed_mib: held.granted_mib,
-            // An unresolvable budget (a percentage on a host whose memory cannot be read) is
-            // reported as none: `vk tune` refuses to run on it, so there is no budget in force.
-            budget_mib: crate::vm::budget_mib(cfg).and_then(Result::ok),
-            running: u32::try_from(held.granted).unwrap_or(u32::MAX),
-            waiting: u32::try_from(held.ahead).unwrap_or(u32::MAX),
-        }),
+    let held = match crate::admit::committed(&cfg.state_dir().join("admit")) {
+        Ok(held) => Some(held),
         Err(e) => {
             eprintln!("vk node: cannot read the admission ledger: {e:#}");
             None
         }
     };
-    Heartbeat {
+    let admission = held.as_ref().map(|held| Admission {
+        committed_mib: held.granted_mib,
+        // An unresolvable budget (a percentage on a host whose memory cannot be read) is
+        // reported as none: `vk tune` refuses to run on it, so there is no budget in force.
+        budget_mib: crate::vm::budget_mib(cfg).and_then(Result::ok),
+        running: u32::try_from(held.granted).unwrap_or(u32::MAX),
+        waiting: u32::try_from(held.ahead).unwrap_or(u32::MAX),
+    });
+    let (workloads, workload_mem_bytes) = lister.collect(cfg, held.as_ref());
+    let heartbeat = Heartbeat {
         admission,
         desired_concurrency: std::fs::read_to_string(crate::schedule::desired_file(cfg))
             .ok()
@@ -108,8 +115,9 @@ pub fn heartbeat(cfg: &Config) -> Heartbeat {
                 })
             })
             .collect(),
-        workload_mem_bytes: Default::default(),
-    }
+        workload_mem_bytes,
+    };
+    (heartbeat, workloads)
 }
 
 /// The filesystems a node reports: the job dirs always, host checkouts when the executor
@@ -330,7 +338,8 @@ mod tests {
         assert_eq!(fs.speed, Some(vk_hub_proto::SpeedClass::Slow));
         assert!(fs.size_bytes > 0);
         assert!(fs.path.ends_with("vk-node-no-such-state/jobs"));
-        let hb = heartbeat(&cfg);
+        let mut lister = crate::workloads::Lister::new(cfg.node.workload_mem_every());
+        let (hb, _) = heartbeat(&cfg, &mut lister);
         assert_eq!(hb.storage.len(), 1);
         // No ledger at all is a fresh host, not a failure.
         assert_eq!(hb.admission.map(|a| a.committed_mib), Some(0));

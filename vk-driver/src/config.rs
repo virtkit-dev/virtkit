@@ -275,11 +275,20 @@ pub struct Node {
     pub jobs_speed: Option<vk_hub_proto::SpeedClass>,
     /// The same for the host-checkout root ([`Config::checkout_root`]).
     pub checkouts_speed: Option<vk_hub_proto::SpeedClass>,
+    /// How often the memory each VM on the host holds is measured for the hub: a walk of
+    /// every process of every VM, which on a large VMM takes a while. New VMs are measured
+    /// when they appear; heartbeats in between repeat the last figures. Unset: 30.
+    pub workload_mem_secs: Option<u64>,
 }
 
 impl Node {
     fn is_default(&self) -> bool {
         *self == Node::default()
+    }
+
+    /// How often workloads' memory is measured, at least a second.
+    pub fn workload_mem_every(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.workload_mem_secs.unwrap_or(30).max(1))
     }
 }
 

@@ -305,7 +305,10 @@ async fn record(hub: &Hub, node: &Node, msg: NodeMsg) -> Result<()> {
             tokio::task::spawn_blocking(move || db.record_heartbeat(&id, heartbeat, now)).await??;
             Ok(())
         }
-        NodeMsg::Report(_) => Ok(()),
+        NodeMsg::Report(report) => {
+            tokio::task::spawn_blocking(move || db.record_report(&id, report, now)).await??;
+            Ok(())
+        }
         NodeMsg::Hello { .. } | NodeMsg::Auth { .. } => {
             bail!("the node repeated its handshake inside a session")
         }

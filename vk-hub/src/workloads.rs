@@ -1,8 +1,9 @@
-//! How a workload reads in a table: its columns, its kind's name, what it belongs to.
+//! How a workload reads in a table — `vk-hub workloads`, local mode's list:
+//! its columns, its kind's name, what it belongs to, its figures.
 
 use vk_hub_proto::{Workload, WorkloadKind};
 
-/// The columns a table of workloads has.
+/// The columns a table of workloads has; `vk-hub workloads` puts the node's before them.
 pub(crate) const COLUMNS: [&str; 9] = [
     "KIND",
     "ID",
@@ -52,6 +53,31 @@ pub(crate) fn owner(w: &Workload) -> String {
     }
 }
 
+/// `mib` in the unit it reads best in: whole GiB, else MiB.
+pub(crate) fn size_mib(mib: u64) -> String {
+    if mib >= 1024 && mib.is_multiple_of(1024) {
+        format!("{}G", mib / 1024)
+    } else {
+        format!("{mib}M")
+    }
+}
+
+/// One workload's cells under [`COLUMNS`], with what it holds now.
+pub(crate) fn cells(w: &Workload, mem_bytes: Option<u64>) -> [String; 9] {
+    let dash = || "-".to_string();
+    [
+        kind_name(w.kind).to_string(),
+        w.id.clone(),
+        owner(w),
+        w.pid.map_or_else(dash, |p| p.to_string()),
+        w.cpus.map_or_else(dash, |c| c.to_string()),
+        w.mem_reserved_mib.map_or_else(dash, size_mib),
+        mem_bytes.map_or_else(dash, |b| size_mib(b >> 20)),
+        w.started_at.map_or_else(dash, crate::utc),
+        w.state_dir.clone(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +110,9 @@ mod tests {
             owner(&workload(WorkloadKind::Run)),
             "alpine:3.20 in /src/app"
         );
+        let cells = cells(&workload(WorkloadKind::Run), Some(3 << 30));
+        assert_eq!(cells[0], "run");
+        assert_eq!((cells[5].as_str(), cells[6].as_str()), ("2G", "3G"));
+        assert_eq!(cells[7], "1970-01-01T00:01:40Z");
     }
 }

@@ -48,6 +48,10 @@ enum Call {
         ttl_secs: u64,
     },
     ListNodes,
+    /// Every node's workloads, or one node's: by ID, or by a hostname only it has.
+    Workloads {
+        node: Option<String>,
+    },
     RemoveNode {
         id: String,
     },
@@ -230,6 +234,7 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
             serde_json::to_value(CreatedToken { token, expires_at })?
         }
         Call::ListNodes => serde_json::to_value(ops::node_views(hub)?)?,
+        Call::Workloads { node } => serde_json::to_value(ops::workloads(hub, node.as_deref())?)?,
         Call::UiLogin { role, ttl_secs } => {
             let Some(base) = &hub.ui_url else {
                 bail!("the web UI is not being served");
@@ -302,6 +307,12 @@ impl Client {
 
     pub fn list_nodes(&self) -> Result<Vec<NodeView>> {
         self.call(Call::ListNodes)
+    }
+
+    pub fn workloads(&self, node: Option<&str>) -> Result<Vec<ops::NodeWorkloads>> {
+        self.call(Call::Workloads {
+            node: node.map(str::to_string),
+        })
     }
 
     /// Whether there was such a node to remove.

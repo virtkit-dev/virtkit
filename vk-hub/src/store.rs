@@ -14,8 +14,11 @@
 //!
 //! Heartbeats are written at [`Durability::None`]: one arrives from every node every few
 //! seconds, and losing the last few to a crash costs nothing — the next one replaces them.
-//! Everything else is durable.
+//! So are a node's workloads, which change with every CI job started or ended and which the
+//! node sends again on every session; they are kept apart from the node's row, which every
+//! heartbeat rewrites, and their memory readings apart from them. Everything else is durable.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -23,7 +26,7 @@ use anyhow::{Context, Result, bail};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use vk_hub_proto::{Heartbeat, Inventory};
+use vk_hub_proto::{Heartbeat, Inventory, Report, Workload};
 
 /// Key: node ID. Value: JSON [`NodeRow`].
 const NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
@@ -37,6 +40,10 @@ const AUDIT_BY_NODE: TableDefinition<(&str, u64), ()> = TableDefinition::new("au
 const UI_LOGINS: TableDefinition<&str, &[u8]> = TableDefinition::new("ui_logins");
 /// Key: `sha256(session secret)`, hex. Value: JSON [`UiSessionRow`].
 const UI_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("ui_sessions");
+/// Each node's latest [`Workloads`], by node ID: the list, without its memory readings.
+const WORKLOADS: TableDefinition<&str, &[u8]> = TableDefinition::new("workloads");
+/// What each node's workloads hold, by node ID: a map of workload ID to bytes.
+const WORKLOAD_MEM: TableDefinition<&str, &[u8]> = TableDefinition::new("workload_mem");
 
 /// The most audit rows kept. Bounded by count rather than age: a quiet fleet keeps its history
 /// for years, and a busy one keeps the newest hundred thousand actions and outcomes — months
@@ -153,6 +160,21 @@ pub struct NodeRow {
     pub heartbeat: Option<Heartbeat>,
     #[serde(default)]
     pub heartbeat_at: Option<u64>,
+    /// How many VMs the node last said it runs, listed or not; `None` until it has said.
+    #[serde(default)]
+    pub workloads: Option<u32>,
+}
+
+/// What a node last said runs on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Workloads {
+    pub listed: Vec<Workload>,
+    /// Running, but left out of `listed` by the node.
+    #[serde(default)]
+    pub omitted: u32,
+    /// What each listed one holds on the host, in bytes, by its ID, from the latest heartbeat.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mem_bytes: BTreeMap<String, u64>,
 }
 
 /// One line of the audit log.
@@ -273,6 +295,10 @@ impl Db {
             .context("opening the sign-in links table")?;
         txn.open_table(UI_SESSIONS)
             .context("opening the web UI sessions table")?;
+        txn.open_table(WORKLOADS)
+            .context("opening the workloads table")?;
+        txn.open_table(WORKLOAD_MEM)
+            .context("opening the workload memory table")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db { db })
     }
@@ -411,6 +437,10 @@ impl Db {
     pub fn remove_node(&self, id: &str) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
         let removed = txn.open_table(NODES)?.remove(id)?.is_some();
+        if removed {
+            txn.open_table(WORKLOADS)?.remove(id)?;
+            txn.open_table(WORKLOAD_MEM)?.remove(id)?;
+        }
         txn.commit().context("removing a node")?;
         Ok(removed)
     }
@@ -425,10 +455,28 @@ impl Db {
     }
 
     pub fn record_heartbeat(&self, id: &str, heartbeat: Heartbeat, now: u64) -> Result<()> {
-        self.update(id, Durability::None, |row| {
+        let mut heartbeat = heartbeat;
+        // Kept only as a lookup for the listed workloads, whose IDs are a few bytes: an ID no
+        // workload can have, and anything past what a report can list, is dropped.
+        let mut mem = std::mem::take(&mut heartbeat.workload_mem_bytes);
+        mem.retain(|id, _| id.len() <= MAX_WORKLOAD_ID);
+        while mem.len() > vk_hub_proto::MAX_WORKLOADS {
+            mem.pop_last();
+        }
+        self.update_txn(now, id, |row, txn| {
             row.heartbeat = Some(heartbeat);
             row.heartbeat_at = Some(now);
             row.last_seen = Some(now);
+            // Written only when it moved: a node repeats its figures between measurements.
+            let mut table = txn.open_table(WORKLOAD_MEM)?;
+            let stored = match table.get(id)? {
+                Some(g) => decode::<BTreeMap<String, u64>>(g.value())?,
+                None => BTreeMap::new(),
+            };
+            if stored != mem {
+                table.insert(id, encode(&mem)?.as_slice())?;
+            }
+            Ok(((), Vec::new(), Durability::None))
         })
     }
 
@@ -437,6 +485,45 @@ impl Db {
         let txn = self.db.begin_write().context("starting a write")?;
         append_audit(&txn, None, actor, event, now)?;
         txn.commit().context("writing an audit line")
+    }
+
+    /// Node `id`'s workloads, with their memory readings; `None` until a report listed them.
+    pub fn workloads(&self, id: &str) -> Result<Option<Workloads>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let Some(listed) = txn.open_table(WORKLOADS)?.get(id)? else {
+            return Ok(None);
+        };
+        let mut workloads: Workloads = decode(listed.value())?;
+        if let Some(mem) = txn.open_table(WORKLOAD_MEM)?.get(id)? {
+            workloads.mem_bytes = decode(mem.value())?;
+        }
+        Ok(Some(workloads))
+    }
+
+    /// Store node `id`'s report.
+    pub fn record_report(&self, id: &str, report: Report, now: u64) -> Result<()> {
+        let mut report = report;
+        // Kept apart from the row.
+        let listed = report.workloads.take().map(|mut listed| {
+            display_safe_workloads(&mut listed);
+            Workloads {
+                listed,
+                omitted: std::mem::take(&mut report.workloads_omitted),
+                mem_bytes: BTreeMap::new(),
+            }
+        });
+        self.update_txn(now, id, |row, txn| {
+            if let Some(workloads) = &listed {
+                let total = u32::try_from(workloads.listed.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(workloads.omitted);
+                row.workloads = Some(total);
+                txn.open_table(WORKLOADS)?
+                    .insert(id, encode(workloads)?.as_slice())?;
+            }
+            row.last_seen = Some(now);
+            Ok(((), Vec::new(), Durability::None))
+        })
     }
 
     /// The last `limit` audit lines, oldest first, of one node or of all.
@@ -826,6 +913,36 @@ pub(crate) fn token_key(token: &str) -> String {
     vk_hub_proto::to_hex(&Sha256::digest(token.as_bytes()))
 }
 
+/// The longest workload ID the hub keeps a memory reading for: a node makes them 16 hex
+/// digits.
+const MAX_WORKLOAD_ID: usize = 64;
+
+/// `workloads` cut to [`vk_hub_proto::MAX_WORKLOADS`], with every string in them made
+/// [`vk_hub_proto::display_safe`].
+fn display_safe_workloads(workloads: &mut Vec<vk_hub_proto::Workload>) {
+    use vk_hub_proto::display_safe as safe;
+    workloads.truncate(vk_hub_proto::MAX_WORKLOADS);
+    for w in workloads {
+        w.id = safe(&w.id);
+        w.state_dir = safe(&w.state_dir);
+        for s in [
+            &mut w.label,
+            &mut w.project,
+            &mut w.job_name,
+            &mut w.job_id,
+            &mut w.workspace,
+            &mut w.environment,
+            &mut w.ssh_alias,
+            &mut w.guest_workspace,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *s = safe(s);
+        }
+    }
+}
+
 /// `inventory` with every string in it made [`vk_hub_proto::display_safe`].
 fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
     use vk_hub_proto::display_safe as safe;
@@ -976,6 +1093,103 @@ mod tests {
             db.record_heartbeat("0".repeat(32).as_str(), Heartbeat::default(), 5)
                 .is_err()
         );
+    }
+
+    /// A node's workloads are its report's latest, cut to the cap with every string made
+    /// display-safe, kept apart from its row with a count on it; their memory readings are a
+    /// bounded lookup; and neither is audited.
+    #[test]
+    fn workloads_are_stored_latest_only_bounded_and_display_safe() {
+        use vk_hub_proto::{MAX_WORKLOADS, WorkloadKind};
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        assert_eq!(db.workloads(&id).unwrap(), None);
+        let hostile = "a\u{1b}[2J\u{202e}<b>";
+        let workload = |i: usize| Workload {
+            id: format!("{i:016x}"),
+            kind: WorkloadKind::CiJob,
+            state_dir: hostile.into(),
+            label: Some(hostile.into()),
+            project: Some(hostile.into()),
+            job_name: Some(hostile.into()),
+            job_id: Some(hostile.into()),
+            workspace: Some(hostile.into()),
+            environment: Some(hostile.into()),
+            pid: Some(1),
+            cpus: Some(2),
+            mem_reserved_mib: Some(1024),
+            started_at: Some(5),
+            ssh_alias: Some(hostile.into()),
+            guest_workspace: Some(hostile.into()),
+        };
+        let report = |n: usize, omitted| Report {
+            workloads: Some((0..n).map(workload).collect()),
+            workloads_omitted: omitted,
+        };
+        db.record_report(&id, report(MAX_WORKLOADS + 5, 7), 2)
+            .unwrap();
+        let row = db.node(&id).unwrap().unwrap();
+        // The row keeps the count and a report without them.
+        assert_eq!(row.workloads, Some(MAX_WORKLOADS as u32 + 7));
+        let stored = db.workloads(&id).unwrap().unwrap();
+        assert_eq!((stored.listed.len(), stored.omitted), (MAX_WORKLOADS, 7));
+        let w = &stored.listed[0];
+        for s in [
+            &w.state_dir,
+            w.label.as_ref().unwrap(),
+            w.project.as_ref().unwrap(),
+            w.job_name.as_ref().unwrap(),
+            w.job_id.as_ref().unwrap(),
+            w.workspace.as_ref().unwrap(),
+            w.environment.as_ref().unwrap(),
+            w.ssh_alias.as_ref().unwrap(),
+            w.guest_workspace.as_ref().unwrap(),
+        ] {
+            assert_eq!(s, "a[2J<b>");
+        }
+        // The next report replaces the list; a node stopping its VMs empties it; a report
+        // that has not looked yet leaves the last one.
+        db.record_report(&id, report(0, 0), 3).unwrap();
+        db.record_report(&id, Report::default(), 4).unwrap();
+        assert_eq!(db.node(&id).unwrap().unwrap().workloads, Some(0));
+        assert_eq!(db.workloads(&id).unwrap().unwrap().listed, Vec::new());
+        assert!(
+            db.audits(Some(&id), 100)
+                .unwrap()
+                .iter()
+                .all(|a| !a.event.contains("a[2J")),
+        );
+
+        let mut mem: BTreeMap<String, u64> = (0..MAX_WORKLOADS + 5)
+            .map(|i| (format!("{i:016x}"), 1))
+            .collect();
+        mem.insert("x".repeat(1000), 1);
+        db.record_heartbeat(
+            &id,
+            Heartbeat {
+                workload_mem_bytes: mem,
+                ..Heartbeat::default()
+            },
+            4,
+        )
+        .unwrap();
+        let kept = db.workloads(&id).unwrap().unwrap().mem_bytes;
+        assert_eq!(kept.len(), MAX_WORKLOADS);
+        assert!(kept.keys().all(|k| k.len() == 16));
+        // Not on the row, which every heartbeat rewrites.
+        let row = db.node(&id).unwrap().unwrap();
+        assert!(row.heartbeat.unwrap().workload_mem_bytes.is_empty());
+        // A removed node takes its workloads with it.
+        assert!(db.remove_node(&id).unwrap());
+        assert_eq!(db.workloads(&id).unwrap(), None);
+    }
+
+    fn enrolled(db: &Db) -> String {
+        let (token, _) = db.create_token(DAY, 0).unwrap();
+        let Enrollment::Enrolled { node_id } = db.enroll(&token, "aa", "h", 1).unwrap() else {
+            panic!("expected an enrollment");
+        };
+        node_id
     }
 
     #[test]

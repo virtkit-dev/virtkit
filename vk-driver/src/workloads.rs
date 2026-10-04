@@ -1,5 +1,6 @@
-//! The VMs running on this host for its user, as `vk workloads` lists them: pinned `vk run`s
-//! and `vk dev` environments from the VM registry, CI jobs from the executor's job dirs.
+//! The VMs running on this host for its user, as `vk workloads` lists them and `vk node`
+//! reports them: pinned `vk run`s and `vk dev` environments from the VM registry, CI jobs from
+//! the executor's job dirs.
 //!
 //! Everything is read from what those already keep, never kept apart: the registry's entries,
 //! checked against their state-dir locks as `vk list` checks them (and pruned as it prunes
@@ -359,8 +360,15 @@ impl Once {
     }
 }
 
+/// The workloads a list carries, and how many running ones it leaves out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Listed {
+    pub(crate) workloads: Vec<Workload>,
+    pub(crate) omitted: u32,
+}
+
 /// What listing the host's workloads keeps from one look to the next.
-struct Lister {
+pub(crate) struct Lister {
     meter: Meter,
     /// The ledger's reservations as last read; `None` where it could not be.
     reserved_mib: Option<HashMap<OsString, u64>>,
@@ -371,7 +379,7 @@ struct Lister {
 }
 
 impl Lister {
-    fn new(mem_every: Duration) -> Self {
+    pub(crate) fn new(mem_every: Duration) -> Self {
         Lister {
             meter: Meter::new(mem_every),
             reserved_mib: None,
@@ -405,6 +413,29 @@ impl Lister {
                 self.reserved_mib = None;
             }
         }
+        let (listed, mem_bytes) = self.look(cfg);
+        WorkloadList {
+            version: vk_hub_proto::WORKLOADS_VERSION,
+            workloads: listed.workloads,
+            omitted: listed.omitted,
+            mem_bytes,
+        }
+    }
+
+    /// The host's workloads as [`Lister::list`] has them, for `vk node`'s heartbeat, which
+    /// reads the admission ledger itself: its reservations are `held`'s, or none where the
+    /// ledger could not be read.
+    pub(crate) fn collect(
+        &mut self,
+        cfg: &Config,
+        held: Option<&crate::admit::Held>,
+    ) -> (Listed, BTreeMap<String, u64>) {
+        self.reserved_mib = held.map(|held| held.mem.iter().cloned().collect());
+        self.look(cfg)
+    }
+
+    /// The workloads with the reservations last read, and what each holds by ID.
+    fn look(&mut self, cfg: &Config) -> (Listed, BTreeMap<String, u64>) {
         let sources = Sources::read(
             cfg,
             self.reserved_mib.clone().unwrap_or_default(),
@@ -419,12 +450,11 @@ impl Lister {
             let links = links.get_or_insert_with(crate::usage::Links::read);
             crate::usage::tree_resident_in(root, links)
         });
-        WorkloadList {
-            version: vk_hub_proto::WORKLOADS_VERSION,
+        let listed = Listed {
             workloads: found.into_iter().map(|(w, _)| w).collect(),
             omitted,
-            mem_bytes,
-        }
+        };
+        (listed, mem_bytes)
     }
 }
 
