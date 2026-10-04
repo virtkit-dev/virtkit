@@ -1,12 +1,13 @@
 //! Live updates: a page's fragment re-rendered and pushed as a server-sent event whenever
 //! what it shows may have changed, for htmx's SSE extension to swap in.
 //!
-//! A fragment that is the same for every viewer — a list of VMs — is rendered once per
-//! change, by one task, and each page's stream only forwards it ([`Source::Shared`]). A page
-//! of one thing renders its own fragment, woken by the changes it follows ([`Source::Own`]).
-//! Either way a fragment is rendered at most once per [`DEBOUNCE`] however fast what it shows
-//! changes, and sent only when it differs from the last one that stream sent, so a page with
-//! nothing new to show is sent nothing but keep-alives.
+//! A fragment that is the same for every viewer — the nodes table, local mode's VMs — is
+//! rendered once per change, by one task, and each page's stream only forwards it
+//! ([`Source::Shared`]). A page of one thing — a node, a VM — renders its own fragment, woken
+//! only by the changes it follows ([`Source::Own`]). Either way a fragment is rendered at most
+//! once per [`DEBOUNCE`] however fast what it shows changes, and sent only when it differs
+//! from the last one that stream sent; ages on the pages move in steps of a heartbeat, so a
+//! page with nothing new to show is sent nothing but keep-alives.
 //!
 //! Streams hold connections, so there are at most [`MAX_STREAMS`] of them — the rest of the
 //! UI's connections stay for pages and posts — and [`MAX_SESSION_STREAMS`] per session. A
@@ -29,18 +30,16 @@ use hyper::{Response, StatusCode};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
 use super::{Auth, Body, pages};
-use crate::server::Hub;
+use crate::server::{HEARTBEAT, Hub};
 
-/// The fewest seconds between two renders of one stream: a page need not follow every
-/// change of something that changes by the second.
+/// The fewest seconds between two renders of one stream: a fleet's heartbeats arrive every
+/// few seconds from every node, and a page need not follow each one.
 const DEBOUNCE: Duration = Duration::from_secs(1);
 
-/// How often a fragment is rendered with no change noted, for what moves on its own. Also
-/// how soon a stream notices its session has ended without being told.
-#[cfg(not(test))]
-const REFRESH: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const REFRESH: Duration = Duration::from_secs(1);
+/// How often a fragment is rendered with no change noted, for what moves on its own: ages,
+/// and a node that goes quiet becomes unreachable without a message saying so. Also how
+/// soon a stream notices its session has ended without being told.
+const REFRESH: Duration = HEARTBEAT;
 
 /// Streams at once, of the [`MAX_CONNECTIONS`](super::MAX_CONNECTIONS) the UI's listeners
 /// share.

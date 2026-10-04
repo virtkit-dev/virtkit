@@ -1,14 +1,20 @@
-//! The web UI: server-rendered pages on a listener of their own.
+//! The web UI: server-rendered pages on a listener of their own, apart from the nodes'. Its
+//! core — sign-in, sessions, the checks below, live updates — serves two sites: the fleet's
+//! pages for `vk-hub serve`, and this machine's VMs for `vk-hub local` ([`local`]).
 //!
-//! **Sign-in.** Single-use tokens are issued over the admin socket or printed by
-//! `vk-hub local` at startup. Opening a link shows a button that posts the token to create
-//! a session, setting its secret as an `HttpOnly`, `SameSite=Strict` cookie. The database
-//! stores only its hash. Only this `POST` spends the token; link scanners and chat previews
-//! leave it unused. Sessions have a viewer or operator role and last [`store::UI_SESSION_TTL`].
+//! **Sign-in.** Single-use tokens are issued over the admin socket — `vk-hub ui login`,
+//! `vk-hub local login` — or printed by `vk-hub local` at startup. Opening a link shows a
+//! button that posts the token to create a session, setting its secret as an `HttpOnly`,
+//! `SameSite=Strict` cookie, also `Secure` and `__Host-` when the UI is reached over https.
+//! The database stores only its hash. Only this `POST` spends the token; link scanners and
+//! chat previews leave it unused. Sessions have a viewer or operator role and last
+//! [`store::UI_SESSION_TTL`]. Links stand in for a login until people sign in through OIDC,
+//! with the identity layer the hub is to share with `vk-registry`.
 //!
 //! **State-changing requests** are `POST`s, and each must come from this UI's own pages —
-//! its `Origin` is the UI's own, or `Sec-Fetch-Site` says `same-origin` — and carry the
-//! session's CSRF token, derived from its secret, in a form field or header.
+//! its `Origin` is the UI's own (a fleet hub's `ui_url`), or `Sec-Fetch-Site` says
+//! `same-origin` — and carry the session's CSRF token, derived from its secret, in a form
+//! field or header. Local mode's operations are `vk` commands ([`actions`]).
 //!
 //! **A page** (`GET`) goes only to a request the UI's own pages made (`same-origin`) or no
 //! page made (`none`: the address bar, a bookmark, a link opened from a terminal).
@@ -17,14 +23,14 @@
 //!
 //! **Every request** must name the UI's host in its `Host`, so a page on another name
 //! resolved to this address (DNS rebinding) reaches nothing. **Every response** carries a
-//! strict Content-Security-Policy: pages show strings the host's `vk` reports, and the policy
-//! is what keeps an escaping mistake from running as script in an operator's session. The
-//! pages themselves escape by construction ([`html`]). It is also for this origin alone to
+//! strict Content-Security-Policy: pages show strings nodes and the host's `vk` send, and the
+//! policy is what keeps an escaping mistake from running as script in an operator's session.
+//! The pages themselves escape by construction ([`html`]). It is also for this origin alone to
 //! embed or open a window on (`Cross-Origin-Resource-Policy`, `-Opener-Policy`).
 //!
 //! **No per-address cap** on connections: the people using the UI are few, often behind one
-//! address. The global cap and the timeouts before a request is read bound what any peer
-//! holds.
+//! reverse proxy or NAT address, where such a cap would lock them all out at once. The global
+//! cap and the timeouts before a request is read bound what any peer holds.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -42,6 +48,7 @@ use hyper_util::rt::TokioTimer;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore};
+use tokio_rustls::TlsAcceptor;
 
 use crate::local::Local;
 use crate::server::{Hub, Io, PRE_AUTH_TIMEOUT};
@@ -87,53 +94,92 @@ const FORM_TIMEOUT: Duration = Duration::from_secs(1);
 /// The web UI's shared state.
 pub struct Ui {
     hub: Arc<Hub>,
-    /// This machine's VMs.
-    local: Arc<Local>,
     /// The UI's origin: what a state-changing request's `Origin` must be.
     origin: String,
     /// The origin without its scheme: what every request's `Host` must be.
     authority: String,
+    /// Whether browsers reach the UI over https, so its cookie may say `Secure`: a fleet
+    /// hub's UI off loopback.
+    secure: bool,
     connections: Arc<Semaphore>,
     /// The live pages' streams open.
     streams: sse::Streams,
-    /// The VMs table, rendered once for every page listing it ([`sse::feed`]).
-    vms_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
-    /// What VM pages last read of their VMs.
-    views: local::ViewCache,
-    /// What `/dev` last read.
-    dev_list: dev::DevList,
-    /// The questions actions asked first, unanswered.
-    questions: actions::Questions,
+    site: Site,
+}
+
+/// What the pages show.
+enum Site {
+    /// `vk-hub serve`: the fleet.
+    Fleet {
+        /// The nodes table, rendered once for every nodes page ([`sse::feed`]).
+        nodes_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+    },
+    /// `vk-hub local`: this machine's VMs.
+    Local(Box<local::LocalSite>),
 }
 
 impl Ui {
-    /// The UI at `origin`, `http://host[:port]`, showing `local`'s VMs.
-    pub fn new(hub: Arc<Hub>, origin: &str, local: Arc<Local>) -> Self {
+    /// The fleet's UI at `origin`, a `ui_url` as the config normalizes it.
+    pub fn new(hub: Arc<Hub>, origin: &str) -> Self {
+        let site = Site::Fleet {
+            nodes_feed: sse::feed(hub.subscribe(), "nodes", render_nodes(hub.clone())),
+        };
+        Self::with_site(hub, origin, site)
+    }
+
+    /// Local mode's UI at `origin`, `http://host[:port]`, showing `local`'s VMs.
+    pub fn local(hub: Arc<Hub>, origin: &str, local: Arc<Local>) -> Self {
+        let site = Site::Local(Box::new(local::LocalSite::new(&hub, local)));
+        Self::with_site(hub, origin, site)
+    }
+
+    fn with_site(hub: Arc<Hub>, origin: &str, site: Site) -> Self {
         let authority = origin
             .split_once("://")
             .map_or(origin, |(_, rest)| rest)
             .to_string();
         Ui {
-            vms_feed: local::feed(&hub, &local),
             hub,
-            local,
             origin: origin.to_string(),
             authority,
+            secure: origin.starts_with("https://"),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             streams: sse::Streams::new(),
-            views: local::ViewCache::new(local::VIEWS_FRESH),
-            dev_list: dev::DevList::new(),
-            questions: actions::Questions::new(),
+            site,
+        }
+    }
+
+    /// What this UI's pages say of signing in.
+    fn texts(&self) -> &'static Texts {
+        match self.site {
+            Site::Fleet { .. } => &FLEET_TEXTS,
+            Site::Local(_) => &LOCAL_TEXTS,
+        }
+    }
+
+    /// The session cookie's name. `__Host-` holds a browser to what makes it safe — `Secure`,
+    /// `Path=/`, no `Domain` — but is refused on plain http.
+    fn cookie_name(&self) -> &'static str {
+        if self.secure { SECURE_COOKIE } else { COOKIE }
+    }
+
+    /// The attributes every session cookie this UI sets carries.
+    fn cookie_attributes(&self) -> &'static str {
+        if self.secure {
+            "Path=/; HttpOnly; SameSite=Strict; Secure"
+        } else {
+            "Path=/; HttpOnly; SameSite=Strict"
         }
     }
 }
 
 const COOKIE: &str = "vk-hub";
+const SECURE_COOKIE: &str = "__Host-vk-hub";
 
-/// Serve the web UI on `listener` until the process ends.
-pub async fn serve(listener: TcpListener, ui: Arc<Ui>) -> Result<()> {
+/// Serve the web UI on `listener` until the process ends, over TLS with `tls`.
+pub async fn serve(listener: TcpListener, tls: Option<TlsAcceptor>, ui: Arc<Ui>) -> Result<()> {
     let permits = ui.connections.clone();
-    crate::server::accept(listener, None, permits, move |io, peer, _| {
+    crate::server::accept(listener, tls, permits, move |io, peer, _| {
         serve_conn(io, ui.clone(), peer)
     })
     .await
@@ -194,7 +240,7 @@ async fn handle(
             "Something failed on the hub; its log says what.",
         )
     });
-    secure_headers(resp.headers_mut());
+    secure_headers(resp.headers_mut(), ui.secure);
     Ok(resp)
 }
 
@@ -202,7 +248,7 @@ async fn handle(
 /// only the assets do: a page holds what the session may see, and its CSRF token.
 /// `Referrer-Policy: same-origin` rather than `no-referrer`, so the pages' own form posts
 /// carry their real `Origin`; nothing crosses to another origin either way.
-fn secure_headers(h: &mut HeaderMap) {
+fn secure_headers(h: &mut HeaderMap, secure: bool) {
     h.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(CSP),
@@ -223,6 +269,12 @@ fn secure_headers(h: &mut HeaderMap) {
         "cross-origin-opener-policy",
         HeaderValue::from_static("same-origin"),
     );
+    if secure {
+        h.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
     if !h.contains_key(header::CACHE_CONTROL) {
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
@@ -232,7 +284,7 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     if !host_is(&req, &ui.authority) {
         return Ok(message(
             StatusCode::MISDIRECTED_REQUEST,
-            "This is not the address the hub's web UI is served at.",
+            ui.texts().misdirected,
         ));
     }
     let path = req.uri().path().to_string();
@@ -243,7 +295,7 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
         return Ok(resp);
     }
     match (method, path.as_str()) {
-        (Method::GET, LOGIN_PATH) => Ok(login_page(&req)),
+        (Method::GET, LOGIN_PATH) => Ok(login_page(&req, ui)),
         (Method::POST, LOGIN_PATH) => login(req, ui).await,
         // Asked for by every browser whatever the page says; there is none.
         (Method::GET, "/favicon.ico") => {
@@ -265,10 +317,13 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
             };
             get(&path, req.uri().query(), &auth, ui).await
         }
-        (Method::POST, _) => match local::action_target(&path) {
-            Some(local::Target::Vm(id)) => actions::vm_action(req, ui, &id).await,
-            Some(local::Target::Dev(name)) => actions::dev_action(req, ui, &name).await,
-            None => Ok(message(StatusCode::NOT_FOUND, "No such action.")),
+        (Method::POST, _) => match &ui.site {
+            Site::Fleet { .. } => Ok(message(StatusCode::NOT_FOUND, "No such action.")),
+            Site::Local(site) => match local::action_target(&path) {
+                Some(local::Target::Vm(id)) => actions::vm_action(req, ui, site, &id).await,
+                Some(local::Target::Dev(name)) => actions::dev_action(req, ui, site, &name).await,
+                None => Ok(message(StatusCode::NOT_FOUND, "No such action.")),
+            },
         },
         _ => Ok(message(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -282,13 +337,40 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
 /// 401 would only have the SSE extension retry it for as long as the page stays open. More
 /// than one session cookie is refused with a 401 as any request is.
 fn signed_out_stream(path: &str, headers: &HeaderMap, ui: &Ui) -> Option<Response<Body>> {
-    if !matches!(session_cookie(headers), Ok(Some(_))) {
+    if !matches!(session_cookie(headers, ui.cookie_name()), Ok(Some(_))) {
         return None;
     }
-    let source = path
-        .strip_prefix("/events/")
-        .and_then(|e| local::source(e, ui))?;
+    let source = path.strip_prefix("/events/").and_then(|e| source(e, ui))?;
     Some(sse::signed_out(&source))
+}
+
+/// What `/events/<event>` streams, if it is one of this site's.
+fn source(event: &str, ui: &Ui) -> Option<sse::Source> {
+    match &ui.site {
+        Site::Fleet { nodes_feed } => {
+            let hub = &ui.hub;
+            match event {
+                "nodes" => Some(sse::Source::Shared {
+                    name: "nodes",
+                    feed: nodes_feed.subscribe(),
+                    render: render_nodes(hub.clone()),
+                }),
+                _ => {
+                    let id = event
+                        .strip_prefix("node/")
+                        .filter(|id| vk_hub_proto::valid_id(id))?
+                        .to_string();
+                    let hub = hub.clone();
+                    Some(sse::Source::Own {
+                        name: "node",
+                        changes: hub.subscribe_node(&id),
+                        render: Arc::new(move || render_node(&hub, &id)),
+                    })
+                }
+            }
+        }
+        Site::Local(site) => local::source(event, &ui.hub, site),
+    }
 }
 
 /// Whether the request names `authority` as its host: its `Host` header under HTTP/1.1, the
@@ -317,33 +399,89 @@ fn from_another_site(headers: &HeaderMap) -> bool {
 
 /// A page: read-only, for any session.
 async fn get(path: &str, query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
-    if path == "/audit" {
-        let query = decode_form(query.unwrap_or("").as_bytes());
-        let before = field(&query, "before").and_then(|b| b.parse().ok());
-        let hub = ui.hub.clone();
-        let rows = blocking(move || hub.db.audit_page(None, before, pages::AUDIT_PAGE)).await?;
-        return Ok(page(pages::audit(auth, &rows)));
+    if let Some(source) = path.strip_prefix("/events/").and_then(|e| source(e, ui)) {
+        return Ok(stream(ui, auth, source));
     }
-    if let Some(source) = path
-        .strip_prefix("/events/")
-        .and_then(|e| local::source(e, ui))
-    {
-        let slot = match ui.streams.take(&store::token_key(&auth.secret)) {
-            Ok(slot) => slot,
-            Err((status, text)) => {
-                let mut resp = message(status, text);
-                // For what reads it; the SSE extension retries on a backoff of its own.
-                resp.headers_mut()
-                    .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
-                return Ok(resp);
+    match &ui.site {
+        Site::Fleet { .. } => fleet_get(path, auth, ui).await,
+        Site::Local(site) => {
+            if path == "/audit" {
+                let query = decode_form(query.unwrap_or("").as_bytes());
+                let before = field(&query, "before").and_then(|b| b.parse().ok());
+                let hub = ui.hub.clone();
+                let rows =
+                    blocking(move || hub.db.audit_page(None, before, pages::AUDIT_PAGE)).await?;
+                let audit = pages::AuditPage { node: None, rows };
+                return Ok(page(pages::audit(auth, &audit, &[], local::NAV)));
             }
-        };
-        return Ok(sse::stream(ui.hub.clone(), auth, source, slot));
+            Ok(local::get(path, auth, ui, site)
+                .await
+                .unwrap_or_else(|| message(StatusCode::NOT_FOUND, "There is no such page.")))
+        }
     }
-    if let Some(resp) = local::get(path, auth, ui).await {
-        return Ok(resp);
+}
+
+/// A fleet page: read-only, for any session.
+async fn fleet_get(path: &str, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
+    let hub = ui.hub.clone();
+    let now = crate::now_secs();
+    if path == "/" {
+        let nodes = blocking(move || crate::ops::node_views(&hub)).await?;
+        return Ok(page(pages::nodes(auth, &nodes, now)));
+    }
+    if let Some(id) = path.strip_prefix("/node/")
+        && vk_hub_proto::valid_id(id)
+    {
+        let id = id.to_string();
+        let detail = blocking(move || node_detail(&hub, &id)).await?;
+        return Ok(match detail {
+            Some(detail) => page(pages::node(auth, &detail, now)),
+            None => message(StatusCode::NOT_FOUND, "There is no such node."),
+        });
     }
     Ok(message(StatusCode::NOT_FOUND, "There is no such page."))
+}
+
+/// A stream of `source` for `auth`'s page, or the refusal when there are too many.
+fn stream(ui: &Ui, auth: &Auth, source: sse::Source) -> Response<Body> {
+    match ui.streams.take(&store::token_key(&auth.secret)) {
+        Ok(slot) => sse::stream(ui.hub.clone(), auth, source, slot),
+        Err((status, text)) => {
+            let mut resp = message(status, text);
+            // For what reads it; the SSE extension retries on a backoff of its own.
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            resp
+        }
+    }
+}
+
+/// The nodes table, as one rendering for every nodes page.
+fn render_nodes(hub: Arc<Hub>) -> sse::Render {
+    Arc::new(move || {
+        let nodes = crate::ops::node_views(&hub)?;
+        Ok(pages::nodes_table(&nodes, crate::now_secs()).into_string())
+    })
+}
+
+/// Node `id`'s page fragment, or the line saying it has gone.
+fn render_node(hub: &Hub, id: &str) -> Result<String> {
+    Ok(match node_detail(hub, id)? {
+        Some(detail) => pages::node_detail(&detail, crate::now_secs()).into_string(),
+        None => pages::gone().into_string(),
+    })
+}
+
+/// What the node page shows of node `id`, or `None` for no such node.
+fn node_detail(hub: &Hub, id: &str) -> Result<Option<pages::NodeDetail>> {
+    let Some(row) = hub.db.node(id)? else {
+        return Ok(None);
+    };
+    Ok(Some(pages::NodeDetail {
+        view: crate::ops::node_view(hub, id.to_string(), &row),
+        workloads: hub.db.workloads(id)?,
+        row,
+    }))
 }
 
 /// Whether `token` looks like a sign-in token, before the database is asked.
@@ -356,11 +494,11 @@ fn well_formed_login(token: &str) -> bool {
 /// `GET /login?t=<token>`: a button that posts the token back. Nothing is spent here, so
 /// whatever fetches a link without a person behind it — a mail scanner, a chat's preview, a
 /// browser's prerender — leaves it for the person.
-fn login_page(req: &Request<Incoming>) -> Response<Body> {
+fn login_page(req: &Request<Incoming>, ui: &Ui) -> Response<Body> {
     let query = decode_form(req.uri().query().unwrap_or("").as_bytes());
     let token = field(&query, "t").unwrap_or("");
     if !well_formed_login(token) {
-        return message(StatusCode::FORBIDDEN, NOT_A_LINK);
+        return message(StatusCode::FORBIDDEN, ui.texts().not_a_link);
     }
     page(pages::sign_in(token))
 }
@@ -381,17 +519,19 @@ async fn login(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     };
     let token = field(&form, "t").unwrap_or("").to_string();
     if !well_formed_login(&token) {
-        return Ok(message(StatusCode::FORBIDDEN, NOT_A_LINK));
+        return Ok(message(StatusCode::FORBIDDEN, ui.texts().not_a_link));
     }
     let hub = ui.hub.clone();
     let now = crate::now_secs();
     let Some((secret, session)) = blocking(move || hub.db.redeem_login(&token, now)).await? else {
-        return Ok(message(StatusCode::FORBIDDEN, SPENT_LINK));
+        return Ok(message(StatusCode::FORBIDDEN, ui.texts().spent_link));
     };
     eprintln!("vk-hub: ui: {} signed in", session.principal());
     let mut resp = html_response(StatusCode::OK, pages::signed_in());
     let cookie = format!(
-        "{COOKIE}={secret}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+        "{}={secret}; {}; Max-Age={}",
+        ui.cookie_name(),
+        ui.cookie_attributes(),
         session.expires_at.saturating_sub(now)
     );
     resp.headers_mut().insert(
@@ -418,7 +558,11 @@ async fn logout(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     // Its pages' live updates end on it.
     ui.hub.sessions_changed();
     let mut resp = message(StatusCode::OK, "Signed out.");
-    let cookie = format!("{COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+    let cookie = format!(
+        "{}=; {}; Max-Age=0",
+        ui.cookie_name(),
+        ui.cookie_attributes()
+    );
     resp.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&cookie).context("building the session cookie")?,
@@ -438,9 +582,9 @@ pub struct Auth {
 
 /// The session the request's cookie names if it is live, or why there is none.
 async fn authenticate(headers: &HeaderMap, ui: &Ui) -> Result<Result<Auth, &'static str>> {
-    let secret = match session_cookie(headers) {
+    let secret = match session_cookie(headers, ui.cookie_name()) {
         Ok(Some(s)) if s.len() == 64 && vk_hub_proto::from_hex(s).is_some() => s.to_string(),
-        Ok(_) => return Ok(Err(SIGNED_OUT)),
+        Ok(_) => return Ok(Err(ui.texts().signed_out)),
         Err(()) => return Ok(Err(CONFLICTING_COOKIES)),
     };
     let hub = ui.hub.clone();
@@ -453,24 +597,24 @@ async fn authenticate(headers: &HeaderMap, ui: &Ui) -> Result<Result<Auth, &'sta
             csrf,
             secret,
         })
-        .ok_or(SIGNED_OUT))
+        .ok_or(ui.texts().signed_out))
 }
 
-/// The session cookie's value, if the request has one — or `Err` when it has more than one.
-/// Cookies are not kept apart by port: another service on the same host can set one of this
-/// name, with a narrower path so the browser sends it first. Picking one would let it choose
-/// the session; neither is taken instead.
-fn session_cookie(headers: &HeaderMap) -> Result<Option<&str>, ()> {
+/// The session cookie `name`'s value, if the request has one — or `Err` when it has more
+/// than one session cookie, of either name. Cookies are not kept apart by port: another
+/// service on the same host can set one of this name, with a narrower path so the browser
+/// sends it first. Picking one would let it choose the session; neither is taken instead.
+fn session_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, ()> {
     let mut found = headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .filter(|(k, _)| *k == COOKIE);
+        .filter(|(k, _)| *k == COOKIE || *k == SECURE_COOKIE);
     match (found.next(), found.next()) {
         (None, _) => Ok(None),
-        (Some((_, v)), None) => Ok(Some(v)),
+        (Some((k, v)), None) => Ok((k == name).then_some(v)),
         (Some(_), Some(_)) => Err(()),
     }
 }
@@ -639,13 +783,31 @@ fn message(status: StatusCode, text: &'static str) -> Response<Body> {
     html_response(status, pages::message(text))
 }
 
-const NOT_A_LINK: &str = "This is not a sign-in link. `vk-hub local login` prints one.";
+/// What the pages say that differs between the sites: how to sign in.
+struct Texts {
+    misdirected: &'static str,
+    not_a_link: &'static str,
+    spent_link: &'static str,
+    signed_out: &'static str,
+}
 
-const SPENT_LINK: &str =
-    "This sign-in link is unknown, used or expired. `vk-hub local login` prints a new one.";
+const FLEET_TEXTS: Texts = Texts {
+    misdirected: "This is not the address the hub's web UI is configured at (its ui_url).",
+    not_a_link: "This is not a sign-in link. `vk-hub ui login` prints one.",
+    spent_link: "This sign-in link is unknown, used or expired. `vk-hub ui login` prints a new \
+                 one.",
+    signed_out: "Not signed in. On the hub's host, `vk-hub ui login` prints a link that signs \
+                 you in.",
+};
 
-const SIGNED_OUT: &str =
-    "Not signed in. On this machine, `vk-hub local login` prints a link that signs you in.";
+const LOCAL_TEXTS: Texts = Texts {
+    misdirected: "This is not the address the hub's web UI is served at.",
+    not_a_link: "This is not a sign-in link. `vk-hub local login` prints one.",
+    spent_link: "This sign-in link is unknown, used or expired. `vk-hub local login` prints a \
+                 new one.",
+    signed_out: "Not signed in. On this machine, `vk-hub local login` prints a link that signs \
+                 you in.",
+};
 
 const CONFLICTING_COOKIES: &str = "Not signed in: this browser sent more than one vk-hub \
      session cookie, which is what a cookie planted by another site on this host looks like. \

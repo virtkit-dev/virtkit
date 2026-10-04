@@ -69,7 +69,7 @@ pub const MAX_LOGIN_TTL: Duration = Duration::from_secs(86_400);
 /// How long a web UI session lasts from sign-in: a working day, then a new link.
 pub const UI_SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 
-/// How many hex digits of a session's key name it: in `vk-hub local
+/// How many hex digits of a session's key name it: in `vk-hub ui sessions` and `vk-hub local
 /// sessions`, and in the audit log as the principal of what it did. 48 bits, unique among the
 /// few sessions a hub holds but not guaranteed to be: `logout <id>` ends every session that
 /// shares one, and a browser's own sign-out ends its session by the whole key.
@@ -109,7 +109,7 @@ struct UiSessionRow {
     expires_at: u64,
 }
 
-/// A web UI session, as the UI and `vk-hub local sessions` see it.
+/// A web UI session, as the UI and `vk-hub ui sessions` see it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiSession {
     /// The start of its key, the hash of its secret — [`SESSION_ID_LEN`] hex digits, which

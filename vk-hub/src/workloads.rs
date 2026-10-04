@@ -1,4 +1,4 @@
-//! How a workload reads in a table — `vk-hub workloads`, local mode's list:
+//! How a workload reads in a table — `vk-hub workloads`, a node's page, local mode's list:
 //! its columns, its kind's name, what it belongs to, its figures.
 
 use vk_hub_proto::{Workload, WorkloadKind};

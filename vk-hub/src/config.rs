@@ -5,11 +5,22 @@
 //! tls_cert = "/etc/vk-hub/cert.pem"
 //! tls_key = "/etc/vk-hub/key.pem"
 //! data_dir = "/var/lib/vk-hub"
+//! # The web UI: off unless `ui_addr` is set.
+//! ui_addr = "0.0.0.0:8444"
+//! ui_url = "https://hub.example.com:8444"  # what browsers reach it as
+//! ui_tls_cert = "/etc/vk-hub/ui-cert.pem"  # default: tls_cert/tls_key
+//! ui_tls_key = "/etc/vk-hub/ui-key.pem"
 //! ```
 //!
 //! Every key is optional. With no TLS the hub serves plain HTTP, which it accepts only on a
 //! loopback address: enrollment tokens travel in the request body, and an authenticated
 //! session carries no channel binding, so a node's session on an open network needs TLS.
+//! The web UI's listener is held to the same rule — its session cookie is a bearer
+//! credential — and serves its own certificate or the node listener's; `ui_url` may be
+//! `http://` only for a loopback host. Even on loopback, plain http shares the session cookie
+//! with every other http service on that host, whatever its port — browsers keep cookies
+//! apart by host, not port — so a UI opened on a machine that serves anything else on
+//! loopback wants TLS too.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -33,6 +44,18 @@ pub struct HubConfig {
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub data_dir: PathBuf,
+    pub ui: Option<UiConfig>,
+}
+
+/// The web UI's listener.
+#[derive(Debug)]
+pub struct UiConfig {
+    pub addr: SocketAddr,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    /// The UI's origin as browsers reach it, `scheme://host[:port]` with no trailing slash:
+    /// what sign-in links start with and what a state-changing request's `Origin` must be.
+    pub url: String,
 }
 
 /// The file as written. `deny_unknown_fields` so a misspelt `tls_cert` fails at startup
@@ -44,6 +67,10 @@ struct FileConfig {
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
     data_dir: Option<PathBuf>,
+    ui_addr: Option<String>,
+    ui_url: Option<String>,
+    ui_tls_cert: Option<PathBuf>,
+    ui_tls_key: Option<PathBuf>,
 }
 
 impl HubConfig {
@@ -76,11 +103,52 @@ impl HubConfig {
                  bind a loopback address"
             );
         }
+        let ui = match f.ui_addr {
+            Some(a) => {
+                let addr: SocketAddr = a
+                    .parse()
+                    .with_context(|| format!("parsing ui_addr {a:?}"))?;
+                let (tls_cert, tls_key) = if f.ui_tls_cert.is_some() || f.ui_tls_key.is_some() {
+                    (f.ui_tls_cert, f.ui_tls_key)
+                } else {
+                    (f.tls_cert.clone(), f.tls_key.clone())
+                };
+                let tls = tls_cert.is_some() || tls_key.is_some();
+                if !tls && !addr.ip().is_loopback() {
+                    bail!(
+                        "ui_addr {addr} is not loopback and no TLS is configured: web UI \
+                         sessions would cross the network in cleartext; set ui_tls_cert/\
+                         ui_tls_key or tls_cert/tls_key, or bind a loopback address"
+                    );
+                }
+                let url = match f.ui_url {
+                    Some(url) => parse_origin(&url)?,
+                    None if addr.ip().is_unspecified() => bail!(
+                        "ui_addr {addr} names no host a browser can reach; set ui_url to the \
+                         address the UI is reached at"
+                    ),
+                    None => {
+                        parse_origin(&format!("{}://{addr}", if tls { "https" } else { "http" }))?
+                    }
+                };
+                Some(UiConfig {
+                    addr,
+                    tls_cert,
+                    tls_key,
+                    url,
+                })
+            }
+            None if f.ui_url.is_some() || f.ui_tls_cert.is_some() || f.ui_tls_key.is_some() => {
+                bail!("ui_url, ui_tls_cert and ui_tls_key need ui_addr, which turns the web UI on")
+            }
+            None => None,
+        };
         Ok(HubConfig {
             addr,
             tls_cert: f.tls_cert,
             tls_key: f.tls_key,
             data_dir,
+            ui,
         })
     }
 
@@ -102,6 +170,91 @@ impl HubConfig {
             "tls_cert and tls_key",
         )
     }
+}
+
+impl UiConfig {
+    /// The web UI's TLS acceptor, or `None` for plain HTTP.
+    pub fn build_tls(&self) -> Result<Option<TlsAcceptor>> {
+        build_tls(
+            self.tls_cert.as_deref(),
+            self.tls_key.as_deref(),
+            "ui_tls_cert and ui_tls_key",
+        )
+    }
+}
+
+/// `url` as an origin — `http` or `https`, a host and maybe a port, and no path — in the form
+/// a browser's `Origin` takes: lowercase, no trailing slash, no default port. `http` is only
+/// for a loopback host.
+fn parse_origin(url: &str) -> Result<String> {
+    let bad = || {
+        anyhow::anyhow!(
+            "ui_url {url:?}: expected http(s)://host[:port], with no path — the address \
+             browsers reach the web UI at"
+        )
+    };
+    let lower = url.to_ascii_lowercase();
+    let trimmed = lower.strip_suffix('/').unwrap_or(&lower);
+    let (scheme, rest) = trimmed.split_once("://").ok_or_else(bad)?;
+    let default_port = match scheme {
+        "https" => 443,
+        "http" => 80,
+        _ => return Err(bad()),
+    };
+    let (host, port) = match rest.strip_prefix('[') {
+        Some(v6) => {
+            let (inner, after) = v6.split_once(']').ok_or_else(bad)?;
+            if inner.is_empty()
+                || !inner
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || ":.".contains(c))
+            {
+                return Err(bad());
+            }
+            let port = match after {
+                "" => None,
+                p => Some(p.strip_prefix(':').ok_or_else(bad)?),
+            };
+            (format!("[{inner}]"), port)
+        }
+        None => {
+            let (host, port) = match rest.split_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (rest, None),
+            };
+            if host.is_empty()
+                || !host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-.".contains(c))
+            {
+                return Err(bad());
+            }
+            (host.to_string(), port)
+        }
+    };
+    let port = match port {
+        None => None,
+        Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => match p.parse::<u16>()
+        {
+            Ok(0) | Err(_) => return Err(bad()),
+            Ok(n) if n == default_port => None,
+            Ok(n) => Some(n),
+        },
+        Some(_) => return Err(bad()),
+    };
+    let loopback = host == "localhost"
+        || host == "[::1]"
+        || host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback());
+    if scheme == "http" && !loopback {
+        bail!(
+            "ui_url {url:?}: plain http is for a loopback host only; the session cookie would \
+             cross the network in cleartext — use https"
+        );
+    }
+    Ok(match port {
+        Some(p) => format!("{scheme}://{host}:{p}"),
+        None => format!("{scheme}://{host}"),
+    })
 }
 
 fn build_tls(cert: Option<&Path>, key: Option<&Path>, what: &str) -> Result<Option<TlsAcceptor>> {
@@ -179,6 +332,91 @@ mod tests {
         assert!(parse("addr = \"127.0.0.1:9000\"\ndata_dir = \"/d\"\n").is_ok());
         assert!(parse("addr = \"[::1]:9000\"\ndata_dir = \"/d\"\n").is_ok());
         assert_eq!(parse("data_dir = \"/d\"\n").unwrap().addr, DEFAULT_ADDR);
+    }
+
+    #[test]
+    fn the_web_ui_is_off_unless_asked_for_and_held_to_the_same_rules() {
+        assert!(parse("data_dir = \"/d\"\n").unwrap().ui.is_none());
+        let ui = parse("ui_addr = \"127.0.0.1:8444\"\ndata_dir = \"/d\"\n")
+            .unwrap()
+            .ui
+            .unwrap();
+        assert_eq!(ui.url, "http://127.0.0.1:8444");
+        // Plain HTTP off loopback, for the UI too.
+        let err = parse("ui_addr = \"0.0.0.0:8444\"\nui_url = \"http://h:8444\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("cleartext"), "{err:#}");
+        // The node listener's pair serves the UI unless it has its own; a wildcard address
+        // needs the URL browsers use.
+        let ui = parse(
+            "addr = \"0.0.0.0:8443\"\ntls_cert = \"/c.pem\"\ntls_key = \"/k.pem\"\n\
+             ui_addr = \"0.0.0.0:8444\"\nui_url = \"https://Hub.example:8444/\"\n",
+        )
+        .unwrap()
+        .ui
+        .unwrap();
+        assert_eq!(ui.tls_cert.as_deref(), Some(Path::new("/c.pem")));
+        assert_eq!(ui.url, "https://hub.example:8444");
+        assert!(
+            parse("ui_addr = \"0.0.0.0:8444\"\ntls_cert = \"/c\"\ntls_key = \"/k\"\n").is_err()
+        );
+        for bad in [
+            "hub.example",
+            "https://hub.example/ui",
+            "ftp://h",
+            "https://",
+        ] {
+            assert!(
+                parse(&format!("ui_addr = \"127.0.0.1:1\"\nui_url = \"{bad}\"\n")).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse("ui_url = \"http://127.0.0.1:1\"\n").is_err());
+        // Origins as browsers write them: default ports dropped; http for loopback only.
+        let url = |u: &str| parse_origin(u).map_err(|e| format!("{e:#}"));
+        assert_eq!(
+            url("HTTPS://Hub.example:443/").unwrap(),
+            "https://hub.example"
+        );
+        assert_eq!(
+            url("https://hub.example:08444").unwrap(),
+            "https://hub.example:8444"
+        );
+        assert_eq!(url("http://127.0.0.1:80").unwrap(), "http://127.0.0.1");
+        assert_eq!(
+            url("http://127.9.0.1:8444").unwrap(),
+            "http://127.9.0.1:8444"
+        );
+        assert_eq!(
+            url("http://localhost:8444").unwrap(),
+            "http://localhost:8444"
+        );
+        assert_eq!(url("http://[::1]:8444").unwrap(), "http://[::1]:8444");
+        assert_eq!(url("https://[fd00::1]:443").unwrap(), "https://[fd00::1]");
+        for plain in [
+            "http://hub.example",
+            "http://10.0.0.1:8444",
+            "http://[fd00::1]",
+        ] {
+            assert!(
+                url(plain).unwrap_err().contains("loopback host only"),
+                "{plain}"
+            );
+        }
+        for bad in [
+            "https://h:0",
+            "https://h:99999",
+            "https://h:x",
+            "https://[::1",
+            "https://h:1:2",
+        ] {
+            assert!(url(bad).unwrap_err().contains("expected"), "{bad}");
+        }
+        // The one derived from a loopback address with TLS.
+        let ui = parse("ui_addr = \"127.0.0.1:443\"\nui_tls_cert = \"/c\"\nui_tls_key = \"/k\"\n")
+            .unwrap()
+            .ui
+            .unwrap();
+        assert_eq!(ui.url, "https://127.0.0.1");
     }
 
     #[test]

@@ -24,8 +24,17 @@ All notable changes to virtkit will be documented in this file.
   jobs, `vk dev` environments and pinned `vk run`s: what each belongs to (project and job,
   workspace and environment, image), its vCPUs, the memory reserved for it and the memory it
   holds now, and when it started. `vk-hub workloads` lists them — `--node` takes a host's ID
-  or name — and the nodes table counts them. `[node] workload_mem_secs` sets how often their
-  memory is measured.
+  or name — a host's page shows them live, and the nodes table counts them. `[node]
+  workload_mem_secs` sets how often their memory is measured.
+- **Experimental: `vk-hub` has a web UI.** With `ui_addr` in its config, `vk-hub serve`
+  also serves live pages listing the fleet and each host's inventory and VMs. `vk-hub ui
+  login` prints a single-use link that signs a browser in for 12 hours; `vk-hub ui sessions`
+  and `vk-hub ui logout` list and end sessions.
+
+### Changed
+
+- `vk-hub local sessions` prints a line per session, as `vk-hub ui sessions` does, and
+  `vk-hub local logout <id>` fails when there is no such session.
 
 ### Fixed
 

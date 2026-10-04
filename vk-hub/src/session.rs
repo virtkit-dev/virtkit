@@ -299,14 +299,17 @@ async fn record(hub: &Hub, node: &Node, msg: NodeMsg) -> Result<()> {
     match msg {
         NodeMsg::Inventory(inventory) => {
             tokio::task::spawn_blocking(move || db.record_inventory(&id, inventory, now)).await??;
+            hub.changed(&node.id);
             Ok(())
         }
         NodeMsg::Heartbeat(heartbeat) => {
             tokio::task::spawn_blocking(move || db.record_heartbeat(&id, heartbeat, now)).await??;
+            hub.changed(&node.id);
             Ok(())
         }
         NodeMsg::Report(report) => {
             tokio::task::spawn_blocking(move || db.record_report(&id, report, now)).await??;
+            hub.changed(&node.id);
             Ok(())
         }
         NodeMsg::Hello { .. } | NodeMsg::Auth { .. } => {

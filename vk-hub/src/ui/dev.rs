@@ -9,6 +9,7 @@ use serde::Deserialize;
 use vk_hub_proto::Workload;
 
 use super::html::Html;
+use super::local::LocalSite;
 use super::pages;
 use super::{Auth, Body, Ui};
 use crate::local::{Keep, Local};
@@ -153,8 +154,8 @@ async fn dev_rows(local: &Local) -> Result<Vec<DevRow>, String> {
 }
 
 /// `GET /dev`.
-pub(super) async fn page(auth: &Auth, ui: &Ui) -> Response<Body> {
-    let rows = ui.dev_list.get(&ui.local, &ui.hub, LIST_FRESH).await;
+pub(super) async fn page(auth: &Auth, ui: &Ui, site: &LocalSite) -> Response<Body> {
+    let rows = site.dev_list.get(&site.local, &ui.hub, LIST_FRESH).await;
     let mut main = Html::new();
     main.raw("<h1>Dev environments</h1>");
     let steer = auth.session.role >= Role::Operator;
@@ -168,10 +169,10 @@ pub(super) async fn page(auth: &Auth, ui: &Ui) -> Response<Body> {
         Ok(rows) if rows.is_empty() => {
             main.raw("<p class=\"empty\">This host keeps no dev environment.</p>");
         }
-        Ok(rows) => table(&mut main, rows, &ui.local, steer.then_some(auth)),
+        Ok(rows) => table(&mut main, rows, &site.local, steer.then_some(auth)),
     }
     main.raw("<p class=\"sub\">Read as the page loads; <a href=\"/dev\">reload</a> for newer.</p>");
-    super::page(pages::layout("dev environments", auth, &main))
+    super::page(super::local::layout("dev environments", auth, &main))
 }
 
 fn table(h: &mut Html, rows: &[DevRow], local: &Local, steer: Option<&Auth>) {
