@@ -3,7 +3,8 @@
 //! qcow2 overlay over the one before, cached by its parent and the instruction — made by booting
 //! the guest on it, acting through qemu-ga ([`crate::winexec`]) and powering it off cleanly.
 //! `ENV`, `WORKDIR` and `SHELL` shape the `RUN` steps after them. `# vk: disk=` sizes a
-//! `winiso:` stage's install, and `# vk: generalize=on` ends the stage with sysprep. The result
+//! `winiso:` stage's install, `# vk: generalize=on` ends the stage with sysprep, and
+//! `# vk: firmware=uefi-secboot` (experimental) enrolls Microsoft's Secure Boot keys. The result
 //! is a bundle `vk run` boots, which records its layer so another Dockerfile can build `FROM` it
 //! against the same build cache: the record names the layer, and only the cache that made it
 //! holds its disk.
@@ -94,6 +95,15 @@ struct Layer {
     /// provisioning: hostname, address, domain join).
     #[serde(default)]
     provision: Option<String>,
+    /// `# vk: firmware=uefi-secboot` (experimental): the image's machines, and the build's
+    /// guests, start with Microsoft's Secure Boot keys enrolled. Inherited by a stage built on
+    /// this one. The image does not carry the build guest's variables: each machine starts from
+    /// the template. Without SMM this guards only the boot chain below the guest's kernel, which
+    /// can rewrite the variable store directly (PK, KEK, db, dbx, or Secure Boot off, for good).
+    /// A variable write Windows authenticates at run time (its Secure Boot update task writing
+    /// db or dbx) is known to bug-check 0x1E in the firmware's runtime services.
+    #[serde(default)]
+    secure_boot: bool,
     /// Variables set by `ENV` since the last step, still to be made machine-wide.
     #[serde(skip)]
     unsaved_env: Vec<(String, String)>,
@@ -202,6 +212,10 @@ fn check_stage(stage: &Stage, context: &Path, no_network: bool) -> Result<()> {
                 bail!("`# vk: generalize={value}`: expected on or off")
             }
             "generalize" => {}
+            "firmware" if !matches!(value.as_str(), "uefi" | "uefi-secboot") => {
+                bail!("`# vk: firmware={value}`: expected uefi or uefi-secboot")
+            }
+            "firmware" => {}
             // Parsed for the Windows build, which does not act on them yet.
             _ => bail!("`# vk: {key}` is not supported yet"),
         }
@@ -354,6 +368,7 @@ fn build_stage(
             env: Vec::new(),
             workdir: None,
             provision: None,
+            secure_boot: false,
             unsaved_env: Vec::new(),
             unmade_workdir: false,
             generalized: false,
@@ -372,6 +387,9 @@ fn build_stage(
             stage.from.image
         );
     };
+    if let Some(firmware) = stage.directive("firmware") {
+        layer.secure_boot = firmware == "uefi-secboot";
+    }
     let steps = Steps {
         cpus,
         mem: &mem,
@@ -857,9 +875,16 @@ fn restart_guest(ga: &mut Client, code: i32, guest: &mut crate::uefi::Guest) -> 
 /// `ENV` and `WORKDIR` left for the step to make.
 fn step_key(layer: &Layer, material: &str) -> String {
     let workdir = layer.workdir.as_deref().filter(|_| layer.unmade_workdir);
+    // Include Secure Boot in the key because a step's drivers may not load under it.
+    // Keys without Secure Boot retain the existing cache format.
+    let firmware = if layer.secure_boot {
+        "\0uefi-secboot"
+    } else {
+        ""
+    };
     hex(&Sha256::digest(
         format!(
-            "winbuild-step-v1\0{}\0{material}\0{:?}\0{workdir:?}",
+            "winbuild-step-v1\0{}\0{material}\0{:?}\0{workdir:?}{firmware}",
             layer.key, layer.unsaved_env
         )
         .as_bytes(),
@@ -969,6 +994,9 @@ fn make_step(
         switch.0 = Some(child);
         nics = attach.nics;
     }
+    if layer.secure_boot {
+        crate::uefi::seed_secure_boot(work)?;
+    }
     let mut vm = crate::uefi::Guest::boot(
         work,
         "vk-build",
@@ -1050,6 +1078,7 @@ fn write_bundle(layer: &Layer, cpus: u32, mem: &str, out: &Path) -> Result<()> {
             "cpus": cpus,
             "mem": mem,
             "disks": ["disk.qcow2"],
+            "secure_boot": layer.secure_boot,
         }))?,
     )?;
     let password = out.join("admin-password");
@@ -1097,6 +1126,7 @@ mod tests {
             env: Vec::new(),
             workdir: None,
             provision: None,
+            secure_boot: false,
             unsaved_env: Vec::new(),
             unmade_workdir: false,
             generalized: false,
@@ -1210,6 +1240,7 @@ mod tests {
         let directives = [
             ("tpm=on", "`# vk: tpm` is not supported yet"),
             ("generalize=yes", "expected on or off"),
+            ("firmware=bios", "expected uefi or uefi-secboot"),
             ("disk=10G", "at least 20G"),
             ("disk=lots", "at least 20G"),
         ];
@@ -1221,6 +1252,10 @@ mod tests {
         assert!(err.contains("a winiso: stage's install only"), "{err}");
         let sized = parsed(&format!("# vk: disk=60G generalize=on\n{WINISO}"));
         check_stage(&sized[0], Path::new("/ctx"), false).unwrap();
+        for firmware in ["uefi", "uefi-secboot"] {
+            let stage = parsed(&format!("# vk: firmware={firmware}\n{WINISO}"));
+            check_stage(&stage[0], Path::new("/ctx"), false).unwrap();
+        }
         assert_eq!(disk_size("60G").unwrap(), 60 << 30);
         let err = refusal("FROM base --drivers=x\n");
         assert!(
@@ -1356,6 +1391,23 @@ mod tests {
         want.sort();
         assert_eq!(left, want);
         let _ = std::fs::remove_dir_all(&layers);
+    }
+
+    #[test]
+    fn a_step_key_covers_secure_boot_and_is_unchanged_without_it() {
+        let base = layer();
+        // Without Secure Boot, the key the cache always had for this step.
+        let v1 = format!("winbuild-step-v1\0{}\0COPY\0x\0[]\0None", base.key);
+        assert_eq!(
+            step_key(&base, "COPY\0x"),
+            hex(&Sha256::digest(v1.as_bytes()))
+        );
+        let mut secure_boot = layer();
+        secure_boot.secure_boot = true;
+        assert_ne!(
+            step_key(&base, "COPY\0x"),
+            step_key(&secure_boot, "COPY\0x")
+        );
     }
 
     #[test]

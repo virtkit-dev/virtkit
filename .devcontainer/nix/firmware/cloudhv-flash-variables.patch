@@ -1,0 +1,26 @@
+--- a/OvmfPkg/CloudHv/CloudHvDefines.fdf.inc
++++ b/OvmfPkg/CloudHv/CloudHvDefines.fdf.inc
+@@ -26,11 +26,20 @@
+ DEFINE SECFV_OFFSET      = 0x003CC000
+ DEFINE SECFV_SIZE        = 0x34000
+ 
+-SET gUefiOvmfPkgTokenSpaceGuid.PcdOvmfFdBaseAddress     = $(FW_BASE_ADDRESS)
+-SET gUefiOvmfPkgTokenSpaceGuid.PcdOvmfFirmwareFdSize    = $(FW_SIZE)
++#
++# vk (local patch): the variable store is a flash device of its own, which the VMM maps at
++# VARS_FLASH_BASE and backs with a file per machine, so UEFI variables (boot entries, Secure
++# Boot keys) persist across boots. These PCDs only tell the flash FVB driver where its device
++# is; the image keeps loading at FW_BASE_ADDRESS. Without the device the probe fails and the
++# variables stay in RAM, as before.
++#
++DEFINE VARS_FLASH_BASE   = 0xFFC00000
++
++SET gUefiOvmfPkgTokenSpaceGuid.PcdOvmfFdBaseAddress     = $(VARS_FLASH_BASE)
++SET gUefiOvmfPkgTokenSpaceGuid.PcdOvmfFirmwareFdSize    = $(VARS_SIZE)
+ SET gUefiOvmfPkgTokenSpaceGuid.PcdOvmfFirmwareBlockSize = $(BLOCK_SIZE)
+ 
+-SET gUefiOvmfPkgTokenSpaceGuid.PcdOvmfFlashNvStorageVariableBase = $(FW_BASE_ADDRESS)
++SET gUefiOvmfPkgTokenSpaceGuid.PcdOvmfFlashNvStorageVariableBase = $(VARS_FLASH_BASE)
+ SET gEfiMdeModulePkgTokenSpaceGuid.PcdFlashNvStorageVariableSize = $(VARS_LIVE_SIZE)
+ 
+ SET gUefiOvmfPkgTokenSpaceGuid.PcdOvmfFlashNvStorageEventLogBase = gUefiOvmfPkgTokenSpaceGuid.PcdOvmfFlashNvStorageVariableBase + gEfiMdeModulePkgTokenSpaceGuid.PcdFlashNvStorageVariableSize

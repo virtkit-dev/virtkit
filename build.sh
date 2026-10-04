@@ -196,6 +196,13 @@ EMBED_FIRMWARE=""
 if [ -e "$OUT/CLOUDHV.fd" ]; then
   EMBED_FIRMWARE=1
   EMBED_ENV="$EMBED_ENV VK_EMBED_FIRMWARE=/work/$OUT/CLOUDHV.fd"
+  # Its variable store templates (empty, and with Microsoft's Secure Boot keys): without them a
+  # UEFI guest's variables live in RAM and are lost at each boot.
+  for vars in CLOUDHV_VARS.fd:VK_EMBED_VARS CLOUDHV_VARS.ms.fd:VK_EMBED_VARS_MS; do
+    if [ -e "$OUT/${vars%%:*}" ]; then
+      EMBED_ENV="$EMBED_ENV ${vars##*:}=/work/$OUT/${vars%%:*}"
+    fi
+  done
 else
   echo "build.sh: no $OUT/CLOUDHV.fd — the vk built here embeds no UEFI firmware (./build-firmware.sh)" >&2
 fi
@@ -282,11 +289,15 @@ toolchain=$(sed -nE 's/^channel = "(.*)"$/\1/p' rust-toolchain.toml)
 # vk's bytes depend on the embedded firmware: a rebuild must rebuild it first.
 if [ -n "$EMBED_FIRMWARE" ]; then
   firmware_step="./build-firmware.sh && "
-  firmware_line=$(cd "$OUT" && sha256sum CLOUDHV.fd)
-  # The nix store path pins the exact edk2 derivation; absent for a CLOUDHV.fd placed by hand.
+  # The variable store templates are embedded too, when present.
+  firmware_line=$(cd "$OUT" && sha256sum CLOUDHV.fd $(ls CLOUDHV_VARS.fd CLOUDHV_VARS.ms.fd 2>/dev/null))
+  # The nix store paths pin the exact edk2 derivations; absent for a CLOUDHV.fd placed by hand.
   store_path=$(awk '$1 == "store_path:" { print $2 }' "$OUT/firmware-build-info.txt" 2>/dev/null || true)
   [ -z "$store_path" ] || firmware_line="$firmware_line
 firmware_store:  $store_path"
+  vars_store_path=$(awk '$1 == "vars_store_path:" { print $2 }' "$OUT/firmware-build-info.txt" 2>/dev/null || true)
+  [ -z "$vars_store_path" ] || firmware_line="$firmware_line
+firmware_vars_store: $vars_store_path"
 else
   firmware_step=""
   firmware_line="firmware:        none"
@@ -357,13 +368,18 @@ if [ -n "$BOOTSTRAP_CHECK" ]; then
   # Clean working-tree copy (no target/.git/dist) so the rebuild can't reuse this build's
   # target/ and is a genuine from-scratch compile.
   tar -c --exclude=./.git --exclude=./target --exclude="./$OUT" . | tar -x -C "$boot_tmp"
-  # `vk` embeds the kernel and any UEFI firmware, so the rebuild must see the same
-  # dist/vmlinux and dist/CLOUDHV.fd (the tree copy above excludes dist/); without them the
-  # two vk binaries would differ.
+  # `vk` embeds the kernel and any UEFI firmware and variable stores, so the rebuild must see
+  # the same dist/vmlinux and dist/CLOUDHV*.fd (the tree copy above excludes dist/); without
+  # them the two vk binaries would differ.
   mkdir -p "$boot_tmp/$OUT"
   cp "$boot_dist/vmlinux" "$boot_tmp/$OUT/vmlinux"
   if [ -n "$EMBED_FIRMWARE" ]; then
     cp "$boot_dist/CLOUDHV.fd" "$boot_tmp/$OUT/CLOUDHV.fd"
+    for vars in CLOUDHV_VARS.fd CLOUDHV_VARS.ms.fd; do
+      if [ -e "$boot_dist/$vars" ]; then
+        cp "$boot_dist/$vars" "$boot_tmp/$OUT/$vars"
+      fi
+    done
   fi
   rebuild_start=$SECONDS
   # Thread the commit in: the copy has no .git.

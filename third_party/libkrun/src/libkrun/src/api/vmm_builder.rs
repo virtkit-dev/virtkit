@@ -38,6 +38,7 @@ pub struct VmmBuilder<'a> {
     hyperv: bool,
     vm_generation_id: Option<[u8; 16]>,
     system_uuid: Option<[u8; 16]>,
+    uefi_vars: Option<std::path::PathBuf>,
     restore_from: Option<std::path::PathBuf>,
     split_irqchip: bool,
     acpi: bool,
@@ -155,6 +156,16 @@ impl<'a> VmmBuilder<'a> {
     /// copy that boots fresh. x86_64 only.
     pub fn system_uuid(mut self, uuid: [u8; 16]) -> Self {
         self.system_uuid = Some(uuid);
+        self
+    }
+
+    /// Back the UEFI variable store with `path` (local patch, see VENDOR.md): a flash device
+    /// at [`arch::x86_64::layout::UEFI_VARS_FLASH_START`] holding the file's contents, which
+    /// the guest's writes change in place. The file is a variable store image (an OVMF
+    /// `VARS.fd`, 528 KiB for a 4 MiB build); the firmware keeps its UEFI variables there
+    /// across boots. x86_64 only.
+    pub fn uefi_vars(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.uefi_vars = Some(path.into());
         self
     }
 
@@ -544,6 +555,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     vm_resources.hyperv_enabled = builder_cfg.hyperv;
     vm_resources.vm_generation_id = builder_cfg.vm_generation_id;
     vm_resources.system_uuid = builder_cfg.system_uuid;
+    vm_resources.uefi_vars = builder_cfg.uefi_vars;
     vm_resources.restore_from = builder_cfg.restore_from;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;

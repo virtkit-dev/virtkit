@@ -14,7 +14,7 @@
 //! lasts until the guest powers off; a stop presses the ACPI power button.
 
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,11 @@ pub(crate) const CONTROL_SOCKET: &str = "vmm.sock";
 pub(crate) const GENERATION_ID: &str = "vmgenid";
 /// The SMBIOS system UUID of a run directory's disks, kept as the generation ID is.
 pub(crate) const SYSTEM_UUID: &str = "system-uuid";
+/// The UEFI variable store of a run directory's disks (the firmware's flash), kept with them.
+pub(crate) const UEFI_VARS: &str = "uefi-vars.fd";
+/// The firmware's variable store flash length. Every store vk boots, including templates and
+/// bundle stores, must match this length for the firmware's flash layout.
+const UEFI_VARS_LEN: u64 = 0x84000;
 
 /// How long a guest has to answer the ACPI power button before vk asks its qemu-ga to shut it
 /// down instead (a Windows guest can be set to ignore the button).
@@ -71,6 +76,14 @@ pub(crate) struct Manifest {
     pub mem: Option<String>,
     /// Disk images in attach order, relative to the bundle directory.
     pub disks: Vec<PathBuf>,
+    /// The machine's UEFI variable store (boot entries, Secure Boot keys), relative to the
+    /// bundle directory; a run starts from a copy. None: the firmware's empty store.
+    #[serde(default)]
+    pub uefi_vars: Option<PathBuf>,
+    /// The machine starts with Microsoft's Secure Boot keys enrolled (when the bundle has no
+    /// variable store of its own).
+    #[serde(default)]
+    pub secure_boot: bool,
     /// Set for a snapshot (`vk snapshot`): the bundle also holds the VM's state and memory,
     /// which a run starts from instead of booting.
     #[serde(default)]
@@ -160,13 +173,29 @@ impl Bundle {
         Ok(manifest)
     }
 
+    /// The file `vm.json` names `relative`, in the bundle directory: a relative path without
+    /// `..`, so a manifest names only files of its bundle.
+    fn file(&self, relative: &Path) -> Result<PathBuf> {
+        let inside = relative
+            .components()
+            .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
+        if !inside || relative.as_os_str().is_empty() {
+            bail!(
+                "{}: {} is not a path inside the bundle",
+                self.dir.join(MANIFEST).display(),
+                relative.display()
+            );
+        }
+        Ok(self.dir.join(relative))
+    }
+
     /// The bundle's disks as absolute paths, each checked to exist.
     pub(crate) fn disks(&self) -> Result<Vec<PathBuf>> {
         self.manifest
             .disks
             .iter()
             .map(|disk| {
-                let path = self.dir.join(disk);
+                let path = self.file(disk)?;
                 if !path.is_file() {
                     bail!("bundle disk {} not found", path.display());
                 }
@@ -273,6 +302,127 @@ fn refuse_unsupported(args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Prepare `bundle`'s disk overlays ([`overlays`]) and variable store ([`seed_uefi_vars`]) in
+/// `work`. `fresh` first removes the previous overlays and store to start from the bundle.
+pub(crate) fn machine_files(work: &Path, bundle: &Bundle, fresh: bool) -> Result<Vec<Disk>> {
+    let bundle_disks = bundle.disks()?;
+    if fresh {
+        let kept = (0..bundle_disks.len()).map(|i| format!("disk{i}.qcow2"));
+        remove_files(work, kept.chain([UEFI_VARS.to_string()]))?;
+    }
+    let disks = overlays(&bundle_disks, work)?;
+    seed_uefi_vars(work, bundle)?;
+    Ok(disks)
+}
+
+/// Remove the files `names` from `dir`, ignoring missing files.
+pub(crate) fn remove_files<N: AsRef<Path>>(
+    dir: &Path,
+    names: impl IntoIterator<Item = N>,
+) -> Result<()> {
+    for name in names {
+        let path = dir.join(name);
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("removing {}", path.display()));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The UEFI variable store of the disks in `work`, made on their first boot from the firmware's
+/// empty template unless [`seed_uefi_vars`] gave them one, and kept with them. None when vk has
+/// no template (built without one): the firmware then keeps its variables in RAM.
+fn uefi_vars(work: &Path) -> Result<Option<PathBuf>> {
+    let path = work.join(UEFI_VARS);
+    if !path.exists() {
+        let Some(template) = vars_template(crate::embed::Asset::UefiVars)? else {
+            return Ok(None);
+        };
+        write_vars(&path, &template)?;
+    }
+    Ok(Some(path))
+}
+
+/// Seed the disks in `work` with `bundle`'s variable store unless they already have one. Copy
+/// the bundle's store so it stays unchanged for the next machine; otherwise use Microsoft's
+/// keys for a Secure Boot bundle.
+pub(crate) fn seed_uefi_vars(work: &Path, bundle: &Bundle) -> Result<()> {
+    let path = work.join(UEFI_VARS);
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(vars) = &bundle.manifest.uefi_vars {
+        let from = bundle.file(vars)?;
+        let bytes = std::fs::read(&from).with_context(|| format!("reading {}", from.display()))?;
+        return write_vars(&path, &bytes).with_context(|| format!("copying {}", from.display()));
+    }
+    if bundle.manifest.secure_boot {
+        seed_secure_boot(work)?;
+    }
+    Ok(())
+}
+
+/// Start the disks in `work` with Secure Boot on, unless they have a variable store already:
+/// the store with Microsoft's keys (KEK, db) enrolled, so Windows and the drivers Microsoft
+/// signs boot and anything else is refused. Experimental: an authenticated variable write at
+/// the guest's run time (Windows' Secure Boot update task writing db or dbx) is known to
+/// bug-check 0x1E in the firmware's runtime services. And without SMM it guards only the boot
+/// chain below the guest's kernel: that kernel can rewrite the variable store directly,
+/// replacing PK, KEK, db or dbx or turning Secure Boot off for good.
+pub(crate) fn seed_secure_boot(work: &Path) -> Result<()> {
+    let path = work.join(UEFI_VARS);
+    if path.exists() {
+        return Ok(());
+    }
+    let Some(template) = vars_template(crate::embed::Asset::UefiVarsSecureBoot)? else {
+        bail!("this vk has no Secure Boot variable store (build-firmware.sh makes one)");
+    };
+    write_vars(&path, &template)
+}
+
+/// A variable store template's bytes: embedded in `vk`, else installed beside the firmware's
+/// default path; None when neither is there.
+fn vars_template(asset: crate::embed::Asset) -> Result<Option<Vec<u8>>> {
+    if let Some(bytes) = asset.embedded() {
+        return Ok(Some(bytes.to_vec()));
+    }
+    match std::fs::read(asset.default_path()) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", asset.default_path())),
+    }
+}
+
+/// Write the variable store `bytes` as the new file `path`, whole or not at all.
+fn write_vars(path: &Path, bytes: &[u8]) -> Result<()> {
+    if bytes.len() as u64 != UEFI_VARS_LEN {
+        bail!(
+            "a UEFI variable store of {} bytes, not {UEFI_VARS_LEN}",
+            bytes.len()
+        );
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Refuse the variable store `path` unless it is [`UEFI_VARS_LEN`] long.
+fn check_vars_len(path: &Path) -> Result<()> {
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .len();
+    if len != UEFI_VARS_LEN {
+        bail!(
+            "{} is a UEFI variable store of {len} bytes, not {UEFI_VARS_LEN}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// The VM generation ID for the disks in `work`: created on first boot, kept across boots,
 /// new for fresh overlays (a copy of the bundle's disk). Only a missing ID is created;
 /// an unreadable or malformed ID is an error, since a silently changed ID makes a
@@ -354,7 +504,8 @@ fn random_uuid_v4() -> Result<[u8; 16]> {
 /// starts from the snapshot in that directory instead of booting, under a new VM generation ID
 /// that `work` does not keep: it is a copy of the snapshotted guest, which it must not pass
 /// for (a domain controller then resets its invocation ID and RID pool), and libkrun refuses
-/// to restore a guest that had one without a new one. It keeps the snapshot's system UUID.
+/// to restore a guest that had one without a new one. It keeps the snapshot's system UUID, and
+/// the caller gives `work` the snapshot's variable store ([`seed_uefi_vars`]).
 pub(crate) fn guest_spec(
     firmware: &Path,
     work: &Path,
@@ -368,6 +519,15 @@ pub(crate) fn guest_spec(
         Some(snapshot) => (random_id()?, restored_uuid(snapshot, work)?),
         None => (generation_id(work)?, system_uuid(work)?),
     };
+    // A restored guest has a variable store only if its snapshot's machine had one (which
+    // [`seed_uefi_vars`] copied in place of `work`'s), as libkrun requires.
+    let uefi_vars = match restore {
+        Some(_) => Some(work.join(UEFI_VARS)).filter(|p| p.exists()),
+        None => uefi_vars(work)?,
+    };
+    if let Some(vars) = &uefi_vars {
+        check_vars_len(vars)?;
+    }
     Ok(VmSpec {
         kernel: firmware.to_path_buf(),
         cmdline: String::new(),
@@ -394,6 +554,7 @@ pub(crate) fn guest_spec(
         hyperv: true,
         vm_generation_id: Some(vm_generation_id),
         system_uuid: Some(system_uuid),
+        uefi_vars,
         serial_input: Some(work.join(CONSOLE_SOCKET)),
         control: Some(work.join(CONTROL_SOCKET)),
         restore_from: restore.map(Path::to_path_buf),
@@ -603,7 +764,6 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
     let firmware = match bundle.manifest.firmware {
         Firmware::Uefi => firmware()?,
     };
-    let bundle_disks = bundle.disks()?;
     let restore = bundle.manifest.snapshot.is_some();
     let guest_ip = if args.net {
         Some(crate::net::switch_addrs(crate::run::RUN_SUBNET)?.2)
@@ -611,13 +771,9 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
         None
     };
     check_restore(&bundle.manifest, args.cpus, args.mem.as_deref(), guest_ip)?;
-    if restore {
-        // Its memory goes with its disks as they were: never with a previous run's overlays.
-        for i in 0..bundle_disks.len() {
-            let _ = std::fs::remove_file(work.join(format!("disk{i}.qcow2")));
-        }
-    }
-    let disks = overlays(&bundle_disks, work)?;
+    // A snapshot's memory goes with its disks and variable store as they were: never with a
+    // previous run's.
+    let disks = machine_files(work, &bundle, restore)?;
     let name = bundle.name();
     let cpus = args.cpus.or(bundle.manifest.cpus).unwrap_or(2);
     let mem = args
@@ -932,6 +1088,142 @@ mod tests {
         assert!(bundle.disks().is_err(), "the named disk does not exist");
         std::fs::write(dir.join("disk.qcow2"), b"").unwrap();
         assert_eq!(bundle.disks().unwrap(), vec![bundle.dir.join("disk.qcow2")]);
+    }
+
+    /// A variable store of the right length, every byte `b`.
+    fn store(b: u8) -> Vec<u8> {
+        vec![b; UEFI_VARS_LEN as usize]
+    }
+
+    /// A bundle in `tmp/img` of the manifest `json`, with a 1 MiB disk `d` and the variable
+    /// store `vars.fd` of `b`s.
+    fn vars_bundle(tmp: &Scratch, json: &str) -> Bundle {
+        let dir = tmp.path().join("img");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(tmp.path().join("run")).unwrap();
+        std::fs::write(dir.join(MANIFEST), json).unwrap();
+        std::fs::write(dir.join("d"), vec![0u8; 1 << 20]).unwrap();
+        std::fs::write(dir.join("vars.fd"), store(b'b')).unwrap();
+        Bundle::detect(dir.to_str().unwrap()).unwrap().unwrap()
+    }
+
+    #[test]
+    fn a_machine_starts_from_a_copy_of_its_bundles_variable_store_and_keeps_its_own() {
+        let tmp = Scratch::new("vars");
+        let bundle = vars_bundle(
+            &tmp,
+            r#"{"firmware": "uefi", "disks": ["d"], "uefi_vars": "vars.fd"}"#,
+        );
+        let work = tmp.path().join("run");
+        assert!(!bundle.manifest.secure_boot);
+        seed_uefi_vars(&work, &bundle).unwrap();
+        assert_eq!(std::fs::read(work.join(UEFI_VARS)).unwrap(), store(b'b'));
+        // The machine's own store, once it has one, is never replaced; the bundle's is never
+        // written.
+        std::fs::write(work.join(UEFI_VARS), store(b'm')).unwrap();
+        seed_uefi_vars(&work, &bundle).unwrap();
+        seed_secure_boot(&work).unwrap();
+        assert_eq!(std::fs::read(work.join(UEFI_VARS)).unwrap(), store(b'm'));
+        assert_eq!(
+            std::fs::read(bundle.dir.join("vars.fd")).unwrap(),
+            store(b'b')
+        );
+    }
+
+    #[test]
+    fn a_fresh_machine_replaces_the_variable_store_its_run_kept() {
+        // As a snapshot's restore does: its memory goes with the snapshot's store only.
+        let tmp = Scratch::new("vars-fresh");
+        let bundle = vars_bundle(
+            &tmp,
+            r#"{"firmware": "uefi", "disks": ["d"], "uefi_vars": "vars.fd"}"#,
+        );
+        let work = tmp.path().join("run");
+        std::fs::write(work.join(UEFI_VARS), store(b's')).unwrap();
+        machine_files(&work, &bundle, false).unwrap();
+        assert_eq!(std::fs::read(work.join(UEFI_VARS)).unwrap(), store(b's'));
+        machine_files(&work, &bundle, true).unwrap();
+        assert_eq!(std::fs::read(work.join(UEFI_VARS)).unwrap(), store(b'b'));
+    }
+
+    #[test]
+    fn a_secure_boot_bundle_without_a_store_starts_from_microsofts_keys() {
+        let tmp = Scratch::new("vars-secboot");
+        let bundle = vars_bundle(
+            &tmp,
+            r#"{"firmware": "uefi", "disks": ["d"], "secure_boot": true}"#,
+        );
+        let work = tmp.path().join("run");
+        let seeded = seed_uefi_vars(&work, &bundle);
+        // The template is vk's own: embedded or installed in a release, absent in a dev build.
+        match vars_template(crate::embed::Asset::UefiVarsSecureBoot).unwrap() {
+            Some(template) => {
+                seeded.unwrap();
+                assert_eq!(std::fs::read(work.join(UEFI_VARS)).unwrap(), template);
+            }
+            None => {
+                let err = seeded.unwrap_err();
+                assert!(format!("{err:#}").contains("no Secure Boot"), "{err:#}");
+                assert!(!work.join(UEFI_VARS).exists());
+            }
+        }
+    }
+
+    #[test]
+    fn a_variable_store_of_another_length_is_refused() {
+        let tmp = Scratch::new("vars-len");
+        let bundle = vars_bundle(
+            &tmp,
+            r#"{"firmware": "uefi", "disks": ["d"], "uefi_vars": "vars.fd"}"#,
+        );
+        let work = tmp.path().join("run");
+        std::fs::write(bundle.dir.join("vars.fd"), b"short").unwrap();
+        let err = seed_uefi_vars(&work, &bundle).unwrap_err();
+        assert!(format!("{err:#}").contains("of 5 bytes"), "{err:#}");
+        assert!(!work.join(UEFI_VARS).exists());
+        std::fs::write(work.join(UEFI_VARS), b"short").unwrap();
+        assert!(check_vars_len(&work.join(UEFI_VARS)).is_err());
+        std::fs::write(work.join(UEFI_VARS), store(0)).unwrap();
+        check_vars_len(&work.join(UEFI_VARS)).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_names_only_files_inside_its_bundle() {
+        let tmp = Scratch::new("vars-paths");
+        let outside = tmp.path().join("outside");
+        std::fs::write(&outside, store(0)).unwrap();
+        let work = tmp.path().join("run");
+        for (json, what) in [
+            (
+                r#"{"firmware": "uefi", "disks": ["../outside"]}"#,
+                "../outside",
+            ),
+            (
+                &format!(
+                    r#"{{"firmware": "uefi", "disks": ["{}"]}}"#,
+                    outside.display()
+                ),
+                outside.to_str().unwrap(),
+            ),
+            (r#"{"firmware": "uefi", "disks": [""]}"#, ""),
+        ] {
+            let bundle = vars_bundle(&tmp, json);
+            let err = bundle.disks().unwrap_err();
+            assert!(
+                err.to_string().contains("not a path inside the bundle"),
+                "{what}: {err}"
+            );
+        }
+        let bundle = vars_bundle(
+            &tmp,
+            r#"{"firmware": "uefi", "disks": ["./d"], "uefi_vars": "../outside"}"#,
+        );
+        assert_eq!(bundle.disks().unwrap(), vec![bundle.dir.join("d")]);
+        let err = seed_uefi_vars(&work, &bundle).unwrap_err();
+        assert!(
+            err.to_string().contains("not a path inside the bundle"),
+            "{err}"
+        );
     }
 
     #[test]

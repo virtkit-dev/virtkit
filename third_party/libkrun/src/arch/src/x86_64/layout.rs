@@ -89,6 +89,11 @@ pub const PVPANIC_PORT: u16 = 0x505;
 /// cloud-hypervisor writes them) and installs them for the OS (local patch).
 pub const SMBIOS_START: u64 = 0x000f_0000;
 
+/// The UEFI variable store flash (local patch): where the firmware's flash driver looks for it
+/// (vk's CloudHv build), below the TSS KVM keeps under 4 GiB, and its erase block size.
+pub const UEFI_VARS_FLASH_START: u64 = 0xffc0_0000;
+pub const UEFI_VARS_FLASH_BLOCK: usize = 0x1000;
+
 /// The 16-byte VM generation ID the DSDT's VGEN device points at: the last page of the
 /// reserved window below 1 MiB, past the ACPI tables (local patch).
 pub const VMGENID_ADDR: u64 = 0x000f_f000;

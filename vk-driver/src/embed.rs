@@ -1,4 +1,5 @@
-//! The guest kernel, vk-agent and UEFI firmware, optionally embedded into the `vk` binary.
+//! The guest kernel, vk-agent, UEFI firmware and its variable store templates, optionally
+//! embedded into the `vk` binary.
 //!
 //! The shipped `vk` is self-contained: build.sh compiles it with the `embed`
 //! feature and points build.rs at a freshly built vk-agent and the pinned vmlinux.
@@ -31,6 +32,10 @@ pub enum Asset {
     Agent,
     /// The UEFI firmware a UEFI guest (Windows) boots (`CLOUDHV.fd`, build-firmware.sh).
     Firmware,
+    /// The firmware's empty variable store for a new machine (`CLOUDHV_VARS.fd`).
+    UefiVars,
+    /// The variable store with Microsoft's Secure Boot keys enrolled (`CLOUDHV_VARS.ms.fd`).
+    UefiVarsSecureBoot,
 }
 
 impl Asset {
@@ -40,6 +45,8 @@ impl Asset {
             Asset::Kernel => "vmlinux",
             Asset::Agent => "vk-agent",
             Asset::Firmware => "CLOUDHV.fd",
+            Asset::UefiVars => "CLOUDHV_VARS.fd",
+            Asset::UefiVarsSecureBoot => "CLOUDHV_VARS.ms.fd",
         }
     }
 
@@ -49,6 +56,8 @@ impl Asset {
             Asset::Kernel => "/usr/local/lib/vk/vmlinux",
             Asset::Agent => "/usr/local/lib/vk/vk-agent",
             Asset::Firmware => "/usr/local/lib/vk/CLOUDHV.fd",
+            Asset::UefiVars => "/usr/local/lib/vk/CLOUDHV_VARS.fd",
+            Asset::UefiVarsSecureBoot => "/usr/local/lib/vk/CLOUDHV_VARS.ms.fd",
         }
     }
 
@@ -57,6 +66,8 @@ impl Asset {
             Asset::Kernel => kernel(),
             Asset::Agent => agent(),
             Asset::Firmware => firmware(),
+            Asset::UefiVars => uefi_vars(),
+            Asset::UefiVarsSecureBoot => uefi_vars_secure_boot(),
         }
     }
 }
@@ -79,6 +90,10 @@ mod blob {
         env!("VK_EMBED_AGENT_STAMP"),
         " ",
         env!("VK_EMBED_FIRMWARE_STAMP"),
+        " ",
+        env!("VK_EMBED_VARS_STAMP"),
+        " ",
+        env!("VK_EMBED_VARS_MS_STAMP"),
         "\n",
         ".section .rodata.vk_embed_kernel,\"a\",@progbits\n",
         ".globl VK_EMBED_KERNEL_START\n",
@@ -104,6 +119,22 @@ mod blob {
         "\"\n",
         ".globl VK_EMBED_FIRMWARE_END\n",
         "VK_EMBED_FIRMWARE_END:\n",
+        ".section .rodata.vk_embed_vars,\"a\",@progbits\n",
+        ".globl VK_EMBED_VARS_START\n",
+        "VK_EMBED_VARS_START:\n",
+        ".incbin \"",
+        env!("VK_EMBED_VARS_PATH"),
+        "\"\n",
+        ".globl VK_EMBED_VARS_END\n",
+        "VK_EMBED_VARS_END:\n",
+        ".section .rodata.vk_embed_vars_ms,\"a\",@progbits\n",
+        ".globl VK_EMBED_VARS_MS_START\n",
+        "VK_EMBED_VARS_MS_START:\n",
+        ".incbin \"",
+        env!("VK_EMBED_VARS_MS_PATH"),
+        "\"\n",
+        ".globl VK_EMBED_VARS_MS_END\n",
+        "VK_EMBED_VARS_MS_END:\n",
     ));
 
     unsafe extern "C" {
@@ -113,6 +144,10 @@ mod blob {
         pub static VK_EMBED_AGENT_END: u8;
         pub static VK_EMBED_FIRMWARE_START: u8;
         pub static VK_EMBED_FIRMWARE_END: u8;
+        pub static VK_EMBED_VARS_START: u8;
+        pub static VK_EMBED_VARS_END: u8;
+        pub static VK_EMBED_VARS_MS_START: u8;
+        pub static VK_EMBED_VARS_MS_END: u8;
     }
 
     /// The bytes between two linker symbols (`None` if empty). The symbols bound a
@@ -144,6 +179,17 @@ mod blob {
             &raw const VK_EMBED_FIRMWARE_END,
         )
     }
+
+    pub fn uefi_vars() -> Option<&'static [u8]> {
+        between(&raw const VK_EMBED_VARS_START, &raw const VK_EMBED_VARS_END)
+    }
+
+    pub fn uefi_vars_secure_boot() -> Option<&'static [u8]> {
+        between(
+            &raw const VK_EMBED_VARS_MS_START,
+            &raw const VK_EMBED_VARS_MS_END,
+        )
+    }
 }
 
 #[cfg(feature = "embed")]
@@ -161,6 +207,16 @@ fn firmware() -> Option<&'static [u8]> {
     blob::firmware()
 }
 
+#[cfg(feature = "embed")]
+fn uefi_vars() -> Option<&'static [u8]> {
+    blob::uefi_vars()
+}
+
+#[cfg(feature = "embed")]
+fn uefi_vars_secure_boot() -> Option<&'static [u8]> {
+    blob::uefi_vars_secure_boot()
+}
+
 #[cfg(not(feature = "embed"))]
 fn kernel() -> Option<&'static [u8]> {
     None
@@ -173,6 +229,16 @@ fn agent() -> Option<&'static [u8]> {
 
 #[cfg(not(feature = "embed"))]
 fn firmware() -> Option<&'static [u8]> {
+    None
+}
+
+#[cfg(not(feature = "embed"))]
+fn uefi_vars() -> Option<&'static [u8]> {
+    None
+}
+
+#[cfg(not(feature = "embed"))]
+fn uefi_vars_secure_boot() -> Option<&'static [u8]> {
     None
 }
 
@@ -253,7 +319,13 @@ mod tests {
 
     #[test]
     fn no_flag_uses_embedded_else_default() {
-        for asset in [Asset::Kernel, Asset::Agent, Asset::Firmware] {
+        for asset in [
+            Asset::Kernel,
+            Asset::Agent,
+            Asset::Firmware,
+            Asset::UefiVars,
+            Asset::UefiVarsSecureBoot,
+        ] {
             let r = resolve(asset, None).unwrap();
             if asset.embedded().is_some() {
                 assert!(r.is_embedded());

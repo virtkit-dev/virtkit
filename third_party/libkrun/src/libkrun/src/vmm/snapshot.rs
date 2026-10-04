@@ -20,7 +20,8 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use devices::legacy::{AcpiPm, AcpiPmState, Cmos, CmosState, I8042Device, I8042State};
+use devices::legacy::{AcpiPm, AcpiPmState, Cmos, CmosState, Flash, FlashState};
+use devices::legacy::{I8042Device, I8042State};
 use devices::legacy::{Serial, SerialState};
 use devices::virtio::{PciTransportState, VirtioPciTransport};
 use vm_memory::{GuestMemoryBackend, GuestMemoryMmap, GuestMemoryRegion};
@@ -222,6 +223,9 @@ pub struct LegacyDevices {
     pub serials: Vec<Arc<Mutex<Serial>>>,
     pub i8042: Arc<Mutex<I8042Device>>,
     pub acpi_pm: Arc<Mutex<AcpiPm>>,
+    /// The UEFI variable store flash, whose contents are its file's: the VM's disks and that
+    /// file are the snapshot's.
+    pub flash: Option<Arc<Mutex<Flash>>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -231,6 +235,8 @@ pub struct LegacyState {
     pub serials: Vec<SerialState>,
     pub i8042: I8042State,
     pub acpi_pm: AcpiPmState,
+    #[serde(default)]
+    pub flash: Option<FlashState>,
 }
 
 impl LegacyDevices {
@@ -244,10 +250,15 @@ impl LegacyDevices {
                 .collect(),
             i8042: self.i8042.lock().unwrap().save_state(),
             acpi_pm: self.acpi_pm.lock().unwrap().save_state(),
+            flash: self
+                .flash
+                .as_ref()
+                .map(|flash| flash.lock().unwrap().save_state()),
         }
     }
 
-    /// Put back `state`, of a VM with as many serial ports.
+    /// Put back `state`, of a VM with as many serial ports, and a UEFI variable store flash if
+    /// this one has one.
     pub fn restore(&self, state: &LegacyState) -> io::Result<()> {
         if state.serials.len() != self.serials.len() {
             return Err(io::Error::other(format!(
@@ -256,12 +267,24 @@ impl LegacyDevices {
                 self.serials.len()
             )));
         }
+        if state.flash.is_some() != self.flash.is_some() {
+            let (snapshot, vm) = match state.flash {
+                Some(_) => ("has", "has none"),
+                None => ("has no", "has one"),
+            };
+            return Err(io::Error::other(format!(
+                "the snapshot {snapshot} a UEFI variable store flash, the VM {vm}"
+            )));
+        }
         self.cmos.lock().unwrap().restore_state(&state.cmos);
         for (serial, saved) in self.serials.iter().zip(&state.serials) {
             serial.lock().unwrap().restore_state(saved);
         }
         self.i8042.lock().unwrap().restore_state(&state.i8042);
         self.acpi_pm.lock().unwrap().restore_state(&state.acpi_pm);
+        if let (Some(flash), Some(saved)) = (&self.flash, &state.flash) {
+            flash.lock().unwrap().restore_state(saved);
+        }
         Ok(())
     }
 }
@@ -710,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_devices_restore_only_with_as_many_serial_ports() {
+    fn legacy_devices_restore_only_with_as_many_serial_ports_and_the_same_flash() {
         use devices::legacy::{AcpiPm, Cmos, I8042Device, Serial};
         use std::sync::atomic::AtomicBool;
         use utils::eventfd::{EFD_NONBLOCK, EventFd};
@@ -731,11 +754,24 @@ mod tests {
                 evt(),
                 None,
             )),
+            flash: None,
         };
         let saved = devices(2).save();
         devices(2).restore(&saved).unwrap();
         let refused = devices(1).restore(&saved).unwrap_err();
         assert!(refused.to_string().contains("2 serial ports, the VM 1"));
+
+        // Nor without the UEFI variable store flash the snapshot has.
+        let with_flash = LegacyState {
+            flash: Some(FlashState::default()),
+            ..devices(2).save()
+        };
+        let refused = devices(2).restore(&with_flash).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("has a UEFI variable store flash")
+        );
     }
 
     #[test]

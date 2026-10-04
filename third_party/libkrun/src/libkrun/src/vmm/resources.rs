@@ -122,6 +122,8 @@ pub struct VmResources {
     pub vm_generation_id: Option<[u8; 16]>,
     /// The system UUID the Windows platform's SMBIOS tables carry, if any (local patch).
     pub system_uuid: Option<[u8; 16]>,
+    /// The file backing the UEFI variable store flash, if any (local patch).
+    pub uefi_vars: Option<std::path::PathBuf>,
     /// A snapshot directory to start the VM from instead of booting (local patch).
     pub restore_from: Option<std::path::PathBuf>,
     /// Whether to enable split irqchip
@@ -282,6 +284,7 @@ mod tests {
             hyperv_enabled: false,
             vm_generation_id: None,
             system_uuid: None,
+            uefi_vars: None,
             restore_from: None,
             split_irqchip: false,
             acpi_enabled: false,
