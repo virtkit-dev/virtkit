@@ -37,6 +37,7 @@ pub struct VmmBuilder<'a> {
     pmu: bool,
     hyperv: bool,
     vm_generation_id: Option<[u8; 16]>,
+    restore_from: Option<std::path::PathBuf>,
     split_irqchip: bool,
     acpi: bool,
     smbios_oem_strings: Vec<String>,
@@ -144,6 +145,16 @@ impl<'a> VmmBuilder<'a> {
         }
         self.vm_generation_id = id;
         Ok(self)
+    }
+
+    /// Start the VM from the snapshot in `dir` ([`VmmHandle::snapshot`]) instead of booting
+    /// its payload: the VM must be configured as the snapshotted one was, the same memory and
+    /// the same devices in the same order, but for its [`VmmBuilder::vm_generation_id`], which
+    /// must be new if the snapshotted VM had one (local patch).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+    pub fn restore_from(mut self, dir: std::path::PathBuf) -> Self {
+        self.restore_from = Some(dir);
+        self
     }
 
     pub fn split_irqchip(mut self, enabled: bool) -> Result<Self, VmmError> {
@@ -265,6 +276,23 @@ impl VmmHandle {
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         Err(VmmError::FeatureDisabled())
+    }
+
+    /// Pause the VM and write its snapshot to `dir`; returns once it is written. The VM stays
+    /// paused: [`VmmHandle::resume`] it, or [`VmmHandle::quit`] (local patch).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+    pub fn snapshot(&self, dir: &std::path::Path) -> Result<(), VmmError> {
+        self.vm_ctl("snapshot", |reply| {
+            VmCtl::Snapshot(dir.to_path_buf(), reply)
+        })
+    }
+
+    /// End the VM as a guest power-off does: devices flush, the process exits.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
+    pub fn quit(&self) -> Result<(), VmmError> {
+        self.vm_ctl_tx
+            .send(VmCtl::Quit)
+            .map_err(|e| VmmError::Internal(format!("quit: {e}")))
     }
 
     /// Signal the guest to perform an orderly ACPI shutdown.
@@ -504,6 +532,7 @@ fn build_vm(builder_cfg: VmmBuilder<'_>) -> Result<Vmm<'_>, VmmError> {
     vm_resources.pmu_enabled = builder_cfg.pmu;
     vm_resources.hyperv_enabled = builder_cfg.hyperv;
     vm_resources.vm_generation_id = builder_cfg.vm_generation_id;
+    vm_resources.restore_from = builder_cfg.restore_from;
     vm_resources.split_irqchip = builder_cfg.split_irqchip;
     vm_resources.acpi_enabled = builder_cfg.acpi;
     if !builder_cfg.smbios_oem_strings.is_empty() {
@@ -623,6 +652,8 @@ mod tests {
                 match req {
                     VmCtl::Pause(reply) => reply.send(Ok(())).unwrap(),
                     VmCtl::Resume(reply) => reply.send(Err("vcpu 1 exited".into())).unwrap(),
+                    #[allow(unreachable_patterns)]
+                    other => panic!("unexpected {other:?}"),
                 }
             }
         });

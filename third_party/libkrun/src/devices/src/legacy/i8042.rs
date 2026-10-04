@@ -101,7 +101,36 @@ pub struct I8042Device {
     btail: Wrapping<usize>,
 }
 
+/// [`I8042Device::save_state`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "snapshot", derive(serde::Serialize, serde::Deserialize))]
+pub struct I8042State {
+    pub status: u8,
+    pub control: u8,
+    pub outp: u8,
+    pub cmd: u8,
+}
+
 impl I8042Device {
+    /// What a snapshot keeps: the controller's registers; queued bytes are dropped (local
+    /// patch).
+    pub fn save_state(&self) -> I8042State {
+        I8042State {
+            status: self.status,
+            control: self.control,
+            outp: self.outp,
+            cmd: self.cmd,
+        }
+    }
+
+    /// Put back what [`I8042Device::save_state`] returned.
+    pub fn restore_state(&mut self, state: &I8042State) {
+        self.status = state.status;
+        self.control = state.control;
+        self.outp = state.outp;
+        self.cmd = state.cmd;
+    }
+
     /// Constructs an i8042 device that will signal the given event when the guest requests it.
     pub fn new(
         reset_evt: EventFd,
@@ -502,5 +531,35 @@ mod tests {
             i8042.trigger_kbd_interrupt().unwrap_err(),
             Error::KbdInterruptDisabled
         )
+    }
+
+    #[test]
+    fn the_registers_survive_save_and_restore() {
+        let device = || {
+            I8042Device::new(
+                EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+                Arc::new(AtomicBool::new(false)),
+                EventFd::new(utils::eventfd::EFD_NONBLOCK).unwrap(),
+            )
+        };
+        let mut i8042 = device();
+        // The guest writes the control byte and the output port, as a driver's init does.
+        i8042.write(0, OFS_STATUS, &[CMD_WRITE_CTR]);
+        i8042.write(0, OFS_DATA, &[CB_KBD_INT | CB_POST_OK]);
+        i8042.write(0, OFS_STATUS, &[CMD_WRITE_OUTP]);
+        i8042.write(0, OFS_DATA, &[0x03]);
+        let saved = i8042.save_state();
+        assert_eq!((saved.control, saved.outp), (CB_KBD_INT | CB_POST_OK, 0x03));
+
+        let mut back = device();
+        back.restore_state(&saved);
+        assert_eq!(back.save_state(), saved);
+        let mut data = [0u8];
+        back.write(0, OFS_STATUS, &[CMD_READ_CTR]);
+        back.read(0, OFS_DATA, &mut data);
+        assert_eq!(data[0], CB_KBD_INT | CB_POST_OK);
+        back.write(0, OFS_STATUS, &[CMD_READ_OUTP]);
+        back.read(0, OFS_DATA, &mut data);
+        assert_eq!(data[0], 0x03);
     }
 }

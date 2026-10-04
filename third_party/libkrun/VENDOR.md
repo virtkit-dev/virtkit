@@ -316,8 +316,10 @@ tables describe fixed hardware instead of a HW-reduced platform. The FADT carrie
 and control blocks at `ACPI_PM_BASE` (0x600), the SCI on `SCI_GSI` (9), the reset register
 (0x60C, value 1), `SLP_BUTTON` and `RESET_REG_SUP`, and points at a 64-byte-aligned FACS.
 The DSDT defines `\_S5`; the MADT's interrupt source override sets the SCI to edge/high,
-matching its irqfd. No PM timer, GPE block or SMI command port. arch's `zerocopy` enables
-`derive` for the override structure, which `acpi_tables` lacks. Covered by `x86_64::acpi::tests`.
+matching its irqfd. No SMI command port. The PM timer is added for UEFI firmware, and a GPE0
+block for VM snapshots, declared only when the VM has a generation ID (both under "UEFI
+firmware and Windows guests" below). arch's `zerocopy` enables `derive` for the override
+structure, which `acpi_tables` lacks. Covered by `x86_64::acpi::tests`.
 
 `src/devices/src/legacy/{acpi_pm.rs (new),mod.rs}` + `src/libkrun/src/vmm/{builder.rs,
 device_manager/legacy.rs}` — the `AcpiPm` PIO device serves that block. An S5 write to PM1a_CNT
@@ -547,3 +549,94 @@ resume. The `KVM_KVMCLOCK_CTRL` TODO in `Vcpu::running` matters only to a Linux 
 kvmclock (its soft-lockup watchdog), and virtkit pauses only UEFI guests. Covered by
 `test_vcpu_pause_resume` in `vstate.rs` and `pause_and_resume_return_the_event_loops_answer`
 in `vmm_builder.rs`.
+
+`src/arch/src/x86_64/linux/{hyperv.rs,msr.rs}` + `src/libkrun/{Cargo.toml,src/vmm/mod.rs,
+src/vmm/linux/vstate.rs}` — the CPU half of a snapshot, behind a `snapshot` feature (serde,
+and kvm-bindings' `serde`). `Vmm::save_cpu_state` / `restore_cpu_state` take and put back, on
+a paused VM, every vCPU's state and the VM's in-kernel state (PIT, PIC, IOAPIC, kvmclock) as
+a serializable `CpuState`, through the vCPU threads (`VcpuEvent::SaveState` /
+`RestoreState`; a running vCPU refuses), with the drain of stale answers and the `Exited`
+handling of pause and resume (`exchange_vcpus`, which also reports a vCPU's
+`VcpuResponse::Error`). It uses the save/restore code inherited from Firecracker, which
+nothing called, with these changes: the MSRs it keeps add the Hyper-V ones (`SNAPSHOT_MSRS`,
+restored after the others and in their order: guest OS ID before the hypercall page, SynIC
+control before its pages, timer configurations before counts) and a few a modern guest sets
+(XSS, ARCH_CAPABILITIES, TSX_CTRL, UMWAIT_CONTROL, KVM poll control); an MSR this KVM refuses
+is skipped at save rather than tripping an assert, and one refused at restore is an error that
+names it. The saved kvmclock drops `KVM_CLOCK_REALTIME` and `KVM_CLOCK_HOST_TSC` as well as
+`TSC_STABLE` (which `KVM_SET_CLOCK` refuses): with REALTIME, which Linux 5.16+ reports, the
+restore would move the clock on by the host time since the snapshot, so the guest's clock
+resumes where the snapshot froze it, whatever the host kernel; the caller sets the guest's
+time after a restore. Covered by tests that move a vCPU's state into a fresh vCPU through JSON,
+plain and with Hyper-V (skipped where KVM has no Hyper-V, as in a nested dev VM), one that
+restores the VM state, and one of `exchange_vcpus`'s error path.
+
+`src/devices/{Cargo.toml,src/virtio/{device.rs,pci.rs,console/device.rs}}` — the virtio half of
+a snapshot. `VirtioPciTransport::save_state` keeps the device type and what the driver wrote
+(BAR0, command, MSI-X table and control, status, acked features, configuration vector, each
+queue's size, vector and ring addresses; the transport now keeps the queues' setup when
+activation hands them to the device) plus the device's own words (`VirtioDevice::save_state`,
+empty by default). `restore_state` refuses another device type or queue count, writes it all
+again in a fresh transport through the same register handlers, in a driver's order, so every
+side effect (BAR routing, MSI-X routes, activation) happens as it did, and fails unless the
+transport then saves the state it was given. Each queue resumes at the index its used ring
+holds in the restored memory, so a request taken but not finished is taken again (idempotent
+for a disk, a duplicate frame for a NIC), and every ready queue is kicked and the guest
+interrupted once. The console's state is the ports the guest started, which a restore starts
+again (the start loop moved into `Console::start_ports`). Serializable behind a `snapshot`
+feature. Covered by a round trip through a fresh transport and the refusals in `pci.rs`.
+
+`src/arch/src/x86_64/{acpi.rs,layout.rs}` + `src/devices/src/legacy/{acpi_pm.rs,i8042.rs,
+mod.rs,x86_64/{cmos.rs,serial.rs}}` + `src/libkrun/{Cargo.toml,src/api/vmm_builder.rs,
+src/vmm/{builder.rs,mod.rs,resources.rs,snapshot.rs,device_manager/kvm/pci.rs}}` +
+`src/devices/src/virtio/pci.rs` — VM snapshots. `VmmHandle::snapshot(dir)` (a
+`VmCtl::Snapshot` with a reply channel, as `pause`) pauses the VM and writes into `dir`
+(created 0700, its files 0600) `state.json` — the CPU state, the legacy devices' (CMOS NVRAM,
+clock offset and a time being set, the UARTs', i8042's and ACPI PM's registers, the PM
+timer's count), every virtio-pci transport's in registration order (the PCI host manager now
+keeps them typed) — and a memory image, the RAM regions in a sparse file whose zero pages are
+holes. The VM stays paused; `VmmHandle::quit` (`VmCtl::Quit`) ends it as a power-off does,
+devices flushing on the way out. The commit is atomic: the image is written under a new name
+(`memory-<nonce>`) and synced, then `state.json.tmp`, which names it, is synced and renamed
+over `state.json`, the directory synced, and only then the previous image removed; a snapshot
+that fails at any point leaves the previous one whole. `state.json` also records the
+kvm-bindings release (whose serialized structs the CPU state is) and the host CPU (CPUID
+vendor, family/model/stepping and feature leaves), and a restore refuses a snapshot of
+another version, kvm-bindings or CPU model: a snapshot restores on the same host model only.
+`VmmBuilder::restore_from(dir)` builds the VM as usual, then, with its vCPUs started paused,
+loads the memory (reading data extents, clearing what the build itself wrote where the image
+has holes), restores the legacy devices (refusing another serial port count) and the
+transports, then the CPU state, and only then kicks the virtio queues and interrupts the guest
+(`kick_restored`, split from `restore_state` so no interrupt is raised before the interrupt
+controllers are back); a failed restore is `StartMicrovmError::Restore`. The VM must be built
+as the snapshotted one was. A restore reads the image in rather than mapping it privately
+over the RAM: Windows touches its working set at once, and faulting it in lazily made it
+slower to its first commands.
+
+The VM generation ID changes on a restore, as Microsoft's spec requires of a VM brought back
+to an earlier point (an Active Directory domain controller relies on it against USN
+rollback): the restored RAM holds the snapshot's ID, which the restore overwrites with the one
+the VM is configured with, and a restore refuses a snapshot whose guest has an ID unless it
+is given one (and one without unless not). It then notifies the guest as QEMU's vmgenid
+does: the `AcpiPm` device gains a GPE0 block at `ACPI_PM_BASE + 0x10` (GPE0_STS, then
+GPE0_EN, 2 bytes each, byte-addressable, status write-1-to-clear), declared in the FADT
+(`GPE0_BLK`, `GPE0_BLK_LEN` 4, `X_GPE0_BLK`) and the DSDT
+(`Scope (\_GPE) { Method (_E05) { Notify (\_SB.VGEN, 0x80) } }`, GPE 5 as QEMU) only when
+the VM has a generation ID; after resuming, the restore latches GPE 5 and raises the SCI if
+the guest enabled it, as the power button does. Covered by byte-level tests of the FADT
+fields and the AML in `acpi.rs`, of the GPE registers in `acpi_pm.rs`, round trips of the
+serial port, i8042 and ACPI PM state, and tests of the memory image, the atomic commit and
+the refusals in `snapshot.rs`.
+
+`src/devices/src/virtio/{mod.rs,block/worker.rs,net/worker/unix.rs,console/{process_rx.rs,
+process_tx.rs}}` + `src/libkrun/src/vmm/mod.rs` — a snapshot quiesces the devices: one
+process-wide gate (`device_writes` / `quiesce_devices`) that the virtio-blk worker holds
+around a queue pass, the virtio-net worker around each wakeup's events and the console ports
+around writing input and publishing completions, and that a snapshot takes exclusively before
+it reads the devices' state and the guest's memory, so no batch or frame lands halfway
+through the dump. A snapshot waits up to 10 s for it, then fails rather than stall. virtio-rng
+and virtio-balloon run on the VMM's event loop, which the snapshot itself occupies. A snapshot
+refuses a VM with any other virtio device (vsock, virtio-fs, GPU, input, vhost-user: their
+threads write guest memory ungated) or with virtio-mmio devices, which it does not save.
+Checked by snapshotting a Windows guest while it downloads and writes files: after the
+restore every file matches its logged hash and the guest carries on.

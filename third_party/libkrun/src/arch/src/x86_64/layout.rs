@@ -47,11 +47,17 @@ pub fn shm_span_usable(ram_last_addr: u64) -> bool {
     ram_last_addr <= SHM_MEM_START
 }
 
-/// Base of the ACPI PM1 register block (PM1a_EVT at +0, PM1a_CNT at +4) and the ACPI reset
-/// register (+0xC), served by the `AcpiPm` PIO device (local patch, see VENDOR.md).
+/// Base of the ACPI PM1 register block (PM1a_EVT at +0, PM1a_CNT at +4), the ACPI reset
+/// register (+0xC) and the GPE0 block (+0x10), served by the `AcpiPm` PIO device (local
+/// patch, see VENDOR.md).
 pub const ACPI_PM_BASE: u16 = 0x600;
 /// Length of the `AcpiPm` PIO window.
-pub const ACPI_PM_LEN: u64 = 0x10;
+pub const ACPI_PM_LEN: u64 = 0x14;
+/// The GPE0 block: GPE0_STS, then GPE0_EN, each `ACPI_GPE0_BLK_LEN / 2` bytes.
+pub const ACPI_GPE0_BLK: u16 = ACPI_PM_BASE + 0x10;
+pub const ACPI_GPE0_BLK_LEN: u8 = 4;
+/// The GPE that notifies the guest of a new VM generation ID (`\_GPE._E05`), QEMU's.
+pub const VMGENID_GPE: u8 = 5;
 /// ACPI reset register, as an absolute port.
 pub const ACPI_RESET_REG: u16 = ACPI_PM_BASE + 0x0c;
 /// Value the guest writes to `ACPI_RESET_REG` to request a reset.

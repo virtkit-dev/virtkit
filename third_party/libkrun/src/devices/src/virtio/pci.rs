@@ -5,6 +5,7 @@
 use std::fmt::{Display, Formatter};
 use std::io;
 use std::mem::size_of;
+use std::num::Wrapping;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -441,6 +442,40 @@ impl PciConfigSpace {
     fn write_u32(&mut self, offset: usize, value: u32) {
         self.write_bytes(offset, &value.to_le_bytes());
     }
+}
+
+/// What a snapshot keeps of a virtio-pci function: what its driver wrote, which
+/// [`VirtioPciTransport::restore_state`] writes again in a fresh transport, plus the device's
+/// own state (local patch).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "snapshot", derive(serde::Serialize, serde::Deserialize))]
+pub struct PciTransportState {
+    /// The virtio device type, which a restore checks against the fresh transport's.
+    pub device_type: u32,
+    pub bar0: u32,
+    pub command: u16,
+    pub msix_control: u16,
+    /// Each MSI-X table entry's four dwords (address low and high, data, control).
+    pub msix_table: Vec<[u32; 4]>,
+    pub device_status: u32,
+    pub acked_features: u64,
+    pub msix_config_vector: u16,
+    /// Every queue of the device, in order: as many as the fresh transport must have.
+    pub queues: Vec<PciQueueState>,
+    /// [`VirtioDevice::save_state`].
+    pub device: Vec<u32>,
+}
+
+/// A queue as its driver set it up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "snapshot", derive(serde::Serialize, serde::Deserialize))]
+pub struct PciQueueState {
+    pub size: u16,
+    pub ready: bool,
+    pub msix_vector: u16,
+    pub desc_table: u64,
+    pub avail_ring: u64,
+    pub used_ring: u64,
 }
 
 pub struct VirtioPciTransport {
@@ -1333,6 +1368,190 @@ impl VirtioPciTransport {
         }
     }
 
+    /// What the driver set up, for [`Self::restore_state`]. Taken on a paused VM, whose
+    /// devices have no request in flight.
+    pub fn save_state(&self) -> PciTransportState {
+        let msix = self.msix.lock().unwrap();
+        let msix_table = (0..u64::from(NUM_VECTORS))
+            .map(|vector| {
+                let mut entry = [0u32; 4];
+                for (dword, value) in entry.iter_mut().enumerate() {
+                    let mut bytes = [0u8; DWORD_SIZE];
+                    msix.read_table(
+                        vector * MSIX_TABLE_ENTRY_SIZE + dword as u64 * 4,
+                        &mut bytes,
+                    );
+                    *value = u32::from_le_bytes(bytes);
+                }
+                entry
+            })
+            .collect();
+        drop(msix);
+        let queues = self
+            .state
+            .queue_setups()
+            .iter()
+            .zip(&self.queue_registers)
+            .map(|(setup, registers)| PciQueueState {
+                size: setup.size,
+                ready: setup.ready,
+                msix_vector: registers.msix_vector,
+                desc_table: setup.desc_table.raw_value(),
+                avail_ring: setup.avail_ring.raw_value(),
+                used_ring: setup.used_ring.raw_value(),
+            })
+            .collect();
+        let device = self.state.locked_device();
+        PciTransportState {
+            device_type: device.device_type(),
+            bar0: self.bar_base,
+            command: self.config.read_u16(pci_config::COMMAND).unwrap_or(0),
+            msix_control: self
+                .config
+                .read_u16(self.msix_cap_offset + MSIX_MSG_CTL_OFFSET)
+                .unwrap_or(0),
+            msix_table,
+            device_status: self.state.device_status,
+            acked_features: device.acked_features(),
+            msix_config_vector: self.msix_config_vector,
+            queues,
+            device: device.save_state(),
+        }
+    }
+
+    /// Bring this fresh transport (and its device) to `state`, with the guest's memory already
+    /// restored: write what the driver wrote, through the same registers, in a driver's order
+    /// (BAR and MSI-X before memory decoding and bus mastering, then the status handshake as
+    /// far as the driver took it, the features and each queue before DRIVER_OK activates the
+    /// device). Each queue resumes where its used ring stands; a request the device had taken
+    /// but not finished when the snapshot was taken is taken again. [`Self::kick_restored`]
+    /// then wakes both sides. Fails on a transport of another device, or one the replay does
+    /// not bring to `state`.
+    pub fn restore_state(&mut self, state: &PciTransportState) -> Result<(), String> {
+        let device_type = self.state.locked_device().device_type();
+        if state.device_type != device_type {
+            return Err(format!(
+                "a virtio device of type {} in the snapshot, of type {device_type} in the VM",
+                state.device_type
+            ));
+        }
+        if state.queues.len() != self.queue_registers.len() {
+            return Err(format!(
+                "virtio device type {device_type}: {} queues in the snapshot, {} in the VM",
+                state.queues.len(),
+                self.queue_registers.len()
+            ));
+        }
+        self.write_driver_state(state);
+        if self.save_state() != *state {
+            return Err(format!(
+                "virtio device type {device_type} did not take its snapshot state"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The driver's writes [`Self::restore_state`] makes again.
+    fn write_driver_state(&mut self, state: &PciTransportState) {
+        use device_status::{ACKNOWLEDGE, DRIVER, DRIVER_OK, FEATURES_OK};
+
+        self.write_config(pci_config::BAR0 as u16, &state.bar0.to_le_bytes());
+        {
+            let mut msix = self.msix.lock().unwrap();
+            for (vector, entry) in state.msix_table.iter().enumerate() {
+                for (dword, value) in entry.iter().enumerate() {
+                    msix.write_table(
+                        vector as u64 * MSIX_TABLE_ENTRY_SIZE + dword as u64 * 4,
+                        &value.to_le_bytes(),
+                    );
+                }
+            }
+        }
+        self.write_config(
+            (self.msix_cap_offset + MSIX_MSG_CTL_OFFSET) as u16,
+            &state.msix_control.to_le_bytes(),
+        );
+        self.write_config(pci_config::COMMAND as u16, &state.command.to_le_bytes());
+
+        let mut status = 0;
+        for step in [ACKNOWLEDGE, DRIVER, FEATURES_OK] {
+            if state.device_status & step == 0 {
+                return;
+            }
+            if step == FEATURES_OK {
+                for page in 0..2u32 {
+                    self.write_common_config(
+                        common_cfg::DRIVER_FEATURE_SELECT,
+                        &page.to_le_bytes(),
+                    );
+                    let features = (state.acked_features >> (32 * page)) as u32;
+                    self.write_common_config(common_cfg::DRIVER_FEATURE, &features.to_le_bytes());
+                }
+            }
+            status |= step;
+            self.write_common_config(common_cfg::DEVICE_STATUS, &[status as u8]);
+        }
+
+        for (index, queue) in state.queues.iter().enumerate() {
+            self.write_common_config(common_cfg::QUEUE_SELECT, &(index as u16).to_le_bytes());
+            self.write_common_config(
+                common_cfg::QUEUE_MSIX_VECTOR,
+                &queue.msix_vector.to_le_bytes(),
+            );
+            if !queue.ready {
+                continue;
+            }
+            self.write_common_config(common_cfg::QUEUE_SIZE, &queue.size.to_le_bytes());
+            for (offset, address) in [
+                (common_cfg::QUEUE_DESCRIPTOR, queue.desc_table),
+                (common_cfg::QUEUE_DRIVER, queue.avail_ring),
+                (common_cfg::QUEUE_DEVICE, queue.used_ring),
+            ] {
+                self.write_common_config(offset, &address.to_le_bytes());
+            }
+            if let Some(used) = self.state.used_index(GuestAddress(queue.used_ring)) {
+                self.state.with_queue_mut(index as u32, |q| {
+                    q.next_avail = Wrapping(used);
+                    q.next_used = Wrapping(used);
+                });
+            }
+            self.write_common_config(common_cfg::QUEUE_ENABLE, &VIRTIO_QUEUE_READY.to_le_bytes());
+        }
+        self.write_common_config(
+            common_cfg::MSIX_CONFIG,
+            &state.msix_config_vector.to_le_bytes(),
+        );
+
+        if state.device_status & DRIVER_OK == 0 {
+            return;
+        }
+        status |= DRIVER_OK;
+        self.write_common_config(common_cfg::DEVICE_STATUS, &[status as u8]);
+        self.state.locked_device().restore_state(&state.device);
+    }
+
+    /// Once the vCPUs are restored too: kick every ready queue and interrupt the guest, so
+    /// neither the device nor the driver waits on a notification the snapshot lost. An
+    /// interrupt raised before the interrupt controllers are restored would be lost itself.
+    pub fn kick_restored(&self) {
+        if self.state.device_status & device_status::DRIVER_OK == 0 {
+            return;
+        }
+        for (setup, event) in self
+            .state
+            .queue_setups()
+            .iter()
+            .zip(self.state.queue_evts())
+        {
+            if setup.ready
+                && let Err(err) = event.write(QUEUE_EVENT_SIGNAL)
+            {
+                warn!("failed to kick a restored virtio-pci queue: {err}");
+            }
+        }
+        self.device_interrupt.signal_used_queue();
+    }
+
     fn read_pci_cfg_region(&mut self, data: &mut [u8]) {
         if let Some((PCI_BAR0_INDEX, selected_offset, len)) = self.pci_cfg_selection()
             && data.len() == len
@@ -1557,7 +1776,7 @@ mod tests {
     use crate::BusDevice;
     use crate::virtio::{ActivateResult, DeviceQueue, QueueConfig};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use vm_memory::GuestAddress;
+    use vm_memory::{Bytes, GuestAddress};
 
     const TEST_DEVICE_TYPE: u32 = 1;
     const TEST_QUEUE_SIZE: u16 = 8;
@@ -1594,6 +1813,8 @@ mod tests {
     struct DummyDevice {
         acked_features: u64,
         activated: bool,
+        /// Where the first queue stood when the device was activated.
+        first_queue_at: Option<(u16, u16)>,
         queue_config: &'static [QueueConfig],
         shm: Option<crate::virtio::VirtioShmRegion>,
         resettable: bool,
@@ -1648,9 +1869,12 @@ mod tests {
             &mut self,
             _mem: GuestMemoryMmap,
             _interrupt: InterruptTransport,
-            _queues: Vec<DeviceQueue>,
+            queues: Vec<DeviceQueue>,
         ) -> ActivateResult {
             self.activated = true;
+            self.first_queue_at = queues
+                .first()
+                .map(|q| (q.queue.next_avail.0, q.queue.next_used.0));
             Ok(())
         }
 
@@ -1681,6 +1905,7 @@ mod tests {
             Arc::new(Mutex::new(DummyDevice {
                 acked_features: 0,
                 activated: false,
+                first_queue_at: None,
                 queue_config,
                 shm: None,
                 resettable: true,
@@ -1982,6 +2207,7 @@ mod tests {
             Arc::new(Mutex::new(DummyDevice {
                 acked_features: 0,
                 activated: false,
+                first_queue_at: None,
                 queue_config: &QUEUE_CONFIG,
                 shm: Some(crate::virtio::VirtioShmRegion {
                     host_addr: 0,
@@ -2056,6 +2282,138 @@ mod tests {
         );
     }
 
+    /// Take `transport` through a driver's setup of queue 0, with MSI-X: vector 0 for the
+    /// configuration, vector 1 for the queue.
+    fn drive_to_driver_ok(transport: &mut VirtioPciTransport) -> u64 {
+        let bar = enable_memory_bar(transport);
+        program_vector(transport, bar, 0);
+        program_vector(transport, bar, 1);
+        enable_msix(transport);
+        let status = |transport: &mut VirtioPciTransport, value: u32| {
+            write_bar(transport, bar, common_cfg::DEVICE_STATUS, &[value as u8])
+        };
+        use device_status::{ACKNOWLEDGE, DRIVER, DRIVER_OK, FEATURES_OK};
+        status(transport, ACKNOWLEDGE);
+        status(transport, ACKNOWLEDGE | DRIVER);
+        write_bar(
+            transport,
+            bar,
+            common_cfg::DRIVER_FEATURE_SELECT,
+            &1u32.to_le_bytes(),
+        );
+        write_bar(
+            transport,
+            bar,
+            common_cfg::DRIVER_FEATURE,
+            &1u32.to_le_bytes(),
+        );
+        status(transport, ACKNOWLEDGE | DRIVER | FEATURES_OK);
+        write_bar(
+            transport,
+            bar,
+            common_cfg::QUEUE_SELECT,
+            &0u16.to_le_bytes(),
+        );
+        write_bar(
+            transport,
+            bar,
+            common_cfg::QUEUE_SIZE,
+            &TEST_SELECTED_QUEUE_SIZE.to_le_bytes(),
+        );
+        write_bar(
+            transport,
+            bar,
+            common_cfg::QUEUE_MSIX_VECTOR,
+            &1u16.to_le_bytes(),
+        );
+        for (offset, address) in [
+            (common_cfg::QUEUE_DESCRIPTOR, TEST_DESCRIPTOR_ADDRESS),
+            (common_cfg::QUEUE_DRIVER, TEST_DRIVER_ADDRESS),
+            (common_cfg::QUEUE_DEVICE, TEST_DEVICE_ADDRESS),
+        ] {
+            write_bar(transport, bar, offset, &address.to_le_bytes());
+        }
+        write_bar(
+            transport,
+            bar,
+            common_cfg::QUEUE_ENABLE,
+            &VIRTIO_QUEUE_READY.to_le_bytes(),
+        );
+        write_bar(transport, bar, common_cfg::MSIX_CONFIG, &0u16.to_le_bytes());
+        status(transport, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
+        bar
+    }
+
+    #[test]
+    fn a_restored_transport_is_as_its_driver_left_it_and_resumes_at_the_used_ring() {
+        let (mut live, _) = transport_with_line();
+        drive_to_driver_ok(&mut live);
+        let saved = live.save_state();
+        assert_eq!(
+            saved.queues[0],
+            PciQueueState {
+                size: TEST_SELECTED_QUEUE_SIZE,
+                ready: true,
+                msix_vector: 1,
+                desc_table: u64::from(TEST_DESCRIPTOR_ADDRESS),
+                avail_ring: u64::from(TEST_DRIVER_ADDRESS),
+                used_ring: u64::from(TEST_DEVICE_ADDRESS),
+            }
+        );
+        assert_eq!(saved.acked_features, 1u64 << VIRTIO_F_VERSION_1);
+        assert_eq!(
+            saved.device_status & device_status::DRIVER_OK,
+            device_status::DRIVER_OK
+        );
+
+        // A fresh transport over the restored memory, where the device had used 7 entries.
+        let (mut fresh, _) = transport_with_line();
+        fresh
+            .state
+            .mem
+            .write_obj(7u16, GuestAddress(u64::from(TEST_DEVICE_ADDRESS) + 2))
+            .unwrap();
+        fresh.restore_state(&saved).unwrap();
+        fresh.kick_restored();
+        assert_eq!(fresh.save_state(), saved);
+        assert!(fresh.msix.lock().unwrap().enabled());
+        let device = fresh.state.device();
+        let device = device.lock().unwrap();
+        let dummy = device.as_any().downcast_ref::<DummyDevice>().unwrap();
+        assert_eq!(dummy.first_queue_at, Some((7, 7)));
+        drop(device);
+        // Kicked once, in case the snapshot took a notification with it.
+        assert_eq!(
+            fresh.state.queue_evts()[0].read().unwrap(),
+            QUEUE_EVENT_SIGNAL
+        );
+    }
+
+    #[test]
+    fn a_restore_refuses_another_device_its_queue_count_or_a_state_it_cannot_reach() {
+        let (mut live, _) = transport_with_line();
+        drive_to_driver_ok(&mut live);
+        let saved = live.save_state();
+        let refused = |state: PciTransportState| {
+            let (mut fresh, _) = transport_with_line();
+            fresh.restore_state(&state).unwrap_err()
+        };
+
+        let mut other = saved.clone();
+        other.device_type += 1;
+        assert!(refused(other).contains("type"), "device type");
+        let mut fewer = saved.clone();
+        fewer.queues.pop();
+        assert!(refused(fewer).contains("queues"), "queue count");
+        // FAILED is not a step of the handshake a restore replays.
+        let mut failed = saved;
+        failed.device_status |= device_status::FAILED;
+        assert!(
+            refused(failed).contains("did not take"),
+            "unreachable state"
+        );
+    }
+
     #[test]
     fn a_reset_the_device_cannot_do_still_reads_back_as_done() {
         let mem =
@@ -2065,6 +2423,7 @@ mod tests {
             Arc::new(Mutex::new(DummyDevice {
                 acked_features: 0,
                 activated: true,
+                first_queue_at: None,
                 queue_config: &QUEUE_CONFIG,
                 shm: None,
                 resettable: false,
@@ -2133,6 +2492,7 @@ mod tests {
             Arc::new(Mutex::new(DummyDevice {
                 acked_features: 0,
                 activated: false,
+                first_queue_at: None,
                 queue_config: &QUEUE_CONFIG,
                 shm: None,
                 resettable: true,

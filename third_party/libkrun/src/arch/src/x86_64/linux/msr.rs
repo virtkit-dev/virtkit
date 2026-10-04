@@ -158,6 +158,17 @@ static WHITELISTED_MSR_RANGES: &[MsrRange] = &[
     SINGLE_MSR!(MSR_TSC_AUX),
 ];
 
+/// MSRs a guest's state also needs beyond the list above, when KVM implements them: the
+/// supervisor XSAVE state mask, the speculation-control capabilities and TSX control a guest
+/// reads at boot and may set, UMWAIT's control and KVM's own poll control.
+static EXTRA_SERIALIZED_MSRS: &[u32] = &[
+    0x0000_00e1, // IA32_UMWAIT_CONTROL
+    0x0000_010a, // IA32_ARCH_CAPABILITIES
+    0x0000_0122, // IA32_TSX_CTRL
+    MSR_IA32_XSS,
+    0x4b56_4d05, // MSR_KVM_POLL_CONTROL
+];
+
 /// Specifies whether a particular MSR should be included in vcpu serialization.
 ///
 /// # Arguments
@@ -171,6 +182,7 @@ pub fn msr_should_serialize(index: u32) -> bool {
     WHITELISTED_MSR_RANGES
         .iter()
         .any(|range| range.contains(index))
+        || EXTRA_SERIALIZED_MSRS.contains(&index)
 }
 
 // Creates and populates required MSR entries for booting Linux on X86_64.

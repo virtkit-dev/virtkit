@@ -67,6 +67,9 @@ pub struct PciHostManager {
     /// The VM's GSI routing table, shared by every transport's MSI-X state. Created with the
     /// first device, when the VM fd is known.
     msi_routes: Option<Arc<Mutex<GsiRoutes>>>,
+    /// Every virtio-pci transport, in registration order: what a snapshot saves and a
+    /// restore of the same device list puts back (local patch).
+    transports: Vec<Arc<Mutex<VirtioPciTransport>>>,
 }
 
 struct KvmPciIntxLine {
@@ -103,6 +106,7 @@ impl PciHostManager {
             functions: Vec::new(),
             next_msi_gsi: IOAPIC_NUM_PINS,
             msi_routes: None,
+            transports: Vec::new(),
         }
     }
 
@@ -230,7 +234,9 @@ impl PciHostManager {
             }
         }));
 
-        let function: Arc<Mutex<dyn PciFunction>> = Arc::new(Mutex::new(transport));
+        let transport = Arc::new(Mutex::new(transport));
+        self.transports.push(transport.clone());
+        let function: Arc<Mutex<dyn PciFunction>> = transport;
         self.root
             .lock()
             .expect("Poisoned PCI root lock")
@@ -254,6 +260,12 @@ impl PciHostManager {
             self.irq += 1;
         }
         Ok(Some(info))
+    }
+
+    /// The virtio-pci transports, in registration order.
+    #[cfg(feature = "snapshot")]
+    pub fn transports(&self) -> &[Arc<Mutex<VirtioPciTransport>>] {
+        &self.transports
     }
 
     /// The host bridge as the ACPI tables describe it; `shm_window` declares the
