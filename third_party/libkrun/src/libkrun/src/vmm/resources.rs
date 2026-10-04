@@ -120,6 +120,8 @@ pub struct VmResources {
     pub hyperv_enabled: bool,
     /// The VM generation ID the DSDT declares, if any (local patch, see VENDOR.md).
     pub vm_generation_id: Option<[u8; 16]>,
+    /// The system UUID the Windows platform's SMBIOS tables carry, if any (local patch).
+    pub system_uuid: Option<[u8; 16]>,
     /// A snapshot directory to start the VM from instead of booting (local patch).
     pub restore_from: Option<std::path::PathBuf>,
     /// Whether to enable split irqchip
@@ -279,6 +281,7 @@ mod tests {
             pmu_enabled: false,
             hyperv_enabled: false,
             vm_generation_id: None,
+            system_uuid: None,
             restore_from: None,
             split_irqchip: false,
             acpi_enabled: false,

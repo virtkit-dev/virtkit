@@ -61,10 +61,10 @@ pub(crate) fn boot(
 ) -> Result<(Child, crate::embed::Resolved)> {
     let bundle = Bundle::open(&svc.ext4)?;
     let disks = bundle.disks()?;
-    // A new machine every start: drop the last start's overlays and generation ID.
+    // A new machine every start: drop the last start's overlays, generation ID and UUID.
     let stale = (0..disks.len())
         .map(|i| format!("disk{i}.qcow2"))
-        .chain([crate::uefi::GENERATION_ID.to_string()]);
+        .chain([crate::uefi::GENERATION_ID, crate::uefi::SYSTEM_UUID].map(String::from));
     for name in stale {
         let path = dir.join(name);
         match std::fs::remove_file(&path) {
