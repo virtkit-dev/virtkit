@@ -2502,6 +2502,7 @@ async fn handle(
 ) -> Result<Response<Body>, Infallible> {
     // Kept for the log line; `route` consumes the request.
     let (method, path) = (req.method().clone(), req.uri().path().to_string());
+    let has_body = !hyper::body::Body::is_end_stream(req.body());
     let tls = state.tls.is_some();
     let resp = route(req, state).await.unwrap_or_else(|e| {
         eprintln!("vk-registry: {method} {path}: {e:#}");
@@ -2511,7 +2512,23 @@ async fn handle(
             "internal error (details in the server log)",
         )
     });
-    Ok(with_hsts(resp, tls))
+    Ok(with_hsts(closing_after_refusal(resp, has_body), tls))
+}
+
+/// `resp`, with `Connection: close` when it refuses a request that came with a body. A
+/// refusal can answer before that body is read through, and hyper then drops the connection
+/// after writing a head that still offered keep-alive, so a client pools it and sees its
+/// next request reset. A refusal that did read the body costs the client a reconnect. A 303
+/// is how a form POST that succeeded answers (`forms::see_other`), after reading its body.
+fn closing_after_refusal(mut resp: Response<Body>, has_body: bool) -> Response<Body> {
+    let status = resp.status();
+    if has_body && !(status.is_success() || status == StatusCode::SEE_OTHER) {
+        resp.headers_mut().insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("close"),
+        );
+    }
+    resp
 }
 
 /// Whether the browser says another site made this request (`Sec-Fetch-Site`). A browser

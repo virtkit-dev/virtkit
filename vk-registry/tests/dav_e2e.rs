@@ -533,6 +533,9 @@ async fn the_files_tree_refuses_what_it_does_not_serve() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 413);
+    // The body left unread, the answer closes the connection: the requests below would
+    // otherwise go out on one the server has dropped.
+    assert_eq!(resp.headers()["connection"], "close");
     // A refusal before the handler reads a PUT body still reads it through: answered, not
     // reset.
     for p in ["/dav/files/bad%20dir/x", "/dav/nope/x", "/dav/files/"] {

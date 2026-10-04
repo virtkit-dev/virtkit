@@ -139,6 +139,19 @@ async fn accounts_mode_gates_v2_and_browse_by_scope() {
     // No credentials at all: /v2/ is the plain 401 an OCI client expects.
     let resp = client.get(format!("{url}/v2/")).send().await.unwrap();
     assert_eq!(resp.status(), 401);
+    // Bodyless, the refusal leaves the connection open for the next request.
+    assert!(resp.headers().get("connection").is_none());
+    // With a body, which the refusal may leave unread, it closes the connection rather than
+    // leave the client to pool one the server drops. The body is kept small: a large unread
+    // one can make the close a reset that races the answer.
+    let resp = client
+        .patch(format!("{url}/v2/team-a/app/blobs/uploads/x"))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+    assert_eq!(resp.headers()["connection"], "close");
 
     // No credentials, a browser page: redirected to /login instead — for every path a
     // person reaches, not just /browse.

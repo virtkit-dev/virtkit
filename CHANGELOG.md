@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- `vk-registry` now announces connection closure when refusing a request with a body,
+  preventing a connection reset on the client's next request.
+
 ## [0.82.0] - 2026-10-04
 
 ### Added
