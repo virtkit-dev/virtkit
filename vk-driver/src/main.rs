@@ -3762,8 +3762,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
         debug,
     } = &cli.cmd
     {
-        // A Windows Dockerfile (`FROM winiso:`, or a windows platform) builds a bundle of
-        // qcow2 layers through qemu-ga instead of an ext4.
+        // A Windows Dockerfile (`FROM winiso:`, a windows platform, or a Windows bundle)
+        // builds a bundle of qcow2 layers through qemu-ga instead of an ext4.
         let mut windows = false;
         if compose.is_none() {
             for f in file {
@@ -3771,7 +3771,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 let Ok(text) = std::fs::read_to_string(f) else {
                     continue;
                 };
-                match winbuild::is_windows(&text) {
+                match winbuild::is_windows(&text, &windows_context(context, f)) {
                     Ok(w) => windows |= w,
                     Err(e) => return fail(&e.context(format!("{}", f.display())), 2),
                 }
@@ -4893,6 +4893,17 @@ fn host_policy_cmd(policy: &str, workspace: &Path, argv: &[String]) -> ExitCode 
     }
 }
 
+/// A Windows build's context: `--context`, else the Dockerfile's directory.
+fn windows_context(context: &[PathBuf], dockerfile: &Path) -> PathBuf {
+    context
+        .first()
+        .cloned()
+        .unwrap_or_else(|| match dockerfile.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from("."),
+        })
+}
+
 /// `vk build` of a Windows Dockerfile: a bundle of qcow2 layers made through qemu-ga
 /// ([`winbuild`]) instead of an ext4, refusing the flags only the Linux build reads.
 async fn windows_build(cmd: &Cmd) -> ExitCode {
@@ -4965,13 +4976,7 @@ async fn windows_build(cmd: &Cmd) -> ExitCode {
             2,
         );
     };
-    let context = context
-        .first()
-        .cloned()
-        .unwrap_or_else(|| match dockerfile.parent() {
-            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-            _ => PathBuf::from("."),
-        });
+    let context = windows_context(context, dockerfile);
     let context = match context.canonicalize() {
         Ok(c) => c,
         Err(e) => {

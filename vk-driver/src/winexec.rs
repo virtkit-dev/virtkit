@@ -187,10 +187,7 @@ pub fn parse_env(env: &[String]) -> Result<Vec<(String, String)>> {
             let Some((key, value)) = entry.split_once('=') else {
                 bail!("invalid --env {entry:?} (expected KEY=value)");
             };
-            if key.is_empty()
-                || key.contains(['"', '\r', '\n'])
-                || value.contains(['"', '\r', '\n'])
-            {
+            if !valid_var(key, value) {
                 bail!(
                     "--env {entry:?}: a Windows guest's variables cannot hold quotes or newlines"
                 );
@@ -198,6 +195,11 @@ pub fn parse_env(env: &[String]) -> Result<Vec<(String, String)>> {
             Ok((key.to_string(), value.to_string()))
         })
         .collect()
+}
+
+/// Whether a batch `set` can carry the variable `key=value`: a name, and no quote or newline.
+pub fn valid_var(key: &str, value: &str) -> bool {
+    !key.is_empty() && !key.contains(['=', '"', '\r', '\n']) && !value.contains(['"', '\r', '\n'])
 }
 
 /// Refuse a command or `--dir` a batch file cannot carry: a newline ends its line.
@@ -268,7 +270,7 @@ fn open_if_present(ga: &mut Client, path: &str) -> Result<Option<i64>> {
 /// Run `cmd.exe /d /v:off /c <words>` and wait for it, for vk's own housekeeping. Each word
 /// goes as its own argument and must need no quoting (qemu-ga's quoting is not cmd.exe's):
 /// vk's paths under [`RUN_DIR`] have no blanks.
-fn cmd(ga: &mut Client, words: &[&str]) -> Result<i32> {
+pub(crate) fn cmd(ga: &mut Client, words: &[&str]) -> Result<i32> {
     let mut args = ["/d", "/v:off", "/c"].map(String::from).to_vec();
     args.extend(words.iter().map(|w| w.to_string()));
     let pid = ga.exec("cmd.exe", &args, false)?;
@@ -303,7 +305,7 @@ pub(crate) fn powershell(ga: &mut Client, script: &str, what: &str) -> Result<i3
     // With a BOM: without one, Windows PowerShell reads the file in the ANSI code page.
     put_run_file(ga, &path, format!("\u{feff}{script}").as_bytes())?;
     let mut out = Vec::new();
-    let ran = exec_command_line(ga, &run_ps1_command_line(&path), &[], None, &mut out);
+    let ran = exec_command_line(ga, &run_ps1_command_line(&path), &[], None, false, &mut out);
     // Best effort, as for a command's own files.
     let _ = cmd(ga, &["del", "/q", &path]);
     let code = ran?;
@@ -377,7 +379,8 @@ pub fn exec(
 
 /// Run the Windows command line `command_line` (a program and its arguments as
 /// `CreateProcess` takes them) through `ga`, its output streamed to `out`, and return its exit
-/// code. A newline in it, or a quote or newline in the working directory `dir`, is refused: a
+/// code, or with `background`, start it and return 0 at once, its output going to a log in the
+/// guest. A newline in it, or a quote or newline in the working directory `dir`, is refused: a
 /// batch file cannot carry them. A shell-form line (`cmd /S /C <text>`) keeps cmd's operators
 /// for the inner shell: [`batch_escape`] makes them literal to the batch file only.
 pub fn exec_command_line(
@@ -385,10 +388,11 @@ pub fn exec_command_line(
     command_line: &str,
     env: &[(String, String)],
     dir: Option<&str>,
+    background: bool,
     out: &mut impl Write,
 ) -> Result<i32> {
     check_line(command_line, dir)?;
-    run_line(ga, command_line, env, dir, false, out)
+    run_line(ga, command_line, env, dir, background, out)
 }
 
 /// Run `command_line` as [`exec`] does, through `ga`, its output streamed to `out`.
