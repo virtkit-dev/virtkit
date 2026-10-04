@@ -1,37 +1,58 @@
-//! The hub's database: the web UI's sign-in links and sessions, and the audit log, in
-//! [`redb`] like `vk-registry`'s accounts store — tables of JSON rows.
+//! The hub's database: enrolled nodes and outstanding enrollment tokens, the web UI's sign-in
+//! links and sessions, and the audit log, in [`redb`] like `vk-registry`'s accounts store —
+//! tables of JSON rows, small enough that listing every node is a scan.
 //!
-//! Sign-in tokens and session secrets are stored as `sha256` hashes, so the file cannot
-//! supply sign-in credentials. A read transaction rejects token guesses without a durable
-//! write. Redeeming a token and creating its session share one write transaction, so
-//! concurrent posts can open only one session per link.
+//! Enrollment tokens, sign-in tokens and session secrets are stored as `sha256` hashes, so
+//! the file cannot enroll a node or supply sign-in credentials. A read transaction rejects
+//! token guesses without a durable write. Spending a token shares one write transaction with
+//! what it opens — the node's pinned key, the session — so concurrent requests can enroll
+//! only one node or open only one session per token.
 //!
-//! Every audit line goes through [`vk_hub_proto::display_safe`]: it holds what the host's
-//! `vk` said, and the log is read on terminals and pages.
+//! Every string a node or the host's `vk` reports is stored through
+//! [`vk_hub_proto::display_safe`]: the database is where it crosses into the operator's
+//! terminal and pages.
+//!
+//! Heartbeats are written at [`Durability::None`]: one arrives from every node every few
+//! seconds, and losing the last few to a crash costs nothing — the next one replaces them.
+//! Everything else is durable.
 
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use vk_hub_proto::{Heartbeat, Inventory};
 
+/// Key: node ID. Value: JSON [`NodeRow`].
+const NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
+/// Key: `sha256(token)`, hex. Value: JSON [`TokenRow`].
+const TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("tokens");
 /// Key: a sequence number, oldest first. Value: JSON [`AuditRow`].
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
+/// Key: `(node id, sequence number)` of each node's audit rows, so one node's log is a range.
+const AUDIT_BY_NODE: TableDefinition<(&str, u64), ()> = TableDefinition::new("audit_by_node");
 /// Key: `sha256(sign-in token)`, hex. Value: JSON [`LoginRow`].
 const UI_LOGINS: TableDefinition<&str, &[u8]> = TableDefinition::new("ui_logins");
 /// Key: `sha256(session secret)`, hex. Value: JSON [`UiSessionRow`].
 const UI_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("ui_sessions");
 
-/// The most audit rows kept. Bounded by count rather than age: a quiet hub keeps its history
-/// for years, and a busy one the newest hundred thousand actions. Past it, the oldest go, a
-/// thousand at a time.
+/// The most audit rows kept. Bounded by count rather than age: a quiet fleet keeps its history
+/// for years, and a busy one keeps the newest hundred thousand actions and outcomes — months
+/// at the rate of a few dozen nodes. Past it, the oldest go, a thousand at a time.
 const AUDIT_MAX: u64 = 100_000;
 const AUDIT_PRUNE: u64 = 1000;
 
-/// Every web UI sign-in token starts with this, so one pasted into the wrong place is
+/// Every enrollment token starts with this, so one pasted into the wrong place is
 /// recognizable.
+const TOKEN_PREFIX: &str = "vkh_";
+
+/// The longest-lived token an operator may issue. A token is a bearer credential for adding
+/// a machine to the fleet; one that outlives its purpose by months is one somebody finds.
+pub const MAX_TOKEN_TTL: Duration = Duration::from_secs(30 * 86_400);
+
+/// Every web UI sign-in token starts with this.
 pub(crate) const LOGIN_PREFIX: &str = "vkl_";
 
 /// The longest-lived sign-in link: it is meant to be opened right away, by whoever asked
@@ -41,10 +62,10 @@ pub const MAX_LOGIN_TTL: Duration = Duration::from_secs(86_400);
 /// How long a web UI session lasts from sign-in: a working day, then a new link.
 pub const UI_SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 
-/// How many hex digits of a session's key name it: in `vk-hub local sessions`, and in the
-/// audit log as the principal of what it did. 48 bits, unique among the few sessions a hub
-/// holds but not guaranteed to be: `vk-hub local logout <id>` ends every session that shares
-/// one, and a browser's own sign-out ends its session by the whole key.
+/// How many hex digits of a session's key name it: in `vk-hub local
+/// sessions`, and in the audit log as the principal of what it did. 48 bits, unique among the
+/// few sessions a hub holds but not guaranteed to be: `logout <id>` ends every session that
+/// shares one, and a browser's own sign-out ends its session by the whole key.
 const SESSION_ID_LEN: usize = 12;
 
 /// What a web UI session may do.
@@ -53,7 +74,7 @@ const SESSION_ID_LEN: usize = 12;
 pub enum Role {
     /// Read everything.
     Viewer,
-    /// And act: stop, start, reboot and remove VMs.
+    /// And act: in local mode, stop, start, reboot and remove VMs.
     Operator,
 }
 
@@ -111,14 +132,63 @@ impl UiSession {
     }
 }
 
+/// An enrolled node. Fields added later carry `#[serde(default)]` so rows written by an
+/// older hub still read.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NodeRow {
+    /// The pinned ed25519 public key, hex.
+    pub public_key: String,
+    /// The hostname given at enrollment, replaced by each inventory's.
+    pub hostname: String,
+    pub enrolled_at: u64,
+    /// The incarnation of the node's latest session.
+    #[serde(default)]
+    pub incarnation: Option<String>,
+    /// When the node last authenticated or sent anything.
+    #[serde(default)]
+    pub last_seen: Option<u64>,
+    #[serde(default)]
+    pub inventory: Option<Inventory>,
+    #[serde(default)]
+    pub heartbeat: Option<Heartbeat>,
+    #[serde(default)]
+    pub heartbeat_at: Option<u64>,
+}
+
 /// One line of the audit log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRow {
     pub at: u64,
-    /// Who: `uid <n>` for whoever used the admin socket, a session's principal for what it
-    /// did, `vk-hub local` for what the hub itself did as it started.
+    /// The node it is about; `None` for the hub's own, and for everything in local mode.
+    #[serde(default)]
+    pub node: Option<String>,
+    /// Who: `uid <n>` for an operator on the admin socket, a session's principal for what it
+    /// did, `vk-hub local` for what local mode did as it started.
     pub actor: String,
     pub event: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TokenRow {
+    created_at: u64,
+    expires_at: u64,
+}
+
+/// What an enrollment came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Enrollment {
+    Enrolled {
+        node_id: String,
+    },
+    /// The key was already pinned, so the node it was pinned to is the answer: a node whose
+    /// first enrollment reply was lost enrolls again with a new token and the same key, and
+    /// holding both is exactly what the first enrollment asked for.
+    Reenrolled {
+        node_id: String,
+    },
+    /// The token is unknown, already used, or expired — deliberately not said which, to a
+    /// caller who may be guessing.
+    BadToken,
 }
 
 pub struct Db {
@@ -194,7 +264,11 @@ impl Db {
         let txn = db
             .begin_write()
             .context("starting the hub db's first write")?;
+        txn.open_table(NODES).context("opening the nodes table")?;
+        txn.open_table(TOKENS).context("opening the tokens table")?;
         txn.open_table(AUDIT).context("opening the audit table")?;
+        txn.open_table(AUDIT_BY_NODE)
+            .context("opening the audit index")?;
         txn.open_table(UI_LOGINS)
             .context("opening the sign-in links table")?;
         txn.open_table(UI_SESSIONS)
@@ -203,21 +277,189 @@ impl Db {
         Ok(Db { db })
     }
 
+    /// Issue a single-use enrollment token valid for `ttl`. Returns the token — shown once,
+    /// never stored — and when it expires. Expired tokens are swept in the same write.
+    pub fn create_token(&self, ttl: Duration, now: u64) -> Result<(String, u64)> {
+        if ttl.is_zero() || ttl > MAX_TOKEN_TTL {
+            bail!(
+                "a token's lifetime must be between 1s and {} days",
+                MAX_TOKEN_TTL.as_secs() / 86_400
+            );
+        }
+        let token = format!("{TOKEN_PREFIX}{}", crate::random_hex(32)?);
+        let expires_at = now.saturating_add(ttl.as_secs());
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            let mut table = txn.open_table(TOKENS)?;
+            let mut expired = Vec::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                if decode::<TokenRow>(value.value())?.expires_at <= now {
+                    expired.push(key.value().to_string());
+                }
+            }
+            for key in expired {
+                table.remove(key.as_str())?;
+            }
+            let row = TokenRow {
+                created_at: now,
+                expires_at,
+            };
+            table.insert(token_key(&token).as_str(), encode(&row)?.as_slice())?;
+        }
+        txn.commit().context("storing an enrollment token")?;
+        Ok((token, expires_at))
+    }
+
+    /// Consume `token` and pin `public_key` (hex) as a new node, or answer with the node it is
+    /// already pinned to. The caller has checked the node's signature.
+    pub fn enroll(
+        &self,
+        token: &str,
+        public_key: &str,
+        hostname: &str,
+        now: u64,
+    ) -> Result<Enrollment> {
+        let key = token_key(token);
+        {
+            let txn = self.db.begin_read().context("starting a read")?;
+            let tokens = txn.open_table(TOKENS)?;
+            let live = tokens
+                .get(key.as_str())?
+                .map(|g| decode::<TokenRow>(g.value()))
+                .transpose()?
+                .is_some_and(|row| row.expires_at > now);
+            // Expired tokens are left for `create_token`'s sweep: removing one here would be
+            // the write this read exists to avoid.
+            if !live {
+                return Ok(Enrollment::BadToken);
+            }
+        }
+        // Checked again under the write lock: another enrollment may have spent it since.
+        let txn = self.db.begin_write().context("starting a write")?;
+        let outcome = {
+            let mut tokens = txn.open_table(TOKENS)?;
+            let row = tokens
+                .remove(key.as_str())?
+                .map(|g| decode::<TokenRow>(g.value()))
+                .transpose()?;
+            // Removed whether or not it is still valid: an expired token is no use to anyone
+            // and a spent one is removed by definition.
+            match row {
+                Some(row) if row.expires_at > now => {
+                    let mut nodes = txn.open_table(NODES)?;
+                    let mut pinned = None;
+                    for entry in nodes.iter()? {
+                        let (id, value) = entry?;
+                        if decode::<NodeRow>(value.value())?.public_key == public_key {
+                            pinned = Some(id.value().to_string());
+                            break;
+                        }
+                    }
+                    if let Some(node_id) = pinned {
+                        Enrollment::Reenrolled { node_id }
+                    } else {
+                        let node_id = crate::random_hex(vk_hub_proto::ID_BYTES)?;
+                        let row = NodeRow {
+                            public_key: public_key.to_string(),
+                            hostname: vk_hub_proto::display_safe(hostname),
+                            enrolled_at: now,
+                            ..NodeRow::default()
+                        };
+                        nodes.insert(node_id.as_str(), encode(&row)?.as_slice())?;
+                        Enrollment::Enrolled { node_id }
+                    }
+                }
+                _ => Enrollment::BadToken,
+            }
+        };
+        txn.commit().context("recording an enrollment")?;
+        Ok(outcome)
+    }
+
+    pub fn node(&self, id: &str) -> Result<Option<NodeRow>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(NODES)?;
+        table
+            .get(id)?
+            .map(|g| decode::<NodeRow>(g.value()))
+            .transpose()
+    }
+
+    /// Every node, by ID.
+    pub fn nodes(&self) -> Result<Vec<(String, NodeRow)>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(NODES)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            out.push((key.value().to_string(), decode::<NodeRow>(value.value())?));
+        }
+        Ok(out)
+    }
+
+    /// A node authenticated a session as `incarnation`.
+    pub fn record_session(&self, id: &str, incarnation: &str, now: u64) -> Result<()> {
+        self.update(id, Durability::Immediate, |row| {
+            row.incarnation = Some(incarnation.to_string());
+            row.last_seen = Some(now);
+        })
+    }
+
+    /// Remove a node: its key is no longer pinned, and a session it opens is refused.
+    /// `Ok(false)` when there was no such node.
+    pub fn remove_node(&self, id: &str) -> Result<bool> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let removed = txn.open_table(NODES)?.remove(id)?.is_some();
+        txn.commit().context("removing a node")?;
+        Ok(removed)
+    }
+
+    pub fn record_inventory(&self, id: &str, inventory: Inventory, now: u64) -> Result<()> {
+        let inventory = display_safe_inventory(inventory);
+        self.update(id, Durability::Immediate, |row| {
+            row.hostname = inventory.hostname.clone();
+            row.inventory = Some(inventory);
+            row.last_seen = Some(now);
+        })
+    }
+
+    pub fn record_heartbeat(&self, id: &str, heartbeat: Heartbeat, now: u64) -> Result<()> {
+        self.update(id, Durability::None, |row| {
+            row.heartbeat = Some(heartbeat);
+            row.heartbeat_at = Some(now);
+            row.last_seen = Some(now);
+        })
+    }
+
     /// Record `event`, done by `actor`, in the audit log.
     pub fn audit(&self, actor: &str, event: &str, now: u64) -> Result<()> {
         let txn = self.db.begin_write().context("starting a write")?;
-        append_audit(&txn, actor, event, now)?;
+        append_audit(&txn, None, actor, event, now)?;
         txn.commit().context("writing an audit line")
     }
 
-    /// The last `limit` audit lines, oldest first.
+    /// The last `limit` audit lines, oldest first, of one node or of all.
     #[cfg(test)]
-    pub fn audits(&self, limit: usize) -> Result<Vec<AuditRow>> {
+    pub fn audits(&self, node: Option<&str>, limit: usize) -> Result<Vec<AuditRow>> {
         let txn = self.db.begin_read().context("starting a read")?;
         let table = txn.open_table(AUDIT)?;
         let mut out = Vec::new();
-        for entry in table.iter()?.rev().take(limit) {
-            out.push(decode::<AuditRow>(entry?.1.value())?);
+        match node {
+            None => {
+                for entry in table.iter()?.rev().take(limit) {
+                    out.push(decode::<AuditRow>(entry?.1.value())?);
+                }
+            }
+            Some(node) => {
+                let index = txn.open_table(AUDIT_BY_NODE)?;
+                for entry in index.range((node, 0)..=(node, u64::MAX))?.rev().take(limit) {
+                    let seq = entry?.0.value().1;
+                    if let Some(row) = table.get(seq)? {
+                        out.push(decode::<AuditRow>(row.value())?);
+                    }
+                }
+            }
         }
         out.reverse();
         Ok(out)
@@ -254,6 +496,7 @@ impl Db {
         }
         append_audit(
             &txn,
+            None,
             actor,
             &format!(
                 "{actor} issued a sign-in link for the {} role, valid for {}s",
@@ -268,7 +511,8 @@ impl Db {
 
     /// Spend sign-in token `token` on a new web UI session. Returns the session's secret — the
     /// cookie, stored only as its hash — and the session, or `None` for a token that is
-    /// unknown, spent or expired. Looked up in a read first, so a guess costs no write.
+    /// unknown, spent or expired. Looked up in a read first, as an enrollment token is, so a
+    /// guess costs no write.
     pub fn redeem_login(&self, token: &str, now: u64) -> Result<Option<(String, UiSession)>> {
         let key = token_key(token);
         {
@@ -311,7 +555,7 @@ impl Db {
                         session.principal(),
                         session.issued_by
                     );
-                    append_audit(&txn, &session.principal(), &event, now)?;
+                    append_audit(&txn, None, &session.principal(), &event, now)?;
                     Some((secret, session))
                 }
                 _ => None,
@@ -414,7 +658,7 @@ impl Db {
             } else {
                 format!("{actor} ended {principal}")
             };
-            append_audit(&txn, actor, &event, now)?;
+            append_audit(&txn, None, actor, &event, now)?;
         }
         txn.commit().context("ending web UI sessions")?;
         Ok(ended.len())
@@ -431,50 +675,186 @@ impl Db {
         })?;
         if live > 0 {
             let event = format!("{actor} voided {live} unspent sign-in link(s)");
-            append_audit(&txn, actor, &event, now)?;
+            append_audit(&txn, None, actor, &event, now)?;
         }
         txn.commit().context("voiding sign-in links")?;
         Ok(live)
     }
 
     /// Up to `limit` audit lines older than sequence number `before` — all of them for
-    /// `None` — newest first, each with its sequence number for the next page.
-    pub fn audit_page(&self, before: Option<u64>, limit: usize) -> Result<Vec<(u64, AuditRow)>> {
+    /// `None` — of one node or of all, newest first, each with its sequence number for the
+    /// next page.
+    pub fn audit_page(
+        &self,
+        node: Option<&str>,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<(u64, AuditRow)>> {
         let before = before.unwrap_or(u64::MAX);
         let txn = self.db.begin_read().context("starting a read")?;
         let table = txn.open_table(AUDIT)?;
         let mut out = Vec::new();
-        for entry in table.range(..before)?.rev().take(limit) {
-            let (seq, value) = entry?;
-            out.push((seq.value(), decode::<AuditRow>(value.value())?));
+        match node {
+            None => {
+                for entry in table.range(..before)?.rev().take(limit) {
+                    let (seq, value) = entry?;
+                    out.push((seq.value(), decode::<AuditRow>(value.value())?));
+                }
+            }
+            Some(node) => {
+                let index = txn.open_table(AUDIT_BY_NODE)?;
+                for entry in index.range((node, 0)..(node, before))?.rev().take(limit) {
+                    let seq = entry?.0.value().1;
+                    if let Some(row) = table.get(seq)? {
+                        out.push((seq, decode::<AuditRow>(row.value())?));
+                    }
+                }
+            }
         }
+        Ok(out)
+    }
+
+    /// Rewrite one node's row. A node removed meanwhile is an error: its session is then
+    /// one the hub no longer recognizes.
+    fn update(
+        &self,
+        id: &str,
+        durability: Durability,
+        change: impl FnOnce(&mut NodeRow),
+    ) -> Result<()> {
+        self.update_audited(
+            id,
+            durability,
+            |row| {
+                change(row);
+                ((), Vec::new())
+            },
+            0,
+        )
+    }
+
+    /// [`Db::update`], with the audit rows `change` returns — `(actor, event)` pairs — written
+    /// in the same transaction as the change they describe.
+    fn update_audited<R>(
+        &self,
+        id: &str,
+        durability: Durability,
+        change: impl FnOnce(&mut NodeRow) -> (R, Vec<(String, String)>),
+        now: u64,
+    ) -> Result<R> {
+        self.update_txn(now, id, |row, _| {
+            let (out, events) = change(row);
+            Ok((out, events, durability))
+        })
+    }
+
+    /// [`Db::update_audited`], with the transaction for `change` to write other tables in and
+    /// the durability `change` decides on.
+    fn update_txn<R>(
+        &self,
+        now: u64,
+        id: &str,
+        change: impl FnOnce(
+            &mut NodeRow,
+            &redb::WriteTransaction,
+        ) -> Result<(R, Vec<(String, String)>, Durability)>,
+    ) -> Result<R> {
+        let mut txn = self.db.begin_write().context("starting a write")?;
+        let (out, durability) = {
+            let mut table = txn.open_table(NODES)?;
+            let mut row = match table.get(id)? {
+                Some(g) => decode::<NodeRow>(g.value())?,
+                None => bail!("node {id} is not enrolled"),
+            };
+            let (out, events, durability) = change(&mut row, &txn)?;
+            table.insert(id, encode(&row)?.as_slice())?;
+            for (actor, event) in events {
+                append_audit(&txn, Some(id), &actor, &event, now)?;
+            }
+            (out, durability)
+        };
+        txn.set_durability(durability)
+            .context("setting a write's durability")?;
+        txn.commit().context("updating a node")?;
         Ok(out)
     }
 }
 
 /// Append an audit row inside `txn`, dropping the oldest past [`AUDIT_MAX`].
-fn append_audit(txn: &redb::WriteTransaction, actor: &str, event: &str, now: u64) -> Result<()> {
+fn append_audit(
+    txn: &redb::WriteTransaction,
+    node: Option<&str>,
+    actor: &str,
+    event: &str,
+    now: u64,
+) -> Result<()> {
     let row = AuditRow {
         at: now,
+        node: node.map(str::to_string),
         actor: actor.to_string(),
         event: vk_hub_proto::display_safe(event),
     };
     let mut table = txn.open_table(AUDIT)?;
+    let mut index = txn.open_table(AUDIT_BY_NODE)?;
     let seq = table
         .last()?
         .map_or(0, |(k, _)| k.value().saturating_add(1));
     table.insert(seq, encode(&row)?.as_slice())?;
+    if let Some(node) = node {
+        index.insert((node, seq), ())?;
+    }
     let first = table.first()?.map_or(seq, |(k, _)| k.value());
     if seq.saturating_sub(first) >= AUDIT_MAX {
         let cut = first.saturating_add(AUDIT_PRUNE);
-        table.retain_in(first..cut, |_, _| false)?;
+        let mut dropped = Vec::new();
+        for entry in table.range(first..cut)? {
+            let (k, v) = entry?;
+            dropped.push((k.value(), decode::<AuditRow>(v.value())?.node));
+        }
+        for (seq, node) in dropped {
+            table.remove(seq)?;
+            if let Some(node) = node {
+                index.remove((node.as_str(), seq))?;
+            }
+        }
     }
     Ok(())
 }
 
-/// A secret's key in its table.
+/// A token's key in [`TOKENS`], and a sign-in token's or session secret's in its table.
 pub(crate) fn token_key(token: &str) -> String {
     vk_hub_proto::to_hex(&Sha256::digest(token.as_bytes()))
+}
+
+/// `inventory` with every string in it made [`vk_hub_proto::display_safe`].
+fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
+    use vk_hub_proto::display_safe as safe;
+    let clean = |s: &mut String| *s = safe(s);
+    let clean_opt = |s: &mut Option<String>| {
+        if let Some(v) = s.as_mut() {
+            *v = safe(v);
+        }
+    };
+    clean(&mut inventory.hostname);
+    clean_opt(&mut inventory.hardware.cpu_model);
+    for check in &mut inventory.hardware.checks {
+        clean(&mut check.name);
+        clean(&mut check.detail);
+    }
+    for fs in &mut inventory.storage {
+        clean(&mut fs.path);
+        clean(&mut fs.device);
+    }
+    clean(&mut inventory.versions.vk);
+    clean_opt(&mut inventory.versions.guest_kernel);
+    clean(&mut inventory.versions.config_hash);
+    if let Some(runner) = inventory.runner.as_mut() {
+        clean(&mut runner.config);
+        for name in &mut runner.runners {
+            clean(name);
+        }
+    }
+    inventory
 }
 
 fn encode<T: Serialize>(row: &T) -> Result<Vec<u8>> {
@@ -491,10 +871,111 @@ mod tests {
 
     const DAY: Duration = Duration::from_secs(86_400);
 
-    fn audit(db: &Db, event: &str, at: u64) {
-        let txn = db.db.begin_write().unwrap();
-        append_audit(&txn, "uid 0", event, at).unwrap();
-        txn.commit().unwrap();
+    #[test]
+    fn a_token_enrolls_exactly_one_node() {
+        let db = Db::open_memory().unwrap();
+        let (token, expires) = db.create_token(DAY, 1000).unwrap();
+        assert!(token.starts_with(TOKEN_PREFIX));
+        assert_eq!(expires, 1000 + 86_400);
+        let Enrollment::Enrolled { node_id } = db.enroll(&token, "aa", "ci-1", 1001).unwrap()
+        else {
+            panic!("expected an enrollment");
+        };
+        assert!(vk_hub_proto::valid_id(&node_id));
+        assert_eq!(
+            db.enroll(&token, "bb", "ci-2", 1002).unwrap(),
+            Enrollment::BadToken
+        );
+        let row = db.node(&node_id).unwrap().unwrap();
+        assert_eq!(
+            (row.public_key.as_str(), row.hostname.as_str()),
+            ("aa", "ci-1")
+        );
+        assert_eq!(db.nodes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_expired_or_unknown_token_enrolls_nothing() {
+        let db = Db::open_memory().unwrap();
+        let (token, expires) = db.create_token(Duration::from_secs(60), 1000).unwrap();
+        assert_eq!(
+            db.enroll(&token, "aa", "h", expires).unwrap(),
+            Enrollment::BadToken
+        );
+        assert_eq!(
+            db.enroll("vkh_nope", "aa", "h", 1000).unwrap(),
+            Enrollment::BadToken
+        );
+        assert!(db.nodes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_pinned_key_enrolls_again_as_its_node_and_a_removed_one_anew() {
+        let db = Db::open_memory().unwrap();
+        let (t1, _) = db.create_token(DAY, 0).unwrap();
+        let (t2, _) = db.create_token(DAY, 0).unwrap();
+        let (t3, _) = db.create_token(DAY, 0).unwrap();
+        let Enrollment::Enrolled { node_id } = db.enroll(&t1, "aa", "h", 1).unwrap() else {
+            panic!("expected an enrollment");
+        };
+        assert_eq!(
+            db.enroll(&t2, "aa", "h", 1).unwrap(),
+            Enrollment::Reenrolled {
+                node_id: node_id.clone()
+            }
+        );
+        // The second token is spent by it all the same.
+        assert_eq!(db.enroll(&t2, "bb", "h", 1).unwrap(), Enrollment::BadToken);
+        assert_eq!(db.nodes().unwrap().len(), 1);
+        assert!(db.remove_node(&node_id).unwrap());
+        assert!(!db.remove_node(&node_id).unwrap());
+        let Enrollment::Enrolled { node_id: again } = db.enroll(&t3, "aa", "h", 1).unwrap() else {
+            panic!("expected a new enrollment");
+        };
+        assert_ne!(again, node_id);
+    }
+
+    #[test]
+    fn token_lifetimes_are_bounded_and_expired_tokens_are_swept() {
+        let db = Db::open_memory().unwrap();
+        assert!(db.create_token(Duration::ZERO, 0).is_err());
+        assert!(db.create_token(MAX_TOKEN_TTL + DAY, 0).is_err());
+        db.create_token(Duration::from_secs(10), 0).unwrap();
+        db.create_token(DAY, 20).unwrap();
+        let txn = db.db.begin_read().unwrap();
+        let table = txn.open_table(TOKENS).unwrap();
+        assert_eq!(redb::ReadableTableMetadata::len(&table).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_session_inventory_and_heartbeat_are_recorded() {
+        let db = Db::open_memory().unwrap();
+        let (token, _) = db.create_token(DAY, 0).unwrap();
+        let Enrollment::Enrolled { node_id } = db.enroll(&token, "aa", "h", 1).unwrap() else {
+            panic!("expected an enrollment");
+        };
+        db.record_session(&node_id, "inc", 2).unwrap();
+        let inventory = Inventory {
+            hostname: "renamed\u{1b}[2J".into(),
+            versions: vk_hub_proto::Versions {
+                vk: "0.80\u{202e}.0".into(),
+                ..Default::default()
+            },
+            ..Inventory::default()
+        };
+        db.record_inventory(&node_id, inventory, 3).unwrap();
+        db.record_heartbeat(&node_id, Heartbeat::default(), 4)
+            .unwrap();
+        let row = db.node(&node_id).unwrap().unwrap();
+        assert_eq!(row.incarnation.as_deref(), Some("inc"));
+        assert_eq!(row.hostname, "renamed[2J");
+        assert_eq!(row.inventory.as_ref().unwrap().versions.vk, "0.80.0");
+        assert_eq!((row.heartbeat_at, row.last_seen), (Some(4), Some(4)));
+        assert!(row.inventory.is_some() && row.heartbeat.is_some());
+        assert!(
+            db.record_heartbeat("0".repeat(32).as_str(), Heartbeat::default(), 5)
+                .is_err()
+        );
     }
 
     #[test]
@@ -502,33 +983,47 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let txn = db.db.begin_write().unwrap();
         for i in 0..AUDIT_MAX + 5 {
-            append_audit(&txn, "uid 0", &format!("e{i}"), i).unwrap();
+            append_audit(&txn, Some("n"), "uid 0", &format!("e{i}"), i).unwrap();
         }
         txn.commit().unwrap();
         let txn = db.db.begin_read().unwrap();
         let rows = redb::ReadableTableMetadata::len(&txn.open_table(AUDIT).unwrap()).unwrap();
+        let indexed =
+            redb::ReadableTableMetadata::len(&txn.open_table(AUDIT_BY_NODE).unwrap()).unwrap();
         assert!(
             rows <= AUDIT_MAX && rows > AUDIT_MAX - AUDIT_PRUNE,
             "{rows}"
         );
+        assert_eq!(rows, indexed);
         drop(txn);
         assert_eq!(
-            db.audits(1).unwrap()[0].event,
+            db.audits(Some("n"), 1).unwrap()[0].event,
             format!("e{}", AUDIT_MAX + 4)
         );
     }
 
     #[test]
-    fn the_audit_log_reads_back_in_order_and_display_safe() {
+    fn the_audit_log_reads_back_in_order_and_by_node() {
         let db = Db::open_memory().unwrap();
         for i in 0..5u64 {
-            audit(&db, &format!("event {i}"), i);
+            let node = if i % 2 == 0 { Some("a") } else { Some("b") };
+            let txn = db.db.begin_write().unwrap();
+            append_audit(&txn, node, "uid 0", &format!("event {i}"), i).unwrap();
+            txn.commit().unwrap();
         }
-        audit(&db, "stopped a VM\u{1b}[2J", 9);
-        let all = db.audits(100).unwrap();
+        let txn = db.db.begin_write().unwrap();
+        append_audit(&txn, None, "uid 0", "issued a token\u{1b}[2J", 9).unwrap();
+        txn.commit().unwrap();
+        let all = db.audits(None, 100).unwrap();
         assert_eq!(all.len(), 6);
-        assert_eq!(all[5].event, "stopped a VM[2J");
-        assert_eq!(db.audits(2).unwrap()[0].event, "event 4");
+        assert_eq!(all[5].event, "issued a token[2J");
+        let a: Vec<_> = db
+            .audits(Some("a"), 2)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert_eq!(a, ["event 2", "event 4"]);
     }
 
     #[test]
@@ -593,7 +1088,7 @@ mod tests {
         assert_eq!(db.end_ui_sessions(None, "uid 0", 1200).unwrap(), 1);
         assert!(db.ui_sessions(1200).unwrap().is_empty());
         let events: Vec<String> = db
-            .audits(20)
+            .audits(None, 20)
             .unwrap()
             .into_iter()
             .map(|r| r.event)
@@ -660,15 +1155,20 @@ mod tests {
     fn the_audit_log_pages_back_newest_first() {
         let db = Db::open_memory().unwrap();
         for i in 0..5u64 {
-            audit(&db, &format!("event {i}"), i);
+            let node = if i % 2 == 0 { Some("a") } else { Some("b") };
+            let txn = db.db.begin_write().unwrap();
+            append_audit(&txn, node, "uid 0", &format!("event {i}"), i).unwrap();
+            txn.commit().unwrap();
         }
         let events = |rows: Vec<(u64, AuditRow)>| -> Vec<(u64, String)> {
             rows.into_iter().map(|(s, r)| (s, r.event)).collect()
         };
-        let first = events(db.audit_page(None, 2).unwrap());
+        let first = events(db.audit_page(None, None, 2).unwrap());
         assert_eq!(first, [(4, "event 4".into()), (3, "event 3".into())]);
-        let next = events(db.audit_page(Some(3), 2).unwrap());
+        let next = events(db.audit_page(None, Some(3), 2).unwrap());
         assert_eq!(next, [(2, "event 2".into()), (1, "event 1".into())]);
+        let a = events(db.audit_page(Some("a"), Some(4), 10).unwrap());
+        assert_eq!(a, [(2, "event 2".into()), (0, "event 0".into())]);
     }
 
     #[test]

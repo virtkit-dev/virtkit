@@ -133,7 +133,7 @@ const COOKIE: &str = "vk-hub";
 /// Serve the web UI on `listener` until the process ends.
 pub async fn serve(listener: TcpListener, ui: Arc<Ui>) -> Result<()> {
     let permits = ui.connections.clone();
-    crate::server::accept(listener, permits, move |io, peer| {
+    crate::server::accept(listener, None, permits, move |io, peer, _| {
         serve_conn(io, ui.clone(), peer)
     })
     .await
@@ -321,7 +321,7 @@ async fn get(path: &str, query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Re
         let query = decode_form(query.unwrap_or("").as_bytes());
         let before = field(&query, "before").and_then(|b| b.parse().ok());
         let hub = ui.hub.clone();
-        let rows = blocking(move || hub.db.audit_page(before, pages::AUDIT_PAGE)).await?;
+        let rows = blocking(move || hub.db.audit_page(None, before, pages::AUDIT_PAGE)).await?;
         return Ok(page(pages::audit(auth, &rows)));
     }
     if let Some(source) = path

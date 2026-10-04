@@ -1049,7 +1049,7 @@ pub async fn serve(opts: Options) -> Result<()> {
     let now = crate::now_secs();
     end_access(&db, now)?;
     let origin = format!("http://{name}:{port}");
-    let hub = Arc::new(Hub::new(db, origin.clone()));
+    let hub = Arc::new(Hub::new(db, Some(origin.clone())));
     let admin = crate::admin::bind(&state.join(ADMIN_SOCKET))?;
     tokio::spawn(crate::admin::serve(admin, hub.clone()));
     eprintln!("vk-hub: running {}", vk.display());
@@ -1255,7 +1255,7 @@ mod tests {
         end_access(&db, 1003).unwrap();
         assert!(db.ui_session(&secret, 1003).unwrap().is_none());
         assert!(db.redeem_login(&unspent, 1003).unwrap().is_none());
-        let audit = db.audit_page(None, 10).unwrap();
+        let audit = db.audit_page(None, None, 10).unwrap();
         let events: Vec<&str> = audit.iter().map(|(_, row)| row.event.as_str()).collect();
         let ended = format!("vk-hub local ended ui session {} (operator)", session.id);
         assert!(events.contains(&ended.as_str()), "{events:?}");
@@ -1524,7 +1524,7 @@ mod tests {
         let local = Arc::new(Local::new(dir.join("vk"), dir.join("actions")));
         let hub = Arc::new(Hub::new(
             Arc::new(Db::open_memory().unwrap()),
-            "http://h".into(),
+            Some("http://h".into()),
         ));
         let unended = |key: &str| {
             local.lock_actions().insert(
@@ -1563,7 +1563,7 @@ mod tests {
             assert!(!ended.ok && ended.said.contains(why), "{ended:?}");
             let events: Vec<String> = hub
                 .db
-                .audits(10)
+                .audits(None, 10)
                 .unwrap()
                 .into_iter()
                 .map(|r| r.event)
@@ -1742,7 +1742,7 @@ mod tests {
         std::fs::set_permissions(&vk, std::fs::Permissions::from_mode(0o755)).unwrap();
         let hub = Hub::new(
             Arc::new(Db::open_memory().unwrap()),
-            "http://hub.example".into(),
+            Some("http://hub.example".into()),
         );
         let local = Local::new(vk, dir.join("actions"));
         let changes = hub.subscribe();

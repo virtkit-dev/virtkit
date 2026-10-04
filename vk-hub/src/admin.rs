@@ -1,11 +1,13 @@
-//! `vk-hub local login`, `sessions` and `logout` reach the running hub through a unix
-//! socket in its state directory.
+//! `vk-hub token`, `vk-hub nodes` and `vk-hub local login`, `sessions` and `logout` reach the
+//! running hub through a unix socket in its data directory.
 //!
-//! Sign-in links must be issued outside the web UI. The CLI cannot open the database
-//! directly either: redb holds it exclusively while the server runs. Like `vk-registry`'s
-//! accounts socket, this local-only channel is `0600` from creation
-//! ([`vk_fs::bind_private`]) and checks that each peer's `SO_PEERCRED` uid is the hub's own
-//! or root's. Both can already read the database.
+//! Enrollment tokens add machines to the fleet, so they must not be minted over the network
+//! the node listener faces, and sign-in links must be issued outside the web UI. The CLI
+//! cannot open the database directly either: redb holds it exclusively while the server runs,
+//! and only the running server knows which sessions are open. Like `vk-registry`'s accounts
+//! socket, this local-only channel is `0600` from creation ([`vk_fs::bind_private`]) and
+//! checks that each peer's `SO_PEERCRED` uid is the hub's own or root's. Both can already read
+//! the database.
 //!
 //! Each connection carries one JSON request and reply. The client half-closes to end the
 //! request; the server closes to end the reply. The envelope carries [`PROTOCOL_VERSION`]
@@ -23,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::ops;
 use crate::server::Hub;
-use crate::store::{Role, UiSession};
 
 /// Bumped only for a change an older peer could misread.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -32,7 +34,8 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Ceiling on a request: the largest is a few dozen bytes.
 const MAX_REQUEST: u64 = 64 * 1024;
 
-/// Ceiling on a reply, for the client: a runaway guard.
+/// Ceiling on a reply, for the client: a runaway guard, sized for a listing of a fleet far
+/// past its target size.
 const MAX_REPLY: u64 = 16 * 1024 * 1024;
 
 /// How long either side waits on the other. Every operation is a small redb transaction.
@@ -40,9 +43,14 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
-// Named on the wire for what they serve, `ui-login` and the rest.
-#[allow(clippy::enum_variant_names)]
 enum Call {
+    CreateToken {
+        ttl_secs: u64,
+    },
+    ListNodes,
+    RemoveNode {
+        id: String,
+    },
     UiLogin {
         role: Role,
         ttl_secs: u64,
@@ -74,6 +82,16 @@ enum Reply<T> {
     Err(String),
 }
 
+/// A freshly minted enrollment token.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreatedToken {
+    pub token: String,
+    pub expires_at: u64,
+}
+
+use crate::ops::NodeView;
+use crate::store::{Role, UiSession};
+
 /// A web UI sign-in link, and when it stops working.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LoginLink {
@@ -96,7 +114,7 @@ pub fn bind(path: &Path) -> Result<UnixListener> {
         ),
         Ok(_) => match std::os::unix::net::UnixStream::connect(path) {
             Ok(_) => bail!(
-                "another vk-hub is already serving {} — only one may use a state directory",
+                "another vk-hub is already serving {} — only one may use a data directory",
                 path.display()
             ),
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
@@ -203,7 +221,19 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
     )?;
     let actor = format!("uid {uid}");
     let value = match envelope.call {
+        Call::CreateToken { ttl_secs } => {
+            let (token, expires_at) = hub
+                .db
+                .create_token(Duration::from_secs(ttl_secs), crate::now_secs())?;
+            // The token itself is never logged: it is the credential.
+            eprintln!("vk-hub: admin: uid {uid} issued an enrollment token valid for {ttl_secs}s");
+            serde_json::to_value(CreatedToken { token, expires_at })?
+        }
+        Call::ListNodes => serde_json::to_value(ops::node_views(hub)?)?,
         Call::UiLogin { role, ttl_secs } => {
+            let Some(base) = &hub.ui_url else {
+                bail!("the web UI is not being served");
+            };
             let (token, expires_at) = hub.db.create_login(
                 role,
                 Duration::from_secs(ttl_secs),
@@ -217,7 +247,7 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
                 role.name()
             );
             serde_json::to_value(LoginLink {
-                url: format!("{}{}?t={token}", hub.ui_url, crate::ui::LOGIN_PATH),
+                url: format!("{base}{}?t={token}", crate::ui::LOGIN_PATH),
                 expires_at,
             })?
         }
@@ -232,6 +262,18 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
                 hub.sessions_changed();
             }
             serde_json::to_value(ended)?
+        }
+        Call::RemoveNode { id } => {
+            let removed = hub.db.remove_node(&id)?;
+            if removed {
+                hub.revoke(&id);
+            }
+            eprintln!(
+                "vk-hub: admin: uid {uid} removed node {} ({})",
+                vk_hub_proto::display_safe(&id),
+                if removed { "applied" } else { "no such node" }
+            );
+            serde_json::to_value(removed)?
         }
     };
     Ok(value)
@@ -250,6 +292,21 @@ impl Client {
         Ok(Client {
             path: path.to_path_buf(),
         })
+    }
+
+    pub fn create_token(&self, ttl: Duration) -> Result<CreatedToken> {
+        self.call(Call::CreateToken {
+            ttl_secs: ttl.as_secs(),
+        })
+    }
+
+    pub fn list_nodes(&self) -> Result<Vec<NodeView>> {
+        self.call(Call::ListNodes)
+    }
+
+    /// Whether there was such a node to remove.
+    pub fn remove_node(&self, id: &str) -> Result<bool> {
+        self.call(Call::RemoveNode { id: id.to_string() })
     }
 
     pub fn ui_login(&self, role: Role, ttl: Duration) -> Result<LoginLink> {
@@ -313,6 +370,44 @@ mod tests {
         dir
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tokens_and_nodes_are_served_over_the_socket() {
+        let dir = scratch("admin");
+        let path = dir.join("admin.sock");
+        let hub = Arc::new(Hub::new(Arc::new(Db::open_memory().unwrap()), None));
+        tokio::spawn(serve(bind(&path).unwrap(), hub.clone()));
+        let client = Client::connect(&path).unwrap();
+        let created = tokio::task::spawn_blocking(move || {
+            client.create_token(Duration::from_secs(60)).unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(created.expires_at > crate::now_secs());
+        hub.db
+            .enroll(&created.token, "aa", "ci-1", crate::now_secs())
+            .unwrap();
+        let client = Client::connect(&path).unwrap();
+        let (nodes, refused, removed) = tokio::task::spawn_blocking(move || {
+            let nodes = client.list_nodes().unwrap();
+            let refused = client.create_token(Duration::ZERO).unwrap_err();
+            let id = nodes[0].id.clone();
+            let removed = (
+                client.remove_node(&id).unwrap(),
+                client.remove_node(&id).unwrap(),
+                client.list_nodes().unwrap().len(),
+            );
+            (nodes, refused, removed)
+        })
+        .await
+        .unwrap();
+        assert_eq!(removed, (true, false, 0));
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].hostname, "ci-1");
+        assert!(!nodes[0].connected);
+        assert!(format!("{refused:#}").contains("lifetime"), "{refused:#}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn binding_refuses_a_live_hub_and_a_non_socket_and_replaces_a_stale_socket() {
         use std::os::unix::fs::PermissionsExt;
@@ -345,10 +440,7 @@ mod tests {
 
     #[test]
     fn a_version_mismatch_says_so() {
-        let hub = Hub::new(
-            Arc::new(Db::open_memory().unwrap()),
-            "http://hub.example".into(),
-        );
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
         let err = dispatch(br#"{"v":99,"call":{"op":"ui-sessions"}}"#, &hub, 0).unwrap_err();
         assert!(format!("{err:#}").contains("v99"), "{err:#}");
         let err = dispatch(br#"{"v":1,"call":{"op":"format-disks"}}"#, &hub, 0).unwrap_err();
@@ -356,11 +448,14 @@ mod tests {
     }
 
     #[test]
-    fn a_sign_in_link_starts_with_the_web_ui_s_url() {
+    fn a_sign_in_link_needs_the_web_ui_and_starts_with_its_url() {
         let call = br#"{"v":1,"call":{"op":"ui-login","role":"operator","ttl_secs":60}}"#;
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+        let err = dispatch(call, &hub, 0).unwrap_err();
+        assert!(format!("{err:#}").contains("not being served"), "{err:#}");
         let hub = Hub::new(
             Arc::new(Db::open_memory().unwrap()),
-            "http://hub.example".into(),
+            Some("http://hub.example".into()),
         );
         let link: LoginLink = serde_json::from_value(dispatch(call, &hub, 1000).unwrap()).unwrap();
         let token = link

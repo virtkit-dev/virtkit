@@ -41,7 +41,7 @@ async fn start_with_vk(
     let origin = origin.map_or_else(|| format!("http://{addr}"), str::to_string);
     let hub = Arc::new(Hub::new(
         Arc::new(Db::open_memory().unwrap()),
-        origin.clone(),
+        Some(origin.clone()),
     ));
     let logs = vk.with_file_name("actions");
     let local = Arc::new(Local::new(vk, logs));
@@ -254,7 +254,7 @@ async fn a_sign_in_link_opens_one_session_with_a_strict_cookie() {
     assert!(!sessions[0].id.is_empty() && !secret.starts_with(&sessions[0].id));
     let events: Vec<String> = hub
         .db
-        .audits(10)
+        .audits(None, 10)
         .unwrap()
         .into_iter()
         .map(|r| r.event)
@@ -343,7 +343,7 @@ async fn a_post_needs_the_ui_origin_and_the_session_csrf_token() {
     assert!(hub.db.ui_sessions(crate::now_secs()).unwrap().is_empty());
     let events: Vec<String> = hub
         .db
-        .audits(10)
+        .audits(None, 10)
         .unwrap()
         .into_iter()
         .map(|r| r.event)
@@ -1403,7 +1403,7 @@ async fn audited(hub: &Hub, want: &str) -> Vec<String> {
     for _ in 0..400 {
         events = hub
             .db
-            .audits(50)
+            .audits(None, 50)
             .unwrap()
             .into_iter()
             .map(|r| r.event)
