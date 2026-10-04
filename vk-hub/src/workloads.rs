@@ -1,5 +1,5 @@
-//! Workload columns, kind names and ownership labels shared by `vk-hub workloads` and local
-//! mode's list, plus the row cells for `vk-hub workloads`.
+//! Workload columns, kind names and ownership labels for the CLI, node pages and local list.
+//! Row cells are shared by `vk-hub workloads` and node pages.
 
 use vk_hub_proto::{Workload, WorkloadKind};
 

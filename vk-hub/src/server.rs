@@ -77,6 +77,9 @@ pub struct Hub {
     pub ui_url: Option<String>,
     /// Bumped whenever anything a page shows may have changed, for its live updates.
     changes: watch::Sender<u64>,
+    /// The same, for one node: what that node's page follows. An entry exists while someone
+    /// follows it.
+    node_changes: Mutex<HashMap<String, watch::Sender<u64>>>,
     /// Bumped when a web UI session ends.
     sessions: watch::Sender<u64>,
 }
@@ -115,18 +118,60 @@ impl Hub {
             handshakes: Arc::new(Semaphore::new(MAX_PRE_AUTH)),
             ui_url,
             changes: watch::Sender::new(0),
+            node_changes: Mutex::new(HashMap::new()),
             sessions: watch::Sender::new(0),
         }
     }
 
-    /// Note that something a page shows may have changed.
+    /// Note that something a page shows of node `node_id` may have changed: its report,
+    /// heartbeat or session.
+    pub(crate) fn changed(&self, node_id: &str) {
+        self.changes.send_modify(|n| *n = n.wrapping_add(1));
+        let mut followed = self
+            .node_changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tx) = followed.get(node_id) {
+            if tx.receiver_count() == 0 {
+                followed.remove(node_id);
+            } else {
+                tx.send_modify(|n| *n = n.wrapping_add(1));
+            }
+        }
+    }
+
+    /// Note that something a page shows beyond one node's row may have changed: in local
+    /// mode, the VMs listed.
     pub(crate) fn touch(&self) {
         self.changes.send_modify(|n| *n = n.wrapping_add(1));
     }
 
-    /// Wake on the next [`Hub::touch`].
+    /// Wake on the next [`Hub::changed`] of any node, or [`Hub::touch`].
     pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
         self.changes.subscribe()
+    }
+
+    /// Wake on the next [`Hub::changed`] of node `node_id`. Entries no page follows any more
+    /// are dropped first, so the map holds no more than the streams open, plus this one.
+    pub(crate) fn subscribe_node(&self, node_id: &str) -> watch::Receiver<u64> {
+        let mut followed = self
+            .node_changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        followed.retain(|_, tx| tx.receiver_count() > 0);
+        followed
+            .entry(node_id.to_string())
+            .or_insert_with(|| watch::Sender::new(0))
+            .subscribe()
+    }
+
+    /// How many nodes have an entry in the map [`Hub::subscribe_node`] fills.
+    #[cfg(test)]
+    pub(crate) fn followed_nodes(&self) -> usize {
+        self.node_changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Note that a web UI session ended.
@@ -157,6 +202,7 @@ impl Hub {
             // `notify_one` stores a permit, so an old session between two awaits still sees it.
             old.ending.notify.notify_one();
         }
+        self.changed(node_id);
         (session, ending)
     }
 
@@ -166,6 +212,7 @@ impl Hub {
             live.ending.revoked.store(true, Ordering::Relaxed);
             live.ending.notify.notify_one();
         }
+        self.changed(node_id);
     }
 
     /// Note that `session` heard from its node.
@@ -186,9 +233,16 @@ impl Hub {
 
     /// Remove `session`, unless a newer one has already taken its place.
     pub(crate) fn close_session(&self, node_id: &str, session: u64) {
-        let mut live = self.lock_live();
-        if live.get(node_id).is_some_and(|l| l.session == session) {
-            live.remove(node_id);
+        let removed = {
+            let mut live = self.lock_live();
+            let ours = live.get(node_id).is_some_and(|l| l.session == session);
+            if ours {
+                live.remove(node_id);
+            }
+            ours
+        };
+        if removed {
+            self.changed(node_id);
         }
     }
 

@@ -777,6 +777,7 @@ fn the_ttl_help_states_the_enforced_bound() {
     };
     for (path, max) in [
         (&["local", "login"][..], store::MAX_LOGIN_TTL),
+        (&["ui", "login"][..], store::MAX_LOGIN_TTL),
         (&["token", "create"][..], store::MAX_TOKEN_TTL),
     ] {
         let help = help(path);

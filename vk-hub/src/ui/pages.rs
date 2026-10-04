@@ -1,6 +1,8 @@
 //! The pages every UI has, as [`Html`]: the frame around them, signing in, the audit log, and
 //! the helpers the rest are built with. Every value in them goes through [`Html::text`] or,
-//! for what the host reported, [`Html::node`].
+//! for what a node or the host reported, [`Html::node`].
+
+use std::collections::HashMap;
 
 use super::Auth;
 use super::assets;
@@ -9,6 +11,14 @@ use crate::store::AuditRow;
 
 /// Audit lines per page of `/audit`.
 pub const AUDIT_PAGE: usize = 100;
+
+/// One page of `/audit`.
+pub struct AuditPage {
+    /// The node it is filtered to, if any.
+    pub node: Option<String>,
+    /// Newest first, with their sequence numbers.
+    pub rows: Vec<(u64, AuditRow)>,
+}
 
 /// The page around `main`: head, stylesheet, the site's navigation `nav`, who is signed in.
 pub fn frame(title: &str, auth: &Auth, nav: &'static str, main: &Html) -> Html {
@@ -99,34 +109,98 @@ pub fn signed_out_fragment(sign_in: &'static str) -> Html {
     h
 }
 
-/// `/audit`: a page of the audit log, newest first, with a link to the next; `nav` the
-/// site's navigation.
-pub fn audit(auth: &Auth, rows: &[(u64, AuditRow)], nav: &'static str) -> Html {
+/// `/audit`: the paginated log, newest first, optionally filtered by node.
+///
+/// `names` maps node IDs to names for the filter and node column; local mode has no nodes
+/// and passes `None`. `nav` is the site's navigation.
+pub fn audit(
+    auth: &Auth,
+    page: &AuditPage,
+    names: Option<&[(String, String)]>,
+    nav: &'static str,
+) -> Html {
+    let with_node = names.is_some();
+    let names = names.unwrap_or_default();
     let mut main = Html::new();
     main.raw("<h1>Audit</h1>");
-    audit_table(&mut main, rows);
-    if rows.len() == AUDIT_PAGE
-        && let Some((oldest, _)) = rows.last()
+    if with_node {
+        main.raw("<form class=\"filter\" method=\"get\" action=\"/audit\">")
+            .raw("<select name=\"node\"><option value=\"\">every node</option>");
+        let mut sorted: Vec<(&str, &str)> = names
+            .iter()
+            .map(|(id, name)| (id.as_str(), name.as_str()))
+            .collect();
+        sorted.sort_by_key(|&(id, name)| (name, id));
+        for (id, name) in sorted {
+            main.raw("<option value=\"").text(id).raw("\"");
+            if page.node.as_deref() == Some(id) {
+                main.raw(" selected");
+            }
+            main.raw(">")
+                .node(name)
+                .raw(" (")
+                .text(id.get(..8).unwrap_or(id))
+                .raw(")</option>");
+        }
+        main.raw("</select> <button>show</button></form>");
+    }
+    let names: HashMap<&str, &str> = names
+        .iter()
+        .map(|(id, name)| (id.as_str(), name.as_str()))
+        .collect();
+    audit_table(&mut main, &page.rows, &names, with_node);
+    if page.rows.len() == AUDIT_PAGE
+        && let Some((oldest, _)) = page.rows.last()
     {
-        main.raw("<p><a href=\"/audit?before=")
-            .text(oldest)
-            .raw("\">older</a></p>");
+        main.raw("<p><a href=\"/audit?");
+        if let Some(node) = &page.node {
+            main.raw("node=").text(node).raw("&amp;");
+        }
+        main.raw("before=").text(oldest).raw("\">older</a></p>");
     }
     frame("audit", auth, nav, &main)
 }
 
-fn audit_table(h: &mut Html, rows: &[(u64, AuditRow)]) {
+fn audit_table(
+    h: &mut Html,
+    rows: &[(u64, AuditRow)],
+    names: &HashMap<&str, &str>,
+    with_node: bool,
+) {
     if rows.is_empty() {
         h.raw("<p class=\"empty\">nothing yet</p>");
         return;
     }
-    h.raw("<table class=\"grid\"><thead><tr><th>when</th>")
-        .raw("<th>who</th><th>what</th></tr></thead><tbody>");
+    h.raw("<table class=\"grid\"><thead><tr><th>when</th>");
+    if with_node {
+        h.raw("<th>node</th>");
+    }
+    h.raw("<th>who</th><th>what</th></tr></thead><tbody>");
     for (_, row) in rows {
-        // The event holds what the host's `vk` said, made display-safe as the store wrote it.
-        h.raw("<tr><td>")
-            .text(crate::utc(row.at))
-            .raw("</td><td>")
+        h.raw("<tr><td>").text(crate::utc(row.at)).raw("</td>");
+        if with_node {
+            h.raw("<td>");
+            match row.node.as_deref() {
+                Some(id) if vk_hub_proto::valid_id(id) => {
+                    h.raw("<a href=\"/node/").text(id).raw("\">");
+                    match names.get(id) {
+                        Some(name) => h.node(name),
+                        None => h.text(id.get(..8).unwrap_or(id)),
+                    };
+                    h.raw("</a>");
+                }
+                Some(id) => {
+                    h.node(id);
+                }
+                None => {
+                    h.raw("-");
+                }
+            }
+            h.raw("</td>");
+        }
+        // The event holds what nodes or the host's `vk` said, made display-safe as the store
+        // wrote it.
+        h.raw("<td>")
             .text(&row.actor)
             .raw("</td><td>")
             .node(&row.event)
@@ -162,7 +236,7 @@ pub fn kv(h: &mut Html, key: &str, value: &str) {
         .raw("</td></tr>");
 }
 
-/// A row whose value is what the host reported.
+/// A row whose value is what a node or the host reported.
 pub fn kv_node(h: &mut Html, key: &'static str, value: &str) {
     h.raw("<tr><th>")
         .text(key)
@@ -173,6 +247,10 @@ pub fn kv_node(h: &mut Html, key: &'static str, value: &str) {
 
 pub fn dash() -> String {
     "-".to_string()
+}
+
+pub fn count(n: Option<u32>) -> String {
+    n.map_or_else(dash, |n| n.to_string())
 }
 
 pub fn mib(n: u64) -> String {
@@ -210,6 +288,23 @@ pub fn rough_bytes(n: u64) -> String {
     format!("{} {name}", two_figures(value))
 }
 
+/// A count that moves by the second — free inodes — to two significant figures, in
+/// thousands, millions and so on past a hundred.
+pub fn rough_count(n: u64) -> String {
+    const UNITS: [&str; 6] = ["", "k", "M", "G", "T", "P"];
+    if n < 100 {
+        return n.to_string();
+    }
+    let mut value = n as f64;
+    let mut unit = 0;
+    // From 995 of a unit, two figures round up to the next: 1.0M, not 1000k.
+    while value >= 995.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+    format!("{}{}", two_figures(value), UNITS.get(unit).unwrap_or(&""))
+}
+
 /// `value`, below a thousand, to two significant figures.
 fn two_figures(value: f64) -> String {
     if value >= 100.0 {
@@ -228,6 +323,14 @@ mod tests {
     /// What moves by the second is shown in steps coarse enough that an idle page stays put.
     #[test]
     fn readings_are_shown_to_two_figures_and_start_times_to_the_minute() {
+        assert_eq!(rough_count(7), "7");
+        assert_eq!(rough_count(1234), "1.2k");
+        assert_eq!(rough_count(54_501_783), "55M");
+        assert_eq!(rough_count(54_501_781), rough_count(54_501_783));
+        assert_eq!(rough_count(62_316_544), "62M");
+        assert_eq!(rough_count(994_999), "990k");
+        assert_eq!(rough_count(995_000), "1.0M");
+        assert_eq!(rough_count(999_999), "1.0M");
         assert_eq!(rough_bytes(197 << 20), "200 MiB");
         assert_eq!(rough_bytes(3 << 30), "3.0 GiB");
         assert_eq!(started(1_790_755_279), "2026-09-30T08:01Z");

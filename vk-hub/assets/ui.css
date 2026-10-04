@@ -55,9 +55,11 @@ table.grid th, table.grid td {
   white-space: nowrap;
 }
 table.grid th { color: var(--muted); font-weight: 600; }
+table.grid tr.down td { color: var(--down); }
 table.kv th, table.kv td { text-align: left; padding: 0.15rem 1rem 0.15rem 0; vertical-align: top; }
 table.kv th { color: var(--muted); font-weight: normal; white-space: nowrap; }
 .notes { color: var(--down); padding-left: 1.2rem; }
+.filter { margin-bottom: 0.75rem; }
 .actions { display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; align-items: center; }
 .actions form { display: flex; gap: 0.4rem; align-items: center; margin: 0; }
 #flash:empty { display: none; }

@@ -1,5 +1,5 @@
-//! `vk-hub token`, `vk-hub nodes` and `vk-hub local login`, `sessions` and `logout` reach the
-//! running hub through a unix socket in its data directory.
+//! `vk-hub token`, `vk-hub nodes`, `vk-hub ui` and `vk-hub local login`, `sessions` and
+//! `logout` reach the running hub through a unix socket in its data directory.
 //!
 //! Enrollment tokens admit machines to the fleet and must be issued outside the node-facing
 //! network; sign-in links must be issued outside the web UI. The CLI cannot open the database:
@@ -240,7 +240,7 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
         }
         Call::UiLogin { role, ttl_secs } => {
             let Some(base) = &hub.ui_url else {
-                bail!("the web UI is not being served");
+                bail!("the web UI is off; set ui_addr in the hub's config to turn it on");
             };
             let (token, expires_at) = hub.db.create_login(
                 role,
@@ -482,7 +482,7 @@ mod tests {
         let call = br#"{"v":1,"call":{"op":"ui-login","role":"operator","ttl_secs":60}}"#;
         let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
         let err = dispatch(call, &hub, 0).unwrap_err();
-        assert!(format!("{err:#}").contains("not being served"), "{err:#}");
+        assert!(format!("{err:#}").contains("web UI is off"), "{err:#}");
         let hub = Hub::new(
             Arc::new(Db::open_memory().unwrap()),
             Some("http://hub.example".into()),

@@ -46,9 +46,10 @@ async fn start_with_vk(
     let logs = vk.with_file_name("actions");
     let local = Arc::new(Local::new(vk, logs));
     let mut ui = Ui::local(hub.clone(), &origin, local.clone());
-    let Site::Local(site) = &mut ui.site;
-    site.views = local::ViewCache::new(fresh);
-    tokio::spawn(serve(listener, Arc::new(ui)));
+    if let Site::Local(site) = &mut ui.site {
+        site.views = local::ViewCache::new(fresh);
+    }
+    tokio::spawn(serve(listener, None, Arc::new(ui)));
     (addr, hub, origin, local)
 }
 
@@ -537,10 +538,11 @@ fn forms_and_cookies_parse() {
     let mut h = HeaderMap::new();
     h.append(header::COOKIE, HeaderValue::from_static("x=1; vk-hub=abc"));
     h.append(header::COOKIE, HeaderValue::from_static("y=2"));
-    assert_eq!(session_cookie(&h), Ok(Some("abc")));
+    assert_eq!(session_cookie(&h, COOKIE), Ok(Some("abc")));
+    assert_eq!(session_cookie(&h, SECURE_COOKIE), Ok(None));
     h.append(header::COOKIE, HeaderValue::from_static("vk-hub=def"));
-    assert_eq!(session_cookie(&h), Err(()));
-    assert_eq!(session_cookie(&HeaderMap::new()), Ok(None));
+    assert_eq!(session_cookie(&h, COOKIE), Err(()));
+    assert_eq!(session_cookie(&HeaderMap::new(), COOKIE), Ok(None));
     assert!(constant_time_eq(b"abc", b"abc"));
     assert!(!constant_time_eq(b"abc", b"abd") && !constant_time_eq(b"abc", b"ab"));
 }
@@ -856,6 +858,7 @@ async fn a_page_is_kept_live_over_server_sent_events() {
     for (stream, name) in [(&mut events, "vms"), (&mut detail, "vm")] {
         let last = next_with(stream, "Signed out").await;
         assert!(last.starts_with(&format!("event: {name}\n")), "{last}");
+        assert!(last.contains("<code>vk-hub local login</code>"), "{last}");
         assert_eq!(
             stream.next().await.as_deref(),
             Some("event: close\ndata: \n\n")
@@ -872,6 +875,7 @@ async fn a_page_is_kept_live_over_server_sent_events() {
         again.body
     );
     assert!(again.body.contains("Signed out"), "{}", again.body);
+    assert!(again.body.contains("vk-hub local login"), "{}", again.body);
     assert!(
         again.body.ends_with("\n\nevent: close\ndata: \n\n"),
         "{}",
@@ -2027,4 +2031,481 @@ esac"#,
     assert_eq!(local.action(&key), Some(before));
     assert_eq!(std::fs::read_to_string(&ran).unwrap(), "stop -- 4242\n");
     let _ = std::fs::remove_dir_all(vk.parent().unwrap());
+}
+
+/// A fleet hub with its UI on an ephemeral loopback port, plain HTTP; the UI's origin.
+async fn start_fleet() -> (SocketAddr, Arc<Hub>, String) {
+    start_fleet_as("http").await
+}
+
+/// [`start_fleet`], the UI configured as reached over `scheme`: the test still speaks plain
+/// HTTP to it, as to one behind a proxy that ends TLS.
+async fn start_fleet_as(scheme: &str) -> (SocketAddr, Arc<Hub>, String) {
+    let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = format!("{scheme}://{addr}");
+    let hub = Arc::new(Hub::new(
+        Arc::new(Db::open_memory().unwrap()),
+        Some(origin.clone()),
+    ));
+    let ui = Arc::new(Ui::new(hub.clone(), &origin));
+    tokio::spawn(serve(listener, None, ui));
+    (addr, hub, origin)
+}
+
+/// What a node sends reaches a page as text: nothing it says becomes markup or script.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hostile_node_is_shown_as_text() {
+    let (addr, hub, _) = start_fleet().await;
+    let (token, _) = hub
+        .db
+        .create_token(Duration::from_secs(60), "uid 0", crate::now_secs())
+        .unwrap();
+    let hostile = "<script>alert(1)</script>\"'><img src=x onerror=alert(2)>";
+    let crate::store::Enrollment::Enrolled { node_id } =
+        hub.db.enroll(&token, "aa", hostile, "peer p", 1).unwrap()
+    else {
+        panic!("expected an enrollment");
+    };
+    let inventory = vk_hub_proto::Inventory {
+        hostname: hostile.into(),
+        versions: vk_hub_proto::Versions {
+            vk: format!("0.80{hostile}\u{202e}"),
+            config_hash: hostile.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    hub.db
+        .record_inventory(&node_id, inventory, true, 2)
+        .unwrap();
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    for path in ["/".to_string(), format!("/node/{node_id}")] {
+        let reply = get(addr, &path, Some(&cookie)).await;
+        assert_eq!(reply.status, 200, "{path}: {}", reply.body);
+        assert!(
+            !reply.body.contains("<script>alert"),
+            "{path}: {}",
+            reply.body
+        );
+        assert!(!reply.body.contains("<img"), "{path}: {}", reply.body);
+        assert!(!reply.body.contains('\u{202e}'), "{path}");
+        assert!(
+            reply
+                .body
+                .contains("&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#39;&gt;"),
+            "{path}: {}",
+            reply.body
+        );
+    }
+    // A malformed or unknown node ID is no page.
+    assert_eq!(get(addr, "/node/zz", Some(&cookie)).await.status, 404);
+    let unknown = format!("/node/{}", "0".repeat(32));
+    assert_eq!(get(addr, &unknown, Some(&cookie)).await.status, 404);
+}
+
+fn enrolled_node(hub: &Hub, hostname: &str) -> String {
+    let (token, _) = hub
+        .db
+        .create_token(Duration::from_secs(60), "uid 0", crate::now_secs())
+        .unwrap();
+    let crate::store::Enrollment::Enrolled { node_id } = hub
+        .db
+        .enroll(&token, &"ab".repeat(16), hostname, "peer p", 1)
+        .unwrap()
+    else {
+        panic!("expected an enrollment");
+    };
+    node_id
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fleet_s_pages_are_kept_live_over_server_sent_events() {
+    let (addr, hub, origin) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    assert_eq!(get(addr, "/events/nodes", None).await.status, 401);
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let mut events = Events::open(addr, "/events/nodes", &cookie).await;
+    let head = events.head.to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("content-type: text/event-stream"), "{head}");
+    assert!(head.contains("cache-control: no-store"), "{head}");
+    assert!(
+        head.contains(&format!("content-security-policy: {CSP}")),
+        "{head}"
+    );
+    // The current table at once, as a single `nodes` event.
+    let first = events.next().await.unwrap();
+    assert!(first.starts_with("event: nodes\ndata: <table"), "{first}");
+    assert!(first.contains("ci-1"), "{first}");
+
+    // A report through the session's path wakes the stream; what the node says arrives as
+    // text, however it is written.
+    let hostile =
+        "ci-2<script>alert(1)</script>\n\nevent: evil\ndata: <img src=x onerror=alert(2)>";
+    hub.db
+        .record_inventory(
+            &node,
+            vk_hub_proto::Inventory {
+                hostname: hostile.into(),
+                ..Default::default()
+            },
+            true,
+            2,
+        )
+        .unwrap();
+    hub.changed(&node);
+    let next = events.next().await.unwrap();
+    assert!(next.starts_with("event: nodes\ndata: "), "{next}");
+    assert!(
+        next.contains("ci-2&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "{next}"
+    );
+    assert!(
+        !next.contains("<script") && !next.contains("<img"),
+        "{next}"
+    );
+    assert!(!next.contains("\nevent: evil"), "{next}");
+
+    // A node's page streams its own fragment.
+    let mut detail = Events::open(addr, &format!("/events/node/{node}"), &cookie).await;
+    let first = detail.next().await.unwrap();
+    assert!(first.starts_with("event: node\ndata: "), "{first}");
+    assert!(first.contains(&node), "{first}");
+    assert!(
+        !first.contains("<script") && !first.contains("<img"),
+        "{first}"
+    );
+
+    // Signed out: each stream says so in its region, closes, and ends.
+    let reply = request(
+        addr,
+        "POST",
+        "/logout",
+        &[&format!("Cookie: {cookie}"), &format!("Origin: {origin}")],
+        &format!("_csrf={csrf}"),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    for (stream, name) in [(&mut events, "nodes"), (&mut detail, "node")] {
+        let last = stream.next().await.unwrap();
+        assert!(last.starts_with(&format!("event: {name}\n")), "{last}");
+        assert!(last.contains("Signed out"), "{last}");
+        assert!(last.contains("<code>vk-hub ui login</code>"), "{last}");
+        assert_eq!(
+            stream.next().await.as_deref(),
+            Some("event: close\ndata: \n\n")
+        );
+        assert_eq!(stream.next().await, None);
+    }
+    // And a page asking again is told the same, rather than refused into retrying.
+    let again = get(addr, "/events/nodes", Some(&cookie)).await;
+    assert_eq!(again.status, 200);
+    assert!(
+        again.body.starts_with("event: nodes\ndata: "),
+        "{}",
+        again.body
+    );
+    assert!(again.body.contains("Signed out"), "{}", again.body);
+    assert!(again.body.contains("vk-hub ui login"), "{}", again.body);
+}
+
+fn ci_workload(id: &str, owner: &str) -> vk_hub_proto::Workload {
+    vk_hub_proto::Workload {
+        id: id.into(),
+        kind: vk_hub_proto::WorkloadKind::CiJob,
+        state_dir: format!("/jobs/{owner}"),
+        label: None,
+        project: Some(owner.into()),
+        job_name: Some("test".into()),
+        job_id: Some("7".into()),
+        workspace: None,
+        environment: None,
+        pid: Some(4321),
+        cpus: Some(2),
+        mem_reserved_mib: Some(2048),
+        started_at: Some(crate::now_secs()),
+        ssh_alias: None,
+        guest_workspace: None,
+    }
+}
+
+/// A node's workloads are on its page and counted in the nodes table, kept live, and what
+/// the node says of them is text.
+#[tokio::test(flavor = "multi_thread")]
+async fn workloads_are_shown_live_and_as_text() {
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let hostile = "acme<script>alert(1)</script>\n\nevent: evil\ndata: <img src=x>";
+    let report = |workloads| vk_hub_proto::Report {
+        workloads: Some(workloads),
+        ..Default::default()
+    };
+    hub.db
+        .record_report(
+            &node,
+            report(vec![ci_workload("aaaaaaaaaaaaaaaa", hostile)]),
+            2,
+        )
+        .unwrap();
+    hub.db
+        .record_heartbeat(
+            &node,
+            vk_hub_proto::Heartbeat {
+                workload_mem_bytes: [("aaaaaaaaaaaaaaaa".to_string(), 3 << 30)].into(),
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap();
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, &format!("/node/{node}"), Some(&cookie)).await;
+    assert_eq!(page.status, 200);
+    for want in [
+        "<h2>Workloads</h2>",
+        "<td>ci-job</td>",
+        "acme&lt;script&gt;alert(1)&lt;/script&gt;",
+        "<td>4321</td>",
+        "<td>2.0 GiB</td>",
+        "<td>3.0 GiB</td>",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    assert!(!page.body.contains("<script>alert") && !page.body.contains("<img"));
+
+    let mut nodes = Events::open(addr, "/events/nodes", &cookie).await;
+    let first = nodes.next().await.unwrap();
+    assert!(first.contains("<th>VMS</th>"), "{first}");
+    assert!(first.contains("<td>1</td></tr>"), "{first}");
+
+    let mut detail = Events::open(addr, &format!("/events/node/{node}"), &cookie).await;
+    let first = detail.next().await.unwrap();
+    assert!(first.contains("acme&lt;script&gt;"), "{first}");
+    assert!(!first.contains("<script") && !first.contains("\nevent: evil"));
+    // A VM starting on the node reaches both pages; one stopping leaves them.
+    hub.db
+        .record_report(
+            &node,
+            report(vec![ci_workload("bbbbbbbbbbbbbbbb", "second-project")]),
+            3,
+        )
+        .unwrap();
+    hub.changed(&node);
+    let next = next_with(&mut detail, "second-project").await;
+    assert!(next.starts_with("event: node\ndata: "), "{next}");
+    assert!(!next.contains("acme"), "{next}");
+    hub.db.record_report(&node, report(Vec::new()), 4).unwrap();
+    hub.changed(&node);
+    next_with(&mut detail, "none running").await;
+    next_with(&mut nodes, "<td>0</td></tr>").await;
+}
+
+/// A node's page follows that node alone.
+#[tokio::test]
+async fn a_node_change_wakes_that_node_s_followers_only() {
+    let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+    let a = hub.subscribe_node("a");
+    let mut all = hub.subscribe();
+    hub.changed("b");
+    assert!(!a.has_changed().unwrap());
+    assert!(all.has_changed().unwrap());
+    all.borrow_and_update();
+    hub.changed("a");
+    assert!(a.has_changed().unwrap() && all.has_changed().unwrap());
+}
+
+/// The page loads its script from the hub alone, configured to evaluate nothing, and has no
+/// inline script or style for the policy to refuse.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fleet_s_pages_load_only_the_embedded_scripts() {
+    let (addr, hub, _) = start_fleet().await;
+    let (cookie, _) = sign_in(addr, &hub, Role::Operator).await;
+    let node = enrolled_node(&hub, "ci-1");
+    for path in [
+        "/".to_string(),
+        format!("/node/{node}"),
+        "/audit".to_string(),
+    ] {
+        let body = get(addr, &path, Some(&cookie)).await.body;
+        assert!(body.contains("\"allowEval\":false"), "{body}");
+        assert!(body.contains("\"selfRequestsOnly\":true"), "{body}");
+        assert_eq!(body.matches("<script").count(), 2, "{body}");
+        assert_eq!(body.matches("<script src=\"/assets/").count(), 2, "{body}");
+        assert!(!body.contains(" style="), "{body}");
+        assert!(!body.contains(" on"), "{body}");
+        assert_eq!(
+            body.matches("sse-close=\"close\"").count(),
+            usize::from(path != "/audit")
+        );
+    }
+}
+
+/// What the pages say of signing in reads as written: no runs of spaces from a string's line
+/// continuation.
+#[test]
+fn the_sign_in_texts_are_single_spaced() {
+    for texts in [&FLEET_TEXTS, &LOCAL_TEXTS] {
+        for text in [
+            texts.misdirected,
+            texts.not_a_link,
+            texts.spent_link,
+            texts.signed_out,
+        ] {
+            assert!(!text.contains("  "), "{text:?}");
+        }
+    }
+}
+
+/// Streams of nodes that may not exist, signed in or not, leave nothing followed behind them.
+#[tokio::test(flavor = "multi_thread")]
+async fn node_streams_leave_nothing_followed_behind() {
+    let (addr, hub, _) = start_fleet().await;
+    let signed_out = format!("{COOKIE}={}", "ab".repeat(32));
+    for i in 0..20u32 {
+        let reply = get(addr, &format!("/events/node/{i:032x}"), Some(&signed_out)).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert!(reply.body.contains("Signed out"), "{}", reply.body);
+    }
+    assert_eq!(hub.followed_nodes(), 0);
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    for i in 0..20u32 {
+        drop(Events::open(addr, &format!("/events/node/{i:032x}"), &cookie).await);
+    }
+    let followed = hub.followed_nodes();
+    assert!(followed <= sse::MAX_SESSION_STREAMS + 1, "{followed}");
+}
+
+/// `/audit` lists the fleet's log, newest first, or one node's, chosen from the hub's nodes.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fleet_s_audit_log_is_shown_and_filtered_by_node() {
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-<1>");
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let all = get(addr, "/audit", Some(&cookie)).await;
+    assert_eq!(all.status, 200, "{}", all.body);
+    for want in [
+        "<a href=\"/audit\">audit</a>",
+        "<select name=\"node\">",
+        &format!("<option value=\"{node}\">ci-&lt;1&gt; ("),
+        "issued an enrollment token",
+        &format!("node {node} enrolled as ci-&lt;1&gt;"),
+        &format!("<a href=\"/node/{node}\">ci-&lt;1&gt;</a>"),
+    ] {
+        assert!(all.body.contains(want), "{want}: {}", all.body);
+    }
+    let one = get(addr, &format!("/audit?node={node}"), Some(&cookie)).await;
+    assert_eq!(one.status, 200, "{}", one.body);
+    assert!(
+        one.body
+            .contains(&format!("<option value=\"{node}\" selected>"))
+    );
+    assert!(one.body.contains("enrolled as"), "{}", one.body);
+    assert!(!one.body.contains("enrollment token"), "{}", one.body);
+    // A malformed filter is no filter.
+    let bad = get(addr, "/audit?node=%3Cx%3E", Some(&cookie)).await;
+    assert_eq!(bad.status, 200);
+    assert!(
+        bad.body.contains("issued an enrollment token"),
+        "{}",
+        bad.body
+    );
+}
+
+/// Reached over https, the session cookie is `__Host-` and `Secure`, every response asks for
+/// https from then on, and an unprefixed cookie planted over plain http on the same host
+/// locks no one out.
+#[tokio::test(flavor = "multi_thread")]
+async fn over_https_the_session_cookie_is_host_bound_and_secure() {
+    let (addr, hub, origin) = start_fleet_as("https").await;
+    let (token, _) = hub
+        .db
+        .create_login(
+            Role::Viewer,
+            Duration::from_secs(60),
+            "uid 0",
+            crate::now_secs(),
+        )
+        .unwrap();
+    let reply = post_login(addr, &token, &[]).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let set = reply.header("set-cookie").unwrap().to_string();
+    assert!(set.starts_with(&format!("{SECURE_COOKIE}=")), "{set}");
+    assert!(set.contains("; Secure"), "{set}");
+    assert_eq!(
+        reply.header("strict-transport-security"),
+        Some("max-age=31536000")
+    );
+    let pair = set.split(';').next().unwrap().to_string();
+    let secret = pair.split_once('=').unwrap().1.to_string();
+    assert_eq!(get(addr, "/", Some(&pair)).await.status, 200);
+    let planted = format!("{COOKIE}={}; {pair}", "cd".repeat(32));
+    assert_eq!(get(addr, "/", Some(&planted)).await.status, 200);
+    let twice = format!("{SECURE_COOKIE}={}; {pair}", "cd".repeat(32));
+    assert_eq!(get(addr, "/", Some(&twice)).await.status, 401);
+    // The unprefixed name alone is no session here.
+    let unprefixed = format!("{COOKIE}={secret}");
+    assert_eq!(get(addr, "/", Some(&unprefixed)).await.status, 401);
+
+    let reply = request(
+        addr,
+        "POST",
+        "/logout",
+        &[
+            &format!("Cookie: {pair}"),
+            &format!("Origin: {origin}"),
+            &format!("X-CSRF-Token: {}", csrf_token(&secret)),
+        ],
+        "",
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let cleared = reply.header("set-cookie").unwrap();
+    assert!(
+        cleared.starts_with(&format!("{SECURE_COOKIE}=;"))
+            && cleared.contains("Max-Age=0")
+            && cleared.contains("; Secure"),
+        "{cleared}"
+    );
+    assert!(hub.db.ui_sessions(crate::now_secs()).unwrap().is_empty());
+}
+
+/// The fleet's pages change nothing: a post anywhere but the sign-in and sign-out paths is
+/// no action, even from a signed-in operator's own page. A request for another host is told
+/// where the fleet's UI is configured.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fleet_takes_no_action_and_names_its_ui_url() {
+    let (addr, hub, origin) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let audit_before = hub.db.audits(None, 100).unwrap();
+    for path in [
+        format!("/node/{node}/action"),
+        "/vm/0123456789abcdef/action".into(),
+    ] {
+        let reply = request(
+            addr,
+            "POST",
+            &path,
+            &[
+                &format!("Cookie: {cookie}"),
+                &format!("Origin: {origin}"),
+                "Content-Type: application/x-www-form-urlencoded",
+            ],
+            &format!("_csrf={csrf}&op=remove&confirm=yes"),
+        )
+        .await;
+        assert_eq!(reply.status, 404, "{path}: {}", reply.body);
+    }
+    assert!(hub.db.node(&node).unwrap().is_some());
+    assert_eq!(hub.db.audits(None, 100).unwrap(), audit_before);
+
+    let reply = request(addr, "GET", "/", &["Host: elsewhere.example"], "").await;
+    assert_eq!(reply.status, 421);
+    assert!(
+        reply
+            .body
+            .contains("(its ui_url, or ui_addr when that is unset)"),
+        "{}",
+        reply.body
+    );
 }

@@ -484,7 +484,10 @@ async fn store(ws: &mut Ws, hub: &Hub, node: &Node, write: Write) -> Result<Opti
     })
     .await?;
     match written {
-        Ok(()) => Ok(None),
+        Ok(()) => {
+            hub.changed(&node.id);
+            Ok(None)
+        }
         Err(e) if e.is::<NotEnrolled>() => {
             refuse(ws, RefusalCode::Revoked, REMOVED).await;
             Ok(Some("removed"))

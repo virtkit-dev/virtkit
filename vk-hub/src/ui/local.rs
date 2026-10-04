@@ -67,6 +67,17 @@ fn render_vms(local: Arc<Local>) -> sse::Render {
     Arc::new(move || Ok(vms_table(&local.listing()).into_string()))
 }
 
+/// The event `/events/<event>` swaps its fragment in on, if it is one of local mode's.
+pub(super) fn event_name(event: &str) -> Option<&'static str> {
+    match event {
+        "vms" => Some("vms"),
+        _ => event
+            .strip_prefix("vm/")
+            .filter(|id| valid_id(id))
+            .map(|_| "vm"),
+    }
+}
+
 /// What `/events/<event>` streams, if it is one of local mode's.
 pub(super) fn source(event: &str, hub: &Hub, site: &LocalSite) -> Option<Source> {
     if event == "vms" {
@@ -132,7 +143,8 @@ pub(super) async fn get(
         let hub = ui.hub.clone();
         let rows =
             super::blocking(move || hub.db.audit_page(None, before, pages::AUDIT_PAGE)).await?;
-        return Ok(Some(super::page(pages::audit(auth, &rows, NAV))));
+        let audit = pages::AuditPage { node: None, rows };
+        return Ok(Some(super::page(pages::audit(auth, &audit, None, NAV))));
     }
     let Some(id) = path.strip_prefix("/vm/").filter(|id| valid_id(id)) else {
         return Ok(None);

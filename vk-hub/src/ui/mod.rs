@@ -1,14 +1,20 @@
-//! The web UI: server-rendered pages on a listener of their own.
+//! The web UI: server-rendered pages on a listener of their own, apart from the nodes'. Its
+//! core — sign-in, sessions, the checks below, live updates — serves two sites: the fleet's
+//! pages for `vk-hub serve` ([`fleet`]), and this machine's VMs for `vk-hub local` ([`local`]).
 //!
-//! **Sign-in.** Single-use tokens are issued over the admin socket or printed by
-//! `vk-hub local` at startup. Opening a link shows a button that posts the token to create
-//! a session, setting its secret as an `HttpOnly`, `SameSite=Strict` cookie. The database
-//! stores only its hash. Only this `POST` spends the token; link scanners and chat previews
-//! leave it unused. Sessions have a viewer or operator role and last [`store::UI_SESSION_TTL`].
+//! **Sign-in.** Single-use tokens are issued over the admin socket — `vk-hub ui login`,
+//! `vk-hub local login` — or printed by `vk-hub local` at startup. Opening a link shows a
+//! button that posts the token to create a session, setting its secret as an `HttpOnly`,
+//! `SameSite=Strict` cookie, also `Secure` and `__Host-` when the UI is reached over https.
+//! The database stores only its hash. Only this `POST` spends the token; link scanners and
+//! chat previews leave it unused. Sessions have a viewer or operator role and last
+//! [`store::UI_SESSION_TTL`]. Links stand in for a login until people sign in through OIDC,
+//! with the identity layer the hub is to share with `vk-registry`.
 //!
 //! **State-changing requests** are `POST`s, and each must come from this UI's own pages —
-//! its `Origin` is the UI's own, or `Sec-Fetch-Site` says `same-origin` — and carry the
-//! session's CSRF token, derived from its secret, in a form field or header.
+//! its `Origin` is the UI's own (a fleet hub's `ui_url`), or `Sec-Fetch-Site` says
+//! `same-origin` — and carry the session's CSRF token, derived from its secret, in a form
+//! field or header. Local mode's operations are `vk` commands ([`actions`]).
 //!
 //! **A page** (`GET`) goes only to a request the UI's own pages made (`same-origin`) or no
 //! page made (`none`: the address bar, a bookmark, a link opened from a terminal).
@@ -17,14 +23,14 @@
 //!
 //! **Every request** must name the UI's host in its `Host`, so a page on another name
 //! resolved to this address (DNS rebinding) reaches nothing. **Every response** carries a
-//! strict Content-Security-Policy: pages show strings the host's `vk` reports, and the policy
-//! is what keeps an escaping mistake from running as script in an operator's session. The
-//! pages themselves escape by construction ([`html`]). It is also for this origin alone to
+//! strict Content-Security-Policy: pages show strings nodes and the host's `vk` send, and the
+//! policy is what keeps an escaping mistake from running as script in an operator's session.
+//! The pages themselves escape by construction ([`html`]). It is also for this origin alone to
 //! embed or open a window on (`Cross-Origin-Resource-Policy`, `-Opener-Policy`).
 //!
 //! **No per-address cap** on connections: the people using the UI are few, often behind one
-//! address. The global cap and the timeouts before a request is read bound what any peer
-//! holds.
+//! reverse proxy or NAT address, where such a cap would lock them all out at once. The global
+//! cap and the timeouts before a request is read bound what any peer holds.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -42,6 +48,7 @@ use hyper_util::rt::TokioTimer;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, Semaphore};
+use tokio_rustls::TlsAcceptor;
 
 use crate::local::Local;
 use crate::server::{Hub, Io, PRE_AUTH_TIMEOUT};
@@ -51,6 +58,7 @@ mod actions;
 mod assets;
 mod body;
 mod dev;
+mod fleet;
 pub mod html;
 mod local;
 mod pages;
@@ -91,6 +99,9 @@ pub struct Ui {
     origin: String,
     /// The origin without its scheme: what every request's `Host` must be.
     authority: String,
+    /// Whether browsers reach the UI over https, so its cookie may say `Secure`: a fleet
+    /// hub's UI off loopback.
+    secure: bool,
     connections: Arc<Semaphore>,
     /// The live pages' streams open.
     streams: sse::Streams,
@@ -99,11 +110,19 @@ pub struct Ui {
 
 /// What the pages show.
 enum Site {
+    /// `vk-hub serve`: the fleet.
+    Fleet(fleet::FleetSite),
     /// `vk-hub local`: this machine's VMs.
     Local(Box<local::LocalSite>),
 }
 
 impl Ui {
+    /// The fleet's UI at `origin`, a `ui_url` as the config normalizes it.
+    pub fn new(hub: Arc<Hub>, origin: &str) -> Self {
+        let site = Site::Fleet(fleet::FleetSite::new(&hub));
+        Self::with_site(hub, origin, site)
+    }
+
     /// Local mode's UI at `origin`, `http://host[:port]`, showing `local`'s VMs.
     pub fn local(hub: Arc<Hub>, origin: &str, local: Arc<Local>) -> Self {
         let site = Site::Local(Box::new(local::LocalSite::new(&hub, local)));
@@ -119,6 +138,7 @@ impl Ui {
             hub,
             origin: origin.to_string(),
             authority,
+            secure: origin.starts_with("https://"),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             streams: sse::Streams::new(),
             site,
@@ -128,17 +148,34 @@ impl Ui {
     /// What this UI's pages say of signing in.
     fn texts(&self) -> &'static Texts {
         match self.site {
+            Site::Fleet(_) => &FLEET_TEXTS,
             Site::Local(_) => &LOCAL_TEXTS,
+        }
+    }
+
+    /// The session cookie's name. `__Host-` holds a browser to what makes it safe — `Secure`,
+    /// `Path=/`, no `Domain` — but is refused on plain http.
+    fn cookie_name(&self) -> &'static str {
+        if self.secure { SECURE_COOKIE } else { COOKIE }
+    }
+
+    /// The attributes every session cookie this UI sets carries.
+    fn cookie_attributes(&self) -> &'static str {
+        if self.secure {
+            "Path=/; HttpOnly; SameSite=Strict; Secure"
+        } else {
+            "Path=/; HttpOnly; SameSite=Strict"
         }
     }
 }
 
 const COOKIE: &str = "vk-hub";
+const SECURE_COOKIE: &str = "__Host-vk-hub";
 
-/// Serve the web UI on `listener` until the process ends.
-pub async fn serve(listener: TcpListener, ui: Arc<Ui>) -> Result<()> {
+/// Serve the web UI on `listener` until the process ends, over TLS with `tls`.
+pub async fn serve(listener: TcpListener, tls: Option<TlsAcceptor>, ui: Arc<Ui>) -> Result<()> {
     let permits = ui.connections.clone();
-    crate::server::accept(listener, None, permits, move |io, peer, _| {
+    crate::server::accept(listener, tls, permits, move |io, peer, _| {
         serve_conn(io, ui.clone(), peer)
     })
     .await
@@ -199,7 +236,7 @@ async fn handle(
             "Something failed on the hub; its log says what.",
         )
     });
-    secure_headers(resp.headers_mut());
+    secure_headers(resp.headers_mut(), ui.secure);
     Ok(resp)
 }
 
@@ -207,7 +244,7 @@ async fn handle(
 /// only the assets do: a page holds what the session may see, and its CSRF token.
 /// `Referrer-Policy: same-origin` rather than `no-referrer`, so the pages' own form posts
 /// carry their real `Origin`; nothing crosses to another origin either way.
-fn secure_headers(h: &mut HeaderMap) {
+fn secure_headers(h: &mut HeaderMap, secure: bool) {
     h.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(CSP),
@@ -228,6 +265,13 @@ fn secure_headers(h: &mut HeaderMap) {
         "cross-origin-opener-policy",
         HeaderValue::from_static("same-origin"),
     );
+    if secure {
+        // Without includeSubDomains, but HSTS has no port: it covers every port of the host.
+        h.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
     if !h.contains_key(header::CACHE_CONTROL) {
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }
@@ -271,6 +315,7 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
             get(&path, req.uri().query(), &auth, ui).await
         }
         (Method::POST, _) => match &ui.site {
+            Site::Fleet(_) => Ok(message(StatusCode::NOT_FOUND, "No such action.")),
             Site::Local(site) => match local::action_target(&path) {
                 Some(local::Target::Vm(id)) => actions::vm_action(req, ui, site, &id).await,
                 Some(local::Target::Dev(name)) => actions::dev_action(req, ui, site, &name).await,
@@ -289,16 +334,28 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
 /// 401 would only have the SSE extension retry it for as long as the page stays open. More
 /// than one session cookie is refused with a 401 as any request is.
 fn signed_out_stream(path: &str, headers: &HeaderMap, ui: &Ui) -> Option<Response<Body>> {
-    if !matches!(session_cookie(headers), Ok(Some(_))) {
+    if !matches!(session_cookie(headers, ui.cookie_name()), Ok(Some(_))) {
         return None;
     }
-    let source = path.strip_prefix("/events/").and_then(|e| source(e, ui))?;
-    Some(sse::signed_out(&source, ui.texts().sign_in_again))
+    let name = path
+        .strip_prefix("/events/")
+        .and_then(|e| event_name(e, ui))?;
+    Some(sse::signed_out(name, ui.texts().sign_in_again))
+}
+
+/// The event `/events/<event>` swaps its fragment in on, if it is one of this site's: what a
+/// signed-out page is told, without following anything for it.
+fn event_name(event: &str, ui: &Ui) -> Option<&'static str> {
+    match &ui.site {
+        Site::Fleet(_) => fleet::event_name(event),
+        Site::Local(_) => local::event_name(event),
+    }
 }
 
 /// What `/events/<event>` streams, if it is one of this site's.
 fn source(event: &str, ui: &Ui) -> Option<sse::Source> {
     match &ui.site {
+        Site::Fleet(site) => fleet::source(event, &ui.hub, site),
         Site::Local(site) => local::source(event, &ui.hub, site),
     }
 }
@@ -333,6 +390,7 @@ async fn get(path: &str, query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Re
         return Ok(stream(ui, auth, source));
     }
     let found = match &ui.site {
+        Site::Fleet(_) => fleet::get(path, query, auth, ui).await?,
         Site::Local(site) => local::get(path, query, auth, ui, site).await?,
     };
     Ok(found.unwrap_or_else(|| message(StatusCode::NOT_FOUND, "There is no such page.")))
@@ -356,7 +414,7 @@ fn stream(ui: &Ui, auth: &Auth, source: sse::Source) -> Response<Body> {
 fn well_formed_login(token: &str) -> bool {
     token
         .strip_prefix(store::LOGIN_PREFIX)
-        .is_some_and(|hex| hex.len() == 64 && vk_hub_proto::from_hex(hex).is_some())
+        .is_some_and(|hex| vk_hub_proto::from_hex_lower::<32>(hex).is_some())
 }
 
 /// `GET /login?t=<token>`: a button that posts the token back. Nothing is spent here, so
@@ -397,7 +455,9 @@ async fn login(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     eprintln!("vk-hub: ui: {} signed in", session.principal());
     let mut resp = html_response(StatusCode::OK, pages::signed_in());
     let cookie = format!(
-        "{COOKIE}={secret}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
+        "{}={secret}; {}; Max-Age={}",
+        ui.cookie_name(),
+        ui.cookie_attributes(),
         session.expires_at.saturating_sub(now)
     );
     resp.headers_mut().insert(
@@ -424,7 +484,11 @@ async fn logout(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     // Its pages' live updates end on it.
     ui.hub.sessions_changed();
     let mut resp = message(StatusCode::OK, "Signed out.");
-    let cookie = format!("{COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+    let cookie = format!(
+        "{}=; {}; Max-Age=0",
+        ui.cookie_name(),
+        ui.cookie_attributes()
+    );
     resp.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&cookie).context("building the session cookie")?,
@@ -444,8 +508,8 @@ pub struct Auth {
 
 /// The session the request's cookie names if it is live, or why there is none.
 async fn authenticate(headers: &HeaderMap, ui: &Ui) -> Result<Result<Auth, &'static str>> {
-    let secret = match session_cookie(headers) {
-        Ok(Some(s)) if s.len() == 64 && vk_hub_proto::from_hex(s).is_some() => s.to_string(),
+    let secret = match session_cookie(headers, ui.cookie_name()) {
+        Ok(Some(s)) if vk_hub_proto::from_hex_lower::<32>(s).is_some() => s.to_string(),
         Ok(_) => return Ok(Err(ui.texts().signed_out)),
         Err(()) => return Ok(Err(CONFLICTING_COOKIES)),
     };
@@ -462,21 +526,23 @@ async fn authenticate(headers: &HeaderMap, ui: &Ui) -> Result<Result<Auth, &'sta
         .ok_or(ui.texts().signed_out))
 }
 
-/// The session cookie's value, if the request has one — or `Err` when it has more than one.
-/// Cookies are not kept apart by port: another service on the same host can set one of this
-/// name, with a narrower path so the browser sends it first. Picking one would let it choose
-/// the session; neither is taken instead.
-fn session_cookie(headers: &HeaderMap) -> Result<Option<&str>, ()> {
+/// The session cookie `name`'s value, if the request has one — or `Err` when it has more
+/// than one session cookie. Cookies are not kept apart by port: another service on the same
+/// host can set one of this name, with a narrower path so the browser sends it first. Picking
+/// one would let it choose the session; neither is taken instead. Over https only the
+/// `__Host-` cookie counts: plain http on the same host can plant an unprefixed one, which
+/// must not lock anyone out; over http either name does.
+fn session_cookie<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, ()> {
     let mut found = headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .filter(|(k, _)| *k == COOKIE);
+        .filter(|(k, _)| *k == name || (name == COOKIE && *k == SECURE_COOKIE));
     match (found.next(), found.next()) {
         (None, _) => Ok(None),
-        (Some((_, v)), None) => Ok(Some(v)),
+        (Some((k, v)), None) => Ok((k == name).then_some(v)),
         (Some(_), Some(_)) => Err(()),
     }
 }
@@ -654,6 +720,17 @@ struct Texts {
     /// Markup: how a page whose session ended signs in again.
     sign_in_again: &'static str,
 }
+
+const FLEET_TEXTS: Texts = Texts {
+    misdirected: "This is not the address the hub's web UI is configured at (its ui_url, or \
+                  ui_addr when that is unset).",
+    not_a_link: "This is not a sign-in link. `vk-hub ui login` prints one.",
+    spent_link: "This sign-in link is unknown, used or expired. `vk-hub ui login` prints a new \
+                 one.",
+    signed_out: "Not signed in. On the hub's host, `vk-hub ui login` prints a link that signs \
+                 you in.",
+    sign_in_again: "<code>vk-hub ui login</code> prints a link to sign in again.",
+};
 
 const LOCAL_TEXTS: Texts = Texts {
     misdirected: "This is not the address the hub's web UI is served at.",

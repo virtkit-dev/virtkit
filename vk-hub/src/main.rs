@@ -7,7 +7,8 @@
 //! sign in with single-use links the hub prints, or issues over a unix socket only its own
 //! user reaches; what they do is recorded in an audit log.
 //!
-//! Experimental.
+//! Experimental. A web UI on a listener of its own shows the fleet to people signed in with
+//! links the admin socket issues.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -47,7 +48,8 @@ struct Cli {
 /// directory whose admin socket they dial.
 #[derive(clap::Args)]
 struct ConfigArg {
-    /// hub.toml: addr, tls_cert, tls_key, data_dir [default: built-in defaults]
+    /// hub.toml: addr, tls_cert, tls_key, data_dir, ui_addr, ui_url, ui_tls_cert,
+    /// ui_tls_key [default: built-in defaults]
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 }
@@ -79,6 +81,13 @@ enum Cmd {
         #[arg(long, value_name = "NODE")]
         node: Option<String>,
     },
+    /// Sign in to the web UI, and see or end its sessions
+    Ui {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: UiCmd,
+    },
     /// Serve a web UI for this machine's VMs, signed into with a link it prints
     ///
     /// Runs as you and shows the VMs you run: pinned `vk run`s, dev environments and CI jobs.
@@ -99,6 +108,32 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum UiCmd {
+    /// Print a single-use link that opens a web UI session
+    ///
+    /// The link is a credential until it is used or expires: open it yourself, pasting it into
+    /// the browser rather than passing it on a command line, which other local users can
+    /// read, or hand it only to whoever the session is for.
+    Login {
+        /// viewer (read only) or operator
+        #[arg(long, default_value = "viewer", value_parser = parse_role)]
+        role: store::Role,
+        /// How long the link stays valid: <n>s, <n>m, <n>h or <n>d (at most 1d)
+        #[arg(long, default_value = "10m", value_parser = parse_login_ttl)]
+        ttl: Duration,
+    },
+    /// List the open web UI sessions
+    Sessions,
+    /// End a web UI session, as `vk-hub ui sessions` lists it, or every one
+    Logout {
+        #[arg(required_unless_present = "all")]
+        id: Option<String>,
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+    },
+}
+
 #[derive(clap::Args)]
 struct LocalArgs {
     /// The loopback port to serve on [default: one the system picks]
@@ -112,6 +147,7 @@ struct LocalArgs {
     vk: Option<std::path::PathBuf>,
 }
 
+/// `vk-hub local`'s own sign-in commands: `vk-hub ui`'s, for the local hub.
 #[derive(Subcommand)]
 enum LocalCmd {
     /// Print another single-use link that opens a session on the running `vk-hub local`
@@ -135,6 +171,16 @@ enum LocalCmd {
         #[arg(long, conflicts_with = "id")]
         all: bool,
     },
+}
+
+impl From<LocalCmd> for UiCmd {
+    fn from(cmd: LocalCmd) -> Self {
+        match cmd {
+            LocalCmd::Login { role, ttl } => UiCmd::Login { role, ttl },
+            LocalCmd::Sessions => UiCmd::Sessions,
+            LocalCmd::Logout { id, all } => UiCmd::Logout { id, all },
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -214,6 +260,13 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Cmd::Ui { config, cmd } => {
+            ui_cmd(
+                admin_client(&HubConfig::load(config.config.as_deref())?)?,
+                cmd,
+            )
+            .await
+        }
         Cmd::Local {
             state_dir,
             args,
@@ -237,7 +290,11 @@ async fn run(cli: Cli) -> Result<()> {
                 None => local::state_dir()?,
             };
             let socket = state_dir.join(local::ADMIN_SOCKET);
-            ui_cmd(admin_client_at(&socket, "vk-hub local` running")?, cmd).await
+            ui_cmd(
+                admin_client_at(&socket, "vk-hub local` running")?,
+                cmd.into(),
+            )
+            .await
         }
         Cmd::Workloads { config, node } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
@@ -252,35 +309,71 @@ async fn run(cli: Cli) -> Result<()> {
 async fn serve(cfg: HubConfig) -> Result<()> {
     let listener = server::listen(cfg.addr).with_context(|| format!("binding {}", cfg.addr))?;
     let tls = cfg.build_tls()?;
+    let ui = match &cfg.ui {
+        Some(ui) => Some((
+            server::listen(ui.addr).with_context(|| format!("binding ui_addr {}", ui.addr))?,
+            ui.build_tls()?,
+            ui,
+        )),
+        None => None,
+    };
     let db = Arc::new(store::Db::open(&cfg.db_path())?);
-    let hub = Arc::new(server::Hub::new(db, None));
+    let hub = Arc::new(server::Hub::new(
+        db,
+        cfg.ui.as_ref().map(|ui| ui.url.clone()),
+    ));
     // Fatal, unlike the registry's optional admin socket: here it is the only way to issue
     // a token, so a hub without it could never enroll anything.
     let admin = admin::bind(&cfg.admin_socket())?;
     tokio::spawn(admin::serve(admin, hub.clone()));
+    let ui = match ui {
+        Some((listener, tls, ui)) => {
+            eprintln!(
+                "vk-hub: serving the web UI on {}://{} as {}",
+                if tls.is_some() { "https" } else { "http" },
+                ui.addr,
+                ui.url
+            );
+            let ui = Arc::new(ui::Ui::new(hub.clone(), &ui.url));
+            Some(ui::serve(listener, tls, ui))
+        }
+        None => None,
+    };
     eprintln!(
         "vk-hub: serving nodes on {}://{} (data in {})",
         if tls.is_some() { "https" } else { "http" },
         cfg.addr,
         cfg.data_dir.display()
     );
-    server::serve(listener, tls, hub).await
+    let nodes = server::serve(listener, tls, hub);
+    // Each serves until the process ends; the first to stop ends the hub.
+    match ui {
+        Some(ui) => tokio::select! {
+            result = nodes => result,
+            result = ui => result.context("serving the web UI"),
+        },
+        None => nodes.await,
+    }
 }
 
-/// `vk-hub local login|sessions|logout`, over the running hub's admin socket.
-async fn ui_cmd(client: admin::Client, cmd: LocalCmd) -> Result<()> {
+/// `vk-hub ui login|sessions|logout`, and `vk-hub local`'s, over the running hub's admin
+/// socket.
+async fn ui_cmd(client: admin::Client, cmd: UiCmd) -> Result<()> {
     match cmd {
-        LocalCmd::Login { role, ttl } => {
+        UiCmd::Login { role, ttl } => {
             let link = tokio::task::spawn_blocking(move || client.ui_login(role, ttl)).await??;
-            // The link alone on stdout, so `$(vk-hub local login)` captures just it.
+            // The link alone on stdout, so `$(vk-hub ui login)` or `$(vk-hub local login)`
+            // captures just it.
             println!("{}", link.url);
             eprintln!(
-                "vk-hub: single-use, valid for {}, signs a browser in as {}",
+                "vk-hub: single-use {} sign-in link, valid for {}; the session it opens \
+                 lasts {}",
+                role.name(),
                 human_duration(ttl),
-                role.name()
+                human_duration(store::UI_SESSION_TTL)
             );
         }
-        LocalCmd::Sessions => {
+        UiCmd::Sessions => {
             let sessions = tokio::task::spawn_blocking(move || client.ui_sessions()).await??;
             let now = now_secs();
             for s in sessions {
@@ -294,7 +387,7 @@ async fn ui_cmd(client: admin::Client, cmd: LocalCmd) -> Result<()> {
                 );
             }
         }
-        LocalCmd::Logout { id, all: _ } => {
+        UiCmd::Logout { id, all: _ } => {
             // `--all` is `id` absent: clap requires one or the other.
             let which = id.clone();
             let ended =
@@ -386,7 +479,7 @@ pub(crate) fn human_duration(d: Duration) -> String {
     }
 }
 
-/// The columns of `vk-hub nodes`.
+/// The columns of `vk-hub nodes`, and of the web UI's nodes table.
 pub(crate) const NODE_COLUMNS: [&str; 9] = [
     "ID",
     "NAME",

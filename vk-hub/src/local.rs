@@ -1104,7 +1104,7 @@ pub async fn serve(opts: Options) -> Result<()> {
     let ui = Arc::new(crate::ui::Ui::local(hub, &origin, local));
     let mut served = tokio::task::JoinSet::new();
     for listener in listeners {
-        served.spawn(crate::ui::serve(listener, ui.clone()));
+        served.spawn(crate::ui::serve(listener, None, ui.clone()));
     }
     // Each serves until the process ends; the first to stop ends the hub.
     match served.join_next().await {
