@@ -124,6 +124,8 @@ pub struct VmResources {
     pub system_uuid: Option<[u8; 16]>,
     /// The file backing the UEFI variable store flash, if any (local patch).
     pub uefi_vars: Option<std::path::PathBuf>,
+    /// The file holding the guest TPM's permanent state, if it has a TPM (local patch).
+    pub tpm_state: Option<std::path::PathBuf>,
     /// A snapshot directory to start the VM from instead of booting (local patch).
     pub restore_from: Option<std::path::PathBuf>,
     /// Whether to enable split irqchip
@@ -285,6 +287,7 @@ mod tests {
             vm_generation_id: None,
             system_uuid: None,
             uefi_vars: None,
+            tpm_state: None,
             restore_from: None,
             split_irqchip: false,
             acpi_enabled: false,

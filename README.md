@@ -782,6 +782,12 @@ The scripts use a `vk` found on `PATH` to build inside a microVM; otherwise they
 Docker. Pass `--docker` to force Docker. `build.sh --use-virtkit=<dist>` selects a
 specific existing virtkit build.
 
+`vk` links libtpms and OpenSSL's libcrypto statically for the TPM it gives Windows guests.
+The build image has them at `/opt/tpm` and sets `VK_LIBTPMS_DIR` to it, so `build.sh` and
+`dev.sh` need nothing more; a plain `cargo build` outside that image needs
+`VK_LIBTPMS_DIR` pointing at a prefix with static musl builds of both
+(`lib/libtpms.a`, `lib/libcrypto.a`).
+
 `vk` normally embeds `dist/vmlinux`, so `build.sh` refuses to proceed when the kernel is
 missing. `--no-kernel` produces a non-shippable binary that requires `--kernel` at
 runtime. The kernel changes less often than the Rust binaries, so one kernel build can be
@@ -811,6 +817,11 @@ those bytes is pinned to something that stays fetchable:
 - `dist/build-info.txt` and `dist/kernel-build-info.txt` record the commit, base image
   digest, locked nixpkgs revision, and the sha256 of every artifact, with the exact
   command that rebuilds and verifies them.
+
+The C libraries `vk` embeds from that image — libtpms and OpenSSL's libcrypto, for the
+Windows guests' TPM — are outside `cargo-audit`'s view, which covers `Cargo.lock` only.
+Their versions are the locked nixpkgs', so a fix for one of their CVEs reaches users through
+a `flake.lock` bump (`./update.sh`) and a new release.
 
 `./build.sh --bootstrap-check` is the proof: it performs the Docker build, rebuilds a clean
 copy of the tree from scratch in a microVM booted by the `vk` it just produced, and fails

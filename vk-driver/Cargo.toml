@@ -73,12 +73,13 @@ jemallocator.workspace = true
 # unwinding that a static libkrun.a link hits. Vendored under third_party/libkrun
 # (libkrun 2.0-dev and PR #875, locally patched; see its VENDOR.md) and driven through its
 # Rust API (src/libkrun_sys.rs). default-features off drops the init blob (we supply our own
-# init); blk + net, and snapshot for serializable VM state.
+# init); blk + net, snapshot for serializable VM state, and tpm for a Windows guest's TPM 2.0
+# (libtpms, linked from the build image's VK_LIBTPMS_DIR).
 [dependencies.krun]
 path = "../third_party/libkrun/src/libkrun"
 package = "libkrun"
 default-features = false
-features = ["blk", "net", "snapshot"]
+features = ["blk", "net", "snapshot", "tpm"]
 
 [features]
 default = ["embed"]

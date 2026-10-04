@@ -306,6 +306,7 @@ pub fn setup_mptable_for_tdshim(guest_mem: &GuestMemoryMmap, num_cpus: u8) -> su
 ///   SMBIOS tables (local patch).
 /// * `system_uuid` - The SMBIOS system UUID of the Windows platform, if any (local patch).
 /// * `smbios_oem_strings` - The SMBIOS OEM strings of the Windows platform, if any (local patch).
+/// * `tpm` - Declare the TPM's CRB device in ACPI (local patch).
 #[allow(unused_variables, clippy::too_many_arguments)]
 pub fn configure_system(
     guest_mem: &GuestMemoryMmap,
@@ -322,6 +323,7 @@ pub fn configure_system(
     windows_platform: bool,
     system_uuid: Option<&[u8; 16]>,
     smbios_oem_strings: &Option<Vec<String>>,
+    tpm: bool,
 ) -> super::Result<()> {
     // The Windows platform gets SMBIOS tables, which Windows reads for the machine's identity
     // and otherwise reports missing (local patch).
@@ -342,6 +344,7 @@ pub fn configure_system(
             pci_host,
             vm_generation_id,
             windows_platform,
+            tpm,
         )
         .map_err(Error::AcpiSetup)?;
     } else {
@@ -681,6 +684,7 @@ mod tests {
             false,
             None,
             &None,
+            false,
         );
         assert!(config_err.is_err());
         #[cfg(not(feature = "tee"))]
@@ -709,6 +713,7 @@ mod tests {
             false,
             None,
             &None,
+            false,
         )
         .unwrap();
 
@@ -732,6 +737,7 @@ mod tests {
             false,
             None,
             &None,
+            false,
         )
         .unwrap();
 
@@ -755,6 +761,7 @@ mod tests {
             false,
             None,
             &None,
+            false,
         )
         .unwrap();
     }
@@ -792,6 +799,7 @@ mod tests {
                 windows_platform,
                 Some(&UUID),
                 &oem_strings,
+                false,
             )
             .unwrap()
         };

@@ -23,6 +23,8 @@ timesync = ["devices/timesync"]
 ffi = ["serde_json", "devices/ffi"]
 # Serializable VM state (`CpuState`), for snapshots.
 snapshot = ["serde", "serde_json", "kvm-bindings/serde", "devices/snapshot"]
+# A TPM 2.0 for the guest: libtpms behind a CRB interface (VmmBuilder::tpm_state).
+tpm = ["devices/tpm"]
 
 [dependencies]
 bitfield = { version = "0.19.4", optional = true }

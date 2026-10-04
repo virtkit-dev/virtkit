@@ -226,6 +226,10 @@ pub struct LegacyDevices {
     /// The UEFI variable store flash, whose contents are its file's: the VM's disks and that
     /// file are the snapshot's.
     pub flash: Option<Arc<Mutex<Flash>>>,
+    /// The TPM, whose state the snapshot holds whole: a restore starts it on that state
+    /// (`TpmCrb::new`), so [`LegacyDevices::restore`] only checks it is there.
+    #[cfg(feature = "tpm")]
+    pub tpm: Option<Arc<Mutex<devices::legacy::TpmCrb>>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -237,11 +241,19 @@ pub struct LegacyState {
     pub acpi_pm: AcpiPmState,
     #[serde(default)]
     pub flash: Option<FlashState>,
+    #[cfg(feature = "tpm")]
+    #[serde(default)]
+    pub tpm: Option<devices::legacy::TpmState>,
+    /// Without the `tpm` feature, only whether the snapshot has a TPM's state, which a restore
+    /// then refuses: the VM has no TPM.
+    #[cfg(not(feature = "tpm"))]
+    #[serde(default, skip_serializing)]
+    pub tpm: Option<serde::de::IgnoredAny>,
 }
 
 impl LegacyDevices {
-    pub fn save(&self) -> LegacyState {
-        LegacyState {
+    pub fn save(&self) -> io::Result<LegacyState> {
+        Ok(LegacyState {
             cmos: self.cmos.lock().unwrap().save_state(),
             serials: self
                 .serials
@@ -254,11 +266,26 @@ impl LegacyDevices {
                 .flash
                 .as_ref()
                 .map(|flash| flash.lock().unwrap().save_state()),
-        }
+            #[cfg(feature = "tpm")]
+            tpm: self
+                .tpm
+                .as_ref()
+                .map(|tpm| tpm.lock().unwrap().save_state())
+                .transpose()?,
+            #[cfg(not(feature = "tpm"))]
+            tpm: None,
+        })
     }
 
-    /// Put back `state`, of a VM with as many serial ports, and a UEFI variable store flash if
-    /// this one has one.
+    fn has_tpm(&self) -> bool {
+        #[cfg(feature = "tpm")]
+        return self.tpm.is_some();
+        #[cfg(not(feature = "tpm"))]
+        false
+    }
+
+    /// Put back `state`, of a VM with as many serial ports, and a UEFI variable store flash and
+    /// a TPM if this one has them (the TPM started on the snapshot's state already).
     pub fn restore(&self, state: &LegacyState) -> io::Result<()> {
         if state.serials.len() != self.serials.len() {
             return Err(io::Error::other(format!(
@@ -267,14 +294,24 @@ impl LegacyDevices {
                 self.serials.len()
             )));
         }
-        if state.flash.is_some() != self.flash.is_some() {
-            let (snapshot, vm) = match state.flash {
-                Some(_) => ("has", "has none"),
-                None => ("has no", "has one"),
-            };
-            return Err(io::Error::other(format!(
-                "the snapshot {snapshot} a UEFI variable store flash, the VM {vm}"
-            )));
+        let presence = [
+            (
+                "UEFI variable store flash",
+                state.flash.is_some(),
+                self.flash.is_some(),
+            ),
+            ("TPM", state.tpm.is_some(), self.has_tpm()),
+        ];
+        for (device, saved, here) in presence {
+            if saved != here {
+                let (snapshot, vm) = match saved {
+                    true => ("has a", "has none"),
+                    false => ("has no", "has one"),
+                };
+                return Err(io::Error::other(format!(
+                    "the snapshot {snapshot} {device}, the VM {vm}"
+                )));
+            }
         }
         self.cmos.lock().unwrap().restore_state(&state.cmos);
         for (serial, saved) in self.serials.iter().zip(&state.serials) {
@@ -733,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_devices_restore_only_with_as_many_serial_ports_and_the_same_flash() {
+    fn legacy_devices_restore_only_with_as_many_serial_ports_and_the_same_flash_and_tpm() {
         use devices::legacy::{AcpiPm, Cmos, I8042Device, Serial};
         use std::sync::atomic::AtomicBool;
         use utils::eventfd::{EFD_NONBLOCK, EventFd};
@@ -755,8 +792,10 @@ mod tests {
                 None,
             )),
             flash: None,
+            #[cfg(feature = "tpm")]
+            tpm: None,
         };
-        let saved = devices(2).save();
+        let saved = devices(2).save().unwrap();
         devices(2).restore(&saved).unwrap();
         let refused = devices(1).restore(&saved).unwrap_err();
         assert!(refused.to_string().contains("2 serial ports, the VM 1"));
@@ -764,7 +803,7 @@ mod tests {
         // Nor without the UEFI variable store flash the snapshot has.
         let with_flash = LegacyState {
             flash: Some(FlashState::default()),
-            ..devices(2).save()
+            ..devices(2).save().unwrap()
         };
         let refused = devices(2).restore(&with_flash).unwrap_err();
         assert!(
@@ -772,6 +811,15 @@ mod tests {
                 .to_string()
                 .contains("has a UEFI variable store flash")
         );
+
+        // Nor without the TPM it has, with or without the `tpm` feature.
+        let mut json = serde_json::to_value(&saved).unwrap();
+        json["tpm"] = serde_json::json!({
+            "registers": [], "buffer": [], "permanent": [], "volatile": []
+        });
+        let with_tpm: LegacyState = serde_json::from_value(json).unwrap();
+        let refused = devices(2).restore(&with_tpm).unwrap_err();
+        assert!(refused.to_string().contains("has a TPM, the VM has none"));
     }
 
     #[test]

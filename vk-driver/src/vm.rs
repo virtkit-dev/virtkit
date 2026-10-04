@@ -1709,6 +1709,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         vm_generation_id: None,
         system_uuid: None,
         uefi_vars: None,
+        tpm_state: None,
         serial_input: None,
         control: None,
         restore_from: None,

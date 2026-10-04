@@ -184,7 +184,9 @@ The toolchain is pinned in `rust-toolchain.toml` (musl target, clippy + rustfmt)
 cargo directly if you have it, or inside the devcontainer image to match CI exactly
 (clippy compiles the workspace, so it needs `build.sh`'s writable cargo home — see
 `.github/workflows/quality.yml`). These are the CI-parity commands, run to verify a
-change; the edit loop above is what to use while iterating:
+change; the edit loop above is what to use while iterating. Outside the build image, set
+`VK_LIBTPMS_DIR` to a prefix with static musl `lib/libtpms.a` and `lib/libcrypto.a` (the
+image's is `/opt/tpm`): `vk-driver` links them for the Windows guests' TPM.
 
 ```bash
 cargo build --release --workspace
@@ -200,7 +202,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 - **Shell:** Bash, `set -euo pipefail`. Scripts that also run inside the build image
   (e.g. `audit.sh` under CI) must stay POSIX-compatible — assume only `sh` there.
 - **Dependency audit:** `cargo-audit` with the RUSTSEC ignore list in `.cargo/audit.toml`
-  (each entry documented with rationale + residual risk).
+  (each entry documented with rationale + residual risk). It does not see the C libraries
+  `vk` links statically from the build image (libtpms and OpenSSL's libcrypto, `/opt/tpm`):
+  their CVEs are fixed by a `flake.lock` bump (`./update.sh`) and a release.
 
 ## CI
 

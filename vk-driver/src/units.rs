@@ -816,6 +816,7 @@ pub fn boot_unit(
             vm_generation_id: None,
             system_uuid: None,
             uefi_vars: None,
+            tpm_state: None,
             serial_input: None,
             control: None,
             restore_from: None,

@@ -477,7 +477,8 @@ impl Vmm {
             .legacy_devices
             .as_ref()
             .ok_or("the VM has no legacy devices to snapshot")?
-            .save();
+            .save()
+            .map_err(|e| format!("saving the devices: {e}"))?;
         let pci = self
             .pci_device_manager
             .as_ref()
@@ -667,6 +668,7 @@ impl Vmm {
         _vm_generation_id: Option<&[u8; 16]>,
         _windows_platform: bool,
         _system_uuid: Option<&[u8; 16]>,
+        _tpm: bool,
     ) -> Result<()> {
         #[cfg(target_arch = "x86_64")]
         {
@@ -700,6 +702,7 @@ impl Vmm {
                 _windows_platform,
                 _system_uuid,
                 _smbios_oem_strings,
+                _tpm,
             )
             .map_err(Error::ConfigureSystem)?;
         }

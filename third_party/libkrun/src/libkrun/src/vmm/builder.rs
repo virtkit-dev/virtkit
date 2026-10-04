@@ -129,6 +129,8 @@ pub enum StartMicrovmError {
     FirmwareRead(io::Error),
     /// Cannot set up the UEFI variable store flash from its file (local patch).
     UefiVars(io::Error),
+    /// Cannot start the guest's TPM (local patch).
+    Tpm(io::Error),
     /// Memory regions are overlapping or mmap fails.
     GuestMemoryMmap(String),
     /// The BZIP2 decoder couldn't decompress the kernel.
@@ -299,6 +301,7 @@ impl Display for StartMicrovmError {
             UefiVars(ref err) => {
                 write!(f, "Cannot set up the UEFI variable store flash: {err}")
             }
+            Tpm(ref err) => write!(f, "Cannot start the guest's TPM: {err}"),
             GuestMemoryMmap(ref err) => {
                 // Remove imbricated quotes from error message.
                 let mut err_msg = format!("{err:?}");
@@ -1151,6 +1154,13 @@ pub fn build_microvm(
     #[cfg_attr(not(feature = "snapshot"), allow(unused_variables))]
     let uefi_vars_flash =
         attach_uefi_vars_flash(vm_resources.uefi_vars.as_deref(), &mut mmio_device_manager)?;
+    // Likewise the TPM.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg_attr(
+        any(not(feature = "snapshot"), not(feature = "tpm")),
+        allow(unused_variables)
+    )]
+    let tpm = attach_tpm(vm_resources, &mut mmio_device_manager)?;
     let vcpus;
     let intc: IrqChip;
     // For x86_64 we need to create the interrupt controller before calling `KVM_CREATE_VCPUS`
@@ -1370,6 +1380,8 @@ pub fn build_microvm(
             i8042: pio_device_manager.i8042.clone(),
             acpi_pm: pio_device_manager.acpi_pm.clone(),
             flash: uefi_vars_flash,
+            #[cfg(feature = "tpm")]
+            tpm,
         }),
         #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
         vm_generation_id: vm_resources.vm_generation_id,
@@ -1458,6 +1470,7 @@ pub fn build_microvm(
         // The Windows platform: a guest with Hyper-V enlightenments is a Windows guest.
         vm_resources.hyperv_enabled,
         vm_resources.system_uuid.as_ref(),
+        vm_resources.tpm_state.is_some(),
     )
     .map_err(StartMicrovmError::Internal)?;
 
@@ -2255,6 +2268,59 @@ pub fn setup_serial_device(
         warn!("Could not add serial input event to epoll: {e:?}");
     }
     Ok(serial)
+}
+
+/// The TPM over the permanent state in `vm_resources.tpm_state`, or the snapshot's TPM for a
+/// restore, its CRB interface on the MMIO bus (local patch, see VENDOR.md); none without a file.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "tpm"))]
+fn attach_tpm(
+    vm_resources: &VmResources,
+    mmio_device_manager: &mut MMIODeviceManager,
+) -> std::result::Result<Option<Arc<Mutex<devices::legacy::TpmCrb>>>, StartMicrovmError> {
+    let Some(path) = vm_resources.tpm_state.as_deref() else {
+        return Ok(None);
+    };
+    // libtpms starts once: a restore starts it on the snapshot's state directly.
+    #[cfg(feature = "snapshot")]
+    let saved = match &vm_resources.restore_from {
+        Some(dir) => {
+            let restore = |e: String| {
+                StartMicrovmError::Restore(format!("the snapshot in {}: {e}", dir.display()))
+            };
+            let saved = super::snapshot::read_state(dir)
+                .map_err(|e| restore(format!("reading the snapshot: {e}")))?;
+            let tpm = saved.legacy.tpm.ok_or_else(|| {
+                restore("restoring the devices: the snapshot has no TPM, the VM has one".into())
+            })?;
+            Some(tpm)
+        }
+        None => None,
+    };
+    #[cfg(not(feature = "snapshot"))]
+    let saved = None;
+    let start = arch::x86_64::layout::TPM_CRB_START;
+    let tpm = devices::legacy::TpmCrb::new(path, start, saved.as_ref())
+        .map_err(StartMicrovmError::Tpm)?;
+    let tpm = Arc::new(Mutex::new(tpm));
+    mmio_device_manager
+        .bus
+        .insert(tpm.clone(), start, arch::x86_64::layout::TPM_CRB_SIZE)
+        .map_err(|e| StartMicrovmError::Tpm(io::Error::other(format!("{e:?}"))))?;
+    Ok(Some(tpm))
+}
+
+/// Without the `tpm` feature there is no TPM to attach.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(feature = "tpm")))]
+fn attach_tpm(
+    vm_resources: &VmResources,
+    _mmio_device_manager: &mut MMIODeviceManager,
+) -> std::result::Result<Option<()>, StartMicrovmError> {
+    match vm_resources.tpm_state {
+        None => Ok(None),
+        Some(_) => Err(StartMicrovmError::Tpm(io::Error::other(
+            "this libkrun is built without the `tpm` feature",
+        ))),
+    }
 }
 
 /// The UEFI variable store flash over `path`, on the MMIO bus where the firmware looks for it
