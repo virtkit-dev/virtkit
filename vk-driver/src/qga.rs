@@ -285,6 +285,38 @@ impl Client {
         Ok(serde_json::from_value(reply)?)
     }
 
+    /// [`Client::exec`] without output, waiting at most `timeout` for the agent's answer.
+    pub fn exec_within(
+        &mut self,
+        path: &str,
+        args: &[String],
+        timeout: std::time::Duration,
+    ) -> Result<i64> {
+        let reply = self.call(
+            "guest-exec",
+            Some(serde_json::json!({ "path": path, "arg": args })),
+            timeout,
+        )?;
+        reply
+            .get("pid")
+            .and_then(serde_json::Value::as_i64)
+            .context("guest-exec returned no pid")
+    }
+
+    /// [`Client::exec_status`], waiting at most `timeout` for the agent's answer.
+    pub fn exec_status_within(
+        &mut self,
+        pid: i64,
+        timeout: std::time::Duration,
+    ) -> Result<ExecStatus> {
+        let reply = self.call(
+            "guest-exec-status",
+            Some(serde_json::json!({ "pid": pid })),
+            timeout,
+        )?;
+        Ok(serde_json::from_value(reply)?)
+    }
+
     /// Open `path` in the guest with an `fopen` mode, returning the agent's handle.
     pub fn file_open(&mut self, path: &str, mode: &str) -> Result<i64> {
         let reply = self.call(

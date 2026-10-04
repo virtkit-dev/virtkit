@@ -37,6 +37,11 @@ struct UnitState {
     /// Windows boot count: provisioning runs without the units lock and must not drive
     /// a guest replaced by a later start.
     boots: u64,
+    /// Its healthcheck has passed since it started: a later dependent does not probe again.
+    healthy: bool,
+    /// How many times it was asked to stop: a start waiting on its dependencies gives up once
+    /// this changes.
+    stops: u64,
 }
 
 type UnitsGuard<'a> = std::sync::MutexGuard<'a, HashMap<String, UnitState>>;
@@ -114,6 +119,8 @@ impl Manager {
                                 guard: None,
                                 firmware: None,
                                 boots: 0,
+                                healthy: false,
+                                stops: 0,
                             },
                         )
                     })
@@ -216,7 +223,7 @@ impl Manager {
     /// skips the build and just boots.
     pub fn start_streamed(&self, name: &str, sink: Option<crate::build::ProgressSink>) -> Reply {
         // Snapshot the unit under the lock, then release it for the (possibly long) build.
-        let unit = {
+        let (unit, stops) = {
             let mut u = self.units_guard();
             let Some(st) = u.get_mut(name) else {
                 return Reply::err(format!("no such unit {name:?}"));
@@ -224,8 +231,13 @@ impl Manager {
             if state_of(st) == "running" {
                 return Reply::ok(format!("{name} already running ({})", st.svc.ip));
             }
-            st.unit.clone()
+            (st.unit.clone(), st.stops)
         };
+        // Wait for dependency health or completion without the lock so `list`/`status`
+        // can answer meanwhile.
+        if let Err(e) = self.wait_dependencies(&unit, stops) {
+            return Reply::err(format!("starting {name}: {e:#}"));
+        }
 
         // A `build:` unit materializes into the shared build tier (lock released for the
         // build) — a fresh stage returns instantly; an `image:` unit was already pulled.
@@ -305,6 +317,7 @@ impl Manager {
                 let ip = st.svc.ip.clone();
                 st.child = Some(child);
                 st.exited = None;
+                st.healthy = false;
                 st.aux = aux;
                 st.guard = guard;
                 Reply::ok(format!("started {name} ({ip})"))
@@ -321,6 +334,7 @@ impl Manager {
         st.child = Some(child);
         st.exited = None;
         st.firmware = Some(firmware);
+        st.healthy = false;
         st.boots += 1;
         Ok((provisioning, st.boots))
     }
@@ -394,6 +408,123 @@ impl Manager {
         }
     }
 
+    /// Wait for what `unit` waits on in its dependencies (`depends_on` conditions): their
+    /// healthcheck passing, or their run to complete successfully. Gives up once `unit` is
+    /// stopped meanwhile (`vk service stop`, compose down), as `stops` then changes.
+    fn wait_dependencies(&self, unit: &crate::compose::Unit, stops: u64) -> Result<()> {
+        let cancelled = || {
+            self.units_guard()
+                .get(&unit.name)
+                .is_none_or(|st| st.stops != stops)
+        };
+        for (dependency, condition) in &unit.wait_for {
+            match condition {
+                crate::compose::Condition::Healthy => {
+                    println!(
+                        "virtkit: service {}: waiting for {dependency} to be healthy",
+                        unit.name
+                    );
+                    self.wait_healthy(dependency, &cancelled)?;
+                }
+                crate::compose::Condition::CompletedSuccessfully => {
+                    println!(
+                        "virtkit: service {}: waiting for {dependency} to complete",
+                        unit.name
+                    );
+                    self.wait_completed(dependency, &cancelled)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Probe `name`'s healthcheck until it passes, or fails `retries` times in a row past its
+    /// start period, which runs from now: vk does not know when the service itself is ready to
+    /// be checked, and a dependent waits only once its dependency has started.
+    fn wait_healthy(&self, name: &str, cancelled: &dyn Fn() -> bool) -> Result<()> {
+        let (check, target, console) = {
+            let mut u = self.units_guard();
+            let st = u
+                .get_mut(name)
+                .with_context(|| format!("no such unit {name:?}"))?;
+            match state_of(st) {
+                "running" if st.healthy => return Ok(()),
+                "running" => {}
+                _ if st.exited.is_none() => anyhow::bail!("{name} was not started"),
+                _ => anyhow::bail!("{name} ended before it was healthy"),
+            }
+            let check = st
+                .unit
+                .healthcheck
+                .clone()
+                .with_context(|| format!("{name} declares no healthcheck to be healthy by"))?;
+            let target = match st.unit.source {
+                crate::compose::Source::Bundle { .. } => {
+                    crate::health::Target::GuestAgent(st.dir.join(crate::uefi::GUEST_AGENT_SOCKET))
+                }
+                _ => crate::health::Target::Agent {
+                    addr: unit_addr(&st.dir),
+                    user: st.unit.user.clone(),
+                },
+            };
+            (check, target, st.dir.join(crate::run::CONSOLE_LOG))
+        };
+        let started = std::time::Instant::now();
+        let mut failures = 0;
+        loop {
+            if !self.still_running(name, &console)? {
+                anyhow::bail!("{name} ended before it was healthy");
+            }
+            let failure = match crate::health::probe(&target, &check.test, check.timeout) {
+                Ok(0) => {
+                    if let Some(st) = self.units_guard().get_mut(name) {
+                        st.healthy = true;
+                    }
+                    return Ok(());
+                }
+                Ok(code) => format!("exit code {code}"),
+                Err(e) => format!("{e:#}"),
+            };
+            failures = crate::health::count_failure(&check, failures, started.elapsed())
+                .with_context(|| {
+                    format!(
+                        "{name} is unhealthy: {} failed checks in a row, the last: {failure}",
+                        check.retries
+                    )
+                })?;
+            pause(check.interval, cancelled)?;
+        }
+    }
+
+    /// Wait until `name`'s guest has ended, successfully: a job service's run. A Linux guest
+    /// powers off the same way whatever its service returned, so its success is the exit code
+    /// its agent logged.
+    fn wait_completed(&self, name: &str, cancelled: &dyn Fn() -> bool) -> Result<()> {
+        loop {
+            {
+                let mut u = self.units_guard();
+                let st = u
+                    .get_mut(name)
+                    .with_context(|| format!("no such unit {name:?}"))?;
+                if state_of(st) != "running" {
+                    let windows = matches!(st.unit.source, crate::compose::Source::Bundle { .. });
+                    let console = st.dir.join(crate::run::CONSOLE_LOG);
+                    return match st.exited {
+                        Some(status) if status.success() && windows => Ok(()),
+                        Some(status) if status.success() => match service_exit_code(&console) {
+                            Some(0) => Ok(()),
+                            Some(code) => anyhow::bail!("{name} exited with code {code}"),
+                            None => anyhow::bail!("{name} ended with no exit code logged"),
+                        },
+                        Some(status) => anyhow::bail!("{name} ended with {status}"),
+                        None => anyhow::bail!("{name} was not started"),
+                    };
+                }
+            }
+            pause(std::time::Duration::from_millis(500), cancelled)?;
+        }
+    }
+
     /// Whether `name` is a Windows unit (a bundle `image:`).
     fn is_windows(&self, name: &str) -> bool {
         self.units_guard()
@@ -434,6 +565,7 @@ impl Manager {
             return Reply::err(format!("no such unit {name:?}"));
         };
         let was_running = state_of(st) == "running";
+        st.stops += 1;
         let mut killed = Vec::new();
         if let Some(mut child) = st.child.take() {
             if let crate::compose::Source::Bundle { .. } = &st.unit.source {
@@ -493,6 +625,10 @@ impl Manager {
     /// for the Windows units), then kill and reap their VMMs and helpers.
     pub fn stop_all(&self) {
         let mut units = self.units_guard();
+        // A start still waiting on its dependencies gives up.
+        for st in units.values_mut() {
+            st.stops += 1;
+        }
         // Compute addresses while borrowing the map immutably. It is unchanged before `iter_mut`,
         // so both iterators have the same order and `zip` aligns.
         let addrs: Vec<_> = units.values().map(|st| unit_addr(&st.dir)).collect();
@@ -591,6 +727,31 @@ fn console_tail(path: &Path, max: u64) -> std::io::Result<String> {
         .position(|&b| b == b'\n')
         .map_or(&[][..], |nl| &bytes[nl + 1..]);
     Ok(String::from_utf8_lossy(whole).into_owned())
+}
+
+/// Sleep for `duration`, giving up once `cancelled`.
+fn pause(duration: std::time::Duration, cancelled: &dyn Fn() -> bool) -> Result<()> {
+    let until = std::time::Instant::now() + duration;
+    loop {
+        if cancelled() {
+            anyhow::bail!("stopped while waiting for its dependencies");
+        }
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(left.min(std::time::Duration::from_millis(250)));
+    }
+}
+
+/// The exit code a Linux guest's agent logged for its service in `console` (the last one: a
+/// service is started once per boot), if any.
+fn service_exit_code(console: &Path) -> Option<i32> {
+    const MARK: &str = "vk-agent init: service exited (code ";
+    let text = std::fs::read_to_string(console).ok()?;
+    let line = text.lines().rev().find(|l| l.contains(MARK))?;
+    let rest = &line[line.find(MARK)? + MARK.len()..];
+    rest[..rest.find(')')?].parse().ok()
 }
 
 /// Build a unit's agent exec address from its runtime directory.
@@ -866,6 +1027,51 @@ mod tests {
             "an idle connection closed early"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_linux_services_exit_code_is_the_last_one_its_agent_logged() {
+        let dir = scratch_dir("exit-code");
+        let console = dir.join("console.log");
+        assert_eq!(service_exit_code(&console), None, "no console yet");
+        std::fs::write(
+            &console,
+            "06:31:22 [INFO] vk-agent init: service pid 56\n\
+             07:30:30 [INFO] vk-agent init: service exited (code 0)\n\
+             boot again\n\
+             07:31:02 [INFO] vk-agent init: service exited (code 1)\n",
+        )
+        .unwrap();
+        assert_eq!(service_exit_code(&console), Some(1));
+        std::fs::write(&console, "vk-agent init: service exited (code -15)\n").unwrap();
+        assert_eq!(service_exit_code(&console), Some(-15));
+        std::fs::write(&console, "a guest that never ran a service\n").unwrap();
+        assert_eq!(service_exit_code(&console), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_wait_on_a_dependency_never_started_fails_and_a_stop_ends_a_wait() {
+        let mgr = manager_over_two_units();
+        let never = || false;
+        for err in [
+            mgr.wait_healthy("cache", &never).unwrap_err(),
+            mgr.wait_completed("cache", &never).unwrap_err(),
+        ] {
+            assert!(format!("{err:#}").contains("was not started"), "{err:#}");
+        }
+        let stops = |mgr: &Manager| mgr.units_guard()["cache"].stops;
+        let before = stops(&mgr);
+        assert!(mgr.stop("cache").ok);
+        mgr.stop_all();
+        assert_eq!(stops(&mgr), before + 2);
+        let started = std::time::Instant::now();
+        let err = pause(std::time::Duration::from_secs(60), &|| true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("stopped while waiting"),
+            "{err:#}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
     /// A manager over one `build:` unit and one `image:` unit, provisioned as `plan_services`

@@ -285,7 +285,7 @@ fn own_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 /// Run `task` on a dedicated thread with its own runtime: a synchronous caller may be on the
 /// owner's runtime, which must not block on its own futures. Thread creation failure is
 /// returned for the caller to treat as a refusal; panicking would poison the held units lock.
-fn on_own_runtime<T, F, Fut>(task: F) -> std::io::Result<JoinHandle<Result<T>>>
+pub(crate) fn on_own_runtime<T, F, Fut>(task: F) -> std::io::Result<JoinHandle<Result<T>>>
 where
     T: Send + 'static,
     F: FnOnce() -> Fut + Send + 'static,

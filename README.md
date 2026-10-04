@@ -187,8 +187,8 @@ A compose file is `services:` and nothing else (a deprecated `version:` is accep
 ignored). vk parses it strictly: an unknown key anywhere is an error, so a docker `volumes:`
 or `networks:` section is refused rather than skipped, and named volumes are not supported —
 bind a path. A service uses `image:` or `build:`, plus any of `environment`, `env_file`,
-`command`, `entrypoint`, `user`, `hostname`, `depends_on`, `volumes`, `profiles` and the
-`x-virtkit` marker. Every host path is relative to the compose file.
+`command`, `entrypoint`, `user`, `hostname`, `depends_on`, `healthcheck`, `volumes`,
+`profiles` and the `x-virtkit` marker. Every host path is relative to the compose file.
 
 #### Images and builds
 
@@ -233,8 +233,21 @@ newline-separated binds expands into several `volumes:` entries.
 
 #### Start order and profiles
 
-`depends_on` (a list, or a map whose only accepted `condition:` is `service_started`)
-orders starts; there is no readiness wait, so retry a first connection. Services with
+`depends_on` (a list, or a map of `condition:`s) orders starts. `service_started`, the
+default, is start order alone: retry a first connection. `service_healthy` waits until the
+dependency's `healthcheck` passes; `service_completed_successfully` waits until the
+dependency's guest has ended, for a Linux one with its service's exit code 0 (a job). Any other
+condition is refused when the file is read, as is waiting for the health of a service without a
+healthcheck. `restart:` and `required: true` are accepted and ignored; `required: false` is
+refused.
+
+A `healthcheck` runs its `test` in the service's guest: `["CMD", prog, args…]` as is,
+`["CMD-SHELL", "line"]` or a string under `/bin/sh -c` (as the service's `user`) in a Linux
+guest and `cmd /S /C` in a Windows one; `["NONE"]` or `disable: true` declares none. `interval`
+and `timeout` default to 30 s, `retries` to 3 (a zero means the default) and `start_period` to
+none; `start_interval` is ignored. vk probes only for a dependent: once per start of the
+dependency, until it passes or fails `retries` times in a row, the start period running from
+when the dependent starts waiting. Services with
 `profiles:` stay declared but down unless a profile is activated (`--profile NAME`,
 repeatable) or an enabled service depends on them; `vk service up NAME` starts one anyway.
 
