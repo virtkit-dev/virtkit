@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use anyhow::Result;
 use bytes::Bytes;
 use hyper::{Response, StatusCode};
 use tokio::sync::watch;
@@ -23,8 +24,42 @@ use crate::local::{Keep, Listing, Local};
 use crate::server::Hub;
 use crate::store::Role;
 
+/// This machine's VMs and the state local pages keep for them.
+pub(super) struct LocalSite {
+    pub(super) local: Arc<Local>,
+    /// The VMs table, rendered once for every page listing it ([`sse::feed`]).
+    pub(super) vms_feed: watch::Sender<Option<Bytes>>,
+    /// Cached VM views.
+    pub(super) views: ViewCache,
+    /// What `/dev` last read.
+    pub(super) dev_list: super::dev::DevList,
+    /// Pending action confirmations.
+    pub(super) questions: super::actions::Questions,
+}
+
+impl LocalSite {
+    pub(super) fn new(hub: &Hub, local: Arc<Local>) -> Self {
+        LocalSite {
+            vms_feed: feed(hub, &local),
+            local,
+            views: ViewCache::new(VIEWS_FRESH),
+            dev_list: super::dev::DevList::new(),
+            questions: super::actions::Questions::new(),
+        }
+    }
+}
+
+/// Local mode's navigation.
+pub(super) const NAV: &str = "<a href=\"/\">VMs</a> <a href=\"/dev\">dev environments</a> \
+                              <a href=\"/audit\">audit</a>";
+
+/// The page around `main`, with local mode's navigation.
+pub(super) fn layout(title: &str, auth: &Auth, main: &Html) -> Html {
+    pages::frame(title, auth, NAV, main)
+}
+
 /// Start the task that renders the VMs table once for every page listing it.
-pub(super) fn feed(hub: &Hub, local: &Arc<Local>) -> watch::Sender<Option<Bytes>> {
+fn feed(hub: &Hub, local: &Arc<Local>) -> watch::Sender<Option<Bytes>> {
     sse::feed(hub.subscribe(), "vms", render_vms(local.clone()))
 }
 
@@ -33,22 +68,22 @@ fn render_vms(local: Arc<Local>) -> sse::Render {
 }
 
 /// What `/events/<event>` streams, if it is one of local mode's.
-pub(super) fn source(event: &str, ui: &Ui) -> Option<Source> {
+pub(super) fn source(event: &str, hub: &Hub, site: &LocalSite) -> Option<Source> {
     if event == "vms" {
         return Some(Source::Shared {
             name: "vms",
-            feed: ui.vms_feed.subscribe(),
-            render: render_vms(ui.local.clone()),
+            feed: site.vms_feed.subscribe(),
+            render: render_vms(site.local.clone()),
         });
     }
     let id = event
         .strip_prefix("vm/")
         .filter(|id| valid_id(id))?
         .to_string();
-    let local = ui.local.clone();
+    let local = site.local.clone();
     Some(Source::Own {
         name: "vm",
-        changes: ui.hub.subscribe(),
+        changes: hub.subscribe(),
         render: Arc::new(move || {
             Ok(match local.workload(&id) {
                 Some((w, mem)) => vm_detail(&w, mem, &local).into_string(),
@@ -78,22 +113,45 @@ pub(super) fn action_target(path: &str) -> Option<Target> {
 }
 
 /// The page for `path`, if it is one of local mode's.
-pub(super) async fn get(path: &str, auth: &Auth, ui: &Ui) -> Option<Response<Body>> {
+pub(super) async fn get(
+    path: &str,
+    query: Option<&str>,
+    auth: &Auth,
+    ui: &Ui,
+    site: &LocalSite,
+) -> Result<Option<Response<Body>>> {
     if path == "/" {
-        return Some(super::page(list(auth, &ui.local.listing())));
+        return Ok(Some(super::page(list(auth, &site.local.listing()))));
     }
     if path == "/dev" {
-        return Some(super::dev::page(auth, ui).await);
+        return Ok(Some(super::dev::page(auth, ui, site).await));
     }
-    let id = path.strip_prefix("/vm/").filter(|id| valid_id(id))?;
-    let Some((w, mem)) = ui.local.workload(id) else {
-        return Some(super::message(
+    if path == "/audit" {
+        let query = super::decode_form(query.unwrap_or("").as_bytes());
+        let before = super::field(&query, "before").and_then(|b| b.parse().ok());
+        let hub = ui.hub.clone();
+        let rows =
+            super::blocking(move || hub.db.audit_page(None, before, pages::AUDIT_PAGE)).await?;
+        return Ok(Some(super::page(pages::audit(auth, &rows, NAV))));
+    }
+    let Some(id) = path.strip_prefix("/vm/").filter(|id| valid_id(id)) else {
+        return Ok(None);
+    };
+    let Some((w, mem)) = site.local.workload(id) else {
+        return Ok(Some(super::message(
             StatusCode::NOT_FOUND,
             "No such VM is running on this machine.",
-        ));
+        )));
     };
-    let views = ui.views.get(&ui.local, &w).await;
-    Some(super::page(vm(auth, id, &w, mem, &ui.local, &views)))
+    let views = site.views.get(&site.local, &w).await;
+    Ok(Some(super::page(vm(
+        auth,
+        id,
+        &w,
+        mem,
+        &site.local,
+        &views,
+    ))))
 }
 
 /// How long a view of a VM may take to read: a page waits on it.
@@ -363,7 +421,7 @@ fn list(auth: &Auth, listing: &Listing) -> Html {
         .raw("sse-close=\"close\">")
         .html(&vms_table(listing))
         .raw("</div>");
-    pages::layout("VMs", auth, &main)
+    layout("VMs", auth, &main)
 }
 
 /// The VMs as `vk workloads` last listed them, or why there is no list.
@@ -497,7 +555,7 @@ fn vm(auth: &Auth, id: &str, w: &Workload, mem: Option<u64>, local: &Local, view
         .raw("<a href=\"/vm/")
         .text(id)
         .raw("\">reload</a> for newer.</p>");
-    pages::layout(&crate::workloads::owner(w), auth, &main)
+    layout(&crate::workloads::owner(w), auth, &main)
 }
 
 /// What a command printed, made [terminal-safe](Html::output).

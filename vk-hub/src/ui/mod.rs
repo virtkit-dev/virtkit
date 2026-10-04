@@ -87,8 +87,6 @@ const FORM_TIMEOUT: Duration = Duration::from_secs(1);
 /// The web UI's shared state.
 pub struct Ui {
     hub: Arc<Hub>,
-    /// This machine's VMs.
-    local: Arc<Local>,
     /// The UI's origin: what a state-changing request's `Origin` must be.
     origin: String,
     /// The origin without its scheme: what every request's `Host` must be.
@@ -96,34 +94,41 @@ pub struct Ui {
     connections: Arc<Semaphore>,
     /// The live pages' streams open.
     streams: sse::Streams,
-    /// The VMs table, rendered once for every page listing it ([`sse::feed`]).
-    vms_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
-    /// What VM pages last read of their VMs.
-    views: local::ViewCache,
-    /// What `/dev` last read.
-    dev_list: dev::DevList,
-    /// The questions actions asked first, unanswered.
-    questions: actions::Questions,
+    site: Site,
+}
+
+/// What the pages show.
+enum Site {
+    /// `vk-hub local`: this machine's VMs.
+    Local(Box<local::LocalSite>),
 }
 
 impl Ui {
-    /// The UI at `origin`, `http://host[:port]`, showing `local`'s VMs.
-    pub fn new(hub: Arc<Hub>, origin: &str, local: Arc<Local>) -> Self {
+    /// Local mode's UI at `origin`, `http://host[:port]`, showing `local`'s VMs.
+    pub fn local(hub: Arc<Hub>, origin: &str, local: Arc<Local>) -> Self {
+        let site = Site::Local(Box::new(local::LocalSite::new(&hub, local)));
+        Self::with_site(hub, origin, site)
+    }
+
+    fn with_site(hub: Arc<Hub>, origin: &str, site: Site) -> Self {
         let authority = origin
             .split_once("://")
             .map_or(origin, |(_, rest)| rest)
             .to_string();
         Ui {
-            vms_feed: local::feed(&hub, &local),
             hub,
-            local,
             origin: origin.to_string(),
             authority,
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             streams: sse::Streams::new(),
-            views: local::ViewCache::new(local::VIEWS_FRESH),
-            dev_list: dev::DevList::new(),
-            questions: actions::Questions::new(),
+            site,
+        }
+    }
+
+    /// What this UI's pages say of signing in.
+    fn texts(&self) -> &'static Texts {
+        match self.site {
+            Site::Local(_) => &LOCAL_TEXTS,
         }
     }
 }
@@ -232,7 +237,7 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     if !host_is(&req, &ui.authority) {
         return Ok(message(
             StatusCode::MISDIRECTED_REQUEST,
-            "This is not the address the hub's web UI is served at.",
+            ui.texts().misdirected,
         ));
     }
     let path = req.uri().path().to_string();
@@ -243,7 +248,7 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
         return Ok(resp);
     }
     match (method, path.as_str()) {
-        (Method::GET, LOGIN_PATH) => Ok(login_page(&req)),
+        (Method::GET, LOGIN_PATH) => Ok(login_page(&req, ui)),
         (Method::POST, LOGIN_PATH) => login(req, ui).await,
         // Asked for by every browser whatever the page says; there is none.
         (Method::GET, "/favicon.ico") => {
@@ -265,10 +270,12 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
             };
             get(&path, req.uri().query(), &auth, ui).await
         }
-        (Method::POST, _) => match local::action_target(&path) {
-            Some(local::Target::Vm(id)) => actions::vm_action(req, ui, &id).await,
-            Some(local::Target::Dev(name)) => actions::dev_action(req, ui, &name).await,
-            None => Ok(message(StatusCode::NOT_FOUND, "No such action.")),
+        (Method::POST, _) => match &ui.site {
+            Site::Local(site) => match local::action_target(&path) {
+                Some(local::Target::Vm(id)) => actions::vm_action(req, ui, site, &id).await,
+                Some(local::Target::Dev(name)) => actions::dev_action(req, ui, site, &name).await,
+                None => Ok(message(StatusCode::NOT_FOUND, "No such action.")),
+            },
         },
         _ => Ok(message(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -285,10 +292,15 @@ fn signed_out_stream(path: &str, headers: &HeaderMap, ui: &Ui) -> Option<Respons
     if !matches!(session_cookie(headers), Ok(Some(_))) {
         return None;
     }
-    let source = path
-        .strip_prefix("/events/")
-        .and_then(|e| local::source(e, ui))?;
-    Some(sse::signed_out(&source))
+    let source = path.strip_prefix("/events/").and_then(|e| source(e, ui))?;
+    Some(sse::signed_out(&source, ui.texts().sign_in_again))
+}
+
+/// What `/events/<event>` streams, if it is one of this site's.
+fn source(event: &str, ui: &Ui) -> Option<sse::Source> {
+    match &ui.site {
+        Site::Local(site) => local::source(event, &ui.hub, site),
+    }
 }
 
 /// Whether the request names `authority` as its host: its `Host` header under HTTP/1.1, the
@@ -317,33 +329,27 @@ fn from_another_site(headers: &HeaderMap) -> bool {
 
 /// A page: read-only, for any session.
 async fn get(path: &str, query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
-    if path == "/audit" {
-        let query = decode_form(query.unwrap_or("").as_bytes());
-        let before = field(&query, "before").and_then(|b| b.parse().ok());
-        let hub = ui.hub.clone();
-        let rows = blocking(move || hub.db.audit_page(None, before, pages::AUDIT_PAGE)).await?;
-        return Ok(page(pages::audit(auth, &rows)));
+    if let Some(source) = path.strip_prefix("/events/").and_then(|e| source(e, ui)) {
+        return Ok(stream(ui, auth, source));
     }
-    if let Some(source) = path
-        .strip_prefix("/events/")
-        .and_then(|e| local::source(e, ui))
-    {
-        let slot = match ui.streams.take(&store::token_key(&auth.secret)) {
-            Ok(slot) => slot,
-            Err((status, text)) => {
-                let mut resp = message(status, text);
-                // For what reads it; the SSE extension retries on a backoff of its own.
-                resp.headers_mut()
-                    .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
-                return Ok(resp);
-            }
-        };
-        return Ok(sse::stream(ui.hub.clone(), auth, source, slot));
+    let found = match &ui.site {
+        Site::Local(site) => local::get(path, query, auth, ui, site).await?,
+    };
+    Ok(found.unwrap_or_else(|| message(StatusCode::NOT_FOUND, "There is no such page.")))
+}
+
+/// A stream of `source` for `auth`'s page, or the refusal when there are too many.
+fn stream(ui: &Ui, auth: &Auth, source: sse::Source) -> Response<Body> {
+    match ui.streams.take(&store::token_key(&auth.secret)) {
+        Ok(slot) => sse::stream(ui.hub.clone(), auth, source, slot, ui.texts().sign_in_again),
+        Err((status, text)) => {
+            let mut resp = message(status, text);
+            // For what reads it; the SSE extension retries on a backoff of its own.
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            resp
+        }
     }
-    if let Some(resp) = local::get(path, auth, ui).await {
-        return Ok(resp);
-    }
-    Ok(message(StatusCode::NOT_FOUND, "There is no such page."))
 }
 
 /// Whether `token` looks like a sign-in token, before the database is asked.
@@ -356,11 +362,11 @@ fn well_formed_login(token: &str) -> bool {
 /// `GET /login?t=<token>`: a button that posts the token back. Nothing is spent here, so
 /// whatever fetches a link without a person behind it — a mail scanner, a chat's preview, a
 /// browser's prerender — leaves it for the person.
-fn login_page(req: &Request<Incoming>) -> Response<Body> {
+fn login_page(req: &Request<Incoming>, ui: &Ui) -> Response<Body> {
     let query = decode_form(req.uri().query().unwrap_or("").as_bytes());
     let token = field(&query, "t").unwrap_or("");
     if !well_formed_login(token) {
-        return message(StatusCode::FORBIDDEN, NOT_A_LINK);
+        return message(StatusCode::FORBIDDEN, ui.texts().not_a_link);
     }
     page(pages::sign_in(token))
 }
@@ -381,12 +387,12 @@ async fn login(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     };
     let token = field(&form, "t").unwrap_or("").to_string();
     if !well_formed_login(&token) {
-        return Ok(message(StatusCode::FORBIDDEN, NOT_A_LINK));
+        return Ok(message(StatusCode::FORBIDDEN, ui.texts().not_a_link));
     }
     let hub = ui.hub.clone();
     let now = crate::now_secs();
     let Some((secret, session)) = blocking(move || hub.db.redeem_login(&token, now)).await? else {
-        return Ok(message(StatusCode::FORBIDDEN, SPENT_LINK));
+        return Ok(message(StatusCode::FORBIDDEN, ui.texts().spent_link));
     };
     eprintln!("vk-hub: ui: {} signed in", session.principal());
     let mut resp = html_response(StatusCode::OK, pages::signed_in());
@@ -440,7 +446,7 @@ pub struct Auth {
 async fn authenticate(headers: &HeaderMap, ui: &Ui) -> Result<Result<Auth, &'static str>> {
     let secret = match session_cookie(headers) {
         Ok(Some(s)) if s.len() == 64 && vk_hub_proto::from_hex(s).is_some() => s.to_string(),
-        Ok(_) => return Ok(Err(SIGNED_OUT)),
+        Ok(_) => return Ok(Err(ui.texts().signed_out)),
         Err(()) => return Ok(Err(CONFLICTING_COOKIES)),
     };
     let hub = ui.hub.clone();
@@ -453,7 +459,7 @@ async fn authenticate(headers: &HeaderMap, ui: &Ui) -> Result<Result<Auth, &'sta
             csrf,
             secret,
         })
-        .ok_or(SIGNED_OUT))
+        .ok_or(ui.texts().signed_out))
 }
 
 /// The session cookie's value, if the request has one — or `Err` when it has more than one.
@@ -639,13 +645,25 @@ fn message(status: StatusCode, text: &'static str) -> Response<Body> {
     html_response(status, pages::message(text))
 }
 
-const NOT_A_LINK: &str = "This is not a sign-in link. `vk-hub local login` prints one.";
+/// What the pages say that differs between the sites: how to sign in.
+struct Texts {
+    misdirected: &'static str,
+    not_a_link: &'static str,
+    spent_link: &'static str,
+    signed_out: &'static str,
+    /// Markup: how a page whose session ended signs in again.
+    sign_in_again: &'static str,
+}
 
-const SPENT_LINK: &str =
-    "This sign-in link is unknown, used or expired. `vk-hub local login` prints a new one.";
-
-const SIGNED_OUT: &str =
-    "Not signed in. On this machine, `vk-hub local login` prints a link that signs you in.";
+const LOCAL_TEXTS: Texts = Texts {
+    misdirected: "This is not the address the hub's web UI is served at.",
+    not_a_link: "This is not a sign-in link. `vk-hub local login` prints one.",
+    spent_link: "This sign-in link is unknown, used or expired. `vk-hub local login` prints a \
+                 new one.",
+    signed_out: "Not signed in. On this machine, `vk-hub local login` prints a link that signs \
+                 you in.",
+    sign_in_again: "<code>vk-hub local login</code> prints a link to sign in again.",
+};
 
 const CONFLICTING_COOKIES: &str = "Not signed in: this browser sent more than one vk-hub \
      session cookie, which is what a cookie planted by another site on this host looks like. \

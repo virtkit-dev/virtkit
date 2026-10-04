@@ -10,13 +10,13 @@ use crate::store::AuditRow;
 /// Audit lines per page of `/audit`.
 pub const AUDIT_PAGE: usize = 100;
 
-/// The page around `main`: head, stylesheet, navigation, who is signed in.
-pub fn layout(title: &str, auth: &Auth, main: &Html) -> Html {
+/// The page around `main`: head, stylesheet, the site's navigation `nav`, who is signed in.
+pub fn frame(title: &str, auth: &Auth, nav: &'static str, main: &Html) -> Html {
     let mut h = Html::new();
     head(&mut h, title);
-    h.raw("<body><header><nav><a href=\"/\">VMs</a> <a href=\"/dev\">dev environments</a> ")
-        .raw("<a href=\"/audit\">audit</a></nav>")
-        .raw("<form class=\"who\" method=\"post\" action=\"/logout\"><span>")
+    h.raw("<body><header><nav>")
+        .raw(nav)
+        .raw("</nav><form class=\"who\" method=\"post\" action=\"/logout\"><span>")
         .text(auth.session.principal())
         .raw(", until ")
         .text(crate::utc(auth.session.expires_at))
@@ -89,16 +89,19 @@ pub fn signed_in() -> Html {
     h
 }
 
-/// A live region's last fragment, once its session has ended.
-pub fn signed_out_fragment() -> Html {
+/// A live region's last fragment, once its session has ended; `sign_in`, markup of the
+/// site's, says how to sign in again.
+pub fn signed_out_fragment(sign_in: &'static str) -> Html {
     let mut h = Html::new();
     h.raw("<p class=\"message\">Signed out: this page no longer updates. ")
-        .raw("<code>vk-hub local login</code> prints a link to sign in again.</p>");
+        .raw(sign_in)
+        .raw("</p>");
     h
 }
 
-/// `/audit`: a page of the audit log, newest first, with a link to the next.
-pub fn audit(auth: &Auth, rows: &[(u64, AuditRow)]) -> Html {
+/// `/audit`: a page of the audit log, newest first, with a link to the next; `nav` the
+/// site's navigation.
+pub fn audit(auth: &Auth, rows: &[(u64, AuditRow)], nav: &'static str) -> Html {
     let mut main = Html::new();
     main.raw("<h1>Audit</h1>");
     audit_table(&mut main, rows);
@@ -109,7 +112,7 @@ pub fn audit(auth: &Auth, rows: &[(u64, AuditRow)]) -> Html {
             .text(oldest)
             .raw("\">older</a></p>");
     }
-    layout("audit", auth, &main)
+    frame("audit", auth, nav, &main)
 }
 
 fn audit_table(h: &mut Html, rows: &[(u64, AuditRow)]) {

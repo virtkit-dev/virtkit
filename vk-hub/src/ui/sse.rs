@@ -246,13 +246,21 @@ impl Source {
 }
 
 /// A stream for `auth`'s page of `source`, holding `slot` for as long as it lasts.
-pub fn stream(hub: Arc<Hub>, auth: &Auth, source: Source, slot: Slot) -> Response<Body> {
+/// `sign_in` says how to sign in again once the session ends ([`pages::signed_out_fragment`]).
+pub fn stream(
+    hub: Arc<Hub>,
+    auth: &Auth,
+    source: Source,
+    slot: Slot,
+    sign_in: &'static str,
+) -> Response<Body> {
     let (tx, rx) = mpsc::channel(4);
     let session = Session {
         changes: hub.subscribe_sessions(),
         hub,
         secret: auth.secret.clone(),
         expires_at: auth.session.expires_at,
+        sign_in,
     };
     let give_up = GIVE_UP.try_with(Arc::clone).ok();
     debug_assert!(give_up.is_some(), "a stream outside a connection's scope");
@@ -269,8 +277,12 @@ pub fn stream(hub: Arc<Hub>, auth: &Auth, source: Source, slot: Slot) -> Respons
 
 /// What a page's stream is answered with once its session has ended, its cookie still sent:
 /// what an open stream ends with, so that the page stops asking rather than retry.
-pub fn signed_out(source: &Source) -> Response<Body> {
-    let mut body = event(source.name(), &pages::signed_out_fragment().into_string()).to_vec();
+pub fn signed_out(source: &Source, sign_in: &'static str) -> Response<Body> {
+    let mut body = event(
+        source.name(),
+        &pages::signed_out_fragment(sign_in).into_string(),
+    )
+    .to_vec();
     body.extend_from_slice(&event(CLOSE, ""));
     event_stream(Body::Full(Some(Bytes::from(body))))
 }
@@ -292,6 +304,8 @@ struct Session {
     expires_at: u64,
     /// Woken when a session ends.
     changes: watch::Receiver<u64>,
+    /// How to sign in again, for the page once it has ended.
+    sign_in: &'static str,
 }
 
 impl Session {
@@ -341,7 +355,7 @@ async fn run(mut session: Session, source: Source, tx: mpsc::Sender<Bytes>) -> R
     };
     match session.live(false).await {
         Some(true) => {}
-        Some(false) => return end(&tx, name).await,
+        Some(false) => return end(&tx, name, session.sign_in).await,
         None => return Ok(()),
     }
     let mut last_frame = event(name, &first);
@@ -398,7 +412,7 @@ async fn run(mut session: Session, source: Source, tx: mpsc::Sender<Bytes>) -> R
             .await
         {
             Some(true) => {}
-            Some(false) => return end(&tx, name).await,
+            Some(false) => return end(&tx, name, session.sign_in).await,
             None => return Ok(()),
         }
         let frame = match frame.filter(|frame| *frame != last_frame) {
@@ -420,8 +434,17 @@ async fn run(mut session: Session, source: Source, tx: mpsc::Sender<Bytes>) -> R
 
 /// Show the session's end in the page's region, then close the stream for good.
 /// Stop sending if the browser disconnects.
-async fn end(tx: &mpsc::Sender<Bytes>, name: &'static str) -> Result<(), Stalled> {
-    if send(tx, event(name, &pages::signed_out_fragment().into_string())).await? {
+async fn end(
+    tx: &mpsc::Sender<Bytes>,
+    name: &'static str,
+    sign_in: &'static str,
+) -> Result<(), Stalled> {
+    if send(
+        tx,
+        event(name, &pages::signed_out_fragment(sign_in).into_string()),
+    )
+    .await?
+    {
         send(tx, event(CLOSE, "")).await?;
     }
     Ok(())
@@ -497,7 +520,7 @@ mod tests {
         let slot = Streams::new().take("s").unwrap();
         let mut resp = GIVE_UP
             .scope(Arc::new(Notify::new()), async {
-                stream(hub, &auth, source, slot)
+                stream(hub, &auth, source, slot, "")
             })
             .await;
         let Body::Stream(rx) = resp.body_mut() else {
@@ -529,7 +552,9 @@ mod tests {
         let give_up = Arc::new(Notify::new());
         let slot = Streams::new().take("s").unwrap();
         let resp = GIVE_UP
-            .scope(give_up.clone(), async { stream(hub, &auth, source, slot) })
+            .scope(give_up.clone(), async {
+                stream(hub, &auth, source, slot, "")
+            })
             .await;
         tokio::time::timeout(Duration::from_secs(30), give_up.notified())
             .await

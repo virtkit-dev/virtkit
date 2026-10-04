@@ -45,8 +45,9 @@ async fn start_with_vk(
     ));
     let logs = vk.with_file_name("actions");
     let local = Arc::new(Local::new(vk, logs));
-    let mut ui = Ui::new(hub.clone(), &origin, local.clone());
-    ui.views = local::ViewCache::new(fresh);
+    let mut ui = Ui::local(hub.clone(), &origin, local.clone());
+    let Site::Local(site) = &mut ui.site;
+    site.views = local::ViewCache::new(fresh);
     tokio::spawn(serve(listener, Arc::new(ui)));
     (addr, hub, origin, local)
 }

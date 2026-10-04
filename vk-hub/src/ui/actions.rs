@@ -28,6 +28,7 @@ use vk_hub_proto::{Workload, WorkloadKind};
 
 use super::dev::{DevRow, dev_name};
 use super::html::Html;
+use super::local::LocalSite;
 use super::pages::{self, csrf_field};
 use super::{Auth, Body, Ui};
 use crate::local::{Action, NotStarted};
@@ -93,13 +94,18 @@ fn vm_about(w: &Workload) -> String {
 }
 
 /// `POST /vm/<id>/action`.
-pub(super) async fn vm_action(req: Request<Incoming>, ui: &Ui, id: &str) -> Result<Response<Body>> {
+pub(super) async fn vm_action(
+    req: Request<Incoming>,
+    ui: &Ui,
+    site: &LocalSite,
+    id: &str,
+) -> Result<Response<Body>> {
     let htmx = req.headers().contains_key("hx-request");
     let (auth, form) = match super::check_post(req, ui, Role::Operator).await? {
         Ok(checked) => checked,
         Err((status, text)) => return Ok(refused(htmx, status, text)),
     };
-    let Some((w, _)) = ui.local.workload(id) else {
+    let Some((w, _)) = site.local.workload(id) else {
         return Ok(refused(
             htmx,
             StatusCode::NOT_FOUND,
@@ -128,9 +134,9 @@ pub(super) async fn vm_action(req: Request<Incoming>, ui: &Ui, id: &str) -> Resu
         asked: vec![("pid", or_dash(w.pid)), ("started", or_dash(w.started_at))],
     };
     if super::field(&form, "confirm") != Some("yes") {
-        return confirm(ui, htmx, &auth, &ask);
+        return confirm(site, htmx, &auth, &ask);
     }
-    if let Err(why) = answered(ui, &auth, &form, &ask) {
+    if let Err(why) = answered(site, &auth, &form, &ask) {
         return Ok(refused(htmx, StatusCode::CONFLICT, why));
     }
     let act = Act {
@@ -139,7 +145,7 @@ pub(super) async fn vm_action(req: Request<Incoming>, ui: &Ui, id: &str) -> Resu
         args,
         timeout: STOP_TIMEOUT,
     };
-    run(ui, htmx, &auth, act, &back, true).await
+    run(ui, site, htmx, &auth, act, &back, true).await
 }
 
 /// The actions `/dev` offers `row`, as `(op, label)`.
@@ -200,6 +206,7 @@ fn dev_command(row: &DevRow, op: &str) -> Option<(Vec<OsString>, Duration)> {
 pub(super) async fn dev_action(
     req: Request<Incoming>,
     ui: &Ui,
+    site: &LocalSite,
     name: &str,
 ) -> Result<Response<Body>> {
     let htmx = req.headers().contains_key("hx-request");
@@ -210,7 +217,10 @@ pub(super) async fn dev_action(
     let op = super::field(&form, "op").unwrap_or("").to_string();
     // Read again, so a start goes to its recorded workspace and a removal only to one that is
     // still stale.
-    let rows = ui.dev_list.get(&ui.local, &ui.hub, Duration::ZERO).await;
+    let rows = site
+        .dev_list
+        .get(&site.local, &ui.hub, Duration::ZERO)
+        .await;
     let row = match &*rows {
         Ok(rows) => rows.iter().find(|r| r.name == name),
         Err(why) => {
@@ -255,9 +265,9 @@ pub(super) async fn dev_action(
             asked: vec![("booted", or_dash(row.booted_secs))],
         };
         if super::field(&form, "confirm") != Some("yes") {
-            return confirm(ui, htmx, &auth, &ask);
+            return confirm(site, htmx, &auth, &ask);
         }
-        if let Err(why) = answered(ui, &auth, &form, &ask) {
+        if let Err(why) = answered(site, &auth, &form, &ask) {
             return Ok(refused(htmx, StatusCode::CONFLICT, why));
         }
     }
@@ -267,7 +277,7 @@ pub(super) async fn dev_action(
         args,
         timeout,
     };
-    run(ui, htmx, &auth, act, "/dev", false).await
+    run(ui, site, htmx, &auth, act, "/dev", false).await
 }
 
 /// A figure as a question's hidden field carries it: `-` for none.
@@ -290,6 +300,7 @@ struct Act {
 /// and once reloaded otherwise.
 async fn run(
     ui: &Ui,
+    site: &LocalSite,
     htmx: bool,
     auth: &Auth,
     act: Act,
@@ -297,7 +308,7 @@ async fn run(
     live: bool,
 ) -> Result<Response<Body>> {
     let principal = auth.session.principal();
-    let started = ui
+    let started = site
         .local
         .start(
             &ui.hub,
@@ -421,13 +432,13 @@ impl Questions {
 /// Whether `form` answers `ask`, asked of this session, with what it was asked about as it is
 /// now.
 fn answered(
-    ui: &Ui,
+    site: &LocalSite,
     auth: &Auth,
     form: &[(String, String)],
     ask: &Ask,
 ) -> Result<(), &'static str> {
     let q = super::field(form, "nonce")
-        .and_then(|nonce| ui.questions.answer(nonce, &auth.csrf, &ask.path, &ask.op))
+        .and_then(|nonce| site.questions.answer(nonce, &auth.csrf, &ask.path, &ask.op))
         .ok_or("Refused: this was answered already, or asked too long ago; ask again.")?;
     let posted = ask
         .asked
@@ -441,8 +452,8 @@ fn answered(
 
 /// The question an action that cannot be taken back asks first, in the flash's place — or,
 /// for a plain form, as a page of its own — with a form that answers it once.
-fn confirm(ui: &Ui, htmx: bool, auth: &Auth, ask: &Ask) -> Result<Response<Body>> {
-    let nonce = ui.questions.ask(Question {
+fn confirm(site: &LocalSite, htmx: bool, auth: &Auth, ask: &Ask) -> Result<Response<Body>> {
+    let nonce = site.questions.ask(Question {
         session: auth.csrf.clone(),
         path: ask.path.clone(),
         op: ask.op.clone(),
@@ -490,7 +501,7 @@ fn confirm(ui: &Ui, htmx: bool, auth: &Auth, ask: &Ask) -> Result<Response<Body>
         .raw("<p><a href=\"")
         .text(&ask.back)
         .raw("\">cancel</a></p>");
-    Ok(super::page(pages::layout("confirm", auth, &main)))
+    Ok(super::page(super::local::layout("confirm", auth, &main)))
 }
 
 /// A refused action: for htmx, the line saying why, swapped in on its own.
