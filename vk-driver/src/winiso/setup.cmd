@@ -8,6 +8,7 @@ for /l %%i in (1,1,60) do (
   if not defined SRC ping -n 2 127.0.0.1 >nul
 )
 if not defined SRC (echo vk: no install medium found & goto failed)
+@LABCONFIG@
 X:\sources\setup.exe /unattend:X:\vk\autounattend.xml /installfrom:%SRC%
 wpeutil shutdown
 exit /b 0
