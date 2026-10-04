@@ -282,37 +282,30 @@ async fn ui_cmd(client: admin::Client, cmd: LocalCmd) -> Result<()> {
         }
         LocalCmd::Sessions => {
             let sessions = tokio::task::spawn_blocking(move || client.ui_sessions()).await??;
-            print!("{}", render_sessions(&sessions));
+            let now = now_secs();
+            for s in sessions {
+                println!(
+                    "{}  {:<8}  signed in {}  expires in {}  link from {}",
+                    s.id,
+                    s.role.name(),
+                    utc(s.created_at),
+                    human_duration(rounded(s.expires_at.saturating_sub(now))),
+                    s.issued_by
+                );
+            }
         }
-        LocalCmd::Logout { id, all } => {
-            let id = if all { None } else { id };
+        LocalCmd::Logout { id, all: _ } => {
+            // `--all` is `id` absent: clap requires one or the other.
+            let which = id.clone();
             let ended =
-                tokio::task::spawn_blocking(move || client.ui_logout(id.as_deref())).await??;
-            eprintln!("vk-hub: ended {ended} session(s)");
+                tokio::task::spawn_blocking(move || client.ui_logout(which.as_deref())).await??;
+            match (id, ended) {
+                (Some(id), 0) => bail!("there is no web UI session {id}"),
+                _ => eprintln!("vk-hub: ended {ended} web UI session(s)"),
+            }
         }
     }
     Ok(())
-}
-
-fn render_sessions(sessions: &[store::UiSession]) -> String {
-    if sessions.is_empty() {
-        return "no open sessions\n".to_string();
-    }
-    let mut out = format!(
-        "{:<14} {:<9} {:<21} {:<21} ISSUED BY\n",
-        "ID", "ROLE", "SINCE", "UNTIL"
-    );
-    for s in sessions {
-        out.push_str(&format!(
-            "{:<14} {:<9} {:<21} {:<21} {}\n",
-            s.id,
-            s.role.name(),
-            utc(s.created_at),
-            utc(s.expires_at),
-            s.issued_by
-        ));
-    }
-    out
 }
 
 /// The running fleet hub's admin socket.
@@ -541,7 +534,11 @@ pub(crate) fn utc(secs: u64) -> String {
 
 /// How long before `now` the instant `then` was, rounded down to the unit it prints in.
 pub(crate) fn ago(now: u64, then: u64) -> Duration {
-    let s = now.saturating_sub(then);
+    rounded(now.saturating_sub(then))
+}
+
+/// `s` seconds rounded down to the unit [`human_duration`] prints them in.
+fn rounded(s: u64) -> Duration {
     Duration::from_secs(match s {
         0..60 => s,
         60..3600 => s / 60 * 60,

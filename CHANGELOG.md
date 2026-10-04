@@ -27,6 +27,11 @@ All notable changes to virtkit will be documented in this file.
   or name — and the nodes table counts them. `[node] workload_mem_secs` sets how often their
   memory is measured.
 
+### Changed
+
+- `vk-hub local sessions` prints one line per session, and nothing when there are none;
+  `vk-hub local logout <id>` fails when there is no such session.
+
 ### Fixed
 
 - `vk-registry` now announces connection closure when refusing a request with a body,
