@@ -10,7 +10,9 @@
 //!
 //! As Docker does on Windows, a shell-form `RUN` is the program line `<SHELL> <text>` (by
 //! default `cmd /S /C <text>`), and runs as qemu-ga does, as SYSTEM. Its exit code 3010 or 1641
-//! asks for a restart (`--reboot=auto`); `--reboot=always|never` overrides.
+//! asks for a restart (`--reboot=auto`); `--reboot=always|never` overrides. A step has no
+//! network unless its `RUN` says `--network=default`. `CMD` is the image's provisioning, which
+//! the bundle records; `ENTRYPOINT` is refused.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -70,12 +72,14 @@ pub(crate) struct Options {
     pub out: PathBuf,
     pub cpus: u32,
     pub mem: String,
+    /// `--build-net none`: refuse `RUN --network=default`.
+    pub no_network: bool,
 }
 
 /// A stage as it builds: its current layer and what its later `RUN`s inherit. A bundle
 /// records it (`layer.json`) so another Dockerfile can build `FROM` the bundle: its key, shell,
-/// `ENV` and `WORKDIR`; the disk is the cache's for that key, and the password is the bundle's
-/// `admin-password`. The bundle builds only against the cache that made it.
+/// `ENV`, `WORKDIR` and `CMD`; the disk is the cache's for that key, and the password is the
+/// bundle's `admin-password`. The bundle builds only against the cache that made it.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct Layer {
     #[serde(skip)]
@@ -86,6 +90,10 @@ struct Layer {
     shell: Vec<String>,
     env: Vec<(String, String)>,
     workdir: Option<String>,
+    /// The image's `CMD`, as the Windows command line a service runs at each start (its
+    /// provisioning: hostname, address, domain join).
+    #[serde(default)]
+    provision: Option<String>,
     /// Variables set by `ENV` since the last step, still to be made machine-wide.
     #[serde(skip)]
     unsaved_env: Vec<(String, String)>,
@@ -180,7 +188,7 @@ pub(crate) fn build(opts: &Options) -> Result<()> {
 }
 
 /// Refuse what `stage` asks for that a Windows build does not do, before anything boots.
-fn check_stage(stage: &Stage, context: &Path) -> Result<()> {
+fn check_stage(stage: &Stage, context: &Path, no_network: bool) -> Result<()> {
     let from = &stage.from;
     let winiso =
         crate::winiso::Source::of_stage(&from.image, &from.extra_flags, context)?.is_some();
@@ -208,6 +216,9 @@ fn check_stage(stage: &Stage, context: &Path) -> Result<()> {
         match instruction {
             Instruction::Run(run) => {
                 reboot_mode(run)?;
+                if network_mode(run)? && no_network {
+                    bail!("RUN --network=default: --build-net none forbids it");
+                }
             }
             Instruction::Copy(copy) => {
                 if copy.from.is_some() {
@@ -237,6 +248,9 @@ fn check_stage(stage: &Stage, context: &Path) -> Result<()> {
             }
             Instruction::User(user) => {
                 bail!("USER {user}: a Windows build runs every step as SYSTEM, through qemu-ga")
+            }
+            Instruction::Entrypoint(_) => {
+                bail!("ENTRYPOINT: a Windows image provisions with CMD alone")
             }
             _ => {}
         }
@@ -275,8 +289,8 @@ fn shell(args: &str) -> Result<Vec<String>> {
 
 /// A `RUN`'s `--reboot` (`auto` by default), refusing the flags a Windows build does not take.
 fn reboot_mode(run: &parser::Run) -> Result<&str> {
-    if !run.mounts.is_empty() || run.network.is_some() || run.security.is_some() {
-        bail!("RUN --mount, --network and --security do not apply to a Windows build");
+    if !run.mounts.is_empty() || run.security.is_some() {
+        bail!("RUN --mount and --security do not apply to a Windows build");
     }
     if let Some((name, _)) = run.extra_flags.iter().find(|(k, _)| k != "reboot") {
         bail!("RUN --{name}: a Windows build takes --reboot only");
@@ -287,6 +301,15 @@ fn reboot_mode(run: &parser::Run) -> Result<&str> {
     match flag(&run.extra_flags, "reboot").unwrap_or("auto") {
         reboot @ ("auto" | "always" | "never") => Ok(reboot),
         reboot => bail!("RUN --reboot={reboot}: expected auto, always or never"),
+    }
+}
+
+/// Whether a `RUN` has a network: none unless it says `--network=default`.
+fn network_mode(run: &parser::Run) -> Result<bool> {
+    match run.network.as_deref() {
+        None | Some("none") => Ok(false),
+        Some("default") => Ok(true),
+        Some(other) => bail!("RUN --network={other}: expected default or none"),
     }
 }
 
@@ -312,7 +335,7 @@ fn build_stage(
     }
     let stage = &stages[index];
     let label = stage.label(index);
-    check_stage(stage, &opts.context).with_context(|| format!("stage {label}"))?;
+    check_stage(stage, &opts.context, opts.no_network).with_context(|| format!("stage {label}"))?;
     let (cpus, mem) = guest_size(stage, opts);
     let bundle = opts.context.join(&stage.from.image);
     let mut layer = if let Some(source) =
@@ -330,6 +353,7 @@ fn build_stage(
             shell: DEFAULT_SHELL.iter().map(|s| s.to_string()).collect(),
             env: Vec::new(),
             workdir: None,
+            provision: None,
             unsaved_env: Vec::new(),
             unmade_workdir: false,
             generalized: false,
@@ -370,6 +394,7 @@ fn build_stage(
             Instruction::Other { name, args } if name == "SHELL" => layer.shell = shell(args)?,
             Instruction::Run(run) => run_step(&mut layer, run, &what, &steps)?,
             Instruction::Copy(copy) => copy_step(&mut layer, copy, &what, &opts.context, &steps)?,
+            Instruction::Cmd(cmd) => layer.provision = provision(&layer.shell, cmd),
             // Recorded by the image's run config in a later step; nothing to build.
             _ => {}
         }
@@ -386,13 +411,14 @@ fn build_stage(
             &mut layer,
             &format!("GENERALIZE\0{answer}"),
             &steps,
+            false,
             |ga, _, vm| generalize(ga, &answer, vm),
         )?;
         layer.generalized = true;
     } else if !layer.unsaved_env.is_empty() || layer.unmade_workdir {
         // As Docker keeps a stage's last ENV and WORKDIR in its image.
         eprintln!("virtkit: [{label}] saving ENV and WORKDIR");
-        step(&mut layer, "SAVE", &steps, |_, _, _| Ok(()))?;
+        step(&mut layer, "SAVE", &steps, false, |_, _, _| Ok(()))?;
     }
     built.insert(index, layer.clone());
     Ok(layer)
@@ -520,13 +546,11 @@ struct Steps<'a> {
 
 fn run_step(layer: &mut Layer, run: &parser::Run, what: &str, steps: &Steps) -> Result<()> {
     let reboot = reboot_mode(run)?;
+    let network = network_mode(run)?;
     let line = command_line(&layer.shell, &run.cmd);
     eprintln!("virtkit: {what} RUN {}", first_line(&line));
-    let material = format!(
-        "RUN\0{line}\0{reboot}\0{:?}\0{:?}",
-        layer.env, layer.workdir
-    );
-    step(layer, &material, steps, |ga, l, vm| {
+    let material = run_material(layer, &line, reboot, network);
+    step(layer, &material, steps, network, |ga, l, vm| {
         let code = crate::winexec::exec_command_line(
             ga,
             &line,
@@ -546,6 +570,14 @@ fn run_step(layer: &mut Layer, run: &parser::Run, what: &str, steps: &Steps) -> 
     })
 }
 
+/// A `RUN` step's material: its command line, flags, and the `ENV` and `WORKDIR` it runs with.
+fn run_material(layer: &Layer, line: &str, reboot: &str, network: bool) -> String {
+    format!(
+        "RUN\0{line}\0{reboot}\0{network}\0{:?}\0{:?}",
+        layer.env, layer.workdir
+    )
+}
+
 fn copy_step(
     layer: &mut Layer,
     copy: &parser::Copy,
@@ -559,7 +591,7 @@ fn copy_step(
         copy.sources.join(" "),
         copy.dest
     );
-    step(layer, &material, steps, |ga, _, _| {
+    step(layer, &material, steps, false, |ga, _, _| {
         make_dirs(ga, targets.iter().map(|(t, _)| t.as_str()))?;
         for (target, path) in &targets {
             let file =
@@ -583,6 +615,12 @@ pub(crate) fn command_line(shell: &[String], cmd: &Cmdline) -> String {
         Cmdline::Shell(text) => format!("{} {text}", quoted(shell)),
         Cmdline::Exec(argv) => quoted(argv),
     }
+}
+
+/// The provisioning a `CMD` records: its command line, or none for `CMD []`, which clears it
+/// as in Docker.
+fn provision(shell: &[String], cmd: &Cmdline) -> Option<String> {
+    Some(command_line(shell, cmd)).filter(|line| !line.is_empty())
 }
 
 fn first_line(s: &str) -> &str {
@@ -798,12 +836,13 @@ fn step_key(layer: &Layer, material: &str) -> String {
 }
 
 /// Make the layer `material` names on top of `layer`, or take it from the cache: boot the guest
-/// on an overlay, make the variables `ENV` set and the directory `WORKDIR` named since the last
-/// step, apply `act`, and power off.
+/// on an overlay, with a `network` or none, make the variables `ENV` set and the directory
+/// `WORKDIR` named since the last step, apply `act`, and power off.
 fn step(
     layer: &mut Layer,
     material: &str,
     steps: &Steps,
+    network: bool,
     act: impl FnOnce(&mut Client, &Layer, &mut crate::uefi::Guest) -> Result<()>,
 ) -> Result<()> {
     let key = step_key(layer, material);
@@ -818,7 +857,7 @@ fn step(
         let disk = tmp.join("disk.qcow2");
         crate::qcow2::create_overlay(&disk, &layer.disk)?;
         let started = Instant::now();
-        if let Err(e) = make_step(layer, &work, &disk, steps, act) {
+        if let Err(e) = make_step(layer, &work, &disk, steps, network, act) {
             // The step's logs stay for whoever reads the error; its disk is no use to them.
             let _ = std::fs::remove_file(&disk);
             return Err(e.context(format!("the step's logs are in {}", work.display())));
@@ -855,21 +894,57 @@ fn clear_attempts(layers: &Path, key: &str) {
     }
 }
 
-/// [`step`]'s guest: boot `disk` with `work` as its run directory, make the variables `ENV`
-/// set and the directory `WORKDIR` named since the last step, apply `act`, and power off.
+/// [`step`]'s guest: boot `disk` with `work` as its run directory and, given `network`, on a
+/// switch of its own as `vk run --net` has; make the variables `ENV` set and the directory
+/// `WORKDIR` named since the last step, apply `act`, and power off.
 fn make_step(
     layer: &Layer,
     work: &Path,
     disk: &Path,
     steps: &Steps,
+    network: bool,
     act: impl FnOnce(&mut Client, &Layer, &mut crate::uefi::Guest) -> Result<()>,
 ) -> Result<()> {
+    // Declared before the guest, so it outlives it.
+    let mut switch = SwitchGuard(None);
+    let mut nics = Vec::new();
+    if network {
+        let vsock = work.join("vsock.sock");
+        let spawn = crate::run::spawn_vm_switch(
+            &vsock,
+            work,
+            crate::run::NET_VSOCK_PORT,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            false,
+            None,
+            crate::prio::Prio::Normal,
+        );
+        let (child, attach) = match tokio::runtime::Handle::try_current() {
+            Ok(rt) => rt.block_on(spawn),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("starting a runtime to spawn the step's switch")?
+                .block_on(spawn),
+        }?;
+        switch.0 = Some(child);
+        nics = attach.nics;
+    }
     let mut vm = crate::uefi::Guest::boot(
         work,
         "vk-build",
         vec![Disk::overlay(disk.to_path_buf())],
         steps.cpus,
         steps.mem,
+        nics,
     )?;
     let mut ga = setup_complete(&mut vm)?;
     if layer.generalized {
@@ -889,43 +964,19 @@ fn make_step(
     Ok(())
 }
 
-/// Wait until Windows has finished setting itself up — on the first boot of a generalized
-/// image, specialize and OOBE restart it after its agent is already up — and return a
-/// connection to its qemu-ga.
+/// [`crate::uefi::wait_started`] for a step's guest `vm`, within [`AGENT_TIMEOUT`].
 fn setup_complete(vm: &mut crate::uefi::Guest) -> Result<Client> {
-    const STATE: &str =
-        r#"reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State" /v ImageState"#;
-    let deadline = Instant::now() + AGENT_TIMEOUT;
-    loop {
-        if !vm.running() {
-            bail!(
-                "the guest powered off while starting; see {}",
-                vm.console().display()
-            );
-        }
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            bail!(
-                "Windows did not finish starting within {}s; see {}",
-                AGENT_TIMEOUT.as_secs(),
-                vm.console().display()
-            );
-        }
-        let Ok(mut ga) = Client::connect(&vm.agent_socket(), left) else {
-            std::thread::sleep(Duration::from_secs(1));
-            continue;
-        };
-        let mut out = Vec::new();
-        match crate::winexec::exec_command_line(&mut ga, STATE, &[], None, false, &mut out) {
-            // Setup done, or no such key (reg exits 1): an image past its first boot. Anything
-            // else, an empty answer included, is a guest still on its way, whose restart out
-            // of OOBE would kill the step's command.
-            Ok(0) if String::from_utf8_lossy(&out).contains("IMAGE_STATE_COMPLETE") => {
-                return Ok(ga);
-            }
-            Ok(1) => return Ok(ga),
-            // Still in specialize or OOBE, or restarting out of them.
-            Ok(_) | Err(_) => std::thread::sleep(Duration::from_secs(5)),
+    let (socket, console) = (vm.agent_socket(), vm.console());
+    crate::uefi::wait_started(&socket, &console, AGENT_TIMEOUT, &mut || vm.running())
+}
+
+/// A step's switch, stopped however the step ends.
+struct SwitchGuard(Option<std::process::Child>);
+
+impl Drop for SwitchGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.take() {
+            crate::run::stop_switch(child);
         }
     }
 }
@@ -999,7 +1050,7 @@ mod tests {
         let stages = parsed(text);
         format!(
             "{:#}",
-            check_stage(&stages[0], Path::new("/ctx")).unwrap_err()
+            check_stage(&stages[0], Path::new("/ctx"), false).unwrap_err()
         )
     }
 
@@ -1014,6 +1065,7 @@ mod tests {
             shell: DEFAULT_SHELL.iter().map(|s| s.to_string()).collect(),
             env: Vec::new(),
             workdir: None,
+            provision: None,
             unsaved_env: Vec::new(),
             unmade_workdir: false,
             generalized: false,
@@ -1065,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn run_takes_reboot_only() {
+    fn run_takes_reboot_and_network_only() {
         let reboot = |text: &str| {
             let stages = parsed(&format!("FROM x\n{text}\n"));
             let Instruction::Run(run) = &stages[0].body[0] else {
@@ -1079,8 +1131,18 @@ mod tests {
         assert!(reboot("RUN --reboot=never --reboot=always a").is_err());
         assert!(reboot("RUN --timeout=5m a").is_err());
         assert!(reboot("RUN --mount=type=cache,target=/c a").is_err());
-        assert!(reboot("RUN --network=none a").is_err());
         assert!(reboot("RUN --security=insecure a").is_err());
+        let network = |text: &str| {
+            let stages = parsed(&format!("FROM x\n{text}\n"));
+            let Instruction::Run(run) = &stages[0].body[0] else {
+                unreachable!()
+            };
+            network_mode(run)
+        };
+        assert!(!network("RUN a").unwrap());
+        assert!(!network("RUN --network=none a").unwrap());
+        assert!(network("RUN --network=default --reboot=never a").unwrap());
+        assert!(network("RUN --network=host a").is_err());
     }
 
     #[test]
@@ -1107,7 +1169,8 @@ mod tests {
             ("ENV P=$PATH\n", "variable substitution"),
             ("WORKDIR $HOME\n", "variable substitution"),
             ("SHELL []\n", "non-empty JSON array"),
-            ("RUN --network=host a\n", "--network"),
+            ("RUN --network=host a\n", "--network=host"),
+            ("ENTRYPOINT [\"a\"]\n", "provisions with CMD alone"),
         ];
         for (body, want) in refused {
             let err = refusal(&format!("{WINISO}{body}"));
@@ -1126,7 +1189,7 @@ mod tests {
         let err = refusal("# vk: disk=60G\nFROM base\n");
         assert!(err.contains("a winiso: stage's install only"), "{err}");
         let sized = parsed(&format!("# vk: disk=60G generalize=on\n{WINISO}"));
-        check_stage(&sized[0], Path::new("/ctx")).unwrap();
+        check_stage(&sized[0], Path::new("/ctx"), false).unwrap();
         assert_eq!(disk_size("60G").unwrap(), 60 << 30);
         let err = refusal("FROM base --drivers=x\n");
         assert!(
@@ -1137,7 +1200,17 @@ mod tests {
             "{WINISO}ENV A=1 B=cost$\nWORKDIR C:/app\nSHELL [\"powershell\", \"-Command\"]\n\
              RUN --reboot=always a\nCOPY a b C:/app/\nLABEL x=y\n"
         ));
-        check_stage(&ok[0], Path::new("/ctx")).unwrap();
+        check_stage(&ok[0], Path::new("/ctx"), false).unwrap();
+        // --build-net none leaves a step no network to ask for.
+        let networked = parsed(&format!("{WINISO}RUN --network=default a\n"));
+        check_stage(&networked[0], Path::new("/ctx"), false).unwrap();
+        let err = check_stage(&networked[0], Path::new("/ctx"), true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("--build-net none forbids it"),
+            "{err:#}"
+        );
+        let offline = parsed(&format!("{WINISO}RUN --network=none a\nRUN a\n"));
+        check_stage(&offline[0], Path::new("/ctx"), true).unwrap();
     }
 
     #[test]
@@ -1151,6 +1224,28 @@ mod tests {
             command_line(&shell, &Cmdline::Exec(vec!["a b".into(), "c".into()])),
             "\"a b\" c"
         );
+    }
+
+    #[test]
+    fn cmd_is_recorded_as_a_command_line_and_cmd_empty_clears_it() {
+        let cmd = |text: &str| {
+            let stages = parsed(&format!("FROM x\n{text}\n"));
+            let Instruction::Cmd(cmd) = &stages[0].body[0] else {
+                unreachable!()
+            };
+            cmd.clone()
+        };
+        let powershell = vec!["powershell".to_string(), "-Command".to_string()];
+        assert_eq!(
+            provision(&powershell, &cmd("CMD a b")).as_deref(),
+            Some("powershell -Command a b")
+        );
+        // MSVCRT quoting: a blank quotes the argument, a quote is escaped.
+        assert_eq!(
+            provision(&powershell, &cmd(r#"CMD ["setup.cmd", "a \"b\" c"]"#)).as_deref(),
+            Some(r#"setup.cmd "a \"b\" c""#)
+        );
+        assert_eq!(provision(&powershell, &cmd("CMD []")), None);
     }
 
     #[test]
@@ -1218,6 +1313,11 @@ mod tests {
         assert_eq!(key, step_key(&workdir, "COPY\0x"));
         workdir.unmade_workdir = true;
         assert_ne!(key, step_key(&workdir, "COPY\0x"));
+        // Network access changes the step's cache material.
+        assert_ne!(
+            run_material(&base, "a", "auto", true),
+            run_material(&base, "a", "auto", false)
+        );
     }
 
     #[test]
@@ -1330,6 +1430,7 @@ mod tests {
         built.env = vec![("A".into(), "1".into())];
         built.workdir = Some("C:\\app".into());
         built.generalized = true;
+        built.provision = Some("cmd /S /C setup.cmd".into());
         std::fs::create_dir_all(cache.join("layers").join(&key)).unwrap();
         std::fs::write(&built.disk, vec![0; 1 << 20]).unwrap();
         write_bundle(&built, 2, "4G", &bundle).unwrap();
@@ -1347,6 +1448,7 @@ mod tests {
         assert_eq!(loaded.disk, step.join("disk.qcow2"));
         assert_eq!(loaded.password, "secret");
         assert!(loaded.generalized);
+        assert_eq!(loaded.provision, built.provision);
         // A step on it keys as one on the layer the bundle recorded.
         assert_eq!(step_key(&loaded, "RUN\0x"), step_key(&built, "RUN\0x"));
         assert_eq!((loaded.env, loaded.workdir), (built.env, built.workdir));
@@ -1388,6 +1490,10 @@ mod tests {
         let loaded = bundle_layer(&bundle, &cache).unwrap();
         assert_eq!(loaded.disk, settled.join("disk.qcow2"));
         assert_eq!(loaded.password, "pw");
+        // Records predating CMD have no provisioning.
+        record.as_object_mut().unwrap().remove("provision");
+        std::fs::write(bundle.join(LAYER_RECORD), record.to_string()).unwrap();
+        assert_eq!(bundle_layer(&bundle, &cache).unwrap().provision, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
