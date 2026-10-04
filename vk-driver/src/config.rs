@@ -60,6 +60,10 @@ pub struct Config {
     /// Which memory node each VM this host boots is placed on; see [`Numa`]. On by default,
     /// and a no-op on the single-node hosts most machines are.
     pub numa: Numa,
+    /// What `vk node` declares about this host to a fleet hub; see [`Node`]. `vk config`
+    /// omits it while untouched.
+    #[serde(skip_serializing_if = "Node::is_default")]
+    pub node: Node,
     /// The GitLab custom executor: read by `vk gitlab
     /// config|prepare|run|cleanup|usage|supervise`, and — each for the subset it needs —
     /// by `vk gc` (the checkout-cache settings) and `vk tune` (the VM template and
@@ -258,6 +262,25 @@ pub enum NumaMode {
     /// larger than a node, or one where the per-node accounting cannot be trusted because
     /// something outside virtkit is taking the memory.
     Interleave,
+}
+
+/// `[node]` — what `vk node` tells a fleet hub about this host that it cannot measure. Read
+/// by `vk node` only.
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Node {
+    /// How fast the filesystem holding the job dirs (`<state_dir>/jobs`) is: `"fast"` or
+    /// `"slow"`. Declared rather than measured, so a busy moment never changes what the node
+    /// reports. Unset: not declared.
+    pub jobs_speed: Option<vk_hub_proto::SpeedClass>,
+    /// The same for the host-checkout root ([`Config::checkout_root`]).
+    pub checkouts_speed: Option<vk_hub_proto::SpeedClass>,
+}
+
+impl Node {
+    fn is_default(&self) -> bool {
+        *self == Node::default()
+    }
 }
 
 /// Host credentials forwarded into job VMs. The SSH agent is relayed over a vsock
@@ -1114,6 +1137,22 @@ mod tests {
             cfg.executor.tools_dir.as_deref(),
             Some(Path::new("/usr/local/lib/vk/ci-tools"))
         );
+    }
+
+    #[test]
+    fn node_speed_classes_parse_and_an_untouched_node_is_not_printed() {
+        let cfg: Config =
+            toml::from_str("[node]\njobs_speed = \"slow\"\ncheckouts_speed = \"fast\"\n").unwrap();
+        assert_eq!(cfg.node.jobs_speed, Some(vk_hub_proto::SpeedClass::Slow));
+        assert_eq!(
+            cfg.node.checkouts_speed,
+            Some(vk_hub_proto::SpeedClass::Fast)
+        );
+        assert!(toml::to_string(&cfg).unwrap().contains("[node]"));
+        assert!(toml::from_str::<Config>("[node]\njobs_speed = \"quick\"\n").is_err());
+        assert!(toml::from_str::<Config>("[node]\nspeed = \"fast\"\n").is_err());
+        let bare: Config = toml::from_str("").unwrap();
+        assert!(!toml::to_string(&bare).unwrap().contains("[node]"));
     }
 
     #[test]

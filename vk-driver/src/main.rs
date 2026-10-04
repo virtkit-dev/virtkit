@@ -54,6 +54,7 @@ mod local;
 mod manager;
 mod mkoci;
 mod net;
+mod node;
 mod numa;
 mod oci;
 mod oomkills;
@@ -243,6 +244,44 @@ struct Cli {
     config: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum NodeCmd {
+    /// Enroll this host with a hub, once
+    ///
+    /// Generates the node's ed25519 identity under <state_dir>/node/, refuses while `vk check`
+    /// fails on KVM, the VMM or the guest kernel, and spends the single-use token that
+    /// `vk-hub token create` printed. The hub pins the key; the host is then that node until
+    /// <state_dir>/node/ is removed or the hub removes it.
+    Join {
+        /// The hub's base URL: https://host[:port] (http only to a loopback hub)
+        hub: String,
+        /// The enrollment token, or `-` to read it on stdin
+        ///
+        /// A token on the command line is visible to every local user in the process list
+        /// while `join` runs; prefer `-` or --token-file.
+        #[arg(
+            long,
+            required_unless_present = "token_file",
+            conflicts_with = "token_file"
+        )]
+        token: Option<String>,
+        /// Read the enrollment token from this file
+        #[arg(long, value_name = "FILE")]
+        token_file: Option<PathBuf>,
+        /// Verify the hub against this PEM CA bundle alone
+        ///
+        /// The system's roots are then not trusted for the hub at all.
+        #[arg(long, value_name = "FILE")]
+        ca: Option<PathBuf>,
+    },
+    /// Keep a session with the hub, in the foreground
+    ///
+    /// Sends the host's inventory at the start and whenever it changes, and a heartbeat every
+    /// few seconds; redials with backoff whenever the hub is unreachable. SIGTERM or SIGINT
+    /// stops it.
+    Run,
 }
 
 #[derive(Subcommand)]
@@ -658,6 +697,15 @@ enum Cmd {
         #[arg(long, value_name = "SECS", default_value_t = 30,
               value_parser = clap::value_parser!(u64).range(1..))]
         mem_secs: u64,
+    },
+    /// Membership in a fleet managed by a vk-hub (experimental)
+    ///
+    /// `join` enrolls this host with a hub; `run` then keeps a session with it, reporting the
+    /// host's inventory and a heartbeat.
+    #[command(hide = true)]
+    Node {
+        #[command(subcommand)]
+        cmd: NodeCmd,
     },
     /// GitLab custom executor
     ///
@@ -4034,6 +4082,29 @@ async fn cli_main(cli: Cli) -> ExitCode {
         ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
+        },
+        Cmd::Node { cmd } => match cmd {
+            NodeCmd::Join {
+                hub,
+                token,
+                token_file,
+                ca,
+            } => {
+                let token = match (token, token_file) {
+                    (_, Some(path)) => node::TokenSource::File(path),
+                    (Some(t), None) if t == "-" => node::TokenSource::Stdin,
+                    (Some(t), None) => node::TokenSource::Literal(t),
+                    (None, None) => unreachable!("clap requires --token or --token-file"),
+                };
+                match node::join(&ctx.cfg, &hub, &token, ca.as_deref()).await {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e, 1),
+                }
+            }
+            NodeCmd::Run => match node::run(ctx.cfg).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, 1),
+            },
         },
         Cmd::Gitlab { cmd } => match cmd {
             GitlabCmd::Config => {

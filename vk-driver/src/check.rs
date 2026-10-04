@@ -78,7 +78,7 @@ impl Feature {
         <Feature as clap::ValueEnum>::from_str(name, false).ok()
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Feature::Kvm => "kvm",
             Feature::Vmm => "vmm",
