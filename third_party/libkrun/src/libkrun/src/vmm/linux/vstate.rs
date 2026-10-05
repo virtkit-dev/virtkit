@@ -490,6 +490,32 @@ pub struct Vm {
 }
 
 impl Vm {
+    /// Turn KVM's virtual PMU off for this VM (`KVM_CAP_PMU_CAPABILITY`). Must run before
+    /// the first vCPU is created. A host whose KVM offers no such capability is left as it
+    /// is: either its vPMU is off already (`kvm.enable_pmu=0`) or it is too old to turn it
+    /// off (Linux < 5.18), and then CPUID alone hides it (local patch, see VENDOR.md).
+    #[cfg(target_arch = "x86_64")]
+    pub fn disable_pmu(&self) {
+        use kvm_bindings::{KVM_CAP_PMU_CAPABILITY, KVM_PMU_CAP_DISABLE};
+        let caps = self
+            .fd
+            .check_extension_raw(u64::from(KVM_CAP_PMU_CAPABILITY));
+        if caps & KVM_PMU_CAP_DISABLE as i32 == 0 {
+            if caps == 0 {
+                debug!("KVM offers no PMU capability: the vPMU is off already, or kept");
+            }
+            return;
+        }
+        let mut cap = kvm_bindings::kvm_enable_cap {
+            cap: KVM_CAP_PMU_CAPABILITY,
+            ..Default::default()
+        };
+        cap.args[0] = u64::from(KVM_PMU_CAP_DISABLE);
+        if let Err(e) = self.fd.enable_cap(&cap) {
+            warn!("could not disable the guest PMU (KVM_CAP_PMU_CAPABILITY): {e}");
+        }
+    }
+
     /// Constructs a new `Vm` using the given `Kvm` instance.
     #[cfg(not(feature = "tee"))]
     pub fn new(kvm: &Kvm) -> Result<Self> {

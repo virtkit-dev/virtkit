@@ -877,6 +877,13 @@ pub fn build_microvm(
         &mut arch_memory_info,
         vm_resources.nested_enabled,
     )?;
+    // Without a guest PMU, turn KVM's vPMU off for the whole VM, before any vCPU exists: on
+    // Intel the zeroed CPUID leaf 0xA hides it, but on AMD the counters stay reachable
+    // whatever CPUID says (local patch, see VENDOR.md).
+    #[cfg(all(not(feature = "tee"), target_os = "linux", target_arch = "x86_64"))]
+    if !vm_resources.pmu_enabled {
+        vm.disable_pmu();
+    }
     #[cfg(all(not(feature = "tee"), target_os = "windows"))]
     #[allow(unused_mut)]
     let mut vm = setup_vm(&guest_memory, vcpu_config.vcpu_count)?;

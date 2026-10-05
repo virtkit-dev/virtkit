@@ -11,6 +11,11 @@ All notable changes to virtkit will be documented in this file.
   with DAX, the switch NICs, vsock, ACPI power-off, power button and reset — and `vk`
   behaves as before.
 
+### Fixed
+
+- **A VM without `--pmu` now has no PMU on AMD hosts either.** It used to be hidden only on
+  Intel; on AMD the guest could still read the host's performance counters.
+
 ### Removed
 
 - **Breaking: the cloud-hypervisor backend is removed.** Every VM boots on the embedded

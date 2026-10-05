@@ -112,7 +112,7 @@ impl<'a> VmmBuilder<'a> {
     /// Expose the guest PMU (local patch, see VENDOR.md): keep Intel's CPUID leaf 0xA as KVM
     /// reports it instead of zeroing it, so KVM's vPMU backs in-guest hardware counters. Off
     /// by default: host counters widen the side-channel surface, so only for trusted guests.
-    /// It gates leaf 0xA only: on AMD the vPMU stays as KVM exposes it either way.
+    /// Off, KVM's vPMU is also disabled for the whole VM, which hides it on AMD as well.
     pub fn pmu(mut self, enabled: bool) -> Self {
         self.pmu = enabled;
         self

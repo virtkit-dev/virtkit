@@ -670,10 +670,10 @@ pub struct VmSpec {
     /// keeps serial regardless (via the `VIRTKIT_KERNEL=image` cmdline token).
     #[serde(default)]
     pub console_serial: bool,
-    /// Expose the guest PMU (`vk run --pmu`): the libkrun backend leaves CPUID
-    /// leaf 0xA as KVM reports it (vendored `VmmBuilder::pmu` patch), so in-guest
-    /// perf gets hardware counters via KVM's vPMU. Default off — host counters
-    /// are a side-channel surface, for trusted dev VMs only.
+    /// Expose the guest PMU (`vk run --pmu`, the vendored `VmmBuilder::pmu` patch): in-guest
+    /// perf gets hardware counters via KVM's vPMU. Default off — host counters are a
+    /// side-channel surface, for trusted dev VMs only — and then the vPMU is turned off for
+    /// the VM and hidden from CPUID, on Intel and AMD alike.
     #[serde(default)]
     pub pmu: bool,
     /// Expose VMX/SVM to the guest (`vk run --nested`) so it can run KVM guests of

@@ -65,6 +65,31 @@ pub fn update_extended_feature_info_entry(
         vm_spec.nested_enabled() && entry.ecx.read_bit(ecx::SVM_BITINDEX),
     );
 
+    // Without a guest PMU (local patch, see VENDOR.md) the VM's vPMU is off, so hide the
+    // core performance counters too, or the guest probes MSRs KVM no longer serves.
+    if !vm_spec.pmu_enabled() {
+        entry.ecx.write_bit(PERFCTR_CORE_BITINDEX, false);
+    }
+
+    Ok(())
+}
+
+/// CPUID 0x80000001 ECX bit 23: the core performance counter extensions.
+const PERFCTR_CORE_BITINDEX: u32 = 23;
+/// AMD's PerfMonV2 leaf, which describes the core counters.
+const LEAF_PERFMON_V2: u32 = 0x8000_0022;
+
+/// Zero PerfMonV2 (0x80000022) for a guest without a PMU (local patch, see VENDOR.md).
+pub fn update_perfmon_v2_entry(
+    entry: &mut kvm_cpuid_entry2,
+    vm_spec: &VmSpec,
+) -> Result<(), Error> {
+    if !vm_spec.pmu_enabled() {
+        entry.eax = 0;
+        entry.ebx = 0;
+        entry.ecx = 0;
+        entry.edx = 0;
+    }
     Ok(())
 }
 
@@ -151,6 +176,7 @@ impl CpuidTransformer for AmdCpuidTransformer {
             leaf_0x80000008::LEAF_NUM => Some(amd::update_amd_features_entry),
             leaf_0x8000001d::LEAF_NUM => Some(amd::update_extended_cache_topology_entry),
             leaf_0x8000001e::LEAF_NUM => Some(amd::update_extended_apic_id_entry),
+            amd::LEAF_PERFMON_V2 => Some(amd::update_perfmon_v2_entry),
             0x8000_0002..=0x8000_0004 => Some(common::update_brand_string_entry),
             _ => None,
         }
@@ -224,6 +250,43 @@ mod tests {
 
         update_largest_extended_fn_entry(&mut entry, &vm_spec).unwrap();
         assert_eq!(entry.eax, 0x8000_0022);
+    }
+
+    #[test]
+    fn without_a_pmu_amd_hides_its_core_counters() {
+        let vm_spec = VmSpec::new(0, 1, false, false).expect("Error creating vm_spec");
+        let mut ext = kvm_cpuid_entry2 {
+            function: crate::cpu_leaf::leaf_0x80000001::LEAF_NUM,
+            ecx: 1 << PERFCTR_CORE_BITINDEX,
+            ..Default::default()
+        };
+        assert!(update_extended_feature_info_entry(&mut ext, &vm_spec).is_ok());
+        assert!(!ext.ecx.read_bit(PERFCTR_CORE_BITINDEX));
+        let mut perfmon = kvm_cpuid_entry2 {
+            function: LEAF_PERFMON_V2,
+            eax: 1,
+            ebx: 6,
+            ..Default::default()
+        };
+        assert!(update_perfmon_v2_entry(&mut perfmon, &vm_spec).is_ok());
+        assert_eq!((perfmon.eax, perfmon.ebx), (0, 0));
+
+        // With the PMU exposed both stay as KVM reported them.
+        let vm_spec = vm_spec.with_pmu_enabled(true);
+        let mut ext = kvm_cpuid_entry2 {
+            function: crate::cpu_leaf::leaf_0x80000001::LEAF_NUM,
+            ecx: 1 << PERFCTR_CORE_BITINDEX,
+            ..Default::default()
+        };
+        assert!(update_extended_feature_info_entry(&mut ext, &vm_spec).is_ok());
+        assert!(ext.ecx.read_bit(PERFCTR_CORE_BITINDEX));
+        let mut perfmon = kvm_cpuid_entry2 {
+            function: LEAF_PERFMON_V2,
+            eax: 1,
+            ..Default::default()
+        };
+        assert!(update_perfmon_v2_entry(&mut perfmon, &vm_spec).is_ok());
+        assert_eq!(perfmon.eax, 1);
     }
 
     #[test]

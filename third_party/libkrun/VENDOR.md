@@ -295,11 +295,13 @@ keeps CPUID leaf 0xA as KVM reports it instead of zeroing it (`VmSpec::with_pmu_
 carried by `VcpuConfig::pmu_enabled`), so KVM's vPMU backs in-guest `perf` hardware events.
 Off by default, as upstream: host counters widen the side-channel surface. Used by `vk run --pmu`.
 
-Known gap, as in the 1.19 tree: the switch only gates Intel's leaf 0xA. On AMD, KVM's vPMU
-(the legacy counters, `PERFCTR_CORE` in 0x80000001 ECX) stays exposed whatever the flag, and
-2.0 no longer clamps the largest extended leaf to 0x8000001f, so PerfMonV2 (0x80000022) is
-visible too. Turning the vPMU off at VM level (`KVM_CAP_PMU_CAPABILITY`) would close it on
-both vendors.
+With the switch off, the VM's vPMU is also turned off at VM level
+(`KVM_CAP_PMU_CAPABILITY` / `KVM_PMU_CAP_DISABLE`, before any vCPU exists), and on AMD the AMD
+transformer clears `PERFCTR_CORE` (0x80000001 ECX bit 23) and zeroes PerfMonV2 (0x80000022,
+which 2.0 no longer hides by clamping the largest extended leaf), as Intel's leaf 0xA is: CPUID
+alone hid the PMU only on Intel. A host KVM without the capability (Linux < 5.18, or its vPMU
+off already) is left as it is. The SEV/TDX builds do not turn the vPMU off. Covered by
+`test_update_perf_mon_entry` and `without_a_pmu_amd_hides_its_core_counters`.
 
 ### ACPI power-off, power button and reset (forward-ported from the 1.19 tree)
 
