@@ -46,6 +46,11 @@ All notable changes to virtkit will be documented in this file.
 - **`vk tune` stands aside on a fleet node** while `vk node run` is up, and otherwise honours
   the ceiling the node last received.
 
+### Fixed
+
+- **`vk update` no longer hangs on a release whose `--version` does not return**: it is
+  killed, with anything it started, after 30 seconds, and the update fails.
+
 ## [0.84.0] - 2026-10-05
 
 ### Changed
