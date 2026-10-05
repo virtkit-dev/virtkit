@@ -18,6 +18,11 @@ use kvm_ioctls::{IoEventAddress, NoDatamatch, VmFd};
 use vm_memory::GuestMemoryMmap;
 
 const PCI_BUS0: u8 = 0;
+/// The most GSI routes KVM accepts (`KVM_MAX_IRQ_ROUTES` on x86).
+const KVM_MAX_IRQ_ROUTES: u32 = 4096;
+/// The routing table's default entries besides the IOAPIC pins' own: the PIC aliases of
+/// pins 0-15, which `GsiRoutes` commits alongside the MSI routes.
+const PIC_ALIAS_ROUTES: u32 = 16;
 /// GSIs below this are the IOAPIC's pins (and their PIC aliases).
 const IOAPIC_NUM_PINS: u32 = arch::x86_64::layout::IRQ_MAX + 1;
 
@@ -25,7 +30,10 @@ const IOAPIC_NUM_PINS: u32 = arch::x86_64::layout::IRQ_MAX + 1;
 pub enum Error {
     Bus(devices::BusError),
     CreateTransport(CreatePciTransportError),
-    IrqsExhausted,
+    /// No device slot or BAR0 space left on bus 0.
+    BusFull,
+    /// More MSI-X vectors than KVM can route.
+    MsiGsisExhausted,
     PciRoot(PciRootError),
     RegisterIoEvent(kvm_ioctls::Error),
     RegisterIrqFd(kvm_ioctls::Error),
@@ -36,7 +44,8 @@ impl Display for Error {
         match self {
             Self::Bus(err) => write!(f, "failed to register PCI bus device: {err}"),
             Self::CreateTransport(err) => write!(f, "failed to create virtio-pci transport: {err}"),
-            Self::IrqsExhausted => write!(f, "no more GSIs are available for PCI INTx"),
+            Self::BusFull => write!(f, "no PCI device slot or BAR space is left on bus 0"),
+            Self::MsiGsisExhausted => write!(f, "no more KVM GSIs are available for MSI-X"),
             Self::PciRoot(err) => write!(f, "failed to register PCI function: {err}"),
             Self::RegisterIoEvent(err) => write!(f, "failed to register queue ioeventfd: {err}"),
             Self::RegisterIrqFd(err) => write!(f, "failed to register MSI-X irqfd: {err}"),
@@ -126,7 +135,7 @@ impl PciHostManager {
         // gets no INTx and interrupts over MSI-X alone, which every virtio-pci driver uses
         // when offered (local patch, see VENDOR.md).
         if self.next_device > 31 {
-            return Err(Error::IrqsExhausted);
+            return Err(Error::BusFull);
         }
 
         let intx_gsi = (self.irq <= arch::x86_64::layout::IRQ_MAX).then_some(self.irq);
@@ -134,7 +143,7 @@ impl PciHostManager {
         let bar_base = arch::x86_64::layout::PCI_BAR_START
             + u64::from(self.next_device - 1) * VIRTIO_PCI_BAR0_SIZE;
         if bar_base + VIRTIO_PCI_BAR0_SIZE > arch::x86_64::layout::PCI_BAR_END {
-            return Err(Error::IrqsExhausted);
+            return Err(Error::BusFull);
         }
         let intx_line = Arc::new(KvmPciIntxLine {
             vm: vm.clone(),
@@ -159,6 +168,10 @@ impl PciHostManager {
         let mut gsis = Vec::new();
         for irqfd in transport.msix_irqfds() {
             let gsi = self.next_msi_gsi;
+            // The table holds the IOAPIC pins, their PIC aliases and one route per MSI GSI.
+            if gsi + PIC_ALIAS_ROUTES >= KVM_MAX_IRQ_ROUTES {
+                return Err(Error::MsiGsisExhausted);
+            }
             vm.register_irqfd(&irqfd, gsi)
                 .map_err(Error::RegisterIrqFd)?;
             gsis.push(gsi);
