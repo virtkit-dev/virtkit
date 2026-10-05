@@ -49,8 +49,9 @@ A node is any host `vk` already runs on:
 
 `vk check`'s KVM, VMM and guest-kernel probes are the gate: a node refuses to enroll while
 one fails. No root is needed at runtime and no distribution is assumed. `vk node run` is a
-foreground process; how it is kept running is the host's choice (a `systemd --user` unit,
-for instance; `vk node` installs none). A unit running it with a managed runner wants
+foreground process; how it is kept running is the host's choice. `vk node service install`
+installs a systemd unit for it (see [Running the node](fleet-prototype.md#running-the-node));
+any other supervisor works. A unit running it with a managed runner wants
 `KillMode=mixed`: gitlab-runner takes `SIGTERM` as abandoning its jobs, so the stop signal
 must reach the node alone, which quits the runner and waits for the jobs; a second one sends
 the runner `SIGTERM`. Its `TimeoutStopSec` bounds that wait: past it, systemd kills both.

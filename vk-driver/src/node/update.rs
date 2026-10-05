@@ -234,7 +234,7 @@ fn installed_after(recorded: Option<PathBuf>, exe: PathBuf, dir: &Path) -> Optio
 }
 
 /// Whether `path` is inside `dir`, both resolved.
-fn under(path: &Path, dir: &Path) -> bool {
+pub fn under(path: &Path, dir: &Path) -> bool {
     match (std::fs::canonicalize(path), std::fs::canonicalize(dir)) {
         (Ok(p), Ok(d)) => p.starts_with(d),
         // What cannot be resolved is not taken as outside.

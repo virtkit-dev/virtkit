@@ -10,7 +10,8 @@
 //! ([`state`]), sets the runner's concurrency every half minute within the hub's ceiling
 //! ([`core`]), whether or not a session is up, with `[node] runner = "managed"` runs
 //! gitlab-runner itself ([`runner`]), updates its own `vk` on trial ([`update`]), and clears
-//! what past jobs left ([`reset`]).
+//! what past jobs left ([`reset`]). `vk node service` installs a systemd unit running it
+//! ([`service`]).
 //! See `docs/fleet-prototype.md`, "Hub and node".
 //!
 //! Everything the node keeps is under `<state_dir>/node/`, a `0700` directory: `key.pk8`
@@ -42,6 +43,7 @@ mod identity;
 mod inventory;
 mod reset;
 mod runner;
+pub mod service;
 mod session;
 mod state;
 mod update;
@@ -162,6 +164,15 @@ fn dir(cfg: &Config) -> PathBuf {
     cfg.state_dir().join("node")
 }
 
+/// Add enrollment instructions to `e` when an enrollment file is missing.
+fn not_enrolled(e: anyhow::Error) -> anyhow::Error {
+    if is_not_found(&e) {
+        e.context("this host is not enrolled — run `vk node join <hub-url> --token -`")
+    } else {
+        e
+    }
+}
+
 /// `vk node join`.
 pub async fn join(cfg: &Config, hub: &str, token: &TokenSource, ca: Option<&Path>) -> Result<()> {
     let dir = dir(cfg);
@@ -227,7 +238,10 @@ pub async fn join(cfg: &Config, hub: &str, token: &TokenSource, ca: Option<&Path
     let path = dir.join(ENROLLMENT_FILE);
     vk_fs::write_atomic(&path, &json, 0o600)
         .with_context(|| format!("writing {}", path.display()))?;
-    println!("vk node: enrolled with {hub} as node {node_id}; start it with `vk node run`");
+    println!(
+        "vk node: enrolled with {hub} as node {node_id}; run it as a service with \
+         `vk node service install`, or in the foreground with `vk node run`"
+    );
     Ok(())
 }
 
@@ -286,13 +300,6 @@ async fn enroll(hub: &str, ca_pem: Option<&[u8]>, ask: &EnrollRequest) -> Result
 /// the node for good (removed, or not the key it pinned).
 pub async fn run(cfg: Config) -> Result<()> {
     let dir = dir(&cfg);
-    let not_enrolled = |e: anyhow::Error| {
-        if is_not_found(&e) {
-            e.context("this host is not enrolled — run `vk node join <hub-url> --token -`")
-        } else {
-            e
-        }
-    };
     check_private(&dir).map_err(not_enrolled)?;
     let _lock = lock(&dir).map_err(not_enrolled)?;
     // Before anything else: this may be the previous binary of an update on trial, whose part
@@ -804,18 +811,22 @@ fn create_dir(dir: &Path) -> Result<()> {
     check_private(dir)
 }
 
-/// That `dir` is a directory of this user's that nobody else can enter, judged off a
-/// descriptor opened without following a symlink. A missing one is an `io::Error` of kind
-/// `NotFound` at the root of the chain.
+/// Check that `dir` is private to this process's effective uid, using [`check_private_to`].
 fn check_private(dir: &Path) -> Result<()> {
+    // SAFETY: `geteuid` reads this process's own id and cannot fail.
+    check_private_to(dir, unsafe { libc::geteuid() })
+}
+
+/// That `dir` is a directory of `uid`'s that nobody else can enter, judged off a descriptor
+/// opened without following a symlink. A missing one is an `io::Error` of kind `NotFound` at
+/// the root of the chain.
+fn check_private_to(dir: &Path, uid: u32) -> Result<()> {
     let meta = std::fs::File::from(vk_fs::open_dir_nofollow(dir)?)
         .metadata()
         .with_context(|| format!("statting {}", dir.display()))?;
-    // SAFETY: `geteuid` reads this process's own id and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    if meta.uid() != euid || meta.mode() & 0o077 != 0 {
+    if meta.uid() != uid || meta.mode() & 0o077 != 0 {
         bail!(
-            "{} must belong to uid {euid} and be private to it (chmod 700); it is uid {} with \
+            "{} must belong to uid {uid} and be private to it (chmod 700); it is uid {} with \
              mode {:o}",
             dir.display(),
             meta.uid(),

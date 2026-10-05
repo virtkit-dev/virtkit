@@ -12,7 +12,10 @@
 //! `vk node` that finds that process still there adopts it rather than start a second: it
 //! counts it as running, quits it when acquisition is to stop, and waits for it to exit
 //! before starting its own. Only the moment between spawning a runner and recording it is
-//! uncovered.
+//! uncovered. Under the unit `vk node service` installs, a node that exits takes its runner
+//! and the jobs running with it: systemd ends the unit's processes before starting it again
+//! (`KillMode=mixed`, which a stop that waits for the jobs needs). Adoption covers a node run
+//! without such a supervisor.
 //!
 //! The child starts with every signal at its default disposition and none blocked, whatever
 //! `vk node run` inherited: a runner that ignores `SIGQUIT` because the shell that started the

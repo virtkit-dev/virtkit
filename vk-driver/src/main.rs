@@ -306,6 +306,44 @@ enum NodeCmd {
     /// reaches the node and not the runner. Exits 75 while another `vk node` holds the state
     /// dir.
     Run,
+    /// Run `vk node run` as a systemd service
+    ///
+    /// As root, a system unit in /etc/systemd/system, running the node as root or as --user;
+    /// as any other user, a user unit under
+    /// $XDG_CONFIG_HOME/systemd/user (else ~/.config/systemd/user), with lingering enabled so
+    /// it runs without a login.
+    Service {
+        #[command(subcommand)]
+        cmd: NodeServiceCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeServiceCmd {
+    /// Write vk-node.service, enable it and start it
+    ///
+    /// The unit runs this vk, resolved, as the installed binary updates replace, with the
+    /// config this command reads. Refuses on a host not enrolled. Run again, it rewrites the
+    /// unit and restarts the node if it is running.
+    Install {
+        /// Enable the unit without starting it
+        #[arg(long)]
+        no_start: bool,
+        /// How long a stop waits for a managed runner's jobs before systemd kills them
+        ///
+        /// 90s, 10m, 1h, or a number of seconds; 0 waits for as long as they take.
+        #[arg(long, value_name = "DURATION", default_value = node::service::DEFAULT_STOP_TIMEOUT,
+              value_parser = dev::config::parse_duration)]
+        stop_timeout: std::time::Duration,
+        /// Run the node as this user, from a system unit (root only)
+        ///
+        /// The host must have been enrolled as that user, and the config must be readable
+        /// by it. The user must be in /etc/passwd.
+        #[arg(long, value_name = "NAME")]
+        user: Option<String>,
+    },
+    /// Stop and disable vk-node.service and remove it, leaving the enrollment
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -735,7 +773,8 @@ enum Cmd {
     /// Membership in a fleet managed by a vk-hub (experimental)
     ///
     /// `join` enrolls this host with a hub; `run` then keeps a session with it, reporting the
-    /// host's inventory and a heartbeat, and follows what the hub asks within local policy.
+    /// host's inventory and a heartbeat, and follows what the hub asks within local policy;
+    /// `service install` runs it under systemd.
     #[command(hide = true)]
     Node {
         #[command(subcommand)]
@@ -4122,6 +4161,20 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 Err(e) if e.is::<node::Locked>() => fail(&e, node::LOCKED_EXIT),
                 Err(e) => fail(&e, 1),
             },
+            NodeCmd::Service { cmd } => {
+                let done = match cmd {
+                    NodeServiceCmd::Install {
+                        no_start,
+                        stop_timeout,
+                        user,
+                    } => node::service::install(&ctx.cfg, !no_start, stop_timeout, user.as_deref()),
+                    NodeServiceCmd::Uninstall => node::service::uninstall(),
+                };
+                match done {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e, 1),
+                }
+            }
         },
         Cmd::Gitlab { cmd } => match cmd {
             GitlabCmd::Config => {
@@ -5935,6 +5988,33 @@ mod tests {
             panic!("--numa node1 must be rejected")
         };
         assert!(err.to_string().contains("off, auto, interleave"), "{err}");
+    }
+
+    /// `vk node service install` stops in an hour by default, and takes a duration.
+    #[test]
+    fn node_service_install_takes_a_stop_timeout() {
+        let timeout_of = |argv: &[&str]| {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            let Cmd::Node {
+                cmd:
+                    NodeCmd::Service {
+                        cmd: NodeServiceCmd::Install { stop_timeout, .. },
+                    },
+            } = cli.cmd
+            else {
+                panic!("expected `vk node service install`")
+            };
+            stop_timeout.as_secs()
+        };
+        assert_eq!(timeout_of(&["vk", "node", "service", "install"]), 3600);
+        assert_eq!(
+            timeout_of(&["vk", "node", "service", "install", "--stop-timeout", "10m"]),
+            600
+        );
+        assert!(
+            Cli::try_parse_from(["vk", "node", "service", "install", "--stop-timeout", "1d"])
+                .is_err()
+        );
     }
 
     /// `--workdir-cache` parses into `ShareCache` and defaults to `Auto`. An explicit value

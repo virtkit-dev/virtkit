@@ -66,6 +66,67 @@ it and ends its session. The host can then join again only as a new node: remove
 `<state_dir>/node/` and use a new token. Issuing a token, enrolling, re-enrolling and removing
 a node are recorded in the audit log.
 
+### Running the node
+
+`vk node service install [--no-start] [--stop-timeout DURATION] [--user NAME]` runs `vk node
+run` under systemd as `vk-node.service`, enabled and started. Run as root, it writes a system
+unit to `/etc/systemd/system/` (`WantedBy=multi-user.target`, pulling in
+`network-online.target`) that runs the node as root, or as `--user NAME`: the unit always names
+its `User=`, so systemd sets `HOME` for a managed runner's default config. The user must be in
+`/etc/passwd`: `vk` reads no other user database, so a user only LDAP or SSSD knows installs a
+user unit instead, running the command as that user. Run as any other user, it writes a user
+unit to `$XDG_CONFIG_HOME/systemd/user/` when the user owns that directory (else
+`.config/systemd/user/` under the home directory `/etc/passwd` gives, not `HOME`: `su` and
+`sudo -u` may carry either over from the invoking user;
+`WantedBy=default.target`), and enables lingering for that user so the node runs without a
+login session, or prints the `sudo loginctl enable-linger <user>` an administrator must run
+when the user may not; `--user` is refused there. It refuses on a host not enrolled, and on one
+whose `<state_dir>/node/` belongs to another user than the node would run as — that user
+enrolled the host, and running the node as another means removing it from the hub, deleting
+`node/` and joining again as that user. It also refuses while another `vk node` holds the state
+dir (a foreground `vk node run`, or a unit of the administrator's own) and the unit is to be
+started, while `vk-node.service` is starting or stopping, when a
+`vk-node.service` it did not write is in the way, and when the other systemd manager already
+runs a node as the same user: a system unit naming that `User=`, or the user's own unit.
+
+On a CI host where the node runs as `gitlab-runner` with `/etc/virtkit/config.toml`, root
+enrolls it as that user and installs the unit:
+
+```sh
+sudo -u gitlab-runner vk node join https://hub.example.com --token -
+sudo vk node service install --user gitlab-runner
+```
+
+With `--user`, the account must be able to reach the state dir, read the config and execute
+`vk`. If the command read no config, it refuses a user config under `~/.config/virtkit/`,
+which the node would read instead. Installation warns if the user cannot write the binary's
+directory: the node refuses updates there. Permissions are checked using mode bits, not
+ACLs. With `[node] runner = "managed"` and no `[node] gitlab_runner`, `gitlab-runner` must be
+on systemd's own `PATH` (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`), which
+lacks `~/.local/bin`; otherwise set `gitlab_runner` to its absolute path.
+
+The unit runs the `vk` the command was run from, resolved through symlinks — the installed
+binary an update replaces, so a release from `<state_dir>/node/releases/` is refused — with
+`--config` naming the config file the command read, if any, so the service uses the state dir
+`join` enrolled. It sets `KillMode=mixed` and `TimeoutStopSec` from `--stop-timeout` (`90s`,
+`10m`, `1h` or seconds; `1h` by default, GitLab's default job timeout; `0` for no limit). A
+shutdown or reboot waits for the same: up to `--stop-timeout` with a managed runner. To stop
+sooner, `systemctl kill --kill-whom=main vk-node` sends the node the second signal, which
+abandons the jobs; a plain `systemctl kill` signals the runner too. `OOMPolicy=continue` keeps
+the node up when the kernel kills one job's VM for memory. The unit is not sandboxed: its
+processes are the runner, its executors and their VMs, which need `/dev/kvm`, taps, the state
+dir and the installed `vk`'s directory; the VM is the isolation boundary. `Restart=on-failure`
+with `RestartSec=10s` starts the node again after a crash, a release on trial killed by its
+`SIGALRM`, an exit 75 or any other failure; a refusal for good exits 1 like a local failure, so
+the start limit — ten starts in ten minutes — is what ends a node that fails on every start,
+after leaving room for a trial's attempts and its rollback. Under the unit, a node that exits
+takes its runner and the jobs running with it: systemd ends the unit's processes before
+starting it again. Runner adoption covers a node run without such a supervisor. Reinstalling
+rewrites the unit, clears a start-limit failure, and restarts a running node, waiting for a
+managed runner's jobs. If the systemd manager is unreachable, installation fails and names
+the unit it wrote. `vk node service uninstall` stops, disables and removes the unit (the
+system unit when run as root), preserving enrollment.
+
 ## Hub and node
 
 `vk-hub serve [--config hub.toml]` serves nodes. `hub.toml` sets `addr` (default
@@ -345,8 +406,9 @@ anything is counted all the same. The binary that executes a release on trial ar
 for a minute past the deadline across the exec, and the release arms it again before anything
 else runs, so the kernel ends a release that hangs — even one that is no `vk` at all — and the
 previous binary, restarted, finds the deadline past; a release that does not hang rolls back
-at the deadline itself. The alarm is disarmed once the trial is confirmed. A node without a
-supervisor that restarts `vk node run` stays down until someone starts it.
+at the deadline itself. The alarm is disarmed once the trial is confirmed. Without a
+supervisor that restarts `vk node run`, such as the unit `vk node service install` writes, a
+release that crashed or was ended leaves the node down until someone starts it.
 
 On trial the release validates, waits for a session with the hub, and only then copies itself
 beside the installed binary — checking what it copied against the sha256 — and renames it into

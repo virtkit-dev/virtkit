@@ -78,6 +78,15 @@ All notable changes to virtkit will be documented in this file.
   cached images too with `--images` — checks itself as an update does, and returns to the state
   it was in; a host that fails the check stays drained. An operator can reset a host from its
   page in the web UI, which asks again first. A reset needs `[node] runner = "managed"`.
+- **Experimental: `vk node service install` runs a fleet node under systemd.** It writes and
+  starts `vk-node.service`: as root, a system unit running as root or the account named by
+  `--user`, such as `gitlab-runner`; otherwise a user unit with lingering so the node runs
+  without a login. The unit uses the command's binary and config. A stop, including host
+  shutdown, waits for a managed runner's jobs (`--stop-timeout`, an hour by default).
+  The unit restarts the node after a failure but not
+  forever; a node that fails takes its runner's jobs with it. Reinstalling rewrites the unit
+  and restarts a running node; `vk node service uninstall` removes the unit and preserves the
+  enrollment.
 
 ### Fixed
 
