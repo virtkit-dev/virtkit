@@ -4,8 +4,11 @@
 # test that removes the enrollment and stops `vk node run` gets the wait back, to enroll the
 # node again. `vk node run` exits 75 while the `vk node join` that wrote the enrollment still
 # holds the state dir, and is started again, for up to a minute; any other exit ends the
-# service.
+# service. A /seed/config.toml (node_config) becomes the guest's vk config.
 set -u
+if [ -f /seed/config.toml ]; then
+  mkdir -p /etc/virtkit && cp /seed/config.toml /etc/virtkit/config.toml
+fi
 enrollment=/var/lib/virtkit/node/enrollment.json
 locked=0
 while :; do

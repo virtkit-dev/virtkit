@@ -49,9 +49,9 @@ jobs:
   fleet-e2e:
     needs: [build]
     runs-on: ubuntu-latest
-    # Above the scripts' caps and cleanups combined (3 × (900 + 120 + 60)s), so the loop
+    # Above the scripts' caps and cleanups combined (4 × (900 + 120 + 70)s), so the loop
     # always ends and reports.
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

@@ -1,0 +1,7 @@
+#!/bin/sh
+# A process-only gitlab-runner stand-in for `[node] runner = "managed"` start/quit/restart
+# tests. It ignores the arguments from `vk node run` and exits on SIGQUIT, like an idle
+# runner. While /tmp/runner-hold exists, it waits before exiting to simulate unfinished jobs.
+trap 'while [ -e /tmp/runner-hold ]; do sleep 0.2; done; exit 0' QUIT
+echo "gitlab-runner stand-in: started ($$)"
+while :; do sleep 0.5; done

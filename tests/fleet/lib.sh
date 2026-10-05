@@ -5,8 +5,10 @@
 # The tests drive the hub's CLI with `vk exec` into the primary, and start and stop node
 # services from there through /run/vk/services. Node guests nest, so each passes `vk check`
 # and enrolls itself with `vk node join`; its root persists, so it keeps its identity across
-# restarts. `fleet_kvm_node` runs one more node on the test host itself, enrolled through the
-# hub's port published on loopback.
+# restarts. A node service's vk config can be set with node_config before it boots, and a
+# gitlab-runner stand-in is in its /seed (tests/fleet/node/gitlab-runner). `fleet_kvm_node`
+# runs one more node on the test host itself, enrolled through the hub's port published on
+# loopback.
 #
 # Source it, then call fleet_up; everything is torn down on exit.
 #
@@ -113,7 +115,9 @@ EOF
     local n
     for n in "$@"; do
       mkdir -p "$FLEET/seed/$n"
-      cp "$FLEET_LIB/node/run-node.sh" "$FLEET/ca.pem" "$FLEET/seed/$n/"
+      cp "$FLEET_LIB/node/run-node.sh" "$FLEET_LIB/node/gitlab-runner" "$FLEET/ca.pem" \
+        "$FLEET/seed/$n/"
+      chmod +x "$FLEET/seed/$n/gitlab-runner"
       echo "  $n:"
       if [ -n "${IMAGE:-}" ]; then
         echo "    image: $IMAGE"
@@ -162,6 +166,11 @@ hub_kill() {
   "$VK" exec "$RUN" -- sh -c 'kill -9 $(pidof vk-hub)'
 }
 
+# hub_audit <id>: node <id>'s lines of the audit log.
+hub_audit() {
+  hub audit --node "$1" --limit 200
+}
+
 # `vk node <args>` on the test host, as node <name>: its own config and state dir.
 host_vk() {
   local name=$1
@@ -195,6 +204,12 @@ node_id() {
     enrollment=$(in_node "$1" cat /var/lib/virtkit/node/enrollment.json)
   fi
   sed -n 's/.*"node_id": *"\([0-9a-f]*\)".*/\1/p' <<<"$enrollment"
+}
+
+# node_config <name>: node service <name>'s vk config, from stdin; its guest takes it as
+# /etc/virtkit/config.toml when it boots.
+node_config() {
+  cat >"$FLEET/seed/$1/config.toml"
 }
 
 # Start node service <name> and enroll it.
@@ -245,6 +260,12 @@ node_cell() {
       gsub(/^ +| +$/, "", v)
       print v
     }'
+}
+
+# cell_is <id> <column> <glob>: whether node <id>'s cell matches.
+cell_is() {
+  # Unquoted on the right: a glob.
+  [[ "$(node_cell "$1" "$2")" == $3 ]]
 }
 
 # Whether node <id> is connected and its inventory has arrived.
