@@ -90,3 +90,18 @@ Covered by the passthrough `negative_lookup_*`, `no_sync_*`, `setupmapping_*`,
 
 Not carried over: the 1.19 tree's `Reader/Writer::from_volatile_slices` constructors and
 public `filesystem`/`read_only` modules, which only virtkit's removed vhost-user daemon used.
+
+### Directory-entry names (forward-ported from the 1.19 tree)
+
+`src/devices/src/virtio/fs/server.rs` — a directory-entry name from the guest must be exactly
+one component. `LOOKUP`, `MKNOD`, `MKDIR`, `SYMLINK` (its new name, not the target), `UNLINK`,
+`RMDIR`, `RENAME`/`RENAME2` (both names), `LINK` and `CREATE` answer `EINVAL` for an empty name,
+`.`, `..` or one containing `/`, before any filesystem sees it. The passthrough engines
+resolve names with `*at()` against the parent's `O_PATH` descriptor and relied on the guest
+kernel never sending such a name, so a guest kernel that did — and a job can bring its own —
+walked out of the share to anything the VMM's user can read or write. Upstream virtiofsd
+refuses the same names (`validate_path_component`). In the server, so the in-process engines
+and their read-only and `AugmentFs` wrappers all get it. Unix hosts only: the Windows engine
+joins names onto a `PathBuf`, where `\` and drive prefixes are separators too. LOOKUP and
+RENAME tests drive the refusal through the server and check that only single components
+reach the filesystem. Search for `entry_name`.
