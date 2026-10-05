@@ -6,17 +6,19 @@
 //! every few seconds — and redials with backoff whenever the session is lost, until SIGTERM
 //! or SIGINT closes it (cleanly unless a send to the hub is stuck) or the hub refuses it for
 //! good. It applies the desired state and commands the hub sends — a concurrency ceiling,
-//! stopping acquisition, drain, quarantine — through its persisted state ([`state`]), sets the
-//! runner's concurrency every half minute within the hub's ceiling ([`core`]), whether or not a
-//! session is up, and with `[node] runner = "managed"` runs gitlab-runner itself ([`runner`]).
+//! stopping acquisition, drain, quarantine, update — through its persisted state ([`state`]),
+//! sets the runner's concurrency every half minute within the hub's ceiling ([`core`]), whether
+//! or not a session is up, with `[node] runner = "managed"` runs gitlab-runner itself
+//! ([`runner`]), and updates its own `vk` on trial ([`update`]).
 //! See `docs/fleet-prototype.md`, "Hub and node".
 //!
 //! Everything the node keeps is under `<state_dir>/node/`, a `0700` directory: `key.pk8`
 //! (the private key, `0600`), `enrollment.json` (the hub's URL and the node ID it assigned),
 //! `state.json` (what the hub asked, the node's own state and its command journal),
 //! `runner.pid` (a managed runner's pid and start time, for a restarted node to find), `ca.pem`
-//! (the CA the hub is verified against, copied at `join` when one was given) and `lock`, which
-//! one `vk node` process at a time holds. A `join` whose answer was lost keeps the key it made
+//! (the CA the hub is verified against, copied at `join` when one was given), `releases/` (a
+//! release being installed, and the binary it replaces) and `lock`, which one `vk node`
+//! process at a time holds. A `join` whose answer was lost keeps the key it made
 //! and joins again with a new token: the hub answers a key it already pinned with the node it
 //! pinned it to.
 //!
@@ -40,6 +42,7 @@ mod inventory;
 mod runner;
 mod session;
 mod state;
+mod update;
 
 use std::io::{BufRead, Read};
 use std::os::fd::AsRawFd;
@@ -290,6 +293,17 @@ pub async fn run(cfg: Config) -> Result<()> {
     };
     check_private(&dir).map_err(not_enrolled)?;
     let _lock = lock(&dir).map_err(not_enrolled)?;
+    // Before anything else: this may be the previous binary of an update on trial, whose part
+    // is to count the attempt and hand over, or to take the node back.
+    match update::on_start(&dir, session::now_secs())? {
+        update::Start::Run => {}
+        update::Start::Exec(binary, alarm_at) => {
+            drop(_lock);
+            return Err(update::exec(&binary, alarm_at));
+        }
+    }
+    update::arm_trial_deadline(&dir, session::now_secs())?;
+    update::note_installed(&dir)?;
     let enrollment = read_enrollment(&dir).map_err(not_enrolled)?;
     let identity = Identity::load(&dir).with_context(|| {
         format!(
@@ -331,6 +345,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     };
     let (runner_tx, runner_state) = tokio::sync::watch::channel(vk_hub_proto::RunnerState::Stopped);
     let core = core::Core::open(&dir, issuer, spec.is_some().then_some(runner_state))?;
+    core.set_allow_downgrade(cfg.node.allow_downgrade);
     let (halt, halted) = tokio::sync::watch::channel(false);
     let supervisor = spec.map(|spec| {
         let signals = runner::Signals {
@@ -345,15 +360,25 @@ pub async fn run(cfg: Config) -> Result<()> {
         core.clone()
             .control(cfg.clone(), CONTROL_EVERY, stop.clone()),
     );
-    let mut gatherer = session::Gatherer::spawn(cfg);
-    let node = session::Node {
+    // Read now, so the first inventory carries it and no session waits on it.
+    if tokio::task::spawn_blocking(update::own_sha256)
+        .await
+        .ok()
+        .flatten()
+        .is_none()
+    {
+        say!("warning: cannot read the running vk to report its sha256");
+    }
+    let mut gatherer = session::Gatherer::spawn(cfg.clone());
+    let node = Arc::new(session::Node {
         dir,
         enrollment,
-        core,
+        core: core.clone(),
         identity,
         incarnation,
         tls,
-    };
+    });
+    tokio::spawn(update::maintain(core, cfg, node.clone(), stop.clone()));
     let ended = hold_sessions(&node, &mut gatherer, &mut stop).await;
     // Stopping, or refused for good, the node quits a managed runner and waits for its jobs to
     // finish: a node its hub no longer knows should not go on taking the fleet's work, and a

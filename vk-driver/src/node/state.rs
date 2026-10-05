@@ -7,12 +7,19 @@
 //! without applying the command again. Desired-state generations no newer than the applied
 //! one are ignored. Generations belong to one hub and enrollment, identified in the file;
 //! re-enrollment or a different hub clears the applied generation but preserves node state.
+//!
+//! An update is a [`Job`] beside the state it moves the node through: accepted from ready,
+//! draining or drained, it drains the node, holds it in `maintenance` while the release is
+//! fetched and in `validating` while the release runs on [`Trial`], then returns the node to
+//! where it started, or to quarantine if one arrived meanwhile.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use vk_hub_proto::{Command, CommandAck, DesiredState, NodeState, Operation, Outcome};
+use vk_hub_proto::{
+    Command, CommandAck, DesiredState, NodeState, Operation, Outcome, UpdatePhase, UpdateProgress,
+};
 
 const STATE_FILE: &str = "state.json";
 
@@ -37,6 +44,82 @@ pub struct Persisted {
     pub quarantined_from: Option<NodeState>,
     #[serde(default)]
     pub journal: Vec<Entry>,
+    /// The update under way.
+    #[serde(default)]
+    pub job: Option<Job>,
+    /// How the update under way, or the last one, is going.
+    #[serde(default)]
+    pub update: Option<UpdateProgress>,
+    /// The installed `vk`, which an update replaces: the file the last `vk node run` not
+    /// started from a release executed, as the kernel names it — symlinks resolved.
+    #[serde(default)]
+    pub installed: Option<PathBuf>,
+}
+
+/// An update under way: accepted, and not yet done, failed or rolled back.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Job {
+    /// The command's ID, whose journal entry says how it ended.
+    pub command: String,
+    pub release: Release,
+    /// The state the node returns to: ready, or drained when it was drained or draining.
+    pub resume: NodeState,
+    /// A quarantine arrived during maintenance: the node enters it instead of `resume`.
+    #[serde(default)]
+    pub quarantine_after: bool,
+    /// Set at the switch; the release runs on trial until it is confirmed or rolled back.
+    #[serde(default)]
+    pub trial: Option<Trial>,
+    /// When the command expires: a drain still under way then calls the update off.
+    pub expires_at: u64,
+    /// How long the update may take once maintenance begins ([`Operation::Update`]).
+    #[serde(default)]
+    pub within_secs: Option<u64>,
+    /// By when it must be confirmed, set as maintenance begins from `within_secs`.
+    #[serde(default)]
+    pub deadline: Option<u64>,
+}
+
+/// The release an update installs, as its command named it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release {
+    pub version: String,
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// A release on trial. The installed binary stays in place until the trial is confirmed, so
+/// whatever starts `vk node run` starts the previous binary, which counts the attempt and
+/// hands over to the release — or, past the attempts allowed or the deadline, takes the node
+/// back itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Trial {
+    /// The installed `vk`, which the release replaces once confirmed.
+    pub exe: PathBuf,
+    /// `exe`'s device and inode at the switch: a file put there meanwhile — by a package
+    /// manager, by hand — is not replaced by the release.
+    pub exe_id: (u64, u64),
+    /// The release, `<node dir>/releases/<sha256>`.
+    pub next: PathBuf,
+    /// The sha256 of the binary it replaces, kept beside it in the releases directory.
+    #[serde(default)]
+    pub previous: Option<String>,
+    /// How many times the release has been started.
+    pub attempts: u32,
+    /// When a trial not yet confirmed is rolled back, whatever else is happening.
+    pub deadline: u64,
+    /// Validated and back in touch with the hub: the release is being installed as `exe`.
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+/// What a node can do, which decides what commands it takes.
+pub struct Abilities {
+    /// It runs its runner, so it can stop it: a drain and a quarantine need that.
+    pub managed: bool,
+    /// Whether it can install the update a command names, or why not. Looked at only for an
+    /// update.
+    pub update: Result<(), String>,
 }
 
 /// Whose generations and commands these are.
@@ -142,17 +225,27 @@ impl Persisted {
         true
     }
 
-    /// Journal `command` and make the state change it asks for, answering with its outcome. A
-    /// command already journaled is answered with what it came to then. `managed` is whether
-    /// this node runs its runner, and so can stop it, which a drain and a quarantine need.
+    /// [`Persisted::command_as`] for a node that can install any update.
+    #[cfg(test)]
     pub fn command(&mut self, command: Command, now: u64, managed: bool) -> CommandAck {
+        let can = Abilities {
+            managed,
+            update: Ok(()),
+        };
+        self.command_as(command, now, &can)
+    }
+
+    /// Journal `command` and make the state change it asks for, answering with its outcome. A
+    /// command already journaled is answered with what it came to then. `can` is what this
+    /// node is able to do.
+    pub fn command_as(&mut self, command: Command, now: u64, can: &Abilities) -> CommandAck {
         if let Some(entry) = self.journal.iter().find(|e| e.id == command.id) {
             return entry.ack();
         }
         let outcome = if now >= command.expires_at {
             Outcome::Expired
         } else {
-            self.execute(&command.op, managed)
+            self.execute(&command, now, can)
         };
         let entry = Entry {
             id: command.id,
@@ -168,13 +261,18 @@ impl Persisted {
         ack
     }
 
-    /// A drain is `accepted` and settles once the node is drained ([`Persisted::finish_drain`]);
-    /// every other operation is done at once. A drain and a quarantine stop the runner taking
-    /// jobs, which this node cannot do to a runner it does not run.
-    fn execute(&mut self, op: &Operation, managed: bool) -> Outcome {
+    /// A drain and an update are `accepted` and settle later ([`Persisted::finish_drain`],
+    /// [`Persisted::end_job`]); every other operation is done at once. A drain and a
+    /// quarantine stop the runner taking jobs, which this node cannot do to a runner it does
+    /// not run.
+    fn execute(&mut self, command: &Command, now: u64, can: &Abilities) -> Outcome {
         let refused = |reason: &str| Outcome::Refused {
             reason: reason.to_string(),
         };
+        let (op, managed) = (&command.op, can.managed);
+        if let Some(outcome) = self.during_job(op, managed) {
+            return outcome;
+        }
         match (op, self.state) {
             (Operation::Drain | Operation::Undrain, NodeState::Quarantined) => {
                 refused("the node is quarantined; release it first")
@@ -222,19 +320,211 @@ impl Persisted {
                 Outcome::Done
             }
             (Operation::Release, _) => Outcome::Done,
-            (Operation::Update { .. }, _) => refused("this node does not apply updates"),
+            // The sha256 names files under the node's directory: refused before any path is
+            // built from it.
+            (Operation::Update { sha256, .. }, _) if !vk_hub_proto::valid_sha256(sha256) => {
+                refused("the release's sha256 is not 64 lowercase hex digits")
+            }
+            (Operation::Update { .. }, NodeState::Quarantined) => {
+                refused("the node is quarantined; release it first")
+            }
+            (Operation::Update { force: false, .. }, _) if !managed => refused(
+                "the runner is external, so vk node cannot drain it, and jobs running across the \
+                 switch would run their stages with two vk versions; update with --force to \
+                 accept that",
+            ),
+            (
+                Operation::Update {
+                    version,
+                    sha256,
+                    size,
+                    within_secs,
+                    ..
+                },
+                state,
+            ) => {
+                if let Err(why) = &can.update {
+                    return refused(why);
+                }
+                let release = Release {
+                    version: version.clone(),
+                    sha256: sha256.clone(),
+                    size: *size,
+                };
+                let (resume, next) = match state {
+                    // An external runner cannot be drained: straight to the download.
+                    NodeState::Ready if !managed => (NodeState::Ready, NodeState::Maintenance),
+                    NodeState::Ready => (NodeState::Ready, NodeState::Draining),
+                    NodeState::Draining => (NodeState::Drained, NodeState::Draining),
+                    _ => (NodeState::Drained, NodeState::Maintenance),
+                };
+                self.state = next;
+                self.update = Some(UpdateProgress {
+                    command: command.id.clone(),
+                    version: release.version.clone(),
+                    sha256: release.sha256.clone(),
+                    phase: if next == NodeState::Draining {
+                        UpdatePhase::Draining
+                    } else {
+                        UpdatePhase::Downloading
+                    },
+                    message: None,
+                });
+                self.job = Some(Job {
+                    command: command.id.clone(),
+                    release,
+                    resume,
+                    quarantine_after: false,
+                    trial: None,
+                    expires_at: command.expires_at,
+                    within_secs: *within_secs,
+                    deadline: None,
+                });
+                if next == NodeState::Maintenance {
+                    self.begin_maintenance(now);
+                }
+                Outcome::Accepted
+            }
         }
     }
 
-    /// The drain is complete: the node is drained, and every drain under way is done. Returns
-    /// whether the node was draining.
-    pub fn finish_drain(&mut self) -> bool {
+    /// What `op` comes to while an update is under way, or `None` to handle it as usual.
+    /// While the node drains for it, the update can still be called off; once maintenance has
+    /// begun, it runs to its end and what an operator asks meanwhile is kept for after.
+    fn during_job(&mut self, op: &Operation, managed: bool) -> Option<Outcome> {
+        let job = self.job.as_mut()?;
+        let draining = self.state == NodeState::Draining;
+        let busy = |job: &Job| Outcome::Refused {
+            reason: format!("an update is under way (command {})", job.command),
+        };
+        Some(match op {
+            Operation::Update { .. } => busy(job),
+            // Refused as at any other time.
+            Operation::Drain | Operation::Quarantine if !managed => return None,
+            Operation::Drain if draining => {
+                job.resume = NodeState::Drained;
+                Outcome::Accepted
+            }
+            // The node takes no jobs now, and returns to drained once the update is over.
+            Operation::Drain => {
+                job.resume = NodeState::Drained;
+                Outcome::Done
+            }
+            Operation::Undrain | Operation::Quarantine if draining => {
+                let message = match op {
+                    Operation::Undrain => "undrained before the update started",
+                    _ => "quarantined before the update started",
+                };
+                self.end_job(
+                    Outcome::Failed {
+                        message: message.into(),
+                    },
+                    UpdatePhase::Failed,
+                );
+                // Still draining, for what follows to end the drain as it would any other.
+                self.state = NodeState::Draining;
+                return None;
+            }
+            Operation::Undrain => busy(job),
+            // In force already — maintenance takes no jobs — and entered when it ends.
+            Operation::Quarantine => {
+                job.quarantine_after = true;
+                Outcome::Done
+            }
+            Operation::Release => {
+                job.quarantine_after = false;
+                Outcome::Done
+            }
+        })
+    }
+
+    /// End the update under way with `outcome`, reported as `phase`: its journal entry takes
+    /// the outcome, and the node goes back to where it was, or into the quarantine that
+    /// arrived meanwhile. Returns whether there was one to end.
+    pub fn end_job(&mut self, outcome: Outcome, phase: UpdatePhase) -> bool {
+        let Some(job) = self.job.take() else {
+            return false;
+        };
+        // The phase already says it was rolled back; the progress says why in words of its
+        // own.
+        let message = match &outcome {
+            Outcome::Failed { message } => Some(
+                message
+                    .strip_prefix("rolled back: ")
+                    .unwrap_or(message)
+                    .to_string(),
+            ),
+            _ => None,
+        };
+        if let Some(entry) = self.journal.iter_mut().find(|e| e.id == job.command) {
+            entry.outcome = outcome;
+        }
+        if let Some(update) = self.update.as_mut().filter(|u| u.command == job.command) {
+            update.phase = phase;
+            update.message = message;
+        }
+        if job.quarantine_after {
+            self.quarantined_from = Some(job.resume);
+            self.state = NodeState::Quarantined;
+        } else {
+            self.state = job.resume;
+        }
+        true
+    }
+
+    /// The update moved on to `phase`, in state `state`.
+    pub fn set_phase(&mut self, state: NodeState, phase: UpdatePhase) {
+        self.state = state;
+        if let Some(update) = self.update.as_mut() {
+            update.phase = phase;
+        }
+    }
+
+    /// The drain is complete: the node is drained, and every drain under way is done — or,
+    /// draining for an update, on to its maintenance. Returns whether the node was draining.
+    pub fn finish_drain(&mut self, now: u64) -> bool {
         if self.state != NodeState::Draining {
             return false;
         }
-        self.state = NodeState::Drained;
+        if self.job.is_some() {
+            self.set_phase(NodeState::Maintenance, UpdatePhase::Downloading);
+            self.begin_maintenance(now);
+        } else {
+            self.state = NodeState::Drained;
+        }
         self.settle_drains(Outcome::Done);
         true
+    }
+
+    /// Start the clock on the update's `within_secs`.
+    fn begin_maintenance(&mut self, now: u64) {
+        if let Some(job) = self.job.as_mut() {
+            job.deadline = job.within_secs.map(|w| now.saturating_add(w));
+        }
+    }
+
+    /// Call off an update whose command expired while the node was still draining for it:
+    /// whoever issued it has given up on it. Returns whether it did.
+    pub fn drain_expired(&mut self, now: u64) -> bool {
+        let expired = self.state == NodeState::Draining
+            && self.job.as_ref().is_some_and(|j| now >= j.expires_at);
+        if expired {
+            // An operator's drain under way beside it goes on; the update's alone ends.
+            let drained_for_operator = self
+                .journal
+                .iter()
+                .any(|e| e.op == Operation::Drain && e.outcome == Outcome::Accepted);
+            self.end_job(
+                Outcome::Failed {
+                    message: "the drain outlasted the command's expiry".into(),
+                },
+                UpdatePhase::Failed,
+            );
+            if drained_for_operator {
+                self.state = NodeState::Draining;
+            }
+        }
+        expired
     }
 
     fn settle_drains(&mut self, outcome: Outcome) {
@@ -368,7 +658,7 @@ mod tests {
         assert!(p.recorded(&first, 10));
         assert!(p.unrecorded().is_empty());
         // Its outcome moving on makes it unrecorded again.
-        assert!(p.finish_drain());
+        assert!(p.finish_drain(1));
         assert_eq!(p.state, NodeState::Drained);
         assert_eq!(p.unrecorded()[0].outcome, Outcome::Done);
         let late = p.command(command("b", Operation::Undrain), 1000, true);
@@ -390,25 +680,6 @@ mod tests {
             let ack = p.command(command(&format!("{op:?}"), op), 1, false);
             assert_eq!(ack.outcome, Outcome::Done);
         }
-    }
-
-    #[test]
-    fn an_update_is_refused_and_leaves_the_node_as_it_was() {
-        let mut p = Persisted::default();
-        let update = Operation::Update {
-            version: "0.84.0".into(),
-            sha256: "ab".repeat(vk_hub_proto::SHA256_LEN),
-            size: 1,
-            signature: None,
-            force: false,
-            within_secs: None,
-        };
-        for managed in [true, false] {
-            let ack = p.command(command(&format!("{managed}"), update.clone()), 1, managed);
-            assert!(matches!(ack.outcome, Outcome::Refused { .. }), "{ack:?}");
-        }
-        assert_eq!(p.state, NodeState::Ready);
-        assert_eq!(p.unrecorded().len(), 2);
     }
 
     #[test]
@@ -446,7 +717,7 @@ mod tests {
             let entry = p.journal.iter().find(|e| e.id == id).unwrap();
             assert!(matches!(entry.outcome, Outcome::Failed { .. }), "{entry:?}");
         }
-        assert!(!p.finish_drain());
+        assert!(!p.finish_drain(1));
 
         p.command(command("d", Operation::Drain), 3, true);
         p.command(command("e", Operation::Quarantine), 3, true);
@@ -461,7 +732,7 @@ mod tests {
     fn a_release_returns_a_drained_node_to_drained() {
         let mut p = Persisted::default();
         p.command(command("d", Operation::Drain), 1, true);
-        assert!(p.finish_drain());
+        assert!(p.finish_drain(1));
         p.command(command("q", Operation::Quarantine), 1, true);
         p.command(command("r", Operation::Release), 1, true);
         assert_eq!(p.state, NodeState::Drained);
@@ -519,5 +790,193 @@ mod tests {
         assert!(p.journal.is_empty());
         assert_eq!(p.state, NodeState::Quarantined);
         assert!(p.apply_desired(desired(1, None, Acquisition::Run)));
+    }
+
+    fn update(id: &str) -> Command {
+        command(
+            id,
+            Operation::Update {
+                version: "0.84.0".into(),
+                sha256: "ab".repeat(vk_hub_proto::SHA256_LEN),
+                size: 1,
+                signature: None,
+                force: false,
+                within_secs: None,
+            },
+        )
+    }
+
+    #[test]
+    fn an_update_drains_then_returns_the_node_where_it_was() {
+        let mut p = Persisted::default();
+        assert_eq!(p.command(update("u"), 1, true).outcome, Outcome::Accepted);
+        assert_eq!(p.state, NodeState::Draining);
+        assert!(p.acquisition_stopped());
+        // Another update meanwhile is refused; the drain becomes maintenance.
+        assert!(matches!(
+            p.command(update("v"), 1, true).outcome,
+            Outcome::Refused { .. }
+        ));
+        assert!(p.finish_drain(1));
+        assert_eq!(p.state, NodeState::Maintenance);
+        assert_eq!(p.update.as_ref().unwrap().phase, UpdatePhase::Downloading);
+        assert!(matches!(
+            p.command(command("x", Operation::Undrain), 1, true).outcome,
+            Outcome::Refused { .. }
+        ));
+        p.set_phase(NodeState::Validating, UpdatePhase::Validating);
+        assert!(p.acquisition_stopped());
+        assert!(p.end_job(Outcome::Done, UpdatePhase::Done));
+        assert_eq!(p.state, NodeState::Ready);
+        assert_eq!(p.journal[0].outcome, Outcome::Done);
+        assert_eq!(p.update.as_ref().unwrap().phase, UpdatePhase::Done);
+        assert!(!p.end_job(Outcome::Done, UpdatePhase::Done));
+
+        // From drained, straight to maintenance, and back to drained.
+        let mut p = Persisted::default();
+        p.command(command("d", Operation::Drain), 1, true);
+        assert!(p.finish_drain(1));
+        p.command(update("u"), 1, true);
+        assert_eq!(p.state, NodeState::Maintenance);
+        p.end_job(
+            Outcome::Failed {
+                message: "rolled back: no".into(),
+            },
+            UpdatePhase::RolledBack,
+        );
+        assert_eq!(p.state, NodeState::Drained);
+        assert_eq!(p.update.as_ref().unwrap().message.as_deref(), Some("no"));
+    }
+
+    #[test]
+    fn an_update_is_called_off_while_draining_and_kept_to_its_end_after() {
+        let mut p = Persisted::default();
+        p.command(update("u"), 1, true);
+        p.command(command("un", Operation::Undrain), 1, true);
+        assert_eq!(p.state, NodeState::Ready);
+        assert!(p.job.is_none());
+        assert!(matches!(p.journal[0].outcome, Outcome::Failed { .. }));
+        assert_eq!(p.update.as_ref().unwrap().phase, UpdatePhase::Failed);
+
+        // A quarantine during maintenance waits for its end; a drain makes it end drained.
+        let mut p = Persisted::default();
+        p.command(update("u"), 1, true);
+        p.finish_drain(1);
+        assert_eq!(
+            p.command(command("q", Operation::Quarantine), 1, true)
+                .outcome,
+            Outcome::Done
+        );
+        assert_eq!(p.state, NodeState::Maintenance);
+        assert_eq!(
+            p.command(command("d", Operation::Drain), 1, true).outcome,
+            Outcome::Done
+        );
+        p.end_job(Outcome::Done, UpdatePhase::Done);
+        assert_eq!(p.state, NodeState::Quarantined);
+        p.command(command("r", Operation::Release), 1, true);
+        assert_eq!(p.state, NodeState::Drained);
+
+        // Quarantined while draining for it: the update is off, the quarantine on.
+        let mut p = Persisted::default();
+        p.command(update("u"), 1, true);
+        p.command(command("q", Operation::Quarantine), 1, true);
+        assert_eq!(p.state, NodeState::Quarantined);
+        assert!(p.job.is_none());
+        assert!(matches!(
+            p.command(update("v"), 1, true).outcome,
+            Outcome::Refused { .. }
+        ));
+    }
+
+    #[test]
+    fn an_update_naming_an_invalid_sha256_is_refused() {
+        for bad in [
+            "../../etc/passwd".to_string(),
+            "AB".repeat(32),
+            "ab".repeat(31),
+        ] {
+            let mut u = update("u");
+            if let Operation::Update { sha256, .. } = &mut u.op {
+                *sha256 = bad;
+            }
+            let mut p = Persisted::default();
+            assert!(matches!(
+                p.command(u, 1, true).outcome,
+                Outcome::Refused { .. }
+            ));
+            assert_eq!(p.state, NodeState::Ready);
+            assert!(p.job.is_none());
+        }
+    }
+
+    #[test]
+    fn an_update_needs_a_managed_runner_or_force_and_a_replaceable_binary() {
+        let mut p = Persisted::default();
+        assert!(matches!(
+            p.command(update("u"), 1, false).outcome,
+            Outcome::Refused { .. }
+        ));
+        let mut forced = update("f");
+        if let Operation::Update { force, .. } = &mut forced.op {
+            *force = true;
+        }
+        assert_eq!(p.command(forced, 1, false).outcome, Outcome::Accepted);
+        // Not drained: an external runner cannot be.
+        assert_eq!(p.state, NodeState::Maintenance);
+        assert_eq!(p.job.as_ref().unwrap().resume, NodeState::Ready);
+        // Nor quarantined meanwhile: it could not be stopped from taking jobs after.
+        assert!(matches!(
+            p.command(command("q", Operation::Quarantine), 1, false)
+                .outcome,
+            Outcome::Refused { .. }
+        ));
+        assert!(!p.job.as_ref().unwrap().quarantine_after);
+
+        let mut p = Persisted::default();
+        let stuck = Abilities {
+            managed: true,
+            update: Err("/usr/bin is not writable".into()),
+        };
+        let ack = p.command_as(update("u"), 1, &stuck);
+        assert!(
+            matches!(&ack.outcome, Outcome::Refused { reason } if reason.contains("writable")),
+            "{ack:?}"
+        );
+        assert_eq!(p.state, NodeState::Ready);
+        assert!(p.job.is_none() && p.update.is_none());
+    }
+
+    #[test]
+    fn an_update_whose_command_expires_while_draining_is_called_off() {
+        let mut p = Persisted::default();
+        let mut u = update("u");
+        u.expires_at = 100;
+        p.command(u, 1, true);
+        assert!(!p.drain_expired(99));
+        assert!(p.drain_expired(100));
+        assert_eq!(p.state, NodeState::Ready);
+        assert!(p.job.is_none());
+        assert!(matches!(p.journal[0].outcome, Outcome::Failed { .. }));
+        // Beside an operator's drain, the drain goes on.
+        let mut p = Persisted::default();
+        p.command(command("d", Operation::Drain), 1, true);
+        let mut u = update("u");
+        u.expires_at = 100;
+        p.command(u, 1, true);
+        assert!(p.drain_expired(100));
+        assert_eq!(p.state, NodeState::Draining);
+        // Once maintenance has begun, the command's expiry is past caring; `within_secs` sets
+        // the update's deadline from there.
+        let mut p = Persisted::default();
+        let mut u = update("u");
+        u.expires_at = 100;
+        if let Operation::Update { within_secs, .. } = &mut u.op {
+            *within_secs = Some(50);
+        }
+        p.command(u, 1, true);
+        assert!(p.finish_drain(10));
+        assert!(!p.drain_expired(200));
+        assert_eq!(p.job.as_ref().unwrap().deadline, Some(60));
     }
 }

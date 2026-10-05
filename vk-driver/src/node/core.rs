@@ -7,17 +7,19 @@
 //! drain or quarantine.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::watch;
 use vk_hub_proto::{
-    Acquisition, Command, CommandAck, Concurrency, DesiredState, DrainProgress, NodeState, Report,
-    RunnerMode, RunnerState,
+    Acquisition, Command, CommandAck, Concurrency, DesiredState, DrainProgress, NodeState,
+    Operation, Report, RunnerMode, RunnerState,
 };
 
-use super::state::{Issuer, Persisted};
+use super::state::{Abilities, Issuer, Persisted};
+use super::update::Binary;
 use crate::config::Config;
 
 pub struct Core {
@@ -35,6 +37,13 @@ pub struct Core {
     /// Bumped on every change to what the node tells the hub: its report or its unrecorded
     /// acks.
     changed: watch::Sender<u64>,
+    /// Whether a session with the hub is up: what an update on trial waits for.
+    connected: watch::Sender<bool>,
+    /// How [`Core::leave`] executes a binary.
+    exec: fn(&Binary, Option<u64>) -> anyhow::Error,
+    /// Whether an update may install an older version than this one (`[node]
+    /// allow_downgrade`).
+    allow_downgrade: AtomicBool,
 }
 
 impl Core {
@@ -75,6 +84,9 @@ impl Core {
             drain: Mutex::new(None),
             acquire,
             changed,
+            connected: watch::Sender::new(false),
+            exec: super::update::exec,
+            allow_downgrade: AtomicBool::new(false),
         }))
     }
 
@@ -115,10 +127,94 @@ impl Core {
     }
 
     /// Journal `command` and carry it out. An external runner cannot be stopped, so a drain or
-    /// a quarantine is refused.
+    /// a quarantine is refused; an update is refused when the node could not install it.
     pub fn command(&self, command: Command, now: u64) -> Result<CommandAck> {
-        let managed = self.runner.is_some();
-        self.update(|p| p.command(command, now, managed))
+        let update = match &command.op {
+            // Looked at only for an update: it reads the filesystem.
+            Operation::Update { version, .. } => {
+                let installed = lock(&self.persisted).installed.clone();
+                super::update::can_replace(installed.as_deref(), &self.dir).and_then(|()| {
+                    super::update::check_version(
+                        env!("CARGO_PKG_VERSION"),
+                        version,
+                        self.allow_downgrade(),
+                    )
+                })
+            }
+            _ => Ok(()),
+        };
+        let can = Abilities {
+            managed: self.runner.is_some(),
+            update,
+        };
+        self.update(|p| p.command_as(command, now, &can))
+    }
+
+    /// Change the persisted state through `f` and execute `exe` in this process's place —
+    /// with `alarm(2)` armed for the trial deadline `alarm_at` when given — holding the
+    /// state's lock throughout: nothing this process does meanwhile, an ack recorded or a
+    /// runner started for the state `f` leaves, can come between the change on disk and the
+    /// binary that follows it. Returns only on failure, with the state on disk as it was
+    /// before.
+    pub fn leave(
+        &self,
+        f: impl FnOnce(&mut Persisted),
+        exe: &Binary,
+        alarm_at: Option<u64>,
+    ) -> anyhow::Error {
+        let persisted = lock(&self.persisted);
+        let mut next = persisted.clone();
+        f(&mut next);
+        if let Err(e) = next.save(&self.dir) {
+            return e;
+        }
+        let e = (self.exec)(exe, alarm_at);
+        // Not executed: the change is undone on disk — it described a binary that is not
+        // running.
+        if let Err(undo) = persisted.save(&self.dir) {
+            return e.context(format!("and restoring the node state failed: {undo:#}"));
+        }
+        e
+    }
+
+    /// Execute binaries through `exec` rather than for real.
+    #[cfg(test)]
+    pub fn set_exec(&mut self, exec: fn(&Binary, Option<u64>) -> anyhow::Error) {
+        self.exec = exec;
+    }
+
+    /// Change the persisted state through `f`, as a command would: on disk first.
+    pub fn change<R>(&self, f: impl FnOnce(&mut Persisted) -> R) -> Result<R> {
+        self.update(f)
+    }
+
+    /// The persisted state as it stands.
+    pub fn persisted(&self) -> Persisted {
+        lock(&self.persisted).clone()
+    }
+
+    /// Let updates install older versions, as `[node] allow_downgrade` says.
+    pub fn set_allow_downgrade(&self, allow: bool) {
+        self.allow_downgrade.store(allow, Ordering::Relaxed);
+    }
+
+    pub fn allow_downgrade(&self) -> bool {
+        self.allow_downgrade.load(Ordering::Relaxed)
+    }
+
+    /// The node dir.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Note whether a session with the hub is up.
+    pub fn set_connected(&self, up: bool) {
+        self.connected.send_replace(up);
+    }
+
+    /// Follows whether a session with the hub is up.
+    pub fn connected(&self) -> watch::Receiver<bool> {
+        self.connected.subscribe()
     }
 
     pub fn recorded(&self, ack: &CommandAck, now: u64) -> Result<()> {
@@ -184,6 +280,7 @@ impl Core {
             drain: (persisted.state == NodeState::Draining)
                 .then(|| *lock(&self.drain))
                 .flatten(),
+            update: persisted.update.clone(),
             ..Report::default()
         }
     }
@@ -261,6 +358,10 @@ impl Core {
 
     /// While draining, read where the drain stands and finish it once complete.
     fn drain_step(&self, cfg: &Config) -> Result<()> {
+        let now = super::session::now_secs();
+        if self.update(|p| p.drain_expired(now))? {
+            say!("the update's command expired before the drain finished");
+        }
         if self.state() != NodeState::Draining {
             self.set(&self.drain, None);
             return Ok(());
@@ -275,7 +376,7 @@ impl Core {
             active_jobs: u32::try_from(jobs.len()).unwrap_or(u32::MAX),
         };
         self.set(&self.drain, Some(progress));
-        if drained(&progress) && self.update(Persisted::finish_drain)? {
+        if drained(&progress) && self.update(|p| p.finish_drain(now))? {
             say!("drained");
             self.set(&self.drain, None);
         }

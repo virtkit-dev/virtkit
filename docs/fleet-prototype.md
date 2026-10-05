@@ -20,17 +20,18 @@ The prototype provides, all experimentally:
   `drain`, `undrain`, `quarantine`, `release`), and the audit log (`vk-hub audit`);
 - on the hub, the `vk` releases it holds (`vk-hub release`) and updates naming one (`vk-hub
   nodes update`), each release served only to a node updating to it;
+- on the node, those updates, run on trial and rolled back to the previous binary when the
+  release does not pass;
 - `vk-hub workloads`: each node's VMs;
 - live nodes and node detail pages, steering from a node's page, and an audit log, with
   sign-in links from `vk-hub ui login`.
 
-A node does not apply an update yet: it refuses one. Rollouts, resets, restart and redeploy
-are not built.
+Release signing, rollouts, resets, restart and redeploy are not built.
 
 | Capability | Current prototype | Proposed gate |
 |---|---|---|
 | Hub recovery | Reissues its stored desired state above a newer node generation; adopts the node's applied state when it holds none | [Preserve node restrictions and resolve the recovery conflict explicitly](fleet-design.md#proposed-recovery-after-a-hub-restore) |
-| Update validation | Not built | [A pinned boot/exec/network/cleanup workload required for unattended rollouts](fleet-design.md#updates) |
+| Update validation | `vk check`, an optional local validation command, then hub reconnection | [A pinned boot/exec/network/cleanup workload required for unattended rollouts](fleet-design.md#updates) |
 | Canary promotion | Not built | [Representative workload success and an observation window](fleet-design.md#updates) |
 | Release trust | Not built | [Pinned keys required for remote updates; explicit development opt-out](fleet-design.md#updates) |
 | Reset | Not built | [Explicit job process ownership, verified empty before scratch removal](fleet-design.md#resets) |
@@ -88,7 +89,8 @@ base64 signature; the `maintenance` and `validating` states; the update's progre
 report; and a release download, `GET /v1/releases/<sha256>`, signed by the node under the
 label `vk-fleet release-download v1` over its ID, the release's 32-byte sha256, the time (`u64`)
 and the channel, sent in the `vk-node`, `vk-time` and `vk-signature` headers. The hub issues
-updates and serves releases (see [Releases](#releases)); a node refuses an update.
+updates and serves releases (see [Releases](#releases)), and a node applies them (see
+[Update trial and rollback](#update-trial-and-rollback)).
 
 The hub admits at most 256 connections that have not authenticated, each step of which (TLS,
 request headers, an enrollment body, a handshake message) has 10 seconds. One past that is
@@ -191,7 +193,8 @@ log keeps the latest 100,000 lines.
 
 `vk node run` keeps what its hub asks in `<state_dir>/node/state.json`, `0600`, rewritten whole
 and renamed into place: the desired-state generation it last applied, its own state (`ready`,
-`draining`, `drained` or `quarantined`), and a journal of the commands it received. A
+`draining`, `drained`, `maintenance`, `validating` or `quarantined`), a journal of the commands
+it received, and the update under way. A
 generation no newer than the applied one is ignored, so each is applied at most once. A
 command is journaled by its ID, together with the change it makes, before anything acts on it;
 one delivered again is answered from its entry rather than run again, and one received past its
@@ -206,7 +209,9 @@ carries its VMs alone; what it persisted still applies.
 
 A drain is `accepted`, and its ack moves to `done` once the node is drained, or to `failed` if
 an `undrain` or a `quarantine` ends it first; a drain of a drained node is `done` at once.
-Any other command the node can carry out is `done` when received. Drain and quarantine need a runner the node runs
+An update is `accepted` too, and ends `done` or `failed` ([Update trial and
+rollback](#update-trial-and-rollback)). Any other command the node can carry out is `done`
+when received. Drain and quarantine need a runner the node runs
 itself: with an external runner the node refuses both, and reports a stop of acquisition in
 the desired state as something it cannot carry out (`unsupported`), while still setting the
 runner's concurrency. Each change is written, and its directory fsynced, before the ack goes
@@ -282,6 +287,80 @@ connection; once authenticated, a download no longer counts against the connecti
 listener allows before authentication, and may hold its connection for 30 minutes past the 30
 seconds any connection gets. At most 64 downloads run at once; past that the request is
 answered HTTP 503, to be retried.
+
+## Maintenance transitions
+
+An update is taken from `ready`, `draining` or `drained` and drains the node first (a drain
+already under way is joined, and the node returns to `drained` after); `maintenance` covers
+the download and the switch, `validating` the release's trial, and the node then returns to
+the state it came from — or enters a quarantine that arrived meanwhile, which is in force from
+the moment it is received since maintenance takes no jobs. While the node still drains,
+`undrain` or `quarantine` call the update off; once maintenance has begun, the update runs to
+its end: a `drain` makes it end `drained`, a `release` withdraws a quarantine received
+meanwhile, and an `undrain` or another update is refused. A quarantined node refuses an
+update. What `validating` runs is `vk check`'s gate and `[node] validate`, an argv of the
+operator's that must exit 0 within `validate_timeout_secs` (600 by default) — booting a small
+image with `$VK_BINARY`, the release on trial, is the intended use. The report carries
+the update's phase (`draining`, `downloading`, `validating`, then `done`, `rolled_back` or
+`failed`, with the reason), and the inventory the sha256 of the `vk` the node runs.
+
+## Update trial and rollback
+
+An update names its release by sha256 and size, and may give a time limit, `within_secs`,
+counted from the end of the drain; a drain still under way when the command expires calls the
+update off. After the drain, the node downloads the release into
+`<state_dir>/node/releases/<sha256>` — a private file renamed into place once it hashes to the
+sha256 and is no longer than the size — runs its `--version` (`vk-selfupdate`'s smoke test,
+killed past 30 seconds), keeps the running binary beside it under its own sha256, and executes
+the release in its own place with a trial recorded in its state, flushed to disk: the
+installed binary's path and its device and inode, the attempts, and a deadline —
+`validate_timeout_secs` plus ten minutes on, or the command's limit if that comes first.
+
+The installed binary is the file the last `vk node run` not started from a release executed,
+as the kernel names it — a symlink is followed, and its target is what an update replaces, so
+a `vk` reached through a link into a versioned directory has that directory's file replaced.
+The path is recorded in the node's state, never read off a release running from the releases
+directory, and an update is refused while it is unknown, gone, inside the node's own
+directory, or in a directory the node's user cannot write.
+
+The installed binary is not touched during the trial, so whatever starts `vk node run` next —
+a supervisor restarting a release that crashed or was ended, or a person — starts the previous
+binary, which counts the attempt and hands over to the release again while it still hashes to
+what was downloaded, and past three attempts, past the deadline, or when it no longer hashes
+ends the update as rolled back and runs on itself. A release that dies before it can count
+anything is counted all the same. The binary that executes a release on trial arms `alarm(2)`
+for a minute past the deadline across the exec, and the release arms it again before anything
+else runs, so the kernel ends a release that hangs — even one that is no `vk` at all — and the
+previous binary, restarted, finds the deadline past; a release that does not hang rolls back
+at the deadline itself. The alarm is disarmed once the trial is confirmed. A node without a
+supervisor that restarts `vk node run` stays down until someone starts it.
+
+On trial the release validates, waits for a session with the hub, and only then copies itself
+beside the installed binary — checking what it copied against the sha256 — and renames it into
+place, ending the update done; it then executes the installed binary, so the node never goes
+on running from its releases directory. A failure or the deadline ends it as rolled back: the
+release executes the installed binary, or failing that the copy kept of it, whichever still
+hashes to what the release replaced; with neither, it quarantines the node, for an operator,
+rather than run on as ready. An installed binary that is no longer the file the trial started
+from — replaced by hand or a package manager meanwhile — is not overwritten: the update fails,
+and the node runs what is installed. A crash during the download leaves the node in
+`maintenance`, which the next start takes up again; one between recording the trial and
+executing the release is the first attempt counted; one during the install is finished by
+the next start. The update's ack is `done`, or `failed` with the reason — `rolled back: …`
+when the release ran. After an update the release and the binary before it are kept in
+`releases/`, and after a rollback the binary running; everything else there is removed.
+
+A release that validates but cannot reach the hub by the deadline is rolled back. The
+previous binary downloaded the release from the hub just before the switch, so the trial
+treats lost connectivity as a release failure: keeping it could leave the node unreachable
+by its hub. If the hub went down meanwhile, the update must be retried.
+
+An update is refused on a node whose runner is external unless issued with `--force`: such a
+runner cannot be drained, so jobs running across the switch run their later stages with the
+new `vk` — the one thing draining exists to prevent. It is refused, too, for an older version
+than the node runs unless the node's own `[node] allow_downgrade = true` allows it, and even
+then for one older than 0.85.0, the first release that takes part in a trial; versions are
+compared as `MAJOR.MINOR.PATCH`, and an older one that is not of that form is refused.
 
 ## Workloads
 

@@ -19,8 +19,8 @@ embedded database, no replication.
   link the executor, admission, the concurrency controller and self-update in-process, dial
   the hub, and apply what the hub asks within what local policy allows; today it enrolls,
   reports inventory, heartbeats and workloads, sets its runner's concurrency, keeps the
-  desired state and commands it is sent, and runs a managed gitlab-runner, which it drains
-  and quarantines.
+  desired state and commands it is sent, runs a managed gitlab-runner, which it drains
+  and quarantines, and updates its own `vk` on trial.
 - **`vk-hub`** — the hub binary: inventory, desired state, operations, audit log, web UI, and
   later the generic job queue. Its database is `redb`, as `vk-registry`'s accounts store is.
 - **`vk-hub-proto`** — the hub↔node wire types, versioned, beside the VM list `vk workloads`
@@ -86,7 +86,7 @@ Then:
   few seconds — at an interval the hub sets, since the hub decides when a quiet node counts
   as unreachable — and command progress and results.
 - **hub → node**: desired state, as a document with a generation number; operations
-  (`drain`, `quarantine` and their reverses; proposed, `update` and `reset`), each with an ID
+  (`drain`, `quarantine` and their reverses, `update`; proposed, `reset`), each with an ID
   and an expiry.
 
 Steering — desired state, commands and their outcomes — takes protocol version 2 on both
@@ -203,11 +203,13 @@ managed runner; the prototype refuses drain and quarantine with an external runn
 [drain and runner lifecycle](fleet-prototype.md#drain-and-runner-lifecycle) for observations,
 runner adoption and transitions.
 
-The `validating` gate runs a boot/exec/network smoke test and, when configured, a
-representative synthetic job before the node goes back to `ready`.
+The intended `validating` gate runs a boot/exec/network smoke test and, when configured, a
+representative synthetic job before the node goes back to `ready`. The prototype's default is
+weaker: the workload test depends on the operator configuring `[node] validate`.
 
-`ready`, `draining`, `drained` and `quarantined` are built; `maintenance` and `validating`
-are not.
+All six states are built; an update is what takes a node through `maintenance` and
+`validating`. The prototype's [maintenance transitions](fleet-prototype.md#maintenance-transitions)
+define how concurrent drain, quarantine and update requests interact.
 
 A node that stops heartbeating is shown as unreachable, not paused: pausing every
 disconnected node would turn a hub outage into a fleet outage.
@@ -233,6 +235,14 @@ Fleet updates add:
 - one `vk` binary per job for the job's whole life: executor stages running during a switch
   must not mix versions, which draining guarantees.
 
+Built: a node drains, downloads and checks the release, and runs it on trial with the
+installed binary untouched; the release must pass `vk check`'s gate and `[node] validate`, and
+reach the hub again, before it installs itself, and a failure, repeated crashes at start or
+the trial's deadline hand the node back to the previous binary. See
+[update trial and rollback](fleet-prototype.md#update-trial-and-rollback) for the binary
+switch, restart deadlines, installed-path checks and the external-runner exception. Release
+signatures are not checked yet.
+
 Proposed release trust: remote updates require at least one locally pinned signing key and a
 valid signature by default. A node may opt out explicitly for development; the hub cannot
 grant that exception, and the node's report and UI must show it. Official release signing is
@@ -254,7 +264,7 @@ a quiet node does not satisfy the gate merely by waiting. Persist the evidence a
 with the rollout so a hub restart does not bypass them. Allow operator-defined canary groups
 for material configuration differences, such as VMM version, kernel and executor settings,
 alongside the hardware profile. Show uncovered groups before starting a rollout. This gate is
-not built, nor are rollouts or a node applying an update.
+not built, nor are rollouts.
 
 Release downloads are authenticated and scoped to a pending update; their bytes do not ride on
 the control session. The hub stores and serves releases this way
@@ -350,11 +360,10 @@ model, commands and process handling.
   the operations local policy allows.
 - Node identities are pinned keys, revoked from the hub (`vk-hub nodes remove`); rotation is
   not built. Enrollment tokens are short-lived and single-use.
-- Proposed: a hub chooses which release a node updates to, never whether it may go back: a
-  node refuses an older `vk` than it runs unless its own configuration allows it
-  (`[node] allow_downgrade`), since an override the hub carried would be worth nothing
-  against a compromised hub — which could otherwise take the fleet back to a release with a
-  known flaw, signed or not.
+- A hub chooses which release a node updates to, never whether it may go back: a node refuses
+  an older `vk` than it runs unless its own configuration allows it (`[node] allow_downgrade`),
+  since an override the hub carried would be worth nothing against a compromised hub — which
+  could otherwise take the fleet back to a release with a known flaw, signed or not.
 - Proposed: runner authentication tokens stay on their nodes, and the hub's GitLab
   credential is a separate one, scoped to managing runners (pause, resume, list).
 - Hub roles: viewer; operator (ceilings, stopping acquisition, drain and quarantine; reset

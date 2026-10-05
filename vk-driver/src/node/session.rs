@@ -229,6 +229,7 @@ pub async fn run(
         opened = opened => opened?,
         () = stopped(stop) => return Ok(()),
     };
+    let _up = Connected::mark(&node.core);
     // The hub pings at the interval it asked for, so its silence is judged by that one; the
     // node's own heartbeats keep to the clamped one.
     let quiet = Duration::from_secs(u64::from(asked.max(1))) * MISSED_HEARTBEATS;
@@ -337,6 +338,22 @@ pub async fn run(
     }
 }
 
+/// Marks the hub reached for as long as it lives: from the welcome to the session's end.
+struct Connected<'a>(&'a Core);
+
+impl<'a> Connected<'a> {
+    fn mark(core: &'a Core) -> Self {
+        core.set_connected(true);
+        Connected(core)
+    }
+}
+
+impl Drop for Connected<'_> {
+    fn drop(&mut self) {
+        self.0.set_connected(false);
+    }
+}
+
 /// Once `stop` is raised. Its `Ref` is dropped here, so a `select!` can wait on it again
 /// inside another branch's handler. A dropped sender counts too: nothing is left to say
 /// otherwise.
@@ -435,7 +452,7 @@ async fn handle(msg: HubMsg, node: &Node, version: u32) -> Result<Option<Command
 }
 
 /// Seconds since the Unix epoch, which command expiries count in.
-fn now_secs() -> u64 {
+pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -1174,6 +1191,47 @@ mod tests {
             .unwrap()
             .journal;
         assert_eq!(journal.len(), 1);
+    }
+
+    /// An update the node could not install is refused with the reason, and the node stays
+    /// ready; the hub counts as reached for as long as the session lasts, which is what a
+    /// release on trial waits for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_update_the_node_cannot_install_is_refused_and_the_session_marks_the_hub_reached() {
+        let mut f = fixture("update").await;
+        let (node, gatherer, stopped, listener, stop) = f.parts();
+        let key = node.identity.public_key().to_vec();
+        let connected = node.core.connected();
+        assert!(!*connected.borrow());
+        let update = command(Operation::Update {
+            version: "0.84.0".into(),
+            sha256: "ab".repeat(vk_hub_proto::SHA256_LEN),
+            size: 1,
+            signature: None,
+            force: true,
+            within_secs: None,
+        });
+        let hub = async {
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, PROTOCOL, STEERING).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            next_of(&mut ws, report_of).await;
+            assert!(*connected.borrow());
+            hub_send(&mut ws, &HubMsg::Command(update)).await;
+            let ack = next_of(&mut ws, ack_of).await;
+            assert!(
+                matches!(&ack.outcome, Outcome::Refused { reason } if reason.contains("installed vk")),
+                "{ack:?}"
+            );
+            stop.send(true).unwrap();
+            while hub_receive(&mut ws).await.is_some() {}
+        };
+        let (_, ended) = tokio::join!(hub, run(node, gatherer, stopped));
+        ended.unwrap();
+        assert!(!*connected.borrow());
+        let report = node.core.report();
+        assert_eq!(report.state, Some(vk_hub_proto::NodeState::Ready));
+        assert_eq!(report.update, None);
     }
 
     /// With a managed runner, a drain stops it and is reported draining until the runner has
