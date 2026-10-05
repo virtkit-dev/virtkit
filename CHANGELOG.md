@@ -15,6 +15,8 @@ All notable changes to virtkit will be documented in this file.
 
 - **A VM without `--pmu` now has no PMU on AMD hosts either.** It used to be hidden only on
   Intel; on AMD the guest could still read the host's performance counters.
+- Jobs under an egress allowlist (enforced or audited) no longer report a spurious `egress
+  denied (dns) an unparsable question` at boot.
 
 ### Removed
 
