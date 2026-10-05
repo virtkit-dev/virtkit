@@ -160,11 +160,11 @@ const DIRTY_CLUSTER: u64 = 64 * 1024;
 
 /// Guest-logical clusters mutated since the last drain, split so the virtkit build backend can
 /// capture only a checkpoint's delta instead of the whole cumulative overlay. `written` holds
-/// clusters any write touched (to read and push as data); `discarded` holds clusters any discard
-/// or write-zeroes touched. A write wins over a discard at the 64 KiB cluster granularity: a
-/// cluster present in both was only partly freed, so it must be read whole (the overlay reflects
-/// the true content, zeroed sub-parts included) rather than holed — [`Self::take`] subtracts the
-/// written set out of the discarded one. A host-side control connection (see
+/// clusters any write, or the partial edge of a write-zeroes, touched (to read and push as
+/// data); `discarded` holds clusters a discard or write-zeroes fully covered. A write wins over
+/// a discard at the 64 KiB cluster granularity: a cluster freed and then written, or written
+/// and then freed, must be read whole (the overlay reflects its true content) rather than holed
+/// — [`Self::take`] subtracts the written set out of the discarded one. A host-side control connection (see
 /// [`Block::spawn_dirty_control`]) drains both at each checkpoint.
 #[derive(Default)]
 pub(crate) struct DirtyRanges {
@@ -180,10 +180,10 @@ impl DirtyRanges {
         }
     }
 
-    /// Record that `[offset, offset+len)` was freed or zeroed (discard / write-zeroes). Only
-    /// whole clusters *fully* inside the range become holes — a partial cluster at either end
-    /// may still hold live data (an ext4 block freed next to live ones in the same 64 KiB
-    /// cluster), so rounding a hole outward would zero that data. Writes round outward instead
+    /// Record that `[offset, offset+len)` was freed (discard, or the middle of a write-zeroes;
+    /// see [`Self::record_zeroes`]). Only whole clusters *fully* inside the range become holes —
+    /// a partial cluster at either end may still hold live data (an ext4 block freed next to live
+    /// ones in the same 64 KiB cluster), so rounding a hole outward would zero that data. Writes round outward instead
     /// (see [`cluster_range`]): touching any part of a cluster keeps it read whole.
     fn record_discard(&mut self, offset: u64, len: u64) {
         if len == 0 {
@@ -194,6 +194,30 @@ impl DirtyRanges {
         for c in first..end_cluster {
             self.discarded.insert(c);
         }
+    }
+
+    /// Record that `[offset, offset+len)` now reads as zeroes (write-zeroes). Whole clusters
+    /// inside the range become holes as for a discard; a partial cluster at either end keeps
+    /// live data beside the zeroed bytes, so it is recorded written — read whole — rather than
+    /// left out of both sets, where the checkpoint would keep its old contents.
+    fn record_zeroes(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let end = offset + len;
+        let first = offset.div_ceil(DIRTY_CLUSTER) * DIRTY_CLUSTER;
+        let last = end / DIRTY_CLUSTER * DIRTY_CLUSTER;
+        if first >= last {
+            self.record_write(offset, len);
+            return;
+        }
+        if offset < first {
+            self.record_write(offset, first - offset);
+        }
+        if last < end {
+            self.record_write(last, end - last);
+        }
+        self.record_discard(first, last - first);
     }
 
     /// Take the written clusters and the purely-discarded ones (discarded minus written) as
@@ -325,6 +349,38 @@ mod dirty_tests {
     }
 
     #[test]
+    fn a_partial_cluster_write_zeroes_reads_its_edges_whole() {
+        // Zeroing [half of cluster 0 .. half of cluster 3): clusters 1 and 2 are holes, and
+        // the zeroed halves of 0 and 3 must reach the checkpoint, so those are written.
+        let mut d = DirtyRanges::default();
+        d.record_zeroes(DIRTY_CLUSTER / 2, 3 * DIRTY_CLUSTER);
+        let (written, discarded) = d.take(10 * DIRTY_CLUSTER);
+        assert_eq!(
+            written,
+            vec![(0, DIRTY_CLUSTER), (3 * DIRTY_CLUSTER, DIRTY_CLUSTER)]
+        );
+        assert_eq!(discarded, vec![(DIRTY_CLUSTER, 2 * DIRTY_CLUSTER)]);
+        // Inside one cluster: no hole, the cluster is written.
+        d.record_zeroes(4096, 4096);
+        assert_eq!(
+            d.take(10 * DIRTY_CLUSTER),
+            (vec![(0, DIRTY_CLUSTER)], vec![])
+        );
+        // Two partial clusters with no whole one between: both written, no hole.
+        d.record_zeroes(48 * 1024, 32 * 1024);
+        assert_eq!(
+            d.take(10 * DIRTY_CLUSTER),
+            (vec![(0, 2 * DIRTY_CLUSTER)], vec![])
+        );
+        // Cluster-aligned: holes only.
+        d.record_zeroes(DIRTY_CLUSTER, DIRTY_CLUSTER);
+        assert_eq!(
+            d.take(10 * DIRTY_CLUSTER),
+            (vec![], vec![(DIRTY_CLUSTER, DIRTY_CLUSTER)])
+        );
+    }
+
+    #[test]
     fn a_zero_length_request_dirties_nothing() {
         // The empty case `cluster_range` exists to express: a request touching no byte must
         // dirty no cluster — not the one holding `offset`, which rounding an unaligned offset
@@ -447,11 +503,16 @@ impl DiskProperties {
         self.dirty.lock().unwrap().record_write(offset, len);
     }
 
-    /// Record a guest discard / write-zeroes for the dirty tracker (no-op unless tracking was
-    /// enabled). Called by the block worker after each request that frees or zeroes clusters,
-    /// so the checkpoint represents them as holes rather than reading or reusing stale data.
+    /// Record a guest discard for the dirty tracker (no-op unless tracking was enabled).
+    /// Called by the block worker after each request that frees clusters, so the checkpoint
+    /// represents them as holes rather than reading or reusing stale data.
     pub(crate) fn record_discard(&self, offset: u64, len: u64) {
         self.dirty.lock().unwrap().record_discard(offset, len);
+    }
+
+    /// See [`DirtyRanges::record_zeroes`].
+    pub(crate) fn record_zeroes(&self, offset: u64, len: u64) {
+        self.dirty.lock().unwrap().record_zeroes(offset, len);
     }
 
     pub fn image_id(&self) -> &[u8] {

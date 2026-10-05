@@ -201,3 +201,9 @@ than one byte past the decompressed length its `.vk_ro_img` entry claims, then r
 does not come to exactly that length: a frame that inflates beyond it (the chunks come from a
 registry anyone with push access fills) is no longer held whole in memory first. Forward-ported
 from the 1.19 tree. Search for `take(u64::from(chunk.length) + 1)`.
+
+`src/devices/src/virtio/block/{device.rs,worker.rs}` — a write-zeroes records the partial
+clusters at its ends as written, not only its whole clusters as holes. The 1.19 tree recorded
+it as a discard, which rounds inward, so the zeroed bytes of a partial head or tail cluster
+reached neither set and a checkpoint kept that cluster's old contents. Not yet in the 1.19
+tree. Covered by `a_partial_cluster_write_zeroes_reads_its_edges_whole`.

@@ -334,6 +334,8 @@ impl BlockWorker {
                     )
                     .map_err(RequestError::Discarding)?;
                 drop(diskfile);
+                // A discard's partial edge clusters stay out of the written set: what the format
+                // layer zeroes inside them is content DISCARD leaves undefined anyway.
                 disk.record_discard(
                     discard_write_data.sector * 512,
                     discard_write_data.num_sectors as u64 * 512,
@@ -365,8 +367,9 @@ impl BlockWorker {
                     )
                     .map_err(RequestError::WritingZeroes)?;
                 }
-                // Freed or zeroed either way — record as a discard so the checkpoint holes it.
-                disk.record_discard(
+                // Zeroed either way: whole clusters are holed, a partial one at an end is read
+                // whole.
+                disk.record_zeroes(
                     discard_write_data.sector * 512,
                     discard_write_data.num_sectors as u64 * 512,
                 );
