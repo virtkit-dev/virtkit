@@ -2650,7 +2650,11 @@ async fn an_operator_steers_a_node_from_its_page() {
         .record_report(
             &node,
             vk_hub_proto::Report {
-                applied_generation: Some(4),
+                applied: Some(vk_hub_proto::DesiredState {
+                    generation: 4,
+                    ceiling: None,
+                    acquisition: Acquisition::Run,
+                }),
                 state: Some(NodeState::Draining),
                 acquisition: Some(Acquisition::Stop),
                 unsupported: vec![format!("no {hostile}")],

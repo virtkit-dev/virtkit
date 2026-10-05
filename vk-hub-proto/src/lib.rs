@@ -548,9 +548,10 @@ pub struct Report {
     /// VMs running but left out of `workloads`.
     #[serde(default)]
     pub workloads_omitted: u32,
-    /// The last desired-state generation applied; `None` before the first.
+    /// The last applied desired state; `None` before the first. A hub with no desired state
+    /// for the node adopts it to preserve the node's restrictions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub applied_generation: Option<u64>,
+    pub applied: Option<DesiredState>,
     /// What of the applied desired state this node cannot carry out, in words.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unsupported: Vec<String>,
@@ -577,6 +578,10 @@ pub struct Report {
 }
 
 impl Report {
+    pub fn applied_generation(&self) -> Option<u64> {
+        self.applied.as_ref().map(|d| d.generation)
+    }
+
     /// This report as a session below [`STEERING`] carries it: its workloads alone.
     pub fn without_steering(self) -> Report {
         Report {
@@ -1400,7 +1405,11 @@ mod tests {
         Report {
             workloads: Some(vec![workload()]),
             workloads_omitted: 1,
-            applied_generation: Some(4),
+            applied: Some(DesiredState {
+                generation: 4,
+                ceiling: Some(4),
+                acquisition: Acquisition::Stop,
+            }),
             unsupported: vec!["stop acquisition".into()],
             state: Some(NodeState::Draining),
             acquisition: Some(Acquisition::Stop),
@@ -1499,7 +1508,7 @@ mod tests {
                 "type": "report",
                 "workloads": [serde_json::to_value(workload()).unwrap()],
                 "workloads_omitted": 1,
-                "applied_generation": 4,
+                "applied": {"generation": 4, "ceiling": 4, "acquisition": "stop"},
                 "unsupported": ["stop acquisition"],
                 "state": "draining",
                 "acquisition": "stop",

@@ -193,9 +193,28 @@ pub struct NodeRow {
     /// The node's latest report of itself, without its workloads: those are kept apart.
     #[serde(default)]
     pub report: Option<Report>,
-    /// What the hub wants of the node; `None` until an operator first asks for anything.
+    /// What the hub wants of the node; `None` until an operator sets it or the hub adopts the
+    /// node's reported applied state.
     #[serde(default)]
     pub desired: Option<DesiredState>,
+    /// Fields of `desired` set by an operator on the defaults before the node's state was
+    /// known. Unset fields come from the node's applied state when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_on_defaults: Option<SetFields>,
+}
+
+/// Which fields of a desired state an operator set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetFields {
+    pub ceiling: bool,
+    pub acquisition: bool,
+}
+
+/// One change an operator makes to what the hub wants of a node.
+#[derive(Clone, Copy, Debug)]
+pub enum DesiredChange {
+    Ceiling(Option<u32>),
+    Acquisition(Acquisition),
 }
 
 /// A command issued to a node, and what the node last said it came to.
@@ -720,6 +739,11 @@ impl Db {
     ///
     /// After a hub restore, a node may report a newer generation. Reissue desired state one
     /// generation above the node's, since it ignores generations at or below the one applied.
+    /// A hub with no desired state for the node — restored from a backup older than its
+    /// steering, or after a hub of protocol version 1 rewrote the row — adopts what the node
+    /// applied instead, so the node keeps the restrictions it was given. Changes an operator
+    /// made in that state before the node reported what it applied are applied onto the node's,
+    /// past its generation, rather than onto the defaults they were made on.
     pub fn record_report(&self, id: &str, mut report: Report, now: u64) -> Result<()> {
         let workloads = report.workloads.take().map(|listed| {
             // Bounded again, as the node bounds them: what it sends is not trusted to be.
@@ -743,21 +767,81 @@ impl Db {
                 .into_iter()
                 .map(|e| ("node".to_string(), e))
                 .collect();
-            let ours = row.desired.as_ref().map_or(0, |d| d.generation);
-            if let Some(theirs) = report.applied_generation
-                && theirs > ours
-            {
-                let mut desired = row.desired.clone().unwrap_or(DEFAULT_DESIRED);
-                desired.generation = theirs.saturating_add(1);
-                events.push((
-                    "hub".to_string(),
-                    format!(
-                        "the node applied generation {theirs}, past this hub's {ours}: \
-                         re-issued the desired state as generation {}",
-                        desired.generation
-                    ),
-                ));
-                row.desired = Some(desired);
+            // A report without `applied` (a fresh node, or a session at protocol version 1)
+            // leaves `set_on_defaults` for the next one that has it.
+            let set = if report.applied.is_some() {
+                row.set_on_defaults.take()
+            } else {
+                None
+            };
+            match (&row.desired, &report.applied, set) {
+                (Some(ours), Some(theirs), Some(set)) => {
+                    let mut merged = DesiredState {
+                        generation: theirs.generation,
+                        ceiling: if set.ceiling {
+                            ours.ceiling
+                        } else {
+                            theirs.ceiling
+                        },
+                        acquisition: if set.acquisition {
+                            ours.acquisition
+                        } else {
+                            theirs.acquisition
+                        },
+                    };
+                    let same = |s: &DesiredState| (s.ceiling, s.acquisition);
+                    if ours.generation > theirs.generation && same(&merged) == same(ours) {
+                        // Ours already carries the change past the node's generation, and may
+                        // be in flight: it stands, as the generation must never go back.
+                        merged.generation = ours.generation;
+                    } else if merged != *theirs || ours.generation > theirs.generation {
+                        merged.generation =
+                            ours.generation.max(theirs.generation).saturating_add(1);
+                        events.push((
+                            "hub".to_string(),
+                            format!(
+                                "applied the operator's change onto the node's desired state, \
+                                 generation {}",
+                                merged.generation
+                            ),
+                        ));
+                    } else if ours != theirs {
+                        events.push((
+                            "hub".to_string(),
+                            format!(
+                                "adopted the node's desired state, generation {}",
+                                theirs.generation
+                            ),
+                        ));
+                    }
+                    row.desired = Some(merged);
+                }
+                (None, Some(applied), _) => {
+                    events.push((
+                        "hub".to_string(),
+                        format!(
+                            "adopted the node's desired state, generation {}",
+                            applied.generation
+                        ),
+                    ));
+                    row.desired = Some(applied.clone());
+                }
+                (Some(ours), Some(theirs), None) if theirs.generation > ours.generation => {
+                    let desired = DesiredState {
+                        generation: theirs.generation.saturating_add(1),
+                        ..ours.clone()
+                    };
+                    events.push((
+                        "hub".to_string(),
+                        format!(
+                            "the node applied generation {}, past this hub's {}: re-issued \
+                             the desired state as generation {}",
+                            theirs.generation, ours.generation, desired.generation
+                        ),
+                    ));
+                    row.desired = Some(desired);
+                }
+                _ => {}
             }
             row.report = Some(report);
             row.last_seen = Some(now);
@@ -779,36 +863,53 @@ impl Db {
         })
     }
 
-    /// Change what the hub wants of node `id` through `change`, from the defaults — no
-    /// ceiling, acquisition running — when nothing was wanted yet, audited as `actor` doing
-    /// `what`. A change takes the next generation after both the hub's and the one the node
-    /// last reported applying, so it is newer to the node whatever the hub has forgotten; one
-    /// that changes nothing is not stored. Returns the new desired state, or `None` when it was
-    /// already so. A node only monitored is refused ([`MonitoringOnly`]).
+    /// Change what the hub wants of node `id` by `change`, from the defaults — no ceiling,
+    /// acquisition running — when nothing was wanted yet, audited as `actor` doing `what`. A
+    /// change takes the next generation after both the hub's and the one the node last reported
+    /// applying, so it is newer to the node whatever the hub has forgotten; one that changes
+    /// nothing is not stored. While the hub knows nothing the node applied, a change made on
+    /// the defaults is recorded as set, even to a default value, so that
+    /// [`Db::record_report`] applies it onto the node's state once reported. Returns the new
+    /// desired state, or `None` when it was already so. A node only monitored is refused
+    /// ([`MonitoringOnly`]).
     pub fn set_desired(
         &self,
         id: &str,
-        change: impl FnOnce(&mut DesiredState),
+        change: DesiredChange,
         actor: &str,
         what: &str,
         now: u64,
     ) -> Result<Option<DesiredState>> {
         self.update_txn(now, id, |row, _| {
             steerable(id, row)?;
+            let applied = row.report.as_ref().and_then(Report::applied_generation);
+            let mut set = row
+                .set_on_defaults
+                .or_else(|| (row.desired.is_none() && applied.is_none()).then(SetFields::default));
             let before = row.desired.clone().unwrap_or(DEFAULT_DESIRED);
             let mut next = before.clone();
-            change(&mut next);
-            if next.ceiling == before.ceiling && next.acquisition == before.acquisition {
+            let newly_set = match change {
+                DesiredChange::Ceiling(ceiling) => {
+                    next.ceiling = ceiling;
+                    set.as_mut()
+                        .is_some_and(|s| !std::mem::replace(&mut s.ceiling, true))
+                }
+                DesiredChange::Acquisition(acquisition) => {
+                    next.acquisition = acquisition;
+                    set.as_mut()
+                        .is_some_and(|s| !std::mem::replace(&mut s.acquisition, true))
+                }
+            };
+            if next == before && !newly_set {
                 // The unchanged row is still written back, without an fsync.
                 return Ok((None, Vec::new(), Durability::None));
             }
-            let applied = row
-                .report
-                .as_ref()
-                .and_then(|r| r.applied_generation)
-                .unwrap_or(0);
-            next.generation = before.generation.max(applied).saturating_add(1);
+            next.generation = before
+                .generation
+                .max(applied.unwrap_or(0))
+                .saturating_add(1);
             row.desired = Some(next.clone());
+            row.set_on_defaults = set;
             let event = format!("{actor} {what} (generation {})", next.generation);
             Ok((
                 Some(next),
@@ -1356,8 +1457,8 @@ fn report_events(previous: Option<&Report>, report: &Report) -> Vec<String> {
     {
         events.push(format!("state {}", state_name(state)));
     }
-    if previous.is_none_or(|p| p.applied_generation != report.applied_generation)
-        && let Some(generation) = report.applied_generation
+    if previous.is_none_or(|p| p.applied_generation() != report.applied_generation())
+        && let Some(generation) = report.applied_generation()
     {
         events.push(format!("applied generation {generation}"));
     }
@@ -2018,8 +2119,14 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let id = enrolled(&db);
         let set = |ceiling| {
-            db.set_desired(&id, |d| d.ceiling = ceiling, "uid 0", "set a ceiling", 5)
-                .unwrap()
+            db.set_desired(
+                &id,
+                DesiredChange::Ceiling(ceiling),
+                "uid 0",
+                "set a ceiling",
+                5,
+            )
+            .unwrap()
         };
         let d = set(Some(4)).unwrap();
         assert_eq!((d.generation, d.ceiling), (1, Some(4)));
@@ -2027,7 +2134,7 @@ mod tests {
         let d = db
             .set_desired(
                 &id,
-                |d| d.acquisition = Acquisition::Stop,
+                DesiredChange::Acquisition(Acquisition::Stop),
                 "uid 0",
                 "stopped acquisition",
                 5,
@@ -2050,7 +2157,13 @@ mod tests {
             ]
         );
         let err = db
-            .set_desired(&"0".repeat(32), |d| d.ceiling = None, "uid 0", "changed", 5)
+            .set_desired(
+                &"0".repeat(32),
+                DesiredChange::Ceiling(None),
+                "uid 0",
+                "changed",
+                5,
+            )
             .unwrap_err();
         assert!(err.is::<NotEnrolled>(), "{err:#}");
     }
@@ -2158,14 +2271,26 @@ mod tests {
     fn a_node_on_version_1_is_monitored_only() {
         let db = Db::open_memory().unwrap();
         let id = enrolled(&db);
-        db.set_desired(&id, |d| d.ceiling = Some(2), "uid 0", "set a ceiling", 1)
-            .unwrap()
-            .unwrap();
+        db.set_desired(
+            &id,
+            DesiredChange::Ceiling(Some(2)),
+            "uid 0",
+            "set a ceiling",
+            1,
+        )
+        .unwrap()
+        .unwrap();
         db.issue_command(&id, Operation::Drain, DAY, "uid 0", 1)
             .unwrap();
         assert!(db.record_session(&id, "ab", 1, 2, || true).unwrap());
         let err = db
-            .set_desired(&id, |d| d.ceiling = Some(3), "uid 0", "set a ceiling", 3)
+            .set_desired(
+                &id,
+                DesiredChange::Ceiling(Some(3)),
+                "uid 0",
+                "set a ceiling",
+                3,
+            )
             .unwrap_err();
         assert!(err.is::<MonitoringOnly>(), "{err:#}");
         assert!(format!("{err:#}").contains("update its vk"), "{err:#}");
@@ -2191,10 +2316,20 @@ mod tests {
     fn a_node_ahead_of_the_hub_gets_the_desired_state_reissued_past_it() {
         let db = Db::open_memory().unwrap();
         let id = enrolled(&db);
-        db.set_desired(&id, |d| d.ceiling = Some(4), "uid 0", "set a ceiling", 1)
-            .unwrap();
-        let report = |applied| Report {
-            applied_generation: applied,
+        db.set_desired(
+            &id,
+            DesiredChange::Ceiling(Some(4)),
+            "uid 0",
+            "set a ceiling",
+            1,
+        )
+        .unwrap();
+        let report = |applied: Option<u64>| Report {
+            applied: applied.map(|generation| DesiredState {
+                generation,
+                ceiling: Some(4),
+                ..DEFAULT_DESIRED
+            }),
             ..Report::default()
         };
         db.record_report(&id, report(Some(1)), 2).unwrap();
@@ -2206,7 +2341,13 @@ mod tests {
         // And a change takes the generation after both.
         db.record_report(&id, report(Some(12)), 4).unwrap();
         let next = db
-            .set_desired(&id, |d| d.ceiling = None, "uid 0", "lifted the ceiling", 5)
+            .set_desired(
+                &id,
+                DesiredChange::Ceiling(None),
+                "uid 0",
+                "lifted the ceiling",
+                5,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(next.generation, 14);
@@ -2225,19 +2366,258 @@ mod tests {
             "{events:?}"
         );
         assert!(events.contains(&"applied generation 12".to_string()));
-        // A node that never asked for anything gets the defaults past its generation.
+    }
+
+    /// A hub with no desired state of its own for a node takes what the node applied, rather
+    /// than lift the node's ceiling or resume its acquisition with the defaults.
+    #[test]
+    fn a_hub_without_desired_state_adopts_the_nodes() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        let applied = DesiredState {
+            generation: 3,
+            ceiling: Some(2),
+            acquisition: Acquisition::Stop,
+        };
+        let report = Report {
+            applied: Some(applied.clone()),
+            ..Report::default()
+        };
+        db.record_report(&id, report.clone(), 2).unwrap();
+        assert_eq!(
+            db.node(&id).unwrap().unwrap().desired,
+            Some(applied.clone())
+        );
+        // Adopted once: the same report again changes nothing.
+        db.record_report(&id, report, 3).unwrap();
+        assert_eq!(db.node(&id).unwrap().unwrap().desired, Some(applied));
+        let events: Vec<String> = db
+            .audits(Some(&id), 20)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        let adopted = "adopted the node's desired state, generation 3";
+        assert_eq!(
+            events.iter().filter(|e| *e == adopted).count(),
+            1,
+            "{events:?}"
+        );
+        // A change goes on from it.
+        let next = db
+            .set_desired(
+                &id,
+                DesiredChange::Ceiling(None),
+                "uid 0",
+                "lifted the ceiling",
+                4,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next,
+            DesiredState {
+                generation: 4,
+                ceiling: None,
+                acquisition: Acquisition::Stop,
+            }
+        );
+        // A node that applied nothing gives the hub nothing to adopt.
         let (token, _) = db.create_token(DAY, "uid 0", 0).unwrap();
         let Enrollment::Enrolled { node_id: fresh } =
             db.enroll(&token, "cc", "h", "peer p", 1).unwrap()
         else {
             panic!("expected an enrollment");
         };
-        db.record_report(&fresh, report(Some(3)), 2).unwrap();
+        db.record_report(&fresh, Report::default(), 2).unwrap();
+        assert_eq!(db.node(&fresh).unwrap().unwrap().desired, None);
+    }
+
+    /// When the hub knows neither its desired state nor the node's applied state, operator
+    /// changes override only the fields they set once the node reports its applied state.
+    #[test]
+    fn a_change_made_on_the_defaults_is_applied_onto_the_nodes_state() {
+        let applied = DesiredState {
+            generation: 7,
+            ceiling: Some(2),
+            acquisition: Acquisition::Stop,
+        };
+        let report = Report {
+            applied: Some(applied.clone()),
+            ..Report::default()
+        };
+        let outcome = |changes: &[DesiredChange]| {
+            let db = Db::open_memory().unwrap();
+            let id = enrolled(&db);
+            for &change in changes {
+                db.set_desired(&id, change, "uid 0", "changed", 1).unwrap();
+            }
+            db.record_report(&id, report.clone(), 2).unwrap();
+            let row = db.node(&id).unwrap().unwrap();
+            assert_eq!(row.set_on_defaults, None);
+            let events: Vec<String> = db
+                .audits(Some(&id), 20)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.event)
+                .collect();
+            (row.desired.unwrap(), events)
+        };
+        let state = |ceiling, acquisition| DesiredState {
+            generation: 8,
+            ceiling,
+            acquisition,
+        };
+        let (desired, events) = outcome(&[DesiredChange::Ceiling(Some(5))]);
+        assert_eq!(desired, state(Some(5), Acquisition::Stop));
+        let merged = "applied the operator's change onto the node's desired state, generation 8";
+        assert!(events.contains(&merged.to_string()), "{events:?}");
+        // Resuming is a change even though the defaults already run acquisition.
+        let (desired, _) = outcome(&[DesiredChange::Acquisition(Acquisition::Run)]);
+        assert_eq!(desired, state(Some(2), Acquisition::Run));
+        let (desired, _) = outcome(&[
+            DesiredChange::Ceiling(Some(5)),
+            DesiredChange::Acquisition(Acquisition::Run),
+        ]);
+        assert_eq!(desired, state(Some(5), Acquisition::Run));
+        // What the node already applied needs no new generation.
+        let (desired, events) = outcome(&[DesiredChange::Ceiling(Some(2))]);
+        assert_eq!(desired, applied);
+        let adopted = "adopted the node's desired state, generation 7";
+        assert!(events.contains(&adopted.to_string()), "{events:?}");
+
+        // A report without what the node applied leaves the change for the next one.
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        db.set_desired(&id, DesiredChange::Ceiling(Some(5)), "uid 0", "changed", 1)
+            .unwrap();
+        db.record_report(&id, Report::default(), 2).unwrap();
+        db.record_report(&id, report.clone(), 3).unwrap();
+        let desired = db.node(&id).unwrap().unwrap().desired.unwrap();
+        assert_eq!(desired, state(Some(5), Acquisition::Stop));
+
+        // A node behind the hub's generations is never sent an older one: the hub's stands
+        // when it carries the change, and one past it is issued when it does not.
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        for (ceiling, now) in [(4, 1), (5, 2), (4, 3)] {
+            db.set_desired(
+                &id,
+                DesiredChange::Ceiling(Some(ceiling)),
+                "uid 0",
+                "changed",
+                now,
+            )
+            .unwrap();
+        }
+        let behind = Report {
+            applied: Some(DesiredState {
+                generation: 1,
+                ceiling: Some(4),
+                acquisition: Acquisition::Run,
+            }),
+            ..Report::default()
+        };
+        db.record_report(&id, behind, 4).unwrap();
+        let ours = DesiredState {
+            generation: 3,
+            ceiling: Some(4),
+            acquisition: Acquisition::Run,
+        };
+        assert_eq!(db.node(&id).unwrap().unwrap().desired, Some(ours.clone()));
+        let caught_up = Report {
+            applied: Some(ours.clone()),
+            ..Report::default()
+        };
+        db.record_report(&id, caught_up, 5).unwrap();
+        assert_eq!(db.node(&id).unwrap().unwrap().desired, Some(ours));
+        let events: Vec<String> = db
+            .audits(Some(&id), 20)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert!(
+            !events.iter().any(|e| e.starts_with("the node applied")),
+            "{events:?}"
+        );
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        for (ceiling, now) in [(4, 1), (5, 2)] {
+            db.set_desired(
+                &id,
+                DesiredChange::Ceiling(Some(ceiling)),
+                "uid 0",
+                "changed",
+                now,
+            )
+            .unwrap();
+        }
+        let stopped = Report {
+            applied: Some(DesiredState {
+                generation: 1,
+                ceiling: Some(4),
+                acquisition: Acquisition::Stop,
+            }),
+            ..Report::default()
+        };
+        db.record_report(&id, stopped, 3).unwrap();
+        let desired = db.node(&id).unwrap().unwrap().desired.unwrap();
         assert_eq!(
-            db.node(&fresh).unwrap().unwrap().desired,
+            desired,
+            DesiredState {
+                generation: 3,
+                ceiling: Some(5),
+                acquisition: Acquisition::Stop,
+            }
+        );
+
+        // A node that reported first is adopted, and a change goes on from its state.
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        db.record_report(&id, report.clone(), 1).unwrap();
+        let next = db
+            .set_desired(&id, DesiredChange::Ceiling(Some(5)), "uid 0", "changed", 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next, state(Some(5), Acquisition::Stop));
+        assert_eq!(db.node(&id).unwrap().unwrap().set_on_defaults, None);
+    }
+
+    /// A hub of protocol version 1 rewrites a node's row without its desired state or what the
+    /// node applied. A change made in the version-2 session before the node's first report is
+    /// applied onto the node's state all the same.
+    #[test]
+    fn a_change_after_a_version_1_rewrite_is_applied_onto_the_nodes_state() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        // The row as such a hub leaves it: a report without what the node applied.
+        db.record_report(&id, Report::default(), 2).unwrap();
+        assert!(db.record_session(&id, "ab", STEERING, 3, || true).unwrap());
+        db.set_desired(
+            &id,
+            DesiredChange::Acquisition(Acquisition::Stop),
+            "uid 0",
+            "stopped acquisition",
+            4,
+        )
+        .unwrap()
+        .unwrap();
+        let report = Report {
+            applied: Some(DesiredState {
+                generation: 3,
+                ceiling: Some(2),
+                acquisition: Acquisition::Run,
+            }),
+            ..Report::default()
+        };
+        db.record_report(&id, report, 5).unwrap();
+        assert_eq!(
+            db.node(&id).unwrap().unwrap().desired,
             Some(DesiredState {
                 generation: 4,
-                ..DEFAULT_DESIRED
+                ceiling: Some(2),
+                acquisition: Acquisition::Stop,
             })
         );
     }

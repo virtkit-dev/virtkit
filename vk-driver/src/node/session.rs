@@ -1128,14 +1128,11 @@ mod tests {
             assert!(challenge(&mut ws, &key, PROTOCOL, STEERING).await);
             hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
             let first = next_of(&mut ws, report_of).await;
-            assert_eq!(first.applied_generation, None);
+            assert_eq!(first.applied_generation(), None);
             assert_eq!(first.state, Some(vk_hub_proto::NodeState::Ready));
             hub_send(&mut ws, &desired()).await;
-            let applied = next_of(&mut ws, |m| {
-                report_of(m).filter(|r| r.applied_generation.is_some())
-            })
-            .await;
-            assert_eq!(applied.applied_generation, Some(1));
+            let applied = next_of(&mut ws, |m| report_of(m).filter(|r| r.applied.is_some())).await;
+            assert_eq!(applied.applied_generation(), Some(1));
             // A stop of acquisition this node cannot carry out, said so.
             assert_eq!(applied.unsupported.len(), 1);
             hub_send(&mut ws, &HubMsg::Command(drain.clone())).await;
@@ -1149,7 +1146,7 @@ mod tests {
             assert!(challenge(&mut ws, &key, PROTOCOL, STEERING).await);
             hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
             let report = next_of(&mut ws, report_of).await;
-            assert_eq!(report.applied_generation, Some(1));
+            assert_eq!(report.applied_generation(), Some(1));
             assert_eq!(next_of(&mut ws, ack_of).await, ack);
             hub_send(&mut ws, &HubMsg::Command(drain.clone())).await;
             assert_eq!(next_of(&mut ws, ack_of).await, ack);

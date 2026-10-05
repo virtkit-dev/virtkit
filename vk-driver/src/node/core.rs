@@ -163,7 +163,7 @@ impl Core {
             );
         }
         Report {
-            applied_generation: persisted.applied.as_ref().map(|d| d.generation),
+            applied: persisted.applied.clone(),
             unsupported,
             state: Some(persisted.state),
             // Stopped only once a managed runner has exited: until then it may be one that
@@ -421,7 +421,7 @@ mod tests {
         .unwrap();
         core.step(&cfg, true).unwrap();
         let report = core.report();
-        assert_eq!(report.applied_generation, Some(1));
+        assert_eq!(report.applied_generation(), Some(1));
         assert_eq!(report.concurrency.unwrap().effective, Some(2));
         assert_eq!(
             std::fs::read_to_string(crate::schedule::desired_file(&cfg)).unwrap(),

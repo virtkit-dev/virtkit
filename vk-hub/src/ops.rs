@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use vk_hub_proto::{Acquisition, Command, DesiredState, Operation, Report};
 
 use crate::server::{Hub, Reach};
-use crate::store::NodeRow;
+use crate::store::{DesiredChange, NodeRow};
 
 /// Command delivery window. One day allows for a node reboot or hub outage without applying
 /// a stale request, such as a week-old drain.
@@ -106,9 +106,13 @@ pub fn set_ceiling(
         Some(n) => format!("set the concurrency ceiling to {n}"),
         None => "lifted the concurrency ceiling".to_string(),
     };
-    let changed =
-        hub.db
-            .set_desired(id, |d| d.ceiling = ceiling, actor, &what, crate::now_secs())?;
+    let changed = hub.db.set_desired(
+        id,
+        DesiredChange::Ceiling(ceiling),
+        actor,
+        &what,
+        crate::now_secs(),
+    )?;
     desired_changed(hub, actor, id, &what, changed.as_ref());
     Ok(changed)
 }
@@ -127,7 +131,7 @@ pub fn set_acquisition(
     };
     let changed = hub.db.set_desired(
         id,
-        |d| d.acquisition = acquisition,
+        DesiredChange::Acquisition(acquisition),
         actor,
         what,
         crate::now_secs(),

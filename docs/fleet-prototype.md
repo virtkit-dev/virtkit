@@ -26,7 +26,7 @@ Releases, updates, rollouts, resets, restart and redeploy are not built.
 
 | Capability | Current prototype | Proposed gate |
 |---|---|---|
-| Hub recovery | Reissues its stored desired state above a newer node generation | [Preserve node restrictions and resolve the recovery conflict explicitly](fleet-design.md#proposed-recovery-after-a-hub-restore) |
+| Hub recovery | Reissues its stored desired state above a newer node generation; adopts the node's applied state when it holds none | [Preserve node restrictions and resolve the recovery conflict explicitly](fleet-design.md#proposed-recovery-after-a-hub-restore) |
 | Update validation | Not built | [A pinned boot/exec/network/cleanup workload required for unattended rollouts](fleet-design.md#updates) |
 | Canary promotion | Not built | [Representative workload success and an observation window](fleet-design.md#updates) |
 | Release trust | Not built | [Pinned keys required for remote updates; explicit development opt-out](fleet-design.md#updates) |
@@ -139,10 +139,22 @@ and audited. A final outcome is never replaced, so a late `accepted` cannot reop
 command. A command the node never took is not sent past its expiry. Settled commands are kept
 30 days, and go with their node when it is removed.
 
-A node that reports a generation past the hub's — the hub restored from a backup, say — has the
-hub's desired state, or the defaults (no ceiling, acquisition running), re-issued as the
-generation after the node's, and the re-issue audited. This orders messages; it does not
-reconcile intent (see [recovery after a hub restore](fleet-design.md#proposed-recovery-after-a-hub-restore)).
+A node reports the desired state it applied, not only its generation. When the hub's desired
+state is older than the node's, or was built on the defaults before the node reported, one of
+these happens, audited either way:
+
+- The hub holds desired state of its own for the node, older — restored from a backup taken
+  after the node was first steered, say. It is re-issued as the generation after the node's.
+  This orders messages; it does not reconcile intent (see
+  [recovery after a hub restore](fleet-design.md#proposed-recovery-after-a-hub-restore)).
+- The hub holds none — restored from a backup taken before the node was steered, or taken
+  back to 0.84.0 or earlier and forward again, since such a hub rewrites the node's row
+  without it. The hub adopts what the node applied as its own desired state, at the node's
+  generation, and sends nothing: the node keeps its ceiling and its stopped acquisition. An
+  operator change made before the node reports what it applied is applied onto the node's
+  state: the fields the operator set, even to a default, replace the node's, the others stay as
+  the node has them, and the result is issued past the node's generation unless the node
+  already applied it.
 
 Steering takes protocol version 2. A node whose latest session ran version 1 — a `vk` of
 0.83.0 or 0.84.0 — is monitored only: the hub refuses to change its desired state or issue it
@@ -153,10 +165,11 @@ sent nothing, and its commands expire unanswered.
 `vk-hub nodes` shows what the hub asked beside what the node reports. STATE is the node's own,
 with how many commands are pending. ACQUIRE and CEILING are the hub's, with the node's in
 brackets where they differ, and `quitting` while a stopped runner finishes its jobs. CONC is
-the concurrency the node set. SYNC compares the generation the node applied with the hub's:
-`ok`, `behind (2<3)` or `ahead (4>3)`, `unknown` before the node's report, and `-` while the
-hub has asked nothing. Under the table, a line says each thing a node cannot carry out
-(`cannot comply: …`) and why it cannot set its concurrency.
+the concurrency the node set. SYNC compares the state the node applied with the hub's: `ok`,
+`behind (2<3)` or `ahead (4>3)`, `differs` when the node applied another state under the same
+generation, `unknown` before the node's report, and `-` while the hub has asked nothing. Under
+the table, a line says each thing a node cannot carry out (`cannot comply: …`) and why it
+cannot set its concurrency.
 
 `vk-hub audit [--node ID] [--limit 50]` prints the latest audit lines, oldest first — time,
 node, actor, event: operator actions, with the generation or command each made, and what

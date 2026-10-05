@@ -676,7 +676,7 @@ fn steering(h: &mut Html, d: &NodeDetail, now: u64) {
             kv(
                 h,
                 "applied generation",
-                &r.applied_generation.map_or_else(dash, |g| g.to_string()),
+                &r.applied_generation().map_or_else(dash, |g| g.to_string()),
             );
             kv(h, "state", &or_dash(r.state.map(crate::store::state_name)));
             kv(

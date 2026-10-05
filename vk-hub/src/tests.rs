@@ -592,7 +592,11 @@ async fn an_ack_in_a_version_1_session_is_a_protocol_error() {
 /// A report of `applied`, as a version-2 node sends it.
 fn applied(applied: Option<u64>) -> NodeMsg {
     NodeMsg::Report(vk_hub_proto::Report {
-        applied_generation: applied,
+        applied: applied.map(|generation| vk_hub_proto::DesiredState {
+            generation,
+            ceiling: None,
+            acquisition: vk_hub_proto::Acquisition::Run,
+        }),
         state: Some(vk_hub_proto::NodeState::Ready),
         ..vk_hub_proto::Report::default()
     })
@@ -739,6 +743,56 @@ async fn a_node_ahead_of_a_restored_hub_is_sent_the_next_generation() {
         panic!("expected desired state");
     };
     assert_eq!((desired.generation, desired.ceiling), (8, Some(5)));
+}
+
+/// A hub with no desired state for a node — one that lost it — takes the node's as its own
+/// and sends it nothing, rather than lift its ceiling with the defaults.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hub_without_desired_state_keeps_the_nodes() {
+    use vk_hub_proto::{Acquisition, DesiredState};
+    let (addr, hub) = start().await;
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    let mut ws = dial(addr).await;
+    assert!(matches!(
+        open(&mut ws, &node_id, &"27".repeat(16), &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    let theirs = DesiredState {
+        generation: 7,
+        ceiling: Some(2),
+        acquisition: Acquisition::Stop,
+    };
+    send(
+        &mut ws,
+        &NodeMsg::Report(vk_hub_proto::Report {
+            applied: Some(theirs.clone()),
+            ..vk_hub_proto::Report::default()
+        }),
+    )
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1500), receive(&mut ws))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        hub.db.node(&node_id).unwrap().unwrap().desired,
+        Some(theirs)
+    );
+    // A change goes on from the node's, acquisition still stopped.
+    ops::set_ceiling(&hub, "uid 0", &node_id, Some(3)).unwrap();
+    let HubMsg::Desired(desired) = receive(&mut ws).await else {
+        panic!("expected desired state");
+    };
+    assert_eq!(
+        desired,
+        DesiredState {
+            generation: 8,
+            ceiling: Some(3),
+            acquisition: Acquisition::Stop,
+        }
+    );
 }
 
 /// Heartbeats and inventories faster than the hub asked for still end with the latest of
@@ -1062,6 +1116,33 @@ fn random_bytes_are_as_many_as_asked() {
     assert_ne!(a, b);
 }
 
+/// SYNC is ok only when the node applied the hub's state, not merely a state under its
+/// generation.
+#[test]
+fn sync_compares_the_applied_state_not_only_its_generation() {
+    use vk_hub_proto::{Acquisition, DesiredState, Report};
+    let desired = DesiredState {
+        generation: 3,
+        ceiling: Some(4),
+        acquisition: Acquisition::Run,
+    };
+    let view = |applied: DesiredState| ops::NodeView {
+        protocol: Some(vk_hub_proto::STEERING),
+        desired: Some(desired.clone()),
+        report: Some(Report {
+            applied: Some(applied),
+            ..Report::default()
+        }),
+        ..ops::NodeView::default()
+    };
+    assert_eq!(steering_cells(&view(desired.clone()))[3], "ok");
+    let other = DesiredState {
+        ceiling: None,
+        ..desired.clone()
+    };
+    assert_eq!(steering_cells(&view(other))[3], "differs");
+}
+
 #[test]
 fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
     use vk_hub_proto::{Acquisition, Concurrency, DesiredState, NodeState, Report};
@@ -1083,7 +1164,11 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
                 acquisition: Acquisition::Stop,
             }),
             report: Some(Report {
-                applied_generation: Some(2),
+                applied: Some(DesiredState {
+                    generation: 2,
+                    ceiling: Some(6),
+                    acquisition: Acquisition::Run,
+                }),
                 state: Some(NodeState::Draining),
                 acquisition: Some(Acquisition::Run),
                 concurrency: Some(Concurrency {

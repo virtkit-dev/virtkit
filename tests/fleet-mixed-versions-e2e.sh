@@ -7,7 +7,9 @@
 #    refused, saying to update its vk.
 # 2. The hub swapped for the old one, on the same database: a node service under test
 #    connects at version 1 and is monitored, and goes on applying the ceiling it had.
-# 3. The hub under test back on that database: the node service is steered again.
+# 3. The hub under test back on that database, which the old hub rewrote without the desired
+#    state: it adopts the ceiling the node service applied rather than lift it, and steers the
+#    node again.
 #
 # Run:  VK=./dist/vk VK_V1=<old vk> VK_HUB_V1=<old vk-hub> tests/fleet-mixed-versions-e2e.sh
 # Skips without VK_V1 and VK_HUB_V1: the vk and vk-hub assets of release v0.83.0 fit, checked
@@ -74,6 +76,12 @@ HUB_BIN=vk-hub
 hub_start
 wait_for 60 node_reported "$n1" || fail "n1 did not reconnect to the hub under test"
 wait_for 60 cell_is "$n1" STATE ready || fail "n1 shows $(node_cell "$n1" STATE), not ready"
+wait_for 60 cell_is "$n1" CEILING 2 || fail "the hub shows n1's ceiling as $(node_cell "$n1" CEILING)"
+cell_is "$n1" SYNC ok || fail "n1 shows $(node_cell "$n1" SYNC), not in sync"
+hub_audit "$n1" | grep "adopted the node's desired state" >/dev/null ||
+  fail "the hub did not audit adopting n1's desired state"
+in_node n1 grep -qx 2 /var/lib/virtkit/schedule/desired-concurrency ||
+  fail "n1 dropped its ceiling once back on the hub under test"
 hub nodes ceiling "$n1" 3
 wait_for 60 cell_is "$n1" SYNC ok || fail "n1 did not apply the new ceiling: $(node_cell "$n1" SYNC)"
 wait_for 30 cell_is "$n1" CONC 3 || fail "n1 runs at $(node_cell "$n1" CONC), not 3"
@@ -82,4 +90,4 @@ cell_is "$old" STATE 'monitor only (v1)' || fail "the old node shows $(node_cell
 hub nodes
 hub_audit "$n1"
 
-echo "PASS: version 1 nodes and hubs monitor, and steering resumes on version 2"
+echo "PASS: version 1 nodes and hubs monitor, and steering resumes on version 2 with the node's ceiling kept"

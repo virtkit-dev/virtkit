@@ -376,9 +376,13 @@ model, commands and process handling.
   hub sends desired state only after a node reports the generation it applied. If that
   generation is newer, the hub reissues its stored state as the generation after it. This
   orders messages but does not reconcile intent: restoring a backup from before an
-  acquisition stop or a ceiling cut can reissue an older permission to run. A node forgets
-  its applied generation when enrolled anew or with another hub, since generations count for
-  one hub and one enrollment.
+  acquisition stop or a ceiling cut can reissue an older permission to run. A hub with no
+  desired state for the node adopts its reported applied state, preserving its restrictions.
+  This covers backups predating steering and downgrades to 0.84.0 or earlier followed by an
+  upgrade, since those versions drop desired state. Operator changes made before the node's
+  report replace only the fields they set. A node forgets its applied
+  generation when enrolled anew or with another hub, since generations count for one hub and
+  one enrollment.
 
 ### Proposed recovery after a hub restore
 
@@ -389,9 +393,10 @@ Ordinary work continues under the node's existing policy; an in-progress mainten
 operation follows its persisted local recovery rules. A higher generation alone is never
 evidence of newer operator intent.
 
-Have the node report the applied policy as well as its generation. Reconciliation presents
-that policy beside the hub's restored policy and lets the operator explicitly adopt the
-node's restrictions or replace them with a reviewed policy. Record the decision and both
+The node reports the applied policy as well as its generation, and the prototype adopts it
+when the hub holds no policy of its own for the node. Reconciliation presents that policy
+beside the hub's restored policy and lets the operator explicitly adopt the node's
+restrictions or replace them with a reviewed policy. Record the decision and both
 states in the audit log before sending anything. Keep persisted drain and quarantine intact;
 recovering the hub does not authorize lifting either.
 

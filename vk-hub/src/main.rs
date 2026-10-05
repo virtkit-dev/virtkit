@@ -707,17 +707,20 @@ fn steering_cells(n: &ops::NodeView) -> [String; 4] {
     let sync = match (&n.desired, report) {
         (None, _) => dash(),
         (Some(_), None) => "unknown".to_string(),
-        (Some(d), Some(r)) if r.applied_generation == Some(d.generation) => "ok".to_string(),
+        (Some(d), Some(r)) if r.applied.as_ref() == Some(d) => "ok".to_string(),
+        // The node took another state under this generation, before a hub restore; it ignores
+        // this one until a change moves the hub past it.
+        (Some(d), Some(r)) if r.applied_generation() == Some(d.generation) => "differs".to_string(),
         // A node that took a generation this hub never issued: the hub re-issues past it on
         // the node's next report.
-        (Some(d), Some(r)) if r.applied_generation > Some(d.generation) => format!(
+        (Some(d), Some(r)) if r.applied_generation() > Some(d.generation) => format!(
             "ahead ({}>{})",
-            r.applied_generation.unwrap_or(0),
+            r.applied_generation().unwrap_or(0),
             d.generation
         ),
         (Some(d), Some(r)) => format!(
             "behind ({}<{})",
-            r.applied_generation.unwrap_or(0),
+            r.applied_generation().unwrap_or(0),
             d.generation
         ),
     };

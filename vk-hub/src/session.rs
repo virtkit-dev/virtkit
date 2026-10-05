@@ -381,7 +381,7 @@ async fn serve(
                         pace.report(r.without_steering(), now).map(Write::Report)
                     }
                     NodeMsg::Report(r) => {
-                        steer.applied = Some(r.applied_generation);
+                        steer.applied = Some(r.applied_generation());
                         report = true;
                         pace.report(r, now).map(Write::Report)
                     }
