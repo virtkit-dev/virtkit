@@ -212,26 +212,38 @@ struct PciInterruptInner {
     log_target: String,
     /// MSI-X delivery, used instead of INTx once the driver enables it.
     msix: Arc<Mutex<MsixConfig>>,
-    /// The vectors the driver chose for configuration changes and for the queues.
+    /// The vectors the driver chose for configuration changes and for the queues. Lock order:
+    /// `msix`, then `vectors`, then `state`.
     vectors: Mutex<MsixVectors>,
 }
 
 /// The MSI-X vectors the driver programmed. The device signals "used queue" without naming
-/// the queue, so every queue is delivered on the first queue vector the driver set: with the
-/// two-entry table that is the shared vector drivers fall back to anyway.
+/// the queue, so a queue event goes to every distinct vector the driver mapped a queue to
+/// (`queues`, one bit per table entry): a handler that finds nothing used on its own queue
+/// just returns, while a vector left out would lose the interrupt.
+// `MsixVectors::queues` holds one bit per table entry.
+const _: () = assert!(NUM_VECTORS as u32 <= u32::BITS);
+
 #[derive(Clone, Copy)]
 struct MsixVectors {
     config: u16,
-    queue: u16,
+    queues: u32,
 }
 
 impl Default for MsixVectors {
     fn default() -> Self {
         Self {
             config: VIRTIO_MSI_NO_VECTOR,
-            queue: VIRTIO_MSI_NO_VECTOR,
+            queues: 0,
         }
     }
+}
+
+/// Whether a BAR access to the MSI-X table or PBA is one the PCI spec defines: naturally
+/// aligned and 4 or 8 bytes wide. Anything else reads as all ones and writes are dropped,
+/// without the per-access warning the guest could otherwise flood the log with.
+fn msix_access(offset: u64, len: usize) -> bool {
+    matches!(len, 4 | 8) && offset % len as u64 == 0
 }
 
 struct PciInterruptState {
@@ -302,19 +314,22 @@ impl PciInterrupt {
     }
 
     fn signal(&self, bit: u8) -> Result<(), crate::Error> {
+        // Held through the INTx path too, so MSI-X cannot be enabled (which deasserts INTx)
+        // between this check and the assertion below. Lock order: msix, vectors, state.
+        let mut msix = self.0.msix.lock().unwrap();
         {
-            let mut msix = self.0.msix.lock().unwrap();
             if msix.enabled() {
                 let vectors = *self.0.vectors.lock().unwrap();
-                let vector = if bit == VIRTIO_ISR_QUEUE {
-                    vectors.queue
-                } else {
-                    vectors.config
-                };
                 // With MSI-X on, an event the driver mapped to no vector is not delivered at
                 // all (virtio 1.2 § 4.1.4.3), never over INTx.
-                if vector != VIRTIO_MSI_NO_VECTOR {
-                    msix.signal(usize::from(vector));
+                if bit == VIRTIO_ISR_QUEUE {
+                    for vector in 0..usize::from(NUM_VECTORS) {
+                        if vectors.queues & (1 << vector) != 0 {
+                            msix.signal(vector);
+                        }
+                    }
+                } else if vectors.config != VIRTIO_MSI_NO_VECTOR {
+                    msix.signal(usize::from(vectors.config));
                 }
                 return Ok(());
             }
@@ -325,10 +340,14 @@ impl PciInterrupt {
         if state.intx_disabled || was_pending {
             return Ok(());
         }
-        self.0
+        let asserted = self
+            .0
             .line
             .set_level(true)
-            .map_err(crate::Error::FailedSignalingUsedQueue)
+            .map_err(crate::Error::FailedSignalingUsedQueue);
+        drop(state);
+        drop(msix);
+        asserted
     }
 }
 
@@ -574,15 +593,15 @@ impl VirtioPciTransport {
 
     /// Push the driver's vector choices to the interrupt path.
     fn sync_msix_vectors(&self) {
-        let queue = self
+        let queues = self
             .queue_registers
             .iter()
             .map(|registers| registers.msix_vector)
-            .find(|&vector| vector != VIRTIO_MSI_NO_VECTOR)
-            .unwrap_or(VIRTIO_MSI_NO_VECTOR);
+            .filter(|&vector| vector != VIRTIO_MSI_NO_VECTOR)
+            .fold(0u32, |mask, vector| mask | 1 << vector);
         self.interrupt.set_vectors(MsixVectors {
             config: self.msix_config_vector,
-            queue,
+            queues,
         });
     }
 
@@ -875,18 +894,26 @@ impl VirtioPciTransport {
         if offset >= MSIX_TABLE_OFFSET
             && offset + data.len() as u64 <= MSIX_TABLE_OFFSET + MSIX_TABLE_LEN
         {
-            self.msix
-                .lock()
-                .unwrap()
-                .read_table(offset - MSIX_TABLE_OFFSET, data);
+            if msix_access(offset, data.len()) {
+                self.msix
+                    .lock()
+                    .unwrap()
+                    .read_table(offset - MSIX_TABLE_OFFSET, data);
+            } else {
+                data.fill(PCI_UNIMPLEMENTED_READ_BYTE);
+            }
             return PciBarAccess::Handled;
         }
         if offset >= MSIX_PBA_OFFSET && offset + data.len() as u64 <= MSIX_PBA_OFFSET + MSIX_PBA_LEN
         {
-            self.msix
-                .lock()
-                .unwrap()
-                .read_pba(offset - MSIX_PBA_OFFSET, data);
+            if msix_access(offset, data.len()) {
+                self.msix
+                    .lock()
+                    .unwrap()
+                    .read_pba(offset - MSIX_PBA_OFFSET, data);
+            } else {
+                data.fill(PCI_UNIMPLEMENTED_READ_BYTE);
+            }
             return PciBarAccess::Handled;
         }
         data.fill(PCI_UNIMPLEMENTED_READ_BYTE);
@@ -917,18 +944,17 @@ impl VirtioPciTransport {
         if offset >= MSIX_TABLE_OFFSET
             && offset + data.len() as u64 <= MSIX_TABLE_OFFSET + MSIX_TABLE_LEN
         {
-            self.msix
-                .lock()
-                .unwrap()
-                .write_table(offset - MSIX_TABLE_OFFSET, data);
+            if msix_access(offset, data.len()) {
+                self.msix
+                    .lock()
+                    .unwrap()
+                    .write_table(offset - MSIX_TABLE_OFFSET, data);
+            }
             return PciBarAccess::Handled;
         }
         if offset >= MSIX_PBA_OFFSET && offset + data.len() as u64 <= MSIX_PBA_OFFSET + MSIX_PBA_LEN
         {
-            self.msix
-                .lock()
-                .unwrap()
-                .write_pba(offset - MSIX_PBA_OFFSET, data);
+            // The PBA is read-only: a driver write is ignored.
             return PciBarAccess::Handled;
         }
         PciBarAccess::Unhandled
@@ -1082,6 +1108,8 @@ impl VirtioPciTransport {
                 self.reset_queue_registers();
                 self.msix_config_vector = VIRTIO_MSI_NO_VECTOR;
                 self.sync_msix_vectors();
+                // A pending bit from before the reset must not fire on the next unmask.
+                self.msix.lock().unwrap().clear_pending();
             } else if status == 0 {
                 // The device refused the reset (net, vsock and balloon cannot). A virtio-pci
                 // driver polls the status until it reads 0 (Linux does when it resets a
@@ -1097,6 +1125,7 @@ impl VirtioPciTransport {
                 self.reset_queue_registers();
                 self.msix_config_vector = VIRTIO_MSI_NO_VECTOR;
                 self.sync_msix_vectors();
+                self.msix.lock().unwrap().clear_pending();
                 self.reset_unsupported = true;
             } else if !was_activated && self.state.locked_device().is_activated() {
                 self.replay_pending_queue_notifications();
@@ -1404,7 +1433,17 @@ impl PciFunction for VirtioPciTransport {
                     let writable = MSIX_MSG_CTL_ENABLE | MSIX_MSG_CTL_FUNCTION_MASK;
                     let ctl = (u16::from_le_bytes(bytes) & writable) | (NUM_VECTORS - 1);
                     self.config.write_u16(ctl_offset, ctl);
-                    self.msix.lock().unwrap().set_msg_ctl(ctl);
+                    let enabling = {
+                        let mut msix = self.msix.lock().unwrap();
+                        let was_enabled = msix.enabled();
+                        msix.set_msg_ctl(ctl);
+                        !was_enabled && msix.enabled()
+                    };
+                    // INTx must be inactive while MSI-X is enabled, and nothing reads the ISR
+                    // to drop a level left asserted before: deassert it now.
+                    if enabling {
+                        self.interrupt.reset();
+                    }
                 }
                 _ => {
                     if let Some(cap_offset) = self.pci_cfg_cap_offset {
@@ -1768,6 +1807,93 @@ mod tests {
             .try_signal(InterruptType::ConfigChange)
             .unwrap();
         assert!(!line.0.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_used_queue_interrupt_reaches_every_queue_vector() {
+        let (mut transport, _) = transport_with_queue_config(&MULTI_QUEUE_CONFIG);
+        let base = enable_memory_bar(&mut transport);
+        enable_msix(&mut transport);
+        for vector in 0..2u16 {
+            program_vector(&mut transport, base, vector);
+            write_bar(
+                &mut transport,
+                base,
+                common_cfg::QUEUE_SELECT,
+                &vector.to_le_bytes(),
+            );
+            write_bar(
+                &mut transport,
+                base,
+                common_cfg::QUEUE_MSIX_VECTOR,
+                &vector.to_le_bytes(),
+            );
+        }
+
+        transport
+            .interrupt
+            .try_signal(InterruptType::UsedQueue)
+            .unwrap();
+        let irqfds = transport.msix_irqfds();
+        assert_eq!(irqfds[0].read().unwrap(), 1, "queue 0's vector");
+        assert_eq!(irqfds[1].read().unwrap(), 1, "queue 1's vector");
+    }
+
+    #[test]
+    fn enabling_msix_deasserts_a_pending_intx() {
+        let (mut transport, line) = transport_with_line();
+        enable_memory_bar(&mut transport);
+        transport
+            .interrupt
+            .try_signal(InterruptType::UsedQueue)
+            .unwrap();
+        assert!(line.0.load(Ordering::SeqCst));
+        enable_msix(&mut transport);
+        assert!(
+            !line.0.load(Ordering::SeqCst),
+            "INTx is inactive under MSI-X"
+        );
+    }
+
+    #[test]
+    fn a_device_reset_drops_pending_msix_vectors() {
+        let (mut transport, _) = transport_with_line();
+        let base = enable_memory_bar(&mut transport);
+        enable_msix(&mut transport);
+        // Vector 1 stays masked (its table entry is never programmed), so the signal is
+        // only recorded in the PBA.
+        write_bar(
+            &mut transport,
+            base,
+            common_cfg::QUEUE_MSIX_VECTOR,
+            &1u16.to_le_bytes(),
+        );
+        transport
+            .interrupt
+            .try_signal(InterruptType::UsedQueue)
+            .unwrap();
+        let mut pba = [0; 8];
+        read_bar(&mut transport, base + MSIX_PBA_OFFSET, &mut pba);
+        assert_ne!(u64::from_le_bytes(pba), 0, "pending while masked");
+
+        write_bar(&mut transport, base, common_cfg::DEVICE_STATUS, &[0]);
+        read_bar(&mut transport, base + MSIX_PBA_OFFSET, &mut pba);
+        assert_eq!(u64::from_le_bytes(pba), 0, "nothing left to fire on unmask");
+    }
+
+    #[test]
+    fn an_odd_sized_msix_table_access_reads_all_ones() {
+        let mut transport = transport();
+        let base = enable_memory_bar(&mut transport);
+        let mut byte = [0];
+        read_bar(&mut transport, base + MSIX_TABLE_OFFSET, &mut byte);
+        assert_eq!(byte, [PCI_UNIMPLEMENTED_READ_BYTE]);
+        // A misaligned 8-byte write is dropped: the entry keeps its address.
+        program_vector(&mut transport, base, 0);
+        write_bar(&mut transport, base, MSIX_TABLE_OFFSET + 4, &[0xaa; 8]);
+        let mut addr = [0; 4];
+        read_bar(&mut transport, base + MSIX_TABLE_OFFSET, &mut addr);
+        assert_eq!(u32::from_le_bytes(addr), 0xfee0_0000);
     }
 
     #[test]

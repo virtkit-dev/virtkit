@@ -287,11 +287,6 @@ impl MsixConfig {
         }
     }
 
-    /// The PBA is read-only from the driver's view.
-    pub fn write_pba(&mut self, _offset: u64, _data: &[u8]) {
-        warn!("msix: PBA is read-only");
-    }
-
     /// Deliver an interrupt for `index`. Returns true if the interrupt was (or
     /// will be, when pending) delivered via MSI-X, so the caller must NOT fall
     /// back to INTx; returns false only when MSI-X is disabled.
@@ -354,6 +349,11 @@ impl MsixConfig {
             warn!("msix: failed to inject pending vector {index}: {e:?}");
         }
         self.clear_pba_pending(index);
+    }
+
+    /// Drop every pending bit: the device was reset, so nothing it raised before is due.
+    pub fn clear_pending(&mut self) {
+        self.pba.fill(0);
     }
 
     /// Mark `vector` pending in the PBA (an interrupt arrived while masked).

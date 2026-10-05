@@ -343,16 +343,18 @@ match on.
 
 `src/devices/src/virtio/{msix.rs (new),mod.rs,pci.rs}` + `src/devices/src/legacy/{gsi.rs (new),
 mod.rs}` + `src/libkrun/src/vmm/device_manager/kvm/pci.rs` — MSI-X for the PR #875 transport,
-which only had INTx. An MSI-X capability closes the capability list, with a two-vector table
-at BAR0 0x4000 and its PBA at 0x5000 (device config is now bounded to 0x1000 bytes). The common
+which only had INTx. An MSI-X capability closes the capability list, with a two-vector table at
+BAR0 0x4000 and its PBA at 0x5000 (device config is now bounded to 0x1000 bytes). The common
 config keeps the vectors the driver picks, an unknown one reading back as NO_VECTOR; once MSI-X
-is enabled an interrupt goes to the driver's vector (every queue on the first queue vector set,
-the device not naming the queue) and never to INTx. `MsixConfig` and `GsiRoutes` are the 1.19
-tree's: each vector has an eventfd registered as a KVM irqfd on its own MSI GSI above the IOAPIC
-pins, and a message write re-commits the full `KVM_SET_GSI_ROUTING` table (default IOAPIC/PIC
-routes plus the MSI ones). Each queue's notification register gets an ioeventfd on the queue
-eventfd, so a kick no longer traps to the VMM thread; the trapping path stays for a relocated
-BAR0, whose ioeventfds are not moved.
+is enabled an interrupt goes to the driver's vectors (a queue event to every distinct vector a
+queue is mapped to, the device not naming the queue) and never to INTx; enabling MSI-X
+deasserts an INTx left pending, and a device reset drops pending PBA bits. Only naturally
+aligned 4- and 8-byte table and PBA accesses reach the MSI-X state; others read all ones.
+`MsixConfig` and `GsiRoutes` are the 1.19 tree's: each vector has an eventfd registered as a
+KVM irqfd on its own MSI GSI above the IOAPIC pins, and a message write re-commits the full
+`KVM_SET_GSI_ROUTING` table (default IOAPIC/PIC routes plus the MSI ones). Each queue's
+notification register gets an ioeventfd on the queue eventfd, so a kick no longer traps to the
+VMM thread; the trapping path stays for a relocated BAR0, whose ioeventfds are not moved.
 
 `src/arch/src/x86_64/{layout.rs,mod.rs,acpi.rs}` + `src/libkrun/src/vmm/{device_manager/shm.rs,
 builder.rs}` + `src/devices/src/virtio/pci.rs` — shared-memory regions (virtio-fs DAX windows)
@@ -366,10 +368,8 @@ prefetchable memory) on the region, answering size probes, and describes it with
 may carry a region. The builder's refusal of shared memory over PCI now applies to the GPU
 region only.
 
-Known gaps, kept for a follow-up: the DSDT declares the span even for a guest whose RAM
-overlaps it; the virtio-mmio path also places regions in the span and rounds them to a power of
-two; and with MSI-X every queue signals the first queue vector, a pending INTx is not
-deasserted when MSI-X is enabled, and a device reset leaves pending PBA bits.
+Known gaps: the DSDT declares the span even for a guest whose RAM overlaps it, and the
+virtio-mmio path also places regions in the span and rounds them to a power of two.
 
 `src/libkrun/src/vmm/device_manager/kvm/pci.rs` + `src/devices/src/virtio/pci.rs` — devices
 past the INTx GSIs (5–23 less the SCI's 9) get interrupt pin 0, line 0xff and no `_PRT` entry
