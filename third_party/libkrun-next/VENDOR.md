@@ -212,3 +212,9 @@ tree. Covered by `a_partial_cluster_write_zeroes_reads_its_edges_whole`.
 dirty-control socket it could bind. The 1.19 tree recorded every write of every disk into
 sets nothing but that socket drains, so a disk without one grew them for the life of the VM,
 up to one entry per 64 KiB of distinct disk written. Not yet in the 1.19 tree.
+
+`src/devices/src/virtio/block/worker.rs` — a read, write, discard or write-zeroes whose byte
+range does not fit the disk answers IOERR before it reaches imago or the dirty tracker. The
+1.19 tree multiplied the guest's sector unchecked, wrapping in release builds and panicking
+the worker in debug ones, and recorded writes past the end as dirty. Not yet in the 1.19
+tree.
