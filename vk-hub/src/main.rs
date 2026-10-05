@@ -9,7 +9,8 @@
 //!
 //! Experimental. The hub steers its nodes only within what each node's own configuration
 //! allows: a concurrency ceiling, stopping and resuming acquisition, drain and quarantine —
-//! all issued over the admin socket, audited, and resent to a node until it has them. A node
+//! all issued over the admin socket, audited, and resent to a node until it has them. It holds
+//! `vk` releases and serves each only to a node it has asked to update to it. A node
 //! whose `vk` speaks only the first fleet protocol version is monitored, not steered. A web UI
 //! on a listener of its own shows the fleet to people signed in with links the admin socket
 //! issues.
@@ -26,6 +27,7 @@ mod admin;
 mod config;
 mod local;
 mod ops;
+mod releases;
 mod server;
 mod session;
 mod store;
@@ -78,6 +80,13 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<NodesCmd>,
     },
+    /// Keep vk binaries for nodes to update to
+    Release {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: ReleaseCmd,
+    },
     /// List the VMs running on the nodes: CI jobs, dev environments, pinned runs
     Workloads {
         #[command(flatten)]
@@ -121,6 +130,28 @@ enum Cmd {
         args: LocalArgs,
         #[command(subcommand)]
         cmd: Option<LocalCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReleaseCmd {
+    /// Copy a vk binary into the hub, as the version it reports
+    ///
+    /// The hub never runs it: it checks that the file is an x86-64 ELF holding the version
+    /// as a string of its own. The file must be readable by the hub's user.
+    Add {
+        /// The vk binary
+        file: PathBuf,
+        /// The version its `vk --version` prints
+        #[arg(long)]
+        version: String,
+    },
+    /// List the releases the hub holds
+    List,
+    /// Delete a release, unless a node is still updating to it
+    Remove {
+        /// Its sha256, or at least the first 8 hex digits
+        release: String,
     },
 }
 
@@ -232,6 +263,17 @@ enum NodesCmd {
     Quarantine { id: String },
     /// End a quarantine: back to `ready`
     Release { id: String },
+    /// Ask the node to replace its vk with a release the hub holds
+    Update {
+        id: String,
+        /// The release's sha256, or at least its first 8 hex digits
+        #[arg(long)]
+        release: String,
+        /// Ask a node whose runner is external, which cannot be drained, to update without
+        /// draining
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// `nodes ceiling`'s value: a number, or none.
@@ -330,7 +372,65 @@ async fn run(cli: Cli) -> Result<()> {
                     command(client, id, Operation::Quarantine).await
                 }
                 Some(NodesCmd::Release { id }) => command(client, id, Operation::Release).await,
+                Some(NodesCmd::Update { id, release, force }) => {
+                    let command = tokio::task::spawn_blocking(move || {
+                        client.update_node(&id, &release, force)
+                    })
+                    .await??;
+                    eprintln!(
+                        "vk-hub: issued {} (command {}); `vk-hub audit --node <id>` shows what \
+                         the node makes of it",
+                        store::operation_name(&command.op),
+                        command.id
+                    );
+                    Ok(())
+                }
             }
+        }
+        Cmd::Release { config, cmd } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            match cmd {
+                ReleaseCmd::Add { file, version } => {
+                    // Absolute, since the hub resolves it from its own working directory.
+                    let file = std::path::absolute(&file)
+                        .with_context(|| format!("resolving {}", file.display()))?;
+                    let added =
+                        tokio::task::spawn_blocking(move || client.add_release(&file, &version))
+                            .await??;
+                    // The sha256 alone on stdout, so `$(vk-hub release add …)` captures it.
+                    println!("{}", added.sha256);
+                    eprintln!(
+                        "vk-hub: holding vk {} ({} bytes); `vk-hub nodes update <id> --release \
+                         {}` updates a node to it",
+                        added.row.version,
+                        added.row.size,
+                        store::short(&added.sha256)
+                    );
+                }
+                ReleaseCmd::List => {
+                    let releases = tokio::task::spawn_blocking(move || client.releases()).await??;
+                    for r in releases {
+                        println!(
+                            "{}  {:<12}  {:>10}  added {} by {}",
+                            r.sha256,
+                            r.row.version,
+                            r.row.size,
+                            utc(r.row.added_at),
+                            r.row.added_by
+                        );
+                    }
+                }
+                ReleaseCmd::Remove { release } => {
+                    let what = release.clone();
+                    match tokio::task::spawn_blocking(move || client.remove_release(&release))
+                        .await??
+                    {
+                        Some(r) => eprintln!("vk-hub: removed release {}", r.sha256),
+                        None => bail!("there is no release {what}"),
+                    }
+                }
+            }
+            Ok(())
         }
         Cmd::Audit {
             config,
@@ -446,10 +546,10 @@ async fn serve(cfg: HubConfig) -> Result<()> {
         None => None,
     };
     let db = Arc::new(store::Db::open(&cfg.db_path())?);
-    let hub = Arc::new(server::Hub::new(
-        db,
-        cfg.ui.as_ref().map(|ui| ui.url.clone()),
-    ));
+    let hub = Arc::new(
+        server::Hub::new(db, cfg.ui.as_ref().map(|ui| ui.url.clone()))
+            .with_releases(cfg.releases_dir()),
+    );
     // Fatal, unlike the registry's optional admin socket: here it is the only way to issue
     // a token, so a hub without it could never enroll anything.
     let admin = admin::bind(&cfg.admin_socket())?;

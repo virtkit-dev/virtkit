@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use vk_hub_proto::{Acquisition, Command, DesiredState, Operation, Report};
 
 use crate::server::{Hub, Reach};
-use crate::store::{DesiredChange, NodeRow};
+use crate::store::{DesiredChange, NodeRow, Release};
 
 /// Command delivery window. One day allows for a node reboot or hub outage without applying
 /// a stale request, such as a week-old drain.
@@ -140,8 +140,37 @@ pub fn set_acquisition(
     Ok(changed)
 }
 
-/// Issue `operation` to node `id`, as `actor`, valid for [`COMMAND_TTL`].
+/// Issue `operation` to node `id`, as `actor`, valid for [`COMMAND_TTL`]. An update is issued
+/// by [`update`], which names a release the hub holds.
 pub fn command(hub: &Hub, actor: &str, id: &str, operation: Operation) -> Result<Command> {
+    if matches!(operation, Operation::Update { .. }) {
+        bail!("an update names a release; see `vk-hub nodes update`");
+    }
+    issue(hub, actor, id, operation)
+}
+
+/// Update node `id` to the release whose sha256 starts with `release`, as `actor`. `force`
+/// asks a node whose runner is external to update without draining.
+pub fn update(hub: &Hub, actor: &str, id: &str, release: &str, force: bool) -> Result<Command> {
+    // Held from the lookup to the command, so the release cannot be removed between them.
+    let _held = hub.releases_lock();
+    let release = hub.db.resolve_release(release)?;
+    issue(hub, actor, id, update_operation(&release, force))
+}
+
+/// The command that updates a node to `release`.
+fn update_operation(release: &Release, force: bool) -> Operation {
+    Operation::Update {
+        version: release.row.version.clone(),
+        sha256: release.sha256.clone(),
+        size: release.row.size,
+        signature: None,
+        force,
+        within_secs: None,
+    }
+}
+
+fn issue(hub: &Hub, actor: &str, id: &str, operation: Operation) -> Result<Command> {
     let command = hub
         .db
         .issue_command(id, operation, COMMAND_TTL, actor, crate::now_secs())?;

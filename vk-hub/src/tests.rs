@@ -33,11 +33,16 @@ async fn start() -> (SocketAddr, Arc<Hub>) {
 
 /// A hub on an ephemeral loopback port, over TLS with the test certificate.
 async fn start_tls() -> (SocketAddr, Arc<Hub>) {
+    serve_on(Some(tls_acceptor())).await
+}
+
+/// The hub's TLS acceptor, with the test certificate.
+fn tls_acceptor() -> tokio_rustls::TlsAcceptor {
     let certs = CertificateDer::pem_slice_iter(TLS_CERT)
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let key = PrivateKeyDer::from_pem_slice(TLS_KEY).unwrap();
-    serve_on(Some(config::acceptor(certs, key).unwrap())).await
+    config::acceptor(certs, key).unwrap()
 }
 
 async fn serve_on(tls: Option<tokio_rustls::TlsAcceptor>) -> (SocketAddr, Arc<Hub>) {
@@ -1019,6 +1024,490 @@ async fn a_tls_session_is_bound_to_its_connection() {
     assert_eq!(code, RefusalCode::BadSignature);
     assert!(reason.contains("pass TLS through"), "{reason}");
     assert_eq!(hub.reach(&node_id), Reach::Connected);
+}
+
+/// A hub keeping releases in a fresh directory under `tag`, on an ephemeral loopback port: the
+/// directory, the address and the hub.
+async fn start_releases(
+    tag: &str,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+) -> (std::path::PathBuf, SocketAddr, Arc<Hub>) {
+    let dir = std::env::temp_dir().join(format!("vk-hub-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let listener = server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hub = Arc::new(
+        Hub::new(Arc::new(Db::open_memory().unwrap()), None).with_releases(dir.join("releases")),
+    );
+    tokio::spawn(server::serve(listener, tls, hub.clone()));
+    (dir, addr, hub)
+}
+
+/// A fake `vk`: an x86-64 ELF header, then bytes that hold `version` as a string of its own.
+fn fake_vk(version: &str) -> Vec<u8> {
+    let mut bin = b"\x7fELF\x02\x01\x01\0\0\0\0\0\0\0\0\0\x02\0\x3e\0".to_vec();
+    bin.extend_from_slice(b"\0vk-driver ");
+    bin.extend_from_slice(version.as_bytes());
+    bin.extend_from_slice(&[0u8; 5000]);
+    bin
+}
+
+/// Add `bin` to `hub` as `version`, from a file in `dir`.
+fn add_release(
+    hub: &Hub,
+    dir: &std::path::Path,
+    bin: &[u8],
+    version: &str,
+) -> anyhow::Result<store::Release> {
+    let file = dir.join("vk");
+    std::fs::write(&file, bin).unwrap();
+    releases::add(hub, "uid 0", &file, version)
+}
+
+/// `GET <path>` with `headers` on `stream`, by hand: the status and the body.
+async fn get_on(
+    mut stream: Box<dyn server::Stream>,
+    path: &str,
+    headers: &[(&str, String)],
+) -> (u16, Vec<u8>) {
+    let mut head = format!("GET {path} HTTP/1.1\r\nHost: hub\r\nConnection: close\r\n");
+    for (k, v) in headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut resp = Vec::new();
+    // A TLS peer that closes without close_notify ends the read with an error; what came
+    // before it is the response.
+    let _ = stream.read_to_end(&mut resp).await;
+    let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let status = std::str::from_utf8(&resp[9..12]).unwrap().parse().unwrap();
+    (status, resp[split + 4..].to_vec())
+}
+
+/// [`get_on`] a new plain TCP connection.
+async fn get_with(addr: SocketAddr, path: &str, headers: &[(&str, String)]) -> (u16, Vec<u8>) {
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    get_on(Box::new(stream), path, headers).await
+}
+
+/// A TLS connection to the hub, and the keying material it exports for a node's signatures.
+async fn tls_stream(addr: SocketAddr) -> (Box<dyn server::Stream>, [u8; TLS_EXPORTER_LEN]) {
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let stream = connector(&[&rustls::version::TLS13])
+        .connect(ServerName::try_from("localhost").unwrap(), stream)
+        .await
+        .unwrap();
+    let exported = stream
+        .get_ref()
+        .1
+        .export_keying_material([0; TLS_EXPORTER_LEN], TLS_EXPORTER_LABEL, None)
+        .unwrap();
+    (Box::new(stream), exported)
+}
+
+/// The headers node `node_id` sends to download `sha256`, signed by `key` at `at` for
+/// `channel`.
+fn download_headers(
+    key: &Ed25519KeyPair,
+    node_id: &str,
+    sha256: &str,
+    at: u64,
+    channel: vk_hub_proto::Channel<'_>,
+) -> Vec<(&'static str, String)> {
+    let digest = vk_hub_proto::from_hex_lower::<{ vk_hub_proto::SHA256_LEN }>(sha256).unwrap();
+    let message = vk_hub_proto::download_message(node_id, &digest, at, channel);
+    vec![
+        (vk_hub_proto::NODE_HEADER, node_id.to_string()),
+        (vk_hub_proto::TIME_HEADER, at.to_string()),
+        (
+            vk_hub_proto::SIGNATURE_HEADER,
+            vk_hub_proto::to_hex(key.sign(&message).as_ref()),
+        ),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_is_an_x86_64_elf_holding_its_version_and_added_once() {
+    let (dir, _, hub) = start_releases("release-add", None).await;
+    let bin = fake_vk("0.84.0");
+    let err = add_release(&hub, &dir, &bin, "0.84.1").unwrap_err();
+    assert!(format!("{err:#}").contains("appears nowhere"), "{err:#}");
+    let err = add_release(&hub, &dir, b"#!/bin/sh\necho 0.84.0\n", "0.84.0").unwrap_err();
+    assert!(format!("{err:#}").contains("not an x86-64 ELF"), "{err:#}");
+    let err = add_release(&hub, &dir, &bin, "0.84 0").unwrap_err();
+    assert!(format!("{err:#}").contains("is not a version"), "{err:#}");
+    // Past the size limit, refused before a byte is read: a sparse file costs nothing.
+    let big = dir.join("big");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(releases::MAX_RELEASE + 1)
+        .unwrap();
+    let err = releases::add(&hub, "uid 0", &big, "0.84.0").unwrap_err();
+    assert!(format!("{err:#}").contains("past the"), "{err:#}");
+    assert!(releases::add(&hub, "uid 0", &dir, "0.84.0").is_err());
+    // A FIFO with no writer is refused at once rather than waited on.
+    let fifo = dir.join("fifo");
+    let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: `c_fifo` is a NUL-terminated path, valid for the call.
+    assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
+    let err = releases::add(&hub, "uid 0", &fifo, "0.84.0").unwrap_err();
+    assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+    std::fs::remove_file(&fifo).unwrap();
+
+    let release = add_release(&hub, &dir, &bin, "0.84.0").unwrap();
+    assert_eq!(release.row.size, bin.len() as u64);
+    let held = dir.join("releases").join(&release.sha256);
+    assert_eq!(std::fs::read(&held).unwrap(), bin);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&held), mode(&dir.join("releases"))), (0o600, 0o700));
+    }
+    // Added again as the same version — a retry whose answer was lost — it is the same one;
+    // as another version, refused.
+    assert_eq!(add_release(&hub, &dir, &bin, "0.84.0").unwrap(), release);
+    let both = fake_vk("0.84.0 0.85.0");
+    let other = add_release(&hub, &dir, &both, "0.85.0").unwrap();
+    let err = add_release(&hub, &dir, &both, "0.84.0").unwrap_err();
+    assert!(format!("{err:#}").contains("already held"), "{err:#}");
+    let listed: Vec<String> = hub
+        .db
+        .releases()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.sha256)
+        .collect();
+    assert_eq!(listed.len(), 2);
+    assert!(releases::remove(&hub, "uid 0", &other.sha256).unwrap());
+    assert!(!releases::remove(&hub, "uid 0", &other.sha256).unwrap());
+    assert!(!dir.join("releases").join(&other.sha256).exists());
+    // Nothing but the held release is left in the directory: no temporary file of an add.
+    let left: Vec<_> = std::fs::read_dir(dir.join("releases"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(left, [std::ffi::OsString::from(&release.sha256)]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_release_is_served_only_to_a_node_updating_to_it_that_signs_for_it() {
+    let (dir, addr, hub) = start_releases("release-download", None).await;
+    let bin = fake_vk("0.84.0");
+    let sha = add_release(&hub, &dir, &bin, "0.84.0").unwrap().sha256;
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    let path = format!("{}{sha}", vk_hub_proto::RELEASE_PATH);
+    let plain = vk_hub_proto::Channel::Plaintext;
+    let signed = |key: &Ed25519KeyPair, at: u64| download_headers(key, &node_id, &sha, at, plain);
+    // No update under way: refused, however well signed.
+    assert_eq!(
+        get_with(addr, &path, &signed(&key, now_secs())).await.0,
+        403
+    );
+
+    ops::update(&hub, "uid 0", &node_id, &sha[..8], false).unwrap();
+    let (status, body) = get_with(addr, &path, &signed(&key, now_secs())).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, bin);
+    assert_eq!(get_with(addr, &path, &[]).await.0, 401);
+    assert_eq!(
+        get_with(addr, &path, &signed(&keypair(), now_secs()))
+            .await
+            .0,
+        403
+    );
+    let stale = now_secs() - vk_hub_proto::DOWNLOAD_SKEW_SECS - 5;
+    assert_eq!(get_with(addr, &path, &signed(&key, stale)).await.0, 401);
+    let ahead = now_secs() + vk_hub_proto::DOWNLOAD_SKEW_SECS + 5;
+    assert_eq!(get_with(addr, &path, &signed(&key, ahead)).await.0, 401);
+    // Signed for this release, presented for another.
+    let other = format!("{}{}", vk_hub_proto::RELEASE_PATH, "cd".repeat(32));
+    assert_eq!(
+        get_with(addr, &other, &signed(&key, now_secs())).await.0,
+        403
+    );
+    // A signature in uppercase hex is not one.
+    let mut upper = signed(&key, now_secs());
+    upper[2].1 = upper[2].1.to_uppercase();
+    assert_eq!(get_with(addr, &path, &upper).await.0, 401);
+
+    // Removal waits for the update, then takes the file too; the node's download with it.
+    let err = releases::remove(&hub, "uid 0", &sha).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("still being updated"),
+        "{err:#}"
+    );
+    let command = hub
+        .db
+        .pending_commands(&node_id, now_secs())
+        .unwrap()
+        .remove(0);
+    hub.db
+        .record_ack(
+            &node_id,
+            &vk_hub_proto::CommandAck {
+                id: command.id,
+                outcome: vk_hub_proto::Outcome::Done,
+            },
+            now_secs(),
+        )
+        .unwrap();
+    assert_eq!(
+        get_with(addr, &path, &signed(&key, now_secs())).await.0,
+        403
+    );
+    assert!(releases::remove(&hub, "uid 0", &sha).unwrap());
+    assert!(!dir.join("releases").join(&sha).exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Over TLS a download is signed for the connection's exporter: presented on another
+/// connection — a relay terminating TLS — the signature does not verify.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tls_download_is_bound_to_its_connection() {
+    let (dir, addr, hub) = start_releases("release-tls", Some(tls_acceptor())).await;
+    let bin = fake_vk("0.84.0");
+    let sha = add_release(&hub, &dir, &bin, "0.84.0").unwrap().sha256;
+    let key = keypair();
+    let public_key = vk_hub_proto::to_hex(key.public_key().as_ref());
+    let Enrollment::Enrolled { node_id } = hub
+        .db
+        .enroll(&token(&hub), &public_key, "ci-1", "peer p", now_secs())
+        .unwrap()
+    else {
+        panic!("expected an enrollment");
+    };
+    ops::update(&hub, "uid 0", &node_id, &sha, false).unwrap();
+    let path = format!("{}{sha}", vk_hub_proto::RELEASE_PATH);
+    let (stream, exported) = tls_stream(addr).await;
+    let headers = download_headers(
+        &key,
+        &node_id,
+        &sha,
+        now_secs(),
+        vk_hub_proto::Channel::Tls(&exported),
+    );
+    let (other, _) = tls_stream(addr).await;
+    assert_eq!(get_on(other, &path, &headers).await.0, 403);
+    let plain = download_headers(
+        &key,
+        &node_id,
+        &sha,
+        now_secs(),
+        vk_hub_proto::Channel::Plaintext,
+    );
+    let (third, _) = tls_stream(addr).await;
+    assert_eq!(get_on(third, &path, &plain).await.0, 403);
+    let (status, body) = get_on(stream, &path, &headers).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, bin);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A release whose binary is missing or the wrong size is answered 404, and adding the same
+/// bytes again puts it back: removing it first is refused while a node updates to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_release_binary_is_not_served_until_added_again() {
+    let (dir, addr, hub) = start_releases("release-lost", None).await;
+    let bin = fake_vk("0.84.0");
+    let release = add_release(&hub, &dir, &bin, "0.84.0").unwrap();
+    let sha = release.sha256.clone();
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    ops::update(&hub, "uid 0", &node_id, &sha, false).unwrap();
+    let path = format!("{}{sha}", vk_hub_proto::RELEASE_PATH);
+    let plain = vk_hub_proto::Channel::Plaintext;
+    let signed = || download_headers(&key, &node_id, &sha, now_secs(), plain);
+    let held = dir.join("releases").join(&sha);
+
+    std::fs::remove_file(&held).unwrap();
+    let (status, body) = get_with(addr, &path, &signed()).await;
+    assert_eq!(status, 404);
+    assert!(String::from_utf8_lossy(&body).contains("missing"));
+    assert_eq!(add_release(&hub, &dir, &bin, "0.84.0").unwrap(), release);
+    assert_eq!(get_with(addr, &path, &signed()).await, (200, bin.clone()));
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&held)
+        .unwrap()
+        .set_len(100)
+        .unwrap();
+    let (status, body) = get_with(addr, &path, &signed()).await;
+    assert_eq!(status, 404);
+    assert!(String::from_utf8_lossy(&body).contains("wrong size"));
+    assert_eq!(add_release(&hub, &dir, &bin, "0.84.0").unwrap(), release);
+    assert_eq!(get_with(addr, &path, &signed()).await, (200, bin.clone()));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An authenticated download gives up its pre-auth permit for a download slot, held while its
+/// body is sent; with every slot taken, the next download is answered 503.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_trades_its_pre_auth_permit_for_a_download_slot() {
+    let (dir, addr, hub) = start_releases("release-slots", None).await;
+    // Far larger than the socket buffers, so its download stays under way while the client
+    // reads nothing: a sparse file, recorded as it is.
+    let sha = "ab".repeat(32);
+    let size = 1u64 << 30;
+    std::fs::create_dir_all(dir.join("releases")).unwrap();
+    std::fs::File::create(dir.join("releases").join(&sha))
+        .unwrap()
+        .set_len(size)
+        .unwrap();
+    let row = store::ReleaseRow {
+        version: "0.84.0".into(),
+        size,
+        added_at: now_secs(),
+        added_by: "uid 0".into(),
+    };
+    hub.db.add_release(&sha, &row, "uid 0").unwrap();
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    ops::update(&hub, "uid 0", &node_id, &sha, false).unwrap();
+    let path = format!("{}{sha}", vk_hub_proto::RELEASE_PATH);
+    let plain = vk_hub_proto::Channel::Plaintext;
+    let signed = || download_headers(&key, &node_id, &sha, now_secs(), plain);
+    let others = u32::try_from(server::MAX_DOWNLOADS - 1).unwrap();
+    let _others = hub
+        .downloads
+        .clone()
+        .try_acquire_many_owned(others)
+        .unwrap();
+
+    let mut first = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut head = format!("GET {path} HTTP/1.1\r\nHost: hub\r\n");
+    for (k, v) in signed() {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    first.write_all(head.as_bytes()).await.unwrap();
+    let mut resp = Vec::new();
+    while !resp.windows(4).any(|w| w == b"\r\n\r\n") {
+        let mut buf = [0u8; 4096];
+        let n = first.read(&mut buf).await.unwrap();
+        assert_ne!(n, 0, "the hub closed before its response head");
+        resp.extend_from_slice(&buf[..n]);
+    }
+    assert!(resp.starts_with(b"HTTP/1.1 200"), "{resp:?}");
+    // The enrollment's permit comes back only once the hub has closed that connection.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while hub.connections.available_permits() != server::MAX_PRE_AUTH {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a pre-auth permit was not given back"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(hub.downloads.available_permits(), 0);
+    let (status, body) = get_with(addr, &path, &signed()).await;
+    assert_eq!(status, 503);
+    assert!(String::from_utf8_lossy(&body).contains("too many"));
+
+    // The slot goes with the body, once the hub finds its peer gone.
+    drop(first);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while hub.downloads.available_permits() == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "the slot was kept");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An update names a release the hub holds, by digest and size, and goes only to a node that
+/// can be steered.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_update_names_a_held_release_and_refuses_a_version_1_node() {
+    let (dir, addr, hub) = start_releases("release-update", None).await;
+    let bin = fake_vk("0.84.0");
+    let release = add_release(&hub, &dir, &bin, "0.84.0").unwrap();
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    let err = ops::update(&hub, "uid 0", &node_id, &"cd".repeat(32), false).unwrap_err();
+    assert!(format!("{err:#}").contains("no release"), "{err:#}");
+    let err = ops::update(&hub, "uid 0", &node_id, "abc", false).unwrap_err();
+    assert!(format!("{err:#}").contains("first 8 hex digits"), "{err:#}");
+    let err = ops::update(&hub, "uid 0", &"00".repeat(16), &release.sha256, false).unwrap_err();
+    assert!(err.is::<store::NotEnrolled>(), "{err:#}");
+    let err = ops::command(
+        &hub,
+        "uid 0",
+        &node_id,
+        vk_hub_proto::Operation::Update {
+            version: "0.84.0".into(),
+            sha256: release.sha256.clone(),
+            size: release.row.size,
+            signature: None,
+            force: false,
+            within_secs: None,
+        },
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("names a release"), "{err:#}");
+
+    // A node not connected yet is taken at its word, and is sent it on connect.
+    let command = ops::update(&hub, "uid 0", &node_id, &release.sha256[..8], true).unwrap();
+    assert_eq!(
+        command.op,
+        vk_hub_proto::Operation::Update {
+            version: "0.84.0".into(),
+            sha256: release.sha256.clone(),
+            size: bin.len() as u64,
+            signature: None,
+            force: true,
+            within_secs: None,
+        }
+    );
+    let events: Vec<String> = hub
+        .db
+        .audits(Some(&node_id), 10)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .collect();
+    assert!(
+        events.contains(&format!(
+            "uid 0 issued update to vk 0.84.0 ({}) (command {})",
+            &release.sha256[..12],
+            command.id
+        )),
+        "{events:?}"
+    );
+    let mut ws = dial(addr).await;
+    assert!(matches!(
+        open(&mut ws, &node_id, &"31".repeat(16), &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    send(&mut ws, &applied(None)).await;
+    let sent = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let HubMsg::Command(c) = receive(&mut ws).await {
+                return c;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(sent, command);
+
+    // A node on version 1 is refused it.
+    let old = keypair();
+    let old_id = enrolled(addr, &hub, &old).await;
+    let mut ws = dial(addr).await;
+    let twist = Twist {
+        versions: Some(V1),
+        ..Twist::default()
+    };
+    assert!(matches!(
+        open_with(&mut ws, &old_id, &"32".repeat(16), &old, twist).await,
+        HubMsg::Welcome { .. }
+    ));
+    let err = ops::update(&hub, "uid 0", &old_id, &release.sha256, false).unwrap_err();
+    assert!(err.is::<store::MonitoringOnly>(), "{err:#}");
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]

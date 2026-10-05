@@ -39,6 +39,10 @@ All notable changes to virtkit will be documented in this file.
   what the hub asked beside what the host reports, drain progress, what the host says it
   cannot do, and its latest command outcomes. A viewer gets no actions, and a
   host still on 0.84.0 or earlier is shown as monitored only.
+- **Experimental: `vk-hub` holds `vk` releases for its hosts.** `vk-hub release add <file>
+  --version <v>` keeps a `vk` binary on the hub, `release list` and `release remove` show and
+  delete them, and `vk-hub nodes update <id> --release <sha256>` asks a host to update to one.
+  The hub hands a release only to an enrolled host that is updating to it.
 - **`vk tune` stands aside on a fleet node** while `vk node run` is up, and otherwise honours
   the ceiling the node last received.
 

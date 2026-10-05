@@ -18,11 +18,14 @@ The prototype provides, all experimentally:
 - on the hub, that desired state (a ceiling, stopping acquisition) and those commands, sent
   to each node and shown beside what it reports (`vk-hub nodes ceiling`, `stop`, `resume`,
   `drain`, `undrain`, `quarantine`, `release`), and the audit log (`vk-hub audit`);
+- on the hub, the `vk` releases it holds (`vk-hub release`) and updates naming one (`vk-hub
+  nodes update`), each release served only to a node updating to it;
 - `vk-hub workloads`: each node's VMs;
 - live nodes and node detail pages, steering from a node's page, and an audit log, with
   sign-in links from `vk-hub ui login`.
 
-Releases, updates, rollouts, resets, restart and redeploy are not built.
+A node does not apply an update yet: it refuses one. Rollouts, resets, restart and redeploy
+are not built.
 
 | Capability | Current prototype | Proposed gate |
 |---|---|---|
@@ -61,9 +64,9 @@ a node are recorded in the audit log.
 `127.0.0.1:8443`), `tls_cert` and `tls_key`, `data_dir` (default `$XDG_DATA_HOME/virtkit/hub`,
 else `~/.local/share/virtkit/hub`), and the web UI's keys (see [Web UI](#web-ui)). Every key
 is optional and an unknown one is an error. Without TLS the hub serves only on loopback. TLS is
-1.3 only, on both the hub and the node. `vk-hub token`, `vk-hub nodes`, `vk-hub workloads`,
-`vk-hub audit` and `vk-hub ui` reach the running hub through `<data_dir>/admin.sock`, open to
-the hub's user and root.
+1.3 only, on both the hub and the node. `vk-hub token`, `vk-hub nodes`, `vk-hub release`,
+`vk-hub workloads`, `vk-hub audit` and `vk-hub ui` reach the running hub through
+`<data_dir>/admin.sock`, open to the hub's user and root.
 
 `vk node run` holds a WebSocket session at `/v1/node` in the foreground. The node signs the
 hub's challenge, its node ID and incarnation (new on every `vk node run`), both version ranges,
@@ -84,8 +87,8 @@ speaks only version 1 runs on its local policy alone. Version 2 also defines upd
 base64 signature; the `maintenance` and `validating` states; the update's progress on the
 report; and a release download, `GET /v1/releases/<sha256>`, signed by the node under the
 label `vk-fleet release-download v1` over its ID, the release's 32-byte sha256, the time (`u64`)
-and the channel, sent in the `vk-node`, `vk-time` and `vk-signature` headers. No hub issues an
-update yet, and a node refuses one.
+and the channel, sent in the `vk-node`, `vk-time` and `vk-signature` headers. The hub issues
+updates and serves releases (see [Releases](#releases)); a node refuses an update.
 
 The hub admits at most 256 connections that have not authenticated, each step of which (TLS,
 request headers, an enrollment body, a handshake message) has 10 seconds. One past that is
@@ -253,6 +256,32 @@ stops acquisition from any state and only `release` lifts it, returning the node
 if that is where it was quarantined and to `ready` otherwise. A quarantined node refuses
 `drain` and `undrain`. All of it is persisted on the node, and a restart or a lost hub leaves
 it where it was.
+
+## Releases
+
+`vk-hub release add <file> --version <v>` copies a `vk` binary into `<data_dir>/releases/`,
+named by its sha256, and prints the sha256; `release list` and `release remove` show and delete
+them, unless a node is still updating to the release. Adding the same bytes and version again
+returns the existing release and restores its binary if missing or the wrong size, so a retry
+after a lost response succeeds. The hub never runs a binary it is handed: it holds the
+database, its TLS key and every node's pinned key, so it only reads the file, checking that it
+is an x86-64 ELF of at most 1 GiB that holds the stated version as a string of its own. The
+version is the operator's to state; running the binary is left to the node. `vk-hub nodes
+update <id> --release <sha256>` issues the update, which names the release by digest and size;
+a prefix of at least 8 hex digits names a release too. `--force` asks a node whose runner is
+external, which cannot be drained, to update without draining. Like any command, it is refused
+for a node monitored only.
+
+An update's release is downloaded from the node listener, `GET /v1/releases/<sha256>`, with the
+node's ID, the time and its signature over both, the release and the connection's TLS exporter
+— the session auth's binding — in the request's headers. The hub serves it only to an enrolled
+node whose pinned key verifies, within five minutes of the hub's clock, and which has an update
+to that release still to finish: the hub is not a download site, and no grant sits in a command
+or the node's journal to be replayed. The body is streamed from the file, one download per
+connection; once authenticated, a download no longer counts against the connections the
+listener allows before authentication, and may hold its connection for 30 minutes past the 30
+seconds any connection gets. At most 64 downloads run at once; past that the request is
+answered HTTP 503, to be retried.
 
 ## Workloads
 

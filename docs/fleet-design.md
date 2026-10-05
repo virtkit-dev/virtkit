@@ -254,10 +254,11 @@ a quiet node does not satisfy the gate merely by waiting. Persist the evidence a
 with the rollout so a hub restart does not bypass them. Allow operator-defined canary groups
 for material configuration differences, such as VMM version, kernel and executor settings,
 alongside the hardware profile. Show uncovered groups before starting a rollout. This gate is
-not built, nor are updates and rollouts.
+not built, nor are rollouts or a node applying an update.
 
-Release downloads are to be authenticated and scoped to a pending update; their bytes do not
-ride on the control session.
+Release downloads are authenticated and scoped to a pending update; their bytes do not ride on
+the control session. The hub stores and serves releases this way
+(see [Releases](fleet-prototype.md#releases)).
 
 ## Resets
 

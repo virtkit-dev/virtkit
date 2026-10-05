@@ -1,6 +1,6 @@
-//! `vk-hub token`, `vk-hub nodes`, `vk-hub workloads`, `vk-hub audit`, `vk-hub ui` and
-//! `vk-hub local login`, `sessions` and `logout` reach the running hub through a unix socket
-//! in its data directory.
+//! `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub workloads`, `vk-hub audit`,
+//! `vk-hub ui` and `vk-hub local login`, `sessions` and `logout` reach the running hub through
+//! a unix socket in its data directory.
 //!
 //! Enrollment tokens admit machines to the fleet and must be issued outside the node-facing
 //! network; sign-in links must be issued outside the web UI. The CLI cannot open the database:
@@ -27,7 +27,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::ops::{self, NodeView};
 use crate::server::Hub;
-use crate::store::{AuditRow, Role, UiSession};
+use crate::store::{AuditRow, Release, Role, UiSession};
 use vk_hub_proto::{Acquisition, Command, DesiredState, Operation};
 
 /// Bumped only for a change an older peer could misread.
@@ -44,8 +44,13 @@ const MAX_REPLY: u64 = 16 * 1024 * 1024;
 /// What of [`MAX_REPLY`] a reply's value may take, leaving the rest to its envelope.
 const MAX_REPLY_VALUE: usize = (MAX_REPLY - 64 * 1024) as usize;
 
-/// How long either side waits on the other. Every operation is a small redb transaction.
+/// How long either side waits on the other. Every operation is a small redb transaction, but
+/// adding a release, which copies and hashes a binary first: see [`ADD_TIMEOUT`].
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the CLI waits for a release to be added: a gigabyte copied and hashed on a slow
+/// disk. An add retried after this ran out finds the release added and answers with it.
+const ADD_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
@@ -73,6 +78,21 @@ enum Call {
     Command {
         id: String,
         operation: Operation,
+    },
+    /// Update a node to a release, named by its sha256 or a prefix of it.
+    UpdateNode {
+        id: String,
+        release: String,
+        force: bool,
+    },
+    /// Copy the binary at `path`, which the hub's user must be able to read, into the hub.
+    AddRelease {
+        path: PathBuf,
+        version: String,
+    },
+    ListReleases,
+    RemoveRelease {
+        release: String,
     },
     /// The latest `limit` audit lines, of one node or of all.
     Audit {
@@ -267,6 +287,18 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
         Call::Command { id, operation } => {
             serde_json::to_value(ops::command(hub, &actor, &id, operation)?)?
         }
+        Call::UpdateNode { id, release, force } => {
+            serde_json::to_value(ops::update(hub, &actor, &id, &release, force)?)?
+        }
+        Call::AddRelease { path, version } => {
+            serde_json::to_value(crate::releases::add(hub, &actor, &path, &version)?)?
+        }
+        Call::ListReleases => serde_json::to_value(hub.db.releases()?)?,
+        Call::RemoveRelease { release } => {
+            let release = hub.db.resolve_release(&release)?;
+            let removed = crate::releases::remove(hub, &actor, &release.sha256)?;
+            serde_json::to_value(removed.then_some(release))?
+        }
         Call::Audit { node, limit } => serde_json::to_value(audit(hub, node.as_deref(), limit)?)?,
         Call::UiLogin { role, ttl_secs } => {
             let Some(base) = &hub.ui_url else {
@@ -399,6 +431,33 @@ impl Client {
         })
     }
 
+    pub fn update_node(&self, id: &str, release: &str, force: bool) -> Result<Command> {
+        self.call(Call::UpdateNode {
+            id: id.to_string(),
+            release: release.to_string(),
+            force,
+        })
+    }
+
+    pub fn add_release(&self, path: &Path, version: &str) -> Result<Release> {
+        self.call(Call::AddRelease {
+            path: path.to_path_buf(),
+            version: version.to_string(),
+        })
+    }
+
+    pub fn releases(&self) -> Result<Vec<Release>> {
+        self.call(Call::ListReleases)
+    }
+
+    /// The release removed, or `None` when another removal took it first. A prefix naming no
+    /// release is an error.
+    pub fn remove_release(&self, release: &str) -> Result<Option<Release>> {
+        self.call(Call::RemoveRelease {
+            release: release.to_string(),
+        })
+    }
+
     /// Oldest first.
     pub fn audit(&self, node: Option<&str>, limit: usize) -> Result<Vec<AuditRow>> {
         self.call(Call::Audit {
@@ -426,6 +485,10 @@ impl Client {
     }
 
     fn call<T: DeserializeOwned>(&self, call: Call) -> Result<T> {
+        let timeout = match call {
+            Call::AddRelease { .. } => ADD_TIMEOUT,
+            _ => IO_TIMEOUT,
+        };
         let request = serde_json::to_vec(&Envelope {
             v: PROTOCOL_VERSION,
             call,
@@ -433,7 +496,7 @@ impl Client {
         .context("encoding an admin request")?;
         let mut stream = std::os::unix::net::UnixStream::connect(&self.path)
             .with_context(|| format!("connecting to {}", self.path.display()))?;
-        stream.set_read_timeout(Some(IO_TIMEOUT))?;
+        stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
         stream
             .write_all(&request)
@@ -593,6 +656,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(issued.op, Operation::Drain);
+        // An update goes through a release the hub holds, never a version and digest the
+        // caller made up.
+        let err = call(format!(
+            r#"{{"op":"command","id":"{id}","operation":{{"kind":"update","version":"1","sha256":"ab","size":1}}}}"#
+        ))
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("names a release"), "{err:#}");
+        let err = call(format!(
+            r#"{{"op":"update-node","id":"{id}","release":"abababab","force":false}}"#
+        ))
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no release abababab"),
+            "{err:#}"
+        );
         let lines: Vec<AuditRow> = serde_json::from_value(
             call(format!(r#"{{"op":"audit","node":"{id}","limit":2}}"#)).unwrap(),
         )

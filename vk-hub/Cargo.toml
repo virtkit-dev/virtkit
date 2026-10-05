@@ -22,8 +22,8 @@ bytes.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
-# `process`: the `vk` commands local mode runs
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util", "sync", "process"] }
+# `process`: the `vk` commands local mode runs; `fs`: the release binaries streamed to nodes
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util", "sync", "process", "fs"] }
 rustls.workspace = true
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
 tokio-tungstenite.workspace = true
