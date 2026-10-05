@@ -536,15 +536,31 @@ mod tests {
 
     /// A port free on this host, held for as long as the returned listener lives — on
     /// `127.0.0.1` only, so the allocator can still bind it on a `127.0.<block>.x` address
-    /// while no other test in this binary can be handed the same number. Two tests taking
-    /// the same ephemeral port would otherwise flake.
+    /// while no other test here can take the same number.
     ///
-    /// Fixed ports would make these tests fail on a machine that happens to hold one, and
-    /// the allocator's own probe binds on every block anyway.
+    /// Taken below the kernel's ephemeral range: the hold on `127.0.0.1` does not stop the
+    /// kernel handing the same number to a socket bound or connecting from another address,
+    /// such as `127.0.<block>.1`, and one doing so between the allocator's two probes failed
+    /// it. A fixed port would fail on a machine that happens to hold it, so the search starts
+    /// at a point drawn per call.
     fn free_port() -> (TcpListener, u16) {
-        let held = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = held.local_addr().unwrap().port();
-        (held, port)
+        const FIRST: u16 = 10_000;
+        let below = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .ok()
+            .and_then(|r| r.split_whitespace().next()?.parse::<u16>().ok())
+            .unwrap_or(32_768);
+        assert!(below > FIRST, "ephemeral ports start at {below}");
+        let span = below - FIRST;
+        let draw = std::hash::BuildHasher::hash_one(&std::hash::RandomState::new(), ());
+        let start = u16::try_from(draw % u64::from(span)).unwrap();
+        (0..span)
+            .map(|i| FIRST + (start + i) % span)
+            .find_map(|port| {
+                TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+                    .ok()
+                    .map(|held| (held, port))
+            })
+            .expect("a free port below the ephemeral range")
     }
 
     #[test]
