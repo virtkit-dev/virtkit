@@ -164,6 +164,9 @@ pub struct NodeRow {
     /// The incarnation of the node's latest session.
     #[serde(default)]
     pub incarnation: Option<String>,
+    /// The protocol version of the node's latest session.
+    #[serde(default)]
+    pub protocol: Option<u32>,
     /// When the node last authenticated or sent anything.
     #[serde(default)]
     pub last_seen: Option<u64>,
@@ -176,6 +179,9 @@ pub struct NodeRow {
     /// How many VMs the node last said it runs, listed or not; `None` until it has said.
     #[serde(default)]
     pub workloads: Option<u32>,
+    /// The node's latest report of itself, without its workloads: those are kept apart.
+    #[serde(default)]
+    pub report: Option<Report>,
 }
 
 /// What a node last said runs on it.
@@ -483,13 +489,14 @@ impl Db {
         nodes_in(&txn)
     }
 
-    /// A node authenticated a session as `incarnation`, recorded only if `current` still
-    /// holds inside the write: a session superseded meanwhile leaves the newer one's
-    /// incarnation alone. Returns whether it was recorded.
+    /// Record an authenticated session's `incarnation` and protocol `version` only if
+    /// `current` holds inside the write, preserving a newer session's values if superseded.
+    /// Return whether the session was recorded.
     pub fn record_session(
         &self,
         id: &str,
         incarnation: &str,
+        version: u32,
         now: u64,
         current: impl FnOnce() -> bool,
     ) -> Result<bool> {
@@ -497,6 +504,7 @@ impl Db {
             let current = current();
             if current {
                 row.incarnation = Some(incarnation.to_string());
+                row.protocol = Some(version);
                 row.last_seen = Some(now);
             }
             Ok((current, Vec::new(), Durability::Immediate))
@@ -620,29 +628,39 @@ impl Db {
             .collect()
     }
 
-    /// Store node `id`'s report. One that has not listed workloads yet changes nothing.
-    pub fn record_report(&self, id: &str, report: Report, now: u64) -> Result<()> {
-        let Some(listed) = report.workloads else {
-            return Ok(());
-        };
-        // Bounded again, as the node bounds them: what it sends is not trusted to be.
-        let (kept, cut) =
-            vk_hub_proto::bound_workloads(listed.into_iter().map(|w| (w, ())).collect());
-        let workloads = Workloads {
-            listed: kept.into_iter().map(|(w, ())| w).collect(),
-            omitted: report.workloads_omitted.saturating_add(cut),
-            mem_bytes: BTreeMap::new(),
-        };
-        // Kept apart from the row, which carries their count.
+    /// Store node `id`'s report on its row, durably when changed. Store workloads separately,
+    /// preserving the previous list when the report has not listed workloads yet.
+    pub fn record_report(&self, id: &str, mut report: Report, now: u64) -> Result<()> {
+        let workloads = report.workloads.take().map(|listed| {
+            // Bounded again, as the node bounds them: what it sends is not trusted to be.
+            let (kept, cut) =
+                vk_hub_proto::bound_workloads(listed.into_iter().map(|w| (w, ())).collect());
+            Workloads {
+                listed: kept.into_iter().map(|(w, ())| w).collect(),
+                omitted: report.workloads_omitted.saturating_add(cut),
+                mem_bytes: BTreeMap::new(),
+            }
+        });
+        report.workloads_omitted = 0;
+        let report = display_safe_report(report);
         self.update_txn(now, id, |row, txn| {
-            let total = u32::try_from(workloads.listed.len())
-                .unwrap_or(u32::MAX)
-                .saturating_add(workloads.omitted);
-            row.workloads = Some(total);
+            let durability = if row.report.as_ref() == Some(&report) {
+                Durability::None
+            } else {
+                Durability::Immediate
+            };
+            row.report = Some(report);
             row.last_seen = Some(now);
-            txn.open_table(WORKLOADS)?
-                .insert(id, encode(&workloads)?.as_slice())?;
-            Ok(((), Vec::new(), Durability::None))
+            // Kept apart from the row, which carries their count.
+            if let Some(workloads) = workloads {
+                let total = u32::try_from(workloads.listed.len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_add(workloads.omitted);
+                row.workloads = Some(total);
+                txn.open_table(WORKLOADS)?
+                    .insert(id, encode(&workloads)?.as_slice())?;
+            }
+            Ok(((), Vec::new(), durability))
         })
     }
 
@@ -1090,6 +1108,19 @@ fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
     inventory
 }
 
+/// `report`'s strings made display-safe, its list cut like an inventory's.
+fn display_safe_report(mut report: Report) -> Report {
+    report.unsupported.truncate(MAX_INVENTORY_ITEMS);
+    for s in report
+        .unsupported
+        .iter_mut()
+        .chain(report.concurrency_error.as_mut())
+    {
+        *s = vk_hub_proto::display_safe(s);
+    }
+    report
+}
+
 /// `heartbeat` cut to what an inventory may hold: [`MAX_INVENTORY_ITEMS`] filesystems, and
 /// the memory of at most [`vk_hub_proto::MAX_WORKLOADS`] workloads, each keyed by an ID of
 /// the shape `vk` gives one — anything else is dropped rather than stored for display.
@@ -1397,8 +1428,8 @@ mod tests {
         else {
             panic!("expected an enrollment");
         };
-        assert!(db.record_session(&node_id, "inc", 2, || true).unwrap());
-        assert!(!db.record_session(&node_id, "old", 2, || false).unwrap());
+        assert!(db.record_session(&node_id, "inc", 2, 2, || true).unwrap());
+        assert!(!db.record_session(&node_id, "old", 1, 2, || false).unwrap());
         let inventory = Inventory {
             hostname: "renamed\u{1b}[2J".into(),
             versions: vk_hub_proto::Versions {
@@ -1412,6 +1443,7 @@ mod tests {
             .unwrap();
         let row = db.node(&node_id).unwrap().unwrap();
         assert_eq!(row.incarnation.as_deref(), Some("inc"));
+        assert_eq!(row.protocol, Some(2));
         assert_eq!(row.hostname, "renamed[2J");
         assert_eq!(row.inventory.as_ref().unwrap().versions.vk, "0.80.0");
         assert_eq!((row.heartbeat_at, row.last_seen), (Some(4), Some(4)));
@@ -1452,6 +1484,7 @@ mod tests {
         let report = |n: usize, omitted| Report {
             workloads: Some((0..n).map(workload).collect()),
             workloads_omitted: omitted,
+            ..Report::default()
         };
         db.record_report(&id, report(MAX_WORKLOADS + 5, 7), 2)
             .unwrap();
@@ -1499,6 +1532,7 @@ mod tests {
             Report {
                 workloads: Some((0..n).map(big).collect()),
                 workloads_omitted: 1,
+                ..Report::default()
             },
             4,
         )
@@ -1538,6 +1572,38 @@ mod tests {
         // A removed node takes its workloads with it.
         assert!(db.remove_node(&id, "uid 0", 5).unwrap());
         assert_eq!(db.workloads(&id).unwrap(), None);
+    }
+
+    /// A report's steering is stored on the row display-safe, its workloads apart; one that
+    /// has not listed workloads yet still replaces it.
+    #[test]
+    fn a_report_s_steering_is_stored_on_the_row() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        let report = Report {
+            workloads: Some(Vec::new()),
+            workloads_omitted: 2,
+            state: Some(vk_hub_proto::NodeState::Draining),
+            unsupported: vec!["no\u{1b}[2J".into()],
+            concurrency_error: Some("bad\u{202e}".into()),
+            ..Report::default()
+        };
+        db.record_report(&id, report, 2).unwrap();
+        let row = db.node(&id).unwrap().unwrap();
+        assert_eq!(
+            row.report,
+            Some(Report {
+                state: Some(vk_hub_proto::NodeState::Draining),
+                unsupported: vec!["no[2J".into()],
+                concurrency_error: Some("bad".into()),
+                ..Report::default()
+            })
+        );
+        assert_eq!(row.workloads, Some(2));
+        db.record_report(&id, Report::default(), 3).unwrap();
+        let row = db.node(&id).unwrap().unwrap();
+        assert_eq!(row.report, Some(Report::default()));
+        assert_eq!(row.workloads, Some(2));
     }
 
     /// A stored list or set of memory readings that does not decode does not fail a listing,

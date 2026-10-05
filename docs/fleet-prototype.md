@@ -70,7 +70,10 @@ Keys, signatures, nonces and IDs are strict lowercase hex. A proxy in front of t
 pass TLS through: terminating it breaks the binding, and the hub refuses the signature.
 
 From 0.83.0, hubs and nodes of different releases interoperate: protocol version 1 and
-enrollment at `/v1/` are frozen, though the fleet remains experimental.
+enrollment at `/v1/` are frozen, though the fleet remains experimental. Version 2 adds
+steering — desired state, commands, their acks, and the node's state on its report. A hub
+serves a version-1 node for monitoring only; a node whose hub speaks only version 1 runs on its
+local policy alone.
 
 The hub admits at most 256 connections that have not authenticated, each step of which (TLS,
 request headers, an enrollment body, a handshake message) has 10 seconds. One past that is

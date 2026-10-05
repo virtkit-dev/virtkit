@@ -79,6 +79,9 @@ Then:
 - **hub → node** (proposed): desired state, as a document with a generation number;
   operations (`drain`, `update`, `reset`), each with an ID and an expiry.
 
+Steering — desired state, commands and their outcomes — takes protocol version 2 on both
+sides; a session with a version-1 node (0.83.0 or 0.84.0) carries monitoring only.
+
 Proposed: a node applies a desired-state generation at most once, and journals every command
 before acting on it, so a command redelivered after a reconnect is recognized and not repeated.
 It repeats each command's outcome until the hub says it has stored it, and the hub resends

@@ -184,6 +184,8 @@ async fn open(
 /// How [`open_with`] departs from what an honest node on plain TCP does.
 #[derive(Default)]
 struct Twist<'a> {
+    /// Speak this range rather than [`PROTOCOL`].
+    versions: Option<VersionRange>,
     /// Sign for this version rather than the one the hub chose.
     version: Option<u32>,
     /// Sign for a TLS connection that exported this.
@@ -200,7 +202,11 @@ async fn open_with(
     signer: &Ed25519KeyPair,
     twist: Twist<'_>,
 ) -> HubMsg {
-    send(ws, &hello(node_id, incarnation, PROTOCOL)).await;
+    send(
+        ws,
+        &hello(node_id, incarnation, twist.versions.unwrap_or(PROTOCOL)),
+    )
+    .await;
     let challenge = receive(ws).await;
     authenticate(ws, challenge, node_id, incarnation, signer, twist).await
 }
@@ -222,7 +228,8 @@ async fn authenticate(
     else {
         panic!("expected a challenge, got {challenge:?}");
     };
-    assert_eq!(version, PROTOCOL.max);
+    let ours = twist.versions.unwrap_or(PROTOCOL);
+    assert_eq!(Some(version), ours.negotiate(PROTOCOL));
     assert_eq!(versions, PROTOCOL);
     let nonce = vk_hub_proto::from_hex(&nonce).unwrap();
     assert_eq!(nonce.len(), vk_hub_proto::CHALLENGE_LEN);
@@ -230,7 +237,7 @@ async fn authenticate(
         &nonce,
         node_id,
         incarnation,
-        PROTOCOL,
+        ours,
         versions,
         twist.version.unwrap_or(version),
         twist
@@ -489,6 +496,97 @@ async fn a_newer_session_supersedes_the_older_one() {
         hub.db.node(&node_id).unwrap().unwrap().incarnation,
         Some("02".repeat(16))
     );
+}
+
+const V1: VersionRange = VersionRange { min: 1, max: 1 };
+
+/// A node speaking only version 1 gets a version-1 session, recorded on its row, and none of
+/// its report's steering is stored; a node speaking version 2 gets that.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_runs_at_the_highest_version_both_speak() {
+    let (addr, hub) = start().await;
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    let mut ws = dial(addr).await;
+    let twist = Twist {
+        versions: Some(V1),
+        ..Twist::default()
+    };
+    assert!(matches!(
+        open_with(&mut ws, &node_id, &"21".repeat(16), &key, twist).await,
+        HubMsg::Welcome { .. }
+    ));
+    assert_eq!(hub.db.node(&node_id).unwrap().unwrap().protocol, Some(1));
+    let report = vk_hub_proto::Report {
+        workloads: Some(Vec::new()),
+        state: Some(vk_hub_proto::NodeState::Draining),
+        ..vk_hub_proto::Report::default()
+    };
+    send(&mut ws, &NodeMsg::Report(report.clone())).await;
+    eventually(|| hub.db.node(&node_id).unwrap().unwrap().report.is_some()).await;
+    assert_eq!(
+        hub.db.node(&node_id).unwrap().unwrap().report,
+        Some(vk_hub_proto::Report::default())
+    );
+
+    let mut ws = dial(addr).await;
+    assert!(matches!(
+        open(&mut ws, &node_id, &"22".repeat(16), &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    let row = hub.db.node(&node_id).unwrap().unwrap();
+    assert_eq!(row.protocol, Some(vk_hub_proto::STEERING));
+    send(&mut ws, &NodeMsg::Report(report)).await;
+    eventually(|| {
+        hub.db
+            .node(&node_id)
+            .unwrap()
+            .unwrap()
+            .report
+            .and_then(|r| r.state)
+            == Some(vk_hub_proto::NodeState::Draining)
+    })
+    .await;
+}
+
+/// An ack is version 2's: in a version-1 session it ends the session as a protocol error,
+/// in a version-2 one it is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ack_in_a_version_1_session_is_a_protocol_error() {
+    let (addr, hub) = start().await;
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    let ack = NodeMsg::Ack(vk_hub_proto::CommandAck {
+        id: "ef".repeat(16),
+        outcome: vk_hub_proto::Outcome::Done,
+    });
+
+    let mut ws = dial(addr).await;
+    assert!(matches!(
+        open(&mut ws, &node_id, &"23".repeat(16), &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    send(&mut ws, &ack).await;
+    send(&mut ws, &NodeMsg::Heartbeat(Heartbeat::default())).await;
+    eventually(|| hub.db.node(&node_id).unwrap().unwrap().heartbeat.is_some()).await;
+    assert_eq!(hub.reach(&node_id), Reach::Connected);
+
+    let mut ws = dial(addr).await;
+    let twist = Twist {
+        versions: Some(V1),
+        ..Twist::default()
+    };
+    assert!(matches!(
+        open_with(&mut ws, &node_id, &"24".repeat(16), &key, twist).await,
+        HubMsg::Welcome { .. }
+    ));
+    send(&mut ws, &ack).await;
+    let HubMsg::Refused { code, reason } = receive(&mut ws).await else {
+        panic!("expected a refusal");
+    };
+    assert_eq!(code, RefusalCode::Protocol);
+    assert!(reason.contains("version-1 session"), "{reason}");
+    closed(&mut ws, Duration::from_secs(5)).await;
 }
 
 /// Heartbeats and inventories faster than the hub asked for still end with the latest of
@@ -1051,7 +1149,7 @@ fn workloads_are_selected_by_id_or_unambiguous_hostname() {
             &a,
             vk_hub_proto::Report {
                 workloads: Some(listed),
-                workloads_omitted: 0,
+                ..vk_hub_proto::Report::default()
             },
             3,
         )

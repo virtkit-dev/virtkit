@@ -17,7 +17,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use vk_hub_proto::{
     CHALLENGE_LEN, Channel, Heartbeat, HubMsg, Inventory, NodeMsg, PROTOCOL, PUBLIC_KEY_LEN,
-    RefusalCode, Report, SIGNATURE_LEN, from_hex_lower,
+    RefusalCode, Report, SIGNATURE_LEN, STEERING, from_hex_lower,
 };
 
 use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS};
@@ -59,9 +59,10 @@ pub async fn run(
         return turn_away(&mut ws, peer, r).await;
     }
     eprintln!(
-        "vk-hub: {peer}: node {} ({}) connected, {}",
+        "vk-hub: {peer}: node {} ({}) connected at protocol version {}, {}",
         node.id,
         node.hostname,
+        node.version,
         match &node.previous_incarnation {
             Some(prev) if *prev == node.incarnation => "reconnected".to_string(),
             Some(_) => format!("restarted as incarnation {}", node.incarnation),
@@ -113,6 +114,8 @@ struct Node {
     hostname: String,
     /// The incarnation of its previous session, to tell a reconnect from a restart.
     previous_incarnation: Option<String>,
+    /// The protocol version of the session: below [`STEERING`], it is monitored only.
+    version: u32,
 }
 
 /// A handshake refusal, with a public reason and private log detail.
@@ -253,6 +256,7 @@ async fn handshake(ws: &mut Ws, hub: &Hub, exported: Exported) -> Result<Node, R
         incarnation,
         hostname: row.hostname,
         previous_incarnation: row.incarnation,
+        version,
     })
 }
 
@@ -260,9 +264,9 @@ async fn handshake(ws: &mut Ws, hub: &Hub, exported: Exported) -> Result<Node, R
 /// or a newer session took over meanwhile.
 async fn welcome(ws: &mut Ws, hub: &Arc<Hub>, node: &Node, session: u64) -> Result<(), Refusal> {
     let (db, live) = (hub.db.clone(), hub.clone());
-    let (id, incarnation) = (node.id.clone(), node.incarnation.clone());
+    let (id, incarnation, version) = (node.id.clone(), node.incarnation.clone(), node.version);
     let recorded = tokio::task::spawn_blocking(move || {
-        db.record_session(&id, &incarnation, crate::now_secs(), || {
+        db.record_session(&id, &incarnation, version, crate::now_secs(), || {
             live.is_current(&id, session)
         })
     })
@@ -364,7 +368,17 @@ async fn serve(
                         Some(Write::Inventory(inventory, pace.inventory_durable(now)))
                     }
                     NodeMsg::Heartbeat(heartbeat) => pace.heartbeat(heartbeat, now).map(Write::Heartbeat),
+                    NodeMsg::Report(report) if node.version < STEERING => {
+                        pace.report(report.without_steering(), now).map(Write::Report)
+                    }
                     NodeMsg::Report(report) => pace.report(report, now).map(Write::Report),
+                    NodeMsg::Ack(_) if node.version < STEERING => {
+                        let reason = format!("an ack in a version-{} session", node.version);
+                        refuse(ws, RefusalCode::Protocol, &reason).await;
+                        bail!("the node sent {reason}");
+                    }
+                    // No command is sent yet, so no ack has anything to settle.
+                    NodeMsg::Ack(_) => None,
                     NodeMsg::Hello { .. } | NodeMsg::Auth { .. } => {
                         bail!("the node repeated its handshake inside a session")
                     }

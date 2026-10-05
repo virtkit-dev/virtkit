@@ -15,7 +15,7 @@
 //! - **The session**: a WebSocket at [`NODE_PATH`], JSON in text frames, [`NodeMsg`] one way
 //!   and [`HubMsg`] the other. It opens with [`NodeMsg::Hello`] → [`HubMsg::Challenge`] →
 //!   [`NodeMsg::Auth`] → [`HubMsg::Welcome`]; after that the node sends its inventory,
-//!   heartbeats and a [`Report`] of its VMs.
+//!   heartbeats and a [`Report`] of its VMs, and from version 2 on the hub steers it.
 //!
 //! **Versioning.** Each side of a session speaks a [`VersionRange`], and the hub picks the
 //! highest version both ranges contain ([`VersionRange::negotiate`]); every message after the
@@ -30,14 +30,27 @@
 //! the same rule, and [`TLS_EXPORTER_LABEL`] and the signed payloads' layout are part of
 //! version 1 too. Tests pin every message's JSON and the signed payloads' bytes.
 //!
+//! Version 2 ([`STEERING`]) adds [`HubMsg::Desired`], [`HubMsg::Command`], [`HubMsg::Recorded`],
+//! [`NodeMsg::Ack`] and [`Report`]'s steering fields. Absent steering fields are omitted from
+//! the wire, preserving version-1 report bytes. Version-1 sessions carry monitoring only;
+//! a node connected to a version-1 hub follows its local policy alone.
+//!
+//! **Steering.** From version 2 the node's [`Report`] also carries its observed state — the
+//! desired-state generation it last applied, its [`NodeState`], whether its runner is taking
+//! jobs, its concurrency — and the node acks every command whose outcome the hub has not yet
+//! recorded. The hub answers each ack with [`HubMsg::Recorded`], resends desired state to a
+//! node whose report shows it behind, and resends commands that have no final outcome; the node
+//! recognizes a command it journaled by its ID and answers with the outcome it recorded rather
+//! than acting twice.
+//!
 //! **Display.** Every string a host reports is the host's to choose; whoever prints one to a
 //! terminal, a log or a page passes it through [`display_safe`] first. Escaping it for the
 //! markup it lands in — HTML, say — stays the printer's job.
 //!
-//! Node IDs and incarnations are 16 random bytes as lowercase hex ([`valid_id`]): the node ID
-//! the hub assigns at enrollment and the incarnation a node draws each time `vk node run`
-//! starts. Keys, signatures and nonces are lowercase hex too, read with [`from_hex_lower`].
-//! Timestamps are seconds since the Unix epoch.
+//! Node IDs, incarnations and command IDs are 16 random bytes as lowercase hex ([`valid_id`]):
+//! the node ID the hub assigns at enrollment, the incarnation a node draws each time `vk node
+//! run` starts, and the ID the hub gives each [`Command`]. Keys, signatures and nonces are
+//! lowercase hex too, read with [`from_hex_lower`]. Timestamps are seconds since the Unix epoch.
 
 use std::collections::BTreeMap;
 
@@ -59,7 +72,11 @@ pub const MAX_WORKLOADS: usize = 256;
 pub const MAX_WORKLOADS_BYTES: usize = 256 * 1024;
 
 /// The protocol versions this build speaks.
-pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 1 };
+pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 2 };
+
+/// The first protocol version with desired state and commands. Earlier versions support
+/// monitoring only.
+pub const STEERING: u32 = 2;
 
 /// The largest message either side accepts, as a WebSocket message or an enrollment body.
 /// An inventory is a few kilobytes; this bounds what a confused or hostile peer can make the
@@ -102,9 +119,9 @@ impl VersionRange {
     }
 }
 
-/// Whether `s` is a node ID or incarnation as this protocol writes one: [`ID_BYTES`] bytes
-/// of lowercase hex. IDs become database keys and log fields, so anything else is refused at
-/// the boundary.
+/// Whether `s` is a node ID, incarnation or command ID as this protocol writes one:
+/// [`ID_BYTES`] bytes of lowercase hex. IDs become database keys and log fields, so anything
+/// else is refused at the boundary.
 pub fn valid_id(s: &str) -> bool {
     from_hex_lower::<ID_BYTES>(s).is_some()
 }
@@ -321,6 +338,9 @@ pub enum NodeMsg {
     Heartbeat(Heartbeat),
     /// Sent once a session is up and again whenever it changes.
     Report(Report),
+    /// What became of a [`HubMsg::Command`]; repeated until the hub answers
+    /// [`HubMsg::Recorded`]. From version 2.
+    Ack(CommandAck),
 }
 
 /// Hub → node.
@@ -345,6 +365,13 @@ pub enum HubMsg {
     },
     /// The session is refused or ended; the connection closes after this.
     Refused { code: RefusalCode, reason: String },
+    /// The state the hub wants the node in, applied at most once per generation. From
+    /// version 2.
+    Desired(DesiredState),
+    /// An operation, journaled by the node before it acts on it. From version 2.
+    Command(Command),
+    /// The hub has stored this ack; the node stops repeating it. From version 2.
+    Recorded(CommandAck),
 }
 
 /// Why a session was refused or ended, for the node to decide whether redialing can help.
@@ -510,7 +537,8 @@ pub struct FsUsage {
     pub inodes: u64,
 }
 
-/// What a node observes of itself.
+/// What a node observes of itself. The steering fields, from version 2, are absent from a
+/// version-1 node's report, which says nothing of them: not that the node is ready.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
     /// The VMs running on the node for its user, oldest first. `None` until the node has
@@ -520,6 +548,163 @@ pub struct Report {
     /// VMs running but left out of `workloads`.
     #[serde(default)]
     pub workloads_omitted: u32,
+    /// The last desired-state generation applied; `None` before the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_generation: Option<u64>,
+    /// What of the applied desired state this node cannot carry out, in words.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsupported: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<NodeState>,
+    /// Whether the runner can take jobs: `Stop` only once a stopped runner has exited, since
+    /// a runner still quitting may yet be one that never heard the signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acquisition: Option<Acquisition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<RunnerMode>,
+    /// The supervised runner's process; `None` for an external runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_state: Option<RunnerState>,
+    /// `None` until the node's concurrency loop has run once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<Concurrency>,
+    /// Why the node's last attempt to set its runner's concurrency failed, if it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_error: Option<String>,
+    /// Present while draining: which of the conditions for `drained` hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain: Option<DrainProgress>,
+}
+
+impl Report {
+    /// This report as a session below [`STEERING`] carries it: its workloads alone.
+    pub fn without_steering(self) -> Report {
+        Report {
+            workloads: self.workloads,
+            workloads_omitted: self.workloads_omitted,
+            ..Report::default()
+        }
+    }
+}
+
+/// The state the hub wants a node in. It only ever narrows local policy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesiredState {
+    /// Increases with every change; a node applies each generation at most once.
+    pub generation: u64,
+    /// The hub's cap on the runner's concurrency; `None` leaves it to the node.
+    pub ceiling: Option<u32>,
+    pub acquisition: Acquisition,
+}
+
+/// A node's own state, persisted on the node: losing the hub changes none of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeState {
+    #[default]
+    Ready,
+    Draining,
+    Drained,
+    /// Left only by [`Operation::Release`].
+    Quarantined,
+}
+
+/// How the node's gitlab-runner is run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerMode {
+    /// `vk node run` supervises it, and can stop and resume its acquisition.
+    Managed,
+    /// Something else runs it; only its concurrency can be steered.
+    #[default]
+    External,
+}
+
+/// `effective = min(estimate, hub_ceiling, local_ceiling)`, as the node last worked it out.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Concurrency {
+    pub estimate: Option<u32>,
+    pub hub_ceiling: Option<u32>,
+    pub local_ceiling: Option<u32>,
+    pub effective: Option<u32>,
+}
+
+/// A supervised runner's process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerState {
+    Running,
+    /// Sent `SIGQUIT`: taking no new jobs, finishing the ones it has. gitlab-runner has no way
+    /// back from this, so acquisition resumes only with a new runner once this one exits.
+    Quitting,
+    #[default]
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DrainProgress {
+    /// The runner has exited, having finished its jobs.
+    pub runner_stopped: bool,
+    /// No reservation is held or waited for in the admission ledger.
+    pub ledger_empty: bool,
+    /// Job supervisors still running.
+    pub active_jobs: u32,
+}
+
+/// Whether the runner may take new jobs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Acquisition {
+    #[default]
+    Run,
+    Stop,
+}
+
+/// An operation for a node, identified so a redelivery after a reconnect is recognized.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Command {
+    /// [`ID_BYTES`] of lowercase hex ([`valid_id`]).
+    pub id: String,
+    /// After this, the node refuses the command rather than starting it.
+    pub expires_at: u64,
+    pub op: Operation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Operation {
+    /// Stop taking jobs, let running ones finish, then report [`NodeState::Drained`].
+    Drain,
+    /// Back to [`NodeState::Ready`] from a drain, taking jobs again.
+    Undrain,
+    /// Stop taking jobs until an operator releases the node, whatever else it is told.
+    Quarantine,
+    /// Leave a quarantine for [`NodeState::Ready`].
+    Release,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandAck {
+    /// The [`Command`]'s ID.
+    pub id: String,
+    pub outcome: Outcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Outcome {
+    /// Journaled and under way.
+    Accepted,
+    Done,
+    Failed {
+        message: String,
+    },
+    /// Not permitted by local policy, or not supported by this node.
+    Refused {
+        reason: String,
+    },
+    /// It arrived past its `expires_at`.
+    Expired,
 }
 
 /// The VMs running on a host, as `vk workloads` prints them.
@@ -831,10 +1016,22 @@ mod tests {
             NodeMsg::Report(Report {
                 workloads: Some(vec![workload(), workload_bare()]),
                 workloads_omitted: 3,
+                ..Report::default()
             }),
             NodeMsg::Report(Report {
                 workloads: Some(Vec::new()),
                 ..Report::default()
+            }),
+            NodeMsg::Report(steering_report()),
+            NodeMsg::Ack(CommandAck {
+                id: id.clone(),
+                outcome: Outcome::Failed {
+                    message: "no".into(),
+                },
+            }),
+            NodeMsg::Ack(CommandAck {
+                id: id.clone(),
+                outcome: Outcome::Expired,
             }),
         ] {
             round_trip(&msg);
@@ -850,6 +1047,30 @@ mod tests {
                 code: RefusalCode::NotEnrolled,
                 reason: "unknown node".into(),
             },
+            HubMsg::Desired(DesiredState {
+                generation: 3,
+                ceiling: Some(4),
+                acquisition: Acquisition::Stop,
+            }),
+            HubMsg::Desired(DesiredState {
+                generation: 1,
+                ceiling: None,
+                acquisition: Acquisition::Run,
+            }),
+            HubMsg::Command(Command {
+                id: id.clone(),
+                expires_at: 0,
+                op: Operation::Drain,
+            }),
+            HubMsg::Command(Command {
+                id: id.clone(),
+                expires_at: 0,
+                op: Operation::Quarantine,
+            }),
+            HubMsg::Recorded(CommandAck {
+                id: id.clone(),
+                outcome: Outcome::Done,
+            }),
         ] {
             round_trip(&msg);
         }
@@ -1114,6 +1335,7 @@ mod tests {
             &NodeMsg::Report(Report {
                 workloads: Some(vec![workload(), workload_bare()]),
                 workloads_omitted: 3,
+                ..Report::default()
             }),
             json!({
                 "type": "report",
@@ -1172,6 +1394,177 @@ mod tests {
             json!({"node_id": "n"}),
         );
         pinned(&ErrorBody { error: "e".into() }, json!({"error": "e"}));
+    }
+
+    fn steering_report() -> Report {
+        Report {
+            workloads: Some(vec![workload()]),
+            workloads_omitted: 1,
+            applied_generation: Some(4),
+            unsupported: vec!["stop acquisition".into()],
+            state: Some(NodeState::Draining),
+            acquisition: Some(Acquisition::Stop),
+            runner: Some(RunnerMode::Managed),
+            runner_state: Some(RunnerState::Quitting),
+            concurrency: Some(Concurrency {
+                estimate: Some(8),
+                hub_ceiling: Some(4),
+                local_ceiling: None,
+                effective: Some(4),
+            }),
+            concurrency_error: Some("invalid [executor.vm] mem".into()),
+            drain: Some(DrainProgress {
+                runner_stopped: false,
+                ledger_empty: true,
+                active_jobs: 1,
+            }),
+        }
+    }
+
+    /// Every message version 2 adds, as it goes on the wire. Version 2 changes nothing of
+    /// version 1's: a report without its steering fields is version 1's byte for byte.
+    #[test]
+    fn version_2_keeps_its_wire_shape() {
+        assert_eq!(STEERING, 2);
+        let id = "0123456789abcdef0123456789abcdef";
+        pinned(
+            &HubMsg::Desired(DesiredState {
+                generation: 3,
+                ceiling: Some(4),
+                acquisition: Acquisition::Stop,
+            }),
+            json!({"type": "desired", "generation": 3, "ceiling": 4, "acquisition": "stop"}),
+        );
+        pinned(
+            &HubMsg::Desired(DesiredState {
+                generation: 1,
+                ceiling: None,
+                acquisition: Acquisition::Run,
+            }),
+            json!({"type": "desired", "generation": 1, "ceiling": null, "acquisition": "run"}),
+        );
+        for (op, kind) in [
+            (Operation::Drain, "drain"),
+            (Operation::Undrain, "undrain"),
+            (Operation::Quarantine, "quarantine"),
+            (Operation::Release, "release"),
+        ] {
+            pinned(
+                &HubMsg::Command(Command {
+                    id: id.into(),
+                    expires_at: 1_800_000_000,
+                    op,
+                }),
+                json!({
+                    "type": "command",
+                    "id": id,
+                    "expires_at": 1_800_000_000,
+                    "op": {"kind": kind},
+                }),
+            );
+        }
+        for (outcome, wire) in [
+            (Outcome::Accepted, json!({"state": "accepted"})),
+            (Outcome::Done, json!({"state": "done"})),
+            (
+                Outcome::Failed {
+                    message: "m".into(),
+                },
+                json!({"state": "failed", "message": "m"}),
+            ),
+            (
+                Outcome::Refused { reason: "r".into() },
+                json!({"state": "refused", "reason": "r"}),
+            ),
+            (Outcome::Expired, json!({"state": "expired"})),
+        ] {
+            pinned(
+                &NodeMsg::Ack(CommandAck {
+                    id: id.into(),
+                    outcome: outcome.clone(),
+                }),
+                json!({"type": "ack", "id": id, "outcome": wire}),
+            );
+            pinned(
+                &HubMsg::Recorded(CommandAck {
+                    id: id.into(),
+                    outcome,
+                }),
+                json!({"type": "recorded", "id": id, "outcome": wire}),
+            );
+        }
+        pinned(
+            &NodeMsg::Report(steering_report()),
+            json!({
+                "type": "report",
+                "workloads": [serde_json::to_value(workload()).unwrap()],
+                "workloads_omitted": 1,
+                "applied_generation": 4,
+                "unsupported": ["stop acquisition"],
+                "state": "draining",
+                "acquisition": "stop",
+                "runner": "managed",
+                "runner_state": "quitting",
+                "concurrency": {
+                    "estimate": 8,
+                    "hub_ceiling": 4,
+                    "local_ceiling": null,
+                    "effective": 4,
+                },
+                "concurrency_error": "invalid [executor.vm] mem",
+                "drain": {"runner_stopped": false, "ledger_empty": true, "active_jobs": 1},
+            }),
+        );
+        for (state, wire) in [
+            (NodeState::Ready, "ready"),
+            (NodeState::Draining, "draining"),
+            (NodeState::Drained, "drained"),
+            (NodeState::Quarantined, "quarantined"),
+        ] {
+            pinned(&state, json!(wire));
+        }
+        for (state, wire) in [
+            (RunnerState::Running, "running"),
+            (RunnerState::Quitting, "quitting"),
+            (RunnerState::Stopped, "stopped"),
+        ] {
+            pinned(&state, json!(wire));
+        }
+        pinned(&RunnerMode::External, json!("external"));
+    }
+
+    /// A report as 0.83.0 and 0.84.0 write it reads with every steering field absent, and goes
+    /// back on the wire as it came; one stripped of its steering is version 1's.
+    #[test]
+    fn a_version_1_report_reads_without_steering() {
+        let wire = r#"{"type":"report","workloads":[],"workloads_omitted":2}"#;
+        let msg: NodeMsg = serde_json::from_str(wire).unwrap();
+        let NodeMsg::Report(report) = &msg else {
+            panic!("expected a report");
+        };
+        assert_eq!(
+            report,
+            &Report {
+                workloads: Some(Vec::new()),
+                workloads_omitted: 2,
+                ..Report::default()
+            }
+        );
+        assert_eq!((report.state, report.acquisition), (None, None));
+        assert_eq!(serde_json::to_string(&msg).unwrap(), wire);
+
+        let stripped = steering_report().without_steering();
+        assert_eq!(
+            serde_json::to_string(&stripped).unwrap(),
+            format!(
+                r#"{{"workloads":[{}],"workloads_omitted":1}}"#,
+                serde_json::to_string(&workload()).unwrap()
+            )
+        );
+        assert_eq!(
+            serde_json::to_string(&Report::default()).unwrap(),
+            r#"{"workloads":null,"workloads_omitted":0}"#
+        );
     }
 
     /// A report and a heartbeat without workloads still read, as "not looked" and "none
