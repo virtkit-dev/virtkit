@@ -647,17 +647,20 @@ pub(crate) fn power_off_blocking(
 /// Wait until the Windows guest behind the qemu-ga `socket` has finished starting — on the
 /// first boot of a generalized image, specialize and OOBE restart it once its agent is already
 /// up — and return a connection to its qemu-ga. `running` says whether the guest is still up;
-/// `console` is its serial log, for the error.
+/// `console` is its serial log, for the error; `label` names the guest in progress lines.
 pub(crate) fn wait_started(
     socket: &Path,
     console: &Path,
     timeout: Duration,
+    label: &str,
     running: &mut dyn FnMut() -> bool,
 ) -> Result<crate::qga::Client> {
     const STATE: &str =
         r#"reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Setup\State" /v ImageState"#;
     let deadline = Instant::now() + timeout;
+    let mut progress = crate::qga::Progress::new(label);
     loop {
+        progress.tick();
         if !running() {
             bail!(
                 "the guest powered off while starting; see {}",

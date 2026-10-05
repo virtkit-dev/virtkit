@@ -27,8 +27,14 @@ use anyhow::{Context, Result, bail};
 use crate::uefi::{Bundle, GUEST_AGENT_SOCKET};
 
 /// How long Windows has to come up — a generalized image's first boot runs specialize and
-/// OOBE — at the start and after each restart its provisioning asks for.
-pub(crate) const START_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// OOBE — at the start and after each restart its provisioning asks for. Generous: on a
+/// loaded host a nested Windows 11 can take most of 15 minutes per boot, and a guest that
+/// powers off is noticed within half a minute anyway.
+pub(crate) const START_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+
+/// How long a guest restored from its snapshot has for its agent to answer: it resumes
+/// where it was rather than boots.
+const RESUME_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// How long a Windows service has to power off before it is killed: a domain controller can
 /// take minutes to shut down.
@@ -175,13 +181,15 @@ impl Provisioning {
         let socket = self.dir.join(GUEST_AGENT_SOCKET);
         let console = self.dir.join(crate::run::CONSOLE_LOG);
         let log_path = self.dir.join(PROVISION_LOG);
+        let label = format!("service {}", self.name);
         let mut log = std::fs::File::create(&log_path)
             .with_context(|| format!("creating {}", log_path.display()))?;
         if self.restored {
             println!("virtkit: service {}: resuming from its snapshot", self.name);
             // Its setup finished before the snapshot: its agent answering is enough.
-            let mut ga = crate::qga::Client::connect(&socket, START_TIMEOUT)
-                .context("the restored guest's agent did not answer")?;
+            let mut ga =
+                crate::qga::Client::connect_while(&socket, RESUME_TIMEOUT, &label, running)
+                    .context("the restored guest's agent did not answer")?;
             // It resumes at the time its snapshot was taken.
             if let Err(e) = crate::uefi::set_clock(&mut ga) {
                 eprintln!(
@@ -197,7 +205,7 @@ impl Provisioning {
             self.name,
             log_path.display()
         );
-        let mut ga = crate::uefi::wait_started(&socket, &console, START_TIMEOUT, running)?;
+        let mut ga = crate::uefi::wait_started(&socket, &console, START_TIMEOUT, &label, running)?;
         self.put_secrets(&mut ga)?;
         let Some(command) = &self.command else {
             return Ok(());
@@ -218,8 +226,14 @@ impl Provisioning {
                     restarts += 1;
                     writeln!(log, "virtkit: exit {code}: restarting Windows")?;
                     crate::winexec::restart(&mut ga, code, running)?;
-                    ga = crate::uefi::wait_started(&socket, &console, START_TIMEOUT, running)
-                        .context("Windows did not come back after the restart")?;
+                    ga = crate::uefi::wait_started(
+                        &socket,
+                        &console,
+                        START_TIMEOUT,
+                        &label,
+                        running,
+                    )
+                    .context("Windows did not come back after the restart")?;
                 }
                 3010 | crate::winexec::RESTART_INITIATED => bail!(
                     "service {}: its provisioning still asks for a restart after {MAX_RESTARTS}",

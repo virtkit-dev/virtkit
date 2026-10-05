@@ -36,8 +36,10 @@ const DEFAULT_SHELL: [&str; 3] = ["cmd", "/S", "/C"];
 /// The disk a `FROM winiso:` stage installs onto.
 const DEFAULT_DISK: u64 = 40 << 30;
 
-/// How long a booting guest has for its qemu-ga to answer.
-const AGENT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How long a booting guest has for its qemu-ga to answer: generous, as a loaded host's
+/// nested Windows 11 can take most of 15 minutes per boot, and a guest that powers off is
+/// noticed within half a minute anyway.
+const AGENT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// How long sysprep has to generalize the image and power the guest off.
 const SYSPREP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -886,8 +888,11 @@ fn make_dirs<'a>(ga: &mut Client, files: impl Iterator<Item = &'a str>) -> Resul
 /// Restart the guest in place, after a step that exited `code`, and wait for its agent.
 fn restart_guest(ga: &mut Client, code: i32, guest: &mut crate::uefi::Guest) -> Result<()> {
     crate::winexec::restart(ga, code, &mut || guest.running())?;
-    *ga = Client::connect(&guest.agent_socket(), AGENT_TIMEOUT)
-        .context("qemu-ga did not come back after the restart")?;
+    let socket = guest.agent_socket();
+    *ga = Client::connect_while(&socket, AGENT_TIMEOUT, "build step", &mut || {
+        guest.running()
+    })
+    .context("qemu-ga did not come back after the restart")?;
     Ok(())
 }
 
@@ -1047,7 +1052,9 @@ fn make_step(
 /// [`crate::uefi::wait_started`] for a step's guest `vm`, within [`AGENT_TIMEOUT`].
 fn setup_complete(vm: &mut crate::uefi::Guest) -> Result<Client> {
     let (socket, console) = (vm.agent_socket(), vm.console());
-    crate::uefi::wait_started(&socket, &console, AGENT_TIMEOUT, &mut || vm.running())
+    crate::uefi::wait_started(&socket, &console, AGENT_TIMEOUT, "build step", &mut || {
+        vm.running()
+    })
 }
 
 /// A step's switch, stopped however the step ends.
