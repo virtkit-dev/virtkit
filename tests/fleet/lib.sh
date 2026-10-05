@@ -13,8 +13,10 @@
 # Source it, then call fleet_up; everything is torn down on exit.
 #
 # Env: VK (default ./dist/vk) and VK_HUB (default: the vk-hub beside VK), the binaries under
-# test; IMAGE, the node services' base image (tests/fleet/node/Dockerfile otherwise);
-# E2E_REQUIRE_KVM=1 fails, rather than skips, on a host without KVM or nesting.
+# test; VK_HUB_V1, an older vk-hub mounted beside it in the primary as vk-hub-v1 (HUB_BIN
+# picks which one hub_start and hub run); IMAGE, the node services' base image
+# (tests/fleet/node/Dockerfile otherwise); E2E_REQUIRE_KVM=1 fails, rather than skips, on a
+# host without KVM or nesting.
 # Needs: KVM with nesting, openssl, and a registry to pull alpine.
 
 FLEET_LIB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -40,6 +42,8 @@ FLEET=$(mktemp -d "${TMPDIR:-/tmp}/vk-fleet.XXXXXX")
 RUN=$FLEET/run
 HUB_CONFIG=/etc/vk-hub/hub.toml
 HUB_PORT=
+HUB_BIN=vk-hub
+KVM_VK=$VK
 KVM_NODE_PID=
 
 fail() {
@@ -111,6 +115,7 @@ EOF
     echo "    volumes:"
     echo "      - $VK_HUB:/usr/local/bin/vk-hub:ro"
     echo "      - ./hub:/etc/vk-hub:ro"
+    [ -z "${VK_HUB_V1:-}" ] || echo "      - $VK_HUB_V1:/usr/local/bin/vk-hub-v1:ro"
     echo "    x-virtkit: {mem: 512M}"
     local n
     for n in "$@"; do
@@ -153,17 +158,17 @@ EOF
 
 # `vk-hub <args>` in the primary, against the hub's config.
 hub() {
-  "$VK" exec "$RUN" -- vk-hub "$@" --config "$HUB_CONFIG"
+  "$VK" exec "$RUN" -- "$HUB_BIN" "$@" --config "$HUB_CONFIG"
 }
 
 hub_start() {
   "$VK" exec -b "$RUN" -- sh -c \
-    "exec vk-hub serve --config $HUB_CONFIG >>/var/log/vk-hub.log 2>&1"
-  wait_for 30 hub nodes >/dev/null 2>&1 || fail "vk-hub serve did not come up"
+    "exec $HUB_BIN serve --config $HUB_CONFIG >>/var/log/vk-hub.log 2>&1"
+  wait_for 30 hub nodes >/dev/null 2>&1 || fail "$HUB_BIN serve did not come up"
 }
 
 hub_kill() {
-  "$VK" exec "$RUN" -- sh -c 'kill -9 $(pidof vk-hub)'
+  "$VK" exec "$RUN" -- sh -c "kill -9 \$(pidof $HUB_BIN)"
 }
 
 # hub_audit <id>: node <id>'s lines of the audit log.
@@ -178,7 +183,7 @@ host_vk() {
   mkdir -p "$FLEET/$name"
   [ -f "$FLEET/$name/config.toml" ] ||
     printf 'state_dir = "%s"\n' "$FLEET/$name/state" >"$FLEET/$name/config.toml"
-  VIRTKIT_CONFIG=$FLEET/$name/config.toml "$VK" "$@"
+  VIRTKIT_CONFIG=$FLEET/$name/config.toml "$KVM_VK" "$@"
 }
 
 # node_join <name> [token]: enroll node <name> with a new token, or the one given — from
@@ -278,9 +283,11 @@ node_is() {
   node_row "$1" | grep -qw -- "$2"
 }
 
-# Start a node on the test host, with its KVM: enrolled as `kvm`, logging to kvm/node.log.
+# fleet_kvm_node [vk]: start a node on the test host, with its KVM, using the given vk or VK.
+# Enroll as `kvm` and log to kvm/node.log.
 fleet_kvm_node() {
+  KVM_VK=${1:-$VK}
   node_join kvm >/dev/null || fail "the test host's node could not join"
-  VIRTKIT_CONFIG=$FLEET/kvm/config.toml "$VK" node run >"$FLEET/kvm/node.log" 2>&1 &
+  VIRTKIT_CONFIG=$FLEET/kvm/config.toml "$KVM_VK" node run >"$FLEET/kvm/node.log" 2>&1 &
   KVM_NODE_PID=$!
 }

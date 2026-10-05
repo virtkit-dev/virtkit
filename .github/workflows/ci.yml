@@ -50,7 +50,7 @@ jobs:
     needs: [build]
     runs-on: ubuntu-latest
     # Above the scripts' caps and cleanups combined (4 × (900 + 120 + 70)s), so the loop
-    # always ends and reports.
+    # always ends and reports. The mixed-version test skips here without the old binaries.
     timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
