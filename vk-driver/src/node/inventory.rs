@@ -75,7 +75,7 @@ pub fn inventory(cfg: &Config) -> Inventory {
             guest_kernel: guest_kernel().clone(),
             config_hash: config_hash(cfg),
         },
-        runner: runner_config(),
+        runner: runner_config(cfg),
     }
 }
 
@@ -269,24 +269,30 @@ fn config_hash(cfg: &Config) -> String {
     vk_hub_proto::to_hex(&Sha256::digest(text.as_bytes()))
 }
 
-/// The gitlab-runner configuration this node's runner reads: the user's own, where the node
-/// runs its runner as the same user, else a root-managed one if it is readable.
-fn runner_config() -> Option<Runner> {
+/// The gitlab-runner configuration this node's runner reads: the one the node steers
+/// ([`crate::schedule::runner_config`]) when there is one, else the first of the user's own
+/// and a root-managed one that reads and parses.
+fn runner_config(cfg: &Config) -> Option<Runner> {
+    if let Some(path) = crate::schedule::runner_config(cfg) {
+        return read_runner(&path);
+    }
     let home = std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(|h| PathBuf::from(h).join(".gitlab-runner/config.toml"));
     home.into_iter()
         .chain([PathBuf::from("/etc/gitlab-runner/config.toml")])
-        .find_map(|path| {
-            use std::io::Read;
-            let mut text = String::new();
-            std::fs::File::open(&path)
-                .and_then(|f| f.take(MAX_RUNNER_CONFIG).read_to_string(&mut text))
-                .ok()?;
-            let mut runner = parse_runner(&text)?;
-            runner.config = path.display().to_string();
-            Some(runner)
-        })
+        .find_map(|path| read_runner(&path))
+}
+
+fn read_runner(path: &Path) -> Option<Runner> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_RUNNER_CONFIG).read_to_string(&mut text))
+        .ok()?;
+    let mut runner = parse_runner(&text)?;
+    runner.config = path.display().to_string();
+    Some(runner)
 }
 
 /// `concurrent` and each `[[runners]]` name, up to [`MAX_RUNNERS`] of them, each cut to
@@ -339,6 +345,29 @@ mod tests {
         let bare = parse_runner("").unwrap();
         assert_eq!((bare.concurrent, bare.runners.len()), (None, 0));
         assert!(parse_runner("not = [toml").is_none());
+    }
+
+    #[test]
+    fn the_runner_config_the_node_steers_is_the_one_reported() {
+        let dir = std::env::temp_dir().join(format!("vk-inventory-runner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let cfg: Config = toml::from_str(&format!(
+            "[node]\nrunner_config = {:?}\n",
+            path.display().to_string()
+        ))
+        .unwrap();
+        // An unreadable configured path reports no config, without falling back.
+        assert!(runner_config(&cfg).is_none());
+        std::fs::write(&path, "concurrent = 3\n[[runners]]\nname = \"mine\"\n").unwrap();
+        let r = runner_config(&cfg).unwrap();
+        assert_eq!(r.config, path.display().to_string());
+        assert_eq!(
+            (r.concurrent, r.runners.as_slice()),
+            (Some(3), &["mine".to_string()][..])
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
