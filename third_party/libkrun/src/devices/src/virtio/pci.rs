@@ -461,6 +461,9 @@ pub struct VirtioPciTransport {
     shm_bar_probe: [bool; 2],
     /// The driver asked for a reset the device cannot perform (see `write_common_config`).
     reset_unsupported: bool,
+    /// Told `(old, new)` BAR0 bases when the guest moves BAR0, so the VMM can move the
+    /// queue-notify ioeventfds with it (local patch).
+    bar0_moved: Option<Box<dyn FnMut(u32, u32) + Send>>,
 }
 
 impl VirtioPciTransport {
@@ -549,6 +552,7 @@ impl VirtioPciTransport {
             shm,
             shm_bar_probe: [false; 2],
             reset_unsupported: false,
+            bar0_moved: None,
         })
     }
 
@@ -572,9 +576,10 @@ impl VirtioPciTransport {
         msix.set_routes(routes);
     }
 
-    /// The guest-physical address of each queue's notification register in BAR0 and the
-    /// eventfd a write there kicks, so the VMM can serve notifications with ioeventfds
-    /// instead of trapping them (local patch).
+    /// The offset in BAR0 of each queue's notification register and the eventfd a write
+    /// there kicks, so the VMM can serve notifications with ioeventfds instead of trapping
+    /// them (local patch). The VMM registers them at `bar0_base() + offset`, and moves them
+    /// when [`Self::on_bar0_moved`] says the guest relocated BAR0.
     pub fn queue_notify_ioevents(&self) -> Vec<(u64, Arc<EventFd>)> {
         self.state
             .queue_evts()
@@ -582,13 +587,21 @@ impl VirtioPciTransport {
             .enumerate()
             .map(|(index, event)| {
                 (
-                    u64::from(self.bar_base)
-                        + NOTIFY_CFG_OFFSET
-                        + index as u64 * u64::from(NOTIFY_OFF_MULTIPLIER),
+                    NOTIFY_CFG_OFFSET + index as u64 * u64::from(NOTIFY_OFF_MULTIPLIER),
                     event.clone(),
                 )
             })
             .collect()
+    }
+
+    /// BAR0's current guest-physical base (0 while unassigned).
+    pub fn bar0_base(&self) -> u32 {
+        self.bar_base
+    }
+
+    /// Call `hook(old, new)` whenever the guest moves BAR0 (local patch).
+    pub fn on_bar0_moved(&mut self, hook: Box<dyn FnMut(u32, u32) + Send>) {
+        self.bar0_moved = Some(hook);
     }
 
     /// Push the driver's vector choices to the interrupt path.
@@ -1398,6 +1411,7 @@ impl PciFunction for VirtioPciTransport {
             }
         }
 
+        let bar0_before = self.bar_base;
         let command_end = pci_config::COMMAND + WORD_SIZE;
         let command_register_touched = start < command_end && end > pci_config::COMMAND;
         let bus_master_was_enabled = self.bus_master_enabled.load(Ordering::Acquire);
@@ -1477,6 +1491,12 @@ impl PciFunction for VirtioPciTransport {
             if !bus_master_was_enabled && bus_master_enabled {
                 self.activate_if_ready();
             }
+        }
+
+        if self.bar_base != bar0_before
+            && let Some(hook) = self.bar0_moved.as_mut()
+        {
+            hook(bar0_before, self.bar_base);
         }
     }
 
@@ -1914,8 +1934,33 @@ mod tests {
         assert_eq!(ioevents.len(), 2);
         assert_eq!(
             ioevents[1].0,
-            u64::from(transport.bar_base) + NOTIFY_CFG_OFFSET + u64::from(NOTIFY_OFF_MULTIPLIER)
+            NOTIFY_CFG_OFFSET + u64::from(NOTIFY_OFF_MULTIPLIER)
         );
+    }
+
+    #[test]
+    fn moving_bar0_tells_the_vmm_but_a_size_probe_does_not() {
+        let mut transport = transport();
+        let moves = Arc::new(Mutex::new(Vec::new()));
+        let seen = moves.clone();
+        transport.on_bar0_moved(Box::new(move |old, new| {
+            seen.lock().unwrap().push((old, new))
+        }));
+        let bar = enable_memory_bar(&mut transport) as u32;
+        // A size probe and its restore leave BAR0 where it was.
+        write_config(
+            &mut transport,
+            pci_config::BAR0 as u16,
+            &u32::MAX.to_le_bytes(),
+        );
+        write_config(&mut transport, pci_config::BAR0 as u16, &bar.to_le_bytes());
+        let moved = bar + 0x10_0000;
+        write_config(
+            &mut transport,
+            pci_config::BAR0 as u16,
+            &moved.to_le_bytes(),
+        );
+        assert_eq!(*moves.lock().unwrap(), vec![(0, bar), (bar, moved)]);
     }
 
     fn transport_with_shm(

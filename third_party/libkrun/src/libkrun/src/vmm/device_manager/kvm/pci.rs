@@ -149,7 +149,7 @@ impl PciHostManager {
             vm: vm.clone(),
             gsi: intx_gsi,
         });
-        let transport = VirtioPciTransport::new(
+        let mut transport = VirtioPciTransport::new(
             guest_memory,
             device,
             intx_gsi.map(|gsi| gsi as u8),
@@ -178,10 +178,39 @@ impl PciHostManager {
             self.next_msi_gsi += 1;
         }
         transport.set_msix_gsis(&gsis, routes);
-        for (address, event) in transport.queue_notify_ioevents() {
-            vm.register_ioevent(&event, &IoEventAddress::Mmio(address), NoDatamatch)
-                .map_err(Error::RegisterIoEvent)?;
+        // Registered at BAR0's current base, and moved with it when the guest relocates
+        // BAR0, so a stale one never swallows writes to whatever lands at the old address.
+        let ioevents = transport.queue_notify_ioevents();
+        let base = u64::from(transport.bar0_base());
+        if base != 0 {
+            for (offset, event) in &ioevents {
+                vm.register_ioevent(event, &IoEventAddress::Mmio(base + offset), NoDatamatch)
+                    .map_err(Error::RegisterIoEvent)?;
+            }
         }
+        let moved_vm = vm.clone();
+        transport.on_bar0_moved(Box::new(move |old, new| {
+            for (offset, event) in &ioevents {
+                if old != 0
+                    && let Err(e) = moved_vm.unregister_ioevent(
+                        event,
+                        &IoEventAddress::Mmio(u64::from(old) + offset),
+                        NoDatamatch,
+                    )
+                {
+                    log::warn!("virtio-pci: moving a queue ioeventfd off 0x{old:x}: {e}");
+                }
+                if new != 0
+                    && let Err(e) = moved_vm.register_ioevent(
+                        event,
+                        &IoEventAddress::Mmio(u64::from(new) + offset),
+                        NoDatamatch,
+                    )
+                {
+                    log::warn!("virtio-pci: moving a queue ioeventfd to 0x{new:x}: {e}");
+                }
+            }
+        }));
 
         let function: Arc<Mutex<dyn PciFunction>> = Arc::new(Mutex::new(transport));
         self.root

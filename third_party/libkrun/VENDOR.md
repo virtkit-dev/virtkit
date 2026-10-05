@@ -354,7 +354,9 @@ aligned 4- and 8-byte table and PBA accesses reach the MSI-X state; others read 
 KVM irqfd on its own MSI GSI above the IOAPIC pins, and a message write re-commits the full
 `KVM_SET_GSI_ROUTING` table (default IOAPIC/PIC routes plus the MSI ones). Each queue's
 notification register gets an ioeventfd on the queue eventfd, so a kick no longer traps to the
-VMM thread; the trapping path stays for a relocated BAR0, whose ioeventfds are not moved.
+VMM thread; when the guest relocates BAR0 the transport tells the VMM (`on_bar0_moved`), which
+moves the ioeventfds with it, so none is left to swallow writes at the old address. They stay
+armed while the guest turns memory decoding off (the trapping path then answers nothing).
 
 `src/arch/src/x86_64/{layout.rs,mod.rs,acpi.rs}` + `src/libkrun/src/vmm/{device_manager/shm.rs,
 builder.rs}` + `src/devices/src/virtio/pci.rs` — shared-memory regions (virtio-fs DAX windows)
