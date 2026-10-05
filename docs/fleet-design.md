@@ -240,12 +240,15 @@ installed binary untouched; the release must pass `vk check`'s gate and `[node] 
 reach the hub again, before it installs itself, and a failure, repeated crashes at start or
 the trial's deadline hand the node back to the previous binary. See
 [update trial and rollback](fleet-prototype.md#update-trial-and-rollback) for the binary
-switch, restart deadlines, installed-path checks and the external-runner exception. Release
-signatures are not checked yet.
+switch, restart deadlines, installed-path checks and the external-runner exception.
 
-Proposed release trust: remote updates require at least one locally pinned signing key and a
-valid signature by default. A node may opt out explicitly for development; the hub cannot
-grant that exception, and the node's report and UI must show it. Official release signing is
+Built release trust: a node with signing keys in its own configuration requires a signature
+by one of them, checked when the update arrives and again before the release first runs; the
+key signs offline, never on the hub ([Release signing](fleet-prototype.md#release-signing)).
+Proposed: remote updates require at least one locally pinned signing key and a valid
+signature by default, where a node with no keys takes unsigned releases today. A node may opt
+out explicitly for development; the hub cannot grant that exception, and the node's report
+and UI must show it. Official release signing is
 a prerequisite for using that default with official binaries. Document key rotation with an
 overlap period, removal of retired keys, and emergency revocation through a trusted path
 independent of the hub. A compromised hub must not be able to add a trusted key or undo its
@@ -364,6 +367,9 @@ model, commands and process handling.
   an older `vk` than it runs unless its own configuration allows it (`[node] allow_downgrade`),
   since an override the hub carried would be worth nothing against a compromised hub — which
   could otherwise take the fleet back to a release with a known flaw, signed or not.
+- A release's signature is checked by the node against keys in its own configuration
+  (`[node] release_keys`), made by a key kept off the hub: a compromised hub can hand a node
+  any bytes, but not a signature it has no key for.
 - Proposed: runner authentication tokens stay on their nodes, and the hub's GitLab
   credential is a separate one, scoped to managing runners (pause, resume, list).
 - Hub roles: viewer; operator (ceilings, stopping acquisition, drain and quarantine; reset

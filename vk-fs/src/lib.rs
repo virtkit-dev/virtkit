@@ -16,9 +16,10 @@
 //!   [`dir_admits_only_us`] is the test, and it is the caller's directory that decides.
 //!
 //! [`bind_private`] applies all four to unix sockets; [`write_atomic`] applies the first
-//! three to files (and [`write_atomic_unsynced`] too, without the fsync). `vk-core` uses it (as [`bind_private_any_length`]) for the agent's exec
-//! channel and `vk-registry` for its admin socket; both require the published name to refer
-//! only to a socket already restricted to `0600`.
+//! three to files (and [`write_atomic_unsynced`] too, without the fsync, and [`write_new`],
+//! never over an existing name). `vk-core` uses it (as [`bind_private_any_length`]) for the
+//! agent's exec channel and `vk-registry` for its admin socket; both require the published
+//! name to refer only to a socket already restricted to `0600`.
 //!
 //! [`open_dir`], [`open_dir_nofollow`] and [`open_dir_in`] expose the third rule to callers
 //! that anchor their own `*at()` operations.
@@ -439,7 +440,14 @@ fn open_dir_flags(dir: &Path, extra: libc::c_int) -> Result<OwnedFd, anyhow::Err
 /// costs the rename, not the data. Callers that need the name itself to survive a power cut
 /// want more than this.
 pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<(), anyhow::Error> {
-    write_atomic_from(path, contents, mode, Durability::Synced, staging_names())
+    write_atomic_from(
+        path,
+        contents,
+        mode,
+        Durability::Synced,
+        Publish::Replace,
+        staging_names(),
+    )
 }
 
 /// [`write_atomic`] without the fsync, for a file nothing needs after a crash: a reader still
@@ -447,7 +455,33 @@ pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> Result<(), anyho
 /// old file, the new one, an empty or partly written one, or nothing — a reader must treat
 /// what it cannot parse as absent.
 pub fn write_atomic_unsynced(path: &Path, contents: &[u8], mode: u32) -> Result<(), anyhow::Error> {
-    write_atomic_from(path, contents, mode, Durability::Unsynced, staging_names())
+    write_atomic_from(
+        path,
+        contents,
+        mode,
+        Durability::Unsynced,
+        Publish::Replace,
+        staging_names(),
+    )
+}
+
+/// [`write_atomic`] where nothing is at `path` yet: publishing fails, with
+/// [`std::io::ErrorKind::AlreadyExists`] in the chain, when something is — a file, a
+/// directory, a symlink — and leaves it as it was. For a file that must never replace
+/// another, such as a key.
+///
+/// Unlike [`write_atomic`], it fsyncs the directory once the name is published, so the name
+/// survives a crash once this returns — as far as the filesystem honours a directory fsync,
+/// which is attempted but not required to succeed.
+pub fn write_new(path: &Path, contents: &[u8], mode: u32) -> Result<(), anyhow::Error> {
+    write_atomic_from(
+        path,
+        contents,
+        mode,
+        Durability::Synced,
+        Publish::NoReplace,
+        staging_names(),
+    )
 }
 
 /// Whether [`write_atomic_from`] fsyncs the staged file before publishing it.
@@ -457,11 +491,19 @@ enum Durability {
     Unsynced,
 }
 
+/// Whether [`write_atomic_from`] publishes over what is at the path.
+#[derive(Clone, Copy)]
+enum Publish {
+    Replace,
+    NoReplace,
+}
+
 fn write_atomic_from(
     path: &Path,
     contents: &[u8],
     mode: u32,
     durability: Durability,
+    publish: Publish,
     mut next_name: impl FnMut() -> Result<String, anyhow::Error>,
 ) -> Result<(), anyhow::Error> {
     let Some(final_name) = path.file_name() else {
@@ -499,20 +541,27 @@ fn write_atomic_from(
             })
             .map_err(|e| anyhow!(e).context(format!("writing the staged file for {path:?}")))
             .and_then(|()| {
-                // SAFETY: both descriptors are live and both names are NUL-terminated.
-                let rc = unsafe {
-                    libc::renameat(
-                        parent_fd.as_raw_fd(),
-                        name.as_ptr(),
-                        parent_fd.as_raw_fd(),
-                        final_name.as_ptr(),
-                    )
+                let published = match publish {
+                    Publish::Replace => {
+                        // SAFETY: the descriptor is live and both names are NUL-terminated.
+                        let rc = unsafe {
+                            libc::renameat(
+                                parent_fd.as_raw_fd(),
+                                name.as_ptr(),
+                                parent_fd.as_raw_fd(),
+                                final_name.as_ptr(),
+                            )
+                        };
+                        if rc == 0 {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::last_os_error())
+                        }
+                    }
+                    Publish::NoReplace => rename_noreplace(parent_fd.as_fd(), &name, &final_name)
+                        .map(|()| sync_dir(parent_fd.as_fd())),
                 };
-                match rc {
-                    0 => Ok(()),
-                    _ => Err(anyhow!(std::io::Error::last_os_error())
-                        .context(format!("publishing {path:?}"))),
-                }
+                published.map_err(|e| anyhow!(e).context(format!("publishing {path:?}")))
             });
         if written.is_err() {
             // Best effort on the error path, through the descriptor this call opened the
@@ -524,6 +573,71 @@ fn write_atomic_from(
         return written;
     }
     bail!("found no free staging name beside {path:?} in {STAGING_ATTEMPTS} tries")
+}
+
+/// Rename `from` to `to` in `dir` unless something is at `to`, failing with
+/// [`std::io::ErrorKind::AlreadyExists`] if it is. Where the filesystem has no
+/// `RENAME_NOREPLACE` (NFS, some FUSE), [`link_noreplace`] does the same.
+fn rename_noreplace(dir: BorrowedFd<'_>, from: &CString, to: &CString) -> std::io::Result<()> {
+    // SAFETY: the descriptor is live and both names are NUL-terminated. The raw syscall: not
+    // every libc wraps `renameat2`.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            dir.as_raw_fd(),
+            from.as_ptr(),
+            dir.as_raw_fd(),
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    match e.raw_os_error() {
+        Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP) => link_noreplace(dir, from, to),
+        _ => Err(e),
+    }
+}
+
+/// [`rename_noreplace`] by `linkat`, which never replaces, then unlinking `from`. Not atomic
+/// as a rename is: if the unlink fails, `to` is published but `from` stays behind as a second
+/// name for it, which is left rather than reported, since `to` is what the caller asked for.
+fn link_noreplace(dir: BorrowedFd<'_>, from: &CString, to: &CString) -> std::io::Result<()> {
+    // SAFETY: the descriptor is live and both names are NUL-terminated.
+    let rc = unsafe {
+        libc::linkat(
+            dir.as_raw_fd(),
+            from.as_ptr(),
+            dir.as_raw_fd(),
+            to.as_ptr(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    let _ = unsafe { libc::unlinkat(dir.as_raw_fd(), from.as_ptr(), 0) };
+    Ok(())
+}
+
+/// Best-effort fsync of the directory `dir` (an `O_PATH` descriptor, which `fsync` refuses,
+/// hence the reopen), so names published in it survive a crash.
+fn sync_dir(dir: BorrowedFd<'_>) {
+    // SAFETY: the descriptor is live and the name is a NUL-terminated literal.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd >= 0 {
+        // SAFETY: `fd` is a fresh descriptor this call owns.
+        let _ = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }).sync_all();
+    }
 }
 
 /// [`open_dir_nofollow`] for one name in an already-open directory, so the directory is not
@@ -671,6 +785,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Published whole where the name is free; refused where anything stands there, a
+    /// dangling symlink included, which is left as it was along with no staging name.
+    #[test]
+    fn writing_new_never_replaces_what_is_there() {
+        let dir = scratch("write-new");
+        let path = dir.join("key");
+        write_new(&path, b"first", 0o600).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let exists = |e: &anyhow::Error| {
+            e.chain().any(|c| {
+                c.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists)
+            })
+        };
+        let err = write_new(&path, b"second", 0o600).unwrap_err();
+        assert!(exists(&err), "{err:#}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(dir.join("nowhere"), &link).unwrap();
+        let err = write_new(&link, b"x", 0o600).unwrap_err();
+        assert!(exists(&err), "{err:#}");
+        assert!(!dir.join("nowhere").exists());
+        let mut left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["key", "link"], "{left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fallback for filesystems without `RENAME_NOREPLACE` publishes the staged file and
+    /// removes the staging name, and refuses an occupied name, leaving both files as they were.
+    #[test]
+    fn linking_new_never_replaces_what_is_there() {
+        let dir = scratch("link-new");
+        let dir_fd = open_dir(&dir).unwrap();
+        let (stage, key) = (CString::new("stage").unwrap(), CString::new("key").unwrap());
+        std::fs::write(dir.join("stage"), b"first").unwrap();
+        link_noreplace(dir_fd.as_fd(), &stage, &key).unwrap();
+        assert_eq!(std::fs::read(dir.join("key")).unwrap(), b"first");
+        assert!(!dir.join("stage").exists());
+        std::fs::write(dir.join("stage"), b"second").unwrap();
+        let err = link_noreplace(dir_fd.as_fd(), &stage, &key).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(std::fs::read(dir.join("key")).unwrap(), b"first");
+        assert_eq!(std::fs::read(dir.join("stage")).unwrap(), b"second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Skip occupied staging names. If all candidates are taken, fail without changing
     /// existing entries or publishing the file.
     #[test]
@@ -682,14 +850,30 @@ mod tests {
         std::fs::write(dir.join(".taken"), b"squatter").unwrap();
         let mut names = [".taken", ".free"].into_iter();
         let retry = move || Ok::<_, anyhow::Error>(names.next().unwrap().to_string());
-        write_atomic_from(&path, b"x", 0o600, Durability::Synced, retry).unwrap();
+        write_atomic_from(
+            &path,
+            b"x",
+            0o600,
+            Durability::Synced,
+            Publish::Replace,
+            retry,
+        )
+        .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"x");
         assert_eq!(std::fs::read(dir.join(".taken")).unwrap(), b"squatter");
 
         // Every candidate taken: no free name, and the squatter is left as it was.
         std::fs::remove_file(&path).unwrap();
         let fixed = || Ok::<_, anyhow::Error>(".taken".to_string());
-        let err = write_atomic_from(&path, b"y", 0o600, Durability::Synced, fixed).unwrap_err();
+        let err = write_atomic_from(
+            &path,
+            b"y",
+            0o600,
+            Durability::Synced,
+            Publish::Replace,
+            fixed,
+        )
+        .unwrap_err();
         assert!(
             format!("{err:#}").contains("no free staging name"),
             "{err:#}"
@@ -710,7 +894,15 @@ mod tests {
         std::fs::write(target.join("keep"), b"keep").unwrap();
 
         let fixed = || Ok::<_, anyhow::Error>(".stage".to_string());
-        let err = write_atomic_from(&target, b"x", 0o600, Durability::Synced, fixed).unwrap_err();
+        let err = write_atomic_from(
+            &target,
+            b"x",
+            0o600,
+            Durability::Synced,
+            Publish::Replace,
+            fixed,
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("publishing"), "{err:#}");
         assert!(target.is_dir());
         assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"keep");

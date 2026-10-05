@@ -52,6 +52,12 @@ All notable changes to virtkit will be documented in this file.
   to an older `vk` only when its own `[node] allow_downgrade` says it may, and never to one
   older than 0.85.0, the first release that takes part in the trial. Each host reports the
   sha256 of the `vk` it runs.
+- **Experimental: signed `vk` releases for a fleet.** `vk release-key generate` makes a
+  signing key and `vk release-key sign` signs a binary, on a machine of your choosing rather
+  than the hub; `vk-hub release add --signature` passes the signature on. A host with
+  `[node] release_keys` updates only to a release one of those keys signed
+  (`require_signed = false` makes that optional), and refuses one whose signature does not
+  verify either way.
 - **`vk tune` stands aside on a fleet node** while `vk node run` is up, and otherwise honours
   the ceiling the node last received.
 

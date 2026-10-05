@@ -164,7 +164,7 @@ fn update_operation(release: &Release, force: bool) -> Operation {
         version: release.row.version.clone(),
         sha256: release.sha256.clone(),
         size: release.row.size,
-        signature: None,
+        signature: release.row.signature.clone(),
         force,
         within_secs: None,
     }

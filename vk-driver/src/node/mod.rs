@@ -344,8 +344,11 @@ pub async fn run(cfg: Config) -> Result<()> {
         node_id: enrollment.node_id.clone(),
     };
     let (runner_tx, runner_state) = tokio::sync::watch::channel(vk_hub_proto::RunnerState::Stopped);
+    let policy =
+        crate::release_key::Policy::from_config(&cfg.node.release_keys, cfg.node.require_signed)?;
     let core = core::Core::open(&dir, issuer, spec.is_some().then_some(runner_state))?;
     core.set_allow_downgrade(cfg.node.allow_downgrade);
+    core.set_release_policy(policy);
     let (halt, halted) = tokio::sync::watch::channel(false);
     let supervisor = spec.map(|spec| {
         let signals = runner::Signals {

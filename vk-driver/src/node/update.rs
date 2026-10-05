@@ -541,6 +541,15 @@ async fn prepare(core: &Core, cfg: &Config, node: &Node, job: &Job) -> Result<()
         core.allow_downgrade(),
     )
     .map_err(|e| anyhow!(e))?;
+    // Before the release runs at all, `--version` included: the keys are the ones the node
+    // runs with now, and the download is held to the sha256 they signed.
+    core.release_policy()
+        .check(
+            &release.sha256,
+            &release.version,
+            release.signature.as_deref(),
+        )
+        .map_err(|e| anyhow!(e))?;
     let exe = installed.context("the installed vk is not known")?;
     let releases = releases_dir(&dir);
     std::fs::DirBuilder::new()
@@ -1711,6 +1720,7 @@ mod tests {
             version: "0.84.0".into(),
             sha256: sha(&bytes),
             size: bytes.len() as u64,
+            signature: None,
         };
         let digest = vk_hub_proto::from_hex_lower(&release.sha256).unwrap();
         let dest = releases_dir(&dir).join(&release.sha256);
@@ -1758,6 +1768,131 @@ mod tests {
             "{err}"
         );
         assert!(releases_left(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node whose installed vk is `<dir>/bin/vk`, its state in `<dir>/node`, and the
+    /// public half of a release key made at `<dir>/release.pk8`.
+    fn signing_node(dir: &Path) -> (Arc<Core>, String) {
+        let node = dir.join("node");
+        std::fs::create_dir_all(releases_dir(&node)).unwrap();
+        let exe = dir.join("bin").join("vk");
+        std::fs::write(&exe, b"old").unwrap();
+        let mut core = Core::open(
+            &node,
+            issuer(),
+            Some(watch::channel(RunnerState::Stopped).1),
+        )
+        .unwrap();
+        Arc::get_mut(&mut core).unwrap().set_exec(fake_exec);
+        core.change(|p| p.installed = Some(exe)).unwrap();
+        let public = crate::release_key::generate(&dir.join("release.pk8")).unwrap();
+        (core, public)
+    }
+
+    /// The update to `<dir>/new` as `version`, carrying `signature`.
+    fn update_to(id: &str, dir: &Path, version: &str, signature: Option<String>) -> Command {
+        Command {
+            id: id.into(),
+            expires_at: u64::MAX,
+            op: Operation::Update {
+                version: version.into(),
+                sha256: sha(&std::fs::read(dir.join("new")).unwrap()),
+                size: 3,
+                signature,
+                force: false,
+                within_secs: None,
+            },
+        }
+    }
+
+    /// A release past this build of vk: the next minor version, at `patch`.
+    fn next_version(patch: u64) -> String {
+        let mut parts = env!("CARGO_PKG_VERSION").split('.');
+        let major = parts.next().unwrap();
+        let minor: u64 = parts.next().unwrap().parse().unwrap();
+        format!("{major}.{}.{patch}", minor + 1)
+    }
+
+    fn refusal(core: &Core, command: Command) -> String {
+        match core.command(command, 1).unwrap().outcome {
+            Outcome::Refused { reason } => reason,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_update_needs_a_signature_by_one_of_the_node_s_own_keys() {
+        let dir = scratch("signed");
+        let (core, public) = signing_node(&dir);
+        core.set_release_policy(
+            crate::release_key::Policy::from_config(std::slice::from_ref(&public), None).unwrap(),
+        );
+        std::fs::write(dir.join("new"), b"new").unwrap();
+        let key = dir.join("release.pk8");
+        let signed =
+            |version: &str| crate::release_key::sign(&key, &dir.join("new"), version).unwrap();
+        let version = next_version(0);
+        let reason = refusal(&core, update_to("a", &dir, &version, None));
+        assert!(reason.contains("unsigned"), "{reason}");
+        // Signed as another version: not a signature of this release.
+        let reason = refusal(
+            &core,
+            update_to("b", &dir, &version, Some(signed(&next_version(1)))),
+        );
+        assert!(
+            reason.contains(&format!("does not verify as vk {version}")),
+            "{reason}"
+        );
+        // Signed by a key the node does not hold.
+        let other = dir.join("other.pk8");
+        crate::release_key::generate(&other).unwrap();
+        let foreign = crate::release_key::sign(&other, &dir.join("new"), &version).unwrap();
+        let reason = refusal(&core, update_to("c", &dir, &version, Some(foreign)));
+        assert!(reason.contains("does not verify"), "{reason}");
+        assert_eq!(core.persisted().job, None);
+
+        let ack = core
+            .command(update_to("d", &dir, &version, Some(signed(&version))), 1)
+            .unwrap();
+        assert_eq!(ack.outcome, Outcome::Accepted);
+        let job = core.persisted().job.unwrap();
+        assert_eq!(job.release.signature, Some(signed(&version)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An update taken before the node required signatures — a restart with release keys
+    /// set in between — is checked again before the release runs, `--version` included.
+    #[tokio::test]
+    async fn a_release_is_checked_again_before_it_first_runs() {
+        let dir = scratch("signed-again");
+        let (core, public) = signing_node(&dir);
+        // Held already, so no download is attempted; a script that would say it ran.
+        let version = next_version(0);
+        let new = format!("#!/bin/sh\necho ran > \"$0.ran\"; echo vk-driver {version}\n");
+        let new = new.as_bytes();
+        std::fs::write(dir.join("new"), new).unwrap();
+        let held = releases_dir(&dir.join("node")).join(sha(new));
+        std::fs::write(&held, new).unwrap();
+        std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ack = core
+            .command(update_to("u", &dir, &version, None), 1)
+            .unwrap();
+        assert_eq!(ack.outcome, Outcome::Accepted);
+        let job = core.persisted().job.unwrap();
+        core.set_release_policy(
+            crate::release_key::Policy::from_config(std::slice::from_ref(&public), None).unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let session = dir.join("session");
+        std::fs::create_dir_all(&session).unwrap();
+        let node = node_of(&session, listener.local_addr().unwrap());
+        let err = prepare(&core, &Config::default(), &node, &job)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("unsigned"), "{err:#}");
+        assert!(!PathBuf::from(format!("{}.ran", held.display())).exists());
+        assert!(executed(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

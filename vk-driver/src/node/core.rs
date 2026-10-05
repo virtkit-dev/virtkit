@@ -44,6 +44,8 @@ pub struct Core {
     /// Whether an update may install an older version than this one (`[node]
     /// allow_downgrade`).
     allow_downgrade: AtomicBool,
+    /// What an update's release must be signed with (`[node] release_keys`).
+    release_policy: Mutex<crate::release_key::Policy>,
 }
 
 impl Core {
@@ -87,6 +89,7 @@ impl Core {
             connected: watch::Sender::new(false),
             exec: super::update::exec,
             allow_downgrade: AtomicBool::new(false),
+            release_policy: Mutex::new(crate::release_key::Policy::default()),
         }))
     }
 
@@ -127,19 +130,30 @@ impl Core {
     }
 
     /// Journal `command` and carry it out. An external runner cannot be stopped, so a drain or
-    /// a quarantine is refused; an update is refused when the node could not install it.
+    /// a quarantine is refused; an update is refused when the node could not install it, or
+    /// may not.
     pub fn command(&self, command: Command, now: u64) -> Result<CommandAck> {
         let update = match &command.op {
             // Looked at only for an update: it reads the filesystem.
-            Operation::Update { version, .. } => {
+            Operation::Update {
+                version,
+                sha256,
+                signature,
+                ..
+            } => {
                 let installed = lock(&self.persisted).installed.clone();
-                super::update::can_replace(installed.as_deref(), &self.dir).and_then(|()| {
-                    super::update::check_version(
-                        env!("CARGO_PKG_VERSION"),
-                        version,
-                        self.allow_downgrade(),
-                    )
-                })
+                super::update::can_replace(installed.as_deref(), &self.dir)
+                    .and_then(|()| {
+                        super::update::check_version(
+                            env!("CARGO_PKG_VERSION"),
+                            version,
+                            self.allow_downgrade(),
+                        )
+                    })
+                    .and_then(|()| {
+                        self.release_policy()
+                            .check(sha256, version, signature.as_deref())
+                    })
             }
             _ => Ok(()),
         };
@@ -200,6 +214,16 @@ impl Core {
 
     pub fn allow_downgrade(&self) -> bool {
         self.allow_downgrade.load(Ordering::Relaxed)
+    }
+
+    /// Require what `policy` says of every update's release, as `[node] release_keys` and
+    /// `require_signed` say.
+    pub fn set_release_policy(&self, policy: crate::release_key::Policy) {
+        *lock(&self.release_policy) = policy;
+    }
+
+    pub fn release_policy(&self) -> crate::release_key::Policy {
+        lock(&self.release_policy).clone()
     }
 
     /// The node dir.

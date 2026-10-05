@@ -284,6 +284,9 @@ pub struct ReleaseRow {
     /// The version the operator stated, which the binary's `--version` must report.
     pub version: String,
     pub size: u64,
+    /// A release key's ed25519 signature over [`vk_hub_proto::release_message`], base64.
+    #[serde(default)]
+    pub signature: Option<String>,
     pub added_at: u64,
     pub added_by: String,
 }
@@ -2538,6 +2541,7 @@ mod tests {
         let row = ReleaseRow {
             version: "0.84.0".into(),
             size: 10,
+            signature: None,
             added_at: 5,
             added_by: "uid 0".into(),
         };

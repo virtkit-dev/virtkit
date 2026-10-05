@@ -21,19 +21,20 @@ The prototype provides, all experimentally:
 - on the hub, the `vk` releases it holds (`vk-hub release`) and updates naming one (`vk-hub
   nodes update`), each release served only to a node updating to it;
 - on the node, those updates, run on trial and rolled back to the previous binary when the
-  release does not pass;
+  release does not pass, and releases checked against signing keys of the node's own (`vk
+  release-key`);
 - `vk-hub workloads`: each node's VMs;
 - live nodes and node detail pages, steering from a node's page, and an audit log, with
   sign-in links from `vk-hub ui login`.
 
-Release signing, rollouts, resets, restart and redeploy are not built.
+Rollouts, resets, restart and redeploy are not built.
 
 | Capability | Current prototype | Proposed gate |
 |---|---|---|
 | Hub recovery | Reissues its stored desired state above a newer node generation; adopts the node's applied state when it holds none | [Preserve node restrictions and resolve the recovery conflict explicitly](fleet-design.md#proposed-recovery-after-a-hub-restore) |
 | Update validation | `vk check`, an optional local validation command, then hub reconnection | [A pinned boot/exec/network/cleanup workload required for unattended rollouts](fleet-design.md#updates) |
 | Canary promotion | Not built | [Representative workload success and an observation window](fleet-design.md#updates) |
-| Release trust | Not built | [Pinned keys required for remote updates; explicit development opt-out](fleet-design.md#updates) |
+| Release trust | Signatures required by default only when keys are configured | [Pinned keys required for remote updates; explicit development opt-out](fleet-design.md#updates) |
 | Reset | Not built | [Explicit job process ownership, verified empty before scratch removal](fleet-design.md#resets) |
 
 ## Enrollment
@@ -276,6 +277,11 @@ update <id> --release <sha256>` issues the update, which names the release by di
 a prefix of at least 8 hex digits names a release too. `--force` asks a node whose runner is
 external, which cannot be drained, to update without draining. Like any command, it is refused
 for a node monitored only.
+`release add --signature <file>` stores a release key's signature with the release, and the
+update carries it (see [Release signing](#release-signing)); the hub checks only that it is an
+ed25519 signature in base64, and `release list` shows which releases are signed. Adding the same
+bytes again requires the same signature, including its absence: remove the release to change
+its signature.
 
 An update's release is downloaded from the node listener, `GET /v1/releases/<sha256>`, with the
 node's ID, the time and its signature over both, the release and the connection's TLS exporter
@@ -361,6 +367,22 @@ new `vk` — the one thing draining exists to prevent. It is refused, too, for a
 than the node runs unless the node's own `[node] allow_downgrade = true` allows it, and even
 then for one older than 0.85.0, the first release that takes part in a trial; versions are
 compared as `MAJOR.MINOR.PATCH`, and an older one that is not of that form is refused.
+
+## Release signing
+
+Signatures are made offline: `vk release-key generate --key <file>` writes an ed25519 key
+(`0600`, published whole and never over an existing file) and prints its public half in
+base64, and `vk release-key sign --key <file> --version <v> <binary>` prints the signature of
+the binary's sha256 and version under the label `vk-fleet release v1`. The tool is in `vk`,
+which every node and workstation has and which already links ring, rather than in `vk-hub`:
+keep the key off the hub so a compromised hub cannot sign releases.
+
+A node's `[node] release_keys` lists its trusted keys. `require_signed` defaults to true when
+any key is set, requiring a signature by one of them. The node checks it on receipt, before
+any drain, and again before the release first runs, using its current keys. With keys
+configured, the node rejects invalid signatures even when signatures are optional. The keys
+are pinned in the node's configuration, not in the `vk` binary. Official releases are not
+signed this way yet: that is a step for the release workflow, with the key in CI's secrets.
 
 ## Workloads
 

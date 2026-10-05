@@ -149,6 +149,10 @@
 #                           # argv that must exit 0; unset = `vk check` alone
 # validate_timeout_secs = 600  # how long `validate` may take
 # allow_downgrade = false   # let an update install an older vk than the one running
+# release_keys = ["<base64>"]  # ed25519 keys (`vk release-key generate`) one of which must
+#                           # have signed a release before this node updates to it
+# require_signed = true     # default: true when release_keys is set; a signature a release
+#                           # carries is checked whenever there are keys
 
 # MICROVM_IMAGE is prefix-based (the prefix names the source): unset = local/default;
 # `local/<name>` = a bundle dir under [local] dir; `virtkit/<name>[:tag|@digest]` =

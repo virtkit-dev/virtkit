@@ -86,6 +86,10 @@ pub struct Release {
     pub version: String,
     pub sha256: String,
     pub size: u64,
+    /// A release key's signature, base64, which the node checks again before the release
+    /// first runs.
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 /// A release on trial. The installed binary stays in place until the trial is confirmed, so
@@ -338,6 +342,7 @@ impl Persisted {
                     version,
                     sha256,
                     size,
+                    signature,
                     within_secs,
                     ..
                 },
@@ -350,6 +355,7 @@ impl Persisted {
                     version: version.clone(),
                     sha256: sha256.clone(),
                     size: *size,
+                    signature: signature.clone(),
                 };
                 let (resume, next) = match state {
                     // An external runner cannot be drained: straight to the download.

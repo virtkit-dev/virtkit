@@ -145,6 +145,10 @@ enum ReleaseCmd {
         /// The version its `vk --version` prints
         #[arg(long)]
         version: String,
+        /// A file holding a release key's signature of it, as `vk release-key sign` prints
+        /// one
+        #[arg(long, value_name = "FILE")]
+        signature: Option<PathBuf>,
     },
     /// List the releases the hub holds
     List,
@@ -390,13 +394,19 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Release { config, cmd } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             match cmd {
-                ReleaseCmd::Add { file, version } => {
+                ReleaseCmd::Add {
+                    file,
+                    version,
+                    signature,
+                } => {
+                    let signature = signature.map(|path| read_signature(&path)).transpose()?;
                     // Absolute, since the hub resolves it from its own working directory.
                     let file = std::path::absolute(&file)
                         .with_context(|| format!("resolving {}", file.display()))?;
-                    let added =
-                        tokio::task::spawn_blocking(move || client.add_release(&file, &version))
-                            .await??;
+                    let added = tokio::task::spawn_blocking(move || {
+                        client.add_release(&file, &version, signature)
+                    })
+                    .await??;
                     // The sha256 alone on stdout, so `$(vk-hub release add …)` captures it.
                     println!("{}", added.sha256);
                     eprintln!(
@@ -411,10 +421,15 @@ async fn run(cli: Cli) -> Result<()> {
                     let releases = tokio::task::spawn_blocking(move || client.releases()).await??;
                     for r in releases {
                         println!(
-                            "{}  {:<12}  {:>10}  added {} by {}",
+                            "{}  {:<12}  {:>10}  {:<8}  added {} by {}",
                             r.sha256,
                             r.row.version,
                             r.row.size,
+                            if r.row.signature.is_some() {
+                                "signed"
+                            } else {
+                                "unsigned"
+                            },
                             utc(r.row.added_at),
                             r.row.added_by
                         );
@@ -627,6 +642,17 @@ async fn ui_cmd(client: admin::Client, cmd: UiCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The signature `vk release-key sign` wrote to `path`: a line of base64, read whole up to a
+/// bound well past one, which the hub checks the shape of.
+fn read_signature(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(4096).read_to_string(&mut text))
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(text.trim().to_string())
 }
 
 /// The running fleet hub's admin socket.

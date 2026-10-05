@@ -1062,7 +1062,7 @@ fn add_release(
 ) -> anyhow::Result<store::Release> {
     let file = dir.join("vk");
     std::fs::write(&file, bin).unwrap();
-    releases::add(hub, "uid 0", &file, version)
+    releases::add(hub, "uid 0", &file, version, None)
 }
 
 /// `GET <path>` with `headers` on `stream`, by hand: the status and the body.
@@ -1144,15 +1144,15 @@ async fn a_release_is_an_x86_64_elf_holding_its_version_and_added_once() {
         .unwrap()
         .set_len(releases::MAX_RELEASE + 1)
         .unwrap();
-    let err = releases::add(&hub, "uid 0", &big, "0.84.0").unwrap_err();
+    let err = releases::add(&hub, "uid 0", &big, "0.84.0", None).unwrap_err();
     assert!(format!("{err:#}").contains("past the"), "{err:#}");
-    assert!(releases::add(&hub, "uid 0", &dir, "0.84.0").is_err());
+    assert!(releases::add(&hub, "uid 0", &dir, "0.84.0", None).is_err());
     // A FIFO with no writer is refused at once rather than waited on.
     let fifo = dir.join("fifo");
     let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
     // SAFETY: `c_fifo` is a NUL-terminated path, valid for the call.
     assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
-    let err = releases::add(&hub, "uid 0", &fifo, "0.84.0").unwrap_err();
+    let err = releases::add(&hub, "uid 0", &fifo, "0.84.0", None).unwrap_err();
     assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
     std::fs::remove_file(&fifo).unwrap();
 
@@ -1172,6 +1172,42 @@ async fn a_release_is_an_x86_64_elf_holding_its_version_and_added_once() {
     let other = add_release(&hub, &dir, &both, "0.85.0").unwrap();
     let err = add_release(&hub, &dir, &both, "0.84.0").unwrap_err();
     assert!(format!("{err:#}").contains("already held"), "{err:#}");
+
+    // A signature must be one in shape, base64 of 64 bytes; whether it verifies is each
+    // node's to judge. Held, it is part of the release: added again without it, or with
+    // another, refused.
+    let file = dir.join("vk");
+    let signed = fake_vk("0.86.0");
+    std::fs::write(&file, &signed).unwrap();
+    let add = |signature: &str| {
+        releases::add(&hub, "uid 0", &file, "0.86.0", Some(signature.to_string()))
+    };
+    for bad in [
+        "abc!".to_string(),
+        vk_hub_proto::to_base64(&[5; vk_hub_proto::SIGNATURE_LEN - 1]),
+        vk_hub_proto::to_hex(&[5; vk_hub_proto::SIGNATURE_LEN]),
+    ] {
+        let err = add(&bad).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not an ed25519 signature"),
+            "{err:#}"
+        );
+    }
+    let signature = vk_hub_proto::to_base64(&[5; vk_hub_proto::SIGNATURE_LEN]);
+    let held = add(&format!("{signature}\n")).unwrap();
+    assert_eq!(held.row.signature.as_deref(), Some(signature.as_str()));
+    assert_eq!(add(&signature).unwrap(), held);
+    let err = add(&vk_hub_proto::to_base64(&[6; vk_hub_proto::SIGNATURE_LEN])).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("with another signature"),
+        "{err:#}"
+    );
+    let err = releases::add(&hub, "uid 0", &file, "0.86.0", None).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("with another signature"),
+        "{err:#}"
+    );
+    assert!(releases::remove(&hub, "uid 0", &held.sha256).unwrap());
     let listed: Vec<String> = hub
         .db
         .releases()
@@ -1361,6 +1397,7 @@ async fn a_download_trades_its_pre_auth_permit_for_a_download_slot() {
     let row = store::ReleaseRow {
         version: "0.84.0".into(),
         size,
+        signature: None,
         added_at: now_secs(),
         added_by: "uid 0".into(),
     };
@@ -1423,7 +1460,10 @@ async fn a_download_trades_its_pre_auth_permit_for_a_download_slot() {
 async fn an_update_names_a_held_release_and_refuses_a_version_1_node() {
     let (dir, addr, hub) = start_releases("release-update", None).await;
     let bin = fake_vk("0.84.0");
-    let release = add_release(&hub, &dir, &bin, "0.84.0").unwrap();
+    let file = dir.join("vk");
+    std::fs::write(&file, &bin).unwrap();
+    let signature = vk_hub_proto::to_base64(&[5; vk_hub_proto::SIGNATURE_LEN]);
+    let release = releases::add(&hub, "uid 0", &file, "0.84.0", Some(signature.clone())).unwrap();
     let key = keypair();
     let node_id = enrolled(addr, &hub, &key).await;
     let err = ops::update(&hub, "uid 0", &node_id, &"cd".repeat(32), false).unwrap_err();
@@ -1448,7 +1488,8 @@ async fn an_update_names_a_held_release_and_refuses_a_version_1_node() {
     .unwrap_err();
     assert!(format!("{err:#}").contains("names a release"), "{err:#}");
 
-    // A node not connected yet is taken at its word, and is sent it on connect.
+    // A node not connected yet is taken at its word, and is sent it on connect, with the
+    // release's signature for the node to check.
     let command = ops::update(&hub, "uid 0", &node_id, &release.sha256[..8], true).unwrap();
     assert_eq!(
         command.op,
@@ -1456,7 +1497,7 @@ async fn an_update_names_a_held_release_and_refuses_a_version_1_node() {
             version: "0.84.0".into(),
             sha256: release.sha256.clone(),
             size: bin.len() as u64,
-            signature: None,
+            signature: Some(signature),
             force: true,
             within_secs: None,
         }

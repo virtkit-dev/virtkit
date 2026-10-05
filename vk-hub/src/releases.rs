@@ -5,6 +5,10 @@
 //! key, so a binary it was handed is only read: hashed, checked to be an x86-64 ELF, and
 //! checked to carry the version the operator states as a string of its own. Running it is
 //! left to the node.
+//!
+//! **Signature verification belongs to the node.** The hub stores optional signatures made
+//! offline with `vk release-key sign` and forwards them. Each node verifies them against
+//! its configured keys; the hub holds no trusted release key.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -38,16 +42,36 @@ pub fn check_version(version: &str) -> Result<()> {
     Ok(())
 }
 
+/// `signature`, trimmed, checked to be what `vk release-key sign` prints: an ed25519
+/// signature in base64. Whether it verifies is each node's to judge, against its own keys.
+fn check_signature(signature: &str) -> Result<String> {
+    let signature = signature.trim();
+    match vk_hub_proto::from_base64(signature) {
+        Some(sig) if sig.len() == vk_hub_proto::SIGNATURE_LEN => Ok(signature.to_string()),
+        _ => bail!(
+            "the signature is not an ed25519 signature in base64, as `vk release-key sign` \
+             prints one"
+        ),
+    }
+}
+
 /// Where release `sha256`'s binary is.
 pub fn path(dir: &Path, sha256: &str) -> PathBuf {
     dir.join(sha256)
 }
 
-/// Copy the binary at `from` into the hub as `version`, audited as `actor`'s. Its sha256
-/// names it; the file is published whole, by rename, before the row that points at it is
-/// written.
-pub fn add(hub: &Hub, actor: &str, from: &Path, version: &str) -> Result<Release> {
+/// Copy the binary at `from` into the hub as `version`, with `signature`, audited as
+/// `actor`'s. Its sha256 names it; the file is published whole, by rename, before the row
+/// that points at it is written.
+pub fn add(
+    hub: &Hub,
+    actor: &str,
+    from: &Path,
+    version: &str,
+    signature: Option<String>,
+) -> Result<Release> {
     check_version(version)?;
+    let signature = signature.map(|s| check_signature(&s)).transpose()?;
     let dir = hub.releases_dir()?;
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -88,6 +112,7 @@ pub fn add(hub: &Hub, actor: &str, from: &Path, version: &str) -> Result<Release
     let row = ReleaseRow {
         version: version.to_string(),
         size,
+        signature,
         added_at: crate::now_secs(),
         added_by: actor.to_string(),
     };
@@ -97,11 +122,16 @@ pub fn add(hub: &Hub, actor: &str, from: &Path, version: &str) -> Result<Release
     let dest = path(dir, &sha256);
     let existing = hub.db.release(&sha256)?;
     if let Some(existing) = &existing {
-        if existing.version != row.version {
+        if existing.version != row.version || existing.signature != row.signature {
             let _ = std::fs::remove_file(&tmp);
             bail!(
-                "release {sha256} is already held, as vk {}",
-                existing.version
+                "release {sha256} is already held, as vk {}{}",
+                existing.version,
+                if existing.signature == row.signature {
+                    ""
+                } else {
+                    " with another signature"
+                }
             );
         }
         // The same bytes as the same release: an add retried after its answer was lost.
