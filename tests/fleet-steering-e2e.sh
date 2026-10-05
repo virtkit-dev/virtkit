@@ -12,6 +12,9 @@
 # 4. A quarantine stops the managed node's runner, and holds across a restart of its guest
 #    until released.
 # 5. The external node refuses a drain, and the audit log says why.
+# 6. Resetting the managed node passes through maintenance and validating back to ready.
+#    It stops a leftover process naming a past job's dir and removes the dir, preserving
+#    a plain `tail` of the same dir and the jobs dir's dot-directories.
 #
 # Run:  VK=./dist/vk tests/fleet-steering-e2e.sh
 # Needs: a `vk` with an embedded kernel/agent and the `vk-hub` beside it, KVM with nesting,
@@ -26,6 +29,8 @@ node_config managed <<'EOF'
 runner = "managed"
 runner_config = "/etc/gitlab-runner/config.toml"
 gitlab_runner = "/seed/gitlab-runner"
+# Holds a reset in validating while /tmp/reset-hold exists.
+validate = ["sh", "-c", "while [ -e /tmp/reset-hold ]; do sleep 0.2; done"]
 EOF
 node_start managed
 in_node managed sh -c 'mkdir -p /etc/gitlab-runner && echo "concurrent = 1" >/etc/gitlab-runner/config.toml'
@@ -121,4 +126,45 @@ wait_for 60 audit_says "$x" '\(drain\): refused: .*runner = "external"' ||
 cell_is "$x" STATE ready || fail "external is $(node_cell "$x" STATE) after refusing a drain"
 hub_audit "$x"
 
-echo "PASS: a ceiling, acquisition, drain and quarantine reach the nodes, as each can take them"
+echo "== a reset clears what a past job left on the managed node =="
+# The leftover binary, named `vk`, takes a job dir in its arguments and ignores SIGTERM
+# to hold maintenance through the reset's grace period. The bystander is a plain `tail`
+# of the same dir. Both record their pids.
+plant='
+jobs=/var/lib/virtkit/jobs
+mkdir -p "$jobs/e2e-leftover" "$jobs/.e2e-keep" /tmp/stub
+touch "$jobs/e2e-leftover/log"
+cp /bin/busybox /tmp/stub/vk
+nohup sh -c "echo \$\$ >/tmp/leftover.pid; trap \"\" TERM
+  exec -a tail /tmp/stub/vk -f $jobs/e2e-leftover/log" >/dev/null 2>&1 </dev/null &
+nohup sh -c "echo \$\$ >/tmp/bystander.pid; exec tail -f $jobs/e2e-leftover/log" \
+  >/dev/null 2>&1 </dev/null &
+'
+in_node managed sh -c "$plant"
+# alive <name>: check that the pid in /tmp/<name>.pid is alive, excluding zombies.
+alive() {
+  in_node managed sh -c "grep -q '^State:[[:space:]]*[^Z]' /proc/\$(cat /tmp/$1.pid)/status"
+}
+wait_for 10 alive leftover || fail "the leftover process did not start"
+wait_for 10 alive bystander || fail "the bystander process did not start"
+in_node managed touch /tmp/reset-hold
+hub nodes reset "$m"
+wait_for 60 cell_is "$m" STATE 'maintenance*' ||
+  fail "managed was never shown in maintenance: $(node_cell "$m" STATE)"
+hub nodes
+wait_for 60 cell_is "$m" STATE 'validating*' ||
+  fail "managed was never shown validating: $(node_cell "$m" STATE)"
+in_node managed rm /tmp/reset-hold
+wait_for 120 cell_is "$m" STATE ready ||
+  { hub_audit "$m"; fail "managed is $(node_cell "$m" STATE) after its reset"; }
+wait_for 30 audit_says "$m" '\(reset\): done' ||
+  { hub_audit "$m"; fail "the audit log misses the reset"; }
+! alive leftover 2>/dev/null || fail "the reset left the leftover process running"
+alive bystander || fail "the reset stopped a process that runs no vk"
+in_node managed test ! -e /var/lib/virtkit/jobs/e2e-leftover || fail "the reset left the job dir"
+in_node managed test -d /var/lib/virtkit/jobs/.e2e-keep ||
+  fail "the reset removed a dot-directory of the jobs dir"
+wait_for 30 runner_up || fail "the managed node did not start its runner once reset"
+hub_audit "$m"
+
+echo "PASS: a ceiling, acquisition, drain, quarantine and reset reach the nodes, as each can take them"
