@@ -1,8 +1,18 @@
+//! Shared fleet operations for every front end. Mutations take an actor (`uid <n>` on the
+//! admin socket), which the store audits with the change.
+
+use std::time::Duration;
+
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+use vk_hub_proto::{Acquisition, Command, DesiredState, Operation, Report};
 
 use crate::server::{Hub, Reach};
 use crate::store::NodeRow;
+
+/// Command delivery window. One day allows for a node reboot or hub outage without applying
+/// a stale request, such as a week-old drain.
+const COMMAND_TTL: Duration = Duration::from_secs(86_400);
 
 /// One row of `vk-hub nodes`: what the database holds about a node, joined with whether it
 /// has a session open now.
@@ -20,6 +30,26 @@ pub struct NodeView {
     /// How many VMs the node last said it runs; `None` until it has said.
     #[serde(default)]
     pub workloads: Option<u32>,
+    /// The fleet protocol version of the node's latest session; `None` before its first. Below
+    /// [`vk_hub_proto::STEERING`], the node is monitored only.
+    #[serde(default)]
+    pub protocol: Option<u32>,
+    /// What the hub wants: `None` until an operator asked for anything.
+    #[serde(default)]
+    pub desired: Option<DesiredState>,
+    /// What the node last reported of itself, without its workloads.
+    #[serde(default)]
+    pub report: Option<Report>,
+    /// Commands still to deliver or finish.
+    #[serde(default)]
+    pub pending_commands: usize,
+}
+
+impl NodeView {
+    /// Whether the node's latest session could not carry steering: it is monitored only.
+    pub fn monitoring_only(&self) -> bool {
+        self.protocol.is_some_and(|v| v < vk_hub_proto::STEERING)
+    }
 }
 
 /// Every enrolled node, as `vk-hub nodes` shows it, ordered by hostname.
@@ -48,7 +78,92 @@ pub fn node_view(hub: &Hub, id: String, row: &NodeRow) -> NodeView {
         committed_mib: admission.map(|a| a.committed_mib),
         budget_mib: admission.and_then(|a| a.budget_mib),
         workloads: row.workloads,
+        protocol: row.protocol,
+        desired: row.desired.clone(),
+        report: row.report.clone(),
+        // A count that cannot be read is shown as none rather than failing the listing.
+        pending_commands: hub
+            .db
+            .pending_commands(&id, crate::now_secs())
+            .map_or(0, |c| c.len()),
         id,
+    }
+}
+
+/// Cap node `id`'s concurrency at `ceiling`, or lift the cap with `None`, as `actor`.
+/// Return the new desired state, or `None` if unchanged.
+pub fn set_ceiling(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    ceiling: Option<u32>,
+) -> Result<Option<DesiredState>> {
+    // Enforce this at the operation boundary as well as in each front end.
+    if ceiling == Some(0) {
+        bail!("a ceiling of 0 is not one gitlab-runner has; stop acquisition instead");
+    }
+    let what = match ceiling {
+        Some(n) => format!("set the concurrency ceiling to {n}"),
+        None => "lifted the concurrency ceiling".to_string(),
+    };
+    let changed =
+        hub.db
+            .set_desired(id, |d| d.ceiling = ceiling, actor, &what, crate::now_secs())?;
+    desired_changed(hub, actor, id, &what, changed.as_ref());
+    Ok(changed)
+}
+
+/// Stop or resume node `id`'s acquisition as `actor`.
+/// Return the new desired state, or `None` if unchanged.
+pub fn set_acquisition(
+    hub: &Hub,
+    actor: &str,
+    id: &str,
+    acquisition: Acquisition,
+) -> Result<Option<DesiredState>> {
+    let what = match acquisition {
+        Acquisition::Run => "resumed acquisition",
+        Acquisition::Stop => "stopped acquisition",
+    };
+    let changed = hub.db.set_desired(
+        id,
+        |d| d.acquisition = acquisition,
+        actor,
+        what,
+        crate::now_secs(),
+    )?;
+    desired_changed(hub, actor, id, what, changed.as_ref());
+    Ok(changed)
+}
+
+/// Issue `operation` to node `id`, as `actor`, valid for [`COMMAND_TTL`].
+pub fn command(hub: &Hub, actor: &str, id: &str, operation: Operation) -> Result<Command> {
+    let command = hub
+        .db
+        .issue_command(id, operation, COMMAND_TTL, actor, crate::now_secs())?;
+    eprintln!(
+        "vk-hub: node {id}: {actor} issued {} (command {})",
+        crate::store::operation_name(&command.op),
+        command.id
+    );
+    hub.kick(id);
+    hub.changed(id);
+    Ok(command)
+}
+
+/// Tell the node's session a desired-state change happened, or say it changed nothing. The
+/// store has audited it with the change.
+fn desired_changed(hub: &Hub, actor: &str, id: &str, what: &str, changed: Option<&DesiredState>) {
+    match changed {
+        Some(desired) => {
+            eprintln!(
+                "vk-hub: node {id}: {actor} {what} (generation {})",
+                desired.generation
+            );
+            hub.kick(id);
+            hub.changed(id);
+        }
+        None => eprintln!("vk-hub: node {id}: {actor} {what}: already so"),
     }
 }
 

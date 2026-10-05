@@ -1,6 +1,7 @@
-//! The hub's database: enrolled nodes and outstanding enrollment tokens, the web UI's sign-in
-//! links and sessions, and the audit log, in [`redb`] like `vk-registry`'s accounts store —
-//! tables of JSON rows, small enough that listing every node is a scan.
+//! The hub's database: enrolled nodes, what the hub wants of them and the commands issued to
+//! them, outstanding enrollment tokens, the web UI's sign-in links and sessions, and the audit
+//! log, in [`redb`] like `vk-registry`'s accounts store — tables of JSON rows, small enough
+//! that listing every node is a scan.
 //!
 //! Enrollment tokens, sign-in tokens and session secrets are stored as `sha256` hashes, so
 //! the file cannot enroll a node or supply sign-in credentials. A read transaction rejects
@@ -29,12 +30,18 @@ use anyhow::{Context, Result, bail};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use vk_hub_proto::{Heartbeat, Inventory, Report, Workload};
+use vk_hub_proto::{
+    Acquisition, Command, CommandAck, DesiredState, Heartbeat, Inventory, NodeState, Operation,
+    Outcome, Report, STEERING, Workload,
+};
 
 /// Key: node ID. Value: JSON [`NodeRow`].
 const NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
 /// Key: `sha256(token)`, hex. Value: JSON [`TokenRow`].
 const TOKENS: TableDefinition<&str, &[u8]> = TableDefinition::new("tokens");
+/// Key: `<node id>/<command id>`, so a node's commands are one range. Value: JSON
+/// [`CommandRow`].
+const COMMANDS: TableDefinition<&str, &[u8]> = TableDefinition::new("commands");
 /// Key: a sequence number, oldest first. Value: JSON [`AuditRow`].
 const AUDIT: TableDefinition<u64, &[u8]> = TableDefinition::new("audit");
 /// Key: `(node id, sequence number)` of each node's audit rows, so one node's log is a range.
@@ -53,6 +60,10 @@ const WORKLOAD_MEM: TableDefinition<&str, &[u8]> = TableDefinition::new("workloa
 /// at the rate of a few dozen nodes. Past it, the oldest go, a thousand at a time.
 const AUDIT_MAX: u64 = 100_000;
 const AUDIT_PRUNE: u64 = 1000;
+
+/// How long a command is kept once it is settled — finished, refused, expired, or never
+/// taken by its expiry — for `vk-hub nodes` and a look back. The audit log keeps the record.
+const COMMAND_KEEP: u64 = 30 * 86_400;
 
 /// At least this often, in seconds, a heartbeat's write is made durable. redb keeps every
 /// non-durable commit's bookkeeping in memory, and the pages it frees unreusable, until the
@@ -182,6 +193,42 @@ pub struct NodeRow {
     /// The node's latest report of itself, without its workloads: those are kept apart.
     #[serde(default)]
     pub report: Option<Report>,
+    /// What the hub wants of the node; `None` until an operator first asks for anything.
+    #[serde(default)]
+    pub desired: Option<DesiredState>,
+}
+
+/// A command issued to a node, and what the node last said it came to.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommandRow {
+    pub command: Command,
+    pub issued_at: u64,
+    /// Issue order among the node's commands, whatever the clock did: one more than the
+    /// highest of its commands kept when this one was issued.
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub outcome: Option<Outcome>,
+    #[serde(default)]
+    pub outcome_at: Option<u64>,
+}
+
+impl CommandRow {
+    /// Still to be delivered or finished: no outcome yet, or one that is under way.
+    fn pending(&self) -> bool {
+        matches!(self.outcome, None | Some(Outcome::Accepted))
+    }
+
+    /// Settled more than `keep` before `now`: a final outcome that old, or an expiry that
+    /// old for a command never taken.
+    fn settled_before(&self, now: u64, keep: u64) -> bool {
+        let settled_at = match &self.outcome {
+            Some(Outcome::Accepted) => return false,
+            Some(_) => self.outcome_at.unwrap_or(self.issued_at),
+            None => self.command.expires_at,
+        };
+        now.saturating_sub(settled_at) > keep
+    }
 }
 
 /// What a node last said runs on it.
@@ -227,6 +274,40 @@ impl std::fmt::Display for NotEnrolled {
 }
 
 impl std::error::Error for NotEnrolled {}
+
+/// The node's latest session ran a protocol version below [`STEERING`]: the hub can monitor
+/// it, not steer it.
+#[derive(Debug)]
+pub struct MonitoringOnly {
+    pub id: String,
+    pub version: u32,
+}
+
+impl std::fmt::Display for MonitoringOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "node {} speaks fleet protocol version {}: the hub can monitor it but not steer \
+             it; update its vk",
+            self.id, self.version
+        )
+    }
+}
+
+impl std::error::Error for MonitoringOnly {}
+
+/// Refuse to steer node `id` whose latest session ran below [`STEERING`]. A node that has not
+/// connected yet is taken at its word: what it is sent waits for a session that can carry it.
+fn steerable(id: &str, row: &NodeRow) -> Result<()> {
+    match row.protocol {
+        Some(version) if version < STEERING => Err(MonitoringOnly {
+            id: id.to_string(),
+            version,
+        }
+        .into()),
+        _ => Ok(()),
+    }
+}
 
 /// What an enrollment came to.
 #[derive(Debug, PartialEq, Eq)]
@@ -321,6 +402,8 @@ impl Db {
             .context("starting the hub db's first write")?;
         txn.open_table(NODES).context("opening the nodes table")?;
         txn.open_table(TOKENS).context("opening the tokens table")?;
+        txn.open_table(COMMANDS)
+            .context("opening the commands table")?;
         txn.open_table(AUDIT).context("opening the audit table")?;
         txn.open_table(AUDIT_BY_NODE)
             .context("opening the audit index")?;
@@ -511,8 +594,8 @@ impl Db {
         })
     }
 
-    /// Remove a node, audited as `actor`'s: its key is no longer pinned, and a session it
-    /// opens is refused. `Ok(false)` when there was no such node.
+    /// Remove a node, audited as `actor`'s: its key is no longer pinned, a session it opens is
+    /// refused, and its commands go. `Ok(false)` when there was no such node.
     pub fn remove_node(&self, id: &str, actor: &str, now: u64) -> Result<bool> {
         let txn = self.db.begin_write().context("starting a write")?;
         let removed = txn.open_table(NODES)?.remove(id)?.is_some();
@@ -526,6 +609,9 @@ impl Db {
             )?;
             txn.open_table(WORKLOADS)?.remove(id)?;
             txn.open_table(WORKLOAD_MEM)?.remove(id)?;
+            let (start, end) = command_range(id);
+            txn.open_table(COMMANDS)?
+                .retain_in(start.as_str()..end.as_str(), |_, _| false)?;
         }
         txn.commit().context("removing a node")?;
         Ok(removed)
@@ -628,8 +714,12 @@ impl Db {
             .collect()
     }
 
-    /// Store node `id`'s report on its row, durably when changed. Store workloads separately,
-    /// preserving the previous list when the report has not listed workloads yet.
+    /// Store node `id`'s report durably when changed, with workloads stored separately and
+    /// preserved when absent from the report. Audit changes to state, applied generation and
+    /// what the node cannot carry out.
+    ///
+    /// After a hub restore, a node may report a newer generation. Reissue desired state one
+    /// generation above the node's, since it ignores generations at or below the one applied.
     pub fn record_report(&self, id: &str, mut report: Report, now: u64) -> Result<()> {
         let workloads = report.workloads.take().map(|listed| {
             // Bounded again, as the node bounds them: what it sends is not trusted to be.
@@ -649,6 +739,26 @@ impl Db {
             } else {
                 Durability::Immediate
             };
+            let mut events: Vec<(String, String)> = report_events(row.report.as_ref(), &report)
+                .into_iter()
+                .map(|e| ("node".to_string(), e))
+                .collect();
+            let ours = row.desired.as_ref().map_or(0, |d| d.generation);
+            if let Some(theirs) = report.applied_generation
+                && theirs > ours
+            {
+                let mut desired = row.desired.clone().unwrap_or(DEFAULT_DESIRED);
+                desired.generation = theirs.saturating_add(1);
+                events.push((
+                    "hub".to_string(),
+                    format!(
+                        "the node applied generation {theirs}, past this hub's {ours}: \
+                         re-issued the desired state as generation {}",
+                        desired.generation
+                    ),
+                ));
+                row.desired = Some(desired);
+            }
             row.report = Some(report);
             row.last_seen = Some(now);
             // Kept apart from the row, which carries their count.
@@ -660,8 +770,170 @@ impl Db {
                 txn.open_table(WORKLOADS)?
                     .insert(id, encode(&workloads)?.as_slice())?;
             }
-            Ok(((), Vec::new(), durability))
+            let durability = if events.is_empty() {
+                durability
+            } else {
+                Durability::Immediate
+            };
+            Ok(((), events, durability))
         })
+    }
+
+    /// Change what the hub wants of node `id` through `change`, from the defaults — no
+    /// ceiling, acquisition running — when nothing was wanted yet, audited as `actor` doing
+    /// `what`. A change takes the next generation after both the hub's and the one the node
+    /// last reported applying, so it is newer to the node whatever the hub has forgotten; one
+    /// that changes nothing is not stored. Returns the new desired state, or `None` when it was
+    /// already so. A node only monitored is refused ([`MonitoringOnly`]).
+    pub fn set_desired(
+        &self,
+        id: &str,
+        change: impl FnOnce(&mut DesiredState),
+        actor: &str,
+        what: &str,
+        now: u64,
+    ) -> Result<Option<DesiredState>> {
+        self.update_txn(now, id, |row, _| {
+            steerable(id, row)?;
+            let before = row.desired.clone().unwrap_or(DEFAULT_DESIRED);
+            let mut next = before.clone();
+            change(&mut next);
+            if next.ceiling == before.ceiling && next.acquisition == before.acquisition {
+                // The unchanged row is still written back, without an fsync.
+                return Ok((None, Vec::new(), Durability::None));
+            }
+            let applied = row
+                .report
+                .as_ref()
+                .and_then(|r| r.applied_generation)
+                .unwrap_or(0);
+            next.generation = before.generation.max(applied).saturating_add(1);
+            row.desired = Some(next.clone());
+            let event = format!("{actor} {what} (generation {})", next.generation);
+            Ok((
+                Some(next),
+                vec![(actor.to_string(), event)],
+                Durability::Immediate,
+            ))
+        })
+    }
+
+    /// Issue `op` to node `id`, valid for `ttl`, audited as `actor`'s. The node must be
+    /// enrolled and not only monitored ([`MonitoringOnly`]). Its commands settled longer than
+    /// [`COMMAND_KEEP`] ago go in the same write.
+    pub fn issue_command(
+        &self,
+        id: &str,
+        op: Operation,
+        ttl: Duration,
+        actor: &str,
+        now: u64,
+    ) -> Result<Command> {
+        let command = Command {
+            id: crate::random_hex(vk_hub_proto::ID_BYTES)?,
+            expires_at: now.saturating_add(ttl.as_secs()),
+            op,
+        };
+        let mut row = CommandRow {
+            command: command.clone(),
+            issued_at: now,
+            seq: 0,
+            outcome: None,
+            outcome_at: None,
+        };
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            let node = txn
+                .open_table(NODES)?
+                .get(id)?
+                .map(|g| decode::<NodeRow>(g.value()))
+                .transpose()?;
+            let Some(node) = node else {
+                return Err(NotEnrolled(id.to_string()).into());
+            };
+            steerable(id, &node)?;
+            let mut commands = txn.open_table(COMMANDS)?;
+            let (start, end) = command_range(id);
+            commands.retain_in(start.as_str()..end.as_str(), |_, value| {
+                decode::<CommandRow>(value).map_or(true, |r| !r.settled_before(now, COMMAND_KEEP))
+            })?;
+            for entry in commands.range(start.as_str()..end.as_str())? {
+                let seq = decode::<CommandRow>(entry?.1.value())?.seq;
+                row.seq = row.seq.max(seq.saturating_add(1));
+            }
+            let key = format!("{id}/{}", command.id);
+            commands.insert(key.as_str(), encode(&row)?.as_slice())?;
+            let event = format!(
+                "{actor} issued {} (command {})",
+                operation_name(&command.op),
+                command.id
+            );
+            append_audit(&txn, Some(id), actor, &event, now)?;
+        }
+        txn.commit().context("issuing a command")?;
+        Ok(command)
+    }
+
+    /// Node `id`'s commands still to deliver or finish, oldest first, leaving out those past
+    /// their expiry that it never answered: it would only refuse them.
+    pub fn pending_commands(&self, id: &str, now: u64) -> Result<Vec<Command>> {
+        let mut rows = self.node_commands(id)?;
+        rows.retain(|r| r.pending() && (r.outcome.is_some() || r.command.expires_at > now));
+        Ok(rows.into_iter().map(|r| r.command).collect())
+    }
+
+    /// Every command of node `id`, oldest first.
+    pub fn node_commands(&self, id: &str) -> Result<Vec<CommandRow>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(COMMANDS)?;
+        let (start, end) = command_range(id);
+        let mut out = Vec::new();
+        for entry in table.range(start.as_str()..end.as_str())? {
+            let (_, value) = entry?;
+            out.push(decode::<CommandRow>(value.value())?);
+        }
+        out.sort_by_key(|r| (r.seq, r.issued_at));
+        Ok(out)
+    }
+
+    /// Store and audit node `id`'s outcome for command `ack.id`. Return `false` for duplicate
+    /// outcomes, unknown commands or any ack after a final outcome: a late `accepted` must
+    /// not reopen a finished command.
+    pub fn record_ack(&self, id: &str, ack: &CommandAck, now: u64) -> Result<bool> {
+        let key = format!("{id}/{}", ack.id);
+        let outcome = display_safe_outcome(ack.outcome.clone());
+        let txn = self.db.begin_write().context("starting a write")?;
+        let news = {
+            let mut table = txn.open_table(COMMANDS)?;
+            let row = table
+                .get(key.as_str())?
+                .map(|g| decode::<CommandRow>(g.value()))
+                .transpose()?;
+            match row {
+                // A final outcome stays: nothing the node sends after it replaces it.
+                Some(mut row) if row.pending() && row.outcome.as_ref() != Some(&outcome) => {
+                    row.outcome = Some(outcome.clone());
+                    row.outcome_at = Some(now);
+                    table.insert(key.as_str(), encode(&row)?.as_slice())?;
+                    Some(row.command)
+                }
+                _ => None,
+            }
+        };
+        // Acks are not paced: one that changes nothing must not cost a commit.
+        let Some(command) = news else {
+            txn.abort().context("dropping a write")?;
+            return Ok(false);
+        };
+        let event = format!(
+            "command {} ({}): {}",
+            command.id,
+            operation_name(&command.op),
+            outcome_text(&outcome)
+        );
+        append_audit(&txn, Some(id), "node", &event, now)?;
+        txn.commit().context("recording an ack")?;
+        Ok(true)
     }
 
     /// The last `limit` audit lines, oldest first, of one node or of all.
@@ -973,6 +1245,19 @@ impl Db {
     }
 }
 
+/// What the hub wants of a node it has asked nothing of.
+const DEFAULT_DESIRED: DesiredState = DesiredState {
+    generation: 0,
+    ceiling: None,
+    acquisition: Acquisition::Run,
+};
+
+/// The key range of node `id`'s commands.
+fn command_range(id: &str) -> (String, String) {
+    // `0` is the character after `/`.
+    (format!("{id}/"), format!("{id}0"))
+}
+
 /// Every node in `txn`, by ID.
 fn nodes_in(txn: &redb::ReadTransaction) -> Result<Vec<(String, NodeRow)>> {
     let table = txn.open_table(NODES)?;
@@ -1060,6 +1345,75 @@ fn append_audit(
         }
     }
     Ok(())
+}
+
+/// The audit lines a report is worth: a new state, a newly applied generation, and what of it
+/// the node cannot carry out — or its concurrency — as it changes.
+fn report_events(previous: Option<&Report>, report: &Report) -> Vec<String> {
+    let mut events = Vec::new();
+    if previous.is_none_or(|p| p.state != report.state)
+        && let Some(state) = report.state
+    {
+        events.push(format!("state {}", state_name(state)));
+    }
+    if previous.is_none_or(|p| p.applied_generation != report.applied_generation)
+        && let Some(generation) = report.applied_generation
+    {
+        events.push(format!("applied generation {generation}"));
+    }
+    if previous.is_none_or(|p| p.unsupported != report.unsupported) {
+        for note in &report.unsupported {
+            events.push(format!("cannot comply: {note}"));
+        }
+    }
+    if previous.is_none_or(|p| p.concurrency_error != report.concurrency_error)
+        && let Some(error) = &report.concurrency_error
+    {
+        events.push(format!("cannot set its concurrency: {error}"));
+    }
+    events
+}
+
+pub(crate) fn state_name(state: NodeState) -> &'static str {
+    match state {
+        NodeState::Ready => "ready",
+        NodeState::Draining => "draining",
+        NodeState::Drained => "drained",
+        NodeState::Quarantined => "quarantined",
+    }
+}
+
+pub(crate) fn operation_name(op: &Operation) -> &'static str {
+    match op {
+        Operation::Drain => "drain",
+        Operation::Undrain => "undrain",
+        Operation::Quarantine => "quarantine",
+        Operation::Release => "release",
+    }
+}
+
+fn outcome_text(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Accepted => "accepted".into(),
+        Outcome::Done => "done".into(),
+        Outcome::Failed { message } => format!("failed: {message}"),
+        Outcome::Refused { reason } => format!("refused: {reason}"),
+        Outcome::Expired => "expired".into(),
+    }
+}
+
+/// `outcome` with the node's text in it made [`vk_hub_proto::display_safe`].
+fn display_safe_outcome(outcome: Outcome) -> Outcome {
+    use vk_hub_proto::display_safe as safe;
+    match outcome {
+        Outcome::Failed { message } => Outcome::Failed {
+            message: safe(&message),
+        },
+        Outcome::Refused { reason } => Outcome::Refused {
+            reason: safe(&reason),
+        },
+        other => other,
+    }
 }
 
 /// A token's key in [`TOKENS`], and a sign-in token's or session secret's in its table.
@@ -1657,6 +2011,293 @@ mod tests {
             panic!("expected an enrollment");
         };
         node_id
+    }
+
+    #[test]
+    fn a_desired_change_takes_the_next_generation_and_no_change_takes_none() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        let set = |ceiling| {
+            db.set_desired(&id, |d| d.ceiling = ceiling, "uid 0", "set a ceiling", 5)
+                .unwrap()
+        };
+        let d = set(Some(4)).unwrap();
+        assert_eq!((d.generation, d.ceiling), (1, Some(4)));
+        assert!(set(Some(4)).is_none());
+        let d = db
+            .set_desired(
+                &id,
+                |d| d.acquisition = Acquisition::Stop,
+                "uid 0",
+                "stopped acquisition",
+                5,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!((d.generation, d.ceiling), (2, Some(4)));
+        assert_eq!(db.node(&id).unwrap().unwrap().desired, Some(d));
+        let events: Vec<String> = db
+            .audits(Some(&id), 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert_eq!(
+            events[1..],
+            [
+                "uid 0 set a ceiling (generation 1)",
+                "uid 0 stopped acquisition (generation 2)"
+            ]
+        );
+        let err = db
+            .set_desired(&"0".repeat(32), |d| d.ceiling = None, "uid 0", "changed", 5)
+            .unwrap_err();
+        assert!(err.is::<NotEnrolled>(), "{err:#}");
+    }
+
+    #[test]
+    fn a_command_is_pending_until_it_has_a_final_outcome() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        let other = {
+            let (token, _) = db.create_token(DAY, "uid 0", 0).unwrap();
+            let Enrollment::Enrolled { node_id } =
+                db.enroll(&token, "bb", "h", "peer p", 1).unwrap()
+            else {
+                panic!("expected an enrollment");
+            };
+            node_id
+        };
+        let drain = db
+            .issue_command(&id, Operation::Drain, DAY, "uid 0", 10)
+            .unwrap();
+        db.issue_command(&other, Operation::Quarantine, DAY, "uid 0", 10)
+            .unwrap();
+        assert_eq!(
+            db.pending_commands(&id, 11).unwrap(),
+            std::slice::from_ref(&drain)
+        );
+        let ack = |outcome| CommandAck {
+            id: drain.id.clone(),
+            outcome,
+        };
+        assert!(db.record_ack(&id, &ack(Outcome::Accepted), 12).unwrap());
+        // Under way is still pending; recording the same outcome again is no news.
+        assert_eq!(db.pending_commands(&id, 13).unwrap().len(), 1);
+        assert!(!db.record_ack(&id, &ack(Outcome::Accepted), 13).unwrap());
+        assert!(db.record_ack(&id, &ack(Outcome::Done), 14).unwrap());
+        assert!(db.pending_commands(&id, 15).unwrap().is_empty());
+        // A late `accepted` does not reopen it, nor another outcome replace the final one.
+        assert!(!db.record_ack(&id, &ack(Outcome::Accepted), 16).unwrap());
+        assert!(!db.record_ack(&id, &ack(Outcome::Expired), 16).unwrap());
+        // Nor is another node's command settled by this one's ack.
+        let theirs = db.node_commands(&other).unwrap().remove(0).command;
+        let stray = CommandAck {
+            id: theirs.id,
+            outcome: Outcome::Done,
+        };
+        assert!(!db.record_ack(&id, &stray, 16).unwrap());
+        let row = db.node_commands(&id).unwrap().remove(0);
+        assert_eq!(row.outcome, Some(Outcome::Done));
+        let events: Vec<String> = db
+            .audits(Some(&id), 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert_eq!(
+            events[1],
+            format!("uid 0 issued drain (command {})", drain.id)
+        );
+        assert_eq!(events[3], format!("command {} (drain): done", drain.id));
+        // An unanswered command past its expiry is not resent.
+        db.issue_command(&id, Operation::Release, Duration::from_secs(5), "uid 0", 20)
+            .unwrap();
+        assert!(db.pending_commands(&id, 30).unwrap().is_empty());
+        assert_eq!(db.node_commands(&other).unwrap().len(), 1);
+        let err = db
+            .issue_command(&"0".repeat(32), Operation::Drain, DAY, "uid 0", 1)
+            .unwrap_err();
+        assert!(err.is::<NotEnrolled>(), "{err:#}");
+    }
+
+    /// A node's failure message is stored and audited made display-safe.
+    #[test]
+    fn a_failure_message_is_stored_display_safe() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        let drain = db
+            .issue_command(&id, Operation::Drain, DAY, "uid 0", 10)
+            .unwrap();
+        let message = format!(
+            "disk\u{202e}full\n{}",
+            "x".repeat(2 * vk_hub_proto::MAX_DISPLAY)
+        );
+        let ack = CommandAck {
+            id: drain.id.clone(),
+            outcome: Outcome::Failed { message },
+        };
+        assert!(db.record_ack(&id, &ack, 11).unwrap());
+        // A second failure does not replace the first.
+        assert!(!db.record_ack(&id, &ack, 12).unwrap());
+        let Some(Outcome::Failed { message }) = db.node_commands(&id).unwrap().remove(0).outcome
+        else {
+            panic!("expected a failure");
+        };
+        assert!(message.starts_with("diskfullx"), "{message:?}");
+        assert_eq!(message.chars().count(), vk_hub_proto::MAX_DISPLAY);
+        let event = db.audits(Some(&id), 1).unwrap().remove(0).event;
+        let head = format!("command {} (drain): failed: diskfullx", drain.id);
+        assert!(event.starts_with(&head), "{event:?}");
+    }
+
+    /// A node whose latest session ran version 1 is refused steering; one that has not
+    /// connected yet is not.
+    #[test]
+    fn a_node_on_version_1_is_monitored_only() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        db.set_desired(&id, |d| d.ceiling = Some(2), "uid 0", "set a ceiling", 1)
+            .unwrap()
+            .unwrap();
+        db.issue_command(&id, Operation::Drain, DAY, "uid 0", 1)
+            .unwrap();
+        assert!(db.record_session(&id, "ab", 1, 2, || true).unwrap());
+        let err = db
+            .set_desired(&id, |d| d.ceiling = Some(3), "uid 0", "set a ceiling", 3)
+            .unwrap_err();
+        assert!(err.is::<MonitoringOnly>(), "{err:#}");
+        assert!(format!("{err:#}").contains("update its vk"), "{err:#}");
+        let err = db
+            .issue_command(&id, Operation::Undrain, DAY, "uid 0", 3)
+            .unwrap_err();
+        assert!(err.is::<MonitoringOnly>(), "{err:#}");
+        // Nothing of either was stored or audited.
+        assert_eq!(
+            db.node(&id).unwrap().unwrap().desired.unwrap().ceiling,
+            Some(2)
+        );
+        assert_eq!(db.node_commands(&id).unwrap().len(), 1);
+        assert_eq!(db.audits(Some(&id), 10).unwrap().len(), 3);
+        assert!(db.record_session(&id, "ab", STEERING, 4, || true).unwrap());
+        db.issue_command(&id, Operation::Undrain, DAY, "uid 0", 5)
+            .unwrap();
+    }
+
+    /// A hub restored from a backup may be behind the generation a node applied; it moves
+    /// past the node's rather than send what the node would ignore.
+    #[test]
+    fn a_node_ahead_of_the_hub_gets_the_desired_state_reissued_past_it() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        db.set_desired(&id, |d| d.ceiling = Some(4), "uid 0", "set a ceiling", 1)
+            .unwrap();
+        let report = |applied| Report {
+            applied_generation: applied,
+            ..Report::default()
+        };
+        db.record_report(&id, report(Some(1)), 2).unwrap();
+        let generation = |db: &Db| db.node(&id).unwrap().unwrap().desired.unwrap().generation;
+        assert_eq!(generation(&db), 1);
+        db.record_report(&id, report(Some(9)), 3).unwrap();
+        let desired = db.node(&id).unwrap().unwrap().desired.unwrap();
+        assert_eq!((desired.generation, desired.ceiling), (10, Some(4)));
+        // And a change takes the generation after both.
+        db.record_report(&id, report(Some(12)), 4).unwrap();
+        let next = db
+            .set_desired(&id, |d| d.ceiling = None, "uid 0", "lifted the ceiling", 5)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.generation, 14);
+        let events: Vec<String> = db
+            .audits(Some(&id), 20)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .collect();
+        assert!(
+            events.contains(
+                &"the node applied generation 9, past this hub's 1: re-issued the desired \
+                  state as generation 10"
+                    .to_string()
+            ),
+            "{events:?}"
+        );
+        assert!(events.contains(&"applied generation 12".to_string()));
+        // A node that never asked for anything gets the defaults past its generation.
+        let (token, _) = db.create_token(DAY, "uid 0", 0).unwrap();
+        let Enrollment::Enrolled { node_id: fresh } =
+            db.enroll(&token, "cc", "h", "peer p", 1).unwrap()
+        else {
+            panic!("expected an enrollment");
+        };
+        db.record_report(&fresh, report(Some(3)), 2).unwrap();
+        assert_eq!(
+            db.node(&fresh).unwrap().unwrap().desired,
+            Some(DesiredState {
+                generation: 4,
+                ..DEFAULT_DESIRED
+            })
+        );
+    }
+
+    #[test]
+    fn commands_keep_their_issue_order_in_one_second_and_across_a_clock_step() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        let ops = [Operation::Drain, Operation::Undrain];
+        // Eight in one second, then one after the clock stepped back.
+        let issued: Vec<Command> = (0..9)
+            .map(|i| {
+                let now = if i < 8 { 10 } else { 5 };
+                db.issue_command(&id, ops[i % 2].clone(), DAY, "uid 0", now)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(db.pending_commands(&id, 10).unwrap(), issued);
+        let listed: Vec<Command> = db
+            .node_commands(&id)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.command)
+            .collect();
+        assert_eq!(listed, issued);
+    }
+
+    #[test]
+    fn settled_commands_are_pruned_and_go_with_their_node() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        let old = db
+            .issue_command(&id, Operation::Release, DAY, "uid 0", 0)
+            .unwrap();
+        let ack = CommandAck {
+            id: old.id,
+            outcome: Outcome::Done,
+        };
+        db.record_ack(&id, &ack, 1).unwrap();
+        // Under way, however old, stays.
+        let running = db
+            .issue_command(&id, Operation::Drain, DAY, "uid 0", 1)
+            .unwrap();
+        let ack = CommandAck {
+            id: running.id.clone(),
+            outcome: Outcome::Accepted,
+        };
+        db.record_ack(&id, &ack, 1).unwrap();
+        db.issue_command(&id, Operation::Release, DAY, "uid 0", 2 + COMMAND_KEEP)
+            .unwrap();
+        let kept: Vec<String> = db
+            .node_commands(&id)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.command.id)
+            .collect();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.contains(&running.id));
+        assert!(db.remove_node(&id, "uid 0", 3 + COMMAND_KEEP).unwrap());
+        assert!(db.node_commands(&id).unwrap().is_empty());
     }
 
     #[test]

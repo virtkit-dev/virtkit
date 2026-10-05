@@ -6,9 +6,9 @@ is built, with its commands, defaults and limits. The [exit criteria](#prototype
 define the evidence required before unattended maintenance or phase 2.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
-fleet's inventory, desired state and operations — drains, `vk` rollouts, resets — and shows
-them in a web UI. Each node runs its own CI jobs through the vk executor; central placement
-is for generic VM jobs, whose queue the hub owns.
+fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
+resets — and shows them in a web UI. Each node runs its own CI jobs through the vk executor;
+central placement is for generic VM jobs, whose queue the hub owns.
 
 The target is a fleet of tens of bare-metal hosts, not hundreds: one hub process, one
 embedded database, no replication.
@@ -84,18 +84,19 @@ Then:
 
 - **node → hub**: inventory when it changes, a heartbeat with capacity and job counts every
   few seconds — at an interval the hub sets, since the hub decides when a quiet node counts
-  as unreachable — and, proposed, command progress and results.
-- **hub → node** (proposed): desired state, as a document with a generation number;
-  operations (`drain`, `update`, `reset`), each with an ID and an expiry.
+  as unreachable — and command progress and results.
+- **hub → node**: desired state, as a document with a generation number; operations
+  (`drain`, `quarantine` and their reverses; proposed, `update` and `reset`), each with an ID
+  and an expiry.
 
 Steering — desired state, commands and their outcomes — takes protocol version 2 on both
 sides; a session with a version-1 node (0.83.0 or 0.84.0) carries monitoring only.
 
 A node applies a desired-state generation at most once, and journals every command before
 acting on it, so a command redelivered after a reconnect is recognized and not repeated. It
-repeats each command's outcome until the hub says it has stored it. Proposed: the hub resends
-desired state to a node that reports an older generation, and every command without a final
-outcome; a command the node never takes expires after a day. A lost connection means the node's
+repeats each command's outcome until the hub says it has stored it. The hub resends desired
+state to a node that reports an older generation, and every command without a final outcome;
+a command the node never takes expires after a day. A lost connection means the node's
 state is unknown, not that it stopped. The prototype's session, limits and timeouts are in [the
 reference](fleet-prototype.md#hub-and-node).
 
@@ -172,8 +173,14 @@ The node applies the hub's ceiling whether or not the hub is reachable. gitlab-r
 `concurrent = 0`, so **stopping acquisition** is a state rather than a number, and needs a
 runner the node runs itself: the node sends gitlab-runner `SIGQUIT`, which stops it
 requesting jobs and lets running ones finish, and does not start it again until the state is
-lifted. See [concurrency control](fleet-prototype.md#concurrency-control) for
-the cadence and how the number reaches the runner.
+lifted. Proposed: the hub also pauses the runner through the GitLab API, which keeps GitLab
+from assigning it jobs even if a request is already in flight when the node stops it. See
+[concurrency control](fleet-prototype.md#concurrency-control) for the cadence and how the
+number reaches the runner.
+
+An operator sets the hub's ceiling today. Proposed: the hub adjusts ceilings itself over tens
+of seconds with hysteresis, cutting quickly under sustained pressure and raising slowly,
+without aiming for equal utilization.
 
 ## Node states
 
@@ -186,7 +193,7 @@ quarantined (entered from any state; left only by an operator)
 A drain:
 
 1. is persisted on the node before anything else;
-2. stops acquisition;
+2. stops acquisition and, proposed, pauses the runner in GitLab;
 3. waits for gitlab-runner to finish its jobs, the executor's cleanup, and the admission
    ledger to empty;
 4. reports `drained` only once all three hold.
@@ -296,8 +303,8 @@ toolchain in the release build:
 
 Planned pages, in order of priority:
 
-1. **nodes** — state, capacity, pressure, admission waits, versions, configuration drift;
-   desired, observed and unknown shown distinctly;
+1. **nodes** — state, capacity (local estimate, hub ceiling, effective), pressure, admission
+   waits, versions, configuration drift; desired, observed and unknown shown distinctly;
 2. **node detail** — inventory, effective configuration, recent jobs, atop timelines and
    egress reports;
 3. **operations** — drain, reset, rollouts and their progress;
@@ -338,8 +345,8 @@ model, commands and process handling.
 
 ## Security
 
-- Proposed: nodes accept typed operations only, never a shell command, each checked against
-  the operations local policy allows. Today the hub sends nodes none.
+- Nodes accept typed operations only, never a shell command. Proposed: each checked against
+  the operations local policy allows.
 - Node identities are pinned keys, revoked from the hub (`vk-hub nodes remove`); rotation is
   not built. Enrollment tokens are short-lived and single-use.
 - Proposed: a hub chooses which release a node updates to, never whether it may go back: a
@@ -347,11 +354,14 @@ model, commands and process handling.
   (`[node] allow_downgrade`), since an override the hub carried would be worth nothing
   against a compromised hub — which could otherwise take the fleet back to a release with a
   known flaw, signed or not.
-- Hub roles: viewer; operator (drain, reset, rollouts, all proposed); admin (enrollment, and
-  the proposed redeploy). Proposed: BMC credentials are held apart and used only by
-  redeploys. Admin is the admin socket's: whoever runs as the hub's user or root, who also
-  issues the web UI's sign-in links; a web UI session is a viewer or an operator. Today an
-  operator session acts only in local mode; fleet pages are read-only.
+- Proposed: runner authentication tokens stay on their nodes, and the hub's GitLab
+  credential is a separate one, scoped to managing runners (pause, resume, list).
+- Hub roles: viewer; operator (ceilings, stopping acquisition, drain and quarantine; reset
+  and rollouts proposed); admin (enrollment, and the proposed redeploy). Proposed: BMC
+  credentials are held apart and used only by redeploys. Admin is the admin socket's:
+  whoever runs as the hub's user or root, who also issues the web UI's sign-in links; a web
+  UI session is a viewer or an operator. Today the fleet is steered through the admin socket
+  alone: an operator session acts only in local mode, and fleet pages are read-only.
 - The web UI and the node endpoint are separate listeners with separate authentication.
   Every UI response carries `Content-Security-Policy: default-src 'self'; script-src 'self';
   style-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none';
@@ -362,8 +372,13 @@ model, commands and process handling.
   `cross-site`. A request whose `Host` is not `ui_url`'s — local mode's own name — is refused
   with 421, so a page on another name that resolves to the UI's address reaches nothing (DNS
   rebinding); a reverse proxy in front of the UI must pass the `Host` it was asked for.
-- Run the hub on its own host and back up its database and secrets. The prototype holds no
-  desired state.
+- Run the hub on its own host and back up its database and secrets. In the prototype, the
+  hub sends desired state only after a node reports the generation it applied. If that
+  generation is newer, the hub reissues its stored state as the generation after it. This
+  orders messages but does not reconcile intent: restoring a backup from before an
+  acquisition stop or a ceiling cut can reissue an older permission to run. A node forgets
+  its applied generation when enrolled anew or with another hub, since generations count for
+  one hub and one enrollment.
 
 ### Proposed recovery after a hub restore
 
@@ -382,8 +397,9 @@ recovering the hub does not authorize lifting either.
 
 The restore procedure must also reconcile pending commands against node journals and their
 acknowledged outcomes before replay or rollout advancement. Old commands that would relax
-restrictions require review. Test recovery from a backup taken before a quarantine, a
-completed maintenance command and a rollout transition. They are not implemented yet.
+restrictions require review. Test recovery from a backup taken before a stop, a ceiling cut,
+a quarantine, a completed maintenance command and a rollout transition. These rules replace
+the prototype's automatic generation bump; they are not implemented yet.
 
 ## Phase 2: generic jobs
 
@@ -480,7 +496,7 @@ node and hub being interrupted together.
 
 | Exercise | Required result |
 |---|---|
-| Restore a backup older than a quarantine | Recovery conflict is visible; the quarantine is not lifted without an explicit reconciliation decision |
+| Restore a backup older than a stop, a ceiling cut or a quarantine | Recovery conflict is visible; acquisition does not resume, the ceiling does not rise and the quarantine is not lifted without an explicit reconciliation decision |
 | Partition the hub during ordinary CI and during drain | Ordinary CI follows persisted policy; drain remains in force; an unreachable node is never presented as confirmed idle |
 | Burst jobs during a drain and a node restart | Accepted work is accounted for; `drained` is reported only after the node's jobs, cleanup and admission complete |
 | Drop command acknowledgements and reconnect with duplicates | The journal preserves one operation identity and its outcome; replay does not repeat a completed destructive effect |
@@ -506,9 +522,10 @@ carry IDs of their own, node-local policy stays authoritative and the protocol i
 1. **Local mode.** `vk workloads` and `vk-hub local`: one host's VMs, a page each, and
    lifecycle actions, with no hub↔node session. Its web UI is the core the fleet's is built
    on.
-2. **Phase 1.** Enrollment, sessions, inventory, drain and quarantine, signed releases and
-   rollouts, resets, the workloads each node runs. Before unattended maintenance, the gaps in
-   the [capability table](fleet-prototype.md#status) close — resets by process ownership, a
+2. **Phase 1.** Enrollment, sessions, inventory, hub ceilings and stopping acquisition,
+   drain and quarantine, signed releases and rollouts, resets, the workloads each node runs.
+   Before unattended maintenance, the gaps in the
+   [capability table](fleet-prototype.md#status) close — resets by process ownership, a
    representative validation workload, recovery after a hub restore, pinned release keys —
    and the [exit criteria](#prototype-exit-criteria) are met.
 3. **Complete accounting.** Every workload type in the node's admission ledger, image builds

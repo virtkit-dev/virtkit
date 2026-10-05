@@ -165,8 +165,8 @@ fn nodes(auth: &Auth, nodes: &[NodeView], now: u64) -> Html {
 // workloads; checked against the columns' names, so a reordering fails to build.
 const NODE_ID: usize = 0;
 const NODE_NAME: usize = 1;
-const NODE_LAST_SEEN: usize = 3;
-const NODE_VK: usize = 4;
+const NODE_LAST_SEEN: usize = 8;
+const NODE_VK: usize = 9;
 const VM_KIND: usize = 0;
 const VM_ID: usize = 1;
 const VM_PID: usize = 3;

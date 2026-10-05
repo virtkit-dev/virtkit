@@ -1,14 +1,18 @@
 //! `vk-hub` — the fleet hub. Nodes running `vk node` enroll with it, hold a session to it,
-//! and report their inventory and heartbeats; operators issue enrollment tokens and list the
-//! fleet. See `docs/fleet-design.md` and `docs/fleet-prototype.md`.
+//! and report their inventory and heartbeats; operators issue enrollment tokens, list the
+//! fleet and steer it. See `docs/fleet-design.md` and `docs/fleet-prototype.md`.
 //!
 //! `vk-hub local` serves a web UI for the VMs of the machine it runs on instead, as the user
 //! who owns them, on a loopback name of its own ("Local mode" in the prototype's reference).
 //! People sign in with single-use links the hub prints, or issues over a unix socket only its
 //! own user reaches; what they do is recorded in an audit log.
 //!
-//! Experimental. A web UI on a listener of its own shows the fleet to people signed in with
-//! links the admin socket issues.
+//! Experimental. The hub steers its nodes only within what each node's own configuration
+//! allows: a concurrency ceiling, stopping and resuming acquisition, drain and quarantine —
+//! all issued over the admin socket, audited, and resent to a node until it has them. A node
+//! whose `vk` speaks only the first fleet protocol version is monitored, not steered. A web UI
+//! on a listener of its own shows the fleet to people signed in with links the admin socket
+//! issues.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -29,13 +33,14 @@ mod ui;
 mod workloads;
 
 use config::HubConfig;
+use vk_hub_proto::{Acquisition, Operation};
 
 // Match vk-registry: jemalloc under musl for a long-lived server.
 #[cfg(target_env = "musl")]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
-/// Fleet hub: node enrollment, inventory and heartbeats; and a web UI for this
+/// Fleet hub: node enrollment, inventory, heartbeats and steering; and a web UI for this
 /// machine's VMs (experimental)
 #[derive(Parser)]
 #[command(name = "vk-hub", version)]
@@ -66,7 +71,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TokenCmd,
     },
-    /// List the enrolled nodes, or remove one
+    /// List the enrolled nodes, or steer or remove one
     Nodes {
         #[command(flatten)]
         config: ConfigArg,
@@ -80,6 +85,17 @@ enum Cmd {
         /// Only this node's: its ID, or a hostname only it has
         #[arg(long, value_name = "NODE")]
         node: Option<String>,
+    },
+    /// Show the audit log: operators' actions and what nodes reported of them
+    Audit {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// Only this node's lines
+        #[arg(long, value_name = "ID")]
+        node: Option<String>,
+        /// How many of the latest lines
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
     /// Sign in to the web UI, and see or end its sessions
     Ui {
@@ -192,6 +208,47 @@ enum NodesCmd {
         /// The node's ID, as `vk-hub nodes` lists it
         id: String,
     },
+    /// Cap how many jobs the node's runner accepts, or lift the cap with `none`
+    ///
+    /// The node takes the smallest of this, its own estimate and its local ceiling; the hub
+    /// only ever lowers what the node would take.
+    Ceiling {
+        id: String,
+        /// A number of jobs, or `none`
+        #[arg(value_parser = parse_ceiling)]
+        ceiling: Ceiling,
+    },
+    /// Stop the node's runner taking new jobs; running ones finish
+    ///
+    /// Needs `[node] runner = "managed"` on the node; an external runner reports it cannot.
+    Stop { id: String },
+    /// Let the node's runner take jobs again
+    Resume { id: String },
+    /// Stop taking jobs and report `drained` once everything running has finished
+    Drain { id: String },
+    /// End a drain: back to `ready`, taking jobs
+    Undrain { id: String },
+    /// Stop taking jobs until `release`, whatever else the node is told
+    Quarantine { id: String },
+    /// End a quarantine: back to `ready`
+    Release { id: String },
+}
+
+/// `nodes ceiling`'s value: a number, or none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ceiling(Option<u32>);
+
+fn parse_ceiling(s: &str) -> Result<Ceiling, String> {
+    if s == "none" {
+        return Ok(Ceiling(None));
+    }
+    match s.parse::<u32>() {
+        Ok(n) if n > 0 => Ok(Ceiling(Some(n))),
+        _ => Err(format!(
+            "{s:?}: expected a number of jobs of at least 1, or none — stopping acquisition is \
+             `vk-hub nodes stop`"
+        )),
+    }
 }
 
 #[derive(Subcommand)]
@@ -258,7 +315,41 @@ async fn run(cli: Cli) -> Result<()> {
                     eprintln!("vk-hub: removed node {what}");
                     Ok(())
                 }
+                Some(NodesCmd::Ceiling { id, ceiling }) => {
+                    let changed =
+                        tokio::task::spawn_blocking(move || client.set_ceiling(&id, ceiling.0))
+                            .await??;
+                    report_desired(changed.as_ref());
+                    Ok(())
+                }
+                Some(NodesCmd::Stop { id }) => acquisition(client, id, Acquisition::Stop).await,
+                Some(NodesCmd::Resume { id }) => acquisition(client, id, Acquisition::Run).await,
+                Some(NodesCmd::Drain { id }) => command(client, id, Operation::Drain).await,
+                Some(NodesCmd::Undrain { id }) => command(client, id, Operation::Undrain).await,
+                Some(NodesCmd::Quarantine { id }) => {
+                    command(client, id, Operation::Quarantine).await
+                }
+                Some(NodesCmd::Release { id }) => command(client, id, Operation::Release).await,
             }
+        }
+        Cmd::Audit {
+            config,
+            node,
+            limit,
+        } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            let rows =
+                tokio::task::spawn_blocking(move || client.audit(node.as_deref(), limit)).await??;
+            for row in rows {
+                println!(
+                    "{}  {}  {}  {}",
+                    utc(row.at),
+                    row.node.as_deref().unwrap_or("-"),
+                    row.actor,
+                    row.event
+                );
+            }
+            Ok(())
         }
         Cmd::Ui { config, cmd } => {
             ui_cmd(
@@ -303,6 +394,43 @@ async fn run(cli: Cli) -> Result<()> {
             print!("{}", render_workloads(&nodes));
             Ok(())
         }
+    }
+}
+
+async fn acquisition(client: admin::Client, id: String, acquisition: Acquisition) -> Result<()> {
+    let changed =
+        tokio::task::spawn_blocking(move || client.set_acquisition(&id, acquisition)).await??;
+    report_desired(changed.as_ref());
+    Ok(())
+}
+
+async fn command(client: admin::Client, id: String, op: Operation) -> Result<()> {
+    let command = tokio::task::spawn_blocking(move || client.command(&id, op)).await??;
+    eprintln!(
+        "vk-hub: issued command {}; `vk-hub audit --node <id>` shows what the node makes of it",
+        command.id
+    );
+    Ok(())
+}
+
+/// Say what a desired-state change came to.
+fn report_desired(changed: Option<&vk_hub_proto::DesiredState>) {
+    match changed {
+        Some(d) => eprintln!(
+            "vk-hub: desired state is now generation {}: ceiling {}, acquisition {}",
+            d.generation,
+            d.ceiling
+                .map_or_else(|| "none".to_string(), |n| n.to_string()),
+            acquisition_name(d.acquisition)
+        ),
+        None => eprintln!("vk-hub: already so; nothing changed"),
+    }
+}
+
+pub(crate) fn acquisition_name(a: Acquisition) -> &'static str {
+    match a {
+        Acquisition::Run => "run",
+        Acquisition::Stop => "stop",
     }
 }
 
@@ -480,10 +608,15 @@ pub(crate) fn human_duration(d: Duration) -> String {
 }
 
 /// The columns of `vk-hub nodes`, and of the web UI's nodes table.
-pub(crate) const NODE_COLUMNS: [&str; 9] = [
+pub(crate) const NODE_COLUMNS: [&str; 14] = [
     "ID",
     "NAME",
     "REACH",
+    "STATE",
+    "ACQUIRE",
+    "CEILING",
+    "CONC",
+    "SYNC",
     "LAST SEEN",
     "VK",
     "CPUS",
@@ -492,11 +625,18 @@ pub(crate) const NODE_COLUMNS: [&str; 9] = [
     "VMS",
 ];
 
-/// One node's cells under [`NODE_COLUMNS`]: what it is.
-pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 9] {
+/// One node's cells under [`NODE_COLUMNS`]: what it is, and for what the hub steers, what it
+/// wants beside what the node last reported. A node only monitored has no steering to show.
+pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 14] {
     let gib = |mib: u64| format!("{}G", mib / 1024);
     let dash = || "-".to_string();
     let count = |n: Option<u32>| n.map_or_else(dash, |c| c.to_string());
+    let report = n.report.as_ref();
+    let concurrency = report.and_then(|r| r.concurrency);
+    let [state, acquire, ceiling, sync] = match n.protocol {
+        Some(v) if n.monitoring_only() => [format!("monitor only (v{v})"), dash(), dash(), dash()],
+        _ => steering_cells(n),
+    };
     [
         n.id.clone(),
         n.hostname.clone(),
@@ -506,6 +646,11 @@ pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 9] {
             "unreachable"
         }
         .to_string(),
+        state,
+        acquire,
+        ceiling,
+        count(concurrency.and_then(|c| c.effective)),
+        sync,
         match n.last_seen {
             Some(t) => format!("{} ago", human_duration(ago(now, t))),
             None => "never".to_string(),
@@ -522,10 +667,93 @@ pub(crate) fn node_cells(n: &ops::NodeView, now: u64) -> [String; 9] {
     ]
 }
 
-/// `vk-hub nodes`' table.
+/// A steered node's STATE, ACQUIRE, CEILING and SYNC cells. STATE is the node's; the others
+/// are the hub's side, or its defaults when it has asked nothing, with the node's beside it
+/// where they differ.
+fn steering_cells(n: &ops::NodeView) -> [String; 4] {
+    let dash = || "-".to_string();
+    let count = |n: Option<u32>| n.map_or_else(dash, |c| c.to_string());
+    let report = n.report.as_ref();
+    let (want_acquisition, want_ceiling) = n
+        .desired
+        .as_ref()
+        .map_or((Acquisition::Run, None), |d| (d.acquisition, d.ceiling));
+    let mut state = report
+        .and_then(|r| r.state)
+        .map_or_else(dash, |s| store::state_name(s).to_string());
+    if n.pending_commands > 0 {
+        state.push_str(&format!(", {} pending", n.pending_commands));
+    }
+    let mut acquire = acquisition_name(want_acquisition).to_string();
+    if let Some(r) = report
+        && let Some(theirs) = r.acquisition
+    {
+        // A runner told to stop is still taking jobs until it has exited.
+        let quitting = r.runner_state == Some(vk_hub_proto::RunnerState::Quitting);
+        if theirs != want_acquisition || quitting {
+            acquire.push_str(&format!(
+                " (node: {}{})",
+                acquisition_name(theirs),
+                if quitting { ", quitting" } else { "" }
+            ));
+        }
+    }
+    let mut ceiling = count(want_ceiling);
+    if let Some(c) = report.and_then(|r| r.concurrency)
+        && c.hub_ceiling != want_ceiling
+    {
+        ceiling.push_str(&format!(" (node: {})", count(c.hub_ceiling)));
+    }
+    let sync = match (&n.desired, report) {
+        (None, _) => dash(),
+        (Some(_), None) => "unknown".to_string(),
+        (Some(d), Some(r)) if r.applied_generation == Some(d.generation) => "ok".to_string(),
+        // A node that took a generation this hub never issued: the hub re-issues past it on
+        // the node's next report.
+        (Some(d), Some(r)) if r.applied_generation > Some(d.generation) => format!(
+            "ahead ({}>{})",
+            r.applied_generation.unwrap_or(0),
+            d.generation
+        ),
+        (Some(d), Some(r)) => format!(
+            "behind ({}<{})",
+            r.applied_generation.unwrap_or(0),
+            d.generation
+        ),
+    };
+    [state, acquire, ceiling, sync]
+}
+
+/// What a node says it cannot do: sentences, not cells.
+fn node_notes(n: &ops::NodeView) -> Vec<String> {
+    let Some(report) = &n.report else {
+        return Vec::new();
+    };
+    let mut notes: Vec<String> = report
+        .unsupported
+        .iter()
+        .map(|note| format!("{}: cannot comply: {note}", n.hostname))
+        .collect();
+    if let Some(error) = &report.concurrency_error {
+        notes.push(format!(
+            "{}: cannot set its concurrency: {error}",
+            n.hostname
+        ));
+    }
+    notes
+}
+
+/// `vk-hub nodes`' table, with each node's notes under it.
 fn render_nodes(nodes: &[ops::NodeView], now: u64) -> String {
-    let rows: Vec<[String; 9]> = nodes.iter().map(|n| node_cells(n, now)).collect();
-    table(&NODE_COLUMNS, &rows)
+    let rows: Vec<[String; 14]> = nodes.iter().map(|n| node_cells(n, now)).collect();
+    let mut out = table(&NODE_COLUMNS, &rows);
+    for n in nodes {
+        for note in node_notes(n) {
+            out.push_str(&note);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// `headers` and `rows` as columns two spaces apart, each as wide as its widest cell is on a

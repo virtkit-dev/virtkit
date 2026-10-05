@@ -91,12 +91,14 @@ struct Live {
     ending: Arc<Ending>,
 }
 
-/// How a session is told to end from outside it.
+/// External notifications to end a session or send changed desired state and commands.
 #[derive(Default)]
 pub(crate) struct Ending {
     pub(crate) notify: Notify,
     /// Set before `notify` when the node was removed rather than superseded.
     pub(crate) revoked: AtomicBool,
+    /// Notified when the node's desired state or commands changed.
+    pub(crate) kick: Notify,
 }
 
 /// A node's session state, as `vk-hub nodes` reports it.
@@ -204,6 +206,14 @@ impl Hub {
         }
         self.changed(node_id);
         (session, ending)
+    }
+
+    /// Tell `node_id`'s session, if it has one, to send what changed. A node with none gets it
+    /// when it next connects.
+    pub(crate) fn kick(&self, node_id: &str) {
+        if let Some(live) = self.lock_live().get(node_id) {
+            live.ending.kick.notify_one();
+        }
     }
 
     /// End `node_id`'s session, if it has one, as revoked. The caller has removed the node.

@@ -1,5 +1,6 @@
-//! `vk-hub token`, `vk-hub nodes`, `vk-hub ui` and `vk-hub local login`, `sessions` and
-//! `logout` reach the running hub through a unix socket in its data directory.
+//! `vk-hub token`, `vk-hub nodes`, `vk-hub workloads`, `vk-hub audit`, `vk-hub ui` and
+//! `vk-hub local login`, `sessions` and `logout` reach the running hub through a unix socket
+//! in its data directory.
 //!
 //! Enrollment tokens admit machines to the fleet and must be issued outside the node-facing
 //! network; sign-in links must be issued outside the web UI. The CLI cannot open the database:
@@ -26,12 +27,13 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::ops::{self, NodeView};
 use crate::server::Hub;
-use crate::store::{Role, UiSession};
+use crate::store::{AuditRow, Role, UiSession};
+use vk_hub_proto::{Acquisition, Command, DesiredState, Operation};
 
 /// Bumped only for a change an older peer could misread.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// Ceiling on a request: the largest is a few dozen bytes.
+/// Ceiling on a request: the largest is a hundred bytes or so.
 const MAX_REQUEST: u64 = 64 * 1024;
 
 /// Ceiling on a reply, for the client: a runaway guard, sized for a listing of a fleet far
@@ -58,6 +60,24 @@ enum Call {
     },
     RemoveNode {
         id: String,
+    },
+    /// `None` lifts the ceiling.
+    SetCeiling {
+        id: String,
+        ceiling: Option<u32>,
+    },
+    SetAcquisition {
+        id: String,
+        acquisition: Acquisition,
+    },
+    Command {
+        id: String,
+        operation: Operation,
+    },
+    /// The latest `limit` audit lines, of one node or of all.
+    Audit {
+        node: Option<String>,
+        limit: usize,
     },
     UiLogin {
         role: Role,
@@ -238,6 +258,16 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
         Call::Workloads { node } => {
             serde_json::to_value(ops::workloads(hub, node.as_deref(), MAX_REPLY_VALUE)?)?
         }
+        Call::SetCeiling { id, ceiling } => {
+            serde_json::to_value(ops::set_ceiling(hub, &actor, &id, ceiling)?)?
+        }
+        Call::SetAcquisition { id, acquisition } => {
+            serde_json::to_value(ops::set_acquisition(hub, &actor, &id, acquisition)?)?
+        }
+        Call::Command { id, operation } => {
+            serde_json::to_value(ops::command(hub, &actor, &id, operation)?)?
+        }
+        Call::Audit { node, limit } => serde_json::to_value(audit(hub, node.as_deref(), limit)?)?,
         Call::UiLogin { role, ttl_secs } => {
             let Some(base) = &hub.ui_url else {
                 bail!("the web UI is off; set ui_addr in the hub's config to turn it on");
@@ -287,6 +317,25 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
     Ok(value)
 }
 
+/// The latest `limit` audit lines, of `node` or of all, oldest first: as many of them as fit
+/// the reply, since a line can carry what a node reported at length.
+fn audit(hub: &Hub, node: Option<&str>, limit: usize) -> Result<Vec<AuditRow>> {
+    let mut bytes = 0usize;
+    let mut rows: Vec<AuditRow> = hub
+        .db
+        .audit_page(node, None, limit)?
+        .into_iter()
+        .map(|(_, row)| row)
+        .take_while(|row| {
+            let size = serde_json::to_vec(row).map_or(usize::MAX, |j| j.len().saturating_add(1));
+            bytes = bytes.saturating_add(size);
+            bytes <= MAX_REPLY_VALUE
+        })
+        .collect();
+    rows.reverse();
+    Ok(rows)
+}
+
 /// The running hub, reached over its admin socket. One short connection per call.
 pub struct Client {
     path: PathBuf,
@@ -321,6 +370,41 @@ impl Client {
     /// Whether there was such a node to remove.
     pub fn remove_node(&self, id: &str) -> Result<bool> {
         self.call(Call::RemoveNode { id: id.to_string() })
+    }
+
+    /// The new desired state, or `None` when it was already so.
+    pub fn set_ceiling(&self, id: &str, ceiling: Option<u32>) -> Result<Option<DesiredState>> {
+        self.call(Call::SetCeiling {
+            id: id.to_string(),
+            ceiling,
+        })
+    }
+
+    /// The new desired state, or `None` when it was already so.
+    pub fn set_acquisition(
+        &self,
+        id: &str,
+        acquisition: Acquisition,
+    ) -> Result<Option<DesiredState>> {
+        self.call(Call::SetAcquisition {
+            id: id.to_string(),
+            acquisition,
+        })
+    }
+
+    pub fn command(&self, id: &str, operation: Operation) -> Result<Command> {
+        self.call(Call::Command {
+            id: id.to_string(),
+            operation,
+        })
+    }
+
+    /// Oldest first.
+    pub fn audit(&self, node: Option<&str>, limit: usize) -> Result<Vec<AuditRow>> {
+        self.call(Call::Audit {
+            node: node.map(str::to_string),
+            limit,
+        })
     }
 
     pub fn ui_login(&self, role: Role, ttl: Duration) -> Result<LoginLink> {
@@ -475,6 +559,52 @@ mod tests {
         assert!(format!("{err:#}").contains("v99"), "{err:#}");
         let err = dispatch(br#"{"v":1,"call":{"op":"format-disks"}}"#, &hub, 0).unwrap_err();
         assert!(format!("{err:#}").contains("older"), "{err:#}");
+    }
+
+    #[test]
+    fn steering_calls_are_served_and_a_zero_ceiling_refused() {
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+        let (token, _) = hub
+            .db
+            .create_token(Duration::from_secs(60), "uid 0", 0)
+            .unwrap();
+        let crate::store::Enrollment::Enrolled { node_id: id } =
+            hub.db.enroll(&token, "aa", "h", "peer p", 1).unwrap()
+        else {
+            panic!("expected an enrollment");
+        };
+        let call =
+            |call: String| dispatch(format!(r#"{{"v":1,"call":{call}}}"#).as_bytes(), &hub, 7);
+        let err = call(format!(r#"{{"op":"set-ceiling","id":"{id}","ceiling":0}}"#)).unwrap_err();
+        assert!(format!("{err:#}").contains("stop acquisition"), "{err:#}");
+        let set: Option<DesiredState> = serde_json::from_value(
+            call(format!(
+                r#"{{"op":"set-acquisition","id":"{id}","acquisition":"stop"}}"#
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(set.map(|d| d.generation), Some(1));
+        let issued: Command = serde_json::from_value(
+            call(format!(
+                r#"{{"op":"command","id":"{id}","operation":{{"kind":"drain"}}}}"#
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(issued.op, Operation::Drain);
+        let lines: Vec<AuditRow> = serde_json::from_value(
+            call(format!(r#"{{"op":"audit","node":"{id}","limit":2}}"#)).unwrap(),
+        )
+        .unwrap();
+        let events: Vec<&str> = lines.iter().map(|r| r.event.as_str()).collect();
+        assert_eq!(
+            events,
+            [
+                "uid 7 stopped acquisition (generation 1)",
+                &format!("uid 7 issued drain (command {})", issued.id)
+            ]
+        );
     }
 
     #[test]

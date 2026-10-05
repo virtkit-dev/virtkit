@@ -589,6 +589,158 @@ async fn an_ack_in_a_version_1_session_is_a_protocol_error() {
     closed(&mut ws, Duration::from_secs(5)).await;
 }
 
+/// A report of `applied`, as a version-2 node sends it.
+fn applied(applied: Option<u64>) -> NodeMsg {
+    NodeMsg::Report(vk_hub_proto::Report {
+        applied_generation: applied,
+        state: Some(vk_hub_proto::NodeState::Ready),
+        ..vk_hub_proto::Report::default()
+    })
+}
+
+/// Desired state goes to a node that reports itself behind, a change made while it is
+/// connected at once, and pending commands on every session until the node reports them
+/// finished; the node's acks are answered, recorded and audited.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lagging_node_gets_desired_state_and_commands_until_they_are_done() {
+    use vk_hub_proto::{Acquisition, CommandAck, Operation, Outcome};
+    let (addr, hub) = start().await;
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    // Accepted before the node's first session: it has not said it cannot take them.
+    let desired = ops::set_ceiling(&hub, "uid 0", &node_id, Some(3))
+        .unwrap()
+        .unwrap();
+    let drain = ops::command(&hub, "uid 0", &node_id, Operation::Drain).unwrap();
+
+    let mut ws = dial(addr).await;
+    assert!(matches!(
+        open(&mut ws, &node_id, &"0d".repeat(16), &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    send(&mut ws, &applied(None)).await;
+    assert_eq!(receive(&mut ws).await, HubMsg::Desired(desired.clone()));
+    assert_eq!(receive(&mut ws).await, HubMsg::Command(drain.clone()));
+    let accepted = CommandAck {
+        id: drain.id.clone(),
+        outcome: Outcome::Accepted,
+    };
+    send(&mut ws, &NodeMsg::Ack(accepted.clone())).await;
+    assert_eq!(receive(&mut ws).await, HubMsg::Recorded(accepted));
+    // A change while connected is sent at once, the drain not again.
+    ops::set_acquisition(&hub, "uid 0", &node_id, Acquisition::Stop).unwrap();
+    let HubMsg::Desired(second) = receive(&mut ws).await else {
+        panic!("expected desired state");
+    };
+    assert_eq!(
+        (second.generation, second.ceiling, second.acquisition),
+        (2, Some(3), Acquisition::Stop)
+    );
+    // Acked unknown commands are answered all the same, or the node would repeat them.
+    let stray = CommandAck {
+        id: "ee".repeat(16),
+        outcome: Outcome::Done,
+    };
+    send(&mut ws, &NodeMsg::Ack(stray.clone())).await;
+    assert_eq!(receive(&mut ws).await, HubMsg::Recorded(stray));
+    ws.close(None).await.unwrap();
+
+    // Reconnected still behind, with the drain under way: both again.
+    let mut ws = dial(addr).await;
+    open(&mut ws, &node_id, &"0d".repeat(16), &key).await;
+    send(&mut ws, &applied(Some(1))).await;
+    assert_eq!(receive(&mut ws).await, HubMsg::Desired(second));
+    assert_eq!(receive(&mut ws).await, HubMsg::Command(drain.clone()));
+    let done = CommandAck {
+        id: drain.id.clone(),
+        outcome: Outcome::Done,
+    };
+    send(&mut ws, &NodeMsg::Ack(done.clone())).await;
+    assert_eq!(receive(&mut ws).await, HubMsg::Recorded(done));
+    assert!(
+        hub.db
+            .pending_commands(&node_id, now_secs())
+            .unwrap()
+            .is_empty()
+    );
+    // Caught up, the node is sent nothing more.
+    send(&mut ws, &applied(Some(2))).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1500), receive(&mut ws))
+            .await
+            .is_err()
+    );
+    let events: Vec<String> = hub
+        .db
+        .audits(Some(&node_id), 100)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .collect();
+    assert!(
+        events.iter().any(|e| e.ends_with("(drain): done")),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|e| e == "state ready"), "{events:?}");
+}
+
+/// A node on version 1 is never sent desired state or a command, even with both waiting for
+/// it; once it has connected so, the hub refuses to steer it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_1_node_is_monitored_and_never_steered() {
+    use vk_hub_proto::Operation;
+    let (addr, hub) = start().await;
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    ops::set_ceiling(&hub, "uid 0", &node_id, Some(3)).unwrap();
+    ops::command(&hub, "uid 0", &node_id, Operation::Quarantine).unwrap();
+
+    let mut ws = dial(addr).await;
+    let twist = Twist {
+        versions: Some(V1),
+        ..Twist::default()
+    };
+    assert!(matches!(
+        open_with(&mut ws, &node_id, &"25".repeat(16), &key, twist).await,
+        HubMsg::Welcome { .. }
+    ));
+    send(&mut ws, &applied(None)).await;
+    // A change while connected is no more sent than what waited.
+    let err = ops::set_ceiling(&hub, "uid 0", &node_id, Some(4)).unwrap_err();
+    assert!(format!("{err:#}").contains("monitor"), "{err:#}");
+    let err = ops::command(&hub, "uid 0", &node_id, Operation::Release).unwrap_err();
+    assert!(format!("{err:#}").contains("update its vk"), "{err:#}");
+    hub.kick(&node_id);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1500), receive(&mut ws))
+            .await
+            .is_err()
+    );
+    let view = ops::node_views(&hub).unwrap().remove(0);
+    assert!(view.monitoring_only());
+    assert_eq!(view.protocol, Some(1));
+}
+
+/// A node that applied a generation past the hub's — the hub restored from a backup — is
+/// sent the desired state as the generation after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_ahead_of_a_restored_hub_is_sent_the_next_generation() {
+    let (addr, hub) = start().await;
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    ops::set_ceiling(&hub, "uid 0", &node_id, Some(5)).unwrap();
+    let mut ws = dial(addr).await;
+    assert!(matches!(
+        open(&mut ws, &node_id, &"26".repeat(16), &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    send(&mut ws, &applied(Some(7))).await;
+    let HubMsg::Desired(desired) = receive(&mut ws).await else {
+        panic!("expected desired state");
+    };
+    assert_eq!((desired.generation, desired.ceiling), (8, Some(5)));
+}
+
 /// Heartbeats and inventories faster than the hub asked for still end with the latest of
 /// each stored.
 #[tokio::test(flavor = "multi_thread")]
@@ -911,18 +1063,41 @@ fn random_bytes_are_as_many_as_asked() {
 }
 
 #[test]
-fn the_nodes_table_lines_up_and_marks_what_is_unknown() {
+fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
+    use vk_hub_proto::{Acquisition, Concurrency, DesiredState, NodeState, Report};
     let nodes = [
         ops::NodeView {
             id: "a".repeat(32),
             hostname: "ci-1".into(),
             connected: true,
             last_seen: Some(995),
-            vk: Some("0.80.0".into()),
+            vk: Some("0.84.0".into()),
             cpus: Some(64),
             mem_total_mib: Some(512 * 1024),
             committed_mib: Some(8 * 1024),
             budget_mib: Some(400 * 1024),
+            protocol: Some(vk_hub_proto::STEERING),
+            desired: Some(DesiredState {
+                generation: 3,
+                ceiling: Some(4),
+                acquisition: Acquisition::Stop,
+            }),
+            report: Some(Report {
+                applied_generation: Some(2),
+                state: Some(NodeState::Draining),
+                acquisition: Some(Acquisition::Run),
+                concurrency: Some(Concurrency {
+                    estimate: Some(9),
+                    hub_ceiling: Some(6),
+                    local_ceiling: None,
+                    effective: Some(6),
+                }),
+                runner_state: Some(vk_hub_proto::RunnerState::Quitting),
+                unsupported: vec!["stopping acquisition: external".into()],
+                concurrency_error: Some("bad mem".into()),
+                ..Report::default()
+            }),
+            pending_commands: 1,
             ..ops::NodeView::default()
         },
         ops::NodeView {
@@ -930,25 +1105,72 @@ fn the_nodes_table_lines_up_and_marks_what_is_unknown() {
             hostname: "ci-2".into(),
             ..ops::NodeView::default()
         },
+        // On version 1, whatever the hub once asked of it.
+        ops::NodeView {
+            id: "c".repeat(32),
+            hostname: "ci-3".into(),
+            protocol: Some(1),
+            desired: Some(DesiredState {
+                generation: 1,
+                ceiling: Some(2),
+                acquisition: Acquisition::Run,
+            }),
+            report: Some(Report::default()),
+            ..ops::NodeView::default()
+        },
     ];
     let table = render_nodes(&nodes, 1000);
     let lines: Vec<&str> = table.lines().collect();
-    assert_eq!(lines.len(), 3, "{table}");
-    let (header, a, b) = (lines[0], lines[1], lines[2]);
+    assert_eq!(lines.len(), 6, "{table}");
+    assert_eq!(
+        lines[4],
+        "ci-1: cannot comply: stopping acquisition: external"
+    );
+    assert_eq!(lines[5], "ci-1: cannot set its concurrency: bad mem");
+    let (header, a, b, c) = (lines[0], lines[1], lines[2], lines[3]);
     assert!(header.starts_with("ID "));
     for (column, want) in [
         ("NAME", "ci-1"),
         ("REACH", "connected"),
+        ("STATE", "draining, 1 pending"),
+        ("ACQUIRE", "stop (node: run, quitting)"),
+        ("CEILING", "4 (node: 6)"),
+        ("CONC", "6"),
+        ("SYNC", "behind (2<3)"),
         ("LAST SEEN", "5s ago"),
         ("ADMITTED", "8G/400G"),
         ("VMS", "-"),
     ] {
         assert_eq!(cell(header, a, column), want, "{column}\n{table}");
     }
-    for (column, want) in [("REACH", "unreachable"), ("LAST SEEN", "never")] {
+    for (column, want) in [
+        ("REACH", "unreachable"),
+        ("STATE", "-"),
+        ("ACQUIRE", "run"),
+        ("CEILING", "-"),
+        ("SYNC", "-"),
+        ("LAST SEEN", "never"),
+    ] {
         assert_eq!(cell(header, b, column), want, "{column}\n{table}");
     }
+    for (column, want) in [
+        ("STATE", "monitor only (v1)"),
+        ("ACQUIRE", "-"),
+        ("CEILING", "-"),
+        ("SYNC", "-"),
+    ] {
+        assert_eq!(cell(header, c, column), want, "{column}\n{table}");
+    }
     assert_eq!(ago(10_000, 10_000 - 7300), Duration::from_secs(7200));
+}
+
+#[test]
+fn a_ceiling_is_a_positive_number_or_none() {
+    assert_eq!(parse_ceiling("none"), Ok(Ceiling(None)));
+    assert_eq!(parse_ceiling("3"), Ok(Ceiling(Some(3))));
+    let err = parse_ceiling("0").unwrap_err();
+    assert!(err.contains("vk-hub nodes stop"), "{err}");
+    assert!(parse_ceiling("-1").is_err());
 }
 
 /// `vk-hub workloads`: each node's VMs under its name, what each belongs to in words, the

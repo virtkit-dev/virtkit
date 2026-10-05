@@ -23,6 +23,14 @@ All notable changes to virtkit will be documented in this file.
   once the old one has exited. A runner left behind by a `vk node run` that was killed is
   picked up rather than started twice. Under systemd, run the node with `KillMode=mixed`, so
   stopping the unit lets jobs finish. An external runner refuses a drain and a quarantine.
+- **Experimental: `vk-hub` steers its hosts.** `vk-hub nodes ceiling <id> <n|none>` caps how
+  many jobs a host's runner accepts, `nodes stop` and `resume` stop and resume job acquisition,
+  `nodes drain` and `undrain` empty a host and bring it back, and `nodes quarantine`
+  keeps a host out of work until `nodes release`. A host that is offline gets what changed
+  when it reconnects. `vk-hub nodes` shows what the hub asked beside what each host reports,
+  which hosts have not caught up, and what a host says it cannot do; `vk-hub audit` lists
+  every operator action and what the hosts made of it. Hosts still on 0.84.0 or earlier are
+  monitored only: the hub refuses to steer them until their `vk` is updated.
 - **`vk tune` stands aside on a fleet node** while `vk node run` is up, and otherwise honours
   the ceiling the node last received.
 

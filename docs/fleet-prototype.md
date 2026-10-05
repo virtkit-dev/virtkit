@@ -15,17 +15,19 @@ The prototype provides, all experimentally:
 - on the node, desired state and a command journal kept across restarts, the runner's
   concurrency set within the hub's ceiling, and drain and quarantine of a gitlab-runner the
   node runs itself (`[node] runner = "managed"`);
+- on the hub, that desired state (a ceiling, stopping acquisition) and those commands, sent
+  to each node and shown beside what it reports (`vk-hub nodes ceiling`, `stop`, `resume`,
+  `drain`, `undrain`, `quarantine`, `release`), and the audit log (`vk-hub audit`);
 - `vk-hub workloads`: each node's VMs;
 - live nodes and node detail pages, and an audit log, with sign-in links from
   `vk-hub ui login`.
 
-The hub observes nodes but does not control them: it sends no desired state or command, so
-none of what the node carries out can be asked for yet. Releases, updates, rollouts, resets,
-restart and redeploy are not built.
+Steering is on the admin socket only: the web UI shows it and does not act on it. Releases,
+updates, rollouts, resets, restart and redeploy are not built.
 
 | Capability | Current prototype | Proposed gate |
 |---|---|---|
-| Hub recovery | Not built: the hub keeps no desired state | [Preserve node restrictions and resolve the recovery conflict explicitly](fleet-design.md#proposed-recovery-after-a-hub-restore) |
+| Hub recovery | Reissues its stored desired state above a newer node generation | [Preserve node restrictions and resolve the recovery conflict explicitly](fleet-design.md#proposed-recovery-after-a-hub-restore) |
 | Update validation | Not built | [A pinned boot/exec/network/cleanup workload required for unattended rollouts](fleet-design.md#updates) |
 | Canary promotion | Not built | [Representative workload success and an observation window](fleet-design.md#updates) |
 | Release trust | Not built | [Pinned keys required for remote updates; explicit development opt-out](fleet-design.md#updates) |
@@ -60,9 +62,9 @@ a node are recorded in the audit log.
 `127.0.0.1:8443`), `tls_cert` and `tls_key`, `data_dir` (default `$XDG_DATA_HOME/virtkit/hub`,
 else `~/.local/share/virtkit/hub`), and the web UI's keys (see [Web UI](#web-ui)). Every key
 is optional and an unknown one is an error. Without TLS the hub serves only on loopback. TLS is
-1.3 only, on both the hub and the node. `vk-hub token`, `vk-hub nodes`, `vk-hub workloads` and
-`vk-hub ui` reach the running hub through `<data_dir>/admin.sock`, open to the hub's user and
-root.
+1.3 only, on both the hub and the node. `vk-hub token`, `vk-hub nodes`, `vk-hub workloads`,
+`vk-hub audit` and `vk-hub ui` reach the running hub through `<data_dir>/admin.sock`, open to
+the hub's user and root.
 
 `vk node run` holds a WebSocket session at `/v1/node` in the foreground. The node signs the
 hub's challenge, its node ID and incarnation (new on every `vk node run`), both version ranges,
@@ -76,8 +78,8 @@ pass TLS through: terminating it breaks the binding, and the hub refuses the sig
 From 0.83.0, hubs and nodes of different releases interoperate: protocol version 1 and
 enrollment at `/v1/` are frozen, though the fleet remains experimental. Version 2 adds
 steering — desired state, commands, their acks, and the node's state on its report. A hub
-serves a version-1 node for monitoring only; a node whose hub speaks only version 1 runs on its
-local policy alone.
+serves a version-1 node for monitoring only (see [Steering](#steering)); a node whose hub
+speaks only version 1 runs on its local policy alone.
 
 The hub admits at most 256 connections that have not authenticated, each step of which (TLS,
 request headers, an enrollment body, a handshake message) has 10 seconds. One past that is
@@ -104,7 +106,8 @@ The hub stores heartbeats and reports at most once per half heartbeat, holding b
 and storing it at the next ping. Heartbeats are written without an fsync, one a minute made
 durable; an inventory is made durable at most once a heartbeat. Each of an inventory's lists
 (filesystems, memory nodes, checks, runner names) is cut to 64 entries. `vk-hub nodes` lists
-ID, NAME, REACH, LAST SEEN, VK, CPUS, RAM, ADMITTED and VMS.
+ID, NAME, REACH, STATE, ACQUIRE, CEILING, CONC, SYNC, LAST SEEN, VK, CPUS, RAM, ADMITTED and
+VMS.
 
 The node redials a lost session with a backoff doubling from 1 to 60 seconds, plus up to a
 quarter of jitter, reset by a session that lasted a minute. Superseded three times in a row, it
@@ -116,6 +119,50 @@ or with a managed runner sends it SIGTERM, abandoning the jobs, and exits once i
 third exits at once. `vk node run` exits 75 while another `vk node` holds
 `<state_dir>/node/lock`, and refuses to start unless `<state_dir>/node/` belongs to its user and
 is closed to everyone else.
+
+## Steering
+
+`vk-hub nodes ceiling <id> <n|none>` caps a node's runner concurrency, and `vk-hub nodes stop`
+and `resume` stop and resume its acquisition: the node's desired state, kept on the hub with a
+generation that moves on every change, to one past both the hub's last and the one the node
+last reported applying. A ceiling of 0 is refused: gitlab-runner has none, and stopping
+acquisition is what it would mean. `vk-hub nodes drain`, `undrain`, `quarantine` and `release`
+issue a command, valid for a day. All of them go through the admin socket and are audited as
+`uid <n>`, the caller's.
+
+A session sends desired state once the node's report shows an older generation, once per
+generation, and each command without a final outcome once per session; nothing goes before the
+node's first report. A change made while the node is connected goes out at once, and one made
+while it is not on its next session. Each ack is answered `recorded`, even for a command the
+hub does not know, which the node would otherwise repeat for ever; a new outcome is recorded
+and audited. A final outcome is never replaced, so a late `accepted` cannot reopen a finished
+command. A command the node never took is not sent past its expiry. Settled commands are kept
+30 days, and go with their node when it is removed.
+
+A node that reports a generation past the hub's — the hub restored from a backup, say — has the
+hub's desired state, or the defaults (no ceiling, acquisition running), re-issued as the
+generation after the node's, and the re-issue audited. This orders messages; it does not
+reconcile intent (see [recovery after a hub restore](fleet-design.md#proposed-recovery-after-a-hub-restore)).
+
+Steering takes protocol version 2. A node whose latest session ran version 1 — a `vk` of
+0.83.0 or 0.84.0 — is monitored only: the hub refuses to change its desired state or issue it
+a command, saying to update its `vk`, and `vk-hub nodes` shows it as `monitor only (v1)`. A
+node that has not connected yet is steered on trust; if it then connects at version 1, it is
+sent nothing, and its commands expire unanswered.
+
+`vk-hub nodes` shows what the hub asked beside what the node reports. STATE is the node's own,
+with how many commands are pending. ACQUIRE and CEILING are the hub's, with the node's in
+brackets where they differ, and `quitting` while a stopped runner finishes its jobs. CONC is
+the concurrency the node set. SYNC compares the generation the node applied with the hub's:
+`ok`, `behind (2<3)` or `ahead (4>3)`, `unknown` before the node's report, and `-` while the
+hub has asked nothing. Under the table, a line says each thing a node cannot carry out
+(`cannot comply: …`) and why it cannot set its concurrency.
+
+`vk-hub audit [--node ID] [--limit 50]` prints the latest audit lines, oldest first — time,
+node, actor, event: operator actions, with the generation or command each made, and what
+nodes report of them — a new state, a newly applied generation, each command's outcome, what a
+node cannot carry out. Each line is written in the transaction of the change it records. The
+log keeps the latest 100,000 lines.
 
 ## Node state and commands
 
