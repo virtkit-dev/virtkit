@@ -267,3 +267,8 @@ skip staging when nothing is staged ahead of them.
 Covered by `virtio::net::device::tests`, `virtio::net::worker::unix::tests` (their interrupt
 checks now count through a test `InterruptHandler`, upstream having dropped the status word),
 `virtio::queue::tests` and the socket-pair tests in `unixstream::unix`.
+
+`src/devices/src/virtio/net/worker/unix.rs` — a TX chain holding no more than the virtio-net
+header (short, or all write-only) is returned used without a frame. Upstream and the 1.19
+tree handed it to the backend, whose `write_frame` asserts on it, so a guest could panic the
+net worker. Covered by `a_header_only_transmit_chain_is_returned_without_a_frame`.

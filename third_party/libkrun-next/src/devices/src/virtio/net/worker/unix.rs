@@ -382,6 +382,17 @@ impl NetWorker {
                 }
             }
 
+            // A chain holding no more than the virtio-net header (all write-only, or just
+            // short) carries no frame: return it used rather than let the backend assert on
+            // it and take the worker down.
+            if read_count <= VNET_HDR_LEN {
+                tx_queue
+                    .add_used(&self.mem, head_index, 0)
+                    .map_err(TxError::QueueError)?;
+                raise_irq = true;
+                continue;
+            }
+
             match self
                 .backend
                 .write_frame(VNET_HDR_LEN, &mut self.tx_frame_buf[..read_count])
@@ -782,6 +793,33 @@ mod tests {
         worker.rx_frame_buf_len = frame.len();
         worker.rx_has_deferred_frame = true;
         (worker, peer, irqs)
+    }
+
+    #[test]
+    fn a_header_only_transmit_chain_is_returned_without_a_frame() {
+        use std::io::Read;
+
+        let mem = &GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        let vq = VirtQueue::new(GuestAddress(0), mem, QSIZE);
+        let (mut worker, mut peer, irqs) = worker(mem, &vq);
+        worker.tx_q.queue = vq.create_queue();
+        peer.set_nonblocking(true).unwrap();
+        // A chain no longer than the virtio-net header, then one that is write-only.
+        vq.dtable[0].set(BUF_BASE, VNET_HDR_LEN as u32, 0, 0);
+        vq.dtable[1].set(BUF_BASE, 64, VIRTQ_DESC_F_WRITE, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.ring[1].set(1);
+        vq.avail.idx.set(2);
+
+        worker.process_tx_loop();
+        assert_eq!(vq.used.idx.get(), 2);
+        assert_ne!(irqs.0.load(Ordering::SeqCst), 0);
+        let mut wire = Vec::new();
+        assert_eq!(
+            peer.read_to_end(&mut wire).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(wire.is_empty());
     }
 
     #[test]
