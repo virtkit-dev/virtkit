@@ -158,6 +158,10 @@ impl Drop for DiskMmap {
 /// aligns to whole clusters.
 const DIRTY_CLUSTER: u64 = 64 * 1024;
 
+/// How long the dirty-control listener waits on a connection's command byte or its reply.
+#[cfg(unix)]
+const DIRTY_CONTROL_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Guest-logical clusters mutated since the last drain, split so the virtkit build backend can
 /// capture only a checkpoint's delta instead of the whole cumulative overlay. `written` holds
 /// clusters any write, or the partial edge of a write-zeroes, touched (to read and push as
@@ -862,12 +866,24 @@ impl Block {
         })
     }
 
-    /// Bind the dirty-control socket at `socket_path`, replacing a stale one; `None` (logged)
-    /// when it cannot be bound, so the disk then tracks nothing.
+    /// Bind the dirty-control socket at `socket_path`, replacing a stale one, owner-only
+    /// (0600): a client can drain the disk's dirty set and force its flushes. The mode is set
+    /// after the bind, so the caller still has to put the socket in a private directory (vk
+    /// uses its 0700 session dir). `None` (logged) when it cannot be bound, so the disk then
+    /// tracks nothing.
     #[cfg(unix)]
     fn bind_dirty_control(socket_path: &str) -> Option<std::os::unix::net::UnixListener> {
+        use std::os::unix::fs::PermissionsExt;
+
         let _ = std::fs::remove_file(socket_path);
         std::os::unix::net::UnixListener::bind(socket_path)
+            .and_then(|l| {
+                std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+                    .inspect_err(|_| {
+                        let _ = std::fs::remove_file(socket_path);
+                    })?;
+                Ok(l)
+            })
             .inspect_err(|e| error!("virtio-blk: dirty-control bind {socket_path} failed: {e}"))
             .ok()
     }
@@ -907,6 +923,16 @@ impl Block {
                             continue;
                         }
                     };
+                    // Connections are served one at a time: a client that sends nothing, or
+                    // reads no reply, must not hold off every later drain. A drain whose reply
+                    // is lost this way loses its delta, so that caller's checkpoint fails.
+                    if let Err(e) = conn
+                        .set_read_timeout(Some(DIRTY_CONTROL_IO_TIMEOUT))
+                        .and_then(|()| conn.set_write_timeout(Some(DIRTY_CONTROL_IO_TIMEOUT)))
+                    {
+                        error!("virtio-blk: dirty-control timeout setup failed: {e}");
+                        continue;
+                    }
                     let mut cmd = [0u8; 1];
                     if conn.read_exact(&mut cmd).is_err() {
                         continue;

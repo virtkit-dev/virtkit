@@ -218,3 +218,9 @@ range does not fit the disk answers IOERR before it reaches imago or the dirty t
 1.19 tree multiplied the guest's sector unchecked, wrapping in release builds and panicking
 the worker in debug ones, and recorded writes past the end as dirty. Not yet in the 1.19
 tree.
+
+`src/devices/src/virtio/block/device.rs` — the dirty-control socket is owner-only (0600) and
+waits at most 5 s on a connection's command byte or reply, since connections are served one
+at a time. The mode is set after the bind, so the caller still puts the socket in a private
+directory. The 1.19 tree left it at the process umask and blocked on a stalled client. Not
+yet in the 1.19 tree.
