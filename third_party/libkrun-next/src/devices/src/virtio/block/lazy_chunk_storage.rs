@@ -248,12 +248,24 @@ impl LazyChunkStorage {
                 )
             })?;
             let data = match chunk.codec {
-                CODEC_ZSTD => zstd::decode_all(&raw[..]).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("zstd-decompressing chunk {}: {e}", path.display()),
-                    )
-                })?,
+                // No further than one byte past the length the header claims: a frame that
+                // inflates beyond it is refused below rather than held in memory.
+                CODEC_ZSTD => {
+                    use std::io::Read;
+                    // The largest chunk vk writes (`CDC_MAX` in vk-driver).
+                    const MAX_CHUNK: usize = 16 << 20;
+                    // Capacity hint only: capped at the largest chunk, whatever the header claims.
+                    let mut data = Vec::with_capacity((chunk.length as usize).min(MAX_CHUNK));
+                    zstd::stream::read::Decoder::new(&raw[..])
+                        .and_then(|d| d.take(u64::from(chunk.length) + 1).read_to_end(&mut data))
+                        .map_err(|e| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("zstd-decompressing chunk {}: {e}", path.display()),
+                            )
+                        })?;
+                    data
+                }
                 CODEC_RAW => raw,
                 other => {
                     return Err(io::Error::new(
@@ -885,8 +897,23 @@ mod tests {
             &[(0, 200, CODEC_ZSTD, digest)],
         );
         let storage =
-            LazyChunkStorage::parse(std::fs::File::open(&manifest).unwrap(), manifest).unwrap();
+            LazyChunkStorage::parse(std::fs::File::open(&manifest).unwrap(), manifest.clone())
+                .unwrap();
         let mut out = vec![0u8; 200];
+        let err = storage.read_range(0, &mut out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        // Manifest claims 50 bytes; the blob inflates past them to 100.
+        write_manifest(
+            &manifest,
+            50,
+            LAYOUT_FLAT,
+            &fx.dir,
+            &[(0, 50, CODEC_ZSTD, digest)],
+        );
+        let storage =
+            LazyChunkStorage::parse(std::fs::File::open(&manifest).unwrap(), manifest).unwrap();
+        let mut out = vec![0u8; 50];
         let err = storage.read_range(0, &mut out).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }

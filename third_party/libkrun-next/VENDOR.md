@@ -195,3 +195,9 @@ the batched requests behind the `RwLock`, the mmap reads of a read-only raw imag
 flush of a write-back cache on power-off, which every disk gets. Covered by
 `block::device::tests` (mmap, concurrency, backing chains), `block::device::dirty_tests` and
 `block::lazy_chunk_storage::tests`.
+
+`src/devices/src/virtio/block/lazy_chunk_storage.rs` — a chunk is zstd-decoded no further
+than one byte past the decompressed length its `.vk_ro_img` entry claims, then refused if it
+does not come to exactly that length: a frame that inflates beyond it (the chunks come from a
+registry anyone with push access fills) is no longer held whole in memory first. Forward-ported
+from the 1.19 tree. Search for `take(u64::from(chunk.length) + 1)`.
