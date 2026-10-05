@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.83.0] - 2026-10-05
+
 ### Added
 
 - **Experimental: `vk-hub`, a hub for a fleet of `vk` hosts.** `vk-hub serve --config
@@ -15,9 +17,8 @@ All notable changes to virtkit will be documented in this file.
   member of a fleet.** `vk node join https://hub --token -` enrolls the host with a `vk-hub`
   once, reading the token on stdin (or `--token-file`), and refuses while `vk check` fails
   on KVM, the VMM or the guest kernel; `--ca` pins the hub's CA. `vk node run` then reports
-  the host to the hub — hardware, the job and checkout filesystems, versions, the
-  gitlab-runner's concurrency and runner names, and a heartbeat with admission and free
-  space every few seconds — reconnects on its own whenever the hub is unreachable, and
+  the host to the hub — hardware, the job and checkout filesystems, versions and the
+  gitlab-runner's concurrency — reconnects on its own whenever the hub is unreachable, and
   exits once the hub has removed the node. `[node] jobs_speed` and `checkouts_speed`
   declare how fast those filesystems are. Hubs and nodes of different releases work
   together from this release on.
@@ -31,9 +32,8 @@ All notable changes to virtkit will be documented in this file.
   also serves live pages listing the fleet, each host's inventory and VMs, and the audit
   log. The UI needs TLS (`ui_tls_cert`/`ui_tls_key`, else the node listener's pair) unless
   `ui_addr` is loopback, and `ui_url`, the address browsers reach it at, when `ui_addr` is
-  a wildcard; `ui_url` is https, or http for a loopback host without TLS. `vk-hub ui login`
-  prints a single-use link that signs a browser in for 12 hours; `vk-hub ui sessions` and
-  `logout` list and end sessions.
+  a wildcard. `vk-hub ui login` prints a single-use link that signs a browser in for 12
+  hours; `vk-hub ui sessions` and `logout` list and end sessions.
 
 ### Changed
 
@@ -42,8 +42,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
-- `vk-registry` now announces connection closure when refusing a request with a body,
-  preventing a connection reset on the client's next request.
+- After `vk-registry` refuses a request with a body, such as an unauthorized blob upload,
+  the client's next request no longer fails with a connection reset.
 
 ## [0.82.0] - 2026-10-04
 
@@ -3482,7 +3482,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.82.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.83.0...HEAD
+[0.83.0]: https://github.com/virtkit-dev/virtkit/compare/v0.82.0...v0.83.0
 [0.82.0]: https://github.com/virtkit-dev/virtkit/compare/v0.81.0...v0.82.0
 [0.81.0]: https://github.com/virtkit-dev/virtkit/compare/v0.80.0...v0.81.0
 [0.80.0]: https://github.com/virtkit-dev/virtkit/compare/v0.79.3...v0.80.0
