@@ -31,7 +31,7 @@ The same codebase powers local compose-service VMs and a GitLab custom executor.
 
 ## Architecture
 
-A Cargo workspace (`Cargo.toml`, edition 2024) with nine crates:
+A Cargo workspace (`Cargo.toml`, edition 2024) with ten crates:
 
 - **`vk-core/`** — the shared host↔guest library: the wire protocol (`messages`,
   `framing`, `addr`, `net`, `status`, `fleetctl`), the formats both sides speak (`atop`,
@@ -67,6 +67,11 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with nine crates:
   in fleet mode: enrollment, the session's messages, protocol version negotiation, and the
   payloads each side signs or verifies. Types and pure functions only — no runtime,
   transport or crypto.
+- **`vk-oidc/`** — the OIDC relying party `vk-registry` and `vk-hub` sign people in with:
+  discovery checked against the configured issuer, the authorization URL with `state` and
+  PKCE, the code exchange and UserInfo, and the checks on an `[oidc]` table's issuer and
+  client-secret file. Each caller keeps its own routes, cookies and sessions. Its
+  `fake-idp` feature is an in-process provider for their tests.
 - **`vk-hub/`** — the hub (bin, experimental). `vk-hub serve` is the fleet hub: it enrolls
   `vk node`s with single-use tokens, pins each node's ed25519 key, holds their WebSocket
   sessions and keeps their inventory and heartbeats in a redb database, along with the

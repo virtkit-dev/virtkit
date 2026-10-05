@@ -1,0 +1,35 @@
+[package]
+name = "vk-oidc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# The OIDC relying party `vk-registry` and `vk-hub` sign people in with: discovery, the
+# authorization URL, and the code exchange. Each caller keeps its own routes, cookies and
+# sessions.
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+# `fake-idp`: an in-process provider for callers' tests
+bytes = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+
+[features]
+fake-idp = ["dep:bytes", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "tokio/net", "tokio/rt"]
+
+# The fake provider is also built for this crate's own tests.
+[dev-dependencies]
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }

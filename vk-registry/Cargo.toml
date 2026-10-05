@@ -39,6 +39,8 @@ zstd.workspace = true
 libc.workspace = true
 # Private admin-socket binding, shared with vk-core.
 vk-fs = { path = "../vk-fs" }
+# the OIDC relying party, shared with vk-hub
+vk-oidc = { path = "../vk-oidc" }
 futures.workspace = true
 redb.workspace = true
 rand.workspace = true

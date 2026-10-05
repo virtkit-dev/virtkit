@@ -1,72 +1,24 @@
-//! OIDC login: `/login`, `/auth/callback`, `/logout`. Hand-rolled against the
-//! Authorization Code flow with PKCE (no OIDC crate) — deliberately, not for lack of
-//! one: it keeps this on the same TLS backend (`reqwest` + rustls) the rest of the crate
-//! already links, instead of risking a second TLS stack (openssl/aws-lc-rs) pulled in by
-//! an OIDC crate's own HTTP-client feature flags (see `Cargo.toml`'s comments on
-//! `reqwest`/`rustls`), and the flow is short: discover, redirect, exchange a code for a
-//! token, call UserInfo for claims.
+//! OIDC routes `/login`, `/auth/callback` and `/logout`, backed by `vk-oidc`.
+//! See that crate's documentation for the flow's security assumptions. This module owns
+//! the registry's routes, sessions, landing pages and login-state cookie, which binds a
+//! login to the browser that started it.
 //!
-//! What the flow does and does not rely on:
-//!
-//! - **`state` is bound to the browser.** `/login` stores it in an `HttpOnly`
-//!   `__Host-`-prefixed cookie *and* server-side; the callback requires both to agree.
-//!   The prefix is what makes the cookie unwritable by a sibling or parent host, so a
-//!   neighbour on the same registrable domain cannot *toss* a state of its own in and
-//!   defeat the binding; it is dropped only on the loopback-plaintext deployment, where
-//!   the prefix's mandatory `Secure` is impossible (see [`login_cookie`]). The
-//!   server-side entry alone would only prove "some login started on this server
-//!   recently", which lets an attacker who completes a login at the provider hand the
-//!   victim a callback URL and log the victim in *as the attacker*. Single-use and a TTL
-//!   are replay protection; the cookie is what makes it CSRF protection.
-//! - **PKCE (S256) is sent even though this is a confidential client.** The client secret
-//!   protects the exchange, but not against code *injection*: a code that leaks (a
-//!   provider-side open redirect, a `Referer`, a proxy log) is otherwise redeemable
-//!   against a victim's callback. RFC 9700 asks for PKCE here for that reason.
-//! - **The id_token's JWT is not parsed or verified, and does not need to be.** Claims
-//!   come from UserInfo over a bearer token this server obtained itself, in a TLS
-//!   request authenticated with the `client_secret`; the identity namespace is the
-//!   *configured* issuer, never one the provider asserts. What id_token verification
-//!   would add — binding the token to this client and this nonce — PKCE plus the
-//!   cookie-bound state already cover for the code path.
-//! - **The provider's discovery document is checked against the configured issuer**, and
-//!   the issuer must be `https` unless it is loopback: every endpoint below is taken from
-//!   that document, so an attacker who can substitute it chooses who logs in.
-//!
-//! One browser runs one login at a time: the state cookie has a single name, so starting
-//! a second login abandons the first, and that first tab has to start over.
+//! That cookie is `__Host-`-prefixed, so no sibling or parent host can toss a `state` of its
+//! own in; the prefix is dropped only on the loopback-plaintext deployment, where its
+//! mandatory `Secure` is impossible (see [`login_cookie`]).
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use bytes::Bytes;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
-use sha2::{Digest, Sha256};
+use vk_oidc::loggable;
 
 use crate::accounts::EmailUpdate;
 use crate::html;
 use crate::{Body, body_of};
-use crate::{ServerState, accounts, percent_encode, query_param};
-
-/// How long an in-flight login (redirected to the provider, not yet back) stays valid.
-/// Generous next to a human's login time, tight next to a session's lifetime.
-const LOGIN_TTL: Duration = Duration::from_secs(5 * 60);
-
-/// Ceiling on in-flight logins. `/login` is necessarily unauthenticated, so without a
-/// cap anyone who can reach the port can grow this map for [`LOGIN_TTL`] at will. At the
-/// cap the oldest entries are evicted rather than the new login refused — refusing would
-/// let one flood close sign-in for everybody, including the admin who would fix it.
-const MAX_PENDING_LOGINS: usize = 4096;
-
-/// Cap on a document read from the provider. A discovery or UserInfo document is a few
-/// KiB; anything near this is a provider trying to exhaust us.
-const MAX_IDP_BODY: usize = 256 * 1024;
-
-/// Cap on a provider- or query-supplied string reproduced in a log line. Claims are
-/// bounded where they enter the store instead (`accounts::clamp_claim`).
-const MAX_LOG_FIELD_LEN: usize = 256;
+use crate::{ServerState, accounts, query_param};
 
 /// Cap on a form POSTed to one of these routes. The only field is a CSRF token.
 const MAX_FORM_BODY: usize = 4 * 1024;
@@ -93,380 +45,44 @@ pub struct OidcConfig {
     pub(crate) public_url: String,
 }
 
-/// The provider as this flow needs it: an HTTP client and the endpoints its discovery
-/// document names. Built together, on the first login — see [`OidcClient::provider`].
-struct Provider {
-    http: reqwest::Client,
-    endpoints: Discovered,
-}
-
-/// What `{issuer}/.well-known/openid-configuration` states, the fields this flow needs.
-struct Discovered {
-    authorization_endpoint: String,
-    token_endpoint: String,
-    userinfo_endpoint: String,
-    /// RP-initiated logout target, if the provider advertises one (not all do).
-    end_session_endpoint: Option<String>,
-    /// True if the provider advertises `client_secret_basic` (the OIDC default) — some
-    /// are registered for it exclusively and reject a secret in the body.
-    secret_in_header: bool,
-}
-
-struct PendingLogin {
-    /// where to send the browser back once login completes — always a `/browse` path,
-    /// because [`OidcClient::login_url`] is the only thing that builds this and replaces
-    /// anything [`is_safe_redirect_target`] rejects.
-    target: String,
-    /// the PKCE verifier whose S256 challenge went to the provider
-    verifier: String,
-    /// when this login stops being redeemable — [`LOGIN_TTL`] after it started. Stored as
-    /// the deadline rather than the start so there is one place the TTL is applied.
-    expires_at: Instant,
-}
-
-/// A configured provider, ready to redirect logins to and exchange codes against.
-/// Discovery is lazy and cached: a provider that is briefly unreachable must not stop the
-/// server from starting, because the `/v2/` clients that never touch OIDC depend on it.
+/// A configured provider, with the registry's callback and landing pages.
 pub struct OidcClient {
-    cfg: OidcConfig,
-    provider: tokio::sync::OnceCell<Provider>,
-    /// state → pending login. Swept opportunistically (on the next `login_url` call)
-    /// rather than by a background task — login volume is human-scale.
-    pending: Mutex<HashMap<String, PendingLogin>>,
+    inner: vk_oidc::Client,
+    public_url: String,
 }
 
 impl OidcClient {
-    /// Build the client. No network, and no tokio runtime needed: both the HTTP client
-    /// and the discovery round-trip are deferred to the first login, so `into_state` can
-    /// stay synchronous and a `vk-registry serve` whose IdP is briefly unreachable still
-    /// starts — the `/v2/` clients that never touch OIDC depend on it starting.
+    /// Build the client without network access or a tokio runtime. Discovery waits until
+    /// the first login, keeping `into_state` synchronous and letting `vk-registry serve`
+    /// start while the IdP is unreachable, so `/v2/` clients that do not use OIDC can work.
     pub fn new(cfg: OidcConfig) -> Self {
+        let public_url = cfg.public_url.trim_end_matches('/').to_string();
+        let inner = vk_oidc::Client::new(
+            vk_oidc::Config {
+                issuer: cfg.issuer,
+                client_id: cfg.client_id,
+                client_secret: cfg.client_secret,
+                redirect_uri: format!("{public_url}/auth/callback"),
+                post_logout_redirect_uri: format!("{public_url}{DEFAULT_TARGET}"),
+            },
+            vk_oidc::Landing {
+                default: DEFAULT_TARGET,
+                is_safe: is_safe_redirect_target,
+            },
+        );
         OidcClient {
-            cfg,
-            provider: tokio::sync::OnceCell::new(),
-            pending: Mutex::new(HashMap::new()),
+            inner,
+            public_url: cfg.public_url,
         }
     }
 
     pub fn issuer(&self) -> &str {
-        &self.cfg.issuer
+        self.inner.issuer()
     }
 
     pub(crate) fn public_url(&self) -> &str {
-        &self.cfg.public_url
+        &self.public_url
     }
-
-    /// The provider's HTTP client and endpoints, built once and cached. A failed attempt
-    /// is not cached, so a provider that comes back later works without a restart.
-    async fn provider(&self) -> Result<&Provider> {
-        self.provider
-            .get_or_try_init(|| async {
-                let http = reqwest::Client::builder()
-                    // A provider that accepts a connection and then says nothing must not
-                    // pin a request task, or the login route, forever.
-                    .connect_timeout(Duration::from_secs(5))
-                    .timeout(Duration::from_secs(10))
-                    // No OIDC endpoint has any business redirecting, and a 307/308 from
-                    // the token endpoint would replay the request *body* — which on the
-                    // `client_secret_post` branch carries the client secret — to whatever
-                    // host the redirect names. A redirect surfaces as an error status.
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .context("building the OIDC HTTP client")?;
-                let url = format!(
-                    "{}/.well-known/openid-configuration",
-                    self.cfg.issuer.trim_end_matches('/')
-                );
-                let doc = get_json(&http, &url, None).await?;
-                // The document defines every endpoint used below, so it has to be the
-                // one this server was configured to trust. OIDC Discovery requires this
-                // comparison for exactly that reason.
-                let stated = doc
-                    .get("issuer")
-                    .and_then(|v| v.as_str())
-                    .context("discovery document is missing \"issuer\"")?;
-                if stated.trim_end_matches('/') != self.cfg.issuer.trim_end_matches('/') {
-                    bail!(
-                        "discovery document states issuer {stated:?}, but this server is \
-                         configured for {:?}",
-                        self.cfg.issuer
-                    );
-                }
-                // Every endpoint below is fetched, or handed to a browser as a
-                // `Location`, so each has to clear the same bar the issuer did: an
-                // absolute `https` (or loopback `http`) URL with nothing in it a header
-                // would refuse. The issuer check pins the document, not what it names.
-                let field = |k: &str| -> Result<String> {
-                    let v = doc
-                        .get(k)
-                        .and_then(|v| v.as_str())
-                        .with_context(|| format!("discovery document is missing {k:?}"))?;
-                    if !is_usable_endpoint(v) {
-                        bail!("discovery document's {k:?} is not an https (or loopback) URL");
-                    }
-                    Ok(v.to_string())
-                };
-                let methods = doc
-                    .get("token_endpoint_auth_methods_supported")
-                    .and_then(|v| v.as_array());
-                let endpoints = Discovered {
-                    authorization_endpoint: field("authorization_endpoint")?,
-                    token_endpoint: field("token_endpoint")?,
-                    userinfo_endpoint: field("userinfo_endpoint")?,
-                    // Optional, and a browser is redirected to it: one that does not
-                    // clear the bar is dropped, leaving logout local-only, rather than
-                    // failing discovery and with it every login.
-                    end_session_endpoint: doc
-                        .get("end_session_endpoint")
-                        .and_then(|v| v.as_str())
-                        .filter(|v| is_usable_endpoint(v))
-                        .map(str::to_string),
-                    // `client_secret_basic` is the default a provider must support, so
-                    // prefer it and fall back to the body only when the provider says it
-                    // takes `client_secret_post` and not basic.
-                    secret_in_header: match methods {
-                        Some(m) => {
-                            let has = |name: &str| m.iter().any(|v| v.as_str() == Some(name));
-                            has("client_secret_basic") || !has("client_secret_post")
-                        }
-                        None => true,
-                    },
-                };
-                Ok(Provider { http, endpoints })
-            })
-            .await
-    }
-
-    fn redirect_uri(&self) -> String {
-        format!(
-            "{}/auth/callback",
-            self.cfg.public_url.trim_end_matches('/')
-        )
-    }
-
-    /// Start a login: mint a single-use `state` and a PKCE verifier, remember where to
-    /// land the browser afterwards, and return the provider's authorization URL together
-    /// with the `state` the caller must put in the browser's login cookie. A `target`
-    /// that is not a safe same-origin one is replaced here, not rejected — this is the
-    /// one place a `PendingLogin` is built, so it is where that invariant belongs.
-    async fn login_url(&self, target: &str) -> Result<(String, String)> {
-        let provider = self.provider().await?;
-        let state = accounts::random_token(24);
-        let verifier = accounts::random_token(32);
-        let challenge = b64url(Sha256::digest(verifier.as_bytes()).as_slice());
-        let target = if is_safe_redirect_target(target) {
-            target
-        } else {
-            DEFAULT_TARGET
-        };
-        {
-            let now = Instant::now();
-            let mut pending = self.pending.lock().unwrap();
-            pending.retain(|_, p| p.expires_at > now);
-            // Evict the soonest to expire — the oldest, while `LOGIN_TTL` is one constant
-            // — rather than refuse the new login: see [`MAX_PENDING_LOGINS`]. Only reached
-            // once the map is full, so the sort is not on the normal path.
-            if pending.len() >= MAX_PENDING_LOGINS {
-                let mut by_age: Vec<(Instant, String)> = pending
-                    .iter()
-                    .map(|(k, p)| (p.expires_at, k.clone()))
-                    .collect();
-                by_age.sort_unstable_by_key(|(t, _)| *t);
-                let excess = pending.len() + 1 - MAX_PENDING_LOGINS;
-                for (_, k) in by_age.into_iter().take(excess) {
-                    pending.remove(&k);
-                }
-            }
-            pending.insert(
-                state.clone(),
-                PendingLogin {
-                    target: target.to_string(),
-                    verifier,
-                    expires_at: now + LOGIN_TTL,
-                },
-            );
-        }
-        let url = format!(
-            "{}response_type=code&client_id={}&redirect_uri={}&scope={}&state={}\
-             &code_challenge={}&code_challenge_method=S256",
-            query_prefix(&provider.endpoints.authorization_endpoint),
-            percent_encode(&self.cfg.client_id),
-            percent_encode(&self.redirect_uri()),
-            percent_encode("openid email profile"),
-            percent_encode(&state),
-            percent_encode(&challenge),
-        );
-        Ok((url, state))
-    }
-
-    /// Redeem an authorization `code` for the caller's claims: require the browser's
-    /// cookie to name the same login as the query's `state`, consume it, exchange the
-    /// code (with the PKCE verifier), then call UserInfo. Returns the original login's
-    /// `target` alongside the claims.
-    async fn exchange(
-        &self,
-        code: &str,
-        state: &str,
-        cookie_state: Option<&str>,
-    ) -> Result<(String, serde_json::Value)> {
-        // The cookie is what makes `state` a CSRF defence rather than mere replay
-        // protection: without it, a callback URL an attacker completed at the provider
-        // would log the victim in as the attacker.
-        let cookie_state = cookie_state.context("this browser did not start a login here")?;
-        if !crate::auth::constant_eq(cookie_state.as_bytes(), state.as_bytes()) {
-            bail!("the login state does not match this browser's");
-        }
-        let provider = self.provider().await?;
-        // A `remove` — the state is a 192-bit random lookup key, not a secret compared
-        // byte-wise, so a map lookup leaks nothing worth timing.
-        let pending = self
-            .pending
-            .lock()
-            .unwrap()
-            .remove(state)
-            .context("unknown or already-used login state")?;
-        if Instant::now() >= pending.expires_at {
-            bail!("login state expired");
-        }
-        let redirect_uri = self.redirect_uri();
-        // Hand-built `application/x-www-form-urlencoded` body — avoids needing
-        // reqwest's `form`/`multipart` feature on top of what the workspace already
-        // enables (`rustls-no-provider`, `json`, `query`, `stream`; see `Cargo.toml`).
-        let mut fields = vec![
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", redirect_uri.as_str()),
-            ("client_id", self.cfg.client_id.as_str()),
-            ("code_verifier", pending.verifier.as_str()),
-        ];
-        let mut req = provider.http.post(&provider.endpoints.token_endpoint);
-        if provider.endpoints.secret_in_header {
-            req = req.basic_auth(&self.cfg.client_id, Some(&self.cfg.client_secret));
-        } else {
-            fields.push(("client_secret", self.cfg.client_secret.as_str()));
-        }
-        let body = fields
-            .iter()
-            .map(|(k, v)| format!("{k}={}", percent_encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
-        let res = req
-            .header(
-                hyper::header::CONTENT_TYPE.as_str(),
-                "application/x-www-form-urlencoded",
-            )
-            .body(body)
-            .send()
-            .await
-            .context("exchanging the authorization code")?;
-        let res =
-            ok_or_provider_error(res, "the token endpoint rejected the authorization code").await?;
-        let token = json_capped(res, "the token response").await?;
-        let access_token = token
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .context("token response is missing access_token")?;
-        let claims = get_json(
-            &provider.http,
-            &provider.endpoints.userinfo_endpoint,
-            Some(access_token),
-        )
-        .await
-        .context("calling the UserInfo endpoint")?;
-        Ok((pending.target, claims))
-    }
-
-    /// Drop a pending login the provider has already refused, rather than leaving it to
-    /// [`LOGIN_TTL`]. Requires the browser's cookie to name it, for the same reason
-    /// [`OidcClient::exchange`] does: nobody else gets to cancel a login.
-    fn abandon(&self, state: &str, cookie_state: Option<&str>) {
-        if cookie_state.is_some_and(|c| crate::auth::constant_eq(c.as_bytes(), state.as_bytes())) {
-            self.pending.lock().unwrap().remove(state);
-        }
-    }
-
-    /// The RP-initiated logout URL, if the provider advertises `end_session_endpoint`;
-    /// `None` leaves logout local-only (still safe — the session is deleted either way).
-    /// `client_id` is sent because a provider that validates the post-logout redirect
-    /// against a registered client needs it (or an `id_token_hint`, which this flow does
-    /// not keep) and rejects the request without either.
-    async fn logout_url(&self) -> Option<String> {
-        let provider = self.provider().await.ok()?;
-        let endpoint = provider.endpoints.end_session_endpoint.as_ref()?;
-        Some(format!(
-            "{}client_id={}&post_logout_redirect_uri={}",
-            query_prefix(endpoint),
-            percent_encode(&self.cfg.client_id),
-            percent_encode(&format!(
-                "{}{DEFAULT_TARGET}",
-                self.cfg.public_url.trim_end_matches('/')
-            )),
-        ))
-    }
-}
-
-/// GET a JSON document from the provider, refusing one too large to be a discovery or
-/// UserInfo response.
-async fn get_json(
-    http: &reqwest::Client,
-    url: &str,
-    bearer: Option<&str>,
-) -> Result<serde_json::Value> {
-    let mut req = http.get(url);
-    if let Some(t) = bearer {
-        req = req.bearer_auth(t);
-    }
-    let res = req
-        .send()
-        .await
-        .with_context(|| format!("fetching {url}"))?;
-    let res = ok_or_provider_error(res, &format!("{url} returned an error status")).await?;
-    json_capped(res, url).await
-}
-
-/// Pass a 2xx through; turn anything else into an error carrying the (capped, log-safe)
-/// body the provider explained itself with. `error_for_status` discards that body, and on
-/// the token endpoint it is the whole diagnosis — `invalid_grant` (the code is stale) and
-/// `invalid_client` (the secret is wrong) are the same status otherwise.
-async fn ok_or_provider_error(res: reqwest::Response, what: &str) -> Result<reqwest::Response> {
-    let status = res.status();
-    if status.is_success() {
-        return Ok(res);
-    }
-    let body = bytes_capped(res, what).await.unwrap_or_default();
-    let detail = loggable(std::str::from_utf8(&body).unwrap_or("<non-utf8 body>"));
-    bail!("{what} ({status}): {detail}");
-}
-
-/// A provider's response body, refused past [`MAX_IDP_BODY`]. Nothing this flow reads is
-/// more than a few KiB, so an unbounded read is only a way for the provider to exhaust
-/// this server's memory.
-async fn json_capped(res: reqwest::Response, what: &str) -> Result<serde_json::Value> {
-    let buf = bytes_capped(res, what).await?;
-    serde_json::from_slice(&buf).with_context(|| format!("parsing {what}"))
-}
-
-/// The bytes of a provider's response, refused past [`MAX_IDP_BODY`].
-async fn bytes_capped(mut res: reqwest::Response, what: &str) -> Result<Vec<u8>> {
-    if let Some(len) = res.content_length()
-        && len > MAX_IDP_BODY as u64
-    {
-        bail!("{what} returned {len} bytes, over the {MAX_IDP_BODY}-byte cap");
-    }
-    // Read to the cap rather than past it: a chunked response declares no length, so the
-    // check above sees nothing and `bytes()` would buffer whatever the provider sends.
-    let mut buf = Vec::new();
-    while let Some(chunk) = res
-        .chunk()
-        .await
-        .with_context(|| format!("reading {what}"))?
-    {
-        if buf.len() + chunk.len() > MAX_IDP_BODY {
-            bail!("{what} returned more than the {MAX_IDP_BODY}-byte cap");
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(buf)
 }
 
 /// `/login`, `/auth/callback`, `/logout` — reachable without a principal (a login page
@@ -501,7 +117,7 @@ async fn login(client: &OidcClient, query: &str, secure: bool) -> Result<Respons
     // Anything unsafe is replaced with [`DEFAULT_TARGET`] inside `login_url`, which is
     // where a `PendingLogin`'s target invariant is enforced.
     let target = query_param(query, "target").unwrap_or_default();
-    let (url, state) = match client.login_url(&target).await {
+    let (url, state) = match client.inner.login_url(&target).await {
         Ok(v) => v,
         Err(e) => return Ok(upstream_failure("starting a login", &e)),
     };
@@ -533,7 +149,7 @@ async fn callback(
         );
         // The login is over; do not leave it holding a slot until LOGIN_TTL.
         if let Some(state) = query_param(query, "state") {
-            client.abandon(&state, cookie_state.as_deref());
+            client.inner.abandon(&state, cookie_state.as_deref());
         }
         return done_with_login(
             html_error(
@@ -554,6 +170,7 @@ async fn callback(
         );
     };
     let (target, claims) = match client
+        .inner
         .exchange(&code, &state_param, cookie_state.as_deref())
         .await
     {
@@ -674,12 +291,13 @@ async fn logout(
         return Ok(internal_failure("ending a session", &e));
     }
     let target = client
+        .inner
         .logout_url()
         .await
         // Not `/`: in accounts mode that is a bare JSON 401, which is a poor page to
         // land a person on after signing out.
         .unwrap_or_else(|| DEFAULT_TARGET.to_string());
-    // `target` is a discovery endpoint `is_usable_endpoint` already vetted, so this
+    // `target` is a discovery endpoint `vk-oidc` already vetted, so this
     // cannot fail; fall back rather than let a `?` escape as a JSON 500 (see above).
     let mut res = redirect(&target).or_else(|_| redirect(DEFAULT_TARGET))?;
     res.headers_mut().append(
@@ -738,7 +356,7 @@ fn login_cookie(state: &str, secure: bool) -> String {
     let max_age = if state.is_empty() {
         0
     } else {
-        LOGIN_TTL.as_secs()
+        vk_oidc::LOGIN_TTL.as_secs()
     };
     let name = login_cookie_name(secure);
     if secure {
@@ -765,32 +383,6 @@ fn login_cookie_name(secure: bool) -> &'static str {
     } else {
         LOGIN_COOKIE
     }
-}
-
-/// A URL prefix ready for the first parameter: the endpoint plus `?` or `&`, since a
-/// provider's endpoint may already carry a query string.
-fn query_prefix(endpoint: &str) -> String {
-    let sep = if endpoint.contains('?') { '&' } else { '?' };
-    format!("{endpoint}{sep}")
-}
-
-/// A provider- or query-supplied string as it may appear in a log line: bounded, and
-/// with control characters replaced — an embedded newline would otherwise forge whole
-/// `vk-registry: …` lines in the log.
-fn loggable(s: &str) -> String {
-    s.chars()
-        .take(MAX_LOG_FIELD_LEN)
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-        .collect()
-}
-
-/// An endpoint out of a discovery document is usable only if it is an absolute URL that
-/// clears the same bar the configured issuer did — `https`, or `http` on loopback — and
-/// carries nothing a `Location` header would refuse. The issuer comparison authenticates
-/// the *document*, not the URLs inside it.
-fn is_usable_endpoint(u: &str) -> bool {
-    (u.starts_with("https://") || crate::config::is_local_url(u))
-        && !u.chars().any(char::is_control)
 }
 
 /// One field out of an `application/x-www-form-urlencoded` body — the same shape as a
@@ -838,22 +430,6 @@ fn is_safe_redirect_target(t: &str) -> bool {
         && !t.contains("..")
 }
 
-/// Unpadded base64url, for the PKCE `code_challenge` (RFC 7636 §4.2).
-fn b64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity((bytes.len() * 4).div_ceil(3));
-    for chunk in bytes.chunks(3) {
-        let b = |i: usize| *chunk.get(i).unwrap_or(&0) as u32;
-        let n = (b(0) << 16) | (b(1) << 8) | b(2);
-        let take = chunk.len() + 1;
-        for i in 0..take {
-            let idx = ((n >> (18 - 6 * i)) & 0x3f) as usize;
-            out.push(ALPHABET[idx] as char);
-        }
-    }
-    out
-}
-
 /// What a sign-in says of the user's email. Operators promote a user by email (`accounts
 /// grant-admin`), so an address the provider marks unverified (`email_verified: false`, or
 /// `"false"` as some spell it) clears the stored one: where anyone can claim an address
@@ -863,29 +439,16 @@ fn b64url(bytes: &[u8]) -> String {
 /// change their address unverified without saying so (the "nOAuth" pattern) is trusted,
 /// which is why the promotion commands name the issuer and subject they act on.
 fn email_claim(claims: &serde_json::Value) -> EmailUpdate<'_> {
-    let unverified = match claims.get("email_verified") {
-        Some(serde_json::Value::Bool(b)) => !b,
-        Some(serde_json::Value::String(s)) => s.eq_ignore_ascii_case("false"),
-        _ => false,
-    };
-    match claims.get("email").and_then(|v| v.as_str()) {
-        _ if unverified => EmailUpdate::Clear,
-        Some(e) => EmailUpdate::Set(e),
-        None => EmailUpdate::Keep,
+    match vk_oidc::email(claims) {
+        vk_oidc::Email::Unverified => EmailUpdate::Clear,
+        vk_oidc::Email::Asserted(e) => EmailUpdate::Set(e),
+        vk_oidc::Email::Absent => EmailUpdate::Keep,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::convert::Infallible;
-    use std::net::SocketAddr;
-
-    use http_body_util::BodyExt;
-    use hyper::service::service_fn;
-    use hyper_util::rt::TokioIo;
-    use tokio::net::TcpListener;
 
     #[test]
     fn an_unverified_email_is_not_kept() {
@@ -1025,421 +588,6 @@ mod tests {
         assert_eq!(login_cookie_value(&headers("other=x"), true), None);
     }
 
-    #[test]
-    fn pkce_challenge_matches_the_rfc_7636_example() {
-        // RFC 7636 appendix B's verifier/challenge pair
-        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        assert_eq!(
-            b64url(Sha256::digest(verifier.as_bytes()).as_slice()),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-        );
-        assert_eq!(b64url(b""), "");
-        assert_eq!(b64url(b"f"), "Zg");
-        assert_eq!(b64url(b"fo"), "Zm8");
-        assert_eq!(b64url(b"foo"), "Zm9v");
-    }
-
-    #[test]
-    fn a_query_prefix_respects_an_endpoint_that_already_has_parameters() {
-        assert_eq!(
-            query_prefix("https://idp/authorize"),
-            "https://idp/authorize?"
-        );
-        assert_eq!(
-            query_prefix("https://idp/authorize?tenant=a"),
-            "https://idp/authorize?tenant=a&"
-        );
-    }
-
-    /// A minimal fake OIDC provider: discovery + token + userinfo, all in one
-    /// in-process hyper server — the same "spin up a real server on an ephemeral port"
-    /// pattern `tests/relay_e2e.rs` uses for its fake upstream. Gives this module real
-    /// end-to-end coverage of discovery, the authorization-URL shape, and the code→
-    /// token→claims exchange, without a live external IdP.
-    async fn fake_idp(basic_auth: bool) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        fake_idp_stating(basic_auth, DocOverride::default()).await
-    }
-
-    /// What a test wants the fake IdP's discovery document to *claim*, where that differs
-    /// from the truth. All-`None` is an honest document.
-    #[derive(Clone, Default)]
-    struct DocOverride {
-        issuer: Option<String>,
-        token_endpoint: Option<String>,
-    }
-
-    impl DocOverride {
-        fn issuer(v: &str) -> Self {
-            DocOverride {
-                issuer: Some(v.to_string()),
-                ..Default::default()
-            }
-        }
-
-        fn token_endpoint(v: &str) -> Self {
-            DocOverride {
-                token_endpoint: Some(v.to_string()),
-                ..Default::default()
-            }
-        }
-    }
-
-    /// [`fake_idp`], but its discovery document claims what `doc` says instead of the
-    /// truth — a substituted document, in other words.
-    async fn fake_idp_stating(
-        basic_auth: bool,
-        doc: DocOverride,
-    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        let stated = doc;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let stated = stated.clone();
-                tokio::spawn(async move {
-                    let svc = service_fn(move |req: Request<Incoming>| {
-                        let stated = stated.clone();
-                        async move {
-                            Ok::<_, Infallible>(
-                                fake_idp_respond(req, addr, basic_auth, stated).await,
-                            )
-                        }
-                    });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), svc)
-                        .await;
-                });
-            }
-        });
-        (addr, handle)
-    }
-
-    /// A failure here answers with a 400 and a reason rather than asserting: this runs in
-    /// a spawned connection task, where a panic would reach the test as an opaque
-    /// connection error instead of a named failure.
-    async fn fake_idp_respond(
-        req: Request<Incoming>,
-        addr: SocketAddr,
-        basic_auth: bool,
-        doc: DocOverride,
-    ) -> Response<Body> {
-        let path = req.uri().path().to_string();
-        let issuer = doc.issuer.unwrap_or_else(|| format!("http://{addr}"));
-        let token_endpoint = doc
-            .token_endpoint
-            .unwrap_or_else(|| format!("http://{addr}/token"));
-        let json = |v: serde_json::Value| {
-            Response::builder()
-                .header(hyper::header::CONTENT_TYPE, "application/json")
-                .body(body_of(Bytes::from(v.to_string())))
-                .unwrap()
-        };
-        let refuse = |why: &str| {
-            Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(body_of(Bytes::from(format!("fake idp: {why}"))))
-                .unwrap()
-        };
-        match path.as_str() {
-            "/.well-known/openid-configuration" => json(serde_json::json!({
-                "issuer": issuer,
-                "authorization_endpoint": format!("http://{addr}/authorize"),
-                "token_endpoint": token_endpoint,
-                "userinfo_endpoint": format!("http://{addr}/userinfo"),
-                "end_session_endpoint": format!("http://{addr}/logout"),
-                "token_endpoint_auth_methods_supported":
-                    if basic_auth { ["client_secret_basic"] } else { ["client_secret_post"] },
-            })),
-            "/token" => {
-                let header_secret = req
-                    .headers()
-                    .get(hyper::header::AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| v.to_string());
-                let body = req.into_body().collect().await.unwrap().to_bytes();
-                let form = String::from_utf8_lossy(&body).to_string();
-                if !form.contains("grant_type=authorization_code") {
-                    return refuse("no authorization_code grant");
-                }
-                // PKCE is not optional in this flow
-                if !form.contains("code_verifier=") {
-                    return refuse("no code_verifier");
-                }
-                let authed = if basic_auth {
-                    // base64("vk-registry:s3cr3t")
-                    header_secret.as_deref() == Some("Basic dmstcmVnaXN0cnk6czNjcjN0")
-                } else {
-                    header_secret.is_none() && form.contains("client_secret=s3cr3t")
-                };
-                if !authed {
-                    return refuse("the client did not authenticate as configured");
-                }
-                json(serde_json::json!({ "access_token": "at-123", "token_type": "Bearer" }))
-            }
-            "/userinfo" => {
-                if req
-                    .headers()
-                    .get(hyper::header::AUTHORIZATION)
-                    .and_then(|v| v.to_str().ok())
-                    != Some("Bearer at-123")
-                {
-                    return refuse("bad access token");
-                }
-                json(serde_json::json!({
-                    "sub": "user-42",
-                    "email": "alice@example.com",
-                    "name": "Alice"
-                }))
-            }
-            _ => Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(body_of(Bytes::new()))
-                .unwrap(),
-        }
-    }
-
-    fn client_for(addr: SocketAddr) -> OidcClient {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        OidcClient::new(OidcConfig {
-            issuer: format!("http://{addr}"),
-            client_id: "vk-registry".to_string(),
-            client_secret: "s3cr3t".to_string(),
-            public_url: "https://registry.internal".to_string(),
-        })
-    }
-
-    /// The state out of a login URL, which is also what the browser's cookie must carry.
-    fn state_of(url: &str) -> String {
-        url.split("state=")
-            .nth(1)
-            .expect("a state param")
-            .split('&')
-            .next()
-            .expect("a value")
-            .to_string()
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn discover_login_and_exchange_round_trip_against_a_fake_provider() {
-        let (addr, _server) = fake_idp(true).await;
-        let client = client_for(addr);
-
-        let (url, state) = client
-            .login_url("/browse/team-a")
-            .await
-            .expect("a login url");
-        assert!(url.starts_with(&format!("http://{addr}/authorize?")));
-        assert!(url.contains("client_id=vk-registry"));
-        assert!(url.contains("code_challenge_method=S256"));
-        assert!(url.contains("code_challenge="));
-        assert!(url.contains(&percent_encode("https://registry.internal/auth/callback")));
-        assert_eq!(state_of(&url), state, "the cookie's state is the URL's");
-
-        let (target, claims) = client
-            .exchange("the-code", &state, Some(&state))
-            .await
-            .expect("the exchange succeeds");
-        assert_eq!(target, "/browse/team-a");
-        assert_eq!(claims["sub"], "user-42");
-        assert_eq!(claims["email"], "alice@example.com");
-
-        // single-use: the same state cannot be redeemed twice
-        assert!(
-            client
-                .exchange("the-code", &state, Some(&state))
-                .await
-                .is_err()
-        );
-    }
-
-    /// A provider registered for `client_secret_post` must still work — the secret moves
-    /// from the header into the body, and nowhere else.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_secret_goes_where_the_provider_says_it_should() {
-        let (addr, _server) = fake_idp(false).await;
-        let client = client_for(addr);
-        let (_, state) = client.login_url("/browse").await.expect("a login url");
-        client
-            .exchange("the-code", &state, Some(&state))
-            .await
-            .expect("post-authenticated exchange succeeds");
-    }
-
-    /// The property `state` exists for: a callback the victim's browser never started
-    /// must not log the victim in. Without the cookie check, an attacker who completes a
-    /// login at the provider can hand over the callback URL and own the session.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_callback_without_this_browsers_cookie_is_refused() {
-        let (addr, _server) = fake_idp(true).await;
-        let client = client_for(addr);
-        let (_, state) = client.login_url("/browse").await.expect("a login url");
-
-        assert!(
-            client.exchange("the-code", &state, None).await.is_err(),
-            "no cookie must not authenticate"
-        );
-        assert!(
-            client
-                .exchange("the-code", &state, Some("some-other-login"))
-                .await
-                .is_err(),
-            "another browser's cookie must not authenticate"
-        );
-        // and the refusals did not consume the state, so the real browser still can
-        client
-            .exchange("the-code", &state, Some(&state))
-            .await
-            .expect("the browser that started the login still completes it");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exchange_rejects_an_unknown_state() {
-        let (addr, _server) = fake_idp(true).await;
-        let client = client_for(addr);
-        assert!(
-            client
-                .exchange("code", "not-a-real-state", Some("not-a-real-state"))
-                .await
-                .is_err()
-        );
-    }
-
-    /// Every endpoint this flow uses comes out of the discovery document, so a document
-    /// that names an issuer other than the configured one is refused.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_discovery_document_for_another_issuer_is_refused() {
-        // served from 127.0.0.1, but claiming to be somebody else entirely
-        let (addr, _server) =
-            fake_idp_stating(true, DocOverride::issuer("https://idp.evil.example")).await;
-        let client = client_for(addr);
-        let e = client
-            .login_url("/browse")
-            .await
-            .expect_err("a mismatched issuer is refused")
-            .to_string();
-        assert!(e.contains("issuer"), "{e}");
-    }
-
-    /// The issuer comparison authenticates the document's *origin*, not the URLs inside
-    /// it — so an otherwise-honest provider naming a cleartext `token_endpoint`, which is
-    /// where the client secret and the code would go, fails discovery outright rather
-    /// than at the first exchange.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_discovery_document_naming_a_cleartext_endpoint_is_refused() {
-        let (addr, _server) = fake_idp_stating(
-            true,
-            DocOverride::token_endpoint("http://idp.example/token"),
-        )
-        .await;
-        let client = client_for(addr);
-        let e = client
-            .login_url("/browse")
-            .await
-            .expect_err("a cleartext endpoint is refused")
-            .to_string();
-        assert!(e.contains("token_endpoint"), "{e}");
-    }
-
-    #[test]
-    fn a_usable_endpoint_is_absolute_https_or_loopback_and_header_safe() {
-        assert!(is_usable_endpoint("https://idp.example/token"));
-        assert!(is_usable_endpoint("http://127.0.0.1:9000/token"));
-        assert!(!is_usable_endpoint("http://idp.example/token"));
-        assert!(!is_usable_endpoint("/token"));
-        // and nothing a `Location` header would refuse, which would 500 mid-flow
-        assert!(!is_usable_endpoint("https://idp.example/token\r\nX: y"));
-    }
-
-    /// A login in flight costs memory until it expires, and `/login` needs no
-    /// credential, so the map that holds them is capped — and at the cap it *evicts*
-    /// rather than refuses. Refusing would let 4096 unauthenticated GETs close sign-in
-    /// for everyone until the TTL ran out, including for whoever would fix it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_flood_of_logins_is_evicted_not_allowed_to_close_sign_in() {
-        let (addr, _server) = fake_idp(true).await;
-        let client = client_for(addr);
-        {
-            let mut pending = client.pending.lock().unwrap();
-            for i in 0..MAX_PENDING_LOGINS {
-                pending.insert(
-                    format!("state-{i}"),
-                    PendingLogin {
-                        target: DEFAULT_TARGET.to_string(),
-                        verifier: "v".to_string(),
-                        expires_at: Instant::now() + LOGIN_TTL,
-                    },
-                );
-            }
-        }
-        let (_, state) = client
-            .login_url("/browse")
-            .await
-            .expect("a login still starts at the cap");
-        let pending = client.pending.lock().unwrap();
-        assert_eq!(pending.len(), MAX_PENDING_LOGINS, "the cap still holds");
-        assert!(
-            pending.contains_key(&state),
-            "the new login is the one kept"
-        );
-    }
-
-    /// An in-flight login is redeemable for [`LOGIN_TTL`] and no longer: a code the
-    /// browser sits on for an hour must not still open a session.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_login_past_its_ttl_is_refused_and_swept() {
-        let (addr, _server) = fake_idp(true).await;
-        let client = client_for(addr);
-        let stale = || PendingLogin {
-            target: DEFAULT_TARGET.to_string(),
-            verifier: "v".to_string(),
-            // due now, so it is expired by the time anything compares against it
-            expires_at: Instant::now(),
-        };
-        client
-            .pending
-            .lock()
-            .unwrap()
-            .insert("stale".to_string(), stale());
-
-        let e = client
-            .exchange("the-code", "stale", Some("stale"))
-            .await
-            .expect_err("an expired login is refused")
-            .to_string();
-        assert!(e.contains("expired"), "{e}");
-
-        // and the opportunistic sweep on the next /login drops it rather than leaving it
-        client
-            .pending
-            .lock()
-            .unwrap()
-            .insert("stale".to_string(), stale());
-        client.login_url("/browse").await.expect("a login url");
-        assert!(!client.pending.lock().unwrap().contains_key("stale"));
-    }
-
-    /// A refused login does not sit in the map until its TTL — but only the browser that
-    /// started it gets to cancel it, or anyone who learned a `state` could.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_provider_refusal_releases_the_login_only_for_its_own_browser() {
-        let (addr, _server) = fake_idp(true).await;
-        let client = client_for(addr);
-        let (_, state) = client.login_url("/browse").await.expect("a login url");
-
-        client.abandon(&state, None);
-        client.abandon(&state, Some("another-browsers-login"));
-        assert!(
-            client.pending.lock().unwrap().contains_key(&state),
-            "nobody else may cancel this login"
-        );
-
-        client.abandon(&state, Some(&state));
-        assert!(client.pending.lock().unwrap().is_empty(), "its own may");
-    }
-
     /// The CSRF guard on `/logout`: only a form this server rendered for *this* session
     /// carries the secret, so a cross-site POST cannot end the session.
     #[test]
@@ -1477,23 +625,6 @@ mod tests {
         assert!(
             cleared.starts_with(accounts::SESSION_COOKIE_HOST),
             "{cleared}"
-        );
-    }
-
-    /// A log line is not a place an identity provider gets to write: a newline in an
-    /// `error_description` would otherwise forge whole `vk-registry: …` entries.
-    #[test]
-    fn a_logged_provider_string_cannot_forge_a_log_line() {
-        assert_eq!(loggable("access_denied"), "access_denied");
-        assert_eq!(
-            loggable("a\nvk-registry: all good\r\tb"),
-            "a\u{fffd}vk-registry: all good\u{fffd}\u{fffd}b"
-        );
-        assert_eq!(
-            loggable(&"x".repeat(MAX_LOG_FIELD_LEN + 10))
-                .chars()
-                .count(),
-            MAX_LOG_FIELD_LEN
         );
     }
 }

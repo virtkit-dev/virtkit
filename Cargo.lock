@@ -4120,6 +4120,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "vk-oidc"
+version = "0.84.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "rand",
+ "reqwest",
+ "rustls",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "vk-registry"
 version = "0.84.0"
 dependencies = [
@@ -4145,6 +4163,7 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "vk-fs",
+ "vk-oidc",
  "vk-selfupdate",
  "zstd",
 ]

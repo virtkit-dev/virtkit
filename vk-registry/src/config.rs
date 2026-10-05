@@ -9,7 +9,7 @@
 //! three.
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -179,10 +179,6 @@ struct FileUpstream {
     password_file: Option<PathBuf>,
     ca_file: Option<PathBuf>,
 }
-
-/// Ceiling on the `[oidc]` client-secret file, trailing newline included — it is checked
-/// against the bytes on disk, before the value is trimmed.
-const MAX_CLIENT_SECRET_LEN: u64 = 4096;
 
 /// The accounts db under a store root, when no `accounts_db` names one. A directory of
 /// its own rather than the root itself: `Db::open` creates that one at 0700 whatever the
@@ -534,71 +530,23 @@ impl ServerConfig {
         for (what, url) in [("issuer", &spec.issuer), ("public_url", &spec.public_url)] {
             // Both end up in a URL this server fetches or hands a browser as a `Location`,
             // and the issuer is also the identity namespace `validate_identity` refuses
-            // control characters in — so they are refused here, at startup, rather than
-            // as a 502 at the first login. `oidc::is_usable_endpoint` holds the endpoints
-            // a discovery document names to the same two conditions.
-            if url.chars().any(char::is_control) {
-                bail!("[oidc] {what} may not contain control characters: {url:?}");
-            }
-            if !url.starts_with("https://") && !is_local_url(url) {
-                bail!(
-                    "[oidc] {what} must be https (or a loopback address): {url:?} would put \
-                     the client secret and the session cookie on the wire in cleartext"
-                );
-            }
-            if url.contains('?') || url.contains('#') {
-                bail!("[oidc] {what} is a base URL, with no query or fragment: {url:?}");
-            }
+            // control characters in — so they are checked here, at startup, rather than
+            // failing as a 502 at the first login. `vk-oidc` holds the endpoints a
+            // discovery document names to the first two.
+            vk_oidc::check_base_url(&format!("[oidc] {what}"), url)?;
         }
         if spec.client_id.is_empty() {
             bail!("[oidc] client_id may not be empty");
         }
-        // Open once, then check the mode of *that* descriptor: `warn_if_mode` would
-        // resolve the path a second time, so the file it reported on need not be the one
-        // read below. `O_NOFOLLOW` for the same reason `accounts::Db::open` uses it — a
-        // credential is not read through someone else's symlink.
-        let secret_file = {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.custom_flags(libc::O_NOFOLLOW);
-            }
-            opts.open(&spec.client_secret_file)
-                .with_context(|| format!("opening {}", spec.client_secret_file.display()))?
-        };
-        crate::warn_if_file_mode(
-            &secret_file,
-            &spec.client_secret_file,
-            0o077,
-            "OIDC client secret",
-            "it is group/world-accessible — restrict it to 0600",
-        );
-        // Bounded: a client secret is tens of bytes, and a `client_secret_file` that is
-        // not one at all (a device, a log) must not be read into memory unbounded. One
-        // byte over the cap is an error rather than a silent truncation, which would
-        // otherwise show up as an unexplained rejection at the token endpoint. Read as
-        // bytes and length-checked before the UTF-8 decode, so an oversize file is
-        // reported as oversize rather than as a decode failure at a cut codepoint.
-        let mut raw = Vec::new();
-        secret_file
-            .take(MAX_CLIENT_SECRET_LEN + 1)
-            .read_to_end(&mut raw)
-            .with_context(|| format!("reading {}", spec.client_secret_file.display()))?;
-        if raw.len() as u64 > MAX_CLIENT_SECRET_LEN {
-            bail!(
-                "{} is over {MAX_CLIENT_SECRET_LEN} bytes; that is not a client secret",
-                spec.client_secret_file.display()
-            );
-        }
-        let client_secret = std::str::from_utf8(&raw)
-            .with_context(|| format!("{} is not text", spec.client_secret_file.display()))?
-            .trim()
-            .to_string();
-        if client_secret.is_empty() {
-            bail!("{} is empty", spec.client_secret_file.display());
-        }
+        let client_secret = vk_oidc::read_client_secret(&spec.client_secret_file, |file| {
+            crate::warn_if_file_mode(
+                file,
+                &spec.client_secret_file,
+                0o077,
+                "OIDC client secret",
+                "it is group/world-accessible — restrict it to 0600",
+            )
+        })?;
         Ok(Some(OidcConfig {
             issuer: spec.issuer.trim_end_matches('/').to_string(),
             client_id: spec.client_id.clone(),
@@ -742,29 +690,7 @@ fn read_file(path: &Path) -> Result<FileConfig> {
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// True for an `http://` URL whose host is loopback: plain HTTP does not leave the
-/// machine there, so it is the one case this config accepts without TLS.
-pub(crate) fn is_local_url(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return false;
-    };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // `http://[::1]@evil.example/` has host `evil.example`, not `::1`: a guard that can be
-    // fooled by its own parsing is worse than none, so userinfo is simply refused.
-    if authority.contains('@') {
-        return false;
-    }
-    // A bracketed IPv6 literal keeps its colons; everything else splits on the port's.
-    let host = match authority.strip_prefix('[') {
-        // …and it must actually end at the bracket, with only a port after it.
-        Some(v6) => match v6.split_once(']') {
-            Some((host, after)) if after.is_empty() || after.starts_with(':') => host,
-            _ => return false,
-        },
-        None => authority.split(':').next().unwrap_or(""),
-    };
-    host == "localhost" || host == "127.0.0.1" || host == "::1"
-}
+pub(crate) use vk_oidc::is_local_url;
 
 fn load_certs(path: &Path) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
     let mut r =
@@ -1234,42 +1160,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Plain HTTP is a leak everywhere but loopback, and the loopback test has to cope
-    /// with a bracketed IPv6 literal as well as a port. A guard that can be fooled by its
-    /// own parsing is worse than none, so the URLs whose *real* host is not the one a
-    /// naive split sees are in here too.
-    #[test]
-    fn only_loopback_counts_as_a_local_url() {
-        for ok in [
-            "http://localhost",
-            "http://localhost:5000",
-            "http://127.0.0.1",
-            "http://127.0.0.1:5000/path",
-            "http://[::1]",
-            "http://[::1]:5000",
-            "http://[::1]:5000/path",
-        ] {
-            assert!(is_local_url(ok), "{ok}");
-        }
-        for bad in [
-            "http://login.example.com",
-            "http://127.0.0.1.evil.example",
-            "http://[::2]:5000",
-            "https://localhost",
-            "localhost",
-            "",
-            // userinfo: the host is whatever follows the `@`
-            "http://127.0.0.1@evil.example/",
-            "http://[::1]@evil.example/",
-            "http://localhost:x@evil.example/",
-            // a bracketed literal has to end at its bracket
-            "http://[::1]evil.example",
-            "http://[::1",
-        ] {
-            assert!(!is_local_url(bad), "{bad}");
-        }
-    }
-
     /// A temp dir of its own (two tests must not share one: the accounts db is
     /// single-writer and they run in parallel) holding a valid client-secret file, plus
     /// the fixtures every accounts-mode case needs.
@@ -1355,7 +1245,11 @@ mod tests {
         std::fs::write(&secret, "\n").unwrap();
         let err = with(spec());
         assert!(err.contains("is empty"), "{err}");
-        std::fs::write(&secret, "x".repeat(MAX_CLIENT_SECRET_LEN as usize + 1)).unwrap();
+        std::fs::write(
+            &secret,
+            "x".repeat(vk_oidc::MAX_CLIENT_SECRET_LEN as usize + 1),
+        )
+        .unwrap();
         let err = with(spec());
         assert!(err.contains("not a client secret"), "{err}");
 
