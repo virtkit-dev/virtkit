@@ -101,10 +101,12 @@ All notable changes to virtkit will be documented in this file.
   controller is slow to). The guest gets 2 vCPUs and 4G unless `vm.json`, `x-virtkit.cpus`/
   `mem` or `--service-cpus`/`--service-mem` say otherwise; volumes, `entrypoint`, `user`,
   every other `x-virtkit` key and `--service-nics` above 1 are refused, and a Windows service
-  is a sibling only (not `--primary`, not in CI jobs). A Ctrl-C stops a services-only run's
-  Windows guests with their power button, during their starts too, where a second Ctrl-C
-  ends `vk` at once. In a foreground run with a primary VM, Ctrl-C kills every guest at once; `vk stop`
-  powers them off. A SIGTERM, or a `--detach` run's Ctrl-C, during the services' starts (Linux
+  is a sibling only (not `--primary`, not in CI jobs). `vk exec <state-dir> --service <name>`
+  runs a command in one, through its qemu-ga, as for a `vk run` of a bundle (`--tty`, `--user`
+  and `--clear-env` are refused), and `vk cp --target <state-dir> --service <name>` copies a
+  file in or out of one. A Ctrl-C stops a services-only run's Windows guests with their power
+  button, during their starts too, where a second Ctrl-C ends `vk` at once. In a foreground
+  run with a primary VM, Ctrl-C kills every guest at once; `vk stop` powers them off. A SIGTERM, or a `--detach` run's Ctrl-C, during the services' starts (Linux
   ones too) now goes through the run's teardown instead of ending it at once; the exit code is
   unchanged (130 or 143).
 - **`vk run` boots a UEFI guest, such as an installed Windows Server, from a local bundle.**

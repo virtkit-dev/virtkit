@@ -1233,6 +1233,9 @@ enum Cmd {
         /// which VM: a directory (default: the current directory), as `vk exec` resolves it
         #[arg(long, value_name = "DIR")]
         target: Option<String>,
+        /// copy to or from this Windows compose service instead, as `vk exec --service` does
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
     },
     /// Publish a port on the guest's own network to the host
     ///
@@ -4466,13 +4469,12 @@ async fn cli_main(cli: Cli) -> ExitCode {
             user,
             command,
         } => {
-            // A Windows (UEFI) guest has no vk-agent: its qemu-ga runs the command instead. A
-            // target that does not resolve falls through to the vk-agent path, which reports it.
-            if service.is_none()
-                && !target.as_deref().is_some_and(is_agent_addr)
-                && let Ok(entry) = vms::resolve_one(target.as_deref().map(Path::new))
-                && let Some(socket) = entry.guest_agent
-            {
+            // A Windows (UEFI) guest has no vk-agent: its qemu-ga runs the command instead.
+            let socket = match windows_exec_socket(target.as_deref(), service.as_deref()) {
+                Ok(socket) => socket,
+                Err(e) => return fail(&e, 2),
+            };
+            if let Some(socket) = socket {
                 if tty || user.is_some() || clear_env {
                     return fail(
                         &anyhow::anyhow!(
@@ -4552,13 +4554,19 @@ async fn cli_main(cli: Cli) -> ExitCode {
             source,
             destination,
             target,
+            service,
         } => {
-            let socket = match vms::resolve_one(target.as_deref().map(Path::new)).and_then(|e| {
-                e.guest_agent.ok_or_else(|| {
-                    anyhow::anyhow!("vk cp copies to a Windows (UEFI) guest; this VM runs vk-agent")
-                })
-            }) {
-                Ok(s) => s,
+            let socket = match windows_exec_socket(target.as_deref(), service.as_deref()) {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    let not = service.map_or("this VM runs vk-agent".into(), |s| {
+                        format!("no Windows service {s} runs here")
+                    });
+                    return fail(
+                        &anyhow::anyhow!("vk cp copies to a Windows (UEFI) guest; {not}"),
+                        2,
+                    );
+                }
                 Err(e) => return fail(&e, 2),
             };
             let guest_side = source.strip_prefix(':').or(destination.strip_prefix(':'));
@@ -5413,6 +5421,58 @@ fn resolve_exec_addr(
     }
     let entry = vms::resolve_one(target.map(Path::new))?;
     resolve_service_addr(&entry, svc)
+}
+
+/// The qemu-ga socket for `vk exec`/`vk cp`: the VM's own, or with `service`, under
+/// `svc-<service>/` in the named directory, then its registered run. The named directory
+/// comes first because a siblings-only run registers no VM. `None` for a raw agent address
+/// or a guest with vk-agent, including Linux services. Errors when `target` resolves to no
+/// VM, or the service's socket is stale.
+fn windows_exec_socket(
+    target: Option<&str>,
+    service: Option<&str>,
+) -> anyhow::Result<Option<PathBuf>> {
+    if target.is_some_and(is_agent_addr) {
+        return Ok(None);
+    }
+    let resolve = || vms::resolve_one(target.map(Path::new));
+    match service {
+        None => Ok(resolve()?.guest_agent),
+        Some(svc) => service_qga_socket(Path::new(target.unwrap_or(".")), svc, || {
+            Ok(resolve()?.state_dir)
+        }),
+    }
+}
+
+/// [`windows_exec_socket`] for a service: its socket under `named`, else under the run
+/// `registered` returns. A socket nobody listens on is left from a run that ended (`vk stop`,
+/// a crash) and is refused here, rather than waited on as a booting guest's would be.
+fn service_qga_socket(
+    named: &Path,
+    service: &str,
+    registered: impl FnOnce() -> anyhow::Result<PathBuf>,
+) -> anyhow::Result<Option<PathBuf>> {
+    let at = |run: &Path| {
+        run.join(format!("svc-{service}"))
+            .join(uefi::GUEST_AGENT_SOCKET)
+    };
+    let socket = match at(named) {
+        s if s.exists() => s,
+        _ => match at(&registered()?) {
+            s if s.exists() => s,
+            _ => return Ok(None),
+        },
+    };
+    use std::io::ErrorKind::{ConnectionRefused, NotFound};
+    match vk_core::unixpath::connect(&socket).map_err(|e| e.kind()) {
+        Err(ConnectionRefused | NotFound) => {
+            anyhow::bail!(
+                "service {service} is not running (stale {})",
+                socket.display()
+            )
+        }
+        _ => Ok(Some(socket)),
+    }
 }
 
 /// As [`resolve_exec_addr`], for a caller that already holds a path. Kept apart from the
@@ -6864,5 +6924,82 @@ mod tests {
         assert!(!control_plane_unreachable(&anyhow::anyhow!(
             "service manager refused: no such unit \"redis\""
         )));
+    }
+
+    /// A run directory with, for each `(service, live)`, a qemu-ga socket under `svc-<service>/`
+    /// that is listened on, or left behind by a listener that is gone. Keep the listeners.
+    fn run_with_sockets(
+        tag: &str,
+        sockets: &[(&str, bool)],
+    ) -> (PathBuf, Vec<std::os::unix::net::UnixListener>) {
+        let run = std::env::temp_dir().join(format!("vk-qga-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&run);
+        let mut live = Vec::new();
+        for &(service, up) in sockets {
+            let dir = run.join(format!("svc-{service}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let listener = vk_core::unixpath::bind(&dir.join(uefi::GUEST_AGENT_SOCKET)).unwrap();
+            if up {
+                live.push(listener);
+            }
+        }
+        (run, live)
+    }
+
+    #[test]
+    fn a_service_socket_is_found_in_the_named_dir_before_the_registered_run() {
+        let (run, _live) = run_with_sockets("named", &[("win", true)]);
+        let found = service_qga_socket(&run, "win", || panic!("the registry is not asked"));
+        assert_eq!(
+            found.unwrap(),
+            Some(run.join("svc-win").join(uefi::GUEST_AGENT_SOCKET))
+        );
+        std::fs::remove_dir_all(&run).unwrap();
+    }
+
+    #[test]
+    fn a_service_socket_is_found_in_the_registered_run() {
+        let (run, _live) = run_with_sockets("registered", &[("win", true)]);
+        let project = run.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let found = service_qga_socket(&project, "win", || Ok(run.clone()));
+        assert_eq!(
+            found.unwrap(),
+            Some(run.join("svc-win").join(uefi::GUEST_AGENT_SOCKET))
+        );
+        // Nothing registered for the named directory is the registry's error.
+        let err = service_qga_socket(&project, "win", || anyhow::bail!("no running vk VM"));
+        assert!(err.unwrap_err().to_string().contains("no running vk VM"));
+        std::fs::remove_dir_all(&run).unwrap();
+    }
+
+    #[test]
+    fn a_service_without_a_socket_is_left_to_vk_agent() {
+        let (run, _live) = run_with_sockets("linux", &[]);
+        std::fs::create_dir_all(run.join("svc-db")).unwrap();
+        assert_eq!(
+            service_qga_socket(&run, "db", || Ok(run.clone())).unwrap(),
+            None
+        );
+        std::fs::remove_dir_all(&run).unwrap();
+    }
+
+    #[test]
+    fn a_stale_service_socket_is_refused_at_once() {
+        let (run, _live) = run_with_sockets("stale", &[("win", false)]);
+        let err = service_qga_socket(&run, "win", || Ok(run.clone())).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("service win is not running (stale"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&run).unwrap();
+    }
+
+    #[test]
+    fn vk_cp_takes_a_service() {
+        let cli =
+            Cli::try_parse_from(["vk", "cp", "--service", "win", "a.txt", ":C:/a.txt"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Cp { service: Some(s), .. } if s == "win"));
     }
 }
