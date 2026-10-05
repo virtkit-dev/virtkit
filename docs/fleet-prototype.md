@@ -71,14 +71,21 @@ the version the hub picked, which the node checks against both ranges before sig
 over TLS, 32 bytes of exporter output under the label `EXPERIMENTAL-vk-fleet-node-auth` (a
 plaintext loopback session signs a `plaintext` marker instead). A signed payload starts with a
 label of its own, and every variable-length part carries a big-endian `u64` length prefix.
-Keys, signatures, nonces and IDs are strict lowercase hex. A proxy in front of the hub must
-pass TLS through: terminating it breaks the binding, and the hub refuses the signature.
+Keys, signatures, nonces and IDs are strict lowercase hex, except a release key's signature,
+which is base64. A proxy in front of the hub must pass TLS through: terminating it breaks the
+binding, and the hub refuses the signature.
 
 From 0.83.0, hubs and nodes of different releases interoperate: protocol version 1 and
 enrollment at `/v1/` are frozen, though the fleet remains experimental. Version 2 adds
 steering — desired state, commands, their acks, and the node's state on its report. A hub
 serves a version-1 node for monitoring only (see [Steering](#steering)); a node whose hub
-speaks only version 1 runs on its local policy alone.
+speaks only version 1 runs on its local policy alone. Version 2 also defines updates: the
+`update` operation, which names a release by sha256 and size and may carry a release key's
+base64 signature; the `maintenance` and `validating` states; the update's progress on the
+report; and a release download, `GET /v1/releases/<sha256>`, signed by the node under the
+label `vk-fleet release-download v1` over its ID, the release's 32-byte sha256, the time (`u64`)
+and the channel, sent in the `vk-node`, `vk-time` and `vk-signature` headers. No hub issues an
+update yet, and a node refuses one.
 
 The hub admits at most 256 connections that have not authenticated, each step of which (TLS,
 request headers, an enrollment body, a handshake message) has 10 seconds. One past that is

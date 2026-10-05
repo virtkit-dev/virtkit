@@ -188,6 +188,9 @@ impl Persisted {
             }
             (Operation::Drain, NodeState::Draining) => Outcome::Accepted,
             (Operation::Drain, NodeState::Drained) => Outcome::Done,
+            (Operation::Drain, NodeState::Maintenance | NodeState::Validating) => {
+                refused("the node is under maintenance")
+            }
             (Operation::Undrain, _) => {
                 if self.state == NodeState::Draining {
                     self.settle_drains(Outcome::Failed {
@@ -219,6 +222,7 @@ impl Persisted {
                 Outcome::Done
             }
             (Operation::Release, _) => Outcome::Done,
+            (Operation::Update { .. }, _) => refused("this node does not apply updates"),
         }
     }
 
@@ -386,6 +390,25 @@ mod tests {
             let ack = p.command(command(&format!("{op:?}"), op), 1, false);
             assert_eq!(ack.outcome, Outcome::Done);
         }
+    }
+
+    #[test]
+    fn an_update_is_refused_and_leaves_the_node_as_it_was() {
+        let mut p = Persisted::default();
+        let update = Operation::Update {
+            version: "0.84.0".into(),
+            sha256: "ab".repeat(vk_hub_proto::SHA256_LEN),
+            size: 1,
+            signature: None,
+            force: false,
+            within_secs: None,
+        };
+        for managed in [true, false] {
+            let ack = p.command(command(&format!("{managed}"), update.clone()), 1, managed);
+            assert!(matches!(ack.outcome, Outcome::Refused { .. }), "{ack:?}");
+        }
+        assert_eq!(p.state, NodeState::Ready);
+        assert_eq!(p.unrecorded().len(), 2);
     }
 
     #[test]

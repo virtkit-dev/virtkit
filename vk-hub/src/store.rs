@@ -1480,16 +1480,21 @@ pub(crate) fn state_name(state: NodeState) -> &'static str {
         NodeState::Ready => "ready",
         NodeState::Draining => "draining",
         NodeState::Drained => "drained",
+        NodeState::Maintenance => "maintenance",
+        NodeState::Validating => "validating",
         NodeState::Quarantined => "quarantined",
     }
 }
 
-pub(crate) fn operation_name(op: &Operation) -> &'static str {
+pub(crate) fn operation_name(op: &Operation) -> String {
     match op {
-        Operation::Drain => "drain",
-        Operation::Undrain => "undrain",
-        Operation::Quarantine => "quarantine",
-        Operation::Release => "release",
+        Operation::Drain => "drain".into(),
+        Operation::Undrain => "undrain".into(),
+        Operation::Quarantine => "quarantine".into(),
+        Operation::Release => "release".into(),
+        Operation::Update { version, .. } => {
+            format!("update to {}", vk_hub_proto::display_safe(version))
+        }
     }
 }
 
@@ -1554,6 +1559,13 @@ fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
     clean(&mut inventory.versions.vk);
     clean_opt(&mut inventory.versions.guest_kernel);
     clean(&mut inventory.versions.config_hash);
+    let sha = &mut inventory.versions.vk_sha256;
+    if sha
+        .as_deref()
+        .is_some_and(|s| !vk_hub_proto::valid_sha256(s))
+    {
+        *sha = None;
+    }
     if let Some(runner) = inventory.runner.as_mut() {
         clean(&mut runner.config);
         for name in &mut runner.runners {
@@ -1563,13 +1575,23 @@ fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
     inventory
 }
 
-/// `report`'s strings made display-safe, its list cut like an inventory's.
+/// `report`'s strings made display-safe, its list cut like an inventory's. An update whose
+/// command ID or sha256 is malformed is dropped: both are identifiers, not text.
 fn display_safe_report(mut report: Report) -> Report {
     report.unsupported.truncate(MAX_INVENTORY_ITEMS);
+    report.update = report
+        .update
+        .filter(|u| vk_hub_proto::valid_id(&u.command) && vk_hub_proto::valid_sha256(&u.sha256));
+    let mut update = Vec::new();
+    if let Some(u) = report.update.as_mut() {
+        update.push(&mut u.version);
+        update.extend(u.message.as_mut());
+    }
     for s in report
         .unsupported
         .iter_mut()
         .chain(report.concurrency_error.as_mut())
+        .chain(update)
     {
         *s = vk_hub_proto::display_safe(s);
     }
@@ -1889,6 +1911,7 @@ mod tests {
             hostname: "renamed\u{1b}[2J".into(),
             versions: vk_hub_proto::Versions {
                 vk: "0.80\u{202e}.0".into(),
+                vk_sha256: Some("ab\u{1b}[2J".into()),
                 ..Default::default()
             },
             ..Inventory::default()
@@ -1900,7 +1923,9 @@ mod tests {
         assert_eq!(row.incarnation.as_deref(), Some("inc"));
         assert_eq!(row.protocol, Some(2));
         assert_eq!(row.hostname, "renamed[2J");
-        assert_eq!(row.inventory.as_ref().unwrap().versions.vk, "0.80.0");
+        let versions = &row.inventory.as_ref().unwrap().versions;
+        assert_eq!(versions.vk, "0.80.0");
+        assert_eq!(versions.vk_sha256, None);
         assert_eq!((row.heartbeat_at, row.last_seen), (Some(4), Some(4)));
         assert!(row.inventory.is_some() && row.heartbeat.is_some());
         assert!(
@@ -2029,6 +2054,17 @@ mod tests {
         assert_eq!(db.workloads(&id).unwrap(), None);
     }
 
+    /// An update's progress with `junk` in each of its free-text strings.
+    fn update(junk: &str) -> vk_hub_proto::UpdateProgress {
+        vk_hub_proto::UpdateProgress {
+            command: "c".repeat(32),
+            version: format!("v{junk}"),
+            sha256: "ab".repeat(vk_hub_proto::SHA256_LEN),
+            phase: vk_hub_proto::UpdatePhase::RolledBack,
+            message: Some(format!("m{junk}")),
+        }
+    }
+
     /// A report's steering is stored on the row display-safe, its workloads apart; one that
     /// has not listed workloads yet still replaces it.
     #[test]
@@ -2041,6 +2077,7 @@ mod tests {
             state: Some(vk_hub_proto::NodeState::Draining),
             unsupported: vec!["no\u{1b}[2J".into()],
             concurrency_error: Some("bad\u{202e}".into()),
+            update: Some(update("\u{202e}")),
             ..Report::default()
         };
         db.record_report(&id, report, 2).unwrap();
@@ -2051,10 +2088,29 @@ mod tests {
                 state: Some(vk_hub_proto::NodeState::Draining),
                 unsupported: vec!["no[2J".into()],
                 concurrency_error: Some("bad".into()),
+                update: Some(update("")),
                 ..Report::default()
             })
         );
         assert_eq!(row.workloads, Some(2));
+        for bad in [
+            vk_hub_proto::UpdateProgress {
+                command: "c\u{202e}".into(),
+                ..update("")
+            },
+            vk_hub_proto::UpdateProgress {
+                sha256: "../x".into(),
+                ..update("")
+            },
+        ] {
+            let report = Report {
+                update: Some(bad),
+                ..Report::default()
+            };
+            db.record_report(&id, report, 3).unwrap();
+            let row = db.node(&id).unwrap().unwrap();
+            assert_eq!(row.report.unwrap().update, None);
+        }
         db.record_report(&id, Report::default(), 3).unwrap();
         let row = db.node(&id).unwrap().unwrap();
         assert_eq!(row.report, Some(Report::default()));
