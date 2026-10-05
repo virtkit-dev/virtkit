@@ -23,17 +23,19 @@ The prototype provides, all experimentally:
 - on the node, those updates, run on trial and rolled back to the previous binary when the
   release does not pass, and releases checked against signing keys of the node's own (`vk
   release-key`);
+- on the hub, rollouts of a release by wave, with a canary per hardware profile (`vk-hub
+  rollout`);
 - `vk-hub workloads`: each node's VMs;
 - live nodes and node detail pages, steering from a node's page, and an audit log, with
   sign-in links from `vk-hub ui login`.
 
-Rollouts, resets, restart and redeploy are not built.
+Resets, restart and redeploy are not built.
 
 | Capability | Current prototype | Proposed gate |
 |---|---|---|
 | Hub recovery | Reissues its stored desired state above a newer node generation; adopts the node's applied state when it holds none | [Preserve node restrictions and resolve the recovery conflict explicitly](fleet-design.md#proposed-recovery-after-a-hub-restore) |
 | Update validation | `vk check`, an optional local validation command, then hub reconnection | [A pinned boot/exec/network/cleanup workload required for unattended rollouts](fleet-design.md#updates) |
-| Canary promotion | Not built | [Representative workload success and an observation window](fleet-design.md#updates) |
+| Canary promotion | One canary per hardware profile, promoted once its update is done, the release reported running and the node back ready or drained | [Representative workload success and an observation window](fleet-design.md#updates) |
 | Release trust | Signatures required by default only when keys are configured | [Pinned keys required for remote updates; explicit development opt-out](fleet-design.md#updates) |
 | Reset | Not built | [Explicit job process ownership, verified empty before scratch removal](fleet-design.md#resets) |
 
@@ -383,6 +385,49 @@ any drain, and again before the release first runs, using its current keys. With
 configured, the node rejects invalid signatures even when signatures are optional. The keys
 are pinned in the node's configuration, not in the `vk` binary. Official releases are not
 signed this way yet: that is a step for the release workflow, with the key in CI's secrets.
+
+## Rollouts
+
+`vk-hub rollout create --release <sha256> [--nodes all|<id>,…] [--batch N]
+[--canary-per-profile] [--max-failures N] [--node-timeout 30m] [--drain-timeout 4h]
+[--force]` puts the chosen nodes into waves — with canaries, wave 0 is one node of each
+hardware profile, and then batches of N in profile and hostname order — and a hub task issues
+each wave's updates once the wave before has finished. It prints the rollout's ID alone on
+stdout. A hardware profile is the CPU model, the RAM rounded to the nearest power of two in
+GiB, and the speed classes declared for the job and checkout filesystems: what makes hosts
+behave differently under one `vk`, and nothing a heartbeat moves.
+
+A node's update succeeds when its command is `done`, it reports the release's sha256 (its
+version, for a node that reports none), and it is back to work: `ready`, or `drained` — the
+state it was in when the update was issued, unless an operator drained or undrained it
+meanwhile. It has two windows. The drain has `--drain-timeout`, from the issue: it is the
+command's expiry, so a node that never takes the command refuses it as expired, and one still
+draining then calls the update off. The update proper has `--node-timeout`, from the node's
+report that its drain is over: the command carries it, and the node makes it its trial's
+deadline, rolling back past it. The hub counts the node failed two minutes after either
+window ends — it learns of the node's progress from reports, and its clock may lead the
+node's — so an update the rollout has given up on is never kept. A hub that has just started
+judges no window for two minutes, while its nodes reconnect: its database predates its
+downtime. A node also fails when its command fails or is refused, when it is removed, or when
+it ends its update quarantined.
+
+A failure pauses the rollout; `rollout resume` carries on past the failed node, and a failure
+past `--max-failures` aborts it instead; a node whose update ends after an abort is recorded
+but not counted. A node is skipped from the start, so canaries are picked among the others,
+when it is monitored only (its latest session at protocol version 1), already runs the
+release, is quarantined, has not reported its state yet, or — unless `--force` — has an
+external runner, which cannot be drained. When its wave comes, a node is skipped for any of
+these, when it has been removed, when it is draining or in maintenance of its own, or when an
+update an operator issued it before the rollout reached it is still under way.
+`rollout status [<id>]`, `pause`, `resume` and `abort` steer it; pausing or aborting issues
+nothing more, and updates under way finish and are still recorded. One rollout runs at a time,
+a release is kept while a rollout of it is not over, and `vk-hub nodes update` refuses a node a
+running or paused rollout has still to update. The rollout and its nodes' states are one row in
+the hub's database, written in one transaction with the commands it issues and the audit lines
+that describe each step; a pass that changes nothing writes nothing; the hub task advances
+every rollout from the database at start, whenever a node reports, and every five seconds, so a
+restarted hub carries on where it stopped. A rollout that cannot advance holds none of the
+others back.
 
 ## Workloads
 

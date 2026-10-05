@@ -1,6 +1,6 @@
-//! `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub workloads`, `vk-hub audit`,
-//! `vk-hub ui` and `vk-hub local login`, `sessions` and `logout` reach the running hub through
-//! a unix socket in its data directory.
+//! `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub rollout`, `vk-hub workloads`,
+//! `vk-hub audit`, `vk-hub ui` and `vk-hub local login`, `sessions` and `logout` reach the
+//! running hub through a unix socket in its data directory.
 //!
 //! Enrollment tokens admit machines to the fleet and must be issued outside the node-facing
 //! network; sign-in links must be issued outside the web UI. The CLI cannot open the database:
@@ -26,6 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::ops::{self, NodeView};
+use crate::rollout::{Rollout, RolloutAction};
 use crate::server::Hub;
 use crate::store::{AuditRow, Release, Role, UiSession};
 use vk_hub_proto::{Acquisition, Command, DesiredState, Operation};
@@ -96,6 +97,15 @@ enum Call {
     ListReleases,
     RemoveRelease {
         release: String,
+    },
+    CreateRollout {
+        plan: ops::RolloutPlan,
+    },
+    ListRollouts,
+    /// Pause, resume or abort a rollout, named by its ID or a prefix of it.
+    SteerRollout {
+        id: String,
+        action: RolloutAction,
     },
     /// The latest `limit` audit lines, of one node or of all.
     Audit {
@@ -306,6 +316,13 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
             let removed = crate::releases::remove(hub, &actor, &release.sha256)?;
             serde_json::to_value(removed.then_some(release))?
         }
+        Call::CreateRollout { plan } => {
+            serde_json::to_value(ops::create_rollout(hub, &actor, &plan)?)?
+        }
+        Call::ListRollouts => serde_json::to_value(ops::rollouts(hub)?)?,
+        Call::SteerRollout { id, action } => {
+            serde_json::to_value(ops::steer_rollout(hub, &actor, &id, action)?)?
+        }
         Call::Audit { node, limit } => serde_json::to_value(audit(hub, node.as_deref(), limit)?)?,
         Call::UiLogin { role, ttl_secs } => {
             let Some(base) = &hub.ui_url else {
@@ -468,6 +485,23 @@ impl Client {
     pub fn remove_release(&self, release: &str) -> Result<Option<Release>> {
         self.call(Call::RemoveRelease {
             release: release.to_string(),
+        })
+    }
+
+    pub fn create_rollout(&self, plan: ops::RolloutPlan) -> Result<Rollout> {
+        self.call(Call::CreateRollout { plan })
+    }
+
+    /// Newest first.
+    pub fn rollouts(&self) -> Result<Vec<Rollout>> {
+        self.call(Call::ListRollouts)
+    }
+
+    /// The rollout as it now is.
+    pub fn steer_rollout(&self, id: &str, action: RolloutAction) -> Result<Rollout> {
+        self.call(Call::SteerRollout {
+            id: id.to_string(),
+            action,
         })
     }
 

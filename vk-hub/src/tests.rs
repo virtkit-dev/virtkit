@@ -1551,6 +1551,449 @@ async fn an_update_names_a_held_release_and_refuses_a_version_1_node() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A node of `hub` enrolled as `name`, with no session yet.
+fn enroll_as(hub: &Hub, name: &str) -> String {
+    let key = vk_hub_proto::to_hex(keypair().public_key().as_ref());
+    match hub
+        .db
+        .enroll(&token(hub), &key, name, "peer", now_secs())
+        .unwrap()
+    {
+        Enrollment::Enrolled { node_id } => node_id,
+        other => panic!("expected an enrollment, got {other:?}"),
+    }
+}
+
+/// Say on behalf of node `id` that it is ready, runs its runner itself and runs the `vk`
+/// whose sha256 is `sha256`.
+fn ready_on(hub: &Hub, id: &str, sha256: &str) {
+    let mut inventory = Inventory {
+        hostname: hub.db.node(id).unwrap().unwrap().hostname,
+        ..Inventory::default()
+    };
+    inventory.versions.vk_sha256 = Some(sha256.into());
+    hub.db
+        .record_inventory(id, inventory, true, now_secs())
+        .unwrap();
+    hub.db
+        .record_report(
+            id,
+            vk_hub_proto::Report {
+                state: Some(vk_hub_proto::NodeState::Ready),
+                runner: Some(vk_hub_proto::RunnerMode::Managed),
+                ..vk_hub_proto::Report::default()
+            },
+            now_secs(),
+        )
+        .unwrap();
+}
+
+/// What node `id` says its one pending command came to.
+fn ack_only(hub: &Hub, id: &str, outcome: vk_hub_proto::Outcome) -> vk_hub_proto::Command {
+    let mut pending = hub.db.pending_commands(id, now_secs()).unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    let command = pending.remove(0);
+    let ack = vk_hub_proto::CommandAck {
+        id: command.id.clone(),
+        outcome,
+    };
+    assert!(hub.db.record_ack(id, &ack, now_secs()).unwrap());
+    command
+}
+
+fn rollout_plan(release: &str, canaries: bool, max_failures: u32) -> ops::RolloutPlan {
+    ops::RolloutPlan {
+        release: release.into(),
+        nodes: ops::Selection::All,
+        batch: 1,
+        canary_per_profile: canaries,
+        max_failures,
+        node_timeout_secs: 600,
+        drain_timeout_secs: 600,
+        force: false,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollout_updates_wave_by_wave_and_pauses_on_a_failure() {
+    let (dir, _, hub) = start_releases("rollout", None).await;
+    let release = add_release(&hub, &dir, &fake_vk("0.85.0"), "0.85.0").unwrap();
+    let (a, b, c, old) = (
+        enroll_as(&hub, "a"),
+        enroll_as(&hub, "b"),
+        enroll_as(&hub, "c"),
+        enroll_as(&hub, "old"),
+    );
+    ready_on(&hub, &a, &"00".repeat(32));
+    ready_on(&hub, &b, &"00".repeat(32));
+    ready_on(&hub, &c, &release.sha256);
+    // A node whose latest session ran version 1 is monitored only, and left out.
+    assert!(
+        hub.db
+            .record_session(&old, "ab", 1, now_secs(), || true)
+            .unwrap()
+    );
+    let plan = rollout_plan(&release.sha256[..8], true, 1);
+    let rollout = ops::create_rollout(&hub, "uid 0", &plan).unwrap();
+    let skipped = |id: &str| match &rollout
+        .row
+        .nodes
+        .iter()
+        .find(|n| n.id == id)
+        .unwrap()
+        .status
+    {
+        rollout::NodeStatus::Skipped { reason } => reason.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert!(skipped(&old).contains("protocol version 1"));
+    assert!(skipped(&c).contains("already runs"));
+    // One rollout at a time.
+    let err = ops::create_rollout(&hub, "uid 0", &plan).unwrap_err();
+    assert!(format!("{err:#}").contains("still running"), "{err:#}");
+    let advance = || hub.db.advance_rollout(&rollout.id, now_secs(), 0).unwrap();
+    // The canary: all share a profile, so one node, alone.
+    let (_, issued) = advance();
+    assert_eq!(issued.len(), 1);
+    let first = issued[0].clone();
+    let second = if first == a { b.clone() } else { a.clone() };
+    assert!(
+        hub.db
+            .pending_commands(&second, now_secs())
+            .unwrap()
+            .is_empty()
+    );
+    // The update carries the node timeout as its deadline, and expires with the drain's.
+    let command = hub
+        .db
+        .pending_commands(&first, now_secs())
+        .unwrap()
+        .remove(0);
+    assert!(matches!(
+        command.op,
+        vk_hub_proto::Operation::Update {
+            within_secs: Some(600),
+            ..
+        }
+    ));
+    assert!(command.expires_at <= now_secs() + 600);
+    // An update of an operator's on the side is refused.
+    let err = ops::update(&hub, "uid 0", &second, &release.sha256, false).unwrap_err();
+    assert!(format!("{err:#}").contains("abort it first"), "{err:#}");
+    assert_eq!(advance(), (false, vec![]));
+    ack_only(&hub, &first, vk_hub_proto::Outcome::Done);
+    // Done, but not yet running the release: waited for.
+    assert!(advance().1.is_empty());
+    ready_on(&hub, &first, &release.sha256);
+    // Updated and back: the next wave starts.
+    assert_eq!(advance().1, std::slice::from_ref(&second));
+    ack_only(
+        &hub,
+        &second,
+        vk_hub_proto::Outcome::Failed {
+            message: "rolled back: validation failed".into(),
+        },
+    );
+    advance();
+    let (_, row) = hub.db.resolve_rollout(&rollout.id[..6]).unwrap();
+    assert!(
+        matches!(&row.state, rollout::RolloutState::Paused { reason } if reason.contains("rolled back")),
+        "{row:?}"
+    );
+    // The release stays while its rollout is not over.
+    let err = releases::remove(&hub, "uid 0", &release.sha256).unwrap_err();
+    assert!(format!("{err:#}").contains("is paused"), "{err:#}");
+    let resumed =
+        ops::steer_rollout(&hub, "uid 0", &rollout.id, rollout::RolloutAction::Resume).unwrap();
+    assert_eq!(resumed.row.state, rollout::RolloutState::Running);
+    advance();
+    let (_, row) = hub.db.resolve_rollout(&rollout.id).unwrap();
+    assert_eq!(row.state, rollout::RolloutState::Done);
+    let events: Vec<String> = hub
+        .db
+        .audits(None, 100)
+        .unwrap()
+        .into_iter()
+        .map(|r| format!("{}: {}", r.actor, r.event))
+        .collect();
+    for want in [
+        "started rollout",
+        "4 node(s), 2 skipped from the start",
+        "updated to vk 0.85.0",
+        "paused: a node failed",
+        "resumed rollout",
+        "done: vk 0.85.0 on 1 node(s), 1 failed, 2 skipped",
+    ] {
+        assert!(
+            events.iter().any(|e| e.contains(want)),
+            "{want}: {events:?}"
+        );
+    }
+    let err =
+        ops::steer_rollout(&hub, "uid 0", &rollout.id, rollout::RolloutAction::Pause).unwrap_err();
+    assert!(format!("{err:#}").contains("cannot be paused"), "{err:#}");
+    // Over: the release can go.
+    assert!(releases::remove(&hub, "uid 0", &release.sha256).unwrap());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aborted_rollout_issues_nothing_more_and_frees_its_nodes() {
+    let (dir, _, hub) = start_releases("rollout-abort", None).await;
+    let release = add_release(&hub, &dir, &fake_vk("0.85.0"), "0.85.0").unwrap();
+    let (a, b) = (enroll_as(&hub, "a"), enroll_as(&hub, "b"));
+    ready_on(&hub, &a, &"00".repeat(32));
+    ready_on(&hub, &b, &"00".repeat(32));
+    let rollout =
+        ops::create_rollout(&hub, "uid 0", &rollout_plan(&release.sha256, false, 0)).unwrap();
+    let (_, issued) = hub.db.advance_rollout(&rollout.id, now_secs(), 0).unwrap();
+    assert_eq!(issued, std::slice::from_ref(&a));
+    let aborted = ops::steer_rollout(
+        &hub,
+        "uid 0",
+        &rollout.id[..4],
+        rollout::RolloutAction::Abort,
+    )
+    .unwrap();
+    assert!(matches!(
+        aborted.row.state,
+        rollout::RolloutState::Aborted { .. }
+    ));
+    // The update under way finishes and is recorded; nothing more is issued.
+    ack_only(&hub, &a, vk_hub_proto::Outcome::Done);
+    ready_on(&hub, &a, &release.sha256);
+    let (changed, issued) = hub.db.advance_rollout(&rollout.id, now_secs(), 0).unwrap();
+    assert!(changed && issued.is_empty());
+    let (_, row) = hub.db.resolve_rollout(&rollout.id).unwrap();
+    assert!(matches!(
+        row.nodes[0].status,
+        rollout::NodeStatus::Succeeded { .. }
+    ));
+    assert_eq!(row.nodes[1].status, rollout::NodeStatus::Pending);
+    // Its nodes are an operator's again.
+    ops::update(&hub, "uid 0", &b, &release.sha256, false).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An update still under way when its rollout is aborted keeps the release, and its failure is
+/// recorded without counting against the rollout.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aborted_rollouts_straggler_keeps_its_release_and_fails_uncounted() {
+    let (dir, _, hub) = start_releases("rollout-straggler", None).await;
+    let release = add_release(&hub, &dir, &fake_vk("0.85.0"), "0.85.0").unwrap();
+    let a = enroll_as(&hub, "a");
+    ready_on(&hub, &a, &"00".repeat(32));
+    let rollout =
+        ops::create_rollout(&hub, "uid 0", &rollout_plan(&release.sha256, false, 0)).unwrap();
+    let (_, issued) = hub.db.advance_rollout(&rollout.id, now_secs(), 0).unwrap();
+    assert_eq!(issued, std::slice::from_ref(&a));
+    ops::steer_rollout(&hub, "uid 0", &rollout.id, rollout::RolloutAction::Abort).unwrap();
+    // Aborted, but a node is still updating to the release.
+    let err = releases::remove(&hub, "uid 0", &release.sha256).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("still being updated"),
+        "{err:#}"
+    );
+    ack_only(
+        &hub,
+        &a,
+        vk_hub_proto::Outcome::Failed {
+            message: "rolled back: validation failed".into(),
+        },
+    );
+    let (changed, issued) = hub.db.advance_rollout(&rollout.id, now_secs(), 0).unwrap();
+    assert!(changed && issued.is_empty());
+    let (_, row) = hub.db.resolve_rollout(&rollout.id).unwrap();
+    assert!(matches!(
+        &row.nodes[0].status,
+        rollout::NodeStatus::Failed { reason, .. } if reason.contains("rolled back")
+    ));
+    assert_eq!(row.failures, 0);
+    assert!(matches!(row.state, rollout::RolloutState::Aborted { .. }));
+    assert!(releases::remove(&hub, "uid 0", &release.sha256).unwrap());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A canary is picked among the nodes the rollout can update: one it could not would leave
+/// its profile without a canary.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_canary_is_one_the_rollout_can_update() {
+    let (dir, _, hub) = start_releases("rollout-canary", None).await;
+    let release = add_release(&hub, &dir, &fake_vk("0.85.0"), "0.85.0").unwrap();
+    let (a, b) = (enroll_as(&hub, "a"), enroll_as(&hub, "b"));
+    ready_on(&hub, &a, &"00".repeat(32));
+    ready_on(&hub, &b, &"00".repeat(32));
+    hub.db
+        .record_report(
+            &a,
+            vk_hub_proto::Report {
+                state: Some(vk_hub_proto::NodeState::Ready),
+                runner: Some(vk_hub_proto::RunnerMode::External),
+                ..vk_hub_proto::Report::default()
+            },
+            now_secs(),
+        )
+        .unwrap();
+    let mut plan = rollout_plan(&release.sha256, true, 0);
+    plan.nodes = ops::Selection::Nodes(vec![a[..7].to_string()]);
+    let err = ops::create_rollout(&hub, "uid 0", &plan).unwrap_err();
+    assert!(format!("{err:#}").contains("first 8 hex digits"), "{err:#}");
+    plan.nodes = ops::Selection::All;
+    let rollout = ops::create_rollout(&hub, "uid 0", &plan).unwrap();
+    let node = |id: &str| {
+        rollout
+            .row
+            .nodes
+            .iter()
+            .find(|n| n.id == id)
+            .unwrap()
+            .clone()
+    };
+    assert!(
+        matches!(&node(&a).status, rollout::NodeStatus::Skipped { reason } if reason.contains("external")),
+        "{:?}",
+        node(&a)
+    );
+    assert_eq!(node(&b).wave, 0);
+    let (_, issued) = hub.db.advance_rollout(&rollout.id, now_secs(), 0).unwrap();
+    assert_eq!(issued, std::slice::from_ref(&b));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// An update an operator issued before the rollout reached the node is left to finish: the
+/// rollout skips the node rather than issue it a second, which it would refuse.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollout_skips_a_node_with_an_update_of_its_own() {
+    let (dir, _, hub) = start_releases("rollout-own", None).await;
+    let release = add_release(&hub, &dir, &fake_vk("0.85.0"), "0.85.0").unwrap();
+    let a = enroll_as(&hub, "a");
+    ready_on(&hub, &a, &"00".repeat(32));
+    ops::update(&hub, "uid 0", &a, &release.sha256, false).unwrap();
+    let rollout =
+        ops::create_rollout(&hub, "uid 0", &rollout_plan(&release.sha256, false, 0)).unwrap();
+    let (_, issued) = hub.db.advance_rollout(&rollout.id, now_secs(), 0).unwrap();
+    assert!(issued.is_empty());
+    let (_, row) = hub.db.resolve_rollout(&rollout.id).unwrap();
+    assert!(
+        matches!(&row.nodes[0].status, rollout::NodeStatus::Skipped { reason } if reason.contains("of its own")),
+        "{row:?}"
+    );
+    assert_eq!(row.state, rollout::RolloutState::Done);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A hub restarted mid-rollout carries on from its database.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollout_survives_a_hub_restart() {
+    let dir = std::env::temp_dir().join(format!("vk-hub-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("data").join("hub.db");
+    let open = || {
+        Hub::new(Arc::new(Db::open(&db_path).unwrap()), None).with_releases(dir.join("releases"))
+    };
+    let hub = open();
+    let release = add_release(&hub, &dir, &fake_vk("0.85.0"), "0.85.0").unwrap();
+    let ids = [enroll_as(&hub, "a"), enroll_as(&hub, "b")];
+    for id in &ids {
+        ready_on(&hub, id, &"00".repeat(32));
+    }
+    let rollout =
+        ops::create_rollout(&hub, "uid 0", &rollout_plan(&release.sha256, false, 0)).unwrap();
+    let (_, issued) = hub.db.advance_rollout(&rollout.id, now_secs(), 0).unwrap();
+    assert_eq!(issued, [ids[0].clone()]);
+    drop(hub);
+
+    let hub = open();
+    // Back after longer than both windows: the database's facts predate the downtime, so the
+    // node has the grace to reconnect and report before it is judged.
+    let later = now_secs() + 10_000;
+    let not_before = later + rollout::GIVE_UP_GRACE_SECS;
+    assert_eq!(
+        hub.db
+            .advance_rollout(&rollout.id, later, not_before)
+            .unwrap(),
+        (false, vec![])
+    );
+    let (_, row) = hub.db.resolve_rollout(&rollout.id).unwrap();
+    assert!(
+        matches!(row.nodes[0].status, rollout::NodeStatus::Updating { .. }),
+        "{row:?}"
+    );
+    ack_only(&hub, &ids[0], vk_hub_proto::Outcome::Done);
+    ready_on(&hub, &ids[0], &release.sha256);
+    assert_eq!(
+        hub.db
+            .advance_rollout(&rollout.id, now_secs(), 0)
+            .unwrap()
+            .1,
+        [ids[1].clone()]
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `vk-hub rollout status` names each node's wave and how its update went.
+#[test]
+fn a_rollout_status_shows_each_node_by_wave() {
+    let row = rollout::RolloutRow {
+        release: "ab".repeat(32),
+        version: "0.85.0".into(),
+        created_at: 1_800_000_000,
+        created_by: "uid 0".into(),
+        batch: 1,
+        canary_per_profile: true,
+        max_failures: 0,
+        node_timeout_secs: 600,
+        drain_timeout_secs: 600,
+        force: false,
+        state: rollout::RolloutState::Paused {
+            reason: "a node failed: b".into(),
+        },
+        failures: 1,
+        nodes: vec![
+            rollout::RolloutNode {
+                id: "n1".into(),
+                hostname: "a".into(),
+                profile: "big".into(),
+                wave: 0,
+                status: rollout::NodeStatus::Succeeded { at: 1_800_000_060 },
+            },
+            rollout::RolloutNode {
+                id: "n2".into(),
+                hostname: "b".into(),
+                profile: "big".into(),
+                wave: 1,
+                status: rollout::NodeStatus::Failed {
+                    reason: "rolled back".into(),
+                    at: 1_800_000_120,
+                },
+            },
+            rollout::RolloutNode {
+                id: "n3".into(),
+                hostname: "c".into(),
+                profile: "big".into(),
+                wave: 2,
+                status: rollout::NodeStatus::Pending,
+            },
+        ],
+    };
+    let r = rollout::Rollout {
+        id: "cafe".repeat(4),
+        row,
+    };
+    let out = render_rollout(&r, 1_800_000_200);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines[0].contains("paused (a node failed: b) at wave 2"),
+        "{out}"
+    );
+    assert!(
+        lines[0].ends_with("1 pending, 1 succeeded, 1 failed"),
+        "{out}"
+    );
+    assert!(lines[2].contains("wave 1  n2") && lines[2].contains("failed: rolled back"));
+}
+
 #[test]
 fn times_read_as_people_write_them() {
     assert_eq!(utc(1_800_000_000), "2027-01-15T08:00:00Z");

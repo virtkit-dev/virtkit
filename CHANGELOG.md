@@ -59,6 +59,14 @@ All notable changes to virtkit will be documented in this file.
   `[node] release_keys` updates only to a release one of those keys signed
   (`require_signed = false` makes that optional), and refuses one whose signature does not
   verify either way.
+- **Experimental: `vk-hub rollout` updates a fleet a wave at a time.** `rollout create
+  --release <sha256>` updates the chosen hosts in batches (`--batch`), optionally one host of
+  each hardware profile first (`--canary-per-profile`), each wave only once the last is updated
+  and back to work. A failed host pauses the rollout until `rollout resume`, and too many
+  (`--max-failures`) abort it; `rollout status`, `pause` and `abort` follow and steer it, and
+  a restarted hub carries on where it stopped. A host gets `--drain-timeout` to drain and
+  `--node-timeout` to update after that. Hosts with an external runner are left out unless
+  `--force`, and hosts on 0.84.0 or earlier are left out.
 - **`vk tune` stands aside on a fleet node** while `vk node run` is up, and otherwise honours
   the ceiling the node last received.
 

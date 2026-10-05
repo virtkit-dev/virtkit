@@ -225,8 +225,9 @@ binary; future configuration migrations must separately preserve a form the prev
 can read.
 
 Rollouts go by hardware profile: one canary per profile, then small batches, each node
-validated before the next batch starts. Rollout state is to live in the hub's database, so a
-rollout survives a hub restart.
+updated, validated and back in its state before the next batch starts. Rollout state lives
+in the hub's database, so a rollout survives a hub restart. Built:
+[Rollouts](fleet-prototype.md#rollouts).
 
 `vk-selfupdate` provides the download, digest check, version smoke test and atomic rename.
 Fleet updates add:
@@ -267,7 +268,7 @@ a quiet node does not satisfy the gate merely by waiting. Persist the evidence a
 with the rollout so a hub restart does not bypass them. Allow operator-defined canary groups
 for material configuration differences, such as VMM version, kernel and executor settings,
 alongside the hardware profile. Show uncovered groups before starting a rollout. This gate is
-not built, nor are rollouts.
+not built: a canary is promoted as soon as its own update has passed.
 
 Release downloads are authenticated and scoped to a pending update; their bytes do not ride on
 the control session. The hub stores and serves releases this way
