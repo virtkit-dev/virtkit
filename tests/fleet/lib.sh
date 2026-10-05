@@ -1,7 +1,8 @@
 # Shared by tests/fleet-*.sh: a fleet as one `vk` compose group.
 #
 # The primary runs `vk-hub serve` over TLS, its certificate from a CA made for the run; each
-# node service runs `vk node run` with the `vk` under test shared in, not baked into an image.
+# node service runs `vk node run` from /opt/vk/bin/vk, copied on first boot from the shared
+# `vk` under test so updates can replace it. The binary is not baked into the image.
 # The tests drive the hub's CLI with `vk exec` into the primary, and start and stop node
 # services from there through /run/vk/services. Node guests nest, so each passes `vk check`
 # and enrolls itself with `vk node join`; its root persists, so it keeps its identity across
@@ -14,9 +15,10 @@
 #
 # Env: VK (default ./dist/vk) and VK_HUB (default: the vk-hub beside VK), the binaries under
 # test; VK_HUB_V1, an older vk-hub mounted beside it in the primary as vk-hub-v1 (HUB_BIN
-# picks which one hub_start and hub run); IMAGE, the node services' base image
-# (tests/fleet/node/Dockerfile otherwise); E2E_REQUIRE_KVM=1 fails, rather than skips, on a
-# host without KVM or nesting.
+# picks which one hub_start and hub run); VK_NEXT, a vk mounted in the primary as
+# /usr/local/share/vk-next, for the hub to hold as a release; IMAGE, the node services' base
+# image (tests/fleet/node/Dockerfile otherwise); E2E_REQUIRE_KVM=1 fails, rather than skips,
+# on a host without KVM or nesting.
 # Needs: KVM with nesting, openssl, and a registry to pull alpine.
 
 FLEET_LIB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -116,6 +118,7 @@ EOF
     echo "      - $VK_HUB:/usr/local/bin/vk-hub:ro"
     echo "      - ./hub:/etc/vk-hub:ro"
     [ -z "${VK_HUB_V1:-}" ] || echo "      - $VK_HUB_V1:/usr/local/bin/vk-hub-v1:ro"
+    [ -z "${VK_NEXT:-}" ] || echo "      - $VK_NEXT:/usr/local/share/vk-next:ro"
     echo "    x-virtkit: {mem: 512M}"
     local n
     for n in "$@"; do
