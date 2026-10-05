@@ -179,6 +179,13 @@ hub_audit() {
   hub audit --node "$1" --limit 200
 }
 
+# audit_says <id> <ERE>: node <id>'s audit log has a line matching <ERE>. Captured first: an
+# early-exiting grep -q would fail the pipeline under pipefail.
+audit_says() {
+  local a
+  a=$(hub_audit "$1") && grep -qE -- "$2" <<<"$a"
+}
+
 # `vk node <args>` on the test host, as node <name>: its own config and state dir.
 host_vk() {
   local name=$1

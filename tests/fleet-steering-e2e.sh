@@ -43,7 +43,6 @@ runner_pid() {
 }
 runner_up() { [ -n "$(runner_pid)" ]; }
 runner_down() { [ -z "$(runner_pid)" ]; }
-audit_says() { hub_audit "$1" | grep -qE -- "$2"; }
 
 wait_for 30 runner_up || fail "the managed node did not start its runner"
 wait_for 30 cell_is "$m" STATE ready || fail "managed is not ready: $(node_cell "$m" STATE)"
