@@ -15,7 +15,8 @@
 //! **State-changing requests** are `POST`s, and each must come from this UI's own pages —
 //! its `Origin` is the UI's own (a fleet hub's `ui_url`), or `Sec-Fetch-Site` says
 //! `same-origin` — and carry the session's CSRF token, derived from its secret, in a form
-//! field or header. Local mode's operations are `vk` commands ([`actions`]).
+//! field or header. A fleet hub's are the admin socket's steering operations ([`fleet`]),
+//! local mode's `vk` commands ([`actions`]).
 //!
 //! **A page** (`GET`) goes only to a request the UI's own pages made (`same-origin`) or no
 //! page made (`none`: the address bar, a bookmark, a link opened from a terminal).
@@ -316,7 +317,10 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
             get(&path, req.uri().query(), &auth, ui).await
         }
         (Method::POST, _) => match &ui.site {
-            Site::Fleet(_) => Ok(message(StatusCode::NOT_FOUND, "No such action.")),
+            Site::Fleet(_) => match fleet::action_node(&path) {
+                Some(id) => fleet::node_action(req, ui, id).await,
+                None => Ok(message(StatusCode::NOT_FOUND, "No such action.")),
+            },
             Site::Local(site) => match local::action_target(&path) {
                 Some(local::Target::Vm(id)) => actions::vm_action(req, ui, site, &id).await,
                 Some(local::Target::Dev(name)) => actions::dev_action(req, ui, site, &name).await,
@@ -708,7 +712,7 @@ fn page(html: html::Html) -> Response<Body> {
 }
 
 /// A page saying `text`, and nothing else.
-fn message(status: StatusCode, text: &'static str) -> Response<Body> {
+fn message(status: StatusCode, text: &str) -> Response<Body> {
     html_response(status, pages::message(text))
 }
 

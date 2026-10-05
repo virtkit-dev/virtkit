@@ -19,11 +19,10 @@ The prototype provides, all experimentally:
   to each node and shown beside what it reports (`vk-hub nodes ceiling`, `stop`, `resume`,
   `drain`, `undrain`, `quarantine`, `release`), and the audit log (`vk-hub audit`);
 - `vk-hub workloads`: each node's VMs;
-- live nodes and node detail pages, and an audit log, with sign-in links from
-  `vk-hub ui login`.
+- live nodes and node detail pages, steering from a node's page, and an audit log, with
+  sign-in links from `vk-hub ui login`.
 
-Steering is on the admin socket only: the web UI shows it and does not act on it. Releases,
-updates, rollouts, resets, restart and redeploy are not built.
+Releases, updates, rollouts, resets, restart and redeploy are not built.
 
 | Capability | Current prototype | Proposed gate |
 |---|---|---|
@@ -127,8 +126,9 @@ and `resume` stop and resume its acquisition: the node's desired state, kept on 
 generation that moves on every change, to one past both the hub's last and the one the node
 last reported applying. A ceiling of 0 is refused: gitlab-runner has none, and stopping
 acquisition is what it would mean. `vk-hub nodes drain`, `undrain`, `quarantine` and `release`
-issue a command, valid for a day. All of them go through the admin socket and are audited as
-`uid <n>`, the caller's.
+issue a command, valid for a day. On the admin socket they are audited as `uid <n>`, the
+caller's; an operator's node page in the web UI runs the same operations, audited as its
+session's principal (see [Web UI](#web-ui)).
 
 A session sends desired state once the node's report shows an older generation, once per
 generation, and each command without a final outcome once per session; nothing goes before the
@@ -306,22 +306,28 @@ an error.
 
 The UI serves the nodes table with the columns of `vk-hub nodes`; each node's inventory,
 heartbeat and workloads; and the audit log (`/audit`, filterable by node, 100 lines a page; the
-hub keeps the newest 100,000 rows). The fleet's pages only show the fleet: removing a node
-stays on the admin socket. A page is refused to a request whose `Sec-Fetch-Site` is
-`same-site` or `cross-site`.
+hub keeps the newest 100,000 rows). A node's page shows what the hub asks of it beside what it
+reports — its state, acquisition, runner, concurrency, drain progress and what it cannot
+carry out — and its 20 latest commands with their outcomes. An operator's node page offers
+the steering actions: a ceiling set or lifted, acquisition stopped or resumed, drain,
+undrain, quarantine, release. Each action returns a status line through htmx while the node's
+fragment updates live, and also works as a plain form. Monitoring-only nodes are marked,
+offer no actions and reject steering posts. Viewers have no actions. Removing a node stays
+on the admin socket. A page is refused to a request whose `Sec-Fetch-Site` is `same-site` or
+`cross-site`.
 
 The nodes table and a node's page stay live over server-sent events. The hub notes every
-heartbeat, report and session, by node. The nodes table is the same for everyone, so one task
-renders it on a change and every nodes page is sent that one rendering; a node's page is woken
-by changes to that node alone. A fragment is rendered at most once a second, and every
-heartbeat interval regardless — a node going quiet sends nothing — and sent only when it
-differs. Ages on the pages move in steps of a heartbeat, so a fleet with nothing new to report
-sends nothing but a keep-alive comment every 15 seconds, and a node reporting faster than that
-changes nothing about the rate. When its session ends, a stream sends a fragment saying so and
-a `close` event, on which htmx's SSE extension (`sse-close`) stops reconnecting; a page asking
-for a stream with the cookie of a session that has ended is answered the same, rather than
-refused into retrying. A stream whose browser stops reading is given up on, and its connection
-dropped.
+heartbeat, report, session, command outcome and desired-state change, by node. The nodes table
+is the same for everyone, so one task renders it on a change and every nodes page is sent that
+one rendering; a node's page is woken by changes to that node alone. A fragment is rendered at
+most once a second, and every heartbeat interval regardless — a node going quiet sends nothing
+— and sent only when it differs. Ages on the pages move in steps of a heartbeat, so a fleet
+with nothing new to report sends nothing but a keep-alive comment every 15 seconds, and a node
+reporting faster than that changes nothing about the rate. When its session ends, a stream
+sends a fragment saying so and a `close` event, on which htmx's SSE extension (`sse-close`)
+stops reconnecting; a page asking for a stream with the cookie of a session that has ended is
+answered the same, rather than refused into retrying. A stream whose browser stops reading is
+given up on, and its connection dropped.
 
 Streams hold connections — the listener speaks HTTP/1.1 only, HTTP/2 not being in the build —
 so at most 96 of its 128 are streams and at most 4 belong to one session — below the six a
@@ -367,8 +373,8 @@ instead (see [Local mode](#local-mode)).
 Every state-changing request is a `POST` from the UI's own origin — its `Origin`, or
 `Sec-Fetch-Site: same-origin` — carrying a CSRF token derived from the session's secret, and
 is done as the session's principal, `ui session <id> (<role>)`, which is what the audit log
-records. On a fleet hub the only one is signing out. Issuing a link, signing in and out, and
-ending sessions are audited too.
+records. On a fleet hub they are signing out and a node's steering actions. Issuing a link,
+signing in and out, and ending sessions are audited too.
 
 ## Local mode
 

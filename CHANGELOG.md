@@ -31,6 +31,12 @@ All notable changes to virtkit will be documented in this file.
   which hosts have not caught up, and what a host says it cannot do; `vk-hub audit` lists
   every operator action and what the hosts made of it. Hosts still on 0.84.0 or earlier are
   monitored only: the hub refuses to steer them until their `vk` is updated.
+- **Experimental: steer a host from its page in the `vk-hub` web UI.** An operator can set or
+  lift a host's ceiling, stop and resume it taking jobs, drain and undrain it, and quarantine
+  and release it, each recorded in the audit log under the operator's session. The page shows
+  what the hub asked beside what the host reports, drain progress, what the host says it
+  cannot do, and its latest command outcomes. A viewer gets no actions, and a
+  host still on 0.84.0 or earlier is shown as monitored only.
 - **`vk tune` stands aside on a fleet node** while `vk node run` is up, and otherwise honours
   the ceiling the node last received.
 

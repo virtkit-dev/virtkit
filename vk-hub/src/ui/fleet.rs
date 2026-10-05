@@ -1,12 +1,17 @@
-//! The fleet's site, for `vk-hub serve`: the nodes table, a page per node with its
-//! inventory, load and workloads, and the audit log by node. Read-only: nothing here changes
-//! a node.
+//! The fleet site for `vk-hub serve`: the nodes table, per-node inventory, load, workloads,
+//! steering, commands and audit log. Operators steer nodes through the shared admin-socket
+//! operations ([`crate::ops`]) as their session's principal. Monitoring-only nodes have no
+//! steering controls.
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use hyper::{Response, StatusCode};
-use vk_hub_proto::{SpeedClass, StorageRole};
+use hyper::body::Incoming;
+use hyper::header::{self, HeaderValue};
+use hyper::{Request, Response, StatusCode};
+use vk_hub_proto::{
+    Acquisition, Operation, Outcome, RunnerMode, RunnerState, SpeedClass, StorageRole,
+};
 
 use super::html::Html;
 use super::pages::{
@@ -14,10 +19,13 @@ use super::pages::{
     started,
 };
 use super::sse::{self, Source};
-use super::{Auth, Body, Ui, blocking, decode_form, field, message, page};
-use crate::ops::NodeView;
+use super::{Auth, Body, Ui, actions, blocking, decode_form, field, message, page};
+use crate::ops::{self, NodeView};
 use crate::server::{HEARTBEAT, Hub};
-use crate::store::NodeRow;
+use crate::store::{CommandRow, MonitoringOnly, NodeRow, NotEnrolled, Role};
+
+/// A node page's latest commands.
+const NODE_COMMANDS: usize = 20;
 
 /// What the fleet's pages keep: the nodes table, rendered once for every page listing it
 /// ([`sse::feed`]).
@@ -128,9 +136,13 @@ fn read_node(hub: &Hub, id: &str) -> Result<Option<NodeDetail>> {
     let Some((row, workloads)) = hub.db.node_with_workloads(id)? else {
         return Ok(None);
     };
+    let mut commands = hub.db.node_commands(id)?;
+    commands.reverse();
+    commands.truncate(NODE_COMMANDS);
     Ok(Some(NodeDetail {
         view: crate::ops::node_view(hub, id.to_string(), &row),
         workloads,
+        commands,
         row,
     }))
 }
@@ -141,6 +153,136 @@ struct NodeDetail {
     row: NodeRow,
     /// `None` until the node has listed any.
     workloads: Option<crate::store::Workloads>,
+    /// The latest, newest first.
+    commands: Vec<CommandRow>,
+}
+
+/// `/node/<id>/action`'s node, if `path` is that for a well-formed ID.
+pub(super) fn action_node(path: &str) -> Option<&str> {
+    path.strip_prefix("/node/")?
+        .strip_suffix("/action")
+        .filter(|id| vk_hub_proto::valid_id(id))
+}
+
+/// What an operator asks of a node.
+enum Steer {
+    Ceiling(Option<u32>),
+    Acquisition(Acquisition),
+    Command(Operation),
+}
+
+/// The actions a node's page offers beside setting a ceiling, as `(op, label)`.
+const NODE_OPS: [(&str, &str); 7] = [
+    ("lift-ceiling", "lift ceiling"),
+    ("stop", "stop acquisition"),
+    ("resume", "resume acquisition"),
+    ("drain", "drain"),
+    ("undrain", "undrain"),
+    ("quarantine", "quarantine"),
+    ("release", "release"),
+];
+
+/// What `form` asks, or why it is no action.
+fn steer(form: &[(String, String)]) -> Result<Steer, &'static str> {
+    Ok(match field(form, "op").unwrap_or("") {
+        "ceiling" => match field(form, "ceiling").map(|c| c.trim().parse::<u32>()) {
+            Some(Ok(n)) if n > 0 => Steer::Ceiling(Some(n)),
+            _ => {
+                return Err(
+                    "Refused: a ceiling is a number of jobs, at least 1. To take none, \
+                     stop acquisition.",
+                );
+            }
+        },
+        "lift-ceiling" => Steer::Ceiling(None),
+        "stop" => Steer::Acquisition(Acquisition::Stop),
+        "resume" => Steer::Acquisition(Acquisition::Run),
+        "drain" => Steer::Command(Operation::Drain),
+        "undrain" => Steer::Command(Operation::Undrain),
+        "quarantine" => Steer::Command(Operation::Quarantine),
+        "release" => Steer::Command(Operation::Release),
+        _ => return Err("No such action."),
+    })
+}
+
+/// `POST /node/<id>/action`: run the shared admin-socket operation as the operator's session
+/// principal. For htmx, return a status line while the node's fragment updates live.
+/// For plain forms, redirect to the node's page or show the refusal.
+pub(super) async fn node_action(
+    req: Request<Incoming>,
+    ui: &Ui,
+    id: &str,
+) -> Result<Response<Body>> {
+    let htmx = req.headers().contains_key("hx-request");
+    let (auth, form) = match super::check_post(req, ui, Role::Operator).await? {
+        Ok(checked) => checked,
+        Err((status, text)) => return Ok(actions::refused(htmx, status, text)),
+    };
+    let steer = match steer(&form) {
+        Ok(steer) => steer,
+        Err(why) => return Ok(actions::refused(htmx, StatusCode::BAD_REQUEST, why)),
+    };
+    let principal = auth.session.principal();
+    let hub = ui.hub.clone();
+    let node = id.to_string();
+    let done = blocking(move || {
+        let desired = |d: Option<vk_hub_proto::DesiredState>| match d {
+            Some(d) => format!(
+                "The hub now asks generation {}: ceiling {}, acquisition {}.",
+                d.generation,
+                pages::count(d.ceiling),
+                crate::acquisition_name(d.acquisition)
+            ),
+            None => "Already so; nothing changed.".to_string(),
+        };
+        Ok(match steer {
+            Steer::Ceiling(ceiling) => {
+                ops::set_ceiling(&hub, &principal, &node, ceiling).map(desired)
+            }
+            Steer::Acquisition(a) => ops::set_acquisition(&hub, &principal, &node, a).map(desired),
+            Steer::Command(op) => ops::command(&hub, &principal, &node, op).map(|c| {
+                format!(
+                    "Issued {} (command {}); what the node makes of it shows below.",
+                    crate::store::operation_name(&c.op),
+                    c.id
+                )
+            }),
+        })
+    })
+    .await?;
+    let said = match done {
+        Ok(said) => said,
+        Err(e) if e.is::<MonitoringOnly>() => {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::CONFLICT,
+                &format!("Refused: {e:#}."),
+            ));
+        }
+        Err(e) if e.is::<NotEnrolled>() => {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::NOT_FOUND,
+                "There is no such node.",
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    if !htmx {
+        let mut resp = Response::new(Body::default());
+        *resp.status_mut() = StatusCode::SEE_OTHER;
+        // The node's ID: the router took it as hex.
+        resp.headers_mut().insert(
+            header::LOCATION,
+            HeaderValue::from_str(&format!("/node/{id}"))?,
+        );
+        return Ok(resp);
+    }
+    let mut h = Html::new();
+    h.raw("<div id=\"flash\" hx-swap-oob=\"true\">")
+        .text(said)
+        .raw("</div>");
+    Ok(actions::swap_none(super::html_response(StatusCode::OK, h)))
 }
 
 /// The page around `main`, with the fleet's navigation.
@@ -165,6 +307,7 @@ fn nodes(auth: &Auth, nodes: &[NodeView], now: u64) -> Html {
 // workloads; checked against the columns' names, so a reordering fails to build.
 const NODE_ID: usize = 0;
 const NODE_NAME: usize = 1;
+const NODE_SYNC: usize = 7;
 const NODE_LAST_SEEN: usize = 8;
 const NODE_VK: usize = 9;
 const VM_KIND: usize = 0;
@@ -176,6 +319,7 @@ const VM_STARTED: usize = 7;
 const _: () = {
     let nodes = &crate::NODE_COLUMNS;
     assert!(column_is(nodes, NODE_ID, "ID") && column_is(nodes, NODE_NAME, "NAME"));
+    assert!(column_is(nodes, NODE_SYNC, "SYNC"));
     assert!(column_is(nodes, NODE_LAST_SEEN, "LAST SEEN") && column_is(nodes, NODE_VK, "VK"));
     let vms = &crate::workloads::COLUMNS;
     assert!(column_is(vms, VM_KIND, "KIND") && column_is(vms, VM_ID, "ID"));
@@ -257,18 +401,40 @@ fn nodes_table(nodes: &[NodeView], now: u64) -> Html {
 
 /// `/node/<id>`.
 ///
-/// The node's ID goes into `sse-connect`: it is one the hub issued, and the router takes only
-/// hex for one.
+/// The node's ID goes into `sse-connect` and the forms' paths: it is one the hub issued, and
+/// the router takes only hex for one.
 fn node(auth: &Auth, detail: &NodeDetail, now: u64) -> Html {
     let id = &detail.view.id;
     let mut main = Html::new();
     main.raw("<h1>").node(&detail.view.hostname).raw("</h1>");
+    if auth.session.role >= Role::Operator && !detail.view.monitoring_only() {
+        steer_forms(&mut main, auth, id);
+    }
     main.raw("<div id=\"detail\" hx-ext=\"sse\" sse-connect=\"/events/node/")
         .text(id)
         .raw("\" sse-swap=\"node\" sse-close=\"close\">")
         .html(&node_detail(detail, now))
         .raw("</div>");
     layout(&detail.view.hostname, auth, &main)
+}
+
+/// An operator's forms, outside the live fragment so an update never clears one being filled
+/// in or the flash. Each posts by htmx, and works as a plain form too.
+fn steer_forms(h: &mut Html, auth: &Auth, id: &str) {
+    let path = format!("/node/{id}/action");
+    h.raw("<section><h2>Steer</h2><div class=\"actions\"><form method=\"post\" action=\"")
+        .text(&path)
+        .raw("\" hx-post=\"")
+        .text(&path)
+        .raw("\" hx-swap=\"none\">");
+    pages::csrf_field(h, auth);
+    h.raw("<input type=\"hidden\" name=\"op\" value=\"ceiling\">")
+        .raw("<input type=\"number\" name=\"ceiling\" min=\"1\" required aria-label=\"ceiling\">")
+        .raw("<button>set ceiling</button></form>");
+    for (op, label) in NODE_OPS {
+        actions::op_form(h, auth, &path, op, label);
+    }
+    h.raw("</div><div id=\"flash\"></div></section>");
 }
 
 /// How long before `now` the instant `then` was, in steps of a heartbeat under a minute:
@@ -308,6 +474,8 @@ fn node_detail(d: &NodeDetail, now: u64) -> Html {
                 .map_or_else(|| "never".to_string(), |t| age(now, t)),
         )
         .raw("</p>");
+
+    steering(&mut h, d, now);
 
     let heartbeat = d.row.heartbeat.as_ref();
     section(&mut h, "Load");
@@ -461,6 +629,158 @@ fn node_detail(d: &NodeDetail, now: u64) -> Html {
     }
 
     h
+}
+
+/// Show desired and reported state and recent commands, or a monitoring-only notice.
+fn steering(h: &mut Html, d: &NodeDetail, now: u64) {
+    let v = &d.view;
+    if let Some(version) = v.protocol.filter(|_| v.monitoring_only()) {
+        section(h, "Steering");
+        kv(
+            h,
+            "steering",
+            &format!(
+                "none: the node speaks fleet protocol version {version}, so the hub monitors it \
+                 and cannot steer it; update its vk"
+            ),
+        );
+        end_section(h);
+        return;
+    }
+
+    section(h, "Asked by the hub");
+    match &v.desired {
+        None => kv(
+            h,
+            "desired state",
+            "nothing asked: no ceiling, acquisition running",
+        ),
+        Some(desired) => {
+            kv(h, "generation", &desired.generation.to_string());
+            kv(h, "ceiling", &count(desired.ceiling));
+            kv(
+                h,
+                "acquisition",
+                crate::acquisition_name(desired.acquisition),
+            );
+        }
+    }
+    kv(h, "sync", &crate::node_cells(v, now)[NODE_SYNC]);
+    end_section(h);
+
+    section(h, "Reported by the node");
+    match &v.report {
+        None => kv(h, "report", "none yet"),
+        Some(r) => {
+            let or_dash = |s: Option<&str>| s.unwrap_or("-").to_string();
+            kv(
+                h,
+                "applied generation",
+                &r.applied_generation.map_or_else(dash, |g| g.to_string()),
+            );
+            kv(h, "state", &or_dash(r.state.map(crate::store::state_name)));
+            kv(
+                h,
+                "acquisition",
+                &or_dash(r.acquisition.map(crate::acquisition_name)),
+            );
+            kv(
+                h,
+                "runner",
+                &or_dash(r.runner.map(|m| match m {
+                    RunnerMode::Managed => "managed",
+                    RunnerMode::External => "external",
+                })),
+            );
+            if let Some(state) = r.runner_state {
+                kv(
+                    h,
+                    "runner process",
+                    match state {
+                        RunnerState::Running => "running",
+                        RunnerState::Quitting => "quitting: finishing its jobs",
+                        RunnerState::Stopped => "stopped",
+                    },
+                );
+            }
+            if let Some(c) = r.concurrency {
+                kv(
+                    h,
+                    "concurrency",
+                    &format!(
+                        "{}: the least of the estimate {}, the hub's ceiling {} and the local \
+                         ceiling {}",
+                        count(c.effective),
+                        count(c.estimate),
+                        count(c.hub_ceiling),
+                        count(c.local_ceiling)
+                    ),
+                );
+            }
+            if let Some(p) = r.drain {
+                kv(
+                    h,
+                    "drain",
+                    &format!(
+                        "runner {}, admission ledger {}, {} job(s) running",
+                        if p.runner_stopped {
+                            "stopped"
+                        } else {
+                            "still running"
+                        },
+                        if p.ledger_empty { "empty" } else { "in use" },
+                        p.active_jobs
+                    ),
+                );
+            }
+            for note in &r.unsupported {
+                kv_node(h, "cannot comply", note);
+            }
+            if let Some(e) = &r.concurrency_error {
+                kv_node(h, "cannot set its concurrency", e);
+            }
+        }
+    }
+    end_section(h);
+
+    commands(h, d, now);
+}
+
+/// The node's latest commands and what it made of them.
+fn commands(h: &mut Html, d: &NodeDetail, now: u64) {
+    h.raw("<section><h2>Commands</h2>");
+    if d.commands.is_empty() {
+        h.raw("<p class=\"empty\">none</p>");
+    } else {
+        h.raw("<table class=\"grid\"><thead><tr><th>issued</th><th>command</th>")
+            .raw("<th>outcome</th><th>expires</th></tr></thead><tbody>");
+        for c in &d.commands {
+            h.raw("<tr><td>")
+                .text(started(c.issued_at))
+                .raw("</td><td>")
+                .text(crate::store::operation_name(&c.command.op))
+                .raw(" <code>")
+                .text(&c.command.id)
+                .raw("</code></td><td>");
+            match &c.outcome {
+                None if c.command.expires_at <= now => h.raw("expired, never taken"),
+                None => h.raw("not taken yet"),
+                Some(Outcome::Accepted) => h.raw("under way"),
+                Some(Outcome::Done) => h.raw("done"),
+                Some(Outcome::Failed { message }) => h.raw("failed: ").node(message),
+                Some(Outcome::Refused { reason }) => h.raw("refused: ").node(reason),
+                Some(Outcome::Expired) => h.raw("expired"),
+            };
+            h.raw("</td><td>")
+                .text(started(c.command.expires_at))
+                .raw("</td></tr>");
+        }
+        h.raw("</tbody></table>");
+    }
+    // The node's ID: the router took it as hex.
+    h.raw("<p><a href=\"/audit?node=")
+        .text(&d.view.id)
+        .raw("\">the node's audit log</a></p></section>");
 }
 
 /// The VMs the node reports running, with what each holds from the last heartbeat. Every

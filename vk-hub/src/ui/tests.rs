@@ -2469,18 +2469,18 @@ async fn over_https_the_session_cookie_is_host_bound_and_secure() {
     assert!(hub.db.ui_sessions(crate::now_secs()).unwrap().is_empty());
 }
 
-/// The fleet's pages change nothing: a post anywhere but the sign-in and sign-out paths is
-/// no action, even from a signed-in operator's own page. A request for another host is told
-/// where the fleet's UI is configured.
+/// A post to the fleet's pages is a node's action or none: one for a VM, or an action a node
+/// has not, changes nothing, even from a signed-in operator's own page. A request for another
+/// host is told where the fleet's UI is configured.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_fleet_takes_no_action_and_names_its_ui_url() {
+async fn the_fleet_takes_only_node_actions_and_names_its_ui_url() {
     let (addr, hub, origin) = start_fleet().await;
     let node = enrolled_node(&hub, "ci-1");
     let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
     let audit_before = hub.db.audits(None, 100).unwrap();
-    for path in [
-        format!("/node/{node}/action"),
-        "/vm/0123456789abcdef/action".into(),
+    for (path, status) in [
+        (format!("/node/{node}/action"), 400),
+        ("/vm/0123456789abcdef/action".into(), 404),
     ] {
         let reply = request(
             addr,
@@ -2494,7 +2494,8 @@ async fn the_fleet_takes_no_action_and_names_its_ui_url() {
             &format!("_csrf={csrf}&op=remove&confirm=yes"),
         )
         .await;
-        assert_eq!(reply.status, 404, "{path}: {}", reply.body);
+        assert_eq!(reply.status, status, "{path}: {}", reply.body);
+        assert!(reply.body.contains("No such action."), "{}", reply.body);
     }
     assert!(hub.db.node(&node).unwrap().is_some());
     assert_eq!(hub.db.audits(None, 100).unwrap(), audit_before);
@@ -2508,4 +2509,253 @@ async fn the_fleet_takes_no_action_and_names_its_ui_url() {
         "{}",
         reply.body
     );
+}
+
+/// The node's audit lines, as `(actor, event)`.
+fn node_audit(hub: &Hub, node: &str) -> Vec<(String, String)> {
+    hub.db
+        .audits(Some(node), 100)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.actor, r.event))
+        .collect()
+}
+
+/// An operator's node page sets and lifts a ceiling, stops and resumes acquisition, and
+/// issues each command, as the session's principal, which the audit log records; by htmx
+/// it is told what came of it, and a plain form goes back to the node's page. The page,
+/// live, shows what the hub asks, what the node reports and its commands, the node's words
+/// as text.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_steers_a_node_from_its_page() {
+    use vk_hub_proto::{Acquisition, NodeState, Outcome};
+    let (addr, hub, origin) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
+    assert!(principal.ends_with("(operator)"), "{principal}");
+    let path = format!("/node/{node}/action");
+
+    let page = get(addr, &format!("/node/{node}"), Some(&cookie)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    for want in [
+        &format!("action=\"{path}\" hx-post=\"{path}\""),
+        "name=\"ceiling\"",
+        "<button>set ceiling</button>",
+        "<button>quarantine</button>",
+        &format!("name=\"_csrf\" value=\"{csrf}\""),
+        "nothing asked: no ceiling, acquisition running",
+        "<h2>Commands</h2><p class=\"empty\">none</p>",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    let mut live = Events::open(addr, &format!("/events/node/{node}"), &cookie).await;
+    live.next().await.unwrap();
+
+    let steer = |form: String, htmx: bool| {
+        let (cookie, origin, path) = (cookie.clone(), origin.clone(), path.clone());
+        async move { post_action(addr, &origin, &cookie, &path, &form, htmx).await }
+    };
+    let desired = || hub.db.node(&node).unwrap().unwrap().desired.unwrap();
+
+    let reply = steer(format!("_csrf={csrf}&op=ceiling&ceiling=3"), true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.header("hx-reswap"), Some("none"));
+    assert!(
+        reply
+            .body
+            .contains("generation 1: ceiling 3, acquisition run"),
+        "{}",
+        reply.body
+    );
+    assert_eq!(desired().ceiling, Some(3));
+    // The node's page follows the change.
+    next_with(&mut live, "<tr><th>ceiling</th><td>3</td></tr>").await;
+
+    let reply = steer(format!("_csrf={csrf}&op=stop"), true).await;
+    assert!(reply.body.contains("acquisition stop"), "{}", reply.body);
+    assert_eq!(desired().acquisition, Acquisition::Stop);
+    let reply = steer(format!("_csrf={csrf}&op=stop"), true).await;
+    assert_eq!(reply.status, 200);
+    assert!(reply.body.contains("Already so"), "{}", reply.body);
+    // A plain form goes back to the page.
+    let reply = steer(format!("_csrf={csrf}&op=resume"), false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(
+        reply.header("location"),
+        Some(path.trim_end_matches("/action"))
+    );
+    assert_eq!(desired().acquisition, Acquisition::Run);
+    steer(format!("_csrf={csrf}&op=lift-ceiling"), true).await;
+    assert_eq!(desired().ceiling, None);
+    assert_eq!(desired().generation, 4);
+    // A ceiling of none, 0 or not a number is no action.
+    for bad in ["", "&ceiling=0", "&ceiling=x"] {
+        let reply = steer(format!("_csrf={csrf}&op=ceiling{bad}"), true).await;
+        assert_eq!(reply.status, 400, "{bad}: {}", reply.body);
+        assert!(reply.body.contains("at least 1"), "{}", reply.body);
+    }
+    assert_eq!(desired().generation, 4);
+
+    for op in ["drain", "undrain", "quarantine", "release"] {
+        let reply = steer(format!("_csrf={csrf}&op={op}"), true).await;
+        assert_eq!(reply.status, 200, "{op}: {}", reply.body);
+        assert!(
+            reply.body.contains(&format!("Issued {op} (command ")),
+            "{}",
+            reply.body
+        );
+    }
+    let commands = hub.db.node_commands(&node).unwrap();
+    assert_eq!(commands.len(), 4);
+
+    let audit = node_audit(&hub, &node);
+    for want in [
+        "set the concurrency ceiling to 3 (generation 1)",
+        "stopped acquisition (generation 2)",
+        "resumed acquisition (generation 3)",
+        "lifted the concurrency ceiling (generation 4)",
+        "issued drain (command ",
+        "issued undrain (command ",
+        "issued quarantine (command ",
+        "issued release (command ",
+    ] {
+        assert!(
+            audit
+                .iter()
+                .any(|(actor, e)| *actor == principal && e.contains(want)),
+            "{want}: {audit:?}"
+        );
+    }
+
+    // What the node says, of itself and of a command, is shown as text.
+    let hostile = "<script>alert(1)</script>";
+    let drain = commands
+        .iter()
+        .find(|c| c.command.op == vk_hub_proto::Operation::Drain)
+        .unwrap();
+    hub.db
+        .record_ack(
+            &node,
+            &vk_hub_proto::CommandAck {
+                id: drain.command.id.clone(),
+                outcome: Outcome::Refused {
+                    reason: hostile.into(),
+                },
+            },
+            crate::now_secs(),
+        )
+        .unwrap();
+    hub.db
+        .record_report(
+            &node,
+            vk_hub_proto::Report {
+                applied_generation: Some(4),
+                state: Some(NodeState::Draining),
+                acquisition: Some(Acquisition::Stop),
+                unsupported: vec![format!("no {hostile}")],
+                concurrency_error: Some(format!("cannot {hostile}")),
+                drain: Some(vk_hub_proto::DrainProgress {
+                    runner_stopped: true,
+                    ledger_empty: false,
+                    active_jobs: 2,
+                }),
+                ..Default::default()
+            },
+            crate::now_secs(),
+        )
+        .unwrap();
+    hub.changed(&node);
+    let fragment = next_with(&mut live, "draining").await;
+    for want in [
+        "<tr><th>sync</th><td>ok</td></tr>",
+        "<tr><th>applied generation</th><td>4</td></tr>",
+        "runner stopped, admission ledger in use, 2 job(s) running",
+        "<tr><th>cannot comply</th><td>no &lt;script&gt;",
+        "<tr><th>cannot set its concurrency</th><td>cannot &lt;script&gt;",
+        "refused: &lt;script&gt;",
+        "not taken yet",
+        &format!("<a href=\"/audit?node={node}\">"),
+    ] {
+        assert!(fragment.contains(want), "{want}: {fragment}");
+    }
+    assert!(!fragment.contains("<script"), "{fragment}");
+}
+
+/// A viewer's page offers no action and its post is refused; an operator's without the
+/// session's CSRF token, or from another origin, is refused too, and one for a node not
+/// enrolled is not found. None of them changes the node or the audit log.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_is_steered_only_by_an_operator_s_own_page() {
+    let (addr, hub, origin) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let path = format!("/node/{node}/action");
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let audit_before = hub.db.audits(None, 100).unwrap();
+
+    let page = get(addr, &format!("/node/{node}"), Some(&viewer)).await;
+    assert_eq!(page.status, 200);
+    assert!(!page.body.contains(&path), "{}", page.body);
+    assert!(page.body.contains("nothing asked"), "{}", page.body);
+
+    let form = format!("_csrf={viewer_csrf}&op=drain");
+    let reply = post_action(addr, &origin, &viewer, &path, &form, true).await;
+    assert_eq!(reply.status, 403);
+    assert!(reply.body.contains("operator role"), "{}", reply.body);
+    let wrong = format!("_csrf={}&op=drain", csrf_token(&"ab".repeat(32)));
+    let reply = post_action(addr, &origin, &operator, &path, &wrong, true).await;
+    assert_eq!(reply.status, 403);
+    assert!(reply.body.contains("CSRF"), "{}", reply.body);
+    let form = format!("_csrf={csrf}&op=drain");
+    let reply = post_action(addr, "http://evil.example", &operator, &path, &form, false).await;
+    assert_eq!(reply.status, 403);
+    assert!(reply.body.contains("did not come from"), "{}", reply.body);
+    let unknown = format!("/node/{}/action", "0".repeat(32));
+    let reply = post_action(addr, &origin, &operator, &unknown, &form, false).await;
+    assert_eq!(reply.status, 404);
+    assert!(
+        reply.body.contains("There is no such node."),
+        "{}",
+        reply.body
+    );
+
+    let row = hub.db.node(&node).unwrap().unwrap();
+    assert!(row.desired.is_none());
+    assert!(hub.db.node_commands(&node).unwrap().is_empty());
+    assert_eq!(hub.db.audits(None, 100).unwrap(), audit_before);
+}
+
+/// A node whose latest session ran protocol version 1 is shown as monitored only, with no
+/// steering offered, and a post forged for it is refused saying so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_1_node_s_page_offers_no_steering() {
+    let (addr, hub, origin) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    assert!(
+        hub.db
+            .record_session(&node, "inc", 1, crate::now_secs(), || true)
+            .unwrap()
+    );
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let path = format!("/node/{node}/action");
+    let page = get(addr, &format!("/node/{node}"), Some(&cookie)).await;
+    assert_eq!(page.status, 200);
+    assert!(!page.body.contains(&path), "{}", page.body);
+    assert!(
+        page.body
+            .contains("speaks fleet protocol version 1, so the hub monitors it"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("<h2>Commands</h2>"), "{}", page.body);
+
+    for (op, htmx) in [("drain", true), ("ceiling&ceiling=2", false)] {
+        let form = format!("_csrf={csrf}&op={op}");
+        let reply = post_action(addr, &origin, &cookie, &path, &form, htmx).await;
+        assert_eq!(reply.status, 409, "{op}: {}", reply.body);
+        assert!(reply.body.contains("update its vk"), "{}", reply.body);
+    }
+    assert!(hub.db.node(&node).unwrap().unwrap().desired.is_none());
+    assert!(hub.db.node_commands(&node).unwrap().is_empty());
 }

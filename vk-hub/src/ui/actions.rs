@@ -505,7 +505,7 @@ fn confirm(site: &LocalSite, htmx: bool, auth: &Auth, ask: &Ask) -> Result<Respo
 }
 
 /// A refused action: for htmx, the line saying why, swapped in on its own.
-fn refused(htmx: bool, status: StatusCode, text: &'static str) -> Response<Body> {
+pub(super) fn refused(htmx: bool, status: StatusCode, text: &str) -> Response<Body> {
     if !htmx {
         return super::message(status, text);
     }
@@ -517,7 +517,7 @@ fn refused(htmx: bool, status: StatusCode, text: &'static str) -> Response<Body>
 }
 
 /// `resp` swapped out of band only: the page around the flash stays as it is.
-fn swap_none(mut resp: Response<Body>) -> Response<Body> {
+pub(super) fn swap_none(mut resp: Response<Body>) -> Response<Body> {
     resp.headers_mut()
         .insert("hx-reswap", HeaderValue::from_static("none"));
     resp

@@ -360,8 +360,8 @@ model, commands and process handling.
   and rollouts proposed); admin (enrollment, and the proposed redeploy). Proposed: BMC
   credentials are held apart and used only by redeploys. Admin is the admin socket's:
   whoever runs as the hub's user or root, who also issues the web UI's sign-in links; a web
-  UI session is a viewer or an operator. Today the fleet is steered through the admin socket
-  alone: an operator session acts only in local mode, and fleet pages are read-only.
+  UI session is a viewer or an operator: an operator steers a node from its page, and a
+  viewer only looks.
 - The web UI and the node endpoint are separate listeners with separate authentication.
   Every UI response carries `Content-Security-Policy: default-src 'self'; script-src 'self';
   style-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none';
