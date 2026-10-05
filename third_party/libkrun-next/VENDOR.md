@@ -224,3 +224,8 @@ waits at most 5 s on a connection's command byte or reply, since connections are
 at a time. The mode is set after the bind, so the caller still puts the socket in a private
 directory. The 1.19 tree left it at the process umask and blocked on a stalled client. Not
 yet in the 1.19 tree.
+
+`src/devices/src/virtio/block/device.rs` — a `DiskFormat::VkLazyChunks` disk is read-only
+whatever the caller asks: its manifest opens read-only and the guest sees `VIRTIO_BLK_F_RO`,
+where the 1.19 tree offered a writable disk whose every write failed. Not yet in the 1.19
+tree.

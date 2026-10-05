@@ -720,6 +720,10 @@ impl Block {
         sync_mode: SyncMode,
         dirty_control_socket: Option<String>,
     ) -> io::Result<Block> {
+        // A chunk view has no writable form: open it read-only and say so to the guest,
+        // rather than offer a disk whose every write fails.
+        let is_disk_read_only =
+            is_disk_read_only || matches!(disk_image_format, DiskFormat::VkLazyChunks);
         let disk_image = OpenOptions::new()
             .read(true)
             .write(!is_disk_read_only)
@@ -777,9 +781,10 @@ impl Block {
                 (FormatAccess::new(vmdk), discard_alignment)
             }
             DiskFormat::VkLazyChunks => {
-                // Always read-only (enforced right here, independent of `is_disk_read_only`),
-                // so discard/write-zeroes granularity is moot; the storage's own default (1) is
-                // fine, and there is no real host file to probe an alignment from anyway.
+                // Always read-only (`is_disk_read_only` is forced above, and the storage is
+                // read-only regardless), so discard/write-zeroes granularity is moot; the
+                // storage's own default (1) is fine, and there is no real host file to probe an
+                // alignment from anyway.
                 let lazy = LazyChunkStorage::open(file_opts)?;
                 let raw = Raw::<Box<dyn DynStorage>>::open_image(Box::new(lazy), false)?;
                 (FormatAccess::new(raw), 1usize)
