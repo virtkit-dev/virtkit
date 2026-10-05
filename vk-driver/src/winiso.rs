@@ -42,8 +42,10 @@ const INSTALL_PASSWORD: &str = "vk-Install-Only-1";
 /// How long Setup may take, WinPE to the first logon's power-off.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 
-/// How long a booting guest has for its qemu-ga to answer.
-const AGENT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How long a booting guest has for its qemu-ga to answer: generous, as a loaded host's
+/// nested Windows 11 can take most of 15 minutes per boot, and a guest that powers off is
+/// noticed within half a minute anyway.
+const AGENT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// What `winiso/setup.cmd` writes to the serial console when WinPE found no install medium.
 const SETUP_FAILED: &str = "vk-install-failed";
@@ -594,7 +596,9 @@ fn settle(dir: &Path, disk: &Path, cpus: u32, mem: &str) -> Result<String> {
                 guest.console().display()
             );
         }
-        let ran = Client::connect(&guest.agent_socket(), AGENT_TIMEOUT).and_then(|mut ga| {
+        let socket = guest.agent_socket();
+        let ga = Client::connect_while(&socket, AGENT_TIMEOUT, "winiso", &mut || guest.running());
+        let ran = ga.and_then(|mut ga| {
             let code = crate::winexec::powershell(&mut ga, &script, "winiso: settle")?;
             Ok((ga, code))
         });

@@ -9,8 +9,9 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// The port name qemu-ga opens (`\\.\Global\org.qemu.guest_agent.0` on Windows).
 pub const PORT_NAME: &str = "org.qemu.guest_agent.0";
@@ -25,6 +26,41 @@ pub struct Client {
     stale: bool,
     /// the socket it was connected through, for [`Client::reconnect`]
     socket: std::path::PathBuf,
+}
+
+/// Reports long Windows waits on stderr about once a minute, as what waits (its `label`, e.g.
+/// `service dc`).
+pub(crate) struct Progress<'a> {
+    label: &'a str,
+    start: Instant,
+    next: Instant,
+}
+
+impl<'a> Progress<'a> {
+    const EVERY: Duration = Duration::from_secs(60);
+
+    pub(crate) fn new(label: &'a str) -> Progress<'a> {
+        let start = Instant::now();
+        Progress {
+            label,
+            start,
+            next: start + Progress::EVERY,
+        }
+    }
+
+    /// Print the line if a minute has passed since the last one.
+    pub(crate) fn tick(&mut self) {
+        let now = Instant::now();
+        if now >= self.next {
+            let waited = now - self.start;
+            eprintln!(
+                "virtkit: {}: still waiting for Windows ({}s…)",
+                self.label,
+                waited.as_secs()
+            );
+            self.next = now + Progress::EVERY;
+        }
+    }
 }
 
 /// The connection to the agent failed: closed, broken, or unanswered in time. Unlike an
@@ -148,6 +184,40 @@ impl Client {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
                 Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// [`Client::connect`] to a guest that may power off meanwhile: connect in slices of at
+    /// most 30 s and give up as soon as `running` says the guest is gone, rather than wait out
+    /// `timeout`. Says on stderr about once a minute that `label` is still waiting.
+    pub fn connect_while(
+        socket: &Path,
+        timeout: Duration,
+        label: &str,
+        running: &mut dyn FnMut() -> bool,
+    ) -> Result<Client> {
+        Client::connect_sliced(socket, timeout, Duration::from_secs(30), label, running)
+    }
+
+    fn connect_sliced(
+        socket: &Path,
+        timeout: Duration,
+        slice: Duration,
+        label: &str,
+        running: &mut dyn FnMut() -> bool,
+    ) -> Result<Client> {
+        let deadline = Instant::now() + timeout;
+        let mut progress = Progress::new(label);
+        loop {
+            if !running() {
+                bail!("the guest powered off");
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match Client::connect(socket, left.min(slice)) {
+                Ok(client) => return Ok(client),
+                Err(e) if left <= slice => return Err(e),
+                Err(_) => progress.tick(),
             }
         }
     }
@@ -517,6 +587,58 @@ pub(crate) mod tests {
         for client in clients {
             client.join().unwrap();
         }
+    }
+
+    #[test]
+    fn connect_while_gives_up_once_the_guest_powers_off() {
+        let dir = TempDir::new("qga-dies");
+        // No agent ever answers; the guest is up for two checks.
+        let mut checks = 0;
+        let start = Instant::now();
+        let Err(e) = Client::connect_sliced(
+            &dir.0.join("qga.sock"),
+            Duration::from_secs(3600),
+            Duration::from_millis(100),
+            "test",
+            &mut || {
+                checks += 1;
+                checks <= 2
+            },
+        ) else {
+            panic!("connected to no agent");
+        };
+        assert!(e.to_string().contains("powered off"), "{e:#}");
+        assert_eq!(checks, 3);
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn connect_while_times_out_on_a_guest_that_never_answers() {
+        let dir = TempDir::new("qga-silent");
+        let start = Instant::now();
+        let Err(e) = Client::connect_sliced(
+            &dir.0.join("qga.sock"),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            "test",
+            &mut || true,
+        ) else {
+            panic!("connected to no agent");
+        };
+        assert!(!e.to_string().contains("powered off"), "{e:#}");
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn connect_while_connects_to_an_answering_agent() {
+        let dir = TempDir::new("qga-up");
+        let sock = dir.0.join("qga.sock");
+        agent_socket(&sock, |request| match request["execute"].as_str() {
+            Some("guest-sync-delimited") => synced(request),
+            _ => b"{\"return\": {}}\n".to_vec(),
+        });
+        let mut ga = Client::connect_while(&sock, DEFAULT_TIMEOUT, "test", &mut || true).unwrap();
+        assert!(ga.call("guest-ping", None, DEFAULT_TIMEOUT).is_ok());
     }
 
     #[test]
