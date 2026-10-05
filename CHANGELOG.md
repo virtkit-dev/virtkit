@@ -9,11 +9,22 @@ All notable changes to virtkit will be documented in this file.
 - **`vk tune` can edit a runner config you own.** A gitlab-runner that runs as your own user
   no longer needs `vk-runnerctl`: name its config as `[node] runner_config` and `vk tune` sets
   `concurrent` there itself, touching nothing else in the file.
+- **Experimental: `vk-hub` steers its hosts.** `vk-hub nodes ceiling <id> <n|none>` caps how
+  many jobs a host's runner accepts, `nodes stop` and `resume` stop and resume job acquisition,
+  `nodes drain` and `undrain` empty a host and bring it back, and `nodes quarantine`
+  keeps a host out of work until `nodes release`. A host that is offline gets what changed
+  when it reconnects. `vk-hub nodes` shows what the hub asked beside what each host reports,
+  which hosts have not caught up, and what a host says it cannot do; `vk-hub audit` lists
+  every operator action and what the hosts made of it. Steering needs this release on both
+  sides: a hub of 0.84.0 or earlier only monitors, and the hub refuses to steer hosts still on
+  0.84.0 or earlier until their `vk` is updated. After a downgrade to 0.84.0 or earlier and
+  upgrade back, or a restore from a backup predating a host's steering, the hub keeps that
+  host's last applied ceiling and acquisition stop.
 - **Experimental: a fleet node applies its hub's concurrency ceiling.** `vk node run` sets
   the runner's concurrency itself every half minute — the smallest of the hub's ceiling, the
   host's own estimate and `max_concurrency` — and keeps what the hub asked across restarts
-  and while the hub is unreachable. A node and a hub both of this release are needed: a hub
-  of 0.84.0 or earlier only monitors.
+  and while the hub is unreachable. `vk tune` stands aside while `vk node run` is up, and
+  otherwise applies the ceiling the node last received.
 - **Experimental: `[node] runner = "managed"` lets the hub stop a host taking jobs.** The
   node runs gitlab-runner itself and restarts it if it dies. The hub can then stop and resume
   acquisition, drain the node — it reports `drained` once the runner has finished its jobs and
@@ -23,16 +34,6 @@ All notable changes to virtkit will be documented in this file.
   once the old one has exited. A runner left behind by a `vk node run` that was killed is
   picked up rather than started twice. Under systemd, run the node with `KillMode=mixed`, so
   stopping the unit lets jobs finish. An external runner refuses a drain and a quarantine.
-- **Experimental: `vk-hub` steers its hosts.** `vk-hub nodes ceiling <id> <n|none>` caps how
-  many jobs a host's runner accepts, `nodes stop` and `resume` stop and resume job acquisition,
-  `nodes drain` and `undrain` empty a host and bring it back, and `nodes quarantine`
-  keeps a host out of work until `nodes release`. A host that is offline gets what changed
-  when it reconnects. `vk-hub nodes` shows what the hub asked beside what each host reports,
-  which hosts have not caught up, and what a host says it cannot do; `vk-hub audit` lists
-  every operator action and what the hosts made of it. Hosts still on 0.84.0 or earlier are
-  monitored only: the hub refuses to steer them until their `vk` is updated. After a downgrade
-  to 0.84.0 or earlier and upgrade back, or a restore from a backup predating a host's steering,
-  the hub keeps that host's last applied ceiling and acquisition stop.
 - **Experimental: steer a host from its page in the `vk-hub` web UI.** An operator can set or
   lift a host's ceiling, stop and resume it taking jobs, drain and undrain it, and quarantine
   and release it, each recorded in the audit log under the operator's session. The page shows
@@ -61,24 +62,22 @@ All notable changes to virtkit will be documented in this file.
   verify either way.
 - **Experimental: `vk-hub rollout` updates a fleet a wave at a time.** `rollout create
   --release <sha256>` updates the chosen hosts in batches (`--batch`), optionally one host of
-  each hardware profile first (`--canary-per-profile`), each wave only once the last is updated
-  and back to work. A failed host pauses the rollout until `rollout resume`, and too many
-  (`--max-failures`) abort it; `rollout status`, `pause` and `abort` follow and steer it, and
-  a restarted hub carries on where it stopped. A host gets `--drain-timeout` to drain and
-  `--node-timeout` to update after that. Hosts with an external runner are left out unless
-  `--force`, and hosts on 0.84.0 or earlier are left out.
-- **Experimental: `vk-hub nodes reset` clears a host.** The host drains, stops whatever its
-  past jobs left running, removes their job directories and its idle host checkouts — its
-  cached images too with `--images` — checks itself as an update does, and returns to the state
-  it was in; a host that fails the check stays drained. An operator can reset a host from its
-  page in the web UI, which asks again first. A reset needs `[node] runner = "managed"`.
+  each hardware profile first (`--canary-per-profile`), each wave only once the last one's
+  hosts are updated and back in the state they were in. A failed host pauses the rollout until
+  `rollout resume`, and too many (`--max-failures`) abort it; `rollout status`, `pause` and
+  `abort` follow and steer it, and a restarted hub carries on where it stopped. A host gets
+  `--drain-timeout` to drain and `--node-timeout` to update after that. Hosts with an
+  external runner are left out unless `--force`, and hosts on 0.84.0 or earlier are left out.
 - **Experimental: the `vk-hub` web UI shows releases and rollouts.** An operations page lists
   the releases the hub holds and each rollout's progress, host by host, as it goes; an
   operator can pause, resume and abort a rollout there. The nodes table, in the UI and in
   `vk-hub nodes`, shows a host updating and a host whose last update was rolled back, and a
   host's page shows its update and the sha256 of the `vk` it runs.
-- **`vk tune` stands aside on a fleet node** while `vk node run` is up, and otherwise honours
-  the ceiling the node last received.
+- **Experimental: `vk-hub nodes reset` clears a host.** The host drains, stops whatever its
+  past jobs left running, removes their job directories and its idle host checkouts — its
+  cached images too with `--images` — checks itself as an update does, and returns to the state
+  it was in; a host that fails the check stays drained. An operator can reset a host from its
+  page in the web UI, which asks again first. A reset needs `[node] runner = "managed"`.
 
 ### Fixed
 

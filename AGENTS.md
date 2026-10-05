@@ -70,7 +70,8 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with nine crates:
 - **`vk-hub/`** — the hub (bin, experimental). `vk-hub serve` is the fleet hub: it enrolls
   `vk node`s with single-use tokens, pins each node's ed25519 key, holds their WebSocket
   sessions and keeps their inventory and heartbeats in a redb database, along with the
-  desired state and commands it sends them; it holds the `vk` releases they update to.
+  desired state and commands — drain, quarantine, update, reset — it steers them with; it
+  holds the `vk` releases they update to, and rolls a release out a wave at a time.
   `vk-hub serve` also serves a web UI of the fleet when `ui_addr` is set; `vk-hub local`
   serves the same UI for the VMs of the machine it runs on, read from `vk workloads --watch`.
   Both sign people in with single-use links and keep an audit log. Built like the

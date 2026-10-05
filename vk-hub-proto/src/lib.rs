@@ -44,12 +44,12 @@
 //! inventory field, which a hub of any version reads or ignores.
 //!
 //! **Steering.** From version 2 the node's [`Report`] also carries its observed state — the
-//! desired-state generation it last applied, its [`NodeState`], whether its runner is taking
-//! jobs, its concurrency — and the node acks every command whose outcome the hub has not yet
-//! recorded. The hub answers each ack with [`HubMsg::Recorded`], resends desired state to a
-//! node whose report shows it behind, and resends commands that have no final outcome; the node
-//! recognizes a command it journaled by its ID and answers with the outcome it recorded rather
-//! than acting twice.
+//! desired state it last applied, its [`NodeState`], whether its runner is taking jobs, its
+//! concurrency, drain and update progress — and the node acks every command whose
+//! outcome the hub has not yet recorded. The hub answers each ack with [`HubMsg::Recorded`],
+//! resends desired state to a node whose report shows it behind, and resends commands that
+//! have no final outcome; the node recognizes a command it journaled by its ID and answers
+//! with the outcome it recorded rather than acting twice.
 //!
 //! **Display.** Every string a host reports is the host's to choose; whoever prints one to a
 //! terminal, a log or a page passes it through [`display_safe`] first. Escaping it for the

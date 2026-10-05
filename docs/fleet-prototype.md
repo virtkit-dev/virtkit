@@ -40,6 +40,8 @@ Restart and redeploy are not built.
 | Canary promotion | One canary per hardware profile, promoted once its update is done, the release reported running and the node back ready or drained | [Representative workload success and an observation window](fleet-design.md#updates) |
 | Release trust | Signatures required by default only when keys are configured | [Pinned keys required for remote updates; explicit development opt-out](fleet-design.md#updates) |
 | Reset | Matches known executables and job paths in process arguments | [Explicit job process ownership, verified empty before scratch removal](fleet-design.md#resets) |
+| Stopping acquisition | `SIGQUIT` to a managed runner | [The runner also paused through the GitLab API](fleet-design.md#runner-concurrency) |
+| Runner binary | Whatever `[node] gitlab_runner` names, or `gitlab-runner` on `PATH` | [Pinned on the node, as `vk` releases are](fleet-design.md#updates) |
 
 ## Enrollment
 
@@ -702,7 +704,17 @@ commit descends from (`build.sh --kernel-from`), or builds one when the kernel i
 since or the run is manual.
 They cover enrollment (single-use and expired tokens, re-enrollment with the same key,
 removal), the session, inventory, heartbeats, workloads, and reconnecting after a hub restart,
-a node restart and a partition. The web UI and local mode have unit tests only.
+a node restart and a partition (`fleet-enrollment`, `fleet-monitoring`, `fleet-resilience`);
+a ceiling, stopping acquisition, drain, quarantine across a node restart, an external
+runner's refusals, and a reset that stops a leftover job process and removes its job dir
+(`fleet-steering`); hubs and nodes of protocol version 1 beside version 2
+(`fleet-mixed-versions`); and updates — a rollback on failed validation, a signature
+required, an update surviving a restart, a rollout a node per wave (`fleet-update`). The web
+UI and local mode have unit tests only.
+
+`fleet-mixed-versions` needs a `vk` and a `vk-hub` of 0.83.0 or 0.84.0 (`VK_V1`,
+`VK_HUB_V1`), and `fleet-update` a `vk` of a higher version, 0.85.0 or later, to update to
+(`VK_NEXT`); each skips without them, as both do in CI.
 
 Without a writable `/dev/kvm` or nested virtualization a script skips; CI and
 `release-e2e.sh` set `E2E_REQUIRE_KVM=1`, which makes that a failure. The scripts also need
@@ -719,10 +731,14 @@ A fleet is one `vk` compose group, set up by `tests/fleet/lib.sh`:
   the fleet.
 - **node services** — nesting guests of 1 GiB (alpine with nftables,
   `tests/fleet/node/Dockerfile`), with the `vk` under test shared in, as `vk-hub` is into
-  the primary, so a code change rebuilds no image. A test enrolls each node from inside its
-  guest with `vk node join`; the service then runs `vk node run`, started again while it
-  exits 75 on a state dir `join` still holds. Their roots persist, so a node keeps its
-  identity across a restart.
+  the primary, so a code change rebuilds no image; a guest copies it to `/opt/vk/bin/vk` on
+  its first boot and runs that copy, for an update to replace. A test enrolls each node from
+  inside its guest with `vk node join`; the service then runs `vk node run`, started again
+  on any exit, as a supervisor would, until the hub refuses the node for good. Their roots
+  persist, so a node keeps its identity and its installed `vk` across a restart. A test sets
+  a node's vk configuration before it boots; a managed runner is a gitlab-runner stand-in
+  (`tests/fleet/node/gitlab-runner`), a process that quits on `SIGQUIT` as a runner with no
+  jobs left does.
 
 One more node runs on the test host itself, beside the compose group, enrolled through the
 hub's port published on loopback (`vk publish`): the VMs it runs are the workloads
@@ -740,3 +756,9 @@ hub's port published on loopback (`vk publish`): the VMs it runs are the workloa
 
 A script that fails prints the end of the hub's log, each node service's state and the end of
 its log, and the end of the host node's log.
+
+### What it does not cover
+
+The suite runs no real gitlab-runner or CI jobs. The stand-in takes no jobs, so drain tests
+wait for a runner that is slow to quit, and reset tests use a planted leftover process.
+How GitLab spreads jobs over runners is measured on real CI hosts under real load.

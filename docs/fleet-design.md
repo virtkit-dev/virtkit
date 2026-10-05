@@ -7,8 +7,9 @@ define the evidence required before unattended maintenance or phase 2.
 
 A fleet is a set of machines running `vk node`, managed by one `vk-hub`. The hub owns the
 fleet's inventory, desired state and operations — capacity ceilings, drains, `vk` rollouts,
-resets — and shows them in a web UI. Each node runs its own CI jobs through the vk executor;
-central placement is for generic VM jobs, whose queue the hub owns.
+resets — and shows them in a web UI. It does not take GitLab jobs itself: each node keeps
+its own gitlab-runner with the vk executor, and the hub steers how much work each runner
+accepts. Central placement is for generic VM jobs, whose queue the hub owns.
 
 The target is a fleet of tens of bare-metal hosts, not hundreds: one hub process, one
 embedded database, no replication.
@@ -20,7 +21,7 @@ embedded database, no replication.
   the hub, and apply what the hub asks within what local policy allows; today it enrolls,
   reports inventory, heartbeats and workloads, sets its runner's concurrency, keeps the
   desired state and commands it is sent, runs a managed gitlab-runner, which it drains
-  and quarantines, and updates its own `vk` on trial.
+  and quarantines, updates its own `vk` on trial, and resets.
 - **`vk-hub`** — the hub binary: inventory, desired state, operations, audit log, web UI, and
   later the generic job queue. Its database is `redb`, as `vk-registry`'s accounts store is.
 - **`vk-hub-proto`** — the hub↔node wire types, versioned, beside the VM list `vk workloads`
@@ -33,6 +34,7 @@ Where state lives:
 
 | Owner | State |
 |---|---|
+| GitLab | the CI queue, job status, traces, artifacts, cancellation |
 | hub | inventory, desired state per node, operations in progress, audit log |
 | node | processes, admission ledger, checkouts, caches, job history, drain state, command journal |
 | registry | images and build content |
@@ -43,7 +45,7 @@ A node is any host `vk` already runs on:
 
 - an x86-64 Linux kernel with KVM enabled;
 - a dedicated user with read/write access to `/dev/kvm`;
-- network access to the hub and to the registries its jobs pull from.
+- network access to the hub, to GitLab, and to the registries its jobs pull from.
 
 `vk check`'s KVM, VMM and guest-kernel probes are the gate: a node refuses to enroll while
 one fails. No root is needed at runtime and no distribution is assumed. `vk node run` is a
@@ -66,7 +68,7 @@ the command and retry behavior.
 
 The node dials the hub over WebSocket on TLS; nodes need no inbound port. The connection
 carries control and telemetry only — images and artifacts go directly between nodes and the
-registry.
+registry or GitLab.
 
 Each connection opens with:
 
@@ -108,10 +110,11 @@ persisted stays in force.
 
 A node's `vk` configuration (`config.toml`) is authoritative: paths, shares, resource
 ceilings, and the executor tuning a host with a lot of RAM and a slow network disk depends on
-(tmpfs `checkout_dir`, reused host-side checkouts, DAX shares, disk admission). Proposed: it
-also sets which operations the hub may run, and the hub only narrows it — a lower concurrency
-ceiling, drain, quarantine, a choice among versions the node allows — never raising a limit
-local policy sets or pushing `[executor]` settings.
+(tmpfs `checkout_dir`, reused host-side checkouts, DAX shares, disk admission). The hub only
+narrows it — a lower concurrency ceiling, stopped acquisition, drain, quarantine, a choice
+among versions the node allows — and, apart from a forced update, never overrides a limit
+local policy sets or pushes `[executor]` settings. Proposed: the node's configuration also
+sets which operations the hub may run.
 
 The node reports a hash of its effective configuration, and its node page shows it, so drift
 between nodes that should match is visible.
@@ -124,14 +127,17 @@ Every node reports, keeping hard facts, measured load and operator policy apart:
 - **storage** — for the job-dir and checkout filesystems: identity, size, free bytes and
   inodes, tmpfs or disk, and a speed class the operator declares (`fast`, `slow`);
 - **pressure** — memory available, CPU, memory and I/O PSI, disk latency;
+- **runner** — the gitlab-runner configuration, its `concurrent` and runner names, its
+  version, and its jobs preparing, waiting on admission, running and cleaning up;
 - **admission** — memory reserved and budget, disk claimed;
 - **versions** — `vk`, the guest kernel, the effective configuration hash.
 
 A transient reading never changes a node's declared capabilities. The facts — hardware,
-filesystem identity and size, declared speed class, versions — are the
-inventory, sent when they change; the readings — pressure, free bytes and inodes, admission
-— ride on the heartbeat. The prototype reports memory available, admission and free space;
-PSI, disk latency and disk admission are not reported yet.
+filesystem identity and size, declared speed class, versions, runner configuration — are
+the inventory, sent when they change; the readings — pressure, free bytes and inodes,
+admission — ride on the heartbeat. The prototype reports memory available, admission, free
+space and the runner's configuration; PSI, disk latency, disk admission, the runner's version
+and its jobs by stage are not reported yet.
 
 ### Workloads
 
@@ -169,6 +175,8 @@ effective = min(local estimate, hub ceiling, local ceiling)
   saturated on a resource the estimate does not see, or whose capacity is kept for other work.
 - **local ceiling** — `[executor.schedule] max_concurrency`, the node's own limit.
 
+`vk tune` and `vk node run` use one controller, with a single writer while the node is up.
+
 The node applies the hub's ceiling whether or not the hub is reachable. gitlab-runner has no
 `concurrent = 0`, so **stopping acquisition** is a state rather than a number, and needs a
 runner the node runs itself: the node sends gitlab-runner `SIGQUIT`, which stops it
@@ -181,6 +189,16 @@ number reaches the runner.
 An operator sets the hub's ceiling today. Proposed: the hub adjusts ceilings itself over tens
 of seconds with hysteresis, cutting quickly under sustained pressure and raising slowly,
 without aiming for equal utilization.
+
+What this achieves is coarse: a node accepts about what it can start, a job beyond that waiting
+at admission, and compatible work lands elsewhere. It cannot pick the best node for a given
+job, and checkout or image locality is incidental — the next job of a project may not return to
+the node holding its tree.
+
+Tags should be stable workload classes (e.g. `vk`, `large-memory`), assigned per runner by the
+operator. GitLab requires a runner to have every tag a job asks for, so tags decide which
+runners are eligible; load is never encoded in them. Protected and untrusted work are
+separated by runner registration and project scope, not by tags.
 
 ## Node states
 
@@ -207,9 +225,10 @@ The intended `validating` gate runs a boot/exec/network smoke test and, when con
 representative synthetic job before the node goes back to `ready`. The prototype's default is
 weaker: the workload test depends on the operator configuring `[node] validate`.
 
-All six states are built; an update is what takes a node through `maintenance` and
-`validating`. The prototype's [maintenance transitions](fleet-prototype.md#maintenance-transitions)
-define how concurrent drain, quarantine and update requests interact.
+All six states are built; an update or a reset is what takes a node through `maintenance`
+and `validating`. The prototype's
+[maintenance transitions](fleet-prototype.md#maintenance-transitions) define how concurrent
+drain, quarantine, update and reset requests interact.
 
 A node that stops heartbeating is shown as unreachable, not paused: pausing every
 disconnected node would turn a hub outage into a fleet outage.
@@ -233,6 +252,7 @@ in the hub's database, so a rollout survives a hub restart. Built:
 Fleet updates add:
 
 - a signature check against keys pinned on the node, before the new binary runs;
+- proposed: the same pinning for the gitlab-runner binary;
 - one `vk` binary per job for the job's whole life: executor stages running during a switch
   must not mix versions, which draining guarantees.
 
@@ -253,7 +273,9 @@ and UI must show it. Official release signing is
 a prerequisite for using that default with official binaries. Document key rotation with an
 overlap period, removal of retired keys, and emergency revocation through a trusted path
 independent of the hub. A compromised hub must not be able to add a trusted key or undo its
-revocation.
+revocation. Proposed: forcing an update on a node without a managed runner needs the node's
+own permission, not just the hub's, and the operator is shown that executor stages may then
+cross versions; today the hub alone allows it, with `--force`.
 
 Proposed validation and promotion: provide a standard workload using an image pinned by digest
 that boots with the candidate, executes a command, checks required networking and proves its
@@ -278,7 +300,7 @@ the control session. The hub stores and serves releases this way
 
 | Operation | Effect |
 |---|---|
-| restart | restart `vk node` |
+| restart | restart `vk node` and its gitlab-runner |
 | reset | drain, stop anything the node's user still owns from past jobs, clear chosen caches and scratch, validate |
 | redeploy | reinstall the host (Redfish/IPMI and PXE) — only on [managed nodes](#managed-nodes) |
 
@@ -319,15 +341,19 @@ toolchain in the release build:
 - **Not Datastar:** it compiles every `data-*` expression with `Function(...)`, which needs
   `'unsafe-eval'`.
 
-Planned pages, in order of priority:
+Pages, in order of priority:
 
 1. **nodes** — state, capacity (local estimate, hub ceiling, effective), pressure, admission
    waits, versions, configuration drift; desired, observed and unknown shown distinctly;
-2. **node detail** — inventory, effective configuration, recent jobs, atop timelines and
-   egress reports;
+2. **node detail** — inventory, effective configuration, recent jobs linked to GitLab, atop
+   timelines and egress reports;
 3. **operations** — drains, resets, rollouts and their progress; built so far, releases and
    rollouts, with a node's drain and reset steered from its page;
 4. **audit** — every operator action and every command's outcome.
+
+Built: the nodes table, node detail and audit pages, and the operations page's releases and
+rollouts. Proposed: pressure and admission waits in the nodes table, and recent jobs linked to
+GitLab, atop timelines and egress reports on node detail.
 
 Proposed: metrics for capacity, admission waits and node states, exported for Prometheus.
 
@@ -505,8 +531,9 @@ required:
 
 ## Prototype first
 
-1. **Drain races** — bursts of jobs, node restarts and hub partitions during a drain. Show
-   that `drained` is only reported when nothing is left.
+1. **Acquisition and drain races** — burst submissions against long polls, concurrency cuts,
+   API pause, `SIGQUIT`, runner restarts, hub partitions. Measure jobs accepted but waiting on
+   admission, and show that `drained` is only reported when nothing is left.
 2. **The slow-disk, large-RAM host under real mixed load** — checkout RAM, image builds, disk
    latency, inode pressure, DAX. Admission does not count image-build guests today, and disk
    admission predicts bytes without tracking inodes.
@@ -519,13 +546,13 @@ required:
 Before phase 2 or unattended fleet maintenance, demonstrate the following on a small fleet.
 Record the versions, configuration, injected failure, observed transitions and audit evidence
 for each run. Unit tests of transitions complement these exercises; they do not replace a
-node and hub being interrupted together.
+runner, node and hub being interrupted together.
 
 | Exercise | Required result |
 |---|---|
 | Restore a backup older than a stop, a ceiling cut or a quarantine | Recovery conflict is visible; acquisition does not resume, the ceiling does not rise and the quarantine is not lifted without an explicit reconciliation decision |
 | Partition the hub during ordinary CI and during drain | Ordinary CI follows persisted policy; drain remains in force; an unreachable node is never presented as confirmed idle |
-| Burst jobs during a drain and a node restart | Accepted work is accounted for; `drained` is reported only after the node's jobs, cleanup and admission complete |
+| Burst jobs during concurrency cuts, a drain, runner shutdown and restart | Accepted work is accounted for; `drained` is reported only after runner exit, cleanup and admission completion |
 | Drop command acknowledgements and reconnect with duplicates | The journal preserves one operation identity and its outcome; replay does not repeat a completed destructive effect |
 | Crash before and after each durable update transition, including install | Restart resumes or rolls back deterministically; it neither accepts jobs prematurely nor loses the known-good binary |
 | Let host checks pass but fail candidate boot, networking or cleanup | Validation fails and the rollout cannot promote the canary |
@@ -551,10 +578,11 @@ carry IDs of their own, node-local policy stays authoritative and the protocol i
    on.
 2. **Phase 1.** Enrollment, sessions, inventory, hub ceilings and stopping acquisition,
    drain and quarantine, signed releases and rollouts, resets, the workloads each node runs.
-   Before unattended maintenance, the gaps in the
-   [capability table](fleet-prototype.md#status) close — resets by process ownership, a
-   representative validation workload, recovery after a hub restore, pinned release keys —
-   and the [exit criteria](#prototype-exit-criteria) are met.
+   Nodes keep their local gitlab-runners. Before unattended maintenance, the gaps in the
+   [capability table](fleet-prototype.md#status) close — the GitLab API pause, gitlab-runner
+   pinning, resets by process ownership, a representative validation workload, recovery after
+   a hub restore, pinned release keys — and the [exit criteria](#prototype-exit-criteria) are
+   met.
 3. **Complete accounting.** Every workload type in the node's admission ledger, image builds
    included, with disk admission tracking inodes.
 4. **Reservations**, as phase 2 describes them, each with a lease the node expires on its
