@@ -48,7 +48,7 @@ imago = { path = "../../../imago", default-features = false, features = ["sync",
 # `is_sync` matches the `sync` feature imago is built with, so `#[maybe_async(AFIT)]` there
 # expands to the same plain sync fns imago's own `Storage` impls use.
 lru = ">=0.9"
-zstd = "0.13"
+zstd = "0.14"
 maybe-async = { version = "0.2", features = ["is_sync"] }
 
 [target.'cfg(unix)'.dependencies]
