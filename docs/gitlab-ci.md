@@ -1094,7 +1094,8 @@ its hub's desired state changes, with the hub's ceiling as a third term: the sma
 estimate, the hub's ceiling and `max_concurrency` wins, so the hub can lower the number but
 never raise it past the node's own. Only the half-minute pass raises it, by the estimate's one
 step when there is a memory budget. The node keeps the hub's ceiling across restarts and while
-the hub is unreachable.
+the hub is unreachable. `vk tune` stands aside while `vk node run` is up, and otherwise
+applies the ceiling the node last received.
 
 A runner that runs as the same user as `vk`, with its own `~/.gitlab-runner/config.toml`, needs
 no `vk-runnerctl`: name the file as `[node] runner_config` and `vk tune` sets its `concurrent`

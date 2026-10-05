@@ -23,6 +23,8 @@ All notable changes to virtkit will be documented in this file.
   once the old one has exited. A runner left behind by a `vk node run` that was killed is
   picked up rather than started twice. Under systemd, run the node with `KillMode=mixed`, so
   stopping the unit lets jobs finish. An external runner refuses a drain and a quarantine.
+- **`vk tune` stands aside on a fleet node** while `vk node run` is up, and otherwise honours
+  the ceiling the node last received.
 
 ## [0.84.0] - 2026-10-05
 

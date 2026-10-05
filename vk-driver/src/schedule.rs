@@ -3,7 +3,9 @@
 //! sets it in a runner config this user owns.
 //!
 //! This is the one place the number is decided: `effective = min(estimate, hub ceiling,
-//! ceiling)` ([`decide`]), held to the previous answer between periods.
+//! ceiling)` ([`decide`]), whether `vk tune` asks or `vk node run`'s own loop does, holding
+//! it to its previous answer between periods — and while `vk node run` is up, only its loop
+//! asks ([`tune`]).
 //!
 //! The admission gate ([`crate::admit`]) is what keeps the host safe — it never lets more
 //! memory be committed than the budget allows. But a job it makes wait has already been
@@ -44,7 +46,7 @@ pub(crate) struct Decision {
     /// What the host can take, by [`concurrency`]; `None` without a memory budget to measure
     /// against.
     pub estimate: Option<u32>,
-    /// The cap a fleet hub set; `None` off a fleet, and from `vk tune`.
+    /// The cap a fleet hub set, as the node last persisted it; `None` off a fleet.
     pub hub_ceiling: Option<u32>,
     /// `[executor.schedule] max_concurrency`.
     pub ceiling: Option<u32>,
@@ -187,8 +189,17 @@ pub fn runner_config_in(cfg: &Config, home: Option<&std::ffi::OsStr>) -> Option<
 /// Measure the host and write what the runner's concurrency should be. Meant to run every
 /// half minute or so from a user timer; each run stands alone, reading its own previous
 /// answer back out of the file it writes.
+///
+/// On a fleet node the node's own loop is the one writer: while `vk node run` holds the
+/// state dir this does nothing, rather than step the concurrency up twice as fast. Otherwise
+/// it applies the hub ceiling the node last persisted, so both give the same answer.
 pub fn tune(cfg: &Config) -> Result<()> {
-    let decision = decide(cfg, None)?;
+    // Held until this pass is done, so no `vk node run` starts writing in the middle of it.
+    let Some(_claim) = crate::node::claim_tuning(cfg)? else {
+        println!("virtkit: `vk node run` sets this runner's concurrency; nothing to do");
+        return Ok(());
+    };
+    let decision = decide(cfg, crate::node::hub_ceiling(cfg)?)?;
     if decision.effective.is_none() {
         bail!(
             "neither [executor.schedule] mem_budget nor max_concurrency is set: nothing to \
@@ -206,7 +217,7 @@ pub(crate) fn describe(d: &Decision) -> String {
         return "runner concurrency left alone: no budget and no ceiling".to_string();
     };
     let term = |n: Option<u32>| n.map_or_else(|| "none".to_string(), |n| n.to_string());
-    // The hub's term only on a node that has one: `vk tune` reports the two it decides on.
+    // The hub's term only on a node that has one.
     let hub = d
         .hub_ceiling
         .map_or_else(String::new, |n| format!(", hub ceiling {n}"));

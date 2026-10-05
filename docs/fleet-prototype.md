@@ -154,6 +154,11 @@ runner) has its `concurrent` set directly. The report carries the
 estimate, both ceilings and the effective number; a concurrency that cannot be set is
 reported with the reason (`concurrency_error`), and logged when it starts.
 
+On a node, `vk node run` is the one writer: `vk tune` does nothing while `vk node run` holds
+`<state_dir>/node/lock`, and otherwise applies the ceiling the node last persisted, so a timer
+left running from before the host joined gives the same answer. A `vk tune` pass holds that
+lock shared, and a starting `vk node run` waits up to ten seconds for it.
+
 ## Drain and runner lifecycle
 
 With `[node] runner = "managed"`, `vk node run` runs `gitlab-runner run --config

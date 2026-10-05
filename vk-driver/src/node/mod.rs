@@ -59,6 +59,9 @@ const ENROLLMENT_FILE: &str = "enrollment.json";
 const CA_FILE: &str = "ca.pem";
 const LOCK_FILE: &str = "lock";
 
+/// Tries at the lock, 100 ms apart: ten seconds, for a `vk tune` pass holding it shared to end.
+const LOCK_TRIES: u32 = 100;
+
 /// The first redial's delay, and the ceiling doubling reaches. A hub restart brings every
 /// node back within seconds; a hub down for longer is not helped by being dialed more often.
 const BACKOFF: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(60));
@@ -546,12 +549,71 @@ fn stop_on_signal(managed: bool) -> Result<(Flag, Flag)> {
     Ok((stop, abort))
 }
 
+/// Shared lock on the node's state dir for a `vk tune` pass, preventing `vk node run` from
+/// starting mid-pass. Holds nothing on a host without a node.
+pub struct TuneClaim {
+    _lock: Option<std::fs::File>,
+}
+
+/// Claim the concurrency for `vk tune`, or `None` when a `vk node` holds this host's node
+/// state dir: `vk node run` is then the one concurrency writer.
+pub fn claim_tuning(cfg: &Config) -> Result<Option<TuneClaim>> {
+    let path = dir(cfg).join(LOCK_FILE);
+    let file = match std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(TuneClaim { _lock: None }));
+        }
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
+    // SAFETY: the fd is owned by `file`, which outlives the call; flock returns 0 or -1.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        return Ok(Some(TuneClaim { _lock: Some(file) }));
+    }
+    let e = std::io::Error::last_os_error();
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return Ok(None);
+    }
+    Err(e).with_context(|| format!("probing {}", path.display()))
+}
+
+/// Last persisted hub concurrency ceiling, or `None` without a fleet enrollment or when the
+/// state belongs to another enrollment. The next `vk node run` forgets that old ceiling.
+pub fn hub_ceiling(cfg: &Config) -> Result<Option<u32>> {
+    let dir = dir(cfg);
+    let enrollment = match read_enrollment(&dir) {
+        Ok(e) => e,
+        Err(e) if is_not_found(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let persisted = state::Persisted::load(&dir)?;
+    let issuer = state::Issuer {
+        hub: enrollment.hub,
+        node_id: enrollment.node_id,
+    };
+    Ok(if persisted.issuer.as_ref() == Some(&issuer) {
+        persisted.hub_ceiling()
+    } else {
+        None
+    })
+}
+
 type Flag = tokio::sync::watch::Receiver<bool>;
 
 /// Hold `<dir>/lock` for as long as the returned file lives: one `vk node` process per state
 /// dir, since two would supersede each other's sessions at the hub, or pair a key with an
 /// enrollment made for another.
 fn lock(dir: &Path) -> Result<std::fs::File> {
+    lock_tries(dir, LOCK_TRIES)
+}
+
+/// [`lock`] with `tries` attempts 100 ms apart, so a shared lock held for one `vk tune` pass
+/// is not mistaken for another node.
+fn lock_tries(dir: &Path, tries: u32) -> Result<std::fs::File> {
     let path = dir.join(LOCK_FILE);
     let file = std::fs::File::options()
         .write(true)
@@ -561,18 +623,23 @@ fn lock(dir: &Path) -> Result<std::fs::File> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .map_err(|e| anyhow::Error::new(e).context(format!("opening {}", path.display())))?;
-    // SAFETY: the fd is owned by `file`, which outlives the call; flock returns 0 or -1.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::WouldBlock {
-            return Err(anyhow::Error::new(Locked(format!(
-                "another `vk node` is running on {} — one at a time per state dir",
-                dir.display()
-            ))));
+    for attempt in 0..tries {
+        // SAFETY: the fd is owned by `file`, which outlives the call; flock returns 0 or -1.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
         }
-        return Err(e).with_context(|| format!("locking {}", path.display()));
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(e).with_context(|| format!("locking {}", path.display()));
+        }
+        if attempt + 1 < tries {
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
-    Ok(file)
+    Err(anyhow::Error::new(Locked(format!(
+        "another `vk node` is running on {} — one at a time per state dir",
+        dir.display()
+    ))))
 }
 
 /// `d` plus up to a quarter more, so a fleet that lost its hub together does not redial it
@@ -829,12 +896,63 @@ concurrent = 4
     fn one_vk_node_holds_a_state_dir_at_a_time() {
         let dir = scratch("lock");
         let held = lock(&dir).unwrap();
-        let err = lock(&dir).unwrap_err();
+        let err = lock_tries(&dir, 1).unwrap_err();
         assert!(err.is::<Locked>());
         assert!(format!("{err:#}").contains("another `vk node`"), "{err:#}");
         drop(held);
         lock(&dir).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn vk_tune_stands_aside_for_a_running_node_and_takes_its_ceiling() {
+        let root = scratch("tune");
+        let cfg: Config =
+            toml::from_str(&format!("state_dir = {:?}\n", root.display().to_string())).unwrap();
+        assert!(claim_tuning(&cfg).unwrap().is_some());
+        assert_eq!(hub_ceiling(&cfg).unwrap(), None);
+        let node = dir(&cfg);
+        create_dir(&node).unwrap();
+        let enrollment = Enrollment {
+            hub: "https://hub".into(),
+            node_id: "ab".repeat(16),
+            ca: false,
+        };
+        std::fs::write(
+            node.join(ENROLLMENT_FILE),
+            serde_json::to_vec(&enrollment).unwrap(),
+        )
+        .unwrap();
+        let ceiling_from = |hub: &str| {
+            let mut persisted = state::Persisted::default();
+            persisted.adopt_issuer(state::Issuer {
+                hub: hub.into(),
+                node_id: enrollment.node_id.clone(),
+            });
+            persisted.apply_desired(vk_hub_proto::DesiredState {
+                generation: 1,
+                ceiling: Some(3),
+                acquisition: vk_hub_proto::Acquisition::Run,
+            });
+            persisted.save(&node).unwrap();
+            hub_ceiling(&cfg).unwrap()
+        };
+        assert_eq!(ceiling_from("https://hub"), Some(3));
+        // Another enrollment's ceiling is one `vk node run` would forget.
+        assert_eq!(ceiling_from("https://other"), None);
+        let held = lock(&node).unwrap();
+        assert!(claim_tuning(&cfg).unwrap().is_none());
+        drop(held);
+        // A tune pass holds the lock shared, and a node starting meanwhile waits it out.
+        let claim = claim_tuning(&cfg).unwrap().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(claim);
+        });
+        let held = lock(&node).unwrap();
+        release.join().unwrap();
+        drop(held);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
