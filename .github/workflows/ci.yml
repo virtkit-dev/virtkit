@@ -9,9 +9,10 @@ name: CI
 # A build job runs after quality — deliberately gated on lint, test and audit, so a
 # push that cannot pass them never spends a build — and uploads the binaries as a
 # GitHub Actions artifact (retention: 1 day). This lets you grab a build from any
-# commit without waiting for a release. The guest kernel is excluded — it compiles
-# a full Linux kernel (tens of minutes) and changes infrequently; use release.yml
-# or build-kernel.sh locally when you need a new vmlinux.
+# commit without waiting for a release. The guest kernel is not built — it compiles
+# a full Linux kernel (tens of minutes) and changes infrequently: vk embeds the one of
+# the release the commit descends from, unless the kernel inputs changed since, when it
+# is built after all.
 #
 # The kernel is built (and embedded into vk) when the workflow is triggered
 # manually (workflow_dispatch), for testing kernel config changes without cutting
@@ -38,4 +39,5 @@ jobs:
     with:
       artifact-prefix: ci
       build-kernel: ${{ github.event_name == 'workflow_dispatch' }}
+      release-kernel: true
       retention-days: 1

@@ -12,6 +12,10 @@ name: Build
 #   artifact-prefix  — prefix for uploaded artifact names; callers set this to
 #                      avoid collisions between CI and release runs on the same SHA.
 #   build-kernel     — whether to build the guest kernel and embed it (default: false).
+#   release-kernel   — embed the guest kernel of the release HEAD descends from instead,
+#                      when kernel/ and build-kernel.sh are as that release built them;
+#                      otherwise the kernel is built. Gives a vk that boots VMs without the
+#                      kernel build's tens of minutes (default: false).
 #   bootstrap-check  — after the Docker build, rebuild from scratch in a vk microVM with the
 #                      vk just built and fail unless the binaries are byte-identical
 #                      (build.sh --bootstrap-check). Needs build-kernel: the rebuild boots
@@ -25,6 +29,9 @@ on:
         type: string
         required: true
       build-kernel:
+        type: boolean
+        default: false
+      release-kernel:
         type: boolean
         default: false
       bootstrap-check:
@@ -41,7 +48,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # Fetch full history and tags only to select a released kernel.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: ${{ inputs.release-kernel && !inputs.build-kernel && '0' || '1' }}
 
       # Build the kernel before the binaries so build.sh finds dist/vmlinux and
       # embeds it into vk. Skipped in ordinary CI — a full kernel build takes tens
@@ -50,14 +60,59 @@ jobs:
         if: inputs.build-kernel
         run: ./build-kernel.sh
 
-      # Without the kernel step above there is no dist/vmlinux to embed, which build.sh
-      # rejects unless the caller says it means it — so ordinary CI passes --no-kernel.
-      # These binaries are artifacts to grab from a commit, not releasable ones.
+      # Reuse the ancestor release's kernel when kernel/ and build-kernel.sh match its
+      # manifest's commit: the kernel version, config and build script are unchanged.
+      # A toolchain bump alone (.devcontainer/) does not trigger a rebuild. Build the
+      # kernel if those inputs changed or no release kernel is available.
+      - name: Fetch the released guest kernel (vmlinux)
+        id: release-kernel
+        if: inputs.release-kernel && !inputs.build-kernel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          build_kernel() {
+            echo "$1"
+            ./build-kernel.sh
+            echo "built=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          }
+          mkdir -p dist
+          tag=$(git describe --tags --abbrev=0 --match 'v*' HEAD) ||
+            build_kernel "::warning::no release tag reachable from HEAD; building the guest kernel"
+          gh release download "$tag" --pattern vmlinux --pattern vmlinux.sha256 \
+            --pattern kernel-build-info.txt --dir dist ||
+            build_kernel "::warning::could not download $tag's guest kernel; building it"
+          for f in vmlinux vmlinux.sha256 kernel-build-info.txt; do
+            [ -s "dist/$f" ] || { echo "::error::release $tag has no $f"; exit 1; }
+          done
+          ( cd dist && sha256sum -c vmlinux.sha256 ) ||
+            { echo "::error::$tag's vmlinux does not match its sha256 sidecar"; exit 1; }
+          # A kernel built from a dirty tree ("<sha> (dirty)") names no commit.
+          commit=$(awk '$1 == "git_commit:" && NF == 2 { print $2 }' dist/kernel-build-info.txt)
+          [ -n "$commit" ] && git cat-file -e "$commit^{commit}" ||
+            { echo "::error::$tag's kernel-build-info.txt names no commit of this history ('$commit')"; exit 1; }
+          rc=0
+          git diff --quiet "$commit" HEAD -- kernel build-kernel.sh || rc=$?
+          case $rc in
+            0)
+              echo "embedding $tag's guest kernel, built at $commit"
+              echo "from=$tag" >>"$GITHUB_OUTPUT"
+              ;;
+            # build-kernel.sh rewrites all three downloaded files.
+            1) build_kernel "the kernel inputs changed since $tag ($commit); building the guest kernel" ;;
+            *) echo "::error::git diff $commit HEAD failed (exit $rc)"; exit 1 ;;
+          esac
+
+      # Without either kernel step, pass --no-kernel: build.sh otherwise requires
+      # dist/vmlinux. With a release's kernel, --kernel-from marks the manifest as a CI
+      # build. Both produce downloadable commit artifacts, not release artifacts.
       # '' has to stay the last operand: it is falsy, so swapping the arms would make
       # `||` always fire and hand --no-kernel to the release build too.
       - name: Build binaries
         if: ${{ !inputs.bootstrap-check }}
-        run: ./build.sh ${{ !inputs.build-kernel && '--no-kernel' || '' }}
+        env:
+          KERNEL_FROM: ${{ steps.release-kernel.outputs.from }}
+        run: ./build.sh ${{ !(inputs.build-kernel || inputs.release-kernel) && '--no-kernel' || '' }} ${KERNEL_FROM:+"--kernel-from=$KERNEL_FROM"}
 
       # The reproducibility attestation. build.sh --bootstrap-check does the Docker build,
       # then rebuilds a clean copy of the tree from scratch inside a vk microVM — booted by
@@ -92,7 +147,7 @@ jobs:
           retention-days: ${{ inputs.retention-days }}
 
       - name: Upload kernel artifact
-        if: inputs.build-kernel
+        if: inputs.build-kernel || steps.release-kernel.outputs.built == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ inputs.artifact-prefix }}-kernel-${{ github.sha }}

@@ -19,6 +19,10 @@
 # --no-kernel: build a `vk` with no embedded kernel — the only way to build without a
 # dist/vmlinux. That vk takes --kernel at runtime, so it is not a shippable binary.
 #
+# --kernel-from=<tag>: embed release <tag>'s dist/vmlinux to skip CI's kernel build.
+# Record its provenance in the manifest: the release recipe builds the kernel from
+# this commit and need not reproduce these bytes.
+#
 # --bootstrap-check: after the default Docker build, rebuild with the just-built vk
 # (the dogfood backend, on a clean copy of the tree in a tmp dir) and assert the binaries
 # are byte-for-byte identical — proof the microVM backend reproduces Docker, i.e. vk
@@ -51,6 +55,7 @@ FORCE_DOCKER=""
 FAST=""              # --fast/--debug: build the debug profile (much faster to compile,
                      # unoptimized + unstripped) for iteration — NOT a release artifact
 NO_KERNEL=""         # --no-kernel: build vk without embedding dist/vmlinux
+KERNEL_FROM=""       # --kernel-from=<tag>: dist/vmlinux is that release's kernel
 VMM=libkrun          # dogfood VMM backend: libkrun (default) or cloud-hypervisor
 for arg in "$@"; do
   case "$arg" in
@@ -59,6 +64,7 @@ for arg in "$@"; do
     --docker) FORCE_DOCKER=1 ;;
     --fast|--debug) FAST=1 ;;
     --no-kernel) NO_KERNEL=1 ;;
+    --kernel-from=?*) KERNEL_FROM="${arg#*=}" ;;
     --vmm=libkrun|--vmm=cloud-hypervisor) VMM="${arg#*=}" ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
@@ -73,6 +79,15 @@ fi
 # the one embedded in it — so a kernel-less build cannot back the check either.
 if [ -n "$NO_KERNEL" ] && [ -n "$BOOTSTRAP_CHECK" ]; then
   echo "--bootstrap-check boots the vk it builds; it cannot be combined with --no-kernel" >&2
+  exit 2
+fi
+if [ -n "$NO_KERNEL" ] && [ -n "$KERNEL_FROM" ]; then
+  echo "--kernel-from names the kernel embedded; it cannot be combined with --no-kernel" >&2
+  exit 2
+fi
+# The debug manifest has no room for the release kernel's provenance.
+if [ -n "$FAST" ] && [ -n "$KERNEL_FROM" ]; then
+  echo "--kernel-from stamps a release-profile manifest; it cannot be combined with --fast" >&2
   exit 2
 fi
 # Cargo profile flag + its target/ subdir, threaded through the embed env, build command,
@@ -285,6 +300,13 @@ elif [ -n "$NO_KERNEL" ]; then
   manifest_header="# virtkit build manifest (--no-kernel) — no embedded kernel, not a release artifact
 # Verify: git checkout <git_commit> && ./build.sh --no-kernel && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
 profile:         release"
+elif [ -n "$KERNEL_FROM" ]; then
+  # The kernel was built at the release's commit, not git_commit: the vk that embeds it is
+  # not git_commit's release build.
+  manifest_header="# virtkit CI build manifest — embeds ${KERNEL_FROM}'s guest kernel, not a release artifact
+# Verify: git checkout <git_commit> && gh release download ${KERNEL_FROM} -p vmlinux -p vmlinux.sha256 -D dist && ( cd dist && sha256sum -c vmlinux.sha256 ) && ./build.sh --kernel-from=${KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
+profile:         release
+kernel_from:     ${KERNEL_FROM}"
 else
   manifest_header="# virtkit reproducible build manifest
 # Verify: git checkout <git_commit> && ./build-kernel.sh && ./build.sh && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
