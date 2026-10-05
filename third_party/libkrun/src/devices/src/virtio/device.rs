@@ -149,6 +149,8 @@ impl VirtioTransportState {
         &self.queue_evts
     }
 
+    // Only the virtio-pci transport (Linux x86_64) has a bus-master bit to gate on.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub(crate) fn set_bus_master_gate(&mut self, gate: Arc<AtomicBool>) {
         self.bus_master_gate = Some(gate.clone());
         if let Some(queues) = &mut self.queues {

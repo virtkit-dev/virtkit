@@ -417,3 +417,9 @@ making a resettable device look like one that cannot reset. Covered by
   …): replaced by the Rust builder setters above.
 - The VM name for the 15-byte `comm` (`krun_start_enter` reading `VIRTKIT_VM_NAME`): vk-driver
   sets it itself.
+
+### Building off Linux x86_64
+
+`src/devices/src/virtio/{mod.rs,device.rs}` — the virtio-pci transport builds on Linux x86_64
+only, where the VMM attaches it: it depends on the KVM-only MSI-X state and GSI routing, and the
+macOS build stopped compiling once they came in. Its bus-master gate is gated with it.

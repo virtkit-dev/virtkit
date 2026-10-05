@@ -33,6 +33,9 @@ mod mmio;
 pub mod msix;
 #[cfg(feature = "net")]
 pub mod net;
+// The virtio-pci transport: only the Linux x86_64 VMM attaches it, and its MSI-X state is
+// KVM-only (local patch, see VENDOR.md).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod pci;
 mod queue;
 #[cfg(not(feature = "tee"))]
@@ -54,6 +57,7 @@ pub use self::gpu::*;
 pub use self::mmio::*;
 #[cfg(feature = "net")]
 pub use self::net::Net;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use self::pci::*;
 pub use self::queue::{Descriptor, DescriptorChain, Queue};
 #[cfg(not(feature = "tee"))]
