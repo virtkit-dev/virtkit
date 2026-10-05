@@ -359,15 +359,18 @@ builder.rs}` + `src/devices/src/virtio/pci.rs` — shared-memory regions (virtio
 over virtio-pci. Regions are carved from a fixed span (`SHM_MEM_START`, 64 GiB at 64 GiB) that
 the DSDT declares as a 64-bit window of the PCI host bridge, each with a power-of-two size of at
 least 2 MiB and a base aligned to it, so a BAR describes it exactly. A guest whose RAM reaches
-the span, on either transport, fails to boot (`ShmCreate(OutOfSpace)`) if it asks for a window;
-vk-driver drops windows past `DAX_MAX_GUEST_MIB` first. The transport pins BAR2/BAR3 (64-bit,
+the span fails to boot (`ShmCreate(OutOfSpace)`) if it asks for a window on virtio-pci;
+vk-driver keeps that from happening: it gives a guest with more than `DAX_MAX_GUEST_MIB` of RAM
+no windows, and drops windows past `DAX_TOTAL_MAX`. The transport pins BAR2/BAR3 (64-bit,
 prefetchable memory) on the region, answering size probes, and describes it with a
 `VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` capability (`virtio_pci_cap64`, region id 0); only virtio-fs
 may carry a region. The builder's refusal of shared memory over PCI now applies to the GPU
 region only.
 
-Known gaps: the DSDT declares the span even for a guest whose RAM overlaps it, and the
-virtio-mmio path also places regions in the span and rounds them to a power of two.
+The fixed span is for virtio-pci only: on virtio-mmio, regions keep upstream's page-aligned
+placement above the guest's RAM, unbounded, and the GPU region (MMIO-only) with them. The DSDT
+declares the span only for a guest whose RAM stays below it. Covered by the `shm::tests` and
+`the_shm_window_is_declared_only_when_the_guest_has_one`.
 
 `src/libkrun/src/vmm/device_manager/kvm/pci.rs` + `src/devices/src/virtio/pci.rs` — devices
 past the INTx GSIs (5–23 less the SCI's 9) get interrupt pin 0, line 0xff and no `_PRT` entry

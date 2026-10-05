@@ -33,13 +33,19 @@ pub const IRQ_MAX: u32 = 23;
 pub const KVM_TSS_ADDRESS: u64 = 0xfffb_d000;
 
 /// Base of the guest-physical span shared-memory regions (virtio-fs DAX windows) are carved
-/// from, and its size. Fixed, and above any guest's RAM, so the DSDT can declare exactly this
-/// span as a 64-bit PCI host-bridge window: the virtio-pci transport exposes each region as a
-/// memory BAR, and Linux keeps a BAR only where a bridge window covers it. It ends at 128 GiB,
-/// so reaching it needs 37 physical address bits, which the guest gets from the host's
-/// CPUID leaf 0x80000008 as KVM reports it.
+/// from when the devices are on virtio-pci, and its size. Fixed, so the DSDT can declare
+/// exactly this span as a 64-bit PCI host-bridge window (for a guest whose RAM stays below
+/// it): the transport exposes each region as a memory BAR, and Linux keeps a BAR only where
+/// a bridge window covers it. It ends at 128 GiB, so reaching it needs 37 physical address
+/// bits, which the guest gets from the host's CPUID leaf 0x80000008 as KVM reports it.
 pub const SHM_MEM_START: u64 = 64 << 30;
 pub const SHM_MEM_SIZE: u64 = 64 << 30;
+
+/// Whether a guest whose RAM ends at `ram_last_addr` can have the span above: its RAM must
+/// stay below `SHM_MEM_START`.
+pub fn shm_span_usable(ram_last_addr: u64) -> bool {
+    ram_last_addr <= SHM_MEM_START
+}
 
 /// Base of the ACPI PM1 register block (PM1a_EVT at +0, PM1a_CNT at +4) and the ACPI reset
 /// register (+0xC), served by the `AcpiPm` PIO device (local patch, see VENDOR.md).

@@ -92,6 +92,10 @@ pub struct PciHostInfo {
     pub bar_start: u64,
     pub bar_size: u64,
     pub functions: Vec<PciFunctionInfo>,
+    /// Whether to declare the shared-memory span (`SHM_MEM_START`) as a 64-bit host-bridge
+    /// window: false for a guest whose RAM reaches into it, which then has no regions there
+    /// (local patch, see VENDOR.md).
+    pub shm_window: bool,
 }
 
 /// Builds a 36-byte ACPI 2.0+ RSDP pointing at the given XSDT address.
@@ -174,10 +178,11 @@ fn build_dsdt(virtio_mmio_devices: &[(u64, u32)], pci_host: Option<&PciHostInfo>
             SHM_MEM_START + SHM_MEM_SIZE - 1,
             None,
         );
-        let crs = Name::new(
-            Path::new("_CRS"),
-            &ResourceTemplate::new(vec![&buses, &memory, &shm]),
-        );
+        let mut resources: Vec<&dyn Aml> = vec![&buses, &memory];
+        if pci_host.shm_window {
+            resources.push(&shm);
+        }
+        let crs = Name::new(Path::new("_CRS"), &ResourceTemplate::new(resources));
 
         let mut prt = PackageBuilder::new();
         for function in &pci_host.functions {
@@ -478,6 +483,7 @@ mod tests {
                 function: 0,
                 gsi: 5,
             }],
+            shm_window: true,
         };
         let bytes = build_dsdt(&[], Some(&pci_host));
 
@@ -490,12 +496,32 @@ mod tests {
     }
 
     #[test]
+    fn the_shm_window_is_declared_only_when_the_guest_has_one() {
+        let pci_host = |shm_window| PciHostInfo {
+            ecam_base: 0xe000_0000,
+            bar_start: 0xe010_0000,
+            bar_size: 0x1eb0_0000,
+            functions: Vec::new(),
+            shm_window,
+        };
+        // A QWord address-space descriptor (0x8a) whose minimum is SHM_MEM_START.
+        let declares = |bytes: &[u8]| {
+            bytes
+                .windows(22)
+                .any(|w| w[0] == 0x8a && w[14..22] == SHM_MEM_START.to_le_bytes())
+        };
+        assert!(declares(&build_dsdt(&[], Some(&pci_host(true)))));
+        assert!(!declares(&build_dsdt(&[], Some(&pci_host(false)))));
+    }
+
+    #[test]
     fn mcfg_contains_bus_zero_ecam_and_valid_checksum() {
         let pci_host = PciHostInfo {
             ecam_base: 0xe000_0000,
             bar_start: 0xe010_0000,
             bar_size: 0x1eb0_0000,
             functions: Vec::new(),
+            shm_window: true,
         };
         let bytes = build_mcfg(&pci_host);
 
@@ -640,6 +666,7 @@ mod tests {
             bar_start: 0xe010_0000,
             bar_size: 0x1eb0_0000,
             functions: Vec::new(),
+            shm_window: true,
         };
 
         setup_acpi(&mem, 1, &[], Some(&pci_host)).unwrap();

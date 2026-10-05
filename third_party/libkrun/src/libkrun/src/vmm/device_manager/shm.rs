@@ -21,11 +21,13 @@ pub struct ShmRegion {
 pub struct ShmManager {
     #[allow(unused)]
     next_guest_addr: u64,
-    /// One past the last address regions may occupy: on x86_64 the end of the span the DSDT
-    /// declares as a PCI host-bridge window; unbounded elsewhere. A `shm_start_addr` of 0
-    /// means the guest has no span at all (local patch, see VENDOR.md).
+    /// One past the last address regions may occupy: the end of the span the DSDT declares
+    /// as a PCI host-bridge window when devices are on virtio-pci; unbounded otherwise.
     #[allow(unused)]
     end_guest_addr: u64,
+    /// Whether regions must be describable by a PCI BAR (a power of two, aligned to it).
+    #[allow(unused)]
+    pci: bool,
     #[allow(unused)]
     page_size: usize,
     fs_regions: BTreeMap<usize, ShmRegion>,
@@ -34,17 +36,32 @@ pub struct ShmManager {
     vhost_user_regions: BTreeMap<usize, ShmRegion>,
 }
 
-/// How much guest-physical space shared-memory regions may occupy, from `shm_start_addr`.
-#[cfg(target_arch = "x86_64")]
-const SHM_SPAN: u64 = arch::x86_64::layout::SHM_MEM_SIZE;
-#[cfg(not(target_arch = "x86_64"))]
-const SHM_SPAN: u64 = u64::MAX;
-
 impl ShmManager {
-    pub fn new(info: &ArchMemoryInfo) -> ShmManager {
+    /// Regions start above the guest's RAM, as upstream, unless the devices are on virtio-pci
+    /// (`pci`, x86_64): then they live in the fixed span at `SHM_MEM_START` that the DSDT
+    /// declares as a host-bridge window, and a guest whose RAM reaches into it has no span
+    /// at all (local patch, see VENDOR.md).
+    pub fn new(info: &ArchMemoryInfo, pci: bool) -> ShmManager {
+        #[cfg(target_arch = "x86_64")]
+        let (start, end) = if pci {
+            use arch::x86_64::layout::{SHM_MEM_SIZE, SHM_MEM_START, shm_span_usable};
+            if shm_span_usable(info.ram_last_addr) {
+                (SHM_MEM_START, SHM_MEM_START + SHM_MEM_SIZE)
+            } else {
+                (0, 0)
+            }
+        } else {
+            (info.shm_start_addr, u64::MAX)
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let (start, end) = {
+            let _ = pci;
+            (info.shm_start_addr, u64::MAX)
+        };
         Self {
-            next_guest_addr: info.shm_start_addr,
-            end_guest_addr: info.shm_start_addr.saturating_add(SHM_SPAN),
+            next_guest_addr: start,
+            end_guest_addr: end,
+            pci,
             page_size: info.page_size,
             fs_regions: BTreeMap::new(),
             gpu_region: None,
@@ -90,8 +107,8 @@ impl ShmManager {
     /// Reserve `size` bytes at `base` (at or after `next_guest_addr`) within the span.
     #[allow(unused)]
     fn create_region_at(&mut self, size: usize, base: u64) -> Result<ShmRegion, Error> {
-        // A start address of 0 is the "this guest has no span" sentinel, not a usable base:
-        // carving a region there would land it on the guest's own RAM.
+        // A start address of 0 is the "this guest has no span" sentinel (a PCI guest whose RAM
+        // reaches the span), not a usable base: a region there would land on the guest's RAM.
         if self.next_guest_addr == 0 {
             return Err(Error::OutOfSpace);
         }
@@ -111,11 +128,11 @@ impl ShmManager {
     /// exposes it as a memory BAR, which a driver sizes by probing an address mask: the size
     /// must be a power of two and the base aligned to it, and the guest maps it in 2 MiB
     /// subsections, so a smaller one is unusable. virtio-mmio carries base and length in
-    /// registers and is happy with either (local patch, see VENDOR.md).
+    /// registers, so it keeps upstream's page-aligned placement (local patch, see VENDOR.md).
     #[cfg(not(feature = "tee"))]
     fn place_fs_region(&self, size: usize) -> Result<(usize, u64), Error> {
         const MIN_SIZE: usize = 2 << 20;
-        if !cfg!(target_arch = "x86_64") {
+        if !self.pci {
             return Ok((align_upwards!(size, self.page_size), self.next_guest_addr));
         }
         let size = size
@@ -157,5 +174,65 @@ impl ShmManager {
     #[cfg(feature = "vhost-user")]
     pub fn vhost_user_region(&self, index: usize) -> Option<&ShmRegion> {
         self.vhost_user_regions.get(&index)
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64", not(feature = "tee")))]
+mod tests {
+    use super::*;
+    use arch::x86_64::layout::{SHM_MEM_SIZE, SHM_MEM_START};
+
+    fn info(ram_last_addr: u64, shm_start_addr: u64) -> ArchMemoryInfo {
+        ArchMemoryInfo {
+            ram_below_gap: 0,
+            ram_above_gap: 0,
+            ram_last_addr,
+            shm_start_addr,
+            guest_last_addr: 0,
+            page_size: 4096,
+            initrd_addr: 0,
+            firmware_addr: 0,
+        }
+    }
+
+    #[test]
+    fn pci_windows_are_aligned_powers_of_two_in_the_span() {
+        let mut shm = ShmManager::new(&info(8 << 30, 9 << 30), true);
+        shm.create_fs_region(0, 3 << 20).unwrap();
+        shm.create_fs_region(1, 1 << 20).unwrap();
+        let a = shm.fs_region(0).unwrap().clone();
+        let b = shm.fs_region(1).unwrap().clone();
+        assert_eq!((a.guest_addr.0, a.size), (SHM_MEM_START, 4 << 20));
+        // Rounded up to the 2 MiB floor, aligned past the first window.
+        assert_eq!(
+            (b.guest_addr.0, b.size),
+            (SHM_MEM_START + (4 << 20), 2 << 20)
+        );
+        // The span is bounded.
+        assert!(matches!(
+            shm.create_fs_region(2, SHM_MEM_SIZE as usize),
+            Err(Error::OutOfSpace)
+        ));
+    }
+
+    #[test]
+    fn a_pci_guest_whose_ram_reaches_the_span_gets_no_window() {
+        let mut shm = ShmManager::new(&info(SHM_MEM_START + 1, SHM_MEM_START + (1 << 30)), true);
+        assert!(matches!(
+            shm.create_fs_region(0, 2 << 20),
+            Err(Error::OutOfSpace)
+        ));
+    }
+
+    #[test]
+    fn mmio_windows_sit_above_ram_page_aligned_and_unbounded() {
+        let start = 128u64 << 30;
+        let mut shm = ShmManager::new(&info(127 << 30, start), false);
+        shm.create_fs_region(0, (3 << 20) + 1).unwrap();
+        shm.create_fs_region(1, SHM_MEM_SIZE as usize).unwrap();
+        let a = shm.fs_region(0).unwrap().clone();
+        let b = shm.fs_region(1).unwrap().clone();
+        assert_eq!((a.guest_addr.0, a.size), (start, (3 << 20) + 4096));
+        assert_eq!(b.guest_addr.0, start + (3 << 20) + 4096);
     }
 }

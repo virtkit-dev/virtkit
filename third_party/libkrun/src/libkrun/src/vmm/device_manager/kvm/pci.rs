@@ -196,12 +196,15 @@ impl PciHostManager {
         Ok(Some(info))
     }
 
-    pub fn acpi_info(&self) -> arch::x86_64::PciHostInfo {
+    /// The host bridge as the ACPI tables describe it; `shm_window` declares the
+    /// shared-memory span as one of its windows.
+    pub fn acpi_info(&self, shm_window: bool) -> arch::x86_64::PciHostInfo {
         arch::x86_64::PciHostInfo {
             ecam_base: arch::x86_64::layout::PCI_ECAM_START,
             bar_start: arch::x86_64::layout::PCI_BAR_START,
             bar_size: arch::x86_64::layout::PCI_BAR_END - arch::x86_64::layout::PCI_BAR_START,
             functions: self.functions.clone(),
+            shm_window,
         }
     }
 }

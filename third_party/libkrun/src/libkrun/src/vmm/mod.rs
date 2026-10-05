@@ -341,10 +341,11 @@ impl Vmm {
             };
 
             #[cfg(target_os = "linux")]
-            let pci_host_info = self
-                .pci_device_manager
-                .as_ref()
-                .map(PciHostManager::acpi_info);
+            let pci_host_info = self.pci_device_manager.as_ref().map(|pci| {
+                pci.acpi_info(arch::x86_64::layout::shm_span_usable(
+                    self.arch_memory_info.ram_last_addr,
+                ))
+            });
             #[cfg(not(target_os = "linux"))]
             let pci_host_info = None;
 

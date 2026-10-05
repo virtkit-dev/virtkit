@@ -737,6 +737,8 @@ pub fn build_microvm(
 ) -> std::result::Result<Arc<Mutex<Vmm>>, StartMicrovmError> {
     let payload = choose_payload(vm_resources)?;
 
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let pci_enabled = false;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let pci_enabled = {
         let enabled = device_manager.uses_pci();
@@ -798,6 +800,7 @@ pub fn build_microvm(
         &fs_shm_sizes,
         gpu_shm_size,
         use_vhost_user,
+        pci_enabled,
         &payload,
         #[cfg(feature = "tee")]
         fw_range_for_mem,
@@ -1895,6 +1898,7 @@ pub fn create_guest_memory(
     fs_shm_sizes: &[Option<usize>],
     gpu_shm_size: Option<usize>,
     use_vhost_user: bool,
+    pci: bool,
     payload: &Payload,
     #[cfg(feature = "tee")] firmware_range: Option<(u64, usize)>,
 ) -> std::result::Result<
@@ -1964,7 +1968,7 @@ pub fn create_guest_memory(
     };
 
     #[allow(unused_mut)]
-    let mut shm_manager = ShmManager::new(&arch_mem_info);
+    let mut shm_manager = ShmManager::new(&arch_mem_info, pci);
 
     #[cfg(feature = "tee")]
     let _ = fs_shm_sizes;
@@ -2612,6 +2616,7 @@ pub mod tests {
             None,
             &[],
             None,
+            false,
             false,
             &Payload::Empty,
             #[cfg(feature = "tee")]
