@@ -325,7 +325,8 @@ Planned pages, in order of priority:
    waits, versions, configuration drift; desired, observed and unknown shown distinctly;
 2. **node detail** — inventory, effective configuration, recent jobs, atop timelines and
    egress reports;
-3. **operations** — drain, reset, rollouts and their progress;
+3. **operations** — drains, resets, rollouts and their progress; built so far, releases and
+   rollouts, with a node's drain and reset steered from its page;
 4. **audit** — every operator action and every command's outcome.
 
 Proposed: metrics for capacity, admission waits and node states, exported for Prometheus.
@@ -377,7 +378,7 @@ model, commands and process handling.
 - Proposed: runner authentication tokens stay on their nodes, and the hub's GitLab
   credential is a separate one, scoped to managing runners (pause, resume, list).
 - Hub roles: viewer; operator (ceilings, stopping acquisition, drain and quarantine,
-  pausing, resuming and aborting rollouts; reset proposed); admin (enrollment, releases,
+  pausing, resuming and aborting rollouts, resets); admin (enrollment, releases,
   starting a rollout, and the proposed redeploy). Proposed: BMC
   credentials are held apart and used only by redeploys. Admin is the admin socket's:
   whoever runs as the hub's user or root, who also issues the web UI's sign-in links; a web

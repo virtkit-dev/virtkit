@@ -27,9 +27,9 @@ The prototype provides, all experimentally:
   rollout`);
 - resets, which clear what a node's past jobs left (`vk-hub nodes reset`);
 - `vk-hub workloads`: each node's VMs;
-- live nodes, node detail and operations pages, steering from a node's page, pausing,
-  resuming and aborting rollouts from the operations page, and an audit log, with sign-in
-  links from `vk-hub ui login`.
+- live nodes, node detail and operations pages, steering and resetting from a node's page,
+  pausing, resuming and aborting rollouts from the operations page, and an audit log, with
+  sign-in links from `vk-hub ui login`.
 
 Restart and redeploy are not built.
 
@@ -142,10 +142,10 @@ is closed to everyone else.
 and `resume` stop and resume its acquisition: the node's desired state, kept on the hub with a
 generation that moves on every change, to one past both the hub's last and the one the node
 last reported applying. A ceiling of 0 is refused: gitlab-runner has none, and stopping
-acquisition is what it would mean. `vk-hub nodes drain`, `undrain`, `quarantine` and `release`
-issue a command, valid for a day, and `vk-hub nodes reset` issues one too ([Resets](#resets)).
-On the admin socket they are audited as `uid <n>`, the caller's; an operator's node page in the
-web UI runs the same operations, audited as its session's principal (see [Web UI](#web-ui)).
+acquisition is what it would mean. `vk-hub nodes drain`, `undrain`, `quarantine`, `release` and
+`reset` issue a command, valid for a day. On the admin socket they are audited as `uid <n>`,
+the caller's; an operator's node page in the web UI runs the same operations, audited as its
+session's principal (see [Web UI](#web-ui)).
 
 A session sends desired state once the node's report shows an older generation, once per
 generation, and each command without a final outcome once per session; nothing goes before the
@@ -434,31 +434,32 @@ others back.
 
 ## Resets
 
-`vk-hub nodes reset <id> [--images]` drains the node like an update does, from `ready`,
-`draining` or `drained` and only with a managed runner, except that the drain is over once the
-runner has exited and no job is waiting for admission or being admitted: a job supervisor a
-failed cleanup left running, and the admission it holds, are what a reset is for, not something
-it waits on. A job admitted with no supervisor yet is a `prepare` under way, which the reset
-does not stop; it waits for that one to exit or hand its job to a supervisor, and fails, the
-node left `drained`, if it has done neither within ten minutes. In `maintenance` the node stops
-the processes past jobs left: those of its user whose binary is a `vk` (the running one, the
-installed one, a release under the node dir, or any file so named), a `cloud-hypervisor` or a
-`virtiofsd`, and whose arguments name a path inside one of its job dirs, whole or as a `--flag=`
-value — a shell or a `tail` of a job's log is not one of them. Each is held by a pidfd opened
-before its `/proc` entry is read and kept only if still alive after, sent `SIGTERM` through it,
-and `SIGKILL` if it has not exited ten seconds later; one still alive five seconds after that,
-or a `/proc` the node cannot list, fails the reset before anything is removed. The node then
-gives back each job dir's network lease, removes the job dirs under `<state_dir>/jobs` and
-anything else there but its dot-entries, a symlink removed as itself and never followed, sweeps
-the host checkouts no job uses, and with `--images` evicts the materialized images under
-`<state_dir>/{registry,docker,build}` as `vk gc --idle-secs 0` does. The build cache's registry
-store is never touched. `validating` then runs what an update's trial does — `vk check`'s gate,
-`[node] validate`, and a session with the hub within ten minutes — and the node returns to the
-state it was in; a node that fails stays `drained`, with the reset `failed` and the reason,
-rather than take jobs on a host that does not pass. A reset clears the last update's progress
-from the node's report, and a reset and an update exclude each other; a `vk node run` stopped
-during either takes it up again at its next start. The command's audit lines name it `reset`, or
-`reset, images included`.
+`vk-hub nodes reset <id> [--images]`, or the reset button on an operator's node page — which
+asks again, on a form of its own, before the reset is issued — drains the node like an update
+does, from `ready`, `draining` or `drained` and only with a managed runner, except that the
+drain is over once the runner has exited and no job is waiting for admission or being admitted:
+a job supervisor a failed cleanup left running, and the admission it holds, are what a reset is
+for, not something it waits on. A job admitted with no supervisor yet is a `prepare` under way,
+which the reset does not stop; it waits for that one to exit or hand its job to a supervisor,
+and fails, the node left `drained`, if it has done neither within ten minutes. In `maintenance`
+the node stops the processes past jobs left: those of its user whose binary is a `vk` (the
+running one, the installed one, a release under the node dir, or any file so named), a
+`cloud-hypervisor` or a `virtiofsd`, and whose arguments name a path inside one of its job dirs,
+whole or as a `--flag=` value — a shell or a `tail` of a job's log is not one of them. Each is
+held by a pidfd opened before its `/proc` entry is read and kept only if still alive after, sent
+`SIGTERM` through it, and `SIGKILL` if it has not exited ten seconds later; one still alive five
+seconds after that, or a `/proc` the node cannot list, fails the reset before anything is
+removed. The node then gives back each job dir's network lease, removes the job dirs under
+`<state_dir>/jobs` and anything else there but its dot-entries, a symlink removed as itself and
+never followed, sweeps the host checkouts no job uses, and with `--images` evicts the
+materialized images under `<state_dir>/{registry,docker,build}` as `vk gc --idle-secs 0` does.
+The build cache's registry store is never touched. `validating` then runs what an update's trial
+does — `vk check`'s gate, `[node] validate`, and a session with the hub within ten minutes — and
+the node returns to the state it was in; a node that fails stays `drained`, with the reset
+`failed` and the reason, rather than take jobs on a host that does not pass. A reset clears the
+last update's progress from the node's report, and a reset and an update exclude each other; a
+`vk node run` stopped during either takes it up again at its next start. The command's audit
+lines name it `reset`, or `reset, images included`.
 
 ## Workloads
 
@@ -536,11 +537,12 @@ hub keeps the newest 100,000 rows). A node's page shows what the hub asks of it 
 reports — its state, acquisition, runner, concurrency, drain progress and what it cannot
 carry out — and its 20 latest commands with their outcomes. An operator's node page offers
 the steering actions: a ceiling set or lifted, acquisition stopped or resumed, drain,
-undrain, quarantine, release. Each action returns a status line through htmx while the node's
-fragment updates live, and also works as a plain form. Monitoring-only nodes are marked,
-offer no actions and reject steering posts. Viewers have no actions. Removing a node stays
-on the admin socket. A page is refused to a request whose `Sec-Fetch-Site` is `same-site` or
-`cross-site`.
+undrain, quarantine, release, and reset, which requires confirmation from the same session,
+once and within ten minutes, as local mode's stops do. Each action returns a status line
+through htmx while the node's fragment updates live, and also works as a plain form.
+Monitoring-only nodes are marked, offer no actions and reject steering posts. Viewers have no
+actions. Removing a node stays on the admin socket. A page is refused to a request whose
+`Sec-Fetch-Site` is `same-site` or `cross-site`.
 
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a

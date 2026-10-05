@@ -2767,6 +2767,79 @@ async fn a_version_1_node_s_page_offers_no_steering() {
     assert!(hub.db.node_commands(&node).unwrap().is_empty());
 }
 
+/// A reset deletes what a node's past jobs left: the node's page asks again first, and only
+/// the answer, once, issues it. A version 1 node is refused before anything is asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_is_issued_only_once_confirmed() {
+    let (addr, hub, origin) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
+    let path = format!("/node/{node}/action");
+    let page = get(addr, &format!("/node/{node}"), Some(&cookie)).await;
+    assert!(
+        page.body.contains("<button>reset</button>"),
+        "{}",
+        page.body
+    );
+
+    let answer = ask(addr, &origin, &cookie, &csrf, &path, "reset").await;
+    assert!(hub.db.node_commands(&node).unwrap().is_empty());
+    let reply = post_action(addr, &origin, &cookie, &path, &answer, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Issued reset (command "),
+        "{}",
+        reply.body
+    );
+    let commands = hub.db.pending_commands(&node, crate::now_secs()).unwrap();
+    assert_eq!(
+        commands.iter().map(|c| &c.op).collect::<Vec<_>>(),
+        [&vk_hub_proto::Operation::Reset { images: false }]
+    );
+    assert!(
+        node_audit(&hub, &node)
+            .iter()
+            .any(|(actor, e)| *actor == principal && e.contains("issued reset (command ")),
+        "{:?}",
+        node_audit(&hub, &node)
+    );
+    // Answered once.
+    let reply = post_action(addr, &origin, &cookie, &path, &answer, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert_eq!(hub.db.node_commands(&node).unwrap().len(), 1);
+
+    let (token, _) = hub
+        .db
+        .create_token(Duration::from_secs(60), "uid 0", crate::now_secs())
+        .unwrap();
+    let crate::store::Enrollment::Enrolled { node_id: old } = hub
+        .db
+        .enroll(&token, &"cd".repeat(16), "ci-2", "peer p", 1)
+        .unwrap()
+    else {
+        panic!("expected an enrollment");
+    };
+    assert!(
+        hub.db
+            .record_session(&old, "inc", 1, crate::now_secs(), || true)
+            .unwrap()
+    );
+    let form = format!("_csrf={csrf}&op=reset");
+    let reply = post_action(
+        addr,
+        &origin,
+        &cookie,
+        &format!("/node/{old}/action"),
+        &form,
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(reply.body.contains("update its vk"), "{}", reply.body);
+    assert!(hub.db.node_commands(&old).unwrap().is_empty());
+}
+
 /// Rollout `ef…`, running, of release `ab…` (unsigned; `cd…`, signed, beside it): node
 /// `hostname` failed with a reason naming it, node `ci-2` still pending. Written straight
 /// into the database; returns its ID.

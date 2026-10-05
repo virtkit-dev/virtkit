@@ -1,8 +1,9 @@
 //! The fleet site for `vk-hub serve`: the nodes table, per-node inventory, load, workloads,
 //! steering, commands, releases and rollouts, and the audit log. Operators steer nodes and
 //! pause, resume or abort rollouts through the shared admin-socket operations ([`crate::ops`])
-//! as their session's principal. Monitoring-only nodes have no steering controls. Adding a
-//! release and starting a rollout stay on the admin socket.
+//! as their session's principal. A reset, which deletes what the node's past jobs left, is
+//! confirmed first ([`actions::ask_first`]). Monitoring-only nodes have no steering controls.
+//! Adding a release and starting a rollout stay on the admin socket.
 
 use std::sync::Arc;
 
@@ -39,6 +40,8 @@ const OPERATIONS_ROLLOUTS: usize = 10;
 /// ([`sse::feed`]). `/operations` shows only releases and rollouts, so it follows
 /// [`Hub::touch`] alone, not every node's heartbeat.
 pub(super) struct FleetSite {
+    /// Pending reset confirmations.
+    questions: actions::Questions,
     nodes_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     steered_operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
@@ -47,6 +50,7 @@ pub(super) struct FleetSite {
 impl FleetSite {
     pub(super) fn new(hub: &Arc<Hub>) -> Self {
         FleetSite {
+            questions: actions::Questions::new(),
             nodes_feed: sse::feed(hub.subscribe(), "nodes", render_nodes(hub.clone())),
             operations_feed: sse::feed(
                 hub.subscribe_touched(),
@@ -240,7 +244,7 @@ enum Steer {
 }
 
 /// The actions a node's page offers beside setting a ceiling, as `(op, label)`.
-const NODE_OPS: [(&str, &str); 7] = [
+const NODE_OPS: [(&str, &str); 8] = [
     ("lift-ceiling", "lift ceiling"),
     ("stop", "stop acquisition"),
     ("resume", "resume acquisition"),
@@ -248,6 +252,7 @@ const NODE_OPS: [(&str, &str); 7] = [
     ("undrain", "undrain"),
     ("quarantine", "quarantine"),
     ("release", "release"),
+    ("reset", "reset"),
 ];
 
 /// What `form` asks, or why it is no action.
@@ -269,6 +274,7 @@ fn steer(form: &[(String, String)]) -> Result<Steer, &'static str> {
         "undrain" => Steer::Command(Operation::Undrain),
         "quarantine" => Steer::Command(Operation::Quarantine),
         "release" => Steer::Command(Operation::Release),
+        "reset" => Steer::Command(Operation::Reset { images: false }),
         _ => return Err("No such action."),
     })
 }
@@ -279,6 +285,7 @@ fn steer(form: &[(String, String)]) -> Result<Steer, &'static str> {
 pub(super) async fn node_action(
     req: Request<Incoming>,
     ui: &Ui,
+    site: &FleetSite,
     id: &str,
 ) -> Result<Response<Body>> {
     let htmx = req.headers().contains_key("hx-request");
@@ -290,6 +297,39 @@ pub(super) async fn node_action(
         Ok(steer) => steer,
         Err(why) => return Ok(actions::refused(htmx, StatusCode::BAD_REQUEST, why)),
     };
+    if matches!(steer, Steer::Command(Operation::Reset { .. })) {
+        // Asked only of a node it can be issued to.
+        let hub = ui.hub.clone();
+        let node = id.to_string();
+        let row = blocking(move || hub.db.node(&node)).await?;
+        let Some(row) = row else {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::NOT_FOUND,
+                "There is no such node.",
+            ));
+        };
+        if let Err(e) = crate::store::steerable(id, &row) {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::CONFLICT,
+                &format!("Refused: {e:#}."),
+            ));
+        }
+        let back = format!("/node/{id}");
+        let ask = actions::Ask {
+            path: format!("{back}/action"),
+            back,
+            op: "reset".into(),
+            what: "Reset this node? It drains, stops what its past jobs left running, and \
+                   deletes their job directories and its idle host checkouts.",
+            asked: Vec::new(),
+        };
+        if let Some(asked) = actions::ask_first(&site.questions, layout, htmx, &auth, &form, &ask)?
+        {
+            return Ok(asked);
+        }
+    }
     let principal = auth.session.principal();
     let hub = ui.hub.clone();
     let node = id.to_string();

@@ -380,7 +380,7 @@ impl std::error::Error for MonitoringOnly {}
 
 /// Refuse to steer node `id` whose latest session ran below [`STEERING`]. A node that has not
 /// connected yet is taken at its word: what it is sent waits for a session that can carry it.
-fn steerable(id: &str, row: &NodeRow) -> Result<()> {
+pub(crate) fn steerable(id: &str, row: &NodeRow) -> Result<()> {
     match row.protocol {
         Some(version) if version < STEERING => Err(MonitoringOnly {
             id: id.to_string(),

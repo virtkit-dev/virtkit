@@ -317,9 +317,9 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
             get(&path, req.uri().query(), &auth, ui).await
         }
         (Method::POST, _) => match &ui.site {
-            Site::Fleet(_) => {
+            Site::Fleet(site) => {
                 if let Some(id) = fleet::action_node(&path) {
-                    fleet::node_action(req, ui, id).await
+                    fleet::node_action(req, ui, site, id).await
                 } else if let Some(id) = fleet::action_rollout(&path) {
                     fleet::rollout_action(req, ui, id).await
                 } else {
