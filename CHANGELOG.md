@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Jobs under an egress allowlist no longer report a spurious `egress denied (dns) an
+  unparsable question` at boot.
+
 ## [0.83.0] - 2026-10-05
 
 ### Added

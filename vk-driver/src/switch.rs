@@ -2489,6 +2489,12 @@ async fn handle_dns(
     egress: Arc<EgressGuard>,
 ) {
     const TYPE_A: u16 = 1;
+    // Shorter than a DNS header: nothing to answer, check or forward. vk-agent's gateway
+    // probe (`wait_for_gateway`) is such a datagram, sent at every boot, so it is dropped
+    // silently rather than recorded as a denial.
+    if query.len() < 12 {
+        return;
+    }
     // The name the failure log attributes an upstream fault to: the primary resolver, even
     // when the fault was met (and retried) across the others.
     let primary = upstreams
@@ -5325,8 +5331,8 @@ mod tests {
         assert_eq!(reply.map(|r| r[3] & 0x0f), Some(RCODE_REFUSED));
         assert!(forwarded.is_none());
 
-        // Allowlist: REFUSED without reaching the upstream, and recorded; a query too short
-        // to answer is dropped.
+        // Allowlist: REFUSED without reaching the upstream, and recorded; a datagram shorter
+        // than a header (vk-agent's gateway probe among them) is dropped unrecorded.
         let log = dir.join("enforce.log");
         let enforce =
             Arc::new(EgressGuard::new(allowlist(), gw).with_denied_log(Some(log.clone())));
@@ -5339,7 +5345,10 @@ mod tests {
                 (Some(RCODE_REFUSED), false)
             );
         }
-        assert_eq!(lookup(&enforce, guest, vec![0; 11]).await, (None, false));
+        for short in [vec![0], vec![0; 11]] {
+            assert_eq!(lookup(&enforce, guest, short.clone()).await, (None, false));
+            assert_eq!(lookup(&open, guest, short).await, (None, false));
+        }
         // The first at once, the repeats counted in one record when they are written out.
         assert_eq!(
             crate::egress_report::read_since(&log, 0).0,
@@ -5347,7 +5356,7 @@ mod tests {
         );
         enforce.flush_dns_denials();
         let repeats = Denial {
-            count: queries.len() as u64 + 1,
+            count: queries.len() as u64,
             ..denial.clone()
         };
         assert_eq!(
