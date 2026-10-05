@@ -134,6 +134,16 @@
 #                           # `vk tune` — or `vk node run`, on a fleet node — sets its
 #                           # `concurrent` directly instead of leaving the number for the
 #                           # root-side vk-runnerctl
+# runner = "external"       # who runs gitlab-runner: "external" (default) — its own service,
+#                           # of which a fleet hub steers only `concurrent` — or "managed":
+#                           # `vk node run` runs `gitlab-runner run --config <runner_config>`
+#                           # as a child, restarts it if it dies, and stops it with SIGQUIT
+#                           # (running jobs finish, no new ones are taken) to stop acquisition,
+#                           # as a drain or a quarantine does. Managed, runner_config defaults
+#                           # to ~/.gitlab-runner/config.toml, and its vk executor must use
+#                           # this same config: drains are judged from this state dir
+# gitlab_runner = "/usr/local/bin/gitlab-runner"  # the binary a managed runner runs;
+#                           # default: gitlab-runner on PATH
 
 # MICROVM_IMAGE is prefix-based (the prefix names the source): unset = local/default;
 # `local/<name>` = a bundle dir under [local] dir; `virtkit/<name>[:tag|@digest]` =

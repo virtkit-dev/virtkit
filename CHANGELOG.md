@@ -14,6 +14,15 @@ All notable changes to virtkit will be documented in this file.
   host's own estimate and `max_concurrency` — and keeps what the hub asked across restarts
   and while the hub is unreachable. A node and a hub both of this release are needed: a hub
   of 0.84.0 or earlier only monitors.
+- **Experimental: `[node] runner = "managed"` lets the hub stop a host taking jobs.** The
+  node runs gitlab-runner itself and restarts it if it dies. The hub can then stop and resume
+  acquisition, drain the node — it reports `drained` once the runner has finished its jobs and
+  nothing is left admitted or running — and quarantine it until an operator releases it; a
+  drained node released from a quarantine stays drained. Stopping lets running jobs finish,
+  and gitlab-runner cannot be resumed while it does, so a resume meanwhile starts a new runner
+  once the old one has exited. A runner left behind by a `vk node run` that was killed is
+  picked up rather than started twice. Under systemd, run the node with `KillMode=mixed`, so
+  stopping the unit lets jobs finish. An external runner refuses a drain and a quarantine.
 
 ## [0.84.0] - 2026-10-05
 

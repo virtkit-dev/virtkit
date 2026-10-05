@@ -12,14 +12,16 @@ The prototype provides, all experimentally:
 - `vk workloads`: the host's running VMs;
 - `vk-hub local`: a web UI to view and act on those VMs, with printed sign-in links;
 - enrollment, node sessions, inventory and heartbeats;
-- on the node, desired state and a command journal kept across restarts, and the runner's
-  concurrency set within the hub's ceiling;
+- on the node, desired state and a command journal kept across restarts, the runner's
+  concurrency set within the hub's ceiling, and drain and quarantine of a gitlab-runner the
+  node runs itself (`[node] runner = "managed"`);
 - `vk-hub workloads`: each node's VMs;
 - live nodes and node detail pages, and an audit log, with sign-in links from
   `vk-hub ui login`.
 
-The hub observes nodes but does not control them: it sends no desired state or command. Drain
-and quarantine, releases, updates, rollouts, resets, restart and redeploy are not built.
+The hub observes nodes but does not control them: it sends no desired state or command, so
+none of what the node carries out can be asked for yet. Releases, updates, rollouts, resets,
+restart and redeploy are not built.
 
 | Capability | Current prototype | Proposed gate |
 |---|---|---|
@@ -107,10 +109,13 @@ ID, NAME, REACH, LAST SEEN, VK, CPUS, RAM, ADMITTED and VMS.
 The node redials a lost session with a backoff doubling from 1 to 60 seconds, plus up to a
 quarter of jitter, reset by a session that lasted a minute. Superseded three times in a row, it
 warns that another host may hold a copy of its state dir and redials every minute. A hub
-refusal of `not_enrolled`, `bad_signature` or `revoked` ends `vk node run`. A first SIGTERM or
-SIGINT closes the session, waiting at most 5 seconds for the hub; a second exits at once.
-`vk node run` exits 75 while another `vk node` holds `<state_dir>/node/lock`, and refuses to
-start unless `<state_dir>/node/` belongs to its user and is closed to everyone else.
+refusal of `not_enrolled`, `bad_signature` or `revoked` ends `vk node run`, once a managed
+runner has finished its jobs. A first SIGTERM or SIGINT closes the session, waiting at most 5
+seconds for the hub, and quits a managed runner, waiting for its jobs; a second exits at once,
+or with a managed runner sends it SIGTERM, abandoning the jobs, and exits once it has gone; a
+third exits at once. `vk node run` exits 75 while another `vk node` holds
+`<state_dir>/node/lock`, and refuses to start unless `<state_dir>/node/` belongs to its user and
+is closed to everyone else.
 
 ## Node state and commands
 
@@ -129,10 +134,13 @@ was kept for: a node enrolled anew, or with another hub, forgets the applied gen
 journal but keeps its own state. In a session at version 1 the node sends no ack and its report
 carries its VMs alone; what it persisted still applies.
 
-Drain and quarantine need a runner the node runs itself, which is not built: the node refuses
-both, and reports a stop of acquisition in the desired state as something it cannot carry out
-(`unsupported`), while still setting the runner's concurrency. `undrain` and `release` have
-nothing to undo, and are `done`.
+A drain is `accepted`, and its ack moves to `done` once the node is drained, or to `failed` if
+an `undrain` or a `quarantine` ends it first; a drain of a drained node is `done` at once.
+Any other command the node can carry out is `done` when received. Drain and quarantine need a runner the node runs
+itself: with an external runner the node refuses both, and reports a stop of acquisition in
+the desired state as something it cannot carry out (`unsupported`), while still setting the
+runner's concurrency. Each change is written, and its directory fsynced, before the ack goes
+out: the hub does not send a command again once it has its ack.
 
 ## Concurrency control
 
@@ -141,9 +149,38 @@ ceiling from the applied desired state as a third term: every half minute, and w
 desired state or anything else it reports changes, only the half-minute pass raising it, by
 the estimate's one step when there is a memory budget. As with `vk tune`, the number goes to
 `<state_dir>/schedule/desired-concurrency` for `vk-runnerctl`, and a runner config the node's
-user owns (`[node] runner_config`) has its `concurrent` set directly. The report carries the
+user owns (`[node] runner_config`, by default `~/.gitlab-runner/config.toml` for a managed
+runner) has its `concurrent` set directly. The report carries the
 estimate, both ceilings and the effective number; a concurrency that cannot be set is
 reported with the reason (`concurrency_error`), and logged when it starts.
+
+## Drain and runner lifecycle
+
+With `[node] runner = "managed"`, `vk node run` runs `gitlab-runner run --config
+<runner_config>` itself (`[node] gitlab_runner` names the binary, `gitlab-runner` on `PATH` by
+default), in a process group of its own and with every signal at its default disposition, so
+one the node inherited as ignored cannot keep the runner from stopping. It restarts a runner
+that dies with a backoff doubling from 1 to 60 seconds, reset by a run that lasted a minute.
+It stops acquisition with `SIGQUIT` while the hub has asked for that and while the node is
+draining, drained or quarantined, and starts no runner until it may take jobs again.
+gitlab-runner has no way back from `SIGQUIT`: a runner told to stop is reported `quitting`,
+and acquisition as still running, until it has exited, and a resume that comes meanwhile
+starts a new runner once the old one has gone. A runner outlives a node killed outright; its
+pid and start time are kept in `<state_dir>/node/runner.pid`, and the next `vk node run`
+follows the runner it finds there rather than start a second.
+
+A drain completes on what the node can observe. gitlab-runner, sent `SIGQUIT`, exits only
+once its jobs are over, cleanup stage included; the admission ledger holds and awaits
+nothing; and no job supervisor is still alive — a job dir alone proves nothing, since a
+failed cleanup leaves one behind, but its supervisor's pid, checked against the job dir, says
+whether its VM is still up. The report carries which of the three hold (`drain`) while the
+node drains. These are the node's own state dir's ledger and job dirs, so the executor its
+runner runs must use the same vk configuration; the node warns at start when the runner's
+config names another. `undrain` returns a drained or draining node to `ready`; a quarantine
+stops acquisition from any state and only `release` lifts it, returning the node to `drained`
+if that is where it was quarantined and to `ready` otherwise. A quarantined node refuses
+`drain` and `undrain`. All of it is persisted on the node, and a restart or a lost hub leaves
+it where it was.
 
 ## Workloads
 

@@ -275,8 +275,17 @@ pub struct Node {
     /// when they appear; heartbeats in between repeat the last figures. Unset: 30.
     pub workload_mem_secs: Option<u64>,
     /// A gitlab-runner config this user owns, whose `concurrent` `vk` sets directly rather
-    /// than leaving the number for `vk-runnerctl`. Unset: the runner is root's.
+    /// than leaving the number for `vk-runnerctl`. Unset: the runner is root's — or, with
+    /// `runner = "managed"`, `~/.gitlab-runner/config.toml`.
     pub runner_config: Option<PathBuf>,
+    /// Who runs gitlab-runner: `"external"` (the default) — a service of its own, whose
+    /// concurrency is all a hub can steer — or `"managed"`: `vk node run` runs it as a child,
+    /// `gitlab-runner run --config <runner_config>`, restarts it when it dies, and stops it
+    /// with `SIGQUIT` (finish the running jobs, take no new ones) when acquisition is to stop.
+    /// A drain or a quarantine needs that, so an external runner refuses them.
+    pub runner: vk_hub_proto::RunnerMode,
+    /// The gitlab-runner binary a managed runner runs. Unset: `gitlab-runner`, on `PATH`.
+    pub gitlab_runner: Option<PathBuf>,
 }
 
 impl Node {

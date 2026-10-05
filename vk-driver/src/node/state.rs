@@ -32,6 +32,9 @@ pub struct Persisted {
     pub applied: Option<DesiredState>,
     #[serde(default)]
     pub state: NodeState,
+    /// The state a quarantine was entered from, which a release returns a drained node to.
+    #[serde(default)]
+    pub quarantined_from: Option<NodeState>,
     #[serde(default)]
     pub journal: Vec<Entry>,
 }
@@ -82,12 +85,17 @@ impl Persisted {
         }
     }
 
-    /// Write the state whole, `0600`, published by `rename`.
+    /// Write the state whole, `0600`, published by `rename`, and fsync the directory: a
+    /// command is acked once it is saved, and the hub does not send an acked command again,
+    /// so a quarantine whose rename a power cut undid would be lost for good.
     pub fn save(&self, dir: &Path) -> Result<()> {
         let json = serde_json::to_vec_pretty(self).context("encoding the node state")?;
         let path = path(dir);
         vk_fs::write_atomic(&path, &json, 0o600)
-            .with_context(|| format!("writing {}", path.display()))
+            .with_context(|| format!("writing {}", path.display()))?;
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("syncing {}", dir.display()))
     }
 
     /// Whether the runner is to take no jobs: the hub asked for that, or the node is not
@@ -135,15 +143,16 @@ impl Persisted {
     }
 
     /// Journal `command` and make the state change it asks for, answering with its outcome. A
-    /// command already journaled is answered with what it came to then.
-    pub fn command(&mut self, command: Command, now: u64) -> CommandAck {
+    /// command already journaled is answered with what it came to then. `managed` is whether
+    /// this node runs its runner, and so can stop it, which a drain and a quarantine need.
+    pub fn command(&mut self, command: Command, now: u64, managed: bool) -> CommandAck {
         if let Some(entry) = self.journal.iter().find(|e| e.id == command.id) {
             return entry.ack();
         }
         let outcome = if now >= command.expires_at {
             Outcome::Expired
         } else {
-            self.execute(&command.op)
+            self.execute(&command.op, managed)
         };
         let entry = Entry {
             id: command.id,
@@ -159,14 +168,76 @@ impl Persisted {
         ack
     }
 
-    /// A drain and a quarantine stop the runner taking jobs, which this node cannot do to a
-    /// runner it does not run; undrain and release have nothing to undo.
-    fn execute(&self, op: &Operation) -> Outcome {
-        match op {
-            Operation::Drain | Operation::Quarantine => Outcome::Refused {
-                reason: "vk node cannot stop a runner it does not run".to_string(),
-            },
-            Operation::Undrain | Operation::Release => Outcome::Done,
+    /// A drain is `accepted` and settles once the node is drained ([`Persisted::finish_drain`]);
+    /// every other operation is done at once. A drain and a quarantine stop the runner taking
+    /// jobs, which this node cannot do to a runner it does not run.
+    fn execute(&mut self, op: &Operation, managed: bool) -> Outcome {
+        let refused = |reason: &str| Outcome::Refused {
+            reason: reason.to_string(),
+        };
+        match (op, self.state) {
+            (Operation::Drain | Operation::Undrain, NodeState::Quarantined) => {
+                refused("the node is quarantined; release it first")
+            }
+            (Operation::Drain | Operation::Quarantine, _) if !managed => refused(
+                "vk node cannot stop a runner it does not run ([node] runner = \"external\")",
+            ),
+            (Operation::Drain, NodeState::Ready) => {
+                self.state = NodeState::Draining;
+                Outcome::Accepted
+            }
+            (Operation::Drain, NodeState::Draining) => Outcome::Accepted,
+            (Operation::Drain, NodeState::Drained) => Outcome::Done,
+            (Operation::Undrain, _) => {
+                if self.state == NodeState::Draining {
+                    self.settle_drains(Outcome::Failed {
+                        message: "undrained before the drain finished".into(),
+                    });
+                }
+                self.state = NodeState::Ready;
+                Outcome::Done
+            }
+            (Operation::Quarantine, NodeState::Quarantined) => Outcome::Done,
+            (Operation::Quarantine, from) => {
+                if from == NodeState::Draining {
+                    self.settle_drains(Outcome::Failed {
+                        message: "quarantined before the drain finished".into(),
+                    });
+                }
+                self.quarantined_from = Some(from);
+                self.state = NodeState::Quarantined;
+                Outcome::Done
+            }
+            // Release restores trust without undoing an operator's completed drain. Return
+            // to drained if quarantined there; otherwise return to ready, including when
+            // quarantine interrupted a drain.
+            (Operation::Release, NodeState::Quarantined) => {
+                self.state = match self.quarantined_from.take() {
+                    Some(NodeState::Drained) => NodeState::Drained,
+                    _ => NodeState::Ready,
+                };
+                Outcome::Done
+            }
+            (Operation::Release, _) => Outcome::Done,
+        }
+    }
+
+    /// The drain is complete: the node is drained, and every drain under way is done. Returns
+    /// whether the node was draining.
+    pub fn finish_drain(&mut self) -> bool {
+        if self.state != NodeState::Draining {
+            return false;
+        }
+        self.state = NodeState::Drained;
+        self.settle_drains(Outcome::Done);
+        true
+    }
+
+    fn settle_drains(&mut self, outcome: Outcome) {
+        for entry in &mut self.journal {
+            if entry.op == Operation::Drain && entry.outcome == Outcome::Accepted {
+                entry.outcome = outcome.clone();
+            }
         }
     }
 
@@ -267,13 +338,18 @@ mod tests {
     fn a_redelivered_command_gets_its_recorded_outcome_not_a_second_run() {
         let dir = scratch("redeliver");
         let mut p = Persisted::default();
-        let ack = p.command(command("a", Operation::Release), 10);
+        let ack = p.command(command("a", Operation::Quarantine), 10, true);
         assert_eq!(ack.outcome, Outcome::Done);
         p.save(&dir).unwrap();
+        // Released by an operator, then the quarantine is delivered again after a reconnect:
+        // it is recognized, and the node stays released.
         let mut p = Persisted::load(&dir).unwrap();
+        p.command(command("b", Operation::Release), 11, true);
+        assert_eq!(p.state, NodeState::Ready);
         let journal = p.journal.clone();
-        let again = p.command(command("a", Operation::Release), 12);
+        let again = p.command(command("a", Operation::Quarantine), 12, true);
         assert_eq!(again, ack);
+        assert_eq!(p.state, NodeState::Ready);
         assert_eq!(p.journal, journal);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -281,37 +357,112 @@ mod tests {
     #[test]
     fn acks_repeat_until_recorded_and_expired_commands_do_nothing() {
         let mut p = Persisted::default();
-        p.command(command("a", Operation::Undrain), 10);
+        p.command(command("a", Operation::Drain), 10, true);
         assert_eq!(p.unrecorded().len(), 1);
         let first = p.unrecorded().remove(0);
+        assert_eq!(first.outcome, Outcome::Accepted);
         assert!(p.recorded(&first, 10));
         assert!(p.unrecorded().is_empty());
-        let late = p.command(command("b", Operation::Undrain), 1000);
+        // Its outcome moving on makes it unrecorded again.
+        assert!(p.finish_drain());
+        assert_eq!(p.state, NodeState::Drained);
+        assert_eq!(p.unrecorded()[0].outcome, Outcome::Done);
+        let late = p.command(command("b", Operation::Undrain), 1000, true);
         assert_eq!(late.outcome, Outcome::Expired);
-        assert_eq!(p.unrecorded(), [late]);
+        assert_eq!(p.state, NodeState::Drained);
+        assert!(p.unrecorded().contains(&late));
     }
 
     #[test]
-    fn a_runner_this_node_does_not_run_is_neither_drained_nor_quarantined() {
+    fn an_external_runner_refuses_a_drain_and_a_quarantine() {
         let mut p = Persisted::default();
         for op in [Operation::Drain, Operation::Quarantine] {
-            let ack = p.command(command(&format!("{op:?}"), op), 1);
+            let ack = p.command(command(&format!("{op:?}"), op), 1, false);
             assert!(matches!(ack.outcome, Outcome::Refused { .. }), "{ack:?}");
         }
+        assert_eq!(p.state, NodeState::Ready);
+        // Undrain and release have nothing to undo.
+        for op in [Operation::Undrain, Operation::Release] {
+            let ack = p.command(command(&format!("{op:?}"), op), 1, false);
+            assert_eq!(ack.outcome, Outcome::Done);
+        }
+    }
+
+    #[test]
+    fn a_quarantine_holds_until_released_and_survives_a_restart() {
+        let dir = scratch("quarantine");
+        let mut p = Persisted::default();
+        p.command(command("q", Operation::Quarantine), 1, true);
+        p.save(&dir).unwrap();
+        let mut p = Persisted::load(&dir).unwrap();
+        assert_eq!(p.state, NodeState::Quarantined);
+        assert!(p.acquisition_stopped());
+        for op in [Operation::Drain, Operation::Undrain] {
+            let ack = p.command(command(&format!("{op:?}"), op), 2, true);
+            assert!(matches!(ack.outcome, Outcome::Refused { .. }), "{ack:?}");
+        }
+        assert_eq!(p.state, NodeState::Quarantined);
+        p.command(command("r", Operation::Release), 3, true);
+        assert_eq!(p.state, NodeState::Ready);
+        assert!(!p.acquisition_stopped());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn undrain_and_quarantine_end_a_drain_under_way() {
+        let mut p = Persisted::default();
+        let ack = p.command(command("a", Operation::Drain), 1, true);
+        assert_eq!(ack.outcome, Outcome::Accepted);
+        assert_eq!(p.state, NodeState::Draining);
+        // A second drain joins the first.
+        let joined = p.command(command("b", Operation::Drain), 1, true);
+        assert_eq!(joined.outcome, Outcome::Accepted);
+        p.command(command("c", Operation::Undrain), 2, true);
+        assert_eq!(p.state, NodeState::Ready);
+        for id in ["a", "b"] {
+            let entry = p.journal.iter().find(|e| e.id == id).unwrap();
+            assert!(matches!(entry.outcome, Outcome::Failed { .. }), "{entry:?}");
+        }
+        assert!(!p.finish_drain());
+
+        p.command(command("d", Operation::Drain), 3, true);
+        p.command(command("e", Operation::Quarantine), 3, true);
+        let d = p.journal.iter().find(|e| e.id == "d").unwrap();
+        assert!(matches!(d.outcome, Outcome::Failed { .. }), "{d:?}");
+        // Released, a drain the quarantine cut short is not taken up again.
+        p.command(command("f", Operation::Release), 3, true);
+        assert_eq!(p.state, NodeState::Ready);
+    }
+
+    #[test]
+    fn a_release_returns_a_drained_node_to_drained() {
+        let mut p = Persisted::default();
+        p.command(command("d", Operation::Drain), 1, true);
+        assert!(p.finish_drain());
+        p.command(command("q", Operation::Quarantine), 1, true);
+        p.command(command("r", Operation::Release), 1, true);
+        assert_eq!(p.state, NodeState::Drained);
+        // A drain of a drained node is done at once.
+        let again = p.command(command("d2", Operation::Drain), 1, true);
+        assert_eq!(again.outcome, Outcome::Done);
+        // From ready, back to ready.
+        p.command(command("u", Operation::Undrain), 1, true);
+        p.command(command("q2", Operation::Quarantine), 1, true);
+        p.command(command("r2", Operation::Release), 1, true);
         assert_eq!(p.state, NodeState::Ready);
     }
 
     #[test]
     fn a_settled_entry_is_kept_until_its_command_expires() {
         let mut p = Persisted::default();
-        let ack = p.command(command("a", Operation::Release), 1);
+        let ack = p.command(command("a", Operation::Release), 1, true);
         p.recorded(&ack, 2);
         // Settled but not expired: a redelivery must still find it.
         assert_eq!(p.journal.len(), 1);
-        let open = p.command(command("b", Operation::Release), 999);
+        let open = p.command(command("b", Operation::Release), 999, true);
         assert_eq!(p.journal.len(), 2);
         // Past its expiry (1000) the settled one goes; the one the hub has not recorded stays.
-        let c = p.command(command("c", Operation::Release), 1000);
+        let c = p.command(command("c", Operation::Release), 1000, true);
         assert_eq!(c.outcome, Outcome::Expired);
         assert!(!p.journal.iter().any(|e| e.id == "a"));
         assert!(p.journal.iter().any(|e| e.id == open.id));
@@ -320,7 +471,7 @@ mod tests {
         for i in 0..JOURNAL_MAX + 3 {
             let mut c = command(&i.to_string(), Operation::Release);
             c.expires_at = u64::MAX;
-            let ack = p.command(c, 1);
+            let ack = p.command(c, 1, true);
             p.recorded(&ack, 1);
         }
         assert_eq!(p.journal.len(), JOURNAL_MAX);
@@ -336,15 +487,14 @@ mod tests {
         let mut p = Persisted::default();
         assert!(!p.adopt_issuer(issuer("https://a")));
         p.apply_desired(desired(7, Some(2), Acquisition::Run));
-        p.command(command("u", Operation::Undrain), 1);
-        p.state = NodeState::Drained;
+        p.command(command("q", Operation::Quarantine), 1, true);
         assert!(!p.adopt_issuer(issuer("https://a")));
         assert_eq!(p.hub_ceiling(), Some(2));
-        // Re-enrolled, or another hub: generation 1 is new again, and the node's state holds.
+        // Re-enrolled, or another hub: generation 1 is new again, and the quarantine holds.
         assert!(p.adopt_issuer(issuer("https://b")));
         assert_eq!(p.applied, None);
         assert!(p.journal.is_empty());
-        assert_eq!(p.state, NodeState::Drained);
+        assert_eq!(p.state, NodeState::Quarantined);
         assert!(p.apply_desired(desired(1, None, Acquisition::Run)));
     }
 }

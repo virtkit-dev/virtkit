@@ -18,8 +18,9 @@ embedded database, no replication.
 - **`vk node`** — a `vk` subcommand run as a long-lived supervisor on each node. It is to
   link the executor, admission, the concurrency controller and self-update in-process, dial
   the hub, and apply what the hub asks within what local policy allows; today it enrolls,
-  reports inventory, heartbeats and workloads, sets its runner's concurrency, and keeps the
-  desired state and commands it is sent.
+  reports inventory, heartbeats and workloads, sets its runner's concurrency, keeps the
+  desired state and commands it is sent, and runs a managed gitlab-runner, which it drains
+  and quarantines.
 - **`vk-hub`** — the hub binary: inventory, desired state, operations, audit log, web UI, and
   later the generic job queue. Its database is `redb`, as `vk-registry`'s accounts store is.
 - **`vk-hub-proto`** — the hub↔node wire types, versioned, beside the VM list `vk workloads`
@@ -47,7 +48,15 @@ A node is any host `vk` already runs on:
 `vk check`'s KVM, VMM and guest-kernel probes are the gate: a node refuses to enroll while
 one fails. No root is needed at runtime and no distribution is assumed. `vk node run` is a
 foreground process; how it is kept running is the host's choice (a `systemd --user` unit,
-for instance; `vk node` installs none).
+for instance; `vk node` installs none). A unit running it with a managed runner wants
+`KillMode=mixed`: gitlab-runner takes `SIGTERM` as abandoning its jobs, so the stop signal
+must reach the node alone, which quits the runner and waits for the jobs; a second one sends
+the runner `SIGTERM`. Its `TimeoutStopSec` bounds that wait: past it, systemd kills both.
+
+A managed gitlab-runner runs as the node's user, with its configuration under
+`~/.gitlab-runner/` unless `[node] runner_config` names another, so `vk node` edits its
+`concurrent` directly. A root-managed runner is supported through `vk-runnerctl`, as `vk tune`
+uses it, with its concurrency the only thing the hub steers.
 
 Enrollment uses a single-use token and a node-generated ed25519 identity. The hub pins the
 key, and the identity survives updates. See [enrollment](fleet-prototype.md#enrollment) for
@@ -91,7 +100,7 @@ state is unknown, not that it stopped. The prototype's session, limits and timeo
 reference](fleet-prototype.md#hub-and-node).
 
 **Losing the hub does not stop the fleet.** A disconnected node keeps running CI under its
-local policy and the last desired state it applied. Proposed: a drain or quarantine it has
+local policy and the last desired state it applied, and a drain or quarantine it has
 persisted stays in force.
 
 ## Configuration
@@ -160,8 +169,10 @@ effective = min(local estimate, hub ceiling, local ceiling)
 - **local ceiling** — `[executor.schedule] max_concurrency`, the node's own limit.
 
 The node applies the hub's ceiling whether or not the hub is reachable. gitlab-runner has no
-`concurrent = 0`, so stopping acquisition is a state rather than a number, and needs a runner
-the node runs itself. See [concurrency control](fleet-prototype.md#concurrency-control) for
+`concurrent = 0`, so **stopping acquisition** is a state rather than a number, and needs a
+runner the node runs itself: the node sends gitlab-runner `SIGQUIT`, which stops it
+requesting jobs and lets running ones finish, and does not start it again until the state is
+lifted. See [concurrency control](fleet-prototype.md#concurrency-control) for
 the cadence and how the number reaches the runner.
 
 ## Node states
@@ -175,17 +186,21 @@ quarantined (entered from any state; left only by an operator)
 A drain:
 
 1. is persisted on the node before anything else;
-2. stops the node taking new work;
-3. waits for the node's CI jobs to finish, the executor's cleanup, and the admission ledger
-   to empty;
+2. stops acquisition;
+3. waits for gitlab-runner to finish its jobs, the executor's cleanup, and the admission
+   ledger to empty;
 4. reports `drained` only once all three hold.
 
-Drain state survives a node restart or loss of the hub.
+Drain state survives a node restart or loss of the hub. Stopping acquisition requires a
+managed runner; the prototype refuses drain and quarantine with an external runner. See
+[drain and runner lifecycle](fleet-prototype.md#drain-and-runner-lifecycle) for observations,
+runner adoption and transitions.
 
 The `validating` gate runs a boot/exec/network smoke test and, when configured, a
 representative synthetic job before the node goes back to `ready`.
 
-None of these states is built.
+`ready`, `draining`, `drained` and `quarantined` are built; `maintenance` and `validating`
+are not.
 
 A node that stops heartbeating is shown as unreachable, not paused: pausing every
 disconnected node would turn a hub outage into a fleet outage.

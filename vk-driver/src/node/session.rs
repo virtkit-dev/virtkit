@@ -788,6 +788,7 @@ mod tests {
                         hub: format!("http://{addr}"),
                         node_id: "ab".repeat(16),
                     },
+                    None,
                 )
                 .unwrap(),
             },
@@ -1118,7 +1119,7 @@ mod tests {
         let mut f = fixture("steer").await;
         let (node, gatherer, stopped, listener, stop) = f.parts();
         let key = node.identity.public_key().to_vec();
-        // Refused, with no runner of its own to stop: still journaled, and its outcome still
+        // Refused, with an external runner to stop: still journaled, and its outcome still
         // repeated until recorded.
         let drain = command(Operation::Drain);
         let hub = async {
@@ -1176,6 +1177,112 @@ mod tests {
             .unwrap()
             .journal;
         assert_eq!(journal.len(), 1);
+    }
+
+    /// With a managed runner, a drain stops it and is reported draining until the runner has
+    /// exited, then drained, and its ack moves from accepted to done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drain_with_a_managed_runner_is_reported_until_drained() {
+        use vk_hub_proto::{Acquisition, NodeState, RunnerState};
+        let mut f = fixture("managed").await;
+        let spec = super::super::runner::stub("session-drain");
+        let (runner_tx, runner) = watch::channel(RunnerState::Stopped);
+        f.node.core = Core::open(
+            &f.dir,
+            super::super::state::Issuer {
+                hub: f.node.enrollment.hub.clone(),
+                node_id: f.node.enrollment.node_id.clone(),
+            },
+            Some(runner),
+        )
+        .unwrap();
+        let (halt, halted) = watch::channel(false);
+        let (_abort, aborted) = watch::channel(false);
+        let supervisor = tokio::spawn(super::super::runner::supervise(
+            spec.clone(),
+            super::super::runner::Signals {
+                allowed: f.node.core.acquire(),
+                halt: halted,
+                abort: aborted,
+            },
+            runner_tx,
+        ));
+        let cfg: Arc<Config> = Arc::new(
+            toml::from_str(&format!(
+                "state_dir = {:?}\n[executor.schedule]\nmax_concurrency = 2\n",
+                f.dir.display().to_string()
+            ))
+            .unwrap(),
+        );
+        let control = tokio::spawn(f.node.core.clone().control(
+            cfg,
+            Duration::from_secs(3600),
+            f.stopped.clone(),
+        ));
+        let (node, gatherer, stopped, listener, stop) = f.parts();
+        let key = node.identity.public_key().to_vec();
+        let drain = command(Operation::Drain);
+        let hub = async {
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, PROTOCOL, STEERING).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            let running = next_of(&mut ws, |m| {
+                report_of(m).filter(|r| r.runner_state == Some(RunnerState::Running))
+            })
+            .await;
+            assert_eq!(running.state, Some(NodeState::Ready));
+            assert_eq!(running.runner, Some(vk_hub_proto::RunnerMode::Managed));
+            assert_eq!(running.acquisition, Some(Acquisition::Run));
+            // Not before the stub handles SIGQUIT.
+            let log = super::super::runner::started_log(&spec);
+            for _ in 0..200 {
+                if log.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            hub_send(&mut ws, &HubMsg::Command(drain.clone())).await;
+            assert_eq!(next_of(&mut ws, ack_of).await.outcome, Outcome::Accepted);
+            // The stub holds on to its jobs until told to finish: draining, the runner
+            // quitting, acquisition still running.
+            let draining = next_of(&mut ws, |m| {
+                report_of(m)
+                    .filter(|r| r.drain.is_some() && r.runner_state == Some(RunnerState::Quitting))
+            })
+            .await;
+            assert_eq!(draining.state, Some(NodeState::Draining));
+            assert!(!draining.drain.unwrap().runner_stopped);
+            assert_eq!(draining.acquisition, Some(Acquisition::Run));
+            super::super::runner::finish(&spec);
+            // The drained report and the done ack, in whichever order a report read as the
+            // drain finished puts them.
+            let (mut drained, mut done) = (None, None);
+            while drained.is_none() || done.is_none() {
+                match next_of(&mut ws, Some).await {
+                    NodeMsg::Report(r) if r.state == Some(NodeState::Drained) => drained = Some(r),
+                    NodeMsg::Ack(ack) if ack.outcome != Outcome::Accepted => done = Some(ack),
+                    _ => {}
+                }
+            }
+            let drained = drained.unwrap();
+            assert_eq!(drained.drain, None);
+            assert_eq!(drained.runner_state, Some(RunnerState::Stopped));
+            assert_eq!(drained.acquisition, Some(Acquisition::Stop));
+            let done = done.unwrap();
+            assert_eq!(done.id, drain.id);
+            assert_eq!(done.outcome, Outcome::Done);
+            stop.send(true).unwrap();
+            while hub_receive(&mut ws).await.is_some() {}
+        };
+        let (_, ended) = tokio::join!(hub, run(node, gatherer, stopped));
+        ended.unwrap();
+        control.await.unwrap();
+        halt.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&spec.dir);
     }
 
     fn desired() -> HubMsg {
