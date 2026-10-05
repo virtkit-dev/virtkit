@@ -423,3 +423,9 @@ making a resettable device look like one that cannot reset. Covered by
 `src/devices/src/virtio/{mod.rs,device.rs}` — the virtio-pci transport builds on Linux x86_64
 only, where the VMM attaches it: it depends on the KVM-only MSI-X state and GSI routing, and the
 macOS build stopped compiling once they came in. Its bus-master gate is gated with it.
+
+### Tests on current KVM
+
+`src/arch/src/x86_64/linux/regs.rs` — `test_setup_sregs` gives its vCPU KVM's supported CPUID
+before setting long-mode sregs: KVM refuses `EFER.LME` (`EINVAL`) on a vCPU whose CPUID lacks
+long mode, as a fresh vCPU's does, so the test failed where the VMM itself works.

@@ -291,6 +291,11 @@ mod tests {
         let kvm = Kvm::new().unwrap();
         let vm = kvm.create_vm().unwrap();
         let vcpu = vm.create_vcpu(0).unwrap();
+        // KVM rejects EFER.LME on a vCPU whose CPUID lacks long mode, as a fresh one does.
+        let cpuid = kvm
+            .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .unwrap();
+        vcpu.set_cpuid2(&cpuid).unwrap();
         let gm = create_guest_mem();
 
         assert!(vcpu.set_sregs(&Default::default()).is_ok());
