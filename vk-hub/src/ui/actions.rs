@@ -28,7 +28,7 @@ use vk_hub_proto::{Workload, WorkloadKind};
 
 use super::dev::{DevRow, dev_name};
 use super::html::Html;
-use super::local::LocalSite;
+use super::local::{self, LocalSite};
 use super::pages::{self, csrf_field};
 use super::{Auth, Body, Ui};
 use crate::local::{Action, NotStarted};
@@ -133,11 +133,8 @@ pub(super) async fn vm_action(
         // apart where the list has no pid.
         asked: vec![("pid", or_dash(w.pid)), ("started", or_dash(w.started_at))],
     };
-    if super::field(&form, "confirm") != Some("yes") {
-        return confirm(site, htmx, &auth, &ask);
-    }
-    if let Err(why) = answered(site, &auth, &form, &ask) {
-        return Ok(refused(htmx, StatusCode::CONFLICT, why));
+    if let Some(asked) = ask_first(&site.questions, local::layout, htmx, &auth, &form, &ask)? {
+        return Ok(asked);
     }
     let act = Act {
         key: key(&w),
@@ -264,11 +261,8 @@ pub(super) async fn dev_action(
             // The boot it was asked about.
             asked: vec![("booted", or_dash(row.booted_secs))],
         };
-        if super::field(&form, "confirm") != Some("yes") {
-            return confirm(site, htmx, &auth, &ask);
-        }
-        if let Err(why) = answered(site, &auth, &form, &ask) {
-            return Ok(refused(htmx, StatusCode::CONFLICT, why));
+        if let Some(asked) = ask_first(&site.questions, local::layout, htmx, &auth, &form, &ask)? {
+            return Ok(asked);
         }
     }
     let act = Act {
@@ -371,17 +365,17 @@ struct Question {
 
 /// What a question is asked about, as `(field, value)`: what must be as it was for its answer
 /// to count.
-type Asked = Vec<(&'static str, String)>;
+pub(super) type Asked = Vec<(&'static str, String)>;
 
 /// A question an action asks first.
-struct Ask {
+pub(super) struct Ask {
     /// The action's path, which the answer posts to.
-    path: String,
+    pub(super) path: String,
     /// The page it is asked from.
-    back: String,
-    op: String,
-    what: &'static str,
-    asked: Asked,
+    pub(super) back: String,
+    pub(super) op: String,
+    pub(super) what: &'static str,
+    pub(super) asked: Asked,
 }
 
 impl Questions {
@@ -429,16 +423,37 @@ impl Questions {
     }
 }
 
+/// Confirm an irreversible action. Return `None` when `form` answers `ask`, otherwise the
+/// question or a refusal. Plain forms show the question in a page built with `layout`.
+pub(super) fn ask_first(
+    questions: &Questions,
+    layout: Layout,
+    htmx: bool,
+    auth: &Auth,
+    form: &[(String, String)],
+    ask: &Ask,
+) -> Result<Option<Response<Body>>> {
+    if super::field(form, "confirm") != Some("yes") {
+        return confirm(questions, layout, htmx, auth, ask).map(Some);
+    }
+    Ok(answered(questions, auth, form, ask)
+        .err()
+        .map(|why| refused(htmx, StatusCode::CONFLICT, why)))
+}
+
+/// Wrap a page's main content in the site's layout, as [`super::local::layout`].
+pub(super) type Layout = fn(&str, &Auth, &Html) -> Html;
+
 /// Whether `form` answers `ask`, asked of this session, with what it was asked about as it is
 /// now.
 fn answered(
-    site: &LocalSite,
+    questions: &Questions,
     auth: &Auth,
     form: &[(String, String)],
     ask: &Ask,
 ) -> Result<(), &'static str> {
     let q = super::field(form, "nonce")
-        .and_then(|nonce| site.questions.answer(nonce, &auth.csrf, &ask.path, &ask.op))
+        .and_then(|nonce| questions.answer(nonce, &auth.csrf, &ask.path, &ask.op))
         .ok_or("Refused: this was answered already, or asked too long ago; ask again.")?;
     let posted = ask
         .asked
@@ -452,8 +467,14 @@ fn answered(
 
 /// The question an action that cannot be taken back asks first, in the flash's place — or,
 /// for a plain form, as a page of its own — with a form that answers it once.
-fn confirm(site: &LocalSite, htmx: bool, auth: &Auth, ask: &Ask) -> Result<Response<Body>> {
-    let nonce = site.questions.ask(Question {
+fn confirm(
+    questions: &Questions,
+    layout: Layout,
+    htmx: bool,
+    auth: &Auth,
+    ask: &Ask,
+) -> Result<Response<Body>> {
+    let nonce = questions.ask(Question {
         session: auth.csrf.clone(),
         path: ask.path.clone(),
         op: ask.op.clone(),
@@ -492,7 +513,7 @@ fn confirm(site: &LocalSite, htmx: bool, auth: &Auth, ask: &Ask) -> Result<Respo
             .raw("</div>");
         return Ok(swap_none(super::html_response(StatusCode::OK, h)));
     }
-    // `back` is the hub's own path: `/dev`, or a VM's, built from its checked ID.
+    // `back` is the hub's own path, built from checked IDs and names.
     let mut main = Html::new();
     main.raw("<h1>Confirm</h1><p>")
         .raw(ask.what)
@@ -501,7 +522,7 @@ fn confirm(site: &LocalSite, htmx: bool, auth: &Auth, ask: &Ask) -> Result<Respo
         .raw("<p><a href=\"")
         .text(&ask.back)
         .raw("\">cancel</a></p>");
-    Ok(super::page(super::local::layout("confirm", auth, &main)))
+    Ok(super::page(layout("confirm", auth, &main)))
 }
 
 /// A refused action: for htmx, the line saying why, swapped in on its own.
