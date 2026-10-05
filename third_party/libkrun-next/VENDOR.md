@@ -167,8 +167,8 @@ lock. Interrupts are raised once per batch that completed anything.
 
 `src/devices/src/virtio/block/{device.rs,worker.rs}` + `src/libkrun/src/api/device_builders.rs` —
 track guest-written clusters and drain them on demand, so virtkit's build backend captures only
-a checkpoint's delta. The worker records every write, discard and write-zeroes in a per-disk
-`DirtyRanges` (64 KiB clusters); with `BlockDevice::set_dirty_control_socket`,
+a checkpoint's delta. With `BlockDevice::set_dirty_control_socket` bound, the worker records
+every write, discard and write-zeroes in a per-disk `DirtyRanges` (64 KiB clusters), and
 `Block::spawn_dirty_control` serves `b'D'` (flush, then reply the written and discarded ranges
 since the last drain: `u32 count` then `count × (u64 offset, u64 len)`, little-endian) and
 `b'F'` (flush only). Consumed by virtkit's `VmSession::drain_dirty` and `flush_disk`. Unix
@@ -207,3 +207,8 @@ clusters at its ends as written, not only its whole clusters as holes. The 1.19 
 it as a discard, which rounds inward, so the zeroed bytes of a partial head or tail cluster
 reached neither set and a checkpoint kept that cluster's old contents. Not yet in the 1.19
 tree. Covered by `a_partial_cluster_write_zeroes_reads_its_edges_whole`.
+
+`src/devices/src/virtio/block/device.rs` — a disk tracks dirty clusters only when it has a
+dirty-control socket it could bind. The 1.19 tree recorded every write of every disk into
+sets nothing but that socket drains, so a disk without one grew them for the life of the VM,
+up to one entry per 64 KiB of distinct disk written. Not yet in the 1.19 tree.

@@ -166,12 +166,15 @@ const DIRTY_CLUSTER: u64 = 64 * 1024;
 /// and then freed, must be read whole (the overlay reflects its true content) rather than holed
 /// — [`Self::take`] subtracts the written set out of the discarded one. A host-side control connection (see
 /// [`Block::spawn_dirty_control`]) drains both at each checkpoint.
+// Off Unix nothing constructs one: no control socket, so no tracking.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Default)]
 pub(crate) struct DirtyRanges {
     written: std::collections::BTreeSet<u64>,
     discarded: std::collections::BTreeSet<u64>,
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 impl DirtyRanges {
     /// Record that `[offset, offset+len)` was written, at cluster granularity.
     fn record_write(&mut self, offset: u64, len: u64) {
@@ -459,9 +462,10 @@ pub(crate) struct DiskProperties {
     pub(crate) mmap: Option<Arc<DiskMmap>>,
     nsectors: u64,
     image_id: Vec<u8>,
-    /// Clusters written since the last drain; shared with the dirty-control listener. Only
-    /// populated for a writable disk that opted into tracking (`spawn_dirty_control`).
-    dirty: Arc<Mutex<DirtyRanges>>,
+    /// Clusters written since the last drain; shared with the dirty-control listener. `None`
+    /// unless the disk has a control socket to drain it (`spawn_dirty_control`): nothing else
+    /// empties the sets.
+    dirty: Option<Arc<Mutex<DirtyRanges>>>,
 }
 
 impl DiskProperties {
@@ -470,7 +474,7 @@ impl DiskProperties {
         disk_image_id: Vec<u8>,
         cache_type: CacheType,
         mmap: Option<Arc<DiskMmap>>,
-        dirty: Arc<Mutex<DirtyRanges>>,
+        dirty: Option<Arc<Mutex<DirtyRanges>>>,
     ) -> io::Result<Self> {
         let disk_size = disk_image.read().unwrap().size();
 
@@ -500,19 +504,25 @@ impl DiskProperties {
     /// Record a guest write for the dirty tracker (no-op unless tracking was enabled).
     /// Called by the block worker after each data-writing request.
     pub(crate) fn record_write(&self, offset: u64, len: u64) {
-        self.dirty.lock().unwrap().record_write(offset, len);
+        if let Some(dirty) = &self.dirty {
+            dirty.lock().unwrap().record_write(offset, len);
+        }
     }
 
     /// Record a guest discard for the dirty tracker (no-op unless tracking was enabled).
     /// Called by the block worker after each request that frees clusters, so the checkpoint
     /// represents them as holes rather than reading or reusing stale data.
     pub(crate) fn record_discard(&self, offset: u64, len: u64) {
-        self.dirty.lock().unwrap().record_discard(offset, len);
+        if let Some(dirty) = &self.dirty {
+            dirty.lock().unwrap().record_discard(offset, len);
+        }
     }
 
-    /// See [`DirtyRanges::record_zeroes`].
+    /// See [`DirtyRanges::record_zeroes`] (no-op unless tracking was enabled).
     pub(crate) fn record_zeroes(&self, offset: u64, len: u64) {
-        self.dirty.lock().unwrap().record_zeroes(offset, len);
+        if let Some(dirty) = &self.dirty {
+            dirty.lock().unwrap().record_zeroes(offset, len);
+        }
     }
 
     pub fn image_id(&self) -> &[u8] {
@@ -673,9 +683,9 @@ pub struct Block {
     mmap: Option<Arc<DiskMmap>>,
     worker_thread: Option<JoinHandle<()>>,
     worker_stopfd: EventFd,
-    /// Dirty-cluster tracker, shared with the block worker and (if tracking was enabled) the
-    /// host-side control listener. Empty and unused unless a control socket was configured.
-    dirty: Arc<Mutex<DirtyRanges>>,
+    /// Dirty-cluster tracker, shared with the block worker and the host-side control listener;
+    /// `None` unless a control socket was configured.
+    dirty: Option<Arc<Mutex<DirtyRanges>>>,
 
     // Virtio fields.
     pub(crate) avail_features: u64,
@@ -774,7 +784,17 @@ impl Block {
 
         let disk_image = Arc::new(RwLock::new(disk_image));
 
-        let dirty = Arc::new(Mutex::new(DirtyRanges::default()));
+        // Tracked only once a control socket is bound to drain it; otherwise it would only grow.
+        #[cfg(unix)]
+        let dirty_listener = dirty_control_socket
+            .as_deref()
+            .and_then(Self::bind_dirty_control);
+        #[cfg(unix)]
+        let dirty = dirty_listener
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(DirtyRanges::default())));
+        #[cfg(not(unix))]
+        let dirty = None;
 
         let disk_properties = DiskProperties::new(
             disk_image.clone(),
@@ -788,8 +808,8 @@ impl Block {
         // configured socket so a checkpoint captures only the delta. Spawned once here — the
         // worker (re)constructs its own `DiskProperties` from the shared `dirty` Arc on activate.
         #[cfg(unix)]
-        if let Some(socket) = dirty_control_socket {
-            Self::spawn_dirty_control(socket, disk_image.clone(), dirty.clone());
+        if let (Some(listener), Some(dirty)) = (dirty_listener, &dirty) {
+            Self::spawn_dirty_control(listener, disk_image.clone(), dirty.clone());
         }
         #[cfg(not(unix))]
         if dirty_control_socket.is_some() {
@@ -842,7 +862,17 @@ impl Block {
         })
     }
 
-    /// Spawn the host-side dirty-drain control listener on `socket_path`. On each connection it
+    /// Bind the dirty-control socket at `socket_path`, replacing a stale one; `None` (logged)
+    /// when it cannot be bound, so the disk then tracks nothing.
+    #[cfg(unix)]
+    fn bind_dirty_control(socket_path: &str) -> Option<std::os::unix::net::UnixListener> {
+        let _ = std::fs::remove_file(socket_path);
+        std::os::unix::net::UnixListener::bind(socket_path)
+            .inspect_err(|e| error!("virtio-blk: dirty-control bind {socket_path} failed: {e}"))
+            .ok()
+    }
+
+    /// Serve the host-side dirty-drain control protocol on `listener`. On each connection it
     /// reads a one-byte command:
     /// - `b'D'` (DRAIN) flushes the disk image to its backing file and replies with the clusters
     ///   mutated since the previous drain as two back-to-back blocks — written clusters, then
@@ -860,21 +890,12 @@ impl Block {
     /// (the build falls back correctly on the virtkit side).
     #[cfg(unix)]
     fn spawn_dirty_control(
-        socket_path: String,
+        listener: std::os::unix::net::UnixListener,
         disk_image: Arc<RwLock<FormatAccess<Box<dyn DynStorage>>>>,
         dirty: Arc<Mutex<DirtyRanges>>,
     ) {
         use std::io::Read;
-        use std::os::unix::net::UnixListener;
 
-        let _ = std::fs::remove_file(&socket_path);
-        let listener = match UnixListener::bind(&socket_path) {
-            Ok(l) => l,
-            Err(e) => {
-                error!("virtio-blk: dirty-control bind {socket_path} failed: {e}");
-                return;
-            }
-        };
         std::thread::Builder::new()
             .name("blk dirty-control".into())
             .spawn(move || {
@@ -1074,7 +1095,7 @@ impl VirtioDevice for Block {
                 self.disk_image_id.clone(),
                 self.cache_type,
                 self.mmap.clone(),
-                Arc::clone(&self.dirty),
+                self.dirty.clone(),
             )
             .map_err(|_| ActivateError::BadActivate)?,
         };
@@ -1151,7 +1172,7 @@ mod tests {
             vec![0u8; VIRTIO_BLK_ID_BYTES as usize],
             CacheType::Unsafe,
             Some(Arc::new(DiskMmap::open(&p).unwrap())),
-            Arc::new(Mutex::new(DirtyRanges::default())),
+            None,
         )
         .unwrap()
     }
