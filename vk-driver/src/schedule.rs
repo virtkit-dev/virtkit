@@ -3,7 +3,7 @@
 //! sets it in a runner config this user owns.
 //!
 //! This is the one place the number is decided: `effective = min(estimate, hub ceiling,
-//! ceiling)` ([`decide`]).
+//! ceiling)` ([`decide`]), held to the previous answer between periods.
 //!
 //! The admission gate ([`crate::admit`]) is what keeps the host safe — it never lets more
 //! memory be committed than the budget allows. But a job it makes wait has already been
@@ -48,8 +48,8 @@ pub(crate) struct Decision {
     pub hub_ceiling: Option<u32>,
     /// `[executor.schedule] max_concurrency`.
     pub ceiling: Option<u32>,
-    /// The smallest term, never below one; `None` when no term applies, which leaves the
-    /// runner's `concurrent` alone.
+    /// The smallest term, never below one, and held to the previous answer when it may not
+    /// rise; `None` when no term applies, which leaves the runner's `concurrent` alone.
     pub effective: Option<u32>,
     /// The figures the estimate rests on, for the report line.
     basis: Option<Basis>,
@@ -86,9 +86,9 @@ pub(crate) fn decide(cfg: &Config, hub_ceiling: Option<u32>) -> Result<Decision>
     decide_with(cfg, hub_ceiling, true)
 }
 
-/// Like [`decide`], but allow the estimate to rise only when `may_rise`. Pass false for
-/// changes between periods that can only lower concurrency, so the estimate can fall
-/// without taking more than one upward step per period.
+/// Like [`decide`], but let the effective answer rise above the previous one only when
+/// `may_rise`. Pass false for changes between periods, so concurrency can fall at once but
+/// rises at most once per period, whichever term lifted.
 pub(crate) fn decide_with(
     cfg: &Config,
     hub_ceiling: Option<u32>,
@@ -99,6 +99,9 @@ pub(crate) fn decide_with(
         .schedule
         .max_concurrency
         .map(std::num::NonZeroU32::get);
+    let previous = std::fs::read_to_string(desired_file(cfg))
+        .ok()
+        .and_then(|t| t.trim().parse::<u32>().ok());
     let (estimate, basis) = match crate::vm::budget_mib(cfg) {
         None => (None, None),
         Some(budget) => {
@@ -111,9 +114,6 @@ pub(crate) fn decide_with(
                 .checked_mul(1024)
                 .context("[executor.vm] mem is absurdly large")?;
             let typical = typical_job_mib(cfg, declared_mib);
-            let previous = std::fs::read_to_string(desired_file(cfg))
-                .ok()
-                .and_then(|t| t.trim().parse::<u32>().ok());
             // Read once: the figures the decision rests on are the ones reported below it.
             let host = host_memory();
             let want = concurrency(Inputs {
@@ -124,7 +124,6 @@ pub(crate) fn decide_with(
                 host,
                 previous,
             });
-            let want = held_below(want, previous, may_rise);
             let basis = Basis {
                 budget_mib,
                 granted_mib: held.granted_mib,
@@ -139,12 +138,13 @@ pub(crate) fn decide_with(
         estimate,
         hub_ceiling,
         ceiling,
-        effective: effective(estimate, hub_ceiling, ceiling),
+        effective: effective(estimate, hub_ceiling, ceiling)
+            .map(|want| held_below(want, previous, may_rise).max(1)),
         basis,
     })
 }
 
-/// `want`, or no more than `previous` unless the estimate `may_rise`.
+/// `want`, or no more than `previous` unless it `may_rise`.
 fn held_below(want: u32, previous: Option<u32>, may_rise: bool) -> u32 {
     match previous {
         Some(prev) if !may_rise => want.min(prev),
@@ -729,6 +729,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
+    /// Between periods a lifted hub ceiling is held to the previous answer even with no
+    /// estimate to step it, and a lowered one applies at once.
+    #[test]
+    fn a_lifted_hub_ceiling_waits_for_the_period() {
+        let (cfg, dir) = scratch_cfg(
+            "decide-hold",
+            crate::config::Schedule {
+                max_concurrency: std::num::NonZeroU32::new(8),
+                ..Default::default()
+            },
+        );
+        apply(&cfg, &decide_with(&cfg, Some(2), true).unwrap()).unwrap();
+        let d = decide_with(&cfg, Some(6), false).unwrap();
+        assert_eq!((d.hub_ceiling, d.effective), (Some(6), Some(2)));
+        assert_eq!(
+            decide_with(&cfg, Some(1), false).unwrap().effective,
+            Some(1)
+        );
+        assert_eq!(decide_with(&cfg, Some(6), true).unwrap().effective, Some(6));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn tune_refuses_with_nothing_to_schedule_against() {
         let (cfg, dir) = scratch_cfg("tune-nothing", crate::config::Schedule::default());
@@ -862,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn between_periods_the_estimate_can_fall_but_not_climb() {
+    fn between_periods_concurrency_can_fall_but_not_climb() {
         assert_eq!(held_below(5, Some(3), false), 3);
         assert_eq!(held_below(2, Some(3), false), 2);
         assert_eq!(held_below(5, Some(3), true), 5);

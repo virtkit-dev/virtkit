@@ -16,9 +16,10 @@ embedded database, no replication.
 ## Components
 
 - **`vk node`** — a `vk` subcommand run as a long-lived supervisor on each node. It is to
-  link the executor, admission and self-update in-process, dial the hub, and apply what the
-  hub asks within what local policy allows; today it enrolls and reports inventory,
-  heartbeats and workloads.
+  link the executor, admission, the concurrency controller and self-update in-process, dial
+  the hub, and apply what the hub asks within what local policy allows; today it enrolls,
+  reports inventory, heartbeats and workloads, sets its runner's concurrency, and keeps the
+  desired state and commands it is sent.
 - **`vk-hub`** — the hub binary: inventory, desired state, operations, audit log, web UI, and
   later the generic job queue. Its database is `redb`, as `vk-registry`'s accounts store is.
 - **`vk-hub-proto`** — the hub↔node wire types, versioned, beside the VM list `vk workloads`
@@ -67,9 +68,8 @@ Each connection opens with:
   connection or used to steer the session to an older version;
 - the node's **incarnation ID**, new on every `vk node run` start, so the hub tells a reconnect
   from a restart;
-- the node's full observed state and the commands it has journaled but not yet reported
-  done (proposed: the prototype sends its inventory, heartbeats and workloads once the
-  session is open, and has no commands).
+- the node's full observed state and every command outcome the hub has not yet recorded,
+  from protocol version 2; then its inventory, heartbeats and workloads.
 
 Then:
 
@@ -82,26 +82,26 @@ Then:
 Steering — desired state, commands and their outcomes — takes protocol version 2 on both
 sides; a session with a version-1 node (0.83.0 or 0.84.0) carries monitoring only.
 
-Proposed: a node applies a desired-state generation at most once, and journals every command
-before acting on it, so a command redelivered after a reconnect is recognized and not repeated.
-It repeats each command's outcome until the hub says it has stored it, and the hub resends
+A node applies a desired-state generation at most once, and journals every command before
+acting on it, so a command redelivered after a reconnect is recognized and not repeated. It
+repeats each command's outcome until the hub says it has stored it. Proposed: the hub resends
 desired state to a node that reports an older generation, and every command without a final
-outcome. A command the node never takes expires after a day. A lost connection means the node's
+outcome; a command the node never takes expires after a day. A lost connection means the node's
 state is unknown, not that it stopped. The prototype's session, limits and timeouts are in [the
 reference](fleet-prototype.md#hub-and-node).
 
 **Losing the hub does not stop the fleet.** A disconnected node keeps running CI under its
-local policy. Proposed: it also keeps the last desired state it applied, and a drain or
-quarantine it has persisted stays in force.
+local policy and the last desired state it applied. Proposed: a drain or quarantine it has
+persisted stays in force.
 
 ## Configuration
 
 A node's `vk` configuration (`config.toml`) is authoritative: paths, shares, resource
 ceilings, and the executor tuning a host with a lot of RAM and a slow network disk depends on
 (tmpfs `checkout_dir`, reused host-side checkouts, DAX shares, disk admission). Proposed: it
-also sets which operations the hub may run, and the hub only narrows it — drain, quarantine, a
-choice among versions the node allows — never raising a limit local policy sets or pushing
-`[executor]` settings.
+also sets which operations the hub may run, and the hub only narrows it — a lower concurrency
+ceiling, drain, quarantine, a choice among versions the node allows — never raising a limit
+local policy sets or pushing `[executor]` settings.
 
 The node reports a hash of its effective configuration, and its node page shows it, so drift
 between nodes that should match is visible.
@@ -141,6 +141,28 @@ It must avoid touching stopped environments or their workspaces. Reports are bou
 omissions, and distinguish reserved memory from measured host memory. The hub keeps the latest
 list, not a history. See [workload reporting](fleet-prototype.md#workloads) for discovery,
 limits, measurement cadence and current UI support.
+
+## Runner concurrency
+
+A node's gitlab-runner takes as many jobs as its `concurrent` allows, and a job admission
+makes wait has already been assigned by GitLab: it cannot move to an idle node. So each node
+keeps its runner from accepting work its host cannot start promptly, with one decision:
+
+```
+effective = min(local estimate, hub ceiling, local ceiling)
+```
+
+- **local estimate** — `vk tune`'s control law: the jobs running plus as many typical jobs as
+  fit the memory budget and the host's available memory, falling at once and rising one step
+  at a time.
+- **hub ceiling** — set by the hub in the node's desired state, for a node that is unhealthy,
+  saturated on a resource the estimate does not see, or whose capacity is kept for other work.
+- **local ceiling** — `[executor.schedule] max_concurrency`, the node's own limit.
+
+The node applies the hub's ceiling whether or not the hub is reachable. gitlab-runner has no
+`concurrent = 0`, so stopping acquisition is a state rather than a number, and needs a runner
+the node runs itself. See [concurrency control](fleet-prototype.md#concurrency-control) for
+the cadence and how the number reaches the runner.
 
 ## Node states
 

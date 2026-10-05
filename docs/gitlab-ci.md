@@ -1089,6 +1089,13 @@ ceiling. It is the runner user's own cap on what it asks for; `vk-runnerctl`'s `
 `max` are the administrator's range and still clamp the result. While the ceiling binds, the
 reported estimate is at most one above it: it climbs from the number last written.
 
+On a fleet node, `vk node run` makes the same decision itself every half minute and whenever
+its hub's desired state changes, with the hub's ceiling as a third term: the smallest of the
+estimate, the hub's ceiling and `max_concurrency` wins, so the hub can lower the number but
+never raise it past the node's own. Only the half-minute pass raises it, by the estimate's one
+step when there is a memory budget. The node keeps the hub's ceiling across restarts and while
+the hub is unreachable.
+
 A runner that runs as the same user as `vk`, with its own `~/.gitlab-runner/config.toml`, needs
 no `vk-runnerctl`: name the file as `[node] runner_config` and `vk tune` sets its `concurrent`
 itself, with the same one-line edit and the same proof that nothing else changed. It refuses a

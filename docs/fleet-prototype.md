@@ -12,12 +12,14 @@ The prototype provides, all experimentally:
 - `vk workloads`: the host's running VMs;
 - `vk-hub local`: a web UI to view and act on those VMs, with printed sign-in links;
 - enrollment, node sessions, inventory and heartbeats;
+- on the node, desired state and a command journal kept across restarts, and the runner's
+  concurrency set within the hub's ceiling;
 - `vk-hub workloads`: each node's VMs;
 - live nodes and node detail pages, and an audit log, with sign-in links from
   `vk-hub ui login`.
 
-The hub observes nodes but does not control them. Desired state, drain and quarantine,
-releases, updates, rollouts, resets, restart and redeploy are not built.
+The hub observes nodes but does not control them: it sends no desired state or command. Drain
+and quarantine, releases, updates, rollouts, resets, restart and redeploy are not built.
 
 | Capability | Current prototype | Proposed gate |
 |---|---|---|
@@ -83,8 +85,10 @@ closed at once. At most 256 handshakes run at once; past that the upgrade is ans
 The hub asks for a heartbeat every 5 seconds; the node clamps what it is asked to 1–300
 seconds. A node silent for 3 heartbeats has its session dropped and is listed unreachable; the
 node gives up on a hub silent for 3 of the intervals it asked for. The node re-reads its
-inventory every 60 seconds and sends it when it changed, and sends a report of its VMs at the
-start of every session and with the next heartbeat after the list changes.
+inventory every 60 seconds and sends it when it changed. Its report carries its VMs and, from
+version 2, its state (see [Node state and commands](#node-state-and-commands)); it goes out at
+the start of every session from version 2, with the next heartbeat after the VMs change, and
+whenever the node's state changes.
 
 The inventory carries the hostname; CPUs, CPU model, RAM, memory nodes and the `vk check`
 results that gate enrollment; the job-dir and checkout filesystems, each with its device, size,
@@ -107,6 +111,39 @@ refusal of `not_enrolled`, `bad_signature` or `revoked` ends `vk node run`. A fi
 SIGINT closes the session, waiting at most 5 seconds for the hub; a second exits at once.
 `vk node run` exits 75 while another `vk node` holds `<state_dir>/node/lock`, and refuses to
 start unless `<state_dir>/node/` belongs to its user and is closed to everyone else.
+
+## Node state and commands
+
+`vk node run` keeps what its hub asks in `<state_dir>/node/state.json`, `0600`, rewritten whole
+and renamed into place: the desired-state generation it last applied, its own state (`ready`,
+`draining`, `drained` or `quarantined`), and a journal of the commands it received. A
+generation no newer than the applied one is ignored, so each is applied at most once. A
+command is journaled by its ID, together with the change it makes, before anything acts on it;
+one delivered again is answered from its entry rather than run again, and one received past its
+expiry is answered `expired`. An entry is kept until the hub has recorded its outcome and its
+command has expired, and past 4096 recorded entries the oldest go first.
+
+The node answers every delivery of a command with its ack, and at the start of every session
+repeats each ack whose outcome the hub has not recorded. The state names the hub and node ID it
+was kept for: a node enrolled anew, or with another hub, forgets the applied generation and the
+journal but keeps its own state. In a session at version 1 the node sends no ack and its report
+carries its VMs alone; what it persisted still applies.
+
+Drain and quarantine need a runner the node runs itself, which is not built: the node refuses
+both, and reports a stop of acquisition in the desired state as something it cannot carry out
+(`unsupported`), while still setting the runner's concurrency. `undrain` and `release` have
+nothing to undo, and are `done`.
+
+## Concurrency control
+
+`vk node run` sets the runner's concurrency itself, with `vk tune`'s decision and the hub's
+ceiling from the applied desired state as a third term: every half minute, and whenever its
+desired state or anything else it reports changes, only the half-minute pass raising it, by
+the estimate's one step when there is a memory budget. As with `vk tune`, the number goes to
+`<state_dir>/schedule/desired-concurrency` for `vk-runnerctl`, and a runner config the node's
+user owns (`[node] runner_config`) has its `concurrent` set directly. The report carries the
+estimate, both ceilings and the effective number; a concurrency that cannot be set is
+reported with the reason (`concurrency_error`), and logged when it starts.
 
 ## Workloads
 

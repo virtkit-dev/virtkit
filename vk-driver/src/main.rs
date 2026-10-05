@@ -272,11 +272,13 @@ enum NodeCmd {
         #[arg(long, value_name = "FILE")]
         ca: Option<PathBuf>,
     },
-    /// Keep a session with the hub, in the foreground
+    /// Keep a session with the hub, and follow it, in the foreground
     ///
     /// Sends the host's inventory at the start and whenever it changes, and a heartbeat every
-    /// few seconds; redials with backoff whenever the hub is unreachable. SIGTERM or SIGINT
-    /// stops it. Exits 75 while another `vk node` holds the state dir.
+    /// few seconds; redials with backoff whenever the hub is unreachable. Sets the runner's
+    /// concurrency every half minute, as `vk tune` would, within the hub's ceiling, and keeps
+    /// what the hub asked across restarts. SIGTERM or SIGINT stops it. Exits 75 while another
+    /// `vk node` holds the state dir.
     Run,
 }
 
@@ -697,7 +699,7 @@ enum Cmd {
     /// Membership in a fleet managed by a vk-hub (experimental)
     ///
     /// `join` enrolls this host with a hub; `run` then keeps a session with it, reporting the
-    /// host's inventory and a heartbeat.
+    /// host's inventory and a heartbeat, and follows what the hub asks within local policy.
     #[command(hide = true)]
     Node {
         #[command(subcommand)]

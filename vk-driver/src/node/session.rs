@@ -1,12 +1,16 @@
-//! One session with the hub: dial, authenticate, then inventory and heartbeats until the
+//! One session with the hub: dial, authenticate, then inventory, heartbeats and reports — and
+//! from [`STEERING`] on, the hub's desired state and commands, each command acked — until the
 //! connection fails or the process is told to stop. [`super::run`] redials.
 //!
 //! Nothing in the session loop waits on the host: the inventory, heartbeat and workloads are
 //! gathered by a [`Gatherer`] task of their own, since a hung mount's `statvfs` or a held
-//! ledger lock would otherwise stop the loop from noticing that the hub has gone quiet. Every
-//! send has a deadline, and the socket carries keepalives and a `TCP_USER_TIMEOUT`, so a peer
-//! that vanished without a word ends the session rather than wedging it.
+//! ledger lock would otherwise stop the loop from noticing that the hub has gone quiet. The
+//! one exception is the node's own state file under `<state_dir>/node`, written before a
+//! change the hub asks for is acted on or acked. Every send has a deadline, and the socket
+//! carries keepalives and a `TCP_USER_TIMEOUT`, so a peer that vanished without a word ends
+//! the session rather than wedging it.
 
+use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,10 +25,12 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use vk_hub_proto::{
-    Channel, Heartbeat, HubMsg, Inventory, NodeMsg, PROTOCOL, Report, STEERING, TLS_EXPORTER_LEN,
+    Channel, CommandAck, Heartbeat, HubMsg, Inventory, NodeMsg, Outcome, PROTOCOL, Report,
+    STEERING, TLS_EXPORTER_LEN,
 };
 
 use super::Enrollment;
+use super::core::Core;
 use super::identity::Identity;
 use crate::config::Config;
 use crate::workloads::Listed;
@@ -93,6 +99,8 @@ pub struct Node {
     pub identity: Identity,
     pub incarnation: String,
     pub tls: Arc<rustls::ClientConfig>,
+    /// What the hub asked and the node's own state, which every session reports.
+    pub core: Arc<Core>,
 }
 
 /// What the gatherer is asked for.
@@ -232,11 +240,24 @@ pub async fn run(
         heartbeat.as_secs()
     );
 
+    // The node's own state and its unrecorded acks first, so a hub deciding what to resend
+    // decides on them.
+    let steering = version >= STEERING;
+    let mut changes = node.core.subscribe();
+    let mut told = Told::default();
+    if steering {
+        for msg in told.news(&node.core, None, version) {
+            if !send_unless_stopped(&mut ws, &msg, heartbeat, stop).await? {
+                return Ok(());
+            }
+        }
+    }
     gatherer.drain();
     gatherer.request(Ask::Inventory);
     let mut sent_inventory: Option<Inventory> = None;
-    // The workloads this session has reported: the first heartbeat's go out on a report.
-    let mut sent_workloads: Option<Listed> = None;
+    // The workloads last gathered, which every report from the first heartbeat on carries;
+    // the hub keeps its previous list through the reports before it.
+    let mut workloads: Option<Listed> = None;
     let mut deadline = tokio::time::Instant::now() + quiet;
     let mut beat = tokio::time::interval(heartbeat);
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -255,25 +276,21 @@ pub async fn run(
             }
             _ = beat.tick() => gatherer.request(Ask::Heartbeat),
             _ = recheck.tick() => gatherer.request(Ask::Inventory),
+            Ok(()) = changes.changed(), if steering => {
+                for msg in told.news(&node.core, workloads.as_ref(), version) {
+                    if !send_unless_stopped(&mut ws, &msg, heartbeat, stop).await? {
+                        return Ok(());
+                    }
+                }
+            }
             Some(gathered) = gatherer.answers.recv() => {
                 let mut msgs = Vec::with_capacity(2);
                 match gathered {
-                    Gathered::Heartbeat(hb, workloads) => {
+                    Gathered::Heartbeat(hb, listed) => {
                         // The report first, so the heartbeat's readings land on the list
                         // they are for.
-                        if sent_workloads.as_ref() != Some(&workloads) {
-                            let report = Report {
-                                workloads: Some(workloads.workloads.clone()),
-                                workloads_omitted: workloads.omitted,
-                                ..Report::default()
-                            };
-                            msgs.push(NodeMsg::Report(if version < STEERING {
-                                report.without_steering()
-                            } else {
-                                report
-                            }));
-                            sent_workloads = Some(workloads);
-                        }
+                        workloads = Some(listed);
+                        msgs.extend(told.news(&node.core, workloads.as_ref(), version));
                         msgs.push(NodeMsg::Heartbeat(hb));
                     }
                     Gathered::Inventory(inventory)
@@ -301,7 +318,16 @@ pub async fn run(
                     Some(Err(e)) => bail!("reading from the hub: {e}"),
                     Some(Ok(Message::Close(_))) => bail!("the hub closed the session"),
                     Some(Ok(Message::Text(text))) => {
-                        handle(parse(text.as_str())?, &node.dir, version)?;
+                        // A command is answered on every delivery, from the journal when it
+                        // came before.
+                        if let Some(ack) = handle(parse(text.as_str())?, node, version).await? {
+                            told.acks.insert(ack.id.clone(), ack.outcome.clone());
+                            if !send_unless_stopped(&mut ws, &NodeMsg::Ack(ack), heartbeat, stop)
+                                .await?
+                            {
+                                return Ok(());
+                            }
+                        }
                     }
                     // tungstenite answers pings itself; each one shows the hub is alive.
                     Some(Ok(_)) => {}
@@ -333,20 +359,97 @@ async fn send_unless_stopped(
     }
 }
 
-/// A message from the hub inside a session at `version`.
-fn handle(msg: HubMsg, dir: &Path, version: u32) -> Result<()> {
+/// What this session has told the hub, so a change goes out once and an ack again only when
+/// its outcome moved on or a new session starts.
+#[derive(Default)]
+struct Told {
+    report: Option<Report>,
+    acks: HashMap<String, Outcome>,
+}
+
+impl Told {
+    /// Return and mark as sent a changed report (`workloads` and steering state), followed
+    /// by unrecorded acks whose current outcomes this session has not sent. Below [`STEERING`],
+    /// include only workloads and no acks. Omit empty reports.
+    fn news(&mut self, core: &Core, workloads: Option<&Listed>, version: u32) -> Vec<NodeMsg> {
+        let mut report = Report {
+            workloads: workloads.map(|w| w.workloads.clone()),
+            workloads_omitted: workloads.map_or(0, |w| w.omitted),
+            ..core.report()
+        };
+        if version < STEERING {
+            report = report.without_steering();
+        }
+        let mut msgs = Vec::new();
+        if report != Report::default() && self.report.as_ref() != Some(&report) {
+            self.report = Some(report.clone());
+            msgs.push(NodeMsg::Report(report));
+        }
+        if version >= STEERING {
+            for ack in core.unrecorded() {
+                if self.acks.get(&ack.id) != Some(&ack.outcome) {
+                    self.acks.insert(ack.id.clone(), ack.outcome.clone());
+                    msgs.push(NodeMsg::Ack(ack));
+                }
+            }
+        }
+        msgs
+    }
+}
+
+/// A message from the hub inside a session at `version`. Desired state and commands go through
+/// the node's persisted state before anything follows them. Returns a command's ack, to be
+/// sent at once; the report the change makes goes out through [`Told::news`].
+async fn handle(msg: HubMsg, node: &Node, version: u32) -> Result<Option<CommandAck>> {
     match msg {
-        HubMsg::Refused { code, reason } => Err(refusal(code, &reason, dir)),
+        HubMsg::Refused { code, reason } => Err(refusal(code, &reason, &node.dir)),
         HubMsg::Challenge { .. } | HubMsg::Welcome { .. } => {
             bail!("the hub repeated its handshake inside a session")
         }
         HubMsg::Desired(_) | HubMsg::Command(_) | HubMsg::Recorded(_) if version < STEERING => {
             bail!("the hub sent {} in a version-{version} session", kind(&msg))
         }
-        // The node follows local policy and ignores desired state and commands,
-        // so it sends no acks for the hub to record.
-        HubMsg::Desired(_) | HubMsg::Command(_) | HubMsg::Recorded(_) => Ok(()),
+        HubMsg::Desired(desired) => {
+            let generation = desired.generation;
+            if persist(&node.core, move |core| core.apply_desired(desired)).await? {
+                say!("applied desired state generation {generation}");
+            }
+            Ok(None)
+        }
+        HubMsg::Command(command) => {
+            if !vk_hub_proto::valid_id(&command.id) {
+                bail!("the hub sent a command with a malformed ID");
+            }
+            let op = format!("{:?}", command.op);
+            let now = now_secs();
+            let ack = persist(&node.core, move |core| core.command(command, now)).await?;
+            say!("command {} ({op}): {:?}", ack.id, ack.outcome);
+            Ok(Some(ack))
+        }
+        HubMsg::Recorded(ack) => {
+            let now = now_secs();
+            persist(&node.core, move |core| core.recorded(&ack, now)).await?;
+            Ok(None)
+        }
     }
+}
+
+/// Seconds since the Unix epoch, which command expiries count in.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Run `f` on the core off the runtime: it writes the node's state file.
+async fn persist<T: Send + 'static>(
+    core: &Arc<Core>,
+    f: impl FnOnce(&Core) -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let core = core.clone();
+    tokio::task::spawn_blocking(move || f(&core))
+        .await
+        .context("persisting the node state")?
 }
 
 /// A message from the hub, its parse error cut to what is safe to print.
@@ -609,7 +712,7 @@ async fn receive(ws: &mut Ws) -> Result<HubMsg> {
 mod tests {
     use super::*;
     use tokio_tungstenite::WebSocketStream;
-    use vk_hub_proto::{RefusalCode, VersionRange};
+    use vk_hub_proto::{Operation, RefusalCode, VersionRange};
 
     type HubSide = WebSocketStream<tokio::net::TcpStream>;
 
@@ -679,6 +782,14 @@ mod tests {
                 identity: Identity::load_or_create(&dir).unwrap(),
                 incarnation: "cd".repeat(16),
                 tls: Arc::new(tls),
+                core: Core::open(
+                    &dir,
+                    super::super::state::Issuer {
+                        hub: format!("http://{addr}"),
+                        node_id: "ab".repeat(16),
+                    },
+                )
+                .unwrap(),
             },
             // A registry of its own, with no VM in it, not this host's.
             gatherer: Gatherer::spawn_in(Arc::new(cfg), Some(dir.join("vms"))),
@@ -898,21 +1009,33 @@ mod tests {
 
     const V1: VersionRange = VersionRange { min: 1, max: 1 };
 
-    /// A hub speaking only version 1 gets a version-1 session, and reports without steering.
+    /// A hub speaking only version 1 gets a version-1 session: reports without steering, and
+    /// no ack, whatever the node has applied and journaled.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_version_1_hub_gets_a_version_1_session() {
         let mut f = fixture("v1").await;
         let (node, gatherer, stopped, listener, stop) = f.parts();
         let key = node.identity.public_key().to_vec();
+        let HubMsg::Desired(desired) = desired() else {
+            unreachable!()
+        };
+        node.core.apply_desired(desired).unwrap();
+        node.core.command(command(Operation::Undrain), 1).unwrap();
+        assert_eq!(node.core.unrecorded().len(), 1);
         let hub = async {
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, V1, 1).await);
             hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
-            let report = next_of(&mut ws, |m| match m {
-                NodeMsg::Report(r) => Some(r),
-                _ => None,
-            })
-            .await;
+            let (mut report, mut heartbeat) = (None, false);
+            while !(report.is_some() && heartbeat) {
+                match next_of(&mut ws, Some).await {
+                    NodeMsg::Report(r) => report = Some(r),
+                    NodeMsg::Heartbeat(_) => heartbeat = true,
+                    NodeMsg::Inventory(_) => {}
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            let report = report.unwrap();
             assert!(report.workloads.is_some());
             assert_eq!(report.clone().without_steering(), report);
             stop.send(true).unwrap();
@@ -944,37 +1067,16 @@ mod tests {
         assert!(!err.is::<Permanent>());
     }
 
-    /// At version 2 desired state, a command and a record are taken without ending the
-    /// session.
+    /// A second handshake inside a session breaks the protocol, and ends the session.
     #[tokio::test(flavor = "multi_thread")]
-    async fn steering_in_a_version_2_session_is_accepted() {
-        let mut f = fixture("v2").await;
+    async fn a_repeated_handshake_ends_the_session() {
+        let mut f = fixture("rehandshake").await;
         let (node, gatherer, stopped, listener, _) = f.parts();
         let key = node.identity.public_key().to_vec();
         let hub = async {
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, PROTOCOL, STEERING).await);
             hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
-            let id = "ef".repeat(16);
-            hub_send(&mut ws, &desired()).await;
-            hub_send(
-                &mut ws,
-                &HubMsg::Command(vk_hub_proto::Command {
-                    id: id.clone(),
-                    expires_at: u64::MAX,
-                    op: vk_hub_proto::Operation::Drain,
-                }),
-            )
-            .await;
-            hub_send(
-                &mut ws,
-                &HubMsg::Recorded(vk_hub_proto::CommandAck {
-                    id,
-                    outcome: vk_hub_proto::Outcome::Done,
-                }),
-            )
-            .await;
-            // Frames are handled in order: the node reaching this one took the three above.
             hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
             while hub_receive(&mut ws).await.is_some() {}
         };
@@ -984,6 +1086,96 @@ mod tests {
             format!("{err:#}").contains("repeated its handshake inside a session"),
             "{err:#}"
         );
+    }
+
+    fn command(op: Operation) -> vk_hub_proto::Command {
+        vk_hub_proto::Command {
+            id: "ef".repeat(16),
+            expires_at: u64::MAX,
+            op,
+        }
+    }
+
+    fn ack_of(msg: NodeMsg) -> Option<CommandAck> {
+        match msg {
+            NodeMsg::Ack(ack) => Some(ack),
+            _ => None,
+        }
+    }
+
+    fn report_of(msg: NodeMsg) -> Option<Report> {
+        match msg {
+            NodeMsg::Report(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// At version 2, desired state is applied and shown on the report, and a command is
+    /// journaled and acked; the ack comes again in the next session until the hub records
+    /// it, and the command delivered again is answered from the journal, not run again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commands_are_applied_once_and_acked_until_recorded() {
+        let mut f = fixture("steer").await;
+        let (node, gatherer, stopped, listener, stop) = f.parts();
+        let key = node.identity.public_key().to_vec();
+        // Refused, with no runner of its own to stop: still journaled, and its outcome still
+        // repeated until recorded.
+        let drain = command(Operation::Drain);
+        let hub = async {
+            // First session: desired state and a drain; the hub records nothing.
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, PROTOCOL, STEERING).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            let first = next_of(&mut ws, report_of).await;
+            assert_eq!(first.applied_generation, None);
+            assert_eq!(first.state, Some(vk_hub_proto::NodeState::Ready));
+            hub_send(&mut ws, &desired()).await;
+            let applied = next_of(&mut ws, |m| {
+                report_of(m).filter(|r| r.applied_generation.is_some())
+            })
+            .await;
+            assert_eq!(applied.applied_generation, Some(1));
+            // A stop of acquisition this node cannot carry out, said so.
+            assert_eq!(applied.unsupported.len(), 1);
+            hub_send(&mut ws, &HubMsg::Command(drain.clone())).await;
+            let ack = next_of(&mut ws, ack_of).await;
+            assert!(matches!(ack.outcome, Outcome::Refused { .. }), "{ack:?}");
+            drop(ws);
+
+            // Second session: the unrecorded ack comes again unasked, and the command
+            // redelivered is answered with it, not run again.
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, PROTOCOL, STEERING).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            let report = next_of(&mut ws, report_of).await;
+            assert_eq!(report.applied_generation, Some(1));
+            assert_eq!(next_of(&mut ws, ack_of).await, ack);
+            hub_send(&mut ws, &HubMsg::Command(drain.clone())).await;
+            assert_eq!(next_of(&mut ws, ack_of).await, ack);
+            hub_send(&mut ws, &HubMsg::Recorded(ack.clone())).await;
+            for _ in 0..100 {
+                if node.core.unrecorded().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            stop.send(true).unwrap();
+            while hub_receive(&mut ws).await.is_some() {}
+        };
+        let node_side = async {
+            let first = run(node, gatherer, stopped).await;
+            assert!(first.is_err(), "the hub dropped the first session");
+            run(node, gatherer, stopped).await
+        };
+        let (_, ended) = tokio::join!(hub, node_side);
+        ended.unwrap();
+        // Recorded, so a third session would have nothing to repeat; journaled once.
+        assert!(node.core.unrecorded().is_empty());
+        assert_eq!(node.core.hub_ceiling(), Some(2));
+        let journal = super::super::state::Persisted::load(&node.dir)
+            .unwrap()
+            .journal;
+        assert_eq!(journal.len(), 1);
     }
 
     fn desired() -> HubMsg {

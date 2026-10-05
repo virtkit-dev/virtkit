@@ -5,14 +5,17 @@
 //! hub for as long as it runs — inventory at the start and whenever it changes, a heartbeat
 //! every few seconds — and redials with backoff whenever the session is lost, until SIGTERM
 //! or SIGINT closes it (cleanly unless a send to the hub is stuck) or the hub refuses it for
-//! good. See `docs/fleet-prototype.md`, "Hub and node".
+//! good. It applies the desired state and commands the hub sends through its persisted state
+//! ([`state`]), and sets the runner's concurrency every half minute within the hub's ceiling
+//! ([`core`]), whether or not a session is up. See `docs/fleet-prototype.md`, "Hub and node".
 //!
 //! Everything the node keeps is under `<state_dir>/node/`, a `0700` directory: `key.pk8`
 //! (the private key, `0600`), `enrollment.json` (the hub's URL and the node ID it assigned),
-//! `ca.pem` (the CA the hub is verified against, copied at `join` when one was given) and
-//! `lock`, which one `vk node` process at a time holds. A `join` whose answer was lost keeps
-//! the key it made and joins again with a new token: the hub answers a key it already pinned
-//! with the node it pinned it to.
+//! `state.json` (what the hub asked, the node's own state and its command journal), `ca.pem`
+//! (the CA the hub is verified against, copied at `join` when one was given) and `lock`, which
+//! one `vk node` process at a time holds. A `join` whose answer was lost keeps the key it made
+//! and joins again with a new token: the hub answers a key it already pinned with the node it
+//! pinned it to.
 //!
 //! Both HTTP paths go straight to the hub, never through `HTTP(S)_PROXY`: the session is a
 //! raw socket a proxy variable cannot reach, and enrollment follows the same route rather
@@ -28,9 +31,11 @@ macro_rules! say {
     }};
 }
 
+mod core;
 mod identity;
 mod inventory;
 mod session;
+mod state;
 
 use std::io::{BufRead, Read};
 use std::os::fd::AsRawFd;
@@ -61,6 +66,10 @@ const STABLE_SESSION: Duration = Duration::from_secs(60);
 /// Supersessions in a row after which the node is taken to share its identity with another
 /// running node, rather than to be racing its own previous session.
 const SUPERSEDED_IN_A_ROW: u32 = 3;
+
+/// How often the node sets its runner's concurrency when nothing prompts it sooner: the
+/// half minute `vk tune`'s timer runs at.
+const CONTROL_EVERY: Duration = Duration::from_secs(30);
 
 /// A token or a CA bundle is a few kilobytes at most; this bounds what a wrong file costs.
 const MAX_INPUT: u64 = 1 << 20;
@@ -291,10 +300,21 @@ pub async fn run(cfg: Config) -> Result<()> {
         enrollment.hub
     );
     let mut stop = stop_on_signal()?;
-    let mut gatherer = session::Gatherer::spawn(Arc::new(cfg));
+    let issuer = state::Issuer {
+        hub: enrollment.hub.clone(),
+        node_id: enrollment.node_id.clone(),
+    };
+    let core = core::Core::open(&dir, issuer)?;
+    let cfg = Arc::new(cfg);
+    tokio::spawn(
+        core.clone()
+            .control(cfg.clone(), CONTROL_EVERY, stop.clone()),
+    );
+    let mut gatherer = session::Gatherer::spawn(cfg);
     let node = session::Node {
         dir,
         enrollment,
+        core,
         identity,
         incarnation,
         tls,

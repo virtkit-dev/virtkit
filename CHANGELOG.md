@@ -9,6 +9,11 @@ All notable changes to virtkit will be documented in this file.
 - **`vk tune` can edit a runner config you own.** A gitlab-runner that runs as your own user
   no longer needs `vk-runnerctl`: name its config as `[node] runner_config` and `vk tune` sets
   `concurrent` there itself, touching nothing else in the file.
+- **Experimental: a fleet node applies its hub's concurrency ceiling.** `vk node run` sets
+  the runner's concurrency itself every half minute — the smallest of the hub's ceiling, the
+  host's own estimate and `max_concurrency` — and keeps what the hub asked across restarts
+  and while the hub is unreachable. A node and a hub both of this release are needed: a hub
+  of 0.84.0 or earlier only monitors.
 
 ## [0.84.0] - 2026-10-05
 
