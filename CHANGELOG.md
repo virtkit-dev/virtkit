@@ -42,7 +42,8 @@ All notable changes to virtkit will be documented in this file.
 - **Experimental: `vk-hub` holds `vk` releases for its hosts.** `vk-hub release add <file>
   --version <v>` keeps a `vk` binary on the hub, `release list` and `release remove` show and
   delete them, and `vk-hub nodes update <id> --release <sha256>` asks a host to update to one.
-  The hub hands a release only to an enrolled host that is updating to it.
+  The hub hands a release only to an enrolled host that is updating to it, and `vk-hub audit`
+  shows each step of a host's update as the host reports it.
 - **Experimental: a fleet node updates `vk` when its hub asks.** It drains, downloads and
   checks the release, and runs it on trial: the new `vk` must pass `vk check`, the optional
   `[node] validate` command (`validate_timeout_secs`) and reach the hub again before it is

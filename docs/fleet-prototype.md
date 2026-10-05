@@ -185,10 +185,10 @@ the table, a line says each thing a node cannot carry out (`cannot comply: …`)
 cannot set its concurrency.
 
 `vk-hub audit [--node ID] [--limit 50]` prints the latest audit lines, oldest first — time,
-node, actor, event: operator actions, with the generation or command each made, and what
-nodes report of them — a new state, a newly applied generation, each command's outcome, what a
-node cannot carry out. Each line is written in the transaction of the change it records. The
-log keeps the latest 100,000 lines.
+node, actor, event: operator actions, with the generation or command each made, and what nodes
+report of them — a new state, a newly applied generation, each command's outcome, each phase of
+an update as the node reaches it, what a node cannot carry out. Each line is written in the
+transaction of the change it records. The log keeps the latest 100,000 lines.
 
 ## Node state and commands
 

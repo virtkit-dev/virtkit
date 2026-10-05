@@ -1596,8 +1596,8 @@ fn append_audit(
     Ok(())
 }
 
-/// The audit lines a report is worth: a new state, a newly applied generation, and what of it
-/// the node cannot carry out — or its concurrency — as it changes.
+/// Audit changes in state, applied generation, update phase, what the node cannot carry out,
+/// and concurrency errors.
 fn report_events(previous: Option<&Report>, report: &Report) -> Vec<String> {
     let mut events = Vec::new();
     if previous.is_none_or(|p| p.state != report.state)
@@ -1615,6 +1615,22 @@ fn report_events(previous: Option<&Report>, report: &Report) -> Vec<String> {
             events.push(format!("cannot comply: {note}"));
         }
     }
+    if let Some(u) = &report.update
+        && previous.is_none_or(|p| {
+            p.update.as_ref().map(|u| (&u.command, u.phase)) != Some((&u.command, u.phase))
+        })
+    {
+        let mut event = format!(
+            "update to vk {} ({}): {}",
+            u.version,
+            short(&u.sha256),
+            update_phase_name(u.phase)
+        );
+        if let Some(message) = &u.message {
+            event.push_str(&format!(": {message}"));
+        }
+        events.push(event);
+    }
     if previous.is_none_or(|p| p.concurrency_error != report.concurrency_error)
         && let Some(error) = &report.concurrency_error
     {
@@ -1631,6 +1647,18 @@ pub(crate) fn state_name(state: NodeState) -> &'static str {
         NodeState::Maintenance => "maintenance",
         NodeState::Validating => "validating",
         NodeState::Quarantined => "quarantined",
+    }
+}
+
+pub(crate) fn update_phase_name(phase: vk_hub_proto::UpdatePhase) -> &'static str {
+    use vk_hub_proto::UpdatePhase;
+    match phase {
+        UpdatePhase::Draining => "draining",
+        UpdatePhase::Downloading => "downloading",
+        UpdatePhase::Validating => "validating",
+        UpdatePhase::Done => "done",
+        UpdatePhase::RolledBack => "rolled back",
+        UpdatePhase::Failed => "failed",
     }
 }
 
@@ -2272,6 +2300,42 @@ mod tests {
         let row = db.node(&id).unwrap().unwrap();
         assert_eq!(row.report, Some(Report::default()));
         assert_eq!(row.workloads, Some(2));
+    }
+
+    /// Each phase of an update a node reports is audited once, as it reaches it.
+    #[test]
+    fn update_phases_are_audited_as_they_change() {
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        let report = |phase, message: Option<&str>| Report {
+            update: Some(vk_hub_proto::UpdateProgress {
+                command: "c1".repeat(16),
+                version: "0.85.0".into(),
+                sha256: "ab".repeat(32),
+                phase,
+                message: message.map(str::to_string),
+            }),
+            ..Report::default()
+        };
+        use vk_hub_proto::UpdatePhase::{Draining, RolledBack};
+        db.record_report(&id, report(Draining, None), 2).unwrap();
+        db.record_report(&id, report(Draining, None), 3).unwrap();
+        db.record_report(&id, report(RolledBack, Some("validation failed")), 4)
+            .unwrap();
+        let events: Vec<String> = db
+            .audits(Some(&id), 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .filter(|e| e.starts_with("update"))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "update to vk 0.85.0 (abababababab): draining",
+                "update to vk 0.85.0 (abababababab): rolled back: validation failed"
+            ]
+        );
     }
 
     /// A stored list or set of memory readings that does not decode does not fail a listing,
