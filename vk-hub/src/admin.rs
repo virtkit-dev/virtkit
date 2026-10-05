@@ -703,6 +703,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(issued.op, Operation::Drain);
+        let reset: Command = serde_json::from_value(
+            call(format!(
+                r#"{{"op":"command","id":"{id}","operation":{{"kind":"reset","images":true}}}}"#
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reset.op, Operation::Reset { images: true });
         // An update goes through a release the hub holds, never a version and digest the
         // caller made up.
         let err = call(format!(
@@ -726,8 +734,8 @@ mod tests {
         assert_eq!(
             events,
             [
-                "uid 7 stopped acquisition (generation 1)",
-                &format!("uid 7 issued drain (command {})", issued.id)
+                &format!("uid 7 issued drain (command {})", issued.id),
+                &format!("uid 7 issued reset, images included (command {})", reset.id)
             ]
         );
     }

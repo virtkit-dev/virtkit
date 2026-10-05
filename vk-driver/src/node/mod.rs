@@ -6,10 +6,11 @@
 //! every few seconds — and redials with backoff whenever the session is lost, until SIGTERM
 //! or SIGINT closes it (cleanly unless a send to the hub is stuck) or the hub refuses it for
 //! good. It applies the desired state and commands the hub sends — a concurrency ceiling,
-//! stopping acquisition, drain, quarantine, update — through its persisted state ([`state`]),
-//! sets the runner's concurrency every half minute within the hub's ceiling ([`core`]), whether
-//! or not a session is up, with `[node] runner = "managed"` runs gitlab-runner itself
-//! ([`runner`]), and updates its own `vk` on trial ([`update`]).
+//! stopping acquisition, drain, quarantine, update, reset — through its persisted state
+//! ([`state`]), sets the runner's concurrency every half minute within the hub's ceiling
+//! ([`core`]), whether or not a session is up, with `[node] runner = "managed"` runs
+//! gitlab-runner itself ([`runner`]), updates its own `vk` on trial ([`update`]), and clears
+//! what past jobs left ([`reset`]).
 //! See `docs/fleet-prototype.md`, "Hub and node".
 //!
 //! Everything the node keeps is under `<state_dir>/node/`, a `0700` directory: `key.pk8`
@@ -39,6 +40,7 @@ macro_rules! say {
 mod core;
 mod identity;
 mod inventory;
+mod reset;
 mod runner;
 mod session;
 mod state;

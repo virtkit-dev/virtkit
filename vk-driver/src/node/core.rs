@@ -18,7 +18,7 @@ use vk_hub_proto::{
     Operation, Report, RunnerMode, RunnerState,
 };
 
-use super::state::{Abilities, Issuer, Persisted};
+use super::state::{Abilities, Issuer, Persisted, Work};
 use super::update::Binary;
 use crate::config::Config;
 
@@ -32,6 +32,9 @@ pub struct Core {
     concurrency_error: Mutex<Option<String>>,
     /// Which of a drain's conditions held at the last pass, while draining.
     drain: Mutex<Option<DrainProgress>>,
+    /// Since when, in seconds since the epoch, a reset's drain has waited only on jobs
+    /// admitted but with no supervisor.
+    preparing_since: Mutex<Option<u64>>,
     /// Whether the runner may take jobs, for a managed runner's supervisor to follow.
     acquire: watch::Sender<bool>,
     /// Bumped on every change to what the node tells the hub: its report or its unrecorded
@@ -84,6 +87,7 @@ impl Core {
             concurrency: Mutex::new(None),
             concurrency_error: Mutex::new(None),
             drain: Mutex::new(None),
+            preparing_since: Mutex::new(None),
             acquire,
             changed,
             connected: watch::Sender::new(false),
@@ -384,10 +388,11 @@ impl Core {
     fn drain_step(&self, cfg: &Config) -> Result<()> {
         let now = super::session::now_secs();
         if self.update(|p| p.drain_expired(now))? {
-            say!("the update's command expired before the drain finished");
+            say!("the command the node drained for expired before the drain finished");
         }
         if self.state() != NodeState::Draining {
             self.set(&self.drain, None);
+            *lock(&self.preparing_since) = None;
             return Ok(());
         }
         let held = crate::admit::committed(&cfg.state_dir().join("admit"))
@@ -400,13 +405,63 @@ impl Core {
             active_jobs: u32::try_from(jobs.len()).unwrap_or(u32::MAX),
         };
         self.set(&self.drain, Some(progress));
-        if drained(&progress) && self.update(|p| p.finish_drain(now))? {
+        // Reset stops supervisors left by failed cleanup; waiting for them or the admission
+        // entries they hold would block it. Drain waits for the runner, pending admissions,
+        // and admitted jobs without supervisors: a `prepare` can outlive its runner, and reset
+        // cannot stop it or safely remove its job dir. It must exit or hand off to a supervisor
+        // within `PREPARE_WAIT`, or the reset fails.
+        let for_reset = lock(&self.persisted)
+            .job
+            .as_ref()
+            .is_some_and(|j| matches!(j.work, Work::Reset { .. }));
+        let done = if for_reset {
+            let preparing: Vec<_> = held
+                .mem
+                .iter()
+                .filter(|(name, _)| {
+                    !jobs
+                        .iter()
+                        .any(|(dir, _)| dir.file_name() == Some(name.as_os_str()))
+                })
+                .map(|(name, _)| name.to_string_lossy())
+                .collect();
+            let waited = {
+                let mut since = lock(&self.preparing_since);
+                if progress.runner_stopped && held.ahead == 0 && !preparing.is_empty() {
+                    now.saturating_sub(*since.get_or_insert(now))
+                } else {
+                    *since = None;
+                    0
+                }
+            };
+            if waited >= PREPARE_WAIT.as_secs() {
+                let message = format!(
+                    "job(s) {} admitted with no live supervisor for {}s; a reset does not \
+                     stop what holds them",
+                    preparing.join(", "),
+                    PREPARE_WAIT.as_secs()
+                );
+                if self.update(|p| p.reset_blocked(message.clone()))? {
+                    say!("the reset failed: {message}");
+                    self.set(&self.drain, None);
+                    *lock(&self.preparing_since) = None;
+                }
+                return Ok(());
+            }
+            progress.runner_stopped && held.ahead == 0 && preparing.is_empty()
+        } else {
+            drained(&progress)
+        };
+        if done && self.update(|p| p.finish_drain(now))? {
             say!("drained");
             self.set(&self.drain, None);
         }
         Ok(())
     }
 }
+
+/// How long a reset's drain waits on a job admitted but with no supervisor before it fails.
+const PREPARE_WAIT: Duration = Duration::from_secs(600);
 
 /// Whether a drain is complete: the runner has exited — which it does on `SIGQUIT` only once
 /// its jobs, their cleanup stage included, are over — the ledger holds and awaits nothing,
@@ -683,6 +738,104 @@ mod tests {
         assert!(read() <= after_tick, "{} after {after_tick}", read());
         halt.send(true).unwrap();
         task.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reset is for the job a failed cleanup left running: its drain does not wait for it,
+    /// nor for the admission it holds, but does wait for one still being asked for.
+    #[test]
+    fn a_reset_drains_past_a_leftover_supervisor() {
+        let dir = scratch("reset-drain");
+        let job = dir.join("state").join("jobs").join("77");
+        std::fs::create_dir_all(&job).unwrap();
+        // A live supervisor, as the drain recognizes one: its pid, with the job dir among its
+        // arguments, and its admission entry held.
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "while :; do sleep 1; done", job.to_str().unwrap()])
+            .spawn()
+            .unwrap();
+        std::fs::write(job.join("supervisor.pid"), child.id().to_string()).unwrap();
+        let admit = dir.join("state").join("admit");
+        std::fs::create_dir_all(&admit).unwrap();
+        std::fs::write(admit.join("77"), "1024 1 granted\n").unwrap();
+        let _granted = crate::admit::hold(&admit, "77").unwrap();
+        std::fs::write(admit.join("78"), "1024 2 waiting\n").unwrap();
+        let waiting = crate::admit::hold(&admit, "78").unwrap();
+        // A job admitted whose supervisor has not taken over: a prepare under way.
+        std::fs::create_dir_all(job.with_file_name("79")).unwrap();
+        std::fs::write(admit.join("79"), "1024 3 granted\n").unwrap();
+        let preparing = crate::admit::hold(&admit, "79").unwrap();
+        let (_runner, runner) = watch::channel(RunnerState::Stopped);
+        let core = Core::open(&dir, issuer(), Some(runner)).unwrap();
+        let cfg = cfg(&dir);
+        let command = |id: &str, op| Command {
+            id: id.into(),
+            expires_at: u64::MAX,
+            op,
+        };
+        core.command(drain(), 1).unwrap();
+        core.step(&cfg, true).unwrap();
+        // A plain drain waits for the job.
+        assert_eq!(core.state(), NodeState::Draining);
+        assert_eq!(core.report().drain.unwrap().active_jobs, 1);
+        assert!(!core.report().drain.unwrap().ledger_empty);
+        core.command(command("u", Operation::Undrain), 1).unwrap();
+        core.command(command("r", Operation::Reset { images: false }), 1)
+            .unwrap();
+        // A job still asking to be admitted is waited for.
+        core.step(&cfg, true).unwrap();
+        assert_eq!(core.state(), NodeState::Draining);
+        drop(waiting);
+        // Retried: a test forking meanwhile can hold the dropped lock for an instant.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while crate::admit::committed(&admit).unwrap().ahead > 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // So is a job admitted that no supervisor runs yet.
+        core.step(&cfg, true).unwrap();
+        assert_eq!(core.state(), NodeState::Draining);
+        drop(preparing);
+        while core.state() == NodeState::Draining && std::time::Instant::now() < deadline {
+            core.step(&cfg, true).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(core.state(), NodeState::Maintenance);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reset_waiting_too_long_on_a_job_being_prepared_fails_and_stays_drained() {
+        let dir = scratch("reset-prepare");
+        std::fs::create_dir_all(dir.join("state").join("jobs").join("79")).unwrap();
+        let admit = dir.join("state").join("admit");
+        std::fs::create_dir_all(&admit).unwrap();
+        std::fs::write(admit.join("79"), "1024 1 granted\n").unwrap();
+        let _preparing = crate::admit::hold(&admit, "79").unwrap();
+        let (_runner, runner) = watch::channel(RunnerState::Stopped);
+        let core = Core::open(&dir, issuer(), Some(runner)).unwrap();
+        let cfg = cfg(&dir);
+        let reset = Command {
+            id: "r".into(),
+            expires_at: u64::MAX,
+            op: Operation::Reset { images: false },
+        };
+        core.command(reset, 1).unwrap();
+        core.step(&cfg, true).unwrap();
+        assert_eq!(core.state(), NodeState::Draining);
+        // As if the prepare had been at it since well before.
+        let started = lock(&core.preparing_since).unwrap();
+        *lock(&core.preparing_since) = Some(started - PREPARE_WAIT.as_secs());
+        core.step(&cfg, true).unwrap();
+        assert_eq!(core.state(), NodeState::Drained);
+        let journal = core.persisted().journal;
+        assert!(
+            matches!(&journal[0].outcome, Outcome::Failed { message } if message.contains("79")),
+            "{journal:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

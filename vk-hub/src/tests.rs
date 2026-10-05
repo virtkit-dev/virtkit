@@ -719,6 +719,9 @@ async fn a_version_1_node_is_monitored_and_never_steered() {
     assert!(format!("{err:#}").contains("monitor"), "{err:#}");
     let err = ops::command(&hub, "uid 0", &node_id, Operation::Release).unwrap_err();
     assert!(format!("{err:#}").contains("update its vk"), "{err:#}");
+    let err =
+        ops::command(&hub, "uid 0", &node_id, Operation::Reset { images: false }).unwrap_err();
+    assert!(err.is::<crate::store::MonitoringOnly>(), "{err:#}");
     hub.kick(&node_id);
     assert!(
         tokio::time::timeout(Duration::from_millis(1500), receive(&mut ws))
@@ -728,6 +731,53 @@ async fn a_version_1_node_is_monitored_and_never_steered() {
     let view = ops::node_views(&hub).unwrap().remove(0);
     assert!(view.monitoring_only());
     assert_eq!(view.protocol, Some(1));
+}
+
+/// A reset goes to the node as any command does, its images flag with it, and the audit log
+/// names it in what was issued and in how it ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_is_sent_and_audited_by_name() {
+    use vk_hub_proto::{CommandAck, Operation, Outcome};
+    let (addr, hub) = start().await;
+    let key = keypair();
+    let node_id = enrolled(addr, &hub, &key).await;
+    let mut ws = dial(addr).await;
+    assert!(matches!(
+        open(&mut ws, &node_id, &"27".repeat(16), &key).await,
+        HubMsg::Welcome { .. }
+    ));
+    send(&mut ws, &applied(None)).await;
+    let reset = ops::command(&hub, "uid 0", &node_id, Operation::Reset { images: true }).unwrap();
+    assert_eq!(receive(&mut ws).await, HubMsg::Command(reset.clone()));
+    for outcome in [
+        Outcome::Accepted,
+        Outcome::Failed {
+            message: "validation failed: vk check: kvm".into(),
+        },
+    ] {
+        let ack = CommandAck {
+            id: reset.id.clone(),
+            outcome,
+        };
+        send(&mut ws, &NodeMsg::Ack(ack.clone())).await;
+        assert_eq!(receive(&mut ws).await, HubMsg::Recorded(ack));
+    }
+    let events: Vec<String> = hub
+        .db
+        .audits(Some(&node_id), 100)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event)
+        .collect();
+    for want in [
+        format!("uid 0 issued reset, images included (command {})", reset.id),
+        format!(
+            "command {} (reset, images included): failed: validation failed: vk check: kvm",
+            reset.id
+        ),
+    ] {
+        assert!(events.contains(&want), "{want}: {events:?}");
+    }
 }
 
 /// A node that applied a generation past the hub's — the hub restored from a backup — is

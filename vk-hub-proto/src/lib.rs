@@ -38,10 +38,10 @@
 //! [`NodeMsg::Ack`] and [`Report`]'s steering fields. Absent steering fields are omitted from
 //! the wire, preserving version-1 report bytes. Version-1 sessions carry monitoring only;
 //! a node connected to a version-1 hub follows its local policy alone. Version 2 also carries
-//! updates: [`Operation::Update`], the [`NodeState::Maintenance`] and
-//! [`NodeState::Validating`] states, the report's [`UpdateProgress`], and the release download.
-//! [`Versions::vk_sha256`] is an optional inventory field, which a hub of any version reads or
-//! ignores.
+//! updates and resets: [`Operation::Update`], [`Operation::Reset`], the
+//! [`NodeState::Maintenance`] and [`NodeState::Validating`] states, the report's
+//! [`UpdateProgress`], and the release download. [`Versions::vk_sha256`] is an optional
+//! inventory field, which a hub of any version reads or ignores.
 //!
 //! **Steering.** From version 2 the node's [`Report`] also carries its observed state — the
 //! desired-state generation it last applied, its [`NodeState`], whether its runner is taking
@@ -872,6 +872,13 @@ pub enum Operation {
         /// `expires_at` calls the update off. `None`: the node's own trial deadline alone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         within_secs: Option<u64>,
+    },
+    /// Drain, stop what past jobs left running, clear their job dirs and the host checkouts —
+    /// the materialized images too with `images` — validate, and return to the state the node
+    /// was in. The build cache's registry store is never touched.
+    Reset {
+        #[serde(default)]
+        images: bool,
     },
 }
 
@@ -1815,6 +1822,14 @@ mod tests {
                 within_secs: None,
             },
             json!({"kind": "update", "version": "v", "sha256": "ab", "size": 1, "force": true}),
+        );
+        pinned(
+            &Operation::Reset { images: true },
+            json!({"kind": "reset", "images": true}),
+        );
+        assert_eq!(
+            serde_json::from_value::<Operation>(json!({"kind": "reset"})).unwrap(),
+            Operation::Reset { images: false }
         );
         let mut versions = serde_json::to_value(&inventory().versions).unwrap();
         versions["vk_sha256"] = json!("cd".repeat(SHA256_LEN));

@@ -67,6 +67,11 @@ All notable changes to virtkit will be documented in this file.
   a restarted hub carries on where it stopped. A host gets `--drain-timeout` to drain and
   `--node-timeout` to update after that. Hosts with an external runner are left out unless
   `--force`, and hosts on 0.84.0 or earlier are left out.
+- **Experimental: `vk-hub nodes reset` clears a host.** The host drains, stops whatever its
+  past jobs left running, removes their job directories and its idle host checkouts — its
+  cached images too with `--images` — checks itself as an update does, and returns to the state
+  it was in; a host that fails the check stays drained. A reset needs
+  `[node] runner = "managed"`.
 - **Experimental: the `vk-hub` web UI shows releases and rollouts.** An operations page lists
   the releases the hub holds and each rollout's progress, host by host, as it goes; an
   operator can pause, resume and abort a rollout there. The nodes table, in the UI and in

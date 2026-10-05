@@ -7,7 +7,7 @@
 
 use std::io::ErrorKind;
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -88,14 +88,27 @@ fn allocate_with(ctx: &JobCtx, tap_exists: impl Fn(&str) -> bool) -> Result<Leas
 /// Release the tap leased by this job, if any. Idempotent: no lease file, or a
 /// lock already taken over by another job, are fine.
 pub fn release(ctx: &JobCtx) {
-    let Ok(tap) = std::fs::read_to_string(ctx.net_lease()) else {
+    release_lease(&locks_dir(ctx), &ctx.job_dir, &ctx.job_id);
+}
+
+/// [`release`] for job `job_id` in `job_dir`, its locks in `locks`: what a node's reset does
+/// for the job dirs whose cleanup never ran.
+pub fn release_lease(locks: &Path, job_dir: &Path, job_id: &str) {
+    let lease = job_dir.join("net.lease");
+    let Ok(tap) = std::fs::read_to_string(&lease) else {
         return;
     };
-    let lock = locks_dir(ctx).join(format!("{}.lock", tap.trim()));
-    if std::fs::read_to_string(&lock).unwrap_or_default() == ctx.job_id {
+    // A tap name that is not a single path component names no lock of ours.
+    let tap = tap.trim();
+    let lock = locks.join(format!("{tap}.lock"));
+    if !tap.is_empty()
+        && !tap.contains('/')
+        && !tap.contains("..")
+        && std::fs::read_to_string(&lock).unwrap_or_default() == job_id
+    {
         let _ = std::fs::remove_file(&lock);
     }
-    let _ = std::fs::remove_file(ctx.net_lease());
+    let _ = std::fs::remove_file(&lease);
 }
 
 fn locks_dir(ctx: &JobCtx) -> PathBuf {

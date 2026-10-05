@@ -25,12 +25,13 @@ The prototype provides, all experimentally:
   release-key`);
 - on the hub, rollouts of a release by wave, with a canary per hardware profile (`vk-hub
   rollout`);
+- resets, which clear what a node's past jobs left (`vk-hub nodes reset`);
 - `vk-hub workloads`: each node's VMs;
 - live nodes, node detail and operations pages, steering from a node's page, pausing,
   resuming and aborting rollouts from the operations page, and an audit log, with sign-in
   links from `vk-hub ui login`.
 
-Resets, restart and redeploy are not built.
+Restart and redeploy are not built.
 
 | Capability | Current prototype | Proposed gate |
 |---|---|---|
@@ -38,7 +39,7 @@ Resets, restart and redeploy are not built.
 | Update validation | `vk check`, an optional local validation command, then hub reconnection | [A pinned boot/exec/network/cleanup workload required for unattended rollouts](fleet-design.md#updates) |
 | Canary promotion | One canary per hardware profile, promoted once its update is done, the release reported running and the node back ready or drained | [Representative workload success and an observation window](fleet-design.md#updates) |
 | Release trust | Signatures required by default only when keys are configured | [Pinned keys required for remote updates; explicit development opt-out](fleet-design.md#updates) |
-| Reset | Not built | [Explicit job process ownership, verified empty before scratch removal](fleet-design.md#resets) |
+| Reset | Matches known executables and job paths in process arguments | [Explicit job process ownership, verified empty before scratch removal](fleet-design.md#resets) |
 
 ## Enrollment
 
@@ -142,9 +143,9 @@ and `resume` stop and resume its acquisition: the node's desired state, kept on 
 generation that moves on every change, to one past both the hub's last and the one the node
 last reported applying. A ceiling of 0 is refused: gitlab-runner has none, and stopping
 acquisition is what it would mean. `vk-hub nodes drain`, `undrain`, `quarantine` and `release`
-issue a command, valid for a day. On the admin socket they are audited as `uid <n>`, the
-caller's; an operator's node page in the web UI runs the same operations, audited as its
-session's principal (see [Web UI](#web-ui)).
+issue a command, valid for a day, and `vk-hub nodes reset` issues one too ([Resets](#resets)).
+On the admin socket they are audited as `uid <n>`, the caller's; an operator's node page in the
+web UI runs the same operations, audited as its session's principal (see [Web UI](#web-ui)).
 
 A session sends desired state once the node's report shows an older generation, once per
 generation, and each command without a final outcome once per session; nothing goes before the
@@ -198,7 +199,7 @@ transaction of the change it records. The log keeps the latest 100,000 lines.
 `vk node run` keeps what its hub asks in `<state_dir>/node/state.json`, `0600`, rewritten whole
 and renamed into place: the desired-state generation it last applied, its own state (`ready`,
 `draining`, `drained`, `maintenance`, `validating` or `quarantined`), a journal of the commands
-it received, and the update under way. A
+it received, and the update or reset under way. A
 generation no newer than the applied one is ignored, so each is applied at most once. A
 command is journaled by its ID, together with the change it makes, before anything acts on it;
 one delivered again is answered from its entry rather than run again, and one received past its
@@ -212,14 +213,14 @@ journal but keeps its own state. In a session at version 1 the node sends no ack
 carries its VMs alone; what it persisted still applies.
 
 A drain is `accepted`, and its ack moves to `done` once the node is drained, or to `failed` if
-an `undrain` or a `quarantine` ends it first; a drain of a drained node is `done` at once.
-An update is `accepted` too, and ends `done` or `failed` ([Update trial and
-rollback](#update-trial-and-rollback)). Any other command the node can carry out is `done`
-when received. Drain and quarantine need a runner the node runs
-itself: with an external runner the node refuses both, and reports a stop of acquisition in
-the desired state as something it cannot carry out (`unsupported`), while still setting the
-runner's concurrency. Each change is written, and its directory fsynced, before the ack goes
-out: the hub does not send a command again once it has its ack.
+an `undrain` or a `quarantine` ends it first; a drain of a drained node is `done` at once. An
+update and a reset are `accepted` too, and end `done` or `failed` ([Update trial and
+rollback](#update-trial-and-rollback), [Resets](#resets)). Any other command the node can carry
+out is `done` when received. Drain, quarantine and reset need a runner the node runs itself:
+with an external runner the node refuses them, and reports a stop of acquisition in the desired
+state as something it cannot carry out (`unsupported`), while still setting the runner's
+concurrency. Each change is written, and its directory fsynced, before the ack goes out: the
+hub does not send a command again once it has its ack.
 
 ## Concurrency control
 
@@ -299,19 +300,20 @@ answered HTTP 503, to be retried.
 
 ## Maintenance transitions
 
-An update is taken from `ready`, `draining` or `drained` and drains the node first (a drain
-already under way is joined, and the node returns to `drained` after); `maintenance` covers
-the download and the switch, `validating` the release's trial, and the node then returns to
-the state it came from — or enters a quarantine that arrived meanwhile, which is in force from
-the moment it is received since maintenance takes no jobs. While the node still drains,
-`undrain` or `quarantine` call the update off; once maintenance has begun, the update runs to
-its end: a `drain` makes it end `drained`, a `release` withdraws a quarantine received
-meanwhile, and an `undrain` or another update is refused. A quarantined node refuses an
-update. What `validating` runs is `vk check`'s gate and `[node] validate`, an argv of the
-operator's that must exit 0 within `validate_timeout_secs` (600 by default) — booting a small
-image with `$VK_BINARY`, the release on trial, is the intended use. The report carries
-the update's phase (`draining`, `downloading`, `validating`, then `done`, `rolled_back` or
-`failed`, with the reason), and the inventory the sha256 of the `vk` the node runs.
+An update or a reset ([Resets](#resets)) is taken from `ready`, `draining` or `drained` and
+drains the node first (a drain already under way is joined, and the node returns to `drained`
+after); `maintenance` covers the download and the switch, `validating` the release's trial, and
+the node then returns to the state it came from — or enters a quarantine that arrived
+meanwhile, which is in force from the moment it is received since maintenance takes no jobs.
+While the node still drains, `undrain` or `quarantine` call the update or reset off; once
+maintenance has begun, the job runs to its end: a `drain` makes it end `drained`, a `release`
+withdraws a quarantine received meanwhile, and an `undrain`, another update or a reset is
+refused. A quarantined node refuses an update and a reset. What `validating` runs is
+`vk check`'s gate and `[node] validate`, an argv of the operator's that must exit 0 within
+`validate_timeout_secs` (600 by default) — booting a small image with `$VK_BINARY`, the
+release on trial, is the intended use. The report carries the update's phase (`draining`,
+`downloading`, `validating`, then `done`, `rolled_back` or `failed`, with the reason), and the
+inventory the sha256 of the `vk` the node runs.
 
 ## Update trial and rollback
 
@@ -429,6 +431,34 @@ that describe each step; a pass that changes nothing writes nothing; the hub tas
 every rollout from the database at start, whenever a node reports, and every five seconds, so a
 restarted hub carries on where it stopped. A rollout that cannot advance holds none of the
 others back.
+
+## Resets
+
+`vk-hub nodes reset <id> [--images]` drains the node like an update does, from `ready`,
+`draining` or `drained` and only with a managed runner, except that the drain is over once the
+runner has exited and no job is waiting for admission or being admitted: a job supervisor a
+failed cleanup left running, and the admission it holds, are what a reset is for, not something
+it waits on. A job admitted with no supervisor yet is a `prepare` under way, which the reset
+does not stop; it waits for that one to exit or hand its job to a supervisor, and fails, the
+node left `drained`, if it has done neither within ten minutes. In `maintenance` the node stops
+the processes past jobs left: those of its user whose binary is a `vk` (the running one, the
+installed one, a release under the node dir, or any file so named), a `cloud-hypervisor` or a
+`virtiofsd`, and whose arguments name a path inside one of its job dirs, whole or as a `--flag=`
+value — a shell or a `tail` of a job's log is not one of them. Each is held by a pidfd opened
+before its `/proc` entry is read and kept only if still alive after, sent `SIGTERM` through it,
+and `SIGKILL` if it has not exited ten seconds later; one still alive five seconds after that,
+or a `/proc` the node cannot list, fails the reset before anything is removed. The node then
+gives back each job dir's network lease, removes the job dirs under `<state_dir>/jobs` and
+anything else there but its dot-entries, a symlink removed as itself and never followed, sweeps
+the host checkouts no job uses, and with `--images` evicts the materialized images under
+`<state_dir>/{registry,docker,build}` as `vk gc --idle-secs 0` does. The build cache's registry
+store is never touched. `validating` then runs what an update's trial does — `vk check`'s gate,
+`[node] validate`, and a session with the hub within ten minutes — and the node returns to the
+state it was in; a node that fails stays `drained`, with the reset `failed` and the reason,
+rather than take jobs on a host that does not pass. A reset clears the last update's progress
+from the node's report, and a reset and an update exclude each other; a `vk node run` stopped
+during either takes it up again at its next start. The command's audit lines name it `reset`, or
+`reset, images included`.
 
 ## Workloads
 

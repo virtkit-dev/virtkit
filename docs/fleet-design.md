@@ -86,7 +86,7 @@ Then:
   few seconds — at an interval the hub sets, since the hub decides when a quiet node counts
   as unreachable — and command progress and results.
 - **hub → node**: desired state, as a document with a generation number; operations
-  (`drain`, `quarantine` and their reverses, `update`; proposed, `reset`), each with an ID
+  (`drain`, `quarantine` and their reverses, `update`, `reset`), each with an ID
   and an expiry.
 
 Steering — desired state, commands and their outcomes — takes protocol version 2 on both
@@ -284,7 +284,9 @@ the control session. The hub stores and serves releases this way
 
 A node without a BMC integration reports redeploy as unavailable.
 
-None is built yet.
+Only reset is built. Its [current implementation](fleet-prototype.md#resets) drains a managed
+runner, stops and removes recognized leftovers and selected caches, then validates. Restart and
+redeploy remain planned.
 
 Proposed reset contract: track each job's host processes in an explicit ownership boundary,
 preferably a delegated cgroup where the host supports it. A process that changes its executable
@@ -294,10 +296,11 @@ a maintenance failure, not evidence that nothing remains; leave the node drained
 what could not be established. Protect the node supervisor and unrelated workloads from the
 cleanup boundary.
 
-A scan of executables and arguments could serve as a fallback for hosts without that
-boundary, but cannot prove that every descendant is gone: report its limited coverage, and
-never describe its result as a verified clean reset or use it to satisfy unattended
-maintenance's reset gate.
+The existing executable-and-argument scan remains a fallback for older jobs and hosts without
+that boundary. It cleans recognized leftovers but cannot prove that every descendant is gone,
+so it must never be described as a verified clean reset or satisfy unattended maintenance's
+reset gate. Proposed: report that limited coverage with the result; today a reset's outcome is
+only `done` or `failed`, and what it cleared goes to the node's log.
 
 ## Web UI
 
