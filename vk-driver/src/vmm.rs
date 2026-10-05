@@ -712,7 +712,8 @@ pub struct VmSpec {
     #[serde(default)]
     pub guest_agent: Option<PathBuf>,
     /// Present Hyper-V enlightenments (`VmmBuilder::hyperv`): a Windows guest then uses the
-    /// reference TSC page, synthetic timers and the TLB-flush/IPI hypercalls.
+    /// reference TSC page, synthetic timers and the TLB-flush/IPI hypercalls. Only UEFI
+    /// (Windows) guests set it; they also omit virtio-rng.
     #[serde(default)]
     pub hyperv: bool,
     /// The VM generation ID (`VmmBuilder::vm_generation_id`): stable across boots of one disk,
