@@ -335,6 +335,28 @@ impl std::fmt::Display for NotEnrolled {
 
 impl std::error::Error for NotEnrolled {}
 
+/// A rollout asked to pause, resume or abort from a state that does not allow it.
+#[derive(Debug)]
+pub struct RolloutConflict {
+    pub id: String,
+    pub state: &'static str,
+    pub action: RolloutAction,
+}
+
+impl std::fmt::Display for RolloutConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rollout {} is {}; it cannot be {}",
+            crate::rollout::short_id(&self.id),
+            self.state,
+            self.action.done()
+        )
+    }
+}
+
+impl std::error::Error for RolloutConflict {}
+
 /// The node's latest session ran a protocol version below [`STEERING`]: the hub can monitor
 /// it, not steer it.
 #[derive(Debug)]
@@ -1240,6 +1262,15 @@ impl Db {
         Ok(out)
     }
 
+    /// Rollout `id`, named in full.
+    pub fn rollout(&self, id: &str) -> Result<Option<RolloutRow>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        txn.open_table(ROLLOUTS)?
+            .get(id)?
+            .map(|g| decode::<RolloutRow>(g.value()))
+            .transpose()
+    }
+
     /// The one rollout whose ID starts with `prefix`, of at least 4 lowercase hex digits.
     pub fn resolve_rollout(&self, prefix: &str) -> Result<(String, RolloutRow)> {
         crate::rollout::check_prefix(prefix)?;
@@ -1345,12 +1376,14 @@ impl Db {
                 (RolloutAction::Abort, s) if s.active() => RolloutState::Aborted {
                     reason: format!("aborted by {actor}"),
                 },
-                (_, s) => bail!(
-                    "rollout {} is {}; it cannot be {}",
-                    crate::rollout::short_id(id),
-                    s.name(),
-                    action.done()
-                ),
+                (_, s) => {
+                    return Err(RolloutConflict {
+                        id: id.to_string(),
+                        state: s.name(),
+                        action,
+                    }
+                    .into());
+                }
             };
             table.insert(id, encode(&row)?.as_slice())?;
             let event = format!(

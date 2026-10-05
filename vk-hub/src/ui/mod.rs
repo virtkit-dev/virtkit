@@ -15,8 +15,8 @@
 //! **State-changing requests** are `POST`s, and each must come from this UI's own pages —
 //! its `Origin` is the UI's own (a fleet hub's `ui_url`), or `Sec-Fetch-Site` says
 //! `same-origin` — and carry the session's CSRF token, derived from its secret, in a form
-//! field or header. A fleet hub's are the admin socket's steering operations ([`fleet`]),
-//! local mode's `vk` commands ([`actions`]).
+//! field or header. A fleet hub's are the admin socket's steering operations, of nodes and of
+//! rollouts ([`fleet`]), local mode's `vk` commands ([`actions`]).
 //!
 //! **A page** (`GET`) goes only to a request the UI's own pages made (`same-origin`) or no
 //! page made (`none`: the address bar, a bookmark, a link opened from a terminal).
@@ -317,10 +317,15 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
             get(&path, req.uri().query(), &auth, ui).await
         }
         (Method::POST, _) => match &ui.site {
-            Site::Fleet(_) => match fleet::action_node(&path) {
-                Some(id) => fleet::node_action(req, ui, id).await,
-                None => Ok(message(StatusCode::NOT_FOUND, "No such action.")),
-            },
+            Site::Fleet(_) => {
+                if let Some(id) = fleet::action_node(&path) {
+                    fleet::node_action(req, ui, id).await
+                } else if let Some(id) = fleet::action_rollout(&path) {
+                    fleet::rollout_action(req, ui, id).await
+                } else {
+                    Ok(message(StatusCode::NOT_FOUND, "No such action."))
+                }
+            }
             Site::Local(site) => match local::action_target(&path) {
                 Some(local::Target::Vm(id)) => actions::vm_action(req, ui, site, &id).await,
                 Some(local::Target::Dev(name)) => actions::dev_action(req, ui, site, &name).await,
@@ -357,10 +362,13 @@ fn event_name(event: &str, ui: &Ui) -> Option<&'static str> {
     }
 }
 
-/// What `/events/<event>` streams, if it is one of this site's.
-fn source(event: &str, ui: &Ui) -> Option<sse::Source> {
+/// What `/events/<event>` streams, if it is one of this site's, for `auth`'s page.
+fn source(event: &str, ui: &Ui, auth: &Auth) -> Option<sse::Source> {
     match &ui.site {
-        Site::Fleet(site) => fleet::source(event, &ui.hub, site),
+        Site::Fleet(site) => {
+            let steer = auth.session.role >= Role::Operator;
+            fleet::source(event, &ui.hub, site, steer)
+        }
         Site::Local(site) => local::source(event, &ui.hub, site),
     }
 }
@@ -391,7 +399,10 @@ fn from_another_site(headers: &HeaderMap) -> bool {
 
 /// A page: read-only, for any session.
 async fn get(path: &str, query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
-    if let Some(source) = path.strip_prefix("/events/").and_then(|e| source(e, ui)) {
+    if let Some(source) = path
+        .strip_prefix("/events/")
+        .and_then(|e| source(e, ui, auth))
+    {
         return Ok(stream(ui, auth, source));
     }
     let found = match &ui.site {

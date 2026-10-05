@@ -1021,6 +1021,23 @@ fn steering_cells(n: &ops::NodeView) -> [String; 4] {
     let mut state = report
         .and_then(|r| r.state)
         .map_or_else(dash, |s| store::state_name(s).to_string());
+    // Show update progress; keep a rollback visible until the next update.
+    if let Some(u) = report.and_then(|r| r.update.as_ref()) {
+        use vk_hub_proto::UpdatePhase;
+        match u.phase {
+            UpdatePhase::Draining | UpdatePhase::Downloading | UpdatePhase::Validating => {
+                state.push_str(&format!(
+                    ", updating to {}: {}",
+                    u.version,
+                    store::update_phase_name(u.phase)
+                ));
+            }
+            UpdatePhase::RolledBack => {
+                state.push_str(&format!(", update to {} rolled back", u.version));
+            }
+            UpdatePhase::Done | UpdatePhase::Failed => {}
+        }
+    }
     if n.pending_commands > 0 {
         state.push_str(&format!(", {} pending", n.pending_commands));
     }

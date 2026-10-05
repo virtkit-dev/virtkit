@@ -2044,10 +2044,13 @@ async fn start_fleet_as(scheme: &str) -> (SocketAddr, Arc<Hub>, String) {
     let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let origin = format!("{scheme}://{addr}");
-    let hub = Arc::new(Hub::new(
-        Arc::new(Db::open_memory().unwrap()),
-        Some(origin.clone()),
-    ));
+    // Releases are written straight into the database, so their directory holds no files and
+    // need not exist: removing one finds nothing to delete.
+    let releases = std::env::temp_dir().join(format!("vk-hub-ui-releases-{}", std::process::id()));
+    let hub = Arc::new(
+        Hub::new(Arc::new(Db::open_memory().unwrap()), Some(origin.clone()))
+            .with_releases(releases),
+    );
     let ui = Arc::new(Ui::new(hub.clone(), &origin));
     tokio::spawn(serve(listener, None, ui));
     (addr, hub, origin)
@@ -2762,4 +2765,368 @@ async fn a_version_1_node_s_page_offers_no_steering() {
     }
     assert!(hub.db.node(&node).unwrap().unwrap().desired.is_none());
     assert!(hub.db.node_commands(&node).unwrap().is_empty());
+}
+
+/// Rollout `ef…`, running, of release `ab…` (unsigned; `cd…`, signed, beside it): node
+/// `hostname` failed with a reason naming it, node `ci-2` still pending. Written straight
+/// into the database; returns its ID.
+fn rollout_of(hub: &Hub, hostname: &str) -> String {
+    let node = enrolled_node(hub, hostname);
+    let release = |version: &str, signature: Option<String>| crate::store::ReleaseRow {
+        version: version.into(),
+        size: 3 << 20,
+        signature,
+        added_at: 1,
+        added_by: "uid 0".into(),
+    };
+    hub.db
+        .add_release(&"ab".repeat(32), &release("0.85.0", None), "uid 0")
+        .unwrap();
+    hub.db
+        .add_release(
+            &"cd".repeat(32),
+            &release("0.86.0", Some("c2ln".into())),
+            "uid 0",
+        )
+        .unwrap();
+    let id = "ef".repeat(16);
+    let row = crate::rollout::RolloutRow {
+        release: "ab".repeat(32),
+        version: "0.85.0".into(),
+        created_at: 1,
+        created_by: "uid 0".into(),
+        batch: 1,
+        canary_per_profile: true,
+        max_failures: 1,
+        node_timeout_secs: 600,
+        drain_timeout_secs: 600,
+        force: false,
+        state: crate::rollout::RolloutState::Running,
+        failures: 0,
+        nodes: vec![
+            crate::rollout::RolloutNode {
+                id: node,
+                hostname: hostname.into(),
+                profile: format!("{hostname} CPU · 64G · jobs fast"),
+                wave: 0,
+                status: crate::rollout::NodeStatus::Failed {
+                    reason: format!("rolled back: {hostname}"),
+                    at: 2,
+                },
+            },
+            crate::rollout::RolloutNode {
+                id: "12".repeat(16),
+                hostname: "ci-2".into(),
+                profile: "ci-2 CPU · 64G · jobs fast".into(),
+                wave: 1,
+                status: crate::rollout::NodeStatus::Pending,
+            },
+        ],
+    };
+    hub.db.create_rollout(&id, &row, "uid 0").unwrap();
+    id
+}
+
+/// `/operations` lists the releases, signed or not, and the rollouts node by node, what nodes
+/// said as text, live; a viewer's page has no buttons and no CSRF token.
+#[tokio::test(flavor = "multi_thread")]
+async fn releases_and_rollouts_are_shown_live() {
+    let (addr, hub, _) = start_fleet().await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/operations", Some(&viewer)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains("<code>vk-hub release add</code>"),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains("<code>vk-hub rollout create</code>"),
+        "{}",
+        page.body
+    );
+
+    let hostile = "ci<script>alert(1)</script>";
+    let id = rollout_of(&hub, hostile);
+    let page = get(addr, "/operations", Some(&viewer)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert_secure(&page);
+    for want in [
+        "<a href=\"/operations\">operations</a>",
+        "sse-connect=\"/events/operations\"",
+        &format!("<code title=\"{}\">abababababab</code>", "ab".repeat(32)),
+        "<td>0.85.0</td><td>3.0 MiB</td><td>no</td>",
+        "<td>0.86.0</td><td>3.0 MiB</td><td>yes</td>",
+        &format!("<code>{}</code> vk 0.85.0", &id[..8]),
+        "<span class=\"state running\">running</span>",
+        "1 pending, 1 failed · wave 1 · release <code>abababababab</code> · batches of 1 after \
+         a canary per profile · 0 of at most 1 failure(s)",
+        &format!(
+            "<a href=\"/node/{}\">ci-2</a></td><td>pending</td>",
+            "12".repeat(16)
+        ),
+        "failed: rolled back: ci&lt;script&gt;",
+        "ci&lt;script&gt;alert(1)&lt;/script&gt; CPU",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    assert!(!page.body.contains("<script>alert"), "{}", page.body);
+    assert!(!page.body.contains("hx-post"), "{}", page.body);
+    assert!(!page.body.contains("hx-headers"), "{}", page.body);
+
+    let mut events = Events::open(addr, "/events/operations", &viewer).await;
+    let first = events.next().await.unwrap();
+    assert!(first.starts_with("event: operations\ndata: "), "{first}");
+    assert!(!first.contains("hx-post"), "{first}");
+    // A release removed and a rollout steered, by the operations the admin socket runs,
+    // reach a viewer's page.
+    assert!(crate::releases::remove(&hub, "uid 0", &"cd".repeat(32)).unwrap());
+    let mut gone = false;
+    for _ in 0..5 {
+        let event = events.next().await.unwrap();
+        if event.contains("<td>0.85.0</td>") && !event.contains("<td>0.86.0</td>") {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "release 0.86.0 still shown");
+    crate::ops::steer_rollout(&hub, "uid 0", &id, crate::rollout::RolloutAction::Abort).unwrap();
+    let next = next_with(&mut events, ">aborted<").await;
+    assert!(next.contains("aborted by uid 0"), "{next}");
+}
+
+/// An operator's `/operations` pauses, resumes and aborts a rollout as the session's
+/// principal, which the audit log records, and its live fragment follows; a change the
+/// rollout's state does not allow is refused saying why.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_steers_a_rollout_from_operations() {
+    use crate::rollout::RolloutState;
+    let (addr, hub, origin) = start_fleet().await;
+    let id = rollout_of(&hub, "ci-1");
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
+    let path = format!("/rollout/{id}/action");
+
+    let page = get(addr, "/operations", Some(&operator)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    for want in [
+        &format!("action=\"{path}\" hx-post=\"{path}\""),
+        "<button>pause</button>",
+        "<button>abort</button>",
+        &format!("X-CSRF-Token&quot;:&quot;{csrf}&quot;"),
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    // The fragment, shared by every operator's page, carries no session's token.
+    let fragment = page.body.split("id=\"operations\"").nth(1).unwrap();
+    assert!(!fragment.contains(&csrf), "{fragment}");
+
+    let mut live = Events::open(addr, "/events/operations", &operator).await;
+    let first = live.next().await.unwrap();
+    assert!(first.contains("hx-post"), "{first}");
+
+    let steer = |form: &str, htmx: bool| {
+        let (operator, origin, path) = (operator.clone(), origin.clone(), path.clone());
+        let form = form.to_string();
+        async move {
+            let headers = [
+                format!("Cookie: {operator}"),
+                format!("Origin: {origin}"),
+                "Content-Type: application/x-www-form-urlencoded".into(),
+                "HX-Request: true".into(),
+            ];
+            let n = if htmx { 4 } else { 3 };
+            let headers: Vec<&str> = headers[..n].iter().map(String::as_str).collect();
+            request(addr, "POST", &path, &headers, &form).await
+        }
+    };
+    let state = || hub.db.resolve_rollout(&id).unwrap().1.state;
+
+    let reply = steer(&format!("_csrf={csrf}&op=pause"), true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.header("hx-reswap"), Some("none"));
+    assert!(
+        reply
+            .body
+            .contains(&format!("Rollout {} is paused.", &id[..8])),
+        "{}",
+        reply.body
+    );
+    assert!(matches!(state(), RolloutState::Paused { .. }));
+    let paused = next_with(&mut live, ">paused<").await;
+    assert!(paused.contains("<button>resume</button>"), "{paused}");
+
+    // Pausing a paused rollout is the operation's refusal, said to the operator.
+    let reply = steer(&format!("_csrf={csrf}&op=pause"), true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(
+        reply.body.contains("is paused; it cannot be paused"),
+        "{}",
+        reply.body
+    );
+    let reply = steer(&format!("_csrf={csrf}&op=wipe"), true).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+
+    // The CSRF token as the header the page sets, and a plain form back to the page.
+    let reply = request(
+        addr,
+        "POST",
+        &path,
+        &[
+            &format!("Cookie: {operator}"),
+            &format!("Origin: {origin}"),
+            &format!("X-CSRF-Token: {csrf}"),
+            "HX-Request: true",
+            "Content-Type: application/x-www-form-urlencoded",
+        ],
+        "op=resume",
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(state(), RolloutState::Running);
+    let reply = steer(&format!("_csrf={csrf}&op=abort"), false).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/operations"));
+    assert!(matches!(state(), RolloutState::Aborted { .. }));
+    let aborted = next_with(&mut live, ">aborted<").await;
+    assert!(!aborted.contains("<button>"), "{aborted}");
+
+    let audit: Vec<String> = hub
+        .db
+        .audits(None, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.actor == principal)
+        .map(|r| r.event)
+        .collect();
+    let short = &id[..8];
+    for want in ["paused", "resumed", "aborted"] {
+        let line = format!("{principal} {want} rollout {short}");
+        assert!(audit.contains(&line), "{line}: {audit:?}");
+    }
+}
+
+/// A viewer's post, an operator's without the session's CSRF token or from another origin,
+/// and one for no rollout are refused, and change nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollout_is_steered_only_by_an_operator_s_own_page() {
+    let (addr, hub, origin) = start_fleet().await;
+    let id = rollout_of(&hub, "ci-1");
+    let path = format!("/rollout/{id}/action");
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let audit_before = hub.db.audits(None, 100).unwrap();
+
+    let form = format!("_csrf={viewer_csrf}&op=pause");
+    let reply = post_action(addr, &origin, &viewer, &path, &form, true).await;
+    assert_eq!(reply.status, 403);
+    assert!(reply.body.contains("operator role"), "{}", reply.body);
+    let reply = post_action(addr, &origin, &operator, &path, "op=pause", true).await;
+    assert_eq!(reply.status, 403);
+    assert!(reply.body.contains("CSRF"), "{}", reply.body);
+    let form = format!("_csrf={csrf}&op=pause");
+    let reply = post_action(addr, "http://evil.example", &operator, &path, &form, false).await;
+    assert_eq!(reply.status, 403);
+    assert!(reply.body.contains("did not come from"), "{}", reply.body);
+
+    // A well-formed ID of no rollout, and one that is no ID at all.
+    let none = format!("/rollout/{}/action", "0".repeat(32));
+    let reply = post_action(addr, &origin, &operator, &none, &form, true).await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+    assert!(reply.body.contains("no such rollout"), "{}", reply.body);
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        "/rollout/nothex/action",
+        &form,
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 404, "{}", reply.body);
+
+    let (_, row) = hub.db.resolve_rollout(&id).unwrap();
+    assert_eq!(row.state, crate::rollout::RolloutState::Running);
+    assert_eq!(hub.db.audits(None, 100).unwrap(), audit_before);
+}
+
+/// The nodes table says a node is updating and how far it has got, and that its last update
+/// was rolled back; the node's page shows the update, with what the node said of it as text,
+/// and the sha256 of the vk it runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_s_update_is_shown_on_the_nodes_table_and_its_page() {
+    use vk_hub_proto::{NodeState, Report, UpdatePhase, UpdateProgress};
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    hub.db
+        .record_inventory(
+            &node,
+            vk_hub_proto::Inventory {
+                hostname: "ci-1".into(),
+                versions: vk_hub_proto::Versions {
+                    vk: "0.84.0".into(),
+                    vk_sha256: Some("12".repeat(32)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            true,
+            2,
+        )
+        .unwrap();
+    let report = |phase, message: Option<&str>| Report {
+        state: Some(NodeState::Maintenance),
+        update: Some(UpdateProgress {
+            command: "c1".repeat(16),
+            version: "0.85<b>".into(),
+            sha256: "ab".repeat(32),
+            phase,
+            message: message.map(str::to_string),
+        }),
+        ..Report::default()
+    };
+    hub.db
+        .record_report(
+            &node,
+            report(UpdatePhase::Validating, None),
+            crate::now_secs(),
+        )
+        .unwrap();
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let mut nodes = Events::open(addr, "/events/nodes", &cookie).await;
+    let first = nodes.next().await.unwrap();
+    assert!(
+        first.contains("<td>maintenance, updating to 0.85&lt;b&gt;: validating</td>"),
+        "{first}"
+    );
+    let page = get(addr, &format!("/node/{node}"), Some(&cookie)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    for want in [
+        "<tr><th>update</th><td>vk 0.85&lt;b&gt; (<code>abababababab</code>): validating</td>",
+        &format!("<tr><th>vk sha256</th><td>{}</td></tr>", "12".repeat(32)),
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    assert!(!page.body.contains("<b>"), "{}", page.body);
+
+    hub.db
+        .record_report(
+            &node,
+            report(UpdatePhase::RolledBack, Some("vk check: <i>failed</i>")),
+            crate::now_secs(),
+        )
+        .unwrap();
+    hub.changed(&node);
+    next_with(
+        &mut nodes,
+        "maintenance, update to 0.85&lt;b&gt; rolled back",
+    )
+    .await;
+    let page = get(addr, &format!("/node/{node}"), Some(&cookie)).await;
+    assert!(
+        page.body
+            .contains("rolled back: vk check: &lt;i&gt;failed&lt;/i&gt;</td>"),
+        "{}",
+        page.body
+    );
 }

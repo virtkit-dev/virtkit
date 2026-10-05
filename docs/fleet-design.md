@@ -373,12 +373,13 @@ model, commands and process handling.
   any bytes, but not a signature it has no key for.
 - Proposed: runner authentication tokens stay on their nodes, and the hub's GitLab
   credential is a separate one, scoped to managing runners (pause, resume, list).
-- Hub roles: viewer; operator (ceilings, stopping acquisition, drain and quarantine; reset
-  and rollouts proposed); admin (enrollment, and the proposed redeploy). Proposed: BMC
+- Hub roles: viewer; operator (ceilings, stopping acquisition, drain and quarantine,
+  pausing, resuming and aborting rollouts; reset proposed); admin (enrollment, releases,
+  starting a rollout, and the proposed redeploy). Proposed: BMC
   credentials are held apart and used only by redeploys. Admin is the admin socket's:
   whoever runs as the hub's user or root, who also issues the web UI's sign-in links; a web
-  UI session is a viewer or an operator: an operator steers a node from its page, and a
-  viewer only looks.
+  UI session is a viewer or an operator: an operator steers a node from its page and a
+  rollout from the operations page, and a viewer only looks.
 - The web UI and the node endpoint are separate listeners with separate authentication.
   Every UI response carries `Content-Security-Policy: default-src 'self'; script-src 'self';
   style-src 'self'; connect-src 'self'; img-src 'self'; object-src 'none'; base-uri 'none';

@@ -26,8 +26,9 @@ The prototype provides, all experimentally:
 - on the hub, rollouts of a release by wave, with a canary per hardware profile (`vk-hub
   rollout`);
 - `vk-hub workloads`: each node's VMs;
-- live nodes and node detail pages, steering from a node's page, and an audit log, with
-  sign-in links from `vk-hub ui login`.
+- live nodes, node detail and operations pages, steering from a node's page, pausing,
+  resuming and aborting rollouts from the operations page, and an audit log, with sign-in
+  links from `vk-hub ui login`.
 
 Resets, restart and redeploy are not built.
 
@@ -511,18 +512,33 @@ offer no actions and reject steering posts. Viewers have no actions. Removing a 
 on the admin socket. A page is refused to a request whose `Sec-Fetch-Site` is `same-site` or
 `cross-site`.
 
-The nodes table and a node's page stay live over server-sent events. The hub notes every
-heartbeat, report, session, command outcome and desired-state change, by node. The nodes table
-is the same for everyone, so one task renders it on a change and every nodes page is sent that
-one rendering; a node's page is woken by changes to that node alone. A fragment is rendered at
-most once a second, and every heartbeat interval regardless — a node going quiet sends nothing
-— and sent only when it differs. Ages on the pages move in steps of a heartbeat, so a fleet
-with nothing new to report sends nothing but a keep-alive comment every 15 seconds, and a node
-reporting faster than that changes nothing about the rate. When its session ends, a stream
-sends a fragment saying so and a `close` event, on which htmx's SSE extension (`sse-close`)
-stops reconnecting; a page asking for a stream with the cookie of a session that has ended is
-answered the same, rather than refused into retrying. A stream whose browser stops reading is
-given up on, and its connection dropped.
+The nodes table and `vk-hub nodes` show an update under way beside the node's state —
+`maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a
+node's page shows the update's release, phase and what the node said of it, and the sha256 of
+the `vk` it runs. `/operations` lists the releases the hub holds, signed or not, and its ten
+latest rollouts with their state, counts, current wave, and each node's status and profile
+by wave. Operators can pause, resume and abort active rollouts. These actions post to
+`/rollout/<id>/action` with the node actions' origin, CSRF and role checks, and run the admin
+socket's operation as the session's principal. Invalid state transitions return 409. The
+shared fragment carries no session token: the surrounding page supplies its session's CSRF
+token through `hx-headers`, as JSON that htmx parses without evaluating. The buttons require
+htmx; `vk-hub rollout pause|resume|abort` works without it. Adding a release from a file on
+the hub's host and starting a rollout remain on the admin socket.
+
+The nodes table, a node's page and `/operations` stay live over server-sent events. The hub
+notes every heartbeat, report, session, command outcome and desired-state change, by node, and
+every release added or removed and rollout step. The nodes table is the same for everyone, so
+one task renders it on a change and every nodes page is sent that one rendering; `/operations`
+likewise, once for every viewer's page and once for every operator's. A node's page is woken
+by changes to that node alone. A fragment is rendered at most once a second, and every
+heartbeat interval regardless — a node going quiet sends nothing — and sent only when it
+differs. Ages on the pages move in steps of a heartbeat, so a fleet with nothing new to report
+sends nothing but a keep-alive comment every 15 seconds, and a node reporting faster than that
+changes nothing about the rate. When its session ends, a stream sends a fragment saying so and
+a `close` event, on which htmx's SSE extension (`sse-close`) stops reconnecting; a page asking
+for a stream with the cookie of a session that has ended is answered the same, rather than
+refused into retrying. A stream whose browser stops reading is given up on, and its connection
+dropped.
 
 Streams hold connections — the listener speaks HTTP/1.1 only, HTTP/2 not being in the build —
 so at most 96 of its 128 are streams and at most 4 belong to one session — below the six a
@@ -568,8 +584,9 @@ instead (see [Local mode](#local-mode)).
 Every state-changing request is a `POST` from the UI's own origin — its `Origin`, or
 `Sec-Fetch-Site: same-origin` — carrying a CSRF token derived from the session's secret, and
 is done as the session's principal, `ui session <id> (<role>)`, which is what the audit log
-records. On a fleet hub they are signing out and a node's steering actions. Issuing a link,
-signing in and out, and ending sessions are audited too.
+records. On a fleet hub they are signing out, a node's steering actions and a rollout's
+pause, resume and abort. Issuing a link, signing in and out, and ending sessions are audited
+too.
 
 ## Local mode
 

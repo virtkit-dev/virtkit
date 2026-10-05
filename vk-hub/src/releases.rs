@@ -166,6 +166,7 @@ pub fn add(
     // A file with no row is harmless — nothing serves it — and the next add of the same
     // bytes replaces it.
     hub.db.add_release(&sha256, &row, actor)?;
+    hub.touch();
     eprintln!(
         "vk-hub: {actor} added release {} as vk {version}",
         crate::store::short(&sha256)
@@ -178,6 +179,7 @@ pub fn remove(hub: &Hub, actor: &str, sha256: &str) -> Result<bool> {
     let _held = hub.releases_lock();
     let removed = hub.db.remove_release(sha256, actor, crate::now_secs())?;
     if removed {
+        hub.touch();
         let file = path(hub.releases_dir()?, sha256);
         match std::fs::remove_file(&file) {
             Ok(()) => {}

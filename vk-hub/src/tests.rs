@@ -2222,6 +2222,54 @@ fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
     assert_eq!(ago(10_000, 10_000 - 7300), Duration::from_secs(7200));
 }
 
+/// STATE says how far an update under way has got, and that the last one was rolled back;
+/// one done or given up before the switch adds nothing.
+#[test]
+fn the_nodes_table_shows_an_update_under_way_and_one_rolled_back() {
+    use vk_hub_proto::{NodeState, Report, UpdatePhase, UpdateProgress};
+    let node = |phase| ops::NodeView {
+        id: "a".repeat(32),
+        hostname: "ci-1".into(),
+        protocol: Some(vk_hub_proto::STEERING),
+        report: Some(Report {
+            state: Some(NodeState::Maintenance),
+            update: Some(UpdateProgress {
+                command: "c1".repeat(16),
+                version: "0.85.0".into(),
+                sha256: "ab".repeat(32),
+                phase,
+                message: Some("vk check failed".into()),
+            }),
+            ..Report::default()
+        }),
+        ..ops::NodeView::default()
+    };
+    for (phase, want) in [
+        (
+            UpdatePhase::Draining,
+            "maintenance, updating to 0.85.0: draining",
+        ),
+        (
+            UpdatePhase::Downloading,
+            "maintenance, updating to 0.85.0: downloading",
+        ),
+        (
+            UpdatePhase::Validating,
+            "maintenance, updating to 0.85.0: validating",
+        ),
+        (
+            UpdatePhase::RolledBack,
+            "maintenance, update to 0.85.0 rolled back",
+        ),
+        (UpdatePhase::Done, "maintenance"),
+        (UpdatePhase::Failed, "maintenance"),
+    ] {
+        let table = render_nodes(&[node(phase)], 1000);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(cell(lines[0], lines[1], "STATE"), want, "{table}");
+    }
+}
+
 #[test]
 fn a_ceiling_is_a_positive_number_or_none() {
     assert_eq!(parse_ceiling("none"), Ok(Ceiling(None)));

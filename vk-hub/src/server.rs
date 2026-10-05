@@ -105,6 +105,9 @@ pub struct Hub {
     /// The same, for one node: what that node's page follows. An entry exists while someone
     /// follows it.
     node_changes: Mutex<HashMap<String, watch::Sender<u64>>>,
+    /// Bumped by [`Hub::touch`] alone, for pages that show nothing of a node's report or
+    /// heartbeat.
+    touched: watch::Sender<u64>,
     /// Bumped when a web UI session ends.
     sessions: watch::Sender<u64>,
 }
@@ -149,6 +152,7 @@ impl Hub {
             releases_lock: Mutex::new(()),
             changes: watch::Sender::new(0),
             node_changes: Mutex::new(HashMap::new()),
+            touched: watch::Sender::new(0),
             sessions: watch::Sender::new(0),
         }
     }
@@ -170,10 +174,16 @@ impl Hub {
         }
     }
 
-    /// Note that something a page shows beyond one node's row may have changed: a rollout, or
-    /// in local mode the VMs listed.
+    /// Note that something a page shows beyond one node's row may have changed: a release, a
+    /// rollout, or in local mode the VMs listed.
     pub(crate) fn touch(&self) {
         self.changes.send_modify(|n| *n = n.wrapping_add(1));
+        self.touched.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Wake on the next [`Hub::touch`] only.
+    pub(crate) fn subscribe_touched(&self) -> watch::Receiver<u64> {
+        self.touched.subscribe()
     }
 
     /// Wake on the next [`Hub::changed`] of any node, or [`Hub::touch`].

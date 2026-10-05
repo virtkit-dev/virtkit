@@ -1,7 +1,8 @@
 //! The fleet site for `vk-hub serve`: the nodes table, per-node inventory, load, workloads,
-//! steering, commands and audit log. Operators steer nodes through the shared admin-socket
-//! operations ([`crate::ops`]) as their session's principal. Monitoring-only nodes have no
-//! steering controls.
+//! steering, commands, releases and rollouts, and the audit log. Operators steer nodes and
+//! pause, resume or abort rollouts through the shared admin-socket operations ([`crate::ops`])
+//! as their session's principal. Monitoring-only nodes have no steering controls. Adding a
+//! release and starting a rollout stay on the admin socket.
 
 use std::sync::Arc;
 
@@ -21,22 +22,42 @@ use super::pages::{
 use super::sse::{self, Source};
 use super::{Auth, Body, Ui, actions, blocking, decode_form, field, message, page};
 use crate::ops::{self, NodeView};
+use crate::rollout::{NodeStatus, Rollout, RolloutAction, RolloutState};
 use crate::server::{HEARTBEAT, Hub};
-use crate::store::{CommandRow, MonitoringOnly, NodeRow, NotEnrolled, Role};
+use crate::store::{
+    CommandRow, MonitoringOnly, NodeRow, NotEnrolled, Release, Role, RolloutConflict,
+};
 
 /// A node page's latest commands.
 const NODE_COMMANDS: usize = 20;
 
-/// What the fleet's pages keep: the nodes table, rendered once for every page listing it
-/// ([`sse::feed`]).
+/// The rollouts `/operations` shows, newest first.
+const OPERATIONS_ROLLOUTS: usize = 10;
+
+/// What the fleet's pages keep: the nodes table, and `/operations`' fragment once for every
+/// viewer's page and once for every operator's, each rendered once for every page showing it
+/// ([`sse::feed`]). `/operations` shows only releases and rollouts, so it follows
+/// [`Hub::touch`] alone, not every node's heartbeat.
 pub(super) struct FleetSite {
     nodes_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+    operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+    steered_operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
 }
 
 impl FleetSite {
     pub(super) fn new(hub: &Arc<Hub>) -> Self {
         FleetSite {
             nodes_feed: sse::feed(hub.subscribe(), "nodes", render_nodes(hub.clone())),
+            operations_feed: sse::feed(
+                hub.subscribe_touched(),
+                "operations",
+                render_operations(hub.clone(), false),
+            ),
+            steered_operations_feed: sse::feed(
+                hub.subscribe_touched(),
+                "operations",
+                render_operations(hub.clone(), true),
+            ),
         }
     }
 }
@@ -45,6 +66,7 @@ impl FleetSite {
 pub(super) fn event_name(event: &str) -> Option<&'static str> {
     match event {
         "nodes" => Some("nodes"),
+        "operations" => Some("operations"),
         _ => event
             .strip_prefix("node/")
             .filter(|id| vk_hub_proto::valid_id(id))
@@ -52,14 +74,30 @@ pub(super) fn event_name(event: &str) -> Option<&'static str> {
     }
 }
 
-/// What `/events/<event>` streams, if it is one of the fleet's.
-pub(super) fn source(event: &str, hub: &Arc<Hub>, site: &FleetSite) -> Option<Source> {
-    if event == "nodes" {
-        return Some(Source::Shared {
-            name: "nodes",
-            feed: site.nodes_feed.subscribe(),
-            render: render_nodes(hub.clone()),
-        });
+/// What `/events/<event>` streams, if it is one of the fleet's, for a page whose session may
+/// `steer`: an operator's `/operations` carries the rollouts' buttons.
+pub(super) fn source(event: &str, hub: &Arc<Hub>, site: &FleetSite, steer: bool) -> Option<Source> {
+    match event {
+        "nodes" => {
+            return Some(Source::Shared {
+                name: "nodes",
+                feed: site.nodes_feed.subscribe(),
+                render: render_nodes(hub.clone()),
+            });
+        }
+        "operations" => {
+            let feed = if steer {
+                &site.steered_operations_feed
+            } else {
+                &site.operations_feed
+            };
+            return Some(Source::Shared {
+                name: "operations",
+                feed: feed.subscribe(),
+                render: render_operations(hub.clone(), steer),
+            });
+        }
+        _ => {}
     }
     let id = event
         .strip_prefix("node/")
@@ -85,6 +123,10 @@ pub(super) async fn get(
     if path == "/" {
         let views = blocking(move || crate::ops::node_views(&hub)).await?;
         return Ok(Some(page(nodes(auth, &views, now))));
+    }
+    if path == "/operations" {
+        let ops = blocking(move || read_operations(&hub)).await?;
+        return Ok(Some(page(operations(auth, &ops, now))));
     }
     if path == "/audit" {
         let query = decode_form(query.unwrap_or("").as_bytes());
@@ -121,6 +163,32 @@ fn render_nodes(hub: Arc<Hub>) -> sse::Render {
         let nodes = crate::ops::node_views(&hub)?;
         Ok(nodes_table(&nodes, crate::now_secs()).into_string())
     })
+}
+
+/// `/operations`' fragment, as one rendering for every page showing it: with the rollouts'
+/// buttons for an operator's, without for a viewer's.
+fn render_operations(hub: Arc<Hub>, steer: bool) -> sse::Render {
+    Arc::new(move || {
+        let ops = read_operations(&hub)?;
+        Ok(operations_fragment(&ops, steer, crate::now_secs()).into_string())
+    })
+}
+
+/// What `/operations` shows.
+fn read_operations(hub: &Hub) -> Result<Operations> {
+    let mut rollouts = ops::rollouts(hub)?;
+    rollouts.truncate(OPERATIONS_ROLLOUTS);
+    Ok(Operations {
+        releases: hub.db.releases()?,
+        rollouts,
+    })
+}
+
+/// What `/operations` shows.
+struct Operations {
+    releases: Vec<Release>,
+    /// The latest, newest first.
+    rollouts: Vec<Rollout>,
 }
 
 /// Node `id`'s page fragment, or the line saying it has gone.
@@ -278,11 +346,91 @@ pub(super) async fn node_action(
         );
         return Ok(resp);
     }
+    Ok(said_so(&said))
+}
+
+/// For htmx, `said` in the flash, swapped in on its own: the live fragment follows the change.
+fn said_so(said: &str) -> Response<Body> {
     let mut h = Html::new();
     h.raw("<div id=\"flash\" hx-swap-oob=\"true\">")
         .text(said)
         .raw("</div>");
-    Ok(actions::swap_none(super::html_response(StatusCode::OK, h)))
+    actions::swap_none(super::html_response(StatusCode::OK, h))
+}
+
+/// `/rollout/<id>/action`'s rollout, if `path` is that for a well-formed ID.
+pub(super) fn action_rollout(path: &str) -> Option<&str> {
+    path.strip_prefix("/rollout/")?
+        .strip_suffix("/action")
+        .filter(|id| vk_hub_proto::valid_id(id))
+}
+
+/// `POST /rollout/<id>/action`: pause, resume or abort as the operator session's principal,
+/// using the admin socket's operation. Like node actions, return a status message for htmx
+/// or redirect to `/operations`.
+pub(super) async fn rollout_action(
+    req: Request<Incoming>,
+    ui: &Ui,
+    id: &str,
+) -> Result<Response<Body>> {
+    let htmx = req.headers().contains_key("hx-request");
+    let (auth, form) = match super::check_post(req, ui, Role::Operator).await? {
+        Ok(checked) => checked,
+        Err((status, text)) => return Ok(actions::refused(htmx, status, text)),
+    };
+    let action = match field(&form, "op") {
+        Some("pause") => RolloutAction::Pause,
+        Some("resume") => RolloutAction::Resume,
+        Some("abort") => RolloutAction::Abort,
+        _ => {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::BAD_REQUEST,
+                "No such action.",
+            ));
+        }
+    };
+    let principal = auth.session.principal();
+    let hub = ui.hub.clone();
+    let rollout = id.to_string();
+    let done = blocking(move || {
+        // The full ID, as the page names it: a prefix is the CLI's convenience.
+        if hub.db.rollout(&rollout)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(ops::steer_rollout(&hub, &principal, &rollout, action)))
+    })
+    .await?;
+    let said = match done {
+        None => {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::NOT_FOUND,
+                "There is no such rollout.",
+            ));
+        }
+        Some(Ok(r)) => format!(
+            "Rollout {} is {}.",
+            crate::rollout::short_id(&r.id),
+            r.row.state.name()
+        ),
+        Some(Err(e)) if e.is::<RolloutConflict>() => {
+            return Ok(actions::refused(
+                htmx,
+                StatusCode::CONFLICT,
+                &format!("Refused: {e:#}."),
+            ));
+        }
+        Some(Err(e)) => return Err(e),
+    };
+    if !htmx {
+        let mut resp = Response::new(Body::default());
+        *resp.status_mut() = StatusCode::SEE_OTHER;
+        resp.headers_mut()
+            .insert(header::LOCATION, HeaderValue::from_static("/operations"));
+        return Ok(resp);
+    }
+    Ok(said_so(&said))
 }
 
 /// The page around `main`, with the fleet's navigation.
@@ -291,7 +439,8 @@ fn layout(title: &str, auth: &Auth, main: &Html) -> Html {
 }
 
 /// The fleet's navigation.
-pub(super) const NAV: &str = "<a href=\"/\">nodes</a> <a href=\"/audit\">audit</a>";
+pub(super) const NAV: &str =
+    "<a href=\"/\">nodes</a> <a href=\"/operations\">operations</a> <a href=\"/audit\">audit</a>";
 
 /// `/`: the nodes table.
 fn nodes(auth: &Auth, nodes: &[NodeView], now: u64) -> Html {
@@ -307,6 +456,7 @@ fn nodes(auth: &Auth, nodes: &[NodeView], now: u64) -> Html {
 // workloads; checked against the columns' names, so a reordering fails to build.
 const NODE_ID: usize = 0;
 const NODE_NAME: usize = 1;
+const NODE_STATE: usize = 3;
 const NODE_SYNC: usize = 7;
 const NODE_LAST_SEEN: usize = 8;
 const NODE_VK: usize = 9;
@@ -319,7 +469,7 @@ const VM_STARTED: usize = 7;
 const _: () = {
     let nodes = &crate::NODE_COLUMNS;
     assert!(column_is(nodes, NODE_ID, "ID") && column_is(nodes, NODE_NAME, "NAME"));
-    assert!(column_is(nodes, NODE_SYNC, "SYNC"));
+    assert!(column_is(nodes, NODE_STATE, "STATE") && column_is(nodes, NODE_SYNC, "SYNC"));
     assert!(column_is(nodes, NODE_LAST_SEEN, "LAST SEEN") && column_is(nodes, NODE_VK, "VK"));
     let vms = &crate::workloads::COLUMNS;
     assert!(column_is(vms, VM_KIND, "KIND") && column_is(vms, VM_ID, "ID"));
@@ -383,8 +533,8 @@ fn nodes_table(nodes: &[NodeView], now: u64) -> Html {
                     }
                     h.raw("</a>");
                 }
-                // What the node sent: its version.
-                NODE_VK => {
+                // What the node sent: its version, and the one it is updating to.
+                NODE_STATE | NODE_VK => {
                     h.node(cell);
                 }
                 _ => {
@@ -603,6 +753,11 @@ fn node_detail(d: &NodeDetail, now: u64) -> Html {
         kv_node(&mut h, "vk", &inv.versions.vk);
         kv_node(
             &mut h,
+            "vk sha256",
+            inv.versions.vk_sha256.as_deref().unwrap_or("-"),
+        );
+        kv_node(
+            &mut h,
             "guest kernel",
             inv.versions.guest_kernel.as_deref().unwrap_or("-"),
         );
@@ -739,6 +894,18 @@ fn steering(h: &mut Html, d: &NodeDetail, now: u64) {
             if let Some(e) = &r.concurrency_error {
                 kv_node(h, "cannot set its concurrency", e);
             }
+            if let Some(u) = &r.update {
+                h.raw("<tr><th>update</th><td>vk ")
+                    .node(&u.version)
+                    .raw(" (<code>")
+                    .node(crate::store::short(&u.sha256))
+                    .raw("</code>): ")
+                    .raw(crate::store::update_phase_name(u.phase));
+                if let Some(message) = &u.message {
+                    h.raw(": ").node(message);
+                }
+                h.raw("</td></tr>");
+            }
         }
     }
     end_section(h);
@@ -829,4 +996,186 @@ fn workloads(h: &mut Html, workloads: Option<&crate::store::Workloads>) {
             .raw(" more running, not listed</p>");
     }
     h.raw("</section>");
+}
+
+/// `/operations`: the releases the hub holds and its latest rollouts, kept live.
+///
+/// The live fragment is rendered once for every viewer and once for every operator
+/// ([`sse::feed`]), so it carries no session's CSRF token: an operator's page sets it around
+/// the fragment as a header on every htmx request from inside it (`hx-headers`), which is how
+/// the rollouts' buttons post. Those buttons need htmx; `vk-hub rollout pause|resume|abort`
+/// does the same without it.
+fn operations(auth: &Auth, ops: &Operations, now: u64) -> Html {
+    let steer = auth.session.role >= Role::Operator;
+    let mut main = Html::new();
+    main.raw("<h1>Operations</h1>");
+    if steer {
+        // The hub derives the hex token; htmx parses the header's JSON without evaluating it.
+        main.raw("<div id=\"flash\"></div><div hx-headers=\"{&quot;X-CSRF-Token&quot;:&quot;")
+            .text(&auth.csrf)
+            .raw("&quot;}\">");
+    }
+    main.raw("<div id=\"operations\" hx-ext=\"sse\" sse-connect=\"/events/operations\" ")
+        .raw("sse-swap=\"operations\" sse-close=\"close\">")
+        .html(&operations_fragment(ops, steer, now))
+        .raw("</div>");
+    if steer {
+        main.raw("</div>");
+    }
+    layout("operations", auth, &main)
+}
+
+/// `/operations`' live part. With `steer`, each rollout still under way carries the buttons
+/// that steer it.
+fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
+    let mut h = Html::new();
+    h.raw("<section><h2>Releases</h2>");
+    if ops.releases.is_empty() {
+        h.raw("<p class=\"empty\">none: <code>vk-hub release add</code> copies a vk binary ")
+            .raw("into the hub</p>");
+    } else {
+        h.raw("<table class=\"grid\"><thead><tr><th>sha256</th><th>version</th>")
+            .raw("<th>size</th><th>signed</th><th>added</th><th>by</th></tr></thead><tbody>");
+        for r in &ops.releases {
+            h.raw("<tr><td><code title=\"")
+                .text(&r.sha256)
+                .raw("\">")
+                .text(crate::store::short(&r.sha256))
+                .raw("</code></td><td>")
+                .text(&r.row.version)
+                .raw("</td><td>")
+                .text(bytes(r.row.size))
+                .raw("</td><td>")
+                .raw(if r.row.signature.is_some() {
+                    "yes"
+                } else {
+                    "no"
+                })
+                .raw("</td><td>")
+                .text(started(r.row.added_at))
+                .raw("</td><td>")
+                .text(&r.row.added_by)
+                .raw("</td></tr>");
+        }
+        h.raw("</tbody></table>");
+    }
+    h.raw("</section><section><h2>Rollouts</h2>");
+    if ops.rollouts.is_empty() {
+        h.raw("<p class=\"empty\">none yet: <code>vk-hub rollout create</code> starts one</p>");
+    }
+    for r in &ops.rollouts {
+        rollout(&mut h, r, steer, now);
+    }
+    h.raw("</section>");
+    h
+}
+
+/// One rollout: what it updates to and how, its state, and each node by wave.
+fn rollout(h: &mut Html, r: &Rollout, steer: bool, now: u64) {
+    let row = &r.row;
+    h.raw("<div class=\"rollout\"><h3><code>")
+        .text(crate::rollout::short_id(&r.id))
+        .raw("</code> vk ")
+        .text(&row.version)
+        .raw(" <span class=\"state ")
+        .raw(row.state.name())
+        .raw("\">")
+        .raw(row.state.name())
+        .raw("</span></h3><p class=\"sub\">");
+    let counts: Vec<String> = r
+        .counts()
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(name, n)| format!("{n} {name}"))
+        .collect();
+    h.text(counts.join(", "));
+    if let Some(wave) = r.wave().filter(|_| row.state.active()) {
+        h.raw(" · wave ").text(wave);
+    }
+    h.raw(" · release <code>")
+        .text(crate::store::short(&row.release))
+        .raw("</code> · batches of ")
+        .text(row.batch)
+        .raw(if row.canary_per_profile {
+            " after a canary per profile"
+        } else {
+            ""
+        })
+        .raw(" · ")
+        .text(row.failures)
+        .raw(" of at most ")
+        .text(row.max_failures)
+        .raw(" failure(s) · started ")
+        .text(started(row.created_at))
+        .raw(" by ")
+        .text(&row.created_by)
+        .raw("</p>");
+    if let RolloutState::Paused { reason } | RolloutState::Aborted { reason } = &row.state {
+        // A failure's reason quotes what a node said.
+        h.raw("<p class=\"reason\">").node(reason).raw("</p>");
+    }
+    if steer && row.state.active() {
+        h.raw("<div class=\"actions\">");
+        let ops: [(&str, &str); 2] = match row.state {
+            RolloutState::Running => [("pause", "pause"), ("abort", "abort")],
+            _ => [("resume", "resume"), ("abort", "abort")],
+        };
+        let path = format!("/rollout/{}/action", r.id);
+        for (op, label) in ops {
+            // The ID is one the hub issued, and the router takes only hex for one. No CSRF
+            // field: the page around the fragment sets the token as a header.
+            h.raw("<form method=\"post\" action=\"")
+                .text(&path)
+                .raw("\" hx-post=\"")
+                .text(&path)
+                .raw("\" hx-swap=\"none\"><input type=\"hidden\" name=\"op\" value=\"")
+                .raw(op)
+                .raw("\"><button>")
+                .raw(label)
+                .raw("</button></form>");
+        }
+        h.raw("</div>");
+    }
+    h.raw("<table class=\"grid\"><thead><tr><th>wave</th><th>node</th><th>status</th>")
+        .raw("<th>profile</th></tr></thead><tbody>");
+    for n in &row.nodes {
+        h.raw("<tr class=\"")
+            .raw(n.status.name())
+            .raw("\"><td>")
+            .text(n.wave)
+            .raw("</td><td>");
+        if vk_hub_proto::valid_id(&n.id) {
+            h.raw("<a href=\"/node/")
+                .text(&n.id)
+                .raw("\">")
+                .node(&n.hostname)
+                .raw("</a>");
+        } else {
+            h.node(&n.hostname);
+        }
+        h.raw("</td><td>");
+        match &n.status {
+            NodeStatus::Pending => {
+                h.raw("pending");
+            }
+            NodeStatus::Skipped { reason } => {
+                h.raw("skipped: ").node(reason);
+            }
+            NodeStatus::Updating { command, since, .. } => {
+                h.raw("updating, issued ")
+                    .text(age(now, *since))
+                    .raw(" (command <code>")
+                    .text(command)
+                    .raw("</code>)");
+            }
+            NodeStatus::Succeeded { at } => {
+                h.raw("succeeded ").text(started(*at));
+            }
+            NodeStatus::Failed { reason, .. } => {
+                h.raw("failed: ").node(reason);
+            }
+        }
+        h.raw("</td><td>").node(&n.profile).raw("</td></tr>");
+    }
+    h.raw("</tbody></table></div>");
 }

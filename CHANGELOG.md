@@ -67,6 +67,11 @@ All notable changes to virtkit will be documented in this file.
   a restarted hub carries on where it stopped. A host gets `--drain-timeout` to drain and
   `--node-timeout` to update after that. Hosts with an external runner are left out unless
   `--force`, and hosts on 0.84.0 or earlier are left out.
+- **Experimental: the `vk-hub` web UI shows releases and rollouts.** An operations page lists
+  the releases the hub holds and each rollout's progress, host by host, as it goes; an
+  operator can pause, resume and abort a rollout there. The nodes table, in the UI and in
+  `vk-hub nodes`, shows a host updating and a host whose last update was rolled back, and a
+  host's page shows its update and the sha256 of the `vk` it runs.
 - **`vk tune` stands aside on a fleet node** while `vk node run` is up, and otherwise honours
   the ceiling the node last received.
 
