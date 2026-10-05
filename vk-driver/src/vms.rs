@@ -2397,12 +2397,9 @@ PUBLISHED     -
         let mut e = compose_entry();
         e.nested = Some(false);
         // A VMM the run named but whose pid it did not record prints bare.
-        e.vmm = Some("cloud-hypervisor".into());
+        e.vmm = Some("libkrun".into());
         let text = detail(&e, None, &[], Freshness::Fresh, true, None);
-        assert!(
-            text.contains("\nVMM           cloud-hypervisor\n"),
-            "{text}"
-        );
+        assert!(text.contains("\nVMM           libkrun\n"), "{text}");
         assert!(text.contains("\nNESTED        no\n"), "{text}");
         assert!(text.contains("\nSTALE         no\n"), "{text}");
     }
