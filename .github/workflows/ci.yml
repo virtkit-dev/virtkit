@@ -17,6 +17,9 @@ name: CI
 # The kernel is built (and embedded into vk) when the workflow is triggered
 # manually (workflow_dispatch), for testing kernel config changes without cutting
 # a release.
+#
+# fleet-e2e then runs the fleet's end-to-end tests (tests/fleet-*.sh) against that
+# build: a hub and its nodes booted as microVMs on the runner's KVM.
 
 on:
   push:
@@ -41,3 +44,62 @@ jobs:
       build-kernel: ${{ github.event_name == 'workflow_dispatch' }}
       release-kernel: true
       retention-days: 1
+
+  # The scripts also run before every release, with the rest of tests/ (release.yml).
+  fleet-e2e:
+    needs: [build]
+    runs-on: ubuntu-latest
+    # Above the scripts' caps and cleanups combined (3 × (900 + 120 + 60)s), so the loop
+    # always ends and reports.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ci-binaries-${{ github.sha }}
+          path: dist
+
+      - name: Enable KVM for the runner user
+        uses: ./.github/actions/enable-kvm
+
+      # An artifact keeps no permission bits. Every script runs, each capped, and the job
+      # fails if any did — or skipped for want of KVM or nesting (E2E_REQUIRE_KVM). The
+      # cap's grace period lets a script's own teardown run; what a killed script still
+      # leaves behind is stopped before the next one starts.
+      - name: Run the fleet end-to-end tests against the built vk
+        env:
+          E2E_REQUIRE_KVM: 1
+        run: |
+          chmod +x dist/vk dist/vk-hub
+          df -h /
+          free -m
+          failed=0
+          for t in tests/fleet-*.sh; do
+            echo "::group::$t"
+            start=$SECONDS
+            VK=dist/vk timeout -k 120 900 bash "$t" || { echo "::error::$t failed"; failed=1; }
+            echo "$t: $((SECONDS - start))s"
+            timeout -k 10 60 dist/vk stop --all || true
+            pkill -f "^$PWD/dist/vk node run\$" || true
+            echo "::endgroup::"
+          done
+          exit "$failed"
+
+      # Clean up after cancellation or timeout bypasses the loop's cleanup.
+      - name: Stop leftover VMs
+        if: always()
+        run: |
+          [ -x dist/vk ] || exit 0
+          dist/vk list || true
+          pkill -f "^$PWD/dist/vk node run\$" || true
+          dist/vk stop --all
+
+      # Report disk and memory use by the fleet's VMs and images to help diagnose
+      # otherwise opaque ENOSPC or OOM test failures.
+      - name: Free space and memory after the tests
+        if: always()
+        run: |
+          df -h /
+          free -m

@@ -11,7 +11,8 @@
 # Source it, then call fleet_up; everything is torn down on exit.
 #
 # Env: VK (default ./dist/vk) and VK_HUB (default: the vk-hub beside VK), the binaries under
-# test; IMAGE, the node services' base image (tests/fleet/node/Dockerfile otherwise).
+# test; IMAGE, the node services' base image (tests/fleet/node/Dockerfile otherwise);
+# E2E_REQUIRE_KVM=1 fails, rather than skips, on a host without KVM or nesting.
 # Needs: KVM with nesting, openssl, and a registry to pull alpine.
 
 FLEET_LIB=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -23,9 +24,14 @@ VK=$(cd "$(dirname "$VK")" && pwd)/$(basename "$VK")
 VK_HUB=${VK_HUB:-$(dirname "$VK")/vk-hub}
 [ -x "$VK_HUB" ] || { echo "no usable vk-hub at $VK_HUB (set VK_HUB)"; exit 2; }
 VK_HUB=$(cd "$(dirname "$VK_HUB")" && pwd)/$(basename "$VK_HUB")
-[ -r /dev/kvm ] && [ -w /dev/kvm ] || { echo "SKIP: no writable /dev/kvm"; exit 0; }
+no_kvm() {
+  [ "${E2E_REQUIRE_KVM:-}" = 1 ] && { echo "FAIL: $1 (E2E_REQUIRE_KVM=1)"; exit 1; }
+  echo "SKIP: $1"
+  exit 0
+}
+[ -r /dev/kvm ] && [ -w /dev/kvm ] || no_kvm "no writable /dev/kvm"
 grep -qsx '[Y1]' /sys/module/kvm_intel/parameters/nested /sys/module/kvm_amd/parameters/nested ||
-  { echo "SKIP: nested virtualization is off"; exit 0; }
+  no_kvm "nested virtualization is off"
 command -v openssl >/dev/null || { echo "fleet: need openssl, for the hub's certificate"; exit 2; }
 
 FLEET=$(mktemp -d "${TMPDIR:-/tmp}/vk-fleet.XXXXXX")

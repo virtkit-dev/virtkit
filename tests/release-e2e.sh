@@ -43,6 +43,9 @@ VK=$(command -v "$asked" || true)
 VK=$(cd "$(dirname "$VK")" && pwd)/$(basename "$VK")
 export VK
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || { echo "release-e2e: no rw access to /dev/kvm" >&2; exit 2; }
+# Fail tests that need unavailable KVM features (nesting): a skipped test cannot
+# validate a release.
+export E2E_REQUIRE_KVM=1
 command -v e2fsck >/dev/null || { echo "release-e2e: need e2fsck (e2fsprogs)" >&2; exit 2; }
 
 echo "release-e2e: testing $VK"
