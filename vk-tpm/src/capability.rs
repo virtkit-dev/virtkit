@@ -13,6 +13,7 @@ use crate::entity::{
     TPM_RH_OWNER, TPM_RH_PLATFORM, TPM_RH_PLATFORM_NV, TPM_RS_PW, handle_type,
 };
 use crate::marshal::{Reader, Writer};
+use crate::object::MAX_OBJECTS;
 use crate::pcr::{self, PCR_COUNT};
 use crate::rc::{Rc, Result};
 use crate::{MAX_COMMAND_SIZE, Out, Tpm};
@@ -86,11 +87,11 @@ pub fn get_capability(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> 
                     .filter_map(|p| u32::try_from(p).ok())
                     .collect(),
                 TPM_HT_PERMANENT => PERMANENT_HANDLES.to_vec(),
-                // No NV index, loaded or saved session, transient or persistent object yet.
+                TPM_HT_TRANSIENT => tpm.loaded_objects(),
+                // No NV index, loaded or saved session, or persistent object yet.
                 TPM_HT_NV_INDEX
                 | TPM_HT_HMAC_SESSION
                 | TPM_HT_POLICY_SESSION
-                | TPM_HT_TRANSIENT
                 | TPM_HT_PERSISTENT => Vec::new(),
                 _ => return Err(Rc::HANDLE.param(2)),
             };
@@ -206,6 +207,8 @@ fn properties(tpm: &Tpm) -> Vec<(u32, u32)> {
         (31, tpm.volatile.orderly_startup),
     ]);
     let commands = u32::try_from(COMMANDS.len()).unwrap_or(0);
+    let loaded = tpm.loaded_objects().len();
+    let transient_avail = u32::try_from(MAX_OBJECTS.saturating_sub(loaded)).unwrap_or(0);
     let max_command = u32::try_from(MAX_COMMAND_SIZE).unwrap_or(0);
     vec![
         (0x100, chars(b"2.0\0")), // TPM_PT_FAMILY_INDICATOR
@@ -263,7 +266,7 @@ fn properties(tpm: &Tpm) -> Vec<(u32, u32)> {
         (0x204, 3),                            // TPM_PT_HR_LOADED_AVAIL
         (0x205, 0),                            // TPM_PT_HR_ACTIVE
         (0x206, 64),                           // TPM_PT_HR_ACTIVE_AVAIL
-        (0x207, 3),                            // TPM_PT_HR_TRANSIENT_AVAIL
+        (0x207, transient_avail),              // TPM_PT_HR_TRANSIENT_AVAIL
         (0x208, 0),                            // TPM_PT_HR_PERSISTENT
         (0x209, 0x33),                         // TPM_PT_HR_PERSISTENT_AVAIL
         (0x20a, 0),                            // TPM_PT_NV_COUNTERS

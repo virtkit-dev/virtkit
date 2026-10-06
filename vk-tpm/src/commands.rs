@@ -10,7 +10,7 @@ use crate::marshal::{Reader, Writer};
 use crate::pcr::{self, Startup};
 use crate::rc::{Rc, Result};
 use crate::state::{Saved, Shutdown};
-use crate::{LOCALITY, Out, Tpm, capability, hierarchy};
+use crate::{LOCALITY, Out, Tpm, capability, hierarchy, object};
 
 pub const TPM_CC_HIERARCHY_CONTROL: u32 = 0x121;
 pub const TPM_CC_CHANGE_EPS: u32 = 0x124;
@@ -23,14 +23,20 @@ pub const TPM_CC_SET_PRIMARY_POLICY: u32 = 0x12e;
 pub const TPM_CC_DICTIONARY_ATTACK_LOCK_RESET: u32 = 0x139;
 pub const TPM_CC_DICTIONARY_ATTACK_PARAMETERS: u32 = 0x13a;
 pub const TPM_CC_PCR_EVENT: u32 = 0x13c;
+pub const TPM_CC_SEQUENCE_COMPLETE: u32 = 0x13e;
 pub const TPM_CC_PCR_RESET: u32 = 0x13d;
 pub const TPM_CC_SELF_TEST: u32 = 0x143;
 pub const TPM_CC_STARTUP: u32 = 0x144;
 pub const TPM_CC_SHUTDOWN: u32 = 0x145;
+pub const TPM_CC_SEQUENCE_UPDATE: u32 = 0x15c;
+pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x165;
 pub const TPM_CC_GET_CAPABILITY: u32 = 0x17a;
 pub const TPM_CC_GET_RANDOM: u32 = 0x17b;
+pub const TPM_CC_HASH: u32 = 0x17d;
 pub const TPM_CC_PCR_READ: u32 = 0x17e;
 pub const TPM_CC_PCR_EXTEND: u32 = 0x182;
+pub const TPM_CC_EVENT_SEQUENCE_COMPLETE: u32 = 0x185;
+pub const TPM_CC_HASH_SEQUENCE_START: u32 = 0x186;
 
 type Run = fn(&mut Tpm, &[u32], &mut Reader, &mut Out) -> Result<()>;
 
@@ -46,6 +52,10 @@ pub struct Command {
     nv: bool,
     /// TPMA_CC.extensive: it may flush many objects.
     extensive: bool,
+    /// TPMA_CC.flushed: it flushes the object it names.
+    flushed: bool,
+    /// TPMA_CC.rHandle: it returns a handle.
+    response_handle: bool,
     pub run: Run,
 }
 
@@ -58,6 +68,8 @@ impl Command {
             sessions: true,
             nv: false,
             extensive: false,
+            flushed: false,
+            response_handle: false,
             run,
         }
     }
@@ -82,6 +94,20 @@ impl Command {
         }
     }
 
+    const fn flushed(self) -> Command {
+        Command {
+            flushed: true,
+            ..self
+        }
+    }
+
+    const fn response_handle(self) -> Command {
+        Command {
+            response_handle: true,
+            ..self
+        }
+    }
+
     const fn no_sessions(self) -> Command {
         Command {
             sessions: false,
@@ -95,7 +121,9 @@ impl Command {
         (self.code & 0xffff)
             | (u32::from(self.nv) << 22)
             | (u32::from(self.extensive) << 23)
+            | (u32::from(self.flushed) << 24)
             | (handles << 25)
+            | (u32::from(self.response_handle) << 28)
     }
 }
 
@@ -152,15 +180,29 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_PCR_RESET, pcr_reset)
         .handles(&[H::Pcr(false)], 1)
         .nv(),
+    Command::new(TPM_CC_SEQUENCE_COMPLETE, object::sequence_complete)
+        .handles(&[H::Object(false)], 1)
+        .flushed(),
     Command::new(TPM_CC_SELF_TEST, self_test).nv(),
     Command::new(TPM_CC_STARTUP, startup).nv().no_sessions(),
     Command::new(TPM_CC_SHUTDOWN, shutdown).nv(),
+    Command::new(TPM_CC_SEQUENCE_UPDATE, object::sequence_update).handles(&[H::Object(false)], 1),
+    Command::new(TPM_CC_FLUSH_CONTEXT, object::flush_context).no_sessions(),
     Command::new(TPM_CC_GET_CAPABILITY, capability::get_capability),
     Command::new(TPM_CC_GET_RANDOM, get_random),
+    Command::new(TPM_CC_HASH, object::hash),
     Command::new(TPM_CC_PCR_READ, pcr_read),
     Command::new(TPM_CC_PCR_EXTEND, pcr_extend)
         .handles(&[H::Pcr(true)], 1)
         .nv(),
+    Command::new(
+        TPM_CC_EVENT_SEQUENCE_COMPLETE,
+        object::event_sequence_complete,
+    )
+    .handles(&[H::Pcr(true), H::Object(false)], 2)
+    .nv()
+    .flushed(),
+    Command::new(TPM_CC_HASH_SEQUENCE_START, object::hash_sequence_start).response_handle(),
 ];
 
 pub fn find(code: u32) -> Option<&'static Command> {
@@ -227,6 +269,7 @@ fn startup(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> 
     let allocation = &tpm.volatile.allocation;
     tpm.volatile.pcrs.startup(allocation, kind, saved_pcrs);
     tpm.volatile.pcr_reconfig = false;
+    tpm.volatile.objects.iter_mut().for_each(|o| *o = None);
     tpm.volatile.orderly_startup = orderly;
     tpm.volatile.da_used = false;
     tpm.volatile.started = true;
@@ -370,7 +413,7 @@ fn pcr_allocate(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result
 impl Tpm {
     /// The PCR an extend goes to, None for TPM_RH_NULL, checked against the locality. Extending
     /// a PCR that TPM2_Shutdown(STATE) saved voids that saved state.
-    fn pcr_to_extend(&mut self, handle: u32) -> Result<Option<usize>> {
+    pub fn pcr_to_extend(&mut self, handle: u32) -> Result<Option<usize>> {
         if handle == TPM_RH_NULL {
             return Ok(None);
         }

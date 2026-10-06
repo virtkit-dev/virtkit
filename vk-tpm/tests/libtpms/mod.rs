@@ -172,6 +172,18 @@ impl LibTpms {
         shared().running = true;
     }
 
+    /// Replace the seeds and proofs (EPS, SPS, PPS, phProof, shProof, ehProof) in the stored
+    /// permanent state, and power-cycle so the TPM uses them.
+    pub fn set_secrets(&mut self, secrets: &[[u8; 64]; 6]) {
+        self.stop();
+        {
+            let mut shared = shared();
+            let state = shared.permanent.as_mut().expect("a stored permanent state");
+            patch_secrets(state, secrets);
+        }
+        self.start();
+    }
+
     /// Power-cycle: the TPM starts again from the permanent state it stored.
     pub fn power_cycle(&mut self) {
         self.stop();
@@ -205,6 +217,33 @@ impl LibTpms {
             ffi::free(response);
             out
         }
+    }
+}
+
+/// PERSISTENT_DATA in libtpms' "permall" blob (NVMarshal.c, PERSISTENT_DATA_Marshal): a header
+/// (version, magic, min_version), disableClear, three algorithms, three policies and three
+/// authValues (TPM2Bs), then the three seeds and the three proofs, each a TPM2B of 64 bytes.
+fn patch_secrets(state: &mut [u8], secrets: &[[u8; 64]; 6]) {
+    const PERSISTENT_DATA_MAGIC: [u8; 4] = 0x1221_3443u32.to_be_bytes();
+    let magic = state
+        .windows(4)
+        .position(|w| w == PERSISTENT_DATA_MAGIC)
+        .expect("PERSISTENT_DATA in the permanent state");
+    // The magic, min_version, disableClear and the three algorithms.
+    let mut at = magic + 4 + 2 + 1 + 3 * 2;
+    let mut tpm2b = |state: &mut [u8], replace: Option<&[u8; 64]>| {
+        let size = u16::from_be_bytes([state[at], state[at + 1]]) as usize;
+        if let Some(value) = replace {
+            assert_eq!(size, value.len(), "a seed or proof of {size} bytes");
+            state[at + 2..at + 2 + size].copy_from_slice(value);
+        }
+        at += 2 + size;
+    };
+    for _ in 0..6 {
+        tpm2b(state, None); // policies and authValues
+    }
+    for secret in secrets {
+        tpm2b(state, Some(secret));
     }
 }
 

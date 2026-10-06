@@ -37,6 +37,7 @@ impl Rc {
     pub const HASH: Rc = Rc(RC_FMT1 + 0x003);
     pub const VALUE: Rc = Rc(RC_FMT1 + 0x004);
     pub const HIERARCHY: Rc = Rc(RC_FMT1 + 0x005);
+    pub const MODE: Rc = Rc(RC_FMT1 + 0x009);
     pub const TYPE: Rc = Rc(RC_FMT1 + 0x00a);
     pub const HANDLE: Rc = Rc(RC_FMT1 + 0x00b);
     pub const AUTH_FAIL: Rc = Rc(RC_FMT1 + 0x00e);

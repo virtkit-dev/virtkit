@@ -14,6 +14,7 @@ use zeroize::Zeroizing;
 use crate::alg::Hash;
 use crate::hierarchy::{ClearState, DaTimers, DictionaryAttack, Hierarchies};
 use crate::marshal::{Reader, Writer};
+use crate::object::{MAX_OBJECTS, Object};
 use crate::pcr::{self, Bank, Banks, Pcrs, Selection};
 use crate::rc::Rc;
 
@@ -210,6 +211,8 @@ pub struct Volatile {
     pub pcr_reconfig: bool,
     pub clear: ClearState,
     pub pcrs: Pcrs,
+    /// The object slots.
+    pub objects: Vec<Option<Object>>,
 }
 
 impl Volatile {
@@ -227,6 +230,7 @@ impl Volatile {
             pcr_reconfig: false,
             clear: ClearState::default(),
             pcrs: Pcrs::new(),
+            objects: empty_slots(),
         }
     }
 
@@ -249,6 +253,17 @@ impl Volatile {
             .map(|b| (b.hash, b.values.clone()))
             .collect();
         write_banks(&mut w, &banks);
+        for object in &self.objects {
+            match object {
+                Some(object) => {
+                    w.u8(1);
+                    object.write(&mut w);
+                }
+                None => {
+                    w.u8(0);
+                }
+            }
+        }
         w.into_bytes()
     }
 
@@ -279,6 +294,12 @@ impl Volatile {
             }
             *bank = Bank { hash, values };
         }
+        let mut objects = empty_slots();
+        for slot in &mut objects {
+            if read_bool(&mut r)? {
+                *slot = Some(Object::read(&mut r)?);
+            }
+        }
         expect_end(&r)?;
         Ok(Volatile {
             started,
@@ -292,8 +313,13 @@ impl Volatile {
             pcr_reconfig,
             clear,
             pcrs,
+            objects,
         })
     }
+}
+
+fn empty_slots() -> Vec<Option<Object>> {
+    std::iter::repeat_with(|| None).take(MAX_OBJECTS).collect()
 }
 
 fn expect_header(r: &mut Reader, magic: &[u8; 8]) -> Result<(), StateError> {

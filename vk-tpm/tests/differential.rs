@@ -8,6 +8,7 @@
 #![cfg(feature = "libtpms")]
 #![allow(
     clippy::unwrap_used,
+    clippy::expect_used,
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects
 )]
@@ -25,6 +26,12 @@ const GET_RANDOM: u32 = 0x17b;
 const PCR_READ: u32 = 0x17e;
 const PCR_EXTEND: u32 = 0x182;
 const PCR_ALLOCATE: u32 = 0x12b;
+const SEQUENCE_COMPLETE: u32 = 0x13e;
+const SEQUENCE_UPDATE: u32 = 0x15c;
+const FLUSH_CONTEXT: u32 = 0x165;
+const HASH: u32 = 0x17d;
+const EVENT_SEQUENCE_COMPLETE: u32 = 0x185;
+const HASH_SEQUENCE_START: u32 = 0x186;
 const PCR_EVENT: u32 = 0x13c;
 const PCR_RESET: u32 = 0x13d;
 
@@ -64,6 +71,17 @@ impl Both {
 
     fn started() -> Both {
         let mut both = Both::new();
+        both.same(&command(STARTUP, &[], None, &[0, 0]));
+        both
+    }
+
+    /// Started, with the same seeds and proofs: what derives from them (tickets, primary
+    /// keys) is the same on both.
+    fn seeded() -> Both {
+        let mut both = Both::new();
+        let secrets: [[u8; 64]; 6] = std::array::from_fn(|i| [0x11 * (i as u8 + 1); 64]);
+        both.theirs.set_secrets(&secrets);
+        both.ours.set_secrets_for_tests(&secrets);
         both.same(&command(STARTUP, &[], None, &[0, 0]));
         both
     }
@@ -761,6 +779,176 @@ fn pcr_allocate_matches() {
     both.power_cycle();
     both.same(&command(STARTUP, &[], None, &[0, 0]));
     read_all_pcrs(&mut both);
+}
+
+/// A TPM2B.
+fn tpm2b(data: &[u8]) -> Vec<u8> {
+    [&(data.len() as u16).to_be_bytes()[..], data].concat()
+}
+
+fn hash(data: &[u8], alg: u16, hierarchy: u32) -> Vec<u8> {
+    let p = [
+        tpm2b(data),
+        alg.to_be_bytes().to_vec(),
+        hierarchy.to_be_bytes().to_vec(),
+    ]
+    .concat();
+    command(HASH, &[], None, &p)
+}
+
+fn sequence_start(auth: &[u8], alg: u16) -> Vec<u8> {
+    let p = [tpm2b(auth), alg.to_be_bytes().to_vec()].concat();
+    command(HASH_SEQUENCE_START, &[], None, &p)
+}
+
+fn sequence_update(handle: u32, pw: &[u8], data: &[u8]) -> Vec<u8> {
+    with_password(SEQUENCE_UPDATE, handle, pw, &tpm2b(data))
+}
+
+fn sequence_complete(handle: u32, pw: &[u8], data: &[u8], hierarchy: u32) -> Vec<u8> {
+    let p = [tpm2b(data), hierarchy.to_be_bytes().to_vec()].concat();
+    with_password(SEQUENCE_COMPLETE, handle, pw, &p)
+}
+
+fn event_sequence_complete(pcr: u32, handle: u32, pw: &[u8], data: &[u8]) -> Vec<u8> {
+    let area = [password(b""), password(pw)].concat();
+    command(
+        EVENT_SEQUENCE_COMPLETE,
+        &[pcr, handle],
+        Some(&area),
+        &tpm2b(data),
+    )
+}
+
+const GENERATED: &[u8] = b"\xffTCG";
+
+#[test]
+fn hash_and_its_tickets_match() {
+    let mut both = Both::seeded();
+    let data = [
+        b"",
+        &b"abc"[..],
+        b"\xffTC",
+        GENERATED,
+        b"\xffTCGdata",
+        &[9; 1024],
+    ];
+    for data in data {
+        for alg in [0x04, 0x0b, 0x0c, 0x0d, 0x10, 0x12] {
+            for hierarchy in [
+                RH_OWNER,
+                RH_ENDORSEMENT,
+                RH_PLATFORM,
+                RH_NULL,
+                RH_LOCKOUT,
+                0,
+            ] {
+                both.same(&hash(data, alg, hierarchy));
+            }
+        }
+    }
+    both.same(&hash(&[0; 1025], 0x0b, RH_OWNER));
+    both.same(&command(HASH, &[], None, &[0, 1, 0, 0, 0x0b]));
+    // A disabled hierarchy still gets its ticket.
+    both.same(&hierarchy_control(RH_OWNER, RH_OWNER, 0));
+    both.same(&hash(b"abc", 0x0b, RH_OWNER));
+}
+
+#[test]
+fn hash_sequences_match() {
+    let mut both = Both::seeded();
+    // Hash sequences: tickets depend on the first block, wherever it comes from.
+    for (first, rest) in [
+        (Some(&b"abc"[..]), &b"def"[..]),
+        (Some(b"ab"), b"cdef"),
+        (Some(GENERATED), b"x"),
+        (Some(b""), GENERATED),
+        (None, GENERATED),
+        (None, b"abcd"),
+        (None, b""),
+    ] {
+        for alg in [0x04, 0x0b, 0x0d] {
+            for hierarchy in [RH_OWNER, RH_PLATFORM, RH_NULL] {
+                let r = both.same(&sequence_start(b"seq\0", alg));
+                let handle = u32::from_be_bytes(r[10..14].try_into().unwrap());
+                if let Some(first) = first {
+                    both.same(&sequence_update(handle, b"seq", first));
+                    both.same(&sequence_update(handle, b"seq", &[5; 1024]));
+                }
+                both.same(&sequence_complete(handle, b"seq", rest, hierarchy));
+                both.same(&sequence_complete(handle, b"seq", rest, hierarchy));
+            }
+        }
+    }
+    // Event sequences, into a PCR or none.
+    for pcr in [RH_NULL, 10, 17, 24] {
+        let r = both.same(&sequence_start(b"", 0x10));
+        let handle = u32::from_be_bytes(r[10..14].try_into().unwrap());
+        both.same(&sequence_update(handle, b"", b"event"));
+        both.same(&sequence_complete(handle, b"", b"", RH_OWNER));
+        both.same(&event_sequence_complete(pcr, handle, b"", b"data"));
+        both.same(&command(FLUSH_CONTEXT, &[], None, &handle.to_be_bytes()));
+    }
+    read_all_pcrs(&mut both);
+}
+
+#[test]
+fn object_slots_match() {
+    let mut both = Both::started();
+    for _ in 0..4 {
+        both.same(&sequence_start(b"pw", 0x0b));
+        both.same(&get_capability(1, 0x8000_0000, 8));
+        both.same(&get_capability(6, 0x207, 1));
+    }
+    // Wrong and missing handles and passwords, sequences of the wrong kind.
+    for handle in [
+        0x8000_0000,
+        0x8000_0002,
+        0x8000_0003,
+        0x80ff_ffff,
+        0x8100_0000,
+        0x8180_0001,
+    ] {
+        both.same(&sequence_update(handle, b"pw", b"x"));
+        both.same(&sequence_update(handle, b"wrong", b"x"));
+        both.same(&event_sequence_complete(RH_NULL, handle, b"pw", b""));
+        both.same(&command(SEQUENCE_UPDATE, &[handle], None, &tpm2b(b"")));
+    }
+    for handle in [
+        0x8000_0001u32,
+        0x8000_0001,
+        0x8000_0000,
+        0x8000_0003,
+        0x0200_0000,
+        0x0300_003f,
+        0x4000_0001,
+        0x8100_0000,
+    ] {
+        both.same(&command(FLUSH_CONTEXT, &[], None, &handle.to_be_bytes()));
+        both.same(&get_capability(1, 0x8000_0000, 8));
+    }
+    both.same(&command(
+        FLUSH_CONTEXT,
+        &[],
+        Some(&password(b"")),
+        &[0x80, 0, 0, 2],
+    ));
+    both.same(&sequence_start(b"", 0x10));
+    both.same(&sequence_start(b"", 0x10));
+    both.same(&sequence_start(&[1; 65], 0x0b));
+    both.same(&sequence_complete(0x8000_0000, b"", b"", RH_OWNER));
+    both.same(&get_capability(1, 0x8000_0001, 1));
+    // Persistent handles take a slot to look the object up: with all of them taken,
+    // TPM_RC_OBJECT_MEMORY.
+    both.same(&sequence_update(0x8100_0000, b"", b""));
+    both.same(&hierarchy_control(RH_OWNER, RH_OWNER, 0));
+    both.same(&sequence_update(0x8100_0000, b"", b""));
+    both.same(&sequence_update(0x8180_0000, b"", b""));
+    // A sequence does not outlive Startup.
+    both.same(&command(SHUTDOWN, &[], None, &[0, 1]));
+    both.power_cycle();
+    both.same(&command(STARTUP, &[], None, &[0, 1]));
+    both.same(&get_capability(1, 0x8000_0000, 8));
 }
 
 /// Deterministic mutations of well-formed commands: both must answer the same, wherever the

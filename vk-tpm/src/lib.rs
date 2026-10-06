@@ -21,9 +21,11 @@
 mod alg;
 mod capability;
 mod commands;
+mod crypt;
 mod entity;
 mod hierarchy;
 mod marshal;
+mod object;
 mod pcr;
 mod rc;
 mod session;
@@ -95,6 +97,19 @@ impl Tpm {
     /// What the TPM keeps across power-off; it holds the seeds, so store it as a secret.
     pub fn permanent_state(&self) -> Zeroizing<Vec<u8>> {
         Zeroizing::new(self.permanent.serialize())
+    }
+
+    /// Differential tests only: give the TPM these seeds and proofs (EPS, SPS, PPS, phProof,
+    /// shProof, ehProof), which the test gives libtpms too, so that what derives from them
+    /// (tickets, primary keys) can be compared byte for byte.
+    #[cfg(feature = "libtpms")]
+    #[doc(hidden)]
+    pub fn set_secrets_for_tests(&mut self, secrets: &[[u8; state::SEED_SIZE]; 6]) {
+        let [eps, sps, pps, ph, sh, eh] = secrets.map(Zeroizing::new);
+        let h = &mut self.permanent.hierarchies;
+        (h.ph_proof, h.sh_proof, h.eh_proof) = (ph, sh, eh);
+        let p = &mut self.permanent;
+        (p.eps, p.sps, p.pps) = (eps, sps, pps);
     }
 
     /// What a snapshot must add to the permanent state to bring the running TPM back.
@@ -180,7 +195,7 @@ impl Tpm {
         let mut out = Out::default();
         (cmd.run)(self, &handles, &mut r, &mut out)?;
 
-        let params = out.params.into_bytes();
+        let params = std::mem::take(&mut out.params).into_bytes();
         let mut w = Writer::new();
         w.u16(tag).u32(0).u32(Rc::SUCCESS.0);
         if let Some(handle) = out.handle {
@@ -191,6 +206,10 @@ impl Tpm {
         }
         w.bytes(&params);
         session::write_response_area(&mut w, &sessions);
+        // A sequence that completed goes only now: the response's authorizations needed it.
+        if let Some(handle) = out.flush {
+            self.flush_object(handle);
+        }
         let mut response = w.into_bytes();
         let len = u32::try_from(response.len()).map_err(|_| Rc::FAILURE)?;
         if response.len() > MAX_COMMAND_SIZE {
@@ -225,6 +244,8 @@ impl Tpm {
 pub struct Out {
     pub handle: Option<u32>,
     pub params: Writer,
+    /// An object to flush once the response is built (a completed sequence).
+    pub flush: Option<u32>,
 }
 
 impl std::ops::Deref for Out {
