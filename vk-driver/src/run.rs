@@ -1816,6 +1816,7 @@ async fn build_and_boot(
         Some(primary_ip),
     )?;
     pin_tap_hosts(&mut planned, primary_tap.as_ref())?;
+    let start_deps = start_deps(&planned);
     // With sibling services under management, the agent exposes their control
     // plane at /run/vk/services (a FUSE bridge to the manager over vsock).
     if !planned.units.is_empty() {
@@ -1995,7 +1996,14 @@ async fn build_and_boot(
     let signalled = signals();
     tokio::pin!(signalled);
     if let Some(mgr) = &manager
-        && let Err(e) = start_eager(mgr, &planned.start, signalled.as_mut(), signals()).await
+        && let Err(e) = start_eager(
+            mgr,
+            &planned.start,
+            &start_deps,
+            signalled.as_mut(),
+            signals(),
+        )
+        .await
     {
         mgr.stop_all();
         if let Some(mut c) = switch.take() {
@@ -2685,8 +2693,9 @@ async fn build_and_boot(
     result
 }
 
-/// Start the eager services `names` through `mgr`, in order. The starts run on a blocking
-/// thread — a Windows service's start waits for its provisioning, minutes — so that `stop`,
+/// Start the eager services `names` through `mgr`, each once those it depends on (`deps`)
+/// have started ([`start_services`]). The starts run on blocking threads — a Windows
+/// service's start waits for its provisioning, minutes — so that `stop`,
 /// resolving meanwhile, stops the services rather than leaving them to its signal's default
 /// action. `Ok` only once every start completed; a stop ends in its [`Stopped`] error, a
 /// failed start in its own. On any error the caller must call `stop_all` again: a start under
@@ -2696,22 +2705,23 @@ async fn build_and_boot(
 async fn start_eager(
     mgr: &std::sync::Arc<crate::manager::Manager>,
     names: &[String],
+    deps: &std::collections::HashMap<String, Vec<String>>,
     stop: impl std::future::Future<Output = Stopped>,
     again: impl std::future::Future<Output = Stopped>,
 ) -> Result<()> {
-    let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let boot = std::sync::Arc::new(Boot::default());
     let mut starts = tokio::task::spawn_blocking({
-        let (mgr, names, stopping) = (mgr.clone(), names.to_vec(), stopping.clone());
+        let (mgr, names, deps, boot) = (mgr.clone(), names.to_vec(), deps.clone(), boot.clone());
         move || -> Result<()> {
-            for name in &names {
-                if stopping.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
-                let reply = mgr.start(name);
-                if !reply.ok {
-                    bail!("booting service {name}: {}", reply.message);
-                }
-                println!("virtkit: service {name}: {}", reply.message);
+            let started = start_services(
+                &names,
+                &deps,
+                &boot,
+                |name| mgr.start(name),
+                || mgr.stop_all(),
+            );
+            if let Err((name, message)) = started {
+                bail!("booting service {name}: {message}");
             }
             Ok(())
         }
@@ -2723,7 +2733,7 @@ async fn start_eager(
         started = &mut starts => return started.context("starting the services")?,
     };
     println!("virtkit: stopping ...");
-    stopping.store(true, std::sync::atomic::Ordering::Relaxed);
+    boot.stop();
     // The start under way ends once its guest is stopped (a Windows provisioning gives up as
     // its guest goes).
     let mgr = mgr.clone();
@@ -2839,6 +2849,106 @@ pub(crate) fn stop_switch(mut child: Child) {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/// Map each service `planned` boots to the `depends_on` services that boot too,
+/// which [`start_services`] waits for.
+fn start_deps(planned: &PlannedServices) -> std::collections::HashMap<String, Vec<String>> {
+    let starting: std::collections::HashSet<&str> =
+        planned.start.iter().map(String::as_str).collect();
+    planned
+        .units
+        .iter()
+        .filter(|(prov, _, _)| starting.contains(prov.name.as_str()))
+        .map(|(prov, _, unit)| {
+            let deps = unit
+                .depends_on
+                .iter()
+                .filter(|d| starting.contains(d.as_str()))
+                .cloned()
+                .collect();
+            (prov.name.clone(), deps)
+        })
+        .collect()
+}
+
+/// What the threads of [`start_services`] share; every change is announced on `changed`.
+#[derive(Default)]
+struct Boot {
+    progress: std::sync::Mutex<BootProgress>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct BootProgress {
+    /// The services whose start succeeded.
+    up: std::collections::HashSet<String>,
+    /// The first service whose start failed, with its error.
+    failure: Option<(String, String)>,
+    /// Set by [`Boot::stop`]: no further service starts.
+    stopping: bool,
+}
+
+impl Boot {
+    /// Let no further service start.
+    fn stop(&self) {
+        self.progress.lock().unwrap().stopping = true;
+        self.changed.notify_all();
+    }
+}
+
+/// Boot the services `names`, each once its dependencies (`deps`) have started;
+/// services that do not depend on one another start in parallel, as compose does. All of
+/// them start at once, so several Windows guests, each provisioning, take longer to start
+/// than one. What a service waits for beyond its dependencies' start (their health, their
+/// completion), `start` waits for. The first failure calls `stop_all` at once — a Windows
+/// provisioning can take minutes — and is returned, with its service. Once a failure or
+/// [`Boot::stop`], no further service starts.
+fn start_services(
+    names: &[String],
+    deps: &std::collections::HashMap<String, Vec<String>>,
+    boot: &Boot,
+    start: impl Fn(&str) -> vk_core::fleetctl::Reply + Sync,
+    stop_all: impl Fn() + Sync,
+) -> std::result::Result<(), (String, String)> {
+    let (start, stop_all) = (&start, &stop_all);
+    std::thread::scope(|scope| {
+        for name in names {
+            let needs = deps.get(name).map_or(&[][..], Vec::as_slice);
+            scope.spawn(move || {
+                {
+                    let mut p = boot.progress.lock().unwrap();
+                    loop {
+                        if p.stopping || p.failure.is_some() {
+                            return;
+                        }
+                        if needs.iter().all(|d| p.up.contains(d)) {
+                            break;
+                        }
+                        p = boot.changed.wait(p).unwrap();
+                    }
+                }
+                let reply = start(name);
+                let mut p = boot.progress.lock().unwrap();
+                if reply.ok {
+                    println!("virtkit: service {name}: {}", reply.message);
+                    p.up.insert(name.clone());
+                    boot.changed.notify_all();
+                } else if p.failure.is_none() {
+                    p.failure = Some((name.clone(), reply.message));
+                    boot.changed.notify_all();
+                    drop(p);
+                    stop_all();
+                }
+            });
+        }
+    });
+    boot.progress
+        .lock()
+        .unwrap()
+        .failure
+        .take()
+        .map_or(Ok(()), Err)
 }
 
 /// Every declared compose unit, materialized and addressed, plus which ones
@@ -3409,6 +3519,7 @@ async fn compose_up(
     // front here (siblings resolve/build via plan_services + the manager).
     let mut planned = plan_services(args, cfg, state_dir, work, &units, None, None)?;
     pin_tap_hosts(&mut planned, None)?;
+    let start_deps = start_deps(&planned);
 
     // The run answers Ctrl-C by stopping its services, a Windows one with its power button, so
     // their VMMs and switch must not take the same SIGINT and die first.
@@ -3468,7 +3579,7 @@ async fn compose_up(
     };
     let stop = signals();
     tokio::pin!(stop);
-    if let Err(e) = start_eager(&mgr, &planned.start, stop.as_mut(), signals()).await {
+    if let Err(e) = start_eager(&mgr, &planned.start, &start_deps, stop.as_mut(), signals()).await {
         mgr.stop_all();
         stop_switch(switch);
         return Err(e);
@@ -5526,6 +5637,7 @@ mod tests {
             let e = start_eager(
                 &mgr,
                 &[],
+                &Default::default(),
                 std::future::ready(Stopped(signal)),
                 std::future::pending(),
             )
@@ -5534,9 +5646,124 @@ mod tests {
             let stopped = e.downcast_ref::<Stopped>().expect("a stop is a Stopped");
             assert_eq!(stopped.exit_code(), code);
         }
-        start_eager(&mgr, &[], std::future::pending(), std::future::pending())
-            .await
-            .expect("every start completed");
+        start_eager(
+            &mgr,
+            &[],
+            &Default::default(),
+            std::future::pending(),
+            std::future::pending(),
+        )
+        .await
+        .expect("every start completed");
+    }
+
+    fn reply(ok: bool) -> vk_core::fleetctl::Reply {
+        vk_core::fleetctl::Reply {
+            ok,
+            message: if ok { "up" } else { "boom" }.into(),
+            units: Vec::new(),
+        }
+    }
+
+    fn names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn b_needs_a() -> std::collections::HashMap<String, Vec<String>> {
+        [("B".to_string(), names(&["A"]))].into()
+    }
+
+    // B starts only once A is up; C, independent, starts alongside A: A's start returns only
+    // once C's has begun.
+    #[test]
+    fn a_service_starts_once_its_dependencies_are_up_the_others_alongside() {
+        let a_up = std::sync::atomic::AtomicBool::new(false);
+        let both = std::sync::Barrier::new(2);
+        let started = std::sync::Mutex::new(Vec::new());
+        let r = start_services(
+            &names(&["A", "B", "C"]),
+            &b_needs_a(),
+            &Boot::default(),
+            |name| {
+                started.lock().unwrap().push(name.to_string());
+                match name {
+                    "A" => {
+                        both.wait();
+                        a_up.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    "B" => assert!(a_up.load(std::sync::atomic::Ordering::SeqCst)),
+                    _ => {
+                        both.wait();
+                    }
+                }
+                reply(true)
+            },
+            || panic!("nothing failed"),
+        );
+        assert_eq!(r, Ok(()));
+        let mut started = started.into_inner().unwrap();
+        started.sort();
+        assert_eq!(started, names(&["A", "B", "C"]));
+    }
+
+    // A failed start stops every service once and returns its error; its dependents never
+    // start.
+    #[test]
+    fn a_failed_start_stops_all_and_its_dependents_never_start() {
+        let stops = std::sync::atomic::AtomicUsize::new(0);
+        let r = start_services(
+            &names(&["A", "B"]),
+            &b_needs_a(),
+            &Boot::default(),
+            |name| {
+                assert_eq!(name, "A", "B depends on the failed A");
+                reply(false)
+            },
+            || {
+                stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+        assert_eq!(r, Err(("A".to_string(), "boom".to_string())));
+        assert_eq!(stops.into_inner(), 1);
+    }
+
+    // Two failures stop the services once, for the first.
+    #[test]
+    fn only_the_first_failure_stops_all() {
+        let both = std::sync::Barrier::new(2);
+        let stops = std::sync::atomic::AtomicUsize::new(0);
+        let r = start_services(
+            &names(&["A", "C"]),
+            &Default::default(),
+            &Boot::default(),
+            |_| {
+                both.wait();
+                reply(false)
+            },
+            || {
+                stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+        assert!(matches!(r, Err((ref name, _)) if name == "A" || name == "C"));
+        assert_eq!(stops.into_inner(), 1);
+    }
+
+    // A stop while B waits on A: B never starts.
+    #[test]
+    fn a_stop_keeps_waiting_services_from_starting() {
+        let boot = Boot::default();
+        let r = start_services(
+            &names(&["A", "B"]),
+            &b_needs_a(),
+            &boot,
+            |name| {
+                assert_eq!(name, "A", "the stop came before A was up");
+                boot.stop();
+                reply(true)
+            },
+            || panic!("nothing failed"),
+        );
+        assert_eq!(r, Ok(()));
     }
 
     // The three reclaim knobs resolve in one order everywhere: a service's own

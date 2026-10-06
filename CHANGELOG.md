@@ -139,6 +139,13 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **Compose services start side by side.** `vk run --compose` used to start its services one
+  after another, each waiting for the one before it to be up; it now starts every service as
+  soon as the services it `depends_on` have started (and, with a condition, are healthy or
+  have completed), as Docker Compose does. A Windows service is up once its provisioning has
+  run, so the members of a lab now join their domains at the same time instead of in turn.
+  The first service that fails stops them all. Every independent service boots at once, so
+  several Windows guests each take longer to start than one alone.
 - **`vk build` refuses Dockerfile flags it does not honour.** A `FROM` flag other than
   `--platform` and `--kernel`, or a `RUN` flag other than `--mount`, `--network` and
   `--security`, now fails the build instead of being ignored, as does a stray word after

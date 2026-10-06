@@ -241,6 +241,9 @@ condition is refused when the file is read, as is waiting for the health of a se
 healthcheck. `restart:` and `required: true` are accepted and ignored; `required: false` is
 refused.
 
+All independent services start at the same time: several
+Windows guests provisioning side by side each take longer to start than one alone.
+
 A `healthcheck` runs its `test` in the service's guest: `["CMD", prog, args…]` as is,
 `["CMD-SHELL", "line"]` or a string under `/bin/sh -c` (as the service's `user`) in a Linux
 guest and `cmd /S /C` in a Windows one; `["NONE"]` or `disable: true` declares none. `interval`
