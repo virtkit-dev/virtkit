@@ -524,15 +524,6 @@ pub fn host_control_socket(vsock: &Path) -> PathBuf {
 /// control sockets: the guest's, the per-port socket of base `vsock`, holding at most
 /// [`MAX_CONTROL_CONNECTIONS`]; and the host's own, [`host_control_socket`].
 pub async fn control_server(vsock: &Path, mgr: Arc<Manager>) -> Result<()> {
-    control_server_idling(vsock, mgr, CONTROL_IDLE).await
-}
-
-/// [`control_server`], dropping a connection after `idle` between requests.
-async fn control_server_idling(
-    vsock: &Path,
-    mgr: Arc<Manager>,
-    idle: std::time::Duration,
-) -> Result<()> {
     let guest = bind_control(&vk_core::net::hybrid_socket(
         vsock,
         vk_core::fleetctl::CONTROL_PORT,
@@ -540,8 +531,8 @@ async fn control_server_idling(
     let host = bind_control(&host_control_socket(vsock))?;
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONTROL_CONNECTIONS));
     tokio::try_join!(
-        serve_control(guest, Some(slots), mgr.clone(), idle),
-        serve_control(host, None, mgr, idle),
+        serve_control(guest, Some(slots), mgr.clone()),
+        serve_control(host, None, mgr),
     )?;
     Ok(())
 }
@@ -558,7 +549,6 @@ async fn serve_control(
     listener: tokio::net::UnixListener,
     slots: Option<Arc<tokio::sync::Semaphore>>,
     mgr: Arc<Manager>,
-    idle: std::time::Duration,
 ) -> Result<()> {
     loop {
         let slot = match &slots {
@@ -569,18 +559,14 @@ async fn serve_control(
         let mgr = mgr.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            if let Err(e) = handle_control(conn, mgr, idle).await {
+            if let Err(e) = handle_control(conn, mgr).await {
                 eprintln!("virtkit: control request: {e:#}");
             }
         });
     }
 }
 
-async fn handle_control(
-    conn: tokio::net::UnixStream,
-    mgr: Arc<Manager>,
-    idle: std::time::Duration,
-) -> Result<()> {
+async fn handle_control(conn: tokio::net::UnixStream, mgr: Arc<Manager>) -> Result<()> {
     let (rd, mut wr) = conn.into_split();
     let mut rd = tokio::io::BufReader::new(rd);
     loop {
@@ -590,7 +576,7 @@ async fn handle_control(
             &mut rd,
             vk_core::fleetctl::MAX_REQUEST,
         );
-        let Ok(Ok(req)) = tokio::time::timeout(idle, read).await else {
+        let Ok(Ok(req)) = tokio::time::timeout(CONTROL_IDLE, read).await else {
             return Ok(());
         };
         match req {
@@ -687,61 +673,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A guest holding every connection it may, idle, leaves the host's clients served at once
-    /// on their own socket while its own next connection waits for a slot, and its idle
-    /// connections are dropped. Real time with a short idle bound: under a paused clock, every
-    /// wait on socket readiness would advance it to the idle timeout and free the slots.
+    /// The guest's and host's control clients of a test server on `vsock`, once it listens.
+    async fn control_sockets(vsock: &Path) -> (PathBuf, PathBuf) {
+        let guest = vk_core::net::hybrid_socket(vsock, vk_core::fleetctl::CONTROL_PORT);
+        let host = host_control_socket(vsock);
+        while !host.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        (guest, host)
+    }
+
+    /// A list request over a fresh connection to `socket`, and its reply.
+    async fn list_over(socket: &Path) -> Reply {
+        let (rd, mut wr) = tokio::net::UnixStream::connect(socket)
+            .await
+            .unwrap()
+            .into_split();
+        let mut rd = tokio::io::BufReader::new(rd);
+        vk_core::fleetctl::write_msg(&mut wr, &Request::List)
+            .await
+            .unwrap();
+        let Frame::Done(reply) = vk_core::fleetctl::read_msg(&mut rd).await.unwrap() else {
+            panic!("a list answers with Done");
+        };
+        reply
+    }
+
+    /// A guest holding every connection it may leaves the host's clients served on their own
+    /// socket while its own next connection waits, until one of its connections closes. No
+    /// connection here reaches the idle bound, so nothing frees a slot but the guest.
     #[tokio::test]
     async fn a_guest_at_its_connection_bound_leaves_the_host_served() {
-        use tokio::io::AsyncReadExt;
         use tokio::net::UnixStream;
-        use tokio::time::{Instant, timeout};
-        const IDLE: std::time::Duration = std::time::Duration::from_secs(2);
         let dir = scratch_dir("control");
         let vsock = dir.join("vsock.sock");
         let mgr = Arc::new(manager_over_two_units());
         tokio::spawn({
             let vsock = vsock.clone();
-            async move { control_server_idling(&vsock, mgr, IDLE).await }
+            async move { control_server(&vsock, mgr).await }
         });
-        let guest = vk_core::net::hybrid_socket(&vsock, vk_core::fleetctl::CONTROL_PORT);
-        let host = host_control_socket(&vsock);
-        while !host.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-        }
-        let held = Instant::now();
-        let mut idle = Vec::new();
+        let (guest, host) = control_sockets(&vsock).await;
+        let mut held = Vec::new();
         for _ in 0..MAX_CONTROL_CONNECTIONS {
-            idle.push(UnixStream::connect(&guest).await.unwrap());
+            held.push(UnixStream::connect(&guest).await.unwrap());
         }
-        let list = async |socket: &Path| {
-            let (rd, mut wr) = UnixStream::connect(socket).await.unwrap().into_split();
-            let mut rd = tokio::io::BufReader::new(rd);
-            vk_core::fleetctl::write_msg(&mut wr, &Request::List)
-                .await
-                .unwrap();
-            let Frame::Done(reply) = vk_core::fleetctl::read_msg(&mut rd).await.unwrap() else {
-                panic!("a list answers with Done");
-            };
-            reply
-        };
 
-        // One guest connection past the bound is not served while the slots stay held.
-        let mut over = std::pin::pin!(list(&guest));
+        // Not served in a while; a short wait, since a slow server only lets this pass.
+        let mut over = std::pin::pin!(list_over(&guest));
         assert!(
-            timeout(IDLE / 2, &mut over).await.is_err(),
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut over)
+                .await
+                .is_err(),
             "a guest connection past the bound was served"
         );
-        let reply = list(&host).await;
+        // Bounded well inside the idle bound, which would free the slots.
+        let reply = tokio::time::timeout(CONTROL_IDLE / 2, list_over(&host))
+            .await
+            .expect("the host waited for a slot");
         assert!(reply.ok, "{}", reply.message);
-        assert!(held.elapsed() < IDLE, "the host waited for a slot");
 
-        for conn in &mut idle {
-            assert_eq!(conn.read(&mut [0u8; 1]).await.unwrap(), 0);
-        }
-        assert!(held.elapsed() >= IDLE, "an idle connection closed early");
-        // With the idle connections dropped, the waiting one is served.
+        held.pop();
         assert!(over.await.ok);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A guest connection is dropped after [`CONTROL_IDLE`], not before. With the clock paused,
+    /// the idle wait is the only timer, so advancing to it elapses the bound.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_guest_connection_is_dropped_at_the_idle_bound() {
+        use tokio::io::AsyncReadExt;
+        let dir = scratch_dir("control-idle");
+        let vsock = dir.join("vsock.sock");
+        let mgr = Arc::new(manager_over_two_units());
+        tokio::spawn({
+            let vsock = vsock.clone();
+            async move { control_server(&vsock, mgr).await }
+        });
+        let (guest, _) = control_sockets(&vsock).await;
+        let opened = tokio::time::Instant::now();
+        let mut idle = tokio::net::UnixStream::connect(&guest).await.unwrap();
+        assert_eq!(idle.read(&mut [0u8; 1]).await.unwrap(), 0);
+        assert!(
+            opened.elapsed() >= CONTROL_IDLE,
+            "an idle connection closed early"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
