@@ -87,6 +87,9 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with ten crates:
   clamped into a range only root can configure. It takes no arguments and no paths from its
   caller, so granting it `NOPASSWD` grants nothing else; all the policy lives in `vk`. Its
   config edit is also a library, for unprivileged `vk` to apply to a runner config it owns.
+- **`vk-tpm/`** — a TPM 2.0 engine in Rust (in progress), to replace libtpms behind libkrun's
+  TPM CRB device: command processing, PCRs, versioned state; crypto from RustCrypto crates
+  only. See `docs/tpm-design.md`.
 
 libkrun is vendored (its own cargo workspace, locally patched) under
 `third_party/libkrun` — see its `VENDOR.md` for the patch list.
