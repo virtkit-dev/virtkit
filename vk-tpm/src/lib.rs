@@ -28,6 +28,7 @@ mod hierarchy;
 mod marshal;
 mod object;
 mod pcr;
+mod public;
 mod rc;
 mod session;
 mod state;

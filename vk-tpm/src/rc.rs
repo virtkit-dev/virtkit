@@ -24,6 +24,7 @@ impl Rc {
 
     pub const INITIALIZE: Rc = Rc(RC_VER1);
     pub const FAILURE: Rc = Rc(RC_VER1 + 0x001);
+    pub const SEQUENCE: Rc = Rc(RC_VER1 + 0x003);
     pub const DISABLED: Rc = Rc(RC_VER1 + 0x020);
     pub const EXCLUSIVE: Rc = Rc(RC_VER1 + 0x021);
     pub const AUTH_TYPE: Rc = Rc(RC_VER1 + 0x024);
@@ -33,24 +34,40 @@ impl Rc {
     pub const COMMAND_SIZE: Rc = Rc(RC_VER1 + 0x042);
     pub const COMMAND_CODE: Rc = Rc(RC_VER1 + 0x043);
     pub const AUTH_CONTEXT: Rc = Rc(RC_VER1 + 0x045);
+    pub const NV_SPACE: Rc = Rc(RC_VER1 + 0x04b);
+    pub const NV_DEFINED: Rc = Rc(RC_VER1 + 0x04c);
+    pub const NO_RESULT: Rc = Rc(RC_VER1 + 0x054);
+    pub const SENSITIVE: Rc = Rc(RC_VER1 + 0x055);
 
     pub const ATTRIBUTES: Rc = Rc(RC_FMT1 + 0x002);
     pub const HASH: Rc = Rc(RC_FMT1 + 0x003);
     pub const VALUE: Rc = Rc(RC_FMT1 + 0x004);
     pub const HIERARCHY: Rc = Rc(RC_FMT1 + 0x005);
+    pub const KEY_SIZE: Rc = Rc(RC_FMT1 + 0x007);
     pub const MODE: Rc = Rc(RC_FMT1 + 0x009);
     pub const TYPE: Rc = Rc(RC_FMT1 + 0x00a);
     pub const HANDLE: Rc = Rc(RC_FMT1 + 0x00b);
+    pub const KDF: Rc = Rc(RC_FMT1 + 0x00c);
+    pub const RANGE: Rc = Rc(RC_FMT1 + 0x00d);
     pub const AUTH_FAIL: Rc = Rc(RC_FMT1 + 0x00e);
     pub const NONCE: Rc = Rc(RC_FMT1 + 0x00f);
+    pub const SCHEME: Rc = Rc(RC_FMT1 + 0x012);
     pub const SIZE: Rc = Rc(RC_FMT1 + 0x015);
     pub const SYMMETRIC: Rc = Rc(RC_FMT1 + 0x016);
+    pub const TAG: Rc = Rc(RC_FMT1 + 0x017);
     pub const INSUFFICIENT: Rc = Rc(RC_FMT1 + 0x01a);
+    pub const SIGNATURE: Rc = Rc(RC_FMT1 + 0x01b);
     pub const KEY: Rc = Rc(RC_FMT1 + 0x01c);
     pub const POLICY_FAIL: Rc = Rc(RC_FMT1 + 0x01d);
+    pub const INTEGRITY: Rc = Rc(RC_FMT1 + 0x01f);
+    pub const TICKET: Rc = Rc(RC_FMT1 + 0x020);
     pub const RESERVED_BITS: Rc = Rc(RC_FMT1 + 0x021);
     pub const BAD_AUTH: Rc = Rc(RC_FMT1 + 0x022);
+    pub const BINDING: Rc = Rc(RC_FMT1 + 0x025);
+    pub const CURVE: Rc = Rc(RC_FMT1 + 0x026);
+    pub const ECC_POINT: Rc = Rc(RC_FMT1 + 0x027);
 
+    pub const CONTEXT_GAP: Rc = Rc(RC_WARN + 0x001);
     pub const OBJECT_MEMORY: Rc = Rc(RC_WARN + 0x002);
     pub const SESSION_MEMORY: Rc = Rc(RC_WARN + 0x003);
     pub const SESSION_HANDLES: Rc = Rc(RC_WARN + 0x005);
