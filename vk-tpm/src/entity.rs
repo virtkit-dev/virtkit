@@ -72,12 +72,18 @@ pub enum HandleKind {
     Object(bool),
     /// TPMI_DH_ENTITY, or with `true` TPMI_DH_ENTITY+: anything with an authorization.
     Entity(bool),
+    /// TPMI_DH_PARENT+: a transient or persistent object, a hierarchy, or TPM_RH_NULL.
+    Parent,
     /// TPMI_RH_NV_AUTH: owner, platform, or an NV index.
     NvAuth,
     /// TPMI_RH_NV_INDEX.
     NvIndex,
     /// TPMI_SH_POLICY: a policy session.
     PolicySession,
+    /// TPMI_SH_HMAC: an HMAC session.
+    HmacSession,
+    /// TPMI_RH_ENDORSEMENT: the endorsement hierarchy (the privacy administrator).
+    Endorsement,
 }
 
 impl HandleKind {
@@ -109,11 +115,19 @@ impl HandleKind {
                     || VENDOR_AUTH.contains(&handle)
                     || (null && handle == TPM_RH_NULL)
             }
+            HandleKind::Parent => {
+                hierarchy
+                    || handle == TPM_RH_NULL
+                    || TRANSIENT.contains(&handle)
+                    || handle_type(handle) == TPM_HT_PERSISTENT
+            }
             HandleKind::NvAuth => {
                 matches!(handle, TPM_RH_OWNER | TPM_RH_PLATFORM) || nv::is_nv_index(handle)
             }
             HandleKind::NvIndex => nv::is_nv_index(handle),
             HandleKind::PolicySession => POLICY_SESSIONS.contains(&handle),
+            HandleKind::HmacSession => HMAC_SESSIONS.contains(&handle),
+            HandleKind::Endorsement => handle == TPM_RH_ENDORSEMENT,
         };
         if ok { Ok(()) } else { Err(Rc::VALUE) }
     }
@@ -262,11 +276,12 @@ impl Tpm {
         }
     }
 
-    /// IsPolicySessionRequired: the ADMIN role of a key with adminWithPolicy or of anything that
-    /// is not an object.
+    /// IsPolicySessionRequired: the DUP role always, the ADMIN role of a key with
+    /// adminWithPolicy or of anything that is not an object.
     pub fn policy_required(&self, handle: u32, role: Role) -> bool {
         match role {
             Role::User => false,
+            Role::Dup => true,
             Role::Admin => {
                 handle_type(handle) != TPM_HT_TRANSIENT
                     || self

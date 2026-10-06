@@ -182,7 +182,7 @@ impl NvPublic {
         Kind::of(self.attributes)
     }
 
-    fn size(&self) -> usize {
+    pub fn size(&self) -> usize {
         usize::from(self.data_size)
     }
 

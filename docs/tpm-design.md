@@ -334,6 +334,8 @@ Where `vk-tpm` answers differently from libtpms, on purpose (the differential te
   CSPRNG, which guest data cannot make better (libtpms mixes it into its own DRBG).
 - **An RSA public key with an even exponent** cannot encrypt (RSAES, OAEP: TPM_RC_FAILURE);
   `rsa` refuses one. No TPM-made key has one.
+- **Derivation parents** (a restricted keyed-hash decryption key, which TPM2_CreateLoaded
+  derives children from) are not implemented: such a key is rejected as a parent (TPM_RC_TYPE).
 
 Quirks of the reference implementation that `vk-tpm` keeps, so it answers the same:
 TPM2_PCR_Allocate takes effect at the next power on and TPM2_Clear drops a pending one

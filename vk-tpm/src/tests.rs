@@ -116,10 +116,12 @@ fn valid_handle(kind: HandleKind) -> u32 {
         HandleKind::Lockout => TPM_RH_LOCKOUT,
         // The sequence the test starts first.
         HandleKind::Object(_) => 0x8000_0000,
-        HandleKind::Entity(_) => TPM_RH_OWNER,
-        // The index and the policy session the test makes first.
+        HandleKind::Entity(_) | HandleKind::Parent => TPM_RH_OWNER,
+        // The index and the sessions the test makes first.
         HandleKind::NvAuth | HandleKind::NvIndex => NV_INDEX,
         HandleKind::PolicySession => 0x0300_0000,
+        HandleKind::HmacSession => 0x0200_0001,
+        HandleKind::Endorsement => TPM_RH_ENDORSEMENT,
     }
 }
 
@@ -174,6 +176,8 @@ fn every_command_refuses_trailing_parameter_bytes() {
         let public: &[u8] = &[0, 14, 0, 8, 0, 0x0b, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0];
         let create = [&[0, 4, 0, 0, 0, 0][..], public, &[0, 0, 0, 0, 0, 0]].concat();
         let load = [&[0, 0][..], public].concat();
+        let create_loaded = [&[0, 4, 0, 0, 0, 0][..], public].concat();
+        let import = [&[0, 0][..], public, &[0, 0, 0, 0, 0, 0x10]].concat();
         let load_external = [&[0, 0][..], public, &[0x40, 0, 0, 7]].concat();
         let context = [&[0; 8][..], &[0x80, 0, 0, 0, 0x40, 0, 0, 7, 0, 0]].concat();
         // nonceTPM, cpHashA, policyRef, expiration, an HMAC signature.
@@ -192,6 +196,15 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_EVICT_CONTROL => &[0x81, 0, 0, 1],
             TPM_CC_CREATE_PRIMARY | TPM_CC_CREATE => &create,
             TPM_CC_LOAD => &load,
+            // qualifyingData, a NULL scheme (and the rest).
+            TPM_CC_CERTIFY | TPM_CC_GET_TIME | TPM_CC_GET_SESSION_AUDIT_DIGEST => &[0, 0, 0, 0x10],
+            TPM_CC_QUOTE => &[0, 0, 0, 0x10, 0, 0, 0, 0],
+            TPM_CC_NV_CERTIFY => &[0, 0, 0, 0x10, 0, 0, 0, 0],
+            TPM_CC_CERTIFY_CREATION => &[0, 0, 0, 0, 0, 0x10, 0x80, 0x21, 0x40, 0, 0, 7, 0, 0],
+            TPM_CC_MAKE_CREDENTIAL | TPM_CC_ACTIVATE_CREDENTIAL => &[0, 0, 0, 0],
+            TPM_CC_CREATE_LOADED => &create_loaded,
+            TPM_CC_IMPORT => &import,
+            TPM_CC_DUPLICATE => &[0, 0, 0, 0x10],
             TPM_CC_LOAD_EXTERNAL => &load_external,
             TPM_CC_READ_PUBLIC
             | TPM_CC_UNSEAL
@@ -206,6 +219,9 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_RSA_ENCRYPT | TPM_CC_RSA_DECRYPT => &[0, 0, 0, 0x10, 0, 0],
             TPM_CC_ECDH_ZGEN => &[0, 4, 0, 0, 0, 0],
             TPM_CC_HMAC | TPM_CC_HMAC_START => &[0, 0, 0, 0x10],
+            // No data, TPM_ALG_NULL, no IV.
+            TPM_CC_ENCRYPT_DECRYPT => &[0, 0, 0x10, 0, 0, 0, 0],
+            TPM_CC_ENCRYPT_DECRYPT_2 => &[0, 0, 0, 0, 0x10, 0, 0],
             TPM_CC_ECC_PARAMETERS => &[0, 3],
             TPM_CC_TEST_PARMS => &[0, 8, 0, 0x10],
             TPM_CC_GET_CAPABILITY => &[0, 0, 0, 6, 0, 0, 1, 0, 0, 0, 0, 1],
@@ -265,25 +281,25 @@ fn every_command_refuses_trailing_parameter_bytes() {
                 | nv::attr::AUTHWRITE
                 | nv::attr::AUTHREAD;
             assert_eq!(nv_define(&mut tpm, NV_INDEX, attributes, 8), 0);
-            let policy = [&[0, 16][..], &[0; 16], &[0, 0, 1, 0, 0x10, 0, 0x0b]].concat();
-            let start = command(
-                TPM_CC_START_AUTH_SESSION,
-                &[TPM_RH_NULL, TPM_RH_NULL],
-                None,
-                &policy,
-            );
-            assert_eq!(rc(&tpm.process(&start)), 0);
+            // A policy session, then an HMAC session.
+            for kind in [1, 0] {
+                let p = [&[0, 16][..], &[0; 16], &[0, 0, kind, 0, 0x10, 0, 0x0b]].concat();
+                let nulls = [TPM_RH_NULL, TPM_RH_NULL];
+                let start = command(TPM_CC_START_AUTH_SESSION, &nulls, None, &p);
+                assert_eq!(rc(&tpm.process(&start)), 0);
+            }
         }
         let handles: Vec<u32> = cmd.handles.iter().map(|&k| valid_handle(k)).collect();
         let passwords = vec![&b""[..]; cmd.auth];
         let response = tpm.process(&command_with(cmd.code, &handles, &passwords, &params));
-        // The ADMIN role of an NV index takes a policy session: the authorization fails first.
-        let expected =
-            if cmd.role == Role::Admin && cmd.handles.first() == Some(&HandleKind::NvIndex) {
-                Rc::AUTH_TYPE.session(1)
-            } else {
-                Rc::SIZE
-            };
+        // The ADMIN role of an NV index, and the DUP role, take a policy session: the
+        // authorization fails first.
+        let nv_admin = cmd.role == Role::Admin && cmd.handles.first() == Some(&HandleKind::NvIndex);
+        let expected = if nv_admin || cmd.role == Role::Dup {
+            Rc::AUTH_TYPE.session(1)
+        } else {
+            Rc::SIZE
+        };
         assert_eq!(rc(&response), expected.0, "command {:#x}", cmd.code);
     }
 }
@@ -3827,4 +3843,487 @@ fn policy_auth_value_and_password_prove_the_auth_value() {
     assert_eq!(pin_read(&mut tpm, b"no"), Err(Rc::BAD_AUTH.session(1).0));
     assert_eq!(pin_read(&mut tpm, b"pin"), Ok(vec![0, 0, 0, 2]));
     assert_eq!(failures(&mut tpm), 2);
+}
+
+// Attestation, credentials, duplication and symmetric encryption.
+
+/// An unrestricted ECDSA (SHA-256) signing key, primary in `hierarchy`.
+fn ecdsa_key(tpm: &mut Tpm, hierarchy: u32) -> u32 {
+    let template = ecc_key(ORDINARY | attr::SIGN, &[0, 0x18, 0, 0x0b]);
+    handle_of(&create_primary(tpm, hierarchy, &template))
+}
+
+/// The TPM2B_ATTEST of an attestation's response, once TPM2_VerifySignature has checked the
+/// TPMT_SIGNATURE that follows it with `key`.
+fn signed_attest(tpm: &mut Tpm, response: &[u8], key: u32) -> Vec<u8> {
+    assert_eq!(rc(response), 0);
+    let (attest, signature) = split2b(response_params(response, false));
+    let mut p = Writer::new();
+    p.tpm2b(&sha256(&[attest])).bytes(signature);
+    let verify = command(TPM_CC_VERIFY_SIGNATURE, &[key], None, &p.into_bytes());
+    assert_eq!(rc(&tpm.process(&verify)), 0, "the signature verifies");
+    attest.to_vec()
+}
+
+/// The fields of a TPMS_ATTEST.
+struct Attest {
+    kind: u16,
+    signer: Vec<u8>,
+    extra: Vec<u8>,
+    reset_count: u32,
+    restart_count: u32,
+    firmware: u64,
+    attested: Vec<u8>,
+}
+
+fn parse_attest(attest: &[u8]) -> Attest {
+    let mut r = Reader::new(attest);
+    assert_eq!(r.u32().unwrap(), 0xff54_4347, "TPM_GENERATED_VALUE");
+    let kind = r.u16().unwrap();
+    let signer = r.tpm2b(MAX_NAME).unwrap().to_vec();
+    let extra = r.tpm2b(64).unwrap().to_vec();
+    let _clock = r.u64().unwrap();
+    let reset_count = r.u32().unwrap();
+    let restart_count = r.u32().unwrap();
+    let _safe = r.u8().unwrap();
+    let firmware = r.u64().unwrap();
+    Attest {
+        kind,
+        signer,
+        extra,
+        reset_count,
+        restart_count,
+        firmware,
+        attested: r.rest().to_vec(),
+    }
+}
+
+#[test]
+fn quotes_and_certifications_are_signed_and_identify_endorsement_keys_only() {
+    use crate::capability::FIRMWARE_VERSION;
+    let mut tpm = started();
+    let pcr0 = read_sha256(&mut tpm, 0).1;
+    let quote = |key: u32| {
+        let mut p = Writer::new();
+        p.tpm2b(b"nonce")
+            .u16(alg::TPM_ALG_NULL)
+            .bytes(&pcr_selection(0));
+        command(TPM_CC_QUOTE, &[key], Some(b""), &p.into_bytes())
+    };
+    for hierarchy in [TPM_RH_ENDORSEMENT, TPM_RH_OWNER] {
+        let key = ecdsa_key(&mut tpm, hierarchy);
+        let r = tpm.process(&quote(key));
+        let quoted = parse_attest(&signed_attest(&mut tpm, &r, key));
+        assert_eq!(quoted.kind, 0x8018);
+        assert_eq!(quoted.extra, b"nonce");
+        let digest = sha256(&[&pcr0]);
+        assert_eq!(quoted.attested, [pcr_selection(0), tpm2b(&digest)].concat());
+        // TPM2_Certify of the key, by itself (its ADMIN role takes its authValue).
+        let mut p = Writer::new();
+        p.tpm2b(b"").u16(alg::TPM_ALG_NULL);
+        let certify = command_with(TPM_CC_CERTIFY, &[key, key], &[b"", b""], &p.into_bytes());
+        let r = tpm.process(&certify);
+        let certified = parse_attest(&signed_attest(&mut tpm, &r, key));
+        assert_eq!(certified.kind, 0x8017);
+        let (name, qualified_name) = split2b(&certified.attested);
+        assert_eq!(name, read_public_name(&mut tpm, key));
+        assert_eq!(split2b(qualified_name).0, quoted.signer);
+        // Outside the endorsement and platform hierarchies, the counters and the firmware
+        // version are offset by KDFa(SHA-512, shProof, "OBFUSCATE", qualifiedSigner).
+        let (reset, restart) = (tpm.permanent.reset_count, tpm.volatile.restart_count);
+        let (mut firmware, mut reset_count, mut restart_count) = (FIRMWARE_VERSION, reset, restart);
+        if hierarchy == TPM_RH_OWNER {
+            let proof = tpm.permanent.hierarchies.sh_proof.as_slice();
+            let mask = crate::crypt::kdfa(
+                alg::Hash::Sha512,
+                proof,
+                b"OBFUSCATE",
+                &quoted.signer,
+                &[],
+                16,
+            );
+            let low = u64::from_le_bytes(mask[..8].try_into().unwrap());
+            let high = u64::from_le_bytes(mask[8..].try_into().unwrap());
+            firmware = firmware.wrapping_add(low);
+            reset_count = reset_count.wrapping_add((high >> 32) as u32);
+            restart_count = restart_count.wrapping_add(high as u32);
+        }
+        for attest in [&quoted, &certified] {
+            assert_eq!(
+                (attest.firmware, attest.reset_count, attest.restart_count),
+                (firmware, reset_count, restart_count),
+                "hierarchy {hierarchy:#x}"
+            );
+        }
+        assert_eq!(hierarchy == TPM_RH_OWNER, firmware != FIRMWARE_VERSION);
+        flush(&mut tpm, key);
+    }
+    // TPM_RH_NULL signs with no scheme, so has no hash to quote with (as libtpms answers).
+    assert_eq!(rc(&tpm.process(&quote(TPM_RH_NULL))), Rc::SCHEME.param(2).0);
+}
+
+#[test]
+fn certify_creation_takes_only_the_ticket_of_the_object() {
+    let mut tpm = started();
+    let key = ecdsa_key(&mut tpm, TPM_RH_OWNER);
+    // TPM2_CreatePrimary: the object, its creationHash and its TPMT_TK_CREATION.
+    let mut create = |template: &[u8]| {
+        let r = create_primary(&mut tpm, TPM_RH_OWNER, template);
+        let (_public, rest) = split2b(response_params(&r, true));
+        let (_creation_data, rest) = split2b(rest);
+        let (creation_hash, rest) = split2b(rest);
+        let ticket_size = 6 + 2 + split2b(&rest[6..]).0.len();
+        let ticket = rest[..ticket_size].to_vec();
+        (handle_of(&r), creation_hash.to_vec(), ticket)
+    };
+    let (object, creation_hash, ticket) = create(&ecc_srk());
+    let (other, _, _) = create(&hmac_key());
+    let certify_creation = |object: u32| {
+        let mut p = Writer::new();
+        p.tpm2b(b"")
+            .tpm2b(&creation_hash)
+            .u16(alg::TPM_ALG_NULL)
+            .bytes(&ticket);
+        let handles = [key, object];
+        command(
+            TPM_CC_CERTIFY_CREATION,
+            &handles,
+            Some(b""),
+            &p.into_bytes(),
+        )
+    };
+    let r = tpm.process(&certify_creation(object));
+    let attest = parse_attest(&signed_attest(&mut tpm, &r, key));
+    assert_eq!(attest.kind, 0x801a);
+    let name = read_public_name(&mut tpm, object);
+    assert_eq!(
+        attest.attested,
+        [tpm2b(&name), tpm2b(&creation_hash)].concat()
+    );
+    assert_eq!(
+        rc(&tpm.process(&certify_creation(other))),
+        Rc::TICKET.param(4).0
+    );
+}
+
+#[test]
+fn a_credential_activates_only_for_the_object_it_names() {
+    let mut tpm = started();
+    let ek = handle_of(&create_primary(&mut tpm, TPM_RH_ENDORSEMENT, &ecc_srk()));
+    let object = ecdsa_key(&mut tpm, TPM_RH_OWNER);
+    let other = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &hmac_key()));
+    let mut p = Writer::new();
+    p.tpm2b(b"the credential")
+        .tpm2b(&read_public_name(&mut tpm, object));
+    let make = command(TPM_CC_MAKE_CREDENTIAL, &[ek], None, &p.into_bytes());
+    let r = tpm.process(&make);
+    assert_eq!(rc(&r), 0);
+    let (blob, rest) = split2b(&r[10..]);
+    let (secret, _) = split2b(rest);
+    let mut activate = |object: u32| {
+        let mut p = Writer::new();
+        p.tpm2b(blob).tpm2b(secret);
+        let handles = [object, ek];
+        let c = command_with(
+            TPM_CC_ACTIVATE_CREDENTIAL,
+            &handles,
+            &[b"", b""],
+            &p.into_bytes(),
+        );
+        tpm.process(&c)
+    };
+    let r = activate(object);
+    assert_eq!(rc(&r), 0);
+    assert_eq!(split2b(response_params(&r, false)).0, b"the credential");
+    assert_eq!(rc(&activate(other)), Rc::INTEGRITY.param(1).0);
+}
+
+/// TPMT_SYM_DEF_OBJECT: AES-128-CFB, and TPM_ALG_NULL.
+const AES128_CFB: &[u8] = &[0, 6, 0, 0x80, 0, 0x43];
+const NO_SYMMETRIC: &[u8] = &[0, 0x10];
+
+/// A sealed data object (with `attributes` too) whose policy lets a policy session duplicate
+/// it: TPM2_PolicyCommandCode(TPM2_Duplicate).
+fn duplicable(attributes: u32) -> Vec<u8> {
+    let code = TPM_CC_DUPLICATE.to_be_bytes();
+    let policy = policy_extend(&[0; 32], TPM_CC_POLICY_COMMAND_CODE, &[&code]);
+    let mut w = Writer::new();
+    w.u16(8)
+        .u16(alg::TPM_ALG_SHA256)
+        .u32(attr::USER_WITH_AUTH | attributes)
+        .tpm2b(&policy)
+        .u16(alg::TPM_ALG_NULL)
+        .u16(0);
+    w.into_bytes()
+}
+
+/// TPM2_Load of a child of `parent`.
+fn load_child(tpm: &mut Tpm, parent: u32, private: &[u8], public: &[u8]) -> u32 {
+    let mut p = Writer::new();
+    p.tpm2b(private).tpm2b(public);
+    handle_of(&tpm.process(&command(TPM_CC_LOAD, &[parent], Some(b""), &p.into_bytes())))
+}
+
+/// TPM2_Create of `template` under `parent` with `data`, then TPM2_Load: the object's handle
+/// and its TPMT_PUBLIC.
+fn create_loaded_child(tpm: &mut Tpm, parent: u32, template: &[u8], data: &[u8]) -> (u32, Vec<u8>) {
+    let p = create_params(b"", data, template);
+    let r = tpm.process(&command(TPM_CC_CREATE, &[parent], Some(b""), &p));
+    assert_eq!(rc(&r), 0);
+    let (private, rest) = split2b(response_params(&r, false));
+    let public = split2b(rest).0.to_vec();
+    (load_child(tpm, parent, private, &public), public)
+}
+
+/// TPM2_Unseal of `object`: the data.
+fn unseal(tpm: &mut Tpm, object: u32) -> Vec<u8> {
+    let r = tpm.process(&command(TPM_CC_UNSEAL, &[object], Some(b""), &[]));
+    assert_eq!(rc(&r), 0);
+    split2b(response_params(&r, false)).0.to_vec()
+}
+
+/// What TPM2_Duplicate answers: encryptionKeyOut, duplicate, outSymSeed.
+type Duplicate = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// TPM2_Duplicate of `object` for `new_parent`, its policy satisfied, with a key the TPM
+/// picks if `symmetric` is not TPM_ALG_NULL.
+fn duplicate(
+    tpm: &mut Tpm,
+    object: u32,
+    new_parent: u32,
+    symmetric: &[u8],
+) -> std::result::Result<Duplicate, u32> {
+    let mut s = policy_session(tpm, POLICY);
+    let code = TPM_CC_DUPLICATE.to_be_bytes();
+    assert_eq!(
+        policy_command(tpm, TPM_CC_POLICY_COMMAND_CODE, &[s.handle], &code),
+        0
+    );
+    let mut p = Writer::new();
+    p.tpm2b(&[]).bytes(symmetric);
+    let turns = &mut [Turn::bound(&mut s, CONTINUE, b"")];
+    let reply = call(
+        tpm,
+        TPM_CC_DUPLICATE,
+        &[object, new_parent],
+        turns,
+        &p.into_bytes(),
+    );
+    flush(tpm, s.handle);
+    let reply = reply?;
+    let (key, rest) = split2b(&reply.params);
+    let (duplicate, rest) = split2b(rest);
+    Ok((key.to_vec(), duplicate.to_vec(), split2b(rest).0.to_vec()))
+}
+
+/// TPM2_Import of `duplicate` (an object whose public area is `public`) under `parent`: the
+/// TPM2B_PRIVATE TPM2_Load takes.
+fn import(
+    tpm: &mut Tpm,
+    parent: u32,
+    public: &[u8],
+    (key, duplicate, seed): &Duplicate,
+    symmetric: &[u8],
+) -> std::result::Result<Vec<u8>, u32> {
+    let mut p = Writer::new();
+    p.tpm2b(key)
+        .tpm2b(public)
+        .tpm2b(duplicate)
+        .tpm2b(seed)
+        .bytes(symmetric);
+    let r = tpm.process(&command(
+        TPM_CC_IMPORT,
+        &[parent],
+        Some(b""),
+        &p.into_bytes(),
+    ));
+    match rc(&r) {
+        0 => Ok(split2b(response_params(&r, false)).0.to_vec()),
+        code => Err(code),
+    }
+}
+
+#[test]
+fn a_duplicate_imports_and_loads_under_its_new_parent() {
+    let mut tpm = started();
+    let srk = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &ecc_srk()));
+    let new_parent = handle_of(&create_primary(&mut tpm, TPM_RH_ENDORSEMENT, &ecc_srk()));
+    let (object, public) = create_loaded_child(&mut tpm, srk, &duplicable(0), b"moved");
+    // Wrapped inside (with a key the TPM picks) and outside (for the new parent), or neither.
+    let wrapped = duplicate(&mut tpm, object, new_parent, AES128_CFB).unwrap();
+    assert_eq!(wrapped.0.len(), 16);
+    let bare = duplicate(&mut tpm, object, TPM_RH_NULL, NO_SYMMETRIC).unwrap();
+    assert!(bare.0.is_empty() && bare.2.is_empty());
+    // Only a storage key is a new parent: not the sealed object itself.
+    assert_eq!(
+        duplicate(&mut tpm, object, object, NO_SYMMETRIC),
+        Err(Rc::TYPE.handle(2).0)
+    );
+    flush(&mut tpm, object);
+    for (dup, symmetric) in [(&wrapped, AES128_CFB), (&bare, NO_SYMMETRIC)] {
+        let private = import(&mut tpm, new_parent, &public, dup, symmetric).unwrap();
+        let copy = load_child(&mut tpm, new_parent, &private, &public);
+        assert_eq!(unseal(&mut tpm, copy), b"moved");
+        flush(&mut tpm, copy);
+    }
+    // Wrapped for the new parent: the old one cannot unwrap it.
+    assert_eq!(
+        import(&mut tpm, srk, &public, &wrapped, AES128_CFB),
+        Err(Rc::INTEGRITY.param(3).0)
+    );
+    // An object that may not leave its TPM, or its parent, is never imported.
+    for fixed in [attr::FIXED_TPM, attr::FIXED_PARENT] {
+        assert_eq!(
+            import(&mut tpm, srk, &duplicable(fixed), &bare, NO_SYMMETRIC),
+            Err(Rc::ATTRIBUTES.param(2).0)
+        );
+    }
+    // Its public area alone: no policy for the DUP role.
+    let mut p = Writer::new();
+    p.tpm2b(&[]).tpm2b(&public).u32(TPM_RH_OWNER);
+    let load = command(TPM_CC_LOAD_EXTERNAL, &[], None, &p.into_bytes());
+    let external = handle_of(&tpm.process(&load));
+    assert_eq!(
+        duplicate(&mut tpm, external, new_parent, AES128_CFB),
+        Err(Rc::AUTH_UNAVAILABLE.0)
+    );
+}
+
+#[test]
+fn encrypted_duplication_takes_both_wraps() {
+    let mut tpm = started();
+    let srk = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &ecc_srk()));
+    let new_parent = handle_of(&create_primary(&mut tpm, TPM_RH_ENDORSEMENT, &ecc_srk()));
+    let template = duplicable(attr::ENCRYPTED_DUPLICATION);
+    let (object, public) = create_loaded_child(&mut tpm, srk, &template, b"moved");
+    assert_eq!(
+        duplicate(&mut tpm, object, new_parent, NO_SYMMETRIC),
+        Err(Rc::SYMMETRIC.param(2).0)
+    );
+    assert_eq!(
+        duplicate(&mut tpm, object, TPM_RH_NULL, AES128_CFB),
+        Err(Rc::HIERARCHY.handle(2).0)
+    );
+    let wrapped = duplicate(&mut tpm, object, new_parent, AES128_CFB).unwrap();
+    let (key, dup, seed) = &wrapped;
+    let no_inner = (Vec::new(), dup.clone(), seed.clone());
+    assert_eq!(
+        import(&mut tpm, new_parent, &public, &no_inner, NO_SYMMETRIC),
+        Err(Rc::ATTRIBUTES.param(1).0)
+    );
+    let no_outer = (key.clone(), dup.clone(), Vec::new());
+    assert_eq!(
+        import(&mut tpm, new_parent, &public, &no_outer, AES128_CFB),
+        Err(Rc::ATTRIBUTES.param(4).0)
+    );
+    assert!(import(&mut tpm, new_parent, &public, &wrapped, AES128_CFB).is_ok());
+}
+
+/// TPM2_CreateLoaded of `template` under `parent` with `data`: the object's handle, and its
+/// TPM2B_PRIVATE, TPMT_PUBLIC and Name.
+fn create_loaded(
+    tpm: &mut Tpm,
+    parent: u32,
+    template: &[u8],
+    data: &[u8],
+) -> (u32, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut sensitive = Writer::new();
+    sensitive.tpm2b(b"").tpm2b(data);
+    let mut p = Writer::new();
+    p.tpm2b(&sensitive.into_bytes()).tpm2b(template);
+    let r = tpm.process(&command(
+        TPM_CC_CREATE_LOADED,
+        &[parent],
+        Some(b""),
+        &p.into_bytes(),
+    ));
+    let handle = handle_of(&r);
+    let (private, rest) = split2b(response_params(&r, true));
+    let (public, rest) = split2b(rest);
+    let name = split2b(rest).0;
+    (handle, private.to_vec(), public.to_vec(), name.to_vec())
+}
+
+#[test]
+fn create_loaded_makes_a_primary_or_a_child() {
+    let mut tpm = started();
+    // Under a hierarchy: the primary TPM2_CreatePrimary derives, and no TPM2B_PRIVATE.
+    let (srk, private, _, name) = create_loaded(&mut tpm, TPM_RH_OWNER, &ecc_srk(), b"");
+    assert!(private.is_empty());
+    let primary = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &ecc_srk()));
+    assert_eq!(read_public_name(&mut tpm, primary), name);
+    flush(&mut tpm, primary);
+    // Under a parent: the child, loaded, and wrapped for a later TPM2_Load.
+    let attributes = attr::FIXED_TPM | attr::FIXED_PARENT | attr::USER_WITH_AUTH;
+    let (child, private, public, name) =
+        create_loaded(&mut tpm, srk, &sealed(attributes), b"inside");
+    assert_eq!(unseal(&mut tpm, child), b"inside");
+    flush(&mut tpm, child);
+    let child = load_child(&mut tpm, srk, &private, &public);
+    assert_eq!(read_public_name(&mut tpm, child), name);
+    assert_eq!(unseal(&mut tpm, child), b"inside");
+}
+
+/// TPM2_EncryptDecrypt2 with `key`: outData and ivOut, or the response code.
+fn encrypt_decrypt2(
+    tpm: &mut Tpm,
+    key: u32,
+    decrypt: bool,
+    mode: u16,
+    (iv, data): (&[u8], &[u8]),
+) -> std::result::Result<(Vec<u8>, Vec<u8>), u32> {
+    let mut p = Writer::new();
+    p.tpm2b(data).u8(decrypt.into()).u16(mode).tpm2b(iv);
+    let c = command(TPM_CC_ENCRYPT_DECRYPT_2, &[key], Some(b""), &p.into_bytes());
+    let r = tpm.process(&c);
+    if rc(&r) != 0 {
+        return Err(rc(&r));
+    }
+    let (out, rest) = split2b(response_params(&r, false));
+    Ok((out.to_vec(), split2b(rest).0.to_vec()))
+}
+
+#[test]
+fn encrypt_decrypt_continues_from_the_iv_it_returns() {
+    use crate::public::{TPM_ALG_CBC, TPM_ALG_CFB, TPM_ALG_CTR, TPM_ALG_ECB, TPM_ALG_OFB};
+    let mut tpm = started();
+    // An AES-128 key with no mode of its own: the caller picks.
+    let attributes = ORDINARY | attr::SIGN | attr::DECRYPT;
+    let template = public(0x25, attributes, &[0, 6, 0, 0x80, 0, 0x10], &[0, 0]);
+    let key = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &template));
+    let data: Vec<u8> = (0..32).collect();
+    let iv = [7u8; 16];
+    for mode in [TPM_ALG_CBC, TPM_ALG_CFB, TPM_ALG_OFB, TPM_ALG_CTR] {
+        let mut run = |decrypt, iv: &[u8], data: &[u8]| {
+            encrypt_decrypt2(&mut tpm, key, decrypt, mode, (iv, data)).unwrap()
+        };
+        let (whole, iv_out) = run(false, &iv, &data);
+        let (first, iv1) = run(false, &iv, &data[..16]);
+        let (second, iv2) = run(false, &iv1, &data[16..]);
+        assert_eq!([first, second].concat(), whole, "mode {mode:#x}");
+        assert_eq!(iv2, iv_out, "mode {mode:#x}");
+        assert_eq!(run(true, &iv, &whole).0, data, "mode {mode:#x}");
+    }
+    // TPM2_EncryptDecrypt: the same, its parameters in another order.
+    let mut p = Writer::new();
+    p.u8(0).u16(TPM_ALG_CBC).tpm2b(&iv).tpm2b(&data);
+    let r = tpm.process(&command(
+        TPM_CC_ENCRYPT_DECRYPT,
+        &[key],
+        Some(b""),
+        &p.into_bytes(),
+    ));
+    let (whole, iv_out) =
+        encrypt_decrypt2(&mut tpm, key, false, TPM_ALG_CBC, (&iv, &data)).unwrap();
+    assert_eq!(
+        response_params(&r, false),
+        [tpm2b(&whole), tpm2b(&iv_out)].concat()
+    );
+    // No mode at all; an IV ECB does not take; a partial block for CBC.
+    let mut refused = |mode, iv: &[u8], data: &[u8]| {
+        encrypt_decrypt2(&mut tpm, key, false, mode, (iv, data)).unwrap_err()
+    };
+    assert_eq!(refused(alg::TPM_ALG_NULL, &iv, &data), Rc::MODE.param(3).0);
+    assert_eq!(refused(TPM_ALG_ECB, &iv, &data), Rc::SIZE.param(4).0);
+    assert_eq!(refused(TPM_ALG_CBC, &iv, &data[..15]), Rc::SIZE.param(1).0);
 }

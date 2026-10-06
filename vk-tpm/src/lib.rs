@@ -20,11 +20,13 @@
 
 mod alg;
 mod asym;
+mod attest;
 mod capability;
 mod commands;
 mod context;
 mod crypt;
 mod drbg;
+mod duplicate;
 mod entity;
 mod hierarchy;
 mod key;

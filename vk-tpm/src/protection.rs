@@ -15,18 +15,54 @@ use crate::rc::{Rc, Result};
 /// The AES block: the IV of a wrapped sensitive area.
 const IV_SIZE: usize = crypt::AES_BLOCK;
 
-/// The parent's nameAlg, and the symmetric key and HMAC key that protect a child.
-type Protection = (Hash, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
+/// The protector's nameAlg, and the symmetric key and HMAC key that protect a child.
+pub type Protection = (Hash, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
 
-/// The keys that protect a child of `parent` named `name` (ComputeProtectionKeyParms,
-/// ComputeOuterIntegrity).
+/// The keys that protect a child of `parent` named `name`.
 fn protection(parent: &Key, name: &[u8]) -> Result<Protection> {
-    let hash = parent.public.name_alg.ok_or(Rc::FAILURE)?;
-    let def = parent.public.params.symmetric().ok_or(Rc::FAILURE)?;
-    let seed = parent.seed();
+    protection_with(parent, parent.seed(), name)
+}
+
+/// Protection keys for `name` under `protector`, derived from `seed` (its own or an external
+/// credential seed) (ComputeProtectionKeyParms, ComputeOuterIntegrity).
+pub fn protection_with(protector: &Key, seed: &[u8], name: &[u8]) -> Result<Protection> {
+    let hash = protector.public.name_alg.ok_or(Rc::FAILURE)?;
+    let def = protector.public.params.symmetric().ok_or(Rc::FAILURE)?;
     let sym = crypt::kdfa(hash, seed, b"STORAGE", name, &[], def.key_bytes());
     let hmac = crypt::kdfa(hash, seed, b"INTEGRITY", &[], &[], hash.size());
     Ok((hash, sym, hmac))
+}
+
+/// ProduceOuterWrap without an IV, as a credential or a duplicate is wrapped for `protector`:
+/// HMAC ‖ `data` encrypted with AES-CFB (a zero IV), under the keys of `seed` and `name`.
+pub fn outer_wrap(protector: &Key, seed: &[u8], name: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    let (hash, sym, hmac) = protection_with(protector, seed, name)?;
+    let mut data = Zeroizing::new(data.to_vec());
+    crypt::aes_cfb(&sym, &[0; IV_SIZE], &mut data, true)?;
+    let integrity = crypt::hmac(hash, &hmac, &[&data, name]);
+    let mut out = Writer::new();
+    out.tpm2b(&integrity).bytes(&data);
+    Ok(out.into_bytes())
+}
+
+/// UnwrapOuter without an IV: check the HMAC `blob` starts with (TPM_RC_INTEGRITY), and
+/// decrypt the rest.
+pub fn outer_unwrap(
+    protector: &Key,
+    seed: &[u8],
+    name: &[u8],
+    blob: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    let mut r = Reader::new(blob);
+    let integrity = r.tpm2b(MAX_DIGEST)?;
+    let (hash, sym, hmac) = protection_with(protector, seed, name)?;
+    let expected = crypt::hmac(hash, &hmac, &[r.rest(), name]);
+    if !bool::from(subtle::ConstantTimeEq::ct_eq(integrity, &expected[..])) {
+        return Err(Rc::INTEGRITY);
+    }
+    let mut data = Zeroizing::new(r.rest().to_vec());
+    crypt::aes_cfb(&sym, &[0; IV_SIZE], &mut data, false)?;
+    Ok(data)
 }
 
 /// SensitiveToPrivate: the TPM2B_PRIVATE of a child of `parent`: integrity ‖ IV ‖ the

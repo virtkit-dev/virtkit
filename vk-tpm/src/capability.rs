@@ -56,6 +56,10 @@ const PT_FIXED: u32 = 0x100;
 const PT_VAR: u32 = 0x200;
 const PT_GROUP: u32 = 0x100;
 
+/// The firmware version: TPM_PT_FIRMWARE_VERSION_1 (high half) and _2, and what attestations
+/// report.
+pub const FIRMWARE_VERSION: u64 = 1 << 32;
+
 /// Up to `count` of `entries` (sorted by key) from key `from` on, and whether more follow.
 fn page<K: Copy + Ord, T: Copy>(entries: &[(K, T)], from: K, count: usize) -> (Vec<(K, T)>, bool) {
     let mut rest = entries.iter().filter(|(key, _)| *key >= from).copied();
@@ -240,9 +244,9 @@ fn properties(tpm: &Tpm) -> Vec<(u32, u32)> {
         (0x107, chars(b"kit\0")),
         (0x108, 0),
         (0x109, 0),
-        (0x10a, 1), // TPM_PT_VENDOR_TPM_TYPE
-        (0x10b, 1), // TPM_PT_FIRMWARE_VERSION_1..2
-        (0x10c, 0),
+        (0x10a, 1),                               // TPM_PT_VENDOR_TPM_TYPE
+        (0x10b, (FIRMWARE_VERSION >> 32) as u32), // TPM_PT_FIRMWARE_VERSION_1..2
+        (0x10c, FIRMWARE_VERSION as u32),
         (0x10d, 1024),                         // TPM_PT_INPUT_BUFFER
         (0x10e, 3),                            // TPM_PT_HR_TRANSIENT_MIN
         (0x10f, 7),                            // TPM_PT_HR_PERSISTENT_MIN

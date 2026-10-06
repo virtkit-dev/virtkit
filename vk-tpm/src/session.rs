@@ -38,8 +38,6 @@ const POLICY_SESSION_FIRST: u32 = 0x0300_0000;
 const MAX_SESSIONS: usize = 3;
 /// The largest nonce or HMAC/password a session carries (sizeof(TPMU_HA)).
 const MAX_AUTH: usize = MAX_DIGEST;
-/// The largest encrypted salt (TPM2B_ENCRYPTED_SECRET, sized for libtpms' RSA-4096).
-const MAX_ENCRYPTED_SECRET: usize = 512;
 /// The size of a bound session's bind value (sizeof(TPMU_NAME): a TPMT_HA).
 const BIND_SIZE: usize = 2 + MAX_DIGEST;
 
@@ -1150,7 +1148,9 @@ pub fn start_auth_session(
     w: &mut Out,
 ) -> Result<()> {
     let nonce_caller = r.tpm2b(MAX_AUTH).map_err(|rc| rc.param(1))?;
-    let encrypted_salt = r.tpm2b(MAX_ENCRYPTED_SECRET).map_err(|rc| rc.param(2))?;
+    let encrypted_salt = r
+        .tpm2b(crate::key::MAX_ENCRYPTED_SECRET)
+        .map_err(|rc| rc.param(2))?;
     let kind = match r.u8().map_err(|rc| rc.param(3))? {
         0x00 => Kind::Hmac,
         0x01 => Kind::Policy,

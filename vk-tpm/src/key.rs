@@ -18,15 +18,19 @@ use crate::entity::{
 use crate::marshal::{Reader, Writer};
 use crate::pcr;
 use crate::protection::{load_checked, unwrap, wrap};
-use crate::public::{self, Params, Parent, Public, Sensitive, SensitiveCreate, Type, Unique, attr};
+use crate::public::{
+    self, MAX_TEMPLATE, Params, Parent, Public, Sensitive, SensitiveCreate, Type, Unique, attr,
+};
 use crate::rc::{Rc, Result};
 use crate::state::{Seed, StateError, read_bool};
 use crate::{LOCALITY, Out, Tpm};
 
 /// TPM_ST_CREATION, the tag of a TPMT_TK_CREATION.
-const TPM_ST_CREATION: u16 = 0x8021;
+pub const TPM_ST_CREATION: u16 = 0x8021;
 /// TPM2B_DATA: sizeof(TPMT_HA).
 pub const MAX_DATA: usize = 2 + MAX_DIGEST;
+/// TPM2B_ENCRYPTED_SECRET: sizeof(TPMU_ENCRYPTED_SECRET), an RSA-4096 block as libtpms sizes it.
+pub const MAX_ENCRYPTED_SECRET: usize = public::MAX_RSA_KEY_BYTES;
 /// TPM2B_PRIVATE: sizeof(_PRIVATE), two TPM2B_DIGESTs and a TPM2B_SENSITIVE as the reference
 /// lays them out.
 pub const MAX_PRIVATE: usize = 2 * (2 + MAX_DIGEST) + 2 + 2 + 2 * (2 + MAX_DIGEST) + 2 + 1280;
@@ -148,6 +152,40 @@ impl Key {
                     own_x,
                     name_alg.size(),
                 ))
+            }
+            _ => Err(Rc::FAILURE),
+        }
+    }
+
+    /// CryptSecretEncrypt: a new seed of the key's nameAlg digest size, and that seed encrypted
+    /// to the key with `label`, as [`Key::decrypt_secret`] decrypts it: RSA-OAEP with the
+    /// nameAlg, or an ephemeral ECDH key and KDFe. The public area is all it takes.
+    pub fn encrypt_secret(&self, label: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
+        let hash = self.public.name_alg.ok_or(Rc::FAILURE)?;
+        if !self.public.has(attr::DECRYPT) {
+            return Err(Rc::ATTRIBUTES);
+        }
+        match (&self.public.params, &self.public.unique) {
+            (Params::Rsa { exponent, .. }, Unique::Rsa(n)) => {
+                let mut seed = Zeroizing::new(vec![0; hash.size()]);
+                getrandom::fill(&mut seed).map_err(|_| Rc::FAILURE)?;
+                let public = asym::rsa_public(n, *exponent)?;
+                let oaep = public::TPM_ALG_OAEP;
+                let secret = asym::rsa_encrypt(&public, oaep, Some(hash), label, &seed)?;
+                Ok((seed, secret))
+            }
+            (Params::Ecc { .. }, Unique::Ecc { x, y }) => {
+                if asym::point(x, y).is_none() {
+                    return Err(Rc::KEY);
+                }
+                let ephemeral = asym::ecc_random()?;
+                let (ex, ey) = asym::ecc_public(ephemeral.as_slice())?;
+                let (zx, _) =
+                    asym::ecc_multiply(ephemeral.as_slice(), x, y).map_err(|_| Rc::KEY)?;
+                let seed = crypt::kdfe(hash, &zx, label, &ex, x, hash.size());
+                let mut point = Writer::new();
+                point.tpm2b(&ex).tpm2b(&ey);
+                Ok((seed, point.into_bytes()))
             }
             _ => Err(Rc::FAILURE),
         }
@@ -431,10 +469,20 @@ impl Tpm {
     /// TicketComputeCreation: TPMT_TK_CREATION, an HMAC with the hierarchy's proof over the
     /// Name and the creation digest.
     fn creation_ticket(&self, hierarchy: u32, name: &[u8], creation_hash: &[u8], w: &mut Writer) {
+        let ticket = self.creation_ticket_digest(hierarchy, name, creation_hash);
+        w.u16(TPM_ST_CREATION).u32(hierarchy).tpm2b(&ticket);
+    }
+
+    /// The digest of a creation ticket: HMAC(proof, TPM_ST_CREATION ‖ Name ‖ creationHash).
+    pub fn creation_ticket_digest(
+        &self,
+        hierarchy: u32,
+        name: &[u8],
+        creation_hash: &[u8],
+    ) -> Vec<u8> {
         let tag = TPM_ST_CREATION.to_be_bytes();
         let proof = self.proof(hierarchy);
-        let ticket = crypt::hmac(Hash::Sha512, proof.as_slice(), &[&tag, name, creation_hash]);
-        w.u16(TPM_ST_CREATION).u32(hierarchy).tpm2b(&ticket);
+        crypt::hmac(Hash::Sha512, proof.as_slice(), &[&tag, name, creation_hash])
     }
 
     /// Flush the objects of a hierarchy being disabled or cleared (ObjectFlushHierarchy).
@@ -530,6 +578,48 @@ pub fn create(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, w: &mut Out) -> Re
     public.write_sized(w);
     w.tpm2b(&creation).tpm2b(&creation_hash);
     tpm.creation_ticket(hierarchy, &name, &creation_hash, w);
+    Ok(())
+}
+
+/// TPM2_CreateLoaded: TPM2_CreatePrimary under a hierarchy, or TPM2_Create under a parent with
+/// the object loaded immediately. A derivation parent (a restricted keyed-hash decryption key)
+/// is not implemented: it is rejected as a parent (see the design's deviations).
+pub fn create_loaded(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, w: &mut Out) -> Result<()> {
+    let mut sensitive = SensitiveCreate::read_sized(r).map_err(|rc| rc.param(1))?;
+    let template = r.tpm2b(MAX_TEMPLATE).map_err(|rc| rc.param(2))?;
+    end(r)?;
+    let parent_handle = first(handles)?;
+    let primary = handle_type(parent_handle) == TPM_HT_PERMANENT;
+    if !primary && !tpm.key(parent_handle).is_some_and(Key::is_parent) {
+        return Err(Rc::TYPE.handle(1));
+    }
+    tpm.free_slot()?;
+    let mut public = Public::from_template(template).map_err(|rc| rc.param(2))?;
+    sensitive.auth =
+        public::adjust_auth(&sensitive.auth, public.digest_size()).map_err(|rc| rc.param(1))?;
+    let parent = if primary {
+        None
+    } else {
+        tpm.key(parent_handle)
+    };
+    let checked = parent.map(|p| Parent { public: &p.public });
+    let data_len = sensitive.data.len();
+    public::create_checks(checked.as_ref(), &public, data_len).map_err(|rc| rc.param(2))?;
+    let secrets = if primary {
+        tpm.derive_primary(parent_handle, &mut public, &sensitive)?
+    } else {
+        create_object(&mut public, &sensitive, &mut Drbg::random()?, None)?
+    };
+    let private = match parent {
+        Some(p) => wrap(p, &public.name(), public.name_alg, &secrets)?,
+        None => Vec::new(),
+    };
+    let mut key = Key::new(public, Some(secrets))?;
+    key.set_loaded(parent, parent_handle);
+    w.tpm2b(&private);
+    key.public.write_sized(w);
+    w.tpm2b(&key.name);
+    w.handle = Some(tpm.load_object(crate::object::Object::Key(Box::new(key)))?);
     Ok(())
 }
 
