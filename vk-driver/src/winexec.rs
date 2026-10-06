@@ -333,20 +333,30 @@ fn put_run_file(ga: &mut Client, path: &str, body: &[u8]) -> Result<()> {
 /// and delete it afterward: a command line would cap it at cmd's 8191 characters. Only SYSTEM
 /// and administrators can read the file; a fixed-size [`run_ps1_command_line`] runs it.
 pub(crate) fn powershell(ga: &mut Client, script: &str, what: &str) -> Result<i32> {
-    let path = format!(r"{RUN_DIR}\{}.ps1", crate::scratch::random_nonce()?);
-    // With a BOM: without one, Windows PowerShell reads the file in the ANSI code page.
-    put_run_file(ga, &path, format!("\u{feff}{script}").as_bytes())?;
     let mut out = Vec::new();
-    let ran = exec_command_line(ga, &run_ps1_command_line(&path), &[], None, false, &mut out);
-    // Best effort, as for a command's own files.
-    let _ = cmd(ga, &["del", "/q", &path]);
-    let code = ran?;
+    let code = powershell_output(ga, script, &mut out)?;
     if code != 0 {
         for line in String::from_utf8_lossy(&out).lines() {
             eprintln!("virtkit: {what}: {line}");
         }
     }
     Ok(code)
+}
+
+/// Run PowerShell `script` as [`powershell`] does, stream its output to `out`, and return its
+/// exit code.
+pub(crate) fn powershell_output(
+    ga: &mut Client,
+    script: &str,
+    out: &mut impl Write,
+) -> Result<i32> {
+    let path = format!(r"{RUN_DIR}\{}.ps1", crate::scratch::random_nonce()?);
+    // With a BOM: without one, Windows PowerShell reads the file in the ANSI code page.
+    put_run_file(ga, &path, format!("\u{feff}{script}").as_bytes())?;
+    let ran = exec_command_line(ga, &run_ps1_command_line(&path), &[], None, false, out);
+    // Best effort, as for a command's own files.
+    let _ = cmd(ga, &["del", "/q", &path]);
+    ran
 }
 
 /// The command line running the `.ps1` at `path` as `-EncodedCommand`, the way vk's other
