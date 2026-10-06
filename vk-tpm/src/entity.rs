@@ -57,6 +57,8 @@ pub enum HandleKind {
     Clear,
     /// TPMI_DH_OBJECT, or with `true` TPMI_DH_OBJECT+: a transient or persistent object.
     Object(bool),
+    /// TPMI_DH_ENTITY, or with `true` TPMI_DH_ENTITY+: anything with an authorization.
+    Entity(bool),
 }
 
 impl HandleKind {
@@ -74,6 +76,15 @@ impl HandleKind {
             HandleKind::Object(null) => {
                 TRANSIENT.contains(&handle)
                     || handle_type(handle) == TPM_HT_PERSISTENT
+                    || (null && handle == TPM_RH_NULL)
+            }
+            HandleKind::Entity(null) => {
+                hierarchy
+                    || handle == TPM_RH_LOCKOUT
+                    || TRANSIENT.contains(&handle)
+                    || matches!(handle_type(handle), TPM_HT_PERSISTENT | TPM_HT_NV_INDEX)
+                    || is_pcr(handle)
+                    || VENDOR_AUTH.contains(&handle)
                     || (null && handle == TPM_RH_NULL)
             }
         };
@@ -126,6 +137,13 @@ impl Tpm {
                         Err(Rc::HANDLE)
                     }
                 }
+                // No NV index exists yet.
+                TPM_HT_NV_INDEX => Err(Rc::HANDLE),
+                TPM_HT_HMAC_SESSION | TPM_HT_POLICY_SESSION => match self.session(handle) {
+                    None => return Err(Rc::REFERENCE_H0.nth(n.saturating_sub(1))),
+                    Some(_) if self.loaded_session(handle).is_none() => Err(Rc::HANDLE),
+                    Some(_) => Ok(()),
+                },
                 // A PCR handle that passed its kind check names a PCR.
                 _ => Ok(()),
             };

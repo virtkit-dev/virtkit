@@ -16,6 +16,7 @@ use crate::marshal::{Reader, Writer};
 use crate::object::MAX_OBJECTS;
 use crate::pcr::{self, PCR_COUNT};
 use crate::rc::{Rc, Result};
+use crate::session::{MAX_ACTIVE, MAX_LOADED};
 use crate::{MAX_COMMAND_SIZE, Out, Tpm};
 
 const TPM_CAP_ALGS: u32 = 0;
@@ -79,19 +80,20 @@ pub fn get_capability(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> 
             more
         }
         TPM_CAP_HANDLES => {
-            let handles: Vec<u32> = match handle_type(property) {
-                TPM_HT_PCR => (0..PCR_COUNT as u32).collect(),
-                TPM_HT_PERMANENT => PERMANENT_HANDLES.to_vec(),
-                TPM_HT_TRANSIENT => tpm.loaded_objects(),
-                // No NV index, loaded or saved session, or persistent object yet.
-                TPM_HT_NV_INDEX
-                | TPM_HT_HMAC_SESSION
-                | TPM_HT_POLICY_SESSION
-                | TPM_HT_PERSISTENT => Vec::new(),
+            // The handles listed, and the one to list from.
+            let (handles, from): (Vec<u32>, u32) = match handle_type(property) {
+                TPM_HT_PCR => ((0..PCR_COUNT as u32).collect(), property),
+                TPM_HT_PERMANENT => (PERMANENT_HANDLES.to_vec(), property),
+                TPM_HT_TRANSIENT => (tpm.loaded_objects(), property),
+                // TPM_HT_LOADED_SESSION: the loaded sessions from that index on, whatever their
+                // type (so a policy session's handle may sort before the one asked for).
+                TPM_HT_HMAC_SESSION => (tpm.loaded_sessions(property), 0),
+                // No NV index, saved session (TPM_HT_SAVED_SESSION) or persistent object yet.
+                TPM_HT_NV_INDEX | TPM_HT_POLICY_SESSION | TPM_HT_PERSISTENT => (Vec::new(), 0),
                 _ => return Err(Rc::HANDLE.param(2)),
             };
             let keyed: Vec<_> = handles.iter().map(|&h| (h, ())).collect();
-            let (handles, more) = page(&keyed, property, count.min(MAX_CAP_HANDLES));
+            let (handles, more) = page(&keyed, from, count.min(MAX_CAP_HANDLES));
             data.count(handles.len());
             for (h, ()) in handles {
                 data.u32(h);
@@ -204,6 +206,9 @@ fn properties(tpm: &Tpm) -> Vec<(u32, u32)> {
     let commands = COMMANDS.len() as u32;
     let loaded = tpm.loaded_objects().len();
     let transient_avail = MAX_OBJECTS.saturating_sub(loaded) as u32;
+    let sessions = tpm.session_count() as u32;
+    let loaded_avail = (MAX_LOADED as u32).saturating_sub(sessions);
+    let active_avail = (MAX_ACTIVE as u32).saturating_sub(sessions);
     let max_command = MAX_COMMAND_SIZE as u32;
     vec![
         (0x100, chars(b"2.0\0")), // TPM_PT_FAMILY_INDICATOR
@@ -257,10 +262,10 @@ fn properties(tpm: &Tpm) -> Vec<(u32, u32)> {
         (0x200, permanent),                    // TPM_PT_PERMANENT
         (0x201, startup_clear),                // TPM_PT_STARTUP_CLEAR
         (0x202, 0),                            // TPM_PT_HR_NV_INDEX
-        (0x203, 0),                            // TPM_PT_HR_LOADED
-        (0x204, 3),                            // TPM_PT_HR_LOADED_AVAIL
-        (0x205, 0),                            // TPM_PT_HR_ACTIVE
-        (0x206, 64),                           // TPM_PT_HR_ACTIVE_AVAIL
+        (0x203, sessions),                     // TPM_PT_HR_LOADED
+        (0x204, loaded_avail),                 // TPM_PT_HR_LOADED_AVAIL
+        (0x205, sessions),                     // TPM_PT_HR_ACTIVE
+        (0x206, active_avail),                 // TPM_PT_HR_ACTIVE_AVAIL
         (0x207, transient_avail),              // TPM_PT_HR_TRANSIENT_AVAIL
         (0x208, 0),                            // TPM_PT_HR_PERSISTENT
         (0x209, 0x33),                         // TPM_PT_HR_PERSISTENT_AVAIL

@@ -148,15 +148,25 @@ impl Hasher {
 }
 
 // TPMA_ALGORITHM bits.
+const SYMMETRIC: u32 = 1 << 1;
 const HASH: u32 = 1 << 2;
+const SIGNING: u32 = 1 << 8;
+const ENCRYPTING: u32 = 1 << 9;
+const METHOD: u32 = 1 << 10;
 
 /// TPM_CAP_ALGS: each implemented algorithm and its TPMA_ALGORITHM, in TPM_ALG_ID order. Only
-/// what the TPM actually implements: a client picks from this list.
-pub const IMPLEMENTED: [(u16, u32); 4] = [
+/// what the TPM actually implements: a client picks from this list. HMAC, AES (in CFB mode),
+/// XOR and KDFa (SP 800-108) are those of the sessions.
+pub const IMPLEMENTED: [(u16, u32); 9] = [
     (TPM_ALG_SHA1, HASH),
+    (0x0005, HASH | SIGNING),   // TPM_ALG_HMAC
+    (0x0006, SYMMETRIC),        // TPM_ALG_AES
+    (0x000a, SYMMETRIC | HASH), // TPM_ALG_XOR
     (TPM_ALG_SHA256, HASH),
     (TPM_ALG_SHA384, HASH),
     (TPM_ALG_SHA512, HASH),
+    (0x0022, HASH | METHOD),          // TPM_ALG_KDF1_SP800_108
+    (0x0043, SYMMETRIC | ENCRYPTING), // TPM_ALG_CFB
 ];
 
 #[cfg(test)]

@@ -343,11 +343,12 @@ pub fn flush_context(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> R
         return Err(Rc::VALUE.param(1));
     }
     end(r)?;
-    if tpm.object(handle).is_some() {
+    if is_session(handle) {
+        tpm.flush_session(handle).map_err(|rc| rc.param(1))
+    } else if tpm.object(handle).is_some() {
         tpm.flush_object(handle);
         Ok(())
     } else {
-        // No session can be loaded yet.
         Err(Rc::HANDLE.param(1))
     }
 }

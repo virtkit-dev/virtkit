@@ -10,7 +10,7 @@ use crate::marshal::{Reader, Writer};
 use crate::pcr::{self, Startup};
 use crate::rc::{Rc, Result};
 use crate::state::{Saved, Shutdown};
-use crate::{LOCALITY, Out, Tpm, capability, hierarchy, object};
+use crate::{LOCALITY, Out, Tpm, capability, hierarchy, object, session};
 
 pub const TPM_CC_HIERARCHY_CONTROL: u32 = 0x121;
 pub const TPM_CC_CHANGE_EPS: u32 = 0x124;
@@ -30,6 +30,7 @@ pub const TPM_CC_STARTUP: u32 = 0x144;
 pub const TPM_CC_SHUTDOWN: u32 = 0x145;
 pub const TPM_CC_SEQUENCE_UPDATE: u32 = 0x15c;
 pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x165;
+pub const TPM_CC_START_AUTH_SESSION: u32 = 0x176;
 pub const TPM_CC_GET_CAPABILITY: u32 = 0x17a;
 pub const TPM_CC_GET_RANDOM: u32 = 0x17b;
 pub const TPM_CC_HASH: u32 = 0x17d;
@@ -48,6 +49,10 @@ pub struct Command {
     pub auth: usize,
     /// It takes an authorization area (not TPM2_Startup).
     pub sessions: bool,
+    /// A session may encrypt its first parameter, a TPM2B (DECRYPT_2).
+    pub decrypt: bool,
+    /// A session may encrypt the response's first parameter, a TPM2B (ENCRYPT_2).
+    pub encrypt: bool,
     /// TPMA_CC.nv: it may write the TPM's NV memory.
     nv: bool,
     /// TPMA_CC.extensive: it may flush many objects.
@@ -66,6 +71,8 @@ impl Command {
             handles: &[],
             auth: 0,
             sessions: true,
+            decrypt: false,
+            encrypt: false,
             nv: false,
             extensive: false,
             flushed: false,
@@ -79,6 +86,20 @@ impl Command {
         Command {
             handles,
             auth,
+            ..self
+        }
+    }
+
+    const fn decrypt(self) -> Command {
+        Command {
+            decrypt: true,
+            ..self
+        }
+    }
+
+    const fn encrypt(self) -> Command {
+        Command {
+            encrypt: true,
             ..self
         }
     }
@@ -155,13 +176,15 @@ pub const COMMANDS: &[Command] = &[
         hierarchy::hierarchy_change_auth,
     )
     .handles(&[H::HierarchyAuth], 1)
-    .nv(),
+    .nv()
+    .decrypt(),
     Command::new(TPM_CC_PCR_ALLOCATE, pcr_allocate)
         .handles(&[H::Platform], 1)
         .nv(),
     Command::new(TPM_CC_SET_PRIMARY_POLICY, hierarchy::set_primary_policy)
         .handles(&[H::HierarchyPolicy], 1)
-        .nv(),
+        .nv()
+        .decrypt(),
     Command::new(
         TPM_CC_DICTIONARY_ATTACK_LOCK_RESET,
         hierarchy::dictionary_attack_lock_reset,
@@ -176,21 +199,31 @@ pub const COMMANDS: &[Command] = &[
     .nv(),
     Command::new(TPM_CC_PCR_EVENT, pcr_event)
         .handles(&[H::Pcr(true)], 1)
-        .nv(),
+        .nv()
+        .decrypt(),
     Command::new(TPM_CC_PCR_RESET, pcr_reset)
         .handles(&[H::Pcr(false)], 1)
         .nv(),
     Command::new(TPM_CC_SEQUENCE_COMPLETE, object::sequence_complete)
         .handles(&[H::Object(false)], 1)
-        .flushed(),
+        .flushed()
+        .decrypt()
+        .encrypt(),
     Command::new(TPM_CC_SELF_TEST, self_test).nv(),
     Command::new(TPM_CC_STARTUP, startup).nv().no_sessions(),
     Command::new(TPM_CC_SHUTDOWN, shutdown).nv(),
-    Command::new(TPM_CC_SEQUENCE_UPDATE, object::sequence_update).handles(&[H::Object(false)], 1),
+    Command::new(TPM_CC_SEQUENCE_UPDATE, object::sequence_update)
+        .handles(&[H::Object(false)], 1)
+        .decrypt(),
     Command::new(TPM_CC_FLUSH_CONTEXT, object::flush_context).no_sessions(),
+    Command::new(TPM_CC_START_AUTH_SESSION, session::start_auth_session)
+        .handles(&[H::Object(true), H::Entity(true)], 0)
+        .response_handle()
+        .decrypt()
+        .encrypt(),
     Command::new(TPM_CC_GET_CAPABILITY, capability::get_capability),
-    Command::new(TPM_CC_GET_RANDOM, get_random),
-    Command::new(TPM_CC_HASH, object::hash),
+    Command::new(TPM_CC_GET_RANDOM, get_random).encrypt(),
+    Command::new(TPM_CC_HASH, object::hash).decrypt().encrypt(),
     Command::new(TPM_CC_PCR_READ, pcr_read),
     Command::new(TPM_CC_PCR_EXTEND, pcr_extend)
         .handles(&[H::Pcr(true)], 1)
@@ -201,8 +234,11 @@ pub const COMMANDS: &[Command] = &[
     )
     .handles(&[H::Pcr(true), H::Object(false)], 2)
     .nv()
-    .flushed(),
-    Command::new(TPM_CC_HASH_SEQUENCE_START, object::hash_sequence_start).response_handle(),
+    .flushed()
+    .decrypt(),
+    Command::new(TPM_CC_HASH_SEQUENCE_START, object::hash_sequence_start)
+        .response_handle()
+        .decrypt(),
 ];
 
 pub fn find(code: u32) -> Option<&'static Command> {
@@ -270,6 +306,8 @@ fn startup(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> 
     tpm.volatile.pcrs.startup(allocation, kind, saved_pcrs);
     tpm.volatile.pcr_reconfig = false;
     tpm.volatile.objects.iter_mut().for_each(|o| *o = None);
+    tpm.volatile.sessions.iter_mut().for_each(|s| *s = None);
+    tpm.volatile.exclusive_audit = None;
     tpm.volatile.orderly_startup = orderly;
     tpm.volatile.da_used = false;
     tpm.volatile.started = true;

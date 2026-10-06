@@ -113,6 +113,7 @@ fn valid_handle(kind: HandleKind) -> u32 {
         HandleKind::Lockout => TPM_RH_LOCKOUT,
         // The sequence the test starts first.
         HandleKind::Object(_) => 0x8000_0000,
+        HandleKind::Entity(_) => TPM_RH_NULL,
     }
 }
 
@@ -123,6 +124,7 @@ fn every_command_refuses_trailing_parameter_bytes() {
         if cmd.code != TPM_CC_STARTUP {
             tpm.process(&command(TPM_CC_STARTUP, &[], None, &[0, 0]));
         }
+        let start_auth_session = [&[0, 16][..], &[0; 16], &[0, 0, 0, 0, 0x10, 0, 0x0b]].concat();
         let params: &[u8] = match cmd.code {
             TPM_CC_GET_CAPABILITY => &[0, 0, 0, 6, 0, 0, 1, 0, 0, 0, 0, 1],
             TPM_CC_GET_RANDOM | TPM_CC_STARTUP | TPM_CC_SHUTDOWN => &[0, 0],
@@ -139,6 +141,8 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_SEQUENCE_UPDATE | TPM_CC_EVENT_SEQUENCE_COMPLETE => &[0, 0],
             TPM_CC_SEQUENCE_COMPLETE => &[0, 0, 0x40, 0, 0, 7],
             TPM_CC_FLUSH_CONTEXT => &[0x80, 0, 0, 0],
+            // A 16-byte nonce, no salt, HMAC, TPM_ALG_NULL, SHA-256.
+            TPM_CC_START_AUTH_SESSION => &start_auth_session,
             _ => &[0, 0, 0, 0],
         };
         let params = [params, &[0xee]].concat();
@@ -956,4 +960,702 @@ fn a_hash_sequence_starting_like_a_signed_structure_gets_no_ticket() {
         "too short to tell"
     );
     assert_eq!(sequence_ticket(&mut tpm, b"data"), TPM_RH_OWNER);
+}
+
+/// TPM2_StartAuthSession: an HMAC session (SHA-256, `symmetric`) bound to `bind`, with a
+/// nonceCaller of 16 bytes of `n`. Returns its handle and nonceTPM.
+fn start_session(tpm: &mut Tpm, bind: u32, symmetric: &[u8], n: u8) -> (u32, Vec<u8>) {
+    let mut p = Writer::new();
+    p.tpm2b(&[n; 16])
+        .tpm2b(&[])
+        .u8(0)
+        .bytes(symmetric)
+        .u16(alg::TPM_ALG_SHA256);
+    let r = tpm.process(&command(
+        TPM_CC_START_AUTH_SESSION,
+        &[TPM_RH_NULL, bind],
+        None,
+        &p.into_bytes(),
+    ));
+    assert_eq!(rc(&r), 0);
+    let handle = u32::from_be_bytes(r[10..14].try_into().unwrap());
+    assert_eq!(r[14..16], [0, 16], "nonceTPM is as long as nonceCaller");
+    (handle, r[16..32].to_vec())
+}
+
+// Client for HMAC, policy and trial sessions. It computes every hash, HMAC, KDFa and cipher
+// directly with RustCrypto, independently of `crypt.rs`, to check the engine against Part 1.
+
+// TPMA_SESSION bits.
+const CONTINUE: u8 = 0x01;
+const AUDIT_EXCLUSIVE: u8 = 0x02;
+const AUDIT_RESET: u8 = 0x04;
+const DECRYPT: u8 = 0x20;
+const ENCRYPT: u8 = 0x40;
+const AUDIT: u8 = 0x80;
+
+// TPM_SE.
+const HMAC: u8 = 0;
+const POLICY: u8 = 1;
+const TRIAL: u8 = 3;
+
+fn sha256(parts: &[&[u8]]) -> Vec<u8> {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for part in parts {
+        h.update(part);
+    }
+    h.finalize().to_vec()
+}
+
+fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+    use hmac::{KeyInit, Mac};
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+    for part in parts {
+        mac.update(part);
+    }
+    mac.finalize().into_bytes().to_vec()
+}
+
+/// KDFa with SHA-256: HMAC(key, counter ‖ label ‖ 0 ‖ contextU ‖ contextV ‖ bits) blocks.
+fn kdfa_sha256(key: &[u8], label: &[u8], u: &[u8], v: &[u8], bytes: usize) -> Vec<u8> {
+    let bits = (bytes as u32 * 8).to_be_bytes();
+    let mut out = Vec::new();
+    for counter in 1u32..=(bytes as u32).div_ceil(32) {
+        out.extend(hmac_sha256(
+            key,
+            &[&counter.to_be_bytes(), label, &[0], u, v, &bits],
+        ));
+    }
+    out.truncate(bytes);
+    out
+}
+
+/// The parameter encryption of a session.
+#[derive(Clone, Copy)]
+enum Cipher {
+    None,
+    Xor,
+    Aes128,
+}
+
+impl Cipher {
+    /// Its TPMT_SYM_DEF, as TPM2_StartAuthSession takes it.
+    fn definition(self) -> Vec<u8> {
+        match self {
+            Cipher::None => vec![0, 0x10],
+            Cipher::Xor => vec![0, 0x0a, 0, 0x0b],
+            Cipher::Aes128 => vec![0, 0x06, 0, 128, 0, 0x43],
+        }
+    }
+
+    /// Encrypt or decrypt `data` in place, keyed by `key` and the nonces, newer first.
+    fn apply(self, key: &[u8], newer: &[u8], older: &[u8], data: &mut [u8], encrypt: bool) {
+        use cfb_mode::cipher::KeyIvInit;
+        match self {
+            Cipher::None => panic!("no parameter encryption"),
+            Cipher::Xor => {
+                let mask = kdfa_sha256(key, b"XOR", newer, older, data.len());
+                data.iter_mut().zip(mask).for_each(|(d, m)| *d ^= m);
+            }
+            Cipher::Aes128 => {
+                let stream = kdfa_sha256(key, b"CFB", newer, older, 32);
+                let (key, iv) = stream.split_at(16);
+                if encrypt {
+                    cfb_mode::Encryptor::<aes::Aes128>::new_from_slices(key, iv)
+                        .unwrap()
+                        .encrypt(data);
+                } else {
+                    cfb_mode::Decryptor::<aes::Aes128>::new_from_slices(key, iv)
+                        .unwrap()
+                        .decrypt(data);
+                }
+            }
+        }
+    }
+}
+
+/// A caller's side of an unsalted SHA-256 session.
+struct Client {
+    handle: u32,
+    key: Vec<u8>,
+    nonce_caller: Vec<u8>,
+    nonce_tpm: Vec<u8>,
+    cipher: Cipher,
+}
+
+impl Client {
+    /// TPM2_StartAuthSession of a `kind` session bound to `bind`, whose authValue is
+    /// `bind_auth`.
+    fn start(tpm: &mut Tpm, kind: u8, bind: u32, bind_auth: &[u8], cipher: Cipher) -> Client {
+        let nonce_caller = vec![0x11; 16];
+        let mut p = Writer::new();
+        p.tpm2b(&nonce_caller)
+            .tpm2b(&[])
+            .u8(kind)
+            .bytes(&cipher.definition())
+            .u16(alg::TPM_ALG_SHA256);
+        let r = tpm.process(&command(
+            TPM_CC_START_AUTH_SESSION,
+            &[TPM_RH_NULL, bind],
+            None,
+            &p.into_bytes(),
+        ));
+        assert_eq!(rc(&r), 0);
+        let handle = u32::from_be_bytes(r[10..14].try_into().unwrap());
+        let nonce_tpm = r[16..].to_vec();
+        assert_eq!(r[14..16], [0, 16], "nonceTPM is as long as nonceCaller");
+        let key = if bind == TPM_RH_NULL {
+            Vec::new()
+        } else {
+            kdfa_sha256(bind_auth, b"ATH", &nonce_tpm, &nonce_caller, 32)
+        };
+        Client {
+            handle,
+            key,
+            nonce_caller,
+            nonce_tpm,
+            cipher,
+        }
+    }
+}
+
+/// A session as one command uses it.
+struct Turn<'a> {
+    client: &'a mut Client,
+    attributes: u8,
+    /// The authValue of the entity the session authorizes, if it authorizes one: it keys the
+    /// parameter encryption, and the HMAC unless `in_hmac` is false.
+    auth: Option<&'a [u8]>,
+    /// False for a session bound to the entity (its authValue is in the session key already)
+    /// and for a policy session.
+    in_hmac: bool,
+}
+
+impl<'a> Turn<'a> {
+    /// The session authorizes an entity whose authValue is `auth`.
+    fn authorizing(client: &'a mut Client, attributes: u8, auth: &'a [u8]) -> Turn<'a> {
+        Turn {
+            client,
+            attributes,
+            auth: Some(auth),
+            in_hmac: true,
+        }
+    }
+
+    /// The session authorizes the entity it is bound to, or is a policy session.
+    fn bound(client: &'a mut Client, attributes: u8, auth: &'a [u8]) -> Turn<'a> {
+        Turn {
+            in_hmac: false,
+            ..Turn::authorizing(client, attributes, auth)
+        }
+    }
+
+    /// The session authorizes nothing: it only encrypts, decrypts or audits.
+    fn alone(client: &'a mut Client, attributes: u8) -> Turn<'a> {
+        Turn {
+            client,
+            attributes,
+            auth: None,
+            in_hmac: false,
+        }
+    }
+
+    fn hmac_key(&self) -> Vec<u8> {
+        let auth = self.auth.filter(|_| self.in_hmac).unwrap_or_default();
+        [&self.client.key[..], auth].concat()
+    }
+
+    fn crypt_key(&self) -> Vec<u8> {
+        [&self.client.key[..], self.auth.unwrap_or_default()].concat()
+    }
+
+    /// The session's HMAC: empty with no key at all, as the engine takes and gives it.
+    fn hmac(&self, parts: &[&[u8]]) -> Vec<u8> {
+        let key = self.hmac_key();
+        if key.is_empty() {
+            Vec::new()
+        } else {
+            hmac_sha256(&key, parts)
+        }
+    }
+}
+
+/// The Name of a handle: the handle, but for a sequence, which has none.
+fn name(handle: u32) -> Vec<u8> {
+    if handle >> 24 == 0x80 {
+        Vec::new()
+    } else {
+        handle.to_be_bytes().to_vec()
+    }
+}
+
+/// A command with HMAC or policy sessions, each with a new nonceCaller. The first parameter (a
+/// TPM2B) is encrypted for the session that has DECRYPT. Each HMAC covers cpHash; the first
+/// session's, when it authorizes, also the nonces of the others that decrypt or encrypt,
+/// unless `cover_nonces` is false.
+fn session_command(
+    code: u32,
+    handles: &[u32],
+    turns: &mut [Turn],
+    params: &[u8],
+    cover_nonces: bool,
+) -> Vec<u8> {
+    let mut params = params.to_vec();
+    for t in turns.iter_mut() {
+        t.client.nonce_caller.iter_mut().for_each(|b| *b += 1);
+    }
+    // Parameters too short for it go as they are, for the TPM to refuse.
+    if let Some(t) = turns.iter().find(|t| t.attributes & DECRYPT != 0) {
+        let size = usize::from(u16::from_be_bytes([params[0], params[1]]));
+        let (newer, older) = (&t.client.nonce_caller, &t.client.nonce_tpm);
+        if let Some(data) = params.get_mut(2..2 + size) {
+            t.client
+                .cipher
+                .apply(&t.crypt_key(), newer, older, data, true);
+        }
+    }
+    let names: Vec<u8> = handles.iter().flat_map(|&h| name(h)).collect();
+    let cp_hash = sha256(&[&code.to_be_bytes(), &names, &params]);
+    let mut extra = Vec::new();
+    if cover_nonces && turns[0].auth.is_some() {
+        for flag in [DECRYPT, ENCRYPT] {
+            let other = turns.iter().skip(1).find(|t| t.attributes & flag != 0);
+            if let Some(t) = other.filter(|t| !extra.contains(&t.client.nonce_tpm)) {
+                extra.push(t.client.nonce_tpm.clone());
+            }
+        }
+    }
+    let mut area = Writer::new();
+    for (i, t) in turns.iter().enumerate() {
+        let c = &t.client;
+        let mut parts: Vec<&[u8]> = vec![&cp_hash, &c.nonce_caller, &c.nonce_tpm];
+        if i == 0 {
+            parts.extend(extra.iter().map(Vec::as_slice));
+        }
+        parts.push(std::slice::from_ref(&t.attributes));
+        area.u32(c.handle)
+            .tpm2b(&c.nonce_caller)
+            .u8(t.attributes)
+            .tpm2b(&t.hmac(&parts));
+    }
+    let area = area.into_bytes();
+    let mut w = Writer::new();
+    w.u16(TPM_ST_SESSIONS).u32(0).u32(code);
+    for &h in handles {
+        w.u32(h);
+    }
+    w.count(area.len()).bytes(&area).bytes(&params);
+    let mut bytes = w.into_bytes();
+    let len = bytes.len() as u32;
+    bytes[2..6].copy_from_slice(&len.to_be_bytes());
+    bytes
+}
+
+/// What a successful command with sessions answered.
+struct Reply {
+    /// The response parameters, the first one decrypted.
+    params: Vec<u8>,
+    /// Each session's attributes, as the response gives them back.
+    attributes: Vec<u8>,
+}
+
+/// Send a command with sessions (none with a response handle), and check each response HMAC
+/// over rpHash with the session's new nonce. Returns the reply, or the response code.
+fn call(
+    tpm: &mut Tpm,
+    code: u32,
+    handles: &[u32],
+    turns: &mut [Turn],
+    params: &[u8],
+) -> std::result::Result<Reply, u32> {
+    let r = tpm.process(&session_command(code, handles, turns, params, true));
+    if rc(&r) != 0 {
+        return Err(rc(&r));
+    }
+    let mut reader = Reader::new(&r[10..]);
+    let size = reader.u32().unwrap() as usize;
+    let mut params = reader.bytes(size).unwrap().to_vec();
+    let rp_hash = sha256(&[&[0; 4], &code.to_be_bytes(), &params]);
+    let mut attributes = Vec::new();
+    for t in turns.iter_mut() {
+        t.client.nonce_tpm = reader.tpm2b(64).unwrap().to_vec();
+        let a = reader.u8().unwrap();
+        let c = &t.client;
+        let expected = t.hmac(&[&rp_hash, &c.nonce_tpm, &c.nonce_caller, &[a]]);
+        assert_eq!(reader.tpm2b(64).unwrap(), expected, "response HMAC");
+        attributes.push(a);
+    }
+    assert!(reader.is_empty());
+    if let Some(t) = turns.iter().find(|t| t.attributes & ENCRYPT != 0) {
+        let size = usize::from(u16::from_be_bytes([params[0], params[1]]));
+        let (newer, older) = (&t.client.nonce_tpm, &t.client.nonce_caller);
+        let data = &mut params[2..2 + size];
+        t.client
+            .cipher
+            .apply(&t.crypt_key(), newer, older, data, false);
+    }
+    Ok(Reply { params, attributes })
+}
+
+/// TPM2_Hash parameters: SHA-256 of `data`, no ticket.
+fn hash_params(data: &[u8]) -> Vec<u8> {
+    let mut p = Writer::new();
+    p.tpm2b(data).u16(alg::TPM_ALG_SHA256).u32(TPM_RH_NULL);
+    p.into_bytes()
+}
+
+#[test]
+fn an_hmac_session_authorizes_and_rolls_its_nonce() {
+    let mut tpm = started();
+    tpm.process(&change_auth(TPM_RH_ENDORSEMENT, b"", b"e"));
+    let mut s = Client::start(&mut tpm, HMAC, TPM_RH_ENDORSEMENT, b"e", Cipher::None);
+    assert_eq!(s.handle, 0x0200_0000);
+    for round in 0..2 {
+        let nonce_tpm = s.nonce_tpm.clone();
+        // Bound to the endorsement hierarchy: its authValue is in the key already.
+        let turns = &mut [Turn::bound(&mut s, CONTINUE, b"e")];
+        let params = tpm2b(b"e");
+        let c = session_command(
+            TPM_CC_HIERARCHY_CHANGE_AUTH,
+            &[TPM_RH_ENDORSEMENT],
+            turns,
+            &params,
+            true,
+        );
+        let r = tpm.process(&c);
+        assert_eq!(rc(&r), 0, "round {round}");
+        // parameterSize 0, then the new nonce, the attributes and the TPM's HMAC.
+        assert_eq!(r[10..16], [0, 0, 0, 0, 0, 16]);
+        let new_nonce = &r[16..32];
+        assert_ne!(new_nonce, nonce_tpm);
+        let code = TPM_CC_HIERARCHY_CHANGE_AUTH.to_be_bytes();
+        let rp_hash = sha256(&[&[0; 4], &code]);
+        let c_nonce = &turns[0].client.nonce_caller;
+        let expected = hmac_sha256(&turns[0].client.key, &[&rp_hash, new_nonce, c_nonce, &[1]]);
+        assert_eq!(r[33..35], [0, 32]);
+        assert_eq!(r[35..], expected[..]);
+        turns[0].client.nonce_tpm = new_nonce.to_vec();
+        // The old nonce no longer works.
+        assert_eq!(rc(&tpm.process(&c)), Rc::BAD_AUTH.session(1).0);
+    }
+}
+
+#[test]
+fn xor_encryption_and_hmacs_take_the_auth_value_of_an_unbound_session() {
+    let mut tpm = started();
+    let mut p = Writer::new();
+    p.tpm2b(b"s").u16(alg::TPM_ALG_SHA256);
+    let r = tpm.process(&command(
+        TPM_CC_HASH_SEQUENCE_START,
+        &[],
+        None,
+        &p.into_bytes(),
+    ));
+    let sequence = u32::from_be_bytes(r[10..14].try_into().unwrap());
+    let mut s = Client::start(&mut tpm, HMAC, TPM_RH_NULL, b"", Cipher::Xor);
+    let attributes = CONTINUE | DECRYPT | ENCRYPT;
+    let mut p = Writer::new();
+    p.tpm2b(b"secret data").u32(TPM_RH_NULL);
+    let reply = call(
+        &mut tpm,
+        TPM_CC_SEQUENCE_COMPLETE,
+        &[sequence],
+        &mut [Turn::authorizing(&mut s, attributes, b"s")],
+        &p.into_bytes(),
+    )
+    .unwrap();
+    assert_eq!(reply.params[2..34], sha256(&[b"secret data"]));
+    assert!(tpm.object(sequence).is_none(), "the sequence is complete");
+    // The wrong authValue keys the wrong HMAC.
+    let r = tpm.process(&command(
+        TPM_CC_HASH_SEQUENCE_START,
+        &[],
+        None,
+        &[0, 0, 0, 0x0b],
+    ));
+    let sequence = u32::from_be_bytes(r[10..14].try_into().unwrap());
+    let turns = &mut [Turn::authorizing(&mut s, CONTINUE, b"s")];
+    let complete = [&tpm2b(b"")[..], &TPM_RH_NULL.to_be_bytes()].concat();
+    assert_eq!(
+        call(
+            &mut tpm,
+            TPM_CC_SEQUENCE_COMPLETE,
+            &[sequence],
+            turns,
+            &complete
+        )
+        .err(),
+        Some(Rc::BAD_AUTH.session(1).0)
+    );
+}
+
+#[test]
+fn aes_cfb_encryption_takes_the_auth_value_even_of_the_bound_entity() {
+    let mut tpm = started();
+    tpm.process(&change_auth(TPM_RH_ENDORSEMENT, b"", b"e"));
+    let mut s = Client::start(&mut tpm, HMAC, TPM_RH_ENDORSEMENT, b"e", Cipher::Aes128);
+    let turns = &mut [Turn::bound(&mut s, CONTINUE | DECRYPT, b"e")];
+    let new_auth = tpm2b(b"a new authValue");
+    call(
+        &mut tpm,
+        TPM_CC_HIERARCHY_CHANGE_AUTH,
+        &[TPM_RH_ENDORSEMENT],
+        turns,
+        &new_auth,
+    )
+    .unwrap();
+    let change = change_auth(TPM_RH_ENDORSEMENT, b"a new authValue", b"");
+    assert_eq!(rc(&tpm.process(&change)), 0);
+    // Authorizing nothing, the session key alone; the response encrypted with the new nonce.
+    let data = [7; 40];
+    let turns = &mut [Turn::alone(&mut s, CONTINUE | DECRYPT | ENCRYPT)];
+    let reply = call(&mut tpm, TPM_CC_HASH, &[], turns, &hash_params(&data)).unwrap();
+    assert_eq!(reply.params[2..34], sha256(&[&data]));
+}
+
+#[test]
+fn the_first_authorization_covers_the_nonces_of_the_sessions_that_encrypt() {
+    let mut tpm = started();
+    tpm.process(&change_auth(TPM_RH_ENDORSEMENT, b"", b"e"));
+    let mut a = Client::start(&mut tpm, HMAC, TPM_RH_NULL, b"", Cipher::None);
+    let mut b = Client::start(&mut tpm, HMAC, TPM_RH_NULL, b"", Cipher::Aes128);
+    let turns = &mut [
+        Turn::authorizing(&mut a, CONTINUE, b"e"),
+        Turn::alone(&mut b, CONTINUE | DECRYPT),
+    ];
+    // The same authValue again (the response HMAC takes the new one): decrypted wrong, it
+    // would be another.
+    let code = TPM_CC_HIERARCHY_CHANGE_AUTH;
+    let new_auth = tpm2b(b"e");
+    let uncovered = session_command(code, &[TPM_RH_ENDORSEMENT], turns, &new_auth, false);
+    assert_eq!(rc(&tpm.process(&uncovered)), Rc::BAD_AUTH.session(1).0);
+    call(&mut tpm, code, &[TPM_RH_ENDORSEMENT], turns, &new_auth).unwrap();
+    assert_eq!(
+        rc(&tpm.process(&change_auth(TPM_RH_ENDORSEMENT, b"e", b""))),
+        0
+    );
+}
+
+#[test]
+fn a_session_bound_to_lockout_fails_as_lockout() {
+    let mut tpm = started();
+    let mut unbound = Client::start(&mut tpm, HMAC, TPM_RH_NULL, b"", Cipher::None);
+    let mut l = Client::start(&mut tpm, HMAC, TPM_RH_LOCKOUT, b"", Cipher::None);
+    let code = TPM_CC_HIERARCHY_CHANGE_AUTH;
+    let change_owner = |tpm: &mut Tpm, turn: Turn| {
+        call(tpm, code, &[TPM_RH_OWNER], &mut [turn], &tpm2b(b"")).err()
+    };
+    // The owner's authorization is exempt from the dictionary-attack protection...
+    let wrong = Turn::authorizing(&mut unbound, CONTINUE, b"wrong");
+    assert_eq!(
+        change_owner(&mut tpm, wrong),
+        Some(Rc::BAD_AUTH.session(1).0)
+    );
+    assert!(tpm.permanent.dictionary_attack.lockout_auth_enabled);
+    // ...but not through a session bound to lockout, whose key the owner's authValue extends.
+    let right = Turn::authorizing(&mut l, CONTINUE, b"");
+    assert_eq!(change_owner(&mut tpm, right), None);
+    let wrong = Turn::authorizing(&mut l, CONTINUE, b"wrong");
+    assert_eq!(
+        change_owner(&mut tpm, wrong),
+        Some(Rc::AUTH_FAIL.session(1).0)
+    );
+    assert!(!tpm.permanent.dictionary_attack.lockout_auth_enabled);
+    // Lockout is now locked out, and so is the session, before its HMAC is checked.
+    let right = Turn::authorizing(&mut l, CONTINUE, b"");
+    assert_eq!(change_owner(&mut tpm, right), Some(Rc::LOCKOUT.0));
+}
+
+#[test]
+fn a_policy_session_authorizes_when_its_digest_and_hash_match_the_policy() {
+    let mut tpm = started();
+    let mut p = Client::start(&mut tpm, POLICY, TPM_RH_NULL, b"", Cipher::None);
+    let set_policy = |tpm: &mut Tpm, digest: &[u8], hash: u16| {
+        let mut p = Writer::new();
+        p.tpm2b(digest).u16(hash);
+        let c = command(
+            TPM_CC_SET_PRIMARY_POLICY,
+            &[TPM_RH_OWNER],
+            Some(b""),
+            &p.into_bytes(),
+        );
+        assert_eq!(rc(&tpm.process(&c)), 0);
+    };
+    let code = TPM_CC_HIERARCHY_CHANGE_AUTH;
+    let change_owner = |tpm: &mut Tpm, p: &mut Client| {
+        let turns = &mut [Turn::bound(p, CONTINUE, b"")];
+        call(tpm, code, &[TPM_RH_OWNER], turns, &tpm2b(b"")).err()
+    };
+    // No policy command yet: the session's policyDigest stays all zeros.
+    set_policy(&mut tpm, &[0; 32], alg::TPM_ALG_SHA256);
+    assert_eq!(change_owner(&mut tpm, &mut p), None);
+    set_policy(&mut tpm, &[1; 32], alg::TPM_ALG_SHA256);
+    assert_eq!(
+        change_owner(&mut tpm, &mut p),
+        Some(Rc::POLICY_FAIL.session(1).0)
+    );
+    set_policy(&mut tpm, &[0; 20], alg::TPM_ALG_SHA1);
+    assert_eq!(
+        change_owner(&mut tpm, &mut p),
+        Some(Rc::POLICY_FAIL.session(1).0)
+    );
+}
+
+#[test]
+fn a_trial_session_authorizes_nothing() {
+    let mut tpm = started();
+    let mut t = Client::start(&mut tpm, TRIAL, TPM_RH_NULL, b"", Cipher::None);
+    let turns = &mut [Turn::bound(&mut t, CONTINUE, b"")];
+    let r = call(
+        &mut tpm,
+        TPM_CC_HIERARCHY_CHANGE_AUTH,
+        &[TPM_RH_OWNER],
+        turns,
+        &tpm2b(b""),
+    );
+    assert_eq!(r.err(), Some(Rc::ATTRIBUTES.session(1).0));
+}
+
+#[test]
+fn an_audit_session_digests_each_command_while_it_stays_exclusive() {
+    let mut tpm = started();
+    let mut s = Client::start(&mut tpm, HMAC, TPM_RH_ENDORSEMENT, b"", Cipher::None);
+    let handle = s.handle;
+    let code = TPM_CC_GET_RANDOM;
+    // Audit GetRandom, and return the digest expected from `from` and the exclusive bit.
+    let mut audit = |tpm: &mut Tpm, attributes: u8, from: &[u8]| {
+        let turns = &mut [Turn::alone(&mut s, CONTINUE | AUDIT | attributes)];
+        let reply = call(tpm, code, &[], turns, &[0, 8])?;
+        let cp_hash = sha256(&[&code.to_be_bytes(), &[0, 8]]);
+        let rp_hash = sha256(&[&[0; 4], &code.to_be_bytes(), &reply.params]);
+        let exclusive = reply.attributes[0] & AUDIT_EXCLUSIVE != 0;
+        Ok::<_, u32>((sha256(&[from, &cp_hash, &rp_hash]), exclusive))
+    };
+    let digest = |tpm: &Tpm| tpm.session(handle).unwrap().audit.clone().unwrap();
+
+    let (expected, exclusive) = audit(&mut tpm, 0, &[0; 32]).unwrap();
+    assert_eq!((digest(&tpm), exclusive), (expected.clone(), true));
+    assert!(
+        tpm.session(handle).unwrap().bound.is_none(),
+        "unbound by its first audit"
+    );
+    let (expected, exclusive) = audit(&mut tpm, AUDIT_EXCLUSIVE, &expected).unwrap();
+    assert_eq!((digest(&tpm), exclusive), (expected.clone(), true));
+    // A command between ends the exclusivity.
+    tpm.process(&command(TPM_CC_GET_RANDOM, &[], None, &[0, 8]));
+    assert_eq!(
+        audit(&mut tpm, AUDIT_EXCLUSIVE, &expected),
+        Err(Rc::EXCLUSIVE.0)
+    );
+    let (expected, exclusive) = audit(&mut tpm, 0, &expected).unwrap();
+    assert_eq!((digest(&tpm), exclusive), (expected, false));
+    // auditReset starts the digest over, exclusive again.
+    let (expected, exclusive) = audit(&mut tpm, AUDIT_RESET | AUDIT_EXCLUSIVE, &[0; 32]).unwrap();
+    assert_eq!((digest(&tpm), exclusive), (expected, true));
+}
+
+#[test]
+fn a_session_without_continue_session_is_flushed_after_the_command() {
+    let mut tpm = started();
+    let mut s = Client::start(&mut tpm, HMAC, TPM_RH_NULL, b"", Cipher::None);
+    let turns = &mut [Turn::authorizing(&mut s, 0, b"")];
+    let reply = call(
+        &mut tpm,
+        TPM_CC_HIERARCHY_CHANGE_AUTH,
+        &[TPM_RH_OWNER],
+        turns,
+        &tpm2b(b""),
+    )
+    .unwrap();
+    assert_eq!(reply.attributes, [0]);
+    assert!(tpm.loaded_sessions(0).is_empty());
+}
+
+#[test]
+fn session_attributes_must_fit_the_command_and_the_session() {
+    let mut tpm = started();
+    let mut plain = Client::start(&mut tpm, HMAC, TPM_RH_NULL, b"", Cipher::None);
+    let mut x = Client::start(&mut tpm, HMAC, TPM_RH_NULL, b"", Cipher::Xor);
+    let mut y = Client::start(&mut tpm, HMAC, TPM_RH_NULL, b"", Cipher::Aes128);
+    // GetRandom has no parameter to decrypt.
+    let turns = &mut [Turn::alone(&mut x, CONTINUE | DECRYPT)];
+    let r = call(&mut tpm, TPM_CC_GET_RANDOM, &[], turns, &[0, 8]);
+    assert_eq!(r.err(), Some(Rc::ATTRIBUTES.session(1).0));
+    // One session decrypts, one audits.
+    let turns = &mut [
+        Turn::alone(&mut x, CONTINUE | DECRYPT),
+        Turn::alone(&mut y, CONTINUE | DECRYPT),
+    ];
+    let r = call(&mut tpm, TPM_CC_HASH, &[], turns, &hash_params(b"data"));
+    assert_eq!(r.err(), Some(Rc::ATTRIBUTES.session(2).0));
+    let turns = &mut [
+        Turn::alone(&mut x, CONTINUE | AUDIT),
+        Turn::alone(&mut y, CONTINUE | AUDIT),
+    ];
+    let r = call(&mut tpm, TPM_CC_GET_RANDOM, &[], turns, &[0, 8]);
+    assert_eq!(r.err(), Some(Rc::ATTRIBUTES.session(2).0));
+    // A session without a symmetric algorithm encrypts nothing.
+    let turns = &mut [Turn::alone(&mut plain, CONTINUE | ENCRYPT)];
+    let r = call(&mut tpm, TPM_CC_GET_RANDOM, &[], turns, &[0, 8]);
+    assert_eq!(r.err(), Some(Rc::SYMMETRIC.session(1).0));
+    // Nor does a password session.
+    let mut c = command(TPM_CC_GET_RANDOM, &[], Some(b""), &[0, 8]);
+    // After the header, the area's size, the session handle and the empty nonce.
+    c[10 + 4 + 4 + 2] = ENCRYPT;
+    assert_eq!(rc(&tpm.process(&c)), Rc::ATTRIBUTES.session(1).0);
+}
+
+#[test]
+fn sessions_fill_their_slots_and_survive_a_snapshot() {
+    let mut tpm = started();
+    let handles: Vec<u32> = (0..3)
+        .map(|n| start_session(&mut tpm, TPM_RH_NULL, &[0, 0x0a, 0, 0x0b], n).0)
+        .collect();
+    assert_eq!(handles, [0x0200_0000, 0x0200_0001, 0x0200_0002]);
+    let mut p = Writer::new();
+    p.tpm2b(&[9; 16])
+        .tpm2b(&[])
+        .u8(1)
+        .u16(alg::TPM_ALG_NULL)
+        .u16(alg::TPM_ALG_SHA1);
+    let policy = command(
+        TPM_CC_START_AUTH_SESSION,
+        &[TPM_RH_NULL, TPM_RH_NULL],
+        None,
+        &p.into_bytes(),
+    );
+    assert_eq!(rc(&tpm.process(&policy)), Rc::SESSION_MEMORY.0);
+    tpm.process(&command(TPM_CC_FLUSH_CONTEXT, &[], None, &[2, 0, 0, 1]));
+    let r = tpm.process(&policy);
+    assert_eq!(
+        r[10..14],
+        [3, 0, 0, 1],
+        "a policy session in the freed handle"
+    );
+
+    let mut restored = Tpm::restore(&tpm.permanent_state(), &tpm.volatile_state()).unwrap();
+    assert_eq!(
+        restored.loaded_sessions(0),
+        [0x0200_0000, 0x0300_0001, 0x0200_0002]
+    );
+    // An unbound, unsalted session has no key: the empty HMAC authorizes an empty authValue.
+    let mut area = Writer::new();
+    area.u32(0x0200_0002).tpm2b(&[1; 16]).u8(1).tpm2b(&[]);
+    let area = area.into_bytes();
+    let mut c = Writer::new();
+    c.u16(TPM_ST_SESSIONS)
+        .u32(0)
+        .u32(TPM_CC_HIERARCHY_CHANGE_AUTH)
+        .u32(TPM_RH_OWNER);
+    c.count(area.len()).bytes(&area).u16(0);
+    let mut c = c.into_bytes();
+    let len = c.len() as u32;
+    c[2..6].copy_from_slice(&len.to_be_bytes());
+    assert_eq!(rc(&restored.process(&c)), 0);
+    // Startup flushes them all.
+    restored.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 0]));
+    let mut next = power_cycle(&restored, 0);
+    assert!(next.loaded_sessions(0).is_empty());
+    assert_eq!(rc(&next.process(&c)), Rc::REFERENCE_S0.0);
 }

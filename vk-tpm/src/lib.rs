@@ -100,7 +100,7 @@ impl Tpm {
     }
 
     /// Snapshot state needed alongside permanent state to restore the running TPM. Store it as
-    /// a secret: it holds the platform's and sequences' authValues.
+    /// a secret: it holds the platform's and sequences' authValues and the session keys.
     pub fn volatile_state(&self) -> Zeroizing<Vec<u8>> {
         Zeroizing::new(self.volatile.serialize())
     }
@@ -162,7 +162,7 @@ impl Tpm {
         }
         self.check_loaded(&handles)?;
 
-        let sessions = if tag == TPM_ST_SESSIONS {
+        let (mut area, params) = if tag == TPM_ST_SESSIONS {
             let auth_size = usize::try_from(r.u32()?).map_err(|_| Rc::SIZE)?;
             if auth_size < 9 || auth_size > r.len() {
                 return Err(Rc::SIZE);
@@ -171,20 +171,21 @@ impl Tpm {
             if !cmd.sessions {
                 return Err(Rc::AUTH_CONTEXT);
             }
-            let mut sessions = session::read_area(area)?;
-            self.authorize(cmd, &handles, &mut sessions)?;
-            sessions
+            let mut area = self.read_area(cmd, area, &handles)?;
+            let params = self.authorize(cmd, &handles, &mut area, r.rest())?;
+            (Some(area), params)
         } else {
             if cmd.auth > 0 {
                 return Err(Rc::AUTH_MISSING);
             }
-            Vec::new()
+            (None, Zeroizing::new(r.rest().to_vec()))
         };
 
         let mut out = Out::default();
-        (cmd.run)(self, &handles, &mut r, &mut out)?;
+        (cmd.run)(self, &handles, &mut Reader::new(&params), &mut out)?;
 
-        let params = std::mem::take(&mut out.params).into_bytes();
+        let mut params = std::mem::take(&mut out.params).into_bytes();
+        let sessions = self.respond(cmd, area.as_mut(), &mut params)?;
         let mut w = Writer::new();
         w.u16(tag).u32(0).u32(Rc::SUCCESS.0);
         if let Some(handle) = out.handle {
@@ -193,8 +194,7 @@ impl Tpm {
         if tag == TPM_ST_SESSIONS {
             w.count(params.len());
         }
-        w.bytes(&params);
-        session::write_response_area(&mut w, &sessions);
+        w.bytes(&params).bytes(&sessions);
         // A sequence that completed goes only now: the response's authorizations needed it.
         if let Some(handle) = out.flush {
             self.flush_object(handle);

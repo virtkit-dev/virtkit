@@ -17,6 +17,7 @@ use crate::marshal::{Reader, Writer};
 use crate::object::{MAX_OBJECTS, Object};
 use crate::pcr::{self, Bank, Banks, Pcrs, Selection};
 use crate::rc::Rc;
+use crate::session::{self, MAX_ACTIVE, Session};
 
 const PERMANENT_MAGIC: &[u8; 8] = b"VKTPM-P\0";
 const VOLATILE_MAGIC: &[u8; 8] = b"VKTPM-V\0";
@@ -24,12 +25,12 @@ const VOLATILE_MAGIC: &[u8; 8] = b"VKTPM-V\0";
 /// changes in place, until one is (docs/tpm-design.md).
 const VERSION: u16 = 1;
 pub const SEED_SIZE: usize = 64;
-/// More than the serialized states hold (a few KiB each, with saved PCRs or every object slot
-/// taken by a sequence), so writing one never reallocates and leaves a stray copy of its
-/// secrets; [`crate::Tpm::permanent_state`] and [`crate::Tpm::volatile_state`] wipe it whole
-/// when dropped.
+/// More than the serialized states hold (the permanent one a few KiB with saved PCRs, the
+/// volatile one some tens with every object and session slot taken), so writing one never
+/// reallocates and leaves a stray copy of its secrets; [`crate::Tpm::permanent_state`] and
+/// [`crate::Tpm::volatile_state`] wipe it whole when dropped.
 const PERMANENT_CAPACITY: usize = 16 * 1024;
-const VOLATILE_CAPACITY: usize = 16 * 1024;
+const VOLATILE_CAPACITY: usize = 64 * 1024;
 
 /// The state could not be read: not ours, a version this build does not know, or corrupt.
 #[derive(Debug, PartialEq, Eq)]
@@ -223,6 +224,11 @@ pub struct Volatile {
     pub pcrs: Pcrs,
     /// The object slots.
     pub objects: Vec<Option<Object>>,
+    /// The sessions, by handle index.
+    pub sessions: Vec<Option<Session>>,
+    /// The session whose audit digest covers every command since it last audited one
+    /// (g_exclusiveAuditSession).
+    pub exclusive_audit: Option<u32>,
 }
 
 impl Volatile {
@@ -240,7 +246,9 @@ impl Volatile {
             pcr_reconfig: false,
             clear: ClearState::default(),
             pcrs: Pcrs::new(),
-            objects: empty_slots(),
+            objects: empty_slots(MAX_OBJECTS),
+            sessions: empty_slots(MAX_ACTIVE),
+            exclusive_audit: None,
         }
     }
 
@@ -263,17 +271,9 @@ impl Volatile {
             .map(|b| (b.hash, b.values.clone()))
             .collect();
         write_banks(&mut w, &banks);
-        for object in &self.objects {
-            match object {
-                Some(object) => {
-                    w.u8(1);
-                    object.write(&mut w);
-                }
-                None => {
-                    w.u8(0);
-                }
-            }
-        }
+        write_slots(&mut w, &self.objects, Object::write);
+        write_slots(&mut w, &self.sessions, Session::write);
+        w.u32(self.exclusive_audit.unwrap_or(0));
         w.into_bytes()
     }
 
@@ -304,12 +304,10 @@ impl Volatile {
                 *bank = Bank { hash, values };
             }
         }
-        let mut objects = empty_slots();
-        for slot in &mut objects {
-            if read_bool(&mut r)? {
-                *slot = Some(Object::read(&mut r)?);
-            }
-        }
+        let objects = read_slots(&mut r, MAX_OBJECTS, Object::read)?;
+        let sessions = read_slots(&mut r, MAX_ACTIVE, Session::read)?;
+        let exclusive_audit = Some(r.u32()?).filter(|&h| h != 0);
+        session::check_slots(&sessions, exclusive_audit)?;
         expect_end(&r)?;
         Ok(Volatile {
             started,
@@ -324,12 +322,39 @@ impl Volatile {
             clear,
             pcrs,
             objects,
+            sessions,
+            exclusive_audit,
         })
     }
 }
 
-fn empty_slots() -> Vec<Option<Object>> {
-    std::iter::repeat_with(|| None).take(MAX_OBJECTS).collect()
+fn empty_slots<T>(n: usize) -> Vec<Option<T>> {
+    std::iter::repeat_with(|| None).take(n).collect()
+}
+
+/// Object or session slots: a flag for each, then what it holds.
+fn write_slots<T>(w: &mut Writer, slots: &[Option<T>], write: fn(&T, &mut Writer)) {
+    for slot in slots {
+        match slot {
+            Some(t) => {
+                w.u8(1);
+                write(t, w);
+            }
+            None => {
+                w.u8(0);
+            }
+        }
+    }
+}
+
+fn read_slots<T>(
+    r: &mut Reader,
+    n: usize,
+    read: fn(&mut Reader) -> Result<T, StateError>,
+) -> Result<Vec<Option<T>>, StateError> {
+    (0..n)
+        .map(|_| Ok(if read_bool(r)? { Some(read(r)?) } else { None }))
+        .collect()
 }
 
 fn expect_header(r: &mut Reader, magic: &[u8; 8]) -> Result<(), StateError> {
@@ -484,7 +509,72 @@ mod tests {
                 },
             }));
         }
+        for slot in &mut v.sessions {
+            *slot = Some(crate::session::Session {
+                kind: crate::session::Kind::Hmac,
+                hash: Hash::Sha512,
+                nonce_tpm: vec![0; 64],
+                key: Zeroizing::new(vec![0; 64]),
+                symmetric: crate::session::Symmetric::Aes(256),
+                bound: Some(Zeroizing::new(vec![0; 66])),
+                da_bound: true,
+                lockout_bound: true,
+                audit: Some(vec![0; 64]),
+                policy_digest: vec![0; 64],
+            });
+        }
         assert!(v.serialize().len() < VOLATILE_CAPACITY / 2);
+    }
+
+    #[test]
+    fn sessions_the_tpm_cannot_have_made_are_refused() {
+        use crate::session::{Kind, Symmetric};
+        let p = Permanent::manufacture().unwrap();
+        let session = || Session {
+            kind: Kind::Hmac,
+            hash: Hash::Sha256,
+            nonce_tpm: vec![0; 16],
+            key: Zeroizing::new(vec![0; 32]),
+            symmetric: Symmetric::Null,
+            bound: None,
+            da_bound: false,
+            lockout_bound: false,
+            audit: Some(vec![0; 32]),
+            policy_digest: Vec::new(),
+        };
+        let restore = |sessions: Vec<Session>, exclusive_audit: Option<u32>| {
+            let mut v = Volatile::power_on(&p);
+            for (slot, session) in v.sessions.iter_mut().zip(sessions) {
+                *slot = Some(session);
+            }
+            v.exclusive_audit = exclusive_audit;
+            Volatile::deserialize(&v.serialize()).map(|_| ())
+        };
+        let bad = Err(StateError("bad session"));
+        assert_eq!(restore(vec![session()], Some(0x0200_0000)), Ok(()));
+        let four = std::iter::repeat_with(session).take(4).collect();
+        assert_eq!(restore(four, None), bad, "MAX_LOADED");
+        assert_eq!(restore(vec![session()], Some(0x0200_0001)), bad);
+        assert_eq!(restore(vec![session()], Some(0x0300_0000)), bad);
+        let short_nonce = Session {
+            nonce_tpm: vec![0; 15],
+            ..session()
+        };
+        let short_key = Session {
+            key: Zeroizing::new(vec![0; 20]),
+            ..session()
+        };
+        let short_audit = Session {
+            audit: Some(vec![0; 20]),
+            ..session()
+        };
+        let no_policy_digest = Session {
+            kind: Kind::Policy,
+            ..session()
+        };
+        for s in [short_nonce, short_key, short_audit, no_policy_digest] {
+            assert_eq!(restore(vec![s], None), bad);
+        }
     }
 
     #[test]

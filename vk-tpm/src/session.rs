@@ -1,24 +1,44 @@
-//! A command's authorization area (Part 1, "Authorizations and Acknowledgments"; the reference
-//! implementation's `SessionProcess.c`): reading the sessions, checking each authorization, and
-//! the session area of the response.
+//! Authorization sessions (Part 1, "Authorizations and Acknowledgments" and "Session-based
+//! encryption"; the reference implementation's `SessionProcess.c` and `Session.c`).
 //!
-//! Only password sessions (TPM_RS_PW) exist so far: any other session handle is one that is not
-//! loaded.
+//! A command's authorization area holds up to three sessions. A password session (TPM_RS_PW)
+//! carries an authValue in clear. An HMAC session proves knowledge of it with an HMAC keyed
+//! by the session key and the authValue, over the command's cpHash and both nonces; a policy
+//! session proves the entity's authPolicy was satisfied. HMAC and policy sessions also encrypt
+//! a command's first parameter (`decrypt`), the response's first one (`encrypt`), or keep an
+//! audit digest of the commands they see (`audit`), and the response carries the TPM's HMAC of
+//! it, with a new TPM nonce.
 
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-use crate::Tpm;
-use crate::alg::MAX_DIGEST;
-use crate::commands::Command;
-use crate::entity::{TPM_RH_LOCKOUT, TPM_RS_PW, is_da_exempt, is_session, strip_zeros};
+use crate::alg::{Hash, MAX_DIGEST, TPM_ALG_NULL};
+use crate::commands::{Command, end};
+use crate::crypt;
+use crate::entity::{
+    TPM_HT_POLICY_SESSION, TPM_RH_LOCKOUT, TPM_RH_NULL, TPM_RS_PW, handle_type, is_da_exempt,
+    is_session, strip_zeros,
+};
 use crate::marshal::{Reader, Writer};
 use crate::rc::{Rc, Result};
+use crate::state::{StateError, read_bool};
+use crate::{Out, Tpm};
 
+/// How many sessions the TPM holds at once (MAX_LOADED_SESSIONS, as libtpms).
+pub const MAX_LOADED: usize = 3;
+/// How many session handles there are (MAX_ACTIVE_SESSIONS); with no TPM2_ContextSave yet,
+/// every active session is a loaded one.
+pub const MAX_ACTIVE: usize = 64;
+const HMAC_SESSION_FIRST: u32 = 0x0200_0000;
+const POLICY_SESSION_FIRST: u32 = 0x0300_0000;
 /// The most sessions a command may carry.
 const MAX_SESSIONS: usize = 3;
 /// The largest nonce or HMAC/password a session carries (sizeof(TPMU_HA)).
 const MAX_AUTH: usize = MAX_DIGEST;
+/// The largest encrypted salt (TPM2B_ENCRYPTED_SECRET, sized for libtpms' RSA-4096).
+const MAX_ENCRYPTED_SECRET: usize = 512;
+/// The size of a bound session's bind value (sizeof(TPMU_NAME): a TPMT_HA).
+const BIND_SIZE: usize = 2 + MAX_DIGEST;
 
 // TPMA_SESSION bits.
 pub const CONTINUE_SESSION: u8 = 0x01;
@@ -29,107 +49,825 @@ const DECRYPT: u8 = 0x20;
 const ENCRYPT: u8 = 0x40;
 const AUDIT: u8 = 0x80;
 
+const TPM_ALG_AES: u16 = 0x0006;
+const TPM_ALG_XOR: u16 = 0x000a;
+const TPM_ALG_CFB: u16 = 0x0043;
+/// The block cipher modes TPMI_ALG_SYM_MODE takes: CTR, OFB, CBC, CFB, ECB.
+const SYM_MODES: std::ops::RangeInclusive<u16> = 0x0040..=0x0044;
+
+/// TPM_SE: what a session is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Hmac,
+    Policy,
+    /// A policy session that only computes a policy digest; it authorizes nothing.
+    Trial,
+}
+
+/// The parameter encryption a session does (its TPMT_SYM_DEF).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Symmetric {
+    Null,
+    /// XOR obfuscation; the hash is the one the definition names, but the session's own is the
+    /// one used (as in the reference implementation).
+    Xor(Hash),
+    /// AES in CFB mode, with a key of these many bits.
+    Aes(u16),
+}
+
+/// A loaded session.
+pub struct Session {
+    pub kind: Kind,
+    pub hash: Hash,
+    pub nonce_tpm: Vec<u8>,
+    /// The session key: KDFa of the bind authValue and the salt, empty if there were none.
+    pub key: Zeroizing<Vec<u8>>,
+    pub symmetric: Symmetric,
+    /// For a bound HMAC session, the bind value of the entity (its Name and authValue).
+    pub bound: Option<Zeroizing<Vec<u8>>>,
+    /// Bound to an entity subject to dictionary-attack protection, lockout in particular.
+    pub da_bound: bool,
+    pub lockout_bound: bool,
+    /// The audit digest, once the session audited a command.
+    pub audit: Option<Vec<u8>>,
+    /// A policy session's policyDigest.
+    pub policy_digest: Vec<u8>,
+}
+
+impl Session {
+    pub fn write(&self, w: &mut Writer) {
+        let kind = match self.kind {
+            Kind::Hmac => 0,
+            Kind::Policy => 1,
+            Kind::Trial => 3,
+        };
+        w.u8(kind)
+            .u16(self.hash.id())
+            .tpm2b(&self.nonce_tpm)
+            .tpm2b(&self.key);
+        match self.symmetric {
+            Symmetric::Null => w.u16(TPM_ALG_NULL),
+            Symmetric::Xor(hash) => w.u16(TPM_ALG_XOR).u16(hash.id()),
+            Symmetric::Aes(bits) => w.u16(TPM_ALG_AES).u16(bits),
+        };
+        match &self.bound {
+            Some(bound) => w.u8(1).tpm2b(bound),
+            None => w.u8(0),
+        };
+        w.u8(self.da_bound.into()).u8(self.lockout_bound.into());
+        match &self.audit {
+            Some(digest) => w.u8(1).tpm2b(digest),
+            None => w.u8(0),
+        };
+        w.tpm2b(&self.policy_digest);
+    }
+
+    /// A session of a stored volatile state, checked as SessionCreate and the commands leave
+    /// one: a nonce of 16 bytes up to the hash's size, a key and digests of the hash's size.
+    pub fn read(r: &mut Reader) -> std::result::Result<Session, StateError> {
+        let bad = StateError("bad session");
+        let kind = match r.u8()? {
+            0 => Kind::Hmac,
+            1 => Kind::Policy,
+            3 => Kind::Trial,
+            _ => return Err(bad),
+        };
+        let hash = Hash::read(r)?;
+        let nonce_tpm = r.tpm2b(MAX_AUTH)?.to_vec();
+        let key = Zeroizing::new(r.tpm2b(MAX_DIGEST)?.to_vec());
+        let symmetric = match r.u16()? {
+            TPM_ALG_NULL => Symmetric::Null,
+            TPM_ALG_XOR => Symmetric::Xor(Hash::read(r)?),
+            TPM_ALG_AES => match r.u16()? {
+                bits @ (128 | 192 | 256) => Symmetric::Aes(bits),
+                _ => return Err(bad),
+            },
+            _ => return Err(bad),
+        };
+        let bound = if read_bool(r)? {
+            Some(Zeroizing::new(r.tpm2b(BIND_SIZE)?.to_vec()))
+        } else {
+            None
+        };
+        let (da_bound, lockout_bound) = (read_bool(r)?, read_bool(r)?);
+        let audit = if read_bool(r)? {
+            Some(r.tpm2b(MAX_DIGEST)?.to_vec())
+        } else {
+            None
+        };
+        let policy_digest = r.tpm2b(MAX_DIGEST)?.to_vec();
+        let policy_size = if kind == Kind::Hmac { 0 } else { hash.size() };
+        if !(16..=hash.size()).contains(&nonce_tpm.len())
+            || !(key.is_empty() || key.len() == hash.size())
+            || audit.as_ref().is_some_and(|d| d.len() != hash.size())
+            || policy_digest.len() != policy_size
+        {
+            return Err(bad);
+        }
+        Ok(Session {
+            kind,
+            hash,
+            nonce_tpm,
+            key,
+            symmetric,
+            bound,
+            da_bound,
+            lockout_bound,
+            audit,
+            policy_digest,
+        })
+    }
+}
+
+/// Check the session slots of a stored volatile state: at most [`MAX_LOADED`] sessions, and
+/// the exclusive audit session, if any, one of them.
+pub fn check_slots(
+    sessions: &[Option<Session>],
+    exclusive_audit: Option<u32>,
+) -> std::result::Result<(), StateError> {
+    let too_many = sessions.iter().flatten().count() > MAX_LOADED;
+    let lost_audit = exclusive_audit.is_some_and(|h| loaded(sessions, h).is_none());
+    if too_many || lost_audit {
+        return Err(StateError("bad session"));
+    }
+    Ok(())
+}
+
+/// The session a handle names, if one of that type is in `sessions`.
+fn loaded(sessions: &[Option<Session>], handle: u32) -> Option<&Session> {
+    let session = sessions.get(index(handle))?.as_ref()?;
+    let policy = handle_type(handle) == TPM_HT_POLICY_SESSION;
+    (policy == (session.kind != Kind::Hmac)).then_some(session)
+}
+
 /// One session of a command's authorization area.
 pub struct Use {
     pub handle: u32,
+    pub nonce_caller: Vec<u8>,
+    /// As the command sent them, then as the response gives them back.
     pub attributes: u8,
-    /// The password (or, for an HMAC or policy session, the HMAC).
+    /// The password, or the HMAC.
     pub auth: Zeroizing<Vec<u8>>,
     /// The command handle at this session's position, if it needs authorization.
     pub associated: Option<u32>,
+    /// The entity's authValue keys the HMACs (an HMAC session not bound to it).
+    include_auth: bool,
 }
 
-/// RetrieveSessionData: read every session of the area, each checked on its own.
-pub fn read_area(mut area: Reader) -> Result<Vec<Use>> {
-    let mut uses: Vec<Use> = Vec::new();
-    let mut n: u32 = 0;
-    while !area.is_empty() {
-        n = n.saturating_add(1);
-        if uses.len() == MAX_SESSIONS {
-            return Err(Rc::SIZE.session(n));
-        }
-        let handle = area.u32().map_err(|rc| rc.session(n))?;
-        if handle != TPM_RS_PW && !is_session(handle) {
-            return Err(Rc::VALUE.session(n));
-        }
-        let nonce = area.tpm2b(MAX_AUTH).map_err(|rc| rc.session(n))?;
-        let attributes = area.u8().map_err(|rc| rc.session(n))?;
-        if attributes & RESERVED != 0 {
-            return Err(Rc::RESERVED_BITS.session(n));
-        }
-        let auth = Zeroizing::new(area.tpm2b(MAX_AUTH).map_err(|rc| rc.session(n))?.to_vec());
-        if handle != TPM_RS_PW {
-            return Err(Rc::REFERENCE_S0.nth(uses.len()));
-        }
-        // A password session only authorizes, in clear, and has no nonce.
-        if attributes & (ENCRYPT | DECRYPT | AUDIT | AUDIT_EXCLUSIVE | AUDIT_RESET) != 0 {
-            return Err(Rc::ATTRIBUTES.session(n));
-        }
-        if !nonce.is_empty() {
-            return Err(Rc::NONCE.session(n));
-        }
-        uses.push(Use {
-            handle,
-            attributes,
-            auth,
-            associated: None,
-        });
+/// A command's authorization area, and what its HMACs are computed over.
+pub struct Area {
+    code: u32,
+    /// The Names of the command's handles.
+    names: Vec<Vec<u8>>,
+    /// The parameters as the command carried them (encrypted).
+    params: Vec<u8>,
+    pub uses: Vec<Use>,
+    decrypt: Option<usize>,
+    encrypt: Option<usize>,
+    audit: Option<usize>,
+}
+
+impl Area {
+    /// cpHash: H(commandCode ‖ Names ‖ parameters).
+    fn cp_hash(&self, hash: Hash) -> Vec<u8> {
+        let code = self.code.to_be_bytes();
+        let mut parts: Vec<&[u8]> = vec![&code];
+        parts.extend(self.names.iter().map(Vec::as_slice));
+        parts.push(&self.params);
+        hash.digest(&parts)
     }
-    Ok(uses)
+}
+
+/// rpHash: H(responseCode ‖ commandCode ‖ parameters), the response code always success.
+fn rp_hash(hash: Hash, code: u32, params: &[u8]) -> Vec<u8> {
+    hash.digest(&[&Rc::SUCCESS.0.to_be_bytes(), &code.to_be_bytes(), params])
+}
+
+/// The index of a session handle (its slot in the handle space).
+fn index(handle: u32) -> usize {
+    usize::try_from(handle & 0x00ff_ffff).unwrap_or(usize::MAX)
 }
 
 impl Tpm {
-    /// The rest of ParseSessionBuffer: pair each session with the handle it authorizes, then
-    /// check every authorization, in order.
-    pub fn authorize(&mut self, cmd: &Command, handles: &[u32], uses: &mut [Use]) -> Result<()> {
-        for (i, &handle) in handles.iter().enumerate().take(cmd.auth) {
-            let u = uses.get_mut(i).ok_or(Rc::AUTH_MISSING)?;
-            u.associated = Some(handle);
-        }
-        for (n, u) in (1..).zip(uses.iter()) {
-            // A password session must have something to authorize.
-            let Some(entity) = u.associated else {
-                return Err(Rc::HANDLE.session(n));
-            };
-            self.check_password(entity, &u.auth)
-                .map_err(|rc| rc.session(n))?;
+    pub fn session(&self, handle: u32) -> Option<&Session> {
+        self.volatile.sessions.get(index(handle))?.as_ref()
+    }
+
+    fn session_mut(&mut self, handle: u32) -> Result<&mut Session> {
+        let slot = self.volatile.sessions.get_mut(index(handle));
+        slot.and_then(Option::as_mut).ok_or(Rc::FAILURE)
+    }
+
+    /// The session a handle names, if one of that type is loaded there.
+    pub fn loaded_session(&self, handle: u32) -> Option<&Session> {
+        loaded(&self.volatile.sessions, handle)
+    }
+
+    /// The handles of the loaded sessions, from index `from` on (TPM_HT_LOADED_SESSION).
+    pub fn loaded_sessions(&self, from: u32) -> Vec<u32> {
+        let from = index(from);
+        (self.volatile.sessions.iter().enumerate())
+            .skip(from)
+            .filter_map(|(i, s)| {
+                let first = match s.as_ref()?.kind {
+                    Kind::Hmac => HMAC_SESSION_FIRST,
+                    _ => POLICY_SESSION_FIRST,
+                };
+                first.checked_add(u32::try_from(i).ok()?)
+            })
+            .collect()
+    }
+
+    pub fn session_count(&self) -> usize {
+        self.volatile.sessions.iter().flatten().count()
+    }
+
+    /// TPM2_FlushContext of a session.
+    pub fn flush_session(&mut self, handle: u32) -> Result<()> {
+        let slot = self.volatile.sessions.get_mut(index(handle));
+        let slot = slot.filter(|s| s.is_some()).ok_or(Rc::HANDLE)?;
+        *slot = None;
+        if self.volatile.exclusive_audit == Some(handle) {
+            self.volatile.exclusive_audit = None;
         }
         Ok(())
     }
 
-    /// CheckAuthSession and CheckPWAuthSession for a password: the entity's authValue in clear.
-    fn check_password(&mut self, entity: u32, password: &[u8]) -> Result<()> {
-        if !is_da_exempt(entity) {
+    /// SessionComputeBoundEntity: the entity's Name, zero-padded to a TPMU_NAME, with its
+    /// authValue XORed into the end. A session bound to it skips the authValue when it
+    /// authorizes it.
+    fn bind_value(&self, entity: u32) -> Zeroizing<Vec<u8>> {
+        let mut bind = Zeroizing::new(self.entity_name(entity));
+        bind.resize(BIND_SIZE, 0);
+        let auth = self.entity_auth(entity);
+        let start = BIND_SIZE.saturating_sub(auth.len());
+        for (b, a) in bind.iter_mut().skip(start).zip(auth.iter()) {
+            *b ^= a;
+        }
+        bind
+    }
+
+    /// RetrieveSessionData: read every session of the area, each checked on its own and
+    /// against the sessions loaded, and note which encrypts, decrypts and audits.
+    pub fn read_area(&self, cmd: &Command, mut area: Reader, handles: &[u32]) -> Result<Area> {
+        let mut a = Area {
+            code: cmd.code,
+            names: handles.iter().map(|&h| self.entity_name(h)).collect(),
+            params: Vec::new(),
+            uses: Vec::new(),
+            decrypt: None,
+            encrypt: None,
+            audit: None,
+        };
+        while !area.is_empty() {
+            let n = session_number(a.uses.len());
+            if a.uses.len() == MAX_SESSIONS {
+                return Err(Rc::SIZE.session(n));
+            }
+            let handle = area.u32().map_err(|rc| rc.session(n))?;
+            if handle != TPM_RS_PW && !is_session(handle) {
+                return Err(Rc::VALUE.session(n));
+            }
+            let nonce_caller = area.tpm2b(MAX_AUTH).map_err(|rc| rc.session(n))?.to_vec();
+            let attributes = area.u8().map_err(|rc| rc.session(n))?;
+            if attributes & RESERVED != 0 {
+                return Err(Rc::RESERVED_BITS.session(n));
+            }
+            let auth = Zeroizing::new(area.tpm2b(MAX_AUTH).map_err(|rc| rc.session(n))?.to_vec());
+            if handle == TPM_RS_PW {
+                // A password session only authorizes, in clear, and has no nonce.
+                let others = ENCRYPT | DECRYPT | AUDIT | AUDIT_EXCLUSIVE | AUDIT_RESET;
+                if attributes & others != 0 {
+                    return Err(Rc::ATTRIBUTES.session(n));
+                }
+                if !nonce_caller.is_empty() {
+                    return Err(Rc::NONCE.session(n));
+                }
+            } else {
+                self.check_session_use(cmd, &mut a, handle, attributes)?;
+            }
+            a.uses.push(Use {
+                handle,
+                nonce_caller,
+                attributes,
+                auth,
+                associated: None,
+                include_auth: true,
+            });
+        }
+        Ok(a)
+    }
+
+    /// RetrieveSessionData checks for the area's next HMAC or policy session: loaded, matching
+    /// its handle's type, used once, and compatible with its attributes.
+    fn check_session_use(
+        &self,
+        cmd: &Command,
+        a: &mut Area,
+        handle: u32,
+        attributes: u8,
+    ) -> Result<()> {
+        let i = a.uses.len();
+        let n = session_number(i);
+        let Some(session) = self.session(handle) else {
+            return Err(Rc::REFERENCE_S0.nth(i));
+        };
+        if self.loaded_session(handle).is_none() || a.uses.iter().any(|u| u.handle == handle) {
+            return Err(Rc::HANDLE.session(n));
+        }
+        if attributes & DECRYPT != 0 {
+            if !cmd.decrypt || a.decrypt.is_some() {
+                return Err(Rc::ATTRIBUTES.session(n));
+            }
+            if session.symmetric == Symmetric::Null {
+                return Err(Rc::SYMMETRIC.session(n));
+            }
+            a.decrypt = Some(i);
+        }
+        if attributes & ENCRYPT != 0 {
+            if !cmd.encrypt || a.encrypt.is_some() {
+                return Err(Rc::ATTRIBUTES.session(n));
+            }
+            if session.symmetric == Symmetric::Null {
+                return Err(Rc::SYMMETRIC.session(n));
+            }
+            a.encrypt = Some(i);
+        }
+        if attributes & AUDIT != 0 {
+            if a.audit.is_some() || session.kind != Kind::Hmac {
+                return Err(Rc::ATTRIBUTES.session(n));
+            }
+            // Once a session audits, it may ask to be the only one that has since.
+            let exclusive = self.volatile.exclusive_audit == Some(handle);
+            if attributes & AUDIT_RESET == 0
+                && session.audit.is_some()
+                && attributes & AUDIT_EXCLUSIVE != 0
+                && !exclusive
+            {
+                return Err(Rc::EXCLUSIVE);
+            }
+            a.audit = Some(i);
+        }
+        Ok(())
+    }
+
+    /// The loaded HMAC or policy session referenced by `u`, as checked by [`Tpm::read_area`].
+    fn use_session(&self, u: &Use) -> Result<&Session> {
+        self.session(u.handle).ok_or(Rc::FAILURE)
+    }
+
+    /// The rest of ParseSessionBuffer: pair each session with the handle it authorizes, check
+    /// every authorization in order, then decrypt the first parameter. Returns the parameters
+    /// to run the command with.
+    pub fn authorize(
+        &mut self,
+        cmd: &Command,
+        handles: &[u32],
+        a: &mut Area,
+        params: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        a.params = params.to_vec();
+        for (i, &handle) in handles.iter().enumerate().take(cmd.auth) {
+            let u = a.uses.get_mut(i).ok_or(Rc::AUTH_MISSING)?;
+            u.associated = Some(handle);
+        }
+        for i in 0..a.uses.len() {
+            let n = session_number(i);
+            let u = a.uses.get(i).ok_or(Rc::FAILURE)?;
+            if u.handle == TPM_RS_PW {
+                // A password session must have something to authorize.
+                if u.associated.is_none() {
+                    return Err(Rc::HANDLE.session(n));
+                }
+            } else {
+                let session = self.use_session(u)?;
+                // A trial session authorizes nothing, nor encrypts or audits.
+                if session.kind == Kind::Trial {
+                    return Err(Rc::ATTRIBUTES.session(n));
+                }
+                // A session bound to a DA-protected entity is locked out with it.
+                if session.da_bound {
+                    self.check_locked_out(session.lockout_bound)?;
+                }
+            }
+            if u.associated.is_some() {
+                self.check_authorization(a, i).map_err(|rc| rc.session(n))?;
+            } else {
+                // A session that authorizes nothing must at least encrypt or audit.
+                if u.attributes & (AUDIT | ENCRYPT | DECRYPT) == 0 {
+                    return Err(Rc::ATTRIBUTES.session(n));
+                }
+                if let Some(u) = a.uses.get_mut(i) {
+                    u.include_auth = false;
+                }
+                self.check_hmac(a, i).map_err(|rc| rc.session(n))?;
+            }
+        }
+        // Decrypted, it may hold a secret (a new authValue).
+        let mut params = Zeroizing::new(params.to_vec());
+        if let Some(i) = a.decrypt {
+            self.crypt_parameter(a, i, &mut params, false)
+                .map_err(|rc| rc.session(session_number(i)))?;
+        }
+        Ok(params)
+    }
+
+    /// CheckAuthSession: session `i` authorizes the entity it is associated with.
+    fn check_authorization(&mut self, a: &mut Area, i: usize) -> Result<()> {
+        let u = a.uses.get(i).ok_or(Rc::FAILURE)?;
+        let entity = u.associated.ok_or(Rc::FAILURE)?;
+        let session = (u.handle != TPM_RS_PW)
+            .then(|| self.use_session(u))
+            .transpose()?;
+        let include_auth = match session {
+            None => true,
+            // An HMAC session bound to the entity already has its authValue in the key.
+            Some(s) if s.kind == Kind::Hmac => {
+                // The bind value holds the authValue: compared in constant time.
+                let bound = s.bound.as_deref();
+                !bound.is_some_and(|b| b.ct_eq(&self.bind_value(entity)).into())
+            }
+            // A policy session uses the authValue only if a policy command asked for it (none
+            // can yet).
+            Some(_) => false,
+        };
+        let kind = session.map(|s| s.kind);
+        if let Some(u) = a.uses.get_mut(i) {
+            u.include_auth = include_auth;
+        }
+        if include_auth && !is_da_exempt(entity) {
             self.check_locked_out(entity == TPM_RH_LOCKOUT)?;
         }
-        if password_matches(password, &self.entity_auth(entity)) {
-            Ok(())
-        } else {
-            Err(self.authorization_failed(entity))
+        match kind {
+            None => {
+                let u = a.uses.get(i).ok_or(Rc::FAILURE)?;
+                if password_matches(&u.auth, &self.entity_auth(entity)) {
+                    Ok(())
+                } else {
+                    Err(self.authorization_failed(a, i))
+                }
+            }
+            Some(Kind::Hmac) => self.check_hmac(a, i),
+            Some(_) => {
+                // CheckPolicyAuthSession: the session reached the entity's authPolicy.
+                let session = self.use_session(a.uses.get(i).ok_or(Rc::FAILURE)?)?;
+                let policy = self.entity_policy(entity).ok_or(Rc::AUTH_UNAVAILABLE)?;
+                let digest_matches: bool = session.policy_digest.ct_eq(&policy.digest).into();
+                if !digest_matches || policy.hash != Some(session.hash) {
+                    return Err(Rc::POLICY_FAIL);
+                }
+                self.check_hmac(a, i)
+            }
         }
     }
 
-    /// IncrementLockout: a failed authorization of `entity` counts against the dictionary-attack
-    /// protection (TPM_RC_AUTH_FAIL), unless the entity is exempt (TPM_RC_BAD_AUTH).
-    fn authorization_failed(&mut self, entity: u32) -> Rc {
-        if is_da_exempt(entity) {
+    /// CheckSessionHMAC: the HMAC session `i` carries is the one the TPM computes.
+    fn check_hmac(&mut self, a: &Area, i: usize) -> Result<()> {
+        let u = a.uses.get(i).ok_or(Rc::FAILURE)?;
+        let session = self.use_session(u)?;
+        let key = self.hmac_key(session, u);
+        // With no key at all, the empty HMAC is the right one.
+        let matches = if key.is_empty() && u.auth.is_empty() {
+            true
+        } else {
+            // The first session, when it authorizes, also covers the nonces of the sessions
+            // that decrypt and encrypt, so these cannot be swapped.
+            let mut extra: Vec<&[u8]> = Vec::new();
+            if i == 0 && u.associated.is_some() {
+                let nonce = |j: usize| {
+                    let other = a.uses.get(j)?;
+                    Some(self.session(other.handle)?.nonce_tpm.as_slice())
+                };
+                if let Some(j) = a.decrypt.filter(|&j| j != i) {
+                    extra.extend(nonce(j));
+                }
+                if let Some(j) = a.encrypt.filter(|&j| j != i && Some(j) != a.decrypt) {
+                    extra.extend(nonce(j));
+                }
+            }
+            let cp_hash = a.cp_hash(session.hash);
+            let attributes = [u.attributes];
+            let mut parts: Vec<&[u8]> = vec![&cp_hash, &u.nonce_caller, &session.nonce_tpm];
+            parts.extend(extra);
+            parts.push(&attributes);
+            let hmac = Zeroizing::new(crypt::hmac(session.hash, &key, &parts));
+            u.auth.ct_eq(&hmac).into()
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(self.authorization_failed(a, i))
+        }
+    }
+
+    /// The key of a session's HMACs: the session key, and the authValue of the entity it
+    /// authorizes unless it is bound to it.
+    fn hmac_key(&self, session: &Session, u: &Use) -> Zeroizing<Vec<u8>> {
+        let mut key = session.key.clone();
+        if let Some(entity) = u.associated.filter(|_| u.include_auth) {
+            key.extend_from_slice(&self.entity_auth(entity));
+        }
+        key
+    }
+
+    /// IncrementLockout: a failed authorization counts against the dictionary-attack
+    /// protection (TPM_RC_AUTH_FAIL) when the entity, or the entity the session is bound to,
+    /// is subject to it; otherwise it is a plain TPM_RC_BAD_AUTH.
+    fn authorization_failed(&mut self, a: &Area, i: usize) -> Rc {
+        let Some(u) = a.uses.get(i) else {
+            return Rc::FAILURE;
+        };
+        // TPM_RH_UNASSIGNED, for a session that authorizes nothing, is exempt.
+        let mut entity = u.associated.unwrap_or(TPM_RH_NULL);
+        if let Some(session) = (u.handle != TPM_RS_PW)
+            .then(|| self.session(u.handle))
+            .flatten()
+        {
+            if session.lockout_bound {
+                entity = TPM_RH_LOCKOUT;
+            }
+            if !session.da_bound && (is_da_exempt(entity) || !u.include_auth) {
+                return Rc::BAD_AUTH;
+            }
+        } else if is_da_exempt(entity) {
             return Rc::BAD_AUTH;
         }
         self.da_failure(entity == TPM_RH_LOCKOUT);
         Rc::AUTH_FAIL
     }
-}
 
-/// The response's session area: for each session, its nonce, attributes and HMAC. A password
-/// session answers with an empty nonce and HMAC, and stays open.
-pub fn write_response_area(w: &mut Writer, uses: &[Use]) {
-    for u in uses {
-        w.u16(0).u8(u.attributes | CONTINUE_SESSION).u16(0);
+    /// CryptParameterDecryption or CryptParameterEncryption: session `i` decrypts the
+    /// command's first parameter or encrypts the response's, a TPM2B, in place. The key is the
+    /// session key and the authValue of the entity the session authorizes, bound or not; the
+    /// nonces go newer first: the caller's for the command, the TPM's (new) for the response.
+    fn crypt_parameter(&self, a: &Area, i: usize, params: &mut [u8], encrypt: bool) -> Result<()> {
+        let u = a.uses.get(i).ok_or(Rc::FAILURE)?;
+        let session = self.use_session(u)?;
+        let data = leading_tpm2b(params)?;
+        let auth = u.associated.map(|e| self.entity_auth(e));
+        let key = Zeroizing::new([&session.key[..], auth.as_deref().map_or(&[], |a| a)].concat());
+        let (newer, older) = if encrypt {
+            (&session.nonce_tpm, &u.nonce_caller)
+        } else {
+            (&u.nonce_caller, &session.nonce_tpm)
+        };
+        match session.symmetric {
+            // The session's hash, whatever the definition said.
+            Symmetric::Xor(_) => {
+                crypt::xor_obfuscate(session.hash, &key, newer, older, data);
+                Ok(())
+            }
+            Symmetric::Aes(bits) => {
+                let key_size = usize::from(bits / 8);
+                let size = key_size + crypt::AES_BLOCK;
+                let stream = crypt::kdfa(session.hash, &key, b"CFB", newer, older, size);
+                let (aes_key, iv) = stream.split_at_checked(key_size).ok_or(Rc::FAILURE)?;
+                crypt::aes_cfb(aes_key, iv, data, encrypt)
+            }
+            Symmetric::Null => Err(Rc::FAILURE),
+        }
+    }
+
+    /// BuildResponseSession: new TPM nonces, the first response parameter encrypted, the audit
+    /// digests updated, then each session's acknowledgment. Sessions that do not continue are
+    /// flushed. Without an authorization area, only the audit exclusivity changes.
+    ///
+    /// The command has already run: failure here (no entropy, a broken invariant) returns an
+    /// error but keeps the command's effects and any new nonces. The reference implementation
+    /// enters failure mode instead.
+    pub fn respond(
+        &mut self,
+        cmd: &Command,
+        a: Option<&mut Area>,
+        params: &mut [u8],
+    ) -> Result<Vec<u8>> {
+        let mut w = Writer::new();
+        let Some(a) = a else {
+            if cmd.sessions {
+                self.volatile.exclusive_audit = None;
+            }
+            return Ok(w.into_bytes());
+        };
+        for u in &a.uses {
+            if u.handle != TPM_RS_PW {
+                let session = self.session_mut(u.handle)?;
+                getrandom::fill(&mut session.nonce_tpm).map_err(|_| Rc::FAILURE)?;
+            }
+        }
+        if let Some(i) = a.encrypt {
+            self.crypt_parameter(a, i, params, true)?;
+        }
+        self.update_audit(a, params)?;
+        for u in &a.uses {
+            self.response_auth(a, u, params, &mut w)?;
+            if u.handle == TPM_RS_PW {
+                continue;
+            }
+            if u.attributes & CONTINUE_SESSION == 0 {
+                self.flush_session(u.handle)?;
+                continue;
+            }
+            // A policy session starts over once used.
+            let session = self.session_mut(u.handle)?;
+            if session.kind == Kind::Policy {
+                session.policy_digest.fill(0);
+            }
+        }
+        Ok(w.into_bytes())
+    }
+
+    /// A session's acknowledgment in the response: its new nonce, its attributes and its HMAC
+    /// over rpHash (empty, as the command's, with no key at all). A password session answers
+    /// with an empty nonce and HMAC, and stays open.
+    fn response_auth(&self, a: &Area, u: &Use, params: &[u8], w: &mut Writer) -> Result<()> {
+        if u.handle == TPM_RS_PW {
+            w.u16(0).u8(u.attributes | CONTINUE_SESSION).u16(0);
+            return Ok(());
+        }
+        let session = self.use_session(u)?;
+        let key = self.hmac_key(session, u);
+        let hmac = if key.is_empty() && u.auth.is_empty() {
+            Vec::new()
+        } else {
+            let rp_hash = rp_hash(session.hash, a.code, params);
+            let attributes = [u.attributes];
+            let parts = [
+                &rp_hash,
+                &session.nonce_tpm,
+                &u.nonce_caller,
+                &attributes[..],
+            ];
+            crypt::hmac(session.hash, &key, &parts)
+        };
+        w.tpm2b(&session.nonce_tpm).u8(u.attributes).tpm2b(&hmac);
+        Ok(())
+    }
+
+    /// UpdateAuditSessionStatus: extend the audit session's digest with this command, which
+    /// keeps it exclusive if no other command came between.
+    fn update_audit(&mut self, a: &mut Area, params: &[u8]) -> Result<()> {
+        let Some(i) = a.audit else {
+            self.volatile.exclusive_audit = None;
+            return Ok(());
+        };
+        let u = a.uses.get(i).ok_or(Rc::FAILURE)?;
+        let (handle, reset) = (u.handle, u.attributes & AUDIT_RESET != 0);
+        let hash = self.use_session(u)?.hash;
+        let cp_hash = a.cp_hash(hash);
+        let rp_hash = rp_hash(hash, a.code, params);
+        let was_exclusive = self.volatile.exclusive_audit == Some(handle);
+        let session = self.session_mut(handle)?;
+        let (digest, exclusive) = match session.audit.take() {
+            Some(digest) if !reset => (digest, was_exclusive),
+            // A first or reset audit starts from zeros, exclusive, and is no longer bound.
+            _ => {
+                session.bound = None;
+                (vec![0; hash.size()], true)
+            }
+        };
+        session.audit = Some(hash.digest(&[&digest, &cp_hash, &rp_hash]));
+        self.volatile.exclusive_audit = exclusive.then_some(handle);
+        let u = a.uses.get_mut(i).ok_or(Rc::FAILURE)?;
+        if exclusive {
+            u.attributes |= AUDIT_EXCLUSIVE;
+        } else {
+            u.attributes &= !AUDIT_EXCLUSIVE;
+        }
+        Ok(())
+    }
+
+    /// SessionCreate: a new session in the first free handle.
+    fn create_session(
+        &mut self,
+        kind: Kind,
+        hash: Hash,
+        nonce_caller: &[u8],
+        symmetric: Symmetric,
+        bind: u32,
+    ) -> Result<(u32, Vec<u8>)> {
+        if self.session_count() >= MAX_LOADED {
+            return Err(Rc::SESSION_MEMORY);
+        }
+        let (i, _) = (self.volatile.sessions.iter().enumerate())
+            .find(|(_, s)| s.is_none())
+            .ok_or(Rc::SESSION_HANDLES)?;
+        let mut nonce_tpm = vec![0; nonce_caller.len()];
+        getrandom::fill(&mut nonce_tpm).map_err(|_| Rc::FAILURE)?;
+        // No salt yet: an RSA or ECC key to decrypt one with comes with objects.
+        let key = if bind == TPM_RH_NULL {
+            Zeroizing::new(Vec::new())
+        } else {
+            let auth = self.entity_auth(bind);
+            crypt::kdfa(hash, &auth, b"ATH", &nonce_tpm, nonce_caller, hash.size())
+        };
+        let bound = (bind != TPM_RH_NULL && kind == Kind::Hmac).then(|| self.bind_value(bind));
+        let da_bound = bind != TPM_RH_NULL && !is_da_exempt(bind);
+        let session = Session {
+            kind,
+            hash,
+            nonce_tpm: nonce_tpm.clone(),
+            key,
+            symmetric,
+            bound,
+            da_bound,
+            lockout_bound: da_bound && bind == TPM_RH_LOCKOUT,
+            audit: None,
+            policy_digest: if kind == Kind::Hmac {
+                Vec::new()
+            } else {
+                vec![0; hash.size()]
+            },
+        };
+        let slot = self.volatile.sessions.get_mut(i).ok_or(Rc::FAILURE)?;
+        *slot = Some(session);
+        let first = if kind == Kind::Hmac {
+            HMAC_SESSION_FIRST
+        } else {
+            POLICY_SESSION_FIRST
+        };
+        let handle = first.checked_add(u32::try_from(i).map_err(|_| Rc::FAILURE)?);
+        Ok((handle.ok_or(Rc::FAILURE)?, nonce_tpm))
     }
 }
 
+/// The number of the area's session `i` in a response code (`+ TPM_RC_S + n`): from 1.
+fn session_number(i: usize) -> u32 {
+    u32::try_from(i).map_or(u32::MAX, |i| i.saturating_add(1))
+}
+
+/// The contents of the TPM2B a parameter area starts with: what parameter encryption covers.
+fn leading_tpm2b(params: &mut [u8]) -> Result<&mut [u8]> {
+    let (size, data) = params
+        .split_first_chunk_mut::<2>()
+        .ok_or(Rc::INSUFFICIENT)?;
+    data.get_mut(..usize::from(u16::from_be_bytes(*size)))
+        .ok_or(Rc::SIZE)
+}
+
 /// Compare the password with authValue in constant time after dropping the trailing zeros of
-/// both (Part 1, "password authorizations").
+/// both (Part 1, "password authorizations"). Only the time for the lengths may differ, as with
+/// libtpms' MemoryEqual2B: that tells the authValue's length at most, never its bytes.
 fn password_matches(password: &[u8], auth_value: &[u8]) -> bool {
     strip_zeros(password).ct_eq(auth_value).into()
+}
+
+/// A TPMT_SYM_DEF+, as TPM2_StartAuthSession takes it: the algorithm, its key size, its mode.
+fn read_symmetric(r: &mut Reader) -> Result<(Symmetric, u16)> {
+    match r.u16()? {
+        TPM_ALG_NULL => Ok((Symmetric::Null, TPM_ALG_NULL)),
+        TPM_ALG_XOR => Ok((Symmetric::Xor(Hash::read(r)?), TPM_ALG_NULL)),
+        TPM_ALG_AES => {
+            let bits = match r.u16()? {
+                bits @ (128 | 192 | 256) => bits,
+                _ => return Err(Rc::VALUE),
+            };
+            let mode = r.u16()?;
+            if mode != TPM_ALG_NULL && !SYM_MODES.contains(&mode) {
+                return Err(Rc::MODE);
+            }
+            Ok((Symmetric::Aes(bits), mode))
+        }
+        // TDES, Camellia and SM4 are out of scope.
+        _ => Err(Rc::SYMMETRIC),
+    }
+}
+
+/// TPM2_StartAuthSession: an HMAC, policy or trial session, bound to an entity or not. Salted
+/// sessions need a loaded RSA or ECC key, which no command can load yet.
+pub fn start_auth_session(
+    tpm: &mut Tpm,
+    handles: &[u32],
+    r: &mut Reader,
+    w: &mut Out,
+) -> Result<()> {
+    let nonce_caller = r.tpm2b(MAX_AUTH).map_err(|rc| rc.param(1))?;
+    let salt = r.tpm2b(MAX_ENCRYPTED_SECRET).map_err(|rc| rc.param(2))?;
+    let kind = match r.u8().map_err(|rc| rc.param(3))? {
+        0x00 => Kind::Hmac,
+        0x01 => Kind::Policy,
+        0x03 => Kind::Trial,
+        _ => return Err(Rc::VALUE.param(3)),
+    };
+    let (symmetric, mode) = read_symmetric(r).map_err(|rc| rc.param(4))?;
+    let hash = Hash::read(r).map_err(|rc| rc.param(5))?;
+    end(r)?;
+    if nonce_caller.len() < 16 || nonce_caller.len() > hash.size() {
+        return Err(Rc::SIZE.param(1));
+    }
+    let tpm_key = handles.first().copied().ok_or(Rc::FAILURE)?;
+    if tpm_key != TPM_RH_NULL {
+        // The only objects so far are sequences: not a key that decrypts.
+        return Err(Rc::KEY.handle(1));
+    }
+    if !salt.is_empty() {
+        return Err(Rc::VALUE.param(2));
+    }
+    if matches!(symmetric, Symmetric::Aes(_)) && mode != TPM_ALG_CFB {
+        return Err(Rc::MODE.param(4));
+    }
+    let bind = handles.get(1).copied().ok_or(Rc::FAILURE)?;
+    let (handle, nonce_tpm) = tpm.create_session(kind, hash, nonce_caller, symmetric, bind)?;
+    w.handle = Some(handle);
+    w.tpm2b(&nonce_tpm);
+    Ok(())
 }

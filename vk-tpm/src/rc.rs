@@ -25,6 +25,7 @@ impl Rc {
     pub const INITIALIZE: Rc = Rc(RC_VER1);
     pub const FAILURE: Rc = Rc(RC_VER1 + 0x001);
     pub const DISABLED: Rc = Rc(RC_VER1 + 0x020);
+    pub const EXCLUSIVE: Rc = Rc(RC_VER1 + 0x021);
     pub const AUTH_TYPE: Rc = Rc(RC_VER1 + 0x024);
     pub const AUTH_MISSING: Rc = Rc(RC_VER1 + 0x025);
     pub const PCR: Rc = Rc(RC_VER1 + 0x027);
@@ -43,11 +44,16 @@ impl Rc {
     pub const AUTH_FAIL: Rc = Rc(RC_FMT1 + 0x00e);
     pub const NONCE: Rc = Rc(RC_FMT1 + 0x00f);
     pub const SIZE: Rc = Rc(RC_FMT1 + 0x015);
+    pub const SYMMETRIC: Rc = Rc(RC_FMT1 + 0x016);
     pub const INSUFFICIENT: Rc = Rc(RC_FMT1 + 0x01a);
+    pub const KEY: Rc = Rc(RC_FMT1 + 0x01c);
+    pub const POLICY_FAIL: Rc = Rc(RC_FMT1 + 0x01d);
     pub const RESERVED_BITS: Rc = Rc(RC_FMT1 + 0x021);
     pub const BAD_AUTH: Rc = Rc(RC_FMT1 + 0x022);
 
     pub const OBJECT_MEMORY: Rc = Rc(RC_WARN + 0x002);
+    pub const SESSION_MEMORY: Rc = Rc(RC_WARN + 0x003);
+    pub const SESSION_HANDLES: Rc = Rc(RC_WARN + 0x005);
     pub const LOCALITY: Rc = Rc(RC_WARN + 0x007);
     /// TPM_RC_REFERENCE_H0: the first handle names an entity that is not loaded (`+ n` for
     /// handle n).
