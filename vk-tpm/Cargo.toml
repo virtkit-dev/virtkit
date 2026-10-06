@@ -1,0 +1,23 @@
+[package]
+name = "vk-tpm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# A TPM 2.0 in Rust, meant to replace libtpms behind libkrun's CRB device. Crypto comes from
+# RustCrypto crates only, never hand-rolled.
+[dependencies]
+getrandom.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+
+# Every byte this crate parses comes from the guest: a panic or an overflow is a VMM crash.
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"

@@ -10,6 +10,7 @@ members = [
     "vk-hub",
     "vk-runnerctl",
     "vk-selfupdate",
+    "vk-tpm",
     "bench",
 ]
 # third_party/libkrun is upstream libkrun's own cargo workspace (the 2.0 development branch),
@@ -93,6 +94,17 @@ oci-client = { version = "0.18", default-features = false }
 flate2 = "1"
 # docker-hash: content hashing of a (Dockerfile, stage) for image-tag resolution
 sha2 = "0.11"
+# vk-tpm's SHA-1 PCR bank (TPM 2.0 keeps one for compatibility). RustCrypto, like sha2; already
+# in the tree via russh.
+sha1 = "0.11"
+# vk-tpm: the TPM's entropy (TPM2_GetRandom, its seeds) from the OS. Already in the tree via rand.
+getrandom = "0.4"
+# vk-tpm: constant-time comparison of authorization values. Already in the tree via the
+# RustCrypto crates.
+subtle = "2"
+# vk-tpm: wipe the TPM's seeds and secrets when they are dropped. Already in the tree via the
+# RustCrypto crates.
+zeroize = "1"
 regex = "1"
 # native OCI bundle store (registry.rs): content-defined chunking of runner.ext4 for
 # block-level dedup, each chunk zstd-compressed independently. fastcdc is pure Rust;

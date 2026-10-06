@@ -4184,6 +4184,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vk-tpm"
+version = "0.84.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "sha1",
+ "sha2",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "vm-fdt"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

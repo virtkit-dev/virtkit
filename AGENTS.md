@@ -31,7 +31,7 @@ The same codebase powers local compose-service VMs and a GitLab custom executor.
 
 ## Architecture
 
-A Cargo workspace (`Cargo.toml`, edition 2024) with nine crates:
+A Cargo workspace (`Cargo.toml`, edition 2024) with ten crates:
 
 - **`vk-core/`** — the shared host↔guest library: the wire protocol (`messages`,
   `framing`, `addr`, `net`, `status`, `fleetctl`), the formats both sides speak (`atop`,
@@ -80,6 +80,9 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with nine crates:
   clamped into a range only root can configure. It takes no arguments and no paths from its
   caller, so granting it `NOPASSWD` grants nothing else; all the policy lives in `vk`. Its
   config edit is also a library, for unprivileged `vk` to apply to a runner config it owns.
+- **`vk-tpm/`** — a TPM 2.0 engine in Rust (in progress), to replace libtpms behind libkrun's
+  TPM CRB device: command processing, PCRs, versioned state; crypto from RustCrypto crates
+  only.
 
 libkrun is vendored (its own cargo workspace, locally patched) under
 `third_party/libkrun` — see its `VENDOR.md` for the patch list.
