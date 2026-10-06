@@ -96,8 +96,8 @@ pub fn get_capability(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> 
                 // TPM_HT_LOADED_SESSION: the loaded sessions from that index on, whatever their
                 // type (so a policy session's handle may sort before the one asked for).
                 TPM_HT_HMAC_SESSION => (tpm.loaded_sessions(property), 0),
-                // No saved session (TPM_HT_SAVED_SESSION) yet.
-                TPM_HT_POLICY_SESSION => (Vec::new(), 0),
+                // TPM_HT_SAVED_SESSION: likewise, the saved ones.
+                TPM_HT_POLICY_SESSION => (tpm.saved_sessions(property), 0),
                 TPM_HT_PERSISTENT => {
                     let list = tpm.permanent.persistent.iter().map(|(h, _)| *h);
                     (list.collect(), property)
@@ -225,7 +225,7 @@ fn properties(tpm: &Tpm) -> Vec<(u32, u32)> {
     let loaded = tpm.loaded_objects().len();
     let transient_avail = u32::try_from(MAX_OBJECTS.saturating_sub(loaded)).unwrap_or(0);
     let sessions = u32::try_from(tpm.session_count()).unwrap_or(0);
-    let active = sessions;
+    let active = u32::try_from(tpm.active_sessions()).unwrap_or(0);
     let loaded_avail = (MAX_LOADED as u32).saturating_sub(sessions);
     let active_avail = (MAX_ACTIVE as u32).saturating_sub(active);
     let persistent = tpm.permanent.persistent.len();

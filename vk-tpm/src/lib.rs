@@ -22,6 +22,7 @@ mod alg;
 mod asym;
 mod capability;
 mod commands;
+mod context;
 mod crypt;
 mod drbg;
 mod entity;

@@ -49,6 +49,8 @@ pub enum HandleKind {
     HierarchyOrNull,
     /// TPMI_RH_PROVISION: owner or platform.
     Provision,
+    /// TPMI_DH_CONTEXT: a session or an object slot.
+    Context,
     /// TPMI_RH_HIERARCHY_AUTH: a hierarchy, or lockout.
     HierarchyAuth,
     /// TPMI_RH_HIERARCHY_POLICY: as TPMI_RH_HIERARCHY_AUTH (and the ACT handles, which this TPM
@@ -74,6 +76,7 @@ impl HandleKind {
             HandleKind::Hierarchy => hierarchy,
             HandleKind::HierarchyOrNull => hierarchy || handle == TPM_RH_NULL,
             HandleKind::Provision => matches!(handle, TPM_RH_OWNER | TPM_RH_PLATFORM),
+            HandleKind::Context => is_session(handle) || TRANSIENT.contains(&handle),
             HandleKind::HierarchyAuth | HandleKind::HierarchyPolicy => {
                 hierarchy || handle == TPM_RH_LOCKOUT
             }

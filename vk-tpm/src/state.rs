@@ -18,7 +18,7 @@ use crate::marshal::{Reader, Writer};
 use crate::object::{MAX_OBJECTS, Object};
 use crate::pcr::{self, Bank, Banks, Pcrs, Selection};
 use crate::rc::Rc;
-use crate::session::{MAX_ACTIVE, Session};
+use crate::session::{MAX_ACTIVE, Session, SessionSlot};
 
 const PERMANENT_MAGIC: &[u8; 8] = b"VKTPM-P\0";
 const VOLATILE_MAGIC: &[u8; 8] = b"VKTPM-V\0";
@@ -106,23 +106,55 @@ pub struct Saved {
     pub reset: ResetData,
 }
 
-/// What only a TPM Reset starts over (STATE_RESET_DATA): the null hierarchy's proof and seed.
+/// What only a TPM Reset starts over (STATE_RESET_DATA): the null hierarchy's proof and seed,
+/// the counters that date contexts, and which session handles hold saved sessions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResetData {
     pub null_proof: Seed,
     pub null_seed: Seed,
+    /// TPM Restarts since the last TPM Reset: a stClear object's context is valid for one.
+    pub clear_count: u32,
+    /// TPM Restarts and Resumes since the last TPM Reset (TPMS_CLOCK_INFO.restartCount).
+    pub restart_count: u32,
+    /// The sequence number of the last object context saved.
+    pub object_context_id: u64,
+    /// The sequence number the next saved session context gets.
+    pub context_counter: u64,
+    /// (handle index, context sequence) of each saved session.
+    pub saved_sessions: Vec<(u32, u64)>,
 }
 
 impl ResetData {
     pub fn write(&self, w: &mut Writer) {
         w.tpm2b(self.null_proof.as_slice())
-            .tpm2b(self.null_seed.as_slice());
+            .tpm2b(self.null_seed.as_slice())
+            .u32(self.clear_count)
+            .u32(self.restart_count)
+            .u64(self.object_context_id)
+            .u64(self.context_counter)
+            .count(self.saved_sessions.len());
+        for (i, sequence) in &self.saved_sessions {
+            w.u32(*i).u64(*sequence);
+        }
     }
 
     pub fn read(r: &mut Reader) -> Result<ResetData, StateError> {
+        let null_proof = read_seed(r)?;
+        let null_seed = read_seed(r)?;
+        let (clear_count, restart_count) = (r.u32()?, r.u32()?);
+        let (object_context_id, context_counter) = (r.u64()?, r.u64()?);
+        let count = r.count(MAX_ACTIVE)?;
+        let saved_sessions = (0..count)
+            .map(|_| Ok((r.u32()?, r.u64()?)))
+            .collect::<Result<_, StateError>>()?;
         Ok(ResetData {
-            null_proof: read_seed(r)?,
-            null_seed: read_seed(r)?,
+            null_proof,
+            null_seed,
+            clear_count,
+            restart_count,
+            object_context_id,
+            context_counter,
+            saved_sessions,
         })
     }
 }
@@ -143,6 +175,10 @@ pub struct Permanent {
     pub shutdown_time: u64,
     /// The persistent objects (TPM2_EvictControl), by handle.
     pub persistent: Vec<(u32, Key)>,
+    /// TPM Resets since the last TPM2_Clear (resetCount), and ever (totalResetCount: object
+    /// contexts of an earlier TPM Reset do not load).
+    pub reset_count: u32,
+    pub total_reset_count: u64,
 }
 
 impl Permanent {
@@ -161,6 +197,8 @@ impl Permanent {
             shutdown: Shutdown::Clear,
             shutdown_time: 0,
             persistent: Vec::new(),
+            reset_count: 0,
+            total_reset_count: 0,
         })
     }
 
@@ -196,6 +234,7 @@ impl Permanent {
             w.u32(*handle);
             key.write(&mut w);
         }
+        w.u32(self.reset_count).u64(self.total_reset_count);
         w.into_bytes()
     }
 
@@ -230,6 +269,8 @@ impl Permanent {
             }
             persistent.push((handle, Key::read(&mut r)?));
         }
+        let reset_count = r.u32()?;
+        let total_reset_count = r.u64()?;
         expect_end(&r)?;
         Ok(Permanent {
             eps,
@@ -241,6 +282,8 @@ impl Permanent {
             shutdown,
             shutdown_time,
             persistent,
+            reset_count,
+            total_reset_count,
         })
     }
 }
@@ -270,13 +313,17 @@ pub struct Volatile {
     /// The object slots.
     pub objects: Vec<Option<Object>>,
     /// The sessions, by handle index.
-    pub sessions: Vec<Option<Session>>,
+    pub sessions: Vec<SessionSlot>,
     /// The session whose audit digest covers every command since it last audited one
     /// (g_exclusiveAuditSession).
     pub exclusive_audit: Option<u32>,
     /// The null hierarchy's proof and seed, new at every TPM Reset.
     pub null_proof: Seed,
     pub null_seed: Seed,
+    pub clear_count: u32,
+    pub restart_count: u32,
+    pub object_context_id: u64,
+    pub context_counter: u64,
 }
 
 impl Volatile {
@@ -295,18 +342,35 @@ impl Volatile {
             clear: ClearState::default(),
             pcrs: Pcrs::new(),
             objects: empty_slots(MAX_OBJECTS),
-            sessions: empty_slots(MAX_ACTIVE),
+            sessions: std::iter::repeat_with(|| SessionSlot::Free)
+                .take(MAX_ACTIVE)
+                .collect(),
             exclusive_audit: None,
             null_proof: zero_seed(),
             null_seed: zero_seed(),
+            clear_count: 0,
+            restart_count: 0,
+            object_context_id: 0,
+            context_counter: 0,
         }
     }
 
     /// What a TPM2_Shutdown(STATE) keeps for a restart or a resume.
     pub fn reset_data(&self) -> ResetData {
+        let saved_sessions = (self.sessions.iter().enumerate())
+            .filter_map(|(i, s)| match s {
+                SessionSlot::Saved(sequence) => Some((u32::try_from(i).ok()?, *sequence)),
+                _ => None,
+            })
+            .collect();
         ResetData {
             null_proof: self.null_proof.clone(),
             null_seed: self.null_seed.clone(),
+            clear_count: self.clear_count,
+            restart_count: self.restart_count,
+            object_context_id: self.object_context_id,
+            context_counter: self.context_counter,
+            saved_sessions,
         }
     }
 
@@ -330,10 +394,27 @@ impl Volatile {
             .collect();
         write_banks(&mut w, &banks);
         write_slots(&mut w, &self.objects, Object::write);
-        write_slots(&mut w, &self.sessions, Session::write);
+        for slot in &self.sessions {
+            match slot {
+                SessionSlot::Free => {
+                    w.u8(0);
+                }
+                SessionSlot::Loaded(s) => {
+                    w.u8(1);
+                    s.write(&mut w);
+                }
+                SessionSlot::Saved(sequence) => {
+                    w.u8(2).u64(*sequence);
+                }
+            }
+        }
         w.u32(self.exclusive_audit.unwrap_or(0));
         w.tpm2b(self.null_proof.as_slice())
-            .tpm2b(self.null_seed.as_slice());
+            .tpm2b(self.null_seed.as_slice())
+            .u32(self.clear_count)
+            .u32(self.restart_count)
+            .u64(self.object_context_id)
+            .u64(self.context_counter);
         w.into_bytes()
     }
 
@@ -365,10 +446,21 @@ impl Volatile {
             *bank = Bank { hash, values };
         }
         let objects = read_slots(&mut r, MAX_OBJECTS, Object::read)?;
-        let sessions = read_slots(&mut r, MAX_ACTIVE, Session::read)?;
+        let sessions = (0..MAX_ACTIVE)
+            .map(|_| {
+                Ok(match r.u8()? {
+                    0 => SessionSlot::Free,
+                    1 => SessionSlot::Loaded(Box::new(Session::read(&mut r)?)),
+                    2 => SessionSlot::Saved(r.u64()?),
+                    _ => return Err(StateError("bad session slot")),
+                })
+            })
+            .collect::<Result<_, StateError>>()?;
         let exclusive_audit = Some(r.u32()?).filter(|&h| h != 0);
         let null_proof = read_seed(&mut r)?;
         let null_seed = read_seed(&mut r)?;
+        let (clear_count, restart_count) = (r.u32()?, r.u32()?);
+        let (object_context_id, context_counter) = (r.u64()?, r.u64()?);
         expect_end(&r)?;
         Ok(Volatile {
             started,
@@ -387,6 +479,10 @@ impl Volatile {
             exclusive_audit,
             null_proof,
             null_seed,
+            clear_count,
+            restart_count,
+            object_context_id,
+            context_counter,
         })
     }
 }
@@ -538,7 +634,10 @@ mod tests {
         let mut p = Permanent::manufacture().unwrap();
         let mut pcrs = Pcrs::new();
         pcrs.startup(&p.allocation, Startup::Reset, None);
-        let v = Volatile::power_on(&p);
+        let mut v = Volatile::power_on(&p);
+        for slot in v.sessions.iter_mut() {
+            *slot = SessionSlot::Saved(u64::MAX);
+        }
         p.shutdown = Shutdown::State(Box::new(Saved {
             pcrs: pcrs.save(),
             clear: ClearState {
@@ -564,7 +663,7 @@ mod tests {
             *slot = Some(Object::Key(Box::new(key.clone())));
         }
         for slot in &mut v.sessions {
-            *slot = Some(crate::session::Session {
+            *slot = SessionSlot::Loaded(Box::new(crate::session::Session {
                 kind: crate::session::Kind::Hmac,
                 hash: Hash::Sha512,
                 nonce_tpm: vec![0; 64],
@@ -575,7 +674,7 @@ mod tests {
                 lockout_bound: true,
                 audit: Some(vec![0; 64]),
                 policy_digest: vec![0; 64],
-            });
+            }));
         }
         assert!(v.serialize().len() < VOLATILE_CAPACITY / 2);
     }

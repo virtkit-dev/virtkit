@@ -26,8 +26,7 @@ use crate::{MAX_COMMAND_SIZE, Out, Tpm};
 
 /// How many sessions the TPM holds at once (MAX_LOADED_SESSIONS, as libtpms).
 pub const MAX_LOADED: usize = 3;
-/// How many session handles there are (MAX_ACTIVE_SESSIONS); with no TPM2_ContextSave yet,
-/// every active session is a loaded one.
+/// How many session handles there are (MAX_ACTIVE_SESSIONS): loaded or saved sessions.
 pub const MAX_ACTIVE: usize = 64;
 const HMAC_SESSION_FIRST: u32 = 0x0200_0000;
 const POLICY_SESSION_FIRST: u32 = 0x0300_0000;
@@ -167,6 +166,14 @@ impl Session {
     }
 }
 
+/// A session handle's slot: free, a loaded session, or a saved one (TPM2_ContextSave), which
+/// keeps its handle and the sequence number of the context that holds it (contextArray).
+pub enum SessionSlot {
+    Free,
+    Loaded(Box<Session>),
+    Saved(u64),
+}
+
 /// One session of a command's authorization area.
 pub struct Use {
     pub handle: u32,
@@ -219,13 +226,19 @@ fn index(handle: u32) -> usize {
 }
 
 impl Tpm {
+    /// The session a handle names, if it is loaded.
     pub fn session(&self, handle: u32) -> Option<&Session> {
-        self.volatile.sessions.get(index(handle))?.as_ref()
+        match self.volatile.sessions.get(index(handle))? {
+            SessionSlot::Loaded(s) => Some(s),
+            _ => None,
+        }
     }
 
     fn session_mut(&mut self, handle: u32) -> Result<&mut Session> {
-        let slot = self.volatile.sessions.get_mut(index(handle));
-        slot.and_then(Option::as_mut).ok_or(Rc::FAILURE)
+        match self.volatile.sessions.get_mut(index(handle)) {
+            Some(SessionSlot::Loaded(s)) => Ok(s),
+            _ => Err(Rc::FAILURE),
+        }
     }
 
     /// The session a handle names, if one of that type is loaded there.
@@ -241,7 +254,10 @@ impl Tpm {
         (self.volatile.sessions.iter().enumerate())
             .skip(from)
             .filter_map(|(i, s)| {
-                let first = match s.as_ref()?.kind {
+                let SessionSlot::Loaded(s) = s else {
+                    return None;
+                };
+                let first = match s.kind {
                     Kind::Hmac => HMAC_SESSION_FIRST,
                     _ => POLICY_SESSION_FIRST,
                 };
@@ -250,15 +266,37 @@ impl Tpm {
             .collect()
     }
 
-    pub fn session_count(&self) -> usize {
-        self.volatile.sessions.iter().flatten().count()
+    /// The handles of the saved sessions, from index `from` on (TPM_HT_SAVED_SESSION), each as
+    /// an HMAC session handle (the reference does not tell them apart).
+    pub fn saved_sessions(&self, from: u32) -> Vec<u32> {
+        (self.volatile.sessions.iter().enumerate())
+            .skip(index(from))
+            .filter(|(_, s)| matches!(s, SessionSlot::Saved(_)))
+            .filter_map(|(i, _)| HMAC_SESSION_FIRST.checked_add(u32::try_from(i).ok()?))
+            .collect()
     }
 
-    /// TPM2_FlushContext of a session.
+    /// How many sessions are loaded.
+    pub fn session_count(&self) -> usize {
+        (self.volatile.sessions.iter())
+            .filter(|s| matches!(s, SessionSlot::Loaded(_)))
+            .count()
+    }
+
+    /// How many session handles are taken, by loaded or saved sessions.
+    pub fn active_sessions(&self) -> usize {
+        (self.volatile.sessions.iter())
+            .filter(|s| !matches!(s, SessionSlot::Free))
+            .count()
+    }
+
+    /// TPM2_FlushContext of a session, loaded or saved.
     pub fn flush_session(&mut self, handle: u32) -> Result<()> {
         let slot = self.volatile.sessions.get_mut(index(handle));
-        let slot = slot.filter(|s| s.is_some()).ok_or(Rc::HANDLE)?;
-        *slot = None;
+        let slot = slot
+            .filter(|s| !matches!(s, SessionSlot::Free))
+            .ok_or(Rc::HANDLE)?;
+        *slot = SessionSlot::Free;
         if self.volatile.exclusive_audit == Some(handle) {
             self.volatile.exclusive_audit = None;
         }
@@ -712,12 +750,17 @@ impl Tpm {
         if self.session_count() >= MAX_LOADED {
             return Err(Rc::SESSION_MEMORY);
         }
-        let (i, _) = (self.volatile.sessions.iter().enumerate())
-            .find(|(_, s)| s.is_none())
+        // The last free slot is kept for the oldest saved session, should it need to come
+        // back before the context counter catches up with it.
+        if self.session_count().saturating_add(1) == MAX_LOADED && self.oldest_saved_is_due() {
+            return Err(Rc::CONTEXT_GAP);
+        }
+        let i = (self.volatile.sessions.iter())
+            .position(|s| matches!(s, SessionSlot::Free))
             .ok_or(Rc::SESSION_HANDLES)?;
         let mut nonce_tpm = vec![0; nonce_caller.len()];
         getrandom::fill(&mut nonce_tpm).map_err(|_| Rc::FAILURE)?;
-        // No salt yet: an RSA or ECC key to decrypt one with comes with objects.
+        // No salt yet.
         let key = if bind == TPM_RH_NULL {
             Zeroizing::new(Vec::new())
         } else {
@@ -743,7 +786,7 @@ impl Tpm {
             },
         };
         let slot = self.volatile.sessions.get_mut(i).ok_or(Rc::FAILURE)?;
-        *slot = Some(session);
+        *slot = SessionSlot::Loaded(Box::new(session));
         let first = if kind == Kind::Hmac {
             HMAC_SESSION_FIRST
         } else {

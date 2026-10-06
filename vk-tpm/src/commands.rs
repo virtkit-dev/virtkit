@@ -9,8 +9,9 @@ use crate::entity::{HandleKind, TPM_RH_NULL};
 use crate::marshal::{Reader, Writer};
 use crate::pcr::{self, Startup};
 use crate::rc::{Rc, Result};
+use crate::session::SessionSlot;
 use crate::state::{ResetData, Saved, Shutdown, new_seed};
-use crate::{LOCALITY, Out, Tpm, capability, hierarchy, key, object, session};
+use crate::{LOCALITY, Out, Tpm, capability, context, hierarchy, key, object, session};
 
 pub const TPM_CC_EVICT_CONTROL: u32 = 0x120;
 pub const TPM_CC_HIERARCHY_CONTROL: u32 = 0x121;
@@ -35,6 +36,8 @@ pub const TPM_CC_CREATE: u32 = 0x153;
 pub const TPM_CC_LOAD: u32 = 0x157;
 pub const TPM_CC_SEQUENCE_UPDATE: u32 = 0x15c;
 pub const TPM_CC_UNSEAL: u32 = 0x15e;
+pub const TPM_CC_CONTEXT_LOAD: u32 = 0x161;
+pub const TPM_CC_CONTEXT_SAVE: u32 = 0x162;
 pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x165;
 pub const TPM_CC_LOAD_EXTERNAL: u32 = 0x167;
 pub const TPM_CC_READ_PUBLIC: u32 = 0x173;
@@ -258,7 +261,13 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_UNSEAL, key::unseal)
         .handles(&[H::Object(false)], 1)
         .encrypt(),
-    Command::new(TPM_CC_FLUSH_CONTEXT, object::flush_context).no_sessions(),
+    Command::new(TPM_CC_CONTEXT_LOAD, context::context_load)
+        .response_handle()
+        .no_sessions(),
+    Command::new(TPM_CC_CONTEXT_SAVE, context::context_save)
+        .handles(&[H::Context], 0)
+        .no_sessions(),
+    Command::new(TPM_CC_FLUSH_CONTEXT, context::flush_context).no_sessions(),
     Command::new(TPM_CC_LOAD_EXTERNAL, key::load_external)
         .response_handle()
         .decrypt()
@@ -501,19 +510,39 @@ fn pcr_allocate(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result
 
 impl Tpm {
     /// What each kind of Startup does to STATE_RESET_DATA: a TPM Reset draws a new null
-    /// hierarchy; a Restart or a Resume brings back what TPM2_Shutdown(STATE) saved. Every
-    /// Startup flushes the sessions.
+    /// hierarchy and starts the counters and the sessions over; a Restart or a Resume brings
+    /// back what TPM2_Shutdown(STATE) saved (saved sessions included), and counts itself.
     fn startup_reset_data(&mut self, kind: Startup, saved: Option<ResetData>) -> Result<()> {
         let v = &mut self.volatile;
-        v.sessions.iter_mut().for_each(|s| *s = None);
+        v.sessions.iter_mut().for_each(|s| *s = SessionSlot::Free);
         match (kind, saved) {
             (Startup::Restart | Startup::Resume, Some(saved)) => {
                 v.null_proof = saved.null_proof;
                 v.null_seed = saved.null_seed;
+                v.clear_count = saved.clear_count;
+                v.restart_count = saved.restart_count.wrapping_add(1);
+                if kind == Startup::Restart {
+                    v.clear_count = v.clear_count.wrapping_add(1);
+                }
+                v.object_context_id = saved.object_context_id;
+                v.context_counter = saved.context_counter;
+                for (i, sequence) in saved.saved_sessions {
+                    let slot = usize::try_from(i).ok().and_then(|i| v.sessions.get_mut(i));
+                    if let Some(slot) = slot {
+                        *slot = SessionSlot::Saved(sequence);
+                    }
+                }
             }
             _ => {
                 v.null_proof = new_seed().map_err(|_| Rc::FAILURE)?;
                 v.null_seed = new_seed().map_err(|_| Rc::FAILURE)?;
+                v.clear_count = 0;
+                v.restart_count = 0;
+                v.object_context_id = 0;
+                v.context_counter = context::FIRST_CONTEXT;
+                let p = &mut self.permanent;
+                p.reset_count = p.reset_count.wrapping_add(1);
+                p.total_reset_count = p.total_reset_count.wrapping_add(1);
             }
         }
         Ok(())

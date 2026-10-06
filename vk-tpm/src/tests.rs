@@ -111,6 +111,7 @@ fn valid_handle(kind: HandleKind) -> u32 {
         | HandleKind::HierarchyAuth
         | HandleKind::HierarchyPolicy
         | HandleKind::Provision => TPM_RH_OWNER,
+        HandleKind::Context => 0x8000_0000,
         HandleKind::Platform | HandleKind::Clear => TPM_RH_PLATFORM,
         HandleKind::Lockout => TPM_RH_LOCKOUT,
         // The sequence the test starts first.
@@ -132,13 +133,15 @@ fn every_command_refuses_trailing_parameter_bytes() {
         let create = [&[0, 4, 0, 0, 0, 0][..], public, &[0, 0, 0, 0, 0, 0]].concat();
         let load = [&[0, 0][..], public].concat();
         let load_external = [&[0, 0][..], public, &[0x40, 0, 0, 7]].concat();
+        let context = [&[0; 8][..], &[0x80, 0, 0, 0, 0x40, 0, 0, 7, 0, 0]].concat();
         let params: &[u8] = match cmd.code {
             TPM_CC_EVICT_CONTROL => &[0x81, 0, 0, 1],
             TPM_CC_CREATE_PRIMARY | TPM_CC_CREATE => &create,
             TPM_CC_LOAD => &load,
             TPM_CC_LOAD_EXTERNAL => &load_external,
-            TPM_CC_READ_PUBLIC | TPM_CC_UNSEAL => &[],
+            TPM_CC_READ_PUBLIC | TPM_CC_UNSEAL | TPM_CC_CONTEXT_SAVE => &[],
             TPM_CC_OBJECT_CHANGE_AUTH => &[0, 0],
+            TPM_CC_CONTEXT_LOAD => &context,
             TPM_CC_GET_CAPABILITY => &[0, 0, 0, 6, 0, 0, 1, 0, 0, 0, 0, 1],
             TPM_CC_GET_RANDOM | TPM_CC_STARTUP | TPM_CC_SHUTDOWN => &[0, 0],
             TPM_CC_SELF_TEST | TPM_CC_CLEAR_CONTROL => &[1],
@@ -1053,6 +1056,79 @@ fn a_sealed_object_round_trips_through_its_parent() {
     load.tpm2b(&tampered).tpm2b(public);
     let load = command(TPM_CC_LOAD, &[srk], Some(b""), &load.into_bytes());
     assert_eq!(rc(&tpm.process(&load)), Rc::INTEGRITY.param(1).0);
+}
+
+#[test]
+fn object_contexts_last_until_a_reset() {
+    let mut tpm = started();
+    let srk = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &ecc_srk()));
+    let mut st_clear = ecc_srk();
+    st_clear[7] |= attr::ST_CLEAR as u8;
+    let volatile = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &st_clear));
+    let save = |tpm: &mut Tpm, h: u32| {
+        let r = tpm.process(&command(TPM_CC_CONTEXT_SAVE, &[h], None, &[]));
+        assert_eq!(rc(&r), 0);
+        r[10..].to_vec()
+    };
+    let (srk_context, volatile_context) = (save(&mut tpm, srk), save(&mut tpm, volatile));
+    assert_eq!(srk_context[..12], [0, 0, 0, 0, 0, 0, 0, 1, 0x80, 0, 0, 0]);
+    assert_eq!(
+        volatile_context[..12],
+        [0, 0, 0, 0, 0, 0, 0, 2, 0x80, 0, 0, 2]
+    );
+    let name = read_public_name(&mut tpm, srk);
+    flush(&mut tpm, srk);
+    flush(&mut tpm, volatile);
+    let load = |c: &[u8]| command(TPM_CC_CONTEXT_LOAD, &[], None, c);
+    let loaded = handle_of(&tpm.process(&load(&srk_context)));
+    assert_eq!(read_public_name(&mut tpm, loaded), name);
+    flush(&mut tpm, loaded);
+    // A snapshot keeps loaded objects and what makes contexts valid.
+    let mut restored = Tpm::restore(&tpm.permanent_state(), &tpm.volatile_state()).unwrap();
+    assert_eq!(rc(&restored.process(&load(&srk_context))), 0);
+    // A restart: the stClear object's context no longer loads.
+    tpm.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 1]));
+    let mut tpm = power_cycle(&tpm, 0);
+    let loaded = handle_of(&tpm.process(&load(&srk_context)));
+    flush(&mut tpm, loaded);
+    let r = tpm.process(&load(&volatile_context));
+    assert_eq!(rc(&r), Rc::INTEGRITY.param(1).0);
+    // A reset: none.
+    tpm.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 0]));
+    let mut tpm = power_cycle(&tpm, 0);
+    assert_eq!(
+        rc(&tpm.process(&load(&srk_context))),
+        Rc::INTEGRITY.param(1).0
+    );
+}
+
+#[test]
+fn a_saved_session_holds_back_the_context_counter() {
+    let mut tpm = started();
+    let (session, _) = start_session(&mut tpm, TPM_RH_NULL, &[0, 0x10], 1);
+    let r = tpm.process(&command(TPM_CC_CONTEXT_SAVE, &[session], None, &[]));
+    assert_eq!(rc(&r), 0);
+    let context = r[10..].to_vec();
+    assert_eq!(
+        context[..8],
+        [0, 0, 0, 0, 0, 0, 0, 4],
+        "the first sequence number"
+    );
+    assert_eq!(tpm.saved_sessions(0), [session]);
+    // 2^16 contexts later, the oldest saved session is due: no more until it is loaded.
+    tpm.volatile.context_counter += 0xffff;
+    let (other, _) = start_session(&mut tpm, TPM_RH_NULL, &[0, 0x10], 2);
+    let r = tpm.process(&command(TPM_CC_CONTEXT_SAVE, &[other], None, &[]));
+    assert_eq!(rc(&r), Rc::CONTEXT_GAP.0);
+    let load = command(TPM_CC_CONTEXT_LOAD, &[], None, &context);
+    assert_eq!(handle_of(&tpm.process(&load)), session);
+    assert_eq!(
+        rc(&tpm.process(&load)),
+        Rc::HANDLE.param(1).0,
+        "loaded once"
+    );
+    let r = tpm.process(&command(TPM_CC_CONTEXT_SAVE, &[other], None, &[]));
+    assert_eq!(rc(&r), 0);
 }
 
 #[test]

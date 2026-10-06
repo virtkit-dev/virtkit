@@ -474,6 +474,10 @@ pub fn clear(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()
         tpm.flush_persistent(hierarchy);
     }
     tpm.permanent.dictionary_attack = DictionaryAttack::default();
+    // The counters that date Clock start over.
+    tpm.permanent.reset_count = 0;
+    tpm.volatile.restart_count = 0;
+    tpm.volatile.clear_count = 0;
     // The reference implementation writes back all of its persistent data here, which drops a
     // pending TPM2_PCR_Allocate; so does this TPM, to answer the same.
     tpm.permanent.allocation = tpm.volatile.allocation.clone();
