@@ -656,7 +656,8 @@ fn assets_of<'a>(
     }
     // The release told us where its assets live; require them on the scheme the API was
     // itself reached over, so a response cannot quietly move the transfer to cleartext —
-    // the sidecar would move with it, leaving the digest gate none the wiser.
+    // the sidecar would move with it, leaving the digest gate none the wiser. `client`
+    // refuses a redirect that would do the same.
     let scheme = format!("{}://", api.split_once("://").map_or("https", |(s, _)| s));
     for a in [asset, digest] {
         if !a.browser_download_url.starts_with(&scheme) {
@@ -852,14 +853,29 @@ async fn fetch_into(
 
 /// An HTTP client identifying itself as `user_agent` — GitHub's API rejects requests without
 /// a `User-Agent` — with the connect and per-read timeouts every download here has. It
+/// follows redirects up to reqwest's default limit, never one from https to anything else. It
 /// honours the `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` environment, as reqwest does.
 pub fn client(user_agent: &str) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(user_agent.to_string())
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::custom(
+            |a| match redirect_refusal(a.previous(), a.url()) {
+                Some(why) => a.error(why),
+                None => reqwest::redirect::Policy::default().redirect(a),
+            },
+        ))
         .build()
         .context("building the HTTP client")
+}
+
+/// The reason to refuse a redirect from `previous` to `next`, if any.
+/// reqwest's default policy follows https to http; once a request has been over https,
+/// every hop after it must be too.
+fn redirect_refusal(previous: &[reqwest::Url], next: &reqwest::Url) -> Option<&'static str> {
+    (next.scheme() != "https" && previous.iter().any(|u| u.scheme() == "https"))
+        .then_some("redirected from https to cleartext")
 }
 
 /// Create the file a download lands in, refusing to reuse anything already at that path:
@@ -1461,6 +1477,13 @@ mod tests {
         if rest == "user-agent" {
             return reply(200, user_agent.as_bytes().to_vec());
         }
+        if rest == "redirect" {
+            return Response::builder()
+                .status(302)
+                .header(hyper::header::LOCATION, format!("/{seg}/user-agent"))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+        }
         let (body, size) = body_of(fault);
         // Both tools share one stand-in body, so a single sidecar with a line for each
         // covers them both. A release publishes one single-line sidecar per binary;
@@ -1798,6 +1821,31 @@ mod tests {
                 .unwrap();
             assert_eq!(seen, format!("{}/{}", tool.name, tool.version));
         }
+    }
+
+    // A redirect is followed while it stays on the scheme it started on, or moves up to
+    // https; once a request has been over https, no hop may leave it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redirect_never_leaves_https() {
+        let resp = test_client()
+            .get(format!("{}/redirect", release_api(Fault::None)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.text().await.unwrap(),
+            format!("{}/{}", VK.name, VK.version)
+        );
+
+        let url = |s: &str| reqwest::Url::parse(s).unwrap();
+        let (http, https) = (url("http://a.example/x"), url("https://a.example/x"));
+        assert_eq!(redirect_refusal(std::slice::from_ref(&http), &http), None);
+        assert_eq!(redirect_refusal(std::slice::from_ref(&http), &https), None);
+        assert_eq!(redirect_refusal(std::slice::from_ref(&https), &https), None);
+        assert!(redirect_refusal(std::slice::from_ref(&https), &http).is_some());
+        assert!(redirect_refusal(&[https.clone(), https.clone()], &http).is_some());
+        assert!(redirect_refusal(&[http.clone(), https], &http).is_some());
     }
 
     // The point of the whole crate: a download that fails either gate never becomes the

@@ -105,6 +105,8 @@ All notable changes to virtkit will be documented in this file.
 
 - **`vk update` no longer hangs on a release whose `--version` does not return**: it is
   killed, with anything it started, after 30 seconds, and the update fails.
+- **Security: `vk update`, `vk-registry update` and `vk toolchain` no longer follow a
+  redirect from https to http**: the download fails instead of continuing in cleartext.
 
 ## [0.84.0] - 2026-10-05
 
