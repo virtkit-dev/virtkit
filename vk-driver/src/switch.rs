@@ -7492,6 +7492,11 @@ mod tests {
         assert_eq!(err.to_string(), "reply too short (4 bytes)");
     }
 
+    /// Whole-lookup budget for an expected answer. These tests exercise the short probes;
+    /// leave enough overall time for host scheduling delays, which can otherwise exhaust
+    /// the budget and fail a lookup that would succeed.
+    const ANSWERED_BUDGET: Duration = Duration::from_secs(30);
+
     #[tokio::test]
     async fn resolve_upstream_retries_past_a_dropped_datagram() {
         // A resolver that drops the first datagram and answers the second — the pattern a
@@ -7513,7 +7518,7 @@ mod tests {
             &[addr],
             3,
             Duration::from_millis(200),
-            Duration::from_secs(1),
+            ANSWERED_BUDGET,
         )
         .await
         .expect("a retry recovers a single dropped datagram");
@@ -7542,7 +7547,7 @@ mod tests {
             &[dead_addr, live_addr],
             3,
             Duration::from_millis(200),
-            Duration::from_secs(1),
+            ANSWERED_BUDGET,
         )
         .await
         .expect("failover reaches the healthy resolver");
@@ -7611,7 +7616,7 @@ mod tests {
             &[addr],
             3,
             Duration::from_millis(500),
-            Duration::from_secs(2),
+            ANSWERED_BUDGET,
         )
         .await
         .expect("the truncated answer resolves");
@@ -7645,7 +7650,7 @@ mod tests {
             &[addr],
             3,
             Duration::from_millis(500),
-            Duration::from_secs(1),
+            ANSWERED_BUDGET,
         )
         .await
         .expect("a truncated answer still resolves for the guest");
