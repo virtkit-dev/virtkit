@@ -72,6 +72,19 @@ pub fn kdfa(alg: u16, key: &[u8], label: &str, u: &[u8], v: &[u8], bytes: usize)
     out
 }
 
+/// KDFe (SP 800-56A, Part 1 11.4.10.3): `bytes` of H(counter ‖ Z ‖ label ‖ U ‖ V), `label` with
+/// its terminating zero.
+pub fn kdfe(alg: u16, z: &[u8], label: &[u8], u: &[u8], v: &[u8], bytes: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut counter = 0u32;
+    while out.len() < bytes {
+        counter += 1;
+        out.extend_from_slice(&digest(alg, &[&counter.to_be_bytes(), z, label, u, v]));
+    }
+    out.truncate(bytes);
+    out
+}
+
 /// A session's parameter encryption.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sym {
@@ -112,15 +125,28 @@ impl Session {
         sym: Sym,
         bind: Option<&[u8]>,
     ) -> Session {
+        Session::salted(response, hash, nonce_caller, sym, bind, &[])
+    }
+
+    /// As [`Session::started`], with a salt: the session key is KDFa of the bind authValue ‖
+    /// the salt.
+    pub fn salted(
+        response: &[u8],
+        hash: u16,
+        nonce_caller: &[u8],
+        sym: Sym,
+        bind: Option<&[u8]>,
+        salt: &[u8],
+    ) -> Session {
         let handle = u32::from_be_bytes(response[10..14].try_into().unwrap());
         let size = u16::from_be_bytes([response[14], response[15]]) as usize;
         let nonce_tpm = response[16..16 + size].to_vec();
-        let key = match bind {
-            Some(auth) => {
-                let size = digest(hash, &[]).len();
-                kdfa(hash, strip(auth), "ATH", &nonce_tpm, nonce_caller, size)
-            }
-            None => Vec::new(),
+        let key = if bind.is_none() && salt.is_empty() {
+            Vec::new()
+        } else {
+            let secret = [strip(bind.unwrap_or_default()), salt].concat();
+            let size = digest(hash, &[]).len();
+            kdfa(hash, &secret, "ATH", &nonce_tpm, nonce_caller, size)
         };
         Session {
             handle,

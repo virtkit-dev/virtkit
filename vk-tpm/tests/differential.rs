@@ -16,6 +16,7 @@
 
 mod client;
 mod libtpms;
+mod objects;
 
 use client::{Auth, Sym};
 use libtpms::LibTpms;
@@ -138,6 +139,41 @@ impl Both {
             sessions
                 .theirs
                 .push(client::Session::started(&theirs, hash, nonce, sym, bind));
+        }
+        rc(&ours)
+    }
+
+    /// TPM2_StartAuthSession of an unbound HMAC session salted with `salt`, sent encrypted to
+    /// `tpm_key` (the same key on both) as `encrypted`. Returns the response code.
+    fn start_salted_session(
+        &mut self,
+        sessions: &mut Sessions,
+        tpm_key: u32,
+        encrypted: &[u8],
+        salt: &[u8],
+        nonce: &[u8],
+    ) -> u32 {
+        let hash = client::SHA256;
+        let params = [
+            tpm2b(nonce),
+            tpm2b(encrypted),
+            vec![SE_HMAC],
+            Sym::Aes(128).marshal(hash),
+            hash.to_be_bytes().to_vec(),
+        ]
+        .concat();
+        let c = command(START_AUTH_SESSION, &[tpm_key, RH_NULL], None, &params);
+        let (ours, theirs) = self.both(&c);
+        assert_eq!(ours.len(), theirs.len(), "command {}", hex(&c));
+        assert_eq!(
+            hex(&ours[..14.min(ours.len())]),
+            hex(&theirs[..14.min(theirs.len())])
+        );
+        if rc(&ours) == 0 {
+            let sym = Sym::Aes(128);
+            let session = |r: &[u8]| client::Session::salted(r, hash, nonce, sym, None, salt);
+            sessions.ours.push(session(&ours));
+            sessions.theirs.push(session(&theirs));
         }
         rc(&ours)
     }
