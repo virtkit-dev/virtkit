@@ -79,6 +79,8 @@ mod sshconf;
 mod switch;
 mod task;
 mod term;
+#[cfg(test)]
+mod testutil;
 mod timing;
 mod toolchain;
 mod units;

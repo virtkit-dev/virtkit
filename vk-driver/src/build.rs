@@ -4477,6 +4477,13 @@ mod tests {
         })
     }
 
+    /// A sweep's claim on `dir`, whose own claim a test has just dropped. A child another test
+    /// forked meanwhile can hold that claim until it execs: see `crate::testutil::released`.
+    fn abandoned(dir: &Path) -> std::fs::File {
+        crate::testutil::acquired(|| claim_if_abandoned(dir))
+            .expect("an unlocked scratch dir is abandoned")
+    }
+
     /// A pid that has certainly been reaped, so a dir named after it never looks live on
     /// its name alone.
     fn dead_pid() -> u32 {
@@ -4703,7 +4710,7 @@ mod tests {
         drop(claim_scratch(&dir).unwrap());
         std::fs::write(dir.join("stage.ext4"), b"a stage half-removed").unwrap();
 
-        let owner = claim_if_abandoned(&dir).expect("an unlocked scratch dir is abandoned");
+        let owner = abandoned(&dir);
         // Mid-walk: contents gone, the dir itself still to come.
         std::fs::remove_file(dir.join("stage.ext4")).unwrap();
         assert!(
@@ -4748,7 +4755,7 @@ mod tests {
         let dir = root.join(format!("{SCRATCH_PREFIX}{}-0", dead_pid()));
         drop(claim_scratch(&dir).unwrap());
 
-        let sweeping = claim_if_abandoned(&dir).expect("an unlocked scratch dir is abandoned");
+        let sweeping = abandoned(&dir);
 
         // The claim goes on the thread and the sweep stays here, so every fallible step of
         // the sweep reports the error it failed with instead of reaching us as a bare

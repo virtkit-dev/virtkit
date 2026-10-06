@@ -697,7 +697,10 @@ mod tests {
             "{e:#}"
         );
         drop(squatter2);
-        assert_eq!(allocate(&plan, None, true).unwrap(), moved);
+        // A child another test forked while the squatter was open holds its socket until it
+        // execs: see `crate::testutil::released`.
+        let again = crate::testutil::once_released("cannot bind", || allocate(&plan, None, true));
+        assert_eq!(again.unwrap(), moved);
         drop(squatter);
         // Forgetting drops the octet, not the block: the next allocation is in the block
         // this environment already holds.
