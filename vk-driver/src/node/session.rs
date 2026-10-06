@@ -974,34 +974,58 @@ mod tests {
         ended.expect("the session outlived its stop").unwrap();
     }
 
-    /// The workloads go out on a report once, and not again with every heartbeat while
-    /// they stay the same.
+    /// Workloads are reported once, then again only when they change, not on every heartbeat.
     #[tokio::test(flavor = "multi_thread")]
     async fn workloads_are_reported_once_while_they_stay_the_same() {
         let mut f = fixture("workloads").await;
-        let (node, gatherer, stopped, listener, stop) = f.parts();
+        let (node, _, stopped, listener, stop) = f.parts();
         let key = node.identity.public_key().to_vec();
+        // Feed heartbeats manually, one at a time, so deadlines do not depend on host read speed.
+        let (feed, answers) = mpsc::channel(1);
+        let asked = Arc::new(Asked::default());
+        let mut gatherer = Gatherer {
+            asked: asked.clone(),
+            answers,
+        };
         let hub = async {
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, PROTOCOL, PROTOCOL.max).await);
-            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
-            let (mut heartbeats, mut with_workloads) = (0, 0);
-            while heartbeats < 4 {
-                match next_of(&mut ws, Some).await {
-                    NodeMsg::Heartbeat(_) => {
-                        heartbeats += 1;
-                        // As a hub pings, so the node does not give the session up as silent.
-                        ws.send(Message::Ping(Vec::new().into())).await.unwrap();
+            // Allow minutes of silence so the session stays open without hub pings.
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
+            // Feed after the inventory request: the session first drains earlier answers
+            // as belonging to a past session.
+            asked.wake.notified().await;
+            let same = Listed::default();
+            let changed = Listed {
+                omitted: 1,
+                ..Listed::default()
+            };
+            for (workloads, reported) in [
+                (&same, true),
+                (&same, false),
+                (&same, false),
+                (&changed, true),
+            ] {
+                let beat = Gathered::Heartbeat(Heartbeat::default(), workloads.clone());
+                feed.send(beat).await.unwrap();
+                // Reports may also carry the node's runner state; count only those with workloads.
+                let mut with_workloads = Vec::new();
+                loop {
+                    match next_of(&mut ws, Some).await {
+                        NodeMsg::Heartbeat(_) => break,
+                        NodeMsg::Report(r) if r.workloads.is_some() => with_workloads.push(r),
+                        _ => {}
                     }
-                    NodeMsg::Report(r) if r.workloads.is_some() => with_workloads += 1,
-                    _ => {}
+                }
+                assert_eq!(with_workloads.len(), usize::from(reported));
+                if let Some(r) = with_workloads.first() {
+                    assert_eq!(r.workloads_omitted, workloads.omitted);
                 }
             }
-            assert_eq!(with_workloads, 1);
             stop.send(true).unwrap();
             while hub_receive(&mut ws).await.is_some() {}
         };
-        let (_, ended) = tokio::join!(hub, run(node, gatherer, stopped));
+        let (_, ended) = tokio::join!(hub, run(node, &mut gatherer, stopped));
         ended.unwrap();
     }
 
