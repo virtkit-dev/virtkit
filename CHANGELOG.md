@@ -9,10 +9,10 @@ All notable changes to virtkit will be documented in this file.
 - **`vk run` boots a UEFI guest, such as an installed Windows Server, from a local bundle.**
   A directory holding `vm.json` (`{"firmware": "uefi", "cpus": 2, "mem": "4G", "disks":
   ["disk.qcow2"]}`) and its named disks boots with embedded UEFI firmware and no vk-agent.
-  The firmware is edk2's OvmfPkg/CloudHv, built by `./build-firmware.sh`; `build.sh` embeds
-  `dist/CLOUDHV.fd` when present, and `VIRTKIT_UEFI_FIRMWARE` selects another. Each disk gets
-  a copy-on-write overlay in the run's directory: the bundle is never written, and
-  `--state-dir` retains the guest's disk across runs. `--net` gives the guest a DHCP lease
+  The firmware is edk2's OvmfPkg/CloudHv, embedded in released vk; a local build embeds
+  `dist/CLOUDHV.fd` from `./build-firmware.sh`, and `VIRTKIT_UEFI_FIRMWARE` selects another.
+  Each disk gets a copy-on-write overlay in the run's directory: the bundle is never written,
+  and `--state-dir` retains the guest's disk across runs. `--net` gives the guest a DHCP lease
   on the run's LAN; `--cpus`/`--mem` override the bundle's values. Flags that need vk-agent
   (a command, `--volume`, `--env`, `--ssh`, ...) are refused. A `--state-dir` run appears in
   `vk list`; `vk reboot` hard-resets it. `vk stop` (or Ctrl-C) presses the ACPI power button

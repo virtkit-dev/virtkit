@@ -283,6 +283,10 @@ toolchain=$(sed -nE 's/^channel = "(.*)"$/\1/p' rust-toolchain.toml)
 if [ -n "$EMBED_FIRMWARE" ]; then
   firmware_step="./build-firmware.sh && "
   firmware_line=$(cd "$OUT" && sha256sum CLOUDHV.fd)
+  # The nix store path pins the exact edk2 derivation; absent for a CLOUDHV.fd placed by hand.
+  store_path=$(awk '$1 == "store_path:" { print $2 }' "$OUT/firmware-build-info.txt" 2>/dev/null || true)
+  [ -z "$store_path" ] || firmware_line="$firmware_line
+firmware_store:  $store_path"
 else
   firmware_step=""
   firmware_line="firmware:        none"
