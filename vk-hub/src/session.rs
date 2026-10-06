@@ -394,6 +394,11 @@ async fn serve(
                         acknowledge(ws, hub, node, ack).await?;
                         None
                     }
+                    NodeMsg::Job(_) => {
+                        let reason = format!("a job message in a version-{} session", node.version);
+                        refuse(ws, RefusalCode::Protocol, &reason).await;
+                        bail!("the node sent {reason}");
+                    }
                     NodeMsg::Hello { .. } | NodeMsg::Auth { .. } => {
                         bail!("the node repeated its handshake inside a session")
                     }

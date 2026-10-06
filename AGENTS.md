@@ -65,7 +65,8 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with ten crates:
 - **`vk-hub-proto/`** — what `vk` tells other programs on its host, such as `vk-hub`:
   the list of the host's VMs `vk workloads` prints; and what `vk node` and `vk-hub` exchange
   in fleet mode: enrollment, the session's messages, protocol version negotiation, and the
-  payloads each side signs or verifies. Types and pure functions only — no runtime,
+  payloads each side signs or verifies; and the hub's client API and the job spec a producer
+  such as `vk-gitlab` submits through it. Types and pure functions only — no runtime,
   transport or crypto.
 - **`vk-oidc/`** — the OIDC relying party `vk-registry` and `vk-hub` sign people in with:
   discovery checked against the configured issuer, the authorization URL with `state` and

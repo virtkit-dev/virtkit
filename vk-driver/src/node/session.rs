@@ -426,6 +426,7 @@ async fn handle(msg: HubMsg, node: &Node, version: u32) -> Result<Option<Command
         HubMsg::Desired(_) | HubMsg::Command(_) | HubMsg::Recorded(_) if version < STEERING => {
             bail!("the hub sent {} in a version-{version} session", kind(&msg))
         }
+        HubMsg::Job(_) => bail!("the hub sent {} in a version-{version} session", kind(&msg)),
         HubMsg::Desired(desired) => {
             let generation = desired.generation;
             if persist(&node.core, move |core| core.apply_desired(desired)).await? {
@@ -488,6 +489,7 @@ fn kind(msg: &HubMsg) -> &'static str {
         HubMsg::Desired(_) => "desired state",
         HubMsg::Command(_) => "a command",
         HubMsg::Recorded(_) => "a record of an ack",
+        HubMsg::Job(_) => "a job message",
     }
 }
 

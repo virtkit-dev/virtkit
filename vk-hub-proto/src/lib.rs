@@ -2,7 +2,7 @@
 //! `vk-hub` in fleet mode. Shared message types and signing payloads prevent format drift;
 //! each side handles its own transport, storage and crypto.
 //!
-//! Four exchanges exist:
+//! Five exchanges exist:
 //!
 //! - **Workloads**: `vk workloads` prints the VMs running on its host for its user as a
 //!   [`WorkloadList`], one JSON document per line, for a local UI or any other reader on the
@@ -20,6 +20,8 @@
 //!   `vk` an [`Operation::Update`] names, and so only on the word of a version 2 session. It
 //!   carries the node's ID, the time and the node's signature over [`download_message`] in the
 //!   [`NODE_HEADER`], [`TIME_HEADER`] and [`SIGNATURE_HEADER`] headers; the body is the binary.
+//! - **The client API** ([`client`]): a job producer holding an API key reserves capacity,
+//!   submits [`job::JobSpec`]s and follows their output and results over HTTP.
 //!
 //! **Versioning.** Each side of a session speaks a [`VersionRange`], and the hub picks the
 //! highest version both ranges contain ([`VersionRange::negotiate`]); every message after the
@@ -42,6 +44,11 @@
 //! [`NodeState::Maintenance`] and [`NodeState::Validating`] states, the report's
 //! [`UpdateProgress`], and the release download. [`Versions::vk_sha256`] is an optional
 //! inventory field, which a hub of any version reads or ignores.
+//!
+//! Version 3 ([`JOBS`]) will add job placement: [`NodeMsg::Job`] and [`HubMsg::Job`] carry
+//! [`dispatch`]'s reservations, job starts, output and results. [`PROTOCOL`] will include it
+//! once both peers implement it; until then, job messages are protocol errors. Producers
+//! such as `vk-gitlab` submit [`job`]'s specs through the hub's [`client`] API.
 //!
 //! **Steering.** From version 2 the node's [`Report`] also carries its observed state — the
 //! desired state it last applied, its [`NodeState`], whether its runner is taking jobs, its
@@ -66,6 +73,10 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+pub mod client;
+pub mod dispatch;
+pub mod job;
 
 /// Where a node enrolls.
 pub const ENROLL_PATH: &str = "/v1/enroll";
@@ -111,6 +122,10 @@ pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 2 };
 /// The first protocol version with desired state and commands. Earlier versions support
 /// monitoring only.
 pub const STEERING: u32 = 2;
+
+/// The first protocol version that carries [`NodeMsg::Job`] and [`HubMsg::Job`]. Not yet in
+/// [`PROTOCOL`].
+pub const JOBS: u32 = 3;
 
 /// The largest message either side accepts, as a WebSocket message or an enrollment body.
 /// An inventory is a few kilobytes; this bounds what a confused or hostile peer can make the
@@ -464,6 +479,8 @@ pub enum NodeMsg {
     /// What became of a [`HubMsg::Command`]; repeated until the hub answers
     /// [`HubMsg::Recorded`]. From version 2.
     Ack(CommandAck),
+    /// Reservations and jobs. From version [`JOBS`].
+    Job(dispatch::NodeJobMsg),
 }
 
 /// Hub → node.
@@ -495,6 +512,8 @@ pub enum HubMsg {
     Command(Command),
     /// The hub has stored this ack; the node stops repeating it. From version 2.
     Recorded(CommandAck),
+    /// Reservations and jobs. From version [`JOBS`].
+    Job(dispatch::HubJobMsg),
 }
 
 /// Why a session was refused or ended, for the node to decide whether redialing can help.
