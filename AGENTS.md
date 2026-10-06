@@ -82,7 +82,8 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with ten crates:
   config edit is also a library, for unprivileged `vk` to apply to a runner config it owns.
 - **`vk-tpm/`** — a TPM 2.0 engine in Rust (in progress), to replace libtpms behind libkrun's
   TPM CRB device: command processing, PCRs, versioned state; crypto from RustCrypto crates
-  only.
+  only. Its differential tests run the same commands against libtpms (`--features libtpms`,
+  `VK_LIBTPMS_DIR`).
 
 libkrun is vendored (its own cargo workspace, locally patched) under
 `third_party/libkrun` — see its `VENDOR.md` for the patch list.

@@ -14,6 +14,11 @@ sha2.workspace = true
 subtle.workspace = true
 zeroize.workspace = true
 
+[features]
+# Test-only: link libtpms (and its libcrypto) from VK_LIBTPMS_DIR so tests/differential.rs can
+# run the same commands on both TPMs and compare. Never enabled by a binary.
+libtpms = []
+
 # Every byte this crate parses comes from the guest: a panic or an overflow is a VMM crash.
 [lints.clippy]
 unwrap_used = "warn"
