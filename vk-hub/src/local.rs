@@ -1408,7 +1408,10 @@ mod tests {
         let vk = fake_vk(
             &dir,
             &format!(
-                "d='{}'\nreadlink /proc/$$/fd/1 > \"$d/log\"; stat -L -c %a /proc/$$/fd/1 > \"$d/mode\"\n\
+                // Captured first, then written: dash applies a simple command's redirection
+                // to its own descriptors, so `readlink /proc/$$/fd/1 > log` reads `log`.
+                "d='{}'\nlog=$(readlink /proc/$$/fd/1); mode=$(stat -L -c %a /proc/$$/fd/1)\n\
+                 echo \"$log\" > \"$d/log\"; echo \"$mode\" > \"$d/mode\"\n\
                  trap 'echo term >> \"$d/termed\"' TERM\nsleep 600 & echo $! > '{}'\n\
                  while :; do sleep 0.1; done",
                 dir.display(),
