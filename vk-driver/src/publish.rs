@@ -996,7 +996,20 @@ mod tests {
         addr
     }
 
-    /// End to end through `run`'s own accept loop: a local TCP client -> `publish::run`
+    /// [`serve_on`], the accept loop behind `run`, relaying to `target` through the agent at
+    /// `agent_addr` on a listener bound here and handed over: a port freed for `run` to bind
+    /// could be taken by any socket meanwhile, and the client would reach that instead.
+    async fn relay(agent_addr: SocketAddr, target: String) -> std::net::SocketAddr {
+        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front_addr = front.local_addr().unwrap();
+        let listen: SocketAddr = format!("tcp://{front_addr}").parse().unwrap();
+        tokio::spawn(async move {
+            let _ = serve_on(RawListener::Tcp(front), &agent_addr, &listen, &target).await;
+        });
+        front_addr
+    }
+
+    /// End to end through the accept loop `run` serves on: a local TCP client -> `serve_on`
     /// -> a fake agent (a real `run_server`) -> an echo target on its "network". Proves
     /// the accept/dial/relay glue this module adds on top of `client_run_connect` (which
     /// `vk-core/tests/exec.rs` already covers directly) is wired correctly end to end.
@@ -1021,20 +1034,8 @@ mod tests {
         let echo_addr = echo_server().await;
         let target = format!("tcp://{echo_addr}");
 
-        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let front_addr = front.local_addr().unwrap();
-        drop(front); // free the port for `run` to bind
-        let listen: SocketAddr = format!("tcp://{front_addr}").parse().unwrap();
-        tokio::spawn(async move {
-            let _ = run(&agent_addr, &listen, &target).await;
-        });
-
-        let mut client = loop {
-            if let Ok(c) = TcpStream::connect(front_addr).await {
-                break c;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        let front_addr = relay(agent_addr, target).await;
+        let mut client = TcpStream::connect(front_addr).await.unwrap();
         client.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
         client.read_exact(&mut buf).await.unwrap();
@@ -1077,20 +1078,8 @@ mod tests {
         let greet_addr = greeter_server().await;
         let target = format!("tcp://{greet_addr}");
 
-        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let front_addr = front.local_addr().unwrap();
-        drop(front);
-        let listen: SocketAddr = format!("tcp://{front_addr}").parse().unwrap();
-        tokio::spawn(async move {
-            let _ = run(&agent_addr, &listen, &target).await;
-        });
-
-        let mut client = loop {
-            if let Ok(c) = TcpStream::connect(front_addr).await {
-                break c;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        let front_addr = relay(agent_addr, target).await;
+        let mut client = TcpStream::connect(front_addr).await.unwrap();
         // Read only — the target speaks first, unprompted.
         let mut buf = [0u8; 14];
         tokio::time::timeout(Duration::from_secs(3), client.read_exact(&mut buf))
@@ -1102,7 +1091,7 @@ mod tests {
 
     /// `--to` naming a host instead of an IP literal: `SocketAddr::from_str` can't
     /// parse it (that's the whole point — see `parse_publish_to`), so this exercises
-    /// the fallback all the way through `run`'s accept loop, not just `--to`'s CLI
+    /// the fallback all the way through `serve_on`'s accept loop, not just `--to`'s CLI
     /// validation. "localhost" stands in for a compose sibling's hostname.
     #[tokio::test]
     async fn relays_to_a_hostname_target() {
@@ -1125,20 +1114,8 @@ mod tests {
         let echo_addr = echo_server().await;
         let target = format!("tcp://localhost:{}", echo_addr.port());
 
-        let front = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let front_addr = front.local_addr().unwrap();
-        drop(front);
-        let listen: SocketAddr = format!("tcp://{front_addr}").parse().unwrap();
-        tokio::spawn(async move {
-            let _ = run(&agent_addr, &listen, &target).await;
-        });
-
-        let mut client = loop {
-            if let Ok(c) = TcpStream::connect(front_addr).await {
-                break c;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        let front_addr = relay(agent_addr, target).await;
+        let mut client = TcpStream::connect(front_addr).await.unwrap();
         client.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
         tokio::time::timeout(Duration::from_secs(3), client.read_exact(&mut buf))
@@ -1212,7 +1189,7 @@ mod tests {
     #[test]
     fn stopping_a_vm_stops_the_publishers_recorded_for_it() {
         let t = state("teardown");
-        let mut victim = std::process::Command::new("sleep")
+        let victim = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .unwrap();
@@ -1224,14 +1201,24 @@ mod tests {
             victim.id(),
             None,
         );
-        // The test holds the publisher's lock and drops it to model process exit.
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            drop(lock);
+        // The lock goes with the process, as a real publisher's does: held until `stop`'s
+        // signal ends the victim. So `stop` finds the entry held and has to signal and wait,
+        // rather than prune a stale record, however late it gets to it.
+        let victim = std::sync::Arc::new(std::sync::Mutex::new(victim));
+        let exited = std::thread::spawn({
+            let victim = victim.clone();
+            move || {
+                let status = loop {
+                    if let Some(status) = victim.lock().unwrap().try_wait().unwrap() {
+                        break status;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                drop(lock);
+                status
+            }
         });
 
-        // Exercise signal-and-wait, not stale-record pruning: `stop` selects the held
-        // entry before the delayed release.
         let (report, all_down) = stop(&t.0, None, Duration::from_secs(2)).unwrap();
         assert!(report.contains("stopped web"), "{report}");
         assert!(all_down);
@@ -1239,8 +1226,10 @@ mod tests {
             !entry_path(&t.0, "web").exists(),
             "a stopped publisher leaves no record behind"
         );
-        let _ = victim.kill();
-        let _ = victim.wait();
+        // A no-op once `stop` has ended it; otherwise the join below would wait out the sleep.
+        let _ = victim.lock().unwrap().kill();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(exited.join().unwrap().signal(), Some(libc::SIGTERM));
     }
 
     #[test]
