@@ -760,16 +760,28 @@ const STATE_DIR_LOCK_RETRY: Duration = Duration::from_millis(5);
 /// lock has stayed held for [`STATE_DIR_LOCK_GRACE`]. Advisory and filesystem-local, like the
 /// other locks in the tree.
 fn lock_state_dir(dir: &Path) -> Result<std::fs::File> {
+    lock_state_dir_within(dir, STATE_DIR_LOCK_GRACE, || {
+        std::thread::sleep(STATE_DIR_LOCK_RETRY)
+    })
+}
+
+/// [`lock_state_dir`] with a supplied grace and action after each refusal.
+/// Tests release the holder in that action, after a definite refusal.
+fn lock_state_dir_within(
+    dir: &Path,
+    grace: Duration,
+    mut after_refusal: impl FnMut(),
+) -> Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
     let f = std::fs::File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
-    let deadline = Instant::now() + STATE_DIR_LOCK_GRACE;
+    let deadline = Instant::now() + grace;
     // SAFETY: the fd is owned by `f`, which the caller keeps alive; flock
     // returns 0 or -1/errno and does not block under LOCK_NB.
     while unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let err = std::io::Error::last_os_error();
         if err.kind() == std::io::ErrorKind::WouldBlock {
             if Instant::now() < deadline {
-                std::thread::sleep(STATE_DIR_LOCK_RETRY);
+                after_refusal();
                 continue;
             }
             // The owning run prints its progress to the terminal that started it, not
@@ -6145,28 +6157,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        // A probe like `vms::alive`'s: the lock taken through its own descriptor, held for a
-        // moment well inside the grace, then dropped.
+        // A probe like `vms::alive`'s: the lock taken through its own descriptor, and dropped
+        // as soon as the lock was refused. The grace is the five seconds `testutil::released`
+        // gives a forked child's copy of the probe, not a race against a 100 ms clock.
         let probe = std::fs::File::open(&dir).unwrap();
         // SAFETY: flock(2) on an fd owned by `probe`, which outlives the call.
         assert_eq!(
             unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
-        let release = std::thread::spawn(move || {
-            std::thread::sleep(STATE_DIR_LOCK_GRACE / 10);
-            drop(probe);
+        let mut probe = Some(probe);
+        let held = lock_state_dir_within(&dir, Duration::from_secs(5), || {
+            drop(probe.take());
+            std::thread::sleep(STATE_DIR_LOCK_RETRY);
         });
-        let start = Instant::now();
-        let held = lock_state_dir(&dir);
-        release.join().unwrap();
         assert!(
             held.is_ok(),
             "a probe must not read as a live run: {:#}",
             held.unwrap_err()
         );
-        // It met the probe's lock and waited it out, rather than finding it already gone.
-        assert!(start.elapsed() >= STATE_DIR_LOCK_GRACE / 10);
+        assert!(probe.is_none(), "the probe's lock was never refused");
 
         drop(held);
         let _ = std::fs::remove_dir_all(&dir);
