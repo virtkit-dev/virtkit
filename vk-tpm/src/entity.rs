@@ -72,6 +72,8 @@ pub enum HandleKind {
     Object(bool),
     /// TPMI_DH_ENTITY, or with `true` TPMI_DH_ENTITY+: anything with an authorization.
     Entity(bool),
+    /// TPMI_DH_PARENT+: a transient or persistent object, a hierarchy, or TPM_RH_NULL.
+    Parent,
     /// TPMI_RH_NV_AUTH: owner, platform, or an NV index.
     NvAuth,
     /// TPMI_RH_NV_INDEX.
@@ -108,6 +110,12 @@ impl HandleKind {
                     || is_pcr(handle)
                     || VENDOR_AUTH.contains(&handle)
                     || (null && handle == TPM_RH_NULL)
+            }
+            HandleKind::Parent => {
+                hierarchy
+                    || handle == TPM_RH_NULL
+                    || TRANSIENT.contains(&handle)
+                    || handle_type(handle) == TPM_HT_PERSISTENT
             }
             HandleKind::NvAuth => {
                 matches!(handle, TPM_RH_OWNER | TPM_RH_PLATFORM) || nv::is_nv_index(handle)

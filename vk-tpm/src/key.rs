@@ -18,7 +18,8 @@ use crate::entity::{
 use crate::marshal::{Reader, Writer};
 use crate::pcr;
 use crate::public::{
-    self, MAX_SYM_DATA, Params, Parent, Public, Sensitive, SensitiveCreate, Type, Unique, attr,
+    self, MAX_SYM_DATA, MAX_TEMPLATE, Params, Parent, Public, Sensitive, SensitiveCreate, Type,
+    Unique, attr,
 };
 use crate::rc::{Rc, Result};
 use crate::state::{Seed, StateError, read_bool};
@@ -711,6 +712,58 @@ pub fn create(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, w: &mut Out) -> Re
     public.write_sized(w);
     w.tpm2b(&creation).tpm2b(&creation_hash);
     tpm.creation_ticket(hierarchy, &name, &creation_hash, w);
+    Ok(())
+}
+
+/// TPM2_CreateLoaded: TPM2_CreatePrimary under a hierarchy, or TPM2_Create under a parent with
+/// the object loaded at once. A derivation parent (a restricted keyed-hash decryption key) is
+/// not implemented: it is no parent here (see the design's deviations).
+pub fn create_loaded(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, w: &mut Out) -> Result<()> {
+    let mut sensitive = SensitiveCreate::read_sized(r).map_err(|rc| rc.param(1))?;
+    let template = r.tpm2b(MAX_TEMPLATE).map_err(|rc| rc.param(2))?;
+    end(r)?;
+    let parent_handle = first(handles)?;
+    let primary = handle_type(parent_handle) == TPM_HT_PERMANENT;
+    if !primary && !tpm.key(parent_handle).is_some_and(Key::is_parent) {
+        return Err(Rc::TYPE.handle(1));
+    }
+    tpm.free_slot()?;
+    let public = Public::from_template(template).map_err(|rc| rc.param(2))?;
+    sensitive.auth =
+        public::adjust_auth(&sensitive.auth, public.digest_size()).map_err(|rc| rc.param(1))?;
+    let parent = if primary {
+        None
+    } else {
+        tpm.key(parent_handle)
+    };
+    let checked = parent.map(|p| Parent { public: &p.public });
+    let data_len = sensitive.data.len();
+    public::create_checks(checked.as_ref(), &public, data_len).map_err(|rc| rc.param(2))?;
+    let mut public = public;
+    let (mut drbg, eps_stir) = if primary {
+        let drbg = Drbg::seeded(
+            tpm.primary_seed(parent_handle).as_slice(),
+            PRIMARY_OBJECT_CREATION,
+            &public.name(),
+            &sensitive.data,
+        );
+        let h = &tpm.permanent.hierarchies;
+        let stir = (parent_handle == TPM_RH_ENDORSEMENT).then_some((&h.sh_proof, &h.eh_proof));
+        (drbg, stir)
+    } else {
+        (Drbg::random()?, None)
+    };
+    let secrets = create_object(&mut public, &sensitive, &mut drbg, eps_stir)?;
+    let private = match parent {
+        Some(p) => wrap(p, &public.name(), public.name_alg, &secrets)?,
+        None => Vec::new(),
+    };
+    let mut key = Key::new(public, Some(secrets))?;
+    key.set_loaded(parent, parent_handle);
+    w.tpm2b(&private);
+    key.public.write_sized(w);
+    w.tpm2b(&key.name);
+    w.handle = Some(tpm.load_object(crate::object::Object::Key(Box::new(key)))?);
     Ok(())
 }
 

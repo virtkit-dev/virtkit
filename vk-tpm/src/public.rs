@@ -71,6 +71,9 @@ pub const MAX_RSA_KEY_BYTES: usize = 512;
 const MAX_RSA_PRIVATE: usize = MAX_RSA_KEY_BYTES / 2 * 5;
 /// TPM2B_ECC_PARAMETER: sized for the reference's largest curve (BN P638).
 pub const MAX_ECC_KEY_BYTES: usize = 80;
+/// TPM2B_TEMPLATE: sizeof(TPMT_PUBLIC) as libtpms lays it out (its RSA-4096 unique, with C's
+/// padding), the most TPM2_CreateLoaded takes.
+pub const MAX_TEMPLATE: usize = 612;
 /// TPM2B_SENSITIVE_DATA (MAX_SYM_DATA).
 pub const MAX_SYM_DATA: usize = 128;
 /// TPM2B_SYM_KEY (MAX_SYM_KEY_BYTES).
@@ -487,6 +490,17 @@ impl Public {
             params,
             unique,
         })
+    }
+
+    /// The contents of TPM2_CreateLoaded's TPM2B_TEMPLATE (UnmarshalToPublic): a TPMT_PUBLIC
+    /// that uses it up.
+    pub fn from_template(template: &[u8]) -> Result<Public> {
+        let mut template = Reader::new(template);
+        let public = Public::read(&mut template, false)?;
+        if !template.is_empty() {
+            return Err(Rc::SIZE);
+        }
+        Ok(public)
     }
 
     /// A TPM2B_PUBLIC. Its size must be exactly what the TPMT_PUBLIC takes, counted as the

@@ -29,6 +29,7 @@ pub const GET_TEST_RESULT: u32 = 0x17c;
 pub const READ_CLOCK: u32 = 0x181;
 pub const ENCRYPT_DECRYPT: u32 = 0x164;
 pub const ENCRYPT_DECRYPT_2: u32 = 0x193;
+pub const CREATE_LOADED: u32 = 0x191;
 
 // TPMA_OBJECT.
 pub const FIXED_TPM: u32 = 1 << 1;
@@ -528,6 +529,122 @@ fn hmac_keys_and_sequences_match() {
     let sealed_key = create_params(b"", b"x", &sealed(), b"", &no_pcrs());
     let sealed = handle(&both.same(&with_password(CREATE_PRIMARY, RH_OWNER, b"", &sealed_key)));
     both.same(&with_password(HMAC_START, sealed, b"", &start));
+}
+
+/// TPM2_CreateLoaded under `parent`, with `template` as given (a TPM2B_TEMPLATE's contents).
+pub fn create_loaded(parent: u32, auth: &[u8], data: &[u8], template: &[u8]) -> Vec<u8> {
+    let p = [sensitive(auth, data), tpm2b(template)].concat();
+    with_password(CREATE_LOADED, parent, b"", &p)
+}
+
+fn flush(both: &mut Both, handle: u32) {
+    both.same(&command(FLUSH_CONTEXT, &[], None, &handle.to_be_bytes()));
+}
+
+#[test]
+fn create_loaded_matches() {
+    let mut both = Both::seeded();
+    // Under a hierarchy: the primary TPM2_CreatePrimary makes, no private part. (The null
+    // hierarchy's seed is each TPM's own.)
+    let (ours, theirs) = both.both(&create_loaded(RH_NULL, b"", b"", &ecc_srk()));
+    assert_eq!(
+        (rc(&ours), ours.len(), &ours[..14]),
+        (0, theirs.len(), &theirs[..14])
+    );
+    flush(&mut both, handle(&ours));
+    for hierarchy in [RH_OWNER, RH_ENDORSEMENT, RH_PLATFORM] {
+        for template in [
+            ecc_srk(),
+            ecdsa_key(),
+            hmac_key(),
+            aes_key(256, 0x43, CIPHER),
+        ] {
+            let loaded = both.same(&create_loaded(hierarchy, b"pw", b"", &template));
+            let h = handle(&loaded);
+            let primary = both.same(&create_primary(hierarchy, &template));
+            // outPrivate (empty), outPublic, Name; CreatePrimary's Name (SHA-256) comes last.
+            let p = params(&primary, true);
+            let name = &p[p.len() - 36..];
+            let expected = [tpm2b(b""), tpm2b(&out_public(&p, 0)), name.to_vec()].concat();
+            assert_eq!(params(&loaded, true), expected);
+            both.same(&command(READ_PUBLIC, &[h], None, &[]));
+            flush(&mut both, h);
+            flush(&mut both, handle(&primary));
+        }
+    }
+    // Under a parent: loaded, and wrapped; each engine's blob loads on the other.
+    let srk = handle(&both.same(&create_primary(RH_OWNER, &ecc_srk())));
+    for (template, data) in [
+        (sealed(), &b"sealed"[..]),
+        (hmac_key(), b""),
+        (ecdsa_key(), b""),
+        (aes_key(128, 0x42, CIPHER), b""),
+    ] {
+        let (ours, theirs) = both.both(&create_loaded(srk, b"pw", data, &template));
+        assert_eq!(
+            (rc(&ours), ours.len(), &ours[..14]),
+            (0, theirs.len(), &theirs[..14])
+        );
+        let child = handle(&ours);
+        for (made, by) in [(&ours, "ours"), (&theirs, "theirs")] {
+            let p = params(made, true);
+            let (private, rest) = split2b(&p);
+            let load = [tpm2b(&private), tpm2b(&split2b(rest).0)].concat();
+            let other = if by == "ours" {
+                both.theirs.process(&with_password(LOAD, srk, b"", &load))
+            } else {
+                both.ours.process(&with_password(LOAD, srk, b"", &load))
+            };
+            let loaded = handle(&other);
+            // The Name it loads with is the one CreateLoaded gave.
+            assert_eq!(params(&other, true), tpm2b(&split2b(split2b(rest).1).0));
+            if data == b"sealed" {
+                let unseal = command(UNSEAL, &[loaded], Some(&password(b"pw")), &[]);
+                let unsealed = if by == "ours" {
+                    both.theirs.process(&unseal)
+                } else {
+                    both.ours.process(&unseal)
+                };
+                assert_eq!(split2b(&params(ok(&unsealed), false)).0, data);
+            }
+            let flush_loaded = command(FLUSH_CONTEXT, &[], None, &loaded.to_be_bytes());
+            if by == "ours" {
+                both.theirs.process(&flush_loaded);
+            } else {
+                both.ours.process(&flush_loaded);
+            }
+        }
+        flush(&mut both, child);
+    }
+    // Refused alike: a parent that is none, a template not used up or too long, secrets given
+    // for an asymmetric key, an authValue too long, no slot left.
+    let template = ecdsa_key();
+    let ecdsa = handle(&both.same(&create_loaded(RH_OWNER, b"", b"", &template)));
+    both.same(&create_loaded(ecdsa, b"", b"", &sealed()));
+    both.same(&create_loaded(
+        RH_OWNER,
+        b"",
+        b"",
+        &[&template[..], &[0]].concat(),
+    ));
+    both.same(&create_loaded(
+        RH_OWNER,
+        b"",
+        b"",
+        &template[..template.len() - 1],
+    ));
+    for size in [611, 612, 613, 700] {
+        let mut long = template.clone();
+        long.resize(size, 0);
+        both.same(&create_loaded(RH_OWNER, b"", b"", &long));
+        let mut garbage = vec![0xee; size];
+        garbage[..2].copy_from_slice(&[0, 0x23]);
+        both.same(&create_loaded(RH_OWNER, b"", b"", &garbage));
+    }
+    both.same(&create_loaded(RH_OWNER, b"", b"x", &template));
+    both.same(&create_loaded(RH_OWNER, &[1; 33], b"", &template));
+    both.same(&create_loaded(srk, b"", b"x", &sealed()));
+    both.same(&create_loaded(srk, b"", b"x", &sealed()));
 }
 
 /// A CreatePrimary or Create response's outPublic (after `skip` leading TPM2Bs).
@@ -1339,6 +1456,7 @@ pub fn answers_randomly(code: u32) -> bool {
             | CONTEXT_SAVE
             | OBJECT_CHANGE_AUTH
             | READ_CLOCK
+            | CREATE_LOADED
     )
 }
 
@@ -1467,6 +1585,8 @@ pub fn mutation_corpus() -> Vec<Vec<u8>> {
         create_primary(RH_NULL, &aes_key(128, 0x10, CIPHER)),
         encrypt_decrypt(0x8000_0002, false, false, 0x42, &[2; 16], &[1; 32]),
         encrypt_decrypt(0x8000_0002, true, true, 0x41, &[2; 16], &[1; 20]),
+        create_loaded(RH_OWNER, b"", b"", &ecc_srk()),
+        create_loaded(0x8000_0000, b"pw", b"data", &sealed()),
         get_capability(8, 0, 4),
         get_capability(1, 0x8100_0000, 4),
         get_capability(1, 0x0300_0000, 4),

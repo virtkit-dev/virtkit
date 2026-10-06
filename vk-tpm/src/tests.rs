@@ -116,7 +116,7 @@ fn valid_handle(kind: HandleKind) -> u32 {
         HandleKind::Lockout => TPM_RH_LOCKOUT,
         // The sequence the test starts first.
         HandleKind::Object(_) => 0x8000_0000,
-        HandleKind::Entity(_) => TPM_RH_OWNER,
+        HandleKind::Entity(_) | HandleKind::Parent => TPM_RH_OWNER,
         // The index and the policy session the test makes first.
         HandleKind::NvAuth | HandleKind::NvIndex => NV_INDEX,
         HandleKind::PolicySession => 0x0300_0000,
@@ -174,6 +174,7 @@ fn every_command_refuses_trailing_parameter_bytes() {
         let public: &[u8] = &[0, 14, 0, 8, 0, 0x0b, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0];
         let create = [&[0, 4, 0, 0, 0, 0][..], public, &[0, 0, 0, 0, 0, 0]].concat();
         let load = [&[0, 0][..], public].concat();
+        let create_loaded = [&[0, 4, 0, 0, 0, 0][..], public].concat();
         let load_external = [&[0, 0][..], public, &[0x40, 0, 0, 7]].concat();
         let context = [&[0; 8][..], &[0x80, 0, 0, 0, 0x40, 0, 0, 7, 0, 0]].concat();
         // nonceTPM, cpHashA, policyRef, expiration, an HMAC signature.
@@ -192,6 +193,7 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_EVICT_CONTROL => &[0x81, 0, 0, 1],
             TPM_CC_CREATE_PRIMARY | TPM_CC_CREATE => &create,
             TPM_CC_LOAD => &load,
+            TPM_CC_CREATE_LOADED => &create_loaded,
             TPM_CC_LOAD_EXTERNAL => &load_external,
             TPM_CC_READ_PUBLIC
             | TPM_CC_UNSEAL

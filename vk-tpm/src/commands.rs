@@ -501,6 +501,11 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_POLICY_TEMPLATE, policy::policy_template)
         .handles(&[H::PolicySession], 0)
         .decrypt(),
+    Command::new(TPM_CC_CREATE_LOADED, key::create_loaded)
+        .handles(&[H::Parent], 1)
+        .response_handle()
+        .decrypt()
+        .encrypt(),
     Command::new(TPM_CC_POLICY_AUTHORIZE_NV, policy::policy_authorize_nv)
         .handles(&[H::NvAuth, H::NvIndex, H::PolicySession], 1),
     Command::new(TPM_CC_ENCRYPT_DECRYPT_2, object::encrypt_decrypt2)
