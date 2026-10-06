@@ -11,6 +11,7 @@ use crate::Tpm;
 use crate::hierarchy::Policy;
 use crate::object::{MAX_OBJECTS, TRANSIENT_FIRST};
 use crate::pcr;
+use crate::public::attr;
 use crate::rc::{Rc, Result};
 
 pub const TPM_RH_OWNER: u32 = 0x4000_0001;
@@ -44,6 +45,10 @@ pub enum HandleKind {
     Pcr(bool),
     /// TPMI_RH_HIERARCHY: owner, endorsement or platform.
     Hierarchy,
+    /// TPMI_RH_HIERARCHY+: a hierarchy or TPM_RH_NULL.
+    HierarchyOrNull,
+    /// TPMI_RH_PROVISION: owner or platform.
+    Provision,
     /// TPMI_RH_HIERARCHY_AUTH: a hierarchy, or lockout.
     HierarchyAuth,
     /// TPMI_RH_HIERARCHY_POLICY: as TPMI_RH_HIERARCHY_AUTH (and the ACT handles, which this TPM
@@ -67,6 +72,8 @@ impl HandleKind {
         let ok = match self {
             HandleKind::Pcr(null) => is_pcr(handle) || (null && handle == TPM_RH_NULL),
             HandleKind::Hierarchy => hierarchy,
+            HandleKind::HierarchyOrNull => hierarchy || handle == TPM_RH_NULL,
+            HandleKind::Provision => matches!(handle, TPM_RH_OWNER | TPM_RH_PLATFORM),
             HandleKind::HierarchyAuth | HandleKind::HierarchyPolicy => {
                 hierarchy || handle == TPM_RH_LOCKOUT
             }
@@ -95,8 +102,6 @@ impl HandleKind {
 /// The handles of the object slots (TRANSIENT_FIRST..=TRANSIENT_LAST).
 const TRANSIENT: std::ops::RangeInclusive<u32> =
     TRANSIENT_FIRST..=TRANSIENT_FIRST + (MAX_OBJECTS as u32 - 1);
-/// Persistent objects from here on belong to the platform.
-const PLATFORM_PERSISTENT: u32 = 0x8180_0000;
 const HMAC_SESSIONS: std::ops::RangeInclusive<u32> = 0x0200_0000..=0x0200_003f;
 const POLICY_SESSIONS: std::ops::RangeInclusive<u32> = 0x0300_0000..=0x0300_003f;
 
@@ -111,37 +116,26 @@ pub fn is_pcr(handle: u32) -> bool {
 
 impl Tpm {
     /// EntityGetLoadStatus: every handle names something the TPM has, in an enabled hierarchy.
-    pub fn check_loaded(&self, handles: &[u32]) -> Result<()> {
-        for (n, &handle) in (1usize..).zip(handles) {
+    /// A persistent object is copied into a free slot for the command, and its handle replaced
+    /// with the slot's (ObjectLoadEvict).
+    pub fn check_loaded(&mut self, code: u32, handles: &mut [u32]) -> Result<()> {
+        for (n, handle) in (1usize..).zip(handles.iter_mut()) {
             let n32 = u32::try_from(n).unwrap_or(0);
-            let status = match handle_type(handle) {
-                TPM_HT_PERMANENT => match handle {
+            let status = match handle_type(*handle) {
+                TPM_HT_PERMANENT => match *handle {
                     TPM_RS_PW | TPM_RH_LOCKOUT => Ok(()),
                     h if VENDOR_AUTH.contains(&h) => Err(Rc::VALUE),
                     h => self.hierarchy_enabled(h),
                 },
-                TPM_HT_TRANSIENT if self.object(handle).is_none() => {
+                TPM_HT_TRANSIENT if self.object(*handle).is_none() => {
                     return Err(Rc::REFERENCE_H0.nth(n.saturating_sub(1)));
                 }
-                // ObjectLoadEvict: no persistent object exists yet, but its slot is taken
-                // before that is found out.
-                TPM_HT_PERSISTENT => {
-                    let enabled = if handle >= PLATFORM_PERSISTENT {
-                        self.volatile.ph_enable
-                    } else {
-                        self.volatile.clear.sh_enable
-                    };
-                    if enabled && self.loaded_objects().len() == MAX_OBJECTS {
-                        Err(Rc::OBJECT_MEMORY)
-                    } else {
-                        Err(Rc::HANDLE)
-                    }
-                }
+                TPM_HT_PERSISTENT => self.load_evict(*handle, code).map(|slot| *handle = slot),
                 // No NV index exists yet.
                 TPM_HT_NV_INDEX => Err(Rc::HANDLE),
-                TPM_HT_HMAC_SESSION | TPM_HT_POLICY_SESSION => match self.session(handle) {
+                TPM_HT_HMAC_SESSION | TPM_HT_POLICY_SESSION => match self.session(*handle) {
                     None => return Err(Rc::REFERENCE_H0.nth(n.saturating_sub(1))),
-                    Some(_) if self.loaded_session(handle).is_none() => Err(Rc::HANDLE),
+                    Some(_) if self.loaded_session(*handle).is_none() => Err(Rc::HANDLE),
                     Some(_) => Ok(()),
                 },
                 // A PCR handle that passed its kind check names a PCR.
@@ -165,10 +159,11 @@ impl Tpm {
         if enabled { Ok(()) } else { Err(Rc::HIERARCHY) }
     }
 
-    /// The entity's Name: for a hierarchy or a PCR, its handle; a sequence has none.
+    /// The entity's Name: an object's own (a sequence has none); for a hierarchy or a PCR, its
+    /// handle.
     pub fn entity_name(&self, handle: u32) -> Vec<u8> {
         if handle_type(handle) == TPM_HT_TRANSIENT {
-            return Vec::new();
+            return self.key(handle).map_or_else(Vec::new, |k| k.name.clone());
         }
         handle.to_be_bytes().to_vec()
     }
@@ -176,7 +171,7 @@ impl Tpm {
     /// The entity's authValue, trailing zeros removed (they never count).
     pub fn entity_auth(&self, handle: u32) -> Zeroizing<Vec<u8>> {
         let h = &self.permanent.hierarchies;
-        let auth = match handle {
+        let auth: &[u8] = match handle {
             TPM_RH_OWNER => &h.owner_auth,
             TPM_RH_ENDORSEMENT => &h.endorsement_auth,
             TPM_RH_LOCKOUT => &h.lockout_auth,
@@ -184,35 +179,68 @@ impl Tpm {
             h => match self.object(h) {
                 Some(object) => object.auth(),
                 // TPM_RH_NULL and the PCRs: the empty authValue.
-                None => return Zeroizing::new(Vec::new()),
+                None => &[],
             },
         };
         Zeroizing::new(strip_zeros(auth).to_vec())
     }
 
-    /// The entity's authPolicy, if it has one a policy session can satisfy.
-    pub fn entity_policy(&self, handle: u32) -> Option<&Policy> {
+    /// The entity's authPolicy, if it has one a policy session can satisfy
+    /// (IsAuthPolicyAvailable): a hierarchy's if set, any key's (with its sensitive area).
+    pub fn entity_policy(&self, handle: u32) -> Option<Policy> {
         let h = &self.permanent.hierarchies;
         let policy = match handle {
             TPM_RH_OWNER => &h.owner_policy,
             TPM_RH_ENDORSEMENT => &h.endorsement_policy,
             TPM_RH_LOCKOUT => &h.lockout_policy,
             TPM_RH_PLATFORM => &self.volatile.clear.platform_policy,
+            h if handle_type(h) == TPM_HT_TRANSIENT => {
+                let key = self.key(h).filter(|k| !k.public_only())?;
+                return Some(Policy {
+                    hash: key.public.name_alg,
+                    digest: key.public.auth_policy.clone(),
+                });
+            }
             // No PCR belongs to a policy group.
             _ => return None,
         };
-        policy.hash.is_some().then_some(policy)
+        policy.hash.is_some().then(|| policy.clone())
     }
-}
 
-/// IsDAExempted: an authorization failure on the entity does not count against the dictionary
-/// attack protection. Every permanent handle but lockout (which has its own), every PCR and every
-/// sequence (noDA) is.
-pub fn is_da_exempt(handle: u32) -> bool {
-    match handle_type(handle) {
-        TPM_HT_PERMANENT => handle != TPM_RH_LOCKOUT,
-        TPM_HT_PCR | TPM_HT_TRANSIENT => true,
-        _ => false,
+    /// IsAuthValueAvailable: whether a password or HMAC session may authorize the entity,
+    /// `admin` for the ADMIN role. A key's authValue serves the USER role if userWithAuth is
+    /// set, the ADMIN role unless adminWithPolicy is; a public key alone has none.
+    pub fn auth_value_available(&self, handle: u32, admin: bool) -> bool {
+        match self.key(handle) {
+            Some(key) => {
+                let has = |a| key.public.has(a);
+                !key.public_only()
+                    && (has(attr::USER_WITH_AUTH) || (admin && !has(attr::ADMIN_WITH_POLICY)))
+            }
+            None => true,
+        }
+    }
+
+    /// IsPolicySessionRequired: the ADMIN role of a key with adminWithPolicy, or of anything
+    /// that is not an object, takes a policy session.
+    pub fn policy_required(&self, handle: u32, admin: bool) -> bool {
+        admin
+            && (handle_type(handle) != TPM_HT_TRANSIENT
+                || self
+                    .key(handle)
+                    .is_some_and(|k| k.public.has(attr::ADMIN_WITH_POLICY)))
+    }
+
+    /// IsDAExempted: an authorization failure on the entity does not count against the
+    /// dictionary-attack protection. Every permanent handle but lockout (which has its own),
+    /// every PCR, every sequence and every key with noDA is.
+    pub fn is_da_exempt(&self, handle: u32) -> bool {
+        match handle_type(handle) {
+            TPM_HT_PERMANENT => handle != TPM_RH_LOCKOUT,
+            TPM_HT_PCR => true,
+            TPM_HT_TRANSIENT => self.key(handle).is_none_or(|k| k.public.has(attr::NO_DA)),
+            _ => false,
+        }
     }
 }
 

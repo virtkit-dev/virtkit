@@ -341,6 +341,33 @@ impl Pcrs {
     }
 }
 
+impl Pcrs {
+    /// PCRComputeCurrentDigest: the digest with `hash` of the selected PCRs, each selection
+    /// first trimmed (in place) to what `allocation` has.
+    pub fn digest(
+        &self,
+        allocation: &[Selection],
+        selections: &mut [Selection],
+        hash: Hash,
+    ) -> Vec<u8> {
+        let mut hasher = crate::alg::Hasher::new(hash);
+        for selection in selections.iter_mut() {
+            for pcr in 0..PCR_COUNT {
+                if !is_allocated(allocation, selection.hash, pcr) {
+                    selection.set(pcr, false);
+                }
+            }
+            let bank = self.banks.iter().find(|b| b.hash == selection.hash);
+            for pcr in (0..PCR_COUNT).filter(|&p| selection.has(p)) {
+                if let Some(value) = bank.and_then(|b| b.values.get(pcr)) {
+                    hasher.update(value);
+                }
+            }
+        }
+        hasher.finish()
+    }
+}
+
 fn is_allocated(allocation: &[Selection], hash: Hash, pcr: usize) -> bool {
     allocation
         .iter()

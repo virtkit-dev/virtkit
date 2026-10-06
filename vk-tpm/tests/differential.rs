@@ -494,8 +494,8 @@ fn capabilities_match() {
         both.same(&get_capability(1, property, 8));
     }
 
-    // Algorithms and commands: vk-tpm implements a subset, with the same attributes.
-    for (capability, size) in [(0u32, 6usize), (2, 4)] {
+    // Algorithms, commands and curves: vk-tpm implements a subset, with the same attributes.
+    for (capability, size) in [(0u32, 6usize), (2, 4), (8, 2)] {
         let (ours, theirs) = both.both(&get_capability(capability, 0, 1000));
         let theirs = capability_entries(&theirs, size);
         let ours = capability_entries(&ours, size);
@@ -517,7 +517,8 @@ fn capabilities_match() {
         0x128, // SPLIT_MAX: no TPM2_Commit
         0x129, 0x12a, // implemented commands
         0x12f, 0x130, // firmware SVN
-        0x20d, // LOADED_CURVES: no ECC yet
+        0x209, // PERSISTENT_AVAIL: vk-tpm keeps 16, libtpms what its NV fits
+        0x20d, // LOADED_CURVES: NIST P-256 only
     ];
     for start in [0x100, 0x200] {
         let (ours, theirs) = both.both(&get_capability(6, start, 1000));

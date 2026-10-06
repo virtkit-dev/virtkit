@@ -26,6 +26,7 @@ mod crypt;
 mod drbg;
 mod entity;
 mod hierarchy;
+mod key;
 mod marshal;
 mod object;
 mod pcr;
@@ -133,7 +134,10 @@ impl Tpm {
         // Whatever the command does to the permanent state, a failed authorization included,
         // is noticed here, so the caller stores it before the guest sees the response.
         let before = self.permanent_state();
-        let response = self.execute(command).unwrap_or_else(|rc| {
+        let response = self.execute(command);
+        // The persistent objects the command named leave their slots, whatever happened.
+        self.flush_evicted();
+        let response = response.unwrap_or_else(|rc| {
             let mut w = Writer::new();
             w.u16(TPM_ST_NO_SESSIONS).u32(HEADER_SIZE as u32).u32(rc.0);
             w.into_bytes()
@@ -175,7 +179,7 @@ impl Tpm {
             kind.check(handle).map_err(|rc| rc.handle(n))?;
             handles.push(handle);
         }
-        self.check_loaded(&handles)?;
+        self.check_loaded(code, &mut handles)?;
 
         let (mut area, params) = if tag == TPM_ST_SESSIONS {
             let auth_size = usize::try_from(r.u32()?).map_err(|_| Rc::SIZE)?;

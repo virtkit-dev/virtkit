@@ -9,9 +9,10 @@ use crate::entity::{HandleKind, TPM_RH_NULL};
 use crate::marshal::{Reader, Writer};
 use crate::pcr::{self, Startup};
 use crate::rc::{Rc, Result};
-use crate::state::{Saved, Shutdown};
-use crate::{LOCALITY, Out, Tpm, capability, hierarchy, object, session};
+use crate::state::{ResetData, Saved, Shutdown, new_seed};
+use crate::{LOCALITY, Out, Tpm, capability, hierarchy, key, object, session};
 
+pub const TPM_CC_EVICT_CONTROL: u32 = 0x120;
 pub const TPM_CC_HIERARCHY_CONTROL: u32 = 0x121;
 pub const TPM_CC_CHANGE_EPS: u32 = 0x124;
 pub const TPM_CC_CHANGE_PPS: u32 = 0x125;
@@ -19,6 +20,7 @@ pub const TPM_CC_CLEAR: u32 = 0x126;
 pub const TPM_CC_CLEAR_CONTROL: u32 = 0x127;
 pub const TPM_CC_HIERARCHY_CHANGE_AUTH: u32 = 0x129;
 pub const TPM_CC_PCR_ALLOCATE: u32 = 0x12b;
+pub const TPM_CC_CREATE_PRIMARY: u32 = 0x131;
 pub const TPM_CC_SET_PRIMARY_POLICY: u32 = 0x12e;
 pub const TPM_CC_DICTIONARY_ATTACK_LOCK_RESET: u32 = 0x139;
 pub const TPM_CC_DICTIONARY_ATTACK_PARAMETERS: u32 = 0x13a;
@@ -28,8 +30,14 @@ pub const TPM_CC_PCR_RESET: u32 = 0x13d;
 pub const TPM_CC_SELF_TEST: u32 = 0x143;
 pub const TPM_CC_STARTUP: u32 = 0x144;
 pub const TPM_CC_SHUTDOWN: u32 = 0x145;
+pub const TPM_CC_OBJECT_CHANGE_AUTH: u32 = 0x150;
+pub const TPM_CC_CREATE: u32 = 0x153;
+pub const TPM_CC_LOAD: u32 = 0x157;
 pub const TPM_CC_SEQUENCE_UPDATE: u32 = 0x15c;
+pub const TPM_CC_UNSEAL: u32 = 0x15e;
 pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x165;
+pub const TPM_CC_LOAD_EXTERNAL: u32 = 0x167;
+pub const TPM_CC_READ_PUBLIC: u32 = 0x173;
 pub const TPM_CC_START_AUTH_SESSION: u32 = 0x176;
 pub const TPM_CC_GET_CAPABILITY: u32 = 0x17a;
 pub const TPM_CC_GET_RANDOM: u32 = 0x17b;
@@ -45,8 +53,10 @@ pub struct Command {
     pub code: u32,
     /// The handle area, in order.
     pub handles: &'static [HandleKind],
-    /// How many of those handles (the first ones) need an authorization session (USER role).
+    /// How many of those handles (the first ones) need an authorization session.
     pub auth: usize,
+    /// The first of them takes the ADMIN role (else they all take the USER role).
+    pub admin: bool,
     /// It takes an authorization area (not TPM2_Startup).
     pub sessions: bool,
     /// A session may encrypt its first parameter, a TPM2B (DECRYPT_2).
@@ -70,6 +80,7 @@ impl Command {
             code,
             handles: &[],
             auth: 0,
+            admin: false,
             sessions: true,
             decrypt: false,
             encrypt: false,
@@ -86,6 +97,13 @@ impl Command {
         Command {
             handles,
             auth,
+            ..self
+        }
+    }
+
+    const fn admin(self) -> Command {
+        Command {
+            admin: true,
             ..self
         }
     }
@@ -152,6 +170,9 @@ use HandleKind as H;
 
 /// Every implemented command, by code.
 pub const COMMANDS: &[Command] = &[
+    Command::new(TPM_CC_EVICT_CONTROL, key::evict_control)
+        .handles(&[H::Provision, H::Object(false)], 1)
+        .nv(),
     Command::new(TPM_CC_HIERARCHY_CONTROL, hierarchy::hierarchy_control)
         .handles(&[H::Hierarchy], 1)
         .nv()
@@ -185,6 +206,11 @@ pub const COMMANDS: &[Command] = &[
         .handles(&[H::HierarchyPolicy], 1)
         .nv()
         .decrypt(),
+    Command::new(TPM_CC_CREATE_PRIMARY, key::create_primary)
+        .handles(&[H::HierarchyOrNull], 1)
+        .response_handle()
+        .decrypt()
+        .encrypt(),
     Command::new(
         TPM_CC_DICTIONARY_ATTACK_LOCK_RESET,
         hierarchy::dictionary_attack_lock_reset,
@@ -212,10 +238,34 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_SELF_TEST, self_test).nv(),
     Command::new(TPM_CC_STARTUP, startup).nv().no_sessions(),
     Command::new(TPM_CC_SHUTDOWN, shutdown).nv(),
+    Command::new(TPM_CC_OBJECT_CHANGE_AUTH, key::object_change_auth)
+        .handles(&[H::Object(false), H::Object(false)], 1)
+        .admin()
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_CREATE, key::create)
+        .handles(&[H::Object(false)], 1)
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_LOAD, key::load)
+        .handles(&[H::Object(false)], 1)
+        .response_handle()
+        .decrypt()
+        .encrypt(),
     Command::new(TPM_CC_SEQUENCE_UPDATE, object::sequence_update)
         .handles(&[H::Object(false)], 1)
         .decrypt(),
+    Command::new(TPM_CC_UNSEAL, key::unseal)
+        .handles(&[H::Object(false)], 1)
+        .encrypt(),
     Command::new(TPM_CC_FLUSH_CONTEXT, object::flush_context).no_sessions(),
+    Command::new(TPM_CC_LOAD_EXTERNAL, key::load_external)
+        .response_handle()
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_READ_PUBLIC, key::read_public)
+        .handles(&[H::Object(false)], 0)
+        .encrypt(),
     Command::new(TPM_CC_START_AUTH_SESSION, session::start_auth_session)
         .handles(&[H::Object(true), H::Entity(true)], 0)
         .response_handle()
@@ -298,15 +348,15 @@ fn startup(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> 
     // TPM2_Clear does not keep.
     tpm.volatile.ph_enable = true;
     tpm.volatile.clear = match (&saved, kind) {
-        (Some(Saved { clear, .. }), Startup::Resume) => clear.clone(),
+        (Some(saved), Startup::Resume) => saved.clear.clone(),
         _ => Default::default(),
     };
     let saved_pcrs = saved.as_ref().map(|s| &s.pcrs);
     let allocation = &tpm.volatile.allocation;
     tpm.volatile.pcrs.startup(allocation, kind, saved_pcrs);
     tpm.volatile.pcr_reconfig = false;
+    tpm.startup_reset_data(kind, saved.map(|s| s.reset))?;
     tpm.volatile.objects.iter_mut().for_each(|o| *o = None);
-    tpm.volatile.sessions.iter_mut().for_each(|s| *s = None);
     tpm.volatile.exclusive_audit = None;
     tpm.volatile.orderly_startup = orderly;
     tpm.volatile.da_used = false;
@@ -326,10 +376,11 @@ fn shutdown(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()>
     tpm.volatile.da_used = false;
     tpm.permanent.shutdown_time = tpm.volatile.time;
     tpm.permanent.shutdown = if state {
-        Shutdown::State(Saved {
+        Shutdown::State(Box::new(Saved {
             pcrs: tpm.volatile.pcrs.save(),
             clear: tpm.volatile.clear.clone(),
-        })
+            reset: tpm.volatile.reset_data(),
+        }))
     } else {
         Shutdown::Clear
     };
@@ -449,6 +500,25 @@ fn pcr_allocate(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result
 }
 
 impl Tpm {
+    /// What each kind of Startup does to STATE_RESET_DATA: a TPM Reset draws a new null
+    /// hierarchy; a Restart or a Resume brings back what TPM2_Shutdown(STATE) saved. Every
+    /// Startup flushes the sessions.
+    fn startup_reset_data(&mut self, kind: Startup, saved: Option<ResetData>) -> Result<()> {
+        let v = &mut self.volatile;
+        v.sessions.iter_mut().for_each(|s| *s = None);
+        match (kind, saved) {
+            (Startup::Restart | Startup::Resume, Some(saved)) => {
+                v.null_proof = saved.null_proof;
+                v.null_seed = saved.null_seed;
+            }
+            _ => {
+                v.null_proof = new_seed().map_err(|_| Rc::FAILURE)?;
+                v.null_seed = new_seed().map_err(|_| Rc::FAILURE)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The PCR an extend goes to, None for TPM_RH_NULL, checked against the locality. Extending
     /// a PCR that TPM2_Shutdown(STATE) saved voids that saved state.
     pub fn pcr_to_extend(&mut self, handle: u32) -> Result<Option<usize>> {

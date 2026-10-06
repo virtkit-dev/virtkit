@@ -7,11 +7,6 @@
 //! very keys libtpms derives from the same seeds, which the differential tests check byte for
 //! byte. RSA primaries also draw from it, but their prime search is vk-tpm's (see `rsa.rs`).
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "primary keys come with objects")
-)]
-
 use aes::Aes256;
 use aes::cipher::{Array, BlockCipherEncrypt, KeyInit};
 use zeroize::{Zeroize, Zeroizing};

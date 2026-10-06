@@ -16,7 +16,7 @@ use crate::alg::{Hash, MAX_DIGEST, TPM_ALG_NULL};
 use crate::commands::{Command, end};
 use crate::crypt;
 use crate::entity::{
-    TPM_HT_POLICY_SESSION, TPM_RH_LOCKOUT, TPM_RH_NULL, TPM_RS_PW, handle_type, is_da_exempt,
+    TPM_HT_POLICY_SESSION, TPM_HT_TRANSIENT, TPM_RH_LOCKOUT, TPM_RH_NULL, TPM_RS_PW, handle_type,
     is_session, strip_zeros,
 };
 use crate::marshal::{Reader, Writer};
@@ -185,6 +185,8 @@ pub struct Use {
 /// A command's authorization area, and what its HMACs are computed over.
 pub struct Area {
     code: u32,
+    /// The first handle takes the ADMIN role (else USER).
+    admin: bool,
     /// The Names of the command's handles.
     names: Vec<Vec<u8>>,
     /// The parameters as the command carried them (encrypted).
@@ -282,6 +284,7 @@ impl Tpm {
     pub fn read_area(&self, cmd: &Command, mut area: Reader, handles: &[u32]) -> Result<Area> {
         let mut a = Area {
             code: cmd.code,
+            admin: cmd.admin,
             names: handles.iter().map(|&h| self.entity_name(h)).collect(),
             params: Vec::new(),
             uses: Vec::new(),
@@ -463,8 +466,18 @@ impl Tpm {
         if let Some(u) = a.uses.get_mut(i) {
             u.include_auth = include_auth;
         }
-        if include_auth && !is_da_exempt(entity) {
+        if include_auth && !self.is_da_exempt(entity) {
             self.check_locked_out(entity == TPM_RH_LOCKOUT)?;
+        }
+        // Only the first handle of a command takes the ADMIN role.
+        let admin = a.admin && i == 0;
+        if !matches!(kind, Some(Kind::Policy | Kind::Trial)) {
+            if self.policy_required(entity, admin) {
+                return Err(Rc::AUTH_TYPE);
+            }
+            if !self.auth_value_available(entity, admin) {
+                return Err(Rc::AUTH_UNAVAILABLE);
+            }
         }
         match kind {
             None => {
@@ -483,6 +496,11 @@ impl Tpm {
                 let policy = self.entity_policy(entity).ok_or(Rc::AUTH_UNAVAILABLE)?;
                 let digest_matches: bool = session.policy_digest.ct_eq(&policy.digest).into();
                 if !digest_matches || policy.hash != Some(session.hash) {
+                    return Err(Rc::POLICY_FAIL);
+                }
+                // The ADMIN role needs a policy bound to the command (TPM2_PolicyCommandCode,
+                // not implemented yet).
+                if admin {
                     return Err(Rc::POLICY_FAIL);
                 }
                 self.check_hmac(a, i)
@@ -555,10 +573,10 @@ impl Tpm {
             if session.lockout_bound {
                 entity = TPM_RH_LOCKOUT;
             }
-            if !session.da_bound && (is_da_exempt(entity) || !u.include_auth) {
+            if !session.da_bound && (self.is_da_exempt(entity) || !u.include_auth) {
                 return Rc::BAD_AUTH;
             }
-        } else if is_da_exempt(entity) {
+        } else if self.is_da_exempt(entity) {
             return Rc::BAD_AUTH;
         }
         self.da_failure(entity == TPM_RH_LOCKOUT);
@@ -707,7 +725,7 @@ impl Tpm {
             crypt::kdfa(hash, &auth, b"ATH", &nonce_tpm, nonce_caller, hash.size())
         };
         let bound = (bind != TPM_RH_NULL && kind == Kind::Hmac).then(|| self.bind_value(bind));
-        let da_bound = bind != TPM_RH_NULL && !is_da_exempt(bind);
+        let da_bound = bind != TPM_RH_NULL && !self.is_da_exempt(bind);
         let session = Session {
             kind,
             hash,
@@ -832,16 +850,19 @@ pub fn start_auth_session(
     }
     let tpm_key = handles.first().copied().ok_or(Rc::FAILURE)?;
     if tpm_key != TPM_RH_NULL {
-        // The only objects so far are sequences: not a key that decrypts.
+        // Salts are not decrypted yet.
         return Err(Rc::KEY.handle(1));
     }
     if !salt.is_empty() {
         return Err(Rc::VALUE.param(2));
     }
+    let bind = handles.get(1).copied().ok_or(Rc::FAILURE)?;
+    if handle_type(bind) == TPM_HT_TRANSIENT && tpm.key(bind).is_some_and(|k| k.public_only()) {
+        return Err(Rc::HANDLE.handle(2));
+    }
     if matches!(symmetric, Symmetric::Aes(_)) && mode != TPM_ALG_CFB {
         return Err(Rc::MODE.param(4));
     }
-    let bind = handles.get(1).copied().ok_or(Rc::FAILURE)?;
     let (handle, nonce_tpm) = tpm.create_session(kind, hash, nonce_caller, symmetric, bind)?;
     w.handle = Some(handle);
     w.tpm2b(&nonce_tpm);

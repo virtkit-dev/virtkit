@@ -1,7 +1,11 @@
 //! Transient objects (Part 1, "Object Structure Elements"): the TPM's [`MAX_OBJECTS`] object
-//! slots, named TRANSIENT_FIRST + slot. So far only hash and event sequences live in them, with
-//! the commands that drive them (Part 3, "Hash/HMAC/Event Sequences") and TPM2_Hash, which
-//! shares their tickets.
+//! slots, named TRANSIENT_FIRST + slot. A slot holds a key (or any object with a public area,
+//! `key.rs`) or a sequence: hash, HMAC and event sequences live here, with the commands that
+//! drive them (Part 3, "Hash/HMAC/Event Sequences") and TPM2_Hash, which shares their tickets.
+//!
+//! A persistent object a command names is copied into a free slot for that command, and its
+//! handle replaced with the slot's, as the reference implementation does (ObjectLoadEvict): the
+//! slot counts against the ones the command may need, and is freed once the command is done.
 
 use zeroize::Zeroizing;
 
@@ -10,6 +14,7 @@ use crate::commands::{end, first, write_digest_values};
 use crate::crypt;
 use crate::entity::{TPM_RH_ENDORSEMENT, TPM_RH_NULL, TPM_RH_OWNER, TPM_RH_PLATFORM, strip_zeros};
 use crate::hierarchy::Auth;
+use crate::key::Key;
 use crate::marshal::{Reader, Writer};
 use crate::rc::{Rc, Result};
 use crate::state::{StateError, read_bool};
@@ -19,9 +24,9 @@ use crate::{Out, Tpm};
 pub const MAX_OBJECTS: usize = 3;
 pub const TRANSIENT_FIRST: u32 = 0x8000_0000;
 /// The largest buffer a sequence or TPM2_Hash takes in one command (TPM2B_MAX_BUFFER).
-const MAX_BUFFER: usize = 1024;
+pub const MAX_BUFFER: usize = 1024;
 /// TPM_ST_HASHCHECK, the tag of a TPMT_TK_HASHCHECK.
-const TPM_ST_HASHCHECK: u16 = 0x8024;
+pub const TPM_ST_HASHCHECK: u16 = 0x8024;
 /// TPM_GENERATED_VALUE: what the TPM puts first in the structures it signs. A digest of data
 /// that starts with it gets no ticket, so a ticket cannot vouch for a forged attestation.
 const TPM_GENERATED_VALUE: [u8; 4] = [0xff, b'T', b'C', b'G'];
@@ -29,17 +34,18 @@ const TPM_GENERATED_VALUE: [u8; 4] = [0xff, b'T', b'C', b'G'];
 /// A loaded object.
 pub enum Object {
     Sequence(Sequence),
+    Key(Box<Key>),
 }
 
-/// A hash or event sequence (TPM2_HashSequenceStart): data in, digests out at the end.
+/// A hash or event sequence: data in, digests out at the end.
 pub struct Sequence {
     pub auth: Auth,
     pub kind: SequenceKind,
 }
 
 pub enum SequenceKind {
-    /// A hash sequence, and whether its ticket may be issued: its first block did not start
-    /// with TPM_GENERATED_VALUE (`safe`, once `started`).
+    /// A hash sequence (TPM2_HashSequenceStart), and whether its ticket may be issued: its
+    /// first block did not start with TPM_GENERATED_VALUE (`safe`, once `started`).
     Hash {
         hasher: Box<Hasher>,
         started: bool,
@@ -50,16 +56,16 @@ pub enum SequenceKind {
 }
 
 impl Object {
-    /// The object's authValue (a sequence's, as TPM2_HashSequenceStart set it).
-    pub fn auth(&self) -> &Auth {
-        match self {
-            Object::Sequence(s) => &s.auth,
-        }
-    }
-
     pub fn write(&self, w: &mut Writer) {
-        let Object::Sequence(s) = self;
-        w.tpm2b(&s.auth);
+        let s = match self {
+            Object::Key(key) => {
+                w.u8(1);
+                key.write(w);
+                return;
+            }
+            Object::Sequence(s) => s,
+        };
+        w.u8(0).tpm2b(&s.auth);
         match &s.kind {
             SequenceKind::Hash {
                 hasher,
@@ -79,6 +85,9 @@ impl Object {
     }
 
     pub fn read(r: &mut Reader) -> std::result::Result<Object, StateError> {
+        if read_bool(r)? {
+            return Ok(Object::Key(Box::new(Key::read(r)?)));
+        }
         let auth = Zeroizing::new(r.tpm2b(MAX_DIGEST)?.to_vec());
         let hasher = |r: &mut Reader| -> std::result::Result<Hasher, StateError> {
             let hash = Hash::read(r)?;
@@ -102,6 +111,14 @@ impl Object {
         };
         Ok(Object::Sequence(Sequence { auth, kind }))
     }
+
+    /// The object's authValue, without its trailing zeros.
+    pub fn auth(&self) -> &[u8] {
+        match self {
+            Object::Sequence(s) => &s.auth,
+            Object::Key(k) => k.auth(),
+        }
+    }
 }
 
 /// The handle of object slot `slot`.
@@ -113,7 +130,7 @@ fn handle(slot: usize) -> Result<u32> {
 }
 
 /// The slot a transient handle names, whether or not something is loaded there.
-fn slot(handle: u32) -> Option<usize> {
+pub fn slot(handle: u32) -> Option<usize> {
     usize::try_from(handle.checked_sub(TRANSIENT_FIRST)?)
         .ok()
         .filter(|&s| s < MAX_OBJECTS)
@@ -131,11 +148,19 @@ impl Tpm {
         object.as_mut().ok_or(Rc::FAILURE)
     }
 
+    /// FindEmptyObjectSlot: TPM_RC_OBJECT_MEMORY if every slot is taken.
+    pub fn free_slot(&self) -> Result<usize> {
+        self.volatile
+            .objects
+            .iter()
+            .position(Option::is_none)
+            .ok_or(Rc::OBJECT_MEMORY)
+    }
+
     /// Load `object` into the first free slot, and return its handle.
-    fn load_object(&mut self, object: Object) -> Result<u32> {
-        let (slot, free) = (self.volatile.objects.iter_mut().enumerate())
-            .find(|(_, o)| o.is_none())
-            .ok_or(Rc::OBJECT_MEMORY)?;
+    pub fn load_object(&mut self, object: Object) -> Result<u32> {
+        let slot = self.free_slot()?;
+        let free = self.volatile.objects.get_mut(slot).ok_or(Rc::FAILURE)?;
         *free = Some(object);
         handle(slot)
     }
@@ -155,21 +180,60 @@ impl Tpm {
             .collect()
     }
 
+    /// The persistent object at `handle`.
+    pub fn persistent(&self, handle: u32) -> Option<&Key> {
+        let list = &self.permanent.persistent;
+        list.iter().find(|(h, _)| *h == handle).map(|(_, k)| k)
+    }
+
+    /// ObjectLoadEvict: copy persistent object `handle` into a free slot for this command, and
+    /// return the slot's handle.
+    pub fn load_evict(&mut self, handle: u32, code: u32) -> Result<u32> {
+        let enabled = if handle >= crate::key::PLATFORM_PERSISTENT {
+            self.volatile.ph_enable
+        } else {
+            self.volatile.clear.sh_enable
+        };
+        if !enabled {
+            return Err(Rc::HANDLE);
+        }
+        self.free_slot()?;
+        let mut key = self.persistent(handle).ok_or(Rc::HANDLE)?.clone();
+        // An endorsement key stays usable for EvictControl alone while the hierarchy is off.
+        if key.hierarchy == TPM_RH_ENDORSEMENT
+            && !self.volatile.clear.eh_enable
+            && code != crate::commands::TPM_CC_EVICT_CONTROL
+        {
+            return Err(Rc::HANDLE);
+        }
+        key.evict = Some(handle);
+        self.load_object(Object::Key(Box::new(key)))
+    }
+
+    /// ObjectCleanupEvict: free the slots persistent objects were copied into for a command.
+    pub fn flush_evicted(&mut self) {
+        for slot in &mut self.volatile.objects {
+            if let Some(Object::Key(k)) = slot
+                && k.evict.is_some()
+            {
+                *slot = None;
+            }
+        }
+    }
+
     /// TicketComputeHashCheck: the ticket that says the TPM computed `digest` (with `hash`) of
     /// data that did not start with TPM_GENERATED_VALUE: an HMAC with the hierarchy's proof.
-    fn hash_check(&self, hierarchy: u32, hash: Hash, digest: &[u8], w: &mut Writer) {
-        let h = &self.permanent.hierarchies;
-        let proof = match hierarchy {
-            TPM_RH_PLATFORM => &h.ph_proof,
-            TPM_RH_ENDORSEMENT => &h.eh_proof,
-            _ => &h.sh_proof,
-        };
+    pub fn hash_check(&self, hierarchy: u32, hash: Hash, digest: &[u8]) -> Vec<u8> {
         let tag = TPM_ST_HASHCHECK.to_be_bytes();
-        let ticket = crypt::hmac(
+        crypt::hmac(
             Hash::Sha512,
-            proof.as_slice(),
+            self.proof(hierarchy).as_slice(),
             &[&tag, &hash.id().to_be_bytes(), digest],
-        );
+        )
+    }
+
+    fn write_hash_check(&self, hierarchy: u32, hash: Hash, digest: &[u8], w: &mut Writer) {
+        let ticket = self.hash_check(hierarchy, hash, digest);
         w.u16(TPM_ST_HASHCHECK).u32(hierarchy).tpm2b(&ticket);
     }
 }
@@ -186,7 +250,7 @@ fn is_ticket_safe(data: &[u8]) -> bool {
 }
 
 /// A TPMI_RH_HIERARCHY+: the hierarchy a ticket is for, or TPM_RH_NULL for none.
-fn read_hierarchy(r: &mut Reader) -> Result<u32> {
+pub fn read_hierarchy(r: &mut Reader) -> Result<u32> {
     let h = r.u32()?;
     match h {
         TPM_RH_OWNER | TPM_RH_ENDORSEMENT | TPM_RH_PLATFORM | TPM_RH_NULL => Ok(h),
@@ -207,7 +271,7 @@ pub fn hash(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result<()>
     if hierarchy == TPM_RH_NULL || generated {
         null_ticket(w);
     } else {
-        tpm.hash_check(hierarchy, hash, &digest, w);
+        tpm.write_hash_check(hierarchy, hash, &digest, w);
     }
     Ok(())
 }
@@ -231,11 +295,19 @@ pub fn hash_sequence_start(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out
     Ok(())
 }
 
+/// The sequence a handle names; TPM_RC_MODE (handle `n`) for any other object.
+fn sequence_mut(tpm: &mut Tpm, handle: u32, n: u32) -> Result<&mut Sequence> {
+    match tpm.object_mut(handle)? {
+        Object::Sequence(s) => Ok(s),
+        Object::Key(_) => Err(Rc::MODE.handle(n)),
+    }
+}
+
 /// TPM2_SequenceUpdate: more data into a sequence.
 pub fn sequence_update(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> {
     let data = r.tpm2b(MAX_BUFFER).map_err(|rc| rc.param(1))?;
     end(r)?;
-    let Object::Sequence(sequence) = tpm.object_mut(first(handles)?)?;
+    let sequence = sequence_mut(tpm, first(handles)?, 1)?;
     match &mut sequence.kind {
         SequenceKind::Hash {
             hasher,
@@ -268,29 +340,30 @@ pub fn sequence_complete(
     let hierarchy = read_hierarchy(r).map_err(|rc| rc.param(2))?;
     end(r)?;
     let handle = first(handles)?;
-    let Object::Sequence(sequence) = tpm.object_mut(handle)?;
-    let SequenceKind::Hash {
-        hasher,
-        started,
-        safe,
-    } = &mut sequence.kind
-    else {
-        return Err(Rc::MODE.handle(1));
-    };
-    let hash = hasher.hash();
-    let mut hasher = Hasher::clone(hasher);
-    hasher.update(data);
-    let digest = hasher.finish();
-    let safe = if *started {
-        *safe
-    } else {
-        is_ticket_safe(data)
-    };
-    w.tpm2b(&digest);
-    if hierarchy == TPM_RH_NULL || !safe {
-        null_ticket(w);
-    } else {
-        tpm.hash_check(hierarchy, hash, &digest, w);
+    let sequence = sequence_mut(tpm, handle, 1)?;
+    match &mut sequence.kind {
+        SequenceKind::Hash {
+            hasher,
+            started,
+            safe,
+        } => {
+            let hash = hasher.hash();
+            let mut hasher = Hasher::clone(hasher);
+            hasher.update(data);
+            let digest = hasher.finish();
+            let safe = if *started {
+                *safe
+            } else {
+                is_ticket_safe(data)
+            };
+            w.tpm2b(&digest);
+            if hierarchy == TPM_RH_NULL || !safe {
+                null_ticket(w);
+            } else {
+                tpm.write_hash_check(hierarchy, hash, &digest, w);
+            }
+        }
+        SequenceKind::Event { .. } => return Err(Rc::MODE.handle(1)),
     }
     w.flush = Some(handle);
     Ok(())
@@ -308,7 +381,7 @@ pub fn event_sequence_complete(
     end(r)?;
     let pcr = first(handles)?;
     let handle = handles.get(1).copied().ok_or(Rc::FAILURE)?;
-    let Object::Sequence(sequence) = tpm.object_mut(handle)?;
+    let sequence = sequence_mut(tpm, handle, 2)?;
     let SequenceKind::Event { hashers } = &sequence.kind else {
         return Err(Rc::MODE.handle(2));
     };

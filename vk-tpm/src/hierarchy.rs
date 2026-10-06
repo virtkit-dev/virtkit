@@ -364,6 +364,10 @@ pub fn hierarchy_control(
     };
     if *selected != state {
         *selected = state;
+        // A hierarchy just disabled takes its loaded objects with it.
+        if !state && enable != TPM_RH_PLATFORM_NV {
+            tpm.flush_hierarchy(enable);
+        }
         tpm.clear_orderly();
     }
     Ok(())
@@ -424,6 +428,8 @@ pub fn change_pps(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Resu
     tpm.permanent.pps = rng_seed()?;
     tpm.permanent.hierarchies.ph_proof = rng_seed()?;
     tpm.volatile.clear.platform_policy = Policy::default();
+    tpm.flush_hierarchy(TPM_RH_PLATFORM);
+    tpm.flush_persistent(TPM_RH_PLATFORM);
     tpm.clear_orderly();
     Ok(())
 }
@@ -438,6 +444,8 @@ pub fn change_eps(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Resu
     h.endorsement_auth = Auth::default();
     h.endorsement_policy = Policy::default();
     tpm.volatile.clear.eh_enable = true;
+    tpm.flush_hierarchy(TPM_RH_ENDORSEMENT);
+    tpm.flush_persistent(TPM_RH_ENDORSEMENT);
     tpm.clear_orderly();
     Ok(())
 }
@@ -461,6 +469,10 @@ pub fn clear(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()
     h.lockout_policy = Policy::default();
     tpm.volatile.clear.sh_enable = true;
     tpm.volatile.clear.eh_enable = true;
+    for hierarchy in [TPM_RH_OWNER, TPM_RH_ENDORSEMENT] {
+        tpm.flush_hierarchy(hierarchy);
+        tpm.flush_persistent(hierarchy);
+    }
     tpm.permanent.dictionary_attack = DictionaryAttack::default();
     // The reference implementation writes back all of its persistent data here, which drops a
     // pending TPM2_PCR_Allocate; so does this TPM, to answer the same.
