@@ -19,7 +19,9 @@
 //! Which binary is replaced is the caller's [`Tool`]. The repository releases are looked
 //! up in is deliberately not part of it: both gates are satisfied by any release that is
 //! internally consistent, so a caller able to name the publisher could point an update at
-//! a repository of its own and have it install cleanly.
+//! a repository of its own and have it install cleanly. [`artifacts_in`] does take a
+//! [`Repository`], for a caller whose configuration is already trusted to name the publisher
+//! — `vk-hub`, whose operator sets where its releases come from.
 
 use std::cmp::Ordering;
 use std::fs::{self, OpenOptions};
@@ -129,6 +131,77 @@ struct ReleaseTag(String);
 impl std::fmt::Display for ReleaseTag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// Where releases are looked up: the root of a GitHub REST API — github.com's, or a GitHub
+/// Enterprise Server's — and a repository on it, `owner/name`. Whoever names it names the
+/// publisher, since both gates pass for any release consistent with itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Repository {
+    api: String,
+    name: String,
+}
+
+impl Repository {
+    /// The repository virtkit's releases are published from, on github.com.
+    pub fn virtkit() -> Self {
+        Self::virtkit_at(API)
+    }
+
+    /// virtkit's repository on the API at `api` rather than github.com's.
+    fn virtkit_at(api: &str) -> Self {
+        Repository {
+            api: api.to_string(),
+            name: REPO.to_string(),
+        }
+    }
+
+    /// Repository `name` (`owner/repo`) at an `http(s)://` API root with no trailing slash.
+    /// The caller chooses the allowed schemes; assets must use the API's scheme.
+    /// Both parts are checked to prevent retargeting the URL: `name` is two segments of
+    /// `[A-Za-z0-9._-]`, neither starting with `.`, and `api` has no query, fragment or
+    /// credentials.
+    pub fn new(api: &str, name: &str) -> Result<Self> {
+        let segment = |s: &str| {
+            !s.is_empty()
+                && !s.starts_with('.')
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        };
+        if !name
+            .split_once('/')
+            .is_some_and(|(o, r)| segment(o) && segment(r))
+        {
+            bail!("{name:?} is not a repository: expected owner/name");
+        }
+        let rest = api
+            .strip_prefix("https://")
+            .or_else(|| api.strip_prefix("http://"));
+        let shaped = rest.is_some_and(|r| {
+            !r.is_empty()
+                && !r.ends_with('/')
+                && !r.starts_with('/')
+                && !r.contains(['?', '#', '@', '\\'])
+                && !r.chars().any(|c| c.is_whitespace() || c.is_control())
+        });
+        if !shaped {
+            bail!("{api:?} is not an API root: expected http(s)://host[/path], no trailing slash");
+        }
+        Ok(Repository {
+            api: api.to_string(),
+            name: name.to_string(),
+        })
+    }
+
+    /// The API root.
+    pub fn api(&self) -> &str {
+        &self.api
+    }
+
+    /// `owner/repo`.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -257,7 +330,7 @@ impl Tool {
         api: &str,
         tag: Option<&str>,
     ) -> Result<Target> {
-        let release = fetch_release(client, api, tag).await?;
+        let release = fetch_release(client, &Repository::virtkit_at(api), tag).await?;
         let (asset, digest) = assets_of(&release, self.name, api)?;
         Ok(Target {
             tag: release.tag_name.clone(),
@@ -489,10 +562,11 @@ fn check_version_output(
 }
 
 /// The API endpoint for a release: the one `tag` names, or the latest published one.
-fn api_url(api: &str, tag: Option<&ReleaseTag>) -> String {
+fn api_url(repo: &Repository, tag: Option<&ReleaseTag>) -> String {
+    let Repository { api, name } = repo;
     match tag {
-        Some(t) => format!("{api}/repos/{REPO}/releases/tags/{t}"),
-        None => format!("{api}/repos/{REPO}/releases/latest"),
+        Some(t) => format!("{api}/repos/{name}/releases/tags/{t}"),
+        None => format!("{api}/repos/{name}/releases/latest"),
     }
 }
 
@@ -526,13 +600,14 @@ fn pick<'a>(assets: &'a [ApiAsset], name: &str) -> Result<&'a ApiAsset> {
 /// Fetch a release from the API: the one `tag` names, or the latest published one.
 async fn fetch_release(
     client: &reqwest::Client,
-    api: &str,
+    repo: &Repository,
     tag: Option<&str>,
 ) -> Result<ApiRelease> {
     // The user's tag crosses the trust boundary once, here; the checked form is what
     // both the URL and the error message below are built from.
     let tag = tag.map(release_tag).transpose()?;
-    let url = api_url(api, tag.as_ref());
+    let url = api_url(repo, tag.as_ref());
+    let name = &repo.name;
     let resp = client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
@@ -549,8 +624,8 @@ async fn fetch_release(
         // 404 on the tags endpoint is the common case: a version that was never
         // released, or spelled differently than the tag.
         match &tag {
-            Some(t) => bail!("no release {t} in {REPO} (HTTP {status})"),
-            None => bail!("no latest release in {REPO} (HTTP {status})"),
+            Some(t) => bail!("no release {t} in {name} (HTTP {status})"),
+            None => bail!("no latest release in {name} (HTTP {status})"),
         }
     }
     let body = bounded_body(resp, MAX_RELEASE_JSON, &url).await?;
@@ -642,17 +717,29 @@ pub async fn artifacts(
     version: Option<&str>,
     names: &[&str],
 ) -> Result<Resolved> {
-    artifacts_at(client, API, version, names).await
+    artifacts_in(client, &Repository::virtkit(), version, names).await
 }
 
 /// [`artifacts`] with a configurable API root for local-server tests, like [`Tool::plan`].
+#[cfg(test)]
 async fn artifacts_at(
     client: &reqwest::Client,
     api: &str,
     version: Option<&str>,
     names: &[&str],
 ) -> Result<Resolved> {
-    let release = fetch_release(client, api, version).await?;
+    artifacts_in(client, &Repository::virtkit_at(api), version, names).await
+}
+
+/// [`artifacts`] from `repo` rather than virtkit's own repository.
+pub async fn artifacts_in(
+    client: &reqwest::Client,
+    repo: &Repository,
+    version: Option<&str>,
+    names: &[&str],
+) -> Result<Resolved> {
+    let api = repo.api.as_str();
+    let release = fetch_release(client, repo, version).await?;
     let has = |name: &str| release.assets.iter().any(|a| a.name == name);
     let mut artifacts = Vec::with_capacity(names.len());
     let mut missing = Vec::new();
@@ -763,8 +850,10 @@ async fn fetch_into(
     publish(tmp, dest, dir)
 }
 
-/// An HTTP client identifying itself: GitHub's API rejects requests without a `User-Agent`.
-fn client(user_agent: &str) -> Result<reqwest::Client> {
+/// An HTTP client identifying itself as `user_agent` — GitHub's API rejects requests without
+/// a `User-Agent` — with the connect and per-read timeouts every download here has. It
+/// honours the `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` environment, as reqwest does.
+pub fn client(user_agent: &str) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(user_agent.to_string())
         .connect_timeout(CONNECT_TIMEOUT)
@@ -1158,13 +1247,48 @@ mod tests {
         // and the shapes that are allowed still build the endpoint they should. Only a
         // `ReleaseTag` can be passed here, so this is the whole surface reaching the URL.
         assert_eq!(
-            api_url(API, Some(&release_tag("0.29.0").unwrap())),
+            api_url(
+                &Repository::virtkit(),
+                Some(&release_tag("0.29.0").unwrap())
+            ),
             "https://api.github.com/repos/virtkit-dev/virtkit/releases/tags/v0.29.0"
         );
         assert_eq!(
-            api_url(API, None),
+            api_url(&Repository::virtkit(), None),
             "https://api.github.com/repos/virtkit-dev/virtkit/releases/latest"
         );
+    }
+
+    // Like the tag, a caller-supplied repository must not retarget the API URL.
+    #[test]
+    fn a_repository_is_an_api_root_and_owner_name() {
+        let r = Repository::new("https://ghe.example/api/v3", "ops/virtkit").unwrap();
+        assert_eq!(
+            api_url(&r, Some(&release_tag("0.29.0").unwrap())),
+            "https://ghe.example/api/v3/repos/ops/virtkit/releases/tags/v0.29.0"
+        );
+        for (api, name) in [
+            ("https://api.github.com", "virtkit"),
+            ("https://api.github.com", "a/b/c"),
+            ("https://api.github.com", "../b"),
+            ("https://api.github.com", "a/.."),
+            ("https://api.github.com", "a/b?x"),
+            ("https://api.github.com/", "a/b"),
+            ("https://u@api.github.com", "a/b"),
+            ("https://api.github.com?x", "a/b"),
+            ("ftp://api.github.com", "a/b"),
+            ("https://", "a/b"),
+            ("https://api.github.com", "a /b"),
+            ("https://api.github.com", "a/b%2f"),
+            ("https://api.git hub.com", "a/b"),
+            ("https://api.github.com\\x", "a/b"),
+            ("https:///x", "a/b"),
+            ("https://api.github.com\n", "a/b"),
+        ] {
+            assert!(Repository::new(api, name).is_err(), "{api:?} {name:?}");
+        }
+        assert!(Repository::new("http://127.0.0.1:8080", "a/b").is_ok());
+        assert!(Repository::new("https://api.github.com", "o/r.js_x-1").is_ok());
     }
 
     // Only a strictly newer release is an update. A lower tag, and a tag with no version
