@@ -364,6 +364,30 @@ impl Tpm {
         (self.permanent.nv.len(), counters)
     }
 
+    /// Define `public` (not orderly) with `data` written, as a manufacturer provisions an index,
+    /// in place of any index at its handle. TPM_RC_NV_SPACE if NV is full.
+    pub fn nv_provision(&mut self, public: NvPublic, data: &[u8]) -> Result<()> {
+        if public.has(attr::ORDERLY) || data.len() != public.size() || public.kind().is_none() {
+            return Err(Rc::FAILURE);
+        }
+        let entry = NvIndex {
+            public,
+            auth: Zeroizing::new(Vec::new()),
+            data: Zeroizing::new(data.to_vec()),
+        };
+        let index = entry.public.index;
+        let replaced = self.nv_entry(index).map_or(0, NvIndex::cost);
+        let used = self.nv_used().saturating_sub(replaced);
+        if used.saturating_add(entry.cost()) > NV_INDEX_SPACE {
+            return Err(Rc::NV_SPACE);
+        }
+        self.nv_delete(index);
+        let list = &mut self.permanent.nv;
+        let at = list.partition_point(|e| e.public.index < index);
+        list.insert(at, entry);
+        Ok(())
+    }
+
     /// The handles of the defined indices, in order.
     pub fn nv_handles(&self) -> Vec<u32> {
         self.permanent.nv.iter().map(|i| i.public.index).collect()

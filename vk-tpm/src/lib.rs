@@ -27,6 +27,7 @@ mod context;
 mod crypt;
 mod drbg;
 mod duplicate;
+mod ek;
 mod entity;
 mod hierarchy;
 mod key;
@@ -43,6 +44,7 @@ mod state;
 
 use std::time::Instant;
 
+pub use ek::EkKind;
 use marshal::{Reader, Writer};
 pub use rc::Rc;
 pub use state::StateError;
