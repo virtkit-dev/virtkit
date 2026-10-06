@@ -134,6 +134,7 @@ impl Provisioning {
         gateway: Ipv4Addr,
     ) -> Result<Provisioning> {
         let record = crate::winbuild::provisioning(&svc.ext4)?;
+        crate::winbuild::warn_evaluation(&svc.ext4, &format!("service {}", svc.name));
         let restored = matches!(
             unit.source,
             crate::compose::Source::Bundle { snapshot: true, .. }

@@ -97,6 +97,7 @@ mod vmm;
 mod vmmctl;
 mod vms;
 mod winbuild;
+mod wineval;
 mod winexec;
 mod winiso;
 mod winsvc;
@@ -1077,6 +1078,13 @@ enum Cmd {
         /// (skipped if e2fsck is absent); adds an fsck per instruction.
         #[arg(long, help_heading = "Instruction cache")]
         debug: bool,
+        /// Windows: install each `FROM winiso:` stage again and rebuild every step on it
+        ///
+        /// For an evaluation image past or near its end. The new install is cached under new
+        /// keys; the old one and its layers stay, so bundles built on them keep working until
+        /// they are rebuilt.
+        #[arg(long, help_heading = "What to build")]
+        reinstall: bool,
     },
     /// Host side of a forward (companion of `vk-agent forward`)
     ///
@@ -3836,6 +3844,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         stage_mem,
         stage_cpus,
         debug,
+        reinstall,
     } = &cli.cmd
     {
         // A Windows Dockerfile (`FROM winiso:`, a windows platform, or a Windows bundle)
@@ -3855,6 +3864,12 @@ async fn cli_main(cli: Cli) -> ExitCode {
         }
         if windows {
             return windows_build(&cli.cmd).await;
+        }
+        if *reinstall {
+            return fail(
+                &anyhow::anyhow!("--reinstall applies to a Windows build only"),
+                2,
+            );
         }
         // each --build-arg is NAME=VALUE; a bare NAME means an empty value.
         let build_args: Vec<(String, String)> = build_arg
@@ -5017,6 +5032,7 @@ async fn windows_build(cmd: &Cmd) -> ExitCode {
         stage_cpus,
         debug,
         build_net,
+        reinstall,
         ..
     } = cmd
     else {
@@ -5084,6 +5100,7 @@ async fn windows_build(cmd: &Cmd) -> ExitCode {
         cpus: build::configured_build_cpus().unwrap_or(4),
         mem: build::configured_build_mem().unwrap_or_else(|| "4G".to_string()),
         no_network,
+        reinstall: *reinstall,
     };
     match tokio::task::spawn_blocking(move || winbuild::build(&opts)).await {
         Ok(Ok(())) => ExitCode::SUCCESS,

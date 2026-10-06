@@ -11,6 +11,10 @@
 //! file (it takes minutes to build), the install by the medium and the disk size, the base layer
 //! by the install and the settle step. Each is made in a directory of its own and renamed into
 //! place whole, so a concurrent build sees either nothing or the finished entry.
+//!
+//! `vk build --reinstall` keys the install and its base layer anew, so both and every layer on
+//! them are built again. Nothing is deleted: bundles built on the old install keep working until
+//! they are rebuilt, and a concurrent build still using it is not disturbed.
 
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -354,22 +358,63 @@ fn install_key(media_key: &str, disk_size: u64) -> String {
     ))
 }
 
-/// Get or build `source`'s base layer on a `disk_size`-byte disk in `cache`. Cache the install
-/// by its medium and disk size, and the settle overlay by the install and settle step, so
-/// changing the settle does not reinstall.
+/// The keys of the install `first` names after `reinstalls` `--reinstall`s, and of its base
+/// layer. A cache that never reinstalled keeps its keys.
+fn keys(first: &str, reinstalls: u32) -> (String, String) {
+    let install = if reinstalls == 0 {
+        first.to_string()
+    } else {
+        hex(&Sha256::digest(
+            format!("{first}\0reinstall {reinstalls}").as_bytes(),
+        ))
+    };
+    let base = hex(&Sha256::digest(
+        ["winiso-settled-v1", &install, SETTLE_PS1]
+            .join("\0")
+            .as_bytes(),
+    ));
+    (install, base)
+}
+
+/// How many times `--reinstall` re-keyed an install, as counted in the file `path` (none
+/// when it is absent).
+fn reinstalls(path: &Path) -> u32 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Count one more reinstall in the file `path`.
+fn count_reinstall(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(
+        path.parent()
+            .context("a reinstall count with no directory")?,
+    )?;
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp, (reinstalls(path) + 1).to_string())?;
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Get or build `source`'s base layer on a `disk_size`-byte disk in `cache`; with `reinstall`,
+/// a new one under new keys. Cache the install by its medium and disk size, and the settle
+/// overlay by the install and settle step, so changing the settle does not reinstall.
 pub(crate) fn base(
     source: &Source,
     disk_size: u64,
     cpus: u32,
     mem: &str,
     cache: &Path,
+    reinstall: bool,
 ) -> Result<Base> {
-    let install_key = install_key(&source.media_key(), disk_size);
-    let key = hex(&Sha256::digest(
-        ["winiso-settled-v1", &install_key, SETTLE_PS1]
-            .join("\0")
-            .as_bytes(),
-    ));
+    let first = install_key(&source.media_key(), disk_size);
+    let count = cache.join("reinstalls").join(&first);
+    if reinstall {
+        // Unlocked: concurrent `--reinstall`s may count once and share the new install, which
+        // is harmless; counted before the install, so every build from now on uses the new keys.
+        count_reinstall(&count)?;
+    }
+    let (install_key, key) = keys(&first, reinstalls(&count));
     let dir = cache.join("settled").join(&key);
     let record = dir.join("base.json");
     if let Ok(text) = std::fs::read_to_string(&record) {
@@ -969,5 +1014,28 @@ mod tests {
         assert_ne!(a, random_password().unwrap());
         assert!(!a.contains(['\'', '"']));
         assert!(a.len() >= 20);
+    }
+
+    #[test]
+    fn a_reinstall_keys_the_install_and_its_base_anew() {
+        let first = install_key("media", 40 << 30);
+        let (install, base) = keys(&first, 0);
+        assert_eq!(
+            install, first,
+            "a cache that never reinstalled keeps its keys"
+        );
+        let (install1, base1) = keys(&first, 1);
+        let (install2, base2) = keys(&first, 2);
+        assert!(install1 != install && install2 != install1);
+        assert!(base1 != base && base2 != base1);
+
+        let dir = std::env::temp_dir().join(format!("vk-winiso-reinstall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let count = dir.join("reinstalls").join(&first);
+        assert_eq!(reinstalls(&count), 0);
+        count_reinstall(&count).unwrap();
+        count_reinstall(&count).unwrap();
+        assert_eq!(reinstalls(&count), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

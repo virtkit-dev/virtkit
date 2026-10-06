@@ -39,6 +39,13 @@ All notable changes to virtkit will be documented in this file.
   `examples/windows` builds labs this way: an Active Directory lab (`tests/windows-ad-e2e.sh`),
   an IIS server with a Linux client, two forests with a trust, a red forest administering a
   production one, and an RDP session to a standalone server (`tests/windows-rdp-e2e.sh`).
+- **Windows evaluation images warn as they near their end.** For a bundle that is not
+  generalized, `vk build` asks Windows at the target's last step how long its evaluation or
+  activation grace lasts and records it in the bundle; `vk run`, compose services and `FROM`
+  the bundle warn from 30 days before an evaluation ends, or 3 days before an unactivated
+  image's activation grace does. `vk build --reinstall` installs a build's `FROM winiso:`
+  stages again under new cache keys; the old install stays cached, so bundles built on it keep
+  working.
 - **Windows machines keep their UEFI variables and can have Secure Boot and a TPM 2.0.** The
   firmware's variable store is a flash device backed by `uefi-vars.fd` in the run directory,
   kept with the machine's disks and carried by `vk snapshot`, so boot entries and keys survive a

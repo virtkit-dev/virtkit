@@ -655,6 +655,26 @@ vk build -f Dockerfile --out ./web-out    # a bundle: vm.json, disks, admin-pass
 - `CMD` is the image's provisioning command, run at each compose service start.
 - Another Windows Dockerfile can start `FROM ./web-out`, on the build cache that made it.
 
+**Evaluation media.** Microsoft's evaluation terms: Server evaluations must be activated
+online within 10 days and then run 180 days from activation; Windows 11 Enterprise
+evaluation 90 days. Evaluation media is for evaluation only: see Microsoft's terms before
+sharing images built from it.
+
+- A generalized image (`generalize=on`) starts a new 10-day grace on each machine, so each
+  must activate online within 10 days of its start (e.g. `slmgr /ato` in its `CMD`, with a
+  network), or Windows shuts down periodically.
+- An image that is not generalized carries its build's licensing: activated online during
+  its build (e.g. in a `RUN --network=default` step), its 180 days run from then for every
+  machine started from it. `vk build` records when that ends, or when the activation grace
+  of an image never activated does, and `vk run`, compose services and `FROM` the bundle
+  warn from 30 days before an evaluation ends, or 3 days before that grace does.
+- `vk build --reinstall` installs each `FROM winiso:` stage again under new cache keys and
+  rebuilds every step on it. The old install and its layers stay cached (tens of GB): bundles
+  built on them keep working until they are rebuilt. Nothing removes them: once no bundle
+  uses the Windows build cache, `rm -rf ~/.local/share/virtkit/windows`
+  (`$XDG_DATA_HOME/virtkit/windows` when that is set) frees it all, and the next build
+  installs from the ISO again.
+
 **Run it.** `vk run ./web-out` boots the bundle on fresh copy-on-write overlays (`--net`
 for a DHCP lease, `--cpus`/`--mem` to resize, `--state-dir` to keep its disks); `vk list`
 shows it. In a compose file, `image: ./web-out` makes a Windows service on the run's LAN,
