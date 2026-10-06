@@ -5,8 +5,8 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
-# A TPM 2.0 in Rust, meant to replace libtpms behind libkrun's CRB device. Crypto comes from
-# RustCrypto crates only, never hand-rolled.
+# A TPM 2.0 in Rust, meant to replace libtpms behind libkrun's CRB device. See
+# docs/tpm-design.md. Crypto comes from RustCrypto crates only, never hand-rolled.
 [dependencies]
 getrandom.workspace = true
 sha1.workspace = true

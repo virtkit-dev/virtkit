@@ -2,6 +2,8 @@
 //! device. The device hands it each command the guest wrote and copies the response back;
 //! it keeps the TPM's state, which this crate serializes (see [`Tpm::permanent_state`]).
 //!
+//! See `docs/tpm-design.md` for the scope (which commands, which algorithms) and the plan.
+//!
 //! Every command byte is guest-controlled: parsing goes through [`marshal::Reader`], which
 //! bounds-checks each read, and no path panics on input.
 
