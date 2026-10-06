@@ -7,10 +7,16 @@
 
 use crate::alg::{self, Hash};
 use crate::commands::{COMMANDS, end};
+use crate::entity::{
+    TPM_HT_HMAC_SESSION, TPM_HT_NV_INDEX, TPM_HT_PCR, TPM_HT_PERMANENT, TPM_HT_PERSISTENT,
+    TPM_HT_POLICY_SESSION, TPM_HT_TRANSIENT, TPM_RH_ENDORSEMENT, TPM_RH_LOCKOUT, TPM_RH_NULL,
+    TPM_RH_OWNER, TPM_RH_PLATFORM, TPM_RH_PLATFORM_NV, TPM_RS_PW, handle_type,
+};
 use crate::marshal::{Reader, Writer};
+use crate::object::MAX_OBJECTS;
 use crate::pcr::{self, PCR_COUNT};
 use crate::rc::{Rc, Result};
-use crate::{MAX_COMMAND_SIZE, TPM_RS_PW, Tpm};
+use crate::{MAX_COMMAND_SIZE, Out, Tpm};
 
 const TPM_CAP_ALGS: u32 = 0;
 const TPM_CAP_HANDLES: u32 = 1;
@@ -34,22 +40,14 @@ const MAX_PCR_PROPERTIES: usize = MAX_CAP_DATA / 8;
 
 /// The permanent handles (hierarchies, TPM_RS_PW, ...), in order.
 const PERMANENT_HANDLES: [u32; 7] = [
-    0x4000_0001, // TPM_RH_OWNER
-    pcr::TPM_RH_NULL,
+    TPM_RH_OWNER,
+    TPM_RH_NULL,
     TPM_RS_PW,
-    0x4000_000a, // TPM_RH_LOCKOUT
-    0x4000_000b, // TPM_RH_ENDORSEMENT
-    0x4000_000c, // TPM_RH_PLATFORM
-    0x4000_000d, // TPM_RH_PLATFORM_NV
+    TPM_RH_LOCKOUT,
+    TPM_RH_ENDORSEMENT,
+    TPM_RH_PLATFORM,
+    TPM_RH_PLATFORM_NV,
 ];
-
-const TPM_HT_PCR: u32 = 0x00;
-const TPM_HT_NV_INDEX: u32 = 0x01;
-const TPM_HT_HMAC_SESSION: u32 = 0x02;
-const TPM_HT_POLICY_SESSION: u32 = 0x03;
-const TPM_HT_PERMANENT: u32 = 0x40;
-const TPM_HT_TRANSIENT: u32 = 0x80;
-const TPM_HT_PERSISTENT: u32 = 0x81;
 
 const PT_FIXED: u32 = 0x100;
 const PT_VAR: u32 = 0x200;
@@ -62,7 +60,7 @@ fn page<K: Copy + Ord, T: Copy>(entries: &[(K, T)], from: K, count: usize) -> (V
     (page, rest.next().is_some())
 }
 
-pub fn get_capability(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Writer) -> Result<()> {
+pub fn get_capability(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result<()> {
     let capability = r.u32().map_err(|rc| rc.param(1))?;
     let property = r.u32().map_err(|rc| rc.param(2))?;
     let count = usize::try_from(r.u32().map_err(|rc| rc.param(3))?).unwrap_or(usize::MAX);
@@ -81,14 +79,14 @@ pub fn get_capability(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Writer) 
             more
         }
         TPM_CAP_HANDLES => {
-            let handles: Vec<u32> = match property >> 24 {
+            let handles: Vec<u32> = match handle_type(property) {
                 TPM_HT_PCR => (0..PCR_COUNT as u32).collect(),
                 TPM_HT_PERMANENT => PERMANENT_HANDLES.to_vec(),
-                // No NV index, loaded or saved session, transient or persistent object yet.
+                TPM_HT_TRANSIENT => tpm.loaded_objects(),
+                // No NV index, loaded or saved session, or persistent object yet.
                 TPM_HT_NV_INDEX
                 | TPM_HT_HMAC_SESSION
                 | TPM_HT_POLICY_SESSION
-                | TPM_HT_TRANSIENT
                 | TPM_HT_PERSISTENT => Vec::new(),
                 _ => return Err(Rc::HANDLE.param(2)),
             };
@@ -123,7 +121,7 @@ pub fn get_capability(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Writer) 
                 data.count(0);
                 true
             } else {
-                pcr::write_selections(&mut data, &tpm.permanent.allocation);
+                pcr::write_selections(&mut data, &tpm.volatile.allocation);
                 false
             }
         }
@@ -168,6 +166,13 @@ fn tpm_properties(tpm: &Tpm, property: u32, count: usize) -> (Vec<(u32, u32)>, b
     page(&in_group, from, count)
 }
 
+/// A TPMA_ bitfield: the bits that are set.
+fn flags(bits: &[(u32, bool)]) -> u32 {
+    bits.iter()
+        .filter(|(_, set)| *set)
+        .fold(0, |acc, (bit, _)| acc | (1 << bit))
+}
+
 /// Four ASCII characters as a UINT32, as TPM_PT_MANUFACTURER and the vendor strings are.
 const fn chars(s: &[u8; 4]) -> u32 {
     u32::from_be_bytes(*s)
@@ -176,17 +181,29 @@ const fn chars(s: &[u8; 4]) -> u32 {
 /// Every TPM_PT, in order.
 fn properties(tpm: &Tpm) -> Vec<(u32, u32)> {
     let da = &tpm.permanent.dictionary_attack;
-    // TPMA_PERMANENT: the EPS is the TPM's own; inLockout once too many tries failed.
-    let mut permanent = 1 << 10;
-    if da.failed_tries >= da.max_tries {
-        permanent |= 1 << 9;
-    }
-    // TPMA_STARTUP_CLEAR: every hierarchy enabled, and whether the last shutdown was orderly.
-    let mut startup_clear = 0xf;
-    if tpm.volatile.orderly_startup {
-        startup_clear |= 1 << 31;
-    }
+    let h = &tpm.permanent.hierarchies;
+    // TPMA_PERMANENT: which authValues are set, disableClear, inLockout, and that the EPS is
+    // the TPM's own.
+    let permanent = flags(&[
+        (0, !h.owner_auth.is_empty()),
+        (1, !h.endorsement_auth.is_empty()),
+        (2, !h.lockout_auth.is_empty()),
+        (8, h.disable_clear),
+        (9, da.in_lockout()),
+        (10, true),
+    ]);
+    // TPMA_STARTUP_CLEAR: the enables, and whether the last shutdown was orderly.
+    let clear = &tpm.volatile.clear;
+    let startup_clear = flags(&[
+        (0, tpm.volatile.ph_enable),
+        (1, clear.sh_enable),
+        (2, clear.eh_enable),
+        (3, clear.ph_enable_nv),
+        (31, tpm.volatile.orderly_startup),
+    ]);
     let commands = COMMANDS.len() as u32;
+    let loaded = tpm.loaded_objects().len();
+    let transient_avail = MAX_OBJECTS.saturating_sub(loaded) as u32;
     let max_command = MAX_COMMAND_SIZE as u32;
     vec![
         (0x100, chars(b"2.0\0")), // TPM_PT_FAMILY_INDICATOR
@@ -244,7 +261,7 @@ fn properties(tpm: &Tpm) -> Vec<(u32, u32)> {
         (0x204, 3),                            // TPM_PT_HR_LOADED_AVAIL
         (0x205, 0),                            // TPM_PT_HR_ACTIVE
         (0x206, 64),                           // TPM_PT_HR_ACTIVE_AVAIL
-        (0x207, 3),                            // TPM_PT_HR_TRANSIENT_AVAIL
+        (0x207, transient_avail),              // TPM_PT_HR_TRANSIENT_AVAIL
         (0x208, 0),                            // TPM_PT_HR_PERSISTENT
         (0x209, 0x33),                         // TPM_PT_HR_PERSISTENT_AVAIL
         (0x20a, 0),                            // TPM_PT_NV_COUNTERS

@@ -55,6 +55,10 @@ impl<'a> Reader<'a> {
         self.array().map(u32::from_be_bytes)
     }
 
+    pub fn u64(&mut self) -> Result<u64> {
+        self.array().map(u64::from_be_bytes)
+    }
+
     /// A TPM2B's contents, at most `max` bytes long.
     pub fn tpm2b(&mut self, max: usize) -> Result<&'a [u8]> {
         let size = usize::from(self.u16()?);
@@ -112,6 +116,10 @@ impl Writer {
     }
 
     pub fn u32(&mut self, v: u32) -> &mut Writer {
+        self.bytes(&v.to_be_bytes())
+    }
+
+    pub fn u64(&mut self, v: u64) -> &mut Writer {
         self.bytes(&v.to_be_bytes())
     }
 

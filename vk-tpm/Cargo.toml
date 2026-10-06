@@ -9,6 +9,7 @@ license.workspace = true
 # docs/tpm-design.md. Crypto comes from RustCrypto crates only, never hand-rolled.
 [dependencies]
 getrandom.workspace = true
+hmac.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 subtle.workspace = true

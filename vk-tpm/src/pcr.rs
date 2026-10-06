@@ -8,10 +8,14 @@ use crate::rc::{Rc, Result};
 pub const PCR_COUNT: usize = 24;
 /// Bytes in a PCR bitmap (TPMS_PCR_SELECTION.sizeofSelect): both its minimum and maximum.
 pub const PCR_SELECT: usize = PCR_COUNT / 8;
-/// TPM_RH_NULL, which TPM2_PCR_Extend takes as "extend nothing".
-pub const TPM_RH_NULL: u32 = 0x4000_0007;
 /// How many PCRs of a bank TPM2_Shutdown(STATE) saves: 0-15.
 pub const STATE_SAVED: usize = 16;
+/// The PCRs a PC Client TPM must keep allocated in some bank: the H-CRTM's and the DRTM's.
+pub const HCRTM_PCR: usize = 0;
+pub const DRTM_PCR: usize = 17;
+/// What TPM2_PCR_Allocate reports as the memory for PCRs (its sizeAvailable): room for every PCR
+/// in every bank, as libtpms has.
+pub const PCR_MEMORY: u32 = (PCR_COUNT * (20 + 32 + 48 + 64)) as u32;
 /// A PCR read returns at most this many digests (TPML_DIGEST); the selection says which.
 const MAX_READ: usize = 8;
 
@@ -111,6 +115,11 @@ impl Selection {
         }
     }
 
+    /// How many PCRs it selects.
+    pub fn count(&self) -> usize {
+        self.select.iter().map(|b| b.count_ones() as usize).sum()
+    }
+
     pub fn has(&self, pcr: usize) -> bool {
         self.select
             .get(pcr / 8)
@@ -191,8 +200,10 @@ impl Pcrs {
         Pcrs { banks, counter: 0 }
     }
 
-    /// Initialize the PCRs for `kind` of startup, from `saved` for a restart or resume.
-    pub fn startup(&mut self, kind: Startup, saved: Option<&Saved>) {
+    /// Initialize the allocated PCRs for `kind` of startup, from `saved` for a restart or
+    /// resume. A PCR not allocated keeps its value, as in the reference implementation (it
+    /// reads again if TPM2_PCR_Allocate brings it back).
+    pub fn startup(&mut self, allocation: &[Selection], kind: Startup, saved: Option<&Saved>) {
         self.counter = match (kind, saved) {
             (Startup::Restart | Startup::Resume, Some(saved)) => saved.counter,
             _ => 0,
@@ -207,9 +218,15 @@ impl Pcrs {
                 let Some(attributes) = attributes(pcr) else {
                     continue;
                 };
-                if attributes.state_save
-                    && let Some(old) = saved.next()
-                {
+                let restored = if attributes.state_save {
+                    saved.next()
+                } else {
+                    None
+                };
+                if !is_allocated(allocation, bank.hash, pcr) {
+                    continue;
+                }
+                if let Some(old) = restored {
                     value.clone_from(old);
                     continue;
                 }
@@ -254,7 +271,9 @@ impl Pcrs {
         }
     }
 
-    fn changed(&mut self, pcr: usize) {
+    /// PCRChanged: count a change to `pcr` in the update counter (unless it is in the TCB
+    /// group).
+    pub fn changed(&mut self, pcr: usize) {
         let no_increment = attributes(pcr).is_some_and(|a| a.no_increment);
         if !no_increment {
             self.counter = self.counter.wrapping_add(1);
@@ -275,6 +294,18 @@ impl Pcrs {
             return;
         };
         *value = hash.digest(&[value, digest]);
+        self.changed(pcr);
+    }
+
+    /// TPM2_PCR_Reset: PCR `pcr` back to zeros, in every bank that has it.
+    pub fn reset(&mut self, allocation: &[Selection], pcr: usize) {
+        for bank in &mut self.banks {
+            if is_allocated(allocation, bank.hash, pcr)
+                && let Some(value) = bank.values.get_mut(pcr)
+            {
+                value.fill(0);
+            }
+        }
         self.changed(pcr);
     }
 
@@ -321,6 +352,11 @@ fn is_allocated(allocation: &[Selection], hash: Hash, pcr: usize) -> bool {
 /// The PCR (as a handle number) is extendable from `locality`.
 pub fn may_extend(pcr: usize, locality: u8) -> bool {
     attributes(pcr).is_some_and(|a| a.extend & (1 << locality) != 0)
+}
+
+/// The PCR (as a handle number) may be reset from `locality`.
+pub fn may_reset(pcr: usize, locality: u8) -> bool {
+    attributes(pcr).is_some_and(|a| a.reset & (1 << locality) != 0)
 }
 
 /// The PCR is saved by TPM2_Shutdown(STATE).
@@ -374,7 +410,7 @@ mod tests {
     #[test]
     fn startup_initializes_and_counts_like_the_pc_client_profile() {
         let mut pcrs = Pcrs::new();
-        pcrs.startup(Startup::Reset, None);
+        pcrs.startup(&every_bank(), Startup::Reset, None);
         // PCRs 0-15 and 17-20 count; the TCB group (16, 21-23) does not.
         assert_eq!(pcrs.counter, 20);
         let sha256 = &pcrs.banks[1];
@@ -387,7 +423,7 @@ mod tests {
     fn extend_hashes_into_allocated_pcrs_only() {
         let all = every_bank();
         let mut pcrs = Pcrs::new();
-        pcrs.startup(Startup::Reset, None);
+        pcrs.startup(&every_bank(), Startup::Reset, None);
         let digest = Hash::Sha256.digest(&[b"x"]);
         pcrs.extend(&all, 7, Hash::Sha256, &digest);
         assert_eq!(
@@ -408,20 +444,20 @@ mod tests {
     fn resume_restores_saved_pcrs_and_restart_does_not() {
         let all = every_bank();
         let mut pcrs = Pcrs::new();
-        pcrs.startup(Startup::Reset, None);
+        pcrs.startup(&every_bank(), Startup::Reset, None);
         pcrs.extend(&all, 0, Hash::Sha1, &[1; 20]);
         pcrs.extend(&all, 23, Hash::Sha1, &[1; 20]);
         let extended = pcrs.banks[0].values[0].clone();
         let saved = pcrs.save();
 
         let mut resumed = Pcrs::new();
-        resumed.startup(Startup::Resume, Some(&saved));
+        resumed.startup(&all, Startup::Resume, Some(&saved));
         assert_eq!(resumed.banks[0].values[0], extended);
         assert_eq!(resumed.banks[0].values[23], vec![0; 20], "23 is not saved");
         assert_eq!(resumed.counter, saved.counter + 4);
 
         let mut restarted = Pcrs::new();
-        restarted.startup(Startup::Restart, Some(&saved));
+        restarted.startup(&all, Startup::Restart, Some(&saved));
         assert_eq!(restarted.banks[0].values[0], vec![0; 20]);
         assert_eq!(restarted.counter, saved.counter + 20);
     }
@@ -429,7 +465,7 @@ mod tests {
     #[test]
     fn read_returns_at_most_eight_and_says_which() {
         let mut pcrs = Pcrs::new();
-        pcrs.startup(Startup::Reset, None);
+        pcrs.startup(&every_bank(), Startup::Reset, None);
         let all = every_bank();
         let ask = vec![
             Selection::all(Hash::Sha1, true),

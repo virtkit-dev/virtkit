@@ -2,12 +2,14 @@
 //! of them.
 
 use sha1::Sha1;
+use sha2::digest::common::hazmat::{SerializableState, SerializedState};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 use crate::marshal::Reader;
 use crate::rc::{Rc, Result};
 
 pub const TPM_ALG_SHA1: u16 = 0x0004;
+pub const TPM_ALG_NULL: u16 = 0x0010;
 pub const TPM_ALG_SHA256: u16 = 0x000b;
 pub const TPM_ALG_SHA384: u16 = 0x000c;
 pub const TPM_ALG_SHA512: u16 = 0x000d;
@@ -46,6 +48,14 @@ impl Hash {
         Hash::from_id(r.u16()?).ok_or(Rc::HASH)
     }
 
+    /// A TPMI_ALG_HASH+: None for TPM_ALG_NULL.
+    pub fn read_or_null(r: &mut Reader) -> Result<Option<Hash>> {
+        match r.u16()? {
+            TPM_ALG_NULL => Ok(None),
+            id => Hash::from_id(id).map(Some).ok_or(Rc::HASH),
+        }
+    }
+
     pub fn size(self) -> usize {
         match self {
             Hash::Sha1 => 20,
@@ -57,19 +67,83 @@ impl Hash {
 
     /// The digest of the concatenation of `parts`.
     pub fn digest(self, parts: &[&[u8]]) -> Vec<u8> {
-        fn run<D: Digest>(parts: &[&[u8]]) -> Vec<u8> {
-            let mut d = D::new();
-            for part in parts {
-                d.update(part);
-            }
-            d.finalize().to_vec()
+        let mut h = Hasher::new(self);
+        for part in parts {
+            h.update(part);
         }
+        h.finish()
+    }
+}
+
+/// A hash sequence's in-progress digest state, saved and restored with the TPM's volatile state.
+#[derive(Clone)]
+pub enum Hasher {
+    Sha1(Sha1),
+    Sha256(Sha256),
+    Sha384(Sha384),
+    Sha512(Sha512),
+}
+
+impl Hasher {
+    pub fn new(hash: Hash) -> Hasher {
+        match hash {
+            Hash::Sha1 => Hasher::Sha1(Sha1::new()),
+            Hash::Sha256 => Hasher::Sha256(Sha256::new()),
+            Hash::Sha384 => Hasher::Sha384(Sha384::new()),
+            Hash::Sha512 => Hasher::Sha512(Sha512::new()),
+        }
+    }
+
+    pub fn hash(&self) -> Hash {
         match self {
-            Hash::Sha1 => run::<Sha1>(parts),
-            Hash::Sha256 => run::<Sha256>(parts),
-            Hash::Sha384 => run::<Sha384>(parts),
-            Hash::Sha512 => run::<Sha512>(parts),
+            Hasher::Sha1(_) => Hash::Sha1,
+            Hasher::Sha256(_) => Hash::Sha256,
+            Hasher::Sha384(_) => Hash::Sha384,
+            Hasher::Sha512(_) => Hash::Sha512,
         }
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        match self {
+            Hasher::Sha1(d) => d.update(data),
+            Hasher::Sha256(d) => d.update(data),
+            Hasher::Sha384(d) => d.update(data),
+            Hasher::Sha512(d) => d.update(data),
+        }
+    }
+
+    pub fn finish(self) -> Vec<u8> {
+        match self {
+            Hasher::Sha1(d) => d.finalize().to_vec(),
+            Hasher::Sha256(d) => d.finalize().to_vec(),
+            Hasher::Sha384(d) => d.finalize().to_vec(),
+            Hasher::Sha512(d) => d.finalize().to_vec(),
+        }
+    }
+
+    /// Its internal state, in RustCrypto's serialization: the block state, the length so far
+    /// and the bytes buffered.
+    pub fn save(&self) -> Vec<u8> {
+        match self {
+            Hasher::Sha1(d) => d.serialize().to_vec(),
+            Hasher::Sha256(d) => d.serialize().to_vec(),
+            Hasher::Sha384(d) => d.serialize().to_vec(),
+            Hasher::Sha512(d) => d.serialize().to_vec(),
+        }
+    }
+
+    /// Restore [`Hasher::save`]'s output if `state` is valid for `hash`.
+    pub fn load(hash: Hash, state: &[u8]) -> Option<Hasher> {
+        fn load<D: SerializableState>(state: &[u8]) -> Option<D> {
+            let state = SerializedState::<D>::try_from(state).ok()?;
+            D::deserialize(&state).ok()
+        }
+        Some(match hash {
+            Hash::Sha1 => Hasher::Sha1(load(state)?),
+            Hash::Sha256 => Hasher::Sha256(load(state)?),
+            Hash::Sha384 => Hasher::Sha384(load(state)?),
+            Hash::Sha512 => Hasher::Sha512(load(state)?),
+        })
     }
 }
 
@@ -100,5 +174,18 @@ mod tests {
             [0xba, 0x78, 0x16, 0xbf]
         );
         assert!(IMPLEMENTED.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    #[test]
+    fn a_saved_hasher_goes_on_where_it_stopped() {
+        for hash in Hash::ALL {
+            let mut h = Hasher::new(hash);
+            h.update(&[7; 200]);
+            let state = h.save();
+            let mut loaded = Hasher::load(hash, &state).unwrap();
+            loaded.update(b"tail");
+            assert_eq!(loaded.finish(), hash.digest(&[&[7; 200], b"tail"]));
+            assert!(Hasher::load(hash, &state[1..]).is_none());
+        }
     }
 }

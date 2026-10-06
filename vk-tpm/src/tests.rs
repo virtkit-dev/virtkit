@@ -2,22 +2,31 @@
 
 use super::*;
 use crate::commands::*;
+use crate::entity::*;
 
 /// A command: no sessions, or one password session with `password`.
 fn command(code: u32, handles: &[u32], password: Option<&[u8]>, params: &[u8]) -> Vec<u8> {
+    let passwords: Vec<&[u8]> = password.into_iter().collect();
+    command_with(code, handles, &passwords, params)
+}
+
+/// A command with one password session per password.
+fn command_with(code: u32, handles: &[u32], passwords: &[&[u8]], params: &[u8]) -> Vec<u8> {
     let mut w = Writer::new();
-    let tag = if password.is_some() {
-        TPM_ST_SESSIONS
-    } else {
+    let tag = if passwords.is_empty() {
         TPM_ST_NO_SESSIONS
+    } else {
+        TPM_ST_SESSIONS
     };
     w.u16(tag).u32(0).u32(code);
     for h in handles {
         w.u32(*h);
     }
-    if let Some(password) = password {
+    if !passwords.is_empty() {
         let mut area = Writer::new();
-        area.u32(TPM_RS_PW).tpm2b(&[]).u8(0).tpm2b(password);
+        for password in passwords {
+            area.u32(TPM_RS_PW).tpm2b(&[]).u8(0).tpm2b(password);
+        }
         let area = area.into_bytes();
         w.count(area.len()).bytes(&area);
     }
@@ -93,6 +102,20 @@ fn malformed_headers_are_refused() {
     assert_eq!(rc(&tpm.process(&huge)), Rc::COMMAND_SIZE.0);
 }
 
+/// A handle of `kind` that is present in a newly started TPM.
+fn valid_handle(kind: HandleKind) -> u32 {
+    match kind {
+        HandleKind::Pcr(_) => 0,
+        HandleKind::Hierarchy | HandleKind::HierarchyAuth | HandleKind::HierarchyPolicy => {
+            TPM_RH_OWNER
+        }
+        HandleKind::Platform | HandleKind::Clear => TPM_RH_PLATFORM,
+        HandleKind::Lockout => TPM_RH_LOCKOUT,
+        // The sequence the test starts first.
+        HandleKind::Object(_) => 0x8000_0000,
+    }
+}
+
 #[test]
 fn every_command_refuses_trailing_parameter_bytes() {
     for cmd in COMMANDS {
@@ -101,18 +124,31 @@ fn every_command_refuses_trailing_parameter_bytes() {
             tpm.process(&command(TPM_CC_STARTUP, &[], None, &[0, 0]));
         }
         let params: &[u8] = match cmd.code {
-            TPM_CC_GET_CAPABILITY => &[0, 0, 0, 6, 0, 0, 1, 0, 0, 0, 0, 1, 0xee],
-            TPM_CC_GET_RANDOM | TPM_CC_STARTUP | TPM_CC_SHUTDOWN => &[0, 0, 0xee],
-            TPM_CC_SELF_TEST => &[1, 0xee],
-            _ => &[0, 0, 0, 0, 0xee],
+            TPM_CC_GET_CAPABILITY => &[0, 0, 0, 6, 0, 0, 1, 0, 0, 0, 0, 1],
+            TPM_CC_GET_RANDOM | TPM_CC_STARTUP | TPM_CC_SHUTDOWN => &[0, 0],
+            TPM_CC_SELF_TEST | TPM_CC_CLEAR_CONTROL => &[1],
+            TPM_CC_HIERARCHY_CONTROL => &[0x40, 0, 0, 1, 1],
+            TPM_CC_HIERARCHY_CHANGE_AUTH | TPM_CC_PCR_EVENT => &[0, 0],
+            TPM_CC_PCR_RESET => &[],
+            TPM_CC_SET_PRIMARY_POLICY => &[0, 0, 0, 0x10],
+            TPM_CC_DICTIONARY_ATTACK_PARAMETERS => &[0; 12],
+            TPM_CC_CHANGE_EPS | TPM_CC_CHANGE_PPS | TPM_CC_CLEAR => &[],
+            TPM_CC_DICTIONARY_ATTACK_LOCK_RESET => &[],
+            TPM_CC_HASH => &[0, 0, 0, 0x0b, 0x40, 0, 0, 7],
+            TPM_CC_HASH_SEQUENCE_START => &[0, 0, 0, 0x10],
+            TPM_CC_SEQUENCE_UPDATE | TPM_CC_EVENT_SEQUENCE_COMPLETE => &[0, 0],
+            TPM_CC_SEQUENCE_COMPLETE => &[0, 0, 0x40, 0, 0, 7],
+            TPM_CC_FLUSH_CONTEXT => &[0x80, 0, 0, 0],
+            _ => &[0, 0, 0, 0],
         };
-        let password = (cmd.auth > 0).then_some(&b""[..]);
-        let response = tpm.process(&command(
-            cmd.code,
-            &[0; 1][..cmd.handles.len()],
-            password,
-            params,
-        ));
+        let params = [params, &[0xee]].concat();
+        if cmd.code != TPM_CC_STARTUP {
+            let start = command(TPM_CC_HASH_SEQUENCE_START, &[], None, &[0, 0, 0, 0x10]);
+            assert_eq!(rc(&tpm.process(&start)), 0);
+        }
+        let handles: Vec<u32> = cmd.handles.iter().map(|&k| valid_handle(k)).collect();
+        let passwords = vec![&b""[..]; cmd.auth];
+        let response = tpm.process(&command_with(cmd.code, &handles, &passwords, &params));
         assert_eq!(rc(&response), Rc::SIZE.0, "command {:#x}", cmd.code);
     }
 }
@@ -169,7 +205,7 @@ fn pcr_extend_checks_handle_locality_and_digests() {
         Rc::LOCALITY.0
     );
     assert_eq!(
-        rc(&tpm.process(&extend(pcr::TPM_RH_NULL, alg::TPM_ALG_SHA256, &[0; 32]))),
+        rc(&tpm.process(&extend(TPM_RH_NULL, alg::TPM_ALG_SHA256, &[0; 32]))),
         0
     );
     assert_eq!(
@@ -329,10 +365,595 @@ fn get_capability_lists_exactly_the_implemented_commands() {
         .chunks(4)
         .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
         .collect();
-    assert_eq!(listed[0], 0x0040_0143, "SelfTest: nv");
+    assert_eq!(
+        listed[0], 0x02c0_0121,
+        "HierarchyControl: nv, extensive, 1 handle"
+    );
     assert_eq!(
         *listed.last().unwrap(),
-        0x0240_0182,
-        "PCR_Extend: nv, 1 handle"
+        0x1000_0186,
+        "HashSequenceStart: a response handle"
     );
+}
+
+/// TPM_PT property `property`, through TPM2_GetCapability.
+fn property(tpm: &mut Tpm, property: u32) -> u32 {
+    let mut p = Writer::new();
+    p.u32(6).u32(property).u32(1);
+    let r = tpm.process(&command(TPM_CC_GET_CAPABILITY, &[], None, &p.into_bytes()));
+    assert_eq!(rc(&r), 0);
+    assert_eq!(u32::from_be_bytes(r[19..23].try_into().unwrap()), property);
+    u32::from_be_bytes(r[23..27].try_into().unwrap())
+}
+
+const TPM_PT_PERMANENT: u32 = 0x200;
+const TPM_PT_STARTUP_CLEAR: u32 = 0x201;
+
+fn change_auth(handle: u32, password: &[u8], new: &[u8]) -> Vec<u8> {
+    let mut p = Writer::new();
+    p.tpm2b(new);
+    command(
+        TPM_CC_HIERARCHY_CHANGE_AUTH,
+        &[handle],
+        Some(password),
+        &p.into_bytes(),
+    )
+}
+
+fn power_cycle(tpm: &Tpm, startup: u8) -> Tpm {
+    let mut next = Tpm::power_on(&tpm.permanent_state()).unwrap();
+    let r = next.process(&command(TPM_CC_STARTUP, &[], None, &[0, startup]));
+    assert_eq!(rc(&r), 0);
+    next
+}
+
+#[test]
+fn hierarchy_auth_values_change_and_authorize() {
+    let mut tpm = started();
+    assert_eq!(property(&mut tpm, TPM_PT_PERMANENT), 1 << 10);
+    assert_eq!(
+        rc(&tpm.process(&change_auth(TPM_RH_OWNER, b"", b"owner\0\0"))),
+        0
+    );
+    assert_eq!(property(&mut tpm, TPM_PT_PERMANENT), 1 << 10 | 1);
+    // The owner is exempt from dictionary-attack protection: a plain TPM_RC_BAD_AUTH.
+    let wrong = change_auth(TPM_RH_OWNER, b"x", b"");
+    assert_eq!(rc(&tpm.process(&wrong)), Rc::BAD_AUTH.session(1).0);
+    assert!(tpm.take_permanent_changed());
+    assert!(!tpm.take_permanent_changed());
+    tpm.process(&wrong);
+    assert!(!tpm.take_permanent_changed(), "nothing counted");
+    let right = change_auth(TPM_RH_OWNER, b"owner", b"");
+    assert_eq!(rc(&tpm.process(&right)), 0);
+    assert_eq!(property(&mut tpm, TPM_PT_PERMANENT), 1 << 10);
+}
+
+#[test]
+fn a_failed_lockout_authorization_locks_lockout_out_until_recovery() {
+    let mut tpm = started();
+    tpm.process(&change_auth(TPM_RH_LOCKOUT, b"", b"lock"));
+    let reset = |pw: &[u8]| {
+        command(
+            TPM_CC_DICTIONARY_ATTACK_LOCK_RESET,
+            &[TPM_RH_LOCKOUT],
+            Some(pw),
+            &[],
+        )
+    };
+    assert_eq!(rc(&tpm.process(&reset(b"lock"))), 0);
+    tpm.take_permanent_changed();
+    assert_eq!(
+        rc(&tpm.process(&reset(b"nope"))),
+        Rc::AUTH_FAIL.session(1).0
+    );
+    assert!(
+        tpm.take_permanent_changed(),
+        "the failure is stored before the response"
+    );
+    assert_eq!(rc(&tpm.process(&reset(b"lock"))), Rc::LOCKOUT.0);
+    // lockoutRecovery is 1000 s by default.
+    tpm.clock.advance(999_000);
+    assert_eq!(rc(&tpm.process(&reset(b"lock"))), Rc::LOCKOUT.0);
+    tpm.clock.advance(1_000);
+    assert_eq!(rc(&tpm.process(&reset(b"lock"))), 0);
+
+    // With lockoutRecovery 0, only the next Startup lets lockout be tried again.
+    let mut p = Writer::new();
+    p.u32(3).u32(1000).u32(0);
+    let params = command(
+        TPM_CC_DICTIONARY_ATTACK_PARAMETERS,
+        &[TPM_RH_LOCKOUT],
+        Some(b"lock"),
+        &p.into_bytes(),
+    );
+    assert_eq!(rc(&tpm.process(&params)), 0);
+    tpm.process(&reset(b"nope"));
+    tpm.clock.advance(10_000_000);
+    assert_eq!(rc(&tpm.process(&reset(b"lock"))), Rc::LOCKOUT.0);
+    let mut tpm = power_cycle(&tpm, 0);
+    assert_eq!(rc(&tpm.process(&reset(b"lock"))), 0);
+}
+
+#[test]
+fn hierarchy_control_disables_until_the_next_startup_clear() {
+    let mut tpm = started();
+    let control = |auth: u32, enable: u32, state: u8| {
+        let mut p = Writer::new();
+        p.u32(enable).u8(state);
+        command(
+            TPM_CC_HIERARCHY_CONTROL,
+            &[auth],
+            Some(b""),
+            &p.into_bytes(),
+        )
+    };
+    assert_eq!(property(&mut tpm, TPM_PT_STARTUP_CLEAR), 0x8000_000f);
+    assert_eq!(rc(&tpm.process(&control(TPM_RH_OWNER, TPM_RH_OWNER, 0))), 0);
+    assert_eq!(property(&mut tpm, TPM_PT_STARTUP_CLEAR), 0x8000_000d);
+    // A disabled hierarchy cannot even be named, nor enable itself again.
+    assert_eq!(
+        rc(&tpm.process(&change_auth(TPM_RH_OWNER, b"", b""))),
+        0x185
+    );
+    let r = tpm.process(&control(TPM_RH_ENDORSEMENT, TPM_RH_OWNER, 1));
+    assert_eq!(rc(&r), Rc::AUTH_TYPE.0);
+    assert_eq!(
+        rc(&tpm.process(&control(TPM_RH_PLATFORM, TPM_RH_OWNER, 1))),
+        0
+    );
+    assert_eq!(
+        rc(&tpm.process(&control(TPM_RH_PLATFORM, TPM_RH_PLATFORM, 0))),
+        0
+    );
+    assert_eq!(
+        rc(&tpm.process(&control(TPM_RH_PLATFORM, TPM_RH_OWNER, 1))),
+        0x185
+    );
+
+    // A resume keeps the enables (the platform's excepted); a restart resets them.
+    tpm.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 1]));
+    let mut resumed = power_cycle(&tpm, 1);
+    assert_eq!(property(&mut resumed, TPM_PT_STARTUP_CLEAR), 0x8000_000f);
+    let mut tpm = started();
+    tpm.process(&control(TPM_RH_ENDORSEMENT, TPM_RH_ENDORSEMENT, 0));
+    tpm.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 1]));
+    let mut resumed = power_cycle(&tpm, 1);
+    assert_eq!(property(&mut resumed, TPM_PT_STARTUP_CLEAR), 0x8000_000b);
+    let mut restarted = power_cycle(&tpm, 0);
+    assert_eq!(property(&mut restarted, TPM_PT_STARTUP_CLEAR), 0x8000_000f);
+}
+
+#[test]
+fn platform_authorization_lasts_until_startup_clear() {
+    let mut tpm = started();
+    assert_eq!(
+        rc(&tpm.process(&change_auth(TPM_RH_PLATFORM, b"", b"pf"))),
+        0
+    );
+    tpm.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 1]));
+    let mut resumed = power_cycle(&tpm, 1);
+    assert_eq!(
+        rc(&resumed.process(&change_auth(TPM_RH_PLATFORM, b"pf", b"pf"))),
+        0
+    );
+    let mut restarted = power_cycle(&tpm, 0);
+    assert_eq!(
+        rc(&restarted.process(&change_auth(TPM_RH_PLATFORM, b"", b""))),
+        0
+    );
+
+    // Changing it after TPM2_Shutdown(STATE) voids the saved state.
+    tpm = started();
+    tpm.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 1]));
+    tpm.process(&change_auth(TPM_RH_PLATFORM, b"", b"x"));
+    let mut next = Tpm::power_on(&tpm.permanent_state()).unwrap();
+    let r = next.process(&command(TPM_CC_STARTUP, &[], None, &[0, 1]));
+    assert_eq!(rc(&r), Rc::VALUE.param(1).0);
+}
+
+#[test]
+fn clear_resets_the_owner_unless_disabled() {
+    let mut tpm = started();
+    tpm.process(&change_auth(TPM_RH_OWNER, b"", b"o"));
+    tpm.process(&change_auth(TPM_RH_LOCKOUT, b"", b"l"));
+    let sps = *tpm.permanent.sps;
+    let clear = |auth: u32, pw: &[u8]| command(TPM_CC_CLEAR, &[auth], Some(pw), &[]);
+    let control = |auth: u32, pw: &[u8], disable: u8| {
+        command(TPM_CC_CLEAR_CONTROL, &[auth], Some(pw), &[disable])
+    };
+    assert_eq!(rc(&tpm.process(&control(TPM_RH_LOCKOUT, b"l", 1))), 0);
+    assert_eq!(
+        property(&mut tpm, TPM_PT_PERMANENT),
+        1 << 10 | 1 << 8 | 0b101
+    );
+    assert_eq!(
+        rc(&tpm.process(&clear(TPM_RH_LOCKOUT, b"l"))),
+        Rc::DISABLED.0
+    );
+    // Only the platform may allow TPM2_Clear again.
+    assert_eq!(
+        rc(&tpm.process(&control(TPM_RH_LOCKOUT, b"l", 0))),
+        Rc::AUTH_FAIL.0
+    );
+    assert_eq!(rc(&tpm.process(&control(TPM_RH_PLATFORM, b"", 0))), 0);
+    assert_eq!(rc(&tpm.process(&clear(TPM_RH_LOCKOUT, b"l"))), 0);
+    assert_eq!(property(&mut tpm, TPM_PT_PERMANENT), 1 << 10);
+    assert_ne!(*tpm.permanent.sps, sps);
+    assert_eq!(rc(&tpm.process(&change_auth(TPM_RH_OWNER, b"", b""))), 0);
+}
+
+#[test]
+fn set_primary_policy_checks_the_digest_size() {
+    let mut tpm = started();
+    let policy = |digest: &[u8], hash: u16| {
+        let mut p = Writer::new();
+        p.tpm2b(digest).u16(hash);
+        command(
+            TPM_CC_SET_PRIMARY_POLICY,
+            &[TPM_RH_OWNER],
+            Some(b""),
+            &p.into_bytes(),
+        )
+    };
+    assert_eq!(
+        rc(&tpm.process(&policy(&[1; 20], alg::TPM_ALG_SHA256))),
+        0x1d5
+    );
+    assert_eq!(rc(&tpm.process(&policy(&[1; 32], alg::TPM_ALG_SHA256))), 0);
+    assert!(tpm.entity_policy(TPM_RH_OWNER).is_some());
+    assert_eq!(rc(&tpm.process(&policy(&[], alg::TPM_ALG_NULL))), 0);
+    assert!(tpm.entity_policy(TPM_RH_OWNER).is_none());
+}
+
+#[test]
+fn pcr_event_digests_with_every_bank_and_extends() {
+    let mut tpm = started();
+    let r = tpm.process(&command(
+        TPM_CC_PCR_EVENT,
+        &[5],
+        Some(b""),
+        &[0, 3, b'a', b'b', b'c'],
+    ));
+    assert_eq!(rc(&r), 0);
+    // Sessions header, parameterSize, then TPML_DIGEST_VALUES.
+    let mut p = Reader::new(&r[14..]);
+    assert_eq!(p.u32(), Ok(4));
+    for hash in alg::Hash::ALL {
+        assert_eq!(p.u16(), Ok(hash.id()));
+        assert_eq!(p.bytes(hash.size()).unwrap(), hash.digest(&[b"abc"]));
+    }
+    let digest = alg::Hash::Sha256.digest(&[b"abc"]);
+    assert_eq!(
+        read_sha256(&mut tpm, 5).1,
+        alg::Hash::Sha256.digest(&[&[0; 32], &digest])
+    );
+    let null = command(TPM_CC_PCR_EVENT, &[TPM_RH_NULL], Some(b""), &[0, 1, 0]);
+    assert_eq!(rc(&tpm.process(&null)), 0);
+    // One change per bank, and none for TPM_RH_NULL.
+    assert_eq!(
+        read_sha256(&mut tpm, 5).0,
+        24,
+        "TPM_RH_NULL extends nothing"
+    );
+}
+
+#[test]
+fn pcr_reset_needs_a_resettable_pcr() {
+    let mut tpm = started();
+    tpm.process(&extend(16, alg::TPM_ALG_SHA256, &[1; 32]));
+    tpm.process(&extend(7, alg::TPM_ALG_SHA256, &[1; 32]));
+    let reset = |pcr| command(TPM_CC_PCR_RESET, &[pcr], Some(b""), &[]);
+    assert_eq!(rc(&tpm.process(&reset(7))), Rc::LOCALITY.0);
+    assert_eq!(rc(&tpm.process(&reset(TPM_RH_NULL))), Rc::VALUE.handle(1).0);
+    assert_eq!(rc(&tpm.process(&reset(16))), 0);
+    assert_eq!(read_sha256(&mut tpm, 16).1, vec![0; 32]);
+    assert_ne!(read_sha256(&mut tpm, 7).1, vec![0; 32]);
+}
+
+#[test]
+fn pcr_allocate_takes_effect_at_the_next_power_on() {
+    let mut tpm = started();
+    let mut p = Writer::new();
+    // SHA-1: nothing; SHA-256: PCR 0 and 17 only.
+    p.u32(2).u16(alg::TPM_ALG_SHA1).u8(3).bytes(&[0; 3]);
+    p.u16(alg::TPM_ALG_SHA256).u8(3).bytes(&[1, 0, 2]);
+    let allocate = command(
+        TPM_CC_PCR_ALLOCATE,
+        &[TPM_RH_PLATFORM],
+        Some(b""),
+        &p.into_bytes(),
+    );
+    let r = tpm.process(&allocate);
+    assert_eq!(rc(&r), 0);
+    // allocationSuccess, maxPCR, sizeNeeded (2 SHA-256 + 24 SHA-384 + 24 SHA-512), sizeAvailable.
+    assert_eq!(r[14], 1);
+    assert_eq!(u32::from_be_bytes(r[15..19].try_into().unwrap()), 24);
+    assert_eq!(
+        u32::from_be_bytes(r[19..23].try_into().unwrap()),
+        2 * 32 + 24 * 112
+    );
+    // Still the old allocation, and no saved state until a TPM Reset.
+    assert_eq!(read_sha256(&mut tpm, 7).1, vec![0; 32]);
+    let state = command(TPM_CC_SHUTDOWN, &[], None, &[0, 1]);
+    assert_eq!(rc(&tpm.process(&state)), Rc::TYPE.param(1).0);
+    let mut tpm = power_cycle(&tpm, 0);
+    let mut p = Writer::new();
+    p.u32(1).u16(alg::TPM_ALG_SHA256).u8(3).bytes(&[0x81, 0, 2]);
+    let r = tpm.process(&command(TPM_CC_PCR_READ, &[], None, &p.into_bytes()));
+    // The selection comes back trimmed to the allocated PCRs.
+    assert_eq!(r[20..24], [3, 1, 0, 2]);
+
+    // Without PCR 0 or 17 in some bank, it is refused.
+    let mut p = Writer::new();
+    p.u32(4);
+    for hash in alg::Hash::ALL {
+        p.u16(hash.id()).u8(3).bytes(&[0, 0, 2]);
+    }
+    let refused = command(
+        TPM_CC_PCR_ALLOCATE,
+        &[TPM_RH_PLATFORM],
+        Some(b""),
+        &p.into_bytes(),
+    );
+    assert_eq!(rc(&tpm.process(&refused)), Rc::PCR.0);
+}
+
+fn tpm2b(data: &[u8]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.tpm2b(data);
+    w.into_bytes()
+}
+
+#[test]
+fn hash_tickets_are_hmacs_with_the_hierarchy_proof() {
+    let mut tpm = started();
+    let mut p = Writer::new();
+    p.tpm2b(b"abc")
+        .u16(alg::TPM_ALG_SHA256)
+        .u32(TPM_RH_ENDORSEMENT);
+    let r = tpm.process(&command(TPM_CC_HASH, &[], None, &p.into_bytes()));
+    assert_eq!(rc(&r), 0);
+    let digest = alg::Hash::Sha256.digest(&[b"abc"]);
+    assert_eq!(r[10..12], [0, 32]);
+    assert_eq!(r[12..44], digest[..]);
+    // TPMT_TK_HASHCHECK: tag, hierarchy, HMAC-SHA512(ehProof, tag ‖ hashAlg ‖ digest).
+    assert_eq!(r[44..50], [0x80, 0x24, 0x40, 0, 0, 0x0b]);
+    let proof = tpm.permanent.hierarchies.eh_proof.as_slice();
+    let ticket = crypt::hmac(
+        alg::Hash::Sha512,
+        proof,
+        &[&[0x80, 0x24], &[0, 0x0b], &digest],
+    );
+    assert_eq!(r[50..52], [0, 64]);
+    assert_eq!(r[52..], ticket[..]);
+
+    // No ticket for data that starts like a structure the TPM signs.
+    let mut p = Writer::new();
+    p.tpm2b(b"\xffTCG...")
+        .u16(alg::TPM_ALG_SHA256)
+        .u32(TPM_RH_OWNER);
+    let r = tpm.process(&command(TPM_CC_HASH, &[], None, &p.into_bytes()));
+    assert_eq!(r[44..], [0x80, 0x24, 0x40, 0, 0, 7, 0, 0]);
+}
+
+#[test]
+fn a_sequence_survives_a_snapshot_and_is_flushed_when_complete() {
+    let mut tpm = started();
+    let r = tpm.process(&command(
+        TPM_CC_HASH_SEQUENCE_START,
+        &[],
+        None,
+        &[0, 2, b'p', b'w', 0, 0x0c],
+    ));
+    assert_eq!(rc(&r), 0);
+    assert_eq!(r[10..14], [0x80, 0, 0, 0]);
+    let update = command(
+        TPM_CC_SEQUENCE_UPDATE,
+        &[0x8000_0000],
+        Some(b"pw"),
+        &tpm2b(&[1; 1000]),
+    );
+    assert_eq!(rc(&tpm.process(&update)), 0);
+    let wrong = command(
+        TPM_CC_SEQUENCE_UPDATE,
+        &[0x8000_0000],
+        Some(b"pv"),
+        &tpm2b(b""),
+    );
+    assert_eq!(
+        rc(&tpm.process(&wrong)),
+        Rc::BAD_AUTH.session(1).0,
+        "sequences are noDA"
+    );
+
+    let mut restored = Tpm::restore(&tpm.permanent_state(), &tpm.volatile_state()).unwrap();
+    let mut p = Writer::new();
+    p.tpm2b(b"end").u32(TPM_RH_NULL);
+    let complete = command(
+        TPM_CC_SEQUENCE_COMPLETE,
+        &[0x8000_0000],
+        Some(b"pw"),
+        &p.into_bytes(),
+    );
+    let r = restored.process(&complete);
+    assert_eq!(rc(&r), 0);
+    let digest = alg::Hash::Sha384.digest(&[&[1; 1000], b"end"]);
+    assert_eq!(r[14..16], [0, 48]);
+    assert_eq!(r[16..64], digest[..]);
+    assert!(restored.loaded_objects().is_empty());
+    assert_eq!(rc(&restored.process(&complete)), Rc::REFERENCE_H0.0);
+}
+
+#[test]
+fn objects_take_the_free_slots() {
+    let mut tpm = started();
+    let start = command(TPM_CC_HASH_SEQUENCE_START, &[], None, &[0, 0, 0, 0x10]);
+    for _ in 0..3 {
+        assert_eq!(rc(&tpm.process(&start)), 0);
+    }
+    assert_eq!(rc(&tpm.process(&start)), Rc::OBJECT_MEMORY.0);
+    let flush = command(TPM_CC_FLUSH_CONTEXT, &[], None, &[0x80, 0, 0, 1]);
+    assert_eq!(rc(&tpm.process(&flush)), 0);
+    assert_eq!(rc(&tpm.process(&flush)), Rc::HANDLE.param(1).0);
+    let r = tpm.process(&start);
+    assert_eq!(r[10..14], [0x80, 0, 0, 1]);
+    let session = command(TPM_CC_FLUSH_CONTEXT, &[], None, &[2, 0, 0, 0]);
+    assert_eq!(rc(&tpm.process(&session)), Rc::HANDLE.param(1).0);
+    let bad = command(TPM_CC_FLUSH_CONTEXT, &[], None, &[0x80, 0, 0, 3]);
+    assert_eq!(rc(&tpm.process(&bad)), Rc::VALUE.param(1).0);
+}
+
+#[test]
+fn failures_heal_one_per_recovery_time() {
+    let mut tpm = started();
+    tpm.permanent.dictionary_attack.failed_tries = 3;
+    assert_eq!(property(&mut tpm, TPM_PT_PERMANENT), 1 << 10 | 1 << 9);
+    // recoveryTime is 1000 s by default.
+    tpm.clock.advance(999_000);
+    assert_eq!(property(&mut tpm, TPM_PT_PERMANENT), 1 << 10 | 1 << 9);
+    tpm.clock.advance(1_001_000);
+    assert_eq!(property(&mut tpm, TPM_PT_PERMANENT), 1 << 10);
+    assert_eq!(tpm.permanent.dictionary_attack.failed_tries, 1);
+}
+
+#[test]
+fn the_heal_timer_counts_across_an_orderly_power_cycle_only() {
+    let shut_down_after_600s = |orderly: bool| {
+        let mut tpm = started();
+        tpm.permanent.dictionary_attack.failed_tries = 1;
+        tpm.clock.advance(600_000);
+        if orderly {
+            tpm.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 0]));
+        }
+        let mut next = power_cycle(&tpm, 0);
+        next.clock.advance(400_000);
+        property(&mut next, TPM_PT_PERMANENT);
+        next.permanent.dictionary_attack.failed_tries
+    };
+    assert_eq!(shut_down_after_600s(true), 0, "600 s before, 400 s after");
+    assert_eq!(shut_down_after_600s(false), 1, "only the 400 s after");
+}
+
+#[test]
+fn power_lost_after_a_da_protected_use_counts_a_failure() {
+    let mut tpm = started();
+    // No entity is DA-protected but lockout yet, whose use is not marked: mark one directly.
+    assert_eq!(tpm.check_locked_out(false), Ok(()), "no TPM_RC_RETRY");
+    assert_eq!(tpm.permanent.shutdown, Shutdown::DaUsed);
+    let lost = power_cycle(&tpm, 0);
+    assert_eq!(lost.permanent.dictionary_attack.failed_tries, 1);
+    assert_eq!(lost.permanent.shutdown, Shutdown::None, "counted once");
+
+    tpm.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 0]));
+    let orderly = power_cycle(&tpm, 0);
+    assert_eq!(orderly.permanent.dictionary_attack.failed_tries, 0);
+}
+
+#[test]
+fn change_eps_and_pps_replace_the_seed_and_proof() {
+    let mut tpm = started();
+    tpm.process(&change_auth(TPM_RH_ENDORSEMENT, b"", b"e"));
+    let (eps, eh_proof) = (*tpm.permanent.eps, *tpm.permanent.hierarchies.eh_proof);
+    let (pps, ph_proof) = (*tpm.permanent.pps, *tpm.permanent.hierarchies.ph_proof);
+    let change = |code| command(code, &[TPM_RH_PLATFORM], Some(b""), &[]);
+    assert_eq!(rc(&tpm.process(&change(TPM_CC_CHANGE_EPS))), 0);
+    assert_ne!(*tpm.permanent.eps, eps);
+    assert_ne!(*tpm.permanent.hierarchies.eh_proof, eh_proof);
+    assert_eq!(*tpm.permanent.pps, pps);
+    assert_eq!(
+        rc(&tpm.process(&change_auth(TPM_RH_ENDORSEMENT, b"", b""))),
+        0,
+        "the endorsement authValue is gone"
+    );
+    assert_eq!(rc(&tpm.process(&change(TPM_CC_CHANGE_PPS))), 0);
+    assert_ne!(*tpm.permanent.pps, pps);
+    assert_ne!(*tpm.permanent.hierarchies.ph_proof, ph_proof);
+}
+
+#[test]
+fn an_event_sequence_digests_with_every_bank_and_extends() {
+    let mut tpm = started();
+    let mut start = |hash: u16| {
+        let mut p = Writer::new();
+        p.tpm2b(b"").u16(hash);
+        let r = tpm.process(&command(
+            TPM_CC_HASH_SEQUENCE_START,
+            &[],
+            None,
+            &p.into_bytes(),
+        ));
+        assert_eq!(rc(&r), 0);
+        u32::from_be_bytes(r[10..14].try_into().unwrap())
+    };
+    let event = start(alg::TPM_ALG_NULL);
+    let hash = start(alg::TPM_ALG_SHA256);
+    let event_complete = |pcr: u32, sequence: u32| {
+        command_with(
+            TPM_CC_EVENT_SEQUENCE_COMPLETE,
+            &[pcr, sequence],
+            &[b"", b""],
+            &tpm2b(b"abc"),
+        )
+    };
+    let mut p = Writer::new();
+    p.tpm2b(b"").u32(TPM_RH_NULL);
+    let complete = command(
+        TPM_CC_SEQUENCE_COMPLETE,
+        &[event],
+        Some(b""),
+        &p.into_bytes(),
+    );
+    assert_eq!(rc(&tpm.process(&complete)), Rc::MODE.handle(1).0);
+    let r = tpm.process(&event_complete(5, hash));
+    assert_eq!(rc(&r), Rc::MODE.handle(2).0);
+
+    let r = tpm.process(&event_complete(5, event));
+    assert_eq!(rc(&r), 0);
+    let mut p = Reader::new(&r[14..]);
+    assert_eq!(p.u32(), Ok(4));
+    for hash in alg::Hash::ALL {
+        assert_eq!(p.u16(), Ok(hash.id()));
+        assert_eq!(p.bytes(hash.size()).unwrap(), hash.digest(&[b"abc"]));
+    }
+    let digest = alg::Hash::Sha256.digest(&[b"abc"]);
+    assert_eq!(
+        read_sha256(&mut tpm, 5).1,
+        alg::Hash::Sha256.digest(&[&[0; 32], &digest])
+    );
+    assert_eq!(
+        tpm.loaded_objects(),
+        [hash],
+        "the event sequence is flushed"
+    );
+}
+
+#[test]
+fn a_hash_sequence_starting_like_a_signed_structure_gets_no_ticket() {
+    let mut tpm = started();
+    let sequence_ticket = |tpm: &mut Tpm, first: &[u8]| {
+        let start = command(TPM_CC_HASH_SEQUENCE_START, &[], None, &[0, 0, 0, 0x0b]);
+        let r = tpm.process(&start);
+        let handle = u32::from_be_bytes(r[10..14].try_into().unwrap());
+        let update = command(TPM_CC_SEQUENCE_UPDATE, &[handle], Some(b""), &tpm2b(first));
+        assert_eq!(rc(&tpm.process(&update)), 0);
+        let mut p = Writer::new();
+        p.tpm2b(b"rest").u32(TPM_RH_OWNER);
+        let complete = command(
+            TPM_CC_SEQUENCE_COMPLETE,
+            &[handle],
+            Some(b""),
+            &p.into_bytes(),
+        );
+        let r = tpm.process(&complete);
+        assert_eq!(rc(&r), 0);
+        // parameterSize, the digest (2 + 32), then the ticket's tag and hierarchy.
+        u32::from_be_bytes(r[50..54].try_into().unwrap())
+    };
+    assert_eq!(sequence_ticket(&mut tpm, b"\xffTCG"), TPM_RH_NULL);
+    assert_eq!(
+        sequence_ticket(&mut tpm, b"\xffTC"),
+        TPM_RH_NULL,
+        "too short to tell"
+    );
+    assert_eq!(sequence_ticket(&mut tpm, b"data"), TPM_RH_OWNER);
 }

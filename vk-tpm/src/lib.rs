@@ -21,15 +21,22 @@
 mod alg;
 mod capability;
 mod commands;
+mod crypt;
+mod entity;
+mod hierarchy;
 mod marshal;
+mod object;
 mod pcr;
 mod rc;
+mod session;
 mod state;
+
+use std::time::Instant;
 
 use marshal::{Reader, Writer};
 pub use rc::Rc;
 pub use state::StateError;
-use state::{Permanent, Volatile};
+use state::{Permanent, Shutdown, Volatile};
 use zeroize::Zeroizing;
 
 /// The largest command (and response) the TPM takes: the buffer of libkrun's CRB device
@@ -46,6 +53,7 @@ const LOCALITY: u8 = 0;
 pub struct Tpm {
     permanent: Permanent,
     volatile: Volatile,
+    clock: Clock,
     /// The permanent state changed since [`Tpm::take_permanent_changed`] last said so.
     permanent_changed: bool,
 }
@@ -53,9 +61,11 @@ pub struct Tpm {
 impl Tpm {
     /// A newly manufactured TPM (fresh seeds), powered on. Its permanent state is new: store it.
     pub fn manufacture() -> Result<Tpm, StateError> {
+        let permanent = Permanent::manufacture()?;
         Ok(Tpm {
-            permanent: Permanent::manufacture()?,
-            volatile: Volatile::power_on(),
+            volatile: Volatile::power_on(&permanent),
+            permanent,
+            clock: Clock::starting_at(0),
             permanent_changed: true,
         })
     }
@@ -63,19 +73,23 @@ impl Tpm {
     /// The TPM whose permanent state is `permanent` (as [`Tpm::permanent_state`] returned it),
     /// powered on: it waits for TPM2_Startup.
     pub fn power_on(permanent: &[u8]) -> Result<Tpm, StateError> {
+        let permanent = Permanent::deserialize(permanent)?;
         Ok(Tpm {
-            permanent: Permanent::deserialize(permanent)?,
-            volatile: Volatile::power_on(),
+            volatile: Volatile::power_on(&permanent),
+            permanent,
+            clock: Clock::starting_at(0),
             permanent_changed: false,
         })
     }
 
     /// The TPM as a snapshot saved it: both states, as [`Tpm::permanent_state`] and
-    /// [`Tpm::volatile_state`] returned them.
+    /// [`Tpm::volatile_state`] returned them. Its time goes on from the snapshot's.
     pub fn restore(permanent: &[u8], volatile: &[u8]) -> Result<Tpm, StateError> {
+        let volatile = Volatile::deserialize(volatile)?;
         Ok(Tpm {
             permanent: Permanent::deserialize(permanent)?,
-            volatile: Volatile::deserialize(volatile)?,
+            clock: Clock::starting_at(volatile.time),
+            volatile,
             permanent_changed: false,
         })
     }
@@ -85,9 +99,10 @@ impl Tpm {
         Zeroizing::new(self.permanent.serialize())
     }
 
-    /// What a snapshot must add to the permanent state to bring the running TPM back.
-    pub fn volatile_state(&self) -> Vec<u8> {
-        self.volatile.serialize()
+    /// Snapshot state needed alongside permanent state to restore the running TPM. Store it as
+    /// a secret: it holds the platform's and sequences' authValues.
+    pub fn volatile_state(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(self.volatile.serialize())
     }
 
     /// Whether the permanent state changed since the last call: the caller then stores
@@ -99,11 +114,18 @@ impl Tpm {
     /// Run one command and return its response, at most [`MAX_COMMAND_SIZE`] bytes. A command
     /// that fails gets the 10-byte error response the specification gives.
     pub fn process(&mut self, command: &[u8]) -> Vec<u8> {
-        self.execute(command).unwrap_or_else(|rc| {
+        // Detect every permanent-state change, including failed authorization, so the caller
+        // stores it before the guest sees the response.
+        let before = self.permanent_state();
+        let response = self.execute(command).unwrap_or_else(|rc| {
             let mut w = Writer::new();
             w.u16(TPM_ST_NO_SESSIONS).u32(HEADER_SIZE as u32).u32(rc.0);
             w.into_bytes()
-        })
+        });
+        if *self.permanent_state() != *before {
+            self.permanent_changed = true;
+        }
+        response
     }
 
     fn execute(&mut self, command: &[u8]) -> rc::Result<Vec<u8>> {
@@ -127,6 +149,10 @@ impl Tpm {
         if (code == commands::TPM_CC_STARTUP) != expects_startup {
             return Err(Rc::INITIALIZE);
         }
+        if self.volatile.started {
+            self.update_time();
+            self.da_self_heal();
+        }
 
         let mut handles = Vec::with_capacity(cmd.handles.len());
         for (n, kind) in (1..).zip(cmd.handles) {
@@ -134,6 +160,7 @@ impl Tpm {
             kind.check(handle).map_err(|rc| rc.handle(n))?;
             handles.push(handle);
         }
+        self.check_loaded(&handles)?;
 
         let sessions = if tag == TPM_ST_SESSIONS {
             let auth_size = usize::try_from(r.u32()?).map_err(|_| Rc::SIZE)?;
@@ -144,7 +171,9 @@ impl Tpm {
             if !cmd.sessions {
                 return Err(Rc::AUTH_CONTEXT);
             }
-            authorize(cmd, &handles, area)?
+            let mut sessions = session::read_area(area)?;
+            self.authorize(cmd, &handles, &mut sessions)?;
+            sessions
         } else {
             if cmd.auth > 0 {
                 return Err(Rc::AUTH_MISSING);
@@ -152,19 +181,23 @@ impl Tpm {
             Vec::new()
         };
 
-        let mut out = Writer::new();
+        let mut out = Out::default();
         (cmd.run)(self, &handles, &mut r, &mut out)?;
 
-        let params = out.into_bytes();
+        let params = std::mem::take(&mut out.params).into_bytes();
         let mut w = Writer::new();
         w.u16(tag).u32(0).u32(Rc::SUCCESS.0);
+        if let Some(handle) = out.handle {
+            w.u32(handle);
+        }
         if tag == TPM_ST_SESSIONS {
             w.count(params.len());
         }
         w.bytes(&params);
-        for attributes in sessions {
-            // A password session answers with an empty nonce and HMAC, and stays open.
-            w.u16(0).u8(attributes | CONTINUE_SESSION).u16(0);
+        session::write_response_area(&mut w, &sessions);
+        // A sequence that completed goes only now: the response's authorizations needed it.
+        if let Some(handle) = out.flush {
+            self.flush_object(handle);
         }
         let mut response = w.into_bytes();
         let len = u32::try_from(response.len()).map_err(|_| Rc::FAILURE)?;
@@ -177,8 +210,70 @@ impl Tpm {
         Ok(response)
     }
 
-    fn mark_permanent_changed(&mut self) {
-        self.permanent_changed = true;
+    /// Bring TPM time up to now (TimeUpdate).
+    fn update_time(&mut self) {
+        self.volatile.time = self.clock.now().max(self.volatile.time);
+    }
+
+    /// Void an orderly shutdown recorded since Startup (g_clearOrderly): a command changed what
+    /// TPM2_Shutdown saved, so the next Startup may not resume from it.
+    fn clear_orderly(&mut self) {
+        if self.permanent.shutdown.is_orderly() {
+            self.permanent.shutdown = if self.volatile.da_used {
+                Shutdown::DaUsed
+            } else {
+                Shutdown::None
+            };
+        }
+    }
+}
+
+/// What a command answers: the handle it created, if it returns one, and its parameters.
+#[derive(Default)]
+pub struct Out {
+    pub handle: Option<u32>,
+    pub params: Writer,
+    /// An object to flush once the response is built (a completed sequence).
+    pub flush: Option<u32>,
+}
+
+impl std::ops::Deref for Out {
+    type Target = Writer;
+    fn deref(&self) -> &Writer {
+        &self.params
+    }
+}
+
+impl std::ops::DerefMut for Out {
+    fn deref_mut(&mut self) -> &mut Writer {
+        &mut self.params
+    }
+}
+
+/// The TPM's time source: milliseconds since power on (or since the snapshot's time), from the
+/// host's monotonic clock.
+struct Clock {
+    origin: Instant,
+    base: u64,
+}
+
+impl Clock {
+    fn starting_at(base: u64) -> Clock {
+        Clock {
+            origin: Instant::now(),
+            base,
+        }
+    }
+
+    fn now(&self) -> u64 {
+        let elapsed = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.base.saturating_add(elapsed)
+    }
+
+    /// Tests: let `ms` pass at once.
+    #[cfg(test)]
+    fn advance(&mut self, ms: u64) {
+        self.base = self.base.saturating_add(ms);
     }
 }
 
@@ -186,91 +281,6 @@ impl Tpm {
 /// one with an unknown tag TPM_RC_VALUE (as libtpms answers).
 fn is_structure_tag(tag: u16) -> bool {
     matches!(tag, 0x00c4 | 0x8000..=0x8002 | 0x8014..=0x801a | 0x8021..=0x8025)
-}
-
-/// TPM_RS_PW: the password session, which authorizes with the entity's authValue in clear.
-const TPM_RS_PW: u32 = 0x4000_0009;
-const HMAC_SESSIONS: std::ops::RangeInclusive<u32> = 0x0200_0000..=0x0200_003f;
-const POLICY_SESSIONS: std::ops::RangeInclusive<u32> = 0x0300_0000..=0x0300_003f;
-const MAX_SESSIONS: usize = 3;
-/// The largest nonce or HMAC/password a session carries (sizeof(TPMU_HA)).
-const MAX_AUTH: usize = alg::MAX_DIGEST;
-
-// TPMA_SESSION bits.
-const CONTINUE_SESSION: u8 = 0x01;
-const AUDIT_EXCLUSIVE: u8 = 0x02;
-const AUDIT_RESET: u8 = 0x04;
-const RESERVED: u8 = 0x18;
-const DECRYPT: u8 = 0x20;
-const ENCRYPT: u8 = 0x40;
-const AUDIT: u8 = 0x80;
-
-/// Check the authorization area against the handles that need it; return each session's
-/// attributes for the response. Only password sessions exist: other session handles are not loaded.
-fn authorize(cmd: &commands::Command, handles: &[u32], mut area: Reader) -> rc::Result<Vec<u8>> {
-    let mut sessions: Vec<(u32, u8, &[u8])> = Vec::new();
-    let mut n: u32 = 0;
-    while !area.is_empty() {
-        n = n.saturating_add(1);
-        if sessions.len() == MAX_SESSIONS {
-            return Err(Rc::SIZE.session(n));
-        }
-        let handle = area.u32().map_err(|rc| rc.session(n))?;
-        if handle != TPM_RS_PW
-            && !HMAC_SESSIONS.contains(&handle)
-            && !POLICY_SESSIONS.contains(&handle)
-        {
-            return Err(Rc::VALUE.session(n));
-        }
-        let nonce = area.tpm2b(MAX_AUTH).map_err(|rc| rc.session(n))?;
-        let attributes = area.u8().map_err(|rc| rc.session(n))?;
-        if attributes & RESERVED != 0 {
-            return Err(Rc::RESERVED_BITS.session(n));
-        }
-        let password = area.tpm2b(MAX_AUTH).map_err(|rc| rc.session(n))?;
-        if handle != TPM_RS_PW {
-            return Err(Rc(Rc::REFERENCE_S0.0.saturating_add(n.saturating_sub(1))));
-        }
-        if attributes & (ENCRYPT | DECRYPT | AUDIT | AUDIT_EXCLUSIVE | AUDIT_RESET) != 0 {
-            return Err(Rc::ATTRIBUTES.session(n));
-        }
-        if !nonce.is_empty() {
-            return Err(Rc::NONCE.session(n));
-        }
-        sessions.push((handle, attributes, password));
-    }
-    if cmd.auth > sessions.len() {
-        return Err(Rc::AUTH_MISSING);
-    }
-    for (n, (i, (_, _, password))) in (1..).zip(sessions.iter().enumerate()) {
-        // Session i authorizes handle i; a password session must have one to authorize.
-        let Some(&handle) = handles.get(i).filter(|_| i < cmd.auth) else {
-            return Err(Rc::HANDLE.session(n));
-        };
-        if !password_matches(password, &auth_value(handle)) {
-            // PCRs are exempt from dictionary-attack protection: a plain TPM_RC_BAD_AUTH.
-            return Err(Rc::BAD_AUTH.session(n));
-        }
-    }
-    Ok(sessions.into_iter().map(|(_, a, _)| a).collect())
-}
-
-/// The authValue of the entity `handle` names. Only PCRs (and TPM_RH_NULL) can be authorized
-/// so far, and their authValue is empty.
-fn auth_value(_handle: u32) -> Zeroizing<Vec<u8>> {
-    Zeroizing::new(Vec::new())
-}
-
-/// Compare the password with authValue in constant time after dropping the password's trailing
-/// zeros (Part 1, "password authorizations").
-fn password_matches(password: &[u8], auth_value: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    let end = password
-        .iter()
-        .rposition(|&b| b != 0)
-        .map_or(0, |i| i.saturating_add(1));
-    let password = password.get(..end).unwrap_or_default();
-    password.ct_eq(auth_value).into()
 }
 
 #[cfg(test)]
