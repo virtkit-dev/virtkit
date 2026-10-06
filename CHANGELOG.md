@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk tune` can edit a runner config you own.** A gitlab-runner that runs as your own user
+  no longer needs `vk-runnerctl`: name its config as `[node] runner_config` and `vk tune` sets
+  `concurrent` there itself, touching nothing else in the file.
+
 ## [0.84.0] - 2026-10-05
 
 ### Changed

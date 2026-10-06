@@ -259,8 +259,8 @@ pub enum NumaMode {
     Interleave,
 }
 
-/// `[node]` — what `vk node` tells a fleet hub about this host that it cannot measure. Read
-/// by `vk node` only.
+/// `[node]` — what `vk node` tells a fleet hub about this host that it cannot measure, and
+/// the runner config `vk` edits directly (`runner_config`, read by `vk tune` too).
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Node {
@@ -274,6 +274,9 @@ pub struct Node {
     /// every process of every VM, which on a large VMM takes a while. New VMs are measured
     /// when they appear; heartbeats in between repeat the last figures. Unset: 30.
     pub workload_mem_secs: Option<u64>,
+    /// A gitlab-runner config this user owns, whose `concurrent` `vk` sets directly rather
+    /// than leaving the number for `vk-runnerctl`. Unset: the runner is root's.
+    pub runner_config: Option<PathBuf>,
 }
 
 impl Node {

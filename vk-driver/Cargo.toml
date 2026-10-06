@@ -24,6 +24,9 @@ vk-fs = { path = "../vk-fs" }
 vk-registry = { path = "../vk-registry" }
 # `vk update`: the release-install path, shared with the vk-registry binary.
 vk-selfupdate = { path = "../vk-selfupdate" }
+# Share the root-side `concurrent` editor and its check that nothing else changed
+# when editing a runner config this user owns.
+vk-runnerctl = { path = "../vk-runnerctl" }
 futures.workspace = true
 libc.workspace = true
 serde.workspace = true

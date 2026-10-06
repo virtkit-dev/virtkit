@@ -1,5 +1,6 @@
 //! Keeping gitlab-runner's appetite in step with the host: works out how many jobs this
-//! runner should be accepting and leaves that number where `vk-runnerctl` can apply it.
+//! runner should be accepting and leaves that number where `vk-runnerctl` can apply it, or
+//! sets it in a runner config this user owns.
 //!
 //! This is the one place the number is decided: `effective = min(estimate, hub ceiling,
 //! ceiling)` ([`decide`]).
@@ -17,7 +18,7 @@
 //! a crude control law the right one.
 
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -151,13 +152,24 @@ fn held_below(want: u32, previous: Option<u32>, may_rise: bool) -> u32 {
     }
 }
 
-/// Put `decision` where the runner picks it up: the desired-concurrency file `vk-runnerctl`
-/// reads.
+/// Write `decision` to the desired-concurrency file: it records this host's request and
+/// feeds `vk-runnerctl` for a root-managed runner. Also set `concurrent` directly when
+/// [`runner_config`] names a config this user owns.
 pub(crate) fn apply(cfg: &Config, decision: &Decision) -> Result<()> {
-    match decision.effective {
-        Some(want) => write_desired(cfg, want),
-        None => Ok(()),
+    let Some(want) = decision.effective else {
+        return Ok(());
+    };
+    write_desired(cfg, want)?;
+    if let Some(path) = runner_config(cfg) {
+        set_runner_concurrent(&path, want)?;
     }
+    Ok(())
+}
+
+/// The gitlab-runner config this user owns and `vk` edits directly, if any: `[node]
+/// runner_config`. Unset, the runner is root's, reached through `vk-runnerctl`.
+pub fn runner_config(cfg: &Config) -> Option<PathBuf> {
+    cfg.node.runner_config.clone()
 }
 
 /// Measure the host and write what the runner's concurrency should be. Meant to run every
@@ -239,6 +251,190 @@ fn write_desired(cfg: &Config, want: u32) -> Result<()> {
         .with_context(|| format!("writing {}", tmp.display()))?;
     drop(file);
     std::fs::rename(&tmp, &path).with_context(|| format!("installing {}", path.display()))
+}
+
+/// Set `concurrent` in the gitlab-runner config at `path`, which this user must own, with
+/// `vk-runnerctl`'s editor: the one line rewritten, and the result proven to differ from the
+/// original at that key alone before it replaces it. gitlab-runner notices the change itself.
+/// Returns whether the file changed: a file that already says `value` is not rewritten, and
+/// one another edit holds locked is left to it.
+///
+/// gitlab-runner saves this file itself too — rewriting it in place, `os.WriteFile`, when it
+/// rotates a runner's token — so the file is read again just before the edit replaces it:
+/// the same inode and contents it was read with, or the edit starts over from what is there
+/// now. An empty file is taken for one caught between that rewrite's truncate and its write.
+/// Every step works relative to the directory, opened once, so the name checked is the name
+/// replaced. What remains is the instant between that check and the rename.
+pub fn set_runner_concurrent(path: &Path, value: u32) -> Result<bool> {
+    set_runner_concurrent_checked(path, value, || {})
+}
+
+/// How many times an edit starts over on a config that changed under it.
+const EDIT_ATTEMPTS: u32 = 5;
+
+/// Like [`set_runner_concurrent`], with a `before_publish` callback between staging and
+/// rechecking the file so tests can simulate a concurrent write.
+fn set_runner_concurrent_checked(
+    path: &Path,
+    value: u32,
+    mut before_publish: impl FnMut(),
+) -> Result<bool> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = path
+        .file_name()
+        .with_context(|| format!("{} names no file", path.display()))?;
+    let c_name = CString::new(name.as_bytes()).context("a runner config path with a NUL")?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let dir = vk_fs::open_dir(parent.unwrap_or(Path::new(".")))?;
+    let mut staged_name = b".".to_vec();
+    staged_name.extend_from_slice(name.as_bytes());
+    staged_name.extend_from_slice(format!(".vk-{}", std::process::id()).as_bytes());
+    let staged = CString::new(staged_name).context("a runner config name with a NUL")?;
+    // SAFETY (both helpers): the directory descriptor is live, the names are NUL-terminated
+    // and outlive each call, and a descriptor a call returns is handed straight to `OwnedFd`.
+    let open_at = |cname: &CString, flags: libc::c_int, mode: libc::c_uint| {
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), cname.as_ptr(), flags, mode) };
+        if fd < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+        }
+    };
+    let unlink_staged = || unsafe { libc::unlinkat(dir.as_raw_fd(), staged.as_ptr(), 0) };
+    // Non-blocking, so a FIFO in the config's place is opened and refused rather than waited
+    // on; reading an ordinary file is unaffected.
+    let read_flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let read_config = || -> Result<(std::fs::File, std::fs::Metadata, String)> {
+        let mut file = open_at(&c_name, read_flags, 0)
+            .with_context(|| format!("opening {}", path.display()))?;
+        let meta = file
+            .metadata()
+            .with_context(|| format!("statting {}", path.display()))?;
+        if !meta.is_file() {
+            bail!(
+                "{} is not an ordinary file — refusing to replace it",
+                path.display()
+            );
+        }
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut file, &mut text)
+            .with_context(|| format!("reading {}", path.display()))?;
+        Ok((file, meta, text))
+    };
+
+    // An attempt that starts over on the same file keeps the lock it took. Retaken through a
+    // new descriptor, it could find itself still held: a fork elsewhere in this process
+    // copies the old descriptor into its child, which holds it until it execs.
+    let mut locked: Option<(std::fs::File, u64, u64)> = None;
+    for _ in 0..EDIT_ATTEMPTS {
+        let (file, meta, text) = read_config()?;
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        if meta.uid() != uid {
+            bail!(
+                "{} belongs to uid {}, not this user: a runner config vk does not own is set \
+                 through vk-runnerctl",
+                path.display(),
+                meta.uid()
+            );
+        }
+        // One edit at a time: two that both pass the recheck would each rename over the
+        // other, the last undoing the first. The edit holding the lock is the current one.
+        let held =
+            matches!(&locked, Some((_, dev, ino)) if (*dev, *ino) == (meta.dev(), meta.ino()));
+        if !held {
+            // SAFETY: the fd is owned by `file`, which outlives the call; flock returns 0 or -1.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+                    return Err(e).with_context(|| format!("locking {}", path.display()));
+                }
+                return Ok(false);
+            }
+            locked = Some((file, meta.dev(), meta.ino()));
+        }
+        if text.is_empty() {
+            // Most likely mid-rewrite: give the writer a moment to finish.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+        if vk_runnerctl::edit::current_concurrent(&text) == Some(value) {
+            return Ok(false);
+        }
+        let edited = vk_runnerctl::edit::set_concurrent(&text, value)
+            .with_context(|| format!("editing {}", path.display()))?;
+        vk_runnerctl::edit::verify(&text, &edited, value)
+            .with_context(|| format!("editing {}", path.display()))?;
+
+        // Per-process, so a leftover from a killed run can never be a live run's file, and
+        // this process's own leftover is cleared first. Created private and exclusively, then
+        // given the config's mode and group through the descriptor, before anyone can open it
+        // by name.
+        unlink_staged();
+        let mut out = open_at(
+            &staged,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+        .with_context(|| format!("staging the edit of {}", path.display()))?;
+        let written = out
+            .write_all(edited.as_bytes())
+            // Permission bits only: a config has no business carrying setuid, setgid or sticky.
+            .and_then(|()| {
+                out.set_permissions(std::fs::Permissions::from_mode(meta.mode() & 0o777))
+            })
+            .and_then(|()| out.sync_all());
+        if let Err(e) = written {
+            unlink_staged();
+            return Err(e).with_context(|| format!("staging the edit of {}", path.display()));
+        }
+        // A new file takes this process's group, not the config's.
+        // SAFETY: the fd is owned by `out`, which outlives the call; fchown returns 0 or -1.
+        if unsafe { libc::fchown(out.as_raw_fd(), libc::uid_t::MAX, meta.gid()) } != 0 {
+            let e = std::io::Error::last_os_error();
+            unlink_staged();
+            return Err(e).with_context(|| format!("restoring the group of {}", path.display()));
+        }
+        drop(out);
+
+        before_publish();
+        let unchanged = match read_config() {
+            Ok((_, now, now_text)) => {
+                now.dev() == meta.dev() && now.ino() == meta.ino() && now_text == text
+            }
+            Err(e) => {
+                unlink_staged();
+                return Err(e);
+            }
+        };
+        if !unchanged {
+            unlink_staged();
+            continue;
+        }
+        // SAFETY: as above.
+        let rc = unsafe {
+            libc::renameat(
+                dir.as_raw_fd(),
+                staged.as_ptr(),
+                dir.as_raw_fd(),
+                c_name.as_ptr(),
+            )
+        };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            unlink_staged();
+            return Err(e).with_context(|| format!("installing {}", path.display()));
+        }
+        return Ok(true);
+    }
+    bail!(
+        "{} stayed empty or kept changing while its `concurrent` was being set; left for the \
+         next pass",
+        path.display()
+    )
 }
 
 /// What this host's `/proc/meminfo` says, in MiB.
@@ -548,6 +744,120 @@ mod tests {
             "{err}"
         );
         assert!(!desired_file(&cfg).exists(), "nothing was written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_runner_config_this_user_owns_is_edited_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let (mut cfg, dir) = scratch_cfg(
+            "edit",
+            crate::config::Schedule {
+                max_concurrency: std::num::NonZeroU32::new(4),
+                ..Default::default()
+            },
+        );
+        let path = dir.join("config.toml");
+        let original =
+            "# ops\nconcurrent = 9  # keep\n\n[[runners]]\n  name = \"a\"\n  token = \"glrt-x\"\n";
+        std::fs::write(&path, original).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        cfg.node.runner_config = Some(path.clone());
+        apply(&cfg, &decide(&cfg, None).unwrap()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, original.replace("concurrent = 9", "concurrent = 4"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(std::fs::read_to_string(desired_file(&cfg)).unwrap(), "4\n");
+        // Nothing to change is not a rewrite.
+        assert!(!set_runner_concurrent(&path, 4).unwrap());
+        // A link in the config's place is not followed.
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(set_runner_concurrent(&link, 5).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gitlab-runner rewrites its config in place when it saves a rotated token. One that
+    /// does so between the edit's read and its rename is not overwritten: the edit starts
+    /// again from what is there.
+    #[test]
+    fn a_config_rewritten_during_the_edit_is_edited_afresh() {
+        let dir = std::env::temp_dir().join(format!("vk-tune-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "concurrent = 9\n\n[[runners]]\n  token = \"old\"\n").unwrap();
+        let mut rewrites = 0;
+        let changed = set_runner_concurrent_checked(&path, 3, || {
+            if rewrites == 0 {
+                // In place, as `os.WriteFile` does: same inode, new contents.
+                std::fs::write(
+                    &path,
+                    "concurrent = 9\n\n[[runners]]\n  token = \"rotated\"\n",
+                )
+                .unwrap();
+            }
+            rewrites += 1;
+        })
+        .unwrap();
+        assert!(changed);
+        assert_eq!(rewrites, 2);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "concurrent = 3\n\n[[runners]]\n  token = \"rotated\"\n"
+        );
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, ["config.toml"].map(std::ffi::OsString::from));
+        // One that never stops changing is left alone, with nothing staged left behind.
+        let err = set_runner_concurrent_checked(&path, 5, || {
+            std::fs::write(&path, format!("concurrent = 3\n# {}\n", next_suffix())).unwrap();
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("kept changing"), "{err:#}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        // An empty file is one caught mid-rewrite, never edited. A new file, as the lock the
+        // last edit took on this one may live on in a concurrent test's forked child.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "").unwrap();
+        let err = set_runner_concurrent(&path, 5).unwrap_err();
+        assert!(format!("{err:#}").contains("stayed empty"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A different number each call, so each rewrite changes the file.
+    fn next_suffix() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// A FIFO or a directory in the config's place is refused, not waited on or replaced.
+    #[test]
+    fn a_runner_config_that_is_not_an_ordinary_file_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("vk-tune-odd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("fifo.toml");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let sub = dir.join("dir.toml");
+        std::fs::create_dir(&sub).unwrap();
+        for path in [&fifo, &sub] {
+            let err = set_runner_concurrent(path, 3).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("not an ordinary file"),
+                "{err:#}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1089,6 +1089,11 @@ ceiling. It is the runner user's own cap on what it asks for; `vk-runnerctl`'s `
 `max` are the administrator's range and still clamp the result. While the ceiling binds, the
 reported estimate is at most one above it: it climbs from the number last written.
 
+A runner that runs as the same user as `vk`, with its own `~/.gitlab-runner/config.toml`, needs
+no `vk-runnerctl`: name the file as `[node] runner_config` and `vk tune` sets its `concurrent`
+itself, with the same one-line edit and the same proof that nothing else changed. It refuses a
+file another user owns.
+
 Getting the number wrong is cheap on purpose. It decides what the runner *accepts*, never
 what is committed: too high and the extra jobs queue at the admission gate exactly as
 before, too low and the host idles until the next run. The gate is the guarantee; this is
