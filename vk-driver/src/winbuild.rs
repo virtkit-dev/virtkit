@@ -50,6 +50,10 @@ const LAYER_RECORD: &str = "layer.json";
 /// The version of the [`LAYER_RECORD`] format this build writes and reads.
 const LAYER_RECORD_VERSION: u64 = 1;
 
+/// The [`crate::wineval::Evaluation`] a step that asked Windows found, in the step's layer
+/// directory.
+const EVALUATION: &str = "evaluation.json";
+
 /// Whether `text` is a Dockerfile for Windows: one of its stages installs from `winiso:`,
 /// names the Windows platform, or starts from a bundle a Windows build wrote (relative to
 /// `context`).
@@ -77,6 +81,8 @@ pub(crate) struct Options {
     pub mem: String,
     /// `--build-net none`: refuse `RUN --network=default`.
     pub no_network: bool,
+    /// `--reinstall`: install each `winiso:` stage again, under new cache keys.
+    pub reinstall: bool,
 }
 
 /// A stage as it builds: its current layer and what its later `RUN`s inherit. A bundle
@@ -193,10 +199,22 @@ pub(crate) fn build(opts: &Options) -> Result<()> {
         .with_context(|| format!("{}", opts.dockerfile.display()))?;
     let cache = crate::run::default_data_base()?.join("windows");
     let started = Instant::now();
-    let mut built: HashMap<usize, Layer> = HashMap::new();
-    let layer = build_stage(&stages, target, opts, &cache, &mut built)?;
+    let mut build = Build {
+        opts,
+        cache: &cache,
+        built: HashMap::new(),
+        reinstalled: Vec::new(),
+    };
+    let layer = build_stage(&mut build, &stages, target, true)?;
+    if opts.reinstall && build.reinstalled.is_empty() {
+        eprintln!(
+            "virtkit: warning: --reinstall: the target builds on no `FROM winiso:` stage; \
+             nothing was installed again"
+        );
+    }
     let (cpus, mem) = guest_size(&stages[target], opts);
-    write_bundle(&layer, cpus, &mem, &opts.out)?;
+    let evaluation = read_evaluation(&cache.join("layers").join(&layer.key));
+    write_bundle(&layer, cpus, &mem, evaluation, &opts.out)?;
     eprintln!(
         "virtkit: built {} in {}s",
         opts.out.display(),
@@ -349,16 +367,24 @@ fn wants_restart(reboot: &str, code: i32) -> Option<bool> {
     }
 }
 
-fn build_stage(
-    stages: &[Stage],
-    index: usize,
-    opts: &Options,
-    cache: &Path,
-    built: &mut HashMap<usize, Layer>,
-) -> Result<Layer> {
-    if let Some(layer) = built.get(&index) {
+/// What one `vk build` keeps across the stages it builds.
+struct Build<'a> {
+    opts: &'a Options,
+    /// The layer cache.
+    cache: &'a Path,
+    /// The stages built so far, by index.
+    built: HashMap<usize, Layer>,
+    /// The installs (medium and disk size) `--reinstall` has made again in this build.
+    reinstalled: Vec<(crate::winiso::Source, u64)>,
+}
+
+/// Build stage `index` of `stages`, and the stages it builds on, into a layer. The `target`
+/// stage's last step also asks Windows how long it keeps working (see [`crate::wineval`]).
+fn build_stage(b: &mut Build, stages: &[Stage], index: usize, target: bool) -> Result<Layer> {
+    if let Some(layer) = b.built.get(&index) {
         return Ok(layer.clone());
     }
+    let (opts, cache) = (b.opts, b.cache);
     let stage = &stages[index];
     let label = stage.label(index);
     check_stage(stage, &opts.context, opts.no_network).with_context(|| format!("stage {label}"))?;
@@ -371,7 +397,13 @@ fn build_stage(
             Some(size) => disk_size(size)?,
             None => DEFAULT_DISK,
         };
-        let base = crate::winiso::base(&source, disk, cpus, &mem, &cache.join("winiso"))?;
+        // Once per install: a second stage on the same one builds on the new install.
+        let reinstall = opts.reinstall && !b.reinstalled.contains(&(source.clone(), disk));
+        if reinstall {
+            b.reinstalled.push((source.clone(), disk));
+        }
+        let base =
+            crate::winiso::base(&source, disk, cpus, &mem, &cache.join("winiso"), reinstall)?;
         Layer {
             disk: base.disk,
             key: base.key,
@@ -390,8 +422,9 @@ fn build_stage(
         .iter()
         .position(|s| s.from.as_name.as_deref() == Some(stage.from.image.as_str()))
     {
-        build_stage(stages, parent, opts, cache, built)?
+        build_stage(b, stages, parent, false)?
     } else if layer_record(&bundle).is_some() {
+        warn_evaluation(&bundle, &format!("FROM {}", stage.from.image));
         bundle_layer(&bundle, cache).with_context(|| format!("FROM {}", stage.from.image))?
     } else {
         bail!(
@@ -405,9 +438,17 @@ fn build_stage(
         cpus,
         mem: &mem,
         cache,
+        evaluation: false,
     };
+    // A generalized image carries no clock of its own: each machine starts a new grace.
+    let generalized = stage.directive("generalize") == Some("on");
+    let last = (target && !generalized).then(|| last_step(&stage.body));
     for (n, instruction) in stage.body.iter().enumerate() {
         let what = format!("[{label} {}/{}]", n + 1, stage.body.len());
+        let steps = &Steps {
+            evaluation: last == Some(n),
+            ..steps
+        };
         match instruction {
             Instruction::Env(pairs) => {
                 for (k, v) in pairs {
@@ -421,14 +462,14 @@ fn build_stage(
                 layer.unmade_workdir = true;
             }
             Instruction::Other { name, args } if name == "SHELL" => layer.shell = shell(args)?,
-            Instruction::Run(run) => run_step(&mut layer, run, &what, &steps)?,
-            Instruction::Copy(copy) => copy_step(&mut layer, copy, &what, &opts.context, &steps)?,
+            Instruction::Run(run) => run_step(&mut layer, run, &what, steps)?,
+            Instruction::Copy(copy) => copy_step(&mut layer, copy, &what, &opts.context, steps)?,
             Instruction::Cmd(cmd) => layer.provision = provision(&layer.shell, cmd),
             // Recorded by the image's run config in a later step; nothing to build.
             _ => {}
         }
     }
-    if stage.directive("generalize") == Some("on") {
+    if generalized {
         // Its step also makes the stage's last ENV and WORKDIR. Generalizing an image built
         // FROM a generalized one runs sysprep again, which Windows allows a limited number of
         // times (its rearm count).
@@ -447,10 +488,49 @@ fn build_stage(
     } else if !layer.unsaved_env.is_empty() || layer.unmade_workdir {
         // As Docker keeps a stage's last ENV and WORKDIR in its image.
         eprintln!("virtkit: [{label}] saving ENV and WORKDIR");
-        step(&mut layer, "SAVE", &steps, false, |_, _, _| Ok(()))?;
+        let steps = &Steps {
+            evaluation: last == Some(stage.body.len()),
+            ..steps
+        };
+        step(&mut layer, "SAVE", steps, false, |_, _, _| Ok(()))?;
     }
-    built.insert(index, layer.clone());
+    b.built.insert(index, layer.clone());
     Ok(layer)
+}
+
+/// Which of `body`'s instructions makes a stage's last layer: its last `RUN` or `COPY`, or
+/// `body.len()` for the step saving an `ENV` or `WORKDIR` after it.
+fn last_step(body: &[Instruction]) -> usize {
+    let saved = |i: &Instruction| matches!(i, Instruction::Env(_) | Instruction::Workdir(_));
+    match body
+        .iter()
+        .rposition(|i| matches!(i, Instruction::Run(_) | Instruction::Copy(_)))
+    {
+        Some(n) if !body[n..].iter().any(saved) => n,
+        _ => body.len(),
+    }
+}
+
+/// The evaluation a step recorded in its layer directory `dir`; none if it recorded none.
+fn read_evaluation(dir: &Path) -> crate::wineval::Evaluation {
+    std::fs::read_to_string(dir.join(EVALUATION))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// The evaluation the bundle at `dir` records; none if it records none.
+fn bundle_evaluation(dir: &Path) -> crate::wineval::Evaluation {
+    layer_record(dir)
+        .and_then(|record| serde_json::from_value(record).ok())
+        .unwrap_or_default()
+}
+
+/// Warn, as `what`, when the bundle at `dir` records an evaluation past or near its end.
+pub(crate) fn warn_evaluation(dir: &Path, what: &str) {
+    if let Some(warning) = bundle_evaluation(dir).warning(crate::vms::unix_now()) {
+        eprintln!("virtkit: warning: {what}: {warning}");
+    }
 }
 
 /// The layer the bundle `dir` records ([`LAYER_RECORD`]), its disk found in `cache` by its key:
@@ -608,11 +688,14 @@ const GENERALIZE_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 </unattend>
 "#;
 
-/// What a stage's steps boot: its guests' size and the layer cache.
+/// What a stage's steps boot: its guests' size and the layer cache; whether the step asks
+/// Windows how long it keeps working.
+#[derive(Clone, Copy)]
 struct Steps<'a> {
     cpus: u32,
     mem: &'a str,
     cache: &'a Path,
+    evaluation: bool,
 }
 
 fn run_step(layer: &mut Layer, run: &parser::Run, what: &str, steps: &Steps) -> Result<()> {
@@ -929,7 +1012,8 @@ fn step(
 ) -> Result<()> {
     let key = step_key(layer, material);
     let dir = steps.cache.join("layers").join(&key);
-    if dir.join("complete").exists() {
+    let cached = dir.join("complete").exists();
+    if cached {
         eprintln!("virtkit:   CACHED {}", &key[..12]);
     } else {
         clear_attempts(&steps.cache.join("layers"), &key);
@@ -939,10 +1023,16 @@ fn step(
         let disk = tmp.join("disk.qcow2");
         crate::qcow2::create_overlay(&disk, &layer.disk)?;
         let started = Instant::now();
-        if let Err(e) = make_step(layer, &work, &disk, steps, network, act) {
-            // The step's logs stay for whoever reads the error; its disk is no use to them.
-            let _ = std::fs::remove_file(&disk);
-            return Err(e.context(format!("the step's logs are in {}", work.display())));
+        let evaluation = match make_step(layer, &work, &disk, steps, network, act) {
+            Ok(evaluation) => evaluation,
+            Err(e) => {
+                // The step's logs stay for whoever reads the error; its disk is no use to them.
+                let _ = std::fs::remove_file(&disk);
+                return Err(e.context(format!("the step's logs are in {}", work.display())));
+            }
+        };
+        if let Some(evaluation) = evaluation {
+            std::fs::write(tmp.join(EVALUATION), serde_json::to_string(&evaluation)?)?;
         }
         let _ = std::fs::remove_dir_all(&work);
         std::fs::write(tmp.join("complete"), "")?;
@@ -954,6 +1044,33 @@ fn step(
     layer.unsaved_env.clear();
     layer.unmade_workdir = false;
     layer.generalized = false;
+    // Made by a build that did not ask Windows, or could not.
+    if cached
+        && steps.evaluation
+        && !dir.join(EVALUATION).exists()
+        && let Err(e) = evaluate_cached(layer, &dir, steps)
+    {
+        crate::wineval::warn_unread(&e);
+    }
+    Ok(())
+}
+
+/// Boot the cached `layer` without a network to query Windows' licensing and record the answer
+/// in its directory `dir`. Later builds reuse it: the answer is a date.
+fn evaluate_cached(layer: &Layer, dir: &Path, steps: &Steps) -> Result<()> {
+    let tmp = crate::winiso::scratch_beside(dir)?;
+    let work = tmp.join("run");
+    std::fs::create_dir_all(&work)?;
+    let disk = tmp.join("disk.qcow2");
+    crate::qcow2::create_overlay(&disk, &layer.disk)?;
+    let evaluation = make_step(layer, &work, &disk, steps, false, |_, _, _| Ok(()));
+    // Best effort: the next attempt at this key clears a leftover (see [`clear_attempts`]).
+    let _ = std::fs::remove_dir_all(&tmp);
+    if let Some(evaluation) = evaluation? {
+        let file = dir.join(format!("{EVALUATION}.tmp-{}", std::process::id()));
+        std::fs::write(&file, serde_json::to_string(&evaluation)?)?;
+        std::fs::rename(&file, dir.join(EVALUATION))?;
+    }
     Ok(())
 }
 
@@ -978,7 +1095,8 @@ fn clear_attempts(layers: &Path, key: &str) {
 
 /// [`step`]'s guest: boot `disk` with `work` as its run directory and, given `network`, on a
 /// switch of its own as `vk run --net` has; make the variables `ENV` set and the directory
-/// `WORKDIR` named since the last step, apply `act`, and power off.
+/// `WORKDIR` named since the last step, apply `act`, and power off. Returns what Windows said
+/// of its licensing when `steps` asks for it.
 fn make_step(
     layer: &Layer,
     work: &Path,
@@ -986,7 +1104,7 @@ fn make_step(
     steps: &Steps,
     network: bool,
     act: impl FnOnce(&mut Client, &Layer, &mut crate::uefi::Guest) -> Result<()>,
-) -> Result<()> {
+) -> Result<Option<crate::wineval::Evaluation>> {
     // Declared before the guest, so it outlives it.
     let mut switch = SwitchGuard(None);
     let mut nics = Vec::new();
@@ -1044,9 +1162,15 @@ fn make_step(
         }
     }
     act(&mut ga, layer, &mut vm)?;
+    let evaluation = if steps.evaluation {
+        eprintln!("virtkit:   reading Windows' licensing");
+        crate::wineval::query(&mut ga)
+    } else {
+        None
+    };
     drop(ga);
     vm.shutdown()?;
-    Ok(())
+    Ok(evaluation)
 }
 
 /// [`crate::uefi::wait_started`] for a step's guest `vm`, within [`AGENT_TIMEOUT`].
@@ -1090,8 +1214,15 @@ fn prepare_script(vars: &[(String, String)], workdir: Option<&str>) -> Option<St
 }
 
 /// Write the bundle `vk run` boots into `out`: `vm.json` (`cpus` and `mem`), an overlay over
-/// the built layer, the Administrator password and, last, its record ([`LAYER_RECORD`]).
-fn write_bundle(layer: &Layer, cpus: u32, mem: &str, out: &Path) -> Result<()> {
+/// the built layer, the Administrator password and, last, its record ([`LAYER_RECORD`]), with
+/// the layer's `evaluation`.
+fn write_bundle(
+    layer: &Layer,
+    cpus: u32,
+    mem: &str,
+    evaluation: crate::wineval::Evaluation,
+    out: &Path,
+) -> Result<()> {
     std::fs::create_dir_all(out)?;
     // Gone until the rest is written, so a bundle half rewritten names no layer.
     let record = out.join(LAYER_RECORD);
@@ -1120,6 +1251,12 @@ fn write_bundle(layer: &Layer, cpus: u32, mem: &str, out: &Path) -> Result<()> {
     writeln!(file, "{}", layer.password)?;
     let mut value = serde_json::to_value(layer)?;
     value["version"] = LAYER_RECORD_VERSION.into();
+    if let serde_json::Value::Object(fields) = serde_json::to_value(evaluation)? {
+        value
+            .as_object_mut()
+            .context("a layer record")?
+            .extend(fields);
+    }
     let tmp = out.join(format!("{LAYER_RECORD}.tmp"));
     std::fs::write(&tmp, serde_json::to_string_pretty(&value)?)?;
     std::fs::rename(&tmp, &record)?;
@@ -1574,6 +1711,73 @@ mod tests {
     }
 
     #[test]
+    fn the_last_step_is_the_last_run_or_copy_or_the_save_after_it() {
+        let last = |text: &str| last_step(&parsed(text)[0].body);
+        assert_eq!(last("FROM b\nRUN a\nCOPY x C:/\nCMD c\n"), 1);
+        assert_eq!(last("FROM b\nRUN a\nENV A=1\nRUN b\n"), 2);
+        assert_eq!(last("FROM b\nRUN a\nWORKDIR C:/w\n"), 2);
+        assert_eq!(last("FROM b\nENV A=1\n"), 1);
+        assert_eq!(last("FROM b\nCMD c\n"), 1);
+    }
+
+    #[test]
+    fn the_last_steps_evaluation_reaches_the_bundle() {
+        let root = scratch("evaluation");
+        let (base, cache, out) = (root.join("base"), root.join("cache"), root.join("out"));
+        // A bundle to build FROM, its layer in the cache.
+        let mut parent = layer();
+        parent.key = "b".repeat(64);
+        let parent_dir = cache.join("layers").join(&parent.key);
+        parent.disk = parent_dir.join("disk.qcow2");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        std::fs::write(&parent.disk, vec![0; 1 << 20]).unwrap();
+        std::fs::write(parent_dir.join("complete"), "").unwrap();
+        write_bundle(&parent, 2, "4G", Default::default(), &base).unwrap();
+        // The target's last step (saving its ENV), cached with what Windows said then.
+        let mut saving = bundle_layer(&base, &cache).unwrap();
+        saving.unsaved_env.push(("A".into(), "1".into()));
+        let key = step_key(&saving, "SAVE");
+        let step = cache.join("layers").join(&key);
+        std::fs::create_dir_all(&step).unwrap();
+        std::fs::write(step.join("disk.qcow2"), vec![0; 1 << 20]).unwrap();
+        std::fs::write(step.join("complete"), "").unwrap();
+        let evaluation = crate::wineval::Evaluation {
+            eval_expires: Some(2_000_000_000),
+            activate_by: None,
+        };
+        std::fs::write(
+            step.join(EVALUATION),
+            serde_json::to_string(&evaluation).unwrap(),
+        )
+        .unwrap();
+
+        let opts = Options {
+            dockerfile: root.join("Dockerfile"),
+            context: root.clone(),
+            target: None,
+            out: out.clone(),
+            cpus: 2,
+            mem: "4G".into(),
+            no_network: false,
+            reinstall: false,
+        };
+        let mut build = Build {
+            opts: &opts,
+            cache: &cache,
+            built: HashMap::new(),
+            reinstalled: Vec::new(),
+        };
+        let stages = parsed("FROM ./base\nENV A=1\n");
+        let built = build_stage(&mut build, &stages, 0, true).unwrap();
+        assert_eq!(built.key, key);
+        let read = read_evaluation(&cache.join("layers").join(&built.key));
+        assert_eq!(read, evaluation);
+        write_bundle(&built, 2, "4G", read, &out).unwrap();
+        assert_eq!(bundle_evaluation(&out), evaluation);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_bundle_names_its_layer_and_the_cache_supplies_the_disk() {
         let root = scratch("bundle");
         let (bundle, cache) = (root.join("out"), root.join("cache"));
@@ -1589,7 +1793,12 @@ mod tests {
         built.tpm = true;
         std::fs::create_dir_all(cache.join("layers").join(&key)).unwrap();
         std::fs::write(&built.disk, vec![0; 1 << 20]).unwrap();
-        write_bundle(&built, 2, "4G", &bundle).unwrap();
+        let evaluation = crate::wineval::Evaluation {
+            eval_expires: Some(1_000_000_000),
+            activate_by: None,
+        };
+        write_bundle(&built, 2, "4G", evaluation, &bundle).unwrap();
+        assert_eq!(bundle_evaluation(&bundle), evaluation);
         let manifest = crate::uefi::Bundle::open(&bundle).unwrap().manifest;
         assert!(manifest.tpm, "the image's machines have a TPM");
         let record = std::fs::read_to_string(bundle.join(LAYER_RECORD)).unwrap();

@@ -791,6 +791,7 @@ impl Drop for Guest {
 /// Boot `bundle` and hold it until the guest powers off or the run is stopped.
 pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<()> {
     refuse_unsupported(args)?;
+    crate::winbuild::warn_evaluation(&bundle.dir, &bundle.dir.display().to_string());
     let firmware = match bundle.manifest.firmware {
         Firmware::Uefi => firmware()?,
     };

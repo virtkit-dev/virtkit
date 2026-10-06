@@ -12,8 +12,14 @@ The Windows Dockerfiles read these ISOs from this directory, pinned by digest:
 | `virtio-win.iso` | virtio-win drivers and qemu-ga | fedorapeople.org, virtio-win direct downloads |
 | `win11-ent-eval-en-us.iso` | Windows 11 Enterprise evaluation, en-us (`win11.Dockerfile` only) | Microsoft Evaluation Center |
 
-The evaluation ISOs are licensed for evaluation only, expire (180 days for Windows Server, 90
-for Windows 11) and may not be redistributed.
+Microsoft's evaluation terms: Server evaluations must be activated online within 10 days and
+then run 180 days from activation; Windows 11 Enterprise evaluation 90 days. Evaluation media
+is for evaluation only: see Microsoft's terms before sharing images built from it. A
+generalized image (`generalize=on`) starts a new 10-day grace on each machine; one that is not
+carries its build's licensing, and `vk run` and compose warn as its evaluation nears its end.
+`vk build --reinstall` (with the same `-f` and `--target`) installs Windows again under new
+cache keys and rebuilds the image; bundles built on the old install keep working until they
+are rebuilt.
 
 The first build installs Windows (about 20 minutes, 70 for Windows 11); every later step is a
 cached layer, shared between the Dockerfiles that start the same way. Every lab password
