@@ -63,6 +63,7 @@ pub const TPM_CC_POLICY_SIGNED: u32 = 0x160;
 pub const TPM_CC_CONTEXT_LOAD: u32 = 0x161;
 pub const TPM_CC_CONTEXT_SAVE: u32 = 0x162;
 pub const TPM_CC_ECDH_KEYGEN: u32 = 0x163;
+pub const TPM_CC_ENCRYPT_DECRYPT: u32 = 0x164;
 pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x165;
 pub const TPM_CC_LOAD_EXTERNAL: u32 = 0x167;
 pub const TPM_CC_NV_READ_PUBLIC: u32 = 0x169;
@@ -100,6 +101,7 @@ pub const TPM_CC_POLICY_NV_WRITTEN: u32 = 0x18f;
 pub const TPM_CC_POLICY_TEMPLATE: u32 = 0x190;
 pub const TPM_CC_CREATE_LOADED: u32 = 0x191;
 pub const TPM_CC_POLICY_AUTHORIZE_NV: u32 = 0x192;
+pub const TPM_CC_ENCRYPT_DECRYPT_2: u32 = 0x193;
 
 type Run = fn(&mut Tpm, &[u32], &mut Reader, &mut Out) -> Result<()>;
 
@@ -406,6 +408,9 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_ECDH_KEYGEN, signing::ecdh_key_gen)
         .handles(&[H::Object(false)], 0)
         .encrypt(),
+    Command::new(TPM_CC_ENCRYPT_DECRYPT, object::encrypt_decrypt)
+        .handles(&[H::Object(false)], 1)
+        .encrypt(),
     Command::new(TPM_CC_FLUSH_CONTEXT, context::flush_context).no_sessions(),
     Command::new(TPM_CC_LOAD_EXTERNAL, key::load_external)
         .response_handle()
@@ -498,6 +503,10 @@ pub const COMMANDS: &[Command] = &[
         .decrypt(),
     Command::new(TPM_CC_POLICY_AUTHORIZE_NV, policy::policy_authorize_nv)
         .handles(&[H::NvAuth, H::NvIndex, H::PolicySession], 1),
+    Command::new(TPM_CC_ENCRYPT_DECRYPT_2, object::encrypt_decrypt2)
+        .handles(&[H::Object(false)], 1)
+        .decrypt()
+        .encrypt(),
 ];
 
 /// IsWriteOperation: the command writes an NV index, so an index authorizes it with its

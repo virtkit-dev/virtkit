@@ -5,15 +5,17 @@
 //! Every derived key comes back [`Zeroizing`].
 
 use aes::{Aes128, Aes192, Aes256};
-use cfb_mode::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyIvInit};
+use cfb_mode::cipher::consts::U16;
+use cfb_mode::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, BlockSizeUser, KeyIvInit};
 use hmac::digest::block_api::EagerHash;
 use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::alg::Hash;
+use crate::public::{TPM_ALG_CBC, TPM_ALG_CFB, TPM_ALG_CTR, TPM_ALG_ECB, TPM_ALG_OFB};
 use crate::rc::{Rc, Result};
 
 /// The AES block size, which is also the size of a CFB IV.
@@ -141,6 +143,117 @@ pub fn aes_cfb(key: &[u8], iv: &[u8], data: &mut [u8], encrypt: bool) -> Result<
     }
 }
 
+/// AES in a block cipher mode (TPM_ALG_CFB, _CTR, _OFB, _CBC or _ECB), in place, for
+/// TPM2_EncryptDecrypt: what OpenSSL computes for libtpms (CryptSymmetricEncrypt/Decrypt), down to
+/// the IV it returns, the one a next call would continue from (EVP_CIPHER_CTX_get_updated_iv):
+/// the last ciphertext block (CBC), the last key stream block (OFB), the next counter (CTR), or
+/// CFB's shift register, part ciphertext after a partial block. ECB and CBC take whole blocks
+/// only. The modes are framed here around RustCrypto's AES block function, so that IV is exact.
+pub fn aes_mode(
+    key: &[u8],
+    mode: u16,
+    iv: [u8; AES_BLOCK],
+    data: &mut [u8],
+    decrypt: bool,
+) -> Result<[u8; AES_BLOCK]> {
+    fn run<C>(
+        key: &[u8],
+        mode: u16,
+        mut iv: [u8; AES_BLOCK],
+        data: &mut [u8],
+        decrypt: bool,
+    ) -> Result<[u8; AES_BLOCK]>
+    where
+        C: BlockCipherEncrypt + BlockCipherDecrypt + KeyInit + BlockSizeUser<BlockSize = U16>,
+    {
+        let cipher = C::new_from_slice(key).map_err(|_| Rc::FAILURE)?;
+        let encrypt_block = |block: &mut [u8; AES_BLOCK]| {
+            let mut b = Array::from(*block);
+            cipher.encrypt_block(&mut b);
+            *block = b.into();
+            b.zeroize();
+        };
+        if matches!(mode, TPM_ALG_ECB | TPM_ALG_CBC) && !data.len().is_multiple_of(AES_BLOCK) {
+            return Err(Rc::SIZE);
+        }
+        let mut stream = [0u8; AES_BLOCK];
+        match mode {
+            TPM_ALG_ECB | TPM_ALG_CBC => {
+                for chunk in data.as_chunks_mut::<AES_BLOCK>().0 {
+                    let input = *chunk;
+                    let mut block = Array::from(input);
+                    let cbc = mode == TPM_ALG_CBC;
+                    if decrypt {
+                        cipher.decrypt_block(&mut block);
+                        if cbc {
+                            xor(&mut block, &iv);
+                            iv = input;
+                        }
+                    } else {
+                        if cbc {
+                            xor(&mut block, &iv);
+                        }
+                        cipher.encrypt_block(&mut block);
+                        if cbc {
+                            iv = block.into();
+                        }
+                    }
+                    chunk.copy_from_slice(&block);
+                    block.zeroize();
+                }
+            }
+            // OpenSSL's CRYPTO_cfb128_encrypt: the shift register is encrypted at each block's
+            // start, then takes each ciphertext byte in turn.
+            TPM_ALG_CFB => {
+                for (i, byte) in data.iter_mut().enumerate() {
+                    let n = i % AES_BLOCK;
+                    if n == 0 {
+                        encrypt_block(&mut iv);
+                    }
+                    let Some(register) = iv.get_mut(n) else {
+                        return Err(Rc::FAILURE);
+                    };
+                    let cipher_byte = if decrypt { *byte } else { *byte ^ *register };
+                    *byte ^= *register;
+                    *register = cipher_byte;
+                }
+            }
+            // CRYPTO_ofb128_encrypt and CRYPTO_ctr128_encrypt: a key stream block at each
+            // block's start; CTR increments its counter (all 128 bits, big-endian) as it does.
+            TPM_ALG_OFB | TPM_ALG_CTR => {
+                for (i, byte) in data.iter_mut().enumerate() {
+                    let n = i % AES_BLOCK;
+                    if n == 0 {
+                        if mode == TPM_ALG_OFB {
+                            encrypt_block(&mut iv);
+                            stream = iv;
+                        } else {
+                            stream = iv;
+                            encrypt_block(&mut stream);
+                            iv = u128::from_be_bytes(iv).wrapping_add(1).to_be_bytes();
+                        }
+                    }
+                    *byte ^= stream.get(n).copied().unwrap_or(0);
+                }
+            }
+            _ => return Err(Rc::MODE),
+        }
+        stream.zeroize();
+        Ok(iv)
+    }
+    fn xor(block: &mut [u8], with: &[u8]) {
+        for (b, w) in block.iter_mut().zip(with) {
+            *b ^= w;
+        }
+    }
+    match key.len() {
+        16 => run::<Aes128>(key, mode, iv, data, decrypt),
+        24 => run::<Aes192>(key, mode, iv, data, decrypt),
+        32 => run::<Aes256>(key, mode, iv, data, decrypt),
+        _ => Err(Rc::FAILURE),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -203,6 +316,76 @@ pub(crate) mod tests {
         assert_ne!(data, b"some parameter");
         xor_obfuscate(Hash::Sha1, b"k", b"u", b"v", &mut data);
         assert_eq!(data, b"some parameter");
+    }
+
+    #[test]
+    fn aes_modes_match_sp_800_38a() {
+        // SP 800-38A F.1.1, F.2.1, F.3.13, F.4.1, F.5.1: AES-128, the first two blocks.
+        let key = unhex("2b7e151628aed2a6abf7158809cf4f3c");
+        let iv: [u8; 16] = unhex("000102030405060708090a0b0c0d0e0f")
+            .try_into()
+            .unwrap();
+        let ctr: [u8; 16] = unhex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")
+            .try_into()
+            .unwrap();
+        let plain = unhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51");
+        let cases = [
+            (
+                TPM_ALG_ECB,
+                iv,
+                "3ad77bb40d7a3660a89ecaf32466ef97f5d3d58503b9699de785895a96fdbaaf",
+            ),
+            (
+                TPM_ALG_CBC,
+                iv,
+                "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2",
+            ),
+            (
+                TPM_ALG_CFB,
+                iv,
+                "3b3fd92eb72dad20333449f8e83cfb4ac8a64537a0b3a93fcde3cdad9f1ce58b",
+            ),
+            (
+                TPM_ALG_OFB,
+                iv,
+                "3b3fd92eb72dad20333449f8e83cfb4a7789508d16918f03f53c52dac54ed825",
+            ),
+            (
+                TPM_ALG_CTR,
+                ctr,
+                "874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff",
+            ),
+        ];
+        for (mode, iv, expected) in cases {
+            let mut data = plain.clone();
+            let next = aes_mode(&key, mode, iv, &mut data, false).unwrap();
+            assert_eq!(data, unhex(expected), "mode {mode:#x}");
+            let back = aes_mode(&key, mode, iv, &mut data, true).unwrap();
+            assert_eq!(data, plain, "mode {mode:#x}");
+            assert_eq!(next, back, "the same IV either way");
+            // Two calls chained through the IV make one.
+            let (mut first, mut second) = (plain[..16].to_vec(), plain[16..].to_vec());
+            let iv2 = aes_mode(&key, mode, iv, &mut first, false).unwrap();
+            aes_mode(&key, mode, iv2, &mut second, false).unwrap();
+            assert_eq!([first, second].concat(), unhex(expected), "mode {mode:#x}");
+        }
+        // The IVs out: CBC's last ciphertext block, CTR's next counter.
+        let mut data = plain.clone();
+        let next = aes_mode(&key, TPM_ALG_CBC, iv, &mut data, false).unwrap();
+        assert_eq!(next[..], data[16..]);
+        let next = aes_mode(&key, TPM_ALG_CTR, ctr, &mut data[..5], false).unwrap();
+        assert_eq!(next[15], 0x00, "the counter moves on a partial block too");
+        // CFB after a partial block: its ciphertext, then the rest of the key stream block,
+        // E(IV).
+        let mut short = plain[..5].to_vec();
+        let next = aes_mode(&key, TPM_ALG_CFB, iv, &mut short, false).unwrap();
+        assert_eq!(next[..5], short[..]);
+        assert_eq!(next[5..], unhex("6d32b6da0937e99bafec60"));
+        assert_eq!(
+            aes_mode(&key, TPM_ALG_CBC, iv, &mut short, false),
+            Err(Rc::SIZE)
+        );
+        assert_eq!(aes_mode(&key, 0x10, iv, &mut short, false), Err(Rc::MODE));
     }
 
     #[test]

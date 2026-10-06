@@ -27,6 +27,8 @@ pub const TEST_PARMS: u32 = 0x18a;
 pub const STIR_RANDOM: u32 = 0x146;
 pub const GET_TEST_RESULT: u32 = 0x17c;
 pub const READ_CLOCK: u32 = 0x181;
+pub const ENCRYPT_DECRYPT: u32 = 0x164;
+pub const ENCRYPT_DECRYPT_2: u32 = 0x193;
 
 // TPMA_OBJECT.
 pub const FIXED_TPM: u32 = 1 << 1;
@@ -392,6 +394,110 @@ fn ecc_signatures_and_ecdh_cross_check() {
     }
     ok(&both.same(&command(ECC_PARAMETERS, &[], None, &[0, 3])));
     both.same(&command(ECC_PARAMETERS, &[], None, &[0, 0]));
+}
+
+/// An unrestricted AES key of `bits` in `mode` (TPM_ALG_NULL: the caller's), that decrypts
+/// and encrypts.
+pub fn aes_key(bits: u16, mode: u16, attributes: u32) -> Vec<u8> {
+    let def = [&[0, 6][..], &bits.to_be_bytes(), &mode.to_be_bytes()].concat();
+    public(ALG_SYMCIPHER, attributes, &def, &tpm2b(b""))
+}
+
+const CIPHER: u32 = FIXED_TPM | FIXED_PARENT | ORIGIN | USER_WITH_AUTH | DECRYPT | SIGN_ATTR;
+
+/// TPM2_EncryptDecrypt, or TPM2_EncryptDecrypt2 (`second`), with `key`.
+pub fn encrypt_decrypt(
+    key: u32,
+    second: bool,
+    decrypt: bool,
+    mode: u16,
+    iv: &[u8],
+    data: &[u8],
+) -> Vec<u8> {
+    let (decrypt, mode) = (vec![u8::from(decrypt)], mode.to_be_bytes().to_vec());
+    if second {
+        let p = [tpm2b(data), decrypt, mode, tpm2b(iv)].concat();
+        with_password(ENCRYPT_DECRYPT_2, key, b"", &p)
+    } else {
+        let p = [decrypt, mode, tpm2b(iv), tpm2b(data)].concat();
+        with_password(ENCRYPT_DECRYPT, key, b"", &p)
+    }
+}
+
+#[test]
+fn symmetric_encryption_matches() {
+    let mut both = Both::seeded();
+    let data: Vec<u8> = (0..1024).map(|i| (i * 7 + 3) as u8).collect();
+    let iv: Vec<u8> = (0..16).map(|i| 0xf0 + i as u8).collect();
+    for bits in [128u16, 256] {
+        for key_mode in [0x10u16, 0x40, 0x41, 0x42, 0x43, 0x44] {
+            let key =
+                handle(&both.same(&create_primary(RH_OWNER, &aes_key(bits, key_mode, CIPHER))));
+            for mode in [0x10u16, 0x40, 0x41, 0x42, 0x43, 0x44, 0x3f, 0x06] {
+                for second in [false, true] {
+                    for decrypt in [false, true] {
+                        for len in [0, 5, 16, 33, 48, 1024] {
+                            let ecb = mode == 0x44 || (mode == 0x10 && key_mode == 0x44);
+                            let iv = if ecb { &[][..] } else { &iv[..] };
+                            let c = encrypt_decrypt(key, second, decrypt, mode, iv, &data[..len]);
+                            both.same(&c);
+                        }
+                    }
+                    // A wrong IV size, and data too long.
+                    for iv in [&[][..], &[1; 8], &[1; 16], &[1; 17]] {
+                        both.same(&encrypt_decrypt(key, second, false, mode, iv, &data[..16]));
+                    }
+                    both.same(&encrypt_decrypt(key, second, true, mode, &iv, &[9; 1025]));
+                }
+            }
+            // Chaining: the IV out continues the stream.
+            if key_mode != 0x10 && key_mode != 0x44 {
+                let whole = params(
+                    ok(&both.same(&encrypt_decrypt(key, true, false, 0x10, &iv, &data[..48]))),
+                    false,
+                );
+                let first = params(
+                    ok(&both.same(&encrypt_decrypt(key, true, false, 0x10, &iv, &data[..16]))),
+                    false,
+                );
+                let (c1, rest) = split2b(&first);
+                let (iv2, _) = split2b(rest);
+                let second = params(
+                    ok(&both.same(&encrypt_decrypt(
+                        key,
+                        true,
+                        false,
+                        0x10,
+                        &iv2,
+                        &data[16..48],
+                    ))),
+                    false,
+                );
+                assert_eq!([c1, split2b(&second).0].concat(), split2b(&whole).0);
+            }
+            both.same(&command(FLUSH_CONTEXT, &[], None, &key.to_be_bytes()));
+        }
+    }
+    // Keys that may not: encrypt without sign, decrypt without decrypt, restricted, CMAC, not a
+    // symmetric key at all.
+    for (attributes, mode) in [
+        (CIPHER & !SIGN_ATTR, 0x43),
+        (CIPHER & !DECRYPT, 0x43),
+        (STORAGE, 0x43),
+        (CIPHER & !DECRYPT, 0x3f),
+    ] {
+        let r = both.same(&create_primary(RH_OWNER, &aes_key(128, mode, attributes)));
+        if rc(&r) != 0 {
+            continue;
+        }
+        let key = handle(&r);
+        for decrypt in [false, true] {
+            both.same(&encrypt_decrypt(key, false, decrypt, 0x10, &iv, b"data"));
+        }
+        both.same(&command(FLUSH_CONTEXT, &[], None, &key.to_be_bytes()));
+    }
+    let hmac = handle(&both.same(&create_primary(RH_OWNER, &hmac_key())));
+    both.same(&encrypt_decrypt(hmac, true, false, 0x43, &iv, b"data"));
 }
 
 #[test]
@@ -1358,6 +1464,9 @@ pub fn mutation_corpus() -> Vec<Vec<u8>> {
         command(STIR_RANDOM, &[], None, &tpm2b(b"stir")),
         command(GET_TEST_RESULT, &[], None, &[]),
         command(READ_CLOCK, &[], None, &[]),
+        create_primary(RH_NULL, &aes_key(128, 0x10, CIPHER)),
+        encrypt_decrypt(0x8000_0002, false, false, 0x42, &[2; 16], &[1; 32]),
+        encrypt_decrypt(0x8000_0002, true, true, 0x41, &[2; 16], &[1; 20]),
         get_capability(8, 0, 4),
         get_capability(1, 0x8100_0000, 4),
         get_capability(1, 0x0300_0000, 4),

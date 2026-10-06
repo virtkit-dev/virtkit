@@ -150,7 +150,7 @@ impl SymDef {
 }
 
 /// CryptSymModeIsValid: a block cipher mode (not a MAC).
-fn is_block_mode(mode: u16) -> bool {
+pub fn is_block_mode(mode: u16) -> bool {
     matches!(
         mode,
         TPM_ALG_CTR | TPM_ALG_OFB | TPM_ALG_CBC | TPM_ALG_CFB | TPM_ALG_ECB

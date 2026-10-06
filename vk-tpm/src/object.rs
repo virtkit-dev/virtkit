@@ -10,13 +10,13 @@
 use zeroize::Zeroizing;
 
 use crate::alg::{Hash, Hasher, MAX_DIGEST};
-use crate::commands::{end, first, write_digest_values};
+use crate::commands::{end, first, read_yes_no, write_digest_values};
 use crate::crypt;
 use crate::entity::{TPM_RH_ENDORSEMENT, TPM_RH_NULL, TPM_RH_OWNER, TPM_RH_PLATFORM, strip_zeros};
 use crate::hierarchy::Auth;
 use crate::key::{Key, hash_block_size};
 use crate::marshal::{Reader, Writer};
-use crate::public::{Params, TPM_ALG_CMAC, Type, attr};
+use crate::public::{Params, TPM_ALG_CMAC, TPM_ALG_ECB, Type, attr, is_block_mode};
 use crate::rc::{Rc, Result};
 use crate::state::{StateError, read_bool};
 use crate::{Out, Tpm};
@@ -522,6 +522,109 @@ pub fn hmac(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, w: &mut Out) -> Resu
     let (hash, key) = mac_key(tpm, first(handles)?, scheme)?;
     w.tpm2b(&crypt::hmac(hash, &key, &[data]));
     Ok(())
+}
+
+/// TPMI_ALG_CIPHER_MODE+: a block cipher mode, or TPM_ALG_NULL.
+fn read_cipher_mode(r: &mut Reader) -> Result<u16> {
+    let mode = r.u16()?;
+    if mode == crate::alg::TPM_ALG_NULL || is_block_mode(mode) {
+        Ok(mode)
+    } else {
+        Err(Rc::MODE)
+    }
+}
+
+/// The parameters of TPM2_EncryptDecrypt and TPM2_EncryptDecrypt2, and the numbers errors give
+/// them in each (`blame`: mode, ivIn, inData).
+struct Cipher<'a> {
+    decrypt: bool,
+    mode: u16,
+    iv: &'a [u8],
+    data: &'a [u8],
+    blame: (u32, u32, u32),
+}
+
+/// EncryptDecryptShared: `data` through an unrestricted symmetric key, its decrypt attribute
+/// to decrypt, its sign attribute to encrypt; the key's mode, or the caller's if it has none.
+fn encrypt_decrypt_shared(tpm: &Tpm, handle: u32, c: &Cipher, w: &mut Out) -> Result<()> {
+    let (blame_mode, blame_iv, blame_data) = c.blame;
+    let key = tpm.key(handle).ok_or(Rc::KEY.handle(1))?;
+    let Params::SymCipher(def) = &key.public.params else {
+        return Err(Rc::KEY.handle(1));
+    };
+    let allowed = if c.decrypt { attr::DECRYPT } else { attr::SIGN };
+    if key.public.has(attr::RESTRICTED) || !key.public.has(allowed) {
+        return Err(Rc::ATTRIBUTES.handle(1));
+    }
+    let null = crate::alg::TPM_ALG_NULL;
+    if def.mode != null && !is_block_mode(def.mode) {
+        return Err(Rc::MODE.handle(1));
+    }
+    let mode = match (def.mode, c.mode) {
+        (own, asked) if own != null && asked != null && asked != own => {
+            return Err(Rc::MODE.param(blame_mode));
+        }
+        (own, _) if own != null => own,
+        (_, asked) if asked != null => asked,
+        _ => return Err(Rc::MODE.param(blame_mode)),
+    };
+    let iv_size = if mode == TPM_ALG_ECB {
+        0
+    } else {
+        crypt::AES_BLOCK
+    };
+    if c.iv.len() != iv_size {
+        return Err(Rc::SIZE.param(blame_iv));
+    }
+    if (mode == TPM_ALG_ECB || mode == crate::public::TPM_ALG_CBC)
+        && !c.data.len().is_multiple_of(crypt::AES_BLOCK)
+    {
+        return Err(Rc::SIZE.param(blame_data));
+    }
+    let secret = key.sensitive.as_ref().map_or(&[][..], |s| &s.secret);
+    let mut data = Zeroizing::new(c.data.to_vec());
+    let mut iv = [0u8; crypt::AES_BLOCK];
+    iv.get_mut(..c.iv.len())
+        .ok_or(Rc::FAILURE)?
+        .copy_from_slice(c.iv);
+    let iv_out = crypt::aes_mode(secret, mode, iv, &mut data, c.decrypt)?;
+    w.tpm2b(&data);
+    w.tpm2b(iv_out.get(..iv_size).ok_or(Rc::FAILURE)?);
+    Ok(())
+}
+
+/// TPM2_EncryptDecrypt: data through a symmetric key.
+pub fn encrypt_decrypt(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, w: &mut Out) -> Result<()> {
+    let decrypt = read_yes_no(r).map_err(|rc| rc.param(1))?;
+    let mode = read_cipher_mode(r).map_err(|rc| rc.param(2))?;
+    let iv = r.tpm2b(crypt::AES_BLOCK).map_err(|rc| rc.param(3))?;
+    let data = r.tpm2b(MAX_BUFFER).map_err(|rc| rc.param(4))?;
+    end(r)?;
+    let c = Cipher {
+        decrypt,
+        mode,
+        iv,
+        data,
+        blame: (2, 3, 4),
+    };
+    encrypt_decrypt_shared(tpm, first(handles)?, &c, w)
+}
+
+/// TPM2_EncryptDecrypt2: TPM2_EncryptDecrypt with the data first, so a session may encrypt it.
+pub fn encrypt_decrypt2(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, w: &mut Out) -> Result<()> {
+    let data = r.tpm2b(MAX_BUFFER).map_err(|rc| rc.param(1))?;
+    let decrypt = read_yes_no(r).map_err(|rc| rc.param(2))?;
+    let mode = read_cipher_mode(r).map_err(|rc| rc.param(3))?;
+    let iv = r.tpm2b(crypt::AES_BLOCK).map_err(|rc| rc.param(4))?;
+    end(r)?;
+    let c = Cipher {
+        decrypt,
+        mode,
+        iv,
+        data,
+        blame: (3, 4, 1),
+    };
+    encrypt_decrypt_shared(tpm, first(handles)?, &c, w)
 }
 
 #[cfg(test)]
