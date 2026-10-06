@@ -32,7 +32,7 @@ pub const SEED_SIZE: usize = 64;
 /// volatile one some tens with every session and object slot taken), so writing one never reallocates and leaves a stray copy of
 /// its secrets. Each is wiped whole when dropped.
 const PERMANENT_CAPACITY: usize = 192 * 1024;
-const VOLATILE_CAPACITY: usize = 64 * 1024;
+const VOLATILE_CAPACITY: usize = 128 * 1024;
 
 /// The state could not be read: not ours, a version this build does not know, or corrupt.
 #[derive(Debug, PartialEq, Eq)]
@@ -184,6 +184,9 @@ pub struct Permanent {
     /// have been reported (TPMS_CLOCK_INFO.safe).
     pub clock: u64,
     pub clock_safe: bool,
+    /// Which run of TPM time it is: it changes whenever TPM time starts over (a power cycle), so
+    /// a policy's timeout or ticket from an earlier run expires (the reference's timeEpoch).
+    pub time_epoch: u32,
     /// The NV indices, by handle.
     pub nv: Vec<NvIndex>,
     /// The highest value a deleted counter index had: a new one starts above it.
@@ -221,6 +224,7 @@ impl Permanent {
             total_reset_count: 0,
             clock: 0,
             clock_safe: true,
+            time_epoch: 0,
             nv: Vec::new(),
             nv_max_counter: 0,
         })
@@ -261,7 +265,8 @@ impl Permanent {
         w.u32(self.reset_count)
             .u64(self.total_reset_count)
             .u64(self.clock)
-            .u8(self.clock_safe.into());
+            .u8(self.clock_safe.into())
+            .u32(self.time_epoch);
         nv::write_nv(&mut w, &self.nv, self.nv_max_counter);
         w.into_bytes()
     }
@@ -301,6 +306,7 @@ impl Permanent {
         let total_reset_count = r.u64()?;
         let clock = r.u64()?;
         let clock_safe = read_bool(&mut r)?;
+        let time_epoch = r.u32()?;
         let (nv, nv_max_counter) = nv::read_nv(&mut r)?;
         expect_end(&r)?;
         Ok(Permanent {
@@ -317,6 +323,7 @@ impl Permanent {
             total_reset_count,
             clock,
             clock_safe,
+            time_epoch,
             nv,
             nv_max_counter,
         })
@@ -729,6 +736,13 @@ mod tests {
                 lockout_bound: true,
                 audit: Some(vec![0; 64]),
                 policy_digest: vec![0; 64],
+                policy: crate::session::PolicyState {
+                    bound: Some((crate::session::Bound::CpHash, vec![0; 64])),
+                    nv_written: Some(true),
+                    ..Default::default()
+                },
+                start_time: u64::MAX,
+                epoch: u32::MAX,
             }));
         }
         assert!(v.serialize().len() < VOLATILE_CAPACITY / 2);

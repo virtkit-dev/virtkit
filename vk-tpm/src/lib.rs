@@ -32,6 +32,7 @@ mod marshal;
 mod nv;
 mod object;
 mod pcr;
+mod policy;
 mod public;
 mod rc;
 mod session;

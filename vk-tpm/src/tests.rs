@@ -116,7 +116,7 @@ fn valid_handle(kind: HandleKind) -> u32 {
         HandleKind::Lockout => TPM_RH_LOCKOUT,
         // The sequence the test starts first.
         HandleKind::Object(_) => 0x8000_0000,
-        HandleKind::Entity(_) => TPM_RH_NULL,
+        HandleKind::Entity(_) => TPM_RH_OWNER,
         // The index and the policy session the test makes first.
         HandleKind::NvAuth | HandleKind::NvIndex => NV_INDEX,
         HandleKind::PolicySession => 0x0300_0000,
@@ -176,8 +176,12 @@ fn every_command_refuses_trailing_parameter_bytes() {
         let load = [&[0, 0][..], public].concat();
         let load_external = [&[0, 0][..], public, &[0x40, 0, 0, 7]].concat();
         let context = [&[0; 8][..], &[0x80, 0, 0, 0, 0x40, 0, 0, 7, 0, 0]].concat();
+        // nonceTPM, cpHashA, policyRef, expiration, an HMAC signature.
+        let policy_signed = [&[0; 10][..], &[0, 5, 0, 0x0b], &[0; 32]].concat();
         // digest, an HMAC signature.
         let verify_signature = [&[0, 0, 0, 5, 0, 0x0b][..], &[0; 32]].concat();
+        // timeout, cpHashA, policyRef, authName, a NULL ticket.
+        let policy_ticket = [&[0; 8][..], &[0x80, 0x23, 0x40, 0, 0, 7, 0, 0]].concat();
         // No authValue; an ordinary index of 8 bytes.
         let nv_public = [
             &[0, 0, 0, 14][..],
@@ -219,6 +223,24 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_SEQUENCE_UPDATE | TPM_CC_EVENT_SEQUENCE_COMPLETE => &[0, 0],
             TPM_CC_SEQUENCE_COMPLETE => &[0, 0, 0x40, 0, 0, 7],
             TPM_CC_FLUSH_CONTEXT => &[0x80, 0, 0, 0],
+            TPM_CC_POLICY_SIGNED => &policy_signed,
+            TPM_CC_POLICY_SECRET => &[0; 12],
+            TPM_CC_POLICY_TICKET => &policy_ticket,
+            TPM_CC_POLICY_OR => &[0, 0, 0, 2, 0, 0, 0, 0],
+            TPM_CC_POLICY_PCR => &[0, 0, 0, 0, 0, 0],
+            TPM_CC_POLICY_LOCALITY => &[1],
+            TPM_CC_POLICY_NV | TPM_CC_POLICY_COUNTER_TIMER => &[0, 0, 0, 0, 0, 0],
+            TPM_CC_POLICY_COMMAND_CODE => &[0, 0, 1, 0x7b],
+            TPM_CC_POLICY_CP_HASH | TPM_CC_POLICY_NAME_HASH | TPM_CC_POLICY_TEMPLATE => &[0, 0],
+            TPM_CC_POLICY_DUPLICATION_SELECT => &[0, 0, 0, 0, 0],
+            TPM_CC_POLICY_AUTHORIZE => &[0, 0, 0, 0, 0, 0, 0x80, 0x22, 0x40, 0, 0, 7, 0, 0],
+            TPM_CC_POLICY_NV_WRITTEN => &[0],
+            TPM_CC_POLICY_AUTH_VALUE
+            | TPM_CC_POLICY_PASSWORD
+            | TPM_CC_POLICY_PHYSICAL_PRESENCE
+            | TPM_CC_POLICY_GET_DIGEST
+            | TPM_CC_POLICY_RESTART
+            | TPM_CC_POLICY_AUTHORIZE_NV => &[],
             TPM_CC_NV_DEFINE_SPACE => &nv_public,
             TPM_CC_NV_SET_BITS => &[0; 8],
             TPM_CC_NV_EXTEND | TPM_CC_NV_CHANGE_AUTH => &[0, 0],
@@ -243,6 +265,14 @@ fn every_command_refuses_trailing_parameter_bytes() {
                 | nv::attr::AUTHWRITE
                 | nv::attr::AUTHREAD;
             assert_eq!(nv_define(&mut tpm, NV_INDEX, attributes, 8), 0);
+            let policy = [&[0, 16][..], &[0; 16], &[0, 0, 1, 0, 0x10, 0, 0x0b]].concat();
+            let start = command(
+                TPM_CC_START_AUTH_SESSION,
+                &[TPM_RH_NULL, TPM_RH_NULL],
+                None,
+                &policy,
+            );
+            assert_eq!(rc(&tpm.process(&start)), 0);
         }
         let handles: Vec<u32> = cmd.handles.iter().map(|&k| valid_handle(k)).collect();
         let passwords = vec![&b""[..]; cmd.auth];
@@ -423,11 +453,11 @@ fn get_capability_lists_exactly_the_implemented_commands() {
         "HierarchyControl: nv, extensive, 1 handle"
     );
     assert!(listed.windows(2).all(|w| (w[0] & 0xffff) < (w[1] & 0xffff)));
-    assert_eq!(
-        listed[listed.len() - 2],
-        0x1000_0186,
+    assert!(
+        listed.contains(&0x1000_0186),
         "HashSequenceStart: a response handle"
     );
+    assert!(listed.contains(&0x0600_0149), "PolicyNV: 3 handles");
 }
 
 /// TPM_PT property `property`, through TPM2_GetCapability.

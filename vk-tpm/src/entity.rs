@@ -34,6 +34,10 @@ pub const TPM_HT_PERMANENT: u8 = 0x40;
 pub const TPM_HT_TRANSIENT: u8 = 0x80;
 pub const TPM_HT_PERSISTENT: u8 = 0x81;
 
+/// TPM2B_NAME: sizeof(TPMU_NAME) as libtpms lays it out, a TPMT_HA padded to the alignment of
+/// its TPM_HANDLE.
+pub const MAX_NAME: usize = 68;
+
 /// The handle's type: its top byte.
 pub fn handle_type(handle: u32) -> u8 {
     handle.to_be_bytes()[0]
