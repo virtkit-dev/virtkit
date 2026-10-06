@@ -112,9 +112,10 @@ impl Tpm {
         (p.eps, p.sps, p.pps) = (eps, sps, pps);
     }
 
-    /// What a snapshot must add to the permanent state to bring the running TPM back.
-    pub fn volatile_state(&self) -> Vec<u8> {
-        self.volatile.serialize()
+    /// What a snapshot must add to the permanent state to bring the running TPM back. It holds
+    /// secrets too (the platform's authValue, session keys), so store it as one.
+    pub fn volatile_state(&self) -> Zeroizing<Vec<u8>> {
+        Zeroizing::new(self.volatile.serialize())
     }
 
     /// Whether the permanent state changed since the last call: the caller then stores
