@@ -3,11 +3,12 @@
 #
 # release.yml runs this on the binary build.yml produced and the publish job releases, so
 # what is tested is what ships. Two identity checks come first and are preconditions — the
-# sha256 sidecars beside the binaries, and vk's version against the release tag (`vk update`
-# compares the two, so a mismatch breaks self-update); neither is worth booting a microVM
-# past. Then `vk check`, a plain image boot, `vk run`'s exit status, and every other script
-# in this directory, each against the same vk. A failure there does not stop the run: every
-# script reports, and the exit status is non-zero if any of them failed.
+# sha256 sidecars beside the binaries (and, for a release, embedded UEFI firmware recorded
+# in build-info.txt), and vk's version against the release tag (`vk update` compares them;
+# a mismatch breaks self-update). Both must pass before booting a microVM. Then `vk check`,
+# a plain image boot, `vk run`'s exit status, and every other script in this directory,
+# each against the same vk. Failures do not stop the run: every script reports,
+# and the exit status is non-zero if any failed.
 #
 #   VK=./dist/vk tests/release-e2e.sh                     # a local build, every script
 #   VK=./dist/vk tests/release-e2e.sh tests/systemd-boot-e2e.sh  # the smoke checks + these
@@ -59,6 +60,15 @@ dir=$(dirname "$VK")
 base=$(basename "$VK")
 [ -f "$dir/$base.sha256" ] || { echo "release-e2e: no $base.sha256 beside the binary" >&2; exit 1; }
 ( cd "$dir" && sha256sum -c ./*.sha256 )
+# A release's vk embeds the UEFI firmware. This checks the build manifest, not vk's bytes:
+# build-info.txt lists CLOUDHV.fd's sha256 when it was embedded, "firmware: none" otherwise.
+if [ -n "${RELEASE_TAG:-}" ]; then
+  [ -f "$dir/build-info.txt" ] || { echo "release-e2e: no build-info.txt beside the binary" >&2; exit 1; }
+  grep -q ' CLOUDHV\.fd$' "$dir/build-info.txt" || {
+    echo "release-e2e: $dir/build-info.txt records no embedded UEFI firmware" >&2
+    exit 1
+  }
+fi
 
 # `vk --version` prints `<crate> <version> (<commit>)`. Match the version as a whitespace
 # token, the way vk-selfupdate does, so only the version itself is load-bearing.

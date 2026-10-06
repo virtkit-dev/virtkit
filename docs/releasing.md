@@ -44,8 +44,9 @@ e2e follows both, and publish waits on all of them:
   ancestor of the candidate. A stale or unbumped candidate fails here, before anything
   compiles.
 - **quality**: rustfmt, clippy, the test suite, cargo-audit — the same jobs CI runs.
-- **build**: the kernel and the binaries, as `build.sh --bootstrap-check`, so the released
-  bytes are reproduced from scratch in a vk microVM before they are accepted.
+- **build**: the kernel and UEFI firmware, then `build.sh --bootstrap-check` for the
+  binaries. The check rebuilds them from scratch in a vk microVM with the same embedded
+  kernel and firmware before accepting them.
 - **e2e**: `tests/release-e2e.sh` on the built `vk` — the sha256 sidecars of every binary,
   the version against the tag, `vk check`, a plain boot, then every end-to-end script in
   `tests/`.
@@ -55,7 +56,8 @@ e2e follows both, and publish waits on all of them:
   jobs", which re-runs prepare and fails on the tag it just pushed. The artifacts it
   publishes are kept for a day, so a run left unfinished longer than that has to be pushed
   to `release` again — unless its tag was already pushed, which prepare now refuses: finish
-  that one by hand with `gh release create vX.Y.Z …` from a local `./build.sh` build.
+  that one by hand with `gh release create vX.Y.Z …` from a local
+  `./build-kernel.sh && ./build-firmware.sh && ./build.sh` build.
 
 The pushes are made with the workflow's own token, which triggers no other workflow:
 `main` gets no second CI run for a sha that just passed the same checks, and the tag
