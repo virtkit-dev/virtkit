@@ -234,7 +234,7 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
     ) -> io::Result<()> {
         if self
             .size
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 (new_size > old).then_some(new_size)
             })
             .is_err()
@@ -256,7 +256,7 @@ impl<S: Storage + 'static> FormatDriverInstance for Raw<S> {
     async fn resize_shrink(&mut self, new_size: u64) -> io::Result<()> {
         if self
             .size
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                 (new_size < old).then_some(new_size)
             })
             .is_err()

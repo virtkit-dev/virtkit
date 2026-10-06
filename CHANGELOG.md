@@ -97,6 +97,10 @@ All notable changes to virtkit will be documented in this file.
   audited, refused sign-ins and those only `*` admits at a bounded rate, and
   `vk-hub ui sessions` names who signed in. Sign-in links from `vk-hub ui login` keep working.
 
+### Changed
+
+- Rust toolchain upgraded to 1.99.0.
+
 ### Fixed
 
 - **`vk update` no longer hangs on a release whose `--version` does not return**: it is

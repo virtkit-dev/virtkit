@@ -44,6 +44,9 @@ block device's `IoVector::from_volatile_slice` calls need 0.18's `VolatileSlice`
 1.19 tree pinned 0.17.1, which the wide range let the root workspace unify down to; the
 narrowing stays so no future pin can do that again.
 
+`raw.rs` calls `AtomicU64::try_update` (a local patch) where upstream calls `fetch_update`, which
+Rust 1.99 deprecates under that new name; the workspace's clippy denies the warning.
+
 ## Local patches
 
 **Bug:** `ensure_data_mapping()` allocates (or COWs) a cluster and commits it to the L2 table
