@@ -523,10 +523,14 @@ async fn disconnect_hangs_up_a_tty_exec() {
         stream.next().await.unwrap().unwrap(),
         Message::StartOK
     ));
+    // Once the job runs `sleep`: until it execs, the forked shell still has the trap, and
+    // a hang-up arriving then is caught and lost at the exec, leaving `sleep` running on.
     let pid: i32 = timeout(Duration::from_secs(10), async {
         loop {
             if let Ok(content) = std::fs::read_to_string(&pid_file)
-                && let Ok(pid) = content.trim().parse()
+                && let Ok(pid) = content.trim().parse::<i32>()
+                && std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .is_ok_and(|cmdline| cmdline.starts_with(b"sleep\0"))
             {
                 return pid;
             }
