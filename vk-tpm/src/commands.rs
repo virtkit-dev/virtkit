@@ -12,7 +12,8 @@ use crate::rc::{Rc, Result};
 use crate::session::SessionSlot;
 use crate::state::{ResetData, Saved, Shutdown, new_seed};
 use crate::{
-    LOCALITY, Out, Tpm, capability, context, hierarchy, key, nv, object, policy, session, signing,
+    LOCALITY, Out, Tpm, attest, capability, context, hierarchy, key, nv, object, policy, session,
+    signing,
 };
 
 pub const TPM_CC_NV_UNDEFINE_SPACE_SPECIAL: u32 = 0x11f;
@@ -44,8 +45,13 @@ pub const TPM_CC_SELF_TEST: u32 = 0x143;
 pub const TPM_CC_STARTUP: u32 = 0x144;
 pub const TPM_CC_SHUTDOWN: u32 = 0x145;
 pub const TPM_CC_STIR_RANDOM: u32 = 0x146;
+pub const TPM_CC_ACTIVATE_CREDENTIAL: u32 = 0x147;
+pub const TPM_CC_CERTIFY: u32 = 0x148;
 pub const TPM_CC_POLICY_NV: u32 = 0x149;
+pub const TPM_CC_CERTIFY_CREATION: u32 = 0x14a;
 pub const TPM_CC_DUPLICATE: u32 = 0x14b;
+pub const TPM_CC_GET_TIME: u32 = 0x14c;
+pub const TPM_CC_GET_SESSION_AUDIT_DIGEST: u32 = 0x14d;
 pub const TPM_CC_NV_READ: u32 = 0x14e;
 pub const TPM_CC_NV_READ_LOCK: u32 = 0x14f;
 pub const TPM_CC_OBJECT_CHANGE_AUTH: u32 = 0x150;
@@ -54,6 +60,7 @@ pub const TPM_CC_CREATE: u32 = 0x153;
 pub const TPM_CC_ECDH_ZGEN: u32 = 0x154;
 pub const TPM_CC_HMAC: u32 = 0x155;
 pub const TPM_CC_LOAD: u32 = 0x157;
+pub const TPM_CC_QUOTE: u32 = 0x158;
 pub const TPM_CC_RSA_DECRYPT: u32 = 0x159;
 pub const TPM_CC_HMAC_START: u32 = 0x15b;
 pub const TPM_CC_SEQUENCE_UPDATE: u32 = 0x15c;
@@ -66,6 +73,7 @@ pub const TPM_CC_ECDH_KEYGEN: u32 = 0x163;
 pub const TPM_CC_ENCRYPT_DECRYPT: u32 = 0x164;
 pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x165;
 pub const TPM_CC_LOAD_EXTERNAL: u32 = 0x167;
+pub const TPM_CC_MAKE_CREDENTIAL: u32 = 0x168;
 pub const TPM_CC_NV_READ_PUBLIC: u32 = 0x169;
 pub const TPM_CC_POLICY_AUTHORIZE: u32 = 0x16a;
 pub const TPM_CC_POLICY_AUTH_VALUE: u32 = 0x16b;
@@ -90,6 +98,7 @@ pub const TPM_CC_POLICY_PCR: u32 = 0x17f;
 pub const TPM_CC_POLICY_RESTART: u32 = 0x180;
 pub const TPM_CC_READ_CLOCK: u32 = 0x181;
 pub const TPM_CC_PCR_EXTEND: u32 = 0x182;
+pub const TPM_CC_NV_CERTIFY: u32 = 0x184;
 pub const TPM_CC_EVENT_SEQUENCE_COMPLETE: u32 = 0x185;
 pub const TPM_CC_HASH_SEQUENCE_START: u32 = 0x186;
 pub const TPM_CC_POLICY_PHYSICAL_PRESENCE: u32 = 0x187;
@@ -343,9 +352,34 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_STARTUP, startup).nv().no_sessions(),
     Command::new(TPM_CC_SHUTDOWN, shutdown).nv(),
     Command::new(TPM_CC_STIR_RANDOM, stir_random).nv().decrypt(),
+    Command::new(TPM_CC_ACTIVATE_CREDENTIAL, attest::activate_credential)
+        .handles(&[H::Object(false), H::Object(false)], 2)
+        .admin()
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_CERTIFY, attest::certify)
+        .handles(&[H::Object(false), H::Object(true)], 2)
+        .admin()
+        .decrypt()
+        .encrypt(),
     Command::new(TPM_CC_POLICY_NV, policy::policy_nv)
         .handles(&[H::NvAuth, H::NvIndex, H::PolicySession], 1)
         .decrypt(),
+    Command::new(TPM_CC_CERTIFY_CREATION, attest::certify_creation)
+        .handles(&[H::Object(true), H::Object(false)], 1)
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_GET_TIME, attest::get_time)
+        .handles(&[H::Endorsement, H::Object(true)], 2)
+        .decrypt()
+        .encrypt(),
+    Command::new(
+        TPM_CC_GET_SESSION_AUDIT_DIGEST,
+        attest::get_session_audit_digest,
+    )
+    .handles(&[H::Endorsement, H::Object(true), H::HmacSession], 2)
+    .decrypt()
+    .encrypt(),
     Command::new(TPM_CC_NV_READ, nv::read)
         .handles(&[H::NvAuth, H::NvIndex], 1)
         .encrypt(),
@@ -376,6 +410,10 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_LOAD, key::load)
         .handles(&[H::Object(false)], 1)
         .response_handle()
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_QUOTE, attest::quote)
+        .handles(&[H::Object(true)], 1)
         .decrypt()
         .encrypt(),
     Command::new(TPM_CC_RSA_DECRYPT, signing::rsa_decrypt)
@@ -414,6 +452,10 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_FLUSH_CONTEXT, context::flush_context).no_sessions(),
     Command::new(TPM_CC_LOAD_EXTERNAL, key::load_external)
         .response_handle()
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_MAKE_CREDENTIAL, attest::make_credential)
+        .handles(&[H::Object(false)], 0)
         .decrypt()
         .encrypt(),
     Command::new(TPM_CC_NV_READ_PUBLIC, nv::read_public)
@@ -469,6 +511,10 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_PCR_EXTEND, pcr_extend)
         .handles(&[H::Pcr(true)], 1)
         .nv(),
+    Command::new(TPM_CC_NV_CERTIFY, attest::nv_certify)
+        .handles(&[H::Object(true), H::NvAuth, H::NvIndex], 2)
+        .decrypt()
+        .encrypt(),
     Command::new(
         TPM_CC_EVENT_SEQUENCE_COMPLETE,
         object::event_sequence_complete,

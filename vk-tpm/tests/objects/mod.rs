@@ -278,7 +278,7 @@ pub fn rsa_decrypt(key: u32, ciphertext: &[u8], scheme: &[u8], label: &[u8]) -> 
 
 const RSASSA_SHA256: &[u8] = &[0, 0x14, 0, 0x0b];
 const RSAPSS_SHA384: &[u8] = &[0, 0x16, 0, 0x0c];
-const ECDSA_SHA256: &[u8] = &[0, 0x18, 0, 0x0b];
+pub const ECDSA_SHA256: &[u8] = &[0, 0x18, 0, 0x0b];
 const OAEP_SHA256: &[u8] = &[0, 0x17, 0, 0x0b];
 const RSAES: &[u8] = &[0, 0x15];
 
@@ -1457,7 +1457,7 @@ pub fn answers_randomly(code: u32) -> bool {
             | OBJECT_CHANGE_AUTH
             | READ_CLOCK
             | CREATE_LOADED
-    )
+    ) || attest::answers_randomly(code)
 }
 
 /// The object commands the mutation pass starts from, on seeded TPMs: primaries and what uses

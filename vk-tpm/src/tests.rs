@@ -117,9 +117,11 @@ fn valid_handle(kind: HandleKind) -> u32 {
         // The sequence the test starts first.
         HandleKind::Object(_) => 0x8000_0000,
         HandleKind::Entity(_) | HandleKind::Parent => TPM_RH_OWNER,
-        // The index and the policy session the test makes first.
+        // The index and the sessions the test makes first.
         HandleKind::NvAuth | HandleKind::NvIndex => NV_INDEX,
         HandleKind::PolicySession => 0x0300_0000,
+        HandleKind::HmacSession => 0x0200_0001,
+        HandleKind::Endorsement => TPM_RH_ENDORSEMENT,
     }
 }
 
@@ -193,6 +195,12 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_EVICT_CONTROL => &[0x81, 0, 0, 1],
             TPM_CC_CREATE_PRIMARY | TPM_CC_CREATE => &create,
             TPM_CC_LOAD => &load,
+            // qualifyingData, a NULL scheme (and the rest).
+            TPM_CC_CERTIFY | TPM_CC_GET_TIME | TPM_CC_GET_SESSION_AUDIT_DIGEST => &[0, 0, 0, 0x10],
+            TPM_CC_QUOTE => &[0, 0, 0, 0x10, 0, 0, 0, 0],
+            TPM_CC_NV_CERTIFY => &[0, 0, 0, 0x10, 0, 0, 0, 0],
+            TPM_CC_CERTIFY_CREATION => &[0, 0, 0, 0, 0, 0x10, 0x80, 0x21, 0x40, 0, 0, 7, 0, 0],
+            TPM_CC_MAKE_CREDENTIAL | TPM_CC_ACTIVATE_CREDENTIAL => &[0, 0, 0, 0],
             TPM_CC_CREATE_LOADED => &create_loaded,
             TPM_CC_LOAD_EXTERNAL => &load_external,
             TPM_CC_READ_PUBLIC
@@ -270,14 +278,13 @@ fn every_command_refuses_trailing_parameter_bytes() {
                 | nv::attr::AUTHWRITE
                 | nv::attr::AUTHREAD;
             assert_eq!(nv_define(&mut tpm, NV_INDEX, attributes, 8), 0);
-            let policy = [&[0, 16][..], &[0; 16], &[0, 0, 1, 0, 0x10, 0, 0x0b]].concat();
-            let start = command(
-                TPM_CC_START_AUTH_SESSION,
-                &[TPM_RH_NULL, TPM_RH_NULL],
-                None,
-                &policy,
-            );
-            assert_eq!(rc(&tpm.process(&start)), 0);
+            // A policy session, then an HMAC session.
+            for kind in [1, 0] {
+                let p = [&[0, 16][..], &[0; 16], &[0, 0, kind, 0, 0x10, 0, 0x0b]].concat();
+                let nulls = [TPM_RH_NULL, TPM_RH_NULL];
+                let start = command(TPM_CC_START_AUTH_SESSION, &nulls, None, &p);
+                assert_eq!(rc(&tpm.process(&start)), 0);
+            }
         }
         let handles: Vec<u32> = cmd.handles.iter().map(|&k| valid_handle(k)).collect();
         let passwords = vec![&b""[..]; cmd.auth];

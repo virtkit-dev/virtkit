@@ -14,6 +14,7 @@
     clippy::arithmetic_side_effects
 )]
 
+mod attest;
 mod client;
 mod libtpms;
 mod nv;
@@ -1821,6 +1822,7 @@ fn mutated_commands_match() {
         &objects::mutation_corpus(),
         &nv::mutation_corpus(),
         &policy::mutation_corpus(),
+        &attest::mutation_corpus(),
     ]
     .concat();
     // xorshift: a fixed seed, so a failure reproduces.

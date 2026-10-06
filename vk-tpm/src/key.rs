@@ -26,9 +26,11 @@ use crate::state::{Seed, StateError, read_bool};
 use crate::{LOCALITY, Out, Tpm};
 
 /// TPM_ST_CREATION, the tag of a TPMT_TK_CREATION.
-const TPM_ST_CREATION: u16 = 0x8021;
+pub const TPM_ST_CREATION: u16 = 0x8021;
 /// TPM2B_DATA: sizeof(TPMT_HA).
 pub const MAX_DATA: usize = 2 + MAX_DIGEST;
+/// TPM2B_ENCRYPTED_SECRET: sizeof(TPMU_ENCRYPTED_SECRET), an RSA-4096 block as libtpms sizes it.
+pub const MAX_ENCRYPTED_SECRET: usize = public::MAX_RSA_KEY_BYTES;
 /// TPM2B_PRIVATE: sizeof(_PRIVATE), two TPM2B_DIGESTs and a TPM2B_SENSITIVE as the reference
 /// lays them out.
 pub const MAX_PRIVATE: usize = 2 * (2 + MAX_DIGEST) + 2 + 2 + 2 * (2 + MAX_DIGEST) + 2 + 1280;
@@ -152,6 +154,40 @@ impl Key {
                     own_x,
                     name_alg.size(),
                 ))
+            }
+            _ => Err(Rc::FAILURE),
+        }
+    }
+
+    /// CryptSecretEncrypt: a new seed of the key's nameAlg digest size, and that seed encrypted
+    /// to the key with `label`, as [`Key::decrypt_secret`] decrypts it: RSA-OAEP with the
+    /// nameAlg, or an ephemeral ECDH key and KDFe. The public area is all it takes.
+    pub fn encrypt_secret(&self, label: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
+        let hash = self.public.name_alg.ok_or(Rc::FAILURE)?;
+        if !self.public.has(attr::DECRYPT) {
+            return Err(Rc::ATTRIBUTES);
+        }
+        match (&self.public.params, &self.public.unique) {
+            (Params::Rsa { exponent, .. }, Unique::Rsa(n)) => {
+                let mut seed = Zeroizing::new(vec![0; hash.size()]);
+                getrandom::fill(&mut seed).map_err(|_| Rc::FAILURE)?;
+                let public = asym::rsa_public(n, *exponent)?;
+                let oaep = public::TPM_ALG_OAEP;
+                let secret = asym::rsa_encrypt(&public, oaep, Some(hash), label, &seed)?;
+                Ok((seed, secret))
+            }
+            (Params::Ecc { .. }, Unique::Ecc { x, y }) => {
+                if asym::point(x, y).is_none() {
+                    return Err(Rc::KEY);
+                }
+                let ephemeral = asym::ecc_random()?;
+                let (ex, ey) = asym::ecc_public(ephemeral.as_slice())?;
+                let (zx, _) =
+                    asym::ecc_multiply(ephemeral.as_slice(), x, y).map_err(|_| Rc::KEY)?;
+                let seed = crypt::kdfe(hash, &zx, label, &ex, x, hash.size());
+                let mut point = Writer::new();
+                point.tpm2b(&ex).tpm2b(&ey);
+                Ok((seed, point.into_bytes()))
             }
             _ => Err(Rc::FAILURE),
         }
@@ -338,18 +374,54 @@ pub fn hash_block_size(hash: Hash) -> usize {
     }
 }
 
-/// The parent's nameAlg, and the symmetric key and HMAC key that protect a child.
-type Protection = (Hash, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
+/// The protector's nameAlg, and the symmetric key and HMAC key that protect a child.
+pub type Protection = (Hash, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
 
-/// The keys that protect a child of `parent` named `name` (ComputeProtectionKeyParms,
-/// ComputeOuterIntegrity).
+/// The keys that protect a child of `parent` named `name`.
 fn protection(parent: &Key, name: &[u8]) -> Result<Protection> {
-    let hash = parent.public.name_alg.ok_or(Rc::FAILURE)?;
-    let def = parent.public.params.symmetric().ok_or(Rc::FAILURE)?;
-    let seed = parent.seed();
+    protection_with(parent, parent.seed(), name)
+}
+
+/// The keys `protector` protects what is named `name` with, from `seed` (its own, or a seed
+/// from outside: a credential's) (ComputeProtectionKeyParms, ComputeOuterIntegrity).
+pub fn protection_with(protector: &Key, seed: &[u8], name: &[u8]) -> Result<Protection> {
+    let hash = protector.public.name_alg.ok_or(Rc::FAILURE)?;
+    let def = protector.public.params.symmetric().ok_or(Rc::FAILURE)?;
     let sym = crypt::kdfa(hash, seed, b"STORAGE", name, &[], def.key_bytes());
     let hmac = crypt::kdfa(hash, seed, b"INTEGRITY", &[], &[], hash.size());
     Ok((hash, sym, hmac))
+}
+
+/// ProduceOuterWrap without an IV, as a credential or a duplicate is wrapped for `protector`:
+/// HMAC ‖ `data` encrypted with AES-CFB (a zero IV), under the keys of `seed` and `name`.
+pub fn outer_wrap(protector: &Key, seed: &[u8], name: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+    let (hash, sym, hmac) = protection_with(protector, seed, name)?;
+    let mut data = Zeroizing::new(data.to_vec());
+    crypt::aes_cfb(&sym, &[0; IV_SIZE], &mut data, true)?;
+    let integrity = crypt::hmac(hash, &hmac, &[&data, name]);
+    let mut out = Writer::new();
+    out.tpm2b(&integrity).bytes(&data);
+    Ok(out.into_bytes())
+}
+
+/// UnwrapOuter without an IV: check the HMAC `blob` starts with (TPM_RC_INTEGRITY), and
+/// decrypt the rest.
+pub fn outer_unwrap(
+    protector: &Key,
+    seed: &[u8],
+    name: &[u8],
+    blob: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    let mut r = Reader::new(blob);
+    let integrity = r.tpm2b(MAX_DIGEST)?;
+    let (hash, sym, hmac) = protection_with(protector, seed, name)?;
+    let expected = crypt::hmac(hash, &hmac, &[r.rest(), name]);
+    if !bool::from(subtle::ConstantTimeEq::ct_eq(integrity, &expected[..])) {
+        return Err(Rc::INTEGRITY);
+    }
+    let mut data = Zeroizing::new(r.rest().to_vec());
+    crypt::aes_cfb(&sym, &[0; IV_SIZE], &mut data, false)?;
+    Ok(data)
 }
 
 /// SensitiveToPrivate: the TPM2B_PRIVATE of a child of `parent`: integrity ‖ IV ‖ the
@@ -602,10 +674,20 @@ impl Tpm {
     /// TicketComputeCreation: TPMT_TK_CREATION, an HMAC with the hierarchy's proof over the
     /// Name and the creation digest.
     fn creation_ticket(&self, hierarchy: u32, name: &[u8], creation_hash: &[u8], w: &mut Writer) {
+        let ticket = self.creation_ticket_digest(hierarchy, name, creation_hash);
+        w.u16(TPM_ST_CREATION).u32(hierarchy).tpm2b(&ticket);
+    }
+
+    /// The digest of a creation ticket: HMAC(proof, TPM_ST_CREATION ‖ Name ‖ creationHash).
+    pub fn creation_ticket_digest(
+        &self,
+        hierarchy: u32,
+        name: &[u8],
+        creation_hash: &[u8],
+    ) -> Vec<u8> {
         let tag = TPM_ST_CREATION.to_be_bytes();
         let proof = self.proof(hierarchy);
-        let ticket = crypt::hmac(Hash::Sha512, proof.as_slice(), &[&tag, name, creation_hash]);
-        w.u16(TPM_ST_CREATION).u32(hierarchy).tpm2b(&ticket);
+        crypt::hmac(Hash::Sha512, proof.as_slice(), &[&tag, name, creation_hash])
     }
 
     /// Flush the objects of a hierarchy being disabled or cleared (ObjectFlushHierarchy).

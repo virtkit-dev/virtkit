@@ -25,7 +25,7 @@ use crate::{Out, Tpm};
 pub const TPM_ST_VERIFIED: u16 = 0x8022;
 
 /// CryptSelectSignScheme: the scheme a key signs with, from its own and the caller's.
-fn select_sign_scheme(key: &Key, requested: Scheme) -> Option<Scheme> {
+pub fn select_sign_scheme(key: &Key, requested: Scheme) -> Option<Scheme> {
     let kind = key.public.kind();
     let own = match kind {
         Type::Rsa | Type::Ecc | Type::KeyedHash => key.public.params.scheme(),
@@ -88,7 +88,7 @@ pub fn sign(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, w: &mut Out) -> Resu
 }
 
 /// CryptSign: the TPMT_SIGNATURE.
-fn write_signature(
+pub fn write_signature(
     key: &Key,
     scheme: Scheme,
     hash: Hash,

@@ -20,6 +20,7 @@
 
 mod alg;
 mod asym;
+mod attest;
 mod capability;
 mod commands;
 mod context;

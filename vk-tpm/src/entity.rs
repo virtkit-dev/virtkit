@@ -80,6 +80,10 @@ pub enum HandleKind {
     NvIndex,
     /// TPMI_SH_POLICY: a policy session.
     PolicySession,
+    /// TPMI_SH_HMAC: an HMAC session.
+    HmacSession,
+    /// TPMI_RH_ENDORSEMENT: the endorsement hierarchy (the privacy administrator).
+    Endorsement,
 }
 
 impl HandleKind {
@@ -122,6 +126,8 @@ impl HandleKind {
             }
             HandleKind::NvIndex => nv::is_nv_index(handle),
             HandleKind::PolicySession => POLICY_SESSIONS.contains(&handle),
+            HandleKind::HmacSession => HMAC_SESSIONS.contains(&handle),
+            HandleKind::Endorsement => handle == TPM_RH_ENDORSEMENT,
         };
         if ok { Ok(()) } else { Err(Rc::VALUE) }
     }
