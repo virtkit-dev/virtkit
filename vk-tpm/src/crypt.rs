@@ -66,10 +66,6 @@ pub fn kdfa(
 /// KDFe (SP 800-56A concatenation, the hash itself as the PRF): `bytes` bytes of key stream from
 /// the shared secret `z`. Each block is H(counter ‖ Z ‖ label ‖ partyUInfo ‖ partyVInfo), with
 /// `label` hashed as given: its terminating 0 included.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "ECC salts and credentials come with ECC keys")
-)]
 pub fn kdfe(
     hash: Hash,
     z: &[u8],

@@ -118,6 +118,44 @@ impl Key {
         }
     }
 
+    /// CryptSecretDecrypt for an asymmetric key: a secret encrypted to it, as a salt or a
+    /// credential seed is, with `label` (its terminating zero included). RSA: OAEP with the
+    /// key's scheme hash, its nameAlg if it has none; at most a digest long. ECC: the TPMS_ECC_POINT
+    /// of an ephemeral key, Z = [d]Q, and KDFe over Z's x-coordinate.
+    pub fn decrypt_secret(&self, label: &[u8], secret: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        let name_alg = self.public.name_alg.ok_or(Rc::SCHEME)?;
+        match (&self.public.params, &self.public.unique) {
+            (Params::Rsa { scheme, .. }, _) => {
+                let (alg, hash) = if scheme.is_null() {
+                    (public::TPM_ALG_OAEP, name_alg)
+                } else {
+                    (scheme.alg, scheme.hash.ok_or(Rc::SCHEME)?)
+                };
+                if alg != public::TPM_ALG_OAEP {
+                    return Err(Rc::SCHEME);
+                }
+                let data = asym::rsa_decrypt(self.rsa()?, alg, Some(hash), label, secret)?;
+                if data.len() > hash.size() {
+                    return Err(Rc::VALUE);
+                }
+                Ok(data)
+            }
+            (Params::Ecc { .. }, Unique::Ecc { x: own_x, .. }) => {
+                let (x, y) = public::read_point(&mut Reader::new(secret))?;
+                let (zx, _) = asym::ecc_multiply(self.ecc_secret()?, &x, &y)?;
+                Ok(crypt::kdfe(
+                    name_alg,
+                    &zx,
+                    label,
+                    &x,
+                    own_x,
+                    name_alg.size(),
+                ))
+            }
+            _ => Err(Rc::FAILURE),
+        }
+    }
+
     /// The seed that protects its children (a parent's seedValue).
     fn seed(&self) -> &[u8] {
         self.sensitive.as_ref().map_or(&[][..], |s| &s.seed)
@@ -946,6 +984,44 @@ pub(crate) mod tests {
         let mut tampered = private.clone();
         *tampered.last_mut().unwrap() ^= 1;
         assert_eq!(unwrap(&srk, b"name", &tampered).err(), Some(Rc::INTEGRITY));
+    }
+
+    #[test]
+    fn salts_decrypt_with_oaep_or_ecdh() {
+        // RSA: OAEP with the nameAlg, "SECRET".
+        let rsa = rsa_storage_key(2048);
+        let Unique::Rsa(n) = &rsa.public.unique else {
+            panic!("an RSA key");
+        };
+        let public = asym::rsa_public(n, 0).unwrap();
+        let salt = [5u8; 64];
+        let c = asym::rsa_encrypt(
+            &public,
+            public::TPM_ALG_OAEP,
+            Some(Hash::Sha512),
+            b"SECRET\0",
+            &salt,
+        )
+        .unwrap();
+        assert_eq!(*rsa.decrypt_secret(b"SECRET\0", &c).unwrap(), salt);
+        assert_eq!(rsa.decrypt_secret(b"OTHER\0", &c), Err(Rc::VALUE));
+        // ECC: an ephemeral point; Z's x-coordinate through KDFe.
+        let srk = ecc_srk();
+        let Unique::Ecc { x, y } = &srk.public.unique else {
+            panic!("an ECC key");
+        };
+        let e = asym::ecc_random().unwrap();
+        let (ex, ey) = asym::ecc_public(e.as_slice()).unwrap();
+        let (zx, _) = asym::ecc_multiply(e.as_slice(), x, y).unwrap();
+        let expected = crypt::kdfe(Hash::Sha256, &zx, b"SECRET\0", &ex, x, 32);
+        let mut point = Writer::new();
+        point.tpm2b(&ex).tpm2b(&ey);
+        let point = point.into_bytes();
+        assert_eq!(*srk.decrypt_secret(b"SECRET\0", &point).unwrap(), *expected);
+        assert_eq!(
+            srk.decrypt_secret(b"SECRET\0", &point[..10]),
+            Err(Rc::INSUFFICIENT)
+        );
     }
 
     #[test]

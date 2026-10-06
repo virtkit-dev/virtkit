@@ -738,7 +738,8 @@ impl Tpm {
         Ok(())
     }
 
-    /// SessionCreate: a new session in the first free handle.
+    /// SessionCreate: a new session in the first free handle, keyed by the bind entity's
+    /// authValue and the salt.
     fn create_session(
         &mut self,
         kind: Kind,
@@ -746,6 +747,7 @@ impl Tpm {
         nonce_caller: &[u8],
         symmetric: Symmetric,
         bind: u32,
+        salt: &[u8],
     ) -> Result<(u32, Vec<u8>)> {
         if self.session_count() >= MAX_LOADED {
             return Err(Rc::SESSION_MEMORY);
@@ -760,12 +762,12 @@ impl Tpm {
             .ok_or(Rc::SESSION_HANDLES)?;
         let mut nonce_tpm = vec![0; nonce_caller.len()];
         getrandom::fill(&mut nonce_tpm).map_err(|_| Rc::FAILURE)?;
-        // No salt yet.
-        let key = if bind == TPM_RH_NULL {
+        let key = if bind == TPM_RH_NULL && salt.is_empty() {
             Zeroizing::new(Vec::new())
         } else {
-            let auth = self.entity_auth(bind);
-            crypt::kdfa(hash, &auth, b"ATH", &nonce_tpm, nonce_caller, hash.size())
+            let mut secret = self.entity_auth(bind);
+            secret.extend_from_slice(salt);
+            crypt::kdfa(hash, &secret, b"ATH", &nonce_tpm, nonce_caller, hash.size())
         };
         let bound = (bind != TPM_RH_NULL && kind == Kind::Hmac).then(|| self.bind_value(bind));
         let da_bound = bind != TPM_RH_NULL && !self.is_da_exempt(bind);
@@ -869,8 +871,8 @@ fn read_symmetric(r: &mut Reader) -> Result<(Symmetric, u16)> {
     }
 }
 
-/// TPM2_StartAuthSession: an HMAC, policy or trial session, bound to an entity or not. Salted
-/// sessions need a loaded RSA or ECC key, which no command can load yet.
+/// TPM2_StartAuthSession: an HMAC, policy or trial session, bound to an entity or not, salted
+/// or not: the salt comes encrypted to `tpmKey` (RSA-OAEP, or ECDH and KDFe).
 pub fn start_auth_session(
     tpm: &mut Tpm,
     handles: &[u32],
@@ -878,7 +880,7 @@ pub fn start_auth_session(
     w: &mut Out,
 ) -> Result<()> {
     let nonce_caller = r.tpm2b(MAX_AUTH).map_err(|rc| rc.param(1))?;
-    let salt = r.tpm2b(MAX_ENCRYPTED_SECRET).map_err(|rc| rc.param(2))?;
+    let encrypted_salt = r.tpm2b(MAX_ENCRYPTED_SECRET).map_err(|rc| rc.param(2))?;
     let kind = match r.u8().map_err(|rc| rc.param(3))? {
         0x00 => Kind::Hmac,
         0x01 => Kind::Policy,
@@ -892,13 +894,28 @@ pub fn start_auth_session(
         return Err(Rc::SIZE.param(1));
     }
     let tpm_key = handles.first().copied().ok_or(Rc::FAILURE)?;
-    if tpm_key != TPM_RH_NULL {
-        // Salts are not decrypted yet.
-        return Err(Rc::KEY.handle(1));
-    }
-    if !salt.is_empty() {
-        return Err(Rc::VALUE.param(2));
-    }
+    let salt = if tpm_key == TPM_RH_NULL {
+        if !encrypted_salt.is_empty() {
+            return Err(Rc::VALUE.param(2));
+        }
+        Zeroizing::new(Vec::new())
+    } else {
+        let key = tpm.key(tpm_key).ok_or(Rc::KEY.handle(1))?;
+        if !key.public.kind().is_asymmetric() {
+            return Err(Rc::KEY.handle(1));
+        }
+        if encrypted_salt.is_empty() {
+            return Err(Rc::VALUE.param(2));
+        }
+        if key.public_only() {
+            return Err(Rc::HANDLE.handle(1));
+        }
+        if !key.public.has(crate::public::attr::DECRYPT) {
+            return Err(Rc::ATTRIBUTES.handle(1));
+        }
+        key.decrypt_secret(b"SECRET\0", encrypted_salt)
+            .map_err(|_| Rc::VALUE.param(2))?
+    };
     let bind = handles.get(1).copied().ok_or(Rc::FAILURE)?;
     if handle_type(bind) == TPM_HT_TRANSIENT && tpm.key(bind).is_some_and(|k| k.public_only()) {
         return Err(Rc::HANDLE.handle(2));
@@ -906,7 +923,8 @@ pub fn start_auth_session(
     if matches!(symmetric, Symmetric::Aes(_)) && mode != TPM_ALG_CFB {
         return Err(Rc::MODE.param(4));
     }
-    let (handle, nonce_tpm) = tpm.create_session(kind, hash, nonce_caller, symmetric, bind)?;
+    let (handle, nonce_tpm) =
+        tpm.create_session(kind, hash, nonce_caller, symmetric, bind, &salt)?;
     w.handle = Some(handle);
     w.tpm2b(&nonce_tpm);
     Ok(())

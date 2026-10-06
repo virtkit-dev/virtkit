@@ -161,7 +161,7 @@ const METHOD: u32 = 1 << 10;
 /// TPM_ALG_ID order. Only what the TPM actually implements: a client picks from this list.
 /// AES only in CFB mode (parameter encryption, the protection of objects and contexts); MGF1
 /// and the KDFs as OAEP, PSS, KDFe and KDFa use them.
-pub const IMPLEMENTED: [(u16, u32); 20] = [
+pub const IMPLEMENTED: [(u16, u32); 21] = [
     (0x0001, ASYMMETRIC | OBJECT), // TPM_ALG_RSA
     (TPM_ALG_SHA1, HASH),
     (0x0005, HASH | SIGNING),                       // TPM_ALG_HMAC
@@ -178,6 +178,7 @@ pub const IMPLEMENTED: [(u16, u32); 20] = [
     (0x0017, ASYMMETRIC | ENCRYPTING), // TPM_ALG_OAEP
     (0x0018, ASYMMETRIC | SIGNING),    // TPM_ALG_ECDSA
     (0x0019, ASYMMETRIC | METHOD),     // TPM_ALG_ECDH
+    (0x0020, HASH | METHOD),           // TPM_ALG_KDF1_SP800_56A
     (0x0022, HASH | METHOD),           // TPM_ALG_KDF1_SP800_108
     (0x0023, ASYMMETRIC | OBJECT),     // TPM_ALG_ECC
     (0x0025, OBJECT),                  // TPM_ALG_SYMCIPHER
