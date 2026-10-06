@@ -18,6 +18,7 @@ mod client;
 mod libtpms;
 mod nv;
 mod objects;
+mod policy;
 
 use client::{Auth, Sym};
 use libtpms::LibTpms;
@@ -1819,6 +1820,7 @@ fn mutated_commands_match() {
         &corpus[..],
         &objects::mutation_corpus(),
         &nv::mutation_corpus(),
+        &policy::mutation_corpus(),
     ]
     .concat();
     // xorshift: a fixed seed, so a failure reproduces.
@@ -1852,8 +1854,14 @@ fn mutated_commands_match() {
         let code = c
             .get(6..10)
             .map(|b| u32::from_be_bytes(b.try_into().unwrap()));
-        // A command code libtpms implements and vk-tpm does not yet: a different answer.
+        // A command code libtpms implements and vk-tpm does not (yet): a different answer.
         let ours_unknown = rc(&ours) == 0x143 && rc(&theirs) != 0x143;
+        // TPM2_PolicyCommandCode of such a command: libtpms' session now differs, start over.
+        if code == Some(policy::POLICY_COMMAND_CODE) && rc(&ours) == 0x1e4 && rc(&theirs) == 0 {
+            drop(both);
+            both = Both::seeded();
+            continue;
+        }
         // An algorithm or a curve vk-tpm does not implement (refused when unmarshalled, or a
         // scheme it cannot run): libtpms may take it. A key libtpms made of it alone would set
         // the two apart: start again.

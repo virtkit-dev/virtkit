@@ -23,6 +23,7 @@ pub const NV_READ_PUBLIC: u32 = 0x169;
 pub const PPWRITE: u32 = 1 << 0;
 pub const OWNERWRITE: u32 = 1 << 1;
 pub const AUTHWRITE: u32 = 1 << 2;
+pub const POLICYWRITE: u32 = 1 << 3;
 pub const COUNTER: u32 = 1 << 4;
 pub const BITS: u32 = 2 << 4;
 pub const EXTEND: u32 = 4 << 4;
