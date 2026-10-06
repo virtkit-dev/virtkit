@@ -548,7 +548,19 @@ async fn disconnect_hangs_up_a_tty_exec() {
     .expect("remote process still alive after client disconnect");
     let elapsed = started.elapsed();
     assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
-    let hup = std::fs::read_to_string(&hup_file).unwrap_or_default();
+    // The hang-up reaches the job and shell together, so the job can be reaped before
+    // the shell's trap writes its file. A shell that got no SIGHUP is killed after the
+    // grace period without writing it; the deadline outlasts that period.
+    let hup = timeout(Duration::from_secs(10), async {
+        loop {
+            match std::fs::read_to_string(&hup_file) {
+                Ok(hup) if hup.ends_with('\n') => return hup,
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_default();
     assert_eq!(hup.trim(), "hup", "the shell got no SIGHUP");
     let _ = std::fs::remove_file(&pid_file);
     let _ = std::fs::remove_file(&hup_file);
