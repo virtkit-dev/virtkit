@@ -349,7 +349,7 @@ EOF
 
 echo
 echo "built into $OUT/:"
-file "$OUT/vk" "$OUT/vk-agent"
+if command -v file >/dev/null 2>&1; then file "$OUT/vk" "$OUT/vk-agent"; fi
 echo
 cat "$OUT/build-info.txt"
 
