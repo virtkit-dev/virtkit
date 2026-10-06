@@ -775,7 +775,8 @@ pub fn toolchain_client() -> Result<reqwest::Client> {
 /// Download `url` into `dest`, requiring it to hash to `sha256` — the digest the caller
 /// already holds, rather than one fetched beside the bytes, which is what makes this
 /// usable against a mirror. Published atomically with `mode`, so `dest` never exists
-/// holding a partial or unverified file, and a failure leaves nothing behind.
+/// holding a partial or unverified file, and a failure leaves nothing behind. So does
+/// dropping the future, as a timeout around it does.
 pub async fn fetch(
     client: &reqwest::Client,
     url: &str,
@@ -795,26 +796,38 @@ pub async fn fetch(
     name.push(dest.file_name().unwrap_or_default());
     name.push(format!(".{}.tmp", std::process::id()));
     let tmp = dir.join(name);
-    let outcome = fetch_into(client, url, &want, &tmp, dir, dest, mode).await;
-    if outcome.is_err() {
-        // Best-effort: an unverified download must not be left lying beside the artifact,
-        // but the original error is what the caller needs to see.
-        let _ = fs::remove_file(&tmp);
-    }
-    outcome
+    // Armed only once the file is ours: one already at the path is refused untouched.
+    let file = create_tmp(&tmp, dir, "download")?;
+    let mut unpublished = Unpublished(Some(&tmp));
+    fetch_into(client, url, &want, file, &tmp, mode).await?;
+    publish(&tmp, dest, dir)?;
+    unpublished.0 = None;
+    Ok(())
 }
 
-/// The body of [`fetch`], with the temporary file's cleanup left to the caller.
+/// Remove an unpublished download's temporary file on drop, including after an error or
+/// cancellation, so unverified bytes do not remain beside the artifact. Cleanup is best
+/// effort to preserve the original error.
+struct Unpublished<'a>(Option<&'a Path>);
+
+impl Drop for Unpublished<'_> {
+    fn drop(&mut self) {
+        if let Some(tmp) = self.0 {
+            let _ = fs::remove_file(tmp);
+        }
+    }
+}
+
+/// The body of [`fetch`]: `tmp` downloaded, verified, given `mode` and flushed, ready to be
+/// published. Its cleanup is left to the caller.
 async fn fetch_into(
     client: &reqwest::Client,
     url: &str,
     want: &[u8; 32],
+    mut file: fs::File,
     tmp: &Path,
-    dir: &Path,
-    dest: &Path,
     mode: u32,
 ) -> Result<()> {
-    let mut file = create_tmp(tmp, dir, "download")?;
     let resp = client
         .get(url)
         .send()
@@ -847,8 +860,7 @@ async fn fetch_into(
         .with_context(|| format!("setting the mode on {}", tmp.display()))?;
     file.sync_all()
         .with_context(|| format!("flushing {} to disk", tmp.display()))?;
-    drop(file);
-    publish(tmp, dest, dir)
+    Ok(())
 }
 
 /// An HTTP client identifying itself as `user_agent` — GitHub's API rejects requests without
@@ -2065,6 +2077,47 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    // A caller's timeout drops the future mid-download: the partial body must not stay
+    // beside the artifact, since nothing would ever remove it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_dropped_mid_download_leaves_no_temp_behind() {
+        use std::io::Read;
+
+        let client = test_client();
+        let s = Scratch::new(&VK, "dropped", 0o755);
+        // Announces more than it sends, then stalls until the client goes away.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let _ = conn.read(&mut [0u8; 4096]);
+            conn.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\npartial")
+                .unwrap();
+            let _ = conn.read_to_end(&mut Vec::new());
+        });
+
+        let dest = s.dir.join("vmlinux");
+        let tmp = s.dir.join(format!(".vmlinux.{}.tmp", std::process::id()));
+        let url = format!("http://{addr}/vmlinux");
+        // Boxed rather than pinned on the stack, so the `drop` below ends the future itself.
+        let mut fetching = Box::pin(fetch(&client, &url, FAKE_SUM, &dest, 0o644));
+        // Driven until the partial body is on disk, then abandoned.
+        let started = std::time::Instant::now();
+        while fs::metadata(&tmp).map_or(true, |m| m.len() == 0) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "nothing was written"
+            );
+            tokio::select! {
+                r = &mut fetching => panic!("the stalled fetch ended: {r:?}"),
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+        drop(fetching);
+        assert!(!tmp.exists(), "{} was left behind", tmp.display());
+        assert!(!dest.exists());
     }
 
     // A tag that was never released and an exhausted API quota are different problems:

@@ -29,4 +29,4 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 rustls.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
