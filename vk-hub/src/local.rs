@@ -1228,12 +1228,20 @@ mod tests {
 
         // Taken on ::1 alone, as a squatter would take it: refused too, and drawn around. A
         // port of its own rather than the one just freed, which a child forked meanwhile by a
-        // test beside this one may hold until it execs.
+        // test beside this one may hold until it execs. The kernel-assigned ::1 squatter
+        // port may already be in use on 127.0.0.1 by any socket of any process. That refusal
+        // names 127.0.0.1 and does not test IPv6 refusal, so draw again.
         if has_v6 {
-            let squatter =
-                crate::server::listen(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0)).unwrap();
-            let port = squatter.local_addr().unwrap().port();
-            let err = format!("{:#}", bind_port(Some(port)).unwrap_err());
+            let (squatter, port, err) = (0..10)
+                .find_map(|_| {
+                    let squatter =
+                        crate::server::listen(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 0))
+                            .unwrap();
+                    let port = squatter.local_addr().unwrap().port();
+                    let err = format!("{:#}", bind_port(Some(port)).unwrap_err());
+                    (!err.contains("127.0.0.1")).then_some((squatter, port, err))
+                })
+                .expect("a port taken on ::1 alone");
             assert!(err.contains(&format!("port {port} is taken")), "{err}");
             assert!(err.contains("[::1]"), "{err}");
             let (drawn, listeners) = bind_port(Some(0)).unwrap();
