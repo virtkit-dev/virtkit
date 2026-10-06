@@ -54,6 +54,8 @@ const TPM_ST_SESSIONS: u16 = 0x8002;
 const HEADER_SIZE: usize = 10;
 /// The locality every command comes from: the device offers locality 0 only.
 const LOCALITY: u8 = 0;
+/// Clock is saved every 2^12 ms (NV_CLOCK_UPDATE_INTERVAL; TPM_PT_CLOCK_UPDATE).
+const CLOCK_UPDATE_INTERVAL: u32 = 12;
 
 /// A TPM: its permanent state (what survives power-off) and its volatile state.
 pub struct Tpm {
@@ -134,7 +136,10 @@ impl Tpm {
     /// that fails gets the 10-byte error response the specification gives.
     pub fn process(&mut self, command: &[u8]) -> Vec<u8> {
         // Whatever the command does to the permanent state, a failed authorization included,
-        // is noticed here, so the caller stores it before the guest sees the response.
+        // is noticed here, so the caller stores it before the guest sees the response. Clock
+        // alone does not count: it is stored with the next change (as libtpms does), and a
+        // TPM that loses power without an orderly shutdown says its clock is not safe.
+        let clock = self.permanent.clock_state();
         let before = self.permanent_state();
         let response = self.execute(command);
         // The persistent objects the command named leave their slots, whatever happened.
@@ -144,9 +149,11 @@ impl Tpm {
             w.u16(TPM_ST_NO_SESSIONS).u32(HEADER_SIZE as u32).u32(rc.0);
             w.into_bytes()
         });
+        let now = self.permanent.set_clock_state(clock);
         if *self.permanent_state() != *before {
             self.permanent_changed = true;
         }
+        self.permanent.set_clock_state(now);
         response
     }
 
@@ -231,9 +238,29 @@ impl Tpm {
         Ok(response)
     }
 
-    /// Bring TPM time up to now (TimeUpdate).
+    /// Bring TPM time and Clock up to now (TimeUpdate).
     fn update_time(&mut self) {
-        self.volatile.time = self.clock.now().max(self.volatile.time);
+        let now = self.clock.now().max(self.volatile.time);
+        let elapsed = now.saturating_sub(self.volatile.time);
+        self.volatile.time = now;
+        // Clock is safe again once it crosses an update interval (TimeClockUpdate: the
+        // reference writes it to NV then).
+        const UPDATE_MASK: u64 = (1 << CLOCK_UPDATE_INTERVAL) - 1;
+        let p = &mut self.permanent;
+        let clock = p.clock.saturating_add(elapsed);
+        if clock | UPDATE_MASK > p.clock | UPDATE_MASK {
+            p.clock_safe = true;
+        }
+        p.clock = clock;
+    }
+
+    /// TPMS_CLOCK_INFO.
+    pub fn write_clock_info(&self, w: &mut Writer) {
+        let p = &self.permanent;
+        w.u64(p.clock)
+            .u32(p.reset_count)
+            .u32(self.volatile.restart_count)
+            .u8(p.clock_safe.into());
     }
 
     /// Void an orderly shutdown recorded since Startup (g_clearOrderly): a command changed what

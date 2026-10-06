@@ -139,8 +139,13 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_CREATE_PRIMARY | TPM_CC_CREATE => &create,
             TPM_CC_LOAD => &load,
             TPM_CC_LOAD_EXTERNAL => &load_external,
-            TPM_CC_READ_PUBLIC | TPM_CC_UNSEAL | TPM_CC_CONTEXT_SAVE | TPM_CC_ECDH_KEYGEN => &[],
-            TPM_CC_OBJECT_CHANGE_AUTH => &[0, 0],
+            TPM_CC_READ_PUBLIC
+            | TPM_CC_UNSEAL
+            | TPM_CC_CONTEXT_SAVE
+            | TPM_CC_ECDH_KEYGEN
+            | TPM_CC_GET_TEST_RESULT
+            | TPM_CC_READ_CLOCK => &[],
+            TPM_CC_OBJECT_CHANGE_AUTH | TPM_CC_STIR_RANDOM => &[0, 0],
             TPM_CC_CONTEXT_LOAD => &context,
             TPM_CC_SIGN => &[0, 0, 0, 0x10, 0x80, 0x24, 0x40, 0, 0, 7, 0, 0],
             TPM_CC_VERIFY_SIGNATURE => &[0, 0, 0, 0x10],
@@ -148,6 +153,7 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_ECDH_ZGEN => &[0, 4, 0, 0, 0, 0],
             TPM_CC_HMAC | TPM_CC_HMAC_START => &[0, 0, 0, 0x10],
             TPM_CC_ECC_PARAMETERS => &[0, 3],
+            TPM_CC_TEST_PARMS => &[0, 8, 0, 0x10],
             TPM_CC_GET_CAPABILITY => &[0, 0, 0, 6, 0, 0, 1, 0, 0, 0, 0, 1],
             TPM_CC_GET_RANDOM | TPM_CC_STARTUP | TPM_CC_SHUTDOWN => &[0, 0],
             TPM_CC_SELF_TEST | TPM_CC_CLEAR_CONTROL => &[1],
@@ -340,7 +346,7 @@ fn get_capability_lists_exactly_the_implemented_commands() {
         "HierarchyControl: nv, extensive, 1 handle"
     );
     assert_eq!(
-        *listed.last().unwrap(),
+        listed[listed.len() - 2],
         0x1000_0186,
         "HashSequenceStart: a response handle"
     );
@@ -1205,4 +1211,43 @@ fn persistent_objects_are_kept_in_the_permanent_state() {
     assert_eq!(rc(&tpm.process(&evict(0x8100_0001, 0x8100_0001))), 0);
     let r = tpm.process(&command(TPM_CC_READ_PUBLIC, &[0x8100_0001], None, &[]));
     assert_eq!(rc(&r), Rc::HANDLE.handle(1).0);
+}
+
+#[test]
+fn clock_goes_on_across_power_cycles() {
+    let mut tpm = started();
+    tpm.clock.advance(5000);
+    let read = |tpm: &mut Tpm| {
+        let r = tpm.process(&command(TPM_CC_READ_CLOCK, &[], None, &[]));
+        assert_eq!(rc(&r), 0);
+        // time, clock, resetCount, restartCount, safe
+        let mut p = Reader::new(&r[10..]);
+        let v = (p.u64(), p.u64(), p.u32(), p.u32(), p.u8());
+        (
+            v.0.unwrap(),
+            v.1.unwrap(),
+            v.2.unwrap(),
+            v.3.unwrap(),
+            v.4.unwrap(),
+        )
+    };
+    let (time, clock, resets, restarts, safe) = read(&mut tpm);
+    assert!(time >= 5000 && clock >= 5000);
+    assert_eq!((resets, restarts, safe), (1, 0, 1));
+    // Clock alone does not make the permanent state worth storing.
+    tpm.take_permanent_changed();
+    tpm.clock.advance(1);
+    read(&mut tpm);
+    assert!(!tpm.take_permanent_changed());
+    // An orderly restart: one more restart; a power loss: one more reset, and not safe.
+    tpm.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 1]));
+    let mut tpm = power_cycle(&tpm, 0);
+    let (_, after, resets, restarts, safe) = read(&mut tpm);
+    assert!(after >= clock);
+    assert_eq!((resets, restarts, safe), (1, 1, 1));
+    let mut tpm = power_cycle(&tpm, 0);
+    let (_, _, resets, restarts, safe) = read(&mut tpm);
+    assert_eq!((resets, restarts, safe), (2, 0, 0));
+    tpm.clock.advance(1 << 12);
+    assert_eq!(read(&mut tpm).4, 1, "safe again once stored");
 }

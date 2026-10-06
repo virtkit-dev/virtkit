@@ -31,6 +31,7 @@ pub const TPM_CC_PCR_RESET: u32 = 0x13d;
 pub const TPM_CC_SELF_TEST: u32 = 0x143;
 pub const TPM_CC_STARTUP: u32 = 0x144;
 pub const TPM_CC_SHUTDOWN: u32 = 0x145;
+pub const TPM_CC_STIR_RANDOM: u32 = 0x146;
 pub const TPM_CC_OBJECT_CHANGE_AUTH: u32 = 0x150;
 pub const TPM_CC_CREATE: u32 = 0x153;
 pub const TPM_CC_ECDH_ZGEN: u32 = 0x154;
@@ -53,11 +54,14 @@ pub const TPM_CC_VERIFY_SIGNATURE: u32 = 0x177;
 pub const TPM_CC_ECC_PARAMETERS: u32 = 0x178;
 pub const TPM_CC_GET_CAPABILITY: u32 = 0x17a;
 pub const TPM_CC_GET_RANDOM: u32 = 0x17b;
+pub const TPM_CC_GET_TEST_RESULT: u32 = 0x17c;
 pub const TPM_CC_HASH: u32 = 0x17d;
 pub const TPM_CC_PCR_READ: u32 = 0x17e;
+pub const TPM_CC_READ_CLOCK: u32 = 0x181;
 pub const TPM_CC_PCR_EXTEND: u32 = 0x182;
 pub const TPM_CC_EVENT_SEQUENCE_COMPLETE: u32 = 0x185;
 pub const TPM_CC_HASH_SEQUENCE_START: u32 = 0x186;
+pub const TPM_CC_TEST_PARMS: u32 = 0x18a;
 
 type Run = fn(&mut Tpm, &[u32], &mut Reader, &mut Out) -> Result<()>;
 
@@ -250,6 +254,7 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_SELF_TEST, self_test).nv(),
     Command::new(TPM_CC_STARTUP, startup).nv().no_sessions(),
     Command::new(TPM_CC_SHUTDOWN, shutdown).nv(),
+    Command::new(TPM_CC_STIR_RANDOM, stir_random).nv().decrypt(),
     Command::new(TPM_CC_OBJECT_CHANGE_AUTH, key::object_change_auth)
         .handles(&[H::Object(false), H::Object(false)], 1)
         .admin()
@@ -321,8 +326,10 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_ECC_PARAMETERS, signing::ecc_parameters),
     Command::new(TPM_CC_GET_CAPABILITY, capability::get_capability),
     Command::new(TPM_CC_GET_RANDOM, get_random).encrypt(),
+    Command::new(TPM_CC_GET_TEST_RESULT, get_test_result).encrypt(),
     Command::new(TPM_CC_HASH, object::hash).decrypt().encrypt(),
     Command::new(TPM_CC_PCR_READ, pcr_read),
+    Command::new(TPM_CC_READ_CLOCK, read_clock),
     Command::new(TPM_CC_PCR_EXTEND, pcr_extend)
         .handles(&[H::Pcr(true)], 1)
         .nv(),
@@ -337,6 +344,7 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_HASH_SEQUENCE_START, object::hash_sequence_start)
         .response_handle()
         .decrypt(),
+    Command::new(TPM_CC_TEST_PARMS, test_parms),
 ];
 
 pub fn find(code: u32) -> Option<&'static Command> {
@@ -403,6 +411,9 @@ fn startup(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> 
     let allocation = &tpm.volatile.allocation;
     tpm.volatile.pcrs.startup(allocation, kind, saved_pcrs);
     tpm.volatile.pcr_reconfig = false;
+    if !orderly {
+        tpm.permanent.clock_safe = false;
+    }
     tpm.startup_reset_data(kind, saved.map(|s| s.reset))?;
     tpm.volatile.objects.iter_mut().for_each(|o| *o = None);
     tpm.volatile.exclusive_audit = None;
@@ -449,6 +460,41 @@ fn get_random(_: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result<()>
     let mut bytes = vec![0; wanted.min(MAX_DIGEST)];
     getrandom::fill(&mut bytes).map_err(|_| Rc::FAILURE)?;
     w.tpm2b(&bytes);
+    Ok(())
+}
+
+/// TPM2_StirRandom: every random byte comes straight from the host's CSPRNG, which guest data
+/// cannot make better; the data is accepted and dropped (the reference mixes it into its own
+/// DRBG, which vk-tpm does not keep).
+fn stir_random(_: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> {
+    r.tpm2b(crate::public::MAX_SYM_DATA)
+        .map_err(|rc| rc.param(1))?;
+    end(r)
+}
+
+/// TPM2_GetTestResult: nothing to report, and every test passed.
+fn get_test_result(_: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result<()> {
+    end(r)?;
+    w.tpm2b(&[]).u32(Rc::SUCCESS.0);
+    Ok(())
+}
+
+/// TPM2_TestParms: whether the TPM takes these parameters (a TPMT_PUBLIC_PARMS): it does if
+/// they unmarshal.
+fn test_parms(_: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> {
+    (|| {
+        let kind = crate::public::Type::read(r)?;
+        crate::public::Params::read(kind, r)
+    })()
+    .map_err(|rc| rc.param(1))?;
+    end(r)
+}
+
+/// TPM2_ReadClock: TPMS_TIME_INFO.
+fn read_clock(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result<()> {
+    end(r)?;
+    w.u64(tpm.volatile.time);
+    tpm.write_clock_info(w);
     Ok(())
 }
 

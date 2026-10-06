@@ -179,9 +179,24 @@ pub struct Permanent {
     /// contexts of an earlier TPM Reset do not load).
     pub reset_count: u32,
     pub total_reset_count: u64,
+    /// Clock (ms), which goes on across power cycles, and whether no larger value of it may
+    /// have been reported (TPMS_CLOCK_INFO.safe).
+    pub clock: u64,
+    pub clock_safe: bool,
 }
 
 impl Permanent {
+    pub fn clock_state(&self) -> (u64, bool) {
+        (self.clock, self.clock_safe)
+    }
+
+    /// Put back Clock as `state` had it, and return what it was.
+    pub fn set_clock_state(&mut self, (clock, safe): (u64, bool)) -> (u64, bool) {
+        let was = self.clock_state();
+        (self.clock, self.clock_safe) = (clock, safe);
+        was
+    }
+
     /// A newly manufactured TPM: fresh seeds and proofs, every bank allocated.
     pub fn manufacture() -> Result<Permanent, StateError> {
         Ok(Permanent {
@@ -199,6 +214,8 @@ impl Permanent {
             persistent: Vec::new(),
             reset_count: 0,
             total_reset_count: 0,
+            clock: 0,
+            clock_safe: true,
         })
     }
 
@@ -234,7 +251,10 @@ impl Permanent {
             w.u32(*handle);
             key.write(&mut w);
         }
-        w.u32(self.reset_count).u64(self.total_reset_count);
+        w.u32(self.reset_count)
+            .u64(self.total_reset_count)
+            .u64(self.clock)
+            .u8(self.clock_safe.into());
         w.into_bytes()
     }
 
@@ -271,6 +291,8 @@ impl Permanent {
         }
         let reset_count = r.u32()?;
         let total_reset_count = r.u64()?;
+        let clock = r.u64()?;
+        let clock_safe = read_bool(&mut r)?;
         expect_end(&r)?;
         Ok(Permanent {
             eps,
@@ -284,6 +306,8 @@ impl Permanent {
             persistent,
             reset_count,
             total_reset_count,
+            clock,
+            clock_safe,
         })
     }
 }

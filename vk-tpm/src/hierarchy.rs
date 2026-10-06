@@ -474,7 +474,9 @@ pub fn clear(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()
         tpm.flush_persistent(hierarchy);
     }
     tpm.permanent.dictionary_attack = DictionaryAttack::default();
-    // The counters that date Clock start over.
+    // Clock starts over, safe, and so do the counters that date it.
+    tpm.permanent.clock = 0;
+    tpm.permanent.clock_safe = true;
     tpm.permanent.reset_count = 0;
     tpm.volatile.restart_count = 0;
     tpm.volatile.clear_count = 0;
