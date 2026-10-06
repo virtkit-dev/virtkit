@@ -192,25 +192,6 @@
             patches = (old.patches or [ ]) ++ [ ./firmware/cloudhv-flash-variables.patch ];
           })).fd;
 
-        # The TPM 2.0 a Windows guest gets (`# vk: tpm=on`): libtpms and the libcrypto it computes
-        # with, static and for musl, which libkrun's `tpm` feature links into `vk`, so the host
-        # needs no swtpm. .devcontainer/Dockerfile links them at /opt/tpm (VK_LIBTPMS_DIR).
-        # nixpkgs packages libtpms as a git snapshot of upstream's master
-        # (0.10.2-unstable-2026-05-06, API 0.11.0), not a release tag; taken as is rather than
-        # overridden to a tag, so it gets nixpkgs' patches and bumps with the rest of flake.lock.
-        # A newer libtpms reads the state an older one wrote, so a bump keeps every machine's
-        # TPM; its fixes reach `vk` only through such a bump and a release.
-        packages.tpmLibs = pkgs.buildEnv {
-          name = "virtkit-tpm-libs";
-          paths = with pkgs.pkgsStatic; [
-            libtpms
-            libtpms.dev
-            openssl.out
-            openssl.dev
-          ];
-          pathsToLink = [ "/lib" "/include" ];
-        };
-
         # Variable store templates for that flash, from the QEMU OVMF build of the same
         # edk2 (same 4 MiB layout): OVMF_VARS.fd empty, OVMF_VARS.ms.fd with Microsoft's
         # Secure Boot keys enrolled. firmware/Dockerfile copies both into dist/.

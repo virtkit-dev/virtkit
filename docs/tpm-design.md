@@ -263,8 +263,8 @@ as the device grants only locality 0. `process` will take one when the device of
 The libkrun crates are a separate cargo workspace. Their `devices` crate depends on `vk-tpm`
 by path, behind its `tpm` feature, and libkrun's lockfile gains the RustCrypto crates
 `vk-tpm` uses, which are already in `vk`'s (pinned to the same versions). `vk` links neither
-libtpms nor OpenSSL any more, and its NOTICE no longer lists them. The build image still
-carries `tpmLibs` at `/opt/tpm`, which nothing uses any more.
+libtpms nor OpenSSL any more, and its NOTICE no longer lists them; neither does the build
+image (see "Test strategy" for the differential tests that needed them).
 
 **Done in phase 5.** The libtpms engine is removed rather than kept behind a feature: the TPM
 had not shipped in a release, so no user has a libtpms state, and a second engine would have

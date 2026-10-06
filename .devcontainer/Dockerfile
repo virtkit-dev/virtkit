@@ -32,8 +32,6 @@ COPY nix /src/nix
 # Realize the toolchain closure — rust + musl cross gcc + host gcc + mold + make + git +
 # cargo-audit/-sweep + busybox sh — into /opt/toolchain. The analogue of an `apk add`.
 RUN nix build "path:/src/nix#buildEnv" --out-link /opt/toolchain
-# Static libtpms + libcrypto for musl, which libkrun's `tpm` feature links (VK_LIBTPMS_DIR).
-RUN nix build "path:/src/nix#tpmLibs" --out-link /opt/tpm
 
 # PATH prepends /opt/toolchain/bin to the base image's own (nix's profile dirs, spelled out
 # because the base is pinned): kernel/Dockerfile chains `FROM virtkit-build` and still needs
@@ -41,8 +39,7 @@ RUN nix build "path:/src/nix#tpmLibs" --out-link /opt/tpm
 # scripts run as the host user with HOME=/tmp. Which compilers cargo uses for the musl
 # target is declared in .cargo/config.toml, not here.
 ENV PATH=/opt/toolchain/bin:/root/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/nix/var/nix/profiles/default/sbin \
-    SSL_CERT_FILE=/opt/toolchain/etc/ssl/certs/ca-bundle.crt \
-    VK_LIBTPMS_DIR=/opt/tpm
+    SSL_CERT_FILE=/opt/toolchain/etc/ssl/certs/ca-bundle.crt
 
 # `dev`: devcontainer.json opens the workspace as it, and so does `vk dev` (.virtkit/config.toml).
 # The rootless virtio-fs share lets root and the host owner's ids write /work and nothing else:
