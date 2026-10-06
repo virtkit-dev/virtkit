@@ -13,6 +13,12 @@ virtkit workspace.
 
 ## Local patches
 
+`src/libkrun/src/api/device_builders.rs` + `src/devices/src/virtio/net/` — add
+`NetDevice::new_tap_fd` for an already attached tap. The backend owns a shared descriptor
+through activation instead of reopening the device name, so vk can reject attachment
+errors before boot and retain the queue across guest resets. The name-based API remains
+available to other callers.
+
 `Cargo.toml` (workspace) — drop the `init/init-blob` and `bindings/*` members, which are not
 vendored and depend on the `ffier` git crate, and the `examples/gtk_display` and
 `init/init-binary` excludes, which are not vendored either. Exclude `src/display` and

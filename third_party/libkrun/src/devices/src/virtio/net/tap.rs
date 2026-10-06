@@ -7,6 +7,7 @@ use nix::sys::stat::Mode;
 use nix::unistd::{read, write};
 use nix::{ioctl_write_int, ioctl_write_ptr};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 use std::{io, mem, ptr};
 use virtio_bindings::virtio_net::{
     VIRTIO_NET_F_GUEST_CSUM, VIRTIO_NET_F_GUEST_TSO4, VIRTIO_NET_F_GUEST_TSO6,
@@ -20,7 +21,7 @@ ioctl_write_int!(tunsetoffload, b'T', 208);
 ioctl_write_ptr!(tunsetvnethdrsz, b'T', 216, c_int);
 
 pub struct Tap {
-    fd: OwnedFd,
+    fd: Arc<OwnedFd>,
 }
 
 impl Tap {
@@ -43,6 +44,17 @@ impl Tap {
 
         req.ifr_ifru.ifru_flags = IFF_TAP as i16 | IFF_NO_PI as i16 | IFF_VNET_HDR as i16;
 
+        unsafe {
+            if let Err(err) = tunsetiff(fd.as_raw_fd(), &mut req as *mut _ as *mut _) {
+                return Err(ConnectError::TunSetIff(io::Error::from(err)));
+            }
+        }
+        Self::from_fd(Arc::new(fd), vnet_features)
+    }
+
+    /// Configure a tap already attached by the caller. Keeping the same open description
+    /// prevents another VM from claiming the queue between validation and activation.
+    pub fn from_fd(fd: Arc<OwnedFd>, vnet_features: u64) -> Result<Self, ConnectError> {
         let mut offload_flags: u64 = 0;
         if (vnet_features & (1 << VIRTIO_NET_F_GUEST_CSUM)) != 0 {
             offload_flags |= TUN_F_CSUM as u64;
@@ -58,10 +70,6 @@ impl Tap {
         }
 
         unsafe {
-            if let Err(err) = tunsetiff(fd.as_raw_fd(), &mut req as *mut _ as *mut _) {
-                return Err(ConnectError::TunSetIff(io::Error::from(err)));
-            }
-
             // TODO(slp): replace hardcoded vnet size with cons
             if let Err(err) = tunsetvnethdrsz(fd.as_raw_fd(), &12) {
                 return Err(ConnectError::TunSetVnetHdrSz(io::Error::from(err)));
@@ -72,10 +80,10 @@ impl Tap {
             }
         }
 
-        match fcntl(&fd, FcntlArg::F_GETFL) {
+        match fcntl(fd.as_ref(), FcntlArg::F_GETFL) {
             Ok(flags) => {
                 if let Err(e) = fcntl(
-                    &fd,
+                    fd.as_ref(),
                     FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
                 ) {
                     warn!("error switching to non-blocking: id={fd:?}, err={e}");
@@ -92,7 +100,7 @@ impl NetBackend for Tap {
     /// Try to read a frame from the tap devie. If no bytes are available reports
     /// ReadError::NothingRead.
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
-        let frame_length = match read(&self.fd, buf) {
+        let frame_length = match read(self.fd.as_ref(), buf) {
             Ok(f) => f,
             #[allow(unreachable_patterns)]
             Err(nix::Error::EAGAIN | nix::Error::EWOULDBLOCK) => {
@@ -108,7 +116,7 @@ impl NetBackend for Tap {
 
     /// Try to write a frame to the tap device.
     fn write_frame(&mut self, _hdr_len: usize, buf: &mut [u8]) -> Result<(), WriteError> {
-        let ret = write(&self.fd, buf).map_err(WriteError::Internal)?;
+        let ret = write(self.fd.as_ref(), buf).map_err(WriteError::Internal)?;
         debug!("Written frame size={}, written={}", buf.len(), ret);
         Ok(())
     }

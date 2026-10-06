@@ -89,6 +89,10 @@ impl NetWorker {
             VirtioNetBackend::Tap(tap_name) => {
                 Box::new(Tap::new(tap_name, vnet_features)?) as Box<dyn NetBackend + Send>
             }
+            #[cfg(target_os = "linux")]
+            VirtioNetBackend::TapFd(fd) => {
+                Box::new(Tap::from_fd(fd, vnet_features)?) as Box<dyn NetBackend + Send>
+            }
         };
 
         Ok(Self {

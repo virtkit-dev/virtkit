@@ -1694,6 +1694,21 @@ impl NetDevice {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "net"))]
+impl NetDevice {
+    /// Create a NIC from an attached tap, taking ownership of its descriptor. The caller
+    /// can validate and claim the device before starting the guest instead of deferring
+    /// the open until the guest activates virtio-net.
+    pub fn new_tap_fd(id: &str, fd: OwnedFd, mac: &[u8], features: u32) -> Result<Self, VmmError> {
+        Self::new_inner(
+            id,
+            devices::virtio::net::device::VirtioNetBackend::TapFd(std::sync::Arc::new(fd)),
+            mac,
+            features,
+        )
+    }
+}
+
 #[cfg(target_os = "windows")]
 #[cfg_attr(feature = "ffi", ffier::export(cfg = "feature = \"net\""))]
 #[cfg_attr(not(feature = "ffi"), cfg(feature = "net"))]
