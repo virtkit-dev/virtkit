@@ -24,6 +24,9 @@ const GET_CAPABILITY: u32 = 0x17a;
 const GET_RANDOM: u32 = 0x17b;
 const PCR_READ: u32 = 0x17e;
 const PCR_EXTEND: u32 = 0x182;
+const PCR_ALLOCATE: u32 = 0x12b;
+const PCR_EVENT: u32 = 0x13c;
+const PCR_RESET: u32 = 0x13d;
 
 const HIERARCHY_CONTROL: u32 = 0x121;
 const CHANGE_EPS: u32 = 0x124;
@@ -667,6 +670,97 @@ fn dictionary_attack_protection_matches() {
 
 fn clear(h: u32) -> Vec<u8> {
     with_password(CLEAR, h, b"", &[])
+}
+
+#[test]
+fn pcr_event_and_reset_match() {
+    let mut both = Both::started();
+    for pcr in (0..25).chain([RH_NULL, RH_OWNER]) {
+        let mut event = vec![0, 5];
+        event.extend_from_slice(b"event");
+        both.same(&command(PCR_EVENT, &[pcr], Some(&password(b"")), &event));
+        both.same(&command(PCR_RESET, &[pcr], Some(&password(b"")), &[]));
+    }
+    for len in [0usize, 1, 1024, 1025] {
+        let mut event = (len as u16).to_be_bytes().to_vec();
+        event.extend(std::iter::repeat_n(7, len));
+        both.same(&command(PCR_EVENT, &[16], Some(&password(b"")), &event));
+    }
+    both.same(&command(PCR_EVENT, &[16], None, &[0, 0]));
+    both.same(&command(PCR_RESET, &[16], Some(&password(b"")), &[0]));
+    read_all_pcrs(&mut both);
+    // Resetting or extending a state-saved PCR after Shutdown(STATE) voids it; others do not.
+    for (code, pcr) in [(PCR_RESET, 16), (PCR_EVENT, 23), (PCR_EVENT, 7)] {
+        both.same(&command(SHUTDOWN, &[], None, &[0, 1]));
+        let params: &[u8] = if code == PCR_EVENT { &[0, 1, 9] } else { &[] };
+        both.same(&command(code, &[pcr], Some(&password(b"")), params));
+        both.power_cycle();
+        both.same(&command(STARTUP, &[], None, &[0, 1]));
+        both.same(&command(STARTUP, &[], None, &[0, 0]));
+        read_all_pcrs(&mut both);
+    }
+}
+
+#[test]
+fn pcr_allocate_matches() {
+    let mut both = Both::started();
+    let allocate = |selections: &[(u16, &[u8])]| {
+        with_password(PCR_ALLOCATE, RH_PLATFORM, b"", &selection(selections))
+    };
+    let none: &[u8] = &[0, 0, 0];
+    let all: &[u8] = &[0xff, 0xff, 0xff];
+    for request in [
+        allocate(&[(0x04, none)]),
+        allocate(&[(0x04, none), (0x0b, none), (0x0c, none), (0x0d, none)]),
+        allocate(&[(0x04, &[1, 0, 0]), (0x0b, &[0, 0, 2])]),
+        allocate(&[(0x04, &[0, 0, 2])]),
+        allocate(&[
+            (0x04, &[0x81, 0, 2]),
+            (0x0b, none),
+            (0x0c, none),
+            (0x0d, none),
+        ]),
+        allocate(&[(0x0b, all), (0x0b, none)]),
+        allocate(&[(0x0b, &[0xff, 0xff])]),
+        allocate(&[(0x12, all)]),
+        allocate(&[]),
+        with_password(PCR_ALLOCATE, RH_OWNER, b"", &selection(&[])),
+    ] {
+        both.same(&request);
+        both.same(&get_capability(5, 0, 8));
+        read_all_pcrs(&mut both);
+        both.same(&extend(1, &[(0x04, vec![1; 20]), (0x0b, vec![2; 32])]));
+        both.same(&command(PCR_RESET, &[16], Some(&password(b"")), &[]));
+    }
+    // The new allocation takes effect at the next TPM Reset; Shutdown(STATE) is refused
+    // until then.
+    both.same(&command(SHUTDOWN, &[], None, &[0, 1]));
+    both.same(&command(SHUTDOWN, &[], None, &[0, 0]));
+    both.power_cycle();
+    both.same(&command(STARTUP, &[], None, &[0, 0]));
+    read_all_pcrs(&mut both);
+    both.same(&command(SHUTDOWN, &[], None, &[0, 1]));
+    both.power_cycle();
+    both.same(&command(STARTUP, &[], None, &[0, 1]));
+    read_all_pcrs(&mut both);
+    // TPM2_Clear drops a pending allocation (the reference implementation rewrites all of its
+    // persistent data).
+    both.same(&allocate(&[(0x04, none)]));
+    both.same(&clear(RH_PLATFORM));
+    both.power_cycle();
+    both.same(&command(STARTUP, &[], None, &[0, 0]));
+    both.same(&get_capability(5, 0, 8));
+    both.same(&allocate(&[
+        (0x04, all),
+        (0x0b, all),
+        (0x0c, all),
+        (0x0d, all),
+    ]));
+    read_all_pcrs(&mut both);
+    both.same(&command(SHUTDOWN, &[], None, &[0, 0]));
+    both.power_cycle();
+    both.same(&command(STARTUP, &[], None, &[0, 0]));
+    read_all_pcrs(&mut both);
 }
 
 /// Deterministic mutations of well-formed commands: both must answer the same, wherever the

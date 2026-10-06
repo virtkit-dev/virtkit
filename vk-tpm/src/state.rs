@@ -96,7 +96,8 @@ pub struct Permanent {
     pub sps: Seed,
     pub pps: Seed,
     pub hierarchies: Hierarchies,
-    /// Which PCRs of which bank are allocated (TPM2_PCR_Allocate), one selection per bank.
+    /// Which PCRs of which bank are allocated from the next power on (TPM2_PCR_Allocate), one
+    /// selection per bank.
     pub allocation: Vec<Selection>,
     pub dictionary_attack: DictionaryAttack,
     pub shutdown: Shutdown,
@@ -201,14 +202,21 @@ pub struct Volatile {
     pub da_used: bool,
     /// The platform hierarchy is enabled (every Startup enables it).
     pub ph_enable: bool,
+    /// The PCR allocation in use: the permanent one as of power on (TPM2_PCR_Allocate changes
+    /// only the latter).
+    pub allocation: Vec<Selection>,
+    /// TPM2_PCR_Allocate changed the allocation since Startup (g_pcrReConfig): the PCRs no
+    /// longer match it, so TPM2_Shutdown(STATE) may not save them.
+    pub pcr_reconfig: bool,
     pub clear: ClearState,
     pub pcrs: Pcrs,
 }
 
 impl Volatile {
     /// The TPM as it powers on (_TPM_Init): waiting for TPM2_Startup.
-    pub fn power_on() -> Volatile {
+    pub fn power_on(permanent: &Permanent) -> Volatile {
         Volatile {
+            allocation: permanent.allocation.clone(),
             started: false,
             orderly_startup: false,
             time: 0,
@@ -216,6 +224,7 @@ impl Volatile {
             da_timers: DaTimers::default(),
             da_used: false,
             ph_enable: true,
+            pcr_reconfig: false,
             clear: ClearState::default(),
             pcrs: Pcrs::new(),
         }
@@ -231,7 +240,9 @@ impl Volatile {
             .u64(self.da_timers.self_heal.cast_unsigned())
             .u64(self.da_timers.lockout.cast_unsigned())
             .u8(self.da_used.into())
-            .u8(self.ph_enable.into());
+            .u8(self.ph_enable.into())
+            .u8(self.pcr_reconfig.into());
+        pcr::write_selections(&mut w, &self.allocation);
         self.clear.write(&mut w);
         w.u32(self.pcrs.counter);
         let banks: Vec<_> = (self.pcrs.banks.iter())
@@ -254,6 +265,8 @@ impl Volatile {
         };
         let da_used = read_bool(&mut r)?;
         let ph_enable = read_bool(&mut r)?;
+        let pcr_reconfig = read_bool(&mut r)?;
+        let allocation = pcr::read_selections(&mut r)?;
         let clear = ClearState::read(&mut r)?;
         let mut pcrs = Pcrs::new();
         pcrs.counter = r.u32()?;
@@ -275,6 +288,8 @@ impl Volatile {
             da_timers,
             da_used,
             ph_enable,
+            allocation,
+            pcr_reconfig,
             clear,
             pcrs,
         })
@@ -351,7 +366,7 @@ mod tests {
         let mut p = Permanent::manufacture().unwrap();
         assert_ne!(*p.eps, *p.sps, "seeds are random");
         let mut pcrs = Pcrs::new();
-        pcrs.startup(Startup::Reset, None);
+        pcrs.startup(&p.allocation, Startup::Reset, None);
         let clear = ClearState {
             platform_auth: Zeroizing::new(b"platform".to_vec()),
             ..Default::default()
@@ -377,12 +392,12 @@ mod tests {
 
     #[test]
     fn volatile_state_round_trips() {
-        let mut v = Volatile::power_on();
+        let mut v = Volatile::power_on(&Permanent::manufacture().unwrap());
         v.started = true;
         v.time = 99;
         v.da_timers.lockout = -5;
         v.clear.sh_enable = false;
-        v.pcrs.startup(Startup::Reset, None);
+        v.pcrs.startup(&v.allocation.clone(), Startup::Reset, None);
         let bytes = v.serialize();
         let w = Volatile::deserialize(&bytes).unwrap();
         assert!(w.started);

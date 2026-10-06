@@ -125,7 +125,7 @@ pub fn get_capability(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> 
                 data.count(0);
                 true
             } else {
-                pcr::write_selections(&mut data, &tpm.permanent.allocation);
+                pcr::write_selections(&mut data, &tpm.volatile.allocation);
                 false
             }
         }

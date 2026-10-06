@@ -59,9 +59,10 @@ pub struct Tpm {
 impl Tpm {
     /// A newly manufactured TPM (fresh seeds), powered on. Its permanent state is new: store it.
     pub fn manufacture() -> Result<Tpm, StateError> {
+        let permanent = Permanent::manufacture()?;
         Ok(Tpm {
-            permanent: Permanent::manufacture()?,
-            volatile: Volatile::power_on(),
+            volatile: Volatile::power_on(&permanent),
+            permanent,
             clock: Clock::starting_at(0),
             permanent_changed: true,
         })
@@ -70,9 +71,10 @@ impl Tpm {
     /// The TPM whose permanent state is `permanent` (as [`Tpm::permanent_state`] returned it),
     /// powered on: it waits for TPM2_Startup.
     pub fn power_on(permanent: &[u8]) -> Result<Tpm, StateError> {
+        let permanent = Permanent::deserialize(permanent)?;
         Ok(Tpm {
-            permanent: Permanent::deserialize(permanent)?,
-            volatile: Volatile::power_on(),
+            volatile: Volatile::power_on(&permanent),
+            permanent,
             clock: Clock::starting_at(0),
             permanent_changed: false,
         })

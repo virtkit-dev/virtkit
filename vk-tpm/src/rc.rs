@@ -27,6 +27,7 @@ impl Rc {
     pub const DISABLED: Rc = Rc(RC_VER1 + 0x020);
     pub const AUTH_TYPE: Rc = Rc(RC_VER1 + 0x024);
     pub const AUTH_MISSING: Rc = Rc(RC_VER1 + 0x025);
+    pub const PCR: Rc = Rc(RC_VER1 + 0x027);
     pub const AUTH_UNAVAILABLE: Rc = Rc(RC_VER1 + 0x02f);
     pub const COMMAND_SIZE: Rc = Rc(RC_VER1 + 0x042);
     pub const COMMAND_CODE: Rc = Rc(RC_VER1 + 0x043);

@@ -6,7 +6,7 @@
 
 use crate::alg::{Hash, MAX_DIGEST};
 use crate::entity::{HandleKind, TPM_RH_NULL};
-use crate::marshal::Reader;
+use crate::marshal::{Reader, Writer};
 use crate::pcr::{self, Startup};
 use crate::rc::{Rc, Result};
 use crate::state::{Saved, Shutdown};
@@ -18,9 +18,12 @@ pub const TPM_CC_CHANGE_PPS: u32 = 0x125;
 pub const TPM_CC_CLEAR: u32 = 0x126;
 pub const TPM_CC_CLEAR_CONTROL: u32 = 0x127;
 pub const TPM_CC_HIERARCHY_CHANGE_AUTH: u32 = 0x129;
+pub const TPM_CC_PCR_ALLOCATE: u32 = 0x12b;
 pub const TPM_CC_SET_PRIMARY_POLICY: u32 = 0x12e;
 pub const TPM_CC_DICTIONARY_ATTACK_LOCK_RESET: u32 = 0x139;
 pub const TPM_CC_DICTIONARY_ATTACK_PARAMETERS: u32 = 0x13a;
+pub const TPM_CC_PCR_EVENT: u32 = 0x13c;
+pub const TPM_CC_PCR_RESET: u32 = 0x13d;
 pub const TPM_CC_SELF_TEST: u32 = 0x143;
 pub const TPM_CC_STARTUP: u32 = 0x144;
 pub const TPM_CC_SHUTDOWN: u32 = 0x145;
@@ -125,6 +128,9 @@ pub const COMMANDS: &[Command] = &[
     )
     .handles(&[H::HierarchyAuth], 1)
     .nv(),
+    Command::new(TPM_CC_PCR_ALLOCATE, pcr_allocate)
+        .handles(&[H::Platform], 1)
+        .nv(),
     Command::new(TPM_CC_SET_PRIMARY_POLICY, hierarchy::set_primary_policy)
         .handles(&[H::HierarchyPolicy], 1)
         .nv(),
@@ -140,6 +146,12 @@ pub const COMMANDS: &[Command] = &[
     )
     .handles(&[H::Lockout], 1)
     .nv(),
+    Command::new(TPM_CC_PCR_EVENT, pcr_event)
+        .handles(&[H::Pcr(true)], 1)
+        .nv(),
+    Command::new(TPM_CC_PCR_RESET, pcr_reset)
+        .handles(&[H::Pcr(false)], 1)
+        .nv(),
     Command::new(TPM_CC_SELF_TEST, self_test).nv(),
     Command::new(TPM_CC_STARTUP, startup).nv().no_sessions(),
     Command::new(TPM_CC_SHUTDOWN, shutdown).nv(),
@@ -168,6 +180,9 @@ pub fn read_yes_no(r: &mut Reader) -> Result<bool> {
         _ => Err(Rc::VALUE),
     }
 }
+
+/// The largest event TPM2_PCR_Event takes (TPM2B_EVENT).
+const MAX_EVENT: usize = 1024;
 
 const TPM_SU_CLEAR: u16 = 0;
 const TPM_SU_STATE: u16 = 1;
@@ -209,7 +224,9 @@ fn startup(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> 
         _ => Default::default(),
     };
     let saved_pcrs = saved.as_ref().map(|s| &s.pcrs);
-    tpm.volatile.pcrs.startup(kind, saved_pcrs);
+    let allocation = &tpm.volatile.allocation;
+    tpm.volatile.pcrs.startup(allocation, kind, saved_pcrs);
+    tpm.volatile.pcr_reconfig = false;
     tpm.volatile.orderly_startup = orderly;
     tpm.volatile.da_used = false;
     tpm.volatile.started = true;
@@ -222,6 +239,9 @@ fn startup(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> 
 fn shutdown(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> {
     let state = read_su(r).map_err(|rc| rc.param(1))?;
     end(r)?;
+    if state && tpm.volatile.pcr_reconfig {
+        return Err(Rc::TYPE.param(1));
+    }
     tpm.volatile.da_used = false;
     tpm.permanent.shutdown_time = tpm.volatile.time;
     tpm.permanent.shutdown = if state {
@@ -257,7 +277,7 @@ fn pcr_read(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result<()>
     let selections = pcr::read_selections(r).map_err(|rc| rc.param(1))?;
     end(r)?;
     let pcrs = &tpm.volatile.pcrs;
-    let (selected, digests) = pcrs.read(&tpm.permanent.allocation, &selections);
+    let (selected, digests) = pcrs.read(&tpm.volatile.allocation, &selections);
     w.u32(pcrs.counter);
     pcr::write_selections(w, &selected);
     w.count(digests.len());
@@ -275,27 +295,112 @@ fn pcr_extend(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, _: &mut Out) -> Re
         (0..count)
             .map(|_| {
                 let hash = Hash::read(r)?;
-                Ok((hash, r.bytes(hash.size())?))
+                Ok((hash, r.bytes(hash.size())?.to_vec()))
             })
             .collect::<Result<Vec<_>>>()
     })()
     .map_err(|rc| rc.param(1))?;
     end(r)?;
-    let handle = handles.first().copied().ok_or(Rc::FAILURE)?;
-    if handle == TPM_RH_NULL {
+    let Some(pcr) = tpm.pcr_to_extend(first(handles)?)? else {
         return Ok(());
+    };
+    tpm.extend(pcr, &digests);
+    Ok(())
+}
+
+/// TPM2_PCR_Event: digest the event data with every bank's algorithm, and extend each into the
+/// PCR (unless it is TPM_RH_NULL). The digests are the response.
+fn pcr_event(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, w: &mut Out) -> Result<()> {
+    let data = r.tpm2b(MAX_EVENT).map_err(|rc| rc.param(1))?;
+    end(r)?;
+    let pcr = tpm.pcr_to_extend(first(handles)?)?;
+    let digests: Vec<_> = (Hash::ALL.into_iter())
+        .map(|hash| (hash, hash.digest(&[data])))
+        .collect();
+    if let Some(pcr) = pcr {
+        tpm.extend(pcr, &digests);
     }
-    let pcr = usize::try_from(handle).map_err(|_| Rc::FAILURE)?;
-    if !pcr::may_extend(pcr, LOCALITY) {
+    write_digest_values(w, &digests);
+    Ok(())
+}
+
+/// TPM2_PCR_Reset: a PCR the locality may reset, back to zeros in every bank.
+fn pcr_reset(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> {
+    end(r)?;
+    let pcr = usize::try_from(first(handles)?).map_err(|_| Rc::FAILURE)?;
+    if !pcr::may_reset(pcr, LOCALITY) {
         return Err(Rc::LOCALITY);
     }
-    // A change to a PCR that TPM2_Shutdown(STATE) saved voids that saved state.
     if pcr::is_state_saved(pcr) {
         tpm.clear_orderly();
     }
-    for (hash, digest) in digests {
-        let allocation = &tpm.permanent.allocation;
-        tpm.volatile.pcrs.extend(allocation, pcr, hash, digest);
-    }
+    tpm.volatile.pcrs.reset(&tpm.volatile.allocation, pcr);
     Ok(())
+}
+
+/// TPM2_PCR_Allocate: the PCRs each bank will have from the next power on. Until then the TPM
+/// goes on with the allocation it has, and TPM2_Shutdown(STATE) is refused.
+fn pcr_allocate(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result<()> {
+    let requested = pcr::read_selections(r).map_err(|rc| rc.param(1))?;
+    end(r)?;
+    // From the allocation in use: a second TPM2_PCR_Allocate replaces the first.
+    let mut allocation = tpm.volatile.allocation.clone();
+    for selection in requested {
+        if let Some(bank) = allocation.iter_mut().find(|s| s.hash == selection.hash) {
+            *bank = selection;
+        }
+    }
+    // A PC Client TPM keeps PCR 0 (the H-CRTM's) and 17 (the DRTM's) in some bank.
+    let kept = |pcr| allocation.iter().any(|s| s.has(pcr));
+    if !kept(pcr::HCRTM_PCR) || !kept(pcr::DRTM_PCR) {
+        return Err(Rc::PCR);
+    }
+    let needed: usize = (allocation.iter())
+        .map(|s| s.count().saturating_mul(s.hash.size()))
+        .sum();
+    tpm.permanent.allocation = allocation;
+    tpm.volatile.pcr_reconfig = true;
+    w.u8(1) // allocationSuccess
+        .u32(pcr::PCR_COUNT as u32) // maxPCR
+        .u32(u32::try_from(needed).unwrap_or(u32::MAX)) // sizeNeeded
+        .u32(pcr::PCR_MEMORY); // sizeAvailable
+    Ok(())
+}
+
+impl Tpm {
+    /// The PCR an extend goes to, None for TPM_RH_NULL, checked against the locality. Extending
+    /// a PCR that TPM2_Shutdown(STATE) saved voids that saved state.
+    fn pcr_to_extend(&mut self, handle: u32) -> Result<Option<usize>> {
+        if handle == TPM_RH_NULL {
+            return Ok(None);
+        }
+        let pcr = usize::try_from(handle).map_err(|_| Rc::FAILURE)?;
+        if !pcr::may_extend(pcr, LOCALITY) {
+            return Err(Rc::LOCALITY);
+        }
+        if pcr::is_state_saved(pcr) {
+            self.clear_orderly();
+        }
+        Ok(Some(pcr))
+    }
+
+    /// Extend each digest into its bank's `pcr`.
+    pub fn extend(&mut self, pcr: usize, digests: &[(Hash, Vec<u8>)]) {
+        for (hash, digest) in digests {
+            let allocation = &self.volatile.allocation;
+            self.volatile.pcrs.extend(allocation, pcr, *hash, digest);
+        }
+    }
+}
+
+/// A TPML_DIGEST_VALUES.
+pub fn write_digest_values(w: &mut Writer, digests: &[(Hash, Vec<u8>)]) {
+    w.count(digests.len());
+    for (hash, digest) in digests {
+        w.u16(hash.id()).bytes(digest);
+    }
+}
+
+pub fn first(handles: &[u32]) -> Result<u32> {
+    handles.first().copied().ok_or(Rc::FAILURE)
 }

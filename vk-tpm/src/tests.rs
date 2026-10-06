@@ -118,7 +118,8 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_GET_RANDOM | TPM_CC_STARTUP | TPM_CC_SHUTDOWN => &[0, 0],
             TPM_CC_SELF_TEST | TPM_CC_CLEAR_CONTROL => &[1],
             TPM_CC_HIERARCHY_CONTROL => &[0x40, 0, 0, 1, 1],
-            TPM_CC_HIERARCHY_CHANGE_AUTH => &[0, 0],
+            TPM_CC_HIERARCHY_CHANGE_AUTH | TPM_CC_PCR_EVENT => &[0, 0],
+            TPM_CC_PCR_RESET => &[],
             TPM_CC_SET_PRIMARY_POLICY => &[0, 0, 0, 0x10],
             TPM_CC_DICTIONARY_ATTACK_PARAMETERS => &[0; 12],
             TPM_CC_CHANGE_EPS | TPM_CC_CHANGE_PPS | TPM_CC_CLEAR => &[],
@@ -526,4 +527,97 @@ fn set_primary_policy_checks_the_digest_size() {
     assert!(tpm.entity_policy(TPM_RH_OWNER).is_some());
     assert_eq!(rc(&tpm.process(&policy(&[], alg::TPM_ALG_NULL))), 0);
     assert!(tpm.entity_policy(TPM_RH_OWNER).is_none());
+}
+
+#[test]
+fn pcr_event_digests_with_every_bank_and_extends() {
+    let mut tpm = started();
+    let r = tpm.process(&command(
+        TPM_CC_PCR_EVENT,
+        &[5],
+        Some(b""),
+        &[0, 3, b'a', b'b', b'c'],
+    ));
+    assert_eq!(rc(&r), 0);
+    // Sessions header, parameterSize, then TPML_DIGEST_VALUES.
+    let mut p = Reader::new(&r[14..]);
+    assert_eq!(p.u32(), Ok(4));
+    for hash in alg::Hash::ALL {
+        assert_eq!(p.u16(), Ok(hash.id()));
+        assert_eq!(p.bytes(hash.size()).unwrap(), hash.digest(&[b"abc"]));
+    }
+    let digest = alg::Hash::Sha256.digest(&[b"abc"]);
+    assert_eq!(
+        read_sha256(&mut tpm, 5).1,
+        alg::Hash::Sha256.digest(&[&[0; 32], &digest])
+    );
+    let null = command(TPM_CC_PCR_EVENT, &[TPM_RH_NULL], Some(b""), &[0, 1, 0]);
+    assert_eq!(rc(&tpm.process(&null)), 0);
+    // One change per bank, and none for TPM_RH_NULL.
+    assert_eq!(
+        read_sha256(&mut tpm, 5).0,
+        24,
+        "TPM_RH_NULL extends nothing"
+    );
+}
+
+#[test]
+fn pcr_reset_needs_a_resettable_pcr() {
+    let mut tpm = started();
+    tpm.process(&extend(16, alg::TPM_ALG_SHA256, &[1; 32]));
+    tpm.process(&extend(7, alg::TPM_ALG_SHA256, &[1; 32]));
+    let reset = |pcr| command(TPM_CC_PCR_RESET, &[pcr], Some(b""), &[]);
+    assert_eq!(rc(&tpm.process(&reset(7))), Rc::LOCALITY.0);
+    assert_eq!(rc(&tpm.process(&reset(TPM_RH_NULL))), Rc::VALUE.handle(1).0);
+    assert_eq!(rc(&tpm.process(&reset(16))), 0);
+    assert_eq!(read_sha256(&mut tpm, 16).1, vec![0; 32]);
+    assert_ne!(read_sha256(&mut tpm, 7).1, vec![0; 32]);
+}
+
+#[test]
+fn pcr_allocate_takes_effect_at_the_next_power_on() {
+    let mut tpm = started();
+    let mut p = Writer::new();
+    // SHA-1: nothing; SHA-256: PCR 0 and 17 only.
+    p.u32(2).u16(alg::TPM_ALG_SHA1).u8(3).bytes(&[0; 3]);
+    p.u16(alg::TPM_ALG_SHA256).u8(3).bytes(&[1, 0, 2]);
+    let allocate = command(
+        TPM_CC_PCR_ALLOCATE,
+        &[TPM_RH_PLATFORM],
+        Some(b""),
+        &p.into_bytes(),
+    );
+    let r = tpm.process(&allocate);
+    assert_eq!(rc(&r), 0);
+    // allocationSuccess, maxPCR, sizeNeeded (2 SHA-256 + 24 SHA-384 + 24 SHA-512), sizeAvailable.
+    assert_eq!(r[14], 1);
+    assert_eq!(u32::from_be_bytes(r[15..19].try_into().unwrap()), 24);
+    assert_eq!(
+        u32::from_be_bytes(r[19..23].try_into().unwrap()),
+        2 * 32 + 24 * 112
+    );
+    // Still the old allocation, and no saved state until a TPM Reset.
+    assert_eq!(read_sha256(&mut tpm, 7).1, vec![0; 32]);
+    let state = command(TPM_CC_SHUTDOWN, &[], None, &[0, 1]);
+    assert_eq!(rc(&tpm.process(&state)), Rc::TYPE.param(1).0);
+    let mut tpm = power_cycle(&tpm, 0);
+    let mut p = Writer::new();
+    p.u32(1).u16(alg::TPM_ALG_SHA256).u8(3).bytes(&[0x81, 0, 2]);
+    let r = tpm.process(&command(TPM_CC_PCR_READ, &[], None, &p.into_bytes()));
+    // The selection comes back trimmed to the allocated PCRs.
+    assert_eq!(r[20..24], [3, 1, 0, 2]);
+
+    // Without PCR 0 or 17 in some bank, it is refused.
+    let mut p = Writer::new();
+    p.u32(4);
+    for hash in alg::Hash::ALL {
+        p.u16(hash.id()).u8(3).bytes(&[0, 0, 2]);
+    }
+    let refused = command(
+        TPM_CC_PCR_ALLOCATE,
+        &[TPM_RH_PLATFORM],
+        Some(b""),
+        &p.into_bytes(),
+    );
+    assert_eq!(rc(&tpm.process(&refused)), Rc::PCR.0);
 }

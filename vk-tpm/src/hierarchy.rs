@@ -10,7 +10,7 @@
 use zeroize::Zeroizing;
 
 use crate::alg::{Hash, MAX_DIGEST};
-use crate::commands::{end, read_yes_no};
+use crate::commands::{end, first, read_yes_no};
 use crate::entity::{
     TPM_RH_ENDORSEMENT, TPM_RH_LOCKOUT, TPM_RH_OWNER, TPM_RH_PLATFORM, TPM_RH_PLATFORM_NV,
     strip_zeros,
@@ -462,6 +462,9 @@ pub fn clear(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()
     tpm.volatile.clear.sh_enable = true;
     tpm.volatile.clear.eh_enable = true;
     tpm.permanent.dictionary_attack = DictionaryAttack::default();
+    // The reference implementation writes back all of its persistent data here, which drops a
+    // pending TPM2_PCR_Allocate; so does this TPM, to answer the same.
+    tpm.permanent.allocation = tpm.volatile.allocation.clone();
     // As if PCR 0 changed: a policy session that checked the PCRs must start again.
     tpm.volatile.pcrs.changed(0);
     tpm.clear_orderly();
@@ -508,10 +511,6 @@ pub fn dictionary_attack_parameters(
     da.recovery_time = recovery_time;
     da.lockout_recovery = lockout_recovery;
     Ok(())
-}
-
-fn first(handles: &[u32]) -> Result<u32> {
-    handles.first().copied().ok_or(Rc::FAILURE)
 }
 
 fn rng_seed() -> Result<Seed> {
