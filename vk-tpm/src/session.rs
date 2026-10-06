@@ -393,7 +393,7 @@ impl Tpm {
         handles: &[u32],
         a: &mut Area,
         params: &[u8],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Zeroizing<Vec<u8>>> {
         a.params = params.to_vec();
         for (i, &handle) in handles.iter().enumerate().take(cmd.auth) {
             let u = a.uses.get_mut(i).ok_or(Rc::AUTH_MISSING)?;
@@ -431,7 +431,8 @@ impl Tpm {
                 self.check_hmac(a, i).map_err(|rc| rc.session(n))?;
             }
         }
-        let mut params = params.to_vec();
+        // Decrypted, it may hold a secret (a new authValue).
+        let mut params = Zeroizing::new(params.to_vec());
         if let Some(i) = a.decrypt {
             let n = u32::try_from(i.saturating_add(1)).map_err(|_| Rc::FAILURE)?;
             self.decrypt_parameter(a, i, &mut params)
@@ -773,7 +774,7 @@ fn param_crypt(
                 older,
                 key_size + crypt::AES_BLOCK,
             );
-            let (aes_key, iv) = stream.split_at(key_size);
+            let (aes_key, iv) = stream.split_at_checked(key_size).ok_or(Rc::FAILURE)?;
             crypt::aes_cfb(aes_key, iv, data, encrypt)
         }
         Symmetric::Null => Err(Rc::FAILURE),

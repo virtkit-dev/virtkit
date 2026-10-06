@@ -190,7 +190,7 @@ impl Tpm {
             if cmd.auth > 0 {
                 return Err(Rc::AUTH_MISSING);
             }
-            (None, r.rest().to_vec())
+            (None, Zeroizing::new(r.rest().to_vec()))
         };
 
         let mut out = Out::default();

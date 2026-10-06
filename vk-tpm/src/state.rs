@@ -25,6 +25,12 @@ const VOLATILE_MAGIC: &[u8; 8] = b"VKTPM-V\0";
 /// changes in place, until one is (docs/tpm-design.md).
 const VERSION: u16 = 1;
 pub const SEED_SIZE: usize = 64;
+/// More than the serialized states can hold (the permanent one a few KiB with saved PCRs, the
+/// volatile one some tens with every session slot taken), so writing one never reallocates and
+/// leaves a stray copy of its secrets. The permanent state is written twice per command
+/// (Tpm::process), so its buffer is kept small: it is wiped whole when dropped.
+const PERMANENT_CAPACITY: usize = 8 * 1024;
+const VOLATILE_CAPACITY: usize = 64 * 1024;
 
 /// The state could not be read: not ours, a version this build does not know, or corrupt.
 #[derive(Debug, PartialEq, Eq)]
@@ -127,7 +133,7 @@ impl Permanent {
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        let mut w = Writer::new();
+        let mut w = Writer::with_capacity(PERMANENT_CAPACITY);
         w.bytes(PERMANENT_MAGIC).u16(VERSION);
         for seed in [&self.eps, &self.sps, &self.pps] {
             w.tpm2b(seed.as_slice());
@@ -243,7 +249,7 @@ impl Volatile {
     }
 
     pub fn serialize(&self) -> Vec<u8> {
-        let mut w = Writer::new();
+        let mut w = Writer::with_capacity(VOLATILE_CAPACITY);
         w.bytes(VOLATILE_MAGIC).u16(VERSION);
         w.u8(self.started.into())
             .u8(self.orderly_startup.into())
@@ -455,6 +461,38 @@ mod tests {
         assert_eq!(w.da_timers, v.da_timers);
         assert_eq!(w.clear, v.clear);
         assert_eq!(w.serialize(), bytes);
+    }
+
+    #[test]
+    fn states_fit_their_buffer() {
+        let tpm = crate::Tpm::manufacture().unwrap();
+        let mut p = Permanent::manufacture().unwrap();
+        let mut pcrs = Pcrs::new();
+        pcrs.startup(&p.allocation, Startup::Reset, None);
+        p.shutdown = Shutdown::State(Saved {
+            pcrs: pcrs.save(),
+            clear: ClearState {
+                platform_auth: Zeroizing::new(vec![1; 64]),
+                ..Default::default()
+            },
+        });
+        assert!(p.serialize().len() < PERMANENT_CAPACITY / 2);
+        let mut v = Volatile::power_on(&tpm.permanent);
+        for slot in &mut v.sessions {
+            *slot = Some(crate::session::Session {
+                kind: crate::session::Kind::Hmac,
+                hash: Hash::Sha512,
+                nonce_tpm: vec![0; 64],
+                key: Zeroizing::new(vec![0; 64]),
+                symmetric: crate::session::Symmetric::Aes(256),
+                bound: Some(Zeroizing::new(vec![0; 66])),
+                da_bound: true,
+                lockout_bound: true,
+                audit: Some(vec![0; 64]),
+                policy_digest: vec![0; 64],
+            });
+        }
+        assert!(v.serialize().len() < VOLATILE_CAPACITY / 2);
     }
 
     #[test]

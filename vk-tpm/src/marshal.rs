@@ -94,6 +94,14 @@ impl Writer {
         Writer::default()
     }
 
+    /// A writer that will not reallocate until it holds `capacity` bytes: the TPM's state is
+    /// written this way, so no copy of its secrets is left behind in freed memory.
+    pub fn with_capacity(capacity: usize) -> Writer {
+        Writer {
+            bytes: Vec::with_capacity(capacity),
+        }
+    }
+
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
