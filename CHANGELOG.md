@@ -57,8 +57,8 @@ All notable changes to virtkit will be documented in this file.
   (bug check 0x1E in the firmware's runtime services; root cause under investigation). It only
   guards the boot chain below the kernel: without SMM the guest's kernel can rewrite the
   variable store directly, replacing PK, KEK, db or dbx or turning Secure Boot off for good.
-  `# vk: tpm=on`, or `"tpm": true`, gives each machine a TPM 2.0 of its own: libtpms runs inside
-  `vk` (no swtpm on the host), its state in `tpm-state` beside the disks, carried by snapshots;
+  `# vk: tpm=on`, or `"tpm": true`, gives each machine a TPM 2.0 of its own, built into `vk`
+  (no swtpm on the host), its state in `tpm-state` beside the disks, carried by snapshots;
   BitLocker and Windows 11's checks see a ready, owned TPM. Build steps run without one.
   `examples/windows/win11.Dockerfile` makes a member (with a TPM and Secure Boot) that joins the
   lab's domain.

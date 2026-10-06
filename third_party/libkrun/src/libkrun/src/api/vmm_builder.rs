@@ -170,11 +170,12 @@ impl<'a> VmmBuilder<'a> {
         self
     }
 
-    /// Give the guest a TPM 2.0 (local patch, see VENDOR.md, `tpm` feature): libtpms behind a
+    /// Give the guest a TPM 2.0 (local patch, see VENDOR.md, `tpm` feature): vk-tpm behind a
     /// CRB interface at [`arch::x86_64::layout::TPM_CRB_START`], declared in the ACPI tables,
     /// its permanent state in `path` (a new TPM, manufactured on first use, when the file is
-    /// missing; one that cannot be read fails the TPM). Keep the file with the machine's disks;
-    /// a [`VmmBuilder::restore_from`] writes the snapshot's permanent state to it. x86_64 only.
+    /// missing; one that cannot be read, or that is not vk-tpm's, fails the TPM). Keep the file
+    /// with the machine's disks; a [`VmmBuilder::restore_from`] writes the snapshot's permanent
+    /// state to it. x86_64 only.
     #[cfg(feature = "tpm")]
     pub fn tpm_state(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.tpm_state = Some(path.into());

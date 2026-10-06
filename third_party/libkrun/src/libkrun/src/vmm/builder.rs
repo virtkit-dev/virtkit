@@ -2280,7 +2280,7 @@ fn attach_tpm(
     let Some(path) = vm_resources.tpm_state.as_deref() else {
         return Ok(None);
     };
-    // libtpms starts once: a restore starts it on the snapshot's state directly.
+    // A restore starts the TPM on the snapshot's state directly.
     #[cfg(feature = "snapshot")]
     let saved = match &vm_resources.restore_from {
         Some(dir) => {

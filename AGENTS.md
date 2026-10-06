@@ -87,15 +87,17 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with ten crates:
   clamped into a range only root can configure. It takes no arguments and no paths from its
   caller, so granting it `NOPASSWD` grants nothing else; all the policy lives in `vk`. Its
   config edit is also a library, for unprivileged `vk` to apply to a runner config it owns.
-- **`vk-tpm/`** — a TPM 2.0 engine in Rust (in progress), to replace libtpms behind libkrun's
-  TPM CRB device: command processing, sessions and parameter encryption, hierarchies and
+- **`vk-tpm/`** — the TPM 2.0 engine in Rust behind libkrun's TPM CRB device (Windows
+  guests' `tpm=on`): command processing, sessions and parameter encryption, hierarchies and
   dictionary-attack protection, PCRs, hash sequences, objects and keys (RSA, ECC P-256,
   primaries derived as libtpms derives them), contexts, persistent objects, NV indices,
   policies, attestation, duplication, EK provisioning, versioned state; crypto from RustCrypto
   crates only. See `docs/tpm-design.md`.
 
 libkrun is vendored (its own cargo workspace, locally patched) under
-`third_party/libkrun` — see its `VENDOR.md` for the patch list.
+`third_party/libkrun` — see its `VENDOR.md` for the patch list. Its `devices` crate depends on
+`vk-tpm` by path, so its `Cargo.lock` locks `vk-tpm`'s dependencies too: after changing them,
+run `cargo update -p vk-tpm` in `third_party/libkrun` as well.
 
 The guest kernel is a vanilla Linux `vmlinux` built from a vendored config fragment
 (`kernel/`); it is pinned and built separately from the binaries.
@@ -190,9 +192,7 @@ The toolchain is pinned in `rust-toolchain.toml` (musl target, clippy + rustfmt)
 cargo directly if you have it, or inside the devcontainer image to match CI exactly
 (clippy compiles the workspace, so it needs `build.sh`'s writable cargo home — see
 `.github/workflows/quality.yml`). These are the CI-parity commands, run to verify a
-change; the edit loop above is what to use while iterating. Outside the build image, set
-`VK_LIBTPMS_DIR` to a prefix with static musl `lib/libtpms.a` and `lib/libcrypto.a` (the
-image's is `/opt/tpm`): `vk-driver` links them for the Windows guests' TPM.
+change; the edit loop above is what to use while iterating.
 
 ```bash
 cargo build --release --workspace
@@ -208,9 +208,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 - **Shell:** Bash, `set -euo pipefail`. Scripts that also run inside the build image
   (e.g. `audit.sh` under CI) must stay POSIX-compatible — assume only `sh` there.
 - **Dependency audit:** `cargo-audit` with the RUSTSEC ignore list in `.cargo/audit.toml`
-  (each entry documented with rationale + residual risk). It does not see the C libraries
-  `vk` links statically from the build image (libtpms and OpenSSL's libcrypto, `/opt/tpm`):
-  their CVEs are fixed by a `flake.lock` bump (`./update.sh`) and a release.
+  (each entry documented with rationale + residual risk).
 
 ## CI
 

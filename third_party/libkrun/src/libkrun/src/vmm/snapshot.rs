@@ -270,8 +270,7 @@ impl LegacyDevices {
             tpm: self
                 .tpm
                 .as_ref()
-                .map(|tpm| tpm.lock().unwrap().save_state())
-                .transpose()?,
+                .map(|tpm| tpm.lock().unwrap().save_state()),
             #[cfg(not(feature = "tpm"))]
             tpm: None,
         })

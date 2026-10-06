@@ -24,8 +24,8 @@ vhost-user = ["vhost", "vmm-sys-util", "krun_display"]
 ffi = []
 # Serializable device state, for snapshots.
 snapshot = ["dep:serde"]
-# A TPM 2.0 (libtpms, linked statically from VK_LIBTPMS_DIR) behind a CRB interface.
-tpm = []
+# A TPM 2.0 (virtkit's vk-tpm) behind a CRB interface.
+tpm = ["dep:vk-tpm", "dep:zeroize"]
 
 [dependencies]
 bitflags = "1.2.0"
@@ -55,6 +55,9 @@ imago = { path = "../../../imago", default-features = false, features = ["sync",
 lru = ">=0.9"
 zstd = "0.14"
 maybe-async = { version = "0.2", features = ["is_sync"] }
+# virtkit's TPM 2.0 engine, a crate of virtkit's workspace (local patch, see VENDOR.md).
+vk-tpm = { path = "../../../../vk-tpm", optional = true }
+zeroize = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30.1", features = ["ioctl", "net", "poll", "socket", "fs", "uio"] }

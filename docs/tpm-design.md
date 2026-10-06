@@ -4,23 +4,24 @@ Status: phases 1 to 4 are implemented: the engine skeleton, sessions, hierarchie
 dictionary-attack protection, the PCR and hash commands, objects (keys, primary keys,
 contexts, persistent objects, signing, RSA and ECDH), NV indices, the policy commands,
 attestation and credentials, duplication, symmetric encryption, and EK provisioning. They were
-tested against libtpms. This document describes the target and the plan for getting there;
+tested against libtpms. Phase 5 runs libkrun's TPM device on `vk-tpm` (see the phase table for
+what is left). This document describes the design and the plan that got there;
 [Deviations](#deviations-from-libtpms) lists where `vk-tpm` answers differently, on purpose.
 
-`vk-tpm` is to replace libtpms and the OpenSSL it computes with as the engine behind libkrun's
-TPM CRB device (`third_party/libkrun/src/devices/src/legacy/x86_64/tpm.rs`). Those are ~300k
-lines of C, linked statically into `vk`. The replacement is a workspace crate with no C, whose
-crypto comes from RustCrypto crates. It is written to the TCG TPM 2.0 Library specification
-(Parts 1-3), and libtpms is its executable reference.
+`vk-tpm` replaced libtpms and the OpenSSL it computed with as the engine behind libkrun's TPM
+CRB device (`third_party/libkrun/src/devices/src/legacy/x86_64/tpm.rs`). Those were ~300k lines
+of C, linked statically into `vk`. The replacement is a workspace crate with no C, whose crypto
+comes from RustCrypto crates. It is written to the TCG TPM 2.0 Library specification
+(Parts 1-3), and libtpms was its executable reference.
 
 ## Why
 
-- **Supply chain and build.** libtpms and OpenSSL are the only C in `vk` that is not a crate's
-  vendored build. They need a dedicated nix output (`tpmLibs`), a musl static OpenSSL, and
-  `VK_LIBTPMS_DIR` plumbing.
+- **Supply chain and build.** libtpms and OpenSSL were the only C in `vk` that was not a
+  crate's vendored build. They needed a dedicated nix output (`tpmLibs`), a musl static
+  OpenSSL, and `VK_LIBTPMS_DIR` plumbing.
 - **Memory safety at a trust boundary.** Every command byte comes from the guest. libtpms has
   had out-of-bounds CVEs in exactly that path, e.g. CVE-2021-3746 and CVE-2023-1017/1018.
-- **One TPM per process.** libtpms keeps global state, so the device has a process-wide lock
+- **One TPM per process.** libtpms keeps global state, so the device had a process-wide lock
   and static callbacks. `vk-tpm` is a value: any number of TPMs per process, and tests run in
   parallel.
 - **Readable state.** The state is ours, versioned, and documented below. libtpms' blobs are
@@ -233,9 +234,9 @@ from a generator seeded with 64 bytes of host entropy.
 
 ## Engine interface (what libkrun's device calls)
 
-It mirrors what `tpm.rs` (at 2ba84aa2) does with libtpms, so the device swaps one for the other:
+The interface mirrors `tpm.rs` with libtpms at 2ba84aa2, allowing the device to swap engines:
 
-| `tpm.rs` today (libtpms) | `vk-tpm` |
+| `tpm.rs` with libtpms | `vk-tpm` |
 |---|---|
 | `TPMLIB_SetBufferSize(BUFFER_SIZE)`, which must equal it | `vk_tpm::MAX_COMMAND_SIZE == BUFFER_SIZE` (0xf80), a `const` assertion in the device |
 | `TPMLIB_SetProfile({"Name":"default-v1"})` | none: the implemented set is fixed per state format version |
@@ -244,7 +245,7 @@ It mirrors what `tpm.rs` (at 2ba84aa2) does with libtpms, so the device swaps on
 | snapshot restore: write the file, `SetState(PERMANENT)`, `SetState(VOLATILE)`, `MainInit` | `Tpm::restore(&saved.permanent, &saved.volatile)`, and write the file |
 | `TPMLIB_Process` | `Tpm::process(&cmd) -> Vec<u8>`, never fails, at most `MAX_COMMAND_SIZE` bytes |
 | `nvram_storedata("permall")` callback | after `process`, `if tpm.take_permanent_changed() { write_atomic(path, &tpm.permanent_state()) }`, before the CRB clears START so a guest never sees a response whose state is not durable |
-| swtpm_setup's EK provisioning (not done today) | optional, at manufacture: `tpm.endorsement_key(kind)` for a CA to certify, then `tpm.provision_endorsement_key(kind, Some(&der))` (see "EK certificate") |
+| none (swtpm_setup's EK provisioning) | at manufacture, `tpm.provision_endorsement_key(kind, None)` for both EKs; for a CA's certificate, `tpm.endorsement_key(kind)` to certify, then `provision_endorsement_key(kind, Some(&der))` (see "EK certificate") |
 | `TPMLIB_GetState(PERMANENT / VOLATILE)` for a snapshot | `permanent_state()` / `volatile_state()`, both `Zeroizing` |
 | `RUNNING` / `PERMANENT_STATE` globals | none: a `Tpm` is a value owned by the `TpmCrb` |
 
@@ -261,8 +262,16 @@ as the device grants only locality 0. `process` will take one when the device of
 
 The libkrun crates are a separate cargo workspace. Their `devices` crate depends on `vk-tpm`
 by path, behind its `tpm` feature, and libkrun's lockfile gains the RustCrypto crates
-`vk-tpm` uses, which are already in `vk`'s. `VK_LIBTPMS_DIR`, the `tpmLibs` flake output and
-the NOTICE entries for libtpms/OpenSSL go away in the same change.
+`vk-tpm` uses, which are already in `vk`'s (pinned to the same versions). `vk` links neither
+libtpms nor OpenSSL any more, and its NOTICE no longer lists them. The build image still
+carries `tpmLibs` at `/opt/tpm`, which nothing uses any more.
+
+**Done in phase 5.** The libtpms engine is removed rather than kept behind a feature: the TPM
+had not shipped in a release, so no user has a libtpms state, and a second engine would have
+kept the C build plumbing in the default build. A new TPM gets its RSA 2048 and P-256 EKs made
+persistent (`provision_endorsement_key(kind, None)`), with no certificate (see "EK
+certificate"). A TPM whose state cannot be stored answers TPM_RC_FAILURE to every later
+command, rather than go on from a state the file does not have.
 
 ## State
 
@@ -328,9 +337,9 @@ mean parsing `NVMarshal.c`'s format, including its seeds. A machine that switche
 a new TPM: new seeds, so a new EK and SRK. Anything sealed to the old TPM is lost: BitLocker
 asks for its recovery key once, then reseals, and Windows Hello keys must be re-enrolled. The
 device must therefore recognize a libtpms state (its blob is not `VKTPM-P`) and fail loudly
-rather than silently manufacture over it. `vk` then offers either to keep the libtpms build for
-that machine or to reset its TPM explicitly. The default for new machines is decided when
-phase 5 lands.
+rather than silently manufacture over it. It does (phase 5): the error names libtpms and says
+how to reset the TPM (remove `tpm-state`) or, for a snapshot, to restore it with the `vk` that
+took it. Every machine, new or not, runs `vk-tpm`.
 
 ## Policy sessions
 
@@ -355,9 +364,8 @@ same each time. What a manufacturer adds is a certificate of it, in NV at 0x01C0
 0x01C0000A (ECC), and often the EK made persistent (0x81010001 / 0x81010002, the handles the
 TCG Provisioning Guidance reserves). The options:
 
-1. **None** (libtpms in `vk` today, and the default): the libtpms build provisions nothing,
-   and its Windows guests use their TPM (Get-Tpm, the TPM-backed AD member of the Windows
-   end-to-end test). AD CS key attestation works by user credentials or by EK public key (the
+1. **None**: the libtpms build provisioned nothing, and its Windows guests used their TPM
+   (Get-Tpm, the TPM-backed AD member of the Windows end-to-end test). AD CS key attestation works by user credentials or by EK public key (the
    EKPUB list), not by EK certificate.
 2. **A per-host virtkit CA** signs each TPM's EK at manufacture (`vk` holds the CA key, exports
    its certificate for an administrator to put in AD CS's EKROOT/EKCA stores): AD CS key
@@ -365,15 +373,17 @@ TCG Provisioning Guidance reserves). The options:
    profile's extensions) and CA key management in `vk-driver`.
 3. A self-signed certificate: present, trusted by nobody; no use.
 
-Decision: **none by default**, the simplest, and what Windows guests run with today; and the
-mechanism for option 2 is in `vk-tpm` now: `Tpm::endorsement_key(kind)` gives the EK's
+Decision: **no certificate**, the simplest, and what Windows guests ran with on libtpms; the
+EKs themselves are made persistent at manufacture (phase 5). The mechanism for option 2 is in
+`vk-tpm`: `Tpm::endorsement_key(kind)` gives the EK's
 public area to certify, `Tpm::provision_endorsement_key(kind, Some(der))` makes the EK
 persistent and stores the certificate in its index (platform-created, written and
 write-locked, readable by the owner and with its empty authValue, `TPMA_NV_NO_DA`), as
-swtpm_setup provisions QEMU's TPMs; given none, it deletes any certificate there. Whether
-`vk` adds the CA is phase 5's call. TPM2_Clear removes the persistent EK (an endorsement
-object), not the certificate (platform-created); TPM2_ChangeEPS removes the EK too and leaves
-the certificate stale.
+swtpm_setup provisions QEMU's TPMs; given none, it deletes any certificate there. The per-host
+CA (option 2) is an optional follow-up: it needs X.509 generation (ECDSA P-256 with `ring`, already in `vk`,
+and a few hundred lines of DER), a CA key under `vk`'s state, and provisioning before the VMM
+starts. TPM2_Clear removes the persistent EK (an endorsement object), not the certificate
+(platform-created); TPM2_ChangeEPS removes the EK too and leaves the certificate stale.
 
 ## Deviations from libtpms
 
@@ -556,4 +566,4 @@ obfuscation of an attestation's counters reads KDFa's output as little-endian wo
 | 2 | **Done.** StartAuthSession (unsalted; bound or not; HMAC, policy, trial), HMAC sessions, cpHash/rpHash/names, parameter encryption (AES-CFB, XOR), audit sessions, KDFa, DA logic, HierarchyControl, HierarchyChangeAuth, SetPrimaryPolicy, Clear, ClearControl, ChangeEPS, ChangePPS, DictionaryAttackLockReset/Parameters, PCR_Allocate/Reset/Event, Hash, hash and event sequences, FlushContext | ~4 kLoC, a third of it tests |
 | 3 | **Done.** Objects: TPMT_PUBLIC/SENSITIVE, protection (symmetric + integrity), CreatePrimary (deterministic), Create/Load/ReadPublic/Unseal/ObjectChangeAuth/LoadExternal, contexts (ContextSave/Load/Flush, saved sessions), EvictControl, Sign/VerifySignature, RSA_Encrypt/Decrypt, ECDH_KeyGen/ZGen, ECC_Parameters, RSA/ECC-salted sessions (with KDFe), HMAC/HMAC_Start and HMAC sequences, TestParms, StirRandom, GetTestResult, ReadClock (with Clock and the reset counters in the state) | ~6.5 kLoC, 40% of it tests |
 | 4 | **Done.** NV indices (every type and attribute, orderly, budget), the policy commands (PolicyCommandCode gives the ADMIN role), attestation (Quote, Certify, CertifyCreation, NV_Certify, GetTime, GetSessionAuditDigest), MakeCredential/ActivateCredential, Duplicate/Import, CreateLoaded, EncryptDecrypt(2), EK provisioning API (see "EK certificate"); change tracking of the permanent state | ~7 kLoC, 40% of it tests |
-| 5 | Integration: libkrun device on `vk-tpm` (detecting a libtpms state, see "No migration"), the EK decision applied (and the per-host CA if wanted), MS-simulator socket server and the IBM TSS / tpm2-tools runs, fuzzing, Windows and Linux guest validation, removal of libtpms | ~1.5 kLoC + validation |
+| 5 | **Done:** libkrun device on `vk-tpm` (detecting a libtpms state, see "No migration"), persistent EKs without certificates, removal of libtpms, Windows guest validation. **Left:** the per-host CA if wanted, MS-simulator socket server and the IBM TSS / tpm2-tools runs, fuzzing, Linux guest validation | ~1.5 kLoC + validation |

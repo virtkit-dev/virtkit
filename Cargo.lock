@@ -1891,9 +1891,11 @@ dependencies = [
  "rand",
  "serde",
  "virtio-bindings",
+ "vk-tpm",
  "vm-fdt",
  "vm-memory",
  "windows-sys 0.61.2",
+ "zeroize",
  "zstd",
 ]
 
