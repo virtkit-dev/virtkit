@@ -106,6 +106,10 @@ pub struct Unit {
     /// directories. Settled in [`map_service`], the one place that knows both the compose dir
     /// and the service name.
     pub persist_root_backing: Option<PathBuf>,
+    /// eth0 on a host tap (compose `x-virtkit.tap`), applied identically primary or sibling:
+    /// the guest holds an address on the tap's LAN, its switch ports follow as eth1 upward
+    /// and the run's service names are pinned in its `/etc/hosts`. `None` = switch only.
+    pub tap: Option<crate::net::TapNet>,
 }
 
 /// Where a unit's image comes from.
@@ -881,30 +885,33 @@ fn map_service(
     };
     // The per-service axes (compose `x-virtkit`): absent key/subkey = the defaults,
     // so an unmarked service keeps today's agent-as-PID1 pinned-kernel 2-vCPU/1G boot.
-    let (init, kernel, cpus, mem, reclaim, dax, nested, nics, persist_root) = match svc.x_virtkit {
-        Some(x) => (
-            x.init()?,
-            x.kernel()?,
-            x.cpus()?,
-            x.mem()?,
-            x.reclaim()?,
-            x.dax()?,
-            x.nested()?,
-            x.nics()?,
-            x.persist_root()?,
-        ),
-        None => (
-            crate::run::InitSource::Default,
-            crate::run::KernelSource::Default,
-            None,
-            None,
-            None,
-            None,
-            false,
-            1,
-            false,
-        ),
-    };
+    let (init, kernel, cpus, mem, reclaim, dax, nested, nics, persist_root, tap) =
+        match svc.x_virtkit {
+            Some(x) => (
+                x.init()?,
+                x.kernel()?,
+                x.cpus()?,
+                x.mem()?,
+                x.reclaim()?,
+                x.dax()?,
+                x.nested()?,
+                x.nics()?,
+                x.persist_root()?,
+                x.tap()?,
+            ),
+            None => (
+                crate::run::InitSource::Default,
+                crate::run::KernelSource::Default,
+                None,
+                None,
+                None,
+                None,
+                false,
+                1,
+                false,
+                None,
+            ),
+        };
     // Key roots by service under the same anchor as overlays, so primary and sibling
     // use the same stable path.
     let persist_root_backing = persist_root.then(|| persist_root_path(&anchor, name));
@@ -942,6 +949,7 @@ fn map_service(
         nested,
         nics,
         persist_root_backing,
+        tap,
     })
 }
 
@@ -1801,7 +1809,8 @@ struct ComposeService {
 /// parsed into [`crate::run::InitSource`] / [`crate::run::KernelSource`], plus the
 /// guest sizing (`cpus`/`mem`), idle page-cache trimming (`reclaim`), the DAX window its
 /// shares get (`dax`), nested virtualization (`nested`), NIC count (`nics`) and root
-/// persistence (`persist_root`). An absent subkey defaults to `Default`/unset/off.
+/// persistence (`persist_root`), and a host tap for eth0 (`tap`). An absent subkey defaults to
+/// `Default`/unset/off.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct XVirtkit {
@@ -1828,6 +1837,24 @@ struct XVirtkit {
     /// scalar, not bool, for the same reason as `nested`
     #[serde(default)]
     persist_root: Option<Scalar>,
+    #[serde(default)]
+    tap: Option<XTap>,
+}
+
+/// `x-virtkit.tap`: the same spec as `vk run --tap`/`--tap-mac`/`--tap-ip`/`--tap-gw`/
+/// `--tap-dns`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct XTap {
+    name: String,
+    #[serde(default)]
+    mac: Option<String>,
+    #[serde(default)]
+    ip: Option<String>,
+    #[serde(default)]
+    gw: Option<String>,
+    #[serde(default)]
+    dns: Vec<String>,
 }
 
 impl XVirtkit {
@@ -1961,6 +1988,26 @@ impl XVirtkit {
                 _ => bail!("x-virtkit.persist_root: expected true or false, got {s:?}"),
             },
         }
+    }
+
+    /// `tap: {name, mac, ip, gw, dns}` → eth0 on that host tap (absent = switch only).
+    fn tap(&self) -> Result<Option<crate::net::TapNet>> {
+        let Some(t) = &self.tap else {
+            return Ok(None);
+        };
+        let addr = |field: &str, s: &str| -> Result<std::net::Ipv4Addr> {
+            s.parse()
+                .with_context(|| format!("x-virtkit.tap.{field}: {s:?} is not an IPv4 address"))
+        };
+        let gw = t.gw.as_deref().map(|g| addr("gw", g)).transpose()?;
+        let dns = t
+            .dns
+            .iter()
+            .map(|d| addr("dns", d))
+            .collect::<Result<Vec<_>>>()?;
+        crate::net::TapNet::new(&t.name, t.mac.as_deref(), t.ip.as_deref(), gw, &dns)
+            .map(Some)
+            .context("x-virtkit.tap")
     }
 }
 
@@ -3374,6 +3421,45 @@ mod tests {
                 .is_err(),
                 "{marker} should be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn x_virtkit_tap_parses_the_run_flags_spec() {
+        assert_eq!(one("services:\n  s:\n    image: x\n").tap, None);
+        let u = one(
+            "services:\n  s:\n    image: x\n    x-virtkit:\n      tap: { name: vkdev0, \
+             mac: BC:24:11:00:27:D9, ip: 10.10.132.201/23, gw: 10.10.132.1, \
+             dns: [10.10.0.53] }\n",
+        );
+        let tap = u.tap.expect("tap declared");
+        assert_eq!(
+            (tap.tap.as_str(), tap.mac.as_str()),
+            ("vkdev0", "bc:24:11:00:27:d9")
+        );
+        assert_eq!(
+            tap.addr,
+            Some((
+                "10.10.132.201".parse().unwrap(),
+                23,
+                "10.10.132.1".parse().unwrap(),
+                vec!["10.10.0.53".parse().unwrap()]
+            ))
+        );
+        // name alone: DHCP on a derived MAC
+        let u = one("services:\n  s:\n    image: x\n    x-virtkit: { tap: { name: t0 } }\n");
+        assert_eq!(u.tap.unwrap().addr, None);
+        for marker in [
+            "{ tap: { mac: 02:00:00:00:00:01 } }",
+            "{ tap: { name: t0, ip: 10.0.0.2/24 } }",
+            "{ tap: { name: t0, ip: 10.0.0.2/24, gw: nope } }",
+            "{ tap: { name: t0, bridge: vmbr0 } }",
+        ] {
+            let err = parse(
+                &format!("services:\n  s:\n    image: x\n    x-virtkit: {marker}\n"),
+                Path::new("/b"),
+            );
+            assert!(err.is_err(), "{marker} should be rejected");
         }
     }
 

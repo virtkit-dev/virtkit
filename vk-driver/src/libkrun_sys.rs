@@ -20,7 +20,7 @@
 //! supervisor.
 
 use std::fs::{File, OpenOptions};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
@@ -161,7 +161,7 @@ fn path_str(path: &Path) -> Result<&str> {
 
 /// Boot `spec` under libkrun in this process. Returns only if setup fails; once the
 /// guest runs, libkrun ends the process with its exit code.
-pub fn boot(spec: &VmSpec) -> Result<()> {
+fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>) -> Result<()> {
     // Before any thread exists, so every thread libkrun spawns inherits the mask and the
     // signal stays pending for the power-button thread.
     block_sigterm();
@@ -207,23 +207,29 @@ pub fn boot(spec: &VmSpec) -> Result<()> {
     }
     match &spec.net {
         Net::None => {}
-        Net::Tap { tap, mac } => {
+        Net::Tap { mac, .. } => {
             let mac =
                 crate::switch::parse_mac(mac).ok_or_else(|| anyhow!("invalid MAC {mac:?}"))?;
-            devices.add(NetDevice::new_tap("eth0", tap, &mac, 0).map_err(krun("tap NIC"))?);
+            let fd = tap_fd
+                .context("tap not attached before boot")?
+                .try_clone()
+                .context("duplicating the tap descriptor")?;
+            devices.add(NetDevice::new_tap_fd("eth0", fd, &mac, 0).map_err(krun("tap NIC"))?);
         }
     }
     // Switch NICs: one virtio-net device per switch port, dialing the socket the switch
     // listens on and speaking its 4-byte-length framing, with no offloads (the switch
     // terminates TCP and wants complete checksums) and the switch LAN's MTU, so the guest
-    // link comes up at it unconfigured. Attach order is interface order (eth0, eth1, …).
+    // link comes up at it unconfigured. Attach order is interface order (eth0, eth1, …),
+    // after a tap's eth0 when there is one; the ids follow it, libkrun keying devices by id.
+    let first = usize::from(matches!(spec.net, Net::Tap { .. }));
     for (i, nic) in spec.nics.iter().enumerate() {
         let socket = SocketPath::new(&nic.socket)
             .with_context(|| format!("switch nic {i}: socket {}", nic.socket.display()))?;
         let mac = crate::switch::parse_mac(&nic.mac)
             .ok_or_else(|| anyhow!("switch nic {i}: invalid MAC {:?}", nic.mac))?;
         let mut net = NetDevice::new_unixstream_path(
-            &format!("eth{i}"),
+            &format!("eth{}", i + first),
             path_str(socket.as_path())?,
             &mac,
             0,
@@ -438,11 +444,17 @@ fn press_power_button_on_sigterm(handle: VmmHandle) -> Result<()> {
 /// reset (SIGUSR1), boots it again. A host SIGTERM is forwarded to the child (its ACPI
 /// power button) and stops the loop. Returns the process exit code to use.
 pub fn keep(spec: &VmSpec) -> Result<i32> {
+    // Claim the actual queue before any guest boots. Keep it across resets too: each boot
+    // inherits this open description, so another VMM cannot take the tap in between.
+    let tap_fd = match &spec.net {
+        Net::None => None,
+        Net::Tap { tap, .. } => Some(crate::net::attach_tap(tap)?),
+    };
     if !spec.reboot {
         // No in-place reboot: boot once. `boot` execs libkrun and never returns on a
         // normal end (libkrun `_exit`s with the guest's code), so this is effectively
         // the whole process; a return here means setup failed before the guest ran.
-        boot(spec)?;
+        boot(spec, tap_fd.as_ref())?;
         return Ok(0);
     }
 
@@ -485,7 +497,7 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
                 libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
             }
-            let code = match boot(spec) {
+            let code = match boot(spec, tap_fd.as_ref()) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("virtkit: libkrun boot: {e:#}");

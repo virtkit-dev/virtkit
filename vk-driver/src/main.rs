@@ -1740,6 +1740,51 @@ enum Cmd {
         /// DHCP + DNS + transparent proxy over vsock.
         #[arg(long, help_heading = "Network")]
         net: bool,
+        /// Attach eth0 to this host tap
+        ///
+        /// The guest is a port on whatever the tap is bridged to, with its own MAC, so it
+        /// holds an address on that LAN. The tap must exist, be owned by the user running vk
+        /// (`ip tuntap add NAME mode tap user USER`, then enslave it to the bridge) and not
+        /// be held by another VM; vk checks this before boot.
+        /// Without --tap-ip the guest asks DHCP: the default init runs dhclient, an image
+        /// init (--init image) keeps its own network configuration. With --net or --compose
+        /// the switch ports follow as eth1 upward, without a route: egress and DNS go
+        /// through the tap, and the compose services' names are pinned in /etc/hosts. A
+        /// --primary service's own `x-virtkit.tap` gives way to this flag.
+        #[arg(long, value_name = "NAME", help_heading = "Network")]
+        tap: Option<String>,
+        /// MAC address of the --tap NIC [default: derived from host identity and tap name]
+        #[arg(
+            long = "tap-mac",
+            value_name = "MAC",
+            requires = "tap",
+            help_heading = "Network"
+        )]
+        tap_mac: Option<String>,
+        /// static address of the --tap NIC, as A.B.C.D/PREFIX (needs --tap-gw and --tap-dns)
+        #[arg(
+            long = "tap-ip",
+            value_name = "CIDR",
+            requires_all = ["tap", "tap_gw", "tap_dns"],
+            help_heading = "Network"
+        )]
+        tap_ip: Option<String>,
+        /// default gateway of the --tap-ip address
+        #[arg(
+            long = "tap-gw",
+            value_name = "IP",
+            requires = "tap_ip",
+            help_heading = "Network"
+        )]
+        tap_gw: Option<std::net::Ipv4Addr>,
+        /// nameserver for a --tap-ip guest (repeatable)
+        #[arg(
+            long = "tap-dns",
+            value_name = "IP",
+            requires = "tap_ip",
+            help_heading = "Network"
+        )]
+        tap_dns: Vec<std::net::Ipv4Addr>,
         /// audit the booted guest's egress: which external domains it contacts
         ///
         /// Lists every one, and how many times, when the run ends. Observes only — it does not
@@ -3112,6 +3157,11 @@ async fn cli_main(cli: Cli) -> ExitCode {
         shell,
         tty,
         net,
+        tap,
+        tap_mac,
+        tap_ip,
+        tap_gw,
+        tap_dns,
         audit_egress,
         build_audit_egress,
         registry_proxy,
@@ -3268,6 +3318,23 @@ async fn cli_main(cli: Cli) -> ExitCode {
         // once keeps a prebuild and the run it warms on the same destination.
         let cache =
             build::CacheOpts::resolve(cache_registry.as_deref(), *cache_insecure, &cfg.build);
+        let tap = match tap
+            .as_deref()
+            .map(|name| {
+                net::TapNet::new(
+                    name,
+                    tap_mac.as_deref(),
+                    tap_ip.as_deref(),
+                    *tap_gw,
+                    tap_dns,
+                )
+                .map_err(|e| e.context("--tap"))
+            })
+            .transpose()
+        {
+            Ok(tap) => tap,
+            Err(e) => return fail(&e, 2),
+        };
         let args = run::RunArgs {
             image: image.clone().unwrap_or_default(),
             dockerfiles: file.clone(),
@@ -3305,6 +3372,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             tty: *tty,
             // services live on the run switch's LAN: --compose implies it.
             net: *net || compose.is_some(),
+            tap,
             audit_egress: *audit_egress,
             build_audit_egress: *build_audit_egress,
             // A `vk dev` config setting; `vk run` has no allowlist flag for the booted guest.

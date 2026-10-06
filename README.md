@@ -315,6 +315,38 @@ its own MAC, answers ARP, and can carry its own listening services — which is 
 appliance separating admin from user traffic needs. Up to 8 per guest;
 `vk check --feature nics` reports whether a `vk` supports them.
 
+`tap` puts a guest's `eth0` on a host tap instead, so the guest holds an address on the
+LAN that tap is bridged to — a machine moved off another hypervisor keeps its MAC and IP:
+
+```yaml
+services:
+  devbox:
+    image: local/devbox
+    x-virtkit:
+      tap: { name: vkdev0, mac: BC:24:11:00:27:D9, ip: 10.10.132.201/23, gw: 10.10.132.1, dns: [10.10.0.53] }
+```
+
+The tap is the caller's: create it owned by the user running `vk` and enslave it to the
+bridge (`ip tuntap add vkdev0 mode tap user $USER && ip link set vkdev0 master vmbr0 up`).
+A static `ip` needs `gw` and `dns`; without one the guest asks the LAN's DHCP. The guest's
+switch ports follow as `eth1` upward, addressed without a route: egress and DNS go through
+the tap, it still reaches its siblings, and their names are pinned in its `/etc/hosts`
+since the LAN's resolver does not know them. `vk` checks a tap before booting on it: it
+must exist, be owned by or open to the user running `vk` (root included), and not be held
+by another VM. Two services naming the same tap fail the run, as does a tap the CI executor
+uses (`net.mode = "tap"` or a `pool` tap) and a static `ip` overlapping the switch LAN
+(`192.168.127.0/24`).
+`vk run --tap NAME` (with `--tap-mac`, `--tap-ip`, `--tap-gw`, `--tap-dns`) does the same
+for the primary, overriding its service's `tap`, and combines with `--net`. A tap guest
+rules out `--audit-egress` and a restricted egress policy, which live on the switch, and a
+tap primary `--registry-proxy`.
+`vk check --feature tap` reports whether a `vk` supports it.
+
+Without `mac` / `--tap-mac`, the MAC is derived from the host's machine ID and tap name,
+so hosts using the same tap name get different MACs. On a host without `/etc/machine-id`,
+the boot ID is used instead; set an explicit MAC to keep it across host reboots there.
+The VMM claims the tap before starting the guest and holds it across guest resets.
+
 #### Volumes and persistent state
 
 A service starts from a clean copy of its image every time: its root filesystem is a

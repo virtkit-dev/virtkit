@@ -17,8 +17,11 @@
 //! Cmdline params (all VIRTKIT_*):
 //!   VIRTKIT_VSOCK_PORT   serve agent's vsock port (default 4444)
 //!   VIRTKIT_HOSTNAME     hostname (+ a 127.0.1.1 self-entry in /etc/hosts)
+//!   VIRTKIT_HOSTS        `name=ip,…` pinned in /etc/hosts: the switch LAN's names, for a
+//!                        guest whose eth0 is a host tap and whose resolver is that LAN's
 //!   VIRTKIT_NET_VIRTIO=1 bring eth0 up: the VMM attached it as a virtio-net device on
-//!                        the host switch (libkrun), so it exists from kernel boot; then
+//!                        the host switch or a host tap (libkrun), so it exists from
+//!                        kernel boot; then
 //!                        DHCP (VIRTKIT_NET_DHCP=1) or a static VIRTKIT_VM_IP /
 //!                        VIRTKIT_VM_GW / VIRTKIT_VM_DNS
 //!   VIRTKIT_NET_EXTRA_IPS  ip/prefix[,ip/prefix] — additional NICs in order. Entry i
@@ -1011,9 +1014,11 @@ fn set_hostname(cmdline: &HashMap<String, String>) {
 
 /// Make this VM's own name resolvable offline (sudo etc. look it up before/without
 /// the network), via the standard 127.0.1.1 entry. Only the bare name — a *.lan name
-/// stays a DNS answer (its real LAN IP), never shadowed by a loopback entry.
+/// stays a DNS answer (its real LAN IP), never shadowed by a loopback entry. Also pins the
+/// `VIRTKIT_HOSTS` names ([`pin_lan_hosts`]).
 fn write_self_hosts(cmdline: &HashMap<String, String>) {
-    let mut hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+    let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+    let mut hosts = pin_lan_hosts(&hosts, cmdline.get("VIRTKIT_HOSTS").map(String::as_str));
     if !hosts
         .lines()
         .any(|l| l.split_whitespace().next() == Some("127.0.0.1"))
@@ -1030,6 +1035,40 @@ fn write_self_hosts(cmdline: &HashMap<String, String>) {
     if let Err(e) = std::fs::write("/etc/hosts", hosts) {
         warn!("vk-agent init: writing /etc/hosts failed: {e}");
     }
+}
+
+/// Marks the `/etc/hosts` lines [`pin_lan_hosts`] writes, so the next boot replaces them
+/// rather than stacking another set on a persistent root.
+const LAN_HOSTS_TAG: &str = "# vk-lan";
+
+/// `hosts` with last boot's pinned LAN names dropped and `spec`'s (`name=ip,…`) appended.
+/// An entry whose address does not parse, or whose name is not a hostname, is skipped.
+fn pin_lan_hosts(hosts: &str, spec: Option<&str>) -> String {
+    let mut out: String = hosts
+        .lines()
+        .filter(|l| !l.ends_with(LAN_HOSTS_TAG))
+        .flat_map(|l| [l, "\n"])
+        .collect();
+    for entry in spec
+        .unwrap_or_default()
+        .split(',')
+        .filter(|e| !e.is_empty())
+    {
+        let Some((name, ip)) = entry.split_once('=') else {
+            warn!("vk-agent init: VIRTKIT_HOSTS entry {entry:?} is not name=ip");
+            continue;
+        };
+        let name_ok = !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_');
+        if !name_ok || ip.parse::<std::net::Ipv4Addr>().is_err() {
+            warn!("vk-agent init: VIRTKIT_HOSTS entry {entry:?} skipped");
+            continue;
+        }
+        out.push_str(&format!("{ip}\t{name}\t{LAN_HOSTS_TAG}\n"));
+    }
+    out
 }
 
 /// Load the image's ENV from /etc/virtkit/env (one KEY=VALUE per line) into our own
@@ -3265,6 +3304,22 @@ fn cstr(s: &str) -> CString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lan_hosts_replace_last_boots_and_skip_bad_entries() {
+        let base = "127.0.0.1\tlocalhost\n10.0.0.9\told\t# vk-lan\n";
+        assert_eq!(
+            pin_lan_hosts(
+                base,
+                Some("db=192.168.127.3,bad name=1.2.3.4,web=x,web=192.168.127.4")
+            ),
+            "127.0.0.1\tlocalhost\n\
+             192.168.127.3\tdb\t# vk-lan\n\
+             192.168.127.4\tweb\t# vk-lan\n"
+        );
+        // No spec: last boot's entries go, the rest stays.
+        assert_eq!(pin_lan_hosts(base, None), "127.0.0.1\tlocalhost\n");
+    }
 
     #[test]
     fn cmdline_parses_key_values() {

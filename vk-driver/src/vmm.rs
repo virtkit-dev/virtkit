@@ -513,9 +513,9 @@ pub fn apply_dax_budget(shares: &mut [FsShare], mem: &str) {
     }
 }
 
-/// Guest networking outside the switch: a host tap by name (CI `net.mode = tap|pool`), or
-/// nothing. Switch-mode guests use [`Net::None`] here and attach through [`switch_attach`]
-/// as [`VmSpec::nics`].
+/// Guest networking outside the switch: a host tap by name (CI `net.mode = tap|pool`,
+/// `vk run --tap`, compose `x-virtkit.tap`), or nothing. With a tap, the switch NICs in
+/// [`VmSpec::nics`] (attached through [`switch_attach`]) follow it as eth1 upward.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum Net {
     None,

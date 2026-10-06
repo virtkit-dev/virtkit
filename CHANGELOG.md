@@ -106,6 +106,14 @@ All notable changes to virtkit will be documented in this file.
   The hub holds the release's `vk` once it matches the sha256 published beside it, unsigned;
   `/operations` offers the same, and shows the latest version available. `release_repository`
   in `hub.toml` names another repository, or `"none"` turns fetching off.
+- **A VM can sit directly on a host network through a tap.** `vk run --tap NAME` (with
+  `--tap-mac`, `--tap-ip`, `--tap-gw` and `--tap-dns`), or `x-virtkit: { tap: … }` on a
+  compose service, puts the guest's first interface on a tap you create and bridge, so it
+  keeps a MAC and an address of its own on that LAN, or asks its DHCP. A compose guest on a
+  tap still reaches the other services by name. A tap that is missing, not the user's or
+  held by another VM fails the run before boot. Without a MAC, the guest's default one is
+  derived from the host and the tap name, so the same tap name on two hosts on one LAN does
+  not collide. `vk check --feature tap` reports support.
 
 ### Changed
 

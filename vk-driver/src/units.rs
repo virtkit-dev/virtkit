@@ -76,6 +76,12 @@ pub struct Provisioned {
     /// standalone qcow2 kept across restart and down/up, `None` = a throwaway CoW over `ext4`
     /// every start. Uniform with the primary path.
     pub persist_root_backing: Option<PathBuf>,
+    /// eth0 on a host tap (its compose `x-virtkit.tap`); the switch ports then follow as eth1
+    /// upward. Uniform with the primary path.
+    pub tap: Option<crate::net::TapNet>,
+    /// The LAN's names (name, ip) a `tap` guest pins in `/etc/hosts`, its resolver being the
+    /// tap LAN's rather than the switch's. Filled in once the whole LAN is planned.
+    pub tap_hosts: Vec<(String, String)>,
 }
 
 /// Where a unit sits on the owner's LAN: the subnet's gateway and prefix, the address slot
@@ -345,6 +351,8 @@ pub fn provisioned(
         nested: unit.nested,
         extra_ips,
         persist_root_backing: unit.persist_root_backing.clone(),
+        tap: unit.tap.clone(),
+        tap_hosts: Vec::new(),
     })
 }
 
@@ -470,6 +478,10 @@ pub fn boot_unit(
              declares neither, and no compose `entrypoint:`/`command:` supplies one",
             svc.name
         );
+    }
+    // Every start, restarts included: the tap may have gone or been taken since the last.
+    if let Some(tap) = &svc.tap {
+        crate::net::probe_tap(&tap.tap).with_context(|| format!("service {}", svc.name))?;
     }
     let vsock = dir.join("vsock.sock");
     let console = dir.join(crate::run::CONSOLE_LOG);
@@ -651,6 +663,18 @@ pub fn boot_unit(
     let mut addrs = vec![svc.addr];
     addrs.extend_from_slice(&svc.extra_ips);
     let attach = crate::vmm::switch_attach(&vsock, net_port, &addrs, svc.prefix, gateway);
+    // A tap guest takes eth0 on the tap: the switch ports shift to eth1 upward, unrouted.
+    let net_cmdline = match &svc.tap {
+        Some(tap) => tap.cmdline(&addrs, svc.prefix, &svc.tap_hosts),
+        None => attach.cmdline.clone(),
+    };
+    let net = match &svc.tap {
+        Some(tap) => crate::vmm::Net::Tap {
+            tap: tap.tap.clone(),
+            mac: tap.mac.clone(),
+        },
+        None => crate::vmm::Net::None,
+    };
 
     // Build and spawn the VMM. On any failure, kill the socket-forward children already
     // spawned above before returning — Child's Drop does not kill, so a soft error
@@ -685,9 +709,10 @@ pub fn boot_unit(
                 svc.hostname
             )
         };
-        // The switch attach: static address, the gateway as default route and resolver (its
-        // DNS answers the service names and forwards the rest), and the NICs after eth0.
-        cmdline.push_str(&attach.cmdline);
+        // Without a tap, the switch attach: static address, the gateway as default route and
+        // resolver (its DNS answers the service names and forwards the rest), and the NICs
+        // after eth0.
+        cmdline.push_str(&net_cmdline);
         if !virtiofs.is_empty() {
             cmdline.push_str(&format!(" VIRTKIT_VIRTIOFS={virtiofs}"));
         }
@@ -759,7 +784,7 @@ pub fn boot_unit(
             vsock_ports,
             cpus: svc.cpus.unwrap_or(DEFAULT_CPUS),
             mem,
-            net: crate::vmm::Net::None,
+            net,
             nics,
             // Like the job VM: freed guest pages go back to the host, so a service
             // that idles between jobs stops holding its peak RAM against the ones

@@ -83,6 +83,7 @@ pub fn to_units(services: Vec<Service>) -> Vec<crate::compose::Unit> {
             nested: false,
             nics: 1,
             persist_root_backing: None,
+            tap: None,
         })
         .collect()
 }

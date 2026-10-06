@@ -327,6 +327,8 @@ pub struct RunArgs {
     /// give the guest egress via a userspace `vk switch` (DHCP + DNS + proxy);
     /// forced on by `compose` (the services live on that switch's LAN)
     pub net: bool,
+    /// `--tap`: eth0 on a host tap; with `net`, the switch ports follow it
+    pub tap: Option<crate::net::TapNet>,
     /// `--audit-egress`: record every external domain the *booted guest* resolves and print
     /// a "domains contacted" summary (with per-domain counts) when the run ends. Requires
     /// `net` (the switch is the resolver); observes without restricting egress.
@@ -483,6 +485,7 @@ impl Default for RunArgs {
             shell: false,
             tty: false,
             net: false,
+            tap: None,
             audit_egress: false,
             build_audit_egress: false,
             egress_allow: None,
@@ -1322,6 +1325,30 @@ async fn build_and_boot(
         args.nested,
         primary_nested_marker(&compose_units, primary_idx),
     );
+    // `--tap` over the primary service's `x-virtkit.tap`, ranked like the sizing axes.
+    let primary_tap = args
+        .tap
+        .clone()
+        .or_else(|| primary_idx.and_then(|i| compose_units[i].tap.clone()));
+    // These live on the switch, which a tap guest's default route no longer goes through.
+    // Only the primary is pointed at the registry proxy; any tap guest escapes the rest.
+    if primary_tap.is_some() && args.registry_proxy.is_some() {
+        bail!("--registry-proxy needs the switch as the guest's route; drop the tap");
+    }
+    let any_tap = primary_tap.is_some() || compose_units.iter().any(|u| u.tap.is_some());
+    if any_tap && args.egress_allow.is_some() {
+        bail!("a restricted egress policy is enforced by the switch; a tap guest bypasses it");
+    }
+    if any_tap && args.audit_egress {
+        bail!("--audit-egress observes the switch; a tap guest's egress bypasses it");
+    }
+    check_taps(
+        cfg,
+        primary_tap.as_ref(),
+        args.net,
+        &compose_units,
+        primary_idx,
+    )?;
     // The pinned/explicit kernel `fullvm::prepare` boots on for a non-image kernel axis
     // (Default or Path). A CLI `--kernel <path>` was already resolved into `kernel` by
     // `run()`; a marker `kernel: <path>` (when the CLI left kernel Default) is resolved
@@ -1711,11 +1738,11 @@ async fn build_and_boot(
 
     // The subnet fixes the gateway and the primary's eth0 address; `spawn_vm_switch` derives
     // the same pair, so `vk list` can report the address straight from the registry.
-    let (gw, _, primary_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
+    let (gw, prefix, primary_ip) = crate::net::switch_addrs(RUN_SUBNET)?;
 
     // Compose services: sibling unit VMs on the run switch, resolvable by alias
     // over its DNS, torn down with the run.
-    let planned = plan_services(
+    let mut planned = plan_services(
         args,
         cfg,
         state_dir,
@@ -1724,6 +1751,7 @@ async fn build_and_boot(
         primary_idx,
         Some(primary_ip),
     )?;
+    pin_tap_hosts(&mut planned, primary_tap.as_ref())?;
     // With sibling services under management, the agent exposes their control
     // plane at /run/vk/services (a FUSE bridge to the manager over vsock).
     if !planned.units.is_empty() {
@@ -1832,7 +1860,21 @@ async fn build_and_boot(
             crate::prio::Prio::Normal,
         )
         .await?;
-        cmdline.push_str(&attach.cmdline);
+        match &primary_tap {
+            Some(tap) => {
+                let mut switch = vec![primary_ip];
+                switch.extend_from_slice(&planned.primary_extra_ips);
+                let primary = primary_ip.to_string();
+                let hosts: Vec<(String, String)> = planned
+                    .hosts
+                    .iter()
+                    .filter(|(_, ip)| *ip != primary)
+                    .cloned()
+                    .collect();
+                cmdline.push_str(&tap.cmdline(&switch, prefix, &hosts));
+            }
+            None => cmdline.push_str(&attach.cmdline),
+        }
         net_attach = Some(attach);
         Some(child)
     } else {
@@ -1844,6 +1886,11 @@ async fn build_and_boot(
         }
         None
     };
+    if !args.net
+        && let Some(tap) = &primary_tap
+    {
+        cmdline.push_str(&tap.cmdline(&[], prefix, &[]));
+    }
 
     // Hand every declared unit to the manager, then boot the eager set through
     // it, dependencies first, once the switch listens. No readiness wait (the
@@ -2204,7 +2251,13 @@ async fn build_and_boot(
         vsock_ports,
         cpus,
         mem: mem.clone(),
-        net: crate::vmm::Net::None,
+        net: match &primary_tap {
+            Some(tap) => crate::vmm::Net::Tap {
+                tap: tap.tap.clone(),
+                mac: tap.mac.clone(),
+            },
+            None => crate::vmm::Net::None,
+        },
         nics,
         balloon: true,
         serial_log: console.clone(),
@@ -3065,6 +3118,73 @@ fn plan_services(
     Ok(planned)
 }
 
+/// Refuse what is wrong with a run's taps before anything boots: one the CI executor uses, a
+/// static address inside the switch LAN of a guest that also has switch ports (siblings
+/// always do, the primary with `--net`), and a primary tap a VMM cannot attach. A sibling's
+/// tap is probed when it starts ([`crate::units::boot_unit`]), since it may never start.
+/// The unit at `primary_idx` is the primary, whose tap `primary` already settles.
+fn check_taps(
+    cfg: &crate::config::Config,
+    primary: Option<&crate::net::TapNet>,
+    primary_on_switch: bool,
+    units: &[crate::compose::Unit],
+    primary_idx: Option<usize>,
+) -> Result<()> {
+    let siblings = units
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != primary_idx)
+        .filter_map(|(_, u)| u.tap.as_ref().map(|t| (t, true)));
+    for (tap, on_switch) in primary
+        .map(|t| (t, primary_on_switch))
+        .into_iter()
+        .chain(siblings)
+    {
+        crate::net::refuse_runner_tap(&cfg.net, &tap.tap)?;
+        if on_switch {
+            tap.refuse_switch_overlap(RUN_SUBNET)
+                .with_context(|| format!("tap {}", tap.tap))?;
+        }
+    }
+    if let Some(tap) = primary {
+        crate::net::probe_tap(&tap.tap)?;
+    }
+    Ok(())
+}
+
+/// Give every tap sibling the LAN's names minus its own, for its `/etc/hosts` (its resolver is
+/// the tap LAN's, which does not know them), and refuse two guests of this run on one tap: a
+/// tap carries one NIC, and the second VMM's open fails (EBUSY), leaving that guest's eth0
+/// dead. A tap held by another run is caught by [`crate::net::probe_tap`] at start.
+fn pin_tap_hosts(
+    planned: &mut PlannedServices,
+    primary_tap: Option<&crate::net::TapNet>,
+) -> Result<()> {
+    let mut claimed: Vec<(&str, String)> = primary_tap
+        .map(|t| (t.tap.as_str(), "the primary".to_string()))
+        .into_iter()
+        .collect();
+    for (prov, _, _) in &planned.units {
+        let Some(tap) = &prov.tap else { continue };
+        if let Some((_, owner)) = claimed.iter().find(|(name, _)| *name == tap.tap) {
+            bail!(
+                "tap {} is claimed by both {owner} and service {}",
+                tap.tap,
+                prov.name
+            );
+        }
+        claimed.push((&tap.tap, format!("service {}", prov.name)));
+    }
+    let hosts = planned.hosts.clone();
+    for (prov, _, _) in &mut planned.units {
+        if prov.tap.is_some() {
+            let own = prov.addr.to_string();
+            prov.tap_hosts = hosts.iter().filter(|(_, ip)| *ip != own).cloned().collect();
+        }
+    }
+    Ok(())
+}
+
 /// Append resolver entries for the run VM, which boots outside the sibling loop.
 /// A `--primary` service uses its service name and hostname; other primaries use their
 /// boot hostname. Compose up has no primary IP and adds no entries.
@@ -3116,10 +3236,21 @@ async fn compose_up(
         args.egress_allow.is_none(),
         "`compose up` does not enforce an egress allowlist"
     );
+    ensure!(
+        args.tap.is_none(),
+        "--tap sets the primary's eth0, and a services-only compose run boots none"
+    );
     let mut units = crate::compose::load(compose, Some(&compose_builtins(args, work)?))?;
     if units.is_empty() {
         bail!("{} declares no services", compose.display());
     }
+    if units.iter().any(|u| u.tap.is_some()) {
+        ensure!(
+            !args.audit_egress,
+            "--audit-egress observes the switch; a tap guest's egress bypasses it"
+        );
+    }
+    check_taps(cfg, None, false, &units, None)?;
     apply_service_overrides(
         &mut units,
         &args.service_cpus,
@@ -3138,7 +3269,8 @@ async fn compose_up(
 
     // compose-up has no primary — every unit is a sibling, so there is nothing to build up
     // front here (siblings resolve/build via plan_services + the manager).
-    let planned = plan_services(args, cfg, state_dir, work, &units, None, None)?;
+    let mut planned = plan_services(args, cfg, state_dir, work, &units, None, None)?;
+    pin_tap_hosts(&mut planned, None)?;
 
     // The switch binds every unit's socket; no VM ever dials the base socket
     // (there is no primary), it is just the switch's canonical listen path.
@@ -5021,6 +5153,105 @@ mod tests {
         let plain = compose_units("services:\n  dev:\n    image: a\n");
         let hosts = primary_hosts(&plain, Some(0), &[], Some(PRIMARY_IP));
         assert_eq!(pairs(&hosts), vec![("dev", "192.168.127.2")]);
+    }
+
+    /// `PlannedServices` for `yaml`'s units, each a sibling in slot order.
+    fn planned_siblings(yaml: &str) -> PlannedServices {
+        let units = compose_units(yaml);
+        let mut hosts = Vec::new();
+        let mut provisioned = Vec::new();
+        for (slot, unit) in units.into_iter().enumerate() {
+            let svc = crate::units::provisioned(
+                &unit,
+                PathBuf::from("/tier/x.ext4"),
+                Default::default(),
+                crate::units::Siting {
+                    gateway: std::net::Ipv4Addr::new(192, 168, 127, 1),
+                    prefix: 24,
+                    slot: slot as u32,
+                    extra_ips: Vec::new(),
+                },
+            )
+            .unwrap();
+            hosts.push((svc.name.clone(), svc.addr.to_string()));
+            provisioned.push((svc, PathBuf::from("/run"), unit));
+        }
+        PlannedServices {
+            units: provisioned,
+            start: Vec::new(),
+            listen: Vec::new(),
+            hosts,
+            reservations: Vec::new(),
+            primary_extra_ips: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn compose_only_taps_refuse_runner_devices_and_switch_overlap() {
+        let cfg = crate::config::Config {
+            net: crate::config::Net {
+                mode: "pool".into(),
+                tap_prefix: "citap".into(),
+                count: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let units = compose_units(
+            "services:\n  db:\n    image: x\n    x-virtkit: { tap: { name: citap2 } }\n",
+        );
+        assert!(
+            check_taps(&cfg, None, false, &units, None)
+                .unwrap_err()
+                .to_string()
+                .contains("CI executor")
+        );
+        let units = compose_units(
+            "services:\n  db:\n    image: x\n    x-virtkit:\n      tap: { name: t0, \
+             ip: 192.168.127.9/24, gw: 192.168.127.1, dns: [1.1.1.1] }\n",
+        );
+        assert!(
+            format!(
+                "{:#}",
+                check_taps(&cfg, None, false, &units, None).unwrap_err()
+            )
+            .contains("overlaps the switch LAN")
+        );
+    }
+
+    #[test]
+    fn one_tap_per_guest_and_each_tap_guest_pins_the_others() {
+        let shared = "services:\n  a:\n    image: x\n    x-virtkit: { tap: { name: t0 } }\n  \
+                      b:\n    image: x\n    x-virtkit: { tap: { name: t0 } }\n";
+        let err = pin_tap_hosts(&mut planned_siblings(shared), None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "tap t0 is claimed by both service a and service b"
+        );
+
+        let yaml = "services:\n  a:\n    image: x\n    x-virtkit: { tap: { name: t1 } }\n  \
+                    b:\n    image: x\n";
+        let primary = crate::net::TapNet::new("t1", None, None, None, &[]).unwrap();
+        let err = pin_tap_hosts(&mut planned_siblings(yaml), Some(&primary)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "tap t1 is claimed by both the primary and service a"
+        );
+
+        let mut planned = planned_siblings(yaml);
+        let primary = crate::net::TapNet::new("t0", None, None, None, &[]).unwrap();
+        pin_tap_hosts(&mut planned, Some(&primary)).unwrap();
+        let tap_hosts: Vec<_> = planned
+            .units
+            .iter()
+            .map(|(p, _, _)| (p.name.as_str(), p.tap_hosts.clone()))
+            .collect();
+        let b = &planned.hosts[1];
+        assert_eq!(
+            tap_hosts,
+            [("a", vec![b.clone()]), ("b", Vec::new())],
+            "a tap guest pins every name but its own; a switch-only one pins none"
+        );
     }
 
     /// Minimal `RunArgs` for option-builder tests. It is not bootable: the CLI normally fills

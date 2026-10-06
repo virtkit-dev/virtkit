@@ -1935,6 +1935,14 @@ fn plan_services(
     let reclaim = vm_reclaim(&ctx.cfg)?;
     let dax = vm_dax(&ctx.cfg)?;
     for (slot, mut unit) in units.into_iter().enumerate() {
+        // A host tap is the caller's own network plumbing; a runner has none to hand a job.
+        if unit.tap.is_some() {
+            bail!(
+                "service {}: x-virtkit.tap is a `vk run` setting; a CI job's services stay on \
+                 the job switch",
+                unit.name
+            );
+        }
         // A compose service's declared sizing obeys the same host ceilings as the job's own.
         clamp_service_size(&ctx.cfg, &mut unit)?;
         // A service without an x-virtkit.reclaim of its own trims like the job guest does.

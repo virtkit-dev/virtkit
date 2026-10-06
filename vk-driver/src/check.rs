@@ -47,6 +47,8 @@ pub enum Feature {
     Publish,
     /// this build can give a guest more than one NIC (`vk run --nics`, `x-virtkit.nics`)
     Nics,
+    /// this build can put a guest's eth0 on a host tap (`vk run --tap`, `x-virtkit.tap`)
+    Tap,
 }
 
 impl Feature {
@@ -54,8 +56,8 @@ impl Feature {
     /// ones (the gitlab runner and its sibling service VMs) probe state dirs under a
     /// root-owned default path, so sweeping them would fail every host that just boots
     /// VMs without running CI. `Entrypoint`, `Publish` and `Nics` answer a question about
-    /// this build rather than about the host, so they belong where a script asks for them
-    /// and nowhere else.
+    /// this build, and `Tap` one about the build and /dev/net/tun, so they belong where a
+    /// script asks for them and nowhere else.
     fn on_request_only(self) -> bool {
         matches!(
             self,
@@ -64,6 +66,7 @@ impl Feature {
                 | Feature::Entrypoint
                 | Feature::Publish
                 | Feature::Nics
+                | Feature::Tap
         )
     }
 
@@ -93,6 +96,7 @@ impl Feature {
             Feature::Entrypoint => "entrypoint",
             Feature::Publish => "publish",
             Feature::Nics => "nics",
+            Feature::Tap => "tap",
         }
     }
 }
@@ -497,6 +501,7 @@ fn evaluate(cfg: &Config, feature: Feature) -> Outcome {
         Feature::Entrypoint => entrypoint(),
         Feature::Publish => publish(),
         Feature::Nics => nics(),
+        Feature::Tap => tap(),
     }
 }
 
@@ -560,6 +565,26 @@ fn nics() -> Outcome {
         )),
         None => fail(format!(
             "no agent to bring the extra NICs up: nothing embedded and {} missing",
+            Asset::Agent.default_path()
+        )),
+    }
+}
+
+/// Whether this `vk` can put a guest's eth0 on a host tap. The tap itself is the caller's to
+/// create and bridge; what this answers is that the binary has the flag, the host a tun device
+/// to open it through, and an agent to address it and pin the run's names.
+fn tap() -> Outcome {
+    if let Err(e) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/net/tun")
+    {
+        return fail(format!("opening /dev/net/tun read/write: {e}"));
+    }
+    match asset_source(Asset::Agent) {
+        Some(src) => ok(format!("eth0 on a host tap; agent {src} addresses it")),
+        None => fail(format!(
+            "no agent to bring the tap NIC up: nothing embedded and {} missing",
             Asset::Agent.default_path()
         )),
     }
@@ -1519,6 +1544,7 @@ mod tests {
         assert!(!sweep.contains(&Feature::Services));
         assert!(!sweep.contains(&Feature::Entrypoint));
         assert!(!sweep.contains(&Feature::Publish));
+        assert!(!sweep.contains(&Feature::Tap));
         for f in <Feature as clap::ValueEnum>::value_variants() {
             assert_eq!(sweep.contains(f), !f.on_request_only());
         }
