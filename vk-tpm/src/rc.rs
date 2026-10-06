@@ -34,6 +34,10 @@ impl Rc {
     pub const COMMAND_SIZE: Rc = Rc(RC_VER1 + 0x042);
     pub const COMMAND_CODE: Rc = Rc(RC_VER1 + 0x043);
     pub const AUTH_CONTEXT: Rc = Rc(RC_VER1 + 0x045);
+    pub const NV_RANGE: Rc = Rc(RC_VER1 + 0x046);
+    pub const NV_LOCKED: Rc = Rc(RC_VER1 + 0x048);
+    pub const NV_AUTHORIZATION: Rc = Rc(RC_VER1 + 0x049);
+    pub const NV_UNINITIALIZED: Rc = Rc(RC_VER1 + 0x04a);
     pub const NV_SPACE: Rc = Rc(RC_VER1 + 0x04b);
     pub const NV_DEFINED: Rc = Rc(RC_VER1 + 0x04c);
     pub const NO_RESULT: Rc = Rc(RC_VER1 + 0x054);

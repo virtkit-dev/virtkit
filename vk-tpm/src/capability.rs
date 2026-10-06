@@ -102,8 +102,7 @@ pub fn get_capability(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> 
                     let list = tpm.permanent.persistent.iter().map(|(h, _)| *h);
                     (list.collect(), property)
                 }
-                // No NV index yet.
-                TPM_HT_NV_INDEX => (Vec::new(), 0),
+                TPM_HT_NV_INDEX => (tpm.nv_handles(), property),
                 _ => return Err(Rc::HANDLE.param(2)),
             };
             let keyed: Vec<_> = handles.iter().map(|&h| (h, ())).collect();
@@ -232,6 +231,10 @@ fn properties(tpm: &Tpm) -> Vec<(u32, u32)> {
     let persistent_avail = u32::try_from(MAX_PERSISTENT.saturating_sub(persistent)).unwrap_or(0);
     let persistent = u32::try_from(persistent).unwrap_or(0);
     let max_command = u32::try_from(MAX_COMMAND_SIZE).unwrap_or(0);
+    let (nv_indices, nv_counters) = tpm.nv_counts();
+    let nv_indices = u32::try_from(nv_indices).unwrap_or(u32::MAX);
+    let nv_counters = u32::try_from(nv_counters).unwrap_or(u32::MAX);
+    let nv_counters_avail = u32::try_from(tpm.nv_counters_available()).unwrap_or(u32::MAX);
     vec![
         (0x100, chars(b"2.0\0")), // TPM_PT_FAMILY_INDICATOR
         (0x101, 0),               // TPM_PT_LEVEL
@@ -283,7 +286,7 @@ fn properties(tpm: &Tpm) -> Vec<(u32, u32)> {
         (0x130, 0),                            // TPM_PT_FIRMWARE_MAX_SVN
         (0x200, permanent),                    // TPM_PT_PERMANENT
         (0x201, startup_clear),                // TPM_PT_STARTUP_CLEAR
-        (0x202, 0),                            // TPM_PT_HR_NV_INDEX
+        (0x202, nv_indices),                   // TPM_PT_HR_NV_INDEX
         (0x203, sessions),                     // TPM_PT_HR_LOADED
         (0x204, loaded_avail),                 // TPM_PT_HR_LOADED_AVAIL
         (0x205, active),                       // TPM_PT_HR_ACTIVE
@@ -291,8 +294,8 @@ fn properties(tpm: &Tpm) -> Vec<(u32, u32)> {
         (0x207, transient_avail),              // TPM_PT_HR_TRANSIENT_AVAIL
         (0x208, persistent),                   // TPM_PT_HR_PERSISTENT
         (0x209, persistent_avail),             // TPM_PT_HR_PERSISTENT_AVAIL
-        (0x20a, 0),                            // TPM_PT_NV_COUNTERS
-        (0x20b, 0x19),                         // TPM_PT_NV_COUNTERS_AVAIL
+        (0x20a, nv_counters),                  // TPM_PT_NV_COUNTERS
+        (0x20b, nv_counters_avail),            // TPM_PT_NV_COUNTERS_AVAIL
         (0x20c, 0),                            // TPM_PT_ALGORITHM_SET
         (0x20d, 1),                            // TPM_PT_LOADED_CURVES: NIST P-256
         (0x20e, da.failed_tries),              // TPM_PT_LOCKOUT_COUNTER

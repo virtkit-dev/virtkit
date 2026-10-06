@@ -29,6 +29,7 @@ mod entity;
 mod hierarchy;
 mod key;
 mod marshal;
+mod nv;
 mod object;
 mod pcr;
 mod public;
