@@ -1,6 +1,9 @@
 //! Keeping gitlab-runner's appetite in step with the host: works out how many jobs this
 //! runner should be accepting and leaves that number where `vk-runnerctl` can apply it.
 //!
+//! This is the one place the number is decided: `effective = min(estimate, hub ceiling,
+//! ceiling)` ([`decide`]).
+//!
 //! The admission gate ([`crate::admit`]) is what keeps the host safe — it never lets more
 //! memory be committed than the budget allows. But a job it makes wait has already been
 //! assigned by GitLab: it holds one of the runner's slots and its own timeout runs while it
@@ -34,12 +37,14 @@ pub fn desired_file(cfg: &Config) -> PathBuf {
 }
 
 /// The runner's concurrency and what it was worked out from:
-/// `effective = min(estimate, ceiling)`, each term optional.
+/// `effective = min(estimate, hub ceiling, ceiling)`, each term optional.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Decision {
     /// What the host can take, by [`concurrency`]; `None` without a memory budget to measure
     /// against.
     pub estimate: Option<u32>,
+    /// The cap a fleet hub set; `None` off a fleet, and from `vk tune`.
+    pub hub_ceiling: Option<u32>,
     /// `[executor.schedule] max_concurrency`.
     pub ceiling: Option<u32>,
     /// The smallest term, never below one; `None` when no term applies, which leaves the
@@ -60,19 +65,34 @@ struct Basis {
 
 /// The smallest of the terms that apply, never below one: `concurrent = 0` is not a throttle
 /// gitlab-runner has, and a runner that accepts nothing never picks up again. The config
-/// refuses a zero ceiling already; this is the guard behind it.
-pub(crate) fn effective(estimate: Option<u32>, ceiling: Option<u32>) -> Option<u32> {
-    [estimate, ceiling]
+/// refuses a zero ceiling already, and a hub's ceiling of zero means one: stopping acquisition
+/// is a state of its own, not a number.
+pub(crate) fn effective(
+    estimate: Option<u32>,
+    hub_ceiling: Option<u32>,
+    ceiling: Option<u32>,
+) -> Option<u32> {
+    [estimate, hub_ceiling, ceiling]
         .into_iter()
         .flatten()
         .min()
         .map(|n| n.max(1))
 }
 
-/// Work the concurrency out from the host, the ledger and the ceiling. The estimate rises
-/// from the previous *effective* answer, so a ceiling that is lifted is climbed back from one
-/// step at a time.
-pub(crate) fn decide(cfg: &Config) -> Result<Decision> {
+/// Decide concurrency from the host, ledger, `hub_ceiling` and local ceiling. The estimate
+/// rises from the previous *effective* answer, one step at a time when a ceiling is lifted.
+pub(crate) fn decide(cfg: &Config, hub_ceiling: Option<u32>) -> Result<Decision> {
+    decide_with(cfg, hub_ceiling, true)
+}
+
+/// Like [`decide`], but allow the estimate to rise only when `may_rise`. Pass false for
+/// changes between periods that can only lower concurrency, so the estimate can fall
+/// without taking more than one upward step per period.
+pub(crate) fn decide_with(
+    cfg: &Config,
+    hub_ceiling: Option<u32>,
+    may_rise: bool,
+) -> Result<Decision> {
     let ceiling = cfg
         .executor
         .schedule
@@ -103,6 +123,7 @@ pub(crate) fn decide(cfg: &Config) -> Result<Decision> {
                 host,
                 previous,
             });
+            let want = held_below(want, previous, may_rise);
             let basis = Basis {
                 budget_mib,
                 granted_mib: held.granted_mib,
@@ -115,10 +136,19 @@ pub(crate) fn decide(cfg: &Config) -> Result<Decision> {
     };
     Ok(Decision {
         estimate,
+        hub_ceiling,
         ceiling,
-        effective: effective(estimate, ceiling),
+        effective: effective(estimate, hub_ceiling, ceiling),
         basis,
     })
+}
+
+/// `want`, or no more than `previous` unless the estimate `may_rise`.
+fn held_below(want: u32, previous: Option<u32>, may_rise: bool) -> u32 {
+    match previous {
+        Some(prev) if !may_rise => want.min(prev),
+        _ => want,
+    }
 }
 
 /// Put `decision` where the runner picks it up: the desired-concurrency file `vk-runnerctl`
@@ -134,7 +164,7 @@ pub(crate) fn apply(cfg: &Config, decision: &Decision) -> Result<()> {
 /// half minute or so from a user timer; each run stands alone, reading its own previous
 /// answer back out of the file it writes.
 pub fn tune(cfg: &Config) -> Result<()> {
-    let decision = decide(cfg)?;
+    let decision = decide(cfg, None)?;
     if decision.effective.is_none() {
         bail!(
             "neither [executor.schedule] mem_budget nor max_concurrency is set: nothing to \
@@ -152,8 +182,12 @@ pub(crate) fn describe(d: &Decision) -> String {
         return "runner concurrency left alone: no budget and no ceiling".to_string();
     };
     let term = |n: Option<u32>| n.map_or_else(|| "none".to_string(), |n| n.to_string());
+    // The hub's term only on a node that has one: `vk tune` reports the two it decides on.
+    let hub = d
+        .hub_ceiling
+        .map_or_else(String::new, |n| format!(", hub ceiling {n}"));
     let mut line = format!(
-        "runner concurrency {want} (estimate {}, ceiling {})",
+        "runner concurrency {want} (estimate {}{hub}, ceiling {})",
         term(d.estimate),
         term(d.ceiling)
     );
@@ -425,15 +459,18 @@ mod tests {
     #[test]
     fn the_smallest_term_binds_and_one_is_the_floor() {
         // Each term binds when it is the smallest.
-        assert_eq!(effective(Some(3), Some(6)), Some(3));
-        assert_eq!(effective(Some(9), Some(2)), Some(2));
+        assert_eq!(effective(Some(3), Some(8), Some(6)), Some(3));
+        assert_eq!(effective(Some(9), Some(4), Some(6)), Some(4));
+        assert_eq!(effective(Some(9), Some(8), Some(2)), Some(2));
         // Absent terms do not bind; a ceiling applies without a budget to estimate from.
-        assert_eq!(effective(None, Some(5)), Some(5));
-        assert_eq!(effective(Some(7), None), Some(7));
-        assert_eq!(effective(None, None), None);
+        assert_eq!(effective(None, Some(5), None), Some(5));
+        assert_eq!(effective(None, None, Some(5)), Some(5));
+        assert_eq!(effective(Some(7), None, None), Some(7));
+        assert_eq!(effective(None, None, None), None);
         // Zero is not a throttle gitlab-runner has.
-        assert_eq!(effective(Some(4), Some(0)), Some(1));
-        assert_eq!(effective(None, Some(0)), Some(1));
+        assert_eq!(effective(Some(4), None, Some(0)), Some(1));
+        assert_eq!(effective(None, None, Some(0)), Some(1));
+        assert_eq!(effective(Some(4), Some(0), None), Some(1));
     }
 
     fn scratch_cfg(tag: &str, schedule: crate::config::Schedule) -> (Config, std::path::PathBuf) {
@@ -462,11 +499,20 @@ mod tests {
             },
         );
         // The estimate is this host's own reading, so only its relation to the rest is fixed.
-        let d = decide(&cfg).unwrap();
-        assert_eq!(d.ceiling, Some(3));
+        let d = decide(&cfg, Some(2)).unwrap();
+        assert_eq!((d.hub_ceiling, d.ceiling), (Some(2), Some(3)));
         assert!(d.estimate.is_some());
+        assert_eq!(d.effective, effective(d.estimate, Some(2), Some(3)));
+        assert!(d.effective <= Some(2));
+        assert!(
+            describe(&d).contains("hub ceiling 2, ceiling 3"),
+            "{}",
+            describe(&d)
+        );
+        let d = decide(&cfg, None).unwrap();
         assert_eq!(d.effective, Some(d.estimate.unwrap().min(3)));
         assert!(describe(&d).contains("ceiling 3"), "{}", describe(&d));
+        assert!(!describe(&d).contains("hub"), "{}", describe(&d));
         // No budget: the ceiling alone decides, and the report has no figures to give.
         let (cfg, dir2) = scratch_cfg(
             "decide-nobudget",
@@ -475,7 +521,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let d = decide(&cfg).unwrap();
+        let d = decide(&cfg, None).unwrap();
         assert_eq!((d.estimate, d.effective), (None, Some(5)));
         assert_eq!(
             describe(&d),
@@ -490,7 +536,7 @@ mod tests {
     #[test]
     fn tune_refuses_with_nothing_to_schedule_against() {
         let (cfg, dir) = scratch_cfg("tune-nothing", crate::config::Schedule::default());
-        let d = decide(&cfg).unwrap();
+        let d = decide(&cfg, None).unwrap();
         assert_eq!(d.effective, None);
         assert_eq!(
             describe(&d),
@@ -503,6 +549,15 @@ mod tests {
         );
         assert!(!desired_file(&cfg).exists(), "nothing was written");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn between_periods_the_estimate_can_fall_but_not_climb() {
+        assert_eq!(held_below(5, Some(3), false), 3);
+        assert_eq!(held_below(2, Some(3), false), 2);
+        assert_eq!(held_below(5, Some(3), true), 5);
+        // Nothing written yet: nothing to hold it to.
+        assert_eq!(held_below(5, None, false), 5);
     }
 
     #[test]
