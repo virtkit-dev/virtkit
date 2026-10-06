@@ -581,6 +581,91 @@ import. ISO output can include BIOS and UEFI boot images, plus an optional hybri
 USB media. See the [appliance guide](docs/appliance.md) for the expected disk and
 staged-tree layouts.
 
+### Windows guests
+
+`vk` also boots UEFI guests such as Windows, natively in its own VMM; running one needs only
+KVM on the host. The first build also needs network access (a Linux helper VM prepares the
+install medium) and about 15 GB of cache. [`examples/windows`](examples/windows) builds whole labs this way (IIS, Active
+Directory, two forests with a trust, a Windows 11 workstation, an RDP session).
+
+**Build an image.** A Dockerfile stage starting `FROM winiso:` installs Windows unattended
+from Microsoft's ISO. Each later step becomes a cached qcow2 layer through the guest's
+qemu-ga:
+
+```dockerfile
+# vk: cpus=4 mem=4G disk=60G
+FROM winiso:ws2025.iso@sha256:<digest> --edition="Windows Server 2025 Standard Evaluation" \
+    --drivers=virtio-win.iso@sha256:<digest> AS base
+SHELL ["powershell", "-NoProfile", "-Command"]
+RUN Install-WindowsFeature Web-Server
+COPY index.html C:/inetpub/wwwroot/index.html
+COPY boot.ps1 C:/vk/
+CMD & C:\vk\boot.ps1; exit $LASTEXITCODE
+```
+
+```sh
+vk build -f Dockerfile --out ./web-out    # a bundle: vm.json, disks, admin-password
+```
+
+- The ISOs are local files pinned by digest; `--drivers` is virtio-win's ISO (drivers and
+  qemu-ga). Without `--edition` the ISO's first image installs. For Windows 11, `--edition`
+  must name a Windows 11 edition: otherwise it installs as a server would and Setup stops at
+  its TPM check. The install takes about 20 minutes (70 for Windows 11) and is cached; so is
+  every later step.
+- `# vk:` directives: `disk=<size>` sizes the install (default 40G), `generalize=on` ends
+  the stage with sysprep (each copy gets its own name and SID), `firmware=uefi-secboot`
+  enrolls Microsoft's Secure Boot keys, `tpm=on` gives each machine a TPM 2.0, and
+  `cpus`/`mem` size the build's guests and the bundle's machine.
+- `RUN` has no network unless it says `--network=default`; exit code 3010 or 1641 restarts
+  Windows (`--reboot=auto|always|never`). Steps run as SYSTEM. `ENV`, `WORKDIR`, `SHELL` and
+  `COPY` apply; `USER`, `ARG`, `ADD`, `ONBUILD`, `ENTRYPOINT`, `COPY --from` and `$VAR`
+  substitution in `ENV`, `WORKDIR` or `COPY` are refused.
+- `CMD` is the image's provisioning command, run at each compose service start.
+- Another Windows Dockerfile can start `FROM ./web-out`, on the build cache that made it.
+
+**Run it.** `vk run ./web-out` boots the bundle on fresh copy-on-write overlays (`--net`
+for a DHCP lease, `--cpus`/`--mem` to resize, `--state-dir` to keep its disks); `vk list`
+shows it. In a compose file, `image: ./web-out` makes a Windows service on the run's LAN,
+at the address its name resolves to:
+
+- each start is a new machine; it is up once its provisioning (`command:`, else the image's
+  `CMD`) has run as SYSTEM, with `VK_HOSTNAME`, `VK_IP`, `VK_PREFIX` and `VK_GATEWAY` set
+  ahead of its `environment:`; exit code 3010 or 1641 restarts Windows and runs it again;
+- `secrets:` land in `C:\ProgramData\Docker\secrets\<target>`, readable by SYSTEM and
+  administrators only;
+- `healthcheck:` runs through qemu-ga, so `depends_on` conditions work across Windows and
+  Linux services, and services start side by side as their dependencies allow.
+
+**Reach a running guest.** Everything goes through qemu-ga, as SYSTEM:
+
+```sh
+vk exec ./run -- ipconfig                       # a vk run --state-dir ./run of a bundle
+vk cp setup.ps1 :C:/vk/setup.ps1 --target ./run
+vk exec ./lab --service dc -- nltest /dsgetdc:corp.lab   # a compose run's --state-dir
+vk cp --target ./lab --service dc :C:/Windows/debug/dcpromo.log .
+vk console ./run                                # the serial console (SAC), when qemu-ga is down
+vk pause ./run && vk resume ./run               # freeze and thaw a vk run of a bundle
+```
+
+**Snapshots.** `vk snapshot <pid|dir> --out <dir>` saves a running bundle's memory, device
+state and disks, then ends it. `vk run <dir>` resumes it as often as wanted.
+`vk snapshot --run-dir <state-dir> --out <dir>` does the same for every Windows service of
+a compose run, and `vk run --compose … --from-snapshot <dir>` brings them back without
+provisioning (the AD lab in 8 s). Each service must keep the address, vCPUs and memory it
+was snapshotted with. A restored guest's clock is set through qemu-ga; until then Kerberos
+may fail. A snapshot depends on the bundle it was taken from and must be written on the
+run's filesystem.
+
+**Firmware, Secure Boot and TPM.** Released `vk` embeds edk2's CloudHv firmware; a source
+build embeds `dist/CLOUDHV.fd` from `./build-firmware.sh` (`VIRTKIT_UEFI_FIRMWARE` selects
+another). A bundle's `vm.json` says whether its machine has Secure Boot (`"secure_boot"`)
+and a TPM (`"tpm"`). UEFI variables persist in `uefi-vars.fd` beside the disks. **Secure Boot is
+experimental:** without SMM the guest's kernel can rewrite the variable store (PK, KEK, db,
+dbx), so it guards only the boot chain below the kernel, and a db/dbx update Windows makes
+at run time is known to crash the guest. The TPM runs inside `vk` (libtpms and OpenSSL
+linked in, no swtpm), its state in `tpm-state`, carried by snapshots; build steps run
+without one.
+
 ## Operational behavior
 
 ### Isolation and privilege
@@ -672,13 +757,14 @@ rebuilt byte-for-byte — see [Build from source](#build-from-source).
 | Command | Use it for |
 | --- | --- |
 | `vk run` | Boot an image, Dockerfile target, or compose fleet; run a command or shell. |
-| `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk. |
+| `vk build` | Build Dockerfile stages into a bootable ext4 image or caller-owned disk, or a Windows Dockerfile into a bundle. |
 | `vk exec` | Run a command in an existing guest and return the command's exit status. |
 | `vk list` | List running `--state-dir` VMs and UEFI bundle runs, and their compose services; scope by pid or directory, `-w` for the full table, `--json`/`--field` for scripts. |
 | `vk stop` | Stop a VM selected by pid or project directory, or stop all registered VMs. |
 | `vk reboot` | Reboot a running VM in place through its guest, or power-cycle it with `--force`. |
 | `vk status` | Probe a guest agent, or report whether its root image is stale. |
 | `vk logs` | Show a VM's console log, telling kernel, agent and guest output apart; `--level warn`, `--agent`, `--service NAME`, `-f`. |
+| `vk cp`, `vk console`, `vk pause\|resume`, `vk snapshot` | Copy files into or out of a [Windows guest](#windows-guests), attach to its serial console, freeze it, or save it to restore later. |
 | `vk atop` | Follow or inspect guest resource recordings. |
 | `vk check` | Validate KVM, VMM, embedded assets, configured host features, and an optional minimum `vk` version. |
 | `vk gc` | Reclaim unused image bases, CI checkouts, and image-cache chunks. |
