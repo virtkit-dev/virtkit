@@ -34,6 +34,53 @@ pub const SEED_SIZE: usize = 64;
 const PERMANENT_CAPACITY: usize = 192 * 1024;
 const VOLATILE_CAPACITY: usize = 128 * 1024;
 
+/// Track every mutable access to permanent state so the TPM can store it without comparing the
+/// whole state after each command. Accesses that change nothing still count (an extra store,
+/// never a missed one); Clock goes through [`Tracked::untracked`].
+pub struct Tracked {
+    value: Permanent,
+    changed: bool,
+}
+
+impl Tracked {
+    pub fn new(value: Permanent, changed: bool) -> Tracked {
+        Tracked { value, changed }
+    }
+
+    /// Whether it was accessed mutably since [`Tracked::take_changed`].
+    pub fn is_changed(&self) -> bool {
+        self.changed
+    }
+
+    /// Whether it was accessed mutably since the last call.
+    pub fn take_changed(&mut self) -> bool {
+        std::mem::take(&mut self.changed)
+    }
+
+    pub fn mark_changed(&mut self) {
+        self.changed = true;
+    }
+
+    /// The state, for a change that is not to be stored by itself (Clock).
+    pub fn untracked(&mut self) -> &mut Permanent {
+        &mut self.value
+    }
+}
+
+impl std::ops::Deref for Tracked {
+    type Target = Permanent;
+    fn deref(&self) -> &Permanent {
+        &self.value
+    }
+}
+
+impl std::ops::DerefMut for Tracked {
+    fn deref_mut(&mut self) -> &mut Permanent {
+        self.changed = true;
+        &mut self.value
+    }
+}
+
 /// The state could not be read: not ours, a version this build does not know, or corrupt.
 #[derive(Debug, PartialEq, Eq)]
 pub struct StateError(pub &'static str);

@@ -668,7 +668,8 @@ fn startup(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> 
     tpm.volatile.orderly_startup = orderly;
     tpm.volatile.da_used = false;
     tpm.volatile.started = true;
-    // Until the next orderly shutdown, losing power is not orderly.
+    // Until the next orderly shutdown, losing power is not orderly. Every Startup asks for a
+    // store; mutable accesses in da_startup and nv_startup that change nothing add no stores.
     tpm.permanent.shutdown = Shutdown::None;
     Ok(())
 }

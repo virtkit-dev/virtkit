@@ -4464,3 +4464,54 @@ fn an_endorsement_key_needs_a_free_persistent_handle() {
     assert!(!tpm.take_permanent_changed());
     assert_eq!(tpm.nv_data(EkKind::Rsa2048.certificate_index()), None);
 }
+
+#[test]
+fn commands_that_change_nothing_lasting_ask_for_no_store() {
+    use nv::attr::*;
+    let mut tpm = started();
+    let attributes = OWNERWRITE | OWNERREAD | AUTHREAD;
+    assert_eq!(nv_define(&mut tpm, NV_INDEX, attributes, 8), 0);
+    let write = [&tpm2b(&[1; 8])[..], &[0, 0]].concat();
+    let r = tpm.process(&command(
+        TPM_CC_NV_WRITE,
+        &[TPM_RH_OWNER, NV_INDEX],
+        Some(b""),
+        &write,
+    ));
+    assert_eq!(rc(&r), 0);
+    let auth_read = command(
+        TPM_CC_NV_READ,
+        &[NV_INDEX, NV_INDEX],
+        Some(b""),
+        &[0, 8, 0, 0],
+    );
+    tpm.take_permanent_changed();
+    // The first DA-protected authorization since Startup is recorded (USE_DA_USED); not the next.
+    assert_eq!(rc(&tpm.process(&auth_read)), 0);
+    assert!(tpm.take_permanent_changed());
+    let pcr_read = [&[0, 0, 0, 1, 0, 0x0b, 3][..], &[0xff; 3]].concat();
+    let hash = [&tpm2b(b"data")[..], &[0, 0x0b, 0x40, 0, 0, 7]].concat();
+    for c in [
+        command(
+            TPM_CC_GET_CAPABILITY,
+            &[],
+            None,
+            &[0, 0, 0, 6, 0, 0, 1, 0, 0, 0, 0, 8],
+        ),
+        command(TPM_CC_GET_RANDOM, &[], None, &[0, 8]),
+        command(TPM_CC_READ_CLOCK, &[], None, &[]),
+        command(TPM_CC_PCR_READ, &[], None, &pcr_read),
+        extend(0, 0x0b, &[1; 32]),
+        command(TPM_CC_HASH, &[], None, &hash),
+        command(
+            TPM_CC_NV_READ,
+            &[TPM_RH_OWNER, NV_INDEX],
+            Some(b""),
+            &[0, 8, 0, 0],
+        ),
+        auth_read,
+    ] {
+        assert_eq!(rc(&tpm.process(&c)), 0);
+        assert!(!tpm.take_permanent_changed(), "command {:x?}", &c[6..10]);
+    }
+}

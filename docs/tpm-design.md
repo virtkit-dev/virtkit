@@ -225,9 +225,13 @@ It mirrors what `tpm.rs` (at 2ba84aa2) does with libtpms, so the device swaps on
 | `RUNNING` / `PERMANENT_STATE` globals | none: a `Tpm` is a value owned by the `TpmCrb` |
 
 `permanent_state()` and `volatile_state()` return `Zeroizing<Vec<u8>>` to protect the seeds
-and the authValues and session keys, respectively. `process` compares permanent state
-before and after each command, so `take_permanent_changed` reports every change, including
-counted authorization failures, without per-command bookkeeping. The file keeps
+and the authValues and session keys, respectively. The `state::Tracked` guard marks permanent
+state changed on every mutable access, so `take_permanent_changed` reports every change,
+including counted authorization failures, without per-command bookkeeping. Clock alone
+bypasses the guard. A mutable access that changes nothing may cause one extra store, never a
+missed one. Unit tests and debug builds with `VK_TPM_CHECK_CHANGES` set (run over the
+differential suite) compare the serialized state around each command and fail on an unmarked
+change. Comparing it in every build made the differential suite 25 times slower. The file keeps
 `write_atomic`'s guarantees: 0600, fsync, rename, then a directory fsync. The locality stays 0,
 as the device grants only locality 0. `process` will take one when the device offers more.
 
