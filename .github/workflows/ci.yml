@@ -12,7 +12,8 @@ name: CI
 # commit without waiting for a release. The guest kernel is not built — it compiles
 # a full Linux kernel (tens of minutes) and changes infrequently: vk embeds the one of
 # the release the commit descends from, unless the kernel inputs changed since, when it
-# is built after all.
+# is built after all. The UEFI firmware is always built and embedded (mostly a
+# cache.nixos.org download).
 #
 # The kernel is built (and embedded into vk) when the workflow is triggered
 # manually (workflow_dispatch), for testing kernel config changes without cutting

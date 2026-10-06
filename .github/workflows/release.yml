@@ -12,15 +12,16 @@ name: Release
 # publish instead of being silently rebased over.
 #
 # virtkit's artifacts are produced by the same reproducible scripts we use locally —
-# build.sh (the static-musl binaries) and build-kernel.sh (the guest vmlinux). GitHub-hosted
+# build.sh (the static-musl binaries), build-kernel.sh (the guest vmlinux) and
+# build-firmware.sh (the UEFI firmware, embedded into vk rather than published). GitHub-hosted
 # ubuntu runners ship Docker and KVM, so the workflow just runs those scripts and uploads
 # everything they drop in dist/. The pinned toolchain lives in the image, not here, so the
 # runner needs no Rust setup.
 #
 # prepare derives the tag from Cargo.toml and refuses a candidate that is already released,
 # has no CHANGELOG section, or does not contain main — in seconds, before anything compiles.
-# build runs in parallel with quality (lint + test + audit); the kernel is built in the
-# same job as the binaries so the published vk has it embedded, and the build runs as
+# build runs in parallel with quality (lint + test + audit); the kernel and the firmware
+# are built in the binaries' job so the published vk has them embedded, and the build runs as
 # `build.sh --bootstrap-check`: the released bytes are attested by rebuilding them from
 # scratch in a vk microVM and requiring an exact match. e2e then boots microVMs with the
 # vk that build produced (tests/release-e2e.sh). publish runs once all of them have

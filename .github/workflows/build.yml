@@ -6,7 +6,9 @@ name: Build
 # The kernel is built first, in the same job as the binaries: build.sh embeds
 # dist/vmlinux into vk when it is present, so building both on one runner is what
 # makes the released vk self-contained. A separate kernel job would leave build.sh
-# with no vmlinux to embed.
+# with no vmlinux to embed. UEFI firmware is built unconditionally in the same job:
+# build-firmware.sh --docker mostly downloads it from cache.nixos.org, so every CI and
+# release vk boots UEFI guests out of the box.
 #
 # Inputs
 #   artifact-prefix  — prefix for uploaded artifact names; callers set this to
@@ -47,6 +49,9 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Allow headroom for the release path (kernel, firmware, Docker build, microVM rebuild).
+    # Cap runaway builds, such as edk2 compiling locally on a cache.nixos.org miss.
+    timeout-minutes: 180
     steps:
       # Fetch full history and tags only to select a released kernel.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -102,6 +107,11 @@ jobs:
             1) build_kernel "the kernel inputs changed since $tag ($commit); building the guest kernel" ;;
             *) echo "::error::git diff $commit HEAD failed (exit $rc)"; exit 1 ;;
           esac
+
+      # Run before either build.sh step to embed dist/CLOUDHV.fd into vk.
+      # --docker forces Docker instead of a vk on PATH.
+      - name: Build UEFI firmware (CLOUDHV.fd)
+        run: ./build-firmware.sh --docker
 
       # Without either kernel step, pass --no-kernel: build.sh otherwise requires
       # dist/vmlinux. With a release's kernel, --kernel-from marks the manifest as a CI
