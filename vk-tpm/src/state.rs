@@ -17,6 +17,7 @@ use crate::marshal::{Reader, Writer};
 use crate::object::{MAX_OBJECTS, Object};
 use crate::pcr::{self, Bank, Banks, Pcrs, Selection};
 use crate::rc::Rc;
+use crate::session::{MAX_ACTIVE, Session};
 
 const PERMANENT_MAGIC: &[u8; 8] = b"VKTPM-P\0";
 const VOLATILE_MAGIC: &[u8; 8] = b"VKTPM-V\0";
@@ -213,6 +214,11 @@ pub struct Volatile {
     pub pcrs: Pcrs,
     /// The object slots.
     pub objects: Vec<Option<Object>>,
+    /// The sessions, by handle index.
+    pub sessions: Vec<Option<Session>>,
+    /// The session whose audit digest covers every command since it last audited one
+    /// (g_exclusiveAuditSession).
+    pub exclusive_audit: Option<u32>,
 }
 
 impl Volatile {
@@ -230,7 +236,9 @@ impl Volatile {
             pcr_reconfig: false,
             clear: ClearState::default(),
             pcrs: Pcrs::new(),
-            objects: empty_slots(),
+            objects: empty_slots(MAX_OBJECTS),
+            sessions: empty_slots(MAX_ACTIVE),
+            exclusive_audit: None,
         }
     }
 
@@ -253,17 +261,9 @@ impl Volatile {
             .map(|b| (b.hash, b.values.clone()))
             .collect();
         write_banks(&mut w, &banks);
-        for object in &self.objects {
-            match object {
-                Some(object) => {
-                    w.u8(1);
-                    object.write(&mut w);
-                }
-                None => {
-                    w.u8(0);
-                }
-            }
-        }
+        write_slots(&mut w, &self.objects, Object::write);
+        write_slots(&mut w, &self.sessions, Session::write);
+        w.u32(self.exclusive_audit.unwrap_or(0));
         w.into_bytes()
     }
 
@@ -294,12 +294,9 @@ impl Volatile {
             }
             *bank = Bank { hash, values };
         }
-        let mut objects = empty_slots();
-        for slot in &mut objects {
-            if read_bool(&mut r)? {
-                *slot = Some(Object::read(&mut r)?);
-            }
-        }
+        let objects = read_slots(&mut r, MAX_OBJECTS, Object::read)?;
+        let sessions = read_slots(&mut r, MAX_ACTIVE, Session::read)?;
+        let exclusive_audit = Some(r.u32()?).filter(|&h| h != 0);
         expect_end(&r)?;
         Ok(Volatile {
             started,
@@ -314,12 +311,39 @@ impl Volatile {
             clear,
             pcrs,
             objects,
+            sessions,
+            exclusive_audit,
         })
     }
 }
 
-fn empty_slots() -> Vec<Option<Object>> {
-    std::iter::repeat_with(|| None).take(MAX_OBJECTS).collect()
+fn empty_slots<T>(n: usize) -> Vec<Option<T>> {
+    std::iter::repeat_with(|| None).take(n).collect()
+}
+
+/// Object or session slots: a flag for each, then what it holds.
+fn write_slots<T>(w: &mut Writer, slots: &[Option<T>], write: fn(&T, &mut Writer)) {
+    for slot in slots {
+        match slot {
+            Some(t) => {
+                w.u8(1);
+                write(t, w);
+            }
+            None => {
+                w.u8(0);
+            }
+        }
+    }
+}
+
+fn read_slots<T>(
+    r: &mut Reader,
+    n: usize,
+    read: fn(&mut Reader) -> Result<T, StateError>,
+) -> Result<Vec<Option<T>>, StateError> {
+    (0..n)
+        .map(|_| Ok(if read_bool(r)? { Some(read(r)?) } else { None }))
+        .collect()
 }
 
 fn expect_header(r: &mut Reader, magic: &[u8; 8]) -> Result<(), StateError> {

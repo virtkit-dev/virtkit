@@ -9,12 +9,15 @@
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
+    clippy::panic,
     clippy::indexing_slicing,
     clippy::arithmetic_side_effects
 )]
 
+mod client;
 mod libtpms;
 
+use client::{Auth, Sym};
 use libtpms::LibTpms;
 use vk_tpm::Tpm;
 
@@ -32,6 +35,7 @@ const FLUSH_CONTEXT: u32 = 0x165;
 const HASH: u32 = 0x17d;
 const EVENT_SEQUENCE_COMPLETE: u32 = 0x185;
 const HASH_SEQUENCE_START: u32 = 0x186;
+const START_AUTH_SESSION: u32 = 0x176;
 const PCR_EVENT: u32 = 0x13c;
 const PCR_RESET: u32 = 0x13d;
 
@@ -95,6 +99,62 @@ impl Both {
     fn same(&mut self, command: &[u8]) -> Vec<u8> {
         let (ours, theirs) = self.both(command);
         assert_eq!(hex(&ours), hex(&theirs), "command {}", hex(command));
+        ours
+    }
+
+    /// TPM2_StartAuthSession on both (a session of `kind`, bound to `bind` whose authValue is
+    /// `bind_auth`); on success, each TPM's session joins `sessions`. Returns the response
+    /// code.
+    fn start_session(
+        &mut self,
+        sessions: &mut Sessions,
+        kind: u8,
+        hash: u16,
+        sym: Sym,
+        (bind, bind_auth): (u32, Option<&[u8]>),
+        nonce: &[u8],
+    ) -> u32 {
+        let params = [
+            tpm2b(nonce),
+            tpm2b(b""),
+            vec![kind],
+            sym.marshal(hash),
+            hash.to_be_bytes().to_vec(),
+        ]
+        .concat();
+        let c = command(START_AUTH_SESSION, &[RH_NULL, bind], None, &params);
+        let (ours, theirs) = self.both(&c);
+        assert_eq!(ours.len(), theirs.len(), "command {}", hex(&c));
+        // The header and the session handle: the nonce is random.
+        assert_eq!(
+            hex(&ours[..14.min(ours.len())]),
+            hex(&theirs[..14.min(theirs.len())])
+        );
+        if rc(&ours) == 0 {
+            let bind = (bind != RH_NULL).then_some(bind_auth.unwrap_or_default());
+            sessions
+                .ours
+                .push(client::Session::started(&ours, hash, nonce, sym, bind));
+            sessions
+                .theirs
+                .push(client::Session::started(&theirs, hash, nonce, sym, bind));
+        }
+        rc(&ours)
+    }
+
+    /// `cmd`, authorized by each TPM's sessions: both must say the same once decrypted, and
+    /// each its response HMACs right.
+    #[track_caller]
+    fn run(&mut self, sessions: &mut Sessions, cmd: &client::Command) -> client::Response {
+        sessions.calls += 1;
+        let nonce: Vec<u8> = (0..20).map(|i| (sessions.calls * 7 + i) as u8).collect();
+        let ours = client::build(cmd, &sessions.ours, &nonce);
+        let theirs = client::build(cmd, &sessions.theirs, &nonce);
+        let ours = self.ours.process(&ours);
+        let theirs = self.theirs.process(&theirs);
+        let ours = client::check(cmd, &mut sessions.ours, &nonce, &ours);
+        let theirs = client::check(cmd, &mut sessions.theirs, &nonce, &theirs);
+        assert_eq!(ours, theirs, "command {:#x}", cmd.code);
         ours
     }
 
@@ -949,6 +1009,647 @@ fn object_slots_match() {
     both.power_cycle();
     both.same(&command(STARTUP, &[], None, &[0, 1]));
     both.same(&get_capability(1, 0x8000_0000, 8));
+}
+
+/// Each TPM's sessions, as the caller tracks them.
+#[derive(Default)]
+struct Sessions {
+    ours: Vec<client::Session>,
+    theirs: Vec<client::Session>,
+    calls: usize,
+}
+
+const SE_HMAC: u8 = 0;
+const SE_POLICY: u8 = 1;
+const SE_TRIAL: u8 = 3;
+const HMAC_SESSION: u32 = 0x0200_0000;
+
+fn change_auth_command(handle: u32, new: &[u8], auths: Vec<Auth>) -> client::Command {
+    client::Command::new(HIERARCHY_CHANGE_AUTH, &[handle], &tpm2b(new), auths)
+}
+
+#[test]
+fn hmac_sessions_match() {
+    let mut both = Both::seeded();
+    let mut s = Sessions::default();
+    let unbound = (RH_NULL, None);
+    assert_eq!(
+        both.start_session(
+            &mut s,
+            SE_HMAC,
+            client::SHA256,
+            Sym::Null,
+            unbound,
+            &[1; 16]
+        ),
+        0
+    );
+    both.same(&change_auth(RH_OWNER, b"", b"owner"));
+    let session = |entity: &[u8], after: Option<&[u8]>| Auth::Session {
+        index: 0,
+        attributes: client::CONTINUE,
+        entity: Some(entity.to_vec()),
+        bound: false,
+        after: after.map(<[u8]>::to_vec),
+        hmac: None,
+    };
+    // The response HMAC is keyed with the new authValue.
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"new\0", vec![session(b"owner", Some(b"new"))]),
+    );
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"", vec![session(b"owner", None)]),
+    );
+    let mut wrong = session(b"new", None);
+    if let Auth::Session { hmac, .. } = &mut wrong {
+        *hmac = Some(vec![0; 32]);
+    }
+    let r = both.run(&mut s, &change_auth_command(RH_OWNER, b"", vec![wrong]));
+    assert_eq!(r.rc, 0x9a2, "TPM_RC_BAD_AUTH");
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"", vec![session(b"new", Some(b""))]),
+    );
+    // The same session for two handles, and a session where none is needed.
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"", vec![session(b"", None), session(b"", None)]),
+    );
+    let get_random = client::Command::new(GET_RANDOM, &[], &[0, 8], vec![session(b"", None)]);
+    both.run(&mut s, &get_random);
+    read_hierarchy_state(&mut both);
+
+    // Bound sessions: the bind authValue is in the key, so not added again for the entity it
+    // is bound to; once that authValue changes, it is.
+    both.same(&change_auth(RH_OWNER, b"", b"owner"));
+    both.same(&change_auth(RH_ENDORSEMENT, b"", b"endorsement"));
+    let bind = (RH_OWNER, Some(&b"owner"[..]));
+    assert_eq!(
+        both.start_session(&mut s, SE_HMAC, client::SHA1, Sym::Null, bind, &[2; 20]),
+        0
+    );
+    let bound = |entity: &[u8], bound: bool, after: Option<&[u8]>| Auth::Session {
+        index: 1,
+        attributes: client::CONTINUE,
+        entity: Some(entity.to_vec()),
+        bound,
+        after: after.map(<[u8]>::to_vec),
+        hmac: None,
+    };
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"owner", vec![bound(b"owner", true, None)]),
+    );
+    both.run(
+        &mut s,
+        &change_auth_command(
+            RH_ENDORSEMENT,
+            b"endorsement",
+            vec![bound(b"endorsement", false, None)],
+        ),
+    );
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"owner", vec![bound(b"owner", false, None)]),
+    );
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"o2", vec![bound(b"owner", true, Some(b"o2"))]),
+    );
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"", vec![bound(b"o2", false, Some(b""))]),
+    );
+
+    // A session bound to lockout is subject to its dictionary-attack protection: a failure
+    // through it disables lockout, whatever the session authorized.
+    both.same(&change_auth(RH_LOCKOUT, b"", b"lock"));
+    let lockout = (RH_LOCKOUT, Some(&b"lock"[..]));
+    assert_eq!(
+        both.start_session(
+            &mut s,
+            SE_HMAC,
+            client::SHA384,
+            Sym::Null,
+            lockout,
+            &[3; 48]
+        ),
+        0
+    );
+    let via_lockout = |hmac: Option<Vec<u8>>| Auth::Session {
+        index: 2,
+        attributes: client::CONTINUE,
+        entity: Some(Vec::new()),
+        bound: false,
+        after: None,
+        hmac,
+    };
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"", vec![via_lockout(None)]),
+    );
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"", vec![via_lockout(Some(vec![1; 48]))]),
+    );
+    read_hierarchy_state(&mut both);
+    let r = both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"", vec![via_lockout(None)]),
+    );
+    assert_eq!(r.rc, 0x921, "TPM_RC_LOCKOUT");
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"", vec![via_lockout(None)]),
+    );
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"", vec![session(b"", None)]),
+    );
+
+    // A session that does not continue is flushed.
+    let mut last = session(b"", None);
+    if let Auth::Session { attributes, .. } = &mut last {
+        *attributes = 0;
+    }
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"", vec![last.clone()]),
+    );
+    both.same(&get_capability(1, HMAC_SESSION, 8));
+    both.same(&get_capability(6, 0x203, 4));
+    both.run(&mut s, &change_auth_command(RH_OWNER, b"", vec![last]));
+}
+
+#[test]
+fn policy_and_trial_sessions_match() {
+    let mut both = Both::seeded();
+    let mut s = Sessions::default();
+    // Without policy commands, a policy session's digest stays all zeros: an authPolicy of
+    // zeros is one it satisfies.
+    let mut p = tpm2b(&[0; 32]);
+    p.extend_from_slice(&client::SHA256.to_be_bytes());
+    both.same(&with_password(SET_PRIMARY_POLICY, RH_OWNER, b"", &p));
+    let unbound = (RH_NULL, None);
+    for (kind, hash) in [
+        (SE_POLICY, client::SHA256),
+        (SE_POLICY, client::SHA1),
+        (SE_TRIAL, client::SHA256),
+    ] {
+        assert_eq!(
+            both.start_session(&mut s, kind, hash, Sym::Null, unbound, &[4; 20]),
+            0
+        );
+    }
+    let policy = |index: usize, attributes: u8| Auth::Session {
+        index,
+        attributes,
+        entity: Some(Vec::new()),
+        // A policy session never adds the authValue.
+        bound: true,
+        after: None,
+        hmac: None,
+    };
+    // Satisfied, SHA-1 instead of SHA-256 (TPM_RC_POLICY_FAIL), no authPolicy
+    // (TPM_RC_AUTH_UNAVAILABLE); a trial session authorizes nothing (TPM_RC_ATTRIBUTES).
+    let expected = [
+        [0, 0x12f, 0x12f],
+        [0x99d, 0x12f, 0x12f],
+        [0x982, 0x982, 0x982],
+    ];
+    for (index, expected) in expected.iter().enumerate() {
+        for (h, rc) in [RH_OWNER, RH_ENDORSEMENT, RH_PLATFORM]
+            .into_iter()
+            .zip(expected)
+        {
+            let cmd = change_auth_command(h, b"", vec![policy(index, client::CONTINUE)]);
+            assert_eq!(both.run(&mut s, &cmd).rc, *rc);
+        }
+    }
+    // As an audit or encryption session, a policy session is refused.
+    let get_random = |auth| client::Command::new(GET_RANDOM, &[], &[0, 8], vec![auth]);
+    both.run(
+        &mut s,
+        &get_random(policy(0, client::CONTINUE | client::AUDIT)),
+    );
+    both.run(
+        &mut s,
+        &get_random(policy(0, client::CONTINUE | client::ENCRYPT)),
+    );
+    both.run(&mut s, &get_random(policy(2, client::CONTINUE)));
+    both.same(&get_capability(1, HMAC_SESSION, 8));
+    both.same(&get_capability(1, HMAC_SESSION + 1, 8));
+    both.same(&get_capability(1, 0x0300_0000, 8));
+}
+
+#[test]
+fn parameter_encryption_matches() {
+    let mut both = Both::seeded();
+    let mut s = Sessions::default();
+    let unbound = (RH_NULL, None);
+    let mut index = 0;
+    for sym in [Sym::Xor, Sym::Aes(128), Sym::Aes(192), Sym::Aes(256)] {
+        for hash in [client::SHA1, client::SHA256, client::SHA512] {
+            let nonce = vec![index as u8 + 1; 16];
+            assert_eq!(
+                both.start_session(&mut s, SE_HMAC, hash, sym, unbound, &nonce),
+                0
+            );
+            let crypt = |attributes: u8| Auth::Session {
+                index,
+                attributes: client::CONTINUE | attributes,
+                entity: None,
+                bound: false,
+                after: None,
+                hmac: None,
+            };
+            // TPM2_Hash: the data in, the digest out; the ticket shows the TPM hashed the
+            // plaintext.
+            let p = [tpm2b(b"some secret data"), vec![0, 0x0b, 0x40, 0, 0, 1]].concat();
+            for attributes in [
+                client::DECRYPT,
+                client::ENCRYPT,
+                client::DECRYPT | client::ENCRYPT,
+            ] {
+                let cmd = client::Command::new(HASH, &[], &p, vec![crypt(attributes)]);
+                assert_eq!(both.run(&mut s, &cmd).rc, 0);
+            }
+            // A new authValue, encrypted, with a password session authorizing.
+            let cmd = change_auth_command(
+                RH_OWNER,
+                b"encrypted",
+                vec![Auth::Password(Vec::new()), crypt(client::DECRYPT)],
+            );
+            both.run(&mut s, &cmd);
+            both.same(&change_auth(RH_OWNER, b"encrypted", b""));
+            // Sessions that cannot: no symmetric algorithm, or a command without the parameter.
+            let cmd =
+                client::Command::new(GET_CAPABILITY, &[], &[0; 12], vec![crypt(client::DECRYPT)]);
+            both.run(&mut s, &cmd);
+            let cmd = client::Command::new(PCR_READ, &[], &[0; 4], vec![crypt(client::ENCRYPT)]);
+            both.run(&mut s, &cmd);
+            index += 1;
+            let r = both.same(&command(
+                FLUSH_CONTEXT,
+                &[],
+                None,
+                &(HMAC_SESSION + 1).to_be_bytes(),
+            ));
+            if rc(&r) == 0 {
+                s.ours.remove(1);
+                s.theirs.remove(1);
+                index -= 1;
+            }
+            if s.ours.len() == 3 {
+                both.same(&command(
+                    FLUSH_CONTEXT,
+                    &[],
+                    None,
+                    &HMAC_SESSION.to_be_bytes(),
+                ));
+                s.ours.remove(0);
+                s.theirs.remove(0);
+                index -= 1;
+            }
+        }
+    }
+
+    // An HMAC session that authorizes, with another that encrypts both ways: the first one's
+    // HMAC covers the other's nonce. The sequence's Name is empty.
+    both.same(&command(
+        FLUSH_CONTEXT,
+        &[],
+        None,
+        &HMAC_SESSION.to_be_bytes(),
+    ));
+    s.ours.clear();
+    s.theirs.clear();
+    assert_eq!(
+        both.start_session(
+            &mut s,
+            SE_HMAC,
+            client::SHA256,
+            Sym::Null,
+            unbound,
+            &[7; 32]
+        ),
+        0
+    );
+    assert_eq!(
+        both.start_session(
+            &mut s,
+            SE_HMAC,
+            client::SHA1,
+            Sym::Aes(128),
+            unbound,
+            &[8; 16]
+        ),
+        0
+    );
+    let r = both.same(&sequence_start(b"seq", client::SHA256));
+    let handle = u32::from_be_bytes(r[10..14].try_into().unwrap());
+    let handles = [handle];
+    let p = [tpm2b(b"the end"), RH_ENDORSEMENT.to_be_bytes().to_vec()].concat();
+    let auths = vec![
+        Auth::session(0, client::CONTINUE, Some(b"seq")),
+        Auth::session(
+            1,
+            client::CONTINUE | client::DECRYPT | client::ENCRYPT,
+            None,
+        ),
+    ];
+    let mut cmd = client::Command::new(SEQUENCE_COMPLETE, &handles, &p, auths);
+    cmd.names = vec![Vec::new()];
+    both.run(&mut s, &cmd);
+    // Both ways round, and the decrypting session first.
+    let r = both.same(&sequence_start(b"seq", client::SHA256));
+    let handle = u32::from_be_bytes(r[10..14].try_into().unwrap());
+    let handles = [handle];
+    let auths = vec![
+        Auth::session(1, client::CONTINUE | client::DECRYPT, Some(b"seq")),
+        Auth::session(0, client::CONTINUE, None),
+    ];
+    let mut cmd = client::Command::new(SEQUENCE_COMPLETE, &handles, &p, auths);
+    cmd.names = vec![Vec::new()];
+    both.run(&mut s, &cmd);
+}
+
+#[test]
+fn audit_sessions_match() {
+    let mut both = Both::seeded();
+    let mut s = Sessions::default();
+    let bind = (RH_OWNER, Some(&b""[..]));
+    assert_eq!(
+        both.start_session(&mut s, SE_HMAC, client::SHA256, Sym::Null, bind, &[5; 16]),
+        0
+    );
+    let audit = |attributes: u8| Auth::Session {
+        index: 0,
+        attributes: client::CONTINUE | client::AUDIT | attributes,
+        entity: None,
+        bound: false,
+        after: None,
+        hmac: None,
+    };
+    let hash_cmd = |auths| {
+        let p = [tpm2b(b"audited"), vec![0, 0x0b, 0x40, 0, 0, 7]].concat();
+        client::Command::new(HASH, &[], &p, auths)
+    };
+    // The first audit makes the session exclusive; it stays so while only it audits.
+    let r = both.run(&mut s, &hash_cmd(vec![audit(0)]));
+    assert_eq!(
+        r.attributes,
+        [client::CONTINUE | client::AUDIT | client::AUDIT_EXCLUSIVE]
+    );
+    both.run(&mut s, &hash_cmd(vec![audit(client::AUDIT_EXCLUSIVE)]));
+    // Any command that could have had a session ends the exclusivity.
+    both.same(&get_capability(6, 0x100, 1));
+    let r = both.run(&mut s, &hash_cmd(vec![audit(0)]));
+    assert_eq!(r.attributes, [client::CONTINUE | client::AUDIT]);
+    both.same(&get_capability(6, 0x100, 1));
+    let r = both.run(&mut s, &hash_cmd(vec![audit(client::AUDIT_EXCLUSIVE)]));
+    assert_eq!(r.rc, 0x121, "TPM_RC_EXCLUSIVE");
+    both.run(&mut s, &hash_cmd(vec![audit(client::AUDIT_RESET)]));
+    both.run(&mut s, &hash_cmd(vec![audit(client::AUDIT_EXCLUSIVE)]));
+    // TPM2_Startup and TPM2_FlushContext take no session: they leave it exclusive.
+    both.same(&command(
+        FLUSH_CONTEXT,
+        &[],
+        None,
+        &0x8000_0000u32.to_be_bytes(),
+    ));
+    both.run(&mut s, &hash_cmd(vec![audit(client::AUDIT_EXCLUSIVE)]));
+    // Auditing an authorization: an audit session is no longer bound.
+    let auth = Auth::Session {
+        index: 0,
+        attributes: client::CONTINUE | client::AUDIT,
+        entity: Some(Vec::new()),
+        bound: false,
+        after: None,
+        hmac: None,
+    };
+    both.run(&mut s, &change_auth_command(RH_OWNER, b"", vec![auth]));
+    // Two audit sessions, or one with a password session.
+    assert_eq!(
+        both.start_session(
+            &mut s,
+            SE_HMAC,
+            client::SHA1,
+            Sym::Null,
+            (RH_NULL, None),
+            &[6; 16]
+        ),
+        0
+    );
+    let second = Auth::session(1, client::CONTINUE | client::AUDIT, None);
+    both.run(&mut s, &hash_cmd(vec![audit(0), second]));
+    both.run(
+        &mut s,
+        &change_auth_command(RH_OWNER, b"", vec![Auth::Password(vec![]), audit(0)]),
+    );
+}
+
+#[test]
+fn session_handles_and_errors_match() {
+    let mut both = Both::started();
+    let mut s = Sessions::default();
+    let start = |both: &mut Both, s: &mut Sessions, kind, hash, sym, bind, nonce: &[u8]| {
+        both.start_session(s, kind, hash, sym, bind, nonce)
+    };
+    let unbound = (RH_NULL, None);
+    // Nonce sizes, session types, hashes, symmetric definitions.
+    for (nonce, hash) in [
+        (15, client::SHA256),
+        (16, client::SHA1),
+        (20, client::SHA1),
+        (21, client::SHA1),
+        (32, client::SHA256),
+        (33, client::SHA256),
+        (64, client::SHA512),
+        (65, client::SHA512),
+    ] {
+        start(
+            &mut both,
+            &mut s,
+            SE_HMAC,
+            hash,
+            Sym::Null,
+            unbound,
+            &vec![9; nonce],
+        );
+        while s.ours.len() > 1 {
+            let h = s.ours.pop().unwrap().handle;
+            s.theirs.pop();
+            both.same(&command(FLUSH_CONTEXT, &[], None, &h.to_be_bytes()));
+        }
+    }
+    let raw = |kind: u8, sym: &[u8], hash: u16, salt: &[u8], handles: [u32; 2]| {
+        let p = [
+            tpm2b(&[1; 16]),
+            tpm2b(salt),
+            vec![kind],
+            sym.to_vec(),
+            hash.to_be_bytes().to_vec(),
+        ]
+        .concat();
+        command(START_AUTH_SESSION, &handles, None, &p)
+    };
+    let null = [RH_NULL, RH_NULL];
+    for bad in [
+        raw(2, &[0, 0x10], 0x0b, b"", null),
+        raw(4, &[0, 0x10], 0x0b, b"", null),
+        raw(0, &[0, 0x10], 0x10, b"", null),
+        raw(0, &[0, 0x10], 0x12, b"", null),
+        raw(0, &[0, 0x06, 0, 128, 0, 0x40], 0x0b, b"", null),
+        raw(0, &[0, 0x06, 0, 128, 0, 0x10], 0x0b, b"", null),
+        raw(0, &[0, 0x06, 0, 128, 0, 0x45], 0x0b, b"", null),
+        raw(0, &[0, 0x06, 0, 129, 0, 0x43], 0x0b, b"", null),
+        raw(0, &[0, 0x0a, 0, 0x10], 0x0b, b"", null),
+        raw(0, &[0, 0x0a, 0, 0x0d], 0x0b, b"", null),
+        raw(0, &[0, 0x25], 0x0b, b"", null),
+        raw(0, &[0, 0x10], 0x0b, b"salt", null),
+        raw(0, &[0, 0x10], 0x0b, &[1; 512], null),
+        raw(0, &[0, 0x10], 0x0b, &[1; 513], null),
+        raw(0, &[0, 0x10], 0x0b, b"", [0x8000_0000, RH_NULL]),
+        raw(0, &[0, 0x10], 0x0b, b"", [0x8100_0000, RH_NULL]),
+        raw(0, &[0, 0x10], 0x0b, b"", [RH_OWNER, RH_NULL]),
+        raw(0, &[0, 0x10], 0x0b, b"", [RH_NULL, 0x0100_0000]),
+        raw(0, &[0, 0x10], 0x0b, b"", [RH_NULL, 0x8100_0000]),
+        raw(0, &[0, 0x10], 0x0b, b"", [RH_NULL, 0x4000_0010]),
+        raw(0, &[0, 0x10], 0x0b, b"", [RH_NULL, 0x8000_0000]),
+        raw(0, &[0, 0x10], 0x0b, b"", [RH_NULL, 24]),
+        raw(0, &[0, 0x10], 0x0b, b"", [RH_NULL, RS_PW]),
+        command(START_AUTH_SESSION, &null, Some(&password(b"")), &[0; 9]),
+    ] {
+        let (ours, theirs) = both.both(&bad);
+        assert_eq!(ours.len(), theirs.len(), "{}", hex(&bad));
+        assert_eq!(ours[..10], theirs[..10], "{}", hex(&bad));
+        if rc(&ours) == 0 {
+            let h = u32::from_be_bytes(ours[10..14].try_into().unwrap());
+            both.same(&command(FLUSH_CONTEXT, &[], None, &h.to_be_bytes()));
+        }
+    }
+    // Bound to a sequence (empty Name) and to a PCR.
+    let r = both.same(&sequence_start(b"sq", client::SHA1));
+    let seq = u32::from_be_bytes(r[10..14].try_into().unwrap());
+    start(
+        &mut both,
+        &mut s,
+        SE_HMAC,
+        client::SHA256,
+        Sym::Null,
+        (seq, Some(b"sq")),
+        &[1; 16],
+    );
+    start(
+        &mut both,
+        &mut s,
+        SE_HMAC,
+        client::SHA256,
+        Sym::Xor,
+        (7, Some(b"")),
+        &[1; 16],
+    );
+    let handles = [seq];
+    let mut cmd = client::Command::new(
+        SEQUENCE_UPDATE,
+        &handles,
+        &tpm2b(b"x"),
+        vec![Auth::Session {
+            index: 1,
+            attributes: client::CONTINUE | client::DECRYPT,
+            entity: Some(b"sq".to_vec()),
+            bound: true,
+            after: None,
+            hmac: None,
+        }],
+    );
+    cmd.names = vec![Vec::new()];
+    both.run(&mut s, &cmd);
+    let pcr = [7u32];
+    let extend = [1u32.to_be_bytes().to_vec(), vec![0, 4], vec![1; 20]].concat();
+    for (index, bound) in [(2, true), (1, false)] {
+        let auth = Auth::Session {
+            index,
+            attributes: client::CONTINUE,
+            entity: Some(Vec::new()),
+            bound,
+            after: None,
+            hmac: None,
+        };
+        both.run(
+            &mut s,
+            &client::Command::new(PCR_EXTEND, &pcr, &extend, vec![auth]),
+        );
+    }
+    // Every slot taken: TPM_RC_SESSION_MEMORY.
+    assert_eq!(
+        start(
+            &mut both,
+            &mut s,
+            SE_HMAC,
+            client::SHA256,
+            Sym::Null,
+            unbound,
+            &[1; 16]
+        ),
+        0x903
+    );
+    both.same(&get_capability(1, HMAC_SESSION, 64));
+    both.same(&get_capability(6, 0x203, 4));
+    // Sessions misused in an authorization area.
+    let session = |index: usize, attributes: u8| Auth::Session {
+        index,
+        attributes,
+        entity: Some(Vec::new()),
+        bound: false,
+        after: None,
+        hmac: None,
+    };
+    let p = [tpm2b(b"x"), vec![0, 0x0b, 0x40, 0, 0, 7]].concat();
+    for auths in [
+        vec![session(0, client::CONTINUE | client::DECRYPT)],
+        vec![session(0, client::CONTINUE)],
+        vec![
+            session(2, client::CONTINUE | client::DECRYPT),
+            session(2, client::CONTINUE | client::ENCRYPT),
+        ],
+        vec![
+            session(2, client::CONTINUE | client::DECRYPT),
+            session(1, client::CONTINUE | client::DECRYPT),
+        ],
+        vec![
+            session(2, client::CONTINUE | client::ENCRYPT),
+            session(1, client::CONTINUE | client::ENCRYPT),
+        ],
+        vec![
+            session(2, client::CONTINUE | client::AUDIT),
+            session(1, client::CONTINUE | client::AUDIT),
+        ],
+        vec![Auth::Password(Vec::new())],
+    ] {
+        let cmd = client::Command::new(HASH, &[], &p, auths);
+        both.run(&mut s, &cmd);
+    }
+    // Policy handles for HMAC sessions, sessions that are not loaded, in the handle area too.
+    for handle in [0x0300_0000, 0x0200_0003, 0x0200_0040] {
+        let area = session_entry(handle);
+        both.same(&command(HASH, &[], Some(&area), &p));
+        both.same(&command(FLUSH_CONTEXT, &[], None, &handle.to_be_bytes()));
+    }
+    // A Startup flushes every session.
+    both.same(&command(SHUTDOWN, &[], None, &[0, 1]));
+    both.power_cycle();
+    both.same(&command(STARTUP, &[], None, &[0, 1]));
+    both.same(&get_capability(1, HMAC_SESSION, 64));
+    both.same(&get_capability(6, 0x203, 4));
+}
+
+/// An authorization-area entry for `handle`, its HMAC empty.
+fn session_entry(handle: u32) -> Vec<u8> {
+    session(handle, &[0; 16], 1, &[])
 }
 
 /// Deterministic mutations of well-formed commands: both must answer the same, wherever the

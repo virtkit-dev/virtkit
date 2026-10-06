@@ -24,6 +24,11 @@ impl<'a> Reader<'a> {
         self.rest.len()
     }
 
+    /// What is left to read.
+    pub fn rest(&self) -> &'a [u8] {
+        self.rest
+    }
+
     /// The next `n` bytes.
     pub fn bytes(&mut self, n: usize) -> Result<&'a [u8]> {
         let Some((head, rest)) = self.rest.split_at_checked(n) else {

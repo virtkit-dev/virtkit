@@ -113,6 +113,7 @@ fn valid_handle(kind: HandleKind) -> u32 {
         HandleKind::Lockout => TPM_RH_LOCKOUT,
         // The sequence the test starts first.
         HandleKind::Object(_) => 0x8000_0000,
+        HandleKind::Entity(_) => TPM_RH_NULL,
     }
 }
 
@@ -123,6 +124,7 @@ fn every_command_refuses_trailing_parameter_bytes() {
         if cmd.code != TPM_CC_STARTUP {
             tpm.process(&command(TPM_CC_STARTUP, &[], None, &[0, 0]));
         }
+        let start_auth_session = [&[0, 16][..], &[0; 16], &[0, 0, 0, 0, 0x10, 0, 0x0b]].concat();
         let params: &[u8] = match cmd.code {
             TPM_CC_GET_CAPABILITY => &[0, 0, 0, 6, 0, 0, 1, 0, 0, 0, 0, 1],
             TPM_CC_GET_RANDOM | TPM_CC_STARTUP | TPM_CC_SHUTDOWN => &[0, 0],
@@ -139,6 +141,8 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_SEQUENCE_UPDATE | TPM_CC_EVENT_SEQUENCE_COMPLETE => &[0, 0],
             TPM_CC_SEQUENCE_COMPLETE => &[0, 0, 0x40, 0, 0, 7],
             TPM_CC_FLUSH_CONTEXT => &[0x80, 0, 0, 0],
+            // A 16-byte nonce, no salt, HMAC, TPM_ALG_NULL, SHA-256.
+            TPM_CC_START_AUTH_SESSION => &start_auth_session,
             _ => &[0, 0, 0, 0],
         };
         let params = [params, &[0xee]].concat();
@@ -744,4 +748,123 @@ fn objects_take_the_free_slots() {
     assert_eq!(rc(&tpm.process(&session)), Rc::HANDLE.param(1).0);
     let bad = command(TPM_CC_FLUSH_CONTEXT, &[], None, &[0x80, 0, 0, 3]);
     assert_eq!(rc(&tpm.process(&bad)), Rc::VALUE.param(1).0);
+}
+
+/// TPM2_StartAuthSession: an HMAC session (SHA-256, `symmetric`) bound to `bind`, with a
+/// nonceCaller of 16 bytes of `n`. Returns its handle and nonceTPM.
+fn start_session(tpm: &mut Tpm, bind: u32, symmetric: &[u8], n: u8) -> (u32, Vec<u8>) {
+    let mut p = Writer::new();
+    p.tpm2b(&[n; 16])
+        .tpm2b(&[])
+        .u8(0)
+        .bytes(symmetric)
+        .u16(alg::TPM_ALG_SHA256);
+    let r = tpm.process(&command(
+        TPM_CC_START_AUTH_SESSION,
+        &[TPM_RH_NULL, bind],
+        None,
+        &p.into_bytes(),
+    ));
+    assert_eq!(rc(&r), 0);
+    let handle = u32::from_be_bytes(r[10..14].try_into().unwrap());
+    assert_eq!(r[14..16], [0, 16], "nonceTPM is as long as nonceCaller");
+    (handle, r[16..32].to_vec())
+}
+
+#[test]
+fn an_hmac_session_authorizes_and_rolls_its_nonce() {
+    let mut tpm = started();
+    tpm.process(&change_auth(TPM_RH_ENDORSEMENT, b"", b"e"));
+    let (handle, mut nonce_tpm) = start_session(&mut tpm, TPM_RH_ENDORSEMENT, &[0, 0x10], 1);
+    assert_eq!(handle, 0x0200_0000);
+    let hash = alg::Hash::Sha256;
+    let key = crypt::kdfa(hash, b"e", b"ATH", &nonce_tpm, &[1; 16], 32);
+    let params = tpm2b(b"e");
+    for (round, nonce_caller) in [[2u8; 16], [3; 16]].iter().enumerate() {
+        // Bound to the endorsement hierarchy: its authValue is in the key already.
+        let code = TPM_CC_HIERARCHY_CHANGE_AUTH.to_be_bytes();
+        let name = TPM_RH_ENDORSEMENT.to_be_bytes();
+        let cp_hash = hash.digest(&[&code, &name, &params]);
+        let hmac = crypt::hmac(hash, &key, &[&cp_hash, nonce_caller, &nonce_tpm, &[1]]);
+        let mut area = Writer::new();
+        area.u32(handle).tpm2b(nonce_caller).u8(1).tpm2b(&hmac);
+        let area = area.into_bytes();
+        let mut c = Writer::new();
+        c.u16(TPM_ST_SESSIONS)
+            .u32(0)
+            .u32(TPM_CC_HIERARCHY_CHANGE_AUTH)
+            .u32(TPM_RH_ENDORSEMENT);
+        c.count(area.len()).bytes(&area).bytes(&params);
+        let mut c = c.into_bytes();
+        let len = c.len() as u32;
+        c[2..6].copy_from_slice(&len.to_be_bytes());
+        let r = tpm.process(&c);
+        assert_eq!(rc(&r), 0, "round {round}");
+        // parameterSize 0, then the new nonce, the attributes and the TPM's HMAC.
+        assert_eq!(r[10..16], [0, 0, 0, 0, 0, 16]);
+        let new_nonce = r[16..32].to_vec();
+        assert_ne!(new_nonce, nonce_tpm);
+        let code = TPM_CC_HIERARCHY_CHANGE_AUTH.to_be_bytes();
+        let rp_hash = hash.digest(&[&[0; 4], &code]);
+        let expected = crypt::hmac(hash, &key, &[&rp_hash, &new_nonce, nonce_caller, &[1]]);
+        assert_eq!(r[33..35], [0, 32]);
+        assert_eq!(r[35..], expected[..]);
+        nonce_tpm = new_nonce;
+        // The old nonce no longer works.
+        assert_eq!(rc(&tpm.process(&c)), Rc::BAD_AUTH.session(1).0);
+    }
+}
+
+#[test]
+fn sessions_fill_their_slots_and_survive_a_snapshot() {
+    let mut tpm = started();
+    let handles: Vec<u32> = (0..3)
+        .map(|n| start_session(&mut tpm, TPM_RH_NULL, &[0, 0x0a, 0, 0x0b], n).0)
+        .collect();
+    assert_eq!(handles, [0x0200_0000, 0x0200_0001, 0x0200_0002]);
+    let mut p = Writer::new();
+    p.tpm2b(&[9; 16])
+        .tpm2b(&[])
+        .u8(1)
+        .u16(alg::TPM_ALG_NULL)
+        .u16(alg::TPM_ALG_SHA1);
+    let policy = command(
+        TPM_CC_START_AUTH_SESSION,
+        &[TPM_RH_NULL, TPM_RH_NULL],
+        None,
+        &p.into_bytes(),
+    );
+    assert_eq!(rc(&tpm.process(&policy)), Rc::SESSION_MEMORY.0);
+    tpm.process(&command(TPM_CC_FLUSH_CONTEXT, &[], None, &[2, 0, 0, 1]));
+    let r = tpm.process(&policy);
+    assert_eq!(
+        r[10..14],
+        [3, 0, 0, 1],
+        "a policy session in the freed handle"
+    );
+
+    let mut restored = Tpm::restore(&tpm.permanent_state(), &tpm.volatile_state()).unwrap();
+    assert_eq!(
+        restored.loaded_sessions(0),
+        [0x0200_0000, 0x0300_0001, 0x0200_0002]
+    );
+    // An unbound, unsalted session has no key: the empty HMAC authorizes an empty authValue.
+    let mut area = Writer::new();
+    area.u32(0x0200_0002).tpm2b(&[1; 16]).u8(1).tpm2b(&[]);
+    let area = area.into_bytes();
+    let mut c = Writer::new();
+    c.u16(TPM_ST_SESSIONS)
+        .u32(0)
+        .u32(TPM_CC_HIERARCHY_CHANGE_AUTH)
+        .u32(TPM_RH_OWNER);
+    c.count(area.len()).bytes(&area).u16(0);
+    let mut c = c.into_bytes();
+    let len = c.len() as u32;
+    c[2..6].copy_from_slice(&len.to_be_bytes());
+    assert_eq!(rc(&restored.process(&c)), 0);
+    // Startup flushes them all.
+    restored.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 0]));
+    let mut next = power_cycle(&restored, 0);
+    assert!(next.loaded_sessions(0).is_empty());
+    assert_eq!(rc(&next.process(&c)), Rc::REFERENCE_S0.0);
 }
