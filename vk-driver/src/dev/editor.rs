@@ -1159,20 +1159,8 @@ mod tests {
         assert!(lock_holder(&plan).is_some());
         assert!(status(&plan).contains("running"), "{}", status(&plan));
         drop(held);
-        // A just-released flock can still be listed while a child another test was spawning
-        // holds a copy of the descriptor, until that child execs: give it a few seconds.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let released = loop {
-            if lock_holder(&plan).is_none() {
-                break true;
-            }
-            if std::time::Instant::now() >= deadline {
-                break false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
         assert!(
-            released,
+            crate::testutil::released(|| lock_holder(&plan).is_none()),
             "lock still held after drop: {:?}",
             lock_holder(&plan)
         );

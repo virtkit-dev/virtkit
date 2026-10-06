@@ -642,7 +642,7 @@ mod tests {
         assert!(err.is::<Locked>());
         assert!(format!("{err:#}").contains("another `vk node`"), "{err:#}");
         drop(held);
-        lock(&dir).unwrap();
+        crate::testutil::once_released("another `vk node`", || lock(&dir)).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

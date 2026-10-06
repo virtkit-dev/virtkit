@@ -437,7 +437,7 @@ fn run_env(env: &Env, opts: &Options, confirm: impl FnOnce() -> Result<bool>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dev::testutil::once_released;
+    use crate::testutil::once_released;
     use std::os::unix::fs::symlink;
 
     /// What a prune says when it finds a state directory's lock held.
@@ -794,47 +794,42 @@ mod tests {
     #[test]
     fn symlinked_selected_paths_are_refused_but_links_inside_storage_are_not_followed() {
         let mut f = fixture("symlinks");
+        // Previous runs' dropped locks can remain held: see `once_released`.
+        // Wait for release so contention cannot masquerade as a refusal.
+        let prune = |plan: &Plan, storage| {
+            once_released(IN_USE, || {
+                run(
+                    plan,
+                    &Options {
+                        storage,
+                        yes: true,
+                        ..Default::default()
+                    },
+                )
+            })
+        };
         let link = f.plan.state_dir.join("root.qcow2");
         std::fs::remove_file(&link).unwrap();
         symlink(f.plan.workspace.join("external.qcow2"), &link).unwrap();
+        let e = prune(&f.plan, false).unwrap_err();
         assert!(
-            run(
-                &f.plan,
-                &Options {
-                    yes: true,
-                    ..Default::default()
-                }
-            )
-            .is_err()
+            format!("{e:#}").contains("root.qcow2 is a symlink or an unexpected file type"),
+            "{e:#}"
         );
         std::fs::remove_file(link).unwrap();
         symlink(&f.plan.workspace, f.plan.state_dir.join("escape")).unwrap();
         f.plan
             .managed_dirs
             .push(f.plan.state_dir.join("escape/subdir"));
+        let e = prune(&f.plan, true).unwrap_err();
         assert!(
-            run(
-                &f.plan,
-                &Options {
-                    storage: true,
-                    yes: true,
-                    ..Default::default()
-                }
-            )
-            .is_err()
+            format!("{e:#}").contains("prune path contains a symlink"),
+            "{e:#}"
         );
         assert!(f.plan.state_dir.join("data.qcow2").exists());
         f.plan.managed_dirs.pop();
         symlink(&f.plan.workspace, f.plan.state_dir.join("cache/link")).unwrap();
-        run(
-            &f.plan,
-            &Options {
-                storage: true,
-                yes: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        prune(&f.plan, true).unwrap();
         assert!(f.plan.workspace.join("external.qcow2").exists());
     }
 

@@ -1293,7 +1293,7 @@ mod tests {
 
         // Kernel lock release makes even an abruptly killed publisher read as dead.
         drop(lock);
-        assert!(live_entries(&t.0).is_empty());
+        assert!(crate::testutil::released(|| live_entries(&t.0).is_empty()));
     }
 
     #[tokio::test]

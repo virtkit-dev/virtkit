@@ -789,18 +789,16 @@ mod tests {
         std::fs::write(&disk, b"data").unwrap();
         // The symlinked reset above took the lock too, so a forked copy of it can refuse this
         // one.
-        let report = crate::dev::testutil::once_released("being booted", || {
+        let report = crate::testutil::once_released("being booted", || {
             rt.block_on(reset(&plan, "runner:/var/wab", true))
         })
         .unwrap();
         assert!(report.contains("removed"), "{report}");
         assert!(!disk.exists(), "the backing survived the reset");
-        let freed = crate::dev::testutil::once_released("still held", || {
-            crate::dev::list::try_lock_state_dir(&plan.state_dir)
-                .map(drop)
-                .ok_or_else(|| anyhow::anyhow!("still held"))
+        let freed = crate::testutil::released(|| {
+            crate::dev::list::try_lock_state_dir(&plan.state_dir).is_some()
         });
-        assert!(freed.is_ok(), "the lock was not handed back");
+        assert!(freed, "the lock was not handed back");
     }
 
     #[test]
@@ -824,7 +822,7 @@ mod tests {
         assert!(format!("{e:#}").contains("being booted"), "{e:#}");
         assert!(disk.is_file(), "nothing was removed under the boot");
         drop(held);
-        let retried = crate::dev::testutil::once_released("being booted", || {
+        let retried = crate::testutil::once_released("being booted", || {
             rt.block_on(reset(&plan, "runner:/var/wab", true))
         });
         assert!(retried.is_ok(), "{retried:?}");
