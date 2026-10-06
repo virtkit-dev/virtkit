@@ -13,16 +13,20 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::alg::{Hash, MAX_DIGEST, TPM_ALG_NULL};
-use crate::commands::{Command, Role, end, is_write_operation};
+use crate::commands::{
+    Command, Role, TPM_CC_CREATE, TPM_CC_CREATE_LOADED, TPM_CC_CREATE_PRIMARY,
+    TPM_CC_POLICY_SECRET, end, is_write_operation,
+};
 use crate::crypt;
 use crate::entity::{
     TPM_HT_NV_INDEX, TPM_HT_POLICY_SESSION, TPM_HT_TRANSIENT, TPM_RH_LOCKOUT, TPM_RH_NULL,
     TPM_RS_PW, handle_type, is_session, strip_zeros,
 };
 use crate::marshal::{Reader, Writer};
+use crate::nv;
 use crate::rc::{Rc, Result};
 use crate::state::{StateError, read_bool};
-use crate::{Out, Tpm};
+use crate::{LOCALITY, Out, Tpm};
 
 /// How many sessions the TPM holds at once (MAX_LOADED_SESSIONS, as libtpms).
 pub const MAX_LOADED: usize = 3;
@@ -91,6 +95,125 @@ pub struct Session {
     pub audit: Option<Vec<u8>>,
     /// A policy session's policyDigest.
     pub policy_digest: Vec<u8>,
+    /// Additional authorization requirements from the policy commands so far.
+    pub policy: PolicyState,
+    /// TPM time when the session started or was last used (policy expirations count from it),
+    /// and the time epoch then.
+    pub start_time: u64,
+    pub epoch: u32,
+}
+
+/// What a policy session's commands require besides its policyDigest (the reference's SESSION
+/// fields and attributes that SessionResetPolicyData clears).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PolicyState {
+    /// TPM2_PolicyCommandCode: the only command the session may authorize (0: any).
+    pub command_code: u32,
+    /// TPM2_PolicyLocality: the TPMA_LOCALITY the command must come from (0: any).
+    pub locality: u8,
+    /// What the command must be: its cpHash, the hash of its handles' Names, or the hash of the
+    /// template it creates (the reference's u1 union).
+    pub bound: Option<(Bound, Vec<u8>)>,
+    /// TPM time after which the session authorizes nothing (0: never).
+    pub timeout: u64,
+    /// TPM2_PolicyPCR: the PCR update counter then; any change voids the session (0: none).
+    pub pcr_counter: u32,
+    /// TPM2_PolicyAuthValue: the HMAC also proves the authValue.
+    pub auth_value_needed: bool,
+    /// TPM2_PolicyPassword: the authValue comes in clear.
+    pub password_needed: bool,
+    /// TPM2_PolicyPhysicalPresence: never satisfied here (no physical presence).
+    pub pp_required: bool,
+    /// TPM2_PolicyNvWritten: the NV index's TPMA_NV_WRITTEN must be this.
+    pub nv_written: Option<bool>,
+}
+
+/// What [`PolicyState::bound`] holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bound {
+    CpHash,
+    Names,
+    Template,
+}
+
+impl PolicyState {
+    /// What the policy commands of a session hashing with `hash` can have left: a cpHash, Names
+    /// hash or template hash of its digest size, and the authValue asked for once at most. (Any
+    /// locality can be: TPMA_LOCALITY bits below 32, an extended locality above.)
+    fn fits(&self, hash: Hash) -> bool {
+        self.bound
+            .as_ref()
+            .is_none_or(|(_, d)| d.len() == hash.size())
+            && !(self.auth_value_needed && self.password_needed)
+    }
+
+    fn write(&self, w: &mut Writer) {
+        w.u32(self.command_code).u8(self.locality);
+        match &self.bound {
+            None => w.u8(0),
+            Some((kind, digest)) => {
+                let kind = match kind {
+                    Bound::CpHash => 1,
+                    Bound::Names => 2,
+                    Bound::Template => 3,
+                };
+                w.u8(kind).tpm2b(digest)
+            }
+        };
+        w.u64(self.timeout).u32(self.pcr_counter);
+        let nv = match self.nv_written {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        };
+        w.u8(self.auth_value_needed.into())
+            .u8(self.password_needed.into())
+            .u8(self.pp_required.into())
+            .u8(nv);
+    }
+
+    fn read(r: &mut Reader) -> std::result::Result<PolicyState, StateError> {
+        let (command_code, locality) = (r.u32()?, r.u8()?);
+        let kind = match r.u8()? {
+            0 => None,
+            1 => Some(Bound::CpHash),
+            2 => Some(Bound::Names),
+            3 => Some(Bound::Template),
+            _ => return Err(StateError("bad session")),
+        };
+        let bound = match kind {
+            Some(kind) => Some((kind, r.tpm2b(MAX_DIGEST)?.to_vec())),
+            None => None,
+        };
+        let (timeout, pcr_counter) = (r.u64()?, r.u32()?);
+        let (auth_value_needed, password_needed) = (read_bool(r)?, read_bool(r)?);
+        let pp_required = read_bool(r)?;
+        let nv_written = match r.u8()? {
+            0 => None,
+            1 => Some(false),
+            2 => Some(true),
+            _ => return Err(StateError("bad session")),
+        };
+        Ok(PolicyState {
+            command_code,
+            locality,
+            bound,
+            timeout,
+            pcr_counter,
+            auth_value_needed,
+            password_needed,
+            pp_required,
+            nv_written,
+        })
+    }
+}
+
+impl Session {
+    /// SessionResetPolicyData: the policy starts over (TPM2_PolicyRestart, or after a use).
+    pub fn reset_policy(&mut self) {
+        self.policy_digest.fill(0);
+        self.policy = PolicyState::default();
+    }
 }
 
 impl Session {
@@ -119,6 +242,8 @@ impl Session {
             None => w.u8(0),
         };
         w.tpm2b(&self.policy_digest);
+        self.policy.write(w);
+        w.u64(self.start_time).u32(self.epoch);
     }
 
     /// A session of a stored volatile state, checked as SessionCreate and the commands leave
@@ -155,11 +280,17 @@ impl Session {
             None
         };
         let policy_digest = r.tpm2b(MAX_DIGEST)?.to_vec();
-        let policy_size = if kind == Kind::Hmac { 0 } else { hash.size() };
+        let policy = PolicyState::read(r)?;
+        let (policy_size, policy_valid) = if kind == Kind::Hmac {
+            (0, policy == PolicyState::default())
+        } else {
+            (hash.size(), policy.fits(hash))
+        };
         if !(16..=hash.size()).contains(&nonce_tpm.len())
             || !(key.is_empty() || key.len() == hash.size())
             || audit.as_ref().is_some_and(|d| d.len() != hash.size())
             || policy_digest.len() != policy_size
+            || !policy_valid
         {
             return Err(bad);
         }
@@ -174,6 +305,9 @@ impl Session {
             lockout_bound,
             audit,
             policy_digest,
+            policy,
+            start_time: r.u64()?,
+            epoch: r.u32()?,
         })
     }
 }
@@ -275,7 +409,7 @@ impl Tpm {
         }
     }
 
-    fn session_mut(&mut self, handle: u32) -> Result<&mut Session> {
+    pub fn session_mut(&mut self, handle: u32) -> Result<&mut Session> {
         match self.volatile.sessions.get_mut(index(handle)) {
             Some(SessionSlot::Loaded(s)) => Ok(s),
             _ => Err(Rc::FAILURE),
@@ -538,9 +672,9 @@ impl Tpm {
                 let bound = s.bound.as_deref();
                 !bound.is_some_and(|b| b.ct_eq(&self.bind_value(entity)).into())
             }
-            // A policy session uses the authValue only if a policy command asked for it (none
-            // can yet).
-            Some(_) => false,
+            // A policy session uses the authValue only if TPM2_PolicyAuthValue or
+            // TPM2_PolicyPassword asked for it.
+            Some(s) => s.policy.auth_value_needed || s.policy.password_needed,
         };
         let kind = session.map(|s| s.kind);
         if let Some(u) = a.uses.get_mut(i) {
@@ -555,6 +689,8 @@ impl Tpm {
             if !self.auth_policy_available(entity, role, a.write) {
                 return Err(Rc::AUTH_UNAVAILABLE);
             }
+            let session = self.use_session(a.uses.get(i).ok_or(Rc::FAILURE)?)?;
+            self.check_policy_session(session, a, entity, role)?;
         } else {
             if self.policy_required(entity, role) {
                 return Err(Rc::AUTH_TYPE);
@@ -563,31 +699,16 @@ impl Tpm {
                 return Err(Rc::AUTH_UNAVAILABLE);
             }
         }
-        let result = match kind {
-            None => {
-                let u = a.uses.get(i).ok_or(Rc::FAILURE)?;
-                if password_matches(&u.auth, &self.entity_auth(entity)) {
-                    Ok(())
-                } else {
-                    Err(self.authorization_failed(a, i))
-                }
+        let password = kind.is_none() || self.password_needed(u_handle(a, i)?);
+        let result = if password {
+            let u = a.uses.get(i).ok_or(Rc::FAILURE)?;
+            if password_matches(&u.auth, &self.entity_auth(entity)) {
+                Ok(())
+            } else {
+                Err(self.authorization_failed(a, i))
             }
-            Some(Kind::Hmac) => self.check_hmac(a, i),
-            Some(_) => {
-                // CheckPolicyAuthSession: the session reached the entity's authPolicy.
-                let session = self.use_session(a.uses.get(i).ok_or(Rc::FAILURE)?)?;
-                let policy = self.entity_policy(entity);
-                let digest_matches: bool = session.policy_digest.ct_eq(&policy.digest).into();
-                if !digest_matches || policy.hash != Some(session.hash) {
-                    return Err(Rc::POLICY_FAIL);
-                }
-                // The ADMIN role needs a policy bound to the command (TPM2_PolicyCommandCode,
-                // not implemented yet).
-                if role != Role::User {
-                    return Err(Rc::POLICY_FAIL);
-                }
-                self.check_hmac(a, i)
-            }
+        } else {
+            self.check_hmac(a, i)
         };
         // A PIN index counts its authorizations: a pass index the successes, a fail index the
         // failures since the last success.
@@ -595,6 +716,79 @@ impl Tpm {
             self.nv_pin_authorized(entity, result.is_ok())?;
         }
         result
+    }
+
+    /// The session asked for the authValue in clear (TPM2_PolicyPassword).
+    fn password_needed(&self, handle: u32) -> bool {
+        self.session(handle)
+            .is_some_and(|s| s.kind != Kind::Hmac && s.policy.password_needed)
+    }
+
+    /// CheckPolicyAuthSession: the policy session reached the entity's authPolicy, and the
+    /// command is one its policy commands allow (code, locality, cpHash or Names or template,
+    /// time, PCRs, NV index written or not). `role` is the role the entity takes.
+    fn check_policy_session(
+        &self,
+        session: &Session,
+        a: &Area,
+        entity: u32,
+        role: Role,
+    ) -> Result<()> {
+        let p = &session.policy;
+        if a.code == TPM_CC_POLICY_SECRET && !p.password_needed && !p.auth_value_needed {
+            return Err(Rc::MODE);
+        }
+        if p.pcr_counter != 0 && p.pcr_counter != self.volatile.pcrs.counter {
+            return Err(Rc::PCR_CHANGED);
+        }
+        let policy = self.entity_policy(entity);
+        let digest_matches: bool = session.policy_digest.ct_eq(&policy.digest).into();
+        if !digest_matches || policy.hash != Some(session.hash) {
+            return Err(Rc::POLICY_FAIL);
+        }
+        if p.timeout != 0
+            && (p.timeout < self.volatile.time || session.epoch != self.permanent.time_epoch)
+        {
+            return Err(Rc::EXPIRED);
+        }
+        if p.command_code != 0 {
+            if p.command_code != a.code {
+                return Err(Rc::POLICY_CC);
+            }
+        } else if role != Role::User {
+            // The ADMIN and DUP roles need a policy bound to the command.
+            return Err(Rc::POLICY_FAIL);
+        }
+        if p.locality != 0 && (p.locality & (1 << LOCALITY) == 0 || p.locality > 31) {
+            return Err(Rc::LOCALITY);
+        }
+        if p.pp_required {
+            return Err(Rc::PP);
+        }
+        if let Some((kind, digest)) = &p.bound {
+            let hash = session.hash;
+            let computed = match kind {
+                Bound::CpHash => Some(a.cp_hash(hash)),
+                Bound::Names => {
+                    let names: Vec<&[u8]> = a.names.iter().map(Vec::as_slice).collect();
+                    Some(hash.digest(&names))
+                }
+                Bound::Template => template_hash(a.code, &a.params, hash),
+            };
+            if !computed.is_some_and(|c| bool::from(c.ct_eq(digest))) {
+                return Err(Rc::POLICY_FAIL);
+            }
+        }
+        if let Some(written) = p.nv_written {
+            let public = (handle_type(entity) == TPM_HT_NV_INDEX)
+                .then(|| self.nv_public(entity))
+                .flatten();
+            let public = public.ok_or(Rc::POLICY_FAIL)?;
+            if public.has(nv::attr::WRITTEN) != written {
+                return Err(Rc::POLICY_FAIL);
+            }
+        }
+        Ok(())
     }
 
     /// CheckSessionHMAC: the HMAC session `i` carries is the one the TPM computes.
@@ -743,18 +937,20 @@ impl Tpm {
                 self.flush_session(u.handle)?;
                 continue;
             }
-            // A policy session starts over once used.
+            // A policy session starts over once used, its expirations counting from now.
+            let (time, epoch) = (self.volatile.time, self.permanent.time_epoch);
             let session = self.session_mut(u.handle)?;
-            if session.kind == Kind::Policy {
-                session.policy_digest.fill(0);
+            if session.kind != Kind::Hmac {
+                session.reset_policy();
+                (session.start_time, session.epoch) = (time, epoch);
             }
         }
         Ok(w.into_bytes())
     }
 
     /// A session's acknowledgment in the response: its new nonce, its attributes and its HMAC
-    /// over rpHash (empty, as the command's, with no key at all). A password session answers
-    /// with an empty nonce and HMAC, and stays open.
+    /// over rpHash (empty, as the command's, with no key at all or after TPM2_PolicyPassword).
+    /// A password session answers with an empty nonce and HMAC, and stays open.
     fn response_auth(&self, a: &Area, u: &Use, params: &[u8], w: &mut Writer) -> Result<()> {
         if u.handle == TPM_RS_PW {
             w.u16(0).u8(u.attributes | CONTINUE_SESSION).u16(0);
@@ -762,7 +958,9 @@ impl Tpm {
         }
         let session = self.use_session(u)?;
         let key = self.hmac_key(session, u);
-        let hmac = if key.is_empty() && u.auth.is_empty() {
+        // No HMAC without a key, nor after TPM2_PolicyPassword.
+        let password = session.policy.password_needed && session.kind != Kind::Hmac;
+        let hmac = if password || (key.is_empty() && u.auth.is_empty()) {
             Vec::new()
         } else {
             let rp_hash = rp_hash(session.hash, a.code, params);
@@ -863,6 +1061,9 @@ impl Tpm {
             } else {
                 vec![0; hash.size()]
             },
+            policy: PolicyState::default(),
+            start_time: self.volatile.time,
+            epoch: self.permanent.time_epoch,
         };
         let slot = self.volatile.sessions.get_mut(i).ok_or(Rc::FAILURE)?;
         *slot = SessionSlot::Loaded(Box::new(session));
@@ -879,6 +1080,28 @@ impl Tpm {
 /// The number of the area's session `i` in a response code (`+ TPM_RC_S + n`): from 1.
 fn session_number(i: usize) -> u32 {
     u32::try_from(i).map_or(u32::MAX, |i| i.saturating_add(1))
+}
+
+/// CompareTemplateHash: the digest of the template (TPM2B_PUBLIC's contents) TPM2_Create,
+/// TPM2_CreatePrimary or TPM2_CreateLoaded carries after its TPM2B_SENSITIVE_CREATE; None for
+/// another command, or parameters too short.
+fn template_hash(code: u32, params: &[u8], hash: Hash) -> Option<Vec<u8>> {
+    if !matches!(
+        code,
+        TPM_CC_CREATE | TPM_CC_CREATE_PRIMARY | TPM_CC_CREATE_LOADED
+    ) {
+        return None;
+    }
+    let mut r = Reader::new(params);
+    let skip = usize::from(r.u16().ok()?);
+    r.bytes(skip).ok()?;
+    let size = usize::from(r.u16().ok()?);
+    Some(hash.digest(&[r.bytes(size).ok()?]))
+}
+
+/// The session handle of session `i` of the area.
+fn u_handle(a: &Area, i: usize) -> Result<u32> {
+    a.uses.get(i).map(|u| u.handle).ok_or(Rc::FAILURE)
 }
 
 /// The contents of the TPM2B a parameter area starts with: what parameter encryption covers.

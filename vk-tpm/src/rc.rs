@@ -25,11 +25,14 @@ impl Rc {
     pub const INITIALIZE: Rc = Rc(RC_VER1);
     pub const FAILURE: Rc = Rc(RC_VER1 + 0x001);
     pub const SEQUENCE: Rc = Rc(RC_VER1 + 0x003);
+    pub const PP: Rc = Rc(RC_VER1 + 0x010);
     pub const DISABLED: Rc = Rc(RC_VER1 + 0x020);
     pub const EXCLUSIVE: Rc = Rc(RC_VER1 + 0x021);
     pub const AUTH_TYPE: Rc = Rc(RC_VER1 + 0x024);
     pub const AUTH_MISSING: Rc = Rc(RC_VER1 + 0x025);
+    pub const POLICY: Rc = Rc(RC_VER1 + 0x026);
     pub const PCR: Rc = Rc(RC_VER1 + 0x027);
+    pub const PCR_CHANGED: Rc = Rc(RC_VER1 + 0x028);
     pub const AUTH_UNAVAILABLE: Rc = Rc(RC_VER1 + 0x02f);
     pub const COMMAND_SIZE: Rc = Rc(RC_VER1 + 0x042);
     pub const COMMAND_CODE: Rc = Rc(RC_VER1 + 0x043);
@@ -40,6 +43,7 @@ impl Rc {
     pub const NV_UNINITIALIZED: Rc = Rc(RC_VER1 + 0x04a);
     pub const NV_SPACE: Rc = Rc(RC_VER1 + 0x04b);
     pub const NV_DEFINED: Rc = Rc(RC_VER1 + 0x04c);
+    pub const CPHASH: Rc = Rc(RC_VER1 + 0x051);
     pub const NO_RESULT: Rc = Rc(RC_VER1 + 0x054);
     pub const SENSITIVE: Rc = Rc(RC_VER1 + 0x055);
 
@@ -67,6 +71,8 @@ impl Rc {
     pub const TICKET: Rc = Rc(RC_FMT1 + 0x020);
     pub const RESERVED_BITS: Rc = Rc(RC_FMT1 + 0x021);
     pub const BAD_AUTH: Rc = Rc(RC_FMT1 + 0x022);
+    pub const EXPIRED: Rc = Rc(RC_FMT1 + 0x023);
+    pub const POLICY_CC: Rc = Rc(RC_FMT1 + 0x024);
     pub const BINDING: Rc = Rc(RC_FMT1 + 0x025);
     pub const CURVE: Rc = Rc(RC_FMT1 + 0x026);
     pub const ECC_POINT: Rc = Rc(RC_FMT1 + 0x027);

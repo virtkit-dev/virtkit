@@ -21,7 +21,7 @@ use crate::rc::{Rc, Result};
 use crate::{Out, Tpm};
 
 /// TPM_ST_VERIFIED, the tag of a TPMT_TK_VERIFIED.
-const TPM_ST_VERIFIED: u16 = 0x8022;
+pub const TPM_ST_VERIFIED: u16 = 0x8022;
 
 /// CryptSelectSignScheme: the scheme a key signs with, from its own and the caller's.
 fn select_sign_scheme(key: &Key, requested: Scheme) -> Option<Scheme> {
@@ -115,13 +115,13 @@ fn write_signature(
 
 /// A TPMT_SIGNATURE: its scheme and hash, and the signature's parts (one for RSA and HMAC, r
 /// and s for ECC).
-struct Signature {
-    alg: u16,
-    hash: Hash,
+pub struct Signature {
+    pub alg: u16,
+    pub hash: Hash,
     parts: Vec<Vec<u8>>,
 }
 
-fn read_signature(r: &mut Reader) -> Result<Signature> {
+pub fn read_signature(r: &mut Reader) -> Result<Signature> {
     // A TPMT_SIGNATURE, not a TPMT_SIGNATURE+: TPM_ALG_NULL is no scheme.
     let alg = r.u16()?;
     if !public::is_sig_scheme(alg) {
@@ -141,7 +141,7 @@ fn read_signature(r: &mut Reader) -> Result<Signature> {
 }
 
 /// CryptValidateSignature.
-fn verify(key: &Key, digest: &[u8], sig: &Signature) -> Result<()> {
+pub fn verify(key: &Key, digest: &[u8], sig: &Signature) -> Result<()> {
     let hash = sig.hash;
     let part = |i: usize| sig.parts.get(i).map_or(&[][..], Vec::as_slice);
     match (&key.public.params, &key.public.unique) {
