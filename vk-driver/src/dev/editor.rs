@@ -1228,9 +1228,11 @@ mod tests {
         std::fs::write(data.join(crate::dev::GENERATION_MARKER), b"gen").unwrap();
         // A "server": a process run by its path under the directory, as the real one's
         // `node` is, so its command line names the directory. A script rather than a link
-        // to `sleep`, so that argv[0] stays the path (busybox would dispatch on it).
+        // to `sleep`, so that argv[0] stays the path (busybox would dispatch on it). It never
+        // ends on its own: a bounded sleep could run out while a loaded host's reset is still
+        // scanning `/proc`, and its exit would read as the reset having missed it.
         let node = data.join("bin/abc/node");
-        std::fs::write(&node, "#!/bin/sh\nsleep 5\n").unwrap();
+        std::fs::write(&node, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
         std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut server = std::process::Command::new(&node).spawn().unwrap();
 
@@ -1258,7 +1260,8 @@ mod tests {
             [crate::dev::GENERATION_MARKER],
             "the generation marker is the boot's, not the server's"
         );
-        // Stopped by the reset, not gone on its own: the signal says which.
+        // Reset sends SIGTERM. Kill a missed server so the assertion fails without hanging.
+        let _ = server.kill();
         let status = server.wait().unwrap();
         assert_eq!(status.signal(), Some(libc::SIGTERM), "{status}");
 
