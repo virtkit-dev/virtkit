@@ -14,8 +14,9 @@ use crate::commands::{end, first, write_digest_values};
 use crate::crypt;
 use crate::entity::{TPM_RH_ENDORSEMENT, TPM_RH_NULL, TPM_RH_OWNER, TPM_RH_PLATFORM, strip_zeros};
 use crate::hierarchy::Auth;
-use crate::key::Key;
+use crate::key::{Key, hash_block_size};
 use crate::marshal::{Reader, Writer};
+use crate::public::{Params, TPM_ALG_CMAC, Type, attr};
 use crate::rc::{Rc, Result};
 use crate::state::{StateError, read_bool};
 use crate::{Out, Tpm};
@@ -37,7 +38,7 @@ pub enum Object {
     Key(Box<Key>),
 }
 
-/// A hash or event sequence: data in, digests out at the end.
+/// A hash, HMAC or event sequence: data in, digests out at the end.
 pub struct Sequence {
     pub auth: Auth,
     pub kind: SequenceKind,
@@ -53,6 +54,13 @@ pub enum SequenceKind {
     },
     /// An event sequence: one digest per PCR bank.
     Event { hashers: Vec<Hasher> },
+    /// An HMAC sequence (TPM2_HMAC_Start), kept as RFC 2104 has it so it can be saved: the
+    /// inner hash, started with the key XOR ipad, and the key (padded to the hash's block) the
+    /// outer hash needs at the end.
+    Hmac {
+        inner: Box<Hasher>,
+        key: Zeroizing<Vec<u8>>,
+    },
 }
 
 impl Object {
@@ -81,6 +89,10 @@ impl Object {
                     w.u16(h.hash().id()).tpm2b(&h.save());
                 }
             }
+            SequenceKind::Hmac { inner, key } => {
+                w.u8(2).u16(inner.hash().id()).tpm2b(&inner.save());
+                w.tpm2b(key);
+            }
         }
     }
 
@@ -107,6 +119,10 @@ impl Object {
                         .collect::<std::result::Result<_, _>>()?,
                 }
             }
+            2 => SequenceKind::Hmac {
+                inner: Box::new(hasher(r)?),
+                key: Zeroizing::new(r.tpm2b(128)?.to_vec()),
+            },
             _ => return Err(StateError("bad object")),
         };
         Ok(Object::Sequence(Sequence { auth, kind }))
@@ -325,11 +341,13 @@ pub fn sequence_update(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, _: &mut O
                 h.update(data);
             }
         }
+        SequenceKind::Hmac { inner, .. } => inner.update(data),
     }
     Ok(())
 }
 
-/// TPM2_SequenceComplete: a hash sequence's digest and ticket. The sequence is flushed.
+/// TPM2_SequenceComplete: a hash sequence's digest and ticket, or an HMAC sequence's HMAC. The
+/// sequence is flushed.
 pub fn sequence_complete(
     tpm: &mut Tpm,
     handles: &[u32],
@@ -362,6 +380,12 @@ pub fn sequence_complete(
             } else {
                 tpm.write_hash_check(hierarchy, hash, &digest, w);
             }
+        }
+        SequenceKind::Hmac { inner, key } => {
+            let mut inner = Hasher::clone(inner);
+            inner.update(data);
+            w.tpm2b(&hmac_finish(inner, key));
+            null_ticket(w);
         }
         SequenceKind::Event { .. } => return Err(Rc::MODE.handle(1)),
     }
@@ -398,4 +422,126 @@ pub fn event_sequence_complete(
     write_digest_values(w, &digests);
     w.flush = Some(handle);
     Ok(())
+}
+
+const IPAD: u8 = 0x36;
+const OPAD: u8 = 0x5c;
+
+/// The HMAC key padded to the hash's block (hashed first if longer): RFC 2104's K0.
+fn hmac_key(hash: Hash, key: &[u8]) -> Zeroizing<Vec<u8>> {
+    let block = hash_block_size(hash);
+    let mut k = Zeroizing::new(if key.len() > block {
+        hash.digest(&[key])
+    } else {
+        key.to_vec()
+    });
+    k.resize(block, 0);
+    k
+}
+
+/// An HMAC sequence's inner hash, started.
+fn hmac_start(hash: Hash, key: &[u8]) -> (Box<Hasher>, Zeroizing<Vec<u8>>) {
+    let k = hmac_key(hash, key);
+    let ipad = Zeroizing::new(k.iter().map(|b| b ^ IPAD).collect::<Vec<u8>>());
+    let mut inner = Hasher::new(hash);
+    inner.update(&ipad);
+    (Box::new(inner), k)
+}
+
+/// The HMAC: H(K0 ^ opad ‖ inner).
+fn hmac_finish(inner: Hasher, key: &[u8]) -> Vec<u8> {
+    let hash = inner.hash();
+    let inner = inner.finish();
+    let opad = Zeroizing::new(key.iter().map(|b| b ^ OPAD).collect::<Vec<u8>>());
+    hash.digest(&[&opad, &inner])
+}
+
+/// TPMI_ALG_MAC_SCHEME+: a hash for an HMAC (or CMAC, which vk-tpm does not implement); None
+/// for TPM_ALG_NULL.
+fn read_mac_scheme(r: &mut Reader) -> Result<Option<u16>> {
+    match r.u16()? {
+        crate::alg::TPM_ALG_NULL => Ok(None),
+        TPM_ALG_CMAC => Ok(Some(TPM_ALG_CMAC)),
+        id if Hash::from_id(id).is_some() => Ok(Some(id)),
+        _ => Err(Rc::SYMMETRIC),
+    }
+}
+
+/// CryptSelectMac and the key checks of TPM2_MAC and TPM2_MAC_Start (TPM2_HMAC and
+/// TPM2_HMAC_Start, the same commands before CMAC): the key and the hash to HMAC with.
+fn mac_key(tpm: &Tpm, handle: u32, scheme: Option<u16>) -> Result<(Hash, Zeroizing<Vec<u8>>)> {
+    let key = tpm.key(handle).ok_or(Rc::TYPE.handle(1))?;
+    let own = match &key.public.params {
+        Params::KeyedHash(s) => s.hash.map(Hash::id),
+        Params::SymCipher(def) => Some(def.mode).filter(|&m| m != crate::alg::TPM_ALG_NULL),
+        _ => return Err(Rc::TYPE.handle(1)),
+    };
+    let mac = match (scheme, own) {
+        (Some(s), Some(o)) if s != o => return Err(Rc::VALUE.param(2)),
+        (Some(s), _) => s,
+        (None, Some(o)) => o,
+        (None, None) => return Err(Rc::VALUE.param(2)),
+    };
+    // A symmetric key would do CMAC, not implemented; a keyed hash takes a hash.
+    let hash = match (key.public.kind(), Hash::from_id(mac)) {
+        (Type::KeyedHash, Some(hash)) => hash,
+        _ => return Err(Rc::SCHEME.param(2)),
+    };
+    if key.public.has(attr::RESTRICTED) {
+        return Err(Rc::ATTRIBUTES.handle(1));
+    }
+    if !key.public.has(attr::SIGN) {
+        return Err(Rc::KEY.handle(1));
+    }
+    let secret = key.sensitive.as_ref().map_or(&[][..], |s| &s.secret);
+    Ok((hash, Zeroizing::new(secret.to_vec())))
+}
+
+/// TPM2_HMAC_Start (TPM2_MAC_Start): an HMAC sequence with a keyed-hash key.
+pub fn hmac_start_command(
+    tpm: &mut Tpm,
+    handles: &[u32],
+    r: &mut Reader,
+    w: &mut Out,
+) -> Result<()> {
+    let auth = Zeroizing::new(strip_zeros(r.tpm2b(MAX_DIGEST).map_err(|rc| rc.param(1))?).to_vec());
+    let scheme = read_mac_scheme(r).map_err(|rc| rc.param(2))?;
+    end(r)?;
+    let (hash, key) = mac_key(tpm, first(handles)?, scheme)?;
+    let (inner, key) = hmac_start(hash, &key);
+    let kind = SequenceKind::Hmac { inner, key };
+    w.handle = Some(tpm.load_object(Object::Sequence(Sequence { auth, kind }))?);
+    Ok(())
+}
+
+/// TPM2_HMAC (TPM2_MAC): the HMAC of a buffer, in one command.
+pub fn hmac(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, w: &mut Out) -> Result<()> {
+    let data = r.tpm2b(MAX_BUFFER).map_err(|rc| rc.param(1))?;
+    let scheme = read_mac_scheme(r).map_err(|rc| rc.param(2))?;
+    end(r)?;
+    let (hash, key) = mac_key(tpm, first(handles)?, scheme)?;
+    w.tpm2b(&crypt::hmac(hash, &key, &[data]));
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_hmac_sequence_is_hmac() {
+        for hash in Hash::ALL {
+            for key in [&b"k"[..], &[7; 200]] {
+                let (mut inner, k) = hmac_start(hash, key);
+                inner.update(b"some ");
+                let saved = Hasher::load(hash, &inner.save()).unwrap();
+                let mut inner = saved;
+                inner.update(b"data");
+                assert_eq!(
+                    hmac_finish(inner, &k),
+                    crypt::hmac(hash, key, &[b"some data"])
+                );
+            }
+        }
+    }
 }

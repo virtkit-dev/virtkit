@@ -34,8 +34,10 @@ pub const TPM_CC_SHUTDOWN: u32 = 0x145;
 pub const TPM_CC_OBJECT_CHANGE_AUTH: u32 = 0x150;
 pub const TPM_CC_CREATE: u32 = 0x153;
 pub const TPM_CC_ECDH_ZGEN: u32 = 0x154;
+pub const TPM_CC_HMAC: u32 = 0x155;
 pub const TPM_CC_LOAD: u32 = 0x157;
 pub const TPM_CC_RSA_DECRYPT: u32 = 0x159;
+pub const TPM_CC_HMAC_START: u32 = 0x15b;
 pub const TPM_CC_SEQUENCE_UPDATE: u32 = 0x15c;
 pub const TPM_CC_SIGN: u32 = 0x15d;
 pub const TPM_CC_UNSEAL: u32 = 0x15e;
@@ -261,6 +263,10 @@ pub const COMMANDS: &[Command] = &[
         .handles(&[H::Object(false)], 1)
         .decrypt()
         .encrypt(),
+    Command::new(TPM_CC_HMAC, object::hmac)
+        .handles(&[H::Object(false)], 1)
+        .decrypt()
+        .encrypt(),
     Command::new(TPM_CC_LOAD, key::load)
         .handles(&[H::Object(false)], 1)
         .response_handle()
@@ -270,6 +276,10 @@ pub const COMMANDS: &[Command] = &[
         .handles(&[H::Object(false)], 1)
         .decrypt()
         .encrypt(),
+    Command::new(TPM_CC_HMAC_START, object::hmac_start_command)
+        .handles(&[H::Object(false)], 1)
+        .response_handle()
+        .decrypt(),
     Command::new(TPM_CC_SEQUENCE_UPDATE, object::sequence_update)
         .handles(&[H::Object(false)], 1)
         .decrypt(),

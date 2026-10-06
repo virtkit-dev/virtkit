@@ -146,6 +146,7 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_VERIFY_SIGNATURE => &[0, 0, 0, 0x10],
             TPM_CC_RSA_ENCRYPT | TPM_CC_RSA_DECRYPT => &[0, 0, 0, 0x10, 0, 0],
             TPM_CC_ECDH_ZGEN => &[0, 4, 0, 0, 0, 0],
+            TPM_CC_HMAC | TPM_CC_HMAC_START => &[0, 0, 0, 0x10],
             TPM_CC_ECC_PARAMETERS => &[0, 3],
             TPM_CC_GET_CAPABILITY => &[0, 0, 0, 6, 0, 0, 1, 0, 0, 0, 0, 1],
             TPM_CC_GET_RANDOM | TPM_CC_STARTUP | TPM_CC_SHUTDOWN => &[0, 0],
