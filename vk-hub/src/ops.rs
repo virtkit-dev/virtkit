@@ -234,6 +234,13 @@ pub struct RolloutPlan {
 /// nodes [`crate::rollout::ineligible`] are skipped from the start, so canaries are picked
 /// among the rest.
 pub fn create_rollout(hub: &Hub, actor: &str, plan: &RolloutPlan) -> Result<Rollout> {
+    let (release, nodes) = plan_rollout(hub, plan)?;
+    start_rollout(hub, actor, plan, &release, nodes)
+}
+
+/// What [`create_rollout`] would start, without starting it: the release, and its nodes by
+/// wave, with those it skips and why.
+pub fn plan_rollout(hub: &Hub, plan: &RolloutPlan) -> Result<(Release, Vec<RolloutNode>)> {
     if plan.batch == 0 {
         bail!("a batch is at least one node");
     }
@@ -301,6 +308,17 @@ pub fn create_rollout(hub: &Hub, actor: &str, plan: &RolloutPlan) -> Result<Roll
                 status: NodeStatus::Skipped { reason },
             }),
     );
+    Ok((release, nodes))
+}
+
+/// Start the rollout [`plan_rollout`] planned, as `actor`.
+pub fn start_rollout(
+    hub: &Hub,
+    actor: &str,
+    plan: &RolloutPlan,
+    release: &Release,
+    nodes: Vec<RolloutNode>,
+) -> Result<Rollout> {
     let now = crate::now_secs();
     let row = RolloutRow {
         release: release.sha256.clone(),

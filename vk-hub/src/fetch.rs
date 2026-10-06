@@ -1,5 +1,5 @@
-//! `vk-hub release fetch`: the hub downloads the `vk` of a virtkit release published on GitHub
-//! and holds it as if `release add` had been given it.
+//! `vk-hub release fetch` and `/operations`' fetch form: the hub downloads the `vk` of a
+//! virtkit release published on GitHub and holds it as if `release add` had been given it.
 //!
 //! The release is resolved, and its `vk` downloaded and checked, by `vk-selfupdate` — the code
 //! `vk update` replaces a binary with — so a fetch passes the same gates an update does short
@@ -16,9 +16,10 @@
 //! trust instead: a fetched release carries none, as official releases are not signed yet, so
 //! a node that requires one refuses it, as it refuses an unsigned `release add`.
 //!
-//! One fetch runs at a time, in the background, and is audited. Asking which release is the
-//! latest is one request at a time too, and answered from the last answer for
-//! [`CHECK_INTERVAL`]: the API allows an unauthenticated caller 60 requests an hour.
+//! One fetch runs at a time, in the background; its progress and outcome are kept for the
+//! pages and audited. Asking which release is the latest is one request at a time too, and
+//! answered from the last answer for [`CHECK_INTERVAL`]: the API allows an unauthenticated
+//! caller 60 requests an hour.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -122,7 +123,7 @@ impl Source {
     }
 }
 
-/// A fetch: what was asked for, by whom, and how far it got.
+/// A fetch, as the pages show it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchStatus {
     /// The version asked for; `None` for the latest.
@@ -163,6 +164,8 @@ pub struct Fetches {
     /// `None`: fetching is off.
     source: Option<Source>,
     status: Mutex<Option<FetchStatus>>,
+    /// The latest release the repository named when last asked, and when.
+    latest: Mutex<Option<(String, u64)>>,
     /// When the repository was last asked which release is the latest, and the version it
     /// named or why asking failed; held while asking, so one request is out at a time.
     checked: tokio::sync::Mutex<Option<(tokio::time::Instant, Result<String, String>)>>,
@@ -173,6 +176,7 @@ impl Fetches {
         Fetches {
             source,
             status: Mutex::new(None),
+            latest: Mutex::new(None),
             checked: tokio::sync::Mutex::new(None),
         }
     }
@@ -182,9 +186,13 @@ impl Fetches {
     }
 
     /// The latest fetch, if any since the hub started.
-    #[cfg(test)]
     pub fn status(&self) -> Option<FetchStatus> {
         lock(&self.status).clone()
+    }
+
+    /// The latest release the repository named, and when it was asked.
+    pub fn latest(&self) -> Option<(String, u64)> {
+        lock(&self.latest).clone()
     }
 }
 
@@ -218,7 +226,7 @@ pub fn wanted(version: &str) -> Result<Option<String>> {
 }
 
 /// Start fetching `version`'s `vk` — the latest release's for `None` — as `actor`, in the
-/// background; what it comes to resolves the handle.
+/// background; what it comes to resolves the handle, and is kept for the pages.
 pub fn start(
     hub: &Arc<Hub>,
     actor: &str,
@@ -278,7 +286,7 @@ pub fn start(
     }))
 }
 
-/// Set the running fetch's phase.
+/// Set the running fetch's phase, for the pages.
 fn phase(hub: &Hub, phase: Phase) {
     if let Some(status) = lock(&hub.fetches.status).as_mut() {
         status.phase = phase;
@@ -389,7 +397,7 @@ async fn within<T>(
         })
 }
 
-/// The latest release the repository names.
+/// The latest release the repository names, kept for the pages.
 pub async fn latest(hub: &Hub) -> Result<String> {
     let Some(source) = hub.fetches.source() else {
         bail!("fetching releases is off: the hub's release_repository is \"none\"");
@@ -407,7 +415,10 @@ pub async fn latest(hub: &Hub) -> Result<String> {
         tokio::time::Instant::now(),
         answer.as_ref().map_err(|e| format!("{e:#}")).cloned(),
     ));
-    answer
+    let version = answer?;
+    *lock(&hub.fetches.latest) = Some((version.clone(), crate::now_secs()));
+    hub.touch();
+    Ok(version)
 }
 
 /// Ask `source` which release is the latest.

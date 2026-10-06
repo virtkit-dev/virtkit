@@ -10,9 +10,9 @@
 //! offline with `vk release-key sign` and forwards them. Each node verifies them against
 //! its configured keys; the hub holds no trusted release key.
 //!
-//! A binary reaches the hub two ways, both held to the same checks: `release add` copies a
-//! file on the hub's host ([`add`]); `release fetch` downloads one from GitHub
-//! ([`crate::fetch`]) into a [`Staged`] file here that [`adopt`] takes in.
+//! A binary reaches the hub three ways, all held to the same checks: `release add` copies a
+//! file on the hub's host ([`add`]); the web UI uploads one, and `release fetch` downloads one
+//! from GitHub ([`crate::fetch`]), each into a [`Staged`] file here that [`adopt`] takes in.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -48,7 +48,7 @@ pub fn check_version(version: &str) -> Result<()> {
 
 /// `signature`, trimmed, checked to be what `vk release-key sign` prints: an ed25519
 /// signature in base64. Whether it verifies is each node's to judge, against its own keys.
-fn check_signature(signature: &str) -> Result<String> {
+pub fn check_signature(signature: &str) -> Result<String> {
     let signature = signature.trim();
     match vk_hub_proto::from_base64(signature) {
         Some(sig) if sig.len() == vk_hub_proto::SIGNATURE_LEN => Ok(signature.to_string()),
@@ -77,7 +77,7 @@ fn releases_dir(hub: &Hub) -> Result<&Path> {
 
 /// A file in the releases directory that is not a release yet: removed when dropped, unless
 /// [`publish`] has renamed it into place. A drop is what cleans up after a failure anywhere,
-/// a download given up included.
+/// a client gone mid-upload included.
 pub struct Staged {
     path: PathBuf,
 }
@@ -112,8 +112,9 @@ impl Drop for Staged {
     }
 }
 
-/// Remove the files a hub that stopped mid-add or mid-fetch left in `dir`: every name starting
-/// with `.`, which no release has. Run as the hub starts, before anything could be staging one.
+/// Remove the files a hub that stopped mid-add, mid-upload or mid-fetch left in `dir`: every
+/// name starting with `.`, which no release has. Run as the hub starts, before anything could
+/// be staging one.
 pub fn sweep(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -177,9 +178,9 @@ pub fn add(
     publish(hub, actor, staged, &sha256, size, version, signature)
 }
 
-/// Take the binary `staged` holds — downloaded into it, and closed — into the hub as `version`,
-/// with `signature`, audited as `actor`'s: the same checks as [`add`], read in place, and the
-/// file renamed to its sha256.
+/// Take the binary `staged` holds — uploaded or downloaded into it, and closed — into the hub
+/// as `version`, with `signature`, audited as `actor`'s: the same checks as [`add`], read in
+/// place, and the file renamed to its sha256.
 pub fn adopt(
     hub: &Hub,
     actor: &str,

@@ -129,6 +129,7 @@ pub(super) async fn vm_action(
             }
             _ => "Stop this VM? Its guest powers off, and it is gone until run again.",
         },
+        detail: Html::new(),
         // The `vk run` it was asked about: its pid, and when it started, which tells two
         // apart where the list has no pid.
         asked: vec![("pid", or_dash(w.pid)), ("started", or_dash(w.started_at))],
@@ -258,6 +259,7 @@ pub(super) async fn dev_action(
                 }
             },
             op,
+            detail: Html::new(),
             // The boot it was asked about.
             asked: vec![("booted", or_dash(row.booted_secs))],
         };
@@ -375,6 +377,8 @@ pub(super) struct Ask {
     pub(super) back: String,
     pub(super) op: String,
     pub(super) what: &'static str,
+    /// What it would do, in detail, shown below the question.
+    pub(super) detail: Html,
     pub(super) asked: Asked,
 }
 
@@ -509,6 +513,7 @@ fn confirm(
         h.raw("<div id=\"flash\" hx-swap-oob=\"true\" class=\"error\">")
             .raw(ask.what)
             .raw(" ")
+            .html(&ask.detail)
             .html(&form)
             .raw("</div>");
         return Ok(swap_none(super::html_response(StatusCode::OK, h)));
@@ -518,6 +523,7 @@ fn confirm(
     main.raw("<h1>Confirm</h1><p>")
         .raw(ask.what)
         .raw("</p>")
+        .html(&ask.detail)
         .html(&form)
         .raw("<p><a href=\"")
         .text(&ask.back)

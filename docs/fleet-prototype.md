@@ -611,15 +611,15 @@ directory its workspace is at. Nothing acts on a node's workloads; local mode ac
 
 `ui_addr` in `hub.toml` turns the listener on, with its own `ui_tls_cert` and `ui_tls_key` or
 the node listener's pair, plain HTTP only on loopback, and TLS 1.3 only. The TLS handshake, a
-request's headers and a form's body each have 10 seconds. `ui_url` is the address browsers
-reach it at: sign-in links start with it, and a state-changing request's `Origin` must be it.
-It defaults to `http(s)://<ui_addr>`, and is required when `ui_addr` binds an unspecified
-address. It is `https` whenever the listener has TLS, and `http` only for `localhost`,
-`127.0.0.0/8` or `[::1]`. It is normalized as a browser writes an origin: lowercase, no path,
-no default port, IPv6 in canonical form; an IPv4-mapped IPv6 address and a numeric host that
-is not a dotted quad are refused. `ui_url`, `ui_tls_cert` or `ui_tls_key` without `ui_addr` is
-an error. An `[oidc]` table adds sign-in through an OIDC provider (see
-[Signing in](#signing-in)).
+request's headers and a form's body each have 10 seconds; a release's upload has limits of its
+own (see below). `ui_url` is the address browsers reach it at: sign-in links start with it, and
+a state-changing request's `Origin` must be it. It defaults to `http(s)://<ui_addr>`, and is
+required when `ui_addr` binds an unspecified address. It is `https` whenever the listener has
+TLS, and `http` only for `localhost`, `127.0.0.0/8` or `[::1]`. It is normalized as a browser
+writes an origin: lowercase, no path, no default port, IPv6 in canonical form; an IPv4-mapped
+IPv6 address and a numeric host that is not a dotted quad are refused. `ui_url`, `ui_tls_cert`
+or `ui_tls_key` without `ui_addr` is an error. An `[oidc]` table adds sign-in through an OIDC
+provider (see [Signing in](#signing-in)).
 
 The UI serves the nodes table with the columns of `vk-hub nodes`; each node's inventory,
 heartbeat and workloads; and the audit log (`/audit`, filterable by node, 100 lines a page; the
@@ -644,8 +644,31 @@ by wave. Operators can pause, resume and abort active rollouts. These actions po
 socket's operation as the session's principal. Invalid state transitions return 409. The
 shared fragment carries no session token: the surrounding page supplies its session's CSRF
 token through `hx-headers`, as JSON that htmx parses without evaluating. The buttons require
-htmx; `vk-hub rollout pause|resume|abort` works without it. Adding a release from a file on
-the hub's host and starting a rollout remain on the admin socket.
+htmx; `vk-hub rollout pause|resume|abort` works without it.
+
+Above the fragment, an operator's `/operations` carries three forms, each with the same
+origin, CSRF and role checks, run as the session's principal; a viewer's carries none.
+
+- **Upload** posts a `vk` binary, its version and optionally a release key's signature (the
+  base64 `vk release-key sign` prints) to `/releases/upload` as `multipart/form-data`, a plain
+  form. The body is read as it arrives: the CSRF token (field or `X-CSRF-Token` header), the
+  version and the signature are checked before a byte of the file is written, and the file is
+  streamed to a private file in `<data_dir>/releases/`, then held through `release add`'s
+  checks. Any failure, the browser leaving included, removes the file; so does `vk-hub serve`
+  starting, for what a stopped hub left. The binary may be 1 GiB, the body must state its length
+  and arrive within a minute plus its length at 256 KiB/s — a little over an hour for 1 GiB,
+  about seven and a half minutes for 100 MB — and never pause for 30 seconds. One upload runs at
+  a time, counted from when its fields pass their checks, and the session must still be an
+  operator's once the file is in.
+- **Fetch from GitHub** posts a version, `latest` by default, to `/releases/fetch` and starts
+  `release fetch` in the background; the fragment shows its progress and how it ended. "Check
+  the latest" asks which version that is and shows it, giving the last answer, or the last
+  failure, again within 30 seconds. The form is absent with `release_repository = "none"`.
+- **Start a rollout** takes a held release, all nodes or a chosen few, and `rollout create`'s
+  options, and posts to `/rollouts`. It is asked again first, as a reset is, showing the
+  release, whether it is signed, and the nodes wave by wave with those skipped and why; the
+  answer counts once, from the same session, within ten minutes, and only while the plan is
+  still what was shown — a node enrolled, removed or updated meanwhile refuses it.
 
 The nodes table, a node's page and `/operations` stay live over server-sent events. The hub
 notes every heartbeat, report, session, command outcome and desired-state change, by node, and
@@ -768,9 +791,9 @@ Every state-changing request is a `POST` from the UI's own origin — its `Origi
 `Sec-Fetch-Site: same-origin` — carrying a CSRF token derived from the session's secret, and
 is done as the session's principal, `ui session <id> (<role>)`, or `ui session <id> (<role>,
 <identity>)` for one opened through OIDC, which is what the audit log records. On a fleet hub
-they are signing out, a node's steering actions and a rollout's pause, resume and abort.
-Issuing a link, signing in and out, a refused OIDC sign-in, granting and revoking roles, and
-ending sessions are audited too.
+they are signing out, a node's steering actions, a rollout's pause, resume and abort,
+uploading and fetching a release, and starting a rollout. Issuing a link, signing in and out,
+a refused OIDC sign-in, granting and revoking roles, and ending sessions are audited too.
 
 ## Local mode
 

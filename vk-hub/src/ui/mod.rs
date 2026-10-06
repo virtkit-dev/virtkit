@@ -16,7 +16,9 @@
 //! its `Origin` is the UI's own (a fleet hub's `ui_url`), or `Sec-Fetch-Site` says
 //! `same-origin` — and carry the session's CSRF token, derived from its secret, in a form
 //! field or header. A fleet hub's are the admin socket's steering operations, of nodes and of
-//! rollouts ([`fleet`]), local mode's `vk` commands ([`actions`]).
+//! rollouts ([`fleet`]), and its releases and rollouts added and started ([`operations`]);
+//! local mode's are `vk` commands ([`actions`]). A release's upload is the one post whose body
+//! is not a small form: [`operations`] reads it as it arrives, under limits of its own.
 //!
 //! **A page** (`GET`) goes only to a request the UI's own pages made (`same-origin`) or no
 //! page made (`none`: the address bar, a bookmark, a link opened from a terminal).
@@ -63,7 +65,9 @@ mod dev;
 mod fleet;
 pub mod html;
 mod local;
+mod multipart;
 mod oidc;
+mod operations;
 mod pages;
 mod sse;
 
@@ -342,7 +346,13 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
         }
         (Method::POST, _) => match &ui.site {
             Site::Fleet(site) => {
-                if let Some(id) = fleet::action_node(&path) {
+                if path == operations::UPLOAD_PATH {
+                    operations::upload(req, ui, site).await
+                } else if path == operations::FETCH_PATH {
+                    operations::fetch_action(req, ui).await
+                } else if path == operations::ROLLOUT_PATH {
+                    operations::create_rollout(req, ui, site).await
+                } else if let Some(id) = fleet::action_node(&path) {
                     fleet::node_action(req, ui, site, id).await
                 } else if let Some(id) = fleet::action_rollout(&path) {
                     fleet::rollout_action(req, ui, id).await
@@ -639,19 +649,10 @@ async fn check_post(
     ui: &Ui,
     need: Role,
 ) -> Result<Result<(Auth, Vec<(String, String)>), (StatusCode, &'static str)>> {
-    if !from_own_page(req.headers(), &ui.origin, false) {
-        return Ok(Err((StatusCode::FORBIDDEN, CROSS_ORIGIN)));
-    }
-    let auth = match authenticate(req.headers(), ui).await? {
+    let auth = match check_caller(req.headers(), ui, need).await? {
         Ok(auth) => auth,
-        Err(why) => return Ok(Err((StatusCode::UNAUTHORIZED, why))),
+        Err(refused) => return Ok(Err(refused)),
     };
-    if auth.session.role < need {
-        return Ok(Err((
-            StatusCode::FORBIDDEN,
-            "Refused: this needs the operator role.",
-        )));
-    }
     let header_token = req
         .headers()
         .get("x-csrf-token")
@@ -662,13 +663,39 @@ async fn check_post(
         Err(refused) => return Ok(Err(refused)),
     };
     let presented = field(&form, "_csrf").map(str::to_string).or(header_token);
-    if !presented.is_some_and(|t| constant_time_eq(t.as_bytes(), auth.csrf.as_bytes())) {
-        return Ok(Err((
-            StatusCode::FORBIDDEN,
-            "Refused: the form's CSRF token is missing or not this session's. Reload the page.",
-        )));
+    if !csrf_ok(presented, &auth) {
+        return Ok(Err((StatusCode::FORBIDDEN, CSRF_REFUSED)));
     }
     Ok(Ok((auth, form)))
+}
+
+/// The checks of [`check_post`] that need only the request's headers: from this UI's own
+/// pages, by a live session with at least `need`. The session, or the status and reason that
+/// refuse it.
+async fn check_caller(
+    headers: &HeaderMap,
+    ui: &Ui,
+    need: Role,
+) -> Result<Result<Auth, (StatusCode, &'static str)>> {
+    if !from_own_page(headers, &ui.origin, false) {
+        return Ok(Err((StatusCode::FORBIDDEN, CROSS_ORIGIN)));
+    }
+    let auth = match authenticate(headers, ui).await? {
+        Ok(auth) => auth,
+        Err(why) => return Ok(Err((StatusCode::UNAUTHORIZED, why))),
+    };
+    if auth.session.role < need {
+        return Ok(Err((
+            StatusCode::FORBIDDEN,
+            "Refused: this needs the operator role.",
+        )));
+    }
+    Ok(Ok(auth))
+}
+
+/// Whether `presented` is `auth`'s session's CSRF token.
+fn csrf_ok(presented: Option<String>, auth: &Auth) -> bool {
+    presented.is_some_and(|t| constant_time_eq(t.as_bytes(), auth.csrf.as_bytes()))
 }
 
 /// Whether a request comes from a page of `origin`: its `Origin` is that, or it names none
@@ -816,6 +843,8 @@ const CONFLICTING_COOKIES: &str = "Not signed in: this browser sent more than on
      Clear this site's cookies and sign in again.";
 
 const CROSS_ORIGIN: &str = "Refused: this request did not come from the hub's own pages.";
+const CSRF_REFUSED: &str =
+    "Refused: the form's CSRF token is missing or not this session's. Reload the page.";
 
 const ANOTHER_SITE: &str = "Refused: another site's page asked for this one. Open the hub's \
      address yourself, or follow its own links.";

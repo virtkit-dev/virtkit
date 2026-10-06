@@ -97,9 +97,15 @@ All notable changes to virtkit will be documented in this file.
   audited, refused sign-ins and those only `*` admits at a bounded rate, and
   `vk-hub ui sessions` names who signed in. Sign-in links from `vk-hub ui login` keep working.
 
+- **Experimental: add releases and start rollouts from the `vk-hub` web UI.** An operator's
+  `/operations` uploads a `vk` binary, with its version and optionally a release key's
+  signature, held through the same checks as `vk-hub release add`; and starts a rollout of a
+  held release to all nodes or chosen ones, after confirming the nodes and waves it shows.
+  Both are audited under the operator's session.
 - **Experimental: `vk-hub release fetch [<version>|latest]` downloads a published release.**
-  The hub holds the release's `vk` once it matches the sha256 published beside it, unsigned.
-  `release_repository` in `hub.toml` names another repository, or `"none"` turns fetching off.
+  The hub holds the release's `vk` once it matches the sha256 published beside it, unsigned;
+  `/operations` offers the same, and shows the latest version available. `release_repository`
+  in `hub.toml` names another repository, or `"none"` turns fetching off.
 
 ### Changed
 

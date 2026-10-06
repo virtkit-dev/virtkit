@@ -3,7 +3,7 @@
 //! pause, resume or abort rollouts through the shared admin-socket operations ([`crate::ops`])
 //! as their session's principal. A reset, which deletes what the node's past jobs left, is
 //! confirmed first ([`actions::ask_first`]). Monitoring-only nodes have no steering controls.
-//! Adding a release and starting a rollout stay on the admin socket.
+//! Operators add releases and start rollouts from `/operations` ([`super::operations`]).
 
 use std::sync::Arc;
 
@@ -21,7 +21,7 @@ use super::pages::{
     started,
 };
 use super::sse::{self, Source};
-use super::{Auth, Body, Ui, actions, blocking, decode_form, field, message, page};
+use super::{Auth, Body, Ui, actions, blocking, decode_form, field, message, operations, page};
 use crate::ops::{self, NodeView};
 use crate::rollout::{NodeStatus, Rollout, RolloutAction, RolloutState};
 use crate::server::{HEARTBEAT, Hub};
@@ -40,8 +40,10 @@ const OPERATIONS_ROLLOUTS: usize = 10;
 /// ([`sse::feed`]). `/operations` shows only releases and rollouts, so it follows
 /// [`Hub::touch`] alone, not every node's heartbeat.
 pub(super) struct FleetSite {
-    /// Pending reset confirmations.
-    questions: actions::Questions,
+    /// Pending reset and rollout confirmations.
+    pub(super) questions: actions::Questions,
+    /// Whether a release is being uploaded.
+    pub(super) uploading: operations::Uploading,
     nodes_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     steered_operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
@@ -51,6 +53,7 @@ impl FleetSite {
     pub(super) fn new(hub: &Arc<Hub>) -> Self {
         FleetSite {
             questions: actions::Questions::new(),
+            uploading: operations::Uploading::new(),
             nodes_feed: sse::feed(hub.subscribe(), "nodes", render_nodes(hub.clone())),
             operations_feed: sse::feed(
                 hub.subscribe_touched(),
@@ -129,8 +132,18 @@ pub(super) async fn get(
         return Ok(Some(page(nodes(auth, &views, now))));
     }
     if path == "/operations" {
-        let ops = blocking(move || read_operations(&hub)).await?;
-        return Ok(Some(page(operations(auth, &ops, now))));
+        let steer = auth.session.role >= Role::Operator;
+        let (ops, nodes) = blocking(move || {
+            // The forms' nodes, for an operator's page alone.
+            let nodes = if steer {
+                crate::ops::node_views(&hub)?
+            } else {
+                Vec::new()
+            };
+            Ok((read_operations(&hub)?, nodes))
+        })
+        .await?;
+        return Ok(Some(page(operations(auth, &ops, &nodes, now))));
     }
     if path == "/audit" {
         let query = decode_form(query.unwrap_or("").as_bytes());
@@ -185,6 +198,9 @@ fn read_operations(hub: &Hub) -> Result<Operations> {
     Ok(Operations {
         releases: hub.db.releases()?,
         rollouts,
+        source: hub.fetches.source().map(|s| s.url().to_string()),
+        fetch: hub.fetches.status(),
+        latest: hub.fetches.latest(),
     })
 }
 
@@ -193,6 +209,12 @@ struct Operations {
     releases: Vec<Release>,
     /// The latest, newest first.
     rollouts: Vec<Rollout>,
+    /// Where releases are fetched from; `None` with fetching off.
+    source: Option<String>,
+    /// The latest fetch since the hub started.
+    fetch: Option<crate::fetch::FetchStatus>,
+    /// The latest release the repository named when last asked, and when.
+    latest: Option<(String, u64)>,
 }
 
 /// Node `id`'s page fragment, or the line saying it has gone.
@@ -323,6 +345,7 @@ pub(super) async fn node_action(
             op: "reset".into(),
             what: "Reset this node? It drains, stops what its past jobs left running, and \
                    deletes their job directories and its idle host checkouts.",
+            detail: Html::new(),
             asked: Vec::new(),
         };
         if let Some(asked) = actions::ask_first(&site.questions, layout, htmx, &auth, &form, &ask)?
@@ -390,7 +413,7 @@ pub(super) async fn node_action(
 }
 
 /// For htmx, `said` in the flash, swapped in on its own: the live fragment follows the change.
-fn said_so(said: &str) -> Response<Body> {
+pub(super) fn said_so(said: &str) -> Response<Body> {
     let mut h = Html::new();
     h.raw("<div id=\"flash\" hx-swap-oob=\"true\">")
         .text(said)
@@ -474,7 +497,7 @@ pub(super) async fn rollout_action(
 }
 
 /// The page around `main`, with the fleet's navigation.
-fn layout(title: &str, auth: &Auth, main: &Html) -> Html {
+pub(super) fn layout(title: &str, auth: &Auth, main: &Html) -> Html {
     pages::frame(title, auth, NAV, main)
 }
 
@@ -1044,12 +1067,14 @@ fn workloads(h: &mut Html, workloads: Option<&crate::store::Workloads>) {
 /// ([`sse::feed`]), so it carries no session's CSRF token: an operator's page sets it around
 /// the fragment as a header on every htmx request from inside it (`hx-headers`), which is how
 /// the rollouts' buttons post. Those buttons need htmx; `vk-hub rollout pause|resume|abort`
-/// does the same without it.
-fn operations(auth: &Auth, ops: &Operations, now: u64) -> Html {
+/// does the same without it. An operator's page carries the forms that add a release and start
+/// a rollout above it.
+fn operations(auth: &Auth, ops: &Operations, nodes: &[NodeView], now: u64) -> Html {
     let steer = auth.session.role >= Role::Operator;
     let mut main = Html::new();
     main.raw("<h1>Operations</h1>");
     if steer {
+        operations::forms(&mut main, auth, &ops.releases, nodes, ops.source.as_deref());
         // The hub derives the hex token; htmx parses the header's JSON without evaluating it.
         main.raw("<div id=\"flash\"></div><div hx-headers=\"{&quot;X-CSRF-Token&quot;:&quot;")
             .text(&auth.csrf)
@@ -1070,6 +1095,7 @@ fn operations(auth: &Auth, ops: &Operations, now: u64) -> Html {
 fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
     let mut h = Html::new();
     h.raw("<section><h2>Releases</h2>");
+    operations::fetch_line(&mut h, ops.fetch.as_ref(), ops.latest.as_ref());
     if ops.releases.is_empty() {
         h.raw("<p class=\"empty\">none: <code>vk-hub release add</code> copies a vk binary ")
             .raw("into the hub</p>");

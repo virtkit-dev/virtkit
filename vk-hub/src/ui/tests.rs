@@ -77,11 +77,26 @@ async fn request(
     headers: &[&str],
     body: &str,
 ) -> Reply {
+    request_bytes(addr, method, path, headers, body.as_bytes()).await
+}
+
+/// [`request`] with a body of bytes, whose `Content-Length` is its own unless `headers` give
+/// one; a response cut short by a reset is taken as far as it got.
+async fn request_bytes(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[&str],
+    body: &[u8],
+) -> Reply {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nConnection: close\r\nContent-Length: {}\r\n",
-        body.len()
-    );
+    let mut head = format!("{method} {path} HTTP/1.1\r\nConnection: close\r\n");
+    if !headers
+        .iter()
+        .any(|h| h.to_ascii_lowercase().starts_with("content-length:"))
+    {
+        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
     if !headers
         .iter()
         .any(|h| h.to_ascii_lowercase().starts_with("host:"))
@@ -94,9 +109,15 @@ async fn request(
     }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes()).await.unwrap();
-    stream.write_all(body.as_bytes()).await.unwrap();
+    // A server refusing early may stop reading.
+    let _ = stream.write_all(body).await;
     let mut resp = Vec::new();
-    stream.read_to_end(&mut resp).await.unwrap();
+    let mut buf = [0u8; 8192];
+    while let Ok(n) = stream.read(&mut buf).await
+        && n > 0
+    {
+        resp.extend_from_slice(&buf[..n]);
+    }
     let resp = String::from_utf8(resp).unwrap();
     let (head, body) = resp.split_once("\r\n\r\n").unwrap();
     let mut lines = head.lines();
@@ -3569,4 +3590,774 @@ async fn without_oidc_there_is_no_provider_to_sign_in_with() {
     );
     assert!(!get(addr, "/", None).await.body.contains("/auth/login"));
     assert_eq!(get(addr, "/login", None).await.status, 403);
+}
+
+/// A fleet hub keeping releases in a scratch directory and fetching them from `api`, if
+/// given; the directory.
+async fn start_fleet_releases(
+    api: Option<&str>,
+) -> (SocketAddr, Arc<Hub>, String, std::path::PathBuf) {
+    let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = format!("http://{addr}");
+    let dir = std::env::temp_dir().join(format!(
+        "vk-hub-ui-releases-{}-{}",
+        std::process::id(),
+        crate::random_hex(4).unwrap()
+    ));
+    let hub = Arc::new(
+        Hub::new(Arc::new(Db::open_memory().unwrap()), Some(origin.clone()))
+            .with_releases(dir.join("releases"))
+            .with_release_source(api.map(crate::fetch::Source::at)),
+    );
+    let ui = Arc::new(Ui::new(hub.clone(), &origin));
+    tokio::spawn(serve(listener, None, ui));
+    (addr, hub, origin, dir)
+}
+
+/// What the releases directory holds that is not a release: nothing, once a request is over.
+fn staged_files(dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir.join("releases")) else {
+        return Vec::new();
+    };
+    entries
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with('.'))
+        .collect()
+}
+
+/// A form as a browser posts it with a file input: its `Content-Type`, and its body.
+fn multipart_form(fields: &[(&str, &[u8])]) -> (String, Vec<u8>) {
+    let boundary = "----vkHubTestBoundary7MA4YWxk";
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        if *name == "file" {
+            body.extend_from_slice(
+                b"Content-Disposition: form-data; name=\"file\"; filename=\"vk\"\r\n\
+                  Content-Type: application/octet-stream\r\n\r\n",
+            );
+        } else {
+            body.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+            );
+        }
+        body.extend_from_slice(value);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={boundary}"), body)
+}
+
+async fn post_upload(
+    addr: SocketAddr,
+    origin: &str,
+    cookie: &str,
+    fields: &[(&str, &[u8])],
+    extra: &[&str],
+) -> Reply {
+    let (content_type, body) = multipart_form(fields);
+    let cookie = format!("Cookie: {cookie}");
+    let origin = format!("Origin: {origin}");
+    let content_type = format!("Content-Type: {content_type}");
+    let mut headers = vec![cookie.as_str(), origin.as_str(), content_type.as_str()];
+    headers.extend_from_slice(extra);
+    request_bytes(addr, "POST", operations::UPLOAD_PATH, &headers, &body).await
+}
+
+/// An operator uploads a release from `/operations`: it is checked and held as the session's
+/// principal, the audit log says so, and nothing is left staged.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_uploads_a_release() {
+    let (addr, hub, origin, dir) = start_fleet_releases(None).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
+    let page = get(addr, "/operations", Some(&operator)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains(
+            "action=\"/releases/upload\" enctype=\"multipart/form-data\"><input type=\"hidden\" \
+             name=\"_csrf\""
+        ),
+        "{}",
+        page.body
+    );
+    // Fetching is off: no form for it.
+    assert!(!page.body.contains("fetch from GitHub"), "{}", page.body);
+
+    let bin = crate::fetch::tests::fake_vk("0.85.0");
+    let reply = post_upload(
+        addr,
+        &origin,
+        &operator,
+        &[
+            ("_csrf", csrf.as_bytes()),
+            ("version", b"0.85.0"),
+            ("signature", b""),
+            ("file", &bin),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/operations"));
+    let releases = hub.db.releases().unwrap();
+    assert_eq!(releases.len(), 1);
+    let release = &releases[0];
+    assert_eq!(
+        (release.row.version.as_str(), release.row.added_by.as_str()),
+        ("0.85.0", principal.as_str())
+    );
+    assert_eq!(release.row.signature, None);
+    let held = std::fs::read(crate::releases::path(
+        &dir.join("releases"),
+        &release.sha256,
+    ));
+    assert_eq!(held.unwrap(), bin);
+    assert!(staged_files(&dir).is_empty(), "{:?}", staged_files(&dir));
+    audited(
+        &hub,
+        &format!(
+            "{principal} added release {} as vk 0.85.0",
+            crate::store::short(&release.sha256)
+        ),
+    )
+    .await;
+
+    // With a signature, as `vk release-key sign` prints one, and the token as a header.
+    let signature = vk_hub_proto::to_base64(&[7u8; vk_hub_proto::SIGNATURE_LEN]);
+    let bin = crate::fetch::tests::fake_vk("0.86.0");
+    let token = format!("X-CSRF-Token: {csrf}");
+    let reply = post_upload(
+        addr,
+        &origin,
+        &operator,
+        &[
+            ("version", b"0.86.0"),
+            ("signature", signature.as_bytes()),
+            ("file", &bin),
+        ],
+        &[&token],
+    )
+    .await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let releases = hub.db.releases().unwrap();
+    assert!(
+        releases
+            .iter()
+            .any(|r| r.row.version == "0.86.0" && r.row.signature.as_deref() == Some(&signature)),
+        "{releases:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An upload past the size a release may be, of no x86-64 ELF, of a version the binary does
+/// not hold, from a viewer, without the session's token or from another origin is refused,
+/// holds nothing, and leaves nothing staged.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_is_refused_and_leaves_nothing_behind() {
+    let (addr, hub, origin, dir) = start_fleet_releases(None).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let bin = crate::fetch::tests::fake_vk("0.85.0");
+    let mut huge = bin.clone();
+    huge.resize(usize::try_from(operations::MAX_UPLOAD).unwrap() + 1, 0);
+    fn fields<'a>(csrf: &'a str, version: &'a [u8], file: &'a [u8]) -> Vec<(&'a str, &'a [u8])> {
+        vec![
+            ("_csrf", csrf.as_bytes()),
+            ("version", version),
+            ("file", file),
+        ]
+    }
+    let (csrf, viewer_csrf, bin, huge) = (&csrf, &viewer_csrf, &bin[..], &huge[..]);
+    for (case, cookie, origin, form, status, said) in [
+        (
+            "huge",
+            &operator,
+            origin.as_str(),
+            fields(csrf, b"0.85.0", huge),
+            413,
+            "at most",
+        ),
+        (
+            "not elf",
+            &operator,
+            origin.as_str(),
+            fields(csrf, b"0.85.0", b"#!/bin/sh\necho 0.85.0\n"),
+            400,
+            "not an x86-64 ELF",
+        ),
+        (
+            "version",
+            &operator,
+            origin.as_str(),
+            fields(csrf, b"0.84.0", bin),
+            400,
+            "appears nowhere",
+        ),
+        (
+            "bad version",
+            &operator,
+            origin.as_str(),
+            fields(csrf, b"0.8 4", bin),
+            400,
+            "not a version",
+        ),
+        (
+            "viewer",
+            &viewer,
+            origin.as_str(),
+            fields(viewer_csrf, b"0.85.0", bin),
+            403,
+            "operator role",
+        ),
+        (
+            "csrf",
+            &operator,
+            origin.as_str(),
+            fields("0000", b"0.85.0", bin),
+            403,
+            "CSRF",
+        ),
+        (
+            "origin",
+            &operator,
+            "http://evil.example",
+            fields(csrf, b"0.85.0", bin),
+            403,
+            "did not come from",
+        ),
+    ] {
+        let reply = post_upload(addr, origin, cookie, &form, &[]).await;
+        assert_eq!(reply.status, status, "{case}: {}", reply.body);
+        assert!(reply.body.contains(said), "{case}: {}", reply.body);
+        assert!(hub.db.releases().unwrap().is_empty(), "{case}");
+        assert!(
+            staged_files(&dir).is_empty(),
+            "{case}: {:?}",
+            staged_files(&dir)
+        );
+    }
+    // A length past what any release may be is refused before a byte is read.
+    let cookie = format!("Cookie: {operator}");
+    let origin_header = format!("Origin: {origin}");
+    let reply = request_bytes(
+        addr,
+        "POST",
+        operations::UPLOAD_PATH,
+        &[
+            &cookie,
+            &origin_header,
+            "Content-Type: multipart/form-data; boundary=x",
+            "Content-Length: 99999999999",
+        ],
+        b"",
+    )
+    .await;
+    assert_eq!(reply.status, 413, "{}", reply.body);
+    // A plain form's encoding is no upload.
+    let reply = request(
+        addr,
+        "POST",
+        operations::UPLOAD_PATH,
+        &[
+            &cookie,
+            &origin_header,
+            "Content-Type: application/x-www-form-urlencoded",
+        ],
+        &format!("_csrf={csrf}&version=0.85.0"),
+    )
+    .await;
+    assert_eq!(reply.status, 415, "{}", reply.body);
+    // A viewer's page offers none of the forms.
+    let page = get(addr, "/operations", Some(&viewer)).await;
+    for absent in [
+        "/releases/upload",
+        "/releases/fetch",
+        "action=\"/rollouts\"",
+    ] {
+        assert!(!page.body.contains(absent), "{absent}: {}", page.body);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An upload of `fields` from `cookie`'s session over a connection of its own, sent as far as
+/// the end of the first `upto` in its body: the request and the connection, to go on with.
+async fn upload_until(
+    addr: SocketAddr,
+    origin: &str,
+    cookie: &str,
+    fields: &[(&str, &[u8])],
+    upto: &[u8],
+) -> (Vec<u8>, usize, tokio::net::TcpStream) {
+    let (content_type, body) = multipart_form(fields);
+    let cut = body.windows(upto.len()).position(|w| w == upto).unwrap() + upto.len();
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "POST {} HTTP/1.1\r\nHost: {addr}\r\nCookie: {cookie}\r\nOrigin: {origin}\r\n\
+         Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        operations::UPLOAD_PATH,
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(&body[..cut]).await.unwrap();
+    (body, cut, stream)
+}
+
+/// [`upload_until`], then the rest of the body a byte at a time, each well inside the idle
+/// limit, until the task is aborted: the connection drops, as when a browser leaves.
+async fn trickle_upload(
+    addr: SocketAddr,
+    origin: &str,
+    cookie: &str,
+    fields: &[(&str, &[u8])],
+    upto: &[u8],
+) -> tokio::task::JoinHandle<()> {
+    let (body, cut, mut stream) = upload_until(addr, origin, cookie, fields, upto).await;
+    tokio::spawn(async move {
+        for byte in &body[cut..] {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if stream.write_all(&[*byte]).await.is_err() {
+                return;
+            }
+        }
+        std::future::pending::<()>().await;
+    })
+}
+
+/// Waits for `dir`'s releases directory to hold a staged file, or for none, as `staged` says.
+async fn until_staged(dir: &std::path::Path, staged: bool) {
+    let started = std::time::Instant::now();
+    while staged_files(dir).is_empty() == staged {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "staged: {:?}",
+            staged_files(dir)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Where a multipart body's file starts: what [`upload_until`] stops after to be inside it.
+const FILE_START: &[u8] = b"application/octet-stream\r\n\r\n\x7fELF";
+
+/// A browser leaving mid-upload, an upload that stalls, and one whose session ends while it
+/// arrives each leave nothing staged or held, and the next upload goes through.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_cut_short_leaves_nothing_behind() {
+    let (addr, hub, origin, dir) = start_fleet_releases(None).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let bin = crate::fetch::tests::fake_vk("0.85.0");
+    let form = [
+        ("_csrf", csrf.as_bytes()),
+        ("version", b"0.85.0".as_slice()),
+        ("file", &bin),
+    ];
+
+    // The browser leaves.
+    let (_, _, stream) = upload_until(addr, &origin, &operator, &form, FILE_START).await;
+    until_staged(&dir, true).await;
+    drop(stream);
+    until_staged(&dir, false).await;
+    assert!(hub.db.releases().unwrap().is_empty());
+
+    // The upload stalls past the idle limit.
+    let (_, _, mut stream) = upload_until(addr, &origin, &operator, &form, FILE_START).await;
+    let mut resp = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut resp))
+        .await
+        .unwrap()
+        .unwrap();
+    let resp = String::from_utf8_lossy(&resp);
+    assert!(resp.starts_with("HTTP/1.1 408"), "{resp}");
+    assert!(resp.contains("too slow"), "{resp}");
+    until_staged(&dir, false).await;
+    assert!(hub.db.releases().unwrap().is_empty());
+
+    // The session ends while the file arrives.
+    let (body, cut, mut stream) = upload_until(addr, &origin, &operator, &form, FILE_START).await;
+    until_staged(&dir, true).await;
+    hub.db
+        .end_ui_sessions(None, "uid 0", crate::now_secs())
+        .unwrap();
+    stream.write_all(&body[cut..]).await.unwrap();
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await.unwrap();
+    let resp = String::from_utf8_lossy(&resp);
+    assert!(resp.starts_with("HTTP/1.1 401"), "{resp}");
+    until_staged(&dir, false).await;
+    assert!(hub.db.releases().unwrap().is_empty());
+
+    // Nothing was left holding the upload slot.
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let form = [
+        ("_csrf", csrf.as_bytes()),
+        ("version", b"0.85.0".as_slice()),
+        ("file", &bin),
+    ];
+    let reply = post_upload(addr, &origin, &operator, &form, &[]).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(hub.db.releases().unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One upload at a time: a second one is refused while the first's file arrives, and goes
+/// through once it has ended. An upload still sending its fields holds nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_upload_at_a_time() {
+    let (addr, hub, origin, dir) = start_fleet_releases(None).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let bin = crate::fetch::tests::fake_vk("0.85.0");
+    let form = [
+        ("_csrf", csrf.as_bytes()),
+        ("version", b"0.85.0".as_slice()),
+        ("file", &bin),
+    ];
+
+    // Still in its CSRF token, so far from its file.
+    let fields = trickle_upload(addr, &origin, &operator, &form, &csrf.as_bytes()[..8]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let reply = post_upload(addr, &origin, &operator, &form, &[]).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    fields.abort();
+
+    let file = trickle_upload(addr, &origin, &operator, &form, FILE_START).await;
+    until_staged(&dir, true).await;
+    let reply = post_upload(addr, &origin, &operator, &form, &[]).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(reply.body.contains("another release"), "{}", reply.body);
+    file.abort();
+    until_staged(&dir, false).await;
+    let reply = post_upload(addr, &origin, &operator, &form, &[]).await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An operator starts a rollout from `/operations` once they have answered the question that
+/// says which nodes it updates in which waves; the answer counts once, from the same session,
+/// and only while the plan is still what was shown.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_starts_a_rollout_once_confirmed() {
+    let (addr, hub, origin) = start_fleet().await;
+    let enroll = |hostname: &str, key: &str| {
+        let (token, _) = hub
+            .db
+            .create_token(Duration::from_secs(60), "uid 0", crate::now_secs())
+            .unwrap();
+        match hub
+            .db
+            .enroll(&token, &key.repeat(16), hostname, "peer p", 1)
+            .unwrap()
+        {
+            crate::store::Enrollment::Enrolled { node_id } => {
+                // Ready, with a managed runner, as a rollout requires without --force.
+                let ready = vk_hub_proto::Report {
+                    state: Some(vk_hub_proto::NodeState::Ready),
+                    runner: Some(vk_hub_proto::RunnerMode::Managed),
+                    ..Default::default()
+                };
+                hub.db
+                    .record_report(&node_id, ready, crate::now_secs())
+                    .unwrap();
+                node_id
+            }
+            _ => panic!("expected an enrollment"),
+        }
+    };
+    let a = enroll("ci-a", "a1");
+    let b = enroll("ci-b", "b1");
+    let sha = "ab".repeat(32);
+    let row = crate::store::ReleaseRow {
+        version: "0.85.0".into(),
+        size: 3 << 20,
+        signature: None,
+        added_at: 1,
+        added_by: "uid 0".into(),
+    };
+    hub.db.add_release(&sha, &row, "uid 0").unwrap();
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
+    let page = get(addr, "/operations", Some(&operator)).await;
+    for want in [
+        "action=\"/rollouts\" hx-post=\"/rollouts\"",
+        &format!("<option value=\"{sha}\">vk 0.85.0 (abababababab)</option>"),
+        &format!("name=\"node\" value=\"{a}\"> ci-a"),
+        &format!("name=\"node\" value=\"{b}\"> ci-b"),
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+
+    let form = format!(
+        "_csrf={csrf}&op=create&release={sha}&select=all&batch=1&max_failures=0&\
+         node_timeout=30m&drain_timeout=4h"
+    );
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        operations::ROLLOUT_PATH,
+        &form,
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    for want in [
+        "Start this rollout?",
+        "vk 0.85.0 (<code>abababababab</code>, unsigned",
+        "to 2 node(s) in 2 wave(s)",
+        "<li>wave 0: ci-a</li><li>wave 1: ci-b</li>",
+        "name=\"confirm\" value=\"yes\"",
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    assert!(hub.db.rollouts().unwrap().is_empty());
+    let answer: String = [
+        "_csrf",
+        "op",
+        "release",
+        "nodes",
+        "batch",
+        "canary_per_profile",
+        "max_failures",
+        "node_timeout",
+        "drain_timeout",
+        "force",
+        "plan",
+        "nonce",
+        "confirm",
+    ]
+    .iter()
+    .map(|f| format!("{f}={}", hidden(&reply.body, f)))
+    .collect::<Vec<_>>()
+    .join("&");
+
+    // Another session cannot answer it.
+    let (other, other_csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let stolen = answer.replace(&csrf, &other_csrf);
+    let reply = post_action(
+        addr,
+        &origin,
+        &other,
+        operations::ROLLOUT_PATH,
+        &stolen,
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        operations::ROLLOUT_PATH,
+        &answer,
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(reply.body.contains("Started rollout"), "{}", reply.body);
+    let rollouts = hub.db.rollouts().unwrap();
+    assert_eq!(rollouts.len(), 1);
+    assert_eq!(rollouts[0].1.created_by, principal);
+    assert_eq!(rollouts[0].1.nodes.len(), 2);
+    audited(&hub, &format!("{principal} started rollout")).await;
+    // Answered once.
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        operations::ROLLOUT_PATH,
+        &answer,
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert_eq!(hub.db.rollouts().unwrap().len(), 1);
+
+    // An answer posting another plan than it was asked, and a node enrolled between the
+    // question and the answer, are refused: neither is what was shown.
+    let ask_for = |form: String| {
+        let (operator, origin) = (operator.clone(), origin.clone());
+        async move {
+            let reply = post_action(
+                addr,
+                &origin,
+                &operator,
+                operations::ROLLOUT_PATH,
+                &form,
+                true,
+            )
+            .await;
+            assert_eq!(reply.status, 200, "{}", reply.body);
+            let answer = [
+                "_csrf",
+                "op",
+                "release",
+                "nodes",
+                "batch",
+                "canary_per_profile",
+                "max_failures",
+                "node_timeout",
+                "drain_timeout",
+                "force",
+                "plan",
+                "nonce",
+                "confirm",
+            ]
+            .iter()
+            .map(|f| format!("{f}={}", hidden(&reply.body, f)))
+            .collect::<Vec<_>>()
+            .join("&");
+            (reply.body, answer)
+        }
+    };
+    let some = format!(
+        "_csrf={csrf}&op=create&release={sha}&select=some&node={a}&batch=1&max_failures=0&\
+         node_timeout=30m&drain_timeout=4h"
+    );
+    let (asked, answer) = ask_for(some).await;
+    assert!(asked.contains("to 1 node(s) in 1 wave(s)"), "{asked}");
+    let answer = answer.replace("batch=1", "batch=2");
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        operations::ROLLOUT_PATH,
+        &answer,
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(reply.body.contains("changed"), "{}", reply.body);
+    let (_, answer) = ask_for(form.clone()).await;
+    enroll("ci-c", "c1");
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        operations::ROLLOUT_PATH,
+        &answer,
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(reply.body.contains("changed"), "{}", reply.body);
+    assert_eq!(hub.db.rollouts().unwrap().len(), 1);
+
+    // A viewer is refused, and a plan with no release named.
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let form = form.replace(csrf.as_str(), &viewer_csrf);
+    let reply = post_action(
+        addr,
+        &origin,
+        &viewer,
+        operations::ROLLOUT_PATH,
+        &form,
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let form = format!("_csrf={csrf}&op=create&select=all&batch=1");
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        operations::ROLLOUT_PATH,
+        &form,
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+}
+
+/// An operator asks for the latest release on GitHub and fetches it from `/operations`; the
+/// page follows the fetch, which is held as the session's principal. A release whose binary
+/// does not hash to its published digest is refused, and the page says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_fetches_a_release_from_github() {
+    use crate::fetch::tests::{FakeRelease, fake_github, fake_vk};
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let api = fake_github(FakeRelease::new("v0.85.0", fake_vk("0.85.0"))).await;
+    let (addr, hub, origin, dir) = start_fleet_releases(Some(&api)).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
+    let page = get(addr, "/operations", Some(&operator)).await;
+    for want in [
+        "action=\"/releases/fetch\" hx-post=\"/releases/fetch\"",
+        "<input name=\"version\" value=\"latest\"",
+        "<button name=\"op\" value=\"fetch\">fetch from GitHub</button>",
+        &format!("From <code>{api}/virtkit-dev/virtkit</code>"),
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    let path = operations::FETCH_PATH;
+    let reply = post_action(
+        addr,
+        &origin,
+        &operator,
+        path,
+        &format!("_csrf={csrf}&op=check"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(reply.body.contains("is 0.85.0."), "{}", reply.body);
+
+    let form = format!("_csrf={csrf}&op=fetch&version=latest");
+    let reply = post_action(addr, &origin, &operator, path, &form, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("Fetching vk latest from"),
+        "{}",
+        reply.body
+    );
+    audited(&hub, &format!("{principal} added release")).await;
+    let releases = hub.db.releases().unwrap();
+    assert_eq!(releases[0].row.version, "0.85.0");
+    assert_eq!(releases[0].row.added_by, principal);
+    let page = get(addr, "/operations", Some(&operator)).await;
+    assert!(
+        page.body.contains("Latest on GitHub: vk 0.85.0"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("Fetched vk 0.85.0"), "{}", page.body);
+    assert!(staged_files(&dir).is_empty(), "{:?}", staged_files(&dir));
+
+    // A viewer may not; nor a version that is not one.
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let reply = post_action(
+        addr,
+        &origin,
+        &viewer,
+        path,
+        &format!("_csrf={viewer_csrf}&op=fetch"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let form = format!("_csrf={csrf}&op=fetch&version=..%2Fx");
+    let reply = post_action(addr, &origin, &operator, path, &form, true).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut tampered = FakeRelease::new("v0.86.0", fake_vk("0.86.0"));
+    tampered.sha256 = "00".repeat(32);
+    let api = fake_github(tampered).await;
+    let (addr, hub, origin, dir) = start_fleet_releases(Some(&api)).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let form = format!("_csrf={csrf}&op=fetch&version=0.86.0");
+    let reply = post_action(addr, &origin, &operator, path, &form, true).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    audited(&hub, "failed to fetch vk 0.86.0").await;
+    assert!(hub.db.releases().unwrap().is_empty());
+    let page = get(addr, "/operations", Some(&operator)).await;
+    assert!(
+        page.body.contains("Fetching vk 0.86.0 failed</span>"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("does not match"), "{}", page.body);
+    assert!(staged_files(&dir).is_empty(), "{:?}", staged_files(&dir));
+    let _ = std::fs::remove_dir_all(&dir);
 }
