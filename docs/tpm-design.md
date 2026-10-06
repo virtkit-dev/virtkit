@@ -1,8 +1,10 @@
 # vk-tpm: a TPM 2.0 in Rust
 
-Status: phases 1 to 3 are implemented: the engine skeleton, sessions, hierarchies, the
-dictionary-attack protection, the PCR and hash commands, and objects: keys, primary keys,
-contexts, persistent objects, signing, RSA and ECDH; all tested against libtpms. This document
+Status: phases 1 to 4 are implemented: the engine skeleton, sessions, hierarchies, the
+dictionary-attack protection, the PCR and hash commands, objects (keys, primary keys,
+contexts, persistent objects, signing, RSA and ECDH), NV indices, the policy commands,
+attestation and credentials, duplication, symmetric encryption, and EK provisioning; all
+tested against libtpms. This document
 describes the target and the plan for getting there; [Deviations](#deviations-from-libtpms) lists
 where `vk-tpm` answers differently, on purpose.
 
@@ -56,6 +58,13 @@ PolicyDuplicationSelect, PolicyNvWritten, PolicyTemplate, PolicyAuthorizeNV,
 PolicyCounterTimer, PolicyPhysicalPresence, NV_Certify, GetCommandAuditDigest,
 SetCommandCodeAuditStatus, ClockSet, ClockRateAdjust, PCR_SetAuthPolicy, PCR_SetAuthValue,
 EC_Ephemeral, ZGen_2Phase.
+
+Of the SHOULD list, phase 4 implements Duplicate, Import, PolicyTicket,
+PolicyDuplicationSelect, PolicyNvWritten, PolicyTemplate, PolicyAuthorizeNV,
+PolicyCounterTimer, PolicyPhysicalPresence and NV_Certify. Not implemented yet (so
+TPM_RC_COMMAND_CODE): Rewrap, GetCommandAuditDigest and SetCommandCodeAuditStatus (command
+audit), ClockSet, ClockRateAdjust, PCR_SetAuthPolicy, PCR_SetAuthValue, EC_Ephemeral,
+ZGen_2Phase; no Windows flow uses them.
 
 **Stubbed (TPM_RC_COMMAND_CODE, not listed):**
 - Field upgrade: FieldUpgradeStart, FieldUpgradeData, FirmwareRead.
@@ -130,6 +139,16 @@ padding, raw RSA included. The decision:
 `.cargo/audit.toml` keeps the advisory suppressed, with this reasoning, until `rsa` 0.10 is
 released.
 
+**Stable `rsa` 0.10, status (2026-10-06).** There is none: crates.io's newest stable `rsa` is
+0.9.10 (still `num-bigint-dig`, the code the advisory is about), the newest release 0.10.0-rc.19
+(published that day; `vk-tpm` and russh are on rc.18), and RUSTSEC-2023-0071 still lists no
+patched version. The plan: stay on the release candidate russh uses, so `Cargo.lock` holds one
+`rsa`; move both to 0.10.0 when it is released, rerunning the differential suite (RSASSA
+signatures, implicit rejection and the RSA primaries' prime search are compared or pinned
+there) and `decryption_time_does_not_depend_on_the_padding`; then drop the audit ignore if the
+advisory names 0.10.0 as patched. An RSA primary would change only if `crypto-primes` changed
+its primality verdicts, which the pinned prime search does not depend on otherwise.
+
 ## Architecture
 
 ```
@@ -153,6 +172,12 @@ vk-tpm/src/
                  ECDH, implicit rejection
   drbg.rs        the reference implementation's CTR_DRBG, which primary keys derive from
   signing.rs     Sign, VerifySignature, RSA_Encrypt/Decrypt, ECDH_KeyGen/ZGen, ECC_Parameters
+  nv.rs          NV indices: every type and attribute, orderly indices in RAM, the NV budget
+  policy.rs      the policy commands; what a policy session requires of an authorization
+  attest.rs      Quote, Certify, CertifyCreation, NV_Certify, GetTime, GetSessionAuditDigest,
+                 MakeCredential, ActivateCredential
+  duplicate.rs   Duplicate, Import
+  ek.rs          the EK of the TCG EK Credential Profile's templates, its provisioning
   context.rs     ContextSave, ContextLoad, FlushContext; saved sessions and the context gap
   pcr.rs         PCR banks, PC Client attributes, startup/save/extend/reset/read
   state.rs       Permanent / Volatile state, versioned serialization
@@ -161,7 +186,8 @@ vk-tpm/src/
   capability.rs  TPM2_GetCapability
 ```
 
-Later phases add `nv.rs`, `policy.rs` and `attest.rs`.
+`object.rs` also has TPM2_EncryptDecrypt(2) (AES in its five modes, `crypt::aes_mode`), and
+`key.rs` TPM2_CreateLoaded.
 
 Command processing follows Part 3's order exactly, because the response code a guest sees for
 a malformed command depends on it:
@@ -218,13 +244,19 @@ It mirrors what `tpm.rs` (at 2ba84aa2) does with libtpms, so the device swaps on
 | snapshot restore: write the file, `SetState(PERMANENT)`, `SetState(VOLATILE)`, `MainInit` | `Tpm::restore(&saved.permanent, &saved.volatile)`, and write the file |
 | `TPMLIB_Process` | `Tpm::process(&cmd) -> Vec<u8>`, never fails, at most `MAX_COMMAND_SIZE` bytes |
 | `nvram_storedata("permall")` callback | after `process`, `if tpm.take_permanent_changed() { write_atomic(path, &tpm.permanent_state()) }`, before the CRB clears START so a guest never sees a response whose state is not durable |
+| swtpm_setup's EK provisioning (not done today) | optional, at manufacture: `tpm.endorsement_key(kind)` for a CA to certify, then `tpm.provision_endorsement_key(kind, Some(&der))` (see "EK certificate") |
 | `TPMLIB_GetState(PERMANENT / VOLATILE)` for a snapshot | `permanent_state()` / `volatile_state()`, both `Zeroizing` |
 | `RUNNING` / `PERMANENT_STATE` globals | none: a `Tpm` is a value owned by the `TpmCrb` |
 
 `permanent_state()` returns `Zeroizing<Vec<u8>>`: it holds the seeds; `volatile_state()` too,
-for the platform authValue and the session keys. `process` compares the permanent state
-before and after each command, so `take_permanent_changed` reports any change, a counted
-authorization failure included, without each command having to remember to. The file keeps
+for the platform authValue and the session keys. The permanent state sits behind a guard
+(`state::Tracked`) whose every mutable access marks it changed, so `take_permanent_changed`
+reports any change, a counted authorization failure included, without each command having to
+remember to; Clock alone goes around the guard. It may over-report (a mutable access that
+changes nothing: one more store), never under-report: unit tests, and a debug build with
+`VK_TPM_CHECK_CHANGES` set (run over the differential suite), compare the serialized state
+around each command and fail on a change left unmarked. (Comparing it in every build made the
+differential suite 25 times slower.) The file keeps
 `write_atomic`'s guarantees: 0600, fsync, rename, then a directory fsync. The locality stays 0,
 as the device grants only locality 0. `process` will take one when the device offers more.
 
@@ -246,13 +278,18 @@ refuses an unknown version, a short blob or trailing bytes. It never guesses.
   their update counter, the enables and the platform authorization, and what a restart or a
   resume keeps: the null hierarchy's proof and seed, the clear and restart counts, the context
   counters and the saved sessions) and TPM time at that shutdown; the persistent objects (at
-  most 16); resetCount and totalResetCount; Clock and whether it is safe. Later phases add NV
-  indices.
+  most 16); resetCount and totalResetCount; Clock and whether it is safe; the time epoch
+  (which run of TPM time it is: a policy timeout or ticket from an earlier one has expired);
+  the NV indices (public area, authValue, data; an orderly index as last stored) and the
+  highest value a deleted counter had.
 - **Volatile** (`VKTPM-V\0`): whether Startup ran, whether it followed an orderly shutdown;
   TPM time and the DA timers; the hierarchy enables and the platform authorization; the PCR
   allocation in use; the PCRs and their update counter; the object slots (keys, and hash, HMAC
   and event sequences with their hash state); the session handles (free, a loaded session, or
-  a saved session's context sequence number) and which session audits exclusively; the null
+  a saved session's context sequence number; a policy session's policyDigest and what its
+  policy commands require: command code, locality, cpHash or Names or template hash,
+  timeout, PCR update counter, authValue or password, NV written, its start time and epoch) and
+  which session audits exclusively; the orderly NV indices' RAM copies; the null
   hierarchy's proof and seed; the clear and restart counts; the context counters.
 
 A key is stored as its public and sensitive areas (the TPM's wire format), its Name and
@@ -296,6 +333,48 @@ rather than silently manufacture over it. `vk` then offers either to keep the li
 that machine or to reset its TPM explicitly. The default for new machines is decided when
 phase 5 lands.
 
+## Policy sessions
+
+A policy command extends the session's policyDigest (H(policyDigest ‖ code ‖ arguments)) and,
+unless the session is a trial, checks its assertion now (PolicyPCR's values, PolicySigned's
+signature, PolicyNV's comparison, ...) or records what the authorization must check
+(`session::PolicyState`). CheckPolicyAuthSession then checks, in the reference's order: the
+PCR update counter, the digest against the entity's authPolicy and its hash, the timeout and
+time epoch, the command code (none: only the USER role; the ADMIN and DUP roles need
+TPM2_PolicyCommandCode or TPM2_PolicyDuplicationSelect), the locality, physical presence (never
+asserted here), the cpHash, Names or template hash, NV written. TPM2_PolicyAuthValue makes the
+HMAC key include the authValue, TPM2_PolicyPassword makes it a password in clear. Once used,
+the session starts over, its expirations counting from then. Tickets (PolicySigned,
+PolicySecret, then PolicyTicket) are HMACs with the hierarchy's proof over the timeout, the
+time epoch and, for one that ends at the next reset, totalResetCount, as in the reference.
+
+## EK certificate
+
+A guest (Windows' provisioning task, `tpm2_createek`) makes its EK with TPM2_CreatePrimary
+and the EK Credential Profile's default template: the key derives from the EPS, so it is the
+same each time. What a manufacturer adds is a certificate of it, in NV at 0x01C00002 (RSA) or
+0x01C0000A (ECC), and often the EK made persistent (0x81010001 / 0x8101000A, as swtpm_setup
+does). The options:
+
+1. **None** (libtpms in `vk` today, and the default): the libtpms build provisions nothing,
+   and its Windows guests use their TPM (Get-Tpm, the TPM-backed AD member of the Windows
+   end-to-end test). AD CS key attestation works by user credentials or by EK public key (the
+   EKPUB list), not by EK certificate.
+2. **A per-host virtkit CA** signs each TPM's EK at manufacture (`vk` holds the CA key, exports
+   its certificate for an administrator to put in AD CS's EKROOT/EKCA stores): AD CS key
+   attestation by EK certificate then works too. It needs X.509 generation (with the
+   profile's extensions) and CA key management in `vk-driver`.
+3. A self-signed certificate: present, trusted by nobody; no use.
+
+Decision: **none by default**, the simplest, and what Windows guests run with today; and the
+mechanism for option 2 is in `vk-tpm` now: `Tpm::endorsement_key(kind)` gives the EK's
+public area to certify, `Tpm::provision_endorsement_key(kind, Some(der))` makes the EK
+persistent and stores the certificate in its index (platform-created, written and
+write-locked, readable by the owner and with its empty authValue, `TPMA_NV_NO_DA`), as
+swtpm_setup provisions QEMU's TPMs. Whether `vk` adds the CA is phase 5's call. TPM2_Clear
+removes the persistent EK (an endorsement object), not the certificate (platform-created);
+TPM2_ChangeEPS makes both stale.
+
 ## Deviations from libtpms
 
 Where `vk-tpm` answers differently from libtpms, on purpose (the differential tests exempt
@@ -331,6 +410,11 @@ exactly these):
   CSPRNG, which guest data cannot make better (libtpms mixes it into its own DRBG).
 - **An RSA public key with an even exponent** cannot encrypt (RSAES, OAEP: TPM_RC_FAILURE);
   `rsa` refuses one. No TPM-made key has one.
+- **Derivation parents** (a restricted keyed-hash decryption key, which TPM2_CreateLoaded
+  derives children from) are not implemented: such a key is no parent (TPM_RC_TYPE).
+- **Attestations** report `vk-tpm`'s firmware version (and each engine has its own Clock).
+- **Command audit** (SetCommandCodeAuditStatus, GetCommandAuditDigest) and TPM2_Rewrap are not
+  implemented.
 
 Quirks of the reference implementation that `vk-tpm` keeps, so it answers the same:
 TPM2_PCR_Allocate takes effect at the next power on and TPM2_Clear drops a pending one
@@ -343,7 +427,10 @@ command (so a child loaded under a persistent parent gets the next slot's handle
 ticket for the null hierarchy is an HMAC with the null proof; TPM2_RSA_Encrypt answers
 TPM_RC_FAILURE for a message too long for its padding (OpenSSL's error); RSAES decryption never
 fails on padding (implicit rejection); the platform may remove an owner's persistent object;
-TPM2_Clear also starts Clock over.
+TPM2_Clear also starts Clock over. And from phase 4: TPM2B_NAME takes 68 bytes (libtpms' padded
+sizeof(TPMU_NAME)), TPM2B_TEMPLATE 612; an attestation of a sequence names it with an empty
+Name; TPM2_Quote filters its selection with the allocation of the next power on; the
+obfuscation of an attestation's counters reads KDFa's output as little-endian words.
 
 ## Security
 
@@ -374,7 +461,7 @@ TPM2_Clear also starts Clock over.
   crashing the VM. In phase 2, lockout is the only DA-protected entity: hierarchies, PCRs and
   sequences are exempt; a key is unless it has noDA. A key's authValue serves the USER role
   only with userWithAuth, the ADMIN role only without adminWithPolicy (a policy session is
-  then required: TPM_RC_AUTH_TYPE, and TPM_RC_POLICY_FAIL until PolicyCommandCode exists).
+  then required: TPM_RC_AUTH_TYPE, and a policy bound to the command, see Policy sessions).
 - **Response size.** A response that would exceed the buffer is `TPM_RC_FAILURE`, never
   truncated.
 
@@ -421,6 +508,13 @@ TPM2_Clear also starts Clock over.
      slots they take; salted sessions (RSA-OAEP and ECDH salts) by the client checking each
      TPM's HMACs; templates, LoadExternal inputs and object authorization (roles, DA,
      bound and policy sessions) by response code.
+   - NV indices, policies, attestation and duplication (`tests/nv`, `tests/policy`,
+     `tests/attest`, `tests/duplication`): NV indices and policy digests byte for byte, policy
+     sessions authorizing alike (roles, cpHash, Names, PCRs, tickets, PolicyAuthorize(NV)); each
+     TPMS_ATTEST byte for byte but for Clock, TPM time and the firmware version (the obfuscated
+     counters included), each engine's signatures verified by the other; credentials and
+     duplicates each engine makes activated or imported by the other; EncryptDecrypt byte for
+     byte, IV out included, in every mode.
    - A **mutation pass** flips bits in a corpus of well-formed commands with a fixed-seed
      xorshift: 60k commands over every implemented command, sessions and objects included, on
      seeded TPMs (re-seeded after a mutation that changes the seeds, after an RSA primary,
@@ -451,5 +545,5 @@ TPM2_Clear also starts Clock over.
 | 1 | **Done.** Crate, marshalling, RCs, state format; Startup, Shutdown, SelfTest, GetCapability, GetRandom, PCR_Read, PCR_Extend; password sessions; the libtpms differential harness | ~3 kLoC, half of it tests |
 | 2 | **Done.** StartAuthSession (unsalted; bound or not; HMAC, policy, trial), HMAC sessions, cpHash/rpHash/names, parameter encryption (AES-CFB, XOR), audit sessions, KDFa/KDFe, DA logic, HierarchyControl, HierarchyChangeAuth, SetPrimaryPolicy, Clear, ClearControl, ChangeEPS, ChangePPS, DictionaryAttackLockReset/Parameters, PCR_Allocate/Reset/Event, Hash, hash and event sequences, FlushContext | ~5.5 kLoC, half of it tests |
 | 3 | **Done.** Objects: TPMT_PUBLIC/SENSITIVE, protection (symmetric + integrity), CreatePrimary (deterministic), Create/Load/ReadPublic/Unseal/ObjectChangeAuth/LoadExternal, contexts (ContextSave/Load/Flush, saved sessions), EvictControl, Sign/VerifySignature, RSA_Encrypt/Decrypt, ECDH_KeyGen/ZGen, ECC_Parameters, RSA/ECC-salted sessions, HMAC/HMAC_Start and HMAC sequences, TestParms, StirRandom, GetTestResult, ReadClock (with Clock and the reset counters in the state) | ~6.5 kLoC, 40% of it tests |
-| 4 | NV indices (all types and attributes), the policy commands (PolicyCommandCode then lets a policy session take the ADMIN role), attestation (Quote, Certify*, GetTime, audit digests, Make/ActivateCredential), EK provisioning at manufacture (EK at 0x81010001 and an EK certificate in 0x01C00002, signed by a per-host virtkit CA). Left over from phase 3: CreateLoaded, EncryptDecrypt(2) | ~4.5 kLoC |
-| 5 | Integration: libkrun device on `vk-tpm`, MS-simulator socket server and the IBM TSS / tpm2-tools runs, fuzzing, Windows and Linux guest validation, removal of libtpms | ~1.5 kLoC + validation |
+| 4 | **Done.** NV indices (every type and attribute, orderly, budget), the policy commands (PolicyCommandCode gives the ADMIN role), attestation (Quote, Certify, CertifyCreation, NV_Certify, GetTime, GetSessionAuditDigest), MakeCredential/ActivateCredential, Duplicate/Import, CreateLoaded, EncryptDecrypt(2), EK provisioning API (see "EK certificate"); change tracking of the permanent state | ~7 kLoC, 40% of it tests |
+| 5 | Integration: libkrun device on `vk-tpm` (detecting a libtpms state, see "No migration"), the EK decision applied (and the per-host CA if wanted), MS-simulator socket server and the IBM TSS / tpm2-tools runs, fuzzing, Windows and Linux guest validation, removal of libtpms | ~1.5 kLoC + validation |
