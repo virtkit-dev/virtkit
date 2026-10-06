@@ -979,6 +979,42 @@ mod tests {
     async fn echo_server() -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        echo_on(listener);
+        addr
+    }
+
+    /// An echo server on one port at every address `localhost` resolves to, returning
+    /// that port. The agent dials those addresses in turn and the resolver returns ::1
+    /// first, so an echo server on 127.0.0.1 alone would leave [::1]:<port> to whatever
+    /// else on the host happens to listen there, and the relay would reach that instead.
+    async fn localhost_echo_server() -> u16 {
+        let mut addrs: Vec<std::net::IpAddr> = tokio::net::lookup_host(("localhost", 0))
+            .await
+            .unwrap()
+            .map(|a| a.ip())
+            .collect();
+        addrs.sort();
+        addrs.dedup();
+        assert!(!addrs.is_empty(), "localhost resolves to nothing");
+        'port: loop {
+            let first = TcpListener::bind((addrs[0], 0)).await.unwrap();
+            let port = first.local_addr().unwrap().port();
+            let mut listeners = vec![first];
+            for &ip in &addrs[1..] {
+                match TcpListener::bind((ip, port)).await {
+                    Ok(listener) => listeners.push(listener),
+                    // taken at this address: pick another port for all of them
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue 'port,
+                    // unusable here (e.g. IPv6 disabled): the agent cannot reach it either
+                    Err(_) => {}
+                }
+            }
+            listeners.into_iter().for_each(echo_on);
+            return port;
+        }
+    }
+
+    fn echo_on(listener: TcpListener) {
         tokio::spawn(async move {
             while let Ok((mut conn, _)) = listener.accept().await {
                 tokio::spawn(async move {
@@ -993,7 +1029,6 @@ mod tests {
                 });
             }
         });
-        addr
     }
 
     /// [`serve_on`], the accept loop behind `run`, relaying to `target` through the agent at
@@ -1111,8 +1146,8 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let echo_addr = echo_server().await;
-        let target = format!("tcp://localhost:{}", echo_addr.port());
+        let port = localhost_echo_server().await;
+        let target = format!("tcp://localhost:{port}");
 
         let front_addr = relay(agent_addr, target).await;
         let mut client = TcpStream::connect(front_addr).await.unwrap();
