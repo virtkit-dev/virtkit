@@ -489,7 +489,7 @@ impl Drop for Unended {
 }
 
 /// Write an audit line off the runtime.
-async fn audit(hub: &Arc<Hub>, actor: &str, event: String) -> Result<()> {
+pub(crate) async fn audit(hub: &Arc<Hub>, actor: &str, event: String) -> Result<()> {
     let (hub, actor) = (hub.clone(), actor.to_string());
     tokio::task::spawn_blocking(move || hub.db.audit(&actor, &event, crate::now_secs()))
         .await

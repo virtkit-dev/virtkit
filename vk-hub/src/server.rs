@@ -103,6 +103,8 @@ pub struct Hub {
     releases: Option<std::path::PathBuf>,
     /// Held by a release's add or remove, from its file to its row.
     releases_lock: Mutex<()>,
+    /// Where releases are fetched from, and the latest fetch.
+    pub(crate) fetches: crate::fetch::Fetches,
     /// Bumped whenever anything a page shows may have changed, for its live updates.
     changes: watch::Sender<u64>,
     /// The same, for one node: what that node's page follows. An entry exists while someone
@@ -154,6 +156,7 @@ impl Hub {
             oidc: false,
             releases: None,
             releases_lock: Mutex::new(()),
+            fetches: crate::fetch::Fetches::new(None),
             changes: watch::Sender::new(0),
             node_changes: Mutex::new(HashMap::new()),
             touched: watch::Sender::new(0),
@@ -237,6 +240,12 @@ impl Hub {
     /// This hub, keeping release binaries in `dir`.
     pub fn with_releases(mut self, dir: std::path::PathBuf) -> Self {
         self.releases = Some(dir);
+        self
+    }
+
+    /// This hub, fetching releases from `source`; `None` fetches none.
+    pub fn with_release_source(mut self, source: Option<crate::fetch::Source>) -> Self {
+        self.fetches = crate::fetch::Fetches::new(source);
         self
     }
 

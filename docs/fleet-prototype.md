@@ -131,11 +131,12 @@ system unit when run as root), preserving enrollment.
 
 `vk-hub serve [--config hub.toml]` serves nodes. `hub.toml` sets `addr` (default
 `127.0.0.1:8443`), `tls_cert` and `tls_key`, `data_dir` (default `$XDG_DATA_HOME/virtkit/hub`,
-else `~/.local/share/virtkit/hub`), and the web UI's keys (see [Web UI](#web-ui)). Every key
-is optional and an unknown one is an error. Without TLS the hub serves only on loopback. TLS is
-1.3 only, on both the hub and the node. `vk-hub token`, `vk-hub nodes`, `vk-hub release`,
-`vk-hub workloads`, `vk-hub audit` and `vk-hub ui` reach the running hub through
-`<data_dir>/admin.sock`, open to the hub's user and root.
+else `~/.local/share/virtkit/hub`), `release_repository` (see [Releases](#releases)), and the
+web UI's keys (see [Web UI](#web-ui)). Every key is optional and an unknown one is an error.
+Without TLS the hub serves only on loopback. TLS is 1.3 only, on both the hub and the node.
+`vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub workloads`, `vk-hub audit` and
+`vk-hub ui` reach the running hub through `<data_dir>/admin.sock`, open to the hub's user and
+root.
 
 `vk node run` holds a WebSocket session at `/v1/node` in the foreground. The node signs the
 hub's challenge, its node ID and incarnation (new on every `vk node run`), both version ranges,
@@ -349,6 +350,30 @@ update carries it (see [Release signing](#release-signing)); the hub checks only
 ed25519 signature in base64, and `release list` shows which releases are signed. Adding the same
 bytes again requires the same signature, including its absence: remove the release to change
 its signature.
+
+`vk-hub release fetch [<version>|latest]` downloads a published release instead, from
+`release_repository` in `hub.toml`: `https://github.com/virtkit-dev/virtkit` by default, another
+`https://<host>/<owner>/<repo>` — a repository on a GitHub Enterprise Server, whose API is
+`/api/v3` on that host — or `"none"`, which turns fetching off. The hub resolves the release
+through GitHub's REST API, downloads its `vk` asset (the static linux x86-64 binary) over https,
+refusing any redirect off it, and holds it only once it hashes to the sha256 the release
+publishes beside it in `vk.sha256`, the tag is the version asked for, and the binary passes the
+checks above; it is held unsigned, as `vk-hub release add` without `--signature` holds one. This
+is the code `vk update` replaces a binary with (`vk-selfupdate`), short of running the binary,
+which the hub never does. The asset may be at most 512 MiB, each read must arrive within 30
+seconds, the fetch's requests within 30 minutes in all, and one fetch runs at a time. The
+`HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` environment of `vk-hub serve` applies. `--check`
+prints which version the latest release is, and downloads nothing; asked again within 30
+seconds, it gives the last answer, or the last failure, as GitHub allows an unauthenticated
+caller 60 requests an hour. The fetch, and a failure with its reason, are audited, and the
+release added is audited as a `release add` is.
+
+What a fetch proves is that the hub holds the bytes the repository published as that version,
+intact: not who built them. A repository or account compromised to publish another binary
+with a matching `vk.sha256` passes, as `vk update` does. Releases are attested by a
+reproducible rebuild in CI, which the hub does not check, and official releases carry no
+release key signature yet, so a node with `require_signed` refuses a fetched release, as it
+refuses any unsigned one (see [Release signing](#release-signing)).
 
 An update's release is downloaded from the node listener, `GET /v1/releases/<sha256>`, with the
 node's ID, the time and its signature over both, the release and the connection's TLS exporter

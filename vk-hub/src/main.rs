@@ -26,6 +26,7 @@ use clap::{Parser, Subcommand};
 
 mod admin;
 mod config;
+mod fetch;
 mod local;
 mod ops;
 mod releases;
@@ -58,7 +59,7 @@ struct Cli {
 #[derive(clap::Args)]
 struct ConfigArg {
     /// hub.toml: addr, tls_cert, tls_key, data_dir, ui_addr, ui_url, ui_tls_cert,
-    /// ui_tls_key, [oidc] [default: built-in defaults]
+    /// ui_tls_key, release_repository, [oidc] [default: built-in defaults]
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 }
@@ -169,6 +170,20 @@ enum ReleaseCmd {
         /// one
         #[arg(long, value_name = "FILE")]
         signature: Option<PathBuf>,
+    },
+    /// Download a release's vk from the hub's release_repository and hold it
+    ///
+    /// The hub downloads the vk of that virtkit release (linux x86-64), requires it to hash to
+    /// the sha256 the release publishes beside it and to hold the version as a string of its
+    /// own, and holds it unsigned. That proves the bytes are the ones published, not who built
+    /// them; a node that requires signed releases refuses it.
+    Fetch {
+        /// The release's version, or `latest`
+        #[arg(default_value = "latest")]
+        version: String,
+        /// Only print which version the latest release is
+        #[arg(long, conflicts_with = "version")]
+        check: bool,
     },
     /// List the releases the hub holds
     List,
@@ -542,6 +557,27 @@ async fn run(cli: Cli) -> Result<()> {
                         store::short(&added.sha256)
                     );
                 }
+                ReleaseCmd::Fetch { check: true, .. } => {
+                    let latest =
+                        tokio::task::spawn_blocking(move || client.latest_release()).await??;
+                    println!("{latest}");
+                }
+                ReleaseCmd::Fetch { version, .. } => {
+                    let version = fetch::wanted(&version)?;
+                    let fetched = tokio::task::spawn_blocking(move || {
+                        client.fetch_release(version.as_deref())
+                    })
+                    .await??;
+                    // The sha256 alone on stdout, as `release add` prints it.
+                    println!("{}", fetched.sha256);
+                    eprintln!(
+                        "vk-hub: holding vk {} ({} bytes, unsigned); `vk-hub rollout create \
+                         --release {}` rolls it out",
+                        fetched.row.version,
+                        fetched.row.size,
+                        store::short(&fetched.sha256)
+                    );
+                }
                 ReleaseCmd::List => {
                     let releases = tokio::task::spawn_blocking(move || client.releases()).await??;
                     for r in releases {
@@ -864,8 +900,11 @@ async fn serve(cfg: HubConfig) -> Result<()> {
         None => None,
     };
     let db = Arc::new(store::Db::open(&cfg.db_path())?);
+    // Before anything could be staging a release: what is staged is a stopped hub's.
+    releases::sweep(&cfg.releases_dir());
     let mut hub = server::Hub::new(db, cfg.ui.as_ref().map(|ui| ui.url.clone()))
-        .with_releases(cfg.releases_dir());
+        .with_releases(cfg.releases_dir())
+        .with_release_source(cfg.release_source.clone());
     if oidc.is_some() {
         if hub.db.accounts()?.is_empty() {
             eprintln!(

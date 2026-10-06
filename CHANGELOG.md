@@ -97,6 +97,10 @@ All notable changes to virtkit will be documented in this file.
   audited, refused sign-ins and those only `*` admits at a bounded rate, and
   `vk-hub ui sessions` names who signed in. Sign-in links from `vk-hub ui login` keep working.
 
+- **Experimental: `vk-hub release fetch [<version>|latest]` downloads a published release.**
+  The hub holds the release's `vk` once it matches the sha256 published beside it, unsigned.
+  `release_repository` in `hub.toml` names another repository, or `"none"` turns fetching off.
+
 ### Changed
 
 - Rust toolchain upgraded to 1.99.0.

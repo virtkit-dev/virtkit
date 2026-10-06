@@ -9,6 +9,10 @@
 //! **Signature verification belongs to the node.** The hub stores optional signatures made
 //! offline with `vk release-key sign` and forwards them. Each node verifies them against
 //! its configured keys; the hub holds no trusted release key.
+//!
+//! A binary reaches the hub two ways, both held to the same checks: `release add` copies a
+//! file on the hub's host ([`add`]); `release fetch` downloads one from GitHub
+//! ([`crate::fetch`]) into a [`Staged`] file here that [`adopt`] takes in.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -60,6 +64,79 @@ pub fn path(dir: &Path, sha256: &str) -> PathBuf {
     dir.join(sha256)
 }
 
+/// The releases directory, created private if it is not there yet.
+fn releases_dir(hub: &Hub) -> Result<&Path> {
+    let dir = hub.releases_dir()?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// A file in the releases directory that is not a release yet: removed when dropped, unless
+/// [`publish`] has renamed it into place. A drop is what cleans up after a failure anywhere,
+/// a download given up included.
+pub struct Staged {
+    path: PathBuf,
+}
+
+impl Staged {
+    /// A new name in the releases directory for a file still to arrive, `.<what>-<random>.tmp`
+    /// — nothing is created yet. Names starting with `.` are never a release's.
+    pub fn name(hub: &Hub, what: &str) -> Result<Staged> {
+        let dir = releases_dir(hub)?;
+        Ok(Staged {
+            path: dir.join(format!(".{what}-{}.tmp", crate::random_hex(8)?)),
+        })
+    }
+
+    /// [`Staged::name`], created private and empty, refusing anything already there.
+    pub fn create(hub: &Hub, what: &str) -> Result<(Staged, std::fs::File)> {
+        let staged = Self::name(hub, what)?;
+        let file = create_private(&staged.path)?;
+        Ok((staged, file))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        // Best effort: the error being reported is what matters, not a failed unlink. Gone
+        // already is the published case.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Remove the files a hub that stopped mid-add or mid-fetch left in `dir`: every name starting
+/// with `.`, which no release has. Run as the hub starts, before anything could be staging one.
+pub fn sweep(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().as_encoded_bytes().starts_with(b".")
+            && entry.file_type().is_ok_and(|t| t.is_file())
+        {
+            // Best effort, as the drop above.
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn create_private(path: &Path) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))
+}
+
 /// Copy the binary at `from` into the hub as `version`, with `signature`, audited as
 /// `actor`'s. Its sha256 names it; the file is published whole, by rename, before the row
 /// that points at it is written.
@@ -72,12 +149,7 @@ pub fn add(
 ) -> Result<Release> {
     check_version(version)?;
     let signature = signature.map(|s| check_signature(&s)).transpose()?;
-    let dir = hub.releases_dir()?;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    releases_dir(hub)?;
     // Non-blocking, so a FIFO opens at once, to be refused below as not a regular file; it
     // changes nothing for a regular file's reads.
     let mut source = std::fs::OpenOptions::new()
@@ -98,17 +170,50 @@ pub fn add(
             meta.len()
         );
     }
-    let tmp = dir.join(format!(".add-{}.tmp", crate::random_hex(8)?));
-    let copied = copy_checked(&mut source, &tmp, version)
-        .with_context(|| format!("reading {} as vk {version}", from.display()));
-    let (sha256, size) = match copied {
-        Ok(v) => v,
-        Err(e) => {
-            // Best effort: the error is what the operator needs, not a failed unlink.
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-    };
+    let (staged, mut out) = Staged::create(hub, "add")?;
+    let (sha256, size) = copy_checked(&mut source, Some((&mut out, staged.path())), version)
+        .with_context(|| format!("reading {} as vk {version}", from.display()))?;
+    drop(out);
+    publish(hub, actor, staged, &sha256, size, version, signature)
+}
+
+/// Take the binary `staged` holds — downloaded into it, and closed — into the hub as `version`,
+/// with `signature`, audited as `actor`'s: the same checks as [`add`], read in place, and the
+/// file renamed to its sha256.
+pub fn adopt(
+    hub: &Hub,
+    actor: &str,
+    staged: Staged,
+    version: &str,
+    signature: Option<String>,
+) -> Result<Release> {
+    check_version(version)?;
+    let signature = signature.map(|s| check_signature(&s)).transpose()?;
+    // Not through a link: the directory is the hub's own, but nothing here needs one.
+    let mut source = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(staged.path())
+        .with_context(|| format!("opening {}", staged.path().display()))?;
+    let (sha256, size) = copy_checked(&mut source, None, version)
+        .with_context(|| format!("reading the binary as vk {version}"))?;
+    drop(source);
+    publish(hub, actor, staged, &sha256, size, version, signature)
+}
+
+/// Rename `staged`, checked to hash to `sha256`, into place as release `sha256`, and record
+/// it.
+fn publish(
+    hub: &Hub,
+    actor: &str,
+    staged: Staged,
+    sha256: &str,
+    size: u64,
+    version: &str,
+    signature: Option<String>,
+) -> Result<Release> {
+    let dir = hub.releases_dir()?;
+    let sha256 = sha256.to_string();
     let row = ReleaseRow {
         version: version.to_string(),
         size,
@@ -123,7 +228,6 @@ pub fn add(
     let existing = hub.db.release(&sha256)?;
     if let Some(existing) = &existing {
         if existing.version != row.version || existing.signature != row.signature {
-            let _ = std::fs::remove_file(&tmp);
             bail!(
                 "release {sha256} is already held, as vk {}{}",
                 existing.version,
@@ -136,7 +240,6 @@ pub fn add(
         }
         // The same bytes as the same release: an add retried after its answer was lost.
         if std::fs::metadata(&dest).is_ok_and(|m| m.is_file() && m.len() == existing.size) {
-            let _ = std::fs::remove_file(&tmp);
             return Ok(Release {
                 sha256,
                 row: existing.clone(),
@@ -145,10 +248,8 @@ pub fn add(
         // Its file is missing or the wrong size: these bytes restore it, under the row already
         // there.
     }
-    if let Err(e) = std::fs::rename(&tmp, &dest) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("publishing {}", dest.display()));
-    }
+    std::fs::rename(staged.path(), &dest)
+        .with_context(|| format!("publishing {}", dest.display()))?;
     if let Ok(d) = std::fs::File::open(dir) {
         // Best effort, as vk-selfupdate's publish: the rename has happened.
         let _ = d.sync_all();
@@ -190,16 +291,14 @@ pub fn remove(hub: &Hub, actor: &str, sha256: &str) -> Result<bool> {
     Ok(removed)
 }
 
-/// Copy `source` to a new private file at `tmp` and flush it to disk. Check that it is an
-/// x86-64 ELF no larger than [`MAX_RELEASE`] and contains `version` as a standalone string
-/// while copying. Return its hex sha256 and size.
-fn copy_checked(source: &mut std::fs::File, tmp: &Path, version: &str) -> Result<(String, u64)> {
-    let mut out = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(tmp)
-        .with_context(|| format!("creating {}", tmp.display()))?;
+/// Read `source` to its end, checking that it is an x86-64 ELF no larger than [`MAX_RELEASE`]
+/// and contains `version` as a standalone string; when `out` is given, copy it there and flush
+/// it to disk. Return its hex sha256 and size.
+fn copy_checked(
+    source: &mut std::fs::File,
+    mut out: Option<(&mut std::fs::File, &Path)>,
+    version: &str,
+) -> Result<(String, u64)> {
     let mut hasher = Sha256::new();
     let mut finder = Finder::new(version.as_bytes());
     let mut header = Vec::with_capacity(ELF_HEADER);
@@ -220,8 +319,10 @@ fn copy_checked(source: &mut std::fs::File, tmp: &Path, version: &str) -> Result
         }
         hasher.update(chunk);
         finder.feed(chunk);
-        out.write_all(chunk)
-            .with_context(|| format!("writing {}", tmp.display()))?;
+        if let Some((out, tmp)) = &mut out {
+            out.write_all(chunk)
+                .with_context(|| format!("writing {}", tmp.display()))?;
+        }
     }
     finder.finish();
     if !is_x86_64_elf(&header) {
@@ -233,8 +334,10 @@ fn copy_checked(source: &mut std::fs::File, tmp: &Path, version: &str) -> Result
              --version against what the binary's `--version` prints"
         );
     }
-    out.sync_all()
-        .with_context(|| format!("flushing {}", tmp.display()))?;
+    if let Some((out, tmp)) = out {
+        out.sync_all()
+            .with_context(|| format!("flushing {}", tmp.display()))?;
+    }
     Ok((vk_hub_proto::to_hex(&hasher.finalize()), size))
 }
 

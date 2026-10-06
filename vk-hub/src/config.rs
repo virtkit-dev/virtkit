@@ -10,6 +10,8 @@
 //! ui_url = "https://hub.example.com:8444"  # what browsers reach it as
 //! ui_tls_cert = "/etc/vk-hub/ui-cert.pem"  # default: tls_cert/tls_key
 //! ui_tls_key = "/etc/vk-hub/ui-key.pem"
+//! # Where `vk-hub release fetch` downloads releases from; "none" turns fetching off.
+//! release_repository = "https://github.com/virtkit-dev/virtkit"
 //!
 //! # Sign-in to the web UI through an OIDC provider; off unless set.
 //! [oidc]
@@ -55,6 +57,8 @@ pub struct HubConfig {
     pub tls_key: Option<PathBuf>,
     pub data_dir: PathBuf,
     pub ui: Option<UiConfig>,
+    /// Where releases are fetched from; `None` with fetching off.
+    pub release_source: Option<crate::fetch::Source>,
 }
 
 /// The web UI's listener.
@@ -93,6 +97,7 @@ struct FileConfig {
     ui_url: Option<String>,
     ui_tls_cert: Option<PathBuf>,
     ui_tls_key: Option<PathBuf>,
+    release_repository: Option<String>,
     oidc: Option<FileOidc>,
 }
 
@@ -197,12 +202,18 @@ impl HubConfig {
             }
             None => None,
         };
+        let release_source = match f.release_repository.as_deref() {
+            None => Some(crate::fetch::Source::virtkit()),
+            Some("none") => None,
+            Some(url) => Some(crate::fetch::Source::parse(url)?),
+        };
         Ok(HubConfig {
             addr,
             tls_cert: f.tls_cert,
             tls_key: f.tls_key,
             data_dir,
             ui,
+            release_source,
         })
     }
 
@@ -425,6 +436,25 @@ mod tests {
         assert_eq!(cfg.db_path(), Path::new("/srv/hub/hub.db"));
         assert_eq!(cfg.admin_socket(), Path::new("/srv/hub/admin.sock"));
         assert!(parse("tls_crt = \"/c.pem\"\n").is_err());
+    }
+
+    #[test]
+    fn releases_are_fetched_from_virtkit_unless_configured_otherwise() {
+        let source =
+            |text: &str| parse(text).map(|c| c.release_source.map(|s| s.url().to_string()));
+        assert_eq!(
+            source("data_dir = \"/d\"\n").unwrap().as_deref(),
+            Some(crate::fetch::DEFAULT_SOURCE)
+        );
+        assert_eq!(
+            source("release_repository = \"https://ghe.example/ops/vk/\"\n")
+                .unwrap()
+                .as_deref(),
+            Some("https://ghe.example/ops/vk")
+        );
+        assert_eq!(source("release_repository = \"none\"\n").unwrap(), None);
+        let err = source("release_repository = \"http://github.com/a/b\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("expected https://"), "{err:#}");
     }
 
     #[test]

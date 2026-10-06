@@ -53,6 +53,14 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// disk. An add retried after this ran out finds the release added and answers with it.
 const ADD_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How long the CLI waits for a fetch: past the hub's own limit on one, so it hears how it
+/// ended. A fetch goes on when the CLI stops waiting; the next finds the release held.
+const FETCH_WAIT: Duration = Duration::from_secs(35 * 60);
+
+/// How long the CLI waits to hear which release is the latest: the hub's own limit on asking,
+/// twice over, as it may be waiting on a check the pages started.
+const CHECK_WAIT: Duration = Duration::from_secs(2 * crate::fetch::CHECK_TIMEOUT.as_secs() + 30);
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 enum Call {
@@ -94,6 +102,12 @@ enum Call {
         #[serde(default)]
         signature: Option<String>,
     },
+    /// Download a release's `vk` from the configured repository: `None` for the latest.
+    FetchRelease {
+        version: Option<String>,
+    },
+    /// The latest release the configured repository publishes.
+    LatestRelease,
     ListReleases,
     RemoveRelease {
         release: String,
@@ -274,9 +288,15 @@ async fn serve_one(mut stream: UnixStream, hub: Arc<Hub>, uid: u32) -> Result<()
     if body.is_empty() {
         return Ok(());
     }
-    let reply = tokio::task::spawn_blocking(move || match dispatch(&body, &hub, uid) {
-        Ok(value) => serde_json::to_vec(&Reply::Ok(value)),
-        Err(e) => serde_json::to_vec(&Reply::<()>::Err(format!("{e:#}"))),
+    let done = match fetch_call(&body) {
+        Some(call) => Some(dispatch_fetch(call, &hub, uid).await),
+        None => None,
+    };
+    let reply = tokio::task::spawn_blocking(move || {
+        match done.unwrap_or_else(|| dispatch(&body, &hub, uid)) {
+            Ok(value) => serde_json::to_vec(&Reply::Ok(value)),
+            Err(e) => serde_json::to_vec(&Reply::<()>::Err(format!("{e:#}"))),
+        }
     })
     .await
     .context("running an admin operation")?
@@ -288,6 +308,39 @@ async fn serve_one(mut stream: UnixStream, hub: Arc<Hub>, uid: u32) -> Result<()
     .await
     .map_err(|_| anyhow!("a peer took longer than {IO_TIMEOUT:?} to read its reply"))?
     .context("writing an admin reply")
+}
+
+/// Extract calls that await network I/O on the runtime rather than a blocking thread.
+/// Leave other calls, including version mismatches, to [`dispatch`].
+fn fetch_call(body: &[u8]) -> Option<Call> {
+    let probe: VersionProbe = serde_json::from_slice(body).ok()?;
+    if probe.v != PROTOCOL_VERSION {
+        return None;
+    }
+    let envelope: Envelope = serde_json::from_slice(body).ok()?;
+    matches!(
+        envelope.call,
+        Call::FetchRelease { .. } | Call::LatestRelease
+    )
+    .then_some(envelope.call)
+}
+
+async fn dispatch_fetch(call: Call, hub: &Arc<Hub>, uid: u32) -> Result<serde_json::Value> {
+    let actor = format!("uid {uid}");
+    match call {
+        Call::FetchRelease { version } => {
+            let version = match version {
+                Some(v) => crate::fetch::wanted(&v)?,
+                None => None,
+            };
+            let release = crate::fetch::start(hub, &actor, version)?
+                .await
+                .context("fetching the release")??;
+            Ok(serde_json::to_value(release)?)
+        }
+        Call::LatestRelease => Ok(serde_json::to_value(crate::fetch::latest(hub).await?)?),
+        _ => bail!("not a fetch"),
+    }
 }
 
 fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
@@ -337,6 +390,9 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
         } => serde_json::to_value(crate::releases::add(
             hub, &actor, &path, &version, signature,
         )?)?,
+        Call::FetchRelease { .. } | Call::LatestRelease => {
+            bail!("a fetch is served on its own path")
+        }
         Call::ListReleases => serde_json::to_value(hub.db.releases()?)?,
         Call::RemoveRelease { release } => {
             let release = hub.db.resolve_release(&release)?;
@@ -543,6 +599,18 @@ impl Client {
         })
     }
 
+    /// Fetch `version`'s `vk`, `None` for the latest release's, waiting until it is held.
+    pub fn fetch_release(&self, version: Option<&str>) -> Result<Release> {
+        self.call(Call::FetchRelease {
+            version: version.map(str::to_string),
+        })
+    }
+
+    /// The latest release the hub's repository publishes.
+    pub fn latest_release(&self) -> Result<String> {
+        self.call(Call::LatestRelease)
+    }
+
     pub fn releases(&self) -> Result<Vec<Release>> {
         self.call(Call::ListReleases)
     }
@@ -618,6 +686,8 @@ impl Client {
     fn call<T: DeserializeOwned>(&self, call: Call) -> Result<T> {
         let timeout = match call {
             Call::AddRelease { .. } => ADD_TIMEOUT,
+            Call::FetchRelease { .. } => FETCH_WAIT,
+            Call::LatestRelease => CHECK_WAIT,
             _ => IO_TIMEOUT,
         };
         let request = serde_json::to_vec(&Envelope {
