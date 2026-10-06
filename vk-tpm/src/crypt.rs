@@ -146,7 +146,7 @@ pub fn aes_cfb(key: &[u8], iv: &[u8], data: &mut [u8], encrypt: bool) -> Result<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     pub fn unhex(s: &str) -> Vec<u8> {

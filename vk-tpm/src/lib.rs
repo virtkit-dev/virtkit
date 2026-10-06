@@ -22,6 +22,7 @@ mod alg;
 mod capability;
 mod commands;
 mod crypt;
+mod drbg;
 mod entity;
 mod hierarchy;
 mod marshal;
