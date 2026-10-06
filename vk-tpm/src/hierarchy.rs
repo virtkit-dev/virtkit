@@ -260,7 +260,8 @@ impl Tpm {
     /// lockoutRecovery has.
     pub fn da_self_heal(&mut self) {
         let now = i64::try_from(self.volatile.time).unwrap_or(i64::MAX);
-        let da = &mut self.permanent.dictionary_attack;
+        // Worked on a copy: the permanent state is touched only if it changes.
+        let mut da = self.permanent.dictionary_attack.clone();
         let timers = &mut self.volatile.da_timers;
         if da.failed_tries != 0 {
             if da.recovery_time == 0 {
@@ -284,6 +285,9 @@ impl Tpm {
             && now.saturating_sub(timers.lockout) / 1000 >= i64::from(da.lockout_recovery)
         {
             da.lockout_auth_enabled = true;
+        }
+        if da != self.permanent.dictionary_attack {
+            self.permanent.dictionary_attack = da;
         }
     }
 

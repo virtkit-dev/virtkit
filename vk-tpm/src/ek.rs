@@ -158,7 +158,6 @@ impl Tpm {
         list.retain(|(h, _)| *h != handle);
         let at = list.partition_point(|(h, _)| *h < handle);
         list.insert(at, (handle, key));
-        self.permanent_changed = true;
         Ok(())
     }
 }

@@ -48,7 +48,7 @@ pub use ek::EkKind;
 use marshal::{Reader, Writer};
 pub use rc::Rc;
 pub use state::StateError;
-use state::{Permanent, Shutdown, Volatile};
+use state::{Permanent, Shutdown, Tracked, Volatile};
 use zeroize::Zeroizing;
 
 /// The largest command (and response) the TPM takes: the buffer of libkrun's CRB device
@@ -65,11 +65,10 @@ const CLOCK_UPDATE_INTERVAL: u32 = 12;
 
 /// A TPM: its permanent state (what survives power-off) and its volatile state.
 pub struct Tpm {
-    permanent: Permanent,
+    /// Changed since [`Tpm::take_permanent_changed`] last said so, or not.
+    permanent: Tracked,
     volatile: Volatile,
     clock: Clock,
-    /// The permanent state changed since [`Tpm::take_permanent_changed`] last said so.
-    permanent_changed: bool,
 }
 
 impl Tpm {
@@ -78,9 +77,8 @@ impl Tpm {
         let permanent = Permanent::manufacture()?;
         Ok(Tpm {
             volatile: Volatile::power_on(&permanent),
-            permanent,
+            permanent: Tracked::new(permanent, true),
             clock: Clock::starting_at(0),
-            permanent_changed: true,
         })
     }
 
@@ -90,9 +88,8 @@ impl Tpm {
         let permanent = Permanent::deserialize(permanent)?;
         Ok(Tpm {
             volatile: Volatile::power_on(&permanent),
-            permanent,
+            permanent: Tracked::new(permanent, false),
             clock: Clock::starting_at(0),
-            permanent_changed: false,
         })
     }
 
@@ -101,10 +98,9 @@ impl Tpm {
     pub fn restore(permanent: &[u8], volatile: &[u8]) -> Result<Tpm, StateError> {
         let volatile = Volatile::deserialize(volatile)?;
         Ok(Tpm {
-            permanent: Permanent::deserialize(permanent)?,
+            permanent: Tracked::new(Permanent::deserialize(permanent)?, false),
             clock: Clock::starting_at(volatile.time),
             volatile,
-            permanent_changed: false,
         })
     }
 
@@ -135,18 +131,19 @@ impl Tpm {
     /// Whether the permanent state changed since the last call: the caller then stores
     /// [`Tpm::permanent_state`] before it hands the guest the response.
     pub fn take_permanent_changed(&mut self) -> bool {
-        std::mem::take(&mut self.permanent_changed)
+        self.permanent.take_changed()
     }
 
     /// Run one command and return its response, at most [`MAX_COMMAND_SIZE`] bytes. A command
     /// that fails gets the 10-byte error response the specification gives.
     pub fn process(&mut self, command: &[u8]) -> Vec<u8> {
         // Whatever the command does to the permanent state, a failed authorization included,
-        // is noticed here, so the caller stores it before the guest sees the response. Clock
-        // alone does not count: it is stored with the next change (as libtpms does), and a
-        // TPM that loses power without an orderly shutdown says its clock is not safe.
-        let clock = self.permanent.clock_state();
-        let before = self.permanent_state();
+        // marks it changed (see `Tracked`), so the caller stores it before the guest sees the
+        // response. Clock alone does not count: it is stored with the next change (as libtpms
+        // does), and a TPM that loses power without an orderly shutdown says its clock is not
+        // safe.
+        let before =
+            check_changes().then(|| (self.permanent.clock_state(), self.permanent_state()));
         let response = self.execute(command);
         // The persistent objects the command named leave their slots, whatever happened.
         self.flush_evicted();
@@ -155,11 +152,14 @@ impl Tpm {
             w.u16(TPM_ST_NO_SESSIONS).u32(HEADER_SIZE as u32).u32(rc.0);
             w.into_bytes()
         });
-        let now = self.permanent.set_clock_state(clock);
-        if *self.permanent_state() != *before {
-            self.permanent_changed = true;
+        if let Some((clock, before)) = before
+            && !self.permanent.is_changed()
+        {
+            let now = self.permanent.untracked().set_clock_state(clock);
+            let same = *self.permanent_state() == *before;
+            self.permanent.untracked().set_clock_state(now);
+            assert!(same, "a change to the permanent state went unnoticed");
         }
-        self.permanent.set_clock_state(now);
         response
     }
 
@@ -252,7 +252,7 @@ impl Tpm {
         // Clock is safe again once it crosses an update interval (TimeClockUpdate: the
         // reference writes it to NV then).
         const UPDATE_MASK: u64 = (1 << CLOCK_UPDATE_INTERVAL) - 1;
-        let p = &mut self.permanent;
+        let p = self.permanent.untracked();
         let clock = p.clock.saturating_add(elapsed);
         if clock | UPDATE_MASK > p.clock | UPDATE_MASK {
             p.clock_safe = true;
@@ -329,6 +329,13 @@ impl Clock {
     fn advance(&mut self, ms: u64) {
         self.base = self.base.saturating_add(ms);
     }
+}
+
+/// Check after each command that every change to the permanent state was noticed, by comparing
+/// it whole: in unit tests, and in a debug build with `VK_TPM_CHECK_CHANGES` set (the
+/// differential tests), as it costs a serialization per command.
+fn check_changes() -> bool {
+    cfg!(test) || (cfg!(debug_assertions) && std::env::var_os("VK_TPM_CHECK_CHANGES").is_some())
 }
 
 /// A TPM_ST the reference implementation knows: a command with another one is TPM_RC_BAD_TAG,

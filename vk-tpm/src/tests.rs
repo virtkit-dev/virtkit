@@ -1563,3 +1563,27 @@ fn a_provisioned_endorsement_key_and_its_certificate_persist() {
         Err(Rc::SIZE)
     );
 }
+
+#[test]
+fn commands_that_change_nothing_lasting_ask_for_no_store() {
+    let mut tpm = started();
+    tpm.take_permanent_changed();
+    let pcr_read = [&[0, 0, 0, 1, 0, 0x0b, 3][..], &[0xff; 3]].concat();
+    let hash = [&tpm2b(b"data")[..], &[0, 0x0b, 0x40, 0, 0, 7]].concat();
+    for c in [
+        command(
+            TPM_CC_GET_CAPABILITY,
+            &[],
+            None,
+            &[0, 0, 0, 6, 0, 0, 1, 0, 0, 0, 0, 8],
+        ),
+        command(TPM_CC_GET_RANDOM, &[], None, &[0, 8]),
+        command(TPM_CC_READ_CLOCK, &[], None, &[]),
+        command(TPM_CC_PCR_READ, &[], None, &pcr_read),
+        extend(0, 0x0b, &[1; 32]),
+        command(TPM_CC_HASH, &[], None, &hash),
+    ] {
+        assert_eq!(rc(&tpm.process(&c)), 0);
+        assert!(!tpm.take_permanent_changed(), "command {:x?}", &c[6..10]);
+    }
+}
