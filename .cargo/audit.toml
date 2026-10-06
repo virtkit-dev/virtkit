@@ -3,14 +3,21 @@
 # RUSTSEC-2023-0071 — Marvin attack (timing side-channel) on the `rsa` crate. No fixed
 # stable release: the constant-time fixes are split across upstream issue #626 (padding)
 # and PR #680 (the decrypt Ok/Err oracle) and currently exist only in the unreleased rsa
-# 0.10 release candidates. `rsa` enters the tree via russh (vk-agent's optional `ssh`
-# feature) as rsa 0.10-rc, which already carries those fixes; used so the embedded SSH
-# server can verify clients' RSA public keys. cargo-audit still flags it because the
-# advisory lists no patched version.
+# 0.10 release candidates. `rsa` enters the tree as 0.10.0-rc (on constant-time
+# crypto-bigint 0.7), which already carries those fixes, through two users:
 #
-# Residual risk is low: our SSH host key is Ed25519 and the server does RSA signature
-# *verification* (public-key side), not the private-key decryption that is Marvin's
-# sharpest edge. Revisit and drop this entry when rsa 0.10 ships stable.
+# - russh (vk-agent's optional `ssh` feature), so the embedded SSH server can verify
+#   clients' RSA public keys: signature *verification* only, our host key is Ed25519.
+# - vk-tpm, whose keys decrypt guest-chosen ciphertexts (an EK decrypts salts and
+#   credentials with OAEP; TPM2_RSA_Decrypt any padding). Every private operation is
+#   blinded and runs in constant time; OAEP is decoded in constant time and all its
+#   failures are one response code; PKCS#1 v1.5 decryption uses implicit rejection (as
+#   OpenSSL 3.2+, so libtpms, does), so it never reports bad padding at all. A timing test
+#   (`decryption_time_does_not_depend_on_the_padding`) checks it. See "RSA and the Marvin
+#   attack" in docs/tpm-design.md.
+#
+# cargo-audit still flags it because the advisory lists no patched version. Revisit and
+# drop this entry when rsa 0.10 ships stable.
 #
 # RUSTSEC-2025-0141 — `bincode` is unmaintained (informational, no vulnerability). It
 # enters the tree via imago, the qcow2 image library used by the vendored libkrun's block

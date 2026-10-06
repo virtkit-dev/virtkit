@@ -19,6 +19,7 @@
 )]
 
 mod alg;
+mod asym;
 mod capability;
 mod commands;
 mod crypt;

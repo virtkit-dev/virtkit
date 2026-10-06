@@ -4199,8 +4199,13 @@ version = "0.84.0"
 dependencies = [
  "aes",
  "cfb-mode",
+ "crypto-bigint",
+ "crypto-primes",
+ "ecdsa",
  "getrandom 0.4.3",
  "hmac",
+ "p256",
+ "rsa",
  "sha1",
  "sha2",
  "subtle",
