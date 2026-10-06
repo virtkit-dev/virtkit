@@ -1777,6 +1777,11 @@ fn mutated_commands_match() {
             drop(both);
             both = Both::seeded();
         }
+        // Now and then, the state the mutations leave in TPMA_PERMANENT, TPMA_STARTUP_CLEAR
+        // and the dictionary-attack counters.
+        if i % 100 == 99 {
+            read_hierarchy_state(&mut both);
+        }
         let mut c = corpus[(next() % corpus.len() as u64) as usize].clone();
         for _ in 0..1 + next() % 3 {
             let at = (next() % c.len() as u64) as usize;
