@@ -1220,3 +1220,146 @@ fn testing_random_and_clock_commands_match() {
     let (ours, theirs) = both.both(&command(READ_CLOCK, &[], None, &[]));
     assert_eq!(ours[26..], theirs[26..], "a reset, not orderly");
 }
+
+/// Commands whose successful answer holds random bytes.
+pub fn answers_randomly(code: u32) -> bool {
+    matches!(
+        code,
+        CREATE
+            | CREATE_PRIMARY
+            | SIGN
+            | RSA_ENCRYPT
+            | ECDH_KEYGEN
+            | CONTEXT_SAVE
+            | OBJECT_CHANGE_AUTH
+            | READ_CLOCK
+    )
+}
+
+/// The object commands the mutation pass starts from, on seeded TPMs: primaries and what uses
+/// them, external keys, contexts, persistent objects.
+pub fn mutation_corpus() -> Vec<Vec<u8>> {
+    // A sealed object libtpms wraps under the ECC storage key both derive.
+    let mut both = Both::seeded();
+    let srk = handle(&both.same(&create_primary(RH_OWNER, &ecc_srk())));
+    let p = create_params(b"pw", b"sealed", &sealed(), b"", &no_pcrs());
+    let created = params(
+        ok(&both.theirs.process(&with_password(CREATE, srk, b"", &p))),
+        false,
+    );
+    let (private, rest) = split2b(&created);
+    let load = [tpm2b(&private), tpm2b(&split2b(rest).0)].concat();
+    drop(both);
+    let digest = client::digest(client::SHA256, &[b"m"]);
+    let ticket = [&[0x80, 0x24][..], &RH_NULL.to_be_bytes(), &[0, 0]].concat();
+    let hmac_signature = [&[0, 5, 0, 0x0b][..], &[3; 32]].concat();
+    let ecc_point = tpm2b(&[tpm2b(&unhex(ECC_X)), tpm2b(&unhex(ECC_Y))].concat());
+    let salt = rsa_encrypt(0x8000_0002, &[5; 32], OAEP_SHA256, b"SECRET\0");
+    let context = [
+        &[0, 0, 0, 0, 0, 0, 0, 1][..],
+        &[0x80, 0, 0, 0],
+        &RH_OWNER.to_be_bytes(),
+        &tpm2b(&[0; 80]),
+    ]
+    .concat();
+    let salted = [tpm2b(&[1; 16]), tpm2b(&[7; 256]), vec![0, 0, 0x10, 0, 0x0b]].concat();
+    vec![
+        create_primary(RH_OWNER, &ecc_srk()),
+        create_primary(RH_ENDORSEMENT, &ecdsa_key()),
+        create_primary(RH_PLATFORM, &hmac_key()),
+        with_password(
+            CREATE_PRIMARY,
+            RH_OWNER,
+            b"",
+            &create_params(
+                b"a",
+                b"data",
+                &sealed(),
+                b"o",
+                &selection(&[(0x0b, &[1, 0, 0])]),
+            ),
+        ),
+        create_primary(
+            RH_NULL,
+            &public(ALG_SYMCIPHER, STORAGE, AES128_CFB, &tpm2b(b"")),
+        ),
+        with_password(
+            CREATE,
+            0x8000_0000,
+            b"",
+            &create_params(b"", b"x", &sealed(), b"", &no_pcrs()),
+        ),
+        with_password(LOAD, 0x8000_0000, b"", &load),
+        load_external(
+            &external_ecc_public(),
+            ALG_ECC,
+            Some(&unhex(ECC_D)),
+            RH_NULL,
+        ),
+        load_external(&external_rsa_public(), ALG_RSA, None, RH_OWNER),
+        command(READ_PUBLIC, &[0x8000_0001], None, &[]),
+        command(UNSEAL, &[0x8000_0001], Some(&password(b"pw")), &[]),
+        with_password(
+            SIGN,
+            0x8000_0001,
+            b"",
+            &[tpm2b(&digest), NULL.to_vec(), ticket.clone()].concat(),
+        ),
+        sign(0x8000_0002, &digest, ECDSA_SHA256),
+        verify(0x8000_0002, &digest, &hmac_signature),
+        rsa_encrypt(0x8000_0002, &[0, 1, 2], NULL, b""),
+        salt,
+        rsa_decrypt(0x8000_0002, &[1; 256], RSAES, b""),
+        with_password(ECDH_ZGEN, 0x8000_0002, b"", &ecc_point),
+        command(ECDH_KEYGEN, &[0x8000_0002], None, &[]),
+        with_password(
+            HMAC,
+            0x8000_0001,
+            b"",
+            &[tpm2b(b"data"), vec![0, 0x0b]].concat(),
+        ),
+        with_password(
+            HMAC_START,
+            0x8000_0001,
+            b"",
+            &[tpm2b(b""), vec![0, 0x10]].concat(),
+        ),
+        command(CONTEXT_SAVE, &[0x8000_0000], None, &[]),
+        command(CONTEXT_LOAD, &[], None, &context),
+        command(
+            EVICT_CONTROL,
+            &[RH_OWNER, 0x8000_0000],
+            Some(&password(b"")),
+            &0x8100_0001u32.to_be_bytes(),
+        ),
+        command(READ_PUBLIC, &[0x8100_0001], None, &[]),
+        command(
+            OBJECT_CHANGE_AUTH,
+            &[0x8000_0001, 0x8000_0000],
+            Some(&password(b"pw")),
+            &tpm2b(b"new"),
+        ),
+        command(START_AUTH_SESSION, &[0x8000_0002, RH_NULL], None, &salted),
+        command(
+            TEST_PARMS,
+            &[],
+            None,
+            &[0, 0x23, 0, 0x10, 0, 0x18, 0, 0x0b, 0, 3, 0, 0x10],
+        ),
+        command(
+            TEST_PARMS,
+            &[],
+            None,
+            &[
+                0, 1, 0, 6, 0, 0x80, 0, 0x43, 0, 0x17, 0, 0x0b, 8, 0, 0, 0, 0, 0,
+            ],
+        ),
+        command(ECC_PARAMETERS, &[], None, &[0, 3]),
+        command(STIR_RANDOM, &[], None, &tpm2b(b"stir")),
+        command(GET_TEST_RESULT, &[], None, &[]),
+        command(READ_CLOCK, &[], None, &[]),
+        get_capability(8, 0, 4),
+        get_capability(1, 0x8100_0000, 4),
+        get_capability(1, 0x0300_0000, 4),
+    ]
+}

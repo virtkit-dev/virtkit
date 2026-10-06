@@ -1706,8 +1706,25 @@ fn handle_count(code: u32) -> Option<usize> {
         | PCR_RESET
         | SEQUENCE_COMPLETE
         | SEQUENCE_UPDATE
-        | PCR_EXTEND => Some(1),
-        START_AUTH_SESSION | EVENT_SEQUENCE_COMPLETE => Some(2),
+        | PCR_EXTEND
+        | objects::CREATE_PRIMARY
+        | objects::CREATE
+        | objects::LOAD
+        | objects::READ_PUBLIC
+        | objects::UNSEAL
+        | objects::SIGN
+        | objects::VERIFY_SIGNATURE
+        | objects::RSA_ENCRYPT
+        | objects::RSA_DECRYPT
+        | objects::ECDH_KEYGEN
+        | objects::ECDH_ZGEN
+        | objects::HMAC
+        | objects::HMAC_START
+        | objects::CONTEXT_SAVE => Some(1),
+        START_AUTH_SESSION
+        | EVENT_SEQUENCE_COMPLETE
+        | objects::EVICT_CONTROL
+        | objects::OBJECT_CHANGE_AUTH => Some(2),
         _ => Some(0),
     }
 }
@@ -1797,6 +1814,7 @@ fn mutated_commands_match() {
         ),
         command(GET_RANDOM, &[], Some(&audit_session), &[0, 0]),
     ];
+    let corpus = [&corpus[..], &objects::mutation_corpus()].concat();
     // xorshift: a fixed seed, so a failure reproduces.
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = move || {
@@ -1836,7 +1854,9 @@ fn mutated_commands_match() {
         let base = rc(&ours) & 0x0bf;
         let unimplemented = rc(&ours) != rc(&theirs)
             && (matches!(base, 0x096 | 0x0a6) || (base == 0x092 && rc(&theirs) == 0));
-        if unimplemented {
+        // RSA encryption with a public key whose exponent is even: rsa refuses it.
+        let even_exponent = code == Some(objects::RSA_ENCRYPT) && rc(&ours) == 0x101;
+        if unimplemented || even_exponent {
             if rc(&theirs) == 0 {
                 drop(both);
                 both = Both::seeded();
@@ -1857,11 +1877,30 @@ fn mutated_commands_match() {
             both = Both::seeded();
             continue;
         }
-        // A session's nonces are each TPM's own: only the shape compares.
-        let random = code == Some(START_AUTH_SESSION) || uses_session(&c);
+        // A session's nonces are each TPM's own, and some commands answer with random bytes
+        // (signatures, encryption, wrapped objects, contexts, the clock): only the shape
+        // compares.
+        let random = code == Some(START_AUTH_SESSION)
+            || uses_session(&c)
+            || code.is_some_and(objects::answers_randomly);
         if random && rc(&ours) == 0 {
+            // A context's blob is each engine's own: its header compares.
+            if code == Some(objects::CONTEXT_SAVE) {
+                assert_eq!(
+                    hex(&ours[6..26]),
+                    hex(&theirs[6..26]),
+                    "command {}",
+                    hex(&c)
+                );
+                continue;
+            }
             assert_eq!(ours.len(), theirs.len(), "command {}", hex(&c));
             assert_eq!(hex(&ours[..10]), hex(&theirs[..10]), "command {}", hex(&c));
+            // vk-tpm's RSA primaries are its own keys: what uses them would differ.
+            if code == Some(objects::CREATE_PRIMARY) && ours != theirs {
+                drop(both);
+                both = Both::seeded();
+            }
             continue;
         }
         assert_eq!(hex(&ours), hex(&theirs), "command {}", hex(&c));
