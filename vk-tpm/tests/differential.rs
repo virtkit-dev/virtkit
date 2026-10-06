@@ -16,6 +16,7 @@
 
 mod client;
 mod libtpms;
+mod nv;
 mod objects;
 
 use client::{Auth, Sym};
@@ -1814,7 +1815,12 @@ fn mutated_commands_match() {
         ),
         command(GET_RANDOM, &[], Some(&audit_session), &[0, 0]),
     ];
-    let corpus = [&corpus[..], &objects::mutation_corpus()].concat();
+    let corpus = [
+        &corpus[..],
+        &objects::mutation_corpus(),
+        &nv::mutation_corpus(),
+    ]
+    .concat();
     // xorshift: a fixed seed, so a failure reproduces.
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut next = move || {
