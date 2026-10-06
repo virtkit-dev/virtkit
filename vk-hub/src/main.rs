@@ -58,7 +58,7 @@ struct Cli {
 #[derive(clap::Args)]
 struct ConfigArg {
     /// hub.toml: addr, tls_cert, tls_key, data_dir, ui_addr, ui_url, ui_tls_cert,
-    /// ui_tls_key [default: built-in defaults]
+    /// ui_tls_key, [oidc] [default: built-in defaults]
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 }
@@ -121,6 +121,17 @@ enum Cmd {
         config: ConfigArg,
         #[command(subcommand)]
         cmd: UiCmd,
+    },
+    /// List, grant and revoke who may sign in to the web UI through OIDC, and as what
+    ///
+    /// A grant gives an email address the provider signs someone in with a role; `*` makes
+    /// anyone else it signs in a viewer. Grants are kept in the hub's database and take effect
+    /// at once, on a hub with [oidc]; nobody else may sign in through it.
+    Accounts {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: Option<AccountsCmd>,
     },
     /// Serve a web UI for this machine's VMs, signed into with a link it prints
     ///
@@ -253,6 +264,35 @@ enum UiCmd {
         #[arg(long, conflicts_with = "id")]
         all: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum AccountsCmd {
+    /// List every grant (the default)
+    List,
+    /// Give an email address a role, replacing the one it was granted
+    ///
+    /// Its open web UI sessions that hold more than a sign-in now gets end.
+    Grant {
+        /// The address, compared ignoring ASCII case, or `*`: anyone the provider signs in,
+        /// with a verified email or not, whom no grant of their own names (viewer only)
+        #[arg(value_parser = parse_account)]
+        email: String,
+        /// viewer (read only) or operator
+        #[arg(long, value_parser = parse_role)]
+        role: store::Role,
+    },
+    /// Remove a grant and end the web UI sessions it admitted that a sign-in no longer would
+    Revoke {
+        /// The address, or `*`
+        #[arg(value_parser = parse_account)]
+        email: String,
+    },
+}
+
+/// An email address, or `*`.
+fn parse_account(s: &str) -> Result<String, String> {
+    store::account_key(s).ok_or_else(|| format!("{s:?} is neither an email address nor *"))
 }
 
 #[derive(clap::Args)]
@@ -562,6 +602,13 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Cmd::Accounts { config, cmd } => {
+            accounts_cmd(
+                admin_client(&HubConfig::load(config.config.as_deref())?)?,
+                cmd.unwrap_or(AccountsCmd::List),
+            )
+            .await
+        }
         Cmd::Local {
             state_dir,
             args,
@@ -788,11 +835,47 @@ async fn serve(cfg: HubConfig) -> Result<()> {
         )),
         None => None,
     };
+    // Read before anything is opened, so a bad secret file stops the hub at startup rather
+    // than at the first sign-in.
+    let oidc = match cfg
+        .ui
+        .as_ref()
+        .and_then(|ui| ui.oidc.as_ref().map(|o| (ui, o)))
+    {
+        Some((ui, o)) => {
+            let secret = vk_oidc::read_client_secret(&o.client_secret_file, |file| {
+                warn_if_file_mode(
+                    file,
+                    &o.client_secret_file,
+                    0o077,
+                    "OIDC client secret",
+                    "it is group/world-accessible — restrict it to 0600",
+                )
+            })?;
+            // The provider's HTTPS client takes the process's default rustls provider.
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            Some(ui::OidcSignIn::new(
+                &ui.url,
+                o.issuer.clone(),
+                o.client_id.clone(),
+                secret,
+            ))
+        }
+        None => None,
+    };
     let db = Arc::new(store::Db::open(&cfg.db_path())?);
-    let hub = Arc::new(
-        server::Hub::new(db, cfg.ui.as_ref().map(|ui| ui.url.clone()))
-            .with_releases(cfg.releases_dir()),
-    );
+    let mut hub = server::Hub::new(db, cfg.ui.as_ref().map(|ui| ui.url.clone()))
+        .with_releases(cfg.releases_dir());
+    if oidc.is_some() {
+        if hub.db.accounts()?.is_empty() {
+            eprintln!(
+                "vk-hub: warning: no role is granted, so nobody can sign in through the OIDC \
+                 provider yet; `vk-hub accounts grant <email> --role operator` grants one"
+            );
+        }
+        hub = hub.with_oidc();
+    }
+    let hub = Arc::new(hub);
     // Fatal, unlike the registry's optional admin socket: here it is the only way to issue
     // a token, so a hub without it could never enroll anything.
     let admin = admin::bind(&cfg.admin_socket())?;
@@ -806,8 +889,17 @@ async fn serve(cfg: HubConfig) -> Result<()> {
                 ui.addr,
                 ui.url
             );
-            let ui = Arc::new(ui::Ui::new(hub.clone(), &ui.url));
-            Some(ui::serve(listener, tls, ui))
+            let mut site = ui::Ui::new(hub.clone(), &ui.url);
+            if let Some(oidc) = oidc {
+                eprintln!(
+                    "vk-hub: web UI sign-in through {}, redirect URI {}{}",
+                    oidc.provider(),
+                    ui.url,
+                    ui::OIDC_CALLBACK_PATH
+                );
+                site = site.with_oidc(oidc);
+            }
+            Some(ui::serve(listener, tls, Arc::new(site)))
         }
         None => None,
     };
@@ -849,13 +941,16 @@ async fn ui_cmd(client: admin::Client, cmd: UiCmd) -> Result<()> {
             let sessions = tokio::task::spawn_blocking(move || client.ui_sessions()).await??;
             let now = now_secs();
             for s in sessions {
+                let how = match &s.identity {
+                    Some(who) => format!("{who} through {}", s.issued_by),
+                    None => format!("link from {}", s.issued_by),
+                };
                 println!(
-                    "{}  {:<8}  signed in {}  expires in {}  link from {}",
+                    "{}  {:<8}  signed in {}  expires in {}  {how}",
                     s.id,
                     s.role.name(),
                     utc(s.created_at),
                     human_duration(rounded(s.expires_at.saturating_sub(now))),
-                    s.issued_by
                 );
             }
         }
@@ -871,6 +966,82 @@ async fn ui_cmd(client: admin::Client, cmd: UiCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `vk-hub accounts list|grant|revoke`, over the running hub's admin socket.
+async fn accounts_cmd(client: admin::Client, cmd: AccountsCmd) -> Result<()> {
+    let oidc = match cmd {
+        AccountsCmd::List => {
+            let accounts = tokio::task::spawn_blocking(move || client.accounts()).await??;
+            print!("{}", render_accounts(&accounts.accounts));
+            if accounts.oidc && accounts.accounts.is_empty() {
+                eprintln!("vk-hub: no role is granted: nobody can sign in through OIDC");
+            }
+            accounts.oidc
+        }
+        AccountsCmd::Grant { email, role } => {
+            let out =
+                tokio::task::spawn_blocking(move || client.grant_account(&email, role)).await??;
+            match out.change.previous {
+                Some(p) if p == role => eprintln!(
+                    "vk-hub: {} is already granted the {} role; nothing changed",
+                    out.email,
+                    role.name()
+                ),
+                Some(p) => eprintln!(
+                    "vk-hub: granted {} the {} role, replacing {}",
+                    out.email,
+                    role.name(),
+                    p.name()
+                ),
+                None => eprintln!("vk-hub: granted {} the {} role", out.email, role.name()),
+            }
+            report_ended(&out);
+            out.oidc
+        }
+        AccountsCmd::Revoke { email } => {
+            let out = tokio::task::spawn_blocking(move || client.revoke_account(&email)).await??;
+            let Some(p) = out.change.previous else {
+                bail!("{} has no grant to revoke", out.email);
+            };
+            eprintln!("vk-hub: revoked {}'s {} grant", out.email, p.name());
+            report_ended(&out);
+            out.oidc
+        }
+    };
+    if !oidc {
+        eprintln!("vk-hub: this hub has no [oidc] in its config: grants take effect once it does");
+    }
+    Ok(())
+}
+
+/// Say how many sessions a grant or revoke ended.
+fn report_ended(out: &admin::AccountOutcome) {
+    if out.change.ended > 0 {
+        eprintln!(
+            "vk-hub: ended {} web UI session(s) that held more than a sign-in now gets",
+            out.change.ended
+        );
+    }
+}
+
+/// `vk-hub accounts`' table: each grant, and who made it when.
+fn render_accounts(accounts: &[(String, store::AccountRow)]) -> String {
+    if accounts.is_empty() {
+        return String::new();
+    }
+    let rows: Vec<[String; 4]> = accounts
+        .iter()
+        .map(|(email, g)| {
+            [
+                email.clone(),
+                g.role.name().to_string(),
+                g.granted_by.clone(),
+                utc(g.granted_at),
+            ]
+        })
+        .collect();
+    table(&["EMAIL", "ROLE", "GRANTED BY", "AT"], &rows)
 }
 
 /// The signature `vk release-key sign` wrote to `path`: a line of base64, read whole up to a

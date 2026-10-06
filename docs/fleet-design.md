@@ -363,9 +363,12 @@ and their rendering and connection limits.
 
 ### Signing in
 
-Sign-in links issued through the admin socket establish viewer or operator sessions. They
-stand in for OIDC login until the shared identity layer is ready. See the prototype reference
-for [sign-in links, sessions and request checks](fleet-prototype.md#signing-in).
+People sign in through the OIDC provider `[oidc]` names, with the relying party `vk-registry`
+uses, and are given the viewer or operator role by their email (unless the provider marks it
+unverified), from a grant `vk-hub accounts` keeps in the hub's database; anyone else is
+refused. Sign-in links issued through the admin socket also establish viewer or operator
+sessions, for whom the provider cannot sign in. See the prototype reference for [sign-in,
+sessions and request checks](fleet-prototype.md#signing-in).
 
 ## Local mode
 
@@ -498,6 +501,8 @@ and nothing else.
 
 The hub and `vk-registry` are to share one identity layer — the registry's accounts
 machinery, used by both — so a person has one login and an API key is issued in one place.
+They share the OIDC relying party today; the web UI's sessions are the hub's own, and its
+roles come from its own grants rather than from the registry's accounts.
 
 Policy on the hub maps a principal (a user, a group or an API key) to:
 

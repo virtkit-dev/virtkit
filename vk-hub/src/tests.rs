@@ -2113,6 +2113,70 @@ fn the_ttl_help_states_the_enforced_bound() {
     }
 }
 
+/// `vk-hub accounts` lists by default; a grant needs `--role`, and grant and revoke take an
+/// address, normalized, or `*`.
+#[test]
+fn accounts_arguments_parse() {
+    let parse = |args: &[&str]| {
+        let mut argv = vec!["vk-hub", "accounts"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv).map(|c| c.cmd) {
+            Ok(Cmd::Accounts { cmd, .. }) => Ok(cmd),
+            Ok(_) => panic!("not accounts"),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    assert!(matches!(parse(&[]), Ok(None)));
+    assert!(matches!(parse(&["list"]), Ok(Some(AccountsCmd::List))));
+    match parse(&["grant", "Alice@Example.com", "--role", "operator"]) {
+        Ok(Some(AccountsCmd::Grant { email, role })) => {
+            assert_eq!(
+                (email.as_str(), role),
+                ("alice@example.com", store::Role::Operator)
+            );
+        }
+        other => panic!("{:?}", other.err()),
+    }
+    let err = parse(&["grant", "alice@example.com"]).unwrap_err();
+    assert!(err.contains("--role"), "{err}");
+    let err = parse(&["grant", "alice@example.com", "--role", "admin"]).unwrap_err();
+    assert!(err.contains("expected viewer or operator"), "{err}");
+    let err = parse(&["grant", "alice", "--role", "viewer"]).unwrap_err();
+    assert!(err.contains("neither an email address nor *"), "{err}");
+    assert!(matches!(
+        parse(&["revoke", "BOB@example.com"]),
+        Ok(Some(AccountsCmd::Revoke { email })) if email == "bob@example.com"
+    ));
+    assert!(matches!(
+        parse(&["grant", "*", "--role", "viewer"]),
+        Ok(Some(AccountsCmd::Grant { email, .. })) if email == "*"
+    ));
+}
+
+/// The accounts table names each grant's address, role, and who made it when.
+#[test]
+fn the_accounts_table_says_who_granted_each_role() {
+    let row = |role, by: &str| store::AccountRow {
+        role,
+        granted_by: by.into(),
+        granted_at: 0,
+    };
+    let accounts = [
+        ("*".to_string(), row(store::Role::Viewer, "uid 0")),
+        (
+            "alice@example.com".to_string(),
+            row(store::Role::Operator, "uid 1000"),
+        ),
+    ];
+    assert_eq!(
+        render_accounts(&accounts),
+        "EMAIL              ROLE      GRANTED BY  AT\n\
+         *                  viewer    uid 0       1970-01-01T00:00:00Z\n\
+         alice@example.com  operator  uid 1000    1970-01-01T00:00:00Z\n"
+    );
+    assert_eq!(render_accounts(&[]), "");
+}
+
 /// The cell under `column` in `line`, by where the header puts the column.
 fn cell<'a>(header: &str, line: &'a str, column: &str) -> &'a str {
     let at = |name: &str| {

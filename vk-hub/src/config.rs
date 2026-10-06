@@ -10,6 +10,12 @@
 //! ui_url = "https://hub.example.com:8444"  # what browsers reach it as
 //! ui_tls_cert = "/etc/vk-hub/ui-cert.pem"  # default: tls_cert/tls_key
 //! ui_tls_key = "/etc/vk-hub/ui-key.pem"
+//!
+//! # Sign-in to the web UI through an OIDC provider; off unless set.
+//! [oidc]
+//! issuer = "https://login.example.com/app/1"
+//! client_id = "vk-hub"
+//! client_secret_file = "/etc/vk-hub/oidc-secret"
 //! ```
 //!
 //! Every key is optional. Sessions bind to the TLS 1.3 exporter. Plain HTTP is allowed only
@@ -21,6 +27,10 @@
 //! with every other http service on that host, whatever its port — browsers keep cookies
 //! apart by host, not port — so a UI opened on a machine that serves anything else on
 //! loopback wants TLS too.
+//!
+//! `[oidc]` needs the web UI, reached over https: the provider sends browsers back to
+//! `<ui_url>/auth/callback`, which is the redirect URI to register with it. Who may sign in,
+//! and as what, is granted with `vk-hub accounts`, not here.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -56,6 +66,18 @@ pub struct UiConfig {
     /// The UI's origin as browsers reach it, `scheme://host[:port]` with no trailing slash:
     /// what sign-in links start with and what a state-changing request's `Origin` must be.
     pub url: String,
+    /// Sign-in through an OIDC provider, besides the links.
+    pub oidc: Option<OidcConfig>,
+}
+
+/// `[oidc]`, checked. The secret is read when the hub starts serving, not here: every
+/// `vk-hub` command loads this file, and only `serve` needs the secret.
+#[derive(Debug)]
+pub struct OidcConfig {
+    /// Without a trailing slash.
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret_file: PathBuf,
 }
 
 /// The file as written. `deny_unknown_fields` so a misspelt `tls_cert` fails at startup
@@ -71,6 +93,16 @@ struct FileConfig {
     ui_url: Option<String>,
     ui_tls_cert: Option<PathBuf>,
     ui_tls_key: Option<PathBuf>,
+    oidc: Option<FileOidc>,
+}
+
+/// `[oidc]` as written; `deny_unknown_fields` for the same reason.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileOidc {
+    issuer: String,
+    client_id: String,
+    client_secret_file: PathBuf,
 }
 
 impl HubConfig {
@@ -140,15 +172,28 @@ impl HubConfig {
                         parse_origin(&format!("{}://{addr}", if tls { "https" } else { "http" }))?
                     }
                 };
+                let oidc = match f.oidc {
+                    Some(o) => {
+                        if !url.starts_with("https://") {
+                            bail!("[oidc] needs the web UI reached over https: ui_url is {url:?}");
+                        }
+                        Some(oidc_config(o)?)
+                    }
+                    None => None,
+                };
                 Some(UiConfig {
                     addr,
                     tls_cert,
                     tls_key,
                     url,
+                    oidc,
                 })
             }
             None if f.ui_url.is_some() || f.ui_tls_cert.is_some() || f.ui_tls_key.is_some() => {
                 bail!("ui_url, ui_tls_cert and ui_tls_key need ui_addr, which turns the web UI on")
+            }
+            None if f.oidc.is_some() => {
+                bail!("[oidc] signs people in to the web UI, which ui_addr turns on")
             }
             None => None,
         };
@@ -195,6 +240,19 @@ impl UiConfig {
             "ui_tls_cert and ui_tls_key",
         )
     }
+}
+
+/// `[oidc]`, checked: the issuer as `vk-registry` checks its own.
+fn oidc_config(o: FileOidc) -> Result<OidcConfig> {
+    vk_oidc::check_base_url("[oidc] issuer", &o.issuer)?;
+    if o.client_id.is_empty() {
+        bail!("[oidc] client_id may not be empty");
+    }
+    Ok(OidcConfig {
+        issuer: o.issuer.trim_end_matches('/').to_string(),
+        client_id: o.client_id,
+        client_secret_file: o.client_secret_file,
+    })
 }
 
 /// `url` as an origin — `http` or `https`, a host and maybe a port, and no path — in the form
@@ -486,6 +544,66 @@ mod tests {
             .ui
             .unwrap();
         assert_eq!(ui.url, "https://127.0.0.1");
+    }
+
+    const UI_HTTPS: &str = "ui_addr = \"127.0.0.1:8444\"\nui_url = \"https://hub.example\"\n\
+                            ui_tls_cert = \"/c\"\nui_tls_key = \"/k\"\n";
+
+    fn oidc(table: &str) -> Result<OidcConfig> {
+        let cfg = parse(&format!(
+            "{UI_HTTPS}[oidc]\nissuer = \"https://login.example.com/app/1/\"\n\
+             client_id = \"vk-hub\"\nclient_secret_file = \"/s\"\n{table}"
+        ))?;
+        Ok(cfg.ui.unwrap().oidc.unwrap())
+    }
+
+    #[test]
+    fn oidc_needs_the_web_ui_over_https() {
+        let err = |r: Result<OidcConfig>| format!("{:#}", r.unwrap_err());
+        let o = oidc("").unwrap();
+        assert_eq!(o.issuer, "https://login.example.com/app/1");
+        assert_eq!(o.client_id, "vk-hub");
+        assert_eq!(o.client_secret_file, Path::new("/s"));
+        assert!(parse(&format!("{UI_HTTPS}[oidc]\nissuer = \"https://i\"\n")).is_err());
+        // Roles are granted with `vk-hub accounts`: lists of them here are unknown keys.
+        for key in ["operators", "viewers", "admins"] {
+            let e = err(oidc(&format!("{key} = [\"a@b\"]\n")));
+            assert!(e.contains("unknown field"), "{key}: {e}");
+        }
+        // The issuer, held to vk-registry's rules.
+        let issuer = |i: &str| {
+            parse(&format!(
+                "{UI_HTTPS}[oidc]\nissuer = \"{i}\"\nclient_id = \"c\"\n\
+                 client_secret_file = \"/s\"\n"
+            ))
+            .map_err(|e| format!("{e:#}"))
+        };
+        assert!(
+            issuer("http://login.example.com")
+                .unwrap_err()
+                .contains("must be https")
+        );
+        assert!(
+            issuer("https://login.example.com/?a=b")
+                .unwrap_err()
+                .contains("base URL")
+        );
+        assert!(issuer("http://127.0.0.1:9000").is_ok());
+        let no_client = parse(&format!(
+            "{UI_HTTPS}[oidc]\nissuer = \"https://i\"\nclient_id = \"\"\n\
+             client_secret_file = \"/s\"\n"
+        ));
+        assert!(format!("{:#}", no_client.unwrap_err()).contains("client_id"));
+        // Without the web UI, or with it over plain http.
+        let table = "[oidc]\nissuer = \"https://i\"\nclient_id = \"c\"\n\
+                     client_secret_file = \"/s\"\n";
+        let e = format!("{:#}", parse(table).unwrap_err());
+        assert!(e.contains("ui_addr"), "{e}");
+        let e = format!(
+            "{:#}",
+            parse(&format!("ui_addr = \"127.0.0.1:8444\"\n{table}")).unwrap_err()
+        );
+        assert!(e.contains("over https"), "{e}");
     }
 
     #[test]

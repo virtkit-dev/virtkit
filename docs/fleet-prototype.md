@@ -593,7 +593,8 @@ address. It is `https` whenever the listener has TLS, and `http` only for `local
 `127.0.0.0/8` or `[::1]`. It is normalized as a browser writes an origin: lowercase, no path,
 no default port, IPv6 in canonical form; an IPv4-mapped IPv6 address and a numeric host that
 is not a dotted quad are refused. `ui_url`, `ui_tls_cert` or `ui_tls_key` without `ui_addr` is
-an error.
+an error. An `[oidc]` table adds sign-in through an OIDC provider (see
+[Signing in](#signing-in)).
 
 The UI serves the nodes table with the columns of `vk-hub nodes`; each node's inventory,
 heartbeat and workloads; and the audit log (`/audit`, filterable by node, 100 lines a page; the
@@ -655,9 +656,70 @@ attributes, escaped.
 
 ### Signing in
 
-A person signs in with a link `vk-hub ui login [--role viewer|operator] [--ttl 10m]` prints
-over the admin socket — `<ui_url>/login?t=<token>`, for a viewer by default; `vk-hub local`
-prints one as it starts, and `vk-hub local login` more, for an operator by default. The token
+With an `[oidc]` table, a person signs in through an OIDC provider:
+
+```toml
+ui_addr = "0.0.0.0:8444"
+ui_url = "https://hub.example.com:8444"
+
+[oidc]
+issuer = "https://login.example.com/app/1"
+client_id = "vk-hub"
+client_secret_file = "/etc/vk-hub/oidc-secret"
+```
+
+`issuer`, `client_id` and `client_secret_file` are checked as `vk-registry`'s `[oidc]` is: the
+issuer is `https` (or loopback `http`) with no query or fragment, and the provider's discovery
+document must name that issuer and only `https` (or loopback `http`) endpoints; the secret
+file is read when `vk-hub serve` starts, not through a symlink, at most 4 KiB, trimmed and not
+empty, with a warning if others can read it. `[oidc]` needs `ui_addr` and a `ui_url` that is
+`https`. Register `<ui_url>/auth/callback` with the provider as the client's redirect URI;
+`vk-hub serve` prints it as it starts.
+
+An unknown key in the table is an error. Manage sign-in grants and roles over the admin
+socket; the hub stores them in its database:
+
+```
+vk-hub accounts grant alice@example.com --role operator
+vk-hub accounts grant '*' --role viewer
+vk-hub accounts revoke alice@example.com
+vk-hub accounts [list]
+```
+
+A grant gives an email address a role, taking effect at once; addresses are compared ignoring
+ASCII case, and granting one again replaces its role. `*` admits anyone the provider signs in
+whom no grant of their own names, with a verified email or not, and only as a viewer. A sign-in
+gets its address's grant, else `*`'s; anyone else is refused. Grant `*` only on a provider that
+signs in a known population, as anyone it signs in can then sign in at will: a sign-in only `*`
+admits is audited within the same bounds as a refusal (below), and one identity holds at most 8
+sessions, a sign-in past that ending its oldest. Lowering or revoking a grant ends the open
+sessions it covered — for `*`, every session opened through OIDC — that hold more than a
+sign-in would now get. `vk-hub accounts` lists every grant with its role, who made it and when.
+Grants are audited as the admin socket's peer, `uid <n>`; a hub without `[oidc]` keeps them for
+when it has one. `vk-hub serve` warns as it starts when `[oidc]` is set and nothing is granted,
+as nobody can sign in yet. Grants name addresses, not a provider: after changing `issuer`,
+review `vk-hub accounts` and end the old sessions with `vk-hub ui logout --all`.
+
+The address is the provider's `email` claim from UserInfo, if it is an address and not marked
+unverified (`email_verified` false); a provider that says nothing of verification is taken at
+its word, as `vk-registry` takes it, so grant by email only with a provider whose `email` claim
+users cannot set themselves. Whoever is refused gets a page saying whom they signed in as, and
+why when their email is marked unverified. The refusal is audited under that name, at most once
+per identity every 10 minutes and 60 times an hour in all, so scripted refusals cannot flood
+the audit log; past that, it is logged to stderr only. A signed-out page carries a "Sign in
+with <issuer host>" button, as `/login` does without a token. It leads to `/auth/login`, which
+sends the browser to the provider with the authorization code flow — `state` in a `__Host-`,
+`SameSite=Lax` cookie bound to the browser, PKCE (S256), valid 5 minutes and single-use. The
+callback exchanges the code with the client secret and reads who signed in from UserInfo; it
+does not verify an ID token or send a nonce, as the state cookie and PKCE already bind the code
+to the browser and this client. It opens a session as a link does, with the identity — the
+email, or `sub <subject>` without one — beside the role. Signing out ends the hub's session
+alone, not the provider's.
+
+Sign-in links remain available for people the provider cannot sign in.
+`vk-hub ui login [--role viewer|operator] [--ttl 10m]` prints a link over the admin socket —
+`<ui_url>/login?t=<token>`, for a viewer by default; `vk-hub local` prints one as it starts,
+and `vk-hub local login` more, for an operator by default. The token
 is single-use, valid 10 minutes by default and at most a day, and stored hashed, like an
 enrollment token. Opening the link shows a "Sign in" button, and only the `POST` it makes —
 `Sec-Fetch-Site` `same-origin` (the sign-in page itself) or `none` — spends the token, so a
@@ -666,8 +728,8 @@ session: a random secret set as a cookie (`HttpOnly`, `SameSite=Strict`, `Path=/
 `Secure` with the `__Host-` prefix over https), kept hashed in the database with its role,
 and valid for 12 hours. The page it answers moves on to `/` itself, so the token never stays
 in the address bar. `vk-hub ui sessions|logout <id>|--all` (`vk-hub local sessions|logout`)
-list and end sessions; an ID, 12 hex digits, ends every session that shares it, and one naming
-none is an error.
+list and end sessions, each with who issued its link or whom the provider signed in; an ID,
+12 hex digits, ends every session that shares it, and one naming none is an error.
 
 Browsers keep cookies apart by host, not by port. On plain http — which the UI serves only
 on loopback — the session cookie therefore reaches every other http service on that host,
@@ -679,10 +741,11 @@ instead (see [Local mode](#local-mode)).
 
 Every state-changing request is a `POST` from the UI's own origin — its `Origin`, or
 `Sec-Fetch-Site: same-origin` — carrying a CSRF token derived from the session's secret, and
-is done as the session's principal, `ui session <id> (<role>)`, which is what the audit log
-records. On a fleet hub they are signing out, a node's steering actions and a rollout's
-pause, resume and abort. Issuing a link, signing in and out, and ending sessions are audited
-too.
+is done as the session's principal, `ui session <id> (<role>)`, or `ui session <id> (<role>,
+<identity>)` for one opened through OIDC, which is what the audit log records. On a fleet hub
+they are signing out, a node's steering actions and a rollout's pause, resume and abort.
+Issuing a link, signing in and out, a refused OIDC sign-in, granting and revoking roles, and
+ending sessions are audited too.
 
 ## Local mode
 

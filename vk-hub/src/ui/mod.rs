@@ -8,9 +8,9 @@
 //! `SameSite=Strict` cookie, also `Secure` and `__Host-` when the UI is reached over https.
 //! The database stores only its hash. Only this `POST` spends the token; link scanners and
 //! chat previews leave it unused. Sessions have a viewer or operator role and last
-//! [`store::UI_SESSION_TTL`]. Links stand in for a login until people sign in through OIDC,
-//! with the identity layer the hub is to share with `vk-registry` (`docs/fleet-design.md`,
-//! "Authentication for submitted jobs").
+//! [`store::UI_SESSION_TTL`]. A fleet hub with `[oidc]` also signs people in through an OIDC
+//! provider ([`oidc`]), with the role a grant in the database gives them; links remain, for
+//! whom the provider cannot sign in.
 //!
 //! **State-changing requests** are `POST`s, and each must come from this UI's own pages —
 //! its `Origin` is the UI's own (a fleet hub's `ui_url`), or `Sec-Fetch-Site` says
@@ -63,10 +63,12 @@ mod dev;
 mod fleet;
 pub mod html;
 mod local;
+mod oidc;
 mod pages;
 mod sse;
 
 use body::Body;
+pub use oidc::{CALLBACK_PATH as OIDC_CALLBACK_PATH, OidcSignIn};
 
 /// Where a sign-in link points.
 pub const LOGIN_PATH: &str = "/login";
@@ -108,6 +110,8 @@ pub struct Ui {
     /// The live pages' streams open.
     streams: sse::Streams,
     site: Site,
+    /// Sign-in through an OIDC provider, besides the links.
+    oidc: Option<OidcSignIn>,
 }
 
 /// What the pages show.
@@ -144,14 +148,31 @@ impl Ui {
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             streams: sse::Streams::new(),
             site,
+            oidc: None,
         }
+    }
+
+    /// The UI, also signing people in through `oidc`.
+    pub fn with_oidc(mut self, oidc: OidcSignIn) -> Self {
+        self.oidc = Some(oidc);
+        self
     }
 
     /// What this UI's pages say of signing in.
     fn texts(&self) -> &'static Texts {
-        match self.site {
-            Site::Fleet(_) => &FLEET_TEXTS,
-            Site::Local(_) => &LOCAL_TEXTS,
+        match (&self.site, &self.oidc) {
+            (Site::Fleet(_), None) => &FLEET_TEXTS,
+            (Site::Fleet(_), Some(_)) => &FLEET_OIDC_TEXTS,
+            (Site::Local(_), _) => &LOCAL_TEXTS,
+        }
+    }
+
+    /// A page saying `text` to someone not signed in: with a button to sign in through the
+    /// provider, where there is one.
+    fn signed_out_page(&self, status: StatusCode, text: &'static str) -> Response<Body> {
+        match &self.oidc {
+            Some(oidc) => html_response(status, pages::sign_in_with(text, oidc.provider())),
+            None => message(status, text),
         }
     }
 
@@ -296,6 +317,9 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     match (method, path.as_str()) {
         (Method::GET, LOGIN_PATH) => Ok(login_page(&req, ui)),
         (Method::POST, LOGIN_PATH) => login(req, ui).await,
+        (Method::GET, oidc::LOGIN_PATH) => oidc::start(&req, ui).await,
+        // Exempt from the check below: the provider's page is another site's.
+        (Method::GET, oidc::CALLBACK_PATH) => oidc::callback(&req, ui).await,
         // Asked for by every browser whatever the page says; there is none.
         (Method::GET, "/favicon.ico") => {
             let mut resp = Response::new(Body::default());
@@ -311,7 +335,7 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                 Ok(auth) => auth,
                 Err(why) => {
                     return Ok(signed_out_stream(&path, req.headers(), ui)
-                        .unwrap_or_else(|| message(StatusCode::UNAUTHORIZED, why)));
+                        .unwrap_or_else(|| ui.signed_out_page(StatusCode::UNAUTHORIZED, why)));
                 }
             };
             get(&path, req.uri().query(), &auth, ui).await
@@ -435,10 +459,17 @@ fn well_formed_login(token: &str) -> bool {
 
 /// `GET /login?t=<token>`: a button that posts the token back. Nothing is spent here, so
 /// whatever fetches a link without a person behind it — a mail scanner, a chat's preview, a
-/// browser's prerender — leaves it for the person.
+/// browser's prerender — leaves it for the person. With no token, the button to sign in
+/// through the provider, where there is one.
 fn login_page(req: &Request<Incoming>, ui: &Ui) -> Response<Body> {
     let query = decode_form(req.uri().query().unwrap_or("").as_bytes());
-    let token = field(&query, "t").unwrap_or("");
+    let token = match field(&query, "t") {
+        Some(token) => token,
+        None if ui.oidc.is_some() => {
+            return ui.signed_out_page(StatusCode::OK, ui.texts().signed_out);
+        }
+        None => "",
+    };
     if !well_formed_login(token) {
         return message(StatusCode::FORBIDDEN, ui.texts().not_a_link);
     }
@@ -470,17 +501,32 @@ async fn login(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     };
     eprintln!("vk-hub: ui: {} signed in", session.principal());
     let mut resp = html_response(StatusCode::OK, pages::signed_in());
+    set_session_cookie(
+        &mut resp,
+        ui,
+        &secret,
+        session.expires_at.saturating_sub(now),
+    )?;
+    Ok(resp)
+}
+
+/// Set the cookie of the session whose secret is `secret`, for `max_age` seconds.
+fn set_session_cookie(
+    resp: &mut Response<Body>,
+    ui: &Ui,
+    secret: &str,
+    max_age: u64,
+) -> Result<()> {
     let cookie = format!(
-        "{}={secret}; {}; Max-Age={}",
+        "{}={secret}; {}; Max-Age={max_age}",
         ui.cookie_name(),
         ui.cookie_attributes(),
-        session.expires_at.saturating_sub(now)
     );
-    resp.headers_mut().insert(
+    resp.headers_mut().append(
         header::SET_COOKIE,
         HeaderValue::from_str(&cookie).context("building the session cookie")?,
     );
-    Ok(resp)
+    Ok(())
 }
 
 /// `POST /logout`: end this session.
@@ -746,6 +792,13 @@ const FLEET_TEXTS: Texts = Texts {
     signed_out: "Not signed in. On the hub's host, `vk-hub ui login` prints a link that signs \
                  you in.",
     sign_in_again: "<code>vk-hub ui login</code> prints a link to sign in again.",
+};
+
+const FLEET_OIDC_TEXTS: Texts = Texts {
+    signed_out: "Not signed in.",
+    sign_in_again: "<a href=\"/auth/login\">Sign in again</a>, or <code>vk-hub ui login</code> \
+                    prints a link.",
+    ..FLEET_TEXTS
 };
 
 const LOCAL_TEXTS: Texts = Texts {

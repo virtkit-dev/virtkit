@@ -89,6 +89,36 @@ pub fn sign_in(token: &str) -> Html {
     h
 }
 
+/// A page saying `text` to someone not signed in, with a button to sign in through the OIDC
+/// provider at `provider`.
+pub fn sign_in_with(text: &str, provider: &str) -> Html {
+    let mut h = Html::new();
+    head(&mut h, "sign in");
+    h.raw("<body><main><form class=\"message\" method=\"get\" action=\"/auth/login\"><p>")
+        .text(text)
+        .raw("</p><button>Sign in with ")
+        .text(provider)
+        .raw("</button><p>Or, on the hub's host, <code>vk-hub ui login</code> prints a link ")
+        .raw("that signs you in.</p></form></main></body></html>");
+    h
+}
+
+/// An OIDC sign-in by `identity`, who is granted no role; `unverified` when the provider
+/// marked their email unverified, so it was not looked up.
+pub fn refused(identity: &str, unverified: bool) -> Html {
+    let mut h = Html::new();
+    head(&mut h, "sign in");
+    h.raw("<body><main><p class=\"message\">You signed in as ")
+        .text(identity)
+        .raw(", who may not use this hub's web UI. Its operator lets people in by email, ")
+        .raw("with <code>vk-hub accounts grant</code>");
+    if unverified {
+        h.raw(", but your provider marks your email unverified");
+    }
+    h.raw(".</p></main></body></html>");
+    h
+}
+
 /// What signing in answers: on to `/` by the page's own navigation, with a link for a
 /// browser that does not follow a refresh.
 pub fn signed_in() -> Html {

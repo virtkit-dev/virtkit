@@ -87,6 +87,15 @@ All notable changes to virtkit will be documented in this file.
   forever; a node that fails takes its runner's jobs with it. Reinstalling rewrites the unit
   and restarts a running node; `vk node service uninstall` removes the unit and preserves the
   enrollment.
+- **Experimental: sign in to the `vk-hub` web UI through your identity provider.** An
+  `[oidc]` table in `hub.toml` names the provider, as `vk-registry`'s does; register
+  `<ui_url>/auth/callback` with it. Who may sign in is granted at runtime:
+  `vk-hub accounts grant <email> --role operator|viewer` gives an address a role,
+  `vk-hub accounts grant '*' --role viewer` lets anyone the provider signs in view, and
+  everyone else is refused. `vk-hub accounts revoke` takes a grant back and ends the sessions it
+  no longer allows; `vk-hub accounts` lists the grants. Grants, revokes and sign-ins are
+  audited, refused sign-ins and those only `*` admits at a bounded rate, and
+  `vk-hub ui sessions` names who signed in. Sign-in links from `vk-hub ui login` keep working.
 
 ### Fixed
 

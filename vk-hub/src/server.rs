@@ -96,6 +96,9 @@ pub struct Hub {
     pub(crate) downloads: Arc<Semaphore>,
     /// The web UI's origin, which its sign-in links start with; `None` with the UI off.
     pub ui_url: Option<String>,
+    /// Whether the web UI signs people in through OIDC, with the roles granted in the
+    /// database.
+    pub oidc: bool,
     /// Where release binaries are kept; `None` for a hub that holds none.
     releases: Option<std::path::PathBuf>,
     /// Held by a release's add or remove, from its file to its row.
@@ -148,6 +151,7 @@ impl Hub {
             handshakes: Arc::new(Semaphore::new(MAX_PRE_AUTH)),
             downloads: Arc::new(Semaphore::new(MAX_DOWNLOADS)),
             ui_url,
+            oidc: false,
             releases: None,
             releases_lock: Mutex::new(()),
             changes: watch::Sender::new(0),
@@ -222,6 +226,12 @@ impl Hub {
     /// Wake on the next [`Hub::sessions_changed`].
     pub(crate) fn subscribe_sessions(&self) -> watch::Receiver<u64> {
         self.sessions.subscribe()
+    }
+
+    /// This hub, signing people in to its web UI through OIDC.
+    pub fn with_oidc(mut self) -> Self {
+        self.oidc = true;
+        self
     }
 
     /// This hub, keeping release binaries in `dir`.

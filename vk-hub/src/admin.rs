@@ -1,6 +1,6 @@
 //! `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub rollout`, `vk-hub workloads`,
-//! `vk-hub audit`, `vk-hub ui` and `vk-hub local login`, `sessions` and `logout` reach the
-//! running hub through a unix socket in its data directory.
+//! `vk-hub audit`, `vk-hub ui`, `vk-hub accounts` and `vk-hub local login`, `sessions` and
+//! `logout` reach the running hub through a unix socket in its data directory.
 //!
 //! Enrollment tokens admit machines to the fleet and must be issued outside the node-facing
 //! network; sign-in links must be issued outside the web UI. The CLI cannot open the database:
@@ -28,7 +28,7 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::ops::{self, NodeView};
 use crate::rollout::{Rollout, RolloutAction};
 use crate::server::Hub;
-use crate::store::{AuditRow, Release, Role, UiSession};
+use crate::store::{AccountChange, AccountRow, AuditRow, Release, Role, UiSession};
 use vk_hub_proto::{Acquisition, Command, DesiredState, Operation};
 
 /// Bumped only for a change an older peer could misread.
@@ -121,6 +121,14 @@ enum Call {
     UiLogout {
         id: Option<String>,
     },
+    ListAccounts,
+    GrantAccount {
+        email: String,
+        role: Role,
+    },
+    RevokeAccount {
+        email: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -155,6 +163,25 @@ pub struct CreatedToken {
 pub struct LoginLink {
     pub url: String,
     pub expires_at: u64,
+}
+
+/// OIDC sign-in grants and their roles.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Accounts {
+    /// Whether the running hub has `[oidc]`: grants take effect only once it does.
+    pub oidc: bool,
+    /// Every grant, by address, `*` first.
+    pub accounts: Vec<(String, AccountRow)>,
+}
+
+/// The result of granting or revoking a role.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccountOutcome {
+    /// The address, normalized, or `*`.
+    pub email: String,
+    pub change: AccountChange,
+    /// Whether the running hub has `[oidc]`.
+    pub oidc: bool,
 }
 
 /// Bind the admin socket at `path`, replacing one a hub that is gone left behind.
@@ -357,6 +384,16 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
             }
             serde_json::to_value(ended)?
         }
+        Call::ListAccounts => serde_json::to_value(Accounts {
+            oidc: hub.oidc,
+            accounts: hub.db.accounts()?,
+        })?,
+        Call::GrantAccount { email, role } => {
+            serde_json::to_value(set_account(hub, &actor, &email, Some(role))?)?
+        }
+        Call::RevokeAccount { email } => {
+            serde_json::to_value(set_account(hub, &actor, &email, None)?)?
+        }
         Call::RemoveNode { id } => {
             let removed = hub.db.remove_node(&id, &actor, crate::now_secs())?;
             if removed {
@@ -371,6 +408,36 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
         }
     };
     Ok(value)
+}
+
+/// Grant `email` `role`, or revoke its grant with `None`, as `actor`.
+fn set_account(hub: &Hub, actor: &str, email: &str, role: Option<Role>) -> Result<AccountOutcome> {
+    let email = crate::store::account_key(email)
+        .ok_or_else(|| anyhow!("{email:?} is neither an email address nor *"))?;
+    let now = crate::now_secs();
+    let change = match role {
+        Some(role) => hub.db.grant_account(&email, role, actor, now)?,
+        None => hub.db.revoke_account(&email, actor, now)?,
+    };
+    if change.previous != role {
+        let what = match role {
+            Some(role) => format!("granted {email} the {} role", role.name()),
+            None => format!("revoked {email}'s grant"),
+        };
+        eprintln!(
+            "vk-hub: admin: {actor} {what}, ending {} web UI session(s)",
+            change.ended
+        );
+    }
+    if change.ended > 0 {
+        // Their pages' live updates end on it.
+        hub.sessions_changed();
+    }
+    Ok(AccountOutcome {
+        email,
+        change,
+        oidc: hub.oidc,
+    })
 }
 
 /// The latest `limit` audit lines, of `node` or of all, oldest first: as many of them as fit
@@ -528,6 +595,23 @@ impl Client {
     pub fn ui_logout(&self, id: Option<&str>) -> Result<usize> {
         self.call(Call::UiLogout {
             id: id.map(str::to_string),
+        })
+    }
+
+    pub fn accounts(&self) -> Result<Accounts> {
+        self.call(Call::ListAccounts)
+    }
+
+    pub fn grant_account(&self, email: &str, role: Role) -> Result<AccountOutcome> {
+        self.call(Call::GrantAccount {
+            email: email.to_string(),
+            role,
+        })
+    }
+
+    pub fn revoke_account(&self, email: &str) -> Result<AccountOutcome> {
+        self.call(Call::RevokeAccount {
+            email: email.to_string(),
         })
     }
 
@@ -738,6 +822,66 @@ mod tests {
                 &format!("uid 7 issued reset, images included (command {})", reset.id)
             ]
         );
+    }
+
+    /// Grants are made and revoked over the socket as the peer's uid, by address normalized,
+    /// or `*`, which is only ever a viewer.
+    #[test]
+    fn accounts_are_granted_listed_and_revoked() {
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None).with_oidc();
+        let call =
+            |call: &str| dispatch(format!(r#"{{"v":1,"call":{call}}}"#).as_bytes(), &hub, 1000);
+        let outcome = |v| serde_json::from_value::<AccountOutcome>(v).unwrap();
+        let granted = outcome(
+            call(r#"{"op":"grant-account","email":"Bob@Example.com","role":"operator"}"#).unwrap(),
+        );
+        assert_eq!(granted.email, "bob@example.com");
+        assert!(granted.oidc);
+        outcome(call(r#"{"op":"grant-account","email":"*","role":"viewer"}"#).unwrap());
+        for bad in [
+            r#"{"op":"grant-account","email":"bob","role":"viewer"}"#,
+            r#"{"op":"grant-account","email":"*","role":"operator"}"#,
+        ] {
+            assert!(call(bad).is_err(), "{bad}");
+        }
+
+        let listed: Accounts =
+            serde_json::from_value(call(r#"{"op":"list-accounts"}"#).unwrap()).unwrap();
+        assert!(listed.oidc);
+        let rows: Vec<(&str, Role, &str)> = listed
+            .accounts
+            .iter()
+            .map(|(e, a)| (e.as_str(), a.role, a.granted_by.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("*", Role::Viewer, "uid 1000"),
+                ("bob@example.com", Role::Operator, "uid 1000"),
+            ]
+        );
+
+        let revoked =
+            outcome(call(r#"{"op":"revoke-account","email":"BOB@example.com"}"#).unwrap());
+        assert_eq!(revoked.change.previous, Some(Role::Operator));
+        let audit = hub.db.audits(None, 10).unwrap();
+        assert_eq!(audit.len(), 3, "{audit:?}");
+        assert!(audit.iter().all(|r| r.actor == "uid 1000"), "{audit:?}");
+        assert_eq!(
+            audit[2].event,
+            "uid 1000 revoked bob@example.com's grant of the operator role"
+        );
+
+        // Without `[oidc]`, a grant is kept all the same, and the reply says it waits.
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+        let reply = dispatch(
+            br#"{"v":1,"call":{"op":"grant-account","email":"a@b","role":"viewer"}}"#,
+            &hub,
+            0,
+        )
+        .unwrap();
+        assert!(!outcome(reply).oidc);
+        assert_eq!(hub.db.oidc_role(Some("a@b")).unwrap(), Some(Role::Viewer));
     }
 
     #[test]

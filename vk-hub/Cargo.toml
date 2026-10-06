@@ -37,6 +37,11 @@ libc.workspace = true
 # the admin socket's private bind
 vk-fs = { path = "../vk-fs" }
 vk-hub-proto = { path = "../vk-hub-proto" }
+# the web UI's OIDC sign-in, shared with vk-registry
+vk-oidc = { path = "../vk-oidc" }
+
+[dev-dependencies]
+vk-oidc = { path = "../vk-oidc", features = ["fake-idp"] }
 
 [target.'cfg(target_env = "musl")'.dependencies]
 jemallocator.workspace = true

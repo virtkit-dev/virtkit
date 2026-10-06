@@ -3203,3 +3203,370 @@ async fn a_node_s_update_is_shown_on_the_nodes_table_and_its_page() {
         page.body
     );
 }
+
+/// A fleet hub's UI reached over https, signing people in through a fake OIDC provider that
+/// says `claims` of whoever signs in, with `grants` of roles by address (or `*`).
+async fn start_oidc(claims: serde_json::Value, grants: &[(&str, Role)]) -> (SocketAddr, Arc<Hub>) {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let idp = vk_oidc::fake_idp::start(vk_oidc::fake_idp::Options {
+        claims,
+        ..Default::default()
+    })
+    .await;
+    let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = format!("https://{addr}");
+    let db = Db::open_memory().unwrap();
+    for (email, role) in grants {
+        db.grant_account(email, *role, "uid 0", 1).unwrap();
+    }
+    let hub = Arc::new(Hub::new(Arc::new(db), Some(origin.clone())).with_oidc());
+    let oidc = OidcSignIn::new(
+        &origin,
+        format!("http://{idp}"),
+        vk_oidc::fake_idp::CLIENT_ID.into(),
+        vk_oidc::fake_idp::CLIENT_SECRET.into(),
+    );
+    let ui = Ui::new(hub.clone(), &origin).with_oidc(oidc);
+    tokio::spawn(serve(listener, None, Arc::new(ui)));
+    (addr, hub)
+}
+
+impl Reply {
+    fn set_cookies(&self) -> Vec<&str> {
+        self.headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+}
+
+/// Start a sign-in at the provider as a browser does: the login cookie it is given.
+async fn start_oidc_login(addr: SocketAddr) -> (String, String) {
+    let reply = request(
+        addr,
+        "GET",
+        "/auth/login",
+        &["Sec-Fetch-Site: same-origin"],
+        "",
+    )
+    .await;
+    assert_eq!(reply.status, 302, "{}", reply.body);
+    let location = reply.header("location").unwrap();
+    assert!(location.contains("/authorize?"), "{location}");
+    let redirect = format!(
+        "redirect_uri=https%3A%2F%2F127.0.0.1%3A{}%2Fauth%2Fcallback&",
+        addr.port()
+    );
+    assert!(location.contains(&redirect), "{location}");
+    let set = reply.header("set-cookie").unwrap();
+    assert!(set.starts_with("__Host-vk-hub-login="), "{set}");
+    assert!(set.contains("SameSite=Lax"), "{set}");
+    let pair = set.split(';').next().unwrap().to_string();
+    let state = pair.split_once('=').unwrap().1.to_string();
+    (pair, state)
+}
+
+/// The provider's redirect back, as the browser follows it: from the provider's page.
+async fn oidc_callback(addr: SocketAddr, state: &str, cookie: Option<&str>) -> Reply {
+    let path = format!("/auth/callback?code=the-code&state={state}");
+    let mut headers = vec!["Sec-Fetch-Site: cross-site".to_string()];
+    if let Some(c) = cookie {
+        headers.push(format!("Cookie: {c}"));
+    }
+    let headers: Vec<&str> = headers.iter().map(String::as_str).collect();
+    request(addr, "GET", &path, &headers, "").await
+}
+
+/// The OIDC sign-in end to end: the signed-out page offers it, the provider's callback opens
+/// a session named after who signed in, in the role granted them, audited; the login cookie
+/// is spent either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oidc_sign_in_opens_a_session_for_whom_a_grant_lets_in() {
+    let (addr, hub) = start_oidc(
+        serde_json::json!({"sub": "user-42", "email": "Alice@Example.com", "email_verified": true}),
+        &[("alice@example.com", Role::Operator)],
+    )
+    .await;
+    let reply = get(addr, "/", None).await;
+    assert_eq!(reply.status, 401);
+    assert!(
+        reply.body.contains("Sign in with 127.0.0.1:"),
+        "{}",
+        reply.body
+    );
+    let page = get(addr, "/login", None).await;
+    assert_eq!(page.status, 200);
+    assert!(
+        page.body.contains("action=\"/auth/login\""),
+        "{}",
+        page.body
+    );
+
+    let (login, state) = start_oidc_login(addr).await;
+    let reply = oidc_callback(addr, &state, Some(&login)).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(reply.body.contains("url=/"), "{}", reply.body);
+    let cookies = reply.set_cookies();
+    assert_eq!(cookies.len(), 2, "{cookies:?}");
+    let session = cookies
+        .iter()
+        .find(|c| c.starts_with(&format!("{SECURE_COOKIE}=")))
+        .unwrap();
+    assert!(session.contains("SameSite=Strict"), "{session}");
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("__Host-vk-hub-login=;") && c.ends_with("Max-Age=0")),
+        "{cookies:?}"
+    );
+    let pair = session.split(';').next().unwrap();
+    let home = request(
+        addr,
+        "GET",
+        "/",
+        &["Sec-Fetch-Site: same-origin", &format!("Cookie: {pair}")],
+        "",
+    )
+    .await;
+    assert_eq!(home.status, 200, "{}", home.body);
+    assert!(
+        home.body.contains("(operator, alice@example.com)"),
+        "{}",
+        home.body
+    );
+
+    let sessions = hub.db.ui_sessions(crate::now_secs()).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].role, Role::Operator);
+    assert_eq!(sessions[0].identity.as_deref(), Some("alice@example.com"));
+    let audit = hub.db.audits(None, 10).unwrap();
+    assert!(
+        audit.iter().any(|r| r
+            .event
+            .contains("signed in as alice@example.com through http://")),
+        "{audit:?}"
+    );
+
+    // The state is spent: the same callback again opens nothing.
+    let again = oidc_callback(addr, &state, Some(&login)).await;
+    assert_eq!(again.status, 400, "{}", again.body);
+    assert_eq!(hub.db.ui_sessions(crate::now_secs()).unwrap().len(), 1);
+}
+
+/// Deny by default: an identity granted nothing is refused with a page saying who signed in,
+/// and the refusal is audited with its reason. An unverified email is no email: it matches no
+/// grant. Nor is an `email` that is not an address: who signed in is named by their subject.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oidc_sign_in_granted_nothing_is_refused_and_audited() {
+    for (claims, identity, why) in [
+        (
+            serde_json::json!({"sub": "user-7", "email": "mallory@example.com"}),
+            "mallory@example.com",
+            "granted no role",
+        ),
+        (
+            serde_json::json!({"sub": "user-7", "email": "alice@example.com", "email_verified": false}),
+            "sub user-7",
+            "its email is marked unverified",
+        ),
+        (
+            serde_json::json!({"sub": "s", "email": "sub x"}),
+            "sub s",
+            "granted no role",
+        ),
+    ] {
+        let (addr, hub) = start_oidc(
+            claims.clone(),
+            &[
+                ("alice@example.com", Role::Operator),
+                ("bob@example.com", Role::Viewer),
+            ],
+        )
+        .await;
+        let (login, state) = start_oidc_login(addr).await;
+        let reply = oidc_callback(addr, &state, Some(&login)).await;
+        assert_eq!(reply.status, 403, "{claims}: {}", reply.body);
+        assert!(
+            reply.body.contains("may not use this hub"),
+            "{}",
+            reply.body
+        );
+        assert!(
+            reply
+                .set_cookies()
+                .iter()
+                .all(|c| !c.starts_with(&format!("{SECURE_COOKIE}="))),
+            "no session cookie"
+        );
+        assert_eq!(
+            reply.body.contains("marks your email unverified"),
+            why.contains("unverified"),
+            "{}",
+            reply.body
+        );
+        assert!(hub.db.ui_sessions(crate::now_secs()).unwrap().is_empty());
+        let audit = hub.db.audits(None, 10).unwrap();
+        assert!(
+            audit.iter().any(|r| r.actor == identity
+                && r.event
+                    .starts_with(&format!("{identity} was refused sign-in"))
+                && r.event.ends_with(why)),
+            "{claims}: {audit:?}"
+        );
+        // Refused again at once: the refusal is not audited a second time.
+        let (login, state) = start_oidc_login(addr).await;
+        let reply = oidc_callback(addr, &state, Some(&login)).await;
+        assert_eq!(reply.status, 403, "{claims}: {}", reply.body);
+        let refusals = hub.db.audits(None, 10).unwrap();
+        let refusals = refusals
+            .iter()
+            .filter(|r| r.event.contains("was refused sign-in"))
+            .count();
+        assert_eq!(refusals, 1, "{claims}");
+    }
+}
+
+/// An address's own grant is matched ignoring ASCII case, and wins over `*`'s.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oidc_sign_in_gets_its_own_grant_over_anyones() {
+    let claims =
+        serde_json::json!({"sub": "user-3", "email": "Carol@Example.com", "email_verified": true});
+    for grants in [
+        &[("carol@example.com", Role::Operator)][..],
+        &[("carol@example.com", Role::Operator), ("*", Role::Viewer)][..],
+    ] {
+        let (addr, hub) = start_oidc(claims.clone(), grants).await;
+        let (login, state) = start_oidc_login(addr).await;
+        let reply = oidc_callback(addr, &state, Some(&login)).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let sessions = hub.db.ui_sessions(crate::now_secs()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].role, Role::Operator);
+        assert_eq!(sessions[0].identity.as_deref(), Some("carol@example.com"));
+    }
+}
+
+/// A revoke ends the sessions its address opened, and the browser holding one is signed out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoked_grant_ends_its_sessions() {
+    let (addr, hub) = start_oidc(
+        serde_json::json!({"sub": "user-3", "email": "carol@example.com"}),
+        &[("carol@example.com", Role::Operator)],
+    )
+    .await;
+    let (login, state) = start_oidc_login(addr).await;
+    let reply = oidc_callback(addr, &state, Some(&login)).await;
+    let session = reply
+        .set_cookies()
+        .into_iter()
+        .find(|c| c.starts_with(&format!("{SECURE_COOKIE}=")))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let home = |cookie: String| async move {
+        request(
+            addr,
+            "GET",
+            "/",
+            &["Sec-Fetch-Site: same-origin", &format!("Cookie: {cookie}")],
+            "",
+        )
+        .await
+        .status
+    };
+    assert_eq!(home(session.clone()).await, 200);
+    let change = hub
+        .db
+        .revoke_account("carol@example.com", "uid 0", crate::now_secs())
+        .unwrap();
+    assert_eq!(change.ended, 1);
+    assert_eq!(home(session).await, 401);
+    // And the next sign-in is refused.
+    let (login, state) = start_oidc_login(addr).await;
+    assert_eq!(oidc_callback(addr, &state, Some(&login)).await.status, 403);
+}
+
+/// The `*` grant lets anyone the provider signs in view: one with no verified email is named
+/// by their subject. Signing in again at once opens another session, not audited a second
+/// time.
+#[tokio::test(flavor = "multi_thread")]
+async fn anyone_may_view_with_the_star_grant() {
+    let (addr, hub) = start_oidc(
+        serde_json::json!({"sub": "user-9", "email": "eve@example.com", "email_verified": "false"}),
+        &[("alice@example.com", Role::Operator), ("*", Role::Viewer)],
+    )
+    .await;
+    for _ in 0..2 {
+        let (login, state) = start_oidc_login(addr).await;
+        let reply = oidc_callback(addr, &state, Some(&login)).await;
+        assert_eq!(reply.status, 200, "{}", reply.body);
+    }
+    let sessions = hub.db.ui_sessions(crate::now_secs()).unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[0].role, Role::Viewer);
+    assert_eq!(sessions[0].identity.as_deref(), Some("sub user-9"));
+    let audit = hub.db.audits(None, 10).unwrap();
+    let sign_ins = audit
+        .iter()
+        .filter(|r| r.event.contains("signed in as sub user-9"))
+        .count();
+    assert_eq!(sign_ins, 1, "{audit:?}");
+}
+
+/// The login cookie is what binds the callback to the browser that started the sign-in: a
+/// callback without it — a URL an attacker completed at the provider and handed over — opens
+/// nothing. Starting a sign-in is for no other site's page.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oidc_callback_this_browser_did_not_start_opens_nothing() {
+    let (addr, hub) = start_oidc(
+        serde_json::json!({"sub": "user-42", "email": "alice@example.com"}),
+        &[("alice@example.com", Role::Operator)],
+    )
+    .await;
+    let (_, state) = start_oidc_login(addr).await;
+    let reply = oidc_callback(addr, &state, None).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    let reply = oidc_callback(addr, &state, Some("__Host-vk-hub-login=another")).await;
+    assert_eq!(reply.status, 400, "{}", reply.body);
+    assert!(hub.db.ui_sessions(crate::now_secs()).unwrap().is_empty());
+
+    let reply = request(
+        addr,
+        "GET",
+        "/auth/login",
+        &["Sec-Fetch-Site: cross-site"],
+        "",
+    )
+    .await;
+    assert_eq!(reply.status, 403);
+    // A refusal at the provider ends the login, and says so.
+    let reply = request(
+        addr,
+        "GET",
+        "/auth/callback?error=access_denied&state=x",
+        &["Sec-Fetch-Site: cross-site"],
+        "",
+    )
+    .await;
+    assert_eq!(reply.status, 400);
+    assert!(reply.body.contains("did not complete"), "{}", reply.body);
+}
+
+/// Without `[oidc]`, neither address leads anywhere, and the pages say only how to get a link.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_oidc_there_is_no_provider_to_sign_in_with() {
+    let (addr, _, _) = start_fleet_as("https").await;
+    assert_eq!(get(addr, "/auth/login", None).await.status, 404);
+    assert_eq!(
+        get(addr, "/auth/callback?code=a&state=b", None)
+            .await
+            .status,
+        404
+    );
+    assert!(!get(addr, "/", None).await.body.contains("/auth/login"));
+    assert_eq!(get(addr, "/login", None).await.status, 403);
+}

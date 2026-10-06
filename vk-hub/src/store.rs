@@ -1,6 +1,7 @@
 //! The hub's database: enrolled nodes, what the hub wants of them and the commands issued to
 //! them, the releases it holds and its rollouts of them, outstanding enrollment tokens, the
-//! web UI's sign-in links and sessions, and the audit log, in [`redb`] like `vk-registry`'s
+//! web UI's sign-in links and sessions, the roles granted to people who sign in through OIDC,
+//! and the audit log, in [`redb`] like `vk-registry`'s
 //! accounts store — tables of JSON rows, small enough that listing every node is a scan.
 //!
 //! Enrollment tokens, sign-in tokens and session secrets are stored as `sha256` hashes, so
@@ -61,6 +62,9 @@ const WORKLOAD_MEM: TableDefinition<&str, &[u8]> = TableDefinition::new("workloa
 const RELEASES: TableDefinition<&str, &[u8]> = TableDefinition::new("releases");
 /// Key: rollout ID. Value: JSON [`RolloutRow`].
 const ROLLOUTS: TableDefinition<&str, &[u8]> = TableDefinition::new("rollouts");
+/// Key: an email address, lowercase, or [`ANYONE`]. Value: JSON [`AccountRow`]: the role
+/// `vk-hub accounts grant` gave whoever the OIDC provider signs in with it.
+const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("accounts");
 
 /// The most audit rows kept. Bounded by count rather than age: a quiet fleet keeps its history
 /// for years, and a busy one keeps the newest hundred thousand actions and outcomes — months
@@ -100,6 +104,11 @@ pub const MAX_LOGIN_TTL: Duration = Duration::from_secs(86_400);
 /// How long a web UI session lasts from sign-in: a working day, then a new link.
 pub const UI_SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 
+/// How many live web UI sessions one identity may hold through OIDC: a sign-in past that ends
+/// its oldest, so that sign-ins the `*` grant admits at will do not grow the table without
+/// bound.
+pub const MAX_OIDC_SESSIONS: usize = 8;
+
 /// How many hex digits of a session's key name it: in `vk-hub ui sessions` and `vk-hub local
 /// sessions`, and in the audit log as the principal of what it did. 48 bits, unique among the
 /// few sessions a hub holds but not guaranteed to be: `logout <id>` ends every session that
@@ -138,6 +147,76 @@ struct UiSessionRow {
     issued_by: String,
     created_at: u64,
     expires_at: u64,
+    /// Who signed in, for a session opened through OIDC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<String>,
+}
+
+/// The grant that admits anyone the OIDC provider signs in, verified email or not, whom no
+/// grant of their own names: only ever as a viewer.
+pub const ANYONE: &str = "*";
+
+/// `e` as the hub keeps an email address it gives a role to: lowercased, as addresses are
+/// compared ignoring ASCII case — full Unicode folding would let a different address
+/// (`\u{212a}` for `k`) match. `None` for what is not an address: no `@`, or whitespace,
+/// control or invisible characters, which no identity the provider signs in can carry.
+pub fn normalize_email(e: &str) -> Option<String> {
+    let bad = |c: char| c.is_whitespace() || c.is_control() || vk_hub_proto::invisible(c);
+    (e.contains('@') && !e.chars().any(bad)).then(|| e.to_ascii_lowercase())
+}
+
+/// What a grant is keyed by: an address, normalized, or [`ANYONE`].
+pub fn account_key(e: &str) -> Option<String> {
+    if e == ANYONE {
+        return Some(ANYONE.to_string());
+    }
+    normalize_email(e)
+}
+
+/// The role `grants` give a sign-in as `identity` — its verified email, normalized, if it has
+/// one: its own grant, else [`ANYONE`]'s.
+fn granted_role(grants: &BTreeMap<String, Role>, identity: Option<&str>) -> Option<Role> {
+    identity
+        .and_then(|who| grants.get(who))
+        .or_else(|| grants.get(ANYONE))
+        .copied()
+}
+
+/// The role a sign-in through OIDC gets by the grants in `table`, with `email` as the
+/// verified address the provider signed someone in with if any: the address's grant, else
+/// [`ANYONE`]'s, and whether it is [`ANYONE`]'s. What is not an address, as
+/// [`normalize_email`] takes them, is no email.
+fn oidc_role_in(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    email: Option<&str>,
+) -> Result<Option<(Role, bool)>> {
+    let email = email.and_then(normalize_email);
+    let mut grants = BTreeMap::new();
+    for key in email.iter().map(String::as_str).chain([ANYONE]) {
+        if let Some(row) = table.get(key)? {
+            grants.insert(key.to_string(), decode::<AccountRow>(row.value())?.role);
+        }
+    }
+    let own = email.as_ref().is_some_and(|e| grants.contains_key(e));
+    Ok(granted_role(&grants, email.as_deref()).map(|role| (role, !own)))
+}
+
+/// A role granted to an email address, for sign-in through OIDC.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountRow {
+    pub role: Role,
+    /// Who granted it: `uid <n>`.
+    pub granted_by: String,
+    pub granted_at: u64,
+}
+
+/// The result of granting or revoking a role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountChange {
+    /// The role granted before; `None` where there was no grant.
+    pub previous: Option<Role>,
+    /// How many of the address's web UI sessions it ended.
+    pub ended: usize,
 }
 
 /// A web UI session, as the UI and `vk-hub ui sessions` see it.
@@ -147,10 +226,14 @@ pub struct UiSession {
     /// another session may share: what names it, and no use as the secret.
     pub id: String,
     pub role: Role,
-    /// Who issued the sign-in link it was opened with.
+    /// Who issued the sign-in link it was opened with, or the OIDC issuer it was opened
+    /// through.
     pub issued_by: String,
     pub created_at: u64,
     pub expires_at: u64,
+    /// Who signed in, for a session opened through OIDC: their email, or `sub <subject>`.
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 impl UiSession {
@@ -161,12 +244,16 @@ impl UiSession {
             issued_by: row.issued_by,
             created_at: row.created_at,
             expires_at: row.expires_at,
+            identity: row.identity,
         }
     }
 
     /// Who the audit log says did what this session did.
     pub fn principal(&self) -> String {
-        format!("ui session {} ({})", self.id, self.role.name())
+        match &self.identity {
+            Some(who) => format!("ui session {} ({}, {who})", self.id, self.role.name()),
+            None => format!("ui session {} ({})", self.id, self.role.name()),
+        }
     }
 }
 
@@ -312,7 +399,7 @@ pub struct AuditRow {
     pub node: Option<String>,
     /// Who: `uid <n>` for an operator on the admin socket, a session's principal for what it
     /// did, `vk-hub local` for what local mode did as it started, `peer <addr>` for an
-    /// enrollment.
+    /// enrollment, and whom an OIDC provider signed in for a sign-in the hub refused.
     pub actor: String,
     pub event: String,
 }
@@ -501,6 +588,8 @@ impl Db {
             .context("opening the releases table")?;
         txn.open_table(ROLLOUTS)
             .context("opening the rollouts table")?;
+        txn.open_table(ACCOUNTS)
+            .context("opening the accounts table")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db {
             db,
@@ -1502,6 +1591,7 @@ impl Db {
                         issued_by: login.issued_by,
                         created_at: now,
                         expires_at: now.saturating_add(UI_SESSION_TTL.as_secs()),
+                        identity: None,
                     };
                     let mut sessions = txn.open_table(UI_SESSIONS)?;
                     sessions.retain(|_, value| {
@@ -1522,6 +1612,67 @@ impl Db {
         };
         txn.commit().context("opening a web UI session")?;
         Ok(session)
+    }
+
+    /// Open a web UI session for `identity`, signed in by the OIDC provider `issuer`.
+    /// Use the grant for its verified `email`, if any, then fall back to [`ANYONE`]'s.
+    /// Read the grant and open the session in one write transaction, ordering sign-in
+    /// before or after each grant change and its session sweep. Beyond [`MAX_OIDC_SESSIONS`]
+    /// live sessions for `identity`, end its oldest without auditing the eviction.
+    /// Audit the sign-in unless only [`ANYONE`]'s grant admits it and `audit_anyone` declines.
+    /// Return the secret (the cookie, stored only as a hash) and session, or `None`
+    /// when no grant admits the sign-in.
+    pub fn create_oidc_session(
+        &self,
+        email: Option<&str>,
+        identity: &str,
+        issuer: &str,
+        now: u64,
+        audit_anyone: impl FnOnce() -> bool,
+    ) -> Result<Option<(String, UiSession)>> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let Some((role, by_anyone)) = oidc_role_in(&txn.open_table(ACCOUNTS)?, email)? else {
+            return Ok(None);
+        };
+        let secret = crate::random_hex(32)?;
+        let key = token_key(&secret);
+        let row = UiSessionRow {
+            role,
+            issued_by: issuer.to_string(),
+            created_at: now,
+            expires_at: now.saturating_add(UI_SESSION_TTL.as_secs()),
+            identity: Some(identity.to_string()),
+        };
+        {
+            let mut sessions = txn.open_table(UI_SESSIONS)?;
+            // One pass drops what has expired or does not decode, and finds `identity`'s.
+            let mut own = Vec::new();
+            sessions.retain(|key, value| match decode::<UiSessionRow>(value) {
+                Ok(r) if r.expires_at > now => {
+                    if r.identity.as_deref() == Some(identity) {
+                        own.push((r.created_at, key.to_string()));
+                    }
+                    true
+                }
+                _ => false,
+            })?;
+            own.sort();
+            let past_cap = (own.len() + 1).saturating_sub(MAX_OIDC_SESSIONS);
+            for (_, oldest) in &own[..past_cap] {
+                sessions.remove(oldest.as_str())?;
+            }
+            sessions.insert(key.as_str(), encode(&row)?.as_slice())?;
+        }
+        let session = UiSession::new(&key, row);
+        if !by_anyone || audit_anyone() {
+            let event = format!(
+                "{} signed in as {identity} through {issuer}",
+                session.principal()
+            );
+            append_audit(&txn, None, &session.principal(), &event, now)?;
+        }
+        txn.commit().context("opening a web UI session")?;
+        Ok(Some((secret, session)))
     }
 
     /// The live web UI session whose cookie is `secret`.
@@ -1593,34 +1744,129 @@ impl Db {
         now: u64,
     ) -> Result<usize> {
         let txn = self.db.begin_write().context("starting a write")?;
-        let mut ended = Vec::new();
-        {
-            let mut table = txn.open_table(UI_SESSIONS)?;
-            table.retain(|key, value| {
-                let Ok(row) = decode::<UiSessionRow>(value) else {
+        let ended = end_sessions_in(&txn, ends, actor, now)?;
+        txn.commit().context("ending web UI sessions")?;
+        Ok(ended)
+    }
+
+    /// The role [`Self::create_oidc_session`] opens a session in for `email`.
+    #[cfg(test)]
+    pub fn oidc_role(&self, email: Option<&str>) -> Result<Option<Role>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        Ok(oidc_role_in(&txn.open_table(ACCOUNTS)?, email)?.map(|(role, _)| role))
+    }
+
+    /// Every grant, by address, [`ANYONE`] first.
+    pub fn accounts(&self) -> Result<Vec<(String, AccountRow)>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(ACCOUNTS)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            out.push((key.value().to_string(), decode(value.value())?));
+        }
+        Ok(out)
+    }
+
+    /// Grant `role` to `email` — an address, or [`ANYONE`], as [`account_key`] takes them —
+    /// replacing the role it had, audited as `actor`'s. [`ANYONE`] may only be a viewer.
+    /// Sessions the grant covers that hold more than a sign-in now gets end with it, so a
+    /// lowered role takes effect at once.
+    pub fn grant_account(
+        &self,
+        email: &str,
+        role: Role,
+        actor: &str,
+        now: u64,
+    ) -> Result<AccountChange> {
+        if email == ANYONE && role != Role::Viewer {
+            bail!(
+                "{ANYONE} may only be granted the viewer role: it admits anyone the provider signs in"
+            );
+        }
+        self.set_account(email, Some(role), actor, now)
+    }
+
+    /// Remove `email`'s grant, audited as `actor`'s, ending the sessions it covered that hold
+    /// more than a sign-in now gets.
+    pub fn revoke_account(&self, email: &str, actor: &str, now: u64) -> Result<AccountChange> {
+        self.set_account(email, None, actor, now)
+    }
+
+    fn set_account(
+        &self,
+        email: &str,
+        role: Option<Role>,
+        actor: &str,
+        now: u64,
+    ) -> Result<AccountChange> {
+        let email = email.to_ascii_lowercase();
+        let email = email.as_str();
+        let txn = self.db.begin_write().context("starting a write")?;
+        let (previous, grants) = {
+            let mut table = txn.open_table(ACCOUNTS)?;
+            let previous = table
+                .get(email)?
+                .map(|g| decode::<AccountRow>(g.value()))
+                .transpose()?
+                .map(|row| row.role);
+            if previous == role {
+                return Ok(AccountChange { previous, ended: 0 });
+            }
+            match role {
+                Some(role) => {
+                    let row = AccountRow {
+                        role,
+                        granted_by: actor.to_string(),
+                        granted_at: now,
+                    };
+                    table.insert(email, encode(&row)?.as_slice())?;
+                }
+                None => {
+                    table.remove(email)?;
+                }
+            }
+            let mut grants = BTreeMap::new();
+            for entry in table.iter()? {
+                let (key, value) = entry?;
+                grants.insert(
+                    key.value().to_string(),
+                    decode::<AccountRow>(value.value())?.role,
+                );
+            }
+            (previous, grants)
+        };
+        let event = match (previous, role) {
+            (None, Some(r)) => format!("{actor} granted {email} the {} role", r.name()),
+            (Some(p), Some(r)) => format!(
+                "{actor} granted {email} the {} role, replacing {}",
+                r.name(),
+                p.name()
+            ),
+            // `(None, None)` is unchanged, and returned above.
+            (p, None) => format!(
+                "{actor} revoked {email}'s grant of the {} role",
+                p.map_or("no", Role::name)
+            ),
+        };
+        append_audit(&txn, None, actor, &event, now)?;
+        // The sessions the grant covers — every one opened through OIDC for [`ANYONE`]'s —
+        // that hold more than a sign-in as their identity now gets.
+        let ended = end_sessions_in(
+            &txn,
+            |_, s| {
+                let Some(who) = s.identity.as_deref() else {
                     return false;
                 };
-                let session = UiSession::new(key, row);
-                if ends(key, &session) {
-                    // An expired one goes silently: it had ended already.
-                    if session.expires_at > now {
-                        ended.push(session.principal());
-                    }
-                    return false;
-                }
-                true
-            })?;
-        }
-        for principal in &ended {
-            let event = if principal == actor {
-                format!("{principal} signed out")
-            } else {
-                format!("{actor} ended {principal}")
-            };
-            append_audit(&txn, None, actor, &event, now)?;
-        }
-        txn.commit().context("ending web UI sessions")?;
-        Ok(ended.len())
+                let covered = email == ANYONE || who.eq_ignore_ascii_case(email);
+                let who = who.to_ascii_lowercase();
+                covered && Some(s.role) > granted_role(&grants, Some(&who))
+            },
+            actor,
+            now,
+        )?;
+        txn.commit().context("changing a grant")?;
+        Ok(AccountChange { previous, ended })
     }
 
     /// Void every unspent sign-in link, recorded as `actor`'s doing. Returns how many.
@@ -1904,6 +2150,40 @@ fn workloads_in(txn: &redb::ReadTransaction, id: &str) -> Result<Option<Workload
         }
     }
     Ok(Some(workloads))
+}
+
+/// End the web UI sessions `ends` picks by key and session, in `txn`, audited as `actor`'s,
+/// dropping every row that does not decode on the way. Returns how many live ones ended.
+fn end_sessions_in(
+    txn: &redb::WriteTransaction,
+    ends: impl Fn(&str, &UiSession) -> bool,
+    actor: &str,
+    now: u64,
+) -> Result<usize> {
+    let mut ended = Vec::new();
+    txn.open_table(UI_SESSIONS)?.retain(|key, value| {
+        let Ok(row) = decode::<UiSessionRow>(value) else {
+            return false;
+        };
+        let session = UiSession::new(key, row);
+        if ends(key, &session) {
+            // An expired one goes silently: it had ended already.
+            if session.expires_at > now {
+                ended.push(session.principal());
+            }
+            return false;
+        }
+        true
+    })?;
+    for principal in &ended {
+        let event = if principal == actor {
+            format!("{principal} signed out")
+        } else {
+            format!("{actor} ended {principal}")
+        };
+        append_audit(txn, None, actor, &event, now)?;
+    }
+    Ok(ended.len())
 }
 
 /// Append an audit row inside `txn`, dropping the oldest past [`AUDIT_MAX`].
@@ -3507,6 +3787,364 @@ mod tests {
         );
     }
 
+    /// A session opened through OIDC carries who signed in: in its principal, so the audit
+    /// log names them for everything it does, and in the listing. A row written before
+    /// sessions had an identity still reads.
+    #[test]
+    fn an_oidc_session_names_who_signed_in() {
+        let db = Db::open_memory().unwrap();
+        db.grant_account("alice@example.com", Role::Operator, "uid 0", 1)
+            .unwrap();
+        let (secret, session) = db
+            .create_oidc_session(
+                Some("alice@example.com"),
+                "alice@example.com",
+                "https://idp",
+                1000,
+                || true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.principal(),
+            format!("ui session {} (operator, alice@example.com)", session.id)
+        );
+        assert_eq!(
+            db.ui_session(&secret, 1001).unwrap().as_ref(),
+            Some(&session)
+        );
+        assert_eq!(db.ui_sessions(1001).unwrap(), vec![session.clone()]);
+        let audit = db.audits(None, 10).unwrap();
+        assert!(
+            audit.iter().any(|r| r.actor == session.principal()
+                && r.event
+                    .ends_with("signed in as alice@example.com through https://idp")),
+            "{audit:?}"
+        );
+        assert_eq!(
+            db.end_ui_session(&secret, &session.principal(), 1002)
+                .unwrap(),
+            1
+        );
+
+        let old: UiSessionRow = serde_json::from_str(
+            r#"{"role":"viewer","issued_by":"uid 0","created_at":1,"expires_at":2}"#,
+        )
+        .unwrap();
+        assert_eq!(old.identity, None);
+    }
+
+    /// A grant is kept by address and audited with who made it; granting the same role again
+    /// changes nothing, and a revoke removes it. A database from before grants opens with
+    /// none.
+    #[test]
+    fn grants_are_kept_replaced_and_revoked() {
+        let db = Db::open_memory().unwrap();
+        let grant = |role| db.grant_account("bob@example.com", role, "uid 1000", 10);
+        assert_eq!(
+            grant(Role::Viewer).unwrap(),
+            AccountChange {
+                previous: None,
+                ended: 0
+            }
+        );
+        assert_eq!(
+            grant(Role::Viewer).unwrap().previous,
+            Some(Role::Viewer),
+            "unchanged"
+        );
+        assert_eq!(grant(Role::Operator).unwrap().previous, Some(Role::Viewer));
+        assert_eq!(
+            db.oidc_role(Some("Bob@Example.COM")).unwrap(),
+            Some(Role::Operator)
+        );
+        assert_eq!(
+            db.accounts().unwrap(),
+            vec![(
+                "bob@example.com".to_string(),
+                AccountRow {
+                    role: Role::Operator,
+                    granted_by: "uid 1000".into(),
+                    granted_at: 10
+                }
+            )]
+        );
+        let change = db.revoke_account("bob@example.com", "uid 0", 11).unwrap();
+        assert_eq!(change.previous, Some(Role::Operator));
+        assert_eq!(db.oidc_role(Some("bob@example.com")).unwrap(), None);
+        assert_eq!(
+            db.revoke_account("bob@example.com", "uid 0", 12)
+                .unwrap()
+                .previous,
+            None
+        );
+        let events: Vec<(String, String)> = db
+            .audits(None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.actor, r.event))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                (
+                    "uid 1000".into(),
+                    "uid 1000 granted bob@example.com the viewer role".into()
+                ),
+                (
+                    "uid 1000".into(),
+                    "uid 1000 granted bob@example.com the operator role, replacing viewer".into()
+                ),
+                (
+                    "uid 0".into(),
+                    "uid 0 revoked bob@example.com's grant of the operator role".into()
+                ),
+            ]
+        );
+
+        let old = Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .unwrap();
+        let txn = old.begin_write().unwrap();
+        txn.open_table(NODES).unwrap();
+        txn.open_table(UI_SESSIONS).unwrap();
+        txn.commit().unwrap();
+        assert!(Db::init(old).unwrap().accounts().unwrap().is_empty());
+    }
+
+    /// A sign-in gets its address's grant, else the `*` grant's viewer role — with or without
+    /// a verified email — else none; `*` is never an operator.
+    #[test]
+    fn a_sign_in_gets_its_own_grant_else_anyones() {
+        let db = Db::open_memory().unwrap();
+        db.grant_account("ops@example.com", Role::Operator, "uid 0", 1)
+            .unwrap();
+        assert_eq!(db.oidc_role(Some("x@y")).unwrap(), None);
+        assert_eq!(
+            db.oidc_role(None).unwrap(),
+            None,
+            "no verified email, no role"
+        );
+        let err = db
+            .grant_account(ANYONE, Role::Operator, "uid 0", 1)
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("only be granted the viewer"),
+            "{err:#}"
+        );
+        db.grant_account(ANYONE, Role::Viewer, "uid 0", 1).unwrap();
+        assert_eq!(db.oidc_role(Some("x@y")).unwrap(), Some(Role::Viewer));
+        assert_eq!(db.oidc_role(None).unwrap(), Some(Role::Viewer));
+        assert_eq!(
+            db.oidc_role(Some("OPS@example.com")).unwrap(),
+            Some(Role::Operator)
+        );
+        // ASCII case only: the Kelvin sign is not a `k`.
+        db.revoke_account(ANYONE, "uid 0", 2).unwrap();
+        db.grant_account("kim@example.com", Role::Viewer, "uid 0", 2)
+            .unwrap();
+        assert_eq!(db.oidc_role(Some("\u{212a}im@example.com")).unwrap(), None);
+    }
+
+    /// A sign-in reads its grant in the write that opens its session: once a revoke has
+    /// committed, no session is opened on the role it took away.
+    #[test]
+    fn a_sign_in_after_a_revoke_opens_no_session() {
+        let db = Db::open_memory().unwrap();
+        db.grant_account("ops@example.com", Role::Operator, "uid 0", 1)
+            .unwrap();
+        db.revoke_account("ops@example.com", "uid 0", 2).unwrap();
+        let opened = db
+            .create_oidc_session(
+                Some("ops@example.com"),
+                "ops@example.com",
+                "https://idp",
+                3,
+                || true,
+            )
+            .unwrap();
+        assert!(opened.is_none());
+        assert!(db.ui_sessions(3).unwrap().is_empty());
+        // `*` admits as a viewer whom no grant of their own names.
+        db.grant_account(ANYONE, Role::Viewer, "uid 0", 4).unwrap();
+        let (_, session) = db
+            .create_oidc_session(
+                Some("OPS@example.com"),
+                "ops@example.com",
+                "https://idp",
+                5,
+                || true,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.role, Role::Viewer);
+    }
+
+    /// One identity holds at most [`MAX_OIDC_SESSIONS`] sessions: signing in past that ends
+    /// its oldest, and no one else's.
+    #[test]
+    fn a_sign_in_past_the_cap_ends_the_oldest_session() {
+        let db = Db::open_memory().unwrap();
+        db.grant_account(ANYONE, Role::Viewer, "uid 0", 1).unwrap();
+        let open = |who: &str, now: u64| {
+            db.create_oidc_session(None, who, "https://idp", now, || true)
+                .unwrap()
+                .unwrap()
+                .1
+        };
+        let other = open("sub other", 99);
+        let first: Vec<UiSession> = (0..MAX_OIDC_SESSIONS as u64)
+            .map(|n| open("sub s", 100 + n))
+            .collect();
+        let newest = open("sub s", 200);
+        let live = db.ui_sessions(201).unwrap();
+        let own: Vec<&UiSession> = live
+            .iter()
+            .filter(|s| s.identity.as_deref() == Some("sub s"))
+            .collect();
+        assert_eq!(own.len(), MAX_OIDC_SESSIONS);
+        assert!(!live.contains(&first[0]), "{live:?}");
+        assert!(live.contains(&first[1]) && live.contains(&newest) && live.contains(&other));
+        assert!(
+            !db.audits(None, 100)
+                .unwrap()
+                .iter()
+                .any(|r| r.event.contains("ended")),
+            "evictions are not audited"
+        );
+    }
+
+    /// A sign-in its own grant admits is always audited; one only `*` admits, as the caller's
+    /// `audit_anyone` says, and only it asks.
+    #[test]
+    fn only_a_sign_in_by_anyones_grant_may_go_unaudited() {
+        let db = Db::open_memory().unwrap();
+        db.grant_account("ops@example.com", Role::Operator, "uid 0", 1)
+            .unwrap();
+        db.grant_account(ANYONE, Role::Viewer, "uid 0", 1).unwrap();
+        let sign_ins = |db: &Db| {
+            db.audits(None, 100)
+                .unwrap()
+                .iter()
+                .filter(|r| r.event.contains(" signed in as "))
+                .count()
+        };
+        let asked = std::cell::Cell::new(0);
+        let open = |email: &str, audit: bool| {
+            db.create_oidc_session(Some(email), email, "https://idp", 10, || {
+                asked.set(asked.get() + 1);
+                audit
+            })
+            .unwrap()
+            .unwrap();
+        };
+        open("ops@example.com", false);
+        assert_eq!((sign_ins(&db), asked.get()), (1, 0));
+        open("eve@example.com", false);
+        assert_eq!((sign_ins(&db), asked.get()), (1, 1));
+        assert_eq!(db.ui_sessions(11).unwrap().len(), 2, "opened all the same");
+        open("eve@example.com", true);
+        assert_eq!((sign_ins(&db), asked.get()), (2, 2));
+    }
+
+    #[test]
+    fn an_email_is_normalized_to_ascii_lowercase() {
+        assert_eq!(
+            normalize_email("Alice@Example.COM").as_deref(),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            normalize_email("\u{212a}im@example.com").as_deref(),
+            Some("\u{212a}im@example.com")
+        );
+        for bad in [
+            "alice",
+            "",
+            "a @b",
+            "a@b\n",
+            "a@\u{202e}b",
+            "a@b\u{200b}",
+            "*",
+        ] {
+            assert_eq!(normalize_email(bad), None, "{bad:?}");
+        }
+        assert_eq!(account_key("*").as_deref(), Some("*"));
+        assert_eq!(account_key("A@B").as_deref(), Some("a@b"));
+        assert_eq!(account_key("**"), None);
+    }
+
+    /// A change to a grant ends the sessions it covers that hold more than a sign-in now gets,
+    /// and no one else's: not another address's, and not one a link opened. `*`'s covers every
+    /// OIDC session not covered by a grant of its own.
+    #[test]
+    fn a_lowered_grant_ends_the_sessions_that_hold_more() {
+        let db = Db::open_memory().unwrap();
+        let open = |email: Option<&str>, who: &str| {
+            db.create_oidc_session(email, who, "https://idp", 100, || true)
+                .unwrap()
+                .unwrap()
+        };
+        // Opened at the same second, so sorted.
+        let alive = |db: &Db| -> Vec<(Role, Option<String>)> {
+            let mut alive: Vec<_> = db
+                .ui_sessions(101)
+                .unwrap()
+                .into_iter()
+                .map(|s| (s.role, s.identity))
+                .collect();
+            alive.sort();
+            alive
+        };
+        let dan = "dan@example.com";
+        // A viewer, then raised to operator: a session in each role.
+        db.grant_account(dan, Role::Viewer, "uid 0", 1).unwrap();
+        open(Some(dan), dan);
+        db.grant_account(dan, Role::Operator, "uid 0", 1).unwrap();
+        open(Some(dan), dan);
+        db.grant_account("erin@example.com", Role::Operator, "uid 0", 1)
+            .unwrap();
+        open(Some("erin@example.com"), "erin@example.com");
+        db.grant_account(ANYONE, Role::Viewer, "uid 0", 1).unwrap();
+        open(None, "sub user-9");
+        let (token, _) = db
+            .create_login(Role::Operator, Duration::from_secs(60), "uid 0", 100)
+            .unwrap();
+        db.redeem_login(&token, 100).unwrap().unwrap();
+
+        // Lowered to viewer: dan's operator session ends, his viewer one stays.
+        let change = db
+            .grant_account("dan@example.com", Role::Viewer, "uid 0", 101)
+            .unwrap();
+        assert_eq!(change.ended, 1);
+        let dan = Some("dan@example.com".to_string());
+        let erin = Some("erin@example.com".to_string());
+        let sub = Some("sub user-9".to_string());
+        assert_eq!(
+            alive(&db),
+            [
+                (Role::Viewer, dan.clone()),
+                (Role::Viewer, sub.clone()),
+                (Role::Operator, None),
+                (Role::Operator, erin.clone())
+            ]
+        );
+        // Revoked while `*` still makes him a viewer: his viewer session stays.
+        let change = db.revoke_account("DAN@example.com", "uid 0", 101).unwrap();
+        assert_eq!(change.ended, 0);
+        // `*` revoked: every viewer it admitted ends — dan's and the one with no email — but
+        // not erin, whose own grant admits her.
+        let change = db.revoke_account(ANYONE, "uid 7", 101).unwrap();
+        assert_eq!(change.ended, 2);
+        assert_eq!(alive(&db), [(Role::Operator, None), (Role::Operator, erin)]);
+        let audit = db.audits(None, 3).unwrap();
+        assert!(
+            audit.iter().any(|r| r.actor == "uid 7"
+                && r.event.starts_with("uid 7 ended ui session ")
+                && r.event.ends_with("(viewer, sub user-9)")),
+            "{audit:?}"
+        );
+    }
+
     /// A row that does not decode is left out of the listing, not made to fail it, and the
     /// next end of sessions drops it; a browser's sign-out ends its own session alone, even
     /// beside one listed under the same ID.
@@ -3526,6 +4164,7 @@ mod tests {
                 issued_by: "uid 0".into(),
                 created_at: 1000,
                 expires_at: 5000,
+                identity: None,
             };
             table
                 .insert(twin.as_str(), encode(&row).unwrap().as_slice())
