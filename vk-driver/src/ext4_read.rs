@@ -578,17 +578,13 @@ mod tests {
     }
 
     impl Scratch {
+        /// A distinct dir: concurrent tests can read the same nanosecond, letting one's
+        /// `Drop` remove the tree another is building an image from.
         fn new() -> Scratch {
-            let mut p = std::env::temp_dir();
-            let uniq = format!(
-                "vk-ext4-read-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            );
-            p.push(uniq);
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let p = std::env::temp_dir().join(format!("vk-ext4-read-{}-{seq}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).unwrap();
             Scratch { path: p }
         }
