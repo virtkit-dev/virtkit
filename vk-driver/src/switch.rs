@@ -1598,21 +1598,25 @@ impl Switch {
 
         let (rd, wr) = conn.into_split();
         let writer = tokio::spawn(writer_task(wr, rx));
-        self.reader(port, rd).await;
+        if let Err(e) = self.reader(port, rd).await
+            && !is_peer_reset(&e)
+        {
+            eprintln!("switch: {bound_ip} (port {port}) disconnected: {e:#}");
+        }
 
         writer.abort();
         self.drop_port(port);
     }
 
-    async fn reader(&self, port: PortId, mut rd: tokio::net::unix::OwnedReadHalf) {
+    /// Switch `port`'s frames until a clean EOF (`Ok`) or a read or framing error.
+    async fn reader(&self, port: PortId, mut rd: tokio::net::unix::OwnedReadHalf) -> Result<()> {
         let mut frames = FrameReader::new();
-        loop {
-            match frames.next(&mut rd).await {
-                Ok(Some((a, b))) if b - a >= 14 => self.handle_frame(port, &frames.buf[a..b]),
-                Ok(Some(_)) => {} // runt
-                Ok(None) | Err(_) => return,
-            }
+        while let Some((a, b)) = frames.next(&mut rd).await? {
+            if b - a >= 14 {
+                self.handle_frame(port, &frames.buf[a..b]);
+            } // else a runt
         }
+        Ok(())
     }
 
     /// Switch one ethernet frame from `port`.
@@ -3414,6 +3418,14 @@ fn write_eth_header(frame: &mut [u8], guest_mac: Mac) {
     frame[0..6].copy_from_slice(&guest_mac);
     frame[6..12].copy_from_slice(&GW_MAC);
     frame[12..14].copy_from_slice(&ethertype.to_be_bytes());
+}
+
+/// Whether `e` is the peer resetting the socket, as a stopped or killed VM does: not worth
+/// a log line, unlike a malformed stream.
+fn is_peer_reset(e: &anyhow::Error) -> bool {
+    e.root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionReset)
 }
 
 /// A guest's qemu stream, read through a bounded buffer. One read can collect several
@@ -6524,6 +6536,19 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn only_a_peer_reset_is_a_quiet_disconnect() {
+        let reset = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            .context("read frame");
+        assert!(is_peer_reset(&reset));
+        let other = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::InvalidData))
+            .context("read frame");
+        assert!(!is_peer_reset(&other));
+        for framing in ["frame length 70000 exceeds 65535", "truncated frame"] {
+            assert!(!is_peer_reset(&anyhow::anyhow!(framing)));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
