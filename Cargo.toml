@@ -44,6 +44,32 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# The crypto vk-tpm computes with, optimized even in the dev profile: unoptimized big-number
+# and curve arithmetic made vk-tpm's tests (RSA key generation above all) several times
+# slower. Dev profile only: release builds are unchanged.
+[profile.dev.package.rsa]
+opt-level = 3
+[profile.dev.package.crypto-bigint]
+opt-level = 3
+[profile.dev.package.crypto-primes]
+opt-level = 3
+[profile.dev.package.p256]
+opt-level = 3
+[profile.dev.package.primeorder]
+opt-level = 3
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+[profile.dev.package.ecdsa]
+opt-level = 3
+[profile.dev.package.sha1]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.aes]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+
 # `inherits` also carries the inherited profile's per-package overrides, so the dev
 # profile's `debug = false` for dependencies has to be undone explicitly here —
 # otherwise no dependency frame resolves in the one profile meant for debugging.
