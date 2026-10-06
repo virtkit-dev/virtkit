@@ -11,20 +11,32 @@ use crate::pcr::{self, Startup};
 use crate::rc::{Rc, Result};
 use crate::session::SessionSlot;
 use crate::state::{ResetData, Saved, Shutdown, new_seed};
-use crate::{LOCALITY, Out, Tpm, capability, context, hierarchy, key, object, session, signing};
+use crate::{
+    LOCALITY, Out, Tpm, capability, context, hierarchy, key, nv, object, session, signing,
+};
 
+pub const TPM_CC_NV_UNDEFINE_SPACE_SPECIAL: u32 = 0x11f;
 pub const TPM_CC_EVICT_CONTROL: u32 = 0x120;
 pub const TPM_CC_HIERARCHY_CONTROL: u32 = 0x121;
+pub const TPM_CC_NV_UNDEFINE_SPACE: u32 = 0x122;
 pub const TPM_CC_CHANGE_EPS: u32 = 0x124;
 pub const TPM_CC_CHANGE_PPS: u32 = 0x125;
 pub const TPM_CC_CLEAR: u32 = 0x126;
 pub const TPM_CC_CLEAR_CONTROL: u32 = 0x127;
 pub const TPM_CC_HIERARCHY_CHANGE_AUTH: u32 = 0x129;
+pub const TPM_CC_NV_DEFINE_SPACE: u32 = 0x12a;
 pub const TPM_CC_PCR_ALLOCATE: u32 = 0x12b;
 pub const TPM_CC_CREATE_PRIMARY: u32 = 0x131;
 pub const TPM_CC_SET_PRIMARY_POLICY: u32 = 0x12e;
+pub const TPM_CC_NV_GLOBAL_WRITE_LOCK: u32 = 0x132;
+pub const TPM_CC_NV_INCREMENT: u32 = 0x134;
+pub const TPM_CC_NV_SET_BITS: u32 = 0x135;
+pub const TPM_CC_NV_EXTEND: u32 = 0x136;
+pub const TPM_CC_NV_WRITE: u32 = 0x137;
+pub const TPM_CC_NV_WRITE_LOCK: u32 = 0x138;
 pub const TPM_CC_DICTIONARY_ATTACK_LOCK_RESET: u32 = 0x139;
 pub const TPM_CC_DICTIONARY_ATTACK_PARAMETERS: u32 = 0x13a;
+pub const TPM_CC_NV_CHANGE_AUTH: u32 = 0x13b;
 pub const TPM_CC_PCR_EVENT: u32 = 0x13c;
 pub const TPM_CC_PCR_RESET: u32 = 0x13d;
 pub const TPM_CC_SEQUENCE_COMPLETE: u32 = 0x13e;
@@ -32,6 +44,8 @@ pub const TPM_CC_SELF_TEST: u32 = 0x143;
 pub const TPM_CC_STARTUP: u32 = 0x144;
 pub const TPM_CC_SHUTDOWN: u32 = 0x145;
 pub const TPM_CC_STIR_RANDOM: u32 = 0x146;
+pub const TPM_CC_NV_READ: u32 = 0x14e;
+pub const TPM_CC_NV_READ_LOCK: u32 = 0x14f;
 pub const TPM_CC_OBJECT_CHANGE_AUTH: u32 = 0x150;
 pub const TPM_CC_CREATE: u32 = 0x153;
 pub const TPM_CC_ECDH_ZGEN: u32 = 0x154;
@@ -47,6 +61,7 @@ pub const TPM_CC_CONTEXT_SAVE: u32 = 0x162;
 pub const TPM_CC_ECDH_KEYGEN: u32 = 0x163;
 pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x165;
 pub const TPM_CC_LOAD_EXTERNAL: u32 = 0x167;
+pub const TPM_CC_NV_READ_PUBLIC: u32 = 0x169;
 pub const TPM_CC_READ_PUBLIC: u32 = 0x173;
 pub const TPM_CC_RSA_ENCRYPT: u32 = 0x174;
 pub const TPM_CC_START_AUTH_SESSION: u32 = 0x176;
@@ -65,14 +80,24 @@ pub const TPM_CC_TEST_PARMS: u32 = 0x18a;
 
 type Run = fn(&mut Tpm, &[u32], &mut Reader, &mut Out) -> Result<()>;
 
+/// The authorization role a handle takes (Part 1, "Authorization Roles").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    User,
+    /// Certifying, changing the authValue of, or deleting the entity: an object without
+    /// adminWithPolicy may use its authValue; anything else needs its policy, and a policy
+    /// session bound to the command (TPM2_PolicyCommandCode).
+    Admin,
+}
+
 pub struct Command {
     pub code: u32,
     /// The handle area, in order.
     pub handles: &'static [HandleKind],
     /// Number of leading handles that need an authorization session.
     pub auth: usize,
-    /// The first of them takes the ADMIN role (else they all take the USER role).
-    pub admin: bool,
+    /// The role the first of them takes (the others take the USER role).
+    pub role: Role,
     /// It takes an authorization area (not TPM2_Startup).
     pub sessions: bool,
     /// A session may encrypt its first parameter, a TPM2B (DECRYPT_2).
@@ -96,7 +121,7 @@ impl Command {
             code,
             handles: &[],
             auth: 0,
-            admin: false,
+            role: Role::User,
             sessions: true,
             decrypt: false,
             encrypt: false,
@@ -119,7 +144,7 @@ impl Command {
 
     const fn admin(self) -> Command {
         Command {
-            admin: true,
+            role: Role::Admin,
             ..self
         }
     }
@@ -186,6 +211,10 @@ use HandleKind as H;
 
 /// Every implemented command, by code.
 pub const COMMANDS: &[Command] = &[
+    Command::new(TPM_CC_NV_UNDEFINE_SPACE_SPECIAL, nv::undefine_space_special)
+        .handles(&[H::NvIndex, H::Platform], 2)
+        .admin()
+        .nv(),
     Command::new(TPM_CC_EVICT_CONTROL, key::evict_control)
         .handles(&[H::Provision, H::Object(false)], 1)
         .nv(),
@@ -193,6 +222,9 @@ pub const COMMANDS: &[Command] = &[
         .handles(&[H::Hierarchy], 1)
         .nv()
         .extensive(),
+    Command::new(TPM_CC_NV_UNDEFINE_SPACE, nv::undefine_space)
+        .handles(&[H::Provision, H::NvIndex], 1)
+        .nv(),
     Command::new(TPM_CC_CHANGE_EPS, hierarchy::change_eps)
         .handles(&[H::Platform], 1)
         .nv()
@@ -215,6 +247,10 @@ pub const COMMANDS: &[Command] = &[
     .handles(&[H::HierarchyAuth], 1)
     .nv()
     .decrypt(),
+    Command::new(TPM_CC_NV_DEFINE_SPACE, nv::define_space)
+        .handles(&[H::Provision], 1)
+        .nv()
+        .decrypt(),
     Command::new(TPM_CC_PCR_ALLOCATE, pcr_allocate)
         .handles(&[H::Platform], 1)
         .nv(),
@@ -227,6 +263,26 @@ pub const COMMANDS: &[Command] = &[
         .response_handle()
         .decrypt()
         .encrypt(),
+    Command::new(TPM_CC_NV_GLOBAL_WRITE_LOCK, nv::global_write_lock)
+        .handles(&[H::Provision], 1)
+        .nv(),
+    Command::new(TPM_CC_NV_INCREMENT, nv::increment)
+        .handles(&[H::NvAuth, H::NvIndex], 1)
+        .nv(),
+    Command::new(TPM_CC_NV_SET_BITS, nv::set_bits)
+        .handles(&[H::NvAuth, H::NvIndex], 1)
+        .nv(),
+    Command::new(TPM_CC_NV_EXTEND, nv::extend)
+        .handles(&[H::NvAuth, H::NvIndex], 1)
+        .nv()
+        .decrypt(),
+    Command::new(TPM_CC_NV_WRITE, nv::write)
+        .handles(&[H::NvAuth, H::NvIndex], 1)
+        .nv()
+        .decrypt(),
+    Command::new(TPM_CC_NV_WRITE_LOCK, nv::write_lock)
+        .handles(&[H::NvAuth, H::NvIndex], 1)
+        .nv(),
     Command::new(
         TPM_CC_DICTIONARY_ATTACK_LOCK_RESET,
         hierarchy::dictionary_attack_lock_reset,
@@ -239,6 +295,11 @@ pub const COMMANDS: &[Command] = &[
     )
     .handles(&[H::Lockout], 1)
     .nv(),
+    Command::new(TPM_CC_NV_CHANGE_AUTH, nv::change_auth)
+        .handles(&[H::NvIndex], 1)
+        .admin()
+        .nv()
+        .decrypt(),
     Command::new(TPM_CC_PCR_EVENT, pcr_event)
         .handles(&[H::Pcr(true)], 1)
         .nv()
@@ -255,6 +316,12 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_STARTUP, startup).nv().no_sessions(),
     Command::new(TPM_CC_SHUTDOWN, shutdown).nv(),
     Command::new(TPM_CC_STIR_RANDOM, stir_random).nv().decrypt(),
+    Command::new(TPM_CC_NV_READ, nv::read)
+        .handles(&[H::NvAuth, H::NvIndex], 1)
+        .encrypt(),
+    Command::new(TPM_CC_NV_READ_LOCK, nv::read_lock)
+        .handles(&[H::NvAuth, H::NvIndex], 1)
+        .nv(),
     Command::new(TPM_CC_OBJECT_CHANGE_AUTH, key::object_change_auth)
         .handles(&[H::Object(false), H::Object(false)], 1)
         .admin()
@@ -308,6 +375,9 @@ pub const COMMANDS: &[Command] = &[
         .response_handle()
         .decrypt()
         .encrypt(),
+    Command::new(TPM_CC_NV_READ_PUBLIC, nv::read_public)
+        .handles(&[H::NvIndex], 0)
+        .encrypt(),
     Command::new(TPM_CC_READ_PUBLIC, key::read_public)
         .handles(&[H::Object(false)], 0)
         .encrypt(),
@@ -346,6 +416,19 @@ pub const COMMANDS: &[Command] = &[
         .decrypt(),
     Command::new(TPM_CC_TEST_PARMS, test_parms),
 ];
+
+/// IsWriteOperation: the command writes an NV index, so an index authorizes it with its
+/// AUTHWRITE or POLICYWRITE (else AUTHREAD or POLICYREAD).
+pub fn is_write_operation(code: u32) -> bool {
+    matches!(
+        code,
+        TPM_CC_NV_WRITE
+            | TPM_CC_NV_INCREMENT
+            | TPM_CC_NV_SET_BITS
+            | TPM_CC_NV_EXTEND
+            | TPM_CC_NV_WRITE_LOCK
+    )
+}
 
 pub fn find(code: u32) -> Option<&'static Command> {
     COMMANDS.iter().find(|c| c.code == code)
@@ -415,6 +498,7 @@ fn startup(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> 
         tpm.permanent.clock_safe = false;
     }
     tpm.startup_reset_data(kind, saved.map(|s| s.reset))?;
+    tpm.nv_startup(kind, orderly);
     tpm.volatile.objects.iter_mut().for_each(|o| *o = None);
     tpm.volatile.exclusive_audit = None;
     tpm.volatile.orderly_startup = orderly;
@@ -433,6 +517,7 @@ fn shutdown(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()>
         return Err(Rc::TYPE.param(1));
     }
     tpm.volatile.da_used = false;
+    tpm.nv_store_orderly();
     tpm.permanent.shutdown_time = tpm.volatile.time;
     tpm.permanent.shutdown = if state {
         Shutdown::State(Box::new(Saved {

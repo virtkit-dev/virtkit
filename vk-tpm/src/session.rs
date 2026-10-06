@@ -13,11 +13,11 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::alg::{Hash, MAX_DIGEST, TPM_ALG_NULL};
-use crate::commands::{Command, end};
+use crate::commands::{Command, Role, end, is_write_operation};
 use crate::crypt;
 use crate::entity::{
-    TPM_HT_POLICY_SESSION, TPM_HT_TRANSIENT, TPM_RH_LOCKOUT, TPM_RH_NULL, TPM_RS_PW, handle_type,
-    is_session, strip_zeros,
+    TPM_HT_NV_INDEX, TPM_HT_POLICY_SESSION, TPM_HT_TRANSIENT, TPM_RH_LOCKOUT, TPM_RH_NULL,
+    TPM_RS_PW, handle_type, is_session, strip_zeros,
 };
 use crate::marshal::{Reader, Writer};
 use crate::rc::{Rc, Result};
@@ -231,8 +231,10 @@ pub struct Use {
 /// A command's authorization area, and what its HMACs are computed over.
 pub struct Area {
     code: u32,
-    /// The first handle takes the ADMIN role (else USER).
-    admin: bool,
+    /// The role the first handle takes (the others take USER).
+    role: Role,
+    /// The command writes an NV index (IsWriteOperation).
+    write: bool,
     /// The Names of the command's handles.
     names: Vec<Vec<u8>>,
     /// The parameters as the command carried them (encrypted).
@@ -359,7 +361,8 @@ impl Tpm {
     pub fn read_area(&self, cmd: &Command, mut area: Reader, handles: &[u32]) -> Result<Area> {
         let mut a = Area {
             code: cmd.code,
-            admin: cmd.admin,
+            role: cmd.role,
+            write: is_write_operation(cmd.code),
             names: handles.iter().map(|&h| self.entity_name(h)).collect(),
             params: Vec::new(),
             uses: Vec::new(),
@@ -546,17 +549,21 @@ impl Tpm {
         if include_auth && !self.is_da_exempt(entity) {
             self.check_locked_out(entity == TPM_RH_LOCKOUT)?;
         }
-        // Only the first handle of a command takes the ADMIN role.
-        let admin = a.admin && i == 0;
-        if !matches!(kind, Some(Kind::Policy | Kind::Trial)) {
-            if self.policy_required(entity, admin) {
+        // Only the first handle may take a role other than USER.
+        let role = if i == 0 { a.role } else { Role::User };
+        if matches!(kind, Some(Kind::Policy | Kind::Trial)) {
+            if !self.auth_policy_available(entity, role, a.write) {
+                return Err(Rc::AUTH_UNAVAILABLE);
+            }
+        } else {
+            if self.policy_required(entity, role) {
                 return Err(Rc::AUTH_TYPE);
             }
-            if !self.auth_value_available(entity, admin) {
+            if !self.auth_value_available(entity, role, a.write) {
                 return Err(Rc::AUTH_UNAVAILABLE);
             }
         }
-        match kind {
+        let result = match kind {
             None => {
                 let u = a.uses.get(i).ok_or(Rc::FAILURE)?;
                 if password_matches(&u.auth, &self.entity_auth(entity)) {
@@ -569,19 +576,25 @@ impl Tpm {
             Some(_) => {
                 // CheckPolicyAuthSession: the session reached the entity's authPolicy.
                 let session = self.use_session(a.uses.get(i).ok_or(Rc::FAILURE)?)?;
-                let policy = self.entity_policy(entity).ok_or(Rc::AUTH_UNAVAILABLE)?;
+                let policy = self.entity_policy(entity);
                 let digest_matches: bool = session.policy_digest.ct_eq(&policy.digest).into();
                 if !digest_matches || policy.hash != Some(session.hash) {
                     return Err(Rc::POLICY_FAIL);
                 }
                 // The ADMIN role needs a policy bound to the command (TPM2_PolicyCommandCode,
                 // not implemented yet).
-                if admin {
+                if role != Role::User {
                     return Err(Rc::POLICY_FAIL);
                 }
                 self.check_hmac(a, i)
             }
+        };
+        // A PIN index counts its authorizations: a pass index the successes, a fail index the
+        // failures since the last success.
+        if include_auth && handle_type(entity) == TPM_HT_NV_INDEX {
+            self.nv_pin_authorized(entity, result.is_ok())?;
         }
+        result
     }
 
     /// CheckSessionHMAC: the HMAC session `i` carries is the one the TPM computes.
@@ -952,6 +965,10 @@ pub fn start_auth_session(
     };
     let bind = handles.get(1).copied().ok_or(Rc::FAILURE)?;
     if handle_type(bind) == TPM_HT_TRANSIENT && tpm.key(bind).is_some_and(|k| k.public_only()) {
+        return Err(Rc::HANDLE.handle(2));
+    }
+    // A PIN index's authValue counts its uses: no session may hold it.
+    if handle_type(bind) == TPM_HT_NV_INDEX && tpm.nv_is_pin(bind) {
         return Err(Rc::HANDLE.handle(2));
     }
     if matches!(symmetric, Symmetric::Aes(_)) && mode != TPM_ALG_CFB {

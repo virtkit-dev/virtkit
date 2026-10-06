@@ -15,6 +15,7 @@ use crate::alg::Hash;
 use crate::hierarchy::{ClearState, DaTimers, DictionaryAttack, Hierarchies};
 use crate::key::{Key, MAX_PERSISTENT};
 use crate::marshal::{Reader, Writer};
+use crate::nv::{self, NvIndex, OrderlyRam};
 use crate::object::{MAX_OBJECTS, Object};
 use crate::pcr::{self, Bank, Banks, Pcrs, Selection};
 use crate::rc::Rc;
@@ -27,10 +28,10 @@ const VOLATILE_MAGIC: &[u8; 8] = b"VKTPM-V\0";
 const VERSION: u16 = 1;
 pub const SEED_SIZE: usize = 64;
 /// More than the serialized states can hold (the permanent one a few KiB with saved PCRs, some
-/// tens with every persistent object an RSA-3072 key, the volatile one some tens with every
-/// session and object slot taken), so writing one never reallocates and leaves a stray copy of
-/// its secrets. Each is wiped whole when dropped.
-const PERMANENT_CAPACITY: usize = 64 * 1024;
+/// tens with every persistent object an RSA-3072 key, and up to 64 KiB more of NV indices; the
+/// volatile one some tens with every session and object slot taken), so writing one never
+/// reallocates and leaves a stray copy of its secrets. Each is wiped whole when dropped.
+const PERMANENT_CAPACITY: usize = 192 * 1024;
 const VOLATILE_CAPACITY: usize = 64 * 1024;
 
 /// The state could not be read: not ours, a version this build does not know, or corrupt.
@@ -187,6 +188,10 @@ pub struct Permanent {
     /// have been reported (TPMS_CLOCK_INFO.safe).
     pub clock: u64,
     pub clock_safe: bool,
+    /// The NV indices, by handle.
+    pub nv: Vec<NvIndex>,
+    /// The highest value a deleted counter index had: a new one starts above it.
+    pub nv_max_counter: u64,
 }
 
 impl Permanent {
@@ -220,6 +225,8 @@ impl Permanent {
             total_reset_count: 0,
             clock: 0,
             clock_safe: true,
+            nv: Vec::new(),
+            nv_max_counter: 0,
         })
     }
 
@@ -259,6 +266,7 @@ impl Permanent {
             .u64(self.total_reset_count)
             .u64(self.clock)
             .u8(self.clock_safe.into());
+        nv::write_nv(&mut w, &self.nv, self.nv_max_counter);
         w.into_bytes()
     }
 
@@ -297,6 +305,7 @@ impl Permanent {
         let total_reset_count = r.u64()?;
         let clock = r.u64()?;
         let clock_safe = read_bool(&mut r)?;
+        let (nv, nv_max_counter) = nv::read_nv(&mut r)?;
         expect_end(&r)?;
         Ok(Permanent {
             eps,
@@ -312,6 +321,8 @@ impl Permanent {
             total_reset_count,
             clock,
             clock_safe,
+            nv,
+            nv_max_counter,
         })
     }
 }
@@ -352,6 +363,8 @@ pub struct Volatile {
     pub restart_count: u32,
     pub object_context_id: u64,
     pub context_counter: u64,
+    /// The orderly NV indices' attributes and data (their RAM copies).
+    pub nv_orderly: Vec<OrderlyRam>,
 }
 
 impl Volatile {
@@ -380,6 +393,7 @@ impl Volatile {
             restart_count: 0,
             object_context_id: 0,
             context_counter: 0,
+            nv_orderly: nv::orderly_images(&permanent.nv),
         }
     }
 
@@ -443,6 +457,7 @@ impl Volatile {
             .u32(self.restart_count)
             .u64(self.object_context_id)
             .u64(self.context_counter);
+        OrderlyRam::write_list(&mut w, &self.nv_orderly);
         w.into_bytes()
     }
 
@@ -490,6 +505,7 @@ impl Volatile {
         let null_seed = read_seed(&mut r)?;
         let (clear_count, restart_count) = (r.u32()?, r.u32()?);
         let (object_context_id, context_counter) = (r.u64()?, r.u64()?);
+        let nv_orderly = OrderlyRam::read_list(&mut r)?;
         expect_end(&r)?;
         Ok(Volatile {
             started,
@@ -512,6 +528,7 @@ impl Volatile {
             restart_count,
             object_context_id,
             context_counter,
+            nv_orderly,
         })
     }
 }
@@ -692,6 +709,20 @@ mod tests {
         let key = crate::key::tests::rsa_storage_key(3072);
         for handle in (0x8100_0000..).take(MAX_PERSISTENT) {
             p.persistent.push((handle, key.clone()));
+        }
+        // And NV indices filling their memory, each with the longest authValue and policy.
+        for index in (0x0100_0000..).take(29) {
+            p.nv.push(nv::NvIndex {
+                public: nv::NvPublic {
+                    index,
+                    name_alg: Hash::Sha512,
+                    attributes: nv::attr::OWNERREAD | nv::attr::OWNERWRITE,
+                    auth_policy: vec![1; 64],
+                    data_size: 2048,
+                },
+                auth: Zeroizing::new(vec![2; 64]),
+                data: Zeroizing::new(vec![3; 2048]),
+            });
         }
         let bytes = p.serialize();
         assert!(

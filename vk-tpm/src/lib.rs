@@ -29,6 +29,7 @@ mod entity;
 mod hierarchy;
 mod key;
 mod marshal;
+mod nv;
 mod object;
 mod pcr;
 mod protection;
@@ -95,8 +96,10 @@ impl Tpm {
     /// [`Tpm::volatile_state`] returned them. Its time goes on from the snapshot's.
     pub fn restore(permanent: &[u8], volatile: &[u8]) -> Result<Tpm, StateError> {
         let volatile = Volatile::deserialize(volatile)?;
+        let permanent = Permanent::deserialize(permanent)?;
+        nv::check_orderly(&permanent.nv, &volatile.nv_orderly)?;
         Ok(Tpm {
-            permanent: Permanent::deserialize(permanent)?,
+            permanent,
             clock: Clock::starting_at(volatile.time),
             volatile,
             permanent_changed: false,

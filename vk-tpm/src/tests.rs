@@ -117,7 +117,48 @@ fn valid_handle(kind: HandleKind) -> u32 {
         // The sequence the test starts first.
         HandleKind::Object(_) => 0x8000_0000,
         HandleKind::Entity(_) => TPM_RH_NULL,
+        // The index the test defines first.
+        HandleKind::NvAuth | HandleKind::NvIndex => NV_INDEX,
     }
+}
+
+/// The NV index tests define.
+const NV_INDEX: u32 = 0x0100_0001;
+
+/// TPM2_NV_DefineSpace by the owner (or the platform): an index of `size` bytes with
+/// SHA-256 as its nameAlg, an empty authValue and no policy.
+fn nv_define(tpm: &mut Tpm, index: u32, attributes: u32, size: u16) -> u32 {
+    nv_define_with(tpm, index, attributes, size, b"", &[])
+}
+
+fn nv_define_with(
+    tpm: &mut Tpm,
+    index: u32,
+    attributes: u32,
+    size: u16,
+    auth: &[u8],
+    policy: &[u8],
+) -> u32 {
+    let mut public = Writer::new();
+    public
+        .u32(index)
+        .u16(alg::TPM_ALG_SHA256)
+        .u32(attributes)
+        .tpm2b(policy)
+        .u16(size);
+    let mut p = Writer::new();
+    p.tpm2b(auth).tpm2b(&public.into_bytes());
+    let owner = if attributes & nv::attr::PLATFORMCREATE != 0 {
+        TPM_RH_PLATFORM
+    } else {
+        TPM_RH_OWNER
+    };
+    rc(&tpm.process(&command(
+        TPM_CC_NV_DEFINE_SPACE,
+        &[owner],
+        Some(b""),
+        &p.into_bytes(),
+    )))
 }
 
 #[test]
@@ -136,6 +177,12 @@ fn every_command_refuses_trailing_parameter_bytes() {
         let context = [&[0; 8][..], &[0x80, 0, 0, 0, 0x40, 0, 0, 7, 0, 0]].concat();
         // digest, an HMAC signature.
         let verify_signature = [&[0, 0, 0, 5, 0, 0x0b][..], &[0; 32]].concat();
+        // No authValue; an ordinary index of 8 bytes.
+        let nv_public = [
+            &[0, 0, 0, 14][..],
+            &[1, 0, 0, 2, 0, 0x0b, 0, 6, 0, 6, 0, 0, 0, 8],
+        ]
+        .concat();
         let params: &[u8] = match cmd.code {
             TPM_CC_EVICT_CONTROL => &[0x81, 0, 0, 1],
             TPM_CC_CREATE_PRIMARY | TPM_CC_CREATE => &create,
@@ -171,6 +218,17 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_SEQUENCE_UPDATE | TPM_CC_EVENT_SEQUENCE_COMPLETE => &[0, 0],
             TPM_CC_SEQUENCE_COMPLETE => &[0, 0, 0x40, 0, 0, 7],
             TPM_CC_FLUSH_CONTEXT => &[0x80, 0, 0, 0],
+            TPM_CC_NV_DEFINE_SPACE => &nv_public,
+            TPM_CC_NV_SET_BITS => &[0; 8],
+            TPM_CC_NV_EXTEND | TPM_CC_NV_CHANGE_AUTH => &[0, 0],
+            TPM_CC_NV_WRITE | TPM_CC_NV_READ => &[0, 0, 0, 0],
+            TPM_CC_NV_UNDEFINE_SPACE
+            | TPM_CC_NV_UNDEFINE_SPACE_SPECIAL
+            | TPM_CC_NV_GLOBAL_WRITE_LOCK
+            | TPM_CC_NV_INCREMENT
+            | TPM_CC_NV_WRITE_LOCK
+            | TPM_CC_NV_READ_LOCK
+            | TPM_CC_NV_READ_PUBLIC => &[],
             // A 16-byte nonce, no salt, HMAC, TPM_ALG_NULL, SHA-256.
             TPM_CC_START_AUTH_SESSION => &start_auth_session,
             _ => &[0, 0, 0, 0],
@@ -179,11 +237,23 @@ fn every_command_refuses_trailing_parameter_bytes() {
         if cmd.code != TPM_CC_STARTUP {
             let start = command(TPM_CC_HASH_SEQUENCE_START, &[], None, &[0, 0, 0, 0x10]);
             assert_eq!(rc(&tpm.process(&start)), 0);
+            let attributes = nv::attr::OWNERWRITE
+                | nv::attr::OWNERREAD
+                | nv::attr::AUTHWRITE
+                | nv::attr::AUTHREAD;
+            assert_eq!(nv_define(&mut tpm, NV_INDEX, attributes, 8), 0);
         }
         let handles: Vec<u32> = cmd.handles.iter().map(|&k| valid_handle(k)).collect();
         let passwords = vec![&b""[..]; cmd.auth];
         let response = tpm.process(&command_with(cmd.code, &handles, &passwords, &params));
-        assert_eq!(rc(&response), Rc::SIZE.0, "command {:#x}", cmd.code);
+        // The ADMIN role of an NV index takes a policy session: the authorization fails first.
+        let expected =
+            if cmd.role == Role::Admin && cmd.handles.first() == Some(&HandleKind::NvIndex) {
+                Rc::AUTH_TYPE.session(1)
+            } else {
+                Rc::SIZE
+            };
+        assert_eq!(rc(&response), expected.0, "command {:#x}", cmd.code);
     }
 }
 
@@ -399,11 +469,16 @@ fn get_capability_lists_exactly_the_implemented_commands() {
         .chunks(4)
         .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
         .collect();
-    assert_eq!(listed[0], 0x0440_0120, "EvictControl: nv, 2 handles");
     assert_eq!(
-        listed[1], 0x02c0_0121,
+        listed[0], 0x0440_011f,
+        "NV_UndefineSpaceSpecial: nv, 2 handles"
+    );
+    assert_eq!(listed[1], 0x0440_0120, "EvictControl: nv, 2 handles");
+    assert_eq!(
+        listed[2], 0x02c0_0121,
         "HierarchyControl: nv, extensive, 1 handle"
     );
+    assert!(listed.windows(2).all(|w| (w[0] & 0xffff) < (w[1] & 0xffff)));
     assert_eq!(
         listed[listed.len() - 2],
         0x1000_0186,
@@ -635,9 +710,9 @@ fn set_primary_policy_checks_the_digest_size() {
         0x1d5
     );
     assert_eq!(rc(&tpm.process(&policy(&[1; 32], alg::TPM_ALG_SHA256))), 0);
-    assert!(tpm.entity_policy(TPM_RH_OWNER).is_some());
+    assert!(tpm.entity_policy(TPM_RH_OWNER).hash.is_some());
     assert_eq!(rc(&tpm.process(&policy(&[], alg::TPM_ALG_NULL))), 0);
-    assert!(tpm.entity_policy(TPM_RH_OWNER).is_none());
+    assert!(tpm.entity_policy(TPM_RH_OWNER).hash.is_none());
 }
 
 #[test]
@@ -1232,6 +1307,19 @@ fn session_command(
     params: &[u8],
     cover_nonces: bool,
 ) -> Vec<u8> {
+    let names: Vec<Vec<u8>> = handles.iter().map(|&h| name(h)).collect();
+    session_command_named(code, handles, &names, turns, params, cover_nonces)
+}
+
+/// [`session_command`] with the handles' Names given (an NV index's is not its handle).
+fn session_command_named(
+    code: u32,
+    handles: &[u32],
+    names: &[Vec<u8>],
+    turns: &mut [Turn],
+    params: &[u8],
+    cover_nonces: bool,
+) -> Vec<u8> {
     let mut params = params.to_vec();
     for t in turns.iter_mut() {
         t.client.nonce_caller.iter_mut().for_each(|b| *b += 1);
@@ -1246,8 +1334,7 @@ fn session_command(
                 .apply(&t.crypt_key(), newer, older, data, true);
         }
     }
-    let names: Vec<u8> = handles.iter().flat_map(|&h| name(h)).collect();
-    let cp_hash = sha256(&[&code.to_be_bytes(), &names, &params]);
+    let cp_hash = sha256(&[&code.to_be_bytes(), &names.concat(), &params]);
     let mut extra = Vec::new();
     if cover_nonces && turns[0].auth.is_some() {
         for flag in [DECRYPT, ENCRYPT] {
@@ -1300,7 +1387,22 @@ fn call(
     turns: &mut [Turn],
     params: &[u8],
 ) -> std::result::Result<Reply, u32> {
-    let r = tpm.process(&session_command(code, handles, turns, params, true));
+    let names: Vec<Vec<u8>> = handles.iter().map(|&h| name(h)).collect();
+    call_named(tpm, code, handles, &names, turns, params)
+}
+
+/// [`call`] with the handles' Names given.
+fn call_named(
+    tpm: &mut Tpm,
+    code: u32,
+    handles: &[u32],
+    names: &[Vec<u8>],
+    turns: &mut [Turn],
+    params: &[u8],
+) -> std::result::Result<Reply, u32> {
+    let r = tpm.process(&session_command_named(
+        code, handles, names, turns, params, true,
+    ));
     if rc(&r) != 0 {
         return Err(rc(&r));
     }
@@ -2288,4 +2390,487 @@ fn a_salt_needs_a_decryption_key() {
         &p.into_bytes(),
     ));
     assert_eq!(rc(&r), Rc::ATTRIBUTES.handle(1).0);
+}
+
+/// TPM2_NV_Increment by the owner, then the counter's value.
+fn nv_increment(tpm: &mut Tpm, index: u32) -> u64 {
+    let increment = command(TPM_CC_NV_INCREMENT, &[TPM_RH_OWNER, index], Some(b""), &[]);
+    assert_eq!(rc(&tpm.process(&increment)), 0);
+    let read = command(
+        TPM_CC_NV_READ,
+        &[TPM_RH_OWNER, index],
+        Some(b""),
+        &[0, 8, 0, 0],
+    );
+    let r = tpm.process(&read);
+    assert_eq!(rc(&r), 0);
+    // The parameter size, then the TPM2B's.
+    u64::from_be_bytes(r[16..24].try_into().unwrap())
+}
+
+#[test]
+fn nv_writes_are_stored_at_once_but_orderly_ones_at_shutdown() {
+    use nv::attr::*;
+    let mut tpm = started();
+    let rw = OWNERWRITE | OWNERREAD;
+    let counter = 1 << TPM_NT_SHIFT;
+    assert_eq!(nv_define(&mut tpm, NV_INDEX, rw | counter, 8), 0);
+    assert_eq!(
+        nv_define(&mut tpm, 0x0100_0002, rw | counter | ORDERLY, 8),
+        0
+    );
+    assert!(tpm.take_permanent_changed(), "defining is stored");
+    assert_eq!(nv_increment(&mut tpm, NV_INDEX), 1);
+    assert!(tpm.take_permanent_changed());
+    // An orderly counter's first value is stored; the next ones are not, until the next
+    // TPM2_Shutdown or boundary.
+    assert_eq!(nv_increment(&mut tpm, 0x0100_0002), 1);
+    assert!(tpm.take_permanent_changed());
+    assert_eq!(nv_increment(&mut tpm, 0x0100_0002), 2);
+    assert!(!tpm.take_permanent_changed());
+    // A snapshot has the RAM copy.
+    let mut restored = Tpm::restore(&tpm.permanent_state(), &tpm.volatile_state()).unwrap();
+    assert_eq!(nv_increment(&mut restored, 0x0100_0002), 3);
+    // Power lost: the orderly counter skips past what it may have reported.
+    let mut lost = power_cycle(&restored, 0);
+    assert_eq!(nv_increment(&mut lost, 0x0100_0002), 0x100);
+    assert_eq!(nv_increment(&mut lost, NV_INDEX), 2);
+    // An orderly shutdown stores it.
+    assert_eq!(nv_increment(&mut lost, 0x0100_0002), 0x101);
+    assert_eq!(
+        rc(&lost.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 0]))),
+        0
+    );
+    let mut next = power_cycle(&lost, 0);
+    assert_eq!(nv_increment(&mut next, 0x0100_0002), 0x102);
+}
+
+#[test]
+fn nv_memory_is_bounded() {
+    use nv::attr::*;
+    let mut tpm = started();
+    let rw = OWNERWRITE | OWNERREAD;
+    let mut defined = 0;
+    let last = loop {
+        let r = nv_define(&mut tpm, NV_INDEX + defined, rw, 2048);
+        if r != 0 {
+            break r;
+        }
+        defined += 1;
+    };
+    assert_eq!(last, Rc::NV_SPACE.0);
+    assert_eq!(defined, 29, "64 KiB of 2 KiB indices");
+    // The permanent state holds them all, and reads back.
+    let state = tpm.permanent_state();
+    let back = Tpm::power_on(&state).unwrap();
+    assert_eq!(*back.permanent_state(), *state);
+    assert_eq!(back.nv_counts(), (29, 0));
+    // The orderly RAM: 512 bytes, 12 for each index's header.
+    let mut tpm = started();
+    assert_eq!(nv_define(&mut tpm, NV_INDEX, rw | ORDERLY, 500), 0);
+    assert_eq!(
+        nv_define(&mut tpm, NV_INDEX + 1, rw | ORDERLY, 1),
+        Rc::NV_SPACE.0
+    );
+    assert_eq!(tpm.nv_counters_available(), 0);
+}
+
+/// An NV index's Name, as a client computes it: SHA-256 of its TPMS_NV_PUBLIC (SHA-256, no
+/// policy), with its attributes as they are now.
+fn nv_name(index: u32, attributes: u32, size: u16) -> Vec<u8> {
+    let mut public = Writer::new();
+    public
+        .u32(index)
+        .u16(alg::TPM_ALG_SHA256)
+        .u32(attributes)
+        .tpm2b(&[])
+        .u16(size);
+    let digest = sha256(&[&public.into_bytes()]);
+    [&alg::TPM_ALG_SHA256.to_be_bytes()[..], &digest].concat()
+}
+
+/// TPM2_NV_Write of `data` at `offset`, authorized by `auth` (owner or platform).
+fn nv_write(tpm: &mut Tpm, auth: u32, index: u32, data: &[u8], offset: u16) -> u32 {
+    let mut p = Writer::new();
+    p.tpm2b(data).u16(offset);
+    let write = command(TPM_CC_NV_WRITE, &[auth, index], Some(b""), &p.into_bytes());
+    rc(&tpm.process(&write))
+}
+
+/// TPM2_NV_Read of `size` bytes at `offset`, authorized by `auth` (owner or platform).
+fn nv_read(
+    tpm: &mut Tpm,
+    auth: u32,
+    index: u32,
+    size: u16,
+    offset: u16,
+) -> std::result::Result<Vec<u8>, u32> {
+    let mut p = Writer::new();
+    p.u16(size).u16(offset);
+    let r = tpm.process(&command(
+        TPM_CC_NV_READ,
+        &[auth, index],
+        Some(b""),
+        &p.into_bytes(),
+    ));
+    match rc(&r) {
+        0 => Ok(split2b(response_params(&r, false)).0.to_vec()),
+        code => Err(code),
+    }
+}
+
+/// A command on an index that takes no parameters (a lock, UndefineSpace), authorized by
+/// `auth` (owner or platform).
+fn nv_command(tpm: &mut Tpm, code: u32, auth: u32, index: u32) -> u32 {
+    rc(&tpm.process(&command(code, &[auth, index], Some(b""), &[])))
+}
+
+fn nv_read_public(tpm: &mut Tpm, index: u32) -> u32 {
+    rc(&tpm.process(&command(TPM_CC_NV_READ_PUBLIC, &[index], None, &[])))
+}
+
+fn shutdown(tpm: &mut Tpm, state: u8) {
+    let r = tpm.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, state]));
+    assert_eq!(rc(&r), 0);
+}
+
+#[test]
+fn an_orderly_index_stays_locked_across_a_power_loss() {
+    use nv::attr::*;
+    // Orderly counters locked for good once written: by NV_WriteLock, and by NV_GlobalWriteLock.
+    let counter = OWNERWRITE | OWNERREAD | ORDERLY | WRITEDEFINE | 1 << TPM_NT_SHIFT;
+    let (locked, globally) = (NV_INDEX, NV_INDEX + 1);
+    let mut tpm = started();
+    assert_eq!(nv_define(&mut tpm, locked, counter, 8), 0);
+    assert_eq!(nv_define(&mut tpm, globally, counter | GLOBALLOCK, 8), 0);
+    nv_increment(&mut tpm, locked);
+    nv_increment(&mut tpm, globally);
+    tpm.take_permanent_changed();
+    let write_lock = TPM_CC_NV_WRITE_LOCK;
+    assert_eq!(nv_command(&mut tpm, write_lock, TPM_RH_OWNER, locked), 0);
+    let global = command(TPM_CC_NV_GLOBAL_WRITE_LOCK, &[TPM_RH_OWNER], Some(b""), &[]);
+    assert_eq!(rc(&tpm.process(&global)), 0);
+    assert!(tpm.take_permanent_changed(), "the locks are stored");
+    // Power lost without TPM2_Shutdown.
+    let mut next = power_cycle(&tpm, 0);
+    for index in [locked, globally] {
+        let increment = command(TPM_CC_NV_INCREMENT, &[TPM_RH_OWNER, index], Some(b""), &[]);
+        assert_eq!(rc(&next.process(&increment)), Rc::NV_LOCKED.0);
+    }
+}
+
+#[test]
+fn nv_locks_last_as_the_index_attributes_say() {
+    use nv::attr::*;
+    let rw = OWNERWRITE | OWNERREAD;
+    let (stclear, define) = (NV_INDEX, NV_INDEX + 1);
+    let (read_lock, write_lock) = (TPM_CC_NV_READ_LOCK, TPM_CC_NV_WRITE_LOCK);
+    let mut tpm = started();
+    let attributes = rw | WRITE_STCLEAR | READ_STCLEAR;
+    assert_eq!(nv_define(&mut tpm, stclear, attributes, 8), 0);
+    assert_eq!(nv_define(&mut tpm, define, rw | WRITEDEFINE, 8), 0);
+    assert_eq!(
+        nv_command(&mut tpm, read_lock, TPM_RH_OWNER, define),
+        Rc::ATTRIBUTES.handle(2).0,
+        "no TPMA_NV_READ_STCLEAR"
+    );
+    for index in [stclear, define] {
+        assert_eq!(nv_write(&mut tpm, TPM_RH_OWNER, index, &[1; 8], 0), 0);
+        assert_eq!(nv_command(&mut tpm, write_lock, TPM_RH_OWNER, index), 0);
+        let rc = nv_write(&mut tpm, TPM_RH_OWNER, index, &[2; 8], 0);
+        assert_eq!(rc, Rc::NV_LOCKED.0);
+    }
+    assert_eq!(nv_command(&mut tpm, read_lock, TPM_RH_OWNER, stclear), 0);
+    let read = nv_read(&mut tpm, TPM_RH_OWNER, stclear, 8, 0);
+    assert_eq!(read, Err(Rc::NV_LOCKED.0));
+
+    // A TPM Resume keeps every lock.
+    shutdown(&mut tpm, 1);
+    let mut resumed = power_cycle(&tpm, 1);
+    let read = nv_read(&mut resumed, TPM_RH_OWNER, stclear, 8, 0);
+    assert_eq!(read, Err(Rc::NV_LOCKED.0));
+    for index in [stclear, define] {
+        let rc = nv_write(&mut resumed, TPM_RH_OWNER, index, &[2; 8], 0);
+        assert_eq!(rc, Rc::NV_LOCKED.0);
+    }
+    // A TPM Restart (after Shutdown(STATE)) or Reset (no Shutdown) ends the STCLEAR ones only.
+    for mut next in [power_cycle(&tpm, 0), power_cycle(&resumed, 0)] {
+        let read = nv_read(&mut next, TPM_RH_OWNER, stclear, 8, 0);
+        assert_eq!(read, Ok(vec![1; 8]));
+        assert_eq!(nv_write(&mut next, TPM_RH_OWNER, stclear, &[2; 8], 0), 0);
+        let rc = nv_write(&mut next, TPM_RH_OWNER, define, &[2; 8], 0);
+        assert_eq!(rc, Rc::NV_LOCKED.0);
+    }
+}
+
+#[test]
+fn nv_reads_and_writes_stay_within_the_index() {
+    use nv::attr::*;
+    let rw = OWNERWRITE | OWNERREAD;
+    let owner = TPM_RH_OWNER;
+    let mut tpm = started();
+    assert_eq!(nv_define(&mut tpm, NV_INDEX, rw, 16), 0);
+    let read = nv_read(&mut tpm, owner, NV_INDEX, 1, 0);
+    assert_eq!(read, Err(Rc::NV_UNINITIALIZED.0));
+    let write = nv_write(&mut tpm, owner, NV_INDEX, &[], 17);
+    assert_eq!(write, Rc::VALUE.param(2).0);
+    let write = nv_write(&mut tpm, owner, NV_INDEX, &[1; 8], 9);
+    assert_eq!(write, Rc::NV_RANGE.0);
+    assert_eq!(nv_write(&mut tpm, owner, NV_INDEX, &[1; 8], 8), 0);
+    // The first write erased the rest of the index.
+    let data = [[0xff; 8], [1; 8]].concat();
+    assert_eq!(nv_read(&mut tpm, owner, NV_INDEX, 16, 0), Ok(data));
+    let read = nv_read(&mut tpm, owner, NV_INDEX, 1025, 0);
+    assert_eq!(read, Err(Rc::VALUE.param(1).0));
+    let read = nv_read(&mut tpm, owner, NV_INDEX, 0, 17);
+    assert_eq!(read, Err(Rc::VALUE.param(2).0));
+    let read = nv_read(&mut tpm, owner, NV_INDEX, 8, 9);
+    assert_eq!(read, Err(Rc::NV_RANGE.0));
+
+    // TPMA_NV_WRITEALL: the whole index at once.
+    let all = NV_INDEX + 1;
+    assert_eq!(nv_define(&mut tpm, all, rw | WRITEALL, 8), 0);
+    assert_eq!(nv_write(&mut tpm, owner, all, &[1; 4], 0), Rc::NV_RANGE.0);
+    assert_eq!(nv_write(&mut tpm, owner, all, &[1; 8], 0), 0);
+    // A counter is written only by TPM2_NV_Increment.
+    let counter = NV_INDEX + 2;
+    assert_eq!(nv_define(&mut tpm, counter, rw | 1 << TPM_NT_SHIFT, 8), 0);
+    assert_eq!(
+        nv_write(&mut tpm, owner, counter, &[1; 8], 0),
+        Rc::ATTRIBUTES.0
+    );
+}
+
+#[test]
+fn nv_access_takes_the_attribute_of_the_authorizing_entity() {
+    use nv::attr::*;
+    let attributes = OWNERWRITE | AUTHREAD;
+    let mut tpm = started();
+    assert_eq!(
+        nv_define_with(&mut tpm, NV_INDEX, attributes, 8, b"pw", &[]),
+        0
+    );
+    let write = nv_write(&mut tpm, TPM_RH_PLATFORM, NV_INDEX, &[1; 8], 0);
+    assert_eq!(write, Rc::NV_AUTHORIZATION.0, "no TPMA_NV_PPWRITE");
+    assert_eq!(nv_write(&mut tpm, TPM_RH_OWNER, NV_INDEX, &[1; 8], 0), 0);
+    let read = nv_read(&mut tpm, TPM_RH_OWNER, NV_INDEX, 8, 0);
+    assert_eq!(read, Err(Rc::NV_AUTHORIZATION.0), "no TPMA_NV_OWNERREAD");
+
+    // The index's own authValue, in an HMAC session's.
+    let name = nv_name(NV_INDEX, attributes | WRITTEN, 8);
+    let names = [name.clone(), name];
+    let mut s = Client::start(&mut tpm, HMAC, TPM_RH_NULL, b"", Cipher::None);
+    let mut as_index = |tpm: &mut Tpm, code: u32, auth: &[u8], params: &[u8]| {
+        let turn = Turn::authorizing(&mut s, CONTINUE, auth);
+        let handles = [NV_INDEX, NV_INDEX];
+        call_named(tpm, code, &handles, &names, &mut [turn], params).map(|r| r.params)
+    };
+    let read = as_index(&mut tpm, TPM_CC_NV_READ, b"pw", &[0, 8, 0, 0]);
+    assert_eq!(read, Ok([&[0, 8][..], &[1; 8]].concat()));
+    let read = as_index(&mut tpm, TPM_CC_NV_READ, b"no", &[0, 8, 0, 0]);
+    assert_eq!(read, Err(Rc::AUTH_FAIL.session(1).0));
+    let write = as_index(&mut tpm, TPM_CC_NV_WRITE, b"pw", &[0, 1, 2, 0, 0]);
+    assert_eq!(write, Err(Rc::AUTH_UNAVAILABLE.0), "no TPMA_NV_AUTHWRITE");
+}
+
+#[test]
+fn pin_indices_count_their_authorizations() {
+    use nv::attr::*;
+    let (fail, pass) = (NV_INDEX, NV_INDEX + 1);
+    let attributes = |kind: u32| OWNERWRITE | OWNERREAD | AUTHREAD | NO_DA | kind << TPM_NT_SHIFT;
+    let mut tpm = started();
+    for (index, kind) in [(fail, 8), (pass, 9)] {
+        let defined = nv_define_with(&mut tpm, index, attributes(kind), 8, b"pin", &[]);
+        assert_eq!(defined, 0);
+        // pinCount 0, pinLimit 2.
+        let write = nv_write(&mut tpm, TPM_RH_OWNER, index, &[0, 0, 0, 0, 0, 0, 0, 2], 0);
+        assert_eq!(write, 0);
+    }
+    // No session may hold a PIN index's authValue.
+    let mut p = Writer::new();
+    p.tpm2b(&[0; 16]).tpm2b(&[]).u8(HMAC).u16(alg::TPM_ALG_NULL);
+    p.u16(alg::TPM_ALG_SHA256);
+    let bound = command(
+        TPM_CC_START_AUTH_SESSION,
+        &[TPM_RH_NULL, fail],
+        None,
+        &p.into_bytes(),
+    );
+    assert_eq!(rc(&tpm.process(&bound)), Rc::HANDLE.handle(2).0);
+
+    // TPM2_NV_Read with the index's authorization: its pinCount, or the response code.
+    let mut s = Client::start(&mut tpm, HMAC, TPM_RH_NULL, b"", Cipher::None);
+    let mut read_count = |tpm: &mut Tpm, index: u32, kind: u32, auth: &[u8]| {
+        let name = nv_name(index, attributes(kind) | WRITTEN, 8);
+        let turn = Turn::authorizing(&mut s, CONTINUE, auth);
+        let params = [0, 4, 0, 0];
+        let r = call_named(
+            tpm,
+            TPM_CC_NV_READ,
+            &[index; 2],
+            &[name.clone(), name],
+            &mut [turn],
+            &params,
+        );
+        r.map(|r| u32::from_be_bytes(r.params[2..6].try_into().unwrap()))
+    };
+    // TPMA_NV_NO_DA: a bad authValue is TPM_RC_BAD_AUTH, no failure counted against the TPM.
+    let failed = Err(Rc::BAD_AUTH.session(1).0);
+    let unavailable = Err(Rc::AUTH_UNAVAILABLE.0);
+    let owner_count = |tpm: &mut Tpm, index: u32| nv_read(tpm, TPM_RH_OWNER, index, 4, 0);
+
+    // A PIN fail index counts the failures since the last success, up to its limit.
+    assert_eq!(read_count(&mut tpm, fail, 8, b"no"), failed);
+    assert_eq!(owner_count(&mut tpm, fail), Ok(vec![0, 0, 0, 1]));
+    assert_eq!(read_count(&mut tpm, fail, 8, b"pin"), Ok(0));
+    assert_eq!(read_count(&mut tpm, fail, 8, b"no"), failed);
+    assert_eq!(read_count(&mut tpm, fail, 8, b"no"), failed);
+    assert_eq!(read_count(&mut tpm, fail, 8, b"pin"), unavailable);
+    // A PIN pass index counts the successes, up to its limit.
+    assert_eq!(read_count(&mut tpm, pass, 9, b"no"), failed);
+    assert_eq!(read_count(&mut tpm, pass, 9, b"pin"), Ok(1));
+    assert_eq!(read_count(&mut tpm, pass, 9, b"pin"), Ok(2));
+    assert_eq!(read_count(&mut tpm, pass, 9, b"pin"), unavailable);
+    assert_eq!(property(&mut tpm, 0x20e), 0, "TPM_PT_LOCKOUT_COUNTER");
+}
+
+#[test]
+fn nv_undefine_space_keeps_what_the_caller_may_not_delete() {
+    use nv::attr::*;
+    let platform = PPWRITE | PPREAD | PLATFORMCREATE;
+    let (special, platforms) = (NV_INDEX, NV_INDEX + 1);
+    let undefine = TPM_CC_NV_UNDEFINE_SPACE;
+    let mut tpm = started();
+    let policy_delete = platform | POLICY_DELETE;
+    let defined = nv_define_with(&mut tpm, special, policy_delete, 8, b"", &[7; 32]);
+    assert_eq!(defined, 0);
+    assert_eq!(nv_define(&mut tpm, platforms, platform, 8), 0);
+    assert_eq!(
+        nv_command(&mut tpm, undefine, TPM_RH_PLATFORM, special),
+        Rc::ATTRIBUTES.handle(2).0,
+        "TPMA_NV_POLICY_DELETE: TPM2_NV_UndefineSpaceSpecial only"
+    );
+    assert_eq!(
+        nv_command(&mut tpm, undefine, TPM_RH_OWNER, platforms),
+        Rc::NV_AUTHORIZATION.0
+    );
+    assert_eq!(
+        nv_command(&mut tpm, undefine, TPM_RH_PLATFORM, platforms),
+        0
+    );
+    assert_eq!(nv_read_public(&mut tpm, platforms), Rc::HANDLE.handle(1).0);
+}
+
+#[test]
+fn a_counter_starts_above_every_counter_deleted() {
+    use nv::attr::*;
+    let counter = OWNERWRITE | OWNERREAD | 1 << TPM_NT_SHIFT;
+    let mut tpm = started();
+    assert_eq!(nv_define(&mut tpm, NV_INDEX, counter, 8), 0);
+    for _ in 0..3 {
+        nv_increment(&mut tpm, NV_INDEX);
+    }
+    let undefine = TPM_CC_NV_UNDEFINE_SPACE;
+    assert_eq!(nv_command(&mut tpm, undefine, TPM_RH_OWNER, NV_INDEX), 0);
+    assert_eq!(nv_define(&mut tpm, NV_INDEX + 1, counter, 8), 0);
+    assert_eq!(nv_increment(&mut tpm, NV_INDEX + 1), 4);
+}
+
+#[test]
+fn clear_deletes_the_owner_indices_only() {
+    use nv::attr::*;
+    let (owners, platforms) = (NV_INDEX, NV_INDEX + 1);
+    let mut tpm = started();
+    assert_eq!(nv_define(&mut tpm, owners, OWNERWRITE | OWNERREAD, 8), 0);
+    let platform = PPWRITE | PPREAD | PLATFORMCREATE;
+    assert_eq!(nv_define(&mut tpm, platforms, platform, 8), 0);
+    let clear = command(TPM_CC_CLEAR, &[TPM_RH_LOCKOUT], Some(b""), &[]);
+    assert_eq!(rc(&tpm.process(&clear)), 0);
+    assert_eq!(nv_read_public(&mut tpm, owners), Rc::HANDLE.handle(1).0);
+    assert_eq!(nv_read_public(&mut tpm, platforms), 0);
+}
+
+#[test]
+fn an_index_is_hidden_while_its_hierarchy_is_disabled() {
+    use nv::attr::*;
+    let (owners, platforms) = (NV_INDEX, NV_INDEX + 1);
+    let platform = PPWRITE | PPREAD | PLATFORMCREATE;
+    let mut tpm = started();
+    assert_eq!(nv_define(&mut tpm, owners, OWNERWRITE | OWNERREAD, 8), 0);
+    assert_eq!(nv_define(&mut tpm, platforms, platform, 8), 0);
+    let disable = |enable: u32| {
+        let mut p = Writer::new();
+        p.u32(enable).u8(0);
+        let control = TPM_CC_HIERARCHY_CONTROL;
+        command(control, &[TPM_RH_PLATFORM], Some(b""), &p.into_bytes())
+    };
+    assert_eq!(rc(&tpm.process(&disable(TPM_RH_OWNER))), 0);
+    assert_eq!(nv_read_public(&mut tpm, owners), Rc::HANDLE.handle(1).0);
+    assert_eq!(nv_read_public(&mut tpm, platforms), 0);
+    assert_eq!(rc(&tpm.process(&disable(TPM_RH_PLATFORM_NV))), 0);
+    assert_eq!(nv_read_public(&mut tpm, platforms), Rc::HANDLE.handle(1).0);
+    assert_eq!(
+        nv_define(&mut tpm, platforms + 1, platform, 8),
+        Rc::HIERARCHY.handle(1).0
+    );
+    // Both come back at the next TPM2_Startup(CLEAR).
+    let mut next = power_cycle(&tpm, 0);
+    assert_eq!(nv_read_public(&mut next, owners), 0);
+    assert_eq!(nv_read_public(&mut next, platforms), 0);
+}
+
+#[test]
+fn a_restored_nv_state_is_checked() {
+    use nv::attr::*;
+    let mut tpm = started();
+    let orderly = OWNERWRITE | OWNERREAD | ORDERLY;
+    assert_eq!(nv_define(&mut tpm, NV_INDEX, orderly, 8), 0);
+    let permanent = tpm.permanent_state();
+    let volatile = tpm.volatile_state();
+    assert!(Tpm::restore(&permanent, &volatile).is_ok());
+    // Orderly RAM that is not the orderly indices' copies.
+    let other = started().volatile_state();
+    assert!(Tpm::restore(&permanent, &other).is_err(), "no copy");
+    tpm.volatile.nv_orderly[0].data.push(0);
+    assert!(
+        Tpm::restore(&permanent, &tpm.volatile_state()).is_err(),
+        "not its size"
+    );
+    tpm.volatile.nv_orderly[0].data.pop();
+    tpm.volatile.nv_orderly[0].attributes &= !ORDERLY;
+    assert!(
+        Tpm::restore(&permanent, &tpm.volatile_state()).is_err(),
+        "other attributes"
+    );
+    tpm.volatile.nv_orderly[0].attributes |= ORDERLY;
+    let copy = tpm.volatile.nv_orderly[0].clone();
+    tpm.volatile.nv_orderly.push(copy);
+    assert!(
+        Tpm::restore(&permanent, &tpm.volatile_state()).is_err(),
+        "two copies"
+    );
+
+    // A counter of other than 8 bytes.
+    let mut tpm = started();
+    assert_eq!(nv_define(&mut tpm, NV_INDEX, OWNERWRITE | OWNERREAD, 2), 0);
+    tpm.permanent.nv[0].public.attributes |= 1 << TPM_NT_SHIFT;
+    assert!(
+        Tpm::power_on(&tpm.permanent_state()).is_err(),
+        "a 2-byte counter"
+    );
+    // Indices over their memory: 29 of 2 KiB fit, not 30.
+    let mut tpm = started();
+    for n in 0..29 {
+        assert_eq!(
+            nv_define(&mut tpm, NV_INDEX + n, OWNERWRITE | OWNERREAD, 2048),
+            0
+        );
+    }
+    let mut extra = tpm.permanent.nv[0].clone();
+    extra.public.index = NV_INDEX + 29;
+    tpm.permanent.nv.push(extra);
+    assert!(
+        Tpm::power_on(&tpm.permanent_state()).is_err(),
+        "over 64 KiB"
+    );
 }

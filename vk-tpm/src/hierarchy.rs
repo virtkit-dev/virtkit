@@ -449,7 +449,8 @@ pub fn change_eps(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Resu
 }
 
 /// TPM2_Clear: a new owner: new storage seed, new owner and endorsement proofs, no owner,
-/// endorsement or lockout authorization, default dictionary-attack parameters.
+/// endorsement or lockout authorization, default dictionary-attack parameters, and none of the
+/// owner's NV indices.
 pub fn clear(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> {
     end(r)?;
     if tpm.permanent.hierarchies.disable_clear {
@@ -471,6 +472,8 @@ pub fn clear(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()
         tpm.flush_hierarchy(hierarchy);
         tpm.flush_persistent(hierarchy);
     }
+    // The owner's NV indices go; the platform's stay.
+    tpm.nv_flush_owner();
     tpm.permanent.dictionary_attack = DictionaryAttack::default();
     // Clock starts over, safe, and so do the counters that date it.
     tpm.permanent.clock = 0;
