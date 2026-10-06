@@ -25,8 +25,24 @@ const GET_RANDOM: u32 = 0x17b;
 const PCR_READ: u32 = 0x17e;
 const PCR_EXTEND: u32 = 0x182;
 
+const HIERARCHY_CONTROL: u32 = 0x121;
+const CHANGE_EPS: u32 = 0x124;
+const CHANGE_PPS: u32 = 0x125;
+const CLEAR: u32 = 0x126;
+const CLEAR_CONTROL: u32 = 0x127;
+const HIERARCHY_CHANGE_AUTH: u32 = 0x129;
+const SET_PRIMARY_POLICY: u32 = 0x12e;
+const DA_LOCK_RESET: u32 = 0x139;
+const DA_PARAMETERS: u32 = 0x13a;
+
+const RH_OWNER: u32 = 0x4000_0001;
 const RS_PW: u32 = 0x4000_0009;
 const RH_NULL: u32 = 0x4000_0007;
+const RH_LOCKOUT: u32 = 0x4000_000a;
+const RH_ENDORSEMENT: u32 = 0x4000_000b;
+const RH_PLATFORM: u32 = 0x4000_000c;
+const RH_PLATFORM_NV: u32 = 0x4000_000d;
+const HIERARCHIES: [u32; 4] = [RH_OWNER, RH_ENDORSEMENT, RH_PLATFORM, RH_LOCKOUT];
 const BANKS: [(u16, usize); 4] = [(0x04, 20), (0x0b, 32), (0x0c, 48), (0x0d, 64)];
 
 /// Both TPMs, fed the same commands.
@@ -451,6 +467,206 @@ fn capabilities_match() {
         assert_eq!(ours.len(), theirs.len(), "{property:#x} {count}");
         assert_eq!(ours[..19], theirs[..19], "{property:#x} {count}");
     }
+}
+
+/// A command authorized by one password session.
+fn with_password(code: u32, handle: u32, pw: &[u8], params: &[u8]) -> Vec<u8> {
+    command(code, &[handle], Some(&password(pw)), params)
+}
+
+fn change_auth(handle: u32, pw: &[u8], new: &[u8]) -> Vec<u8> {
+    let mut p = (new.len() as u16).to_be_bytes().to_vec();
+    p.extend_from_slice(new);
+    with_password(HIERARCHY_CHANGE_AUTH, handle, pw, &p)
+}
+
+fn hierarchy_control(auth: u32, enable: u32, state: u8) -> Vec<u8> {
+    let mut p = enable.to_be_bytes().to_vec();
+    p.push(state);
+    with_password(HIERARCHY_CONTROL, auth, b"", &p)
+}
+
+/// The TPM properties that describe the hierarchies and the dictionary-attack state.
+fn read_hierarchy_state(both: &mut Both) {
+    both.same(&get_capability(6, 0x200, 2)); // TPMA_PERMANENT, TPMA_STARTUP_CLEAR
+    both.same(&get_capability(6, 0x20e, 4)); // lockout counter and parameters
+}
+
+#[test]
+fn hierarchy_authorizations_match() {
+    let mut both = Both::started();
+    read_hierarchy_state(&mut both);
+    for (i, &h) in HIERARCHIES.iter().enumerate() {
+        let auth = vec![b'a' + i as u8; 4 + i];
+        both.same(&change_auth(h, b"", &[&auth[..], &[0, 0]].concat()));
+        both.same(&change_auth(h, b"", b""));
+        both.same(&change_auth(h, &auth, b"x"));
+        both.same(&change_auth(h, b"x\0\0", &auth));
+        read_hierarchy_state(&mut both);
+    }
+    // Every handle a TPMI_RH_HIERARCHY_AUTH may not be, and auth values of every size.
+    for h in [
+        RH_NULL,
+        RH_PLATFORM_NV,
+        RS_PW,
+        0,
+        0x4000_0010,
+        0x4000_0110,
+        0x8000_0000,
+    ] {
+        both.same(&change_auth(h, b"", b""));
+    }
+    for len in [32, 48, 64, 65] {
+        both.same(&change_auth(RH_OWNER, b"a\0\0\0\0\0", &vec![1; len]));
+    }
+    // TPM2_SetPrimaryPolicy: digest sizes, algorithms, then the lockout and platform ones.
+    for (digest, alg) in [
+        (vec![1; 32], 0x0bu16),
+        (vec![1; 20], 0x0b),
+        (vec![], 0x10),
+        (vec![1; 20], 0x10),
+        (vec![1; 64], 0x0d),
+        (vec![1; 32], 0x12),
+    ] {
+        let mut p = (digest.len() as u16).to_be_bytes().to_vec();
+        p.extend_from_slice(&digest);
+        p.extend_from_slice(&alg.to_be_bytes());
+        for h in HIERARCHIES {
+            let pw: &[u8] = match h {
+                RH_OWNER => &[1; 64],
+                RH_LOCKOUT => b"dddddddd",
+                _ => b"x",
+            };
+            both.same(&with_password(SET_PRIMARY_POLICY, h, pw, &p));
+        }
+    }
+}
+
+#[test]
+fn hierarchy_control_and_clear_match() {
+    let mut both = Both::started();
+    let enables = [
+        RH_OWNER,
+        RH_ENDORSEMENT,
+        RH_PLATFORM_NV,
+        RH_PLATFORM,
+        RH_NULL,
+        RH_LOCKOUT,
+    ];
+    for auth in [RH_OWNER, RH_ENDORSEMENT, RH_PLATFORM] {
+        for enable in enables {
+            for state in [0, 1, 2] {
+                both.same(&hierarchy_control(auth, enable, state));
+                read_hierarchy_state(&mut both);
+                both.same(&hierarchy_control(RH_PLATFORM, enable, 1));
+            }
+        }
+    }
+    // Disabled hierarchies, through a resume and a restart.
+    both.same(&hierarchy_control(RH_OWNER, RH_OWNER, 0));
+    both.same(&hierarchy_control(RH_PLATFORM, RH_PLATFORM_NV, 0));
+    both.same(&change_auth(RH_PLATFORM, b"", b"pf"));
+    both.same(&change_auth(RH_OWNER, b"", b""));
+    both.same(&command(SHUTDOWN, &[], None, &[0, 1]));
+    both.power_cycle();
+    both.same(&command(STARTUP, &[], None, &[0, 1]));
+    read_hierarchy_state(&mut both);
+    both.same(&change_auth(RH_PLATFORM, b"pf", b"pf"));
+    both.same(&hierarchy_control(RH_PLATFORM, RH_PLATFORM, 0));
+    both.same(&change_auth(RH_PLATFORM, b"pf", b""));
+    both.same(&command(SHUTDOWN, &[], None, &[0, 1]));
+    // A command that changes what Shutdown(STATE) saved voids it.
+    both.same(&hierarchy_control(RH_ENDORSEMENT, RH_ENDORSEMENT, 0));
+    both.power_cycle();
+    both.same(&command(STARTUP, &[], None, &[0, 1]));
+    both.same(&command(STARTUP, &[], None, &[0, 0]));
+    read_hierarchy_state(&mut both);
+
+    // TPM2_ClearControl and TPM2_Clear, from lockout and from the platform.
+    both.same(&change_auth(RH_OWNER, b"", b"owner"));
+    both.same(&change_auth(RH_LOCKOUT, b"", b"lock"));
+    let clear = |h: u32, pw: &[u8]| with_password(CLEAR, h, pw, &[]);
+    let control = |h: u32, pw: &[u8], disable: u8| with_password(CLEAR_CONTROL, h, pw, &[disable]);
+    for c in [
+        control(RH_LOCKOUT, b"lock", 1),
+        clear(RH_LOCKOUT, b"lock"),
+        clear(RH_PLATFORM, b""),
+        control(RH_LOCKOUT, b"lock", 0),
+        control(RH_LOCKOUT, b"lock", 2),
+        control(RH_OWNER, b"owner", 0),
+        control(RH_PLATFORM, b"", 0),
+        clear(RH_OWNER, b"owner"),
+        clear(RH_LOCKOUT, b"lock"),
+        change_auth(RH_OWNER, b"owner", b""),
+        change_auth(RH_OWNER, b"", b""),
+        with_password(CHANGE_EPS, RH_PLATFORM, b"", &[]),
+        with_password(CHANGE_PPS, RH_PLATFORM, b"", &[]),
+        with_password(CHANGE_PPS, RH_OWNER, b"", &[]),
+        with_password(CHANGE_EPS, RH_PLATFORM, b"", &[0]),
+    ] {
+        both.same(&c);
+        read_hierarchy_state(&mut both);
+        both.same(&command(
+            PCR_READ,
+            &[],
+            None,
+            &selection(&[(0x0b, &[1, 0, 0])]),
+        ));
+    }
+}
+
+#[test]
+fn dictionary_attack_protection_matches() {
+    let mut both = Both::started();
+    let reset = |pw: &[u8]| with_password(DA_LOCK_RESET, RH_LOCKOUT, pw, &[]);
+    let parameters = |pw: &[u8], max: u32, recovery: u32, lockout: u32| {
+        let p = [
+            max.to_be_bytes(),
+            recovery.to_be_bytes(),
+            lockout.to_be_bytes(),
+        ]
+        .concat();
+        with_password(DA_PARAMETERS, RH_LOCKOUT, pw, &p)
+    };
+    both.same(&change_auth(RH_LOCKOUT, b"", b"lock"));
+    both.same(&reset(b"lock"));
+    both.same(&reset(b"wrong"));
+    read_hierarchy_state(&mut both);
+    both.same(&reset(b"lock"));
+    both.same(&parameters(b"lock", 5, 10, 0));
+    // Through a power cycle, lockout is still locked out (lockoutRecovery was 1000 s).
+    both.power_cycle();
+    both.same(&command(STARTUP, &[], None, &[0, 0]));
+    both.same(&reset(b"lock"));
+    both.same(&change_auth(RH_LOCKOUT, b"lock", b"lock"));
+    read_hierarchy_state(&mut both);
+
+    // With lockoutRecovery 0, the next Startup lets it be tried again.
+    drop(both); // libtpms is one TPM per process
+    let mut both = Both::started();
+    both.same(&parameters(b"", 5, 10, 0));
+    both.same(
+        &parameters(b"", 5, 10, 0)
+            .iter()
+            .copied()
+            .chain([0])
+            .collect::<Vec<_>>(),
+    );
+    read_hierarchy_state(&mut both);
+    both.same(&reset(b"x"));
+    both.same(&reset(b""));
+    both.same(&command(SHUTDOWN, &[], None, &[0, 0]));
+    both.power_cycle();
+    both.same(&command(STARTUP, &[], None, &[0, 0]));
+    both.same(&reset(b""));
+    both.same(&parameters(b"", 0, 0, 0));
+    read_hierarchy_state(&mut both);
+    both.same(&clear(RH_LOCKOUT));
+    read_hierarchy_state(&mut both);
+}
+
+fn clear(h: u32) -> Vec<u8> {
+    with_password(CLEAR, h, b"", &[])
 }
 
 /// Deterministic mutations of well-formed commands: both must answer the same, wherever the

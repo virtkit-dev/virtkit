@@ -8,6 +8,7 @@ use crate::marshal::Reader;
 use crate::rc::{Rc, Result};
 
 pub const TPM_ALG_SHA1: u16 = 0x0004;
+pub const TPM_ALG_NULL: u16 = 0x0010;
 pub const TPM_ALG_SHA256: u16 = 0x000b;
 pub const TPM_ALG_SHA384: u16 = 0x000c;
 pub const TPM_ALG_SHA512: u16 = 0x000d;
@@ -44,6 +45,14 @@ impl Hash {
     /// A TPMI_ALG_HASH (without TPM_ALG_NULL): TPM_RC_HASH for anything else.
     pub fn read(r: &mut Reader) -> Result<Hash> {
         Hash::from_id(r.u16()?).ok_or(Rc::HASH)
+    }
+
+    /// A TPMI_ALG_HASH+: None for TPM_ALG_NULL.
+    pub fn read_or_null(r: &mut Reader) -> Result<Option<Hash>> {
+        match r.u16()? {
+            TPM_ALG_NULL => Ok(None),
+            id => Hash::from_id(id).map(Some).ok_or(Rc::HASH),
+        }
     }
 
     pub fn size(self) -> usize {

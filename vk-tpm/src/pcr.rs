@@ -8,8 +8,6 @@ use crate::rc::{Rc, Result};
 pub const PCR_COUNT: usize = 24;
 /// Bytes in a PCR bitmap (TPMS_PCR_SELECTION.sizeofSelect): both its minimum and maximum.
 pub const PCR_SELECT: usize = PCR_COUNT / 8;
-/// TPM_RH_NULL, which TPM2_PCR_Extend takes as "extend nothing".
-pub const TPM_RH_NULL: u32 = 0x4000_0007;
 /// A PCR read returns at most this many digests (TPML_DIGEST); the selection says which.
 const MAX_READ: usize = 8;
 
@@ -252,7 +250,9 @@ impl Pcrs {
         }
     }
 
-    fn changed(&mut self, pcr: usize) {
+    /// PCRChanged: count a change to `pcr` in the update counter (unless it is in the TCB
+    /// group).
+    pub fn changed(&mut self, pcr: usize) {
         let no_increment = attributes(pcr).is_some_and(|a| a.no_increment);
         // PCR 0 always counts (TPM2_Clear signals a change through it).
         if pcr == 0 || !no_increment {

@@ -1,10 +1,10 @@
 //! The TPM's state, and its serialized forms.
 //!
-//! - [`Permanent`]: what a TPM keeps across power cycles (its NV memory): seeds, PCR bank
-//!   allocation, dictionary-attack counters, and what the last TPM2_Shutdown saved. The VMM
-//!   writes it to the machine's state file each time it changes.
-//! - [`Volatile`]: what is lost at power-off (PCR values, whether TPM2_Startup ran). Only a
-//!   snapshot keeps it.
+//! - [`Permanent`]: what a TPM keeps across power cycles (its NV memory): seeds, the hierarchies'
+//!   authorizations and proofs, PCR bank allocation, dictionary-attack state, and what the last
+//!   TPM2_Shutdown saved. The VMM writes it to the machine's state file each time it changes.
+//! - [`Volatile`]: what is lost at power-off (PCR values, whether TPM2_Startup ran, the
+//!   hierarchy enables). Only a snapshot keeps it.
 //!
 //! Each serializes as a magic, a format version and the fields in order, in the TPM's own wire
 //! format. A reader refuses a version it does not know, rather than guess.
@@ -12,14 +12,17 @@
 use zeroize::Zeroizing;
 
 use crate::alg::Hash;
+use crate::hierarchy::{ClearState, DaTimers, DictionaryAttack, Hierarchies};
 use crate::marshal::{Reader, Writer};
-use crate::pcr::{self, Bank, Banks, Pcrs, Saved, Selection};
+use crate::pcr::{self, Bank, Banks, Pcrs, Selection};
 use crate::rc::Rc;
 
 const PERMANENT_MAGIC: &[u8; 8] = b"VKTPM-P\0";
 const VOLATILE_MAGIC: &[u8; 8] = b"VKTPM-V\0";
+/// No vk-tpm state has been stored outside a test yet: the format stays at version 1, and
+/// changes in place, until one is (docs/tpm-design.md).
 const VERSION: u16 = 1;
-const SEED_SIZE: usize = 64;
+pub const SEED_SIZE: usize = 64;
 
 /// The state could not be read: not ours, a version this build does not know, or corrupt.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,39 +42,52 @@ impl From<Rc> for StateError {
     }
 }
 
-/// A hierarchy's seed: the root every primary key of it is derived from. Wiped when dropped.
+/// A hierarchy's seed, the root every primary key of it is derived from, or a proof. Wiped when
+/// dropped.
 pub type Seed = Zeroizing<[u8; SEED_SIZE]>;
 
-/// How the TPM was last shut down, which decides what the next TPM2_Startup may do.
+/// A random seed (or proof), from the host's entropy.
+pub fn new_seed() -> Result<Seed, StateError> {
+    let mut seed = Seed::new([0; SEED_SIZE]);
+    getrandom::fill(seed.as_mut()).map_err(|_| StateError("no entropy for the seeds"))?;
+    Ok(seed)
+}
+
+pub fn read_seed(r: &mut Reader) -> Result<Seed, StateError> {
+    let bytes = r.tpm2b(SEED_SIZE)?;
+    let seed: [u8; SEED_SIZE] = bytes.try_into().map_err(|_| StateError("bad seed"))?;
+    Ok(Seed::new(seed))
+}
+
+/// How the TPM was last shut down (its orderlyState), which decides what the next TPM2_Startup
+/// may do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Shutdown {
     /// No orderly shutdown since the last Startup: the next one is a TPM Reset.
     None,
+    /// As None, and a DA-protected authValue was used since: the TPM Reset counts one failed
+    /// authorization, in case one was lost with the power.
+    DaUsed,
     /// TPM2_Shutdown(CLEAR) (or a new TPM).
     Clear,
     /// TPM2_Shutdown(STATE), with what it saved.
     State(Saved),
 }
 
-/// The dictionary-attack parameters and counter (TPM2_DictionaryAttackParameters).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DictionaryAttack {
-    pub max_tries: u32,
-    pub recovery_time: u32,
-    pub lockout_recovery: u32,
-    pub failed_tries: u32,
+impl Shutdown {
+    /// The shutdown was orderly: no failure is presumed lost, and Startup may restart or
+    /// resume.
+    pub fn is_orderly(&self) -> bool {
+        matches!(self, Shutdown::Clear | Shutdown::State(_))
+    }
 }
 
-impl Default for DictionaryAttack {
-    /// The reference implementation's (and libtpms') defaults.
-    fn default() -> DictionaryAttack {
-        DictionaryAttack {
-            max_tries: 3,
-            recovery_time: 1000,
-            lockout_recovery: 1000,
-            failed_tries: 0,
-        }
-    }
+/// What TPM2_Shutdown(STATE) saves for the TPM2_Startup after it: the state-saved PCRs, and the
+/// enables and platform authorization a resume brings back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Saved {
+    pub pcrs: pcr::Saved,
+    pub clear: ClearState,
 }
 
 pub struct Permanent {
@@ -79,30 +95,31 @@ pub struct Permanent {
     pub eps: Seed,
     pub sps: Seed,
     pub pps: Seed,
+    pub hierarchies: Hierarchies,
     /// Which PCRs of which bank are allocated (TPM2_PCR_Allocate), one selection per bank.
     pub allocation: Vec<Selection>,
     pub dictionary_attack: DictionaryAttack,
     pub shutdown: Shutdown,
+    /// TPM time (ms) at the last TPM2_Shutdown, from which the dictionary-attack timers go on
+    /// counting after an orderly power cycle.
+    pub shutdown_time: u64,
 }
 
 impl Permanent {
-    /// A newly manufactured TPM: fresh seeds, every bank allocated.
+    /// A newly manufactured TPM: fresh seeds and proofs, every bank allocated.
     pub fn manufacture() -> Result<Permanent, StateError> {
-        let seed = || -> Result<Seed, StateError> {
-            let mut seed = Seed::new([0; SEED_SIZE]);
-            getrandom::fill(seed.as_mut()).map_err(|_| StateError("no entropy for the seeds"))?;
-            Ok(seed)
-        };
         Ok(Permanent {
-            eps: seed()?,
-            sps: seed()?,
-            pps: seed()?,
+            eps: new_seed()?,
+            sps: new_seed()?,
+            pps: new_seed()?,
+            hierarchies: Hierarchies::manufacture()?,
             allocation: Hash::ALL
                 .into_iter()
                 .map(|h| Selection::all(h, true))
                 .collect(),
             dictionary_attack: DictionaryAttack::default(),
             shutdown: Shutdown::Clear,
+            shutdown_time: 0,
         })
     }
 
@@ -112,60 +129,60 @@ impl Permanent {
         for seed in [&self.eps, &self.sps, &self.pps] {
             w.tpm2b(seed.as_slice());
         }
+        self.hierarchies.write(&mut w);
         pcr::write_selections(&mut w, &self.allocation);
-        let da = &self.dictionary_attack;
-        w.u32(da.max_tries)
-            .u32(da.recovery_time)
-            .u32(da.lockout_recovery)
-            .u32(da.failed_tries);
+        self.dictionary_attack.write(&mut w);
         match &self.shutdown {
             Shutdown::None => {
                 w.u8(0);
             }
-            Shutdown::Clear => {
+            Shutdown::DaUsed => {
                 w.u8(1);
             }
+            Shutdown::Clear => {
+                w.u8(2);
+            }
             Shutdown::State(saved) => {
-                w.u8(2).u32(saved.counter);
-                write_banks(&mut w, &saved.banks);
+                w.u8(3).u32(saved.pcrs.counter);
+                write_banks(&mut w, &saved.pcrs.banks);
+                saved.clear.write(&mut w);
             }
         }
+        w.u64(self.shutdown_time);
         w.into_bytes()
     }
 
     pub fn deserialize(bytes: &[u8]) -> Result<Permanent, StateError> {
         let mut r = Reader::new(bytes);
         expect_header(&mut r, PERMANENT_MAGIC)?;
-        let mut seed = || -> Result<Seed, StateError> {
-            let bytes = r.tpm2b(SEED_SIZE)?;
-            let seed: [u8; SEED_SIZE] = bytes.try_into().map_err(|_| StateError("bad seed"))?;
-            Ok(Seed::new(seed))
-        };
-        let (eps, sps, pps) = (seed()?, seed()?, seed()?);
+        let (eps, sps, pps) = (read_seed(&mut r)?, read_seed(&mut r)?, read_seed(&mut r)?);
+        let hierarchies = Hierarchies::read(&mut r)?;
         let allocation = pcr::read_selections(&mut r)?;
-        let dictionary_attack = DictionaryAttack {
-            max_tries: r.u32()?,
-            recovery_time: r.u32()?,
-            lockout_recovery: r.u32()?,
-            failed_tries: r.u32()?,
-        };
+        let dictionary_attack = DictionaryAttack::read(&mut r)?;
         let shutdown = match r.u8()? {
             0 => Shutdown::None,
-            1 => Shutdown::Clear,
-            2 => Shutdown::State(Saved {
-                counter: r.u32()?,
-                banks: read_banks(&mut r)?,
+            1 => Shutdown::DaUsed,
+            2 => Shutdown::Clear,
+            3 => Shutdown::State(Saved {
+                pcrs: pcr::Saved {
+                    counter: r.u32()?,
+                    banks: read_banks(&mut r)?,
+                },
+                clear: ClearState::read(&mut r)?,
             }),
             _ => return Err(StateError("bad shutdown state")),
         };
+        let shutdown_time = r.u64()?;
         expect_end(&r)?;
         Ok(Permanent {
             eps,
             sps,
             pps,
+            hierarchies,
             allocation,
             dictionary_attack,
             shutdown,
+            shutdown_time,
         })
     }
 }
@@ -175,6 +192,16 @@ pub struct Volatile {
     pub started: bool,
     /// The shutdown before that Startup was orderly (TPMA_STARTUP_CLEAR.orderly).
     pub orderly_startup: bool,
+    /// TPM time: milliseconds since power on, as of the command being run.
+    pub time: u64,
+    /// TPM time restarted from zero since the last Startup (_plat__TimerWasReset).
+    pub time_reset: bool,
+    pub da_timers: DaTimers,
+    /// A DA-protected authValue was used since Startup (g_daUsed).
+    pub da_used: bool,
+    /// The platform hierarchy is enabled (every Startup enables it).
+    pub ph_enable: bool,
+    pub clear: ClearState,
     pub pcrs: Pcrs,
 }
 
@@ -184,6 +211,12 @@ impl Volatile {
         Volatile {
             started: false,
             orderly_startup: false,
+            time: 0,
+            time_reset: true,
+            da_timers: DaTimers::default(),
+            da_used: false,
+            ph_enable: true,
+            clear: ClearState::default(),
             pcrs: Pcrs::new(),
         }
     }
@@ -193,7 +226,14 @@ impl Volatile {
         w.bytes(VOLATILE_MAGIC).u16(VERSION);
         w.u8(self.started.into())
             .u8(self.orderly_startup.into())
-            .u32(self.pcrs.counter);
+            .u64(self.time)
+            .u8(self.time_reset.into())
+            .u64(self.da_timers.self_heal.cast_unsigned())
+            .u64(self.da_timers.lockout.cast_unsigned())
+            .u8(self.da_used.into())
+            .u8(self.ph_enable.into());
+        self.clear.write(&mut w);
+        w.u32(self.pcrs.counter);
         let banks: Vec<_> = (self.pcrs.banks.iter())
             .map(|b| (b.hash, b.values.clone()))
             .collect();
@@ -206,9 +246,17 @@ impl Volatile {
         expect_header(&mut r, VOLATILE_MAGIC)?;
         let started = read_bool(&mut r)?;
         let orderly_startup = read_bool(&mut r)?;
-        let counter = r.u32()?;
+        let time = r.u64()?;
+        let time_reset = read_bool(&mut r)?;
+        let da_timers = DaTimers {
+            self_heal: r.u64()?.cast_signed(),
+            lockout: r.u64()?.cast_signed(),
+        };
+        let da_used = read_bool(&mut r)?;
+        let ph_enable = read_bool(&mut r)?;
+        let clear = ClearState::read(&mut r)?;
         let mut pcrs = Pcrs::new();
-        pcrs.counter = counter;
+        pcrs.counter = r.u32()?;
         for (hash, values) in read_banks(&mut r)? {
             let bank = (pcrs.banks.iter_mut())
                 .find(|b| b.hash == hash)
@@ -222,6 +270,12 @@ impl Volatile {
         Ok(Volatile {
             started,
             orderly_startup,
+            time,
+            time_reset,
+            da_timers,
+            da_used,
+            ph_enable,
+            clear,
             pcrs,
         })
     }
@@ -245,7 +299,7 @@ fn expect_end(r: &Reader) -> Result<(), StateError> {
     }
 }
 
-fn read_bool(r: &mut Reader) -> Result<bool, StateError> {
+pub fn read_bool(r: &mut Reader) -> Result<bool, StateError> {
     match r.u8()? {
         0 => Ok(false),
         1 => Ok(true),
@@ -289,6 +343,7 @@ fn read_banks(r: &mut Reader) -> Result<Banks, StateError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hierarchy::Policy;
     use crate::pcr::Startup;
 
     #[test]
@@ -297,24 +352,44 @@ mod tests {
         assert_ne!(*p.eps, *p.sps, "seeds are random");
         let mut pcrs = Pcrs::new();
         pcrs.startup(Startup::Reset, None);
-        p.shutdown = Shutdown::State(pcrs.save());
+        let clear = ClearState {
+            platform_auth: Zeroizing::new(b"platform".to_vec()),
+            ..Default::default()
+        };
+        p.shutdown = Shutdown::State(Saved {
+            pcrs: pcrs.save(),
+            clear,
+        });
         p.dictionary_attack.failed_tries = 2;
+        p.hierarchies.owner_auth = Zeroizing::new(b"owner".to_vec());
+        p.hierarchies.lockout_policy = Policy {
+            hash: Some(Hash::Sha256),
+            digest: vec![7; 32],
+        };
+        p.shutdown_time = 1234;
         let bytes = p.serialize();
         let q = Permanent::deserialize(&bytes).unwrap();
         assert_eq!(q.serialize(), bytes);
         assert_eq!(*q.eps, *p.eps);
         assert_eq!(q.shutdown, p.shutdown);
+        assert_eq!(*q.hierarchies.owner_auth, b"owner");
     }
 
     #[test]
     fn volatile_state_round_trips() {
         let mut v = Volatile::power_on();
         v.started = true;
+        v.time = 99;
+        v.da_timers.lockout = -5;
+        v.clear.sh_enable = false;
         v.pcrs.startup(Startup::Reset, None);
         let bytes = v.serialize();
         let w = Volatile::deserialize(&bytes).unwrap();
         assert!(w.started);
         assert_eq!(w.pcrs, v.pcrs);
+        assert_eq!(w.da_timers, v.da_timers);
+        assert_eq!(w.clear, v.clear);
+        assert_eq!(w.serialize(), bytes);
     }
 
     #[test]
