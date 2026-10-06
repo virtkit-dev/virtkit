@@ -632,6 +632,39 @@ impl Tpm {
         }
     }
 
+    /// A primary key of `hierarchy`, derived from the hierarchy's seed and `template`
+    /// (DRBG_InstantiateSeeded, then CryptCreateObject): the same key every time, until the seed
+    /// changes. The template's unique field becomes the key's.
+    pub fn derive_primary(
+        &self,
+        hierarchy: u32,
+        template: &mut Public,
+        sensitive: &SensitiveCreate,
+    ) -> Result<Sensitive> {
+        let mut drbg = Drbg::seeded(
+            self.primary_seed(hierarchy).as_slice(),
+            PRIMARY_OBJECT_CREATION,
+            &template.name(),
+            &sensitive.data,
+        );
+        let h = &self.permanent.hierarchies;
+        let eps_stir = (hierarchy == TPM_RH_ENDORSEMENT).then_some((&h.sh_proof, &h.eh_proof));
+        create_object(template, sensitive, &mut drbg, eps_stir)
+    }
+
+    /// The primary key `template` makes in `hierarchy`, as TPM2_CreatePrimary loads it.
+    pub fn primary_key(
+        &self,
+        hierarchy: u32,
+        mut template: Public,
+        sensitive: &SensitiveCreate,
+    ) -> Result<Key> {
+        let secrets = self.derive_primary(hierarchy, &mut template, sensitive)?;
+        let mut key = Key::new(template, Some(secrets))?;
+        key.set_loaded(None, hierarchy);
+        Ok(key)
+    }
+
     /// The object (with a public area) a handle names: a transient one, or a persistent one
     /// loaded for the command.
     pub fn key(&self, handle: u32) -> Option<&Key> {
@@ -742,18 +775,7 @@ pub fn create_primary(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, w: &mut Ou
     let digest_size = input.public.digest_size();
     let auth = public::adjust_auth(&input.sensitive.auth, digest_size).map_err(|rc| rc.param(1))?;
     input.sensitive.auth = auth;
-    let mut drbg = Drbg::seeded(
-        tpm.primary_seed(hierarchy).as_slice(),
-        PRIMARY_OBJECT_CREATION,
-        &input.public.name(),
-        &input.sensitive.data,
-    );
-    let h = &tpm.permanent.hierarchies;
-    let eps_stir = (hierarchy == TPM_RH_ENDORSEMENT).then_some((&h.sh_proof, &h.eh_proof));
-    let mut public = input.public;
-    let sensitive = create_object(&mut public, &input.sensitive, &mut drbg, eps_stir)?;
-    let mut key = Key::new(public, Some(sensitive))?;
-    key.set_loaded(None, hierarchy);
+    let key = tpm.primary_key(hierarchy, input.public, &input.sensitive)?;
     let name_alg = key.public.name_alg.ok_or(Rc::FAILURE)?;
     let (creation, creation_hash) =
         tpm.creation_data(hierarchy, name_alg, &mut input.pcrs, &input.outside);
@@ -822,20 +844,11 @@ pub fn create_loaded(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, w: &mut Out
     let data_len = sensitive.data.len();
     public::create_checks(checked.as_ref(), &public, data_len).map_err(|rc| rc.param(2))?;
     let mut public = public;
-    let (mut drbg, eps_stir) = if primary {
-        let drbg = Drbg::seeded(
-            tpm.primary_seed(parent_handle).as_slice(),
-            PRIMARY_OBJECT_CREATION,
-            &public.name(),
-            &sensitive.data,
-        );
-        let h = &tpm.permanent.hierarchies;
-        let stir = (parent_handle == TPM_RH_ENDORSEMENT).then_some((&h.sh_proof, &h.eh_proof));
-        (drbg, stir)
+    let secrets = if primary {
+        tpm.derive_primary(parent_handle, &mut public, &sensitive)?
     } else {
-        (Drbg::random()?, None)
+        create_object(&mut public, &sensitive, &mut Drbg::random()?, None)?
     };
-    let secrets = create_object(&mut public, &sensitive, &mut drbg, eps_stir)?;
     let private = match parent {
         Some(p) => wrap(p, &public.name(), public.name_alg, &secrets)?,
         None => Vec::new(),
