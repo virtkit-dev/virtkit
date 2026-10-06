@@ -10,10 +10,18 @@ license.workspace = true
 [dependencies]
 aes.workspace = true
 cfb-mode.workspace = true
-getrandom.workspace = true
+crypto-bigint.workspace = true
+crypto-primes.workspace = true
+ecdsa.workspace = true
+# sys_rng: the host's CSPRNG as a rand_core RNG, for rsa's blinding and ECDSA's hedged nonces.
+getrandom = { workspace = true, features = ["sys_rng"] }
 hmac.workspace = true
-sha1.workspace = true
-sha2.workspace = true
+p256.workspace = true
+rsa.workspace = true
+# oid: the DigestInfo prefixes of RSASSA-PKCS1-v1_5 signatures. zeroize: a hash state is wiped
+# when dropped (an HMAC sequence's inner hash is keyed).
+sha1 = { workspace = true, features = ["oid", "zeroize"] }
+sha2 = { workspace = true, features = ["oid", "zeroize"] }
 subtle.workspace = true
 zeroize.workspace = true
 

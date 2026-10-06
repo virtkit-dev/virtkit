@@ -16,7 +16,7 @@ use crate::alg::{Hash, MAX_DIGEST, TPM_ALG_NULL};
 use crate::commands::{Command, end};
 use crate::crypt;
 use crate::entity::{
-    TPM_HT_POLICY_SESSION, TPM_RH_LOCKOUT, TPM_RH_NULL, TPM_RS_PW, handle_type, is_da_exempt,
+    TPM_HT_POLICY_SESSION, TPM_HT_TRANSIENT, TPM_RH_LOCKOUT, TPM_RH_NULL, TPM_RS_PW, handle_type,
     is_session, strip_zeros,
 };
 use crate::marshal::{Reader, Writer};
@@ -26,8 +26,7 @@ use crate::{Out, Tpm};
 
 /// How many sessions the TPM holds at once (MAX_LOADED_SESSIONS, as libtpms).
 pub const MAX_LOADED: usize = 3;
-/// How many session handles there are (MAX_ACTIVE_SESSIONS); with no TPM2_ContextSave yet,
-/// every active session is a loaded one.
+/// How many session handles there are (MAX_ACTIVE_SESSIONS): loaded or saved sessions.
 pub const MAX_ACTIVE: usize = 64;
 const HMAC_SESSION_FIRST: u32 = 0x0200_0000;
 const POLICY_SESSION_FIRST: u32 = 0x0300_0000;
@@ -179,23 +178,38 @@ impl Session {
     }
 }
 
-/// Check the session slots of a stored volatile state: at most [`MAX_LOADED`] sessions, and
-/// the exclusive audit session, if any, one of them.
+/// A session handle's slot: free, a loaded session, or a saved one (TPM2_ContextSave), which
+/// keeps its handle and the sequence number of the context that holds it (contextArray).
+pub enum SessionSlot {
+    Free,
+    Loaded(Box<Session>),
+    Saved(u64),
+}
+
+/// Check the session slots of a stored volatile state: at most [`MAX_LOADED`] loaded sessions,
+/// and the exclusive audit session, if any, one of them or a saved one.
 pub fn check_slots(
-    sessions: &[Option<Session>],
+    sessions: &[SessionSlot],
     exclusive_audit: Option<u32>,
 ) -> std::result::Result<(), StateError> {
-    let too_many = sessions.iter().flatten().count() > MAX_LOADED;
-    let lost_audit = exclusive_audit.is_some_and(|h| loaded(sessions, h).is_none());
-    if too_many || lost_audit {
+    let loaded_count = (sessions.iter())
+        .filter(|s| matches!(s, SessionSlot::Loaded(_)))
+        .count();
+    let lost_audit = exclusive_audit.is_some_and(|h| match sessions.get(index(h)) {
+        Some(SessionSlot::Saved(_)) => !is_session(h),
+        _ => loaded(sessions, h).is_none(),
+    });
+    if loaded_count > MAX_LOADED || lost_audit {
         return Err(StateError("bad session"));
     }
     Ok(())
 }
 
-/// The session a handle names, if one of that type is in `sessions`.
-fn loaded(sessions: &[Option<Session>], handle: u32) -> Option<&Session> {
-    let session = sessions.get(index(handle))?.as_ref()?;
+/// The session a handle names, if one of that type is loaded in `sessions`.
+fn loaded(sessions: &[SessionSlot], handle: u32) -> Option<&Session> {
+    let SessionSlot::Loaded(session) = sessions.get(index(handle))? else {
+        return None;
+    };
     let policy = handle_type(handle) == TPM_HT_POLICY_SESSION;
     (policy == (session.kind != Kind::Hmac)).then_some(session)
 }
@@ -217,6 +231,8 @@ pub struct Use {
 /// A command's authorization area, and what its HMACs are computed over.
 pub struct Area {
     code: u32,
+    /// The first handle takes the ADMIN role (else USER).
+    admin: bool,
     /// The Names of the command's handles.
     names: Vec<Vec<u8>>,
     /// The parameters as the command carried them (encrypted).
@@ -249,13 +265,19 @@ fn index(handle: u32) -> usize {
 }
 
 impl Tpm {
+    /// The session a handle names, if it is loaded.
     pub fn session(&self, handle: u32) -> Option<&Session> {
-        self.volatile.sessions.get(index(handle))?.as_ref()
+        match self.volatile.sessions.get(index(handle))? {
+            SessionSlot::Loaded(s) => Some(s),
+            _ => None,
+        }
     }
 
     fn session_mut(&mut self, handle: u32) -> Result<&mut Session> {
-        let slot = self.volatile.sessions.get_mut(index(handle));
-        slot.and_then(Option::as_mut).ok_or(Rc::FAILURE)
+        match self.volatile.sessions.get_mut(index(handle)) {
+            Some(SessionSlot::Loaded(s)) => Ok(s),
+            _ => Err(Rc::FAILURE),
+        }
     }
 
     /// The session a handle names, if one of that type is loaded there.
@@ -269,7 +291,10 @@ impl Tpm {
         (self.volatile.sessions.iter().enumerate())
             .skip(from)
             .filter_map(|(i, s)| {
-                let first = match s.as_ref()?.kind {
+                let SessionSlot::Loaded(s) = s else {
+                    return None;
+                };
+                let first = match s.kind {
                     Kind::Hmac => HMAC_SESSION_FIRST,
                     _ => POLICY_SESSION_FIRST,
                 };
@@ -278,15 +303,37 @@ impl Tpm {
             .collect()
     }
 
-    pub fn session_count(&self) -> usize {
-        self.volatile.sessions.iter().flatten().count()
+    /// The handles of the saved sessions, from index `from` on (TPM_HT_SAVED_SESSION), each as
+    /// an HMAC session handle (the reference does not tell them apart).
+    pub fn saved_sessions(&self, from: u32) -> Vec<u32> {
+        (self.volatile.sessions.iter().enumerate())
+            .skip(index(from))
+            .filter(|(_, s)| matches!(s, SessionSlot::Saved(_)))
+            .filter_map(|(i, _)| HMAC_SESSION_FIRST.checked_add(u32::try_from(i).ok()?))
+            .collect()
     }
 
-    /// TPM2_FlushContext of a session.
+    /// How many sessions are loaded.
+    pub fn session_count(&self) -> usize {
+        (self.volatile.sessions.iter())
+            .filter(|s| matches!(s, SessionSlot::Loaded(_)))
+            .count()
+    }
+
+    /// How many session handles are taken, by loaded or saved sessions.
+    pub fn active_sessions(&self) -> usize {
+        (self.volatile.sessions.iter())
+            .filter(|s| !matches!(s, SessionSlot::Free))
+            .count()
+    }
+
+    /// TPM2_FlushContext of a session, loaded or saved.
     pub fn flush_session(&mut self, handle: u32) -> Result<()> {
         let slot = self.volatile.sessions.get_mut(index(handle));
-        let slot = slot.filter(|s| s.is_some()).ok_or(Rc::HANDLE)?;
-        *slot = None;
+        let slot = slot
+            .filter(|s| !matches!(s, SessionSlot::Free))
+            .ok_or(Rc::HANDLE)?;
+        *slot = SessionSlot::Free;
         if self.volatile.exclusive_audit == Some(handle) {
             self.volatile.exclusive_audit = None;
         }
@@ -312,6 +359,7 @@ impl Tpm {
     pub fn read_area(&self, cmd: &Command, mut area: Reader, handles: &[u32]) -> Result<Area> {
         let mut a = Area {
             code: cmd.code,
+            admin: cmd.admin,
             names: handles.iter().map(|&h| self.entity_name(h)).collect(),
             params: Vec::new(),
             uses: Vec::new(),
@@ -495,8 +543,18 @@ impl Tpm {
         if let Some(u) = a.uses.get_mut(i) {
             u.include_auth = include_auth;
         }
-        if include_auth && !is_da_exempt(entity) {
+        if include_auth && !self.is_da_exempt(entity) {
             self.check_locked_out(entity == TPM_RH_LOCKOUT)?;
+        }
+        // Only the first handle of a command takes the ADMIN role.
+        let admin = a.admin && i == 0;
+        if !matches!(kind, Some(Kind::Policy | Kind::Trial)) {
+            if self.policy_required(entity, admin) {
+                return Err(Rc::AUTH_TYPE);
+            }
+            if !self.auth_value_available(entity, admin) {
+                return Err(Rc::AUTH_UNAVAILABLE);
+            }
         }
         match kind {
             None => {
@@ -514,6 +572,11 @@ impl Tpm {
                 let policy = self.entity_policy(entity).ok_or(Rc::AUTH_UNAVAILABLE)?;
                 let digest_matches: bool = session.policy_digest.ct_eq(&policy.digest).into();
                 if !digest_matches || policy.hash != Some(session.hash) {
+                    return Err(Rc::POLICY_FAIL);
+                }
+                // The ADMIN role needs a policy bound to the command (TPM2_PolicyCommandCode,
+                // not implemented yet).
+                if admin {
                     return Err(Rc::POLICY_FAIL);
                 }
                 self.check_hmac(a, i)
@@ -586,10 +649,10 @@ impl Tpm {
             if session.lockout_bound {
                 entity = TPM_RH_LOCKOUT;
             }
-            if !session.da_bound && (is_da_exempt(entity) || !u.include_auth) {
+            if !session.da_bound && (self.is_da_exempt(entity) || !u.include_auth) {
                 return Rc::BAD_AUTH;
             }
-        } else if is_da_exempt(entity) {
+        } else if self.is_da_exempt(entity) {
             return Rc::BAD_AUTH;
         }
         self.da_failure(entity == TPM_RH_LOCKOUT);
@@ -736,7 +799,8 @@ impl Tpm {
         Ok(())
     }
 
-    /// SessionCreate: a new session in the first free handle.
+    /// SessionCreate: a new session in the first free handle, keyed by the bind entity's
+    /// authValue and the salt.
     fn create_session(
         &mut self,
         kind: Kind,
@@ -744,24 +808,33 @@ impl Tpm {
         nonce_caller: &[u8],
         symmetric: Symmetric,
         bind: u32,
+        salt: &[u8],
     ) -> Result<(u32, Vec<u8>)> {
         if self.session_count() >= MAX_LOADED {
             return Err(Rc::SESSION_MEMORY);
         }
-        let (i, _) = (self.volatile.sessions.iter().enumerate())
-            .find(|(_, s)| s.is_none())
+        // The last free slot is kept for the oldest saved session, should it need to come
+        // back before the context counter catches up with it.
+        if self.session_count().saturating_add(1) == MAX_LOADED && self.oldest_saved_is_due() {
+            return Err(Rc::CONTEXT_GAP);
+        }
+        let i = (self.volatile.sessions.iter())
+            .position(|s| matches!(s, SessionSlot::Free))
             .ok_or(Rc::SESSION_HANDLES)?;
         let mut nonce_tpm = vec![0; nonce_caller.len()];
         getrandom::fill(&mut nonce_tpm).map_err(|_| Rc::FAILURE)?;
-        // No salt yet: an RSA or ECC key to decrypt one with comes with objects.
-        let key = if bind == TPM_RH_NULL {
+        let key = if bind == TPM_RH_NULL && salt.is_empty() {
             Zeroizing::new(Vec::new())
         } else {
             let auth = self.entity_auth(bind);
-            crypt::kdfa(hash, &auth, b"ATH", &nonce_tpm, nonce_caller, hash.size())
+            let mut secret =
+                Zeroizing::new(Vec::with_capacity(auth.len().saturating_add(salt.len())));
+            secret.extend_from_slice(&auth);
+            secret.extend_from_slice(salt);
+            crypt::kdfa(hash, &secret, b"ATH", &nonce_tpm, nonce_caller, hash.size())
         };
         let bound = (bind != TPM_RH_NULL && kind == Kind::Hmac).then(|| self.bind_value(bind));
-        let da_bound = bind != TPM_RH_NULL && !is_da_exempt(bind);
+        let da_bound = bind != TPM_RH_NULL && !self.is_da_exempt(bind);
         let session = Session {
             kind,
             hash,
@@ -779,7 +852,7 @@ impl Tpm {
             },
         };
         let slot = self.volatile.sessions.get_mut(i).ok_or(Rc::FAILURE)?;
-        *slot = Some(session);
+        *slot = SessionSlot::Loaded(Box::new(session));
         let first = if kind == Kind::Hmac {
             HMAC_SESSION_FIRST
         } else {
@@ -832,8 +905,8 @@ fn read_symmetric(r: &mut Reader) -> Result<(Symmetric, u16)> {
     }
 }
 
-/// TPM2_StartAuthSession: an HMAC, policy or trial session, bound to an entity or not. Salted
-/// sessions need a loaded RSA or ECC key, which no command can load yet.
+/// TPM2_StartAuthSession: an HMAC, policy or trial session, bound to an entity or not, salted
+/// or not: the salt comes encrypted to `tpmKey` (RSA-OAEP, or ECDH and KDFe).
 pub fn start_auth_session(
     tpm: &mut Tpm,
     handles: &[u32],
@@ -841,7 +914,7 @@ pub fn start_auth_session(
     w: &mut Out,
 ) -> Result<()> {
     let nonce_caller = r.tpm2b(MAX_AUTH).map_err(|rc| rc.param(1))?;
-    let salt = r.tpm2b(MAX_ENCRYPTED_SECRET).map_err(|rc| rc.param(2))?;
+    let encrypted_salt = r.tpm2b(MAX_ENCRYPTED_SECRET).map_err(|rc| rc.param(2))?;
     let kind = match r.u8().map_err(|rc| rc.param(3))? {
         0x00 => Kind::Hmac,
         0x01 => Kind::Policy,
@@ -855,18 +928,37 @@ pub fn start_auth_session(
         return Err(Rc::SIZE.param(1));
     }
     let tpm_key = handles.first().copied().ok_or(Rc::FAILURE)?;
-    if tpm_key != TPM_RH_NULL {
-        // The only objects so far are sequences: not a key that decrypts.
-        return Err(Rc::KEY.handle(1));
-    }
-    if !salt.is_empty() {
-        return Err(Rc::VALUE.param(2));
+    let salt = if tpm_key == TPM_RH_NULL {
+        if !encrypted_salt.is_empty() {
+            return Err(Rc::VALUE.param(2));
+        }
+        Zeroizing::new(Vec::new())
+    } else {
+        let key = tpm.key(tpm_key).ok_or(Rc::KEY.handle(1))?;
+        if !key.public.kind().is_asymmetric() {
+            return Err(Rc::KEY.handle(1));
+        }
+        if encrypted_salt.is_empty() {
+            return Err(Rc::VALUE.param(2));
+        }
+        if key.public_only() {
+            return Err(Rc::HANDLE.handle(1));
+        }
+        if !key.public.has(crate::public::attr::DECRYPT) {
+            return Err(Rc::ATTRIBUTES.handle(1));
+        }
+        key.decrypt_secret(b"SECRET\0", encrypted_salt)
+            .map_err(|_| Rc::VALUE.param(2))?
+    };
+    let bind = handles.get(1).copied().ok_or(Rc::FAILURE)?;
+    if handle_type(bind) == TPM_HT_TRANSIENT && tpm.key(bind).is_some_and(|k| k.public_only()) {
+        return Err(Rc::HANDLE.handle(2));
     }
     if matches!(symmetric, Symmetric::Aes(_)) && mode != TPM_ALG_CFB {
         return Err(Rc::MODE.param(4));
     }
-    let bind = handles.get(1).copied().ok_or(Rc::FAILURE)?;
-    let (handle, nonce_tpm) = tpm.create_session(kind, hash, nonce_caller, symmetric, bind)?;
+    let (handle, nonce_tpm) =
+        tpm.create_session(kind, hash, nonce_caller, symmetric, bind, &salt)?;
     w.handle = Some(handle);
     w.tpm2b(&nonce_tpm);
     Ok(())

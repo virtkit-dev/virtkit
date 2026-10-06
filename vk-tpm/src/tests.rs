@@ -106,9 +106,12 @@ fn malformed_headers_are_refused() {
 fn valid_handle(kind: HandleKind) -> u32 {
     match kind {
         HandleKind::Pcr(_) => 0,
-        HandleKind::Hierarchy | HandleKind::HierarchyAuth | HandleKind::HierarchyPolicy => {
-            TPM_RH_OWNER
-        }
+        HandleKind::Hierarchy
+        | HandleKind::HierarchyOrNull
+        | HandleKind::HierarchyAuth
+        | HandleKind::HierarchyPolicy
+        | HandleKind::Provision => TPM_RH_OWNER,
+        HandleKind::Context => 0x8000_0000,
         HandleKind::Platform | HandleKind::Clear => TPM_RH_PLATFORM,
         HandleKind::Lockout => TPM_RH_LOCKOUT,
         // The sequence the test starts first.
@@ -125,7 +128,34 @@ fn every_command_refuses_trailing_parameter_bytes() {
             tpm.process(&command(TPM_CC_STARTUP, &[], None, &[0, 0]));
         }
         let start_auth_session = [&[0, 16][..], &[0; 16], &[0, 0, 0, 0, 0x10, 0, 0x0b]].concat();
+        // A keyed-hash public area, and the parameters that carry one.
+        let public: &[u8] = &[0, 14, 0, 8, 0, 0x0b, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0];
+        let create = [&[0, 4, 0, 0, 0, 0][..], public, &[0, 0, 0, 0, 0, 0]].concat();
+        let load = [&[0, 0][..], public].concat();
+        let load_external = [&[0, 0][..], public, &[0x40, 0, 0, 7]].concat();
+        let context = [&[0; 8][..], &[0x80, 0, 0, 0, 0x40, 0, 0, 7, 0, 0]].concat();
+        // digest, an HMAC signature.
+        let verify_signature = [&[0, 0, 0, 5, 0, 0x0b][..], &[0; 32]].concat();
         let params: &[u8] = match cmd.code {
+            TPM_CC_EVICT_CONTROL => &[0x81, 0, 0, 1],
+            TPM_CC_CREATE_PRIMARY | TPM_CC_CREATE => &create,
+            TPM_CC_LOAD => &load,
+            TPM_CC_LOAD_EXTERNAL => &load_external,
+            TPM_CC_READ_PUBLIC
+            | TPM_CC_UNSEAL
+            | TPM_CC_CONTEXT_SAVE
+            | TPM_CC_ECDH_KEYGEN
+            | TPM_CC_GET_TEST_RESULT
+            | TPM_CC_READ_CLOCK => &[],
+            TPM_CC_OBJECT_CHANGE_AUTH | TPM_CC_STIR_RANDOM => &[0, 0],
+            TPM_CC_CONTEXT_LOAD => &context,
+            TPM_CC_SIGN => &[0, 0, 0, 0x10, 0x80, 0x24, 0x40, 0, 0, 7, 0, 0],
+            TPM_CC_VERIFY_SIGNATURE => &verify_signature,
+            TPM_CC_RSA_ENCRYPT | TPM_CC_RSA_DECRYPT => &[0, 0, 0, 0x10, 0, 0],
+            TPM_CC_ECDH_ZGEN => &[0, 4, 0, 0, 0, 0],
+            TPM_CC_HMAC | TPM_CC_HMAC_START => &[0, 0, 0, 0x10],
+            TPM_CC_ECC_PARAMETERS => &[0, 3],
+            TPM_CC_TEST_PARMS => &[0, 8, 0, 0x10],
             TPM_CC_GET_CAPABILITY => &[0, 0, 0, 6, 0, 0, 1, 0, 0, 0, 0, 1],
             TPM_CC_GET_RANDOM | TPM_CC_STARTUP | TPM_CC_SHUTDOWN => &[0, 0],
             TPM_CC_SELF_TEST | TPM_CC_CLEAR_CONTROL => &[1],
@@ -369,12 +399,13 @@ fn get_capability_lists_exactly_the_implemented_commands() {
         .chunks(4)
         .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
         .collect();
+    assert_eq!(listed[0], 0x0440_0120, "EvictControl: nv, 2 handles");
     assert_eq!(
-        listed[0], 0x02c0_0121,
+        listed[1], 0x02c0_0121,
         "HierarchyControl: nv, extensive, 1 handle"
     );
     assert_eq!(
-        *listed.last().unwrap(),
+        listed[listed.len() - 2],
         0x1000_0186,
         "HashSequenceStart: a response handle"
     );
@@ -1658,4 +1689,603 @@ fn sessions_fill_their_slots_and_survive_a_snapshot() {
     let mut next = power_cycle(&restored, 0);
     assert!(next.loaded_sessions(0).is_empty());
     assert_eq!(rc(&next.process(&c)), Rc::REFERENCE_S0.0);
+}
+
+// Objects and keys.
+
+/// A TPMT_PUBLIC with SHA-256 as its nameAlg and no authPolicy.
+fn public(kind: u16, attributes: u32, params: &[u8], unique: &[u8]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u16(kind)
+        .u16(alg::TPM_ALG_SHA256)
+        .u32(attributes)
+        .tpm2b(&[]);
+    w.bytes(params).bytes(unique);
+    w.into_bytes()
+}
+
+use crate::public::attr;
+
+const STORAGE: u32 = attr::FIXED_TPM
+    | attr::FIXED_PARENT
+    | attr::SENSITIVE_DATA_ORIGIN
+    | attr::USER_WITH_AUTH
+    | attr::NO_DA
+    | attr::RESTRICTED
+    | attr::DECRYPT;
+
+/// An ECC P-256 storage key (AES-128-CFB for its children).
+fn ecc_srk() -> Vec<u8> {
+    let params = [0, 6, 0, 0x80, 0, 0x43, 0, 0x10, 0, 3, 0, 0x10];
+    public(0x23, STORAGE, &params, &[0, 0, 0, 0])
+}
+
+/// A sealed data object: its secret given at creation.
+fn sealed(attributes: u32) -> Vec<u8> {
+    public(8, attributes, &[0, 0x10], &[0, 0])
+}
+
+/// An HMAC key (SHA-256), noDA.
+fn hmac_key() -> Vec<u8> {
+    let attributes = attr::FIXED_TPM
+        | attr::FIXED_PARENT
+        | attr::SENSITIVE_DATA_ORIGIN
+        | attr::USER_WITH_AUTH
+        | attr::NO_DA
+        | attr::SIGN;
+    public(8, attributes, &[0, 5, 0, 0x0b], &[0, 0])
+}
+
+/// The parameters of TPM2_CreatePrimary and TPM2_Create.
+fn create_params(auth: &[u8], data: &[u8], public: &[u8]) -> Vec<u8> {
+    let mut sensitive = Writer::new();
+    sensitive.tpm2b(auth).tpm2b(data);
+    let mut w = Writer::new();
+    w.tpm2b(&sensitive.into_bytes())
+        .tpm2b(public)
+        .tpm2b(&[])
+        .u32(0);
+    w.into_bytes()
+}
+
+/// TPM2_CreatePrimary: the response.
+fn create_primary(tpm: &mut Tpm, hierarchy: u32, public: &[u8]) -> Vec<u8> {
+    let p = create_params(b"", b"", public);
+    tpm.process(&command(TPM_CC_CREATE_PRIMARY, &[hierarchy], Some(b""), &p))
+}
+
+fn handle_of(response: &[u8]) -> u32 {
+    assert_eq!(rc(response), 0);
+    u32::from_be_bytes(response[10..14].try_into().unwrap())
+}
+
+/// The first TPM2B in `bytes`, and the rest.
+fn split2b(bytes: &[u8]) -> (&[u8], &[u8]) {
+    let size = usize::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+    (&bytes[2..2 + size], &bytes[2 + size..])
+}
+
+/// A response's parameters (after a handle, with `handle`), for a command with sessions.
+fn response_params(r: &[u8], handle: bool) -> &[u8] {
+    let at = if handle { 14 } else { 10 };
+    let size = u32::from_be_bytes(r[at..at + 4].try_into().unwrap()) as usize;
+    &r[at + 4..at + 4 + size]
+}
+
+fn read_public_name(tpm: &mut Tpm, handle: u32) -> Vec<u8> {
+    let r = tpm.process(&command(TPM_CC_READ_PUBLIC, &[handle], None, &[]));
+    assert_eq!(rc(&r), 0);
+    let (_, rest) = split2b(&r[10..]);
+    split2b(rest).0.to_vec()
+}
+
+fn flush(tpm: &mut Tpm, handle: u32) {
+    let r = tpm.process(&command(
+        TPM_CC_FLUSH_CONTEXT,
+        &[],
+        None,
+        &handle.to_be_bytes(),
+    ));
+    assert_eq!(rc(&r), 0);
+}
+
+#[test]
+fn a_primary_key_is_derived_again_from_its_seed() {
+    let mut tpm = started();
+    let srk = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &ecc_srk()));
+    let name = read_public_name(&mut tpm, srk);
+    flush(&mut tpm, srk);
+    let mut tpm = power_cycle(&tpm, 0);
+    let again = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &ecc_srk()));
+    assert_eq!(
+        read_public_name(&mut tpm, again),
+        name,
+        "the same key every time"
+    );
+    flush(&mut tpm, again);
+    let other = handle_of(&create_primary(&mut tpm, TPM_RH_ENDORSEMENT, &ecc_srk()));
+    assert_ne!(
+        read_public_name(&mut tpm, other),
+        name,
+        "another hierarchy, another key"
+    );
+    flush(&mut tpm, other);
+    // TPM2_Clear draws a new storage seed.
+    let clear = command(TPM_CC_CLEAR, &[TPM_RH_LOCKOUT], Some(b""), &[]);
+    assert_eq!(rc(&tpm.process(&clear)), 0);
+    let after = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &ecc_srk()));
+    assert_ne!(read_public_name(&mut tpm, after), name);
+}
+
+#[test]
+fn a_sealed_object_round_trips_through_its_parent() {
+    let mut tpm = started();
+    let srk = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &ecc_srk()));
+    let attributes = attr::FIXED_TPM | attr::FIXED_PARENT | attr::USER_WITH_AUTH;
+    let p = create_params(b"pw", b"the secret", &sealed(attributes));
+    let r = tpm.process(&command(TPM_CC_CREATE, &[srk], Some(b""), &p));
+    assert_eq!(rc(&r), 0);
+    let (private, rest) = split2b(response_params(&r, false));
+    let (public, _) = split2b(rest);
+    let mut load = Writer::new();
+    load.tpm2b(private).tpm2b(public);
+    let load = command(TPM_CC_LOAD, &[srk], Some(b""), &load.into_bytes());
+    let item = handle_of(&tpm.process(&load));
+    let unseal = |pw: &[u8]| command(TPM_CC_UNSEAL, &[item], Some(pw), &[]);
+    let r = tpm.process(&unseal(b"pw"));
+    assert_eq!(split2b(response_params(&r, false)).0, b"the secret");
+    // Not noDA: a wrong authValue counts against the dictionary-attack protection.
+    assert_eq!(rc(&tpm.process(&unseal(b"no"))), Rc::AUTH_FAIL.session(1).0);
+    assert!(tpm.take_permanent_changed());
+    // A new authValue: the object wrapped again; the old blob still has the old one.
+    let change = command(
+        TPM_CC_OBJECT_CHANGE_AUTH,
+        &[item, srk],
+        Some(b"pw"),
+        &tpm2b(b"new"),
+    );
+    let r = tpm.process(&change);
+    assert_eq!(rc(&r), 0);
+    let rewrapped = split2b(response_params(&r, false)).0.to_vec();
+    flush(&mut tpm, item);
+    let mut load = Writer::new();
+    load.tpm2b(&rewrapped).tpm2b(public);
+    let load = command(TPM_CC_LOAD, &[srk], Some(b""), &load.into_bytes());
+    let item = handle_of(&tpm.process(&load));
+    let r = tpm.process(&command(TPM_CC_UNSEAL, &[item], Some(b"new"), &[]));
+    assert_eq!(rc(&r), 0);
+    // Tampered with: refused.
+    let mut tampered = private.to_vec();
+    *tampered.last_mut().unwrap() ^= 1;
+    let mut load = Writer::new();
+    load.tpm2b(&tampered).tpm2b(public);
+    let load = command(TPM_CC_LOAD, &[srk], Some(b""), &load.into_bytes());
+    assert_eq!(rc(&tpm.process(&load)), Rc::INTEGRITY.param(1).0);
+}
+
+#[test]
+fn hmac_signatures_verify_and_get_a_ticket() {
+    let mut tpm = started();
+    let key = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &hmac_key()));
+    let digest = alg::Hash::Sha256.digest(&[b"m"]);
+    let mut p = Writer::new();
+    p.tpm2b(&digest).u16(alg::TPM_ALG_NULL);
+    p.u16(object::TPM_ST_HASHCHECK).u32(TPM_RH_NULL).tpm2b(&[]);
+    let r = tpm.process(&command(TPM_CC_SIGN, &[key], Some(b""), &p.into_bytes()));
+    let signature = response_params(&r, false).to_vec();
+    // TPMT_SIGNATURE: HMAC, SHA-256, the HMAC.
+    assert_eq!(signature[..4], [0, 5, 0, 0x0b]);
+    let mut p = Writer::new();
+    p.tpm2b(&digest).bytes(&signature);
+    let r = tpm.process(&command(
+        TPM_CC_VERIFY_SIGNATURE,
+        &[key],
+        None,
+        &p.into_bytes(),
+    ));
+    assert_eq!(rc(&r), 0);
+    // TPMT_TK_VERIFIED for the owner.
+    assert_eq!(r[10..16], [0x80, 0x22, 0x40, 0, 0, 1]);
+    let mut bad = signature.clone();
+    bad[10] ^= 1;
+    let mut p = Writer::new();
+    p.tpm2b(&digest).bytes(&bad);
+    let r = tpm.process(&command(
+        TPM_CC_VERIFY_SIGNATURE,
+        &[key],
+        None,
+        &p.into_bytes(),
+    ));
+    assert_eq!(rc(&r), Rc::SIGNATURE.param(2).0);
+}
+
+#[test]
+fn object_contexts_last_until_a_reset() {
+    let mut tpm = started();
+    let srk = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &ecc_srk()));
+    let mut st_clear = ecc_srk();
+    st_clear[7] |= attr::ST_CLEAR as u8;
+    let volatile = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &st_clear));
+    let save = |tpm: &mut Tpm, h: u32| {
+        let r = tpm.process(&command(TPM_CC_CONTEXT_SAVE, &[h], None, &[]));
+        assert_eq!(rc(&r), 0);
+        r[10..].to_vec()
+    };
+    let (srk_context, volatile_context) = (save(&mut tpm, srk), save(&mut tpm, volatile));
+    assert_eq!(srk_context[..12], [0, 0, 0, 0, 0, 0, 0, 1, 0x80, 0, 0, 0]);
+    assert_eq!(
+        volatile_context[..12],
+        [0, 0, 0, 0, 0, 0, 0, 2, 0x80, 0, 0, 2]
+    );
+    let name = read_public_name(&mut tpm, srk);
+    flush(&mut tpm, srk);
+    flush(&mut tpm, volatile);
+    let load = |c: &[u8]| command(TPM_CC_CONTEXT_LOAD, &[], None, c);
+    let loaded = handle_of(&tpm.process(&load(&srk_context)));
+    assert_eq!(read_public_name(&mut tpm, loaded), name);
+    flush(&mut tpm, loaded);
+    // A snapshot keeps loaded objects and what makes contexts valid.
+    let mut restored = Tpm::restore(&tpm.permanent_state(), &tpm.volatile_state()).unwrap();
+    assert_eq!(rc(&restored.process(&load(&srk_context))), 0);
+    // A restart: the stClear object's context no longer loads.
+    tpm.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 1]));
+    let mut tpm = power_cycle(&tpm, 0);
+    let loaded = handle_of(&tpm.process(&load(&srk_context)));
+    flush(&mut tpm, loaded);
+    let r = tpm.process(&load(&volatile_context));
+    assert_eq!(rc(&r), Rc::INTEGRITY.param(1).0);
+    // A reset: none.
+    tpm.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 0]));
+    let mut tpm = power_cycle(&tpm, 0);
+    assert_eq!(
+        rc(&tpm.process(&load(&srk_context))),
+        Rc::INTEGRITY.param(1).0
+    );
+}
+
+#[test]
+fn a_saved_session_holds_back_the_context_counter() {
+    let mut tpm = started();
+    let (session, _) = start_session(&mut tpm, TPM_RH_NULL, &[0, 0x10], 1);
+    let r = tpm.process(&command(TPM_CC_CONTEXT_SAVE, &[session], None, &[]));
+    assert_eq!(rc(&r), 0);
+    let context = r[10..].to_vec();
+    assert_eq!(
+        context[..8],
+        [0, 0, 0, 0, 0, 0, 0, 4],
+        "the first sequence number"
+    );
+    assert_eq!(tpm.saved_sessions(0), [session]);
+    // 2^16 contexts later, the oldest saved session is due: no more until it is loaded.
+    tpm.volatile.context_counter += 0xffff;
+    let (other, _) = start_session(&mut tpm, TPM_RH_NULL, &[0, 0x10], 2);
+    let r = tpm.process(&command(TPM_CC_CONTEXT_SAVE, &[other], None, &[]));
+    assert_eq!(rc(&r), Rc::CONTEXT_GAP.0);
+    let load = command(TPM_CC_CONTEXT_LOAD, &[], None, &context);
+    assert_eq!(handle_of(&tpm.process(&load)), session);
+    assert_eq!(
+        rc(&tpm.process(&load)),
+        Rc::HANDLE.param(1).0,
+        "loaded once"
+    );
+    let r = tpm.process(&command(TPM_CC_CONTEXT_SAVE, &[other], None, &[]));
+    assert_eq!(rc(&r), 0);
+}
+
+#[test]
+fn persistent_objects_are_kept_in_the_permanent_state() {
+    let mut tpm = started();
+    let srk = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &ecc_srk()));
+    let name = read_public_name(&mut tpm, srk);
+    tpm.take_permanent_changed();
+    let evict = |object: u32, persistent: u32| {
+        command(
+            TPM_CC_EVICT_CONTROL,
+            &[TPM_RH_OWNER, object],
+            Some(b""),
+            &persistent.to_be_bytes(),
+        )
+    };
+    assert_eq!(rc(&tpm.process(&evict(srk, 0x8100_0001))), 0);
+    assert!(tpm.take_permanent_changed());
+    let mut tpm = power_cycle(&tpm, 0);
+    assert_eq!(read_public_name(&mut tpm, 0x8100_0001), name);
+    assert!(
+        tpm.loaded_objects().is_empty(),
+        "its slot is freed after the command"
+    );
+    // A persistent parent, with every other slot taken: the command has no room for it.
+    for _ in 0..3 {
+        create_primary(&mut tpm, TPM_RH_OWNER, &hmac_key());
+    }
+    let r = tpm.process(&command(TPM_CC_READ_PUBLIC, &[0x8100_0001], None, &[]));
+    assert_eq!(rc(&r), Rc::OBJECT_MEMORY.0);
+    flush(&mut tpm, 0x8000_0000);
+    assert_eq!(rc(&tpm.process(&evict(0x8100_0001, 0x8100_0001))), 0);
+    let r = tpm.process(&command(TPM_CC_READ_PUBLIC, &[0x8100_0001], None, &[]));
+    assert_eq!(rc(&r), Rc::HANDLE.handle(1).0);
+}
+
+#[test]
+fn clock_goes_on_across_power_cycles() {
+    let mut tpm = started();
+    tpm.clock.advance(5000);
+    let read = |tpm: &mut Tpm| {
+        let r = tpm.process(&command(TPM_CC_READ_CLOCK, &[], None, &[]));
+        assert_eq!(rc(&r), 0);
+        // time, clock, resetCount, restartCount, safe
+        let mut p = Reader::new(&r[10..]);
+        let v = (p.u64(), p.u64(), p.u32(), p.u32(), p.u8());
+        (
+            v.0.unwrap(),
+            v.1.unwrap(),
+            v.2.unwrap(),
+            v.3.unwrap(),
+            v.4.unwrap(),
+        )
+    };
+    let (time, clock, resets, restarts, safe) = read(&mut tpm);
+    assert!(time >= 5000 && clock >= 5000);
+    assert_eq!((resets, restarts, safe), (1, 0, 1));
+    // Clock alone does not make the permanent state worth storing.
+    tpm.take_permanent_changed();
+    tpm.clock.advance(1);
+    read(&mut tpm);
+    assert!(!tpm.take_permanent_changed());
+    // An orderly restart: one more restart; a power loss: one more reset, and not safe.
+    tpm.process(&command(TPM_CC_SHUTDOWN, &[], None, &[0, 1]));
+    let mut tpm = power_cycle(&tpm, 0);
+    let (_, after, resets, restarts, safe) = read(&mut tpm);
+    assert!(after >= clock);
+    assert_eq!((resets, restarts, safe), (1, 1, 1));
+    let mut tpm = power_cycle(&tpm, 0);
+    let (_, _, resets, restarts, safe) = read(&mut tpm);
+    assert_eq!((resets, restarts, safe), (2, 0, 0));
+    tpm.clock.advance(1 << 12);
+    assert_eq!(read(&mut tpm).4, 1, "safe again once stored");
+}
+
+/// The response's outPublic (TPM2_CreatePrimary), and its unique field: the last `unique`
+/// bytes.
+fn created_unique(response: &[u8], unique: usize) -> Vec<u8> {
+    let (public, _) = split2b(response_params(response, true));
+    public[public.len() - unique..].to_vec()
+}
+
+/// A started TPM with the seeds and proofs the differential tests gave libtpms too (tag
+/// `vk-tpm-differential`): EPS, SPS, PPS, phProof, shProof, ehProof of 0x11, 0x22, ... 0x66.
+fn seeded() -> Tpm {
+    let mut tpm = started();
+    let seed = |b: u8| crate::state::Seed::new([b; crate::state::SEED_SIZE]);
+    let p = &mut tpm.permanent;
+    (p.eps, p.sps, p.pps) = (seed(0x11), seed(0x22), seed(0x33));
+    let h = &mut p.hierarchies;
+    (h.ph_proof, h.sh_proof, h.eh_proof) = (seed(0x44), seed(0x55), seed(0x66));
+    tpm
+}
+
+#[test]
+fn primaries_are_the_keys_libtpms_derives_from_the_same_seeds() {
+    use crate::crypt::tests::unhex;
+    // Captured from libtpms (by the differential harness) with the same seeds and templates.
+    let mut tpm = seeded();
+    let srk = create_primary(&mut tpm, TPM_RH_OWNER, &ecc_srk());
+    assert_eq!(
+        created_unique(&srk, 68),
+        unhex(
+            "00200559420e7df88240b263c8140920c1555274fc98c9e9fb9d75e4a78b84049e35\
+             00203c1c93c5afe4be521be5346c2b92ca91b5b8a9cbc7b772aa8c58c4abc38bc1b8"
+        ),
+        "the ECC storage key of the owner"
+    );
+    let hmac = create_primary(&mut tpm, TPM_RH_ENDORSEMENT, &hmac_key());
+    assert_eq!(
+        created_unique(&hmac, 34),
+        unhex("00204e7548027a56041c80c8fd0ae197b741f1ae847f631695e29e2cfb3c597eb3a1"),
+        "an HMAC key of the endorsement hierarchy (the proofs stirred in)"
+    );
+    // RSA primaries are vk-tpm's own (a prime search of its own): pinned so they never change.
+    flush(&mut tpm, handle_of(&srk));
+    flush(&mut tpm, handle_of(&hmac));
+    let params = [0, 6, 0, 0x80, 0, 0x43, 0, 0x10, 0x08, 0, 0, 0, 0, 0];
+    let rsa = create_primary(
+        &mut tpm,
+        TPM_RH_OWNER,
+        &public(1, STORAGE, &params, &[0, 0]),
+    );
+    let modulus = created_unique(&rsa, 256);
+    assert_eq!(
+        alg::Hash::Sha256.digest(&[&modulus]),
+        unhex("4ed4db532b6ce1d05af2d213919a8ec01c6120ec4a6a29ef30e0e55f70f0980d"),
+        "the SHA-256 of the modulus"
+    );
+}
+
+#[test]
+fn a_context_loads_only_as_it_was_saved() {
+    let mut tpm = started();
+    let srk = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &ecc_srk()));
+    let r = tpm.process(&command(TPM_CC_CONTEXT_SAVE, &[srk], None, &[]));
+    // TPMS_CONTEXT: sequence (8), savedHandle (4), hierarchy (4), the blob.
+    let context = r[10..].to_vec();
+    let mut flipped = context.clone();
+    *flipped.last_mut().unwrap() ^= 1;
+    let mut hierarchy = context.clone();
+    hierarchy[12..16].copy_from_slice(&TPM_RH_ENDORSEMENT.to_be_bytes());
+    let mut st_clear = context.clone();
+    st_clear[8..12].copy_from_slice(&0x8000_0002u32.to_be_bytes());
+    let load = |c: &[u8]| command(TPM_CC_CONTEXT_LOAD, &[], None, c);
+    for tampered in [flipped, hierarchy, st_clear] {
+        assert_eq!(rc(&tpm.process(&load(&tampered))), Rc::INTEGRITY.param(1).0);
+    }
+    assert_eq!(rc(&tpm.process(&load(&context))), 0);
+}
+
+/// An ECC P-256 key with these attributes and scheme (no symmetric definition).
+fn ecc_key(attributes: u32, scheme: &[u8]) -> Vec<u8> {
+    let params = [&[0, 0x10][..], scheme, &[0, 3, 0, 0x10]].concat();
+    public(0x23, attributes, &params, &[0, 0, 0, 0])
+}
+
+const ORDINARY: u32 =
+    attr::FIXED_TPM | attr::FIXED_PARENT | attr::SENSITIVE_DATA_ORIGIN | attr::USER_WITH_AUTH;
+
+#[test]
+fn ecdh_z_gen_refuses_a_point_off_the_curve() {
+    let mut tpm = started();
+    let r = create_primary(
+        &mut tpm,
+        TPM_RH_OWNER,
+        &ecc_key(ORDINARY | attr::DECRYPT, &[0, 0x10]),
+    );
+    let key = handle_of(&r);
+    let point = created_unique(&r, 68);
+    let z_gen = |point: &[u8]| command(TPM_CC_ECDH_ZGEN, &[key], Some(b""), &tpm2b(point));
+    assert_eq!(rc(&tpm.process(&z_gen(&point))), 0);
+    let mut off_curve = point.clone();
+    *off_curve.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        rc(&tpm.process(&z_gen(&off_curve))),
+        Rc::ECC_POINT.param(1).0
+    );
+}
+
+#[test]
+fn a_restricted_key_signs_only_with_a_ticket_from_the_tpm() {
+    let mut tpm = started();
+    let ecdsa_sha256 = [0, 0x18, 0, 0x0b];
+    let restricted = ecc_key(ORDINARY | attr::SIGN | attr::RESTRICTED, &ecdsa_sha256);
+    let key = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &restricted));
+    let sign = |digest: &[u8], hierarchy: u32, ticket: &[u8]| {
+        let mut p = Writer::new();
+        p.tpm2b(digest).u16(alg::TPM_ALG_NULL);
+        p.u16(object::TPM_ST_HASHCHECK).u32(hierarchy).tpm2b(ticket);
+        command(TPM_CC_SIGN, &[key], Some(b""), &p.into_bytes())
+    };
+    let digest = alg::Hash::Sha256.digest(&[b"m"]);
+    assert_eq!(
+        rc(&tpm.process(&sign(&digest, TPM_RH_NULL, &[]))),
+        Rc::TICKET.param(3).0,
+        "no ticket"
+    );
+    assert_eq!(
+        rc(&tpm.process(&sign(&digest, TPM_RH_OWNER, &[7; 64]))),
+        Rc::TICKET.param(3).0,
+        "a wrong ticket"
+    );
+    // TPM2_Hash: the digest, and a ticket that the TPM made it.
+    let mut p = Writer::new();
+    p.tpm2b(b"m").u16(alg::TPM_ALG_SHA256).u32(TPM_RH_OWNER);
+    let r = tpm.process(&command(TPM_CC_HASH, &[], None, &p.into_bytes()));
+    let (hashed, ticket) = split2b(&r[10..]);
+    assert_eq!(hashed, digest);
+    let (ticket, _) = split2b(&ticket[6..]);
+    assert_eq!(rc(&tpm.process(&sign(&digest, TPM_RH_OWNER, ticket))), 0);
+}
+
+#[test]
+fn verify_signature_refuses_a_null_signature() {
+    let mut tpm = started();
+    let key = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &hmac_key()));
+    let mut p = Writer::new();
+    p.tpm2b(&alg::Hash::Sha256.digest(&[b"m"]))
+        .u16(alg::TPM_ALG_NULL);
+    let r = tpm.process(&command(
+        TPM_CC_VERIFY_SIGNATURE,
+        &[key],
+        None,
+        &p.into_bytes(),
+    ));
+    assert_eq!(rc(&r), Rc::SCHEME.param(2).0);
+}
+
+// A fixed P-256 key: d, and its public point (x, y).
+const ECC_D: &str = "af235cdd12ce6ccf8df6cf4e18f15035bbbf6b7dbdbeace49afb951672d886a9";
+const ECC_X: &str = "d0d528c1d062530f685a929cb78d81e77b9c2c9f7cce8d53ca0807f0fae8418f";
+const ECC_Y: &str = "57b6d63f94e338242c26136f0936f211735396ccdd23ecfc48ffe46edcffbf0c";
+
+/// TPM2_LoadExternal of an ECC key with these attributes, its point (x, y) and its private
+/// scalar if any, into `hierarchy`.
+fn load_external_ecc(
+    attributes: u32,
+    (x, y): (&str, &str),
+    d: Option<&str>,
+    hierarchy: u32,
+) -> Vec<u8> {
+    use crate::crypt::tests::unhex;
+    let unique = [tpm2b(&unhex(x)), tpm2b(&unhex(y))].concat();
+    let public = public(
+        0x23,
+        attributes,
+        &[0, 0x10, 0, 0x10, 0, 3, 0, 0x10],
+        &unique,
+    );
+    let sensitive = match d {
+        Some(d) => {
+            let mut s = Writer::new();
+            s.u16(0x23).tpm2b(&[]).tpm2b(&[]).tpm2b(&unhex(d));
+            tpm2b(&s.into_bytes())
+        }
+        None => tpm2b(&[]),
+    };
+    let mut p = Writer::new();
+    p.bytes(&sensitive).tpm2b(&public).u32(hierarchy);
+    command(TPM_CC_LOAD_EXTERNAL, &[], None, &p.into_bytes())
+}
+
+#[test]
+fn load_external_takes_a_private_key_only_into_the_null_hierarchy_and_as_its_own() {
+    let mut tpm = started();
+    let usage = attr::USER_WITH_AUTH | attr::SIGN | attr::DECRYPT;
+    let point = (ECC_X, ECC_Y);
+    let mut load = |attributes, point, d, hierarchy| {
+        let r = tpm.process(&load_external_ecc(attributes, point, d, hierarchy));
+        if rc(&r) == 0 {
+            flush(&mut tpm, handle_of(&r));
+        }
+        rc(&r)
+    };
+    assert_eq!(load(usage, point, Some(ECC_D), TPM_RH_NULL), 0);
+    assert_eq!(
+        load(usage, point, None, TPM_RH_OWNER),
+        0,
+        "a public key anywhere"
+    );
+    assert_eq!(
+        load(usage, point, Some(ECC_D), TPM_RH_OWNER),
+        Rc::HIERARCHY.param(3).0
+    );
+    for fixed in [attr::FIXED_TPM, attr::FIXED_PARENT, attr::RESTRICTED] {
+        assert_eq!(
+            load(usage | fixed, point, Some(ECC_D), TPM_RH_NULL),
+            Rc::ATTRIBUTES.param(2).0
+        );
+    }
+    // Another key's point: the base point, d = 1's.
+    let g = (
+        "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296",
+        "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+    );
+    assert_eq!(load(usage, g, Some(ECC_D), TPM_RH_NULL), Rc::BINDING.0);
+}
+
+#[test]
+fn a_salt_needs_a_decryption_key() {
+    let mut tpm = started();
+    let ecdsa_sha256 = [0, 0x18, 0, 0x0b];
+    let signing = ecc_key(ORDINARY | attr::SIGN, &ecdsa_sha256);
+    let key = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &signing));
+    let mut p = Writer::new();
+    p.tpm2b(&[1; 16])
+        .tpm2b(&[0, 2, 0, 0])
+        .u8(0)
+        .u16(alg::TPM_ALG_NULL)
+        .u16(alg::TPM_ALG_SHA256);
+    let r = tpm.process(&command(
+        TPM_CC_START_AUTH_SESSION,
+        &[key, TPM_RH_NULL],
+        None,
+        &p.into_bytes(),
+    ));
+    assert_eq!(rc(&r), Rc::ATTRIBUTES.handle(1).0);
 }

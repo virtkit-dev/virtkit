@@ -1,5 +1,5 @@
-//! The TPM's keyed primitives (Part 1, "Cryptographic Functions"): HMAC, KDFa, and symmetric
-//! transforms for parameter encryption. RustCrypto supplies the primitives; this module
+//! The TPM's keyed primitives (Part 1, "Cryptographic Functions"): HMAC, KDFa, KDFe, and
+//! symmetric transforms for parameter encryption. RustCrypto supplies the primitives; this module
 //! frames their inputs as specified.
 //!
 //! Every derived key comes back [`Zeroizing`].
@@ -60,6 +60,22 @@ pub fn kdfa(
             key,
             &[&counter, label, terminator, context_u, context_v, &bits],
         )
+    })
+}
+
+/// KDFe (SP 800-56A concatenation, the hash itself as the PRF): `bytes` bytes of key stream from
+/// the shared secret `z`. Each block is H(counter ‖ Z ‖ label ‖ partyUInfo ‖ partyVInfo), with
+/// `label` hashed as given: its terminating 0 included.
+pub fn kdfe(
+    hash: Hash,
+    z: &[u8],
+    label: &[u8],
+    party_u: &[u8],
+    party_v: &[u8],
+    bytes: usize,
+) -> Zeroizing<Vec<u8>> {
+    counter_mode(hash.size(), bytes, |counter| {
+        hash.digest(&[&counter, z, label, party_u, party_v])
     })
 }
 
@@ -126,10 +142,10 @@ pub fn aes_cfb(key: &[u8], iv: &[u8], data: &mut [u8], encrypt: bool) -> Result<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn unhex(s: &str) -> Vec<u8> {
+    pub fn unhex(s: &str) -> Vec<u8> {
         (0..s.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
@@ -169,6 +185,15 @@ mod tests {
         // A label that already ends in its 0 gets no second one.
         assert_eq!(kdfa(Hash::Sha256, key, b"ATH\0", u, v, 40), out);
         assert!(kdfa(Hash::Sha1, key, b"", u, v, 0).is_empty());
+    }
+
+    #[test]
+    fn kdfe_is_hash_counter_mode() {
+        let out = kdfe(Hash::Sha384, b"z", b"SECRET\0", b"u", b"v", 50);
+        let block =
+            |i: u32| Hash::Sha384.digest(&[&i.to_be_bytes(), b"z", b"SECRET\0", b"u", b"v"]);
+        assert_eq!(out[..48], block(1)[..]);
+        assert_eq!(out[48..], block(2)[..2]);
     }
 
     #[test]

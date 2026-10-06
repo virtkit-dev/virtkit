@@ -19,16 +19,23 @@
 )]
 
 mod alg;
+mod asym;
 mod capability;
 mod commands;
+mod context;
 mod crypt;
+mod drbg;
 mod entity;
 mod hierarchy;
+mod key;
 mod marshal;
 mod object;
 mod pcr;
+mod protection;
+mod public;
 mod rc;
 mod session;
+mod signing;
 mod state;
 
 use std::time::Instant;
@@ -48,6 +55,8 @@ const TPM_ST_SESSIONS: u16 = 0x8002;
 const HEADER_SIZE: usize = 10;
 /// The locality every command comes from: the device offers locality 0 only.
 const LOCALITY: u8 = 0;
+/// Clock is saved every 2^12 ms (NV_CLOCK_UPDATE_INTERVAL; TPM_PT_CLOCK_UPDATE).
+const CLOCK_UPDATE_INTERVAL: u32 = 12;
 
 /// A TPM: its permanent state (what survives power-off) and its volatile state.
 pub struct Tpm {
@@ -115,16 +124,24 @@ impl Tpm {
     /// that fails gets the 10-byte error response the specification gives.
     pub fn process(&mut self, command: &[u8]) -> Vec<u8> {
         // Detect every permanent-state change, including failed authorization, so the caller
-        // stores it before the guest sees the response.
+        // stores it before the guest sees the response. Clock alone does not count: it is
+        // stored with the next change (as libtpms does), and a TPM that loses power without an
+        // orderly shutdown says its clock is not safe.
+        let clock = self.permanent.clock_state();
         let before = self.permanent_state();
-        let response = self.execute(command).unwrap_or_else(|rc| {
+        let response = self.execute(command);
+        // The persistent objects the command named leave their slots, whatever happened.
+        self.flush_evicted();
+        let response = response.unwrap_or_else(|rc| {
             let mut w = Writer::new();
             w.u16(TPM_ST_NO_SESSIONS).u32(HEADER_SIZE as u32).u32(rc.0);
             w.into_bytes()
         });
+        let now = self.permanent.set_clock_state(clock);
         if *self.permanent_state() != *before {
             self.permanent_changed = true;
         }
+        self.permanent.set_clock_state(now);
         response
     }
 
@@ -160,7 +177,7 @@ impl Tpm {
             kind.check(handle).map_err(|rc| rc.handle(n))?;
             handles.push(handle);
         }
-        self.check_loaded(&handles)?;
+        self.check_loaded(code, &mut handles)?;
 
         let (mut area, params) = if tag == TPM_ST_SESSIONS {
             let auth_size = usize::try_from(r.u32()?).map_err(|_| Rc::SIZE)?;
@@ -210,9 +227,29 @@ impl Tpm {
         Ok(response)
     }
 
-    /// Bring TPM time up to now (TimeUpdate).
+    /// Bring TPM time and Clock up to now (TimeUpdate).
     fn update_time(&mut self) {
-        self.volatile.time = self.clock.now().max(self.volatile.time);
+        let now = self.clock.now().max(self.volatile.time);
+        let elapsed = now.saturating_sub(self.volatile.time);
+        self.volatile.time = now;
+        // Clock is safe again once it crosses an update interval (TimeClockUpdate: the
+        // reference writes it to NV then).
+        const UPDATE_MASK: u64 = (1 << CLOCK_UPDATE_INTERVAL) - 1;
+        let p = &mut self.permanent;
+        let clock = p.clock.saturating_add(elapsed);
+        if clock | UPDATE_MASK > p.clock | UPDATE_MASK {
+            p.clock_safe = true;
+        }
+        p.clock = clock;
+    }
+
+    /// TPMS_CLOCK_INFO.
+    pub fn write_clock_info(&self, w: &mut Writer) {
+        let p = &self.permanent;
+        w.u64(p.clock)
+            .u32(p.reset_count)
+            .u32(self.volatile.restart_count)
+            .u8(p.clock_safe.into());
     }
 
     /// Void an orderly shutdown recorded since Startup (g_clearOrderly): a command changed what
@@ -279,7 +316,7 @@ impl Clock {
 
 /// A TPM_ST the reference implementation knows: a command with another one is TPM_RC_BAD_TAG,
 /// one with an unknown tag TPM_RC_VALUE (as libtpms answers).
-fn is_structure_tag(tag: u16) -> bool {
+pub(crate) fn is_structure_tag(tag: u16) -> bool {
     matches!(tag, 0x00c4 | 0x8000..=0x8002 | 0x8014..=0x801a | 0x8021..=0x8025)
 }
 

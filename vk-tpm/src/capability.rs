@@ -12,9 +12,11 @@ use crate::entity::{
     TPM_HT_POLICY_SESSION, TPM_HT_TRANSIENT, TPM_RH_ENDORSEMENT, TPM_RH_LOCKOUT, TPM_RH_NULL,
     TPM_RH_OWNER, TPM_RH_PLATFORM, TPM_RH_PLATFORM_NV, TPM_RS_PW, handle_type,
 };
+use crate::key::MAX_PERSISTENT;
 use crate::marshal::{Reader, Writer};
 use crate::object::MAX_OBJECTS;
 use crate::pcr::{self, PCR_COUNT};
+use crate::public::TPM_ECC_NIST_P256;
 use crate::rc::{Rc, Result};
 use crate::session::{MAX_ACTIVE, MAX_LOADED};
 use crate::{MAX_COMMAND_SIZE, Out, Tpm};
@@ -88,8 +90,14 @@ pub fn get_capability(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> 
                 // TPM_HT_LOADED_SESSION: the loaded sessions from that index on, whatever their
                 // type (so a policy session's handle may sort before the one asked for).
                 TPM_HT_HMAC_SESSION => (tpm.loaded_sessions(property), 0),
-                // No NV index, saved session (TPM_HT_SAVED_SESSION) or persistent object yet.
-                TPM_HT_NV_INDEX | TPM_HT_POLICY_SESSION | TPM_HT_PERSISTENT => (Vec::new(), 0),
+                // TPM_HT_SAVED_SESSION: likewise, the saved ones.
+                TPM_HT_POLICY_SESSION => (tpm.saved_sessions(property), 0),
+                TPM_HT_PERSISTENT => {
+                    let list = tpm.permanent.persistent.iter().map(|(h, _)| *h);
+                    (list.collect(), property)
+                }
+                // No NV index yet.
+                TPM_HT_NV_INDEX => (Vec::new(), 0),
                 _ => return Err(Rc::HANDLE.param(2)),
             };
             let keyed: Vec<_> = handles.iter().map(|&h| (h, ())).collect();
@@ -146,9 +154,13 @@ pub fn get_capability(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> 
             more
         }
         TPM_CAP_ECC_CURVES => {
-            // No ECC yet.
-            data.count(0);
-            false
+            let curves = [(u32::from(TPM_ECC_NIST_P256), ())];
+            let (curves, more) = page(&curves, property, count.min(MAX_CAP_DATA / 2));
+            data.count(curves.len());
+            for (curve, ()) in curves {
+                data.u16(u16::try_from(curve).unwrap_or(0));
+            }
+            more
         }
         _ => return Err(Rc::VALUE.param(1)),
     };
@@ -207,8 +219,12 @@ fn properties(tpm: &Tpm) -> Vec<(u32, u32)> {
     let loaded = tpm.loaded_objects().len();
     let transient_avail = MAX_OBJECTS.saturating_sub(loaded) as u32;
     let sessions = tpm.session_count() as u32;
+    let active = tpm.active_sessions() as u32;
     let loaded_avail = (MAX_LOADED as u32).saturating_sub(sessions);
-    let active_avail = (MAX_ACTIVE as u32).saturating_sub(sessions);
+    let active_avail = (MAX_ACTIVE as u32).saturating_sub(active);
+    let persistent = tpm.permanent.persistent.len();
+    let persistent_avail = MAX_PERSISTENT.saturating_sub(persistent) as u32;
+    let persistent = persistent as u32;
     let max_command = MAX_COMMAND_SIZE as u32;
     vec![
         (0x100, chars(b"2.0\0")), // TPM_PT_FAMILY_INDICATOR
@@ -264,15 +280,15 @@ fn properties(tpm: &Tpm) -> Vec<(u32, u32)> {
         (0x202, 0),                            // TPM_PT_HR_NV_INDEX
         (0x203, sessions),                     // TPM_PT_HR_LOADED
         (0x204, loaded_avail),                 // TPM_PT_HR_LOADED_AVAIL
-        (0x205, sessions),                     // TPM_PT_HR_ACTIVE
+        (0x205, active),                       // TPM_PT_HR_ACTIVE
         (0x206, active_avail),                 // TPM_PT_HR_ACTIVE_AVAIL
         (0x207, transient_avail),              // TPM_PT_HR_TRANSIENT_AVAIL
-        (0x208, 0),                            // TPM_PT_HR_PERSISTENT
-        (0x209, 0x33),                         // TPM_PT_HR_PERSISTENT_AVAIL
+        (0x208, persistent),                   // TPM_PT_HR_PERSISTENT
+        (0x209, persistent_avail),             // TPM_PT_HR_PERSISTENT_AVAIL
         (0x20a, 0),                            // TPM_PT_NV_COUNTERS
         (0x20b, 0x19),                         // TPM_PT_NV_COUNTERS_AVAIL
         (0x20c, 0),                            // TPM_PT_ALGORITHM_SET
-        (0x20d, 0),                            // TPM_PT_LOADED_CURVES: no ECC yet
+        (0x20d, 1),                            // TPM_PT_LOADED_CURVES: NIST P-256
         (0x20e, da.failed_tries),              // TPM_PT_LOCKOUT_COUNTER
         (0x20f, da.max_tries),                 // TPM_PT_MAX_AUTH_FAIL
         (0x210, da.recovery_time),             // TPM_PT_LOCKOUT_INTERVAL

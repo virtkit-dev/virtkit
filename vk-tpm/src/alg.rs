@@ -148,25 +148,40 @@ impl Hasher {
 }
 
 // TPMA_ALGORITHM bits.
+const ASYMMETRIC: u32 = 1 << 0;
 const SYMMETRIC: u32 = 1 << 1;
 const HASH: u32 = 1 << 2;
+const OBJECT: u32 = 1 << 3;
 const SIGNING: u32 = 1 << 8;
 const ENCRYPTING: u32 = 1 << 9;
 const METHOD: u32 = 1 << 10;
 
-/// TPM_CAP_ALGS: each implemented algorithm and its TPMA_ALGORITHM, in TPM_ALG_ID order. Only
-/// what the TPM actually implements: a client picks from this list. HMAC, AES (in CFB mode),
-/// XOR and KDFa (SP 800-108) are those of the sessions.
-pub const IMPLEMENTED: [(u16, u32); 9] = [
+/// TPM_CAP_ALGS: each implemented algorithm and its TPMA_ALGORITHM (as libtpms has it), in
+/// TPM_ALG_ID order. Only what the TPM actually implements: a client picks from this list.
+/// AES only in CFB mode (parameter encryption, the protection of objects and contexts); MGF1
+/// and the KDFs as OAEP, PSS, KDFe and KDFa use them.
+pub const IMPLEMENTED: [(u16, u32); 21] = [
+    (0x0001, ASYMMETRIC | OBJECT), // TPM_ALG_RSA
     (TPM_ALG_SHA1, HASH),
-    (0x0005, HASH | SIGNING),   // TPM_ALG_HMAC
-    (0x0006, SYMMETRIC),        // TPM_ALG_AES
-    (0x000a, SYMMETRIC | HASH), // TPM_ALG_XOR
+    (0x0005, HASH | SIGNING),                       // TPM_ALG_HMAC
+    (0x0006, SYMMETRIC),                            // TPM_ALG_AES
+    (0x0007, HASH | METHOD),                        // TPM_ALG_MGF1
+    (0x0008, HASH | OBJECT | SIGNING | ENCRYPTING), // TPM_ALG_KEYEDHASH
+    (0x000a, SYMMETRIC | HASH),                     // TPM_ALG_XOR
     (TPM_ALG_SHA256, HASH),
     (TPM_ALG_SHA384, HASH),
     (TPM_ALG_SHA512, HASH),
-    (0x0022, HASH | METHOD),          // TPM_ALG_KDF1_SP800_108
-    (0x0043, SYMMETRIC | ENCRYPTING), // TPM_ALG_CFB
+    (0x0014, ASYMMETRIC | SIGNING),    // TPM_ALG_RSASSA
+    (0x0015, ASYMMETRIC | ENCRYPTING), // TPM_ALG_RSAES
+    (0x0016, ASYMMETRIC | SIGNING),    // TPM_ALG_RSAPSS
+    (0x0017, ASYMMETRIC | ENCRYPTING), // TPM_ALG_OAEP
+    (0x0018, ASYMMETRIC | SIGNING),    // TPM_ALG_ECDSA
+    (0x0019, ASYMMETRIC | METHOD),     // TPM_ALG_ECDH
+    (0x0020, HASH | METHOD),           // TPM_ALG_KDF1_SP800_56A
+    (0x0022, HASH | METHOD),           // TPM_ALG_KDF1_SP800_108
+    (0x0023, ASYMMETRIC | OBJECT),     // TPM_ALG_ECC
+    (0x0025, OBJECT),                  // TPM_ALG_SYMCIPHER
+    (0x0043, SYMMETRIC | ENCRYPTING),  // TPM_ALG_CFB
 ];
 
 #[cfg(test)]

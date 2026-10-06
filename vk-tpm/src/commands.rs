@@ -9,9 +9,11 @@ use crate::entity::{HandleKind, TPM_RH_NULL};
 use crate::marshal::{Reader, Writer};
 use crate::pcr::{self, Startup};
 use crate::rc::{Rc, Result};
-use crate::state::{Saved, Shutdown};
-use crate::{LOCALITY, Out, Tpm, capability, hierarchy, object, session};
+use crate::session::SessionSlot;
+use crate::state::{ResetData, Saved, Shutdown, new_seed};
+use crate::{LOCALITY, Out, Tpm, capability, context, hierarchy, key, object, session, signing};
 
+pub const TPM_CC_EVICT_CONTROL: u32 = 0x120;
 pub const TPM_CC_HIERARCHY_CONTROL: u32 = 0x121;
 pub const TPM_CC_CHANGE_EPS: u32 = 0x124;
 pub const TPM_CC_CHANGE_PPS: u32 = 0x125;
@@ -19,6 +21,7 @@ pub const TPM_CC_CLEAR: u32 = 0x126;
 pub const TPM_CC_CLEAR_CONTROL: u32 = 0x127;
 pub const TPM_CC_HIERARCHY_CHANGE_AUTH: u32 = 0x129;
 pub const TPM_CC_PCR_ALLOCATE: u32 = 0x12b;
+pub const TPM_CC_CREATE_PRIMARY: u32 = 0x131;
 pub const TPM_CC_SET_PRIMARY_POLICY: u32 = 0x12e;
 pub const TPM_CC_DICTIONARY_ATTACK_LOCK_RESET: u32 = 0x139;
 pub const TPM_CC_DICTIONARY_ATTACK_PARAMETERS: u32 = 0x13a;
@@ -28,16 +31,37 @@ pub const TPM_CC_SEQUENCE_COMPLETE: u32 = 0x13e;
 pub const TPM_CC_SELF_TEST: u32 = 0x143;
 pub const TPM_CC_STARTUP: u32 = 0x144;
 pub const TPM_CC_SHUTDOWN: u32 = 0x145;
+pub const TPM_CC_STIR_RANDOM: u32 = 0x146;
+pub const TPM_CC_OBJECT_CHANGE_AUTH: u32 = 0x150;
+pub const TPM_CC_CREATE: u32 = 0x153;
+pub const TPM_CC_ECDH_ZGEN: u32 = 0x154;
+pub const TPM_CC_HMAC: u32 = 0x155;
+pub const TPM_CC_LOAD: u32 = 0x157;
+pub const TPM_CC_RSA_DECRYPT: u32 = 0x159;
+pub const TPM_CC_HMAC_START: u32 = 0x15b;
 pub const TPM_CC_SEQUENCE_UPDATE: u32 = 0x15c;
+pub const TPM_CC_SIGN: u32 = 0x15d;
+pub const TPM_CC_UNSEAL: u32 = 0x15e;
+pub const TPM_CC_CONTEXT_LOAD: u32 = 0x161;
+pub const TPM_CC_CONTEXT_SAVE: u32 = 0x162;
+pub const TPM_CC_ECDH_KEYGEN: u32 = 0x163;
 pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x165;
+pub const TPM_CC_LOAD_EXTERNAL: u32 = 0x167;
+pub const TPM_CC_READ_PUBLIC: u32 = 0x173;
+pub const TPM_CC_RSA_ENCRYPT: u32 = 0x174;
 pub const TPM_CC_START_AUTH_SESSION: u32 = 0x176;
+pub const TPM_CC_VERIFY_SIGNATURE: u32 = 0x177;
+pub const TPM_CC_ECC_PARAMETERS: u32 = 0x178;
 pub const TPM_CC_GET_CAPABILITY: u32 = 0x17a;
 pub const TPM_CC_GET_RANDOM: u32 = 0x17b;
+pub const TPM_CC_GET_TEST_RESULT: u32 = 0x17c;
 pub const TPM_CC_HASH: u32 = 0x17d;
 pub const TPM_CC_PCR_READ: u32 = 0x17e;
+pub const TPM_CC_READ_CLOCK: u32 = 0x181;
 pub const TPM_CC_PCR_EXTEND: u32 = 0x182;
 pub const TPM_CC_EVENT_SEQUENCE_COMPLETE: u32 = 0x185;
 pub const TPM_CC_HASH_SEQUENCE_START: u32 = 0x186;
+pub const TPM_CC_TEST_PARMS: u32 = 0x18a;
 
 type Run = fn(&mut Tpm, &[u32], &mut Reader, &mut Out) -> Result<()>;
 
@@ -45,8 +69,10 @@ pub struct Command {
     pub code: u32,
     /// The handle area, in order.
     pub handles: &'static [HandleKind],
-    /// Number of leading handles that need an authorization session (USER role).
+    /// Number of leading handles that need an authorization session.
     pub auth: usize,
+    /// The first of them takes the ADMIN role (else they all take the USER role).
+    pub admin: bool,
     /// It takes an authorization area (not TPM2_Startup).
     pub sessions: bool,
     /// A session may encrypt its first parameter, a TPM2B (DECRYPT_2).
@@ -70,6 +96,7 @@ impl Command {
             code,
             handles: &[],
             auth: 0,
+            admin: false,
             sessions: true,
             decrypt: false,
             encrypt: false,
@@ -86,6 +113,13 @@ impl Command {
         Command {
             handles,
             auth,
+            ..self
+        }
+    }
+
+    const fn admin(self) -> Command {
+        Command {
+            admin: true,
             ..self
         }
     }
@@ -152,6 +186,9 @@ use HandleKind as H;
 
 /// Every implemented command, by code.
 pub const COMMANDS: &[Command] = &[
+    Command::new(TPM_CC_EVICT_CONTROL, key::evict_control)
+        .handles(&[H::Provision, H::Object(false)], 1)
+        .nv(),
     Command::new(TPM_CC_HIERARCHY_CONTROL, hierarchy::hierarchy_control)
         .handles(&[H::Hierarchy], 1)
         .nv()
@@ -185,6 +222,11 @@ pub const COMMANDS: &[Command] = &[
         .handles(&[H::HierarchyPolicy], 1)
         .nv()
         .decrypt(),
+    Command::new(TPM_CC_CREATE_PRIMARY, key::create_primary)
+        .handles(&[H::HierarchyOrNull], 1)
+        .response_handle()
+        .decrypt()
+        .encrypt(),
     Command::new(
         TPM_CC_DICTIONARY_ATTACK_LOCK_RESET,
         hierarchy::dictionary_attack_lock_reset,
@@ -212,19 +254,82 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_SELF_TEST, self_test).nv(),
     Command::new(TPM_CC_STARTUP, startup).nv().no_sessions(),
     Command::new(TPM_CC_SHUTDOWN, shutdown).nv(),
+    Command::new(TPM_CC_STIR_RANDOM, stir_random).nv().decrypt(),
+    Command::new(TPM_CC_OBJECT_CHANGE_AUTH, key::object_change_auth)
+        .handles(&[H::Object(false), H::Object(false)], 1)
+        .admin()
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_CREATE, key::create)
+        .handles(&[H::Object(false)], 1)
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_ECDH_ZGEN, signing::ecdh_z_gen)
+        .handles(&[H::Object(false)], 1)
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_HMAC, object::hmac)
+        .handles(&[H::Object(false)], 1)
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_LOAD, key::load)
+        .handles(&[H::Object(false)], 1)
+        .response_handle()
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_RSA_DECRYPT, signing::rsa_decrypt)
+        .handles(&[H::Object(false)], 1)
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_HMAC_START, object::hmac_start_command)
+        .handles(&[H::Object(false)], 1)
+        .response_handle()
+        .decrypt(),
     Command::new(TPM_CC_SEQUENCE_UPDATE, object::sequence_update)
         .handles(&[H::Object(false)], 1)
         .decrypt(),
-    Command::new(TPM_CC_FLUSH_CONTEXT, object::flush_context).no_sessions(),
+    Command::new(TPM_CC_SIGN, signing::sign)
+        .handles(&[H::Object(false)], 1)
+        .decrypt(),
+    Command::new(TPM_CC_UNSEAL, key::unseal)
+        .handles(&[H::Object(false)], 1)
+        .encrypt(),
+    Command::new(TPM_CC_CONTEXT_LOAD, context::context_load)
+        .response_handle()
+        .no_sessions(),
+    Command::new(TPM_CC_CONTEXT_SAVE, context::context_save)
+        .handles(&[H::Context], 0)
+        .no_sessions(),
+    Command::new(TPM_CC_ECDH_KEYGEN, signing::ecdh_key_gen)
+        .handles(&[H::Object(false)], 0)
+        .encrypt(),
+    Command::new(TPM_CC_FLUSH_CONTEXT, context::flush_context).no_sessions(),
+    Command::new(TPM_CC_LOAD_EXTERNAL, key::load_external)
+        .response_handle()
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_READ_PUBLIC, key::read_public)
+        .handles(&[H::Object(false)], 0)
+        .encrypt(),
+    Command::new(TPM_CC_RSA_ENCRYPT, signing::rsa_encrypt)
+        .handles(&[H::Object(false)], 0)
+        .decrypt()
+        .encrypt(),
     Command::new(TPM_CC_START_AUTH_SESSION, session::start_auth_session)
         .handles(&[H::Object(true), H::Entity(true)], 0)
         .response_handle()
         .decrypt()
         .encrypt(),
+    Command::new(TPM_CC_VERIFY_SIGNATURE, signing::verify_signature)
+        .handles(&[H::Object(false)], 0)
+        .decrypt(),
+    Command::new(TPM_CC_ECC_PARAMETERS, signing::ecc_parameters),
     Command::new(TPM_CC_GET_CAPABILITY, capability::get_capability),
     Command::new(TPM_CC_GET_RANDOM, get_random).encrypt(),
+    Command::new(TPM_CC_GET_TEST_RESULT, get_test_result).encrypt(),
     Command::new(TPM_CC_HASH, object::hash).decrypt().encrypt(),
     Command::new(TPM_CC_PCR_READ, pcr_read),
+    Command::new(TPM_CC_READ_CLOCK, read_clock),
     Command::new(TPM_CC_PCR_EXTEND, pcr_extend)
         .handles(&[H::Pcr(true)], 1)
         .nv(),
@@ -239,6 +344,7 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_HASH_SEQUENCE_START, object::hash_sequence_start)
         .response_handle()
         .decrypt(),
+    Command::new(TPM_CC_TEST_PARMS, test_parms),
 ];
 
 pub fn find(code: u32) -> Option<&'static Command> {
@@ -298,15 +404,18 @@ fn startup(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> 
     // (enables, platform auth and policy).
     tpm.volatile.ph_enable = true;
     tpm.volatile.clear = match (&saved, kind) {
-        (Some(Saved { clear, .. }), Startup::Resume) => clear.clone(),
+        (Some(saved), Startup::Resume) => saved.clear.clone(),
         _ => Default::default(),
     };
     let saved_pcrs = saved.as_ref().map(|s| &s.pcrs);
     let allocation = &tpm.volatile.allocation;
     tpm.volatile.pcrs.startup(allocation, kind, saved_pcrs);
     tpm.volatile.pcr_reconfig = false;
+    if !orderly {
+        tpm.permanent.clock_safe = false;
+    }
+    tpm.startup_reset_data(kind, saved.map(|s| s.reset))?;
     tpm.volatile.objects.iter_mut().for_each(|o| *o = None);
-    tpm.volatile.sessions.iter_mut().for_each(|s| *s = None);
     tpm.volatile.exclusive_audit = None;
     tpm.volatile.orderly_startup = orderly;
     tpm.volatile.da_used = false;
@@ -326,10 +435,11 @@ fn shutdown(tpm: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()>
     tpm.volatile.da_used = false;
     tpm.permanent.shutdown_time = tpm.volatile.time;
     tpm.permanent.shutdown = if state {
-        Shutdown::State(Saved {
+        Shutdown::State(Box::new(Saved {
             pcrs: tpm.volatile.pcrs.save(),
             clear: tpm.volatile.clear.clone(),
-        })
+            reset: tpm.volatile.reset_data(),
+        }))
     } else {
         Shutdown::Clear
     };
@@ -350,6 +460,41 @@ fn get_random(_: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result<()>
     let mut bytes = vec![0; wanted.min(MAX_DIGEST)];
     getrandom::fill(&mut bytes).map_err(|_| Rc::FAILURE)?;
     w.tpm2b(&bytes);
+    Ok(())
+}
+
+/// TPM2_StirRandom: every random byte comes straight from the host's CSPRNG, which guest data
+/// cannot make better; the data is accepted and dropped (the reference mixes it into its own
+/// DRBG, which vk-tpm does not keep).
+fn stir_random(_: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> {
+    r.tpm2b(crate::public::MAX_SYM_DATA)
+        .map_err(|rc| rc.param(1))?;
+    end(r)
+}
+
+/// TPM2_GetTestResult: nothing to report, and every test passed.
+fn get_test_result(_: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result<()> {
+    end(r)?;
+    w.tpm2b(&[]).u32(Rc::SUCCESS.0);
+    Ok(())
+}
+
+/// TPM2_TestParms: whether the TPM takes these parameters (a TPMT_PUBLIC_PARMS): it does if
+/// they unmarshal.
+fn test_parms(_: &mut Tpm, _: &[u32], r: &mut Reader, _: &mut Out) -> Result<()> {
+    (|| {
+        let kind = crate::public::Type::read(r)?;
+        crate::public::Params::read(kind, r)
+    })()
+    .map_err(|rc| rc.param(1))?;
+    end(r)
+}
+
+/// TPM2_ReadClock: TPMS_TIME_INFO.
+fn read_clock(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result<()> {
+    end(r)?;
+    w.u64(tpm.volatile.time);
+    tpm.write_clock_info(w);
     Ok(())
 }
 
@@ -439,6 +584,45 @@ fn pcr_allocate(tpm: &mut Tpm, _: &[u32], r: &mut Reader, w: &mut Out) -> Result
 }
 
 impl Tpm {
+    /// What each kind of Startup does to STATE_RESET_DATA: a TPM Reset draws a new null
+    /// hierarchy and starts the counters and the sessions over; a Restart or a Resume brings
+    /// back what TPM2_Shutdown(STATE) saved (saved sessions included), and counts itself.
+    fn startup_reset_data(&mut self, kind: Startup, saved: Option<ResetData>) -> Result<()> {
+        let v = &mut self.volatile;
+        v.sessions.iter_mut().for_each(|s| *s = SessionSlot::Free);
+        match (kind, saved) {
+            (Startup::Restart | Startup::Resume, Some(saved)) => {
+                v.null_proof = saved.null_proof;
+                v.null_seed = saved.null_seed;
+                v.clear_count = saved.clear_count;
+                v.restart_count = saved.restart_count.wrapping_add(1);
+                if kind == Startup::Restart {
+                    v.clear_count = v.clear_count.wrapping_add(1);
+                }
+                v.object_context_id = saved.object_context_id;
+                v.context_counter = saved.context_counter;
+                for (i, sequence) in saved.saved_sessions {
+                    let slot = usize::try_from(i).ok().and_then(|i| v.sessions.get_mut(i));
+                    if let Some(slot) = slot {
+                        *slot = SessionSlot::Saved(sequence);
+                    }
+                }
+            }
+            _ => {
+                v.null_proof = new_seed().map_err(|_| Rc::FAILURE)?;
+                v.null_seed = new_seed().map_err(|_| Rc::FAILURE)?;
+                v.clear_count = 0;
+                v.restart_count = 0;
+                v.object_context_id = 0;
+                v.context_counter = context::FIRST_CONTEXT;
+                let p = &mut self.permanent;
+                p.reset_count = p.reset_count.wrapping_add(1);
+                p.total_reset_count = p.total_reset_count.wrapping_add(1);
+            }
+        }
+        Ok(())
+    }
+
     /// The PCR an extend goes to, None for TPM_RH_NULL, checked against the locality. Extending
     /// a PCR that TPM2_Shutdown(STATE) saved voids that saved state.
     pub fn pcr_to_extend(&mut self, handle: u32) -> Result<Option<usize>> {

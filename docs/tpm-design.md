@@ -1,9 +1,10 @@
 # vk-tpm: a TPM 2.0 in Rust
 
-Status: phases 1 and 2 are implemented: the engine skeleton, the first commands, sessions,
-hierarchies, the dictionary-attack protection, the PCR and hash commands. They were tested
-against libtpms. This document describes the target and the plan for getting there;
-[Deviations](#deviations-from-libtpms) lists where `vk-tpm` answers differently, on purpose.
+Status: phases 1 to 3 are implemented: the engine skeleton, sessions, hierarchies, the
+dictionary-attack protection, the PCR and hash commands, and objects: keys, primary keys,
+contexts, persistent objects, signing, RSA and ECDH. They were tested against libtpms. This
+document describes the target and the plan for getting there; [Deviations](#deviations-from-libtpms)
+lists where `vk-tpm` answers differently, on purpose.
 
 `vk-tpm` is to replace libtpms and the OpenSSL it computes with as the engine behind libkrun's
 TPM CRB device (`third_party/libkrun/src/devices/src/legacy/x86_64/tpm.rs`). Those are ~300k
@@ -41,6 +42,10 @@ attestation):**
 | Hierarchy, DA | HierarchyControl, HierarchyChangeAuth, ChangeEPS, ChangePPS, Clear, ClearControl, SetPrimaryPolicy, DictionaryAttackLockReset, DictionaryAttackParameters |
 | Objects | CreatePrimary, Create, CreateLoaded, Load, LoadExternal, ReadPublic, ObjectChangeAuth, Unseal, EvictControl, FlushContext, ContextSave, ContextLoad |
 | Crypto | Sign, VerifySignature, RSA_Encrypt, RSA_Decrypt, ECDH_KeyGen, ECDH_ZGen, ECC_Parameters, HMAC, Hash, HashSequenceStart, HMAC_Start, SequenceUpdate, SequenceComplete, EventSequenceComplete, EncryptDecrypt(2) |
+
+TPM2_HMAC and TPM2_HMAC_Start are TPM2_MAC and TPM2_MAC_Start in libtpms (the same codes and
+wire format, a MAC scheme where a hash was); `vk-tpm` takes the same parameters, with an HMAC
+only.
 | Sessions, policy | StartAuthSession, PolicyRestart, PolicyPCR, PolicyAuthValue, PolicyPassword, PolicyOR, PolicySecret, PolicySigned, PolicyCommandCode, PolicyGetDigest, PolicyAuthorize, PolicyNV, PolicyLocality, PolicyCpHash, PolicyNameHash |
 | Attestation | Quote, Certify, CertifyCreation, GetTime, GetSessionAuditDigest, ActivateCredential, MakeCredential |
 | NV | NV_DefineSpace, NV_UndefineSpace, NV_UndefineSpaceSpecial, NV_ReadPublic, NV_Read, NV_Write, NV_Increment, NV_Extend, NV_SetBits, NV_WriteLock, NV_ReadLock, NV_GlobalWriteLock, NV_ChangeAuth |
@@ -89,13 +94,41 @@ over `aes`. They are added only when a phase needs them:
 - phase 1: `sha1`, `sha2`, `getrandom`, `subtle` (constant-time comparison), `zeroize`
   (wiping secrets).
 - phase 2: `hmac`, `aes`, `cfb-mode`.
-- phase 3: `rsa`, `p256`, `ecdsa`.
+- phase 3: `rsa` 0.10.0-rc (the release candidate russh already uses, on constant-time
+  `crypto-bigint` 0.7; `hazmat` for raw RSA), `p256` 0.14 and `ecdsa` 0.17 (ECDSA, the hedged
+  RFC 6979 nonce, and the curve arithmetic ECDH needs), `crypto-bigint` and `crypto-primes` (the
+  primary keys' derivations, below: both are what `rsa` computes with), `getrandom`'s `sys_rng`
+  (the host's CSPRNG as a `rand_core` RNG: RSA blinding, ECDSA nonces). `sha1`/`sha2` gain their
+  `oid` feature (the DigestInfo of PKCS#1 v1.5 signatures).
 
-The `rsa` crate carries RUSTSEC-2023-0071 (Marvin: timing in PKCS#1 v1.5 decryption), which
-`.cargo/audit.toml` already suppresses for russh. A TPM decrypts guest-chosen ciphertexts with
-its EK (ActivateCredential, salted sessions), so phase 3 must either use an `rsa` release built
-on constant-time `crypto-bigint`, or blind the private operation and confirm it with timing
-tests. This is an open item.
+### RSA and the Marvin attack
+
+The `rsa` crate carries RUSTSEC-2023-0071 (Marvin: timing in RSA decryption). It matters here: a
+TPM decrypts guest-chosen ciphertexts. An EK (a restricted decryption key) does so without any
+authorization, for TPM2_StartAuthSession's salt (and phase 4's ActivateCredential), always with
+OAEP; an unrestricted key the caller is authorized to use does with TPM2_RSA_Decrypt, with any
+padding, raw RSA included. The decision:
+
+- `rsa` 0.10.0-rc on `crypto-bigint` 0.7, which carries the upstream fixes the advisory waits on
+  (constant-time modular exponentiation, constant-time padding checks; issue #626, PR #680), not
+  0.9 on `num-bigint-dig`.
+- Every private-key operation is blinded (signatures included), on top of the constant-time
+  exponentiation.
+- OAEP is decoded in constant time, and all its failures (first byte, label hash, separator)
+  are one response code, TPM_RC_VALUE, after the same work: no Manger oracle. This is the EK's
+  path.
+- PKCS#1 v1.5 (RSAES) decryption uses implicit rejection (draft-irtf-cfrg-rsa-guidance), as
+  OpenSSL 3.2+ does, so libtpms too: a malformed ciphertext decrypts to a message derived from
+  the private exponent and the ciphertext, the same one every time, and never to an error. No
+  Bleichenbacher oracle, not even in the result. `vk-tpm`'s synthetic messages are OpenSSL's, byte
+  for byte (the differential tests compare them), which needs the private exponent libtpms gives
+  OpenSSL: d modulo λ(n) from 2048 bits with e above 2^16, modulo φ(n) otherwise.
+- `decryption_time_does_not_depend_on_the_padding` (ignored by default; run optimized) times
+  valid against invalid ciphertexts, interleaved: on the dev VM the medians of RSA-2048
+  decryptions differ by 0.01% (OAEP) and 0.00% (RSAES), at ~2.6 ms each.
+
+`.cargo/audit.toml` keeps the advisory suppressed, with this reasoning, until `rsa` 0.10 is
+released.
 
 ## Architecture
 
@@ -105,13 +138,23 @@ vk-tpm/src/
   marshal.rs     Reader/Writer: bounds-checked big-endian wire format, TPM2B, TPML counts
   rc.rs          TPM_RC values; handle/parameter/session numbering of format-one codes
   alg.rs         implemented algorithms (TPM_CAP_ALGS), hash dispatch, serializable hash state
-  crypt.rs       HMAC, KDFa, XOR obfuscation, AES-CFB, over RustCrypto
+  crypt.rs       HMAC, KDFa, KDFe, XOR obfuscation, AES-CFB, over RustCrypto
   entity.rs      handles: interface types, load status, Names, authValues, authPolicies
   session.rs     sessions; the authorization area: cpHash/rpHash, HMACs, parameter encryption,
                  audit; StartAuthSession
   hierarchy.rs   hierarchy auths, policies, proofs, enables; dictionary-attack logic; the
                  hierarchy and DA commands
-  object.rs      transient object slots; hash and event sequences, TPM2_Hash, FlushContext
+  object.rs      transient object slots, persistent objects copied in for a command; hash, HMAC
+                 and event sequences, TPM2_Hash, TPM2_HMAC
+  public.rs      TPMT_PUBLIC, TPMT_SENSITIVE: wire format, Names, attribute and scheme checks
+  key.rs         loaded keys; primary and ordinary object creation, the object commands,
+                 EvictControl, salt and credential decryption
+  protection.rs  a child wrapped under its parent (Create/Load), the checks before loading
+  asym.rs        RSA and ECC P-256 over RustCrypto: key generation, signatures, encryption,
+                 ECDH, implicit rejection
+  drbg.rs        the reference implementation's CTR_DRBG, which primary keys derive from
+  signing.rs     Sign, VerifySignature, RSA_Encrypt/Decrypt, ECDH_KeyGen/ZGen, ECC_Parameters
+  context.rs     ContextSave, ContextLoad, FlushContext; saved sessions and the context gap
   pcr.rs         PCR banks, PC Client attributes, startup/save/extend/reset/read
   state.rs       Permanent / Volatile state, versioned serialization
   commands.rs    command table (code, handle kinds, auth count, TPMA_CC, parameter encryption)
@@ -119,8 +162,7 @@ vk-tpm/src/
   capability.rs  TPM2_GetCapability
 ```
 
-Later phases grow `object.rs` (TPMT_PUBLIC/SENSITIVE, protection, primaries) and add
-`context.rs`, `nv.rs` and `policy.rs`.
+Later phases add `nv.rs`, `policy.rs` and `attest.rs`.
 
 Command processing follows Part 3's order exactly, because the response code a guest sees for
 a malformed command depends on it:
@@ -141,10 +183,28 @@ A command parses all its parameters before it acts, so a refused command changes
 except that a failed authorization counts against the dictionary-attack protection before the
 parameters are read, as in the reference implementation.
 
-**Determinism.** Each primary key derives from its hierarchy's seed through KDFa, keyed by the
-template. RSA primaries use a DRBG seeded the same way, so a TPM recreates the same EK/SRK
-every boot. The RSA prime search is ours, so our primaries will not equal libtpms' even from
-identical seeds; libtpms' own algorithm is `SEED_COMPAT_LEVEL`-specific.
+**Determinism.** The same primary key is recreated from its hierarchy's seed and template
+every boot. As in the reference implementation (`DRBG_InstantiateSeeded`), a CTR_DRBG
+(AES-256) is seeded through the reference's own derivation function with the seed, "Primary
+Object Creation", the template's Name and the caller's sensitive data; an endorsement key's
+generator also takes the storage and endorsement proofs before its seed is drawn. Every value
+is drawn as the reference draws it:
+
+- an ECC private key: 40 bytes, reduced modulo n - 1, plus one (FIPS 186-4 B.4.1);
+- a keyed hash's or a symmetric key's secret: the digest or key size;
+- then the seed that protects a parent's children (and makes a symmetric object's unique).
+
+So `vk-tpm`'s ECC, keyed-hash and symmetric primaries are the very keys libtpms derives from
+the same seeds: the differential tests compare them byte for byte (outPublic, creation data,
+ticket, Name), and load each other's wrapped children.
+
+RSA primaries are not: the reference sieves for primes in a way that depends on its
+`SEED_COMPAT_LEVEL`. `vk-tpm`'s prime search is its own, defined by the arithmetic alone so that
+a crate upgrade cannot change an EK: each prime is the first one at or above a candidate drawn
+from the generator (its top two bits and low bit set, so the modulus has exactly its size) that
+is not 1 modulo the exponent, found by sieving with small primes and testing with Baillie-PSW
+(`crypto-primes`); |p - q| must exceed 2^(bits/2 - 100). Non-primary keys run the same code
+from a generator seeded with 64 bytes of host entropy.
 
 ## Engine interface (what libkrun's device calls)
 
@@ -184,14 +244,27 @@ refuses an unknown version, a short blob or trailing bytes.
   endorsement proofs; disableClear; the PCR allocation from the next power on; the DA
   parameters, failed-tries counter and whether lockoutAuth may be tried; the last shutdown
   (none, none with a DA-protected authorization since, CLEAR, or STATE with the saved PCRs,
-  their update counter, the enables and the platform authorization) and TPM time at that
-  shutdown. Later phases add persistent objects, NV indices, the clock, and the reset/restart
-  counters.
+  their update counter, the enables and the platform authorization, and what a restart or a
+  resume keeps: the null hierarchy's proof and seed, the clear and restart counts, the context
+  counters and the saved sessions) and TPM time at that shutdown; the persistent objects (at
+  most 16); resetCount and totalResetCount; Clock and whether it is safe. Later phases add NV
+  indices.
 - **Volatile** (`VKTPM-V\0`): whether Startup ran, whether it followed an orderly shutdown;
   TPM time and the DA timers; the hierarchy enables and the platform authorization; the PCR
-  allocation in use; the PCRs and their update counter; the object slots (hash and event
-  sequences, with their hash state); the sessions and which one audits exclusively. Later
-  phases add keys and the context counter.
+  allocation in use; the PCRs and their update counter; the object slots (keys, and hash, HMAC
+  and event sequences with their hash state); the session handles (free, a loaded session, or
+  a saved session's context sequence number) and which session audits exclusively; the null
+  hierarchy's proof and seed; the clear and restart counts; the context counters.
+
+A stored key contains its public and sensitive areas (the TPM's wire format), Name,
+qualified name, hierarchy and flags. Its RSA private key is rebuilt from its prime when the
+state is read, never stored.
+
+Clock (TPM2_ReadClock) is in the permanent state, but a change to Clock alone does not mark it
+changed (`take_permanent_changed`): it is stored with the next real change, as libtpms does.
+Clock is safe again (and would be written to NV by the reference) each time it crosses a 2^12
+ms boundary; a startup that does not follow an orderly shutdown makes it unsafe, since the
+stored value may be behind one reported.
 
 The version is bumped when a field is added; the reader accepts every older version and fills
 the new fields with what a TPM upgraded from that version would have. A snapshot is restored
@@ -201,7 +274,19 @@ place.
 
 A sequence's hash state is serialized as RustCrypto's `SerializableState` gives it (block
 state, length, buffered bytes). That format belongs to the `sha1`/`sha2` crates: an upgrade
-that changes it must bump the state version.
+that changes it must bump the state version. An HMAC sequence is kept as RFC 2104 has it (the
+inner hash, started with the key XOR ipad, and the padded key), since `hmac`'s state does not
+serialize.
+
+**Contexts.** A context (TPM2_ContextSave) holds the object or session as the volatile state
+serializes it, after its sequence number, encrypted with AES-256-CFB under KDFa(SHA-512, the
+hierarchy's proof, "CONTEXT", sequence, handle ‖ totalResetCount), with an HMAC-SHA512 under the proof over
+totalResetCount, clearCount for an stClear object, the sequence, the handle and the ciphertext
+(Part 1 30.3.2). No context loads after a TPM Reset (and a temporary object's never, the null
+proof being new), nor an stClear object's after a Restart. The blob is `vk-tpm`'s own; around it
+(sequence numbers, saved handles, hierarchies, the context gap, saved sessions keeping their
+handles across a Restart) everything is the reference's. Windows pads TPM2_ContextLoad to
+TPM_PT_MAX_OBJECT_CONTEXT; libtpms takes the padding, and so does `vk-tpm`.
 
 **No migration from libtpms.** libtpms' blob is its internal NV layout, so converting it would
 mean parsing `NVMarshal.c`'s format, including its seeds. A machine that switches engines gets
@@ -222,7 +307,7 @@ Where `vk-tpm` answers differently from libtpms, on purpose (the differential te
 - **Not implemented** (yet, or out of scope): those commands are TPM_RC_COMMAND_CODE, and
   absent from TPM_CAP_COMMANDS; the algorithms are absent from TPM_CAP_ALGS. In
   TPM2_StartAuthSession, TDES, Camellia and SM4 are TPM_RC_SYMMETRIC, where libtpms'
-  `default-v1` profile accepts them; a `tpmKey` is necessarily a sequence, so TPM_RC_KEY.
+  `default-v1` profile accepts them.
 - **A failed Startup(STATE) keeps a pending DA failure.** libtpms clears its "DA used" mark
   before it checks the startup type, so the Startup(CLEAR) that follows forgets the failure
   it should count; `vk-tpm` refuses the command without changing anything.
@@ -231,13 +316,37 @@ Where `vk-tpm` answers differently from libtpms, on purpose (the differential te
   power after it counts nothing; `vk-tpm` marks it, and counts the failure.
 - **Persistence.** `vk-tpm` reports every change to the permanent state; libtpms skips writing
   a disabled lockoutAuth when lockoutRecovery is 0 (the next Startup re-enables it anyway).
+- **Algorithms of phase 3.** Only NIST P-256: another curve is TPM_RC_CURVE where it is
+  unmarshalled (libtpms' `default-v1` takes P-192 to P-521, BN-256/638, SM2), in
+  TPM2_ECC_Parameters and TPM2_TestParms too; TDES, Camellia and SM4 keys are
+  TPM_RC_SYMMETRIC. Schemes `vk-tpm` cannot run are taken as identifiers, as libtpms takes them,
+  and fail where they would be used: signing or verifying with ECDAA, EC-Schnorr or SM2 is
+  TPM_RC_SCHEME, and so is a CMAC (TPM2_MAC/MAC_Start with a symmetric key).
+- **RSA primaries** are other keys than libtpms' from the same seeds (see Determinism).
+- **Contexts** are `vk-tpm`'s blobs, of other sizes than libtpms'. Their key and IV also
+  derive from totalResetCount, which the reference leaves out: its key and IV repeat once the
+  sequence numbers start over after a TPM Reset.
+- **TPM2_Clear deletes the owner's and the endorsement's persistent objects**, as Part 3
+  says; libtpms keeps them (its NvFlushHierarchy does not find their hierarchy).
+- **TPM_PT_HR_PERSISTENT_AVAIL**: `vk-tpm` keeps at most 16 persistent objects; libtpms as many
+  as its NV holds.
+- **TPM2_StirRandom** takes the data and drops it: every random byte comes from the host's
+  CSPRNG, which guest data cannot make better (libtpms mixes it into its own DRBG).
+- **An RSA public key with an even exponent** cannot encrypt (RSAES, OAEP: TPM_RC_FAILURE);
+  `rsa` refuses one. No TPM-made key has one.
 
 Quirks of the reference implementation that `vk-tpm` keeps, so it answers the same:
 TPM2_PCR_Allocate takes effect at the next power on and TPM2_Clear drops a pending one
 (libtpms rewrites its whole PERSISTENT_DATA there); a PCR not allocated keeps its value
 through a Startup; TPM2_DictionaryAttackParameters leaves failedTries alone; XOR parameter
 obfuscation uses the session's hash, not the one its TPMT_SYM_DEF names; a session's first
-audit unbinds it.
+audit unbinds it. And from phase 3: TPM2_Create answers TPM_RC_OBJECT_MEMORY when every slot is
+taken, though it loads nothing; a persistent object a command names takes a slot for the
+command (so a child loaded under a persistent parent gets the next slot's handle); a creation
+ticket for the null hierarchy is an HMAC with the null proof; TPM2_RSA_Encrypt answers
+TPM_RC_FAILURE for a message too long for its padding (OpenSSL's error); RSAES decryption never
+fails on padding (implicit rejection); the platform may remove an owner's persistent object;
+TPM2_Clear also starts Clock over.
 
 ## Security
 
@@ -250,19 +359,25 @@ audit unbinds it.
   Secret-dependent crypto is left to RustCrypto's constant-time implementations; the RSA
   caveat is above.
 - **Secrets.** Seeds and proofs are `Zeroizing<[u8; 64]>`; authValues, session keys, HMAC
-  keys and KDF outputs are `Zeroizing`, and so are both serialized states. Later phases do the
-  same for sensitive areas and private keys.
-- **Entropy.** It comes from `getrandom`, the host's CSPRNG, for seeds, nonces and GetRandom.
-  StirRandom will mix guest input into a DRBG of our own (HMAC-DRBG), never replacing host
-  entropy.
+  keys and KDF outputs are `Zeroizing`, and so are both serialized states, sensitive areas
+  (authValue, seed, secret), wrapped and decrypted buffers, and the primary-key DRBG's state.
+  `rsa`'s private keys wipe themselves; the prime search wipes its rejected candidates (the
+  sieve's internal state is `crypto-primes`').
+- **Entropy.** It comes from `getrandom`, the host's CSPRNG, for seeds, nonces, GetRandom,
+  the secrets of ordinary objects, IVs, RSA blinding and ECDSA's hedged nonces. StirRandom
+  changes nothing (see Deviations).
+- **RSA** private operations are blinded and constant time, their decryption paddings too: see
+  "RSA and the Marvin attack".
 - **DA logic** follows `DA.c` and `SessionProcess.c`, with libtpms' build switches
   (`USE_DA_USED`, `ACCUMULATE_SELF_HEAL_TIMER`). A failure on a DA-protected entity, or
   through a session bound to one, counts; a non-orderly startup counts one failure if a
   DA-protected authValue was used since the last Startup; a failed lockoutAuth disables it
   until lockoutRecovery passes (or the next Startup, when that is 0). Failures are counted in
   the permanent state before the response leaves, so a guest cannot roll the counter back by
-  crashing the VM. So far lockout is the only DA-protected entity: hierarchies, PCRs and
-  sequences are exempt; objects come in phase 3.
+  crashing the VM. In phase 2, lockout is the only DA-protected entity: hierarchies, PCRs and
+  sequences are exempt; a key is unless it has noDA. A key's authValue serves the USER role
+  only with userWithAuth, the ADMIN role only without adminWithPolicy (a policy session is
+  then required: TPM_RC_AUTH_TYPE, and TPM_RC_POLICY_FAIL until PolicyCommandCode exists).
 - **Response size.** A response that would exceed the buffer is `TPM_RC_FAILURE`, never
   truncated.
 
@@ -302,12 +417,28 @@ audit unbinds it.
      decrypted the responses and compared them. This cross-checked KDFa, XOR and AES-CFB
      parameter encryption, cpHash/rpHash, bound, policy and audit sessions.
    - Randomized outputs are cross-verified instead: ECDSA/PSS signatures are verified by the
-     other engine, and OAEP ciphertexts are decrypted by the other.
+     other engine, and OAEP/RSAES ciphertexts are decrypted by the other.
+   - Objects (`tests/objects`): ECC, keyed-hash and symmetric primaries of every hierarchy are
+     compared byte for byte (with outside info, PCRs and a sealed secret in the creation
+     data); RSA primaries by shape, each engine's signature verified by the other. Children
+     each engine creates under the shared ECC storage key are loaded by both (sealed data,
+     HMAC, ECDSA, storage and RSA-1024 keys), re-wrapped by ObjectChangeAuth and loaded again;
+     tampered blobs are refused alike. A fixed RSA-2048 key (TPM2_LoadExternal) gives
+     identical RSASSA signatures, raw RSA and RSAES implicit-rejection results; a fixed P-256
+     key identical ECDH. Contexts are compared by header and by what loading them answers
+     (objects, sessions, gap, restart, reset); persistent objects by handle lists and the
+     slots they take; salted sessions (RSA-OAEP and ECDH salts) by the client checking each
+     TPM's HMACs; templates, LoadExternal inputs and object authorization (roles, DA,
+     bound and policy sessions) by response code. Values captured from libtpms this way stay
+     in `vk-tpm`'s own tests: the ECC and keyed-hash primaries of fixed seeds, and an RSAES
+     implicit-rejection result.
    - A **mutation pass** flips bits in a corpus of well-formed commands with a fixed-seed
-     xorshift: 60k commands over every implemented command, sessions included, on seeded
-     TPMs (re-seeded after a mutation that changes the seeds, and every 3000 commands). It
-     compares both answers wherever the command is one `vk-tpm` implements, by shape where
-     a session's nonce is in it.
+     xorshift: 60k commands over every implemented command, sessions and objects included, on
+     seeded TPMs (re-seeded after a mutation that changes the seeds, after an RSA primary,
+     and every 3000 commands). It compares both answers wherever the command is one `vk-tpm`
+     implements, by shape where a session's nonce or a random value is in it (a context by its
+     header), and skips an algorithm `vk-tpm` does not implement (re-seeding if libtpms made a
+     key of it).
 3. **TPM 2.0 test suites** over a socket. A small `vk-tpm` binary (test-only) will serve the
    MS simulator protocol: port 2321 for commands, 2322 for platform signals (power, NV,
    cancel). It runs:
@@ -330,6 +461,6 @@ audit unbinds it.
 |---|---|---|
 | 1 | **Done.** Crate, marshalling, RCs, state format; Startup, Shutdown, SelfTest, GetCapability, GetRandom, PCR_Read, PCR_Extend; password sessions; the libtpms differential harness (ran at tag `vk-tpm-differential`, not kept) | ~3 kLoC, half of it tests |
 | 2 | **Done.** StartAuthSession (unsalted; bound or not; HMAC, policy, trial), HMAC sessions, cpHash/rpHash/names, parameter encryption (AES-CFB, XOR), audit sessions, KDFa, DA logic, HierarchyControl, HierarchyChangeAuth, SetPrimaryPolicy, Clear, ClearControl, ChangeEPS, ChangePPS, DictionaryAttackLockReset/Parameters, PCR_Allocate/Reset/Event, Hash, hash and event sequences, FlushContext | ~4 kLoC, a third of it tests |
-| 3 | Objects: TPMT_PUBLIC/SENSITIVE, protection (symmetric + integrity), CreatePrimary (deterministic), Create/Load/ReadPublic/Unseal/ObjectChangeAuth/LoadExternal, contexts (ContextSave/Load/Flush, EvictControl), Sign/Verify, RSA_Encrypt/Decrypt, ECDH, EncryptDecrypt. Moved from phase 2, as they need keys: RSA/ECC-salted sessions (with KDFe), HMAC_Start and HMAC sequences, TestParms; and StirRandom, GetTestResult, ReadClock (with the clock and reset counters in the state) | ~5.5 kLoC |
-| 4 | NV indices (all types and attributes), the policy commands, attestation (Quote, Certify*, GetTime, audit digests, Make/ActivateCredential), EK provisioning at manufacture (EK at 0x81010001 and an EK certificate in 0x01C00002, signed by a per-host virtkit CA) | ~4 kLoC |
+| 3 | **Done.** Objects: TPMT_PUBLIC/SENSITIVE, protection (symmetric + integrity), CreatePrimary (deterministic), Create/Load/ReadPublic/Unseal/ObjectChangeAuth/LoadExternal, contexts (ContextSave/Load/Flush, saved sessions), EvictControl, Sign/VerifySignature, RSA_Encrypt/Decrypt, ECDH_KeyGen/ZGen, ECC_Parameters, RSA/ECC-salted sessions (with KDFe), HMAC/HMAC_Start and HMAC sequences, TestParms, StirRandom, GetTestResult, ReadClock (with Clock and the reset counters in the state) | ~6.5 kLoC, 40% of it tests |
+| 4 | NV indices (all types and attributes), the policy commands (PolicyCommandCode then lets a policy session take the ADMIN role), attestation (Quote, Certify*, GetTime, audit digests, Make/ActivateCredential), EK provisioning at manufacture (EK at 0x81010001 and an EK certificate in 0x01C00002, signed by a per-host virtkit CA). Left over from phase 3: CreateLoaded, EncryptDecrypt(2) | ~4.5 kLoC |
 | 5 | Integration: libkrun device on `vk-tpm`, MS-simulator socket server and the IBM TSS / tpm2-tools runs, fuzzing, Windows and Linux guest validation, removal of libtpms | ~1.5 kLoC + validation |
