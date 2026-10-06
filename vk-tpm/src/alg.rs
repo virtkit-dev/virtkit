@@ -159,22 +159,29 @@ const METHOD: u32 = 1 << 10;
 
 /// TPM_CAP_ALGS: each implemented algorithm and its TPMA_ALGORITHM (as libtpms has it), in
 /// TPM_ALG_ID order. Only what the TPM actually implements: a client picks from this list.
-/// AES only in CFB mode (parameter encryption, the protection of objects); KDFa (SP 800-108)
-/// as the sessions and the protection use it.
-pub const IMPLEMENTED: [(u16, u32); 13] = [
+/// AES only in CFB mode (parameter encryption, the protection of objects and contexts); MGF1
+/// and the KDFs as OAEP, PSS, KDFe and KDFa use them.
+pub const IMPLEMENTED: [(u16, u32); 20] = [
     (0x0001, ASYMMETRIC | OBJECT), // TPM_ALG_RSA
     (TPM_ALG_SHA1, HASH),
     (0x0005, HASH | SIGNING),                       // TPM_ALG_HMAC
     (0x0006, SYMMETRIC),                            // TPM_ALG_AES
+    (0x0007, HASH | METHOD),                        // TPM_ALG_MGF1
     (0x0008, HASH | OBJECT | SIGNING | ENCRYPTING), // TPM_ALG_KEYEDHASH
     (0x000a, SYMMETRIC | HASH),                     // TPM_ALG_XOR
     (TPM_ALG_SHA256, HASH),
     (TPM_ALG_SHA384, HASH),
     (TPM_ALG_SHA512, HASH),
-    (0x0022, HASH | METHOD),          // TPM_ALG_KDF1_SP800_108
-    (0x0023, ASYMMETRIC | OBJECT),    // TPM_ALG_ECC
-    (0x0025, OBJECT),                 // TPM_ALG_SYMCIPHER
-    (0x0043, SYMMETRIC | ENCRYPTING), // TPM_ALG_CFB
+    (0x0014, ASYMMETRIC | SIGNING),    // TPM_ALG_RSASSA
+    (0x0015, ASYMMETRIC | ENCRYPTING), // TPM_ALG_RSAES
+    (0x0016, ASYMMETRIC | SIGNING),    // TPM_ALG_RSAPSS
+    (0x0017, ASYMMETRIC | ENCRYPTING), // TPM_ALG_OAEP
+    (0x0018, ASYMMETRIC | SIGNING),    // TPM_ALG_ECDSA
+    (0x0019, ASYMMETRIC | METHOD),     // TPM_ALG_ECDH
+    (0x0022, HASH | METHOD),           // TPM_ALG_KDF1_SP800_108
+    (0x0023, ASYMMETRIC | OBJECT),     // TPM_ALG_ECC
+    (0x0025, OBJECT),                  // TPM_ALG_SYMCIPHER
+    (0x0043, SYMMETRIC | ENCRYPTING),  // TPM_ALG_CFB
 ];
 
 #[cfg(test)]

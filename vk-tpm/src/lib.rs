@@ -34,6 +34,7 @@ mod pcr;
 mod public;
 mod rc;
 mod session;
+mod signing;
 mod state;
 
 use std::time::Instant;
@@ -299,7 +300,7 @@ impl Clock {
 
 /// A TPM_ST the reference implementation knows: a command with another one is TPM_RC_BAD_TAG,
 /// one with an unknown tag TPM_RC_VALUE (as libtpms answers).
-fn is_structure_tag(tag: u16) -> bool {
+pub(crate) fn is_structure_tag(tag: u16) -> bool {
     matches!(tag, 0x00c4 | 0x8000..=0x8002 | 0x8014..=0x801a | 0x8021..=0x8025)
 }
 

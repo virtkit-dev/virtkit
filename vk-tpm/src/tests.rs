@@ -139,9 +139,14 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_CREATE_PRIMARY | TPM_CC_CREATE => &create,
             TPM_CC_LOAD => &load,
             TPM_CC_LOAD_EXTERNAL => &load_external,
-            TPM_CC_READ_PUBLIC | TPM_CC_UNSEAL | TPM_CC_CONTEXT_SAVE => &[],
+            TPM_CC_READ_PUBLIC | TPM_CC_UNSEAL | TPM_CC_CONTEXT_SAVE | TPM_CC_ECDH_KEYGEN => &[],
             TPM_CC_OBJECT_CHANGE_AUTH => &[0, 0],
             TPM_CC_CONTEXT_LOAD => &context,
+            TPM_CC_SIGN => &[0, 0, 0, 0x10, 0x80, 0x24, 0x40, 0, 0, 7, 0, 0],
+            TPM_CC_VERIFY_SIGNATURE => &[0, 0, 0, 0x10],
+            TPM_CC_RSA_ENCRYPT | TPM_CC_RSA_DECRYPT => &[0, 0, 0, 0x10, 0, 0],
+            TPM_CC_ECDH_ZGEN => &[0, 4, 0, 0, 0, 0],
+            TPM_CC_ECC_PARAMETERS => &[0, 3],
             TPM_CC_GET_CAPABILITY => &[0, 0, 0, 6, 0, 0, 1, 0, 0, 0, 0, 1],
             TPM_CC_GET_RANDOM | TPM_CC_STARTUP | TPM_CC_SHUTDOWN => &[0, 0],
             TPM_CC_SELF_TEST | TPM_CC_CLEAR_CONTROL => &[1],
@@ -1056,6 +1061,42 @@ fn a_sealed_object_round_trips_through_its_parent() {
     load.tpm2b(&tampered).tpm2b(public);
     let load = command(TPM_CC_LOAD, &[srk], Some(b""), &load.into_bytes());
     assert_eq!(rc(&tpm.process(&load)), Rc::INTEGRITY.param(1).0);
+}
+
+#[test]
+fn hmac_signatures_verify_and_get_a_ticket() {
+    let mut tpm = started();
+    let key = handle_of(&create_primary(&mut tpm, TPM_RH_OWNER, &hmac_key()));
+    let digest = alg::Hash::Sha256.digest(&[b"m"]);
+    let mut p = Writer::new();
+    p.tpm2b(&digest).u16(alg::TPM_ALG_NULL);
+    p.u16(object::TPM_ST_HASHCHECK).u32(TPM_RH_NULL).tpm2b(&[]);
+    let r = tpm.process(&command(TPM_CC_SIGN, &[key], Some(b""), &p.into_bytes()));
+    let signature = response_params(&r, false).to_vec();
+    // TPMT_SIGNATURE: HMAC, SHA-256, the HMAC.
+    assert_eq!(signature[..4], [0, 5, 0, 0x0b]);
+    let mut p = Writer::new();
+    p.tpm2b(&digest).bytes(&signature);
+    let r = tpm.process(&command(
+        TPM_CC_VERIFY_SIGNATURE,
+        &[key],
+        None,
+        &p.into_bytes(),
+    ));
+    assert_eq!(rc(&r), 0);
+    // TPMT_TK_VERIFIED for the owner.
+    assert_eq!(r[10..16], [0x80, 0x22, 0x40, 0, 0, 1]);
+    let mut bad = signature.clone();
+    bad[10] ^= 1;
+    let mut p = Writer::new();
+    p.tpm2b(&digest).bytes(&bad);
+    let r = tpm.process(&command(
+        TPM_CC_VERIFY_SIGNATURE,
+        &[key],
+        None,
+        &p.into_bytes(),
+    ));
+    assert_eq!(rc(&r), Rc::SIGNATURE.param(2).0);
 }
 
 #[test]

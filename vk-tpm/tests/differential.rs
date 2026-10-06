@@ -1794,6 +1794,19 @@ fn mutated_commands_match() {
             .map(|b| u32::from_be_bytes(b.try_into().unwrap()));
         // A command code libtpms implements and vk-tpm does not yet: a different answer.
         let ours_unknown = rc(&ours) == 0x143 && rc(&theirs) != 0x143;
+        // An algorithm or a curve vk-tpm does not implement (refused when unmarshalled, or a
+        // scheme it cannot run): libtpms may take it. A key libtpms made of it alone would set
+        // the two apart: start again.
+        let base = rc(&ours) & 0x0bf;
+        let unimplemented = rc(&ours) != rc(&theirs)
+            && (matches!(base, 0x096 | 0x0a6) || (base == 0x092 && rc(&theirs) == 0));
+        if unimplemented {
+            if rc(&theirs) == 0 {
+                drop(both);
+                both = Both::seeded();
+            }
+            continue;
+        }
         // GetCapability for a capability vk-tpm reports differently (or not yet).
         let capability = c.get(c.len().saturating_sub(12)..c.len().saturating_sub(8));
         let other_capability =

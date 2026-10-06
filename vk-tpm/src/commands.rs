@@ -11,7 +11,7 @@ use crate::pcr::{self, Startup};
 use crate::rc::{Rc, Result};
 use crate::session::SessionSlot;
 use crate::state::{ResetData, Saved, Shutdown, new_seed};
-use crate::{LOCALITY, Out, Tpm, capability, context, hierarchy, key, object, session};
+use crate::{LOCALITY, Out, Tpm, capability, context, hierarchy, key, object, session, signing};
 
 pub const TPM_CC_EVICT_CONTROL: u32 = 0x120;
 pub const TPM_CC_HIERARCHY_CONTROL: u32 = 0x121;
@@ -33,15 +33,22 @@ pub const TPM_CC_STARTUP: u32 = 0x144;
 pub const TPM_CC_SHUTDOWN: u32 = 0x145;
 pub const TPM_CC_OBJECT_CHANGE_AUTH: u32 = 0x150;
 pub const TPM_CC_CREATE: u32 = 0x153;
+pub const TPM_CC_ECDH_ZGEN: u32 = 0x154;
 pub const TPM_CC_LOAD: u32 = 0x157;
+pub const TPM_CC_RSA_DECRYPT: u32 = 0x159;
 pub const TPM_CC_SEQUENCE_UPDATE: u32 = 0x15c;
+pub const TPM_CC_SIGN: u32 = 0x15d;
 pub const TPM_CC_UNSEAL: u32 = 0x15e;
 pub const TPM_CC_CONTEXT_LOAD: u32 = 0x161;
 pub const TPM_CC_CONTEXT_SAVE: u32 = 0x162;
+pub const TPM_CC_ECDH_KEYGEN: u32 = 0x163;
 pub const TPM_CC_FLUSH_CONTEXT: u32 = 0x165;
 pub const TPM_CC_LOAD_EXTERNAL: u32 = 0x167;
 pub const TPM_CC_READ_PUBLIC: u32 = 0x173;
+pub const TPM_CC_RSA_ENCRYPT: u32 = 0x174;
 pub const TPM_CC_START_AUTH_SESSION: u32 = 0x176;
+pub const TPM_CC_VERIFY_SIGNATURE: u32 = 0x177;
+pub const TPM_CC_ECC_PARAMETERS: u32 = 0x178;
 pub const TPM_CC_GET_CAPABILITY: u32 = 0x17a;
 pub const TPM_CC_GET_RANDOM: u32 = 0x17b;
 pub const TPM_CC_HASH: u32 = 0x17d;
@@ -250,12 +257,23 @@ pub const COMMANDS: &[Command] = &[
         .handles(&[H::Object(false)], 1)
         .decrypt()
         .encrypt(),
+    Command::new(TPM_CC_ECDH_ZGEN, signing::ecdh_z_gen)
+        .handles(&[H::Object(false)], 1)
+        .decrypt()
+        .encrypt(),
     Command::new(TPM_CC_LOAD, key::load)
         .handles(&[H::Object(false)], 1)
         .response_handle()
         .decrypt()
         .encrypt(),
+    Command::new(TPM_CC_RSA_DECRYPT, signing::rsa_decrypt)
+        .handles(&[H::Object(false)], 1)
+        .decrypt()
+        .encrypt(),
     Command::new(TPM_CC_SEQUENCE_UPDATE, object::sequence_update)
+        .handles(&[H::Object(false)], 1)
+        .decrypt(),
+    Command::new(TPM_CC_SIGN, signing::sign)
         .handles(&[H::Object(false)], 1)
         .decrypt(),
     Command::new(TPM_CC_UNSEAL, key::unseal)
@@ -267,6 +285,9 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_CONTEXT_SAVE, context::context_save)
         .handles(&[H::Context], 0)
         .no_sessions(),
+    Command::new(TPM_CC_ECDH_KEYGEN, signing::ecdh_key_gen)
+        .handles(&[H::Object(false)], 0)
+        .encrypt(),
     Command::new(TPM_CC_FLUSH_CONTEXT, context::flush_context).no_sessions(),
     Command::new(TPM_CC_LOAD_EXTERNAL, key::load_external)
         .response_handle()
@@ -275,11 +296,19 @@ pub const COMMANDS: &[Command] = &[
     Command::new(TPM_CC_READ_PUBLIC, key::read_public)
         .handles(&[H::Object(false)], 0)
         .encrypt(),
+    Command::new(TPM_CC_RSA_ENCRYPT, signing::rsa_encrypt)
+        .handles(&[H::Object(false)], 0)
+        .decrypt()
+        .encrypt(),
     Command::new(TPM_CC_START_AUTH_SESSION, session::start_auth_session)
         .handles(&[H::Object(true), H::Entity(true)], 0)
         .response_handle()
         .decrypt()
         .encrypt(),
+    Command::new(TPM_CC_VERIFY_SIGNATURE, signing::verify_signature)
+        .handles(&[H::Object(false)], 0)
+        .decrypt(),
+    Command::new(TPM_CC_ECC_PARAMETERS, signing::ecc_parameters),
     Command::new(TPM_CC_GET_CAPABILITY, capability::get_capability),
     Command::new(TPM_CC_GET_RANDOM, get_random).encrypt(),
     Command::new(TPM_CC_HASH, object::hash).decrypt().encrypt(),

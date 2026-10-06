@@ -7,8 +7,6 @@
 //! constant time; every decryption failure is one error (TPM_RC_VALUE), so a caller learns only
 //! that it failed. See "RSA and the Marvin attack" in docs/tpm-design.md.
 
-#![cfg_attr(not(test), expect(dead_code, reason = "keys come next"))]
-
 use crypto_bigint::{BoxedUint, Limb, NonZero, Resize, U384};
 use crypto_primes::hazmat::SmallFactorsSieve;
 use crypto_primes::{Flavor, is_prime};

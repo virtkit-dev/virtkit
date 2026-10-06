@@ -8,8 +8,6 @@
 //! (TPM_RC_SYMMETRIC). Schemes vk-tpm cannot run (ECDAA, SM2, EC-Schnorr, ECMQV, KDF2, CMAC...)
 //! are only identifiers here, accepted as the reference does; using one fails where it is used.
 
-#![expect(dead_code, reason = "objects come next")]
-
 use zeroize::Zeroizing;
 
 use crate::alg::{Hash, MAX_DIGEST, TPM_ALG_NULL};
