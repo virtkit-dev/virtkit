@@ -1652,11 +1652,68 @@ fn session_entry(handle: u32) -> Vec<u8> {
     session(handle, &[0; 16], 1, &[])
 }
 
+/// How many handles a command implemented by both has in its handle area.
+fn handle_count(code: u32) -> Option<usize> {
+    match code {
+        HIERARCHY_CONTROL
+        | CHANGE_EPS
+        | CHANGE_PPS
+        | CLEAR
+        | CLEAR_CONTROL
+        | HIERARCHY_CHANGE_AUTH
+        | PCR_ALLOCATE
+        | SET_PRIMARY_POLICY
+        | DA_LOCK_RESET
+        | DA_PARAMETERS
+        | PCR_EVENT
+        | PCR_RESET
+        | SEQUENCE_COMPLETE
+        | SEQUENCE_UPDATE
+        | PCR_EXTEND => Some(1),
+        START_AUTH_SESSION | EVENT_SEQUENCE_COMPLETE => Some(2),
+        _ => Some(0),
+    }
+}
+
+/// The command's authorization area names an HMAC or policy session: the response, if a
+/// success, carries that TPM's own nonce and HMAC.
+fn uses_session(c: &[u8]) -> bool {
+    let at = |i: usize, n: usize| c.get(i..i + n);
+    let Some(code) = at(6, 4).map(|b| u32::from_be_bytes(b.try_into().unwrap())) else {
+        return false;
+    };
+    if at(0, 2) != Some(&[0x80, 0x02]) {
+        return false;
+    }
+    let mut i = 10 + 4 * handle_count(code).unwrap_or(0) + 4;
+    while let Some(handle) = at(i, 4) {
+        if matches!(handle[0], 0x02 | 0x03) {
+            return true;
+        }
+        let Some(nonce) = at(i + 4, 2).map(|b| u16::from_be_bytes([b[0], b[1]]) as usize) else {
+            return false;
+        };
+        i += 4 + 2 + nonce + 1;
+        let Some(hmac) = at(i, 2).map(|b| u16::from_be_bytes([b[0], b[1]]) as usize) else {
+            return false;
+        };
+        i += 2 + hmac;
+    }
+    false
+}
+
 /// Deterministic mutations of well-formed commands: both must answer the same, wherever the
-/// answer does not depend on what vk-tpm does not implement yet.
+/// answer does not depend on what vk-tpm does not implement yet, or on randomness (a session's
+/// nonces, new seeds and proofs).
 #[test]
 fn mutated_commands_match() {
-    let mut both = Both::started();
+    let start_session = |kind: u8, bind: u32| {
+        let p = [tpm2b(&[1; 16]), tpm2b(b""), vec![kind, 0, 0x10, 0, 0x0b]].concat();
+        command(START_AUTH_SESSION, &[RH_NULL, bind], None, &p)
+    };
+    let hmac_session = session_entry(HMAC_SESSION);
+    let audit_session = session(HMAC_SESSION, &[0; 16], 0x81, &[]);
+    let zeros_policy = [tpm2b(&[0; 32]), vec![0, 0x0b]].concat();
     let corpus = [
         extend(4, &[(0x04, vec![1; 20]), (0x0b, vec![2; 32])]),
         command(
@@ -1668,8 +1725,40 @@ fn mutated_commands_match() {
         get_capability(5, 0, 1),
         get_capability(7, 0, 4),
         get_capability(1, 0x4000_0000, 3),
+        get_capability(1, 0x0200_0000, 3),
+        get_capability(1, 0x8000_0000, 3),
         command(SELF_TEST, &[], None, &[1]),
         command(SHUTDOWN, &[], None, &[0, 0]),
+        change_auth(RH_OWNER, b"", b""),
+        change_auth(RH_LOCKOUT, b"", b""),
+        hierarchy_control(RH_PLATFORM, RH_OWNER, 1),
+        with_password(SET_PRIMARY_POLICY, RH_OWNER, b"", &zeros_policy),
+        with_password(CLEAR_CONTROL, RH_PLATFORM, b"", &[0]),
+        with_password(
+            PCR_ALLOCATE,
+            RH_PLATFORM,
+            b"",
+            &selection(&[(0x04, &[0xff; 3])]),
+        ),
+        command(PCR_EVENT, &[16], Some(&password(b"")), &tpm2b(b"event")),
+        command(PCR_RESET, &[16], Some(&password(b"")), &[]),
+        hash(b"abcd", 0x0b, RH_OWNER),
+        sequence_start(b"pw", 0x0b),
+        sequence_start(b"", 0x10),
+        sequence_update(0x8000_0000, b"pw", b"data"),
+        sequence_complete(0x8000_0001, b"pw", b"end", RH_ENDORSEMENT),
+        event_sequence_complete(16, 0x8000_0000, b"", b"x"),
+        command(FLUSH_CONTEXT, &[], None, &0x8000_0002u32.to_be_bytes()),
+        start_session(SE_HMAC, RH_NULL),
+        start_session(SE_POLICY, RH_OWNER),
+        command(FLUSH_CONTEXT, &[], None, &HMAC_SESSION.to_be_bytes()),
+        command(
+            HIERARCHY_CHANGE_AUTH,
+            &[RH_OWNER],
+            Some(&hmac_session),
+            &tpm2b(b""),
+        ),
+        command(GET_RANDOM, &[], Some(&audit_session), &[0, 0]),
     ];
     // xorshift: a fixed seed, so a failure reproduces.
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -1680,7 +1769,14 @@ fn mutated_commands_match() {
         seed
     };
     let mut compared = 0;
-    for _ in 0..50_000 {
+    let mut both = Both::seeded();
+    for i in 0..60_000 {
+        // Start again now and then, from whatever the mutations left (changed authValues,
+        // disabled hierarchies, every slot taken).
+        if i % 3_000 == 0 {
+            drop(both);
+            both = Both::seeded();
+        }
         let mut c = corpus[(next() % corpus.len() as u64) as usize].clone();
         for _ in 0..1 + next() % 3 {
             let at = (next() % c.len() as u64) as usize;
@@ -1699,8 +1795,22 @@ fn mutated_commands_match() {
         if ours_unknown || other_capability {
             continue;
         }
+        // New seeds and proofs: give both the same again.
+        if rc(&ours) == 0 && matches!(code, Some(CLEAR | CHANGE_EPS | CHANGE_PPS)) {
+            assert_eq!(hex(&ours), hex(&theirs), "command {}", hex(&c));
+            drop(both);
+            both = Both::seeded();
+            continue;
+        }
+        // A session's nonces are each TPM's own: only the shape compares.
+        let random = code == Some(START_AUTH_SESSION) || uses_session(&c);
+        if random && rc(&ours) == 0 {
+            assert_eq!(ours.len(), theirs.len(), "command {}", hex(&c));
+            assert_eq!(hex(&ours[..10]), hex(&theirs[..10]), "command {}", hex(&c));
+            continue;
+        }
         assert_eq!(hex(&ours), hex(&theirs), "command {}", hex(&c));
         compared += 1;
     }
-    assert!(compared > 25_000, "only {compared} compared");
+    assert!(compared > 30_000, "only {compared} compared");
 }
