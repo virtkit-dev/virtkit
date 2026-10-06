@@ -1281,38 +1281,48 @@ mod tests {
     /// per-process maximum can give.
     #[test]
     fn a_sweep_totals_every_process_and_names_the_largest() {
-        let me = std::process::id() as i32;
-        let (one, two) = (hog(64), hog(64));
-        let (pid_one, pid_two) = (one.pid(), two.pid());
+        // Use a dedicated shell as the root: a sibling test's forked, not-yet-exec'd child
+        // is resident as the whole test binary and could appear in only one of two sweeps
+        // rooted at the test process.
+        let root = nested_hogs(2, 64);
+        let cmdline = |pid: i32| std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
 
-        // Both children resident *and* settled before measuring. A shell doubling its string
-        // holds the old copy alongside the new one, so its RSS overshoots and falls back —
-        // comparing one sweep against per-process reads is only meaningful once neither is
-        // moving, or the two land on opposite sides of a spike.
-        let rss_of = |pid: i32| mem(pid).map_or(0, |(rss, _)| rss);
-        let grown = std::time::Instant::now();
-        let mut last = [0, 0];
-        loop {
-            let now = [rss_of(pid_one), rss_of(pid_two)];
-            let settled = now
+        // Measured once the tree is still: the root, both holders, and the `sleep` each started
+        // once its string was held. Any fork in between — a holder reading its string in, or
+        // starting its `sleep` — shows as an extra process.
+        let settling = Instant::now();
+        let (pid_one, pid_two) = loop {
+            let tree = descendants(root.pid(), &HashSet::new());
+            let holders: Vec<i32> = tree
                 .iter()
-                .zip(&last)
-                .all(|(n, l): (&u64, &u64)| *n >= 60 * 1024 * 1024 && n.abs_diff(*l) < 1024 * 1024);
-            if settled {
-                break;
+                .skip(1)
+                .copied()
+                .filter(|&pid| cmdline(pid).starts_with(b"sh\0"))
+                .collect();
+            let sleeps = tree
+                .iter()
+                .filter(|&&pid| cmdline(pid).starts_with(b"sleep\0"))
+                .count();
+            // 5 = the root + two holders + their two `sleep`s; any more is a fork in flight.
+            if let (&[one, two], 2, 5) = (&holders[..], sleeps, tree.len()) {
+                break (one, two);
             }
             assert!(
-                grown.elapsed() < Duration::from_secs(60),
-                "children never settled: {now:?}"
+                settling.elapsed() < Duration::from_secs(60),
+                "the holders never settled: {tree:?}"
             );
-            last = now;
-            std::thread::sleep(Duration::from_millis(100));
-        }
+            std::thread::sleep(Duration::from_millis(50));
+        };
 
         // One pass, so the figures are comparable: the total holds both children at once,
-        // where the largest process — this test process, or either child — holds one.
-        let (held, biggest) = sweep(me, &HashSet::new());
+        // where the largest process holds one.
+        let rss_of = |pid: i32| mem(pid).map_or(0, |(rss, _)| rss);
+        let (held, biggest) = sweep(root.pid(), &HashSet::new());
         let (rss_one, rss_two) = (rss_of(pid_one), rss_of(pid_two));
+        assert!(
+            rss_one.min(rss_two) >= 64 * 1024 * 1024,
+            "{rss_one} and {rss_two}"
+        );
         assert!(held >= rss_one + rss_two, "both children counted: {held}");
         assert!(biggest >= rss_one.max(rss_two), "largest: {biggest}");
         assert!(
@@ -1321,7 +1331,7 @@ mod tests {
         );
 
         // A skipped pid leaves the total, so a phase is charged for its own processes alone.
-        let (without_one, _) = sweep(me, &HashSet::from([pid_one]));
+        let (without_one, _) = sweep(root.pid(), &HashSet::from([pid_one]));
         assert!(without_one < held, "{without_one} vs {held}");
     }
 
@@ -1452,9 +1462,9 @@ mod tests {
         assert_eq!(parse_pss("Pss:  18446744073709551615 kB\n"), None);
     }
 
-    /// A shell that holds nothing itself and waits on a child that holds `mib`. The root is
-    /// dedicated, so unlike a reading rooted at the test process this one cannot be moved by
-    /// the sibling tests' children coming and going.
+    /// A shell that holds nothing itself and waits on children that each hold `mib`.
+    /// This dedicated root excludes sibling tests' children, whose arrivals and exits
+    /// would change a reading rooted at the test process.
     struct NestedHog(Reap);
 
     impl NestedHog {
@@ -1471,19 +1481,25 @@ mod tests {
         }
     }
 
-    fn nested_hog(mib: usize) -> NestedHog {
+    fn nested_hogs(count: usize, mib: usize) -> NestedHog {
         use std::os::unix::process::CommandExt;
 
+        // Once its string is held, each child starts one `sleep` and waits on it; the tree
+        // then stops forking. Starting `sleep` every second would fork a child temporarily
+        // resident as the parent's whole string.
         let inner = format!(
-            "s=$(head -c {} /dev/zero | tr \"\\0\" x); while true; do sleep 1; done",
+            "s=$(head -c {} /dev/zero | tr \"\\0\" x); sleep 100000 & wait",
             mib * 1024 * 1024
         );
         NestedHog(Reap::running_sh(
             std::process::Command::new("sh")
-                .args(["-c", &format!("sh -c '{inner}' & wait")])
+                .args([
+                    "-c",
+                    &format!("{}wait", format!("sh -c '{inner}' & ").repeat(count)),
+                ])
                 .process_group(0)
                 .spawn()
-                .expect("spawning a shell whose child holds memory"),
+                .expect("spawning a shell whose children hold memory"),
         ))
     }
 
@@ -1528,7 +1544,7 @@ mod tests {
         // `vk list` dashes the cell rather than claiming the VM holds nothing.
         assert_eq!(tree_resident(-1), None);
 
-        let root = nested_hog(64);
+        let root = nested_hogs(1, 64);
         let grown = Instant::now();
         while tree_resident(root.pid()).is_none_or(|t| t < 32 * 1024 * 1024) {
             assert!(
