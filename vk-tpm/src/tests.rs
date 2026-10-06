@@ -176,6 +176,8 @@ fn every_command_refuses_trailing_parameter_bytes() {
         let load = [&[0, 0][..], public].concat();
         let load_external = [&[0, 0][..], public, &[0x40, 0, 0, 7]].concat();
         let context = [&[0; 8][..], &[0x80, 0, 0, 0, 0x40, 0, 0, 7, 0, 0]].concat();
+        // digest, an HMAC signature.
+        let verify_signature = [&[0, 0, 0, 5, 0, 0x0b][..], &[0; 32]].concat();
         // No authValue; an ordinary index of 8 bytes.
         let nv_public = [
             &[0, 0, 0, 14][..],
@@ -196,7 +198,7 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_OBJECT_CHANGE_AUTH | TPM_CC_STIR_RANDOM => &[0, 0],
             TPM_CC_CONTEXT_LOAD => &context,
             TPM_CC_SIGN => &[0, 0, 0, 0x10, 0x80, 0x24, 0x40, 0, 0, 7, 0, 0],
-            TPM_CC_VERIFY_SIGNATURE => &[0, 0, 0, 0x10],
+            TPM_CC_VERIFY_SIGNATURE => &verify_signature,
             TPM_CC_RSA_ENCRYPT | TPM_CC_RSA_DECRYPT => &[0, 0, 0, 0x10, 0, 0],
             TPM_CC_ECDH_ZGEN => &[0, 4, 0, 0, 0, 0],
             TPM_CC_HMAC | TPM_CC_HMAC_START => &[0, 0, 0, 0x10],

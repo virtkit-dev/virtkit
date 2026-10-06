@@ -22,7 +22,7 @@ use crate::rc::{Rc, Result};
 use crate::{Out, Tpm};
 
 /// TPM_ST_VERIFIED, the tag of a TPMT_TK_VERIFIED.
-const TPM_ST_VERIFIED: u16 = 0x8022;
+pub const TPM_ST_VERIFIED: u16 = 0x8022;
 
 /// CryptSelectSignScheme: the scheme a key signs with, from its own and the caller's.
 fn select_sign_scheme(key: &Key, requested: Scheme) -> Option<Scheme> {
@@ -116,23 +116,17 @@ fn write_signature(
 
 /// A TPMT_SIGNATURE: its scheme and hash, and the signature's parts (one for RSA and HMAC, r
 /// and s for ECC).
-struct Signature {
-    alg: u16,
-    hash: Option<Hash>,
+pub struct Signature {
+    pub alg: u16,
+    pub hash: Hash,
     parts: Vec<Vec<u8>>,
 }
 
-fn read_signature(r: &mut Reader) -> Result<Signature> {
+pub fn read_signature(r: &mut Reader) -> Result<Signature> {
+    // A TPMT_SIGNATURE, not a TPMT_SIGNATURE+: TPM_ALG_NULL is no scheme.
     let alg = r.u16()?;
-    if !(public::is_sig_scheme(alg) || alg == TPM_ALG_NULL) {
+    if !public::is_sig_scheme(alg) {
         return Err(Rc::SCHEME);
-    }
-    if alg == TPM_ALG_NULL {
-        return Ok(Signature {
-            alg,
-            hash: None,
-            parts: Vec::new(),
-        });
     }
     let hash = Hash::read(r)?;
     let parts = match alg {
@@ -144,18 +138,12 @@ fn read_signature(r: &mut Reader) -> Result<Signature> {
             r.tpm2b(MAX_ECC_KEY_BYTES)?.to_vec(),
         ],
     };
-    Ok(Signature {
-        alg,
-        hash: Some(hash),
-        parts,
-    })
+    Ok(Signature { alg, hash, parts })
 }
 
 /// CryptValidateSignature.
-fn verify(key: &Key, digest: &[u8], sig: &Signature) -> Result<()> {
-    let (Some(hash), true) = (sig.hash, sig.alg != TPM_ALG_NULL) else {
-        return Err(Rc::SIGNATURE);
-    };
+pub fn verify(key: &Key, digest: &[u8], sig: &Signature) -> Result<()> {
+    let hash = sig.hash;
     let part = |i: usize| sig.parts.get(i).map_or(&[][..], Vec::as_slice);
     match (&key.public.params, &key.public.unique) {
         (Params::Rsa { exponent, .. }, Unique::Rsa(n)) => {
@@ -208,16 +196,19 @@ pub fn verify_signature(tpm: &mut Tpm, handles: &[u32], r: &mut Reader, w: &mut 
             .u32(crate::entity::TPM_RH_NULL)
             .tpm2b(&[]);
     } else {
-        // TicketComputeVerified: HMAC(proof, TPM_ST_VERIFIED ‖ digest ‖ Name).
-        let tag = TPM_ST_VERIFIED.to_be_bytes();
-        let ticket = crypt::hmac(
-            Hash::Sha512,
-            tpm.proof(hierarchy).as_slice(),
-            &[&tag, &digest, &key.name],
-        );
+        let ticket = tpm.verified_ticket(hierarchy, &digest, &key.name);
         w.u16(TPM_ST_VERIFIED).u32(hierarchy).tpm2b(&ticket);
     }
     Ok(())
+}
+
+impl Tpm {
+    /// TicketComputeVerified: HMAC(proof, TPM_ST_VERIFIED ‖ digest ‖ Name).
+    pub fn verified_ticket(&self, hierarchy: u32, digest: &[u8], name: &[u8]) -> Vec<u8> {
+        let tag = TPM_ST_VERIFIED.to_be_bytes();
+        let proof = self.proof(hierarchy);
+        crypt::hmac(Hash::Sha512, proof.as_slice(), &[&tag, digest, name])
+    }
 }
 
 /// IsLabelProperlyFormatted: an OAEP label is empty or ends with its terminating zero.
