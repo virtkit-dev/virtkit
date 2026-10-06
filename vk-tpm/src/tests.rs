@@ -4327,3 +4327,140 @@ fn encrypt_decrypt_continues_from_the_iv_it_returns() {
     assert_eq!(refused(TPM_ALG_ECB, &iv, &data), Rc::SIZE.param(4).0);
     assert_eq!(refused(TPM_ALG_CBC, &iv, &data[..15]), Rc::SIZE.param(1).0);
 }
+
+/// The outPublic from TPM2_CreatePrimary with `kind`'s EK template in the endorsement hierarchy.
+fn create_ek(tpm: &mut Tpm, kind: EkKind) -> Vec<u8> {
+    let template = kind_template(kind);
+    let mut p = Writer::new();
+    p.u16(4).u16(0).u16(0).tpm2b(&template).tpm2b(&[]).u32(0);
+    let r = tpm.process(&command(
+        TPM_CC_CREATE_PRIMARY,
+        &[TPM_RH_ENDORSEMENT],
+        Some(b""),
+        &p.into_bytes(),
+    ));
+    assert_eq!(rc(&r), 0);
+    let mut reader = Reader::new(&r[18..]);
+    reader.tpm2b(4096).unwrap().to_vec()
+}
+
+/// The profile's default template for `kind`, as a guest sends it.
+fn kind_template(kind: EkKind) -> Vec<u8> {
+    let policy: [u8; 32] = [
+        0x83, 0x71, 0x97, 0x67, 0x44, 0x84, 0xb3, 0xf8, 0x1a, 0x90, 0xcc, 0x8d, 0x46, 0xa5, 0xd7,
+        0x24, 0xfd, 0x52, 0xd7, 0x6e, 0x06, 0x52, 0x0b, 0x64, 0xf2, 0xa1, 0xda, 0x1b, 0x33, 0x14,
+        0x69, 0xaa,
+    ];
+    let mut w = Writer::new();
+    match kind {
+        EkKind::Rsa2048 => {
+            w.u16(1).u16(0x0b).u32(0x0003_00b2).tpm2b(&policy);
+            w.u16(6).u16(128).u16(0x43).u16(0x10).u16(2048).u32(0);
+            w.tpm2b(&[0; 256]);
+        }
+        EkKind::EccNistP256 => {
+            w.u16(0x23).u16(0x0b).u32(0x0003_00b2).tpm2b(&policy);
+            w.u16(6).u16(128).u16(0x43).u16(0x10).u16(3).u16(0x10);
+            w.tpm2b(&[0; 32]).tpm2b(&[0; 32]);
+        }
+    }
+    w.into_bytes()
+}
+
+#[test]
+fn the_endorsement_key_is_the_one_a_guest_creates() {
+    let mut tpm = started();
+    for kind in [EkKind::EccNistP256, EkKind::Rsa2048] {
+        let ek = tpm.endorsement_key(kind).unwrap();
+        assert_eq!(create_ek(&mut tpm, kind), ek);
+        tpm.process(&command(TPM_CC_FLUSH_CONTEXT, &[], None, &[0x80, 0, 0, 0]));
+    }
+}
+
+#[test]
+fn a_provisioned_endorsement_key_and_its_certificate_persist() {
+    let mut tpm = Tpm::manufacture().unwrap();
+    tpm.take_permanent_changed();
+    let kind = EkKind::EccNistP256;
+    let certificate: Vec<u8> = (0..1500).map(|i| i as u8).collect();
+    tpm.provision_endorsement_key(kind, Some(&certificate))
+        .unwrap();
+    assert!(tpm.take_permanent_changed());
+    let mut tpm = Tpm::power_on(&tpm.permanent_state()).unwrap();
+    tpm.process(&command(TPM_CC_STARTUP, &[], None, &[0, 0]));
+    // The EK at its handle, the one TPM2_CreatePrimary makes.
+    let r = tpm.process(&command(TPM_CC_READ_PUBLIC, &[kind.handle()], None, &[]));
+    assert_eq!(rc(&r), 0);
+    let public = Reader::new(&r[10..]).tpm2b(4096).unwrap().to_vec();
+    assert_eq!(public, tpm.endorsement_key(kind).unwrap());
+    // The certificate, read by the owner in two parts; nobody may write it.
+    let index = kind.certificate_index();
+    let mut read = Vec::new();
+    for (size, offset) in [(1024u16, 0u16), (476, 1024)] {
+        let p = [size.to_be_bytes(), offset.to_be_bytes()].concat();
+        let r = tpm.process(&command(
+            TPM_CC_NV_READ,
+            &[TPM_RH_OWNER, index],
+            Some(b""),
+            &p,
+        ));
+        assert_eq!(rc(&r), 0);
+        read.extend_from_slice(Reader::new(&r[14..]).tpm2b(1024).unwrap());
+    }
+    assert_eq!(read, certificate);
+    let write = [&tpm2b(b"x")[..], &[0, 0]].concat();
+    let r = tpm.process(&command(
+        TPM_CC_NV_WRITE,
+        &[TPM_RH_PLATFORM, index],
+        Some(b""),
+        &write,
+    ));
+    assert_eq!(rc(&r), Rc::NV_LOCKED.0);
+    let r = tpm.process(&command(
+        TPM_CC_NV_UNDEFINE_SPACE,
+        &[TPM_RH_OWNER, index],
+        Some(b""),
+        &[],
+    ));
+    assert_eq!(rc(&r), Rc::NV_AUTHORIZATION.0);
+    // Provisioning again replaces both; a certificate too large is refused.
+    tpm.provision_endorsement_key(kind, Some(b"new")).unwrap();
+    assert_eq!(tpm.nv_data(index).unwrap(), b"new");
+    assert_eq!(
+        tpm.provision_endorsement_key(kind, Some(&[0; 2049])),
+        Err(Rc::SIZE)
+    );
+}
+
+#[test]
+fn provisioning_without_a_certificate_removes_the_old_one() {
+    let mut tpm = started();
+    let kind = EkKind::Rsa2048;
+    tpm.provision_endorsement_key(kind, Some(b"old")).unwrap();
+    tpm.provision_endorsement_key(kind, None).unwrap();
+    assert_eq!(tpm.nv_data(kind.certificate_index()), None);
+    let r = tpm.process(&command(TPM_CC_READ_PUBLIC, &[kind.handle()], None, &[]));
+    assert_eq!(rc(&r), 0);
+    let public = Reader::new(&r[10..]).tpm2b(4096).unwrap().to_vec();
+    assert_eq!(public, tpm.endorsement_key(kind).unwrap());
+}
+
+#[test]
+fn an_endorsement_key_needs_a_free_persistent_handle() {
+    let mut tpm = started();
+    let kind = EkKind::EccNistP256;
+    tpm.provision_endorsement_key(kind, None).unwrap();
+    let key = tpm.permanent.persistent[0].1.clone();
+    for handle in (0x8100_0000..).take(crate::key::MAX_PERSISTENT - 1) {
+        tpm.permanent.persistent.push((handle, key.clone()));
+    }
+    // Replace its own occupied handle; fail if every handle is occupied by others.
+    assert_eq!(tpm.provision_endorsement_key(kind, None), Ok(()));
+    tpm.take_permanent_changed();
+    assert_eq!(
+        tpm.provision_endorsement_key(EkKind::Rsa2048, Some(b"cert")),
+        Err(Rc::NV_SPACE)
+    );
+    assert!(!tpm.take_permanent_changed());
+    assert_eq!(tpm.nv_data(EkKind::Rsa2048.certificate_index()), None);
+}

@@ -154,6 +154,7 @@ vk-tpm/src/
                  ECDH, implicit rejection
   drbg.rs        the reference implementation's CTR_DRBG, which primary keys derive from
   signing.rs     Sign, VerifySignature, RSA_Encrypt/Decrypt, ECDH_KeyGen/ZGen, ECC_Parameters
+  ek.rs          the EK of the TCG EK Credential Profile's templates, its provisioning
   context.rs     ContextSave, ContextLoad, FlushContext; saved sessions and the context gap
   pcr.rs         PCR banks, PC Client attributes, startup/save/extend/reset/read
   state.rs       Permanent / Volatile state, versioned serialization
@@ -219,6 +220,7 @@ It mirrors what `tpm.rs` (at 2ba84aa2) does with libtpms, so the device swaps on
 | snapshot restore: write the file, `SetState(PERMANENT)`, `SetState(VOLATILE)`, `MainInit` | `Tpm::restore(&saved.permanent, &saved.volatile)`, and write the file |
 | `TPMLIB_Process` | `Tpm::process(&cmd) -> Vec<u8>`, never fails, at most `MAX_COMMAND_SIZE` bytes |
 | `nvram_storedata("permall")` callback | after `process`, `if tpm.take_permanent_changed() { write_atomic(path, &tpm.permanent_state()) }`, before the CRB clears START so a guest never sees a response whose state is not durable |
+| swtpm_setup's EK provisioning (not done today) | optional, at manufacture: `tpm.endorsement_key(kind)` for a CA to certify, then `tpm.provision_endorsement_key(kind, Some(&der))` (see "EK certificate") |
 | `TPMLIB_GetState(PERMANENT / VOLATILE)` for a snapshot | `permanent_state()` / `volatile_state()`, both `Zeroizing` |
 | `RUNNING` / `PERMANENT_STATE` globals | none: a `Tpm` is a value owned by the `TpmCrb` |
 
@@ -296,6 +298,34 @@ device must therefore recognize a libtpms state (its blob is not `VKTPM-P`) and 
 rather than silently manufacture over it. `vk` then offers either to keep the libtpms build for
 that machine or to reset its TPM explicitly. The default for new machines is decided when
 phase 5 lands.
+
+## EK certificate
+
+A guest (Windows' provisioning task, `tpm2_createek`) makes its EK with TPM2_CreatePrimary
+and the EK Credential Profile's default template: the key derives from the EPS, so it is the
+same each time. What a manufacturer adds is a certificate of it, in NV at 0x01C00002 (RSA) or
+0x01C0000A (ECC), and often the EK made persistent (0x81010001 / 0x81010002, the handles the
+TCG Provisioning Guidance reserves). The options:
+
+1. **None** (libtpms in `vk` today, and the default): the libtpms build provisions nothing,
+   and its Windows guests use their TPM (Get-Tpm, the TPM-backed AD member of the Windows
+   end-to-end test). AD CS key attestation works by user credentials or by EK public key (the
+   EKPUB list), not by EK certificate.
+2. **A per-host virtkit CA** signs each TPM's EK at manufacture (`vk` holds the CA key, exports
+   its certificate for an administrator to put in AD CS's EKROOT/EKCA stores): AD CS key
+   attestation by EK certificate then works too. It needs X.509 generation (with the
+   profile's extensions) and CA key management in `vk-driver`.
+3. A self-signed certificate: present, trusted by nobody; no use.
+
+Decision: **none by default**, the simplest, and what Windows guests run with today; and the
+mechanism for option 2 is in `vk-tpm` now: `Tpm::endorsement_key(kind)` gives the EK's
+public area to certify, `Tpm::provision_endorsement_key(kind, Some(der))` makes the EK
+persistent and stores the certificate in its index (platform-created, written and
+write-locked, readable by the owner and with its empty authValue, `TPMA_NV_NO_DA`), as
+swtpm_setup provisions QEMU's TPMs; given none, it deletes any certificate there. Whether
+`vk` adds the CA is phase 5's call. TPM2_Clear removes the persistent EK (an endorsement
+object), not the certificate (platform-created); TPM2_ChangeEPS removes the EK too and leaves
+the certificate stale.
 
 ## Deviations from libtpms
 
