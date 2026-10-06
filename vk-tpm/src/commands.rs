@@ -12,8 +12,8 @@ use crate::rc::{Rc, Result};
 use crate::session::SessionSlot;
 use crate::state::{ResetData, Saved, Shutdown, new_seed};
 use crate::{
-    LOCALITY, Out, Tpm, attest, capability, context, hierarchy, key, nv, object, policy, session,
-    signing,
+    LOCALITY, Out, Tpm, attest, capability, context, duplicate, hierarchy, key, nv, object, policy,
+    session, signing,
 };
 
 pub const TPM_CC_NV_UNDEFINE_SPACE_SPECIAL: u32 = 0x11f;
@@ -59,6 +59,7 @@ pub const TPM_CC_POLICY_SECRET: u32 = 0x151;
 pub const TPM_CC_CREATE: u32 = 0x153;
 pub const TPM_CC_ECDH_ZGEN: u32 = 0x154;
 pub const TPM_CC_HMAC: u32 = 0x155;
+pub const TPM_CC_IMPORT: u32 = 0x156;
 pub const TPM_CC_LOAD: u32 = 0x157;
 pub const TPM_CC_QUOTE: u32 = 0x158;
 pub const TPM_CC_RSA_DECRYPT: u32 = 0x159;
@@ -181,6 +182,13 @@ impl Command {
     const fn admin(self) -> Command {
         Command {
             role: Role::Admin,
+            ..self
+        }
+    }
+
+    const fn dup(self) -> Command {
+        Command {
+            role: Role::Dup,
             ..self
         }
     }
@@ -369,6 +377,11 @@ pub const COMMANDS: &[Command] = &[
         .handles(&[H::Object(true), H::Object(false)], 1)
         .decrypt()
         .encrypt(),
+    Command::new(TPM_CC_DUPLICATE, duplicate::duplicate)
+        .handles(&[H::Object(false), H::Object(true)], 1)
+        .dup()
+        .decrypt()
+        .encrypt(),
     Command::new(TPM_CC_GET_TIME, attest::get_time)
         .handles(&[H::Endorsement, H::Object(true)], 2)
         .decrypt()
@@ -404,6 +417,10 @@ pub const COMMANDS: &[Command] = &[
         .decrypt()
         .encrypt(),
     Command::new(TPM_CC_HMAC, object::hmac)
+        .handles(&[H::Object(false)], 1)
+        .decrypt()
+        .encrypt(),
+    Command::new(TPM_CC_IMPORT, duplicate::import)
         .handles(&[H::Object(false)], 1)
         .decrypt()
         .encrypt(),

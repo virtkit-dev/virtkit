@@ -426,7 +426,7 @@ pub fn outer_unwrap(
 
 /// SensitiveToPrivate: the TPM2B_PRIVATE of a child of `parent`: integrity ‖ IV ‖ the
 /// sensitive area (its authValue padded to the digest of `name_alg`) encrypted with AES-CFB.
-fn wrap(parent: &Key, name: &[u8], name_alg: Option<Hash>, s: &Sensitive) -> Result<Vec<u8>> {
+pub fn wrap(parent: &Key, name: &[u8], name_alg: Option<Hash>, s: &Sensitive) -> Result<Vec<u8>> {
     let (hash, sym, hmac) = protection(parent, name)?;
     let mut iv = [0u8; IV_SIZE];
     getrandom::fill(&mut iv).map_err(|_| Rc::FAILURE)?;
@@ -586,7 +586,7 @@ fn same_number(a: &[u8], b: &[u8]) -> bool {
 
 /// ObjectLoad: check an object about to be loaded under `parent` (None: external), then build
 /// it.
-fn load_checked(
+pub fn load_checked(
     parent: Option<&Key>,
     public: Public,
     sensitive: Option<Sensitive>,

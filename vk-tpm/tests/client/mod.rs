@@ -172,26 +172,31 @@ impl Session {
                 let n = bits as usize / 8;
                 let stream = kdfa(self.hash, &key, "CFB", newer, older, n + 16);
                 let (k, iv) = stream.split_at(n);
-                macro_rules! cfb {
-                    ($aes:ty) => {
-                        if encrypt {
-                            cfb_mode::Encryptor::<$aes>::new_from_slices(k, iv)
-                                .unwrap()
-                                .encrypt(data)
-                        } else {
-                            cfb_mode::Decryptor::<$aes>::new_from_slices(k, iv)
-                                .unwrap()
-                                .decrypt(data)
-                        }
-                    };
-                }
-                match bits {
-                    128 => cfb!(aes::Aes128),
-                    192 => cfb!(aes::Aes192),
-                    _ => cfb!(aes::Aes256),
-                }
+                aes_cfb(k, iv, data, encrypt);
             }
         }
+    }
+}
+
+/// AES-CFB, in place; the key's length picks AES-128, -192 or -256.
+pub fn aes_cfb(key: &[u8], iv: &[u8], data: &mut [u8], encrypt: bool) {
+    macro_rules! cfb {
+        ($aes:ty) => {
+            if encrypt {
+                cfb_mode::Encryptor::<$aes>::new_from_slices(key, iv)
+                    .unwrap()
+                    .encrypt(data)
+            } else {
+                cfb_mode::Decryptor::<$aes>::new_from_slices(key, iv)
+                    .unwrap()
+                    .decrypt(data)
+            }
+        };
+    }
+    match key.len() {
+        16 => cfb!(aes::Aes128),
+        24 => cfb!(aes::Aes192),
+        _ => cfb!(aes::Aes256),
     }
 }
 

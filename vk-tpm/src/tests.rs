@@ -177,6 +177,7 @@ fn every_command_refuses_trailing_parameter_bytes() {
         let create = [&[0, 4, 0, 0, 0, 0][..], public, &[0, 0, 0, 0, 0, 0]].concat();
         let load = [&[0, 0][..], public].concat();
         let create_loaded = [&[0, 4, 0, 0, 0, 0][..], public].concat();
+        let import = [&[0, 0][..], public, &[0, 0, 0, 0, 0, 0x10]].concat();
         let load_external = [&[0, 0][..], public, &[0x40, 0, 0, 7]].concat();
         let context = [&[0; 8][..], &[0x80, 0, 0, 0, 0x40, 0, 0, 7, 0, 0]].concat();
         // nonceTPM, cpHashA, policyRef, expiration, an HMAC signature.
@@ -202,6 +203,8 @@ fn every_command_refuses_trailing_parameter_bytes() {
             TPM_CC_CERTIFY_CREATION => &[0, 0, 0, 0, 0, 0x10, 0x80, 0x21, 0x40, 0, 0, 7, 0, 0],
             TPM_CC_MAKE_CREDENTIAL | TPM_CC_ACTIVATE_CREDENTIAL => &[0, 0, 0, 0],
             TPM_CC_CREATE_LOADED => &create_loaded,
+            TPM_CC_IMPORT => &import,
+            TPM_CC_DUPLICATE => &[0, 0, 0, 0x10],
             TPM_CC_LOAD_EXTERNAL => &load_external,
             TPM_CC_READ_PUBLIC
             | TPM_CC_UNSEAL
@@ -289,13 +292,14 @@ fn every_command_refuses_trailing_parameter_bytes() {
         let handles: Vec<u32> = cmd.handles.iter().map(|&k| valid_handle(k)).collect();
         let passwords = vec![&b""[..]; cmd.auth];
         let response = tpm.process(&command_with(cmd.code, &handles, &passwords, &params));
-        // The ADMIN role of an NV index takes a policy session: the authorization fails first.
-        let expected =
-            if cmd.role == Role::Admin && cmd.handles.first() == Some(&HandleKind::NvIndex) {
-                Rc::AUTH_TYPE.session(1)
-            } else {
-                Rc::SIZE
-            };
+        // The ADMIN role of an NV index, and the DUP role, take a policy session: the
+        // authorization fails first.
+        let nv_admin = cmd.role == Role::Admin && cmd.handles.first() == Some(&HandleKind::NvIndex);
+        let expected = if nv_admin || cmd.role == Role::Dup {
+            Rc::AUTH_TYPE.session(1)
+        } else {
+            Rc::SIZE
+        };
         assert_eq!(rc(&response), expected.0, "command {:#x}", cmd.code);
     }
 }

@@ -16,6 +16,7 @@
 
 mod attest;
 mod client;
+mod duplication;
 mod libtpms;
 mod nv;
 mod objects;
@@ -195,6 +196,26 @@ impl Both {
         let theirs = client::check(cmd, &mut sessions.theirs, &nonce, &theirs);
         assert_eq!(ours, theirs, "command {:#x}", cmd.code);
         ours
+    }
+
+    /// `cmd`, authorized by each TPM's sessions, for a command that answers randomly: each
+    /// TPM's response, decrypted and its HMACs checked.
+    #[track_caller]
+    fn run_apart(
+        &mut self,
+        sessions: &mut Sessions,
+        cmd: &client::Command,
+    ) -> (client::Response, client::Response) {
+        sessions.calls += 1;
+        let nonce: Vec<u8> = (0..20).map(|i| (sessions.calls * 7 + i) as u8).collect();
+        let ours = client::build(cmd, &sessions.ours, &nonce);
+        let theirs = client::build(cmd, &sessions.theirs, &nonce);
+        let ours = self.ours.process(&ours);
+        let theirs = self.theirs.process(&theirs);
+        (
+            client::check(cmd, &mut sessions.ours, &nonce, &ours),
+            client::check(cmd, &mut sessions.theirs, &nonce, &theirs),
+        )
     }
 
     /// Power off and on: both start again from their permanent state.
@@ -1823,6 +1844,7 @@ fn mutated_commands_match() {
         &nv::mutation_corpus(),
         &policy::mutation_corpus(),
         &attest::mutation_corpus(),
+        &duplication::mutation_corpus(),
     ]
     .concat();
     // xorshift: a fixed seed, so a failure reproduces.
