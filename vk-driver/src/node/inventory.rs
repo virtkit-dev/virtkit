@@ -270,18 +270,17 @@ fn config_hash(cfg: &Config) -> String {
 }
 
 /// The gitlab-runner configuration this node's runner reads: the one the node steers
-/// ([`crate::schedule::runner_config`]) when there is one, else the first of the user's own
-/// and a root-managed one that reads and parses.
+/// ([`crate::schedule::runner_config`]) when there is one, else the root-managed one
+/// `vk-runnerctl` steers, if it is readable.
 fn runner_config(cfg: &Config) -> Option<Runner> {
-    if let Some(path) = crate::schedule::runner_config(cfg) {
-        return read_runner(&path);
-    }
-    let home = std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|h| PathBuf::from(h).join(".gitlab-runner/config.toml"));
-    home.into_iter()
-        .chain([PathBuf::from("/etc/gitlab-runner/config.toml")])
-        .find_map(|path| read_runner(&path))
+    runner_config_in(cfg, std::env::var_os("HOME").as_deref())
+}
+
+/// [`runner_config`], with `home` for `$HOME`.
+fn runner_config_in(cfg: &Config, home: Option<&std::ffi::OsStr>) -> Option<Runner> {
+    let path = crate::schedule::runner_config_in(cfg, home)
+        .unwrap_or_else(|| PathBuf::from("/etc/gitlab-runner/config.toml"));
+    read_runner(&path)
 }
 
 fn read_runner(path: &Path) -> Option<Runner> {
@@ -366,6 +365,24 @@ mod tests {
         assert_eq!(
             (r.concurrent, r.runners.as_slice()),
             (Some(3), &["mine".to_string()][..])
+        );
+
+        // Without runner_config, managed runners use the user's config; external runners
+        // use root's, even when the user's config exists.
+        let home = dir.join("home");
+        let own = home.join(".gitlab-runner/config.toml");
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::fs::write(&own, "concurrent = 5\n").unwrap();
+        let managed: Config = toml::from_str("[node]\nrunner = \"managed\"\n").unwrap();
+        let r = runner_config_in(&managed, Some(home.as_os_str())).unwrap();
+        assert_eq!(
+            (r.config, r.concurrent),
+            (own.display().to_string(), Some(5))
+        );
+        let external = Config::default();
+        assert!(
+            runner_config_in(&external, Some(home.as_os_str()))
+                .is_none_or(|r| r.config == "/etc/gitlab-runner/config.toml")
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }

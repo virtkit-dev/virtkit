@@ -170,11 +170,16 @@ pub(crate) fn apply(cfg: &Config, decision: &Decision) -> Result<()> {
 /// runner_config`, which a managed runner defaults to `~/.gitlab-runner/config.toml`.
 /// Otherwise the runner is root's, reached through `vk-runnerctl`.
 pub fn runner_config(cfg: &Config) -> Option<PathBuf> {
+    runner_config_in(cfg, std::env::var_os("HOME").as_deref())
+}
+
+/// [`runner_config`], with `home` for `$HOME`.
+pub fn runner_config_in(cfg: &Config, home: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     match (&cfg.node.runner_config, cfg.node.runner) {
         (Some(path), _) => Some(path.clone()),
-        (None, vk_hub_proto::RunnerMode::Managed) => std::env::var_os("HOME")
+        (None, vk_hub_proto::RunnerMode::Managed) => home
             .filter(|h| !h.is_empty())
-            .map(|h| PathBuf::from(h).join(".gitlab-runner/config.toml")),
+            .map(|h| Path::new(h).join(".gitlab-runner/config.toml")),
         (None, vk_hub_proto::RunnerMode::External) => None,
     }
 }
