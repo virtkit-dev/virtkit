@@ -563,6 +563,10 @@ pub struct Inventory {
     pub versions: Versions,
     /// `None` when no gitlab-runner configuration could be read.
     pub runner: Option<Runner>,
+    /// The labels the node's configuration declares, which a job's placement may require
+    /// ([`client::Placement::labels`]). Older inventories omit labels and default to none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1130,6 +1134,7 @@ mod tests {
                 concurrent: Some(8),
                 runners: vec!["ci-7".into()],
             }),
+            labels: Vec::new(),
         }
     }
 
@@ -1849,6 +1854,15 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<Operation>(json!({"kind": "reset"})).unwrap(),
             Operation::Reset { images: false }
+        );
+        let mut labelled = serde_json::to_value(inventory()).unwrap();
+        labelled["labels"] = json!(["large-memory"]);
+        pinned(
+            &Inventory {
+                labels: vec!["large-memory".into()],
+                ..inventory()
+            },
+            labelled,
         );
         let mut versions = serde_json::to_value(&inventory().versions).unwrap();
         versions["vk_sha256"] = json!("cd".repeat(SHA256_LEN));

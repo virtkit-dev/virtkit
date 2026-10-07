@@ -77,6 +77,7 @@ pub fn inventory(cfg: &Config) -> Inventory {
             vk_sha256: super::update::known_sha256(),
         },
         runner: runner_config(cfg),
+        labels: Vec::new(),
     }
 }
 
