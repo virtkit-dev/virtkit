@@ -15,6 +15,12 @@ All notable changes to virtkit will be documented in this file.
   its control socket to quit, which flushes every disk as a guest power-off does, and kills it
   only if it is still there 10 seconds later; the VMM's own backstop after the power button and
   the hard reset end it the same way.
+- **Windows guests stop within the time vk gives them.** A domain controller ignores the ACPI
+  power button while its winlogon waits on the Group Policy client, so vk now asks qemu-ga to
+  shut a guest down 10 seconds after the button rather than 20. `vk run` of a Windows bundle
+  gives the guest the three minutes a Windows compose service has, where it had a Linux
+  guest's minute, too short for a domain controller; and the VMM's own backstop, which ended
+  any guest 70 seconds after the button, now waits past every grace vk gives.
 - **Windows guests have a virtio-rng.** libkrun's virtio-net can now reset: the device
   stops its worker and keeps its backend (a tap, or the switch's socket, which it owns and
   must not open twice) for the driver's next initialization, with the offloads that driver

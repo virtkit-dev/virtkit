@@ -100,9 +100,10 @@ fn mem_mib(mem: &str) -> Result<u32> {
 const GUEST_CID: u64 = 3;
 
 /// How long the guest gets to act on the power button before the boot child ends the VM
-/// itself, disks flushed — a backstop for a guest that ignores it, should the host not end
-/// it first.
-const POWER_BUTTON_GRACE: Duration = Duration::from_secs(70);
+/// itself, disks flushed: a backstop for a guest that ignores it after `vk` is gone. It
+/// outlasts the longest grace `vk` gives, a Windows build step's ten minutes
+/// (`uefi::BUILD_STOP_GRACE`), so that `vk` ends the VM itself whenever it is there to.
+const POWER_BUTTON_GRACE: Duration = Duration::from_secs(11 * 60);
 
 /// How long the VM has to flush its disks and exit once the backstop ends it, before the boot
 /// child exits anyway.
@@ -544,9 +545,8 @@ fn press_power_button_on_sigterm(handle: VmmHandle) -> Result<()> {
                             tv_nsec: left.subsec_nanos() as _,
                         };
                         // SAFETY: a valid set and timespec; a null siginfo is allowed.
-                        let sig = unsafe {
-                            libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout)
-                        };
+                        let sig =
+                            unsafe { libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout) };
                         if sig < 0 {
                             continue;
                         }

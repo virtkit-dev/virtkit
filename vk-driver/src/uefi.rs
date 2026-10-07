@@ -54,8 +54,11 @@ const UEFI_VARS_LEN: u64 = 0x84000;
 pub(crate) const TPM_STATE: &str = "tpm-state";
 
 /// How long a guest has to answer the ACPI power button before vk asks its qemu-ga to shut it
-/// down instead (a Windows guest can be set to ignore the button).
-const BUTTON_GRACE: Duration = Duration::from_secs(20);
+/// down instead. Windows starts shutting down within a second or two of the button, unless it
+/// ignores it: a domain controller does while its winlogon waits on the Group Policy client,
+/// which can last as long as the DC runs. Asking qemu-ga during a shutdown already under way
+/// changes nothing.
+const BUTTON_GRACE: Duration = Duration::from_secs(10);
 
 /// How long a build guest has to power off before it is killed.
 const BUILD_STOP_GRACE: Duration = Duration::from_secs(10 * 60);
@@ -1029,15 +1032,16 @@ pub(crate) async fn run(
     let result = hold(&mut ch, &console, args.detach_log.as_deref()).await;
     if ch.try_wait().ok().flatten().is_none() {
         // Stopped: the power button, then qemu-ga's shutdown; the VM ended at once
-        // ([`force_off`]) once STOP_GRACE runs out or on a second Ctrl-C.
+        // ([`force_off`]) once a Windows service's STOP_GRACE runs out (a domain controller
+        // takes most of a minute to shut down) or on a second Ctrl-C.
         tokio::select! {
-            off = power_off(&mut ch, work, crate::shutdown::STOP_GRACE) => match off {
+            off = power_off(&mut ch, work, crate::winsvc::STOP_GRACE) => match off {
                 Some(after) => {
                     println!("virtkit: guest powered off ({after:.0?} after the power button)")
                 }
                 None => eprintln!(
                     "virtkit: guest still up {}s after the power button; ending the VM",
-                    crate::shutdown::STOP_GRACE.as_secs()
+                    crate::winsvc::STOP_GRACE.as_secs()
                 ),
             },
             _ = tokio::signal::ctrl_c() => eprintln!("virtkit: Ctrl-C again; ending the VM"),
