@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Windows guests get a hardware random-number generator, as Linux guests do.** A Windows
+  guest restored from a snapshot taken before this release restores without one.
+
 ## [0.87.0] - 2026-10-10
 
 ### Added

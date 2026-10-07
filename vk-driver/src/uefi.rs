@@ -623,6 +623,11 @@ pub(crate) fn guest_spec(
         reboot: true,
         numa: crate::numa::Numa::Auto,
         guest_agent: Some(work.join(GUEST_AGENT_SOCKET)),
+        // Restored as the snapshot was taken: libkrun restores the virtio-pci functions in order.
+        rng: match restore {
+            Some(snapshot) => crate::snapshot::has_rng(snapshot)?,
+            None => true,
+        },
         hyperv: true,
         vm_generation_id: Some(vm_generation_id),
         system_uuid: Some(system_uuid),
