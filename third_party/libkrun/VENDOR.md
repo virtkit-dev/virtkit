@@ -527,6 +527,31 @@ every `KVM_EXIT_HYPERV` is answered. Windows then enables its SynIC on every vCP
 reference TSC page, synthetic timers and the TLB-flush/IPI hypercalls. Covered by the merge tests
 in `hyperv.rs` and, against the host's KVM, `test_configure_vcpu_with_hyperv` in `vstate.rs`.
 
+`src/libkrun/src/vmm/linux/vstate.rs` — `int1` on an AMD host that is itself a VM. An AMD
+processor delivers the #DB of an `int1` (ICEBP) past SVM's #DB intercept; under Hyper-V's nested
+SVM (WSL2, Azure) KVM gets it as an intercepted #DB with RIP still on the `int1`, injects it
+there, and the guest executes the `int1` again, forever (a user-mode `int1` in a Linux guest
+loops the same way; Intel hosts, nested or not, are fine). Windows' PatchGuard runs a check that
+single-steps an `int1` now and then, and the guest stops answering: a Windows 11 restored from a
+snapshot hung 14 to 16 minutes later every time, as it reached the check its snapshot had
+scheduled. For a guest with the Hyper-V enlightenments (Windows) on an AMD host whose CPUID has
+the hypervisor bit, or as `KRUN_INT1_WORKAROUND` (`1`, `0`) says, each vCPU sets
+`KVM_SET_GUEST_DEBUG` (`ENABLE | USE_HW_BP`, no breakpoints of its own) so the guest's #DB exits
+come to the VMM (`KVM_EXIT_DEBUG`); `Vcpu::step_over_int1` reads the byte at the exit's PC
+through the guest's page tables (not `KVM_TRANSLATE`, a supervisor access that SMAP refuses on a
+user page), moves RIP past it if it is an `int1`, sets DR6 from the exit as KVM does when it
+delivers a #DB itself, and injects the #DB (`KVM_GUESTDBG_INJECT_DB`). The guest's own hardware
+breakpoints are off while it is on (KVM loads the host's DR7, 0). Checked with a program that
+runs `int1` and the PatchGuard sequence (`popf` setting TF, `mov ss`, `int1`) in a Linux guest:
+the same traps at the same addresses as on the host, where it looped without this.
+Limits: an `int1` behind a prefix (`66 f1`), or outside long mode, is not recognized and still
+loops; a single-step trap that lands on an `int1` is not told from the `int1`'s own #DB (on the
+faulty host both come with RIP on it), so the `int1` is stepped over unrun. KVM's own
+single-step over an NMI window (SVM without vNMI) is no longer absorbed while this is on, so
+the guest may get a stray single-step trap if an NMI arrives during another's IRET. A #DB KVM
+refuses to queue beside a pending exception (`EBUSY`) is dropped rather than ending the VM.
+The page walk is covered by `the_int1_page_walk_follows_the_guest_tables`.
+
 `src/arch/src/x86_64/{acpi.rs,layout.rs,mod.rs}` + `src/devices/src/legacy/x86_64/pvpanic.rs` +
 `src/libkrun/src/{api/vmm_builder.rs,vmm/*}` — the ACPI devices a Windows guest expects:
 - pvpanic, for every x86_64 guest with ACPI: QEMU's ISA device at port 0x505 (`QEMU0001` in the

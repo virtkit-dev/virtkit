@@ -31,6 +31,9 @@ All notable changes to virtkit will be documented in this file.
   first request to shut down after 10 seconds rather than 20. `vk stop` waits 210 seconds by
   default (was 90) before it reports a run as stuck. A Windows guest left behind by a vk that
   crashed is ended after 11 minutes rather than 70 seconds.
+- **Windows guests no longer hang on an AMD host that is itself a virtual machine** (WSL2,
+  Hyper-V, Azure): Windows stopped answering at a random time, a restored Windows 11 about a
+  quarter of an hour after its restore. There, the guest's hardware breakpoints are off.
 
 ## [0.87.0] - 2026-10-10
 
