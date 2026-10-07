@@ -173,6 +173,14 @@ All notable changes to virtkit will be documented in this file.
   `FROM <image> [AS <name>]`. `--platform` and `--kernel` after the image now apply, as they
   do before it.
 
+### Fixed
+
+- **`vk run --state-dir` accepts a relative path.** A run from a Dockerfile or an image
+  with a relative `--state-dir` failed at boot (`Backing file "/proc/self/fd/./rel/root.qcow2":
+  No such file or directory`): its disk overlay named the backing image relative to the
+  current directory. The state dir is now made absolute, and overlays name their backing
+  images by absolute path.
+
 ## [0.85.0] - 2026-10-07
 
 ### Added

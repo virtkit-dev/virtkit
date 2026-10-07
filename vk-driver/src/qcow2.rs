@@ -364,6 +364,10 @@ pub fn create_overlay(path: &Path, backing: &Path) -> Result<()> {
             ImageKind::Raw => ("raw", f.metadata()?.len()),
         }
     };
+    // Store an absolute backing name: qcow2 readers resolve relative names against the
+    // overlay's directory, not the caller's cwd.
+    let backing =
+        std::path::absolute(backing).with_context(|| format!("resolving {}", backing.display()))?;
     let backing_name = backing
         .to_str()
         .context("backing path not utf-8")?
@@ -2694,6 +2698,30 @@ mod tests {
             };
             assert!(err.contains(want), "{name}: expected {want:?}, got {err:?}");
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `vk run --state-dir ./rel` hands the overlay a cwd-relative backing, which a reader
+    /// would resolve against the overlay's own directory instead.
+    #[test]
+    fn create_overlay_stores_a_relative_backing_as_absolute() {
+        let dir = std::env::temp_dir().join(format!("vk-relbacking-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("ovl")).unwrap();
+        let backing = dir.join("base.raw");
+        std::fs::write(&backing, vec![0u8; 1 << 20]).unwrap();
+        // The same file, named relative to the cwd.
+        let cwd = std::env::current_dir().unwrap();
+        let up = PathBuf::from_iter(cwd.components().skip(1).map(|_| ".."));
+        let relative = up.join(backing.strip_prefix("/").unwrap());
+
+        let overlay = dir.join("ovl/disk.qcow2");
+        create_overlay(&overlay, &relative).unwrap();
+        let img = Qcow2::open(&overlay).unwrap();
+        let stored = img.backing_path().unwrap();
+        assert!(stored.is_absolute(), "{}", stored.display());
+        assert_eq!(stored.canonicalize().unwrap(), backing);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

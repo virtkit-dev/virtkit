@@ -772,6 +772,9 @@ impl WorkDir {
 
     /// Create-or-reuse a caller-pinned scratch dir (`--state-dir`).
     fn pinned(path: PathBuf) -> Result<WorkDir> {
+        // Make the path absolute so the registered run and derived paths work from any cwd.
+        let path =
+            std::path::absolute(&path).with_context(|| format!("resolving {}", path.display()))?;
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -3471,9 +3474,9 @@ fn push_primary_hosts(
 /// compose file under `.virtkit/`.
 fn compose_builtins(args: &RunArgs, work: &Path) -> Result<crate::compose::Builtins> {
     let mut builtins = crate::compose::Builtins::resolve(args.workspace.as_deref(), Some(work))?;
-    // `WorkDir::pinned` preserves `--state-dir` verbatim as `work`; use it as the durable anchor.
-    if let Some(dir) = &args.state_dir {
-        builtins.persist_anchor = Some(dir.clone());
+    // A pinned `work` is `--state-dir` made absolute: the durable anchor.
+    if args.state_dir.is_some() {
+        builtins.persist_anchor = Some(work.to_path_buf());
     }
     Ok(builtins)
 }
@@ -6936,6 +6939,20 @@ mod tests {
 
         drop(work);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_relative_state_dir_is_pinned_absolute() {
+        let dir = std::env::temp_dir().join(format!("vk-relstate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cwd = std::env::current_dir().unwrap();
+        let up = PathBuf::from_iter(cwd.components().skip(1).map(|_| ".."));
+        let relative = up.join(dir.strip_prefix("/").unwrap());
+        let work = WorkDir::pinned(relative).unwrap();
+        assert_eq!(work.path, std::path::absolute(&work.path).unwrap());
+        assert!(work.path.is_absolute() && work.path.is_dir());
+        drop(work);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
