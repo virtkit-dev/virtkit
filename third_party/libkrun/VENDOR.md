@@ -610,9 +610,11 @@ names it. The saved kvmclock drops `KVM_CLOCK_REALTIME` and `KVM_CLOCK_HOST_TSC`
 `TSC_STABLE` (which `KVM_SET_CLOCK` refuses): with REALTIME, which Linux 5.16+ reports, the
 restore would move the clock on by the host time since the snapshot, so the guest's clock
 resumes where the snapshot froze it, whatever the host kernel; the caller sets the guest's
-time after a restore. Covered by tests that move a vCPU's state into a fresh vCPU through JSON,
-plain and with Hyper-V (skipped where KVM has no Hyper-V, as in a nested dev VM), one that
-restores the VM state, and one of `exchange_vcpus`'s error path.
+time after a restore. A vCPU's saved CPUID is the one KVM runs it with (`KVM_GET_CPUID2`), not
+the one it was configured with, so a snapshot of a restored VM keeps the CPUID its guest has
+been running with, wherever it was restored. Covered by tests that move a vCPU's state into a
+fresh vCPU through JSON, plain and with Hyper-V (skipped where KVM has no Hyper-V, as in a
+nested dev VM), one that restores the VM state, and one of `exchange_vcpus`'s error path.
 
 `src/devices/{Cargo.toml,src/virtio/{device.rs,pci.rs,console/device.rs}}` — the virtio half of
 a snapshot. `VirtioPciTransport::save_state` keeps the device type and what the driver wrote

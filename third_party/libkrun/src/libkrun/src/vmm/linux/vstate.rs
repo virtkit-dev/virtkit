@@ -186,6 +186,9 @@ pub enum Error {
     /// Failed to get KVM vcpu xsave.
     VcpuGetXsave(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
+    /// Failed to get KVM vcpu cpuid.
+    VcpuGetCpuid(kvm_ioctls::Error),
+    #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu cpuid.
     VcpuSetCpuid(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
@@ -365,6 +368,8 @@ impl Display for Error {
             VcpuGetXcrs(e) => write!(f, "Failed to get KVM vcpu xcrs: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuGetXsave(e) => write!(f, "Failed to get KVM vcpu xsave: {e}"),
+            #[cfg(target_arch = "x86_64")]
+            VcpuGetCpuid(e) => write!(f, "Failed to get KVM vcpu cpuid: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetCpuid(e) => write!(f, "Failed to set KVM vcpu cpuid: {e}"),
             #[cfg(target_arch = "x86_64")]
@@ -1690,8 +1695,14 @@ impl Vcpu {
             .fd
             .get_vcpu_events()
             .map_err(Error::VcpuGetVcpuEvents)?;
+        // The CPUID KVM runs the vCPU with, not the one it was configured with: a restored
+        // vCPU runs the snapshot's, and a snapshot of it must keep that one (local patch).
+        let cpuid = self
+            .fd
+            .get_cpuid2(KVM_MAX_CPUID_ENTRIES)
+            .map_err(Error::VcpuGetCpuid)?;
         Ok(VcpuState {
-            cpuid: self.cpuid.as_slice().to_vec(),
+            cpuid: cpuid.as_slice().to_vec(),
             msrs,
             hyperv_msrs,
             debug_regs,
