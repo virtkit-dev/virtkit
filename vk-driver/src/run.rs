@@ -1995,11 +1995,13 @@ async fn build_and_boot(
     // the guest is ready). Either signal's default action would end the run at once, leaving
     // the guests to the VMM's parent-death signal and skipping the host-side teardown (the
     // poweroff request, the registry and mount cleanup, the summaries). Both are heard from
-    // here on, through the services' starts, and routed through teardown.
+    // here on, through the services' starts, and routed through teardown, as is an output whose
+    // reader has gone (`output_closed`).
     let signals = || async {
         tokio::select! {
             _ = crate::shutdown::terminate_signal() => Stopped(libc::SIGTERM),
             _ = crate::detach::interrupt() => Stopped(libc::SIGINT),
+            _ = crate::shutdown::output_closed() => Stopped(libc::SIGPIPE),
         }
     };
     let signalled = signals();
@@ -3593,6 +3595,7 @@ async fn compose_up(
         tokio::select! {
             _ = tokio::signal::ctrl_c() => Stopped(libc::SIGINT),
             _ = crate::shutdown::terminate_signal() => Stopped(libc::SIGTERM),
+            _ = crate::shutdown::output_closed() => Stopped(libc::SIGPIPE),
         }
     };
     let stop = signals();

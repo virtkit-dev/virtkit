@@ -39,6 +39,10 @@ All notable changes to virtkit will be documented in this file.
 - **Windows guests no longer hang on an AMD host that is itself a virtual machine** (WSL2,
   Hyper-V, Azure): Windows stopped answering at a random time, a restored Windows 11 about a
   quarter of an hour after its restore. There, the guest's hardware breakpoints are off.
+- **A `vk run` whose output is closed stops its guests.** Piped into a reader that went away
+  (`vk run … | head`, a `while read` loop that ended), a compose run froze with its guests
+  still running, and `vk stop` did not end it. It now stops as `vk stop` would,
+  powering its guests off.
 
 ## [0.86.0] - 2026-10-07
 

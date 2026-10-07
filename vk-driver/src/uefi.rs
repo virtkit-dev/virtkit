@@ -1140,6 +1140,7 @@ async fn hold(ch: &mut Child, console: &Path, detach_log: Option<&Path>) -> Resu
         tokio::select! {
             _ = crate::shutdown::terminate_signal() => {}
             _ = tokio::signal::ctrl_c() => {}
+            _ = crate::shutdown::output_closed() => {}
         }
     };
     tokio::pin!(stop);

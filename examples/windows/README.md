@@ -175,8 +175,5 @@ out after it went through, a trust the other DC is not ready for yet).
 Run end to end on a 40 GB host, from a clean cache (every image built from the ISOs): the two
 multi-forest labs whole (both workstations, every check, the RDP job's sign-ins across the
 trusts; about 7 minutes each once built), `tests/windows-ad-e2e.sh` (the lab
-restored in 8 s), and `tests/windows-rdp-e2e.sh`. Left:
+restored in 8 s), and `tests/windows-rdp-e2e.sh`.
 
-- **A `vk run` whose output closes leaves its Windows guests running:** writing to a closed
-  pipe ended the run before it powered its guests off (seen with `vk run … | while read`); it
-  should stop its guests whatever ends it.

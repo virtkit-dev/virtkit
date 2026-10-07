@@ -360,6 +360,91 @@ pub(crate) async fn ask_poweroff(addr: &SocketAddr) -> bool {
     }
 }
 
+/// Resolve once this run's stdout or stderr is a pipe or socket whose reader has gone (`vk run
+/// … | head`, a `while read` loop that ended) or a terminal that hung up, having pointed both
+/// at /dev/null: a print to them would panic its thread on `EPIPE`, which wedged a compose run
+/// with its guests still running (the thread the run then waited on was gone, and its own
+/// teardown printed too). A run that waits on this hears it as it hears `vk stop`, and powers
+/// its guests off; elsewhere a closed output still ends the process as before. Never resolves
+/// for files and live terminals, in the `--detach` child (whose output goes to its log), or if
+/// the watch cannot start.
+pub(crate) async fn output_closed() {
+    use std::sync::OnceLock;
+    static CLOSED: OnceLock<Option<tokio::sync::watch::Receiver<bool>>> = OnceLock::new();
+
+    if crate::detach::is_child() {
+        return std::future::pending().await;
+    }
+    let watch = CLOSED.get_or_init(|| {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        // A thread of its own rather than the blocking pool: it may wait in `poll` for the
+        // whole run, and a runtime waits for its blocking tasks before it shuts down.
+        std::thread::Builder::new()
+            .name("vk-output-watch".into())
+            .spawn(move || {
+                if wait_output_closed() {
+                    let _ = tx.send(true);
+                }
+            })
+            .ok()
+            .map(|_| rx)
+    });
+    let Some(mut rx) = watch.clone() else {
+        return std::future::pending().await;
+    };
+    if rx.wait_for(|closed| *closed).await.is_err() {
+        return std::future::pending().await;
+    }
+    discard_output();
+}
+
+/// Point stdout and stderr at /dev/null.
+fn discard_output() {
+    if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+        use std::os::fd::AsRawFd;
+        for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+            // SAFETY: dup2 onto a standard descriptor this process owns.
+            unsafe { libc::dup2(null.as_raw_fd(), fd) };
+        }
+    }
+}
+
+/// Block until stdout or stderr reports an error or a hang-up. False if `poll` fails for good
+/// or both are closed descriptors.
+fn wait_output_closed() -> bool {
+    let mut fds = [libc::STDOUT_FILENO, libc::STDERR_FILENO].map(|fd| libc::pollfd {
+        fd,
+        events: 0,
+        revents: 0,
+    });
+    loop {
+        // SAFETY: `fds` is a valid array of `fds.len()` pollfd structures.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if fds
+            .iter()
+            .any(|p| p.revents & (libc::POLLERR | libc::POLLHUP) != 0)
+        {
+            break;
+        }
+        // POLLNVAL: a closed descriptor, polled no more.
+        for p in &mut fds {
+            if p.revents & libc::POLLNVAL != 0 {
+                p.fd = -1;
+            }
+        }
+        if fds.iter().all(|p| p.fd < 0) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Wait for SIGTERM, as sent by `vk stop` and `vk publish stop`.
 /// If the handler cannot be installed, wait forever and leave SIGTERM's default termination
 /// in place.
