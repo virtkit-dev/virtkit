@@ -1151,6 +1151,8 @@ struct Inner {
     /// gets its fixed IP; the pool skips reserved IPs so it never collides.
     reservations: HashMap<Mac, Ipv4Addr>,
     next_idx: u32,
+    /// DHCP: leases granted without a router or resolver ([`Spawn::unrouted`])
+    unrouted: HashSet<Ipv4Addr>,
 }
 
 struct Switch {
@@ -1185,6 +1187,10 @@ pub struct Spawn {
     /// this address instead of a pool lease, so an image-init sibling that DHCPs
     /// eth0 lands on the IP the resolver advertises for its name
     pub reservations: Vec<(String, String)>,
+    /// Addresses whose DHCP lease carries no router or resolver: the switch ports of a guest
+    /// whose eth0 is a host tap, whose default route and DNS go through the tap. A Windows
+    /// guest DHCPs those ports, and would otherwise hold two default routes.
+    pub unrouted: Vec<Ipv4Addr>,
     pub allow_ip: Vec<String>,
     pub allow_name: Vec<String>,
     /// Force allowlist mode even when both lists are empty: an empty allowlist then denies
@@ -1258,6 +1264,9 @@ pub fn spawn(opts: &Spawn) -> Result<std::process::Child> {
     }
     for (mac, ip) in &opts.reservations {
         cmd.arg("--reserve").arg(format!("{mac}={ip}"));
+    }
+    for ip in &opts.unrouted {
+        cmd.arg("--unrouted").arg(ip.to_string());
     }
     for a in &opts.allow_ip {
         cmd.arg("--allow-ip").arg(a);
@@ -1355,6 +1364,7 @@ pub async fn run(
     prefix: u8,
     hosts: HashMap<String, Ipv4Addr>,
     reservations: HashMap<Mac, Ipv4Addr>,
+    unrouted: HashSet<Ipv4Addr>,
     egress: Egress,
     per_source: HashMap<Ipv4Addr, Egress>,
     registry_proxy: Option<(Ipv4Addr, SocketAddr)>,
@@ -1465,6 +1475,7 @@ pub async fn run(
         inner: Mutex::new(Inner {
             next_idx: FIRST_LEASE,
             reservations,
+            unrouted,
             // Record ownership before any NIC connects so admission does not depend on
             // connection order.
             ip_vm: listen.iter().map(|(_, ip, vm)| (*ip, *vm)).collect(),
@@ -1766,7 +1777,8 @@ impl Switch {
     fn dhcp(&self, inner: &mut Inner, req: &[u8], mac: Mac) -> Option<Vec<u8>> {
         let lease = alloc_lease(inner, &self.cfg, mac)?;
         inner.ip_mac.insert(lease, mac);
-        dhcp_reply(req, mac, &self.cfg, lease)
+        let routed = !inner.unrouted.contains(&lease);
+        dhcp_reply(req, mac, &self.cfg, lease, routed)
     }
 
     fn drop_port(&self, port: PortId) {
@@ -3530,8 +3542,15 @@ fn ipv4_dst(ip: &[u8]) -> Option<Ipv4Addr> {
     (ip.len() >= 20 && (ip[0] >> 4) == 4).then(|| Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]))
 }
 
-/// Build a DHCP OFFER/ACK granting `lease` to `client_mac`.
-fn dhcp_reply(ip: &[u8], client_mac: Mac, cfg: &Cfg, lease: Ipv4Addr) -> Option<Vec<u8>> {
+/// Build a DHCP OFFER/ACK granting `lease` to `client_mac`; `routed` adds the gateway as its
+/// router and resolver.
+fn dhcp_reply(
+    ip: &[u8],
+    client_mac: Mac,
+    cfg: &Cfg,
+    lease: Ipv4Addr,
+    routed: bool,
+) -> Option<Vec<u8>> {
     let ihl = ((ip[0] & 0x0f) as usize) * 4;
     let req = ip.get(ihl + 8..)?; // UDP payload = the DHCP message
     if req.len() < 240 || req[0] != 1 || req[236..240] != [99, 130, 83, 99] {
@@ -3564,8 +3583,10 @@ fn dhcp_reply(ip: &[u8], client_mac: Mac, cfg: &Cfg, lease: Ipv4Addr) -> Option<
     opt(&mut p, 54, &gw); // server id
     opt(&mut p, 51, &DHCP_LEASE_SECS.to_be_bytes());
     opt(&mut p, 1, &netmask(cfg.prefix));
-    opt(&mut p, 3, &gw); // router
-    opt(&mut p, 6, &gw); // DNS = the gateway's own resolver
+    if routed {
+        opt(&mut p, 3, &gw); // router
+        opt(&mut p, 6, &gw); // DNS = the gateway's own resolver
+    }
     p.push(255);
 
     let builder = etherparse::PacketBuilder::ethernet2(GW_MAC, client_mac)
@@ -7135,6 +7156,7 @@ mod tests {
                 24,
                 HashMap::new(),
                 HashMap::new(),
+                HashSet::new(),
                 Egress::AllowAll,
                 HashMap::new(),
                 None,
@@ -7816,6 +7838,36 @@ mod tests {
             alloc_lease(&mut inner, &cfg, a),
             Some(Ipv4Addr::new(192, 168, 127, 2))
         );
+    }
+
+    #[test]
+    fn an_unrouted_lease_carries_no_router_or_resolver() {
+        let (sw, _port, _egress) = two_vm_switch(Egress::new(&[], &[]).unwrap());
+        let tapped = [0x52, 0x54, 0x00, 0xa8, 0xe7, 0x03];
+        let tapped_ip = Ipv4Addr::new(192, 168, 231, 3);
+        let mut discover = vec![0u8; 240];
+        discover[0] = 1; // BOOTREQUEST
+        discover[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        discover.extend_from_slice(&[53, 1, 1, 255]);
+        let mut ip = Vec::new();
+        etherparse::PacketBuilder::ipv4([0, 0, 0, 0], [255, 255, 255, 255], 64)
+            .udp(68, DHCP_SERVER_PORT)
+            .write(&mut ip, &discover)
+            .unwrap();
+        let mut inner = sw.inner.lock().unwrap();
+        inner.reservations.insert(tapped, tapped_ip);
+        inner.unrouted.insert(tapped_ip);
+        // The reply's options: past ethernet, IPv4, UDP and the fixed BOOTP fields.
+        let options = |reply: Vec<u8>| reply[ETH_HDR + 20 + 8 + 240..].to_vec();
+        let routed = options(sw.dhcp(&mut inner, &ip, [0xaa; 6]).unwrap());
+        assert_eq!(dhcp_option(&routed, 3), Some(&[192, 168, 231, 1][..]));
+        assert_eq!(dhcp_option(&routed, 6), Some(&[192, 168, 231, 1][..]));
+        let reply = sw.dhcp(&mut inner, &ip, tapped).unwrap();
+        assert_eq!(reply[ETH_HDR + 20 + 8 + 16..][..4], tapped_ip.octets());
+        let unrouted = options(reply);
+        assert_eq!(dhcp_option(&unrouted, 1), Some(&[255, 255, 255, 0][..]));
+        assert_eq!(dhcp_option(&unrouted, 3), None);
+        assert_eq!(dhcp_option(&unrouted, 6), None);
     }
 
     #[test]

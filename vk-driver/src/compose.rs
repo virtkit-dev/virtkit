@@ -1096,7 +1096,6 @@ fn map_service(
                 (dax.is_some(), "x-virtkit.dax"),
                 (nested, "x-virtkit.nested"),
                 (nics != 1, "x-virtkit.nics"),
-                (tap.is_some(), "x-virtkit.tap"),
                 (persist_root, "x-virtkit.persist_root"),
             ];
             if let Some((_, key)) = unsupported.iter().find(|(set, _)| *set) {
@@ -2627,6 +2626,23 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_service_takes_a_tap() {
+        let base = BundleDir::new("bundle-tap");
+        let units = parse(
+            "services:\n  dc:\n    image: ./win\n    x-virtkit:\n      tap: { name: vktap0, \
+             mac: '52:54:00:00:00:01', ip: 192.168.77.10/24, gw: 192.168.77.1, \
+             dns: [192.168.77.1] }\n",
+            &base.0,
+        )
+        .unwrap();
+        assert!(matches!(units[0].source, Source::Bundle { .. }));
+        let tap = units[0].tap.as_ref().unwrap();
+        assert_eq!(tap.tap, "vktap0");
+        assert_eq!(tap.mac, "52:54:00:00:00:01");
+        assert!(tap.addr.is_some());
+    }
+
+    #[test]
     fn a_secret_is_a_read_only_file_bind_for_linux_and_a_copy_for_windows() {
         let base = BundleDir::new("secrets");
         std::fs::write(base.0.join("pw.txt"), "s3cret").unwrap();
@@ -2789,10 +2805,6 @@ mod tests {
             ("x-virtkit.dax", "    x-virtkit:\n      dax: off\n"),
             ("x-virtkit.nested", "    x-virtkit:\n      nested: true\n"),
             ("x-virtkit.nics", "    x-virtkit:\n      nics: 2\n"),
-            (
-                "x-virtkit.tap",
-                "    x-virtkit:\n      tap: { name: vkdev0 }\n",
-            ),
             (
                 "x-virtkit.persist_root",
                 "    x-virtkit:\n      persist_root: true\n",

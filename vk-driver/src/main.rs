@@ -101,6 +101,7 @@ mod wineval;
 mod winexec;
 mod winiso;
 mod winsvc;
+mod wintap;
 mod workloads;
 mod wsl;
 
@@ -1470,6 +1471,11 @@ enum Cmd {
         /// A guest with this MAC gets exactly this address instead of a pool lease.
         #[arg(long = "reserve", value_name = "MAC=IP")]
         reserve: Vec<String>,
+        /// address leased without a router or DNS server (repeatable)
+        ///
+        /// A port of a guest whose eth0 is a host tap, which routes through the tap.
+        #[arg(long = "unrouted", value_name = "IP")]
+        unrouted: Vec<std::net::Ipv4Addr>,
         /// egress allowlist — destination IPv4 CIDR for direct (non-proxied) egress
         ///
         /// Optionally port-scoped as CIDR:port (repeatable). With no --allow-ip/--allow-name,
@@ -4194,6 +4200,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
         prefix,
         host,
         reserve,
+        unrouted,
         allow_ip,
         allow_name,
         egress_restrict,
@@ -4306,6 +4313,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             *prefix,
             hosts,
             reservations,
+            unrouted.iter().copied().collect(),
             egress,
             per_source,
             proxy,

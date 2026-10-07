@@ -357,6 +357,11 @@ for the primary, overriding its service's `tap`, and combines with `--net`. A ta
 rules out `--audit-egress` and a restricted egress policy, which live on the switch, and a
 tap primary `--registry-proxy`.
 `vk check --feature tap` reports whether a `vk` supports it.
+A [Windows guest](#windows-guests) takes a tap too, `vk run --tap` on a bundle or `tap` on a
+Windows service: Windows reads no kernel command line, so vk sets a static `ip` through
+qemu-ga once Windows has started (until then the guest has no address on the tap), and
+pins the siblings' names in `C:\Windows\System32\drivers\etc\hosts`; its switch port's
+DHCP lease carries no router or DNS server, so the tap holds the only default route.
 
 Without `mac` / `--tap-mac`, the MAC is derived from the host's machine ID and tap name,
 so hosts using the same tap name get different MACs. On a host without `/etc/machine-id`,
@@ -676,7 +681,8 @@ sharing images built from it.
   installs from the ISO again.
 
 **Run it.** `vk run ./web-out` boots the bundle on fresh copy-on-write overlays (`--net`
-for a DHCP lease, `--cpus`/`--mem` to resize, `--state-dir` to keep its disks); `vk list`
+for a DHCP lease, `--tap` for [a host network](#guest-size-init-kernel-and-nics), `--cpus`/`--mem` to
+resize, `--state-dir` to keep its disks); `vk list`
 shows it. In a compose file, `image: ./web-out` makes a Windows service on the run's LAN,
 at the address its name resolves to:
 
@@ -703,8 +709,8 @@ vk pause ./run && vk resume ./run               # freeze and thaw a vk run of a 
 state and disks, then ends it. `vk run <dir>` resumes it as often as wanted.
 `vk snapshot --run-dir <state-dir> --out <dir>` does the same for every Windows service of
 a compose run, and `vk run --compose … --from-snapshot <dir>` brings them back without
-provisioning (the AD lab in 8 s). Each service must keep the address, vCPUs and memory it
-was snapshotted with. A restored guest's clock is set through qemu-ga; until then Kerberos
+provisioning (the AD lab in 8 s). Each service must keep the address, tap, vCPUs and memory
+it was snapshotted with. A restored guest's clock is set through qemu-ga; until then Kerberos
 may fail. A snapshot depends on the bundle it was taken from and must be written on the
 run's filesystem.
 

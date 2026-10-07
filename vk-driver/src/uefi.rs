@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::net::TapNet;
 use crate::run::RunArgs;
 use crate::vmm::{Disk, Net, VmSpec};
 
@@ -98,27 +99,73 @@ pub(crate) struct Manifest {
 }
 
 /// What a snapshot bundle's run must match: the VM it was taken of.
-#[derive(Debug, Clone, Copy, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SnapshotInfo {
     /// The VM's address on its run's network, which its NIC's MAC derives from and the guest
     /// keeps using; None: it had no network.
     pub addr: Option<Ipv4Addr>,
+    /// The tap its first NIC was on, whose MAC and address the guest keeps using; None: it had
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tap: Option<TapNet>,
+}
+
+/// The run directory's record of the guest's tap ([`record_tap`]), which a snapshot keeps.
+pub(crate) const TAP_SPEC: &str = "tap.json";
+
+/// Record in `work` the tap the guest booting there is on, or that it has none.
+pub(crate) fn record_tap(work: &Path, tap: Option<&TapNet>) -> Result<()> {
+    let path = work.join(TAP_SPEC);
+    match tap {
+        Some(tap) => std::fs::write(&path, serde_json::to_vec(tap)?),
+        None => match std::fs::remove_file(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            done => done,
+        },
+    }
+    .with_context(|| format!("writing {}", path.display()))
+}
+
+/// The tap [`record_tap`] recorded in `work`; None: the guest has none.
+pub(crate) fn recorded_tap(work: &Path) -> Result<Option<TapNet>> {
+    let path = work.join(TAP_SPEC);
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(
+            serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing {}", path.display()))?,
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
 }
 
 /// Refuse to restore the snapshot `manifest` describes (if it is one) with other vCPUs `cpus`,
-/// memory `mem` or address `addr` than it was taken with: its saved CPU, memory and NIC state
-/// fit only those. `cpus` and `mem` are overrides (None: the manifest's); `addr` is the
-/// guest's address on its run's network (None: no network).
+/// memory `mem`, address `addr` or tap `tap` than it was taken with: its saved CPU, memory and
+/// NIC state fit only those. `cpus` and `mem` are overrides (None: the manifest's); `addr` is
+/// the guest's address on its run's network (None: no network).
 pub(crate) fn check_restore(
     manifest: &Manifest,
     cpus: Option<u32>,
     mem: Option<&str>,
     addr: Option<Ipv4Addr>,
+    tap: Option<&TapNet>,
 ) -> Result<()> {
-    let Some(snapshot) = manifest.snapshot else {
+    let Some(snapshot) = &manifest.snapshot else {
         return Ok(());
     };
+    if snapshot.tap.as_ref() != tap {
+        let taken = match &snapshot.tap {
+            Some(TapNet {
+                tap,
+                mac,
+                addr: Some((ip, prefix, ..)),
+            }) => format!("on tap {tap} ({mac}, {ip}/{prefix})"),
+            Some(TapNet { tap, mac, .. }) => format!("on tap {tap} ({mac}, DHCP)"),
+            None => "without a tap".to_string(),
+        };
+        bail!("this snapshot was taken {taken}: run it the same way");
+    }
     match (snapshot.addr, addr) {
         (Some(_), None) => bail!("this snapshot was taken on a network: run it with --net"),
         (None, Some(_)) => bail!("this snapshot was taken without a network: run it without --net"),
@@ -291,7 +338,6 @@ fn refuse_unsupported(args: &RunArgs) -> Result<()> {
         (args.host_exec, "--host-exec"),
         (args.atop.is_some(), "--atop"),
         (args.nics.is_some(), "--nics"),
-        (args.tap.is_some(), "--tap"),
         (args.audit_egress, "--audit-egress"),
         (args.registry_proxy.is_some(), "--registry-proxy"),
         (
@@ -589,6 +635,17 @@ pub(crate) fn guest_spec(
     })
 }
 
+/// The first NIC of a guest on `tap`: none without one. Its switch ports follow it.
+pub(crate) fn tap_net(tap: Option<&TapNet>) -> Net {
+    match tap {
+        Some(tap) => Net::Tap {
+            tap: tap.tap.clone(),
+            mac: tap.mac.clone(),
+        },
+        None => Net::None,
+    }
+}
+
 /// Stop the guest behind `ch`, with run directory `work`: press the ACPI power button, then
 /// request qemu-ga shutdown after [`BUTTON_GRACE`]. Return the elapsed time since the button,
 /// or `None` after `grace` if still running; the caller then kills it.
@@ -790,8 +847,14 @@ impl Drop for Guest {
 }
 
 /// Boot `bundle` and hold it until the guest powers off or the run is stopped.
-pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<()> {
+pub(crate) async fn run(
+    args: &RunArgs,
+    cfg: &crate::config::Config,
+    work: &Path,
+    bundle: Bundle,
+) -> Result<()> {
     refuse_unsupported(args)?;
+    crate::run::check_taps(cfg, args.tap.as_ref(), args.net, &[], None)?;
     crate::winbuild::warn_evaluation(&bundle.dir, &bundle.dir.display().to_string());
     let firmware = match bundle.manifest.firmware {
         Firmware::Uefi => firmware()?,
@@ -802,7 +865,14 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
     } else {
         None
     };
-    check_restore(&bundle.manifest, args.cpus, args.mem.as_deref(), guest_ip)?;
+    check_restore(
+        &bundle.manifest,
+        args.cpus,
+        args.mem.as_deref(),
+        guest_ip,
+        args.tap.as_ref(),
+    )?;
+    record_tap(work, args.tap.as_ref())?;
     // A snapshot's memory goes with its disks, variable store and TPM state as they were:
     // never with a previous run's.
     let disks = machine_files(work, &bundle, restore)?;
@@ -822,6 +892,11 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
     let mut switch = None;
     let mut nics = Vec::new();
     if args.net {
+        // Beside a tap, the switch is no route: Windows DHCPs its port.
+        let unrouted: Vec<Ipv4Addr> = guest_ip
+            .filter(|_| args.tap.is_some())
+            .into_iter()
+            .collect();
         let (child, attach) = crate::run::spawn_vm_switch(
             &vsock,
             work,
@@ -832,6 +907,7 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
             &[],
             &[],
             &[],
+            &unrouted,
             None,
             None,
             Some(work.join(crate::run::NET_BYTES)),
@@ -847,6 +923,7 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
     let restore_from = restore.then_some(bundle.dir.as_path());
     let mut spec = guest_spec(&firmware.path, work, &name, disks, cpus, &mem, restore_from)?;
     spec.nics = nics;
+    spec.net = tap_net(args.tap.as_ref());
     spec.numa = args.numa.clone();
     spec.tpm_state = tpm_state(work, &bundle.manifest);
     let vmm = crate::vmm::selected();
@@ -862,17 +939,22 @@ pub(crate) async fn run(args: &RunArgs, work: &Path, bundle: Bundle) -> Result<(
     // `vk reboot` hard-resets the guest: there is no agent to ask.
     crate::run::forward_hard_resets(&ch);
     println!(
-        "virtkit: {name}: UEFI guest {} ({cpus} vCPU, {mem}{}); console {}",
+        "virtkit: {name}: UEFI guest {} ({cpus} vCPU, {mem}{}{}); console {}",
         if restore {
             "restored from its snapshot"
         } else {
             "booting"
         },
         guest_ip.map_or(String::new(), |ip| format!(", {ip}")),
+        args.tap
+            .as_ref()
+            .map_or(String::new(), |t| format!(", tap {}", t.tap)),
         console.display()
     );
     if restore {
         set_clock_when_up(work.join(GUEST_AGENT_SOCKET));
+    } else if let Some(tap) = args.tap.clone() {
+        set_tap_address_when_up(work.to_path_buf(), tap, ch.id());
     }
 
     let _registration = crate::vms::register(crate::vms::VmEntry {
@@ -955,6 +1037,34 @@ fn set_clock_when_up(socket: PathBuf) {
                  until it is: {e:#}"
             ),
         });
+}
+
+/// Configure the tap address of the guest booting in run directory `work` under VMM `vmm`
+/// on a separate thread ([`set_tap_address`]). A restored guest needs no configuration:
+/// its snapshot was taken on the same tap, already configured.
+fn set_tap_address_when_up(work: PathBuf, tap: TapNet, vmm: u32) {
+    let _ = std::thread::Builder::new()
+        .name("vk-tap-address".into())
+        .spawn(
+            move || match set_tap_address(&work, &tap, &mut || crate::spawn::pid_alive(vmm)) {
+                Ok(()) => println!("virtkit: the guest's tap address is set"),
+                Err(e) => eprintln!("virtkit: warning: the guest's tap address is not set: {e:#}"),
+            },
+        );
+}
+
+/// Configure the tap address of the guest in run directory `work` once Windows has started
+/// ([`wait_started`]); until then a static address is not on the tap. `running` says whether
+/// the guest is still up.
+fn set_tap_address(work: &Path, tap: &TapNet, running: &mut dyn FnMut() -> bool) -> Result<()> {
+    let mut ga = wait_started(
+        &work.join(GUEST_AGENT_SOCKET),
+        &work.join(crate::run::CONSOLE_LOG),
+        crate::winsvc::START_TIMEOUT,
+        "the guest",
+        running,
+    )?;
+    crate::wintap::configure(&mut ga, tap, &[])
 }
 
 /// Set the clock of the guest behind `ga` to the host's.
@@ -1048,12 +1158,19 @@ mod tests {
         assert_eq!(
             m.snapshot,
             Some(SnapshotInfo {
-                addr: Some(Ipv4Addr::new(192, 168, 127, 2))
+                addr: Some(Ipv4Addr::new(192, 168, 127, 2)),
+                tap: None,
             })
         );
         let m = manifest(r#"{"firmware": "uefi", "disks": ["d"], "snapshot": {"addr": null}}"#)
             .unwrap();
-        assert_eq!(m.snapshot, Some(SnapshotInfo { addr: None }));
+        assert_eq!(
+            m.snapshot,
+            Some(SnapshotInfo {
+                addr: None,
+                tap: None
+            })
+        );
         assert!(
             manifest(r#"{"firmware": "uefi", "disks": ["d"]}"#)
                 .unwrap()
@@ -1076,11 +1193,15 @@ mod tests {
                 "snapshot": {"addr": "192.168.127.2"}}"#,
         )
         .unwrap();
-        check_restore(&m, None, None, ip(2)).unwrap();
-        check_restore(&m, Some(2), Some("4096M"), ip(2)).unwrap();
-        check_restore(&m, Some(2), Some("4096"), ip(2)).unwrap();
-        let err =
-            |cpus, mem, addr| format!("{:#}", check_restore(&m, cpus, mem, addr).unwrap_err());
+        check_restore(&m, None, None, ip(2), None).unwrap();
+        check_restore(&m, Some(2), Some("4096M"), ip(2), None).unwrap();
+        check_restore(&m, Some(2), Some("4096"), ip(2), None).unwrap();
+        let err = |cpus, mem, addr| {
+            format!(
+                "{:#}",
+                check_restore(&m, cpus, mem, addr, None).unwrap_err()
+            )
+        };
         assert!(err(None, None, None).contains("with --net"));
         assert!(err(None, None, ip(3)).contains("taken at 192.168.127.2, not 192.168.127.3"));
         let resized = "runs only with the 2 vCPUs and 4G of memory";
@@ -1091,12 +1212,74 @@ mod tests {
                 "snapshot": {"addr": null}}"#,
         )
         .unwrap();
-        check_restore(&offline, None, None, None).unwrap();
-        let err = check_restore(&offline, None, None, ip(2)).unwrap_err();
+        check_restore(&offline, None, None, None, None).unwrap();
+        let err = check_restore(&offline, None, None, ip(2), None).unwrap_err();
         assert!(format!("{err:#}").contains("without --net"));
         // A bundle that is not a snapshot boots with anything.
         let boot = manifest(r#"{"firmware": "uefi", "disks": ["d"]}"#).unwrap();
-        check_restore(&boot, Some(8), Some("1G"), None).unwrap();
+        check_restore(&boot, Some(8), Some("1G"), None, None).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_restores_only_on_the_tap_it_was_taken_with() {
+        let gw = Some(Ipv4Addr::new(192, 168, 77, 1));
+        let dns = [Ipv4Addr::new(192, 168, 77, 1)];
+        let tap = |name, ip| TapNet::new(name, Some("52:54:00:00:00:01"), ip, gw, &dns).unwrap();
+        let taken = tap("vktap0", Some("192.168.77.10/24"));
+        // Recorded in the run directory at boot, where a snapshot reads it.
+        let work = Scratch::new("tap-spec");
+        assert_eq!(recorded_tap(work.path()).unwrap(), None);
+        record_tap(work.path(), Some(&taken)).unwrap();
+        assert_eq!(recorded_tap(work.path()).unwrap().as_ref(), Some(&taken));
+        let json = serde_json::json!({
+            "firmware": "uefi", "disks": ["d"],
+            "snapshot": { "addr": null, "tap": taken },
+        });
+        let m = manifest(&json.to_string()).unwrap();
+        check_restore(&m, None, None, None, Some(&taken)).unwrap();
+        let err = |tap: Option<&TapNet>| {
+            format!(
+                "{:#}",
+                check_restore(&m, None, None, None, tap).unwrap_err()
+            )
+        };
+        assert!(err(None).contains("taken on tap vktap0 (52:54:00:00:00:01, 192.168.77.10/24)"));
+        let moved = tap("vktap0", Some("192.168.77.11/24"));
+        assert!(err(Some(&moved)).contains("run it the same way"));
+        assert!(err(Some(&tap("vktap1", Some("192.168.77.10/24")))).contains("the same way"));
+        // A snapshot without one restores without one, and its manifest says nothing of it.
+        record_tap(work.path(), None).unwrap();
+        assert_eq!(recorded_tap(work.path()).unwrap(), None);
+        let none = SnapshotInfo {
+            addr: None,
+            tap: None,
+        };
+        assert_eq!(serde_json::to_string(&none).unwrap(), r#"{"addr":null}"#);
+        let m = manifest(r#"{"firmware": "uefi", "disks": ["d"], "snapshot": {"addr": null}}"#)
+            .unwrap();
+        let err = check_restore(&m, None, None, None, Some(&taken)).unwrap_err();
+        assert!(format!("{err:#}").contains("without a tap"));
+    }
+
+    #[test]
+    fn the_tap_address_is_not_waited_for_once_the_guest_is_gone() {
+        let work = Scratch::new("tap-gone");
+        let tap = TapNet::new("vktap0", Some("52:54:00:00:00:01"), None, None, &[]).unwrap();
+        let err = set_tap_address(work.path(), &tap, &mut || false).unwrap_err();
+        assert!(err.to_string().contains("powered off"), "{err:#}");
+    }
+
+    #[test]
+    fn a_guest_on_a_tap_gets_it_as_its_first_nic() {
+        assert!(matches!(tap_net(None), Net::None));
+        let tap = TapNet::new("vktap0", Some("52:54:00:00:00:01"), None, None, &[]).unwrap();
+        let Net::Tap { tap, mac } = tap_net(Some(&tap)) else {
+            panic!("a tap guest's first NIC is its tap");
+        };
+        assert_eq!(
+            (tap.as_str(), mac.as_str()),
+            ("vktap0", "52:54:00:00:00:01")
+        );
     }
 
     #[test]
@@ -1303,11 +1486,6 @@ mod tests {
         let args = RunArgs {
             command: vec!["true".into()],
             ssh: true,
-            tap: Some(crate::net::TapNet {
-                tap: "vkdev0".into(),
-                mac: "02:00:00:00:00:01".into(),
-                addr: None,
-            }),
             audit_egress: true,
             registry_proxy: Some("10.0.2.2:5000".into()),
             inactivity_timeout_secs: Some(60),
@@ -1316,7 +1494,7 @@ mod tests {
         let err = refuse_unsupported(&args).unwrap_err().to_string();
         assert!(
             err.contains(
-                "honour a command, --ssh, --tap, --audit-egress, --registry-proxy, --inactivity-timeout"
+                "honour a command, --ssh, --audit-egress, --registry-proxy, --inactivity-timeout"
             ),
             "{err}"
         );

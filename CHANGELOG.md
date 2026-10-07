@@ -112,7 +112,7 @@ All notable changes to virtkit will be documented in this file.
   restart` press the guest's power button and give it three minutes to power off (a domain
   controller is slow to). The guest gets 2 vCPUs and 4G unless `vm.json`, `x-virtkit.cpus`/
   `mem` or `--service-cpus`/`--service-mem` say otherwise; volumes, `entrypoint`, `user`,
-  every other `x-virtkit` key and `--service-nics` above 1 are refused, and a Windows service
+  every other `x-virtkit` key but `tap` and `--service-nics` above 1 are refused, and a Windows service
   is a sibling only (not `--primary`, not in CI jobs). `vk exec <state-dir> --service <name>`
   runs a command in one, through its qemu-ga, as for a `vk run` of a bundle (`--tty`, `--user`
   and `--clear-env` are refused), and `vk cp --target <state-dir> --service <name>` copies a
@@ -121,6 +121,15 @@ All notable changes to virtkit will be documented in this file.
   run with a primary VM, Ctrl-C kills every guest at once; `vk stop` powers them off. A SIGTERM, or a `--detach` run's Ctrl-C, during the services' starts (Linux
   ones too) now goes through the run's teardown instead of ending it at once; the exit code is
   unchanged (130 or 143).
+- **Windows guests can sit on a host network through a tap.** `vk run --tap` on a bundle and
+  `x-virtkit: { tap: … }` on a Windows compose service work as for a Linux guest: the tap is
+  the first NIC, checked the same way at each start. A static `ip` is set through qemu-ga
+  once Windows has started, so the guest has no address on the tap until then; without one
+  Windows asks the tap LAN's DHCP, turned back on should a kept disk hold an earlier static
+  address. A compose service also gets the other services' names in
+  its hosts file. The switch no longer hands a tap guest's port a router or DNS server, so
+  Windows keeps one default route, through the tap. A snapshot restores only on the tap,
+  MAC and address it was taken with.
 - **`vk run` boots a UEFI guest, such as an installed Windows Server, from a local bundle.**
   A directory holding `vm.json` (`{"firmware": "uefi", "cpus": 2, "mem": "4G", "disks":
   ["disk.qcow2"]}`) and its named disks boots with embedded UEFI firmware and no vk-agent.

@@ -2092,6 +2092,8 @@ fn spawn_switch(
         prefix,
         hosts,
         reservations,
+        // A CI job's guests reach the switch through eth0, never beside a tap.
+        unrouted: Vec::new(),
         allow_ip,
         allow_name,
         restrict,

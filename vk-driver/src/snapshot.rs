@@ -103,6 +103,9 @@ fn save(
             .with_context(|| format!("copying {} into the snapshot", uuid.display()))?;
         crate::vmmctl::snapshot(control, &out)?;
         let machine = machine(&out)?;
+        // A tap guest restores only on the tap it was taken on, with its MAC and address.
+        let work = control.parent().context("the VM's run directory")?;
+        let tap = crate::uefi::recorded_tap(work)?;
         // A restored VM must have the snapshot's TPM.
         let tpm = !snapshot_state(&out)?["legacy"]["tpm"].is_null();
         let manifest = serde_json::json!({
@@ -112,7 +115,7 @@ fn save(
             "disks": names,
             "uefi_vars": vars.map(|_| crate::uefi::UEFI_VARS),
             "tpm": tpm,
-            "snapshot": crate::uefi::SnapshotInfo { addr: machine.addr },
+            "snapshot": crate::uefi::SnapshotInfo { addr: machine.addr, tap },
         });
         std::fs::write(&manifest_tmp, serde_json::to_string_pretty(&manifest)?)
             .with_context(|| format!("writing {}", manifest_tmp.display()))?;
@@ -434,7 +437,8 @@ mod tests {
         assert_eq!(
             bundle.manifest.snapshot,
             Some(crate::uefi::SnapshotInfo {
-                addr: Some(Ipv4Addr::new(192, 168, 127, 2))
+                addr: Some(Ipv4Addr::new(192, 168, 127, 2)),
+                tap: None,
             })
         );
         {
@@ -442,6 +446,18 @@ mod tests {
             let mode = std::fs::metadata(&out).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o700);
         }
+    }
+
+    #[test]
+    fn a_snapshot_of_a_tap_guest_records_its_tap() {
+        let run = Run::new("tap", false);
+        let tap =
+            crate::net::TapNet::new("vktap0", Some("52:54:00:00:00:01"), None, None, &[]).unwrap();
+        crate::uefi::record_tap(&run.dir.join("run"), Some(&tap)).unwrap();
+        let out = run.dir.join("out");
+        run.snapshot(&out).unwrap();
+        let bundle = crate::uefi::Bundle::open(&out).unwrap();
+        assert_eq!(bundle.manifest.snapshot.unwrap().tap, Some(tap));
     }
 
     #[test]

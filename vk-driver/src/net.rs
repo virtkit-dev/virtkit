@@ -174,7 +174,8 @@ fn parse_subnet(s: &str) -> Result<(Ipv4Addr, u8)> {
 /// A guest NIC on a caller-provided host tap (`vk run --tap`, compose `x-virtkit.tap`): eth0
 /// is a virtio-net device on the tap, so the guest sits on whatever LAN the tap is bridged to.
 /// A guest that also has switch ports (`--net`, compose) gets them as eth1 upward.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TapNet {
     pub tap: String,
     pub mac: String,

@@ -576,7 +576,7 @@ pub async fn run(args: &RunArgs, cfg: &crate::config::Config) -> Result<()> {
     // locked here as a pinned one already is.
     if let Some(bundle) = crate::uefi::Bundle::detect(&args.image)? {
         work.lock()?;
-        return crate::uefi::run(args, &work.path, bundle).await;
+        return crate::uefi::run(args, cfg, &work.path, bundle).await;
     }
     // Resolve the agent and kernel: an explicit flag wins, else the copy embedded
     // in `vk` (served from a memfd), else the on-disk default.
@@ -1815,7 +1815,7 @@ async fn build_and_boot(
         primary_idx,
         Some(primary_ip),
     )?;
-    pin_tap_hosts(&mut planned, primary_tap.as_ref())?;
+    plan_taps(&mut planned, primary_tap.as_ref())?;
     let start_deps = start_deps(&planned);
     // With sibling services under management, the agent exposes their control
     // plane at /run/vk/services (a FUSE bridge to the manager over vsock).
@@ -1905,6 +1905,11 @@ async fn build_and_boot(
             (Some(allow), None) => (allow.allow_ip.as_slice(), allow.allow_name.as_slice()),
             _ => (&[][..], &[][..]),
         };
+        let mut unrouted = planned.unrouted.clone();
+        if primary_tap.is_some() {
+            unrouted.push(primary_ip);
+            unrouted.extend_from_slice(&planned.primary_extra_ips);
+        }
         let (child, attach) = spawn_vm_switch(
             &vsock,
             work,
@@ -1915,6 +1920,7 @@ async fn build_and_boot(
             &planned.primary_extra_ips,
             &hosts,
             &planned.reservations,
+            &unrouted,
             registry_proxy,
             args.audit_egress.then(|| work.join(AUDIT_LOG)),
             Some(work.join(NET_BYTES)),
@@ -2970,6 +2976,9 @@ struct PlannedServices {
     /// its run-assigned IP, so an image-init sibling that DHCPs eth0 lands on the
     /// address the resolver advertises for its name
     reservations: Vec<(String, String)>,
+    /// the switch addresses of tap siblings, leased without a router or resolver
+    /// ([`crate::switch::Spawn::unrouted`])
+    unrouted: Vec<std::net::Ipv4Addr>,
     /// Addresses for the primary VM's NICs after eth0, in interface order. Allocated here
     /// because they come from the same LAN-wide region as the siblings' and must not
     /// collide with them; consumed by the primary boot, not by the manager.
@@ -3223,6 +3232,7 @@ fn plan_services(
         listen: Vec::new(),
         hosts: Vec::new(),
         reservations: Vec::new(),
+        unrouted: Vec::new(),
         primary_extra_ips: Vec::new(),
     };
     let (gw, prefix, _) = crate::net::switch_addrs(RUN_SUBNET)?;
@@ -3360,7 +3370,7 @@ fn plan_services(
 /// always do, the primary with `--net`), and a primary tap a VMM cannot attach. A sibling's
 /// tap is probed when it starts ([`crate::units::boot_unit`]), since it may never start.
 /// The unit at `primary_idx` is the primary, whose tap `primary` already settles.
-fn check_taps(
+pub(crate) fn check_taps(
     cfg: &crate::config::Config,
     primary: Option<&crate::net::TapNet>,
     primary_on_switch: bool,
@@ -3389,11 +3399,12 @@ fn check_taps(
     Ok(())
 }
 
-/// Give every tap sibling the LAN's names minus its own, for its `/etc/hosts` (its resolver is
-/// the tap LAN's, which does not know them), and refuse two guests of this run on one tap: a
-/// tap carries one NIC, and the second VMM's open fails (EBUSY), leaving that guest's eth0
-/// dead. A tap held by another run is caught by [`crate::net::probe_tap`] at start.
-fn pin_tap_hosts(
+/// Plan the run's tap siblings: refuse two guests of this run on one tap (a tap carries one
+/// NIC, and the second VMM's open fails with EBUSY, leaving that guest's eth0 dead), give each
+/// the LAN's names minus its own for its hosts file (its resolver is the tap LAN's, which does
+/// not know them), and lease its switch ports without a route. A tap held by another run is
+/// caught by [`crate::net::probe_tap`] at start.
+fn plan_taps(
     planned: &mut PlannedServices,
     primary_tap: Option<&crate::net::TapNet>,
 ) -> Result<()> {
@@ -3417,6 +3428,8 @@ fn pin_tap_hosts(
         if prov.tap.is_some() {
             let own = prov.addr.to_string();
             prov.tap_hosts = hosts.iter().filter(|(_, ip)| *ip != own).cloned().collect();
+            planned.unrouted.push(prov.addr);
+            planned.unrouted.extend_from_slice(&prov.extra_ips);
         }
     }
     Ok(())
@@ -3518,7 +3531,7 @@ async fn compose_up(
     // compose-up has no primary — every unit is a sibling, so there is nothing to build up
     // front here (siblings resolve/build via plan_services + the manager).
     let mut planned = plan_services(args, cfg, state_dir, work, &units, None, None)?;
-    pin_tap_hosts(&mut planned, None)?;
+    plan_taps(&mut planned, None)?;
     let start_deps = start_deps(&planned);
 
     // The run answers Ctrl-C by stopping its services, a Windows one with its power button, so
@@ -3543,6 +3556,7 @@ async fn compose_up(
         &[],
         &planned.hosts,
         &planned.reservations,
+        &planned.unrouted,
         None,
         args.audit_egress.then(|| work.join(AUDIT_LOG)),
         Some(work.join(NET_BYTES)),
@@ -4706,6 +4720,8 @@ pub(crate) async fn spawn_vm_switch(
     primary_extra_ips: &[std::net::Ipv4Addr],
     hosts: &[(String, String)],
     reservations: &[(String, String)],
+    // Addresses leased without a router or resolver: the switch ports of tap guests.
+    unrouted: &[std::net::Ipv4Addr],
     registry_proxy: Option<(std::net::Ipv4Addr, std::net::SocketAddr)>,
     audit_log: Option<PathBuf>,
     // Where this switch publishes what it forwarded, for the phase's resource line. A build
@@ -4746,6 +4762,7 @@ pub(crate) async fn spawn_vm_switch(
         prefix,
         hosts: hosts.to_vec(),
         reservations,
+        unrouted: unrouted.to_vec(),
         allow_ip: allow_ip.to_vec(),
         allow_name: allow_name.to_vec(),
         restrict,
@@ -5014,6 +5031,7 @@ pub(crate) async fn boot_session(
             &[],
             // A build stage guest is one NIC: nothing declares otherwise, and a RUN step
             // has no interface layout to satisfy.
+            &[],
             &[],
             &[],
             &[],
@@ -5473,6 +5491,7 @@ mod tests {
             listen: Vec::new(),
             hosts,
             reservations: Vec::new(),
+            unrouted: Vec::new(),
             primary_extra_ips: Vec::new(),
         }
     }
@@ -5514,7 +5533,7 @@ mod tests {
     fn one_tap_per_guest_and_each_tap_guest_pins_the_others() {
         let shared = "services:\n  a:\n    image: x\n    x-virtkit: { tap: { name: t0 } }\n  \
                       b:\n    image: x\n    x-virtkit: { tap: { name: t0 } }\n";
-        let err = pin_tap_hosts(&mut planned_siblings(shared), None).unwrap_err();
+        let err = plan_taps(&mut planned_siblings(shared), None).unwrap_err();
         assert_eq!(
             err.to_string(),
             "tap t0 is claimed by both service a and service b"
@@ -5523,7 +5542,7 @@ mod tests {
         let yaml = "services:\n  a:\n    image: x\n    x-virtkit: { tap: { name: t1 } }\n  \
                     b:\n    image: x\n";
         let primary = crate::net::TapNet::new("t1", None, None, None, &[]).unwrap();
-        let err = pin_tap_hosts(&mut planned_siblings(yaml), Some(&primary)).unwrap_err();
+        let err = plan_taps(&mut planned_siblings(yaml), Some(&primary)).unwrap_err();
         assert_eq!(
             err.to_string(),
             "tap t1 is claimed by both the primary and service a"
@@ -5531,7 +5550,7 @@ mod tests {
 
         let mut planned = planned_siblings(yaml);
         let primary = crate::net::TapNet::new("t0", None, None, None, &[]).unwrap();
-        pin_tap_hosts(&mut planned, Some(&primary)).unwrap();
+        plan_taps(&mut planned, Some(&primary)).unwrap();
         let tap_hosts: Vec<_> = planned
             .units
             .iter()
@@ -5542,6 +5561,11 @@ mod tests {
             tap_hosts,
             [("a", vec![b.clone()]), ("b", Vec::new())],
             "a tap guest pins every name but its own; a switch-only one pins none"
+        );
+        assert_eq!(
+            planned.unrouted,
+            [planned.units[0].0.addr],
+            "only a tap guest's switch port is leased without a route"
         );
     }
 

@@ -5,7 +5,10 @@
 //! Every start boots fresh overlays over the bundle's disks, with a new VM generation ID: a
 //! restart is a new machine, as a Linux service's throwaway root is. The NIC's MAC derives from
 //! the unit's address, so the switch's DHCP reservation hands Windows that address, with the
-//! gateway as its resolver (which answers the other services' names).
+//! gateway as its resolver (which answers the other services' names). A service on a tap
+//! (`x-virtkit.tap`) has it as its first NIC instead, the switch port leased without a route;
+//! its static address, if any, and the run's names in its hosts file are set over qemu-ga
+//! before its provisioning ([`crate::wintap`]).
 //!
 //! The service is up once its provisioning has run: the compose `command:`, else the image's
 //! `CMD` (kept in the bundle's `layer.json`), run through qemu-ga as SYSTEM with `VK_HOSTNAME`,
@@ -66,6 +69,10 @@ pub(crate) fn boot(
     gateway: Ipv4Addr,
 ) -> Result<(Child, crate::embed::Resolved)> {
     let bundle = Bundle::open(&svc.ext4)?;
+    // Every start, restarts included: the tap may have gone or been taken since the last.
+    if let Some(tap) = &svc.tap {
+        crate::net::probe_tap(&tap.tap).with_context(|| format!("service {}", svc.name))?;
+    }
     let disks = new_machine(dir, &bundle)?;
     let cpus = svc.cpus.or(bundle.manifest.cpus).unwrap_or(DEFAULT_CPUS);
     let mem = svc
@@ -78,17 +85,25 @@ pub(crate) fn boot(
         svc.cpus,
         svc.mem.as_deref(),
         Some(svc.addr),
+        svc.tap.as_ref(),
     )
     .with_context(|| format!("service {}", svc.name))?;
+    crate::uefi::record_tap(dir, svc.tap.as_ref())?;
     let address = dir.join(ADDRESS);
     std::fs::write(&address, svc.addr.to_string())
         .with_context(|| format!("writing {}", address.display()))?;
     let firmware = crate::uefi::firmware()?;
     // A snapshot (`vk run --compose --from-snapshot`) resumes instead of booting.
-    let restore = bundle.manifest.snapshot.map(|_| bundle.dir.as_path());
+    let restore = bundle
+        .manifest
+        .snapshot
+        .as_ref()
+        .map(|_| bundle.dir.as_path());
     let mut spec =
         crate::uefi::guest_spec(&firmware.path, dir, &svc.name, disks, cpus, &mem, restore)?;
     spec.tpm_state = crate::uefi::tpm_state(dir, &bundle.manifest);
+    // A tap is the first NIC, the switch port the next, which the switch leases without a route.
+    spec.net = crate::uefi::tap_net(svc.tap.as_ref());
     spec.nics = crate::vmm::switch_attach(
         &dir.join(crate::units::VSOCK_SOCKET),
         net_port,
@@ -122,6 +137,11 @@ pub(crate) struct Provisioning {
     pub secrets: Vec<crate::compose::Secret>,
     /// The service resumes from a snapshot, provisioned already: only its clock is set.
     pub restored: bool,
+    /// Its first NIC's tap, configured before provisioning ([`crate::wintap`]), and the
+    /// run's names (name, ip) pinned in its hosts file because the tap LAN's resolver
+    /// does not know them.
+    pub tap: Option<crate::net::TapNet>,
+    pub tap_hosts: Vec<(String, String)>,
 }
 
 impl Provisioning {
@@ -173,6 +193,8 @@ impl Provisioning {
             env,
             secrets: unit.secrets.clone(),
             restored,
+            tap: svc.tap.clone(),
+            tap_hosts: svc.tap_hosts.clone(),
         })
     }
 
@@ -207,6 +229,10 @@ impl Provisioning {
             log_path.display()
         );
         let mut ga = crate::uefi::wait_started(&socket, &console, START_TIMEOUT, &label, running)?;
+        if let Some(tap) = &self.tap {
+            crate::wintap::configure(&mut ga, tap, &self.tap_hosts)
+                .with_context(|| format!("service {}", self.name))?;
+        }
         self.put_secrets(&mut ga)?;
         let Some(command) = &self.command else {
             return Ok(());
@@ -405,6 +431,26 @@ mod tests {
     }
 
     #[test]
+    fn a_service_on_a_tap_takes_it_to_its_provisioning() {
+        let p = provisioning_of(
+            "    x-virtkit:\n      tap: { name: vktap0, mac: '52:54:00:00:00:01', \
+             ip: 192.168.77.10/24, gw: 192.168.77.1, dns: [192.168.77.1] }\n",
+        )
+        .unwrap();
+        let tap = p.tap.unwrap();
+        assert_eq!(
+            (tap.tap.as_str(), tap.mac.as_str()),
+            ("vktap0", "52:54:00:00:00:01")
+        );
+        assert_eq!(
+            tap.addr.unwrap().0,
+            Ipv4Addr::new(192, 168, 77, 10),
+            "its static address"
+        );
+        assert!(provisioning_of("").unwrap().tap.is_none());
+    }
+
+    #[test]
     fn a_variable_a_batch_file_cannot_carry_is_refused_before_booting() {
         let Err(err) = provisioning_of("    environment:\n      PASS: 'a\"b'\n") else {
             panic!("a quote in a variable is refused");
@@ -487,6 +533,8 @@ mod tests {
                 file: dir.join("pw.txt"),
             }],
             restored: false,
+            tap: None,
+            tap_hosts: Vec::new(),
         };
         let result = p.put_secrets(&mut ga);
         let _ = std::fs::remove_dir_all(&dir);
