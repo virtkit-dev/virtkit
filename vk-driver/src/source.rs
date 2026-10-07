@@ -288,8 +288,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("vk-docker-config-{}", std::process::id()));
         std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
         let docker = dir.join("docker");
+        // Written beside it and copied in place by `cp`: while this process holds a file open for
+        // writing, a child another test forks inherits that fd until it execs, and the file
+        // cannot be run meanwhile (ETXTBSY).
+        let source = docker.with_extension("sh");
         vk_fs::write_atomic(
-            &docker,
+            &source,
             br#"#!/bin/sh
 set -eu
 [ "$#" -eq 5 ]
@@ -312,6 +316,11 @@ esac
             0o700,
         )
         .unwrap();
+        let copied = std::process::Command::new("cp")
+            .arg(&source)
+            .arg(&docker)
+            .status();
+        assert!(copied.unwrap().success());
 
         for image in ["missing", "null", "empty"] {
             let c = docker_run_config(&docker, image).unwrap();
