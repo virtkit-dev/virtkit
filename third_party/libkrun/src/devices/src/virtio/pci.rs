@@ -247,7 +247,7 @@ impl Default for MsixVectors {
 /// aligned and 4 or 8 bytes wide. Anything else reads as all ones and writes are dropped,
 /// without the per-access warning the guest could otherwise flood the log with.
 fn msix_access(offset: u64, len: usize) -> bool {
-    matches!(len, 4 | 8) && offset % len as u64 == 0
+    matches!(len, 4 | 8) && offset.is_multiple_of(len as u64)
 }
 
 struct PciInterruptState {
@@ -2618,7 +2618,7 @@ mod tests {
         );
 
         let mut value = [0; 4];
-        bars.read(0, u64::from(DEVICE_CFG_OFFSET), &mut value);
+        bars.read(0, DEVICE_CFG_OFFSET, &mut value);
         assert_eq!(value, DEVICE_CONFIG);
 
         config.write(
@@ -2626,11 +2626,11 @@ mod tests {
             crate::pci::CONFIG_MECHANISM_1_DATA_PORT_OFFSET,
             &second_bar.to_le_bytes(),
         );
-        bars.read(0, u64::from(DEVICE_CFG_OFFSET), &mut value);
+        bars.read(0, DEVICE_CFG_OFFSET, &mut value);
         assert_eq!(value, [PCI_UNIMPLEMENTED_READ_BYTE; DWORD_SIZE]);
         bars.read(
             0,
-            u64::from(second_bar - first_bar) + u64::from(DEVICE_CFG_OFFSET),
+            u64::from(second_bar - first_bar) + DEVICE_CFG_OFFSET,
             &mut value,
         );
         assert_eq!(value, DEVICE_CONFIG);
