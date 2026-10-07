@@ -69,9 +69,10 @@ vk build -f win11.Dockerfile --target member11 --out ./member11-out
 
 Add it to `lab-ad.compose.yaml` as the Dockerfile describes.
 
-Secure Boot is **experimental** in vk: the firmware runs without SMM, so the guest's kernel can
-rewrite PK, KEK, db or dbx, or turn Secure Boot off; it guards only the boot chain below the
-kernel. See the known issue below.
+Secure Boot runs without SMM: vk keeps and checks the UEFI variables on the host, so PK, KEK, db
+and dbx are out of the guest's reach and Windows applies Microsoft's updates to them (its
+Secure-Boot-Update task), but the firmware itself runs unprotected from the guest's kernel
+while it boots. See [how Windows guests work](../../docs/windows.md).
 
 ## 4. Two forests with a trust — `two-forests.compose.yaml`
 
@@ -158,16 +159,6 @@ out after it went through, a trust the other DC is not ready for yet).
 
 ## Known issues
 
-- **Windows 11 stops with bug check 0x1E when it updates its Secure Boot databases**, a
-  consequence of the experimental Secure Boot above. The scheduled task
-  `\Microsoft\Windows\PI\Secure-Boot-Update` writes authenticated UEFI variables (db/dbx) at
-  run time, and that write faults in the firmware's runtime services (KMODE_EXCEPTION_NOT_HANDLED,
-  from `taskhostw.exe`; root cause under investigation). Starting the task reproduces it within
-  seconds; reading variables and plain writes (`bcdedit` on `{fwbootmgr}`) do not. Windows runs
-  the task on its own schedule, so a workstation crashed at random. `win11.Dockerfile` disables
-  the task: the machines then get no db/dbx revocations and no rollover to Microsoft's 2023
-  certificates, which is acceptable for a lab only, and Windows servicing may still trigger such
-  an update.
 - **The multi-forest labs need about 15 GiB of guest memory**, and a domain controller at least
   2.5 GiB: at 1.5 GiB, under a trust being made and several joins at once, Active Directory
   ran short and answered in odd ways (an account it had "not found", "the directory service is
@@ -186,8 +177,6 @@ multi-forest labs whole (both workstations, every check, the RDP job's sign-ins 
 trusts; about 7 minutes each once built), `tests/windows-ad-e2e.sh` (the lab
 restored in 8 s), and `tests/windows-rdp-e2e.sh`. Left:
 
-- **The firmware fault above:** find its root cause in the authenticated variable path (with
-  the flash variable store), fix it, and turn the Secure Boot update task back on.
 - **A `vk run` whose output closes leaves its Windows guests running:** writing to a closed
   pipe ended the run before it powered its guests off (seen with `vk run … | while read`); it
   should stop its guests whatever ends it.
