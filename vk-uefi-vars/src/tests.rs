@@ -497,3 +497,164 @@ fn a_snapshot_keeps_the_phase_and_the_volatile_variables() {
         [1]
     );
 }
+
+// --- Malformed messages: the guest writes the buffer, and a panic would end its VM ---
+
+/// xorshift64*, so that a failing iteration replays from its seed.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n.max(1) as u64) as usize
+    }
+}
+
+/// An MM message for `handler`: its header, then `body`.
+fn mm(handler: &Guid, body: &[u8]) -> Vec<u8> {
+    let mut m = handler.0.to_vec();
+    m.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    m.extend_from_slice(body);
+    m
+}
+
+/// A variable protocol message: function, status, then `payload`.
+fn var_mm(function: u64, payload: &[u8]) -> Vec<u8> {
+    let mut body = function.to_le_bytes().to_vec();
+    body.extend_from_slice(&u64::MAX.to_le_bytes());
+    body.extend_from_slice(payload);
+    mm(&guid::SMM_VARIABLE_PROTOCOL, &body)
+}
+
+/// ACCESS_VARIABLE: guid, data size, name size, attributes, name, data.
+fn access(g: &Guid, n: &str, attrs: u32, data: &[u8], room: usize) -> Vec<u8> {
+    let name = codec::ucs2_bytes(&name(n));
+    let mut p = g.0.to_vec();
+    p.extend_from_slice(&(data.len().max(room) as u64).to_le_bytes());
+    p.extend_from_slice(&(name.len() as u64).to_le_bytes());
+    p.extend_from_slice(&attrs.to_le_bytes());
+    p.extend_from_slice(&name);
+    p.extend_from_slice(data);
+    p.resize(ACCESS_NAME + name.len() + data.len().max(room), 0);
+    p
+}
+
+/// Well-formed messages of every kind the service handles, to mutate.
+fn seed_messages(pk: &Signer, kek: &Signer) -> Vec<Vec<u8>> {
+    let g = GLOBAL_VARIABLE;
+    let db = IMAGE_SECURITY_DATABASE;
+    let mut seeds = vec![
+        var_mm(3, &access(&VENDOR, "Fuzz", NV_BS_RT, b"value", 0)),
+        var_mm(1, &access(&VENDOR, "Fuzz", 0, b"", 64)),
+        var_mm(1, &access(&g, "SecureBoot", 0, b"", 1)),
+        var_mm(4, &[0u8; 32]),
+        var_mm(5, &[]),
+        var_mm(6, &[]),
+        var_mm(8, &access(&VENDOR, "Fuzz", 0, b"", 0)),
+        var_mm(9, &[]),
+        var_mm(10, &[]),
+        var_mm(11, &[0u8; 8]),
+    ];
+    let mut next = VENDOR.0.to_vec();
+    next.extend_from_slice(&64u64.to_le_bytes());
+    next.extend_from_slice(&[0u8; 64]);
+    seeds.push(var_mm(2, &next));
+    for (n, guid, by, payload) in [
+        ("PK", g, None, pk.siglist()),
+        ("KEK", g, Some(pk), kek.siglist()),
+        ("db", db, Some(kek), kek.siglist()),
+        ("dbx", db, Some(kek), kek.siglist()),
+    ] {
+        let data = authenticated(n, &guid, AUTH, 1, &payload, by);
+        seeds.push(var_mm(3, &access(&guid, n, AUTH, &data, 0)));
+    }
+    for command in 1..=5u32 {
+        let mut body = POLICY_SIGNATURE.to_le_bytes().to_vec();
+        body.extend_from_slice(&POLICY_REVISION.to_le_bytes());
+        body.extend_from_slice(&command.to_le_bytes());
+        body.extend_from_slice(&[0u8; 12]);
+        if command == 3 {
+            let name = codec::ucs2_bytes(&name("Fuzz"));
+            body.extend_from_slice(&0x0001_0000u32.to_le_bytes()); // revision
+            body.extend_from_slice(&((40 + name.len()) as u16).to_le_bytes());
+            body.extend_from_slice(&40u16.to_le_bytes()); // name offset
+            body.extend_from_slice(&VENDOR.0);
+            body.extend_from_slice(&[0u8; 16]); // sizes, attributes
+            body.extend_from_slice(&name);
+        } else {
+            body.extend_from_slice(&[0u8; 16]);
+        }
+        seeds.push(mm(&guid::VAR_CHECK_POLICY_MMI, &body));
+    }
+    seeds
+}
+
+/// Flip bytes, set 4- or 8-byte fields to edge values, cut or extend the message.
+fn mutate(m: &mut Vec<u8>, rng: &mut Rng) {
+    const EDGES: [u64; 8] = [0, 1, 2, 0x7f, 0xffff, 0xffff_ffff, u64::MAX, 0x8400];
+    for _ in 0..1 + rng.below(4) {
+        match rng.below(6) {
+            0 | 1 if !m.is_empty() => {
+                let i = rng.below(m.len());
+                m[i] ^= 1 << rng.below(8);
+            }
+            2 if m.len() >= 8 => {
+                let i = rng.below(m.len() - 7);
+                let v = EDGES[rng.below(EDGES.len())];
+                m[i..i + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            3 if m.len() >= 4 => {
+                let i = rng.below(m.len() - 3);
+                let v = EDGES[rng.below(EDGES.len())] as u32;
+                m[i..i + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            4 => m.truncate(rng.below(m.len() + 1)),
+            _ => m.resize(m.len() + rng.below(64), rng.next() as u8),
+        }
+    }
+}
+
+/// Mutated and random messages never panic the service, nor writing its store after them.
+/// `UEFI_VARS_FUZZ=<iterations>` and `UEFI_VARS_FUZZ_SEED=<n>` run it longer or elsewhere.
+#[test]
+fn malformed_messages_never_panic_the_service() {
+    let env = |key: &str, default: u64| {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let iterations = env("UEFI_VARS_FUZZ", 20_000);
+    let seed = env("UEFI_VARS_FUZZ_SEED", 0x5eed);
+    let (pk, kek) = (signer("PK"), signer("KEK"));
+    let seeds = seed_messages(&pk, &kek);
+    let mut rng = Rng(seed | 1);
+    let mut svc = Service::new(image()).unwrap();
+    for i in 0..iterations {
+        // Now and then a fresh service, in setup mode and before the end of DXE again.
+        if i % 2_000 == 0 {
+            svc = Service::new(image()).unwrap();
+        }
+        let mut m = if rng.below(10) == 0 {
+            (0..rng.below(512)).map(|_| rng.next() as u8).collect()
+        } else {
+            seeds[rng.below(seeds.len())].clone()
+        };
+        mutate(&mut m, &mut rng);
+        let message = m.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = svc.communicate(&mut m);
+            let _ = svc.take_image();
+        }));
+        assert!(
+            outcome.is_ok(),
+            "iteration {i} (seed {seed:#x}) panicked the service on {message:02x?}"
+        );
+    }
+}
