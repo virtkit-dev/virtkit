@@ -185,7 +185,8 @@
         # only, swaps the platform's variable driver for edk2's client of a variable service on
         # the host (VirtMmCommunicationDxe, as for qemu's uefi-vars device), which vk's
         # vk-uefi-vars is, and adds the MemoryOverwriteRequestControl variable BitLocker looks
-        # for with a TPM.
+        # for with a TPM. NOTICE names the edk2 and OpenSSL versions this builds: update it
+        # when a lock bump changes either.
         packages.firmware =
           ((pkgs.OVMF-cloud-hypervisor.override {
             secureBoot = true;
