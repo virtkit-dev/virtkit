@@ -10,7 +10,7 @@
 //! the firmware's own checks failed once Windows had mapped its runtime services.
 //!
 //! The non-volatile variables live in an edk2 variable store flash image (`edk2`), the format
-//! the machines' stores already had.
+//! the machines' stores already had. See docs/uefi-vars-design.md.
 
 mod auth;
 mod codec;

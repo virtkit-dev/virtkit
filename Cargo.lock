@@ -1892,6 +1892,7 @@ dependencies = [
  "serde",
  "virtio-bindings",
  "vk-tpm",
+ "vk-uefi-vars",
  "vm-fdt",
  "vm-memory",
  "windows-sys 0.61.2",

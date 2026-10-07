@@ -91,10 +91,14 @@ pub use self::serial::SerialState;
 pub use self::vcpu::VcpuList;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use self::x86_64::flash::{Flash, FlashMode, FlashState};
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "uefi-vars"))]
+pub use self::x86_64::fw_cfg::{FW_CFG_PORT, FW_CFG_PORT_LEN, FwCfg};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use self::x86_64::pvpanic::PvPanic;
 #[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "tpm"))]
 pub use self::x86_64::tpm::{TPM_CRB_SIZE, TpmCrb, TpmState};
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "uefi-vars"))]
+pub use self::x86_64::uefi_vars::{UEFI_VARS_SIZE, UefiVars, UefiVarsState};
 
 // Cannot use multiple types as bounds for a trait object, so we define our own trait
 // which is a composition of the desired bounds. In this case, io::Read and AsRawFd.

@@ -103,16 +103,18 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with thirteen crates:
   primaries derived as libtpms derives them), contexts, persistent objects, NV indices,
   policies, attestation, duplication, EK provisioning, versioned state; crypto from RustCrypto
   crates only. See `docs/tpm-design.md`.
-- **`vk-uefi-vars/`** — the UEFI variable service of Windows guests, on the host: the variables
-  in an edk2 variable store image, GetVariable, GetNextVariableName, SetVariable and
-  QueryVariableInfo as edk2's SMM variable driver answers them, Secure Boot's authenticated
-  writes (PKCS#7, signature lists), private authenticated variables, variable policies and
-  locks; crypto from RustCrypto crates only.
+- **`vk-uefi-vars/`** — the UEFI variable service of Windows guests, on the host behind
+  libkrun's uefi-vars device: the variables in an edk2 variable store image, GetVariable,
+  GetNextVariableName, SetVariable and QueryVariableInfo as edk2's SMM variable driver answers
+  them, Secure Boot's authenticated writes (PKCS#7, signature lists), private authenticated
+  variables, variable policies and locks; crypto from RustCrypto crates only. See
+  `docs/uefi-vars-design.md`.
 
 libkrun is vendored (its own cargo workspace, locally patched) under
 `third_party/libkrun` — see its `VENDOR.md` for the patch list. Its `devices` crate depends on
-`vk-tpm` by path, so its `Cargo.lock` locks `vk-tpm`'s dependencies too: after changing them,
-run `cargo update -p vk-tpm` in `third_party/libkrun` as well.
+`vk-tpm` and `vk-uefi-vars` by path, so its `Cargo.lock` locks their dependencies too: after
+changing them, run `cargo update -p vk-tpm` (or `-p vk-uefi-vars`) in `third_party/libkrun` as
+well.
 
 The guest kernel is a vanilla Linux `vmlinux` built from a vendored config fragment
 (`kernel/`); it is pinned and built separately from the binaries.

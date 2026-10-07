@@ -99,6 +99,10 @@ pub const UEFI_VARS_FLASH_BLOCK: usize = 0x1000;
 pub const TPM_CRB_START: u64 = 0xfed4_0000;
 pub const TPM_CRB_SIZE: u64 = 0x1000;
 
+/// The UEFI variable service's register page (local patch, see VENDOR.md), which the firmware
+/// finds through fw_cfg's etc/hardware-info.
+pub const UEFI_VARS_START: u64 = 0xfed5_0000;
+
 /// The 16-byte VM generation ID the DSDT's VGEN device points at: the last page of the
 /// reserved window below 1 MiB, past the ACPI tables (local patch).
 pub const VMGENID_ADDR: u64 = 0x000f_f000;

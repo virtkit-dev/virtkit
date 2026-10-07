@@ -9,6 +9,15 @@ All notable changes to virtkit will be documented in this file.
 - **Windows guests get a hardware random-number generator, as Linux guests do.** A Windows
   guest restored from a snapshot taken before this release restores without one.
 
+### Fixed
+
+- **Windows can update its Secure Boot databases.** Windows' Secure Boot update task stopped
+  the guest with bug check 0x1E when it wrote dbx; the update now applies. vk keeps and checks
+  a Windows guest's UEFI variables itself, as a physical machine's firmware does out of the
+  operating system's reach: PK, KEK, db and dbx change only through updates signed by the keys
+  above them, and the guest's kernel can no longer rewrite them. Machines keep their variable
+  files, and snapshots taken before restore as they did.
+
 ## [0.87.0] - 2026-10-10
 
 ### Added
