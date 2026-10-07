@@ -2545,7 +2545,22 @@ mod tests {
         assert_eq!(json(&again.sregs), json(&saved.sregs));
         assert_eq!(json(&again.lapic), json(&saved.lapic));
         assert_eq!(json(&again.xcrs), json(&saved.xcrs));
-        assert_eq!(json(&again.cpuid), json(&saved.cpuid));
+        // Leaves 0xB and 0x1F carry in EDX the x2APIC ID of the host CPU each vCPU's supported
+        // CPUID was read on, which differs between two vCPUs as the scheduler places them.
+        let without_host_x2apic_ids = |cpuid: &[kvm_cpuid_entry2]| {
+            let mut cpuid = cpuid.to_vec();
+            for entry in cpuid
+                .iter_mut()
+                .filter(|e| matches!(e.function, 0xb | 0x1f))
+            {
+                entry.edx = 0;
+            }
+            json(&cpuid)
+        };
+        assert_eq!(
+            without_host_x2apic_ids(&again.cpuid),
+            without_host_x2apic_ids(&saved.cpuid)
+        );
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]
