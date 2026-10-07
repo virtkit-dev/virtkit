@@ -4,7 +4,7 @@
 //! the guest on it, acting through qemu-ga ([`crate::winexec`]) and powering it off cleanly.
 //! `ENV`, `WORKDIR` and `SHELL` shape the `RUN` steps after them. `# vk: disk=` sizes a
 //! `winiso:` stage's install, `# vk: generalize=on` ends the stage with sysprep, and
-//! `# vk: firmware=uefi-secboot` (experimental) enrolls Microsoft's Secure Boot keys. The result
+//! `# vk: firmware=uefi-secboot` enrolls Microsoft's Secure Boot keys. The result
 //! is a bundle `vk run` boots, which records its layer so another Dockerfile can build `FROM` it
 //! against the same build cache: the record names the layer, and only the cache that made it
 //! holds its disk.
@@ -103,13 +103,12 @@ struct Layer {
     /// provisioning: hostname, address, domain join).
     #[serde(default)]
     provision: Option<String>,
-    /// `# vk: firmware=uefi-secboot` (experimental): the image's machines, and the build's
+    /// `# vk: firmware=uefi-secboot`: the image's machines, and the build's
     /// guests, start with Microsoft's Secure Boot keys enrolled. Inherited by a stage built on
     /// this one. The image does not carry the build guest's variables: each machine starts from
-    /// the template. Without SMM this guards only the boot chain below the guest's kernel, which
-    /// can rewrite the variable store directly (PK, KEK, db, dbx, or Secure Boot off, for good).
-    /// A variable write Windows authenticates at run time (its Secure Boot update task writing
-    /// db or dbx) is known to bug-check 0x1E in the firmware's runtime services.
+    /// the template. The variables are kept and checked on the host (`vk-uefi-vars`), out of the
+    /// guest's reach, and Windows' db and dbx updates apply; without SMM, what remains open to
+    /// the guest's kernel is the firmware itself.
     #[serde(default)]
     secure_boot: bool,
     /// `# vk: tpm=on`: the image's machines have a TPM 2.0, each its own. The build's guests
