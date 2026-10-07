@@ -661,7 +661,8 @@ impl Service {
     }
 
     /// Whether the guest may not write `name` in `guid` at all: the modes the service keeps,
-    /// the read-only defaults, the signer records, and the variables locked at the end of DXE.
+    /// the read-only defaults, the signer records, MorLock, and the variables locked at the end
+    /// of DXE.
     fn read_only(&self, guid: &Guid, name: &[u16]) -> bool {
         let is = |s: &str| name.iter().copied().eq(s.encode_utf16());
         (*guid == GLOBAL_VARIABLE
@@ -678,6 +679,8 @@ impl Service {
                 || DEFAULTS.iter().any(|n| is(n))))
             || *guid == CERT_DB
             || *guid == VENDOR_KEYS_NV
+            // Unsupported: created by the OS, it would say MorLock is.
+            || *guid == guid::MEMORY_OVERWRITE_REQUEST_CONTROL_LOCK
             || (self.end_of_dxe && self.locks.iter().any(|(g, n)| g == guid && n == name))
     }
 

@@ -706,3 +706,17 @@ fn a_volatile_private_variable_leaves_no_record_past_its_boot() {
     assert!(next_boot.signer_records().is_empty());
     assert_eq!(next_boot.data(&CERT_DB, SIGNERS), None);
 }
+
+#[test]
+fn the_os_cannot_create_morlock() {
+    let mut svc = Service::new(image()).unwrap();
+    assert_eq!(
+        svc.set_variable(
+            &guid::MEMORY_OVERWRITE_REQUEST_CONTROL_LOCK,
+            &name("MemoryOverwriteRequestControlLock"),
+            NV_BS_RT,
+            &[1]
+        ),
+        Status::WRITE_PROTECTED
+    );
+}

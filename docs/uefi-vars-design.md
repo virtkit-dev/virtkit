@@ -107,6 +107,8 @@ runtime cache, which that client refuses, as OVMF's own `QEMU_PV_VARS` build doe
 - No hardware error records (`HwErrRec`), as the flash build had none.
 - Variable properties set through EDKII_VAR_CHECK_PROTOCOL are accepted but not enforced, and
   VarCheckUefiLib's checks of the global variables' attributes and sizes are not made.
+- MorLock is not supported: its variable is read-only, so the OS cannot create it and take it
+  as supported. MOR itself is a plain variable (edk2's TCG MOR driver creates it).
 - `VIRTKIT_UEFI_FIRMWARE` naming a firmware built for the flash boots without variables.
 
 ## Tests

@@ -140,6 +140,14 @@ pub const SECURE_BOOT_ENABLE_DISABLE: Guid = Guid::new(
     0x4556,
     [0x99, 0xc4, 0x00, 0x10, 0x09, 0xc9, 0x3a, 0x44],
 );
+/// MemoryOverwriteRequestControlLock (TCG Platform Reset Attack Mitigation), which vk does not
+/// support.
+pub const MEMORY_OVERWRITE_REQUEST_CONTROL_LOCK: Guid = Guid::new(
+    0xbb983ccf,
+    0x151d,
+    0x40e1,
+    [0xa0, 0x7b, 0x4a, 0x17, 0xbe, 0x16, 0x82, 0x92],
+);
 /// edk2's VendorKeysNv.
 pub const VENDOR_KEYS_NV: Guid = Guid::new(
     0x9073e4e0,

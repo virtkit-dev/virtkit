@@ -16,7 +16,7 @@ index e64548d..900b33a 100644
    gEfiMdeModulePkgTokenSpaceGuid.PcdHiiOsRuntimeSupport|FALSE
    gEfiMdeModulePkgTokenSpaceGuid.PcdDxeIplSupportUefiDecompress|FALSE
    gEfiMdeModulePkgTokenSpaceGuid.PcdDxeIplSwitchToLongMode|FALSE
-@@ -906,21 +913,17 @@
+@@ -906,21 +913,23 @@
  !else
  
    #
@@ -43,6 +43,12 @@ index e64548d..900b33a 100644
    # TPM support
    #
  !include OvmfPkg/Include/Dsc/OvmfTpmComponentsDxe.dsc.inc
++
++  #
++  # vk (local patch): the MemoryOverwriteRequestControl (MOR) variable, which Windows'
++  # BitLocker expects with a TPM. MorLock stays unsupported.
++  #
++!include OvmfPkg/Include/Dsc/MorLock.dsc.inc
 diff --git a/OvmfPkg/CloudHv/CloudHvX64.fdf b/OvmfPkg/CloudHv/CloudHvX64.fdf
 index b698395..b0674d8 100644
 --- a/OvmfPkg/CloudHv/CloudHvX64.fdf
@@ -57,7 +63,7 @@ index b698395..b0674d8 100644
  }
  
  #
-@@ -326,16 +323,14 @@ INF  MdeModulePkg/Universal/Variable/RuntimeDxe/VariableSmmRuntimeDxe.inf
+@@ -326,16 +323,15 @@ INF  MdeModulePkg/Universal/Variable/RuntimeDxe/VariableSmmRuntimeDxe.inf
  #
  # Variable driver stack (non-SMM)
  #
@@ -73,6 +79,7 @@ index b698395..b0674d8 100644
  # TPM support
  #
  !include OvmfPkg/Include/Fdf/OvmfTpmDxe.fdf.inc
++!include OvmfPkg/Include/Fdf/MorLock.fdf.inc
  !include OvmfPkg/Include/Fdf/OvmfOptHw.fdf.inc
  
  ################################################################################

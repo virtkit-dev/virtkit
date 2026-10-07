@@ -11,6 +11,8 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **BitLocker with a TPM finds the memory-overwrite-request variable it expects** in a Windows
+  guest, which logged event 24629 without it.
 - **Windows can update its Secure Boot databases.** Windows' Secure Boot update task stopped
   the guest with bug check 0x1E when it wrote dbx; the update now applies. vk keeps and checks
   a Windows guest's UEFI variables itself, as a physical machine's firmware does out of the

@@ -184,7 +184,8 @@
         # which libkrun lacks). firmware/cloudhv-host-variables.patch, a configuration change
         # only, swaps the platform's variable driver for edk2's client of a variable service on
         # the host (VirtMmCommunicationDxe, as for qemu's uefi-vars device), which vk's
-        # vk-uefi-vars is.
+        # vk-uefi-vars is, and adds the MemoryOverwriteRequestControl variable BitLocker looks
+        # for with a TPM.
         packages.firmware =
           ((pkgs.OVMF-cloud-hypervisor.override {
             secureBoot = true;
