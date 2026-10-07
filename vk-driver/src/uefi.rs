@@ -54,11 +54,14 @@ const UEFI_VARS_LEN: u64 = 0x84000;
 pub(crate) const TPM_STATE: &str = "tpm-state";
 
 /// How long a guest has to answer the ACPI power button before vk asks its qemu-ga to shut it
-/// down instead (a Windows guest can be set to ignore the button).
-const BUTTON_GRACE: Duration = Duration::from_secs(20);
+/// down instead. Windows starts shutting down within a second or two of the button, unless it
+/// ignores it: a domain controller does while its winlogon waits on the Group Policy client,
+/// which can last as long as the DC runs. Asking qemu-ga during a shutdown already under way
+/// changes nothing.
+const BUTTON_GRACE: Duration = Duration::from_secs(10);
 
 /// How long a build guest has to power off before it is ended ([`force_off`]).
-const BUILD_STOP_GRACE: Duration = Duration::from_secs(10 * 60);
+pub(crate) const BUILD_STOP_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// A VMM that exits within this long of its spawn failed to boot; past it, the guest is up
 /// as far as a detached run's parent cares (Windows has no agent to answer earlier).
@@ -684,7 +687,7 @@ async fn power_off(ch: &mut Child, work: &Path, grace: Duration) -> Option<Durat
 
 /// How long a VMM asked to quit has to flush its disks and exit before it is killed; the boot
 /// child's own backstop (`libkrun_sys::QUIT_BACKSTOP`) gives it as long.
-const QUIT_GRACE: Duration = Duration::from_secs(10);
+pub(crate) const QUIT_GRACE: Duration = Duration::from_secs(10);
 
 /// End the guest behind `ch`, with run directory `work`, now: ask its VMM over the control
 /// socket to quit, which flushes every disk's write-back cache before the process exits (as a
@@ -1032,16 +1035,17 @@ pub(crate) async fn run(
     let result = hold(&mut ch, &console, args.detach_log.as_deref()).await;
     if ch.try_wait().ok().flatten().is_none() {
         // Stopped: the power button, then qemu-ga's shutdown; the VM ended ([`force_off`]) once
-        // STOP_GRACE runs out or on a second Ctrl-C, which then still gives the VM up to
-        // QUIT_GRACE to flush its disks; a third Ctrl-C does not shorten it.
+        // `winsvc::STOP_GRACE` (the grace a Windows compose service gets) runs out or on a second
+        // Ctrl-C. Either way the VM still has QUIT_GRACE to flush its disks, which a third Ctrl-C
+        // does not shorten. A domain controller takes most of a minute to shut down.
         tokio::select! {
-            off = power_off(&mut ch, work, crate::shutdown::STOP_GRACE) => match off {
+            off = power_off(&mut ch, work, crate::winsvc::STOP_GRACE) => match off {
                 Some(after) => {
                     println!("virtkit: guest powered off ({after:.0?} after the power button)")
                 }
                 None => eprintln!(
                     "virtkit: guest still up {}s after the power button; ending the VM",
-                    crate::shutdown::STOP_GRACE.as_secs()
+                    crate::winsvc::STOP_GRACE.as_secs()
                 ),
             },
             _ = tokio::signal::ctrl_c() => eprintln!("virtkit: Ctrl-C again; ending the VM"),

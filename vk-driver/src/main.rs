@@ -2336,9 +2336,10 @@ enum Cmd {
         all: bool,
         /// seconds to wait for each VM to go down before reporting it stuck
         ///
-        /// A run allows its guests one minute to power off; the default leaves time for the
-        /// run to exit without reporting an orderly shutdown as stuck.
-        #[arg(long, default_value_t = 90, value_name = "SECS")]
+        /// A run allows a Linux guest one minute to power off and a Windows guest three, then 10
+        /// seconds to save its disks; the default leaves time for either run to exit without
+        /// reporting an orderly shutdown as stuck.
+        #[arg(long, default_value_t = 210, value_name = "SECS")]
         timeout: u64,
     },
     /// Reboot running vk VM(s) in place

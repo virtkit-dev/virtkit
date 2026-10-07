@@ -10,7 +10,7 @@
 # 3. `vk stop` lets a daemon left in the primary by `vk exec` handle SIGTERM rather than
 #    meet the power cut, and the command the run booted with handle it too.
 # 4. The stop powers `db` off alongside the primary: `db` stops while the primary's command
-#    is still in its TERM trap, and the whole stop stays well within `vk stop`'s 90 s.
+#    is still in its TERM trap, and the whole stop stays well within `vk stop`'s 210 s.
 #
 # Run:  VK=./dist/vk tests/stop-workloads-e2e.sh
 # Needs: a `vk` with an embedded kernel/agent, KVM, and a registry to pull alpine.

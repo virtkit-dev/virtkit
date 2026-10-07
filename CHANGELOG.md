@@ -25,6 +25,12 @@ All notable changes to virtkit will be documented in this file.
   with `--state-dir` so badly that the guest no longer booted. vk now has the VM write out its
   disks before it ends, and cuts the power only if it is still running 10 seconds later. A
   Linux guest's hard reset ends the same way.
+- **Windows guests stop within the time vk gives them.** `vk run` of a Windows bundle now gives
+  the guest three minutes to shut down, as a Windows compose service has, where it had a Linux
+  guest's one minute, too short for a domain controller; and vk asks a guest that ignores the
+  first request to shut down after 10 seconds rather than 20. `vk stop` waits 210 seconds by
+  default (was 90) before it reports a run as stuck. A Windows guest left behind by a vk that
+  crashed is ended after 11 minutes rather than 70 seconds.
 
 ## [0.87.0] - 2026-10-10
 

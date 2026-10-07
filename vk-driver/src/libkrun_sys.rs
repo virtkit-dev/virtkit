@@ -100,9 +100,18 @@ fn mem_mib(mem: &str) -> Result<u32> {
 const GUEST_CID: u64 = 3;
 
 /// How long the guest gets to act on the power button before the boot child ends the VM
-/// itself, disks flushed — a backstop for a guest that ignores it, should the host not end
-/// it first.
+/// itself, disks flushed: a backstop for a guest that ignores it after `vk` is gone. Each
+/// outlasts the longest grace `vk` gives that kind of guest, so that `vk` ends the VM itself
+/// whenever it is there to: a Linux guest's stop (`shutdown::STOP_GRACE`), and for a UEFI
+/// (Windows) guest a build step's ten minutes (`uefi::BUILD_STOP_GRACE`).
 const POWER_BUTTON_GRACE: Duration = Duration::from_secs(70);
+const UEFI_POWER_BUTTON_GRACE: Duration = Duration::from_secs(11 * 60);
+const _: () = {
+    let quit = crate::uefi::QUIT_GRACE.as_secs();
+    assert!(POWER_BUTTON_GRACE.as_secs() > crate::shutdown::STOP_GRACE.as_secs());
+    assert!(UEFI_POWER_BUTTON_GRACE.as_secs() > crate::uefi::BUILD_STOP_GRACE.as_secs() + quit);
+    assert!(UEFI_POWER_BUTTON_GRACE.as_secs() > crate::winsvc::STOP_GRACE.as_secs() + quit);
+};
 
 /// How long the VM has to flush its disks and exit once the backstop ends it, before the boot
 /// child exits anyway: as long as `uefi::QUIT_GRACE` gives it when vk ends it.
@@ -373,7 +382,13 @@ fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>) -> Result<()> {
     if let Some(socket) = &spec.control {
         crate::vmmctl::serve(socket, handle.clone())?;
     }
-    press_power_button_on_sigterm(handle)?;
+    // `hyperv` stands for "a UEFI (Windows) guest" here; no other spec sets it.
+    let grace = if spec.hyperv {
+        UEFI_POWER_BUTTON_GRACE
+    } else {
+        POWER_BUTTON_GRACE
+    };
+    press_power_button_on_sigterm(handle, grace)?;
 
     // Blocks until the guest powers off or resets; libkrun `_exit`s with its code. It returns
     // only when the event loop fails, which must not read as a clean power-off.
@@ -505,11 +520,11 @@ impl crate::vmmctl::Control for VmmHandle {
 }
 
 /// Handle SIGTERM on a dedicated thread: resume a paused guest and press its ACPI power button.
-/// [`POWER_BUTTON_GRACE`] after the first SIGTERM, a guest still up is ended as `vk`'s
-/// `force_off` ends it, through the VMM's own quit, which flushes every disk before the process
-/// exits: the boot child must not outlive its parent, and a plain kill would leave a qcow2
-/// overlay's cached metadata unwritten.
-fn press_power_button_on_sigterm(handle: VmmHandle) -> Result<()> {
+/// `grace` ([`POWER_BUTTON_GRACE`], [`UEFI_POWER_BUTTON_GRACE`]) after the first SIGTERM, a
+/// guest still up is ended as `vk`'s `force_off` ends it, through the VMM's own quit, which
+/// flushes every disk before the process exits: the boot child must not outlive its parent,
+/// and a plain kill would leave a qcow2 overlay's cached metadata unwritten.
+fn press_power_button_on_sigterm(handle: VmmHandle, grace: Duration) -> Result<()> {
     std::thread::Builder::new()
         .name("vk-power-button".into())
         .spawn(move || {
@@ -532,7 +547,7 @@ fn press_power_button_on_sigterm(handle: VmmHandle) -> Result<()> {
                             eprintln!(
                                 "virtkit: the guest is still up {}s after the power button; \
                                  ending the VM",
-                                POWER_BUTTON_GRACE.as_secs()
+                                grace.as_secs()
                             );
                             if let Err(e) = handle.quit() {
                                 eprintln!("virtkit: ending the VM: {e}");
@@ -566,12 +581,12 @@ fn press_power_button_on_sigterm(handle: VmmHandle) -> Result<()> {
                     continue;
                 }
                 if deadline.is_none() {
-                    deadline = Some(Instant::now() + POWER_BUTTON_GRACE);
+                    deadline = Some(Instant::now() + grace);
                     // The last resort, armed before anything that waits on the event loop
                     // (resuming does): should the loop be stuck, neither the deadline above nor
                     // the quit can end the VM, and SIGALRM (its default action, set in
                     // block_sigterm) still ends the boot child once both have had their time.
-                    let last_resort = POWER_BUTTON_GRACE + QUIT_BACKSTOP + Duration::from_secs(1);
+                    let last_resort = grace + QUIT_BACKSTOP + Duration::from_secs(1);
                     // SAFETY: alarm(2) has no memory-safety preconditions.
                     unsafe { libc::alarm(last_resort.as_secs() as libc::c_uint) };
                 }
