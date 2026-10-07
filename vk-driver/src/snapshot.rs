@@ -167,6 +167,21 @@ fn create_private_dir(dir: &Path) -> Result<()> {
 }
 
 /// The `state.json` libkrun wrote in `snapshot`.
+/// The virtio device ID of an entropy source (virtio 1.2 § 5).
+const VIRTIO_ID_RNG: u64 = 4;
+
+/// Whether the VM `snapshot` was taken of had a virtio-rng, which its restore must then have,
+/// and only then: libkrun restores the virtio-pci functions in order.
+pub(crate) fn has_rng(snapshot: &Path) -> Result<bool> {
+    let state = snapshot_state(snapshot)?;
+    let pci = state["pci"]
+        .as_array()
+        .context("the snapshot records no virtio-pci function")?;
+    Ok(pci
+        .iter()
+        .any(|function| function["device_type"].as_u64() == Some(VIRTIO_ID_RNG)))
+}
+
 fn snapshot_state(snapshot: &Path) -> Result<serde_json::Value> {
     let path = snapshot.join("state.json");
     serde_json::from_reader(std::io::BufReader::new(
@@ -500,6 +515,29 @@ mod tests {
         assert_eq!(machine.cpus, Some(2));
         assert_eq!(machine.mem.as_deref(), Some("3072M"));
         assert_eq!(machine.addr, Some(Ipv4Addr::new(192, 168, 127, 3)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restore_has_a_virtio_rng_only_if_the_snapshot_had_one() {
+        let dir = std::env::temp_dir().join(format!("vk-snapshot-rng-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Block, net and console: a Windows guest snapshotted before it had a virtio-rng.
+        std::fs::write(
+            dir.join("state.json"),
+            r#"{"pci":[{"device_type":2},{"device_type":1},{"device_type":3}]}"#,
+        )
+        .unwrap();
+        assert!(!has_rng(&dir).unwrap());
+        std::fs::write(
+            dir.join("state.json"),
+            r#"{"pci":[{"device_type":2},{"device_type":1},{"device_type":4}]}"#,
+        )
+        .unwrap();
+        assert!(has_rng(&dir).unwrap());
+        std::fs::write(dir.join("state.json"), r#"{"version":1}"#).unwrap();
+        assert!(has_rng(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -14,6 +14,8 @@ use crate::virtio::{
 };
 
 use super::backend::{ReadError, WriteError};
+#[cfg(unix)]
+use super::worker::Backend;
 use super::worker::NetWorker;
 
 #[cfg(unix)]
@@ -25,6 +27,10 @@ use std::cmp;
 use std::io::Write;
 use std::mem::size_of;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::thread::JoinHandle;
+#[cfg(unix)]
+use utils::eventfd::{EFD_NONBLOCK, EventFd};
 use virtio_bindings::virtio_net::{VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_MTU};
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use vm_memory::{ByteValued, GuestMemoryError, GuestMemoryMmap};
@@ -94,6 +100,20 @@ pub struct Net {
     pub(crate) device_state: DeviceState,
 
     config: VirtioNetConfig,
+
+    /// The running worker, which hands its backend back when `worker_stopfd` stops it.
+    #[cfg(unix)]
+    worker: Option<JoinHandle<Backend>>,
+    #[cfg(unix)]
+    worker_stopfd: EventFd,
+    /// The backend between a reset and the next activation. Opened once: an `*Fd` backend
+    /// owns its descriptor, which a second open would take from a closed (or reused) number.
+    #[cfg(unix)]
+    backend: Option<Backend>,
+    /// Whether the backend has been opened; one lost since (its worker panicked) is not
+    /// opened again, for that reason.
+    #[cfg(unix)]
+    backend_opened: bool,
 }
 
 /// The features an MTU brings: the MTU itself, and on Unix hosts mergeable receive buffers. The
@@ -145,6 +165,15 @@ impl Net {
 
             device_state: DeviceState::Inactive,
             config,
+
+            #[cfg(unix)]
+            worker: None,
+            #[cfg(unix)]
+            worker_stopfd: EventFd::new(EFD_NONBLOCK).map_err(super::Error::EventFd)?,
+            #[cfg(unix)]
+            backend: None,
+            #[cfg(unix)]
+            backend_opened: false,
         })
     }
 
@@ -232,15 +261,42 @@ impl VirtioDevice for Net {
             ActivateError::BadActivate
         })?;
 
-        match NetWorker::new(
+        // Before the backend leaves the device: a worker that cannot be stopped must not get it.
+        #[cfg(unix)]
+        let stop = self.worker_stopfd.try_clone().map_err(|err| {
+            error!(
+                "virtio-net ({}): cannot clone its stop eventfd: {err}",
+                self.id
+            );
+            ActivateError::BadActivate
+        })?;
+        #[cfg(unix)]
+        let worker = self.open_backend().map(|backend| {
+            NetWorker::with_backend(
+                rx_q,
+                tx_q,
+                interrupt.clone(),
+                mem.clone(),
+                self.acked_features,
+                backend,
+            )
+        });
+        #[cfg(windows)]
+        let worker = NetWorker::new(
             rx_q,
             tx_q,
             interrupt.clone(),
             mem.clone(),
             self.acked_features,
             self.cfg_backend.clone(),
-        ) {
+        );
+        match worker {
             Ok(worker) => {
+                #[cfg(unix)]
+                {
+                    self.worker = Some(worker.run(stop));
+                }
+                #[cfg(windows)]
                 worker.run();
                 self.device_state = DeviceState::Activated(mem, interrupt);
                 Ok(())
@@ -257,6 +313,39 @@ impl VirtioDevice for Net {
 
     fn is_activated(&self) -> bool {
         self.device_state.is_activated()
+    }
+
+    /// Stop the worker and keep its backend for the next activation (local patch). Windows'
+    /// virtio-net driver resets the device as it starts, and again when another virtio
+    /// function makes it start over; a device that cannot reset leaves it failed.
+    #[cfg(unix)]
+    fn reset(&mut self) -> bool {
+        if let Some(worker) = self.worker.take() {
+            let _ = self.worker_stopfd.write(1);
+            match worker.join() {
+                Ok(backend) => self.backend = Some(backend),
+                Err(err) => error!("virtio-net ({}) worker panicked: {err:?}", self.id),
+            }
+        }
+        self.device_state = DeviceState::Inactive;
+        true
+    }
+}
+
+#[cfg(unix)]
+impl Net {
+    /// The backend for an activation: the one a reset kept, set to the features this
+    /// driver negotiated, or on the first activation a newly opened one.
+    fn open_backend(&mut self) -> std::result::Result<Backend, super::backend::ConnectError> {
+        if let Some(mut backend) = self.backend.take() {
+            backend.set_vnet_features(self.acked_features)?;
+            return Ok(backend);
+        }
+        if self.backend_opened {
+            return Err(super::backend::ConnectError::BackendLost);
+        }
+        self.backend_opened = true;
+        NetWorker::connect(self.cfg_backend.clone(), self.acked_features)
     }
 }
 
@@ -290,6 +379,61 @@ mod tests {
         let mut field = [0u8; 2];
         dev.read_config(10, &mut field);
         assert_eq!(u16::from_le_bytes(field), 65500);
+    }
+
+    struct NoIrq;
+
+    impl crate::virtio::device::InterruptHandler for NoIrq {
+        fn try_signal(
+            &self,
+            _interrupt: crate::virtio::device::InterruptType,
+        ) -> std::result::Result<(), crate::Error> {
+            Ok(())
+        }
+    }
+
+    /// A reset stops the worker and keeps its backend, which the next activation carries on
+    /// with: the socket stays open, owned once, until the device goes.
+    #[test]
+    fn a_reset_keeps_the_backend_for_the_next_activation() {
+        use crate::virtio::queue::Queue;
+        use std::io::{ErrorKind, Read};
+        use std::os::fd::IntoRawFd;
+        use std::sync::Arc;
+        use utils::eventfd::EventFd;
+        use vm_memory::GuestAddress;
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let (socket, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut dev = Net::new(
+            "eth0".into(),
+            VirtioNetBackend::UnixstreamFd(socket.into_raw_fd()),
+            MAC,
+            0,
+            None,
+        )
+        .unwrap();
+        let queues = || {
+            (0..NUM_QUEUES)
+                .map(|_| DeviceQueue::new(Queue::new(16), Arc::new(EventFd::new(0).unwrap())))
+                .collect::<Vec<_>>()
+        };
+        let interrupt = || InterruptTransport::from_handler(Arc::new(NoIrq));
+        peer.set_nonblocking(true).unwrap();
+        let still_open = |peer: &mut std::os::unix::net::UnixStream| {
+            peer.read(&mut [0u8; 1]).unwrap_err().kind() == ErrorKind::WouldBlock
+        };
+
+        for _ in 0..3 {
+            dev.activate(mem.clone(), interrupt(), queues()).unwrap();
+            assert!(dev.is_activated());
+            assert!(dev.reset());
+            assert!(!dev.is_activated());
+            assert!(dev.backend.is_some(), "the worker handed its backend back");
+            assert!(still_open(&mut peer));
+        }
+        drop(dev);
+        assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0, "the device closed it");
     }
 
     /// VIRTIO_NET_F_MTU and the mergeable receive buffers that come with it are offered only

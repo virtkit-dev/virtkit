@@ -2,9 +2,10 @@ use std::cmp;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::result;
 use std::sync::atomic::Ordering;
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
+use utils::eventfd::EventFd;
 use virtio_bindings::virtio_net::VIRTIO_NET_F_MRG_RXBUF;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 
@@ -57,7 +58,12 @@ pub struct NetWorker {
     tx_has_deferred_frame: bool,
 }
 
+/// A backend a worker hands back when it stops, for the next one to carry on with.
+pub type Backend = Box<dyn NetBackend + Send>;
+
 impl NetWorker {
+    /// A worker over the backend `cfg_backend` describes, newly opened.
+    #[cfg(test)]
     pub fn new(
         rx_q: DeviceQueue,
         tx_q: DeviceQueue,
@@ -66,7 +72,24 @@ impl NetWorker {
         vnet_features: u64,
         cfg_backend: VirtioNetBackend,
     ) -> Result<Self, ConnectError> {
-        let backend = match cfg_backend {
+        let backend = Self::connect(cfg_backend, vnet_features)?;
+        Ok(Self::with_backend(
+            rx_q,
+            tx_q,
+            interrupt,
+            mem,
+            vnet_features,
+            backend,
+        ))
+    }
+
+    /// Open the backend `cfg_backend` describes. An `*Fd` backend takes ownership of its
+    /// descriptor, so this is done once per device: a reset keeps the backend instead.
+    pub fn connect(
+        cfg_backend: VirtioNetBackend,
+        vnet_features: u64,
+    ) -> Result<Backend, ConnectError> {
+        Ok(match cfg_backend {
             VirtioNetBackend::UnixstreamFd(fd) => {
                 // SAFETY: we need to trust that the library user has configured
                 // the backend with a healthy file descriptor.
@@ -93,9 +116,19 @@ impl NetWorker {
             VirtioNetBackend::TapFd(fd) => {
                 Box::new(Tap::from_fd(fd, vnet_features)?) as Box<dyn NetBackend + Send>
             }
-        };
+        })
+    }
 
-        Ok(Self {
+    /// A worker over a backend already open.
+    pub fn with_backend(
+        rx_q: DeviceQueue,
+        tx_q: DeviceQueue,
+        interrupt: InterruptTransport,
+        mem: GuestMemoryMmap,
+        vnet_features: u64,
+        backend: Backend,
+    ) -> Self {
+        Self {
             rx_q,
             tx_q,
 
@@ -113,26 +146,35 @@ impl NetWorker {
             tx_frame_buf: [0u8; MAX_BUFFER_SIZE],
             tx_iovec: Vec::with_capacity(QUEUE_SIZE as usize),
             tx_has_deferred_frame: false,
-        })
+        }
     }
 
-    pub fn run(self) {
+    /// Run the worker on a thread of its own until `stop` is signaled; the thread then ends
+    /// and returns the backend, for the device's next activation (local patch: lets the
+    /// device reset).
+    pub fn run(self, stop: EventFd) -> JoinHandle<Backend> {
         thread::Builder::new()
             .name("virtio-net worker".into())
-            .spawn(|| self.work())
-            .unwrap();
+            .spawn(|| self.work(stop))
+            .unwrap()
     }
 
-    fn work(mut self) {
+    fn work(mut self, stop: EventFd) -> Backend {
         #[cfg(target_os = "macos")]
         const TX_TIMER_FD: RawFd = -2;
 
         let virtq_rx_ev_fd = self.rx_q.event.as_raw_fd();
         let virtq_tx_ev_fd = self.tx_q.event.as_raw_fd();
         let backend_socket = self.backend.raw_socket_fd();
+        let stop_fd = stop.as_raw_fd();
 
         let mut epoll = Epoll::new().unwrap();
 
+        let _ = epoll.ctl(
+            ControlOperation::Add,
+            stop_fd,
+            &EpollEvent::new(EventSet::IN, stop_fd as u64),
+        );
         let _ = epoll.ctl(
             ControlOperation::Add,
             virtq_rx_ev_fd,
@@ -161,6 +203,10 @@ impl NetWorker {
                         let source = event.fd();
                         let event_set = event.event_set();
                         match event_set {
+                            EventSet::IN if source == stop_fd => {
+                                let _ = stop.read();
+                                return self.backend;
+                            }
                             EventSet::IN if source == virtq_rx_ev_fd => {
                                 self.process_rx_queue_event();
                             }

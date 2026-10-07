@@ -1,7 +1,7 @@
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
-pub use unix::NetWorker;
+pub use unix::{Backend, NetWorker};
 
 #[cfg(windows)]
 mod windows;

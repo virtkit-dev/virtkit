@@ -4,6 +4,15 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows guests have a virtio-rng.** libkrun's virtio-net can now reset: the device
+  stops its worker and keeps its backend (a tap, or the switch's socket, which it owns and
+  must not open twice) for the driver's next initialization, with the offloads that driver
+  negotiates. Windows' virtio-net driver resets its device again when it finds a virtio-rng
+  beside it; refused, it left the guest without network, so UEFI guests had gone without one. A
+  snapshot taken without one still restores without one.
+
 ## [0.86.0] - 2026-10-07
 
 ### Added

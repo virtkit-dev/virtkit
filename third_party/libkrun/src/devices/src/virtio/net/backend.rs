@@ -32,6 +32,9 @@ pub enum ConnectError {
     TunSetVnetHdrSz(io::Error),
     #[cfg(not(target_os = "windows"))]
     TunSetOffload(io::Error),
+    /// The backend was lost with a worker that panicked, after it had been opened once.
+    #[cfg(not(target_os = "windows"))]
+    BackendLost,
 }
 
 #[allow(dead_code)]
@@ -79,6 +82,13 @@ pub trait NetBackend {
     /// event. Backends that complete every frame in `write_frame` have nothing to do.
     fn flush_frames(&mut self) -> Result<(), WriteError>;
     fn raw_socket_fd(&self) -> RawFd;
+
+    /// Adopt the features a driver negotiated. A backend outlives a device reset, and the
+    /// driver that initializes the device again may negotiate other offloads; only a tap has
+    /// any to set (local patch).
+    fn set_vnet_features(&mut self, _vnet_features: u64) -> Result<(), ConnectError> {
+        Ok(())
+    }
 
     /// Delay in microseconds before retrying after NothingWritten.
     /// Returns 0 if no delay-based retry is needed (e.g. on Linux where

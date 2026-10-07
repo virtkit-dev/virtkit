@@ -291,12 +291,10 @@ fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>) -> Result<()> {
         }
         devices.add(vsock);
     }
-    // virtio-rng: the guest's /dev/hwrng and early entropy. Not for a UEFI (Windows) guest,
-    // which has entropy of its own: beside a virtio-rng function, Windows' virtio-net driver
-    // fails to start (device status Error, its first initialization reset and the second
-    // refused), so the guest has no network. A workaround: our virtio-net cannot reset.
-    // `hyperv` stands for "a UEFI (Windows) guest" here; no other spec sets it.
-    if !spec.hyperv {
+    // virtio-rng: the guest's /dev/hwrng and early entropy. Windows' virtio-net driver resets
+    // its device again when it finds a virtio-rng function beside it, which needs our
+    // virtio-net's reset.
+    if spec.rng {
         devices.add(RngDevice::new().map_err(krun("rng"))?);
     }
     // virtio-balloon with free-page reporting; libkrun 2.0 attaches nothing implicitly.

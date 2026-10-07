@@ -812,6 +812,7 @@ pub fn boot_unit(
             reboot: true,
             numa: crate::numa::Numa::Auto,
             guest_agent: None,
+            rng: true,
             hyperv: false,
             vm_generation_id: None,
             system_uuid: None,

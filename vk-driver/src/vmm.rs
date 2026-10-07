@@ -711,9 +711,14 @@ pub struct VmSpec {
     /// running vk-agent.
     #[serde(default)]
     pub guest_agent: Option<PathBuf>,
+    /// A virtio-rng: the guest's /dev/hwrng and early entropy. Every guest has one, except a
+    /// Windows guest restored from a snapshot taken without one (before vk's virtio-net could
+    /// reset, Windows guests had none).
+    #[serde(default = "default_rng")]
+    pub rng: bool,
     /// Present Hyper-V enlightenments (`VmmBuilder::hyperv`): a Windows guest then uses the
     /// reference TSC page, synthetic timers and the TLB-flush/IPI hypercalls. Only UEFI
-    /// (Windows) guests set it; they also omit virtio-rng.
+    /// (Windows) guests set it.
     #[serde(default)]
     pub hyperv: bool,
     /// The VM generation ID (`VmmBuilder::vm_generation_id`): stable across boots of one disk,
@@ -742,6 +747,10 @@ pub struct VmSpec {
     /// A snapshot directory ([`crate::vmmctl`]) the VM starts from instead of booting.
     #[serde(default)]
     pub restore_from: Option<PathBuf>,
+}
+
+fn default_rng() -> bool {
+    true
 }
 
 /// A virtual machine monitor that can boot a [`VmSpec`]. `Send` so a boxed `dyn Vmm`

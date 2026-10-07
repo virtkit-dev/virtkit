@@ -1159,15 +1159,15 @@ impl VirtioPciTransport {
                 // A pending bit from before the reset must not fire on the next unmask.
                 self.msix.lock().unwrap().clear_pending();
             } else if status == 0 {
-                // The device refused the reset (net, vsock and balloon cannot). A virtio-pci
-                // driver polls the status until it reads 0 (Linux does when it resets a
-                // device at reboot or power-off, in `vp_modern_set_status`), so it would wait
-                // forever: report the reset done, and drop the transport's own state as a
-                // reset does. The device stays failed underneath, its workers still running:
-                // a later re-initialization reads status 0 and gives up (Linux at
-                // FEATURES_OK) instead of activating it twice, but a driver that re-inits in
-                // the same process must not reuse the rings the device may still write. The
-                // status reads 0 from then on, hiding FAILED (local patch).
+                // The device refused the reset (vsock and balloon cannot, nor net on a Windows
+                // host). A virtio-pci driver polls the status until it reads 0 (Linux does when it
+                // resets a device at reboot or power-off, in `vp_modern_set_status`), so it would
+                // wait forever: report the reset done, and drop the transport's own state as a
+                // reset does. The device stays failed underneath, its workers still running: a
+                // later re-initialization reads status 0 and gives up (Linux at FEATURES_OK)
+                // instead of activating it twice, but a driver that re-inits in the same process
+                // must not reuse the rings the device may still write. The status reads 0 from then
+                // on, hiding FAILED (local patch).
                 warn!("virtio-pci: the device cannot reset; reporting it reset anyway");
                 self.interrupt.reset();
                 self.reset_queue_registers();

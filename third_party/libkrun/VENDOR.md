@@ -278,6 +278,17 @@ header (short, or all write-only) is returned used without a frame. Upstream and
 tree handed it to the backend, whose `write_frame` asserts on it, so a guest could panic the
 net worker. Covered by `a_header_only_transmit_chain_is_returned_without_a_frame`.
 
+`src/devices/src/virtio/net/{device.rs,backend.rs,tap.rs,worker/{mod.rs,unix.rs}}` — virtio-net
+resets on unix hosts. The worker thread stops on an eventfd of the device's and returns its
+backend, which the device keeps for the next activation: opened once, because an `*Fd`
+backend owns its descriptor (a second open would take a closed or reused number) and a
+unixstream backend holds the rest of a frame it was sending or receiving. The next driver's
+features go to the kept backend through `NetBackend::set_vnet_features`, which a tap answers
+with `TUNSETOFFLOAD`. Windows' virtio-net driver resets its device as it starts and again when
+another virtio function makes it start over (a virtio-rng); refused, it left the guest without
+network. The Windows backend and worker remain upstream's and still refuse. Covered by
+`a_reset_keeps_the_backend_for_the_next_activation`.
+
 ### virtio-vsock (forward-ported from the 1.19 tree)
 
 `src/devices/src/virtio/vsock/unix_proxy/unix.rs` — `release` shuts down the host socket and
@@ -400,16 +411,16 @@ IOAPIC drops a pulse that arrives while the previous one awaits its EOI, and a b
 waits forever on I/O that already completed. Covered by
 `virtio_mmio_interrupts_are_edge_triggered`.
 
-`src/devices/src/virtio/{pci.rs,device.rs}` — a reset the device cannot perform (net, vsock and
-balloon implement none) reads back as done. Linux's virtio-pci driver polls the status until it
-reads 0 after writing 0 (`vp_modern_set_status`), which recent kernels do to every device at
-reboot and power-off, so the guest hung there and never reached its ACPI reset or S5. The
-transport drops its own state as for a reset, but the device stays failed underneath, its
-workers running, and the status reads 0 from then on (hiding FAILED): a later
+`src/devices/src/virtio/{pci.rs,device.rs}` — a reset the device cannot perform (vsock and
+balloon implement none, nor net on a Windows host) reads back as done. Linux's virtio-pci driver
+polls the status until it reads 0 after writing 0 (`vp_modern_set_status`), which recent kernels
+do to every device at reboot and power-off, so the guest hung there and never reached its ACPI
+reset or S5. The transport drops its own state as for a reset, but the device stays failed
+underneath, its workers running, and the status reads 0 from then on (hiding FAILED): a later
 re-initialization gets no further than its first write and gives up (Linux at FEATURES_OK)
-rather than activating it twice. vk relaunches the VM on a reset, so nothing reuses the rings.
-A FAILED the driver wrote itself is now cleared by a reset, as the spec has it, instead of
-making a resettable device look like one that cannot reset. Covered by
+rather than activating it twice. vk relaunches the VM on a reset, so nothing reuses the rings. A
+FAILED the driver wrote itself is now cleared by a reset, as the spec has it, instead of making
+a resettable device look like one that cannot reset. Covered by
 `a_reset_the_device_cannot_do_still_reads_back_as_done` and
 `a_driver_written_failed_is_cleared_by_a_reset`.
 
