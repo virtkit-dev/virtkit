@@ -90,8 +90,9 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with ten crates:
 - **`vk-tpm/`** — a TPM 2.0 engine in Rust (in progress), to replace libtpms behind libkrun's
   TPM CRB device: command processing, sessions and parameter encryption, hierarchies and
   dictionary-attack protection, PCRs, hash sequences, objects and keys (RSA, ECC P-256,
-  primaries derived as libtpms derives them), contexts, persistent objects, EK provisioning,
-  versioned state; crypto from RustCrypto crates only. See `docs/tpm-design.md`.
+  primaries derived as libtpms derives them), contexts, persistent objects, NV indices,
+  policies, attestation, duplication, EK provisioning, versioned state; crypto from RustCrypto
+  crates only. See `docs/tpm-design.md`.
 
 libkrun is vendored (its own cargo workspace, locally patched) under
 `third_party/libkrun` — see its `VENDOR.md` for the patch list.
