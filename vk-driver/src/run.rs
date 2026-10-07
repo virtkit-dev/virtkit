@@ -1962,14 +1962,17 @@ async fn build_and_boot(
     // the guest is ready). Either signal's default action would end the run at once, leaving
     // the guests to the VMM's parent-death signal and skipping the host-side teardown (the
     // poweroff request, the registry and mount cleanup, the summaries). Both are heard from
-    // here on, through the services' starts, and routed through teardown.
-    let signals = || async {
+    // here on, through the services' starts, and routed through teardown, as is an output whose
+    // reader has gone (`output_closed`).
+    // The output only once: still closed, it would end the second wait at once.
+    let signals = |watch_output: bool| async move {
         tokio::select! {
             _ = crate::shutdown::terminate_signal() => Stopped(libc::SIGTERM),
             _ = crate::detach::interrupt() => Stopped(libc::SIGINT),
+            _ = crate::shutdown::output_closed_if(watch_output) => Stopped(libc::SIGPIPE),
         }
     };
-    let signalled = signals();
+    let signalled = signals(true);
     tokio::pin!(signalled);
     if let Some(mgr) = &manager
         && let Err(e) = start_eager(
@@ -1977,7 +1980,7 @@ async fn build_and_boot(
             &planned.start,
             &start_deps,
             signalled.as_mut(),
-            signals(),
+            signals(false),
         )
         .await
     {
@@ -3556,15 +3559,25 @@ async fn compose_up(
     // Unlike `build_and_boot`, which leaves a foreground Ctrl-C to SIGINT's default (its guest
     // command and helpers take it too), this run hears it always: Ctrl-C is how a
     // services-only run is ended, so it goes through `stop_all` (see `isolate_helpers` above).
-    let signals = || async {
+    // The output only once: still closed, it would end the second wait at once.
+    let signals = |watch_output: bool| async move {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => Stopped(libc::SIGINT),
             _ = crate::shutdown::terminate_signal() => Stopped(libc::SIGTERM),
+            _ = crate::shutdown::output_closed_if(watch_output) => Stopped(libc::SIGPIPE),
         }
     };
-    let stop = signals();
+    let stop = signals(true);
     tokio::pin!(stop);
-    if let Err(e) = start_eager(&mgr, &planned.start, &start_deps, stop.as_mut(), signals()).await {
+    if let Err(e) = start_eager(
+        &mgr,
+        &planned.start,
+        &start_deps,
+        stop.as_mut(),
+        signals(false),
+    )
+    .await
+    {
         mgr.stop_all();
         stop_switch(switch);
         return Err(e);

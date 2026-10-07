@@ -8,6 +8,7 @@
 //! [`request_reboot`] and [`hard_reset`] are the reboot equivalents — the agent over vsock, or
 //! SIGUSR1 to the boot child's keeper, which relaunches the VM in place (see `libkrun_sys::keep`).
 
+use std::os::fd::RawFd;
 use std::process::Child;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -360,6 +361,105 @@ pub(crate) async fn ask_poweroff(addr: &SocketAddr) -> bool {
     }
 }
 
+/// Resolve once this run's stdout or stderr is a pipe or socket whose reader has gone (`vk run
+/// … | head`, a `while read` loop that ended) or a terminal that hung up; the closed one(s) by
+/// then point at /dev/null. A print to them would panic its thread on `EPIPE`, which wedged a
+/// compose run with its guests still running (the thread the run then waited on was gone, and
+/// its own teardown printed too). A run that waits on this hears it as it hears `vk stop`, and
+/// powers its guests off. Never resolves for files and live terminals, for a socket whose peer
+/// only half-closed it, in the `--detach` child (whose output goes to its log), or if the watch
+/// cannot start. Once the output has closed, it resolves at once on every later call.
+pub(crate) async fn output_closed() {
+    use std::sync::OnceLock;
+    static CLOSED: OnceLock<Option<tokio::sync::watch::Receiver<bool>>> = OnceLock::new();
+
+    if crate::detach::is_child() {
+        return std::future::pending().await;
+    }
+    let watch = CLOSED.get_or_init(|| {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        // A thread of its own rather than the blocking pool: it may wait in `poll` for the
+        // whole run, and a runtime waits for its blocking tasks before it shuts down.
+        std::thread::Builder::new()
+            .name("vk-output-watch".into())
+            .spawn(move || {
+                let closed = wait_closed([libc::STDOUT_FILENO, libc::STDERR_FILENO]);
+                if !closed.is_empty() {
+                    // Here, at once: any thread may print before a waiter is polled.
+                    discard(&closed);
+                    let _ = tx.send(true);
+                }
+            })
+            .ok()
+            .map(|_| rx)
+    });
+    let Some(mut rx) = watch.clone() else {
+        return std::future::pending().await;
+    };
+    if rx.wait_for(|closed| *closed).await.is_err() {
+        std::future::pending().await
+    }
+}
+
+/// [`output_closed`] when `watch`, else never: a run's second wait for a stop (a further
+/// signal ends it at once) must not take the output that already stopped it for another.
+pub(crate) async fn output_closed_if(watch: bool) {
+    if watch {
+        output_closed().await
+    } else {
+        std::future::pending().await
+    }
+}
+
+/// Point the descriptors `fds` at /dev/null.
+fn discard(fds: &[RawFd]) {
+    if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+        use std::os::fd::AsRawFd;
+        for &fd in fds {
+            // SAFETY: dup2 onto a descriptor this process owns.
+            unsafe { libc::dup2(null.as_raw_fd(), fd) };
+        }
+    }
+}
+
+/// Block until one of the written-to descriptors `fds` reports an error or a hang-up; those
+/// that did. Empty if `poll` fails for good, or once every one of them is closed (std opens
+/// /dev/null over closed standard descriptors at startup, so only after a later close).
+fn wait_closed(fds: [RawFd; 2]) -> Vec<RawFd> {
+    let mut polled = fds.map(|fd| libc::pollfd {
+        fd,
+        events: 0,
+        revents: 0,
+    });
+    loop {
+        // SAFETY: `polled` is a valid array of `polled.len()` pollfd structures.
+        let ready = unsafe { libc::poll(polled.as_mut_ptr(), polled.len() as libc::nfds_t, -1) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Vec::new();
+        }
+        let closed: Vec<RawFd> = polled
+            .iter()
+            .filter(|p| p.revents & (libc::POLLERR | libc::POLLHUP) != 0)
+            .map(|p| p.fd)
+            .collect();
+        if !closed.is_empty() {
+            return closed;
+        }
+        // POLLNVAL: a closed descriptor, polled no more (else poll would return at once).
+        for p in &mut polled {
+            if p.revents & libc::POLLNVAL != 0 {
+                p.fd = -1;
+            }
+        }
+        if polled.iter().all(|p| p.fd < 0) {
+            return Vec::new();
+        }
+    }
+}
+
 /// Wait for SIGTERM, as sent by `vk stop` and `vk publish stop`.
 /// If the handler cannot be installed, wait forever and leave SIGTERM's default termination
 /// in place.
@@ -421,6 +521,60 @@ pub(crate) fn wait_exit(child: &mut Child, deadline: Instant) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pipe: (read end, write end).
+    fn pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        // SAFETY: a valid two-int array; the descriptors are owned from here on.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: both were just opened, and are owned by nothing else.
+        unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    /// `wait_closed` on a thread, its result to come. A test takes it before it drops the
+    /// descriptors: their numbers would go to another test's files meanwhile.
+    fn waiting(fds: [RawFd; 2]) -> std::sync::mpsc::Receiver<Vec<RawFd>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(wait_closed(fds));
+        });
+        rx
+    }
+
+    #[test]
+    fn a_pipe_whose_reader_has_gone_is_closed_output_and_the_other_is_kept() {
+        use std::os::fd::AsRawFd;
+        let (reader, writer) = pipe();
+        let (_live_reader, live) = pipe();
+        drop(reader);
+        let closed = waiting([live.as_raw_fd(), writer.as_raw_fd()]);
+        assert_eq!(
+            closed.recv_timeout(Duration::from_secs(5)),
+            Ok(vec![writer.as_raw_fd()])
+        );
+    }
+
+    #[test]
+    fn a_live_pipe_and_a_file_are_not_closed_output() {
+        use std::os::fd::AsRawFd;
+        let (reader, writer) = pipe();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let fds = [writer.as_raw_fd(), file.as_raw_fd()];
+        let closed = waiting(fds);
+        assert!(closed.recv_timeout(Duration::from_millis(200)).is_err());
+        // The reader gone, the wait ends, before the descriptors go.
+        drop(reader);
+        assert_eq!(
+            closed.recv_timeout(Duration::from_secs(5)),
+            Ok(vec![writer.as_raw_fd()])
+        );
+    }
 
     fn spawn(cmd: &str, args: &[&str]) -> Child {
         std::process::Command::new(cmd).args(args).spawn().unwrap()
