@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`vk run` no longer drops an environment variable whose value holds a newline**, such as a
+  multi-line `--env`: the guest sees the value whole. One holding a NUL byte is refused, naming
+  the variable.
+
 ## [0.86.0] - 2026-10-07
 
 ### Added

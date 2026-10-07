@@ -1482,24 +1482,14 @@ async fn build_and_boot(
     }
     // --env/--env-file extras, upserted so they win over the image env — both in
     // `drive`'s exports and in the guest's own env (the media below carry the
-    // merged list: the boot config for a clean -f/--primary image, an injected
-    // /etc/virtkit/env capture for a converted one).
+    // merged list in the boot config).
     for (k, v) in &args.env {
         match image_env.iter_mut().find(|(ek, _)| ek == k) {
             Some(e) => e.1 = v.clone(),
             None => image_env.push((k.clone(), v.clone())),
         }
     }
-    // Every carrier of this list (drive's exports, the boot config, the
-    // /etc/virtkit/env capture) is line-oriented in the guest: drop entries an
-    // embedded newline would split into bogus extra lines — loudly.
-    image_env.retain(|(k, v)| {
-        let ok = !k.contains('\n') && !v.contains('\n');
-        if !ok {
-            eprintln!("virtkit: skipping env var {k:?} (embedded newline)");
-        }
-        ok
-    });
+    check_guest_env(&image_env)?;
 
     // 2. assemble the boot medium (virtkit-agent injected as PID 1). The media are unlinked
     // scratch fds — `media` keeps them open (their /proc/self/fd paths must resolve until
@@ -1514,29 +1504,31 @@ async fn build_and_boot(
         media.push(s);
         Ok(path)
     };
-    // The effective env as capture-file lines, injected into a converted image's
-    // rootfs at /etc/virtkit/env (a clean `-f` image carries it in the boot config
-    // instead). Same format as the conversion capture: raw KEY=VALUE per line.
-    let env_capture = work.join("env.capture");
+    // The effective env as a boot config, injected into a converted image's root where the
+    // agent reads it at boot (a clean `-f` image carries it in its initramfs instead). JSON
+    // rather than the line-per-entry /etc/virtkit/env, which the agent rewrites from it, so a
+    // value holding a newline arrives whole.
+    let env_config = work.join("env.json");
     let mut injects: Vec<(&str, &Path, u16)> =
         vec![(crate::initramfs::CMDRUNNER_PATH, agent, 0o755)];
     if !image_env.is_empty() {
-        let text: String = image_env
-            .iter()
-            .map(|(k, v)| format!("{k}={v}\n"))
-            .collect();
+        let text = vk_core::runcfg::RunConfig {
+            env: image_env.clone(),
+            ..Default::default()
+        }
+        .to_json();
         // env values may be secrets (the reason they stay off the cmdline):
-        // keep the host-side capture private too.
+        // keep the host-side copy private too.
         use std::io::Write;
         std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
-            .open(&env_capture)
+            .open(&env_config)
             .and_then(|mut f| f.write_all(text.as_bytes()))
-            .with_context(|| format!("writing {}", env_capture.display()))?;
-        injects.push(("etc/virtkit/env", &env_capture, 0o644));
+            .with_context(|| format!("writing {}", env_config.display()))?;
+        injects.push((vk_core::runcfg::INITRAMFS_PATH, &env_config, 0o600));
     }
     let t_media = Instant::now();
     // The kernel the VM boots on. Normally the pinned kernel passed in; when the
@@ -4220,6 +4212,20 @@ async fn ssh_greets(addr: &SocketAddr, budget: Duration) -> Result<()> {
     .map_err(|_| anyhow!("no identification string within {budget:?}"))?
 }
 
+/// Refuse a guest env entry the guest cannot set, naming it: an empty name, `=` in a name,
+/// or a NUL anywhere. Anything else — newlines, tabs, any UTF-8 — reaches the guest whole.
+fn check_guest_env(env: &[(String, String)]) -> Result<()> {
+    for (k, v) in env {
+        if k.is_empty() || k.contains(['=', '\0']) {
+            bail!("env var name {k:?} cannot be set in the guest");
+        }
+        if v.contains('\0') {
+            bail!("env var {k:?} holds a NUL byte, which no environment can carry");
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     ch: &mut Child,
@@ -5384,6 +5390,33 @@ mod tests {
 
     fn compose_units(yaml: &str) -> Vec<crate::compose::Unit> {
         crate::compose::parse(yaml, Path::new("/proj"), &|_| None, None).unwrap()
+    }
+
+    /// A value with newlines, tabs or any UTF-8 goes to the guest whole, in the boot config
+    /// the agent reads; only what no environment can hold is refused, by name.
+    #[test]
+    fn guest_env_keeps_any_value_without_a_nul() {
+        let env = vec![
+            (
+                "GITLAB_OMNIBUS_CONFIG".to_string(),
+                "a = 1\nb = 'x'\n".to_string(),
+            ),
+            ("TAB".to_string(), "x\ty — ü".to_string()),
+        ];
+        check_guest_env(&env).unwrap();
+        let cfg = vk_core::runcfg::RunConfig {
+            env: env.clone(),
+            ..Default::default()
+        };
+        let back = vk_core::runcfg::RunConfig::from_json(&cfg.to_json()).unwrap();
+        assert_eq!(back.env, env);
+
+        let err = check_guest_env(&[("K".into(), "a\0b".into())]).unwrap_err();
+        assert!(err.to_string().contains("\"K\""), "{err}");
+        for bad in ["", "A=B", "A\0"] {
+            let err = check_guest_env(&[(bad.into(), "v".into())]).unwrap_err();
+            assert!(err.to_string().contains(&format!("{bad:?}")), "{err}");
+        }
     }
 
     /// Resolver entries after appending the primary to the siblings' hosts.

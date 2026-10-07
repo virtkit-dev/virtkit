@@ -9,7 +9,8 @@
 //!   /virtkit-service.json  (initramfs) the service's runtime config — env, user,
 //!                       workdir, entrypoint+cmd — merged by the host (image defaults
 //!                       + per-service overrides) and read *before* the pivot hides
-//!                       the initramfs. The image itself stays byte-clean.
+//!                       the initramfs. The image itself stays byte-clean. `vk run`
+//!                       puts its env there in a converted image's own root.
 //!   /etc/virtkit/env    image ENV (KEY=VALUE per line; lost by `docker export`)
 //!   /etc/virtkit/user   image USER: exported as VIRTKIT_DEFAULT_RUN_USER so served
 //!                       stages drop to it (serve mode)
@@ -1079,10 +1080,20 @@ fn load_image_env() {
     };
     for line in text.lines() {
         if let Some((k, v)) = line.split_once('=') {
-            // SAFETY: still single-threaded (before any fork).
-            unsafe { std::env::set_var(k, v) };
+            set_env(k, v);
         }
     }
+}
+
+/// `std::env::set_var`, minus its panic — this is PID 1 — on a name it cannot set: such an
+/// entry is skipped with a warning naming it.
+fn set_env(k: &str, v: &str) {
+    if k.is_empty() || k.contains(['=', '\0']) || v.contains('\0') {
+        warn!("vk-agent init: env var {k:?} cannot be set, skipped");
+        return;
+    }
+    // SAFETY: called only from the single-threaded init, before any fork.
+    unsafe { std::env::set_var(k, v) };
 }
 
 /// Export the image's USER (captured into /etc/virtkit/user) as
@@ -1145,8 +1156,8 @@ fn home_for_default_user(
         .map(std::path::PathBuf::from)
 }
 
-/// The boot-time service config carried in the agent initramfs — `None` when the
-/// initramfs carries none (a plain `vk run`/builder boot) or it fails to parse.
+/// The boot-time config carried in the agent initramfs or a converted image's root.
+/// `None` when the boot carries no config or it fails to parse.
 /// Must run before the pivot: the initramfs is hidden underneath afterwards.
 fn read_boot_config() -> Option<RunConfig> {
     let path = format!("/{}", vk_core::runcfg::INITRAMFS_PATH);
@@ -1166,11 +1177,10 @@ fn read_boot_config() -> Option<RunConfig> {
 fn apply_boot_config(cfg: Option<&RunConfig>) {
     let Some(cfg) = cfg else { return };
     for (k, v) in &cfg.env {
-        // SAFETY: still single-threaded init, before any serve/service fork.
-        unsafe { std::env::set_var(k, v) };
+        set_env(k, v);
     }
     if !cfg.user.is_empty() && cfg.user != "root" {
-        // SAFETY: as above.
+        // SAFETY: still single-threaded init, before any serve/service fork.
         unsafe { std::env::set_var("VIRTKIT_DEFAULT_RUN_USER", &cfg.user) };
         info!("vk-agent init: VIRTKIT_DEFAULT_RUN_USER={}", cfg.user);
     }
@@ -1198,12 +1208,19 @@ fn materialize_env(cfg: Option<&RunConfig>) {
             None => merged.push((k.clone(), v.clone())),
         }
     }
-    // one entry per line — a key/value with an embedded newline can't fit the format
-    let text: String = merged
-        .iter()
-        .filter(|(k, v)| !k.contains('\n') && !v.contains('\n'))
-        .map(|(k, v)| format!("{k}={v}\n"))
-        .collect();
+    // One entry per line: a key or value with a newline cannot fit the format. It is still in
+    // the agent's own environment, which every command it runs inherits.
+    let mut text = String::new();
+    for (k, v) in &merged {
+        if k.contains('\n') || v.contains('\n') {
+            warn!(
+                "vk-agent init: {k:?} holds a newline: left out of /etc/virtkit/env, so login \
+                 shells that read it do not see it"
+            );
+            continue;
+        }
+        text.push_str(&format!("{k}={v}\n"));
+    }
     let _ = std::fs::create_dir_all("/etc/virtkit");
     if let Err(e) = std::fs::write("/etc/virtkit/env", text) {
         warn!("vk-agent init: writing /etc/virtkit/env failed: {e}");
@@ -4068,6 +4085,16 @@ mod tests {
             exposed_ports: vec![6379],
         };
         assert_eq!(RunConfig::from_json(&cfg.to_json()).unwrap(), cfg);
+    }
+
+    /// A name `set_var` would panic on is skipped, not PID 1's end.
+    #[test]
+    fn an_env_var_no_environment_can_hold_is_skipped() {
+        set_env("", "v");
+        set_env("A=B", "v");
+        set_env("A\0", "v");
+        set_env("VK_TEST_NUL_VALUE", "a\0b");
+        assert!(std::env::var_os("VK_TEST_NUL_VALUE").is_none());
     }
 
     #[test]
