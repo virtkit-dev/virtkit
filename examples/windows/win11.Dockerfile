@@ -4,8 +4,9 @@
 # the install itself skips Setup's checks for them (Microsoft's LabConfig keys), and the build's
 # steps run without a TPM.
 #
-# Secure Boot is EXPERIMENTAL in vk: without SMM, the guest's kernel can rewrite PK, KEK, db or
-# dbx, or turn Secure Boot off, so it guards only the boot chain below the kernel. Lab use only.
+# Secure Boot without SMM: vk keeps and checks the UEFI variables on the host, so PK, KEK, db and
+# dbx are out of the guest's reach and Windows applies Microsoft's updates to them, but the
+# firmware itself runs unprotected while it boots. Lab use only.
 #
 #   vk build -f win11.Dockerfile --target member11 --out ./member11-out
 #
@@ -41,11 +42,6 @@ SHELL ["powershell", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Co
 # No automatic device encryption: Windows 11 would otherwise encrypt each member's disk with
 # BitLocker at its first boot on the TPM. Turn BitLocker on where a test needs it.
 RUN reg add HKLM\SYSTEM\CurrentControlSet\Control\BitLocker /v PreventDeviceEncryption /t REG_DWORD /d 1 /f
-# No Secure Boot database update: the task's authenticated UEFI variable writes at run time stop
-# Windows with bug check 0x1E in the firmware's runtime services (root cause under
-# investigation; README.md, known issues). So no db/dbx revocations and no 2023 CA rollover:
-# lab use only, and Windows servicing may still write those variables.
-RUN schtasks /Change /TN '\Microsoft\Windows\PI\Secure-Boot-Update' /Disable
 # Remote Desktop on, as on the servers (lab.Dockerfile's base).
 RUN Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' fDenyTSConnections 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
 COPY join.ps1 red-forest-check.ps1 rdp-probe.ps1 C:/vk/
