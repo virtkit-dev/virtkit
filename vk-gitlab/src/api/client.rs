@@ -33,7 +33,7 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const READ_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 10;
-/// The bound on one job request's long poll (virtkit's `docs/gitlab-dispatch.md`, kept
+/// The bound on one job request's long poll (`docs/gitlab-dispatch.md`, kept
 /// inside a reservation's lease); Workhorse answers a held request before it.
 const JOB_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 

@@ -1,8 +1,9 @@
 # GitLab dispatch: the contract
 
-Status: proposed, not implemented. `vk-hub-proto` defines the wire types: `client` for the
-hub's client API, `dispatch` for session job messages, and `job` for the job spec. Serde tests
-pin their JSON. See [GitLab jobs](fleet-design.md#gitlab-jobs) for the design and rationale.
+Status: experimental; `vk-gitlab`, `vk-hub` and `vk node` implement it. `vk-hub-proto`
+defines the wire types: `client` for the hub's client API, `dispatch` for session job
+messages, and `job` for the job spec. Serde tests pin their JSON. See
+[GitLab jobs](fleet-design.md#gitlab-jobs) for the design and rationale.
 
 Three parties take part:
 
@@ -286,11 +287,13 @@ submitted is submitted with the same `request_id`.
 
 The state file is `<state_dir>/<runner name>.json`. `state_dir` defaults to
 `/var/lib/vk-gitlab` and is created `0700`; the daemon refuses to start when group or others
-can access it. A record stays until the hub has settled its job, including a job already
-reported to GitLab or abandoned before submission. A runner's `name` defaults to its token's
-short form, so a runner whose token may change needs an explicit `name`, or the new token
-starts an empty file and the old one's jobs are never resumed; the daemon warns at start about
-state files no configured runner owns.
+can access it. A daemon run as an unprivileged service user cannot create the default, so
+create it for that user before the first start:
+`install -d -m 0700 -o <user> -g <group> /var/lib/vk-gitlab`. A record stays until the hub
+has settled its job, including a job already reported to GitLab or abandoned before
+submission. A runner's `name` defaults to its token's short form, so a runner whose token may
+change needs an explicit `name`, or the new token starts an empty file and the old one's jobs
+are never resumed; the daemon warns at start about state files no configured runner owns.
 
 Hub jobs and reservations belong to the API key that created them, and the hub answers
 `not_found` for them to any other key. The state file records a fingerprint of the key, and a
@@ -433,8 +436,8 @@ its `helpers/trace` masks it. Those ports keep gitlab-runner's MIT notice.
 
 ## Compatibility fixtures
 
-Ported from gitlab-runner v19.5.0 (MIT; the notice goes with the fixtures), as tests in the
-`vk-gitlab` repository unless noted:
+Ported from gitlab-runner v19.5.0 (MIT; the notice is in `NOTICE`), as tests of the
+`vk-gitlab` crate unless noted:
 
 | Upstream | Ported as |
 |---|---|

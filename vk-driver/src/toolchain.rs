@@ -28,11 +28,12 @@ use crate::dev::config::LOCK_FILE;
 ///
 /// `.github/workflows/release.yml` publishes exactly this list, and `quality.yml` checks
 /// that the two still agree.
-const DEFAULT_ARTIFACTS: [&str; 6] = [
+const DEFAULT_ARTIFACTS: [&str; 7] = [
     "vk",
     "vk-agent",
     "vk-registry",
     "vk-hub",
+    "vk-gitlab",
     "vk-runnerctl",
     "vmlinux",
 ];

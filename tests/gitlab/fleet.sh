@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # The fleet side: a vk-registry for caches, vk-hub over TLS, one enrolled `vk node run`, and
-# vk-gitlab — all on this host, under $RUN, each logging to $LOGS. Sourced by run.sh.
+# vk-gitlab — all on this host, under $RUN, each logging to $LOGS. Sourced by gitlab-e2e.sh.
 #
 # Inputs: VK (the vk under test, for the node), VK_HUB, VK_REGISTRY (optional), VK_GITLAB,
 # GL_URL, RUN, LOGS.
@@ -31,7 +31,7 @@ stop_bg() {
 }
 
 # A CA for the run and the hub's certificate under it, for 127.0.0.1 (as tests/fleet/lib.sh
-# in virtkit makes them).
+# makes them).
 fleet_certs() {
   local d=$RUN/pki
   mkdir -p "$d"

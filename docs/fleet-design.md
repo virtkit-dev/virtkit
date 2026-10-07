@@ -27,8 +27,8 @@ embedded database, no replication.
 - **`vk-hub`** — the hub binary: inventory, desired state, operations, audit log, web UI, and
   later reservations, job placement and the client API job producers use. Its database is
   `redb`, as `vk-registry`'s accounts store is.
-- **`vk-gitlab`** — proposed, a project of its own: gitlab-runner's GitLab-facing side,
-  reimplemented. It holds runner tokens, takes jobs from GitLab and submits them to the hub,
+- **`vk-gitlab`** — experimental, a crate of this workspace: gitlab-runner's GitLab-facing
+  side, reimplemented. It holds runner tokens, takes jobs from GitLab and submits them to the hub,
   and writes their traces and states back to GitLab.
 - **`vk-hub-proto`** — the hub↔node wire types, versioned, beside the VM list `vk workloads`
   prints for the programs on its host, the hub's client API and the job spec. A node and the
@@ -543,7 +543,8 @@ its principal — user or key — in the audit log.
 
 ## GitLab jobs
 
-Proposed, not built; the wire contract is [GitLab dispatch](gitlab-dispatch.md).
+Experimental; the wire contract is [GitLab dispatch](gitlab-dispatch.md), and
+[GitLab end to end](gitlab-e2e.md) runs it against a real GitLab.
 
 `vk-gitlab` is gitlab-runner's GitLab-facing side, reimplemented: it registers as one or more
 runners, asks GitLab for jobs, and has the hub run each on a node. The node runs the job's

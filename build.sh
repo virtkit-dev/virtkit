@@ -206,10 +206,11 @@ if [ -e "$OUT/CLOUDHV.fd" ]; then
 else
   echo "build.sh: no $OUT/CLOUDHV.fd — the vk built here embeds no UEFI firmware (./build-firmware.sh)" >&2
 fi
-# vk-registry (the standalone central server), vk-hub (the experimental local web UI) and
-# vk-runnerctl (the root-side setter for gitlab-runner's concurrent) embed nothing, so they
-# build plainly (no EMBED_ENV) alongside vk.
-BUILD_CMD="cargo build $CARGO_PROFILE_FLAG -p vk-agent && env $EMBED_ENV cargo build $CARGO_PROFILE_FLAG -p vk-driver${FEATURES:+ --features $FEATURES} && cargo build $CARGO_PROFILE_FLAG -p vk-registry && cargo build $CARGO_PROFILE_FLAG -p vk-hub && cargo build $CARGO_PROFILE_FLAG -p vk-runnerctl"
+# vk-registry (the standalone central server), vk-hub (the experimental fleet hub and local
+# web UI), vk-gitlab (the experimental GitLab runner for a vk-hub fleet) and vk-runnerctl (the
+# root-side setter for gitlab-runner's concurrent) embed nothing, so they build plainly (no
+# EMBED_ENV) alongside vk.
+BUILD_CMD="cargo build $CARGO_PROFILE_FLAG -p vk-agent && env $EMBED_ENV cargo build $CARGO_PROFILE_FLAG -p vk-driver${FEATURES:+ --features $FEATURES} && cargo build $CARGO_PROFILE_FLAG -p vk-registry && cargo build $CARGO_PROFILE_FLAG -p vk-hub && cargo build $CARGO_PROFILE_FLAG -p vk-gitlab && cargo build $CARGO_PROFILE_FLAG -p vk-runnerctl"
 
 compile_start=$SECONDS
 if [ -n "$VK_BIN" ]; then
@@ -264,7 +265,7 @@ mkdir -p "$OUT"
 # Replace atomically (write a temp, then rename): a plain cp truncates the destination and
 # would fail "Text file busy" if the old $OUT/vk is still being executed (e.g. by a
 # previous --use-virtkit / --bootstrap-check run); rename never does.
-for b in vk vk-agent vk-registry vk-hub vk-runnerctl; do
+for b in vk vk-agent vk-registry vk-hub vk-gitlab vk-runnerctl; do
   cp "target/$TARGET/$PROFILE_DIR/$b" "$OUT/.$b.tmp"
   mv -f "$OUT/.$b.tmp" "$OUT/$b"
 done
@@ -272,9 +273,9 @@ done
 # Reproducibility manifest: the pinned inputs and the artifact hashes. Anyone can
 # rebuild from the same commit + inputs and confirm byte-for-byte:
 #   git checkout <git_commit> && ./build-kernel.sh && ./build.sh &&
-#     ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
+#     ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 # The sidecars name the binaries bare, so the check runs from inside dist/.
-( cd "$OUT" && sha256sum vk > vk.sha256 && sha256sum vk-agent > vk-agent.sha256 && sha256sum vk-registry > vk-registry.sha256 && sha256sum vk-hub > vk-hub.sha256 && sha256sum vk-runnerctl > vk-runnerctl.sha256 )
+( cd "$OUT" && sha256sum vk > vk.sha256 && sha256sum vk-agent > vk-agent.sha256 && sha256sum vk-registry > vk-registry.sha256 && sha256sum vk-hub > vk-hub.sha256 && sha256sum vk-gitlab > vk-gitlab.sha256 && sha256sum vk-runnerctl > vk-runnerctl.sha256 )
 # The inputs that fix the bytes: the base image digest (.devcontainer/Dockerfile's FROM) and
 # the flake.lock revs of nixpkgs / rust-overlay.
 # The rev flake.lock pins for one input: the first "rev" inside that input's node.
@@ -314,25 +315,25 @@ elif [ -n "$FEATURES" ]; then
   # Release-profile bytes, but of a vk with extra features: the release recipe rebuilds the
   # default feature set, so it would fail against these hashes.
   manifest_header="# virtkit build manifest (--features=${FEATURES}) — extra features, not a release artifact
-# Verify: git checkout <git_commit> && ${firmware_step}./build.sh --features=${FEATURES}${NO_KERNEL:+ --no-kernel}${KERNEL_FROM:+ --kernel-from=$KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && ${firmware_step}./build.sh --features=${FEATURES}${NO_KERNEL:+ --no-kernel}${KERNEL_FROM:+ --kernel-from=$KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 profile:         release
 features:        ${FEATURES}"
 elif [ -n "$NO_KERNEL" ]; then
   # Same trap as --fast, one step removed: the bytes are release-profile but kernel-less,
   # so the release recipe — which embeds the kernel — rebuilds something else entirely.
   manifest_header="# virtkit build manifest (--no-kernel) — no embedded kernel, not a release artifact
-# Verify: git checkout <git_commit> && ${firmware_step}./build.sh --no-kernel && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && ${firmware_step}./build.sh --no-kernel && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 profile:         release"
 elif [ -n "$KERNEL_FROM" ]; then
   # The kernel was built at the release's commit, not git_commit: the vk that embeds it is
   # not git_commit's release build.
   manifest_header="# virtkit CI build manifest — embeds ${KERNEL_FROM}'s guest kernel, not a release artifact
-# Verify: git checkout <git_commit> && gh release download ${KERNEL_FROM} -p vmlinux -p vmlinux.sha256 -D dist && ( cd dist && sha256sum -c vmlinux.sha256 ) && ${firmware_step}./build.sh --kernel-from=${KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && gh release download ${KERNEL_FROM} -p vmlinux -p vmlinux.sha256 -D dist && ( cd dist && sha256sum -c vmlinux.sha256 ) && ${firmware_step}./build.sh --kernel-from=${KERNEL_FROM} && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 profile:         release
 kernel_from:     ${KERNEL_FROM}"
 else
   manifest_header="# virtkit reproducible build manifest
-# Verify: git checkout <git_commit> && ./build-kernel.sh && ${firmware_step}./build.sh && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-runnerctl.sha256 )
+# Verify: git checkout <git_commit> && ./build-kernel.sh && ${firmware_step}./build.sh && ( cd dist && sha256sum -c vk.sha256 vk-agent.sha256 vk-registry.sha256 vk-hub.sha256 vk-gitlab.sha256 vk-runnerctl.sha256 )
 profile:         release"
 fi
 cat > "$OUT/build-info.txt" <<EOF

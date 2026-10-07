@@ -48,7 +48,7 @@ pub struct FeaturesInfo {
 }
 
 impl FeaturesInfo {
-    /// What a vk fleet runner advertises (virtkit's `docs/gitlab-dispatch.md`, "Daemon ↔
+    /// What a vk fleet runner advertises (`docs/gitlab-dispatch.md`, "Daemon ↔
     /// GitLab"): the network side's trace and cancellation features, `two_phase_job_commit`
     /// (the job is committed only once a node accepted it), and what the node's executor
     /// runs. Not `session`, `terminal`, `proxy`, `shared`, `vault_secrets`,

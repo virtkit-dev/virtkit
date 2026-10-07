@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Shared helpers for tests/e2e: logging, polling, and the result table. Sourced by run.sh.
+# Shared helpers for gitlab-e2e.sh: logging, polling, and the result table.
 
 log() { printf '%s %s\n' "$(date +%T)" "$*" >&2; }
 die() {

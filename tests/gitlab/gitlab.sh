@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# shellcheck disable=SC2034 # GL_REUSED is read by run.sh
-# GitLab CE in a vk microVM, and its API. Sourced by run.sh.
+# shellcheck disable=SC2034 # GL_REUSED is read by gitlab-e2e.sh
+# GitLab CE in a vk microVM, and its API. Sourced by gitlab-e2e.sh.
 #
 # The image's own init (/assets/init-container: runsvdir, then `gitlab-ctl reconfigure`, then
 # `wait`) runs as the trailing command of a detached `vk run`, under vk-agent as PID 1 — the
@@ -202,7 +202,7 @@ gl_seed() {
 }
 
 # gl_push <branch> <dir>: replace the branch with a single commit of <dir>; print its SHA.
-# lib/askpass.sh supplies root's token from $GL_DIR/pat without a credential helper.
+# askpass.sh supplies root's token from $GL_DIR/pat without a credential helper.
 gl_push() {
   local branch=$1 dir=$2
   (
@@ -210,7 +210,7 @@ gl_push() {
     git init -q -b "$branch" .
     git add -A
     git -c user.name=e2e -c user.email=e2e@example.invalid commit -q -m "e2e $branch $RUN_ID"
-    GIT_ASKPASS=$E2E/lib/askpass.sh GL_PAT_FILE=$GL_DIR/pat GIT_TERMINAL_PROMPT=0 \
+    GIT_ASKPASS=$E2E/askpass.sh GL_PAT_FILE=$GL_DIR/pat GIT_TERMINAL_PROMPT=0 \
       git -c credential.helper= push -q -f "http://root@$GL_HOST:$GL_PORT/$GL_PROJECT_PATH.git" \
       "HEAD:refs/heads/$branch" >/dev/null
     git rev-parse HEAD

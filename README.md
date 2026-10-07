@@ -814,6 +814,7 @@ local store. The central server and storage model are documented in
 | `vk-agent` | Guest PID 1 and command server. It configures mounts, networking, hostname, shared directories, optional SSH, and host-driven execution over vsock. |
 | `vk-registry` | Optional OCI-distribution server with a pull-through cache, a WebDAV view of the store with a plain-file area for compiler caches, and build-once locking. |
 | `vk-hub` | Experimental hub for a fleet of `vk node` hosts, and a web UI for the VMs on this machine: `vk-hub local` serves it on loopback. See the [fleet design](docs/fleet-design.md) and [prototype reference](docs/fleet-prototype.md). |
+| `vk-gitlab` | Experimental GitLab runner for a `vk-hub` fleet: takes jobs from GitLab and has the hub run each on a `vk node`. See [GitLab dispatch](docs/gitlab-dispatch.md). |
 | `vk-runnerctl` | Optional root-side helper that adjusts GitLab runner concurrency within an administrator-configured range. |
 
 ## Architecture
@@ -911,7 +912,7 @@ Build the pinned guest kernel first, then the static binaries:
 ```sh
 ./build-kernel.sh    # dist/vmlinux
 ./build-firmware.sh  # dist/CLOUDHV.fd: UEFI firmware (optional; embedded by build.sh)
-./build.sh           # dist/{vk,vk-agent,vk-registry,vk-hub,vk-runnerctl,...}
+./build.sh           # dist/{vk,vk-agent,vk-registry,vk-hub,vk-gitlab,vk-runnerctl,...}
 ```
 
 The scripts use a `vk` found on `PATH` to build inside a microVM; otherwise they use
@@ -962,6 +963,7 @@ vk-driver/       host driver, builder, VMM, networking, compose, and GitLab exec
 vk-agent/        guest PID 1 and exec server
 vk-registry/     optional central OCI store and distribution server
 vk-hub/          experimental fleet hub, and local web UI for this machine's VMs
+vk-gitlab/       experimental GitLab runner that hands jobs to a vk-hub fleet
 vk-runnerctl/    optional root-side GitLab concurrency helper
 vk-selfupdate/   shared self-update implementation for vk and vk-registry
 vk-fs/           filesystem objects created private and published whole

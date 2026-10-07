@@ -1,7 +1,7 @@
 # shellcheck shell=bash
-# shellcheck disable=SC2034 # SC_DETAIL is read by run.sh
+# shellcheck disable=SC2034 # SC_DETAIL is read by gitlab-e2e.sh
 # Each scenario pushes a branch with its own .gitlab-ci.yml to the test project and checks
-# GitLab's job status, failure_reason, trace and artifacts. Sourced by run.sh, which runs
+# GitLab's job status, failure_reason, trace and artifacts. Sourced by gitlab-e2e.sh, which runs
 # every scenario but `restart` concurrently, each in a subshell.
 #
 # A scenario is a function `sc_<name>` that returns non-zero, after `bad` has said why, when an

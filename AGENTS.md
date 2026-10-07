@@ -21,7 +21,8 @@ Skip badges on restatements, tool output, and descriptions of your own next step
 
 virtkit — a rootless microVM toolkit shipped as static-musl binaries (`vk` + the
 embedded `vk-agent`, plus the optional `vk-registry` central server, the
-`vk-runnerctl` runner throttle and the experimental `vk-hub` fleet hub and local web UI).
+`vk-runnerctl` runner throttle, the experimental `vk-hub` fleet hub and local web UI, and
+the experimental `vk-gitlab` runner that has the hub run GitLab jobs).
 It boots OCI/Docker images as fast microVMs on its embedded
 [libkrun](https://github.com/containers/libkrun) VMM, gives them a shared LAN with egress
 over ordinary host sockets (no tap, no bridge, no `CAP_NET_ADMIN`, no root), and drives
@@ -31,7 +32,7 @@ The same codebase powers local compose-service VMs and a GitLab custom executor.
 
 ## Architecture
 
-A Cargo workspace (`Cargo.toml`, edition 2024) with ten crates:
+A Cargo workspace (`Cargo.toml`, edition 2024) with twelve crates:
 
 - **`vk-core/`** — the shared host↔guest library: the wire protocol (`messages`,
   `framing`, `addr`, `net`, `status`, `fleetctl`), the formats both sides speak (`atop`,
@@ -83,6 +84,14 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with ten crates:
   Both sign people in with single-use links and keep an audit log. Built like the
   `vk-registry` server (hyper, rustls on ring); operators reach it through a private unix
   socket and the web UI. See `docs/fleet-design.md` and `docs/fleet-prototype.md`.
+- **`vk-gitlab/`** — the GitLab runner for a fleet (lib + bin, experimental): gitlab-runner's
+  GitLab-facing side, reimplemented from gitlab-runner v19.5.0 (MIT, see `NOTICE`). It asks
+  GitLab for jobs only once the hub has reserved room, translates each into
+  `vk-hub-proto`'s job spec, submits it through the hub's client API, and copies the job's
+  output and outcome back into GitLab's trace and state; a state file per runner lets a
+  restarted daemon pick its jobs up again. Its tests run against an in-process fake GitLab
+  and fake hub, with fixtures ported from gitlab-runner's own suite. See
+  `docs/gitlab-dispatch.md`.
 - **`vk-runnerctl/`** — the only component that runs as root, and deliberately the smallest:
   it sets gitlab-runner's `concurrent` from a number unprivileged `vk` leaves in a file,
   clamped into a range only root can configure. It takes no arguments and no paths from its
@@ -223,7 +232,10 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 - **End-to-end suite** (`tests/`): `VK=./dist/vk tests/release-e2e.sh` runs it against a
   local build — it needs KVM, e2fsprogs and network — and naming scripts narrows the run.
   Every other `tests/*.sh` is picked up by its glob, so adding one gates the next release
-  with no registration step.
+  with no registration step — except `windows-*.sh` (run with `ISO_DIR`) and
+  `gitlab-e2e.sh`, which boots a GitLab CE of its own to test `vk-gitlab` (run with
+  `E2E_GITLAB=1`; see [`docs/gitlab-e2e.md`](docs/gitlab-e2e.md)). Helpers live in
+  subdirectories (`tests/fleet/`, `tests/gitlab/`), out of the glob's reach.
 
 Reproducibility is load-bearing: the binaries are baked into microVM images. Keep
 builds byte-deterministic (pinned toolchain/base image, `SOURCE_DATE_EPOCH`, path

@@ -148,11 +148,13 @@ jobs:
             dist/vk-agent
             dist/vk-registry
             dist/vk-hub
+            dist/vk-gitlab
             dist/vk-runnerctl
             dist/vk.sha256
             dist/vk-agent.sha256
             dist/vk-registry.sha256
             dist/vk-hub.sha256
+            dist/vk-gitlab.sha256
             dist/vk-runnerctl.sha256
             dist/build-info.txt
           retention-days: ${{ inputs.retention-days }}

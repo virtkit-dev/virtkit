@@ -14,13 +14,14 @@
 #   VK=./dist/vk tests/release-e2e.sh tests/systemd-boot-e2e.sh  # the smoke checks + these
 #   RELEASE_TAG=v0.61.0 VK=dist/vk tests/release-e2e.sh     # what release.yml runs
 #   ISO_DIR=~/.cache/vk-windows VK=./dist/vk tests/release-e2e.sh   # the Windows tests too
+#   E2E_GITLAB=1 VK=./dist/vk tests/release-e2e.sh        # the GitLab suite too (gitlab-e2e.sh)
 #
 # Needs: KVM, network for the image pulls the scripts do, e2fsprogs, and GNU coreutils
 # (busybox `timeout` signals only its child, so a killed step would leak the microVMs it
 # started). E2E_TIMEOUT caps each step, in seconds (default 1800, and 7200 for the windows-*
-# tests, whose first run installs Windows), so a hung microVM fails the gate instead of holding
-# it; E2E_BUDGET caps the run as a whole (default 0, no cap) so the results table still prints
-# inside a CI job timeout.
+# tests, whose first run installs Windows, and the gitlab-* ones, whose first run boots
+# GitLab), so a hung microVM fails the gate instead of holding it; E2E_BUDGET caps the run as
+# a whole (default 0, no cap) so the results table still prints inside a CI job timeout.
 set -euo pipefail
 
 usage() {
@@ -30,7 +31,7 @@ usage() {
 
 here="$(cd "$(dirname "$0")" && pwd)"
 self=$(basename "$0")
-windows_timeout=${E2E_TIMEOUT:-7200}
+long_timeout=${E2E_TIMEOUT:-7200}
 E2E_TIMEOUT=${E2E_TIMEOUT:-1800}
 E2E_BUDGET=${E2E_BUDGET:-0}
 # 0 would mean "no limit" to timeout, which is the one thing this cap exists to prevent.
@@ -104,7 +105,7 @@ started=$SECONDS
 step() { # <name> <command...>
   local name=$1 rc=0 cap=$E2E_TIMEOUT left
   shift
-  [[ $name != windows-* ]] || cap=$windows_timeout
+  [[ $name != windows-* && $name != gitlab-* ]] || cap=$long_timeout
   names+=("$name")
   if [ "$E2E_BUDGET" -ne 0 ]; then
     left=$((E2E_BUDGET - (SECONDS - started)))
@@ -176,6 +177,15 @@ for script in "${scripts[@]}"; do
   if [ "$#" -eq 0 ] && [[ $name == windows-* ]] && [ -z "${ISO_DIR:-}" ]; then
     names+=("$name")
     results+=("not run (needs ISO_DIR, the Windows ISOs)")
+    not_run=$((not_run + 1))
+    continue
+  fi
+  # The GitLab suite boots a GitLab CE of its own (about 9 GiB of memory, up to 11 minutes)
+  # and tests vk-gitlab rather than vk: run it when E2E_GITLAB=1 asks for it, list it as not
+  # run otherwise (named on the command line, it runs regardless).
+  if [ "$#" -eq 0 ] && [[ $name == gitlab-* ]] && [ "${E2E_GITLAB:-}" != 1 ]; then
+    names+=("$name")
+    results+=("not run (needs E2E_GITLAB=1)")
     not_run=$((not_run + 1))
     continue
   fi

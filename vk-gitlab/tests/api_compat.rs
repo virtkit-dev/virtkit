@@ -274,7 +274,7 @@ async fn request_job() {
 #[tokio::test]
 async fn request_job_advertises_runner_info() {
     // TestGitLabClient_RequestJob_TransmitsTwoPhaseJobCommit and TestFeaturesInfo_JSONMarshaling,
-    // with the feature set of virtkit's docs/gitlab-dispatch.md.
+    // with the feature set of docs/gitlab-dispatch.md.
     let s = FakeGitLab::start(|_: &Recorded| Reply::status(204)).await;
     client(&s.url, VALID_TOKEN, 1).request_job().await;
     let body = s.requests()[0].json();

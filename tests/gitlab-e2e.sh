@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # End-to-end: vk-gitlab between a real GitLab CE and a real virtkit fleet, all on this host.
 #
 #   GitLab CE ── job requests, traces ──> vk-gitlab ── client API ──> vk-hub ── session ──> vk node
 #        ^                                                                                     │
 #        └──────────── clone, artifacts (job token), from the job's microVM ───────────────────┘
 #
-# GitLab runs in a vk microVM (lib/gitlab.sh) whose state is cached across runs; vk-hub, a
+# GitLab runs in a vk microVM (gitlab/gitlab.sh) whose state is cached across runs; vk-hub, a
 # vk-registry for caches, one enrolled `vk node run` and vk-gitlab run as host processes
-# (lib/fleet.sh). Each scenario (lib/scenarios.sh) pushes a branch with its own
-# .gitlab-ci.yml and asserts the outcome through GitLab's API.
+# (gitlab/fleet.sh). Each scenario (gitlab/scenarios.sh) pushes a branch with its own
+# .gitlab-ci.yml and asserts the outcome through GitLab's API. See docs/gitlab-e2e.md.
 #
-# Usage: tests/e2e/run.sh --vk <path> --vk-hub <path> [options]
+# Not part of the release gate: tests/release-e2e.sh runs it only with E2E_GITLAB=1, or
+# when named.
 #
-#   --vk PATH            the vk under test: the node runs it (virtkit's ./build.sh output)
-#   --vk-hub PATH        the vk-hub under test
+# Usage: tests/gitlab-e2e.sh [options]
+#
+#   --vk PATH            the vk under test: the node runs it (default: $VK, else dist/vk)
+#   --vk-hub PATH        the vk-hub under test (default: beside --vk)
 #   --vk-registry PATH   vk-registry for the node's [registry] (default: beside --vk-hub);
 #                        without one the cache scenario is skipped
+#   --vk-gitlab PATH     the vk-gitlab under test (default: beside --vk-hub)
 #   --vk-boot PATH       the vk that boots GitLab (default: vk on PATH, else --vk)
-#   --vk-gitlab PATH     use this vk-gitlab instead of building one with ./dev.sh
 #   --scenario NAME      run only these (repeatable, or comma-separated); default: all
 #   --keep               leave everything running (GitLab, hub, node, vk-gitlab)
 #   --reset-gitlab       discard the cached GitLab instance first (a cold boot)
@@ -31,21 +35,19 @@
 # Needs: KVM, curl, jq, git, openssl, ss, ip, shuf, network to Docker Hub; about 9 GiB of free RAM
 # (GitLab 6 GiB, job VMs 1 GiB each) and 15 GiB of disk for the GitLab image and its state.
 set -euo pipefail
-CALLER=$PWD
-cd "$(dirname "$0")"
-E2E=$PWD
-REPO=$(cd ../.. && pwd)
+E2E=$(cd "$(dirname "$0")/gitlab" && pwd)
+REPO=$(cd "$E2E/../.." && pwd)
 
-# shellcheck source=images.env
+# shellcheck source=gitlab/images.env
 . "$E2E/images.env"
-# shellcheck source=lib/common.sh
-. "$E2E/lib/common.sh"
-# shellcheck source=lib/gitlab.sh
-. "$E2E/lib/gitlab.sh"
-# shellcheck source=lib/fleet.sh
-. "$E2E/lib/fleet.sh"
-# shellcheck source=lib/scenarios.sh
-. "$E2E/lib/scenarios.sh"
+# shellcheck source=gitlab/common.sh
+. "$E2E/common.sh"
+# shellcheck source=gitlab/gitlab.sh
+. "$E2E/gitlab.sh"
+# shellcheck source=gitlab/fleet.sh
+. "$E2E/fleet.sh"
+# shellcheck source=gitlab/scenarios.sh
+. "$E2E/scenarios.sh"
 
 ALL_SCENARIOS=(basic scripts variables exit_codes artifacts cache services timeout cancel restart)
 
@@ -61,30 +63,20 @@ abs() {
   echo "$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
 }
 
-# from_caller <path>: a relative path option resolved against the caller's directory, not
-# this script's. A bare name stays as given (a binary looked up on PATH).
-from_caller() {
-  case $1 in
-    /* | '') echo "$1" ;;
-    */*) echo "$CALLER/$1" ;;
-    *) if [ "${2:-}" = dir ]; then echo "$CALLER/$1"; else echo "$1"; fi ;;
-  esac
-}
-
-VK='' VK_HUB='' VK_REGISTRY='' VK_BOOT='' VK_GITLAB='' KEEP='' RESET='' STOP_ONLY='' RUN=''
+VK=${VK:-$REPO/dist/vk} VK_HUB='' VK_REGISTRY='' VK_BOOT='' VK_GITLAB='' KEEP='' RESET='' STOP_ONLY='' RUN=''
 SCENARIOS=()
 while [ $# -gt 0 ]; do
   case $1 in
-    --vk) VK=$(from_caller "$2") && shift ;;
-    --vk-hub) VK_HUB=$(from_caller "$2") && shift ;;
-    --vk-registry) VK_REGISTRY=$(from_caller "$2") && shift ;;
-    --vk-boot) VK_BOOT=$(from_caller "$2") && shift ;;
-    --vk-gitlab) VK_GITLAB=$(from_caller "$2") && shift ;;
+    --vk) VK=$2 && shift ;;
+    --vk-hub) VK_HUB=$2 && shift ;;
+    --vk-registry) VK_REGISTRY=$2 && shift ;;
+    --vk-boot) VK_BOOT=$2 && shift ;;
+    --vk-gitlab) VK_GITLAB=$2 && shift ;;
     --scenario) IFS=, read -r -a s <<<"$2" && SCENARIOS+=("${s[@]}") && shift ;;
     --keep) KEEP=1 ;;
     --reset-gitlab) RESET=1 ;;
     --stop-gitlab) STOP_ONLY=1 ;;
-    --run-dir) RUN=$(from_caller "$2" dir) && shift ;;
+    --run-dir) RUN=$2 && shift ;;
     -h | --help) usage ;;
     *) echo "unknown argument: $1" >&2 && usage ;;
   esac
@@ -112,13 +104,13 @@ if [ -n "$STOP_ONLY" ]; then
   exit 0
 fi
 
-[ -n "$VK" ] && [ -n "$VK_HUB" ] || usage
 VK=$(abs "$VK")
-VK_HUB=$(abs "$VK_HUB")
+VK_HUB=$(abs "${VK_HUB:-$(dirname "$VK")/vk-hub}")
 if [ -z "$VK_REGISTRY" ] && [ -x "$(dirname "$VK_HUB")/vk-registry" ]; then
   VK_REGISTRY=$(dirname "$VK_HUB")/vk-registry
 fi
 [ -z "$VK_REGISTRY" ] || VK_REGISTRY=$(abs "$VK_REGISTRY")
+VK_GITLAB=$(abs "${VK_GITLAB:-$(dirname "$VK_HUB")/vk-gitlab}")
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || die "no writable /dev/kvm"
 
 [ ${#SCENARIOS[@]} -gt 0 ] || SCENARIOS=("${ALL_SCENARIOS[@]}")
@@ -148,7 +140,7 @@ teardown() {
   if [ -n "$KEEP" ]; then
     log "--keep: leaving everything up. GitLab: ${GL_URL:-?} (root / see $GL_DIR/instance.env);"
     log "  hub: $RUN/hub/hub.toml; node: VIRTKIT_CONFIG=$RUN/node/config.toml;"
-    log "  stop with: tests/e2e/run.sh --stop-gitlab, and kill the pids in $RUN/*.pid"
+    log "  stop with: tests/gitlab-e2e.sh --stop-gitlab, and kill the pids in $RUN/*.pid"
   else
     fleet_down
     [ -z "${GL_PAT:-}" ] || [ -z "${GL_RUNNER_ID:-}" ] ||
@@ -170,16 +162,6 @@ if [ -n "$RESET" ]; then
   rm -rf "$GL_DIR"
 fi
 
-# vk-gitlab: a static-musl debug build from the pinned toolchain. `cargo test --no-run` on an
-# integration test builds the binary beside it; dev.sh refuses `cargo build`. A development VM
-# this boots powers off after two idle minutes, not dev.sh's half hour, to hand its memory back.
-if [ -z "$VK_GITLAB" ]; then
-  log "vk-gitlab: building with ./dev.sh"
-  (cd "$REPO" && VK_DEV_IDLE_SECS=${VK_DEV_IDLE_SECS:-120} ./dev.sh test -p vk-gitlab --no-run --test hub_e2e) >"$LOGS/build-vk-gitlab.log" 2>&1 ||
-    { tail -30 "$LOGS/build-vk-gitlab.log" >&2; die "building vk-gitlab failed"; }
-  VK_GITLAB=$REPO/target/x86_64-unknown-linux-musl/debug/vk-gitlab
-fi
-VK_GITLAB=$(abs "$VK_GITLAB")
 log "vk-gitlab: $("$VK_GITLAB" --version)"
 log "vk: $("$VK" --version); vk-hub: $("$VK_HUB" --version 2>&1 | head -1)"
 
