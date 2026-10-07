@@ -996,8 +996,8 @@ pub struct VcpuConfig {
 /// intercept; under Hyper-V's nested SVM (WSL2, Azure) it comes to KVM as an intercepted #DB
 /// with RIP still on the `int1` instead, KVM injects it there, and the guest executes the
 /// `int1` again, forever. Windows' PatchGuard runs one now and then, and the guest hangs. On for
-/// a Windows guest (`windows`) on an AMD host that is itself a VM, or as `KRUN_INT1_WORKAROUND`
-/// says (`1` or `0`).
+/// a Windows guest (`windows`) where [`int1_fault`] finds the fault, or as
+/// `KRUN_INT1_WORKAROUND` says (`1` or `0`).
 #[cfg(target_arch = "x86_64")]
 fn int1_workaround(windows: bool) -> bool {
     match env::var("KRUN_INT1_WORKAROUND").as_deref() {
@@ -1005,10 +1005,7 @@ fn int1_workaround(windows: bool) -> bool {
         Ok("0") => return false,
         _ => {}
     }
-    let vendor = std::arch::x86_64::__cpuid(0);
-    let amd = (vendor.ebx, vendor.edx, vendor.ecx) == (0x6874_7541, 0x6974_6e65, 0x444d_4163);
-    let nested = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
-    windows && amd && nested
+    windows && int1_fault()
 }
 
 /// The byte at linear address `va` of a guest whose CR3, CR4 and EFER are these, through its
@@ -1044,6 +1041,114 @@ fn guest_linear_byte(mem: &GuestMemoryMmap, cr3: u64, cr4: u64, efer: u64, va: u
         table = entry & ADDRESS;
     }
     mem.read_obj(GuestAddress(table | (va & 0xfff))).ok()
+}
+
+/// Whether this host delivers an `int1` back onto itself, the fault [`int1_workaround`] steps
+/// over: [`probe_int1`], once per process. If the probe cannot run, the hosts where the fault
+/// has been seen: an AMD processor with the hypervisor bit (Hyper-V's nested SVM).
+#[cfg(target_arch = "x86_64")]
+fn int1_fault() -> bool {
+    static FAULT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FAULT.get_or_init(|| match probe_int1() {
+        Ok(fault) => {
+            info!(
+                "this host delivers int1 {}",
+                if fault { "onto itself" } else { "correctly" }
+            );
+            fault
+        }
+        Err(e) => {
+            let vendor = std::arch::x86_64::__cpuid(0);
+            let amd =
+                (vendor.ebx, vendor.edx, vendor.ecx) == (0x6874_7541, 0x6974_6e65, 0x444d_4163);
+            let nested = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
+            warn!(
+                "could not probe how this host delivers int1 ({e}); taking it to {} the fault, \
+                 as an AMD host that is itself a VM may",
+                if amd && nested { "have" } else { "lack" }
+            );
+            amd && nested
+        }
+    })
+}
+
+/// Run `int1` in a throwaway one-page VM, in real mode, under a #DB handler that reports on an
+/// I/O port the return address the #DB pushed: past the `int1` as it should be (false), or the
+/// `int1` itself (true), where the guest would execute it again forever. The real-mode answer
+/// stands for long mode, where Windows runs its `int1`: the faulty hosts seen so far answer
+/// the same in both.
+#[cfg(target_arch = "x86_64")]
+fn probe_int1() -> std::result::Result<bool, String> {
+    use vm_memory::Bytes;
+    const SIZE: usize = 0x1000;
+    const CODE: u16 = 0x100;
+    const HANDLER: u16 = 0x200;
+    const STACK: u64 = 0xff0;
+    const PORT: u16 = 0x80;
+    // The real-mode IVT's #DB entry (offset, segment), the code, and the #DB handler.
+    const IVT_DB: u64 = 4;
+    const PROGRAM: [u8; 2] = [0xf1, 0xf4]; // int1; hlt
+    // mov bp, sp; mov ax, [bp]; mov dx, 0x80 (PORT); out dx, ax; iret
+    const DB_HANDLER: [u8; 10] = [0x89, 0xe5, 0x8b, 0x46, 0x00, 0xba, 0x80, 0x00, 0xef, 0xcf];
+
+    // Before the VM, so that it outlives the VM whatever returns early: locals drop in reverse.
+    let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), SIZE)])
+        .map_err(|e| format!("its memory: {e}"))?;
+    let kvm = Kvm::new().map_err(|e| format!("opening KVM: {e}"))?;
+    let vm = kvm.create_vm().map_err(|e| format!("creating a VM: {e}"))?;
+    let mut ivt = [0u8; 4];
+    ivt[..2].copy_from_slice(&HANDLER.to_le_bytes());
+    for (addr, bytes) in [
+        (IVT_DB, &ivt[..]),
+        (u64::from(CODE), &PROGRAM[..]),
+        (u64::from(HANDLER), &DB_HANDLER[..]),
+    ] {
+        mem.write_slice(bytes, GuestAddress(addr))
+            .map_err(|e| format!("writing its code: {e}"))?;
+    }
+    let host = mem
+        .get_host_address(GuestAddress(0))
+        .map_err(|e| format!("its memory: {e}"))?;
+    let region = kvm_bindings::kvm_userspace_memory_region {
+        slot: 0,
+        flags: 0,
+        guest_phys_addr: 0,
+        memory_size: SIZE as u64,
+        userspace_addr: host as u64,
+    };
+    // SAFETY: the region is `mem`'s mapping, declared before the VM and so dropped after it.
+    unsafe { vm.set_user_memory_region(region) }.map_err(|e| format!("its memory: {e}"))?;
+    let mut vcpu = vm.create_vcpu(0).map_err(|e| format!("a vCPU: {e}"))?;
+    let mut sregs = vcpu.get_sregs().map_err(|e| format!("its sregs: {e}"))?;
+    for seg in [&mut sregs.cs, &mut sregs.ds, &mut sregs.ss] {
+        seg.base = 0;
+        seg.selector = 0;
+    }
+    vcpu.set_sregs(&sregs)
+        .map_err(|e| format!("its sregs: {e}"))?;
+    let regs = kvm_regs {
+        rip: u64::from(CODE),
+        rsp: STACK,
+        rflags: 2,
+        ..Default::default()
+    };
+    vcpu.set_regs(&regs).map_err(|e| format!("its regs: {e}"))?;
+    for _ in 0..16 {
+        match vcpu.run() {
+            Ok(VcpuExit::IoOut(port, data)) if port == PORT && data.len() == 2 => {
+                return match u16::from_le_bytes([data[0], data[1]]) {
+                    ip if ip == CODE + 1 => Ok(false),
+                    ip if ip == CODE => Ok(true),
+                    ip => Err(format!("its #DB returned to {ip:#x}")),
+                };
+            }
+            Ok(VcpuExit::Hlt) => return Err("it halted without its #DB".to_string()),
+            Ok(_) => {}
+            Err(e) if matches!(e.errno(), libc::EINTR | libc::EAGAIN) => {}
+            Err(e) => return Err(format!("running it: {e}")),
+        }
+    }
+    Err("no answer from it".to_string())
 }
 
 // Using this for easier explicit type-casting to help IDEs interpret the code.
@@ -2358,6 +2463,15 @@ mod tests {
             vcpu.configure_x86_64(&vm_mem, GuestAddress(0), &vcpu_config, true, false)
                 .is_ok()
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_int1_probe_answers() {
+        // Either answer is a host's (true under Hyper-V's nested SVM on AMD); what matters is
+        // that the probe's VM runs to one.
+        let fault = probe_int1().expect("the int1 probe answers");
+        println!("this host delivers int1 onto itself: {fault}");
     }
 
     #[cfg(target_arch = "x86_64")]

@@ -67,10 +67,10 @@ its rationale and test. For Windows they add:
   host), its state in `tpm-state`;
 - SMBIOS tables with a per-machine UUID, a VM generation ID, KVM's Hyper-V enlightenments,
   pvpanic (a guest crash is logged to the run's `console.vmm.log`);
-- on an AMD host that is itself a VM (WSL2, Azure), the guest's debug exceptions taken by the
-  VMM, which steps over `int1`: Hyper-V's nested SVM reports an `int1`'s exception with the
-  instruction pointer still on it, the guest ran it again forever, and Windows' PatchGuard
-  runs one now and then;
+- on a host whose KVM delivers an `int1` onto itself (Hyper-V's nested SVM on AMD: WSL2,
+  Azure), which the VMM probes in a throwaway VM, the guest's debug exceptions taken by the
+  VMM, which steps over `int1`: the guest ran it again forever, and Windows' PatchGuard runs
+  one now and then;
 - pause and resume, and snapshot and restore of memory, CPU and device state.
 
 ## Driver (`vk-driver`)
@@ -125,9 +125,10 @@ button.
   subnet down (.254, .253, ...), like any compose service, besides its tap.
 - **Build steps run without a TPM**: a key sealed to an ephemeral TPM would leave the layer
   unbootable.
-- **No hardware breakpoints in a guest on an AMD host that is itself a VM** (WSL2, Azure): the
-  VMM takes the guest's debug exceptions there to step over `int1` (see VMM above), so a kernel
-  debugger's hardware breakpoints and watchpoints in the guest do not fire.
+- **No hardware breakpoints in a Windows guest where the host delivers `int1` onto itself**
+  (Hyper-V's nested SVM on AMD: WSL2, Azure): the VMM takes the guest's debug exceptions there
+  to step over `int1` (see VMM above), so a kernel debugger's hardware breakpoints and
+  watchpoints in the guest do not fire.
 - **Secure Boot without SMM** guards the boot chain: the variables are out of the guest's reach
   now, but the firmware itself runs unprotected from the guest's kernel while it boots.
 
