@@ -678,7 +678,7 @@ the executor's own image rules apply; a service answers to its first alias only;
 in-guest checkout does not retry through gitlab-runner's worktree clearing; caches need a
 remote `[registry]`. `tests/node-job-e2e.sh` runs journaled jobs through `vk node job` in
 real microVMs; the session is tested against an in-process hub speaking the version-3
-messages, not yet against `vk-hub`.
+messages, and `vk-gitlab/tests/e2e/run.sh` runs it against `vk-hub` and GitLab CE end to end.
 
 ## Workloads
 
