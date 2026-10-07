@@ -4,6 +4,8 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+## [0.85.0] - 2026-10-07
+
 ### Added
 
 - **`vk tune` can edit a runner config you own.** A gitlab-runner that runs as your own user
@@ -3631,7 +3633,8 @@ All notable changes to virtkit will be documented in this file.
 - Guest kernel build pipeline (`build-kernel.sh`, `update-kernel.sh`; vanilla Linux with vendored config fragment).
 - Reproducible static-musl binaries from a digest-pinned Alpine devcontainer (`build.sh`, `update.sh`).
 
-[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.84.0...HEAD
+[Unreleased]: https://github.com/virtkit-dev/virtkit/compare/v0.85.0...HEAD
+[0.85.0]: https://github.com/virtkit-dev/virtkit/compare/v0.84.0...v0.85.0
 [0.84.0]: https://github.com/virtkit-dev/virtkit/compare/v0.83.0...v0.84.0
 [0.83.0]: https://github.com/virtkit-dev/virtkit/compare/v0.82.0...v0.83.0
 [0.82.0]: https://github.com/virtkit-dev/virtkit/compare/v0.81.0...v0.82.0
