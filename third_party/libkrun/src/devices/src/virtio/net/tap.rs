@@ -55,30 +55,13 @@ impl Tap {
     /// Configure a tap already attached by the caller. Keeping the same open description
     /// prevents another VM from claiming the queue between validation and activation.
     pub fn from_fd(fd: Arc<OwnedFd>, vnet_features: u64) -> Result<Self, ConnectError> {
-        let mut offload_flags: u64 = 0;
-        if (vnet_features & (1 << VIRTIO_NET_F_GUEST_CSUM)) != 0 {
-            offload_flags |= TUN_F_CSUM as u64;
-        }
-        if (vnet_features & (1 << VIRTIO_NET_F_GUEST_TSO4)) != 0 {
-            offload_flags |= TUN_F_TSO4 as u64;
-        }
-        if (vnet_features & (1 << VIRTIO_NET_F_GUEST_TSO6)) != 0 {
-            offload_flags |= TUN_F_TSO6 as u64;
-        }
-        if (vnet_features & (1 << VIRTIO_NET_F_GUEST_UFO)) != 0 {
-            offload_flags |= TUN_F_UFO as u64;
-        }
-
         unsafe {
             // TODO(slp): replace hardcoded vnet size with cons
             if let Err(err) = tunsetvnethdrsz(fd.as_raw_fd(), &12) {
                 return Err(ConnectError::TunSetVnetHdrSz(io::Error::from(err)));
             }
-
-            if let Err(err) = tunsetoffload(fd.as_raw_fd(), offload_flags) {
-                return Err(ConnectError::TunSetOffload(io::Error::from(err)));
-            }
         }
+        set_offloads(&fd, vnet_features)?;
 
         match fcntl(fd.as_ref(), FcntlArg::F_GETFL) {
             Ok(flags) => {
@@ -96,7 +79,35 @@ impl Tap {
     }
 }
 
+/// Tell the tap which offloads the driver accepts, so it hands the guest only frames the
+/// driver negotiated.
+fn set_offloads(fd: &OwnedFd, vnet_features: u64) -> Result<(), ConnectError> {
+    let mut offload_flags: u64 = 0;
+    if (vnet_features & (1 << VIRTIO_NET_F_GUEST_CSUM)) != 0 {
+        offload_flags |= TUN_F_CSUM as u64;
+    }
+    if (vnet_features & (1 << VIRTIO_NET_F_GUEST_TSO4)) != 0 {
+        offload_flags |= TUN_F_TSO4 as u64;
+    }
+    if (vnet_features & (1 << VIRTIO_NET_F_GUEST_TSO6)) != 0 {
+        offload_flags |= TUN_F_TSO6 as u64;
+    }
+    if (vnet_features & (1 << VIRTIO_NET_F_GUEST_UFO)) != 0 {
+        offload_flags |= TUN_F_UFO as u64;
+    }
+    unsafe {
+        if let Err(err) = tunsetoffload(fd.as_raw_fd(), offload_flags) {
+            return Err(ConnectError::TunSetOffload(io::Error::from(err)));
+        }
+    }
+    Ok(())
+}
+
 impl NetBackend for Tap {
+    fn set_vnet_features(&mut self, vnet_features: u64) -> Result<(), ConnectError> {
+        set_offloads(&self.fd, vnet_features)
+    }
+
     /// Try to read a frame from the tap devie. If no bytes are available reports
     /// ReadError::NothingRead.
     fn read_frame(&mut self, buf: &mut [u8]) -> Result<usize, ReadError> {
