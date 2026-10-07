@@ -328,7 +328,8 @@ impl Provisioning {
 }
 
 /// Stop the Windows service `name` whose VMM is `child` and runtime dir `dir` as `vk stop` stops a
-/// UEFI guest, killing it past [`STOP_GRACE`], and reap it; `false` if it had to be killed.
+/// UEFI guest, ending it past [`STOP_GRACE`] ([`crate::uefi::force_off`]), and reap it; `false`
+/// if it had to be ended.
 pub(crate) fn stop(name: &str, child: &mut Child, dir: &Path) -> bool {
     let off = match crate::uefi::power_off_blocking(child, dir, STOP_GRACE) {
         Ok(off) => off.is_some(),
@@ -337,8 +338,7 @@ pub(crate) fn stop(name: &str, child: &mut Child, dir: &Path) -> bool {
             false
         }
     };
-    let _ = child.kill();
-    let _ = child.wait();
+    crate::uefi::force_off_blocking(child, dir);
     off
 }
 

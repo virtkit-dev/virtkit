@@ -682,6 +682,50 @@ async fn power_off(ch: &mut Child, work: &Path, grace: Duration) -> Option<Durat
     exited_by(ch, deadline).await.then(|| pressed.elapsed())
 }
 
+/// How long a VMM asked to quit has to flush its disks and exit before it is killed.
+const QUIT_GRACE: Duration = Duration::from_secs(10);
+
+/// End the guest behind `ch`, with run directory `work`, now: ask its VMM over the control
+/// socket to quit, which flushes every disk's write-back cache before the process exits (as a
+/// guest power-off does), and kill it only if it is still there after [`QUIT_GRACE`]. A kill
+/// skips that flush: imago's cached qcow2 metadata never reaches the overlay, whose L2 tables
+/// and refcounts may then disagree, and the next run of a kept disk (`--state-dir`) allocates
+/// a cluster already in use and corrupts the guest's filesystem. Then reap it.
+pub(crate) async fn force_off(ch: &mut Child, work: &Path) {
+    if ch.try_wait().ok().flatten().is_none() {
+        match crate::vmmctl::quit(&work.join(CONTROL_SOCKET)) {
+            Ok(()) if exited_by(ch, Instant::now() + QUIT_GRACE).await => {}
+            Ok(()) => eprintln!(
+                "virtkit: the VM did not end within {}s of asking it to; killed",
+                QUIT_GRACE.as_secs()
+            ),
+            Err(e) => eprintln!("virtkit: asking the VM to end: {e:#}; killed"),
+        }
+        let _ = ch.kill();
+    }
+    let _ = ch.wait();
+}
+
+/// [`force_off`] from synchronous code, as [`power_off_blocking`] runs [`power_off`].
+pub(crate) fn force_off_blocking(ch: &mut Child, work: &Path) {
+    let ended = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                rt.block_on(force_off(ch, work));
+                Some(())
+            })
+            .join()
+    });
+    if !matches!(ended, Ok(Some(()))) {
+        let _ = ch.kill();
+        let _ = ch.wait();
+    }
+}
+
 /// [`power_off`] from synchronous code, on a thread of its own (so it can block whether or not
 /// the caller is inside a runtime). A guest already off counts as off at once. Each call costs
 /// a thread and a runtime: `Manager::stop_all` makes one per Windows unit, a handful at most.
@@ -844,10 +888,7 @@ impl Guest {
 
 impl Drop for Guest {
     fn drop(&mut self) {
-        if self.running() {
-            let _ = self.ch.kill();
-        }
-        let _ = self.ch.wait();
+        force_off_blocking(&mut self.ch, &self.work);
     }
 }
 
@@ -987,23 +1028,22 @@ pub(crate) async fn run(
 
     let result = hold(&mut ch, &console, args.detach_log.as_deref()).await;
     if ch.try_wait().ok().flatten().is_none() {
-        // Stopped: the power button, then qemu-ga's shutdown; the kill once STOP_GRACE runs
-        // out or on a second Ctrl-C.
+        // Stopped: the power button, then qemu-ga's shutdown; the VM ended at once
+        // ([`force_off`]) once STOP_GRACE runs out or on a second Ctrl-C.
         tokio::select! {
             off = power_off(&mut ch, work, crate::shutdown::STOP_GRACE) => match off {
                 Some(after) => {
                     println!("virtkit: guest powered off ({after:.0?} after the power button)")
                 }
                 None => eprintln!(
-                    "virtkit: guest still up {}s after the power button; killed",
+                    "virtkit: guest still up {}s after the power button; ending the VM",
                     crate::shutdown::STOP_GRACE.as_secs()
                 ),
             },
-            _ = tokio::signal::ctrl_c() => eprintln!("virtkit: Ctrl-C again; guest killed"),
+            _ = tokio::signal::ctrl_c() => eprintln!("virtkit: Ctrl-C again; ending the VM"),
         }
-        let _ = ch.kill();
     }
-    let _ = ch.wait();
+    force_off(&mut ch, work).await;
     if let Some(child) = switch.take() {
         crate::run::stop_switch(child);
     }

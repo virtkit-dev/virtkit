@@ -6,6 +6,15 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **A Windows guest vk had to end no longer corrupts its kept disk.** When a guest ignored the
+  power button and qemu-ga past the grace (a stop, a compose service, a build step's guest), vk
+  killed its VMM, and a hard reset (`vk reboot` without an agent) killed it too: the qcow2
+  overlay's metadata the VMM still held was lost, its L2 tables and refcounts disagreed, and the
+  next run of the same disk (`--state-dir`) handed out a cluster already in use. A domain
+  controller killed twice no longer booted (`winload.efi`, 0xc000000f). vk now asks the VMM over
+  its control socket to quit, which flushes every disk as a guest power-off does, and kills it
+  only if it is still there 10 seconds later; the VMM's own backstop after the power button and
+  the hard reset end it the same way.
 - **Windows guests have a virtio-rng.** libkrun's virtio-net can now reset: the device
   stops its worker and keeps its backend (a tap, or the switch's socket, which it owns and
   must not open twice) for the driver's next initialization, with the offloads that driver
