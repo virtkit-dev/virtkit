@@ -19,6 +19,12 @@ All notable changes to virtkit will be documented in this file.
   operating system's reach: PK, KEK, db and dbx change only through updates signed by the keys
   above them, and the guest's kernel can no longer rewrite them. Machines keep their variable
   files, and snapshots taken before restore as they did.
+- **Ending a Windows guest that ignores shutdown no longer corrupts its kept disk.** When a guest
+  did not power off within its grace (`vk stop`, a compose service, a build step's guest) or was
+  hard-reset (`vk reboot` without an agent), vk cut its power, which could corrupt a disk kept
+  with `--state-dir` so badly that the guest no longer booted. vk now has the VM write out its
+  disks before it ends, and cuts the power only if it is still running 10 seconds later. A
+  Linux guest's hard reset ends the same way.
 
 ## [0.87.0] - 2026-10-10
 

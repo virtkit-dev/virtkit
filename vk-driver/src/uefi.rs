@@ -57,7 +57,7 @@ pub(crate) const TPM_STATE: &str = "tpm-state";
 /// down instead (a Windows guest can be set to ignore the button).
 const BUTTON_GRACE: Duration = Duration::from_secs(20);
 
-/// How long a build guest has to power off before it is killed.
+/// How long a build guest has to power off before it is ended ([`force_off`]).
 const BUILD_STOP_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// A VMM that exits within this long of its spawn failed to boot; past it, the guest is up
@@ -653,7 +653,7 @@ pub(crate) fn tap_net(tap: Option<&TapNet>) -> Net {
 
 /// Stop the guest behind `ch`, with run directory `work`: press the ACPI power button, then
 /// request qemu-ga shutdown after [`BUTTON_GRACE`]. Return the elapsed time since the button,
-/// or `None` after `grace` if still running; the caller then kills it.
+/// or `None` after `grace` if still running; the caller then ends it ([`force_off`]).
 async fn power_off(ch: &mut Child, work: &Path, grace: Duration) -> Option<Duration> {
     let pressed = Instant::now();
     let deadline = pressed + grace;
@@ -680,6 +680,53 @@ async fn power_off(ch: &mut Child, work: &Path, grace: Duration) -> Option<Durat
         Err(e) => eprintln!("virtkit: qemu-ga shutdown: {e:#}"),
     }
     exited_by(ch, deadline).await.then(|| pressed.elapsed())
+}
+
+/// How long a VMM asked to quit has to flush its disks and exit before it is killed; the boot
+/// child's own backstop (`libkrun_sys::QUIT_BACKSTOP`) gives it as long.
+const QUIT_GRACE: Duration = Duration::from_secs(10);
+
+/// End the guest behind `ch`, with run directory `work`, now: ask its VMM over the control
+/// socket to quit, which flushes every disk's write-back cache before the process exits (as a
+/// guest power-off does), and kill it only if it is still there after [`QUIT_GRACE`]. A kill
+/// skips that flush: imago's cached qcow2 metadata never reaches the overlay, whose L2 tables
+/// and refcounts may then disagree, and the next run of a kept disk (`--state-dir`) allocates
+/// a cluster already in use and corrupts the guest's filesystem. Then reap it.
+pub(crate) async fn force_off(ch: &mut Child, work: &Path) {
+    if ch.try_wait().ok().flatten().is_none() {
+        match crate::vmmctl::quit(&work.join(CONTROL_SOCKET)) {
+            Ok(()) if exited_by(ch, Instant::now() + QUIT_GRACE).await => {}
+            Ok(()) => eprintln!(
+                "virtkit: the VM did not end within {}s of asking it to; killed",
+                QUIT_GRACE.as_secs()
+            ),
+            Err(e) => eprintln!("virtkit: asking the VM to end: {e:#}; killed"),
+        }
+        // ESRCH (it exited meanwhile) leaves nothing to kill.
+        let _ = ch.kill();
+    }
+    let _ = ch.wait();
+}
+
+/// [`force_off`] from synchronous code, as [`power_off_blocking`] runs [`power_off`].
+pub(crate) fn force_off_blocking(ch: &mut Child, work: &Path) {
+    let ended = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                rt.block_on(force_off(ch, work));
+                Some(())
+            })
+            .join()
+    });
+    if !matches!(ended, Ok(Some(()))) {
+        // No runtime to ask the VM with: kill it; ESRCH, it is gone already.
+        let _ = ch.kill();
+        let _ = ch.wait();
+    }
 }
 
 /// [`power_off`] from synchronous code, on a thread of its own (so it can block whether or not
@@ -824,10 +871,10 @@ impl Guest {
         }
     }
 
-    /// Stop the guest as `vk stop` does, with [`BUILD_STOP_GRACE`] before the kill (a build
+    /// Stop the guest as `vk stop` does, with [`BUILD_STOP_GRACE`] before it is ended (a build
     /// layer must close cleanly, and a Windows that has just changed roles takes its time).
-    /// Return an error if killed: its disk may hold a torn write. Blocks; call outside async
-    /// tasks (builds run on a blocking thread).
+    /// Return an error if it had to be ended: the guest never shut down, so its filesystems may
+    /// not be clean. Blocks; call outside async tasks (builds run on a blocking thread).
     pub(crate) fn shutdown(mut self) -> Result<Duration> {
         if !self.running() {
             return Ok(Duration::ZERO);
@@ -835,7 +882,7 @@ impl Guest {
         match power_off_blocking(&mut self.ch, &self.work, BUILD_STOP_GRACE)? {
             Some(after) => Ok(after),
             None => bail!(
-                "the guest did not power off within {}s and was killed",
+                "the guest did not power off within {}s and was ended",
                 BUILD_STOP_GRACE.as_secs()
             ),
         }
@@ -844,10 +891,7 @@ impl Guest {
 
 impl Drop for Guest {
     fn drop(&mut self) {
-        if self.running() {
-            let _ = self.ch.kill();
-        }
-        let _ = self.ch.wait();
+        force_off_blocking(&mut self.ch, &self.work);
     }
 }
 
@@ -987,23 +1031,23 @@ pub(crate) async fn run(
 
     let result = hold(&mut ch, &console, args.detach_log.as_deref()).await;
     if ch.try_wait().ok().flatten().is_none() {
-        // Stopped: the power button, then qemu-ga's shutdown; the kill once STOP_GRACE runs
-        // out or on a second Ctrl-C.
+        // Stopped: the power button, then qemu-ga's shutdown; the VM ended ([`force_off`]) once
+        // STOP_GRACE runs out or on a second Ctrl-C, which then still gives the VM up to
+        // QUIT_GRACE to flush its disks; a third Ctrl-C does not shorten it.
         tokio::select! {
             off = power_off(&mut ch, work, crate::shutdown::STOP_GRACE) => match off {
                 Some(after) => {
                     println!("virtkit: guest powered off ({after:.0?} after the power button)")
                 }
                 None => eprintln!(
-                    "virtkit: guest still up {}s after the power button; killed",
+                    "virtkit: guest still up {}s after the power button; ending the VM",
                     crate::shutdown::STOP_GRACE.as_secs()
                 ),
             },
-            _ = tokio::signal::ctrl_c() => eprintln!("virtkit: Ctrl-C again; guest killed"),
+            _ = tokio::signal::ctrl_c() => eprintln!("virtkit: Ctrl-C again; ending the VM"),
         }
-        let _ = ch.kill();
     }
-    let _ = ch.wait();
+    force_off(&mut ch, work).await;
     if let Some(child) = switch.take() {
         crate::run::stop_switch(child);
     }
@@ -1580,5 +1624,35 @@ mod tests {
             panic!("an overlay over another disk was reused");
         };
         assert!(format!("{err:#}").contains("another bundle"), "{err:#}");
+    }
+
+    /// A VMM whose control socket cannot be reached is killed at once, not after the quit
+    /// grace, and reaped.
+    #[test]
+    fn a_vmm_that_cannot_be_asked_to_quit_is_killed_and_reaped() {
+        let work = std::env::temp_dir().join(format!("vk-force-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).unwrap();
+        let mut ch = std::process::Command::new("sleep")
+            .arg("600")
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        force_off_blocking(&mut ch, &work);
+        assert!(start.elapsed() < QUIT_GRACE);
+        assert!(ch.try_wait().unwrap().is_some(), "reaped");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// A VMM already gone is only reaped.
+    #[test]
+    fn a_vmm_already_gone_is_only_reaped() {
+        let work = std::env::temp_dir().join(format!("vk-force-off-gone-{}", std::process::id()));
+        let mut ch = std::process::Command::new("true").spawn().unwrap();
+        while ch.try_wait().unwrap().is_none() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        force_off_blocking(&mut ch, &work);
+        assert!(ch.try_wait().unwrap().is_some());
     }
 }

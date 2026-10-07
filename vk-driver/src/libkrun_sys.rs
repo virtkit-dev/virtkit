@@ -99,9 +99,14 @@ fn mem_mib(mem: &str) -> Result<u32> {
 /// The guest's vsock CID: 3, the one vk's guests have always had.
 const GUEST_CID: u64 = 3;
 
-/// Seconds the guest gets to act on the power button before SIGALRM ends the boot child —
-/// a backstop for a guest that ignores it. The host escalates to SIGKILL well before.
-const POWER_BUTTON_GRACE_SECS: libc::c_uint = 70;
+/// How long the guest gets to act on the power button before the boot child ends the VM
+/// itself, disks flushed — a backstop for a guest that ignores it, should the host not end
+/// it first.
+const POWER_BUTTON_GRACE: Duration = Duration::from_secs(70);
+
+/// How long the VM has to flush its disks and exit once the backstop ends it, before the boot
+/// child exits anyway: as long as `uefi::QUIT_GRACE` gives it when vk ends it.
+const QUIT_BACKSTOP: Duration = Duration::from_secs(10);
 
 /// The drive letter of the `index`th disk (`a` for vda), refused past `z`.
 fn disk_letter(index: usize) -> Result<char> {
@@ -453,20 +458,29 @@ fn set_process_name(name: &str) {
     unsafe { libc::prctl(libc::PR_SET_NAME, name.as_ptr()) };
 }
 
+/// The signals the boot child's power-button thread takes: SIGTERM (the power button) and
+/// SIGUSR2 (the keeper's hard reset, [`keeper_sigusr1`]).
 fn sigterm_set() -> libc::sigset_t {
     // SAFETY: sigemptyset initializes the set before sigaddset reads it.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGUSR2);
         set
     }
 }
 
 fn block_sigterm() {
-    // An inherited SIG_IGN would discard SIGTERM even while blocked, so sigwait never woke.
+    // Both of [`sigterm_set`]'s signals, SIGUSR2 too. An inherited SIG_IGN would discard them
+    // even while blocked, so sigwait never woke.
     // SAFETY: resetting a disposition to its default has no preconditions.
-    unsafe { libc::signal(libc::SIGTERM, libc::SIG_DFL) };
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::signal(libc::SIGUSR2, libc::SIG_DFL);
+        // The power button's last resort (SIGALRM) must end the process, whoever spawned it.
+        libc::signal(libc::SIGALRM, libc::SIG_DFL);
+    }
     let set = sigterm_set();
     // SAFETY: a valid set; only the calling thread's mask changes.
     unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) };
@@ -490,22 +504,77 @@ impl crate::vmmctl::Control for VmmHandle {
     }
 }
 
-/// Handle SIGTERM on a dedicated thread: resume a paused guest, press its ACPI power button,
-/// and arm a backstop alarm so the boot child never outlives its parent.
+/// Handle SIGTERM on a dedicated thread: resume a paused guest and press its ACPI power button.
+/// [`POWER_BUTTON_GRACE`] after the first SIGTERM, a guest still up is ended as `vk`'s
+/// `force_off` ends it, through the VMM's own quit, which flushes every disk before the process
+/// exits: the boot child must not outlive its parent, and a plain kill would leave a qcow2
+/// overlay's cached metadata unwritten.
 fn press_power_button_on_sigterm(handle: VmmHandle) -> Result<()> {
     std::thread::Builder::new()
         .name("vk-power-button".into())
         .spawn(move || {
             let set = sigterm_set();
+            let mut deadline: Option<Instant> = None;
             loop {
-                let mut sig = 0;
-                // SAFETY: a valid set, blocked in every thread; sigwait only reports which.
-                if unsafe { libc::sigwait(&set, &mut sig) } != 0 || sig != libc::SIGTERM {
+                let sig = match deadline {
+                    None => {
+                        let mut sig = 0;
+                        // SAFETY: a valid set, blocked in every thread; sigwait only reports
+                        // which.
+                        if unsafe { libc::sigwait(&set, &mut sig) } != 0 {
+                            continue;
+                        }
+                        sig
+                    }
+                    Some(deadline) => {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            eprintln!(
+                                "virtkit: the guest is still up {}s after the power button; \
+                                 ending the VM",
+                                POWER_BUTTON_GRACE.as_secs()
+                            );
+                            if let Err(e) = handle.quit() {
+                                eprintln!("virtkit: ending the VM: {e}");
+                            }
+                            std::thread::sleep(QUIT_BACKSTOP);
+                            // SAFETY: _exit(2) has no memory-safety preconditions.
+                            unsafe { libc::_exit(1) };
+                        }
+                        let timeout = libc::timespec {
+                            tv_sec: left.as_secs() as _,
+                            tv_nsec: left.subsec_nanos() as _,
+                        };
+                        // SAFETY: a valid set and timespec; a null siginfo is allowed.
+                        let sig =
+                            unsafe { libc::sigtimedwait(&set, std::ptr::null_mut(), &timeout) };
+                        if sig < 0 {
+                            continue;
+                        }
+                        sig
+                    }
+                };
+                if sig == libc::SIGUSR2 {
+                    // The keeper's hard reset: end the VM, disks flushed, for the keeper to
+                    // boot it again; the keeper kills it if it lingers.
+                    if let Err(e) = handle.quit() {
+                        eprintln!("virtkit: ending the VM for a hard reset: {e}");
+                    }
                     continue;
                 }
-                // Armed first: resuming waits on the event loop.
-                // SAFETY: alarm(2) has no memory-safety preconditions.
-                unsafe { libc::alarm(POWER_BUTTON_GRACE_SECS) };
+                if sig != libc::SIGTERM {
+                    continue;
+                }
+                if deadline.is_none() {
+                    deadline = Some(Instant::now() + POWER_BUTTON_GRACE);
+                    // The last resort, armed before anything that waits on the event loop
+                    // (resuming does): should the loop be stuck, neither the deadline above nor
+                    // the quit can end the VM, and SIGALRM (its default action, set in
+                    // block_sigterm) still ends the boot child once both have had their time.
+                    let last_resort = POWER_BUTTON_GRACE + QUIT_BACKSTOP + Duration::from_secs(1);
+                    // SAFETY: alarm(2) has no memory-safety preconditions.
+                    unsafe { libc::alarm(last_resort.as_secs() as libc::c_uint) };
+                }
                 // A paused guest (`vk pause`) would not see the button; a running one is
                 // left as it is.
                 if let Err(e) = handle.resume() {
@@ -578,6 +647,7 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
             unsafe {
                 libc::signal(libc::SIGTERM, libc::SIG_DFL);
                 libc::signal(libc::SIGUSR1, libc::SIG_DFL);
+                libc::signal(libc::SIGALRM, libc::SIG_DFL);
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
                 libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
             }
@@ -596,6 +666,8 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
 
         let status = wait_for(pid);
         CHILD_PID.store(0, Ordering::SeqCst);
+        // SAFETY: alarm(2) has no memory-safety preconditions. Cancels a hard reset's backstop.
+        unsafe { libc::alarm(0) };
 
         // A graceful stop (SIGTERM to the keeper) always ends the loop, whatever the child
         // reported.
@@ -603,12 +675,7 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
             return Ok(status.code().unwrap_or(0));
         }
 
-        let reboot = match status {
-            Wait::Exited(code) => code == i32::from(KRUN_EXIT_GUEST_RESET),
-            // We only SIGKILL the child for a host-driven hard reset.
-            Wait::Signaled(_) => HARD_RESET.swap(false, Ordering::SeqCst),
-        };
-        if !reboot {
+        if !reboots(&status, HARD_RESET.swap(false, Ordering::SeqCst)) {
             return Ok(status.code().unwrap_or(1));
         }
 
@@ -629,7 +696,7 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 /// Set by SIGTERM: end the relaunch loop after the child stops.
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Set by SIGUSR1 (hard reset): the child was SIGKILLed on purpose, so relaunch it.
+/// Set by SIGUSR1 (hard reset): the child was ended on purpose, so relaunch it.
 static HARD_RESET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// SIGTERM to the keeper: forward it to the child (its ACPI power button) and stop looping.
@@ -642,9 +709,24 @@ extern "C" fn keeper_sigterm(_sig: libc::c_int) {
     }
 }
 
-/// SIGUSR1 to the keeper: hard-reset — SIGKILL the child and let the loop relaunch it.
+/// SIGUSR1 to the keeper: hard-reset — have the child end the VM through its own quit, which
+/// flushes the disks the relaunch boots again (a kill would leave a qcow2 overlay's cached
+/// metadata unwritten, and the next boot would corrupt it), and let the loop relaunch it. SIGALRM
+/// kills the child if it is still there [`QUIT_BACKSTOP`] later.
 extern "C" fn keeper_sigusr1(_sig: libc::c_int) {
     HARD_RESET.store(true, Ordering::SeqCst);
+    let pid = CHILD_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        // SAFETY: kill(2) and alarm(2) are async-signal-safe.
+        unsafe {
+            libc::kill(pid, libc::SIGUSR2);
+            libc::alarm(QUIT_BACKSTOP.as_secs() as libc::c_uint);
+        }
+    }
+}
+
+/// SIGALRM to the keeper: a hard reset's child did not end by itself; kill it.
+extern "C" fn keeper_sigalrm(_sig: libc::c_int) {
     let pid = CHILD_PID.load(Ordering::SeqCst);
     if pid > 0 {
         // SAFETY: kill(2) is async-signal-safe.
@@ -653,7 +735,8 @@ extern "C" fn keeper_sigusr1(_sig: libc::c_int) {
 }
 
 fn install_keeper_signals() {
-    // SAFETY: the handlers only touch atomics and call kill(2), all async-signal-safe.
+    // SAFETY: the handlers only touch atomics and call kill(2) and alarm(2), all
+    // async-signal-safe.
     unsafe {
         libc::signal(
             libc::SIGTERM,
@@ -663,6 +746,10 @@ fn install_keeper_signals() {
             libc::SIGUSR1,
             keeper_sigusr1 as *const () as libc::sighandler_t,
         );
+        libc::signal(
+            libc::SIGALRM,
+            keeper_sigalrm as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -670,6 +757,16 @@ fn install_keeper_signals() {
 enum Wait {
     Exited(i32),
     Signaled(i32),
+}
+
+/// Whether the keeper boots the VM again after its child ended with `status`: on a guest reset,
+/// and on a host-driven hard reset however the child went (its own quit, or the kill backing
+/// it up), even a guest that powered off by itself as the reset arrived.
+fn reboots(status: &Wait, hard_reset: bool) -> bool {
+    match status {
+        Wait::Exited(code) => hard_reset || *code == i32::from(KRUN_EXIT_GUEST_RESET),
+        Wait::Signaled(_) => hard_reset,
+    }
 }
 
 impl Wait {
@@ -706,7 +803,23 @@ fn wait_for(pid: i32) -> Wait {
 
 #[cfg(test)]
 mod tests {
-    use super::{KernelFormat, console_cmdline, detect_kernel_format, disk_letter, mem_mib};
+    use super::{
+        KRUN_EXIT_GUEST_RESET, KernelFormat, Wait, console_cmdline, detect_kernel_format,
+        disk_letter, mem_mib, reboots,
+    };
+
+    #[test]
+    fn the_keeper_reboots_on_a_guest_or_a_hard_reset_only() {
+        let reset = i32::from(KRUN_EXIT_GUEST_RESET);
+        assert!(reboots(&Wait::Exited(reset), false));
+        assert!(!reboots(&Wait::Exited(0), false));
+        assert!(!reboots(&Wait::Signaled(libc::SIGKILL), false));
+        // A hard reset reboots however the child ended: its own quit, the backstop's kill, or a
+        // power-off that raced it.
+        assert!(reboots(&Wait::Exited(0), true));
+        assert!(reboots(&Wait::Exited(1), true));
+        assert!(reboots(&Wait::Signaled(libc::SIGKILL), true));
+    }
 
     #[test]
     fn disks_are_lettered_up_to_z() {

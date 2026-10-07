@@ -389,8 +389,9 @@ pub(crate) fn press_power_button(child: &Child) -> bool {
     signal_child(child, libc::SIGTERM)
 }
 
-/// SIGUSR1 the VMM `child`: its keeper hard-resets the guest (SIGKILL) and relaunches it in
-/// place — the reboot equivalent of the power button, for an unreachable agent.
+/// SIGUSR1 the VMM `child`: its keeper hard-resets the guest (ends the VM through its quit,
+/// killing it only if it lingers) and relaunches it in place — the reboot equivalent of the
+/// power button, for an unreachable agent.
 pub(crate) fn hard_reset(child: &Child) -> bool {
     signal_child(child, libc::SIGUSR1)
 }

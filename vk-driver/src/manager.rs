@@ -651,13 +651,13 @@ impl Manager {
                 scope.spawn(move || {
                     if !crate::winsvc::stop(name, child, dir) {
                         eprintln!(
-                            "virtkit: {name}: killed (the guest did not power off within {}s)",
+                            "virtkit: {name}: ended (the guest did not power off within {}s)",
                             crate::winsvc::STOP_GRACE.as_secs()
                         );
                     }
                 });
             }
-            // Report each kill and its reason immediately.
+            // Report each forced end and its reason immediately.
             crate::shutdown::power_off_then_kill(&mut vmms);
         });
         for st in units.values_mut() {
