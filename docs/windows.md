@@ -108,7 +108,10 @@ button.
 - `tests/windows-ad-e2e.sh`: the AD lab (a DC, a Linux job creating its users, two members,
   RDP sign-ins), then a snapshot of the lab and its restore.
 - `tests/windows-rdp-e2e.sh`: a full Remote Desktop session into a standalone server.
-- `tests/release-e2e.sh` runs both when `ISO_DIR` names where the ISOs are.
+- `tests/int1-e2e.sh`: a guest's `int1` traps once, with the VMM stepping over it; says
+  whether the host has the nested-SVM fault without it.
+- `tests/release-e2e.sh` runs the Windows tests when `ISO_DIR` names where the ISOs are, and
+  `int1-e2e.sh` always.
 
 ## Known limits
 
@@ -128,7 +131,7 @@ button.
 - **No hardware breakpoints in a Windows guest where the host delivers `int1` onto itself**
   (Hyper-V's nested SVM on AMD: WSL2, Azure): the VMM takes the guest's debug exceptions there
   to step over `int1` (see VMM above), so a kernel debugger's hardware breakpoints and
-  watchpoints in the guest do not fire.
+  watchpoints in the guest do not fire. `tests/int1-e2e.sh` says whether a host has the fault.
 - **Secure Boot without SMM** guards the boot chain: the variables are out of the guest's reach
   now, but the firmware itself runs unprotected from the guest's kernel while it boots.
 
