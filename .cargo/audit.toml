@@ -4,7 +4,7 @@
 # stable release: the constant-time fixes are split across upstream issue #626 (padding)
 # and PR #680 (the decrypt Ok/Err oracle) and currently exist only in the unreleased rsa
 # 0.10 release candidates. `rsa` enters the tree as 0.10.0-rc (on constant-time
-# crypto-bigint 0.7), which already carries those fixes, through two users:
+# crypto-bigint 0.7), which already carries those fixes, through three users:
 #
 # - russh (vk-agent's optional `ssh` feature), so the embedded SSH server can verify
 #   clients' RSA public keys: signature *verification* only, our host key is Ed25519.
@@ -15,6 +15,9 @@
 #   OpenSSL 3.2+, so libtpms, does), so it never reports bad padding at all. A timing test
 #   (`decryption_time_does_not_depend_on_the_padding`) checks it. See "RSA and the Marvin
 #   attack" in docs/tpm-design.md.
+# - vk-uefi-vars, which verifies the PKCS#7 signatures of Secure Boot and private
+#   authenticated variable writes: signature *verification* only, with public keys; no
+#   private key, so nothing for the attack to time.
 #
 # cargo-audit still flags it because the advisory lists no patched version. Revisit and
 # drop this entry when rsa 0.10 ships stable.

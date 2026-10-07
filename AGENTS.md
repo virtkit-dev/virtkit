@@ -32,7 +32,7 @@ The same codebase powers local compose-service VMs and a GitLab custom executor.
 
 ## Architecture
 
-A Cargo workspace (`Cargo.toml`, edition 2024) with twelve crates:
+A Cargo workspace (`Cargo.toml`, edition 2024) with thirteen crates:
 
 - **`vk-core/`** — the shared host↔guest library: the wire protocol (`messages`,
   `framing`, `addr`, `net`, `status`, `fleetctl`), the formats both sides speak (`atop`,
@@ -103,6 +103,11 @@ A Cargo workspace (`Cargo.toml`, edition 2024) with twelve crates:
   primaries derived as libtpms derives them), contexts, persistent objects, NV indices,
   policies, attestation, duplication, EK provisioning, versioned state; crypto from RustCrypto
   crates only. See `docs/tpm-design.md`.
+- **`vk-uefi-vars/`** — the UEFI variable service of Windows guests, on the host: the variables
+  in an edk2 variable store image, GetVariable, GetNextVariableName, SetVariable and
+  QueryVariableInfo as edk2's SMM variable driver answers them, Secure Boot's authenticated
+  writes (PKCS#7, signature lists), private authenticated variables, variable policies and
+  locks; crypto from RustCrypto crates only.
 
 libkrun is vendored (its own cargo workspace, locally patched) under
 `third_party/libkrun` — see its `VENDOR.md` for the patch list. Its `devices` crate depends on
