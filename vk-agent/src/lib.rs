@@ -1,6 +1,6 @@
 //! Guest-only agent code: PID 1 bring-up (`init`), the block-device mount syscalls
-//! (`diskmount`), fs freeze/thaw (`fsfreeze`), VM shutdown (`poweroff`),
-//! the writable layer's high-water mark (`fsmark`), the guest's peak memory demand
+//! (`diskmount`), a CI job's archives (`archive`), fs freeze/thaw (`fsfreeze`), VM shutdown
+//! (`poweroff`), the writable layer's high-water mark (`fsmark`), the guest's peak memory demand
 //! (`memmark`), the OOM kills the guest kernel made (`oomkills`), whether a CI job has its
 //! gitlab-runner (`tools`), the line the marks publish (`mark`), the run's environment for login
 //! shells (`runenv`), guest statistics in atop's
@@ -8,6 +8,7 @@
 //! (`netcfg`) and the embedded SSH server (`ssh`/`sftp`, feature `ssh`). The shared host↔guest
 //! protocol and runtime helpers live in the `vk-core` crate.
 
+pub mod archive;
 pub mod atop;
 pub mod button;
 pub mod ctlfs;

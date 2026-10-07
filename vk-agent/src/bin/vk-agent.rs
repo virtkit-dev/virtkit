@@ -215,6 +215,19 @@ fn main() {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(vk_agent::fsmark::main(&rest));
     }
+    // A CI job's caches and artifacts (no socket): the host runs `vk-agent archive` to stream a
+    // tar of what they select out of the job's tree, and `vk-agent extract` to unpack one in.
+    match std::env::args().nth(1).as_deref() {
+        Some("archive") => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            std::process::exit(vk_agent::archive::archive_main(&rest));
+        }
+        Some("extract") => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            std::process::exit(vk_agent::archive::extract_main(&rest));
+        }
+        _ => {}
+    }
     // Peak guest memory without a socket, read by the host before stage teardown.
     if std::env::args().nth(1).as_deref() == Some("memmark") {
         let rest: Vec<String> = std::env::args().skip(2).collect();
