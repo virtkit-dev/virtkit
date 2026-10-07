@@ -532,14 +532,18 @@ there, and the guest executes the `int1` again, forever (a user-mode `int1` in a
 loops the same way; Intel hosts, nested or not, are fine). Windows' PatchGuard runs a check that
 single-steps an `int1` now and then, and the guest stops answering: a Windows 11 restored from a
 snapshot hung 14 to 16 minutes later every time, as it reached the check its snapshot had
-scheduled. For a guest with the Hyper-V enlightenments (Windows) on an AMD host whose CPUID has
-the hypervisor bit, or as `KRUN_INT1_WORKAROUND` (`1`, `0`) says, each vCPU sets
+scheduled. For a guest with the Hyper-V enlightenments (Windows) on a host found to have the
+fault, or as `KRUN_INT1_WORKAROUND` (`1`, `0`) says, each vCPU sets
 `KVM_SET_GUEST_DEBUG` (`ENABLE | USE_HW_BP`, no breakpoints of its own) so the guest's #DB exits
 come to the VMM (`KVM_EXIT_DEBUG`); `Vcpu::step_over_int1` reads the byte at the exit's PC
 through the guest's page tables (not `KVM_TRANSLATE`, a supervisor access that SMAP refuses on a
 user page), moves RIP past it if it is an `int1`, sets DR6 from the exit as KVM does when it
 delivers a #DB itself, and injects the #DB (`KVM_GUESTDBG_INJECT_DB`). The guest's own hardware
-breakpoints are off while it is on (KVM loads the host's DR7, 0). Checked with a program that
+breakpoints are off while it is on (KVM loads the host's DR7, 0). Whether the host has the fault
+is probed once per process (`probe_int1`): a throwaway one-page VM runs `int1` in real mode
+under a #DB handler that reports the return address on an I/O port, the `int1` itself on a
+faulty host, past it elsewhere; a bare AMD or Intel host keeps the guest's breakpoints.
+`the_int1_probe_answers` runs it against the host's KVM. Checked with a program that
 runs `int1` and the PatchGuard sequence (`popf` setting TF, `mov ss`, `int1`) in a Linux guest:
 the same traps at the same addresses as on the host, where it looped without this.
 
