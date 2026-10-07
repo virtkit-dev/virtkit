@@ -3,8 +3,9 @@
 //! pause, resume or abort rollouts through the shared admin-socket operations ([`crate::ops`])
 //! as their session's principal. A reset, which deletes what the node's past jobs left, is
 //! confirmed first ([`actions::ask_first`]). Monitoring-only nodes have no steering controls.
-//! Operators add releases and start rollouts from `/operations` ([`super::operations`]), and
-//! issue enrollment tokens from the nodes page ([`create_token`]).
+//! Operators add releases and start rollouts from `/operations` ([`super::operations`]),
+//! which also lists client API jobs, read only. They issue enrollment tokens from the
+//! nodes page ([`create_token`]).
 
 use std::sync::Arc;
 
@@ -47,6 +48,9 @@ const TOKEN_TTLS: [(u64, &str); 4] = [
 
 /// The rollouts `/operations` shows, newest first.
 const OPERATIONS_ROLLOUTS: usize = 10;
+
+/// The placed jobs `/operations` shows, newest first.
+const OPERATIONS_JOBS: usize = 20;
 
 /// What the fleet's pages keep: the nodes table, and `/operations`' fragment once for every
 /// viewer's page and once for every operator's, each rendered once for every page showing it
@@ -211,6 +215,7 @@ fn read_operations(hub: &Hub) -> Result<Operations> {
     Ok(Operations {
         releases: hub.db.releases()?,
         rollouts,
+        jobs: crate::jobs::listing(hub, OPERATIONS_JOBS)?,
         source: hub.fetches.source().map(|s| s.url().to_string()),
         fetch: hub.fetches.status(),
         latest: hub.fetches.latest(),
@@ -222,6 +227,8 @@ struct Operations {
     releases: Vec<Release>,
     /// The latest, newest first.
     rollouts: Vec<Rollout>,
+    /// The latest placed jobs, newest first.
+    jobs: Vec<(String, crate::store::JobRow)>,
     /// Where releases are fetched from; `None` with fetching off.
     source: Option<String>,
     /// The latest fetch since the hub started.
@@ -787,6 +794,9 @@ fn node_detail(d: &NodeDetail, now: u64) -> Html {
 
     let heartbeat = d.row.heartbeat.as_ref();
     section(&mut h, "Load");
+    if let Some(why) = &v.last_refusal {
+        kv_node(&mut h, "refuses reservations", why);
+    }
     match heartbeat {
         None => kv(&mut h, "heartbeat", "none yet"),
         Some(hb) => {
@@ -1228,7 +1238,56 @@ fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
         rollout(&mut h, r, steer, now);
     }
     h.raw("</section>");
+    placed_jobs(&mut h, &ops.jobs, now);
     h
+}
+
+/// The latest jobs placed through the client API, and how each stands.
+fn placed_jobs(h: &mut Html, jobs: &[(String, crate::store::JobRow)], now: u64) {
+    h.raw("<section><h2>Jobs</h2>");
+    if jobs.is_empty() {
+        h.raw("<p class=\"empty\">none placed: <code>vk-hub keys create</code> issues the key ")
+            .raw("vk-gitlab places jobs with</p></section>");
+        return;
+    }
+    h.raw("<table class=\"grid\"><thead><tr><th>id</th><th>job</th><th>key</th>")
+        .raw("<th>pool</th><th>state</th><th>node</th><th>output</th><th>submitted</th>")
+        .raw("</tr></thead><tbody>");
+    for (id, j) in jobs {
+        let state = crate::jobs::state_text(j);
+        h.raw("<tr><td><code title=\"")
+            .text(id)
+            .raw("\">")
+            .text(id.get(..8).unwrap_or(id))
+            .raw("</code></td><td>")
+            .text(&j.title)
+            .raw("</td><td>")
+            .text(&j.key_name)
+            .raw("</td><td>")
+            .text(&j.placement.pool)
+            .raw("</td><td>")
+            .text(state)
+            .raw("</td><td>");
+        match &j.node {
+            // The router takes only hex for a node's ID.
+            Some(node) if vk_hub_proto::valid_id(node) => {
+                h.raw("<a href=\"/node/")
+                    .text(node)
+                    .raw("\"><code>")
+                    .text(node.get(..8).unwrap_or(node))
+                    .raw("</code></a>");
+            }
+            _ => {
+                h.raw("-");
+            }
+        }
+        h.raw("</td><td>")
+            .text(bytes(j.output_len))
+            .raw("</td><td>")
+            .text(age(now, j.created_at))
+            .raw("</td></tr>");
+    }
+    h.raw("</tbody></table></section>");
 }
 
 /// One rollout: what it updates to and how, its state, and each node by wave.

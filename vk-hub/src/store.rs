@@ -38,6 +38,12 @@ use vk_hub_proto::{
 
 use crate::rollout::{Effect, Facts, NodeStatus, RolloutAction, RolloutRow, RolloutState};
 
+mod jobs;
+mod keys;
+
+pub use jobs::{JobRow, RequestRow, Submitted};
+pub use keys::{ApiPrincipal, KeyPolicy, KeyRow, MAX_KEY_TTL, Scope, envelope_text, valid_name};
+
 /// Key: node ID. Value: JSON [`NodeRow`].
 const NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
 /// Key: `sha256(token)`, hex. Value: JSON [`TokenRow`].
@@ -295,6 +301,9 @@ pub struct NodeRow {
     /// known. Unset fields come from the node's applied state when reported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set_on_defaults: Option<SetFields>,
+    /// The pools the operator put the node in, which placed jobs name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<String>,
 }
 
 /// Which fields of a desired state an operator set.
@@ -498,6 +507,8 @@ pub struct Db {
     db: Database,
     /// When a heartbeat's write was last made durable ([`HEARTBEAT_SYNC_SECS`]).
     heartbeat_synced_at: AtomicU64,
+    /// When requests past their keep were last swept.
+    requests_swept_at: AtomicU64,
 }
 
 impl Db {
@@ -590,10 +601,19 @@ impl Db {
             .context("opening the rollouts table")?;
         txn.open_table(ACCOUNTS)
             .context("opening the accounts table")?;
+        txn.open_table(keys::API_KEYS)
+            .context("opening the API keys table")?;
+        txn.open_table(jobs::JOBS)
+            .context("opening the jobs table")?;
+        txn.open_table(jobs::JOB_SPECS)
+            .context("opening the job specs table")?;
+        txn.open_table(jobs::REQUESTS)
+            .context("opening the requests table")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db {
             db,
             heartbeat_synced_at: AtomicU64::new(0),
+            requests_swept_at: AtomicU64::new(0),
         })
     }
 
@@ -860,8 +880,13 @@ impl Db {
 
     /// Record `event`, done by `actor`, in the audit log.
     pub fn audit(&self, actor: &str, event: &str, now: u64) -> Result<()> {
+        self.audit_node(None, actor, event, now)
+    }
+
+    /// Record `event`, done by `actor`, in the audit log, as about `node`.
+    pub fn audit_node(&self, node: Option<&str>, actor: &str, event: &str, now: u64) -> Result<()> {
         let txn = self.db.begin_write().context("starting a write")?;
-        append_audit(&txn, None, actor, event, now)?;
+        append_audit(&txn, node, actor, event, now)?;
         txn.commit().context("writing an audit line")
     }
 
@@ -1919,6 +1944,33 @@ impl Db {
         Ok(out)
     }
 
+    /// Put node `id` in `pools`, replacing the ones it was in, audited as `actor`'s. Whether
+    /// that changed anything.
+    pub fn set_pools(&self, id: &str, pools: &[String], actor: &str, now: u64) -> Result<bool> {
+        if let Some(bad) = pools.iter().find(|p| !valid_name(p)) {
+            bail!("{bad:?} is not a pool's name");
+        }
+        let mut pools = pools.to_vec();
+        pools.sort();
+        pools.dedup();
+        self.update_txn(now, id, |row, _| {
+            if row.pools == pools {
+                return Ok((false, Vec::new(), Durability::Immediate));
+            }
+            row.pools = pools.clone();
+            let event = if pools.is_empty() {
+                format!("{actor} took node {id} out of every pool")
+            } else {
+                format!("{actor} put node {id} in pools {}", pools.join(", "))
+            };
+            Ok((
+                true,
+                vec![(actor.to_string(), event)],
+                Durability::Immediate,
+            ))
+        })
+    }
+
     /// Rewrite a node's row and append the `(actor, event)` audit pairs returned by `change`
     /// in one transaction. `change` can write other tables and selects the durability.
     /// Return [`NotEnrolled`] if the node was removed: the hub no longer recognizes its
@@ -2363,6 +2415,10 @@ fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
     inventory.storage.truncate(MAX_INVENTORY_ITEMS);
     if let Some(runner) = inventory.runner.as_mut() {
         runner.runners.truncate(MAX_INVENTORY_ITEMS);
+    }
+    inventory.labels.truncate(MAX_INVENTORY_ITEMS);
+    for label in &mut inventory.labels {
+        clean(label);
     }
     clean(&mut inventory.hostname);
     clean_opt(&mut inventory.hardware.cpu_model);

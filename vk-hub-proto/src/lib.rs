@@ -45,10 +45,11 @@
 //! [`UpdateProgress`], and the release download. [`Versions::vk_sha256`] is an optional
 //! inventory field, which a hub of any version reads or ignores.
 //!
-//! Version 3 ([`JOBS`]) will add job placement: [`NodeMsg::Job`] and [`HubMsg::Job`] carry
-//! [`dispatch`]'s reservations, job starts, output and results. [`PROTOCOL`] will include it
-//! once both peers implement it; until then, job messages are protocol errors. Producers
-//! such as `vk-gitlab` submit [`job`]'s specs through the hub's [`client`] API.
+//! Version 3 ([`JOBS`]) adds job placement: [`NodeMsg::Job`] and [`HubMsg::Job`] carry
+//! [`dispatch`]'s reservations, job starts, output and results, and a job message in a
+//! session below it is a protocol error. [`PROTOCOL`] stays at 1 to 2; a peer that places or
+//! runs jobs negotiates from a range of its own reaching [`JOBS`]. Producers such as
+//! `vk-gitlab` submit [`job`]'s specs through the hub's [`client`] API.
 //!
 //! **Steering.** From version 2 the node's [`Report`] also carries its observed state — the
 //! desired state it last applied, its [`NodeState`], whether its runner is taking jobs, its
@@ -123,8 +124,8 @@ pub const PROTOCOL: VersionRange = VersionRange { min: 1, max: 2 };
 /// monitoring only.
 pub const STEERING: u32 = 2;
 
-/// The first protocol version that carries [`NodeMsg::Job`] and [`HubMsg::Job`]. Not yet in
-/// [`PROTOCOL`].
+/// The first protocol version carrying [`NodeMsg::Job`] and [`HubMsg::Job`]. Not in
+/// [`PROTOCOL`]; peers implementing it use their own range that includes it.
 pub const JOBS: u32 = 3;
 
 /// The largest message either side accepts, as a WebSocket message or an enrollment body.

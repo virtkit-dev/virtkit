@@ -14,7 +14,8 @@
 //! release out to the fleet a wave at a time. A node
 //! whose `vk` speaks only the first fleet protocol version is monitored, not steered. A web UI
 //! on a listener of its own shows the fleet to people signed in with links the admin socket
-//! issues.
+//! issues. Automation holding an API key — `vk-gitlab` — reserves capacity on nodes and has
+//! jobs placed on them through the client API (`docs/gitlab-dispatch.md`).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -25,8 +26,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 
 mod admin;
+mod client;
 mod config;
 mod fetch;
+mod jobs;
 mod local;
 mod ops;
 mod releases;
@@ -59,7 +62,8 @@ struct Cli {
 #[derive(clap::Args)]
 struct ConfigArg {
     /// hub.toml: addr, tls_cert, tls_key, data_dir, ui_addr, ui_url, ui_tls_cert,
-    /// ui_tls_key, release_repository, [oidc] [default: built-in defaults]
+    /// ui_tls_key, release_repository, job_lost_after_secs, [oidc] [default: built-in
+    /// defaults]
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 }
@@ -133,6 +137,21 @@ enum Cmd {
         config: ConfigArg,
         #[command(subcommand)]
         cmd: Option<AccountsCmd>,
+    },
+    /// Issue, list and revoke the API keys automation such as vk-gitlab places jobs with
+    Keys {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: Option<KeysCmd>,
+    },
+    /// List the jobs placed on the fleet through the client API, newest first
+    Jobs {
+        #[command(flatten)]
+        config: ConfigArg,
+        /// How many of the latest
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
     },
     /// Serve a web UI for this machine's VMs, signed into with a link it prints
     ///
@@ -305,6 +324,76 @@ enum AccountsCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum KeysCmd {
+    /// List every key, revoked and expired ones included (the default)
+    List,
+    /// Issue an API key, printed once
+    ///
+    /// The key is a bearer credential for the hub's client API: hand it to the automation
+    /// it is for through a file only it reads, never on a command line.
+    Create {
+        /// What the key is for, unique among the keys that work: letters, digits, '.', '_', '-'
+        #[arg(long)]
+        name: String,
+        /// jobs (reserve capacity, place and follow jobs) or capacity (only ask for room);
+        /// repeat for both
+        #[arg(long = "scope", value_name = "SCOPE", default_value = "jobs", value_parser = parse_scope)]
+        scopes: Vec<store::Scope>,
+        /// A pool its jobs may be placed in, or * for any; repeat for several
+        #[arg(long = "pool", value_name = "POOL", required = true)]
+        pools: Vec<String>,
+        /// The most memory one of its jobs may ask for: <n>M, <n>G or <n>T
+        #[arg(long, value_name = "SIZE", value_parser = parse_mem_size)]
+        max_mem: Option<u64>,
+        /// The most CPUs one of its jobs may ask for
+        #[arg(long, value_name = "N")]
+        max_cpus: Option<u32>,
+        /// The most job disk one of its jobs may ask for: <n>M, <n>G or <n>T
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        max_disk: Option<u64>,
+        /// How long the key works: <n>s, <n>m, <n>h or <n>d (at most 365d)
+        #[arg(long, default_value = "90d", value_parser = parse_key_ttl)]
+        ttl: Duration,
+    },
+    /// Revoke the working key of that name; with none working, remove those that no longer
+    /// work
+    Revoke { name: String },
+}
+
+fn parse_scope(s: &str) -> Result<store::Scope, String> {
+    store::Scope::parse(s).ok_or_else(|| format!("{s:?}: expected jobs or capacity"))
+}
+
+/// A size in bytes: a number with a binary unit, `K`, `M`, `G` or `T`.
+fn parse_size(s: &str) -> Result<u64, String> {
+    let bad = || format!("{s:?}: expected <n>K, <n>M, <n>G or <n>T");
+    let (n, unit) = s.split_at(s.len().saturating_sub(1));
+    let shift = match unit {
+        "K" | "k" => 10,
+        "M" | "m" => 20,
+        "G" | "g" => 30,
+        "T" | "t" => 40,
+        _ => return Err(bad()),
+    };
+    let n: u64 = n.parse().map_err(|_| bad())?;
+    n.checked_mul(1 << shift).filter(|b| *b > 0).ok_or_else(bad)
+}
+
+/// A memory size, at least 1 MiB: envelopes count memory in MiB.
+fn parse_mem_size(s: &str) -> Result<u64, String> {
+    let bytes = parse_size(s)?;
+    if bytes < 1 << 20 {
+        return Err(format!("{s:?}: expected at least 1M"));
+    }
+    Ok(bytes)
+}
+
+/// An API key's lifetime, at most [`store::MAX_KEY_TTL`].
+fn parse_key_ttl(s: &str) -> Result<Duration, String> {
+    parse_ttl(s, store::MAX_KEY_TTL, "a key")
+}
+
 /// An email address, or `*`.
 fn parse_account(s: &str) -> Result<String, String> {
     store::account_key(s).ok_or_else(|| format!("{s:?} is neither an email address nor *"))
@@ -403,6 +492,12 @@ enum NodesCmd {
         /// Evict the node's materialized images too
         #[arg(long)]
         images: bool,
+    },
+    /// Put the node in the pools placed jobs name, replacing those it was in, or `none`
+    Pools {
+        id: String,
+        /// Pool names separated by commas, or `none`
+        pools: String,
     },
     /// Ask the node to replace its vk with a release the hub holds
     Update {
@@ -515,6 +610,22 @@ async fn run(cli: Cli) -> Result<()> {
                 Some(NodesCmd::Release { id }) => command(client, id, Operation::Release).await,
                 Some(NodesCmd::Reset { id, images }) => {
                     command(client, id, Operation::Reset { images }).await
+                }
+                Some(NodesCmd::Pools { id, pools }) => {
+                    let pools: Vec<String> = match pools.as_str() {
+                        "none" => Vec::new(),
+                        list => list
+                            .split(',')
+                            .map(|p| p.trim().to_string())
+                            .filter(|p| !p.is_empty())
+                            .collect(),
+                    };
+                    let changed =
+                        tokio::task::spawn_blocking(move || client.set_pools(&id, pools)).await??;
+                    if !changed {
+                        eprintln!("vk-hub: already so; nothing changed");
+                    }
+                    Ok(())
                 }
                 Some(NodesCmd::Update { id, release, force }) => {
                     let command = tokio::task::spawn_blocking(move || {
@@ -673,6 +784,19 @@ async fn run(cli: Cli) -> Result<()> {
                 cmd.into(),
             )
             .await
+        }
+        Cmd::Keys { config, cmd } => {
+            keys_cmd(
+                admin_client(&HubConfig::load(config.config.as_deref())?)?,
+                cmd.unwrap_or(KeysCmd::List),
+            )
+            .await
+        }
+        Cmd::Jobs { config, limit } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            let jobs = tokio::task::spawn_blocking(move || client.jobs(limit)).await??;
+            print!("{}", render_jobs(&jobs, now_secs()));
+            Ok(())
         }
         Cmd::Workloads { config, node } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
@@ -915,7 +1039,9 @@ async fn serve(cfg: HubConfig) -> Result<()> {
         }
         hub = hub.with_oidc();
     }
-    let hub = Arc::new(hub);
+    let hub = Arc::new(hub.with_jobs(cfg.jobs_dir(), cfg.job_lost_after)?);
+    jobs::recover(&hub).await?;
+    tokio::spawn(jobs::drive(hub.clone()));
     // Fatal, unlike the registry's optional admin socket: here it is the only way to issue
     // a token, so a hub without it could never enroll anything.
     let admin = admin::bind(&cfg.admin_socket())?;
@@ -1053,6 +1179,124 @@ async fn accounts_cmd(client: admin::Client, cmd: AccountsCmd) -> Result<()> {
         eprintln!("vk-hub: this hub has no [oidc] in its config: grants take effect once it does");
     }
     Ok(())
+}
+
+/// `vk-hub keys list|create|revoke`, over the running hub's admin socket.
+async fn keys_cmd(client: admin::Client, cmd: KeysCmd) -> Result<()> {
+    match cmd {
+        KeysCmd::List => {
+            let keys = tokio::task::spawn_blocking(move || client.keys()).await??;
+            print!("{}", render_keys(&keys, now_secs()));
+        }
+        KeysCmd::Create {
+            name,
+            scopes,
+            pools,
+            max_mem,
+            max_cpus,
+            max_disk,
+            ttl,
+        } => {
+            let max_envelope = (max_mem.is_some() || max_cpus.is_some() || max_disk.is_some())
+                .then(|| vk_hub_proto::job::Envelope {
+                    mem_mib: max_mem.map_or(u64::MAX, |b| b >> 20),
+                    cpus: max_cpus.unwrap_or(u32::MAX),
+                    disk_bytes: max_disk.unwrap_or(u64::MAX),
+                });
+            let policy = store::KeyPolicy {
+                scopes,
+                pools,
+                max_envelope,
+            };
+            let created =
+                tokio::task::spawn_blocking(move || client.create_key(&name, policy, ttl))
+                    .await??;
+            // The key alone on stdout, so `vk-hub keys create … > file` captures just it.
+            println!("{}", created.key);
+            eprintln!(
+                "vk-hub: API key {} works for {}; keep it in a file only its holder reads",
+                created.row.name,
+                human_duration(ttl)
+            );
+        }
+        KeysCmd::Revoke { name } => {
+            let what = name.clone();
+            if !tokio::task::spawn_blocking(move || client.revoke_key(&name)).await?? {
+                bail!("there is no key {what}");
+            }
+            eprintln!("vk-hub: key {what} revoked");
+        }
+    }
+    Ok(())
+}
+
+/// `vk-hub keys`' table.
+fn render_keys(keys: &[store::KeyRow], now: u64) -> String {
+    let rows: Vec<[String; 8]> = keys
+        .iter()
+        .map(|k| {
+            let state = if k.revoked_at.is_some() {
+                "revoked".to_string()
+            } else if k.expires_at <= now {
+                "expired".to_string()
+            } else {
+                format!(
+                    "expires in {}",
+                    human_duration(rounded(k.expires_at.saturating_sub(now)))
+                )
+            };
+            let scopes: Vec<&str> = k.scopes.iter().map(|s| s.name()).collect();
+            [
+                k.name.clone(),
+                format!("vkk_{}…", k.prefix),
+                scopes.join(","),
+                k.pools.join(","),
+                k.max_envelope
+                    .map_or_else(|| "-".to_string(), store::envelope_text),
+                utc(k.created_at),
+                k.created_by.clone(),
+                state,
+            ]
+        })
+        .collect();
+    table(
+        &[
+            "NAME", "KEY", "SCOPES", "POOLS", "LARGEST", "CREATED", "BY", "STATE",
+        ],
+        &rows,
+    )
+}
+
+/// `vk-hub jobs`' table.
+fn render_jobs(jobs: &[(String, store::JobRow)], now: u64) -> String {
+    let rows: Vec<[String; 8]> = jobs
+        .iter()
+        .map(|(id, j)| {
+            [
+                id.clone(),
+                j.key_name.clone(),
+                j.placement.pool.clone(),
+                jobs::state_text(j),
+                j.node.clone().unwrap_or_else(|| "-".to_string()),
+                j.output_len.to_string(),
+                format!("{} ago", human_duration(ago(now, j.created_at))),
+                j.title.clone(),
+            ]
+        })
+        .collect();
+    table(
+        &[
+            "ID",
+            "KEY",
+            "POOL",
+            "STATE",
+            "NODE",
+            "OUTPUT",
+            "SUBMITTED",
+            "JOB",
+        ],
+        &rows,
+    )
 }
 
 /// Say how many sessions a grant or revoke ended.
@@ -1312,14 +1556,26 @@ fn steering_cells(n: &ops::NodeView) -> [String; 4] {
 
 /// What a node says it cannot do: sentences, not cells.
 fn node_notes(n: &ops::NodeView) -> Vec<String> {
+    let mut placement = Vec::new();
+    if !n.pools.is_empty() {
+        placement.push(format!("{}: in pools {}", n.hostname, n.pools.join(", ")));
+    }
+    if !n.labels.is_empty() {
+        placement.push(format!("{}: labels {}", n.hostname, n.labels.join(", ")));
+    }
+    if let Some(why) = &n.last_refusal {
+        placement.push(format!("{}: refuses reservations: {why}", n.hostname));
+    }
     let Some(report) = &n.report else {
-        return Vec::new();
+        return placement;
     };
-    let mut notes: Vec<String> = report
-        .unsupported
-        .iter()
-        .map(|note| format!("{}: cannot comply: {note}", n.hostname))
-        .collect();
+    let mut notes: Vec<String> = placement;
+    notes.extend(
+        report
+            .unsupported
+            .iter()
+            .map(|note| format!("{}: cannot comply: {note}", n.hostname)),
+    );
     if let Some(error) = &report.concurrency_error {
         notes.push(format!(
             "{}: cannot set its concurrency: {error}",

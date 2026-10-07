@@ -234,8 +234,8 @@ async fn authenticate(
         panic!("expected a challenge, got {challenge:?}");
     };
     let ours = twist.versions.unwrap_or(PROTOCOL);
-    assert_eq!(Some(version), ours.negotiate(PROTOCOL));
-    assert_eq!(versions, PROTOCOL);
+    assert_eq!(Some(version), ours.negotiate(session::PROTOCOL));
+    assert_eq!(versions, session::PROTOCOL);
     let nonce = vk_hub_proto::from_hex(&nonce).unwrap();
     assert_eq!(nonce.len(), vk_hub_proto::CHALLENGE_LEN);
     let signature = signer.sign(&vk_hub_proto::auth_message(
@@ -2618,3 +2618,5 @@ fn audit_times_are_utc() {
     assert_eq!(utc(951_782_400), "2000-02-29T00:00:00Z");
     assert_eq!(utc(1_790_755_279), "2026-09-30T08:01:19Z");
 }
+
+mod jobs;

@@ -103,7 +103,8 @@ request_concurrency = 1
 GitLab's job response does not carry the job's tags, and GitLab only gives a runner jobs
 whose tags it has, so placement is per runner: one runner per class of work, with the tags
 of that class registered in GitLab and its pool and labels here. A pool is a set of nodes the
-hub's operator names; a label is one a node declares in its own configuration. The API key's
+hub's operator names (`vk-hub nodes pools <id> <a,b>`); a label is one a node declares in its
+own configuration and reports in its inventory's `labels`, absent from an older node's. The API key's
 policy on the hub decides the pools the daemon may use and the largest envelope it may ask
 for.
 
@@ -188,8 +189,10 @@ An error body is `{error, code, retry_after_secs?}`; a code the client does not 
 ## Hub ↔ node: protocol version 3
 
 Version 3 (`JOBS`) adds one message type each way to the existing session, `{"type": "job",
-"kind": …}`, whose payloads are `vk_hub_proto::dispatch`'s. `PROTOCOL` reaches 3 when a hub
-and a node implement it; a job message in a session below 3 is a protocol error.
+"kind": …}`, whose payloads are `vk_hub_proto::dispatch`'s. A job message in a session below 3
+is a protocol error. `PROTOCOL` stays at 1 to 2; each side that implements version 3 negotiates
+from a range of its own reaching it: the hub accepts 1 to 3, so a node offering 3 gets it, and
+one offering at most 2 is steered and never offered a job.
 
 | Hub → node | Answer | Meaning |
 |---|---|---|

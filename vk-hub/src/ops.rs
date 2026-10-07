@@ -44,6 +44,15 @@ pub struct NodeView {
     /// Commands still to deliver or finish.
     #[serde(default)]
     pub pending_commands: usize,
+    /// The pools placed jobs may name it by.
+    #[serde(default)]
+    pub pools: Vec<String>,
+    /// The labels it declares.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Why it refused the hub's latest offer of a reservation, while it accepts none.
+    #[serde(default)]
+    pub last_refusal: Option<String>,
 }
 
 impl NodeView {
@@ -87,6 +96,9 @@ pub fn node_view(hub: &Hub, id: String, row: &NodeRow) -> NodeView {
             .db
             .pending_commands(&id, crate::now_secs())
             .map_or(0, |c| c.len()),
+        pools: row.pools.clone(),
+        labels: inventory.map(|i| i.labels.clone()).unwrap_or_default(),
+        last_refusal: crate::jobs::last_refusal(hub, &id),
         id,
     }
 }

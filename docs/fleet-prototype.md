@@ -29,7 +29,10 @@ The prototype provides, all experimentally:
 - `vk-hub workloads`: each node's VMs;
 - live nodes, node detail and operations pages, steering and resetting from a node's page,
   pausing, resuming and aborting rollouts from the operations page, and an audit log, with
-  sign-in links from `vk-hub ui login`.
+  sign-in links from `vk-hub ui login`;
+- on the hub, the side of [GitLab dispatch](gitlab-dispatch.md) it owns: API keys (`vk-hub
+  keys`), pools (`vk-hub nodes pools`), the client API, reservations and job placement over
+  protocol version 3, and job output (`vk-hub jobs`); see [Placed jobs](#placed-jobs).
 
 Restart and redeploy are not built.
 
@@ -157,11 +160,12 @@ system unit when run as root), preserving enrollment.
 `vk-hub serve [--config hub.toml]` serves nodes. `hub.toml` sets `addr` (default
 `127.0.0.1:8443`), `tls_cert` and `tls_key`, `data_dir` (default `$XDG_DATA_HOME/virtkit/hub`,
 else `~/.local/share/virtkit/hub`), `release_repository` (see [Releases](#releases)), and the
-web UI's keys (see [Web UI](#web-ui)). Every key is optional and an unknown one is an error.
-Without TLS the hub serves only on loopback. TLS is 1.3 only, on both the hub and the node.
-`vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub workloads`, `vk-hub audit` and
-`vk-hub ui` reach the running hub through `<data_dir>/admin.sock`, open to the hub's user and
-root.
+web UI's keys (see [Web UI](#web-ui)) and `job_lost_after_secs` (see
+[Placed jobs](#placed-jobs)). Every key is optional and an unknown one is an error. Without TLS
+the hub serves only on loopback. TLS is 1.3 only, on both the hub and the node. `vk-hub token`,
+`vk-hub nodes`, `vk-hub release`, `vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub
+keys` and `vk-hub jobs` reach the running hub through `<data_dir>/admin.sock`, open to the
+hub's user and root.
 
 `vk node run` holds a WebSocket session at `/v1/node` in the foreground. The node signs the
 hub's challenge, its node ID and incarnation (new on every `vk node run`), both version ranges,
@@ -184,7 +188,10 @@ report; and a release download, `GET /v1/releases/<sha256>`, signed by the node 
 label `vk-fleet release-download v1` over its ID, the release's 32-byte sha256, the time (`u64`)
 and the channel, sent in the `vk-node`, `vk-time` and `vk-signature` headers. The hub issues
 updates and serves releases (see [Releases](#releases)), and a node applies them (see
-[Update trial and rollback](#update-trial-and-rollback)).
+[Update trial and rollback](#update-trial-and-rollback)). Version 3 adds reservations and
+placed jobs (see [Placed jobs](#placed-jobs)). The hub uses its own range, versions 1 to 3;
+`vk node` uses `vk_hub_proto::PROTOCOL`, still 1 to 2 until it implements version 3.
+A session negotiates version 3 only with a node that implements it.
 
 The hub admits at most 256 connections that have not authenticated, each step of which (TLS,
 request headers, an enrollment body, a handshake message) has 10 seconds. One past that is
@@ -205,7 +212,8 @@ whether it is tmpfs and the speed `[node] jobs_speed` or `checkouts_speed` decla
 and guest kernel versions and a hash of the effective configuration; and the gitlab-runner
 configuration read, its `concurrent` and its runner names. The heartbeat carries admission
 (memory committed and budget, jobs running and waiting), the runner concurrency last asked
-for, memory available, free bytes and inodes per filesystem, and each VM's memory.
+for, memory available, free bytes and inodes per filesystem, and each VM's memory. Inventory
+may also carry node-declared labels that placed jobs can require; older nodes send none.
 
 The hub stores heartbeats and reports at most once per half heartbeat, holding back the latest
 and storing it at the next ping. Heartbeats are written without an fsync, one a minute made
@@ -631,6 +639,84 @@ reply, each is replaced by its count and a pointer to `vk-hub workloads --node <
 A dev environment's entry also names its SSH alias, when it has an SSH setup, and the guest
 directory its workspace is at. Nothing acts on a node's workloads; local mode acts on its own
 (see [Local mode](#local-mode)).
+
+## Placed jobs
+
+The hub implements its side of [GitLab dispatch](gitlab-dispatch.md).
+
+**API keys.** `vk-hub keys create --name <name> --pool <pool> [--pool …] [--scope jobs|capacity]
+[--max-mem <size>] [--max-cpus <n>] [--max-disk <size>] [--ttl 90d]` prints a key, `vkk_` and
+64 hex digits, once; the hub keeps its sha256 only. A key lives at most 365 days and works
+until it expires or is revoked. Its name is unique among the keys that work. Scope `jobs` is
+the whole client API; `capacity` is `POST /v1/capacity` alone. Its pools — `*` for any — and
+largest envelope bound every placement it names: anything outside them is 403 `forbidden`. `keys
+list` shows each key's name, first 8 characters, scopes, pools, largest envelope, when and by
+whom it was created, and whether it works; `keys revoke <name>` revokes the working key of that
+name, or, with none working, removes those of that name that no longer do. The hub holds at most
+256 keys. Creating, revoking and removing are audited; a key is audited as `key <name>`, and its
+jobs and reservations are its own: another key's are 404.
+
+**Pools and labels.** `vk-hub nodes pools <id> <pool,…|none>` sets the pools a node is in,
+audited. Labels come from the node's inventory. `vk-hub nodes` lists each node's pools and
+labels under the table.
+
+**The client API** is served on the node listener under `/v1/capacity`, `/v1/reservations` and
+`/v1/jobs`. The key is checked before the body is read. A body is at most 64 KiB, a job
+submission 576 KiB, its spec 512 KiB (413 `too_large`), and has 30 seconds to arrive. A
+connection counts among the 256 unauthenticated ones until a key checks; then it counts among
+64 client connections, past which a request is answered 503 `unavailable`. A client connection
+closes when idle for 10 seconds between requests, and after 10 minutes finishes the request it
+serves, within 2 more, then closes. Long polls hold at most 60 seconds. A `request_id` makes a
+create idempotent for a day, kept in the database: for a reservation, the grant only, so a
+request that got no reservation is tried afresh; for a job, the job.
+
+**Placement.** A node takes placed work while its session is at version 3 and has sent its
+`held`, it is connected, in the pool, carries every label, reports itself ready and has at
+least the CPUs the envelope asks. Its room is its last heartbeat's admission budget less committed
+memory — or its memory available, with no budget — and the job filesystem's most free space,
+less what the hub asked of it since: offers not yet answered, reservations accepted after that
+heartbeat, and starts not yet answered that are not on a reservation. `fits` is the sum of each
+node's room in envelopes, at most 1024 a node. Offers go to the node with the most room first;
+an offer unanswered after 5 seconds is abandoned, and released if the node accepts it later.
+When every node with room has refused, the hub pauses 2 seconds and asks again until the
+request's `wait_secs`, then answers 503 `no_capacity` with `retry_after_secs` 5. Leases are
+1–600 seconds. A renew waits 10 seconds for the node's answer (then 503 `unavailable`). A
+node's reservations end with its session, or when a new session of the node replaces it:
+renewing one is then 410 `reservation_gone`, and its next `held` gets each released.
+
+**Jobs.** A submission stores the job record, redacted spec and `request_id` in one durable
+transaction; the full spec stays in memory until a node accepts the job. The hub holds
+at most 4096 jobs not finished; past that a submission is answered 503 `unavailable` with
+`retry_after_secs` 5. A placement loop, woken by every change and every second, sends each
+queued job to its reservation's node while that reservation holds, else to the node with the
+most room. A refused start sends the job elsewhere, gives a reservation it named back, and asks
+a node that refused again only after 2 seconds; a start whose answer is lost with its session
+waits for the node's `held`, which either names the job — accepted — or not, when the job is
+placed again. A queued job is ended `no_capacity` when it cannot be placed by its
+`place_within_secs` (at most a day), and `canceled` at once when its producer cancels it; a
+reservation it named goes back to its node. A cancel mode the hub does not know is `immediate`.
+Every change of state is written durably and audited: submitted, sent to a node, accepted,
+refused, finished, canceled, settled, lost.
+
+**Output** is kept in `<data_dir>/jobs/<id>.out`, written at the chunk's offset and synced — the
+directory too, for a file's first bytes — before the node is acked. A chunk overlapping what is
+held is trimmed; one past it ends the node's session as a protocol error. Past the job's trace
+limit and 64 KiB more, or past 64 MiB whatever the limit, output is acked and dropped. A read
+answers at most 1 MiB. Settling a finished job deletes its output and keeps its record; records
+go 30 days after a job finished or was settled.
+
+**Lost nodes.** A node holding a job, unreachable — 3 missed heartbeats — for
+`job_lost_after_secs` (300 by default, 1 to 86400), loses the job: it ends `lost`, which
+`vk-gitlab` reports as `runner_system_failure`. When the node comes back and names the job in
+its `held`, the hub cancels it `immediate`, acks and drops what output it still sends, and
+answers its result with `recorded` without changing the job's.
+
+**Hub restarts.** Records and output survive. Queued or starting jobs end `lost`; running jobs
+continue, with nodes resending output from the end of the stored file.
+
+`vk-hub jobs [--limit 50]` lists the latest jobs: ID, key, pool, state or how it ended, node,
+output length, age and what the job is. The web UI's operations page lists the latest 20, live,
+to viewers and operators alike.
 
 ## Web UI
 

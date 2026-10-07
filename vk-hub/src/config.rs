@@ -12,6 +12,8 @@
 //! ui_tls_key = "/etc/vk-hub/ui-key.pem"
 //! # Where `vk-hub release fetch` downloads releases from; "none" turns fetching off.
 //! release_repository = "https://github.com/virtkit-dev/virtkit"
+//! # How long a node holding a placed job may be unreachable before the job is lost.
+//! job_lost_after_secs = 300
 //!
 //! # Sign-in to the web UI through an OIDC provider; off unless set.
 //! [oidc]
@@ -59,6 +61,8 @@ pub struct HubConfig {
     pub ui: Option<UiConfig>,
     /// Where releases are fetched from; `None` with fetching off.
     pub release_source: Option<crate::fetch::Source>,
+    /// How long a node holding a placed job may be unreachable before the job is lost.
+    pub job_lost_after: std::time::Duration,
 }
 
 /// The web UI's listener.
@@ -98,6 +102,7 @@ struct FileConfig {
     ui_tls_cert: Option<PathBuf>,
     ui_tls_key: Option<PathBuf>,
     release_repository: Option<String>,
+    job_lost_after_secs: Option<u64>,
     oidc: Option<FileOidc>,
 }
 
@@ -236,6 +241,11 @@ impl HubConfig {
             Some("none") => None,
             Some(url) => Some(crate::fetch::Source::parse(url)?),
         };
+        let job_lost_after = match f.job_lost_after_secs {
+            None => crate::jobs::DEFAULT_LOST_AFTER,
+            Some(secs @ 1..=86_400) => std::time::Duration::from_secs(secs),
+            Some(secs) => bail!("job_lost_after_secs {secs}: expected 1 to 86400"),
+        };
         Ok(HubConfig {
             addr,
             tls_cert: f.tls_cert,
@@ -243,6 +253,7 @@ impl HubConfig {
             data_dir,
             ui,
             release_source,
+            job_lost_after,
         })
     }
 
@@ -254,6 +265,11 @@ impl HubConfig {
     /// Where release binaries are kept.
     pub fn releases_dir(&self) -> PathBuf {
         self.data_dir.join("releases")
+    }
+
+    /// Where placed jobs' output is kept.
+    pub fn jobs_dir(&self) -> PathBuf {
+        self.data_dir.join("jobs")
     }
 
     /// The admin socket `vk-hub token` and `vk-hub nodes` reach the running hub through.
@@ -524,6 +540,25 @@ mod tests {
         assert_eq!(source("release_repository = \"none\"\n").unwrap(), None);
         let err = source("release_repository = \"http://github.com/a/b\"\n").unwrap_err();
         assert!(format!("{err:#}").contains("expected https://"), "{err:#}");
+    }
+
+    #[test]
+    fn a_job_is_lost_after_a_day_at_most() {
+        let lost =
+            |extra: &str| parse(&format!("data_dir = \"/d\"\n{extra}")).map(|c| c.job_lost_after);
+        assert_eq!(lost("").unwrap(), crate::jobs::DEFAULT_LOST_AFTER);
+        for secs in [1, 86_400] {
+            assert_eq!(
+                lost(&format!("job_lost_after_secs = {secs}\n")).unwrap(),
+                std::time::Duration::from_secs(secs)
+            );
+        }
+        for bad in ["0", "86401", "-1"] {
+            assert!(
+                lost(&format!("job_lost_after_secs = {bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

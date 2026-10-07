@@ -3074,6 +3074,66 @@ async fn releases_and_rollouts_are_shown_live() {
     assert!(next.contains("aborted by uid 0"), "{next}");
 }
 
+/// `/operations` lists the jobs placed through the client API, as text, to a viewer, and
+/// follows them live.
+#[tokio::test(flavor = "multi_thread")]
+async fn placed_jobs_are_shown_live() {
+    use vk_hub_proto::client::{JobState, Placement};
+    let (addr, hub, _) = start_fleet().await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/operations", Some(&viewer)).await;
+    assert!(page.body.contains("none placed"), "{}", page.body);
+    let id = "cd".repeat(16);
+    let mut row = crate::store::JobRow {
+        key: "k".into(),
+        key_name: "gitlab".into(),
+        request_id: "01".repeat(16),
+        placement: Placement {
+            pool: "ci".into(),
+            labels: vec![],
+            envelope: vk_hub_proto::job::Envelope::default(),
+        },
+        title: "GitLab job 7 of g/<b>p</b> (test)".into(),
+        created_at: crate::now_secs(),
+        state: JobState::Queued,
+        revision: 1,
+        node: None,
+        stage: None,
+        cancel: None,
+        result: None,
+        output_len: 0,
+        finished_at: None,
+        settled_at: None,
+    };
+    hub.db
+        .submit_job(&id, &row, "d", b"{}", "key gitlab", row.created_at)
+        .unwrap();
+    let page = get(addr, "/operations", Some(&viewer)).await;
+    for want in [
+        &format!("<code title=\"{id}\">cdcdcdcd</code>"),
+        "GitLab job 7 of g/&lt;b&gt;p&lt;/b&gt; (test)",
+        "<td>gitlab</td><td>ci</td><td>queued</td><td>-</td>",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+    let mut events = Events::open(addr, "/events/operations", &viewer).await;
+    events.next().await.unwrap();
+    row.state = JobState::Running;
+    row.stage = Some("step_script".into());
+    row.node = Some("ef".repeat(16));
+    row.revision = 2;
+    hub.db.put_job(&id, &row, &[], row.created_at).unwrap();
+    hub.touch();
+    let next = next_with(&mut events, "running: step_script").await;
+    assert!(
+        next.contains(&format!(
+            "<a href=\"/node/{}\"><code>efefefef</code></a>",
+            "ef".repeat(16)
+        )),
+        "{next}"
+    );
+}
+
 /// An operator's `/operations` pauses, resumes and aborts a rollout as the session's
 /// principal, which the audit log records, and its live fragment follows; a change the
 /// rollout's state does not allow is refused saying why.

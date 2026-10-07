@@ -1,6 +1,7 @@
 //! One node's WebSocket session: authenticate against the key pinned at enrollment with
 //! hello/challenge/auth, then store inventory, heartbeats and reports until it disconnects.
-//! From version [`STEERING`], also send desired state and commands.
+//! From version [`STEERING`], also send desired state and commands; from version [`JOBS`],
+//! reservations and jobs ([`crate::jobs`]).
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -17,8 +18,8 @@ use tokio::time::Instant;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use vk_hub_proto::{
-    CHALLENGE_LEN, Channel, Heartbeat, HubMsg, Inventory, NodeMsg, PROTOCOL, PUBLIC_KEY_LEN,
-    RefusalCode, Report, SIGNATURE_LEN, STEERING, from_hex_lower,
+    CHALLENGE_LEN, Channel, Heartbeat, HubMsg, Inventory, JOBS, NodeMsg, PUBLIC_KEY_LEN,
+    RefusalCode, Report, SIGNATURE_LEN, STEERING, VersionRange, from_hex_lower,
 };
 
 use crate::server::{Ending, Exported, HEARTBEAT, HEARTBEAT_SECS, Hub, MISSED_HEARTBEATS};
@@ -33,6 +34,13 @@ type Ws = WebSocketStream<TokioIo<Upgraded>>;
 const HANDSHAKE_STEP: Duration = crate::server::PRE_AUTH_TIMEOUT;
 #[cfg(test)]
 const HANDSHAKE_STEP: Duration = Duration::from_secs(1);
+
+/// The protocol versions this hub speaks: [`vk_hub_proto::PROTOCOL`]'s and [`JOBS`]. A node
+/// offering less negotiates the highest version both speak.
+pub const PROTOCOL: VersionRange = VersionRange {
+    min: vk_hub_proto::PROTOCOL.min,
+    max: JOBS,
+};
 
 /// What a node removed from the hub is told.
 const REMOVED: &str = "this node was removed from the hub";
@@ -70,8 +78,10 @@ pub async fn run(
             None => format!("first session, incarnation {}", node.incarnation),
         }
     );
-    let ended = serve(&mut ws, &hub, &node, session, &ending).await;
+    let jobs = crate::jobs::open_link(&hub, &node.id, session, node.version).await;
+    let ended = serve(&mut ws, &hub, &node, session, &ending, jobs).await;
     hub.close_session(&node.id, session);
+    crate::jobs::close_link(&hub, &node.id, session).await;
     match ended {
         Ok(why) => eprintln!("vk-hub: {peer}: node {} disconnected: {why}", node.id),
         Err(e) => {
@@ -302,6 +312,7 @@ async fn serve(
     node: &Node,
     session: u64,
     ending: &Ending,
+    mut jobs: Option<tokio::sync::mpsc::Receiver<vk_hub_proto::dispatch::HubJobMsg>>,
 ) -> Result<&'static str> {
     let quiet = HEARTBEAT * MISSED_HEARTBEATS;
     let mut ping = tokio::time::interval(HEARTBEAT);
@@ -325,6 +336,7 @@ async fn serve(
                 return Ok(why);
             }
             () = ending.kick.notified() => steer.sync(ws, hub, node).await?,
+            Some(msg) = next_job(&mut jobs) => send(ws, &HubMsg::Job(msg)).await?,
             _ = ping.tick() => {
                 tokio::time::timeout(HEARTBEAT, ws.send(Message::Ping(Default::default())))
                     .await
@@ -394,10 +406,26 @@ async fn serve(
                         acknowledge(ws, hub, node, ack).await?;
                         None
                     }
-                    NodeMsg::Job(_) => {
+                    NodeMsg::Job(_) if node.version < JOBS => {
                         let reason = format!("a job message in a version-{} session", node.version);
                         refuse(ws, RefusalCode::Protocol, &reason).await;
                         bail!("the node sent {reason}");
+                    }
+                    NodeMsg::Job(msg) => {
+                        match crate::jobs::on_node(hub, &node.id, session, msg).await {
+                            Ok(answers) => {
+                                for answer in answers {
+                                    send(ws, &HubMsg::Job(answer)).await?;
+                                }
+                            }
+                            Err(e) if e.is::<crate::jobs::Violation>() => {
+                                let reason = format!("{e:#}");
+                                refuse(ws, RefusalCode::Protocol, &reason).await;
+                                bail!("the node broke the job protocol: {reason}");
+                            }
+                            Err(e) => return Err(e),
+                        }
+                        None
                     }
                     NodeMsg::Hello { .. } | NodeMsg::Auth { .. } => {
                         bail!("the node repeated its handshake inside a session")
@@ -414,6 +442,16 @@ async fn serve(
                 }
             }
         }
+    }
+}
+
+/// The next job message for the session to send; never, in a session below [`JOBS`].
+async fn next_job(
+    jobs: &mut Option<tokio::sync::mpsc::Receiver<vk_hub_proto::dispatch::HubJobMsg>>,
+) -> Option<vk_hub_proto::dispatch::HubJobMsg> {
+    match jobs {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
     }
 }
 

@@ -1,6 +1,7 @@
 //! `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub rollout`, `vk-hub workloads`,
-//! `vk-hub audit`, `vk-hub ui`, `vk-hub accounts` and `vk-hub local login`, `sessions` and
-//! `logout` reach the running hub through a unix socket in its data directory.
+//! `vk-hub audit`, `vk-hub ui`, `vk-hub accounts`, `vk-hub keys`, `vk-hub jobs` and
+//! `vk-hub local login`, `sessions` and `logout` reach the running hub through a unix socket
+//! in its data directory.
 //!
 //! Enrollment tokens admit machines to the fleet and must be issued outside the node-facing
 //! network; sign-in links must be issued outside the web UI. The CLI cannot open the database:
@@ -28,7 +29,9 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::ops::{self, NodeView};
 use crate::rollout::{Rollout, RolloutAction};
 use crate::server::Hub;
-use crate::store::{AccountChange, AccountRow, AuditRow, Release, Role, UiSession};
+use crate::store::{
+    AccountChange, AccountRow, AuditRow, JobRow, KeyPolicy, KeyRow, Release, Role, UiSession,
+};
 use vk_hub_proto::{Acquisition, Command, DesiredState, Operation};
 
 /// Bumped only for a change an older peer could misread.
@@ -143,6 +146,24 @@ enum Call {
     RevokeAccount {
         email: String,
     },
+    /// Put a node in pools, replacing the ones it was in.
+    SetPools {
+        id: String,
+        pools: Vec<String>,
+    },
+    CreateKey {
+        name: String,
+        policy: KeyPolicy,
+        ttl_secs: u64,
+    },
+    ListKeys,
+    RevokeKey {
+        name: String,
+    },
+    /// The latest `limit` placed jobs.
+    ListJobs {
+        limit: usize,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -186,6 +207,13 @@ pub struct Accounts {
     pub oidc: bool,
     /// Every grant, by address, `*` first.
     pub accounts: Vec<(String, AccountRow)>,
+}
+
+/// A freshly minted API key, and its row.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreatedKey {
+    pub key: String,
+    pub row: KeyRow,
 }
 
 /// The result of granting or revoking a role.
@@ -450,6 +478,38 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
         Call::RevokeAccount { email } => {
             serde_json::to_value(set_account(hub, &actor, &email, None)?)?
         }
+        Call::SetPools { id, pools } => {
+            let changed = hub.db.set_pools(&id, &pools, &actor, crate::now_secs())?;
+            hub.changed(&id);
+            serde_json::to_value(changed)?
+        }
+        Call::CreateKey {
+            name,
+            policy,
+            ttl_secs,
+        } => {
+            let (key, row) = hub.db.create_api_key(
+                &name,
+                &policy,
+                Duration::from_secs(ttl_secs),
+                &actor,
+                crate::now_secs(),
+            )?;
+            // The key itself is never logged: it is the credential.
+            eprintln!("vk-hub: admin: {actor} created API key {name}");
+            serde_json::to_value(CreatedKey { key, row })?
+        }
+        Call::ListKeys => serde_json::to_value(hub.db.api_keys()?)?,
+        Call::RevokeKey { name } => {
+            let revoked = hub.db.revoke_api_key(&name, &actor, crate::now_secs())?;
+            if revoked {
+                eprintln!("vk-hub: admin: {actor} revoked API key {name}");
+            }
+            serde_json::to_value(revoked)?
+        }
+        Call::ListJobs { limit } => {
+            serde_json::to_value(crate::jobs::listing(hub, limit.min(10_000))?)?
+        }
         Call::RemoveNode { id } => {
             let removed = hub.db.remove_node(&id, &actor, crate::now_secs())?;
             if removed {
@@ -681,6 +741,39 @@ impl Client {
         self.call(Call::RevokeAccount {
             email: email.to_string(),
         })
+    }
+
+    /// Whether the node's pools changed.
+    pub fn set_pools(&self, id: &str, pools: Vec<String>) -> Result<bool> {
+        self.call(Call::SetPools {
+            id: id.to_string(),
+            pools,
+        })
+    }
+
+    pub fn create_key(&self, name: &str, policy: KeyPolicy, ttl: Duration) -> Result<CreatedKey> {
+        self.call(Call::CreateKey {
+            name: name.to_string(),
+            policy,
+            ttl_secs: ttl.as_secs(),
+        })
+    }
+
+    /// Oldest first.
+    pub fn keys(&self) -> Result<Vec<KeyRow>> {
+        self.call(Call::ListKeys)
+    }
+
+    /// Whether anything was revoked or removed.
+    pub fn revoke_key(&self, name: &str) -> Result<bool> {
+        self.call(Call::RevokeKey {
+            name: name.to_string(),
+        })
+    }
+
+    /// Newest first.
+    pub fn jobs(&self, limit: usize) -> Result<Vec<(String, JobRow)>> {
+        self.call(Call::ListJobs { limit })
     }
 
     fn call<T: DeserializeOwned>(&self, call: Call) -> Result<T> {
@@ -952,6 +1045,68 @@ mod tests {
         .unwrap();
         assert!(!outcome(reply).oidc);
         assert_eq!(hub.db.oidc_role(Some("a@b")).unwrap(), Some(Role::Viewer));
+    }
+
+    #[test]
+    fn keys_pools_and_jobs_are_served_over_the_socket() {
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+        let call =
+            |call: &str| dispatch(format!(r#"{{"v":1,"call":{call}}}"#).as_bytes(), &hub, 1000);
+        let created: CreatedKey = serde_json::from_value(
+            call(
+                r#"{"op":"create-key","name":"gitlab","policy":{"scopes":["jobs"],"pools":["ci"],"max_envelope":null},"ttl_secs":3600}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(created.key.starts_with("vkk_"));
+        assert!(
+            hub.db
+                .api_key(&created.key, crate::now_secs())
+                .unwrap()
+                .is_some()
+        );
+        let keys: Vec<KeyRow> =
+            serde_json::from_value(call(r#"{"op":"list-keys"}"#).unwrap()).unwrap();
+        assert_eq!(keys, [created.row]);
+        assert_eq!(
+            call(r#"{"op":"revoke-key","name":"gitlab"}"#).unwrap(),
+            true
+        );
+        assert!(
+            hub.db
+                .api_key(&created.key, crate::now_secs())
+                .unwrap()
+                .is_none()
+        );
+
+        let (token, _) = hub
+            .db
+            .create_token(Duration::from_secs(60), "uid 0", 0)
+            .unwrap();
+        let crate::store::Enrollment::Enrolled { node_id: id } =
+            hub.db.enroll(&token, "aa", "h", "peer p", 1).unwrap()
+        else {
+            panic!("expected an enrollment");
+        };
+        let set = format!(r#"{{"op":"set-pools","id":"{id}","pools":["ci","big"]}}"#);
+        assert_eq!(call(&set).unwrap(), true);
+        assert_eq!(call(&set).unwrap(), false);
+        assert_eq!(hub.db.node(&id).unwrap().unwrap().pools, ["big", "ci"]);
+        let bad = format!(r#"{{"op":"set-pools","id":"{id}","pools":["no pool"]}}"#);
+        assert!(call(&bad).is_err());
+        let jobs = call(r#"{"op":"list-jobs","limit":10}"#).unwrap();
+        assert_eq!(jobs, serde_json::json!([]));
+        let audit = hub.db.audits(None, 10).unwrap();
+        let events: Vec<&str> = audit.iter().map(|r| r.event.as_str()).collect();
+        assert!(
+            events.contains(&"uid 1000 revoked API key gitlab"),
+            "{events:?}"
+        );
+        assert!(
+            events.contains(&format!("uid 1000 put node {id} in pools big, ci").as_str()),
+            "{events:?}"
+        );
     }
 
     #[test]

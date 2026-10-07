@@ -17,6 +17,14 @@ All notable changes to virtkit will be documented in this file.
 - **`vk node join --replace` re-enrolls a host as a new node.** After reading the token and
   passing checks, it preserves the old identity in `<state_dir>/node.replaced-<time>` and
   prints the old node ID for `vk-hub nodes remove`.
+- **Experimental: `vk-hub` places jobs for automation.** `vk-hub keys` issues, lists and
+  revokes API keys — hashed at rest, expiring, bound to pools and a largest envelope — and
+  `vk-hub nodes pools` puts nodes in the pools jobs name. A key's holder asks the hub for room,
+  reserves it on a node and has jobs run there through the client API on the hub's node
+  listener; the hub stores each job's output before acknowledging it, fails a job whose node
+  stays unreachable, and keeps records and output across its own restart. `vk-hub jobs` and the
+  web UI's operations page list the jobs placed. Hosts whose `vk` does not speak fleet
+  protocol version 3 are monitored and steered but offered no jobs.
 
 ### Fixed
 

@@ -1,6 +1,7 @@
 //! Shared hub state, a connection-limited accept loop, and the node listener:
-//! `POST /v1/enroll`, the `/v1/node` WebSocket and release downloads. Like `vk-registry`, it
-//! uses hyper with TLS when the config supplies a certificate.
+//! `POST /v1/enroll`, the `/v1/node` WebSocket, release downloads and the client API
+//! ([`crate::client`]). Like `vk-registry`, it uses hyper with TLS when the config supplies a
+//! certificate.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -31,9 +32,9 @@ use vk_hub_proto::{
 use crate::store::{Db, Enrollment};
 
 /// A response body: whole, or a release binary streamed from its file.
-type Body = BoxBody<Bytes, std::io::Error>;
+pub(crate) type Body = BoxBody<Bytes, std::io::Error>;
 
-fn full(bytes: impl Into<Bytes>) -> Body {
+pub(crate) fn full(bytes: impl Into<Bytes>) -> Body {
     Full::new(bytes.into())
         .map_err(|never| match never {})
         .boxed()
@@ -81,6 +82,17 @@ pub(crate) const MAX_PRE_AUTH: usize = 256;
 /// 503, to be retried.
 pub(crate) const MAX_DOWNLOADS: usize = 64;
 
+/// Client API connections at once, past their key's check: a `vk-gitlab` holds a few, one per
+/// request it has in flight. One past it is answered `unavailable`.
+const MAX_CLIENTS: usize = 64;
+
+/// How long a client API connection may stay open. It then finishes the request it is serving
+/// — a long poll at most, within [`CLIENT_DRAIN`] — and closes, and the client dials again.
+const CLIENT_LIFETIME: Duration = Duration::from_secs(600);
+
+/// How long a client connection asked to close has to finish its request.
+const CLIENT_DRAIN: Duration = Duration::from_secs(120);
+
 /// What every connection shares: the database, the sessions currently open, and the bounds
 /// on connections that have not authenticated and on release downloads.
 pub struct Hub {
@@ -118,6 +130,10 @@ pub struct Hub {
     touched: watch::Sender<u64>,
     /// Bumped when a web UI session ends.
     sessions: watch::Sender<u64>,
+    /// Permits for client API connections past their key's check ([`MAX_CLIENTS`]).
+    clients: Arc<Semaphore>,
+    /// Reservations and placed jobs.
+    pub(crate) dispatch: crate::jobs::Dispatch,
 }
 
 /// One node's open session.
@@ -165,7 +181,17 @@ impl Hub {
             node_changes: Mutex::new(HashMap::new()),
             touched: watch::Sender::new(0),
             sessions: watch::Sender::new(0),
+            clients: Arc::new(Semaphore::new(MAX_CLIENTS)),
+            dispatch: crate::jobs::Dispatch::new(None, crate::jobs::DEFAULT_LOST_AFTER),
         }
+    }
+
+    /// This hub, placing jobs and keeping their output in `dir`, losing a job whose node has
+    /// been unreachable for `lost_after`.
+    pub fn with_jobs(mut self, dir: std::path::PathBuf, lost_after: Duration) -> Result<Self> {
+        crate::jobs::output_dir(&dir)?;
+        self.dispatch = crate::jobs::Dispatch::new(Some(dir), lost_after);
+        Ok(self)
     }
 
     /// Note that something a page shows of node `node_id` may have changed: its report,
@@ -461,25 +487,62 @@ where
     }
 }
 
-/// What a connection's requests share: whether it serves a download, and its [`PreAuth`].
+/// What a connection's requests share: whether it serves a download, its [`PreAuth`], and
+/// once a client API key was checked on it, its place among the clients'.
 #[derive(Clone)]
 struct ConnState {
     downloading: Arc<AtomicBool>,
     permit: PreAuth,
+    client: Arc<Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+}
+
+impl ConnState {
+    /// Count the connection among the clients', no longer among the unauthenticated: whether
+    /// there was room for it.
+    fn claim_client(&self, hub: &Hub) -> bool {
+        let mut client = self
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if client.is_none() {
+            let Ok(permit) = hub.clients.clone().try_acquire_owned() else {
+                return false;
+            };
+            *client = Some(permit);
+            drop(
+                self.permit
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take(),
+            );
+        }
+        true
+    }
+
+    fn is_client(&self) -> bool {
+        self.client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
 }
 
 async fn serve_conn(io: Io, hub: Arc<Hub>, peer: SocketAddr, exported: Exported, permit: PreAuth) {
     let state = ConnState {
         downloading: Arc::new(AtomicBool::new(false)),
         permit,
+        client: Arc::new(Mutex::new(None)),
     };
     let downloading = state.downloading.clone();
+    let conn_state = state.clone();
     let svc = service_fn(move |req| handle(req, hub.clone(), peer, exported, state.clone()));
     // `with_upgrades`: a WebSocket is an HTTP/1.1 upgrade, handed over once the 101 is out,
     // which is also when this future ends. The header timeout needs the timer — without one
     // hyper quietly applies none. The connection as a whole is bounded too: a node makes one
     // request on it, an enrollment, an upgrade or a download, so one kept idle is only one
-    // held open. An authenticated download gets [`DOWNLOAD_TIMEOUT`] more.
+    // held open. An authenticated download gets [`DOWNLOAD_TIMEOUT`] more, and a client
+    // whose key was checked [`CLIENT_LIFETIME`]; between its requests, the header timeout
+    // closes one left idle.
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(PRE_AUTH_TIMEOUT)
@@ -491,10 +554,22 @@ async fn serve_conn(io: Io, hub: Arc<Hub>, peer: SocketAddr, exported: Exported,
         Err(_) if downloading.load(Ordering::Relaxed) => {
             tokio::time::timeout(DOWNLOAD_TIMEOUT, conn).await.ok()
         }
+        Err(_) if conn_state.is_client() => {
+            match tokio::time::timeout(CLIENT_LIFETIME, &mut conn).await {
+                Ok(ended) => Some(ended),
+                Err(_) => {
+                    conn.as_mut().graceful_shutdown();
+                    tokio::time::timeout(CLIENT_DRAIN, conn).await.ok()
+                }
+            }
+        }
         Err(_) => None,
     };
-    if let Some(Err(e)) = ended {
-        eprintln!("vk-hub: {peer}: connection error: {e}");
+    match ended {
+        // A client's connection left idle between its requests, closed as intended.
+        Some(Err(e)) if e.is_timeout() && conn_state.is_client() => {}
+        Some(Err(e)) => eprintln!("vk-hub: {peer}: connection error: {e}"),
+        _ => {}
     }
 }
 
@@ -511,12 +586,31 @@ async fn handle(
         (&Method::GET, path) if path.starts_with(RELEASE_PATH) => {
             download(&req, &hub, peer, exported, &state).await
         }
+        (_, path) if crate::client::is_client_path(path) => Ok(client(req, &hub, &state).await),
         _ => Ok(error(StatusCode::NOT_FOUND, "no such endpoint")),
     };
     Ok(resp.unwrap_or_else(|e| {
         eprintln!("vk-hub: {peer}: {e:#}");
         error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
     }))
+}
+
+/// A client API request: its key checked before anything else is read.
+async fn client(req: Request<Incoming>, hub: &Arc<Hub>, state: &ConnState) -> Response<Body> {
+    let principal = match crate::client::authenticate(req.headers(), hub).await {
+        Ok(p) => p,
+        Err(e) => return e.response(),
+    };
+    if !state.claim_client(hub) {
+        return crate::client::ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            vk_hub_proto::client::ErrorCode::Unavailable,
+            "too many client connections",
+        )
+        .retry_after(1)
+        .response();
+    }
+    crate::client::serve(req, hub, principal).await
 }
 
 /// `POST /v1/enroll`: check the node's proof of its key, then spend the token on it.
