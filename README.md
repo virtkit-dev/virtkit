@@ -717,11 +717,13 @@ run's filesystem.
 **Firmware, Secure Boot and TPM.** Released `vk` embeds edk2's CloudHv firmware; a source
 build embeds `dist/CLOUDHV.fd` from `./build-firmware.sh` (`VIRTKIT_UEFI_FIRMWARE` selects
 another). A bundle's `vm.json` says whether its machine has Secure Boot (`"secure_boot"`)
-and a TPM (`"tpm"`). UEFI variables persist in `uefi-vars.fd` beside the disks. **Secure Boot is
-experimental:** without SMM the guest's kernel can rewrite the variable store (PK, KEK, db,
-dbx), so it guards only the boot chain below the kernel, and a db/dbx update Windows makes
-at run time is known to crash the guest. The TPM runs inside `vk` (`vk-tpm`, a TPM 2.0 in
-Rust; no swtpm), its state in `tpm-state`, carried by snapshots; build steps run without one.
+and a TPM (`"tpm"`). The UEFI variables are kept and checked by `vk` itself, as SMM keeps them
+on a physical machine (`vk-uefi-vars`), in `uefi-vars.fd` beside the disks: PK, KEK, db and dbx
+are out of the guest's reach and Windows applies Microsoft's updates to them. Secure Boot runs
+without SMM, so the firmware itself is unprotected from the guest's kernel while it boots. The
+TPM runs inside `vk` (`vk-tpm`, a TPM 2.0 in Rust; no swtpm), its state in `tpm-state`,
+carried by snapshots; build steps run without one. [How Windows guests work](docs/windows.md)
+describes the firmware, the VMM and the driver, and their known limits.
 
 ## Operational behavior
 
