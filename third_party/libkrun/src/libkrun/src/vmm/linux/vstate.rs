@@ -192,6 +192,12 @@ pub enum Error {
     /// Failed to set KVM vcpu debug regs.
     VcpuSetDebugRegs(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
+    /// Failed to set the vcpu's guest debugging (KVM_SET_GUEST_DEBUG).
+    VcpuSetGuestDebug(kvm_ioctls::Error),
+    #[cfg(target_arch = "x86_64")]
+    /// Failed to step over the guest's int1 on a #DB exit.
+    VcpuStepInt1(kvm_ioctls::Error),
+    #[cfg(target_arch = "x86_64")]
     /// Failed to set KVM vcpu lapic.
     VcpuSetLapic(kvm_ioctls::Error),
     #[cfg(target_arch = "x86_64")]
@@ -363,6 +369,10 @@ impl Display for Error {
             VcpuSetCpuid(e) => write!(f, "Failed to set KVM vcpu cpuid: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetDebugRegs(e) => write!(f, "Failed to set KVM vcpu debug regs: {e}"),
+            #[cfg(target_arch = "x86_64")]
+            VcpuSetGuestDebug(e) => write!(f, "Failed to set KVM vcpu guest debugging: {e}"),
+            #[cfg(target_arch = "x86_64")]
+            VcpuStepInt1(e) => write!(f, "Failed to step over the guest's int1: {e}"),
             #[cfg(target_arch = "x86_64")]
             VcpuSetLapic(e) => write!(f, "Failed to set KVM vcpu lapic: {e}"),
             #[cfg(target_arch = "x86_64")]
@@ -982,6 +992,26 @@ pub struct VcpuConfig {
 }
 
 // Using this for easier explicit type-casting to help IDEs interpret the code.
+/// Whether the vCPUs take the guest's #DB exits, to step over `int1` themselves
+/// ([`Vcpu::step_over_int1`]). An AMD processor raises the #DB of an `int1` past SVM's #DB
+/// intercept; under Hyper-V's nested SVM (WSL2, Azure) it comes to KVM as an intercepted #DB
+/// with RIP still on the `int1` instead, KVM injects it there, and the guest executes the
+/// `int1` again, forever. Windows' PatchGuard runs one now and then, and the guest hangs. On for
+/// a Windows guest (`windows`) on an AMD host that is itself a VM, or as `KRUN_INT1_WORKAROUND`
+/// says (`1` or `0`).
+#[cfg(target_arch = "x86_64")]
+fn int1_workaround(windows: bool) -> bool {
+    match env::var("KRUN_INT1_WORKAROUND").as_deref() {
+        Ok("1") => return true,
+        Ok("0") => return false,
+        _ => {}
+    }
+    let vendor = std::arch::x86_64::__cpuid(0);
+    let amd = (vendor.ebx, vendor.edx, vendor.ecx) == (0x6874_7541, 0x6974_6e65, 0x444d_4163);
+    let nested = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
+    windows && amd && nested
+}
+
 type VcpuCell = Cell<Option<*mut Vcpu>>;
 
 /// A wrapper around creating and using a kvm-based VCPU.
@@ -1004,6 +1034,10 @@ pub struct Vcpu {
     hyperv: bool,
     #[cfg(target_arch = "x86_64")]
     kernel_enomem_workaround: bool,
+    /// The guest's memory, when this vCPU takes the guest's #DB exits to step over `int1`
+    /// ([`Vcpu::step_over_int1`]).
+    #[cfg(target_arch = "x86_64")]
+    int1_memory: Option<GuestMemoryMmap>,
 
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
@@ -1148,6 +1182,7 @@ impl Vcpu {
             msr_list,
             hyperv: false,
             kernel_enomem_workaround,
+            int1_memory: None,
             event_receiver,
             event_sender: Some(event_sender),
             response_receiver: Some(response_receiver),
@@ -1295,6 +1330,25 @@ impl Vcpu {
         self.fd
             .set_cpuid2(&self.cpuid)
             .map_err(Error::VcpuSetCpuid)?;
+
+        if int1_workaround(vcpu_config.hyperv_enabled) {
+            // The guest's #DB exits come here (KVM_EXIT_DEBUG); no breakpoint of the host's
+            // (DR7 0), so the guest's own hardware breakpoints are off while this is on.
+            let debug = kvm_bindings::kvm_guest_debug {
+                control: kvm_bindings::KVM_GUESTDBG_ENABLE | kvm_bindings::KVM_GUESTDBG_USE_HW_BP,
+                ..Default::default()
+            };
+            self.fd
+                .set_guest_debug(&debug)
+                .map_err(Error::VcpuSetGuestDebug)?;
+            self.int1_memory = Some(guest_mem.clone());
+            if self.id == 0 {
+                info!(
+                    "the guest's #DB exits come to the VMM, to step over int1 (its hardware \
+                     breakpoints are off)"
+                );
+            }
+        }
 
         if kernel_boot {
             arch::x86_64::msr::setup_msrs(&self.fd).map_err(Error::MSRSConfiguration)?;
@@ -1567,6 +1621,90 @@ impl Vcpu {
         Ok(())
     }
 
+    /// The byte at the guest's linear address `va`, through the guest's long-mode page tables
+    /// (4 or 5 levels). Not KVM_TRANSLATE: its walk is a supervisor access, which SMAP refuses
+    /// on a user page. `None` outside long mode, or for an address the tables do not map.
+    #[cfg(target_arch = "x86_64")]
+    fn guest_byte(&self, mem: &GuestMemoryMmap, va: u64) -> Option<u8> {
+        use vm_memory::Bytes;
+        const PRESENT: u64 = 1;
+        const PAGE_SIZE_BIT: u64 = 1 << 7;
+        const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
+        const EFER_LMA: u64 = 1 << 10;
+        const CR4_LA57: u64 = 1 << 12;
+
+        let sregs = self.fd.get_sregs().ok()?;
+        if sregs.efer & EFER_LMA == 0 {
+            return None;
+        }
+        let levels: u32 = if sregs.cr4 & CR4_LA57 != 0 { 5 } else { 4 };
+        let mut table = sregs.cr3 & ADDRESS;
+        for level in (1..=levels).rev() {
+            let shift = 12 + 9 * (level - 1);
+            let index = (va >> shift) & 0x1ff;
+            let entry: u64 = mem.read_obj(GuestAddress(table + index * 8)).ok()?;
+            if entry & PRESENT == 0 {
+                return None;
+            }
+            // A 1 GiB or 2 MiB page.
+            if (level == 3 || level == 2) && entry & PAGE_SIZE_BIT != 0 {
+                let size = 1u64 << shift;
+                let pa = (entry & ADDRESS & !(size - 1)) | (va & (size - 1));
+                return mem.read_obj(GuestAddress(pa)).ok();
+            }
+            table = entry & ADDRESS;
+        }
+        mem.read_obj(GuestAddress(table | (va & 0xfff))).ok()
+    }
+
+    /// Deliver a #DB of the guest's that this vCPU took ([`int1_workaround`]) as the hardware
+    /// would. An `int1` raises its #DB after the instruction, but this host reports it with RIP
+    /// still on the `int1`, so RIP moves past it first; any other #DB is delivered where it
+    /// came. Then DR6 takes the exit's bits, as KVM sets it when it delivers a #DB itself, and
+    /// KVM injects the #DB.
+    #[cfg(target_arch = "x86_64")]
+    fn step_over_int1(&self, debug: kvm_bindings::kvm_debug_exit_arch) -> Result<()> {
+        const INT1: u8 = 0xf1;
+        const DR6_ACTIVE_LOW: u64 = 0xffff_0ff0;
+        const DR6_TRAP_BITS: u64 = 0xf;
+        const DR6_RESERVED_12: u64 = 1 << 12;
+
+        let at_int1 = self
+            .int1_memory
+            .as_ref()
+            .and_then(|mem| self.guest_byte(mem, debug.pc))
+            == Some(INT1);
+        if at_int1 {
+            let mut regs = self.fd.get_regs().map_err(Error::VcpuStepInt1)?;
+            regs.rip += 1;
+            self.fd.set_regs(&regs).map_err(Error::VcpuStepInt1)?;
+        }
+        debug!(
+            "vcpu {}: #DB at {:#x}, dr6 {:#x}{}",
+            self.id,
+            debug.pc,
+            debug.dr6,
+            if at_int1 { ", stepped over int1" } else { "" }
+        );
+        // kvm_deliver_exception_payload's DR6 for a #DB.
+        let mut regs = self.fd.get_debug_regs().map_err(Error::VcpuStepInt1)?;
+        let payload = debug.dr6 ^ DR6_ACTIVE_LOW;
+        regs.dr6 = (regs.dr6 & !DR6_TRAP_BITS) | DR6_ACTIVE_LOW;
+        regs.dr6 |= payload;
+        regs.dr6 ^= payload & DR6_ACTIVE_LOW;
+        regs.dr6 &= !DR6_RESERVED_12;
+        self.fd.set_debug_regs(&regs).map_err(Error::VcpuStepInt1)?;
+        let inject = kvm_bindings::kvm_guest_debug {
+            control: kvm_bindings::KVM_GUESTDBG_ENABLE
+                | kvm_bindings::KVM_GUESTDBG_USE_HW_BP
+                | kvm_bindings::KVM_GUESTDBG_INJECT_DB,
+            ..Default::default()
+        };
+        self.fd
+            .set_guest_debug(&inject)
+            .map_err(Error::VcpuStepInt1)
+    }
+
     /// Runs the vCPU in KVM context and handles the kvm exit reason.
     ///
     /// Returns error or enum specifying whether emulation was handled or interrupted.
@@ -1674,6 +1812,12 @@ impl Vcpu {
                         hyperv.u.hcall.result =
                             arch::x86_64::linux::hyperv::HV_STATUS_INVALID_HYPERCALL_CODE;
                     }
+                    Ok(VcpuEmulation::Handled)
+                }
+                // A #DB of the guest's, on a host where this vCPU takes them (local patch).
+                #[cfg(target_arch = "x86_64")]
+                VcpuExit::Debug(debug) => {
+                    self.step_over_int1(debug)?;
                     Ok(VcpuEmulation::Handled)
                 }
                 VcpuExit::Hlt => {

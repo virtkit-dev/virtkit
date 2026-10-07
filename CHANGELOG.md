@@ -36,6 +36,9 @@ All notable changes to virtkit will be documented in this file.
   operating system's reach: PK, KEK, db and dbx change only through updates signed by the keys
   above them, and the guest's kernel can no longer rewrite them. Machines keep their variable
   files, and snapshots taken before restore as they did.
+- **Windows guests no longer hang on an AMD host that is itself a virtual machine** (WSL2,
+  Hyper-V, Azure): Windows stopped answering at a random time, a restored Windows 11 about a
+  quarter of an hour after its restore. There, the guest's hardware breakpoints are off.
 
 ## [0.86.0] - 2026-10-07
 
