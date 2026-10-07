@@ -26,6 +26,9 @@ ffi = []
 snapshot = ["dep:serde"]
 # A TPM 2.0 (virtkit's vk-tpm) behind a CRB interface.
 tpm = ["dep:vk-tpm", "dep:zeroize"]
+# The UEFI variable service (virtkit's vk-uefi-vars) behind edk2's uefi-vars register interface,
+# found through a fw_cfg file.
+uefi-vars = ["dep:vk-uefi-vars"]
 
 [dependencies]
 bitflags = "1.2.0"
@@ -57,6 +60,8 @@ zstd = "0.14"
 maybe-async = { version = "0.2", features = ["is_sync"] }
 # virtkit's TPM 2.0 engine, a crate of virtkit's workspace (local patch, see VENDOR.md).
 vk-tpm = { path = "../../../../vk-tpm", optional = true }
+# virtkit's UEFI variable service, a crate of virtkit's workspace (local patch, see VENDOR.md).
+vk-uefi-vars = { path = "../../../../vk-uefi-vars", optional = true }
 zeroize = { version = "1", optional = true }
 
 [target.'cfg(unix)'.dependencies]

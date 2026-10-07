@@ -680,6 +680,25 @@ VM that has no flash where the snapshot had one, or the reverse; its contents ar
 which the embedder keeps with the snapshot like the disks. Covered by tests replaying edk2's
 probe and its program and erase sequences.
 
+`src/devices/src/legacy/x86_64/{uefi_vars.rs,fw_cfg.rs}` + `src/devices/Cargo.toml` +
+`src/arch/src/x86_64/layout.rs` + `src/libkrun/{Cargo.toml,src/vmm/{builder.rs,snapshot.rs}}` —
+the UEFI variables on the host (`uefi-vars` feature), in place of the flash above for a machine
+that boots: virtkit's `vk-uefi-vars` (a path dependency on the crate in virtkit's workspace, as
+`vk-tpm` is; a change to its dependencies needs `cargo update -p vk-uefi-vars` here) keeps the
+variables in the same store file and checks authenticated writes, and the firmware's variable
+driver is edk2's client of such a service (VirtMmCommunicationDxe, as for QEMU's
+`uefi-vars-x64`). The device serves edk2's `QemuUefiVars.h` register interface at
+`UEFI_VARS_START` (0xFED50000, a page): magic, reset, and DMA transfers of the firmware's 64 KiB
+MM communication buffer, answered in place before the command's status reads back; a command
+that changed a non-volatile variable has the store file replaced (written whole, synced,
+renamed over it) first. The firmware finds the device through QEMU's fw_cfg, here its
+traditional I/O ports only (selector 0x510, data 0x511, no DMA) with one file,
+`etc/hardware-info` (a HardwareInfoTypeQemuUefiVars entry giving the address). A snapshot keeps
+the service's phase, volatile variables, policies and locks (`UefiVarsState`), its
+non-volatile variables being the file's; a snapshot taken with the flash has none, and restores
+with the flash, whose firmware its memory holds. Covered by vk-uefi-vars' tests and a fw_cfg
+directory test.
+
 `src/devices/src/legacy/x86_64/tpm.rs` + `src/devices/Cargo.toml` + `src/arch/src/x86_64/{acpi.rs,
 layout.rs,mod.rs}` + `src/libkrun/src/vmm/{builder.rs,resources.rs,snapshot.rs,mod.rs}` +
 `src/libkrun/src/api/vmm_builder.rs` — a TPM 2.0 (`tpm` feature): virtkit's `vk-tpm` engine (a

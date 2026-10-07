@@ -914,6 +914,7 @@ dependencies = [
  "vhost",
  "virtio-bindings",
  "vk-tpm",
+ "vk-uefi-vars",
  "vm-fdt",
  "vm-memory",
  "vmm-sys-util",
@@ -2031,6 +2032,16 @@ dependencies = [
  "sha2 0.11.0",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "vk-uefi-vars"
+version = "0.86.0"
+dependencies = [
+ "crypto-bigint",
+ "rsa",
+ "sha1",
+ "sha2 0.11.0",
 ]
 
 [[package]]

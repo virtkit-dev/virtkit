@@ -1,0 +1,85 @@
+diff --git a/OvmfPkg/CloudHv/CloudHvX64.dsc b/OvmfPkg/CloudHv/CloudHvX64.dsc
+index e64548d..900b33a 100644
+--- a/OvmfPkg/CloudHv/CloudHvX64.dsc
++++ b/OvmfPkg/CloudHv/CloudHvX64.dsc
+@@ -474,6 +474,13 @@
+ #
+ ################################################################################
+ [PcdsFeatureFlag]
++  #
++  # vk (local patch): the UEFI variables are the host's (vk's uefi-vars device); stop with a
++  # message rather than boot without them. VirtMmCommunicationDxe stops too unless the
++  # variable runtime cache is off.
++  #
++  gUefiOvmfPkgTokenSpaceGuid.PcdQemuVarsRequire|TRUE
++  gEfiMdeModulePkgTokenSpaceGuid.PcdEnableVariableRuntimeCache|FALSE
+   gEfiMdeModulePkgTokenSpaceGuid.PcdHiiOsRuntimeSupport|FALSE
+   gEfiMdeModulePkgTokenSpaceGuid.PcdDxeIplSupportUefiDecompress|FALSE
+   gEfiMdeModulePkgTokenSpaceGuid.PcdDxeIplSwitchToLongMode|FALSE
+@@ -906,21 +913,23 @@
+ !else
+ 
+   #
+-  # Variable driver stack (non-SMM)
++  # Variable driver stack (vk, local patch): the host's variable service (vk's uefi-vars device,
++  # as qemu's -device uefi-vars-x64), found through fw_cfg, which only this module reads.
+   #
+-  OvmfPkg/QemuFlashFvbServicesRuntimeDxe/FvbServicesRuntimeDxe.inf
+-  OvmfPkg/EmuVariableFvbRuntimeDxe/Fvb.inf {
+-    <LibraryClasses>
+-      PlatformFvbLib|OvmfPkg/Library/EmuVariableFvbLib/EmuVariableFvbLib.inf
+-  }
+-  MdeModulePkg/Universal/FaultTolerantWriteDxe/FaultTolerantWriteDxe.inf
+-  MdeModulePkg/Universal/Variable/RuntimeDxe/VariableRuntimeDxe.inf {
++  OvmfPkg/VirtMmCommunicationDxe/VirtMmCommunication.inf {
+     <LibraryClasses>
+-      NULL|MdeModulePkg/Library/VarCheckUefiLib/VarCheckUefiLib.inf
++      QemuFwCfgLib|OvmfPkg/Library/QemuFwCfgLib/QemuFwCfgDxeLib.inf
+   }
++  MdeModulePkg/Universal/Variable/RuntimeDxe/VariableSmmRuntimeDxe.inf
+ !endif
+ 
+   #
+   # TPM support
+   #
+ !include OvmfPkg/Include/Dsc/OvmfTpmComponentsDxe.dsc.inc
++
++  #
++  # vk (local patch): the MemoryOverwriteRequestControl (MOR) variable, which Windows'
++  # BitLocker expects with a TPM. MorLock stays unsupported.
++  #
++!include OvmfPkg/Include/Dsc/MorLock.dsc.inc
+diff --git a/OvmfPkg/CloudHv/CloudHvX64.fdf b/OvmfPkg/CloudHv/CloudHvX64.fdf
+index b698395..b0674d8 100644
+--- a/OvmfPkg/CloudHv/CloudHvX64.fdf
++++ b/OvmfPkg/CloudHv/CloudHvX64.fdf
+@@ -200,9 +200,6 @@ APRIORI DXE {
+   INF  MdeModulePkg/Universal/DevicePathDxe/DevicePathDxe.inf
+   INF  MdeModulePkg/Universal/PCD/Dxe/Pcd.inf
+   INF  OvmfPkg/AmdSevDxe/AmdSevDxe.inf
+-!if $(SMM_REQUIRE) == FALSE
+-  INF  OvmfPkg/QemuFlashFvbServicesRuntimeDxe/FvbServicesRuntimeDxe.inf
+-!endif
+ }
+ 
+ #
+@@ -326,16 +323,15 @@ INF  MdeModulePkg/Universal/Variable/RuntimeDxe/VariableSmmRuntimeDxe.inf
+ #
+ # Variable driver stack (non-SMM)
+ #
+-INF  OvmfPkg/QemuFlashFvbServicesRuntimeDxe/FvbServicesRuntimeDxe.inf
+-INF  OvmfPkg/EmuVariableFvbRuntimeDxe/Fvb.inf
+-INF  MdeModulePkg/Universal/FaultTolerantWriteDxe/FaultTolerantWriteDxe.inf
+-INF  MdeModulePkg/Universal/Variable/RuntimeDxe/VariableRuntimeDxe.inf
++INF  OvmfPkg/VirtMmCommunicationDxe/VirtMmCommunication.inf
++INF  MdeModulePkg/Universal/Variable/RuntimeDxe/VariableSmmRuntimeDxe.inf
+ !endif
+ 
+ #
+ # TPM support
+ #
+ !include OvmfPkg/Include/Fdf/OvmfTpmDxe.fdf.inc
++!include OvmfPkg/Include/Fdf/MorLock.fdf.inc
+ !include OvmfPkg/Include/Fdf/OvmfOptHw.fdf.inc
+ 
+ ################################################################################

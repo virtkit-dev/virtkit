@@ -12,6 +12,7 @@ members = [
     "vk-runnerctl",
     "vk-selfupdate",
     "vk-tpm",
+    "vk-uefi-vars",
     "bench",
 ]
 # third_party/libkrun is upstream libkrun's own cargo workspace (the 2.0 development branch),

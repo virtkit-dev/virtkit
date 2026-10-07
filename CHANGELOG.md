@@ -12,6 +12,15 @@ All notable changes to virtkit will be documented in this file.
   negotiates. Windows' virtio-net driver resets its device again when it finds a virtio-rng
   beside it; refused, it left the guest without network, so UEFI guests had gone without one. A
   snapshot taken without one still restores without one.
+- **The UEFI firmware has the `MemoryOverwriteRequestControl` (MOR) variable** that BitLocker
+  looks for with a TPM, which logged event 24629 without it: edk2's TCG MOR driver is in the
+  CloudHv build. MorLock stays unsupported.
+- **Windows can update its Secure Boot databases.** Windows' Secure Boot update task stopped
+  the guest with bug check 0x1E when it wrote dbx; the update now applies. vk keeps and checks
+  a Windows guest's UEFI variables itself, as a physical machine's firmware does out of the
+  operating system's reach: PK, KEK, db and dbx change only through updates signed by the keys
+  above them, and the guest's kernel can no longer rewrite them. Machines keep their variable
+  files, and snapshots taken before restore as they did.
 
 ## [0.86.0] - 2026-10-07
 

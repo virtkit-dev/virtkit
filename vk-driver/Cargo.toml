@@ -79,7 +79,7 @@ jemallocator.workspace = true
 path = "../third_party/libkrun/src/libkrun"
 package = "libkrun"
 default-features = false
-features = ["blk", "net", "snapshot", "tpm"]
+features = ["blk", "net", "snapshot", "tpm", "uefi-vars"]
 
 [features]
 default = ["embed"]

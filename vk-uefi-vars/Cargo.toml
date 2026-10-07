@@ -1,0 +1,28 @@
+[package]
+name = "vk-uefi-vars"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# The UEFI variable service a Windows guest's firmware calls on the host, behind libkrun's
+# uefi-vars device, instead of keeping and checking its variables itself. See
+# docs/uefi-vars-design.md. Crypto comes from RustCrypto crates only, never hand-rolled.
+[dependencies]
+crypto-bigint.workspace = true
+rsa.workspace = true
+# oid: the DigestInfo prefixes of RSASSA-PKCS1-v1_5 signatures.
+sha1 = { workspace = true, features = ["oid"] }
+sha2 = { workspace = true, features = ["oid"] }
+
+# Every byte this crate parses comes from the guest: a panic or an overflow is a VMM crash.
+[lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+
+[dev-dependencies]
+# Test keys: the host's CSPRNG for rsa's key generation and signing.
+getrandom = { workspace = true, features = ["sys_rng"] }

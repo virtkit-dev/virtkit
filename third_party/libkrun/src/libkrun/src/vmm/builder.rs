@@ -1152,8 +1152,12 @@ pub fn build_microvm(
     // Held for the snapshot's legacy devices; the MMIO bus keeps the device itself.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     #[cfg_attr(not(feature = "snapshot"), allow(unused_variables))]
-    let uefi_vars_flash =
-        attach_uefi_vars_flash(vm_resources.uefi_vars.as_deref(), &mut mmio_device_manager)?;
+    let (uefi_vars_flash, uefi_vars) = attach_uefi_vars(
+        vm_resources,
+        &guest_memory,
+        &mut mmio_device_manager,
+        &mut pio_device_manager,
+    )?;
     // Likewise the TPM.
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     #[cfg_attr(
@@ -1382,6 +1386,8 @@ pub fn build_microvm(
             flash: uefi_vars_flash,
             #[cfg(feature = "tpm")]
             tpm,
+            #[cfg(feature = "uefi-vars")]
+            uefi_vars,
         }),
         #[cfg(all(target_os = "linux", target_arch = "x86_64", feature = "snapshot"))]
         vm_generation_id: vm_resources.vm_generation_id,
@@ -2322,6 +2328,83 @@ fn attach_tpm(
         ))),
     }
 }
+
+/// The UEFI variables of a machine with a store file (local patch, see VENDOR.md): the variable
+/// service on the host (vk-uefi-vars) and the fw_cfg file the firmware finds it through, or,
+/// to restore a snapshot taken with it (whose firmware drives a flash) or without the
+/// `uefi-vars` feature, the variable store flash. Neither without a file.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[allow(clippy::type_complexity)]
+fn attach_uefi_vars(
+    vm_resources: &VmResources,
+    #[cfg_attr(not(feature = "uefi-vars"), allow(unused_variables))] guest_memory: &GuestMemoryMmap,
+    mmio_device_manager: &mut MMIODeviceManager,
+    #[cfg_attr(not(feature = "uefi-vars"), allow(unused_variables))]
+    pio_device_manager: &mut PortIODeviceManager,
+) -> std::result::Result<
+    (Option<Arc<Mutex<devices::legacy::Flash>>>, UefiVarsDevice),
+    StartMicrovmError,
+> {
+    let Some(path) = vm_resources.uefi_vars.as_deref() else {
+        return Ok((None, None));
+    };
+    #[cfg(feature = "snapshot")]
+    let saved = match &vm_resources.restore_from {
+        Some(dir) => Some(super::snapshot::read_state(dir).map_err(|e| {
+            StartMicrovmError::Restore(format!("the snapshot in {}: {e}", dir.display()))
+        })?),
+        None => None,
+    };
+    #[cfg(feature = "snapshot")]
+    let flash_snapshot = saved.as_ref().is_some_and(|s| s.legacy.flash.is_some());
+    #[cfg(not(feature = "snapshot"))]
+    let flash_snapshot = false;
+    #[cfg(feature = "uefi-vars")]
+    if !flash_snapshot {
+        #[cfg(feature = "snapshot")]
+        let state = saved.as_ref().and_then(|s| s.legacy.uefi_vars.clone());
+        #[cfg(not(feature = "snapshot"))]
+        let state = None;
+        let start = arch::x86_64::layout::UEFI_VARS_START;
+        let vars = devices::legacy::UefiVars::new(path, guest_memory.clone(), state.as_ref())
+            .map_err(StartMicrovmError::UefiVars)?;
+        let vars = Arc::new(Mutex::new(vars));
+        mmio_device_manager
+            .bus
+            .insert(vars.clone(), start, devices::legacy::UEFI_VARS_SIZE)
+            .map_err(|e| StartMicrovmError::UefiVars(io::Error::other(format!("{e:?}"))))?;
+        // HARDWARE_INFO_HEADER (type 2, QEMU UEFI vars; size) and SIMPLE_INFO (its address).
+        let mut info = Vec::new();
+        info.extend_from_slice(&2u64.to_le_bytes());
+        info.extend_from_slice(&8u64.to_le_bytes());
+        info.extend_from_slice(&start.to_le_bytes());
+        let fw_cfg = devices::legacy::FwCfg::new(vec![("etc/hardware-info".into(), info)]);
+        pio_device_manager
+            .io_bus
+            .insert(
+                Arc::new(Mutex::new(fw_cfg)),
+                devices::legacy::FW_CFG_PORT,
+                devices::legacy::FW_CFG_PORT_LEN,
+            )
+            .map_err(|e| StartMicrovmError::UefiVars(io::Error::other(format!("{e:?}"))))?;
+        return Ok((None, Some(vars)));
+    }
+    let _ = flash_snapshot;
+    Ok((
+        attach_uefi_vars_flash(Some(path), mmio_device_manager)?,
+        None,
+    ))
+}
+
+/// The UEFI variable service device, where the feature has one.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", feature = "uefi-vars"))]
+type UefiVarsDevice = Option<Arc<Mutex<devices::legacy::UefiVars>>>;
+#[cfg(all(
+    target_arch = "x86_64",
+    target_os = "linux",
+    not(feature = "uefi-vars")
+))]
+type UefiVarsDevice = Option<()>;
 
 /// The UEFI variable store flash over `path`, on the MMIO bus where the firmware looks for it
 /// (local patch, see VENDOR.md); none without a file.

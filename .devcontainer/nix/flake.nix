@@ -180,16 +180,20 @@
         # The UEFI firmware a Windows (UEFI) guest boots: edk2's OvmfPkg/CloudHv platform,
         # an ELF with a PVH entry point that libkrun loads like a kernel and hands the memory
         # map and ACPI tables. firmware/Dockerfile copies its CLOUDHV.fd into dist/. Built
-        # with TPM 2.0 support (libkrun's CRB TPM, measured boot), Secure Boot (without SMM,
-        # which libkrun lacks) and its variable store on a flash device of its own
-        # (firmware/cloudhv-flash-variables.patch), which libkrun backs with a file per machine.
+        # with TPM 2.0 support (libkrun's CRB TPM, measured boot) and Secure Boot (without SMM,
+        # which libkrun lacks). firmware/cloudhv-host-variables.patch, a configuration change
+        # only, swaps the platform's variable driver for edk2's client of a variable service on
+        # the host (VirtMmCommunicationDxe, as for qemu's uefi-vars device), which vk's
+        # vk-uefi-vars is, and adds the MemoryOverwriteRequestControl variable BitLocker looks
+        # for with a TPM. The derivation's default output keeps edk2's Build tree, with each
+        # module's .debug, for mapping a firmware fault to its source.
         packages.firmware =
           ((pkgs.OVMF-cloud-hypervisor.override {
             secureBoot = true;
             systemManagementModeRequired = false;
             tpmSupport = true;
           }).overrideAttrs (old: {
-            patches = (old.patches or [ ]) ++ [ ./firmware/cloudhv-flash-variables.patch ];
+            patches = (old.patches or [ ]) ++ [ ./firmware/cloudhv-host-variables.patch ];
           })).fd;
 
         # Variable store templates for that flash, from the QEMU OVMF build of the same

@@ -230,6 +230,10 @@ pub struct LegacyDevices {
     /// (`TpmCrb::new`), so [`LegacyDevices::restore`] only checks it is there.
     #[cfg(feature = "tpm")]
     pub tpm: Option<Arc<Mutex<devices::legacy::TpmCrb>>>,
+    /// The UEFI variable service, which a restore also starts on the snapshot's state
+    /// (`UefiVars::new`), its variables in its file like the flash's (local patch).
+    #[cfg(feature = "uefi-vars")]
+    pub uefi_vars: Option<Arc<Mutex<devices::legacy::UefiVars>>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -249,6 +253,14 @@ pub struct LegacyState {
     #[cfg(not(feature = "tpm"))]
     #[serde(default, skip_serializing)]
     pub tpm: Option<serde::de::IgnoredAny>,
+    /// The UEFI variable service's state (local patch). A snapshot taken with the variable
+    /// store flash has none, and restores with the flash.
+    #[cfg(feature = "uefi-vars")]
+    #[serde(default)]
+    pub uefi_vars: Option<devices::legacy::UefiVarsState>,
+    #[cfg(not(feature = "uefi-vars"))]
+    #[serde(default, skip_serializing)]
+    pub uefi_vars: Option<serde::de::IgnoredAny>,
 }
 
 impl LegacyDevices {
@@ -273,7 +285,21 @@ impl LegacyDevices {
                 .map(|tpm| tpm.lock().unwrap().save_state()),
             #[cfg(not(feature = "tpm"))]
             tpm: None,
+            #[cfg(feature = "uefi-vars")]
+            uefi_vars: self
+                .uefi_vars
+                .as_ref()
+                .map(|vars| vars.lock().unwrap().save_state()),
+            #[cfg(not(feature = "uefi-vars"))]
+            uefi_vars: None,
         })
+    }
+
+    fn has_uefi_vars(&self) -> bool {
+        #[cfg(feature = "uefi-vars")]
+        return self.uefi_vars.is_some();
+        #[cfg(not(feature = "uefi-vars"))]
+        false
     }
 
     fn has_tpm(&self) -> bool {
@@ -300,6 +326,11 @@ impl LegacyDevices {
                 self.flash.is_some(),
             ),
             ("TPM", state.tpm.is_some(), self.has_tpm()),
+            (
+                "UEFI variable service",
+                state.uefi_vars.is_some(),
+                self.has_uefi_vars(),
+            ),
         ];
         for (device, saved, here) in presence {
             if saved != here {
@@ -793,6 +824,8 @@ mod tests {
             flash: None,
             #[cfg(feature = "tpm")]
             tpm: None,
+            #[cfg(feature = "uefi-vars")]
+            uefi_vars: None,
         };
         let saved = devices(2).save().unwrap();
         devices(2).restore(&saved).unwrap();
@@ -819,6 +852,19 @@ mod tests {
         let with_tpm: LegacyState = serde_json::from_value(json).unwrap();
         let refused = devices(2).restore(&with_tpm).unwrap_err();
         assert!(refused.to_string().contains("has a TPM, the VM has none"));
+
+        // Nor without the UEFI variable service it has, with or without `uefi-vars`.
+        let mut json = serde_json::to_value(&saved).unwrap();
+        json["uefi_vars"] = serde_json::json!({
+            "status": 0, "buffer_size": 0, "dma": 0, "transient": []
+        });
+        let with_vars: LegacyState = serde_json::from_value(json).unwrap();
+        let refused = devices(2).restore(&with_vars).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("has a UEFI variable service, the VM has none")
+        );
     }
 
     #[test]
