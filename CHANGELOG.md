@@ -39,6 +39,9 @@ All notable changes to virtkit will be documented in this file.
   (`vk run … | head`, a `while read` loop that ended), a run now powers its guests off and
   ends, as `vk stop` would, where a compose run froze with its guests still running and
   `vk stop` could not end it. Its error output, if still open, keeps the run's last messages.
+- **A guest restored from a snapshot restarts from its disks.** Restarting it (from Windows,
+  or `vk reboot`) resumed the snapshot's memory again, over disks that had moved on since: the
+  guest hung, and its file system risked corruption. A restart now boots it afresh.
 
 ## [0.87.0] - 2026-10-10
 

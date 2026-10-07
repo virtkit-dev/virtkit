@@ -17,7 +17,7 @@
 //! dedicated thread waits for it and calls `VmmHandle::shutdown`, so nothing runs in a signal
 //! handler. When the spec allows reboot, [`keep`] wraps the boot in a relaunch loop so a guest
 //! reset (`KRUN_EXIT_GUEST_RESET`) reboots the VM in place — same pid and vsock socket for the
-//! supervisor.
+//! supervisor — afresh from its disks, a restored VM's snapshot used on its first boot only.
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsFd, BorrowedFd, IntoRawFd, OwnedFd};
@@ -173,9 +173,10 @@ fn path_str(path: &Path) -> Result<&str> {
         .with_context(|| format!("{} is not valid UTF-8", path.display()))
 }
 
-/// Boot `spec` under libkrun in this process. Returns only if setup fails; once the
-/// guest runs, libkrun ends the process with its exit code.
-fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>) -> Result<()> {
+/// Boot `spec` under libkrun in this process, resuming `spec.restore_from` only when `restore`.
+/// Returns only if setup fails; once the guest runs, libkrun ends the process with its exit
+/// code.
+fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>, restore: bool) -> Result<()> {
     // Before any thread exists, so every thread libkrun spawns inherits the mask and the
     // signal stays pending for the power-button thread.
     block_sigterm();
@@ -305,8 +306,8 @@ fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>) -> Result<()> {
         }
         devices.add(vsock);
     }
-    // virtio-rng: the guest's /dev/hwrng and early entropy. Off only to restore a snapshot
-    // taken without one.
+    // virtio-rng: the guest's /dev/hwrng and early entropy. Off only for a guest restored from
+    // a snapshot taken without one (its later boots too, after a reset).
     if spec.rng {
         devices.add(RngDevice::new().map_err(krun("rng"))?);
     }
@@ -358,7 +359,7 @@ fn boot(spec: &VmSpec, tap_fd: Option<&OwnedFd>) -> Result<()> {
         .map_err(krun("serial console"))?
         .vm_generation_id(spec.vm_generation_id)
         .map_err(krun("VM generation ID"))?;
-    let builder = match &spec.restore_from {
+    let builder = match spec.restore_from.as_ref().filter(|_| restore) {
         Some(dir) => builder.restore_from(dir.clone()),
         None => builder,
     };
@@ -609,8 +610,9 @@ fn press_power_button_on_sigterm(handle: VmmHandle, grace: Duration) -> Result<(
 /// Runs in the libkrun boot process (before any Tokio runtime, so `fork` is safe). The
 /// forked child runs [`boot`], which execs into libkrun and never returns; this parent
 /// waits for it and, on a guest reset ([`KRUN_EXIT_GUEST_RESET`]) or a host-driven hard
-/// reset (SIGUSR1), boots it again. A host SIGTERM is forwarded to the child (its ACPI
-/// power button) and stops the loop. Returns the process exit code to use.
+/// reset (SIGUSR1), boots it again, afresh: a snapshot it was restored from serves the first
+/// boot only. A host SIGTERM is forwarded to the child (its ACPI power button) and stops the
+/// loop. Returns the process exit code to use.
 pub fn keep(spec: &VmSpec) -> Result<i32> {
     // Claim the actual queue before any guest boots. Keep it across resets too: each boot
     // inherits this open description, so another VMM cannot take the tap in between.
@@ -622,12 +624,15 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
         // No in-place reboot: boot once. `boot` execs libkrun and never returns on a
         // normal end (libkrun `_exit`s with the guest's code), so this is effectively
         // the whole process; a return here means setup failed before the guest ran.
-        boot(spec, tap_fd.as_ref())?;
+        boot(spec, tap_fd.as_ref(), true)?;
         return Ok(0);
     }
 
     install_keeper_signals();
     let mut short_boots = 0u32;
+    // A restored VM resumes from its snapshot once; a reset boots it afresh, from its disks,
+    // which have moved on from the snapshot's memory since.
+    let mut restore = true;
     loop {
         // Stale listen sockets from the previous boot make libkrun's vsock bind fail
         // (EEXIST). Remove exactly the ones libkrun rebinds (listen=true) — never the
@@ -666,7 +671,7 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
                 libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
             }
-            let code = match boot(spec, tap_fd.as_ref()) {
+            let code = match boot(spec, tap_fd.as_ref(), restore) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("virtkit: libkrun boot: {e:#}");
@@ -703,6 +708,7 @@ pub fn keep(spec: &VmSpec) -> Result<i32> {
         } else {
             short_boots = 0;
         }
+        restore = false;
         eprintln!("virtkit: guest reset — rebooting");
     }
 }
