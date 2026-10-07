@@ -227,6 +227,8 @@ mod fake {
         calls: Vec<FakeCall>,
         refuse_submit: Option<DispatchError>,
         refuse_renew: Option<DispatchError>,
+        /// Job ID → reads of its view (`GET /v1/jobs/<id>`) started.
+        view_reads: HashMap<String, usize>,
     }
 
     impl Inner {
@@ -342,6 +344,11 @@ mod fake {
         /// Ends a reservation, as a lapsed lease or a lost node does.
         pub fn drop_reservation(&self, id: &str) {
             self.change(|i| i.reservations.remove(id));
+        }
+
+        /// Number of view reads started for job `id`.
+        pub fn view_reads(&self, id: &str) -> usize {
+            self.lock().view_reads.get(id).copied().unwrap_or(0)
         }
 
         pub fn calls(&self) -> Vec<FakeCall> {
@@ -547,6 +554,7 @@ mod fake {
             after: Option<u64>,
             wait: Duration,
         ) -> DispatchResult<JobView> {
+            *self.lock().view_reads.entry(id.to_owned()).or_default() += 1;
             let current = |i: &mut Inner| i.job_mut(id).map(|j| j.view.clone());
             self.poll(
                 Some(wait),

@@ -1632,6 +1632,16 @@ async fn follow<D: Dispatcher>(
     };
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut pump = std::pin::pin!(pump_output(shared, &hub_id, &trace));
+    // The job view's long poll outlives the loop's other wake-ups (the tick, output, GitLab's
+    // answers): made anew in each turn, it would be dropped mid-request every second, and
+    // with it the connection it held. After a failed read it waits for `view_at` first.
+    let (job_id, wait) = (&hub_id, hub.wait);
+    let poll_view = |after: u64, at: Instant| async move {
+        tokio::time::sleep_until(at).await;
+        shared.dispatcher.job(job_id, Some(after), wait).await
+    };
+    // Boxed instead of `pin!` so the future can be dropped when the loop ends.
+    let mut view_poll = Box::pin(poll_view(view.revision, view_at));
     loop {
         if output_done && view.state == HubJobState::Finished {
             break;
@@ -1650,10 +1660,7 @@ async fn follow<D: Dispatcher>(
                     view.result.get_or_insert(lost(e.message, trace.len() as u64));
                 }
             }
-            v = async {
-                tokio::time::sleep_until(view_at).await;
-                shared.dispatcher.job(&hub_id, Some(view.revision), hub.wait).await
-            }, if view.state != HubJobState::Finished => {
+            v = &mut view_poll, if view.state != HubJobState::Finished => {
                 match v {
                     Ok(v) => {
                         view_errors.ok();
@@ -1667,6 +1674,7 @@ async fn follow<D: Dispatcher>(
                         view_at = Instant::now() + view_errors.failed(&hub_id, "Reading the job from the hub", &e);
                     }
                 }
+                view_poll.set(poll_view(view.revision, view_at));
             }
             changed = remote.changed(), if remote_open => {
                 if changed.is_err() {
@@ -1703,6 +1711,8 @@ async fn follow<D: Dispatcher>(
             }
         }
     }
+    // An in-flight read would otherwise hold its connection through the reporting below.
+    drop(view_poll);
 
     if aborted_by_gitlab {
         // GitLab ended the job: stop it now and write nothing more.

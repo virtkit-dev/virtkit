@@ -48,6 +48,7 @@ both!(
     output_the_hub_lost_fails_the_job,
     abort_reports_a_job_the_hub_never_ends,
     a_failed_verify_is_retried_for_the_runner_id,
+    a_running_jobs_view_poll_outlives_the_tick,
 );
 
 async fn job_runs_and_reports(via: Via) {
@@ -518,5 +519,22 @@ async fn a_failed_verify_is_retried_for_the_runner_id(via: Via) {
     assert_eq!(h.fake.requests_to("/api/v4/runners/verify").len(), 2);
     h.hub.finish(&hub_id, None, None);
     h.final_update(29).await;
+    h.stop().await;
+}
+
+async fn a_running_jobs_view_poll_outlives_the_tick(via: Via) {
+    let mut h = Harness::unstarted(2, via).await;
+    h.options.hub.wait = Duration::from_secs(5);
+    h.daemon = h.spawn_daemon();
+    h.hub.set_slots("p1", 1);
+    h.gl.push_job(job_json(40));
+    let (hub_id, _) = h.accepted_job(1).await;
+    let reads = h.hub.view_reads(&hub_id);
+    // Three ticks of the follow loop, within one long poll.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let more = h.hub.view_reads(&hub_id) - reads;
+    assert!(more <= 1, "{more} reads of the job's view in 3 s");
+    h.hub.finish(&hub_id, None, None);
+    assert_eq!(h.final_update(40).await["state"], "success");
     h.stop().await;
 }
