@@ -472,6 +472,65 @@ fn a_private_authenticated_variable_keeps_its_signer() {
         Status::SUCCESS
     );
     assert_eq!(get(&svc, &VENDOR, "Mine").unwrap().1, b"three");
+    // A delete is a write: no signature, no delete.
+    assert_eq!(
+        svc.set_variable(&VENDOR, &name("Mine"), 0, &[]),
+        Status::SECURITY_VIOLATION
+    );
+    assert_eq!(get(&svc, &VENDOR, "Mine").unwrap().1, b"three");
+}
+
+#[test]
+fn the_secure_boot_keys_are_not_deleted_without_a_signature() {
+    let pk = signer("PK");
+    let kek = signer("KEK");
+    let mut svc = Service::new(image()).unwrap();
+    let g = GLOBAL_VARIABLE;
+    let db = IMAGE_SECURITY_DATABASE;
+    let data = authenticated("PK", &g, AUTH, 1, &pk.siglist(), None);
+    assert_eq!(
+        svc.set_variable(&g, &name("PK"), AUTH, &data),
+        Status::SUCCESS
+    );
+    let data = authenticated("KEK", &g, AUTH, 2, &kek.siglist(), Some(&pk));
+    assert_eq!(
+        svc.set_variable(&g, &name("KEK"), AUTH, &data),
+        Status::SUCCESS
+    );
+    let data = authenticated("db", &db, AUTH, 3, &kek.siglist(), Some(&kek));
+    assert_eq!(
+        svc.set_variable(&db, &name("db"), AUTH, &data),
+        Status::SUCCESS
+    );
+    // Attributes 0 (a delete), or a plain write without time-based authentication: refused,
+    // the keys stay, and so does user mode.
+    for (guid, n) in [(g, "PK"), (g, "KEK"), (db, "db")] {
+        assert_eq!(
+            svc.set_variable(&guid, &name(n), 0, &[]),
+            Status::INVALID_PARAMETER,
+            "{n}"
+        );
+        assert_eq!(
+            svc.set_variable(&guid, &name(n), NV_BS_RT, b"junk"),
+            Status::INVALID_PARAMETER,
+            "{n}"
+        );
+        assert!(get(&svc, &guid, n).is_some(), "{n} is gone");
+    }
+    assert_eq!(get(&svc, &g, "SetupMode").unwrap().1, [0]);
+    assert_eq!(get(&svc, &g, "SecureBoot").unwrap().1, [1]);
+    // The PK deletes itself only by a PK-signed empty write.
+    let unsigned = authenticated("PK", &g, AUTH, 4, &[], None);
+    assert_eq!(
+        svc.set_variable(&g, &name("PK"), AUTH, &unsigned),
+        Status::SECURITY_VIOLATION
+    );
+    let signed = authenticated("PK", &g, AUTH, 4, &[], Some(&pk));
+    assert_eq!(
+        svc.set_variable(&g, &name("PK"), AUTH, &signed),
+        Status::SUCCESS
+    );
+    assert_eq!(get(&svc, &g, "SetupMode").unwrap().1, [1]);
 }
 
 #[test]
