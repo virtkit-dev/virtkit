@@ -47,6 +47,10 @@ All notable changes to virtkit will be documented in this file.
 - **A Windows install no longer hangs for hours without its guest agent.** On a loaded host
   the agent's install could fail at the first logon; the install now retries it on its next
   boot. Cached Windows installs are rebuilt once.
+- **Windows guests wait out a slow host disk instead of failing their I/O.** A Windows guest
+  now waits over four minutes for a disk write, where on a slow or overloaded host disk it gave
+  up after a minute, and BitLocker encryption could then crash Windows. Cached Windows installs
+  are rebuilt once.
 
 ## [0.87.0] - 2026-10-10
 

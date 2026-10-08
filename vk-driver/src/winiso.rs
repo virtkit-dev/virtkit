@@ -695,6 +695,10 @@ Set-ItemProperty $wl AutoAdminLogon '0'
 Remove-ItemProperty $wl -Name DefaultPassword -ErrorAction SilentlyContinue
 Remove-Item C:\vk\*.msi -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName 'vk qemu-ga' -Confirm:$false -ErrorAction SilentlyContinue
+# A loaded host can take tens of seconds per write: past the disk's timeout (60 s in these
+# guests), Windows fails the I/O, and BitLocker's conversion then bug-checks. Wait as long as a VM
+# disk may take: 255 s, the most Microsoft documents.
+New-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\Disk -Name TimeOutValue -Value 255 -PropertyType DWord -Force | Out-Null
 # vk's network is identified (it has a gateway), so Windows files it as Public; a lab wants
 # Private. A startup task moves every non-domain profile there once the network is up.
 $fix = 'for ($i = 0; $i -lt 24; $i++) { Get-NetConnectionProfile | Where-Object NetworkCategory -ne DomainAuthenticated | Set-NetConnectionProfile -NetworkCategory Private; Start-Sleep 5 }'
@@ -858,6 +862,10 @@ mod tests {
             assert!(!answer.contains("@QEMU_GA_MSI@"), "{edition}");
         }
         assert!(SETTLE_PS1.contains("Unregister-ScheduledTask -TaskName 'vk qemu-ga'"));
+        // The settled layer waits on a slow disk rather than failing its I/O.
+        assert!(
+            SETTLE_PS1.contains(r"Services\Disk -Name TimeOutValue -Value 255 -PropertyType DWord")
+        );
     }
 
     #[test]
