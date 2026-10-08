@@ -44,6 +44,9 @@ All notable changes to virtkit will be documented in this file.
   guest hung, and its file system risked corruption. A restart now boots it afresh.
 - **A Windows guest snapshotted early in its boot restores.** A snapshot taken while Windows
   was starting, as of a guest stuck in a boot loop, failed to restore.
+- **A Windows install no longer hangs for hours without its guest agent.** On a loaded host
+  the agent's install could fail at the first logon; the install now retries it on its next
+  boot. Cached Windows installs are rebuilt once.
 
 ## [0.87.0] - 2026-10-10
 
