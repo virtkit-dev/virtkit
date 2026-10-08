@@ -33,6 +33,11 @@ All notable changes to virtkit will be documented in this file.
   then waited three hours on an agent that was not there. The first logon now leaves a startup
   task that installs qemu-ga again on the settle boot while its service is missing, which the
   settle step removes. The answer file changes, so a cached install is made anew.
+- **Windows guests wait out a slow host disk instead of failing their I/O.** On a host
+  whose disk took tens of seconds per write (a QLC SSD past its cache, under several guests),
+  Windows' disk class gave up after its 60 s and failed the I/O; BitLocker's conversion then
+  ended in a bug check (IRQL_GT_ZERO_AT_SYSTEM_SERVICE). The settle step of a Windows install
+  now sets the disk timeout to 300 s.
 - **A Windows snapshot taken before Windows set up its virtio-rng restores.** The firmware
   resets the device as it hands over to Windows, and the reset kept the features its driver
   had negotiated, which a fresh device does not have: a snapshot taken in that window, as of a
