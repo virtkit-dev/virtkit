@@ -563,8 +563,20 @@ impl Service {
             return checked;
         }
         let kind = auth::kind(guid, name);
-        if kind.is_some() && !time_based && attributes != 0 {
+        // PK, KEK and the signature databases change only through a time-based authenticated
+        // write, a delete included (edk2's ProcessVarWithPk): attributes 0 is no way around it.
+        if kind.is_some() && !time_based {
             return Status::INVALID_PARAMETER;
+        }
+        // Nor is any other time-based authenticated variable deleted without one, once it exists:
+        // write-protected, as edk2's ProcessVariable has it (a plain write of it fails earlier,
+        // its attributes not its own).
+        if !time_based
+            && existing
+                .as_ref()
+                .is_some_and(|v| v.attributes & TIME_BASED_AUTHENTICATED_WRITE_ACCESS != 0)
+        {
+            return Status::WRITE_PROTECTED;
         }
         // The signer records to store with the variable, when this write gives it an owner.
         let mut signers = None;
