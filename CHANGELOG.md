@@ -33,6 +33,12 @@ All notable changes to virtkit will be documented in this file.
   then waited three hours on an agent that was not there. The first logon now leaves a startup
   task that installs qemu-ga again on the settle boot while its service is missing, which the
   settle step removes. The answer file changes, so a cached install is made anew.
+- **A Windows guest's agent comes back after a busy boot.** When a boot was busy (servicing,
+  Windows Update, a loaded host), qemu-ga could miss its service start (event 7009) and stay
+  down until the next boot: vk then waited out its timeout on a guest that was up, as a
+  red-forest workstation did for 45 minutes after its domain join's restart. A Windows image
+  now gives services two minutes to start, and a startup task starts qemu-ga again while it is
+  stopped or stuck starting.
 - **Windows guests wait out a slow host disk instead of failing their I/O.** On a host
   whose disk took tens of seconds per write (a QLC SSD past its cache, under several guests),
   Windows' disk class gave up after its 60 s and failed the I/O; BitLocker's conversion then
