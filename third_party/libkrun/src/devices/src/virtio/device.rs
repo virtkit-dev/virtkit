@@ -241,6 +241,9 @@ impl VirtioTransportState {
         self.acked_features_select = 0;
         self.queue_select = 0;
         self.device_status = device_status::INIT;
+        // The driver's acked features go with the reset, as the spec has it, so a device reset
+        // and not yet set up again saves a fresh device's state (local patch, see VENDOR.md).
+        self.locked_device().set_acked_features(0);
         // Keep config_generation monotonic and reuse queue eventfds across reset.
         let mut queues = Self::create_queues(&self.queue_config);
         if let Some(gate) = &self.bus_master_gate {

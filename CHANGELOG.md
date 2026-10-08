@@ -42,6 +42,8 @@ All notable changes to virtkit will be documented in this file.
 - **A guest restored from a snapshot restarts from its disks.** Restarting it (from Windows,
   or `vk reboot`) resumed the snapshot's memory again, over disks that had moved on since: the
   guest hung, and its file system risked corruption. A restart now boots it afresh.
+- **A Windows guest snapshotted early in its boot restores.** A snapshot taken while Windows
+  was starting, as of a guest stuck in a boot loop, failed to restore.
 
 ## [0.87.0] - 2026-10-10
 
