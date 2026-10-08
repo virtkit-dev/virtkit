@@ -134,6 +134,16 @@ button.
   watchpoints in the guest do not fire. `tests/int1-e2e.sh` says whether a host has the fault.
 - **Secure Boot without SMM** guards the boot chain: the variables are out of the guest's reach
   now, but the firmware itself runs unprotected from the guest's kernel while it boots.
+- **Restarting Windows during BitLocker's first encryption on a saturated host disk can leave
+  it unbootable** (open, under investigation): with the host disk taking tens of seconds per
+  write (a QLC SSD past its cache, under several guests), a Windows 11 guest restarted
+  mid-conversion (`Enable-BitLocker -UsedSpaceOnly` with a TPM protector) often does not boot
+  again, with NTFS_FILE_SYSTEM, UNMOUNTABLE_BOOT_VOLUME or CRITICAL_SERVICE_FAILED
+  (0xC0000428). It predates the host-kept variables and the flushing stop (it reproduces on
+  0.86.0). The 255 s disk timeout vk sets at install (`Disk\TimeOutValue`) stops the I/O
+  errors and the bug check during the conversion, but not this failure. A restart under the
+  same load without the conversion boots, and a machine encrypted with the earlier firmware
+  keeps booting on this one.
 
 ## Secure Boot database updates
 
