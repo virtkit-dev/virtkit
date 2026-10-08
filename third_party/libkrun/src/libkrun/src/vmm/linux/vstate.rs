@@ -78,6 +78,33 @@ use super::tee::amdsnp::launch as snp;
 /// Signal number (SIGRTMIN) used to kick Vcpus.
 pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
 
+/// CET's CPUID bits: shadow stacks (leaf 7.0 ECX), indirect branch tracking (leaf 7.0 EDX), and
+/// the XSAVE components of its user and supervisor state (leaf 0xD.1 ECX).
+#[cfg(target_arch = "x86_64")]
+const LEAF7_ECX_SHSTK: u32 = 1 << 7;
+#[cfg(target_arch = "x86_64")]
+const LEAF7_EDX_IBT: u32 = 1 << 20;
+#[cfg(target_arch = "x86_64")]
+const XSS_CET_U: u32 = 1 << 11;
+#[cfg(target_arch = "x86_64")]
+const XSS_CET_S: u32 = 1 << 12;
+
+/// Hide CET from the guest (local patch, see VENDOR.md): a snapshot does not carry all of a
+/// CET guest's live state, and a guest restored from one bug-checked.
+#[cfg(target_arch = "x86_64")]
+fn hide_cet(cpuid: &mut CpuId) {
+    for entry in cpuid.as_mut_slice() {
+        match (entry.function, entry.index) {
+            (0x7, 0) => {
+                entry.ecx &= !LEAF7_ECX_SHSTK;
+                entry.edx &= !LEAF7_EDX_IBT;
+            }
+            (0xd, 1) => entry.ecx &= !(XSS_CET_U | XSS_CET_S),
+            _ => {}
+        }
+    }
+}
+
 /// Errors associated with the wrappers over KVM ioctls.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -1448,6 +1475,8 @@ impl Vcpu {
             }
         }
 
+        hide_cet(&mut self.cpuid);
+
         if vcpu_config.hyperv_enabled {
             use arch::x86_64::linux::hyperv;
             let off = match hyperv::apply(&self.fd, &mut self.cpuid) {
@@ -2622,6 +2651,51 @@ mod tests {
         assert_eq!(json(&again.lapic), json(&saved.lapic));
         assert_eq!(json(&again.xcrs), json(&saved.xcrs));
         assert_eq!(json(&again.cpuid), json(&saved.cpuid));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_guest_is_given_no_cet() {
+        let entry = |function, index, ecx, edx| kvm_cpuid_entry2 {
+            function,
+            index,
+            ecx,
+            edx,
+            ..Default::default()
+        };
+        let mut cpuid = CpuId::from_entries(&[
+            entry(0x7, 0, u32::MAX, u32::MAX),
+            entry(0x7, 1, u32::MAX, u32::MAX),
+            entry(0xd, 1, u32::MAX, u32::MAX),
+        ])
+        .unwrap();
+        hide_cet(&mut cpuid);
+        let got = cpuid.as_slice();
+        // Shadow stacks and IBT, nothing else of leaf 7.
+        assert_eq!(got[0].ecx, !LEAF7_ECX_SHSTK);
+        assert_eq!(got[0].edx, !LEAF7_EDX_IBT);
+        assert_eq!((got[1].ecx, got[1].edx), (u32::MAX, u32::MAX));
+        // Nor the XSAVE components of CET's user and supervisor state.
+        assert_eq!(got[2].ecx, !(XSS_CET_U | XSS_CET_S));
+        assert_eq!(got[2].edx, u32::MAX);
+    }
+
+    /// A configured vCPU runs without CET, whatever this host's KVM offers.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_configured_vcpu_runs_without_cet() {
+        let (_vm, vcpu, _mem) = configured_vcpu(false);
+        let cpuid = vcpu.fd.get_cpuid2(KVM_MAX_CPUID_ENTRIES).unwrap();
+        for e in cpuid.as_slice() {
+            match (e.function, e.index) {
+                (0x7, 0) => {
+                    assert_eq!(e.ecx & LEAF7_ECX_SHSTK, 0);
+                    assert_eq!(e.edx & LEAF7_EDX_IBT, 0);
+                }
+                (0xd, 1) => assert_eq!(e.ecx & (XSS_CET_U | XSS_CET_S), 0),
+                _ => {}
+            }
+        }
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]

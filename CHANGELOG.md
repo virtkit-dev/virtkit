@@ -55,6 +55,10 @@ All notable changes to virtkit will be documented in this file.
   could fail to start and stay down until the next restart, so vk waited out its timeout on a
   guest that was up. Windows images now give services longer to start and start the agent again
   when it failed. Cached Windows installs are rebuilt once.
+- **A Windows guest restored from its snapshot no longer crashes on a Linux 6.18 host** (WSL2's
+  kernel today), where it stopped with PAGE_FAULT_IN_NONPAGED_AREA within a minute. Guests no
+  longer get CET (hardware-enforced stack protection). Snapshots taken before this release still
+  crash on such a host: take them again.
 
 ## [0.87.0] - 2026-10-10
 
