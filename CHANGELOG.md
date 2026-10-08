@@ -27,6 +27,11 @@ All notable changes to virtkit will be documented in this file.
   negotiates. Windows' virtio-net driver resets its device again when it finds a virtio-rng
   beside it; refused, it left the guest without network, so UEFI guests had gone without one. A
   snapshot taken without one still restores without one.
+- **A Windows snapshot taken before Windows set up its virtio-rng restores.** The firmware
+  resets the device as it hands over to Windows, and the reset kept the features its driver
+  had negotiated, which a fresh device does not have: a snapshot taken in that window, as of a
+  guest stuck in a boot loop, failed to restore ("virtio device type 4 did not take its
+  snapshot state"). A reset now drops them, as the virtio spec has it.
 - **The UEFI firmware has the `MemoryOverwriteRequestControl` (MOR) variable** that BitLocker
   looks for with a TPM, which logged event 24629 without it: edk2's TCG MOR driver is in the
   CloudHv build. MorLock stays unsupported.

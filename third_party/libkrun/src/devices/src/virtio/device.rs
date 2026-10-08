@@ -241,6 +241,11 @@ impl VirtioTransportState {
         self.acked_features_select = 0;
         self.queue_select = 0;
         self.device_status = device_status::INIT;
+        // The features go with the rest of the negotiation, as the spec has it: a device reset
+        // and not yet set up again (Windows' virtio-rng between the firmware's ExitBootServices
+        // and its driver) must save the state a fresh device has, for a snapshot to restore
+        // (local patch).
+        self.locked_device().set_acked_features(0);
         // Keep config_generation monotonic and reuse queue eventfds across reset.
         let mut queues = Self::create_queues(&self.queue_config);
         if let Some(gate) = &self.bus_master_gate {

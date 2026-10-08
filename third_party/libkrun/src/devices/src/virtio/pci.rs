@@ -2390,6 +2390,25 @@ mod tests {
     }
 
     #[test]
+    fn a_transport_snapshotted_after_a_reset_restores() {
+        let (mut live, _) = transport_with_line();
+        let bar = drive_to_driver_ok(&mut live);
+        // The firmware's driver resets the device at ExitBootServices; the OS's has yet to
+        // set it up again.
+        write_bar(&mut live, bar, common_cfg::DEVICE_STATUS, &[0]);
+        let saved = live.save_state();
+        assert_eq!(saved.device_status, device_status::INIT);
+        assert_eq!(
+            saved.acked_features, 0,
+            "a reset drops the negotiated features"
+        );
+
+        let (mut fresh, _) = transport_with_line();
+        fresh.restore_state(&saved).unwrap();
+        assert_eq!(fresh.save_state(), saved);
+    }
+
+    #[test]
     fn a_restore_refuses_another_device_its_queue_count_or_a_state_it_cannot_reach() {
         let (mut live, _) = transport_with_line();
         drive_to_driver_ok(&mut live);

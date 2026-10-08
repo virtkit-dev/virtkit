@@ -617,7 +617,11 @@ holds in the restored memory, so a request taken but not finished is taken again
 for a disk, a duplicate frame for a NIC), and every ready queue is kicked and the guest
 interrupted once. The console's state is the ports the guest started, which a restore starts
 again (the start loop moved into `Console::start_ports`). Serializable behind a `snapshot`
-feature. Covered by a round trip through a fresh transport and the refusals in `pci.rs`.
+feature. Covered by a round trip through a fresh transport and the refusals in `pci.rs`. A
+device reset drops the features the driver acked, as the spec has it: a device reset and not
+yet set up again (Windows' virtio-rng between the firmware's ExitBootServices and its driver)
+saved them and restored without, so its snapshot did not restore. Covered by
+`a_transport_snapshotted_after_a_reset_restores`.
 
 `src/arch/src/x86_64/{acpi.rs,layout.rs}` + `src/devices/src/legacy/{acpi_pm.rs,i8042.rs,
 mod.rs,x86_64/{cmos.rs,serial.rs}}` + `src/libkrun/{Cargo.toml,src/api/vmm_builder.rs,
