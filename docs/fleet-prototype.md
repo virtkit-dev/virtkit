@@ -757,12 +757,14 @@ per identity every 10 minutes and 60 times an hour in all, so scripted refusals 
 the audit log; past that, it is logged to stderr only. A signed-out page carries a "Sign in
 with <issuer host>" button, as `/login` does without a token. It leads to `/auth/login`, which
 sends the browser to the provider with the authorization code flow — `state` in a `__Host-`,
-`SameSite=Lax` cookie bound to the browser, PKCE (S256), valid 5 minutes and single-use. The
-callback exchanges the code with the client secret and reads who signed in from UserInfo; it
-does not verify an ID token or send a nonce, as the state cookie and PKCE already bind the code
-to the browser and this client. It opens a session as a link does, with the identity — the
-email, or `sub <subject>` without one — beside the role. Signing out ends the hub's session
-alone, not the provider's.
+`SameSite=Lax` cookie bound to the browser, PKCE (S256), valid 5 minutes and single-use.
+Another site's page may open `/auth/login` only through top-level navigation
+(`Sec-Fetch-Mode: navigate`, `Sec-Fetch-Dest: document`), so a provider's application portal
+can use it as the application's login URL. The callback exchanges the code with the client
+secret and reads who signed in from UserInfo; it does not verify an ID token or send a nonce,
+as the state cookie and PKCE already bind the code to the browser and this client. It opens
+a session as a link does, with the identity — the email, or `sub <subject>` without one —
+beside the role. Signing out ends the hub's session alone, not the provider's.
 
 Sign-in links remain available for people the provider cannot sign in.
 `vk-hub ui login [--role viewer|operator] [--ttl 10m]` prints a link over the admin socket —

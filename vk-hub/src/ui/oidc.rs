@@ -6,8 +6,11 @@
 //! `__Host-` cookie that binds it to this browser; `GET /auth/callback` is where the provider
 //! sends it back, the redirect URI registered with the provider. The cookie is
 //! `SameSite=Lax`, as it has to arrive on that cross-site navigation, and the callback is
-//! exempt from the check that refuses another site's page for that reason. The callback opens
-//! a session for whom a grant in the database lets in
+//! exempt from the check that refuses another site's page for that reason. `/auth/login`
+//! accepts another site's page only through top-level navigation, as a provider's portal
+//! does. It redirects to the provider, with the state cookie binding the sign-in to this
+//! browser. This can replace another tab's login cookie, causing that sign-in to fail and
+//! require a restart. The callback opens a session for whom a grant in the database lets in
 //! ([`crate::store::Db::create_oidc_session`]), answering, as a link's sign-in does, with a
 //! page that moves on to `/` itself: the session cookie is `SameSite=Strict`, and a redirect
 //! would carry on the navigation the provider's page started. Anyone else is refused. Refusals,
@@ -146,12 +149,14 @@ impl OidcSignIn {
     }
 }
 
-/// `GET /auth/login`: on to the provider. Not for another site's page, as no page is.
+/// `GET /auth/login`: redirect to the provider. Another site's page may start a sign-in
+/// through top-level navigation, as a provider's portal does; images, frames and script
+/// requests are refused.
 pub async fn start(req: &Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     let Some(oidc) = &ui.oidc else {
         return Ok(message(StatusCode::NOT_FOUND, NOT_CONFIGURED));
     };
-    if from_another_site(req.headers()) {
+    if from_another_site(req.headers()) && !top_level_navigation(req.headers()) {
         return Ok(message(StatusCode::FORBIDDEN, ANOTHER_SITE));
     }
     let (url, state) = match oidc.client.login_url("/").await {
@@ -172,6 +177,13 @@ pub async fn start(req: &Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
         HeaderValue::from_str(&login_cookie(&state)).context("building the login cookie")?,
     );
     Ok(resp)
+}
+
+/// Whether the browser reports top-level navigation, such as following a link, rather than
+/// a subresource, frame or script request.
+fn top_level_navigation(headers: &HeaderMap) -> bool {
+    let is = |name: &str, value: &[u8]| headers.get(name).is_some_and(|v| v.as_bytes() == value);
+    is("sec-fetch-mode", b"navigate") && is("sec-fetch-dest", b"document")
 }
 
 /// `GET /auth/callback`: redeem the provider's code for who signed in, and open a session for

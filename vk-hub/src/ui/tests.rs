@@ -3540,7 +3540,7 @@ async fn anyone_may_view_with_the_star_grant() {
 
 /// The login cookie is what binds the callback to the browser that started the sign-in: a
 /// callback without it — a URL an attacker completed at the provider and handed over — opens
-/// nothing. Starting a sign-in is for no other site's page.
+/// nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oidc_callback_this_browser_did_not_start_opens_nothing() {
     let (addr, hub) = start_oidc(
@@ -3555,15 +3555,6 @@ async fn an_oidc_callback_this_browser_did_not_start_opens_nothing() {
     assert_eq!(reply.status, 400, "{}", reply.body);
     assert!(hub.db.ui_sessions(crate::now_secs()).unwrap().is_empty());
 
-    let reply = request(
-        addr,
-        "GET",
-        "/auth/login",
-        &["Sec-Fetch-Site: cross-site"],
-        "",
-    )
-    .await;
-    assert_eq!(reply.status, 403);
     // A refusal at the provider ends the login, and says so.
     let reply = request(
         addr,
@@ -3575,6 +3566,61 @@ async fn an_oidc_callback_this_browser_did_not_start_opens_nothing() {
     .await;
     assert_eq!(reply.status, 400);
     assert!(reply.body.contains("did not complete"), "{}", reply.body);
+}
+
+/// Another site's page starts a sign-in only as a tab's own navigation, as a provider's
+/// portal does; an image, a frame or a script's request is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_providers_portal_starts_an_oidc_sign_in_only_as_a_navigation() {
+    let (addr, _hub) = start_oidc(
+        serde_json::json!({"sub": "user-42", "email": "alice@example.com"}),
+        &[("alice@example.com", Role::Operator)],
+    )
+    .await;
+    for headers in [
+        &["Sec-Fetch-Site: cross-site"][..],
+        &[
+            "Sec-Fetch-Site: cross-site",
+            "Sec-Fetch-Mode: no-cors",
+            "Sec-Fetch-Dest: image",
+        ],
+        &[
+            "Sec-Fetch-Site: cross-site",
+            "Sec-Fetch-Mode: navigate",
+            "Sec-Fetch-Dest: iframe",
+        ],
+        &[
+            "Sec-Fetch-Site: cross-site",
+            "Sec-Fetch-Mode: navigate",
+            "Sec-Fetch-Dest: object",
+        ],
+        &[
+            "Sec-Fetch-Site: same-site",
+            "Sec-Fetch-Mode: cors",
+            "Sec-Fetch-Dest: empty",
+        ],
+    ] {
+        let reply = request(addr, "GET", "/auth/login", headers, "").await;
+        assert_eq!(reply.status, 403, "{headers:?}");
+        assert!(reply.header("set-cookie").is_none(), "{headers:?}");
+    }
+    for site in ["cross-site", "same-site"] {
+        let site = format!("Sec-Fetch-Site: {site}");
+        let headers = [
+            site.as_str(),
+            "Sec-Fetch-Mode: navigate",
+            "Sec-Fetch-Dest: document",
+        ];
+        let reply = request(addr, "GET", "/auth/login", &headers, "").await;
+        assert_eq!(reply.status, 302, "{site}: {}", reply.body);
+        assert!(reply.header("location").unwrap().contains("/authorize?"));
+        assert!(
+            reply
+                .header("set-cookie")
+                .is_some_and(|c| c.contains("__Host-vk-hub-login")),
+            "{site}"
+        );
+    }
 }
 
 /// Without `[oidc]`, neither address leads anywhere, and the pages say only how to get a link.

@@ -21,7 +21,8 @@
 //! is not a small form: [`operations`] reads it as it arrives, under limits of its own.
 //!
 //! **A page** (`GET`) goes only to a request the UI's own pages made (`same-origin`) or no
-//! page made (`none`: the address bar, a bookmark, a link opened from a terminal).
+//! page made (`none`: the address bar, a bookmark, a link opened from a terminal);
+//! `/auth/login` also goes to another site's top-level navigation ([`oidc`]).
 //! `SameSite=Strict` alone would not do: it sends the cookie with requests from another port
 //! of the same name, another origin but the same site.
 //!
@@ -321,6 +322,7 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
     match (method, path.as_str()) {
         (Method::GET, LOGIN_PATH) => Ok(login_page(&req, ui)),
         (Method::POST, LOGIN_PATH) => login(req, ui).await,
+        // Checks navigation headers itself to allow a provider's portal.
         (Method::GET, oidc::LOGIN_PATH) => oidc::start(&req, ui).await,
         // Exempt from the check below: the provider's page is another site's.
         (Method::GET, oidc::CALLBACK_PATH) => oidc::callback(&req, ui).await,

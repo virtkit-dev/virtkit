@@ -4,6 +4,13 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A provider's application portal can start a `vk-hub` OIDC sign-in.** `/auth/login`
+  accepts another site's page when the browser navigates the tab itself, so registering it
+  as the application's login URL, as Trustelem's portal does, no longer ends on a refusal
+  page; an image, a frame or a script's request is still refused.
+
 ## [0.86.1] - 2026-10-08
 
 ### Added
