@@ -1639,6 +1639,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The same race over an overlay whose backing image holds data, as a bundle's disk is: each
+    /// first write into a cluster copies the backing's other bytes in (copy-on-write). BitLocker
+    /// encrypting a volume rewrites every used sector in place this way, many to a cluster at
+    /// once. Every slice written must read back, and no other must fall back to the backing's.
+    #[test]
+    fn concurrent_writes_into_one_backed_qcow2_cluster_all_land() {
+        use imago::FormatCreateBuilder;
+        use imago::io_buffers::{IoVector, IoVectorMut};
+        use std::io::{IoSlice, IoSliceMut};
+
+        const CLUSTER: u64 = 64 * 1024;
+        const SLICE: u64 = 4096;
+        const THREADS: u64 = CLUSTER / SLICE;
+        const CLUSTERS: u64 = 8;
+        const BACKING: u8 = 0xee;
+
+        let dir = temp_dir("qcow2-backed-cluster-race");
+        std::fs::write(
+            dir.join("base.raw"),
+            vec![BACKING; (CLUSTER * CLUSTERS) as usize],
+        )
+        .unwrap();
+        let path = dir.join("overlay.qcow2");
+        let open_file =
+            || ImagoFile::open(StorageOpenOptions::new().write(true).filename(&path)).unwrap();
+        std::fs::File::create(&path).unwrap();
+        BoxedQcow2::create_builder(Box::new(open_file()))
+            .size(CLUSTER * CLUSTERS)
+            .backing("base.raw".into(), "raw".into())
+            .create()
+            .unwrap();
+        let fa: SharedImage = Arc::new(RwLock::new(FormatAccess::new(
+            open_qcow2_chain(Box::new(open_file()), true).unwrap(),
+        )));
+        let pattern = |c: u64, t: u64| ((c * THREADS + t) % 251 + 1) as u8;
+
+        // Every other slice, so the copy-on-write has backing bytes to carry between them.
+        for c in 0..CLUSTERS {
+            std::thread::scope(|scope| {
+                for t in (0..THREADS).step_by(2) {
+                    let fa = Arc::clone(&fa);
+                    scope.spawn(move || {
+                        let buf = vec![pattern(c, t); SLICE as usize];
+                        fa.read()
+                            .unwrap()
+                            .writev(
+                                IoVector::from(vec![IoSlice::new(&buf)]),
+                                c * CLUSTER + t * SLICE,
+                            )
+                            .unwrap();
+                    });
+                }
+            });
+        }
+        fa.read().unwrap().flush().unwrap();
+
+        for c in 0..CLUSTERS {
+            for t in 0..THREADS {
+                let mut got = vec![0u8; SLICE as usize];
+                fa.read()
+                    .unwrap()
+                    .readv(
+                        IoVectorMut::from(vec![IoSliceMut::new(&mut got)]),
+                        c * CLUSTER + t * SLICE,
+                    )
+                    .unwrap();
+                let want = if t % 2 == 0 { pattern(c, t) } else { BACKING };
+                assert_eq!(
+                    got,
+                    vec![want; SLICE as usize],
+                    "cluster {c}, slice {t} did not survive its concurrent neighbours"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Write-zeroes and a write can land in the same 64 KiB cluster in one batch (see
     /// `worker::IO_PARALLELISM`), and zeroing part of a cluster whose surroundings read as zero
     /// is done by mapping the whole cluster to zero — which erases a write that allocated that
