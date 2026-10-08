@@ -699,6 +699,15 @@ Unregister-ScheduledTask -TaskName 'vk qemu-ga' -Confirm:$false -ErrorAction Sil
 # guests), Windows fails the I/O, and BitLocker's conversion then bug-checks. Wait as long as a VM
 # disk may take: 255 s, the most Microsoft documents.
 New-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\Disk -Name TimeOutValue -Value 255 -PropertyType DWord -Force | Out-Null
+# On a busy boot (servicing, Windows Update, a loaded host) qemu-ga can miss its service start
+# (event 7009) and nothing starts it again: its agent stays silent until the next boot. Give
+# services longer to start, and have a startup task start qemu-ga again, for about ten minutes,
+# while it is stopped with a non-zero exit code (e.g. 1077, never started) or stuck starting past
+# that timeout. A stop with exit code 0 is a shutdown's, which it must leave alone.
+New-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Control -Name ServicesPipeTimeout -Value 120000 -PropertyType DWord -Force | Out-Null
+$watch = '$pending = 0; Start-Sleep 60; for ($i = 0; $i -lt 20; $i++) { $s = Get-CimInstance Win32_Service | Where-Object Name -eq QEMU-GA; if ($s) { if ($s.State -eq ''Start Pending'') { $pending++ } else { $pending = 0 }; if (($s.State -eq ''Stopped'' -and $s.ExitCode -ne 0) -or $pending -ge 5) { Stop-Process -Name qemu-ga -Force -ErrorAction SilentlyContinue; Start-Service QEMU-GA -ErrorAction SilentlyContinue; $pending = 0 } }; Start-Sleep 30 }'
+$action = New-ScheduledTaskAction -Execute powershell.exe -Argument "-NoProfile -NonInteractive -Command $watch"
+Register-ScheduledTask -TaskName 'vk qemu-ga watch' -Action $action -Trigger (New-ScheduledTaskTrigger -AtStartup) -User SYSTEM -RunLevel Highest -Force | Out-Null
 # vk's network is identified (it has a gateway), so Windows files it as Public; a lab wants
 # Private. A startup task moves every non-domain profile there once the network is up.
 $fix = 'for ($i = 0; $i -lt 24; $i++) { Get-NetConnectionProfile | Where-Object NetworkCategory -ne DomainAuthenticated | Set-NetConnectionProfile -NetworkCategory Private; Start-Sleep 5 }'
@@ -866,6 +875,16 @@ mod tests {
         assert!(
             SETTLE_PS1.contains(r"Services\Disk -Name TimeOutValue -Value 255 -PropertyType DWord")
         );
+        // And starts qemu-ga again when a busy boot made it miss its service start.
+        assert!(
+            SETTLE_PS1
+                .contains(r"Control -Name ServicesPipeTimeout -Value 120000 -PropertyType DWord")
+        );
+        let watch = SETTLE_PS1.find("Register-ScheduledTask -TaskName 'vk qemu-ga watch'");
+        assert!(watch.is_some_and(|at| SETTLE_PS1[..at].contains("Start-Service QEMU-GA")));
+        assert!(watch.is_some_and(|at| SETTLE_PS1[at..].contains("-AtStartup")));
+        // Never on a shutdown's clean stop (exit code 0).
+        assert!(SETTLE_PS1.contains("-eq ''Stopped'' -and $s.ExitCode -ne 0"));
     }
 
     #[test]

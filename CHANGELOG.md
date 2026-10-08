@@ -51,6 +51,10 @@ All notable changes to virtkit will be documented in this file.
   now waits over four minutes for a disk write, where on a slow or overloaded host disk it gave
   up after a minute, and BitLocker encryption could then crash Windows. Cached Windows installs
   are rebuilt once.
+- **A Windows guest's agent comes back after a slow boot.** On a busy boot the guest agent
+  could fail to start and stay down until the next restart, so vk waited out its timeout on a
+  guest that was up. Windows images now give services longer to start and start the agent again
+  when it failed. Cached Windows installs are rebuilt once.
 
 ## [0.87.0] - 2026-10-10
 
