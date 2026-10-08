@@ -311,7 +311,10 @@ impl Source {
         // The first logon installs virtio-win and qemu-ga. On a client the virtio-win package
         // updates drivers that only take over after a restart, the serial port's among them,
         // and qemu-ga's installer then waits on a service that cannot start: there qemu-ga
-        // goes first, on the drivers Setup installed.
+        // goes first, on the drivers Setup installed. On a loaded host its installer can still
+        // time out (its VSS provider's registration, error 1722, or its service's start, 1920)
+        // and roll back: a startup task installs it again on the settle boot while its service
+        // is missing, since without an agent that boot cannot even ask.
         let (first, second) = if self.is_client() {
             (QEMU_GA_MSI, VIRTIO_WIN_MSI)
         } else {
@@ -320,6 +323,7 @@ impl Source {
         ANSWER_TEMPLATE
             .replace("@FIRST_MSI@", first)
             .replace("@SECOND_MSI@", second)
+            .replace("@QEMU_GA_MSI@", QEMU_GA_MSI)
             .replace("@IMAGE_KEY@", key)
             .replace("@IMAGE_VALUE@", &value)
             .replace("@INSTALL_PASSWORD@", INSTALL_PASSWORD)
@@ -689,6 +693,7 @@ $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 Set-ItemProperty $wl AutoAdminLogon '0'
 Remove-ItemProperty $wl -Name DefaultPassword -ErrorAction SilentlyContinue
 Remove-Item C:\vk\*.msi -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName 'vk qemu-ga' -Confirm:$false -ErrorAction SilentlyContinue
 # vk's network is identified (it has a gateway), so Windows files it as Public; a lab wants
 # Private. A startup task moves every non-domain profile there once the network is up.
 $fix = 'for ($i = 0; $i -lt 24; $i++) { Get-NetConnectionProfile | Where-Object NetworkCategory -ne DomainAuthenticated | Set-NetConnectionProfile -NetworkCategory Private; Start-Sleep 5 }'
@@ -834,6 +839,24 @@ mod tests {
         assert!(!order(
             &source("Windows Server 2025 Standard Evaluation").answer_file()
         ));
+        // Both leave a startup task that installs qemu-ga again while its service is missing,
+        // registered before the first logon says it finished; the settle step removes it.
+        for edition in [
+            "Windows 11 Enterprise Evaluation",
+            "Windows Server 2025 Standard Evaluation",
+        ] {
+            let answer = source(edition).answer_file();
+            let task = answer
+                .find("Register-ScheduledTask -TaskName 'vk qemu-ga'")
+                .unwrap();
+            let retry = answer.find("Get-Service QEMU-GA").unwrap();
+            assert!(retry < task, "{edition}");
+            assert!(answer[retry..task].contains(&format!("/i C:\\vk\\{QEMU_GA_MSI} ")));
+            assert!(answer[task..].contains("-AtStartup"), "{edition}");
+            assert!(task < answer.find("install-done.txt").unwrap(), "{edition}");
+            assert!(!answer.contains("@QEMU_GA_MSI@"), "{edition}");
+        }
+        assert!(SETTLE_PS1.contains("Unregister-ScheduledTask -TaskName 'vk qemu-ga'"));
     }
 
     #[test]

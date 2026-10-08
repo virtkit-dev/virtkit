@@ -27,6 +27,12 @@ All notable changes to virtkit will be documented in this file.
   negotiates. Windows' virtio-net driver resets its device again when it finds a virtio-rng
   beside it; refused, it left the guest without network, so UEFI guests had gone without one. A
   snapshot taken without one still restores without one.
+- **A Windows install no longer ends up without its guest agent.** On a loaded host qemu-ga's
+  installer can time out at the first logon (its VSS provider's registration, error 1722, or
+  its service's start, 1920) and roll back; the install still finished, and the settle boot
+  then waited three hours on an agent that was not there. The first logon now leaves a startup
+  task that installs qemu-ga again on the settle boot while its service is missing, which the
+  settle step removes. The answer file changes, so a cached install is made anew.
 - **A Windows snapshot taken before Windows set up its virtio-rng restores.** The firmware
   resets the device as it hands over to Windows, and the reset kept the features its driver
   had negotiated, which a fresh device does not have: a snapshot taken in that window, as of a
