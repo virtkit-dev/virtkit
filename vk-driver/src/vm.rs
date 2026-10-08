@@ -14,12 +14,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::image::ResolvedImage;
 use crate::jobctx::JobCtx;
 
-/// The boot medium: a read-only base rootfs (booted through a CoW overlay) plus a
-/// self-booting image's own initrd, if it shipped one, and the image's runtime config
-/// (Env/User), applied at boot for a byte-clean generic bundle.
+/// The clean rootfs and runtime config the host agent boots through a CoW overlay.
 struct Media {
     rootfs: PathBuf,
-    initrd: Option<PathBuf>,
     config: Option<vk_core::runcfg::RunConfig>,
     /// A held reference on `rootfs`, for a base freshly resolved from the shared build tier
     /// (a `dockerfile:`/compose `build:` unit) — `None` for anything resolved through
@@ -32,22 +29,13 @@ struct Media {
 
 impl Media {
     fn files(&self) -> Vec<&Path> {
-        let mut v = vec![self.rootfs.as_path()];
-        v.extend(self.initrd.as_deref());
-        v
+        vec![self.rootfs.as_path()]
     }
 }
 
-/// What MICROVM_IMAGE resolved to: the boot files plus the two facts about the boot that
-/// only the resolve step knows. A struct rather than a tuple because `generic` and `nested`
-/// are both bare bools — positional, they are one transposition away from a silent swap.
+/// The resolved image and the compose primary's nesting policy.
 struct BootPlan {
-    /// `None` = boot vk's embedded kernel.
-    kernel: Option<PathBuf>,
     media: Media,
-    /// A generic boot: the embedded agent rides a preinit initramfs as `/init` and pivots,
-    /// rather than the image booting its own init.
-    generic: bool,
     /// The compose primary's own `x-virtkit.nested`; the boot ORs it with the runner's
     /// `[executor.vm] nested` through [`crate::run::effective_nested`]. False for every non-compose
     /// form: nothing else carries the marker.
@@ -455,8 +443,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     };
 
     // Resolve (and, for a `dockerfile:` image, build) the boot media in the runner-visible process;
-    // the supervisor re-resolves from the same env (a fingerprint hit for a build). A `None`
-    // kernel boots vk's embedded copy — nothing to stat.
+    // the supervisor re-resolves from the same env (a fingerprint hit for a build).
     let mut plan = resolve_media(ctx)?;
     // Every base this phase resolves or builds, held until prepare returns — same rationale as
     // `_checkout_use` above: nothing else protects a resolved base from the idle GC, and this
@@ -474,7 +461,7 @@ pub async fn prepare(ctx: &JobCtx) -> Result<()> {
     // Referenced first, then checked, so nothing can be evicted between the two. A base
     // already gone before this runs now reports itself from the acquisition rather than from
     // the check below, which is the cost of closing that window.
-    for p in plan.media.files().into_iter().chain(plan.kernel.as_deref()) {
+    for p in plan.media.files() {
         if !p.is_file() {
             bail!("image file missing: {}", p.display());
         }
@@ -643,8 +630,8 @@ async fn wait_for_services(ctx: &JobCtx, names: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Resolve MICROVM_IMAGE to the [`BootPlan`] the job VM boots: its kernel and media, plus
-/// whether the boot is generic and whether a compose primary asked to nest.
+/// Resolve MICROVM_IMAGE to the [`BootPlan`] the job VM boots: its media, plus
+/// whether a compose primary asked to nest.
 ///
 /// `MICROVM_IMAGE: dockerfile:<path>[#<stage>]` builds a **git-defined** image from the
 /// host-side checkout into the shared build tier and boots that; `compose:<file>#<primary>`
@@ -660,21 +647,12 @@ fn resolve_media(ctx: &JobCtx) -> Result<BootPlan> {
         return compose_unit_media(ctx, &fleet.units[fleet.primary]);
     }
     match crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image_ref)? {
-        ResolvedImage::Disk {
-            rootfs,
-            kernel,
-            initrd,
-            generic,
-            config,
-        } => Ok(BootPlan {
-            kernel,
+        ResolvedImage::Disk { rootfs, config } => Ok(BootPlan {
             media: Media {
                 rootfs,
-                initrd,
                 config,
                 use_guard: None,
             },
-            generic,
             // A plain image ref carries no compose marker; only `[executor.vm] nested` can grant it.
             nested: false,
         }),
@@ -688,14 +666,11 @@ fn resolve_media(ctx: &JobCtx) -> Result<BootPlan> {
 fn resolve_dockerfile_form(ctx: &JobCtx, spec: &str) -> Result<BootPlan> {
     let (rootfs, config, guard) = build_git_image(ctx, spec)?;
     Ok(BootPlan {
-        kernel: None,
         media: Media {
             rootfs,
-            initrd: None,
             config: Some(config),
             use_guard: Some(guard),
         },
-        generic: true,
         nested: false,
     })
 }
@@ -1114,38 +1089,27 @@ fn compose_unit_media(ctx: &JobCtx, unit: &crate::compose::Unit) -> Result<BootP
         crate::compose::Source::Build { .. } => {
             let (rootfs, config, guard) = build_compose_unit(ctx, unit)?;
             Ok(BootPlan {
-                kernel: None,
                 media: Media {
                     rootfs,
-                    initrd: None,
                     config: Some(config),
                     use_guard: Some(guard),
                 },
-                generic: true,
                 nested: unit.nested,
             })
         }
         crate::compose::Source::Image(image) => {
-            let crate::image::ResolvedImage::Disk {
-                rootfs,
-                kernel,
-                initrd,
-                generic,
-                config,
-            } = crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image)?;
+            let crate::image::ResolvedImage::Disk { rootfs, config } =
+                crate::image::resolve_ref(&ctx.cfg, ctx.cfg.state_dir(), image)?;
             let config = Some(crate::compose::merged_config(
                 &config.unwrap_or_default(),
                 unit,
             ));
             Ok(BootPlan {
-                kernel,
                 media: Media {
                     rootfs,
-                    initrd,
                     config,
                     use_guard: None,
                 },
-                generic,
                 nested: unit.nested,
             })
         }
@@ -1225,21 +1189,16 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         None
     };
     let BootPlan {
-        kernel: kernel_opt,
         mut media,
-        generic,
         nested: primary_nested,
     } = resolve_media(ctx)?;
     let (cpus, mem) = vm_size(ctx)?;
     // The agent and kernel back each guest boot (they ride the boot media) and any
     // service build; an embedded copy lives in a memfd whose path is valid only while
     // its handle is open — supervise runs for the job's whole life. `[build] agent`/
-    // `[build] kernel` override; a bundle that ships its own kernel resolves to that.
+    // `[build] kernel` override the embedded assets.
     let agent = crate::embed::resolve(crate::embed::Asset::Agent, cfg.build.agent.as_deref())?;
-    let kernel = crate::embed::resolve(
-        crate::embed::Asset::Kernel,
-        kernel_opt.as_deref().or(cfg.build.kernel.as_deref()),
-    )?;
+    let kernel = crate::embed::resolve(crate::embed::Asset::Kernel, cfg.build.kernel.as_deref())?;
     let mut children: Vec<std::process::Child> = Vec::new();
     // Remember the switch so `stop_helpers` can drain it after stopping the other helpers.
     // `None` unless `net.mode = "switch"`.
@@ -1271,39 +1230,16 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
     let overlay = ctx.overlay();
     crate::qcow2::create_overlay(&overlay, &media.rootfs)?;
 
-    let (mut cmdline, initramfs) = if generic {
-        // generic guest: the embedded agent rides a preinit initramfs as /init, pivots
-        // into the ext4 root on /dev/vda and serves the exec channel — the rootfs stays
-        // byte-clean (no baked agent), and the image's Env/User are applied from the
-        // bundle config. Same model `vk run -f`/`vk build` use.
-        let cpio = ctx.job_dir.join("initramfs.cpio");
-        crate::initramfs::build_agent_initramfs_with_config(
-            &agent.path,
-            media.config.as_ref(),
-            &cpio,
-        )
+    // The host agent and config ride a separate initramfs, never the root disk.
+    let cpio = ctx.job_dir.join("initramfs.cpio");
+    crate::initramfs::build_agent_initramfs_with_config(&agent.path, media.config.as_ref(), &cpio)
         .context("building the guest preinit initramfs")?;
-        (
-            format!(
-                "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
-                 VIRTKIT_HOSTNAME={} VIRTKIT_VSOCK_PORT={}",
-                cfg.executor.vm.hostname, cfg.executor.vm.vsock_port
-            ),
-            Some(cpio),
-        )
-    } else {
-        // self-booting image: virtkit-agent (baked) is PID 1, execs the image's captured
-        // entrypoint (VIRTKIT_MODE=service) which brings up systemd; the in-guest serve
-        // agent then runs as a systemd unit. The image ships its own initrd, if any.
-        (
-            format!(
-                "console=ttyS0 root=/dev/vda rw rootfstype=ext4 init=/usr/local/bin/vk-agent \
-                 VIRTKIT_MODE=service VIRTKIT_HOSTNAME={}",
-                cfg.executor.vm.hostname
-            ),
-            media.initrd.clone(),
-        )
-    };
+    let mut cmdline = format!(
+        "console=ttyS0 rdinit=/init VIRTKIT_PIVOT=/dev/vda \
+         VIRTKIT_HOSTNAME={} VIRTKIT_VSOCK_PORT={}",
+        cfg.executor.vm.hostname, cfg.executor.vm.vsock_port
+    );
+    let initramfs = Some(cpio);
 
     let mut shares: Vec<crate::vmm::FsShare> = Vec::new();
     // `[executor.vm] dax`: the window each directory share gets, so the guest reads a shared tree
@@ -1651,9 +1587,6 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         cmdline.push_str(&cfg.executor.vm.cmdline_extra);
     }
 
-    // kernel is common; the boot medium is the CoW disk overlay plus a
-    // self-booting image's initrd. A generic guest on the pinned kernel ships
-    // no initrd (virtio-blk + ext4 built in).
     // The overlay is deleted with the job, so it offers the guest no FLUSH: each fsync a
     // package manager or build tool issues per file would otherwise be a host fsync plus
     // qcow2 metadata writeback, for data nobody keeps.

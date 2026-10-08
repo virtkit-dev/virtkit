@@ -405,7 +405,7 @@ enum GitlabCmd {
 enum RegistryCmd {
     /// Push a local bundle dir to the [registry] repo at <name>:<tag>
     ///
-    /// The directory holds runner.ext4 + boot.kind [+ vmlinuz + initrd.img], and its
+    /// The directory holds runner.ext4 + boot.kind, optionally runner.ext4.json, and its
     /// blobs are stored with CDC+zstd chunk dedup.
     Push {
         /// Local bundle directory

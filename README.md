@@ -120,6 +120,12 @@ kept intentionally compact.
 starts a microVM, and executes either the requested command or a shell. By default the
 guest uses virtkit's embedded kernel and runs `vk-agent` as PID 1.
 
+Bundles must declare `generic-disk` in `boot.kind`; legacy `systemd` and unmarked
+bundles are rejected. Rebuild them with `vk build`. When packaging an ext4 manually,
+keep its generated `<out>.json` sidecar beside `runner.ext4` as `runner.ext4.json`.
+For an image that needs its own init, use compose `x-virtkit.init: image` or
+`entrypoint` (and `kernel: image` if needed); vk supplies the preinit agent and config.
+
 Use `--net` to allow guest egress. Networking is implemented by a userspace switch in
 the `vk` process, and outbound traffic leaves through ordinary host sockets. The host
 does not need a bridge, tap device, or firewall changes.

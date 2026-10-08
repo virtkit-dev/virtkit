@@ -154,7 +154,7 @@ struct BundleConfig {
     /// written at their offsets, the rest left as holes).
     total_size: u64,
     chunk_count: usize,
-    /// One of systemd|generic-disk|generic-cpio (the boot.kind string).
+    /// The supported boot kind: generic-disk.
     boot_kind: String,
     compression: String,
     has_kernel: bool,
@@ -180,7 +180,7 @@ fn bundle_config_from_dir(
 ) -> Result<BundleConfig> {
     let boot_kind = image::read_boot_kind(dir).with_context(|| {
         format!(
-            "bundle {}: unsupported boot.kind marker — re-push it",
+            "bundle {}: unsupported boot.kind (legacy systemd and unmarked bundles are retired) — rebuild with vk build and re-push",
             dir.display()
         )
     })?;
@@ -1303,6 +1303,9 @@ async fn push_async(
     let total_size = std::fs::metadata(&ext4)
         .with_context(|| format!("stat {}", ext4.display()))?
         .len();
+    let has_kernel = dir.join("vmlinuz").is_file();
+    let has_initrd = dir.join("initrd.img").is_file();
+    let mut config = bundle_config_from_dir(dir, total_size, 0, has_kernel, has_initrd)?;
 
     // CDC + per-chunk zstd, hole-aware: only the file's data extents are read and
     // chunked (the sparse free region — often most of the image — is skipped, the pull
@@ -1370,8 +1373,6 @@ async fn push_async(
     );
 
     // kernel/initrd, when present, as their own raw blobs (small; no chunking).
-    let has_kernel = dir.join("vmlinuz").is_file();
-    let has_initrd = dir.join("initrd.img").is_file();
     if has_kernel {
         layers.push(
             push_file(
@@ -1397,7 +1398,7 @@ async fn push_async(
         );
     }
 
-    let config = bundle_config_from_dir(dir, total_size, chunk_count, has_kernel, has_initrd)?;
+    config.chunk_count = chunk_count;
     let config_json = serde_json::to_vec(&config).context("serializing the bundle config")?;
     let config_digest = sha256_hex(&config_json);
     let config_desc = OciDescriptor {
@@ -1512,7 +1513,7 @@ async fn resolve_async(
         image::sweep_chunks(&registry_root);
     }
     let boot_kind = image::read_boot_kind(&dir).with_context(|| {
-        format!("registry bundle {name}@{digest}: unsupported boot.kind marker — re-push it")
+        format!("registry bundle {name}@{digest}: unsupported boot.kind (legacy systemd and unmarked bundles are retired) — rebuild with vk build and re-push")
     })?;
     println!("virtkit: image {name}@{digest} (registry bundle, {boot_kind:?})");
     Ok((image::resolved_from_dir(&dir, boot_kind), dir))
@@ -1550,6 +1551,9 @@ async fn pull_into(
     let config = pull_blob_bytes(client, image, &manifest.config, MAX_CONFIG_BLOB).await?;
     let config: BundleConfig =
         serde_json::from_slice(&config).context("parsing the bundle config blob")?;
+    image::parse_boot_kind(Some(&config.boot_kind)).with_context(|| {
+        format!("registry bundle {name}@{digest}: unsupported boot.kind (legacy systemd and unmarked bundles are retired) — rebuild with vk build and re-push")
+    })?;
 
     let tmp = staging_tmp(dir);
     let _ = std::fs::remove_dir_all(&tmp);
@@ -3061,6 +3065,9 @@ mod local {
         let total_size = std::fs::metadata(&ext4)
             .with_context(|| format!("stat {}", ext4.display()))?
             .len();
+        let has_kernel = dir.join("vmlinuz").is_file();
+        let has_initrd = dir.join("initrd.img").is_file();
+        let mut config = bundle_config_from_dir(dir, total_size, 0, has_kernel, has_initrd)?;
         let mut layers: Vec<OciDescriptor> = Vec::new();
         let regions = file_data_extents(&ext4, total_size)?;
         chunk_regions_into(
@@ -3072,8 +3079,6 @@ mod local {
         )?;
         // the ext4's chunks alone; the kernel/initrd blobs below are not chunk layers.
         let chunk_count = layers.len();
-        let has_kernel = dir.join("vmlinuz").is_file();
-        let has_initrd = dir.join("initrd.img").is_file();
         if has_kernel {
             layers.push(put_file(&store, &dir.join("vmlinuz"), KERNEL_MEDIA_TYPE)?);
         }
@@ -3084,7 +3089,7 @@ mod local {
                 INITRD_MEDIA_TYPE,
             )?);
         }
-        let config = bundle_config_from_dir(dir, total_size, chunk_count, has_kernel, has_initrd)?;
+        config.chunk_count = chunk_count;
         put_bundle_manifest(&store, name, tag, layers, config)
     }
 
@@ -4010,6 +4015,7 @@ mod tests {
         let bundle = dir.join("bundle");
         std::fs::create_dir_all(&bundle).unwrap();
         // an ext4 image, plus the two raw blobs `push_file` handles
+        std::fs::write(bundle.join("boot.kind"), "generic-disk").unwrap();
         std::fs::write(bundle.join("runner.ext4"), vec![3u8; 200_000]).unwrap();
         std::fs::write(bundle.join("vmlinuz"), b"kernel bytes").unwrap();
         std::fs::write(bundle.join("initrd.img"), b"initrd bytes").unwrap();
@@ -4249,6 +4255,53 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn retired_bundles_are_rejected_before_transferring_layers() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = retry_tmpdir("retired-bundle");
+        let root = dir.join("store");
+        let bundle = dir.join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        let ext4 = bundle.join("runner.ext4");
+        std::fs::write(&ext4, vec![7; 4096]).unwrap();
+        let store = std::sync::Arc::new(vk_registry::Store::new(root.clone()).unwrap());
+        let url = spawn_registry(std::sync::Arc::new(vk_registry::ServerState {
+            store: store.clone(),
+            upstreams: vec![],
+            locks: vk_registry::lock::LockManager::new(),
+            auth: vk_registry::Authenticator::Shared(vk_registry::auth::Auth::None),
+            tls: None,
+            webdav: true,
+        }));
+        let remote = Registry::for_share(url, true, None, String::new(), None, None, None);
+        for marker in [None, Some("systemd"), Some("generic-cpio")] {
+            if let Some(marker) = marker {
+                std::fs::write(bundle.join("boot.kind"), marker).unwrap();
+            }
+            let err = local::push_bundle(&root, &bundle, "legacy", "latest").unwrap_err();
+            assert!(err.to_string().contains("unsupported boot.kind"), "{err:#}");
+            let err =
+                block_on(push_async(&remote, &bundle, "legacy", "latest", false)).unwrap_err();
+            assert!(err.to_string().contains("unsupported boot.kind"), "{err:#}");
+            let stats = store.stats().unwrap();
+            assert_eq!(stats.identity_bytes + stats.zstd_bytes, 0);
+        }
+
+        // Seed an old bundle through the low-level cache writer, then try a fresh pull.
+        let digest = push_ext4(&local_registry(&root), "legacy", "old", &ext4, "systemd").unwrap();
+        let (client, auth) = client(&remote).unwrap();
+        let image = make_digest_ref(&remote, "legacy", &digest).unwrap();
+        let dest = dir.join("pulled");
+        let err = block_on(pull_into(
+            &client, &auth, &image, "legacy", &digest, &dest, "legacy",
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("unsupported boot.kind"), "{err:#}");
+        assert!(!dest.exists());
+        assert!(!staging_tmp(&dest).exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

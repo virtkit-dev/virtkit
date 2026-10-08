@@ -274,20 +274,9 @@ pub fn provision(
 ) -> Result<Provisioned> {
     let (ext4, config) = match &unit.source {
         crate::compose::Source::Image(image) => {
-            let crate::image::ResolvedImage::Disk {
-                rootfs,
-                generic,
-                config,
-                ..
-            } = crate::image::resolve_ref(cfg, state_dir, image)
-                .with_context(|| format!("service {}", unit.name))?;
-            if !generic {
-                bail!(
-                    "service {:?} resolves to a self-booting (systemd) image; a `services:` \
-                     image must be generic-disk",
-                    unit.name
-                );
-            }
+            let crate::image::ResolvedImage::Disk { rootfs, config, .. } =
+                crate::image::resolve_ref(cfg, state_dir, image)
+                    .with_context(|| format!("service {}", unit.name))?;
             (
                 rootfs,
                 crate::compose::merged_config(&config.unwrap_or_default(), unit),

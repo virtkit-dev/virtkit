@@ -32,8 +32,6 @@ use crate::config::Config;
 /// — which skips the pull/build — still knows how to boot it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootKind {
-    /// The image ships its own kernel + systemd (a self-booting ext4 bundle).
-    Systemd,
     /// Generic OCI image, booted from an ext4 disk on the pinned guest kernel,
     /// virtkit-agent as PID 1.
     GenericDisk,
@@ -41,20 +39,10 @@ pub enum BootKind {
 
 /// What `resolve` produced for a job's MICROVM_IMAGE.
 pub enum ResolvedImage {
-    /// A CoW ext4 rootfs booted off /dev/vda. `generic=false`: a self-booting
-    /// image — its own kernel + initrd, the agent (service mode) hands off to systemd.
-    /// `generic=true`: the embedded shared kernel (virtio+ext4 built in, so
-    /// `initrd=None`), the agent as PID 1, `ip=` networking.
-    /// `kernel=None` boots vk's embedded kernel (a kernel-less bundle / OCI image);
-    /// `Some(path)` boots a kernel the bundle ships.
+    /// A clean rootfs booted through the host agent's preinit initramfs.
     Disk {
         rootfs: PathBuf,
-        kernel: Option<PathBuf>,
-        initrd: Option<PathBuf>,
-        generic: bool,
-        /// The image's runtime config (Env/User/Workdir/Cmd), applied at boot so the guest
-        /// runs as the image intends. `None` for a bundle/image that ships no config sidecar
-        /// (an older bundle, or a self-booting systemd image that carries its own).
+        /// Runtime config from the sidecar; older bundles may lack it.
         config: Option<vk_core::runcfg::RunConfig>,
     },
 }
@@ -81,52 +69,18 @@ pub fn resolve_ref(cfg: &Config, state_dir: &Path, image_ref: &str) -> Result<Re
     }
 }
 
-/// Return a `ResolvedImage` from a cached/baked bundle dir, shared by the registry and
-/// local paths: the boot shape from the recorded `boot.kind`, and which kernel/initrd
-/// files the bundle ships. A bundle that ships no kernel boots vk's embedded one
-/// (`kernel=None`).
-pub(crate) fn resolved_from_dir(dir: &Path, kind: BootKind) -> ResolvedImage {
-    let rootfs = dir.join("runner.ext4");
-    let vmlinuz = dir.join("vmlinuz");
-    // The image's runtime config, written next to runner.ext4 by the bundle pull (from the
-    // manifest's run_config); the boot applies it. Absent for bundles built without it.
+/// Resolve a supported bundle. The host supplies its kernel and agent at boot.
+pub(crate) fn resolved_from_dir(dir: &Path, _kind: BootKind) -> ResolvedImage {
     let config = std::fs::read(dir.join("runner.ext4.json"))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
-    match kind {
-        // self-booting (systemd): the image's own kernel + initrd if it shipped
-        // one, otherwise the embedded shared kernel, booting the ext4 root directly.
-        BootKind::Systemd => {
-            let (kernel, initrd) = if vmlinuz.is_file() {
-                (Some(vmlinuz), Some(dir.join("initrd.img")))
-            } else {
-                (None, None)
-            };
-            ResolvedImage::Disk {
-                rootfs,
-                kernel,
-                initrd,
-                generic: false,
-                config,
-            }
-        }
-        // generic: the embedded shared kernel (virtio + ext4 built in), mounting the
-        // ext4 root directly.
-        BootKind::GenericDisk => ResolvedImage::Disk {
-            rootfs,
-            kernel: None,
-            initrd: None,
-            generic: true,
-            config,
-        },
+    ResolvedImage::Disk {
+        rootfs: dir.join("runner.ext4"),
+        config,
     }
 }
 
-/// Read the boot flavour from a bundle dir. An absent marker reads as systemd
-/// (bundles predating the marker); an unrecognised marker — e.g. the retired
-/// `generic-cpio` — reads as `None`, which callers treat as a stale bundle.
-/// The marker is trimmed before matching, so a file written with a trailing
-/// newline (e.g. `echo generic-disk > boot.kind`) is read correctly.
+/// Read the bundle marker. Missing and retired boot kinds are unsupported.
 pub(crate) fn read_boot_kind(dir: &Path) -> Option<BootKind> {
     parse_boot_kind(
         std::fs::read_to_string(dir.join("boot.kind"))
@@ -135,11 +89,10 @@ pub(crate) fn read_boot_kind(dir: &Path) -> Option<BootKind> {
     )
 }
 
-fn parse_boot_kind(marker: Option<&str>) -> Option<BootKind> {
+pub(crate) fn parse_boot_kind(marker: Option<&str>) -> Option<BootKind> {
     match marker.map(str::trim) {
-        None | Some("systemd") => Some(BootKind::Systemd),
         Some("generic-disk") => Some(BootKind::GenericDisk),
-        Some(_) => None,
+        _ => None,
     }
 }
 
@@ -147,7 +100,6 @@ fn parse_boot_kind(marker: Option<&str>) -> Option<BootKind> {
 /// config blob and the bundle marker record).
 pub(crate) fn boot_kind_tag(kind: BootKind) -> &'static str {
     match kind {
-        BootKind::Systemd => "systemd",
         BootKind::GenericDisk => "generic-disk",
     }
 }
@@ -773,12 +725,8 @@ mod tests {
             parse_boot_kind(Some("generic-disk\n")),
             Some(BootKind::GenericDisk)
         ));
-        assert!(matches!(
-            parse_boot_kind(Some("  systemd \n")),
-            Some(BootKind::Systemd)
-        ));
-        // absent marker -> legacy systemd bundle
-        assert!(matches!(parse_boot_kind(None), Some(BootKind::Systemd)));
+        assert!(parse_boot_kind(Some("  systemd \n")).is_none());
+        assert!(parse_boot_kind(None).is_none());
         // unknown markers (including the retired generic-cpio) -> stale bundle
         assert!(parse_boot_kind(Some("generic-cpio")).is_none());
         assert!(parse_boot_kind(Some("bogus")).is_none());

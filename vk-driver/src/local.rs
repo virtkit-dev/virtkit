@@ -3,11 +3,10 @@
 //! MICROVM_IMAGE is unset).
 //!
 //! Each `<[local] dir>/<name>/` is a baked bundle — a `runner.ext4`, a
-//! `boot.kind`, and OPTIONALLY a `vmlinuz` + `initrd.img` — produced by
-//! build-image.sh or pulled into place. Nothing is fetched: this is the
+//! `boot.kind` (`generic-disk`), and an optional `runner.ext4.json` config sidecar — built
+//! with `vk build` or pulled into place. Nothing is fetched: this is the
 //! on-disk counterpart of the registry/docker cached-dir path, resolved to a
-//! `ResolvedImage` exactly the same way (the boot shape from `boot.kind`,
-//! vk's embedded kernel for kernel-less bundles).
+//! `ResolvedImage` exactly the same way, booted on vk's embedded kernel.
 
 use anyhow::{Context, Result, bail};
 
@@ -27,14 +26,14 @@ pub fn resolve(cfg: &Config, state_dir: &Path, name: &str) -> Result<ResolvedIma
         );
     }
     let dir = cfg.local_dir_under(state_dir).join(name);
-    if !dir.join("runner.ext4").is_file() || !dir.join("boot.kind").is_file() {
+    if !dir.join("runner.ext4").is_file() {
         bail!(
-            "local image {name:?} not found at {} — bake it with build-image.sh or pull it",
+            "local image {name:?} not found at {} — build it with vk build or pull it",
             dir.display()
         );
     }
     let boot_kind = image::read_boot_kind(&dir).with_context(|| {
-        format!("local image {name:?}: unsupported boot.kind marker — rebuild the image")
+        format!("local image {name:?}: unsupported boot.kind (legacy systemd and unmarked bundles are retired) — rebuild with vk build")
     })?;
     println!("virtkit: image local/{name} ({boot_kind:?})");
     Ok(image::resolved_from_dir(&dir, boot_kind))

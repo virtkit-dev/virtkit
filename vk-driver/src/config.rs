@@ -543,7 +543,7 @@ pub struct Egress {
 #[serde(deny_unknown_fields, default)]
 pub struct Local {
     /// Directory of local guest bundles: each `<dir>/<name>/` is a bundle
-    /// (`runner.ext4` + `boot.kind` [+ `vmlinuz` + `initrd.img`]). Unset =
+    /// (`runner.ext4` + `boot.kind`, optionally `runner.ext4.json`). Unset =
     /// `<state_dir>/images` (see `Local::dir`).
     pub dir: Option<PathBuf>,
 }

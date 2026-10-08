@@ -4,6 +4,11 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Legacy `systemd` bundles are no longer supported.** Rebuild bundles with `vk build`;
+  use compose `init: image` or `init: entrypoint` for images that start their own init.
+
 ### Fixed
 
 - **`vk run` no longer drops an environment variable whose value holds a newline**, such as a
