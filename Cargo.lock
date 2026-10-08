@@ -4018,6 +4018,7 @@ dependencies = [
  "rand",
  "russh",
  "russh-sftp",
+ "serde_json",
  "simplelog",
  "tar",
  "tokio",

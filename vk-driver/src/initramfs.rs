@@ -100,8 +100,8 @@ pub fn build_fullvm_initramfs(
 
 /// Build a cpio initramfs at `out` from the rootfs tar streamed by `tar` (a single
 /// pass — no tar file needed), injecting each host file in `injects` at its guest
-/// path with the given mode (the agent PID 1, plus e.g. the captured
-/// `/etc/virtkit/{env,user}`). Hardlinks/device nodes/fifos are skipped — a generic
+/// path with the given mode (the agent PID 1, plus `vk run --ram`'s boot config).
+/// Hardlinks/device nodes/fifos are skipped — a generic
 /// rootfs (alpine, distroless) has none that matter for booting.
 pub fn build_initramfs_injecting(
     tar: impl Read,
@@ -116,6 +116,10 @@ pub fn build_initramfs_injecting(
         let mut e = entry?;
         let header = e.header();
         let mode = header.mode().unwrap_or(0o644) & 0o7777;
+        let owner = (
+            u32::try_from(header.uid()?).context("image uid exceeds the cpio format")?,
+            u32::try_from(header.gid()?).context("image gid exceeds the cpio format")?,
+        );
         let etype = header.entry_type();
         let path = e.path()?.to_string_lossy().into_owned();
         let name = path
@@ -126,14 +130,14 @@ pub fn build_initramfs_injecting(
             continue;
         }
         if etype.is_dir() {
-            cpio.dir(name, mode)?;
+            cpio.dir_owned(name, mode, owner)?;
         } else if etype.is_symlink() {
             if let Some(target) = e.link_name()? {
-                cpio.symlink(name, &target.to_string_lossy())?;
+                cpio.symlink(name, &target.to_string_lossy(), owner)?;
             }
         } else if etype.is_file() {
             let size = header.size()?;
-            cpio.file(name, mode, size as u32, &mut e)?;
+            cpio.file_owned(name, mode, size as u32, owner, &mut e)?;
         }
     }
 
@@ -151,6 +155,58 @@ pub fn build_initramfs_injecting(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ram_images_keep_archive_owners_and_inject_as_root() {
+        let tmp = std::env::temp_dir().join(format!("vk-initramfs-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, kind) in [
+            ("home/app", tar::EntryType::Directory),
+            ("home/app/value", tar::EntryType::Regular),
+            ("home/app/link", tar::EntryType::Symlink),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(0o700);
+            header.set_uid(1234);
+            header.set_gid(4321);
+            header.set_size(0);
+            if kind.is_symlink() {
+                header.set_link_name("value").unwrap();
+            }
+            header.set_cksum();
+            tar.append_data(&mut header, name, std::io::empty())
+                .unwrap();
+        }
+        let archive = tar.into_inner().unwrap();
+        let agent = tmp.join("agent");
+        std::fs::write(&agent, b"agent").unwrap();
+        let out = tmp.join("root.cpio");
+        build_initramfs_injecting(&archive[..], &[("init", &agent, 0o755)], &out).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let mut pos = 0;
+        let mut seen = 0;
+        loop {
+            assert_eq!(&bytes[pos..pos + 6], b"070701");
+            let field = |n: usize| {
+                let start = pos + 6 + n * 8;
+                usize::from_str_radix(std::str::from_utf8(&bytes[start..start + 8]).unwrap(), 16)
+                    .unwrap()
+            };
+            let (uid, gid, size, namesize) = (field(2), field(3), field(6), field(11));
+            let name = std::str::from_utf8(&bytes[pos + 110..pos + 110 + namesize - 1]).unwrap();
+            if name == "TRAILER!!!" {
+                break;
+            }
+            let owner = if name == "init" { (0, 0) } else { (1234, 4321) };
+            assert_eq!((uid, gid), owner, "{name}");
+            seen += 1;
+            pos = (pos + 110 + namesize).next_multiple_of(4) + size.next_multiple_of(4);
+        }
+        assert_eq!(seen, 4);
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
 
     #[test]
     fn agent_initramfs_carries_the_boot_config() {

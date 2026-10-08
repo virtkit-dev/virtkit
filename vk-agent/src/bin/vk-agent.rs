@@ -238,6 +238,12 @@ fn main() {
         let rest: Vec<String> = std::env::args().skip(2).collect();
         std::process::exit(vk_agent::tools::main(&rest));
     }
+    // The run's environment (no socket), for login shells and anything else the agent did not
+    // start: `vk-agent env --export|--print0|--exec`.
+    if std::env::args().nth(1).as_deref() == Some("env") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        std::process::exit(vk_agent::runenv::main(&rest));
+    }
     // The guest statistics sampler (no socket): init forks `vk-agent atop <dir>
     // <interval_secs>` at boot when the cmdline asks for it, and it appends atop-parseable
     // samples of this guest's /proc to the host archive share until SIGUSR2.

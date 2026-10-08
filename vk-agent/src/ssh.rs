@@ -633,6 +633,17 @@ fn login_env(command: &mut Command, user: &str, ru: &ResolvedUser) {
         Ok(None) => {}
         Err(e) => warn!("ssh: session environment ignored: {e:#}"),
     }
+    // /etc/profile may reset PATH before the login hook runs. Preserve the SSH
+    // session's chosen PATH so the hook restores that, including session overrides.
+    let path = command
+        .as_std()
+        .get_envs()
+        .find(|(k, _)| *k == "PATH")
+        .and_then(|(_, v)| v.map(std::ffi::OsStr::to_owned))
+        .or_else(|| std::env::var_os("PATH"));
+    if let Some(path) = path {
+        command.env("VIRTKIT_SSH_PATH", path);
+    }
 }
 
 /// The session environment file, when the host is the one that wrote it.

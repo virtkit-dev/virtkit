@@ -1,6 +1,7 @@
 //! Turn a local OCI image archive (the tar `buildctl --output type=oci` produces)
 //! directly into a bootable ext4 rootfs — flattening layers AND extracting the
-//! image config (Env/User/Entrypoint/Cmd) — with no docker/podman. This collapses
+//! image config (Env/User/WorkingDir/Entrypoint/Cmd) into the `<out>.json` sidecar every
+//! other conversion writes — with no docker/podman. This collapses
 //! the old `podman load → create → export → mkext-tar` chain into a single
 //! `buildctl … --output type=oci,dest=- | vk mkext-oci - out.ext4 …` pass.
 //!
@@ -11,6 +12,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -55,47 +57,26 @@ struct Manifest {
     layers: Vec<Descriptor>,
 }
 
-#[derive(Deserialize)]
-struct ConfigFile {
-    config: Option<ImageConfig>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct ImageConfig {
-    env: Option<Vec<String>>,
-    user: Option<String>,
-}
-
 /// Build an ext4 rootfs from a local OCI image archive.
 ///
 /// `archive` is the OCI tar (or "-" to read stdin, spooled to a temp file). The
-/// caller's `injects` (image-relative guest path, host path, octal mode) are
-/// applied alongside the auto-generated capture files derived from the image:
-/// `/etc/virtkit/{env,user}`, so the caller never needs podman. Shared by the
-/// `mkext-oci` CLI dispatch and the `build` subcommand.
+/// caller's `injects` (image-relative guest path, host path, octal mode) are the only
+/// files added to the image's own. Its runtime config goes to
+/// [`crate::build::config_sidecar`]`(out)`, for the boot to apply — never into the image.
+/// The `mkext-oci` CLI dispatch is its caller.
 pub(crate) fn archive_to_ext4(
     archive: &Path,
     out: &Path,
     injects: &[(&str, &Path, u16)],
-    env_files: &[PathBuf],
     extra_free_blocks: u64,
     fsid: &ext4::FsId,
 ) -> Result<()> {
-    // staging dir next to the output for the spooled archive, blob spill, and
-    // generated config files; removed on the way out. (The flattened rootfs is
+    // staging dir next to the output for the spooled archive and blob spill;
+    // removed on the way out. (The flattened rootfs is
     // streamed straight into the ext4 builder, not staged.)
     let work = out.with_extension("mkoci.tmp");
     std::fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
-    let r = build_inner(
-        archive,
-        out,
-        injects,
-        env_files,
-        extra_free_blocks,
-        fsid,
-        &work,
-    );
+    let r = build_inner(archive, out, injects, extra_free_blocks, fsid, &work);
     let _ = std::fs::remove_dir_all(&work);
     r
 }
@@ -104,7 +85,6 @@ fn build_inner(
     archive: &Path,
     out: &Path,
     injects: &[(&str, &Path, u16)],
-    env_files: &[PathBuf],
     extra_free_blocks: u64,
     fsid: &ext4::FsId,
     work: &Path,
@@ -148,32 +128,7 @@ fn build_inner(
     };
 
     let manifest: Manifest = ar.read_json(&blob_path(&manifest_digest))?;
-    let config: ConfigFile = ar.read_json(&blob_path(&manifest.config.digest))?;
-
-    // Auto-generate the env/user capture files (dropped by the layer flattening,
-    // restored at boot by the agent for serve boots) up front, so they are ready as
-    // injects before we start streaming the rootfs.
-    let ic = config.config.unwrap_or(ImageConfig {
-        env: None,
-        user: None,
-    });
-    let env_file = work.join("env");
-    let user_file = work.join("user");
-    std::fs::write(
-        &env_file,
-        render_env_with_files(ic.env.as_deref().unwrap_or(&[]), env_files)?,
-    )
-    .with_context(|| format!("writing {}", env_file.display()))?;
-    std::fs::write(
-        &user_file,
-        format!("{}\n", ic.user.as_deref().unwrap_or("")),
-    )
-    .with_context(|| format!("writing {}", user_file.display()))?;
-
-    // caller injects first, then the generated config files (image-relative paths).
-    let mut all: Vec<(&str, &Path, u16)> = injects.to_vec();
-    all.push(("etc/virtkit/env", env_file.as_path(), 0o644));
-    all.push(("etc/virtkit/user", user_file.as_path(), 0o644));
+    let config = run_config(&ar.read_json(&blob_path(&manifest.config.digest))?);
 
     // flatten layers in manifest order through the shared Merger.
     let mut merger = Merger::new(crate::scratch::scratch(work, "rootfs-spill")?.file);
@@ -190,7 +145,24 @@ fn build_inner(
     // block-rounding slack + a fixed margin (the image is sparse, so over-sizing
     // is free). inodes: one per entry plus the injects and headroom.
     let image_bytes = merger.data_bytes() + (entry_count as u64) * 4096 + 256 * 1024 * 1024;
-    let inodes = entry_count as u64 + all.len() as u64 + 4096;
+    let inodes = entry_count as u64 + injects.len() as u64 + 4096;
+
+    // Keep both output names in the same directory even if its path changes. Invalidate
+    // the old config before replacing the image, so a failed conversion cannot pair a
+    // new rootfs with the previous image's environment and user.
+    let parent = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let output_dir = vk_fs::open_dir(parent)?;
+    let anchored_out = PathBuf::from(format!("/proc/self/fd/{}", output_dir.as_raw_fd()))
+        .join(out.file_name().context("image output has no file name")?);
+    let sidecar = crate::build::config_sidecar(&anchored_out);
+    match std::fs::remove_file(&sidecar) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).context("removing the previous image config"),
+    }
 
     // Stream the flattened rootfs straight from the Merger into the ext4 builder
     // through an OS pipe — no intermediate rootfs tar on disk (saves a multi-GB
@@ -202,12 +174,12 @@ fn build_inner(
     });
     let build = ext4::build_from_tar_stream(
         BufReader::with_capacity(1 << 20, rd),
-        &all,
+        injects,
         image_bytes,
         extra_free_blocks,
         Some(inodes),
         fsid,
-        out,
+        &anchored_out,
     );
     // Surface the build error first (a writer BrokenPipe would just be its symptom);
     // otherwise propagate a merger failure. join() can't deadlock: when the ext4
@@ -218,8 +190,15 @@ fn build_inner(
         .map_err(|_| anyhow::anyhow!("rootfs merger thread panicked"))?;
     build?;
     let n = merged?;
+    vk_fs::write_atomic(&sidecar, config.to_json().as_bytes(), 0o600)
+        .with_context(|| format!("writing the config for {}", out.display()))?;
     println!("virtkit: flattened {layers_n} layers -> {n} entries");
     Ok(())
+}
+
+/// The runtime config of an OCI image config blob, as the other conversions read it.
+fn run_config(blob: &serde_json::Value) -> vk_core::runcfg::RunConfig {
+    crate::oci::parse_config_object(&blob["config"]).into()
 }
 
 const INDEX_PATH: &str = "index.json";
@@ -234,33 +213,6 @@ fn is_index(media_type: &str) -> bool {
 fn blob_path(digest: &str) -> String {
     let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
     format!("blobs/sha256/{hex}")
-}
-
-/// Render `/etc/virtkit/env`: raw KEY=VALUE lines, dropping any without `=` (the
-/// agent takes the rest of the line verbatim).
-fn render_env_file(env: &[String]) -> String {
-    let mut out = String::new();
-    for line in env {
-        if line.split_once('=').is_some() {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Render `/etc/virtkit/env` from the image-config env first, then each caller
-/// env-file's lines appended in order — all under the same `=`-only rule: lines
-/// without an `=` are dropped (blank lines and typical `#` comments).
-fn render_env_with_files(env: &[String], env_files: &[PathBuf]) -> Result<String> {
-    let mut out = render_env_file(env);
-    for ef in env_files {
-        let raw = std::fs::read_to_string(ef)
-            .with_context(|| format!("reading env-file {}", ef.display()))?;
-        let lines: Vec<String> = raw.lines().map(str::to_string).collect();
-        out.push_str(&render_env_file(&lines));
-    }
-    Ok(out)
 }
 
 /// Random-access reader over an OCI archive: a one-pass index of every blob's
@@ -423,9 +375,9 @@ mod tests {
         b.into_inner().unwrap()
     }
 
-    /// End-to-end of the parse + flatten + config-render path (no ext4 bytes):
+    /// End-to-end of the parse + flatten + config path (no ext4 bytes):
     /// the flattened rootfs must show the whiteout applied and the override won,
-    /// and the rendered env/user must match the image config.
+    /// and the runtime config must match the image config.
     #[test]
     fn parse_flatten_and_render() {
         let dir = std::env::temp_dir().join(format!("virtkit-mkoci-test-{}", std::process::id()));
@@ -441,7 +393,7 @@ mod tests {
         let manifest: Manifest = ar
             .read_json(&blob_path(&index.manifests[0].digest))
             .unwrap();
-        let config: ConfigFile = ar.read_json(&blob_path(&manifest.config.digest)).unwrap();
+        let config = run_config(&ar.read_json(&blob_path(&manifest.config.digest)).unwrap());
 
         // flatten through the shared Merger.
         let mut merger = Merger::new(crate::scratch::scratch(&dir, "test-spill").unwrap().file);
@@ -476,35 +428,68 @@ mod tests {
             "layer-2 override did not win"
         );
 
-        // config render.
-        let ic = config.config.unwrap();
+        // config.
         assert_eq!(
-            render_env_file(ic.env.as_deref().unwrap()),
-            "PATH=/usr/bin\nFOO=bar\n",
+            config.env,
+            [
+                ("PATH".to_string(), "/usr/bin".to_string()),
+                ("FOO".to_string(), "bar".to_string())
+            ],
             "malformed env line should be dropped"
         );
-        assert_eq!(format!("{}\n", ic.user.as_deref().unwrap()), "svc\n");
+        assert_eq!(config.user, "svc");
+        assert_eq!(config.entrypoint, ["/app/main", "--serve"]);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // An env-file appends its `=`-lines to the rendered image-config env, in order,
-    // dropping any non-`=` line (blanks, comments, bare tokens).
+    /// The image config lands in the sidecar beside the ext4, never in the image: no
+    /// /etc/virtkit in the rootfs.
     #[test]
-    fn env_file_appends_eq_lines_and_drops_others() {
-        let dir = std::env::temp_dir().join(format!("virtkit-envfile-test-{}", std::process::id()));
+    fn the_config_goes_to_the_sidecar_not_the_image() {
+        let dir = std::env::temp_dir().join(format!("virtkit-mkoci-ext4-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let ef = dir.join("dev.env");
-        std::fs::write(&ef, "FOO_TEST=bar\n# comment\nNOEQ\n\nBAZ=1\n").unwrap();
+        let archive_path = dir.join("image.tar");
+        std::fs::write(&archive_path, build_fixture()).unwrap();
+        let out = dir.join("out.ext4");
+        archive_to_ext4(&archive_path, &out, &[], 0, &ext4::FsId::default()).unwrap();
 
-        let image_env = vec!["PATH=/usr/bin".to_string()];
-        let rendered = render_env_with_files(&image_env, std::slice::from_ref(&ef)).unwrap();
-
-        // image-config env first, then the env-file's `=`-lines in order; NOEQ/comment/
-        // blank dropped.
-        assert_eq!(rendered, "PATH=/usr/bin\nFOO_TEST=bar\nBAZ=1\n");
-        assert!(!rendered.contains("NOEQ"));
+        let fs = crate::ext4_read::Ext4Reader::open(&out).unwrap();
+        assert_eq!(fs.read_file("/etc/keep.conf", 64).unwrap(), b"keep\n");
+        assert!(fs.lookup("/etc/virtkit").unwrap().is_none());
+        let config = crate::build::read_config_sidecar(&out).unwrap();
+        assert_eq!(config.user, "svc");
+        assert_eq!(config.env[1], ("FOO".to_string(), "bar".to_string()));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replacing_an_image_invalidates_config_without_following_sidecar_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("virtkit-mkoci-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let archive = dir.join("image.tar");
+        std::fs::write(&archive, build_fixture()).unwrap();
+        let out = dir.join("out.ext4");
+        let sidecar = crate::build::config_sidecar(&out);
+        let other = dir.join("unrelated");
+        std::fs::write(&other, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&other, &sidecar).unwrap();
+        archive_to_ext4(&archive, &out, &[], 0, &ext4::FsId::default()).unwrap();
+        assert_eq!(std::fs::read(&other).unwrap(), b"keep me");
+        assert!(std::fs::symlink_metadata(&sidecar).unwrap().is_file());
+        assert_eq!(
+            std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // Fail while replacing the image: its previous config must already be gone.
+        std::fs::remove_file(&out).unwrap();
+        std::fs::create_dir(&out).unwrap();
+        assert!(archive_to_ext4(&archive, &out, &[], 0, &ext4::FsId::default()).is_err());
+        assert!(!sidecar.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

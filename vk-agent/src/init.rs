@@ -4,16 +4,15 @@
 //! own entrypoint (`VIRTKIT_MODE=service`).
 //!
 //! Configuration comes from the kernel cmdline (the executor passes it; a guest
-//! booted `init=/usr/local/bin/vk-agent` gets no usable argv), from the boot
-//! initramfs, and from capture files written at image-conversion time:
+//! booted `init=/usr/local/bin/vk-agent` gets no usable argv) and from the boot
+//! initramfs:
 //!   /virtkit-service.json  (initramfs) the service's runtime config — env, user,
 //!                       workdir, entrypoint+cmd — merged by the host (image defaults
 //!                       + per-service overrides) and read *before* the pivot hides
-//!                       the initramfs. The image itself stays byte-clean. `vk run`
-//!                       puts its env there in a converted image's own root.
-//!   /etc/virtkit/env    image ENV (KEY=VALUE per line; lost by `docker export`)
-//!   /etc/virtkit/user   image USER: exported as VIRTKIT_DEFAULT_RUN_USER so served
-//!                       stages drop to it (serve mode)
+//!                       the initramfs. The image itself stays byte-clean. Its env is
+//!                       published for login shells under /run/vk (see `runenv`).
+//!   /etc/virtkit/{env,user}  image ENV and USER as older vk wrote them into a converted
+//!                       image; still read, under the boot config, when present
 //!
 //! Cmdline params (all VIRTKIT_*):
 //!   VIRTKIT_VSOCK_PORT   serve agent's vsock port (default 4444)
@@ -135,7 +134,6 @@ const SSH_VSOCK_PORT: u32 = 2222;
 /// Guest-side SSH_AUTH_SOCK the forwarder binds (on the /run tmpfs, never in the image).
 const SSH_AGENT_SOCK: &str = "/run/virtkit-ssh-agent.sock";
 const HOST_EXEC_AGENT_SOURCE: &str = "/proc/1/exe";
-const HOST_EXEC_AGENT_BIN: &str = "/run/vk/bin/vk-agent";
 
 /// Entry point for `… init`. Sets the guest up, then serves (default) or execs the
 /// image entrypoint (VIRTKIT_MODE=service).
@@ -191,11 +189,11 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     bring_up_loopback();
     set_hostname(&cmdline);
     write_self_hosts(&cmdline);
-    load_image_env(); // so served/exec'd commands inherit the image PATH etc.
+    let legacy_env = load_legacy_image_env(); // so served/exec'd commands inherit the image PATH
     export_default_run_user(); // so served stages drop to the image's USER
     apply_boot_config(boot_config.as_ref()); // the boot config wins over any capture
     ensure_home_for_default_user(); // default user's passwd HOME, not the kernel's inherited /
-    materialize_env(boot_config.as_ref()); // persist the merged env for login shells
+    publish_env(boot_config.as_ref(), legacy_env, &cmdline); // the merged env, for login shells
     // Filesystems to freeze clean at poweroff: disk volumes and any persistent overlay uppers
     // (both host-backed ext4); see [`DISK_MOUNTS`].
     let mut disk_freeze = mount_virtiofs(&cmdline)?;
@@ -283,9 +281,9 @@ fn pivot_to_real_root() -> Result<bool> {
 /// What is applied is that list and nothing more — whatever takes PID 1 next brings the
 /// rest of the machine up itself (/dev/pts, /run, loopback, tmpfs scratch), the way an init
 /// does. An entrypoint that needs those *without* exec'ing an init belongs in
-/// `VIRTKIT_MODE=service`, which sets them up and forks it. /run is the one exception, and
-/// only under `--compose`: the control fs mounted in it has to outlive the handoff, so
-/// [`claim_run_tmpfs`] gets there first.
+/// `VIRTKIT_MODE=service`, which sets them up and forks it. `/run` is the exception when
+/// the boot publishes environment files, a compose control fs or socket volumes there:
+/// [`claim_run_tmpfs`] mounts it first so those survive the handoff.
 ///
 /// Any modular image kernel's boot-critical modules are already loaded by the caller
 /// (`run_init`) before this runs — they must precede the pivot, which mounts the ext4
@@ -343,10 +341,13 @@ fn run_full_vm(
     // harmless (it never shadows a *.lan DNS answer), and what the default path already does.
     set_hostname(cmdline);
     write_self_hosts(cmdline);
-    load_image_env();
+    let legacy_env = load_legacy_image_env();
+    export_default_run_user();
     apply_boot_config(cfg);
-    materialize_env(cfg);
-    claim_run_tmpfs(cmdline); // before the shares: a volume under /run must land on that tmpfs
+    // Before the shares: a volume under /run must land on that tmpfs. Before the environment
+    // is published there, too.
+    claim_run_tmpfs(cmdline, cfg.is_some());
+    publish_env(cfg, legacy_env, cmdline);
     let mut disk_freeze = mount_virtiofs(cmdline)?;
     disk_freeze.extend(mount_disks(cmdline)?);
     let _ = DISK_MOUNTS.set(disk_freeze);
@@ -859,16 +860,14 @@ fn mount_data(
 /// Mount the RAM scratch dirs named on the cmdline (VIRTKIT_TMPFS=/path:size[,/path:size],
 /// e.g. /builds:64G). For job scratch (CI clones into /builds): guest memory is allocated
 /// on demand and returned to the host when the VM is torn down, so an over-sized cap is
-/// free. Each dir is chowned to the captured run-user (the image USER) so a job stage
+/// free. Each dir is chowned to the run user (the image USER) so a job stage
 /// running as that user can write into it. Runs before the payload (service/systemd) so
 /// the mounts are already in place.
 fn apply_tmpfs(cmdline: &HashMap<String, String>) {
     let Some(spec) = cmdline.get("VIRTKIT_TMPFS") else {
         return;
     };
-    let user = std::fs::read_to_string("/etc/virtkit/user")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
+    let user = std::env::var("VIRTKIT_DEFAULT_RUN_USER").unwrap_or_default();
     for entry in spec.split(',').filter(|e| !e.is_empty()) {
         let Some((path, size)) = parse_tmpfs_entry(entry) else {
             warn!("vk-agent init: bad VIRTKIT_TMPFS entry {entry:?} (want /path:size)");
@@ -1072,34 +1071,45 @@ fn pin_lan_hosts(hosts: &str, spec: Option<&str>) -> String {
     out
 }
 
-/// Load the image's ENV from /etc/virtkit/env (one KEY=VALUE per line) into our own
-/// environment, so the serve agent and any exec'd command inherit it (PATH, etc.).
-fn load_image_env() {
+/// Load the image ENV an older vk wrote into a converted image (/etc/virtkit/env, one
+/// KEY=VALUE per line) into our own environment, so the serve agent and any exec'd command
+/// inherit it, and return it for [`publish_env`]. Today's vk carries the image config in the
+/// boot config instead and leaves the image byte-clean; this read, and
+/// [`export_default_run_user`]'s, can go once no image converted by vk 0.86 or older — a bundle
+/// already pushed, say — is still booted.
+fn load_legacy_image_env() -> Vec<(String, String)> {
     let Ok(text) = std::fs::read_to_string("/etc/virtkit/env") else {
-        return;
+        return Vec::new();
     };
+    let mut env = Vec::new();
     for line in text.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            set_env(k, v);
+        if let Some((k, v)) = line.split_once('=')
+            && set_env(k, v)
+        {
+            env.push((k.to_string(), v.to_string()));
         }
     }
+    env
 }
 
 /// `std::env::set_var`, minus its panic — this is PID 1 — on a name it cannot set: such an
-/// entry is skipped with a warning naming it.
-fn set_env(k: &str, v: &str) {
+/// entry is skipped with a warning naming it, and `false` returned.
+fn set_env(k: &str, v: &str) -> bool {
     if k.is_empty() || k.contains(['=', '\0']) || v.contains('\0') {
         warn!("vk-agent init: env var {k:?} cannot be set, skipped");
-        return;
+        return false;
     }
     // SAFETY: called only from the single-threaded init, before any fork.
     unsafe { std::env::set_var(k, v) };
+    true
 }
 
-/// Export the image's USER (captured into /etc/virtkit/user) as
+/// Export the image USER an older vk wrote into a converted image (/etc/virtkit/user) as
 /// VIRTKIT_DEFAULT_RUN_USER, so the serve agent's exec server drops each stage to it
 /// — a generic guest then runs like `docker run` would. Empty/root is left unset (the
-/// agent already runs as root). The serve child inherits this env across the fork.
+/// agent already runs as root). The serve child inherits this env across the fork. A boot
+/// config's user wins ([`apply_boot_config`]); see [`load_legacy_image_env`] for when this
+/// can go.
 fn export_default_run_user() {
     let user = std::fs::read_to_string("/etc/virtkit/user")
         .map(|s| s.trim().to_string())
@@ -1156,12 +1166,19 @@ fn home_for_default_user(
         .map(std::path::PathBuf::from)
 }
 
-/// The boot-time config carried in the agent initramfs or a converted image's root.
-/// `None` when the boot carries no config or it fails to parse.
-/// Must run before the pivot: the initramfs is hidden underneath afterwards.
+/// The boot-time service config carried in the agent initramfs — `None` when the
+/// initramfs carries none (a builder boot) or it fails to parse.
+/// Must run before the pivot: the initramfs is hidden underneath afterwards. On a boot that
+/// stays in the initramfs (`vk run --ram`) it would stay visible at `/` for the VM's life,
+/// so it is unlinked once read: its env may hold secrets.
 fn read_boot_config() -> Option<RunConfig> {
     let path = format!("/{}", vk_core::runcfg::INITRAMFS_PATH);
     let text = std::fs::read_to_string(&path).ok()?;
+    if root_is_initramfs()
+        && let Err(e) = std::fs::remove_file(&path)
+    {
+        warn!("vk-agent init: removing {path} failed: {e}");
+    }
     match RunConfig::from_json(&text) {
         Ok(c) => Some(c),
         Err(e) => {
@@ -1171,9 +1188,8 @@ fn read_boot_config() -> Option<RunConfig> {
     }
 }
 
-/// Apply the boot config's environment and user the way the `/etc/virtkit` capture
-/// does for converted images — the config wins over any baked capture (a clean image
-/// has none). The entrypoint/workdir parts are consumed by `run_service`.
+/// Apply the boot config's environment and user — over any legacy `/etc/virtkit` capture
+/// (a clean image has none). The entrypoint/workdir parts are consumed by `run_service`.
 fn apply_boot_config(cfg: Option<&RunConfig>) {
     let Some(cfg) = cfg else { return };
     for (k, v) in &cfg.env {
@@ -1183,47 +1199,110 @@ fn apply_boot_config(cfg: Option<&RunConfig>) {
         // SAFETY: still single-threaded init, before any serve/service fork.
         unsafe { std::env::set_var("VIRTKIT_DEFAULT_RUN_USER", &cfg.user) };
         info!("vk-agent init: VIRTKIT_DEFAULT_RUN_USER={}", cfg.user);
+    } else {
+        // SAFETY: boot config is applied before threads or children exist.
+        unsafe { std::env::remove_var("VIRTKIT_DEFAULT_RUN_USER") };
     }
 }
 
-/// Persist the boot config's environment to /etc/virtkit/env, upserted over any
-/// baked capture (config wins, order preserved). The runtime env is already
-/// applied by `apply_boot_config`; this write is for *login* shells, whose
-/// /etc/profile resets PATH — a profile.d snippet can re-apply the effective env
-/// from the file, and on a clean-image boot (`run -f`) the file would otherwise
-/// not exist at all. Best effort: a read-only rootfs just keeps the in-process env.
-fn materialize_env(cfg: Option<&RunConfig>) {
-    let Some(cfg) = cfg else { return };
-    if cfg.env.is_empty() {
+fn run_is_tmpfs() -> bool {
+    // SAFETY: statfs writes a plain struct through a valid pointer.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    #[allow(clippy::unnecessary_cast)] // statfs differs between glibc and musl
+    unsafe {
+        libc::statfs(c"/run".as_ptr(), &mut st) == 0 && st.f_type as i64 == libc::TMPFS_MAGIC as i64
+    }
+}
+
+/// Whether `/` is still the initramfs the kernel unpacked (a ramfs or tmpfs), rather than an
+/// image filesystem the kernel mounted — where nothing is the agent's to remove.
+fn root_is_initramfs() -> bool {
+    // SAFETY: `statfs` is plain old data, for which all-zero bytes are a valid value.
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: the path is NUL-terminated and `st` is a writable `statfs`.
+    if unsafe { libc::statfs(c"/".as_ptr(), &mut st) } != 0 {
+        return false;
+    }
+    // libc names no RAMFS_MAGIC (linux/magic.h's 0x858458f6).
+    const RAMFS_MAGIC: i64 = 0x8584_58f6;
+    #[allow(clippy::unnecessary_cast)] // f_type's width differs between libcs
+    let fs = st.f_type as i64;
+    fs == RAMFS_MAGIC || fs == libc::TMPFS_MAGIC
+}
+
+/// Publish the run's environment — any legacy capture with the boot config's env over it —
+/// under /run/vk for login shells, whose profile resets PATH, and hook `/etc/profile.d` up to
+/// re-apply it (see `runenv`). Readable by root, the run user and the SSH user, each through a
+/// file of their own. A boot without config or legacy env publishes nothing.
+/// Best effort — a failure costs
+/// login shells the run's env, which every command the agent starts still inherits.
+fn publish_env(
+    cfg: Option<&RunConfig>,
+    legacy: Vec<(String, String)>,
+    cmdline: &HashMap<String, String>,
+) {
+    if cfg.is_none() && legacy.is_empty() {
         return;
     }
-    let mut merged: Vec<(String, String)> = std::fs::read_to_string("/etc/virtkit/env")
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|l| l.split_once('=').map(|(k, v)| (k.into(), v.into())))
-        .collect();
-    for (k, v) in &cfg.env {
-        match merged.iter_mut().find(|(ek, _)| ek == k) {
+    if !run_is_tmpfs() {
+        warn!("vk-agent init: /run is not tmpfs; refusing to publish the environment");
+        return;
+    }
+    let mut env: Vec<(String, String)> = Vec::new();
+    let empty = RunConfig::default();
+    let cfg = cfg.unwrap_or(&empty);
+    for (k, v) in legacy.iter().chain(&cfg.env) {
+        if k.is_empty() || k.contains(['=', '\0']) || v.contains('\0') {
+            continue; // skipped, with a warning, by apply_boot_config
+        }
+        match env.iter_mut().find(|(ek, _)| ek == k) {
             Some(e) => e.1 = v.clone(),
-            None => merged.push((k.clone(), v.clone())),
+            None => env.push((k.clone(), v.clone())),
         }
     }
-    // One entry per line: a key or value with a newline cannot fit the format. It is still in
-    // the agent's own environment, which every command it runs inherits.
-    let mut text = String::new();
-    for (k, v) in &merged {
-        if k.contains('\n') || v.contains('\n') {
-            warn!(
-                "vk-agent init: {k:?} holds a newline: left out of /etc/virtkit/env, so login \
-                 shells that read it do not see it"
-            );
-            continue;
+    let run = user_ids(&std::env::var("VIRTKIT_DEFAULT_RUN_USER").unwrap_or_default());
+    let mut readers = vec![(0, 0)];
+    let ssh = (cmdline.get("VIRTKIT_SSH").map(String::as_str) == Some("1"))
+        .then(|| {
+            user_ids(
+                cmdline
+                    .get("VIRTKIT_SSH_USER")
+                    .map_or("root", String::as_str),
+            )
+        })
+        .flatten();
+    for ids in [run, ssh].into_iter().flatten() {
+        if !readers.iter().any(|(uid, _)| *uid == ids.0) {
+            readers.push(ids);
         }
-        text.push_str(&format!("{k}={v}\n"));
     }
-    let _ = std::fs::create_dir_all("/etc/virtkit");
-    if let Err(e) = std::fs::write("/etc/virtkit/env", text) {
-        warn!("vk-agent init: writing /etc/virtkit/env failed: {e}");
+    let file = crate::runenv::EnvFile {
+        run_uid: run.map(|(uid, _)| uid),
+        env,
+    };
+    let base = Path::new(crate::runenv::RUN_VK);
+    if let Err(e) = crate::runenv::publish(base, &file, &readers) {
+        warn!("vk-agent init: publishing the environment for login shells failed: {e:#}");
+        return;
+    }
+    install_agent_bin();
+    if let Err(e) = crate::runenv::hook_login_shells(base, Path::new("/etc/profile.d")) {
+        warn!("vk-agent init: login shells will not get the run's environment: {e:#}");
+    }
+}
+
+/// The uid and primary gid `user` (a name, uid or `user:group` spec) runs as; root for an
+/// empty spec. `None`, with a warning, when the image's passwd cannot resolve it.
+fn user_ids(user: &str) -> Option<(u32, u32)> {
+    if user.is_empty() || user == "root" {
+        return Some((0, 0));
+    }
+    match vk_core::exec::server::resolve_user(user) {
+        Ok(ru) => Some((ru.uid, ru.gid)),
+        Err(e) => {
+            warn!("vk-agent init: user {user} does not resolve ({e}) — no environment file for it");
+            None
+        }
     }
 }
 
@@ -2352,9 +2431,8 @@ fn ctl_enabled(cmdline: &HashMap<String, String>) -> bool {
 /// run's other endpoints. Its nodes are attributed to the run's own user, so a
 /// primary that runs as the image's `USER` can drive its siblings — off the same
 /// `VIRTKIT_DEFAULT_RUN_USER` the exec server drops served commands by. The variable, not a
-/// `RunConfig`: the default path has none to read (a plain `vk run` carries no boot config),
-/// where only the `/etc/virtkit/user` capture names the user, and the run's other endpoints
-/// read it the same way.
+/// `RunConfig`: an older image's `/etc/virtkit/user` capture can name the user with no boot
+/// config to carry it, and the run's other endpoints read it the same way.
 fn maybe_ctlfs(cmdline: &HashMap<String, String>) {
     if !ctl_enabled(cmdline) {
         return;
@@ -2408,8 +2486,8 @@ fn ctl_owner_ids(user: &str) -> (u32, u32) {
 const RUN_TMPFS_FLAGS: libc::c_ulong = libc::MS_NOSUID | libc::MS_NODEV | libc::MS_STRICTATIME;
 const RUN_TMPFS_DATA: &str = "mode=0755,size=20%,nr_inodes=800k";
 
-/// VIRTKIT_CTL=1 in the full-VM path: claim /run as a tmpfs before the control fs is
-/// mounted under it. An init that finds nothing mounted on /run mounts its own tmpfs
+/// The full-VM path: claim /run as a tmpfs before anything is put under it.
+/// An init that finds nothing mounted on /run mounts its own tmpfs
 /// there — which would hide the FUSE mount underneath it, leaving /run/vk/services in
 /// /proc/self/mounts and unreachable — while one that finds /run already a mount point
 /// leaves it alone (systemd checks exactly that, in `mount_one`, for every API mount
@@ -2423,11 +2501,12 @@ const RUN_TMPFS_DATA: &str = "mode=0755,size=20%,nr_inodes=800k";
 /// The default path needs none of this: `mount_api_filesystems` already put /run on a
 /// tmpfs and no image init follows it.
 ///
-/// Both the compose control fs and `socket` volumes under /run require this claim. The
-/// warning therefore refers to anything this boot placed there.
-fn claim_run_tmpfs(cmdline: &HashMap<String, String>) {
+/// The compose control fs, `socket` volumes under /run and the run's environment published
+/// for login shells (`publish_env`, whenever the boot carries a config) all require this
+/// claim. The warning therefore refers to anything this boot placed there.
+fn claim_run_tmpfs(cmdline: &HashMap<String, String>, publishes_env: bool) {
     // An image init that replaces /run would hide a socket bound there before exec.
-    if !ctl_enabled(cmdline) && !socket_volume_under_run(cmdline) {
+    if !publishes_env && !ctl_enabled(cmdline) && !socket_volume_under_run(cmdline) {
         return;
     }
     // As `mount_api_filesystems` does: an image that ships no /run (FROM scratch) has
@@ -2587,9 +2666,7 @@ fn maybe_host_exec(cmdline: &HashMap<String, String>) {
         warn!("vk-agent init: creating /run/vk failed: {e}");
         return;
     }
-    if let Err(e) = install_host_exec_agent(HOST_EXEC_AGENT_SOURCE, HOST_EXEC_AGENT_BIN) {
-        warn!("vk-agent init: mounting {HOST_EXEC_AGENT_BIN} failed: {e:#}");
-    }
+    install_agent_bin();
     // Give the socket to the run user (VIRTKIT_DEFAULT_RUN_USER, set above by
     // export_default_run_user/apply_boot_config; unset when the stage runs as root)
     // so a non-root job stage can reach the host channel.
@@ -2597,6 +2674,20 @@ fn maybe_host_exec(cmdline: &HashMap<String, String>) {
     if let Err(e) = fork_agent(&host_exec_forward_args(port, run_user.as_deref())) {
         warn!("vk-agent init: host-exec forward failed to start: {e}");
     }
+}
+
+/// Make the running agent reachable at [`crate::runenv::AGENT_BIN`] for guest processes — the
+/// host-exec client and the login-shell hook — once per boot, whichever needs it first.
+fn install_agent_bin() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        if let Err(e) = install_host_exec_agent(HOST_EXEC_AGENT_SOURCE, crate::runenv::AGENT_BIN) {
+            warn!(
+                "vk-agent init: mounting {} failed: {e:#}",
+                crate::runenv::AGENT_BIN
+            );
+        }
+    });
 }
 
 fn install_host_exec_agent(src: &str, dest: &str) -> Result<()> {

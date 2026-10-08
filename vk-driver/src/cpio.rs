@@ -27,13 +27,20 @@ impl<W: Write> CpioWriter<W> {
     }
 
     /// Header + name + padding; the caller streams `datasize` body bytes next.
-    fn header(&mut self, name: &str, mode: u32, nlink: u32, datasize: u32) -> io::Result<()> {
+    fn header(
+        &mut self,
+        name: &str,
+        mode: u32,
+        nlink: u32,
+        datasize: u32,
+        owner: (u32, u32),
+    ) -> io::Result<()> {
         self.ino = self.ino.wrapping_add(1);
         let name = name.as_bytes();
         let namesize = name.len() as u32 + 1; // includes the trailing NUL
         self.w.write_all(b"070701")?;
         for field in [
-            self.ino, mode, 0, 0, nlink, 0, datasize, 0, 0, 0, 0, namesize, 0,
+            self.ino, mode, owner.0, owner.1, nlink, 0, datasize, 0, 0, 0, 0, namesize, 0,
         ] {
             write!(self.w, "{field:08x}")?;
         }
@@ -51,25 +58,34 @@ impl<W: Write> CpioWriter<W> {
     }
 
     pub fn dir(&mut self, name: &str, mode: u32) -> io::Result<()> {
-        self.header(name, S_IFDIR | (mode & 0o7777), 2, 0)
+        self.dir_owned(name, mode, (0, 0))
     }
 
-    pub fn symlink(&mut self, name: &str, target: &str) -> io::Result<()> {
+    pub fn dir_owned(&mut self, name: &str, mode: u32, owner: (u32, u32)) -> io::Result<()> {
+        self.header(name, S_IFDIR | (mode & 0o7777), 2, 0, owner)
+    }
+
+    pub fn symlink(&mut self, name: &str, target: &str, owner: (u32, u32)) -> io::Result<()> {
         let target = target.as_bytes();
-        self.header(name, S_IFLNK | 0o777, 1, target.len() as u32)?;
+        self.header(name, S_IFLNK | 0o777, 1, target.len() as u32, owner)?;
         self.w.write_all(target)?;
         self.pad(target.len())
     }
 
     /// Stream a regular file: exactly `size` bytes are read from `data`.
-    pub fn file(
+    pub fn file(&mut self, name: &str, mode: u32, size: u32, data: impl Read) -> io::Result<()> {
+        self.file_owned(name, mode, size, (0, 0), data)
+    }
+
+    pub fn file_owned(
         &mut self,
         name: &str,
         mode: u32,
         size: u32,
+        owner: (u32, u32),
         mut data: impl Read,
     ) -> io::Result<()> {
-        self.header(name, S_IFREG | (mode & 0o7777), 1, size)?;
+        self.header(name, S_IFREG | (mode & 0o7777), 1, size, owner)?;
         let copied = io::copy(&mut data, &mut self.w)?;
         if copied != u64::from(size) {
             return Err(io::Error::other(format!(
@@ -101,7 +117,7 @@ impl<W: Write> CpioWriter<W> {
     }
 
     pub fn finish(mut self) -> io::Result<W> {
-        self.header("TRAILER!!!", 0, 1, 0)?;
+        self.header("TRAILER!!!", 0, 1, 0, (0, 0))?;
         self.w.flush()?;
         Ok(self.w)
     }
@@ -117,7 +133,7 @@ mod tests {
         let mut c = CpioWriter::new(&mut buf);
         c.dir("usr", 0o755).unwrap();
         c.file_bytes("usr/x", 0o644, b"hello").unwrap();
-        c.symlink("link", "usr/x").unwrap();
+        c.symlink("link", "usr/x", (0, 0)).unwrap();
         c.finish().unwrap();
 
         // every entry header starts on a 4-byte boundary with the newc magic

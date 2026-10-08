@@ -4,16 +4,26 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Login shells inherit the image and run environment**, including multi-line values and
+  the image's `PATH`. `vk-agent env --export`, `--print0`, and `--exec` make that environment
+  available to other guest processes. Login identity variables are excluded, as are `PATH`
+  and loader variables when the caller is not the run user.
+
 ### Changed
 
+- **Runtime environment values stay off the guest root disk.** Older converted images'
+  environment files remain readable for compatibility. Custom login hooks that read
+  `/etc/virtkit/env` can be removed after upgrading to this release.
 - **Legacy `systemd` bundles are no longer supported.** Rebuild bundles with `vk build`;
   use compose `init: image` or `init: entrypoint` for images that start their own init.
 
 ### Fixed
 
-- **`vk run` no longer drops an environment variable whose value holds a newline**, such as a
-  multi-line `--env`: the guest sees the value whole. One holding a NUL byte is refused, naming
-  the variable.
+- **`vk run` preserves multi-line environment values in commands and login shells.**
+  Variables containing a NUL byte are rejected.
+- **Plain image and RAM boots honor the image's `USER`**, as Dockerfile and compose boots do.
 
 ## [0.86.0] - 2026-10-07
 

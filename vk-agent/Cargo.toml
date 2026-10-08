@@ -22,6 +22,8 @@ log.workspace = true
 rand = { workspace = true, optional = true }
 russh = { workspace = true, optional = true }
 russh-sftp = { workspace = true, optional = true }
+# The run's environment file `vk-agent env` reads back (`runenv`).
+serde_json.workspace = true
 simplelog.workspace = true
 # Unpack the checkout tar into the overlay's tmpfs upper at boot
 # (VIRTKIT_VIRTIOFS_OVERLAY_SEED).

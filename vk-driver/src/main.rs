@@ -2536,9 +2536,9 @@ enum Cmd {
     },
     /// Build an ext4 image straight from a local OCI image archive
     ///
-    /// The tar `buildctl --output type=oci` produces: flattens its layers AND extracts the
-    /// image config (Env/User/Entrypoint/Cmd into /etc/virtkit/{env,user,cmd}), no
-    /// docker/podman. Replaces the podman load→create→export→mkext-tar chain.
+    /// The tar `buildctl --output type=oci` produces: flattens its layers AND writes the
+    /// image config (Env/User/WorkingDir/Entrypoint/Cmd) to `<out>.json`, no docker/podman.
+    /// Replaces the podman load→create→export→mkext-tar chain.
     #[command(hide = true)]
     MkextOci {
         /// OCI image archive (tar), or "-" to STREAM stdin
@@ -3814,7 +3814,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
             .map(|(g, h, m)| (g.as_str(), h.as_path(), *m))
             .collect();
         let extra_free = free_gib * (1024 * 1024 * 1024 / 4096); // GiB -> 4 KiB blocks
-        return match mkoci::archive_to_ext4(archive, out, &injects, &[], extra_free, &fsid) {
+        return match mkoci::archive_to_ext4(archive, out, &injects, extra_free, &fsid) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&e, 1),
         };

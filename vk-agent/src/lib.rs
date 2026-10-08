@@ -2,7 +2,8 @@
 //! (`diskmount`), fs freeze/thaw (`fsfreeze`), VM shutdown (`poweroff`),
 //! the writable layer's high-water mark (`fsmark`), the guest's peak memory demand
 //! (`memmark`), the OOM kills the guest kernel made (`oomkills`), whether a CI job has its
-//! gitlab-runner (`tools`), the line the marks publish (`mark`), guest statistics in atop's
+//! gitlab-runner (`tools`), the line the marks publish (`mark`), the run's environment for login
+//! shells (`runenv`), guest statistics in atop's
 //! parseable format (`atop`, with the exited tasks `taskstats` reports), networking
 //! (`netcfg`) and the embedded SSH server (`ssh`/`sftp`, feature `ssh`). The shared host↔guest
 //! protocol and runtime helpers live in the `vk-core` crate.
@@ -20,6 +21,7 @@ pub mod netcfg;
 pub mod oomkills;
 pub mod poweroff;
 pub mod reclaim;
+pub mod runenv;
 #[cfg(feature = "ssh")]
 pub mod sftp;
 #[cfg(feature = "ssh")]

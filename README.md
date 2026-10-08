@@ -120,6 +120,22 @@ kept intentionally compact.
 starts a microVM, and executes either the requested command or a shell. By default the
 guest uses virtkit's embedded kernel and runs `vk-agent` as PID 1.
 
+The image's `ENV`, with `--env` and `--env-file` over it, reaches commands the agent
+starts. Its `USER` sets their default identity. Login shells recover the environment
+through `/etc/profile.d/zz-virtkit-env.sh`, mounted from `/run` without writing the
+hook to the root disk. The hook preserves session values and restores the image's
+`PATH` ahead of the login profile's additions; SSH session PATH overrides take precedence.
+It excludes login identity variables, and excludes `PATH` and loader variables for a
+UID other than the run user's. Images without `/etc/profile.d` get no automatic hook.
+
+Other processes can use `/run/vk/bin/vk-agent env --export`, `--print0`, or `--exec CMD`.
+The environment lives on tmpfs: `/run/vk/env.json` is root-only, with private copies
+for the run and SSH users. The export command validates its complete output before
+printing; callers should check its exit status before evaluating it. Boot configuration
+travels in the host-supplied initramfs, never in the guest root disk. Build `RUN` steps
+receive their changing environment and user through the exec channel instead.
+Older images' `/etc/virtkit/{env,user}` files are still read as a fallback.
+
 Bundles must declare `generic-disk` in `boot.kind`; legacy `systemd` and unmarked
 bundles are rejected. Rebuild them with `vk build`. When packaging an ext4 manually,
 keep its generated `<out>.json` sidecar beside `runner.ext4` as `runner.ext4.json`.

@@ -232,13 +232,15 @@ fn registry_host_name(h: &str) -> bool {
         && port.is_none_or(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
 }
 
-/// Where a pulled image lands: `<state_dir>/docker/<name>/<digest>/`, holding the
-/// `runner.ext4` rootfs and its config sidecar.
+/// Version 2 excludes legacy env/user capture files from converted roots.
+const CONVERSION_VERSION: &str = "2";
+
+/// `<state_dir>/docker/<name>/<digest>-v<version>/`, including the config sidecar.
 fn image_cache_dir(state_dir: &Path, name: &str, digest: &str) -> PathBuf {
-    state_dir
-        .join("docker")
-        .join(name)
-        .join(digest.trim_start_matches("sha256:"))
+    state_dir.join("docker").join(name).join(format!(
+        "{}-v{CONVERSION_VERSION}",
+        digest.trim_start_matches("sha256:")
+    ))
 }
 
 /// Pull + cache + boot the OCI ref `full` with `creds` (cache-keyed by `name` + digest).
@@ -588,6 +590,20 @@ mod tests {
         assert_eq!(relayed(reg, &format!("{reg}/virtkit/build-cache:x")), None);
         // Registry hosts are case-insensitive, so this one still nests under itself.
         assert_eq!(relayed(reg, &format!("{}/o/i", reg.to_uppercase())), None);
+    }
+
+    #[test]
+    fn conversions_do_not_reuse_unsalted_images() {
+        let root = Path::new("/cache");
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let old = root.join("docker/alpine").join("a".repeat(64));
+        let current = image_cache_dir(root, "alpine", &digest);
+        assert_ne!(current, old);
+        assert_eq!(
+            current,
+            root.join("docker/alpine")
+                .join(format!("{}-v{CONVERSION_VERSION}", "a".repeat(64)))
+        );
     }
 
     /// A ref pinned to something that is not a digest never becomes a cache path: it

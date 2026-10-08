@@ -1504,32 +1504,6 @@ async fn build_and_boot(
         media.push(s);
         Ok(path)
     };
-    // The effective env as a boot config, injected into a converted image's root where the
-    // agent reads it at boot (a clean `-f` image carries it in its initramfs instead). JSON
-    // rather than the line-per-entry /etc/virtkit/env, which the agent rewrites from it, so a
-    // value holding a newline arrives whole.
-    let env_config = work.join("env.json");
-    let mut injects: Vec<(&str, &Path, u16)> =
-        vec![(crate::initramfs::CMDRUNNER_PATH, agent, 0o755)];
-    if !image_env.is_empty() {
-        let text = vk_core::runcfg::RunConfig {
-            env: image_env.clone(),
-            ..Default::default()
-        }
-        .to_json();
-        // env values may be secrets (the reason they stay off the cmdline):
-        // keep the host-side copy private too.
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&env_config)
-            .and_then(|mut f| f.write_all(text.as_bytes()))
-            .with_context(|| format!("writing {}", env_config.display()))?;
-        injects.push((vk_core::runcfg::INITRAMFS_PATH, &env_config, 0o600));
-    }
     let t_media = Instant::now();
     // The kernel the VM boots on. Normally the pinned kernel passed in; when the
     // kernel axis is `image`, fullvm::prepare below overrides it with the kernel
@@ -1633,13 +1607,37 @@ async fn build_and_boot(
                 Some(boot.initramfs),
                 kcmd,
             )
-        } else if let Some(ext4) = &dockerfile_ext4 {
-            // A Dockerfile build exports a *clean* ext4 (no agent baked in). Boot it the way
-            // the builder boots its own stages: a minimal initramfs holds the agent as `/init`,
-            // which pivots into the ext4 at /dev/vda — so the booted image stays byte-clean.
-            // The boot config carries the effective env (stage/service ENV + --env
-            // extras): the agent applies it and materializes /etc/virtkit/env for login
-            // shells, keeping the image itself byte-clean.
+        } else if !args.ram || dockerfile_ext4.is_some() {
+            // A clean ext4 — a Dockerfile build's export, or the image converted here — booted
+            // the way the builder boots its own stages: a minimal initramfs holds the agent as
+            // `/init`, which pivots into the ext4 at /dev/vda, so the booted image stays
+            // byte-clean. The boot config carries the effective env (image/stage/service ENV +
+            // --env extras) and rides that initramfs, never the root disk: its values may be
+            // secrets. The agent applies it and publishes it under /run for login shells.
+            let ext4 = if let Some(ext4) = &dockerfile_ext4 {
+                ext4.clone()
+            } else {
+                println!("virtkit: building ext4 rootfs");
+                let rootfs = medium("root.ext4")?;
+                let source = source.as_ref().expect("an image boot resolved a source");
+                source
+                    .stream_tar(work, |tar, hints| {
+                        crate::ext4::build_from_tar_stream(
+                            tar,
+                            &[],
+                            hints.image_bytes(),
+                            0,
+                            Some(hints.inode_count()),
+                            &crate::ext4::FsId {
+                                with_journal: true,
+                                ..Default::default()
+                            },
+                            &rootfs,
+                        )
+                    })
+                    .await?;
+                rootfs
+            };
             let cpio = medium("initramfs.cpio")?;
             let boot_cfg = vk_core::runcfg::RunConfig {
                 env: image_env.clone(),
@@ -1651,11 +1649,13 @@ async fn build_and_boot(
             // primary, else a throwaway qcow2 CoW over the read-only backing (writable raw
             // fails on tmpfs).
             let overlay = match (&primary_persist_root, &primary_image_id) {
-                (Some(backing), Some(id)) => crate::compose::ensure_persist_root(backing, ext4, id)
-                    .context("persistent root")?,
+                (Some(backing), Some(id)) => {
+                    crate::compose::ensure_persist_root(backing, &ext4, id)
+                        .context("persistent root")?
+                }
                 _ => {
                     let overlay = medium("overlay.qcow2")?;
-                    crate::qcow2::create_overlay(&overlay, ext4)?;
+                    crate::qcow2::create_overlay(&overlay, &ext4)?;
                     overlay
                 }
             };
@@ -1668,41 +1668,16 @@ async fn build_and_boot(
                     primary_hostname.as_deref().unwrap_or(PRIMARY_HOSTNAME)
                 ),
             )
-        } else if !args.ram {
-            println!("virtkit: building ext4 rootfs");
-            let rootfs = medium("root.ext4")?;
-            let source = source.as_ref().expect("an image boot resolved a source");
-            source
-                .stream_tar(work, |tar, hints| {
-                    crate::ext4::build_from_tar_stream(
-                        tar,
-                        &injects,
-                        hints.image_bytes(),
-                        0,
-                        Some(hints.inode_count()),
-                        &crate::ext4::FsId {
-                            with_journal: true,
-                            ..Default::default()
-                        },
-                        &rootfs,
-                    )
-                })
-                .await?;
-            // throwaway rw qcow2 overlay over the ro raw ext4 (rw raw errors on tmpfs)
-            let overlay = medium("overlay.qcow2")?;
-            crate::qcow2::create_overlay(&overlay, &rootfs)?;
-            (
-                vec![crate::vmm::Disk::overlay(overlay)],
-                // no initrd: the kernel mounts /dev/vda (ext4) directly
-                None,
-                format!(
-                    "console=ttyS0 root=/dev/vda rw rootfstype=ext4 \
-                     init=/usr/local/bin/vk-agent \
-                     VIRTKIT_HOSTNAME={PRIMARY_HOSTNAME} VIRTKIT_VSOCK_PORT={VSOCK_PORT}"
-                ),
-            )
         } else {
+            // --ram: the image itself is the initramfs, with the agent and the boot config
+            // injected into it. The agent unlinks the config once read; nothing here is on a
+            // disk.
             println!("virtkit: building cpio initramfs");
+            let env_config = scratch_boot_config(work, &image_env, &primary_user)?;
+            let injects: [(&str, &Path, u16); 2] = [
+                (crate::initramfs::CMDRUNNER_PATH, agent, 0o755),
+                (vk_core::runcfg::INITRAMFS_PATH, &env_config.path, 0o600),
+            ];
             let cpio = medium("initramfs.cpio")?;
             let source = source.as_ref().expect("an image boot resolved a source");
             source
@@ -4210,6 +4185,26 @@ async fn ssh_greets(addr: &SocketAddr, budget: Duration) -> Result<()> {
     })
     .await
     .map_err(|_| anyhow!("no identification string within {budget:?}"))?
+}
+
+/// The effective env as a boot config file in `work`, for a boot that injects it rather than
+/// building an initramfs around it. Mode 0600: env values may be secrets (the reason they stay
+/// off the kernel cmdline).
+fn scratch_boot_config(
+    work: &Path,
+    env: &[(String, String)],
+    user: &str,
+) -> Result<crate::scratch::ScratchFile> {
+    let mut scratch = crate::scratch::scratch(work, "env.json")?;
+    let text = vk_core::runcfg::RunConfig {
+        env: env.to_vec(),
+        user: user.to_string(),
+        ..Default::default()
+    }
+    .to_json();
+    use std::io::Write;
+    scratch.file.write_all(text.as_bytes())?;
+    Ok(scratch)
 }
 
 /// Refuse a guest env entry the guest cannot set, naming it: an empty name, `=` in a name,
