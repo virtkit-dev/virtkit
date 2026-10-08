@@ -26,6 +26,10 @@
 //!
 //! [`entry_in`] exposes the fourth to callers walking a path, links included: it says whether
 //! an entry could have been put there, or swapped since, by another user.
+//!
+//! [`chown_tree`] keeps the third when root transfers a tree to a user who may already write
+//! in it. Entries are opened from their parent's descriptor and changed through their own,
+//! so name swaps cannot redirect the changes.
 
 use anyhow::{Context, anyhow, bail};
 use std::ffi::{CString, OsStr};
@@ -671,6 +675,353 @@ fn openat_dir_raw(parent: BorrowedFd<'_>, name: &CString) -> std::io::Result<Own
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// What [`chown_tree`] did.
+#[derive(Debug, Default)]
+pub struct ChownTree {
+    /// Entries whose owner changed.
+    pub changed: u64,
+    /// Entries left as they are, whoever owns them: files also linked from outside the tree,
+    /// and mount roots and entries on another device, which are not entered either.
+    pub skipped: Vec<PathBuf>,
+}
+
+/// Transfer `dir` and its contents to `uid` as root, for the user who will run in it.
+/// The user may already be writing there. Leave groups unchanged.
+///
+/// Nothing past `dir` is resolved by path, and `dir` itself is refused if it is a symlink.
+/// Each entry is opened `O_PATH | O_NOFOLLOW` from its already-open parent, and the inode that
+/// descriptor holds is the one inspected, changed and, for a directory, entered, so a name
+/// swapped mid-walk cannot steer the change elsewhere. A symlink is changed itself, never what
+/// it names.
+///
+/// A non-directory with more than one link is changed only once the walk has found as many
+/// of its names in the tree as it has links; until then its descriptor is held, so its inode
+/// number cannot pass to another file. One still short at the end is also linked from outside
+/// and is left alone and reported, as is one past the first 256 such inodes held at once.
+/// Names are counted as the walk opens them, so a user who moves a link it made ahead of the
+/// walk counts it twice. That is only allowed with `fs.protected_hardlinks` set to 1, which
+/// lets a user link only files it owns or can already read and write: the most such a move
+/// wins is ownership of one of those. When the setting reads otherwise, or cannot be read,
+/// every multiply-linked file is left alone and reported.
+///
+/// Entries on another device and mount roots, bind mounts of the same filesystem included,
+/// are neither changed nor entered; mount roots are told by `STATX_ATTR_MOUNT_ROOT`, which
+/// kernels before 5.8 do not report, leaving the device check alone there.
+///
+/// The walk recurses holding one directory descriptor per level besides the linked inodes
+/// it holds, and fails on a tree nested deeper than 512 levels, which keeps it within the
+/// usual 1024-descriptor limit and the stack.
+pub fn chown_tree(dir: &Path, uid: u32) -> Result<ChownTree, anyhow::Error> {
+    let protected =
+        std::fs::read_to_string("/proc/sys/fs/protected_hardlinks").is_ok_and(|v| v.trim() == "1");
+    chown_tree_linked(dir, uid, protected)
+}
+
+/// [`chown_tree`], changing multiply-linked files only when `links_protected` says
+/// `fs.protected_hardlinks` is on.
+fn chown_tree_linked(
+    dir: &Path,
+    uid: u32,
+    links_protected: bool,
+) -> Result<ChownTree, anyhow::Error> {
+    let c_dir = cstr(dir.as_os_str())?;
+    // SAFETY: the path is NUL-terminated and outlives the call.
+    let fd = unsafe {
+        libc::open(
+            c_dir.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(
+            anyhow!(std::io::Error::last_os_error()).context(format!("opening {}", dir.display()))
+        );
+    }
+    // SAFETY: `fd` is a fresh descriptor this call owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let st = statx_fd(fd.as_fd()).with_context(|| format!("inspecting {}", dir.display()))?;
+    let mut walk = ChownWalk {
+        uid,
+        dev: (st.stx_dev_major, st.stx_dev_minor),
+        done: ChownTree::default(),
+        links_protected,
+        linked: std::collections::HashMap::new(),
+    };
+    if st.stx_uid != uid {
+        walk.chown(fd.as_fd())
+            .with_context(|| format!("chowning {}", dir.display()))?;
+    }
+    walk.entries(fd, dir, 1)?;
+    let ChownWalk {
+        mut done, linked, ..
+    } = walk;
+    let mut outside: Vec<PathBuf> = linked.into_values().map(|l| l.path).collect();
+    outside.sort();
+    done.skipped.extend(outside);
+    Ok(done)
+}
+
+/// How many directory levels below its root [`chown_tree`] enters, one descriptor each.
+const CHOWN_TREE_MAX_DEPTH: usize = 512;
+
+/// How many multiply-linked inodes [`chown_tree`] holds open at once, waiting for their other
+/// names. With [`CHOWN_TREE_MAX_DEPTH`], 256 descriptors short of the usual soft limit of
+/// 1024, for the caller's own.
+const CHOWN_TREE_MAX_LINKED: usize = 256;
+
+/// [`chown_tree`]'s state across the walk.
+struct ChownWalk {
+    uid: u32,
+    /// The root's device, which the walk does not leave.
+    dev: (u32, u32),
+    done: ChownTree,
+    /// Whether multiply-linked files may change at all: see [`chown_tree`].
+    links_protected: bool,
+    /// Multiply-linked inodes by inode number, held until all their names are found.
+    linked: std::collections::HashMap<u64, Linked>,
+}
+
+/// A multiply-linked inode whose names [`chown_tree`] has only partly found.
+struct Linked {
+    /// Holds the inode, so its number stays its own.
+    _fd: OwnedFd,
+    seen: u32,
+    /// The first name found, for the report.
+    path: PathBuf,
+}
+
+impl ChownWalk {
+    /// Give the inode `fd` holds to the walk's user, a symlink included, and count it.
+    fn chown(&mut self, fd: BorrowedFd<'_>) -> std::io::Result<()> {
+        // SAFETY: `fd` is open and the empty name NUL-terminated; with `AT_EMPTY_PATH` the
+        // change lands on the inode `fd` holds. -1 leaves the group as it is.
+        let rc = unsafe {
+            libc::fchownat(
+                fd.as_raw_fd(),
+                c"".as_ptr(),
+                self.uid,
+                libc::gid_t::MAX,
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.done.changed += 1;
+        Ok(())
+    }
+
+    /// Whether the inode `entry` holds, inspected as `st`, has had all its names found, the
+    /// one at `path` included. Its descriptor is kept until then.
+    fn all_links_found(&mut self, entry: OwnedFd, st: &Statx, path: PathBuf) -> bool {
+        use std::collections::hash_map::Entry;
+        if !self.links_protected {
+            self.done.skipped.push(path);
+            return false;
+        }
+        let held = self.linked.len();
+        let seen = match self.linked.entry(st.stx_ino) {
+            Entry::Occupied(mut linked) => {
+                linked.get_mut().seen += 1;
+                linked.get().seen
+            }
+            Entry::Vacant(_) if held >= CHOWN_TREE_MAX_LINKED => {
+                self.done.skipped.push(path);
+                return false;
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(Linked {
+                    _fd: entry,
+                    seen: 1,
+                    path,
+                });
+                1
+            }
+        };
+        // `st` is this name's fresh inspection, so a link added or removed since the inode
+        // was first found counts.
+        if seen < st.stx_nlink {
+            return false;
+        }
+        self.linked.remove(&st.stx_ino);
+        true
+    }
+
+    /// Walk the open directory `dir`; use `path` only for errors and the report.
+    fn entries(&mut self, dir: OwnedFd, path: &Path, depth: usize) -> Result<(), anyhow::Error> {
+        if depth > CHOWN_TREE_MAX_DEPTH {
+            bail!(
+                "{} is nested deeper than {CHOWN_TREE_MAX_DEPTH} levels",
+                path.display()
+            );
+        }
+        let fail = |e: std::io::Error, what: &str, name: &OsStr| {
+            anyhow!(e).context(format!("{what} {}", path.join(name).display()))
+        };
+        // The names first, then the changes: the stream is closed before descending, so the
+        // walk holds one directory stream at a time however deep the tree, and one descriptor
+        // per level.
+        let names = list_dir(&dir).with_context(|| format!("listing {}", path.display()))?;
+        for name in names {
+            let c_name = one_name(&name)?;
+            // SAFETY: the descriptor is live and the name NUL-terminated.
+            let fd = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let e = std::io::Error::last_os_error();
+                // Gone since the listing: nothing left to hand over.
+                if e.raw_os_error() == Some(libc::ENOENT) {
+                    continue;
+                }
+                return Err(fail(e, "opening", &name));
+            }
+            // SAFETY: `fd` is a fresh descriptor this call owns.
+            let entry = unsafe { OwnedFd::from_raw_fd(fd) };
+            let st = statx_fd(entry.as_fd()).map_err(|e| fail(e, "inspecting", &name))?;
+            let is_dir = u32::from(st.stx_mode) & libc::S_IFMT == libc::S_IFDIR;
+            let mount_root =
+                st.stx_attributes_mask & st.stx_attributes & STATX_ATTR_MOUNT_ROOT != 0;
+            if (st.stx_dev_major, st.stx_dev_minor) != self.dev || mount_root {
+                self.done.skipped.push(path.join(&name));
+                continue;
+            }
+            if !is_dir && st.stx_nlink > 1 {
+                // Changed through this name's descriptor, the same inode as the one held.
+                let dup = entry.try_clone().map_err(|e| fail(e, "holding", &name))?;
+                if self.all_links_found(dup, &st, path.join(&name)) && st.stx_uid != self.uid {
+                    self.chown(entry.as_fd())
+                        .map_err(|e| fail(e, "chowning", &name))?;
+                }
+                continue;
+            }
+            if st.stx_uid != self.uid {
+                self.chown(entry.as_fd())
+                    .map_err(|e| fail(e, "chowning", &name))?;
+            }
+            if is_dir {
+                // `.` from `entry` is the directory just inspected, whatever its name says now.
+                // SAFETY: `entry` is open and the name NUL-terminated.
+                let fd = unsafe {
+                    libc::openat(
+                        entry.as_raw_fd(),
+                        c".".as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(fail(std::io::Error::last_os_error(), "opening", &name));
+                }
+                // SAFETY: `fd` is a fresh descriptor this call owns.
+                let sub = unsafe { OwnedFd::from_raw_fd(fd) };
+                drop(entry);
+                self.entries(sub, &path.join(&name), depth + 1)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The part of the kernel's `struct statx` (`linux/stat.h`) [`chown_tree`] reads, padded to the
+/// whole struct `statx(2)` writes. `libc` declares it only for musl builds configured with
+/// `RUST_LIBC_UNSTABLE_MUSL_V1_2_3`, which virtkit's is not.
+#[repr(C)]
+struct Statx {
+    stx_mask: u32,
+    _blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    _gid: u32,
+    stx_mode: u16,
+    _spare0: u16,
+    stx_ino: u64,
+    _size_blocks: [u64; 2],
+    stx_attributes_mask: u64,
+    _times: [u64; 8],
+    _rdev: [u32; 2],
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    _rest: [u64; 14],
+}
+
+const _: () = assert!(std::mem::size_of::<Statx>() == 256);
+
+/// `STATX_TYPE | STATX_MODE | STATX_NLINK | STATX_UID | STATX_INO`: the [`Statx`] fields the
+/// walk reads, which a filesystem must report for it to proceed. Spelled out for the same
+/// reason as [`Statx`], as is [`STATX_ATTR_MOUNT_ROOT`] (both `linux/stat.h`).
+const STATX_NEEDED: u32 = 0x010f;
+const STATX_ATTR_MOUNT_ROOT: u64 = 0x2000;
+
+/// Inspect the inode held by `fd` with `statx(2)`.
+fn statx_fd(fd: BorrowedFd<'_>) -> std::io::Result<Statx> {
+    let mut buf = std::mem::MaybeUninit::<Statx>::uninit();
+    // SAFETY: `fd` is open for the borrow, the empty name is NUL-terminated, and the kernel
+    // writes one `struct statx` through `buf`, which is exactly that size.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            fd.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+            STATX_NEEDED,
+            buf.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: a successful `statx` filled the whole struct.
+    let st = unsafe { buf.assume_init() };
+    if st.stx_mask & STATX_NEEDED != STATX_NEEDED {
+        return Err(std::io::Error::other(
+            "statx reported no type, mode, link count, owner or inode number",
+        ));
+    }
+    Ok(st)
+}
+
+/// List names in the open directory `dir`, excluding `.` and `..`.
+fn list_dir(dir: &OwnedFd) -> std::io::Result<Vec<std::ffi::OsString>> {
+    // `fdopendir` takes the descriptor over, so it gets a duplicate of its own.
+    let dup = dir.try_clone()?;
+    // SAFETY: `dup` is a fresh descriptor whose ownership passes to the stream.
+    let stream = unsafe { libc::fdopendir(dup.as_raw_fd()) };
+    if stream.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    std::mem::forget(dup);
+    let mut names = Vec::new();
+    let failed = loop {
+        // `readdir` returns null at EOF and on error; errno distinguishes them.
+        // SAFETY: errno is this thread's own.
+        unsafe { *libc::__errno_location() = 0 };
+        // SAFETY: `stream` is open until the `closedir` below.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let e = std::io::Error::last_os_error();
+            break (e.raw_os_error() != Some(0)).then_some(e);
+        }
+        // SAFETY: a non-null entry's `d_name` is NUL-terminated and valid until the next
+        // `readdir` on the stream.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name = name.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(std::ffi::OsString::from_vec(name.to_vec()));
+        }
+    };
+    // SAFETY: `stream` is open, and closing it closes the duplicate it owns.
+    unsafe { libc::closedir(stream) };
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(names),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,6 +1031,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The tree changes hands, links themselves rather than what they name, a file hard-linked
+    /// only within the tree changes with it, one also linked from outside keeps its owner and
+    /// is reported, and a final symlink is refused. Changing another user's ownership takes
+    /// root, so the root branch is the one that checks the handover; without root only the
+    /// no-op of handing the tree to its own owner and the refusal run.
+    #[test]
+    fn chown_tree_hands_over_the_tree_and_follows_no_link() {
+        let dir = scratch("chown-tree");
+        let outside = scratch("chown-tree-outside");
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::write(dir.join("a/b/f"), b"x").unwrap();
+        std::fs::write(outside.join("target"), b"x").unwrap();
+        std::os::unix::fs::symlink(outside.join("target"), dir.join("a/link")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("dirlink")).unwrap();
+        // SAFETY: reads this process's own id.
+        let me = unsafe { libc::geteuid() };
+        let done = chown_tree(&dir, me).unwrap();
+        assert_eq!((done.changed, done.skipped), (0, Vec::<PathBuf>::new()));
+        // Without `fs.protected_hardlinks`, a file linked twice within the tree is left too.
+        std::fs::write(dir.join("pair"), b"x").unwrap();
+        std::fs::hard_link(dir.join("pair"), dir.join("a/pair")).unwrap();
+        let mut done = chown_tree_linked(&dir, me, false).unwrap();
+        done.skipped.sort();
+        assert_eq!(done.skipped, [dir.join("a/pair"), dir.join("pair")]);
+        std::fs::remove_file(dir.join("a/pair")).unwrap();
+        std::fs::remove_file(dir.join("pair")).unwrap();
+        let link = scratch("chown-tree-link");
+        std::fs::remove_dir(&link).unwrap();
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(chown_tree(&link, me).is_err());
+        if me == 0 {
+            use std::os::unix::fs::MetadataExt;
+            let owner = |p: &Path| std::fs::symlink_metadata(p).unwrap().uid();
+            std::fs::write(outside.join("hard"), b"x").unwrap();
+            std::fs::hard_link(outside.join("hard"), dir.join("a/hard")).unwrap();
+            std::fs::write(dir.join("pair"), b"x").unwrap();
+            std::fs::hard_link(dir.join("pair"), dir.join("a/b/pair")).unwrap();
+            let done = chown_tree_linked(&dir, 4321, true).unwrap();
+            // dir, a, a/b, a/b/f, a/link, dirlink, the pair's inode; not a/hard.
+            assert_eq!(done.changed, 7);
+            assert_eq!(done.skipped, [dir.join("a/hard")]);
+            for p in [
+                "", "a", "a/b", "a/b/f", "a/link", "dirlink", "pair", "a/b/pair",
+            ] {
+                assert_eq!(owner(&dir.join(p)), 4321, "{p}");
+            }
+            assert_eq!(owner(&outside.join("hard")), 0);
+            assert_eq!(owner(&outside.join("target")), 0);
+            assert_eq!(owner(&outside), 0);
+        }
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// [`open_dir`] follows a symlinked directory; [`open_dir_nofollow`] refuses it.
