@@ -78,6 +78,30 @@ use super::tee::amdsnp::launch as snp;
 /// Signal number (SIGRTMIN) used to kick Vcpus.
 pub(crate) const VCPU_RTSIG_OFFSET: i32 = 0;
 
+/// Hide CET (shadow stacks, indirect branch tracking) and the XSAVE components that hold its
+/// state from the guest (local patch, see VENDOR.md). Linux 6.18 gives a guest CET, and a
+/// snapshot does not carry all of a CET guest's live state: restored Windows Servers came
+/// back on a user shadow-stack pointer of 0 (a bug check at its next exception), and with the
+/// shadow-stack pointer and CET MSRs saved, to a double fault and a triple fault. A restore
+/// keeps the CPUID its snapshot was taken with.
+#[cfg(target_arch = "x86_64")]
+fn hide_cet(cpuid: &mut CpuId) {
+    const LEAF7_ECX_SHSTK: u32 = 1 << 7;
+    const LEAF7_EDX_IBT: u32 = 1 << 20;
+    const XSS_CET_U: u32 = 1 << 11;
+    const XSS_CET_S: u32 = 1 << 12;
+    for entry in cpuid.as_mut_slice() {
+        match (entry.function, entry.index) {
+            (0x7, 0) => {
+                entry.ecx &= !LEAF7_ECX_SHSTK;
+                entry.edx &= !LEAF7_EDX_IBT;
+            }
+            (0xd, 1) => entry.ecx &= !(XSS_CET_U | XSS_CET_S),
+            _ => {}
+        }
+    }
+}
+
 /// Errors associated with the wrappers over KVM ioctls.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -1402,6 +1426,8 @@ impl Vcpu {
             }
         }
 
+        hide_cet(&mut self.cpuid);
+
         if vcpu_config.hyperv_enabled {
             use arch::x86_64::linux::hyperv;
             let off = match hyperv::apply(&self.fd, &mut self.cpuid) {
@@ -2561,6 +2587,33 @@ mod tests {
             without_host_x2apic_ids(&again.cpuid),
             without_host_x2apic_ids(&saved.cpuid)
         );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_guest_is_given_no_cet() {
+        let entry = |function, index, ecx, edx| kvm_cpuid_entry2 {
+            function,
+            index,
+            ecx,
+            edx,
+            ..Default::default()
+        };
+        let mut cpuid = CpuId::from_entries(&[
+            entry(0x7, 0, u32::MAX, u32::MAX),
+            entry(0x7, 1, u32::MAX, u32::MAX),
+            entry(0xd, 1, u32::MAX, u32::MAX),
+        ])
+        .unwrap();
+        hide_cet(&mut cpuid);
+        let got = cpuid.as_slice();
+        // Shadow stacks and IBT, nothing else of leaf 7.
+        assert_eq!(got[0].ecx, !(1 << 7));
+        assert_eq!(got[0].edx, !(1 << 20));
+        assert_eq!((got[1].ecx, got[1].edx), (u32::MAX, u32::MAX));
+        // Nor the XSAVE components of CET's user and supervisor state.
+        assert_eq!(got[2].ecx, !((1 << 11) | (1 << 12)));
+        assert_eq!(got[2].edx, u32::MAX);
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "snapshot"))]

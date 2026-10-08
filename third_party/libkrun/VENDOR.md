@@ -623,6 +623,15 @@ yet set up again (Windows' virtio-rng between the firmware's ExitBootServices an
 saved them and restored without, so its snapshot did not restore. Covered by
 `a_transport_snapshotted_after_a_reset_restores`.
 
+`src/libkrun/src/vmm/linux/vstate.rs` — no CET for the guest: `hide_cet` clears shadow stacks
+and IBT from CPUID leaf 7 and CET's user and supervisor XSAVE components from leaf 0xD
+subleaf 1, before the CPUID is set. Linux 6.18 gives a guest CET, and a snapshot does not carry
+all of a CET guest's live state: on a 6.18 WSL2 host, Windows Servers restored from a snapshot
+came back on a user shadow-stack pointer of 0 (PAGE_FAULT_IN_NONPAGED_AREA at the next
+exception, writing to address -8), and with `KVM_REG_GUEST_SSP` and the CET MSRs saved too, to
+a double fault and a triple fault two minutes later. A restore keeps the CPUID its snapshot was
+taken with. Covered by `the_guest_is_given_no_cet`.
+
 `src/arch/src/x86_64/{acpi.rs,layout.rs}` + `src/devices/src/legacy/{acpi_pm.rs,i8042.rs,
 mod.rs,x86_64/{cmos.rs,serial.rs}}` + `src/libkrun/{Cargo.toml,src/api/vmm_builder.rs,
 src/vmm/{builder.rs,mod.rs,resources.rs,snapshot.rs,device_manager/kvm/pci.rs}}` +

@@ -33,6 +33,10 @@ All notable changes to virtkit will be documented in this file.
   then waited three hours on an agent that was not there. The first logon now leaves a startup
   task that installs qemu-ga again on the settle boot while its service is missing, which the
   settle step removes. The answer file changes, so a cached install is made anew.
+- **A guest restored from its snapshot no longer crashes on a host that gives it CET.** On a
+  Linux 6.18 host (WSL2's kernel today), KVM gives a guest CET shadow stacks, whose live state
+  a snapshot did not carry: a restored Windows Server stopped with
+  PAGE_FAULT_IN_NONPAGED_AREA within a minute. A guest is now given no CET.
 - **A Windows guest's agent comes back after a busy boot.** When a boot was busy (servicing,
   Windows Update, a loaded host), qemu-ga could miss its service start (event 7009) and stay
   down until the next boot: vk then waited out its timeout on a guest that was up, as a
