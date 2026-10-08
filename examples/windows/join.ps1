@@ -1,4 +1,5 @@
-# Provision a member at every start: use the DC ($env:LAB_DC, a service name) as its resolver,
+# Provision a member at every start: activate Windows if it is not, use the DC ($env:LAB_DC, a
+# service name) as its resolver,
 # then join the domain ($env:LAB_DOMAIN, corp.lab by default)
 # under the service's name with vkjoin (password in the join_password secret). Joining
 # requires a restart (exit 3010). Once joined, list the lab's users ($env:LAB_USERS) found in
@@ -21,6 +22,13 @@ function Retry([int] $tries, [int] $sleep, [scriptblock] $step) {
 }
 
 $domain = if ($env:LAB_DOMAIN) { $env:LAB_DOMAIN } else { 'corp.lab' }
+# An evaluation must be activated online: past its grace unactivated, Windows shuts down every
+# hour. Activate it while the run's own resolver still answers for the Internet; without a
+# network this fails and the lab goes on.
+$windows = Get-CimInstance SoftwareLicensingProduct -Filter "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL"
+if ($windows -and $windows.LicenseStatus -ne 1) {
+    cscript //nologo "$env:SystemRoot\System32\slmgr.vbs" /ato | Out-Host
+}
 $nic = (Get-NetAdapter | Where-Object Status -eq 'Up' | Select-Object -First 1).ifIndex
 $dc = Resolve-DnsName $env:LAB_DC -Server $env:VK_GATEWAY -Type A -DnsOnly |
     Select-Object -First 1 -ExpandProperty IPAddress

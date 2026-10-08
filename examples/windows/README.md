@@ -17,6 +17,9 @@ then run 180 days from activation; Windows 11 Enterprise evaluation 90 days. Eva
 is for evaluation only: see Microsoft's terms before sharing images built from it. A
 generalized image (`generalize=on`) starts a new 10-day grace on each machine; one that is not
 carries its build's licensing, and `vk run` and compose warn as its evaluation nears its end.
+A lab member's provisioning (`join.ps1`) activates an unactivated Windows at every start when
+the lab reaches the Internet: unactivated past its grace, a Windows 11 evaluation shuts down
+every hour.
 `vk build --reinstall` (with the same `-f` and `--target`) installs Windows again under new
 cache keys and rebuilds the image; bundles built on the old install keep working until they
 are rebuilt.

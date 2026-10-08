@@ -33,6 +33,11 @@ All notable changes to virtkit will be documented in this file.
   then waited three hours on an agent that was not there. The first logon now leaves a startup
   task that installs qemu-ga again on the settle boot while its service is missing, which the
   settle step removes. The answer file changes, so a cached install is made anew.
+- **The lab examples' Windows 11 workstations no longer shut down every hour.** Specialized
+  at build, they carry their build's evaluation licensing, and once its activation grace
+  ended Windows shut them down hourly (wlms). A lab member's provisioning (`join.ps1`) now
+  activates an unactivated Windows at every start when the lab reaches the Internet: 90 days
+  for Windows 11 Enterprise, 180 for Server.
 - **A guest restored from its snapshot no longer crashes on a host that gives it CET.** On a
   Linux 6.18 host (WSL2's kernel today), KVM gives a guest CET shadow stacks, whose live state
   a snapshot did not carry: a restored Windows Server stopped with
