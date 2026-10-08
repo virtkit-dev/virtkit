@@ -99,6 +99,9 @@ pub struct Hub {
     /// Whether the web UI signs people in through OIDC, with the roles granted in the
     /// database.
     pub oidc: bool,
+    /// The enrollment and connection URL for `vk node join`, when known
+    /// ([`crate::config::HubConfig::node_url`]).
+    pub node_url: Option<String>,
     /// Where release binaries are kept; `None` for a hub that holds none.
     releases: Option<std::path::PathBuf>,
     /// Held by a release's add or remove, from its file to its row.
@@ -154,6 +157,7 @@ impl Hub {
             downloads: Arc::new(Semaphore::new(MAX_DOWNLOADS)),
             ui_url,
             oidc: false,
+            node_url: None,
             releases: None,
             releases_lock: Mutex::new(()),
             fetches: crate::fetch::Fetches::new(None),
@@ -234,6 +238,12 @@ impl Hub {
     /// This hub, signing people in to its web UI through OIDC.
     pub fn with_oidc(mut self) -> Self {
         self.oidc = true;
+        self
+    }
+
+    /// This hub, advertising `url` as its node endpoint.
+    pub fn with_node_url(mut self, url: Option<String>) -> Self {
+        self.node_url = url;
         self
     }
 

@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **Operators enroll nodes from `vk-hub`'s web UI.** The nodes page issues single-use
+  enrollment tokens, like `vk-hub token create`, valid for an hour, ten minutes, a day or
+  seven days. Each token appears once with a `vk node join` command using the hub's node
+  address: `addr`'s port and, when it binds every address, the UI's hostname.
 - **`vk node join --user NAME --service`, as root, moves a host onto a hub in one command.**
   `--user` creates the user when there is none, adds it to `/dev/kvm`'s group, hands it the
   state dir and what is already in it, checks it can read the config, and enrolls as it;

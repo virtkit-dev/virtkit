@@ -903,6 +903,7 @@ async fn serve(cfg: HubConfig) -> Result<()> {
     // Before anything could be staging a release: what is staged is a stopped hub's.
     releases::sweep(&cfg.releases_dir());
     let mut hub = server::Hub::new(db, cfg.ui.as_ref().map(|ui| ui.url.clone()))
+        .with_node_url(cfg.node_url())
         .with_releases(cfg.releases_dir())
         .with_release_source(cfg.release_source.clone());
     if oidc.is_some() {

@@ -111,6 +111,35 @@ struct FileOidc {
 }
 
 impl HubConfig {
+    /// The hub URL for `vk node join`, using `addr`'s port and the UI's hostname when `addr`
+    /// binds every address or the UI's IP. Otherwise use `addr`'s IP; TLS accepts it only if
+    /// the certificate names that IP. Returns `None` when neither supplies a host a node can dial.
+    pub fn node_url(&self) -> Option<String> {
+        let tls = self.tls_cert.is_some();
+        // The UI's origin is normalized: `scheme://host[:port]`, an IPv6 host bracketed.
+        let ui_host = || -> Option<String> {
+            let authority = self.ui.as_ref()?.url.split_once("://")?.1;
+            Some(match authority.strip_prefix('[') {
+                Some(v6) => format!("[{}]", v6.split_once(']')?.0),
+                None => authority.split(':').next()?.to_string(),
+            })
+        };
+        let ip = self.addr.ip();
+        let host = match ip {
+            ip if ip.is_unspecified() => ui_host()?,
+            ip if self.ui.as_ref().is_some_and(|ui| ui.addr.ip() == ip) => ui_host()?,
+            std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+            v4 => v4.to_string(),
+        };
+        let (scheme, default) = if tls { ("https", 443) } else { ("http", 80) };
+        let port = self.addr.port();
+        Some(if port == default {
+            format!("{scheme}://{host}")
+        } else {
+            format!("{scheme}://{host}:{port}")
+        })
+    }
+
     /// Read `path`, or the defaults when there is none.
     pub fn load(path: Option<&Path>) -> Result<Self> {
         let file = match path {
@@ -436,6 +465,46 @@ mod tests {
         assert_eq!(cfg.db_path(), Path::new("/srv/hub/hub.db"));
         assert_eq!(cfg.admin_socket(), Path::new("/srv/hub/admin.sock"));
         assert!(parse("tls_crt = \"/c.pem\"\n").is_err());
+    }
+
+    #[test]
+    fn nodes_are_told_the_node_listener_on_the_host_the_ui_is_reached_at() {
+        let tls = "tls_cert = \"/c.pem\"\ntls_key = \"/k.pem\"\ndata_dir = \"/d\"\n";
+        let url = |extra: &str| parse(&format!("{tls}{extra}")).unwrap().node_url();
+        let ui = "ui_addr = \"0.0.0.0:443\"\nui_url = \"https://hub.example.com\"\n";
+        assert_eq!(
+            url(&format!("addr = \"0.0.0.0:8443\"\n{ui}")).as_deref(),
+            Some("https://hub.example.com:8443")
+        );
+        assert_eq!(
+            url(&format!("addr = \"0.0.0.0:443\"\n{ui}")).as_deref(),
+            Some("https://hub.example.com")
+        );
+        let v6 = "ui_addr = \"[::]:8444\"\nui_url = \"https://[2001:db8::1]:8444\"\n";
+        assert_eq!(
+            url(&format!("addr = \"[::]:8443\"\n{v6}")).as_deref(),
+            Some("https://[2001:db8::1]:8443")
+        );
+        assert_eq!(
+            url("addr = \"10.0.0.5:8443\"\n").as_deref(),
+            Some("https://10.0.0.5:8443")
+        );
+        // On the UI's IP, by the UI's name, which the certificate more likely covers.
+        let same_ip = "ui_addr = \"10.0.0.5:443\"\nui_url = \"https://hub.example.com\"\n";
+        assert_eq!(
+            url(&format!("addr = \"10.0.0.5:8443\"\n{same_ip}")).as_deref(),
+            Some("https://hub.example.com:8443")
+        );
+        assert_eq!(
+            url(&format!("addr = \"10.0.0.6:8443\"\n{same_ip}")).as_deref(),
+            Some("https://10.0.0.6:8443")
+        );
+        // Bound everywhere, with no UI to name a host.
+        assert_eq!(url("addr = \"0.0.0.0:8443\"\n"), None);
+        assert_eq!(
+            parse("data_dir = \"/d\"\n").unwrap().node_url().as_deref(),
+            Some("http://127.0.0.1:8443")
+        );
     }
 
     #[test]

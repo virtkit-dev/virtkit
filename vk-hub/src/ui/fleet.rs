@@ -3,7 +3,8 @@
 //! pause, resume or abort rollouts through the shared admin-socket operations ([`crate::ops`])
 //! as their session's principal. A reset, which deletes what the node's past jobs left, is
 //! confirmed first ([`actions::ask_first`]). Monitoring-only nodes have no steering controls.
-//! Operators add releases and start rollouts from `/operations` ([`super::operations`]).
+//! Operators add releases and start rollouts from `/operations` ([`super::operations`]), and
+//! issue enrollment tokens from the nodes page ([`create_token`]).
 
 use std::sync::Arc;
 
@@ -31,6 +32,18 @@ use crate::store::{
 
 /// A node page's latest commands.
 const NODE_COMMANDS: usize = 20;
+
+/// Where the nodes page's form issues an enrollment token.
+pub(super) const TOKEN_PATH: &str = "/tokens";
+
+/// Token lifetimes offered by the form, in seconds. The first is the default, matching
+/// `vk-hub token create`; the CLI accepts any lifetime up to the store's limit.
+const TOKEN_TTLS: [(u64, &str); 4] = [
+    (3_600, "1 hour"),
+    (600, "10 minutes"),
+    (86_400, "1 day"),
+    (7 * 86_400, "7 days"),
+];
 
 /// The rollouts `/operations` shows, newest first.
 const OPERATIONS_ROLLOUTS: usize = 10;
@@ -512,7 +525,89 @@ fn nodes(auth: &Auth, nodes: &[NodeView], now: u64) -> Html {
         .raw("<div id=\"nodes\" hx-ext=\"sse\" sse-connect=\"/events/nodes\" sse-swap=\"nodes\" sse-close=\"close\">")
         .html(&nodes_table(nodes, now))
         .raw("</div>");
+    if auth.session.role >= Role::Operator {
+        token_form(&mut main, auth);
+    }
     layout("nodes", auth, &main)
+}
+
+/// An operator's enrollment form, outside the live fragment. A plain POST returns the token
+/// on its own page so it is not sent to every viewer in a shared fragment.
+fn token_form(h: &mut Html, auth: &Auth) {
+    h.raw("<section><h2>Enroll a node</h2><form method=\"post\" action=\"")
+        .raw(TOKEN_PATH)
+        .raw("\">");
+    pages::csrf_field(h, auth);
+    h.raw("<label>valid for <select name=\"ttl\">");
+    for (secs, label) in TOKEN_TTLS {
+        h.raw("<option value=\"")
+            .text(secs.to_string())
+            .raw("\">")
+            .text(label)
+            .raw("</option>");
+    }
+    h.raw("</select></label><button>issue an enrollment token</button></form>")
+        .raw("<p class=\"sub\">Single-use: the node redeems it with <code>vk node join</code>, ")
+        .raw("which pins the node's key. Shown a single time.</p></section>");
+}
+
+/// `POST /tokens`: issue a single-use enrollment token, audited as the operator's session
+/// principal. Show it once with redemption instructions; store only its hash and never log it.
+pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
+    let (auth, form) = match super::check_post(req, ui, Role::Operator).await? {
+        Ok(checked) => checked,
+        Err((status, text)) => return Ok(message(status, text)),
+    };
+    let Some(ttl) = field(&form, "ttl")
+        .and_then(|t| t.parse::<u64>().ok())
+        .filter(|t| TOKEN_TTLS.iter().any(|(secs, _)| secs == t))
+    else {
+        return Ok(message(
+            StatusCode::BAD_REQUEST,
+            "Refused: not one of the form's lifetimes.",
+        ));
+    };
+    let (hub, principal) = (ui.hub.clone(), auth.session.principal());
+    let (token, expires_at) = blocking(move || {
+        hub.db.create_token(
+            std::time::Duration::from_secs(ttl),
+            &principal,
+            crate::now_secs(),
+        )
+    })
+    .await?;
+    eprintln!(
+        "vk-hub: ui: {} issued an enrollment token valid for {ttl}s",
+        auth.session.principal()
+    );
+    let mut main = Html::new();
+    main.raw("<h1>Enrollment token</h1><p>Single-use, valid until ")
+        .text(started(expires_at))
+        .raw(". It is shown this once: copy it now.</p><pre>")
+        .text(&token)
+        .raw("</pre><p>On the node, as root, run this, then paste the token and press Enter ")
+        .raw("(it is read on stdin): it sets the host up for ")
+        .raw("the user the node runs as — created if need be, given <code>/dev/kvm</code> and ")
+        .raw("the state dir — enrolls it, and runs the node as a service:</p><pre>");
+    let url = |h: &mut Html| {
+        match &ui.hub.node_url {
+            Some(url) => h.text(url),
+            None => h.raw("&lt;hub-url&gt;"),
+        };
+    };
+    main.raw("vk node join ");
+    url(&mut main);
+    main.raw(" --token - --user gitlab-runner --service</pre>")
+        .raw("<p class=\"sub\">Add <code>--replace</code> for a host already enrolled: its old ")
+        .raw("identity is moved aside and <code>join</code> prints the old node's ID, to ")
+        .raw("remove with <code>vk-hub nodes remove &lt;id&gt;</code> on the hub. As the user ")
+        .raw("itself, without root: ")
+        .raw("<code>vk node join ");
+    url(&mut main);
+    main.raw(" --token -</code>, then <code>vk node service install</code>. Read on stdin, ")
+        .raw("the token stays out of the shell's history and the process list.</p>")
+        .raw("<p><a href=\"/\">back to the nodes</a></p>");
+    Ok(page(layout("enrollment token", &auth, &main)))
 }
 
 // Where the pages put cells of their own, by column of `vk-hub nodes` and of a node's
@@ -564,8 +659,8 @@ const fn column_is(columns: &[&str], i: usize, name: &str) -> bool {
 fn nodes_table(nodes: &[NodeView], now: u64) -> Html {
     let mut h = Html::new();
     if nodes.is_empty() {
-        h.raw("<p class=\"empty\">No node has enrolled yet: <code>vk-hub token create</code> ")
-            .raw("issues a token for <code>vk node join</code>.</p>");
+        h.raw("<p class=\"empty\">No node has enrolled yet: an operator issues a token for ")
+            .raw("<code>vk node join</code> below, or with <code>vk-hub token create</code>.</p>");
         return h;
     }
     h.raw("<table class=\"grid\"><thead><tr>");

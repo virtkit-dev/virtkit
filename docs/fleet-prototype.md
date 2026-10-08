@@ -656,8 +656,11 @@ undrain, quarantine, release, and reset, which requires confirmation from the sa
 once and within ten minutes, as local mode's stops do. Each action returns a status line
 through htmx while the node's fragment updates live, and also works as a plain form.
 Monitoring-only nodes are marked, offer no actions and reject steering posts. Viewers have no
-actions. Removing a node stays on the admin socket. A page is refused to a request whose
-`Sec-Fetch-Site` is `same-site` or `cross-site`.
+actions. Operators also issue enrollment tokens from the nodes page, like `vk-hub token
+create`, valid for an hour, ten minutes, a day or seven days. A plain POST to `/tokens` uses
+the same origin, CSRF and role checks and returns a page showing the token once. Issuance is
+audited as the session's principal; the token is never logged. Removing a node stays on the
+admin socket. A page is refused to a request whose `Sec-Fetch-Site` is `same-site` or `cross-site`.
 
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a

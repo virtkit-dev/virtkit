@@ -2062,6 +2062,11 @@ async fn start_fleet() -> (SocketAddr, Arc<Hub>, String) {
 /// [`start_fleet`], the UI configured as reached over `scheme`: the test still speaks plain
 /// HTTP to it, as to one behind a proxy that ends TLS.
 async fn start_fleet_as(scheme: &str) -> (SocketAddr, Arc<Hub>, String) {
+    start_fleet_with(scheme, None).await
+}
+
+/// [`start_fleet_as`], with `node_url` advertised as the hub's node endpoint.
+async fn start_fleet_with(scheme: &str, node_url: Option<&str>) -> (SocketAddr, Arc<Hub>, String) {
     let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let origin = format!("{scheme}://{addr}");
@@ -2070,11 +2075,91 @@ async fn start_fleet_as(scheme: &str) -> (SocketAddr, Arc<Hub>, String) {
     let releases = std::env::temp_dir().join(format!("vk-hub-ui-releases-{}", std::process::id()));
     let hub = Arc::new(
         Hub::new(Arc::new(Db::open_memory().unwrap()), Some(origin.clone()))
-            .with_releases(releases),
+            .with_releases(releases)
+            .with_node_url(node_url.map(str::to_string)),
     );
     let ui = Arc::new(Ui::new(hub.clone(), &origin));
     tokio::spawn(serve(listener, None, ui));
     (addr, hub, origin)
+}
+
+/// Operators receive a redeemable token once in the POST response, audited as their session.
+/// Viewers see no form and cannot request a token.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_issues_an_enrollment_token_from_the_nodes_page() {
+    let (addr, hub, origin) = start_fleet().await;
+    let (viewer, viewer_csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, "/", Some(&viewer)).await;
+    assert!(
+        page.body.contains("an operator issues a token"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("action=\"/tokens\""), "{}", page.body);
+    let form = format!("_csrf={viewer_csrf}&ttl=3600");
+    let reply = post_action(addr, &origin, &viewer, "/tokens", &form, false).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, "/", Some(&operator)).await;
+    assert!(page.body.contains("action=\"/tokens\""), "{}", page.body);
+    // Only a lifetime the form offers, and only with the session's CSRF token.
+    for (form, status) in [
+        (format!("_csrf={csrf}&ttl=5"), 400),
+        ("ttl=3600".to_string(), 403),
+    ] {
+        let reply = post_action(addr, &origin, &operator, "/tokens", &form, false).await;
+        assert_eq!(reply.status, status, "{form}: {}", reply.body);
+    }
+    let form = format!("_csrf={csrf}&ttl=3600");
+    let reply = post_action(addr, &origin, &operator, "/tokens", &form, false).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.header("cache-control"), Some("no-store"));
+    assert!(
+        reply
+            .body
+            .contains("vk node join &lt;hub-url&gt; --token - --user gitlab-runner --service"),
+        "{}",
+        reply.body
+    );
+    let at = reply.body.find("vkh_").expect("the token");
+    let token: String = reply.body[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    assert!(matches!(
+        hub.db.enroll(&token, "aa", "node", "peer p", 1).unwrap(),
+        crate::store::Enrollment::Enrolled { .. }
+    ));
+    let audit = hub.db.audit_page(None, None, 10).unwrap();
+    assert!(
+        audit.iter().any(|(_, row)| row.actor.contains("(operator)")
+            && row
+                .event
+                .contains("issued an enrollment token valid for 3600s")),
+        "{:?}",
+        audit
+            .iter()
+            .map(|(_, r)| (&r.actor, &r.event))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The token page's `vk node join` command uses the hub's node address.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_token_page_names_the_hubs_node_address() {
+    let (addr, hub, origin) = start_fleet_with("http", Some("https://hub.example.com:8443")).await;
+    let (operator, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let form = format!("_csrf={csrf}&ttl=3600");
+    let reply = post_action(addr, &origin, &operator, "/tokens", &form, false).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("vk node join https://hub.example.com:8443 --token -"),
+        "{}",
+        reply.body
+    );
 }
 
 /// What a node sends reaches a page as text: nothing it says becomes markup or script.
