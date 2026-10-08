@@ -160,10 +160,12 @@ interleaving to be deterministic.
 The end-to-end races live with the virtio-blk device that provokes them, in
 `third_party/libkrun/src/devices` (`block/device.rs`), since they need real threads writing
 through a shared `FormatAccess` and only that crate builds imago with `sync`:
-`concurrent_writes_into_one_qcow2_cluster_all_land` (two writes into one cluster) and
+`concurrent_writes_into_one_qcow2_cluster_all_land` (two writes into one cluster),
+`concurrent_writes_into_one_backed_qcow2_cluster_all_land` (the same over a raw backing, so a
+sharer that redid the copy-on-write would overwrite bytes already written) and
 `a_write_extending_its_run_never_supersedes_a_claim_in_flight` (a multi-cluster write's contiguous
-run meeting a claim in flight). Both fail against the unpatched `qcow2/cow.rs`. They are
-probabilistic by nature, so both loop over many rounds rather than racing once.
+run meeting a claim in flight). All fail against the unpatched `qcow2/cow.rs`. They are
+probabilistic by nature, so all loop over many rounds rather than racing once.
 
 Suspected (not confirmed upstream) root cause of a `vk build` corruption incident: real
 `Input/output error`s from ext4 on unrelated later operations touching the same region. Image is

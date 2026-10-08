@@ -1169,21 +1169,33 @@ mod tests {
         dir
     }
 
-    /// A writable qcow2 disk of `size` bytes, backing-less, under its own temp dir: `(dir,
-    /// image)`, the caller removing `dir` when done. The race tests below each drive their own
-    /// concurrent workload through one of these; `size` is the bytes that workload addresses.
-    fn race_image(tag: &str, size: u64) -> (PathBuf, SharedImage) {
+    /// A temp dir removed when dropped, so that a failed assertion leaves nothing behind.
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A writable qcow2 disk of `size` bytes under its own temp dir, over a raw image holding
+    /// `backing` if given: `(dir, image)`, the dir removed when dropped. The race tests below
+    /// each drive their own concurrent workload through one of these; `size` is the bytes that
+    /// workload addresses.
+    fn race_image(tag: &str, size: u64, backing: Option<&[u8]>) -> (TempDir, SharedImage) {
         use imago::FormatCreateBuilder;
 
-        let dir = temp_dir(tag);
-        let path = dir.join("img.qcow2");
+        let dir = TempDir(temp_dir(tag));
+        let path = dir.0.join("img.qcow2");
         let open_file =
             || ImagoFile::open(StorageOpenOptions::new().write(true).filename(&path)).unwrap();
         std::fs::File::create(&path).unwrap();
-        BoxedQcow2::create_builder(Box::new(open_file()))
-            .size(size)
-            .create()
-            .unwrap();
+        let mut builder = BoxedQcow2::create_builder(Box::new(open_file())).size(size);
+        if let Some(bytes) = backing {
+            std::fs::write(dir.0.join("base.raw"), bytes).unwrap();
+            builder = builder.backing("base.raw".into(), "raw".into());
+        }
+        builder.create().unwrap();
         let image = Arc::new(RwLock::new(FormatAccess::new(
             open_qcow2_chain(Box::new(open_file()), true).unwrap(),
         )));
@@ -1596,7 +1608,7 @@ mod tests {
         // Several clusters, each written by a fresh concurrent burst: one round can get lucky.
         const CLUSTERS: u64 = 8;
 
-        let (dir, fa) = race_image("qcow2-cluster-race", CLUSTER * CLUSTERS);
+        let (_dir, fa) = race_image("qcow2-cluster-race", CLUSTER * CLUSTERS, None);
         let pattern = |c: u64, t: u64| ((c * THREADS + t) % 251 + 1) as u8;
 
         for c in 0..CLUSTERS {
@@ -1635,8 +1647,70 @@ mod tests {
                 );
             }
         }
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    /// The same race over an overlay whose backing image holds data, as a bundle's disk is: each
+    /// first write into a cluster copies the backing's other bytes in (copy-on-write). BitLocker
+    /// encrypting a volume rewrites every used sector in place this way, many to a cluster at
+    /// once. Every slice written must read back, and every slice left unwritten must keep the
+    /// backing's bytes.
+    #[test]
+    fn concurrent_writes_into_one_backed_qcow2_cluster_all_land() {
+        use imago::io_buffers::{IoVector, IoVectorMut};
+        use std::io::{IoSlice, IoSliceMut};
+
+        const CLUSTER: u64 = 64 * 1024;
+        const SLICE: u64 = 4096;
+        const THREADS: u64 = CLUSTER / SLICE;
+        const CLUSTERS: u64 = 32;
+        const BACKING: u8 = 0xee;
+
+        let backing = vec![BACKING; (CLUSTER * CLUSTERS) as usize];
+        let (_dir, fa) = race_image(
+            "qcow2-backed-cluster-race",
+            CLUSTER * CLUSTERS,
+            Some(&backing),
+        );
+        let pattern = |c: u64, t: u64| ((c * THREADS + t) % 251 + 1) as u8;
+
+        // Every other slice, so the copy-on-write has backing bytes to carry between them.
+        for c in 0..CLUSTERS {
+            std::thread::scope(|scope| {
+                for t in (0..THREADS).step_by(2) {
+                    let fa = Arc::clone(&fa);
+                    scope.spawn(move || {
+                        let buf = vec![pattern(c, t); SLICE as usize];
+                        fa.read()
+                            .unwrap()
+                            .writev(
+                                IoVector::from(vec![IoSlice::new(&buf)]),
+                                c * CLUSTER + t * SLICE,
+                            )
+                            .unwrap();
+                    });
+                }
+            });
+        }
+        fa.read().unwrap().flush().unwrap();
+
+        for c in 0..CLUSTERS {
+            for t in 0..THREADS {
+                let mut got = vec![0u8; SLICE as usize];
+                fa.read()
+                    .unwrap()
+                    .readv(
+                        IoVectorMut::from(vec![IoSliceMut::new(&mut got)]),
+                        c * CLUSTER + t * SLICE,
+                    )
+                    .unwrap();
+                let want = if t % 2 == 0 { pattern(c, t) } else { BACKING };
+                assert_eq!(
+                    got,
+                    vec![want; SLICE as usize],
+                    "cluster {c}, slice {t} did not survive its concurrent neighbours"
+                );
+            }
+        }
     }
 
     /// Write-zeroes and a write can land in the same 64 KiB cluster in one batch (see
@@ -1655,7 +1729,7 @@ mod tests {
         // at 64 rounds a regression still slips through about half the time.
         const CLUSTERS: u64 = 1024;
 
-        let (dir, fa) = race_image("qcow2-zero-race", CLUSTER * CLUSTERS);
+        let (_dir, fa) = race_image("qcow2-zero-race", CLUSTER * CLUSTERS, None);
 
         for c in 0..CLUSTERS {
             std::thread::scope(|scope| {
@@ -1703,8 +1777,6 @@ mod tests {
                 "cluster {c}: the write-zeroes did not survive the write beside it"
             );
         }
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The same race one cluster over: a multi-cluster write extends its host allocation as a
@@ -1723,7 +1795,7 @@ mod tests {
         // Several rounds, each on its own pair of clusters: one round can get lucky.
         const ROUNDS: u64 = 64;
 
-        let (dir, fa) = race_image("qcow2-run-vs-claim", CLUSTER * 2 * ROUNDS);
+        let (_dir, fa) = race_image("qcow2-run-vs-claim", CLUSTER * 2 * ROUNDS, None);
 
         for round in 0..ROUNDS {
             // `head` is written in full plus the leading bytes of `tail`'s cluster (so its
@@ -1771,8 +1843,6 @@ mod tests {
                 "round {round}: the head write lost its last cluster"
             );
         }
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The other half of the same locking scheme: `discard`, both forms of write-zeroes, the
