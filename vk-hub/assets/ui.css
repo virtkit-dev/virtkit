@@ -81,3 +81,13 @@ pre {
   max-height: 40rem;
   margin: 0.3rem 0;
 }
+.steer .groups { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-start; }
+.steer .group { flex: 1 1 20rem; border: 1px solid var(--line); border-radius: 4px; padding: 0.4rem 0.75rem 0.5rem; }
+.steer .group h3 { margin: 0 0 0.3rem; }
+.steer .group.danger { border-color: var(--down); }
+.steer .group.danger h3, button.danger { color: var(--down); }
+.steer .now { font-weight: 600; margin: 0.3rem 0; }
+.steer form.act { display: flex; flex-wrap: wrap; gap: 0.2rem 0.6rem; align-items: baseline; margin: 0.3rem 0; }
+.steer form.act button { min-width: 8rem; }
+.steer .does { color: var(--muted); }
+.steer input[type="number"] { width: 5rem; }

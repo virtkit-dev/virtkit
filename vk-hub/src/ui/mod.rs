@@ -403,10 +403,7 @@ fn event_name(event: &str, ui: &Ui) -> Option<&'static str> {
 /// What `/events/<event>` streams, if it is one of this site's, for `auth`'s page.
 fn source(event: &str, ui: &Ui, auth: &Auth) -> Option<sse::Source> {
     match &ui.site {
-        Site::Fleet(site) => {
-            let steer = auth.session.role >= Role::Operator;
-            fleet::source(event, &ui.hub, site, steer)
-        }
+        Site::Fleet(site) => fleet::source(event, &ui.hub, site, auth),
         Site::Local(site) => local::source(event, &ui.hub, site),
     }
 }

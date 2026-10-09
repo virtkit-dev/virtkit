@@ -62,8 +62,13 @@ fn head(h: &mut Html, title: &str) {
 
 /// The hidden field carrying the session's CSRF token.
 pub fn csrf_field(h: &mut Html, auth: &Auth) {
+    csrf_input(h, &auth.csrf);
+}
+
+/// The hidden field carrying a session's CSRF token, `csrf`.
+pub fn csrf_input(h: &mut Html, csrf: &str) {
     h.raw("<input type=\"hidden\" name=\"_csrf\" value=\"")
-        .text(&auth.csrf)
+        .text(csrf)
         .raw("\">");
 }
 

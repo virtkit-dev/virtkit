@@ -1,8 +1,10 @@
 //! The fleet site for `vk-hub serve`: the nodes table, per-node inventory, load, workloads,
 //! steering, commands, releases and rollouts, and the audit log. Operators steer nodes and
 //! pause, resume or abort rollouts through the shared admin-socket operations ([`crate::ops`])
-//! as their session's principal. A reset, which deletes what the node's past jobs left, is
-//! confirmed first ([`actions::ask_first`]). Monitoring-only nodes have no steering controls.
+//! as their session's principal; a node's page offers, in plain words, only those that apply
+//! to where the node stands ([`Panel`]). A reset, which deletes what the node's past jobs
+//! left, is confirmed first ([`actions::ask_first`]). Monitoring-only nodes have no steering
+//! controls.
 //! Operators add releases and start rollouts from `/operations` ([`super::operations`]),
 //! which also lists client API jobs, read only. They issue enrollment tokens from the
 //! nodes page ([`create_token`]).
@@ -98,9 +100,10 @@ pub(super) fn event_name(event: &str) -> Option<&'static str> {
     }
 }
 
-/// What `/events/<event>` streams, if it is one of the fleet's, for a page whose session may
-/// `steer`: an operator's `/operations` carries the rollouts' buttons.
-pub(super) fn source(event: &str, hub: &Arc<Hub>, site: &FleetSite, steer: bool) -> Option<Source> {
+/// A fleet `/events/<event>` stream for `auth`'s page. Operators see rollout buttons on
+/// `/operations` and node steering actions rendered per stream with the session's CSRF token.
+pub(super) fn source(event: &str, hub: &Arc<Hub>, site: &FleetSite, auth: &Auth) -> Option<Source> {
+    let steer = auth.session.role >= Role::Operator;
     match event {
         "nodes" => {
             return Some(Source::Shared {
@@ -128,10 +131,11 @@ pub(super) fn source(event: &str, hub: &Arc<Hub>, site: &FleetSite, steer: bool)
         .filter(|id| vk_hub_proto::valid_id(id))?
         .to_string();
     let hub = hub.clone();
+    let csrf = steer_token(auth).map(str::to_string);
     Some(Source::Own {
         name: "node",
         changes: hub.subscribe_node(&id),
-        render: Arc::new(move || render_node(&hub, &id)),
+        render: Arc::new(move || render_node(&hub, &id, csrf.as_deref())),
     })
 }
 
@@ -237,10 +241,11 @@ struct Operations {
     latest: Option<(String, u64)>,
 }
 
-/// Node `id`'s page fragment, or the line saying it has gone.
-fn render_node(hub: &Hub, id: &str) -> Result<String> {
+/// Node `id`'s page fragment, with its steering actions given `csrf`, or the line saying it
+/// has gone.
+fn render_node(hub: &Hub, id: &str, csrf: Option<&str>) -> Result<String> {
     Ok(match read_node(hub, id)? {
-        Some(detail) => node_detail(&detail, crate::now_secs()).into_string(),
+        Some(detail) => node_detail(&detail, crate::now_secs(), csrf).into_string(),
         None => gone().into_string(),
     })
 }
@@ -284,18 +289,6 @@ enum Steer {
     Acquisition(Acquisition),
     Command(Operation),
 }
-
-/// The actions a node's page offers beside setting a ceiling, as `(op, label)`.
-const NODE_OPS: [(&str, &str); 8] = [
-    ("lift-ceiling", "lift ceiling"),
-    ("stop", "stop acquisition"),
-    ("resume", "resume acquisition"),
-    ("drain", "drain"),
-    ("undrain", "undrain"),
-    ("quarantine", "quarantine"),
-    ("release", "release"),
-    ("reset", "reset"),
-];
 
 /// What `form` asks, or why it is no action.
 fn steer(form: &[(String, String)]) -> Result<Steer, &'static str> {
@@ -724,34 +717,269 @@ fn node(auth: &Auth, detail: &NodeDetail, now: u64) -> Html {
     let id = &detail.view.id;
     let mut main = Html::new();
     main.raw("<h1>").node(&detail.view.hostname).raw("</h1>");
-    if auth.session.role >= Role::Operator && !detail.view.monitoring_only() {
-        steer_forms(&mut main, auth, id);
+    let csrf = steer_token(auth);
+    if csrf.is_some() && !detail.view.monitoring_only() {
+        // Outside the live fragment, so an update never clears what an action said.
+        main.raw("<div id=\"flash\"></div>");
     }
     main.raw("<div id=\"detail\" hx-ext=\"sse\" sse-connect=\"/events/node/")
         .text(id)
         .raw("\" sse-swap=\"node\" sse-close=\"close\">")
-        .html(&node_detail(detail, now))
+        .html(&node_detail(detail, now, csrf))
         .raw("</div>");
     layout(&detail.view.hostname, auth, &main)
 }
 
-/// An operator's forms, outside the live fragment so an update never clears one being filled
-/// in or the flash. Each posts by htmx, and works as a plain form too.
-fn steer_forms(h: &mut Html, auth: &Auth, id: &str) {
-    let path = format!("/node/{id}/action");
-    h.raw("<section><h2>Steer</h2><div class=\"actions\"><form method=\"post\" action=\"")
-        .text(&path)
-        .raw("\" hx-post=\"")
-        .text(&path)
-        .raw("\" hx-swap=\"none\">");
-    pages::csrf_field(h, auth);
-    h.raw("<input type=\"hidden\" name=\"op\" value=\"ceiling\">")
-        .raw("<input type=\"number\" name=\"ceiling\" min=\"1\" required aria-label=\"ceiling\">")
-        .raw("<button>set ceiling</button></form>");
-    for (op, label) in NODE_OPS {
-        actions::op_form(h, auth, &path, op, label);
+/// The session's CSRF token for node actions, or `None` to omit unauthorized controls.
+fn steer_token(auth: &Auth) -> Option<&str> {
+    (auth.session.role >= Role::Operator).then_some(auth.csrf.as_str())
+}
+
+/// One action of a node page's steering panel: its `op`, its button, and what it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Act {
+    op: &'static str,
+    label: &'static str,
+    does: &'static str,
+}
+
+const PAUSE: Act = Act {
+    op: "stop",
+    label: "Pause intake",
+    does: "Take no new jobs; the running ones finish.",
+};
+const RESUME: Act = Act {
+    op: "resume",
+    label: "Resume intake",
+    does: "Take new jobs again.",
+};
+const LIFT: Act = Act {
+    op: "lift-ceiling",
+    label: "Remove the limit",
+    does: "Let the node decide how many jobs it runs at once.",
+};
+const DRAIN: Act = Act {
+    op: "drain",
+    label: "Drain",
+    does: "Finish the running jobs and take no new ones, for maintenance.",
+};
+const STAY_DRAINED: Act = Act {
+    op: "drain",
+    label: "Stay drained",
+    does: "Keep the node drained once the update or reset ends.",
+};
+const UNDRAIN: Act = Act {
+    op: "undrain",
+    label: "Undrain",
+    does: "Back in service: take jobs again.",
+};
+const QUARANTINE: Act = Act {
+    op: "quarantine",
+    label: "Quarantine",
+    does: "Take the node out of service until it is released: no jobs, no updates, no \
+           resets. For a node you no longer trust.",
+};
+const RELEASE: Act = Act {
+    op: "release",
+    label: "Release",
+    does: "Return the node to service, drained if it was drained before.",
+};
+const RESET: Act = Act {
+    op: "reset",
+    label: "Reset",
+    does: "Drain, stop what past jobs left running, and delete their job directories and \
+           the idle checkouts. Asked again first.",
+};
+
+/// A node page's steering, by group: where the node stands on each thing an operator
+/// steers, and the actions that apply from there. Every action posts to the same route
+/// whatever is offered: the hub and the node refuse what does not apply, as they would from
+/// `vk-hub nodes`; the panel offers what makes sense now.
+struct Panel {
+    /// Why some of the node's steering does not apply, if it does not.
+    note: Option<&'static str>,
+    intake: String,
+    intake_acts: Vec<Act>,
+    limit: String,
+    lift: Option<Act>,
+    maintenance: &'static str,
+    maintenance_acts: Vec<Act>,
+    danger_acts: Vec<Act>,
+}
+
+impl Panel {
+    fn of(v: &NodeView) -> Panel {
+        use vk_hub_proto::NodeState;
+        let report = v.report.as_ref();
+        let state = report.and_then(|r| r.state);
+        let external = report.and_then(|r| r.runner) == Some(RunnerMode::External);
+        let paused = v
+            .desired
+            .as_ref()
+            .is_some_and(|d| d.acquisition == Acquisition::Stop);
+        let ceiling = v.desired.as_ref().and_then(|d| d.ceiling);
+        let effective = report.and_then(|r| r.concurrency).and_then(|c| c.effective);
+
+        let stopped = match state {
+            _ if paused => Some(": intake paused"),
+            Some(NodeState::Ready) | None => None,
+            Some(NodeState::Draining) => Some(" while draining"),
+            Some(NodeState::Drained) => Some(" while drained"),
+            Some(NodeState::Maintenance) => Some(" while under maintenance"),
+            Some(NodeState::Validating) => Some(" while checking itself"),
+            Some(NodeState::Quarantined) => Some(" while quarantined"),
+        };
+        let intake = match stopped {
+            None => "Taking new jobs".to_string(),
+            // Pausing intake of the hub's jobs does not stop the external runner.
+            Some(why) if external => {
+                format!("Not taking the hub's jobs{why}; the external runner may still take jobs")
+            }
+            Some(why) => format!("Not taking new jobs{why}"),
+        };
+        let intake_acts = if paused { vec![RESUME] } else { vec![PAUSE] };
+        let mut limit = match ceiling {
+            Some(n) => format!("Max concurrent jobs: {n}"),
+            None => "Max concurrent jobs: no limit from the hub".to_string(),
+        };
+        if let Some(n) = effective {
+            limit.push_str(&format!(" (running at most {n} now)"));
+        }
+
+        let maintenance = match state {
+            None => "State not reported yet",
+            Some(NodeState::Ready) => "In service",
+            Some(NodeState::Draining) if external => {
+                "Draining: finishing the hub's jobs here, taking none of them"
+            }
+            Some(NodeState::Draining) => "Draining: finishing its running jobs, taking no new ones",
+            Some(NodeState::Drained) if external => "Drained: none of the hub's jobs running here",
+            Some(NodeState::Drained) => "Drained: no jobs running, none taken",
+            Some(NodeState::Maintenance) => "Under maintenance: an update or a reset is under way",
+            Some(NodeState::Validating) => "Checking itself after maintenance",
+            Some(NodeState::Quarantined) if external => {
+                "Quarantined: taking none of the hub's jobs until released"
+            }
+            Some(NodeState::Quarantined) => "Quarantined: out of service until released",
+        };
+        let maintenance_acts = match state {
+            None => vec![DRAIN, UNDRAIN],
+            Some(NodeState::Ready) => vec![DRAIN],
+            Some(NodeState::Maintenance | NodeState::Validating) => vec![STAY_DRAINED],
+            Some(NodeState::Draining | NodeState::Drained) => vec![UNDRAIN],
+            Some(NodeState::Quarantined) => Vec::new(),
+        };
+        // Refuse resets with an external runner: it may still use what a reset deletes.
+        let mut danger_acts = match state {
+            Some(NodeState::Quarantined) => vec![RELEASE],
+            None => vec![QUARANTINE, RELEASE],
+            Some(_) => vec![QUARANTINE],
+        };
+        if !external
+            && matches!(
+                state,
+                None | Some(NodeState::Ready | NodeState::Draining | NodeState::Drained)
+            )
+        {
+            danger_acts.push(RESET);
+        }
+        Panel {
+            note: external.then_some(
+                "Its runner is external: pausing intake, draining and quarantining stop only \
+                 the jobs the hub places here; the runner may still take jobs. A reset is \
+                 refused.",
+            ),
+            intake,
+            intake_acts,
+            limit,
+            lift: ceiling.map(|_| LIFT),
+            maintenance,
+            maintenance_acts,
+            danger_acts,
+        }
     }
-    h.raw("</div><div id=\"flash\"></div></section>");
+
+    /// Every action offered, in the panel's order, the limit's own form first.
+    #[cfg(test)]
+    fn ops(&self) -> Vec<&'static str> {
+        std::iter::once("ceiling")
+            .chain(self.intake_acts.iter().map(|a| a.op))
+            .chain(self.lift.iter().map(|a| a.op))
+            .chain(self.maintenance_acts.iter().map(|a| a.op))
+            .chain(self.danger_acts.iter().map(|a| a.op))
+            .collect()
+    }
+}
+
+/// Show the node's state and, given an operator's `csrf`, applicable actions with explanations.
+/// Viewers see only the state. The live fragment keeps actions current; `hx-preserve` keeps
+/// the limit input through updates, including edits in progress. Forms support htmx and plain
+/// submission.
+fn steer_panel(h: &mut Html, v: &NodeView, csrf: Option<&str>) {
+    let p = Panel::of(v);
+    let path = format!("/node/{}/action", v.id);
+    let act = |h: &mut Html, a: &Act, class: &'static str| {
+        let Some(csrf) = csrf else { return };
+        form_open(h, &path, csrf);
+        h.raw("<input type=\"hidden\" name=\"op\" value=\"")
+            .raw(a.op)
+            .raw("\"><button")
+            .raw(class)
+            .raw(">")
+            .raw(a.label)
+            .raw("</button><span class=\"does\">")
+            .raw(a.does)
+            .raw("</span></form>");
+    };
+    h.raw("<section class=\"steer\"><h2>Steering</h2>");
+    if let Some(note) = p.note {
+        h.raw("<p class=\"sub\">").raw(note).raw("</p>");
+    }
+    h.raw("<div class=\"groups\"><div class=\"group\"><h3>Job intake</h3><p class=\"now\">")
+        .text(&p.intake)
+        .raw("</p>");
+    for a in &p.intake_acts {
+        act(h, a, "");
+    }
+    h.raw("<p class=\"now\">").text(&p.limit).raw("</p>");
+    if let Some(csrf) = csrf {
+        // No placeholder: hx-preserve would keep the first render's, stale after a change.
+        form_open(h, &path, csrf);
+        h.raw("<input type=\"hidden\" name=\"op\" value=\"ceiling\">")
+            .raw("<label for=\"ceiling\">Max concurrent jobs</label>")
+            .raw("<input id=\"ceiling\" type=\"number\" name=\"ceiling\" min=\"1\" required ")
+            .raw("hx-preserve=\"true\"><button>Set the limit</button><span class=\"does\">")
+            .raw("Run at most this many jobs at once on this node.</span></form>");
+    }
+    if let Some(a) = &p.lift {
+        act(h, a, "");
+    }
+    h.raw("</div><div class=\"group\"><h3>Maintenance</h3><p class=\"now\">")
+        .raw(p.maintenance)
+        .raw("</p>");
+    for a in &p.maintenance_acts {
+        act(h, a, "");
+    }
+    h.raw("</div>");
+    if csrf.is_some() && !p.danger_acts.is_empty() {
+        h.raw("<div class=\"group danger\"><h3>Danger zone</h3>");
+        for a in &p.danger_acts {
+            act(h, a, " class=\"danger\"");
+        }
+        h.raw("</div>");
+    }
+    h.raw("</div></section>");
+}
+
+/// The opening of a steering form posting to `path`, by htmx or as a plain form, with the
+/// session's CSRF token `csrf`.
+fn form_open(h: &mut Html, path: &str, csrf: &str) {
+    h.raw("<form class=\"act\" method=\"post\" action=\"")
+        .text(path)
+        .raw("\" hx-post=\"")
+        .text(path)
+        .raw("\" hx-swap=\"none\">");
+    pages::csrf_input(h, csrf);
 }
 
 /// How long before `now` the instant `then` was, in steps of a heartbeat under a minute:
@@ -773,8 +1001,9 @@ fn gone() -> Html {
     h
 }
 
-/// A node's page below its name: everything the hub knows of it.
-fn node_detail(d: &NodeDetail, now: u64) -> Html {
+/// A node's page below its name: everything the hub knows of it, and its steering panel,
+/// with its actions given `csrf`, an operator's token.
+fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
     let v = &d.view;
     let mut h = Html::new();
     h.raw("<p class=\"sub\"><code>")
@@ -792,6 +1021,9 @@ fn node_detail(d: &NodeDetail, now: u64) -> Html {
         )
         .raw("</p>");
 
+    if !v.monitoring_only() {
+        steer_panel(&mut h, v, csrf);
+    }
     steering(&mut h, d, now);
 
     let heartbeat = d.row.heartbeat.as_ref();
@@ -1406,4 +1638,164 @@ fn rollout(h: &mut Html, r: &Rollout, steer: bool, now: u64) {
         h.raw("</td><td>").node(&n.profile).raw("</td></tr>");
     }
     h.raw("</tbody></table></div>");
+}
+
+#[cfg(test)]
+mod tests {
+    use vk_hub_proto::{Concurrency, DesiredState, NodeState, Report};
+
+    use super::*;
+
+    fn view(state: NodeState, runner: RunnerMode, desired: Option<DesiredState>) -> NodeView {
+        NodeView {
+            desired,
+            report: Some(Report {
+                state: Some(state),
+                runner: Some(runner),
+                ..Report::default()
+            }),
+            ..NodeView::default()
+        }
+    }
+
+    /// A node's page offers, from each state, the actions that apply there: no drain of a
+    /// node draining, no release of one not quarantined, no reset when the runner is external.
+    /// With no state reported yet, every state action is offered.
+    #[test]
+    fn the_steering_panel_offers_what_applies_to_the_node_s_state() {
+        use NodeState::*;
+        use RunnerMode::{External, Managed};
+        let ops = |v: &NodeView| Panel::of(v).ops();
+        assert_eq!(
+            ops(&NodeView::default()),
+            [
+                "ceiling",
+                "stop",
+                "drain",
+                "undrain",
+                "quarantine",
+                "release",
+                "reset"
+            ]
+        );
+        for (state, want) in [
+            (
+                Ready,
+                &["ceiling", "stop", "drain", "quarantine", "reset"][..],
+            ),
+            (
+                Draining,
+                &["ceiling", "stop", "undrain", "quarantine", "reset"],
+            ),
+            (
+                Drained,
+                &["ceiling", "stop", "undrain", "quarantine", "reset"],
+            ),
+            (Maintenance, &["ceiling", "stop", "drain", "quarantine"]),
+            (Validating, &["ceiling", "stop", "drain", "quarantine"]),
+            (Quarantined, &["ceiling", "stop", "release"]),
+        ] {
+            assert_eq!(ops(&view(state, Managed, None)), want, "{state:?}");
+        }
+        // During maintenance a drain keeps the node drained afterwards, and says so.
+        assert_eq!(
+            Panel::of(&view(Maintenance, Managed, None)).maintenance_acts[0].label,
+            "Stay drained"
+        );
+        assert_eq!(
+            ops(&view(Ready, External, None)),
+            ["ceiling", "stop", "drain", "quarantine"]
+        );
+        let mut unreported = view(Ready, External, None);
+        if let Some(r) = unreported.report.as_mut() {
+            r.state = None;
+        }
+        assert_eq!(
+            ops(&unreported),
+            [
+                "ceiling",
+                "stop",
+                "drain",
+                "undrain",
+                "quarantine",
+                "release"
+            ]
+        );
+
+        let paused = DesiredState {
+            generation: 2,
+            ceiling: Some(3),
+            acquisition: Acquisition::Stop,
+        };
+        assert_eq!(
+            ops(&view(Ready, Managed, Some(paused.clone()))),
+            [
+                "ceiling",
+                "resume",
+                "lift-ceiling",
+                "drain",
+                "quarantine",
+                "reset"
+            ]
+        );
+        assert_eq!(
+            ops(&view(Ready, External, Some(paused.clone()))),
+            ["ceiling", "resume", "lift-ceiling", "drain", "quarantine"]
+        );
+    }
+
+    /// Each control says where the node stands in words.
+    #[test]
+    fn the_steering_panel_says_where_the_node_stands() {
+        let paused = DesiredState {
+            generation: 2,
+            ceiling: Some(3),
+            acquisition: Acquisition::Stop,
+        };
+        let mut v = view(NodeState::Ready, RunnerMode::Managed, Some(paused));
+        let p = Panel::of(&v);
+        assert_eq!(p.intake, "Not taking new jobs: intake paused");
+        assert_eq!(p.limit, "Max concurrent jobs: 3");
+        assert_eq!(p.maintenance, "In service");
+        assert_eq!(p.note, None);
+        v.desired = None;
+        if let Some(r) = v.report.as_mut() {
+            r.state = Some(NodeState::Drained);
+            r.runner = Some(RunnerMode::External);
+            r.concurrency = Some(Concurrency {
+                effective: Some(2),
+                ..Concurrency::default()
+            });
+        }
+        let p = Panel::of(&v);
+        assert_eq!(
+            p.intake,
+            "Not taking the hub's jobs while drained; the external runner may still take jobs"
+        );
+        assert_eq!(
+            p.limit,
+            "Max concurrent jobs: no limit from the hub (running at most 2 now)"
+        );
+        assert_eq!(
+            p.maintenance,
+            "Drained: none of the hub's jobs running here"
+        );
+        assert_eq!(
+            p.note,
+            Some(
+                "Its runner is external: pausing intake, draining and quarantining stop only \
+                 the jobs the hub places here; the runner may still take jobs. A reset is \
+                 refused."
+            )
+        );
+        v.desired = Some(DesiredState {
+            generation: 3,
+            ceiling: None,
+            acquisition: Acquisition::Stop,
+        });
+        assert_eq!(
+            Panel::of(&v).intake,
+            "Not taking the hub's jobs: intake paused; the external runner may still take jobs"
+        );
+    }
 }

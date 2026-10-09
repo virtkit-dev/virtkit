@@ -2485,7 +2485,13 @@ async fn the_fleet_s_pages_load_only_the_embedded_scripts() {
         assert_eq!(body.matches("<script").count(), 2, "{body}");
         assert_eq!(body.matches("<script src=\"/assets/").count(), 2, "{body}");
         assert!(!body.contains(" style="), "{body}");
-        assert!(!body.contains(" on"), "{body}");
+        // No inline event handler: no ` on…=` attribute.
+        let handler = body.match_indices(" on").any(|(i, _)| {
+            let rest = &body[i + 3..];
+            let name = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
+            name > 0 && rest[name..].starts_with('=')
+        });
+        assert!(!handler, "{body}");
         assert_eq!(
             body.matches("sse-close=\"close\"").count(),
             usize::from(path != "/audit")
@@ -2694,16 +2700,28 @@ async fn an_operator_steers_a_node_from_its_page() {
     for want in [
         &format!("action=\"{path}\" hx-post=\"{path}\""),
         "name=\"ceiling\"",
-        "<button>set ceiling</button>",
-        "<button>quarantine</button>",
+        "<p class=\"now\">Taking new jobs</p>",
+        "<button>Pause intake</button>",
+        "<p class=\"now\">Max concurrent jobs: no limit from the hub</p>",
+        "<button>Set the limit</button>",
+        "<p class=\"now\">State not reported yet</p>",
+        "<button>Drain</button><span class=\"does\">Finish the running jobs",
+        "<h3>Danger zone</h3>",
+        "<button class=\"danger\">Quarantine</button>",
         &format!("name=\"_csrf\" value=\"{csrf}\""),
         "nothing asked: no ceiling, acquisition running",
         "<h2>Commands</h2><p class=\"empty\">none</p>",
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);
     }
+    assert!(!page.body.contains("Remove the limit"), "{}", page.body);
     let mut live = Events::open(addr, &format!("/events/node/{node}"), &cookie).await;
-    live.next().await.unwrap();
+    // The stream renders the operator's actions too, with the session's token.
+    let first = live.next().await.unwrap();
+    assert!(
+        first.contains(&format!("name=\"_csrf\" value=\"{csrf}\"")),
+        "{first}"
+    );
 
     let steer = |form: String, htmx: bool| {
         let (cookie, origin, path) = (cookie.clone(), origin.clone(), path.clone());
@@ -2722,12 +2740,24 @@ async fn an_operator_steers_a_node_from_its_page() {
         reply.body
     );
     assert_eq!(desired().ceiling, Some(3));
-    // The node's page follows the change.
-    next_with(&mut live, "<tr><th>ceiling</th><td>3</td></tr>").await;
+    // The node's page follows the change, and offers what applies now.
+    let fragment = next_with(&mut live, "<tr><th>ceiling</th><td>3</td></tr>").await;
+    for want in [
+        "<p class=\"now\">Max concurrent jobs: 3</p>",
+        "<button>Remove the limit</button>",
+    ] {
+        assert!(fragment.contains(want), "{want}: {fragment}");
+    }
+    assert!(!fragment.contains("placeholder"), "{fragment}");
 
     let reply = steer(format!("_csrf={csrf}&op=stop"), true).await;
     assert!(reply.body.contains("acquisition stop"), "{}", reply.body);
     assert_eq!(desired().acquisition, Acquisition::Stop);
+    let fragment = next_with(&mut live, "Not taking new jobs: intake paused").await;
+    assert!(
+        fragment.contains("<button>Resume intake</button>") && !fragment.contains("Pause intake"),
+        "{fragment}"
+    );
     let reply = steer(format!("_csrf={csrf}&op=stop"), true).await;
     assert_eq!(reply.status, 200);
     assert!(reply.body.contains("Already so"), "{}", reply.body);
@@ -2833,9 +2863,14 @@ async fn an_operator_steers_a_node_from_its_page() {
         "refused: &lt;script&gt;",
         "not taken yet",
         &format!("<a href=\"/audit?node={node}\">"),
+        // A draining node is offered its undrain, not another drain.
+        "<p class=\"now\">Not taking new jobs while draining</p>",
+        "<p class=\"now\">Draining: finishing its running jobs, taking no new ones</p>",
+        "<button>Undrain</button>",
     ] {
         assert!(fragment.contains(want), "{want}: {fragment}");
     }
+    assert!(!fragment.contains("value=\"drain\""), "{fragment}");
     assert!(!fragment.contains("<script"), "{fragment}");
 }
 
@@ -2855,6 +2890,23 @@ async fn a_node_is_steered_only_by_an_operator_s_own_page() {
     assert_eq!(page.status, 200);
     assert!(!page.body.contains(&path), "{}", page.body);
     assert!(page.body.contains("nothing asked"), "{}", page.body);
+    // Where the node stands, without what an operator could change.
+    assert!(
+        page.body.contains("<p class=\"now\">Taking new jobs</p>"),
+        "{}",
+        page.body
+    );
+    assert!(
+        !page.body.contains("class=\"act\"") && !page.body.contains("Danger zone"),
+        "{}",
+        page.body
+    );
+    let mut live = Events::open(addr, &format!("/events/node/{node}"), &viewer).await;
+    let first = live.next().await.unwrap();
+    assert!(
+        first.contains("Taking new jobs") && !first.contains(&path) && !first.contains("_csrf"),
+        "{first}"
+    );
 
     let form = format!("_csrf={viewer_csrf}&op=drain");
     let reply = post_action(addr, &origin, &viewer, &path, &form, true).await;
@@ -2928,7 +2980,8 @@ async fn a_reset_is_issued_only_once_confirmed() {
     let path = format!("/node/{node}/action");
     let page = get(addr, &format!("/node/{node}"), Some(&cookie)).await;
     assert!(
-        page.body.contains("<button>reset</button>"),
+        page.body
+            .contains("<button class=\"danger\">Reset</button>"),
         "{}",
         page.body
     );

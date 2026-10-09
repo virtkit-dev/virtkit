@@ -899,18 +899,29 @@ provider (see [Signing in](#signing-in)).
 The UI serves the nodes table with the columns of `vk-hub nodes`; each node's inventory,
 heartbeat and workloads; and the audit log (`/audit`, filterable by node, 100 lines a page; the
 hub keeps the newest 100,000 rows). A node's page shows what the hub asks of it beside what it
-reports — its state, acquisition, runner, concurrency, drain progress and what it cannot
-carry out — and its 20 latest commands with their outcomes. An operator's node page offers
-the steering actions: a ceiling set or lifted, acquisition stopped or resumed, drain,
-undrain, quarantine, release, and reset, which requires confirmation from the same session,
-once and within ten minutes, as local mode's stops do. Each action returns a status line
-through htmx while the node's fragment updates live, and also works as a plain form.
-Monitoring-only nodes are marked, offer no actions and reject steering posts. Viewers have no
-actions. Operators also issue enrollment tokens from the nodes page, like `vk-hub token
-create`, valid for an hour, ten minutes, a day or seven days. A plain POST to `/tokens` uses
-the same origin, CSRF and role checks and returns a page showing the token once. Issuance is
-audited as the session's principal; the token is never logged. Removing a node stays on the
-admin socket. A page is refused to a request whose `Sec-Fetch-Site` is `same-site` or `cross-site`.
+reports — its state, acquisition, runner, concurrency, drain progress and what it cannot carry
+out — and its 20 latest commands with their outcomes. It opens with a steering panel describing
+the current state in plain language, grouped into *Job intake* — whether the node takes new jobs, the
+hub's concurrency ceiling and the node's current effective limit; *Maintenance* — in service,
+draining, drained, under maintenance, checking itself or quarantined; and an operator-only
+*Danger zone*. Operators see applicable actions with short explanations: pause intake or
+resume it, set the limit or remove it, drain from ready or during maintenance (the node stays
+drained once it ends), undrain while draining or drained, quarantine unless quarantined, release only then,
+reset from ready, draining or drained; no reset when the runner is external; everything while
+the node has reported nothing. They are the admin socket's operations — ceiling set or lifted,
+acquisition stopped or resumed, drain, undrain, quarantine, release, reset — posted to
+`/node/<id>/action` as before, which still refuses what does not apply. A reset requires
+confirmation from the same session, once and within ten minutes, as local mode's stops do. The
+panel is part of the node's live fragment, rendered for an operator's stream with that
+session's CSRF token, so what it offers follows the node; the limit's number field is kept
+through updates (`hx-preserve`). Each action returns a status line through htmx, and also works
+as a plain form. Monitoring-only nodes are marked, offer no actions and reject steering posts.
+Viewers see where the node stands and no actions. Operators also issue enrollment tokens from
+the nodes page, like `vk-hub token create`, valid for an hour, ten minutes, a day or seven
+days. A plain POST to `/tokens` uses the same origin, CSRF and role checks and returns a page
+showing the token once. Issuance is audited as the session's principal; the token is never
+logged. Removing a node stays on the admin socket. A page is refused to a request whose
+`Sec-Fetch-Site` is `same-site` or `cross-site`.
 
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a

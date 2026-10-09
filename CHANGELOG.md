@@ -46,6 +46,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **Node pages in `vk-hub` explain the current state and available actions.** The steering
+  panel groups job intake, maintenance and a danger zone, shows the current state in plain
+  language, and offers only applicable actions, each with a short explanation.
 - **Drain and quarantine on a fleet node with an external runner now stop the jobs the hub
   places there** instead of being refused. The node says that its runner may still take jobs,
   and reports `drained` once the jobs it runs, and any vk executor job already admitted, are
