@@ -7,7 +7,8 @@
 
 use std::time::Duration;
 
-use vk_hub_proto::job::CiJob;
+use vk_hub_proto::job::{CiJob, parse_bool};
+use vk_hub_proto::stamp;
 
 use super::vars::Vars;
 
@@ -51,6 +52,8 @@ pub struct Settings {
     pub script_timeout: Option<Duration>,
     /// `RUNNER_AFTER_SCRIPT_TIMEOUT`, else the after_script step's own, else 5 minutes.
     pub after_script_timeout: Duration,
+    /// `FF_TIMESTAMPS`: each line of the output stamped with the time it came.
+    pub timestamps: bool,
     /// What gitlab-runner would warn about, in its words.
     pub warnings: Vec<String>,
 }
@@ -107,6 +110,8 @@ impl Settings {
         let restore_cache_attempts = read.attempts("RESTORE_CACHE_ATTEMPTS");
         let after_script_ignore_errors = read.bool("AFTER_SCRIPT_IGNORE_ERRORS", true);
         let script_timeout = read.duration("RUNNER_SCRIPT_TIMEOUT");
+        let (timestamps, warning) = stamp::enabled(Some(&vars.value(stamp::FLAG)));
+        read.warnings.extend(warning);
         read.unsupported("GIT_CLONE_PATH", "the project dir is the node's");
         read.unsupported(
             "GIT_CLONE_EXTRA_FLAGS",
@@ -170,6 +175,7 @@ impl Settings {
             after_script_ignore_errors,
             script_timeout,
             after_script_timeout,
+            timestamps,
             warnings,
         }
     }
@@ -280,15 +286,6 @@ impl Reader<'_> {
                 "{name}: not supported on vk nodes ({why}); ignored"
             ));
         }
-    }
-}
-
-/// Go's `strconv.ParseBool`.
-fn parse_bool(raw: &str) -> Option<bool> {
-    match raw {
-        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
-        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
-        _ => None,
     }
 }
 
@@ -457,6 +454,22 @@ mod tests {
         let s = Settings::of(&job, &vars);
         assert_eq!(s.script_timeout, None);
         assert!(s.warnings.is_empty());
+    }
+
+    #[test]
+    fn timestamps_are_on_unless_the_job_turns_them_off() {
+        let (job_, vars) = job(&[]);
+        assert!(Settings::of(&job_, &vars).timestamps);
+        let (job_, vars) = job(&[("FF_TIMESTAMPS", "false")]);
+        let s = Settings::of(&job_, &vars);
+        assert!(!s.timestamps && s.warnings.is_empty());
+        let (job_, vars) = job(&[("FF_TIMESTAMPS", "nope")]);
+        let s = Settings::of(&job_, &vars);
+        assert!(s.timestamps);
+        assert_eq!(
+            s.warnings,
+            ["FF_TIMESTAMPS: could not parse feature flag, expected bool, got nope"]
+        );
     }
 
     #[test]

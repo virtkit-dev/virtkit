@@ -46,7 +46,8 @@ adapted:
 - in vk-driver: the job driver under src/node/jobs (output masking, trace, step scripts,
   variables, build settings, artifact transfers, and their tests);
 - in vk-agent: the archive rules in src/archive.rs;
-- in vk-hub-proto: the failure-reason mapping in src/job.rs.
+- in vk-hub-proto: the failure-reason mapping in src/job.rs and the log line timestamps in
+  src/stamp.rs.
 
 Each names the upstream file and test it comes from.
 https://gitlab.com/gitlab-org/gitlab-runner/-/tree/v19.5.0

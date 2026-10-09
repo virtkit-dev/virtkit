@@ -32,10 +32,11 @@ use vk_hub_proto::dispatch::CancelMode;
 use vk_hub_proto::job::{
     ArtifactOutcome, CiJob, FailureClass, JobResult, JobSpec, STEP_AFTER_SCRIPT, UploadState,
 };
+use vk_hub_proto::stamp::{self, Kind};
 
 use super::journal::{self, Meta};
 use super::settings::{Settings, Submodules};
-use super::trace::{ANSI_BOLD_CYAN, ANSI_RESET, Trace};
+use super::trace::{ANSI_BOLD_CYAN, ANSI_RESET, Stream, Trace};
 use super::vars::Vars;
 use super::{StageCtx, artifacts, cache, env, script};
 use crate::config::Config;
@@ -96,6 +97,8 @@ struct Driver {
     dir: PathBuf,
     job: CiJob,
     trace: Arc<Trace>,
+    /// The current `vk` executable, used as the executor.
+    exe: PathBuf,
     /// When the job's timeout runs out.
     deadline: Instant,
     timeout: Duration,
@@ -174,6 +177,7 @@ fn setup(cfg: Config, dir: &Path) -> Result<Setup> {
         &job.trace.mask_prefixes,
         limit,
         job.trace.sections,
+        settings.timestamps,
     )?);
     let timeout = Duration::from_secs(job.timeout_secs.max(1));
     let ctx = JobCtx::for_env(cfg, &child_env)?;
@@ -183,6 +187,7 @@ fn setup(cfg: Config, dir: &Path) -> Result<Setup> {
         dir: dir.to_path_buf(),
         job,
         trace,
+        exe: crate::spawn::self_exe(),
         deadline: Instant::now() + timeout,
         timeout,
         stopped: CancellationToken::new(),
@@ -682,7 +687,7 @@ impl Driver {
         args: &[std::ffi::OsString],
         phase: Option<(Phase, Option<Instant>)>,
     ) -> Result<End> {
-        let mut command = Command::new(crate::spawn::self_exe());
+        let mut command = Command::new(&self.exe);
         if let Some(src) = &self.ctx.cfg.source {
             command.arg("--config").arg(src);
         }
@@ -691,35 +696,41 @@ impl Driver {
             .args(args)
             .stdin(Stdio::null());
         env::apply(&mut command, &self.env);
+        let to_trace = phase.is_some();
+        // Stamped, stdout and stderr are streams of their own (`O` and `E`), as gitlab-runner
+        // keeps its executor's; unstamped, one pipe keeps their order exactly.
         let (reader, writer) = pipe()?;
+        let (err_reader, err_writer) = if to_trace && self.trace.timestamps() {
+            let (r, w) = pipe()?;
+            (Some(r), w)
+        } else {
+            (None, writer.try_clone()?)
+        };
         command
-            .stdout(Stdio::from(writer.try_clone()?))
-            .stderr(Stdio::from(writer));
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::from(err_writer));
         let mut child = command
             .spawn()
             .with_context(|| format!("starting `vk gitlab {cmd}`"))?;
-        // The parent's copies of the write end are gone with `command`.
+        // The parent's copies of the write ends are gone with `command`.
         drop(command);
-        let trace = self.trace.clone();
-        let log = self.dir.join(journal::DRIVER_LOG);
-        let to_trace = phase.is_some();
-        let pump = tokio::task::spawn_blocking(move || {
-            let mut reader = File::from(reader);
-            let mut buf = vec![0u8; 16 * 1024];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let chunk = buf.get(..n).unwrap_or_default();
-                        if to_trace {
-                            trace.write(chunk);
-                        } else {
-                            append_log(&log, chunk);
-                        }
-                    }
-                }
-            }
-        });
+        let id = match cmd {
+            "prepare" => stamp::STREAM_EXECUTOR,
+            _ => stamp::STREAM_WORK,
+        };
+        let pumps: Vec<_> = [
+            Some((reader, Kind::Stdout)),
+            err_reader.map(|r| (r, Kind::Stderr)),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|(reader, kind)| {
+            let trace = self.trace.clone();
+            let stream = to_trace.then(|| trace.stream(id, kind));
+            let log = self.dir.join(journal::DRIVER_LOG);
+            tokio::task::spawn_blocking(move || pump(reader, &trace, stream, &log))
+        })
+        .collect();
         let mut stopped = None;
         let cleanup_deadline = Instant::now() + CLEANUP_TIMEOUT;
         let status = loop {
@@ -741,7 +752,9 @@ impl Driver {
         };
         // The pipe closes once every process holding it is gone; a guest command's own
         // children never get it.
-        let _ = pump.await;
+        for pump in pumps {
+            let _ = pump.await;
+        }
         if let Some(stop) = stopped {
             return Ok(End::Stopped(stop));
         }
@@ -855,6 +868,28 @@ fn pipe() -> Result<(OwnedFd, OwnedFd)> {
     Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
+/// A command's output from `reader` until every writer is gone: into `trace` on `stream`, or
+/// without one into the driver's log at `log`.
+fn pump(reader: OwnedFd, trace: &Trace, mut stream: Option<Stream>, log: &Path) {
+    let mut reader = File::from(reader);
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let chunk = buf.get(..n).unwrap_or_default();
+                match &mut stream {
+                    Some(stream) => trace.write(stream, chunk),
+                    None => append_log(log, chunk),
+                }
+            }
+        }
+    }
+    if let Some(stream) = stream {
+        trace.close(stream);
+    }
+}
+
 fn append_log(path: &Path, bytes: &[u8]) {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -879,6 +914,58 @@ fn say_log(dir: &Path, line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::jobs::testkit::Fixture;
+
+    #[tokio::test]
+    async fn stamped_stdout_and_stderr_are_streams_of_their_own() {
+        let f = Fixture::stamped("driver-run", "https://gitlab.example");
+        // Stands in for `vk gitlab run`. Written by `cp`, not here: a file this process holds
+        // open for writing, as a child another test forks meanwhile inherits it, cannot be run
+        // (ETXTBSY).
+        let exe = f.dir.join("vk");
+        let source = exe.with_extension("sh");
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o755)
+                .open(&source)
+                .unwrap();
+            file.write_all(b"#!/bin/sh\necho out\necho err >&2\n")
+                .unwrap();
+        }
+        let copied = std::process::Command::new("cp")
+            .arg(&source)
+            .arg(&exe)
+            .status();
+        assert!(copied.unwrap().success());
+        let timeout = Duration::from_secs(60);
+        let driver = Driver {
+            ctx: JobCtx::for_env(Config::default(), &[]).unwrap(),
+            env: Vec::new(),
+            dir: f.dir.clone(),
+            job: f.job.clone(),
+            trace: f.trace.clone(),
+            exe,
+            deadline: Instant::now() + timeout,
+            timeout,
+            stopped: CancellationToken::new(),
+        };
+        let end = driver
+            .executor("run", &[], Some((Phase::Steps, None)))
+            .await;
+        assert_eq!(end.unwrap(), End::Ok);
+        // Separate pipes preserve stream identity, not line order.
+        let output = f.output();
+        let mut lines: Vec<_> = output
+            .lines()
+            .map(|l| &l[stamp::HEADER_LEN - 4..])
+            .collect();
+        lines.sort_unstable();
+        assert_eq!(lines, ["01E err", "01O out"], "{output:?}");
+    }
 
     #[test]
     fn durations_print_as_go_prints_them() {

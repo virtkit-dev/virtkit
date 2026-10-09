@@ -240,6 +240,15 @@ pub struct Variable {
     pub raw: bool,
 }
 
+/// A boolean variable's value as gitlab-runner reads one, with Go's `strconv.ParseBool`.
+pub fn parse_bool(raw: &str) -> Option<bool> {
+    match raw {
+        "1" | "t" | "T" | "TRUE" | "true" | "True" => Some(true),
+        "0" | "f" | "F" | "FALSE" | "false" | "False" => Some(false),
+        _ => None,
+    }
+}
+
 /// A user step. GitLab names them: `script`, `after_script`, `release` and others to come;
 /// [`STEP_AFTER_SCRIPT`] runs after the others whatever their outcome, every other step in
 /// order while the job is succeeding.

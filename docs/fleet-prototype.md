@@ -708,10 +708,16 @@ when GitLab folds them. The trace ends `Job succeeded` or `ERROR: Job failed: <w
 
 **Output.** The trace is masked as gitlab-runner masks it — masked variables, the job and
 dependency tokens and registry passwords, `features.token_mask_prefixes` and gitlab-runner's
-default prefixes, sensitive URL parameters — and cut at `trace.limit_bytes` (4 MiB when 0)
-with its notice, into the journal's `output`. The node sends chunks of at most 256 KiB,
-up to 4 MiB beyond the hub's last ack. After reconnecting, it waits for each job's ack before
-resending from that offset. Output is kept until the hub records the result.
+default prefixes, sensitive URL parameters — then timestamped as gitlab-runner stamps it
+unless the job sets `FF_TIMESTAMPS: "false"`, and cut at `trace.limit_bytes` (4 MiB when 0)
+with its notice, into the journal's `output`. A stamp is when the node read the line (its
+start, for a line that spans reads), however late the daemon reads it from the hub:
+`<RFC 3339 UTC, microseconds> <stream><O|E><' '|'+'>`, stream `00` for the node's own lines
+and `vk gitlab prepare`, `01` for `vk gitlab run`, `E` for stderr, `+` for a line continuing
+the stream's last one; stamped, each command's stdout and stderr are masked and stamped apart.
+The node sends chunks of at most 256 KiB, up to 4 MiB beyond the hub's last ack. After
+reconnecting, it waits for each job's ack before resending from that offset. Output is kept
+until the hub records the result.
 
 **Cancellation and results.** `cancel` is written to the journal for the driver, which checks
 it every fraction of a second: graceful stops the running stage, runs `after_script` when the

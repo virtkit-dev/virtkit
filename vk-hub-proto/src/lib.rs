@@ -78,6 +78,7 @@ use serde::{Deserialize, Serialize};
 pub mod client;
 pub mod dispatch;
 pub mod job;
+pub mod stamp;
 
 /// Where a node enrolls.
 pub const ENROLL_PATH: &str = "/v1/enroll";

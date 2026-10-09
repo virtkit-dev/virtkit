@@ -231,7 +231,9 @@ node does not hold is admitted like any other ask, without waiting: `refused no_
 when it does not fit.
 
 **Output.** Offsets count bytes of the output as GitLab will hold it: masked, with section
-markers, cut at the trace limit. The node sends at most 4 MiB past the last ack, keeps every
+markers, timestamped (unless the job sets `FF_TIMESTAMPS` false), cut at the trace limit. A
+stamp is when the node read the line (its start, for a line that spans reads), however late
+the daemon reads it from the hub. The node sends at most 4 MiB past the last ack, keeps every
 byte past it on disk, and after a reconnect resends from the offset the hub acked. The hub
 appends each chunk to the job's output file and acks once it is synced; a chunk overlapping
 what it holds is trimmed, one leaving a gap is a protocol error.
@@ -431,8 +433,13 @@ image, boot, services), `prepare_script`, `get_sources`, `restore_cache`,
 `get_sources` uses the host-side checkout the executor already has, honouring `GIT_STRATEGY`,
 `GIT_DEPTH`, `GIT_SUBMODULE_STRATEGY`, `GIT_CHECKOUT` and `GIT_CLEAN_FLAGS`; the other stages
 reuse the executor's VM, exec and cleanup code. Step scripts are generated as gitlab-runner's
-bash shell generates them (`shells/abstract.go`, `shells/bash.go`), and output is masked as
-its `helpers/trace` masks it. Those ports keep gitlab-runner's MIT notice.
+bash shell generates them (`shells/abstract.go`, `shells/bash.go`), and output is masked and
+timestamped as its `common/buildlogger` masks and stamps it: each stream on its own — the
+node's lines and `vk gitlab prepare` as stream `00`, `vk gitlab run` as `01`, stdout `O` and
+stderr `E` apart — masked before it is stamped, the stamps counted in the trace limit.
+`FF_TIMESTAMPS` is read from the job's variables only, on by default as in gitlab-runner 19.5;
+a runner's `[runners.feature_flags]` has no equivalent here. Those ports keep gitlab-runner's
+MIT notice.
 
 ## Compatibility fixtures
 

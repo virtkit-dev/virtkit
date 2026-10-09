@@ -93,24 +93,34 @@ pub fn answer(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
 }
 
 /// A job of GitLab's at `server_url`, with a private dir as its scratch and its trace in
-/// `output` there.
+/// `output` there, unstamped unless made [`Fixture::stamped`].
 pub struct Fixture {
     pub dir: std::path::PathBuf,
     pub cfg: Config,
     pub job: CiJob,
     pub vars: Vars,
-    pub trace: Trace,
+    pub trace: Arc<Trace>,
     pub cancel: CancellationToken,
 }
 
 impl Fixture {
     pub fn new(tag: &str, server_url: &str) -> Fixture {
+        Fixture::with(tag, server_url, false)
+    }
+
+    /// A fixture whose trace stamps its lines (`FF_TIMESTAMPS`).
+    pub fn stamped(tag: &str, server_url: &str) -> Fixture {
+        Fixture::with(tag, server_url, true)
+    }
+
+    fn with(tag: &str, server_url: &str, timestamps: bool) -> Fixture {
         // `vk` installs it in main; reqwest needs it for any client.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = std::env::temp_dir().join(format!("vk-stages-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let trace = Trace::open(&dir.join("output"), &[], &[], 1 << 20, false).unwrap();
+        let trace = Trace::open(&dir.join("output"), &[], &[], 1 << 20, false, timestamps);
+        let trace = Arc::new(trace.unwrap());
         let job = CiJob {
             server_url: server_url.into(),
             job: CiJobInfo {
