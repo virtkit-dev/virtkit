@@ -454,6 +454,8 @@ impl Persisted {
                 });
                 Outcome::Accepted
             }
+            // Not spoken below protocol version 4, which this node does not offer.
+            (Operation::Tools { .. }, _) => refused("this vk does not build tools"),
         }
     }
 
@@ -505,6 +507,7 @@ impl Persisted {
                 job.quarantine_after = false;
                 Outcome::Done
             }
+            Operation::Tools { .. } => return None,
         })
     }
 

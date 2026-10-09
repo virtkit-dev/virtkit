@@ -2444,6 +2444,13 @@ pub(crate) fn operation_name(op: &Operation) -> String {
         ),
         Operation::Reset { images: false } => "reset".into(),
         Operation::Reset { images: true } => "reset, images included".into(),
+        Operation::Tools {
+            version, sha256, ..
+        } => format!(
+            "tools {} ({})",
+            vk_hub_proto::display_safe(version),
+            vk_hub_proto::display_safe(short(sha256))
+        ),
     }
 }
 

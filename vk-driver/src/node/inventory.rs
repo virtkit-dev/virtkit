@@ -75,6 +75,7 @@ pub fn inventory(cfg: &Config) -> Inventory {
             guest_kernel: guest_kernel().clone(),
             config_hash: config_hash(cfg),
             vk_sha256: super::update::known_sha256(),
+            tools: None,
         },
         runner: runner_config(cfg),
         // Checked when `vk node run` starts; one gone wrong since is left out.

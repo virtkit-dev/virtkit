@@ -20,6 +20,9 @@
 //!   `vk` an [`Operation::Update`] names, and so only on the word of a version 2 session. It
 //!   carries the node's ID, the time and the node's signature over [`download_message`] in the
 //!   [`NODE_HEADER`], [`TIME_HEADER`] and [`SIGNATURE_HEADER`] headers; the body is the binary.
+//!   A tools download, `GET` [`TOOLS_PATH`]`<sha256>`, fetches the definition an
+//!   [`Operation::Tools`] names the same way, signed over [`tools_download_message`]; the body
+//!   is the definition's tar.
 //! - **The client API** ([`client`]): a job producer holding an API key reserves capacity,
 //!   submits [`job::JobSpec`]s and follows their output and results over HTTP.
 //!
@@ -50,6 +53,11 @@
 //! session below it is a protocol error. [`PROTOCOL`] stays at 1 to 2; a peer that places or
 //! runs jobs negotiates from a range of its own reaching [`JOBS`]. Producers such as
 //! `vk-gitlab` submit [`job`]'s specs through the hub's [`client`] API.
+//!
+//! Version 4 ([`TOOLS`]) adds the CI tools a hub has its nodes build: [`Operation::Tools`],
+//! [`Report::tools`] and the tools download. A hub sends no such command in a session below
+//! it, and a node leaves the report's tools progress out there. [`Versions::tools`] is an
+//! optional inventory field, which a hub of any version reads or ignores.
 //!
 //! **Steering.** From version 2 the node's [`Report`] also carries its observed state — the
 //! desired state it last applied, its [`NodeState`], whether its runner is taking jobs, its
@@ -90,6 +98,11 @@ pub const NODE_PATH: &str = "/v1/node";
 /// that holds releases serves it; a node fetches from it only for an [`Operation::Update`].
 pub const RELEASE_PATH: &str = "/v1/releases/";
 
+/// Where a node downloads a tools definition: this, then the definition's sha256 in lowercase
+/// hex. A node fetches from it only for an [`Operation::Tools`], with the headers a release
+/// download carries, signed over [`tools_download_message`].
+pub const TOOLS_PATH: &str = "/v1/tools/";
+
 /// A release download's header carrying the node's ID ([`valid_id`]).
 pub const NODE_HEADER: &str = "vk-node";
 
@@ -128,6 +141,19 @@ pub const STEERING: u32 = 2;
 /// The first protocol version carrying [`NodeMsg::Job`] and [`HubMsg::Job`]. Not in
 /// [`PROTOCOL`]; peers implementing it use their own range that includes it.
 pub const JOBS: u32 = 3;
+
+/// The first protocol version carrying tools definitions: [`Operation::Tools`],
+/// [`Report::tools`] and the tools download. Not in [`PROTOCOL`] either.
+pub const TOOLS: u32 = 4;
+
+/// The largest tools definition — a build context packed as a tar — a hub holds and a node
+/// takes: a Dockerfile and the few files it copies, not the tools themselves.
+pub const MAX_TOOLS_DEFINITION: u64 = 64 << 20;
+
+/// The tools a tools definition must provide: without `gitlab-runner` a job transfers no
+/// artifacts, caches or dotenv reports, and without `git` a job whose image has none clones
+/// nothing.
+pub const REQUIRED_TOOLS: [&str; 2] = ["git", "gitlab-runner"];
 
 /// The largest message either side accepts, as a WebSocket message or an enrollment body.
 /// An inventory is a few kilobytes; this bounds what a confused or hostile peer can make the
@@ -315,7 +341,41 @@ pub fn download_message(
     at: u64,
     channel: Channel<'_>,
 ) -> Vec<u8> {
-    let mut m = b"vk-fleet release-download v1\0".to_vec();
+    signed_download(
+        b"vk-fleet release-download v1\0",
+        node_id,
+        sha256,
+        at,
+        channel,
+    )
+}
+
+/// What a node signs to download tools definition `sha256`: the same fields as
+/// [`download_message`], with a distinct label so tools and release signatures cannot
+/// authorize each other's downloads.
+pub fn tools_download_message(
+    node_id: &str,
+    sha256: &[u8; SHA256_LEN],
+    at: u64,
+    channel: Channel<'_>,
+) -> Vec<u8> {
+    signed_download(
+        b"vk-fleet tools-download v1\0",
+        node_id,
+        sha256,
+        at,
+        channel,
+    )
+}
+
+fn signed_download(
+    label: &[u8],
+    node_id: &str,
+    sha256: &[u8; SHA256_LEN],
+    at: u64,
+    channel: Channel<'_>,
+) -> Vec<u8> {
+    let mut m = label.to_vec();
     part(&mut m, node_id.as_bytes());
     part(&mut m, sha256);
     m.extend_from_slice(&at.to_be_bytes());
@@ -682,6 +742,25 @@ pub struct Versions {
     /// it is, where two builds can share a version. `None` when the binary could not be read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vk_sha256: Option<String>,
+    /// The CI tools the node built from its hub's tools definition and made current; `None`
+    /// when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolsInstalled>,
+}
+
+/// The CI tools a node built from a tools definition ([`Operation::Tools`]) and made current.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolsInstalled {
+    /// The definition's sha256, lowercase hex ([`valid_sha256`]).
+    pub sha256: String,
+    /// The label the operator gave it.
+    pub version: String,
+    /// The first line each tool printed for `--version`, by file name; empty when the node
+    /// runs none of them outside a VM.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tools: BTreeMap<String, String>,
+    /// Whether `[executor] tools_dir` names them: when not, jobs are given whatever it names.
+    pub in_use: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -772,6 +851,9 @@ pub struct Report {
     /// The update under way, or the last one, with how it ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<UpdateProgress>,
+    /// The tools build under way, or the last one, with how it ended. From version [`TOOLS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolsProgress>,
 }
 
 impl Report {
@@ -785,6 +867,14 @@ impl Report {
             workloads: self.workloads,
             workloads_omitted: self.workloads_omitted,
             ..Report::default()
+        }
+    }
+
+    /// This report without tools progress, for sessions below [`TOOLS`].
+    pub fn without_tools(self) -> Report {
+        Report {
+            tools: None,
+            ..self
         }
     }
 }
@@ -817,6 +907,49 @@ pub enum UpdatePhase {
     RolledBack,
     /// Given up before the switch; the binary is unchanged.
     Failed,
+}
+
+/// Progress of an [`Operation::Tools`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolsProgress {
+    /// The command's ID.
+    pub command: String,
+    /// The label the operator gave the definition.
+    pub version: String,
+    /// The definition's sha256, lowercase hex ([`valid_sha256`]).
+    pub sha256: String,
+    pub phase: ToolsPhase,
+    /// Why it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// The last lines a failed build printed, at most [`MAX_TOOLS_LOG_LINES`] of at most
+    /// [`MAX_TOOLS_LOG_LINE`] bytes each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub log: Vec<String>,
+}
+
+/// The most lines of a failed tools build's output a report carries.
+pub const MAX_TOOLS_LOG_LINES: usize = 40;
+
+/// The longest line of a failed tools build's output a report carries, in bytes.
+pub const MAX_TOOLS_LOG_LINE: usize = 512;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolsPhase {
+    /// Fetching and checking the definition.
+    Downloading,
+    /// Building it in microVMs.
+    Building,
+    /// Checking the tools built and making them current.
+    Installing,
+    /// Current: jobs that start from now on are given them.
+    Done,
+    /// Given up; the tools that were current still are.
+    Failed,
+    /// A phase from a later `vk`.
+    #[serde(other)]
+    Other,
 }
 
 /// The state the hub wants a node in. It only ever narrows local policy.
@@ -946,6 +1079,19 @@ pub enum Operation {
     Reset {
         #[serde(default)]
         images: bool,
+    },
+    /// Build the CI tools from tools definition `sha256` — a build context whose Dockerfile
+    /// has a `tools` stage holding the tools at its root — and make them the ones
+    /// `<state_dir>/tools/current` names. Nothing drains: a job keeps the tools it started
+    /// with. From version [`TOOLS`].
+    Tools {
+        /// The label the operator gave the definition.
+        version: String,
+        /// The definition's sha256, lowercase hex ([`valid_sha256`]): what it is downloaded
+        /// by and checked against.
+        sha256: String,
+        /// Its size in bytes; a download longer than this is refused.
+        size: u64,
     },
 }
 
@@ -1179,6 +1325,7 @@ mod tests {
                 guest_kernel: Some("6.18.52".into()),
                 config_hash: "ab".repeat(32),
                 vk_sha256: None,
+                tools: None,
             },
             runner: Some(Runner {
                 config: "/home/ci/.gitlab-runner/config.toml".into(),
@@ -1730,6 +1877,7 @@ mod tests {
                 phase: UpdatePhase::RolledBack,
                 message: Some("validation failed".into()),
             }),
+            tools: None,
         }
     }
 
@@ -1944,6 +2092,117 @@ mod tests {
             pinned(&state, json!(wire));
         }
         pinned(&RunnerMode::External, json!("external"));
+    }
+
+    /// Version 4 wire format. Without tools progress, reports match version 3 byte for byte;
+    /// without tools, inventories match every earlier version.
+    #[test]
+    fn version_4_keeps_its_wire_shape() {
+        assert_eq!(TOOLS, 4);
+        assert_eq!(TOOLS_PATH, "/v1/tools/");
+        let id = "0123456789abcdef0123456789abcdef";
+        let sha = "ab".repeat(SHA256_LEN);
+        pinned(
+            &HubMsg::Command(Command {
+                id: id.into(),
+                expires_at: 1_800_000_000,
+                op: Operation::Tools {
+                    version: "2026.10".into(),
+                    sha256: sha.clone(),
+                    size: 4096,
+                },
+            }),
+            json!({
+                "type": "command",
+                "id": id,
+                "expires_at": 1_800_000_000,
+                "op": {"kind": "tools", "version": "2026.10", "sha256": sha, "size": 4096},
+            }),
+        );
+        let progress = ToolsProgress {
+            command: id.into(),
+            version: "2026.10".into(),
+            sha256: sha.clone(),
+            phase: ToolsPhase::Failed,
+            message: Some("the build failed".into()),
+            log: vec!["ERROR: no stage tools".into()],
+        };
+        pinned(
+            &progress,
+            json!({
+                "command": id,
+                "version": "2026.10",
+                "sha256": sha,
+                "phase": "failed",
+                "message": "the build failed",
+                "log": ["ERROR: no stage tools"],
+            }),
+        );
+        pinned(
+            &ToolsProgress {
+                phase: ToolsPhase::Building,
+                message: None,
+                log: Vec::new(),
+                ..progress.clone()
+            },
+            json!({"command": id, "version": "2026.10", "sha256": sha, "phase": "building"}),
+        );
+        for (phase, wire) in [
+            (ToolsPhase::Downloading, "downloading"),
+            (ToolsPhase::Building, "building"),
+            (ToolsPhase::Installing, "installing"),
+            (ToolsPhase::Done, "done"),
+            (ToolsPhase::Failed, "failed"),
+            (ToolsPhase::Other, "other"),
+        ] {
+            pinned(&phase, json!(wire));
+        }
+        let later: ToolsPhase = serde_json::from_value(json!("verifying")).unwrap();
+        assert_eq!(later, ToolsPhase::Other);
+        let mut report = serde_json::to_value(NodeMsg::Report(steering_report())).unwrap();
+        report["tools"] = serde_json::to_value(&progress).unwrap();
+        pinned(
+            &NodeMsg::Report(Report {
+                tools: Some(progress.clone()),
+                ..steering_report()
+            }),
+            report,
+        );
+        assert_eq!(
+            Report {
+                tools: Some(progress),
+                ..steering_report()
+            }
+            .without_tools(),
+            steering_report()
+        );
+        let mut versions = serde_json::to_value(&inventory().versions).unwrap();
+        versions["tools"] = json!({
+            "sha256": sha,
+            "version": "2026.10",
+            "tools": {"git": "git version 2.49.0"},
+            "in_use": true,
+        });
+        pinned(
+            &Versions {
+                tools: Some(ToolsInstalled {
+                    sha256: sha.clone(),
+                    version: "2026.10".into(),
+                    tools: BTreeMap::from([("git".into(), "git version 2.49.0".into())]),
+                    in_use: true,
+                }),
+                ..inventory().versions
+            },
+            versions,
+        );
+        assert_eq!(
+            serde_json::from_value::<ToolsInstalled>(
+                json!({"sha256": sha, "version": "v", "in_use": false})
+            )
+            .unwrap()
+            .tools,
+            BTreeMap::new()
+        );
     }
 
     /// A report as 0.83.0 and 0.84.0 write it reads with every steering field absent, and goes
@@ -2213,6 +2472,12 @@ mod tests {
             assert_ne!(other, base);
         }
         assert_ne!(release, base);
+        let tools = tools_download_message("n", &sha, 5, Channel::Plaintext);
+        assert!(tools.starts_with(b"vk-fleet tools-download v1\0"));
+        assert_eq!(
+            tools.get(b"vk-fleet tools-download v1\0".len()..),
+            base.get(b"vk-fleet release-download v1\0".len()..)
+        );
     }
 
     #[test]
@@ -2261,6 +2526,14 @@ mod tests {
         assert_eq!(
             download_message("n", &sha, 0x0102, Channel::Plaintext),
             b"vk-fleet release-download v1\0\
+              \0\0\0\0\0\0\0\x01n\
+              \0\0\0\0\0\0\0\x200123456789abcdef0123456789ABCDEF\
+              \0\0\0\0\0\0\x01\x02\
+              \0\0\0\0\0\0\0\x09plaintext"
+        );
+        assert_eq!(
+            tools_download_message("n", &sha, 0x0102, Channel::Plaintext),
+            b"vk-fleet tools-download v1\0\
               \0\0\0\0\0\0\0\x01n\
               \0\0\0\0\0\0\0\x200123456789abcdef0123456789ABCDEF\
               \0\0\0\0\0\0\x01\x02\
