@@ -94,6 +94,19 @@ const KEYS: &[Key] = &[
     },
     Key {
         table: Table::Top,
+        name: "max_connections",
+        help: "connections served at once, each holding a file\n\
+               descriptor; past it, new ones wait [default: 4096]",
+    },
+    Key {
+        table: Table::Top,
+        name: "max_connections_per_client",
+        help: "connections from one client address (IPv6: /64);\n\
+               past it, new ones are answered 503; behind a reverse\n\
+               proxy, set it to max_connections [default: 1024]",
+    },
+    Key {
+        table: Table::Top,
         name: "oidc",
         help: "the [oidc] table below; required in accounts mode",
     },

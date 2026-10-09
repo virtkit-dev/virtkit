@@ -1987,8 +1987,8 @@ const TRANSFER_BACKOFF: Backoff = Backoff {
 /// or the response: on a lossy path a registry's send stalls in RTO backoff and reqwest's
 /// `TCP_USER_TIMEOUT` (30 s by default; `oci_client` offers no way to set it) has the
 /// kernel abort the socket mid-body, which a fresh connection a moment later serves fine.
-/// A registry turning requests away — closing new connections, or answering 503 or 429, as
-/// vk-registry does past its per-client connection cap — is retried for longer (see
+/// A registry turning requests away — answering 503 or 429, as vk-registry does past its
+/// per-client connection cap, or closing new connections — is retried for longer (see
 /// [`TRANSFER_BACKOFF`]). Any other registry *answer* — not found, unauthorized, a digest
 /// that does not match — comes back at once: repeating it would only hide it for a few
 /// seconds.
@@ -2483,9 +2483,10 @@ struct BuildLockInner {
     heartbeat: Option<std::thread::JoinHandle<()>>,
 }
 
-/// One acquire attempt on `key`, long-polling up to `wait` (`Duration::ZERO` tries once and
-/// returns immediately). `None` if the wait elapsed with the key still held, or on any
-/// transport error — the caller treats both as "not acquired".
+/// One acquire attempt on `key`, long-polling up to `wait` for a holder to let go
+/// (`Duration::ZERO` does not wait for one, though a busy registry's 503 is still waited out
+/// for up to 30 s). `None` if the wait elapsed with the key still held, or on any transport
+/// error — the caller treats both as "not acquired".
 fn acquire_once(
     client: &Arc<vk_registry::LockClient>,
     key: &str,
@@ -2562,7 +2563,20 @@ pub fn build_lock(rg: &Registry, key: &str, on_wait: &mut dyn FnMut(&str)) -> Op
             // the TTL and a peer reacquired) just means the build proceeds uncoordinated;
             // correctness is unaffected, only cross-runner dedup. Not surfaced here to keep
             // the live build dashboard's terminal clean.
-            let _ = rt.block_on(hb_client.renew(&hb_held, BUILD_LOCK_TTL));
+            //
+            // A renew waits out a busy registry for up to half the TTL, and `Drop` joins this
+            // thread: give it up as soon as the stop is signalled.
+            let stopping = async {
+                while !*lock.lock().unwrap() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            rt.block_on(async {
+                tokio::select! {
+                    _ = hb_client.renew(&hb_held, BUILD_LOCK_TTL) => {}
+                    () = stopping => {}
+                }
+            });
         }
     });
 

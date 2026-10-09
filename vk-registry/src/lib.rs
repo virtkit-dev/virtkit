@@ -79,6 +79,17 @@ pub enum Authenticator {
     },
 }
 
+impl Authenticator {
+    /// The `WWW-Authenticate` value an unauthenticated request is challenged with, `None`
+    /// when the server is open.
+    fn challenge_value(&self) -> Option<&'static str> {
+        match self {
+            Authenticator::Shared(auth) => auth.challenge_value(),
+            Authenticator::Accounts { .. } => Some(accounts::CHALLENGE),
+        }
+    }
+}
+
 /// Everything a connection handler needs: the content-addressed store, the relay
 /// upstreams (empty ⇒ a plain local registry, no mirroring), the build-once lock
 /// authority, the client-auth scheme, and the optional TLS acceptor. Cheap to
@@ -2148,6 +2159,12 @@ pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
     // Resolved before `into_state` consumes the config; bound after it, because the
     // listener is only worth having once the db behind it is open.
     let admin_socket = cfg.resolved_admin_socket();
+    let limits = ConnLimits {
+        connections: cfg.max_connections,
+        per_peer: cfg.max_connections_per_client,
+        ..CONN_LIMITS
+    };
+    raise_nofile_limit(limits.connections);
     let mut state = cfg.into_state()?;
     state.tls = tls;
     let state = Arc::new(state);
@@ -2174,7 +2191,7 @@ pub async fn serve_config(cfg: ServerConfig) -> Result<()> {
             ),
         }
     }
-    serve_on(listener, state).await
+    serve_limited(listener, state, limits).await
 }
 
 /// The line a server announces itself with: the store it serves, whether it mirrors, and
@@ -2224,24 +2241,48 @@ struct ConnLimits {
     headers: Duration,
     /// Connections served at once; past it, accepting waits for one to close.
     connections: usize,
-    /// Connections served at once from one client address; past it, a new one is closed
-    /// as soon as it is accepted, so one host cannot take every slot of `connections`.
+    /// Connections served at once from one client address; past it, a new one is turned
+    /// away as soon as it is accepted, so one host cannot take every slot of `connections`.
     /// An IPv6 client counts by its /64, the block one host is commonly given, and an
     /// IPv4-mapped IPv6 address as the IPv4 address it maps.
     per_peer: usize,
+    /// Connections turned away by `per_peer` that are answered 503 at once, each held for at
+    /// most `handshake`, twice [`REFUSAL_HEADERS`] and [`REFUSAL_LINGER`]; past it, they are
+    /// closed unanswered.
+    /// They do not count against `connections`, so this is what bounds their cost.
+    refusals: usize,
 }
+
+/// The connections a server admits by default (`max_connections`). Each holds a
+/// descriptor, so the open-file limit has to be above it; see [`raise_nofile_limit`].
+const DEFAULT_MAX_CONNECTIONS: usize = 4096;
+/// The connections one client address may hold by default (`max_connections_per_client`).
+/// A quarter of the total: a CI host runs a dozen jobs pulling sixteen blobs at a time
+/// each, and every one of those requests is a connection of its own over HTTP/1.1.
+const DEFAULT_MAX_CONNECTIONS_PER_CLIENT: usize = 1024;
 
 const CONN_LIMITS: ConnLimits = ConnLimits {
     handshake: Duration::from_secs(10),
     headers: Duration::from_secs(30),
-    connections: 1024,
-    // A quarter of the total: a busy runner host pulling many layers is not throttled.
-    per_peer: 256,
+    connections: DEFAULT_MAX_CONNECTIONS,
+    per_peer: DEFAULT_MAX_CONNECTIONS_PER_CLIENT,
+    refusals: 64,
 };
 
-/// Open connections per client address (see [`peer_key`]) and whether the cap was logged
-/// since that address last fell below it.
-type PeerCounts = Arc<Mutex<HashMap<IpAddr, (usize, bool)>>>;
+/// For a turned-away client to send its request headers before it is closed unanswered.
+const REFUSAL_HEADERS: Duration = Duration::from_secs(5);
+/// The `Retry-After` a turned-away request is answered with, in seconds.
+const REFUSAL_RETRY_AFTER: &str = "2";
+/// How long, and how much, a refused request's body is read after the answer before the
+/// connection is closed.
+const REFUSAL_LINGER: Duration = Duration::from_secs(2);
+const REFUSAL_DRAIN: usize = 64 * 1024;
+/// How often a stretch at a connection cap is logged: once on reaching it, then at most
+/// once per this long, with the count of what went unlogged.
+const CAP_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// Open connections per client address (see [`peer_key`]).
+type PeerCounts = Arc<Mutex<HashMap<IpAddr, usize>>>;
 
 /// The address a client's connections are counted under: its IPv4 address, or its IPv6 /64.
 fn peer_key(ip: IpAddr) -> IpAddr {
@@ -2255,29 +2296,24 @@ fn peer_key(ip: IpAddr) -> IpAddr {
 struct PeerSlot {
     peers: PeerCounts,
     key: IpAddr,
-    max: usize,
 }
 
 impl PeerSlot {
-    /// Count a connection from `ip`. At `max`, return whether this is the first refusal
-    /// since the address last fell below the cap, so callers log only that refusal.
-    fn acquire(peers: &PeerCounts, ip: IpAddr, max: usize) -> Result<PeerSlot, bool> {
+    /// Count a connection from `ip`, or `None` when it already holds `max`.
+    fn acquire(peers: &PeerCounts, ip: IpAddr, max: usize) -> Option<PeerSlot> {
         let key = peer_key(ip);
         let mut map = peers.lock().unwrap_or_else(|e| e.into_inner());
-        let (open, warned) = map.entry(key).or_insert((0, false));
+        let open = map.entry(key).or_insert(0);
         if *open >= max {
-            let first = !*warned;
-            *warned = true;
             if *open == 0 {
                 map.remove(&key);
             }
-            return Err(first);
+            return None;
         }
         *open += 1;
-        Ok(PeerSlot {
+        Some(PeerSlot {
             peers: peers.clone(),
             key,
-            max,
         })
     }
 }
@@ -2285,15 +2321,79 @@ impl PeerSlot {
 impl Drop for PeerSlot {
     fn drop(&mut self) {
         let mut map = self.peers.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((open, warned)) = map.get_mut(&self.key) {
+        if let Some(open) = map.get_mut(&self.key) {
             *open = open.saturating_sub(1);
-            if *open < self.max {
-                *warned = false;
-            }
             if *open == 0 {
                 map.remove(&self.key);
             }
         }
+    }
+}
+
+/// Last log time and unlogged refusal count per client address. A busy host repeatedly
+/// crosses its cap as connections open and close; logging each crossing would be noisy.
+#[derive(Default)]
+struct RefusalLog(HashMap<IpAddr, (std::time::Instant, u64)>);
+
+impl RefusalLog {
+    /// Count a refusal of `key` at `now`. When it is time to log one, return how many went
+    /// unlogged before it.
+    fn refused(&mut self, key: IpAddr, now: std::time::Instant) -> Option<u64> {
+        if let Some((at, unlogged)) = self.0.get_mut(&key)
+            && now.duration_since(*at) < CAP_LOG_EVERY
+        {
+            *unlogged += 1;
+            return None;
+        }
+        // Addresses not refused for a while are forgotten here, so the map holds only the
+        // ones refused within the last `CAP_LOG_EVERY`.
+        let before = self.0.remove(&key).map_or(0, |(_, unlogged)| unlogged);
+        self.0
+            .retain(|_, (at, _)| now.duration_since(*at) < CAP_LOG_EVERY);
+        self.0.insert(key, (now, 0));
+        Some(before)
+    }
+}
+
+/// Raise the soft open-file limit to the hard one (at most `fs.nr_open`) and warn when it is
+/// still too low for `connections`. Each connection holds a descriptor, and a server out of
+/// them fails accepts and store reads alike. The `install-service` unit sets `LimitNOFILE` well
+/// above any cap; a server started by hand gets the shell's soft limit, commonly 1024.
+fn raise_nofile_limit(connections: usize) {
+    // Store files, the listener, upstream and admin sockets, beside the connections.
+    const HEADROOM: u64 = 256;
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit only read and write the struct passed.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return;
+    }
+    // An unlimited hard limit (`RLIM_INFINITY`) is no limit the kernel grants: a process may
+    // open at most `fs.nr_open` files, and a soft limit above it is refused.
+    let ceiling = std::fs::read_to_string("/proc/sys/fs/nr_open")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map_or(lim.rlim_max, |nr_open| lim.rlim_max.min(nr_open));
+    if lim.rlim_cur < ceiling {
+        let raised = libc::rlimit {
+            rlim_cur: ceiling,
+            rlim_max: lim.rlim_max,
+        };
+        // SAFETY: as above.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            lim = raised;
+        }
+    }
+    let needed = (connections as u64).saturating_add(HEADROOM);
+    if lim.rlim_cur < needed {
+        eprintln!(
+            "vk-registry: warning: the open-file limit is {} but max_connections = \
+             {connections} needs about {needed}; raise it (LimitNOFILE=, ulimit -n) or lower \
+             max_connections",
+            lim.rlim_cur
+        );
     }
 }
 
@@ -2308,6 +2408,18 @@ async fn serve_limited(
     listener: TcpListener,
     state: Arc<ServerState>,
     limits: ConnLimits,
+) -> Result<()> {
+    let refusals = Arc::new(tokio::sync::Semaphore::new(limits.refusals));
+    serve_refusing(listener, state, limits, refusals).await
+}
+
+/// [`serve_limited`] with caller-supplied refusal permits (`limits.refusals`) so tests can
+/// observe their use.
+async fn serve_refusing(
+    listener: TcpListener,
+    state: Arc<ServerState>,
+    limits: ConnLimits,
+    refusals: Arc<tokio::sync::Semaphore>,
 ) -> Result<()> {
     if let Ok(addr) = listener.local_addr() {
         eprintln!(
@@ -2329,21 +2441,20 @@ async fn serve_limited(
     }
     let slots = Arc::new(tokio::sync::Semaphore::new(limits.connections));
     let peers = PeerCounts::default();
-    // Whether the cap was hit and not yet left: it is logged once per stretch at the cap.
-    let mut full = false;
+    let mut refused = RefusalLog::default();
+    // When the cap was last logged: once per stretch at it, and at most every
+    // `CAP_LOG_EVERY`, as a server near its cap goes over and back all the time.
+    let mut full_logged: Option<std::time::Instant> = None;
     loop {
         // Held for the connection's life: at the cap, new clients wait in the kernel's
         // backlog rather than each costing a task here.
         let slot = match slots.clone().try_acquire_owned() {
-            Ok(slot) => {
-                full = false;
-                slot
-            }
+            Ok(slot) => slot,
             Err(_) => {
-                if !full {
-                    full = true;
+                if full_logged.is_none_or(|t| t.elapsed() >= CAP_LOG_EVERY) {
+                    full_logged = Some(std::time::Instant::now());
                     eprintln!(
-                        "vk-registry: {} connections open, new ones wait",
+                        "vk-registry: {} connections open (max_connections), new ones wait",
                         limits.connections
                     );
                 }
@@ -2364,20 +2475,33 @@ async fn serve_limited(
                 continue;
             }
         };
-        let peer_slot = match PeerSlot::acquire(&peers, peer.ip(), limits.per_peer) {
-            Ok(peer_slot) => peer_slot,
-            Err(first) => {
-                // Log once until the count falls below the cap to prevent a client from
-                // producing a log line for every rejected connection.
-                if first {
-                    eprintln!(
-                        "vk-registry: {} has {} connections open, new ones are closed",
-                        peer.ip(),
-                        limits.per_peer
-                    );
-                }
-                continue;
+        let Some(peer_slot) = PeerSlot::acquire(&peers, peer.ip(), limits.per_peer) else {
+            drop(slot);
+            let key = peer_key(peer.ip());
+            if let Some(unlogged) = refused.refused(key, std::time::Instant::now()) {
+                let since = match unlogged {
+                    0 => String::new(),
+                    n => format!(" ({n} turned away since the last notice)"),
+                };
+                eprintln!(
+                    "vk-registry: {} has {} connections open (max_connections_per_client), \
+                     new ones are answered 503{since}",
+                    match key {
+                        IpAddr::V6(_) => format!("{key}/64"),
+                        IpAddr::V4(_) => key.to_string(),
+                    },
+                    limits.per_peer
+                );
             }
+            // Past `refusals` the client is not even told: it is closed with nothing read.
+            if let Ok(permit) = refusals.clone().try_acquire_owned() {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    refuse(stream, &state, limits).await;
+                });
+            }
+            continue;
         };
         let state = state.clone();
         tokio::spawn(async move {
@@ -2394,6 +2518,83 @@ async fn serve_limited(
             }
         });
     }
+}
+
+/// Answer one request on a turned-away connection with a 503 and a `Retry-After`, then
+/// close it: a client told to come back later can wait, where one whose connection is
+/// closed under it cannot tell that from a failure. Nothing is logged: the refusal already
+/// was, and a client that hangs up first is one that did not need the answer.
+///
+/// The 503 carries the server's authentication challenge, as a 401 would: oci-client learns
+/// how to authenticate from its first `GET /v2/`, and without a challenge there it sends
+/// the requests that follow anonymously.
+async fn refuse(stream: tokio::net::TcpStream, state: &ServerState, limits: ConnLimits) {
+    let challenge = state.auth.challenge_value();
+    match &state.tls {
+        Some(acceptor) => {
+            if let Ok(Ok(tls)) =
+                tokio::time::timeout(limits.handshake, acceptor.accept(stream)).await
+            {
+                refuse_on(tls, challenge).await;
+            }
+        }
+        None => refuse_on(stream, challenge).await,
+    }
+}
+
+/// [`refuse`] over any transport.
+async fn refuse_on<S>(stream: S, challenge: Option<&'static str>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let svc = service_fn(move |_req| async move {
+        let mut resp = error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "TOOMANYREQUESTS",
+            "too many connections from this address; retry later",
+        );
+        let headers = resp.headers_mut();
+        headers.insert(
+            hyper::header::RETRY_AFTER,
+            hyper::header::HeaderValue::from_static(REFUSAL_RETRY_AFTER),
+        );
+        if let Some(challenge) = challenge {
+            headers.insert(
+                hyper::header::WWW_AUTHENTICATE,
+                hyper::header::HeaderValue::from_static(challenge),
+            );
+        }
+        Ok::<_, Infallible>(resp)
+    });
+    let conn = http1::Builder::new()
+        .keep_alive(false)
+        .timer(TokioTimer::new())
+        .header_read_timeout(REFUSAL_HEADERS)
+        .serve_connection(TokioIo::new(stream), svc)
+        .without_shutdown();
+    // Bounded as a whole too: the answer is small, but a client that never reads it would
+    // otherwise hold the write, and with it the permit, for as long as it likes. Errors are
+    // the client's: one that resets instead of reading is one that did not need the answer.
+    let Ok(Ok(parts)) = tokio::time::timeout(REFUSAL_HEADERS * 2, conn).await else {
+        return;
+    };
+    // Close the write side, then read what the client still sends — the rest of a refused
+    // upload, up to `REFUSAL_DRAIN` — so the close is a FIN after the answer, not a reset
+    // over unread bytes that can discard the answer before the client reads it.
+    let mut stream = parts.io.into_inner();
+    let _ = tokio::time::timeout(REFUSAL_LINGER, async {
+        stream.shutdown().await?;
+        let (mut left, mut buf) = (REFUSAL_DRAIN, [0u8; 8192]);
+        while left > 0 {
+            match stream.read(&mut buf).await? {
+                0 => break,
+                n => left = left.saturating_sub(n),
+            }
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await;
 }
 
 /// Serve one HTTP/1 connection over any transport (plain TCP or TLS).
@@ -4398,20 +4599,43 @@ mod tests {
 
     /// Start a server with `limits` on an ephemeral port over a fresh store named `tag`.
     async fn serve_test_limited(tag: &str, limits: ConnLimits) -> (SocketAddr, PathBuf) {
+        let (addr, dir, _) = serve_test_with(tag, limits, auth::Auth::None, None).await;
+        (addr, dir)
+    }
+
+    /// [`serve_test_limited`] with `auth` and `tls`, and the permits of its refusals.
+    async fn serve_test_with(
+        tag: &str,
+        limits: ConnLimits,
+        auth: auth::Auth,
+        tls: Option<tokio_rustls::TlsAcceptor>,
+    ) -> (SocketAddr, PathBuf, Arc<tokio::sync::Semaphore>) {
         let dir = std::env::temp_dir().join(format!("vk-regserve-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let state = Arc::new(ServerState {
             store: Arc::new(Store::new(dir.clone()).unwrap()),
             upstreams: Vec::new(),
             locks: lock::LockManager::new(),
-            auth: Authenticator::Shared(auth::Auth::None),
-            tls: None,
+            auth: Authenticator::Shared(auth),
+            tls,
             webdav: false,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_limited(listener, state, limits));
-        (addr, dir)
+        let refusals = Arc::new(tokio::sync::Semaphore::new(limits.refusals));
+        tokio::spawn(serve_refusing(listener, state, limits, refusals.clone()));
+        (addr, dir, refusals)
+    }
+
+    /// Wait for `permits` to have `n` available, as the server takes and returns them.
+    async fn permits_reach(permits: &tokio::sync::Semaphore, n: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while permits.available_permits() != n {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{} refusal permits, not {n}", permits.available_permits()));
     }
 
     /// A client that stops mid-header is dropped once the header timeout passes, and the
@@ -4425,6 +4649,7 @@ mod tests {
             headers: Duration::from_secs(1),
             connections: 1,
             per_peer: 16,
+            refusals: 4,
         };
         let (addr, dir) = serve_test_limited("limits", limits).await;
 
@@ -4471,6 +4696,7 @@ mod tests {
             headers: Duration::from_secs(1),
             connections: 4,
             per_peer: 4,
+            refusals: 4,
         };
         let (addr, dir) = serve_test_limited("idle", limits).await;
 
@@ -4491,8 +4717,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Past its per-address cap, a client's new connection is closed at once, while another
-    /// address is still served.
+    /// Past its per-address cap, a client's new connection is answered 503 with a
+    /// `Retry-After` and closed, while another address is still served; past the refusals
+    /// answered at once, it is closed unanswered.
     #[tokio::test]
     async fn connections_are_capped_per_client_address() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4502,17 +4729,47 @@ mod tests {
             headers: Duration::from_secs(5),
             connections: 4,
             per_peer: 1,
+            refusals: 1,
         };
-        let (addr, dir) = serve_test_limited("perpeer", limits).await;
+        let (addr, dir, refusals) =
+            serve_test_with("perpeer", limits, auth::Auth::None, None).await;
 
         let mut held = tokio::net::TcpStream::connect(addr).await.unwrap();
         held.write_all(b"GET /v2/ HTTP/1.1\r\n").await.unwrap();
-        // Same address, over its cap: closed with nothing read or written.
+        // Same address, over its cap: told to come back later, its upload left unread
+        // without that answer being lost to a reset.
         let mut over = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut buf = [0u8; 64];
-        let n = tokio::time::timeout(Duration::from_secs(2), over.read(&mut buf))
+        let body = vec![b'x'; 32 * 1024];
+        let head = format!(
+            "PUT /v2/r/blobs/uploads/u HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        over.write_all(&[head.as_bytes(), &body].concat())
             .await
-            .expect("a connection past the per-address cap was kept open")
+            .unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut all = Vec::new();
+            over.read_to_end(&mut all).await.map(|_| all)
+        })
+        .await
+        .expect("a connection past the per-address cap was kept open")
+        .unwrap();
+        let answer = String::from_utf8_lossy(&answer).to_ascii_lowercase();
+        assert!(answer.starts_with("http/1.1 503"), "{answer}");
+        assert!(answer.contains("retry-after: 2"), "{answer}");
+        assert!(answer.contains("toomanyrequests"), "{answer}");
+        assert!(!answer.contains("www-authenticate"), "{answer}");
+        drop(over);
+        // A refusal still waiting for its request holds the one permit, so the next one
+        // over the cap is closed with nothing read or written.
+        permits_reach(&refusals, 1).await;
+        let _waiting = tokio::net::TcpStream::connect(addr).await.unwrap();
+        permits_reach(&refusals, 0).await;
+        let mut unanswered = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), unanswered.read(&mut buf))
+            .await
+            .expect("a refusal past the permits was kept open")
             .unwrap();
         assert_eq!(n, 0, "{:?}", &buf[..n]);
         // Another loopback address has its own count.
@@ -4532,23 +4789,174 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A connection's per-address count is released when it closes, and the entry with it;
-    /// a refusal is reported as the first only once per stretch at the cap.
+    /// A refusal over TLS is answered after the handshake, and carries the server's
+    /// challenge, so a client probing `/v2/` learns how to authenticate even when turned away.
+    #[tokio::test]
+    async fn a_refusal_over_tls_carries_the_challenge() {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        // The test certificate and key vk-hub's tests use, for `localhost`.
+        const TLS_CA: &[u8] = include_bytes!("testdata/tls-ca.pem");
+        const TLS_CERT: &[u8] = include_bytes!("testdata/tls-cert.pem");
+        const TLS_KEY: &[u8] = include_bytes!("testdata/tls-key.pem");
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certs = CertificateDer::pem_slice_iter(TLS_CERT)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(TLS_KEY).unwrap();
+        let sc = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(sc));
+        let limits = ConnLimits {
+            handshake: Duration::from_secs(5),
+            headers: Duration::from_secs(5),
+            connections: 4,
+            per_peer: 1,
+            refusals: 1,
+        };
+        let basic = auth::Auth::Basic {
+            user: "u".into(),
+            pass: "p".into(),
+        };
+        let (addr, dir, _) = serve_test_with("refuse-tls", limits, basic, Some(acceptor)).await;
+
+        let _held = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(TLS_CA).unwrap())
+            .resolve("localhost", addr)
+            .build()
+            .unwrap();
+        let resp = client
+            .get(format!("https://localhost:{}/v2/", addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let header = |name| resp.headers().get(name).and_then(|v| v.to_str().ok());
+        assert_eq!(header(hyper::header::RETRY_AFTER), Some("2"));
+        assert_eq!(
+            header(hyper::header::WWW_AUTHENTICATE),
+            Some("Basic realm=\"vk-registry\"")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The challenge on a refusal is harmless to a client that already sends credentials:
+    /// refused, it gets them through once the address is below its cap again.
+    #[tokio::test]
+    async fn an_authenticated_client_gets_through_after_a_refusal() {
+        let limits = ConnLimits {
+            handshake: Duration::from_secs(5),
+            headers: Duration::from_secs(5),
+            connections: 4,
+            per_peer: 1,
+            refusals: 1,
+        };
+        let basic = auth::Auth::Basic {
+            user: "u".into(),
+            pass: "p".into(),
+        };
+        let (addr, dir, refusals) = serve_test_with("refuse-basic", limits, basic, None).await;
+        let held = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client = reqwest::Client::new();
+        let probe = || {
+            client
+                .get(format!("http://{addr}/v2/"))
+                .basic_auth("u", Some("p"))
+                .send()
+        };
+        let resp = probe().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().contains_key(hyper::header::WWW_AUTHENTICATE));
+        drop((resp, held));
+        permits_reach(&refusals, 1).await;
+        // The held connection's slot is given back once the server sees it closed.
+        let resp = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let resp = probe().await.unwrap();
+                if resp.status() != StatusCode::SERVICE_UNAVAILABLE {
+                    return resp;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the address stayed over its cap");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lock request turned away past the per-address cap is asked again after the
+    /// `Retry-After`, not read as the lock being held.
+    #[tokio::test]
+    async fn a_lock_request_waits_out_a_refusal() {
+        let limits = ConnLimits {
+            handshake: Duration::from_secs(5),
+            headers: Duration::from_secs(5),
+            connections: 4,
+            per_peer: 1,
+            refusals: 1,
+        };
+        let (addr, dir, _) = serve_test_with("lock-refused", limits, auth::Auth::None, None).await;
+        let held = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client = LockClient::new(
+            format!("http://{addr}"),
+            ClientAuth::None,
+            reqwest::Client::new(),
+        );
+        let start = std::time::Instant::now();
+        let acquire = client.acquire("k", Duration::from_secs(30), Duration::ZERO, "me");
+        let free = async {
+            // Well before the `Retry-After` is up, free the address's slot.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            drop(held);
+        };
+        let (got, ()) = tokio::join!(acquire, free);
+        assert!(got.unwrap().is_some(), "the lock was not acquired");
+        // Only a refusal's `Retry-After` takes this long.
+        assert!(
+            start.elapsed() >= Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A connection's per-address count is released when it closes, and the entry with it.
     #[test]
     fn peer_slots_count_and_release() {
         let peers = PeerCounts::default();
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
         let a = PeerSlot::acquire(&peers, ip, 2).unwrap();
         let b = PeerSlot::acquire(&peers, ip, 2).unwrap();
-        assert!(matches!(PeerSlot::acquire(&peers, ip, 2), Err(true)));
-        assert!(matches!(PeerSlot::acquire(&peers, ip, 2), Err(false)));
-        assert!(PeerSlot::acquire(&peers, "192.0.2.2".parse().unwrap(), 2).is_ok());
+        assert!(PeerSlot::acquire(&peers, ip, 2).is_none());
+        assert!(PeerSlot::acquire(&peers, "192.0.2.2".parse().unwrap(), 2).is_some());
         drop(a);
         let c = PeerSlot::acquire(&peers, ip, 2).unwrap();
-        // Back at the cap after falling below it: logged again.
-        assert!(matches!(PeerSlot::acquire(&peers, ip, 2), Err(true)));
+        assert!(PeerSlot::acquire(&peers, ip, 2).is_none());
         drop((b, c));
         assert!(peers.lock().unwrap().is_empty());
+    }
+
+    /// An address's refusals are logged at most once per `CAP_LOG_EVERY`, the next line
+    /// counting those in between, however often it crosses its cap meanwhile; an address
+    /// not refused for that long is forgotten.
+    #[test]
+    fn refusals_are_logged_at_most_once_a_period() {
+        let t0 = std::time::Instant::now();
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+        let mut log = RefusalLog::default();
+        assert_eq!(log.refused(a, t0), Some(0));
+        assert_eq!(log.refused(a, t0 + Duration::from_secs(1)), None);
+        assert_eq!(log.refused(a, t0 + Duration::from_secs(59)), None);
+        assert_eq!(log.refused(b, t0 + Duration::from_secs(59)), Some(0));
+        assert_eq!(log.refused(a, t0 + CAP_LOG_EVERY), Some(2));
+        assert_eq!(log.refused(a, t0 + CAP_LOG_EVERY * 2), Some(0));
+        // `b` was last refused more than a period before, so the log no longer holds it.
+        assert_eq!(log.0.len(), 1);
     }
 
     /// IPv6 clients count by /64, and an IPv4-mapped address as its IPv4 address.
@@ -4566,7 +4974,7 @@ mod tests {
 
         let peers = PeerCounts::default();
         let _a = PeerSlot::acquire(&peers, "2001:db8::1".parse().unwrap(), 1).unwrap();
-        assert!(PeerSlot::acquire(&peers, "2001:db8::2".parse().unwrap(), 1).is_err());
+        assert!(PeerSlot::acquire(&peers, "2001:db8::2".parse().unwrap(), 1).is_none());
     }
 
     /// The URL a server prints is the URL that reaches it: a TLS-configured server says

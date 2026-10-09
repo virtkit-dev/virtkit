@@ -627,6 +627,45 @@ The proxy never binds a network interface, and request and response bodies strea
 directions. This keeps registry credentials out of guest jobs without buffering large
 layers. The feature is opt-in and requires guest networking.
 
+## Connection limits
+
+Every limit below applies before authentication, so a client that connects and sends
+nothing cannot hold a task and a descriptor indefinitely: 10 s to finish a TLS handshake,
+30 s for a request's headers to arrive (on connect, and again whenever a kept-alive
+connection goes idle).
+
+- **`max_connections`** (default 4096) is how many connections are served at once. Past it,
+  the server stops accepting until one closes, and new clients wait in the listen backlog
+  (4096).
+- **`max_connections_per_client`** (default 1024) is how many of those one client address
+  may hold: an IPv4 address, or an IPv6 /64, the block one host is commonly given. Without
+  it, one busy host — a CI runner whose jobs all start pulling at once — could take every
+  slot and leave the other runners waiting in the backlog. A connection past it is
+  answered `503` with `Retry-After: 2`, the server's `WWW-Authenticate` challenge (a client
+  probing `/v2/` learns from it how to authenticate) and an OCI `TOOMANYREQUESTS` error,
+  then closed once up to 64 KiB of an unread request body is drained. At most 64 such
+  answers are pending at once, each bounded by the handshake timeout and 12 s; past that, a
+  turned-away connection is closed unanswered. The cap is logged at most once a minute per
+  address, with the count turned away since the last line. Behind a TLS-terminating
+  reverse proxy every client is the proxy's address: set it equal to `max_connections`
+  there.
+
+The server speaks HTTP/1.1 only, so every request in flight is a connection. `vk` fetches
+or uploads up to 16 blobs at once per pull or push, so a host running N of them at once
+holds up to 16·N connections; size `max_connections_per_client` to the busiest host and
+`max_connections` to the fleet. `vk` waits out a `503`, a `429`, or a connection closed
+before any answer for up to three minutes, with jittered exponential backoff; clients
+before that change retried a closed connection three times over 14 s and fail on a `503`
+at once. Build-lock requests (`/lock/`) are turned away like any other; the lock client
+waits out a `503` too, an acquire for its own wait or at least 30 s, a renewal for up to
+half the lease. Its release, holder and failure-memo calls do not: they are best effort, and
+a refused release leaves the lock held until its lease runs out.
+
+Each connection holds a file descriptor, beside the store files being read and written.
+`serve` raises its soft open-file limit to the hard limit (at most `fs.nr_open`) and warns
+when that is still below `max_connections` plus 256. The unit `install-service` writes sets
+`LimitNOFILE=1048576`; a server started by hand gets the shell's limits.
+
 ## Operational constraints and deferred work
 
 - The lock manager and accounts database assume one server process. Multi-replica operation

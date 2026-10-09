@@ -86,6 +86,11 @@ pub struct ServerConfig {
     /// objects already stored under `files/` stay reachable over `/v2/` and expire under `gc`
     /// like any tag.
     pub webdav: bool,
+    /// Connections served at once; past it, new ones wait in the listen backlog.
+    pub max_connections: usize,
+    /// Connections served at once from one client address (an IPv6 /64); past it, new ones
+    /// are answered 503 and closed, so one host cannot take every slot of `max_connections`.
+    pub max_connections_per_client: usize,
 }
 
 /// The `[oidc]` config table, as declared (before its client secret is read and checked
@@ -139,6 +144,8 @@ struct FileConfig {
     admin_socket: Option<FileAdminSocket>,
     /// Enable `/dav/`; defaults to true.
     webdav: Option<bool>,
+    max_connections: Option<usize>,
+    max_connections_per_client: Option<usize>,
     oidc: Option<FileOidc>,
     #[serde(default)]
     upstream: Vec<FileUpstream>,
@@ -228,6 +235,8 @@ impl ServerConfig {
             admin_socket: AdminSocket::Unset,
             oidc: None,
             webdav: true,
+            max_connections: crate::DEFAULT_MAX_CONNECTIONS,
+            max_connections_per_client: crate::DEFAULT_MAX_CONNECTIONS_PER_CLIENT,
         }
     }
 
@@ -405,7 +414,12 @@ impl ServerConfig {
                 public_url: o.public_url,
             }),
             webdav: f.webdav.unwrap_or(true),
+            max_connections: f.max_connections.unwrap_or(crate::DEFAULT_MAX_CONNECTIONS),
+            max_connections_per_client: f
+                .max_connections_per_client
+                .unwrap_or(crate::DEFAULT_MAX_CONNECTIONS_PER_CLIENT),
         };
+        cfg.check_connection_limits()?;
         // Also here, not only in `build_auth`: `load` is where a file becomes a config, so
         // a contradictory file is refused by parsing it at all, not only by the path that
         // goes on to build the auth scheme. The serve path does both, so no message an
@@ -413,6 +427,22 @@ impl ServerConfig {
         // help examples' test does.
         cfg.check_auth_exclusions()?;
         Ok(cfg)
+    }
+
+    /// Reject zero caps, which serve no clients, and a per-client cap above the total,
+    /// which adds no limit and is likely a typo.
+    fn check_connection_limits(&self) -> Result<()> {
+        if self.max_connections == 0 || self.max_connections_per_client == 0 {
+            bail!("max_connections and max_connections_per_client must be at least 1");
+        }
+        if self.max_connections_per_client > self.max_connections {
+            bail!(
+                "max_connections_per_client ({}) is above max_connections ({})",
+                self.max_connections_per_client,
+                self.max_connections
+            );
+        }
+        Ok(())
     }
 
     /// The auth keys that cannot be combined, refused before anything they name is read —
@@ -1156,6 +1186,48 @@ mod tests {
         let cfg = ServerConfig::load(&good, None, None).unwrap();
         assert_eq!(cfg.token_file, Some(PathBuf::from("/etc/t")));
         assert_eq!(cfg.upstreams.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The connection caps default when unset, are taken from the file when set, and a cap
+    /// that would serve no one or that caps nothing is refused.
+    #[test]
+    fn connection_caps_are_read_and_checked() {
+        let dir = std::env::temp_dir().join(format!("vk-regserve-caps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let load = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            ServerConfig::load(&p, None, None)
+        };
+
+        let cfg = load("bare.toml", "root = \"/srv/reg\"\n").unwrap();
+        assert_eq!(cfg.max_connections, crate::DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(
+            cfg.max_connections_per_client,
+            crate::DEFAULT_MAX_CONNECTIONS_PER_CLIENT
+        );
+        let cfg = load(
+            "set.toml",
+            "max_connections = 10000\nmax_connections_per_client = 2500\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (cfg.max_connections, cfg.max_connections_per_client),
+            (10000, 2500)
+        );
+
+        let err = load("zero.toml", "max_connections_per_client = 0\n")
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("at least 1"), "{err:#}");
+        let err = load("above.toml", "max_connections = 100\n")
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("above max_connections"), "{err:#}");
+        assert!(load("negative.toml", "max_connections = -1\n").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

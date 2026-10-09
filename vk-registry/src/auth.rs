@@ -55,13 +55,23 @@ impl Auth {
     /// configured for one scheme and sends it unprompted, so the challenge is a statement of
     /// what this server takes rather than something a client has to be steered by.
     pub fn challenge(&self) -> Response<Body> {
-        let challenge = match self {
-            Auth::Basic { .. } => "Basic realm=\"vk-registry\"",
-            _ => "Bearer realm=\"vk-registry\"",
-        };
+        let challenge = self.challenge_value().unwrap_or(BEARER_CHALLENGE);
         crate::unauthorized(challenge, "authentication required")
     }
+
+    /// The `WWW-Authenticate` value [`Self::challenge`] carries, `None` when anyone is let in.
+    pub fn challenge_value(&self) -> Option<&'static str> {
+        match self {
+            Auth::None => None,
+            Auth::Basic { .. } => Some(BASIC_CHALLENGE),
+            Auth::Bearer { .. } => Some(BEARER_CHALLENGE),
+        }
+    }
 }
+
+/// The `WWW-Authenticate` values this server challenges with.
+pub(crate) const BASIC_CHALLENGE: &str = "Basic realm=\"vk-registry\"";
+const BEARER_CHALLENGE: &str = "Bearer realm=\"vk-registry\"";
 
 fn authorization(req: &Request<Incoming>) -> Option<&str> {
     req.headers()

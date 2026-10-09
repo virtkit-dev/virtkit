@@ -898,11 +898,11 @@ fn api_key_token(headers: &HeaderMap) -> Option<String> {
 /// Human-facing routes redirect to OIDC before reaching this response. Other browser
 /// requests may display a native Basic prompt.
 pub fn challenge() -> Response<Body> {
-    crate::unauthorized(
-        "Basic realm=\"vk-registry\"",
-        "sign in or provide a vkr_ API key",
-    )
+    crate::unauthorized(CHALLENGE, "sign in or provide a vkr_ API key")
 }
+
+/// The `WWW-Authenticate` value [`challenge`] carries.
+pub(crate) const CHALLENGE: &str = crate::auth::BASIC_CHALLENGE;
 
 /// The credential for `scheme`, if the request carries one. The scheme name is matched
 /// case-insensitively and the separator is `1*SP`, both per RFC 7235.

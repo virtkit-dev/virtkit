@@ -106,9 +106,17 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`vk-registry` admits more connections, and asks clients past its per-host cap to come
+  back.** It serves 4096 connections at once and 1024 from one client address by default,
+  up from 1024 and 256; `max_connections` and `max_connections_per_client` in its config
+  file set them. A connection past the per-address cap is answered 503 with `Retry-After`
+  rather than closed, and the cap is logged at most once a minute per address. `serve`
+  raises its open-file limit as far as allowed and warns when that is below
+  `max_connections`. Update `vk` on runner hosts as well: earlier versions fail at once on
+  that 503, where they retried a closed connection a few times.
 - **Registry pulls and pushes wait out a busy registry instead of failing the CI job.** When
-  the registry turns a request away — answering 503 or 429, or closing the connection before
-  answering, as `vk-registry` does past its per-host connection cap — `vk` retries with
+  the registry turns a request away — answering 503 or 429, as `vk-registry` does past its
+  per-host connection cap, or closing the connection before answering — `vk` retries with
   growing, randomized delays for up to three minutes, with a note at most every 10 seconds,
   where it gave up after three retries over 14 seconds. A missing blob, a refused login or a
   digest mismatch still fails at once.

@@ -44,6 +44,29 @@ pub struct FailInfo {
     pub age: Duration,
 }
 
+/// How long a lock request turned away with a 503 is asked again at least, however short
+/// its own wait.
+const BUSY_WINDOW: Duration = Duration::from_secs(30);
+
+/// When `resp` is a 503, sleep for its `Retry-After` (2 s without one, at most 10 s) and
+/// return true, unless that would end more than `window` after `start`.
+async fn wait_out(resp: &reqwest::Response, start: tokio::time::Instant, window: Duration) -> bool {
+    if resp.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return false;
+    }
+    let pause = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok()?.trim().parse().ok())
+        .map_or(Duration::from_secs(2), Duration::from_secs)
+        .min(Duration::from_secs(10));
+    if start.elapsed() + pause > window {
+        return false;
+    }
+    tokio::time::sleep(pause).await;
+    true
+}
+
 impl LockClient {
     pub fn new(base: impl Into<String>, auth: ClientAuth, client: reqwest::Client) -> Self {
         LockClient {
@@ -71,7 +94,8 @@ impl LockClient {
 
     /// Atomically acquire ALL `names`, long-polling up to `wait`. `Ok(Some(owner))` on
     /// success (the shared batch owner token), `Ok(None)` if the wait elapsed with some
-    /// name still held (409). All-or-nothing.
+    /// name still held (409). All-or-nothing. A server turning the request away (503) is
+    /// asked again within `wait`, or within `BUSY_WINDOW` when that is shorter.
     pub async fn acquire_all(
         &self,
         names: &[String],
@@ -79,17 +103,24 @@ impl LockClient {
         wait: Duration,
         holder: &str,
     ) -> Result<Option<String>> {
-        let mut query = self.name_query(names);
-        let (ttl_s, wait_s) = (ttl.as_secs().to_string(), wait.as_secs().to_string());
-        query.push(("ttl", &ttl_s));
-        query.push(("wait", &wait_s));
-        let resp = self
-            .auth(self.client.post(self.url("acquire")))
-            .query(&query)
-            .header("x-vk-lock-holder", holder)
-            .send()
-            .await
-            .context("acquiring lock(s)")?;
+        let start = tokio::time::Instant::now();
+        let resp = loop {
+            let mut query = self.name_query(names);
+            let left = wait.saturating_sub(start.elapsed());
+            let (ttl_s, wait_s) = (ttl.as_secs().to_string(), left.as_secs().to_string());
+            query.push(("ttl", &ttl_s));
+            query.push(("wait", &wait_s));
+            let resp = self
+                .auth(self.client.post(self.url("acquire")))
+                .query(&query)
+                .header("x-vk-lock-holder", holder)
+                .send()
+                .await
+                .context("acquiring lock(s)")?;
+            if !wait_out(&resp, start, wait.max(BUSY_WINDOW)).await {
+                break resp;
+            }
+        };
         if resp.status() == reqwest::StatusCode::CONFLICT {
             return Ok(None);
         }
@@ -105,18 +136,26 @@ impl LockClient {
     }
 
     /// Renew every name in the batch; returns how many the server still recognized as
-    /// owned (fewer than `names.len()` means the batch was partly lost).
+    /// owned (fewer than `names.len()` means the batch was partly lost). A server turning
+    /// the request away (503) is asked again for up to half of `ttl`, so a heartbeat that
+    /// renews a third of the way through the lease asks for the last time before it lapses.
     pub async fn renew_all(&self, names: &[String], owner: &str, ttl: Duration) -> Result<usize> {
         let mut query = self.name_query(names);
         let ttl_s = ttl.as_secs().to_string();
         query.push(("ttl", &ttl_s));
-        let resp = self
-            .auth(self.client.post(self.url("renew")))
-            .query(&query)
-            .header("x-vk-lock-owner", owner)
-            .send()
-            .await
-            .context("renewing lock(s)")?;
+        let start = tokio::time::Instant::now();
+        let resp = loop {
+            let resp = self
+                .auth(self.client.post(self.url("renew")))
+                .query(&query)
+                .header("x-vk-lock-owner", owner)
+                .send()
+                .await
+                .context("renewing lock(s)")?;
+            if !wait_out(&resp, start, ttl / 2).await {
+                break resp;
+            }
+        };
         // 200 = full renew, 409 = partial (some names already lost) — both carry the count
         // body. Any other status (auth/transport/server error) is a failure, not a partial.
         let status = resp.status();
