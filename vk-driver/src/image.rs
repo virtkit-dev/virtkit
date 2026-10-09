@@ -356,6 +356,13 @@ pub(crate) fn acquire_pull_lock(
     )
 }
 
+/// [`acquire_pull_lock`] without waiting: `None` when another process holds it. Held, it
+/// answers waiters as a waited-for lock does, so they wait for it rather than give up.
+fn try_acquire_pull_lock(dir: &Path) -> Option<PullLock> {
+    let addr = pull_lock_addr(pull_lock_hash(dir)).ok()?;
+    UnixListener::bind_addr(&addr).ok().map(spawn_holder)
+}
+
 /// [`acquire_pull_lock`], retrying the bind every `poll`, and querying the holder at the first
 /// refusal and every 25 polls after.
 fn acquire_pull_lock_with(
@@ -538,29 +545,63 @@ fn base_dirs(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Removes its `path` on drop unless [`Self::keep`] consumed it first. Guarantees a tier's
-/// `.tmp` scratch (a build stage under `ensure::ensure_build_tier`, or a docker-tier pull
-/// under `dockerimg::build`) is wiped the instant its build/pull fails or panics — rather
-/// than depending on a later sweep to ever notice it (see [`sweep_orphaned_build_tmp`],
-/// which exists only to backstop the case nothing can run at all: a hard kill, SIGKILL, or
-/// OOM, where no destructor runs either).
+/// A tier's `.tmp` staging dir (a build stage under `ensure::ensure_build_tier`, or a
+/// docker-tier pull under `dockerimg::build`), claimed for as long as this guard lives and
+/// removed on drop unless [`Self::keep`] consumed it first — so it is wiped the instant its
+/// build/pull fails or panics rather than left for a sweep. The claim is an exclusive `flock`
+/// on the directory, which the kernel drops however the process ends; it is what
+/// [`sweep_orphaned_build_tmp`] reads, with the pull lock, to tell a dead dir from a live one.
 pub(crate) struct TmpGuard<'a> {
     path: &'a Path,
+    /// `None` on a filesystem that cannot take the `flock`, where the pull lock alone holds.
+    claim: Option<std::fs::File>,
     keep: bool,
 }
 
 impl<'a> TmpGuard<'a> {
-    pub(crate) fn new(path: &'a Path) -> Self {
-        TmpGuard { path, keep: false }
+    /// Create `path` afresh, removing what a past build or pull left there, and claim it. The
+    /// caller holds the pull lock of the dir `path` is promoted to, so whatever it removes is
+    /// dead. On a filesystem that cannot take the claim (NFS, or no `flock` support), the dir
+    /// goes unclaimed and the pull lock alone holds; one already claimed is an error.
+    pub(crate) fn create(path: &'a Path) -> Result<Self> {
+        Self::create_locking(path, flock_nb)
     }
 
-    /// Defuse: the caller has taken ownership of `path` (promoted/renamed it away), so
-    /// there is nothing left here to remove. Takes `self` by value rather than flipping a
-    /// flag through `&mut self`: the immediately-following implicit drop of this value is
-    /// what "defuses" it (it just finds `keep` already true and no-ops) — not
-    /// `mem::forget`/`ManuallyDrop`, the destructor still runs.
-    pub(crate) fn keep(mut self) {
+    /// [`Self::create`], claiming with `lock`.
+    fn create_locking(
+        path: &'a Path,
+        lock: impl Fn(&std::fs::File) -> std::io::Result<()>,
+    ) -> Result<Self> {
+        // Ignored: under the pull lock whatever is there is dead, and the build writes every
+        // file a promoted dir is read for; a remnant this cannot remove is only carried along.
+        let _ = std::fs::remove_dir_all(path);
+        std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
+        let dir =
+            std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let claim = match lock(&dir) {
+            Ok(()) => Some(dir),
+            // Held: a live build reached this dir without the pull lock, and it is its to
+            // remove, not this one's.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(e).with_context(|| format!("claiming {}", path.display()));
+            }
+            Err(_) => None,
+        };
+        Ok(TmpGuard {
+            path,
+            claim,
+            keep: false,
+        })
+    }
+
+    /// Transfer removal responsibility to the caller promoting (renaming) `path`. Return the
+    /// claim for the caller to hold through the rename, keeping the `.tmp` directory claimed.
+    /// Consume `self` rather than borrow it mutably: its destructor runs immediately with
+    /// removal disabled by `keep`, without `mem::forget` or `ManuallyDrop`.
+    #[must_use = "the claim is to be held until the dir is renamed away"]
+    pub(crate) fn keep(mut self) -> Option<std::fs::File> {
         self.keep = true;
+        self.claim.take()
     }
 }
 
@@ -574,62 +615,280 @@ impl Drop for TmpGuard<'_> {
     }
 }
 
-/// Reclaim orphaned `<name>.tmp` scratch anywhere under `root` (a build-tier or docker-tier
-/// cache dir): staging left behind by a build/pull that was killed or failed before it could
-/// promote (rename) into its final, fingerprinted dir (see `ensure::ensure_build_tier`,
-/// `dockerimg::build`). Such a `.tmp` never gets a `.used` marker (only the promoted dir gets
-/// one), so [`gc_idle`]'s idle-eviction never reaches it — it would otherwise sit forever.
-/// Safe to reclaim because the promoted dir's pull lock (`acquire_pull_lock`) is held for the
-/// *entire* window from before the `.tmp` is created to after promotion or failure: a
-/// non-blocking bind on that same abstract socket tells us whether a build is still in
-/// flight without waiting on it. Best-effort.
-///
-/// Walks like [`base_dirs`] (the name between `root` and the `.tmp`/digest can be
-/// multi-level, e.g. the docker tier's `<name>/<digest>.tmp`) rather than a flat `read_dir` —
-/// the build tier's fingerprint dirs happen to sit directly under `root`, but nothing else
-/// here assumes that.
-pub(crate) fn sweep_orphaned_build_tmp(root: &Path) {
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
-                reclaim_orphaned_tmp(&path);
-                continue;
-            }
-            if is_base_dir(&path) {
-                continue; // a promoted base — nothing to sweep inside it
-            }
-            stack.push(path); // an intermediate name component (e.g. docker's `<name>`)
+/// Take an exclusive `flock` on `file` without waiting: `WouldBlock` when another holds one.
+fn flock_nb(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: the fd is open for the borrow; flock returns 0 or -1 and does not block under
+    // `LOCK_NB`.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// How long a `.tmp` staging dir is left after it or an entry directly in it last changed,
+/// whatever its locks say: a build from before [`TmpGuard`] claimed its dir, or on a
+/// filesystem without `flock`, is judged by the pull lock alone.
+const DEAD_TMP_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many name levels below a tier root [`sweep_orphaned_build_tmp`] descends: a bound on
+/// the walk, not on names. The build tier's staging dirs sit right under it, the docker tier's
+/// under a repository name a group deeper per level, up to 20 nested groups on GitLab.
+const TMP_SWEEP_DEPTH: usize = 64;
+
+/// Whether a sweep also names the dead dirs it left: another user's, and those a removal
+/// could not finish. They stay until someone acts on them, so only the sweeps an operator
+/// starts or reads — `vk gc`, a node reset, the node's first — name them, not every build's
+/// and job's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Leftovers {
+    Name,
+    Quiet,
+}
+
+/// What [`sweep_orphaned_build_tmp`] reclaimed and left.
+#[derive(Debug, Default)]
+pub(crate) struct Swept {
+    /// Dead staging dirs removed.
+    pub(crate) dirs: u64,
+    /// The disk space they held.
+    pub(crate) bytes: u64,
+    /// Dead staging dirs another user owns, left for that user's own sweeps.
+    pub(crate) foreign: Vec<PathBuf>,
+    /// What a removal left in place (a mount inside a staging dir) or failed on.
+    pub(crate) left: Vec<String>,
+}
+
+impl Swept {
+    /// Say in one line what the sweep of `root` reclaimed, nothing when it reclaimed nothing,
+    /// and, with [`Leftovers::Name`], what it left.
+    fn report(&self, root: &Path, leftovers: Leftovers) {
+        if self.dirs > 0 {
+            println!(
+                "virtkit: reclaimed {} dead build dir(s) under {}, {}",
+                self.dirs,
+                root.display(),
+                crate::usage::fmt_bytes(self.bytes)
+            );
+        }
+        if leftovers == Leftovers::Quiet {
+            return;
+        }
+        if !self.foreign.is_empty() {
+            let dirs: Vec<_> = self
+                .foreign
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            eprintln!(
+                "virtkit: left {} dead build dir(s) owned by another user: {}",
+                dirs.len(),
+                dirs.join(", ")
+            );
+        }
+        for left in &self.left {
+            eprintln!("virtkit: reclaiming a dead build dir: {left}");
         }
     }
 }
 
-/// Reclaim `path` (a `.tmp` scratch dir) iff nothing holds its build/pull lock — see
-/// [`sweep_orphaned_build_tmp`].
-fn reclaim_orphaned_tmp(path: &Path) {
-    let promoted = path.with_extension("");
-    let Ok(addr) = pull_lock_addr(pull_lock_hash(&promoted)) else {
-        return;
-    };
-    // Nobody holds the lock right now: the `.tmp` is an orphan, not a live build. If a
-    // build is actively holding it for this fingerprint, leave it alone.
-    if let Ok(_lock) = UnixListener::bind_addr(&addr) {
-        println!(
-            "virtkit: reclaiming orphaned build scratch {}",
-            path.display()
-        );
-        if let Err(e) = std::fs::remove_dir_all(path) {
-            eprintln!("virtkit: reclaiming {}: {e}", path.display());
-        }
-        // `_lock` drops here, releasing the socket.
+/// Reclaim the `<name>.tmp` staging dirs under `root` (a build-tier or docker-tier cache dir)
+/// left by builds and pulls that died before promoting them — a job killed with its node
+/// service, cancelled, or OOM-killed runs no destructor. Such a dir never gets a `.used`
+/// marker, so [`gc_idle`] never reaches it. Say in one line what was reclaimed.
+///
+/// A dir is dead when nothing holds either of its locks: the pull lock of the dir it is
+/// promoted to (`acquire_pull_lock`, held from before the `.tmp` is created to after its
+/// promotion or removal) and the [`TmpGuard`] claim on the dir itself, held until it is
+/// renamed away. The pull lock is an abstract socket named after the path, so it alone
+/// misjudges a build in another network namespace, or one that reached the tier by another
+/// path; the claim is held by the open directory and alone misjudges a `vk` that predates it,
+/// or a filesystem without `flock`. Both are held across the removal, so a build of the same
+/// stage waits it out, and a dir that or an entry directly in it changed within
+/// [`DEAD_TMP_GRACE`] is left whatever they say. A dir another user owns is left.
+///
+/// The dir removed is the inode judged, never what its name leads to by then, and the tree is
+/// walked and removed through descriptors (see [`vk_fs::remove_tree_in`]): a symlink is never
+/// followed, whether to a staging dir or out of one, and nothing mounted inside one is
+/// entered. Best-effort: what cannot be read is left for the next sweep.
+pub(crate) fn sweep_orphaned_build_tmp(root: &Path, leftovers: Leftovers) -> Swept {
+    let swept = sweep_dead_tmp(root, DEAD_TMP_GRACE);
+    swept.report(root, leftovers);
+    swept
+}
+
+/// [`sweep_orphaned_build_tmp`] on both tiers under `state_dir` that stage: built stages and
+/// pulled docker images.
+pub(crate) fn sweep_orphaned_staging(state_dir: &Path, leftovers: Leftovers) {
+    for tier in ["build", "docker"] {
+        sweep_orphaned_build_tmp(&state_dir.join(tier), leftovers);
     }
+}
+
+/// [`sweep_orphaned_build_tmp`] with the grace spelled out, without the report.
+fn sweep_dead_tmp(root: &Path, grace: std::time::Duration) -> Swept {
+    let mut sweep = TmpSweep {
+        grace,
+        now: std::time::SystemTime::now(),
+        swept: Swept::default(),
+    };
+    // The root may be reached through a link of the operator's; nothing below it is.
+    if let Ok(top) = vk_fs::open_dir(root) {
+        sweep.level(&top, root, 0);
+    }
+    sweep.swept
+}
+
+/// [`sweep_dead_tmp`]'s state across the walk.
+struct TmpSweep {
+    grace: std::time::Duration,
+    now: std::time::SystemTime,
+    swept: Swept,
+}
+
+impl TmpSweep {
+    /// Reclaim the dead staging dirs in the open dir `dir`, shown as `path` and `depth` levels
+    /// below the tier root, and descend into its other dirs but a promoted base. Names are
+    /// read first and each opened in turn, so one descriptor per level is open at a time.
+    fn level(&mut self, dir: &std::os::fd::OwnedFd, path: &Path, depth: usize) {
+        use std::os::fd::AsFd;
+
+        let Ok(names) = vk_fs::dir_names(dir.as_fd()) else {
+            return;
+        };
+        for name in names {
+            let at = path.join(&name);
+            if Path::new(&name).extension() == Some(std::ffi::OsStr::new("tmp")) {
+                self.reclaim_if_dead(dir, &name, &at);
+                continue;
+            }
+            if depth + 1 >= TMP_SWEEP_DEPTH {
+                continue;
+            }
+            // Refuses a symlink and anything but a directory.
+            let Ok(sub) = vk_fs::open_dir_in(dir.as_fd(), &name) else {
+                continue;
+            };
+            // A promoted base: nothing to sweep inside it.
+            if !holds_base(&sub) {
+                self.level(&sub, &at, depth + 1);
+            }
+        }
+    }
+
+    /// Remove the staging dir `name` in `parent`, shown as `at`, if it is dead — see
+    /// [`sweep_orphaned_build_tmp`] — and account for it.
+    fn reclaim_if_dead(
+        &mut self,
+        parent: &std::os::fd::OwnedFd,
+        name: &std::ffi::OsStr,
+        at: &Path,
+    ) {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let Ok(dir) = vk_fs::open_dir_in(parent.as_fd(), name) else {
+            return; // gone, not a directory, or a symlink
+        };
+        // Held answering, so a build of the same stage waits the removal out.
+        let Some(_pull) = try_acquire_pull_lock(&at.with_extension("")) else {
+            return; // a build or pull of this entry is in flight
+        };
+        // Reopened from the descriptor, the same inode, for a lock `flock` can take.
+        let Ok(claim) = vk_fs::reopen_dir(dir.as_fd()).map(std::fs::File::from) else {
+            return;
+        };
+        let Ok(meta) = claim.metadata() else {
+            return;
+        };
+        let Some(changed) = last_changed(&claim) else {
+            return;
+        };
+        if self.now.duration_since(changed).unwrap_or_default() < self.grace {
+            return;
+        }
+        // Held while the tree goes. Only a holder refuses it: where the filesystem has no
+        // `flock`, no build holds one either, and the pull lock and the grace decide alone.
+        if flock_nb(&claim).is_err_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) {
+            return; // claimed by a live build
+        }
+        // SAFETY: geteuid(2) has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } {
+            self.swept.foreign.push(at.to_path_buf());
+            return;
+        }
+        let swept = &mut self.swept;
+        match vk_fs::remove_tree_in(parent.as_fd(), name, dir.as_fd()) {
+            Ok(done) => {
+                swept.bytes = swept.bytes.saturating_add(done.bytes);
+                if done.skipped.is_empty() {
+                    swept.dirs += 1;
+                } else {
+                    let kept: Vec<_> = done
+                        .skipped
+                        .iter()
+                        .map(|p| at.with_file_name(p).display().to_string())
+                        .collect();
+                    swept.left.push(format!(
+                        "{}: left in place, a mount, on another filesystem or another user's: {}",
+                        at.display(),
+                        kept.join(", ")
+                    ));
+                }
+            }
+            Err(e) => swept.left.push(format!("{}: {e:#}", at.display())),
+        }
+    }
+}
+
+/// The `stat` of `name` in `dir`, unfollowed.
+fn stat_in(dir: std::os::fd::BorrowedFd<'_>, name: &std::ffi::OsStr) -> Option<libc::stat> {
+    use std::os::fd::AsRawFd;
+
+    let name = std::ffi::CString::new(name.as_bytes()).ok()?;
+    // SAFETY: `stat` is plain old data, for which all-zero bytes are a valid value.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the fd is open for the borrow, the name NUL-terminated, `st` writable.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    (rc == 0).then_some(st)
+}
+
+/// When the open dir `dir` or an entry directly in it last changed: a build writing its image
+/// changes that file, not the dir. `None` when it cannot be read.
+fn last_changed(dir: &std::fs::File) -> Option<std::time::SystemTime> {
+    use std::os::fd::AsFd;
+
+    let at = |st: &libc::stat| {
+        let secs = u64::try_from(st.st_mtime).unwrap_or(0);
+        let nanos = u32::try_from(st.st_mtime_nsec).unwrap_or(0);
+        std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos)
+    };
+    let mut newest = dir.metadata().ok()?.modified().ok()?;
+    for name in vk_fs::dir_names(dir.as_fd()).ok()? {
+        // Gone since the listing: nothing newer to read.
+        if let Some(st) = stat_in(dir.as_fd(), &name) {
+            newest = newest.max(at(&st));
+        }
+    }
+    Some(newest)
+}
+
+/// Whether the open dir `dir` is a promoted base, by [`is_base_dir`]'s test.
+fn holds_base(dir: &std::os::fd::OwnedFd) -> bool {
+    ["runner.ext4", crate::ensure::UNIT_IMAGE]
+        .iter()
+        .any(|name| {
+            stat_in(std::os::fd::AsFd::as_fd(dir), std::ffi::OsStr::new(name))
+                .is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG)
+        })
 }
 
 /// The name a pull stages a chunk under before renaming it onto its digest: the digest,
@@ -809,6 +1068,38 @@ mod tests {
         drop((held, squatter));
     }
 
+    // The sweeper's lock, taken without waiting, answers like a build's: a waiter waits it out
+    // rather than give up on an unanswering holder, and gets the lock once it goes.
+    #[test]
+    fn a_lock_taken_without_waiting_is_waited_out() {
+        let dir =
+            std::env::temp_dir().join(format!("virtkit-test-try-pull-lock-{}", std::process::id()));
+        let held = try_acquire_pull_lock(&dir).expect("a free lock is taken");
+        assert!(try_acquire_pull_lock(&dir).is_none(), "a held lock is not");
+        let addr = pull_lock_addr(pull_lock_hash(&dir)).unwrap();
+        // SAFETY: geteuid(2) has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        assert_eq!(query_holder(&addr).unwrap().unwrap().uid, Some(me));
+        let waiter = {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                acquire_pull_lock_with(
+                    &dir,
+                    "build",
+                    "img",
+                    "sha256:x",
+                    std::time::Duration::from_millis(1),
+                )
+                .map(drop)
+            })
+        };
+        // Past a few queries' worth of polls.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!waiter.is_finished(), "the waiter keeps waiting");
+        drop(held);
+        waiter.join().unwrap().unwrap();
+    }
+
     #[test]
     fn a_waiter_refuses_a_foreign_or_unanswering_holder() {
         let ours = Holder {
@@ -887,28 +1178,103 @@ mod tests {
         }
     }
 
+    /// Date `dir` an hour back, past any grace.
+    fn age(dir: &Path) {
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::open(dir)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(then))
+            .unwrap();
+    }
+
+    // Dead is neither lock held and nothing changed within the grace: a dir held by either
+    // lock, or one just made, is a live build's.
     #[test]
-    fn sweep_orphaned_build_tmp_reclaims_unlocked_but_spares_a_live_build() {
+    fn sweep_orphaned_build_tmp_reclaims_only_dead_staging_dirs() {
         let root =
             std::env::temp_dir().join(format!("virtkit-test-sweep-tmp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let orphan = root.join("orphan.tmp");
-        let live = root.join("live.tmp");
-        std::fs::create_dir_all(&orphan).unwrap();
-        std::fs::create_dir_all(&live).unwrap();
-        // hold the live one's build lock, standing in for a build actually in flight.
-        let held = acquire_pull_lock(&root.join("live"), "build", "myimg", "sha256:x").unwrap();
-        sweep_orphaned_build_tmp(&root);
+        let dead = root.join("dead.tmp");
+        std::fs::create_dir_all(dead.join(".build-1-0-x")).unwrap();
+        std::fs::write(dead.join(".build-1-0-x/stage.ext4"), vec![1u8; 64 * 1024]).unwrap();
+        age(&dead.join(".build-1-0-x"));
+        age(&dead);
+        // A build in flight holds the pull lock of the dir it promotes to...
+        let pulling = root.join("pulling.tmp");
+        std::fs::create_dir_all(&pulling).unwrap();
+        age(&pulling);
+        let pull = acquire_pull_lock(&root.join("pulling"), "build", "myimg", "sha256:x").unwrap();
+        // ...and its claim on the staging dir, which holds without the pull lock's socket.
+        let claimed = root.join("claimed.tmp");
+        let claim = TmpGuard::create(&claimed).unwrap();
+        age(&claimed);
+        let fresh = root.join("fresh.tmp");
+        std::fs::create_dir_all(&fresh).unwrap();
+        // A build writing its image changes the file, not the dir.
+        let writing = root.join("writing.tmp");
+        std::fs::create_dir_all(&writing).unwrap();
+        std::fs::write(writing.join("runner.ext4"), b"x").unwrap();
+        age(&writing);
+
+        let swept = sweep_dead_tmp(&root, DEAD_TMP_GRACE);
+        assert!(!dead.exists(), "a dead staging dir must be reclaimed");
+        assert_eq!(swept.dirs, 1);
+        assert!(swept.bytes >= 64 * 1024, "{}", swept.bytes);
+        assert!(swept.foreign.is_empty() && swept.left.is_empty());
         assert!(
-            !orphan.exists(),
-            "an unlocked .tmp orphan must be reclaimed"
+            pulling.exists(),
+            "a dir under a held pull lock must be spared"
+        );
+        assert!(claimed.exists(), "a claimed dir must be spared");
+        assert!(
+            fresh.exists(),
+            "a dir changed within the grace must be spared"
         );
         assert!(
-            live.exists(),
-            "a .tmp still under a live build lock must be spared"
+            writing.exists(),
+            "a dir whose file changed within the grace must be spared"
         );
-        drop(held);
+
+        drop((pull, claim));
+        age(&pulling);
+        sweep_dead_tmp(&root, DEAD_TMP_GRACE);
+        assert!(!pulling.exists(), "released, the dir is dead");
+        assert!(!claimed.exists(), "a dropped guard removes its own dir");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A symlink is never followed: not one wearing a staging dir's name, not one on the way
+    // to a staging dir, not one inside a staging dir being removed.
+    #[test]
+    fn sweep_orphaned_build_tmp_follows_no_symlink() {
+        let base =
+            std::env::temp_dir().join(format!("virtkit-test-sweep-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(outside.join("nested.tmp")).unwrap();
+        std::fs::write(outside.join("nested.tmp/keep"), b"x").unwrap();
+        std::fs::write(outside.join("keep"), b"x").unwrap();
+        age(&outside.join("nested.tmp"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("named.tmp")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("img")).unwrap();
+        let dead = root.join("dead.tmp");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::os::unix::fs::symlink(&outside, dead.join("out")).unwrap();
+        age(&dead);
+
+        let swept = sweep_dead_tmp(&root, std::time::Duration::ZERO);
+        assert_eq!(swept.dirs, 1);
+        assert!(
+            !dead.exists(),
+            "the real staging dir goes, its link with it"
+        );
+        assert!(root.join("named.tmp").is_symlink());
+        assert!(root.join("img").is_symlink());
+        assert!(outside.join("keep").is_file());
+        assert!(outside.join("nested.tmp/keep").is_file());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     // The docker tier nests a `.tmp` one level deeper than the build tier
@@ -925,7 +1291,7 @@ mod tests {
         std::fs::create_dir_all(&orphan).unwrap();
         std::fs::create_dir_all(&promoted).unwrap();
         std::fs::write(promoted.join("runner.ext4"), b"").unwrap();
-        sweep_orphaned_build_tmp(&root);
+        sweep_dead_tmp(&root, std::time::Duration::ZERO);
         assert!(
             !orphan.exists(),
             "a nested, unlocked .tmp orphan must be reclaimed"
@@ -942,18 +1308,74 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("virtkit-test-tmpguard-{}", std::process::id()));
         let removed = dir.join("removed");
-        std::fs::create_dir_all(&removed).unwrap();
-        drop(TmpGuard::new(&removed));
+        std::fs::create_dir_all(removed.join("stale")).unwrap();
+        let guard = TmpGuard::create(&removed).unwrap();
+        assert!(
+            !removed.join("stale").exists(),
+            "a guard starts from an empty dir"
+        );
+        drop(guard);
         assert!(
             !removed.exists(),
             "an un-kept guard must remove its path on drop"
         );
 
         let kept = dir.join("kept");
-        std::fs::create_dir_all(&kept).unwrap();
-        TmpGuard::new(&kept).keep();
+        drop(TmpGuard::create(&kept).unwrap().keep());
         assert!(kept.exists(), "a kept guard must leave its path alone");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether another open of `dir` can take the claim.
+    fn claimable(dir: &Path) -> bool {
+        flock_nb(&std::fs::File::open(dir).unwrap()).is_ok()
+    }
+
+    // The claim `keep` hands over still holds the dir once it is renamed to its final name, and
+    // only dropping it releases the dir.
+    #[test]
+    fn tmp_guard_claim_outlives_keep_and_the_rename() {
+        let dir = std::env::temp_dir().join(format!(
+            "virtkit-test-tmpguard-claim-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = dir.join("img.tmp");
+        let promoted = dir.join("img");
+        let claim = TmpGuard::create(&tmp).unwrap().keep();
+        assert!(claim.is_some());
+        assert!(!claimable(&tmp), "a kept dir stays claimed");
+        std::fs::rename(&tmp, &promoted).unwrap();
+        assert!(!claimable(&promoted), "the claim holds through the rename");
+        drop(claim);
+        assert!(claimable(&promoted));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A filesystem that cannot take the claim (NFS, no `flock`) builds unclaimed, under the pull
+    // lock alone; a claim another holds is the one refusal, and that dir is left to its holder.
+    #[test]
+    fn tmp_guard_builds_unclaimed_where_flock_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "virtkit-test-tmpguard-noflock-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tmp = dir.join("img.tmp");
+        for errno in [libc::EBADF, libc::ENOLCK, libc::EOPNOTSUPP, libc::EINVAL] {
+            let guard =
+                TmpGuard::create_locking(&tmp, |_| Err(std::io::Error::from_raw_os_error(errno)))
+                    .unwrap();
+            assert!(tmp.is_dir());
+            drop(guard);
+            assert!(!tmp.exists(), "an unclaimed guard still removes its dir");
+        }
+        let held = TmpGuard::create_locking(&tmp, |_| {
+            Err(std::io::Error::from_raw_os_error(libc::EWOULDBLOCK))
+        });
+        assert!(held.is_err());
+        assert!(tmp.is_dir(), "a dir claimed by another is left to it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

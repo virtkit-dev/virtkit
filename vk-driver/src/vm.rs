@@ -2726,11 +2726,15 @@ pub fn cleanup(ctx: &JobCtx) -> Result<()> {
     crate::admit::release(&ctx.admit_dir(), &ctx.job_id);
     // Before the job dir goes: the marker naming the archive directory is in it.
     crate::atop::compress_job_log(ctx);
-    match std::fs::remove_dir_all(&ctx.job_dir) {
+    let removed = match std::fs::remove_dir_all(&ctx.job_dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("removing {}", ctx.job_dir.display())),
-    }
+    };
+    // A job killed mid-build leaves its staging dir behind, and nothing else may build here
+    // again for a while: reclaim what dead jobs left, this one's included.
+    crate::image::sweep_orphaned_staging(ctx.cfg.state_dir(), crate::image::Leftovers::Quiet);
+    removed
 }
 
 /// Spawn a tied child (PDEATHSIG — it dies with this process, see

@@ -3,12 +3,13 @@
 //!
 //! What is cleared is what a job leaves behind, and nothing a job needs to run faster next
 //! time unless asked: the job dirs under `<state_dir>/jobs` (whatever a failed cleanup kept —
-//! overlays, logs, sockets, a network lease) and the host checkouts no job uses; the
-//! materialized images under `<state_dir>/{registry,docker,build}` only with `images`. The
-//! build cache's registry store is never touched. An entry of `<state_dir>/jobs` that is not a
-//! directory, a symlink included, is removed as itself and never followed. Validation is an
-//! update's: `vk check`'s gate and `[node] validate`, then a session with the hub. A node that
-//! does not pass stays drained, for an operator to look at, rather than take jobs.
+//! overlays, logs, sockets, a network lease), the host checkouts no job uses and the staging
+//! dirs of builds and pulls no job runs any more; the materialized images under
+//! `<state_dir>/{registry,docker,build}` only with `images`. The build cache's registry store
+//! is never touched. An entry of `<state_dir>/jobs` that is not a directory, a symlink
+//! included, is removed as itself and never followed. Validation is an update's: `vk check`'s
+//! gate and `[node] validate`, then a session with the hub. A node that does not pass stays
+//! drained, for an operator to look at, rather than take jobs.
 //!
 //! What is stopped is what the executor starts for a job and nothing else: a process of this
 //! user whose binary is a `vk` — this one, the installed one, a release under the node dir, or
@@ -148,8 +149,9 @@ impl Binaries {
     }
 }
 
-/// Stop past jobs' leftovers, release their network leases, and remove their dirs and idle
-/// host checkouts. With `images`, also sweep materialized images. Return a text summary.
+/// Stop past jobs' leftovers, release their network leases, and remove their dirs, idle host
+/// checkouts and dead builds' staging dirs. With `images`, also sweep materialized images.
+/// Return a text summary.
 fn clear(cfg: &Config, images: bool, ours: &Binaries) -> Result<String> {
     let jobs = cfg.state_dir().join("jobs");
     let JobsDir { dirs, strays } = job_dirs(&jobs)?;
@@ -187,9 +189,9 @@ fn clear(cfg: &Config, images: bool, ours: &Binaries) -> Result<String> {
         crate::image::sweep_chunks(&registry);
         for tier in ["docker", "build"] {
             crate::image::gc_idle(&state.join(tier), Duration::ZERO);
-            crate::image::sweep_orphaned_build_tmp(&state.join(tier));
         }
     }
+    crate::image::sweep_orphaned_staging(cfg.state_dir(), crate::image::Leftovers::Name);
     // The sweeps say themselves what they evicted; a tree in use is left.
     Ok(format!(
         "stopped {stopped} process(es) left by past jobs, removed {removed} of {} job dir(s){}, \
@@ -506,6 +508,36 @@ mod tests {
         assert!(root.join("state").join("escape.lock").exists());
         assert!(outside.join("net.lease").exists());
         assert!(jobs.join(".net").join("vk5.lock").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A dead build's staging dir is cleared without `images`; one a build still claims stays.
+    #[test]
+    fn dead_staging_dirs_are_cleared() {
+        let root = std::env::temp_dir().join(format!("vk-node-reset-tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let state = root.join("state");
+        let aged = |path: &Path| {
+            let then = std::time::SystemTime::now() - Duration::from_secs(3600);
+            std::fs::File::open(path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(then))
+                .unwrap();
+        };
+        let dead = state.join("build").join("fp.tmp");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::write(dead.join("runner.qcow2"), "x").unwrap();
+        aged(&dead.join("runner.qcow2"));
+        aged(&dead);
+        let live = state.join("docker").join("img").join("digest.tmp");
+        let claim = crate::image::TmpGuard::create(&live).unwrap();
+        aged(&live);
+        let cfg: Config =
+            toml::from_str(&format!("state_dir = {:?}\n", state.display().to_string())).unwrap();
+        clear(&cfg, false, &ours()).unwrap();
+        assert!(!dead.exists());
+        assert!(live.exists());
+        drop(claim);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

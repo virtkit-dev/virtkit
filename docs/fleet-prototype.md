@@ -741,7 +741,8 @@ held by a pidfd opened before its `/proc` entry is read and kept only if still a
 seconds after that, or a `/proc` the node cannot list, fails the reset before anything is
 removed. The node then gives back each job dir's network lease, removes the job dirs under
 `<state_dir>/jobs` and anything else there but its dot-entries, a symlink removed as itself and
-never followed, sweeps the host checkouts no job uses, and with `--images` evicts the
+never followed, sweeps the host checkouts no job uses and the dead builds' staging dirs (see
+*Dead builds* below), and with `--images` evicts the
 materialized images under `<state_dir>/{registry,docker,build}` as `vk gc --idle-secs 0` does.
 The build cache's registry store is never touched. `validating` then runs what an update's trial
 does — `vk check`'s gate, `[node] validate`, and a session with the hub within ten minutes — and
@@ -811,6 +812,19 @@ then each guest stage through `vk gitlab run`, then `vk gitlab cleanup`, whose o
 the job's `driver.log`. `vk gitlab run` writes the script's exit code to
 `BUILD_EXIT_CODE_FILE`, as gitlab-runner's custom executor protocol has it, for a local runner
 too.
+
+**Dead builds.** A job killed while it builds or pulls its image — the service stopped, the job
+cancelled, the node taken out of its pool — runs no cleanup and leaves the image's staging dir,
+`<state_dir>/{build,docker}/…/<name>.tmp`, on the jobs' filesystem, whose free space the hub
+places by. Each staging dir is locked by the build that fills it until it is renamed to the
+image's name, with an `flock` on the dir and the pull lock of the image it becomes, and the
+kernel drops both however that build ends; on a filesystem without `flock` the pull lock alone
+holds. The node removes those neither lock holds and in which neither the dir nor an entry
+directly in it changed for a minute: when `vk node run` starts, every ten minutes after, at each
+`vk gitlab cleanup`, on a reset, and on `vk gc`. It logs, per tier, how many it removed and the
+space they held; it follows no symlink, enters no mount, and leaves what another user owns,
+naming such dirs on `vk gc`, a reset and the node's first sweep. The locks are local to the
+host, so a `state_dir` must not be shared between hosts.
 
 **Stages.** gitlab-runner's order and words: `prepare_executor`, `prepare_script`,
 `get_sources` (`GET_SOURCES_ATTEMPTS`), `restore_cache` (`RESTORE_CACHE_ATTEMPTS`),

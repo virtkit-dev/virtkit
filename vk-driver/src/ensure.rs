@@ -228,16 +228,18 @@ pub fn ensure_build_tier(
     // Reclaim scratch orphaned by earlier failed/killed builds of *other* stages before
     // asking for more space ourselves — otherwise a tier stuck failing (e.g. ENOSPC) never
     // gets a chance to recover, since the success path below is never reached.
-    crate::image::sweep_orphaned_build_tmp(&state_dir.join("build"));
+    crate::image::sweep_orphaned_build_tmp(
+        &state_dir.join("build"),
+        crate::image::Leftovers::Quiet,
+    );
     let tmp = dir.with_extension("tmp");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     // Wipe `tmp` the instant the build below fails (or panics) — don't leave that for a
     // later sweep to notice. `ensure_unit_build`'s `?` runs this on the way out.
-    let cleanup = crate::image::TmpGuard::new(&tmp);
+    let cleanup = crate::image::TmpGuard::create(&tmp)?;
     // ensure_unit_build writes the qcow2 + config sidecar and stamps the UUID at the out path.
     ensure_unit_build(recipe, target, stage_key, &tmp.join(UNIT_IMAGE), sink)?;
-    cleanup.keep(); // built successfully: the rename below takes ownership of `tmp`.
+    // Built successfully: the rename below takes ownership of `tmp`, under its claim.
+    let _claim = cleanup.keep();
     // The one removal that ignores references — but by construction nobody holds one: a
     // holder found the entry fresh, and so would the two `reference_if_fresh` checks above,
     // which would have returned long before here.
@@ -252,7 +254,7 @@ pub fn ensure_build_tier(
         .context("internal invariant: the build tier is one of the managed cache tiers")?;
     let build_root = state_dir.join("build");
     crate::image::gc_idle(&build_root, idle);
-    crate::image::sweep_orphaned_build_tmp(&build_root);
+    crate::image::sweep_orphaned_build_tmp(&build_root, crate::image::Leftovers::Quiet);
     Ok((dir, guard))
 }
 

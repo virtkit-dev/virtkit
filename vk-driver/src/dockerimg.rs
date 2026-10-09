@@ -287,11 +287,11 @@ fn resolve_pinned(
             // Reclaim scratch orphaned by earlier failed/killed pulls of *other* images
             // before asking for more space ourselves — otherwise a tier stuck failing
             // (e.g. ENOSPC) never gets a chance to recover.
-            image::sweep_orphaned_build_tmp(&state_dir.join("docker"));
+            image::sweep_orphaned_build_tmp(&state_dir.join("docker"), image::Leftovers::Quiet);
             build(&pinned, creds, &dir)?;
             let docker_root = state_dir.join("docker");
             image::gc_idle(&docker_root, cfg.image_cache_idle());
-            image::sweep_orphaned_build_tmp(&docker_root);
+            image::sweep_orphaned_build_tmp(&docker_root, image::Leftovers::Quiet);
         }
     }
     image::mark_used(&dir);
@@ -308,12 +308,10 @@ fn resolve_pinned(
 /// prepare never leaves a half-built rootfs a cache check would trust.
 fn build(full: &str, creds: &Creds, dir: &Path) -> Result<()> {
     let tmp = dir.with_extension("tmp");
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     // Wipe `tmp` the instant the pull below fails (or panics) — don't leave that for a
     // later sweep to notice. `image::sweep_orphaned_build_tmp` backstops the case nothing
     // can run at all (SIGKILL/OOM).
-    let cleanup = image::TmpGuard::new(&tmp);
+    let cleanup = image::TmpGuard::create(&tmp)?;
     println!("virtkit: pulling {full} ...");
     // Flatten the image byte-clean (the agent rides the boot initramfs) and capture its
     // Config into the runner.ext4.json sidecar — the shared OCI-flatten core. A journalled
@@ -337,7 +335,8 @@ fn build(full: &str, creds: &Creds, dir: &Path) -> Result<()> {
     if !rootfs.is_file() {
         bail!("OCI direct build of {full} produced no rootfs");
     }
-    cleanup.keep(); // pulled successfully: the rename below takes ownership of `tmp`.
+    // Pulled successfully: the rename below takes ownership of `tmp`, under its claim.
+    let _claim = cleanup.keep();
     let _ = std::fs::remove_dir_all(dir);
     std::fs::rename(&tmp, dir)
         .with_context(|| format!("promoting {} to {}", tmp.display(), dir.display()))

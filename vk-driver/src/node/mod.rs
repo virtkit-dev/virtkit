@@ -88,6 +88,9 @@ const SUPERSEDED_IN_A_ROW: u32 = 3;
 /// half minute `vk tune`'s timer runs at.
 const CONTROL_EVERY: Duration = Duration::from_secs(30);
 
+/// How often the node reclaims the staging dirs of builds and pulls that died with their job.
+const SWEEP_EVERY: Duration = Duration::from_secs(600);
+
 /// A token or a CA bundle is a few kilobytes at most; this bounds what a wrong file costs.
 const MAX_INPUT: u64 = 1 << 20;
 
@@ -622,6 +625,7 @@ pub async fn run(cfg: Config) -> Result<()> {
         node.clone(),
         stop.clone(),
     ));
+    tokio::spawn(sweep_dead_builds(cfg.clone(), stop.clone()));
     tokio::spawn(update::maintain(core, cfg, node.clone(), stop.clone()));
     let ended = hold_sessions(&node, &mut gatherer, &mut stop).await;
     // Stopping, or refused for good, the node quits a managed runner and waits for its jobs to
@@ -772,6 +776,31 @@ async fn hold_sessions(
             }
         }
         backoff = (backoff * 2).min(BACKOFF.1);
+    }
+}
+
+/// Reclaim the staging dirs of builds and pulls that died with their job — a job killed with
+/// the node service, cancelled, or on a node taken out of its pool runs no cleanup — now and
+/// every [`SWEEP_EVERY`] until `stop`. They sit on the jobs' filesystem, whose free space the
+/// hub places by. Only the first sweep names the dead dirs it has to leave.
+async fn sweep_dead_builds(cfg: Arc<Config>, mut stop: tokio::sync::watch::Receiver<bool>) {
+    let mut tick = tokio::time::interval(SWEEP_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut leftovers = crate::image::Leftovers::Name;
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            () = session::stopped(&mut stop) => return,
+        }
+        let cfg = cfg.clone();
+        // Off the runtime: it walks and removes trees.
+        let swept = tokio::task::spawn_blocking(move || {
+            crate::image::sweep_orphaned_staging(cfg.state_dir(), leftovers);
+        });
+        leftovers = crate::image::Leftovers::Quiet;
+        if let Err(e) = swept.await {
+            say!("sweeping dead builds failed: {e}");
+        }
     }
 }
 

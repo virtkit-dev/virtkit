@@ -117,6 +117,13 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Builds killed with their job no longer leave their scratch behind for good.** A job
+  stopped while it built or pulled its image — the node service restarted, the job cancelled,
+  the node taken out of its pool — left the image's half-built copy, often tens of GiB, until a
+  later job happened to build a different image, eating the jobs' disk and skewing where the
+  hub placed work. `vk node` now reclaims what dead builds left when it starts and every ten
+  minutes, as do each job's cleanup, a node reset and `vk gc`, and says how much it freed. A
+  build still running is never touched, nor what another user's builds left.
 - **`vk-registry` admits more connections, and asks clients past its per-host cap to come
   back.** It serves 4096 connections at once and 1024 from one client address by default,
   up from 1024 and 256; `max_connections` and `max_connections_per_client` in its config
