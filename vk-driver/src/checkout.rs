@@ -452,7 +452,7 @@ fn origin_of(dest: &Path) -> Option<String> {
         return None;
     }
     // From `/`, so git finds no repository of its own around the process's cwd to read.
-    let out = Command::new("git")
+    let out = git_command()
         .current_dir("/")
         .args(["config", "--file"])
         .arg(git_dir.join("config"))
@@ -514,7 +514,7 @@ pub fn ensure(url: &str, ref_name: &str, sha: &str, dest: &Path) -> Result<()> {
         // so the reused-slot `fetch` below stays blobless too.
         let dest_s = dest.to_str().context("checkout dir is not utf-8")?;
         run(
-            Command::new("git").args([
+            git_command().args([
                 "clone",
                 "--quiet",
                 "--no-checkout",
@@ -626,11 +626,19 @@ fn redact_url(url: &str) -> String {
     }
 }
 
+/// Use the C locale so host git's messages in the job log have the same language
+/// on every host.
+fn git_command() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env("LC_ALL", "C").env_remove("LANGUAGE");
+    cmd
+}
+
 /// Run `git -C <dir> <args…>`, erroring on a non-zero exit. `what` is a fixed, secret-free
 /// label for diagnostics — the command (which may carry the token-bearing URL) is never
 /// rendered.
 fn git(dir: &Path, args: &[&str], what: &str) -> Result<()> {
-    let mut cmd = Command::new("git");
+    let mut cmd = git_command();
     cmd.arg("-C").arg(dir).args(args);
     run(&mut cmd, what)
 }
@@ -648,6 +656,15 @@ fn run(cmd: &mut Command, what: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_git_speaks_the_c_locale() {
+        use std::ffi::OsStr;
+        let cmd = git_command();
+        let env: Vec<_> = cmd.get_envs().collect();
+        assert!(env.contains(&(OsStr::new("LC_ALL"), Some(OsStr::new("C")))));
+        assert!(env.contains(&(OsStr::new("LANGUAGE"), None)));
+    }
 
     #[test]
     fn without_userinfo_keeps_the_remote_and_drops_the_token() {
@@ -677,11 +694,7 @@ mod tests {
         let init = |origin: &str| {
             let _ = std::fs::remove_dir_all(&dest);
             claim(&dest).unwrap();
-            run(
-                Command::new("git").args(["init", "--quiet"]).arg(&dest),
-                "init",
-            )
-            .unwrap();
+            run(git_command().args(["init", "--quiet"]).arg(&dest), "init").unwrap();
             git(&dest, &["remote", "add", "origin", origin], "remote add").unwrap();
         };
 
@@ -1102,7 +1115,7 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         let repo = repo.as_path();
         let sh = |args: &[&str]| {
-            let st = Command::new("git")
+            let st = git_command()
                 .arg("-C")
                 .arg(repo)
                 .args(["-c", "user.email=t@t", "-c", "user.name=t"])
@@ -1151,7 +1164,7 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         let repo = repo.as_path();
         let sh = |args: &[&str]| {
-            let st = Command::new("git")
+            let st = git_command()
                 .arg("-C")
                 .arg(repo)
                 .args(args)
@@ -1160,7 +1173,7 @@ mod tests {
             assert!(st.success(), "git {args:?}");
         };
         let checkstat = || {
-            let out = Command::new("git")
+            let out = git_command()
                 .arg("-C")
                 .arg(repo)
                 .args(["config", "--get-all", "core.checkStat"])

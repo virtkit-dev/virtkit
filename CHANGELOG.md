@@ -63,6 +63,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **The vk executor's host checkout logs in English on every host.** It ran `git` in the
+  host's locale, so a job's log read in French on a host set to `fr_FR`; host `git` now runs
+  with `LC_ALL=C`.
 - **`vk node service install` refuses a node user other than the one CI jobs run as.** It
   refuses when the vk executor's files belong to another user, or gitlab-runner runs it as
   another, naming the user the node must run as; `--ignore-ci-user` goes ahead anyway.
