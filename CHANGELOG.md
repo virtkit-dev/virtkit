@@ -24,6 +24,11 @@ All notable changes to virtkit will be documented in this file.
   remembers which node built what across a restart. Nodes now tell the hub their image idle
   time; with an older `vk` the hub assumes 30 minutes, and never prefers a node that reports
   no load average.
+- **`vk-hub` retains recent successful and canceled jobs' output.** Once settled, these jobs
+  keep the last 1 MiB of their logs (`kept_output` in `hub.toml`, `"0"` to keep none), shown on
+  their pages and by `vk-hub jobs show`, as for failed jobs. The total is limited to 1 GiB
+  (`kept_output_total`), with the oldest retained output evicted first. Failed jobs' retained
+  output is exempt from this limit and eviction.
 - **`vk-hub` keeps the end of a failed job's output.** When `vk-gitlab` settles a failed job
   — a script failure, a system failure, a lost node… — the hub keeps the last 256 KiB of its
   log, masked on the node, for as long as it keeps the job (`kept_failure_output` in
@@ -42,9 +47,10 @@ All notable changes to virtkit will be documented in this file.
 - **`vk-hub`'s web UI shows each job's log, live while it runs.** Every result on the Jobs page
   links to the job's page. It shows the available log's tail, follows new lines while the job
   runs, and shows the final result. Output scrolls to the end unless you scroll up to read.
-  Once its producer settles a job that did not fail, the page says the log is gone and links
-  to the job on GitLab when a web link is available. The log uses GitLab's style: a dark
-  background, numbered lines, the output's colours and bold text, and job details on the right.
+  Once its producer settles a job that did not fail, the page shows the end the hub keeps of
+  its log, then, once that is evicted, says the log is gone and links to the job on GitLab when
+  a web link is available. The log uses GitLab's style: a dark background, numbered lines, the
+  output's colours and bold text, and job details on the right.
 - **A running job's run time ticks in `vk-hub`'s web UI.** On the Jobs page and a job's page it
   advances each second between the hub's updates.
 - **`vk-hub`'s Jobs page filters by job name, branch and pipeline.** The name and branch

@@ -19,6 +19,11 @@
 //! # How much of the end of a failed job's output is kept, with its record, once its producer
 //! # settles it; "0" keeps none.
 //! kept_failure_output = "256K"
+//! # Bytes retained from the end of any other finished job's output once settled ("0" keeps
+//! # none), capped by kept_output_total. The cache evicts the oldest retained tails first
+//! # to stay within kept_output_total.
+//! kept_output = "1M"
+//! kept_output_total = "1G"
 //! # A job whose image its node builds goes first to a node that still holds that image while
 //! # that node's load per CPU, the job's vCPUs added, stays below this ("0" turns the preference
 //! # off) and, without the job, is at most image_affinity_max_extra_load above the least loaded
@@ -69,6 +74,13 @@ const MAX_JOB_HISTORY: u64 = 1_000_000;
 /// every failed job in the history, and the admin socket's reply carries it whole.
 const MAX_KEPT_FAILURE_OUTPUT: u64 = 4 << 20;
 
+/// The most of any other job's output `kept_output` may keep: the admin socket's reply
+/// carries it whole.
+const MAX_KEPT_OUTPUT: u64 = 4 << 20;
+
+/// The most `kept_output_total` may hold: the database holds it all.
+const MAX_KEPT_OUTPUT_TOTAL: u64 = 64 << 30;
+
 /// The resolved configuration.
 #[derive(Debug)]
 pub struct HubConfig {
@@ -85,6 +97,11 @@ pub struct HubConfig {
     pub job_history: usize,
     /// How many bytes from the end of a failed job's output are kept once it is settled.
     pub kept_failure_output: u64,
+    /// Bytes retained from the end of any other finished job's output once settled, capped
+    /// by `kept_output_total`. The cache's total also stays within that limit.
+    pub kept_output: u64,
+    /// Total byte limit for those tails; the oldest retained tails are evicted first.
+    pub kept_output_total: u64,
     /// When a node holding a job's image is preferred.
     pub image_affinity: crate::jobs::Affinity,
 }
@@ -132,6 +149,8 @@ struct FileConfig {
     job_lost_after_secs: Option<u64>,
     job_history: Option<u64>,
     kept_failure_output: Option<String>,
+    kept_output: Option<String>,
+    kept_output_total: Option<String>,
     image_affinity_max_load: Option<f64>,
     image_affinity_max_extra_load: Option<f64>,
     oidc: Option<FileOidc>,
@@ -290,6 +309,20 @@ impl HubConfig {
                 _ => bail!("kept_failure_output {size:?}: expected a size from 0 to 4M"),
             },
         };
+        let kept_output = match f.kept_output.as_deref() {
+            None => crate::jobs::DEFAULT_KEPT_OUTPUT,
+            Some(size) => match parse_size(size) {
+                Some(n) if n <= MAX_KEPT_OUTPUT => n,
+                _ => bail!("kept_output {size:?}: expected a size from 0 to 4M"),
+            },
+        };
+        let kept_output_total = match f.kept_output_total.as_deref() {
+            None => crate::jobs::DEFAULT_KEPT_OUTPUT_TOTAL,
+            Some(size) => match parse_size(size) {
+                Some(n) if n <= MAX_KEPT_OUTPUT_TOTAL => n,
+                _ => bail!("kept_output_total {size:?}: expected a size from 0 to 64G"),
+            },
+        };
         let default = crate::jobs::Affinity::default();
         let image_affinity = crate::jobs::Affinity {
             max_load: millionths(
@@ -315,6 +348,8 @@ impl HubConfig {
             job_lost_after,
             job_history,
             kept_failure_output,
+            kept_output,
+            kept_output_total,
             image_affinity,
         })
     }
@@ -708,6 +743,43 @@ mod tests {
         ] {
             assert!(
                 kept(&format!("kept_failure_output = {bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_jobs_keep_up_to_4_mib_of_output_within_up_to_64_gib() {
+        let kept = |extra: &str| {
+            parse(&format!("data_dir = \"/d\"\n{extra}"))
+                .map(|c| (c.kept_output, c.kept_output_total))
+        };
+        assert_eq!(
+            kept("").unwrap(),
+            (
+                crate::jobs::DEFAULT_KEPT_OUTPUT,
+                crate::jobs::DEFAULT_KEPT_OUTPUT_TOTAL
+            )
+        );
+        for (extra, want) in [
+            ("kept_output = \"0\"\nkept_output_total = \"0\"\n", (0, 0)),
+            (
+                "kept_output = \"4M\"\nkept_output_total = \"64g\"\n",
+                (4 << 20, 64 << 30),
+            ),
+            (
+                "kept_output = \"64K\"\nkept_output_total = \"512M\"\n",
+                (64 << 10, 512 << 20),
+            ),
+        ] {
+            assert_eq!(kept(extra).unwrap(), want, "{extra}");
+        }
+        for bad in ["\"4097K\"", "\"1G\"", "\"-1\"", "\"lots\"", "1024"] {
+            assert!(kept(&format!("kept_output = {bad}\n")).is_err(), "{bad}");
+        }
+        for bad in ["\"65G\"", "\"1T\"", "\"-1\"", "\"lots\"", "1024"] {
+            assert!(
+                kept(&format!("kept_output_total = {bad}\n")).is_err(),
                 "{bad}"
             );
         }

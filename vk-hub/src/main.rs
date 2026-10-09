@@ -64,7 +64,7 @@ struct Cli {
 struct ConfigArg {
     /// hub.toml: addr, tls_cert, tls_key, data_dir, ui_addr, ui_url, ui_tls_cert,
     /// ui_tls_key, release_repository, job_lost_after_secs, job_history, kept_failure_output,
-    /// image_affinity_max_load, image_affinity_max_extra_load,
+    /// kept_output, kept_output_total, image_affinity_max_load, image_affinity_max_extra_load,
     /// [oidc] [default: built-in defaults]
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
@@ -368,7 +368,7 @@ enum AccountsCmd {
 
 #[derive(Subcommand)]
 enum JobsCmd {
-    /// Show a job's record and, for a failed job, the end of its output that the hub kept
+    /// Show a job's record and the end of its output that the hub kept
     Show {
         /// The job's ID, as `vk-hub jobs` lists it
         id: String,
@@ -1229,6 +1229,8 @@ async fn serve(cfg: HubConfig) -> Result<()> {
         .and_then(|ui| ui.oidc.as_ref())
         .and_then(|o| o.default_role);
     let mut db = store::Db::open(&cfg.db_path())?;
+    // A kept_output_total lowered while the hub was stopped holds from its start.
+    db.fit_job_cache(cfg.kept_output_total)?;
     if let Some(role) = default_role {
         db = db.with_oidc_default_role(role);
     }
@@ -1268,6 +1270,7 @@ async fn serve(cfg: HubConfig) -> Result<()> {
     let hub = Arc::new(
         hub.with_jobs(cfg.jobs_dir(), cfg.job_lost_after, cfg.job_history)?
             .keeping_failure_output(cfg.kept_failure_output)
+            .keeping_output(cfg.kept_output, cfg.kept_output_total)
             .preferring_warm_images(cfg.image_affinity),
     );
     jobs::recover(&hub).await?;

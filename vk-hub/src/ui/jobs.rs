@@ -707,11 +707,10 @@ pub(super) async fn detail(id: &str, auth: &Auth, ui: &Ui) -> Result<Response<Bo
         };
         let output = match stretch {
             Some(stretch) => Output::Held(stretch),
-            None if row.outcome() == JobOutcome::Failed => match hub.db.job_tail(&job)? {
+            None => match hub.db.job_tail(&job)? {
                 Some(tail) => Output::Kept(tail),
                 None => Output::Gone,
             },
-            None => Output::Gone,
         };
         anyhow::Ok(Some((row, output, hub.db.node_names()?)))
     })

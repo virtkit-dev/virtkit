@@ -1,5 +1,6 @@
 //! Display [`crate::jobs::readable`] output on `/jobs/<id>`: the tail still held by the
-//! hub, a settled failed job's retained tail, or the reason no output is available.
+//! hub, a settled job's kept tail — a failed job's with its record, another's while the hub's
+//! cache of them has room — or the reason no output is available.
 //!
 //! Running jobs stream updates over `/events/job/<id>`. Each step reads from the previous
 //! offset, appends completed lines to the page's `<pre>`, and replaces open lines that
@@ -47,7 +48,7 @@ const STEP: u64 = 256 << 10;
 pub(super) enum Output {
     /// The end of the output the hub holds, up to [`OPENING`].
     Held(Stretch),
-    /// The end of a failed job's output, kept when its producer settled it.
+    /// The end of a finished job's output, kept when its producer settled it.
     Kept(Vec<u8>),
     /// Nothing held or kept.
     Gone,
@@ -59,7 +60,11 @@ pub(super) fn section(h: &mut Html, j: &JobRow, output: &Output, live: bool) {
         Output::Kept(tail) => {
             h.raw("<section><h2>End of its output</h2><p class=\"sub\">The last ")
                 .text(bytes(tail.len() as u64))
-                .raw(", masked as the node streamed it.</p><pre class=\"log\">");
+                .raw(", masked as the node streamed it");
+            if j.outcome() != JobOutcome::Failed {
+                h.raw(", kept while the hub's cache of finished jobs' output has room");
+            }
+            h.raw(".</p><pre class=\"log\">");
             for line in crate::jobs::readable(tail) {
                 line_html(h, &line);
                 h.raw("\n");

@@ -3634,7 +3634,7 @@ pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
 /// the end of its output the hub kept, as text: escaped, its escape sequences and GitLab's
 /// section markers dropped, its stamps shown as times.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_failed_job_s_page_shows_the_end_of_its_output() {
+async fn a_finished_job_s_page_shows_the_end_kept_of_its_output() {
     use vk_hub_proto::client::JobState;
     use vk_hub_proto::job::{FailureClass, JobResult};
     let (addr, hub, _) = start_fleet().await;
@@ -3664,6 +3664,7 @@ async fn a_failed_job_s_page_shows_the_end_of_its_output() {
         (1, Some(FailureClass::System)),
         (2, None),
         (3, Some(FailureClass::Lost)),
+        (4, None),
     ] {
         hub.db
             .submit_job(
@@ -3682,6 +3683,11 @@ async fn a_failed_job_s_page_shows_the_end_of_its_output() {
          {stamp} 01E \x1b[31m<script>alert(1)</script>\x1b[0m\n"
     );
     assert!(hub.db.keep_job_tail(&id(1), tail.as_bytes()).unwrap());
+    assert!(
+        hub.db
+            .cache_job_tail(&id(4), b"all good\n", 1 << 20)
+            .unwrap()
+    );
 
     let page = get(addr, "/jobs", Some(&viewer)).await.body;
     assert!(
@@ -3743,6 +3749,18 @@ async fn a_failed_job_s_page_shows_the_end_of_its_output() {
         "{page}"
     );
     assert!(!page.contains("sse-connect"), "{page}");
+    // One that succeeded whose end is still in the hub's cache shows it.
+    let page = get(addr, &format!("/jobs/{}", id(4)), Some(&viewer))
+        .await
+        .body;
+    for want in [
+        "<h2>End of its output</h2><p class=\"sub\">The last 9 B, masked as the node streamed \
+         it, kept while the hub's cache of finished jobs' output has room.</p>",
+        "<span class=\"t\">all good</span>",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    assert!(!page.contains("GitLab has it"), "{page}");
 
     let reply = get(addr, &format!("/jobs/{}", id(9)), Some(&viewer)).await;
     assert_eq!(reply.status, 404);

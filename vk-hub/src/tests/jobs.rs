@@ -3156,8 +3156,13 @@ async fn a_job_s_record_wakes_the_history_and_its_output_does_not() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// A hub as [`start_jobs`]'s keeping `keep` bytes of a failed job's output when it is settled.
-async fn start_keeping(dir: &std::path::Path, keep: u64) -> (SocketAddr, Arc<Hub>) {
+/// A hub as [`start_jobs`]'s keeping `keep` bytes of a failed job's output when it is settled,
+/// and `(bytes, total)` of others' ([`Hub::keeping_output`]).
+async fn start_keeping(
+    dir: &std::path::Path,
+    keep: u64,
+    (bytes, total): (u64, u64),
+) -> (SocketAddr, Arc<Hub>) {
     let listener = server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None)
@@ -3167,7 +3172,8 @@ async fn start_keeping(dir: &std::path::Path, keep: u64) -> (SocketAddr, Arc<Hub
             crate::store::DEFAULT_JOB_HISTORY,
         )
         .unwrap()
-        .keeping_failure_output(keep);
+        .keeping_failure_output(keep)
+        .keeping_output(bytes, total);
     let hub = Arc::new(hub);
     tokio::spawn(server::serve(listener, None, hub.clone()));
     tokio::spawn(crate::jobs::drive(hub.clone()));
@@ -3198,11 +3204,12 @@ async fn settled_job(
 }
 
 /// Settled, a failed job keeps the end of its output, from a line's start, with its record;
-/// a job that succeeded keeps none, and neither does a hub configured to keep none.
+/// a job that succeeded or was canceled keeps its end in the hub's cache, the oldest going
+/// past its total; a hub configured to keep none keeps none.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_failed_job_keeps_the_end_of_its_output_when_settled() {
+async fn a_settled_job_keeps_the_end_of_its_output() {
     let dir = scratch("kept");
-    let (addr, hub) = start_keeping(&dir, 16).await;
+    let (addr, hub) = start_keeping(&dir, 16, (8, 16)).await;
     let key = jobs_key(&hub);
     let mut node = ready_node(addr, &hub, 16384).await;
     let out = b"first line\nsecond line\nthird\n";
@@ -3244,20 +3251,69 @@ async fn a_failed_job_keeps_the_end_of_its_output_when_settled() {
         hub.db.job_tail(&script).unwrap().as_deref(),
         Some(&b"boom\n"[..])
     );
-    let ok = settled_job(addr, &key, &mut node, 3, out, None).await;
+    // The last 8 bytes from a line's start; detail reads the same before it is settled.
+    let ok = running_job(addr, &key, &mut node, 3).await;
+    node.send(output(&ok, 0, out));
+    assert!(matches!(node.job().await, HubJobMsg::OutputAck { .. }));
+    node.send(NodeJobMsg::Result {
+        job: ok.clone(),
+        result: result(None, out.len() as u64),
+    });
+    assert_eq!(node.job().await, HubJobMsg::Recorded { job: ok.clone() });
+    let (_, tail) = crate::jobs::detail(&hub, &ok).unwrap().unwrap();
+    assert_eq!(tail.as_deref(), Some(&b"third\n"[..]));
+    let path = format!("/v1/jobs/{ok}/settle");
+    assert_eq!(api(addr, "POST", &path, Some(&key), None).await.status, 204);
+    assert_eq!(
+        hub.db.job_tail(&ok).unwrap().as_deref(),
+        Some(&b"third\n"[..])
+    );
+    let (row, tail) = crate::jobs::detail(&hub, &ok).unwrap().unwrap();
+    assert!(row.settled_at.is_some());
+    assert_eq!(tail.as_deref(), Some(&b"third\n"[..]));
+    let canceled = settled_job(
+        addr,
+        &key,
+        &mut node,
+        4,
+        b"stop\n",
+        Some(FailureClass::Canceled),
+    )
+    .await;
+    assert_eq!(
+        hub.db.job_tail(&canceled).unwrap().as_deref(),
+        Some(&b"stop\n"[..])
+    );
+    // 6 and 5 bytes kept of 16: 7 more evict the oldest, and only it.
+    let more = settled_job(addr, &key, &mut node, 5, b"later!\n", None).await;
     assert_eq!(hub.db.job_tail(&ok).unwrap(), None);
     assert_eq!(crate::jobs::detail(&hub, &ok).unwrap().unwrap().1, None);
-    let canceled = settled_job(addr, &key, &mut node, 4, out, Some(FailureClass::Canceled)).await;
-    assert_eq!(hub.db.job_tail(&canceled).unwrap(), None);
+    assert!(hub.db.job_tail(&canceled).unwrap().is_some());
+    assert!(hub.db.job_tail(&more).unwrap().is_some());
+    // A failed job's end is outside the cache.
+    assert_eq!(
+        hub.db.job_tail(&script).unwrap().as_deref(),
+        Some(&b"boom\n"[..])
+    );
 
     // Configured to keep none.
     let off = dir.join("off");
-    let (addr, hub) = start_keeping(&off, 0).await;
+    let (addr, hub) = start_keeping(&off, 0, (0, 1 << 20)).await;
     let key = jobs_key(&hub);
     let mut node = ready_node(addr, &hub, 16384).await;
     let id = settled_job(addr, &key, &mut node, 1, out, Some(FailureClass::System)).await;
     assert_eq!(hub.db.job_tail(&id).unwrap(), None);
     assert_eq!(crate::jobs::detail(&hub, &id).unwrap().unwrap().1, None);
+    let ok = settled_job(addr, &key, &mut node, 2, out, None).await;
+    assert_eq!(hub.db.job_tail(&ok).unwrap(), None);
+    assert_eq!(crate::jobs::detail(&hub, &ok).unwrap().unwrap().1, None);
+    // Nor does a cache of no room.
+    let none = dir.join("none");
+    let (addr, hub) = start_keeping(&none, 0, (1 << 20, 0)).await;
+    let key = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let ok = settled_job(addr, &key, &mut node, 1, out, None).await;
+    assert_eq!(hub.db.job_tail(&ok).unwrap(), None);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

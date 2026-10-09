@@ -120,6 +120,14 @@ const DEFAULT_OUTPUT_LIMIT: u64 = 4 << 20;
 /// (`kept_failure_output` in `hub.toml`).
 pub const DEFAULT_KEPT_FAILURE_OUTPUT: u64 = 256 * 1024;
 
+/// Default output tail size for settled jobs that did not fail
+/// (`kept_output` in `hub.toml`).
+pub const DEFAULT_KEPT_OUTPUT: u64 = 1 << 20;
+
+/// Default total byte limit for retained output of jobs that did not fail
+/// (`kept_output_total` in `hub.toml`); the oldest retained tails are evicted first.
+pub const DEFAULT_KEPT_OUTPUT_TOTAL: u64 = 1 << 30;
+
 /// How long a node keeps an image no job uses, when it does not say: `vk`'s default
 /// `image_cache_idle_secs`.
 const DEFAULT_IMAGE_IDLE_SECS: u64 = vk_hub_proto::DEFAULT_IMAGE_CACHE_IDLE_SECS;
@@ -172,6 +180,11 @@ pub struct Dispatch {
     /// How many bytes from the end of a failed job's output are kept when it is settled; 0
     /// keeps none.
     pub kept_failure_output: u64,
+    /// Bytes retained from the end of a job's output on settlement if it did not fail.
+    /// The cache stays within `kept_output_total`; 0 keeps none.
+    pub kept_output: u64,
+    /// Total byte limit for retained tails of jobs that did not fail; 0 keeps none.
+    pub kept_output_total: u64,
     /// When a node holding a job's image is preferred.
     pub affinity: Affinity,
 }
@@ -285,6 +298,8 @@ impl Dispatch {
             lost_after,
             history,
             kept_failure_output: DEFAULT_KEPT_FAILURE_OUTPUT,
+            kept_output: DEFAULT_KEPT_OUTPUT,
+            kept_output_total: DEFAULT_KEPT_OUTPUT_TOTAL,
             affinity: Affinity::default(),
             state: Mutex::new(State {
                 capacity_revision: crate::now_secs().saturating_mul(1000),
@@ -2031,7 +2046,8 @@ pub async fn cancel(
 
 /// Settle `principal`'s finished job `id`: delete its output file and keep its record.
 /// For failed jobs, retain the output tail ([`Dispatch::kept_failure_output`]) with the
-/// record so the failure details remain readable.
+/// record so the failure details remain readable; for others, a tail
+/// ([`Dispatch::kept_output`]) in the hub's bounded cache of them.
 pub async fn settle(hub: &Hub, principal: &ApiPrincipal, id: &str) -> Result<(), ApiError> {
     let (_, mut row) = view(hub, principal, id).await?;
     if row.state != JobState::Finished {
@@ -2045,14 +2061,24 @@ pub async fn settle(hub: &Hub, principal: &ApiPrincipal, id: &str) -> Result<(),
         return Ok(());
     }
     let dir = hub.dispatch.output_dir()?.to_path_buf();
-    let keep = hub.dispatch.kept_failure_output;
-    if keep > 0 && row.outcome() == JobOutcome::Failed {
+    // `None`: kept with the record, outside the cache.
+    let (keep, cache) = match row.outcome() {
+        JobOutcome::Failed => (hub.dispatch.kept_failure_output, None),
+        _ => {
+            let total = hub.dispatch.kept_output_total;
+            (hub.dispatch.kept_output.min(total), Some(total))
+        }
+    };
+    if keep > 0 {
         // Kept before the file goes: a hub stopped in between keeps it when settled again.
         let (dir, job, len) = (dir.clone(), id.to_string(), row.output_len);
         blocking(hub, move |db| {
             let tail = output_tail(&dir, &job, len, keep)?;
             if !tail.is_empty() {
-                db.keep_job_tail(&job, &tail)?;
+                match cache {
+                    None => db.keep_job_tail(&job, &tail)?,
+                    Some(total) => db.cache_job_tail(&job, &tail, total)?,
+                };
             }
             Ok(())
         })
@@ -2506,9 +2532,9 @@ pub fn history(
     Ok(page)
 }
 
-/// Job `id`'s record and, for a failed job, its node-masked output tail: retained at
-/// settlement or read from the stored output before settlement. Returns `None` if the job
-/// is not in the history.
+/// Job `id`'s record and, for a finished job, its node-masked output tail, while retained.
+/// Before settlement, read as much stored output as settlement would retain.
+/// Returns `None` if the job is not in the history.
 pub fn detail(hub: &Hub, id: &str) -> Result<Option<(JobRow, Option<Vec<u8>>)>> {
     // An output file is named by the ID.
     if !vk_hub_proto::valid_id(id) {
@@ -2518,11 +2544,14 @@ pub fn detail(hub: &Hub, id: &str) -> Result<Option<(JobRow, Option<Vec<u8>>)>> 
     let Some(row) = live.map_or_else(|| hub.db.job(id), |r| Ok(Some(r)))? else {
         return Ok(None);
     };
-    if row.outcome() != JobOutcome::Failed {
-        return Ok(Some((row, None)));
-    }
+    let keep = match row.outcome() {
+        JobOutcome::Running => return Ok(Some((row, None))),
+        JobOutcome::Failed => hub.dispatch.kept_failure_output,
+        JobOutcome::Success | JobOutcome::Canceled => {
+            hub.dispatch.kept_output.min(hub.dispatch.kept_output_total)
+        }
+    };
     let mut tail = hub.db.job_tail(id)?;
-    let keep = hub.dispatch.kept_failure_output;
     if tail.is_none()
         && keep > 0
         && row.settled_at.is_none()

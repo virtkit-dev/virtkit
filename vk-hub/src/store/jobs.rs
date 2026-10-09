@@ -7,7 +7,7 @@
 //! in submission order ([`JOB_ORDER`]), so the oldest go first and a page of history is a
 //! range read from the newest end.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
@@ -26,13 +26,28 @@ pub(super) const JOB_SPECS: TableDefinition<&str, &[u8]> = TableDefinition::new(
 pub(super) const REQUESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("requests");
 /// Key: a sequence number, oldest submission first. Value: the job's ID.
 pub(super) const JOB_ORDER: TableDefinition<u64, &str> = TableDefinition::new("job_order");
-/// Key: job ID. Value: the end of a failed job's output, kept when its producer settled it
-/// ([`crate::jobs::settle`]), as the node masked it. Goes with the job's record.
+/// Key: job ID. Value: the end of a finished job's output, kept when its producer settled it
+/// ([`crate::jobs::settle`]), as the node masked it. Goes with the job's record; a job that did
+/// not fail keeps it only while [`JOB_CACHE`] does.
 pub(super) const JOB_TAILS: TableDefinition<&str, &[u8]> = TableDefinition::new("job_tails");
-/// The history's bookkeeping. Key: one of the names below. Value: a [`JOB_ORDER`] sequence.
+/// Key: job ID. Value: the length of its end in [`JOB_TAILS`], so what reckons with the ends
+/// kept — the cache's count, eviction, the checks at start — reads no end itself.
+pub(super) const JOB_TAIL_LENS: TableDefinition<&str, u64> = TableDefinition::new("job_tail_lens");
+/// The cache of the ends kept of jobs that did not fail. Key: a sequence number, oldest kept
+/// first, the first evicted. Value: the job's ID. [`CACHED_BYTES`] is their total.
+pub(super) const JOB_CACHE: TableDefinition<u64, &str> = TableDefinition::new("job_cache");
+/// The history's bookkeeping. Key: one of the names below. Value: as each says.
 const JOB_META: TableDefinition<&str, u64> = TableDefinition::new("job_meta");
-/// Every job placed below this in [`JOB_ORDER`] has finished and expired past [`JOB_KEEP`].
+/// A [`JOB_ORDER`] sequence: every job placed below it has finished and expired past
+/// [`JOB_KEEP`].
 const EXPIRED_BELOW: &str = "expired_below";
+/// The bytes of [`JOB_TAILS`] that [`JOB_CACHE`] holds.
+const CACHED_BYTES: &str = "cached_bytes";
+/// Set once [`JOB_TAIL_LENS`] has every end of [`JOB_TAILS`]: a database a build without it
+/// wrote has them filled in once. An end a build without the lengths writes later (a dev
+/// downgrade) has none, so orphan cleanup misses it; it is outside the cache, so nothing is
+/// miscounted.
+const TAIL_LENS: &str = "tail_lens";
 
 /// How long a `request_id` keeps its answer.
 pub const REQUEST_KEEP: u64 = 86_400;
@@ -442,12 +457,71 @@ impl Db {
                 return Ok(false);
             }
             txn.open_table(JOB_TAILS)?.insert(id, tail)?;
+            txn.open_table(JOB_TAIL_LENS)?
+                .insert(id, tail.len() as u64)?;
         }
         txn.commit().context("keeping a job's output")?;
         Ok(true)
     }
 
-    /// The end of job `id`'s output kept by [`Db::keep_job_tail`].
+    /// Cache job `id`'s output `tail` for a job that did not fail. Evict the oldest retained
+    /// tails until it fits within `total` bytes. Return false without storing it if the job
+    /// is no longer in the history or `tail` alone exceeds `total`. Preserve an existing tail:
+    /// a job's output is final once settled.
+    pub fn cache_job_tail(&self, id: &str, tail: &[u8], total: u64) -> Result<bool> {
+        let len = tail.len() as u64;
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            if len > total || txn.open_table(JOBS)?.get(id)?.is_none() {
+                return Ok(false);
+            }
+            let mut lens = txn.open_table(JOB_TAIL_LENS)?;
+            if lens.get(id)?.is_some() {
+                return Ok(true);
+            }
+            let mut tails = txn.open_table(JOB_TAILS)?;
+            let mut cache = txn.open_table(JOB_CACHE)?;
+            let mut meta = txn.open_table(JOB_META)?;
+            let mut kept = Kept {
+                cache: &mut cache,
+                tails: &mut tails,
+                lens: &mut lens,
+            };
+            let cached = kept.evict(&mut meta, total.saturating_sub(len))?;
+            let seq = cache
+                .last()?
+                .map_or(0, |(k, _)| k.value().saturating_add(1));
+            cache.insert(seq, id)?;
+            tails.insert(id, tail)?;
+            lens.insert(id, len)?;
+            meta.insert(CACHED_BYTES, cached.saturating_add(len))?;
+        }
+        txn.commit().context("caching a job's output")?;
+        Ok(true)
+    }
+
+    /// Evict the oldest retained tails from [`Db::cache_job_tail`]'s cache until it holds at
+    /// most `total` bytes, to apply a reduced configuration limit.
+    pub fn fit_job_cache(&self, total: u64) -> Result<()> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            let mut meta = txn.open_table(JOB_META)?;
+            if meta.get(CACHED_BYTES)?.map_or(0, |g| g.value()) <= total {
+                return Ok(());
+            }
+            let mut kept = Kept {
+                cache: &mut txn.open_table(JOB_CACHE)?,
+                tails: &mut txn.open_table(JOB_TAILS)?,
+                lens: &mut txn.open_table(JOB_TAIL_LENS)?,
+            };
+            let cached = kept.evict(&mut meta, total)?;
+            meta.insert(CACHED_BYTES, cached)?;
+        }
+        txn.commit().context("fitting the job output cache")?;
+        Ok(())
+    }
+
+    /// The end of job `id`'s output kept by [`Db::keep_job_tail`] or [`Db::cache_job_tail`].
     pub fn job_tail(&self, id: &str) -> Result<Option<Vec<u8>>> {
         let txn = self.db.begin_read().context("starting a read")?;
         let table = txn.open_table(JOB_TAILS)?;
@@ -663,10 +737,31 @@ impl Db {
                 order.remove(seq)?;
             }
             let mut tails = txn.open_table(JOB_TAILS)?;
+            let mut lens = txn.open_table(JOB_TAIL_LENS)?;
+            let mut uncached = HashMap::new();
             for id in &dropped {
                 table.remove(id.as_str())?;
                 specs.remove(id.as_str())?;
                 tails.remove(id.as_str())?;
+                if let Some(len) = lens.remove(id.as_str())? {
+                    uncached.insert(id.as_str(), len.value());
+                }
+            }
+            if !uncached.is_empty() {
+                // A failed job's end is not in the cache: only what leaves it counts.
+                let mut freed = 0u64;
+                txn.open_table(JOB_CACHE)?
+                    .retain(|_, id| match uncached.get(id) {
+                        Some(len) => {
+                            freed = freed.saturating_add(*len);
+                            false
+                        }
+                        None => true,
+                    })?;
+                if freed > 0 {
+                    let cached = meta.get(CACHED_BYTES)?.map_or(0, |g| g.value());
+                    meta.insert(CACHED_BYTES, cached.saturating_sub(freed))?;
+                }
             }
 
             let from = meta.get(EXPIRED_BELOW)?.map_or(0, |g| g.value());
@@ -717,6 +812,99 @@ impl Db {
     }
 }
 
+/// Retained tails and their bookkeeping within one write transaction.
+struct Kept<'a, 't> {
+    cache: &'a mut redb::Table<'t, u64, &'static str>,
+    tails: &'a mut redb::Table<'t, &'static str, &'static [u8]>,
+    lens: &'a mut redb::Table<'t, &'static str, u64>,
+}
+
+impl Kept<'_, '_> {
+    /// Evict the oldest cache entries and their tails until their byte count, read from
+    /// [`CACHED_BYTES`] in `meta`, is at most `total`. Return the remaining byte count.
+    fn evict(&mut self, meta: &mut redb::Table<'_, &'static str, u64>, total: u64) -> Result<u64> {
+        let mut cached = meta.get(CACHED_BYTES)?.map_or(0, |g| g.value());
+        while cached > total {
+            let Some(id) = (self.cache.pop_first()?).map(|(_, id)| id.value().to_string()) else {
+                // [`index_job_cache`] keeps the count true; nothing is left to evict anyway.
+                cached = 0;
+                break;
+            };
+            self.tails.remove(id.as_str())?;
+            if let Some(len) = self.lens.remove(id.as_str())? {
+                cached = cached.saturating_sub(len.value());
+            }
+        }
+        Ok(cached)
+    }
+}
+
+/// Rebuild [`JOB_CACHE`] and [`CACHED_BYTES`] from the ends kept, by their lengths
+/// ([`JOB_TAIL_LENS`]), inside `txn`, after [`order_jobs`] dropped those of missing records.
+/// Run at every start: an older hub may have dropped records, and with them cached ends,
+/// without knowing of the cache. An entry whose end is gone, or whose job failed, goes; an end
+/// of a job that did not fail and is not in the cache joins its newest end.
+pub(super) fn index_job_cache(txn: &redb::WriteTransaction) -> Result<()> {
+    let mut cache = txn.open_table(JOB_CACHE)?;
+    let lens = txn.open_table(JOB_TAIL_LENS)?;
+    let table = txn.open_table(JOBS)?;
+    // A record that does not decode is taken for failed: its end stays with it.
+    let cacheable = |id: &str| -> Result<bool> {
+        Ok(table.get(id)?.is_some_and(|row| {
+            decode::<JobRow>(row.value()).is_ok_and(|r| r.outcome() != JobOutcome::Failed)
+        }))
+    };
+    let (mut seen, mut gone, mut cached) = (HashSet::new(), Vec::new(), 0u64);
+    for entry in cache.iter()? {
+        let (seq, id) = entry?;
+        let id = id.value().to_string();
+        match lens.get(id.as_str())? {
+            Some(len) if !seen.contains(&id) && cacheable(&id)? => {
+                cached = cached.saturating_add(len.value());
+                seen.insert(id);
+            }
+            _ => gone.push(seq.value()),
+        }
+    }
+    for seq in gone {
+        cache.remove(seq)?;
+    }
+    // In the order of their IDs: which of them was kept first is not known.
+    let mut join = Vec::new();
+    for entry in lens.iter()? {
+        let (id, len) = entry?;
+        if !seen.contains(id.value()) && cacheable(id.value())? {
+            cached = cached.saturating_add(len.value());
+            join.push(id.value().to_string());
+        }
+    }
+    let next = cache
+        .last()?
+        .map_or(0, |(k, _)| k.value().saturating_add(1));
+    for (seq, id) in (next..).zip(&join) {
+        cache.insert(seq, id.as_str())?;
+    }
+    txn.open_table(JOB_META)?.insert(CACHED_BYTES, cached)?;
+    Ok(())
+}
+
+/// Fill [`JOB_TAIL_LENS`] in from [`JOB_TAILS`], once, inside `txn`: the one start that reads
+/// every end kept.
+fn fill_tail_lens(txn: &redb::WriteTransaction) -> Result<()> {
+    let mut meta = txn.open_table(JOB_META)?;
+    if meta.get(TAIL_LENS)?.is_some() {
+        return Ok(());
+    }
+    let tails = txn.open_table(JOB_TAILS)?;
+    let mut lens = txn.open_table(JOB_TAIL_LENS)?;
+    for entry in tails.iter()? {
+        let (id, tail) = entry?;
+        lens.insert(id.value(), tail.value().len() as u64)?;
+    }
+    meta.insert(TAIL_LENS, 1)?;
+    Ok(())
+}
+
 /// The next sequence in `order`, past the newest and at least [`EXPIRED_BELOW`],
 /// so jobs added after rebuilding the order are not mistaken for expired jobs.
 fn next_seq(
@@ -734,11 +922,14 @@ fn next_seq(
 /// missing records, inside `txn`. Run at every start: an older hub may have added or removed
 /// jobs, either before the index existed or since this hub last ran.
 pub(super) fn order_jobs(txn: &redb::WriteTransaction) -> Result<()> {
+    fill_tail_lens(txn)?;
     let mut order = txn.open_table(JOB_ORDER)?;
     let table = txn.open_table(JOBS)?;
     let mut tails = txn.open_table(JOB_TAILS)?;
+    let mut lens = txn.open_table(JOB_TAIL_LENS)?;
+    // By their lengths alone: no end is read.
     let mut orphans = Vec::new();
-    for entry in tails.iter()? {
+    for entry in lens.iter()? {
         let id = entry?.0.value().to_string();
         if table.get(id.as_str())?.is_none() {
             orphans.push(id);
@@ -746,6 +937,7 @@ pub(super) fn order_jobs(txn: &redb::WriteTransaction) -> Result<()> {
     }
     for id in orphans {
         tails.remove(id.as_str())?;
+        lens.remove(id.as_str())?;
     }
     let (mut placed, mut gone) = (HashSet::new(), Vec::new());
     for entry in order.iter()? {
@@ -974,6 +1166,197 @@ mod tests {
         db.prune_jobs(3 + JOB_KEEP, 1).unwrap();
         assert_eq!(listed(&db), [id(2)]);
         assert_eq!(db.job_tail(&id(1)).unwrap(), None);
+    }
+
+    /// The jobs in the output cache, oldest first, and the bytes it counts.
+    fn cache(db: &Db) -> (Vec<String>, u64) {
+        let txn = db.db.begin_read().unwrap();
+        let cache = txn.open_table(JOB_CACHE).unwrap();
+        let ids = cache
+            .iter()
+            .unwrap()
+            .map(|e| e.unwrap().1.value().to_string());
+        let meta = txn.open_table(JOB_META).unwrap();
+        let bytes = meta.get(CACHED_BYTES).unwrap().map_or(0, |g| g.value());
+        (ids.collect(), bytes)
+    }
+
+    fn failed_settled(n: u64) -> JobRow {
+        let mut row = job(n, JobState::Finished, Some(FailureClass::Script));
+        row.settled_at = row.finished_at;
+        row
+    }
+
+    /// The ends of jobs that did not fail are kept within the cache's total, the oldest kept
+    /// evicted first; a failed job's end is outside it and stays.
+    #[test]
+    fn the_output_cache_keeps_within_its_total_evicting_the_oldest() {
+        let db = Db::open_memory().unwrap();
+        for n in 1..=4 {
+            submit(&db, n, &settled(n));
+        }
+        submit(&db, 5, &failed_settled(5));
+        assert!(db.keep_job_tail(&id(5), b"boom\n").unwrap());
+        assert!(db.cache_job_tail(&id(1), b"one\n", 10).unwrap());
+        assert!(db.cache_job_tail(&id(2), b"two\n", 10).unwrap());
+        assert_eq!(cache(&db), (vec![id(1), id(2)], 8));
+        assert!(db.cache_job_tail(&id(3), b"six\n", 10).unwrap());
+        assert_eq!(cache(&db), (vec![id(2), id(3)], 8));
+        assert_eq!(db.job_tail(&id(1)).unwrap(), None);
+        // Over the total alone, or not in the history: not kept, and nothing evicted.
+        assert!(!db.cache_job_tail(&id(4), b"elevenbytes", 10).unwrap());
+        assert!(!db.cache_job_tail(&id(9), b"x", 10).unwrap());
+        assert!(!db.cache_job_tail(&id(4), b"x", 0).unwrap());
+        assert_eq!(db.job_tail(&id(4)).unwrap(), None);
+        // Kept again, as a settle retried after a stop does: it stays as it was.
+        assert!(db.cache_job_tail(&id(2), b"other\n", 10).unwrap());
+        assert_eq!(db.job_tail(&id(2)).unwrap().as_deref(), Some(&b"two\n"[..]));
+        assert_eq!(cache(&db), (vec![id(2), id(3)], 8));
+        // A total lowered evicts down to it.
+        db.fit_job_cache(4).unwrap();
+        assert_eq!(cache(&db), (vec![id(3)], 4));
+        db.fit_job_cache(0).unwrap();
+        assert_eq!(cache(&db), (vec![], 0));
+        assert_eq!(db.job_tail(&id(3)).unwrap(), None);
+        assert_eq!(
+            db.job_tail(&id(5)).unwrap().as_deref(),
+            Some(&b"boom\n"[..])
+        );
+    }
+
+    /// A job dropped from the history takes its cached end with it, and the cache counts it
+    /// gone; a failed job's end dropped likewise leaves the count alone.
+    #[test]
+    fn a_cached_end_goes_with_its_record() {
+        let db = Db::open_memory().unwrap();
+        submit(&db, 1, &settled(1));
+        submit(&db, 2, &failed_settled(2));
+        submit(&db, 3, &settled(3));
+        assert!(db.cache_job_tail(&id(1), b"one\n", 100).unwrap());
+        assert!(db.keep_job_tail(&id(2), b"boom\n").unwrap());
+        assert!(db.cache_job_tail(&id(3), b"three\n", 100).unwrap());
+        db.prune_jobs(4, 1).unwrap();
+        assert_eq!(listed(&db), [id(3)]);
+        assert_eq!(db.job_tail(&id(1)).unwrap(), None);
+        assert_eq!(db.job_tail(&id(2)).unwrap(), None);
+        assert_eq!(cache(&db), (vec![id(3)], 6));
+        db.prune_jobs(4, 0).unwrap();
+        assert_eq!(cache(&db), (vec![], 0));
+    }
+
+    /// At start the cache is rebuilt from the ends kept: entries whose end an older hub
+    /// dropped with its record go, an end of a job that did not fail joins it, and the count
+    /// is what is left.
+    #[test]
+    fn the_output_cache_is_rebuilt_at_start() {
+        let db = Db::open_memory().unwrap();
+        for n in 1..=3 {
+            submit(&db, n, &settled(n));
+        }
+        submit(&db, 4, &failed_settled(4));
+        assert!(db.cache_job_tail(&id(1), b"one\n", 100).unwrap());
+        assert!(db.cache_job_tail(&id(2), b"two!\n", 100).unwrap());
+        assert!(db.keep_job_tail(&id(4), b"boom\n").unwrap());
+        let txn = db.db.begin_write().unwrap();
+        {
+            // An older hub dropped job 1's record, unaware of its end and of the cache.
+            txn.open_table(JOBS)
+                .unwrap()
+                .remove(id(1).as_str())
+                .unwrap();
+            // An end the cache does not list, and a second entry for one it does.
+            txn.open_table(JOB_TAILS)
+                .unwrap()
+                .insert(id(3).as_str(), &b"three\n"[..])
+                .unwrap();
+            txn.open_table(JOB_TAIL_LENS)
+                .unwrap()
+                .insert(id(3).as_str(), 6)
+                .unwrap();
+            txn.open_table(JOB_CACHE)
+                .unwrap()
+                .insert(9, id(2).as_str())
+                .unwrap();
+            txn.open_table(JOB_META)
+                .unwrap()
+                .insert(CACHED_BYTES, 999)
+                .unwrap();
+        }
+        order_jobs(&txn).unwrap();
+        index_job_cache(&txn).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(cache(&db), (vec![id(2), id(3)], 11));
+        assert_eq!(db.job_tail(&id(1)).unwrap(), None);
+        assert_eq!(
+            db.job_tail(&id(4)).unwrap().as_deref(),
+            Some(&b"boom\n"[..])
+        );
+
+        // A database from before the cache: every end of a job that did not fail joins it.
+        let txn = db.db.begin_write().unwrap();
+        txn.delete_table(JOB_CACHE).unwrap();
+        index_job_cache(&txn).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(cache(&db), (vec![id(2), id(3)], 11));
+        // Rebuilt, it evicts as before.
+        submit(&db, 5, &settled(5));
+        assert!(db.cache_job_tail(&id(5), b"five\n", 11).unwrap());
+        assert_eq!(cache(&db), (vec![id(3), id(5)], 11));
+        assert_eq!(db.job_tail(&id(2)).unwrap(), None);
+    }
+
+    /// The ends' lengths, kept beside them, are what the cache reckons with; a database without
+    /// them has them filled in once, from the ends, at start.
+    #[test]
+    fn the_ends_lengths_are_kept_beside_them() {
+        let db = Db::open_memory().unwrap();
+        submit(&db, 1, &settled(1));
+        submit(&db, 2, &failed_settled(2));
+        assert!(db.cache_job_tail(&id(1), b"one\n", 100).unwrap());
+        assert!(db.keep_job_tail(&id(2), b"boom!\n").unwrap());
+        let lens = |db: &Db| -> Vec<(String, u64)> {
+            let txn = db.db.begin_read().unwrap();
+            let lens = txn.open_table(JOB_TAIL_LENS).unwrap();
+            (lens.iter().unwrap())
+                .map(|e| e.unwrap())
+                .map(|(k, v)| (k.value().to_string(), v.value()))
+                .collect()
+        };
+        assert_eq!(lens(&db), [(id(1), 4), (id(2), 6)]);
+        let txn = db.db.begin_write().unwrap();
+        txn.delete_table(JOB_TAIL_LENS).unwrap();
+        txn.open_table(JOB_META).unwrap().remove(TAIL_LENS).unwrap();
+        order_jobs(&txn).unwrap();
+        index_job_cache(&txn).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(lens(&db), [(id(1), 4), (id(2), 6)]);
+        assert_eq!(cache(&db), (vec![id(1)], 4));
+        // Pruned, an end goes with its length.
+        db.prune_jobs(4, 0).unwrap();
+        assert_eq!(lens(&db), []);
+        assert_eq!(cache(&db), (vec![], 0));
+    }
+
+    /// The cache and its count outlast the hub: reopened, the database holds them as they were.
+    #[test]
+    fn the_output_cache_survives_a_reopen() {
+        let dir = std::env::temp_dir().join(format!("vk-hub-cache-{}", std::process::id()));
+        // Absent on a first run.
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("hub.db");
+        let db = Db::open(&path).unwrap();
+        for n in 1..=2 {
+            submit(&db, n, &settled(n));
+        }
+        assert!(db.cache_job_tail(&id(1), b"one\n", 100).unwrap());
+        assert!(db.cache_job_tail(&id(2), b"two\n", 100).unwrap());
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert_eq!(cache(&db), (vec![id(1), id(2)], 8));
+        assert!(db.cache_job_tail(&id(1), b"one\n", 8).unwrap());
+        assert_eq!(cache(&db), (vec![id(1), id(2)], 8));
+        drop(db);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Past its count, the history drops its oldest settled or expired jobs, record and spec,

@@ -210,10 +210,10 @@ system unit when run as root), preserving enrollment.
 `127.0.0.1:8443`), `tls_cert` and `tls_key`, `data_dir` (default `$XDG_DATA_HOME/virtkit/hub`,
 else `~/.local/share/virtkit/hub`), `release_repository` (see [Releases](#releases)), and the
 web UI's keys (see [Web UI](#web-ui)), and `job_lost_after_secs`, `job_history`,
-`kept_failure_output`, `image_affinity_max_load` and `image_affinity_max_extra_load` (see
-[Placed jobs](#placed-jobs)). Every key is optional and an unknown one is an error. Without TLS
-the hub serves only on loopback. TLS is 1.3 only, on both the hub
-and the node. `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub tools`,
+`kept_failure_output`, `kept_output`, `kept_output_total`, `image_affinity_max_load` and
+`image_affinity_max_extra_load` (see [Placed jobs](#placed-jobs)). Every key is optional and an
+unknown one is an error. Without TLS the hub serves only on loopback. TLS is 1.3 only, on both
+the hub and the node. `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub tools`,
 `vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub keys` and `vk-hub jobs` reach the
 running hub through `<data_dir>/admin.sock`, open to the hub's user and root.
 
@@ -1126,6 +1126,18 @@ roughly `job_history` × `kept_failure_output` of it — about 2.4 GiB at the de
 job to fail; more between the hourly trims, or for tails kept before `kept_failure_output` was
 lowered — and its file does not shrink when they go.
 
+**Other jobs' output.** Settling a successful or canceled job retains its output tail the same
+way, but in a cache with a total size limit. Each tail holds up to `kept_output` bytes (`1M`
+by default, at most `4M`), capped by `kept_output_total` (`1G` by default, at most `64G`).
+Setting either to `"0"` keeps none. The cache evicts the oldest retained tails until a new
+tail fits within `kept_output_total`. Failed jobs' retained output is exempt from this limit
+and eviction. Pruning a job's history record also removes its cached tail. Lowering the total
+while the hub is stopped causes eviction to the new limit at startup.
+At every start the hub rebuilds the cache's index and count from the ends the database holds,
+so a database an older hub wrote to is consistent again. The database grows by up to
+`kept_output_total` (1 GiB by default) on top of the failed jobs' kept output, and its file does
+not shrink when an end is evicted or the total lowered.
+
 **History.** The hub keeps the records of the newest `job_history` jobs (10,000 by default, 1 to
 1,000,000), in submission order: once an hour the oldest finished ones past that count go if
 they were settled or are past those 30 days; a job not finished, or finished and not yet
@@ -1151,8 +1163,9 @@ nodes resending output from the end of the stored file.
 output length, age, how long it ran (or has been running), its VM's peak memory, and what the
 job is. `vk-hub jobs show <id>` prints one job's record, one field per line: outcome, exit
 code, node message, GitLab page, node, pool, key, submission/start/finish/settlement times,
-run time and resource usage. For failed jobs it also prints the end of the output, made
-readable as in the web UI (below), so the job's escape sequences never reach the terminal.
+run time and resource usage. It also prints the end of a finished job's output the hub kept,
+or before it is settled as much as settling would keep, made readable as in the web UI (below),
+so the job's escape sequences never reach the terminal.
 The web UI's jobs page shows the whole history to viewers and operators alike (see
 [Web UI](#web-ui)).
 
@@ -1249,8 +1262,9 @@ what precedes its last carriage return goes, else its head is kept, ending `…`
 `vk-hub jobs show` reads the end the hub kept the same way. While the hub holds the output — until
 the job's producer settles it, or for 30 days after it finished — the page shows its last 1 MiB,
 saying how much precedes it; once settled, a failed job's page shows the end the hub kept (see
-[Placed jobs](#placed-jobs)), and another's says its output is gone, linking to the job on GitLab
-when its spec names a plain web URL.
+[Placed jobs](#placed-jobs)), and so does another's while the hub's cache still holds its end;
+past that, it says its output is gone, linking to the job on GitLab when its spec names a plain
+web URL.
 
 While the job runs, its page follows it over `/events/job/<id>`, a stream like the others
 (below): the hub notes each piece of output it stores and each change to the job's record, by

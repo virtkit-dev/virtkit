@@ -232,8 +232,8 @@ pub struct Accounts {
     pub default_role: Option<Role>,
 }
 
-/// A placed job's record and, for a failed job, its node-masked output tail encoded as
-/// base64 ([`crate::jobs::detail`]).
+/// A placed job's record and, for a finished job, its retained node-masked output tail,
+/// encoded as base64 ([`crate::jobs::detail`]).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JobDetail {
     pub row: JobRow,

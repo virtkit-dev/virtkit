@@ -672,7 +672,12 @@ impl Db {
             .context("opening the requests table")?;
         txn.open_table(jobs::JOB_TAILS)
             .context("opening the job output tails table")?;
+        txn.open_table(jobs::JOB_CACHE)
+            .context("opening the job output cache table")?;
+        txn.open_table(jobs::JOB_TAIL_LENS)
+            .context("opening the job output lengths table")?;
         jobs::order_jobs(&txn).context("ordering the job history")?;
+        jobs::index_job_cache(&txn).context("indexing the job output cache")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db {
             db,

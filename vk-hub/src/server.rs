@@ -225,6 +225,15 @@ impl Hub {
         self
     }
 
+    /// Retain the last `bytes` of output on settlement for jobs that did not fail, within a
+    /// cache of `total` bytes; 0 for either keeps none.
+    /// Call after [`Hub::with_jobs`], which sets the defaults.
+    pub fn keeping_output(mut self, bytes: u64, total: u64) -> Self {
+        self.dispatch.kept_output = bytes;
+        self.dispatch.kept_output_total = total;
+        self
+    }
+
     /// Prefer nodes holding a job's image according to `affinity`.
     /// Call after [`Hub::with_jobs`], which sets the default.
     pub fn preferring_warm_images(mut self, affinity: crate::jobs::Affinity) -> Self {
