@@ -7,7 +7,8 @@
 //! controls.
 //! Operators add releases and start rollouts from `/operations` ([`super::operations`]),
 //! which also lists client API jobs, read only. They issue enrollment tokens from the
-//! nodes page ([`create_token`]).
+//! nodes page ([`create_token`]), and grant OIDC sign-in roles from `/users`
+//! ([`super::users`]), which only their navigation links to.
 
 use std::sync::Arc;
 
@@ -180,7 +181,15 @@ pub(super) async fn get(
             anyhow::Ok((pages::AuditPage { node, rows }, names))
         })
         .await?;
-        return Ok(Some(page(pages::audit(auth, &audit, Some(&names), NAV))));
+        return Ok(Some(page(pages::audit(
+            auth,
+            &audit,
+            Some(&names),
+            nav(auth),
+        ))));
+    }
+    if path == super::users::PATH {
+        return super::users::get(auth, ui).await.map(Some);
     }
     if let Some(id) = path.strip_prefix("/node/")
         && vk_hub_proto::valid_id(id)
@@ -511,14 +520,29 @@ pub(super) async fn rollout_action(
 
 /// The page around `main`, with the fleet's navigation.
 pub(super) fn layout(title: &str, here: &str, auth: &Auth, main: &Html) -> Html {
-    pages::frame(title, here, auth, NAV, main)
+    pages::frame(title, here, auth, nav(auth), main)
 }
 
-/// The fleet's navigation.
-pub(super) const NAV: pages::Nav = &[
+/// The fleet's navigation for `auth`'s session: an operator's has the users page too.
+fn nav(auth: &Auth) -> pages::Nav {
+    if auth.session.role >= Role::Operator {
+        OPERATOR_NAV
+    } else {
+        NAV
+    }
+}
+
+const NAV: pages::Nav = &[
     ("/", "Nodes"),
     ("/operations", "Operations"),
     ("/audit", "Audit"),
+];
+
+const OPERATOR_NAV: pages::Nav = &[
+    ("/", "Nodes"),
+    ("/operations", "Operations"),
+    ("/audit", "Audit"),
+    (super::users::PATH, "Users"),
 ];
 
 /// `/`: the nodes table.

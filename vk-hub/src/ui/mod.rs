@@ -16,8 +16,9 @@
 //! its `Origin` is the UI's own (a fleet hub's `ui_url`), or `Sec-Fetch-Site` says
 //! `same-origin` — and carry the session's CSRF token, derived from its secret, in a form
 //! field or header. A fleet hub's are the admin socket's steering operations, of nodes and of
-//! rollouts ([`fleet`]), and its releases and rollouts added and started ([`operations`]);
-//! local mode's are `vk` commands ([`actions`]). A release's upload is the one post whose body
+//! rollouts ([`fleet`]), its releases and rollouts added and started ([`operations`]), and its
+//! OIDC grants given, changed and revoked ([`users`]); local mode's are `vk` commands
+//! ([`actions`]). A release's upload is the one post whose body
 //! is not a small form: [`operations`] reads it as it arrives, under limits of its own.
 //!
 //! **A page** (`GET`) goes only to a request the UI's own pages made (`same-origin`) or no
@@ -71,6 +72,7 @@ mod oidc;
 mod operations;
 mod pages;
 mod sse;
+mod users;
 
 use body::Body;
 pub use oidc::{CALLBACK_PATH as OIDC_CALLBACK_PATH, OidcSignIn};
@@ -352,6 +354,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                     operations::upload(req, ui, site).await
                 } else if path == operations::FETCH_PATH {
                     operations::fetch_action(req, ui).await
+                } else if path == users::PATH {
+                    users::action(req, ui, site).await
                 } else if path == fleet::TOKEN_PATH {
                     fleet::create_token(req, ui).await
                 } else if path == operations::ROLLOUT_PATH {

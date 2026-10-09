@@ -3,13 +3,13 @@
 
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::{Acquisition, Command, DesiredState, Operation, Report};
 
 use crate::rollout::{NodeStatus, Rollout, RolloutAction, RolloutNode, RolloutRow, RolloutState};
 use crate::server::{Hub, Reach};
-use crate::store::{DesiredChange, NodeRow, Release};
+use crate::store::{AccountChange, DesiredChange, NodeRow, Release, Role};
 
 /// Command delivery window. One day allows for a node reboot or hub outage without applying
 /// a stale request, such as a week-old drain.
@@ -381,6 +381,54 @@ pub fn steer_rollout(hub: &Hub, actor: &str, id: &str, action: RolloutAction) ->
     );
     hub.touch();
     Ok(Rollout { id, row })
+}
+
+/// The result of granting or revoking a role.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AccountOutcome {
+    /// The address, normalized, or `*`.
+    pub email: String,
+    pub change: AccountChange,
+    /// Whether the running hub has `[oidc]`.
+    pub oidc: bool,
+}
+
+/// Grant `email` — an address or `*` — `role`, or revoke its grant with `None`, as `actor`,
+/// ending the web UI sessions that now hold more than a sign-in gets. With
+/// `keep_an_operator`, refused with [`crate::store::LastOperator`] where it would take the
+/// operator role from the last address granted it.
+pub fn set_account(
+    hub: &Hub,
+    actor: &str,
+    email: &str,
+    role: Option<Role>,
+    keep_an_operator: bool,
+) -> Result<AccountOutcome> {
+    let email = crate::store::account_key(email)
+        .ok_or_else(|| anyhow!("{email:?} is neither an email address nor *"))?;
+    let now = crate::now_secs();
+    let change = hub
+        .db
+        .change_account(&email, role, keep_an_operator, actor, now)?;
+    if change.previous != role {
+        let what = match role {
+            Some(role) => format!("granted {email} the {} role", role.name()),
+            None => format!("revoked {email}'s grant"),
+        };
+        eprintln!(
+            "vk-hub: {actor} {what}, ending {} web UI session(s)",
+            change.ended
+        );
+    }
+    if change.ended > 0 {
+        // Their pages' live updates end on it.
+        hub.sessions_changed();
+    }
+    Ok(AccountOutcome {
+        email,
+        change,
+        oidc: hub.oidc,
+    })
 }
 
 /// One node's workloads, as `vk-hub workloads` lists them.

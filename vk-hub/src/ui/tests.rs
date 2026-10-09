@@ -2534,36 +2534,53 @@ async fn the_fleet_s_pages_load_only_the_embedded_scripts() {
         "/".to_string(),
         format!("/node/{node}"),
         "/audit".to_string(),
+        "/users".to_string(),
     ] {
         let body = get(addr, &path, Some(&cookie)).await.body;
-        assert!(body.contains("\"allowEval\":false"), "{body}");
-        assert!(body.contains("\"selfRequestsOnly\":true"), "{body}");
-        assert_eq!(body.matches("<script").count(), 3, "{body}");
-        assert_eq!(body.matches("<script src=\"/assets/").count(), 3, "{body}");
-        // The script that shows times in the browser's zone, run once the page is read.
-        let time = format!(
-            "<script src=\"{}\" defer></script>",
-            assets::url(assets::TIME)
-        );
-        assert!(body.contains(&time), "{body}");
-        // The hub's time, by which the script measures ages.
-        let now = body
-            .strip_prefix("<!doctype html><html lang=\"en\" data-now=\"")
-            .and_then(|rest| rest.get(..21));
-        assert!(now.is_some_and(|now| now.ends_with("Z\"")), "{body}");
-        assert!(!body.contains(" style="), "{body}");
-        // No inline event handler: no ` on…=` attribute.
-        let handler = body.match_indices(" on").any(|(i, _)| {
-            let rest = &body[i + 3..];
-            let name = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
-            name > 0 && rest[name..].starts_with('=')
-        });
-        assert!(!handler, "{body}");
+        assert_only_embedded_scripts(&body);
         assert_eq!(
             body.matches("sse-close=\"close\"").count(),
-            usize::from(path != "/audit")
+            usize::from(path != "/audit" && path != "/users")
         );
     }
+    // The users page with its forms, on a hub with `[oidc]`.
+    let (addr, hub) = start_oidc(
+        serde_json::json!({"sub": "s"}),
+        &[("alice@example.com", Role::Operator), ("*", Role::Viewer)],
+    )
+    .await;
+    let (cookie, _) = sign_in(addr, &hub, Role::Operator).await;
+    let body = get(addr, "/users", Some(&cookie)).await.body;
+    assert!(body.contains("value=\"revoke\""), "{body}");
+    assert_only_embedded_scripts(&body);
+}
+
+/// `body` loads its script from the hub alone, configured to evaluate nothing, and has no
+/// inline script, style or event handler.
+fn assert_only_embedded_scripts(body: &str) {
+    assert!(body.contains("\"allowEval\":false"), "{body}");
+    assert!(body.contains("\"selfRequestsOnly\":true"), "{body}");
+    assert_eq!(body.matches("<script").count(), 3, "{body}");
+    assert_eq!(body.matches("<script src=\"/assets/").count(), 3, "{body}");
+    // The script that shows times in the browser's zone, run once the page is read.
+    let time = format!(
+        "<script src=\"{}\" defer></script>",
+        assets::url(assets::TIME)
+    );
+    assert!(body.contains(&time), "{body}");
+    // The hub's time, by which the script measures ages.
+    let now = body
+        .strip_prefix("<!doctype html><html lang=\"en\" data-now=\"")
+        .and_then(|rest| rest.get(..21));
+    assert!(now.is_some_and(|now| now.ends_with("Z\"")), "{body}");
+    assert!(!body.contains(" style="), "{body}");
+    // No inline event handler: no ` on…=` attribute.
+    let handler = body.match_indices(" on").any(|(i, _)| {
+        let rest = &body[i + 3..];
+        let name = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
+        name > 0 && rest[name..].starts_with('=')
+    });
+    assert!(!handler, "{body}");
 }
 
 /// What the pages say of signing in reads as written: no runs of spaces from a string's line
@@ -4040,6 +4057,429 @@ async fn without_oidc_there_is_no_provider_to_sign_in_with() {
     );
     assert!(!get(addr, "/", None).await.body.contains("/auth/login"));
     assert_eq!(get(addr, "/login", None).await.status, 403);
+}
+
+/// Post `form` to `/users` from the UI's origin `https://<addr>`, by htmx.
+async fn post_users(addr: SocketAddr, cookie: &str, form: &str) -> Reply {
+    post_action(
+        addr,
+        &format!("https://{addr}"),
+        cookie,
+        users::PATH,
+        form,
+        true,
+    )
+    .await
+}
+
+/// Post `form`, which `/users` asks about first: the form that answers it, confirmed.
+async fn ask_users(addr: SocketAddr, cookie: &str, csrf: &str, form: &str) -> String {
+    let reply = post_users(addr, cookie, form).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply.body.contains("name=\"confirm\" value=\"yes\""),
+        "{}",
+        reply.body
+    );
+    assert!(reply.body.contains("<button class=\"danger\">Yes, "));
+    let asked: String = ["op", "email", "role", "previous"]
+        .into_iter()
+        .filter(|f| reply.body.contains(&format!("name=\"{f}\"")))
+        .map(|f| format!("&{f}={}", hidden(&reply.body, f)))
+        .collect();
+    format!(
+        "_csrf={csrf}{asked}&nonce={}&confirm=yes",
+        hidden(&reply.body, "nonce")
+    )
+}
+
+/// The grants, as `(address, role, granted by)`.
+fn grants(hub: &Hub) -> Vec<(String, Role, String)> {
+    hub.db
+        .accounts()
+        .unwrap()
+        .into_iter()
+        .map(|(e, a)| (e, a.role, a.granted_by))
+        .collect()
+}
+
+/// A session opened through the hub's fake provider, as the identity its claims name: its
+/// cookie pair and CSRF token.
+async fn oidc_session(addr: SocketAddr) -> (String, String) {
+    let (login, state) = start_oidc_login(addr).await;
+    let reply = oidc_callback(addr, &state, Some(&login)).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let pair = reply
+        .set_cookies()
+        .into_iter()
+        .find(|c| c.starts_with(&format!("{SECURE_COOKIE}=")))
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let csrf = csrf_token(pair.split_once('=').unwrap().1);
+    (pair, csrf)
+}
+
+/// `/users` is an operator's: a viewer has no link to it, is refused the page with 403, and
+/// cannot post to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_users_page_is_for_operators_alone() {
+    let (addr, hub) = start_oidc(serde_json::json!({"sub": "s"}), &[]).await;
+    let (viewer, csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let home = get(addr, "/", Some(&viewer)).await;
+    assert!(!home.body.contains("href=\"/users\""), "{}", home.body);
+    let page = get(addr, "/users", Some(&viewer)).await;
+    assert_eq!(page.status, 403, "{}", page.body);
+    assert_secure(&page);
+    assert!(
+        page.body.contains("needs the operator role"),
+        "{}",
+        page.body
+    );
+    let form = format!("_csrf={csrf}&op=grant&email=eve@example.com&role=operator");
+    assert_eq!(post_users(addr, &viewer, &form).await.status, 403);
+    assert!(grants(&hub).is_empty());
+
+    let (operator, _) = sign_in(addr, &hub, Role::Operator).await;
+    let home = get(addr, "/", Some(&operator)).await;
+    assert!(
+        home.body.contains("<a href=\"/users\">Users</a>"),
+        "{}",
+        home.body
+    );
+    let page = get(addr, "/users", Some(&operator)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body
+            .contains("<a href=\"/users\" aria-current=\"page\">Users</a>"),
+        "{}",
+        page.body
+    );
+}
+
+/// An operator grants an address a role, raises it at once, and lowers and revokes it once
+/// confirmed — each through the admin socket's operation, audited as the session's principal.
+/// Every grant is listed with who made it, `*` as everyone the provider signs in, and the
+/// page says what anyone else gets.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_operator_grants_changes_and_revokes_from_the_users_page() {
+    let (addr, hub) = start_oidc(
+        serde_json::json!({"sub": "s"}),
+        &[("alice@example.com", Role::Operator)],
+    )
+    .await;
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
+    let page = get(addr, "/users", Some(&cookie)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    for want in [
+        "<td>alice@example.com</td><td><span class=\"badge busy\">operator</span></td>\
+         <td>uid 0</td>",
+        "Anyone else the provider signs in: <span class=\"badge bad\">refused</span>.",
+        "<form class=\"wide\" method=\"post\" action=\"/users\" hx-post=\"/users\"",
+        "<option value=\"operator\" selected>operator</option>",
+    ] {
+        assert!(page.body.contains(want), "{want}: {}", page.body);
+    }
+
+    // A new grant, its address normalized: no question asked.
+    let form = format!("_csrf={csrf}&op=grant&email=Bob%40Example.com&role=viewer");
+    let reply = post_users(addr, &cookie, &form).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.header("hx-reswap"), Some("none"));
+    assert!(
+        reply.body.contains(
+            "<div id=\"flash\" hx-swap-oob=\"true\">Granted bob@example.com the viewer role.</div>"
+        ),
+        "{}",
+        reply.body
+    );
+    assert!(
+        reply
+            .body
+            .contains("<section id=\"users\" hx-swap-oob=\"true\">")
+            && reply.body.contains("<td>bob@example.com</td>"),
+        "{}",
+        reply.body
+    );
+    audited(
+        &hub,
+        &format!("{principal} granted bob@example.com the viewer role"),
+    )
+    .await;
+    assert_eq!(
+        grants(&hub)[1],
+        ("bob@example.com".into(), Role::Viewer, principal.clone())
+    );
+
+    // Raised at once.
+    let form = format!("_csrf={csrf}&op=change&email=bob@example.com&role=operator");
+    let reply = post_users(addr, &cookie, &form).await;
+    assert!(
+        reply.body.contains("the operator role, replacing viewer."),
+        "{}",
+        reply.body
+    );
+
+    // Lowered once asked; the question names it, and its answer counts once.
+    let form = format!("_csrf={csrf}&op=change&email=bob@example.com&role=viewer");
+    let answer = ask_users(addr, &cookie, &csrf, &form).await;
+    assert_eq!(grants(&hub)[1].1, Role::Operator, "nothing done yet");
+    let reply = post_users(addr, &cookie, &answer).await;
+    assert!(
+        reply.body.contains("the viewer role, replacing operator."),
+        "{}",
+        reply.body
+    );
+    // Sent again, it lowers nothing, so nothing is asked or done.
+    let again = post_users(addr, &cookie, &answer).await;
+    assert!(
+        again.body.contains("Already so; nothing changed."),
+        "{}",
+        again.body
+    );
+    audited(
+        &hub,
+        &format!("{principal} granted bob@example.com the viewer role, replacing operator"),
+    )
+    .await;
+
+    // `*`, as a viewer only, shown as everyone the provider signs in.
+    let form = format!("_csrf={csrf}&op=grant&email=*&role=operator");
+    assert_eq!(post_users(addr, &cookie, &form).await.status, 400);
+    let form = format!("_csrf={csrf}&op=grant&email=*&role=viewer");
+    let reply = post_users(addr, &cookie, &form).await;
+    assert!(
+        reply.body.contains("<td>Everyone signed in through 127.0.0.1:")
+            && reply
+                .body
+                .contains("Anyone else the provider signs in: <span class=\"badge\">viewer</span>, by the grant to everyone."),
+        "{}",
+        reply.body
+    );
+
+    // An answer to a question about a grant that has changed since is refused.
+    let form = format!("_csrf={csrf}&op=revoke&email=bob@example.com");
+    let stale = ask_users(addr, &cookie, &csrf, &form).await;
+    hub.db
+        .grant_account("bob@example.com", Role::Operator, "uid 0", 2)
+        .unwrap();
+    let reply = post_users(addr, &cookie, &stale).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(reply.body.contains("it changed"), "{}", reply.body);
+    assert_eq!(grants(&hub)[2].1, Role::Operator);
+
+    // Revoked once asked.
+    let answer = ask_users(addr, &cookie, &csrf, &form).await;
+    let reply = post_users(addr, &cookie, &answer).await;
+    assert!(
+        reply.body.contains("Revoked the grant of bob@example.com."),
+        "{}",
+        reply.body
+    );
+    audited(
+        &hub,
+        &format!("{principal} revoked bob@example.com's grant of the operator role"),
+    )
+    .await;
+    assert_eq!(
+        grants(&hub)
+            .into_iter()
+            .map(|(e, _, _)| e)
+            .collect::<Vec<_>>(),
+        ["*", "alice@example.com"]
+    );
+
+    // A plain form goes back to the page; what is not an address or a role is refused.
+    let reply = post_action(
+        addr,
+        &format!("https://{addr}"),
+        &cookie,
+        "/users",
+        &format!("_csrf={csrf}&op=grant&email=carol@example.com&role=viewer"),
+        false,
+    )
+    .await;
+    assert_eq!(reply.status, 303, "{}", reply.body);
+    assert_eq!(reply.header("location"), Some("/users"));
+    for form in [
+        "op=grant&email=not-an-address&role=viewer",
+        "op=grant&email=a%20b@example.com&role=viewer",
+        "op=grant&email=dan@example.com&role=admin",
+        "op=delete&email=dan@example.com",
+    ] {
+        let reply = post_users(addr, &cookie, &format!("_csrf={csrf}&{form}")).await;
+        assert_eq!(reply.status, 400, "{form}: {}", reply.body);
+    }
+
+    // An address with markup in it is escaped in its row and in its forms' hidden field.
+    let form = format!("_csrf={csrf}&op=grant&email=a%22%3Cb%3E%40example.com&role=viewer");
+    let reply = post_users(addr, &cookie, &form).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    for want in [
+        "<td>a&quot;&lt;b&gt;@example.com</td>",
+        "<input type=\"hidden\" name=\"email\" value=\"a&quot;&lt;b&gt;@example.com\">",
+    ] {
+        assert!(reply.body.contains(want), "{want}: {}", reply.body);
+    }
+    assert!(!reply.body.contains("a\"<b>"), "{}", reply.body);
+    assert_eq!(grants(&hub).len(), 4);
+}
+
+/// A post to `/users` from another origin, or without the session's CSRF token, changes
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_users_post_needs_the_ui_origin_and_the_csrf_token() {
+    let (addr, hub) = start_oidc(serde_json::json!({"sub": "s"}), &[]).await;
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let form = format!("_csrf={csrf}&op=grant&email=eve@example.com&role=operator");
+    let reply = post_action(addr, "https://evil.example", &cookie, "/users", &form, true).await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let reply = post_users(
+        addr,
+        &cookie,
+        "op=grant&email=eve@example.com&role=operator",
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    let reply = post_users(
+        addr,
+        &cookie,
+        &format!(
+            "_csrf={}&op=grant&email=eve@example.com&role=operator",
+            "0".repeat(64)
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, 403, "{}", reply.body);
+    assert!(grants(&hub).is_empty());
+}
+
+/// The operator role is never taken from the last address granted it from the page — the
+/// operator's own included — and the refusal says how to get back in; nothing is asked first.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_last_operator_grant_is_kept() {
+    let (addr, hub) = start_oidc(
+        serde_json::json!({"sub": "u", "email": "alice@example.com"}),
+        &[
+            ("alice@example.com", Role::Operator),
+            ("bob@example.com", Role::Viewer),
+        ],
+    )
+    .await;
+    let (cookie, csrf) = oidc_session(addr).await;
+    for form in [
+        "op=revoke&email=alice@example.com",
+        "op=change&email=Alice@example.com&role=viewer",
+    ] {
+        let reply = post_users(addr, &cookie, &format!("_csrf={csrf}&{form}")).await;
+        assert_eq!(reply.status, 409, "{form}: {}", reply.body);
+        assert!(
+            reply.body.contains("no address granted the operator role")
+                && reply.body.contains("vk-hub ui login --role operator"),
+            "{}",
+            reply.body
+        );
+        assert!(!reply.body.contains("name=\"confirm\""), "{}", reply.body);
+    }
+    // A viewer's grant goes all the same.
+    let answer = ask_users(
+        addr,
+        &cookie,
+        &csrf,
+        &format!("_csrf={csrf}&op=revoke&email=bob@example.com"),
+    )
+    .await;
+    assert_eq!(post_users(addr, &cookie, &answer).await.status, 200);
+    assert_eq!(
+        grants(&hub),
+        [("alice@example.com".into(), Role::Operator, "uid 0".into())]
+    );
+}
+
+/// Lowering a grant ends the sessions it admitted that now hold more — an operator lowering
+/// their own, with another operator left, signs themselves out — audited as the session
+/// opened through the provider.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lowered_grant_ends_its_sessions() {
+    let (addr, hub) = start_oidc(
+        serde_json::json!({"sub": "u", "email": "bob@example.com", "email_verified": true}),
+        &[
+            ("alice@example.com", Role::Operator),
+            ("bob@example.com", Role::Operator),
+        ],
+    )
+    .await;
+    let (bob, csrf) = oidc_session(addr).await;
+    let (other, _) = oidc_session(addr).await;
+    let principal = hub.db.ui_sessions(crate::now_secs()).unwrap()[0].principal();
+    assert!(
+        principal.ends_with("(operator, bob@example.com)"),
+        "{principal}"
+    );
+    let answer = ask_users(
+        addr,
+        &bob,
+        &csrf,
+        &format!("_csrf={csrf}&op=change&email=bob@example.com&role=viewer"),
+    )
+    .await;
+    let reply = post_users(addr, &bob, &answer).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("Ended 2 web UI session(s) that held more than that."),
+        "{}",
+        reply.body
+    );
+    audited(
+        &hub,
+        "granted bob@example.com the viewer role, replacing operator",
+    )
+    .await;
+    let events = hub.db.audits(None, 20).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|r| r.actor.ends_with("(operator, bob@example.com)")
+                && r.event.contains("granted bob@example.com the viewer role")),
+        "{events:?}"
+    );
+    for cookie in [&bob, &other] {
+        assert_eq!(get(addr, "/", Some(cookie)).await.status, 401);
+    }
+    // Signing in again gets the lowered role.
+    let (again, _) = oidc_session(addr).await;
+    assert_eq!(get(addr, "/users", Some(&again)).await.status, 403);
+}
+
+/// Without `[oidc]`, `/users` lists the grants kept for when the hub has it, and says so; it
+/// changes none.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_oidc_the_users_page_only_lists_the_grants() {
+    let (addr, hub, origin) = start_fleet().await;
+    hub.db
+        .grant_account("alice@example.com", Role::Operator, "uid 0", 1)
+        .unwrap();
+    let (cookie, csrf) = sign_in(addr, &hub, Role::Operator).await;
+    let page = get(addr, "/users", Some(&cookie)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains("take effect once OIDC is configured")
+            && page.body.contains("<td>alice@example.com</td>")
+            && !page.body.contains("<form class=\"wide\"")
+            && !page.body.contains("value=\"revoke\""),
+        "{}",
+        page.body
+    );
+    let form = format!("_csrf={csrf}&op=grant&email=eve@example.com&role=viewer");
+    let reply = post_action(addr, &origin, &cookie, "/users", &form, true).await;
+    assert_eq!(reply.status, 409, "{}", reply.body);
+    assert!(reply.body.contains("[oidc]"), "{}", reply.body);
+    assert_eq!(grants(&hub).len(), 1);
 }
 
 /// A fleet hub keeping releases in a scratch directory and fetching them from `api`, if

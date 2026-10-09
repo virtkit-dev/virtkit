@@ -26,12 +26,10 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::ops::{self, NodeView};
+use crate::ops::{self, AccountOutcome, NodeView};
 use crate::rollout::{Rollout, RolloutAction};
 use crate::server::Hub;
-use crate::store::{
-    AccountChange, AccountRow, AuditRow, JobRow, KeyPolicy, KeyRow, Release, Role, UiSession,
-};
+use crate::store::{AccountRow, AuditRow, JobRow, KeyPolicy, KeyRow, Release, Role, UiSession};
 use vk_hub_proto::{Acquisition, Command, DesiredState, Operation};
 
 /// Bumped only for a change an older peer could misread.
@@ -217,16 +215,6 @@ pub struct Accounts {
 pub struct CreatedKey {
     pub key: String,
     pub row: KeyRow,
-}
-
-/// The result of granting or revoking a role.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct AccountOutcome {
-    /// The address, normalized, or `*`.
-    pub email: String,
-    pub change: AccountChange,
-    /// Whether the running hub has `[oidc]`.
-    pub oidc: bool,
 }
 
 /// Bind the admin socket at `path`, replacing one a hub that is gone left behind.
@@ -477,10 +465,10 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
             default_role: hub.db.oidc_default_role(),
         })?,
         Call::GrantAccount { email, role } => {
-            serde_json::to_value(set_account(hub, &actor, &email, Some(role))?)?
+            serde_json::to_value(ops::set_account(hub, &actor, &email, Some(role), false)?)?
         }
         Call::RevokeAccount { email } => {
-            serde_json::to_value(set_account(hub, &actor, &email, None)?)?
+            serde_json::to_value(ops::set_account(hub, &actor, &email, None, false)?)?
         }
         Call::SetPools { id, pools } => {
             let changed = hub.db.set_pools(&id, &pools, &actor, crate::now_secs())?;
@@ -528,36 +516,6 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
         }
     };
     Ok(value)
-}
-
-/// Grant `email` `role`, or revoke its grant with `None`, as `actor`.
-fn set_account(hub: &Hub, actor: &str, email: &str, role: Option<Role>) -> Result<AccountOutcome> {
-    let email = crate::store::account_key(email)
-        .ok_or_else(|| anyhow!("{email:?} is neither an email address nor *"))?;
-    let now = crate::now_secs();
-    let change = match role {
-        Some(role) => hub.db.grant_account(&email, role, actor, now)?,
-        None => hub.db.revoke_account(&email, actor, now)?,
-    };
-    if change.previous != role {
-        let what = match role {
-            Some(role) => format!("granted {email} the {} role", role.name()),
-            None => format!("revoked {email}'s grant"),
-        };
-        eprintln!(
-            "vk-hub: admin: {actor} {what}, ending {} web UI session(s)",
-            change.ended
-        );
-    }
-    if change.ended > 0 {
-        // Their pages' live updates end on it.
-        hub.sessions_changed();
-    }
-    Ok(AccountOutcome {
-        email,
-        change,
-        oidc: hub.oidc,
-    })
 }
 
 /// The latest `limit` audit lines, of `node` or of all, oldest first: as many of them as fit

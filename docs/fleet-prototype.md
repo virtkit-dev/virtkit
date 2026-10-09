@@ -926,8 +926,9 @@ Viewers see where the node stands and no actions. Operators also issue enrollmen
 the nodes page, like `vk-hub token create`, valid for an hour, ten minutes, a day or seven
 days. A plain POST to `/tokens` uses the same origin, CSRF and role checks and returns a page
 showing the token once. Issuance is audited as the session's principal; the token is never
-logged. Removing a node stays on the admin socket. A page is refused to a request whose
-`Sec-Fetch-Site` is `same-site` or `cross-site`.
+logged. Removing a node stays on the admin socket. Operators grant who signs in through the
+OIDC provider, and as what, from `/users` (see [Signing in](#signing-in)). A page is refused
+to a request whose `Sec-Fetch-Site` is `same-site` or `cross-site`.
 
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a
@@ -1055,7 +1056,7 @@ empty, with a warning if others can read it. `[oidc]` needs `ui_addr` and a `ui_
 `vk-hub serve` prints it as it starts.
 
 An unknown key in the table is an error. Manage sign-in grants and roles over the admin
-socket; the hub stores them in its database:
+socket or from the web UI's Users page (below); the hub stores them in its database:
 
 ```
 vk-hub accounts grant alice@example.com --role operator
@@ -1086,6 +1087,21 @@ keeps them for later use. At startup, `vk-hub serve` reports a default role that
 sign-ins without a matching grant. It warns when `[oidc]` is set but neither grants nor a
 default role allow anyone to sign in. Grants name addresses, not a provider: after changing
 `issuer`, review `vk-hub accounts` and end the old sessions with `vk-hub ui logout --all`.
+
+The Users page (`/users`) appears only in operators' navigation; viewers receive 403.
+It lists each grant's role, author and date, showing `*` as
+`Everyone signed in through <issuer host>`. It also shows the access other users get:
+viewer through `*` or `default_role`, or refused. Operators grant, change and revoke roles
+by posting to `/users`, with the steering actions' origin, CSRF and role checks. The page
+uses the admin socket's operations, including address validation, audit and session
+termination, as the session's principal instead of `uid <n>`.
+Lowering or revoking a grant is asked again first,
+as a reset is, and the answer counts only while the grant is still as it was.
+The page refuses to demote or revoke the last operator grant, including the operator's own,
+with a check in the same transaction as the change. Otherwise, no operator could sign in through
+the provider. `vk-hub accounts` can still remove it;
+`vk-hub ui login --role operator` prints a recovery sign-in link. Without `[oidc]`, the page
+only lists grants and explains that they take effect once OIDC is configured.
 
 The address is the provider's `email` claim from UserInfo, if it is an address and not marked
 unverified (`email_verified` false); a provider that says nothing of verification is taken at
@@ -1136,7 +1152,8 @@ Every state-changing request is a `POST` from the UI's own origin — its `Origi
 is done as the session's principal, `ui session <id> (<role>)`, or `ui session <id> (<role>,
 <identity>)` for one opened through OIDC, which is what the audit log records. On a fleet hub
 they are signing out, a node's steering actions, a rollout's pause, resume and abort,
-uploading and fetching a release, and starting a rollout. Issuing a link, signing in and out,
+uploading and fetching a release, starting a rollout, and granting, changing and revoking a
+role on `/users`. Issuing a link, signing in and out,
 a refused OIDC sign-in, granting and revoking roles, and ending sessions are audited too.
 
 ## Local mode

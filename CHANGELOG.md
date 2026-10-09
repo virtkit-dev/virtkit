@@ -6,6 +6,11 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **Operators manage OIDC sign-in grants from `vk-hub`'s Users page.** It lists each grant,
+  who made it and when, and the access other users get. Operators grant, change and revoke
+  roles as with `vk-hub accounts`, with confirmation before lowering or revoking a grant.
+  The page refuses to demote or revoke the last operator grant;
+  `vk-hub ui login --role operator` remains the way back in.
 - **`[oidc] default_role = "viewer"` gives a read-only view to everyone the provider signs in.**
   Anyone no grant admits, `*` included, signs in to `vk-hub`'s web UI as a viewer instead of
   being refused. `"operator"` is refused. `vk-hub accounts` lists the default role, and

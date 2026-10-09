@@ -217,7 +217,7 @@ fn oidc_role_in(
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountRow {
     pub role: Role,
-    /// Who granted it: `uid <n>`.
+    /// Who granted it: `uid <n>` over the admin socket, or a web UI session's principal.
     pub granted_by: String,
     pub granted_at: u64,
 }
@@ -479,6 +479,18 @@ impl std::fmt::Display for MonitoringOnly {
 }
 
 impl std::error::Error for MonitoringOnly {}
+
+/// A grant change refused: it would take the operator role from the last address granted it.
+#[derive(Debug)]
+pub struct LastOperator;
+
+impl std::fmt::Display for LastOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("it would leave no address granted the operator role")
+    }
+}
+
+impl std::error::Error for LastOperator {}
 
 /// Refuse to steer node `id` whose latest session ran below [`STEERING`]. A node that has not
 /// connected yet is taken at its word: what it is sent waits for a session that can carry it.
@@ -1841,10 +1853,8 @@ impl Db {
         Ok(out)
     }
 
-    /// Grant `role` to `email` — an address, or [`ANYONE`], as [`account_key`] takes them —
-    /// replacing the role it had, audited as `actor`'s. [`ANYONE`] may only be a viewer.
-    /// Sessions the grant covers that hold more than a sign-in now gets end with it, so a
-    /// lowered role takes effect at once.
+    /// [`Self::change_account`] granting `role`.
+    #[cfg(test)]
     pub fn grant_account(
         &self,
         email: &str,
@@ -1852,27 +1862,34 @@ impl Db {
         actor: &str,
         now: u64,
     ) -> Result<AccountChange> {
-        if email == ANYONE && role != Role::Viewer {
+        self.change_account(email, Some(role), false, actor, now)
+    }
+
+    /// [`Self::change_account`] revoking.
+    #[cfg(test)]
+    pub fn revoke_account(&self, email: &str, actor: &str, now: u64) -> Result<AccountChange> {
+        self.change_account(email, None, false, actor, now)
+    }
+
+    /// Grant `role` to `email` — an address, or [`ANYONE`], as [`account_key`] takes them —
+    /// replacing the role it had, or remove its grant with `None`, audited as `actor`'s.
+    /// [`ANYONE`] may only be a viewer. Sessions the grant covered that hold more than a
+    /// sign-in now gets end with it, so a lowered role takes effect at once. With
+    /// `keep_an_operator`, a change that would take the operator role from the last address
+    /// granted it is refused with [`LastOperator`], in the same transaction.
+    pub fn change_account(
+        &self,
+        email: &str,
+        role: Option<Role>,
+        keep_an_operator: bool,
+        actor: &str,
+        now: u64,
+    ) -> Result<AccountChange> {
+        if email == ANYONE && role.is_some_and(|r| r != Role::Viewer) {
             bail!(
                 "{ANYONE} may only be granted the viewer role: it admits anyone the provider signs in"
             );
         }
-        self.set_account(email, Some(role), actor, now)
-    }
-
-    /// Remove `email`'s grant, audited as `actor`'s, ending the sessions it covered that hold
-    /// more than a sign-in now gets.
-    pub fn revoke_account(&self, email: &str, actor: &str, now: u64) -> Result<AccountChange> {
-        self.set_account(email, None, actor, now)
-    }
-
-    fn set_account(
-        &self,
-        email: &str,
-        role: Option<Role>,
-        actor: &str,
-        now: u64,
-    ) -> Result<AccountChange> {
         let email = email.to_ascii_lowercase();
         let email = email.as_str();
         let txn = self.db.begin_write().context("starting a write")?;
@@ -1901,6 +1918,13 @@ impl Db {
             }
             (previous, grants_in(&table)?)
         };
+        // Dropping the transaction leaves the grant as it was.
+        if keep_an_operator
+            && previous == Some(Role::Operator)
+            && !grants.values().any(|&r| r == Role::Operator)
+        {
+            return Err(LastOperator.into());
+        }
         let event = match (previous, role) {
             (None, Some(r)) => format!("{actor} granted {email} the {} role", r.name()),
             (Some(p), Some(r)) => format!(
@@ -3949,6 +3973,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.identity, None);
+    }
+
+    /// Asked to keep an operator, a change never takes the role from the last address granted
+    /// it, and a refused one changes and audits nothing.
+    #[test]
+    fn the_last_operator_grant_is_kept_when_asked() {
+        let db = Db::open_memory().unwrap();
+        let change = |email: &str, role| db.change_account(email, role, true, "uid 0", 10);
+        change("a@example.com", Some(Role::Operator)).unwrap();
+        change("b@example.com", Some(Role::Viewer)).unwrap();
+        let refused = |r: Result<AccountChange>| r.unwrap_err().is::<LastOperator>();
+        assert!(refused(change("a@example.com", Some(Role::Viewer))));
+        assert!(refused(change("a@example.com", None)));
+        assert_eq!(
+            db.oidc_role(Some("a@example.com")).unwrap(),
+            Some(Role::Operator)
+        );
+        // Nothing is audited for a refused change.
+        assert_eq!(db.audits(None, 10).unwrap().len(), 2);
+        // A viewer's grant goes whatever is left; another operator lets the first go.
+        change("b@example.com", None).unwrap();
+        change("c@example.com", Some(Role::Operator)).unwrap();
+        change("a@example.com", None).unwrap();
+        assert!(refused(change("C@example.com", Some(Role::Viewer))));
+        // Not asked, the last goes as the admin socket lets it.
+        db.revoke_account("c@example.com", "uid 0", 11).unwrap();
+        assert!(db.accounts().unwrap().is_empty());
     }
 
     /// A grant is kept by address and audited with who made it; granting the same role again

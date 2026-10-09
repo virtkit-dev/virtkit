@@ -1364,7 +1364,7 @@ fn render_jobs(jobs: &[(String, store::JobRow)], now: u64) -> String {
 }
 
 /// Say how many sessions a grant or revoke ended.
-fn report_ended(out: &admin::AccountOutcome) {
+fn report_ended(out: &ops::AccountOutcome) {
     if out.change.ended > 0 {
         eprintln!(
             "vk-hub: ended {} web UI session(s) that held more than a sign-in now gets",
