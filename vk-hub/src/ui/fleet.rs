@@ -153,13 +153,15 @@ pub(super) fn source(
     })
 }
 
-/// The page for `path`, if it is one of the fleet's: read-only, for any session.
+/// The page for `path`, if it is one of the fleet's: read-only, for any session. `swap` as
+/// for [`super::jobs::get`].
 pub(super) async fn get(
     path: &str,
     query: Option<&str>,
     auth: &Auth,
     ui: &Ui,
     site: &FleetSite,
+    swap: bool,
 ) -> Result<Option<Response<Body>>> {
     let hub = ui.hub.clone();
     let now = crate::now_secs();
@@ -206,7 +208,7 @@ pub(super) async fn get(
         return super::users::get(auth, ui).await.map(Some);
     }
     if path == super::jobs::PATH {
-        return super::jobs::get(query, auth, &site.jobs, ui)
+        return super::jobs::get(query, auth, &site.jobs, ui, swap)
             .await
             .map(Some);
     }

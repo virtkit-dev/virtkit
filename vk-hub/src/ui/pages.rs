@@ -81,8 +81,10 @@ fn current(nav: Nav, here: &str) -> &'static str {
 /// htmx's configuration: nothing evaluated, no script run from a swapped fragment, no
 /// inline style of its own (the policy would refuse it), requests to this origin only — and
 /// a refusal (4xx, 5xx) swapped rather than dropped, so the line saying why shows, without
-/// logging it as an error.
-const HTMX_CONFIG: &str = r#"{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"selfRequestsOnly":true,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"4..","swap":true,"error":false},{"code":"5..","swap":true,"error":false},{"code":"...","swap":false,"error":true}]}"#;
+/// logging it as an error. Disable the history cache in session storage so Back reloads
+/// the URL set by the Jobs filter, restoring its form and live fragment rather than a
+/// cached page with the form's initial values.
+const HTMX_CONFIG: &str = r#"{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"selfRequestsOnly":true,"historyCacheSize":0,"refreshOnHistoryMiss":true,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"4..","swap":true,"error":false},{"code":"5..","swap":true,"error":false},{"code":"...","swap":false,"error":true}]}"#;
 
 /// Open the page through its head. `data-now` gives `time.js` the hub's page-generation
 /// time so ages use the hub's clock.

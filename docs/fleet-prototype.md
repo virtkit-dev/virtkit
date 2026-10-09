@@ -1170,7 +1170,13 @@ so its cost grows with `job_history`. The summary covers the newest 10,000 match
 the share of finished jobs that succeeded (without a result filter), and the median run time of
 finished jobs. The newest page of each filter updates live (below). Older pages stay as loaded, say
 so and link back to the newest. The filter form stays outside the live fragment so updates preserve
-selections in progress. Each node's page links to its jobs.
+selections in progress. Selections apply immediately; typing applies after a 300 ms pause. Each
+request replaces any pending request. htmx fetches the filtered page and replaces the jobs,
+including the live fragment, closing the old stream and opening the new one. The URL follows the
+filter for bookmarking or sharing. Each applied filter adds a history entry; Back and Forward
+reload that URL because htmx's history cache is disabled. *Show* or Enter applies the filter
+immediately and loads the page without JavaScript. Refused or failed requests, including expired
+sessions, trigger a full page load. Each node's page links to its jobs.
 
 `/jobs/<id>` shows viewers and operators the job's result, failure class, exit code, node
 message, GitLab page when the spec names a plain web URL, project, node, pool, key,
@@ -1231,7 +1237,8 @@ a value the page would ignore — or an unknown or repeated field, or `before` �
 streams of one filter share a rendering, renewed once a job has changed or it is half a
 heartbeat old, and a page loaded meanwhile starts from it: however many pages follow a filter,
 the history is read for it at most once per change and twice a heartbeat. A rendering is kept
-only while a stream has asked for it within two heartbeats.
+only while a stream, or the filter form's request for its page, has asked for it within two
+heartbeats; a plain page load keeps none.
 How long a running job has run moves in steps of a heartbeat, as ages do. The filter form's
 nodes and projects are those of when the page was loaded: a new one is offered on reload. A
 fragment is rendered at most once a second, and every heartbeat interval regardless — a node

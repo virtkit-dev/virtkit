@@ -22,7 +22,8 @@ All notable changes to virtkit will be documented in this file.
 - **`vk-hub`'s Jobs page filters by job name, branch and pipeline.** The name and branch
   match any part, ignoring the case of ASCII letters; each row shows its branch and pipeline,
   the pipeline linked to GitLab, and clicking a job's name, branch or pipeline narrows the page
-  to it.
+  to it. Filters apply as you change them, and the address bar follows them, so a filtered view
+  can be bookmarked or shared and the back button returns to the one before.
 - **`vk-hub` holds CI tools definitions and has nodes build them.** `vk-hub tools add <dir>
   --version <label>` takes a build context — a Dockerfile whose `tools` stage holds static `git` and
   any other tools, such as `git-lfs` — packed so that the same tree is the same definition; `vk-hub

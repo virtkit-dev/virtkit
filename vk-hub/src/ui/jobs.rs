@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
+use hyper::header::{HeaderMap, HeaderValue};
 use hyper::{Response, StatusCode};
 use vk_hub_proto::client::JobState;
 
@@ -47,12 +48,14 @@ const MAX_TEXT: usize = 1024;
 const FIELDS: [&str; 6] = ["node", "project", "result", "name", "ref", "pipeline"];
 
 /// `GET /jobs[?node=…&project=…&result=…&name=…&ref=…&pipeline=…&before=…]`. A filter value
-/// that cannot be one is ignored, as the audit log ignores a node that is not an ID.
+/// that cannot be one is ignored, as the audit log ignores a node that is not an ID. `swap`:
+/// the filter's form asks for it ([`filter_swap`]).
 pub(super) async fn get(
     query: Option<&str>,
     auth: &Auth,
     renders: &Arc<Renders>,
     ui: &Ui,
+    swap: bool,
 ) -> Result<Response<Body>> {
     let query = decode_form(query.unwrap_or("").as_bytes());
     let mut filter = JobFilter::default();
@@ -67,7 +70,8 @@ pub(super) async fn get(
     let main = match before {
         None => {
             let renders = renders.clone();
-            let newest = blocking(move || renders.page(&hub, &wanted, Instant::now())).await?;
+            let newest =
+                blocking(move || renders.page(&hub, &wanted, Instant::now(), swap)).await?;
             let Newest {
                 fragment,
                 projects,
@@ -167,9 +171,10 @@ pub(super) fn source(hub: &Arc<Hub>, renders: &Arc<Renders>, filter: JobFilter) 
 /// The newest page per followed filter, shared by its streams and newly loaded pages.
 #[derive(Default)]
 pub(super) struct Renders {
-    /// By filter: when a stream last asked for it, and its rendering. An entry no stream has
-    /// asked for in two heartbeats is dropped — every stream asks once a heartbeat — so only
-    /// the filters of open streams, and of streams closed within two heartbeats, are kept.
+    /// Renderings and last-request times by filter. Streams and filter form requests add
+    /// entries; plain page loads do not. Entries expire after two heartbeats without a
+    /// request. Streams request each heartbeat, keeping open streams' filters and those
+    /// requested by a stream or form within two heartbeats.
     by_filter: Mutex<HashMap<JobFilter, (Instant, Latest)>>,
 }
 
@@ -218,8 +223,12 @@ impl Renders {
 
     /// `filter`'s newest page for a page loaded at `now`: a stream's rendering, renewed if it
     /// no longer stands, so the stream's first update is never older; with no stream following
-    /// the filter, one read for the page alone, kept for no one.
-    fn page(&self, hub: &Hub, filter: &JobFilter, now: Instant) -> Result<Arc<Newest>> {
+    /// the filter, one read for the page alone, kept for no one. For the filter's form
+    /// (`swap`), whose page's stream opens at once, the rendering is kept for that stream.
+    fn page(&self, hub: &Hub, filter: &JobFilter, now: Instant, swap: bool) -> Result<Arc<Newest>> {
+        if swap {
+            return self.render(hub, filter, now);
+        }
         let entry = lock(&self.by_filter).get(filter).map(|(_, e)| e.clone());
         match entry {
             Some(entry) => renew(&entry, hub, filter, now),
@@ -282,19 +291,47 @@ fn history(
     h.raw("<h1>Jobs</h1>");
     // Outside the live fragment, so an update never resets a choice being made.
     filter_form(&mut h, filter, projects, names);
+    // Replace this part with the new filter's results, including the live fragment,
+    // so the old stream closes and the new one opens.
+    h.raw("<div id=\"").raw(RESULTS).raw("\">");
     if paged {
         h.raw("<p class=\"sub\">Older jobs, as they stood when this page was loaded; <a href=\"");
         href(&mut h, filter, None);
         h.raw("\">the newest</a> are kept up to date.</p>")
             .html(shown);
-        return h;
+    } else {
+        h.raw("<div id=\"jobs\" hx-ext=\"sse\" sse-connect=\"/events/jobs");
+        query(&mut h, filter, None);
+        h.raw("\" sse-swap=\"jobs\" sse-close=\"close\">")
+            .html(shown)
+            .raw("</div>");
     }
-    h.raw("<div id=\"jobs\" hx-ext=\"sse\" sse-connect=\"/events/jobs");
-    query(&mut h, filter, None);
-    h.raw("\" sse-swap=\"jobs\" sse-close=\"close\">")
-        .html(shown)
-        .raw("</div>");
+    h.raw("</div>");
     h
+}
+
+/// The ID of the part of the page the filter's form replaces.
+const RESULTS: &str = "jobs-results";
+
+/// Whether `headers` are those of the filter's form asking htmx for the part it replaces: a
+/// stream of the new filter follows at once.
+pub(super) fn filter_swap(headers: &HeaderMap) -> bool {
+    headers.contains_key("hx-request")
+        && headers
+            .get("hx-target")
+            .is_some_and(|t| t.as_bytes() == RESULTS.as_bytes())
+}
+
+/// Redirect a refused or failed filter request to a full load of the `/jobs` URI.
+/// Swapping in a page without the results container would remove both the jobs and the
+/// target for later filter requests.
+pub(super) fn reload(uri: &str, refused: Response<Body>) -> Response<Body> {
+    let Ok(to) = HeaderValue::from_str(uri) else {
+        return refused;
+    };
+    let mut resp = Response::new(Body::default());
+    resp.headers_mut().insert("hx-redirect", to);
+    resp
 }
 
 /// The jobs: the summary, the table and the link to older jobs. `paged` as for [`history`].
@@ -316,11 +353,11 @@ fn fragment(
             "<p class=\"empty\">none placed yet: a producer such as vk-gitlab places jobs with \
              a key from <code>vk-hub keys create</code></p>"
         } else {
-            "<p class=\"empty\">none match</p>"
+            "<p class=\"empty\" role=\"status\">none match</p>"
         });
         return h;
     }
-    h.raw("<p class=\"sub\">");
+    h.raw("<p class=\"sub\" role=\"status\">");
     if s.capped {
         h.raw("the latest ")
             .text(thousands(SUMMARY_JOBS))
@@ -381,12 +418,26 @@ fn job_table(
     h.raw("</tbody></table></section>");
 }
 
-/// Node, project and result filters. Keep the selected node or project as an option even
-/// if the node was removed or the project is outside the scanned history.
+/// The filter's form. Keep the selected node or project as an option even if the node was
+/// removed or the project is outside the scanned history.
+///
+/// With htmx, selections apply immediately and typing after a 300 ms pause. Each request
+/// replaces any pending request, fetches the filtered page, swaps in its jobs and updates
+/// the URL for Back and bookmarking. History caching is disabled ([`super::pages`]), so
+/// Back reloads the page. The button or Enter applies immediately; without htmx, the form
+/// loads the page.
 fn filter_form(h: &mut Html, filter: &JobFilter, projects: &[String], names: &[(String, String)]) {
-    h.raw("<form class=\"filter\" method=\"get\" action=\"")
+    h.raw("<form id=\"jobs-filter\" class=\"filter\" method=\"get\" action=\"")
         .raw(PATH)
-        .raw("\"><select name=\"node\" aria-label=\"node\">")
+        .raw("\" hx-get=\"")
+        .raw(PATH)
+        .raw("\" hx-trigger=\"submit, change from:(#jobs-filter select), ")
+        .raw("input changed delay:300ms from:(#jobs-filter input)\" hx-target=\"#")
+        .raw(RESULTS)
+        .raw("\" hx-select=\"#")
+        .raw(RESULTS)
+        .raw("\" hx-swap=\"outerHTML\" hx-push-url=\"true\" hx-sync=\"this:replace\">")
+        .raw("<select name=\"node\" aria-label=\"Node\">")
         .raw("<option value=\"\">Every node</option>");
     if let Some(node) = &filter.node
         && !names.iter().any(|(id, _)| id == node)
@@ -413,7 +464,7 @@ fn filter_form(h: &mut Html, filter: &JobFilter, projects: &[String], names: &[(
             .text(id.get(..8).unwrap_or(id))
             .raw(")</option>");
     }
-    h.raw("</select><select name=\"project\" aria-label=\"project\">")
+    h.raw("</select><select name=\"project\" aria-label=\"Project\">")
         .raw("<option value=\"\">Every project</option>");
     if let Some(project) = &filter.project
         && !projects.contains(project)
@@ -431,7 +482,7 @@ fn filter_form(h: &mut Html, filter: &JobFilter, projects: &[String], names: &[(
         }
         h.raw(">").node(project).raw("</option>");
     }
-    h.raw("</select><select name=\"result\" aria-label=\"result\">")
+    h.raw("</select><select name=\"result\" aria-label=\"Result\">")
         .raw("<option value=\"\">Every result</option>");
     for outcome in JobOutcome::ALL {
         h.raw("<option value=\"").raw(outcome.name()).raw("\"");
@@ -454,6 +505,8 @@ fn filter_form(h: &mut Html, filter: &JobFilter, projects: &[String], names: &[(
             .raw(label)
             .raw("\" value=\"")
             .text(value.unwrap_or(""))
+            .raw("\" maxlength=\"")
+            .text(vk_hub_proto::MAX_DISPLAY)
             .raw("\">");
     }
     h.raw("<input type=\"number\" name=\"pipeline\" min=\"1\" placeholder=\"Pipeline\" ")
@@ -955,21 +1008,32 @@ mod tests {
     }
 
     /// A page starts from the rendering of a stream following its filter, and with none keeps
-    /// nothing.
+    /// nothing unless the filter's form asked for it.
     #[test]
     fn a_page_reuses_a_stream_s_rendering_and_keeps_none() {
         let hub = Hub::new(Arc::new(crate::store::Db::open_memory().unwrap()), None);
         let renders = Renders::default();
         let t = Instant::now();
         let all = JobFilter::default();
-        renders.page(&hub, &all, t).unwrap();
+        renders.page(&hub, &all, t, false).unwrap();
         assert_eq!(renders.filters(), 0);
         let streamed = renders.render(&hub, &all, t).unwrap();
         assert!(Arc::ptr_eq(
-            &renders.page(&hub, &all, t).unwrap(),
+            &renders.page(&hub, &all, t, false).unwrap(),
             &streamed
         ));
         assert_eq!(renders.filters(), 1);
+        // The filter's form keeps its page's rendering for the stream that follows it.
+        let failed = JobFilter {
+            outcome: Some(JobOutcome::Failed),
+            ..JobFilter::default()
+        };
+        let swapped = renders.page(&hub, &failed, t, true).unwrap();
+        assert_eq!(renders.filters(), 2);
+        assert!(Arc::ptr_eq(
+            &renders.render(&hub, &failed, t).unwrap(),
+            &swapped
+        ));
     }
 
     /// A stream asks a heartbeat after its last ask, slightly under a heartbeat after the

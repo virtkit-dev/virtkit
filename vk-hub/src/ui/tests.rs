@@ -3541,7 +3541,11 @@ async fn the_job_history_is_shown_filtered_and_paged() {
     assert_eq!(rows(&page), 2, "{page}");
     assert!(page.contains(">build-104<") && page.contains(">build-102<"));
     assert!(
-        page.contains("name=\"ref\" placeholder=\"Branch\" aria-label=\"Branch\" value=\"MAIN\"")
+        page.contains(
+            "name=\"ref\" placeholder=\"Branch\" aria-label=\"Branch\" value=\"MAIN\" \
+             maxlength=\"256\""
+        ),
+        "{page}"
     );
     let page = get(addr, "/jobs?pipeline=77&name=%20Build-10", Some(&viewer))
         .await
@@ -3726,6 +3730,39 @@ async fn a_failed_job_s_page_shows_the_end_of_its_output() {
     assert!(!reply.body.contains("alert"), "{}", reply.body);
 }
 
+/// An expired session makes a filter request load the full page rather than swap in a
+/// page without the results container.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_jobs_filter_loads_the_whole_page_when_refused() {
+    let (addr, hub, _) = start_fleet().await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let path = "/jobs?result=failed";
+    let cookie = format!("Cookie: {viewer}");
+    let swap = [
+        cookie.as_str(),
+        "HX-Request: true",
+        "HX-Target: jobs-results",
+    ];
+    let reply = request(addr, "GET", path, &swap, "").await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.header("hx-redirect"), None);
+    assert!(
+        reply.body.contains("<div id=\"jobs-results\">"),
+        "{}",
+        reply.body
+    );
+    hub.db
+        .end_ui_sessions(None, "uid 0", crate::now_secs())
+        .unwrap();
+    let reply = request(addr, "GET", path, &swap, "").await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    assert_eq!(reply.header("hx-redirect"), Some(path));
+    // Any other request is refused as before.
+    let reply = request(addr, "GET", path, &swap[..2], "").await;
+    assert_eq!(reply.status, 401, "{}", reply.body);
+    assert_eq!(reply.header("hx-redirect"), None);
+}
+
 /// `/jobs`' newest page follows the jobs as they change, filtered as the page is; an older
 /// page stays as loaded, and a stream with a filter the page would not take is refused.
 #[tokio::test(flavor = "multi_thread")]
@@ -3744,9 +3781,32 @@ async fn the_newest_jobs_are_kept_live_in_their_filter() {
         ),
         "{page}"
     );
-    // The filter's form is outside the live fragment.
+    // The form stays outside the live fragment. With htmx, changes replace the filtered
+    // results and live fragment and update the URL. The button or Enter applies immediately
+    // and loads the page without htmx.
+    let form = page
+        .split("<form id=\"jobs-filter\" class=\"filter\"")
+        .nth(1)
+        .and_then(|rest| rest.split("</form>").next())
+        .expect("the filter's form");
+    for want in [
+        " method=\"get\" action=\"/jobs\" hx-get=\"/jobs\"",
+        " hx-trigger=\"submit, change from:(#jobs-filter select), \
+         input changed delay:300ms from:(#jobs-filter input)\"",
+        " hx-target=\"#jobs-results\" hx-select=\"#jobs-results\" hx-swap=\"outerHTML\"",
+        " hx-push-url=\"true\" hx-sync=\"this:replace\"",
+        "\"> <button>Show</button>",
+    ] {
+        assert!(form.contains(want), "{want}: {form}");
+    }
+    assert_eq!(form.matches("<button").count(), 1, "{form}");
     assert!(
-        page.find("<form class=\"filter\"") < page.find("<div id=\"jobs\""),
+        page.contains("</form><div id=\"jobs-results\"><div id=\"jobs\" hx-ext=\"sse\""),
+        "{page}"
+    );
+    // Going back loads the page its URL names, rather than a copy whose form is stale.
+    assert!(
+        page.contains("\"historyCacheSize\":0,\"refreshOnHistoryMiss\":true"),
         "{page}"
     );
     let page = get(
@@ -3766,7 +3826,10 @@ async fn the_newest_jobs_are_kept_live_in_their_filter() {
         .body;
     assert!(!page.contains("sse-connect"), "{page}");
     assert!(
-        page.contains("when this page was loaded; <a href=\"/jobs?result=failed\">the newest</a>"),
+        page.contains(
+            "<div id=\"jobs-results\"><p class=\"sub\">Older jobs, as they stood when this page \
+             was loaded; <a href=\"/jobs?result=failed\">the newest</a>"
+        ),
         "{page}"
     );
     for bad in [
@@ -3789,7 +3852,7 @@ async fn the_newest_jobs_are_kept_live_in_their_filter() {
     let first = failed.next().await.unwrap();
     assert_eq!(
         first,
-        "event: jobs\ndata: <p class=\"empty\">none match</p>\n\n"
+        "event: jobs\ndata: <p class=\"empty\" role=\"status\">none match</p>\n\n"
     );
 
     // A job submitted after the page opened.
@@ -3804,7 +3867,7 @@ async fn the_newest_jobs_are_kept_live_in_their_filter() {
     submit(1, &history_job(1, "acme/web"));
     let next = next_with(&mut all, "build-1").await;
     assert!(
-        next.starts_with("event: jobs\ndata: <p class=\"sub\">1 job</p>"),
+        next.starts_with("event: jobs\ndata: <p class=\"sub\" role=\"status\">1 job</p>"),
         "{next}"
     );
     assert!(

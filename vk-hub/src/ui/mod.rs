@@ -260,6 +260,12 @@ async fn handle(
     ui: Arc<Ui>,
     peer: SocketAddr,
 ) -> Result<Response<Body>, Infallible> {
+    // The Jobs page's filter form, which needs the whole page when it gets no jobs.
+    let reload = (req.method() == Method::GET
+        && req.uri().path() == jobs::PATH
+        && jobs::filter_swap(req.headers()))
+    .then(|| req.uri().path_and_query().map(|p| p.as_str().to_string()))
+    .flatten();
     let mut resp = route(req, &ui).await.unwrap_or_else(|e| {
         eprintln!("vk-hub: ui: {peer}: {e:#}");
         message(
@@ -267,6 +273,11 @@ async fn handle(
             "Something failed on the hub; its log says what.",
         )
     });
+    if let Some(uri) = reload
+        && !resp.status().is_success()
+    {
+        resp = jobs::reload(&uri, resp);
+    }
     secure_headers(resp.headers_mut(), ui.secure);
     Ok(resp)
 }
@@ -347,7 +358,8 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
                         .unwrap_or_else(|| ui.signed_out_page(StatusCode::UNAUTHORIZED, why)));
                 }
             };
-            get(&path, req.uri().query(), &auth, ui).await
+            let swap = jobs::filter_swap(req.headers());
+            get(&path, req.uri().query(), &auth, ui, swap).await
         }
         (Method::POST, _) => match &ui.site {
             Site::Fleet(site) => {
@@ -438,7 +450,14 @@ fn from_another_site(headers: &HeaderMap) -> bool {
 }
 
 /// A page: read-only, for any session.
-async fn get(path: &str, query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
+/// `swap`: the Jobs page's filter form asks ([`jobs::filter_swap`]).
+async fn get(
+    path: &str,
+    query: Option<&str>,
+    auth: &Auth,
+    ui: &Ui,
+    swap: bool,
+) -> Result<Response<Body>> {
     if let Some(source) = path
         .strip_prefix("/events/")
         .and_then(|e| source(e, query, ui, auth))
@@ -446,7 +465,7 @@ async fn get(path: &str, query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Re
         return Ok(stream(ui, auth, source));
     }
     let found = match &ui.site {
-        Site::Fleet(site) => fleet::get(path, query, auth, ui, site).await?,
+        Site::Fleet(site) => fleet::get(path, query, auth, ui, site, swap).await?,
         Site::Local(site) => local::get(path, query, auth, ui, site).await?,
     };
     Ok(found.unwrap_or_else(|| message(StatusCode::NOT_FOUND, "There is no such page.")))
