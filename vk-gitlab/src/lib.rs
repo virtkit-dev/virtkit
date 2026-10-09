@@ -14,5 +14,6 @@ pub mod job;
 pub mod logging;
 pub mod poll;
 pub mod secret;
+pub mod spec;
 pub mod system_id;
 pub mod trace;

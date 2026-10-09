@@ -357,8 +357,9 @@ other jobs share. A request to the cache's registry is bounded by `CACHE_REQUEST
 
 `JobSpec` is tagged by `kind`; `gitlab_ci` is the only kind. `vk-gitlab` translates
 GitLab's job response into a `CiJob`, normalizing what the node would otherwise interpret:
-defaults are filled in, cache keys are sanitized (`cache/cachekey`), aliases are split, empty
-formats become `zip`. What only concerns the conversation with GitLab stays with the daemon.
+defaults are filled in, cache keys are expanded and sanitized (`cache/cachekey`), aliases are
+split, empty formats become `zip`. What only concerns the conversation with GitLab stays with
+the daemon.
 
 Every field of the response, from gitlab-runner 19.5's `common/spec/spec.go`:
 
@@ -381,7 +382,7 @@ Every field of the response, from gitlab-runner 19.5's `common/spec/spec.go`:
 | `image.executor_opts.docker.platform`, `.docker.user`, `.kubernetes.user` | `image.platform`, `image.user` | `image_executor_opts` is not advertised; when GitLab sends them anyway, these are honoured |
 | `services[]` | `services` | as `image`; run as a compose group beside the job VM, on one node |
 | `artifacts[]` `name`, `untracked`, `paths`, `exclude`, `when`, `artifact_type`, `artifact_format`, `expire_in` | `artifacts` | |
-| `cache[]` `key`, `untracked`, `policy`, `paths`, `when`, `fallback_keys` | `caches` | |
+| `cache[]` `key`, `untracked`, `policy`, `paths`, `when`, `fallback_keys` | `caches` | keys expanded against the job's and the runner's variables, as gitlab-runner expands them; variables only the node sets (`CI_PROJECT_DIR`, `CI_CONCURRENT_ID`, …) expand to nothing |
 | `credentials[]` of type `registry` | `registry_credentials` | other types are ignored, as by gitlab-runner |
 | `dependencies[]` `id`, `token`, `name`, `artifacts_file` | `dependencies` | |
 | `features.trace_sections`, `.token_mask_prefixes` | `trace` | `trace.limit_bytes` is the runner's `output_limit`, 4 MiB by default |

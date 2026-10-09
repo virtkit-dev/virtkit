@@ -33,6 +33,8 @@ ring.workspace = true
 # RateLimit-ResetTime / Retry-After dates.
 httpdate.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "signal"] }
+# The hub's client API and the job spec it carries.
+vk-hub-proto = { path = "../vk-hub-proto" }
 
 [target.'cfg(target_env = "musl")'.dependencies]
 jemallocator.workspace = true
