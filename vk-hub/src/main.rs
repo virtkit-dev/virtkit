@@ -984,7 +984,40 @@ pub(crate) fn acquisition_name(a: Acquisition) -> &'static str {
     }
 }
 
+/// Best-effort raise of the soft `RLIMIT_NOFILE` to the hard limit, capped at 1M: the client
+/// connections alone may hold [`server::MAX_CLIENT_CONNS`] descriptors, past a service's
+/// usual soft limit of 1024, and a hub out of them stops accepting nodes too. Warns when the
+/// limit stays below what the connection caps add up to.
+fn raise_nofile() {
+    let need = server::MAX_CLIENT_CONNS + 2 * server::MAX_PRE_AUTH + server::MAX_DOWNLOADS;
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit read/write only the `rlimit` we pass.
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return;
+        }
+        let want = lim.rlim_max.min(1024 * 1024);
+        if lim.rlim_cur < want {
+            lim.rlim_cur = want;
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
+                return;
+            }
+        }
+    }
+    if lim.rlim_cur < need as libc::rlim_t {
+        eprintln!(
+            "vk-hub: warning: open file limit is {}, below the {need} connections the hub may \
+             hold; raise its hard limit (LimitNOFILE=)",
+            lim.rlim_cur
+        );
+    }
+}
+
 async fn serve(cfg: HubConfig) -> Result<()> {
+    raise_nofile();
     let listener = server::listen(cfg.addr).with_context(|| format!("binding {}", cfg.addr))?;
     let tls = cfg.build_tls()?;
     let ui = match &cfg.ui {

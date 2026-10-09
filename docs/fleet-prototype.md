@@ -761,7 +761,10 @@ labels under the table.
 `/v1/jobs`. The key is checked before the body is read. A body is at most 64 KiB, a job
 submission 576 KiB, its spec 512 KiB (413 `too_large`), and has 30 seconds to arrive. A
 connection counts among the 256 unauthenticated ones until a key checks; then it counts among
-64 client connections, past which a request is answered 503 `unavailable`. A client connection
+1024 client connections shared by every key, past which a request is answered 503
+`unavailable`. A running job keeps two of them, its view's long poll and its output's. The hub
+raises its soft descriptor limit to the hard limit, at most 1M, at startup to hold them, and
+warns when that stays below what its connection caps add up to. A client connection
 closes when idle for 10 seconds between requests, and after 10 minutes finishes the request it
 serves, within 2 more, then closes. Long polls hold at most 60 seconds. A `request_id` makes a
 create idempotent for a day, kept in the database: for a reservation, the grant only, so a

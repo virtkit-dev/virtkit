@@ -1926,6 +1926,28 @@ async fn submissions_past_the_live_jobs_cap_are_told_to_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn client_connections_past_the_cap_are_told_to_retry() {
+    let dir = scratch("client-cap");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let ask = || Some(json!({"placement": placement()}));
+    let all = u32::try_from(server::MAX_CLIENT_CONNS).unwrap();
+    let held = hub.clients.clone().try_acquire_many_owned(all).unwrap();
+    let resp = api(addr, "POST", "/v1/capacity", Some(&key), ask()).await;
+    assert_eq!((resp.status, resp.code()), (503, ErrorCode::Unavailable));
+    assert_eq!(
+        resp.json::<vk_hub_proto::client::ClientError>()
+            .retry_after_secs,
+        Some(1)
+    );
+    // Room again once the connections holding it close.
+    drop(held);
+    let resp = api(addr, "POST", "/v1/capacity", Some(&key), ask()).await;
+    assert_eq!(resp.status, 200, "{resp:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_reservation_stops_offering_at_its_wait() {
     let dir = scratch("reserve-wait");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;

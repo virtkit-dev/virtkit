@@ -82,9 +82,12 @@ pub(crate) const MAX_PRE_AUTH: usize = 256;
 /// 503, to be retried.
 pub(crate) const MAX_DOWNLOADS: usize = 64;
 
-/// Client API connections at once, past their key's check: a `vk-gitlab` holds a few, one per
-/// request it has in flight. One past it is answered `unavailable`.
-const MAX_CLIENTS: usize = 64;
+/// Client API connections at once, past their key's check. A `vk-gitlab` holds one per request
+/// in flight, most of them long polls: each running job keeps two open (its view's and its
+/// output's), so a daemon with a few hundred jobs needs about twice that many. An idle one costs a
+/// descriptor, a task, and a TLS session with its buffers. The cap is shared by every key, not
+/// counted per key. One past it is answered `unavailable`.
+pub(crate) const MAX_CLIENT_CONNS: usize = 1024;
 
 /// How long a client API connection may stay open. It then finishes the request it is serving
 /// — a long poll at most, within [`CLIENT_DRAIN`] — and closes, and the client dials again.
@@ -130,8 +133,8 @@ pub struct Hub {
     touched: watch::Sender<u64>,
     /// Bumped when a web UI session ends.
     sessions: watch::Sender<u64>,
-    /// Permits for client API connections past their key's check ([`MAX_CLIENTS`]).
-    clients: Arc<Semaphore>,
+    /// Permits for client API connections past their key's check ([`MAX_CLIENT_CONNS`]).
+    pub(crate) clients: Arc<Semaphore>,
     /// Reservations and placed jobs.
     pub(crate) dispatch: crate::jobs::Dispatch,
 }
@@ -181,7 +184,7 @@ impl Hub {
             node_changes: Mutex::new(HashMap::new()),
             touched: watch::Sender::new(0),
             sessions: watch::Sender::new(0),
-            clients: Arc::new(Semaphore::new(MAX_CLIENTS)),
+            clients: Arc::new(Semaphore::new(MAX_CLIENT_CONNS)),
             dispatch: crate::jobs::Dispatch::new(None, crate::jobs::DEFAULT_LOST_AFTER),
         }
     }
