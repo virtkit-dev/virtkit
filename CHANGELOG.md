@@ -62,7 +62,9 @@ All notable changes to virtkit will be documented in this file.
   listener; the hub stores each job's output before acknowledging it, fails a job whose node
   stays unreachable, and keeps records and output across its own restart. `vk-hub jobs` lists
   the jobs placed. Hosts whose `vk` does not speak fleet protocol version 3 are monitored and
-  steered but offered no jobs.
+  steered but offered no jobs. The hub places each reservation and job on its least loaded node
+  — by its share of the jobs it can hold, the CPUs they take and its load average — so
+  concurrent builds, and their registry traffic, spread across hosts.
 - **Experimental: fleet nodes run GitLab jobs placed by the hub.** `vk node run` reserves
   memory and disk from the executor's job budget, then runs jobs in microVMs with the same
   image, checkout, services, egress and sizing as `vk gitlab`. Jobs use gitlab-runner's stages

@@ -123,6 +123,16 @@ that finds such a runner on its host says so in its report and refuses with `run
 offer and every start without a reservation (a reservation it already holds is renewed and
 started on); the hub places nothing on it and counts it in no capacity.
 
+Among the nodes with room, the hub offers a reservation, or starts a job without one, on the
+least loaded first, then the one with the most room, then by node ID. A node's load is the
+largest of: its placed work against that work plus its room (the envelopes it still fits);
+the vCPUs of its placed work per CPU; and its heartbeat's 1-minute load average per CPU, left
+out for a node too old to report one. Work therefore spreads across nodes even at moderate
+load — concurrent builds, and the traffic they put on shared services such as the registry,
+are not stacked on the one node with slightly more room, a host busy with work of its own
+takes new work last, and losing a node loses fewer jobs. Memory, disk and the cap
+bound each node, and capacity (`fits`) is the sum of every node's room.
+
 ## Daemon ↔ hub: the client API
 
 HTTP/1.1 and JSON over TLS 1.3, on the hub's node listener (`addr`), under `/v1/`. Every
@@ -149,11 +159,11 @@ or the output is complete. A long poll that times out answers as a plain request
 not nodes: a node with room for two counts two.
 
 **Reservations.** `{request_id, placement, lease_secs, wait_secs}` → `{reservation, node,
-envelope, lease_secs}`. The hub filters the pool's nodes on labels, readiness and headroom,
-and offers the envelope to one at a time, most headroom first, until one accepts or
-`wait_secs` runs out (503 `no_capacity`). `renew` extends a lease from now and answers the
-lease the node granted; a reservation that lapsed, was released or whose node was lost
-answers 410 `reservation_gone`. `DELETE` releases it, and answers 204 for one already gone.
+envelope, lease_secs}`. The hub filters the pool's nodes on labels, readiness and headroom, and
+offers the envelope to one at a time, least loaded first ([Placement](#placement)), until one
+accepts or `wait_secs` runs out (503 `no_capacity`). `renew` extends a lease from now and
+answers the lease the node granted; a reservation that lapsed, was released or whose node was
+lost answers 410 `reservation_gone`. `DELETE` releases it, and answers 204 for one already gone.
 
 **Jobs.** `{request_id, placement, reservation, place_within_secs, spec}` → `JobView`. The hub
 starts the job on the reservation's node; with no reservation, or one that is gone, it

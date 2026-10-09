@@ -991,21 +991,31 @@ proceed. The hub uses its desired
 ceiling; the node uses its last applied ceiling, so it may refuse `ceiling` after a raise until
 it applies the change. Lowering the ceiling cancels nothing: running jobs continue, and new work
 resumes when the count falls below it. A node running its own gitlab-runner, whose `concurrent`
-the ceiling bounds, takes no placed jobs, so nothing else runs beside them. Offers go to the
-node with the most room first; an offer unanswered after 5 seconds is abandoned, and released if
-the node accepts it later. When every node with room has refused, the hub pauses 2 seconds and
-asks again until the request's `wait_secs`, then answers 503 `no_capacity` with
-`retry_after_secs` 5. Leases are 1–600 seconds. A renew waits 10 seconds for the node's answer
-(then 503 `unavailable`). A node's reservations end with its session, or when a new session of
-the node replaces it: renewing one is then 410 `reservation_gone`, and its next `held` gets each
-released.
+the ceiling bounds, takes no placed jobs, so nothing else runs beside them.
+
+**Order.** Offers and starts go to the least loaded node first, then the one with the most
+room, then by node ID. A node's load is the largest of three ratios: its placed work against
+that work plus its room; the vCPUs of its placed work (reservations offered and not refused,
+jobs sent and not finished) per CPU; and its last heartbeat's 1-minute load average per CPU,
+left out for a node that sends none. With two nodes of 25 and 22 envelopes free, sequential
+work goes to each in turn rather than all to the first, and a busy host — by its own load or
+by what the hub put on it — takes new work last. Spreading keeps concurrent builds, and the
+pulls and pushes they put on a shared registry, off any one host, and loses less with a node.
+Each node stays bounded by its memory, disk and cap as above; `fits` does not depend on this order.
+
+An offer unanswered after 5 seconds is abandoned, and released if the node accepts it later. When
+every node with room has refused, the hub pauses 2 seconds and asks again until the request's
+`wait_secs`, then answers 503 `no_capacity` with `retry_after_secs` 5. Leases are 1–600 seconds. A
+renew waits 10 seconds for the node's answer (then 503 `unavailable`). A node's reservations end
+with its session, or when a new session of the node replaces it: renewing one is then 410
+`reservation_gone`, and its next `held` gets each released.
 
 **Jobs.** A submission stores the job record, redacted spec and `request_id` in one durable
 transaction; the full spec stays in memory until a node accepts the job. The hub holds
 at most 4096 jobs not finished; past that a submission is answered 503 `unavailable` with
 `retry_after_secs` 5. A placement loop, woken by every change and every second, sends each
-queued job to its reservation's node while that reservation holds, else to the node with the
-most room. A refused start sends the job elsewhere, gives a reservation it named back, and asks
+queued job to its reservation's node while that reservation holds, else to the least loaded
+node. A refused start sends the job elsewhere, gives a reservation it named back, and asks
 a node that refused again only after 2 seconds; a start whose answer is lost with its session
 waits for the node's `held`, which either names the job — accepted — or not, when the job is
 placed again. A queued job is ended `no_capacity` when it cannot be placed by its

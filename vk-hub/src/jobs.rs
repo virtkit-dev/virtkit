@@ -15,7 +15,8 @@
 //! ready. Its room is what its last heartbeat left — the admission ledger's budget less what
 //! it has committed, or the memory available, and the jobs filesystem's free space — less
 //! what the hub has asked of it since: reservations accepted after that heartbeat, offers
-//! and starts not yet answered. Offers and starts go to the node with the most room first.
+//! and starts not yet answered. Offers and starts go to the least loaded node first ([`load`]),
+//! then the roomiest, then by ID.
 //! A node takes placed work only below its cap ([`placed_cap`]): the operator's ceiling or its
 //! own executor limit, whichever is smaller, counted by [`placed`]. The node refuses past
 //! either too ([`Refusal::Ceiling`], [`Refusal::Concurrency`]), should the hub's count fall
@@ -1011,7 +1012,15 @@ async fn on_result(
 
 /// A node's room for `placement`'s envelope: how many it fits, `None` when it takes no
 /// placed work now.
-fn room(hub: &Hub, state: &State, node: &str, row: &NodeRow, placement: &Placement) -> Option<u64> {
+/// `placed` is the node's placed work, as [`placed`] counts it.
+fn room(
+    hub: &Hub,
+    state: &State,
+    node: &str,
+    row: &NodeRow,
+    placement: &Placement,
+    placed: u64,
+) -> Option<u64> {
     let link = state.links.get(node)?;
     if !link.held || hub.reach(node) != Reach::Connected {
         return None;
@@ -1046,7 +1055,7 @@ fn room(hub: &Hub, state: &State, node: &str, row: &NodeRow, placement: &Placeme
         return None;
     }
     let below_cap = match placed_cap(row.desired.as_ref(), report) {
-        Some(cap) => u64::from(cap).saturating_sub(placed(state, node)),
+        Some(cap) => u64::from(cap).saturating_sub(placed),
         None => MAX_FITS,
     };
     let heartbeat = row.heartbeat.as_ref()?;
@@ -1105,14 +1114,37 @@ fn room(hub: &Hub, state: &State, node: &str, row: &NodeRow, placement: &Placeme
 /// `held` that the hub has disowned, until their result comes. A job submitted on a
 /// reservation counts as the reservation until it is sent, as the job after.
 fn placed(state: &State, node: &str) -> u64 {
-    let reservations = (state.reservations.values())
-        .filter(|r| r.node == node && !matches!(r.phase, ResvPhase::Refused(_)))
-        .count();
-    let jobs = (state.jobs.values())
-        .filter(|j| j.node() == Some(node))
-        .count();
-    let disowned = state.disowned.get(node).map_or(0, HashSet::len);
-    u64::try_from(reservations.saturating_add(jobs).saturating_add(disowned)).unwrap_or(u64::MAX)
+    tallies(state).get(node).map_or(0, |t| t.placed)
+}
+
+/// A node's placed work, as [`placed`] counts it, and the vCPUs of that work: its reservations
+/// not refused and the jobs sent to it and not finished. A disowned job's envelope is not known.
+#[derive(Clone, Copy, Default)]
+struct Tally {
+    placed: u64,
+    cpus: u64,
+}
+
+/// Every node's [`Tally`], in one pass over the dispatch state.
+fn tallies(state: &State) -> HashMap<&str, Tally> {
+    let mut by_node: HashMap<&str, Tally> = HashMap::new();
+    let live = (state.reservations.values())
+        .filter(|r| !matches!(r.phase, ResvPhase::Refused(_)))
+        .map(|r| (r.node.as_str(), r.envelope.cpus));
+    let sent =
+        (state.jobs.values()).filter_map(|j| Some((j.node()?, j.row.placement.envelope.cpus)));
+    for (node, cpus) in live.chain(sent) {
+        let t = by_node.entry(node).or_default();
+        t.placed = t.placed.saturating_add(1);
+        t.cpus = t.cpus.saturating_add(u64::from(cpus));
+    }
+    for (node, jobs) in &state.disowned {
+        let t = by_node.entry(node.as_str()).or_default();
+        t.placed = t
+            .placed
+            .saturating_add(u64::try_from(jobs.len()).unwrap_or(u64::MAX));
+    }
+    by_node
 }
 
 /// How much placed work `node` holds as the hub counts it against its ceiling.
@@ -1172,7 +1204,48 @@ pub fn placed_cap(desired: Option<&DesiredState>, report: Option<&Report>) -> Op
         .min()
 }
 
-/// The nodes with room for `placement`, most room first, but those in `skip`.
+/// Load for ordering candidates, in millionths: the maximum of `placed / (placed + room)`,
+/// placed vCPUs per CPU, and the 1-minute load average per CPU. Omit the load average when
+/// absent (older `vk`); CPU overcommit can put the ratio above one. The placed-work share
+/// counts jobs of any size against room in this placement's envelopes, so mixed sizes make
+/// it a heuristic, not the fraction of the node in use.
+fn load(placed: u64, room: u64, placed_cpus: u64, cpus: u32, load1_hundredths: Option<u32>) -> u64 {
+    const WHOLE: u64 = 1_000_000;
+    let share = (placed.saturating_mul(WHOLE))
+        .checked_div(placed.saturating_add(room))
+        .unwrap_or(0);
+    let cpus = u64::from(cpus);
+    let committed = (placed_cpus.saturating_mul(WHOLE))
+        .checked_div(cpus)
+        .unwrap_or(0);
+    let busy = load1_hundredths
+        .and_then(|l| (u64::from(l).saturating_mul(WHOLE / 100)).checked_div(cpus))
+        .unwrap_or(0);
+    share.max(committed).max(busy)
+}
+
+/// Nodes with room for `placement`, excluding `skip`, with their room and [`Tally`].
+fn rooms<'a>(
+    hub: &Hub,
+    state: &'a State,
+    nodes: &'a [(String, NodeRow)],
+    placement: &Placement,
+    skip: &HashSet<String>,
+) -> Vec<(&'a str, &'a NodeRow, u64, Tally)> {
+    let tallies = tallies(state);
+    nodes
+        .iter()
+        .filter(|(id, _)| !skip.contains(id))
+        .filter_map(|(id, row)| {
+            let tally = tallies.get(id.as_str()).copied().unwrap_or_default();
+            let room = room(hub, state, id, row, placement, tally.placed)?;
+            Some((id.as_str(), row, room, tally))
+        })
+        .collect()
+}
+
+/// Nodes with room for `placement`, excluding `skip`: least loaded first ([`load`]),
+/// then most room, then by ID.
 fn candidates(
     hub: &Hub,
     state: &State,
@@ -1180,13 +1253,26 @@ fn candidates(
     placement: &Placement,
     skip: &HashSet<String>,
 ) -> Vec<(String, u64)> {
-    let mut found: Vec<(String, u64)> = nodes
-        .iter()
-        .filter(|(id, _)| !skip.contains(id))
-        .filter_map(|(id, row)| Some((id.clone(), room(hub, state, id, row, placement)?)))
+    let found = rooms(hub, state, nodes, placement, skip)
+        .into_iter()
+        .map(|(id, row, room, tally)| {
+            let load = load(
+                tally.placed,
+                room,
+                tally.cpus,
+                row.inventory.as_ref().map_or(0, |i| i.hardware.cpus),
+                row.heartbeat.as_ref().and_then(|h| h.load1_hundredths),
+            );
+            (id.to_string(), room, load)
+        })
         .collect();
-    found.sort_by(|(a, x), (b, y)| y.cmp(x).then_with(|| a.cmp(b)));
-    found
+    least_loaded_first(found)
+}
+
+/// `(node, room, load)`s as `(node, room)`, least load first, then most room, then by node.
+fn least_loaded_first(mut found: Vec<(String, u64, u64)>) -> Vec<(String, u64)> {
+    found.sort_by(|(a, x, p), (b, y, q)| p.cmp(q).then_with(|| y.cmp(x)).then_with(|| a.cmp(b)));
+    found.into_iter().map(|(id, room, _)| (id, room)).collect()
 }
 
 /// `POST /v1/capacity`'s answer for `placement`: the envelopes its nodes have room for, and
@@ -1195,9 +1281,9 @@ pub async fn capacity(hub: &Hub, placement: &Placement) -> Result<Capacity> {
     let nodes = blocking(hub, |db| db.nodes()).await?;
     let key = serde_json::to_string(placement).context("encoding a placement")?;
     let mut state = hub.dispatch.lock();
-    let fits: u64 = candidates(hub, &state, &nodes, placement, &HashSet::new())
+    let fits: u64 = rooms(hub, &state, &nodes, placement, &HashSet::new())
         .iter()
-        .map(|(_, n)| n)
+        .map(|(_, _, n, _)| n)
         .sum();
     let fits = u32::try_from(fits).unwrap_or(u32::MAX);
     let now = Instant::now();
@@ -1291,6 +1377,7 @@ pub async fn reserve(
         let mut changed = hub.dispatch.subscribe();
         let mut node_changed = hub.subscribe();
         let nodes = blocking(hub, |db| db.nodes()).await?;
+        // Ranked once a round: after a refusal or a timeout, the next offer follows this order.
         let found = {
             let state = hub.dispatch.lock();
             candidates(hub, &state, &nodes, placement, &tried)
@@ -1985,8 +2072,8 @@ async fn step(hub: &Hub) -> Result<()> {
     Ok(())
 }
 
-/// Send queued job `id` to a node: the one its reservation is on while the reservation
-/// holds, else the one with the most room it has not refused. The row to write, if it went.
+/// Send queued job `id` to its reservation's node while the reservation holds, else the
+/// least loaded node that has not refused it ([`candidates`]). Return the row to write if sent.
 fn place(
     hub: &Hub,
     state: &mut State,
@@ -2239,6 +2326,59 @@ pub(crate) fn run_text(ms: u64) -> String {
         1..60 => format!("{s}s"),
         60..3600 => format!("{}m{:02}s", s / 60, s % 60),
         _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_node_s_load_is_its_largest_share() {
+        // Placed work against room, alone: an older node, no CPUs known.
+        assert_eq!(load(0, 25, 0, 0, None), 0);
+        assert_eq!(load(1, 24, 0, 0, None), 40_000);
+        // The vCPUs placed, or the load average, per CPU, when larger.
+        assert_eq!(load(1, 24, 4, 8, None), 500_000);
+        assert_eq!(load(1, 24, 4, 8, Some(600)), 750_000);
+        assert_eq!(load(1, 24, 0, 8, Some(1600)), 2_000_000);
+        assert_eq!(load(3, 1, 2, 8, Some(100)), 750_000);
+    }
+
+    #[test]
+    fn candidates_go_least_loaded_then_roomiest_then_by_id() {
+        let found = vec![
+            ("c".to_string(), 5, 100),
+            ("b".to_string(), 9, 100),
+            ("a".to_string(), 9, 100),
+            ("d".to_string(), 1, 50),
+            ("e".to_string(), 30, 900),
+        ];
+        let order: Vec<String> = least_loaded_first(found)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(order, ["d", "a", "b", "c", "e"]);
+    }
+
+    /// Nodes of 25 and 22 envelopes take sequential work in turn.
+    #[test]
+    fn sequential_work_spreads_over_nodes_of_unequal_room() {
+        let mut placed = [0_u64; 2];
+        let room = [25_u64, 22];
+        let mut took = String::new();
+        for _ in 0..6 {
+            let found = (0..2)
+                .map(|n| {
+                    let left = room[n] - placed[n];
+                    (n.to_string(), left, load(placed[n], left, 0, 0, None))
+                })
+                .collect();
+            let (first, _) = least_loaded_first(found).remove(0);
+            placed[first.parse::<usize>().unwrap()] += 1;
+            took.push_str(&first);
+        }
+        assert_eq!(took, "010101");
     }
 }
 

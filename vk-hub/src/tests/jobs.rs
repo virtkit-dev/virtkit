@@ -2371,6 +2371,37 @@ async fn a_node_s_own_limit_caps_what_it_is_placed_with_the_ceiling() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn placed_work_goes_to_the_least_loaded_node() {
+    let dir = scratch("spread");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    // Memory for eight envelopes, for four, and for none.
+    let mut big = ready_node(addr, &hub, 32768).await;
+    let mut small = ready_node(addr, &hub, 16384).await;
+    let mut full = ready_node(addr, &hub, 2048).await;
+    // Both empty: the roomier first. Then each goes to the one with the smaller share of
+    // placed work and of its CPUs, on a tie the roomier.
+    reserve_on(addr, &key, &mut big, 1).await;
+    reserve_on(addr, &key, &mut small, 2).await;
+    reserve_on(addr, &key, &mut big, 3).await;
+    reserve_on(addr, &key, &mut small, 4).await;
+    // Starts are ordered the same.
+    running_job(addr, &key, &mut big, 5).await;
+    for node in [&mut big, &mut small, &mut full] {
+        node.quiet(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        (
+            crate::jobs::placed_on(&hub, &big.id),
+            crate::jobs::placed_on(&hub, &small.id),
+            crate::jobs::placed_on(&hub, &full.id),
+        ),
+        (3, 2, 0)
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_job_the_hub_disowned_counts_against_the_ceiling_until_it_ends() {
     let dir = scratch("ceiling-disowned");
     let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
