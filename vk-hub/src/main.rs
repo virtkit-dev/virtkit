@@ -63,8 +63,8 @@ struct Cli {
 #[derive(clap::Args)]
 struct ConfigArg {
     /// hub.toml: addr, tls_cert, tls_key, data_dir, ui_addr, ui_url, ui_tls_cert,
-    /// ui_tls_key, release_repository, job_lost_after_secs, job_history, [oidc] [default:
-    /// built-in defaults]
+    /// ui_tls_key, release_repository, job_lost_after_secs, job_history, kept_failure_output,
+    /// [oidc] [default: built-in defaults]
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 }
@@ -161,12 +161,15 @@ enum Cmd {
         cmd: Option<KeysCmd>,
     },
     /// List the jobs placed on the fleet through the client API, newest first
+    #[command(args_conflicts_with_subcommands = true)]
     Jobs {
         #[command(flatten)]
         config: ConfigArg,
         /// How many of the latest
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        #[command(subcommand)]
+        cmd: Option<JobsCmd>,
     },
     /// Serve a web UI for this machine's VMs, signed into with a link it prints
     ///
@@ -359,6 +362,15 @@ enum AccountsCmd {
         /// The address, or `*`
         #[arg(value_parser = parse_account)]
         email: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum JobsCmd {
+    /// Show a job's record and, for a failed job, the end of its output that the hub kept
+    Show {
+        /// The job's ID, as `vk-hub jobs` lists it
+        id: String,
     },
 }
 
@@ -880,10 +892,30 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Cmd::Jobs { config, limit } => {
+        Cmd::Jobs {
+            config,
+            limit,
+            cmd: None,
+        } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             let jobs = tokio::task::spawn_blocking(move || client.jobs(limit)).await??;
             print!("{}", render_jobs(&jobs, now_secs()));
+            Ok(())
+        }
+        Cmd::Jobs {
+            config,
+            cmd: Some(JobsCmd::Show { id }),
+            ..
+        } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            let job = {
+                let id = id.clone();
+                tokio::task::spawn_blocking(move || client.job(&id)).await??
+            };
+            let Some((row, output)) = job else {
+                bail!("no job {} in the history", vk_hub_proto::display_safe(&id));
+            };
+            print!("{}", render_job(&id, &row, output.as_deref(), now_secs()));
             Ok(())
         }
         Cmd::Workloads { config, node } => {
@@ -1230,7 +1262,10 @@ async fn serve(cfg: HubConfig) -> Result<()> {
         }
         hub = hub.with_oidc();
     }
-    let hub = Arc::new(hub.with_jobs(cfg.jobs_dir(), cfg.job_lost_after, cfg.job_history)?);
+    let hub = Arc::new(
+        hub.with_jobs(cfg.jobs_dir(), cfg.job_lost_after, cfg.job_history)?
+            .keeping_failure_output(cfg.kept_failure_output),
+    );
     jobs::recover(&hub).await?;
     tokio::spawn(jobs::drive(hub.clone()));
     // Fatal, unlike the registry's optional admin socket: here it is the only way to issue
@@ -1501,6 +1536,74 @@ fn render_jobs(jobs: &[(String, store::JobRow)], now: u64) -> String {
         ],
         &rows,
     )
+}
+
+/// `vk-hub jobs show`: job `id`'s record, a field a line, then what was kept of its output
+/// made readable ([`jobs::readable`]): the job's escape sequences never reach the terminal.
+fn render_job(id: &str, j: &store::JobRow, output: Option<&[u8]>, now: u64) -> String {
+    let result = j.result.as_ref();
+    let usage = result.and_then(|r| r.usage);
+    let dash = || "-".to_string();
+    let at = |t: Option<u64>| t.map_or_else(dash, utc);
+    let mut fields = vec![
+        ("job", id.to_string()),
+        ("title", j.title.clone()),
+        ("project", j.project.clone().unwrap_or_else(dash)),
+        ("state", jobs::state_text(j)),
+    ];
+    if let Some(code) = result.and_then(|r| r.exit_code) {
+        fields.push(("exit code", code.to_string()));
+    }
+    if let Some(message) = result.and_then(|r| r.message.clone()) {
+        fields.push(("message", message));
+    }
+    // Shown only as a plain web link, as the web UI does.
+    if let Some(url) = j.job_url.clone().filter(|u| vk_hub_proto::is_web_link(u)) {
+        fields.push(("gitlab", url));
+    }
+    fields.extend([
+        ("node", j.node.clone().unwrap_or_else(dash)),
+        ("pool", j.placement.pool.clone()),
+        ("key", j.key_name.clone()),
+        ("submitted", utc(j.created_at)),
+        ("started", at(j.started_at)),
+        ("finished", at(j.finished_at)),
+        ("settled", at(j.settled_at)),
+        ("ran", j.ran_ms(now).map_or_else(dash, jobs::run_text)),
+        (
+            "peak memory",
+            usage
+                .and_then(|u| u.peak_mem_bytes)
+                .map_or_else(dash, |b| workloads::size_mib(b.div_ceil(1 << 20))),
+        ),
+        (
+            "cpu time",
+            usage
+                .and_then(|u| u.cpu_ms)
+                .map_or_else(dash, jobs::run_text),
+        ),
+        ("output", format!("{} bytes", j.output_len)),
+    ]);
+    let mut out = String::new();
+    for (key, value) in fields {
+        let value = vk_hub_proto::display_safe(&value);
+        out.push_str(&format!("{key:<12} {value}\n"));
+    }
+    if let Some(output) = output {
+        out.push_str(&format!(
+            "\nThe last {} bytes of its output, masked as the node streamed it:\n",
+            output.len()
+        ));
+        for line in jobs::readable(output) {
+            if let Some(at) = &line.at {
+                out.push_str(at.get(11..19).unwrap_or(at));
+                out.push(' ');
+            }
+            out.push_str(&line.text);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Say how many sessions a grant or revoke ended.

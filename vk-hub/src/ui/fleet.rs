@@ -6,7 +6,8 @@
 //! left, is confirmed first ([`actions::ask_first`]). Monitoring-only nodes have no steering
 //! controls.
 //! Operators add releases and start rollouts from `/operations` ([`super::operations`]); the
-//! jobs placed through the client API are listed, read only, on `/jobs` ([`super::jobs`]).
+//! jobs placed through the client API are listed, read only, on `/jobs`, a failed one with a
+//! page of its own ([`super::jobs`]).
 //! Operators issue enrollment tokens from the nodes page ([`create_token`]), and grant OIDC
 //! sign-in roles from `/users` ([`super::users`]), which only their navigation links to.
 
@@ -208,6 +209,11 @@ pub(super) async fn get(
         return super::jobs::get(query, auth, &site.jobs, ui)
             .await
             .map(Some);
+    }
+    if let Some(id) = path.strip_prefix(super::jobs::DETAIL_PREFIX)
+        && vk_hub_proto::valid_id(id)
+    {
+        return super::jobs::detail(id, auth, ui).await.map(Some);
     }
     if let Some(id) = path.strip_prefix("/node/")
         && vk_hub_proto::valid_id(id)

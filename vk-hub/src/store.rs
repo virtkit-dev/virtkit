@@ -670,6 +670,8 @@ impl Db {
             .context("opening the job specs table")?;
         txn.open_table(jobs::REQUESTS)
             .context("opening the requests table")?;
+        txn.open_table(jobs::JOB_TAILS)
+            .context("opening the job output tails table")?;
         jobs::order_jobs(&txn).context("ordering the job history")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db {

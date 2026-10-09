@@ -95,7 +95,7 @@ fn escape_into(out: &mut String, s: &str) {
 /// terminator, and the shorter ones — rather than the escape alone, which leaves `[0;32m`
 /// behind. Lines and tabs are kept; other controls, and the [`vk_hub_proto::invisible`]
 /// characters, are dropped.
-fn terminal_safe(s: &str) -> String {
+pub fn terminal_safe(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {

@@ -1,7 +1,9 @@
 //! The fleet's `/jobs`, for every session: the history of the jobs the hub placed, newest
 //! first, a page at a time, filtered by node, GitLab project and result, with what each used
 //! on its node where the node reported it ([`vk_hub_proto::job::JobUsage`]) and a line summing
-//! up every job the filter matches. Read only; a job's own page is GitLab's.
+//! up every job the filter matches. Read only; a job's own page is GitLab's, but a failed
+//! job's result links to `/jobs/<id>`, its record and the end of its output as the hub kept it
+//! ([`crate::jobs::detail`]), for when GitLab's trace is cut or out of reach.
 //!
 //! The newest page of any filter stays live: its stream's URL carries the filter, and each
 //! stream renders its own fragment, woken by [`Hub::jobs_changed`] alone. The summary reads the
@@ -15,18 +17,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::Result;
-use hyper::Response;
+use hyper::{Response, StatusCode};
 use vk_hub_proto::client::JobState;
 
 use super::html::Html;
 use super::pages::{self, bytes, mib};
 use super::sse::Source;
-use super::{Auth, Body, Ui, blocking, decode_form, field, fleet, page};
+use super::{Auth, Body, Ui, blocking, decode_form, field, fleet, message, page};
 use crate::server::{HEARTBEAT, Hub};
 use crate::store::{JobFilter, JobOutcome, JobPage, JobRow, SUMMARY_JOBS};
 
 /// The page.
 pub(super) const PATH: &str = "/jobs";
+
+/// A job's page, `/jobs/<id>`.
+pub(super) const DETAIL_PREFIX: &str = "/jobs/";
 
 /// The event the newest page's fragment is swapped in on, from `/events/jobs[?<filter>]`.
 pub(super) const EVENT: &str = "jobs";
@@ -453,6 +458,36 @@ fn job_row(h: &mut Html, id: &str, j: &JobRow, names: &HashMap<&str, &str>, now:
         .raw("</td><td>")
         .node(j.project.as_deref().unwrap_or("-"))
         .raw("</td><td>");
+    node_link(h, j, names);
+    h.raw("</td><td>");
+    // A failed job's page has why, as far as its output says; the router takes only hex.
+    if j.outcome() == JobOutcome::Failed && vk_hub_proto::valid_id(id) {
+        h.raw("<a href=\"").raw(DETAIL_PREFIX).text(id).raw("\">");
+        result_badge(h, j);
+        h.raw("</a>");
+    } else {
+        result_badge(h, j);
+    }
+    h.raw("</td><td>");
+    match j.started_at {
+        Some(at) => pages::at(h, at),
+        None => h.raw("-"),
+    };
+    h.raw("</td><td class=\"num\">")
+        .text(dash_or(j.ran_ms(now).map(crate::jobs::run_text)))
+        .raw("</td><td class=\"num\">")
+        .text(dash_or(usage.and_then(|u| u.peak_mem_bytes).map(bytes)))
+        .raw("</td><td class=\"num\">")
+        .text(dash_or(
+            usage.and_then(|u| u.cpu_ms).map(crate::jobs::run_text),
+        ))
+        .raw("</td><td class=\"num\">")
+        .text(dash_or(size_text(j)))
+        .raw("</td></tr>");
+}
+
+/// The node job `j` was sent to, linked to its page, or `-`.
+fn node_link(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>) {
     match &j.node {
         // The router takes only hex for a node's ID.
         Some(node) if vk_hub_proto::valid_id(node) => {
@@ -470,33 +505,140 @@ fn job_row(h: &mut Html, id: &str, j: &JobRow, names: &HashMap<&str, &str>, now:
             h.raw("-");
         }
     }
-    h.raw("</td><td>");
-    result_badge(h, j);
-    h.raw("</td><td>");
-    match j.started_at {
-        Some(at) => pages::at(h, at),
-        None => h.raw("-"),
-    };
+}
+
+/// The guest job `j` ran in: `4 vCPUs, 8.0 GiB`.
+fn size_text(j: &JobRow) -> Option<String> {
+    let usage = j.result.as_ref().and_then(|r| r.usage);
     let size = match usage.map(|u| (u.cpus, u.mem_mib)) {
         Some((Some(cpus), Some(mem))) => Some((cpus, mem)),
         // Fall back to the placement envelope when the node did not report the guest size.
         _ => Some((j.placement.envelope.cpus, j.placement.envelope.mem_mib))
             .filter(|&(cpus, mem)| cpus > 0 && mem > 0),
     };
-    h.raw("</td><td class=\"num\">")
-        .text(dash_or(j.ran_ms(now).map(crate::jobs::run_text)))
-        .raw("</td><td class=\"num\">")
-        .text(dash_or(usage.and_then(|u| u.peak_mem_bytes).map(bytes)))
-        .raw("</td><td class=\"num\">")
-        .text(dash_or(
-            usage.and_then(|u| u.cpu_ms).map(crate::jobs::run_text),
-        ))
-        .raw("</td><td class=\"num\">")
-        .text(dash_or(size.map(|(cpus, mem)| {
-            let unit = if cpus == 1 { "vCPU" } else { "vCPUs" };
-            format!("{cpus} {unit}, {}", mib(mem))
-        })))
-        .raw("</td></tr>");
+    size.map(|(cpus, mem)| {
+        let unit = if cpus == 1 { "vCPU" } else { "vCPUs" };
+        format!("{cpus} {unit}, {}", mib(mem))
+    })
+}
+
+/// `GET /jobs/<id>`: job `id`'s record and, for a failed job, the end of its output
+/// ([`crate::jobs::detail`]), for every session.
+pub(super) async fn detail(id: &str, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
+    let (hub, job) = (ui.hub.clone(), id.to_string());
+    let found = blocking(move || {
+        let Some((row, tail)) = crate::jobs::detail(&hub, &job)? else {
+            return Ok(None);
+        };
+        anyhow::Ok(Some((row, tail, hub.db.node_names()?)))
+    })
+    .await?;
+    let Some((row, tail, names)) = found else {
+        return Ok(message(StatusCode::NOT_FOUND, "There is no such job."));
+    };
+    let main = job_page(id, &row, tail.as_deref(), &names, crate::now_secs());
+    Ok(page(fleet::layout("Job", PATH, auth, &main)))
+}
+
+/// A job's page: its record, then for a failed job what was kept of its output.
+fn job_page(
+    id: &str,
+    j: &JobRow,
+    tail: Option<&[u8]>,
+    names: &[(String, String)],
+    now: u64,
+) -> Html {
+    let names: HashMap<&str, &str> = names
+        .iter()
+        .map(|(id, name)| (id.as_str(), name.as_str()))
+        .collect();
+    let result = j.result.as_ref();
+    let usage = result.and_then(|r| r.usage);
+    let mut h = Html::new();
+    h.raw("<h1>")
+        .node(j.name.as_deref().unwrap_or(&j.title))
+        .raw("</h1>");
+    h.raw("<p class=\"sub\"><code>").text(id).raw("</code>");
+    if j.job_url.as_deref().is_some_and(vk_hub_proto::is_web_link) {
+        h.raw(" · ")
+            .external_link(j.job_url.as_deref(), "On GitLab");
+    }
+    h.raw(" · <a href=\"").raw(PATH).raw("\">All jobs</a></p>");
+    pages::section(&mut h, "Job");
+    let mut cell = Html::new();
+    result_badge(&mut cell, j);
+    pages::kv_html(&mut h, "Result", &cell);
+    if let Some(class) = result.and_then(|r| r.failure) {
+        pages::kv(&mut h, "Failure class", crate::jobs::failure_name(class));
+    }
+    if let Some(code) = result.and_then(|r| r.exit_code) {
+        pages::kv(&mut h, "Exit code", &code.to_string());
+    }
+    if let Some(message) = result.and_then(|r| r.message.as_deref()) {
+        pages::kv_node(&mut h, "Message", message);
+    }
+    pages::kv_node(&mut h, "Title", &j.title);
+    pages::kv_node(&mut h, "Project", j.project.as_deref().unwrap_or("-"));
+    let mut cell = Html::new();
+    node_link(&mut cell, j, &names);
+    pages::kv_html(&mut h, "Node", &cell);
+    pages::kv_node(&mut h, "Pool", &j.placement.pool);
+    pages::kv_node(&mut h, "Submitted by", &format!("key {}", j.key_name));
+    for (key, at) in [
+        ("Submitted", Some(j.created_at)),
+        ("Started", j.started_at),
+        ("Finished", j.finished_at),
+        ("Settled", j.settled_at),
+    ] {
+        let mut cell = Html::new();
+        match at {
+            Some(at) => pages::at(&mut cell, at),
+            None => cell.raw("-"),
+        };
+        pages::kv_html(&mut h, key, &cell);
+    }
+    pages::kv(
+        &mut h,
+        "Ran",
+        &dash_or(j.ran_ms(now).map(crate::jobs::run_text)),
+    );
+    pages::kv(
+        &mut h,
+        "Peak memory",
+        &dash_or(usage.and_then(|u| u.peak_mem_bytes).map(bytes)),
+    );
+    pages::kv(
+        &mut h,
+        "CPU time",
+        &dash_or(usage.and_then(|u| u.cpu_ms).map(crate::jobs::run_text)),
+    );
+    pages::kv(&mut h, "Size", &dash_or(size_text(j)));
+    pages::kv(&mut h, "Output", &bytes(j.output_len));
+    pages::end_section(&mut h);
+    if j.outcome() != JobOutcome::Failed {
+        return h;
+    }
+    h.raw("<section><h2>End of its output</h2>");
+    let Some(tail) = tail else {
+        h.raw("<p class=\"empty\">none kept</p></section>");
+        return h;
+    };
+    h.raw("<p class=\"sub\">The last ")
+        .text(bytes(tail.len() as u64))
+        .raw(", masked as the node streamed it.</p><pre>");
+    for line in crate::jobs::readable(tail) {
+        if let Some(at) = &line.at {
+            // A plain `<time>`: `time.js` rewrites only those with a `datetime`.
+            h.raw("<time title=\"")
+                .text(at)
+                .raw("\">")
+                .text(at.get(11..19).unwrap_or(at))
+                .raw("</time> ");
+        }
+        h.text(&line.text).raw("\n");
+    }
+    h.raw("</pre></section>");
+    h
 }
 
 /// How the job stands: its outcome's colour, with the failure's class and exit code, or the

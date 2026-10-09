@@ -7,6 +7,12 @@ All notable changes to virtkit will be documented in this file.
 ### Added
 
 - **`vk-hub`'s web UI shows virtkit's logo as its browser tab icon.**
+- **`vk-hub` keeps the end of a failed job's output.** When `vk-gitlab` settles a failed job
+  — a script failure, a system failure, a lost node… — the hub keeps the last 256 KiB of its
+  log, masked on the node, for as long as it keeps the job (`kept_failure_output` in
+  `hub.toml`, `"0"` to keep none). Unsettled jobs retain no log beyond 30 days after finishing.
+  Failed results on the Jobs page link to the job's details and log, readable without GitLab
+  by every signed-in session, including viewers. `vk-hub jobs show <id>` prints the same.
 - **`vk-hub` holds CI tools definitions and has nodes build them.** `vk-hub tools add <dir>
   --version <label>` takes a build context — a Dockerfile whose `tools` stage holds static `git` and
   any other tools, such as `git-lfs` — packed so that the same tree is the same definition; `vk-hub

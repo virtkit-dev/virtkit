@@ -16,6 +16,9 @@
 //! job_lost_after_secs = 300
 //! # How many placed jobs' records the job history keeps, newest first.
 //! job_history = 10000
+//! # How much of the end of a failed job's output is kept, with its record, once its producer
+//! # settles it; "0" keeps none.
+//! kept_failure_output = "256K"
 //!
 //! # Sign-in to the web UI through an OIDC provider; off unless set.
 //! [oidc]
@@ -56,6 +59,10 @@ pub const DEFAULT_ADDR: SocketAddr =
 /// The most jobs' records `job_history` may keep: each is a few kilobytes in the database.
 const MAX_JOB_HISTORY: u64 = 1_000_000;
 
+/// The most of a failed job's output `kept_failure_output` may keep: the database holds it for
+/// every failed job in the history, and the admin socket's reply carries it whole.
+const MAX_KEPT_FAILURE_OUTPUT: u64 = 4 << 20;
+
 /// The resolved configuration.
 #[derive(Debug)]
 pub struct HubConfig {
@@ -70,6 +77,8 @@ pub struct HubConfig {
     pub job_lost_after: std::time::Duration,
     /// How many placed jobs' records the job history keeps.
     pub job_history: usize,
+    /// How many bytes from the end of a failed job's output are kept once it is settled.
+    pub kept_failure_output: u64,
 }
 
 /// The web UI's listener.
@@ -114,6 +123,7 @@ struct FileConfig {
     release_repository: Option<String>,
     job_lost_after_secs: Option<u64>,
     job_history: Option<u64>,
+    kept_failure_output: Option<String>,
     oidc: Option<FileOidc>,
 }
 
@@ -263,6 +273,13 @@ impl HubConfig {
             Some(n @ 1..=MAX_JOB_HISTORY) => usize::try_from(n)?,
             Some(n) => bail!("job_history {n}: expected 1 to {MAX_JOB_HISTORY}"),
         };
+        let kept_failure_output = match f.kept_failure_output.as_deref() {
+            None => crate::jobs::DEFAULT_KEPT_FAILURE_OUTPUT,
+            Some(size) => match parse_size(size) {
+                Some(n) if n <= MAX_KEPT_FAILURE_OUTPUT => n,
+                _ => bail!("kept_failure_output {size:?}: expected a size from 0 to 4M"),
+            },
+        };
         Ok(HubConfig {
             addr,
             tls_cert: f.tls_cert,
@@ -272,6 +289,7 @@ impl HubConfig {
             release_source,
             job_lost_after,
             job_history,
+            kept_failure_output,
         })
     }
 
@@ -319,6 +337,24 @@ impl UiConfig {
             "ui_tls_cert and ui_tls_key",
         )
     }
+}
+
+/// A size in bytes, with an optional `K`, `M` or `G` suffix of powers of 1024: `256K`.
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    let (num, shift) = [('K', 10), ('M', 20), ('G', 30)]
+        .into_iter()
+        .find_map(|(unit, shift)| {
+            s.strip_suffix(unit)
+                .or_else(|| s.strip_suffix(unit.to_ascii_lowercase()))
+                .map(|n| (n, shift))
+        })
+        .unwrap_or((s, 0));
+    // Digits alone: `parse` would take a leading `+`.
+    if !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    num.parse::<u64>().ok()?.checked_mul(1u64 << shift)
 }
 
 /// `[oidc]`, checked: the issuer as `vk-registry` checks its own.
@@ -605,6 +641,40 @@ mod tests {
         assert_eq!(keep("job_history = 500\n").unwrap(), 500);
         for bad in ["0", "1000001", "-1"] {
             assert!(keep(&format!("job_history = {bad}\n")).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_failed_job_keeps_up_to_4_mib_of_output() {
+        let kept = |extra: &str| {
+            parse(&format!("data_dir = \"/d\"\n{extra}")).map(|c| c.kept_failure_output)
+        };
+        assert_eq!(kept("").unwrap(), crate::jobs::DEFAULT_KEPT_FAILURE_OUTPUT);
+        for (size, bytes) in [
+            ("0", 0),
+            ("1000", 1000),
+            ("256K", 256 << 10),
+            ("4m", 4 << 20),
+        ] {
+            assert_eq!(
+                kept(&format!("kept_failure_output = \"{size}\"\n")).unwrap(),
+                bytes,
+                "{size}"
+            );
+        }
+        for bad in [
+            "\"4097K\"",
+            "\"1G\"",
+            "\"-1\"",
+            "\"+1K\"",
+            "\"K\"",
+            "\"lots\"",
+            "1024",
+        ] {
+            assert!(
+                kept(&format!("kept_failure_output = {bad}\n")).is_err(),
+                "{bad}"
+            );
         }
     }
 

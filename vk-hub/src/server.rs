@@ -215,6 +215,13 @@ impl Hub {
         Ok(self)
     }
 
+    /// This hub, keeping the last `bytes` of a failed job's output when it is settled; 0 keeps
+    /// none. After [`Hub::with_jobs`], which sets the default.
+    pub fn keeping_failure_output(mut self, bytes: u64) -> Self {
+        self.dispatch.kept_failure_output = bytes;
+        self
+    }
+
     /// Note that something a page shows of node `node_id` may have changed: its report,
     /// heartbeat or session.
     pub(crate) fn changed(&self, node_id: &str) {

@@ -180,6 +180,10 @@ enum Call {
     ListJobs {
         limit: usize,
     },
+    /// One placed job's record, and for a failed one the end of its output.
+    ShowJob {
+        id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -226,6 +230,14 @@ pub struct Accounts {
     /// `[oidc] default_role`, used when no grant matches. Older hubs omit it and have none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_role: Option<Role>,
+}
+
+/// A placed job's record and, for a failed job, its node-masked output tail encoded as
+/// base64 ([`crate::jobs::detail`]).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JobDetail {
+    pub row: JobRow,
+    pub output: Option<String>,
 }
 
 /// A freshly minted API key, and its row.
@@ -541,6 +553,13 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
         Call::ListJobs { limit } => {
             serde_json::to_value(crate::jobs::listing(hub, limit.min(10_000))?)?
         }
+        Call::ShowJob { id } => {
+            let detail = crate::jobs::detail(hub, &id)?.map(|(row, output)| JobDetail {
+                row,
+                output: output.as_deref().map(vk_hub_proto::to_base64),
+            });
+            serde_json::to_value(detail)?
+        }
         Call::RemoveNode { id } => {
             let removed = hub.db.remove_node(&id, &actor, crate::now_secs())?;
             if removed {
@@ -802,6 +821,22 @@ impl Client {
     /// Newest first.
     pub fn jobs(&self, limit: usize) -> Result<Vec<(String, JobRow)>> {
         self.call(Call::ListJobs { limit })
+    }
+
+    /// Job `id`'s record and, for a failed job, the end of its output; `None` for a job not in
+    /// the history.
+    pub fn job(&self, id: &str) -> Result<Option<(JobRow, Option<Vec<u8>>)>> {
+        let call = Call::ShowJob { id: id.to_string() };
+        let Some(detail) = self.call::<Option<JobDetail>>(call)? else {
+            return Ok(None);
+        };
+        let output = match detail.output {
+            Some(b64) => {
+                Some(vk_hub_proto::from_base64(&b64).context("the job's output is not base64")?)
+            }
+            None => None,
+        };
+        Ok(Some((detail.row, output)))
     }
 
     fn call<T: DeserializeOwned>(&self, call: Call) -> Result<T> {
@@ -1214,6 +1249,11 @@ mod tests {
         assert!(call(&bad).is_err());
         let jobs = call(r#"{"op":"list-jobs","limit":10}"#).unwrap();
         assert_eq!(jobs, serde_json::json!([]));
+        let job = call(&format!(r#"{{"op":"show-job","id":"{id}"}}"#)).unwrap();
+        assert_eq!(job, serde_json::Value::Null);
+        // Not an ID: no file is looked for under it.
+        let job = call(r#"{"op":"show-job","id":"../x"}"#).unwrap();
+        assert_eq!(job, serde_json::Value::Null);
         let audit = hub.db.audits(None, 10).unwrap();
         let events: Vec<&str> = audit.iter().map(|r| r.event.as_str()).collect();
         assert!(

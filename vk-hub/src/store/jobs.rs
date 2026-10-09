@@ -26,6 +26,9 @@ pub(super) const JOB_SPECS: TableDefinition<&str, &[u8]> = TableDefinition::new(
 pub(super) const REQUESTS: TableDefinition<&str, &[u8]> = TableDefinition::new("requests");
 /// Key: a sequence number, oldest submission first. Value: the job's ID.
 pub(super) const JOB_ORDER: TableDefinition<u64, &str> = TableDefinition::new("job_order");
+/// Key: job ID. Value: the end of a failed job's output, kept when its producer settled it
+/// ([`crate::jobs::settle`]), as the node masked it. Goes with the job's record.
+pub(super) const JOB_TAILS: TableDefinition<&str, &[u8]> = TableDefinition::new("job_tails");
 /// The history's bookkeeping. Key: one of the names below. Value: a [`JOB_ORDER`] sequence.
 const JOB_META: TableDefinition<&str, u64> = TableDefinition::new("job_meta");
 /// Every job placed below this in [`JOB_ORDER`] has finished and expired past [`JOB_KEEP`].
@@ -398,6 +401,27 @@ impl Db {
         Ok(true)
     }
 
+    /// Keep job `id`'s output `tail` for as long as its record. Return false without storing
+    /// it if the job is no longer in the history.
+    pub fn keep_job_tail(&self, id: &str, tail: &[u8]) -> Result<bool> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        {
+            if txn.open_table(JOBS)?.get(id)?.is_none() {
+                return Ok(false);
+            }
+            txn.open_table(JOB_TAILS)?.insert(id, tail)?;
+        }
+        txn.commit().context("keeping a job's output")?;
+        Ok(true)
+    }
+
+    /// The end of job `id`'s output kept by [`Db::keep_job_tail`].
+    pub fn job_tail(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(JOB_TAILS)?;
+        Ok(table.get(id)?.map(|g| g.value().to_vec()))
+    }
+
     /// Every job not finished.
     pub fn unfinished_jobs(&self) -> Result<Vec<(String, JobRow)>> {
         let txn = self.db.begin_read().context("starting a read")?;
@@ -514,10 +538,11 @@ impl Db {
     }
 
     /// Keep the history to its newest `keep` jobs: past that count, the oldest finished jobs
-    /// that were settled or expired go, record and spec; a job its producer may still read
-    /// stays. A finished job settled or finished more than [`JOB_KEEP`] before `now` expires:
-    /// its spec goes, and so does its output if it was never settled. The IDs whose output
-    /// files go: the jobs dropped and the jobs expired that still held output.
+    /// that were settled or expired go, record, spec and kept output ([`JOB_TAILS`]); a job
+    /// its producer may still read stays. A finished job settled or finished more than
+    /// [`JOB_KEEP`] before `now` expires: its spec goes, and so does its output file if it was
+    /// never settled, but not its kept output. The IDs whose output files go: the jobs dropped
+    /// and the jobs expired that still held output.
     ///
     /// Trimming reads from the oldest job as far as the excess goes, and at most
     /// [`TRIM_SCAN`] jobs past it; expiring, from
@@ -573,9 +598,11 @@ impl Db {
             for seq in unplaced {
                 order.remove(seq)?;
             }
+            let mut tails = txn.open_table(JOB_TAILS)?;
             for id in &dropped {
                 table.remove(id.as_str())?;
                 specs.remove(id.as_str())?;
+                tails.remove(id.as_str())?;
             }
 
             let from = meta.get(EXPIRED_BELOW)?.map_or(0, |g| g.value());
@@ -639,12 +666,23 @@ fn next_seq(
     Ok(next.max(floor))
 }
 
-/// Append unindexed jobs in submission order and remove entries for missing records,
-/// inside `txn`. Run at every start: an older hub may have added or removed jobs,
-/// either before the index existed or since this hub last ran.
+/// Append unindexed jobs in submission order and remove entries, and kept output, for
+/// missing records, inside `txn`. Run at every start: an older hub may have added or removed
+/// jobs, either before the index existed or since this hub last ran.
 pub(super) fn order_jobs(txn: &redb::WriteTransaction) -> Result<()> {
     let mut order = txn.open_table(JOB_ORDER)?;
     let table = txn.open_table(JOBS)?;
+    let mut tails = txn.open_table(JOB_TAILS)?;
+    let mut orphans = Vec::new();
+    for entry in tails.iter()? {
+        let id = entry?.0.value().to_string();
+        if table.get(id.as_str())?.is_none() {
+            orphans.push(id);
+        }
+    }
+    for id in orphans {
+        tails.remove(id.as_str())?;
+    }
     let (mut placed, mut gone) = (HashSet::new(), Vec::new());
     for entry in order.iter()? {
         let (seq, id) = entry?;
@@ -846,6 +884,30 @@ mod tests {
         let txn = db.db.begin_read().unwrap();
         let meta = txn.open_table(JOB_META).unwrap();
         meta.get(EXPIRED_BELOW).unwrap().map(|g| g.value())
+    }
+
+    /// A failed job's kept output lives as long as its record: past its keep it stays, dropped
+    /// from the history it goes, and none is kept for a job not in it.
+    #[test]
+    fn kept_output_goes_with_its_record() {
+        let db = Db::open_memory().unwrap();
+        let mut failed = job(1, JobState::Finished, Some(FailureClass::Script));
+        failed.settled_at = failed.finished_at;
+        submit(&db, 1, &failed);
+        submit(&db, 2, &settled(2));
+        assert!(db.keep_job_tail(&id(1), b"error: boom\n").unwrap());
+        assert!(!db.keep_job_tail(&id(9), b"x").unwrap());
+        assert_eq!(db.job_tail(&id(9)).unwrap(), None);
+        // Expired, the record stays and so does what was kept of its output.
+        db.prune_jobs(3 + JOB_KEEP, 10).unwrap();
+        assert!(db.job(&id(1)).unwrap().unwrap().expired_at.is_some());
+        assert_eq!(
+            db.job_tail(&id(1)).unwrap().as_deref(),
+            Some(&b"error: boom\n"[..])
+        );
+        db.prune_jobs(3 + JOB_KEEP, 1).unwrap();
+        assert_eq!(listed(&db), [id(2)]);
+        assert_eq!(db.job_tail(&id(1)).unwrap(), None);
     }
 
     /// Past its count, the history drops its oldest settled or expired jobs, record and spec,

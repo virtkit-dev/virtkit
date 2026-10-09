@@ -45,7 +45,7 @@ use vk_hub_proto::{JOBS, NodeState, StorageRole};
 
 use crate::client::ApiError;
 use crate::server::{Hub, Reach};
-use crate::store::{ApiPrincipal, JobFilter, JobPage, JobRow, NodeRow};
+use crate::store::{ApiPrincipal, JobFilter, JobOutcome, JobPage, JobRow, NodeRow};
 
 /// How long a node may be unreachable while it holds a job before the job is lost, by
 /// default.
@@ -96,6 +96,10 @@ const MAX_CAPACITY_ENTRIES: usize = 1024;
 /// The trace limit a job without one is held to, as gitlab-runner's `output_limit`'s default.
 const DEFAULT_OUTPUT_LIMIT: u64 = 4 << 20;
 
+/// How much of a failed job's output is kept once it is settled, by default
+/// (`kept_failure_output` in `hub.toml`).
+pub const DEFAULT_KEPT_FAILURE_OUTPUT: u64 = 256 * 1024;
+
 /// How often the job history is trimmed to its count and outputs past their keep are dropped.
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 
@@ -110,6 +114,9 @@ pub struct Dispatch {
     pub lost_after: Duration,
     /// How many jobs' records the history keeps.
     history: usize,
+    /// How many bytes from the end of a failed job's output are kept when it is settled; 0
+    /// keeps none.
+    pub kept_failure_output: u64,
 }
 
 #[derive(Default)]
@@ -210,6 +217,7 @@ impl Dispatch {
             output_dir,
             lost_after,
             history,
+            kept_failure_output: DEFAULT_KEPT_FAILURE_OUTPUT,
             state: Mutex::new(State {
                 capacity_revision: crate::now_secs().saturating_mul(1000),
                 ..State::default()
@@ -311,6 +319,22 @@ fn read_output(dir: &Path, id: &str, at: u64, max: usize) -> Result<Vec<u8>> {
     }
     buf.truncate(filled);
     Ok(buf)
+}
+
+/// The last `max` bytes of job `id`'s output, `len` bytes long, from the start of a line:
+/// what precedes the first newline is dropped when the cut fell inside a line.
+fn output_tail(dir: &Path, id: &str, len: u64, max: u64) -> Result<Vec<u8>> {
+    let from = len.saturating_sub(max);
+    // From the byte before the cut, so a line starting right at it is kept whole.
+    let start = from.saturating_sub(1);
+    let want = usize::try_from(len.saturating_sub(start)).unwrap_or(usize::MAX);
+    let mut tail = read_output(dir, id, start, want)?;
+    if from > 0 {
+        // With no newline, only that byte goes.
+        let cut = tail.iter().position(|&b| b == b'\n').map_or(1, |nl| nl + 1);
+        tail.drain(..cut.min(tail.len()));
+    }
+    Ok(tail)
 }
 
 /// The length of job `id`'s output file: what of it the hub stored.
@@ -1567,7 +1591,9 @@ pub async fn cancel(
     Ok(view(hub, principal, id).await?.0)
 }
 
-/// Settle `principal`'s finished job `id`: its output is dropped, its record kept.
+/// Settle `principal`'s finished job `id`: delete its output file and keep its record.
+/// For failed jobs, retain the output tail ([`Dispatch::kept_failure_output`]) with the
+/// record so the failure details remain readable.
 pub async fn settle(hub: &Hub, principal: &ApiPrincipal, id: &str) -> Result<(), ApiError> {
     let (_, mut row) = view(hub, principal, id).await?;
     if row.state != JobState::Finished {
@@ -1581,6 +1607,19 @@ pub async fn settle(hub: &Hub, principal: &ApiPrincipal, id: &str) -> Result<(),
         return Ok(());
     }
     let dir = hub.dispatch.output_dir()?.to_path_buf();
+    let keep = hub.dispatch.kept_failure_output;
+    if keep > 0 && row.outcome() == JobOutcome::Failed {
+        // Kept before the file goes: a hub stopped in between keeps it when settled again.
+        let (dir, job, len) = (dir.clone(), id.to_string(), row.output_len);
+        blocking(hub, move |db| {
+            let tail = output_tail(&dir, &job, len, keep)?;
+            if !tail.is_empty() {
+                db.keep_job_tail(&job, &tail)?;
+            }
+            Ok(())
+        })
+        .await?;
+    }
     let path = output_path(&dir, id);
     tokio::task::spawn_blocking(move || match std::fs::remove_file(&path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -1944,6 +1983,141 @@ pub fn history(
     Ok(page)
 }
 
+/// Job `id`'s record and, for a failed job, its node-masked output tail: retained at
+/// settlement or read from the stored output before settlement. Returns `None` if the job
+/// is not in the history.
+pub fn detail(hub: &Hub, id: &str) -> Result<Option<(JobRow, Option<Vec<u8>>)>> {
+    // An output file is named by the ID.
+    if !vk_hub_proto::valid_id(id) {
+        return Ok(None);
+    }
+    let live = live_row(&hub.dispatch.lock(), id).cloned();
+    let Some(row) = live.map_or_else(|| hub.db.job(id), |r| Ok(Some(r)))? else {
+        return Ok(None);
+    };
+    if row.outcome() != JobOutcome::Failed {
+        return Ok(Some((row, None)));
+    }
+    let mut tail = hub.db.job_tail(id)?;
+    let keep = hub.dispatch.kept_failure_output;
+    if tail.is_none()
+        && keep > 0
+        && row.settled_at.is_none()
+        && row.expired_at.is_none()
+        && let Some(dir) = &hub.dispatch.output_dir
+    {
+        tail = Some(output_tail(dir, id, row.output_len, keep)?).filter(|t| !t.is_empty());
+    }
+    Ok(Some((row, tail)))
+}
+
+/// One line of a job's output as [`readable`] makes it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TraceLine {
+    /// When it came, from its stamp (`FF_TIMESTAMPS`): `2026-10-09T12:10:43.123456Z`.
+    pub at: Option<String>,
+    /// Its text, [`crate::ui::html::terminal_safe`].
+    pub text: String,
+}
+
+/// `output`, a job's trace, for reading: lines continued (`+` stamps) joined to the line they
+/// continue, a line rewritten by carriage returns shown as it was left, GitLab's collapsible
+/// section markers removed (a line that held nothing else with them), and the terminal's escape
+/// sequences and other controls dropped.
+pub fn readable(output: &[u8]) -> Vec<TraceLine> {
+    use vk_hub_proto::stamp::HEADER_LEN;
+    // For display alone: an invalid sequence shows as U+FFFD.
+    let output = String::from_utf8_lossy(output);
+    let mut joined: Vec<(Option<String>, String)> = Vec::new();
+    // By stream and `O`/`E` (header bytes 28..31): the index of its last line, which a `+`
+    // continues.
+    let mut last: HashMap<&str, usize> = HashMap::new();
+    for line in output.split_terminator('\n') {
+        let Some(h) = line.get(..HEADER_LEN).filter(|h| stamped(h.as_bytes())) else {
+            joined.push((None, line.to_string()));
+            continue;
+        };
+        let text = line.get(HEADER_LEN..).unwrap_or_default();
+        let key = h.get(28..31).unwrap_or_default();
+        let continued = h.as_bytes().get(HEADER_LEN - 1) == Some(&b'+');
+        match last.get(key).and_then(|&i| joined.get_mut(i)) {
+            Some(prev) if continued => prev.1.push_str(text),
+            _ => {
+                last.insert(key, joined.len());
+                joined.push((
+                    h.get(..HEADER_LEN - 5).map(str::to_string),
+                    text.to_string(),
+                ));
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    for (at, text) in joined {
+        let (text, marked) = without_sections(&text);
+        // What the terminal was left showing: the text after the last carriage return.
+        let shown = text
+            .trim_end_matches('\r')
+            .rsplit('\r')
+            .next()
+            .unwrap_or_default();
+        let text = crate::ui::html::terminal_safe(shown);
+        if marked && text.trim().is_empty() {
+            continue;
+        }
+        lines.push(TraceLine { at, text });
+    }
+    lines
+}
+
+/// Whether `h` is a stamp's header: `2026-10-09T12:10:43.123456Z 01O ` or `+` at its end.
+fn stamped(h: &[u8]) -> bool {
+    let digit = |i: usize| h.get(i).is_some_and(u8::is_ascii_digit);
+    let is = |i: usize, c: u8| h.get(i) == Some(&c);
+    h.len() == vk_hub_proto::stamp::HEADER_LEN
+        && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18]
+            .into_iter()
+            .all(digit)
+        && (20..26).all(digit)
+        && is(4, b'-')
+        && is(7, b'-')
+        && is(10, b'T')
+        && is(13, b':')
+        && is(16, b':')
+        && is(19, b'.')
+        && is(26, b'Z')
+        && is(27, b' ')
+        && h.get(28..30)
+            .is_some_and(|s| s.iter().all(u8::is_ascii_hexdigit))
+        && (is(30, b'O') || is(30, b'E'))
+        && (is(31, b' ') || is(31, b'+'))
+}
+
+/// `line` without GitLab's section markers — `section_start:<time>:<name>[<options>]` and
+/// `section_end:<time>:<name>`, each up to the carriage return that ends it — and whether it
+/// had one.
+fn without_sections(line: &str) -> (String, bool) {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    let mut marked = false;
+    loop {
+        let at = ["section_start:", "section_end:"]
+            .iter()
+            .filter_map(|m| rest.find(m))
+            .min();
+        let Some(at) = at else {
+            out.push_str(rest);
+            return (out, marked);
+        };
+        marked = true;
+        out.push_str(rest.get(..at).unwrap_or_default());
+        let marker = rest.get(at..).unwrap_or_default();
+        rest = match marker.find('\r') {
+            Some(cr) => marker.get(cr + 1..).unwrap_or_default(),
+            None => "",
+        };
+    }
+}
+
 /// Job `id`'s row as the hub holds it ahead of the database, if it does.
 fn live_row<'s>(state: &'s State, id: &str) -> Option<&'s JobRow> {
     (state.jobs.get(id).map(|j| &j.row)).or_else(|| state.finished.get(id))
@@ -1994,6 +2168,11 @@ pub(crate) mod testing {
             .get(id)
             .map(|j| j.output_cap)
             .unwrap()
+    }
+
+    /// [`output_tail`], for tests.
+    pub fn output_tail(dir: &Path, id: &str, len: u64, max: u64) -> Result<Vec<u8>> {
+        super::output_tail(dir, id, len, max)
     }
 
     /// How many placements' capacity revisions the hub keeps.

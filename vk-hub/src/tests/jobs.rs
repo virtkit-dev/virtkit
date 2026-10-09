@@ -2495,3 +2495,240 @@ async fn a_job_s_record_wakes_the_history_and_its_output_does_not() {
     assert!(jobs.has_changed().unwrap());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A hub as [`start_jobs`]'s keeping `keep` bytes of a failed job's output when it is settled.
+async fn start_keeping(dir: &std::path::Path, keep: u64) -> (SocketAddr, Arc<Hub>) {
+    let listener = server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None)
+        .with_jobs(
+            dir.join("jobs"),
+            Duration::from_secs(60),
+            crate::store::DEFAULT_JOB_HISTORY,
+        )
+        .unwrap()
+        .keeping_failure_output(keep);
+    let hub = Arc::new(hub);
+    tokio::spawn(server::serve(listener, None, hub.clone()));
+    tokio::spawn(crate::jobs::drive(hub.clone()));
+    (addr, hub)
+}
+
+/// Run job `n` on `node` to `failure` with `out` as its output, then settle it: its ID.
+async fn settled_job(
+    addr: SocketAddr,
+    key: &str,
+    node: &mut FakeNode,
+    n: u8,
+    out: &[u8],
+    failure: Option<FailureClass>,
+) -> String {
+    let id = running_job(addr, key, node, n).await;
+    node.send(output(&id, 0, out));
+    assert!(matches!(node.job().await, HubJobMsg::OutputAck { .. }));
+    node.send(NodeJobMsg::Result {
+        job: id.clone(),
+        result: result(failure, out.len() as u64),
+    });
+    assert_eq!(node.job().await, HubJobMsg::Recorded { job: id.clone() });
+    view_until(addr, key, &id, |v| v.state == JobState::Finished).await;
+    let path = format!("/v1/jobs/{id}/settle");
+    assert_eq!(api(addr, "POST", &path, Some(key), None).await.status, 204);
+    id
+}
+
+/// Settled, a failed job keeps the end of its output, from a line's start, with its record;
+/// a job that succeeded keeps none, and neither does a hub configured to keep none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_job_keeps_the_end_of_its_output_when_settled() {
+    let dir = scratch("kept");
+    let (addr, hub) = start_keeping(&dir, 16).await;
+    let key = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let out = b"first line\nsecond line\nthird\n";
+
+    // Finished and not yet settled, its page reads the end of the output stored.
+    let id = running_job(addr, &key, &mut node, 1).await;
+    node.send(output(&id, 0, out));
+    assert!(matches!(node.job().await, HubJobMsg::OutputAck { .. }));
+    node.send(NodeJobMsg::Result {
+        job: id.clone(),
+        result: result(Some(FailureClass::System), out.len() as u64),
+    });
+    assert_eq!(node.job().await, HubJobMsg::Recorded { job: id.clone() });
+    let (_, tail) = crate::jobs::detail(&hub, &id).unwrap().unwrap();
+    assert_eq!(tail.as_deref(), Some(&b"third\n"[..]));
+    assert_eq!(hub.db.job_tail(&id).unwrap(), None);
+    let path = format!("/v1/jobs/{id}/settle");
+    assert_eq!(api(addr, "POST", &path, Some(&key), None).await.status, 204);
+    assert!(!dir.join("jobs").join(format!("{id}.out")).exists());
+    // The last 16 bytes, from the line they cut into on.
+    assert_eq!(
+        hub.db.job_tail(&id).unwrap().as_deref(),
+        Some(&b"third\n"[..])
+    );
+    let (row, tail) = crate::jobs::detail(&hub, &id).unwrap().unwrap();
+    assert!(row.settled_at.is_some());
+    assert_eq!(tail.as_deref(), Some(&b"third\n"[..]));
+
+    let script = settled_job(
+        addr,
+        &key,
+        &mut node,
+        2,
+        b"boom\n",
+        Some(FailureClass::Script),
+    )
+    .await;
+    assert_eq!(
+        hub.db.job_tail(&script).unwrap().as_deref(),
+        Some(&b"boom\n"[..])
+    );
+    let ok = settled_job(addr, &key, &mut node, 3, out, None).await;
+    assert_eq!(hub.db.job_tail(&ok).unwrap(), None);
+    assert_eq!(crate::jobs::detail(&hub, &ok).unwrap().unwrap().1, None);
+    let canceled = settled_job(addr, &key, &mut node, 4, out, Some(FailureClass::Canceled)).await;
+    assert_eq!(hub.db.job_tail(&canceled).unwrap(), None);
+
+    // Configured to keep none.
+    let off = dir.join("off");
+    let (addr, hub) = start_keeping(&off, 0).await;
+    let key = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let id = settled_job(addr, &key, &mut node, 1, out, Some(FailureClass::System)).await;
+    assert_eq!(hub.db.job_tail(&id).unwrap(), None);
+    assert_eq!(crate::jobs::detail(&hub, &id).unwrap().unwrap().1, None);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A trace is made readable: stamps parsed and continued lines joined, a line rewritten by
+/// carriage returns shown as it was left, section markers and escape sequences dropped.
+#[test]
+fn a_trace_is_made_readable() {
+    let stamp = "2026-10-09T12:10:43.123456Z";
+    let trace = format!(
+        "{stamp} 00O \x1b[0KRunning with vk\x1b[0;m\n\
+         {stamp} 00O section_start:1700000000:step_script\r\x1b[0K\n\
+         {stamp} 00O+\x1b[0KExecuting \"step_script\"\x1b[0;m\n\
+         {stamp} 01O 10%\r50%\r100%\r\n\
+         {stamp} 01E \x1b[31m<b>error</b>\x1b[0m: \x07boom\n\
+         {stamp} 00O section_end:1700000001:step_script\r\x1b[0K\n\
+         plain \x1b]0;title\x07line\n"
+    );
+    let lines = crate::jobs::readable(trace.as_bytes());
+    let at = Some(stamp.to_string());
+    let want = [
+        (at.clone(), "Running with vk"),
+        (at.clone(), "Executing \"step_script\""),
+        (at.clone(), "100%"),
+        (at.clone(), "<b>error</b>: boom"),
+        (None, "plain line"),
+    ];
+    assert_eq!(
+        lines
+            .iter()
+            .map(|l| (l.at.clone(), l.text.as_str()))
+            .collect::<Vec<_>>(),
+        want
+    );
+    // Not valid UTF-8, it is shown all the same.
+    let lines = crate::jobs::readable(b"bad \xff byte\n");
+    assert_eq!(lines[0].text, "bad \u{fffd} byte");
+    // A continued line joins its own stream's last line, whatever came between.
+    let trace = format!(
+        "{stamp} 01O 10%\r\n\
+         {stamp} 01E warn\n\
+         {stamp} 01O+50%\r100%\n"
+    );
+    let lines = crate::jobs::readable(trace.as_bytes());
+    assert_eq!(
+        lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+        ["100%", "warn"]
+    );
+}
+
+/// The end of a job's output starts at a line's start: a line the cut fell inside is dropped,
+/// one starting right at the cut is kept whole.
+#[test]
+fn an_output_s_end_starts_at_a_line() {
+    let dir = scratch("tail");
+    let id = "a".repeat(32);
+    let output = b"one\ntwo\nthree\n";
+    std::fs::write(dir.join(format!("{id}.out")), output).unwrap();
+    let len = output.len() as u64;
+    let tail = |max| crate::jobs::testing::output_tail(&dir, &id, len, max).unwrap();
+    assert_eq!(tail(len), output);
+    // "two\n" starts right at the cut.
+    assert_eq!(tail(len - 4), b"two\nthree\n");
+    assert_eq!(tail(len - 5), b"three\n");
+    // Inside the last line, with no line after it: nothing.
+    assert_eq!(tail(3), b"");
+    // A line cut with no newline after the cut keeps what follows it.
+    std::fs::write(dir.join(format!("{id}.out")), b"one\ntwo").unwrap();
+    let tail = crate::jobs::testing::output_tail(&dir, &id, 7, 2).unwrap();
+    assert_eq!(tail, b"wo");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// `vk-hub jobs show <id>` prints a job's record and the end of its output, without the
+/// job's escape sequences.
+#[test]
+fn a_job_is_shown_on_the_command_line() {
+    let cli = Cli::try_parse_from(["vk-hub", "jobs", "show", "abc"]).unwrap();
+    let Cmd::Jobs {
+        cmd: Some(JobsCmd::Show { id }),
+        ..
+    } = cli.cmd
+    else {
+        panic!("expected jobs show");
+    };
+    assert_eq!(id, "abc");
+    assert!(Cli::try_parse_from(["vk-hub", "jobs", "--limit", "5", "show", "abc"]).is_err());
+    let mut row = crate::store::JobRow {
+        key: "k".into(),
+        key_name: "gitlab".into(),
+        request_id: request_id(1),
+        placement: placement(),
+        title: "GitLab job 7 of g/p (test)".into(),
+        job_url: Some("https://gitlab.example.com/g/p/-/jobs/7".into()),
+        project: Some("g/p".into()),
+        name: Some("test".into()),
+        created_at: 1000,
+        state: JobState::Finished,
+        revision: 3,
+        node: Some("ab".repeat(16)),
+        stage: None,
+        cancel: None,
+        result: Some(result(Some(FailureClass::System), 30)),
+        output_len: 30,
+        started_at: Some(1010),
+        finished_at: Some(1070),
+        settled_at: Some(1080),
+        expired_at: None,
+    };
+    row.result.as_mut().unwrap().message = Some("the VM did not boot".into());
+    let id = "cd".repeat(16);
+    let out = render_job(
+        &id,
+        &row,
+        Some(b"2026-10-09T12:10:43.123456Z 00O \x1b[31mno kernel\x1b[0m\n"),
+        2000,
+    );
+    for want in [
+        format!("job          {id}\n"),
+        "state        failed: system failure\n".to_string(),
+        "message      the VM did not boot\n".to_string(),
+        "gitlab       https://gitlab.example.com/g/p/-/jobs/7\n".to_string(),
+        "finished     1970-01-01T00:17:50Z\n".to_string(),
+        "ran          1m00s\n".to_string(),
+        "\nThe last 51 bytes of its output, masked as the node streamed it:\n\
+         12:10:43 no kernel\n"
+            .to_string(),
+    ] {
+        assert!(out.contains(&want), "{want:?} not in {out}");
+    }
+    assert!(!out.contains('\x1b'), "{out}");
+    // A link that is not a plain web one is left out.
+    row.job_url = Some("javascript:alert(1)".into());
+    assert!(!render_job(&id, &row, None, 2000).contains("gitlab "));
+}

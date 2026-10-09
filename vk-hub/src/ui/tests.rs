@@ -3569,6 +3569,116 @@ pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
     }
 }
 
+/// A failed job links from the history to its page, which shows any session its record and
+/// the end of its output the hub kept, as text: escaped, its escape sequences and GitLab's
+/// section markers dropped, its stamps shown as times.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_job_s_page_shows_the_end_of_its_output() {
+    use vk_hub_proto::client::JobState;
+    use vk_hub_proto::job::{FailureClass, JobResult};
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let now = crate::now_secs();
+    let id = |n: u64| format!("{n:032x}");
+    let ended = |n: u64, failure| {
+        let mut row = history_job(n, "acme/web");
+        row.state = JobState::Finished;
+        row.node = Some(node.clone());
+        row.job_url = Some(format!("https://gitlab.example.com/acme/web/-/jobs/{n}"));
+        row.started_at = Some(now - 5);
+        row.finished_at = Some(now);
+        row.settled_at = Some(now);
+        row.result = Some(JobResult {
+            failure,
+            exit_code: None,
+            message: Some("the VM <did> not boot".into()),
+            output_len: 0,
+            artifacts: Vec::new(),
+            usage: None,
+        });
+        row
+    };
+    for (n, failure) in [
+        (1, Some(FailureClass::System)),
+        (2, None),
+        (3, Some(FailureClass::Lost)),
+    ] {
+        hub.db
+            .submit_job(
+                &id(n),
+                &ended(n, failure),
+                &n.to_string(),
+                b"{}",
+                "key gitlab",
+                now,
+            )
+            .unwrap();
+    }
+    let stamp = "2026-10-09T12:10:43.123456Z";
+    let tail = format!(
+        "{stamp} 00O section_start:1700000000:prepare\r\x1b[0K\n\
+         {stamp} 01E \x1b[31m<script>alert(1)</script>\x1b[0m\n"
+    );
+    assert!(hub.db.keep_job_tail(&id(1), tail.as_bytes()).unwrap());
+
+    let page = get(addr, "/jobs", Some(&viewer)).await.body;
+    assert!(
+        page.contains(&format!(
+            "<a href=\"/jobs/{}\"><span class=\"badge bad\" title=\"the VM &lt;did&gt; not \
+             boot\">system failure</span></a>",
+            id(1)
+        )),
+        "{page}"
+    );
+    // One that succeeded has no page linked.
+    assert!(!page.contains(&format!("/jobs/{}", id(2))), "{page}");
+
+    let reply = get(addr, &format!("/jobs/{}", id(1)), Some(&viewer)).await;
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let page = reply.body;
+    assert_only_embedded_scripts(&page);
+    for want in [
+        "<h1>build-1</h1>",
+        "<a href=\"https://gitlab.example.com/acme/web/-/jobs/1\" target=\"_blank\" \
+         rel=\"noopener noreferrer\">On GitLab</a>",
+        "<tr><th>Failure class</th><td>system failure</td></tr>",
+        "<tr><th>Message</th><td>the VM &lt;did&gt; not boot</td></tr>",
+        &format!("<a href=\"/node/{node}\">ci-1</a>"),
+        "<h2>End of its output</h2>",
+        "<pre><time title=\"2026-10-09T12:10:43.123456Z\">12:10:43</time> \
+         &lt;script&gt;alert(1)&lt;/script&gt;\n</pre>",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    assert!(
+        !page.contains('\x1b') && !page.contains("section_start"),
+        "{page}"
+    );
+    let page = get(addr, &format!("/jobs/{}", id(3)), Some(&viewer))
+        .await
+        .body;
+    assert!(page.contains("<p class=\"empty\">none kept</p>"), "{page}");
+    let page = get(addr, &format!("/jobs/{}", id(2)), Some(&viewer))
+        .await
+        .body;
+    assert!(page.contains("<span class=\"badge ok\""), "{page}");
+    assert!(!page.contains("End of its output"), "{page}");
+
+    let reply = get(addr, &format!("/jobs/{}", id(9)), Some(&viewer)).await;
+    assert_eq!(reply.status, 404);
+    assert!(
+        reply.body.contains("There is no such job."),
+        "{}",
+        reply.body
+    );
+    let reply = get(addr, "/jobs/zz", Some(&viewer)).await;
+    assert_eq!(reply.status, 404);
+    let reply = get(addr, &format!("/jobs/{}", id(1)), None).await;
+    assert_eq!(reply.status, 401);
+    assert!(!reply.body.contains("alert"), "{}", reply.body);
+}
+
 /// `/jobs`' newest page follows the jobs as they change, filtered as the page is; an older
 /// page stays as loaded, and a stream with a filter the page would not take is refused.
 #[tokio::test(flavor = "multi_thread")]

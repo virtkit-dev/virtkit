@@ -199,12 +199,12 @@ system unit when run as root), preserving enrollment.
 `vk-hub serve [--config hub.toml]` serves nodes. `hub.toml` sets `addr` (default
 `127.0.0.1:8443`), `tls_cert` and `tls_key`, `data_dir` (default `$XDG_DATA_HOME/virtkit/hub`,
 else `~/.local/share/virtkit/hub`), `release_repository` (see [Releases](#releases)), and the
-web UI's keys (see [Web UI](#web-ui)), and `job_lost_after_secs` and `job_history` (see
-[Placed jobs](#placed-jobs)). Every key is optional and an unknown one is an error. Without TLS
-the hub serves only on loopback. TLS is 1.3 only, on both the hub and the node. `vk-hub token`,
-`vk-hub nodes`, `vk-hub release`, `vk-hub tools`, `vk-hub workloads`, `vk-hub audit`,
-`vk-hub ui`, `vk-hub keys` and `vk-hub jobs` reach the running hub through
-`<data_dir>/admin.sock`, open to the hub's user and root.
+web UI's keys (see [Web UI](#web-ui)), and `job_lost_after_secs`, `job_history` and
+`kept_failure_output` (see [Placed jobs](#placed-jobs)). Every key is optional and an unknown
+one is an error. Without TLS the hub serves only on loopback. TLS is 1.3 only, on both the hub
+and the node. `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub tools`,
+`vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub keys` and `vk-hub jobs` reach the
+running hub through `<data_dir>/admin.sock`, open to the hub's user and root.
 
 `vk node run` holds a WebSocket session at `/v1/node` in the foreground. The node signs the
 hub's challenge, its node ID and incarnation (new on every `vk node run`), both version ranges,
@@ -984,6 +984,21 @@ answers at most 1 MiB. Settling a finished job deletes its output and keeps its 
 never settled loses its output 30 days after it finished, and reading it is then 404 as for a
 settled job; every job loses its redacted spec 30 days after it was settled or finished.
 
+**Failed jobs' output.** Settling a job that failed — any failure but a cancel: a script
+failure, a timeout, a system failure, `no_capacity`, `lost`… — first keeps the end of its output
+with its record, so why it failed stays readable once the node's job dir is gone and when
+GitLab's trace was cut or is out of the reader's reach: the last `kept_failure_output` bytes
+(`256K` by default; `K`, `M` or `G`, at most `4M`; `"0"` keeps none), from the first line that
+starts in them. It is the output as the hub stored it, masked by the node before it was sent;
+the hub masks nothing more, and every signed-in session of the web UI, a viewer's included, can
+read it. The kept output lives exactly as long as the record: the 30 days that expire an
+unsettled job's output do not touch it, and it goes when the history drops the record. A failed
+job its producer never settles keeps none: its output goes with those 30 days. Before it is
+settled, a failed job's page reads the same end from the stored output. The database holds
+roughly `job_history` × `kept_failure_output` of it — about 2.4 GiB at the defaults, were every
+job to fail; more between the hourly trims, or for tails kept before `kept_failure_output` was
+lowered — and its file does not shrink when they go.
+
 **History.** The hub keeps the records of the newest `job_history` jobs (10,000 by default, 1 to
 1,000,000), in submission order: once an hour the oldest finished ones past that count go if
 they were settled or are past those 30 days; a job not finished, or finished and not yet
@@ -1007,7 +1022,11 @@ nodes resending output from the end of the stored file.
 
 `vk-hub jobs [--limit 50]` lists the latest jobs: ID, key, pool, state or how it ended, node,
 output length, age, how long it ran (or has been running), its VM's peak memory, and what the
-job is. The web UI's jobs page shows the whole history to viewers and operators alike (see
+job is. `vk-hub jobs show <id>` prints one job's record, one field per line: outcome, exit
+code, node message, GitLab page, node, pool, key, submission/start/finish/settlement times,
+run time and resource usage. For failed jobs it also prints the end of the output, made
+readable as in the web UI (below), so the job's escape sequences never reach the terminal.
+The web UI's jobs page shows the whole history to viewers and operators alike (see
 [Web UI](#web-ui)).
 
 ## Web UI
@@ -1053,13 +1072,13 @@ Operators grant who signs in through the OIDC provider, and as what, from `/user
 in](#signing-in)). A page is refused to a request whose `Sec-Fetch-Site` is `same-site` or
 `cross-site`.
 
-`/jobs` shows viewers and operators the job history (see [Placed jobs](#placed-jobs)),
-newest first, 100 jobs per page, with a link to older jobs. Each row shows the job, linked to
-GitLab when the spec names a plain web URL; its project; its node, linked to the node's page;
-and its result: running with its stage, succeeded, failed with its class and exit code (the
-node's message on hover), or canceled. It also shows when a node accepted the job, its elapsed
-run time, its VM's peak memory and CPU time, and the guest's vCPUs and memory, falling back to
-the placement envelope when the node did not report the guest size.
+`/jobs` shows viewers and operators the job history (see [Placed jobs](#placed-jobs)), newest
+first, 100 jobs per page, with a link to older jobs. Each row shows the job, linked to GitLab
+when the spec names a plain web URL; its project; its node, linked to the node's page; and its
+result: running with its stage, succeeded, failed with its class and exit code (the node's
+message on hover, and a link to the job's page), or canceled. It also shows when a node accepted
+the job, its elapsed run time, its VM's peak memory and CPU time, and the guest's vCPUs and
+memory, falling back to the placement envelope when the node did not report the guest size.
 
 Node, project and result filters (`running` for queued or running jobs, `success`, `failed`,
 `canceled`) carry over to older pages. The summary covers the newest 10,000 matching jobs:
@@ -1067,6 +1086,14 @@ the count, the share of finished jobs that succeeded (without a result filter), 
 run time of finished jobs. The newest page of each filter updates live (below). Older pages
 stay as loaded, say so and link back to the newest. The filter form stays outside the live
 fragment so updates preserve selections in progress. Each node's page links to its jobs.
+
+`/jobs/<id>` shows viewers and operators the job's result, failure class, exit code, node
+message, GitLab page when the spec names a plain web URL, project, node, pool, key,
+submission/start/finish/settlement times, run time and resource usage. For failed jobs it
+shows the end of the output (see [Placed jobs](#placed-jobs)) as text in a `<pre>`. Continued
+lines are rejoined; carriage-return updates show the final text. GitLab section markers,
+terminal escape sequences and other controls are removed. Each line's timestamp shows the
+time of day, with the full timestamp on hover.
 
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a
