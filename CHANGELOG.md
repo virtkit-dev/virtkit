@@ -6,6 +6,7 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **`vk-hub`'s web UI shows virtkit's logo as its browser tab icon.**
 - **`vk-hub` holds CI tools definitions and has nodes build them.** `vk-hub tools add <dir>
   --version <label>` takes a build context — a Dockerfile whose `tools` stage holds static `git` and
   any other tools, such as `git-lfs` — packed so that the same tree is the same definition; `vk-hub

@@ -329,7 +329,7 @@ async fn route(req: Request<Incoming>, ui: &Ui) -> Result<Response<Body>> {
         (Method::GET, oidc::LOGIN_PATH) => oidc::start(&req, ui).await,
         // Exempt from the check below: the provider's page is another site's.
         (Method::GET, oidc::CALLBACK_PATH) => oidc::callback(&req, ui).await,
-        // Asked for by every browser whatever the page says; there is none.
+        // Still probed by browsers that skip the pages' SVG icon link; there is no `.ico`.
         (Method::GET, "/favicon.ico") => {
             let mut resp = Response::new(Body::default());
             *resp.status_mut() = StatusCode::NO_CONTENT;

@@ -550,6 +550,25 @@ async fn assets_are_served_for_good_under_their_hash() {
     let etag = reply.header("etag").unwrap().to_string();
     let reply = request(addr, "GET", path, &[&format!("If-None-Match: {etag}")], "").await;
     assert_eq!(reply.status, 304);
+    // The icon every page names: the docs' logo mark, kept in step with it.
+    assert_eq!(
+        include_bytes!("../../assets/favicon.svg"),
+        include_bytes!("../../../docs/assets/logo-mark.svg")
+    );
+    let icon = assets::url(assets::ICON);
+    let reply = get(addr, icon, None).await;
+    assert_eq!(reply.status, 200);
+    assert_secure(&reply);
+    assert_eq!(reply.header("content-type"), Some("image/svg+xml"));
+    assert!(reply.body.starts_with("<svg"));
+    let page = get(addr, "/", None).await;
+    assert!(
+        page.body.contains(&format!(
+            "<link rel=\"icon\" type=\"image/svg+xml\" href=\"{icon}\">"
+        )),
+        "{}",
+        page.body
+    );
     for (name, script) in [
         (assets::HTMX, include_str!("../../assets/htmx.min.js")),
         (assets::SSE, include_str!("../../assets/sse.min.js")),
