@@ -6,15 +6,22 @@ authors.workspace = true
 license.workspace = true
 description = "A GitLab runner that hands jobs to a virtkit fleet hub"
 
-# Integration tests drive the library against an in-process fake GitLab.
+# The library holds the config, GitLab API client, job log, poll loop and dispatcher;
+# the binary provides the CLI. Integration tests use an in-process fake GitLab.
 [lib]
 name = "vk_gitlab"
 path = "src/lib.rs"
 
+[[bin]]
+name = "vk-gitlab"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 bytes.workspace = true
 # `kv`: the structured fields every log line carries (runner, job, correlation_id, …).
 log = { workspace = true, features = ["kv", "std"] }
@@ -25,7 +32,10 @@ rustls.workspace = true
 ring.workspace = true
 # RateLimit-ResetTime / Retry-After dates.
 httpdate.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "time", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync", "signal"] }
+
+[target.'cfg(target_env = "musl")'.dependencies]
+jemallocator.workspace = true
 
 [dev-dependencies]
 # The fake GitLab the integration tests run in-process.

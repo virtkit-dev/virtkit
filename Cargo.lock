@@ -4107,10 +4107,12 @@ version = "0.86.1"
 dependencies = [
  "anyhow",
  "bytes",
+ "clap",
  "http-body-util",
  "httpdate",
  "hyper",
  "hyper-util",
+ "jemallocator",
  "log",
  "reqwest",
  "ring",
@@ -4118,6 +4120,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml",
 ]
 
 [[package]]
