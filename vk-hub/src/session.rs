@@ -1,7 +1,7 @@
 //! One node's WebSocket session: authenticate against the key pinned at enrollment with
 //! hello/challenge/auth, then store inventory, heartbeats and reports until it disconnects.
 //! From version [`STEERING`], also send desired state and commands; from version [`JOBS`],
-//! reservations and jobs ([`crate::jobs`]).
+//! reservations and jobs ([`crate::jobs`]); from version [`vk_hub_proto::TOOLS`], tools builds.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -35,11 +35,11 @@ const HANDSHAKE_STEP: Duration = crate::server::PRE_AUTH_TIMEOUT;
 #[cfg(test)]
 const HANDSHAKE_STEP: Duration = Duration::from_secs(1);
 
-/// The protocol versions this hub speaks: [`vk_hub_proto::PROTOCOL`]'s and [`JOBS`]. A node
-/// offering less negotiates the highest version both speak.
+/// The protocol versions this hub speaks: [`vk_hub_proto::PROTOCOL`]'s, [`JOBS`] and
+/// [`vk_hub_proto::TOOLS`]. A node offering less negotiates the highest version both speak.
 pub const PROTOCOL: VersionRange = VersionRange {
     min: vk_hub_proto::PROTOCOL.min,
-    max: JOBS,
+    max: vk_hub_proto::TOOLS,
 };
 
 /// What a node removed from the hub is told.
@@ -486,6 +486,13 @@ impl Steer {
             send(ws, &HubMsg::Desired(desired)).await?;
         }
         for command in pending {
+            // A node below it could not read one: the command waits for a session that can
+            // carry it, or expires.
+            if matches!(command.op, vk_hub_proto::Operation::Tools { .. })
+                && node.version < vk_hub_proto::TOOLS
+            {
+                continue;
+            }
             if self.sent_commands.insert(command.id.clone()) {
                 send(ws, &HubMsg::Command(command)).await?;
             }

@@ -37,6 +37,7 @@ mod rollout;
 mod server;
 mod session;
 mod store;
+mod tools;
 mod ui;
 mod workloads;
 
@@ -93,6 +94,20 @@ enum Cmd {
         config: ConfigArg,
         #[command(subcommand)]
         cmd: ReleaseCmd,
+    },
+    /// Keep the CI tools definitions nodes build their tools_dir from
+    ///
+    /// A definition is a build context: a directory with a Dockerfile whose `tools` stage
+    /// holds static tools (git, git-lfs, gitlab-runner…) at its root. `vk-hub nodes tools`
+    /// has nodes build one with `vk build` and install what the stage holds as
+    /// `<state_dir>/tools/current`, the directory their `[executor] tools_dir` names. Those
+    /// tools then run in every job VM: holding the admin socket is what registering them
+    /// takes.
+    Tools {
+        #[command(flatten)]
+        config: ConfigArg,
+        #[command(subcommand)]
+        cmd: ToolsCmd,
     },
     /// Roll a release out to the fleet, a wave at a time
     Rollout {
@@ -210,6 +225,29 @@ enum ReleaseCmd {
     Remove {
         /// Its sha256, or at least the first 8 hex digits
         release: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ToolsCmd {
+    /// Pack a build context into a tools definition the hub holds
+    ///
+    /// Regular files and directories only, packed reproducibly: the same tree is the same
+    /// definition, by sha256. It needs a Dockerfile at its root; the directory must be
+    /// readable by the hub's user.
+    Add {
+        /// The build context
+        dir: PathBuf,
+        /// A label for it, shown beside it on every node that builds it
+        #[arg(long)]
+        version: String,
+    },
+    /// List the tools definitions the hub holds
+    List,
+    /// Delete a tools definition, unless a node still has to build it
+    Remove {
+        /// Its sha256, or at least the first 8 hex digits
+        tools: String,
     },
 }
 
@@ -504,6 +542,23 @@ enum NodesCmd {
         /// Pool names separated by commas, or `none`
         pools: String,
     },
+    /// Ask the node to build a tools definition and make the tools current
+    ///
+    /// The node builds it with `vk build` in microVMs, apart from its build cache, checks
+    /// that the `tools` stage holds git and gitlab-runner, and switches
+    /// `<state_dir>/tools/current` to them: jobs that start from then on get them, running
+    /// ones keep theirs. Nothing drains. Needs protocol version 4 on the node.
+    Tools {
+        /// The node's ID; omitted with --all
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<String>,
+        /// Every node that speaks version 4 and has not these tools current or building
+        #[arg(long)]
+        all: bool,
+        /// The definition's sha256, or at least its first 8 hex digits
+        #[arg(long)]
+        tools: String,
+    },
     /// Ask the node to replace its vk with a release the hub holds
     Update {
         id: String,
@@ -631,6 +686,31 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                     Ok(())
                 }
+                Some(NodesCmd::Tools { id, all: _, tools }) => {
+                    let issued = tokio::task::spawn_blocking(move || {
+                        client.node_tools(id.as_deref(), &tools)
+                    })
+                    .await??;
+                    for n in issued {
+                        match (n.command, n.skipped) {
+                            (Some(command), _) => eprintln!(
+                                "vk-hub: {} ({}): issued (command {command})",
+                                n.hostname, n.id
+                            ),
+                            (None, why) => eprintln!(
+                                "vk-hub: {} ({}): skipped: {}",
+                                n.hostname,
+                                n.id,
+                                why.unwrap_or_default()
+                            ),
+                        }
+                    }
+                    eprintln!(
+                        "vk-hub: `vk-hub nodes` and `vk-hub audit --node <id>` show how the \
+                         builds go"
+                    );
+                    Ok(())
+                }
                 Some(NodesCmd::Update { id, release, force }) => {
                     let command = tokio::task::spawn_blocking(move || {
                         client.update_node(&id, &release, force)
@@ -723,6 +803,10 @@ async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Tools { config, cmd } => {
+            let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
+            tools_cmd(client, cmd).await
+        }
         Cmd::Rollout { config, cmd } => {
             let client = admin_client(&HubConfig::load(config.config.as_deref())?)?;
             rollout_cmd(client, cmd).await
@@ -810,6 +894,50 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn tools_cmd(client: admin::Client, cmd: ToolsCmd) -> Result<()> {
+    match cmd {
+        ToolsCmd::Add { dir, version } => {
+            // Absolute, since the hub resolves it from its own working directory.
+            let dir = std::path::absolute(&dir)
+                .with_context(|| format!("resolving {}", dir.display()))?;
+            let added =
+                tokio::task::spawn_blocking(move || client.add_tools(&dir, &version)).await??;
+            // The sha256 alone on stdout, so `$(vk-hub tools add …)` captures it.
+            println!("{}", added.sha256);
+            eprintln!(
+                "vk-hub: holding tools {} ({} files, {} bytes packed); `vk-hub nodes tools <id> \
+                 --tools {}` has a node build them",
+                added.row.version,
+                added.row.files,
+                added.row.size,
+                store::short(&added.sha256)
+            );
+        }
+        ToolsCmd::List => {
+            let tools = tokio::task::spawn_blocking(move || client.tools()).await??;
+            for t in tools {
+                println!(
+                    "{}  {:<16}  {:>4} files  {:>10}  added {} by {}",
+                    t.sha256,
+                    t.row.version,
+                    t.row.files,
+                    t.row.size,
+                    utc(t.row.added_at),
+                    t.row.added_by
+                );
+            }
+        }
+        ToolsCmd::Remove { tools } => {
+            let what = tools.clone();
+            match tokio::task::spawn_blocking(move || client.remove_tools(&tools)).await?? {
+                Some(t) => eprintln!("vk-hub: removed tools {}", t.sha256),
+                None => bail!("there are no tools {what}"),
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn rollout_cmd(client: admin::Client, cmd: RolloutCmd) -> Result<()> {
@@ -1079,11 +1207,13 @@ async fn serve(cfg: HubConfig) -> Result<()> {
         );
     }
     let db = Arc::new(db);
-    // Before anything could be staging a release: what is staged is a stopped hub's.
+    // Before anything could be staging a release or tools: what is staged is a stopped hub's.
     releases::sweep(&cfg.releases_dir());
+    releases::sweep(&cfg.tools_dir());
     let mut hub = server::Hub::new(db, cfg.ui.as_ref().map(|ui| ui.url.clone()))
         .with_node_url(cfg.node_url())
         .with_releases(cfg.releases_dir())
+        .with_tools(cfg.tools_dir())
         .with_release_source(cfg.release_source.clone());
     if oidc.is_some() {
         if let Some(role) = default_role {
@@ -1668,6 +1798,51 @@ fn node_notes(n: &ops::NodeView) -> Vec<String> {
             n.hostname
         ));
     }
+    notes.extend(tools_notes(n));
+    notes
+}
+
+/// What a node says of its CI tools: those current, and the build under way or the last one,
+/// with the end of its output when it failed.
+fn tools_notes(n: &ops::NodeView) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(t) = &n.tools {
+        let found: Vec<String> = t.tools.values().cloned().collect();
+        notes.push(format!(
+            "{}: tools {} ({}){}{}",
+            n.hostname,
+            t.version,
+            store::short(&t.sha256),
+            if found.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", found.join(", "))
+            },
+            if t.in_use {
+                ""
+            } else {
+                "; not in use: [executor] tools_dir names another directory"
+            }
+        ));
+    }
+    let Some(b) = n.report.as_ref().and_then(|r| r.tools.as_ref()) else {
+        return notes;
+    };
+    // A build that ended well is the tools line above.
+    if b.phase == vk_hub_proto::ToolsPhase::Done {
+        return notes;
+    }
+    notes.push(format!(
+        "{}: tools {} ({}): {}{}",
+        n.hostname,
+        b.version,
+        store::short(&b.sha256),
+        store::tools_phase_name(b.phase),
+        b.message
+            .as_deref()
+            .map_or_else(String::new, |m| format!(": {m}"))
+    ));
+    notes.extend(b.log.iter().map(|line| format!("    {line}")));
     notes
 }
 

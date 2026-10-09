@@ -1,7 +1,7 @@
-//! `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub rollout`, `vk-hub workloads`,
-//! `vk-hub audit`, `vk-hub ui`, `vk-hub accounts`, `vk-hub keys`, `vk-hub jobs` and
-//! `vk-hub local login`, `sessions` and `logout` reach the running hub through a unix socket
-//! in its data directory.
+//! `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub tools`, `vk-hub rollout`,
+//! `vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub accounts`, `vk-hub keys`,
+//! `vk-hub jobs` and `vk-hub local login`, `sessions` and `logout` reach the running hub
+//! through a unix socket in its data directory.
 //!
 //! Enrollment tokens admit machines to the fleet and must be issued outside the node-facing
 //! network; sign-in links must be issued outside the web UI. The CLI cannot open the database:
@@ -29,7 +29,9 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::ops::{self, AccountOutcome, NodeView};
 use crate::rollout::{Rollout, RolloutAction};
 use crate::server::Hub;
-use crate::store::{AccountRow, AuditRow, JobRow, KeyPolicy, KeyRow, Release, Role, UiSession};
+use crate::store::{
+    AccountRow, AuditRow, JobRow, KeyPolicy, KeyRow, Release, Role, Tools, UiSession,
+};
 use vk_hub_proto::{Acquisition, Command, DesiredState, Operation};
 
 /// Bumped only for a change an older peer could misread.
@@ -50,8 +52,8 @@ const MAX_REPLY_VALUE: usize = (MAX_REPLY - 64 * 1024) as usize;
 /// adding a release, which copies and hashes a binary first: see [`ADD_TIMEOUT`].
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long the CLI waits for a release to be added: a gigabyte copied and hashed on a slow
-/// disk. An add retried after this ran out finds the release added and answers with it.
+/// How long the CLI waits for a release or tools to be added: a gigabyte copied and hashed on
+/// a slow disk. An add retried after this ran out finds the release added and answers with it.
 const ADD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How long the CLI waits for a fetch: past the hub's own limit on one, so it hears how it
@@ -112,6 +114,22 @@ enum Call {
     ListReleases,
     RemoveRelease {
         release: String,
+    },
+    /// Pack the build context at `path`, which the hub's user must be able to read, into a
+    /// tools definition.
+    AddTools {
+        path: PathBuf,
+        version: String,
+    },
+    ListTools,
+    RemoveTools {
+        tools: String,
+    },
+    /// Have a node build a tools definition, named by its sha256 or a prefix of it; `None`
+    /// for every node that can and needs to.
+    NodeTools {
+        id: Option<String>,
+        tools: String,
     },
     CreateRollout {
         plan: ops::RolloutPlan,
@@ -418,6 +436,27 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
             let removed = crate::releases::remove(hub, &actor, &release.sha256)?;
             serde_json::to_value(removed.then_some(release))?
         }
+        Call::AddTools { path, version } => {
+            serde_json::to_value(crate::tools::add(hub, &actor, &path, &version)?)?
+        }
+        Call::ListTools => serde_json::to_value(hub.db.tools_list()?)?,
+        Call::RemoveTools { tools } => {
+            let tools = hub.db.resolve_tools(&tools)?;
+            let removed = crate::tools::remove(hub, &actor, &tools.sha256)?;
+            serde_json::to_value(removed.then_some(tools))?
+        }
+        Call::NodeTools {
+            id: Some(id),
+            tools,
+        } => serde_json::to_value(vec![ops::ToolsIssued {
+            command: Some(ops::tools(hub, &actor, &id, &tools)?.id),
+            hostname: hub.db.node(&id)?.map(|n| n.hostname).unwrap_or_default(),
+            skipped: None,
+            id,
+        }])?,
+        Call::NodeTools { id: None, tools } => {
+            serde_json::to_value(ops::tools_all(hub, &actor, &tools)?)?
+        }
         Call::CreateRollout { plan } => {
             serde_json::to_value(ops::create_rollout(hub, &actor, &plan)?)?
         }
@@ -645,6 +684,33 @@ impl Client {
         })
     }
 
+    pub fn add_tools(&self, path: &Path, version: &str) -> Result<Tools> {
+        self.call(Call::AddTools {
+            path: path.to_path_buf(),
+            version: version.to_string(),
+        })
+    }
+
+    pub fn tools(&self) -> Result<Vec<Tools>> {
+        self.call(Call::ListTools)
+    }
+
+    /// The definition removed, or `None` when another removal took it first. A prefix naming
+    /// none is an error.
+    pub fn remove_tools(&self, tools: &str) -> Result<Option<Tools>> {
+        self.call(Call::RemoveTools {
+            tools: tools.to_string(),
+        })
+    }
+
+    /// Have node `id`, or with `None` every node that can and needs to, build `tools`.
+    pub fn node_tools(&self, id: Option<&str>, tools: &str) -> Result<Vec<ops::ToolsIssued>> {
+        self.call(Call::NodeTools {
+            id: id.map(str::to_string),
+            tools: tools.to_string(),
+        })
+    }
+
     pub fn create_rollout(&self, plan: ops::RolloutPlan) -> Result<Rollout> {
         self.call(Call::CreateRollout { plan })
     }
@@ -740,7 +806,7 @@ impl Client {
 
     fn call<T: DeserializeOwned>(&self, call: Call) -> Result<T> {
         let timeout = match call {
-            Call::AddRelease { .. } => ADD_TIMEOUT,
+            Call::AddRelease { .. } | Call::AddTools { .. } => ADD_TIMEOUT,
             Call::FetchRelease { .. } => FETCH_WAIT,
             Call::LatestRelease => CHECK_WAIT,
             _ => IO_TIMEOUT,
@@ -868,6 +934,79 @@ mod tests {
         std::fs::write(&file, b"keep").unwrap();
         assert!(bind(&file).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The tools calls, as the CLI sends them: added from a directory, issued to one node and
+    /// to every node, listed, and removed once nothing is left to build, each audited as the
+    /// caller.
+    #[test]
+    fn tools_calls_are_served_and_audited_as_the_caller() {
+        let dir = scratch("tools");
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None).with_tools(dir.join("held"));
+        let ctx = dir.join("ctx");
+        std::fs::create_dir_all(&ctx).unwrap();
+        std::fs::write(ctx.join("Dockerfile"), "FROM scratch AS tools\n").unwrap();
+        let (token, _) = hub
+            .db
+            .create_token(Duration::from_secs(60), "uid 0", 0)
+            .unwrap();
+        let crate::store::Enrollment::Enrolled { node_id: id } =
+            hub.db.enroll(&token, "aa", "h", "peer p", 1).unwrap()
+        else {
+            panic!("expected an enrollment");
+        };
+        let call = |call: serde_json::Value| {
+            dispatch(
+                serde_json::json!({"v": 1, "call": call})
+                    .to_string()
+                    .as_bytes(),
+                &hub,
+                7,
+            )
+        };
+        let added: Tools = serde_json::from_value(
+            call(serde_json::json!({"op": "add-tools", "path": ctx, "version": "2026.10"}))
+                .unwrap(),
+        )
+        .unwrap();
+        let listed: Vec<Tools> =
+            serde_json::from_value(call(serde_json::json!({"op": "list-tools"})).unwrap()).unwrap();
+        assert_eq!(listed, std::slice::from_ref(&added));
+        let prefix = &added.sha256[..8];
+        let one: Vec<ops::ToolsIssued> = serde_json::from_value(
+            call(serde_json::json!({"op": "node-tools", "id": id, "tools": prefix})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!((one.len(), one[0].hostname.as_str()), (1, "h"));
+        assert!(one[0].command.is_some());
+        let all: Vec<ops::ToolsIssued> = serde_json::from_value(
+            call(serde_json::json!({"op": "node-tools", "id": null, "tools": prefix})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            all[0].skipped.as_deref(),
+            Some("is building these tools already")
+        );
+        let err = call(serde_json::json!({"op": "remove-tools", "tools": prefix})).unwrap_err();
+        assert!(format!("{err:#}").contains("still has to build"), "{err:#}");
+        let events: Vec<String> = hub
+            .db
+            .audits(None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|a| format!("{} {}", a.actor, a.event))
+            .collect();
+        let short = crate::store::short(&added.sha256);
+        for want in [
+            format!("uid 7 uid 7 added tools {short} as version 2026.10 (1 file)"),
+            format!("uid 7 uid 7 issued tools 2026.10 ({short})"),
+        ] {
+            assert!(
+                events.iter().any(|e| e.starts_with(&want)),
+                "{want}: {events:?}"
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

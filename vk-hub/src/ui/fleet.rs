@@ -227,6 +227,7 @@ fn read_operations(hub: &Hub) -> Result<Operations> {
     rollouts.truncate(OPERATIONS_ROLLOUTS);
     Ok(Operations {
         releases: hub.db.releases()?,
+        tools: hub.db.tools_list()?,
         rollouts,
         source: hub.fetches.source().map(|s| s.url().to_string()),
         fetch: hub.fetches.status(),
@@ -237,6 +238,8 @@ fn read_operations(hub: &Hub) -> Result<Operations> {
 /// What `/operations` shows.
 struct Operations {
     releases: Vec<Release>,
+    /// The tools definitions held, newest first.
+    tools: Vec<crate::store::Tools>,
     /// The latest, newest first.
     rollouts: Vec<Rollout>,
     /// Where releases are fetched from; `None` with fetching off.
@@ -1224,6 +1227,31 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
             inv.versions.guest_kernel.as_deref().unwrap_or("-"),
         );
         kv_node(&mut h, "Configuration hash", &inv.versions.config_hash);
+        match &inv.versions.tools {
+            None => kv(&mut h, "CI tools", "none from the hub"),
+            Some(t) => {
+                h.raw("<tr><th>CI tools</th><td>")
+                    .node(&t.version)
+                    .raw(" (<code title=\"")
+                    .node(&t.sha256)
+                    .raw("\">")
+                    .node(crate::store::short(&t.sha256))
+                    .raw("</code>)");
+                if !t.in_use {
+                    h.raw(", not in use: <code>[executor] tools_dir</code> names another ")
+                        .raw("directory");
+                }
+                h.raw("</td></tr>");
+                // Both the node's words: a tool's name is a file it found.
+                for (name, version) in &t.tools {
+                    h.raw("<tr><th>")
+                        .node(name)
+                        .raw("</th><td>")
+                        .node(version)
+                        .raw("</td></tr>");
+                }
+            }
+        }
         end_section(&mut h);
 
         section(&mut h, "Runner");
@@ -1365,6 +1393,25 @@ fn steering(h: &mut Html, d: &NodeDetail, now: u64) {
                     .raw(crate::store::update_phase_name(u.phase));
                 if let Some(message) = &u.message {
                     h.raw(": ").node(message);
+                }
+                h.raw("</td></tr>");
+            }
+            if let Some(t) = &r.tools {
+                h.raw("<tr><th>Tools build</th><td>")
+                    .node(&t.version)
+                    .raw(" (<code>")
+                    .node(crate::store::short(&t.sha256))
+                    .raw("</code>): ")
+                    .raw(crate::store::tools_phase_name(t.phase));
+                if let Some(message) = &t.message {
+                    h.raw(": ").node(message);
+                }
+                if !t.log.is_empty() {
+                    h.raw("<pre>");
+                    for line in &t.log {
+                        h.node(line).raw("\n");
+                    }
+                    h.raw("</pre>");
                 }
                 h.raw("</td></tr>");
             }
@@ -1528,6 +1575,32 @@ fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
                 .html(&pages::at_html(r.row.added_at))
                 .raw("</td><td>")
                 .text(&r.row.added_by)
+                .raw("</td></tr>");
+        }
+        h.raw("</tbody></table>");
+    }
+    h.raw("</section><section><h2>CI tools</h2>");
+    if ops.tools.is_empty() {
+        h.raw("<p class=\"empty\">none: <code>vk-hub tools add</code> packs a build context ")
+            .raw("into the hub, and <code>vk-hub nodes tools</code> has nodes build it</p>");
+    } else {
+        h.raw("<table class=\"grid\"><thead><tr><th>sha256</th><th>version</th>")
+            .raw("<th>files</th><th>size</th><th>added</th><th>by</th></tr></thead><tbody>");
+        for t in &ops.tools {
+            h.raw("<tr><td><code title=\"")
+                .text(&t.sha256)
+                .raw("\">")
+                .text(crate::store::short(&t.sha256))
+                .raw("</code></td><td>")
+                .text(&t.row.version)
+                .raw("</td><td>")
+                .text(t.row.files)
+                .raw("</td><td>")
+                .text(bytes(t.row.size))
+                .raw("</td><td>")
+                .html(&pages::at_html(t.row.added_at))
+                .raw("</td><td>")
+                .text(&t.row.added_by)
                 .raw("</td></tr>");
         }
         h.raw("</tbody></table>");

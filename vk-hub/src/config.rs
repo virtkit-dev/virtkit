@@ -285,6 +285,11 @@ impl HubConfig {
         self.data_dir.join("releases")
     }
 
+    /// Where tools definitions are kept.
+    pub fn tools_dir(&self) -> PathBuf {
+        self.data_dir.join("tools")
+    }
+
     /// Where placed jobs' output is kept.
     pub fn jobs_dir(&self) -> PathBuf {
         self.data_dir.join("jobs")

@@ -9,7 +9,10 @@ use vk_hub_proto::{Acquisition, Command, DesiredState, Operation, Report};
 
 use crate::rollout::{NodeStatus, Rollout, RolloutAction, RolloutNode, RolloutRow, RolloutState};
 use crate::server::{Hub, Reach};
-use crate::store::{AccountChange, DesiredChange, NodeRow, Release, Role};
+use crate::store::{
+    AccountChange, DesiredChange, MonitoringOnly, NodeRow, NotEnrolled, Release, Role, Tools,
+    ToolsUnsupported,
+};
 
 /// Command delivery window. One day allows for a node reboot or hub outage without applying
 /// a stale request, such as a week-old drain.
@@ -53,6 +56,9 @@ pub struct NodeView {
     /// Why it refused the hub's latest offer of a reservation, while it accepts none.
     #[serde(default)]
     pub last_refusal: Option<String>,
+    /// The CI tools it built from a definition of the hub's and made current.
+    #[serde(default)]
+    pub tools: Option<vk_hub_proto::ToolsInstalled>,
 }
 
 impl NodeView {
@@ -99,6 +105,7 @@ pub fn node_view(hub: &Hub, id: String, row: &NodeRow) -> NodeView {
         pools: row.pools.clone(),
         labels: inventory.map(|i| i.labels.clone()).unwrap_or_default(),
         last_refusal: crate::jobs::last_refusal(hub, &id),
+        tools: inventory.and_then(|i| i.versions.tools.clone()),
         id,
     }
 }
@@ -154,12 +161,99 @@ pub fn set_acquisition(
 }
 
 /// Issue `operation` to node `id`, as `actor`, valid for [`COMMAND_TTL`]. An update is issued
-/// by [`update`], which names a release the hub holds.
+/// by [`update`], which names a release the hub holds, and a tools build by [`tools`].
 pub fn command(hub: &Hub, actor: &str, id: &str, operation: Operation) -> Result<Command> {
-    if matches!(operation, Operation::Update { .. }) {
-        bail!("an update names a release; see `vk-hub nodes update`");
+    match operation {
+        Operation::Update { .. } => bail!("an update names a release; see `vk-hub nodes update`"),
+        Operation::Tools { .. } => {
+            bail!("a tools build names a definition the hub holds; see `vk-hub nodes tools`")
+        }
+        operation => issue(hub, actor, id, operation),
     }
-    issue(hub, actor, id, operation)
+}
+
+/// Have node `id` build the tools definition whose sha256 starts with `tools` and make the
+/// tools current, as `actor`. A node whose latest session ran below
+/// [`vk_hub_proto::TOOLS`] is refused.
+pub fn tools(hub: &Hub, actor: &str, id: &str, tools: &str) -> Result<Command> {
+    // Held from the lookup to the command, so the definition cannot be removed between them.
+    let _held = hub.tools_lock();
+    let tools = hub.db.resolve_tools(tools)?;
+    issue(hub, actor, id, tools_operation(&tools))
+}
+
+/// What became of one node in [`tools_all`]: the command issued to it, or why it was skipped.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolsIssued {
+    pub id: String,
+    pub hostname: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub skipped: Option<String>,
+}
+
+/// [`tools`] for every node, as `actor`, but those that cannot take it or have no need to:
+/// a node monitored only or whose latest session ran below [`vk_hub_proto::TOOLS`], one that
+/// has the tools current already, and one with a build of them still under way. Ordered by
+/// hostname. Any other error ends it, leaving the commands already issued.
+pub fn tools_all(hub: &Hub, actor: &str, tools: &str) -> Result<Vec<ToolsIssued>> {
+    let _held = hub.tools_lock();
+    let tools = hub.db.resolve_tools(tools)?;
+    let mut nodes = hub.db.nodes()?;
+    nodes.sort_by(|a, b| (&a.1.hostname, &a.0).cmp(&(&b.1.hostname, &b.0)));
+    let now = crate::now_secs();
+    let mut out = Vec::new();
+    for (id, row) in nodes {
+        let has = row
+            .inventory
+            .as_ref()
+            .and_then(|i| i.versions.tools.as_ref())
+            .is_some_and(|t| t.sha256 == tools.sha256);
+        let skip = match row.protocol {
+            Some(v) if v < vk_hub_proto::TOOLS => Some(format!(
+                "speaks protocol version {v}, and tools take version {}: update its vk",
+                vk_hub_proto::TOOLS
+            )),
+            _ if has => Some("has these tools current already".to_string()),
+            _ if hub.db.building_tools(&id, &tools.sha256, now)? => {
+                Some("is building these tools already".to_string())
+            }
+            _ => None,
+        };
+        let (command, skipped) = match skip {
+            Some(why) => (None, Some(why)),
+            // The node may have changed since the lookup. Skip the same refusals at issue
+            // time; any other error ends the run.
+            None => match issue(hub, actor, &id, tools_operation(&tools)) {
+                Ok(c) => (Some(c.id), None),
+                Err(e)
+                    if e.is::<MonitoringOnly>()
+                        || e.is::<ToolsUnsupported>()
+                        || e.is::<NotEnrolled>() =>
+                {
+                    (None, Some(format!("{e:#}")))
+                }
+                Err(e) => return Err(e),
+            },
+        };
+        out.push(ToolsIssued {
+            id,
+            hostname: row.hostname,
+            command,
+            skipped,
+        });
+    }
+    Ok(out)
+}
+
+/// The command that has a node build and install `tools`.
+fn tools_operation(tools: &Tools) -> Operation {
+    Operation::Tools {
+        version: tools.row.version.clone(),
+        sha256: tools.sha256.clone(),
+        size: tools.row.size,
+    }
 }
 
 /// Update node `id` to the release whose sha256 starts with `release`, as `actor`. `force`

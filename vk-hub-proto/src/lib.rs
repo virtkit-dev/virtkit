@@ -923,7 +923,7 @@ pub struct ToolsProgress {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     /// The last lines a failed build printed, at most [`MAX_TOOLS_LOG_LINES`] of at most
-    /// [`MAX_TOOLS_LOG_LINE`] bytes each.
+    /// [`MAX_TOOLS_LOG_LINE`] characters each.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub log: Vec<String>,
 }
@@ -931,8 +931,9 @@ pub struct ToolsProgress {
 /// The most lines of a failed tools build's output a report carries.
 pub const MAX_TOOLS_LOG_LINES: usize = 40;
 
-/// The longest line of a failed tools build's output a report carries, in bytes.
-pub const MAX_TOOLS_LOG_LINE: usize = 512;
+/// The longest line of a failed tools build's output a report carries, in characters: the
+/// hub cuts a longer one to it, as it cuts every string it keeps for display.
+pub const MAX_TOOLS_LOG_LINE: usize = MAX_DISPLAY;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

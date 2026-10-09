@@ -1,5 +1,5 @@
 //! Shared hub state, a connection-limited accept loop, and the node listener:
-//! `POST /v1/enroll`, the `/v1/node` WebSocket, release downloads and the client API
+//! `POST /v1/enroll`, the `/v1/node` WebSocket, release and tools downloads and the client API
 //! ([`crate::client`]). Like `vk-registry`, it uses hyper with TLS when the config supplies a
 //! certificate.
 
@@ -26,7 +26,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use vk_hub_proto::{
     ENROLL_PATH, EnrollRequest, EnrollResponse, ErrorBody, NODE_PATH, PUBLIC_KEY_LEN, RELEASE_PATH,
-    SHA256_LEN, SIGNATURE_LEN, from_hex_lower,
+    SHA256_LEN, SIGNATURE_LEN, TOOLS_PATH, from_hex_lower,
 };
 
 use crate::store::{Db, Enrollment};
@@ -76,10 +76,10 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// at once.
 pub(crate) const MAX_PRE_AUTH: usize = 256;
 
-/// Release downloads at once. Each holds a descriptor, a TLS session and its buffers for up
-/// to [`DOWNLOAD_TIMEOUT`], and a node with an update under way can sign as many as it
-/// likes: this bounds them. A few for each node of a fleet of tens; one past it is answered
-/// 503, to be retried.
+/// Release and tools downloads at once. Each holds a descriptor, a TLS session and its
+/// buffers for up to [`DOWNLOAD_TIMEOUT`], and a node with an update under way can sign as
+/// many as it likes: this bounds them. A few for each node of a fleet of tens; one past it is
+/// answered 503, to be retried.
 pub(crate) const MAX_DOWNLOADS: usize = 64;
 
 /// Client API connections at once, past their key's check. A `vk-gitlab` holds one per request
@@ -121,6 +121,10 @@ pub struct Hub {
     releases: Option<std::path::PathBuf>,
     /// Held by a release's add or remove, from its file to its row.
     releases_lock: Mutex<()>,
+    /// Where tools definitions are kept; `None` for a hub that holds none.
+    tools: Option<std::path::PathBuf>,
+    /// Held by a tools definition's add or remove, from its file to its row.
+    tools_lock: Mutex<()>,
     /// Where releases are fetched from, and the latest fetch.
     pub(crate) fetches: crate::fetch::Fetches,
     /// Bumped whenever anything a page shows may have changed, for its live updates.
@@ -179,6 +183,8 @@ impl Hub {
             node_url: None,
             releases: None,
             releases_lock: Mutex::new(()),
+            tools: None,
+            tools_lock: Mutex::new(()),
             fetches: crate::fetch::Fetches::new(None),
             changes: watch::Sender::new(0),
             node_changes: Mutex::new(HashMap::new()),
@@ -289,6 +295,26 @@ impl Hub {
     pub fn with_releases(mut self, dir: std::path::PathBuf) -> Self {
         self.releases = Some(dir);
         self
+    }
+
+    /// This hub, keeping tools definitions in `dir`.
+    pub fn with_tools(mut self, dir: std::path::PathBuf) -> Self {
+        self.tools = Some(dir);
+        self
+    }
+
+    /// Where tools definitions are kept.
+    pub fn tools_dir(&self) -> Result<&std::path::Path> {
+        self.tools
+            .as_deref()
+            .context("this hub keeps no tools definitions")
+    }
+
+    /// One tools definition add or remove at a time, as [`Hub::releases_lock`] is for releases.
+    pub(crate) fn tools_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.tools_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// This hub, fetching releases from `source`; `None` fetches none.
@@ -596,7 +622,10 @@ async fn handle(
         (&Method::POST, ENROLL_PATH) => enroll(req, &hub, peer).await,
         (&Method::GET, NODE_PATH) => Ok(upgrade(req, hub, peer, exported)),
         (&Method::GET, path) if path.starts_with(RELEASE_PATH) => {
-            download(&req, &hub, peer, exported, &state).await
+            download(&req, &hub, peer, exported, &state, Download::Release).await
+        }
+        (&Method::GET, path) if path.starts_with(TOOLS_PATH) => {
+            download(&req, &hub, peer, exported, &state, Download::Tools).await
         }
         (_, path) if crate::client::is_client_path(path) => Ok(client(req, &hub, &state).await),
         _ => Ok(error(StatusCode::NOT_FOUND, "no such endpoint")),
@@ -688,29 +717,71 @@ async fn enroll(req: Request<Incoming>, hub: &Hub, peer: SocketAddr) -> Result<R
     })
 }
 
+/// What a node downloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Download {
+    /// The `vk` binary an update names.
+    Release,
+    /// The tools definition a tools build names.
+    Tools,
+}
+
+impl Download {
+    fn prefix(self) -> &'static str {
+        match self {
+            Download::Release => RELEASE_PATH,
+            Download::Tools => TOOLS_PATH,
+        }
+    }
+
+    fn what(self) -> &'static str {
+        match self {
+            Download::Release => "release",
+            Download::Tools => "tools definition",
+        }
+    }
+
+    fn message(
+        self,
+        node_id: &str,
+        digest: &[u8; SHA256_LEN],
+        at: u64,
+        channel: vk_hub_proto::Channel<'_>,
+    ) -> Vec<u8> {
+        match self {
+            Download::Release => vk_hub_proto::download_message(node_id, digest, at, channel),
+            Download::Tools => vk_hub_proto::tools_download_message(node_id, digest, at, channel),
+        }
+    }
+}
+
 /// `GET /v1/releases/<sha256>`: a release's binary, to a node that proves it is one — by a
 /// signature over [`vk_hub_proto::download_message`] with its pinned key, bound to this
 /// connection — and has an update to that release still to finish. Nothing else may fetch a
 /// release: the hub is not a download site, and a node learns of a release only from the
-/// command that names it.
+/// command that names it. `GET /v1/tools/<sha256>` serves a tools definition the same way,
+/// signed over [`vk_hub_proto::tools_download_message`], to a node with a tools build of it
+/// still to finish.
 async fn download(
     req: &Request<Incoming>,
     hub: &Hub,
     peer: SocketAddr,
     exported: Exported,
     state: &ConnState,
+    kind: Download,
 ) -> Result<Response<Body>> {
+    let what = kind.what();
     let sha256 = req
         .uri()
         .path()
-        .strip_prefix(RELEASE_PATH)
+        .strip_prefix(kind.prefix())
         .unwrap_or_default()
         .to_string();
     let Some(digest) = vk_hub_proto::valid_sha256(&sha256)
         .then(|| from_hex_lower::<SHA256_LEN>(&sha256))
         .flatten()
     else {
-        return Ok(error(StatusCode::NOT_FOUND, "no such release"));
+        return Ok(error(StatusCode::NOT_FOUND, &format!("no such {what}")));
     };
     let header = |name: &str| req.headers().get(name).and_then(|v| v.to_str().ok());
     let (Some(node_id), Some(at), Some(signature)) = (
@@ -720,7 +791,7 @@ async fn download(
     ) else {
         return Ok(error(
             StatusCode::UNAUTHORIZED,
-            "a release is downloaded by a node, signing for it",
+            &format!("a {what} is downloaded by a node, signing for it"),
         ));
     };
     let node_id = node_id.to_string();
@@ -733,12 +804,19 @@ async fn download(
     }
     let db = hub.db.clone();
     let (id, sha) = (node_id.clone(), sha256.clone());
-    let (row, wanted, release) = tokio::task::spawn_blocking(move || {
-        anyhow::Ok((
+    // The node, whether it has a command under way that this download is for, and the size
+    // the file is recorded at.
+    let (row, wanted, size) = tokio::task::spawn_blocking(move || match kind {
+        Download::Release => anyhow::Ok((
             db.node(&id)?,
             db.updating_to(&id, &sha, now)?,
-            db.release(&sha)?,
-        ))
+            db.release(&sha)?.map(|r| r.size),
+        )),
+        Download::Tools => anyhow::Ok((
+            db.node(&id)?,
+            db.building_tools(&id, &sha, now)?,
+            db.tools(&sha)?.map(|t| t.size),
+        )),
     })
     .await
     .context("looking a download up")??;
@@ -752,7 +830,7 @@ async fn download(
         Some(exported) => vk_hub_proto::Channel::Tls(exported),
         None => vk_hub_proto::Channel::Plaintext,
     };
-    let message = vk_hub_proto::download_message(&node_id, &digest, at, channel);
+    let message = kind.message(&node_id, &digest, at, channel);
     if !crate::verify(&public_key, &message, &signature) {
         return Ok(error(
             StatusCode::FORBIDDEN,
@@ -760,23 +838,29 @@ async fn download(
              front of the hub breaks its binding to the connection: pass TLS through",
         ));
     }
-    let (Some(release), true) = (release, wanted) else {
+    let (Some(recorded), true) = (size, wanted) else {
         return Ok(error(
             StatusCode::FORBIDDEN,
-            "this node has no update to that release under way",
+            match kind {
+                Download::Release => "this node has no update to that release under way",
+                Download::Tools => "this node has no tools build of that definition under way",
+            },
         ));
     };
-    let path = crate::releases::path(hub.releases_dir()?, &sha256);
+    let path = match kind {
+        Download::Release => crate::releases::path(hub.releases_dir()?, &sha256),
+        Download::Tools => crate::tools::path(hub.tools_dir()?, &sha256),
+    };
     let file = match tokio::fs::File::open(&path).await {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
-                "vk-hub: release {sha256} is recorded but {} is missing",
+                "vk-hub: {what} {sha256} is recorded but {} is missing",
                 path.display()
             );
             return Ok(error(
                 StatusCode::NOT_FOUND,
-                "the release's binary is missing",
+                &format!("the {what}'s file is missing"),
             ));
         }
         Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
@@ -786,21 +870,20 @@ async fn download(
         .await
         .with_context(|| format!("reading {}", path.display()))?
         .len();
-    if size != release.size {
+    if size != recorded {
         eprintln!(
-            "vk-hub: release {sha256} is recorded as {} bytes but {} holds {size}",
-            release.size,
+            "vk-hub: {what} {sha256} is recorded as {recorded} bytes but {} holds {size}",
             path.display()
         );
         return Ok(error(
             StatusCode::NOT_FOUND,
-            "the release's binary is the wrong size",
+            &format!("the {what}'s file is the wrong size"),
         ));
     }
     let Ok(slot) = hub.downloads.clone().try_acquire_owned() else {
         return Ok(error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "too many release downloads at once; retry",
+            "too many downloads at once; retry",
         ));
     };
     state.downloading.store(true, Ordering::Relaxed);
@@ -813,7 +896,7 @@ async fn download(
             .take(),
     );
     eprintln!(
-        "vk-hub: {peer}: node {node_id} is downloading release {}",
+        "vk-hub: {peer}: node {node_id} is downloading {what} {}",
         crate::store::short(&sha256)
     );
     // The slot goes with the body, which hyper drops once it is sent or the peer is gone.
@@ -836,10 +919,7 @@ async fn download(
         header::CONTENT_TYPE,
         header::HeaderValue::from_static("application/octet-stream"),
     );
-    h.insert(
-        header::CONTENT_LENGTH,
-        header::HeaderValue::from(release.size),
-    );
+    h.insert(header::CONTENT_LENGTH, header::HeaderValue::from(recorded));
     // One download per connection: what [`DOWNLOAD_TIMEOUT`] bounds is this one.
     h.insert(
         header::CONNECTION,

@@ -40,12 +40,14 @@ use crate::rollout::{Effect, Facts, NodeStatus, RolloutAction, RolloutRow, Rollo
 
 mod jobs;
 mod keys;
+mod tools;
 
 pub use jobs::{
     DEFAULT_JOB_HISTORY, JobFilter, JobOutcome, JobPage, JobRow, RequestRow, SUMMARY_JOBS,
     Submitted,
 };
 pub use keys::{ApiPrincipal, KeyPolicy, KeyRow, MAX_KEY_TTL, Scope, envelope_text, valid_name};
+pub use tools::{Tools, ToolsRow};
 
 /// Key: node ID. Value: JSON [`NodeRow`].
 const NODES: TableDefinition<&str, &[u8]> = TableDefinition::new("nodes");
@@ -495,6 +497,29 @@ impl std::fmt::Display for LastOperator {
 
 impl std::error::Error for LastOperator {}
 
+/// The node's latest session ran a protocol version below [`vk_hub_proto::TOOLS`]: it cannot
+/// take a tools build.
+#[derive(Debug)]
+pub struct ToolsUnsupported {
+    pub id: String,
+    pub version: u32,
+}
+
+impl std::fmt::Display for ToolsUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "node {} last connected at protocol version {}, and tools take version {}: update \
+             its vk",
+            self.id,
+            self.version,
+            vk_hub_proto::TOOLS
+        )
+    }
+}
+
+impl std::error::Error for ToolsUnsupported {}
+
 /// Refuse to steer node `id` whose latest session ran below [`STEERING`]. A node that has not
 /// connected yet is taken at its word: what it is sent waits for a session that can carry it.
 pub(crate) fn steerable(id: &str, row: &NodeRow) -> Result<()> {
@@ -639,6 +664,8 @@ impl Db {
             .context("opening the API keys table")?;
         txn.open_table(jobs::JOBS)
             .context("opening the jobs table")?;
+        txn.open_table(tools::TOOLS)
+            .context("opening the tools table")?;
         txn.open_table(jobs::JOB_SPECS)
             .context("opening the job specs table")?;
         txn.open_table(jobs::REQUESTS)
@@ -2100,6 +2127,15 @@ fn insert_command(
         return Err(NotEnrolled(id.to_string()).into());
     };
     steerable(id, &node)?;
+    if let (Operation::Tools { .. }, Some(version)) = (&op, node.protocol)
+        && version < vk_hub_proto::TOOLS
+    {
+        return Err(ToolsUnsupported {
+            id: id.to_string(),
+            version,
+        }
+        .into());
+    }
     let command = Command {
         id: crate::random_hex(vk_hub_proto::ID_BYTES)?,
         expires_at: now.saturating_add(ttl.as_secs()),
@@ -2403,7 +2439,35 @@ fn report_events(previous: Option<&Report>, report: &Report) -> Vec<String> {
     {
         events.push(format!("cannot set its concurrency: {error}"));
     }
+    if let Some(t) = &report.tools
+        && previous.is_none_or(|p| {
+            p.tools.as_ref().map(|t| (&t.command, t.phase)) != Some((&t.command, t.phase))
+        })
+    {
+        let mut event = format!(
+            "tools {} ({}): {}",
+            t.version,
+            short(&t.sha256),
+            tools_phase_name(t.phase)
+        );
+        if let Some(message) = &t.message {
+            event.push_str(&format!(": {message}"));
+        }
+        events.push(event);
+    }
     events
+}
+
+pub(crate) fn tools_phase_name(phase: vk_hub_proto::ToolsPhase) -> &'static str {
+    use vk_hub_proto::ToolsPhase;
+    match phase {
+        ToolsPhase::Downloading => "downloading",
+        ToolsPhase::Building => "building",
+        ToolsPhase::Installing => "installing",
+        ToolsPhase::Done => "done",
+        ToolsPhase::Failed => "failed",
+        ToolsPhase::Other => "unknown",
+    }
 }
 
 pub(crate) fn state_name(state: NodeState) -> &'static str {
@@ -2531,6 +2595,20 @@ fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
     {
         *sha = None;
     }
+    let tools = &mut inventory.versions.tools;
+    *tools = tools
+        .take()
+        .filter(|t| vk_hub_proto::valid_sha256(&t.sha256))
+        .map(|mut t| {
+            clean(&mut t.version);
+            t.tools = t
+                .tools
+                .into_iter()
+                .take(MAX_INVENTORY_ITEMS)
+                .map(|(name, version)| (safe(&name), safe(&version)))
+                .collect();
+            t
+        });
     if let Some(runner) = inventory.runner.as_mut() {
         clean(&mut runner.config);
         for name in &mut runner.runners {
@@ -2540,17 +2618,31 @@ fn display_safe_inventory(mut inventory: Inventory) -> Inventory {
     inventory
 }
 
-/// `report`'s strings made display-safe, its list cut like an inventory's. An update whose
+/// `report`'s strings made display-safe, its list cut like an inventory's and a tools build's
+/// log to its last [`vk_hub_proto::MAX_TOOLS_LOG_LINES`] lines. An update or tools build whose
 /// command ID or sha256 is malformed is dropped: both are identifiers, not text.
 fn display_safe_report(mut report: Report) -> Report {
     report.unsupported.truncate(MAX_INVENTORY_ITEMS);
     report.update = report
         .update
         .filter(|u| vk_hub_proto::valid_id(&u.command) && vk_hub_proto::valid_sha256(&u.sha256));
+    report.tools = report
+        .tools
+        .filter(|t| vk_hub_proto::valid_id(&t.command) && vk_hub_proto::valid_sha256(&t.sha256));
     let mut update = Vec::new();
     if let Some(u) = report.update.as_mut() {
         update.push(&mut u.version);
         update.extend(u.message.as_mut());
+    }
+    if let Some(t) = report.tools.as_mut() {
+        let n = t
+            .log
+            .len()
+            .saturating_sub(vk_hub_proto::MAX_TOOLS_LOG_LINES);
+        t.log.drain(..n);
+        update.push(&mut t.version);
+        update.extend(t.message.as_mut());
+        update.extend(t.log.iter_mut());
     }
     for s in report
         .unsupported
@@ -3120,6 +3212,67 @@ mod tests {
                 "update to vk 0.85.0 (abababababab): draining",
                 "update to vk 0.85.0 (abababababab): rolled back: validation failed"
             ]
+        );
+    }
+
+    /// A tools build's phases are audited as they change, one from a later `vk` as unknown;
+    /// its log is kept to its last lines, each cut to what the hub keeps of a line.
+    #[test]
+    fn tools_phases_are_audited_and_the_log_kept_to_its_end() {
+        use vk_hub_proto::{MAX_TOOLS_LOG_LINE, MAX_TOOLS_LOG_LINES, ToolsPhase};
+        let db = Db::open_memory().unwrap();
+        let id = enrolled(&db);
+        let report = |phase, log: Vec<String>| Report {
+            tools: Some(vk_hub_proto::ToolsProgress {
+                command: "c1".repeat(16),
+                version: "2026.10".into(),
+                sha256: "ab".repeat(32),
+                phase,
+                message: None,
+                log,
+            }),
+            ..Report::default()
+        };
+        db.record_report(&id, report(ToolsPhase::Building, Vec::new()), 2)
+            .unwrap();
+        db.record_report(&id, report(ToolsPhase::Other, Vec::new()), 3)
+            .unwrap();
+        let mut log: Vec<String> = (0..MAX_TOOLS_LOG_LINES + 5)
+            .map(|i| format!("line {i}"))
+            .collect();
+        log.push("x".repeat(2 * MAX_TOOLS_LOG_LINE));
+        db.record_report(&id, report(ToolsPhase::Failed, log), 4)
+            .unwrap();
+        let events: Vec<String> = db
+            .audits(Some(&id), 10)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.event)
+            .filter(|e| e.starts_with("tools"))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "tools 2026.10 (abababababab): building",
+                "tools 2026.10 (abababababab): unknown",
+                "tools 2026.10 (abababababab): failed",
+            ]
+        );
+        let kept = db
+            .node(&id)
+            .unwrap()
+            .unwrap()
+            .report
+            .unwrap()
+            .tools
+            .unwrap()
+            .log;
+        assert_eq!(kept.len(), MAX_TOOLS_LOG_LINES);
+        assert_eq!(kept[0], "line 6");
+        assert_eq!(kept[MAX_TOOLS_LOG_LINES - 2], "line 44");
+        assert_eq!(
+            kept[MAX_TOOLS_LOG_LINES - 1],
+            "x".repeat(MAX_TOOLS_LOG_LINE)
         );
     }
 

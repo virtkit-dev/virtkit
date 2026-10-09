@@ -4143,6 +4143,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",

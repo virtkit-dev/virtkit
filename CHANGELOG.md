@@ -6,6 +6,13 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **`vk-hub` holds CI tools definitions and has nodes build them.** `vk-hub tools add <dir>
+  --version <label>` takes a build context — a Dockerfile whose `tools` stage holds static
+  `git`, `git-lfs` and `gitlab-runner` — packed so that the same tree is the same definition;
+  `vk-hub tools list` and `remove` manage them. `vk-hub nodes tools <id> --tools <sha256>`, or
+  `--all`, asks nodes to build one and give its tools to their jobs, skipping nodes too old to.
+  `vk-hub nodes`, a node's page and the operations page show each node's tools and how its
+  last build went, with the end of a failed build's output.
 - **Operators manage OIDC sign-in grants from `vk-hub`'s Users page.** It lists each grant,
   who made it and when, and the access other users get. Operators grant, change and revoke
   roles as with `vk-hub accounts`, with confirmation before lowering or revoking a grant.

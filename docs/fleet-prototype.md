@@ -25,6 +25,8 @@ The prototype provides, all experimentally:
   release-key`);
 - on the hub, rollouts of a release by wave, with a canary per hardware profile (`vk-hub
   rollout`);
+- on the hub, CI tools definitions (`vk-hub tools`) and builds of one issued to nodes (`vk-hub
+  nodes tools`), each definition served only to a node building it;
 - resets, which clear what a node's past jobs left (`vk-hub nodes reset`);
 - on the node, placed GitLab jobs (protocol version 3, [below](#placed-jobs-on-the-node)):
   reservations decided from the admission ledger, and jobs run stage by stage in microVMs,
@@ -198,9 +200,9 @@ else `~/.local/share/virtkit/hub`), `release_repository` (see [Releases](#releas
 web UI's keys (see [Web UI](#web-ui)), and `job_lost_after_secs` and `job_history` (see
 [Placed jobs](#placed-jobs)). Every key is optional and an unknown one is an error. Without TLS
 the hub serves only on loopback. TLS is 1.3 only, on both the hub and the node. `vk-hub token`,
-`vk-hub nodes`, `vk-hub release`, `vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub
-keys` and `vk-hub jobs` reach the running hub through `<data_dir>/admin.sock`, open to the
-hub's user and root.
+`vk-hub nodes`, `vk-hub release`, `vk-hub tools`, `vk-hub workloads`, `vk-hub audit`,
+`vk-hub ui`, `vk-hub keys` and `vk-hub jobs` reach the running hub through
+`<data_dir>/admin.sock`, open to the hub's user and root.
 
 `vk node run` holds a WebSocket session at `/v1/node` in the foreground. The node signs the
 hub's challenge, its node ID and incarnation (new on every `vk node run`), both version ranges,
@@ -224,8 +226,12 @@ label `vk-fleet release-download v1` over its ID, the release's 32-byte sha256, 
 and the channel, sent in the `vk-node`, `vk-time` and `vk-signature` headers. The hub issues
 updates and serves releases (see [Releases](#releases)), and a node applies them (see
 [Update trial and rollback](#update-trial-and-rollback)). Version 3 adds reservations and
-placed jobs (see [Placed jobs](#placed-jobs)). The hub and `vk node` each speak versions 1 to 3
-from ranges of their own; `vk_hub_proto::PROTOCOL` stays 1 to 2.
+placed jobs (see [Placed jobs](#placed-jobs)). Version 4 adds CI tools builds: the `tools`
+operation, which names a tools definition by sha256 and size; the build's progress on the
+report; and the definition's download, `GET /v1/tools/<sha256>`, signed as a release download is
+but under the label `vk-fleet tools-download v1` (see [CI tools](#ci-tools)). The hub speaks
+versions 1 to 4 and `vk node` 1 to 3, from ranges of their own; `vk_hub_proto::PROTOCOL` stays
+1 to 2.
 A session negotiates version 3 only with a node that implements it.
 
 The hub admits at most 256 connections that have not authenticated, each step of which (TLS,
@@ -612,6 +618,52 @@ that describe each step; a pass that changes nothing writes nothing; the hub tas
 every rollout from the database at start, whenever a node reports, and every five seconds, so a
 restarted hub carries on where it stopped. A rollout that cannot advance holds none of the
 others back.
+
+## CI tools
+
+`vk-hub tools add <dir> --version <label>` packs a build context into a definition stored in
+`<data_dir>/tools/` under its sha256 and prints that digest. `tools list` lists definitions;
+`tools remove` deletes one unless a node still has to build it. The context needs a
+`Dockerfile` at its root with a `tools` stage that holds the tools at its root: static `git`,
+`git-remote-http`, `git-remote-https`, `git-lfs` and `gitlab-runner`, typically a `FROM scratch AS
+tools` stage copying them from a build stage. The hub never builds or runs it. It packs it
+reproducibly, so the same tree is the same definition: entries in byte order of their paths,
+each directory before its contents, owner 0, mtime 0, mode `0755` for a directory and for a file
+with any execute bit, `0644` for any other file. It takes only regular files and directories,
+64 MiB at most once packed, and reads the tree as its own user without following anything under
+the directory named: a symlink there is refused, not packed, since the hub's user can read the
+hub's TLS key and database. Adding the same tree with the same label returns the stored
+definition and restores its tar if missing; a different label is refused. The tar is published by
+rename before its row is written, and the add and its sha256 are audited.
+
+`vk-hub nodes tools <id> --tools <sha256>` asks a node to build a definition and make the tools
+current; a prefix of at least 8 hex digits names a definition. `--all` asks every node but those
+whose latest session ran below protocol version 4, those whose inventory reports these tools
+current, and those building them already, and says which it skipped and why. The request is a
+command, valid for a day and audited like any other. It needs protocol version 4: the hub
+refuses it for a node whose latest session ran below that, and sends none in such a session; a
+node that has not connected yet is asked on trust, and the command waits for a session that can
+carry it. Nothing drains and the node's state does not move. Builds are issued node by node, not
+by rollout: a failed build leaves the node on the tools it had.
+
+The definition is downloaded from the node listener at `GET /v1/tools/<sha256>`, with the node's
+ID, the time and its signature in the headers a release download carries, over the label `vk-fleet
+tools-download v1`: a release download's signature does not fetch a definition, nor the reverse.
+The hub serves it only to an enrolled node whose pinned key verifies, within five minutes of the
+hub's clock, and which has a build of that definition still to finish, under the same limits as
+a release download.
+
+The node's report carries the build's phase (`downloading`, `building`, `installing`, then `done`
+or `failed`, with the reason and the last 40 lines of a failed build's output), and its inventory
+the tools current: the definition, its label, the first line each tool printed for `--version`,
+and whether `[executor] tools_dir` names them. `vk-hub nodes` notes both under its table, a node's
+page shows them under Versions and Steering, `/operations` lists the definitions held, and the
+audit log has each phase as the node reports it.
+
+Whoever registers a definition can put any binary into every job VM of the nodes that build it:
+a job's PATH gets each tool its image lacks, and gitlab-runner handles the job's artifacts,
+caches and token. Registering and issuing tools is the admin socket's alone — the hub's user or
+root, audited as `uid <n>` — not the web UI's.
 
 ## Resets
 

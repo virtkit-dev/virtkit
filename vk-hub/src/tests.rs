@@ -1088,7 +1088,9 @@ async fn start_releases(
     let listener = server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let hub = Arc::new(
-        Hub::new(Arc::new(Db::open_memory().unwrap()), None).with_releases(dir.join("releases")),
+        Hub::new(Arc::new(Db::open_memory().unwrap()), None)
+            .with_releases(dir.join("releases"))
+            .with_tools(dir.join("tools")),
     );
     tokio::spawn(server::serve(listener, tls, hub.clone()));
     (dir, addr, hub)
@@ -2635,3 +2637,4 @@ fn audit_times_are_utc() {
 }
 
 mod jobs;
+mod tools;

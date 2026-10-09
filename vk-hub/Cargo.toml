@@ -31,6 +31,8 @@ futures.workspace = true
 redb.workspace = true
 ring.workspace = true
 sha2.workspace = true
+# tools definitions packed reproducibly; already in the tree through vk-driver
+tar.workspace = true
 # column widths in the CLI's tables
 unicode-width.workspace = true
 libc.workspace = true
