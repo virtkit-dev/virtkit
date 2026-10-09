@@ -530,6 +530,258 @@ fn linger() {
     }
 }
 
+/// Require root for `join --user` and a plain user name suitable for a unit file.
+pub(super) fn root_for_user(name: &str) -> Result<()> {
+    if euid() != 0 {
+        bail!(
+            "--user sets the host up for another user, which takes root; leave it out to join as this user"
+        );
+    }
+    plain_user_name(name)
+}
+
+/// Validate `name` as a plain user name suitable for a unit file.
+fn plain_user_name(name: &str) -> Result<()> {
+    let plain = name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c));
+    if name.is_empty() || name.starts_with('-') || !plain {
+        bail!("{name:?} is not a user name");
+    }
+    Ok(())
+}
+
+/// Prepare the node's account as root for `vk node join --user NAME`. If absent from
+/// `/etc/passwd`, create a system user with its own home. Add it to `/dev/kvm`'s group and
+/// transfer the state directory and contents, as `vk node run` requires; see
+/// [`vk_fs::chown_tree`] for exclusions. Report changes and set `handed` once ownership
+/// may have changed.
+pub(super) fn prepare_account(name: &str, cfg: &Config, handed: &mut bool) -> Result<Account> {
+    root_for_user(name)?;
+    let mut account = match Account::lookup(name)? {
+        Some(account) => account,
+        None => {
+            run_tool(
+                "useradd",
+                &[
+                    "--system",
+                    "--create-home",
+                    "--shell",
+                    "/usr/sbin/nologin",
+                    name,
+                ],
+            )?;
+            println!("vk node: created the system user {name}");
+            Account::named(name)?
+        }
+    };
+    let kvm = std::fs::metadata("/dev/kvm")
+        .context("statting /dev/kvm: this host has no KVM for the node's VMs")?
+        .gid();
+    if !account.groups.contains(&kvm) {
+        run_tool("usermod", &["--append", "--groups", &kvm.to_string(), name])?;
+        println!("vk node: added {name} to /dev/kvm's group (gid {kvm})");
+        account = Account::named(name)?;
+    }
+    let state = cfg.state_dir();
+    if !state.exists() {
+        // Handed to the user with the rest below.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(state)
+            .with_context(|| format!("creating {}", state.display()))?;
+        println!("vk node: created {} for {name}", state.display());
+    }
+    *handed = true;
+    let done = vk_fs::chown_tree(state, account.uid)?;
+    if done.changed > 0 {
+        println!(
+            "vk node: gave {name} {} entries under {} that were another user's",
+            done.changed,
+            state.display()
+        );
+    }
+    let mut foreign = Vec::new();
+    for path in &done.skipped {
+        let owner = std::fs::symlink_metadata(path)
+            .with_context(|| format!("statting {}", path.display()))?
+            .uid();
+        println!(
+            "vk node: warning: left {} as it is: a mount, or a file also linked from outside {}",
+            path.display(),
+            state.display()
+        );
+        if owner != account.uid {
+            foreign.push(path.display().to_string());
+        }
+    }
+    if !foreign.is_empty() {
+        bail!(
+            "{name} would not own {}: give it these, or move them out of {}",
+            foreign.join(", "),
+            state.display()
+        );
+    }
+    let exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .context("resolving the running vk")?;
+    let config = cfg
+        .source
+        .as_deref()
+        .map(|p| std::fs::canonicalize(p).with_context(|| format!("resolving {}", p.display())))
+        .transpose()?;
+    reachable(&account, state, &exe, config.as_deref())?;
+    Ok(account)
+}
+
+/// Mark the child join run as the node's user so only the parent prints the next step.
+pub(super) const JOIN_CHILD: &str = "VK_NODE_JOIN_AS_USER";
+
+/// What to run once a host is enrolled, in this process's scope: start the unit already
+/// installed, or install one — for `user`, as root.
+pub(super) fn next_step(user: Option<&str>) -> String {
+    let scope = Scope::current();
+    let installed = scope.unit_dir().is_ok_and(|dir| dir.join(UNIT).exists());
+    step_after_join(scope, installed, user)
+}
+
+/// [`next_step`] in `scope`, whether the unit is `installed` there.
+fn step_after_join(scope: Scope, installed: bool, user: Option<&str>) -> String {
+    let systemctl = if scope == Scope::User {
+        "systemctl --user"
+    } else {
+        "systemctl"
+    };
+    if installed {
+        format!(
+            "{UNIT} is installed; start the node on its new enrollment: `{systemctl} start vk-node`"
+        )
+    } else {
+        let user = user.map(|u| format!(" --user {u}")).unwrap_or_default();
+        format!(
+            "run the node as a service: `vk node service install{user}` (or pass --service to \
+             join), or in the foreground: `vk node run`"
+        )
+    }
+}
+
+/// Run `vk` with `args` using `account`'s uid, primary and supplementary groups, and home.
+/// Feed `input` on stdin and require success.
+pub(super) fn run_as(account: &Account, args: &[std::ffi::OsString], input: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().context("resolving the running vk")?;
+    let mut cmd = Command::new(&exe);
+    cmd.args(args)
+        .env_clear()
+        .env("PATH", SYSTEMD_PATH)
+        .env("HOME", &account.home)
+        .env("USER", &account.name)
+        .env("LOGNAME", &account.name)
+        .env(JOIN_CHILD, "1")
+        .current_dir("/")
+        .stdin(std::process::Stdio::piped());
+    let (uid, gid, groups) = (account.uid, account.gid, account.groups.clone());
+    // SAFETY: the closure runs in the child between fork and exec, and calls only
+    // async-signal-safe functions on data copied in before the fork. Groups go first and the
+    // uid last: once it is dropped, neither of the others may change.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setgroups(groups.len(), groups.as_ptr()) != 0
+                || libc::setgid(gid) != 0
+                || libc::setuid(uid) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("running {} as {}", exe.display(), account.name))?;
+    // Always wait for the child, even if writing fails: an early exit closes the pipe,
+    // and the exit status explains the failure.
+    let written = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(format!("{input}\n").as_bytes()),
+        None => Err(std::io::Error::other("no pipe to the child's stdin")),
+    };
+    let status = child.wait().context("waiting for the join")?;
+    if !status.success() {
+        bail!("joining as {} failed ({status})", account.name);
+    }
+    written.context("handing the token over")
+}
+
+/// Stop a running `vk-node.service` in this process's scope to release the state dir.
+/// Return whether it was running.
+pub(super) fn stop_running() -> Result<bool> {
+    let scope = Scope::current();
+    if !is_active(scope) {
+        return Ok(false);
+    }
+    println!("vk node: stopping {UNIT}: the node stops once a managed runner's jobs finish");
+    systemctl(scope, &["stop", UNIT])?;
+    Ok(true)
+}
+
+/// That no node holds the node dir `dir` before `join --user NAME` changes the host for
+/// `name`; a running one is named with how to stop it. Like [`idle`], a dir never locked is
+/// not probed, so no lock file is left root's.
+pub(super) fn idle_for_join(dir: &Path, name: &str, service: bool) -> Result<()> {
+    if !dir.join(super::LOCK_FILE).exists() {
+        return Ok(());
+    }
+    let e = match super::lock_tries(dir, 1) {
+        Ok(_) => return Ok(()),
+        Err(e) if e.is::<super::Locked>() => e,
+        Err(e) => return Err(e),
+    };
+    let own = Account::lookup(name)?
+        .map(|a| a.home.join(".config/systemd/user").join(UNIT))
+        .filter(|unit| unit.exists());
+    Err(match own {
+        Some(unit) => e.context(format!(
+            "{name} runs a node from a user unit of its own, {}: stop it as {name} \
+             (`systemctl --user stop vk-node`) and remove it with `vk node service uninstall`",
+            unit.display()
+        )),
+        None if service => e.context(
+            "a node is running on this host outside vk-node.service: stop it first (a \
+             foreground `vk node run`, or a unit of your own)",
+        ),
+        None => e.context(
+            "a node is running on this host: stop it first (`systemctl stop vk-node`), or \
+             pass --service, which stops it and starts it again once enrolled",
+        ),
+    })
+}
+
+/// Whether the system `vk-node.service`, if any, runs the node as `user`.
+pub(super) fn unit_runs_as(user: &str) -> bool {
+    runs_as(&Path::new("/etc/systemd/system").join(UNIT), user).unwrap_or(false)
+}
+
+/// Start `vk-node.service` in this process's scope again, after [`stop_running`] stopped it
+/// for a join that then failed.
+pub(super) fn start_again() -> Result<()> {
+    systemctl(Scope::current(), &["start", UNIT])?;
+    println!("vk node: started {UNIT} again");
+    Ok(())
+}
+
+/// Run `tool` with `args`, requiring success.
+fn run_tool(tool: &str, args: &[&str]) -> Result<()> {
+    let status = Command::new(tool)
+        .args(args)
+        .status()
+        .with_context(|| format!("running {tool}"))?;
+    if !status.success() {
+        bail!("`{tool} {}` failed ({status})", args.join(" "));
+    }
+    Ok(())
+}
+
 /// That the node dir `dir` belongs to `account` and is private to it, as `vk node run` running
 /// as that user requires.
 fn owned_by(dir: &Path, account: &Account) -> Result<()> {
@@ -542,8 +794,8 @@ fn owned_by(dir: &Path, account: &Account) -> Result<()> {
         anyhow!(
             "{} belongs to {owner}: this host was enrolled as {owner}. Install with `--user \
              {owner}`, or, to run the node as {name}, remove it from the hub (`vk-hub nodes \
-             remove <id>`), delete {} as root or {owner}, and `vk node join` again as {name}",
-            dir.display(),
+             remove <id>`) and enroll it again as root: `vk node join <hub-url> --token - \
+             --replace --user {name}`",
             dir.display(),
             name = account.name,
         )
@@ -554,10 +806,18 @@ fn owned_by(dir: &Path, account: &Account) -> Result<()> {
 /// the user's own config for the one this command read.
 fn reachable(account: &Account, dir: &Path, exe: &Path, config: Option<&Path>) -> Result<()> {
     if !may(account, dir, 0o7)? {
-        bail!("{} cannot reach {}", account.name, dir.display());
+        bail!(
+            "{} cannot reach {}: it, or a directory above it, denies that user",
+            account.name,
+            dir.display()
+        );
     }
     if !may(account, exe, 0o1)? {
-        bail!("{} cannot execute {}", account.name, exe.display());
+        bail!(
+            "{} cannot execute {}: run an installed vk, such as /usr/local/bin/vk",
+            account.name,
+            exe.display()
+        );
     }
     match config {
         Some(config) => {
@@ -634,9 +894,10 @@ fn permits(account: &Account, uid: u32, gid: u32, mode: u32, want: u32) -> bool 
 /// `hostpolicy::self_passwd` reads this process's own name and home as UTF-8 environment
 /// values; this also looks users up by name and lists their groups.
 #[derive(Debug)]
-struct Account {
-    name: String,
-    uid: u32,
+pub(super) struct Account {
+    pub(super) name: String,
+    pub(super) uid: u32,
+    gid: u32,
     home: PathBuf,
     groups: Vec<libc::gid_t>,
 }
@@ -644,24 +905,24 @@ struct Account {
 impl Account {
     /// The user called `name`, which must be a plain user name a unit file can hold.
     fn named(name: &str) -> Result<Account> {
-        let plain = name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c));
-        if name.is_empty() || name.starts_with('-') || !plain {
-            bail!("{name:?} is not a user name");
-        }
-        let c_name = CString::new(name).context("a user name")?;
-        passwd(|pwd, buf, result| {
-            // SAFETY: every pointer is live and exclusively borrowed for the call, and the
-            // length is `buf`'s own.
-            unsafe { libc::getpwnam_r(c_name.as_ptr(), pwd, buf.as_mut_ptr(), buf.len(), result) }
-        })?
-        .with_context(|| {
+        Self::lookup(name)?.with_context(|| {
             format!(
                 "there is no user {name} in /etc/passwd, the only user database vk reads; to \
                  run the node as a user only LDAP or SSSD knows, run `vk node service install` \
                  as {name}, for a user unit"
             )
+        })
+    }
+
+    /// The user called `name`, or `None` when `/etc/passwd` has none; `name` must be a plain
+    /// user name a unit file can hold.
+    fn lookup(name: &str) -> Result<Option<Account>> {
+        plain_user_name(name)?;
+        let c_name = CString::new(name).context("a user name")?;
+        passwd(|pwd, buf, result| {
+            // SAFETY: every pointer is live and exclusively borrowed for the call, and the
+            // length is `buf`'s own.
+            unsafe { libc::getpwnam_r(c_name.as_ptr(), pwd, buf.as_mut_ptr(), buf.len(), result) }
         })
     }
 
@@ -707,6 +968,7 @@ fn passwd(
             .context("a user name that is not UTF-8")?
             .to_string(),
         uid: pwd.pw_uid,
+        gid: pwd.pw_gid,
         home,
         groups,
     }))
@@ -840,6 +1102,7 @@ mod tests {
         let ci = Account {
             name: "ci".to_string(),
             uid: 1000,
+            gid: 1000,
             home: PathBuf::from("/home/ci"),
             groups: vec![1000, 27],
         };
@@ -915,6 +1178,7 @@ mod tests {
         Account {
             name: "ci".to_string(),
             uid,
+            gid: uid,
             home: home.to_path_buf(),
             groups: Vec::new(),
         }
@@ -1053,6 +1317,44 @@ mod tests {
         chmod(&closed, 0o711);
         assert!(may(&other, &node, 0o7).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_join_for_a_user_is_refused_while_a_node_holds_the_dir() {
+        let dir = scratch("idle-join");
+        let none = "vk-no-such-user";
+        idle_for_join(&dir, none, false).unwrap();
+        let held = super::super::lock_tries(&dir, 1).unwrap();
+        let err = format!("{:#}", idle_for_join(&dir, none, false).unwrap_err());
+        assert!(err.contains("pass --service"), "{err}");
+        let err = format!("{:#}", idle_for_join(&dir, none, true).unwrap_err());
+        assert!(err.contains("outside vk-node.service"), "{err}");
+        drop(held);
+        // An unheld lock file passes. Not this one: a child another test forks meanwhile
+        // shares its lock until it execs.
+        let free = dir.join("free");
+        std::fs::create_dir(&free).unwrap();
+        std::fs::write(free.join(super::super::LOCK_FILE), "").unwrap();
+        idle_for_join(&free, none, true).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn after_a_join_the_installed_unit_is_started_or_one_installed() {
+        let start = step_after_join(Scope::User, true, None);
+        assert!(
+            start.contains("`systemctl --user start vk-node`"),
+            "{start}"
+        );
+        let start = step_after_join(Scope::System, true, Some("ci"));
+        assert!(start.contains("`systemctl start vk-node`"), "{start}");
+        let install = step_after_join(Scope::System, false, Some("ci"));
+        assert!(
+            install.contains("`vk node service install --user ci`"),
+            "{install}"
+        );
+        let install = step_after_join(Scope::User, false, None);
+        assert!(install.contains("`vk node service install`"), "{install}");
     }
 
     #[test]

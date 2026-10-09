@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **`vk node join --user NAME --service`, as root, moves a host onto a hub in one command.**
+  `--user` creates the user when there is none, adds it to `/dev/kvm`'s group, hands it the
+  state dir and what is already in it, checks it can read the config, and enrolls as it;
+  `--service` then installs and starts `vk-node.service`, stopping a running one first.
 - **`vk node join --replace` re-enrolls a host as a new node.** After reading the token and
   passing checks, it preserves the old identity in `<state_dir>/node.replaced-<time>` and
   prints the old node ID for `vk-hub nodes remove`.

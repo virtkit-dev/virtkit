@@ -314,6 +314,21 @@ enum NodeCmd {
         /// remove the old node from its hub with `vk-hub nodes remove <id>`.
         #[arg(long)]
         replace: bool,
+        /// Set the host up for this user and enroll as it (root only)
+        ///
+        /// Creates the user when /etc/passwd has none, adds it to /dev/kvm's group, creates the
+        /// state dir and hands it and what is in it to the user (not mounts, nor files also
+        /// linked from outside it), checks the user can read the config, then enrolls as that
+        /// user.
+        #[arg(long, value_name = "NAME")]
+        user: Option<String>,
+        /// Then run the node as a service, as `vk node service install` does
+        ///
+        /// A vk-node.service already running is stopped first, which waits for a managed
+        /// runner's jobs, and started again on the new enrollment, or on the old one if the
+        /// join fails with it still in place.
+        #[arg(long)]
+        service: bool,
     },
     /// Keep a session with the hub, and follow it, in the foreground
     ///
@@ -4374,6 +4389,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 token_file,
                 ca,
                 replace,
+                user,
+                service,
             } => {
                 let token = match (token, token_file) {
                     (_, Some(path)) => node::TokenSource::File(path),
@@ -4384,7 +4401,11 @@ async fn cli_main(cli: Cli) -> ExitCode {
                         return fail(&anyhow::anyhow!("give --token or --token-file"), 2);
                     }
                 };
-                let opts = node::JoinOptions { replace };
+                let opts = node::JoinOptions {
+                    replace,
+                    user,
+                    service,
+                };
                 match node::join(&ctx.cfg, &hub, &token, ca.as_deref(), &opts).await {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => fail(&e, 1),

@@ -178,6 +178,10 @@ fn not_enrolled(e: anyhow::Error) -> anyhow::Error {
 pub struct JoinOptions {
     /// Re-enroll a host as a new node, preserving its old identity in a separate directory.
     pub replace: bool,
+    /// Set the host up for this user and enroll as it (root only).
+    pub user: Option<String>,
+    /// Then run the node as a service, stopping one already running first.
+    pub service: bool,
 }
 
 /// `vk node join`.
@@ -199,7 +203,114 @@ pub async fn join(
         }
     }
     let token = token.read()?;
-    enroll_here(cfg, &hub, &token, ca, opts.replace).await
+    if let Some(name) = &opts.user {
+        service::root_for_user(name)?;
+        // Checked as root here, and again as the user by the join run as it.
+        host_checks(cfg)?;
+    }
+    // A running node holds the state dir; the service is started again if the join fails.
+    let stopped = opts.service && service::stop_running()?;
+    let mut handed = false;
+    let joined = async {
+        match opts.user.as_deref() {
+            // Enrolled as the user it will run as, by this same command run as that user.
+            Some(name) => {
+                service::idle_for_join(&dir(cfg), name, opts.service)?;
+                let account = service::prepare_account(name, cfg, &mut handed)?;
+                service::run_as(&account, &child_args(cfg, &hub, ca, opts.replace)?, &token)?
+            }
+            None => enroll_here(cfg, &hub, &token, ca, opts.replace).await?,
+        }
+        if opts.service {
+            let timeout = crate::dev::config::parse_duration(service::DEFAULT_STOP_TIMEOUT)?;
+            service::install(cfg, true, timeout, opts.user.as_deref())?;
+        }
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if let Err(e) = joined {
+        if stopped {
+            restart_after(cfg, opts.user.as_deref().filter(|_| handed));
+        }
+        return Err(e);
+    }
+    if !opts.service && std::env::var_os(service::JOIN_CHILD).is_none() {
+        // Only the operator's join prints the next step; the child join leaves it to us.
+        println!("vk node: {}", service::next_step(opts.user.as_deref()));
+    }
+    Ok(())
+}
+
+/// Start the node `join` stopped again after the join failed, unless [`why_left_stopped`].
+/// `handed_to` is the user the state dir was handed to, if it was.
+fn restart_after(cfg: &Config, handed_to: Option<&str>) {
+    let enrolled = read_enrollment(&dir(cfg)).is_ok();
+    let left = match why_left_stopped(enrolled, handed_to, service::unit_runs_as) {
+        Some(why) => why,
+        None => match service::start_again() {
+            Ok(()) => return,
+            Err(e) => format!("{e:#}"),
+        },
+    };
+    println!("vk node: warning: {} stays stopped: {left}", service::UNIT);
+}
+
+/// Why a node stopped for a failed join cannot run as it did: a failed `--replace` leaves the
+/// node dir without an enrollment, the error saying where the old one went, and once the state
+/// dir is handed to `handed_to`, a unit that does not `runs_as` that user may no longer reach it.
+fn why_left_stopped(
+    enrolled: bool,
+    handed_to: Option<&str>,
+    runs_as: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if !enrolled {
+        return Some("this host has no enrollment left".to_string());
+    }
+    let user = handed_to.filter(|user| !runs_as(user))?;
+    Some(format!(
+        "it runs the node as another user than {user}, to whom the state dir now belongs"
+    ))
+}
+
+/// That this host passes `vk check`, which a node needs.
+fn host_checks(cfg: &Config) -> Result<()> {
+    let failed: Vec<String> = inventory::checks(cfg)
+        .into_iter()
+        .filter(|c| !c.ok)
+        .map(|c| format!("{}: {}", c.name, c.detail))
+        .collect();
+    if !failed.is_empty() {
+        bail!(
+            "this host fails `vk check`, so it cannot join a fleet:\n  {}",
+            failed.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
+/// Arguments for the child `vk node join`: pass the token on stdin and make paths absolute
+/// because the child runs from `/` as the node's user.
+fn child_args(
+    cfg: &Config,
+    hub: &str,
+    ca: Option<&Path>,
+    replace: bool,
+) -> Result<Vec<std::ffi::OsString>> {
+    let absolute =
+        |p: &Path| std::path::absolute(p).with_context(|| format!("resolving {}", p.display()));
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(config) = &cfg.source {
+        args.extend(["--config".into(), absolute(config)?.into()]);
+    }
+    args.extend(["node".into(), "join".into(), hub.into()]);
+    args.extend(["--token".into(), "-".into()]);
+    if let Some(ca) = ca {
+        args.extend(["--ca".into(), absolute(ca)?.into()]);
+    }
+    if replace {
+        args.push("--replace".into());
+    }
+    Ok(args)
 }
 
 /// Report that `existing` cannot be replaced without `--replace`.
@@ -221,17 +332,7 @@ async fn enroll_here(
     replace: bool,
 ) -> Result<()> {
     let dir = dir(cfg);
-    let failed: Vec<String> = inventory::checks(cfg)
-        .into_iter()
-        .filter(|c| !c.ok)
-        .map(|c| format!("{}: {}", c.name, c.detail))
-        .collect();
-    if !failed.is_empty() {
-        bail!(
-            "this host fails `vk check`, so it cannot join a fleet:\n  {}",
-            failed.join("\n  ")
-        );
-    }
+    host_checks(cfg)?;
     // Copied, so the node does not depend on a file elsewhere staying where it was, and
     // checked now rather than on the first `run`.
     let ca_pem = match ca {
@@ -282,10 +383,7 @@ async fn enroll_here(
         )),
         None => e,
     })?;
-    println!(
-        "vk node: enrolled with {hub} as node {node_id}; run it as a service with \
-         `vk node service install`, or in the foreground with `vk node run`"
-    );
+    println!("vk node: enrolled with {hub} as node {node_id}");
     Ok(())
 }
 
@@ -296,7 +394,10 @@ fn make_room(dir: &Path, replace: bool) -> Result<(std::fs::File, Option<PathBuf
     create_dir(dir)?;
     let lock = lock(dir).map_err(|e| {
         if e.is::<Locked>() {
-            e.context("a node is running on this host: stop it first (`systemctl stop vk-node`)")
+            e.context(
+                "a node is running on this host: stop it first (`systemctl stop vk-node`), or \
+                 pass --service, which stops it and starts it again once enrolled",
+            )
         } else {
             e
         }
@@ -1065,6 +1166,42 @@ concurrent = 4
         }
         assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
         std::fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn a_node_stopped_for_a_failed_join_restarts_unless_it_can_no_longer_run() {
+        let as_ci = |user: &str| user == "ci";
+        assert_eq!(why_left_stopped(true, None, as_ci), None);
+        assert_eq!(why_left_stopped(true, Some("ci"), as_ci), None);
+        let why = why_left_stopped(true, Some("other"), as_ci).unwrap();
+        assert!(why.contains("another user than other"), "{why}");
+        let why = why_left_stopped(false, None, as_ci).unwrap();
+        assert!(why.contains("no enrollment"), "{why}");
+    }
+
+    #[test]
+    fn a_join_as_another_user_passes_absolute_paths_and_replace_on() {
+        let cfg = Config {
+            source: Some(PathBuf::from("vk.toml")),
+            ..Config::default()
+        };
+        let cwd = std::env::current_dir().unwrap();
+        let args = child_args(&cfg, "https://hub", Some(Path::new("ca.pem")), true).unwrap();
+        let want: Vec<std::ffi::OsString> = vec![
+            "--config".into(),
+            cwd.join("vk.toml").into(),
+            "node".into(),
+            "join".into(),
+            "https://hub".into(),
+            "--token".into(),
+            "-".into(),
+            "--ca".into(),
+            cwd.join("ca.pem").into(),
+            "--replace".into(),
+        ];
+        assert_eq!(args, want);
+        let args = child_args(&Config::default(), "https://hub", None, false).unwrap();
+        assert_eq!(args, ["node", "join", "https://hub", "--token", "-"]);
     }
 
     #[test]

@@ -62,7 +62,26 @@ kernel, and on a host already enrolled unless given `--replace`, which enrolls i
 node: once the token is read and the checks pass, the old `<state_dir>/node/` is moved aside to
 `node.replaced-<time>` beside it, not deleted, and `join` prints the old node ID to remove from
 its hub. If the enrollment then fails, the error names where the old identity is, to move back.
-A running node holds the state dir, and `join` says so.
+A running node holds the state dir, and `join` says so: stop it, or pass `--service`, which
+stops it first and starts it again if the join fails with its old enrollment still in place.
+
+Run as root, `join --user NAME` sets the host up for the user the node will run as, then
+enrolls as that user. Once the token is read, the checks pass and no node holds the state dir,
+it creates the user when `/etc/passwd` has none (`useradd --system --create-home`, shell
+`nologin`), adds it to the group `/dev/kvm` belongs to, creates the state dir and hands it and
+what is in it to the user (`chown`, groups left as they are, never following a symlink,
+crossing a mount point or changing a file also linked from outside the tree: those are named
+and left as they are, and `join` refuses if one is not the user's), and checks that the user
+can reach the state dir, run `vk` and read the config. The enrollment itself runs as the user
+— its uid, groups and home — with the token passed on stdin. `--service` stops a running
+`vk-node.service` before any of this, and once enrolled installs and starts it as `vk node
+service install [--user NAME]` does. If the join fails, the unit is started again only while
+its enrollment is still in place and it runs as `NAME`. So one command moves a runner host to
+a hub, and a new one onto it:
+
+```sh
+sudo vk node join https://hub.example.com:8443 --token - --user gitlab-runner --service [--replace]
+```
 
 A node whose enrollment answer was lost enrolls again with a new token and the same key, and
 gets its node ID back. The identity survives `vk` updates. `vk-hub nodes remove <id>` revokes
@@ -100,6 +119,8 @@ enrolls it as that user and installs the unit:
 sudo -u gitlab-runner vk node join https://hub.example.com --token -
 sudo vk node service install --user gitlab-runner
 ```
+
+`sudo vk node join … --user gitlab-runner --service` does both, and sets the user up first.
 
 With `--user`, the account must be able to reach the state dir, read the config and execute
 `vk`. If the command read no config, it refuses a user config under `~/.config/virtkit/`,
