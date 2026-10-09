@@ -1184,7 +1184,10 @@ submission/start/finish/settlement times, run time and resource usage. For faile
 shows the end of the output (see [Placed jobs](#placed-jobs)) as text in a `<pre>`. Continued
 lines are rejoined; carriage-return updates show the final text. GitLab section markers,
 terminal escape sequences and other controls are removed. Each line's timestamp shows the
-time of day, with the full timestamp on hover.
+time of day, with the full timestamp on hover. A line is kept to 64 KiB: past it, what precedes
+its last carriage return goes, else its head is kept, ending `…`. Lines waiting for a `+` line
+to continue them are held to 256 KiB in all, past which the oldest is taken as complete;
+`vk-hub jobs show` reads the end the hub kept the same way.
 
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a

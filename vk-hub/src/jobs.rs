@@ -30,7 +30,7 @@
 //! comes back. A node's session ending ends its reservations at once; the node's `held`
 //! names them when it is back, and the hub releases them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -2220,48 +2220,265 @@ pub struct TraceLine {
 /// section markers removed (a line that held nothing else with them), and the terminal's escape
 /// sequences and other controls dropped.
 pub fn readable(output: &[u8]) -> Vec<TraceLine> {
-    use vk_hub_proto::stamp::HEADER_LEN;
     // For display alone: an invalid sequence shows as U+FFFD.
-    let output = String::from_utf8_lossy(output);
-    let mut joined: Vec<(Option<String>, String)> = Vec::new();
-    // By stream and `O`/`E` (header bytes 28..31): the index of its last line, which a `+`
-    // continues.
-    let mut last: HashMap<&str, usize> = HashMap::new();
-    for line in output.split_terminator('\n') {
-        let Some(h) = line.get(..HEADER_LEN).filter(|h| stamped(h.as_bytes())) else {
-            joined.push((None, line.to_string()));
-            continue;
+    let mut trace = Trace::default();
+    let mut lines = trace.push(&String::from_utf8_lossy(output));
+    lines.extend(trace.finish());
+    lines
+}
+
+/// The most of one line [`Trace`] keeps: a progress bar redrawn for hours is one line. Past
+/// it, what precedes the line's last carriage return goes, as nothing shows it; with none to
+/// cut at, its head is kept and the rest dropped, marked [`CUT_MARK`].
+const MAX_HELD_LINE: usize = 64 * 1024;
+
+/// What ends a line [`Trace`] cut short.
+const CUT_MARK: &str = "…";
+
+/// The most [`Trace`] holds back in all, each line counted as its text and [`HELD_LINE_COST`]:
+/// past it the oldest line is taken as done, so a stream that leaves a line open while another
+/// writes on holds neither memory nor the rest back without end.
+const MAX_HELD: usize = 256 * 1024;
+
+/// What a held line counts for besides its text.
+const HELD_LINE_COST: usize = 64;
+
+/// The longest escape sequence a cut line is kept from ending inside.
+const MAX_ESCAPE: usize = 32;
+
+/// A job's trace made [`readable`] as it arrives, a stretch at a time. A stamped line is
+/// continued by the next `+` line of its stream (`O` or `E`), which may come after lines of
+/// the other: lines are held back from the first one still open, and [`Trace::held`] is how
+/// they read so far. What is held is bounded: [`MAX_HELD_LINE`] a line, [`MAX_HELD`] in all.
+#[derive(Default)]
+pub struct Trace {
+    /// The lines not yet done, oldest first.
+    held: VecDeque<HeldLine>,
+    /// What `held` counts for against [`MAX_HELD`].
+    cost: usize,
+    /// The ID the next held line takes.
+    next: u64,
+    /// The held line the last stretch ended inside, before its newline.
+    open: Option<u64>,
+}
+
+/// A line [`Trace`] holds back.
+struct HeldLine {
+    id: u64,
+    /// Its stream and `O`/`E` (header bytes 28..31); `None` for an unstamped line, which
+    /// nothing continues.
+    key: Option<String>,
+    /// Its stamp's time.
+    at: Option<String>,
+    /// Its text as it came, continuations joined, kept under [`MAX_HELD_LINE`].
+    text: String,
+    /// Where its text ends, [`CUT_MARK`] included, once [`hold`] cut it short.
+    cut: Option<usize>,
+    /// Whether a later line of its stream has started, so nothing more continues it.
+    done: bool,
+}
+
+impl HeldLine {
+    fn cost(&self) -> usize {
+        self.text.len().saturating_add(HELD_LINE_COST)
+    }
+
+    fn shown(self) -> Option<TraceLine> {
+        shown((self.at, self.text))
+    }
+}
+
+impl Trace {
+    /// The lines the trace's next stretch, `text`, ends, in order. A stretch may end anywhere
+    /// but inside a character.
+    pub fn push(&mut self, text: &str) -> Vec<TraceLine> {
+        use vk_hub_proto::stamp::HEADER_LEN;
+        let mut done = Vec::new();
+        let mut rest = text;
+        if let Some(id) = self.open.take()
+            && let Some(i) = self.held.iter().position(|l| l.id == id)
+        {
+            let (head, tail) = rest.split_once('\n').unwrap_or((rest, ""));
+            self.extend(i, head);
+            if !rest.contains('\n') {
+                self.open = Some(id);
+            }
+            rest = tail;
+        }
+        for piece in rest.split_inclusive('\n') {
+            let line = piece.strip_suffix('\n').unwrap_or(piece);
+            let ends = piece.ends_with('\n');
+            let Some(h) = line.get(..HEADER_LEN).filter(|h| stamped(h.as_bytes())) else {
+                self.add(None, None, line, true, ends);
+                self.settle(&mut done);
+                continue;
+            };
+            let text = line.get(HEADER_LEN..).unwrap_or_default();
+            let key = h.get(28..31).unwrap_or_default();
+            let continued = h.as_bytes().get(HEADER_LEN - 1) == Some(&b'+');
+            let last = (self.held.iter()).rposition(|l| !l.done && l.key.as_deref() == Some(key));
+            match last {
+                Some(i) if continued => {
+                    self.extend(i, text);
+                    if !ends {
+                        self.open = self.held.get(i).map(|l| l.id);
+                    }
+                    self.settle(&mut done);
+                    continue;
+                }
+                Some(i) => {
+                    if let Some(l) = self.held.get_mut(i) {
+                        l.done = true;
+                    }
+                }
+                None => {}
+            }
+            let at = h.get(..HEADER_LEN - 5).map(str::to_string);
+            self.add(Some(key.to_string()), at, text, false, ends);
+            self.settle(&mut done);
+        }
+        done
+    }
+
+    /// Hold a new line, `done` when nothing can continue it, open when `!ends`.
+    fn add(&mut self, key: Option<String>, at: Option<String>, text: &str, done: bool, ends: bool) {
+        let id = self.next;
+        self.next = self.next.wrapping_add(1);
+        let mut line = HeldLine {
+            id,
+            key,
+            at,
+            text: text.to_string(),
+            cut: None,
+            done,
         };
-        let text = line.get(HEADER_LEN..).unwrap_or_default();
-        let key = h.get(28..31).unwrap_or_default();
-        let continued = h.as_bytes().get(HEADER_LEN - 1) == Some(&b'+');
-        match last.get(key).and_then(|&i| joined.get_mut(i)) {
-            Some(prev) if continued => prev.1.push_str(text),
-            _ => {
-                last.insert(key, joined.len());
-                joined.push((
-                    h.get(..HEADER_LEN - 5).map(str::to_string),
-                    text.to_string(),
-                ));
+        hold(&mut line.text, &mut line.cut);
+        self.cost = self.cost.saturating_add(line.cost());
+        self.held.push_back(line);
+        if !ends {
+            self.open = Some(id);
+        }
+    }
+
+    /// Continue held line `i` with `text`.
+    fn extend(&mut self, i: usize, text: &str) {
+        let Some(line) = self.held.get_mut(i) else {
+            return;
+        };
+        self.cost = self.cost.saturating_sub(line.cost());
+        line.text.push_str(text);
+        hold(&mut line.text, &mut line.cut);
+        self.cost = self.cost.saturating_add(line.cost());
+    }
+
+    /// Emit completed lines from the front into `done`. Above [`MAX_HELD`], also emit
+    /// the oldest unfinished lines.
+    fn settle(&mut self, done: &mut Vec<TraceLine>) {
+        while let Some(front) = self.held.front()
+            && (self.cost > MAX_HELD || (front.done && Some(front.id) != self.open))
+        {
+            let Some(line) = self.held.pop_front() else {
+                break;
+            };
+            self.cost = self.cost.saturating_sub(line.cost());
+            if Some(line.id) == self.open {
+                // What continues it is read as a line of its own.
+                self.open = None;
+            }
+            done.extend(line.shown());
+        }
+    }
+
+    /// The lines held back, as they read so far.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "for a page following a running job")
+    )]
+    pub fn held(&self) -> Vec<TraceLine> {
+        self.held
+            .iter()
+            .filter_map(|l| shown((l.at.clone(), l.text.clone())))
+            .collect()
+    }
+
+    /// The lines held back, now that nothing can continue them.
+    pub fn finish(&mut self) -> Vec<TraceLine> {
+        self.open = None;
+        self.cost = 0;
+        self.held.drain(..).filter_map(HeldLine::shown).collect()
+    }
+}
+
+/// Keep `line`, held while it may be continued, under [`MAX_HELD_LINE`]. `cut`: where it ends
+/// once cut short, past which what is appended goes, but from a carriage return on.
+fn hold(line: &mut String, cut: &mut Option<usize>) {
+    if let Some(end) = *cut {
+        // Appended after the mark: a carriage return starts a drawing anew, else it goes.
+        let body = line.trim_end_matches('\r');
+        match body.get(end..).and_then(|after| after.rfind('\r')) {
+            Some(cr) => {
+                line.drain(..end.saturating_add(cr).saturating_add(1));
+                *cut = None;
+            }
+            None => {
+                // A trailing carriage return stays, for the next drawing to restart from.
+                let cr = line.ends_with('\r');
+                line.truncate(end);
+                if cr {
+                    line.push('\r');
+                }
+                return;
             }
         }
     }
-    let mut lines = Vec::new();
-    for (at, text) in joined {
-        let (text, marked) = without_sections(&text);
-        // What the terminal was left showing: the text after the last carriage return.
-        let shown = text
-            .trim_end_matches('\r')
-            .rsplit('\r')
-            .next()
-            .unwrap_or_default();
-        let text = crate::ui::html::terminal_safe(shown);
-        if marked && text.trim().is_empty() {
-            continue;
-        }
-        lines.push(TraceLine { at, text });
+    if line.len() <= MAX_HELD_LINE {
+        return;
     }
-    lines
+    // Nothing shows what precedes the last carriage return, but those it ends with.
+    if let Some(cr) = line.trim_end_matches('\r').rfind('\r') {
+        line.drain(..=cr);
+        if line.len() <= MAX_HELD_LINE {
+            return;
+        }
+    }
+    let end = (0..=MAX_HELD_LINE)
+        .rev()
+        .find(|&i| line.is_char_boundary(i))
+        .unwrap_or(0);
+    line.truncate(before_escape(line, end));
+    line.push_str(CUT_MARK);
+    *cut = Some(line.len());
+}
+
+/// Where to end `line` cut at `end`: before an escape sequence `end` would split, if one
+/// starts within [`MAX_ESCAPE`] bytes of it, so no half of one shows.
+fn before_escape(line: &str, end: usize) -> usize {
+    let from = end.saturating_sub(MAX_ESCAPE);
+    let Some(esc) = line.get(from..end).and_then(|w| w.rfind('\x1b')) else {
+        return end;
+    };
+    let esc = from.saturating_add(esc);
+    let seq = line.get(esc.saturating_add(1)..end).unwrap_or_default();
+    // A CSI sequence ends with its final byte; another escape with the character after it.
+    let ended = match seq.strip_prefix('[') {
+        Some(params) => params.bytes().any(|b| (0x40..=0x7e).contains(&b)),
+        None => !seq.is_empty(),
+    };
+    if ended { end } else { esc }
+}
+
+/// Format a joined line with its timestamp: remove GitLab section markers, keep the final
+/// carriage-return update, and apply [`crate::ui::html::terminal_safe`]. Return `None`
+/// for a line containing only a section marker.
+fn shown((at, text): (Option<String>, String)) -> Option<TraceLine> {
+    let (text, marked) = without_sections(&text);
+    let shown = text
+        .trim_end_matches('\r')
+        .rsplit('\r')
+        .next()
+        .unwrap_or_default();
+    let text = crate::ui::html::terminal_safe(shown);
+    (!marked || !text.trim().is_empty()).then_some(TraceLine { at, text })
 }
 
 /// Whether `h` is a stamp's header: `2026-10-09T12:10:43.123456Z 01O ` or `+` at its end.
@@ -2332,6 +2549,117 @@ pub(crate) fn run_text(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lines still open show as the terminal would: continued, then overwritten.
+    #[test]
+    fn the_lines_still_open_show_as_they_read() {
+        let stamp = |kind: char| format!("2026-10-09T12:10:43.123456Z 01O{kind}");
+        let mut trace = Trace::default();
+        assert!(trace.push(&format!("{}10%\r\n", stamp(' '))).is_empty());
+        assert_eq!(texts(&trace.held()), ["10%"]);
+        assert!(trace.push(&format!("{}20%\r\n", stamp('+'))).is_empty());
+        assert_eq!(texts(&trace.held()), ["20%"]);
+        let done = trace.push(&format!("{}next\n", stamp(' ')));
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].text, "20%");
+        assert_eq!(texts(&trace.held()), ["next"]);
+        // A line redrawn without end is held to its last drawing, bounded.
+        let mut trace = Trace::default();
+        trace.push(&format!("{} start", stamp(' ')));
+        for n in 0..20_000 {
+            trace.push(&format!("\rprogress {n:05}"));
+        }
+        trace.push("\r");
+        assert_eq!(texts(&trace.held()), ["progress 19999"]);
+        assert_eq!(texts(&trace.finish()), ["progress 19999"]);
+    }
+
+    fn texts(lines: &[TraceLine]) -> Vec<&str> {
+        lines.iter().map(|l| l.text.as_str()).collect()
+    }
+
+    /// A `+` line continues its own stream's last line, past lines of the other, which wait
+    /// for it in order.
+    #[test]
+    fn a_continuation_joins_its_own_stream_s_line() {
+        let stamp = |io: char, kind: char| format!("2026-10-09T12:10:43.123456Z 01{io}{kind}");
+        let output = format!(
+            "{}out a\n{}err\n{}out b\n{}err more\n{}last\n",
+            stamp('O', ' '),
+            stamp('E', ' '),
+            stamp('O', '+'),
+            stamp('E', '+'),
+            stamp('O', ' '),
+        );
+        let whole = readable(output.as_bytes());
+        assert_eq!(texts(&whole), ["out aout b", "errerr more", "last"]);
+        let mut trace = Trace::default();
+        let mut shown = Vec::new();
+        for line in output.split_inclusive('\n') {
+            shown.extend(trace.push(line));
+        }
+        // The error line waits for a later one of its stream; "last" waits behind it.
+        assert_eq!(texts(&shown), ["out aout b"]);
+        assert_eq!(texts(&trace.held()), ["errerr more", "last"]);
+        shown.extend(trace.finish());
+        assert_eq!(shown, whole);
+    }
+
+    /// An oversized line keeps its head and a cut marker without splitting an escape
+    /// sequence. Continuations are dropped until a carriage return starts a new update.
+    #[test]
+    fn a_long_line_keeps_its_head_marked_cut() {
+        let stamp = |kind: char| format!("2026-10-09T12:10:43.123456Z 01O{kind}");
+        let head = "x".repeat(MAX_HELD_LINE - 2);
+        let output = format!("{}{head}\x1b[31mred\x1b[0m and more\n", stamp(' '));
+        let lines = readable(output.as_bytes());
+        assert_eq!(texts(&lines), [format!("{head}{CUT_MARK}")]);
+        let mut trace = Trace::default();
+        trace.push(&format!("{}{head}yyyy\n", stamp(' ')));
+        trace.push(&format!("{}more\n", stamp('+')));
+        assert_eq!(texts(&trace.held()), [format!("{head}yy{CUT_MARK}")]);
+        trace.push(&format!("{}\rprogress 1\r\n", stamp('+')));
+        assert_eq!(texts(&trace.held()), ["progress 1"]);
+        // Redraws ending in a carriage return, after a cut: the last drawing shows.
+        let mut trace = Trace::default();
+        trace.push(&format!("{}{head}yyyy\n", stamp(' ')));
+        trace.push(&format!("{}50%\r\n", stamp('+')));
+        trace.push(&format!("{}60%\r\n", stamp('+')));
+        assert_eq!(texts(&trace.held()), ["60%"]);
+        // A long last drawing is cut at its carriage return, then at its head.
+        let mut trace = Trace::default();
+        let long = "z".repeat(2 * MAX_HELD_LINE);
+        trace.push(&format!("{}old\r{long}\r\n", stamp(' ')));
+        let held = trace.finish();
+        assert_eq!(held.len(), 1);
+        assert!(held[0].text.ends_with(CUT_MARK), "{}", held[0].text.len());
+        assert!(held[0].text.starts_with('z'));
+        assert_eq!(held[0].text.len(), MAX_HELD_LINE + CUT_MARK.len());
+    }
+
+    /// A line left open while the other stream writes on holds back no more than
+    /// [`MAX_HELD`]: past it, the open line is taken as done, and the rest follow.
+    #[test]
+    fn what_is_held_back_is_bounded() {
+        let stamp = |io: char| format!("2026-10-09T12:10:43.123456Z 01{io} ");
+        let mut trace = Trace::default();
+        assert!(trace.push(&format!("{}waiting\n", stamp('E'))).is_empty());
+        let mut shown = Vec::new();
+        for n in 0..10_000 {
+            shown.extend(trace.push(&format!("{}line {n:05} {}\n", stamp('O'), "x".repeat(80))));
+        }
+        let held: usize = trace
+            .held()
+            .iter()
+            .map(|l| l.text.len() + HELD_LINE_COST)
+            .sum();
+        assert!(held <= MAX_HELD, "{held}");
+        assert_eq!(shown.first().map(|l| l.text.as_str()), Some("waiting"));
+        shown.extend(trace.finish());
+        assert_eq!(shown.len(), 10_001);
+        assert!(shown[1].text.starts_with("line 00000 "));
+        assert!(shown[10_000].text.starts_with("line 09999 "));
+    }
 
     #[test]
     fn a_node_s_load_is_its_largest_share() {
