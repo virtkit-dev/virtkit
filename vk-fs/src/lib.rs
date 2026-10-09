@@ -22,14 +22,17 @@
 //! name to refer only to a socket already restricted to `0600`.
 //!
 //! [`open_dir`], [`open_dir_nofollow`] and [`open_dir_in`] expose the third rule to callers
-//! that anchor their own `*at()` operations.
+//! that anchor their own `*at()` operations, and [`reopen_dir`] and [`dir_names`] read or lock
+//! a directory so held.
 //!
 //! [`entry_in`] exposes the fourth to callers walking a path, links included: it says whether
 //! an entry could have been put there, or swapped since, by another user.
 //!
 //! [`chown_tree`] keeps the third when root transfers a tree to a user who may already write
 //! in it. Entries are opened from their parent's descriptor and changed through their own,
-//! so name swaps cannot redirect the changes.
+//! so name swaps cannot redirect the changes. [`remove_tree_in`] removes a tree the same way,
+//! the very directory its caller opened, a link always as itself, nothing past a mount and
+//! nothing another user owns.
 
 use anyhow::{Context, anyhow, bail};
 use std::ffi::{CString, OsStr};
@@ -653,6 +656,19 @@ pub fn open_dir_in(dir: BorrowedFd<'_>, name: &OsStr) -> Result<OwnedFd, anyhow:
         .map_err(|e| anyhow!(e).context(format!("opening {name:?}")))
 }
 
+/// Reopen `dir` for listing or `flock`, which an `O_PATH` descriptor from [`open_dir_in`]
+/// cannot support. Opening `.` relative to `dir` preserves its inode even if its name changes.
+pub fn reopen_dir(dir: BorrowedFd<'_>) -> Result<OwnedFd, anyhow::Error> {
+    open_listing(dir).map_err(|e| anyhow!(e).context("reopening a directory to read it"))
+}
+
+/// List `dir` excluding `.` and `..`. Read through a separate descriptor ([`reopen_dir`]),
+/// allowing `dir` to be an `O_PATH` descriptor.
+pub fn dir_names(dir: BorrowedFd<'_>) -> Result<Vec<std::ffi::OsString>, anyhow::Error> {
+    let listing = reopen_dir(dir)?;
+    list_dir(&listing).context("listing a directory")
+}
+
 /// [`open_dir_in`] for the staging directory [`publish_into`] just made.
 fn openat_dir(parent: BorrowedFd<'_>, name: &CString) -> Result<OwnedFd, anyhow::Error> {
     openat_dir_raw(parent, name)
@@ -926,7 +942,220 @@ impl ChownWalk {
     }
 }
 
-/// The part of the kernel's `struct statx` (`linux/stat.h`) [`chown_tree`] reads, padded to the
+/// What [`remove_tree_in`] did.
+#[derive(Debug, Default)]
+pub struct RemoveTree {
+    /// Disk space the removed entries held, in bytes. A file also linked from elsewhere, whose
+    /// space stays in use, is not counted.
+    pub bytes: u64,
+    /// Entries left in place, relative to the parent: mount roots, entries on another device
+    /// and entries another user owns, none of which is entered either. The directories above
+    /// one are left too.
+    pub skipped: Vec<PathBuf>,
+}
+
+/// How many directory levels below its root [`remove_tree_in`] enters, one descriptor each.
+const REMOVE_TREE_MAX_DEPTH: usize = 512;
+
+/// Remove the directory `dir`, found as `name` in `parent`, and everything in it, never
+/// following a symlink: a link is removed itself, never what it names.
+///
+/// `dir` is the directory the caller opened as `name` (with [`open_dir_in`], say) and judged
+/// removable, and it is the one removed: unless `name` still leads to the same inode, nothing
+/// is. The walk lists and enters `dir` itself, never the name again. The final
+/// `unlinkat(AT_REMOVEDIR)` is by name, checked against `dir` just before; a directory swapped
+/// in between is removed only if it is empty, which is all `AT_REMOVEDIR` takes.
+///
+/// Nothing past `parent` is resolved by path. Each entry is opened `O_PATH | O_NOFOLLOW` from
+/// its already-open parent, and the inode that descriptor holds is the one inspected and, for
+/// a directory, entered. Entries are unlinked by name through the parent's descriptor, so a
+/// name swapped mid-walk can at most make it remove what was swapped in, never anything
+/// outside the tree; a directory goes with `AT_REMOVEDIR`, which takes only an empty one.
+///
+/// Mount roots, entries on another device (bind mounts of the same filesystem included) and
+/// entries another user owns are neither entered nor removed, and the directories holding them
+/// stay; all are reported. `dir` itself is refused if it is not a directory, and reported
+/// untouched if it is one of those. `name` is one name: not empty, `.` or `..`, and without a
+/// `/`.
+///
+/// The walk recurses holding one directory descriptor per level and fails on a tree nested
+/// deeper than 512 levels. An error stops it, leaving what it had not yet removed, and returns
+/// no count of what it had.
+pub fn remove_tree_in(
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+    dir: BorrowedFd<'_>,
+) -> Result<RemoveTree, anyhow::Error> {
+    if name == "." || name == ".." {
+        bail!("{name:?} is not an entry of its own");
+    }
+    let c_name = one_name(name)?;
+    let shown = Path::new(name);
+    let st = statx_fd(dir).with_context(|| format!("inspecting {}", shown.display()))?;
+    if u32::from(st.stx_mode) & libc::S_IFMT != libc::S_IFDIR {
+        bail!("{} is not a directory", shown.display());
+    }
+    still_named(parent, &c_name, &st, shown)?;
+    let above = statx_fd(parent).context("inspecting the parent directory")?;
+    let mut walk = RemoveWalk {
+        dev: (above.stx_dev_major, above.stx_dev_minor),
+        // SAFETY: `geteuid` reads this process's own id and cannot fail.
+        uid: unsafe { libc::geteuid() },
+        done: RemoveTree::default(),
+    };
+    if walk.foreign(&st) {
+        walk.done.skipped.push(shown.to_path_buf());
+        return Ok(walk.done);
+    }
+    let listing = open_listing(dir)
+        .map_err(|e| anyhow!(e).context(format!("opening {}", shown.display())))?;
+    walk.entries(listing, shown, 1)?;
+    if walk.done.skipped.is_empty() {
+        still_named(parent, &c_name, &st, shown)?;
+        walk.unlink(parent, &c_name, &st, shown)?;
+    }
+    Ok(walk.done)
+}
+
+/// Refuse unless `name` in `parent` is, unfollowed, the inode inspected as `st`.
+fn still_named(
+    parent: BorrowedFd<'_>,
+    name: &CString,
+    st: &Statx,
+    shown: &Path,
+) -> Result<(), anyhow::Error> {
+    let entry = openat_entry(parent, name)
+        .map_err(|e| anyhow!(e).context(format!("opening {}", shown.display())))?;
+    let now = statx_fd(entry.as_fd()).with_context(|| format!("inspecting {}", shown.display()))?;
+    let id = |s: &Statx| (s.stx_dev_major, s.stx_dev_minor, s.stx_ino);
+    if id(&now) != id(st) {
+        bail!("{} is no longer the directory opened", shown.display());
+    }
+    Ok(())
+}
+
+/// [`remove_tree_in`]'s state across the walk.
+struct RemoveWalk {
+    /// The device of the tree's parent, which the walk does not leave.
+    dev: (u32, u32),
+    /// This user, the only one whose entries the walk removes.
+    uid: u32,
+    done: RemoveTree,
+}
+
+impl RemoveWalk {
+    /// Whether the inode inspected as `st` is a mount root, on another device, or another
+    /// user's.
+    fn foreign(&self, st: &Statx) -> bool {
+        (st.stx_dev_major, st.stx_dev_minor) != self.dev
+            || st.stx_uid != self.uid
+            || st.stx_attributes_mask & st.stx_attributes & STATX_ATTR_MOUNT_ROOT != 0
+    }
+
+    /// Unlink `name`, inspected as `st`, from `dir` — a directory with `AT_REMOVEDIR` — and
+    /// count the space it held. One already gone counts nothing.
+    fn unlink(
+        &mut self,
+        dir: BorrowedFd<'_>,
+        name: &CString,
+        st: &Statx,
+        shown: &Path,
+    ) -> Result<(), anyhow::Error> {
+        let is_dir = u32::from(st.stx_mode) & libc::S_IFMT == libc::S_IFDIR;
+        let flags = if is_dir { libc::AT_REMOVEDIR } else { 0 };
+        // SAFETY: the descriptor is live and the name NUL-terminated.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(());
+            }
+            return Err(anyhow!(e).context(format!("removing {}", shown.display())));
+        }
+        if st.stx_mask & STATX_BLOCKS != 0 && (is_dir || st.stx_nlink <= 1) {
+            let bytes = st.stx_blocks.saturating_mul(512);
+            self.done.bytes = self.done.bytes.saturating_add(bytes);
+        }
+        Ok(())
+    }
+
+    /// Empty the open directory `dir`; use `path` only for errors and the report.
+    fn entries(&mut self, dir: OwnedFd, path: &Path, depth: usize) -> Result<(), anyhow::Error> {
+        if depth > REMOVE_TREE_MAX_DEPTH {
+            bail!(
+                "{} is nested deeper than {REMOVE_TREE_MAX_DEPTH} levels",
+                path.display()
+            );
+        }
+        // The names first, then the removals: the stream is closed before descending.
+        let names = list_dir(&dir).with_context(|| format!("listing {}", path.display()))?;
+        for name in names {
+            let c_name = one_name(&name)?;
+            let shown = path.join(&name);
+            let entry = match openat_entry(dir.as_fd(), &c_name) {
+                Ok(entry) => entry,
+                // Gone since the listing: nothing left to remove.
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => continue,
+                Err(e) => return Err(anyhow!(e).context(format!("opening {}", shown.display()))),
+            };
+            let st = statx_fd(entry.as_fd())
+                .with_context(|| format!("inspecting {}", shown.display()))?;
+            if self.foreign(&st) {
+                self.done.skipped.push(shown);
+                continue;
+            }
+            if u32::from(st.stx_mode) & libc::S_IFMT == libc::S_IFDIR {
+                let sub = open_listing(entry.as_fd())
+                    .map_err(|e| anyhow!(e).context(format!("opening {}", shown.display())))?;
+                drop(entry);
+                let skipped = self.done.skipped.len();
+                self.entries(sub, &shown, depth + 1)?;
+                if self.done.skipped.len() > skipped {
+                    continue;
+                }
+            }
+            self.unlink(dir.as_fd(), &c_name, &st, &shown)?;
+        }
+        Ok(())
+    }
+}
+
+/// Open the entry `name` in `dir` as an `O_PATH` descriptor on the entry itself, a symlink
+/// included.
+fn openat_entry(dir: BorrowedFd<'_>, name: &CString) -> std::io::Result<OwnedFd> {
+    // SAFETY: the descriptor is live and the name NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor this call owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Open the directory `entry` holds for listing. `.` from `entry` is the directory already
+/// inspected, whatever its name says now.
+fn open_listing(entry: BorrowedFd<'_>) -> std::io::Result<OwnedFd> {
+    // SAFETY: `entry` is open and the name NUL-terminated.
+    let fd = unsafe {
+        libc::openat(
+            entry.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor this call owns.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The part of the kernel's `struct statx` (`linux/stat.h`) the tree walks read, padded to the
 /// whole struct `statx(2)` writes. `libc` declares it only for musl builds configured with
 /// `RUST_LIBC_UNSTABLE_MUSL_V1_2_3`, which virtkit's is not.
 #[repr(C)]
@@ -940,7 +1169,8 @@ struct Statx {
     stx_mode: u16,
     _spare0: u16,
     stx_ino: u64,
-    _size_blocks: [u64; 2],
+    _size: u64,
+    stx_blocks: u64,
     stx_attributes_mask: u64,
     _times: [u64; 8],
     _rdev: [u32; 2],
@@ -955,6 +1185,8 @@ const _: () = assert!(std::mem::size_of::<Statx>() == 256);
 /// walk reads, which a filesystem must report for it to proceed. Spelled out for the same
 /// reason as [`Statx`], as is [`STATX_ATTR_MOUNT_ROOT`] (both `linux/stat.h`).
 const STATX_NEEDED: u32 = 0x010f;
+/// `STATX_BLOCKS`: asked for too, for [`remove_tree_in`]'s count, but not required.
+const STATX_BLOCKS: u32 = 0x0400;
 const STATX_ATTR_MOUNT_ROOT: u64 = 0x2000;
 
 /// Inspect the inode held by `fd` with `statx(2)`.
@@ -968,7 +1200,7 @@ fn statx_fd(fd: BorrowedFd<'_>) -> std::io::Result<Statx> {
             fd.as_raw_fd(),
             c"".as_ptr(),
             libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            STATX_NEEDED,
+            STATX_NEEDED | STATX_BLOCKS,
             buf.as_mut_ptr(),
         )
     };
@@ -1031,6 +1263,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// The tree goes with its links, and nothing a link names; the space counted is the
+    /// tree's own, a file also linked from outside excepted. A symlink or a file in the tree's
+    /// place is refused.
+    #[test]
+    fn remove_tree_in_removes_the_tree_and_follows_no_link() {
+        let root = scratch("remove-tree");
+        let outside = scratch("remove-tree-outside");
+        let tree = root.join("tree");
+        std::fs::create_dir_all(tree.join("a/b")).unwrap();
+        std::fs::write(tree.join("a/b/f"), vec![7u8; 64 * 1024]).unwrap();
+        std::fs::write(outside.join("target"), b"x").unwrap();
+        std::fs::write(outside.join("shared"), vec![7u8; 64 * 1024]).unwrap();
+        std::fs::hard_link(outside.join("shared"), tree.join("shared")).unwrap();
+        std::os::unix::fs::symlink(outside.join("target"), tree.join("a/link")).unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("dirlink")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("toplink")).unwrap();
+        std::fs::write(root.join("file"), b"x").unwrap();
+        let parent = open_dir(&root).unwrap();
+        let held = |name: &str| openat_entry(parent.as_fd(), &CString::new(name).unwrap()).unwrap();
+        let remove = |name: &str, dir: &OwnedFd| {
+            remove_tree_in(parent.as_fd(), OsStr::new(name), dir.as_fd())
+        };
+
+        let err = remove("toplink", &held("toplink")).unwrap_err();
+        assert!(format!("{err:#}").contains("not a directory"), "{err:#}");
+        assert!(remove("file", &held("file")).is_err());
+        let dir = open_dir_in(parent.as_fd(), OsStr::new("tree")).unwrap();
+        assert!(remove("..", &dir).is_err());
+        assert!(remove("a/b", &dir).is_err());
+
+        let done = remove("tree", &dir).unwrap();
+        assert!(!tree.exists());
+        assert!(done.skipped.is_empty(), "{:?}", done.skipped);
+        // The 64 KiB file and the directories, not the file still linked from outside.
+        assert!(done.bytes >= 64 * 1024, "{}", done.bytes);
+        assert!(done.bytes < 2 * 64 * 1024, "{}", done.bytes);
+        assert!(outside.join("target").is_file());
+        assert!(outside.join("shared").is_file());
+        assert!(root.join("toplink").is_symlink());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// Only the directory opened goes: once its name leads elsewhere, nothing is removed.
+    #[test]
+    fn remove_tree_in_refuses_a_name_swapped_since_opened() {
+        let root = scratch("remove-tree-swap");
+        std::fs::create_dir_all(root.join("tree")).unwrap();
+        std::fs::write(root.join("tree/f"), b"x").unwrap();
+        let parent = open_dir(&root).unwrap();
+        let opened = open_dir_in(parent.as_fd(), OsStr::new("tree")).unwrap();
+        std::fs::rename(root.join("tree"), root.join("moved")).unwrap();
+        std::fs::create_dir(root.join("tree")).unwrap();
+        std::fs::write(root.join("tree/g"), b"x").unwrap();
+
+        let err = remove_tree_in(parent.as_fd(), OsStr::new("tree"), opened.as_fd()).unwrap_err();
+        assert!(format!("{err:#}").contains("no longer"), "{err:#}");
+        assert!(root.join("tree/g").is_file());
+        assert!(root.join("moved/f").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `dir_names` lists through an `O_PATH` descriptor, which cannot be read itself.
+    #[test]
+    fn dir_names_lists_an_o_path_directory() {
+        let root = scratch("dir-names");
+        std::fs::write(root.join("a"), b"x").unwrap();
+        std::fs::create_dir(root.join("b")).unwrap();
+        let dir = open_dir(&root).unwrap();
+        let mut names = dir_names(dir.as_fd()).unwrap();
+        names.sort();
+        assert_eq!(names, ["a", "b"]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The tree changes hands, links themselves rather than what they name, a file hard-linked
