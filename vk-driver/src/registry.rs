@@ -1250,7 +1250,7 @@ fn staging_tmp(bundle: &Path) -> PathBuf {
 /// Build an oci-client `Client` + `RegistryAuth` from a `[registry]` section, the same
 /// construction `oci.rs` uses for the docker and launch paths (rustls, optional PEM CA,
 /// Basic vs Anonymous auth).
-fn client(rg: &Registry) -> Result<(oci_client::Client, RegistryAuth)> {
+pub(crate) fn client(rg: &Registry) -> Result<(oci_client::Client, RegistryAuth)> {
     let mut cfg = ClientConfig::default();
     if let Some(ca) = &rg.ca_file {
         let pem = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
@@ -1267,7 +1267,7 @@ fn client(rg: &Registry) -> Result<(oci_client::Client, RegistryAuth)> {
 }
 
 /// `<registry.repo>/<name>` parsed into an oci-client `Reference` at `tag`/`digest`.
-fn make_ref(rg: &Registry, name: &str, refr: &str) -> Result<OciReference> {
+pub(crate) fn make_ref(rg: &Registry, name: &str, refr: &str) -> Result<OciReference> {
     let whole = format!("{}/{name}:{refr}", rg.repo);
     whole
         .parse()
@@ -2176,7 +2176,14 @@ async fn detect_transparent_zstd(rg: &Registry, image: &OciReference) -> bool {
 
 /// A reqwest client honoring the registry's TLS settings (rustls + optional PEM CA),
 /// for the transparent-zstd blob push that needs a per-request `Content-Encoding`.
-fn http_client(rg: &Registry) -> Result<reqwest::Client> {
+pub(crate) fn http_client(rg: &Registry) -> Result<reqwest::Client> {
+    http_client_builder(rg)?
+        .build()
+        .context("building the registry HTTP client")
+}
+
+/// [`http_client`]'s builder, for a caller that adds settings of its own (timeouts).
+pub(crate) fn http_client_builder(rg: &Registry) -> Result<reqwest::ClientBuilder> {
     let mut b = reqwest::Client::builder();
     if let Some(ca) = &rg.ca_file {
         let pem = std::fs::read(ca).with_context(|| format!("reading {}", ca.display()))?;
@@ -2184,7 +2191,7 @@ fn http_client(rg: &Registry) -> Result<reqwest::Client> {
             reqwest::Certificate::from_pem(&pem).context("parsing the registry CA")?,
         );
     }
-    b.build().context("building the registry HTTP client")
+    Ok(b)
 }
 
 // ---- build-once lock (client of the vk-registry /lock API) ----
@@ -2385,13 +2392,13 @@ pub fn report_build_failure(rg: &Registry, key: &str, reason: &str) {
 /// (`token_file`) takes precedence over Basic (`username` + `password_file`), else none.
 /// One resolver for every client path (oci_client, raw HTTP, the lock API) so the driver
 /// can authenticate to a registry gated by either Basic or a static bearer token.
-enum Cred {
+pub(crate) enum Cred {
     None,
     Basic { user: String, pass: String },
     Bearer { token: String },
 }
 
-fn cred(rg: &Registry) -> Result<Cred> {
+pub(crate) fn cred(rg: &Registry) -> Result<Cred> {
     if let Some(tf) = &rg.token_file {
         // A bearer token carries no meaningful surrounding whitespace, so trim both ends
         // (unlike a password below, which may legitimately begin with whitespace and is
@@ -2433,7 +2440,7 @@ impl Cred {
         }
     }
     /// Attach the credential to a raw reqwest request.
-    fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    pub(crate) fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self {
             Cred::None => req,
             Cred::Basic { user, pass } => req.basic_auth(user, Some(pass)),

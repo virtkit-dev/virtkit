@@ -152,12 +152,18 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
     // then counted by nobody, which is the one thing this ledger exists to prevent.
     let file = {
         let _dir_lock = lock_dir(dir)?;
+        // `vk node` hands the job a reservation granted to the hub. Keep its queue position
+        // and claim until this ask is granted, so the job waits only for the extra resources.
+        let reserved = reserved_entry(&path)?;
         let file = open_shared(&path)?;
-        // Written before the lock drops, not on the next pass: an entry that exists but is
-        // still empty parses as nothing, so a scan catching it in that state would report a
-        // ledger anomaly against a job that is merely starting up — and leave its request out
-        // of the queue order for that pass.
-        entry.write(&file, &path)?;
+        match reserved {
+            Some(asked) => entry.asked = asked,
+            // Written before the lock drops, not on the next pass: an entry that exists but is
+            // still empty parses as nothing, so a scan catching it in that state would report a
+            // ledger anomaly against a job that is merely starting up — and leave its request
+            // out of the queue order for that pass.
+            None => entry.write(&file, &path)?,
+        }
         file
     };
     let deadline = Instant::now() + timeout;
@@ -233,6 +239,103 @@ pub fn acquire(dir: &Path, job_id: &str, ask: &Ask, timeout: Duration) -> Result
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// The request time of a granted entry at `path` held for the job about to ask under that
+/// name. Unheld entries belong to dead jobs and do not count. Called under the directory lock.
+fn reserved_entry(path: &Path) -> Result<Option<u128>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+    };
+    if !locked(&file) {
+        return Ok(None);
+    }
+    Ok(Entry::read(&file).filter(|e| e.granted).map(|e| e.asked))
+}
+
+/// What keeps an ask out of the ledger on a pass that cannot wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Short {
+    Memory,
+    Disk,
+    /// Jobs that asked first are still waiting: granting this ask would jump them.
+    Queue,
+}
+
+/// Try [`acquire`] without waiting: return a reservation if `ask` fits, otherwise the shortage,
+/// leaving no entry. This lets `vk node` answer the hub's reservation requests immediately.
+pub fn try_acquire(
+    dir: &Path,
+    name: &str,
+    ask: &Ask,
+) -> Result<std::result::Result<Reservation, Short>> {
+    if ask.mem.is_some_and(|m| m.want_mib > m.budget_mib) {
+        return Ok(Err(Short::Memory));
+    }
+    if let Some(DiskAsk { want, jobs }) = ask.disk {
+        // A node asked before any job ran has no job dirs yet; made as prepare makes it.
+        std::fs::create_dir_all(jobs).with_context(|| format!("creating {}", jobs.display()))?;
+        let total = crate::usage::fs_space(jobs)
+            .with_context(|| format!("reading the free space of {}", jobs.display()))?
+            .total;
+        if want > total {
+            return Ok(Err(Short::Disk));
+        }
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restricting {} to 0700", dir.display()))?;
+    let path = dir.join(name);
+    let mut anomalies = Vec::new();
+    // One pass under the directory lock, entry and all: a scan never sees it waiting.
+    let out = (|| {
+        let _dir_lock = lock_dir(dir)?;
+        let asked = now_nanos();
+        let held = tally(dir, name, asked, &mut anomalies)?;
+        let mut pass = Pass {
+            ask: *ask,
+            used_mib: held.granted_mib,
+            ahead: held.ahead,
+            room: None,
+        };
+        if !pass.mem_short() {
+            pass.room = ask
+                .disk
+                .map(|d| DiskRoom::of(d.jobs, &held.disk))
+                .transpose()?;
+        }
+        if let Some(blocker) = pass.blocker() {
+            return Ok(Err(match blocker {
+                Blocker::Memory => Short::Memory,
+                Blocker::Disk => Short::Disk,
+                Blocker::Queue => Short::Queue,
+            }));
+        }
+        if reserved_entry(&path)?.is_some() {
+            bail!("{} is already reserved", path.display());
+        }
+        let file = open_shared(&path)?;
+        Entry {
+            want_mib: ask.mem.map_or(0, |m| m.want_mib),
+            asked,
+            granted: true,
+            node: None,
+            disk: ask.disk.map(|d| d.want),
+        }
+        .write(&file, &path)?;
+        Ok(Ok(Reservation {
+            file,
+            job_id: name.to_string(),
+        }))
+    })();
+    report(&anomalies);
+    out
 }
 
 /// What one admission pass found, kept to say why the job has to wait.
@@ -450,6 +553,39 @@ pub fn hold(dir: &Path, job_id: &str) -> Option<Reservation> {
 }
 
 impl Reservation {
+    /// The ledger name this reservation is held under.
+    pub fn name(&self) -> &str {
+        &self.job_id
+    }
+
+    /// Hand this reservation to the job named `to`: its entry is renamed under the directory
+    /// lock, keeping its lock, its claim and its place, so the job's own [`acquire`] finds it
+    /// and waits only for what it needs beyond it. Refused while another holder has an entry
+    /// of that name.
+    pub fn rename(self, dir: &Path, to: &str) -> Result<Reservation> {
+        let _dir_lock = lock_dir(dir)?;
+        let target = dir.join(to);
+        if let Ok(file) = File::open(&target) {
+            if locked(&file) {
+                bail!("{} is held by another job", target.display());
+            }
+            // A dead job's entry, which the next tally would reap anyway.
+            let _ = std::fs::remove_file(&target);
+        }
+        std::fs::rename(dir.join(&self.job_id), &target)
+            .with_context(|| format!("renaming the reservation {} to {to}", self.job_id))?;
+        Ok(Reservation {
+            file: self.file,
+            job_id: to.to_string(),
+        })
+    }
+
+    /// The locked entry, for a process that hands the reservation on by descriptor: the
+    /// reservation counts for as long as any copy of it stays open.
+    pub fn into_file(self) -> File {
+        self.file
+    }
+
     /// Choose the memory node this job's VM boots on, and record it in the ledger so the jobs
     /// placed after it know the node is taken.
     ///
@@ -1895,6 +2031,60 @@ mod tests {
         crate::admit::release(&dir, "mine");
         drop(held_by_others);
         crate::admit::release(&dir, "other");
+        until_ledger_is(&dir, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_one_pass_ask_never_jumps_a_waiting_job() {
+        let dir = tmpdir("try-queue");
+        let waiting = held(&dir, "waiter", 4096, 1, false);
+        let ask = |want_mib| Ask {
+            mem: Some(MemAsk {
+                want_mib,
+                budget_mib: 8192,
+            }),
+            disk: None,
+        };
+        // Room for both, but the waiter asked first.
+        assert!(matches!(
+            try_acquire(&dir, "resv", &ask(1024)).unwrap(),
+            Err(Short::Queue)
+        ));
+        assert!(!dir.join("resv").exists(), "a refused ask leaves nothing");
+        assert!(matches!(
+            try_acquire(&dir, "resv", &ask(16384)).unwrap(),
+            Err(Short::Memory)
+        ));
+        drop(waiting);
+        let granted = try_acquire(&dir, "resv", &ask(1024)).unwrap().unwrap();
+        assert_eq!(live_mib(&dir), 1024);
+        drop(granted);
+        until_ledger_is(&dir, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reservation_is_not_renamed_onto_a_held_entry() {
+        let dir = tmpdir("rename-held");
+        let other = held(&dir, "job", 1024, 1, true);
+        let ask = Ask {
+            mem: Some(MemAsk {
+                want_mib: 1024,
+                budget_mib: 8192,
+            }),
+            disk: None,
+        };
+        let resv = try_acquire(&dir, "resv", &ask).unwrap().unwrap();
+        let err = resv.rename(&dir, "job").unwrap_err();
+        assert!(err.to_string().contains("held by another job"), "{err}");
+        drop(other);
+        // A dead job's entry gives way.
+        let resv = try_acquire(&dir, "resv2", &ask).unwrap().unwrap();
+        let renamed = resv.rename(&dir, "job").unwrap();
+        assert_eq!(renamed.name(), "job");
+        assert!(!dir.join("resv2").exists());
+        drop(renamed);
         until_ledger_is(&dir, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }

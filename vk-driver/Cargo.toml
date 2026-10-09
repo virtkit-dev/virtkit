@@ -40,7 +40,7 @@ fastcdc.workspace = true
 zstd.workspace = true
 lzma-rs.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "net", "io-util", "signal"] }
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io-util"] }
 toml.workspace = true
 etherparse.workspace = true
 ipstack.workspace = true

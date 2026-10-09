@@ -80,19 +80,34 @@ pub struct JobCtx {
 
 impl JobCtx {
     pub fn new(cfg: Config) -> Result<JobCtx> {
+        Self::from_lookup(cfg, &process_env)
+    }
+
+    /// Build the context from `env`, as a placed job's driver does for its executor commands,
+    /// rather than this process's environment. Later entries win.
+    pub fn for_env(cfg: Config, env: &[(String, String)]) -> Result<JobCtx> {
+        Self::from_lookup(cfg, &|name| {
+            env.iter()
+                .rev()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        })
+    }
+
+    fn from_lookup(cfg: Config, env: &Lookup<'_>) -> Result<JobCtx> {
         // The runner's own account of the job first; CI_JOB_ID is the same number where
         // there is no job response to read, and VM_JOB_ID covers manual runs outside
         // gitlab-runner.
         // Read once and threaded down: two reads of the same path are two chances to get two
         // different answers, and the job id and the project identity have to come from one.
-        let response = JobResponse::read();
+        let response = JobResponse::read(env);
         let job_id = match &response {
             Some(r) => r.id.to_string(),
-            None => std::env::var("CUSTOM_ENV_CI_JOB_ID")
-                .or_else(|_| std::env::var("VM_JOB_ID"))
-                .unwrap_or_else(|_| "dev".into()),
+            None => env("CUSTOM_ENV_CI_JOB_ID")
+                .or_else(|| env("VM_JOB_ID"))
+                .unwrap_or_else(|| "dev".into()),
         };
-        Self::with_response(cfg, job_id, response)
+        Self::with_response(cfg, job_id, response, env)
     }
 
     /// A context for a named job id, reading whatever job response the environment offers.
@@ -100,11 +115,16 @@ impl JobCtx {
     /// path are two chances to get two different answers.
     #[cfg(test)]
     pub fn new_for_job(cfg: Config, job_id: String) -> Result<JobCtx> {
-        let response = JobResponse::read();
-        Self::with_response(cfg, job_id, response)
+        let response = JobResponse::read(&process_env);
+        Self::with_response(cfg, job_id, response, &process_env)
     }
 
-    fn with_response(cfg: Config, job_id: String, response: Option<JobResponse>) -> Result<JobCtx> {
+    fn with_response(
+        cfg: Config,
+        job_id: String,
+        response: Option<JobResponse>,
+        env: &Lookup<'_>,
+    ) -> Result<JobCtx> {
         // The id lands in a filesystem path: keep it to one sane path component.
         if job_id.is_empty()
             || !job_id
@@ -119,16 +139,11 @@ impl JobCtx {
         // VM_IMAGE for manual runs) → the GitLab `image:` (CI_JOB_IMAGE) → unset, which
         // image::resolve treats as local/default. A bare `image:` is booted directly under
         // the [docker] repo allowlist; the local/virtkit/docker/ forms select a source.
-        let image_ref = std::env::var("CUSTOM_ENV_MICROVM_IMAGE")
-            .or_else(|_| std::env::var("VM_IMAGE"))
-            .or_else(|_| std::env::var("CUSTOM_ENV_CI_JOB_IMAGE"))
-            .ok()
+        let image_ref = env("CUSTOM_ENV_MICROVM_IMAGE")
+            .or_else(|| env("VM_IMAGE"))
+            .or_else(|| env("CUSTOM_ENV_CI_JOB_IMAGE"))
             .filter(|s| !s.is_empty());
-        let job_var = |name: &str| {
-            std::env::var(format!("CUSTOM_ENV_{name}"))
-                .ok()
-                .filter(|s| !s.is_empty())
-        };
+        let job_var = |name: &str| env(&format!("CUSTOM_ENV_{name}")).filter(|s| !s.is_empty());
         Ok(JobCtx {
             cfg,
             job_id,
@@ -147,8 +162,8 @@ impl JobCtx {
             egress_dry_run_req: job_var("MICROVM_EGRESS_DRY_RUN").is_some_and(|v| is_truthy(&v)),
             identity_from_runner: response.is_some(),
             usage_report_req: job_var("MICROVM_USAGE_REPORT").is_some_and(|v| is_truthy(&v)),
-            build_failure: exit_code_env("BUILD_FAILURE_EXIT_CODE", 1),
-            system_failure: exit_code_env("SYSTEM_FAILURE_EXIT_CODE", 2),
+            build_failure: exit_code_env(env, "BUILD_FAILURE_EXIT_CODE", 1),
+            system_failure: exit_code_env(env, "SYSTEM_FAILURE_EXIT_CODE", 2),
             ci_repo_url: job_var("CI_REPOSITORY_URL"),
             ci_commit_sha: job_var("CI_COMMIT_SHA"),
             ci_commit_ref: job_var("CI_COMMIT_REF_NAME"),
@@ -518,16 +533,15 @@ impl JobResponse {
     /// `None` where there is no job response to read, which means no job: `vk` run from an
     /// operator's shell, or a manual run outside gitlab-runner. A real job always
     /// has one, so nothing a job does can take this path.
-    fn read() -> Option<JobResponse> {
+    fn read(env: &Lookup<'_>) -> Option<JobResponse> {
         // Errors are swallowed rather than reported: the text holds the job token, so nothing
         // from it goes near a log, and the caller falls back to the variables. But falling back
         // *inside a job* means keying that job's stored state on values the job itself can set,
         // which is what this exists to stop — so say so once, where an operator will see it.
-        let parsed = std::env::var("JOB_RESPONSE_FILE")
-            .ok()
+        let parsed = env("JOB_RESPONSE_FILE")
             .and_then(|path| std::fs::read_to_string(&path).ok())
             .and_then(|text| serde_json::from_str::<JobResponse>(&text).ok());
-        if parsed.is_none() && std::env::var_os("CUSTOM_ENV_CI_JOB_ID").is_some() {
+        if parsed.is_none() && env("CUSTOM_ENV_CI_JOB_ID").is_some() {
             eprintln!(
                 "virtkit: warning: no readable JOB_RESPONSE_FILE — keying this job's stored \
                  state on its own CI_* variables (gitlab-runner 15.0 or newer writes one)"
@@ -585,11 +599,15 @@ fn is_truthy(v: &str) -> bool {
     )
 }
 
-fn exit_code_env(name: &str, fallback: i32) -> i32 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(fallback)
+/// A job's environment variable by name: this process's own, or one computed for the job.
+type Lookup<'a> = dyn Fn(&str) -> Option<String> + 'a;
+
+fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+fn exit_code_env(env: &Lookup<'_>, name: &str, fallback: i32) -> i32 {
+    env(name).and_then(|v| v.parse().ok()).unwrap_or(fallback)
 }
 
 /// The current job's identity for lock-holder reporting: its GitLab job URL (clickable) when
@@ -626,6 +644,36 @@ mod tests {
     use crate::config::Executor;
     use std::path::Path;
 
+    /// A placed job's driver gives its context an environment of its own, not this
+    /// process's: the job response it names and the variables in it decide.
+    #[test]
+    fn a_context_reads_a_given_environment() {
+        let dir = std::env::temp_dir().join(format!("vk-jobctx-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let response = dir.join("job_response.json");
+        std::fs::write(
+            &response,
+            r#"{"id": 77, "job_info": {"name": "e", "project_id": 12, "project_full_path": "a/b"}}"#,
+        )
+        .unwrap();
+        let env = |k: &str, v: &str| (k.to_string(), v.to_string());
+        let ctx = JobCtx::for_env(
+            Config::default(),
+            &[
+                env("CUSTOM_ENV_MICROVM_USER", "nobody"),
+                env("JOB_RESPONSE_FILE", &response.display().to_string()),
+                env("BUILD_FAILURE_EXIT_CODE", "5"),
+                env("CUSTOM_ENV_MICROVM_USER", "1000"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(ctx.job_id, "77");
+        assert_eq!(ctx.user_req.as_deref(), Some("1000"), "the last one wins");
+        assert_eq!(ctx.build_failure, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The identity a job keys its stored state on comes from the runner's account of the
     /// job, not from the variables beside it — which a job sets itself, as it sets the
     /// `MICROVM_*` knobs. A forged `CI_PROJECT_ID` in the payload's own variable list must
@@ -657,7 +705,7 @@ mod tests {
 
         // And the context built from it keys on those, not on the variables of the same names —
         // which is the whole property, and is not tested by reading the struct's own fields.
-        let ctx = JobCtx::with_response(Config::default(), "4242".into(), Some(r))
+        let ctx = JobCtx::with_response(Config::default(), "4242".into(), Some(r), &process_env)
             .expect("a context for a real job");
         assert_eq!(ctx.project_id.as_deref(), Some("42"));
         assert_eq!(ctx.job_name.as_deref(), Some("test:unit"));
@@ -689,7 +737,7 @@ mod tests {
                 project_full_path: "acme/web".into(),
             },
         };
-        let ctx = JobCtx::with_response(cfg, "7".into(), Some(response)).unwrap();
+        let ctx = JobCtx::with_response(cfg, "7".into(), Some(response), &process_env).unwrap();
         std::fs::create_dir_all(&ctx.job_dir).unwrap();
         ctx.record(4, "8G").unwrap();
         let written = std::fs::read(ctx.job_dir.join(JOB_RECORD)).unwrap();

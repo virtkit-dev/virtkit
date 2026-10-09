@@ -331,21 +331,27 @@ node already holds the token that authorizes the upload. The cost is that the no
 daemon, sees GitLab's answer, so it reports each upload's outcome in the result and in the
 trace. The node follows gitlab-runner's upload rules: `POST /jobs/:id/artifacts` multipart
 with the archive in field `file`, query `artifact_format`, `artifact_type` and `expire_in`,
-a 307's `Location` followed, 413 not retried, 503 retried after `Retry-After`.
+a 307's `Location` followed, 413 not retried, 503 retried after `Retry-After`. Unlike
+gitlab-runner, it refuses a 307 from https to http and sends the job token after a 307 only
+to GitLab's own origin.
 
 **Dependency artifacts** come from GitLab to the node: `GET /jobs/<dependency id>/artifacts`
 with that dependency's token.
 
 **Caches go to the registry** the node already uses. A cache is an OCI artifact with one
-`tar+zstd` layer, in repository `ci-cache/<gitlab host>/<project id>`, tagged with the
-sha256 of its key and the protection of the job's ref, so a protected and an unprotected
-job never share one, as with gitlab-runner. The last archive written wins; content addressing
+`tar+zstd` layer, in repository `ci-cache/<gitlab host>[/<gitlab path>]/<project id>`,
+tagged with the sha256 of its key and the protection of the job's ref, so a protected and an
+unprotected job never share one, as with gitlab-runner. The last archive written wins; content addressing
 makes an unchanged cache's upload a blob probe. Caches are not shared with gitlab-runner's
 `cache.zip`s: a project moving to the fleet starts cold.
 
 Archiving and extracting run in the guest, in `vk-agent`, on the job's tree as the job left
 it, with the bytes streamed over vsock; the node does the network transfers. No archiver
-needs to be in the job's image.
+needs to be in the job's image. On the node, an archive is converted as it streams; only
+what a format needs whole touches the job's disk — a downloaded zip, a cache layer, an
+artifact's archive before its upload — each capped at 10 GiB, so a job cannot fill the disk
+other jobs share. A request to the cache's registry is bounded by `CACHE_REQUEST_TIMEOUT`
+(minutes, 10 by default), as gitlab-runner bounds its cache transfers.
 
 ## The job spec
 

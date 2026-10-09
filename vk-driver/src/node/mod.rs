@@ -41,6 +41,7 @@ macro_rules! say {
 mod core;
 mod identity;
 mod inventory;
+pub mod jobs;
 mod reset;
 mod runner;
 pub mod service;
@@ -579,8 +580,10 @@ pub async fn run(cfg: Config) -> Result<()> {
         say!("warning: cannot read the running vk to report its sha256");
     }
     let mut gatherer = session::Gatherer::spawn(cfg.clone());
+    let jobs = jobs::Jobs::open(&dir, cfg.clone()).context("reading the placed jobs")?;
     let node = Arc::new(session::Node {
         dir,
+        jobs,
         enrollment,
         core: core.clone(),
         identity,

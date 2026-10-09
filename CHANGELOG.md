@@ -25,6 +25,12 @@ All notable changes to virtkit will be documented in this file.
   stays unreachable, and keeps records and output across its own restart. `vk-hub jobs` and the
   web UI's operations page list the jobs placed. Hosts whose `vk` does not speak fleet
   protocol version 3 are monitored and steered but offered no jobs.
+- **Experimental: fleet nodes run GitLab jobs placed by the hub.** `vk node run` reserves
+  memory and disk from the executor's job budget, then runs jobs in microVMs with the same
+  image, checkout, services, egress and sizing as `vk gitlab`. Jobs use gitlab-runner's stages
+  and step scripts, keep caches in the node's registry, transfer artifacts to and from GitLab,
+  and stream masked traces to the hub. Jobs survive `vk node run` restarts outside
+  `vk node service`.
 - `[node] labels` declares the labels the hub may place GitLab jobs by.
 
 ### Fixed

@@ -25,8 +25,8 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use vk_hub_proto::{
-    Channel, CommandAck, Heartbeat, HubMsg, Inventory, NodeMsg, Outcome, PROTOCOL, Report,
-    STEERING, TLS_EXPORTER_LEN,
+    Channel, CommandAck, Heartbeat, HubMsg, Inventory, JOBS, NodeMsg, Outcome, PROTOCOL, Report,
+    STEERING, TLS_EXPORTER_LEN, VersionRange,
 };
 
 use super::Enrollment;
@@ -60,6 +60,15 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// fall well inside the silence that ends a session, so the socket fails first and says why.
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+
+/// The protocol versions this node speaks: placed jobs on top of what every peer shares.
+pub const NODE_PROTOCOL: VersionRange = VersionRange {
+    min: PROTOCOL.min,
+    max: JOBS,
+};
+
+/// How often the node looks at its placed jobs for news: output, stages, results, leases.
+const JOBS_EVERY: Duration = Duration::from_millis(250);
 
 /// The transport under the WebSocket: TCP, or TLS over it.
 pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -101,6 +110,8 @@ pub struct Node {
     pub tls: Arc<rustls::ClientConfig>,
     /// What the hub asked and the node's own state, which every session reports.
     pub core: Arc<Core>,
+    /// Reservations and placed jobs, from protocol version [`JOBS`].
+    pub jobs: Arc<super::jobs::Jobs>,
 }
 
 /// What the gatherer is asked for.
@@ -253,6 +264,19 @@ pub async fn run(
             }
         }
     }
+    // Placed jobs: everything held, once per session, before the hub places anything here.
+    let placing = version >= JOBS;
+    if placing {
+        let jobs = node.jobs.clone();
+        let held = tokio::task::spawn_blocking(move || jobs.held(std::time::Instant::now()))
+            .await
+            .context("reading the placed jobs")?;
+        if !send_unless_stopped(&mut ws, &NodeMsg::Job(held), heartbeat, stop).await? {
+            return Ok(());
+        }
+    }
+    let mut job_tick = tokio::time::interval(JOBS_EVERY);
+    job_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     gatherer.drain();
     gatherer.request(Ask::Inventory);
     let mut sent_inventory: Option<Inventory> = None;
@@ -276,6 +300,13 @@ pub async fn run(
                 return Ok(());
             }
             _ = beat.tick() => gatherer.request(Ask::Heartbeat),
+            _ = job_tick.tick(), if placing => {
+                for msg in poll_jobs(node).await? {
+                    if !send_unless_stopped(&mut ws, &msg, heartbeat, stop).await? {
+                        return Ok(());
+                    }
+                }
+            }
             _ = recheck.tick() => gatherer.request(Ask::Inventory),
             Ok(()) = changes.changed(), if steering => {
                 for msg in told.news(&node.core, workloads.as_ref(), version) {
@@ -319,9 +350,23 @@ pub async fn run(
                     Some(Err(e)) => bail!("reading from the hub: {e}"),
                     Some(Ok(Message::Close(_))) => bail!("the hub closed the session"),
                     Some(Ok(Message::Text(text))) => {
+                        let msg = parse(text.as_str())?;
+                        if let HubMsg::Job(job) = msg {
+                            if !placing {
+                                bail!("the hub sent a job message in a version-{version} session");
+                            }
+                            let mut replies = handle_job(node, job).await?;
+                            replies.extend(poll_jobs(node).await?);
+                            for reply in &replies {
+                                if !send_unless_stopped(&mut ws, reply, heartbeat, stop).await? {
+                                    return Ok(());
+                                }
+                            }
+                            continue;
+                        }
                         // A command is answered on every delivery, from the journal when it
                         // came before.
-                        if let Some(ack) = handle(parse(text.as_str())?, node, version).await? {
+                        if let Some(ack) = handle(msg, node, version).await? {
                             told.acks.insert(ack.id.clone(), ack.outcome.clone());
                             if !send_unless_stopped(&mut ws, &NodeMsg::Ack(ack), heartbeat, stop)
                                 .await?
@@ -336,6 +381,28 @@ pub async fn run(
             }
         }
     }
+}
+
+/// A job message from the hub, answered from the node's ledger and job journal.
+async fn handle_job(node: &Node, msg: vk_hub_proto::dispatch::HubJobMsg) -> Result<Vec<NodeMsg>> {
+    let ready = super::jobs::ready(node.core.state(), *node.core.acquire().borrow());
+    let jobs = node.jobs.clone();
+    let replies =
+        tokio::task::spawn_blocking(move || jobs.handle(msg, ready, std::time::Instant::now()))
+            .await
+            .context("handling a job message")?;
+    Ok(replies.into_iter().map(NodeMsg::Job).collect())
+}
+
+/// What the placed jobs have to tell the hub now.
+async fn poll_jobs(node: &Node) -> Result<Vec<NodeMsg>> {
+    let quarantined = node.core.state() == vk_hub_proto::NodeState::Quarantined;
+    let jobs = node.jobs.clone();
+    let msgs =
+        tokio::task::spawn_blocking(move || jobs.poll(std::time::Instant::now(), quarantined))
+            .await
+            .context("following the placed jobs")?;
+    Ok(msgs.into_iter().map(NodeMsg::Job).collect())
 }
 
 /// Marks the hub reached for as long as it lives: from the welcome to the session's end.
@@ -533,7 +600,7 @@ async fn handshake(
     send(
         ws,
         &NodeMsg::Hello {
-            versions: PROTOCOL,
+            versions: NODE_PROTOCOL,
             node_id: node_id.clone(),
             incarnation: node.incarnation.clone(),
             vk_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -549,14 +616,14 @@ async fn handshake(
         } => {
             // The highest version both sides speak, and nothing else: a hub — or something
             // between the two — picking a lower one is refused, not followed.
-            if !PROTOCOL.accepts_pick(versions, version) {
+            if !NODE_PROTOCOL.accepts_pick(versions, version) {
                 bail!(
                     "the hub chose protocol version {version} of {}–{}, not the highest this vk \
                      ({}–{}) shares with it",
                     versions.min,
                     versions.max,
-                    PROTOCOL.min,
-                    PROTOCOL.max
+                    NODE_PROTOCOL.min,
+                    NODE_PROTOCOL.max
                 );
             }
             let nonce = vk_hub_proto::from_hex_lower::<{ vk_hub_proto::CHALLENGE_LEN }>(&nonce)
@@ -574,7 +641,7 @@ async fn handshake(
         &nonce,
         node_id,
         &node.incarnation,
-        PROTOCOL,
+        NODE_PROTOCOL,
         hub_versions,
         version,
         channel,
@@ -778,8 +845,8 @@ mod tests {
             std::env::temp_dir().join(format!("vk-node-session-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg: Config =
-            toml::from_str(&format!("state_dir = {:?}\n", dir.display().to_string())).unwrap();
+        let state = format!("state_dir = {:?}\n", dir.display().to_string());
+        let cfg: Config = toml::from_str(&state).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -810,6 +877,11 @@ mod tests {
                     None,
                 )
                 .unwrap(),
+                jobs: super::super::jobs::for_test(
+                    &dir,
+                    toml::from_str(&state).unwrap(),
+                    Some(8192),
+                ),
             },
             // A registry of its own, with no VM in it, not this host's.
             gatherer: Gatherer::spawn_in(Arc::new(cfg), Some(dir.join("vms"))),
@@ -1040,10 +1112,10 @@ mod tests {
             let mut ws = accept(listener).await;
             // The hub claims a range the node shares only version 1 of, and picks another.
             let offered = VersionRange {
-                min: PROTOCOL.min,
-                max: PROTOCOL.max + 1,
+                min: NODE_PROTOCOL.min,
+                max: NODE_PROTOCOL.max + 1,
             };
-            assert!(!challenge(&mut ws, &key, offered, PROTOCOL.max + 1).await);
+            assert!(!challenge(&mut ws, &key, offered, NODE_PROTOCOL.max + 1).await);
         };
         let (_, ended) = tokio::join!(hub, run(node, gatherer, stopped));
         let err = ended.unwrap_err();
@@ -1451,6 +1523,125 @@ mod tests {
                 return t;
             }
         }
+    }
+
+    /// A version-3 hub, as the contract has it: `held` first; an offer granted from the
+    /// ledger; a job started on it, its output streamed and acked, its result repeated until
+    /// recorded. A version-2 hub meanwhile gets no job message at all (the tests above).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_version_3_hub_places_a_job_and_gets_its_output_and_result() {
+        use super::super::jobs::tests::{envelope, hex, spec};
+        use vk_hub_proto::dispatch::{HubJobMsg, JobStart, NodeJobMsg, OfferReply};
+        let mut f = fixture("v3").await;
+        let (node, gatherer, stopped, listener, stop) = f.parts();
+        let key = node.identity.public_key().to_vec();
+        let jobs_dir = node.dir.join("jobs").join(hex("b"));
+        let hub = async {
+            let mut ws = accept(listener).await;
+            let v3 = VersionRange { min: 1, max: JOBS };
+            assert!(challenge(&mut ws, &key, v3, JOBS).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
+            let held = next_of(&mut ws, |m| match m {
+                NodeMsg::Job(NodeJobMsg::Held(h)) => Some(h),
+                _ => None,
+            })
+            .await;
+            assert!(held.jobs.is_empty() && held.reservations.is_empty());
+            let job = |m: HubJobMsg| HubMsg::Job(m);
+            hub_send(
+                &mut ws,
+                &job(HubJobMsg::Offer {
+                    reservation: hex("a"),
+                    envelope: envelope(4096),
+                    lease_secs: 90,
+                }),
+            )
+            .await;
+            let reply = next_of(&mut ws, |m| match m {
+                NodeMsg::Job(NodeJobMsg::OfferReply { reply, .. }) => Some(reply),
+                _ => None,
+            })
+            .await;
+            assert_eq!(reply, OfferReply::Accepted { lease_secs: 90 });
+            hub_send(
+                &mut ws,
+                &job(HubJobMsg::Start(Box::new(JobStart {
+                    job: hex("b"),
+                    reservation: Some(hex("a")),
+                    envelope: envelope(4096),
+                    spec: spec(4242),
+                }))),
+            )
+            .await;
+            let mut output = Vec::new();
+            let result = loop {
+                match next_of(&mut ws, |m| match m {
+                    NodeMsg::Job(j) => Some(j),
+                    _ => None,
+                })
+                .await
+                {
+                    NodeJobMsg::Output { offset, data, .. } => {
+                        assert_eq!(offset, output.len() as u64, "a gap in the output");
+                        output.extend(vk_hub_proto::from_base64(&data).unwrap());
+                        hub_send(
+                            &mut ws,
+                            &job(HubJobMsg::OutputAck {
+                                job: hex("b"),
+                                offset: output.len() as u64,
+                            }),
+                        )
+                        .await;
+                    }
+                    NodeJobMsg::Result { result, .. } => break result,
+                    _ => {}
+                }
+            };
+            assert_eq!(result.output_len, output.len() as u64);
+            assert!(result.failure.is_none());
+            assert!(
+                String::from_utf8(output)
+                    .unwrap()
+                    .contains("GitLab job 4242")
+            );
+            hub_send(&mut ws, &job(HubJobMsg::Recorded { job: hex("b") })).await;
+            // Recorded: the job's journal goes.
+            for _ in 0..100 {
+                if !jobs_dir.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert!(!jobs_dir.exists());
+            stop.send(true).unwrap();
+            while hub_receive(&mut ws).await.is_some() {}
+        };
+        let (_, ended) = tokio::join!(hub, run(node, gatherer, stopped));
+        ended.unwrap();
+    }
+
+    /// A job message in a session below version 3 breaks the protocol.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_message_below_version_3_ends_the_session() {
+        let mut f = fixture("v2-job").await;
+        let (node, gatherer, stopped, listener, _) = f.parts();
+        let key = node.identity.public_key().to_vec();
+        let hub = async {
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, PROTOCOL, STEERING).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 60 }).await;
+            hub_send(
+                &mut ws,
+                &HubMsg::Job(vk_hub_proto::dispatch::HubJobMsg::Recorded {
+                    job: "ab".repeat(16),
+                }),
+            )
+            .await;
+            while hub_receive(&mut ws).await.is_some() {}
+        };
+        let (_, ended) = tokio::join!(hub, run(node, gatherer, stopped));
+        let err = ended.unwrap_err();
+        assert!(format!("{err:#}").contains("version-2"), "{err:#}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

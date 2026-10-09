@@ -26,6 +26,9 @@ The prototype provides, all experimentally:
 - on the hub, rollouts of a release by wave, with a canary per hardware profile (`vk-hub
   rollout`);
 - resets, which clear what a node's past jobs left (`vk-hub nodes reset`);
+- on the node, placed GitLab jobs (protocol version 3, [below](#placed-jobs-on-the-node)):
+  reservations decided from the admission ledger, and jobs run stage by stage in microVMs,
+  their masked output streamed to the hub;
 - `vk-hub workloads`: each node's VMs;
 - live nodes, node detail and operations pages, steering and resetting from a node's page,
   pausing, resuming and aborting rollouts from the operations page, and an audit log, with
@@ -189,8 +192,8 @@ label `vk-fleet release-download v1` over its ID, the release's 32-byte sha256, 
 and the channel, sent in the `vk-node`, `vk-time` and `vk-signature` headers. The hub issues
 updates and serves releases (see [Releases](#releases)), and a node applies them (see
 [Update trial and rollback](#update-trial-and-rollback)). Version 3 adds reservations and
-placed jobs (see [Placed jobs](#placed-jobs)). The hub uses its own range, versions 1 to 3;
-`vk node` uses `vk_hub_proto::PROTOCOL`, still 1 to 2 until it implements version 3.
+placed jobs (see [Placed jobs](#placed-jobs)). The hub and `vk node` each speak versions 1 to 3
+from ranges of their own; `vk_hub_proto::PROTOCOL` stays 1 to 2.
 A session negotiates version 3 only with a node that implements it.
 
 The hub admits at most 256 connections that have not authenticated, each step of which (TLS,
@@ -583,6 +586,99 @@ the node returns to the state it was in; a node that fails stays `drained`, with
 last update's progress from the node's report, and a reset and an update exclude each other; a
 `vk node run` stopped during either takes it up again at its next start. The command's audit
 lines name it `reset`, or `reset, images included`.
+
+## Placed jobs on the node
+
+A node speaks protocol versions 1 to 3, but accepts placed jobs only in version 3, under the
+[GitLab dispatch](gitlab-dispatch.md) contract. After the steering messages, it sends `held`
+as its first job message, listing every reservation and job it holds. The hub needs this
+list before placing work.
+
+**Reservations.** An offer is decided at once against the same admission ledger
+(`<state_dir>/admit/`) as executor jobs: memory against `[executor.schedule] mem_budget`, job-dir
+disk under `disk_admission`, vCPUs against `[executor.vm] max_cpus` (else `cpus`). An offer
+that would jump executor jobs still waiting is refused too, as `memory` (`disk` without a
+budget). A granted offer is a ledger entry `reservation-<id>` the node holds locked, with no
+job behind it; with neither memory nor disk admission on, nothing is held and every offer that
+passes the vCPU check is granted. Leases are cut to 600 seconds and run on the node's monotonic
+clock; an offer of a reservation already held renews it. A node not `ready`, or with acquisition
+stopped, refuses offers and starts without a reservation; a quarantined node releases every
+reservation. Reservations live in memory: a restarted node holds none, and the hub releases
+what it thought held.
+
+**Starting a job.** Before answering `accepted`, the node journals the start under
+`<state_dir>/node/jobs/<job id>/` (`0700`), with the spec and its secrets in `start.json`
+(`0600`). Repeated starts are answered from the journal. The reservation's ledger entry is
+renamed to the GitLab job ID and passed to the driver by descriptor, preserving its queue
+position and claim. Executor admission then waits only for additional resources and returns
+any excess. A start without a held reservation is admitted immediately or refused
+(`no_reservation` if it named one). The node assigns the lowest free `CI_CONCURRENT_ID`
+among its jobs and `CI_CONCURRENT_PROJECT_ID` within the project.
+
+**The driver.** `vk node job <dir>` (hidden) runs each job in a process of its own session,
+so a `vk node run` started outside `vk node service` can restart under it; stopping the
+service (`KillMode=mixed`) ends the drivers and their VMs with it. The driver computes from
+the journal, and runs the executor's own commands with, the environment gitlab-runner gives a
+custom executor — every variable as `CUSTOM_ENV_<key>`, a
+`JOB_RESPONSE_FILE` without the token, `CI_JOB_SERVICES` built from the spec's services,
+`MICROVM_USER` from the image's user, `MICROVM_MEM`/`MICROVM_CPUS` from a `# vk: mem=… cpus=…`
+line in a step's script when no variable sets them — so image selection, the host checkout,
+services, egress, atop, sizing and history are the executor's, unchanged: `vk gitlab prepare`,
+then each guest stage through `vk gitlab run`, then `vk gitlab cleanup`, whose output stays in
+the job's `driver.log`. `vk gitlab run` writes the script's exit code to
+`BUILD_EXIT_CODE_FILE`, as gitlab-runner's custom executor protocol has it, for a local runner
+too.
+
+**Stages.** gitlab-runner's order and words: `prepare_executor`, `prepare_script`,
+`get_sources` (`GET_SOURCES_ATTEMPTS`), `restore_cache` (`RESTORE_CACHE_ATTEMPTS`),
+`download_artifacts` (`ARTIFACT_DOWNLOAD_ATTEMPTS`), each `step_<name>` (under
+`RUNNER_SCRIPT_TIMEOUT` when set),
+`after_script` (with `CI_JOB_STATUS`, under `RUNNER_AFTER_SCRIPT_TIMEOUT`, the step's own
+timeout or five minutes, its failure ignored unless `AFTER_SCRIPT_IGNORE_ERRORS` is false),
+`archive_cache` or `archive_cache_on_failure`, `upload_artifacts_on_success` or
+`_on_failure`, `cleanup_file_variables`. The guest stages are scripts written as
+gitlab-runner's bash shell writes them (`shells/bash.go`, `shells/abstract.go`): every variable
+exported, file variables written under `<project dir>.tmp`, `GITLAB_ENV` sourced, each command
+echoed then run in an `eval`ed subshell under `errexit` and `pipefail`, `CI_DEBUG_TRACE` as
+`xtrace`, POSIX quoting where the guest has no bash. With `[executor] host_checkout` the
+sources are the executor's host checkout and `get_sources` runs only the
+`pre_get_sources_script` and `post_get_sources_script` hooks, in the guest; without it the
+guest clones as gitlab-runner does — `GIT_STRATEGY`, `GIT_DEPTH`, refspecs, `GIT_CHECKOUT`,
+`GIT_CLEAN_FLAGS`, `GIT_FETCH_EXTRA_FLAGS`, submodules, LFS — with the job token from a
+credential helper, never in a URL or a config. Caches and artifacts are the node's: archived
+and unpacked in the guest by `vk-agent archive|extract` over the exec channel, moved by the
+node (caches: the node's `[registry]`, with its own credential, as in the contract;
+artifacts: GitLab, with the job's and its dependencies' tokens). Each stage is a trace section
+when GitLab folds them. The trace ends `Job succeeded` or `ERROR: Job failed: <why>`.
+
+**Output.** The trace is masked as gitlab-runner masks it — masked variables, the job and
+dependency tokens and registry passwords, `features.token_mask_prefixes` and gitlab-runner's
+default prefixes, sensitive URL parameters — and cut at `trace.limit_bytes` (4 MiB when 0)
+with its notice, into the journal's `output`. The node sends chunks of at most 256 KiB,
+up to 4 MiB beyond the hub's last ack. After reconnecting, it waits for each job's ack before
+resending from that offset. Output is kept until the hub records the result.
+
+**Cancellation and results.** `cancel` is written to the journal for the driver, which checks
+it every fraction of a second: graceful stops the running stage, runs `after_script` when the
+steps had started, archives and uploads nothing, and ends the job `canceled`; immediate stops
+whatever runs, skips `after_script` and the file-variable cleanup, and cleans up. The job's
+timeout ends it the same way, `timeout`. The result is written last, after `vk gitlab
+cleanup`, and sent once the hub has acked all of the output, again every 15 seconds until the
+hub records it; then the job's directory goes. A job whose driver is gone without a result —
+the host stopped under it — ends `interrupted` once the node has run `vk gitlab cleanup` for
+it. `vk gitlab cleanup` has five minutes, wherever it runs, before it is stopped. Failure
+classes: a step's exit `script` with its exit code; the clone, a dependency download or an
+artifact upload `external_dependency`; the executor or the node `system`; an unsupported job
+`configuration`. Cache failures are warnings, as with gitlab-runner.
+
+**Not yet.** The `zipzstd` and `tarzstd` artifact formats fail their upload; submodules need
+the in-guest checkout; image and service pull failures read as `system`, not `image_pull`;
+the spec's registry credentials and image platform, entrypoint and command are not used —
+the executor's own image rules apply; a service answers to its first alias only; the
+in-guest checkout does not retry through gitlab-runner's worktree clearing; caches need a
+remote `[registry]`. `tests/node-job-e2e.sh` runs journaled jobs through `vk node job` in
+real microVMs; the session is tested against an in-process hub speaking the version-3
+messages, not yet against `vk-hub`.
 
 ## Workloads
 

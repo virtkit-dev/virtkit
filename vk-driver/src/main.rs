@@ -342,6 +342,17 @@ enum NodeCmd {
     /// reaches the node and not the runner. Exits 75 while another `vk node` holds the state
     /// dir.
     Run,
+    /// internal: one placed job, which `vk node run` starts detached
+    ///
+    /// Runs the stages of the job journaled in DIR and writes how it ended there.
+    #[command(hide = true)]
+    Job {
+        /// the job's journal dir under <state_dir>/node/jobs
+        dir: PathBuf,
+        /// the admission ledger entry it holds, inherited
+        #[arg(long)]
+        ledger_fd: Option<i32>,
+    },
     /// Run `vk node run` as a systemd service
     ///
     /// As root, a system unit in /etc/systemd/system, running the node as root or as --user;
@@ -4407,6 +4418,12 @@ async fn cli_main(cli: Cli) -> ExitCode {
                     service,
                 };
                 match node::join(&ctx.cfg, &hub, &token, ca.as_deref(), &opts).await {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => fail(&e, 1),
+                }
+            }
+            NodeCmd::Job { dir, ledger_fd } => {
+                match node::jobs::driver::run(ctx.cfg, &dir, ledger_fd).await {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => fail(&e, 1),
                 }

@@ -1659,6 +1659,7 @@ mod tests {
             incarnation: "cd".repeat(16),
             tls: Arc::new(tls),
             core: Core::open(dir, Issuer { hub, ..issuer() }, None).unwrap(),
+            jobs: crate::node::jobs::for_test(dir, crate::config::Config::default(), None),
         }
     }
 
