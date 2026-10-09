@@ -503,6 +503,7 @@ async fn submit(
         started_at: None,
         finished_at: None,
         settled_at: None,
+        expired_at: None,
     };
     let redacted = match &ask.spec {
         JobSpec::GitlabCi(ci) => JobSpec::GitlabCi(ci.redacted()),
@@ -523,10 +524,16 @@ async fn submit(
             hub.touch();
             Ok(json(StatusCode::CREATED, &view))
         }
-        Submitted::Again(id) => {
-            let (view, _) = jobs::view(hub, principal, &id).await?;
-            Ok(json(StatusCode::CREATED, &view))
-        }
+        Submitted::Again(id) => match jobs::view(hub, principal, &id).await {
+            Ok((view, _)) => Ok(json(StatusCode::CREATED, &view)),
+            // The request's answer outlives the job's record.
+            Err(e) if e.status == StatusCode::NOT_FOUND => Err(ApiError::new(
+                StatusCode::GONE,
+                ErrorCode::NotFound,
+                format!("job {id} was dropped from the history"),
+            )),
+            Err(e) => Err(e),
+        },
         Submitted::Conflict => Err(conflict()),
     }
 }

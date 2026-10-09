@@ -185,15 +185,24 @@ impl Hub {
             touched: watch::Sender::new(0),
             sessions: watch::Sender::new(0),
             clients: Arc::new(Semaphore::new(MAX_CLIENT_CONNS)),
-            dispatch: crate::jobs::Dispatch::new(None, crate::jobs::DEFAULT_LOST_AFTER),
+            dispatch: crate::jobs::Dispatch::new(
+                None,
+                crate::jobs::DEFAULT_LOST_AFTER,
+                crate::store::DEFAULT_JOB_HISTORY,
+            ),
         }
     }
 
     /// This hub, placing jobs and keeping their output in `dir`, losing a job whose node has
-    /// been unreachable for `lost_after`.
-    pub fn with_jobs(mut self, dir: std::path::PathBuf, lost_after: Duration) -> Result<Self> {
+    /// been unreachable for `lost_after`, and keeping the records of the newest `history`.
+    pub fn with_jobs(
+        mut self,
+        dir: std::path::PathBuf,
+        lost_after: Duration,
+        history: usize,
+    ) -> Result<Self> {
         crate::jobs::output_dir(&dir)?;
-        self.dispatch = crate::jobs::Dispatch::new(Some(dir), lost_after);
+        self.dispatch = crate::jobs::Dispatch::new(Some(dir), lost_after, history);
         Ok(self)
     }
 

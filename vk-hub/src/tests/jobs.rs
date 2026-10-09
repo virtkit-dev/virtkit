@@ -63,7 +63,11 @@ async fn serve_undriven(
     let addr = listener.local_addr().unwrap();
     let hub = Arc::new(
         Hub::new(db, None)
-            .with_jobs(dir.join("jobs"), lost_after)
+            .with_jobs(
+                dir.join("jobs"),
+                lost_after,
+                crate::store::DEFAULT_JOB_HISTORY,
+            )
             .unwrap(),
     );
     crate::jobs::recover(&hub).await.unwrap();
@@ -1656,6 +1660,105 @@ async fn a_job_submitted_twice_runs_once() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A job past its keep reads as having no output, and a create retried after its job left
+/// the history is told so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_expired_or_dropped_from_the_history_says_so() {
+    let dir = scratch("history");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let job: JobView = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body(1, None, 60)),
+    )
+    .await
+    .json();
+    let resp = api(
+        addr,
+        "POST",
+        &format!("/v1/jobs/{}/cancel", job.id),
+        Some(&key),
+        Some(json!({"mode": "immediate"})),
+    )
+    .await;
+    assert_eq!(resp.status, 202);
+    let output = format!("/v1/jobs/{}/output?offset=0", job.id);
+    assert_eq!(
+        api(addr, "GET", &output, Some(&key), None).await.status,
+        200
+    );
+
+    // Never settled, past its keep.
+    let later = now_secs() + 31 * 86_400;
+    assert_eq!(
+        hub.db.prune_jobs(later, 100).unwrap(),
+        std::slice::from_ref(&job.id)
+    );
+    let resp = api(addr, "GET", &output, Some(&key), None).await;
+    assert_eq!((resp.status, resp.code()), (404, ErrorCode::NotFound));
+
+    // Dropped from the history.
+    assert!(hub.db.prune_jobs(later, 0).unwrap().is_empty());
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body(1, None, 60)),
+    )
+    .await;
+    assert_eq!((resp.status, resp.code()), (410, ErrorCode::NotFound));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A restarted hub deletes the output files no job may read again: a settled job's, and one
+/// of a job it holds no record of.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_hub_deletes_output_no_job_may_read() {
+    let dir = scratch("sweep");
+    let db = Arc::new(Db::open_memory().unwrap());
+    let (addr, hub) = serve_hub(db.clone(), &dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let mut ids = Vec::new();
+    for n in 1..=2 {
+        let job: JobView = api(
+            addr,
+            "POST",
+            "/v1/jobs",
+            Some(&key),
+            Some(job_body(n, None, 60)),
+        )
+        .await
+        .json();
+        let cancel = format!("/v1/jobs/{}/cancel", job.id);
+        let mode = json!({"mode": "immediate"});
+        let resp = api(addr, "POST", &cancel, Some(&key), Some(mode)).await;
+        assert_eq!(resp.status, 202);
+        ids.push(job.id);
+    }
+    let settle = format!("/v1/jobs/{}/settle", ids[1]);
+    assert_eq!(
+        api(addr, "POST", &settle, Some(&key), None).await.status,
+        204
+    );
+    let jobs = dir.join("jobs");
+    let unread = jobs.join(format!("{}.out", ids[0]));
+    let settled = jobs.join(format!("{}.out", ids[1]));
+    let unknown = jobs.join(format!("{}.out", "f".repeat(32)));
+    let other = jobs.join("notes");
+    for path in [&unread, &settled, &unknown, &other] {
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    serve_hub(db, &dir, Duration::from_secs(60)).await;
+    assert!(unread.exists() && other.exists());
+    assert!(!settled.exists() && !unknown.exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_start_gives_its_reservation_back_and_a_canceled_one_ends() {
     let dir = scratch("refused");
@@ -2220,6 +2323,7 @@ fn the_jobs_table_says_how_each_job_stands() {
         started_at: None,
         finished_at: None,
         settled_at: None,
+        expired_at: None,
     };
     let mut running = row(JobState::Running, None);
     running.started_at = Some(1010);

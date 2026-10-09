@@ -41,7 +41,7 @@ use crate::rollout::{Effect, Facts, NodeStatus, RolloutAction, RolloutRow, Rollo
 mod jobs;
 mod keys;
 
-pub use jobs::{JobRow, RequestRow, Submitted};
+pub use jobs::{DEFAULT_JOB_HISTORY, JobRow, RequestRow, Submitted};
 pub use keys::{ApiPrincipal, KeyPolicy, KeyRow, MAX_KEY_TTL, Scope, envelope_text, valid_name};
 
 /// Key: node ID. Value: JSON [`NodeRow`].
@@ -640,6 +640,7 @@ impl Db {
             .context("opening the job specs table")?;
         txn.open_table(jobs::REQUESTS)
             .context("opening the requests table")?;
+        jobs::order_jobs(&txn).context("ordering the job history")?;
         txn.commit().context("initializing the hub database")?;
         Ok(Db {
             db,

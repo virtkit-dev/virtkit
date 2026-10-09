@@ -195,7 +195,7 @@ system unit when run as root), preserving enrollment.
 `vk-hub serve [--config hub.toml]` serves nodes. `hub.toml` sets `addr` (default
 `127.0.0.1:8443`), `tls_cert` and `tls_key`, `data_dir` (default `$XDG_DATA_HOME/virtkit/hub`,
 else `~/.local/share/virtkit/hub`), `release_repository` (see [Releases](#releases)), and the
-web UI's keys (see [Web UI](#web-ui)) and `job_lost_after_secs` (see
+web UI's keys (see [Web UI](#web-ui)), and `job_lost_after_secs` and `job_history` (see
 [Placed jobs](#placed-jobs)). Every key is optional and an unknown one is an error. Without TLS
 the hub serves only on loopback. TLS is 1.3 only, on both the hub and the node. `vk-hub token`,
 `vk-hub nodes`, `vk-hub release`, `vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub
@@ -872,8 +872,20 @@ refused, finished, canceled, settled, lost.
 directory too, for a file's first bytes — before the node is acked. A chunk overlapping what is
 held is trimmed; one past it ends the node's session as a protocol error. Past the job's trace
 limit and 64 KiB more, or past 64 MiB whatever the limit, output is acked and dropped. A read
-answers at most 1 MiB. Settling a finished job deletes its output and keeps its record; records
-go 30 days after a job finished or was settled.
+answers at most 1 MiB. Settling a finished job deletes its output and keeps its record. A job
+never settled loses its output 30 days after it finished, and reading it is then 404 as for a
+settled job; every job loses its redacted spec 30 days after it was settled or finished.
+
+**History.** The hub keeps the records of the newest `job_history` jobs (10,000 by default, 1 to
+1,000,000), in submission order: once an hour the oldest finished ones past that count go if
+they were settled or are past those 30 days; a job not finished, or finished and not yet
+settled, stays however old. Retrying the create of a job gone from the history answers 410
+`not_found`. A record says when the job was submitted, when a node accepted it and when it
+ended, how it ended, and what the node reported it used (see
+[Result](gitlab-dispatch.md#hub--node-protocol-version-3)): wall-clock time, CPU time and peak
+memory of its VM, and the guest's vCPUs and memory. Records with no place in the order — from a
+hub before the history, or one run since — join its newest end, by when they were submitted,
+when the hub opens its database.
 
 **Lost nodes.** A node holding a job, unreachable — 3 missed heartbeats — for
 `job_lost_after_secs` (300 by default, 1 to 86400), loses the job: it ends `lost`, which
@@ -881,8 +893,9 @@ go 30 days after a job finished or was settled.
 its `held`, the hub cancels it `immediate`, acks and drops what output it still sends, and
 answers its result with `recorded` without changing the job's.
 
-**Hub restarts.** Records and output survive. Queued or starting jobs end `lost`; running jobs
-continue, with nodes resending output from the end of the stored file.
+**Hub restarts.** Records and output survive; output whose job is gone from the history, settled
+or past its 30 days is deleted. Queued or starting jobs end `lost`; running jobs continue, with
+nodes resending output from the end of the stored file.
 
 `vk-hub jobs [--limit 50]` lists the latest jobs: ID, key, pool, state or how it ended, node,
 output length, age, how long it ran (or has been running), its VM's peak memory, and what the

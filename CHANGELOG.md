@@ -42,8 +42,9 @@ All notable changes to virtkit will be documented in this file.
   and stream masked, timestamped traces to the hub (none with `FF_TIMESTAMPS: "false"`). Jobs
   survive `vk node run` restarts outside `vk node service`. With its result, a node reports the
   job's wall-clock time, its VM's CPU time and peak memory, and the guest's vCPUs and memory;
-  the hub's client API shows them on the job. `vk-hub jobs` shows how long each job ran and the
-  most memory it used.
+  the hub's client API shows them on the job. The hub keeps the records of the newest 10,000
+  jobs it placed (`job_history` in `hub.toml`), and answers 410 to a retried create whose job
+  it has dropped. `vk-hub jobs` shows how long each job ran and the most memory it used.
 - `[node] labels` declares the labels the hub may place GitLab jobs by.
 - **`vk-hub`'s web UI links the jobs it placed to their GitLab pages.** A node's workloads,
   local mode's VMs and the jobs on the operations page open the job on GitLab in a new tab. A

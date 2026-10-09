@@ -62,8 +62,8 @@ struct Cli {
 #[derive(clap::Args)]
 struct ConfigArg {
     /// hub.toml: addr, tls_cert, tls_key, data_dir, ui_addr, ui_url, ui_tls_cert,
-    /// ui_tls_key, release_repository, job_lost_after_secs, [oidc] [default: built-in
-    /// defaults]
+    /// ui_tls_key, release_repository, job_lost_after_secs, job_history, [oidc] [default:
+    /// built-in defaults]
     #[arg(long, value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 }
@@ -1100,7 +1100,7 @@ async fn serve(cfg: HubConfig) -> Result<()> {
         }
         hub = hub.with_oidc();
     }
-    let hub = Arc::new(hub.with_jobs(cfg.jobs_dir(), cfg.job_lost_after)?);
+    let hub = Arc::new(hub.with_jobs(cfg.jobs_dir(), cfg.job_lost_after, cfg.job_history)?);
     jobs::recover(&hub).await?;
     tokio::spawn(jobs::drive(hub.clone()));
     // Fatal, unlike the registry's optional admin socket: here it is the only way to issue

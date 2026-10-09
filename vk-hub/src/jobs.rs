@@ -96,7 +96,7 @@ const MAX_CAPACITY_ENTRIES: usize = 1024;
 /// The trace limit a job without one is held to, as gitlab-runner's `output_limit`'s default.
 const DEFAULT_OUTPUT_LIMIT: u64 = 4 << 20;
 
-/// How often finished jobs' records past their keep are pruned.
+/// How often the job history is trimmed to its count and outputs past their keep are dropped.
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 
 /// The hub's dispatch state.
@@ -108,6 +108,8 @@ pub struct Dispatch {
     output_dir: Option<PathBuf>,
     /// How long a node holding a job may be unreachable before the job is lost.
     pub lost_after: Duration,
+    /// How many jobs' records the history keeps.
+    history: usize,
 }
 
 #[derive(Default)]
@@ -200,12 +202,14 @@ type Event = (Option<String>, String, String);
 const HUB: &str = "hub";
 
 impl Dispatch {
-    /// Dispatch keeping output in `output_dir`, or none at all.
-    pub fn new(output_dir: Option<PathBuf>, lost_after: Duration) -> Self {
+    /// Dispatch keeping output in `output_dir`, or none at all, and the records of the newest
+    /// `history` jobs.
+    pub fn new(output_dir: Option<PathBuf>, lost_after: Duration, history: usize) -> Self {
         Dispatch {
             changes: watch::Sender::new(0),
             output_dir,
             lost_after,
+            history,
             state: Mutex::new(State {
                 capacity_revision: crate::now_secs().saturating_mul(1000),
                 ..State::default()
@@ -1440,6 +1444,10 @@ pub async fn output(
     if row.settled_at.is_some() {
         return Err(not_found(&format!("job {id} was settled; its output is gone")).into());
     }
+    if row.expired_at.is_some() {
+        let gone = format!("job {id} was never settled; its output is gone");
+        return Err(not_found(&gone).into());
+    }
     let len = row.output_len;
     if offset > len {
         return Err(OutputError::PastEnd(len));
@@ -1593,11 +1601,13 @@ pub async fn settle(hub: &Hub, principal: &ApiPrincipal, id: &str) -> Result<(),
 // The placement loop.
 
 /// Pick the hub's jobs back up after a restart: a job no node had accepted ends lost; one
-/// running carries on, its output as stored.
+/// running carries on, its output as stored. Output no job may read again goes.
 pub async fn recover(hub: &Hub) -> Result<()> {
     let Some(dir) = hub.dispatch.output_dir.clone() else {
         return Ok(());
     };
+    let swept = dir.clone();
+    blocking(hub, move |db| sweep_outputs(db, &swept)).await?;
     let rows = blocking(hub, |db| db.unfinished_jobs()).await?;
     for (id, mut row) in rows {
         row.output_len = stored_len(&dir, &id);
@@ -1646,6 +1656,44 @@ pub async fn recover(hub: &Hub) -> Result<()> {
     Ok(())
 }
 
+/// Delete the output files in `dir` of jobs gone from the history, settled or expired: those
+/// a hub stopped between recording that and deleting them left behind. A file that cannot
+/// be deleted is logged and left, as when pruning.
+fn sweep_outputs(db: &crate::store::Db, dir: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("vk-hub: reading {}: {e}", dir.display());
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!("vk-hub: reading {}: {e}", dir.display());
+                break;
+            }
+        };
+        let name = entry.file_name();
+        let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".out")) else {
+            continue;
+        };
+        let readable =
+            (db.job(id)?).is_some_and(|r| r.settled_at.is_none() && r.expired_at.is_none());
+        if readable {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("vk-hub: removing {}: {e}", path.display());
+        }
+    }
+    Ok(())
+}
+
 /// Place queued jobs, end those past their deadline and those whose node was lost, until the
 /// process ends.
 pub async fn drive(hub: Arc<Hub>) {
@@ -1669,7 +1717,8 @@ pub async fn drive(hub: Arc<Hub>) {
 }
 
 async fn prune(hub: &Hub) {
-    let gone = match blocking(hub, |db| db.prune_jobs(crate::now_secs())).await {
+    let keep = hub.dispatch.history;
+    let gone = match blocking(hub, move |db| db.prune_jobs(crate::now_secs(), keep)).await {
         Ok(gone) => gone,
         Err(e) => {
             eprintln!("vk-hub: pruning jobs: {e:#}");
@@ -1678,7 +1727,8 @@ async fn prune(hub: &Hub) {
     };
     if let Some(dir) = hub.dispatch.output_dir.clone() {
         for id in gone {
-            // An unsettled job's output, past its keep.
+            // A dropped job's output, or an unsettled one's past its keep. Stopped before
+            // this, the hub deletes them when it next starts.
             let path = output_path(&dir, &id);
             if let Err(e) = std::fs::remove_file(&path)
                 && e.kind() != std::io::ErrorKind::NotFound

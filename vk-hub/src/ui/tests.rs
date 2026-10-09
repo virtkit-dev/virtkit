@@ -3305,6 +3305,7 @@ async fn placed_jobs_are_shown_live() {
         started_at: None,
         finished_at: None,
         settled_at: None,
+        expired_at: None,
     };
     hub.db
         .submit_job(&id, &row, "d", b"{}", "key gitlab", row.created_at)

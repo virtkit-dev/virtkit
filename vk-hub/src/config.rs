@@ -14,6 +14,8 @@
 //! release_repository = "https://github.com/virtkit-dev/virtkit"
 //! # How long a node holding a placed job may be unreachable before the job is lost.
 //! job_lost_after_secs = 300
+//! # How many placed jobs' records the job history keeps, newest first.
+//! job_history = 10000
 //!
 //! # Sign-in to the web UI through an OIDC provider; off unless set.
 //! [oidc]
@@ -51,6 +53,9 @@ use tokio_rustls::TlsAcceptor;
 pub const DEFAULT_ADDR: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 8443);
 
+/// The most jobs' records `job_history` may keep: each is a few kilobytes in the database.
+const MAX_JOB_HISTORY: u64 = 1_000_000;
+
 /// The resolved configuration.
 #[derive(Debug)]
 pub struct HubConfig {
@@ -63,6 +68,8 @@ pub struct HubConfig {
     pub release_source: Option<crate::fetch::Source>,
     /// How long a node holding a placed job may be unreachable before the job is lost.
     pub job_lost_after: std::time::Duration,
+    /// How many placed jobs' records the job history keeps.
+    pub job_history: usize,
 }
 
 /// The web UI's listener.
@@ -106,6 +113,7 @@ struct FileConfig {
     ui_tls_key: Option<PathBuf>,
     release_repository: Option<String>,
     job_lost_after_secs: Option<u64>,
+    job_history: Option<u64>,
     oidc: Option<FileOidc>,
 }
 
@@ -250,6 +258,11 @@ impl HubConfig {
             Some(secs @ 1..=86_400) => std::time::Duration::from_secs(secs),
             Some(secs) => bail!("job_lost_after_secs {secs}: expected 1 to 86400"),
         };
+        let job_history = match f.job_history {
+            None => crate::store::DEFAULT_JOB_HISTORY,
+            Some(n @ 1..=MAX_JOB_HISTORY) => usize::try_from(n)?,
+            Some(n) => bail!("job_history {n}: expected 1 to {MAX_JOB_HISTORY}"),
+        };
         Ok(HubConfig {
             addr,
             tls_cert: f.tls_cert,
@@ -258,6 +271,7 @@ impl HubConfig {
             ui,
             release_source,
             job_lost_after,
+            job_history,
         })
     }
 
@@ -576,6 +590,17 @@ mod tests {
         assert_eq!(source("release_repository = \"none\"\n").unwrap(), None);
         let err = source("release_repository = \"http://github.com/a/b\"\n").unwrap_err();
         assert!(format!("{err:#}").contains("expected https://"), "{err:#}");
+    }
+
+    #[test]
+    fn the_job_history_keeps_one_to_a_million_jobs() {
+        let keep =
+            |extra: &str| parse(&format!("data_dir = \"/d\"\n{extra}")).map(|c| c.job_history);
+        assert_eq!(keep("").unwrap(), crate::store::DEFAULT_JOB_HISTORY);
+        assert_eq!(keep("job_history = 500\n").unwrap(), 500);
+        for bad in ["0", "1000001", "-1"] {
+            assert!(keep(&format!("job_history = {bad}\n")).is_err(), "{bad}");
+        }
     }
 
     #[test]

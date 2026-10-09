@@ -168,8 +168,9 @@ cancelling a finished job changes nothing and answers its view.
 keeps its record.
 
 **Idempotency and retries.** `request_id` — 16 random bytes, hex — makes a create
-idempotent for a day: the same ID with the same body answers the first answer again; with
-another body, 409 `conflict`. Renew, release, cancel and settle are idempotent by nature.
+idempotent for a day: the same ID with the same body answers the first answer again, or 410
+`not_found` once the hub has dropped that job from its history; with another body, 409
+`conflict`. Renew, release, cancel and settle are idempotent by nature.
 The daemon retries transport errors and every retryable code with backoff from 1 to 30
 seconds and jitter, honouring `retry_after_secs`, and never retries another 4xx.
 
@@ -181,6 +182,7 @@ seconds and jitter, honouring `retry_after_secs`, and never retries another 4xx.
 | 404 | `not_found` | no such job or reservation of this key's | no |
 | 409 | `conflict` | `request_id` reused with another body | no |
 | 410 | `reservation_gone` | lapsed, released, or its node lost | reserve again |
+| 410 | `not_found` | a create retried after its job left the hub's history | no |
 | 413 | `too_large` | spec over 512 KiB | no |
 | 500 | `internal` | — | yes |
 | 503 | `no_capacity` | no node accepted in time | yes, after `retry_after_secs` |
