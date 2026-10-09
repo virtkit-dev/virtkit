@@ -97,9 +97,9 @@ recorded in the audit log.
 
 ### Running the node
 
-`vk node service install [--no-start] [--stop-timeout DURATION] [--user NAME]` runs `vk node
-run` under systemd as `vk-node.service`, enabled and started. Run as root, it writes a system
-unit to `/etc/systemd/system/` (`WantedBy=multi-user.target`, pulling in
+`vk node service install [--no-start] [--stop-timeout DURATION] [--user NAME] [--ignore-ci-user]`
+runs `vk node run` under systemd as `vk-node.service`, enabled and started. Run as root, it
+writes a system unit to `/etc/systemd/system/` (`WantedBy=multi-user.target`, pulling in
 `network-online.target`) that runs the node as root, or as `--user NAME`: the unit always names
 its `User=`, so systemd sets `HOME` for a managed runner's default config. The user must be in
 `/etc/passwd`: `vk` reads no other user database, so a user only LDAP or SSSD knows installs a
@@ -119,14 +119,46 @@ started, while `vk-node.service` is starting or stopping, when a
 runs a node as the same user: a system unit naming that `User=`, or the user's own unit.
 
 On a CI host where the node runs as `gitlab-runner` with `/etc/virtkit/config.toml`, root
-enrolls it as that user and installs the unit:
+enrolls it as that user and installs the unit. The packaged `gitlab-runner.service` runs as
+root, so it must first run as `gitlab-runner` too (see below), owning its config, which it
+reads and writes:
 
 ```sh
+sudo systemctl edit gitlab-runner     # [Service] User=gitlab-runner
+sudo chown -R gitlab-runner: /etc/gitlab-runner
+sudo systemctl restart gitlab-runner
 sudo -u gitlab-runner vk node join https://hub.example.com --token -
 sudo vk node service install --user gitlab-runner
 ```
 
 `sudo vk node join … --user gitlab-runner --service` does both, and sets the user up first.
+
+The unit's own `--user gitlab-runner` stays harmless for the vk custom executor, but a
+shell-executor runner on the same host then fails: it switches to that user with `su`, which
+takes root.
+
+The node must run as the user the host's CI jobs run as: it reads the admission ledger
+(`<state_dir>/admit/`, entries `0600`) and job dirs (`<state_dir>/jobs/`) the runner's vk
+executor writes, and the executor reads what the node's placed jobs leave there. gitlab-runner
+runs a custom executor as itself, so a gitlab-runner service running as root writes them as
+root, whatever its `--user`. `vk node join --user NAME` and `vk node service install` refuse
+when they find another user's sign: a job's entry in `admit/` or `jobs/` owned by another user
+(the directories, the ledger's `.lock` and `reservation-*` entries excepted; a former node
+user's placed jobs still running count as its jobs); or, with an external runner, a
+`gitlab-runner.service` not masked (its drop-ins included) whose `User=` is another — root
+when it sets none — and whose config, from its `--config` or `/etc/gitlab-runner/config.toml`
+for root, has a custom executor running `vk`.
+
+The refusal names the users and the evidence, and explains both remedies: run the node as
+the CI user, or run gitlab-runner as the node's user (`User=` in a drop-in from
+`systemctl edit gitlab-runner`, with `/etc/gitlab-runner` owned by that user) and transfer
+the old user's state to the node's user. `--ignore-ci-user` proceeds with a warning.
+
+`join` checks before transferring state ownership, which would hide the evidence without
+fixing the cause. It skips this check for a managed runner, which runs as the node's user.
+`vk node run` warns once at startup. When a concurrency or drain pass fails with a
+permission error, it logs the user mismatch instead, once until the message changes.
+Concurrency failures also reach the hub as `concurrency_error`.
 
 With `--user`, the account must be able to reach the state dir, read the config and execute
 `vk`. If the command read no config, it refuses a user config under `~/.config/virtkit/`,

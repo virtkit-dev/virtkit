@@ -79,7 +79,7 @@ impl Scope {
 }
 
 /// This process's effective uid.
-fn euid() -> u32 {
+pub(super) fn euid() -> u32 {
     // SAFETY: `geteuid` reads this process's own id and cannot fail.
     unsafe { libc::geteuid() }
 }
@@ -215,6 +215,15 @@ fn exec_word(path: &Path) -> Result<String> {
     Ok(word)
 }
 
+/// What [`install`] does when the host's CI jobs run as another user than the node would.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CiUser {
+    Refuse,
+    Warn,
+    /// The caller has just checked.
+    Checked,
+}
+
 /// `vk node service install`, for the node to run as `user` when given; only root may name
 /// one.
 pub fn install(
@@ -222,6 +231,7 @@ pub fn install(
     start: bool,
     stop_timeout: Duration,
     user: Option<&str>,
+    ci_user: CiUser,
 ) -> Result<()> {
     let scope = Scope::current();
     let dir = super::dir(cfg);
@@ -259,6 +269,14 @@ pub fn install(
         .transpose()?;
     if let Some(account) = &account {
         reachable(account, &dir, &exe, config.as_deref())?;
+    }
+    if ci_user != CiUser::Checked {
+        let (uid, name) = match &account {
+            Some(account) => (account.uid, account.name.clone()),
+            // A user only LDAP or SSSD knows installs a user unit: named by its uid.
+            None => (euid(), super::ci_user::user_name(euid())),
+        };
+        ci_user_matches(cfg, Some(uid), &name, ci_user == CiUser::Warn)?;
     }
     if cfg.node.runner == vk_hub_proto::RunnerMode::Managed
         && cfg.node.gitlab_runner.is_none()
@@ -635,6 +653,27 @@ pub(super) fn prepare_account(name: &str, cfg: &Config, handed: &mut bool) -> Re
     Ok(account)
 }
 
+/// Refuse a node to run as `name` (`uid`, `None` for a user still to be created) when the
+/// host's CI jobs run as another user, unless `ignore`, which only warns.
+pub(super) fn ci_user_matches(
+    cfg: &Config,
+    uid: Option<u32>,
+    name: &str,
+    ignore: bool,
+) -> Result<()> {
+    let node = super::ci_user::NodeUser { uid, name };
+    let seen = super::ci_user::others(cfg, &node);
+    if seen.is_empty() {
+        return Ok(());
+    }
+    let why = super::ci_user::explain(&node, cfg.state_dir(), &seen, true);
+    if ignore {
+        println!("vk node: warning: {why}");
+        return Ok(());
+    }
+    bail!("{why}; or pass --ignore-ci-user to go ahead all the same")
+}
+
 /// Mark the child join run as the node's user so only the parent prints the next step.
 pub(super) const JOIN_CHILD: &str = "VK_NODE_JOIN_AS_USER";
 
@@ -916,7 +955,7 @@ impl Account {
 
     /// The user called `name`, or `None` when `/etc/passwd` has none; `name` must be a plain
     /// user name a unit file can hold.
-    fn lookup(name: &str) -> Result<Option<Account>> {
+    pub(super) fn lookup(name: &str) -> Result<Option<Account>> {
         plain_user_name(name)?;
         let c_name = CString::new(name).context("a user name")?;
         passwd(|pwd, buf, result| {
@@ -927,7 +966,7 @@ impl Account {
     }
 
     /// The user with id `uid`.
-    fn of(uid: u32) -> Result<Account> {
+    pub(super) fn of(uid: u32) -> Result<Account> {
         passwd(|pwd, buf, result| {
             // SAFETY: as in `named`.
             unsafe { libc::getpwuid_r(uid, pwd, buf.as_mut_ptr(), buf.len(), result) }

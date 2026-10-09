@@ -38,6 +38,7 @@ macro_rules! say {
     }};
 }
 
+mod ci_user;
 mod core;
 mod identity;
 mod inventory;
@@ -183,6 +184,8 @@ pub struct JoinOptions {
     pub user: Option<String>,
     /// Then run the node as a service, stopping one already running first.
     pub service: bool,
+    /// Go ahead though the host's CI jobs run as another user than `user`.
+    pub ignore_ci_user: bool,
 }
 
 /// `vk node join`.
@@ -208,6 +211,12 @@ pub async fn join(
         service::root_for_user(name)?;
         // Checked as root here, and again as the user by the join run as it.
         host_checks(cfg)?;
+        // Check before transferring state ownership hides the executor's user. A managed
+        // runner runs as the node, so the transfer also fixes ownership of a former user's state.
+        if cfg.node.runner == vk_hub_proto::RunnerMode::External {
+            let uid = service::Account::lookup(name)?.map(|a| a.uid);
+            service::ci_user_matches(cfg, uid, name, opts.ignore_ci_user)?;
+        }
     }
     // A running node holds the state dir; the service is started again if the join fails.
     let stopped = opts.service && service::stop_running()?;
@@ -224,7 +233,13 @@ pub async fn join(
         }
         if opts.service {
             let timeout = crate::dev::config::parse_duration(service::DEFAULT_STOP_TIMEOUT)?;
-            service::install(cfg, true, timeout, opts.user.as_deref())?;
+            let ci_user = match (&opts.user, opts.ignore_ci_user) {
+                // Checked above, or left unchecked there for a managed runner.
+                (Some(_), _) => service::CiUser::Checked,
+                (None, true) => service::CiUser::Warn,
+                (None, false) => service::CiUser::Refuse,
+            };
+            service::install(cfg, true, timeout, opts.user.as_deref(), ci_user)?;
         }
         Ok::<_, anyhow::Error>(())
     }
@@ -512,6 +527,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     update::note_installed(&dir)?;
     let enrollment = read_enrollment(&dir).map_err(not_enrolled)?;
     inventory::labels(&cfg)?;
+    if let Some(why) = ci_user::this_node(&cfg) {
+        say!("warning: {why}");
+    }
     let identity = Identity::load(&dir).with_context(|| {
         format!(
             "loading the node's identity ({})",

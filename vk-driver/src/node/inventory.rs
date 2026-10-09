@@ -25,7 +25,7 @@ pub const GATE: [Feature; 3] = [Feature::Kvm, Feature::Vmm, Feature::Kernel];
 const TMPFS_MAGIC: u64 = 0x0102_1994;
 
 /// The most of a gitlab-runner config read: a real one is a few kilobytes.
-const MAX_RUNNER_CONFIG: u64 = 1 << 20;
+pub(super) const MAX_RUNNER_CONFIG: u64 = 1 << 20;
 
 /// The most runner names reported, and the longest one kept.
 const MAX_RUNNERS: usize = 64;

@@ -329,6 +329,14 @@ enum NodeCmd {
         /// join fails with it still in place.
         #[arg(long)]
         service: bool,
+        /// Join with --user although the host's CI jobs run as another user
+        ///
+        /// Without it, --user with an external runner is refused when the jobs' entries under
+        /// the state dir belong to another user, or when gitlab-runner.service runs the vk
+        /// custom executor as another: the node could not read the admission ledger and job
+        /// dirs those jobs write.
+        #[arg(long)]
+        ignore_ci_user: bool,
     },
     /// Keep a session with the hub, and follow it, in the foreground
     ///
@@ -388,6 +396,11 @@ enum NodeServiceCmd {
         /// by it. The user must be in /etc/passwd.
         #[arg(long, value_name = "NAME")]
         user: Option<String>,
+        /// Install although the host's CI jobs run as another user than the node would
+        ///
+        /// Without it, installing is refused as `vk node join --user` refuses joining.
+        #[arg(long)]
+        ignore_ci_user: bool,
     },
     /// Stop and disable vk-node.service and remove it, leaving the enrollment
     Uninstall,
@@ -4402,6 +4415,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 replace,
                 user,
                 service,
+                ignore_ci_user,
             } => {
                 let token = match (token, token_file) {
                     (_, Some(path)) => node::TokenSource::File(path),
@@ -4416,6 +4430,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                     replace,
                     user,
                     service,
+                    ignore_ci_user,
                 };
                 match node::join(&ctx.cfg, &hub, &token, ca.as_deref(), &opts).await {
                     Ok(()) => ExitCode::SUCCESS,
@@ -4439,7 +4454,17 @@ async fn cli_main(cli: Cli) -> ExitCode {
                         no_start,
                         stop_timeout,
                         user,
-                    } => node::service::install(&ctx.cfg, !no_start, stop_timeout, user.as_deref()),
+                        ignore_ci_user,
+                    } => node::service::install(
+                        &ctx.cfg,
+                        !no_start,
+                        stop_timeout,
+                        user.as_deref(),
+                        match ignore_ci_user {
+                            true => node::service::CiUser::Warn,
+                            false => node::service::CiUser::Refuse,
+                        },
+                    ),
                     NodeServiceCmd::Uninstall => node::service::uninstall(),
                 };
                 match done {

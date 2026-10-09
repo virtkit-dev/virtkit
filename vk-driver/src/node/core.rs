@@ -30,6 +30,8 @@ pub struct Core {
     concurrency: Mutex<Option<Concurrency>>,
     /// Why the last attempt at setting the concurrency failed, if it did.
     concurrency_error: Mutex<Option<String>>,
+    /// Why the last pass at a drain failed, if it did: logged when it changes.
+    drain_error: Mutex<Option<String>>,
     /// Which of a drain's conditions held at the last pass, while draining.
     drain: Mutex<Option<DrainProgress>>,
     /// Since when, in seconds since the epoch, a reset's drain has waited only on jobs
@@ -83,6 +85,7 @@ impl Core {
             persisted: Mutex::new(persisted),
             concurrency: Mutex::new(None),
             concurrency_error: Mutex::new(None),
+            drain_error: Mutex::new(None),
             drain: Mutex::new(None),
             preparing_since: Mutex::new(None),
             acquire,
@@ -340,18 +343,16 @@ impl Core {
             let core = self.clone();
             let cfg = cfg.clone();
             // Off the runtime: it reads files and takes the ledger's lock.
-            match tokio::task::spawn_blocking(move || core.step(&cfg, may_rise)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => say!("{e:#}"),
-                Err(e) => say!("the concurrency loop failed: {e}"),
+            if let Err(e) = tokio::task::spawn_blocking(move || core.step(&cfg, may_rise)).await {
+                say!("the concurrency loop failed: {e}");
             }
         }
     }
 
     /// Update concurrency, then drain progress, independently of either's failure. An invalid
     /// concurrency config must not block a drain. Concurrency errors are reported as well as
-    /// logged.
-    fn step(&self, cfg: &Config, may_rise: bool) -> Result<()> {
+    /// logged; each error is logged when it changes, not at every pass.
+    fn step(&self, cfg: &Config, may_rise: bool) {
         let concurrency =
             crate::schedule::decide_with(cfg, self.hub_ceiling(), may_rise).and_then(|decision| {
                 crate::schedule::apply(cfg, &decision)?;
@@ -371,14 +372,22 @@ impl Core {
                 self.set(&self.concurrency_error, None);
             }
             Err(e) => {
-                let message = format!("{e:#}");
+                let message = explain_denied(cfg, &e);
                 if lock(&self.concurrency_error).as_deref() != Some(&message) {
                     say!("setting the runner's concurrency: {message}");
                 }
                 self.set(&self.concurrency_error, Some(message));
             }
         }
-        self.drain_step(cfg)
+        let drained = self.drain_step(cfg);
+        let message = drained.as_ref().err().map(|e| explain_denied(cfg, e));
+        let mut last = lock(&self.drain_error);
+        if let Some(message) = &message
+            && last.as_ref() != Some(message)
+        {
+            say!("{message}");
+        }
+        *last = message;
     }
 
     /// While draining, read where the drain stands and finish it once complete.
@@ -472,6 +481,20 @@ impl Core {
     }
 }
 
+/// Explain a CI user mismatch, when found, for permission errors; otherwise return `e`.
+/// Raw permission errors name the first entry encountered, so their wording can change
+/// on every pass.
+fn explain_denied(cfg: &Config, e: &anyhow::Error) -> String {
+    let denied = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+    });
+    match denied.then(|| super::ci_user::this_node(cfg)).flatten() {
+        Some(why) => why,
+        None => format!("{e:#}"),
+    }
+}
+
 /// How long a reset's drain waits on a job admitted but with no supervisor before it fails.
 const PREPARE_WAIT: Duration = Duration::from_secs(600);
 
@@ -534,6 +557,12 @@ mod tests {
     /// A hub job ID, naming a placed job's journal.
     const PLACED: &str = "0123456789abcdef0123456789abcdef";
 
+    /// A pass expected to go through: `step` logs a drain's failure rather than return it.
+    fn step(core: &Core, cfg: &Config) {
+        core.step(cfg, true);
+        assert_eq!(*lock(&core.drain_error), None);
+    }
+
     fn drain() -> Command {
         Command {
             id: "d".into(),
@@ -588,13 +617,13 @@ mod tests {
         assert_eq!(ack.outcome, Outcome::Accepted);
         // The runner is told to stop at once; the drain waits for it to have gone.
         assert!(!*allowed.borrow());
-        core.step(&cfg, true).unwrap();
+        step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Draining);
         let progress = core.report().drain.unwrap();
         assert!(!progress.runner_stopped && progress.ledger_empty && progress.active_jobs == 0);
         // Quitting is still a runner: not drained, and acquisition not yet reported stopped.
         runner_tx.send(RunnerState::Quitting).unwrap();
-        core.step(&cfg, true).unwrap();
+        step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Draining);
         assert_eq!(core.report().acquisition, Some(Acquisition::Run));
         // A placed job accepted, with no supervisor: it holds the drain past the runner.
@@ -606,11 +635,11 @@ mod tests {
         )
         .unwrap();
         runner_tx.send(RunnerState::Stopped).unwrap();
-        core.step(&cfg, true).unwrap();
+        step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Draining);
         assert_eq!(core.report().drain.unwrap().active_jobs, 1);
         std::fs::write(placed.join(crate::node::jobs::journal::RESULT), "{}").unwrap();
-        core.step(&cfg, true).unwrap();
+        step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Drained);
         assert_eq!(core.unrecorded()[0].outcome, Outcome::Done);
         let report = core.report();
@@ -637,7 +666,7 @@ mod tests {
             acquisition: Acquisition::Stop,
         })
         .unwrap();
-        core.step(&cfg, true).unwrap();
+        step(&core, &cfg);
         let report = core.report();
         assert_eq!(report.applied_generation(), Some(1));
         assert_eq!(report.concurrency.unwrap().effective, Some(2));
@@ -681,7 +710,7 @@ mod tests {
             core.state(),
             *core.acquire().borrow()
         ));
-        core.step(&cfg, true).unwrap();
+        step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Draining);
         let report = core.report();
         let progress = report.drain.unwrap();
@@ -694,7 +723,7 @@ mod tests {
         );
         // The placed job ends.
         std::fs::write(placed.join(journal::RESULT), "{}").unwrap();
-        core.step(&cfg, true).unwrap();
+        step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Draining);
         assert_eq!(core.report().drain.unwrap().active_jobs, 0);
         // Then the runner's job.
@@ -702,7 +731,7 @@ mod tests {
         // Retried: a test forking meanwhile can hold the dropped lock for an instant.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while core.state() == NodeState::Draining && std::time::Instant::now() < deadline {
-            core.step(&cfg, true).unwrap();
+            step(&core, &cfg);
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(core.state(), NodeState::Drained);
@@ -722,7 +751,7 @@ mod tests {
         let core =
             Core::open(&dir, issuer(), Some(watch::channel(RunnerState::Stopped).1)).unwrap();
         core.command(drain(), 1).unwrap();
-        core.step(&cfg, true).unwrap();
+        step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Drained);
         let report = core.report();
         assert!(
@@ -864,7 +893,7 @@ mod tests {
             op,
         };
         core.command(drain(), 1).unwrap();
-        core.step(&cfg, true).unwrap();
+        step(&core, &cfg);
         // A plain drain waits for the job.
         assert_eq!(core.state(), NodeState::Draining);
         assert_eq!(core.report().drain.unwrap().active_jobs, 1);
@@ -873,7 +902,7 @@ mod tests {
         core.command(command("r", Operation::Reset { images: false }), 1)
             .unwrap();
         // A job still asking to be admitted is waited for.
-        core.step(&cfg, true).unwrap();
+        step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Draining);
         drop(waiting);
         // Retried: a test forking meanwhile can hold the dropped lock for an instant.
@@ -884,11 +913,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         // So is a job admitted that no supervisor runs yet.
-        core.step(&cfg, true).unwrap();
+        step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Draining);
         drop(preparing);
         while core.state() == NodeState::Draining && std::time::Instant::now() < deadline {
-            core.step(&cfg, true).unwrap();
+            step(&core, &cfg);
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(core.state(), NodeState::Maintenance);
@@ -914,12 +943,12 @@ mod tests {
             op: Operation::Reset { images: false },
         };
         core.command(reset, 1).unwrap();
-        core.step(&cfg, true).unwrap();
+        step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Draining);
         // As if the prepare had been at it since well before.
         let started = lock(&core.preparing_since).unwrap();
         *lock(&core.preparing_since) = Some(started - PREPARE_WAIT.as_secs());
-        core.step(&cfg, true).unwrap();
+        step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Drained);
         let journal = core.persisted().journal;
         assert!(

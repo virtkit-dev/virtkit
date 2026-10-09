@@ -14,6 +14,7 @@ All notable changes to virtkit will be documented in this file.
   `--user` creates the user when there is none, adds it to `/dev/kvm`'s group, hands it the
   state dir and what is already in it, checks it can read the config, and enrolls as it;
   `--service` then installs and starts `vk-node.service`, stopping a running one first.
+  `--user` checks the user as `vk node service install` does (see Fixed).
 - **`vk node join --replace` re-enrolls a host as a new node.** After reading the token and
   passing checks, it preserves the old identity in `<state_dir>/node.replaced-<time>` and
   prints the old node ID for `vk-hub nodes remove`.
@@ -48,6 +49,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`vk node service install` refuses a node user other than the one CI jobs run as.** It
+  refuses when the vk executor's files belong to another user, or gitlab-runner runs it as
+  another, naming the user the node must run as; `--ignore-ci-user` goes ahead anyway.
+  `vk node run` says so once instead of repeating permission errors.
 - **`allow_failure: exit_codes` works with the vk executor.** `vk gitlab run` reports a
   failing script's exit code through `BUILD_EXIT_CODE_FILE`, so gitlab-runner shows the job's
   real exit code.
