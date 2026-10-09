@@ -131,6 +131,9 @@ pub struct Hub {
     changes: watch::Sender<u64>,
     /// Per-node change counters followed by node pages.
     node_changes: Followed,
+    /// Bumped for one placed job when its output grows or its record changes: what the job's
+    /// page follows.
+    job_changes: Followed,
     /// Bumped by [`Hub::touch`] alone, for pages that show nothing of a node's report or
     /// heartbeat.
     touched: watch::Sender<u64>,
@@ -189,6 +192,7 @@ impl Hub {
             fetches: crate::fetch::Fetches::new(None),
             changes: watch::Sender::new(0),
             node_changes: Followed::default(),
+            job_changes: Followed::default(),
             touched: watch::Sender::new(0),
             jobs: watch::Sender::new(0),
             sessions: watch::Sender::new(0),
@@ -242,9 +246,19 @@ impl Hub {
 
     /// Note that a placed job's record may have changed: one submitted, placed, accepted,
     /// at a new stage, finished, canceled or settled, or records dropped from the history.
-    /// Its output is not followed.
+    /// Its output is not followed here, but by [`Hub::job_changed`].
     pub(crate) fn jobs_changed(&self) {
         self.jobs.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Note that placed job `id`'s output grew or its record changed.
+    pub(crate) fn job_changed(&self, id: &str) {
+        self.job_changes.bump(id);
+    }
+
+    /// Wake on the next [`Hub::job_changed`] of job `id`.
+    pub(crate) fn subscribe_job(&self, id: &str) -> watch::Receiver<u64> {
+        self.job_changes.subscribe(id)
     }
 
     /// Wake on the next [`Hub::jobs_changed`] only.

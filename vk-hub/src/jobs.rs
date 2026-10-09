@@ -383,6 +383,7 @@ async fn persist(hub: &Hub, id: &str, row: JobRow, events: Vec<Event>) -> Result
     }
     hub.touch();
     hub.jobs_changed();
+    hub.job_changed(&id);
     Ok(())
 }
 
@@ -945,10 +946,14 @@ async fn on_output(
         tokio::task::spawn_blocking(move || write_output(&dir, &job, have, &kept))
             .await
             .context("writing output")??;
-        let mut state = hub.dispatch.lock();
-        if let Some(job) = state.jobs.get_mut(id) {
-            job.row.output_len = have.saturating_add(len);
+        {
+            let mut state = hub.dispatch.lock();
+            if let Some(job) = state.jobs.get_mut(id) {
+                job.row.output_len = have.saturating_add(len);
+            }
         }
+        // The job's page alone: its record is unchanged until written.
+        hub.job_changed(id);
     }
     let acked = end.max(have);
     Ok(vec![HubJobMsg::OutputAck {
@@ -2206,6 +2211,63 @@ pub fn detail(hub: &Hub, id: &str) -> Result<Option<(JobRow, Option<Vec<u8>>)>> 
     Ok(Some((row, tail)))
 }
 
+/// What a job's page reads of its stored output.
+pub struct Stretch {
+    /// Where it starts in the output.
+    pub from: u64,
+    pub bytes: Vec<u8>,
+    /// How long the output was when it was read.
+    pub len: u64,
+}
+
+/// Job `id`'s record as the hub holds it and, while the hub holds its output, up to `max`
+/// bytes of it: from `from`, or for `None` its end, from the start of a line as
+/// [`output_tail`] cuts it. `None` for a job not in the history.
+pub fn output_stretch(
+    hub: &Hub,
+    id: &str,
+    from: Option<u64>,
+    max: u64,
+) -> Result<Option<(JobRow, Option<Stretch>)>> {
+    // An output file is named by the ID.
+    if !vk_hub_proto::valid_id(id) {
+        return Ok(None);
+    }
+    let live = live_row(&hub.dispatch.lock(), id).cloned();
+    let Some(row) = live.map_or_else(|| hub.db.job(id), |r| Ok(Some(r)))? else {
+        return Ok(None);
+    };
+    let Some(dir) = hub
+        .dispatch
+        .output_dir
+        .as_deref()
+        .filter(|_| row.settled_at.is_none() && row.expired_at.is_none())
+    else {
+        return Ok(Some((row, None)));
+    };
+    let len = row.output_len;
+    let stretch = match from {
+        None => {
+            let bytes = output_tail(dir, id, len, max)?;
+            Stretch {
+                from: len.saturating_sub(bytes.len() as u64),
+                bytes,
+                len,
+            }
+        }
+        Some(from) => {
+            let want = len.saturating_sub(from).min(max);
+            let want = usize::try_from(want).unwrap_or(usize::MAX);
+            Stretch {
+                from,
+                bytes: read_output(dir, id, from, want)?,
+                len,
+            }
+        }
+    };
+    Ok(Some((row, Some(stretch))))
+}
+
 /// One line of a job's output as [`readable`] makes it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TraceLine {
@@ -2390,10 +2452,6 @@ impl Trace {
     }
 
     /// The lines held back, as they read so far.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "for a page following a running job")
-    )]
     pub fn held(&self) -> Vec<TraceLine> {
         self.held
             .iter()

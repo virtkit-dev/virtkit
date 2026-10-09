@@ -1066,7 +1066,7 @@ the hub masks nothing more, and every signed-in session of the web UI, a viewer'
 read it. The kept output lives exactly as long as the record: the 30 days that expire an
 unsettled job's output do not touch it, and it goes when the history drops the record. A failed
 job its producer never settles keeps none: its output goes with those 30 days. Before it is
-settled, a failed job's page reads the same end from the stored output. The database holds
+settled, a job's page reads its stored output (see [Web UI](#web-ui)). The database holds
 roughly `job_history` × `kept_failure_output` of it — about 2.4 GiB at the defaults, were every
 job to fail; more between the hourly trims, or for tails kept before `kept_failure_output` was
 lowered — and its file does not shrink when they go.
@@ -1151,11 +1151,11 @@ is `same-site` or `cross-site`.
 first, 100 jobs per page, with a link to older jobs. Each row shows the job's name, with a link
 (`↗`) to it on GitLab when the spec names a plain web URL; its project; its branch or tag; its
 pipeline, linked to GitLab's page of it (`<project URL>/-/pipelines/<pipeline ID>`) when the
-job's URL is one; its node, linked to the node's page; and its result: running with its stage,
-succeeded, failed with its class and exit code (the node's message on hover, and a link to the
-job's page), or canceled. It also shows when a node accepted the job, its elapsed run time, its
-VM's peak memory and CPU time, and the guest's vCPUs and memory, falling back to the placement
-envelope when the node did not report the guest size.
+job's URL is one; its node, linked to the node's page; and its result, linked to the job's
+page: running with its stage, succeeded, failed with its class and exit code (the node's
+message on hover), or canceled. It also shows when a node accepted the job, its elapsed run
+time, its VM's peak memory and CPU time, and the guest's vCPUs and memory, falling back to the
+placement envelope when the node did not report the guest size.
 
 Node, project, result (`running` for queued or running jobs, `success`, `failed`, `canceled`),
 job name, branch and pipeline filters carry over to older pages. Project and node filters
@@ -1178,16 +1178,35 @@ reload that URL because htmx's history cache is disabled. *Show* or Enter applie
 immediately and loads the page without JavaScript. Refused or failed requests, including expired
 sessions, trigger a full page load. Each node's page links to its jobs.
 
-`/jobs/<id>` shows viewers and operators the job's result, failure class, exit code, node
-message, GitLab page when the spec names a plain web URL, project, node, pool, key,
-submission/start/finish/settlement times, run time and resource usage. For failed jobs it
-shows the end of the output (see [Placed jobs](#placed-jobs)) as text in a `<pre>`. Continued
-lines are rejoined; carriage-return updates show the final text. GitLab section markers,
-terminal escape sequences and other controls are removed. Each line's timestamp shows the
-time of day, with the full timestamp on hover. A line is kept to 64 KiB: past it, what precedes
-its last carriage return goes, else its head is kept, ending `…`. Lines waiting for a `+` line
-to continue them are held to 256 KiB in all, past which the oldest is taken as complete;
-`vk-hub jobs show` reads the end the hub kept the same way.
+`/jobs/<id>`, for viewers and operators alike, shows a job's record: its result, failure class,
+exit code and the node's message, its GitLab page when the spec names a plain web URL, its
+project, node, pool and key, when it was submitted, started, finished and settled, how long it
+ran and what it used. Then its output, as the node masked it, in a `<pre>`, as text: lines
+continued after a cut joined back, a line rewritten by carriage returns as it was left,
+GitLab's section markers and the terminal's escape sequences and other controls dropped, and
+each line's stamp as its time of day, the full instant on hover. A line is kept to 64 KiB: past it,
+what precedes its last carriage return goes, else its head is kept, ending `…`. Lines waiting for a
+`+` line to continue them are held to 256 KiB in all, past which the oldest is taken as complete;
+`vk-hub jobs show` reads the end the hub kept the same way. While the hub holds the output — until
+the job's producer settles it, or for 30 days after it finished — the page shows its last 1 MiB,
+saying how much precedes it; once settled, a failed job's page shows the end the hub kept (see
+[Placed jobs](#placed-jobs)), and another's says its output is gone, linking to the job on GitLab
+when its spec names a plain web URL.
+
+While the job runs, its page follows it over `/events/job/<id>`, a stream like the others
+(below): the hub notes each piece of output it stores and each change to the job's record, by
+job, and the stream reads what the output gained from where it last stopped — at most 1 MiB,
+the page's opening, on its first step and 256 KiB on each later one, the rest a second later —
+and sends the lines it completes, which the page appends, and those still open, in a place of
+its own replaced each time: the last so far, which a carriage return may still rewrite, and
+any line a later `+` line of its stream (`O` or `E`) may still continue, with those after it.
+A stream's first step replaces the lines the page shows, so one reopened after a dropped connection
+shows no line twice. A stream opened once the output has gone sends the record alone and closes. A
+change to the record — a new stage, more output, the result — replaces the record. Once the job has
+finished and its output is read to its end, the stream sends its last line and its result, and
+closes. The output stays scrolled to its end as it grows, unless scrolled up to read, and keeps its
+last 2 MiB of text or so, saying earlier lines went; that takes the embedded `follow.js`, without
+which it grows unscrolled and whole.
 
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a
@@ -1225,11 +1244,12 @@ origin, CSRF and role checks, run as the session's principal; a viewer's carries
   answer counts once, from the same session, within ten minutes, and only while the plan is
   still what was shown — a node enrolled, removed or updated meanwhile refuses it.
 
-The nodes table, a node's page, `/operations` and `/jobs`' newest page stay live over
-server-sent events. The hub notes every heartbeat, report, session, command outcome and
-desired-state change, by node; every release added or removed and rollout step; and every
-change to a placed job's record — submitted, placed, accepted, at a new stage, finished,
-canceled or settled — and each hourly trim of the history, but not its output. The nodes table
+The nodes table, a node's page, `/operations`, `/jobs`' newest page and a running job's page
+stay live over server-sent events. The hub notes every heartbeat, report, session, command
+outcome and desired-state change, by node; every release added or removed and rollout step;
+every change to a placed job's record — submitted, placed, accepted, at a new stage, finished,
+canceled or settled — and each hourly trim of the history; and, by job, each piece of its
+output stored, which wakes that job's page alone, never `/jobs`. The nodes table
 is the same for everyone, so one task renders it on a change and every nodes page is sent that
 one rendering; `/operations` likewise, once for every viewer's page and once for every
 operator's. A node's page is woken by changes to that node alone, and `/jobs` by changes to

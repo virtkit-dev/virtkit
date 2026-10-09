@@ -27,7 +27,9 @@ use super::pages::{
     open_cell, rough_bytes, rough_count, section, started,
 };
 use super::sse::{self, Source};
-use super::{Auth, Body, Ui, actions, blocking, decode_form, field, message, operations, page};
+use super::{
+    Auth, Body, Ui, actions, blocking, decode_form, field, job_output, message, operations, page,
+};
 use crate::ops::{self, NodeView};
 use crate::rollout::{NodeStatus, Rollout, RolloutAction, RolloutState};
 use crate::server::{HEARTBEAT, Hub};
@@ -96,6 +98,7 @@ pub(super) fn event_name(event: &str) -> Option<&'static str> {
         "nodes" => Some("nodes"),
         "operations" => Some("operations"),
         super::jobs::EVENT => Some(super::jobs::EVENT),
+        _ if job_event(event).is_some() => Some(job_output::RECORD),
         _ => event
             .strip_prefix("node/")
             .filter(|id| vk_hub_proto::valid_id(id))
@@ -103,9 +106,18 @@ pub(super) fn event_name(event: &str) -> Option<&'static str> {
     }
 }
 
+/// The job `/events/<event>` follows, `job/<id>`, if it is one.
+fn job_event(event: &str) -> Option<&str> {
+    let events = job_output::EVENTS.strip_prefix("/events/")?;
+    event
+        .strip_prefix(events)
+        .filter(|id| vk_hub_proto::valid_id(id))
+}
+
 /// A fleet `/events/<event>[?<query>]` stream for `auth`'s page. Operators see rollout buttons
 /// on `/operations` and node steering actions rendered per stream with the session's CSRF
-/// token. `/jobs`' stream follows the filter in `query`.
+/// token. `/jobs`' stream follows the filter in `query`; a job's page's, `job/<id>`, its
+/// output.
 pub(super) fn source(
     event: &str,
     query: Option<&str>,
@@ -118,6 +130,12 @@ pub(super) fn source(
         super::jobs::EVENT => {
             let filter = super::jobs::stream_filter(query)?;
             return Some(super::jobs::source(hub, &site.jobs, filter));
+        }
+        // A job's page takes no query.
+        _ if job_event(event).is_some() => {
+            return job_event(event)
+                .filter(|_| query.is_none())
+                .map(|id| job_output::source(hub, id));
         }
         "nodes" => {
             return Some(Source::Shared {

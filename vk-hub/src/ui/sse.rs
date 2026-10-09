@@ -8,7 +8,8 @@
 //! way a fragment is rendered at most once per [`DEBOUNCE`] however fast what it shows
 //! changes, and sent only when it differs from the last one that stream sent; ages on the
 //! pages move in steps of a heartbeat, so a page with nothing new to show is sent nothing but
-//! keep-alives.
+//! keep-alives. A page that grows — a running job's output — is sent what is new, at most
+//! once per [`DEBOUNCE`] too, and told when nothing more will come ([`Source::Follow`]).
 //!
 //! Streams hold connections, so there are at most [`MAX_STREAMS`] of them — the rest of the
 //! UI's connections stay for pages and posts — and [`MAX_SESSION_STREAMS`] per session. A
@@ -234,6 +235,31 @@ pub enum Source {
         changes: watch::Receiver<u64>,
         render: Render,
     },
+    /// What this page follows step by step, such as a log it appends to: `next` is called at
+    /// once, then whenever `changes` says there may be more, and once a heartbeat. Each step's
+    /// events are sent as they are, nothing compared with the last. `name` is the event a
+    /// session's end is shown in.
+    Follow {
+        name: &'static str,
+        changes: watch::Receiver<u64>,
+        next: Next,
+    },
+}
+
+/// The next step of a [`Source::Follow`]: called off the runtime, as it may read the
+/// database, and never twice at once for one stream.
+pub type Next = Arc<dyn Fn() -> anyhow::Result<Step> + Send + Sync>;
+
+/// One step of a [`Source::Follow`].
+#[derive(Debug, Default)]
+pub struct Step {
+    /// The events to send, `(name, data)`, in order: none for nothing new.
+    pub events: Vec<(&'static str, String)>,
+    /// There is more to send already: the next step follows a [`DEBOUNCE`] after this one,
+    /// without waiting for a change.
+    pub more: bool,
+    /// Nothing will follow: the stream sends `close` after these events and ends.
+    pub last: bool,
 }
 
 /// A stream for `auth`'s page of `source`, holding `slot` for as long as it lasts.
@@ -328,6 +354,11 @@ async fn run(mut session: Session, source: Source, tx: mpsc::Sender<Bytes>) -> R
             changes,
             render,
         } => (name, None, Some(changes), render),
+        Source::Follow {
+            name,
+            changes,
+            next,
+        } => return follow(session, name, changes, next, tx).await,
     };
     let mut refresh = refresh_interval();
     let mut last_render = Instant::now();
@@ -416,6 +447,69 @@ async fn run(mut session: Session, source: Source, tx: mpsc::Sender<Bytes>) -> R
             }
             last_sent = Instant::now();
         }
+    }
+}
+
+/// Run a [`Source::Follow`] step immediately, then on changes, heartbeats or pending output,
+/// at most once per [`DEBOUNCE`]. Stop after the last step, browser disconnect or session
+/// end. As in [`run`], check the session before sending.
+async fn follow(
+    mut session: Session,
+    name: &'static str,
+    mut changes: watch::Receiver<u64>,
+    next: Next,
+    tx: mpsc::Sender<Bytes>,
+) -> Result<(), Stalled> {
+    let mut refresh = refresh_interval();
+    let mut last_sent = Instant::now();
+    let mut recheck = false;
+    loop {
+        changes.borrow_and_update();
+        let stepped = Instant::now();
+        let f = next.clone();
+        let Some(step) = blocking(RENDERING, move || f()).await else {
+            return Ok(());
+        };
+        match session.live(recheck).await {
+            Some(true) => {}
+            Some(false) => return end(&tx, name, session.sign_in).await,
+            None => return Ok(()),
+        }
+        let mut frame = Vec::new();
+        for &(event_name, ref data) in &step.events {
+            frame.extend_from_slice(&event(event_name, data));
+        }
+        if step.last {
+            frame.extend_from_slice(&event(CLOSE, ""));
+        } else if frame.is_empty() && last_sent.elapsed() >= KEEP_ALIVE {
+            frame.extend_from_slice(COMMENT);
+        }
+        if !frame.is_empty() {
+            if !send(&tx, Bytes::from(frame)).await? {
+                return Ok(());
+            }
+            last_sent = Instant::now();
+        }
+        if step.last {
+            return Ok(());
+        }
+        recheck = false;
+        if !step.more {
+            // Sessions first: one ended is not sent another step, whatever else is ready.
+            tokio::select! {
+                biased;
+                changed = session.changes.changed() => match changed {
+                    Ok(()) => recheck = true,
+                    Err(_) => return Ok(()),
+                },
+                () = tx.closed() => return Ok(()),
+                changed = changes.changed() => if changed.is_err() {
+                    return Ok(());
+                },
+                _ = refresh.tick() => recheck = true,
+            }
+        }
+        tokio::time::sleep_until((stepped + DEBOUNCE).into()).await;
     }
 }
 

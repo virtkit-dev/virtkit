@@ -183,7 +183,7 @@ pre {
   max-height: 40rem;
   margin: var(--s2) 0;
 }
-pre time { color: var(--muted); }
+pre time, pre .cut { color: var(--muted); }
 
 /* Controls. */
 button, input, select { font: inherit; color: inherit; }

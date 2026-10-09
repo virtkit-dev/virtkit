@@ -573,6 +573,7 @@ async fn assets_are_served_for_good_under_their_hash() {
         (assets::HTMX, include_str!("../../assets/htmx.min.js")),
         (assets::SSE, include_str!("../../assets/sse.min.js")),
         (assets::TIME, include_str!("../../assets/time.js")),
+        (assets::FOLLOW, include_str!("../../assets/follow.js")),
     ] {
         let reply = get(addr, assets::url(name), None).await;
         assert_eq!(reply.status, 200);
@@ -1066,8 +1067,8 @@ async fn pages_load_only_the_embedded_scripts() {
         let body = get(addr, &path, Some(&cookie)).await.body;
         assert!(body.contains("\"allowEval\":false"), "{body}");
         assert!(body.contains("\"selfRequestsOnly\":true"), "{body}");
-        assert_eq!(body.matches("<script").count(), 3, "{body}");
-        assert_eq!(body.matches("<script src=\"/assets/").count(), 3, "{body}");
+        assert_eq!(body.matches("<script").count(), 4, "{body}");
+        assert_eq!(body.matches("<script src=\"/assets/").count(), 4, "{body}");
         // The script that shows times in the browser's zone, run once the page is read.
         let time = format!(
             "<script src=\"{}\" defer></script>",
@@ -2580,14 +2581,20 @@ async fn the_fleet_s_pages_load_only_the_embedded_scripts() {
 fn assert_only_embedded_scripts(body: &str) {
     assert!(body.contains("\"allowEval\":false"), "{body}");
     assert!(body.contains("\"selfRequestsOnly\":true"), "{body}");
-    assert_eq!(body.matches("<script").count(), 3, "{body}");
-    assert_eq!(body.matches("<script src=\"/assets/").count(), 3, "{body}");
+    assert_eq!(body.matches("<script").count(), 4, "{body}");
+    assert_eq!(body.matches("<script src=\"/assets/").count(), 4, "{body}");
     // The script that shows times in the browser's zone, run once the page is read.
     let time = format!(
         "<script src=\"{}\" defer></script>",
         assets::url(assets::TIME)
     );
     assert!(body.contains(&time), "{body}");
+    // The one that keeps a running job's output scrolled to its end.
+    let follow = format!(
+        "<script src=\"{}\" defer></script>",
+        assets::url(assets::FOLLOW)
+    );
+    assert!(body.contains(&follow), "{body}");
     // The hub's time, by which the script measures ages.
     let now = body
         .strip_prefix("<!doctype html><html lang=\"en\" data-now=\"")
@@ -3682,8 +3689,15 @@ async fn a_failed_job_s_page_shows_the_end_of_its_output() {
         )),
         "{page}"
     );
-    // One that succeeded has no page linked.
-    assert!(!page.contains(&format!("/jobs/{}", id(2))), "{page}");
+    // Every job links to its page.
+    assert!(
+        page.contains(&format!(
+            "<a href=\"/jobs/{}\"><span class=\"badge ok\" title=\"the VM &lt;did&gt; not \
+             boot\">success</span></a>",
+            id(2)
+        )),
+        "{page}"
+    );
 
     let reply = get(addr, &format!("/jobs/{}", id(1)), Some(&viewer)).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
@@ -3715,6 +3729,16 @@ async fn a_failed_job_s_page_shows_the_end_of_its_output() {
         .body;
     assert!(page.contains("<span class=\"badge ok\""), "{page}");
     assert!(!page.contains("End of its output"), "{page}");
+    // A job settled that succeeded: its output went, GitLab has it.
+    assert!(
+        page.contains(
+            "<p class=\"empty\">dropped once its producer had it: \
+             <a href=\"https://gitlab.example.com/acme/web/-/jobs/2\" target=\"_blank\" \
+             rel=\"noopener noreferrer\">GitLab has it</a></p>"
+        ),
+        "{page}"
+    );
+    assert!(!page.contains("sse-connect"), "{page}");
 
     let reply = get(addr, &format!("/jobs/{}", id(9)), Some(&viewer)).await;
     assert_eq!(reply.status, 404);
@@ -3761,6 +3785,316 @@ async fn the_jobs_filter_loads_the_whole_page_when_refused() {
     let reply = request(addr, "GET", path, &swap[..2], "").await;
     assert_eq!(reply.status, 401, "{}", reply.body);
     assert_eq!(reply.header("hx-redirect"), None);
+}
+
+/// A scratch directory, removed when dropped, by a failed test too.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("vk-hub-ui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Scratch(dir)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A fleet UI on a hub that keeps jobs' output in `dir`.
+async fn start_fleet_placing(dir: &std::path::Path) -> (SocketAddr, Arc<Hub>) {
+    let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = format!("http://{addr}");
+    let hub = Arc::new(
+        Hub::new(Arc::new(Db::open_memory().unwrap()), Some(origin.clone()))
+            .with_jobs(dir.to_path_buf(), crate::jobs::DEFAULT_LOST_AFTER, 100)
+            .unwrap(),
+    );
+    let ui = Arc::new(Ui::new(hub.clone(), &origin));
+    tokio::spawn(serve(listener, None, ui));
+    (addr, hub)
+}
+
+/// A stamp's header, `kind` ` ` for a line or `+` for a line's continuation.
+fn stamp(kind: char) -> String {
+    format!("2026-10-09T12:10:43.123456Z 01O{kind}")
+}
+
+/// Running job `n`'s record, with `output` stored as its output.
+fn running_with_output(hub: &Hub, dir: &std::path::Path, n: u64, output: &[u8]) -> String {
+    use vk_hub_proto::client::JobState;
+    let id = format!("{n:032x}");
+    std::fs::write(dir.join(format!("{id}.out")), output).unwrap();
+    let mut row = history_job(n, "acme/web");
+    row.state = JobState::Running;
+    row.started_at = Some(crate::now_secs());
+    row.output_len = output.len() as u64;
+    let now = crate::now_secs();
+    hub.db
+        .submit_job(&id, &row, &n.to_string(), b"{}", "key gitlab", now)
+        .unwrap();
+    id
+}
+
+/// Job `id`'s output grows by `more`, as the hub stores what a node sends.
+fn more_output(hub: &Hub, dir: &std::path::Path, id: &str, more: &[u8]) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join(format!("{id}.out")))
+        .unwrap();
+    file.write_all(more).unwrap();
+    let mut row = hub.db.job(id).unwrap().unwrap();
+    row.output_len += more.len() as u64;
+    assert!(hub.db.put_job(id, &row, &[], crate::now_secs()).unwrap());
+    hub.job_changed(id);
+}
+
+/// A running job's page follows its output and record over a stream of its own, for any
+/// session: what the output gains appended in order however it was cut, mid-line or
+/// mid-character, the last line so far replaced as it changes, and the stream closed with
+/// the job's result.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_job_s_page_follows_its_output() {
+    use vk_hub_proto::client::JobState;
+    use vk_hub_proto::job::JobResult;
+    let scratch = Scratch::new("follow");
+    let dir = &scratch.0;
+    let (addr, hub) = start_fleet_placing(dir).await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let first = format!("{}<b>first</b>\n{}10%\r\n", stamp(' '), stamp(' '));
+    let id = running_with_output(&hub, dir, 1, first.as_bytes());
+    let time = "<time title=\"2026-10-09T12:10:43.123456Z\">12:10:43</time> ";
+
+    // The history links every job to its page.
+    let page = get(addr, "/jobs", Some(&viewer)).await.body;
+    assert!(
+        page.contains(&format!(
+            "<a href=\"/jobs/{id}\"><span class=\"badge busy\">running</span></a>"
+        )),
+        "{page}"
+    );
+    let page = get(addr, &format!("/jobs/{id}"), Some(&viewer)).await.body;
+    assert_only_embedded_scripts(&page);
+    for want in [
+        format!(
+            "<div hx-ext=\"sse\" sse-connect=\"/events/job/{id}\" sse-close=\"close\">\
+             <div id=\"job-record\" sse-swap=\"job\">"
+        ),
+        "<span hidden sse-swap=\"output-start\" hx-target=\"#job-lines\"></span>".to_string(),
+        format!(
+            "<pre data-follow><span id=\"job-lines\" sse-swap=\"output\" hx-swap=\"beforeend\">\
+             {time}&lt;b&gt;first&lt;/b&gt;\n</span><span id=\"job-held\" sse-swap=\"held\">\
+             {time}10%</span></pre>"
+        ),
+    ] {
+        assert!(page.contains(&want), "{want}: {page}");
+    }
+    for bad in [
+        format!("/events/job/{id}?x=1"),
+        "/events/job/zz".to_string(),
+    ] {
+        assert_eq!(get(addr, &bad, Some(&viewer)).await.status, 404, "{bad}");
+    }
+
+    let mut stream = Events::open(addr, &format!("/events/job/{id}"), &viewer).await;
+    assert!(stream.head.starts_with("HTTP/1.1 200"), "{}", stream.head);
+    // What the page shows, replacing it: a stream opened again shows no line twice.
+    assert_eq!(
+        stream.next().await.unwrap(),
+        format!("event: output-start\ndata: {time}&lt;b&gt;first&lt;/b&gt;\ndata: \n\n")
+    );
+    assert_eq!(
+        stream.next().await.unwrap(),
+        format!("event: held\ndata: {time}10%\n\n")
+    );
+    let record = stream.next().await.unwrap();
+    assert!(
+        record.starts_with("event: job\ndata: <section><h2>Job</h2>")
+            && record.contains("<span class=\"badge busy\">running</span>"),
+        "{record}"
+    );
+
+    // The last line continued, then a line cut inside a character.
+    let mut cut = format!("{}20%\r\n{}d", stamp('+'), stamp(' ')).into_bytes();
+    cut.push(0xc3);
+    more_output(&hub, dir, &id, &cut);
+    assert_eq!(
+        stream.next().await.unwrap(),
+        format!("event: held\ndata: {time}20%\n\n")
+    );
+    // The record shows the output's length: it follows it.
+    let record = stream.next().await.unwrap();
+    assert!(record.starts_with("event: job\ndata: "), "{record}");
+    let mut rest = vec![0xa9];
+    rest.extend_from_slice(format!("jà ✓\n{}last\n", stamp(' ')).as_bytes());
+    more_output(&hub, dir, &id, &rest);
+    assert_eq!(
+        stream.next().await.unwrap(),
+        format!("event: output\ndata: {time}20%\ndata: {time}déjà ✓\ndata: \n\n")
+    );
+    assert_eq!(
+        stream.next().await.unwrap(),
+        format!("event: held\ndata: {time}last\n\n")
+    );
+    let record = stream.next().await.unwrap();
+    assert!(record.starts_with("event: job\ndata: "), "{record}");
+
+    // It ends: its last line, then its result, and the stream closes.
+    let mut row = hub.db.job(&id).unwrap().unwrap();
+    row.state = JobState::Finished;
+    row.revision += 1;
+    row.finished_at = Some(crate::now_secs());
+    row.result = Some(JobResult {
+        failure: None,
+        exit_code: Some(0),
+        message: None,
+        output_len: row.output_len,
+        artifacts: Vec::new(),
+        usage: None,
+    });
+    hub.db.put_job(&id, &row, &[], crate::now_secs()).unwrap();
+    hub.job_changed(&id);
+    assert_eq!(
+        stream.next().await.unwrap(),
+        format!("event: output\ndata: {time}last\ndata: \n\n")
+    );
+    assert_eq!(stream.next().await.unwrap(), "event: held\ndata: \n\n");
+    let record = stream.next().await.unwrap();
+    assert!(
+        record.contains("<span class=\"badge ok\">success</span>"),
+        "{record}"
+    );
+    assert_eq!(
+        stream.next().await.as_deref(),
+        Some("event: close\ndata: \n\n")
+    );
+    assert_eq!(stream.next().await, None);
+    // Its page now shows it all, followed no more.
+    let page = get(addr, &format!("/jobs/{id}"), Some(&viewer)).await.body;
+    assert!(!page.contains("sse-connect"), "{page}");
+    assert!(
+        page.contains(&format!("{time}déjà ✓\n{time}last\n</span>")),
+        "{page}"
+    );
+}
+
+/// A job's stream opened once its output went sends its record alone and closes, the page
+/// keeping what it was served; one following it when it goes ends the lines it holds first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_s_stream_ends_once_its_output_went() {
+    let scratch = Scratch::new("settled");
+    let dir = &scratch.0;
+    let (addr, hub) = start_fleet_placing(dir).await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let time = "<time title=\"2026-10-09T12:10:43.123456Z\">12:10:43</time> ";
+    let settle = |id: &str| {
+        let mut row = hub.db.job(id).unwrap().unwrap();
+        row.settled_at = Some(crate::now_secs());
+        row.revision += 1;
+        assert!(hub.db.put_job(id, &row, &[], crate::now_secs()).unwrap());
+        hub.job_changed(id);
+    };
+    let output = format!("{}line\n{}open", stamp(' '), stamp(' '));
+    let id = running_with_output(&hub, dir, 1, output.as_bytes());
+    let page = get(addr, &format!("/jobs/{id}"), Some(&viewer)).await.body;
+    assert!(page.contains("sse-connect"), "{page}");
+    settle(&id);
+    let mut stream = Events::open(addr, &format!("/events/job/{id}"), &viewer).await;
+    let record = stream.next().await.unwrap();
+    assert!(
+        record.starts_with("event: job\ndata: <section><h2>Job</h2>"),
+        "{record}"
+    );
+    assert_eq!(
+        stream.next().await.as_deref(),
+        Some("event: close\ndata: \n\n")
+    );
+    assert_eq!(stream.next().await, None);
+
+    let id = running_with_output(&hub, dir, 2, output.as_bytes());
+    let mut stream = Events::open(addr, &format!("/events/job/{id}"), &viewer).await;
+    let start = stream.next().await.unwrap();
+    assert!(start.starts_with("event: output-start\n"), "{start}");
+    assert_eq!(
+        stream.next().await.unwrap(),
+        format!("event: held\ndata: {time}line\n\n")
+    );
+    assert!(stream.next().await.unwrap().starts_with("event: job\n"));
+    settle(&id);
+    assert_eq!(
+        stream.next().await.unwrap(),
+        format!("event: output\ndata: {time}line\ndata: \n\n")
+    );
+    assert_eq!(stream.next().await.unwrap(), "event: held\ndata: \n\n");
+    assert!(stream.next().await.unwrap().starts_with("event: job\n"));
+    assert_eq!(
+        stream.next().await.as_deref(),
+        Some("event: close\ndata: \n\n")
+    );
+}
+
+/// A job's page, and its stream's first step, show the end of a long output, saying how much
+/// precedes it; a later step reads a bounded stretch, the rest at the next.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_job_s_page_shows_a_bounded_stretch_of_its_output() {
+    let dir = std::env::temp_dir().join(format!("vk-hub-ui-bounded-{}", std::process::id()));
+    let (addr, hub) = start_fleet_placing(&dir).await;
+    let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
+    // 100-byte lines, stamped as a node sends them and numbered: 1.1 MiB of them.
+    let lines = |from: usize, to: usize| {
+        (from..to)
+            .map(|n| {
+                let x = "x".repeat(54);
+                format!("2026-10-09T12:10:43.123456Z 01O line {n:07} {x}\n")
+            })
+            .collect::<String>()
+    };
+    let opening = job_output::OPENING as usize;
+    let id = running_with_output(&hub, &dir, 1, lines(0, opening / 100 + 1000).as_bytes());
+    let page = get(addr, &format!("/jobs/{id}"), Some(&viewer)).await.body;
+    assert!(page.contains(" before this not shown</span>\n"), "{page}");
+    assert!(!page.contains("line 0000000 "), "{page}");
+
+    let mut stream = Events::open(addr, &format!("/events/job/{id}"), &viewer).await;
+    let start = stream.next().await.unwrap();
+    assert!(
+        start.starts_with("event: output-start\n"),
+        "{}",
+        &start[..80]
+    );
+    assert!(start.contains(" before this not shown"));
+    // Each line's stamp grows into its `<time>`: bounded all the same.
+    assert!(start.len() < 2 * opening, "{}", start.len());
+    // Its last line is held, as the next may continue it.
+    let last = opening / 100 + 999;
+    assert!(start.contains(&format!("line {:07} ", last - 1)));
+    assert!(!start.contains(&format!("line {last:07} ")));
+    let held = stream.next().await.unwrap();
+    assert!(held.starts_with("event: held\ndata: <time "), "{held}");
+    assert!(held.contains(&format!("line {last:07} ")), "{held}");
+    // 600 KiB more: read a stretch at a time, in order.
+    let more = lines(last + 1, last + 1 + 6000);
+    more_output(&hub, &dir, &id, more.as_bytes());
+    let mut seen = Vec::new();
+    while seen.last() != Some(&(last + 5999)) {
+        let event = stream.next().await.unwrap();
+        if !event.starts_with("event: output\n") {
+            continue;
+        }
+        assert!(event.len() < 512 * 1024, "{}", event.len());
+        seen.extend(
+            event
+                .split("line ")
+                .skip(1)
+                .map(|l| l[..7].parse::<usize>().unwrap()),
+        );
+    }
+    assert_eq!(seen, (last..last + 6000).collect::<Vec<_>>());
 }
 
 /// `/jobs`' newest page follows the jobs as they change, filtered as the page is; an older

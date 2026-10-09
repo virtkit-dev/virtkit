@@ -13,4 +13,5 @@ version, whose sha512 is that version's `dist.integrity`. To update one, take th
 version's file, check it the same way, and change the version, URL and sha256 here in the
 same commit.
 
-`ui.css`, `time.js` and `favicon.svg` (a copy of `docs/assets/logo-mark.svg`) are the UI's own.
+`ui.css`, `time.js`, `follow.js` and `favicon.svg` (a copy of `docs/assets/logo-mark.svg`) are
+the UI's own.

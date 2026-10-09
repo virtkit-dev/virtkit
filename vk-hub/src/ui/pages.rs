@@ -107,6 +107,8 @@ fn head(h: &mut Html, title: &str) {
         .text(assets::url(assets::SSE))
         .raw("\"></script><script src=\"")
         .text(assets::url(assets::TIME))
+        .raw("\" defer></script><script src=\"")
+        .text(assets::url(assets::FOLLOW))
         .raw("\" defer></script></head>");
 }
 

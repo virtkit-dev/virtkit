@@ -17,8 +17,13 @@ All notable changes to virtkit will be documented in this file.
   — a script failure, a system failure, a lost node… — the hub keeps the last 256 KiB of its
   log, masked on the node, for as long as it keeps the job (`kept_failure_output` in
   `hub.toml`, `"0"` to keep none). Unsettled jobs retain no log beyond 30 days after finishing.
-  Failed results on the Jobs page link to the job's details and log, readable without GitLab
-  by every signed-in session, including viewers. `vk-hub jobs show <id>` prints the same.
+  A failed job's page shows that log, readable without GitLab by every signed-in session,
+  including viewers. `vk-hub jobs show <id>` prints the same.
+- **`vk-hub`'s web UI shows each job's log, live while it runs.** Every result on the Jobs page
+  links to the job's page. It shows the available log's tail, follows new lines while the job
+  runs, and shows the final result. Output scrolls to the end unless you scroll up to read.
+  Once its producer settles a job that did not fail, the page says the log is gone and links
+  to the job on GitLab when a web link is available.
 - **`vk-hub`'s Jobs page filters by job name, branch and pipeline.** The name and branch
   match any part, ignoring the case of ASCII letters; each row shows its branch and pipeline,
   the pipeline linked to GitLab, and clicking a job's name, branch or pipeline narrows the page
