@@ -32,9 +32,9 @@ All notable changes to virtkit will be documented in this file.
   `vk-hub nodes pools` puts nodes in the pools jobs name. A key's holder asks the hub for room,
   reserves it on a node and has jobs run there through the client API on the hub's node
   listener; the hub stores each job's output before acknowledging it, fails a job whose node
-  stays unreachable, and keeps records and output across its own restart. `vk-hub jobs` and the
-  web UI's operations page list the jobs placed. Hosts whose `vk` does not speak fleet
-  protocol version 3 are monitored and steered but offered no jobs.
+  stays unreachable, and keeps records and output across its own restart. `vk-hub jobs` lists
+  the jobs placed. Hosts whose `vk` does not speak fleet protocol version 3 are monitored and
+  steered but offered no jobs.
 - **Experimental: fleet nodes run GitLab jobs placed by the hub.** `vk node run` reserves
   memory and disk from the executor's job budget, then runs jobs in microVMs with the same
   image, checkout, services, egress and sizing as `vk gitlab`. Jobs use gitlab-runner's stages
@@ -44,10 +44,12 @@ All notable changes to virtkit will be documented in this file.
   job's wall-clock time, its VM's CPU time and peak memory, and the guest's vCPUs and memory;
   the hub's client API shows them on the job. The hub keeps the records of the newest 10,000
   jobs it placed (`job_history` in `hub.toml`), and answers 410 to a retried create whose job
-  it has dropped. `vk-hub jobs` shows how long each job ran and the most memory it used.
+  it has dropped. `vk-hub jobs` shows how long each job ran and the most memory it used. The
+  web UI's Jobs page shows job history and resource usage, with node, project and result
+  filters, success rate and median run time. Each node's page links to its jobs.
 - `[node] labels` declares the labels the hub may place GitLab jobs by.
 - **`vk-hub`'s web UI links the jobs it placed to their GitLab pages.** A node's workloads,
-  local mode's VMs and the jobs on the operations page open the job on GitLab in a new tab. A
+  local mode's VMs and the jobs on the Jobs page open the job on GitLab in a new tab. A
   job of a host's own gitlab-runner stays plain text: its variables could point the link
   anywhere.
 - **Experimental: `vk-gitlab` runs GitLab jobs on a fleet.** A new binary, published with each

@@ -31,8 +31,8 @@ The prototype provides, all experimentally:
   their masked output streamed to the hub;
 - `vk-hub workloads`: each node's VMs;
 - live nodes, node detail and operations pages, steering and resetting from a node's page,
-  pausing, resuming and aborting rollouts from the operations page, and an audit log, with
-  sign-in links from `vk-hub ui login`;
+  pausing, resuming and aborting rollouts from the operations page, a job history, and an
+  audit log, with sign-in links from `vk-hub ui login`;
 - on the hub, the side of [GitLab dispatch](gitlab-dispatch.md) it owns: API keys (`vk-hub
   keys`), pools (`vk-hub nodes pools`), the client API, reservations and job placement over
   protocol version 3, and job output (`vk-hub jobs`); see [Placed jobs](#placed-jobs).
@@ -899,8 +899,8 @@ nodes resending output from the end of the stored file.
 
 `vk-hub jobs [--limit 50]` lists the latest jobs: ID, key, pool, state or how it ended, node,
 output length, age, how long it ran (or has been running), its VM's peak memory, and what the
-job is. The web UI's operations page lists the latest 20, live,
-to viewers and operators alike, each leading to its page on GitLab.
+job is. The web UI's jobs page shows the whole history to viewers and operators alike (see
+[Web UI](#web-ui)).
 
 ## Web UI
 
@@ -917,32 +917,47 @@ or `ui_tls_key` without `ui_addr` is an error. An `[oidc]` table adds sign-in th
 provider (see [Signing in](#signing-in)).
 
 The UI serves the nodes table with the columns of `vk-hub nodes`; each node's inventory,
-heartbeat and workloads; and the audit log (`/audit`, filterable by node, 100 lines a page; the
-hub keeps the newest 100,000 rows). A node's page shows what the hub asks of it beside what it
-reports — its state, acquisition, runner, concurrency, drain progress and what it cannot carry
-out — and its 20 latest commands with their outcomes. It opens with a steering panel describing
-the current state in plain language, grouped into *Job intake* — whether the node takes new jobs, the
-hub's concurrency ceiling and the node's current effective limit; *Maintenance* — in service,
-draining, drained, under maintenance, checking itself or quarantined; and an operator-only
-*Danger zone*. Operators see applicable actions with short explanations: pause intake or
-resume it, set the limit or remove it, drain from ready or during maintenance (the node stays
-drained once it ends), undrain while draining or drained, quarantine unless quarantined, release only then,
-reset from ready, draining or drained; no reset when the runner is external; everything while
-the node has reported nothing. They are the admin socket's operations — ceiling set or lifted,
-acquisition stopped or resumed, drain, undrain, quarantine, release, reset — posted to
-`/node/<id>/action` as before, which still refuses what does not apply. A reset requires
-confirmation from the same session, once and within ten minutes, as local mode's stops do. The
-panel is part of the node's live fragment, rendered for an operator's stream with that
-session's CSRF token, so what it offers follows the node; the limit's number field is kept
-through updates (`hx-preserve`). Each action returns a status line through htmx, and also works
-as a plain form. Monitoring-only nodes are marked, offer no actions and reject steering posts.
-Viewers see where the node stands and no actions. Operators also issue enrollment tokens from
-the nodes page, like `vk-hub token create`, valid for an hour, ten minutes, a day or seven
-days. A plain POST to `/tokens` uses the same origin, CSRF and role checks and returns a page
-showing the token once. Issuance is audited as the session's principal; the token is never
-logged. Removing a node stays on the admin socket. Operators grant who signs in through the
-OIDC provider, and as what, from `/users` (see [Signing in](#signing-in)). A page is refused
-to a request whose `Sec-Fetch-Site` is `same-site` or `cross-site`.
+heartbeat and workloads; the job history (`/jobs`, below); and the audit log (`/audit`,
+filterable by node, 100 lines a page; the hub keeps the newest 100,000 rows). A node's page
+shows what the hub asks of it beside what it reports — its state, acquisition, runner,
+concurrency, drain progress and what it cannot carry out — and its 20 latest commands with their
+outcomes. It opens with a steering panel describing the current state in plain language, grouped
+into *Job intake* — whether the node takes new jobs, the hub's concurrency ceiling and the
+node's current effective limit; *Maintenance* — in service, draining, drained, under
+maintenance, checking itself or quarantined; and an operator-only *Danger zone*. Operators see
+applicable actions with short explanations: pause intake or resume it, set the limit or remove
+it, drain from ready or during maintenance (the node stays drained once it ends), undrain while
+draining or drained, quarantine unless quarantined, release only then, reset from ready,
+draining or drained; no reset when the runner is external; everything while the node has
+reported nothing. They are the admin socket's operations — ceiling set or lifted, acquisition
+stopped or resumed, drain, undrain, quarantine, release, reset — posted to `/node/<id>/action`
+as before, which still refuses what does not apply. A reset requires confirmation from the same
+session, once and within ten minutes, as local mode's stops do. The panel is part of the node's
+live fragment, rendered for an operator's stream with that session's CSRF token, so what it
+offers follows the node; the limit's number field is kept through updates (`hx-preserve`). Each
+action returns a status line through htmx, and also works as a plain form. Monitoring-only nodes
+are marked, offer no actions and reject steering posts. Viewers see where the node stands and no
+actions. Operators also issue enrollment tokens from the nodes page, like `vk-hub token create`,
+valid for an hour, ten minutes, a day or seven days. A plain POST to `/tokens` uses the same
+origin, CSRF and role checks and returns a page showing the token once. Issuance is audited as
+the session's principal; the token is never logged. Removing a node stays on the admin socket.
+Operators grant who signs in through the OIDC provider, and as what, from `/users` (see [Signing
+in](#signing-in)). A page is refused to a request whose `Sec-Fetch-Site` is `same-site` or
+`cross-site`.
+
+`/jobs` shows viewers and operators the job history (see [Placed jobs](#placed-jobs)),
+newest first, 100 jobs per page, with a link to older jobs. Each row shows the job, linked to
+GitLab when the spec names a plain web URL; its project; its node, linked to the node's page;
+and its result: running with its stage, succeeded, failed with its class and exit code (the
+node's message on hover), or canceled. It also shows when a node accepted the job, its elapsed
+run time, its VM's peak memory and CPU time, and the guest's vCPUs and memory, falling back to
+the placement envelope when the node did not report the guest size.
+
+Node, project and result filters (`running` for queued or running jobs, `success`, `failed`,
+`canceled`) carry over to older pages. The summary covers the newest 10,000 matching jobs:
+the count, the share of finished jobs that succeeded (without a result filter), and the median
+run time of finished jobs. The page shows jobs as of loading and does not update live. Each
+node's page links to its jobs.
 
 The nodes table and `vk-hub nodes` show an update under way beside the node's state —
 `maintenance, updating to 0.85.0: downloading` — and a rolled-back one until the next; a

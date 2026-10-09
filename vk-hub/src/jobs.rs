@@ -45,7 +45,7 @@ use vk_hub_proto::{JOBS, NodeState, StorageRole};
 
 use crate::client::ApiError;
 use crate::server::{Hub, Reach};
-use crate::store::{ApiPrincipal, JobRow, NodeRow};
+use crate::store::{ApiPrincipal, JobFilter, JobPage, JobRow, NodeRow};
 
 /// How long a node may be unreachable while it holds a job before the job is lost, by
 /// default.
@@ -1914,12 +1914,35 @@ pub fn listing(hub: &Hub, limit: usize) -> Result<Vec<(String, JobRow)>> {
     let mut rows = hub.db.jobs(limit)?;
     let state = hub.dispatch.lock();
     for (id, row) in &mut rows {
-        if let Some(live) = (state.jobs.get(id).map(|j| &j.row)).or_else(|| state.finished.get(id))
-        {
+        if let Some(live) = live_row(&state, id) {
             *row = live.clone();
         }
     }
     Ok(rows)
+}
+
+/// A history page ([`crate::store::Db::job_page`]) updated with in-memory job state, excluding
+/// jobs that no longer match `filter`. The summary uses stored rows and lags unwritten changes.
+pub fn history(
+    hub: &Hub,
+    filter: &JobFilter,
+    before: Option<u64>,
+    limit: usize,
+) -> Result<JobPage> {
+    let mut page = hub.db.job_page(filter, before, limit, crate::now_secs())?;
+    let state = hub.dispatch.lock();
+    page.rows.retain_mut(|(_, id, row)| {
+        if let Some(live) = live_row(&state, id) {
+            *row = live.clone();
+        }
+        filter.matches(row)
+    });
+    Ok(page)
+}
+
+/// Job `id`'s row as the hub holds it ahead of the database, if it does.
+fn live_row<'s>(state: &'s State, id: &str) -> Option<&'s JobRow> {
+    (state.jobs.get(id).map(|j| &j.row)).or_else(|| state.finished.get(id))
 }
 
 /// A job's run or CPU time, `ms` milliseconds, to the second: `42s`, `3m05s`, `1h02m`.
@@ -1946,6 +1969,11 @@ pub(crate) mod testing {
     /// Whether `node` has a version-3 link that has sent its `held`.
     pub fn linked(hub: &Hub, node: &str) -> bool {
         hub.dispatch.lock().links.get(node).is_some_and(|l| l.held)
+    }
+
+    /// Hold `row` as job `id`'s final row, as the hub does until it is written.
+    pub fn hold_finished(hub: &Hub, id: &str, row: JobRow) {
+        hub.dispatch.lock().finished.insert(id.to_string(), row);
     }
 
     /// End job `id` with success in memory only, as it stands before its row is written.

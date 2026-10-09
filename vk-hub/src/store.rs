@@ -41,7 +41,10 @@ use crate::rollout::{Effect, Facts, NodeStatus, RolloutAction, RolloutRow, Rollo
 mod jobs;
 mod keys;
 
-pub use jobs::{DEFAULT_JOB_HISTORY, JobRow, RequestRow, Submitted};
+pub use jobs::{
+    DEFAULT_JOB_HISTORY, JobFilter, JobOutcome, JobPage, JobRow, RequestRow, SUMMARY_JOBS,
+    Submitted,
+};
 pub use keys::{ApiPrincipal, KeyPolicy, KeyRow, MAX_KEY_TTL, Scope, envelope_text, valid_name};
 
 /// Key: node ID. Value: JSON [`NodeRow`].

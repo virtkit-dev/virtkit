@@ -2535,12 +2535,13 @@ async fn the_fleet_s_pages_load_only_the_embedded_scripts() {
         format!("/node/{node}"),
         "/audit".to_string(),
         "/users".to_string(),
+        "/jobs".to_string(),
     ] {
         let body = get(addr, &path, Some(&cookie)).await.body;
         assert_only_embedded_scripts(&body);
         assert_eq!(
             body.matches("sse-close=\"close\"").count(),
-            usize::from(path != "/audit" && path != "/users")
+            usize::from(!["/audit", "/users", "/jobs"].contains(&path.as_str()))
         );
     }
     // The users page with its forms, on a hub with `[oidc]`.
@@ -3271,69 +3272,248 @@ async fn releases_and_rollouts_are_shown_live() {
     assert!(next.contains("aborted by uid 0"), "{next}");
 }
 
-/// `/operations` lists the jobs placed through the client API, as text, to a viewer, and
-/// follows them live.
+/// Placed jobs have a tab of their own, right after the nodes, and `/operations` no longer
+/// lists them.
 #[tokio::test(flavor = "multi_thread")]
-async fn placed_jobs_are_shown_live() {
-    use vk_hub_proto::client::{JobState, Placement};
+async fn placed_jobs_are_a_tab_of_their_own() {
     let (addr, hub, _) = start_fleet().await;
+    for role in [Role::Viewer, Role::Operator] {
+        let (cookie, _) = sign_in(addr, &hub, role).await;
+        let page = get(addr, "/operations", Some(&cookie)).await.body;
+        assert!(
+            page.contains(
+                "<nav><a href=\"/\">Nodes</a><a href=\"/jobs\">Jobs</a>\
+                 <a href=\"/operations\" aria-current=\"page\">Operations</a>\
+                 <a href=\"/audit\">Audit</a>"
+            ),
+            "{page}"
+        );
+        assert!(
+            !page.contains("<h2>Jobs</h2>") && !page.contains("none placed"),
+            "{page}"
+        );
+    }
+}
+
+/// `/jobs` shows a viewer the job history newest first with what each job used, links a job
+/// to GitLab only by a plain web URL and its node to the node's page, filters by node, project
+/// and result, and pages back from the oldest job shown, keeping the filter.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_job_history_is_shown_filtered_and_paged() {
+    use vk_hub_proto::client::{JobState, Placement};
+    use vk_hub_proto::job::{Envelope, FailureClass, JobResult, JobUsage};
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
     let (viewer, _) = sign_in(addr, &hub, Role::Viewer).await;
-    let page = get(addr, "/operations", Some(&viewer)).await;
-    assert!(page.body.contains("none placed"), "{}", page.body);
-    let id = "cd".repeat(16);
-    let mut row = crate::store::JobRow {
+    let page = get(addr, "/jobs", Some(&viewer)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(page.body.contains("none placed yet"), "{}", page.body);
+    assert!(
+        page.body
+            .contains("<a href=\"/jobs\" aria-current=\"page\">Jobs</a>"),
+        "{}",
+        page.body
+    );
+
+    let now = crate::now_secs();
+    let ended = |failure, exit_code, usage| {
+        Some(JobResult {
+            failure,
+            exit_code,
+            message: None,
+            output_len: 0,
+            artifacts: Vec::new(),
+            usage,
+        })
+    };
+    let job = |n: u64, project: &str, url: &str, state, result| crate::store::JobRow {
         key: "k".into(),
         key_name: "gitlab".into(),
-        request_id: "01".repeat(16),
+        request_id: format!("{n:032}"),
         placement: Placement {
             pool: "ci".into(),
             labels: vec![],
-            envelope: vk_hub_proto::job::Envelope::default(),
+            envelope: Envelope::default(),
         },
-        title: "GitLab job 7 of g/<b>p</b> (test)".into(),
-        job_url: Some("https://gitlab.example.com/g/p/-/jobs/7".into()),
-        project: None,
-        name: None,
-        created_at: crate::now_secs(),
-        state: JobState::Queued,
+        title: format!("GitLab job {n} of {project} (build)"),
+        job_url: Some(url.to_string()),
+        project: Some(project.to_string()),
+        name: Some(format!("build-{n}")),
+        created_at: now,
+        state,
         revision: 1,
         node: None,
         stage: None,
         cancel: None,
-        result: None,
+        result,
         output_len: 0,
         started_at: None,
         finished_at: None,
         settled_at: None,
         expired_at: None,
     };
-    hub.db
-        .submit_job(&id, &row, "d", b"{}", "key gitlab", row.created_at)
-        .unwrap();
-    let page = get(addr, "/operations", Some(&viewer)).await;
-    for want in [
-        &format!("<code title=\"{id}\">cdcdcdcd</code>"),
-        "<a href=\"https://gitlab.example.com/g/p/-/jobs/7\" target=\"_blank\" \
-         rel=\"noopener noreferrer\">GitLab job 7 of g/&lt;b&gt;p&lt;/b&gt; (test)</a>",
-        "<td>gitlab</td><td>ci</td><td><span class=\"badge\">queued</span></td><td>-</td>",
-    ] {
-        assert!(page.body.contains(want), "{want}: {}", page.body);
+    let submit = |n: u64, row: &crate::store::JobRow| {
+        let id = format!("{n:032x}");
+        hub.db
+            .submit_job(&id, row, &n.to_string(), b"{}", "key gitlab", now)
+            .unwrap();
+    };
+    // A page and a bit of jobs still queued, then three that ran.
+    for n in 1..=101 {
+        submit(n, &job(n, "bulk/x", "", JobState::Queued, None));
     }
-    let mut events = Events::open(addr, "/events/operations", &viewer).await;
-    events.next().await.unwrap();
-    row.state = JobState::Running;
-    row.stage = Some("step_script".into());
-    row.node = Some("ef".repeat(16));
-    row.revision = 2;
-    hub.db.put_job(&id, &row, &[], row.created_at).unwrap();
-    hub.touch();
-    let next = next_with(&mut events, "running: step_script").await;
+    let mut measured = job(
+        102,
+        "acme/web",
+        "https://gitlab.example.com/acme/web/-/jobs/102",
+        JobState::Finished,
+        ended(
+            None,
+            None,
+            Some(JobUsage {
+                wall_ms: 61_000,
+                cpu_ms: Some(120_000),
+                peak_mem_bytes: Some(3 << 30),
+                cpus: Some(4),
+                mem_mib: Some(8192),
+            }),
+        ),
+    );
+    measured.node = Some(node.clone());
+    measured.started_at = Some(now - 100);
+    measured.finished_at = Some(now - 30);
+    submit(102, &measured);
+    let mut failed = job(
+        103,
+        "acme/api",
+        "javascript:alert(1)",
+        JobState::Finished,
+        ended(Some(FailureClass::Script), Some(2), None),
+    );
+    failed.node = Some("ef".repeat(16));
+    failed.started_at = Some(now - 20);
+    failed.finished_at = Some(now - 10);
+    submit(103, &failed);
+    let mut running = job(
+        104,
+        "acme/web",
+        "https://gitlab.example.com/acme/web/-/jobs/104",
+        JobState::Running,
+        None,
+    );
+    running.node = Some(node.clone());
+    running.stage = Some("step_script".into());
+    running.started_at = Some(now - 90);
+    submit(104, &running);
+
+    let rows = |body: &str| body.matches("<tr><td title=").count();
+    let page = get(addr, "/jobs", Some(&viewer)).await.body;
+    assert_only_embedded_scripts(&page);
+    assert_eq!(rows(&page), 100, "{page}");
+    for want in [
+        // 61 and 10 seconds.
+        "104 jobs · 50% of 2 finished succeeded · median run of finished jobs 35s",
+        "<a href=\"https://gitlab.example.com/acme/web/-/jobs/102\" target=\"_blank\" \
+         rel=\"noopener noreferrer\">build-102</a></td><td>acme/web</td>",
+        &format!("<a href=\"/node/{node}\">ci-1</a>"),
+        "<span class=\"badge ok\">success</span>",
+        "<td class=\"num\">1m01s</td><td class=\"num\">3.0 GiB</td>\
+         <td class=\"num\">2m00s</td><td class=\"num\">4 vCPUs, 8.0 GiB</td>",
+        // Not a web link: the name as text.
+        ">build-103</td><td>acme/api</td><td><a href=\"/node/efefefefefefefefefefefefefefefef\">\
+         <code>efefefef</code></a></td>",
+        "<span class=\"badge bad\">script failure, exit 2</span>",
+        "<span class=\"badge busy\">running: step_script</span>",
+        // Running for a minute and a half, by the hub's clock.
+        "<td class=\"num\">1m3",
+        "<span class=\"badge\">queued</span>",
+    ] {
+        assert!(page.contains(want), "{want}: {page}");
+    }
+    assert!(!page.contains("href=\"javascript"), "{page}");
+    // Newest first.
+    let at = |name: &str| page.find(name).unwrap();
+    assert!(at("build-104") < at("build-103") && at("build-103") < at("build-102"));
+    let older = page
+        .split("<a href=\"/jobs?before=")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("a link to older jobs");
+    let page = get(addr, &format!("/jobs?before={older}"), Some(&viewer))
+        .await
+        .body;
+    assert_eq!(rows(&page), 4, "{page}");
     assert!(
-        next.contains(&format!(
-            "<a href=\"/node/{}\"><code>efefefef</code></a>",
-            "ef".repeat(16)
+        page.contains(">build-1<") && !page.contains("Older</a>"),
+        "{page}"
+    );
+    let page = get(addr, "/jobs?before=0", Some(&viewer)).await.body;
+    assert_eq!(rows(&page), 0, "{page}");
+    assert!(
+        page.contains("104 jobs") && page.contains("<p class=\"empty\">no older jobs</p>"),
+        "{page}"
+    );
+
+    let page = get(addr, "/jobs?result=failed", Some(&viewer)).await.body;
+    assert_eq!(rows(&page), 1, "{page}");
+    // Filtered on a result, the summary gives no success rate.
+    assert!(
+        page.contains("1 job · median run of finished jobs 10s</p>"),
+        "{page}"
+    );
+    assert!(
+        page.contains("<option value=\"failed\" selected>Failed</option>"),
+        "{page}"
+    );
+    let page = get(addr, &format!("/jobs?node={node}"), Some(&viewer))
+        .await
+        .body;
+    assert_eq!(rows(&page), 2, "{page}");
+    let page = get(
+        addr,
+        "/jobs?project=acme%2Fweb&result=running",
+        Some(&viewer),
+    )
+    .await
+    .body;
+    assert_eq!(rows(&page), 1, "{page}");
+    assert!(page.contains("build-104"), "{page}");
+    assert!(
+        page.contains("<option value=\"acme/web\" selected>acme/web</option>"),
+        "{page}"
+    );
+    let page = get(addr, "/jobs?project=no%3Cpe", Some(&viewer)).await.body;
+    assert!(page.contains("none match"), "{page}");
+    assert!(
+        page.contains("<option value=\"no&lt;pe\" selected>no&lt;pe</option>"),
+        "{page}"
+    );
+    // A node no longer enrolled, as the history still names it.
+    let gone = "ef".repeat(16);
+    let page = get(addr, &format!("/jobs?node={gone}"), Some(&viewer))
+        .await
+        .body;
+    assert_eq!(rows(&page), 1, "{page}");
+    assert!(
+        page.contains(&format!(
+            "<option value=\"{gone}\" selected>efefefef</option>"
         )),
-        "{next}"
+        "{page}"
+    );
+    // The filter carries over to older jobs.
+    let page = get(addr, "/jobs?result=running", Some(&viewer)).await.body;
+    assert_eq!(rows(&page), 100, "{page}");
+    assert!(
+        page.contains("<a href=\"/jobs?result=running&amp;before="),
+        "{page}"
+    );
+
+    let page = get(addr, &format!("/node/{node}"), Some(&viewer))
+        .await
+        .body;
+    assert!(
+        page.contains(&format!("<a href=\"/jobs?node={node}\">Its jobs</a>")),
+        "{page}"
     );
 }
 

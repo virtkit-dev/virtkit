@@ -5,10 +5,10 @@
 //! to where the node stands ([`Panel`]). A reset, which deletes what the node's past jobs
 //! left, is confirmed first ([`actions::ask_first`]). Monitoring-only nodes have no steering
 //! controls.
-//! Operators add releases and start rollouts from `/operations` ([`super::operations`]),
-//! which also lists client API jobs, read only. They issue enrollment tokens from the
-//! nodes page ([`create_token`]), and grant OIDC sign-in roles from `/users`
-//! ([`super::users`]), which only their navigation links to.
+//! Operators add releases and start rollouts from `/operations` ([`super::operations`]); the
+//! jobs placed through the client API are listed, read only, on `/jobs` ([`super::jobs`]).
+//! Operators issue enrollment tokens from the nodes page ([`create_token`]), and grant OIDC
+//! sign-in roles from `/users` ([`super::users`]), which only their navigation links to.
 
 use std::sync::Arc;
 
@@ -51,9 +51,6 @@ const TOKEN_TTLS: [(u64, &str); 4] = [
 
 /// The rollouts `/operations` shows, newest first.
 const OPERATIONS_ROLLOUTS: usize = 10;
-
-/// The placed jobs `/operations` shows, newest first.
-const OPERATIONS_JOBS: usize = 20;
 
 /// What the fleet's pages keep: the nodes table, and `/operations`' fragment once for every
 /// viewer's page and once for every operator's, each rendered once for every page showing it
@@ -191,6 +188,9 @@ pub(super) async fn get(
     if path == super::users::PATH {
         return super::users::get(auth, ui).await.map(Some);
     }
+    if path == super::jobs::PATH {
+        return super::jobs::get(query, auth, ui).await.map(Some);
+    }
     if let Some(id) = path.strip_prefix("/node/")
         && vk_hub_proto::valid_id(id)
     {
@@ -228,7 +228,6 @@ fn read_operations(hub: &Hub) -> Result<Operations> {
     Ok(Operations {
         releases: hub.db.releases()?,
         rollouts,
-        jobs: crate::jobs::listing(hub, OPERATIONS_JOBS)?,
         source: hub.fetches.source().map(|s| s.url().to_string()),
         fetch: hub.fetches.status(),
         latest: hub.fetches.latest(),
@@ -240,8 +239,6 @@ struct Operations {
     releases: Vec<Release>,
     /// The latest, newest first.
     rollouts: Vec<Rollout>,
-    /// The latest placed jobs, newest first.
-    jobs: Vec<(String, crate::store::JobRow)>,
     /// Where releases are fetched from; `None` with fetching off.
     source: Option<String>,
     /// The latest fetch since the hub started.
@@ -534,12 +531,14 @@ fn nav(auth: &Auth) -> pages::Nav {
 
 const NAV: pages::Nav = &[
     ("/", "Nodes"),
+    (super::jobs::PATH, "Jobs"),
     ("/operations", "Operations"),
     ("/audit", "Audit"),
 ];
 
 const OPERATOR_NAV: pages::Nav = &[
     ("/", "Nodes"),
+    (super::jobs::PATH, "Jobs"),
     ("/operations", "Operations"),
     ("/audit", "Audit"),
     (super::users::PATH, "Users"),
@@ -1409,7 +1408,9 @@ fn commands(h: &mut Html, d: &NodeDetail, now: u64) {
     // The node's ID: the router took it as hex.
     h.raw("<p><a href=\"/audit?node=")
         .text(&d.view.id)
-        .raw("\">The node's audit log</a></p></section>");
+        .raw("\">The node's audit log</a> · <a href=\"/jobs?node=")
+        .text(&d.view.id)
+        .raw("\">Its jobs</a></p></section>");
 }
 
 /// The VMs the node reports running, with what each holds from the last heartbeat. Every
@@ -1539,69 +1540,7 @@ fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
         rollout(&mut h, r, steer, now);
     }
     h.raw("</section>");
-    placed_jobs(&mut h, &ops.jobs, now);
     h
-}
-
-/// The latest jobs placed through the client API, and how each stands.
-fn placed_jobs(h: &mut Html, jobs: &[(String, crate::store::JobRow)], now: u64) {
-    h.raw("<section><h2>Jobs</h2>");
-    if jobs.is_empty() {
-        h.raw("<p class=\"empty\">none placed: <code>vk-hub keys create</code> issues the key ")
-            .raw("vk-gitlab places jobs with</p></section>");
-        return;
-    }
-    h.raw("<table class=\"grid\"><thead><tr><th>id</th><th>job</th><th>key</th>")
-        .raw("<th>pool</th><th>state</th><th>node</th><th>output</th><th>submitted</th>")
-        .raw("</tr></thead><tbody>");
-    for (id, j) in jobs {
-        let state = crate::jobs::state_text(j);
-        h.raw("<tr><td><code title=\"")
-            .text(id)
-            .raw("\">")
-            .text(id.get(..8).unwrap_or(id))
-            .raw("</code></td><td>")
-            // The producer's spec named the page: checked as a node's would be.
-            .external_link(j.job_url.as_deref(), &j.title)
-            .raw("</td><td>")
-            .text(&j.key_name)
-            .raw("</td><td>")
-            .text(&j.placement.pool)
-            .raw("</td><td>")
-            .raw(job_badge(j))
-            .text(state)
-            .raw("</span></td><td>");
-        match &j.node {
-            // The router takes only hex for a node's ID.
-            Some(node) if vk_hub_proto::valid_id(node) => {
-                h.raw("<a href=\"/node/")
-                    .text(node)
-                    .raw("\"><code>")
-                    .text(node.get(..8).unwrap_or(node))
-                    .raw("</code></a>");
-            }
-            _ => {
-                h.raw("-");
-            }
-        }
-        h.raw("</td><td>")
-            .text(bytes(j.output_len))
-            .raw("</td><td>")
-            .html(&time_ago_html(now, j.created_at))
-            .raw("</td></tr>");
-    }
-    h.raw("</tbody></table></section>");
-}
-
-/// The badge opening a placed job's state: waiting, under way, or how it ended.
-fn job_badge(j: &crate::store::JobRow) -> &'static str {
-    use vk_hub_proto::client::JobState;
-    match (j.state, &j.result) {
-        (JobState::Finished, Some(r)) if r.failure.is_none() => "<span class=\"badge ok\">",
-        (JobState::Finished, Some(_)) => "<span class=\"badge bad\">",
-        (JobState::Starting | JobState::Running, _) => "<span class=\"badge busy\">",
-        _ => "<span class=\"badge\">",
-    }
 }
 
 /// One rollout: what it updates to and how, its state, and each node by wave.

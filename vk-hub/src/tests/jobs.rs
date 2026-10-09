@@ -2377,3 +2377,63 @@ fn the_jobs_table_says_how_each_job_stands() {
         "{out}"
     );
 }
+
+/// A page of the history shows the job as the hub holds it ahead of the database, and leaves
+/// out one that no longer matches the filter.
+#[test]
+fn a_history_page_shows_jobs_as_the_hub_holds_them() {
+    use crate::store::{JobFilter, JobOutcome};
+    let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None);
+    let row = |n: u8| crate::store::JobRow {
+        key: "k".into(),
+        key_name: "gitlab".into(),
+        request_id: request_id(n),
+        placement: placement(),
+        title: format!("GitLab job {n}"),
+        job_url: None,
+        project: None,
+        name: None,
+        created_at: 1000,
+        state: JobState::Running,
+        revision: 1,
+        node: Some("ab".repeat(16)),
+        stage: Some("step_script".into()),
+        cancel: None,
+        result: None,
+        output_len: 0,
+        started_at: Some(1000),
+        finished_at: None,
+        settled_at: None,
+        expired_at: None,
+    };
+    for n in 1..=2 {
+        let id = format!("{n:032x}");
+        hub.db
+            .submit_job(&id, &row(n), &n.to_string(), b"{}", "key gitlab", 1000)
+            .unwrap();
+    }
+    let mut ended = row(2);
+    ended.state = JobState::Finished;
+    ended.revision = 2;
+    ended.result = Some(result(Some(FailureClass::Script), 0));
+    let (one, two) = (format!("{:032x}", 1), format!("{:032x}", 2));
+    crate::jobs::testing::hold_finished(&hub, &two, ended);
+
+    let page = crate::jobs::history(&hub, &JobFilter::default(), None, 10).unwrap();
+    let states: Vec<_> = page.rows.iter().map(|r| (r.1.clone(), r.2.state)).collect();
+    assert_eq!(
+        states,
+        [
+            (two.clone(), JobState::Finished),
+            (one.clone(), JobState::Running)
+        ]
+    );
+    let running = JobFilter {
+        outcome: Some(JobOutcome::Running),
+        ..JobFilter::default()
+    };
+    let page = crate::jobs::history(&hub, &running, None, 10).unwrap();
+    assert_eq!(page.rows.iter().map(|r| &r.1).collect::<Vec<_>>(), [&one]);
+    // The summary is of the stored rows.
+    assert_eq!(page.summary.matched, 2);
+}

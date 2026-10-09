@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::client::{CancelMode, JobState, JobView, Placement};
-use vk_hub_proto::job::JobResult;
+use vk_hub_proto::job::{FailureClass, JobResult};
 
 use super::{Db, append_audit, decode, encode};
 
@@ -44,6 +44,9 @@ const TRIM_SCAN: u64 = 10_000;
 
 /// How many jobs' records the history keeps by default (`job_history` in `hub.toml`).
 pub const DEFAULT_JOB_HISTORY: usize = 10_000;
+
+/// Maximum number of matching jobs in a history summary, counted newest first.
+pub const SUMMARY_JOBS: usize = 10_000;
 
 /// How often, at most, requests past [`REQUEST_KEEP`] are swept.
 const REQUEST_SWEEP_SECS: u64 = 600;
@@ -124,6 +127,118 @@ impl JobRow {
         };
         Some(end.saturating_sub(self.started_at?).saturating_mul(1000))
     }
+
+    /// The job's outcome for history filtering.
+    pub fn outcome(&self) -> JobOutcome {
+        match (self.state, &self.result) {
+            (JobState::Finished, Some(r)) => match r.failure {
+                None => JobOutcome::Success,
+                Some(FailureClass::Canceled) => JobOutcome::Canceled,
+                Some(_) => JobOutcome::Failed,
+            },
+            (JobState::Finished, None) => JobOutcome::Failed,
+            _ => JobOutcome::Running,
+        }
+    }
+}
+
+/// Job outcome used by the history filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobOutcome {
+    /// Queued, starting or running.
+    Running,
+    Success,
+    /// Ended by a failure of any class but a cancel.
+    Failed,
+    Canceled,
+}
+
+impl JobOutcome {
+    pub const ALL: [JobOutcome; 4] = [
+        JobOutcome::Running,
+        JobOutcome::Success,
+        JobOutcome::Failed,
+        JobOutcome::Canceled,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            JobOutcome::Running => "running",
+            JobOutcome::Success => "success",
+            JobOutcome::Failed => "failed",
+            JobOutcome::Canceled => "canceled",
+        }
+    }
+
+    /// The label shown in the result filter.
+    pub fn label(self) -> &'static str {
+        match self {
+            JobOutcome::Running => "Running",
+            JobOutcome::Success => "Success",
+            JobOutcome::Failed => "Failed",
+            JobOutcome::Canceled => "Canceled",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<JobOutcome> {
+        JobOutcome::ALL.into_iter().find(|o| o.name() == s)
+    }
+}
+
+/// Which jobs a page of history shows: those matching every filter set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobFilter {
+    /// The node it was sent to.
+    pub node: Option<String>,
+    /// Its GitLab project, exactly.
+    pub project: Option<String>,
+    pub outcome: Option<JobOutcome>,
+}
+
+impl JobFilter {
+    pub fn matches(&self, row: &JobRow) -> bool {
+        self.node
+            .as_ref()
+            .is_none_or(|n| row.node.as_ref() == Some(n))
+            && (self.project.as_ref()).is_none_or(|p| row.project.as_ref() == Some(p))
+            && self.outcome.is_none_or(|o| row.outcome() == o)
+    }
+}
+
+/// Summary of the newest [`SUMMARY_JOBS`] matching jobs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobSummary {
+    pub matched: usize,
+    /// More jobs match than were summed up.
+    pub capped: bool,
+    /// Those that ended, whichever way.
+    pub finished: usize,
+    pub succeeded: usize,
+    /// The median of how long the finished ones ran, in milliseconds.
+    pub median_ms: Option<u64>,
+}
+
+/// The median of `values`, the mean of the middle two for an even count.
+fn median(values: &mut [u64]) -> Option<u64> {
+    values.sort_unstable();
+    let mid = values.len() / 2;
+    match values.len() {
+        0 => None,
+        n if n % 2 == 1 => Some(values[mid]),
+        _ => Some(values[mid - 1].midpoint(values[mid])),
+    }
+}
+
+/// A page of the job history, newest first.
+#[derive(Debug, Default)]
+pub struct JobPage {
+    /// Each job's place in the history ([`JOB_ORDER`]), ID and record.
+    pub rows: Vec<(u64, String, JobRow)>,
+    /// The last job's position, used as the next page's exclusive cursor when older jobs match.
+    pub older: Option<u64>,
+    pub summary: JobSummary,
+    /// Every project in the history, sorted, for the filter's choices.
+    pub projects: Vec<String>,
 }
 
 /// A client request that created something, and what it was answered.
@@ -315,6 +430,79 @@ impl Db {
             }
         }
         Ok(out)
+    }
+
+    /// Up to `limit` matching jobs, newest first, submitted before the job at `before`.
+    /// Includes a summary of the newest [`SUMMARY_JOBS`] jobs matching `filter`.
+    pub fn job_page(
+        &self,
+        filter: &JobFilter,
+        before: Option<u64>,
+        limit: usize,
+        now: u64,
+    ) -> Result<JobPage> {
+        self.job_page_summing(filter, before, limit, now, SUMMARY_JOBS)
+    }
+
+    /// [`Db::job_page`], summing up at most the newest `summed` jobs `filter` matches. The
+    /// scan stops once the page is full, its next job found, and `summed` jobs counted, so
+    /// the filter's projects are those of the jobs read.
+    fn job_page_summing(
+        &self,
+        filter: &JobFilter,
+        before: Option<u64>,
+        limit: usize,
+        now: u64,
+        summed: usize,
+    ) -> Result<JobPage> {
+        let txn = self.db.begin_read().context("starting a read")?;
+        let table = txn.open_table(JOBS)?;
+        let order = txn.open_table(JOB_ORDER)?;
+        let mut page = JobPage::default();
+        let mut projects = std::collections::BTreeSet::new();
+        let mut ran = Vec::new();
+        for entry in order.iter()?.rev() {
+            let (seq, id) = entry?;
+            let Some(row) = table.get(id.value())? else {
+                continue;
+            };
+            // One that does not decode is left out rather than failing every page.
+            let Ok(row) = decode::<JobRow>(row.value()) else {
+                continue;
+            };
+            if let Some(p) = &row.project {
+                projects.insert(p.clone());
+            }
+            if !filter.matches(&row) {
+                continue;
+            }
+            let summary = &mut page.summary;
+            if summary.matched < summed {
+                summary.matched += 1;
+                if row.state == JobState::Finished {
+                    summary.finished += 1;
+                    summary.succeeded += usize::from(row.outcome() == JobOutcome::Success);
+                    ran.extend(row.ran_ms(now));
+                }
+            } else {
+                summary.capped = true;
+            }
+            let seq = seq.value();
+            if before.is_some_and(|b| seq >= b) {
+                continue;
+            }
+            if page.rows.len() < limit {
+                page.rows.push((seq, id.value().to_string(), row));
+            } else {
+                page.older = page.rows.last().map(|r| r.0);
+                if page.summary.capped {
+                    break;
+                }
+            }
+        }
+        page.summary.median_ms = median(&mut ran);
+        page.projects = projects.into_iter().collect();
+        Ok(page)
     }
 
     /// Job `id`'s spec as submitted, redacted.
@@ -738,6 +926,126 @@ mod tests {
         assert!(db.job_spec(&id(2)).unwrap().is_none());
         assert_eq!(expired_below(&db), Some(4));
         assert_eq!(listed(&db), [4, 3, 2, 1].map(id));
+    }
+
+    /// A page is newest first, filtered on every field set, continues before the last one
+    /// shown, and sums up every job the filter matches.
+    #[test]
+    fn a_history_page_is_filtered_and_continues() {
+        let db = Db::open_memory().unwrap();
+        let failures = [
+            None,
+            Some(FailureClass::Script),
+            Some(FailureClass::Canceled),
+        ];
+        for n in 1..=11 {
+            let failure = failures[(n % 3) as usize];
+            submit(&db, n, &job(n, JobState::Finished, failure));
+        }
+        submit(&db, 12, &job(12, JobState::Running, None));
+        let all = JobFilter::default();
+        let page = db.job_page(&all, None, 5, 100).unwrap();
+        let ids = |page: &JobPage| page.rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&page), [12, 11, 10, 9, 8].map(id));
+        assert_eq!(page.older, Some(page.rows[4].0));
+        assert_eq!(page.projects, ["p0", "p1", "p2"]);
+        assert_eq!(
+            page.summary,
+            JobSummary {
+                matched: 12,
+                capped: false,
+                finished: 11,
+                succeeded: 3,
+                // n seconds each, 1 to 11.
+                median_ms: Some(6000),
+            }
+        );
+        let next = db.job_page(&all, Some(page.rows[4].0), 5, 100).unwrap();
+        assert_eq!(ids(&next), [7, 6, 5, 4, 3].map(id));
+        let last = db.job_page(&all, Some(next.rows[4].0), 5, 100).unwrap();
+        assert_eq!(ids(&last), [2, 1].map(id));
+        assert_eq!(last.older, None);
+
+        // Project p0 is jobs 3, 6, 9 and 12; on node a…, 6 and 12.
+        let filter = JobFilter {
+            node: Some("a".repeat(32)),
+            project: Some("p0".into()),
+            outcome: None,
+        };
+        assert_eq!(
+            ids(&db.job_page(&filter, None, 5, 100).unwrap()),
+            [12, 6].map(id)
+        );
+        let failed = JobFilter {
+            outcome: Some(JobOutcome::Failed),
+            ..JobFilter::default()
+        };
+        let page = db.job_page(&failed, None, 5, 100).unwrap();
+        assert_eq!(ids(&page), [10, 7, 4, 1].map(id));
+        assert_eq!((page.summary.matched, page.summary.succeeded), (4, 0));
+        let page = db.job_page(&failed, None, 2, 100).unwrap();
+        assert_eq!(ids(&page), [10, 7].map(id));
+        let next = db.job_page(&failed, page.older, 2, 100).unwrap();
+        assert_eq!(ids(&next), [4, 1].map(id));
+        assert_eq!((next.older, next.summary.matched), (None, 4));
+        let past = db.job_page(&failed, Some(next.rows[1].0), 2, 100).unwrap();
+        assert!(past.rows.is_empty());
+        assert_eq!((past.older, past.summary.matched), (None, 4));
+        let running = JobFilter {
+            outcome: Some(JobOutcome::Running),
+            ..JobFilter::default()
+        };
+        let page = db.job_page(&running, None, 5, 100).unwrap();
+        assert_eq!(ids(&page), [id(12)]);
+        assert_eq!(page.summary.median_ms, None);
+        // Running for 88 seconds of the hub's clock.
+        assert_eq!(page.rows[0].2.ran_ms(100), Some(88_000));
+
+        // A row that does not decode is left out.
+        let txn = db.db.begin_write().unwrap();
+        txn.open_table(JOBS)
+            .unwrap()
+            .insert(id(5).as_str(), b"not json".as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+        let page = db.job_page(&all, None, 20, 100).unwrap();
+        assert_eq!(page.rows.len(), 11);
+        assert!(!ids(&page).contains(&id(5)));
+    }
+
+    /// The summary is of the newest jobs the filter matches, up to its bound, and says when
+    /// more match; the page past them is still served.
+    #[test]
+    fn a_history_page_sums_up_a_bounded_number_of_jobs() {
+        let db = Db::open_memory().unwrap();
+        for n in 1..=11 {
+            let failure = (n % 3 != 0).then_some(FailureClass::Script);
+            submit(&db, n, &job(n, JobState::Finished, failure));
+        }
+        submit(&db, 12, &job(12, JobState::Running, None));
+        let all = JobFilter::default();
+        let ids = |page: &JobPage| page.rows.iter().map(|r| r.1.clone()).collect::<Vec<_>>();
+        let page = db.job_page_summing(&all, None, 2, 100, 5).unwrap();
+        assert_eq!(ids(&page), [12, 11].map(id));
+        assert_eq!(page.older, Some(page.rows[1].0));
+        assert_eq!(
+            page.summary,
+            JobSummary {
+                matched: 5,
+                capped: true,
+                finished: 4,
+                succeeded: 1,
+                // Jobs 8 to 11 ran 8 to 11 seconds: the mean of the middle two.
+                median_ms: Some(9500),
+            }
+        );
+        let deep = db
+            .job_page_summing(&all, Some(page.rows[1].0 - 4), 2, 100, 5)
+            .unwrap();
+        assert_eq!(ids(&deep), [6, 5].map(id));
+        assert_eq!(deep.summary, page.summary);
+        let whole = db.job_page_summing(&all, None, 2, 100, 12).unwrap();
+        assert_eq!((whole.summary.matched, whole.summary.capped), (12, false));
     }
 
     /// The node's own measure of a job's run wins over the hub's timestamps.

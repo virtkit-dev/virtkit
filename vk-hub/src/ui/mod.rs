@@ -66,6 +66,7 @@ mod body;
 mod dev;
 mod fleet;
 pub mod html;
+mod jobs;
 mod local;
 mod multipart;
 mod oidc;
