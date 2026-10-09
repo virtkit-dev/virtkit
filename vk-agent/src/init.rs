@@ -143,6 +143,8 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     info!("vk-agent init: PID {} ({socket})", std::process::id());
     // SAFETY: single-threaded here (no tokio, no serve fork yet).
     unsafe { std::env::set_var("PATH", DEFAULT_PATH) };
+    // Before forking, so every guest process inherits the limit.
+    raise_nofile_hard_limit();
 
     // The boot config rides the initramfs, which the pivot below hides — read it first.
     let boot_config = read_boot_config();
@@ -235,6 +237,43 @@ pub fn run_init(socket: &SocketAddr, inactivity_timeout: Option<u64>) -> Result<
     // Catch a host power-button press (the stop fallback when the exec channel is gone).
     crate::button::watch_power_button();
     supervise(serve)
+}
+
+/// The open-file hard limit PID 1 hands down, as systemd sets it (`DefaultLimitNOFILE`).
+const NOFILE_HARD: libc::rlim_t = 524_288;
+
+/// Keep the soft limit for `select()` users; raise the hard limit to at least [`NOFILE_HARD`].
+fn nofile_limits(soft: libc::rlim_t, hard: libc::rlim_t) -> (libc::rlim_t, libc::rlim_t) {
+    (soft, hard.max(NOFILE_HARD))
+}
+
+/// Raise `RLIMIT_NOFILE`'s hard limit from the kernel's 4096 for the whole guest. Nothing
+/// else does in an agent-init guest, so a nested `vk`, which lifts its soft limit to the
+/// hard one, can serve a source tree over virtio-fs.
+fn raise_nofile_hard_limit() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit read/write only the `rlimit` we pass.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return;
+    }
+    let (cur, max) = nofile_limits(lim.rlim_cur, lim.rlim_max);
+    if max == lim.rlim_max {
+        return;
+    }
+    let lim = libc::rlimit {
+        rlim_cur: cur,
+        rlim_max: max,
+    };
+    // SAFETY: as above.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } != 0 {
+        warn!(
+            "vk-agent init: raising the open-file hard limit to {max} failed: {}",
+            io::Error::last_os_error()
+        );
+    }
 }
 
 /// When booted from the agent-only initramfs, mount the real root (an ext4 named by
@@ -3459,6 +3498,14 @@ mod tests {
         assert_eq!(m.get("VIRTKIT_HOSTNAME").unwrap(), "runner");
         assert_eq!(m.get("VIRTKIT_VM_DNS").unwrap(), "1.1.1.1,8.8.8.8");
         assert!(!m.contains_key("ro"));
+    }
+
+    #[test]
+    fn nofile_limits_raise_the_hard_limit_only() {
+        assert_eq!(nofile_limits(1024, 4096), (1024, NOFILE_HARD));
+        // Never lowered, and the soft limit is left alone.
+        assert_eq!(nofile_limits(4096, 1 << 20), (4096, 1 << 20));
+        assert_eq!(nofile_limits(1024, NOFILE_HARD), (1024, NOFILE_HARD));
     }
 
     #[test]

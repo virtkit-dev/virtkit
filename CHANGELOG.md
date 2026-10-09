@@ -183,6 +183,11 @@ All notable changes to virtkit will be documented in this file.
   kept every old one on the jobs' disk. `vk node` now evicts them when it starts and every ten
   minutes, as does each job's cleanup, and says how many went and how much space they held.
   An image a job or VM is using is never evicted.
+- **Guests give their processes an open-file hard limit of 524288, as systemd does.** Under
+  virtkit's own init they kept the kernel's 4096, so a `vk` run inside a guest, such as a
+  dev VM in an interactive box or a nested CI job, ran out of descriptors serving a source
+  tree to its own guest, where builds such as cargo's then failed with "Too many open files".
+  The soft limit stays at 1024.
 - **`vk-registry` admits more connections, and asks clients past its per-host cap to come
   back.** It serves 4096 connections at once and 1024 from one client address by default,
   up from 1024 and 256; `max_connections` and `max_connections_per_client` in its config
