@@ -2732,8 +2732,10 @@ pub fn cleanup(ctx: &JobCtx) -> Result<()> {
         Err(e) => Err(e).with_context(|| format!("removing {}", ctx.job_dir.display())),
     };
     // A job killed mid-build leaves its staging dir behind, and nothing else may build here
-    // again for a while: reclaim what dead jobs left, this one's included.
+    // again for a while: reclaim what dead jobs left, this one's included. Likewise images
+    // idle past the cache's window, which otherwise go only when a job misses the cache.
     crate::image::sweep_orphaned_staging(ctx.cfg.state_dir(), crate::image::Leftovers::Quiet);
+    crate::image::evict_idle_images(ctx.cfg.state_dir(), ctx.cfg.image_cache_idle());
     removed
 }
 

@@ -501,15 +501,98 @@ pub(crate) fn acquire_use_lock_for(
     )?))
 }
 
+/// What [`gc_idle`] evicted.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Evicted {
+    pub(crate) bases: u64,
+    /// The disk space they held.
+    pub(crate) bytes: u64,
+}
+
 /// Evict every materialized base under `root` that no process is overlaying and that has
-/// been idle at least `idle`, on [`crate::cachelock`]'s protocol. Best-effort.
-pub(crate) fn gc_idle(root: &Path, idle: std::time::Duration) {
+/// been idle at least `idle`, on [`crate::cachelock`]'s protocol, and say once what went.
+/// Bases are found without following a symlink or leaving the tier root's filesystem, and
+/// removed through descriptors (see [`vk_fs::remove_tree_in`]): no symlink inside followed,
+/// nothing mounted inside entered, nothing another user owns removed. Best-effort.
+pub(crate) fn gc_idle(root: &Path, idle: std::time::Duration) -> Evicted {
     let now = std::time::SystemTime::now();
+    let mut evicted = Evicted::default();
     for base in base_dirs(root) {
         crate::cachelock::try_reclaim(&base.join(".inuse"), &base.join(".used"), idle, now, || {
-            println!("virtkit: evicting idle image base {}", base.display());
-            let _ = std::fs::remove_dir_all(&base);
+            match remove_base(&base) {
+                Ok(bytes) => {
+                    evicted.bases += 1;
+                    evicted.bytes = evicted.bytes.saturating_add(bytes);
+                }
+                Err(e) => eprintln!("virtkit: evicting {}: {e:#}", base.display()),
+            }
         });
+    }
+    if evicted.bases > 0 {
+        println!(
+            "virtkit: evicted {} idle image(s) under {}, {}",
+            evicted.bases,
+            root.display(),
+            crate::usage::fmt_bytes(evicted.bytes)
+        );
+    }
+    evicted
+}
+
+/// Remove `base` and return the space it held. Remove its image first so interrupted removal
+/// leaves a cache miss, never a hit on a half-removed image.
+fn remove_base(base: &Path) -> Result<u64> {
+    use std::os::fd::{AsFd, AsRawFd};
+
+    let (Some(parent), Some(name)) = (base.parent(), base.file_name()) else {
+        bail!("{} names no entry", base.display());
+    };
+    let parent = vk_fs::open_dir(parent)?;
+    let dir = vk_fs::open_dir_in(parent.as_fd(), name)?;
+    let mut bytes = 0u64;
+    // SAFETY: geteuid(2) has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    for image in ["runner.ext4", crate::ensure::UNIT_IMAGE] {
+        let image = std::ffi::OsStr::new(image);
+        // Another user's is left to the tree removal, which reports it.
+        let Some(st) = stat_in(dir.as_fd(), image).filter(|st| st.st_uid == me) else {
+            continue;
+        };
+        let c_image = std::ffi::CString::new(image.as_bytes())?;
+        // SAFETY: the descriptor is live and the name NUL-terminated.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), c_image.as_ptr(), 0) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e).with_context(|| format!("removing {}", base.join(image).display()));
+            }
+        } else if st.st_nlink <= 1 {
+            let held = u64::try_from(st.st_blocks).unwrap_or(0).saturating_mul(512);
+            bytes = bytes.saturating_add(held);
+        }
+    }
+    let done = vk_fs::remove_tree_in(parent.as_fd(), name, dir.as_fd())?;
+    if !done.skipped.is_empty() {
+        let kept: Vec<_> = done
+            .skipped
+            .iter()
+            .map(|p| base.with_file_name(p).display().to_string())
+            .collect();
+        bail!(
+            "left in place (a mount, another filesystem or another user's): {}",
+            kept.join(", ")
+        );
+    }
+    Ok(bytes.saturating_add(done.bytes))
+}
+
+/// Run [`gc_idle`] on the job image tiers under `state_dir`: pulled `virtkit/` bundles,
+/// pulled docker images and built stages. Also remove chunks no bundle references.
+pub(crate) fn evict_idle_images(state_dir: &Path, idle: std::time::Duration) {
+    let registry = state_dir.join("registry");
+    gc_idle(&registry, idle);
+    sweep_chunks(&registry);
+    for tier in ["docker", "build"] {
+        gc_idle(&state_dir.join(tier), idle);
     }
 }
 
@@ -525,7 +608,13 @@ fn is_base_dir(dir: &Path) -> bool {
 }
 
 fn base_dirs(root: &Path) -> Vec<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
     let mut out = Vec::new();
+    // Allow an operator's symlink to the root, but keep the walk on that filesystem.
+    let Ok(dev) = std::fs::metadata(root).map(|m| m.dev()) else {
+        return out;
+    };
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         if is_base_dir(&dir) {
@@ -536,9 +625,9 @@ fn base_dirs(root: &Path) -> Vec<PathBuf> {
             continue;
         };
         for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
+            // The entry itself: a symlink is not walked into, nor another filesystem.
+            if e.metadata().is_ok_and(|m| m.is_dir() && m.dev() == dev) {
+                stack.push(e.path());
             }
         }
     }
@@ -838,7 +927,7 @@ impl TmpSweep {
                         .map(|p| at.with_file_name(p).display().to_string())
                         .collect();
                     swept.left.push(format!(
-                        "{}: left in place, a mount, on another filesystem or another user's: {}",
+                        "{}: left in place (a mount, another filesystem or another user's): {}",
                         at.display(),
                         kept.join(", ")
                     ));
@@ -1185,6 +1274,19 @@ mod tests {
         }
     }
 
+    /// `len` bytes no filesystem compresses below `len`, for a test that counts space freed.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
     /// Date `dir` an hour back, past any grace.
     fn age(dir: &Path) {
         let then = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
@@ -1203,7 +1305,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let dead = root.join("dead.tmp");
         std::fs::create_dir_all(dead.join(".build-1-0-x")).unwrap();
-        std::fs::write(dead.join(".build-1-0-x/stage.ext4"), vec![1u8; 64 * 1024]).unwrap();
+        std::fs::write(dead.join(".build-1-0-x/stage.ext4"), noise(64 * 1024)).unwrap();
         age(&dead.join(".build-1-0-x"));
         age(&dead);
         // A build in flight holds the pull lock of the dir it promotes to...
@@ -1490,6 +1592,87 @@ mod tests {
                 .is_none()
         );
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // What the node's periodic sweep runs: idle bases of both tiers go, counted; a base in
+    // use, one used within the window, and one reached only through a symlink stay.
+    #[test]
+    fn evict_idle_images_counts_what_went_and_follows_no_symlink() {
+        use std::time::{Duration, SystemTime};
+        let tmp = std::env::temp_dir().join(format!("vk-evict-idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let state = tmp.join("state");
+        let base = |dir: PathBuf, idle_for: Duration| -> PathBuf {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("runner.ext4"), noise(64 * 1024)).unwrap();
+            mark_used(&dir);
+            std::fs::File::open(dir.join(".used"))
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(SystemTime::now() - idle_for))
+                .unwrap();
+            dir
+        };
+        let hour = Duration::from_secs(3600);
+        let idle_build = base(state.join("build").join("fp"), hour);
+        let idle_docker = base(state.join("docker").join("img").join("d1"), hour);
+        let recent = base(state.join("docker").join("img").join("d2"), Duration::ZERO);
+        let busy = base(state.join("build").join("busy"), hour);
+        let guard = acquire_use_lock_for(&state, &busy.join("runner.ext4"))
+            .unwrap()
+            .unwrap();
+        // Re-dated by the acquisition: age it again, so only the reference keeps it.
+        std::fs::File::open(busy.join(".used"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::now() - hour))
+            .unwrap();
+        let outside = base(tmp.join("outside").join("fp"), hour);
+        std::os::unix::fs::symlink(tmp.join("outside"), state.join("build").join("link")).unwrap();
+
+        // Retried for the reason `cachelock::reclaimed_eventually` documents.
+        let mut build = Evicted::default();
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            let once = gc_idle(&state.join("build"), Duration::from_secs(1800));
+            build.bases += once.bases;
+            build.bytes += once.bytes;
+            !idle_build.exists()
+        }));
+        assert_eq!(build.bases, 1);
+        assert!(build.bytes >= 64 * 1024, "{}", build.bytes);
+        assert!(crate::cachelock::reclaimed_eventually(|| {
+            evict_idle_images(&state, Duration::from_secs(1800));
+            !idle_docker.exists()
+        }));
+        assert!(!idle_build.exists());
+        assert!(!idle_docker.exists());
+        assert!(recent.exists(), "a base used within the window must stay");
+        assert!(busy.exists(), "a base in use must stay");
+        assert!(outside.exists(), "a base behind a symlink must stay");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // The image goes first: a removal that stops part-way leaves a cache miss, not a base that
+    // still looks whole. A dir this user cannot empty stops it, unless the test runs as root.
+    #[test]
+    fn remove_base_takes_the_image_before_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("vk-remove-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let base = tmp.join("img").join("d1");
+        std::fs::create_dir_all(base.join("a-locked")).unwrap();
+        std::fs::write(base.join("a-locked/f"), b"x").unwrap();
+        std::fs::write(base.join("runner.ext4"), noise(64 * 1024)).unwrap();
+        let locked = base.join("a-locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = remove_base(&base);
+        assert!(!base.join("runner.ext4").exists(), "{result:?}");
+        if base.exists() {
+            assert!(result.is_err());
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        } else {
+            assert!(result.unwrap() >= 64 * 1024);
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

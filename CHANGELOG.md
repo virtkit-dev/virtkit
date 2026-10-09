@@ -128,6 +128,12 @@ All notable changes to virtkit will be documented in this file.
   `vk run`'s image builds and pulls, and those of a CI job no longer leave their working files
   for a later sweep when cancelled, wherever the signal would otherwise have ended them on the
   spot.
+- **Images no job uses leave a node even when every job hits the cache.** Built and pulled job
+  images idle past `image_cache_idle_secs` (30 minutes by default) were evicted only when a job
+  needed an image the node did not have, or by `vk gc`, so a node whose jobs all reused theirs
+  kept every old one on the jobs' disk. `vk node` now evicts them when it starts and every ten
+  minutes, as does each job's cleanup, and says how many went and how much space they held.
+  An image a job or VM is using is never evicted.
 - **`vk-registry` admits more connections, and asks clients past its per-host cap to come
   back.** It serves 4096 connections at once and 1024 from one client address by default,
   up from 1024 and 256; `max_connections` and `max_connections_per_client` in its config

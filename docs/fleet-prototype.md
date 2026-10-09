@@ -828,6 +828,14 @@ host, so a `state_dir` must not be shared between hosts. A build or pull stopped
 (a cancelled job) while that signal is at its default action removes its staging dir itself
 before it exits.
 
+**Idle images.** At startup, every ten minutes and on each `vk gitlab cleanup`, the node
+sweeps dead builds' staging dirs and evicts unreferenced built and pulled images under
+`<state_dir>/{registry,docker,build}` after `image_cache_idle_secs` (30 minutes by default),
+as `vk gc` does. This frees old images from the jobs' filesystem even when every job hits
+the cache. A job, its VM and its services hold references to their images for as long as
+they run; the idle window starts when the last reference is released. One line per tier
+reports the number of evicted images and the space they held.
+
 **Stages.** gitlab-runner's order and words: `prepare_executor`, `prepare_script`,
 `get_sources` (`GET_SOURCES_ATTEMPTS`), `restore_cache` (`RESTORE_CACHE_ATTEMPTS`),
 `download_artifacts` (`ARTIFACT_DOWNLOAD_ATTEMPTS`), each `step_<name>` (under
