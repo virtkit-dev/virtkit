@@ -37,7 +37,7 @@ use vk_hub_proto::{NodeState, Outcome, UpdatePhase};
 
 use super::core::Core;
 use super::session::{Node, now_secs};
-use super::state::{Job, Persisted, Release, Trial};
+use super::state::{Job, Persisted, Trial};
 use crate::config::Config;
 
 /// How many times a release on trial may be started before the previous binary takes the
@@ -522,7 +522,7 @@ async fn prepare(core: &Core, cfg: &Config, node: &Node, job: &Job) -> Result<()
     let release = job.release().context("the job is no update")?.clone();
     // Validated when the command was accepted; checked again because the job comes back from
     // the state file across restarts.
-    let digest = vk_hub_proto::from_hex_lower::<{ vk_hub_proto::SHA256_LEN }>(&release.sha256)
+    vk_hub_proto::from_hex_lower::<{ vk_hub_proto::SHA256_LEN }>(&release.sha256)
         .with_context(|| format!("the release's sha256 {:?} is not valid", release.sha256))?;
     if own_sha256().as_deref() == Some(release.sha256.as_str()) {
         say!("already running release {}", release.sha256);
@@ -571,7 +571,14 @@ async fn prepare(core: &Core, cfg: &Config, node: &Node, job: &Job) -> Result<()
         Err(_) => {
             say!("downloading vk {} ({})", release.version, release.sha256);
             let download = async {
-                tokio::time::timeout(DOWNLOAD_TIMEOUT, download(node, &release, &digest, &next))
+                let fetch = Fetch {
+                    kind: Kind::Release,
+                    sha256: &release.sha256,
+                    size: release.size,
+                    // Executable by this user alone, like everything under the node dir.
+                    mode: 0o700,
+                };
+                tokio::time::timeout(DOWNLOAD_TIMEOUT, download(node, &fetch, &next))
                     .await
                     .map_err(|_| anyhow!("the download took longer than {DOWNLOAD_TIMEOUT:?}"))?
             };
@@ -935,16 +942,54 @@ impl Drop for KillGroup {
     }
 }
 
-/// Fetch `release` from the hub into `dest`, published only once it checks out.
-async fn download(
-    node: &Node,
-    release: &Release,
-    digest: &[u8; vk_hub_proto::SHA256_LEN],
-    dest: &Path,
-) -> Result<()> {
-    let dir = dest.parent().context("the release has no directory")?;
-    let tmp = dir.join(format!(".{}.{}.tmp", release.sha256, std::process::id()));
-    let outcome = download_into(node, release, digest, &tmp)
+/// What a node downloads from its hub by digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    /// A `vk` release.
+    Release,
+    /// A CI tools definition.
+    #[cfg_attr(not(test), expect(dead_code, reason = "fleet CI tools fetch it next"))]
+    Tools,
+}
+
+/// Build the signed message from the node ID, digest, time and channel.
+type SignFn = fn(&str, &[u8; vk_hub_proto::SHA256_LEN], u64, vk_hub_proto::Channel<'_>) -> Vec<u8>;
+
+impl Kind {
+    /// Where the hub serves it, the sha256 to follow, and what the node signs to download it.
+    fn endpoint(self) -> (&'static str, SignFn) {
+        match self {
+            Self::Release => (vk_hub_proto::RELEASE_PATH, vk_hub_proto::download_message),
+            Self::Tools => (
+                vk_hub_proto::TOOLS_PATH,
+                vk_hub_proto::tools_download_message,
+            ),
+        }
+    }
+}
+
+/// A file a node downloads from its hub by digest.
+pub(super) struct Fetch<'a> {
+    pub kind: Kind,
+    /// Its sha256, lowercase hex.
+    pub sha256: &'a str,
+    /// Maximum size in bytes.
+    pub size: u64,
+    /// The permission bits it is published with.
+    pub mode: u32,
+}
+
+/// Download `fetch` from the hub, publishing it at `dest` after validation.
+/// Only individual reads time out; callers must bound the whole transfer.
+pub(super) async fn download(node: &Node, fetch: &Fetch<'_>, dest: &Path) -> Result<()> {
+    let digest = vk_hub_proto::from_hex_lower::<{ vk_hub_proto::SHA256_LEN }>(fetch.sha256)
+        .with_context(|| format!("the sha256 {:?} is not valid", fetch.sha256))?;
+    if fetch.mode & !0o777 != 0 {
+        bail!("mode {:o} is more than permission bits", fetch.mode);
+    }
+    let dir = dest.parent().context("the download has no directory")?;
+    let tmp = dir.join(format!(".{}.{}.tmp", fetch.sha256, std::process::id()));
+    let outcome = download_into(node, fetch, &digest, &tmp)
         .await
         .and_then(|()| {
             std::fs::rename(&tmp, dest)
@@ -956,7 +1001,7 @@ async fn download(
             Ok(())
         });
     if outcome.is_err() {
-        // Best effort: the error is what matters, and `sweep_partial` takes what is left.
+        // Best-effort cleanup preserves the download error; the caller's sweep handles leftovers.
         let _ = std::fs::remove_file(&tmp);
     }
     outcome
@@ -964,7 +1009,7 @@ async fn download(
 
 async fn download_into(
     node: &Node,
-    release: &Release,
+    fetch: &Fetch<'_>,
     digest: &[u8; vk_hub_proto::SHA256_LEN],
     tmp: &Path,
 ) -> Result<()> {
@@ -983,15 +1028,14 @@ async fn download_into(
     };
     let at = now_secs();
     let node_id = &node.enrollment.node_id;
-    let signature = node.identity.sign(&vk_hub_proto::download_message(
-        node_id, digest, at, channel,
-    ));
+    let (path, sign) = fetch.kind.endpoint();
+    let signature = node.identity.sign(&sign(node_id, digest, at, channel));
     let (mut sender, conn) =
         hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
             .await
             .context("opening the download")?;
     let driver = tokio::spawn(conn);
-    let request = hyper::Request::get(format!("{}{}", vk_hub_proto::RELEASE_PATH, release.sha256))
+    let request = hyper::Request::get(format!("{path}{}", fetch.sha256))
         .header(hyper::header::HOST, authority)
         .header(vk_hub_proto::NODE_HEADER, node_id.as_str())
         .header(vk_hub_proto::TIME_HEADER, at.to_string())
@@ -1001,7 +1045,7 @@ async fn download_into(
     let resp = sender
         .send_request(request)
         .await
-        .context("asking the hub for the release")?;
+        .context("asking the hub for the download")?;
     let status = resp.status();
     let mut body = resp.into_body();
     if !status.is_success() {
@@ -1027,16 +1071,16 @@ async fn download_into(
             .await
             .map_err(|_| anyhow!("the hub sent nothing for {READ_TIMEOUT:?}"))?;
         let Some(frame) = frame else { break };
-        let frame = frame.context("downloading the release")?;
+        let frame = frame.context("reading the download")?;
         let Ok(data) = frame.into_data() else {
             continue;
         };
         written = written.saturating_add(data.len() as u64);
-        if written > release.size {
+        if written > fetch.size {
             driver.abort();
             bail!(
                 "the download is longer than the {} bytes the command named",
-                release.size
+                fetch.size
             );
         }
         hasher.update(&data);
@@ -1045,14 +1089,13 @@ async fn download_into(
     }
     driver.abort();
     let got = vk_hub_proto::to_hex(&hasher.finalize());
-    if got != release.sha256 {
+    if got != fetch.sha256 {
         bail!(
             "the download hashes to {got}, not the {} the command named",
-            release.sha256
+            fetch.sha256
         );
     }
-    // Executable by this user alone, like everything under the node dir.
-    file.set_permissions(std::fs::Permissions::from_mode(0o700))
+    file.set_permissions(std::fs::Permissions::from_mode(fetch.mode & 0o777))
         .with_context(|| format!("setting the mode on {}", tmp.display()))?;
     file.sync_all()
         .with_context(|| format!("flushing {}", tmp.display()))?;
@@ -1183,10 +1226,10 @@ fn sweep_staging(to: &Path) {
     }
 }
 
-/// Remove what a download cut short left in the releases directory. Nothing else writes
-/// there, and one `vk node` runs per node dir.
-fn sweep_partial(releases: &Path) {
-    let Ok(entries) = std::fs::read_dir(releases) else {
+/// Remove interrupted [`download`] files: all dot-named entries in `dir`.
+/// Requires a directory with no other dot-named entries or other `vk node` downloading into it.
+pub(super) fn sweep_partial(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -1220,7 +1263,7 @@ fn prune(dir: &Path, keep: &[Option<String>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::state::Issuer;
+    use crate::node::state::{Issuer, Release};
     use std::sync::Mutex;
     use vk_hub_proto::{Command, Operation, RunnerState};
 
@@ -1663,10 +1706,23 @@ mod tests {
         }
     }
 
-    /// The hub's side of one download: answer `status` with `body`. Returns whether the
-    /// request carried the node's signature over what it asked for.
+    /// The hub's side of one release download: answer `status` with `body`. Returns whether
+    /// the request carried the node's signature over what it asked for.
     async fn serve_once(
         listener: &tokio::net::TcpListener,
+        public_key: &[u8],
+        status: &str,
+        body: &[u8],
+    ) -> bool {
+        let (path, sign) = Kind::Release.endpoint();
+        serve_once_at(listener, path, sign, public_key, status, body).await
+    }
+
+    /// [`serve_once`] for a download served under `path` and checked against `sign`.
+    async fn serve_once_at(
+        listener: &tokio::net::TcpListener,
+        served_at: &str,
+        sign: SignFn,
         public_key: &[u8],
         status: &str,
         body: &[u8],
@@ -1679,7 +1735,7 @@ mod tests {
         }
         let head = String::from_utf8(head).unwrap();
         let path = head.split_whitespace().nth(1).unwrap();
-        let sha256 = path.strip_prefix(vk_hub_proto::RELEASE_PATH).unwrap();
+        let sha256 = path.strip_prefix(served_at).unwrap();
         let header = |name: &str| {
             head.lines()
                 .find_map(|l| {
@@ -1690,7 +1746,7 @@ mod tests {
                 })
                 .unwrap()
         };
-        let message = vk_hub_proto::download_message(
+        let message = sign(
             &header(vk_hub_proto::NODE_HEADER),
             &vk_hub_proto::from_hex_lower(sha256).unwrap(),
             header(vk_hub_proto::TIME_HEADER).parse().unwrap(),
@@ -1710,6 +1766,16 @@ mod tests {
         verified
     }
 
+    /// How an update fetches `release`.
+    fn fetch_of(release: &Release) -> Fetch<'_> {
+        Fetch {
+            kind: Kind::Release,
+            sha256: &release.sha256,
+            size: release.size,
+            mode: 0o700,
+        }
+    }
+
     /// Signed for, and kept only whole: a download longer than the command said, one that
     /// hashes to something else and one the hub refuses leave nothing behind.
     #[tokio::test(flavor = "multi_thread")]
@@ -1725,11 +1791,11 @@ mod tests {
             size: bytes.len() as u64,
             signature: None,
         };
-        let digest = vk_hub_proto::from_hex_lower(&release.sha256).unwrap();
         let dest = releases_dir(&dir).join(&release.sha256);
+        let fetch = fetch_of(&release);
         let (verified, got) = tokio::join!(
             serve_once(&listener, &key, "200 OK", &bytes),
-            download(&node, &release, &digest, &dest)
+            download(&node, &fetch, &dest)
         );
         got.unwrap();
         assert!(verified);
@@ -1744,9 +1810,10 @@ mod tests {
             size: release.size - 1,
             ..release.clone()
         };
+        let short_fetch = fetch_of(&short);
         let (_, got) = tokio::join!(
             serve_once(&listener, &key, "200 OK", &bytes),
-            download(&node, &short, &digest, &dest)
+            download(&node, &short_fetch, &dest)
         );
         let err = format!("{:#}", got.unwrap_err());
         assert!(err.contains("longer than"), "{err}");
@@ -1755,7 +1822,7 @@ mod tests {
         other[0] = b'?';
         let (_, got) = tokio::join!(
             serve_once(&listener, &key, "200 OK", &other),
-            download(&node, &release, &digest, &dest)
+            download(&node, &fetch, &dest)
         );
         let err = format!("{:#}", got.unwrap_err());
         assert!(err.contains("hashes to"), "{err}");
@@ -1763,7 +1830,7 @@ mod tests {
         let refusal = br#"{"error":"this node has no update to that release under way"}"#;
         let (_, got) = tokio::join!(
             serve_once(&listener, &key, "403 Forbidden", refusal),
-            download(&node, &release, &digest, &dest)
+            download(&node, &fetch, &dest)
         );
         let err = format!("{:#}", got.unwrap_err());
         assert!(
@@ -1771,6 +1838,58 @@ mod tests {
             "{err}"
         );
         assert!(releases_left(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tools downloads use the tools path and a signature distinct from release downloads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tools_definition_is_downloaded_under_its_own_signature() {
+        let dir = scratch("tools-download");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node = node_of(&dir, listener.local_addr().unwrap());
+        let key = node.identity.public_key().to_vec();
+        let bytes = b"a tar".to_vec();
+        let sha256 = sha(&bytes);
+        let fetch = Fetch {
+            kind: Kind::Tools,
+            sha256: &sha256,
+            size: bytes.len() as u64,
+            mode: 0o600,
+        };
+        let dest = dir.join(format!(".{sha256}.tar"));
+        let (verified, got) = tokio::join!(
+            serve_once_at(
+                &listener,
+                vk_hub_proto::TOOLS_PATH,
+                vk_hub_proto::tools_download_message,
+                &key,
+                "200 OK",
+                &bytes
+            ),
+            download(&node, &fetch, &dest)
+        );
+        got.unwrap();
+        assert!(verified);
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_file(&dest).unwrap();
+
+        let (verified, got) = tokio::join!(
+            serve_once_at(
+                &listener,
+                vk_hub_proto::TOOLS_PATH,
+                vk_hub_proto::download_message,
+                &key,
+                "200 OK",
+                &bytes
+            ),
+            download(&node, &fetch, &dest)
+        );
+        got.unwrap();
+        assert!(!verified);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
