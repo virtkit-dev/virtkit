@@ -87,6 +87,15 @@ pub struct CiJob {
 }
 
 impl CiJob {
+    /// The job's page on its GitLab, if one can be named ([`crate::gitlab_job_url`]).
+    pub fn job_url(&self) -> Option<String> {
+        crate::gitlab_job_url(
+            &self.server_url,
+            &self.job.project_path,
+            &self.job.id.to_string(),
+        )
+    }
+
     /// This job with every secret replaced, fit for a log.
     pub fn redacted(&self) -> CiJob {
         const HIDDEN: &str = "[MASKED]";

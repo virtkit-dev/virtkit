@@ -2834,6 +2834,7 @@ mod tests {
             started_at: Some(5),
             ssh_alias: Some(hostile.into()),
             guest_workspace: Some(hostile.into()),
+            job_url: Some(format!("https://gitlab.example.com/{hostile}")),
         };
         let report = |n: usize, omitted| Report {
             workloads: Some((0..n).map(workload).collect()),
@@ -2860,7 +2861,10 @@ mod tests {
             assert_eq!(s, "a[2J<b>");
         }
         // What a link is built of is dropped rather than altered.
-        assert_eq!((&w.ssh_alias, &w.guest_workspace), (&None, &None));
+        assert_eq!(
+            (&w.ssh_alias, &w.guest_workspace, &w.job_url),
+            (&None, &None, &None)
+        );
         // The next report replaces the list; a node stopping its VMs empties it; a report
         // that has not looked yet leaves the last one.
         db.record_report(&id, report(0, 0), 3).unwrap();
@@ -2878,6 +2882,7 @@ mod tests {
             environment: long(),
             ssh_alias: long(),
             guest_workspace: long(),
+            job_url: long(),
             ..workload(i)
         };
         let n = MAX_WORKLOADS;

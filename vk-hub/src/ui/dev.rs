@@ -264,6 +264,7 @@ pub(super) mod tests {
             started_at: None,
             ssh_alias: None,
             guest_workspace: None,
+            job_url: None,
         }
     }
 

@@ -392,6 +392,48 @@ pub fn from_base64(s: &str) -> Option<Vec<u8>> {
 /// The longest string of a host's that is kept for display.
 pub const MAX_DISPLAY: usize = 256;
 
+/// Whether `url` is fit for a page to link to: an absolute `https://` or `http://` URL — a
+/// GitLab on a private network is often served over plain http — with a host and no
+/// userinfo, of printable ASCII but for quotes, angle brackets, backslashes and backticks,
+/// and at most [`MAX_DISPLAY`] bytes. Anything else — another scheme, a relative URL, one a
+/// browser would read differently from how it reads — is not a link.
+pub fn is_web_link(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    url.len() <= MAX_DISPLAY
+        && !authority.is_empty()
+        && !authority.starts_with(':')
+        && !authority.contains('@')
+        && url.bytes().all(|b| {
+            b.is_ascii_graphic() && !matches!(b, b'"' | b'\'' | b'<' | b'>' | b'\\' | b'`')
+        })
+}
+
+/// GitLab's page for job `job_id` of the project at `project_path` on the GitLab at
+/// `server_url`, `<server_url>/<project_path>/-/jobs/<job_id>`: `None` unless the job ID is a
+/// number, the path is one GitLab gives, and the result [`is_web_link`].
+pub fn gitlab_job_url(server_url: &str, project_path: &str, job_id: &str) -> Option<String> {
+    let server = server_url.trim_end_matches('/');
+    let path_ok = !project_path.is_empty()
+        && project_path.split('/').all(|c| {
+            !c.is_empty()
+                && c != "."
+                && c != ".."
+                && c.chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        });
+    let id_ok = !job_id.is_empty() && job_id.bytes().all(|b| b.is_ascii_digit());
+    if !path_ok || !id_ok || server.contains(['?', '#']) {
+        return None;
+    }
+    Some(format!("{server}/{project_path}/-/jobs/{job_id}")).filter(|u| is_web_link(u))
+}
+
 /// `s` made safe to print, cut to [`MAX_DISPLAY`] characters. Dropped: control characters
 /// and the [`invisible`] ones.
 pub fn display_safe(s: &str) -> String {
@@ -985,6 +1027,10 @@ pub struct Workload {
     /// display-safe as it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guest_workspace: Option<String>,
+    /// A CI job's page on its GitLab; `None` where `vk` cannot tell, and when it is not a
+    /// link a page may open ([`is_web_link`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_url: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1012,8 +1058,8 @@ pub fn is_workload_id(id: &str) -> bool {
 
 /// Make `w` fit to show: every string [`display_safe`], except the SSH alias and guest
 /// workspace, which are put into a link as they are and so are dropped rather than altered
-/// when not display-safe already. `false` when its ID is not one `vk` gives
-/// ([`is_workload_id`]): such a workload is not to be listed.
+/// when not display-safe already, and the job's URL, dropped unless [`is_web_link`]. `false`
+/// when its ID is not one `vk` gives ([`is_workload_id`]): such a workload is not to be listed.
 pub fn make_display_safe(w: &mut Workload) -> bool {
     if !is_workload_id(&w.id) {
         return false;
@@ -1036,6 +1082,9 @@ pub fn make_display_safe(w: &mut Workload) -> bool {
         if s.as_deref().is_some_and(|v| display_safe(v) != v) {
             *s = None;
         }
+    }
+    if w.job_url.as_deref().is_some_and(|u| !is_web_link(u)) {
+        w.job_url = None;
     }
     true
 }
@@ -1156,6 +1205,7 @@ mod tests {
             started_at: Some(1_800_000_000),
             ssh_alias: None,
             guest_workspace: None,
+            job_url: None,
         }
     }
 
@@ -1197,6 +1247,7 @@ mod tests {
             started_at: None,
             ssh_alias: None,
             guest_workspace: None,
+            job_url: None,
         }
     }
 
@@ -1972,6 +2023,65 @@ mod tests {
         assert_eq!(serde_json::from_str::<Workload>(&json).unwrap(), dev);
     }
 
+    /// Only an absolute http(s) URL with a host, no userinfo and nothing a browser reads
+    /// otherwise than as written is a link; a job's page is built only of a number and a path
+    /// GitLab gives.
+    #[test]
+    fn only_a_plain_web_url_is_a_link() {
+        for good in [
+            "https://gitlab.example.com/acme/web/-/jobs/7",
+            "http://10.0.0.5:8080/g/p/-/jobs/1?x=%20#top",
+        ] {
+            assert!(is_web_link(good), "{good}");
+        }
+        for bad in [
+            "javascript:alert(1)",
+            "data:text/html,x",
+            "//gitlab.example.com/x",
+            "/acme/web",
+            "HTTPS://gitlab.example.com/",
+            "https://",
+            "https:///path",
+            "https://:8080/x",
+            "https://user:pw@gitlab.example.com/",
+            "https://gitlab.example.com@evil.example/",
+            "https://evil.example\\@gitlab.example.com/",
+            "https://gitlab.example.com/a b",
+            "https://gitlab.example.com/\u{202e}",
+            "https://gitlab.example.com/\n",
+            "https://gitlab.example.com/\"onmouseover=\"x",
+            "https://gitlab.example.com/<b>",
+            "https://gitlab.example.com/é",
+            &format!("https://gitlab.example.com/{}", "a".repeat(MAX_DISPLAY)),
+        ] {
+            assert!(!is_web_link(bad), "{bad:?}");
+        }
+        assert_eq!(
+            gitlab_job_url("https://gitlab.example.com/", "acme/sub/web", "8938680").as_deref(),
+            Some("https://gitlab.example.com/acme/sub/web/-/jobs/8938680")
+        );
+        assert_eq!(
+            gitlab_job_url("http://gl:8080/root", "acme/web", "7").as_deref(),
+            Some("http://gl:8080/root/acme/web/-/jobs/7")
+        );
+        for (server, path, id) in [
+            ("https://g", "acme/web", "dev"),
+            ("https://g", "acme/web", ""),
+            ("https://g", "acme/../web", "7"),
+            ("https://g", "/acme", "7"),
+            ("https://g", "", "7"),
+            ("https://g?x=", "acme/web", "7"),
+            ("ftp://g", "acme/web", "7"),
+            ("https://u@g", "acme/web", "7"),
+        ] {
+            assert_eq!(
+                gitlab_job_url(server, path, id),
+                None,
+                "{server} {path} {id}"
+            );
+        }
+    }
+
     #[test]
     fn negotiation_picks_the_highest_common_version() {
         let r = |min, max| VersionRange { min, max };
@@ -2213,6 +2323,7 @@ mod tests {
             workspace: Some(hostile.into()),
             ssh_alias: Some(hostile.into()),
             guest_workspace: Some("/workdir".into()),
+            job_url: Some("javascript:alert(1)".into()),
             ..workload_bare()
         };
         assert!(make_display_safe(&mut w));
@@ -2221,6 +2332,14 @@ mod tests {
         assert_eq!(w.workspace.as_deref(), Some("a[2J<b>"));
         assert_eq!(w.ssh_alias, None);
         assert_eq!(w.guest_workspace.as_deref(), Some("/workdir"));
+        assert_eq!(w.job_url, None);
+        let url = "https://gitlab.example.com/acme/web/-/jobs/7";
+        let mut w = Workload {
+            job_url: Some(url.into()),
+            ..workload()
+        };
+        assert!(make_display_safe(&mut w));
+        assert_eq!(w.job_url.as_deref(), Some(url));
         for id in ["ABABABABABABABAB", "abab", "x\u{1b}", &"ab".repeat(16)] {
             let mut w = Workload {
                 id: id.into(),

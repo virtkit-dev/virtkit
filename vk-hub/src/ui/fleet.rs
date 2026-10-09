@@ -14,7 +14,7 @@ use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
 use hyper::{Request, Response, StatusCode};
 use vk_hub_proto::{
-    Acquisition, Operation, Outcome, RunnerMode, RunnerState, SpeedClass, StorageRole,
+    Acquisition, Operation, Outcome, RunnerMode, RunnerState, SpeedClass, StorageRole, WorkloadKind,
 };
 
 use super::html::Html;
@@ -627,6 +627,7 @@ const NODE_LAST_SEEN: usize = 8;
 const NODE_VK: usize = 9;
 const VM_KIND: usize = 0;
 const VM_ID: usize = 1;
+const VM_FOR: usize = 2;
 const VM_PID: usize = 3;
 const VM_RESERVED: usize = 5;
 const VM_IN_USE: usize = 6;
@@ -638,6 +639,7 @@ const _: () = {
     assert!(column_is(nodes, NODE_LAST_SEEN, "LAST SEEN") && column_is(nodes, NODE_VK, "VK"));
     let vms = &crate::workloads::COLUMNS;
     assert!(column_is(vms, VM_KIND, "KIND") && column_is(vms, VM_ID, "ID"));
+    assert!(column_is(vms, VM_FOR, "FOR"));
     assert!(column_is(vms, VM_PID, "PID") && column_is(vms, 4, "CPUS"));
     assert!(column_is(vms, VM_RESERVED, "RESERVED") && column_is(vms, VM_IN_USE, "IN USE"));
     assert!(column_is(vms, VM_STARTED, "STARTED"));
@@ -1151,6 +1153,11 @@ fn workloads(h: &mut Html, workloads: Option<&crate::store::Workloads>) {
                 // Of the hub's making: the kind's name and the figures.
                 VM_KIND | VM_PID..=VM_STARTED => h.text(cell),
                 VM_ID => h.raw("<code>").node(cell).raw("</code>"),
+                // A CI job, leading to its page on GitLab where the node named one fit to be
+                // a link.
+                VM_FOR if w.kind == WorkloadKind::CiJob => {
+                    h.external_link(w.job_url.as_deref(), cell)
+                }
                 _ => h.node(cell),
             };
             h.raw("</td>");
@@ -1260,7 +1267,8 @@ fn placed_jobs(h: &mut Html, jobs: &[(String, crate::store::JobRow)], now: u64) 
             .raw("\">")
             .text(id.get(..8).unwrap_or(id))
             .raw("</code></td><td>")
-            .text(&j.title)
+            // The producer's spec named the page: checked as a node's would be.
+            .external_link(j.job_url.as_deref(), &j.title)
             .raw("</td><td>")
             .text(&j.key_name)
             .raw("</td><td>")

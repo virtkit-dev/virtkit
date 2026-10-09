@@ -9,7 +9,10 @@
 //! A host's strings go only in text content or quoted plain attributes (`title`, `value`),
 //! never in an attribute htmx interprets (`hx-*`, `sse-*`). Those and an `href` are the hub's
 //! own, built from constants, from IDs the router has checked are hex, and from dev
-//! environment names checked to be `[A-Za-z0-9._-]` not starting with `.` or `-`.
+//! environment names checked to be `[A-Za-z0-9._-]` not starting with `.` or `-` — but for a
+//! CI job's page on its GitLab, [`Html::external_link`], which goes into an `href` only when
+//! it is a plain http(s) URL ([`vk_hub_proto::is_web_link`]), and opens in a tab of its own
+//! that learns nothing of the hub's page.
 
 use std::fmt::Display;
 
@@ -38,6 +41,21 @@ impl Html {
     pub fn node(&mut self, value: &str) -> &mut Self {
         escape_into(&mut self.0, &vk_hub_proto::display_safe(value));
         self
+    }
+
+    /// Show the host's `label` as a link if `url` passes [`vk_hub_proto::is_web_link`]
+    /// (plain HTTP(S)), or as text otherwise. Open links in a new tab with no opener or
+    /// referrer. The node- or producer-supplied URL is trusted for nothing else.
+    pub fn external_link(&mut self, url: Option<&str>, label: &str) -> &mut Self {
+        match url.filter(|u| vk_hub_proto::is_web_link(u)) {
+            Some(url) => self
+                .raw("<a href=\"")
+                .text(url)
+                .raw("\" target=\"_blank\" rel=\"noopener noreferrer\">")
+                .node(label)
+                .raw("</a>"),
+            None => self.node(label),
+        }
     }
 
     /// Make host command output [`terminal_safe`] and escape it for a `<pre>`.
@@ -166,6 +184,34 @@ mod tests {
             "<td title=\"&quot;&gt;&lt;script&gt;x&lt;/script&gt;\">\
              &lt;img src=x onerror=alert(1)&gt;[2J&#39;</td>"
         );
+    }
+
+    /// Only a plain http(s) URL becomes a link, escaped; anything else leaves the label as
+    /// text, as it would be with no URL at all.
+    #[test]
+    fn only_a_plain_web_url_becomes_a_link() {
+        let link = |url: Option<&str>| {
+            let mut h = Html::new();
+            h.external_link(url, "acme/web <b> #7");
+            h.into_string()
+        };
+        assert_eq!(
+            link(Some("https://gitlab.example.com/acme/web/-/jobs/7?a=1&b=2")),
+            "<a href=\"https://gitlab.example.com/acme/web/-/jobs/7?a=1&amp;b=2\" \
+             target=\"_blank\" rel=\"noopener noreferrer\">acme/web &lt;b&gt; #7</a>"
+        );
+        let text = link(None);
+        assert_eq!(text, "acme/web &lt;b&gt; #7");
+        for bad in [
+            "javascript:alert(1)",
+            "https://u:p@gitlab.example.com/",
+            "https://gitlab.example.com/\"><script>",
+            "https://gitlab.example.com/\u{7}",
+            "/node/x",
+            "",
+        ] {
+            assert_eq!(link(Some(bad)), text, "{bad:?}");
+        }
     }
 
     #[test]

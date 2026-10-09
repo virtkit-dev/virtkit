@@ -1,6 +1,7 @@
 //! The gitlab-runner custom executor environment for a placed job's `vk gitlab
 //! prepare|run|cleanup`: every job variable as `CUSTOM_ENV_<key>`, `JOB_RESPONSE_FILE`,
-//! failure exit codes and `BUILD_EXIT_CODE_FILE`. This lets placed jobs reuse the executor.
+//! failure exit codes and `BUILD_EXIT_CODE_FILE`, and the GitLab the job came from
+//! ([`crate::jobctx::JOB_SERVER_URL`]). This lets placed jobs reuse the executor.
 
 use std::path::Path;
 
@@ -161,6 +162,7 @@ pub fn child_env(
         "JOB_RESPONSE_FILE",
         dir.join(JOB_RESPONSE).display().to_string(),
     );
+    set(crate::jobctx::JOB_SERVER_URL, job.server_url.clone());
     Ok(env)
 }
 
@@ -183,6 +185,7 @@ pub fn apply(cmd: &mut std::process::Command, env: &[(String, String)]) {
         if k.starts_with(b"CUSTOM_ENV_")
             || [
                 &b"JOB_RESPONSE_FILE"[..],
+                crate::jobctx::JOB_SERVER_URL.as_bytes(),
                 b"BUILD_EXIT_CODE_FILE",
                 b"BUILD_FAILURE_EXIT_CODE",
                 b"SYSTEM_FAILURE_EXIT_CODE",
@@ -213,7 +216,10 @@ mod tests {
     use vk_hub_proto::job::{Image, Step, Variable};
 
     fn job() -> CiJob {
-        let mut job = CiJob::default();
+        let mut job = CiJob {
+            server_url: "https://gitlab.example.com".into(),
+            ..CiJob::default()
+        };
         job.job.id = 42;
         job.job.project_path = "acme/web".into();
         job.token = "glcbt-tok".into();
@@ -295,6 +301,10 @@ mod tests {
         assert_eq!(
             get("BUILD_EXIT_CODE_FILE").as_deref(),
             Some("/n/j/exit_code")
+        );
+        assert_eq!(
+            get(crate::jobctx::JOB_SERVER_URL).as_deref(),
+            Some("https://gitlab.example.com")
         );
         let services: serde_json::Value =
             serde_json::from_str(&get("CUSTOM_ENV_CI_JOB_SERVICES").unwrap()).unwrap();

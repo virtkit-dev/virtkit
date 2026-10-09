@@ -745,10 +745,17 @@ Workload discovery reads existing records:
   stale entries as `vk list` does;
 - running dev environments' identities, as read by `vk dev list`;
 - executor job dirs with a live supervisor, and the `job.json` that `prepare` writes with
-  the job's ID, project, name, image and size;
+  the job's ID, project, name, image, size and page on GitLab;
 - the admission ledger's reservations.
 
 A job prepared by an older `vk` has no record and is reported by its job ID alone.
+
+A job the hub placed links its page, `<GitLab>/<project path>/-/jobs/<job ID>`: the project
+path and job ID from the runner's account of the job (`JOB_RESPONSE_FILE`), the GitLab from the
+URL the runner took it from, which the node's driver passes to `prepare` as `VK_JOB_SERVER_URL`.
+A job of the host's own gitlab-runner gets no link: everything that would name its GitLab,
+`CI_SERVER_URL` and `CI_JOB_URL`, is a variable the job can set, so a job could point its
+link anywhere. It is shown as text.
 
 Only what runs is read. A stopped dev environment's state dir and any environment's workspace
 are left alone, so a share nobody is using is not mounted, or kept mounted, by whoever lists
@@ -769,8 +776,10 @@ One bound, `bound_workloads` in `vk-hub-proto`, applies on the node and again on
 most 256 entries and 256 KiB, CI jobs first, then the newest of the rest, stopping at the
 first that does not fit. Every string is stripped of control and invisible characters and cut
 to 256 characters; an SSH alias or guest workspace that is not display-safe is dropped rather
-than altered, and an entry whose ID is not 16 lowercase hex digits is dropped. Every entry left
-out is counted, and the hub shows the count.
+than altered, and an entry whose ID is not 16 lowercase hex digits is dropped. A job's page
+that is not a plain web URL is dropped too: it must be `https://` or `http://`, with a host,
+no userinfo, printable ASCII without quotes, angle brackets, backslashes or backticks, and at
+most 256 bytes. Every entry left out is counted, and the hub shows the count.
 
 Each VM's host memory travels beside the list — on a node, on the heartbeat — keyed by the
 entry's ID, which derives from its state dir. It is the managing process's whole tree — guest,
@@ -871,7 +880,7 @@ continue, with nodes resending output from the end of the stored file.
 
 `vk-hub jobs [--limit 50]` lists the latest jobs: ID, key, pool, state or how it ended, node,
 output length, age and what the job is. The web UI's operations page lists the latest 20, live,
-to viewers and operators alike.
+to viewers and operators alike, each leading to its page on GitLab.
 
 ## Web UI
 
@@ -968,8 +977,15 @@ caching. htmx runs with `allowEval`, `allowScriptTags` and `includeIndicatorStyl
 Node IDs, issued by the hub and checked as fixed-length lowercase hex — and in local mode the
 VM IDs `vk workloads` derives, checked the same way, and dev environment names, checked to be
 `[A-Za-z0-9._-]` not starting with `.` or `-` — are the only values in an attribute htmx reads
-or a link the hub builds; what nodes or the host send goes only into text and plain
-attributes, escaped.
+or a link the hub builds to its own pages. The one link to elsewhere is a CI job's page on
+GitLab, which a node names for a job on its host and the hub records for a placed job from
+its spec: shown on a node's page, local mode's VMs and `/operations`, it becomes an `href`
+only when it is a plain web URL — `https://` or `http://`, as GitLab on a private network is
+often served, with a host, no userinfo, printable ASCII without quotes, angle brackets,
+backslashes or backticks, at most 256 bytes — checked again as the page is built, escaped,
+and opened in a new tab with `rel="noopener noreferrer"`; anything else leaves the job's name
+as text. Everything else nodes or the host send goes only into text and plain attributes,
+escaped.
 
 ### Signing in
 

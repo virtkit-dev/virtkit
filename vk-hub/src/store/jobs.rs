@@ -41,6 +41,9 @@ pub struct JobRow {
     /// What the job is, for display: GitLab's job ID, project and name.
     #[serde(default)]
     pub title: String,
+    /// The job's GitLab page from its spec; `None` for an invalid URL or an older hub's record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_url: Option<String>,
     pub created_at: u64,
     pub state: JobState,
     pub revision: u64,
@@ -321,6 +324,7 @@ mod tests {
                 envelope: Envelope::default(),
             },
             title: "gitlab job 7".into(),
+            job_url: None,
             created_at: 10,
             state: JobState::Queued,
             revision,

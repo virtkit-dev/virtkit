@@ -483,6 +483,10 @@ fn vms_table(listing: &Listing) -> Html {
                 1 => {
                     h.raw("<code>").node(cell).raw("</code>");
                 }
+                // A CI job, leading to its page on GitLab where `vk` named one.
+                2 if w.kind == WorkloadKind::CiJob => {
+                    h.external_link(w.job_url.as_deref(), cell);
+                }
                 _ => {
                     h.node(cell);
                 }
@@ -603,6 +607,11 @@ fn vm_detail(w: &Workload, mem: Option<u64>, local: &Local) -> Html {
         if let Some(value) = value {
             kv_node(&mut h, key, value);
         }
+    }
+    if let Some(url) = &w.job_url {
+        h.raw("<tr><th>on GitLab</th><td>")
+            .external_link(Some(url), url)
+            .raw("</td></tr>");
     }
     kv(
         &mut h,

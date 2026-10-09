@@ -33,6 +33,10 @@ All notable changes to virtkit will be documented in this file.
   and stream masked traces to the hub. Jobs survive `vk node run` restarts outside
   `vk node service`.
 - `[node] labels` declares the labels the hub may place GitLab jobs by.
+- **`vk-hub`'s web UI links the jobs it placed to their GitLab pages.** A node's workloads,
+  local mode's VMs and the jobs on the operations page open the job on GitLab in a new tab. A
+  job of a host's own gitlab-runner stays plain text: its variables could point the link
+  anywhere.
 - **Experimental: `vk-gitlab` runs GitLab jobs on a fleet.** A new binary, published with each
   release: `vk-gitlab run` takes jobs from GitLab as one or more runners, the way gitlab-runner
   19.5 does, and has `vk-hub` (configured in `[hub]`) run each on a node of the runner's pool.

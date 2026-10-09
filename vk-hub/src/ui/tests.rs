@@ -394,6 +394,7 @@ fn workload(id: &str, label: &str) -> vk_hub_proto::Workload {
         started_at: Some(1_790_755_279),
         ssh_alias: None,
         guest_workspace: None,
+        job_url: None,
     }
 }
 
@@ -2336,6 +2337,7 @@ fn ci_workload(id: &str, owner: &str) -> vk_hub_proto::Workload {
         started_at: Some(crate::now_secs()),
         ssh_alias: None,
         guest_workspace: None,
+        job_url: None,
     }
 }
 
@@ -2407,6 +2409,48 @@ async fn workloads_are_shown_live_and_as_text() {
     hub.changed(&node);
     next_with(&mut detail, "none running").await;
     next_with(&mut nodes, "<td>0</td></tr>").await;
+}
+
+/// A CI job the node names a GitLab page for leads to it, in a tab of its own; a URL that is
+/// not a plain http(s) one leaves the job as text.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_ci_job_links_to_its_gitlab_page() {
+    let (addr, hub, _) = start_fleet().await;
+    let node = enrolled_node(&hub, "ci-1");
+    let linked = vk_hub_proto::Workload {
+        job_url: Some("https://gitlab.example.com/git/wab/-/jobs/8938680".into()),
+        ..ci_workload("aaaaaaaaaaaaaaaa", "git/wab")
+    };
+    let forged = vk_hub_proto::Workload {
+        job_url: Some("javascript:alert(1)".into()),
+        ..ci_workload("bbbbbbbbbbbbbbbb", "acme/web")
+    };
+    hub.db
+        .record_report(
+            &node,
+            vk_hub_proto::Report {
+                workloads: Some(vec![linked, forged]),
+                ..Default::default()
+            },
+            2,
+        )
+        .unwrap();
+    let (cookie, _) = sign_in(addr, &hub, Role::Viewer).await;
+    let page = get(addr, &format!("/node/{node}"), Some(&cookie)).await;
+    assert!(
+        page.body.contains(
+            "<td><a href=\"https://gitlab.example.com/git/wab/-/jobs/8938680\" \
+             target=\"_blank\" rel=\"noopener noreferrer\">git/wab test #7</a></td>"
+        ),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains("<td>acme/web test #7</td>"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains("javascript:"), "{}", page.body);
 }
 
 /// A node's page follows that node alone.
@@ -3094,6 +3138,7 @@ async fn placed_jobs_are_shown_live() {
             envelope: vk_hub_proto::job::Envelope::default(),
         },
         title: "GitLab job 7 of g/<b>p</b> (test)".into(),
+        job_url: Some("https://gitlab.example.com/g/p/-/jobs/7".into()),
         created_at: crate::now_secs(),
         state: JobState::Queued,
         revision: 1,
@@ -3111,7 +3156,8 @@ async fn placed_jobs_are_shown_live() {
     let page = get(addr, "/operations", Some(&viewer)).await;
     for want in [
         &format!("<code title=\"{id}\">cdcdcdcd</code>"),
-        "GitLab job 7 of g/&lt;b&gt;p&lt;/b&gt; (test)",
+        "<a href=\"https://gitlab.example.com/g/p/-/jobs/7\" target=\"_blank\" \
+         rel=\"noopener noreferrer\">GitLab job 7 of g/&lt;b&gt;p&lt;/b&gt; (test)</a>",
         "<td>gitlab</td><td>ci</td><td>queued</td><td>-</td>",
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);

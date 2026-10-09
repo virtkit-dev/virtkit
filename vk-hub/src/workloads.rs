@@ -103,6 +103,7 @@ mod tests {
             started_at: Some(100),
             ssh_alias: None,
             guest_workspace: None,
+            job_url: None,
         }
     }
 

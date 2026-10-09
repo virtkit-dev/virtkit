@@ -483,6 +483,9 @@ async fn submit(
         request_id: ask.request_id.clone(),
         placement: ask.placement.clone(),
         title: title(&ask.spec),
+        job_url: match &ask.spec {
+            JobSpec::GitlabCi(ci) => ci.job_url(),
+        },
         created_at: crate::now_secs(),
         state: JobState::Queued,
         revision: 1,

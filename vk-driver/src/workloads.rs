@@ -192,6 +192,7 @@ fn workloads(sources: &Sources) -> Vec<(Workload, Option<i32>)> {
                 .filter(|row| sources.ssh.contains(&row.dir))
                 .map(|row| crate::dev::alias_for(&row.dir)),
             guest_workspace: dev.and_then(|row| row.workspace_folder.clone()),
+            job_url: None,
         };
         out.push((workload, pid.and_then(|p| i32::try_from(p).ok())));
     }
@@ -222,6 +223,7 @@ fn workloads(sources: &Sources) -> Vec<(Workload, Option<i32>)> {
             started_at: j.started_at,
             ssh_alias: None,
             guest_workspace: None,
+            job_url: record.and_then(|r| r.job_url.clone()),
         };
         out.push((workload, Some(j.supervisor)));
     }
@@ -617,6 +619,7 @@ mod tests {
                         image: Some("rust:1.90".into()),
                         cpus: 4,
                         mem: "8G".into(),
+                        job_url: Some("https://gitlab.example.com/acme/web/-/jobs/4242".into()),
                     }),
                     started_at: Some(300),
                 },
@@ -643,6 +646,11 @@ mod tests {
         assert_eq!(w.project.as_deref(), Some("acme/web"));
         assert_eq!(w.job_name.as_deref(), Some("test:unit"));
         assert_eq!(w.label.as_deref(), Some("rust:1.90"));
+        assert_eq!(
+            w.job_url.as_deref(),
+            Some("https://gitlab.example.com/acme/web/-/jobs/4242")
+        );
+        assert_eq!(old.0.job_url, None);
         assert_eq!((w.pid, w.cpus), (Some(11), Some(4)));
         assert_eq!(
             w.mem_reserved_mib,
@@ -661,6 +669,7 @@ mod tests {
                     image: None,
                     cpus: 4,
                     mem: "8G".into(),
+                    job_url: None,
                 }),
                 started_at: None,
             }],

@@ -76,7 +76,15 @@ pub struct JobCtx {
     /// names the job's project as. From the runner's account of the job, or `CI_PROJECT_PATH`
     /// where there is none.
     project_path: Option<String>,
+    /// Display-only link in the job record, built for hub-placed jobs from the runner's
+    /// job data and the driver-supplied [`JOB_SERVER_URL`]. The host's gitlab-runner jobs
+    /// get no link: jobs can override `CI_SERVER_URL` and `CI_JOB_URL`.
+    job_url: Option<String>,
 }
+
+/// The GitLab URL the runner took the job from, passed by a placed job's driver to its
+/// executor commands. Job variables cannot override it.
+pub const JOB_SERVER_URL: &str = "VK_JOB_SERVER_URL";
 
 impl JobCtx {
     pub fn new(cfg: Config) -> Result<JobCtx> {
@@ -144,6 +152,10 @@ impl JobCtx {
             .or_else(|| env("CUSTOM_ENV_CI_JOB_IMAGE"))
             .filter(|s| !s.is_empty());
         let job_var = |name: &str| env(&format!("CUSTOM_ENV_{name}")).filter(|s| !s.is_empty());
+        let job_url = response.as_ref().and_then(|r| {
+            let server = env(JOB_SERVER_URL).filter(|s| !s.is_empty())?;
+            vk_hub_proto::gitlab_job_url(&server, &r.job_info.project_full_path, &r.id.to_string())
+        });
         Ok(JobCtx {
             cfg,
             job_id,
@@ -195,6 +207,7 @@ impl JobCtx {
                 Some(r) => Some(r.job_info.project_full_path.clone()),
                 None => job_var("CI_PROJECT_PATH"),
             },
+            job_url,
         })
     }
 
@@ -414,6 +427,7 @@ impl JobCtx {
             image: self.image_ref.clone(),
             cpus,
             mem: mem.to_string(),
+            job_url: self.job_url.clone(),
         };
         let json = serde_json::to_vec(&record)?;
         // Not synced: after a crash the VM this describes is gone too, so a reader must check
@@ -439,6 +453,9 @@ pub struct JobRecord {
     pub cpus: u32,
     /// The `vm.mem`-style size token the primary VM boots with.
     pub mem: String,
+    /// The job's GitLab page, or `None` when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_url: Option<String>,
 }
 
 /// The [`JobRecord`]'s name in a job dir.
@@ -665,10 +682,17 @@ mod tests {
                 env("JOB_RESPONSE_FILE", &response.display().to_string()),
                 env("BUILD_FAILURE_EXIT_CODE", "5"),
                 env("CUSTOM_ENV_MICROVM_USER", "1000"),
+                env("CUSTOM_ENV_CI_SERVER_URL", "https://elsewhere.example"),
+                env(JOB_SERVER_URL, "http://gitlab.internal:8080"),
             ],
         )
         .unwrap();
         assert_eq!(ctx.job_id, "77");
+        assert_eq!(
+            ctx.job_url.as_deref(),
+            Some("http://gitlab.internal:8080/a/b/-/jobs/77"),
+            "the driver's GitLab, not the job's variable"
+        );
         assert_eq!(ctx.user_req.as_deref(), Some("1000"), "the last one wins");
         assert_eq!(ctx.build_failure, 5);
         let _ = std::fs::remove_dir_all(&dir);
@@ -719,7 +743,9 @@ mod tests {
     }
 
     /// A job's record names the project by its full path from the runner's account, and is
-    /// private to the node's user.
+    /// private to the node's user. It links the job's page only for a job the hub placed, on
+    /// the GitLab its driver names: never from `CI_SERVER_URL` or `CI_JOB_URL`, which the job
+    /// may set itself.
     #[test]
     fn a_job_record_names_the_job_as_the_runner_does() {
         use std::os::unix::fs::PermissionsExt;
@@ -729,7 +755,7 @@ mod tests {
             state_dir: Some(dir.clone()),
             ..Default::default()
         };
-        let response = JobResponse {
+        let response = || JobResponse {
             id: 7,
             job_info: JobInfo {
                 name: "test:unit".into(),
@@ -737,7 +763,24 @@ mod tests {
                 project_full_path: "acme/web".into(),
             },
         };
-        let ctx = JobCtx::with_response(cfg, "7".into(), Some(response), &process_env).unwrap();
+        // The host's own runner: the job's variables name its GitLab, so no link.
+        let own = |name: &str| match name {
+            "CUSTOM_ENV_CI_SERVER_URL" => Some("https://evil.example/".to_string()),
+            "CUSTOM_ENV_CI_JOB_URL" => Some("https://evil.example/".to_string()),
+            _ => None,
+        };
+        let own_cfg = Config {
+            state_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let own_ctx = JobCtx::with_response(own_cfg, "7".into(), Some(response()), &own).unwrap();
+        assert_eq!(own_ctx.job_url, None);
+        // A placed job: its driver names the GitLab, whatever the job's variables say.
+        let env = |name: &str| match name {
+            JOB_SERVER_URL => Some("https://gitlab.example.com/".to_string()),
+            _ => own(name),
+        };
+        let ctx = JobCtx::with_response(cfg, "7".into(), Some(response()), &env).unwrap();
         std::fs::create_dir_all(&ctx.job_dir).unwrap();
         ctx.record(4, "8G").unwrap();
         let written = std::fs::read(ctx.job_dir.join(JOB_RECORD)).unwrap();
@@ -751,6 +794,7 @@ mod tests {
                 image: ctx.image_ref.clone(),
                 cpus: 4,
                 mem: "8G".into(),
+                job_url: Some("https://gitlab.example.com/acme/web/-/jobs/7".into()),
             }
         );
         let mode = std::fs::metadata(ctx.job_dir.join(JOB_RECORD))
@@ -850,6 +894,7 @@ mod tests {
             job_name: Some("test:unit 1/3".into()),
             project_id: Some("42".into()),
             project_path: None,
+            job_url: None,
         }
     }
 

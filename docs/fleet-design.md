@@ -155,8 +155,8 @@ doing rather than only how full it is; [local mode](#local-mode) shows the same 
 machine it runs on. Each entry carries:
 
 - the kind — CI job, dev environment, pinned run (`vk run --state-dir`);
-- what it belongs to — project, job name and job ID for CI; workspace and environment for
-  `vk dev`; the image and project directory for a run;
+- what it belongs to — project, job name, job ID and the job's page on GitLab for CI;
+  workspace and environment for `vk dev`; the image and project directory for a run;
 - the pid of the process managing it — the `vk run`, or the job's supervisor — its vCPUs,
   the memory reserved for it, when it started, and its state dir. The reservation is the
   admission ledger's for a CI job, and the memory the VM booted with otherwise.

@@ -193,7 +193,10 @@ fn reservation_body(n: u8, wait_secs: u32) -> Value {
 }
 
 fn spec(gitlab_id: u64) -> JobSpec {
-    let mut ci = CiJob::default();
+    let mut ci = CiJob {
+        server_url: "https://gitlab.example.com".into(),
+        ..CiJob::default()
+    };
     ci.job.id = gitlab_id;
     ci.job.project_path = "group/project".into();
     ci.job.name = "test".into();
@@ -1159,6 +1162,11 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     ] {
         assert!(events.contains(&want), "{want} not in {events:?}");
     }
+    // The UI links the job to its page on GitLab.
+    assert_eq!(
+        hub.db.job(&id).unwrap().unwrap().job_url.as_deref(),
+        Some("https://gitlab.example.com/group/project/-/jobs/2")
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -2178,6 +2186,7 @@ fn the_jobs_table_says_how_each_job_stands() {
         request_id: request_id(1),
         placement: placement(),
         title: "GitLab job 7 of g/p (test)".into(),
+        job_url: None,
         created_at: 1000,
         state,
         revision: 1,

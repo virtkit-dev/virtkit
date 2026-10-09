@@ -2414,6 +2414,7 @@ fn the_workloads_table_names_what_each_vm_is_for() {
         started_at: None,
         ssh_alias: None,
         guest_workspace: None,
+        job_url: None,
     };
     let job = Workload {
         project: Some("acme/web".into()),
@@ -2584,6 +2585,7 @@ fn workloads_are_selected_by_id_or_unambiguous_hostname() {
             started_at: Some(i),
             ssh_alias: None,
             guest_workspace: None,
+            job_url: None,
         })
         .collect();
     hub.db
