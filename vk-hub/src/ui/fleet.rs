@@ -148,7 +148,7 @@ pub(super) fn source(
     let csrf = steer_token(auth).map(str::to_string);
     Some(Source::Own {
         name: "node",
-        changes: hub.subscribe_node(&id),
+        changes: crate::jobs::subscribe_node_work(&hub, &id),
         render: Arc::new(move || render_node(&hub, &id, csrf.as_deref())),
     })
 }
@@ -875,6 +875,9 @@ struct Panel {
     intake: String,
     intake_acts: Vec<Act>,
     limit: String,
+    /// How many jobs the hub has placed on the node, against the limit: for a node that
+    /// takes placed jobs, from a hub that places them.
+    placed: Option<String>,
     lift: Option<Act>,
     maintenance: &'static str,
     maintenance_acts: Vec<Act>,
@@ -919,6 +922,13 @@ impl Panel {
         if let Some(n) = effective {
             limit.push_str(&format!(" (running at most {n} now)"));
         }
+        let placed = v
+            .placed
+            .filter(|_| v.protocol.is_some_and(|p| p >= vk_hub_proto::JOBS))
+            .map(|placed| match ceiling {
+                Some(n) => format!("Placed by the hub: {placed} of {n}"),
+                None => format!("Placed by the hub: {placed}"),
+            });
 
         let maintenance = match state {
             None => "State not reported yet",
@@ -966,6 +976,7 @@ impl Panel {
             intake,
             intake_acts,
             limit,
+            placed,
             lift: ceiling.map(|_| LIFT),
             maintenance,
             maintenance_acts,
@@ -1016,6 +1027,9 @@ fn steer_panel(h: &mut Html, v: &NodeView, csrf: Option<&str>) {
         act(h, a, "");
     }
     h.raw("<p class=\"now\">").text(&p.limit).raw("</p>");
+    if let Some(placed) = &p.placed {
+        h.raw("<p class=\"now\">").text(placed).raw("</p>");
+    }
     if let Some(csrf) = csrf {
         // No placeholder: hx-preserve would keep the first render's, stale after a change.
         form_open(h, &path, csrf);
@@ -1023,7 +1037,8 @@ fn steer_panel(h: &mut Html, v: &NodeView, csrf: Option<&str>) {
             .raw("<label for=\"ceiling\">Max concurrent jobs</label>")
             .raw("<input id=\"ceiling\" type=\"number\" name=\"ceiling\" min=\"1\" required ")
             .raw("hx-preserve=\"true\"><button>Set the limit</button><span class=\"does\">")
-            .raw("Run at most this many jobs at once on this node.</span></form>");
+            .raw("Run at most this many of its runner's jobs at once on this node, and at ")
+            .raw("most this many of the jobs the hub places here.</span></form>");
     }
     if let Some(a) = &p.lift {
         act(h, a, "");
@@ -1866,6 +1881,16 @@ mod tests {
         let p = Panel::of(&v);
         assert_eq!(p.intake, "Not taking new jobs: intake paused");
         assert_eq!(p.limit, "Max concurrent jobs: 3");
+        // Only a node that takes placed jobs, from a hub that places them, says how many it
+        // holds.
+        assert_eq!(p.placed, None);
+        v.protocol = Some(vk_hub_proto::JOBS);
+        assert_eq!(Panel::of(&v).placed, None);
+        v.placed = Some(2);
+        assert_eq!(
+            Panel::of(&v).placed.as_deref(),
+            Some("Placed by the hub: 2 of 3")
+        );
         assert_eq!(p.maintenance, "In service");
         assert_eq!(p.note, None);
         v.desired = None;
@@ -1886,6 +1911,7 @@ mod tests {
             p.limit,
             "Max concurrent jobs: no limit from the hub (running at most 2 now)"
         );
+        assert_eq!(p.placed.as_deref(), Some("Placed by the hub: 2"));
         assert_eq!(
             p.maintenance,
             "Drained: none of the hub's jobs running here"

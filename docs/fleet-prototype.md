@@ -279,7 +279,8 @@ is closed to everyone else.
 
 ## Steering
 
-`vk-hub nodes ceiling <id> <n|none>` caps a node's runner concurrency, and `vk-hub nodes stop`
+`vk-hub nodes ceiling <id> <n|none>` separately caps a node's runner concurrency and the jobs the
+hub places on it (see [Placed jobs](#placed-jobs)), and `vk-hub nodes stop`
 and `resume` stop and resume its acquisition: the node's desired state, kept on the hub with a
 generation that moves on every change, to one past both the hub's last and the one the node
 last reported applying. A ceiling of 0 is refused: gitlab-runner has none, and stopping
@@ -765,9 +766,10 @@ budget). A granted offer is a ledger entry `reservation-<id>` the node holds loc
 job behind it; with neither memory nor disk admission on, nothing is held and every offer that
 passes the vCPU check is granted. Leases are cut to 600 seconds and run on the node's monotonic
 clock; an offer of a reservation already held renews it. A node not `ready`, or with acquisition
-stopped, refuses offers and starts without a reservation; a quarantined node releases every
-reservation. Reservations live in memory: a restarted node holds none, and the hub releases
-what it thought held.
+stopped, refuses offers and starts without a reservation; so does, as `ceiling`, a node whose
+placed jobs not finished and reservations held reach the hub's ceiling, as the node last
+applied it. A quarantined node releases every reservation. Reservations live in memory: a
+restarted node holds none, and the hub releases what it thought held.
 
 **Starting a job.** Before answering `accepted`, the node journals the start under
 `<state_dir>/node/jobs/<job id>/` (`0700`), with the spec and its secrets in `start.json`
@@ -950,17 +952,32 @@ request that got no reservation is tried afresh; for a job, the job.
 
 **Placement.** A node takes placed work while its session is at version 3 and has sent its
 `held`, it is connected, in the pool, carries every label, reports itself ready and has at
-least the CPUs the envelope asks. Its room is its last heartbeat's admission budget less committed
+least the CPUs the envelope asks, and while it holds less placed work than the ceiling the
+operator set it, if any. Its room is its last heartbeat's admission budget less committed
 memory — or its memory available, with no budget — and the job filesystem's most free space,
 less what the hub asked of it since: offers not yet answered, reservations accepted after that
 heartbeat, and starts not yet answered that are not on a reservation. `fits` is the sum of each
-node's room in envelopes, at most 1024 a node. Offers go to the node with the most room first;
-an offer unanswered after 5 seconds is abandoned, and released if the node accepts it later.
-When every node with room has refused, the hub pauses 2 seconds and asks again until the
-request's `wait_secs`, then answers 503 `no_capacity` with `retry_after_secs` 5. Leases are
-1–600 seconds. A renew waits 10 seconds for the node's answer (then 503 `unavailable`). A
-node's reservations end with its session, or when a new session of the node replaces it:
-renewing one is then 410 `reservation_gone`, and its next `held` gets each released.
+node's room in envelopes, at most 1024 a node, and at most what its ceiling leaves.
+
+**The ceiling.** The hub counts offered reservations that have not been refused, unfinished
+jobs sent to the node (including those recovered from its database after a restart), and jobs
+reported in `held` that the hub has ended or never knew, until their results arrive. A job on
+a reservation counts once: as the reservation until sent, then as the job. The node counts
+unfinished placed jobs and held reservations against its applied ceiling. It refuses excess
+offers or starts without a reservation as `ceiling`, preventing overshoot if the hub
+undercounts. Starts on held reservations and renewals still proceed. The hub uses its desired
+ceiling; the node uses its last applied ceiling, so it may refuse `ceiling` after a raise until
+it applies the change. Lowering the ceiling cancels nothing: running jobs continue, and new
+work resumes when the count falls below it. The ceiling applies separately to placed jobs
+and the node's gitlab-runner, allowing a combined total of twice the ceiling. The hub counts
+no runner jobs, and the node's ledger cannot identify them all: without admission, a runner
+job holds no entry. Offers go to the node with the most room first; an
+offer unanswered after 5 seconds is abandoned, and released if the node accepts it later. When
+every node with room has refused, the hub pauses 2 seconds and asks again until the request's
+`wait_secs`, then answers 503 `no_capacity` with `retry_after_secs` 5. Leases are 1–600 seconds.
+A renew waits 10 seconds for the node's answer (then 503 `unavailable`). A node's reservations
+end with its session, or when a new session of the node replaces it: renewing one is then 410
+`reservation_gone`, and its next `held` gets each released.
 
 **Jobs.** A submission stores the job record, redacted spec and `request_id` in one durable
 transaction; the full spec stays in memory until a node accepts the job. The hub holds
@@ -1050,8 +1067,10 @@ shows what the hub asks of it beside what it reports — its state, acquisition,
 concurrency, drain progress and what it cannot carry out — and its 20 latest commands with their
 outcomes. It opens with a steering panel describing the current state in plain language, grouped
 into *Job intake* — whether the node takes new jobs, the hub's concurrency ceiling and the
-node's current effective limit; *Maintenance* — in service, draining, drained, under
-maintenance, checking itself or quarantined; and an operator-only *Danger zone*. Operators see
+node's current effective limit, and on a hub that places jobs, for a node at protocol version
+3 or later, the jobs the hub has placed on it against that ceiling (`Placed by the hub: 3 of
+4`); *Maintenance* — in service, draining, drained, under maintenance, checking itself or
+quarantined; and an operator-only *Danger zone*. Operators see
 applicable actions with short explanations: pause intake or resume it, set the limit or remove
 it, drain from ready or during maintenance (the node stays drained once it ends), undrain while
 draining or drained, quarantine unless quarantined, release only then, reset from ready,

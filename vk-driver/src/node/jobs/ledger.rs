@@ -35,6 +35,27 @@ struct Entry {
     held: Option<admit::Reservation>,
 }
 
+/// Whether the node takes new placed work: a reservation, or a job not on one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    Open,
+    /// Draining, drained, quarantined, in maintenance, or with acquisition stopped.
+    NotReady,
+    /// The node's placed jobs not finished and its reservations, `held` of them, reach the
+    /// hub's concurrency ceiling.
+    Ceiling {
+        ceiling: u32,
+        held: usize,
+    },
+}
+
+impl Gate {
+    /// Why a closed gate refuses at the ceiling, in the hub's words.
+    pub fn ceiling_message(ceiling: u32, held: usize) -> String {
+        format!("{held} placed jobs and reservations reach the hub's ceiling of {ceiling}")
+    }
+}
+
 pub struct Ledger {
     limits: Limits,
     entries: BTreeMap<String, Entry>,
@@ -112,14 +133,20 @@ impl Ledger {
         }
     }
 
+    /// How many reservations are held.
+    pub fn count(&self) -> usize {
+        self.entries.len()
+    }
+
     /// The hub's offer: granted for at most [`MAX_LEASE_SECS`], or refused. An offer of a
-    /// reservation already held renews it, keeping the envelope it was granted with.
+    /// reservation already held renews it, keeping the envelope it was granted with, whatever
+    /// `gate` says of new work.
     pub fn offer(
         &mut self,
         id: &str,
         envelope: Envelope,
         lease_secs: u32,
-        ready: bool,
+        gate: Gate,
         now: Instant,
     ) -> OfferReply {
         if !vk_hub_proto::valid_id(id) || lease_secs == 0 {
@@ -133,11 +160,20 @@ impl Ledger {
             entry.expires = now + Duration::from_secs(lease.into());
             return OfferReply::Accepted { lease_secs: lease };
         }
-        if !ready {
-            return OfferReply::Refused {
-                reason: Refusal::NotReady,
-                message: None,
-            };
+        match gate {
+            Gate::Open => {}
+            Gate::NotReady => {
+                return OfferReply::Refused {
+                    reason: Refusal::NotReady,
+                    message: None,
+                };
+            }
+            Gate::Ceiling { ceiling, held } => {
+                return OfferReply::Refused {
+                    reason: Refusal::Ceiling,
+                    message: Some(Gate::ceiling_message(ceiling, held)),
+                };
+            }
         }
         match self.admit(&ledger_name(id), &envelope) {
             Ok(held) => {
@@ -259,11 +295,12 @@ mod tests {
         let (mut l, dir) = ledger("budget", Some(8192));
         let now = Instant::now();
         assert_eq!(
-            l.offer(&id("a"), env(6144, 4), 90, true, now),
+            l.offer(&id("a"), env(6144, 4), 90, Gate::Open, now),
             OfferReply::Accepted { lease_secs: 90 }
         );
         // The first one's memory is held: a second does not fit, and says why.
-        let OfferReply::Refused { reason, .. } = l.offer(&id("b"), env(4096, 4), 90, true, now)
+        let OfferReply::Refused { reason, .. } =
+            l.offer(&id("b"), env(4096, 4), 90, Gate::Open, now)
         else {
             panic!("a second offer over the budget was granted");
         };
@@ -276,7 +313,7 @@ mod tests {
             }
         );
         assert!(matches!(
-            l.offer(&id("b"), env(4096, 4), 90, true, now),
+            l.offer(&id("b"), env(4096, 4), 90, Gate::Open, now),
             OfferReply::Accepted { .. }
         ));
         let _ = std::fs::remove_dir_all(dir);
@@ -287,7 +324,7 @@ mod tests {
         let (mut l, dir) = ledger("lease", Some(8192));
         let now = Instant::now();
         assert_eq!(
-            l.offer(&id("a"), env(1024, 1), 3600, true, now),
+            l.offer(&id("a"), env(1024, 1), 3600, Gate::Open, now),
             OfferReply::Accepted {
                 lease_secs: MAX_LEASE_SECS
             }
@@ -312,21 +349,21 @@ mod tests {
         let (mut l, dir) = ledger("refuse", None);
         let now = Instant::now();
         assert_eq!(
-            l.offer(&id("a"), env(1, 1), 90, false, now),
+            l.offer(&id("a"), env(1, 1), 90, Gate::NotReady, now),
             OfferReply::Refused {
                 reason: Refusal::NotReady,
                 message: None
             }
         );
         assert!(matches!(
-            l.offer(&id("a"), env(1, 9), 90, true, now),
+            l.offer(&id("a"), env(1, 9), 90, Gate::Open, now),
             OfferReply::Refused {
                 reason: Refusal::Cpus,
                 ..
             }
         ));
         assert!(matches!(
-            l.offer("not-an-id", env(1, 1), 90, true, now),
+            l.offer("not-an-id", env(1, 1), 90, Gate::Open, now),
             OfferReply::Refused {
                 reason: Refusal::Invalid,
                 ..
@@ -334,7 +371,7 @@ mod tests {
         ));
         // Without admission there is nothing to hold, and the offer is granted.
         assert!(matches!(
-            l.offer(&id("a"), env(1 << 20, 1), 90, true, now),
+            l.offer(&id("a"), env(1 << 20, 1), 90, Gate::Open, now),
             OfferReply::Accepted { .. }
         ));
         let (envelope, held) = l.take(&id("a")).unwrap();
@@ -356,7 +393,7 @@ mod tests {
             ..env(1, 1)
         };
         assert_eq!(
-            l.offer(&id("a"), ask, 90, true, now),
+            l.offer(&id("a"), ask, 90, Gate::Open, now),
             OfferReply::Accepted { lease_secs: 90 }
         );
         assert!(l.limits.jobs_dir.is_dir());
@@ -372,7 +409,7 @@ mod tests {
         let (mut l, dir) = ledger("takeover", Some(8192));
         let now = Instant::now();
         assert!(matches!(
-            l.offer(&id("a"), env(6144, 2), 90, true, now),
+            l.offer(&id("a"), env(6144, 2), 90, Gate::Open, now),
             OfferReply::Accepted { .. }
         ));
         let (_, held) = l.take(&id("a")).unwrap();
@@ -388,7 +425,7 @@ mod tests {
         let own = admit::acquire(&l.limits.admit_dir, "4242", &ask, Duration::ZERO).unwrap();
         // What it gave back fits another.
         assert!(matches!(
-            l.offer(&id("b"), env(6144, 2), 90, true, now),
+            l.offer(&id("b"), env(6144, 2), 90, Gate::Open, now),
             OfferReply::Accepted { .. }
         ));
         drop((own, held));

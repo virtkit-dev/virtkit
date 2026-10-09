@@ -185,6 +185,8 @@ effective = min(local estimate, hub ceiling, local ceiling)
   at a time.
 - **hub ceiling** — set by the hub in the node's desired state, for a node that is unhealthy,
   saturated on a resource the estimate does not see, or whose capacity is kept for other work.
+  It caps the jobs the hub places on the node too, counted by both sides (see
+  [placed jobs](fleet-prototype.md#placed-jobs)).
 - **local ceiling** — `[executor.schedule] max_concurrency`, the node's own limit.
 
 `vk tune` and `vk node run` use one controller, with a single writer while the node is up.

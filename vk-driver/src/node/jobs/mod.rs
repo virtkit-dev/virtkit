@@ -39,7 +39,7 @@ use vk_hub_proto::job::{CiJob, FailureClass, JobResult, JobSpec, MAX_JOB_SPEC};
 
 use crate::config::Config;
 use journal::Meta;
-use ledger::{Ledger, Limits};
+use ledger::{Gate, Ledger, Limits};
 use trace::Trace;
 use vars::Vars;
 
@@ -119,6 +119,34 @@ struct State {
     jobs: BTreeMap<String, Track>,
     /// Why the last offer was refused, logged when it changes; `None` once one is granted.
     refused: Option<(Refusal, Option<String>)>,
+}
+
+impl State {
+    /// Whether new placed work is taken. At the hub's ceiling, the node's placed jobs not
+    /// finished and its reservations fill it: a job on a reservation counts once, as the
+    /// reservation until it starts. Jobs past a ceiling lowered under them carry on.
+    fn gate(&self, intake: Intake) -> Gate {
+        if !intake.ready {
+            return Gate::NotReady;
+        }
+        let held = (self.jobs.values().filter(|t| t.result.is_none()).count())
+            .saturating_add(self.ledger.count());
+        match intake.ceiling {
+            Some(ceiling) if held >= usize::try_from(ceiling).unwrap_or(usize::MAX) => {
+                Gate::Ceiling { ceiling, held }
+            }
+            _ => Gate::Open,
+        }
+    }
+}
+
+/// What the node takes of new placed work, from its steering state.
+#[derive(Clone, Copy, Debug)]
+pub struct Intake {
+    /// The node takes new work: [`ready`].
+    pub ready: bool,
+    /// The hub's concurrency ceiling, from the applied desired state.
+    pub ceiling: Option<u32>,
 }
 
 /// Every reservation and placed job this node holds, for the sessions of `vk node run`.
@@ -250,8 +278,8 @@ impl Jobs {
         NodeJobMsg::Held(Held { reservations, jobs })
     }
 
-    /// The answers to a message from the hub. `ready`: the node takes new work.
-    pub fn handle(&self, msg: HubJobMsg, ready: bool, now: Instant) -> Vec<NodeJobMsg> {
+    /// The answers to a message from the hub, taking new work as `intake` says.
+    pub fn handle(&self, msg: HubJobMsg, intake: Intake, now: Instant) -> Vec<NodeJobMsg> {
         let mut state = lock(&self.state);
         match msg {
             HubJobMsg::Offer {
@@ -259,9 +287,10 @@ impl Jobs {
                 envelope,
                 lease_secs,
             } => {
+                let gate = state.gate(intake);
                 let reply = state
                     .ledger
-                    .offer(&reservation, envelope, lease_secs, ready, now);
+                    .offer(&reservation, envelope, lease_secs, gate, now);
                 if let Some(line) = refusal_change(&mut state.refused, &reply) {
                     say!("{line}");
                 }
@@ -278,7 +307,7 @@ impl Jobs {
                 let state = state.ledger.release(&reservation);
                 vec![NodeJobMsg::Lease { reservation, state }]
             }
-            HubJobMsg::Start(start) => self.start(&mut state, *start, ready),
+            HubJobMsg::Start(start) => self.start(&mut state, *start, intake),
             HubJobMsg::OutputAck { job, offset } => {
                 if let Some(t) = state.jobs.get_mut(&job) {
                     let len = journal::output_len(&t.dir);
@@ -328,7 +357,7 @@ impl Jobs {
         }
     }
 
-    fn start(&self, state: &mut State, start: JobStart, ready: bool) -> Vec<NodeJobMsg> {
+    fn start(&self, state: &mut State, start: JobStart, intake: Intake) -> Vec<NodeJobMsg> {
         let job = start.job.clone();
         let refused = |reason: Refusal, message: String| {
             vec![NodeJobMsg::Job {
@@ -362,14 +391,15 @@ impl Jobs {
         }
         let name = gitlab_id.to_string();
         // The ledger entry the job holds: its reservation's, renamed to the job, or a fresh
-        // one for a job placed without one.
+        // one for a job placed without one, past the gate.
+        let gate = state.gate(intake);
         let mut msgs = Vec::new();
         let taken = start
             .reservation
             .as_deref()
             .and_then(|r| state.ledger.take(r));
-        let held = match taken {
-            Some((_, held)) => {
+        let held = match (taken, gate) {
+            (Some((_, held)), _) => {
                 if let Some(r) = &start.reservation {
                     msgs.push(NodeJobMsg::Lease {
                         reservation: r.clone(),
@@ -380,10 +410,13 @@ impl Jobs {
                 }
                 held
             }
-            None if !ready => {
+            (None, Gate::NotReady) => {
                 return refused(Refusal::NotReady, "the node takes no new work".into());
             }
-            None => match state.ledger.admit(&name, &start.envelope) {
+            (None, Gate::Ceiling { ceiling, held }) => {
+                return refused(Refusal::Ceiling, Gate::ceiling_message(ceiling, held));
+            }
+            (None, Gate::Open) => match state.ledger.admit(&name, &start.envelope) {
                 Ok(held) => held,
                 Err((reason, message)) => {
                     let reason = match start.reservation {
@@ -789,6 +822,7 @@ fn refusal_change(
         (Refusal::Cpus, None) => "short of CPUs",
         (Refusal::Policy, None) => "not allowed by the configuration",
         (Refusal::NoReservation, None) => "no such reservation",
+        (Refusal::Ceiling, None) => "at the hub's ceiling",
         (Refusal::Other, None) => "for another reason",
     };
     Some(format!("refusing the hub's offers: {why}"))
@@ -876,14 +910,30 @@ pub(crate) mod tests {
         }
     }
 
-    fn jobs(tag: &str, budget: Option<u64>) -> (Arc<Jobs>, PathBuf) {
+    /// An empty directory of the test's own.
+    fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("vk-node-jobs-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn jobs(tag: &str, budget: Option<u64>) -> (Arc<Jobs>, PathBuf) {
+        let dir = scratch(tag);
         let cfg: Config =
             toml::from_str(&format!("state_dir = {:?}\n", dir.display().to_string())).unwrap();
         (for_test(&dir, cfg, budget), dir)
     }
+
+    const OPEN: Intake = Intake {
+        ready: true,
+        ceiling: None,
+    };
+
+    const NOT_READY: Intake = Intake {
+        ready: false,
+        ceiling: None,
+    };
 
     fn start(job: &str, reservation: Option<String>, id: u64) -> HubJobMsg {
         HubJobMsg::Start(Box::new(JobStart {
@@ -924,13 +974,13 @@ pub(crate) mod tests {
             lease_secs: 90,
         };
         assert_eq!(
-            jobs.handle(offer, true, now),
+            jobs.handle(offer, OPEN, now),
             vec![NodeJobMsg::OfferReply {
                 reservation: hex("a"),
                 reply: OfferReply::Accepted { lease_secs: 90 }
             }]
         );
-        let replies = jobs.handle(start(&hex("b"), Some(hex("a")), 4242), true, now);
+        let replies = jobs.handle(start(&hex("b"), Some(hex("a")), 4242), OPEN, now);
         assert_eq!(
             replies,
             vec![
@@ -953,7 +1003,7 @@ pub(crate) mod tests {
         assert!(response.contains("4242") && !response.contains("glcbt"));
         // A redelivered start is answered from the journal, not run again: this driver has
         // already finished.
-        let again = jobs.handle(start(&hex("b"), Some(hex("a")), 4242), true, now);
+        let again = jobs.handle(start(&hex("b"), Some(hex("a")), 4242), OPEN, now);
         assert_eq!(
             again,
             vec![NodeJobMsg::Job {
@@ -977,7 +1027,7 @@ pub(crate) mod tests {
                 job: hex("b"),
                 offset: data.len() as u64,
             },
-            true,
+            OPEN,
             now,
         );
         let msgs = jobs.poll(now, false);
@@ -993,7 +1043,7 @@ pub(crate) mod tests {
                 .iter()
                 .any(|m| matches!(m, NodeJobMsg::Result { .. }))
         );
-        jobs.handle(HubJobMsg::Recorded { job: hex("b") }, true, now);
+        jobs.handle(HubJobMsg::Recorded { job: hex("b") }, OPEN, now);
         assert!(!job_dir.exists());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1002,7 +1052,7 @@ pub(crate) mod tests {
     fn a_start_without_a_held_reservation_is_admitted_or_refused_at_once() {
         let (jobs, dir) = jobs("noresv", Some(2048));
         let now = Instant::now();
-        let refused = jobs.handle(start(&hex("b"), Some(hex("a")), 1), true, now);
+        let refused = jobs.handle(start(&hex("b"), Some(hex("a")), 1), OPEN, now);
         assert!(matches!(
             refused.as_slice(),
             [NodeJobMsg::Job {
@@ -1014,7 +1064,7 @@ pub(crate) mod tests {
             }]
         ));
         assert!(!dir.join("jobs").join(hex("b")).exists());
-        let not_ready = jobs.handle(start(&hex("c"), None, 2), false, now);
+        let not_ready = jobs.handle(start(&hex("c"), None, 2), NOT_READY, now);
         assert!(matches!(
             not_ready.as_slice(),
             [NodeJobMsg::Job {
@@ -1028,6 +1078,124 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A driver that has started and not finished.
+    fn running_driver(_: &Jobs, _: &Path, held: Option<crate::admit::Reservation>) -> Result<()> {
+        drop(held);
+        Ok(())
+    }
+
+    /// At the hub's ceiling, a node refuses new reservations and jobs not on one, counting
+    /// both; it still renews what it holds and starts jobs on it. Lowering the ceiling stops
+    /// nothing running, and a job ending makes room again.
+    #[test]
+    fn the_hubs_ceiling_caps_placed_jobs_and_reservations() {
+        let dir = scratch("ceiling");
+        let cfg: Config =
+            toml::from_str(&format!("state_dir = {:?}\n", dir.display().to_string())).unwrap();
+        let limits = Limits {
+            admit_dir: dir.join("admit"),
+            jobs_dir: dir.join("vm-jobs"),
+            budget_mib: None,
+            disk_admission: false,
+            max_cpus: 8,
+        };
+        let jobs = Jobs::open_with(&dir, Arc::new(cfg), limits, running_driver, fake_cleanup);
+        let now = Instant::now();
+        let at = |ceiling| Intake {
+            ready: true,
+            ceiling: Some(ceiling),
+        };
+        let offer = |id: &str| HubJobMsg::Offer {
+            reservation: hex(id),
+            envelope: envelope(1024),
+            lease_secs: 90,
+        };
+        let granted = |msgs: Vec<NodeJobMsg>| {
+            matches!(
+                msgs.as_slice(),
+                [NodeJobMsg::OfferReply {
+                    reply: OfferReply::Accepted { .. },
+                    ..
+                }]
+            )
+        };
+        let refused_at_ceiling = |msgs: &[NodeJobMsg]| {
+            matches!(
+                msgs,
+                [NodeJobMsg::OfferReply {
+                    reply: OfferReply::Refused {
+                        reason: Refusal::Ceiling,
+                        ..
+                    },
+                    ..
+                }] | [NodeJobMsg::Job {
+                    state: RunState::Refused {
+                        reason: Refusal::Ceiling,
+                        ..
+                    },
+                    ..
+                }]
+            )
+        };
+        assert!(granted(jobs.handle(offer("a"), at(2), now)));
+        let msgs = jobs.handle(start(&hex("b"), None, 2), at(2), now);
+        assert!(
+            matches!(
+                msgs.as_slice(),
+                [NodeJobMsg::Job {
+                    state: RunState::Accepted,
+                    ..
+                }]
+            ),
+            "{msgs:?}"
+        );
+        // A reservation and a job: full.
+        let msgs = jobs.handle(offer("c"), at(2), now);
+        assert!(refused_at_ceiling(&msgs), "{msgs:?}");
+        let msgs = jobs.handle(start(&hex("e"), None, 5), at(2), now);
+        assert!(refused_at_ceiling(&msgs), "{msgs:?}");
+        assert!(!dir.join("jobs").join(hex("e")).exists());
+        // What it holds is renewed and started on all the same.
+        assert!(granted(jobs.handle(offer("a"), at(2), now)));
+        let msgs = jobs.handle(start(&hex("d"), Some(hex("a")), 4), at(2), now);
+        assert!(
+            matches!(
+                msgs.first(),
+                Some(NodeJobMsg::Job {
+                    state: RunState::Accepted,
+                    ..
+                })
+            ),
+            "{msgs:?}"
+        );
+        let msgs = jobs.handle(offer("c"), at(2), now);
+        assert!(refused_at_ceiling(&msgs), "{msgs:?}");
+        // Lowered under them, both jobs carry on: nothing is canceled.
+        let msgs = jobs.handle(offer("c"), at(1), now);
+        assert!(refused_at_ceiling(&msgs), "{msgs:?}");
+        let NodeJobMsg::Held(held) = jobs.held(now) else {
+            panic!("not held");
+        };
+        assert_eq!(held.jobs.len(), 2);
+        assert!(held.jobs.iter().all(|j| !j.finished));
+        for job in ["b", "d"] {
+            assert!(
+                !dir.join("jobs")
+                    .join(hex(job))
+                    .join(journal::CANCEL)
+                    .exists()
+            );
+        }
+        // One ends: room for one more under 2, none under 1.
+        let ended = dir.join("jobs").join(hex("b"));
+        journal::write_json(&ended.join(journal::RESULT), &interrupted()).unwrap();
+        jobs.poll(now, false);
+        let msgs = jobs.handle(offer("c"), at(1), now);
+        assert!(refused_at_ceiling(&msgs), "{msgs:?}");
+        assert!(granted(jobs.handle(offer("c"), at(2), now)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_reconnect_resends_from_the_hubs_ack_and_leases_lapse() {
         let (jobs, dir) = jobs("reconnect", None);
@@ -1038,10 +1206,10 @@ pub(crate) mod tests {
                 envelope: envelope(1),
                 lease_secs: 5,
             },
-            true,
+            OPEN,
             now,
         );
-        jobs.handle(start(&hex("b"), None, 7), true, now);
+        jobs.handle(start(&hex("b"), None, 7), OPEN, now);
         assert!(!jobs.poll(now, false).is_empty());
         // A new session: held lists both, and output waits for the hub's offset.
         let NodeJobMsg::Held(held) = jobs.held(now) else {
@@ -1065,7 +1233,7 @@ pub(crate) mod tests {
                 job: hex("b"),
                 offset: 2,
             },
-            true,
+            OPEN,
             now,
         );
         let msgs = jobs.poll(now, false);
@@ -1080,7 +1248,7 @@ pub(crate) mod tests {
                     job: hex("b"),
                     mode: CancelMode::Immediate
                 },
-                true,
+                OPEN,
                 now
             )
             .is_empty()
@@ -1098,7 +1266,7 @@ pub(crate) mod tests {
                 envelope: envelope(1024),
                 lease_secs: 90,
             },
-            true,
+            OPEN,
             now,
         );
         // Another holder has the GitLab job's ledger name: the reservation cannot become it.
@@ -1112,7 +1280,7 @@ pub(crate) mod tests {
         let _other = crate::admit::try_acquire(&dir.join("admit"), "4242", &ask)
             .unwrap()
             .unwrap();
-        let replies = jobs.handle(start(&hex("b"), Some(hex("a")), 4242), true, now);
+        let replies = jobs.handle(start(&hex("b"), Some(hex("a")), 4242), OPEN, now);
         assert!(
             matches!(
                 replies.as_slice(),
@@ -1221,7 +1389,7 @@ pub(crate) mod tests {
                 job: hex("b"),
                 offset: 0,
             },
-            true,
+            OPEN,
             now,
         );
         // A driver still starting has the benefit of the doubt.
@@ -1268,7 +1436,7 @@ pub(crate) mod tests {
                 job: hex("b"),
                 offset: 0,
             },
-            true,
+            OPEN,
             now,
         );
         let later = now + DRIVER_START;
@@ -1299,7 +1467,7 @@ pub(crate) mod tests {
                 job: hex("b"),
                 offset: 0,
             },
-            true,
+            OPEN,
             now,
         );
         let cancel = |mode| {
@@ -1308,7 +1476,7 @@ pub(crate) mod tests {
                     job: hex("b"),
                     mode,
                 },
-                true,
+                OPEN,
                 now,
             )
         };
@@ -1321,7 +1489,7 @@ pub(crate) mod tests {
                 job: hex("c"),
                 mode: CancelMode::Immediate,
             },
-            true,
+            OPEN,
             now,
         );
         assert!(matches!(
@@ -1352,7 +1520,7 @@ pub(crate) mod tests {
                     job: hex("b"),
                     mode: CancelMode::Immediate
                 },
-                true,
+                OPEN,
                 now
             )
             .is_empty()
@@ -1364,7 +1532,7 @@ pub(crate) mod tests {
         let msgs = jobs.poll(now, false);
         assert!(!msgs.iter().any(|m| matches!(m, NodeJobMsg::Output { .. })));
         assert!(msgs.iter().any(|m| matches!(m, NodeJobMsg::Result { .. })));
-        jobs.handle(HubJobMsg::Recorded { job: hex("b") }, true, now);
+        jobs.handle(HubJobMsg::Recorded { job: hex("b") }, OPEN, now);
         assert!(!job_dir.exists());
         let NodeJobMsg::Held(held) = jobs.held(now) else {
             panic!("not held");

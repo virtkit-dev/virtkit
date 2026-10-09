@@ -2191,6 +2191,210 @@ async fn a_start_on_a_reservation_counts_against_room_until_a_heartbeat_shows_it
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The next start the hub sends `node`, past the other job messages.
+async fn next_start(node: &mut FakeNode) -> Box<vk_hub_proto::dispatch::JobStart> {
+    loop {
+        if let HubJobMsg::Start(start) = node.job().await {
+            return start;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_at_its_ceiling_is_placed_nothing_until_a_job_ends() {
+    let dir = scratch("ceiling");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    // Memory for four envelopes, a ceiling of two.
+    let mut node = ready_node(addr, &hub, 16384).await;
+    crate::ops::set_ceiling(&hub, "uid 0", &node.id, Some(2)).unwrap();
+    let fits = || async {
+        crate::jobs::capacity(&hub, &placement())
+            .await
+            .unwrap()
+            .fits
+    };
+    assert_eq!(fits().await, 2);
+    // A reservation and a job fill it.
+    reserve_on(addr, &key, &mut node, 1).await;
+    assert_eq!(fits().await, 1);
+    let first = running_job(addr, &key, &mut node, 2).await;
+    assert_eq!(fits().await, 0);
+    assert_eq!(crate::jobs::placed_on(&hub, &node.id), 2);
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/reservations",
+        Some(&key),
+        Some(reservation_body(3, 1)),
+    )
+    .await;
+    assert_eq!(resp.code(), ErrorCode::NoCapacity, "{resp:?}");
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body(4, None, 30)),
+    )
+    .await;
+    let waiting: JobView = resp.json();
+    node.quiet(Duration::from_secs(1)).await;
+    // Lowered under what it holds, nothing it runs is canceled.
+    crate::ops::set_ceiling(&hub, "uid 0", &node.id, Some(1)).unwrap();
+    node.quiet(Duration::from_millis(500)).await;
+    crate::ops::set_ceiling(&hub, "uid 0", &node.id, Some(2)).unwrap();
+    // The job ends: the waiting one goes to the node.
+    node.send(NodeJobMsg::Result {
+        job: first,
+        result: result(None, 0),
+    });
+    assert_eq!(next_start(&mut node).await.job, waiting.id);
+    assert_eq!(fits().await, 0);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_the_hub_disowned_counts_against_the_ceiling_until_it_ends() {
+    let dir = scratch("ceiling-disowned");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let node_key = keypair();
+    let id = new_node(addr, &hub, &node_key).await;
+    crate::ops::set_ceiling(&hub, "uid 0", &id, Some(1)).unwrap();
+    let stray = "5e".repeat(16);
+    let held = Held {
+        reservations: vec![],
+        jobs: vec![HeldJob {
+            job: stray.clone(),
+            state: RunState::Running {
+                stage: "step_script".into(),
+            },
+            output_len: 0,
+            finished: false,
+        }],
+    };
+    let mut node = connect(addr, &id, &node_key, V3, 16384, Some(held)).await;
+    wait_until(|| crate::jobs::testing::linked(&hub, &id) && heard(&hub, &id)).await;
+    assert!(matches!(node.job().await, HubJobMsg::Cancel { .. }));
+    let fits = || async {
+        crate::jobs::capacity(&hub, &placement())
+            .await
+            .unwrap()
+            .fits
+    };
+    assert_eq!(fits().await, 0);
+    node.send(NodeJobMsg::Result {
+        job: stray.clone(),
+        result: result(Some(FailureClass::Canceled), 0),
+    });
+    assert_eq!(node.job().await, HubJobMsg::Recorded { job: stray });
+    assert_eq!(fits().await, 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A node refusing `ceiling` while the hub counts room on it is passed over: the offer goes
+/// to another node, and so does the start it refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_refusing_at_its_ceiling_is_passed_over() {
+    let dir = scratch("ceiling-refused");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let mut big = ready_node(addr, &hub, 32768).await;
+    let mut small = ready_node(addr, &hub, 8192).await;
+    let ceiling = || OfferReply::Refused {
+        reason: Refusal::Ceiling,
+        message: None,
+    };
+    let ask = {
+        let key = key.clone();
+        tokio::spawn(async move {
+            api(
+                addr,
+                "POST",
+                "/v1/reservations",
+                Some(&key),
+                Some(reservation_body(1, 5)),
+            )
+            .await
+        })
+    };
+    let HubJobMsg::Offer { reservation, .. } = big.job().await else {
+        panic!("expected an offer");
+    };
+    big.send(NodeJobMsg::OfferReply {
+        reservation,
+        reply: ceiling(),
+    });
+    let HubJobMsg::Offer { reservation, .. } = small.job().await else {
+        panic!("expected an offer");
+    };
+    small.send(NodeJobMsg::OfferReply {
+        reservation,
+        reply: OfferReply::Accepted { lease_secs: 60 },
+    });
+    let resp = ask.await.unwrap();
+    assert_eq!(resp.status, 201, "{resp:?}");
+    assert_eq!(
+        crate::jobs::last_refusal(&hub, &big.id).as_deref(),
+        Some("ceiling")
+    );
+
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body(2, None, 30)),
+    )
+    .await;
+    let job: JobView = resp.json();
+    let start = next_start(&mut big).await;
+    assert_eq!(start.job, job.id);
+    big.send(NodeJobMsg::Job {
+        job: job.id.clone(),
+        state: RunState::Refused {
+            reason: Refusal::Ceiling,
+            message: None,
+        },
+    });
+    assert_eq!(next_start(&mut small).await.job, job.id);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A node's page wakes when the hub places work on it, which only dispatch notes, and not for
+/// work placed elsewhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_s_page_wakes_when_work_is_placed_on_it() {
+    let hub = Arc::new(Hub::new(Arc::new(Db::open_memory().unwrap()), None));
+    let (node, other) = ("ab".repeat(16), "cd".repeat(16));
+    let mut work = crate::jobs::subscribe_node_work(&hub, &node);
+    let elsewhere = crate::jobs::subscribe_node_work(&hub, &other);
+    crate::jobs::testing::offer_unanswered(&hub, &node);
+    wait_until(|| work.has_changed().unwrap()).await;
+    assert!(!elsewhere.has_changed().unwrap());
+    work.borrow_and_update();
+    crate::jobs::testing::offer_unanswered(&hub, &other);
+    wait_until(|| elsewhere.has_changed().unwrap()).await;
+    assert!(!work.has_changed().unwrap());
+}
+
+/// The task behind a node page's wake-ups ends with the page's stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_s_page_wake_ups_end_with_its_stream() {
+    let hub = Arc::new(Hub::new(Arc::new(Db::open_memory().unwrap()), None));
+    let node = "ab".repeat(16);
+    let work = crate::jobs::subscribe_node_work(&hub, &node);
+    // The task holds the hub, and the node's notifications, until it ends.
+    assert_eq!(hub.followed_nodes(), 1);
+    assert!(Arc::strong_count(&hub) > 1);
+    drop(work);
+    crate::jobs::testing::offer_unanswered(&hub, &node);
+    wait_until(|| Arc::strong_count(&hub) == 1).await;
+    // A notification for the node finds no one following it and forgets it.
+    hub.changed(&node);
+    assert_eq!(hub.followed_nodes(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_on_a_reservation_with_no_placement_window_starts() {
     let dir = scratch("window-0");

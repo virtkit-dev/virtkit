@@ -507,10 +507,12 @@ enum NodesCmd {
         /// The node's ID, as `vk-hub nodes` lists it
         id: String,
     },
-    /// Cap how many jobs the node's runner accepts, or lift the cap with `none`
+    /// Cap how many jobs the node runs at once, or lift the cap with `none`
     ///
-    /// The node takes the smallest of this, its own estimate and its local ceiling; the hub
-    /// only ever lowers what the node would take.
+    /// For the node's runner, the node takes the smallest of this, its own estimate and its
+    /// local ceiling; the hub only ever lowers what the node would take. The jobs the hub
+    /// places are capped at it apart: reservations and jobs not finished, counted by the hub
+    /// and again by the node. Running jobs past a lowered cap carry on.
     Ceiling {
         id: String,
         /// A number of jobs, or `none`

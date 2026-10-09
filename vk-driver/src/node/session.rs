@@ -386,10 +386,13 @@ pub async fn run(
 
 /// A job message from the hub, answered from the node's ledger and job journal.
 async fn handle_job(node: &Node, msg: vk_hub_proto::dispatch::HubJobMsg) -> Result<Vec<NodeMsg>> {
-    let ready = super::jobs::ready(node.core.state(), *node.core.acquire().borrow());
+    let intake = super::jobs::Intake {
+        ready: super::jobs::ready(node.core.state(), *node.core.acquire().borrow()),
+        ceiling: node.core.hub_ceiling(),
+    };
     let jobs = node.jobs.clone();
     let replies =
-        tokio::task::spawn_blocking(move || jobs.handle(msg, ready, std::time::Instant::now()))
+        tokio::task::spawn_blocking(move || jobs.handle(msg, intake, std::time::Instant::now()))
             .await
             .context("handling a job message")?;
     Ok(replies.into_iter().map(NodeMsg::Job).collect())

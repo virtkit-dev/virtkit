@@ -60,7 +60,8 @@ move to another runner. So the daemon holds capacity before it asks, never after
 
 - **Capacity first.** `POST /v1/capacity` is advisory: the hub's count, from heartbeats less
   the reservations and starting jobs they do not show yet, of how many envelopes of the
-  placement its ready nodes could take.
+  placement its ready nodes could take, each node at most what its concurrency ceiling leaves
+  past the reservations and jobs it holds.
   The daemon does not poll GitLab for a runner while it is 0, so a fleet with no room leaves
   the job pending in GitLab for another runner.
 - **Then a reservation.** Before each job request the daemon holds a reservation. The node
@@ -109,6 +110,10 @@ hub's operator names (`vk-hub nodes pools <id> <a,b>`); a label is one a node de
 own configuration and reports in its inventory's `labels`, absent from an older node's. The API key's
 policy on the hub decides the pools the daemon may use and the largest envelope it may ask
 for.
+
+A node's concurrency ceiling (`vk-hub nodes ceiling`) caps its placed work: the hub offers and
+starts nothing on a node whose reservations and jobs not finished reach it, and the node
+refuses `ceiling` past it by its own count. Running jobs above a lowered ceiling carry on.
 
 ## Daemon ↔ hub: the client API
 
@@ -219,8 +224,9 @@ one offering at most 2 is steered and never offered a job.
 | `result {job, result}` | how the job ended; repeated until `recorded` |
 
 Refusal reasons are `memory`, `disk`, `cpus`, `not_ready` (draining, drained, quarantined, in
-maintenance), `policy`, `no_reservation` and `invalid`; one the hub does not know reads as
-`other`.
+maintenance), `policy`, `no_reservation`, `invalid` and `ceiling` (the node's placed jobs not
+finished and reservations held reach the hub's ceiling, as the node last applied it); one the
+hub does not know reads as `other`, as `ceiling` does on a hub older than it.
 
 **Reservations.** A node answers an offer at once from its ledger: granted, or refused with
 the resource that is short. It holds the entry in the ledger itself, with no job process

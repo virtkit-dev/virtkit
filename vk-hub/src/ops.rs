@@ -59,6 +59,10 @@ pub struct NodeView {
     /// The CI tools it built from a definition of the hub's and made current.
     #[serde(default)]
     pub tools: Option<vk_hub_proto::ToolsInstalled>,
+    /// The reservations and jobs not finished the hub has placed on it, as counted against
+    /// its ceiling; `None` from a hub that places no jobs.
+    #[serde(default)]
+    pub placed: Option<u64>,
 }
 
 impl NodeView {
@@ -106,6 +110,9 @@ pub fn node_view(hub: &Hub, id: String, row: &NodeRow) -> NodeView {
         labels: inventory.map(|i| i.labels.clone()).unwrap_or_default(),
         last_refusal: crate::jobs::last_refusal(hub, &id),
         tools: inventory.and_then(|i| i.versions.tools.clone()),
+        placed: crate::jobs::accepting(hub)
+            .is_ok()
+            .then(|| crate::jobs::placed_on(hub, &id)),
         id,
     }
 }

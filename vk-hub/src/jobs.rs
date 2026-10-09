@@ -16,6 +16,9 @@
 //! it has committed, or the memory available, and the jobs filesystem's free space — less
 //! what the hub has asked of it since: reservations accepted after that heartbeat, offers
 //! and starts not yet answered. Offers and starts go to the node with the most room first.
+//! A node the operator gave a concurrency ceiling takes placed work only below it, counted by
+//! [`placed`]: the node refuses past it too ([`Refusal::Ceiling`]), should the hub's count
+//! fall short of the node's.
 //! The hub places a job again only while no node can have started it: after a refused start,
 //! or a start that never went out; a start whose answer was lost waits for the node's `held`.
 //!
@@ -131,6 +134,10 @@ struct State {
     finished: HashMap<String, JobRow>,
     /// Why each node refused its latest offer, until it accepts one.
     refusals: HashMap<String, String>,
+    /// Jobs not finished that each node named in its `held` and the hub holds no live record
+    /// of — ended here while the node was away, or never known — until their result comes:
+    /// the node is stopping them, and they count against its ceiling meanwhile.
+    disowned: HashMap<String, HashSet<String>>,
     /// Since when each node holding a job has been seen unreachable.
     unreachable_since: HashMap<String, Instant>,
     /// Each placement's last capacity, its revision and when it was last asked, by the
@@ -472,6 +479,7 @@ fn refusal_name(r: Refusal) -> &'static str {
         Refusal::Policy => "policy",
         Refusal::NoReservation => "no reservation",
         Refusal::Invalid => "invalid",
+        Refusal::Ceiling => "ceiling",
         Refusal::Other => "other",
     }
 }
@@ -545,6 +553,8 @@ pub async fn close_link(hub: &Hub, node: &str, session: u64) {
             return;
         }
         state.links.remove(node);
+        // The node names those it still runs in its next session's `held`.
+        state.disowned.remove(node);
         end_reservations(&mut state, node)
     };
     hub.dispatch.bump();
@@ -637,15 +647,15 @@ async fn on_held(hub: &Hub, node: &str, held: Held) -> Result<Vec<HubJobMsg>> {
         }
         let named: HashSet<String> = held.jobs.iter().map(|j| j.job.clone()).collect();
         let mut unknown = Vec::new();
+        let mut disowned = HashSet::new();
         for j in held.jobs {
-            let Some(job) = state.jobs.get_mut(&j.job) else {
+            let Some(job) = (state.jobs.get_mut(&j.job)).filter(|x| x.node() == Some(node)) else {
+                if !j.finished {
+                    disowned.insert(j.job.clone());
+                }
                 unknown.push(j.job);
                 continue;
             };
-            if job.node() != Some(node) {
-                unknown.push(j.job);
-                continue;
-            }
             // Journaled: accepted, whatever answer was lost.
             if job.row.state != JobState::Running {
                 job.row.state = JobState::Running;
@@ -689,6 +699,11 @@ async fn on_held(hub: &Hub, node: &str, held: Held) -> Result<Vec<HubJobMsg>> {
             ) {
                 writes.push((id, w.0, w.1));
             }
+        }
+        if disowned.is_empty() {
+            state.disowned.remove(node);
+        } else {
+            state.disowned.insert(node.to_string(), disowned);
         }
         unknown
     };
@@ -950,6 +965,12 @@ async fn on_result(
         let mut state = hub.dispatch.lock();
         let Some(job) = state.jobs.get_mut(id).filter(|j| j.node() == Some(node)) else {
             // Ended by the hub, or never its: recorded all the same, so the node stops.
+            if let Some(d) = state.disowned.get_mut(node) {
+                d.remove(id);
+                if d.is_empty() {
+                    state.disowned.remove(node);
+                }
+            }
             return Ok(recorded);
         };
         if result.output_len != job.row.output_len {
@@ -1014,6 +1035,10 @@ fn room(hub: &Hub, state: &State, node: &str, row: &NodeRow, placement: &Placeme
     if env.cpus > inventory.hardware.cpus {
         return None;
     }
+    let below_ceiling = match row.desired.as_ref().and_then(|d| d.ceiling) {
+        Some(ceiling) => u64::from(ceiling).saturating_sub(placed(state, node)),
+        None => MAX_FITS,
+    };
     let heartbeat = row.heartbeat.as_ref()?;
     let since = row.heartbeat_at.unwrap_or(0);
     // What the hub asked of it that its heartbeat does not show yet.
@@ -1045,7 +1070,7 @@ fn room(hub: &Hub, state: &State, node: &str, row: &NodeRow, placement: &Placeme
         _ => heartbeat.mem_available_mib?,
     }
     .saturating_sub(pending.mem_mib);
-    let mut fits = MAX_FITS;
+    let mut fits = below_ceiling.min(MAX_FITS);
     if let Some(n) = mem_free.checked_div(env.mem_mib) {
         fits = fits.min(n);
     }
@@ -1062,6 +1087,65 @@ fn room(hub: &Hub, state: &State, node: &str, row: &NodeRow, placement: &Placeme
         fits = fits.min(n);
     }
     (fits > 0).then_some(fits)
+}
+
+/// How much placed work `node` holds as the hub counts it against the node's ceiling, one
+/// per job it will run: reservations offered and not refused (an offer abandoned is counted
+/// until the node answers it), jobs sent to it and not finished, and jobs it named in its
+/// `held` that the hub has disowned, until their result comes. A job submitted on a
+/// reservation counts as the reservation until it is sent, as the job after.
+fn placed(state: &State, node: &str) -> u64 {
+    let reservations = (state.reservations.values())
+        .filter(|r| r.node == node && !matches!(r.phase, ResvPhase::Refused(_)))
+        .count();
+    let jobs = (state.jobs.values())
+        .filter(|j| j.node() == Some(node))
+        .count();
+    let disowned = state.disowned.get(node).map_or(0, HashSet::len);
+    u64::try_from(reservations.saturating_add(jobs).saturating_add(disowned)).unwrap_or(u64::MAX)
+}
+
+/// How much placed work `node` holds as the hub counts it against its ceiling.
+pub fn placed_on(hub: &Hub, node: &str) -> u64 {
+    placed(&hub.dispatch.lock(), node)
+}
+
+/// Wake on the next [`Hub::changed`] of `node`, or change to what the hub has placed on it
+/// ([`placed_on`]) or to why it refuses offers ([`last_refusal`]), which the hub notes only
+/// as a change to dispatch at large: a task compares them on each such change, so a node's
+/// page is not rendered for every other node's work.
+pub fn subscribe_node_work(hub: &Arc<Hub>, node: &str) -> watch::Receiver<u64> {
+    let mut changed = hub.subscribe_node(node);
+    let mut dispatch = hub.dispatch.subscribe();
+    let (tx, rx) = watch::channel(0u64);
+    let (hub, node) = (hub.clone(), node.to_string());
+    let work = move || {
+        let state = hub.dispatch.lock();
+        (placed(&state, &node), state.refusals.get(&node).cloned())
+    };
+    let mut shown = work();
+    tokio::spawn(async move {
+        loop {
+            let ours = tokio::select! {
+                () = tx.closed() => return,
+                r = changed.changed() => match r {
+                    Ok(()) => true,
+                    Err(_) => return,
+                },
+                r = dispatch.changed() => match r {
+                    Ok(()) => false,
+                    Err(_) => return,
+                },
+            };
+            let now = work();
+            if !ours && now == shown {
+                continue;
+            }
+            shown = now;
+            tx.send_modify(|n| *n = n.wrapping_add(1));
+        }
+    });
+    rx
 }
 
 /// The nodes with room for `placement`, most room first, but those in `skip`.
@@ -2173,6 +2257,24 @@ pub(crate) mod testing {
     /// [`output_tail`], for tests.
     pub fn output_tail(dir: &Path, id: &str, len: u64, max: u64) -> Result<Vec<u8>> {
         super::output_tail(dir, id, len, max)
+    }
+
+    /// Offer `node` a reservation it has not answered, as the hub counts against its
+    /// ceiling.
+    pub fn offer_unanswered(hub: &Hub, node: &str) {
+        let id = crate::random_hex(vk_hub_proto::ID_BYTES).unwrap();
+        hub.dispatch.lock().reservations.insert(
+            id,
+            Resv {
+                key: "k".into(),
+                node: node.to_string(),
+                envelope: Envelope::default(),
+                phase: ResvPhase::Offered,
+                accepted_at: 0,
+                leases: 0,
+            },
+        );
+        hub.dispatch.bump();
     }
 
     /// How many placements' capacity revisions the hub keeps.

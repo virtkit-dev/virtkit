@@ -178,6 +178,9 @@ pub enum Refusal {
     NoReservation,
     /// The job's spec could not be read.
     Invalid,
+    /// The node already runs or holds as many placed jobs and reservations as the hub's
+    /// concurrency ceiling allows. A hub older than this reason reads it as [`Refusal::Other`].
+    Ceiling,
     /// A reason from a later node.
     #[serde(other)]
     Other,
@@ -426,6 +429,31 @@ mod tests {
         );
         let end: LeaseEnd = serde_json::from_value(json!("preempted")).unwrap();
         assert_eq!(end, LeaseEnd::Other);
+    }
+
+    /// `ceiling` came after the first nodes: a hub that knows it reads it, and one that does
+    /// not reads it as any later reason, `other`.
+    #[test]
+    fn a_ceiling_refusal_reads_as_ceiling_and_as_other_before_it() {
+        let refused = OfferReply::Refused {
+            reason: Refusal::Ceiling,
+            message: None,
+        };
+        let wire = serde_json::to_value(&refused).unwrap();
+        assert_eq!(wire, json!({"state": "refused", "reason": "ceiling"}));
+        assert_eq!(serde_json::from_value::<OfferReply>(wire).unwrap(), refused);
+
+        #[derive(Debug, PartialEq, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Before {
+            Memory,
+            #[serde(other)]
+            Other,
+        }
+        assert_eq!(
+            serde_json::from_value::<Before>(json!("ceiling")).unwrap(),
+            Before::Other
+        );
     }
 
     #[test]
