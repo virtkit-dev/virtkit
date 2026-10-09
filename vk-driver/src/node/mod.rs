@@ -603,6 +603,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     core.set_placed(vk_hub_proto::PlacedIntake {
         runner: local_runner,
         limit: (cfg.executor.schedule.max_concurrency).map(std::num::NonZeroU32::get),
+        image_cache_idle_secs: Some(cfg.image_cache_idle().as_secs()),
     });
     let (halt, halted) = tokio::sync::watch::channel(false);
     let supervisor = spec.map(|spec| {

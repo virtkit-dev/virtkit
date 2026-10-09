@@ -883,6 +883,11 @@ pub struct PlacedIntake {
     /// `None`: no limit of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// How long the node keeps an image it built or pulled for a job once no job uses it
+    /// (`image_cache_idle_secs`), in seconds: at most how long the hub counts the node as still
+    /// holding the images of the jobs it ran. `None`: a node from before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_cache_idle_secs: Option<u64>,
 }
 
 impl Report {
@@ -2346,6 +2351,7 @@ mod tests {
             placed: Some(PlacedIntake {
                 runner: Some("[node] runner = \"managed\"".into()),
                 limit: None,
+                image_cache_idle_secs: None,
             }),
             ..steering_report()
         };
@@ -2357,9 +2363,12 @@ mod tests {
             &PlacedIntake {
                 runner: None,
                 limit: Some(3),
+                image_cache_idle_secs: Some(1800),
             },
-            json!({"limit": 3}),
+            json!({"limit": 3, "image_cache_idle_secs": 1800}),
         );
+        let older: PlacedIntake = serde_json::from_value(json!({"limit": 3})).unwrap();
+        assert_eq!(older.image_cache_idle_secs, None);
         assert_eq!(steering_report().placed, None);
     }
 
