@@ -124,10 +124,27 @@ pub(crate) fn try_reclaim(
     let Ok(file) = open_lock(lock) else {
         return false;
     };
+    reclaim_opened(&file, lock, used, idle, now, remove)
+}
+
+/// [`try_reclaim`] with `lock` already open as `file`.
+fn reclaim_opened(
+    file: &std::fs::File,
+    lock: &Path,
+    used: &Path,
+    idle: Duration,
+    now: SystemTime,
+    remove: impl FnOnce(),
+) -> bool {
     // A live user holds LOCK_SH, so a non-blocking LOCK_EX fails (EWOULDBLOCK): a sweep never
     // waits behind one.
     // SAFETY: the fd is owned by `file`, which outlives the call.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return false;
+    }
+    // As in `acquire_shared`, a lock on an unlinked file does not exclude users of an entry
+    // rebuilt at the same path after reclamation.
+    if !same_file(file, lock).unwrap_or(false) {
         return false;
     }
     let idle_ok = match std::fs::metadata(used).and_then(|m| m.modified()) {
@@ -190,6 +207,30 @@ mod tests {
         let lock = dir.join(".inuse");
         let used = dir.join(".used");
         (dir, lock, used)
+    }
+
+    // Replacing the entry between open and lock leaves us holding its old lock file;
+    // users of the new entry lock the replacement.
+    #[test]
+    fn a_lock_file_replaced_since_opened_reclaims_nothing() {
+        let (dir, lock, used) = sidecars("replaced");
+        stamp(&lock, &used);
+        let file = open_lock(&lock).unwrap();
+        std::fs::remove_file(&lock).unwrap();
+        stamp(&lock, &used);
+        let mut removed = false;
+        let reclaimed = reclaim_opened(
+            &file,
+            &lock,
+            &used,
+            Duration::ZERO,
+            SystemTime::now(),
+            || {
+                removed = true;
+            },
+        );
+        assert!(!reclaimed && !removed);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
