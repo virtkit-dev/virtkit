@@ -137,6 +137,12 @@ impl JobRow {
         Some(end.saturating_sub(self.started_at?).saturating_mul(1000))
     }
 
+    /// Start time on the hub's clock; `None` before node acceptance or after the job ends.
+    pub fn running_since(&self) -> Option<u64> {
+        self.started_at
+            .filter(|_| self.state != JobState::Finished && self.result.is_none())
+    }
+
     /// The job's outcome for history filtering.
     pub fn outcome(&self) -> JobOutcome {
         match (self.state, &self.result) {

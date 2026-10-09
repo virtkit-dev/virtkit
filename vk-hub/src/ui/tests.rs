@@ -3467,13 +3467,16 @@ async fn the_job_history_is_shown_filtered_and_paged() {
          rel=\"noopener noreferrer\">↗</a></td>",
         "<span class=\"badge bad\">script failure, exit 2</span>",
         "<span class=\"badge busy\">running: step_script</span>",
-        // Running for a minute and a half, by the hub's clock.
-        "<td class=\"num\">1m3",
+        // Running for 90 seconds by the hub's clock; the browser advances the duration.
+        "<td class=\"num\"><span data-since=\"",
+        "\">1m3",
         "<span class=\"badge\">queued</span>",
     ] {
         assert!(page.contains(want), "{want}: {page}");
     }
     assert!(!page.contains("href=\"javascript"), "{page}");
+    // Only the running job's duration advances.
+    assert_eq!(page.matches("data-since=").count(), 1, "{page}");
     // Newest first.
     let at = |name: &str| page.find(name).unwrap();
     assert!(at("build-104") < at("build-103") && at("build-103") < at("build-102"));
@@ -3882,6 +3885,8 @@ async fn a_running_job_s_page_follows_its_output() {
         )),
         "{page}"
     );
+    // The browser advances the duration from its start time between updates.
+    assert!(page.contains("<span data-since=\"20"), "{page}");
     let page = get(addr, &format!("/jobs/{id}"), Some(&viewer)).await.body;
     assert_only_embedded_scripts(&page);
     for want in [
@@ -3973,6 +3978,8 @@ async fn a_running_job_s_page_follows_its_output() {
         record.contains("<span class=\"badge ok\">success</span>"),
         "{record}"
     );
+    // The duration stops advancing when the job ends.
+    assert!(!record.contains("data-since"), "{record}");
     assert_eq!(
         stream.next().await.as_deref(),
         Some("event: close\ndata: \n\n")

@@ -2,6 +2,7 @@
 // ago it was, or how soon it is ("11:52 · 5 min ago"; the date too when not today), kept up
 // to date as the page's fragments are swapped in and as time passes. The page states the
 // UTC instant in each element's text and title, which is what shows without this script.
+// Running job durations advance each second from their start time (`data-since`).
 // Loaded as a file: the policy allows no inline script, and nothing here evaluates code.
 (function () {
   "use strict";
@@ -83,7 +84,45 @@
     }
   }
 
+  // How long since `ms`, as the hub writes a run time: 42s, 3m07s, 1h05m.
+  function elapsed(ms, now) {
+    var s = Math.max(0, Math.floor((now - ms) / 1000));
+    var pad = function (n) {
+      return (n < 10 ? "0" : "") + n;
+    };
+    if (s < 1) {
+      return "<1s";
+    }
+    if (s < 60) {
+      return s + "s";
+    }
+    if (s < 3600) {
+      return Math.floor(s / 60) + "m" + pad(s % 60) + "s";
+    }
+    return Math.floor(s / 3600) + "h" + pad(Math.floor((s % 3600) / 60)) + "m";
+  }
+
+  // Advance running job durations between page updates.
+  function tick() {
+    var now = Date.now() + skew;
+    var all = document.querySelectorAll("[data-since]");
+    for (var i = 0; i < all.length; i++) {
+      var ms = Date.parse(all[i].getAttribute("data-since"));
+      if (isNaN(ms)) {
+        continue;
+      }
+      var text = elapsed(ms, now);
+      if (all[i].textContent !== text) {
+        all[i].textContent = text;
+      }
+    }
+  }
+
   show();
+  tick();
+  document.addEventListener("htmx:afterSwap", tick);
+  document.addEventListener("htmx:oobAfterSwap", tick);
+  setInterval(tick, 1000);
   // A fragment swapped in, by a request or a live update, comes with the server's text.
   document.addEventListener("htmx:afterSwap", show);
   document.addEventListener("htmx:oobAfterSwap", show);

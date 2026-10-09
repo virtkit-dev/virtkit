@@ -10,8 +10,8 @@
 //! stream renders its own fragment, woken by [`Hub::jobs_changed`] alone. The summary reads the
 //! whole history, so the streams of one filter share a rendering ([`Renders`]), which a page
 //! loaded meanwhile starts from: a filter's page is read once per change to the jobs, and at
-//! most twice a heartbeat for how long its jobs have run, however many pages follow it. An older
-//! page stays as it was loaded.
+//! most twice a heartbeat for what it shows by the hub's clock, however many pages follow it.
+//! An older page stays as it was loaded.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -192,8 +192,8 @@ struct Rendered {
 impl Rendered {
     /// Whether the rendering is current at `now` for the jobs' `generation`. Expire it after
     /// half a heartbeat: streams request updates once a heartbeat, but the last rendering
-    /// may be slightly younger. A full-heartbeat limit would update run times only every
-    /// other heartbeat.
+    /// may be slightly younger. A full-heartbeat limit would renew what the page shows by the
+    /// hub's clock — run times for a page without `time.js` — only every other heartbeat.
     fn stands(&self, generation: u64, now: Instant) -> bool {
         self.generation == generation && now.duration_since(self.at) < HEARTBEAT / 2
     }
@@ -617,9 +617,9 @@ fn job_row(
         Some(at) => pages::at(h, at),
         None => h.raw("-"),
     };
+    h.raw("</td><td class=\"num\">");
+    ran(h, j, now);
     h.raw("</td><td class=\"num\">")
-        .text(dash_or(j.ran_ms(now).map(crate::jobs::run_text)))
-        .raw("</td><td class=\"num\">")
         .text(dash_or(usage.and_then(|u| u.peak_mem_bytes).map(bytes)))
         .raw("</td><td class=\"num\">")
         .text(dash_or(
@@ -763,6 +763,21 @@ fn job_page(id: &str, j: &JobRow, output: &Output, names: &[(String, String)], n
     h
 }
 
+/// Job `j`'s elapsed run time. While running, `data-since` holds its start time so
+/// `time.js` advances the duration each second between page updates.
+fn ran(h: &mut Html, j: &JobRow, now: u64) {
+    let text = dash_or(j.ran_ms(now).map(crate::jobs::run_text));
+    match j.running_since() {
+        Some(at) => h
+            .raw("<span data-since=\"")
+            .text(crate::utc(at))
+            .raw("\">")
+            .text(text)
+            .raw("</span>"),
+        None => h.text(text),
+    };
+}
+
 /// A job's record, as its page shows it.
 pub(super) fn record(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>, now: u64) {
     let result = j.result.as_ref();
@@ -800,7 +815,9 @@ pub(super) fn record(h: &mut Html, j: &JobRow, names: &HashMap<&str, &str>, now:
         };
         pages::kv_html(h, key, &cell);
     }
-    pages::kv(h, "Ran", &dash_or(j.ran_ms(now).map(crate::jobs::run_text)));
+    let mut cell = Html::new();
+    ran(&mut cell, j, now);
+    pages::kv_html(h, "Ran", &cell);
     pages::kv(
         h,
         "Peak memory",
