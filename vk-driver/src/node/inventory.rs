@@ -1,7 +1,8 @@
 //! What `vk node` reports: the inventory — hardware, storage, versions, runner — and the
 //! heartbeat's readings, with the workloads read alongside them. Everything comes from what
 //! the rest of `vk` already measures: the admission ledger, the scheduler's
-//! desired-concurrency file, the memory budget, the NUMA topology and `vk check`.
+//! desired-concurrency file, the memory budget, the NUMA topology and `vk check` — except the
+//! load average, read from `/proc/loadavg`.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -176,8 +177,26 @@ pub fn heartbeat(cfg: &Config, readings: &mut Readings) -> (Heartbeat, Listed) {
             })
             .collect(),
         workload_mem_bytes,
+        // Unreadable (no procfs): reported as none.
+        load1_hundredths: std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|t| load1_hundredths(&t)),
     };
     (heartbeat, workloads)
+}
+
+/// The 1-minute load average of a `/proc/loadavg` line, in hundredths.
+fn load1_hundredths(loadavg: &str) -> Option<u32> {
+    let (whole, frac) = loadavg.split_whitespace().next()?.split_once('.')?;
+    let frac = frac.get(..2)?;
+    if !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    whole
+        .parse::<u32>()
+        .ok()?
+        .checked_mul(100)?
+        .checked_add(frac.parse().ok()?)
 }
 
 /// The filesystems a node reports: the job dirs always, host checkouts when the executor
@@ -354,6 +373,15 @@ fn parse_runner(text: &str) -> Option<Runner> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_average_is_read_in_hundredths() {
+        assert_eq!(load1_hundredths("3.07 2.50 1.00 4/812 9921\n"), Some(307));
+        assert_eq!(load1_hundredths("0.00 0.00 0.00 1/1 1"), Some(0));
+        for bad in ["", "3 2 1", "x.07 1 1", "3.0", "3.-7 1 1"] {
+            assert_eq!(load1_hundredths(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn labels_are_checked_and_kept_sorted() {

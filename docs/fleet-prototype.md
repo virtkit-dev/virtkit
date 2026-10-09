@@ -254,7 +254,8 @@ whether it is tmpfs and the speed `[node] jobs_speed` or `checkouts_speed` decla
 and guest kernel versions and a hash of the effective configuration; and the gitlab-runner
 configuration read, its `concurrent` and its runner names. The heartbeat carries admission
 (memory committed and budget, jobs running and waiting), the runner concurrency last asked
-for, memory available, free bytes and inodes per filesystem, and each VM's memory. Inventory
+for, memory available, free bytes and inodes per filesystem, each VM's memory, and the host's
+1-minute load average (absent when unreadable or omitted by an older node). Inventory
 also carries the labels the node declares in `[node] labels`, which placed jobs can require;
 older nodes send none.
 

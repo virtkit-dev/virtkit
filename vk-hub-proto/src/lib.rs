@@ -787,6 +787,10 @@ pub struct Heartbeat {
     /// the report. A workload missing here could not be measured.
     #[serde(default)]
     pub workload_mem_bytes: BTreeMap<String, u64>,
+    /// The host's 1-minute load average (runnable and uninterruptible tasks), in hundredths.
+    /// `None` when unreadable or omitted by an older node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load1_hundredths: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1434,6 +1438,7 @@ mod tests {
                 inodes: 1 << 20,
             }],
             workload_mem_bytes: BTreeMap::from([("ab".repeat(8), 1 << 30)]),
+            load1_hundredths: Some(250),
         }
     }
 
@@ -1748,6 +1753,7 @@ mod tests {
                     "inodes": 1_u64 << 20,
                 }],
                 "workload_mem_bytes": {"abababababababab": 1_u64 << 30},
+                "load1_hundredths": 250,
             }),
         );
         pinned(
