@@ -1,9 +1,10 @@
 //! The fleet's `/jobs`, for every session: the history of the jobs the hub placed, newest
-//! first, a page at a time, filtered by node, GitLab project and result, with what each used
-//! on its node where the node reported it ([`vk_hub_proto::job::JobUsage`]) and a line summing
-//! up every job the filter matches. Read only; a job's own page is GitLab's, but a failed
-//! job's result links to `/jobs/<id>`, its record and the end of its output as the hub kept it
-//! ([`crate::jobs::detail`]), for when GitLab's trace is cut or out of reach.
+//! first, a page at a time, filtered by node, GitLab project, result, job name, branch and
+//! pipeline, with what each used on its node where the node reported it
+//! ([`vk_hub_proto::job::JobUsage`]) and a line summing up every job the filter matches.
+//! Read only; a job's own page is GitLab's, but a failed job's result links to `/jobs/<id>`,
+//! its record and the end of its output as the hub kept it ([`crate::jobs::detail`]), for
+//! when GitLab's trace is cut or out of reach.
 //!
 //! The newest page of any filter stays live: its stream's URL carries the filter, and each
 //! stream renders its own fragment, woken by [`Hub::jobs_changed`] alone. The summary reads the
@@ -39,11 +40,14 @@ pub(super) const EVENT: &str = "jobs";
 /// Jobs per page.
 const JOBS_PAGE: usize = 100;
 
-/// The longest project name the filter takes; GitLab's full paths are far shorter.
-const MAX_PROJECT: usize = 1024;
+/// The longest project the filter takes; what a job records of it is far shorter.
+const MAX_TEXT: usize = 1024;
 
-/// `GET /jobs[?node=…&project=…&result=…&before=…]`. A filter value that cannot be one is
-/// ignored, as the audit log ignores a node that is not an ID.
+/// The filter's parameters, in the order a query carries them.
+const FIELDS: [&str; 6] = ["node", "project", "result", "name", "ref", "pipeline"];
+
+/// `GET /jobs[?node=…&project=…&result=…&name=…&ref=…&pipeline=…&before=…]`. A filter value
+/// that cannot be one is ignored, as the audit log ignores a node that is not an ID.
 pub(super) async fn get(
     query: Option<&str>,
     auth: &Auth,
@@ -51,11 +55,12 @@ pub(super) async fn get(
     ui: &Ui,
 ) -> Result<Response<Body>> {
     let query = decode_form(query.unwrap_or("").as_bytes());
-    let filter = JobFilter {
-        node: field(&query, "node").and_then(node),
-        project: field(&query, "project").and_then(project),
-        outcome: field(&query, "result").and_then(JobOutcome::parse),
-    };
+    let mut filter = JobFilter::default();
+    for name in FIELDS {
+        if let Some(value) = field(&query, name) {
+            set(&mut filter, name, value);
+        }
+    }
     let before = field(&query, "before").and_then(|b| b.parse().ok());
     let hub = ui.hub.clone();
     let wanted = filter.clone();
@@ -88,7 +93,43 @@ fn node(value: &str) -> Option<String> {
 }
 
 fn project(value: &str) -> Option<String> {
-    (!value.is_empty() && value.len() <= MAX_PROJECT).then(|| value.to_string())
+    (!value.is_empty() && value.len() <= MAX_TEXT).then(|| value.to_string())
+}
+
+/// A job name or branch substring with surrounding whitespace trimmed. Limit it to
+/// [`vk_hub_proto::MAX_DISPLAY`] characters, like the recorded fields, to bound the cost
+/// of matching every record.
+fn part(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.chars().count() <= vk_hub_proto::MAX_DISPLAY)
+        .then(|| value.to_string())
+}
+
+/// A pipeline's ID: digits alone, as GitLab numbers them.
+fn pipeline(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok().filter(|&p| p > 0)
+}
+
+/// Set field `name` from [`FIELDS`] to `value` and return whether it is valid.
+/// Blank values mean "any": accept them without setting a field.
+fn set(filter: &mut JobFilter, name: &str, value: &str) -> bool {
+    if value.trim().is_empty() {
+        return true;
+    }
+    match name {
+        "node" => node(value).map(|v| filter.node = Some(v)),
+        "project" => project(value).map(|v| filter.project = Some(v)),
+        "result" => JobOutcome::parse(value).map(|v| filter.outcome = Some(v)),
+        "name" => part(value).map(|v| filter.name = Some(v)),
+        "ref" => part(value).map(|v| filter.git_ref = Some(v)),
+        "pipeline" => pipeline(value).map(|v| filter.pipeline = Some(v)),
+        _ => None,
+    }
+    .is_some()
 }
 
 /// Parse the filter for `/events/jobs?<query>`. Accept the page's filter values, each field
@@ -96,21 +137,11 @@ fn project(value: &str) -> Option<String> {
 /// request those queries.
 pub(super) fn stream_filter(query: Option<&str>) -> Option<JobFilter> {
     let mut filter = JobFilter::default();
-    let mut seen = [false; 3];
+    let mut seen = [false; FIELDS.len()];
     for (name, value) in decode_form(query.unwrap_or("").as_bytes()) {
-        let i = ["node", "project", "result"]
-            .iter()
-            .position(|n| *n == name)?;
-        if std::mem::replace(seen.get_mut(i)?, true) {
+        let i = FIELDS.iter().position(|n| *n == name)?;
+        if std::mem::replace(seen.get_mut(i)?, true) || !set(&mut filter, &name, &value) {
             return None;
-        }
-        if value.is_empty() {
-            continue;
-        }
-        match i {
-            0 => filter.node = Some(node(&value)?),
-            1 => filter.project = Some(project(&value)?),
-            _ => filter.outcome = Some(JobOutcome::parse(&value)?),
         }
     }
     Some(filter)
@@ -321,7 +352,7 @@ fn fragment(
             (None, false) => "<p class=\"empty\">none match</p>",
         });
     } else {
-        job_table(&mut h, &jobs.rows, &names, now);
+        job_table(&mut h, filter, &jobs.rows, &names, now);
     }
     if let Some(oldest) = jobs.older {
         h.raw("<p><a href=\"");
@@ -331,14 +362,21 @@ fn fragment(
     h
 }
 
-/// The page's jobs, one row each.
-fn job_table(h: &mut Html, rows: &[(u64, String, JobRow)], names: &HashMap<&str, &str>, now: u64) {
+/// The page's jobs, one row each, filtered by `filter`.
+fn job_table(
+    h: &mut Html,
+    filter: &JobFilter,
+    rows: &[(u64, String, JobRow)],
+    names: &HashMap<&str, &str>,
+    now: u64,
+) {
     h.raw("<section><table class=\"grid\"><thead><tr><th>job</th><th>project</th>")
+        .raw("<th>branch</th><th>pipeline</th>")
         .raw("<th>node</th><th>result</th><th>started</th><th class=\"num\">ran</th>")
         .raw("<th class=\"num\">peak memory</th><th class=\"num\">CPU time</th>")
         .raw("<th class=\"num\">size</th></tr></thead><tbody>");
     for (_, id, j) in rows {
-        job_row(h, id, j, names, now);
+        job_row(h, filter, id, j, names, now);
     }
     h.raw("</tbody></table></section>");
 }
@@ -402,7 +440,26 @@ fn filter_form(h: &mut Html, filter: &JobFilter, projects: &[String], names: &[(
         }
         h.raw(">").raw(outcome.label()).raw("</option>");
     }
-    h.raw("</select> <button>Show</button></form>");
+    h.raw("</select>");
+    let pipeline = filter.pipeline.map(|p| p.to_string());
+    for (name, label, value) in [
+        ("name", "Job name", filter.name.as_deref()),
+        ("ref", "Branch", filter.git_ref.as_deref()),
+    ] {
+        h.raw("<input type=\"search\" name=\"")
+            .raw(name)
+            .raw("\" placeholder=\"")
+            .raw(label)
+            .raw("\" aria-label=\"")
+            .raw(label)
+            .raw("\" value=\"")
+            .text(value.unwrap_or(""))
+            .raw("\">");
+    }
+    h.raw("<input type=\"number\" name=\"pipeline\" min=\"1\" placeholder=\"Pipeline\" ")
+        .raw("aria-label=\"Pipeline\" value=\"")
+        .text(pipeline.as_deref().unwrap_or(""))
+        .raw("\"> <button>Show</button></form>");
 }
 
 /// `/jobs` with `filter`, and `before` if given, as its query.
@@ -412,14 +469,18 @@ fn href(h: &mut Html, filter: &JobFilter, before: Option<u64>) {
 }
 
 /// `filter`, and `before` if given, as a query string: `?` and each set field, or nothing.
-/// Values are percent-encoded down to unreserved characters, so a project's name cannot end
-/// the attribute or add a parameter.
+/// Values are percent-encoded down to unreserved characters, so a project's, job's or
+/// branch's name cannot end the attribute or add a parameter.
 fn query(h: &mut Html, filter: &JobFilter, before: Option<u64>) {
+    let pipeline = filter.pipeline.map(|p| p.to_string());
     let before = before.map(|b| b.to_string());
     let fields = [
         ("node", filter.node.as_deref()),
         ("project", filter.project.as_deref()),
         ("result", filter.outcome.map(JobOutcome::name)),
+        ("name", filter.name.as_deref()),
+        ("ref", filter.git_ref.as_deref()),
+        ("pipeline", pipeline.as_deref()),
         ("before", before.as_deref()),
     ];
     let mut separator = "?";
@@ -446,18 +507,47 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-/// One job's row. Its name and project are the producer's, made display-safe when recorded
-/// and again here; its link is checked as every external link is ([`Html::external_link`]).
-fn job_row(h: &mut Html, id: &str, j: &JobRow, names: &HashMap<&str, &str>, now: u64) {
+/// One job's row, in a page filtered by `filter`. Its name, project and branch are the
+/// producer's, made display-safe when recorded and again here; its name, branch and pipeline
+/// narrow the page to the jobs that share them; its links to GitLab are checked as every
+/// external link is ([`Html::external_link`]).
+fn job_row(
+    h: &mut Html,
+    filter: &JobFilter,
+    id: &str,
+    j: &JobRow,
+    names: &HashMap<&str, &str>,
+    now: u64,
+) {
     let usage = j.result.as_ref().and_then(|r| r.usage);
-    let label = j.name.as_deref().unwrap_or(&j.title);
-    h.raw("<tr><td title=\"")
-        .text(id)
-        .raw("\">")
-        .external_link(j.job_url.as_deref(), label)
-        .raw("</td><td>")
+    h.raw("<tr><td title=\"").text(id).raw("\">");
+    match &j.name {
+        Some(name) => narrowing(h, filter, |f| f.name = Some(name.clone()), name),
+        None => {
+            h.node(&j.title);
+        }
+    }
+    gitlab_link(h, j.job_url.as_deref());
+    h.raw("</td><td>")
         .node(j.project.as_deref().unwrap_or("-"))
         .raw("</td><td>");
+    match &j.git_ref {
+        Some(git_ref) => narrowing(h, filter, |f| f.git_ref = Some(git_ref.clone()), git_ref),
+        None => {
+            h.raw("-");
+        }
+    }
+    h.raw("</td><td>");
+    match j.pipeline {
+        Some(p) => {
+            narrowing(h, filter, |f| f.pipeline = Some(p), &p.to_string());
+            gitlab_link(h, pipeline_url(j.job_url.as_deref(), p).as_deref());
+        }
+        None => {
+            h.raw("-");
+        }
+    }
+    h.raw("</td><td>");
     node_link(h, j, names);
     h.raw("</td><td>");
     // A failed job's page has why, as far as its output says; the router takes only hex.
@@ -484,6 +574,35 @@ fn job_row(h: &mut Html, id: &str, j: &JobRow, names: &HashMap<&str, &str>, now:
         .raw("</td><td class=\"num\">")
         .text(dash_or(size_text(j)))
         .raw("</td></tr>");
+}
+
+/// `label`, a producer's string, linked to the jobs `filter` matches once `narrow` has set
+/// one more of its fields.
+fn narrowing(h: &mut Html, filter: &JobFilter, narrow: impl FnOnce(&mut JobFilter), label: &str) {
+    let mut narrowed = filter.clone();
+    narrow(&mut narrowed);
+    h.raw("<a href=\"");
+    href(h, &narrowed, None);
+    h.raw("\">").node(label).raw("</a>");
+}
+
+/// ` ↗`, linked to `url` on GitLab, or nothing when `url` is not a plain web link.
+fn gitlab_link(h: &mut Html, url: Option<&str>) {
+    if url.is_some_and(vk_hub_proto::is_web_link) {
+        h.raw(" ").external_link(url, "↗");
+    }
+}
+
+/// GitLab's page for pipeline `pipeline` of the project whose job's page is `job_url`:
+/// `<project>/-/pipelines/<pipeline>` for a `<project>/-/jobs/<id>` that is a plain web link.
+fn pipeline_url(job_url: Option<&str>, pipeline: u64) -> Option<String> {
+    let (project, job) = job_url
+        .filter(|u| vk_hub_proto::is_web_link(u))?
+        .rsplit_once("/-/jobs/")?;
+    if job.is_empty() || !job.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("{project}/-/pipelines/{pipeline}")).filter(|u| vk_hub_proto::is_web_link(u))
 }
 
 /// The node job `j` was sent to, linked to its page, or `-`.
@@ -701,9 +820,9 @@ mod tests {
             "acme%2Fweb%20app%26x%3D%22%3C"
         );
         let filter = JobFilter {
-            node: None,
             project: Some("a&b".into()),
             outcome: Some(JobOutcome::Failed),
+            ..JobFilter::default()
         };
         let mut h = Html::new();
         href(&mut h, &filter, Some(7));
@@ -719,6 +838,77 @@ mod tests {
             stream_filter(Some("project=a%26b&result=failed")),
             Some(filter)
         );
+    }
+
+    /// Every filter field survives a query roundtrip.
+    #[test]
+    fn a_filter_s_query_reads_back_as_the_filter() {
+        let filter = JobFilter {
+            node: Some("ab".repeat(16)),
+            project: Some("g/p q".into()),
+            outcome: Some(JobOutcome::Running),
+            name: Some("test: \"e2e\" <x>".into()),
+            git_ref: Some("feature/é&x=1".into()),
+            pipeline: Some(4012),
+        };
+        let mut h = Html::new();
+        query(&mut h, &filter, None);
+        let written = h.into_string();
+        assert_eq!(
+            written,
+            format!(
+                "?node={}&amp;project=g%2Fp%20q&amp;result=running\
+                 &amp;name=test%3A%20%22e2e%22%20%3Cx%3E&amp;ref=feature%2F%C3%A9%26x%3D1\
+                 &amp;pipeline=4012",
+                "ab".repeat(16)
+            )
+        );
+        let unescaped = written.strip_prefix('?').unwrap().replace("&amp;", "&");
+        assert_eq!(stream_filter(Some(&unescaped)), Some(filter.clone()));
+        // Trim surrounding whitespace from search text; empty fields mean "any".
+        assert_eq!(
+            stream_filter(Some("name=+build+&ref=&pipeline=&node=&project=&result=")),
+            Some(JobFilter {
+                name: Some("build".into()),
+                ..JobFilter::default()
+            })
+        );
+    }
+
+    /// A row's name, branch and pipeline narrow the page it is on, escaped as any filter
+    /// value is; its pipeline links to GitLab's page of it only from a plain web link.
+    #[test]
+    fn a_row_narrows_its_page_to_what_it_shares() {
+        let filter = JobFilter {
+            outcome: Some(JobOutcome::Failed),
+            ..JobFilter::default()
+        };
+        let mut h = Html::new();
+        narrowing(
+            &mut h,
+            &filter,
+            |f| f.git_ref = Some("x\"><b>".into()),
+            "x\"><b>",
+        );
+        assert_eq!(
+            h.into_string(),
+            "<a href=\"/jobs?result=failed&amp;ref=x%22%3E%3Cb%3E\">x&quot;&gt;&lt;b&gt;</a>"
+        );
+        assert_eq!(
+            pipeline_url(Some("https://gitlab.example.com/g/p/-/jobs/7"), 40).as_deref(),
+            Some("https://gitlab.example.com/g/p/-/pipelines/40")
+        );
+        for bad in [
+            None,
+            Some("javascript:alert(1)//-/jobs/7"),
+            Some("https://gitlab.example.com/g/p/-/jobs/x"),
+            Some("https://gitlab.example.com/g/p"),
+        ] {
+            assert_eq!(pipeline_url(bad, 40), None, "{bad:?}");
+        }
+        let mut h = Html::new();
+        gitlab_link(&mut h, Some("javascript:alert(1)"));
+        assert_eq!(h.into_string(), "");
     }
 
     /// The streams of a filter share its rendering until a job changes or it is half a
@@ -818,11 +1008,28 @@ mod tests {
                 ..JobFilter::default()
             })
         );
-        let long = "p".repeat(MAX_PROJECT + 1);
+        let long = "p".repeat(MAX_TEXT + 1);
+        let longest = "é".repeat(vk_hub_proto::MAX_DISPLAY);
+        assert_eq!(
+            stream_filter(Some(&format!("name={longest}"))),
+            Some(JobFilter {
+                name: Some(longest.clone()),
+                ..JobFilter::default()
+            })
+        );
         for bad in [
+            format!("name={longest}e"),
             "node=xyz".to_string(),
             "result=lost".to_string(),
             format!("project={long}"),
+            format!("name={long}"),
+            format!("ref={long}"),
+            "pipeline=0".to_string(),
+            "pipeline=-1".to_string(),
+            "pipeline=%2B7".to_string(),
+            "pipeline=1x".to_string(),
+            "pipeline=99999999999999999999999".to_string(),
+            "name=a&name=b".to_string(),
             "result=failed&result=success".to_string(),
             // An older page has no stream.
             "before=3".to_string(),

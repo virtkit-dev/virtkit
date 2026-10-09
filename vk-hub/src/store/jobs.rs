@@ -72,6 +72,12 @@ pub struct JobRow {
     /// The job's name in its pipeline, display-safe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The branch or tag it ran for, display-safe; `None` when the spec has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    /// GitLab's ID of its pipeline; `None` when the spec has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<u64>,
     /// The job's GitLab page from its spec; `None` for an invalid URL or an older hub's record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_url: Option<String>,
@@ -188,7 +194,7 @@ impl JobOutcome {
     }
 }
 
-/// Which jobs a page of history shows: those matching every filter set.
+/// Jobs matching every active filter. A missing field matches no filter value.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct JobFilter {
     /// The node it was sent to.
@@ -196,16 +202,36 @@ pub struct JobFilter {
     /// Its GitLab project, exactly.
     pub project: Option<String>,
     pub outcome: Option<JobOutcome>,
+    /// A substring of its job name, ignoring ASCII case.
+    pub name: Option<String>,
+    /// A substring of its branch or tag, ignoring ASCII case.
+    pub git_ref: Option<String>,
+    /// Its pipeline's ID.
+    pub pipeline: Option<u64>,
 }
 
 impl JobFilter {
     pub fn matches(&self, row: &JobRow) -> bool {
+        let holds = |want: &Option<String>, have: &Option<String>| {
+            want.as_deref()
+                .is_none_or(|w| have.as_deref().is_some_and(|h| contains_folded(h, w)))
+        };
         self.node
             .as_ref()
             .is_none_or(|n| row.node.as_ref() == Some(n))
             && (self.project.as_ref()).is_none_or(|p| row.project.as_ref() == Some(p))
             && self.outcome.is_none_or(|o| row.outcome() == o)
+            && holds(&self.name, &row.name)
+            && holds(&self.git_ref, &row.git_ref)
+            && self.pipeline.is_none_or(|p| row.pipeline == Some(p))
     }
+}
+
+/// Whether `haystack` contains `needle`, ignoring ASCII case. Avoid allocations because
+/// this runs on every record a page of history reads.
+fn contains_folded(haystack: &str, needle: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), needle.as_bytes());
+    n.is_empty() || h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
 }
 
 /// Summary of the newest [`SUMMARY_JOBS`] matching jobs.
@@ -746,6 +772,8 @@ mod tests {
             job_url: None,
             project: None,
             name: None,
+            git_ref: None,
+            pipeline: None,
             created_at: 10,
             state: JobState::Queued,
             revision,
@@ -1032,7 +1060,7 @@ mod tests {
         let filter = JobFilter {
             node: Some("a".repeat(32)),
             project: Some("p0".into()),
-            outcome: None,
+            ..JobFilter::default()
         };
         assert_eq!(
             ids(&db.job_page(&filter, None, 5, 100).unwrap()),
@@ -1073,6 +1101,49 @@ mod tests {
         let page = db.job_page(&all, None, 20, 100).unwrap();
         assert_eq!(page.rows.len(), 11);
         assert!(!ids(&page).contains(&id(5)));
+    }
+
+    /// Name and branch match substrings ignoring ASCII case; pipeline matches exactly.
+    /// Older records without these fields match none of their filters.
+    #[test]
+    fn a_history_page_is_filtered_by_name_branch_and_pipeline() {
+        let db = Db::open_memory().unwrap();
+        let mut older = job(1, JobState::Finished, None);
+        older.name = None;
+        submit(&db, 1, &older);
+        for (n, name, git_ref, pipeline) in [
+            (2, "build-x86", "main", 40),
+            (3, "Test:Unit", "feature/Main-menu", 41),
+            (4, "test:e2e", "release-1", 41),
+        ] {
+            let mut row = job(n, JobState::Finished, None);
+            row.name = Some(name.into());
+            row.git_ref = Some(git_ref.into());
+            row.pipeline = Some(pipeline);
+            submit(&db, n, &row);
+        }
+        let ids = |filter: &JobFilter| {
+            let page = db.job_page(filter, None, 10, 100).unwrap();
+            assert_eq!(page.summary.matched, page.rows.len());
+            page.rows.into_iter().map(|r| r.1).collect::<Vec<_>>()
+        };
+        let by = |name: Option<&str>, git_ref: Option<&str>, pipeline: Option<u64>| JobFilter {
+            name: name.map(str::to_string),
+            git_ref: git_ref.map(str::to_string),
+            pipeline,
+            ..JobFilter::default()
+        };
+        assert_eq!(ids(&by(Some("TEST:"), None, None)), [4, 3].map(id));
+        assert_eq!(ids(&by(Some("build-x86"), None, None)), [id(2)]);
+        assert_eq!(ids(&by(None, Some("main"), None)), [3, 2].map(id));
+        assert_eq!(ids(&by(None, None, Some(41))), [4, 3].map(id));
+        assert_eq!(ids(&by(Some("unit"), Some("main"), Some(41))), [id(3)]);
+        assert!(ids(&by(None, None, Some(4))).is_empty());
+        assert!(ids(&by(Some("nothing"), None, None)).is_empty());
+        // Job 1 has no name, branch or pipeline: only the unfiltered page has it.
+        assert_eq!(ids(&JobFilter::default()).last(), Some(&id(1)));
+        assert!(ids(&by(Some("b"), None, None)).iter().all(|j| *j != id(1)));
+        assert!(contains_folded("é-Main", "MAIN") && !contains_folded("É", "é"));
     }
 
     /// The summary is of the newest jobs the filter matches, up to its bound, and says when

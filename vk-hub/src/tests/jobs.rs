@@ -204,6 +204,8 @@ fn spec(gitlab_id: u64) -> JobSpec {
     ci.job.id = gitlab_id;
     ci.job.project_path = "group/project".into();
     ci.job.name = "test".into();
+    ci.job.pipeline_id = 900 + gitlab_id;
+    ci.sources.git_ref = "feature/\u{202e}menu".into();
     ci.token = "glcbt-secret".into();
     ci.trace.limit_bytes = 1 << 20;
     JobSpec::GitlabCi(ci)
@@ -1187,6 +1189,11 @@ async fn a_job_runs_on_its_reservation_streams_output_and_settles() {
     assert_eq!(
         (row.project.as_deref(), row.name.as_deref()),
         (Some("group/project"), Some("test"))
+    );
+    // Its branch made display-safe, and its pipeline.
+    assert_eq!(
+        (row.git_ref.as_deref(), row.pipeline),
+        (Some("feature/menu"), Some(902))
     );
     assert!(row.started_at.is_some() && row.started_at <= row.finished_at);
     assert_eq!(row.ran_ms(crate::now_secs()), Some(4200));
@@ -2674,6 +2681,8 @@ fn the_jobs_table_says_how_each_job_stands() {
         started_at: None,
         finished_at: None,
         settled_at: None,
+        git_ref: None,
+        pipeline: None,
         expired_at: None,
     };
     let mut running = row(JobState::Running, None);
@@ -2755,6 +2764,8 @@ fn a_history_page_shows_jobs_as_the_hub_holds_them() {
         started_at: Some(1000),
         finished_at: None,
         settled_at: None,
+        git_ref: None,
+        pipeline: None,
         expired_at: None,
     };
     for n in 1..=2 {
@@ -3055,6 +3066,8 @@ fn a_job_is_shown_on_the_command_line() {
         started_at: Some(1010),
         finished_at: Some(1070),
         settled_at: Some(1080),
+        git_ref: None,
+        pipeline: None,
         expired_at: None,
     };
     row.result.as_mut().unwrap().message = Some("the VM did not boot".into());

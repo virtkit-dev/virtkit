@@ -1148,19 +1148,29 @@ on the admin socket. Operators grant who signs in through the OIDC provider, and
 is `same-site` or `cross-site`.
 
 `/jobs` shows viewers and operators the job history (see [Placed jobs](#placed-jobs)), newest
-first, 100 jobs per page, with a link to older jobs. Each row shows the job, linked to GitLab
-when the spec names a plain web URL; its project; its node, linked to the node's page; and its
-result: running with its stage, succeeded, failed with its class and exit code (the node's
-message on hover, and a link to the job's page), or canceled. It also shows when a node accepted
-the job, its elapsed run time, its VM's peak memory and CPU time, and the guest's vCPUs and
-memory, falling back to the placement envelope when the node did not report the guest size.
+first, 100 jobs per page, with a link to older jobs. Each row shows the job's name, with a link
+(`↗`) to it on GitLab when the spec names a plain web URL; its project; its branch or tag; its
+pipeline, linked to GitLab's page of it (`<project URL>/-/pipelines/<pipeline ID>`) when the
+job's URL is one; its node, linked to the node's page; and its result: running with its stage,
+succeeded, failed with its class and exit code (the node's message on hover, and a link to the
+job's page), or canceled. It also shows when a node accepted the job, its elapsed run time, its
+VM's peak memory and CPU time, and the guest's vCPUs and memory, falling back to the placement
+envelope when the node did not report the guest size.
 
-Node, project and result filters (`running` for queued or running jobs, `success`, `failed`,
-`canceled`) carry over to older pages. The summary covers the newest 10,000 matching jobs:
-the count, the share of finished jobs that succeeded (without a result filter), and the median
-run time of finished jobs. The newest page of each filter updates live (below). Older pages
-stay as loaded, say so and link back to the newest. The filter form stays outside the live
-fragment so updates preserve selections in progress. Each node's page links to its jobs.
+Node, project, result (`running` for queued or running jobs, `success`, `failed`, `canceled`),
+job name, branch and pipeline filters carry over to older pages. Project and node filters
+match exactly. Job name and branch filters match substrings, ignoring ASCII case and trimming
+surrounding whitespace (`main` matches `main` and `feature/Main-menu`). Pipeline filters match
+the ID. A job's name, branch and pipeline link to the page with that
+filter added. A job whose spec has no ref or pipeline matches no such filter. Every filter is a scan
+of the history from its newest job, a record decoded and matched at a time, until the page and the
+summary are complete: a rare value reads the whole history, `job_history` records (10,000 by
+default), on each load of the page and, for the live newest page, at most twice a heartbeat (below),
+so its cost grows with `job_history`. The summary covers the newest 10,000 matching jobs: the count,
+the share of finished jobs that succeeded (without a result filter), and the median run time of
+finished jobs. The newest page of each filter updates live (below). Older pages stay as loaded, say
+so and link back to the newest. The filter form stays outside the live fragment so updates preserve
+selections in progress. Each node's page links to its jobs.
 
 `/jobs/<id>` shows viewers and operators the job's result, failure class, exit code, node
 message, GitLab page when the spec names a plain web URL, project, node, pool, key,

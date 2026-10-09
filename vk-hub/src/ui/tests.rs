@@ -3369,6 +3369,8 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         started_at: None,
         finished_at: None,
         settled_at: None,
+        git_ref: None,
+        pipeline: None,
         expired_at: None,
     };
     let submit = |n: u64, row: &crate::store::JobRow| {
@@ -3401,6 +3403,7 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         ),
     );
     measured.node = Some(node.clone());
+    measured.git_ref = Some("main".into());
     measured.started_at = Some(now - 100);
     measured.finished_at = Some(now - 30);
     submit(102, &measured);
@@ -3412,6 +3415,8 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         ended(Some(FailureClass::Script), Some(2), None),
     );
     failed.node = Some("ef".repeat(16));
+    failed.git_ref = Some("fix/<x>".into());
+    failed.pipeline = Some(77);
     failed.started_at = Some(now - 20);
     failed.finished_at = Some(now - 10);
     submit(103, &failed);
@@ -3423,6 +3428,8 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         None,
     );
     running.node = Some(node.clone());
+    running.git_ref = Some("feature/main-menu".into());
+    running.pipeline = Some(77);
     running.stage = Some("step_script".into());
     running.started_at = Some(now - 90);
     submit(104, &running);
@@ -3434,15 +3441,23 @@ async fn the_job_history_is_shown_filtered_and_paged() {
     for want in [
         // 61 and 10 seconds.
         "104 jobs · 50% of 2 finished succeeded · median run of finished jobs 35s",
-        "<a href=\"https://gitlab.example.com/acme/web/-/jobs/102\" target=\"_blank\" \
-         rel=\"noopener noreferrer\">build-102</a></td><td>acme/web</td>",
+        "<a href=\"/jobs?name=build-102\">build-102</a> \
+         <a href=\"https://gitlab.example.com/acme/web/-/jobs/102\" target=\"_blank\" \
+         rel=\"noopener noreferrer\">↗</a></td><td>acme/web</td>\
+         <td><a href=\"/jobs?ref=main\">main</a></td><td>-</td>",
         &format!("<a href=\"/node/{node}\">ci-1</a>"),
         "<span class=\"badge ok\">success</span>",
         "<td class=\"num\">1m01s</td><td class=\"num\">3.0 GiB</td>\
          <td class=\"num\">2m00s</td><td class=\"num\">4 vCPUs, 8.0 GiB</td>",
-        // Not a web link: the name as text.
-        ">build-103</td><td>acme/api</td><td><a href=\"/node/efefefefefefefefefefefefefefefef\">\
-         <code>efefefef</code></a></td>",
+        // Not a web link: no link to GitLab, for the job or its pipeline.
+        "<a href=\"/jobs?name=build-103\">build-103</a></td><td>acme/api</td>\
+         <td><a href=\"/jobs?ref=fix%2F%3Cx%3E\">fix/&lt;x&gt;</a></td>\
+         <td><a href=\"/jobs?pipeline=77\">77</a></td>\
+         <td><a href=\"/node/efefefefefefefefefefefefefefefef\"><code>efefefef</code></a></td>",
+        // The job's pipeline, and its page on GitLab.
+        "<td><a href=\"/jobs?pipeline=77\">77</a> \
+         <a href=\"https://gitlab.example.com/acme/web/-/pipelines/77\" target=\"_blank\" \
+         rel=\"noopener noreferrer\">↗</a></td>",
         "<span class=\"badge bad\">script failure, exit 2</span>",
         "<span class=\"badge busy\">running: step_script</span>",
         // Running for a minute and a half, by the hub's clock.
@@ -3521,6 +3536,36 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         )),
         "{page}"
     );
+    // A part of a job name or branch, in either case, and a pipeline; the form shows them.
+    let page = get(addr, "/jobs?ref=MAIN", Some(&viewer)).await.body;
+    assert_eq!(rows(&page), 2, "{page}");
+    assert!(page.contains(">build-104<") && page.contains(">build-102<"));
+    assert!(
+        page.contains("name=\"ref\" placeholder=\"Branch\" aria-label=\"Branch\" value=\"MAIN\"")
+    );
+    let page = get(addr, "/jobs?pipeline=77&name=%20Build-10", Some(&viewer))
+        .await
+        .body;
+    assert_eq!(rows(&page), 2, "{page}");
+    assert!(
+        page.contains("2 jobs · 0% of 1 finished succeeded"),
+        "{page}"
+    );
+    assert!(page.contains("value=\"Build-10\""), "{page}");
+    assert!(
+        page.contains("aria-label=\"Pipeline\" value=\"77\""),
+        "{page}"
+    );
+    // A row narrows the page it is on.
+    assert!(
+        page.contains("<a href=\"/jobs?name=build-104&amp;pipeline=77\">build-104</a>"),
+        "{page}"
+    );
+    let page = get(addr, "/jobs?name=build-1&ref=fix%2F%3C", Some(&viewer))
+        .await
+        .body;
+    assert_eq!(rows(&page), 1, "{page}");
+    assert!(page.contains("value=\"fix/&lt;\""), "{page}");
     // The filter carries over to older jobs.
     let page = get(addr, "/jobs?result=running", Some(&viewer)).await.body;
     assert_eq!(rows(&page), 100, "{page}");
@@ -3565,6 +3610,8 @@ pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
         started_at: None,
         finished_at: None,
         settled_at: None,
+        git_ref: None,
+        pipeline: None,
         expired_at: None,
     }
 }

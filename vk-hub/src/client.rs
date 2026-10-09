@@ -492,6 +492,14 @@ async fn submit(
         name: match &ask.spec {
             JobSpec::GitlabCi(ci) => Some(vk_hub_proto::display_safe(&ci.job.name)),
         },
+        git_ref: match &ask.spec {
+            JobSpec::GitlabCi(ci) => {
+                Some(vk_hub_proto::display_safe(&ci.sources.git_ref)).filter(|r| !r.is_empty())
+            }
+        },
+        pipeline: match &ask.spec {
+            JobSpec::GitlabCi(ci) => Some(ci.job.pipeline_id).filter(|&p| p > 0),
+        },
         created_at: crate::now_secs(),
         state: JobState::Queued,
         revision: 1,

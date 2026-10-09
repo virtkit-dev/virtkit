@@ -9,7 +9,8 @@
 //! A host's strings go only in text content or quoted plain attributes (`title`, `value`),
 //! never in an attribute htmx interprets (`hx-*`, `sse-*`). Those and an `href` are the hub's
 //! own, built from constants, from IDs the router has checked are hex, and from dev
-//! environment names checked to be `[A-Za-z0-9._-]` not starting with `.` or `-` — but for a
+//! environment names checked to be `[A-Za-z0-9._-]` not starting with `.` or `-`, with the
+//! Jobs page's filter values percent-encoded down to unreserved characters — but for a
 //! CI job's page on its GitLab, [`Html::external_link`], which goes into an `href` only when
 //! it is a plain http(s) URL ([`vk_hub_proto::is_web_link`]), and opens in a tab of its own
 //! that learns nothing of the hub's page.

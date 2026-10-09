@@ -19,6 +19,10 @@ All notable changes to virtkit will be documented in this file.
   `hub.toml`, `"0"` to keep none). Unsettled jobs retain no log beyond 30 days after finishing.
   Failed results on the Jobs page link to the job's details and log, readable without GitLab
   by every signed-in session, including viewers. `vk-hub jobs show <id>` prints the same.
+- **`vk-hub`'s Jobs page filters by job name, branch and pipeline.** The name and branch
+  match any part, ignoring the case of ASCII letters; each row shows its branch and pipeline,
+  the pipeline linked to GitLab, and clicking a job's name, branch or pipeline narrows the page
+  to it.
 - **`vk-hub` holds CI tools definitions and has nodes build them.** `vk-hub tools add <dir>
   --version <label>` takes a build context — a Dockerfile whose `tools` stage holds static `git` and
   any other tools, such as `git-lfs` — packed so that the same tree is the same definition; `vk-hub

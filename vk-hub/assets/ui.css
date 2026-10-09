@@ -214,6 +214,8 @@ input[type="file"] { padding: 0.2rem; }
 input[type="email"], input[type="text"] { min-width: 16rem; }
 label { color: var(--muted); }
 .filter { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; margin-bottom: var(--s4); }
+.filter input[type="search"] { width: 11rem; }
+.filter input[type="number"] { width: 8rem; }
 .actions { display: flex; flex-wrap: wrap; gap: var(--s2) var(--s4); align-items: center; }
 .actions form { display: flex; gap: var(--s2); align-items: center; margin: 0; }
 /* A row's actions stay a cell, their forms wrapping within it. */
