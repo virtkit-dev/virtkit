@@ -187,6 +187,16 @@ fn runner_unit_user(unit_dirs: &[&str]) -> Option<(String, PathBuf)> {
             .filter_map(|p| std::fs::read_to_string(p).ok()),
     );
     let service = parse_unit(&texts);
+    // A unit whose program is gone runs nothing. Only an absolute program is checked: one
+    // systemd looks up, or with specifiers or `${X}`, is kept. So is one whose absence cannot
+    // be told, such as behind a directory this user cannot search.
+    if service.program.as_deref().is_some_and(|p| {
+        p.is_absolute()
+            && p.to_str().is_some_and(|p| !p.contains(['%', '$']))
+            && matches!(p.try_exists(), Ok(false))
+    }) {
+        return None;
+    }
     let user = service.user.unwrap_or_else(|| "root".to_string());
     let config = match service.config {
         Some(config) => config,
@@ -211,6 +221,8 @@ struct RunnerService {
     user: Option<String>,
     /// `--config`/`-c` on the last `ExecStart=`.
     config: Option<PathBuf>,
+    /// The last `ExecStart=` program without prefixes (`-`, `@`, `:`, `+`, `!`, `|`).
+    program: Option<PathBuf>,
 }
 
 fn parse_unit(texts: &[String]) -> RunnerService {
@@ -232,7 +244,12 @@ fn parse_unit(texts: &[String]) -> RunnerService {
             match key.trim() {
                 // An empty assignment resets it, to root.
                 "User" => out.user = Some(value.to_string()).filter(|v| !v.is_empty()),
-                "ExecStart" if !value.is_empty() => {
+                // An empty assignment resets the commands: none is run.
+                "ExecStart" if value.is_empty() => {
+                    out.config = None;
+                    out.program = None;
+                }
+                "ExecStart" => {
                     let words: Vec<&str> = value
                         .split_whitespace()
                         .map(|w| w.trim_matches('"'))
@@ -243,6 +260,13 @@ fn parse_unit(texts: &[String]) -> RunnerService {
                             w => w.strip_prefix("--config=").or(w.strip_prefix("-c=")),
                         }
                         .map(PathBuf::from)
+                    });
+                    // systemd unquotes the program after taking its prefixes off.
+                    out.program = value.split_whitespace().next().map(|w| {
+                        PathBuf::from(
+                            w.trim_start_matches(['-', '@', ':', '+', '!', '|'])
+                                .trim_matches('"'),
+                        )
                     });
                 }
                 _ => {}
@@ -422,6 +446,7 @@ ExecStart=/usr/bin/gitlab-runner "run" "--config" "/etc/gitlab-runner/config.tom
             RunnerService {
                 user: None,
                 config: Some(PathBuf::from("/etc/gitlab-runner/config.toml")),
+                program: Some(PathBuf::from("/usr/bin/gitlab-runner")),
             }
         );
         let drop_in = "[Service]\nUser=gitlab-runner\n".to_string();
@@ -441,6 +466,32 @@ ExecStart=/usr/bin/gitlab-runner "run" "--config" "/etc/gitlab-runner/config.tom
                 "{exec}"
             );
         }
+        // Strip program prefixes before unquoting.
+        for exec in [
+            "@/usr/bin/gitlab-runner gitlab-runner run -c /c.toml",
+            "+/usr/bin/gitlab-runner run -c /c.toml",
+            "!!/usr/bin/gitlab-runner run -c /c.toml",
+            ":/usr/bin/gitlab-runner run -c /c.toml",
+            "|/usr/bin/gitlab-runner run -c /c.toml",
+            "-\"/usr/bin/gitlab-runner\" run -c /c.toml",
+        ] {
+            let unit = format!("[Service]\nExecStart={exec}\n");
+            assert_eq!(
+                parse_unit(&[unit]),
+                RunnerService {
+                    user: None,
+                    config: Some(PathBuf::from("/c.toml")),
+                    program: Some(PathBuf::from("/usr/bin/gitlab-runner")),
+                },
+                "{exec}"
+            );
+        }
+        // An empty `ExecStart=` resets the commands.
+        let reset = "[Service]\nExecStart=\n".to_string();
+        assert_eq!(
+            parse_unit(&[unit.to_string(), reset]),
+            RunnerService::default()
+        );
     }
 
     #[test]
@@ -451,22 +502,49 @@ ExecStart=/usr/bin/gitlab-runner "run" "--config" "/etc/gitlab-runner/config.tom
         std::fs::create_dir_all(units.join(format!("{RUNNER_UNIT}.d"))).unwrap();
         std::fs::create_dir_all(lib.join(format!("{RUNNER_UNIT}.d"))).unwrap();
         let config = dir.join("config.toml");
+        let runner = dir.join("gitlab-runner");
+        let unit = |program: &Path| {
+            format!(
+                "[Service]\nExecStart=-{} run --config {}\n",
+                program.display(),
+                config.display()
+            )
+        };
+        let runs_vk = "[[runners]]\nexecutor = \"custom\"\n[runners.custom]\n\
+                       run_exec = \"/usr/local/bin/vk\"\n";
+        // The runner it names is gone.
+        std::fs::write(lib.join(RUNNER_UNIT), unit(&runner)).unwrap();
+        std::fs::write(&config, runs_vk).unwrap();
+        let dirs = [units.to_str().unwrap(), lib.to_str().unwrap()];
+        assert_eq!(runner_unit_user(&dirs), None);
+        // Keep programs that systemd looks up on its PATH.
         std::fs::write(
             lib.join(RUNNER_UNIT),
-            format!(
-                "[Service]\nExecStart=/usr/bin/gitlab-runner run --config {}\n",
-                config.display()
-            ),
+            unit(Path::new("gitlab-runner-not-on-path")),
         )
         .unwrap();
-        let dirs = [units.to_str().unwrap(), lib.to_str().unwrap()];
+        assert_eq!(
+            runner_unit_user(&dirs),
+            Some(("root".to_string(), lib.join(RUNNER_UNIT)))
+        );
+        // And programs systemd expands first.
+        for program in [
+            "/nonexistent/%h/gitlab-runner",
+            "/nonexistent/${X}/gitlab-runner",
+        ] {
+            std::fs::write(lib.join(RUNNER_UNIT), unit(Path::new(program))).unwrap();
+            assert_eq!(
+                runner_unit_user(&dirs),
+                Some(("root".to_string(), lib.join(RUNNER_UNIT))),
+                "{program}"
+            );
+        }
+        std::fs::write(lib.join(RUNNER_UNIT), unit(&runner)).unwrap();
+        std::fs::write(&runner, "").unwrap();
+        std::fs::remove_file(&config).unwrap();
         // No config to read: nothing said.
         assert_eq!(runner_unit_user(&dirs), None);
-        std::fs::write(
-            &config,
-            "[[runners]]\nexecutor = \"custom\"\n[runners.custom]\nrun_exec = \"/usr/local/bin/vk\"\n",
-        )
-        .unwrap();
+        std::fs::write(&config, runs_vk).unwrap();
         assert_eq!(
             runner_unit_user(&dirs),
             Some(("root".to_string(), lib.join(RUNNER_UNIT)))

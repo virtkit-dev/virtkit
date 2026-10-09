@@ -103,7 +103,8 @@ All notable changes to virtkit will be documented in this file.
 - **`vk node service install` refuses a node user other than the one CI jobs run as.** It
   refuses when the vk executor's files belong to another user, or gitlab-runner runs it as
   another, naming the user the node must run as; `--ignore-ci-user` goes ahead anyway.
-  `vk node run` says so once instead of repeating permission errors.
+  `vk node run` says so once instead of repeating permission errors. A gitlab-runner whose
+  package was removed no longer counts.
 - **`allow_failure: exit_codes` works with the vk executor.** `vk gitlab run` reports a
   failing script's exit code through `BUILD_EXIT_CODE_FILE`, so gitlab-runner shows the job's
   real exit code.
