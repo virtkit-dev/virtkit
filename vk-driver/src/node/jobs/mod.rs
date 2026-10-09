@@ -434,6 +434,7 @@ impl Jobs {
                 message: Some(format!("the node could not start the job: {e:#}")),
                 output_len: journal::output_len(&dir),
                 artifacts: Vec::new(),
+                usage: None,
             };
             let _ = journal::write_json(&dir.join(journal::RESULT), &result);
         }
@@ -678,6 +679,7 @@ impl Jobs {
             message: Some("the job's driver ended without a result".into()),
             output_len: journal::output_len(&t.dir),
             artifacts: Vec::new(),
+            usage: None,
         };
         // Written before it is reported, so the next node to read this journal agrees; tried
         // again at the next poll when it cannot be.
@@ -839,6 +841,7 @@ pub(crate) mod tests {
             message: None,
             output_len: output.len() as u64,
             artifacts: Vec::new(),
+            usage: None,
         };
         journal::write_json(&dir.join(journal::RESULT), &result)
     }
@@ -1175,6 +1178,7 @@ pub(crate) mod tests {
             message: None,
             output_len: 0,
             artifacts: Vec::new(),
+            usage: None,
         }
     }
 

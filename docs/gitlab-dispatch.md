@@ -150,7 +150,8 @@ placed twice — see [failures](#failures). The spec is at most 512 KiB serializ
 `too_large`).
 
 `JobView` is `{id, revision, state, node, stage, output_len, cancel, result}`: `state` is
-`queued`, `starting`, `running` or `finished`, and `result` is present once finished.
+`queued`, `starting`, `running` or `finished`, and `result` is present once finished, with the
+node's `usage` when it sent one (see [Result](#hub--node-protocol-version-3)).
 `revision` moves with every change but the output's length.
 
 **Output.** The answer's body is the output from `offset`, at most 1 MiB, with
@@ -238,9 +239,22 @@ byte past it on disk, and after a reconnect resends from the offset the hub acke
 appends each chunk to the job's output file and acks once it is synced; a chunk overlapping
 what it holds is trimmed, one leaving a gap is a protocol error.
 
-**Result.** `{failure?, exit_code?, message?, output_len, artifacts}`, sent once every byte up
-to `output_len` is acked. `artifacts` gives each upload's outcome: `uploaded`, `skipped`,
-`too_large` or `failed`.
+**Result.** `{failure?, exit_code?, message?, output_len, artifacts, usage?}`, sent once every
+byte up to `output_len` is acked. `artifacts` gives each upload's outcome: `uploaded`, `skipped`,
+`too_large` or `failed`. `usage` is what the job used on the node, `{wall_ms, cpu_ms?,
+peak_mem_bytes?, cpus?, mem_mib?}`:
+
+- `wall_ms`: from the driver's start to the job's end, cleanup included;
+- `cpu_ms` and `peak_mem_bytes`: the job's VM supervisor and every process under it — the VMM
+  and its vCPUs, service VMs, the switch, the forwards — read from `/proc` after the last stage
+  and before cleanup, using the same measurement as the executor's `job resource usage` trace. CPU
+  time is user plus system, guest execution included. Peak memory is each process's `VmHWM`
+  summed: an upper bound where they did not peak together. Host-side cache and artifact
+  transfers, and a host checkout, are not counted. Both are absent when no VM was up to read;
+- `cpus` and `mem_mib`: the guest's size, from the job's `MICROVM_CPUS` and `MICROVM_MEM`
+  clamped by the node's ceilings.
+
+`usage` is optional, as are all its fields except `wall_ms`.
 
 **Reconnects.** After its report, a version-3 node sends `held`. The hub releases each
 reservation it does not know, cancels `immediate` each job it has given up on, and answers

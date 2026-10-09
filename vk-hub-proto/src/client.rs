@@ -295,6 +295,7 @@ mod tests {
                 message: Some("node lost".into()),
                 output_len: 8192,
                 artifacts: vec![],
+                usage: None,
             }),
         });
         round_trip(&CancelRequest {

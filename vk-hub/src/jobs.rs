@@ -390,6 +390,7 @@ fn finish(
         message,
         output_len,
         artifacts: Vec::new(),
+        usage: None,
     });
     let events = vec![(row.node.clone(), HUB.to_string(), event)];
     state.finished.insert(id.to_string(), job.row.clone());

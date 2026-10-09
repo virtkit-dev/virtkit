@@ -2416,12 +2416,20 @@ fn job_placement(
     Ok(crate::numa::Numa::Placed(placement))
 }
 
-/// The guest RAM this job declares, in MiB: `MICROVM_MEM` clamped by the host ceilings, the
-/// figure a reservation is capped at and the job's history is read against.
-pub(crate) fn declared_mem_mib(ctx: &JobCtx) -> Result<u64> {
-    parse_gib(&vm_size(ctx)?.1)?
+/// The vCPUs and guest RAM (MiB) this job declares: `MICROVM_CPUS` and `MICROVM_MEM` clamped
+/// by the host ceilings.
+pub(crate) fn declared_size(ctx: &JobCtx) -> Result<(u32, u64)> {
+    let (cpus, mem) = vm_size(ctx)?;
+    let mem_mib = parse_gib(&mem)?
         .checked_mul(1024)
-        .context("guest memory size is absurdly large")
+        .context("guest memory size is absurdly large")?;
+    Ok((cpus, mem_mib))
+}
+
+/// The guest RAM this job declares, in MiB (see `declared_size`): the figure a reservation is
+/// capped at and the job's history is read against.
+pub(crate) fn declared_mem_mib(ctx: &JobCtx) -> Result<u64> {
+    Ok(declared_size(ctx)?.1)
 }
 
 /// Reserve this job's guest RAM against the host's `[executor.schedule] mem_budget`, and room for

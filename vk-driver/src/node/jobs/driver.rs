@@ -30,7 +30,8 @@ use anyhow::{Context, Result};
 use tokio_util::sync::CancellationToken;
 use vk_hub_proto::dispatch::CancelMode;
 use vk_hub_proto::job::{
-    ArtifactOutcome, CiJob, FailureClass, JobResult, JobSpec, STEP_AFTER_SCRIPT, UploadState,
+    ArtifactOutcome, CiJob, FailureClass, JobResult, JobSpec, JobUsage, STEP_AFTER_SCRIPT,
+    UploadState,
 };
 use vk_hub_proto::stamp::{self, Kind};
 
@@ -143,6 +144,7 @@ pub async fn run(cfg: Config, dir: &Path, ledger_fd: Option<i32>) -> Result<()> 
                 message: Some(format!("the job's driver could not start: {e:#}")),
                 output_len: journal::output_len(dir),
                 artifacts: Vec::new(),
+                usage: None,
             };
             journal::write_json(&dir.join(journal::RESULT), &result)?;
             return Err(e);
@@ -209,6 +211,7 @@ impl Driver {
         place: &super::vars::Place,
         meta: &Meta,
     ) -> JobResult {
+        let began = Instant::now();
         let t = self.trace.clone();
         t.print(&format!("Running with vk {}", env!("CARGO_PKG_VERSION")));
         t.print(&format!(
@@ -220,6 +223,9 @@ impl Driver {
             t.warning(w);
         }
         let (end, class, artifacts) = self.stages(vars, settings, place).await;
+        // Read before cleanup stops the VM and its process counters disappear.
+        let tree = crate::vm::live_supervisor_pid(&self.ctx).and_then(crate::usage::tree);
+        let size = crate::vm::declared_size(&self.ctx).ok();
         self.set_stage("cleanup");
         match self.executor("cleanup", &[], None).await {
             Ok(End::Ok) => {}
@@ -244,6 +250,7 @@ impl Driver {
             message,
             output_len: t.len(),
             artifacts,
+            usage: Some(job_usage(began.elapsed(), tree.as_ref(), size)),
         }
     }
 
@@ -772,6 +779,23 @@ impl Driver {
     }
 }
 
+/// Job usage from elapsed wall time, the VM's process tree from [`crate::usage::tree`]
+/// (`None` when no VM was up to read), and guest size `(vCPUs, MiB)` when available.
+fn job_usage(
+    wall: Duration,
+    tree: Option<&crate::usage::Usage>,
+    size: Option<(u32, u64)>,
+) -> JobUsage {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    JobUsage {
+        wall_ms: ms(wall),
+        cpu_ms: tree.map(|u| ms(u.cpu)),
+        peak_mem_bytes: tree.map(|u| u.peak_rss),
+        cpus: size.map(|(cpus, _)| cpus),
+        mem_mib: size.map(|(_, mib)| mib),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn info<'a>(
     job: &'a CiJob,
@@ -997,6 +1021,25 @@ mod tests {
             )
             .0,
             FailureClass::ExternalDependency
+        );
+    }
+
+    /// Wall time is always reported; VM usage and size are included when available.
+    /// This test's process stands in for the VM.
+    #[test]
+    fn a_job_reports_what_its_vm_used() {
+        let tree = crate::usage::tree(std::process::id() as i32).unwrap();
+        let usage = job_usage(Duration::from_millis(90_500), Some(&tree), Some((4, 8192)));
+        assert_eq!(usage.wall_ms, 90_500);
+        assert_eq!(usage.cpu_ms, Some(tree.cpu.as_millis() as u64));
+        assert!(usage.peak_mem_bytes.is_some_and(|b| b > 0), "{usage:?}");
+        assert_eq!((usage.cpus, usage.mem_mib), (Some(4), Some(8192)));
+        assert_eq!(
+            job_usage(Duration::from_secs(2), None, None),
+            JobUsage {
+                wall_ms: 2000,
+                ..JobUsage::default()
+            }
         );
     }
 }

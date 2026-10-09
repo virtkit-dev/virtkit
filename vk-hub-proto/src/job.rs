@@ -409,6 +409,31 @@ pub struct JobResult {
     /// What became of each artifact upload, in the spec's order.
     #[serde(default)]
     pub artifacts: Vec<ArtifactOutcome>,
+    /// What the job used on its node; absent from the hub's own results (`no_capacity`, `lost`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<JobUsage>,
+}
+
+/// Resource usage on the node, for the hub's history. Unavailable measurements are absent:
+/// a job whose VM never booted has no CPU time or memory to report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobUsage {
+    /// Wall-clock time from the job's driver starting it to its end, cleanup included.
+    #[serde(default)]
+    pub wall_ms: u64,
+    /// User and system CPU time of the job's VM and its host helpers, including guest execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ms: Option<u64>,
+    /// Sum of host memory high-water marks for the job's VM and helpers, in bytes:
+    /// an upper bound when the processes did not peak together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_mem_bytes: Option<u64>,
+    /// The guest's vCPUs, as the node sized it from the job's request and its ceilings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u32>,
+    /// The guest's memory in MiB, sized the same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_mib: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -830,5 +855,45 @@ pub(crate) mod tests {
     fn an_upload_state_from_a_later_peer_reads_as_other() {
         let state: UploadState = serde_json::from_value(json!("quarantined")).unwrap();
         assert_eq!(state, UploadState::Other);
+    }
+
+    /// Older results decode without usage; measured usage round-trips. Unavailable figures
+    /// are omitted rather than sent as zero.
+    #[test]
+    fn a_result_reads_with_or_without_usage() {
+        let old: JobResult = serde_json::from_value(json!({"output_len": 7})).unwrap();
+        assert_eq!(old.usage, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("usage"));
+        let measured = JobResult {
+            usage: Some(JobUsage {
+                wall_ms: 61_000,
+                cpu_ms: Some(120_500),
+                peak_mem_bytes: Some(3 << 30),
+                cpus: Some(4),
+                mem_mib: Some(8192),
+            }),
+            ..old.clone()
+        };
+        let wire = serde_json::to_value(&measured).unwrap();
+        assert_eq!(
+            wire["usage"],
+            json!({"wall_ms": 61_000, "cpu_ms": 120_500, "peak_mem_bytes": 3u64 << 30,
+                   "cpus": 4, "mem_mib": 8192})
+        );
+        assert_eq!(serde_json::from_value::<JobResult>(wire).unwrap(), measured);
+        let unbooted = JobResult {
+            usage: Some(JobUsage {
+                wall_ms: 900,
+                ..JobUsage::default()
+            }),
+            ..old
+        };
+        assert_eq!(
+            serde_json::to_value(&unbooted).unwrap()["usage"],
+            json!({"wall_ms": 900})
+        );
+        // Unknown measurements from newer nodes are ignored.
+        let later: JobUsage = serde_json::from_value(json!({"wall_ms": 1, "gpu_ms": 5})).unwrap();
+        assert_eq!(later.wall_ms, 1);
     }
 }

@@ -330,6 +330,7 @@ mod tests {
                         artifact_type: "archive".into(),
                         state: UploadState::Skipped,
                     }],
+                    usage: None,
                 },
             },
         ]
