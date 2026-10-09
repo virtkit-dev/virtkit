@@ -854,6 +854,18 @@ pub struct Report {
     /// The tools build under way, or the last one, with how it ended. From version [`TOOLS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsProgress>,
+    /// The node's placed-job intake. Older nodes omit this field and declare no policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placed: Option<PlacedIntake>,
+}
+
+/// A node's configured intake of hub-placed jobs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacedIntake {
+    /// Why the node takes none: the host runs a gitlab-runner of its own with the vk executor,
+    /// in words. A host runs one or the other, never both. `None`: it takes them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<String>,
 }
 
 impl Report {
@@ -1879,6 +1891,7 @@ mod tests {
                 message: Some("validation failed".into()),
             }),
             tools: None,
+            placed: None,
         }
     }
 
@@ -2238,6 +2251,22 @@ mod tests {
             serde_json::to_string(&Report::default()).unwrap(),
             r#"{"workloads":null,"workloads_omitted":0}"#
         );
+    }
+
+    /// Older reports omit placed-job intake; absence does not mean refusal.
+    #[test]
+    fn placed_intake_keeps_its_wire_shape() {
+        let runner = Report {
+            placed: Some(PlacedIntake {
+                runner: Some("[node] runner = \"managed\"".into()),
+            }),
+            ..steering_report()
+        };
+        let mut wire = serde_json::to_value(NodeMsg::Report(steering_report())).unwrap();
+        wire["placed"] = json!({"runner": "[node] runner = \"managed\""});
+        pinned(&NodeMsg::Report(runner), wire);
+        pinned(&PlacedIntake::default(), json!({}));
+        assert_eq!(steering_report().placed, None);
     }
 
     /// A report and a heartbeat without workloads still read, as "not looked" and "none

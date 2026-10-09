@@ -510,9 +510,9 @@ enum NodesCmd {
     /// Cap how many jobs the node runs at once, or lift the cap with `none`
     ///
     /// For the node's runner, the node takes the smallest of this, its own estimate and its
-    /// local ceiling; the hub only ever lowers what the node would take. The jobs the hub
-    /// places are capped at it apart: reservations and jobs not finished, counted by the hub
-    /// and again by the node. Running jobs past a lowered cap carry on.
+    /// local ceiling; the hub only ever lowers what the node would take. On a node that takes
+    /// the hub's jobs instead, they are capped at it: reservations and jobs not finished,
+    /// counted by the hub and again by the node. Running jobs past a lowered cap carry on.
     Ceiling {
         id: String,
         /// A number of jobs, or `none`
@@ -521,20 +521,20 @@ enum NodesCmd {
     },
     /// Stop the node's runner taking new jobs; running ones finish
     ///
-    /// With `[node] runner = "external"`, the node stops taking the jobs the hub places and
-    /// reports that its runner may still take jobs. Drain and quarantine behave the same way.
+    /// With `[node] runner = "external"`, a gitlab-runner of the node's own is not stopped, and
+    /// the node reports that it may still take jobs. Drain and quarantine behave the same way.
     Stop { id: String },
     /// Let the node's runner take jobs again
     Resume { id: String },
     /// Stop taking jobs and report `drained` once everything running has finished
     ///
-    /// With `[node] runner = "external"`, only the jobs the hub places.
+    /// With `[node] runner = "external"`, a gitlab-runner of the node's own is not stopped.
     Drain { id: String },
     /// End a drain: back to `ready`, taking jobs
     Undrain { id: String },
     /// Stop taking jobs until `release`, whatever else the node is told
     ///
-    /// With `[node] runner = "external"`, only the jobs the hub places.
+    /// With `[node] runner = "external"`, a gitlab-runner of the node's own is not stopped.
     Quarantine { id: String },
     /// End a quarantine: back to `ready`
     Release { id: String },
@@ -1884,8 +1884,21 @@ fn node_notes(n: &ops::NodeView) -> Vec<String> {
     if !n.labels.is_empty() {
         placement.push(format!("{}: labels {}", n.hostname, n.labels.join(", ")));
     }
-    if let Some(why) = &n.last_refusal {
+    // On a hub that places jobs, a runner of the node's own, which says why it refuses them.
+    let own_runner = (n.report.as_ref())
+        .and_then(|r| r.placed.as_ref())
+        .and_then(|p| p.runner.as_ref())
+        .filter(|_| n.placed.is_some());
+    if let Some(why) = &n.last_refusal
+        && !(own_runner.is_some() && (why == "runner" || why.starts_with("runner: ")))
+    {
         placement.push(format!("{}: refuses reservations: {why}", n.hostname));
+    }
+    if let Some(why) = own_runner {
+        placement.push(format!(
+            "{}: takes none of the hub's jobs: it runs its own gitlab-runner ({why})",
+            n.hostname
+        ));
     }
     let Some(report) = &n.report else {
         return placement;

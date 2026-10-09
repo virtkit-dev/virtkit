@@ -10,8 +10,7 @@ All notable changes to virtkit will be documented in this file.
   and the web UI's *Max concurrent jobs* also cap placed jobs and reservations, letting operators
   bring a node in gradually or spare a shared service such as the registry. The capacity
   `vk-gitlab` sees shrinks to match, and the node also enforces the ceiling. Lowering it leaves
-  running jobs alone. A node's page shows placed jobs against the ceiling. If the node also
-  runs its own gitlab-runner, each workload has a separate limit under the same ceiling.
+  running jobs alone. A node's page shows placed jobs against the ceiling.
 - **`vk-hub`'s web UI shows virtkit's logo as its browser tab icon.**
 - **`vk-hub` keeps the end of a failed job's output.** When `vk-gitlab` settles a failed job
   — a script failure, a system failure, a lost node… — the hub keeps the last 256 KiB of its
@@ -76,7 +75,11 @@ All notable changes to virtkit will be documented in this file.
   web UI's Jobs page shows job history and resource usage, with node, project and result
   filters, success rate and median run time. Like the nodes page, the newest page of each
   filter updates live: new jobs appear at the top, and running jobs show stage changes and
-  results. Each node's page links to its jobs.
+  results. Each node's page links to its jobs. A host runs its own gitlab-runner with the vk
+  executor or the hub's jobs, never both: a node that finds such a runner when it starts —
+  managed by the node, gitlab-runner's systemd unit, or the config `[node] runner_config` names
+  — takes none of the hub's jobs, and the hub offers it nothing and says why on the node's page
+  and under `vk-hub nodes`.
 - `[node] labels` declares the labels the hub may place GitLab jobs by.
 - **`vk-hub`'s web UI links the jobs it placed to their GitLab pages.** A node's workloads,
   local mode's VMs and the jobs on the Jobs page open the job on GitLab in a new tab. A
@@ -102,10 +105,9 @@ All notable changes to virtkit will be documented in this file.
 - **Node pages in `vk-hub` explain the current state and available actions.** The steering
   panel groups job intake, maintenance and a danger zone, shows the current state in plain
   language, and offers only applicable actions, each with a short explanation.
-- **Drain and quarantine on a fleet node with an external runner now stop the jobs the hub
-  places there** instead of being refused. The node says that its runner may still take jobs,
-  and reports `drained` once the jobs it runs, and any vk executor job already admitted, are
-  over. A reset is still refused there.
+- **Drain and quarantine on a fleet node with an external runner are now accepted** instead of
+  being refused. The node says its runner may still take jobs, and reports `drained` once every
+  vk executor job already admitted is over. A reset is still refused there.
 - **`vk-hub`'s web UI shows times in the browser's own time zone, with how long ago they
   were** (`11:52 · 5 min ago`), the exact UTC time on hover; without JavaScript, the UTC time
   shows as before.

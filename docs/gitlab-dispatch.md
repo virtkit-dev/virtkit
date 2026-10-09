@@ -115,6 +115,11 @@ A node's concurrency ceiling (`vk-hub nodes ceiling`) caps its placed work: the 
 starts nothing on a node whose reservations and jobs not finished reach it, and the node
 refuses `ceiling` past it by its own count. Running jobs above a lowered ceiling carry on.
 
+A host runs its own gitlab-runner with the vk executor or takes placed jobs, never both. A node
+that finds such a runner on its host says so in its report and refuses with `runner` every new
+offer and every start without a reservation (a reservation it already holds is renewed and
+started on); the hub places nothing on it and counts it in no capacity.
+
 ## Daemon ↔ hub: the client API
 
 HTTP/1.1 and JSON over TLS 1.3, on the hub's node listener (`addr`), under `/v1/`. Every
@@ -224,9 +229,10 @@ one offering at most 2 is steered and never offered a job.
 | `result {job, result}` | how the job ended; repeated until `recorded` |
 
 Refusal reasons are `memory`, `disk`, `cpus`, `not_ready` (draining, drained, quarantined, in
-maintenance), `policy`, `no_reservation`, `invalid` and `ceiling` (the node's placed jobs not
-finished and reservations held reach the hub's ceiling, as the node last applied it); one the
-hub does not know reads as `other`, as `ceiling` does on a hub older than it.
+maintenance), `policy`, `no_reservation`, `invalid`, `ceiling` (the node's placed jobs not
+finished and reservations held reach the hub's ceiling, as the node last applied it) and
+`runner` (the host runs its own gitlab-runner with the vk executor); one the hub does not know
+reads as `other`, as `ceiling` and `runner` do on a hub older than them.
 
 **Reservations.** A node answers an offer at once from its ledger: granted, or refused with
 the resource that is short. It holds the entry in the ledger itself, with no job process

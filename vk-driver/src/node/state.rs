@@ -174,8 +174,8 @@ pub struct Trial {
 /// What a node can do, which decides what commands it takes.
 pub struct Abilities {
     /// The node runs and can stop its runner, as reset and update without `force` require.
-    /// Drain and quarantine also work with an external runner: the node runs hub-placed jobs
-    /// itself in either mode.
+    /// Drain and quarantine also work without a managed runner: they stop the hub-placed jobs
+    /// the node runs itself.
     pub managed: bool,
     /// Whether it can install the update a command names, or why not. Looked at only for an
     /// update.

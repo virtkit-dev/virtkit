@@ -2650,6 +2650,7 @@ fn display_safe_report(mut report: Report) -> Report {
         .unsupported
         .iter_mut()
         .chain(report.concurrency_error.as_mut())
+        .chain(report.placed.as_mut().and_then(|p| p.runner.as_mut()))
         .chain(update)
     {
         *s = vk_hub_proto::display_safe(s);

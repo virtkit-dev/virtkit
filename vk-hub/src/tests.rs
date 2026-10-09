@@ -2245,6 +2245,39 @@ fn sync_compares_the_applied_state_not_only_its_generation() {
     assert_eq!(steering_cells(&view(other))[3], "differs");
 }
 
+/// A node running its own gitlab-runner says so under `vk-hub nodes` once, on a hub that places
+/// jobs, in place of the refusal it causes.
+#[test]
+fn a_node_s_own_runner_is_noted_on_a_hub_that_places_jobs() {
+    use vk_hub_proto::{PlacedIntake, Report};
+    let mut n = ops::NodeView {
+        hostname: "ci-1".into(),
+        report: Some(Report {
+            placed: Some(PlacedIntake {
+                runner: Some("gitlab-runner.service runs the vk custom executor".into()),
+            }),
+            ..Report::default()
+        }),
+        last_refusal: Some("runner".into()),
+        placed: Some(0),
+        ..ops::NodeView::default()
+    };
+    assert_eq!(
+        node_notes(&n),
+        [
+            "ci-1: takes none of the hub's jobs: it runs its own gitlab-runner \
+          (gitlab-runner.service runs the vk custom executor)"
+        ]
+    );
+    // Another refusal still shows.
+    n.last_refusal = Some("memory".into());
+    assert_eq!(node_notes(&n).len(), 2);
+    // A hub that places no jobs says nothing of them.
+    n.placed = None;
+    n.last_refusal = None;
+    assert!(node_notes(&n).is_empty(), "{:?}", node_notes(&n));
+}
+
 #[test]
 fn the_nodes_table_shows_desired_beside_observed_and_marks_a_lag() {
     use vk_hub_proto::{Acquisition, Concurrency, DesiredState, NodeState, Report};

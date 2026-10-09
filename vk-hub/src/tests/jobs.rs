@@ -2254,6 +2254,58 @@ async fn a_node_at_its_ceiling_is_placed_nothing_until_a_job_ends() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Report `node`'s placed-job intake and wait for the hub to store it.
+async fn report_placed(hub: &Hub, node: &FakeNode, placed: vk_hub_proto::PlacedIntake) {
+    node.outbox
+        .send(NodeMsg::Report(Report {
+            state: Some(NodeState::Ready),
+            placed: Some(placed.clone()),
+            ..Report::default()
+        }))
+        .unwrap();
+    wait_until(|| {
+        hub.db
+            .node(&node.id)
+            .unwrap()
+            .and_then(|r| r.report)
+            .is_some_and(|r| r.placed.as_ref() == Some(&placed))
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_node_running_its_own_runner_is_offered_nothing() {
+    let dir = scratch("own-runner");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let fits = || async {
+        crate::jobs::capacity(&hub, &placement())
+            .await
+            .unwrap()
+            .fits
+    };
+    // Saying it runs none changes nothing.
+    report_placed(&hub, &node, vk_hub_proto::PlacedIntake::default()).await;
+    assert_eq!(fits().await, 4);
+    let runner = vk_hub_proto::PlacedIntake {
+        runner: Some("gitlab-runner.service runs the vk custom executor".into()),
+    };
+    report_placed(&hub, &node, runner).await;
+    assert_eq!(fits().await, 0);
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/reservations",
+        Some(&key),
+        Some(reservation_body(1, 1)),
+    )
+    .await;
+    assert_eq!(resp.code(), ErrorCode::NoCapacity, "{resp:?}");
+    node.quiet(Duration::from_millis(300)).await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_job_the_hub_disowned_counts_against_the_ceiling_until_it_ends() {
     let dir = scratch("ceiling-disowned");

@@ -18,7 +18,8 @@
 //! and starts not yet answered. Offers and starts go to the node with the most room first.
 //! A node the operator gave a concurrency ceiling takes placed work only below it, counted by
 //! [`placed`]: the node refuses past it too ([`Refusal::Ceiling`]), should the hub's count
-//! fall short of the node's.
+//! fall short of the node's. A node that reports a gitlab-runner of its own takes none
+//! ([`Refusal::Runner`]).
 //! The hub places a job again only while no node can have started it: after a refused start,
 //! or a start that never went out; a start whose answer was lost waits for the node's `held`.
 //!
@@ -480,6 +481,7 @@ fn refusal_name(r: Refusal) -> &'static str {
         Refusal::NoReservation => "no reservation",
         Refusal::Invalid => "invalid",
         Refusal::Ceiling => "ceiling",
+        Refusal::Runner => "runner",
         Refusal::Other => "other",
     }
 }
@@ -1023,11 +1025,17 @@ fn room(hub: &Hub, state: &State, node: &str, row: &NodeRow, placement: &Placeme
     {
         return None;
     }
-    if row
-        .report
-        .as_ref()
+    let report = row.report.as_ref();
+    if report
         .and_then(|r| r.state)
         .is_some_and(|s| s != NodeState::Ready)
+    {
+        return None;
+    }
+    // A host runs its own gitlab-runner or the hub's jobs, never both.
+    if report
+        .and_then(|r| r.placed.as_ref())
+        .is_some_and(|p| p.runner.is_some())
     {
         return None;
     }

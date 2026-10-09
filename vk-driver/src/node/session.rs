@@ -389,6 +389,7 @@ async fn handle_job(node: &Node, msg: vk_hub_proto::dispatch::HubJobMsg) -> Resu
     let intake = super::jobs::Intake {
         ready: super::jobs::ready(node.core.state(), *node.core.acquire().borrow()),
         ceiling: node.core.hub_ceiling(),
+        runner: node.core.placed().runner.is_some(),
     };
     let jobs = node.jobs.clone();
     let replies =
@@ -1238,6 +1239,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn commands_are_applied_once_and_acked_until_recorded() {
         let mut f = fixture("steer").await;
+        // An external runner of its own: it may go on taking jobs past a stop.
+        f.node.core.set_placed(vk_hub_proto::PlacedIntake {
+            runner: Some("gitlab-runner.service runs the vk custom executor".into()),
+        });
         let (node, gatherer, stopped, listener, stop) = f.parts();
         let key = node.identity.public_key().to_vec();
         // A reset, refused with an external runner: still journaled, and its outcome still

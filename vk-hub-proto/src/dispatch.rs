@@ -181,6 +181,10 @@ pub enum Refusal {
     /// The node already runs or holds as many placed jobs and reservations as the hub's
     /// concurrency ceiling allows. A hub older than this reason reads it as [`Refusal::Other`].
     Ceiling,
+    /// The host runs a gitlab-runner of its own with the vk executor, so it takes no placed
+    /// work at all ([`crate::PlacedIntake::runner`]). Read as [`Refusal::Other`] by a hub older
+    /// than this reason.
+    Runner,
     /// A reason from a later node.
     #[serde(other)]
     Other,
@@ -431,18 +435,10 @@ mod tests {
         assert_eq!(end, LeaseEnd::Other);
     }
 
-    /// `ceiling` came after the first nodes: a hub that knows it reads it, and one that does
-    /// not reads it as any later reason, `other`.
+    /// `ceiling` and `runner` came after the first nodes: a hub that knows them reads them, and
+    /// one that does not reads them as any later reason, `other`.
     #[test]
-    fn a_ceiling_refusal_reads_as_ceiling_and_as_other_before_it() {
-        let refused = OfferReply::Refused {
-            reason: Refusal::Ceiling,
-            message: None,
-        };
-        let wire = serde_json::to_value(&refused).unwrap();
-        assert_eq!(wire, json!({"state": "refused", "reason": "ceiling"}));
-        assert_eq!(serde_json::from_value::<OfferReply>(wire).unwrap(), refused);
-
+    fn later_refusals_read_as_themselves_and_as_other_before_them() {
         #[derive(Debug, PartialEq, Deserialize)]
         #[serde(rename_all = "snake_case")]
         enum Before {
@@ -450,10 +446,19 @@ mod tests {
             #[serde(other)]
             Other,
         }
-        assert_eq!(
-            serde_json::from_value::<Before>(json!("ceiling")).unwrap(),
-            Before::Other
-        );
+        for (reason, name) in [(Refusal::Ceiling, "ceiling"), (Refusal::Runner, "runner")] {
+            let refused = OfferReply::Refused {
+                reason,
+                message: None,
+            };
+            let wire = serde_json::to_value(&refused).unwrap();
+            assert_eq!(wire, json!({"state": "refused", "reason": name}));
+            assert_eq!(serde_json::from_value::<OfferReply>(wire).unwrap(), refused);
+            assert_eq!(
+                serde_json::from_value::<Before>(json!(name)).unwrap(),
+                Before::Other
+            );
+        }
     }
 
     #[test]

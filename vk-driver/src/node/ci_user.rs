@@ -1,8 +1,7 @@
 //! Whether this host's CI jobs run as another user than the node. The node reads the
 //! admission ledger (`<state_dir>/admit/`) and the job dirs (`<state_dir>/jobs/`) its runner's
 //! vk executor writes, `0600` and `0700`; when the executor runs as another user, the node
-//! cannot read them, under-counts admission and cannot tell when a drain is done — and the
-//! executor cannot read what the node's own placed jobs leave there either.
+//! cannot read them, under-counts admission and cannot tell when a drain is done.
 //!
 //! Two signs are read: who owns the jobs' entries under the state dir, and, with an external
 //! runner, the user gitlab-runner's systemd unit runs as when its config runs the vk custom
@@ -98,6 +97,31 @@ pub fn this_node(cfg: &Config) -> Option<String> {
     };
     let seen = others(cfg, &node);
     (!seen.is_empty()).then(|| explain(&node, cfg.state_dir(), &seen, false))
+}
+
+/// Detect the host's own vk gitlab-runner: managed mode, gitlab-runner's unit configured to
+/// run vk, or a vk runner in `[node] runner_config`. Such a host takes no hub-placed jobs.
+pub fn local_runner(cfg: &Config) -> Option<String> {
+    local_runner_in(cfg, UNIT_DIRS)
+}
+
+/// [`local_runner`], reading gitlab-runner's unit from `unit_dirs`.
+fn local_runner_in(cfg: &Config, unit_dirs: &[&str]) -> Option<String> {
+    if cfg.node.runner == vk_hub_proto::RunnerMode::Managed {
+        return Some("the node runs gitlab-runner itself ([node] runner = \"managed\")".into());
+    }
+    if let Some((_, unit)) = runner_unit_user(unit_dirs) {
+        return Some(format!("{} runs the vk custom executor", unit.display()));
+    }
+    let config = cfg.node.runner_config.as_deref()?;
+    let mut text = String::new();
+    std::fs::File::open(config)
+        .and_then(|f| {
+            f.take(super::inventory::MAX_RUNNER_CONFIG)
+                .read_to_string(&mut text)
+        })
+        .ok()?;
+    runs_vk(&text).then(|| format!("{} runs the vk custom executor", config.display()))
 }
 
 fn owner(path: &Path) -> Option<u32> {
@@ -571,6 +595,63 @@ ExecStart=/usr/bin/gitlab-runner "run" "--config" "/etc/gitlab-runner/config.tom
         // Masked: it runs nothing.
         std::os::unix::fs::symlink("/dev/null", units.join(RUNNER_UNIT)).unwrap();
         assert_eq!(runner_unit_user(&dirs), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_host_runs_its_own_runner_when_managed_its_unit_or_its_config_runs_vk() {
+        let dir = scratch("local-runner");
+        let units = dir.join("units");
+        std::fs::create_dir_all(&units).unwrap();
+        let dirs = [units.to_str().unwrap()];
+        let config = dir.join("config.toml");
+        let with = |extra: &str| -> Config {
+            toml::from_str(&format!(
+                "state_dir = {:?}\n[node]\n{extra}",
+                dir.display().to_string()
+            ))
+            .unwrap()
+        };
+        // Nothing of gitlab-runner here.
+        assert_eq!(local_runner_in(&with(""), &dirs), None);
+        let managed = local_runner_in(&with("runner = \"managed\"\n"), &dirs).unwrap();
+        assert!(managed.contains("managed"), "{managed}");
+        // The config the node steers, once it runs vk.
+        let named = with(&format!(
+            "runner_config = {:?}\n",
+            config.display().to_string()
+        ));
+        assert_eq!(local_runner_in(&named, &dirs), None);
+        std::fs::write(&config, "[[runners]]\nexecutor = \"shell\"\n").unwrap();
+        assert_eq!(local_runner_in(&named, &dirs), None);
+        std::fs::write(
+            &config,
+            "[[runners]]\nexecutor = \"custom\"\n[runners.custom]\nrun_exec = \"/usr/local/bin/vk\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            local_runner_in(&named, &dirs),
+            Some(format!("{} runs the vk custom executor", config.display()))
+        );
+        // gitlab-runner's unit, running that config.
+        let runner = dir.join("gitlab-runner");
+        std::fs::write(&runner, "").unwrap();
+        std::fs::write(
+            units.join(RUNNER_UNIT),
+            format!(
+                "[Service]\nExecStart={} run --config {}\n",
+                runner.display(),
+                config.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            local_runner_in(&with(""), &dirs),
+            Some(format!(
+                "{} runs the vk custom executor",
+                units.join(RUNNER_UNIT).display()
+            ))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

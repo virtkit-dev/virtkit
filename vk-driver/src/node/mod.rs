@@ -578,6 +578,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     let core = core::Core::open(&dir, issuer, spec.is_some().then_some(runner_state))?;
     core.set_allow_downgrade(cfg.node.allow_downgrade);
     core.set_release_policy(policy);
+    core.set_placed(vk_hub_proto::PlacedIntake {
+        runner: ci_user::local_runner(&cfg),
+    });
     let (halt, halted) = tokio::sync::watch::channel(false);
     let supervisor = spec.map(|spec| {
         let signals = runner::Signals {

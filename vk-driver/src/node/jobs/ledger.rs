@@ -39,6 +39,8 @@ struct Entry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Gate {
     Open,
+    /// The host runs a gitlab-runner of its own with the vk executor: it takes no placed work.
+    Runner,
     /// Draining, drained, quarantined, in maintenance, or with acquisition stopped.
     NotReady,
     /// The node's placed jobs not finished and its reservations, `held` of them, reach the
@@ -50,9 +52,26 @@ pub enum Gate {
 }
 
 impl Gate {
-    /// Why a closed gate refuses at the ceiling, in the hub's words.
-    pub fn ceiling_message(ceiling: u32, held: usize) -> String {
-        format!("{held} placed jobs and reservations reach the hub's ceiling of {ceiling}")
+    /// Why a closed gate refuses, in the hub's words; `None` when it is open.
+    pub fn refusal(self) -> Option<(Refusal, Option<String>)> {
+        match self {
+            Gate::Open => None,
+            Gate::Runner => Some((
+                Refusal::Runner,
+                Some(
+                    "this host runs its own gitlab-runner with the vk executor, and a host runs \
+                     one or the other"
+                        .into(),
+                ),
+            )),
+            Gate::NotReady => Some((Refusal::NotReady, None)),
+            Gate::Ceiling { ceiling, held } => Some((
+                Refusal::Ceiling,
+                Some(format!(
+                    "{held} placed jobs and reservations reach the hub's ceiling of {ceiling}"
+                )),
+            )),
+        }
     }
 }
 
@@ -160,20 +179,8 @@ impl Ledger {
             entry.expires = now + Duration::from_secs(lease.into());
             return OfferReply::Accepted { lease_secs: lease };
         }
-        match gate {
-            Gate::Open => {}
-            Gate::NotReady => {
-                return OfferReply::Refused {
-                    reason: Refusal::NotReady,
-                    message: None,
-                };
-            }
-            Gate::Ceiling { ceiling, held } => {
-                return OfferReply::Refused {
-                    reason: Refusal::Ceiling,
-                    message: Some(Gate::ceiling_message(ceiling, held)),
-                };
-            }
+        if let Some((reason, message)) = gate.refusal() {
+            return OfferReply::Refused { reason, message };
         }
         match self.admit(&ledger_name(id), &envelope) {
             Ok(held) => {

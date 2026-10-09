@@ -878,6 +878,8 @@ struct Panel {
     /// How many jobs the hub has placed on the node, against the limit: for a node that
     /// takes placed jobs, from a hub that places them.
     placed: Option<String>,
+    /// Why the node takes none of the hub's jobs: a gitlab-runner of its own.
+    own_runner: Option<String>,
     lift: Option<Act>,
     maintenance: &'static str,
     maintenance_acts: Vec<Act>,
@@ -890,6 +892,15 @@ impl Panel {
         let report = v.report.as_ref();
         let state = report.and_then(|r| r.state);
         let external = report.and_then(|r| r.runner) == Some(RunnerMode::External);
+        let own_runner = report
+            .and_then(|r| r.placed.as_ref())
+            .and_then(|p| p.runner.as_deref());
+        // A node that says it runs no gitlab-runner of its own runs only the hub's jobs; one
+        // older than saying so may run an external runner.
+        let external_runner = external
+            && report
+                .and_then(|r| r.placed.as_ref())
+                .is_none_or(|p| p.runner.is_some());
         let paused = v
             .desired
             .as_ref()
@@ -908,8 +919,17 @@ impl Panel {
         };
         let intake = match stopped {
             None => "Taking new jobs".to_string(),
-            // Pausing intake of the hub's jobs does not stop the external runner.
-            Some(why) if external => {
+            // Its own runner, external, is all it runs, and nothing the hub says stops it.
+            Some(why) if external && own_runner.is_some() => {
+                let what = if paused {
+                    "Intake paused".to_string()
+                } else {
+                    format!("Intake stopped{why}")
+                };
+                format!("{what}, but the external runner may still take jobs")
+            }
+            // A node that does not say whether it runs one may run the hub's jobs beside it.
+            Some(why) if external_runner => {
                 format!("Not taking the hub's jobs{why}; the external runner may still take jobs")
             }
             Some(why) => format!("Not taking new jobs{why}"),
@@ -924,7 +944,7 @@ impl Panel {
         }
         let placed = v
             .placed
-            .filter(|_| v.protocol.is_some_and(|p| p >= vk_hub_proto::JOBS))
+            .filter(|_| v.protocol.is_some_and(|p| p >= vk_hub_proto::JOBS) && own_runner.is_none())
             .map(|placed| match ceiling {
                 Some(n) => format!("Placed by the hub: {placed} of {n}"),
                 None => format!("Placed by the hub: {placed}"),
@@ -967,16 +987,27 @@ impl Panel {
         {
             danger_acts.push(RESET);
         }
-        Panel {
-            note: external.then_some(
-                "Its runner is external: pausing intake, draining and quarantining stop only \
-                 the jobs the hub places here; the runner may still take jobs. A reset is \
-                 refused.",
+        let note = match (external, external_runner) {
+            (true, true) => Some(
+                "Its runner is external: pausing intake, draining and quarantining do not stop \
+                 it, and it may still take jobs. A reset is refused.",
             ),
+            (true, false) => Some("With [node] runner = \"external\", a reset is refused."),
+            (false, _) => None,
+        };
+        Panel {
+            note,
             intake,
             intake_acts,
             limit,
             placed,
+            // Said only by a hub that places jobs.
+            own_runner: own_runner.filter(|_| v.placed.is_some()).map(|why| {
+                format!(
+                    "Takes none of the hub's jobs: this host runs its own gitlab-runner with the \
+                     vk executor ({why})"
+                )
+            }),
             lift: ceiling.map(|_| LIFT),
             maintenance,
             maintenance_acts,
@@ -1027,8 +1058,8 @@ fn steer_panel(h: &mut Html, v: &NodeView, csrf: Option<&str>) {
         act(h, a, "");
     }
     h.raw("<p class=\"now\">").text(&p.limit).raw("</p>");
-    if let Some(placed) = &p.placed {
-        h.raw("<p class=\"now\">").text(placed).raw("</p>");
+    for line in p.placed.iter().chain(&p.own_runner) {
+        h.raw("<p class=\"now\">").text(line).raw("</p>");
     }
     if let Some(csrf) = csrf {
         // No placeholder: hx-preserve would keep the first render's, stale after a change.
@@ -1037,8 +1068,8 @@ fn steer_panel(h: &mut Html, v: &NodeView, csrf: Option<&str>) {
             .raw("<label for=\"ceiling\">Max concurrent jobs</label>")
             .raw("<input id=\"ceiling\" type=\"number\" name=\"ceiling\" min=\"1\" required ")
             .raw("hx-preserve=\"true\"><button>Set the limit</button><span class=\"does\">")
-            .raw("Run at most this many of its runner's jobs at once on this node, and at ")
-            .raw("most this many of the jobs the hub places here.</span></form>");
+            .raw("Run at most this many jobs at once on this node: its runner's, or those ")
+            .raw("the hub places here.</span></form>");
     }
     if let Some(a) = &p.lift {
         act(h, a, "");
@@ -1767,7 +1798,7 @@ fn rollout(h: &mut Html, r: &Rollout, steer: bool, now: u64) {
 
 #[cfg(test)]
 mod tests {
-    use vk_hub_proto::{Concurrency, DesiredState, NodeState, Report};
+    use vk_hub_proto::{Concurrency, DesiredState, NodeState, PlacedIntake, Report};
 
     use super::*;
 
@@ -1919,11 +1950,11 @@ mod tests {
         assert_eq!(
             p.note,
             Some(
-                "Its runner is external: pausing intake, draining and quarantining stop only \
-                 the jobs the hub places here; the runner may still take jobs. A reset is \
-                 refused."
+                "Its runner is external: pausing intake, draining and quarantining do not stop \
+                 it, and it may still take jobs. A reset is refused."
             )
         );
+        assert_eq!(p.own_runner, None);
         v.desired = Some(DesiredState {
             generation: 3,
             ceiling: None,
@@ -1933,5 +1964,43 @@ mod tests {
             Panel::of(&v).intake,
             "Not taking the hub's jobs: intake paused; the external runner may still take jobs"
         );
+        // A node that says it runs no gitlab-runner of its own runs only the hub's jobs.
+        if let Some(r) = v.report.as_mut() {
+            r.placed = Some(PlacedIntake::default());
+        }
+        let p = Panel::of(&v);
+        assert_eq!(p.intake, "Not taking new jobs: intake paused");
+        assert_eq!(
+            p.note,
+            Some("With [node] runner = \"external\", a reset is refused.")
+        );
+        assert_eq!(p.placed.as_deref(), Some("Placed by the hub: 2"));
+        // One that runs its own takes none of them, and says why.
+        if let Some(r) = v.report.as_mut() {
+            r.placed = Some(PlacedIntake {
+                runner: Some("gitlab-runner.service runs the vk custom executor".into()),
+            });
+        }
+        let p = Panel::of(&v);
+        assert_eq!(p.placed, None);
+        assert_eq!(
+            p.own_runner.as_deref(),
+            Some(
+                "Takes none of the hub's jobs: this host runs its own gitlab-runner with the vk \
+                 executor (gitlab-runner.service runs the vk custom executor)"
+            )
+        );
+        assert_eq!(
+            p.intake,
+            "Intake paused, but the external runner may still take jobs"
+        );
+        v.desired = None;
+        assert_eq!(
+            Panel::of(&v).intake,
+            "Intake stopped while drained, but the external runner may still take jobs"
+        );
+        // A hub that places no jobs says nothing of them.
+        v.placed = None;
+        assert_eq!(Panel::of(&v).own_runner, None);
     }
 }

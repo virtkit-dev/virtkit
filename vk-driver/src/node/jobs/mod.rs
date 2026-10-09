@@ -122,10 +122,14 @@ struct State {
 }
 
 impl State {
-    /// Whether new placed work is taken. At the hub's ceiling, the node's placed jobs not
-    /// finished and its reservations fill it: a job on a reservation counts once, as the
-    /// reservation until it starts. Jobs past a ceiling lowered under them carry on.
+    /// Whether new placed work is taken: never on a host running its own runner. At the hub's
+    /// ceiling, the node's placed jobs not finished and its reservations fill it: a job on a
+    /// reservation counts once, as the reservation until it starts. Jobs past a ceiling lowered
+    /// under them carry on.
     fn gate(&self, intake: Intake) -> Gate {
+        if intake.runner {
+            return Gate::Runner;
+        }
         if !intake.ready {
             return Gate::NotReady;
         }
@@ -147,6 +151,9 @@ pub struct Intake {
     pub ready: bool,
     /// The hub's concurrency ceiling, from the applied desired state.
     pub ceiling: Option<u32>,
+    /// The host runs a gitlab-runner of its own with the vk executor
+    /// ([`vk_hub_proto::PlacedIntake::runner`]).
+    pub runner: bool,
 }
 
 /// Every reservation and placed job this node holds, for the sessions of `vk node run`.
@@ -410,22 +417,22 @@ impl Jobs {
                 }
                 held
             }
-            (None, Gate::NotReady) => {
-                return refused(Refusal::NotReady, "the node takes no new work".into());
-            }
-            (None, Gate::Ceiling { ceiling, held }) => {
-                return refused(Refusal::Ceiling, Gate::ceiling_message(ceiling, held));
-            }
-            (None, Gate::Open) => match state.ledger.admit(&name, &start.envelope) {
-                Ok(held) => held,
-                Err((reason, message)) => {
-                    let reason = match start.reservation {
-                        Some(_) => Refusal::NoReservation,
-                        None => reason,
-                    };
+            (None, gate) => {
+                if let Some((reason, message)) = gate.refusal() {
+                    let message = message.unwrap_or_else(|| "the node takes no new work".into());
                     return refused(reason, message);
                 }
-            },
+                match state.ledger.admit(&name, &start.envelope) {
+                    Ok(held) => held,
+                    Err((reason, message)) => {
+                        let reason = match start.reservation {
+                            Some(_) => Refusal::NoReservation,
+                            None => reason,
+                        };
+                        return refused(reason, message);
+                    }
+                }
+            }
         };
         // Past the take, a refusal goes out with the end of the reservation it consumed.
         let refused_after = |msgs: Vec<NodeJobMsg>, reason, message| {
@@ -823,6 +830,7 @@ fn refusal_change(
         (Refusal::Policy, None) => "not allowed by the configuration",
         (Refusal::NoReservation, None) => "no such reservation",
         (Refusal::Ceiling, None) => "at the hub's ceiling",
+        (Refusal::Runner, None) => "this host runs its own gitlab-runner",
         (Refusal::Other, None) => "for another reason",
     };
     Some(format!("refusing the hub's offers: {why}"))
@@ -928,11 +936,12 @@ pub(crate) mod tests {
     const OPEN: Intake = Intake {
         ready: true,
         ceiling: None,
+        runner: false,
     };
 
     const NOT_READY: Intake = Intake {
         ready: false,
-        ceiling: None,
+        ..OPEN
     };
 
     fn start(job: &str, reservation: Option<String>, id: u64) -> HubJobMsg {
@@ -1102,8 +1111,8 @@ pub(crate) mod tests {
         let jobs = Jobs::open_with(&dir, Arc::new(cfg), limits, running_driver, fake_cleanup);
         let now = Instant::now();
         let at = |ceiling| Intake {
-            ready: true,
             ceiling: Some(ceiling),
+            ..OPEN
         };
         let offer = |id: &str| HubJobMsg::Offer {
             reservation: hex(id),
@@ -1193,6 +1202,76 @@ pub(crate) mod tests {
         let msgs = jobs.handle(offer("c"), at(1), now);
         assert!(refused_at_ceiling(&msgs), "{msgs:?}");
         assert!(granted(jobs.handle(offer("c"), at(2), now)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A host running its own gitlab-runner refuses every new reservation and job not on one,
+    /// whatever else would let it take them; a reservation it already holds is renewed.
+    #[test]
+    fn a_host_running_its_own_runner_refuses_placed_work() {
+        let (jobs, dir) = jobs("runner", None);
+        let now = Instant::now();
+        let runner = Intake {
+            runner: true,
+            ..OPEN
+        };
+        let offer = |id: &str| HubJobMsg::Offer {
+            reservation: hex(id),
+            envelope: envelope(1),
+            lease_secs: 90,
+        };
+        assert!(matches!(
+            jobs.handle(offer("a"), OPEN, now).as_slice(),
+            [NodeJobMsg::OfferReply {
+                reply: OfferReply::Accepted { .. },
+                ..
+            }]
+        ));
+        for intake in [
+            runner,
+            Intake {
+                ready: false,
+                ..runner
+            },
+        ] {
+            let msgs = jobs.handle(offer("c"), intake, now);
+            let [
+                NodeJobMsg::OfferReply {
+                    reply:
+                        OfferReply::Refused {
+                            reason: Refusal::Runner,
+                            message: Some(why),
+                        },
+                    ..
+                },
+            ] = msgs.as_slice()
+            else {
+                panic!("{msgs:?}");
+            };
+            assert!(why.contains("gitlab-runner"), "{why}");
+            let msgs = jobs.handle(start(&hex("b"), None, 2), intake, now);
+            assert!(
+                matches!(
+                    msgs.as_slice(),
+                    [NodeJobMsg::Job {
+                        state: RunState::Refused {
+                            reason: Refusal::Runner,
+                            ..
+                        },
+                        ..
+                    }]
+                ),
+                "{msgs:?}"
+            );
+            assert!(!dir.join("jobs").join(hex("b")).exists());
+        }
+        assert!(matches!(
+            jobs.handle(offer("a"), runner, now).as_slice(),
+            [NodeJobMsg::OfferReply {
+                reply: OfferReply::Accepted { .. },
+                ..
+            }]
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 

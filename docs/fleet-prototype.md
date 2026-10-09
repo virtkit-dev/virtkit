@@ -143,15 +143,14 @@ takes root.
 
 The node must run as the user the host's CI jobs run as: it reads the admission ledger
 (`<state_dir>/admit/`, entries `0600`) and job dirs (`<state_dir>/jobs/`) the runner's vk
-executor writes, and the executor reads what the node's placed jobs leave there. gitlab-runner
-runs a custom executor as itself, so a gitlab-runner service running as root writes them as
-root, whatever its `--user`. `vk node join --user NAME` and `vk node service install` refuse
-when they find another user's sign: a job's entry in `admit/` or `jobs/` owned by another user
-(the directories, the ledger's `.lock` and `reservation-*` entries excepted; a former node
-user's placed jobs still running count as its jobs); or, with an external runner, a
-`gitlab-runner.service` not masked (its drop-ins included) whose `User=` is another — root
-when it sets none — and whose config, from its `--config` or `/etc/gitlab-runner/config.toml`
-for root, has a custom executor running `vk`.
+executor writes. gitlab-runner runs a custom executor as itself, so a gitlab-runner service
+running as root writes them as root, whatever its `--user`. `vk node join --user NAME` and
+`vk node service install` refuse when they find another user's sign: a job's entry in `admit/`
+or `jobs/` owned by another user (the directories, the ledger's `.lock` and `reservation-*`
+entries excepted; a former node user's placed jobs still running count as its jobs); or, with
+an external runner, a `gitlab-runner.service` not masked (its drop-ins included) whose `User=`
+is another — root when it sets none — and whose config, from its `--config` or
+`/etc/gitlab-runner/config.toml` for root, has a custom executor running `vk`.
 
 The refusal names the users and the evidence, and explains both remedies: run the node as
 the CI user, or run gitlab-runner as the node's user (`User=` in a drop-in from
@@ -279,15 +278,15 @@ is closed to everyone else.
 
 ## Steering
 
-`vk-hub nodes ceiling <id> <n|none>` separately caps a node's runner concurrency and the jobs the
-hub places on it (see [Placed jobs](#placed-jobs)), and `vk-hub nodes stop`
-and `resume` stop and resume its acquisition: the node's desired state, kept on the hub with a
-generation that moves on every change, to one past both the hub's last and the one the node
-last reported applying. A ceiling of 0 is refused: gitlab-runner has none, and stopping
-acquisition is what it would mean. `vk-hub nodes drain`, `undrain`, `quarantine`, `release` and
-`reset` issue a command, valid for a day. On the admin socket they are audited as `uid <n>`,
-the caller's; an operator's node page in the web UI runs the same operations, audited as its
-session's principal (see [Web UI](#web-ui)).
+`vk-hub nodes ceiling <id> <n|none>` caps a node's runner concurrency or, on a node that takes
+placed jobs instead, the jobs the hub places on it (see [Placed jobs](#placed-jobs)), and
+`vk-hub nodes stop` and `resume` stop and resume its acquisition: the node's desired state, kept
+on the hub with a generation that moves on every change, to one past both the hub's last and the
+one the node last reported applying. A ceiling of 0 is refused: gitlab-runner has none, and
+stopping acquisition is what it would mean. `vk-hub nodes drain`, `undrain`, `quarantine`,
+`release` and `reset` issue a command, valid for a day. On the admin socket they are audited as
+`uid <n>`, the caller's; an operator's node page in the web UI runs the same operations, audited
+as its session's principal (see [Web UI](#web-ui)).
 
 A session sends desired state once the node's report shows an older generation, once per
 generation, and each command without a final outcome once per session; nothing goes before the
@@ -417,18 +416,18 @@ offers and starts without a reservation ([Placed jobs on the node](#placed-jobs-
 so the hub stops placing work on it. A start on a reservation granted before the drain is
 still accepted, as the hub may already hold its GitLab job, and the drain waits for that job.
 
-With `[node] runner = "external"`, placed jobs are all the node can stop: it does not run
-gitlab-runner. Drain and quarantine are accepted all the same, and apply to the jobs the hub
-places; the report says that the runner may still take jobs (`unsupported`, shown as `cannot
-comply`) for as long as acquisition is stopped. The drain does not wait for the runner to
-exit; it completes once the admission ledger holds nothing and no job supervisor is left, at a
-moment the external runner runs no vk job. A runner that keeps the ledger busy keeps the node
-`draining` until it is undrained or the runner is stopped by other means; a job the runner
-takes after `drained` is not noticed. A reset, which clears job dirs a running job may use,
-stays refused. An update needs `--force` ([Update trial and
-rollback](#update-trial-and-rollback)): a forced update from `ready` goes straight to
-maintenance, waiting for neither the runner's jobs nor placed jobs; on a node already draining
-it waits for that drain.
+With `[node] runner = "external"`, the node does not run gitlab-runner. On a host that takes
+placed jobs, which runs none ([one kind of host](#placed-jobs-on-the-node)), those are all there
+is to stop. On a host whose own gitlab-runner the node found, drain and quarantine are accepted
+all the same, and the report says that the runner may still take jobs (`unsupported`, shown as
+`cannot comply`) for as long as acquisition is stopped. The drain does not wait for the runner
+to exit; it completes once the admission ledger holds nothing and no job supervisor is left, at
+a moment the external runner runs no vk job. A runner that keeps the ledger busy keeps the node
+`draining` until it is undrained or the runner is stopped by other means; a job the runner takes
+after `drained` is not noticed. A reset, which clears job dirs a running job may use, stays
+refused. An update needs `--force` ([Update trial and rollback](#update-trial-and-rollback)): a
+forced update from `ready` goes straight to maintenance, waiting for neither the runner's jobs
+nor placed jobs; on a node already draining it waits for that drain.
 
 ## Releases
 
@@ -758,6 +757,22 @@ A node speaks protocol versions 1 to 3, but accepts placed jobs only in version 
 as its first job message, listing every reservation and job it holds. The hub needs this
 list before placing work.
 
+**One kind of host.** A host runs its own gitlab-runner with the vk executor or takes the jobs
+the hub places, never both. `vk node run` looks for a runner of its own when it starts: `[node]
+runner = "managed"`, gitlab-runner's systemd unit (as [the CI user check](#running-the-node)
+reads it) running a config that runs the vk custom executor, or such a config named by `[node]
+runner_config`. A runner it cannot find that way — a unit running as a user of its own without
+`--config`, or a user unit — is named by its config in `[node] runner_config`. Finding one, it
+logs it once, reports what it found in its report's `placed.runner`, and refuses with `runner`
+every new offer and every start without a reservation; a hub that places jobs offers it nothing and
+shows why on the node's page and under `vk-hub nodes`. A reservation it held before is renewed
+and started on as usual. The check reads unit files and configs, not whether a runner runs: to
+move a host over to placed jobs, drain it, remove or mask `gitlab-runner.service`, unset `[node]
+runner_config` (and `runner = "managed"`), then restart `vk node`. The other way, drain it
+before installing a runner, so that no placed job runs beside the runner's until `vk node`
+restarts and finds it. A node older than this check reports nothing of it, and the hub places
+work on it as before.
+
 **Reservations.** An offer is decided at once against the same admission ledger
 (`<state_dir>/admit/`) as executor jobs: memory against `[executor.schedule] mem_budget`, job-dir
 disk under `disk_admission`, vCPUs against `[executor.vm] max_cpus` (else `cpus`). An offer
@@ -951,33 +966,33 @@ create idempotent for a day, kept in the database: for a reservation, the grant 
 request that got no reservation is tried afresh; for a job, the job.
 
 **Placement.** A node takes placed work while its session is at version 3 and has sent its
-`held`, it is connected, in the pool, carries every label, reports itself ready and has at
-least the CPUs the envelope asks, and while it holds less placed work than the ceiling the
-operator set it, if any. Its room is its last heartbeat's admission budget less committed
-memory — or its memory available, with no budget — and the job filesystem's most free space,
-less what the hub asked of it since: offers not yet answered, reservations accepted after that
-heartbeat, and starts not yet answered that are not on a reservation. `fits` is the sum of each
-node's room in envelopes, at most 1024 a node, and at most what its ceiling leaves.
+`held`, it is connected, in the pool, carries every label, reports itself ready and has at least
+the CPUs the envelope asks, does not report a gitlab-runner of its own ([one kind of
+host](#placed-jobs-on-the-node)), and while it holds less placed work than the ceiling the
+operator set it, if any. Its room is its last heartbeat's admission budget less committed memory
+— or its memory available, with no budget — and the job filesystem's most free space, less what
+the hub asked of it since: offers not yet answered, reservations accepted after that heartbeat,
+and starts not yet answered that are not on a reservation. `fits` is the sum of each node's room
+in envelopes, at most 1024 a node, and at most what its ceiling leaves.
 
-**The ceiling.** The hub counts offered reservations that have not been refused, unfinished
-jobs sent to the node (including those recovered from its database after a restart), and jobs
-reported in `held` that the hub has ended or never knew, until their results arrive. A job on
-a reservation counts once: as the reservation until sent, then as the job. The node counts
+**The ceiling.** The hub counts offered reservations that have not been refused, unfinished jobs
+sent to the node (including those recovered from its database after a restart), and jobs
+reported in `held` that the hub has ended or never knew, until their results arrive. A job on a
+reservation counts once: as the reservation until sent, then as the job. The node counts
 unfinished placed jobs and held reservations against its applied ceiling. It refuses excess
 offers or starts without a reservation as `ceiling`, preventing overshoot if the hub
 undercounts. Starts on held reservations and renewals still proceed. The hub uses its desired
 ceiling; the node uses its last applied ceiling, so it may refuse `ceiling` after a raise until
-it applies the change. Lowering the ceiling cancels nothing: running jobs continue, and new
-work resumes when the count falls below it. The ceiling applies separately to placed jobs
-and the node's gitlab-runner, allowing a combined total of twice the ceiling. The hub counts
-no runner jobs, and the node's ledger cannot identify them all: without admission, a runner
-job holds no entry. Offers go to the node with the most room first; an
-offer unanswered after 5 seconds is abandoned, and released if the node accepts it later. When
-every node with room has refused, the hub pauses 2 seconds and asks again until the request's
-`wait_secs`, then answers 503 `no_capacity` with `retry_after_secs` 5. Leases are 1–600 seconds.
-A renew waits 10 seconds for the node's answer (then 503 `unavailable`). A node's reservations
-end with its session, or when a new session of the node replaces it: renewing one is then 410
-`reservation_gone`, and its next `held` gets each released.
+it applies the change. Lowering the ceiling cancels nothing: running jobs continue, and new work
+resumes when the count falls below it. A node running its own gitlab-runner, whose `concurrent`
+the ceiling bounds, takes no placed jobs, so nothing else runs beside them. Offers go to the
+node with the most room first; an offer unanswered after 5 seconds is abandoned, and released if
+the node accepts it later. When every node with room has refused, the hub pauses 2 seconds and
+asks again until the request's `wait_secs`, then answers 503 `no_capacity` with
+`retry_after_secs` 5. Leases are 1–600 seconds. A renew waits 10 seconds for the node's answer
+(then 503 `unavailable`). A node's reservations end with its session, or when a new session of
+the node replaces it: renewing one is then 410 `reservation_gone`, and its next `held` gets each
+released.
 
 **Jobs.** A submission stores the job record, redacted spec and `request_id` in one durable
 transaction; the full spec stays in memory until a node accepts the job. The hub holds
@@ -1067,29 +1082,29 @@ shows what the hub asks of it beside what it reports — its state, acquisition,
 concurrency, drain progress and what it cannot carry out — and its 20 latest commands with their
 outcomes. It opens with a steering panel describing the current state in plain language, grouped
 into *Job intake* — whether the node takes new jobs, the hub's concurrency ceiling and the
-node's current effective limit, and on a hub that places jobs, for a node at protocol version
-3 or later, the jobs the hub has placed on it against that ceiling (`Placed by the hub: 3 of
-4`); *Maintenance* — in service, draining, drained, under maintenance, checking itself or
-quarantined; and an operator-only *Danger zone*. Operators see
-applicable actions with short explanations: pause intake or resume it, set the limit or remove
-it, drain from ready or during maintenance (the node stays drained once it ends), undrain while
-draining or drained, quarantine unless quarantined, release only then, reset from ready,
-draining or drained; no reset when the runner is external; everything while the node has
-reported nothing. They are the admin socket's operations — ceiling set or lifted, acquisition
-stopped or resumed, drain, undrain, quarantine, release, reset — posted to `/node/<id>/action`
-as before, which still refuses what does not apply. A reset requires confirmation from the same
-session, once and within ten minutes, as local mode's stops do. The panel is part of the node's
-live fragment, rendered for an operator's stream with that session's CSRF token, so what it
-offers follows the node; the limit's number field is kept through updates (`hx-preserve`). Each
-action returns a status line through htmx, and also works as a plain form. Monitoring-only nodes
-are marked, offer no actions and reject steering posts. Viewers see where the node stands and no
-actions. Operators also issue enrollment tokens from the nodes page, like `vk-hub token create`,
-valid for an hour, ten minutes, a day or seven days. A plain POST to `/tokens` uses the same
-origin, CSRF and role checks and returns a page showing the token once. Issuance is audited as
-the session's principal; the token is never logged. Removing a node stays on the admin socket.
-Operators grant who signs in through the OIDC provider, and as what, from `/users` (see [Signing
-in](#signing-in)). A page is refused to a request whose `Sec-Fetch-Site` is `same-site` or
-`cross-site`.
+node's current effective limit, and on a hub that places jobs, for a node at protocol version 3
+or later, the jobs the hub has placed on it against that ceiling (`Placed by the hub: 3 of 4`),
+or why it takes none when it runs its own gitlab-runner; *Maintenance* — in service, draining,
+drained, under maintenance, checking itself or quarantined; and an operator-only *Danger zone*.
+Operators see applicable actions with short explanations: pause intake or resume it, set the
+limit or remove it, drain from ready or during maintenance (the node stays drained once it
+ends), undrain while draining or drained, quarantine unless quarantined, release only then,
+reset from ready, draining or drained; no reset when the runner is external; everything while
+the node has reported nothing. They are the admin socket's operations — ceiling set or lifted,
+acquisition stopped or resumed, drain, undrain, quarantine, release, reset — posted to
+`/node/<id>/action` as before, which still refuses what does not apply. A reset requires
+confirmation from the same session, once and within ten minutes, as local mode's stops do. The
+panel is part of the node's live fragment, rendered for an operator's stream with that session's
+CSRF token, so what it offers follows the node; the limit's number field is kept through updates
+(`hx-preserve`). Each action returns a status line through htmx, and also works as a plain form.
+Monitoring-only nodes are marked, offer no actions and reject steering posts. Viewers see where
+the node stands and no actions. Operators also issue enrollment tokens from the nodes page, like
+`vk-hub token create`, valid for an hour, ten minutes, a day or seven days. A plain POST to
+`/tokens` uses the same origin, CSRF and role checks and returns a page showing the token once.
+Issuance is audited as the session's principal; the token is never logged. Removing a node stays
+on the admin socket. Operators grant who signs in through the OIDC provider, and as what, from
+`/users` (see [Signing in](#signing-in)). A page is refused to a request whose `Sec-Fetch-Site`
+is `same-site` or `cross-site`.
 
 `/jobs` shows viewers and operators the job history (see [Placed jobs](#placed-jobs)), newest
 first, 100 jobs per page, with a link to older jobs. Each row shows the job, linked to GitLab

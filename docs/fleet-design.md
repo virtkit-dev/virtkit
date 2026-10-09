@@ -11,7 +11,8 @@ resets — and shows them in a web UI. In the target, GitLab jobs reach the flee
 `vk-gitlab`, a daemon that takes them from GitLab as a runner and has the hub place each one on
 a node ([GitLab jobs](#gitlab-jobs)); generic VM jobs are placed the same way. Until then, and
 on any node still configured so, each node keeps its own gitlab-runner with the vk executor,
-and the hub steers how much work each runner accepts.
+and the hub steers how much work each runner accepts. A host does one or the other, never both:
+a node that finds its own runner takes no placed jobs.
 
 The target is a fleet of tens of bare-metal hosts, not hundreds: one hub process, one
 embedded database, no replication.
@@ -185,8 +186,8 @@ effective = min(local estimate, hub ceiling, local ceiling)
   at a time.
 - **hub ceiling** — set by the hub in the node's desired state, for a node that is unhealthy,
   saturated on a resource the estimate does not see, or whose capacity is kept for other work.
-  It caps the jobs the hub places on the node too, counted by both sides (see
-  [placed jobs](fleet-prototype.md#placed-jobs)).
+  On a node that takes placed jobs instead of running a gitlab-runner, it caps those, counted
+  by both sides (see [placed jobs](fleet-prototype.md#placed-jobs)).
 - **local ceiling** — `[executor.schedule] max_concurrency`, the node's own limit.
 
 `vk tune` and `vk node run` use one controller, with a single writer while the node is up.
@@ -231,8 +232,9 @@ A drain:
 4. reports `drained` only once all three hold.
 
 Drain state survives a node restart or loss of the hub. Stopping a runner's acquisition
-requires a managed runner; with an external runner the prototype's drain and quarantine stop
-only the jobs the hub places on the node, and say the runner goes on. See
+requires a managed runner; with an external runner the prototype's drain and quarantine leave
+it running, and say so. A node that takes placed jobs runs no runner, so they stop all it runs.
+See
 [drain and runner lifecycle](fleet-prototype.md#drain-and-runner-lifecycle) for observations,
 runner adoption and transitions.
 
@@ -577,7 +579,8 @@ runners, asks GitLab for jobs, and has the hub run each on a node. The node runs
 stages itself — no gitlab-runner binary on the node or in the guest — reusing the executor's
 VM, exec, checkout and cleanup code. The local gitlab-runner with the vk executor is the
 transition state: it keeps working on the nodes still configured for it, and a node moves
-over by draining its runner and taking placed jobs instead.
+over by draining, removing or masking `gitlab-runner.service`, unsetting `[node] runner_config`
+(and `runner = "managed"`) and restarting `vk node`, which then takes placed jobs instead.
 
 ```
 GitLab ◀──runner API──▶ vk-gitlab ──client API──▶ vk-hub ◀──session──▶ vk node ──▶ microVMs
@@ -714,7 +717,7 @@ carry IDs of their own, node-local policy stays authoritative and the protocol i
    build failures apart from system failures, and cleanup when the lease lapses.
 6. **GitLab jobs.** The hub's client API with API keys, pools and labels, and `vk-gitlab`;
    nodes run GitLab jobs' stages themselves. Nodes move over one at a time, each draining its
-   local gitlab-runner; a fleet runs both kinds of node meanwhile.
+   local gitlab-runner; a fleet runs both kinds of node meanwhile, and no node runs both.
 7. **Generic jobs.** `vk submit`, people as principals and their policy, scoring on locality,
    and per-job registry tokens, on the client API GitLab jobs already use.
 8. **Managed nodes** — the OS image, PXE, Redfish — whenever a host is to be managed end to

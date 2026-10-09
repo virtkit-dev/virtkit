@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 use vk_hub_proto::{
     Acquisition, Command, CommandAck, Concurrency, DesiredState, DrainProgress, NodeState,
-    Operation, Report, RunnerMode, RunnerState,
+    Operation, PlacedIntake, Report, RunnerMode, RunnerState,
 };
 
 use super::state::{Abilities, Issuer, Persisted, Work};
@@ -51,6 +51,8 @@ pub struct Core {
     allow_downgrade: AtomicBool,
     /// What an update's release must be signed with (`[node] release_keys`).
     release_policy: Mutex<crate::release_key::Policy>,
+    /// The node's configured intake of hub-placed jobs.
+    placed: Mutex<PlacedIntake>,
 }
 
 impl Core {
@@ -94,6 +96,7 @@ impl Core {
             exec: super::update::exec,
             allow_downgrade: AtomicBool::new(false),
             release_policy: Mutex::new(crate::release_key::Policy::default()),
+            placed: Mutex::new(PlacedIntake::default()),
         }))
     }
 
@@ -134,8 +137,8 @@ impl Core {
     }
 
     /// Journal `command` and carry it out. An external runner cannot be stopped, so a reset is
-    /// refused, and a drain or a quarantine stops only the jobs the hub places; an update is
-    /// refused when the node could not install it, or may not.
+    /// refused, and a drain or a quarantine leaves it running; an update is refused when the
+    /// node could not install it, or may not.
     pub fn command(&self, command: Command, now: u64) -> Result<CommandAck> {
         let update = match &command.op {
             // Looked at only for an update: it reads the filesystem.
@@ -230,6 +233,19 @@ impl Core {
         lock(&self.release_policy).clone()
     }
 
+    /// Set placed-job intake and log when the host's own runner prevents it.
+    pub fn set_placed(&self, placed: PlacedIntake) {
+        if let Some(why) = &placed.runner {
+            say!("this host runs its own gitlab-runner ({why}): it takes no placed jobs");
+        }
+        self.set(&self.placed, placed);
+    }
+
+    /// The node's intake of hub-placed jobs.
+    pub fn placed(&self) -> PlacedIntake {
+        lock(&self.placed).clone()
+    }
+
     /// The node dir.
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -278,11 +294,13 @@ impl Core {
         let persisted = lock(&self.persisted).clone();
         let stopped = persisted.acquisition_stopped();
         let runner = self.runner.as_ref().map(|r| *r.borrow());
+        let placed = self.placed();
         let mut unsupported = Vec::new();
-        if stopped && runner.is_none() {
+        // A host with no runner of its own runs only the hub's jobs, which a stop stops.
+        if stopped && runner.is_none() && placed.runner.is_some() {
             unsupported.push(
                 "stopping acquisition: the runner is external ([node] runner = \"external\"), \
-                 so the node stops taking the hub's jobs but the runner may still take jobs"
+                 so it may still take jobs"
                     .to_string(),
             );
         }
@@ -310,6 +328,7 @@ impl Core {
                 .flatten(),
             update: persisted.update.clone(),
             tools: persisted.tools_progress.clone(),
+            placed: Some(placed),
             ..Report::default()
         }
     }
@@ -407,9 +426,10 @@ impl Core {
         let jobs = crate::vm::live_job_supervisors(&cfg.state_dir().join("jobs"))
             .context("counting the jobs left for the drain")?;
         // Count placed jobs from acceptance to result, including before supervisor startup
-        // and during cleanup after driver exit. Match supervisors by GitLab job ID alone:
-        // an external runner's job from another GitLab instance with the same ID hides the
-        // placed job, leaving the count one short until either ends.
+        // and during cleanup after driver exit. Match supervisors by GitLab job ID alone: a
+        // host taking placed jobs runs no runner whose jobs could share one, but while it is
+        // moved over, a job its former runner left running can, and hides a placed job from
+        // the count until either ends.
         let placed = super::jobs::journal::unfinished(&self.dir.join("jobs"))
             .context("counting the placed jobs left for the drain")?;
         let unsupervised = placed
@@ -627,19 +647,7 @@ mod tests {
         step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Draining);
         assert_eq!(core.report().acquisition, Some(Acquisition::Run));
-        // A placed job accepted, with no supervisor: it holds the drain past the runner.
-        let placed = dir.join("jobs").join(PLACED);
-        std::fs::create_dir_all(&placed).unwrap();
-        std::fs::write(
-            placed.join(crate::node::jobs::journal::META),
-            r#"{"gitlab_id":41,"slot":0,"project_slot":0,"project_id":7}"#,
-        )
-        .unwrap();
         runner_tx.send(RunnerState::Stopped).unwrap();
-        step(&core, &cfg);
-        assert_eq!(core.state(), NodeState::Draining);
-        assert_eq!(core.report().drain.unwrap().active_jobs, 1);
-        std::fs::write(placed.join(crate::node::jobs::journal::RESULT), "{}").unwrap();
         step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Drained);
         assert_eq!(core.unrecorded()[0].outcome, Outcome::Done);
@@ -675,19 +683,30 @@ mod tests {
             std::fs::read_to_string(crate::schedule::desired_file(&cfg)).unwrap(),
             "2\n"
         );
-        // External: the runner goes on taking jobs, and the report says why.
+        // With no runner of its own, the host runs only the hub's jobs, which a stop stops.
         assert_eq!(report.acquisition, Some(Acquisition::Run));
         assert_eq!(report.runner, Some(RunnerMode::External));
         assert_eq!(report.runner_state, None);
-        assert_eq!(report.unsupported.len(), 1);
+        assert_eq!(report.unsupported, Vec::<String>::new());
         assert!(!*core.acquire().borrow());
+        // An external runner goes on taking jobs, and the report says why.
+        core.set_placed(PlacedIntake {
+            runner: Some("gitlab-runner.service runs the vk custom executor".into()),
+        });
+        let report = core.report();
+        assert_eq!(report.unsupported.len(), 1);
+        assert!(
+            report.unsupported[0].contains("may still take jobs"),
+            "{:?}",
+            report.unsupported
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// With an external runner, a drain stops the jobs the hub places and completes once
-    /// those and whatever holds the admission ledger are over, saying the runner goes on.
+    /// Without a managed runner, a drain stops the jobs the hub places and completes once
+    /// those and whatever holds the admission ledger are over.
     #[test]
-    fn an_external_runner_drains_once_the_placed_jobs_and_the_ledger_are_done() {
+    fn a_node_without_a_managed_runner_drains_once_its_jobs_and_the_ledger_are_done() {
         use crate::node::jobs::journal;
         let dir = scratch("external-drain");
         let core = Core::open(&dir, issuer(), None).unwrap();
@@ -700,11 +719,11 @@ mod tests {
             r#"{"gitlab_id":41,"slot":0,"project_slot":0,"project_id":7}"#,
         )
         .unwrap();
-        // An admission the external runner's executor holds.
+        // The admission it holds, by its GitLab job ID.
         let admit = dir.join("state").join("admit");
         std::fs::create_dir_all(&admit).unwrap();
-        std::fs::write(admit.join("42"), "1024 1 granted\n").unwrap();
-        let held = crate::admit::hold(&admit, "42").unwrap();
+        std::fs::write(admit.join("41"), "1024 1 granted\n").unwrap();
+        let held = crate::admit::hold(&admit, "41").unwrap();
         let ack = core.command(drain(), 1).unwrap();
         assert_eq!(ack.outcome, Outcome::Accepted);
         assert!(!crate::node::jobs::ready(
@@ -717,17 +736,13 @@ mod tests {
         let progress = report.drain.unwrap();
         assert!(!progress.runner_stopped && !progress.ledger_empty);
         assert_eq!(progress.active_jobs, 1);
-        assert!(
-            report.unsupported[0].contains("may still take jobs"),
-            "{:?}",
-            report.unsupported
-        );
+        assert_eq!(report.unsupported, Vec::<String>::new());
         // The placed job ends.
         std::fs::write(placed.join(journal::RESULT), "{}").unwrap();
         step(&core, &cfg);
         assert_eq!(core.state(), NodeState::Draining);
         assert_eq!(core.report().drain.unwrap().active_jobs, 0);
-        // Then the runner's job.
+        // Then its driver, which held the admission until its cleanup was over.
         drop(held);
         // Retried: a test forking meanwhile can hold the dropped lock for an instant.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
