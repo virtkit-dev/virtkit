@@ -180,21 +180,27 @@ pub fn account_key(e: &str) -> Option<String> {
 }
 
 /// The role `grants` give a sign-in as `identity` — its verified email, normalized, if it has
-/// one: its own grant, else [`ANYONE`]'s.
-fn granted_role(grants: &BTreeMap<String, Role>, identity: Option<&str>) -> Option<Role> {
+/// one: its own grant, else [`ANYONE`]'s, else `default_role`.
+fn granted_role(
+    grants: &BTreeMap<String, Role>,
+    identity: Option<&str>,
+    default_role: Option<Role>,
+) -> Option<Role> {
     identity
         .and_then(|who| grants.get(who))
         .or_else(|| grants.get(ANYONE))
         .copied()
+        .or(default_role)
 }
 
 /// The role a sign-in through OIDC gets by the grants in `table`, with `email` as the
 /// verified address the provider signed someone in with if any: the address's grant, else
-/// [`ANYONE`]'s, and whether it is [`ANYONE`]'s. What is not an address, as
-/// [`normalize_email`] takes them, is no email.
+/// [`ANYONE`]'s, else `default_role`, and whether it is not the address's own. What is not
+/// an address, as [`normalize_email`] takes them, is no email.
 fn oidc_role_in(
     table: &impl ReadableTable<&'static str, &'static [u8]>,
     email: Option<&str>,
+    default_role: Option<Role>,
 ) -> Result<Option<(Role, bool)>> {
     let email = email.and_then(normalize_email);
     let mut grants = BTreeMap::new();
@@ -204,7 +210,7 @@ fn oidc_role_in(
         }
     }
     let own = email.as_ref().is_some_and(|e| grants.contains_key(e));
-    Ok(granted_role(&grants, email.as_deref()).map(|role| (role, !own)))
+    Ok(granted_role(&grants, email.as_deref(), default_role).map(|role| (role, !own)))
 }
 
 /// A role granted to an email address, for sign-in through OIDC.
@@ -509,6 +515,8 @@ pub struct Db {
     heartbeat_synced_at: AtomicU64,
     /// When requests past their keep were last swept.
     requests_swept_at: AtomicU64,
+    /// `[oidc] default_role`, used when no grant matches an OIDC sign-in.
+    oidc_default_role: Option<Role>,
 }
 
 impl Db {
@@ -576,6 +584,17 @@ impl Db {
         Self::init(db)
     }
 
+    /// Use `role` for OIDC sessions when no grant matches.
+    pub fn with_oidc_default_role(mut self, role: Role) -> Self {
+        self.oidc_default_role = Some(role);
+        self
+    }
+
+    /// The OIDC role used when no grant matches.
+    pub fn oidc_default_role(&self) -> Option<Role> {
+        self.oidc_default_role
+    }
+
     fn init(db: Database) -> Result<Self> {
         let txn = db
             .begin_write()
@@ -614,6 +633,7 @@ impl Db {
             db,
             heartbeat_synced_at: AtomicU64::new(0),
             requests_swept_at: AtomicU64::new(0),
+            oidc_default_role: None,
         })
     }
 
@@ -1640,11 +1660,13 @@ impl Db {
     }
 
     /// Open a web UI session for `identity`, signed in by the OIDC provider `issuer`.
-    /// Use the grant for its verified `email`, if any, then fall back to [`ANYONE`]'s.
+    /// Use the grant for its verified `email`, if any, then fall back to [`ANYONE`]'s, then
+    /// to the default role ([`Self::with_oidc_default_role`]).
     /// Read the grant and open the session in one write transaction, ordering sign-in
     /// before or after each grant change and its session sweep. Beyond [`MAX_OIDC_SESSIONS`]
     /// live sessions for `identity`, end its oldest without auditing the eviction.
-    /// Audit the sign-in unless only [`ANYONE`]'s grant admits it and `audit_anyone` declines.
+    /// Audit the sign-in unless only [`ANYONE`]'s grant or the default role admits it and
+    /// `audit_anyone` declines.
     /// Return the secret (the cookie, stored only as a hash) and session, or `None`
     /// when no grant admits the sign-in.
     pub fn create_oidc_session(
@@ -1656,7 +1678,9 @@ impl Db {
         audit_anyone: impl FnOnce() -> bool,
     ) -> Result<Option<(String, UiSession)>> {
         let txn = self.db.begin_write().context("starting a write")?;
-        let Some((role, by_anyone)) = oidc_role_in(&txn.open_table(ACCOUNTS)?, email)? else {
+        let Some((role, by_anyone)) =
+            oidc_role_in(&txn.open_table(ACCOUNTS)?, email, self.oidc_default_role)?
+        else {
             return Ok(None);
         };
         let secret = crate::random_hex(32)?;
@@ -1778,7 +1802,31 @@ impl Db {
     #[cfg(test)]
     pub fn oidc_role(&self, email: Option<&str>) -> Result<Option<Role>> {
         let txn = self.db.begin_read().context("starting a read")?;
-        Ok(oidc_role_in(&txn.open_table(ACCOUNTS)?, email)?.map(|(role, _)| role))
+        Ok(
+            oidc_role_in(&txn.open_table(ACCOUNTS)?, email, self.oidc_default_role)?
+                .map(|(role, _)| role),
+        )
+    }
+
+    /// End OIDC sessions whose roles exceed what their identities now get from grants and
+    /// the default role. Called at startup to apply a default lowered or removed while the
+    /// hub was stopped. Audit as `actor` and return the number of live sessions ended.
+    pub fn end_oidc_sessions_above_grants(&self, actor: &str, now: u64) -> Result<usize> {
+        let txn = self.db.begin_write().context("starting a write")?;
+        let grants = grants_in(&txn.open_table(ACCOUNTS)?)?;
+        let ended = end_sessions_in(
+            &txn,
+            |_, s| {
+                s.identity.as_deref().is_some_and(|who| {
+                    let who = who.to_ascii_lowercase();
+                    Some(s.role) > granted_role(&grants, Some(&who), self.oidc_default_role)
+                })
+            },
+            actor,
+            now,
+        )?;
+        txn.commit().context("ending web UI sessions")?;
+        Ok(ended)
     }
 
     /// Every grant, by address, [`ANYONE`] first.
@@ -1851,15 +1899,7 @@ impl Db {
                     table.remove(email)?;
                 }
             }
-            let mut grants = BTreeMap::new();
-            for entry in table.iter()? {
-                let (key, value) = entry?;
-                grants.insert(
-                    key.value().to_string(),
-                    decode::<AccountRow>(value.value())?.role,
-                );
-            }
-            (previous, grants)
+            (previous, grants_in(&table)?)
         };
         let event = match (previous, role) {
             (None, Some(r)) => format!("{actor} granted {email} the {} role", r.name()),
@@ -1876,7 +1916,8 @@ impl Db {
         };
         append_audit(&txn, None, actor, &event, now)?;
         // The sessions the grant covers — every one opened through OIDC for [`ANYONE`]'s —
-        // that hold more than a sign-in as their identity now gets.
+        // that hold more than a sign-in as their identity now gets, the default role
+        // included.
         let ended = end_sessions_in(
             &txn,
             |_, s| {
@@ -1885,7 +1926,7 @@ impl Db {
                 };
                 let covered = email == ANYONE || who.eq_ignore_ascii_case(email);
                 let who = who.to_ascii_lowercase();
-                covered && Some(s.role) > granted_role(&grants, Some(&who))
+                covered && Some(s.role) > granted_role(&grants, Some(&who), self.oidc_default_role)
             },
             actor,
             now,
@@ -2202,6 +2243,21 @@ fn workloads_in(txn: &redb::ReadTransaction, id: &str) -> Result<Option<Workload
         }
     }
     Ok(Some(workloads))
+}
+
+/// Every grant in `table`, by address or [`ANYONE`].
+fn grants_in(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<BTreeMap<String, Role>> {
+    let mut grants = BTreeMap::new();
+    for entry in table.iter()? {
+        let (key, value) = entry?;
+        grants.insert(
+            key.value().to_string(),
+            decode::<AccountRow>(value.value())?.role,
+        );
+    }
+    Ok(grants)
 }
 
 /// End the web UI sessions `ends` picks by key and session, in `txn`, audited as `actor`'s,
@@ -4000,11 +4056,34 @@ mod tests {
             db.oidc_role(Some("OPS@example.com")).unwrap(),
             Some(Role::Operator)
         );
+        // The default role admits whoever no grant names, after the address's and `*`'s. An
+        // operator default, which the config refuses, only tells `*`'s viewer apart from it.
+        let txn = db.db.begin_read().unwrap();
+        let table = txn.open_table(ACCOUNTS).unwrap();
+        assert_eq!(
+            oidc_role_in(&table, Some("x@y"), Some(Role::Operator)).unwrap(),
+            Some((Role::Viewer, true))
+        );
+        assert_eq!(
+            oidc_role_in(&table, Some("ops@example.com"), Some(Role::Viewer)).unwrap(),
+            Some((Role::Operator, false))
+        );
+        drop((table, txn));
         // ASCII case only: the Kelvin sign is not a `k`.
         db.revoke_account(ANYONE, "uid 0", 2).unwrap();
         db.grant_account("kim@example.com", Role::Viewer, "uid 0", 2)
             .unwrap();
         assert_eq!(db.oidc_role(Some("\u{212a}im@example.com")).unwrap(), None);
+        let txn = db.db.begin_read().unwrap();
+        let table = txn.open_table(ACCOUNTS).unwrap();
+        assert_eq!(
+            oidc_role_in(&table, Some("nobody@example.com"), Some(Role::Viewer)).unwrap(),
+            Some((Role::Viewer, true))
+        );
+        assert_eq!(
+            oidc_role_in(&table, Some("nobody@example.com"), None).unwrap(),
+            None
+        );
     }
 
     /// A sign-in reads its grant in the write that opens its session: once a revoke has
@@ -4106,6 +4185,136 @@ mod tests {
         assert_eq!(db.ui_sessions(11).unwrap().len(), 2, "opened all the same");
         open("eve@example.com", true);
         assert_eq!((sign_ins(&db), asked.get()), (2, 2));
+    }
+
+    /// The default role admits, in that role, whoever no grant names, `*` included, and is
+    /// audited as a sign-in `*` admits; an address's own grant still wins.
+    #[test]
+    fn a_default_role_admits_whoever_no_grant_names() {
+        let db = Db::open_memory()
+            .unwrap()
+            .with_oidc_default_role(Role::Viewer);
+        db.grant_account("ops@example.com", Role::Operator, "uid 0", 1)
+            .unwrap();
+        let asked = std::cell::Cell::new(0);
+        let open = |email: Option<&str>, who: &str| {
+            db.create_oidc_session(email, who, "https://idp", 10, || {
+                asked.set(asked.get() + 1);
+                false
+            })
+            .unwrap()
+            .unwrap()
+            .1
+        };
+        assert_eq!(
+            open(Some("eve@example.com"), "eve@example.com").role,
+            Role::Viewer
+        );
+        assert_eq!(asked.get(), 1, "audited as `*`'s");
+        assert_eq!(open(None, "sub user-9").role, Role::Viewer);
+        assert_eq!(asked.get(), 2);
+        assert_eq!(
+            open(Some("ops@example.com"), "ops@example.com").role,
+            Role::Operator
+        );
+        assert_eq!(asked.get(), 2, "its own grant is always audited");
+        let sign_ins = db
+            .audits(None, 100)
+            .unwrap()
+            .iter()
+            .filter(|r| r.event.contains(" signed in as "))
+            .count();
+        assert_eq!(sign_ins, 1);
+    }
+
+    /// A revoke spares the sessions the default role would admit again, and ends those that
+    /// hold more.
+    #[test]
+    fn a_revoke_spares_what_the_default_role_admits() {
+        let db = Db::open_memory()
+            .unwrap()
+            .with_oidc_default_role(Role::Viewer);
+        let dan = "dan@example.com";
+        let open = |who: &str| {
+            db.create_oidc_session(Some(who), who, "https://idp", 100, || true)
+                .unwrap()
+                .unwrap();
+        };
+        db.grant_account(dan, Role::Viewer, "uid 0", 1).unwrap();
+        open(dan);
+        db.grant_account(dan, Role::Operator, "uid 0", 1).unwrap();
+        open(dan);
+        db.grant_account(ANYONE, Role::Viewer, "uid 0", 1).unwrap();
+        open("eve@example.com");
+        assert_eq!(db.revoke_account(dan, "uid 0", 101).unwrap().ended, 1);
+        assert_eq!(db.revoke_account(ANYONE, "uid 0", 101).unwrap().ended, 0);
+        let mut alive: Vec<_> = db
+            .ui_sessions(101)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.role, s.identity.unwrap()))
+            .collect();
+        alive.sort();
+        assert_eq!(
+            alive,
+            [
+                (Role::Viewer, dan.to_string()),
+                (Role::Viewer, "eve@example.com".to_string())
+            ]
+        );
+    }
+
+    /// At startup, the OIDC sessions that hold more than the grants and the default role now
+    /// give end, audited; the rest, and those links opened, stay.
+    #[test]
+    fn a_removed_default_role_ends_its_sessions_at_startup() {
+        let mut db = Db::open_memory()
+            .unwrap()
+            .with_oidc_default_role(Role::Viewer);
+        db.grant_account("ops@example.com", Role::Operator, "uid 0", 1)
+            .unwrap();
+        db.grant_account("bob@example.com", Role::Viewer, "uid 0", 1)
+            .unwrap();
+        for (email, who) in [
+            (Some("ops@example.com"), "ops@example.com"),
+            (Some("Bob@example.com"), "bob@example.com"),
+            (Some("eve@example.com"), "eve@example.com"),
+            (None, "sub user-9"),
+        ] {
+            db.create_oidc_session(email, who, "https://idp", 100, || true)
+                .unwrap()
+                .unwrap();
+        }
+        let (token, _) = db
+            .create_login(Role::Operator, Duration::from_secs(60), "uid 0", 100)
+            .unwrap();
+        db.redeem_login(&token, 100).unwrap().unwrap();
+        assert_eq!(db.end_oidc_sessions_above_grants("hub", 101).unwrap(), 0);
+        db.oidc_default_role = None;
+        assert_eq!(db.end_oidc_sessions_above_grants("hub", 101).unwrap(), 2);
+        let mut alive: Vec<_> = db
+            .ui_sessions(101)
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.role, s.identity))
+            .collect();
+        alive.sort();
+        assert_eq!(
+            alive,
+            [
+                (Role::Viewer, Some("bob@example.com".to_string())),
+                (Role::Operator, None),
+                (Role::Operator, Some("ops@example.com".to_string())),
+            ]
+        );
+        let audit = db.audits(None, 10).unwrap();
+        assert!(
+            audit.iter().any(|r| r.actor == "hub"
+                && r.event.starts_with("hub ended ui session ")
+                && r.event.ends_with("(viewer, eve@example.com)")),
+            "{audit:?}"
+        );
+        assert_eq!(db.end_oidc_sessions_above_grants("hub", 101).unwrap(), 0);
     }
 
     #[test]

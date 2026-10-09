@@ -6,6 +6,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Added
 
+- **`[oidc] default_role = "viewer"` gives a read-only view to everyone the provider signs in.**
+  Anyone no grant admits, `*` included, signs in to `vk-hub`'s web UI as a viewer instead of
+  being refused. `"operator"` is refused. `vk-hub accounts` lists the default role, and
+  removing it ends, at the hub's next start, the sessions that only it admitted.
 - **Operators enroll nodes from `vk-hub`'s web UI.** The nodes page issues single-use
   enrollment tokens, like `vk-hub token create`, valid for an hour, ten minutes, a day or
   seven days. Each token appears once with a `vk node join` command using the hub's node

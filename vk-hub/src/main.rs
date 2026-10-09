@@ -1060,7 +1060,25 @@ async fn serve(cfg: HubConfig) -> Result<()> {
         }
         None => None,
     };
-    let db = Arc::new(store::Db::open(&cfg.db_path())?);
+    let default_role = cfg
+        .ui
+        .as_ref()
+        .and_then(|ui| ui.oidc.as_ref())
+        .and_then(|o| o.default_role);
+    let mut db = store::Db::open(&cfg.db_path())?;
+    if let Some(role) = default_role {
+        db = db.with_oidc_default_role(role);
+    }
+    // A default role lowered or removed while the hub was stopped takes effect at once, as a
+    // lowered grant does.
+    let ended = db.end_oidc_sessions_above_grants("hub", now_secs())?;
+    if ended > 0 {
+        eprintln!(
+            "vk-hub: ended {ended} web UI session(s) holding more than the grants and \
+             [oidc] default_role now give"
+        );
+    }
+    let db = Arc::new(db);
     // Before anything could be staging a release: what is staged is a stopped hub's.
     releases::sweep(&cfg.releases_dir());
     let mut hub = server::Hub::new(db, cfg.ui.as_ref().map(|ui| ui.url.clone()))
@@ -1068,7 +1086,13 @@ async fn serve(cfg: HubConfig) -> Result<()> {
         .with_releases(cfg.releases_dir())
         .with_release_source(cfg.release_source.clone());
     if oidc.is_some() {
-        if hub.db.accounts()?.is_empty() {
+        if let Some(role) = default_role {
+            eprintln!(
+                "vk-hub: anyone the OIDC provider signs in whom no grant names gets the {} role \
+                 ([oidc] default_role), audited within the same bounds as `*`",
+                role.name()
+            );
+        } else if hub.db.accounts()?.is_empty() {
             eprintln!(
                 "vk-hub: warning: no role is granted, so nobody can sign in through the OIDC \
                  provider yet; `vk-hub accounts grant <email> --role operator` grants one"
@@ -1176,8 +1200,11 @@ async fn accounts_cmd(client: admin::Client, cmd: AccountsCmd) -> Result<()> {
     let oidc = match cmd {
         AccountsCmd::List => {
             let accounts = tokio::task::spawn_blocking(move || client.accounts()).await??;
-            print!("{}", render_accounts(&accounts.accounts));
-            if accounts.oidc && accounts.accounts.is_empty() {
+            print!(
+                "{}",
+                render_accounts(&accounts.accounts, accounts.default_role)
+            );
+            if accounts.oidc && accounts.accounts.is_empty() && accounts.default_role.is_none() {
                 eprintln!("vk-hub: no role is granted: nobody can sign in through OIDC");
             }
             accounts.oidc
@@ -1347,11 +1374,14 @@ fn report_ended(out: &admin::AccountOutcome) {
 }
 
 /// `vk-hub accounts`' table: each grant, and who made it when.
-fn render_accounts(accounts: &[(String, store::AccountRow)]) -> String {
-    if accounts.is_empty() {
+fn render_accounts(
+    accounts: &[(String, store::AccountRow)],
+    default_role: Option<store::Role>,
+) -> String {
+    if accounts.is_empty() && default_role.is_none() {
         return String::new();
     }
-    let rows: Vec<[String; 4]> = accounts
+    let mut rows: Vec<[String; 4]> = accounts
         .iter()
         .map(|(email, g)| {
             [
@@ -1362,6 +1392,15 @@ fn render_accounts(accounts: &[(String, store::AccountRow)]) -> String {
             ]
         })
         .collect();
+    // Last, as a sign-in falls back to it last.
+    if let Some(role) = default_role {
+        rows.push([
+            "(default)".to_string(),
+            role.name().to_string(),
+            "[oidc] default_role".to_string(),
+            String::new(),
+        ]);
+    }
     table(&["EMAIL", "ROLE", "GRANTED BY", "AT"], &rows)
 }
 

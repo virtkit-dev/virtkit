@@ -2153,7 +2153,8 @@ fn accounts_arguments_parse() {
     ));
 }
 
-/// The accounts table names each grant's address, role, and who made it when.
+/// The accounts table names each grant's address, role, and who made it when, and the
+/// default role last.
 #[test]
 fn the_accounts_table_says_who_granted_each_role() {
     let row = |role, by: &str| store::AccountRow {
@@ -2169,12 +2170,24 @@ fn the_accounts_table_says_who_granted_each_role() {
         ),
     ];
     assert_eq!(
-        render_accounts(&accounts),
+        render_accounts(&accounts, None),
         "EMAIL              ROLE      GRANTED BY  AT\n\
          *                  viewer    uid 0       1970-01-01T00:00:00Z\n\
          alice@example.com  operator  uid 1000    1970-01-01T00:00:00Z\n"
     );
-    assert_eq!(render_accounts(&[]), "");
+    assert_eq!(render_accounts(&[], None), "");
+    // The default role, which admits whoever no grant names, comes last.
+    assert_eq!(
+        render_accounts(&accounts[1..], Some(store::Role::Viewer)),
+        "EMAIL              ROLE      GRANTED BY           AT\n\
+         alice@example.com  operator  uid 1000             1970-01-01T00:00:00Z\n\
+         (default)          viewer    [oidc] default_role\n"
+    );
+    assert_eq!(
+        render_accounts(&[], Some(store::Role::Viewer)),
+        "EMAIL      ROLE    GRANTED BY           AT\n\
+         (default)  viewer  [oidc] default_role\n"
+    );
 }
 
 /// The cell under `column` in `line`, by where the header puts the column.

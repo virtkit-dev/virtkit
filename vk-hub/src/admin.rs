@@ -207,6 +207,9 @@ pub struct Accounts {
     pub oidc: bool,
     /// Every grant, by address, `*` first.
     pub accounts: Vec<(String, AccountRow)>,
+    /// `[oidc] default_role`, used when no grant matches. Older hubs omit it and have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_role: Option<Role>,
 }
 
 /// A freshly minted API key, and its row.
@@ -471,6 +474,7 @@ fn dispatch(body: &[u8], hub: &Hub, uid: u32) -> Result<serde_json::Value> {
         Call::ListAccounts => serde_json::to_value(Accounts {
             oidc: hub.oidc,
             accounts: hub.db.accounts()?,
+            default_role: hub.db.oidc_default_role(),
         })?,
         Call::GrantAccount { email, role } => {
             serde_json::to_value(set_account(hub, &actor, &email, Some(role))?)?
@@ -1045,6 +1049,22 @@ mod tests {
         .unwrap();
         assert!(!outcome(reply).oidc);
         assert_eq!(hub.db.oidc_role(Some("a@b")).unwrap(), Some(Role::Viewer));
+    }
+
+    /// The listing carries the default role, and reads from a hub that predates it as none.
+    #[test]
+    fn the_accounts_listing_carries_the_default_role() {
+        let db = Db::open_memory().unwrap();
+        let hub = Hub::new(Arc::new(db.with_oidc_default_role(Role::Viewer)), None).with_oidc();
+        let listed = dispatch(br#"{"v":1,"call":{"op":"list-accounts"}}"#, &hub, 0).unwrap();
+        assert_eq!(listed["default_role"], "viewer");
+        let listed: Accounts = serde_json::from_value(listed).unwrap();
+        assert_eq!(listed.default_role, Some(Role::Viewer));
+        let old: Accounts = serde_json::from_str(r#"{"oidc":true,"accounts":[]}"#).unwrap();
+        assert_eq!(old.default_role, None);
+        let hub = Hub::new(Arc::new(Db::open_memory().unwrap()), None).with_oidc();
+        let listed = dispatch(br#"{"v":1,"call":{"op":"list-accounts"}}"#, &hub, 0).unwrap();
+        assert!(listed.get("default_role").is_none(), "{listed}");
     }
 
     #[test]

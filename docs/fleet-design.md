@@ -377,10 +377,10 @@ and their rendering and connection limits.
 
 People sign in through the OIDC provider `[oidc]` names, with the relying party `vk-registry`
 uses, and are given the viewer or operator role by their email (unless the provider marks it
-unverified), from a grant `vk-hub accounts` keeps in the hub's database; anyone else is
-refused. Sign-in links issued through the admin socket also establish viewer or operator
-sessions, for whom the provider cannot sign in. See the prototype reference for [sign-in,
-sessions and request checks](fleet-prototype.md#signing-in).
+unverified), from a grant `vk-hub accounts` keeps in the hub's database or the `[oidc]` table's
+`default_role` (viewer at most); anyone else is refused. Sign-in links issued through the admin
+socket also establish viewer or operator sessions, for whom the provider cannot sign in. See the
+prototype reference for [sign-in, sessions and request checks](fleet-prototype.md#signing-in).
 
 ## Local mode
 

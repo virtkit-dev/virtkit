@@ -3520,6 +3520,15 @@ async fn a_node_s_update_is_shown_on_the_nodes_table_and_its_page() {
 /// A fleet hub's UI reached over https, signing people in through a fake OIDC provider that
 /// says `claims` of whoever signs in, with `grants` of roles by address (or `*`).
 async fn start_oidc(claims: serde_json::Value, grants: &[(&str, Role)]) -> (SocketAddr, Arc<Hub>) {
+    start_oidc_with(claims, grants, None).await
+}
+
+/// [`start_oidc`], with `default_role` as the `[oidc]` table's.
+async fn start_oidc_with(
+    claims: serde_json::Value,
+    grants: &[(&str, Role)],
+    default_role: Option<Role>,
+) -> (SocketAddr, Arc<Hub>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let idp = vk_oidc::fake_idp::start(vk_oidc::fake_idp::Options {
         claims,
@@ -3529,7 +3538,10 @@ async fn start_oidc(claims: serde_json::Value, grants: &[(&str, Role)]) -> (Sock
     let listener = crate::server::listen("127.0.0.1:0".parse().unwrap()).unwrap();
     let addr = listener.local_addr().unwrap();
     let origin = format!("https://{addr}");
-    let db = Db::open_memory().unwrap();
+    let mut db = Db::open_memory().unwrap();
+    if let Some(role) = default_role {
+        db = db.with_oidc_default_role(role);
+    }
     for (email, role) in grants {
         db.grant_account(email, *role, "uid 0", 1).unwrap();
     }
@@ -3758,6 +3770,37 @@ async fn an_oidc_sign_in_gets_its_own_grant_over_anyones() {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].role, Role::Operator);
         assert_eq!(sessions[0].identity.as_deref(), Some("carol@example.com"));
+    }
+}
+
+/// The default role lets whoever no grant names view, as `*` does; without it they are
+/// refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_default_role_lets_whoever_no_grant_names_view() {
+    let claims =
+        serde_json::json!({"sub": "user-5", "email": "eve@example.com", "email_verified": true});
+    let grants = [("alice@example.com", Role::Operator)];
+    for default_role in [None, Some(Role::Viewer)] {
+        let (addr, hub) = start_oidc_with(claims.clone(), &grants, default_role).await;
+        let (login, state) = start_oidc_login(addr).await;
+        let reply = oidc_callback(addr, &state, Some(&login)).await;
+        let sessions = hub.db.ui_sessions(crate::now_secs()).unwrap();
+        if default_role.is_none() {
+            assert_eq!(reply.status, 403, "{}", reply.body);
+            assert!(sessions.is_empty());
+            continue;
+        }
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].role, Role::Viewer);
+        assert_eq!(sessions[0].identity.as_deref(), Some("eve@example.com"));
+        let audit = hub.db.audits(None, 10).unwrap();
+        assert!(
+            audit.iter().any(|r| r
+                .event
+                .contains("signed in as eve@example.com through http://")),
+            "{audit:?}"
+        );
     }
 }
 

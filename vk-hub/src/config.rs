@@ -86,6 +86,9 @@ pub struct OidcConfig {
     pub issuer: String,
     pub client_id: String,
     pub client_secret_file: PathBuf,
+    /// The OIDC role when neither an address nor `*` grant matches: viewer or `None`
+    /// (the default, which admits nobody).
+    pub default_role: Option<crate::store::Role>,
 }
 
 /// The file as written. `deny_unknown_fields` so a misspelt `tls_cert` fails at startup
@@ -113,6 +116,7 @@ struct FileOidc {
     issuer: String,
     client_id: String,
     client_secret_file: PathBuf,
+    default_role: Option<String>,
 }
 
 impl HubConfig {
@@ -304,10 +308,21 @@ fn oidc_config(o: FileOidc) -> Result<OidcConfig> {
     if o.client_id.is_empty() {
         bail!("[oidc] client_id may not be empty");
     }
+    // Anyone the provider signs in gets it, so no more than `*` may grant: a viewer.
+    let default_role = match o.default_role.as_deref() {
+        None | Some("none") => None,
+        Some("viewer") => Some(crate::store::Role::Viewer),
+        Some("operator") => bail!(
+            "[oidc] default_role = \"operator\" would let anyone the provider signs in act on \
+             the fleet; grant operators by address (`vk-hub accounts grant`)"
+        ),
+        Some(other) => bail!("[oidc] default_role {other:?}: expected viewer or none"),
+    };
     Ok(OidcConfig {
         issuer: o.issuer.trim_end_matches('/').to_string(),
         client_id: o.client_id,
         client_secret_file: o.client_secret_file,
+        default_role,
     })
 }
 
@@ -468,6 +483,27 @@ mod tests {
 
     fn parse(text: &str) -> Result<HubConfig> {
         HubConfig::from_file(toml::from_str(text)?)
+    }
+
+    #[test]
+    fn a_default_role_admits_viewers_at_most() {
+        let with = |role: &str| {
+            parse(&format!(
+                "ui_addr = \"127.0.0.1:8444\"\nui_url = \"https://hub.example.com:8444\"\n\
+                 tls_cert = \"/c\"\ntls_key = \"/k\"\n[oidc]\n\
+                 issuer = \"https://login.example.com/app/1\"\nclient_id = \"vk-hub\"\n\
+                 client_secret_file = \"/s\"\n{role}"
+            ))
+            .map(|c| c.ui.unwrap().oidc.unwrap().default_role)
+        };
+        assert_eq!(with("").unwrap(), None);
+        assert_eq!(with("default_role = \"none\"\n").unwrap(), None);
+        assert_eq!(
+            with("default_role = \"viewer\"\n").unwrap(),
+            Some(crate::store::Role::Viewer)
+        );
+        assert!(with("default_role = \"operator\"\n").is_err());
+        assert!(with("default_role = \"admin\"\n").is_err());
     }
 
     #[test]

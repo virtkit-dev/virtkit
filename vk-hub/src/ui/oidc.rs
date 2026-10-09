@@ -10,15 +10,16 @@
 //! accepts another site's page only through top-level navigation, as a provider's portal
 //! does. It redirects to the provider, with the state cookie binding the sign-in to this
 //! browser. This can replace another tab's login cookie, causing that sign-in to fail and
-//! require a restart. The callback opens a session for whom a grant in the database lets in
-//! ([`crate::store::Db::create_oidc_session`]), answering, as a link's sign-in does, with a
+//! require a restart. The callback opens a session for whom a grant in the database or
+//! `[oidc] default_role` lets in ([`crate::store::Db::create_oidc_session`]), answering, as a link's sign-in does, with a
 //! page that moves on to `/` itself: the session cookie is `SameSite=Strict`, and a redirect
 //! would carry on the navigation the provider's page started. Anyone else is refused. Refusals,
-//! and sign-ins only the `*` grant admits, are audited within [`SignInAudit`]'s bounds.
+//! and sign-ins only the `*` grant or the default role admits, are audited within
+//! [`SignInAudit`]'s bounds.
 //!
 //! Who signed in is their email, when the provider gives an address it does not mark
 //! unverified, else `sub <subject>`; only an email is looked up, so a sign-in without one is
-//! let in only by the `*` grant.
+//! let in only by the `*` grant or the default role.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -107,7 +108,7 @@ pub struct OidcSignIn {
     /// The issuer's host, for the sign-in button.
     provider: String,
     refusals: Mutex<SignInAudit>,
-    /// Sign-ins only the `*` grant admits.
+    /// Sign-ins only the `*` grant or the default role admits.
     anyones: Arc<Mutex<SignInAudit>>,
 }
 

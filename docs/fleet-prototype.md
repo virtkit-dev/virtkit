@@ -1023,6 +1023,7 @@ ui_url = "https://hub.example.com:8444"
 issuer = "https://login.example.com/app/1"
 client_id = "vk-hub"
 client_secret_file = "/etc/vk-hub/oidc-secret"
+# default_role = "viewer"
 ```
 
 `issuer`, `client_id` and `client_secret_file` are checked as `vk-registry`'s `[oidc]` is: the
@@ -1046,16 +1047,25 @@ vk-hub accounts [list]
 A grant gives an email address a role, taking effect at once; addresses are compared ignoring
 ASCII case, and granting one again replaces its role. `*` admits anyone the provider signs in
 whom no grant of their own names, with a verified email or not, and only as a viewer. A sign-in
-gets its address's grant, else `*`'s; anyone else is refused. Grant `*` only on a provider that
-signs in a known population, as anyone it signs in can then sign in at will: a sign-in only `*`
-admits is audited within the same bounds as a refusal (below), and one identity holds at most 8
-sessions, a sign-in past that ending its oldest. Lowering or revoking a grant ends the open
-sessions it covered — for `*`, every session opened through OIDC — that hold more than a
-sign-in would now get. `vk-hub accounts` lists every grant with its role, who made it and when.
-Grants are audited as the admin socket's peer, `uid <n>`; a hub without `[oidc]` keeps them for
-when it has one. `vk-hub serve` warns as it starts when `[oidc]` is set and nothing is granted,
-as nobody can sign in yet. Grants name addresses, not a provider: after changing `issuer`,
-review `vk-hub accounts` and end the old sessions with `vk-hub ui logout --all`.
+gets its address's grant, then `*`'s, then `[oidc] default_role`; otherwise it is refused.
+`default_role = "viewer"` provides the same fallback as `*`, configured in the file instead
+of a database grant. `"none"` is the default and admits nobody; `"operator"` is refused
+because it would grant that role to anyone the provider signs in. Use `*` or a default role
+only with a provider that signs in a known population: anyone it signs in can then sign in
+at will. Both fallbacks have the same audit bounds as refusals (below). One identity holds
+at most 8 sessions; signing in past that limit ends its oldest.
+
+Lowering or revoking a grant ends covered sessions whose roles exceed what the grants and
+default role now allow. For `*`, this covers every OIDC session. At startup, `vk-hub serve`
+ends all OIDC sessions above their current grants and default role, auditing as `hub`.
+Lowering or removing `default_role` therefore takes effect on restart.
+
+`vk-hub accounts` lists each grant's role, author and time, followed by the default role as
+`(default)`. Grants are audited as the admin socket's peer, `uid <n>`; a hub without `[oidc]`
+keeps them for later use. At startup, `vk-hub serve` reports a default role that admits
+sign-ins without a matching grant. It warns when `[oidc]` is set but neither grants nor a
+default role allow anyone to sign in. Grants name addresses, not a provider: after changing
+`issuer`, review `vk-hub accounts` and end the old sessions with `vk-hub ui logout --all`.
 
 The address is the provider's `email` claim from UserInfo, if it is an address and not marked
 unverified (`email_verified` false); a provider that says nothing of verification is taken at
