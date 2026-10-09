@@ -586,7 +586,7 @@ pub(super) fn action_line(h: &mut Html, action: Option<&Action>) {
         .raw(", ");
     match &a.ended {
         None => {
-            h.raw("running since ").text(pages::started(a.started_at));
+            h.raw("running since ").html(&pages::at_html(a.started_at));
         }
         Some(e) => {
             h.raw(if e.ok {
@@ -595,7 +595,7 @@ pub(super) fn action_line(h: &mut Html, action: Option<&Action>) {
                 "<span class=\"reason\">failed</span>"
             })
             .raw(", ended ")
-            .text(pages::started(e.at))
+            .html(&pages::at_html(e.at))
             .raw(": ")
             .node(&e.said);
         }

@@ -711,7 +711,7 @@ pub(super) fn fetch_line(
         h.raw("Latest on GitHub: vk ")
             .node(version)
             .raw(", as of ")
-            .text(pages::started(*at))
+            .html(&pages::at_html(*at))
             .raw(". ");
     }
     if let Some(s) = status {
@@ -738,13 +738,13 @@ pub(super) fn fetch_line(
                     .raw(" (<code>")
                     .text(crate::store::short(sha256))
                     .raw("</code>) at ")
-                    .text(pages::started(*at));
+                    .html(&pages::at_html(*at));
             }
             Phase::Failed { reason, at } => {
                 h.raw("<span class=\"reason\">Fetching vk ")
                     .text(asked)
                     .raw(" failed</span> at ")
-                    .text(pages::started(*at))
+                    .html(&pages::at_html(*at))
                     .raw(": ")
                     .node(reason);
             }

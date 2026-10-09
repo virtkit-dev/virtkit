@@ -53,6 +53,9 @@ All notable changes to virtkit will be documented in this file.
   places there** instead of being refused. The node says that its runner may still take jobs,
   and reports `drained` once the jobs it runs, and any vk executor job already admitted, are
   over. A reset is still refused there.
+- **`vk-hub`'s web UI shows times in the browser's own time zone, with how long ago they
+  were** (`11:52 · 5 min ago`), the exact UTC time on hover; without JavaScript, the UTC time
+  shows as before.
 
 ### Fixed
 

@@ -16,8 +16,9 @@ use hyper::{Response, StatusCode};
 use tokio::sync::watch;
 use vk_hub_proto::{Workload, WorkloadKind};
 
+use super::fleet::{VM_FOR, VM_ID, VM_KIND, VM_PID, VM_STARTED};
 use super::html::Html;
-use super::pages::{self, dash, end_section, kv, kv_node, section};
+use super::pages::{self, dash, end_section, kv, kv_html, kv_node, section};
 use super::sse::{self, Source};
 use super::{Auth, Body, Ui};
 use crate::local::{Keep, Listing, Local};
@@ -468,23 +469,29 @@ fn vms_table(listing: &Listing) -> Html {
         for (i, cell) in cells.iter().enumerate() {
             h.raw("<td>");
             match i {
+                VM_STARTED => {
+                    match w.started_at {
+                        Some(t) => pages::time(&mut h, t, cell),
+                        None => h.text(cell),
+                    };
+                }
                 // Of the hub's making: the kind's name and the figures.
-                0 | 3..=7 => {
+                VM_KIND | VM_PID..VM_STARTED => {
                     h.text(cell);
                 }
                 // The ID, leading to the VM's page; the router takes only hex for one.
-                1 if valid_id(cell) => {
+                VM_ID if valid_id(cell) => {
                     h.raw("<a href=\"/vm/")
                         .text(cell)
                         .raw("\"><code>")
                         .text(cell)
                         .raw("</code></a>");
                 }
-                1 => {
+                VM_ID => {
                     h.raw("<code>").node(cell).raw("</code>");
                 }
                 // A CI job, leading to its page on GitLab where `vk` named one.
-                2 if w.kind == WorkloadKind::CiJob => {
+                VM_FOR if w.kind == WorkloadKind::CiJob => {
                     h.external_link(w.job_url.as_deref(), cell);
                 }
                 _ => {
@@ -633,11 +640,10 @@ fn vm_detail(w: &Workload, mem: Option<u64>, local: &Local) -> Html {
         "memory held",
         &mem.map_or_else(dash, pages::rough_bytes),
     );
-    kv(
-        &mut h,
-        "started",
-        &w.started_at.map_or_else(dash, pages::started),
-    );
+    match w.started_at {
+        Some(t) => kv_html(&mut h, "started", &pages::at_html(t)),
+        None => kv(&mut h, "started", &dash()),
+    }
     h.raw("<tr><th>last action</th><td>");
     super::actions::action_line(&mut h, local.action(&super::actions::key(w)).as_ref());
     h.raw("</td></tr>");

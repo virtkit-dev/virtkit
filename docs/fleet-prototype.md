@@ -983,8 +983,11 @@ proxy or NAT address.
 
 htmx 2.0.7 and htmx-ext-sse 2.2.3 are vendored in `vk-hub/assets/` (`VENDOR.md` gives their
 sources and digests), embedded, and served under a hash of their content with a year's
-caching. htmx runs with `allowEval`, `allowScriptTags` and `includeIndicatorStyles` off and
-`selfRequestsOnly` on; the pages have no inline script or style for the policy to refuse.
+caching, as are the UI's own stylesheet and `time.js`: every page loads htmx, its SSE
+extension and `time.js`, and no other script. htmx runs with `allowEval`, `allowScriptTags`
+and `includeIndicatorStyles` off and `selfRequestsOnly` on; the pages have no inline script
+or style for the policy to refuse.
+
 Node IDs, issued by the hub and checked as fixed-length lowercase hex — and in local mode the
 VM IDs `vk workloads` derives, checked the same way, and dev environment names, checked to be
 `[A-Za-z0-9._-]` not starting with `.` or `-` — are the only values in an attribute htmx reads
@@ -997,6 +1000,16 @@ backslashes or backticks, at most 256 bytes — checked again as the page is bui
 and opened in a new tab with `rel="noopener noreferrer"`; anything else leaves the job's name
 as text. Everything else nodes or the host send goes only into text and plain attributes,
 escaped.
+
+Every time a page shows — when a VM started, a node was last seen, a command was issued, an
+audit line written — is a `<time>` element carrying the UTC instant in its `datetime` and
+`title`. The hub cannot know the browser's time zone, so `time.js`, deferred, shows each in
+the browser's zone with how long ago it was, or how soon it is: `11:52 · 5 min ago`, the
+date too when it is not today, and under a minute in steps of 5 seconds, a heartbeat, as the
+server's text does. Ages are by the hub's clock: each page carries the hub's time in its
+`<html data-now>`, from which the script corrects for a browser clock that is off. It
+updates on load, after each htmx swap — live updates included — and every 5 seconds,
+without evaluating anything. Without it, the page's own text stays: the UTC time, or an age.
 
 ### Signing in
 

@@ -444,7 +444,15 @@ async fn the_vms_are_listed_each_with_a_page() {
         reply.body
     );
     assert!(reply.body.contains("300 MiB"), "{}", reply.body);
-    assert!(reply.body.contains("2026-09-30T08:01Z"), "{}", reply.body);
+    // In UTC, for the page's script to show in the browser's zone.
+    assert!(
+        reply.body.contains(
+            "<td><time datetime=\"2026-09-30T08:01:19Z\" title=\"2026-09-30 08:01:19 UTC\">\
+             2026-09-30T08:01Z</time></td>"
+        ),
+        "{}",
+        reply.body
+    );
     let reply = get(addr, &format!("/vm/{id}"), Some(&cookie)).await;
     assert_eq!(reply.status, 200, "{}", reply.body);
     assert!(reply.body.contains("/s/alpine:3.20"), "{}", reply.body);
@@ -529,6 +537,7 @@ async fn assets_are_served_for_good_under_their_hash() {
     for (name, script) in [
         (assets::HTMX, include_str!("../../assets/htmx.min.js")),
         (assets::SSE, include_str!("../../assets/sse.min.js")),
+        (assets::TIME, include_str!("../../assets/time.js")),
     ] {
         let reply = get(addr, assets::url(name), None).await;
         assert_eq!(reply.status, 200);
@@ -1022,8 +1031,19 @@ async fn pages_load_only_the_embedded_scripts() {
         let body = get(addr, &path, Some(&cookie)).await.body;
         assert!(body.contains("\"allowEval\":false"), "{body}");
         assert!(body.contains("\"selfRequestsOnly\":true"), "{body}");
-        assert_eq!(body.matches("<script").count(), 2, "{body}");
-        assert_eq!(body.matches("<script src=\"/assets/").count(), 2, "{body}");
+        assert_eq!(body.matches("<script").count(), 3, "{body}");
+        assert_eq!(body.matches("<script src=\"/assets/").count(), 3, "{body}");
+        // The script that shows times in the browser's zone, run once the page is read.
+        let time = format!(
+            "<script src=\"{}\" defer></script>",
+            assets::url(assets::TIME)
+        );
+        assert!(body.contains(&time), "{body}");
+        // The hub's time, by which the script measures ages.
+        let now = body
+            .strip_prefix("<!doctype html><html lang=\"en\" data-now=\"")
+            .and_then(|rest| rest.get(..21));
+        assert!(now.is_some_and(|now| now.ends_with("Z\"")), "{body}");
         assert!(!body.contains(" style="), "{body}");
         // No event handler attribute: ` on<letters>=`.
         let handler = body.split(" on").skip(1).any(|rest| {
@@ -2341,6 +2361,16 @@ fn ci_workload(id: &str, owner: &str) -> vk_hub_proto::Workload {
     }
 }
 
+/// Whether `body` has, right after some `before`, a `<time>` element with a UTC instant to
+/// the second (`datetime="YYYY-MM-DDTHH:MM:SSZ"`).
+fn utc_time_after(body: &str, before: &str) -> bool {
+    let open = format!("{before}<time datetime=\"");
+    body.match_indices(&open).any(|(i, _)| {
+        let rest = &body[i + open.len()..];
+        rest.len() > 21 && rest.as_bytes()[19] == b'Z' && rest.as_bytes()[20] == b'"'
+    })
+}
+
 /// A node's workloads are on its page and counted in the nodes table, kept live, and what
 /// the node says of them is text.
 #[tokio::test(flavor = "multi_thread")]
@@ -2383,10 +2413,17 @@ async fn workloads_are_shown_live_and_as_text() {
         assert!(page.body.contains(want), "{want}: {}", page.body);
     }
     assert!(!page.body.contains("<script>alert") && !page.body.contains("<img"));
+    // When the node was heard from, in UTC for the page's script.
+    assert!(
+        utc_time_after(&page.body, "<tr><th>heartbeat</th><td>"),
+        "{}",
+        page.body
+    );
 
     let mut nodes = Events::open(addr, "/events/nodes", &cookie).await;
     let first = nodes.next().await.unwrap();
     assert!(first.contains("<th>VMS</th>"), "{first}");
+    assert!(utc_time_after(&first, "<td>"), "{first}");
     assert!(first.contains("<td>1</td></tr>"), "{first}");
 
     let mut detail = Events::open(addr, &format!("/events/node/{node}"), &cookie).await;
@@ -2482,8 +2519,19 @@ async fn the_fleet_s_pages_load_only_the_embedded_scripts() {
         let body = get(addr, &path, Some(&cookie)).await.body;
         assert!(body.contains("\"allowEval\":false"), "{body}");
         assert!(body.contains("\"selfRequestsOnly\":true"), "{body}");
-        assert_eq!(body.matches("<script").count(), 2, "{body}");
-        assert_eq!(body.matches("<script src=\"/assets/").count(), 2, "{body}");
+        assert_eq!(body.matches("<script").count(), 3, "{body}");
+        assert_eq!(body.matches("<script src=\"/assets/").count(), 3, "{body}");
+        // The script that shows times in the browser's zone, run once the page is read.
+        let time = format!(
+            "<script src=\"{}\" defer></script>",
+            assets::url(assets::TIME)
+        );
+        assert!(body.contains(&time), "{body}");
+        // The hub's time, by which the script measures ages.
+        let now = body
+            .strip_prefix("<!doctype html><html lang=\"en\" data-now=\"")
+            .and_then(|rest| rest.get(..21));
+        assert!(now.is_some_and(|now| now.ends_with("Z\"")), "{body}");
         assert!(!body.contains(" style="), "{body}");
         // No inline event handler: no ` on…=` attribute.
         let handler = body.match_indices(" on").any(|(i, _)| {

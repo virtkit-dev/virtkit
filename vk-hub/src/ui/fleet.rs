@@ -21,8 +21,8 @@ use vk_hub_proto::{
 
 use super::html::Html;
 use super::pages::{
-    self, bytes, count, dash, end_section, kv, kv_node, mib, rough_bytes, rough_count, section,
-    started,
+    self, bytes, count, dash, end_section, kv, kv_html, kv_node, mib, rough_bytes, rough_count,
+    section, started,
 };
 use super::sse::{self, Source};
 use super::{Auth, Body, Ui, actions, blocking, decode_form, field, message, operations, page};
@@ -581,8 +581,8 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
         auth.session.principal()
     );
     let mut main = Html::new();
-    main.raw("<h1>Enrollment token</h1><p>Single-use, valid until ")
-        .text(started(expires_at))
+    main.raw("<h1>Enrollment token</h1><p>Single-use, valid until ");
+    pages::at(&mut main, expires_at)
         .raw(". It is shown this once: copy it now.</p><pre>")
         .text(&token)
         .raw("</pre><p>On the node, as root, run this, then paste the token and press Enter ")
@@ -610,21 +610,21 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
     Ok(page(layout("enrollment token", &auth, &main)))
 }
 
-// Where the pages put cells of their own, by column of `vk-hub nodes` and of a node's
-// workloads; checked against the columns' names, so a reordering fails to build.
+// Columns with custom rendering in `vk-hub nodes` and `vk workloads` (a node's VMs
+// here, the host's in local mode). Name checks make a reordering fail to build.
 const NODE_ID: usize = 0;
 const NODE_NAME: usize = 1;
 const NODE_STATE: usize = 3;
 const NODE_SYNC: usize = 7;
 const NODE_LAST_SEEN: usize = 8;
 const NODE_VK: usize = 9;
-const VM_KIND: usize = 0;
-const VM_ID: usize = 1;
-const VM_FOR: usize = 2;
-const VM_PID: usize = 3;
+pub(super) const VM_KIND: usize = 0;
+pub(super) const VM_ID: usize = 1;
+pub(super) const VM_FOR: usize = 2;
+pub(super) const VM_PID: usize = 3;
 const VM_RESERVED: usize = 5;
 const VM_IN_USE: usize = 6;
-const VM_STARTED: usize = 7;
+pub(super) const VM_STARTED: usize = 7;
 const _: () = {
     let nodes = &crate::NODE_COLUMNS;
     assert!(column_is(nodes, NODE_ID, "ID") && column_is(nodes, NODE_NAME, "NAME"));
@@ -696,6 +696,12 @@ fn nodes_table(nodes: &[NodeView], now: u64) -> Html {
                 // What the node sent: its version, and the one it is updating to.
                 NODE_STATE | NODE_VK => {
                     h.node(cell);
+                }
+                NODE_LAST_SEEN => {
+                    match n.last_seen {
+                        Some(t) => pages::time(&mut h, t, cell),
+                        None => h.text(cell),
+                    };
                 }
                 _ => {
                     h.text(cell);
@@ -994,6 +1000,18 @@ fn age(now: u64, then: u64) -> String {
     }
 }
 
+/// The instant `then` as a [`pages::time`], with its [`age`] at `now` as fallback text.
+fn time_ago(h: &mut Html, now: u64, then: u64) -> &mut Html {
+    pages::time(h, then, &age(now, then))
+}
+
+/// [`time_ago`] as a standalone fragment.
+fn time_ago_html(now: u64, then: u64) -> Html {
+    let mut h = Html::new();
+    time_ago(&mut h, now, then);
+    h
+}
+
 /// A node page's fragment once the node has been removed.
 fn gone() -> Html {
     let mut h = Html::new();
@@ -1014,12 +1032,12 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
         } else {
             "unreachable"
         })
-        .raw(" · last seen ")
-        .text(
-            v.last_seen
-                .map_or_else(|| "never".to_string(), |t| age(now, t)),
-        )
-        .raw("</p>");
+        .raw(" · last seen ");
+    match v.last_seen {
+        Some(t) => time_ago(&mut h, now, t),
+        None => h.raw("never"),
+    };
+    h.raw("</p>");
 
     if !v.monitoring_only() {
         steer_panel(&mut h, v, csrf);
@@ -1035,7 +1053,7 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
         None => kv(&mut h, "heartbeat", "none yet"),
         Some(hb) => {
             if let Some(at) = d.row.heartbeat_at {
-                kv(&mut h, "heartbeat", &age(now, at));
+                kv_html(&mut h, "heartbeat", &time_ago_html(now, at));
             }
             match &hb.admission {
                 Some(a) => {
@@ -1324,8 +1342,8 @@ fn commands(h: &mut Html, d: &NodeDetail, now: u64) {
         h.raw("<table class=\"grid\"><thead><tr><th>issued</th><th>command</th>")
             .raw("<th>outcome</th><th>expires</th></tr></thead><tbody>");
         for c in &d.commands {
-            h.raw("<tr><td>")
-                .text(started(c.issued_at))
+            h.raw("<tr><td>");
+            pages::at(h, c.issued_at)
                 .raw("</td><td>")
                 .text(crate::store::operation_name(&c.command.op))
                 .raw(" <code>")
@@ -1340,9 +1358,8 @@ fn commands(h: &mut Html, d: &NodeDetail, now: u64) {
                 Some(Outcome::Refused { reason }) => h.raw("refused: ").node(reason),
                 Some(Outcome::Expired) => h.raw("expired"),
             };
-            h.raw("</td><td>")
-                .text(started(c.command.expires_at))
-                .raw("</td></tr>");
+            h.raw("</td><td>");
+            pages::at(h, c.command.expires_at).raw("</td></tr>");
         }
         h.raw("</tbody></table>");
     }
@@ -1382,8 +1399,12 @@ fn workloads(h: &mut Html, workloads: Option<&crate::store::Workloads>) {
         for (i, cell) in cells.iter().enumerate() {
             h.raw("<td>");
             match i {
+                VM_STARTED => match w.started_at {
+                    Some(t) => pages::time(h, t, cell),
+                    None => h.text(cell),
+                },
                 // Of the hub's making: the kind's name and the figures.
-                VM_KIND | VM_PID..=VM_STARTED => h.text(cell),
+                VM_KIND | VM_PID..VM_STARTED => h.text(cell),
                 VM_ID => h.raw("<code>").node(cell).raw("</code>"),
                 // A CI job, leading to its page on GitLab where the node named one fit to be
                 // a link.
@@ -1462,7 +1483,7 @@ fn operations_fragment(ops: &Operations, steer: bool, now: u64) -> Html {
                     "no"
                 })
                 .raw("</td><td>")
-                .text(started(r.row.added_at))
+                .html(&pages::at_html(r.row.added_at))
                 .raw("</td><td>")
                 .text(&r.row.added_by)
                 .raw("</td></tr>");
@@ -1524,7 +1545,7 @@ fn placed_jobs(h: &mut Html, jobs: &[(String, crate::store::JobRow)], now: u64) 
         h.raw("</td><td>")
             .text(bytes(j.output_len))
             .raw("</td><td>")
-            .text(age(now, j.created_at))
+            .html(&time_ago_html(now, j.created_at))
             .raw("</td></tr>");
     }
     h.raw("</tbody></table></section>");
@@ -1566,7 +1587,7 @@ fn rollout(h: &mut Html, r: &Rollout, steer: bool, now: u64) {
         .raw(" of at most ")
         .text(row.max_failures)
         .raw(" failure(s) · started ")
-        .text(started(row.created_at))
+        .html(&pages::at_html(row.created_at))
         .raw(" by ")
         .text(&row.created_by)
         .raw("</p>");
@@ -1623,13 +1644,13 @@ fn rollout(h: &mut Html, r: &Rollout, steer: bool, now: u64) {
             }
             NodeStatus::Updating { command, since, .. } => {
                 h.raw("updating, issued ")
-                    .text(age(now, *since))
+                    .html(&time_ago_html(now, *since))
                     .raw(" (command <code>")
                     .text(command)
                     .raw("</code>)");
             }
             NodeStatus::Succeeded { at } => {
-                h.raw("succeeded ").text(started(*at));
+                h.raw("succeeded ").html(&pages::at_html(*at));
             }
             NodeStatus::Failed { reason, .. } => {
                 h.raw("failed: ").node(reason);

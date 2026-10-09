@@ -28,9 +28,9 @@ pub fn frame(title: &str, auth: &Auth, nav: &'static str, main: &Html) -> Html {
         .raw(nav)
         .raw("</nav><form class=\"who\" method=\"post\" action=\"/logout\"><span>")
         .text(auth.session.principal())
-        .raw(", until ")
-        .text(crate::utc(auth.session.expires_at))
-        .raw("</span> ");
+        .raw(", until ");
+    at(&mut h, auth.session.expires_at);
+    h.raw("</span> ");
     csrf_field(&mut h, auth);
     h.raw("<button>sign out</button></form></header><main>")
         .html(main)
@@ -44,8 +44,12 @@ pub fn frame(title: &str, auth: &Auth, nav: &'static str, main: &Html) -> Html {
 /// logging it as an error.
 const HTMX_CONFIG: &str = r#"{"allowEval":false,"allowScriptTags":false,"includeIndicatorStyles":false,"selfRequestsOnly":true,"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"4..","swap":true,"error":false},{"code":"5..","swap":true,"error":false},{"code":"...","swap":false,"error":true}]}"#;
 
+/// Open the page through its head. `data-now` gives `time.js` the hub's page-generation
+/// time so ages use the hub's clock.
 fn head(h: &mut Html, title: &str) {
-    h.raw("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">")
+    h.raw("<!doctype html><html lang=\"en\" data-now=\"")
+        .text(crate::utc(crate::now_secs()))
+        .raw("\"><head><meta charset=\"utf-8\">")
         .raw("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
         .raw("<meta name=\"htmx-config\" content='")
         .raw(HTMX_CONFIG)
@@ -57,7 +61,9 @@ fn head(h: &mut Html, title: &str) {
         .text(assets::url(assets::HTMX))
         .raw("\"></script><script src=\"")
         .text(assets::url(assets::SSE))
-        .raw("\"></script></head>");
+        .raw("\"></script><script src=\"")
+        .text(assets::url(assets::TIME))
+        .raw("\" defer></script></head>");
 }
 
 /// The hidden field carrying the session's CSRF token.
@@ -212,7 +218,8 @@ fn audit_table(
     }
     h.raw("<th>who</th><th>what</th></tr></thead><tbody>");
     for (_, row) in rows {
-        h.raw("<tr><td>").text(crate::utc(row.at)).raw("</td>");
+        h.raw("<tr><td>");
+        time(h, row.at, &crate::utc(row.at)).raw("</td>");
         if with_node {
             h.raw("<td>");
             match row.node.as_deref() {
@@ -244,6 +251,34 @@ fn audit_table(
     h.raw("</tbody></table>");
 }
 
+/// The instant `secs` as a `<time>` element for `time.js` to show in the browser's zone
+/// with its age. Without the script, `text` shows the UTC instant or an age; the title
+/// always gives the exact UTC instant. Use only the hub's own figures.
+pub fn time<'h>(h: &'h mut Html, secs: u64, text: &str) -> &'h mut Html {
+    let utc = crate::utc(secs);
+    // `YYYY-MM-DDTHH:MM:SSZ` as `YYYY-MM-DD HH:MM:SS UTC`.
+    let title = format!("{} UTC", utc.replacen('T', " ", 1).trim_end_matches('Z'));
+    h.raw("<time datetime=\"")
+        .text(&utc)
+        .raw("\" title=\"")
+        .text(title)
+        .raw("\">")
+        .text(text)
+        .raw("</time>")
+}
+
+/// [`time`] with [`started`] as the fallback text.
+pub fn at(h: &mut Html, secs: u64) -> &mut Html {
+    time(h, secs, &started(secs))
+}
+
+/// [`at`] as a standalone fragment.
+pub fn at_html(secs: u64) -> Html {
+    let mut h = Html::new();
+    at(&mut h, secs);
+    h
+}
+
 /// Start time to the minute. Unlike uptime, it stays fixed as the workload ages.
 pub fn started(secs: u64) -> String {
     let mut at = crate::utc(secs);
@@ -268,6 +303,15 @@ pub fn kv(h: &mut Html, key: &str, value: &str) {
         .text(key)
         .raw("</th><td>")
         .text(value)
+        .raw("</td></tr>");
+}
+
+/// A row with hub-generated markup as its value.
+pub fn kv_html(h: &mut Html, key: &str, value: &Html) {
+    h.raw("<tr><th>")
+        .text(key)
+        .raw("</th><td>")
+        .html(value)
         .raw("</td></tr>");
 }
 
@@ -369,5 +413,21 @@ mod tests {
         assert_eq!(rough_bytes(197 << 20), "200 MiB");
         assert_eq!(rough_bytes(3 << 30), "3.0 GiB");
         assert_eq!(started(1_790_755_279), "2026-09-30T08:01Z");
+    }
+
+    /// An instant carries its exact UTC time for the script and the title, and shows the
+    /// text given without the script.
+    #[test]
+    fn an_instant_is_a_time_element_in_utc() {
+        let mut h = Html::new();
+        at(&mut h, 1_790_755_279);
+        time(&mut h, 1_790_755_279, "5s ago");
+        assert_eq!(
+            h.into_string(),
+            "<time datetime=\"2026-09-30T08:01:19Z\" title=\"2026-09-30 08:01:19 UTC\">\
+             2026-09-30T08:01Z</time>\
+             <time datetime=\"2026-09-30T08:01:19Z\" title=\"2026-09-30 08:01:19 UTC\">\
+             5s ago</time>"
+        );
     }
 }
