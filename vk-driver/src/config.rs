@@ -303,6 +303,9 @@ pub struct Node {
     /// Whether an update needs a signature by one of `release_keys`. Unset: when any key is
     /// set. A release that carries a signature is checked whenever there are keys.
     pub require_signed: Option<bool>,
+    /// Labels for job placement: a `vk-gitlab` runner requires nodes with all its labels.
+    /// At most 32 labels, each 1–64 ASCII letters, digits or `-_.:/=` characters.
+    pub labels: Vec<String>,
 }
 
 impl Node {

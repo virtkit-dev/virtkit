@@ -213,7 +213,8 @@ and guest kernel versions and a hash of the effective configuration; and the git
 configuration read, its `concurrent` and its runner names. The heartbeat carries admission
 (memory committed and budget, jobs running and waiting), the runner concurrency last asked
 for, memory available, free bytes and inodes per filesystem, and each VM's memory. Inventory
-may also carry node-declared labels that placed jobs can require; older nodes send none.
+also carries the labels the node declares in `[node] labels`, which placed jobs can require;
+older nodes send none.
 
 The hub stores heartbeats and reports at most once per half heartbeat, holding back the latest
 and storing it at the next ping. Heartbeats are written without an fsync, one a minute made

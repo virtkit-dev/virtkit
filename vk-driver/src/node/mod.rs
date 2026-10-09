@@ -510,6 +510,7 @@ pub async fn run(cfg: Config) -> Result<()> {
     update::arm_trial_deadline(&dir, session::now_secs())?;
     update::note_installed(&dir)?;
     let enrollment = read_enrollment(&dir).map_err(not_enrolled)?;
+    inventory::labels(&cfg)?;
     let identity = Identity::load(&dir).with_context(|| {
         format!(
             "loading the node's identity ({})",

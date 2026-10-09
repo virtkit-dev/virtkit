@@ -77,8 +77,37 @@ pub fn inventory(cfg: &Config) -> Inventory {
             vk_sha256: super::update::known_sha256(),
         },
         runner: runner_config(cfg),
-        labels: Vec::new(),
+        // Checked when `vk node run` starts; one gone wrong since is left out.
+        labels: labels(cfg).unwrap_or_default(),
     }
+}
+
+/// Maximum label count and length.
+const MAX_LABELS: usize = 32;
+const MAX_LABEL: usize = 64;
+
+/// Validate `[node] labels` as short words the hub can store and print unchanged.
+pub fn labels(cfg: &Config) -> anyhow::Result<Vec<String>> {
+    let labels = &cfg.node.labels;
+    if labels.len() > MAX_LABELS {
+        anyhow::bail!("[node] labels: at most {MAX_LABELS} labels");
+    }
+    for label in labels {
+        let ok = (1..=MAX_LABEL).contains(&label.len())
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.:/=".contains(&b));
+        if !ok {
+            anyhow::bail!(
+                "[node] labels: {:?} is not 1 to {MAX_LABEL} of ASCII letters, digits and -_.:/=",
+                vk_hub_proto::display_safe(label)
+            );
+        }
+    }
+    let mut out = labels.clone();
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 /// What the heartbeat keeps from one reading to the next.
@@ -324,6 +353,26 @@ fn parse_runner(text: &str) -> Option<Runner> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labels_are_checked_and_kept_sorted() {
+        let cfg = |toml: &str| -> Config { toml::from_str(toml).unwrap() };
+        assert_eq!(
+            labels(&cfg(
+                "[node]\nlabels = [\"large-memory\", \"gpu\", \"gpu\"]\n"
+            ))
+            .unwrap(),
+            vec!["gpu".to_string(), "large-memory".to_string()]
+        );
+        for bad in ["\"\"", "\"two words\"", "\"tab\\t\"", "\"é\""] {
+            assert!(
+                labels(&cfg(&format!("[node]\nlabels = [{bad}]\n"))).is_err(),
+                "{bad}"
+            );
+        }
+        let many: Vec<String> = (0..33).map(|i| format!("\"l{i}\"")).collect();
+        assert!(labels(&cfg(&format!("[node]\nlabels = [{}]\n", many.join(",")))).is_err());
+    }
 
     #[test]
     fn the_kernel_release_is_read_from_its_banner() {
