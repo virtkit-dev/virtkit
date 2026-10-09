@@ -551,10 +551,13 @@ fn base_dirs(root: &Path) -> Vec<PathBuf> {
 /// build/pull fails or panics rather than left for a sweep. The claim is an exclusive `flock`
 /// on the directory, which the kernel drops however the process ends; it is what
 /// [`sweep_orphaned_build_tmp`] reads, with the pull lock, to tell a dead dir from a live one.
+/// A SIGTERM or SIGINT that would end the process removes the dir first (see
+/// [`crate::termclean`]).
 pub(crate) struct TmpGuard<'a> {
     path: &'a Path,
     /// `None` on a filesystem that cannot take the `flock`, where the pull lock alone holds.
     claim: Option<std::fs::File>,
+    _on_signal: crate::termclean::Registration,
     keep: bool,
 }
 
@@ -578,18 +581,21 @@ impl<'a> TmpGuard<'a> {
         std::fs::create_dir_all(path).with_context(|| format!("creating {}", path.display()))?;
         let dir =
             std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        let claim = match lock(&dir) {
-            Ok(()) => Some(dir),
+        let claimed = match lock(&dir) {
+            Ok(()) => true,
             // Held: a live build reached this dir without the pull lock, and it is its to
-            // remove, not this one's.
+            // remove, not this one's — on a signal either.
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 return Err(e).with_context(|| format!("claiming {}", path.display()));
             }
-            Err(_) => None,
+            Err(_) => false,
         };
+        let on_signal = crate::termclean::remove_on_signal(path, std::os::fd::AsFd::as_fd(&dir));
+        let claim = claimed.then_some(dir);
         Ok(TmpGuard {
             path,
             claim,
+            _on_signal: on_signal,
             keep: false,
         })
     }
@@ -597,7 +603,8 @@ impl<'a> TmpGuard<'a> {
     /// Transfer removal responsibility to the caller promoting (renaming) `path`. Return the
     /// claim for the caller to hold through the rename, keeping the `.tmp` directory claimed.
     /// Consume `self` rather than borrow it mutably: its destructor runs immediately with
-    /// removal disabled by `keep`, without `mem::forget` or `ManuallyDrop`.
+    /// removal disabled by `keep`, without `mem::forget` or `ManuallyDrop`. That destructor
+    /// also unregisters the dir from removal on a signal, before the caller promotes it.
     #[must_use = "the claim is to be held until the dir is renamed away"]
     pub(crate) fn keep(mut self) -> Option<std::fs::File> {
         self.keep = true;

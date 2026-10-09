@@ -124,6 +124,10 @@ All notable changes to virtkit will be documented in this file.
   hub placed work. `vk node` now reclaims what dead builds left when it starts and every ten
   minutes, as do each job's cleanup, a node reset and `vk gc`, and says how much it freed. A
   build still running is never touched, nor what another user's builds left.
+- **A build stopped with SIGTERM or Ctrl-C removes its scratch on the way out.** `vk build`,
+  `vk run`'s image builds and pulls, and those of a CI job no longer leave their working files
+  for a later sweep when cancelled, wherever the signal would otherwise have ended them on the
+  spot.
 - **`vk-registry` admits more connections, and asks clients past its per-host cap to come
   back.** It serves 4096 connections at once and 1024 from one client address by default,
   up from 1024 and 256; `max_connections` and `max_connections_per_client` in its config

@@ -824,7 +824,9 @@ directly in it changed for a minute: when `vk node run` starts, every ten minute
 `vk gitlab cleanup`, on a reset, and on `vk gc`. It logs, per tier, how many it removed and the
 space they held; it follows no symlink, enters no mount, and leaves what another user owns,
 naming such dirs on `vk gc`, a reset and the node's first sweep. The locks are local to the
-host, so a `state_dir` must not be shared between hosts.
+host, so a `state_dir` must not be shared between hosts. A build or pull stopped with `SIGTERM`
+(a cancelled job) while that signal is at its default action removes its staging dir itself
+before it exits.
 
 **Stages.** gitlab-runner's order and words: `prepare_executor`, `prepare_script`,
 `get_sources` (`GET_SOURCES_ATTEMPTS`), `restore_cache` (`RESTORE_CACHE_ATTEMPTS`),

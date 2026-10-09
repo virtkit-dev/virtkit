@@ -84,6 +84,7 @@ mod sshconf;
 mod switch;
 mod task;
 mod term;
+mod termclean;
 #[cfg(test)]
 mod testutil;
 mod timing;

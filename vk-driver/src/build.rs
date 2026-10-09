@@ -929,8 +929,8 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     let seq = BUILD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scratch = build_scratch(anchor, seq)?;
     // Self-heal: a build normally removes its scratch on exit (even on error), but a hard
-    // kill (SIGKILL/OOM/Ctrl-C/panic) orphans it. Before starting, drop any sibling
-    // scratch nobody is holding, so crashed runs don't accumulate.
+    // kill (SIGKILL/OOM, Ctrl-C under a handler of its own, a panic) orphans it. Before
+    // starting, drop any sibling scratch nobody is holding, so crashed runs don't accumulate.
     if let Some(parent) = scratch.parent() {
         sweep_stale_scratch(parent, SCRATCH_PREFIX);
     }
@@ -945,7 +945,10 @@ fn build_backend(inputs: Vec<PlanInput>, opts: &Options, microvm: bool) -> Resul
     // Claim ours for the length of the build, so a concurrent sweep (another build starting
     // beside us) can tell it is live without having to interpret our pid. After the resolve
     // above, so its failure leaves no scratch dir behind.
-    let _scratch_owner = claim_scratch(&scratch)?;
+    let scratch_owner = claim_scratch(&scratch)?;
+    // A SIGTERM or SIGINT ends the process without running the removal at the end.
+    let _scratch_on_signal =
+        crate::termclean::remove_on_signal(&scratch, std::os::fd::AsFd::as_fd(&scratch_owner));
     // Live build overview (Docker/buildkit-style): a dashboard in a terminal, plain `#N`
     // lines otherwise. The drivers populate it (which stages/steps run) once they know the
     // needed set, and route each stage's guest output through it.
@@ -1162,7 +1165,9 @@ pub fn build_units(units: Vec<BuildUnit>, opts: &Options) -> Result<HashMap<Stri
         sweep_stale_scratch(parent, SCRATCH_PREFIX);
     }
     // As in `build_backend`: hold the scratch's own lock for the whole build.
-    let _scratch_owner = claim_scratch(&scratch)?;
+    let scratch_owner = claim_scratch(&scratch)?;
+    let _scratch_on_signal =
+        crate::termclean::remove_on_signal(&scratch, std::os::fd::AsFd::as_fd(&scratch_owner));
     let mut mv = make_microvm(opts, &scratch, &kernel.path, &agent.path, &timings)?;
     // One job budget for every unit's stages combined (not per unit), so concurrent work
     // stays within host RAM instead of multiplying live guests. The ceiling itself is
