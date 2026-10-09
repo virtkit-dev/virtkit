@@ -7,15 +7,15 @@ All notable changes to virtkit will be documented in this file.
 ### Added
 
 - **`vk-hub` holds CI tools definitions and has nodes build them.** `vk-hub tools add <dir>
-  --version <label>` takes a build context — a Dockerfile whose `tools` stage holds static
-  `git`, `git-lfs` and `gitlab-runner` — packed so that the same tree is the same definition;
-  `vk-hub tools list` and `remove` manage them. `vk-hub nodes tools <id> --tools <sha256>`, or
-  `--all`, asks nodes to build one and give its tools to their jobs, skipping nodes too old to.
-  `vk-hub nodes`, a node's page and the operations page show each node's tools and how its
-  last build went, with the end of a failed build's output.
+  --version <label>` takes a build context — a Dockerfile whose `tools` stage holds static `git` and
+  any other tools, such as `git-lfs` — packed so that the same tree is the same definition; `vk-hub
+  tools list` and `remove` manage them. `vk-hub nodes tools <id> --tools <sha256>`, or `--all`, asks
+  nodes to build one and give its tools to their jobs, skipping nodes too old to. `vk-hub nodes`, a
+  node's page and the operations page show each node's tools and how its last build went, with the
+  end of a failed build's output.
 - **`vk node` builds the CI tools its hub names, and gives them to jobs.** It builds the
   definition with `vk build` in microVMs, without reading or filling its build cache, checks
-  that `git` and `gitlab-runner` are there and statically linked, and installs the tools as
+  that `git` is there and statically linked, and installs the tools as
   `<state_dir>/tools/current`: once the first build is done, as `vk-hub nodes` shows, set
   `[executor] tools_dir` to that path. Jobs that start afterwards get them, running jobs keep
   theirs, and the previous tools are kept; a failed build changes nothing. `vk node run` warns,
@@ -77,6 +77,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **`vk check --feature gitlab` requires a `gitlab-runner` in `[executor] tools_dir` only where
+  one runs on the host** — one `vk node` manages, or one on systemd's `PATH`. Jobs a hub places
+  need only `git` there.
 - **`vk-hub`'s web UI is restyled.** The top bar marks the current page and shows your
   identity and role. Coloured badges show node, job and rollout states. Tables keep their
   headers visible and align figures. Light and dark themes follow the browser's preference,

@@ -1095,6 +1095,11 @@ fn registry(cfg: &Config) -> Outcome {
 }
 
 fn gitlab(cfg: &Config) -> Outcome {
+    gitlab_with(cfg, &SYSTEMD_PATH)
+}
+
+/// [`gitlab`], looking for a gitlab-runner of the host's own in `path`.
+fn gitlab_with(cfg: &Config, path: &[&str]) -> Outcome {
     // Without a config file this host runs no executor — return a skip that
     // run() escalates to a "requested but not enabled" failure (this check only
     // runs when named with --feature) rather than a confusing permission error
@@ -1107,7 +1112,7 @@ fn gitlab(cfg: &Config) -> Outcome {
         return fail(format!("{e} (per-job state lives there; see state_dir)"));
     }
     if let Some(dir) = &cfg.executor.tools_dir
-        && let Err(e) = check_tools_dir(cfg, dir)
+        && let Err(e) = check_tools_dir(cfg, dir, host_gitlab_runner(cfg, path).as_deref())
     {
         return fail(format!("[executor] tools_dir {e}"));
     }
@@ -1170,11 +1175,45 @@ fn readable_root(
     Ok((root, shown))
 }
 
-/// Fails unless `[executor] tools_dir` holds a gitlab-runner the guest can run: without one a
-/// job transfers no artifacts, caches or dotenv reports and still passes.
-fn check_tools_dir(cfg: &Config, dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
+/// systemd's default `PATH`, where a runner service finds its binary.
+const SYSTEMD_PATH: [&str; 6] = [
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+];
+
+/// Why this host runs a gitlab-runner of its own, or `None`: `vk node` manages one, or one is
+/// in a directory of `path`. Only these are seen: a runner started from another directory or
+/// in a container goes unnoticed, and its jobs pass this check with no gitlab-runner.
+fn host_gitlab_runner(cfg: &Config, path: &[&str]) -> Option<String> {
+    if cfg.node.runner == vk_hub_proto::RunnerMode::Managed {
+        return Some("vk node manages a gitlab-runner here".into());
+    }
+    path.iter()
+        .map(|dir| Path::new(dir).join("gitlab-runner"))
+        .find(|p| p.is_file())
+        .map(|p| format!("this host runs gitlab-runner at {}", p.display()))
+}
+
+/// Fails unless `[executor] tools_dir` is readable and, when `runner_here` says why the host
+/// runs a gitlab-runner, holds one the guest can run: that runner's jobs transfer artifacts,
+/// caches and dotenv reports with it. Jobs a hub places need none: the node transfers what
+/// vk-agent archives.
+fn check_tools_dir(cfg: &Config, dir: &Path, runner_here: Option<&str>) -> Result<(), String> {
     let (root, shown) = readable_root(cfg, dir, crate::vm::ShareRoot::Tools)?;
+    let Some(why) = runner_here else {
+        return Ok(());
+    };
+    shared_runner(&root, &shown).map_err(|e| format!("{e}, required because {why}"))
+}
+
+/// Fails unless the tools share `root`, shown as `shown`, holds a gitlab-runner the guest can
+/// run.
+fn shared_runner(root: &Path, shown: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
     let name = Path::new("gitlab-runner");
     match std::fs::symlink_metadata(root.join(name)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1186,7 +1225,7 @@ fn check_tools_dir(cfg: &Config, dir: &Path) -> Result<(), String> {
         Err(e) => return Err(format!("{shown}: gitlab-runner: {e}")),
         Ok(_) => {}
     }
-    let meta = follow_in_share(&root, name).map_err(|e| {
+    let meta = follow_in_share(root, name).map_err(|e| {
         format!("{shown}: gitlab-runner is a symlink the guest cannot follow ({e})")
     })?;
     if !meta.is_file() {
@@ -1643,10 +1682,10 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// Resolve tools_dir as the executor does, and require a gitlab-runner the guest can
-    /// follow to an executable regular file inside it.
+    /// Resolve tools_dir as the executor does and, where the host runs a gitlab-runner of its
+    /// own, require one the guest can follow to an executable regular file inside it.
     #[test]
-    fn the_gitlab_check_requires_a_gitlab_runner_in_tools_dir() {
+    fn the_gitlab_check_requires_a_gitlab_runner_in_tools_dir_where_the_host_runs_one() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         let root = std::env::temp_dir().join(format!("vk-check-tools-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1654,15 +1693,49 @@ mod tests {
         std::fs::create_dir_all(real.join("bin")).unwrap();
         let link = root.join("tools");
         symlink(&real, &link).unwrap();
-        let with = |tools: &Path| Config {
-            source: Some(root.join("config.toml")),
-            state_dir: Some(root.clone()),
-            executor: Executor {
-                tools_dir: Some(tools.to_path_buf()),
+        // A runner the node manages is one of the host's own, whatever is on PATH.
+        let with = |tools: &Path| {
+            let mut cfg = Config {
+                source: Some(root.join("config.toml")),
+                state_dir: Some(root.clone()),
+                executor: Executor {
+                    tools_dir: Some(tools.to_path_buf()),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
+            };
+            cfg.node.runner = vk_hub_proto::RunnerMode::Managed;
+            cfg
         };
+        // A host with no runner of its own needs none in tools_dir; one with a runner on
+        // systemd's PATH does, and so does a node that manages one.
+        let external = || {
+            let mut cfg = with(&link);
+            cfg.node.runner = vk_hub_proto::RunnerMode::External;
+            cfg
+        };
+        let out = gitlab_with(&external(), &[]);
+        assert_eq!(out.status, Status::Ok, "{}", out.detail);
+        let host_bin = root.join("host-bin");
+        std::fs::create_dir_all(&host_bin).unwrap();
+        std::fs::write(host_bin.join("gitlab-runner"), "").unwrap();
+        let out = gitlab_with(&external(), &[host_bin.to_str().unwrap()]);
+        assert_eq!(out.status, Status::Fail);
+        let because = format!(
+            "required because this host runs gitlab-runner at {}",
+            host_bin.join("gitlab-runner").display()
+        );
+        assert!(out.detail.contains(&because), "{}", out.detail);
+        let out = gitlab_with(&with(&link), &[]);
+        assert_eq!(out.status, Status::Fail);
+        assert!(
+            out.detail.contains(
+                "no gitlab-runner (jobs would transfer no artifacts, caches or dotenv \
+                           reports), required because vk node manages a gitlab-runner here"
+            ),
+            "{}",
+            out.detail
+        );
         let fails = |why: &str, needle: &str| {
             let out = gitlab(&with(&link));
             assert_eq!(out.status, Status::Fail, "{why}");

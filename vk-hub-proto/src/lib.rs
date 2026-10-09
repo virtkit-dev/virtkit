@@ -150,10 +150,10 @@ pub const TOOLS: u32 = 4;
 /// takes: a Dockerfile and the few files it copies, not the tools themselves.
 pub const MAX_TOOLS_DEFINITION: u64 = 64 << 20;
 
-/// The tools a tools definition must provide: without `gitlab-runner` a job transfers no
-/// artifacts, caches or dotenv reports, and without `git` a job whose image has none clones
-/// nothing.
-pub const REQUIRED_TOOLS: [&str; 2] = ["git", "gitlab-runner"];
+/// Tools definitions must provide `git` for cloning when the job image lacks it.
+/// Hub jobs need no `gitlab-runner`: `vk-agent` archives and extracts caches and
+/// artifacts, and the node transfers them.
+pub const REQUIRED_TOOLS: [&str; 1] = ["git"];
 
 /// The largest message either side accepts, as a WebSocket message or an enrollment body.
 /// An inventory is a few kilobytes; this bounds what a confused or hostile peer can make the

@@ -65,6 +65,8 @@
 //!   VIRTKIT_TOOLS        tag:mountpoint — mount this virtio-fs share (read-only)
 //!                        and link the CI tools it carries (git/git-lfs/…) onto
 //!                        the PATH, skipping any the image already provides
+//!   VIRTKIT_NO_RUNNER=1  suppress missing-gitlab-runner reports and logs: the host
+//!                        transfers this job's artifacts and caches
 //!   VIRTKIT_TMPFS        /path:size[,/path:size] RAM scratch dirs (e.g. CI /builds)
 //!   VIRTKIT_ATOP         tag:mountpoint:interval_secs — mount this virtio-fs share
 //!                        read-write and fork the guest statistics sampler on it: one
@@ -1953,7 +1955,8 @@ fn apply_symlinks(cmdline: &HashMap<String, String>) {
 /// host keeps the binaries; nothing is copied into the guest or baked into a bundle.
 ///
 /// A job left without gitlab-runner, by the share and the image alike, is recorded for
-/// `vk-agent tools` (the `tools` module) with the share's reason.
+/// `vk-agent tools` (the `tools` module) with the share's reason, unless it needs none
+/// (`VIRTKIT_NO_RUNNER=1`).
 fn link_ci_tools(cmdline: &HashMap<String, String>) {
     let Some(spec) = cmdline.get("VIRTKIT_TOOLS") else {
         return;
@@ -1965,7 +1968,8 @@ fn link_ci_tools(cmdline: &HashMap<String, String>) {
     // Before linking, which would put the share's own gitlab-runner on PATH.
     let image_has_runner = which_runnable("gitlab-runner");
     let scan = link_ci_tools_from(tag, mnt, image_has_runner);
-    let Some(why) = crate::tools::problem(&scan, image_has_runner) else {
+    let problem = crate::tools::problem(&scan, image_has_runner).filter(|_| needs_runner(cmdline));
+    let Some(why) = problem else {
         if let Err(why) = &scan {
             warn!("vk-agent init: CI tools {tag} at {mnt}: {why}");
         }
@@ -1973,6 +1977,12 @@ fn link_ci_tools(cmdline: &HashMap<String, String>) {
     };
     warn!("vk-agent init: CI tools {tag} at {mnt}: this job has no gitlab-runner: {why}");
     crate::tools::record(&why);
+}
+
+/// Jobs need gitlab-runner for artifact and cache transfers unless marked as a hub job
+/// by `VIRTKIT_NO_RUNNER=1`.
+fn needs_runner(cmdline: &HashMap<String, String>) -> bool {
+    cmdline.get("VIRTKIT_NO_RUNNER").map(String::as_str) != Some("1")
 }
 
 /// Mount the share `tag` at `mnt` and link its tools onto PATH; `Err` when it cannot be
@@ -3412,6 +3422,15 @@ fn cstr(s: &str) -> CString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_job_a_hub_placed_needs_no_gitlab_runner() {
+        let with = |v: &str| HashMap::from([("VIRTKIT_NO_RUNNER".to_owned(), v.to_owned())]);
+        assert!(needs_runner(&HashMap::new()));
+        assert!(needs_runner(&with("0")));
+        assert!(needs_runner(&with("")));
+        assert!(!needs_runner(&with("1")));
+    }
 
     #[test]
     fn lan_hosts_replace_last_boots_and_skip_bad_entries() {

@@ -545,7 +545,7 @@ enum NodesCmd {
     /// Ask the node to build a tools definition and make the tools current
     ///
     /// The node builds it with `vk build` in microVMs, apart from its build cache, checks
-    /// that the `tools` stage holds git and gitlab-runner, and switches
+    /// that the `tools` stage holds a static git, and switches
     /// `<state_dir>/tools/current` to them: jobs that start from then on get them, running
     /// ones keep theirs. Nothing drains. Needs protocol version 4 on the node.
     Tools {

@@ -71,15 +71,18 @@ job rather than booting a guest that cannot nest.
 
 `[executor] tools_dir` names a host directory of static tools — `git`, `git-remote-http(s)`,
 `git-lfs`, `gitlab-runner` — shared read-only into every job VM; the guest links each one its image
-lacks onto its PATH. `vk check --feature gitlab` fails without a `gitlab-runner` there: without one
-a job transfers no artifacts, caches or dotenv reports. The directory is resolved at each job's
-start, so pointing a link at a new one changes the tools of the jobs that start after it.
+lacks onto its PATH. On a host that runs a gitlab-runner of its own — one `vk node` manages, or one
+on systemd's `PATH` — `vk check --feature gitlab` fails without a `gitlab-runner` there: that
+runner's jobs transfer no artifacts, caches or dotenv reports without one. Jobs a hub places need
+only `git`. The directory is resolved at each job's start, so pointing a link at a new one changes
+the tools of the jobs that start after it.
 
 On a fleet node the hub can provision it: `vk-hub tools add` holds a build context whose `tools`
-stage holds the tools, and `vk-hub nodes tools` has nodes build it and install the result as
-`<state_dir>/tools/current` ([CI tools](fleet-prototype.md#ci-tools)). Once the node's first
-build is done, as `vk-hub nodes` shows, point the executor there; before that the link does not
-exist, and jobs given it fail to boot:
+stage holds the tools — a definition need only provide `git` — and `vk-hub nodes tools` has nodes
+build it and install the result as `<state_dir>/tools/current`
+([CI tools](fleet-prototype.md#ci-tools)). Once the node's first build is done, as `vk-hub nodes`
+shows, point the executor there; before that the link does not exist, and jobs given it fail to
+boot:
 
 ```toml
 [executor]

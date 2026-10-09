@@ -670,15 +670,17 @@ Its microVMs belong to the child: neither the node's VM list nor its admission l
 them, so they run alongside jobs without reserved resources. Stopping the node ends the
 build; the next `vk node run` restarts it from the beginning.
 
-The stage's root is read out of the exported ext4 in-process, with no `debugfs`: each regular
-file, `0755`, and each symlink naming a regular file beside it (`git-remote-https` →
-`git-remote-http`); a directory such as `lost+found` is left out, and any other link refuses the
-build. `git` and `gitlab-runner` must be there, each an x86-64 ELF executable with no program
-interpreter: statically linked, since a job's image may lack the libc a dynamic one wants. The
-tools are run on the host — `--version`, an empty environment, ten seconds, the first line kept —
-only on a node that takes unsigned releases (no `[node] release_keys`, or `require_signed =
-false`), whose hub can run anything there already; a node that requires signed releases runs them
-nowhere but in job VMs, and reports no versions.
+The stage's root is read out of the exported ext4 in-process, with no `debugfs`: each regular file,
+`0755`, and each symlink naming a regular file beside it (`git-remote-https` → `git-remote-http`); a
+directory such as `lost+found` is left out, and any other link refuses the build. `git` must be
+there, an x86-64 ELF executable with no program interpreter: statically linked, since a job's image
+may lack the libc a dynamic one wants. `gitlab-runner` need not be: the jobs a hub places archive
+and extract caches and artifacts in `vk-agent` and have the node transfer them, so they run none. A
+node whose `vk node` manages a gitlab-runner (`[node] runner = "managed"`) still needs one in its
+definition, or `vk check --feature gitlab` fails. The tools are run on the host — `--version`, an
+empty environment, ten seconds, the first line kept — only on a node that takes unsigned releases
+(no `[node] release_keys`, or `require_signed = false`), whose hub can run anything there already; a
+node that requires signed releases runs them nowhere but in job VMs, and reports no versions.
 
 The tools are installed as `<state_dir>/tools/<sha256>/`, `0755` with their files `0755`, with
 `<sha256>.json` beside it naming the label and versions, and `<state_dir>/tools/current` is
@@ -709,11 +711,11 @@ and whether `[executor] tools_dir` names them. `vk-hub nodes` notes both under i
 page shows them under Versions and Steering, `/operations` lists the definitions held, and the
 audit log has each phase as the node reports it.
 
-Whoever registers a definition can put any binary into every job VM of the nodes that build it:
-a job's PATH gets each tool its image lacks, and gitlab-runner handles the job's artifacts,
-caches and token. Registering and issuing tools is the admin socket's alone — the hub's user or
-root, audited as `uid <n>` — not the web UI's. The definition itself is code each node builds in
-microVMs, with network, as any `vk build` is.
+Whoever registers a definition can put any binary into every job VM of the nodes that build it: a
+job's PATH gets each tool its image lacks, and in the jobs of a gitlab-runner the node manages, the
+definition's gitlab-runner handles the artifacts, caches and token. Registering and issuing tools is
+the admin socket's alone — the hub's user or root, audited as `uid <n>` — not the web UI's. The
+definition itself is code each node builds in microVMs, with network, as any `vk build` is.
 
 Not built: rolling tools out by wave and canary, as [rollouts](#rollouts) do releases; pinning a
 definition with a signature the node checks, as releases are; and running the version probe in a

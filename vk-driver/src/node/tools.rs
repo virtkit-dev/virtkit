@@ -1142,13 +1142,9 @@ mod tests {
             failed.message
         );
         stage_source(&dir, &elf(false));
-        std::fs::remove_file(dir.join("stage-src/gitlab-runner")).unwrap();
+        std::fs::remove_file(dir.join("stage-src/git")).unwrap();
         let failed = install_as(&dir, &c, fake_build).await.unwrap_err();
-        assert!(
-            failed.message.contains("has no gitlab-runner"),
-            "{}",
-            failed.message
-        );
+        assert!(failed.message.contains("has no git"), "{}", failed.message);
         // A link out of the stage is refused, not followed.
         stage_source(&dir, &elf(false));
         std::os::unix::fs::symlink("/etc/passwd", dir.join("stage-src/passwd")).unwrap();
@@ -1161,6 +1157,10 @@ mod tests {
 
         assert_eq!(current(&root).as_deref(), Some(a.as_str()));
         assert!(!root.join(&b).exists() && !root.join(&c).exists());
+        // gitlab-runner is optional: jobs a hub places run none.
+        stage_source(&dir, &elf(false));
+        std::fs::remove_file(dir.join("stage-src/gitlab-runner")).unwrap();
+        install_as(&dir, &c, fake_build).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

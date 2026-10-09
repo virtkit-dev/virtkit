@@ -1285,7 +1285,7 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
             gid_map: Vec::new(),
             cache: crate::vmm::ShareCache::Auto,
         });
-        cmdline.push_str(" VIRTKIT_TOOLS=vktools:/run/virtkit-tools");
+        cmdline.push_str(tools_cmdline(ctx));
     }
 
     // [executor] host_checkout: the sources checked out on the host in prepare, shared
@@ -1776,11 +1776,11 @@ async fn probe_guest_shell(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
 /// caches or dotenv reports and the job still passes, so the warning explains the loss.
 /// The guest decides because only it knows whether the image provides gitlab-runner.
 /// Best-effort: an agent that cannot answer delays prepare by at most 5 s, never failing
-/// the job.
+/// the job. A job a hub placed is not asked: the node transfers its artifacts and caches.
 async fn report_tools_share(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
-    let Some(dir) = &ctx.cfg.executor.tools_dir else {
+    if ctx.cfg.executor.tools_dir.is_none() || ctx.hub_placed {
         return;
-    };
+    }
     let (out, sink) = crate::executor::stdout_capture();
     let asked = tokio::time::timeout(
         Duration::from_secs(5),
@@ -1803,9 +1803,19 @@ async fn report_tools_share(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
     if crate::executor::capture_overran(&out) {
         return;
     }
-    let Some(why) = tools_problem(&out) else {
-        return;
-    };
+    if let Some(warning) = tools_warning(ctx, &out) {
+        eprintln!("{warning}");
+    }
+}
+
+/// The job trace's warning for what the guest said, `out`, about its tools share: `None`
+/// when the job has a gitlab-runner or needs none.
+fn tools_warning(ctx: &JobCtx, out: &[u8]) -> Option<String> {
+    let dir = ctx.cfg.executor.tools_dir.as_ref()?;
+    if ctx.hub_placed {
+        return None;
+    }
+    let why = tools_problem(out)?;
     // The tree this job booted with, not what a link repointed since names now.
     let shown = match std::fs::read(ctx.tools_root_file()) {
         Ok(root) if !root.is_empty() && root != dir.as_os_str().as_bytes() => format!(
@@ -1815,10 +1825,20 @@ async fn report_tools_share(ctx: &JobCtx, addr: &vk_core::addr::SocketAddr) {
         ),
         _ => dir.display().to_string(),
     };
-    eprintln!(
+    Some(format!(
         "virtkit: warning: this job has no gitlab-runner, so artifacts, caches and dotenv \
          reports will not be transferred ([executor] tools_dir {shown}: {why})"
-    );
+    ))
+}
+
+/// Kernel arguments for the CI tools mount. Hub jobs need no gitlab-runner because the
+/// node transfers their artifacts and caches.
+fn tools_cmdline(ctx: &JobCtx) -> &'static str {
+    if ctx.hub_placed {
+        " VIRTKIT_TOOLS=vktools:/run/virtkit-tools VIRTKIT_NO_RUNNER=1"
+    } else {
+        " VIRTKIT_TOOLS=vktools:/run/virtkit-tools"
+    }
 }
 
 /// Format the guest-written `vk-agent tools` diagnostic as one job-trace line. Replace
@@ -3805,6 +3825,45 @@ mod tests {
         assert_eq!(tools_problem(b"bad \xff utf-8\n"), None);
         let long = "x".repeat(1000);
         assert_eq!(tools_problem(long.as_bytes()).unwrap().len(), 200);
+    }
+
+    /// A job of the host's own runner left without gitlab-runner is warned about, and has its
+    /// guest report it; a job a hub placed needs none, and neither happens.
+    #[test]
+    fn only_a_job_of_the_hosts_runner_is_warned_it_has_no_gitlab_runner() {
+        let dir = std::env::temp_dir().join(format!("vk-tools-warning-{}", std::process::id()));
+        let cfg = || Config {
+            state_dir: Some(dir.clone()),
+            executor: crate::config::Executor {
+                tools_dir: Some(dir.join("tools")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let job = |placed: bool| {
+            let mut env = vec![("CUSTOM_ENV_CI_JOB_ID".to_string(), "7".to_string())];
+            if placed {
+                env.push((
+                    crate::jobctx::JOB_SERVER_URL.to_string(),
+                    "https://gitlab.example.com/".to_string(),
+                ));
+            }
+            JobCtx::for_env(cfg(), &env).unwrap()
+        };
+        let said = b"the share has no gitlab-runner\n";
+        let own = job(false);
+        assert!(!own.hub_placed);
+        assert!(
+            tools_warning(&own, said).is_some_and(|w| w.contains("has no gitlab-runner")),
+            "{:?}",
+            tools_warning(&own, said)
+        );
+        assert!(!tools_cmdline(&own).contains("VIRTKIT_NO_RUNNER"));
+        let placed = job(true);
+        assert!(placed.hub_placed);
+        assert_eq!(tools_warning(&placed, said), None);
+        assert!(tools_cmdline(&placed).contains(" VIRTKIT_NO_RUNNER=1"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Unset parses to no explicit policy, so the default applies where the share is built.

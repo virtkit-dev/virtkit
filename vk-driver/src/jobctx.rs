@@ -80,6 +80,9 @@ pub struct JobCtx {
     /// job data and the driver-supplied [`JOB_SERVER_URL`]. The host's gitlab-runner jobs
     /// get no link: jobs can override `CI_SERVER_URL` and `CI_JOB_URL`.
     job_url: Option<String>,
+    /// Whether a hub placed the job: its driver names the GitLab ([`JOB_SERVER_URL`]). The
+    /// node transfers such a job's artifacts and caches, so it needs no gitlab-runner.
+    pub hub_placed: bool,
 }
 
 /// The GitLab URL the runner took the job from, passed by a placed job's driver to its
@@ -152,8 +155,10 @@ impl JobCtx {
             .or_else(|| env("CUSTOM_ENV_CI_JOB_IMAGE"))
             .filter(|s| !s.is_empty());
         let job_var = |name: &str| env(&format!("CUSTOM_ENV_{name}")).filter(|s| !s.is_empty());
+        let server = env(JOB_SERVER_URL).filter(|s| !s.is_empty());
+        let hub_placed = server.is_some();
         let job_url = response.as_ref().and_then(|r| {
-            let server = env(JOB_SERVER_URL).filter(|s| !s.is_empty())?;
+            let server = server?;
             vk_hub_proto::gitlab_job_url(&server, &r.job_info.project_full_path, &r.id.to_string())
         });
         Ok(JobCtx {
@@ -208,6 +213,7 @@ impl JobCtx {
                 None => job_var("CI_PROJECT_PATH"),
             },
             job_url,
+            hub_placed,
         })
     }
 
@@ -899,6 +905,7 @@ mod tests {
             project_id: Some("42".into()),
             project_path: None,
             job_url: None,
+            hub_placed: false,
         }
     }
 
