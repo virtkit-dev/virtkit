@@ -1012,7 +1012,10 @@ impl Config {
     /// How long a materialized image base may sit idle (no live overlay) before the
     /// cache GC evicts it. Default 30 min.
     pub fn image_cache_idle(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.image_cache_idle_secs.unwrap_or(1800))
+        std::time::Duration::from_secs(
+            self.image_cache_idle_secs
+                .unwrap_or(vk_hub_proto::DEFAULT_IMAGE_CACHE_IDLE_SECS),
+        )
     }
 
     /// How long an unused GitLab host checkout stays cached. By default checkouts and

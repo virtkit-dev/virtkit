@@ -209,9 +209,10 @@ system unit when run as root), preserving enrollment.
 `vk-hub serve [--config hub.toml]` serves nodes. `hub.toml` sets `addr` (default
 `127.0.0.1:8443`), `tls_cert` and `tls_key`, `data_dir` (default `$XDG_DATA_HOME/virtkit/hub`,
 else `~/.local/share/virtkit/hub`), `release_repository` (see [Releases](#releases)), and the
-web UI's keys (see [Web UI](#web-ui)), and `job_lost_after_secs`, `job_history` and
-`kept_failure_output` (see [Placed jobs](#placed-jobs)). Every key is optional and an unknown
-one is an error. Without TLS the hub serves only on loopback. TLS is 1.3 only, on both the hub
+web UI's keys (see [Web UI](#web-ui)), and `job_lost_after_secs`, `job_history`,
+`kept_failure_output` and `image_affinity_max_load` (see [Placed jobs](#placed-jobs)). Every
+key is optional and an unknown one is an error. Without TLS the hub serves only on loopback.
+TLS is 1.3 only, on both the hub
 and the node. `vk-hub token`, `vk-hub nodes`, `vk-hub release`, `vk-hub tools`,
 `vk-hub workloads`, `vk-hub audit`, `vk-hub ui`, `vk-hub keys` and `vk-hub jobs` reach the
 running hub through `<data_dir>/admin.sock`, open to the hub's user and root.
@@ -817,7 +818,8 @@ stopped, refuses offers and starts without a reservation; so does, as `ceiling`,
 placed jobs not finished and reservations held reach the hub's ceiling, as the node last
 applied it, and as `concurrency` one whose same count reaches its own
 `[executor.schedule] max_concurrency` when that is the smaller. The node reports that limit as
-`placed.limit`. A quarantined node releases every reservation. Reservations live in memory: a
+`placed.limit`, and its `image_cache_idle_secs` as `placed.image_cache_idle_secs`. A
+quarantined node releases every reservation. Reservations live in memory: a
 restarted node holds none, and the hub releases what it thought held.
 
 **Starting a job.** Before answering `accepted`, the node journals the start under
@@ -1057,6 +1059,22 @@ by what the hub put on it — takes new work last. Spreading keeps concurrent bu
 pulls and pushes they put on a shared registry, off any one host, and loses less with a node.
 Each node stays bounded by its memory, disk and cap as above; `fits` does not depend on this order.
 
+**Image affinity.** A job whose image, or a service's, its node builds from the job's checkout
+(`dockerfile:` or `compose:`) has an image key: its project path and those image references.
+The hub remembers, in memory, when each node last ran a job of each key — when it accepted it
+and when it finished — and counts the node as still holding the image for the node's
+`placed.image_cache_idle_secs` (30 minutes for a node that does not report it, a day at most).
+Such a job goes first to the first node, in the order above, that still holds its image, has
+room within every cap above, has not refused it, and is lightly loaded: its heartbeat's
+1-minute load average and the vCPUs of its placed work, each per CPU, below
+`image_affinity_max_load` in `hub.toml` (default `0.5`; `0` turns affinity off). A node that
+sends no load average is never preferred. A job submitted on a reservation whose node does not
+hold the image starts on such a node instead, without a reservation, and its reservation is
+released at once; on a refusal it is placed as any job without one. Busier nodes, or none
+holding the image, leave the order above unchanged. Reservations are offered before the job is
+known, so they follow the order above alone. The audit says `where its image is warm`, and
+names the reservation given back. A restarted hub has forgotten which node holds what.
+
 An offer unanswered after 5 seconds is abandoned, and released if the node accepts it later. When
 every node with room has refused, the hub pauses 2 seconds and asks again until the request's
 `wait_secs`, then answers 503 `no_capacity` with `retry_after_secs` 5. Leases are 1–600 seconds. A
@@ -1069,7 +1087,8 @@ transaction; the full spec stays in memory until a node accepts the job. The hub
 at most 4096 jobs not finished; past that a submission is answered 503 `unavailable` with
 `retry_after_secs` 5. A placement loop, woken by every change and every second, sends each
 queued job to its reservation's node while that reservation holds, else to the least loaded
-node. A refused start sends the job elsewhere, gives a reservation it named back, and asks
+node — but for [image affinity](#placed-jobs), which may move it off its reservation. A
+refused start sends the job elsewhere, gives a reservation it named back, and asks
 a node that refused again only after 2 seconds; a start whose answer is lost with its session
 waits for the node's `held`, which either names the job — accepted — or not, when the job is
 placed again. A queued job is ended `no_capacity` when it cannot be placed by its

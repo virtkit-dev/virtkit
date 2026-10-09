@@ -17,6 +17,17 @@
 //! what the hub has asked of it since: reservations accepted after that heartbeat, offers
 //! and starts not yet answered. Offers and starts go to the least loaded node first ([`load`]),
 //! then the roomiest, then by ID.
+//!
+//! **Image affinity.** A job whose image a node builds from the job's checkout (`dockerfile:`
+//! or `compose:`, as its own image or a service's) goes first to a node that ran a job of the
+//! same project with the same such images within that node's image idle window, while that
+//! node is lightly loaded: its 1-minute load average, and the vCPUs of its placed work, each
+//! per CPU below [`Dispatch::affinity_max_load`]. Such a node has the image built and boots
+//! the job in seconds where another spends a minute or two building it. A job submitted on a
+//! reservation on a node without the image starts on the warm node instead, without its
+//! reservation, which is released. Busier, the job goes least loaded first as above; a node
+//! that sends no load average is never preferred. What each node ran is kept in memory only.
+//!
 //! A node takes placed work only below its cap ([`placed_cap`]): the operator's ceiling or its
 //! own executor limit, whichever is smaller, counted by [`placed`]. The node refuses past
 //! either too ([`Refusal::Ceiling`], [`Refusal::Concurrency`]), should the hub's count fall
@@ -107,6 +118,20 @@ const DEFAULT_OUTPUT_LIMIT: u64 = 4 << 20;
 /// (`kept_failure_output` in `hub.toml`).
 pub const DEFAULT_KEPT_FAILURE_OUTPUT: u64 = 256 * 1024;
 
+/// How long a node keeps an image no job uses, when it does not say: `vk`'s default
+/// `image_cache_idle_secs`.
+const DEFAULT_IMAGE_IDLE_SECS: u64 = vk_hub_proto::DEFAULT_IMAGE_CACHE_IDLE_SECS;
+
+/// The longest a node is counted as holding a job's image after the job, whatever it says.
+const MAX_IMAGE_IDLE_SECS: u64 = 86_400;
+
+/// The most image keys the hub remembers nodes for; the least recently used goes.
+const MAX_IMAGE_KEYS: usize = 4096;
+
+/// The CPU load under which a node holding a job's image is preferred, in millionths per
+/// CPU, by default (`image_affinity_max_load` in `hub.toml`): 0.5.
+pub const DEFAULT_AFFINITY_MAX_LOAD: u64 = 500_000;
+
 /// How often the job history is trimmed to its count and outputs past their keep are dropped.
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
 
@@ -124,6 +149,9 @@ pub struct Dispatch {
     /// How many bytes from the end of a failed job's output are kept when it is settled; 0
     /// keeps none.
     pub kept_failure_output: u64,
+    /// The CPU load, in millionths per CPU, under which a node holding a job's image is
+    /// preferred ([`DEFAULT_AFFINITY_MAX_LOAD`]); 0 turns image affinity off.
+    pub affinity_max_load: u64,
 }
 
 #[derive(Default)]
@@ -154,6 +182,9 @@ struct State {
     /// Requests being served, by `<key>/<request_id>`, so a retry racing its first attempt
     /// is told to wait rather than served twice.
     inflight: HashSet<String>,
+    /// When each node last ran a job of each image key ([`image_key`]), on the hub's clock in
+    /// seconds; at most [`MAX_IMAGE_KEYS`] keys.
+    warm: HashMap<String, HashMap<String, u64>>,
 }
 
 /// A node's version-3 session.
@@ -204,6 +235,8 @@ struct LiveJob {
     /// When the node accepted the reservation it was sent on, as [`Resv::accepted_at`]: until
     /// a heartbeat from after that, its start is counted against the node's room.
     reservation_accepted_at: u64,
+    /// Its [`image_key`], from its spec; `None` for a job recovered after a restart.
+    image_key: Option<String>,
 }
 
 impl LiveJob {
@@ -229,6 +262,7 @@ impl Dispatch {
             lost_after,
             history,
             kept_failure_output: DEFAULT_KEPT_FAILURE_OUTPUT,
+            affinity_max_load: DEFAULT_AFFINITY_MAX_LOAD,
             state: Mutex::new(State {
                 capacity_revision: crate::now_secs().saturating_mul(1000),
                 ..State::default()
@@ -410,6 +444,12 @@ fn finish(
         && let Some(r) = state.reservations.remove(&reservation)
     {
         send(state, &r.node, HubJobMsg::Release { reservation });
+    }
+    // Its node used its image until now.
+    if job.row.started_at.is_some()
+        && let (Some(key), Some(node)) = (job.image_key.take(), job.row.node.as_deref())
+    {
+        warm_touch(state, key, node, crate::now_secs());
     }
     let row = &mut job.row;
     row.state = JobState::Finished;
@@ -838,6 +878,10 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
         let Some(job) = state.jobs.get_mut(id).filter(|j| j.node() == Some(node)) else {
             return Ok(Vec::new());
         };
+        // Its node has its image, or is building it.
+        let warmed = matches!(run, RunState::Accepted | RunState::Running { .. })
+            .then(|| job.image_key.clone())
+            .flatten();
         let row = &mut job.row;
         let mut events = Vec::new();
         match run {
@@ -887,7 +931,11 @@ async fn on_job_state(hub: &Hub, node: &str, id: &str, run: RunState) -> Result<
             RunState::Finished => return Ok(Vec::new()),
         }
         row.revision = row.revision.saturating_add(1);
-        (row.clone(), events)
+        let write = (row.clone(), events);
+        if let Some(key) = warmed {
+            warm_touch(&mut state, key, node, crate::now_secs());
+        }
+        write
     };
     persist(hub, id, write.0, write.1).await?;
     Ok(answers)
@@ -1281,6 +1329,98 @@ fn least_loaded_first(mut found: Vec<(String, u64, u64)>) -> Vec<(String, u64)> 
     found.into_iter().map(|(id, room, _)| (id, room)).collect()
 }
 
+/// Placement key: the GitLab, project and checkout-built job and service image references
+/// (`dockerfile:`, `compose:`). Used to prefer a node that last built those images;
+/// `None` when all images are pulled.
+fn image_key(spec: &JobSpec) -> Option<String> {
+    let JobSpec::GitlabCi(ci) = spec;
+    let built: Vec<&str> = std::iter::once(&ci.image)
+        .chain(&ci.services)
+        .map(|i| i.name.as_str())
+        .filter(|n| n.starts_with("dockerfile:") || n.starts_with("compose:"))
+        .collect();
+    if built.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}\n{}\n{}",
+        ci.server_url,
+        ci.job.project_path,
+        built.join("\n")
+    ))
+}
+
+/// Note that `node` used image `key` at `now`, forgetting the least recently used key past
+/// [`MAX_IMAGE_KEYS`] and, under this key, nodes past [`MAX_IMAGE_IDLE_SECS`].
+fn warm_touch(state: &mut State, key: String, node: &str, now: u64) {
+    let nodes = state.warm.entry(key).or_default();
+    nodes.retain(|_, at| now.saturating_sub(*at) < MAX_IMAGE_IDLE_SECS);
+    nodes.insert(node.to_string(), now);
+    if state.warm.len() > MAX_IMAGE_KEYS
+        && let Some(oldest) = (state.warm.iter())
+            .min_by_key(|(_, nodes)| nodes.values().max().copied().unwrap_or(0))
+            .map(|(k, _)| k.clone())
+    {
+        state.warm.remove(&oldest);
+    }
+}
+
+/// Whether a node that used an image at `used_at` still holds it at `now`, by its idle window
+/// `idle_secs`.
+fn still_warm(used_at: u64, idle_secs: u64, now: u64) -> bool {
+    now.saturating_sub(used_at) < idle_secs.min(MAX_IMAGE_IDLE_SECS)
+}
+
+/// A node's CPU pressure in millionths, for image affinity: the larger of its 1-minute load
+/// average and the vCPUs of its placed work, each per CPU. `None` without a load average or a
+/// CPU count: such a node is not known to be lightly loaded.
+fn cpu_pressure(placed_cpus: u64, cpus: u32, load1_hundredths: Option<u32>) -> Option<u64> {
+    let load1 = load1_hundredths?;
+    (cpus > 0).then(|| load(0, 0, placed_cpus, cpus, Some(load1)))
+}
+
+/// The nodes that still hold image `key`, by [`still_warm`] and their own idle window, each
+/// with whether its [`cpu_pressure`] is below `max_load`.
+fn warm_nodes(
+    state: &State,
+    nodes: &[(String, NodeRow)],
+    key: &str,
+    max_load: u64,
+    now: u64,
+) -> HashMap<String, bool> {
+    let Some(used) = state.warm.get(key) else {
+        return HashMap::new();
+    };
+    nodes
+        .iter()
+        .filter_map(|(id, row)| {
+            let at = *used.get(id)?;
+            let idle = (row.report.as_ref())
+                .and_then(|r| r.placed.as_ref())
+                .and_then(|p| p.image_cache_idle_secs)
+                .unwrap_or(DEFAULT_IMAGE_IDLE_SECS);
+            if !still_warm(at, idle, now) {
+                return None;
+            }
+            let pressure = cpu_pressure(
+                tallies(state).get(id.as_str()).map_or(0, |t| t.cpus),
+                row.inventory.as_ref().map_or(0, |i| i.hardware.cpus),
+                row.heartbeat.as_ref().and_then(|h| h.load1_hundredths),
+            );
+            Some((id.clone(), pressure.is_some_and(|p| p < max_load)))
+        })
+        .collect()
+}
+
+/// `found`, as [`candidates`] orders them, with the first node of `light` moved to the front.
+fn warm_first(mut found: Vec<(String, u64)>, light: &HashSet<String>) -> Vec<(String, u64)> {
+    if let Some(at) = found.iter().position(|(id, _)| light.contains(id)) {
+        let warm = found.remove(at);
+        found.insert(0, warm);
+    }
+    found
+}
+
 /// `POST /v1/capacity`'s answer for `placement`: the envelopes its nodes have room for, and
 /// its revision, which moves when that does.
 pub async fn capacity(hub: &Hub, placement: &Placement) -> Result<Capacity> {
@@ -1606,6 +1746,7 @@ pub fn admit(
     } else {
         limit
     };
+    let image_key = image_key(&spec);
     let mut state = hub.dispatch.lock();
     let reservation = reservation.filter(|r| {
         state
@@ -1624,6 +1765,7 @@ pub fn admit(
             round_ended: None,
             output_cap: limit.saturating_add(OUTPUT_SLACK).min(MAX_OUTPUT),
             reservation_accepted_at: 0,
+            image_key,
         },
     );
     drop(state);
@@ -1868,6 +2010,7 @@ pub async fn recover(hub: &Hub) -> Result<()> {
                     // limit's worth past it.
                     output_cap: limit.saturating_add(DEFAULT_OUTPUT_LIMIT).min(MAX_OUTPUT),
                     reservation_accepted_at: 0,
+                    image_key: None,
                 },
             );
             continue;
@@ -1884,6 +2027,7 @@ pub async fn recover(hub: &Hub) -> Result<()> {
                 round_ended: None,
                 output_cap: 0,
                 reservation_accepted_at: 0,
+                image_key: None,
             },
         );
         if let Some((row, events)) = finish(
@@ -2079,7 +2223,9 @@ async fn step(hub: &Hub) -> Result<()> {
 }
 
 /// Send queued job `id` to its reservation's node while the reservation holds, else the
-/// least loaded node that has not refused it ([`candidates`]). Return the row to write if sent.
+/// least loaded candidate that has not refused it ([`candidates`]). Prefer a lightly loaded
+/// candidate holding its image unless the reservation's node also holds it ([`warm_nodes`]).
+/// Return the row to write if sent.
 fn place(
     hub: &Hub,
     state: &mut State,
@@ -2089,12 +2235,33 @@ fn place(
 ) -> Option<(String, JobRow, Vec<Event>)> {
     let job = state.jobs.get(id)?;
     let spec = job.spec.clone()?;
+    let placement = job.row.placement.clone();
+    let mut tried = job.tried.clone();
+    let warm = match (&job.image_key, hub.dispatch.affinity_max_load) {
+        (Some(key), max_load @ 1..) => warm_nodes(state, nodes, key, max_load, crate::now_secs()),
+        _ => HashMap::new(),
+    };
+    let light: HashSet<String> = (warm.iter())
+        .filter(|(_, light)| **light)
+        .map(|(id, _)| id.clone())
+        .collect();
     let reserved = job.reservation.as_ref().and_then(|r| {
         let x = state.reservations.get(r)?;
         let ok = matches!(x.phase, ResvPhase::Held { .. })
             && state.links.get(&x.node).is_some_and(|l| l.held);
         ok.then(|| (r.clone(), x.node.clone(), x.envelope, x.accepted_at))
     });
+    // A reservation on a node without the image gives way to a lightly loaded node with it.
+    let given_up = reserved
+        .as_ref()
+        .filter(|(_, node, _, _)| {
+            !warm.contains_key(node)
+                && !light.is_empty()
+                && (candidates(hub, state, nodes, &placement, &tried).iter())
+                    .any(|(id, _)| light.contains(id))
+        })
+        .map(|(r, _, _, _)| r.clone());
+    let reserved = reserved.filter(|_| given_up.is_none());
     let mut accepted_at = 0;
     let (node, reservation, envelope) = match reserved {
         Some((r, node, envelope, at)) => {
@@ -2102,8 +2269,6 @@ fn place(
             (node, Some(r), envelope)
         }
         None => {
-            let placement = job.row.placement.clone();
-            let mut tried = job.tried.clone();
             let mut found = candidates(hub, state, nodes, &placement, &tried);
             if found.is_empty() && !tried.is_empty() {
                 // Every node with room refused it: after a pause, ask them all again.
@@ -2117,7 +2282,7 @@ fn place(
                 tried.clear();
                 found = candidates(hub, state, nodes, &placement, &tried);
             }
-            let (node, _) = found.into_iter().next()?;
+            let (node, _) = warm_first(found, &light).into_iter().next()?;
             (node, None, placement.envelope)
         }
     };
@@ -2141,14 +2306,30 @@ fn place(
     job.row.state = JobState::Starting;
     job.row.node = Some(node.clone());
     job.row.revision = job.row.revision.saturating_add(1);
-    let how = match &reservation {
+    let row = job.row.clone();
+    let mut how = match &reservation {
         Some(r) => format!("on reservation {r}"),
         None => "without a reservation".to_string(),
     };
+    if light.contains(&node) {
+        how.push_str(", where its image is warm");
+    }
+    if let Some(r) = given_up
+        && let Some(x) = state.reservations.remove(&r)
+    {
+        send(
+            state,
+            &x.node,
+            HubJobMsg::Release {
+                reservation: r.clone(),
+            },
+        );
+        how.push_str(&format!(", giving back reservation {r} on node {}", x.node));
+    }
     let event = format!("hub sent job {id} to node {node} {how}");
     Some((
         id.to_string(),
-        job.row.clone(),
+        row,
         vec![(Some(node), HUB.to_string(), event)],
     ))
 }
@@ -2788,6 +2969,146 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
         assert_eq!(order, ["d", "a", "b", "c", "e"]);
+    }
+
+    /// A node of 8 CPUs reporting `load1_hundredths`, and how long it keeps idle images.
+    fn node_row(load1_hundredths: Option<u32>, idle_secs: Option<u64>) -> NodeRow {
+        NodeRow {
+            inventory: Some(vk_hub_proto::Inventory {
+                hardware: vk_hub_proto::Hardware {
+                    cpus: 8,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            heartbeat: Some(vk_hub_proto::Heartbeat {
+                load1_hundredths,
+                ..Default::default()
+            }),
+            report: Some(Report {
+                placed: Some(vk_hub_proto::PlacedIntake {
+                    image_cache_idle_secs: idle_secs,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// First node for image `key` among `found`, supplied least loaded first.
+    /// `warm` names the node that last ran it and how many seconds ago.
+    fn first(warm: (&str, u64), nodes: &[(String, NodeRow)], found: &[&str]) -> String {
+        const NOW: u64 = 1_000_000;
+        let mut state = State::default();
+        let (node, ago) = warm;
+        warm_touch(&mut state, "key".into(), node, NOW - ago);
+        let light: HashSet<String> = warm_nodes(&state, nodes, "key", 500_000, NOW)
+            .into_iter()
+            .filter_map(|(id, light)| light.then_some(id))
+            .collect();
+        let found = found.iter().map(|id| (id.to_string(), 1)).collect();
+        warm_first(found, &light).remove(0).0
+    }
+
+    #[test]
+    fn a_lightly_loaded_node_holding_the_image_goes_first() {
+        let nodes = |warm_load, idle| {
+            vec![
+                ("cold".to_string(), node_row(Some(0), None)),
+                ("warm".to_string(), node_row(warm_load, idle)),
+            ]
+        };
+        let found = ["cold", "warm"];
+        // A load of 2 on 8 CPUs, under half: the warm node, though the other is less loaded.
+        assert_eq!(first(("warm", 60), &nodes(Some(200), None), &found), "warm");
+        // Loaded to half its CPUs or past: least loaded first.
+        assert_eq!(first(("warm", 60), &nodes(Some(400), None), &found), "cold");
+        assert_eq!(
+            first(("warm", 60), &nodes(Some(1200), None), &found),
+            "cold"
+        );
+        // No load average: not known to be lightly loaded.
+        assert_eq!(first(("warm", 60), &nodes(None, None), &found), "cold");
+        // Past the node's idle window, 30 minutes when it does not say: it evicted the image.
+        assert_eq!(
+            first(("warm", 1800), &nodes(Some(200), None), &found),
+            "cold"
+        );
+        assert_eq!(
+            first(("warm", 1799), &nodes(Some(200), None), &found),
+            "warm"
+        );
+        assert_eq!(
+            first(("warm", 1800), &nodes(Some(200), Some(3600)), &found),
+            "warm"
+        );
+        assert_eq!(
+            first(("warm", 600), &nodes(Some(200), Some(300)), &found),
+            "cold"
+        );
+        // Not a candidate, for room or caps: never placed on.
+        assert_eq!(
+            first(("warm", 60), &nodes(Some(200), None), &["cold"]),
+            "cold"
+        );
+        // Already first, or no node holds it: unchanged.
+        assert_eq!(
+            first(("warm", 60), &nodes(Some(0), None), &["warm", "cold"]),
+            "warm"
+        );
+        assert_eq!(first(("gone", 60), &nodes(Some(200), None), &found), "cold");
+    }
+
+    #[test]
+    fn a_node_s_cpu_pressure_counts_its_placed_vcpus_and_load_average() {
+        assert_eq!(cpu_pressure(0, 8, Some(200)), Some(250_000));
+        assert_eq!(cpu_pressure(6, 8, Some(200)), Some(750_000));
+        assert_eq!(cpu_pressure(0, 8, None), None);
+        assert_eq!(cpu_pressure(0, 0, Some(0)), None);
+    }
+
+    #[test]
+    fn only_a_job_whose_image_its_node_builds_has_an_image_key() {
+        let on = |server: &str, project: &str, image: &str, services: &[&str]| {
+            let mut ci = vk_hub_proto::job::CiJob {
+                server_url: server.into(),
+                ..Default::default()
+            };
+            ci.job.project_path = project.into();
+            ci.image.name = image.into();
+            for s in services {
+                ci.services.push(vk_hub_proto::job::Image {
+                    name: s.to_string(),
+                    ..Default::default()
+                });
+            }
+            image_key(&JobSpec::GitlabCi(ci))
+        };
+        let job = |project: &str, image: &str, services: &[&str]| {
+            on("https://a.example", project, image, services)
+        };
+        assert_eq!(job("g/p", "alpine:3", &[]), None);
+        assert_eq!(job("g/p", "", &["postgres:16"]), None);
+        let built = job("g/p", "dockerfile:ci/Dockerfile", &["postgres:16"]);
+        assert_eq!(
+            built.as_deref(),
+            Some("https://a.example\ng/p\ndockerfile:ci/Dockerfile")
+        );
+        assert_ne!(built, job("g/q", "dockerfile:ci/Dockerfile", &[]));
+        // The same project path on another GitLab is another project.
+        assert_ne!(
+            built,
+            on("https://b.example", "g/p", "dockerfile:ci/Dockerfile", &[])
+        );
+        assert_eq!(
+            job("g/p", "alpine:3", &["dockerfile:db/Dockerfile"]).as_deref(),
+            Some("https://a.example\ng/p\ndockerfile:db/Dockerfile")
+        );
+        assert_eq!(
+            job("g/p", "compose:compose.yml#app", &[]).as_deref(),
+            Some("https://a.example\ng/p\ncompose:compose.yml#app")
+        );
     }
 
     /// Nodes of 25 and 22 envelopes take sequential work in turn.

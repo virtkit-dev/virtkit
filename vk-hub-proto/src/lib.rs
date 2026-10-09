@@ -890,6 +890,10 @@ pub struct PlacedIntake {
     pub image_cache_idle_secs: Option<u64>,
 }
 
+/// `vk`'s `image_cache_idle_secs` when its config sets none, and what a hub takes for a node
+/// that does not report it ([`PlacedIntake::image_cache_idle_secs`]).
+pub const DEFAULT_IMAGE_CACHE_IDLE_SECS: u64 = 1800;
+
 impl Report {
     pub fn applied_generation(&self) -> Option<u64> {
         self.applied.as_ref().map(|d| d.generation)

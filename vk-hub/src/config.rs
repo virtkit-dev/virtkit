@@ -19,6 +19,9 @@
 //! # How much of the end of a failed job's output is kept, with its record, once its producer
 //! # settles it; "0" keeps none.
 //! kept_failure_output = "256K"
+//! # A job whose image its node builds goes first to a node that still holds that image while
+//! # that node's CPU load, per CPU, is below this; "0" turns the preference off.
+//! image_affinity_max_load = 0.5
 //!
 //! # Sign-in to the web UI through an OIDC provider; off unless set.
 //! [oidc]
@@ -79,6 +82,9 @@ pub struct HubConfig {
     pub job_history: usize,
     /// How many bytes from the end of a failed job's output are kept once it is settled.
     pub kept_failure_output: u64,
+    /// The CPU load per CPU, in millionths, under which a node holding a job's image is
+    /// preferred; 0 turns the preference off.
+    pub image_affinity_max_load: u64,
 }
 
 /// The web UI's listener.
@@ -124,6 +130,7 @@ struct FileConfig {
     job_lost_after_secs: Option<u64>,
     job_history: Option<u64>,
     kept_failure_output: Option<String>,
+    image_affinity_max_load: Option<f64>,
     oidc: Option<FileOidc>,
 }
 
@@ -280,6 +287,11 @@ impl HubConfig {
                 _ => bail!("kept_failure_output {size:?}: expected a size from 0 to 4M"),
             },
         };
+        let image_affinity_max_load = match f.image_affinity_max_load {
+            None => crate::jobs::DEFAULT_AFFINITY_MAX_LOAD,
+            Some(load) if (0.0..=1.0).contains(&load) => (load * 1e6).round() as u64,
+            Some(load) => bail!("image_affinity_max_load {load}: expected 0 to 1"),
+        };
         Ok(HubConfig {
             addr,
             tls_cert: f.tls_cert,
@@ -290,6 +302,7 @@ impl HubConfig {
             job_lost_after,
             job_history,
             kept_failure_output,
+            image_affinity_max_load,
         })
     }
 
@@ -673,6 +686,27 @@ mod tests {
         ] {
             assert!(
                 kept(&format!("kept_failure_output = {bad}\n")).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_affinity_holds_below_a_load_of_0_to_1_per_cpu() {
+        let max = |extra: &str| {
+            parse(&format!("data_dir = \"/d\"\n{extra}")).map(|c| c.image_affinity_max_load)
+        };
+        assert_eq!(max("").unwrap(), crate::jobs::DEFAULT_AFFINITY_MAX_LOAD);
+        for (load, millionths) in [("0", 0), ("0.25", 250_000), ("1", 1_000_000)] {
+            assert_eq!(
+                max(&format!("image_affinity_max_load = {load}\n")).unwrap(),
+                millionths,
+                "{load}"
+            );
+        }
+        for bad in ["-0.1", "1.5", "nan", "\"0.5\""] {
+            assert!(
+                max(&format!("image_affinity_max_load = {bad}\n")).is_err(),
                 "{bad}"
             );
         }

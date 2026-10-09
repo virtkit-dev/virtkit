@@ -136,6 +136,14 @@ are not stacked on the one node with slightly more room, a host busy with work o
 takes new work last, and losing a node loses fewer jobs. Memory, disk and the cap
 bound each node, and capacity (`fits`) is the sum of every node's room.
 
+A job whose image its node builds from the checkout (`dockerfile:` or `compose:`, its own or a
+service's) goes first to a node that ran a job of the same project with the same such images
+within that node's `image_cache_idle_secs`, while that node is lightly loaded: 1-minute load
+average and placed vCPUs, each per CPU, below the hub's `image_affinity_max_load` (default
+`0.5`). That node boots it in seconds where another spends a minute or two building the image.
+A job submitted on a reservation on a node without the image then starts on the warm node
+without it, and the hub releases the reservation. Under heavier load the order above holds.
+
 ## Daemon ↔ hub: the client API
 
 HTTP/1.1 and JSON over TLS 1.3, on the hub's node listener (`addr`), under `/v1/`. Every
@@ -169,11 +177,12 @@ answers the lease the node granted; a reservation that lapsed, was released or w
 lost answers 410 `reservation_gone`. `DELETE` releases it, and answers 204 for one already gone.
 
 **Jobs.** `{request_id, placement, reservation, place_within_secs, spec}` → `JobView`. The hub
-starts the job on the reservation's node; with no reservation, or one that is gone, it
-places the job as it places a reservation, for up to `place_within_secs`. A node that refuses
-the start leaves the job free to place again; a start the node may have taken is never
-placed twice — see [failures](#failures). The spec is at most 512 KiB serialized (413
-`too_large`).
+starts the job on the reservation's node — unless a lightly loaded node holds the job's
+built image ([placement](#placement)), when it releases the reservation and starts the job
+there; with no reservation, or one that is gone, it places the job as it places a reservation,
+for up to `place_within_secs`. A node that refuses the start leaves the job free to place
+again; a start the node may have taken is never placed twice — see [failures](#failures). The
+spec is at most 512 KiB serialized (413 `too_large`).
 
 `JobView` is `{id, revision, state, node, stage, output_len, cancel, result}`: `state` is
 `queued`, `starting`, `running` or `finished`, and `result` is present once finished, with the

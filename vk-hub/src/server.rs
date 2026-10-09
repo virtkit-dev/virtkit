@@ -225,6 +225,14 @@ impl Hub {
         self
     }
 
+    /// This hub, placing a job first on a node that still holds its image while that node's
+    /// CPU load is below `max_load` millionths per CPU; 0 never does. After [`Hub::with_jobs`],
+    /// which sets the default.
+    pub fn preferring_warm_images_below(mut self, max_load: u64) -> Self {
+        self.dispatch.affinity_max_load = max_load;
+        self
+    }
+
     /// Note that something a page shows of node `node_id` may have changed: its report,
     /// heartbeat or session.
     pub(crate) fn changed(&self, node_id: &str) {

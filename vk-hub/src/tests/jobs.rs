@@ -302,20 +302,40 @@ async fn connect(
         id,
         key,
         versions,
-        mem_mib,
+        heartbeat(mem_mib, None),
         held,
         Duration::from_millis(300),
     )
     .await
 }
 
-/// [`connect`], heartbeating every `beat` after the first.
+/// A heartbeat with `mem_mib` free, and `load1_hundredths` the load average.
+fn heartbeat(mem_mib: u64, load1_hundredths: Option<u32>) -> Heartbeat {
+    Heartbeat {
+        admission: Some(Admission {
+            committed_mib: 0,
+            budget_mib: Some(mem_mib),
+            running: 0,
+            waiting: 0,
+        }),
+        storage: vec![FsUsage {
+            role: StorageRole::Jobs,
+            free_bytes: 100 << 30,
+            free_inodes: 1 << 20,
+            inodes: 1 << 20,
+        }],
+        load1_hundredths,
+        ..Heartbeat::default()
+    }
+}
+
+/// [`connect`], sending `heartbeat` every `beat` after the first.
 async fn connect_beating(
     addr: SocketAddr,
     id: &str,
     key: &Ed25519KeyPair,
     versions: VersionRange,
-    mem_mib: u64,
+    heartbeat: Heartbeat,
     held: Option<Held>,
     beat: Duration,
 ) -> FakeNode {
@@ -335,21 +355,6 @@ async fn connect_beating(
         },
         labels: vec!["big".into()],
         ..Inventory::default()
-    };
-    let heartbeat = Heartbeat {
-        admission: Some(Admission {
-            committed_mib: 0,
-            budget_mib: Some(mem_mib),
-            running: 0,
-            waiting: 0,
-        }),
-        storage: vec![FsUsage {
-            role: StorageRole::Jobs,
-            free_bytes: 100 << 30,
-            free_inodes: 1 << 20,
-            inodes: 1 << 20,
-        }],
-        ..Heartbeat::default()
     };
     send(&mut ws, &NodeMsg::Inventory(inventory)).await;
     send(&mut ws, &NodeMsg::Heartbeat(heartbeat.clone())).await;
@@ -410,9 +415,28 @@ async fn connect_beating(
 
 /// A version-3 node in pool `ci`, connected, ready and holding nothing.
 async fn ready_node(addr: SocketAddr, hub: &Hub, mem_mib: u64) -> FakeNode {
+    loaded_node(addr, hub, mem_mib, None).await
+}
+
+/// [`ready_node`], reporting `load1_hundredths` as its load average.
+async fn loaded_node(
+    addr: SocketAddr,
+    hub: &Hub,
+    mem_mib: u64,
+    load1_hundredths: Option<u32>,
+) -> FakeNode {
     let key = keypair();
     let id = new_node(addr, hub, &key).await;
-    let node = connect(addr, &id, &key, V3, mem_mib, Some(Held::default())).await;
+    let node = connect_beating(
+        addr,
+        &id,
+        &key,
+        V3,
+        heartbeat(mem_mib, load1_hundredths),
+        Some(Held::default()),
+        Duration::from_millis(300),
+    )
+    .await;
     wait_until(|| crate::jobs::testing::linked(hub, &id) && heard(hub, &id)).await;
     node
 }
@@ -2164,7 +2188,7 @@ async fn a_start_on_a_reservation_counts_against_room_until_a_heartbeat_shows_it
         &id,
         &node_key,
         V3,
-        8192,
+        heartbeat(8192, None),
         Some(Held::default()),
         Duration::from_secs(3600),
     )
@@ -2405,6 +2429,128 @@ async fn placed_work_goes_to_the_least_loaded_node() {
         ),
         (3, 2, 0)
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Job `n`'s body, its image `image`.
+fn job_body_with_image(n: u8, reservation: Option<&str>, image: &str) -> Value {
+    let mut body = job_body(n, reservation, 30);
+    let JobSpec::GitlabCi(mut ci) = spec(u64::from(n));
+    ci.image.name = image.into();
+    body["spec"] = json!(JobSpec::GitlabCi(ci));
+    body
+}
+
+/// A Dockerfile job prefers a lightly loaded node that ran the same project's Dockerfile,
+/// releasing its reservation on a cold node. A job with a pulled image uses its reservation.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_goes_to_a_lightly_loaded_node_holding_its_image() {
+    let dir = scratch("affinity");
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    // A load of 1 on 8 CPUs, and none.
+    let mut warm = loaded_node(addr, &hub, 16384, Some(100)).await;
+    let image = "dockerfile:ci/Dockerfile";
+    // The first runs on `warm`, alone in the pool.
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body_with_image(1, None, image)),
+    )
+    .await;
+    let first: JobView = resp.json();
+    assert_eq!(next_start(&mut warm).await.job, first.id);
+    warm.send(NodeJobMsg::Job {
+        job: first.id.clone(),
+        state: RunState::Accepted,
+    });
+    view_until(addr, &key, &first.id, |v| v.state == JobState::Running).await;
+    warm.send(NodeJobMsg::Result {
+        job: first.id.clone(),
+        result: result(None, 0),
+    });
+    view_until(addr, &key, &first.id, |v| v.state == JobState::Finished).await;
+    let mut cold = loaded_node(addr, &hub, 16384, Some(0)).await;
+    // A reservation goes to the less loaded `cold`; the job submitted on it, to `warm`.
+    let grant = reserve_on(addr, &key, &mut cold, 2).await;
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body_with_image(3, Some(&grant.reservation), image)),
+    )
+    .await;
+    let second: JobView = resp.json();
+    let start = next_start(&mut warm).await;
+    assert_eq!(
+        (start.job.as_str(), start.reservation),
+        (second.id.as_str(), None)
+    );
+    assert_eq!(
+        cold.job().await,
+        HubJobMsg::Release {
+            reservation: grant.reservation.clone()
+        }
+    );
+    assert_eq!(crate::jobs::testing::reservations(&hub), 0);
+    wait_until(|| {
+        (hub.db.audits(Some(&warm.id), 50).unwrap().iter()).any(|a| {
+            a.event.contains("where its image is warm")
+                && a.event
+                    .contains(&format!("giving back reservation {}", grant.reservation))
+        })
+    })
+    .await;
+    // Refused there, it starts on `cold` all the same, without the reservation it gave back.
+    warm.send(NodeJobMsg::Job {
+        job: second.id.clone(),
+        state: RunState::Refused {
+            reason: Refusal::Memory,
+            message: None,
+        },
+    });
+    let start = next_start(&mut cold).await;
+    assert_eq!(
+        (start.job.as_str(), start.reservation),
+        (second.id.as_str(), None)
+    );
+    assert_eq!(crate::jobs::testing::reservations(&hub), 0);
+    cold.send(NodeJobMsg::Job {
+        job: second.id.clone(),
+        state: RunState::Accepted,
+    });
+    view_until(addr, &key, &second.id, |v| v.state == JobState::Running).await;
+    cold.send(NodeJobMsg::Result {
+        job: second.id.clone(),
+        result: result(None, 0),
+    });
+    view_until(addr, &key, &second.id, |v| v.state == JobState::Finished).await;
+    assert_eq!(
+        cold.job().await,
+        HubJobMsg::Recorded {
+            job: second.id.clone()
+        }
+    );
+    // Its image pulled: it starts on its reservation.
+    let grant = reserve_on(addr, &key, &mut cold, 4).await;
+    let resp = api(
+        addr,
+        "POST",
+        "/v1/jobs",
+        Some(&key),
+        Some(job_body_with_image(5, Some(&grant.reservation), "alpine:3")),
+    )
+    .await;
+    let third: JobView = resp.json();
+    let start = next_start(&mut cold).await;
+    assert_eq!(
+        (start.job.as_str(), start.reservation.as_deref()),
+        (third.id.as_str(), Some(grant.reservation.as_str()))
+    );
+    warm.quiet(Duration::from_millis(300)).await;
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

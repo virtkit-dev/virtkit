@@ -531,11 +531,11 @@ Job {
 }
 ```
 
-Placement filters on labels and capabilities, scores on headroom and locality, then takes a
-reservation on the chosen node. A compose group runs whole on one node. Inputs are packaged
-explicitly; nothing refers to a submitter's local paths. A job whose node disconnects is not
-rerun until its first run is known to be over, and only under a retry policy that says its
-side effects can repeat.
+Placement filters on labels and capabilities, scores on headroom and locality (such as a node
+still holding the image a job builds), then takes a reservation on the chosen node. A compose
+group runs whole on one node. Inputs are packaged explicitly; nothing refers to a submitter's
+local paths. A job whose node disconnects is not rerun until its first run is known to be over,
+and only under a retry policy that says its side effects can repeat.
 
 ### Authentication for submitted jobs
 
