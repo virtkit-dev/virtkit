@@ -139,6 +139,7 @@ fn every_modeled_field() {
     );
     assert_eq!(job.cache[0].fallback_keys, ["deps-main"]);
     assert!(job.debug_mode_enabled());
+    assert!(job.timestamps(), "on unless FF_TIMESTAMPS turns them off");
     assert_eq!(job.features.token_mask_prefixes, ["ghp_"]);
     assert_eq!(job.features.failure_reasons.len(), 4);
     let tracing = job.features.tracing.as_ref().unwrap();

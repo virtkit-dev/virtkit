@@ -54,6 +54,7 @@ fn record(h: &Harness, id: i64, phase: Phase, hub_job: Option<String>) -> JobRec
         trace_offset: 0,
         failure_reasons: vec![],
         debug_trace: false,
+        timestamps: true,
         placement: p1(),
         spec: (phase == Phase::Taken).then(|| spec_for(h, id)),
     }

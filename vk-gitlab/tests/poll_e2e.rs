@@ -251,13 +251,21 @@ async fn unsupported_jobs_fail_before_submission(via: Via) {
     let fin = h.final_update(11).await;
     // runner_configuration_error, mapped for a GitLab that does not know it
     assert_eq!(fin["failure_reason"], "script_failure");
-    assert!(h.gl.log(11).contains("external secrets are not supported"));
+    let log = h.gl.log(11);
+    assert!(log.contains("external secrets are not supported"));
+    // The runner's own line is stamped as gitlab-runner stamps it.
+    assert_eq!(log.get(26..45), Some("Z 00O \x1b[31;1mERROR:"), "{log:?}");
 
     let mut job = job_json(12);
     job["run"] = serde_json::json!("[{\"name\":\"s\",\"script\":\"true\"}]");
+    job["variables"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"key": "FF_TIMESTAMPS", "value": "false"}));
     h.gl.push_job(job);
     let fin = h.final_update(12).await;
     assert_eq!(fin["failure_reason"], "script_failure");
+    assert!(h.gl.log(12).starts_with("\x1b[31;1mERROR: "));
     assert!(
         !h.hub
             .calls()

@@ -739,6 +739,33 @@ fn variable_bool(value: &str) -> bool {
     }
 }
 
+/// `FF_TIMESTAMPS` among `vars`: the last one, expanded against them unless raw, as the node
+/// reads it (variables only the node sets expand to nothing here); on when absent. A file
+/// variable expands to a path on the node, never a bool, so to a placeholder path here.
+pub fn timestamps(vars: &[Variable]) -> bool {
+    let flag = vars
+        .iter()
+        .rev()
+        .find(|v| v.key == vk_hub_proto::stamp::FLAG)
+        .map(|v| match v.raw {
+            true => v.value.clone(),
+            false => {
+                let paths: Vec<Variable> = vars
+                    .iter()
+                    .map(|w| match w.file {
+                        true => Variable {
+                            value: format!("/{}", w.key),
+                            ..w.clone()
+                        },
+                        false => w.clone(),
+                    })
+                    .collect();
+                crate::spec::expand(&v.value, &paths)
+            }
+        });
+    vk_hub_proto::stamp::enabled(flag.as_deref()).0
+}
+
 impl Job {
     /// The value of the last variable named `key`, as gitlab-runner resolves duplicates.
     pub fn variable(&self, key: &str) -> Option<&str> {
@@ -754,6 +781,12 @@ impl Job {
         ["CI_DEBUG_TRACE", "CI_DEBUG_SERVICES"]
             .iter()
             .any(|k| self.variable(k).is_some_and(variable_bool))
+    }
+
+    /// `FF_TIMESTAMPS`: whether the job's log lines are stamped. The node warns about invalid
+    /// values if the job reaches it.
+    pub fn timestamps(&self) -> bool {
+        timestamps(&self.variables)
     }
 
     /// The repository URL without credentials, query or fragment (gitlab-runner's
@@ -943,6 +976,28 @@ mod tests {
         assert_eq!(job.git_info.depth, 0);
         assert!(job.variables.is_empty());
         assert!(job.features.failure_reasons.is_empty());
+    }
+
+    #[test]
+    fn the_timestamps_flag_is_expanded_unless_raw() {
+        let var = |key: &str, value: &str, raw| Variable {
+            key: key.into(),
+            value: value.into(),
+            raw,
+            ..Variable::default()
+        };
+        assert!(timestamps(&[]));
+        let off = var("OFF", "false", false);
+        assert!(!timestamps(&[
+            off.clone(),
+            var("FF_TIMESTAMPS", "$OFF", false)
+        ]));
+        assert!(timestamps(&[off, var("FF_TIMESTAMPS", "$OFF", true)]));
+        let file = Variable {
+            file: true,
+            ..var("OFF", "false", false)
+        };
+        assert!(timestamps(&[file, var("FF_TIMESTAMPS", "$OFF", false)]));
     }
 
     #[test]

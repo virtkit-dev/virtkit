@@ -271,7 +271,10 @@ each job it follows with `output_ack` at the offset it holds.
   `Content-Range: <start>-<end>` (inclusive, no unit), at most 1 MiB a patch, every
   `X-GitLab-Trace-Update-Interval` seconds (3 by default, capped at 15 minutes). 202 moves the
   offset on; 416 moves it to the end of the response's `Range: 0-<n>`, which is also how
-  a restarted daemon finds where to resume; 404 or 403 abort the job.
+  a restarted daemon finds where to resume; 404 or 403 abort the job. The trace preserves the
+  node's output byte for byte. Errors for jobs the daemon refuses or cannot decode, submit
+  or place use gitlab-runner's logger timestamp format (stream `00`, stdout), unless the
+  job's `FF_TIMESTAMPS` is false. The state file preserves this flag across restarts.
 - **Keep-alive.** With no new output for 30 seconds, `PUT /jobs/:id` `state=running` with the
   trace's `crc32:<hex>` checksum and byte size.
 - **Final update.** Once the hub reports the job finished and its output complete and every

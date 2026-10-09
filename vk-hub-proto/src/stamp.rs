@@ -139,6 +139,16 @@ fn digits(out: &mut [u8], mut n: u64) {
     }
 }
 
+/// Stamp the runner's own lines in `p` at `now` using gitlab-runner's logger format
+/// (stream 00, stdout). Add a final newline if missing.
+pub fn own_lines(p: &[u8], now: SystemTime) -> Vec<u8> {
+    let mut s = Stamper::new(STREAM_EXECUTOR, Kind::Stdout);
+    let mut out = Vec::new();
+    s.write(p, now, &mut |b| out.extend_from_slice(b));
+    s.close(&mut |b| out.extend_from_slice(b));
+    out
+}
+
 /// Days since 1970-01-01 as a proleptic Gregorian date (Howard Hinnant's `civil_from_days`).
 fn civil(days: i64) -> (i64, u64, u64) {
     let z = days + 719_468;
@@ -389,6 +399,15 @@ mod tests {
         assert_eq!(
             stamped(&mut s, &["é\nü".as_bytes()]),
             "2026-10-09T12:10:43.123456Z 01O é\n2026-10-09T12:10:43.123456Z 01O ü\n"
+        );
+    }
+
+    #[test]
+    fn own_lines_are_each_stamped() {
+        assert_eq!(
+            String::from_utf8(own_lines(b"ERROR: one\ntwo", at(0))).unwrap(),
+            "2026-10-09T12:10:43.123456Z 00O ERROR: one\n\
+             2026-10-09T12:10:43.123456Z 00O two\n"
         );
     }
 

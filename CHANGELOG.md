@@ -45,8 +45,9 @@ All notable changes to virtkit will be documented in this file.
   release: `vk-gitlab run` takes jobs from GitLab as one or more runners, the way gitlab-runner
   19.5 does, and has `vk-hub` (configured in `[hub]`) run each on a node of the runner's pool.
   It asks GitLab for a job only once the fleet has room for it, reports the job's log and
-  outcome to GitLab, and picks its jobs up again after a restart. `vk-gitlab verify` checks
-  each configured runner's token.
+  outcome to GitLab, and picks its jobs up again after a restart. Its errors for jobs it
+  cannot run use the node's timestamp format unless `FF_TIMESTAMPS` is false.
+  `vk-gitlab verify` checks each configured runner's token.
 
 ### Changed
 

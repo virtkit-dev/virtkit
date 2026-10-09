@@ -10,11 +10,12 @@ use bytes::Bytes;
 use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Method, Response, StatusCode, Url};
 use serde::Serialize;
+use vk_hub_proto::stamp;
 
 use super::types::*;
 use crate::backoff::{Backoff, hex, random_bytes};
 use crate::failure::{FailureReason, JobState};
-use crate::job::Job;
+use crate::job::{self, Job};
 use crate::secret::{Secret, is_created_runner_token};
 
 pub const RUNNER_TOKEN_HEADER: &str = "RUNNER-TOKEN";
@@ -757,7 +758,19 @@ impl GitLabClient {
             token: Secret::new(token),
         };
         let line = format!("ERROR: the runner could not decode this job (at {at})\n");
-        let _ = self.patch_trace(&creds, line.as_bytes(), 0, false).await;
+        // Stamped unless the variables that decode turn it off.
+        let vars: Vec<job::Variable> = value
+            .get("variables")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| serde_json::from_value(v.clone()).ok())
+            .collect();
+        let line = match job::timestamps(&vars) {
+            true => stamp::own_lines(line.as_bytes(), std::time::SystemTime::now()),
+            false => line.into_bytes(),
+        };
+        let _ = self.patch_trace(&creds, &line, 0, false).await;
         let mut info = UpdateJobInfo::new(id, JobState::Failed);
         info.failure_reason = Some(FailureReason::runner_system_failure());
         let _ = self.update_job(&creds, &info).await;
@@ -980,7 +993,7 @@ pub async fn status_message(resp: Response, method: &Method) -> String {
     if status.is_success() || !is_json(&resp) {
         return status_text(status);
     }
-    let url = crate::job::clean_url(resp.url().as_str());
+    let url = job::clean_url(resp.url().as_str());
     let Ok(body) = resp.bytes().await else {
         return status_text(status);
     };

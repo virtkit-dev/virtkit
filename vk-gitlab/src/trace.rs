@@ -166,6 +166,8 @@ pub struct TraceSettings {
     pub final_update_backoff_max: Duration,
     /// `debug_trace` on each patch (`CI_DEBUG_TRACE` / `CI_DEBUG_SERVICES`).
     pub debug_trace: bool,
+    /// The job's `FF_TIMESTAMPS`: stamp the daemon's own lines in the node's format.
+    pub timestamps: bool,
 }
 
 impl Default for TraceSettings {
@@ -178,6 +180,7 @@ impl Default for TraceSettings {
             final_update_retry_limit: DEFAULT_FINAL_UPDATE_RETRY_LIMIT,
             final_update_backoff_max: DEFAULT_FINAL_UPDATE_BACKOFF_MAX,
             debug_trace: false,
+            timestamps: vk_hub_proto::stamp::DEFAULT,
         }
     }
 }

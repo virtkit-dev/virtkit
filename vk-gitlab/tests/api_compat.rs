@@ -337,6 +337,9 @@ async fn undecodable_job_is_failed_not_dropped() {
     assert!(res.job.is_none() && res.healthy);
     // The decoding error names the position only: serde's message quotes the payload.
     let line = String::from_utf8(s.requests_to("/api/v4/jobs/77/trace")[0].body.to_vec()).unwrap();
+    // Stamped as the runner's own line: no readable variables turn it off.
+    assert_eq!(line.get(26..32), Some("Z 00O "), "{line}");
+    let line = line.get(32..).unwrap_or_default();
     assert!(
         line.starts_with("ERROR: the runner could not decode this job (at line 1, column "),
         "{line}"
@@ -346,6 +349,28 @@ async fn undecodable_job_is_failed_not_dropped() {
     assert_eq!(update.header("job-token"), "jt");
     assert_eq!(update.json()["state"], "failed");
     assert_eq!(update.json()["failure_reason"], "runner_system_failure");
+}
+
+#[tokio::test]
+async fn undecodable_job_keeps_ff_timestamps_off() {
+    // The variables that decode still turn the stamp off.
+    let s = FakeGitLab::start(|r: &Recorded| match r.path.as_str() {
+        "/api/v4/jobs/request" => Reply::status(201).json(
+            r#"{"id": 78, "token": "jt", "steps": 1,
+                "variables": [{"key": "FF_TIMESTAMPS", "value": "false"}, 5]}"#,
+        ),
+        "/api/v4/jobs/78/trace" => Reply::status(202),
+        "/api/v4/jobs/78" => Reply::status(200),
+        _ => Reply::status(404),
+    })
+    .await;
+    let res = client(&s.url, VALID_TOKEN, 1).request_job().await;
+    assert!(res.job.is_none() && res.healthy);
+    let line = String::from_utf8(s.requests_to("/api/v4/jobs/78/trace")[0].body.to_vec()).unwrap();
+    assert!(
+        line.starts_with("ERROR: the runner could not decode this job"),
+        "{line}"
+    );
 }
 
 // --- PUT jobs/:id ----------------------------------------------------------------------

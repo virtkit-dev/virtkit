@@ -26,11 +26,12 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::Instant;
+use vk_hub_proto::stamp;
 
 use crate::api::{
     ClientOptions, GitLabClient, Info, JobCredentials, RetryPolicy, UpdateJobInfo, UpdateState,
@@ -55,9 +56,13 @@ const UNHEALTHY_BACKOFF_INITIAL: Duration = Duration::from_secs(30);
 const ANSI_BOLD_RED: &str = "\x1b[31;1m";
 const ANSI_RESET: &str = "\x1b[0;m";
 
-/// An error line as gitlab-runner's build logger writes one.
-fn error_line(msg: &str) -> String {
-    format!("{ANSI_BOLD_RED}ERROR: {msg}{ANSI_RESET}\n")
+/// An error line as gitlab-runner's build logger writes one, stamped at `stamped_at`, if given.
+fn error_line(msg: &str, stamped_at: Option<SystemTime>) -> Vec<u8> {
+    let line = format!("{ANSI_BOLD_RED}ERROR: {msg}{ANSI_RESET}\n");
+    match stamped_at {
+        Some(now) => stamp::own_lines(line.as_bytes(), now),
+        None => line.into_bytes(),
+    }
 }
 
 /// A hub `request_id`: 16 random bytes, hex.
@@ -919,7 +924,10 @@ async fn fail_uncommitted(
         Some(mapper),
         trace_settings.clone(),
     );
-    trace.write(error_line(msg).as_bytes());
+    trace.write(&error_line(
+        msg,
+        trace_settings.timestamps.then(SystemTime::now),
+    ));
     if let Err(e) = trace.fail(reason, exit_code).await {
         log::error!(job = creds.id, error = e.to_string().as_str(); "Could not report the job's final state");
     }
@@ -1188,7 +1196,7 @@ async fn run_job<D: Dispatcher>(
             let _ = shared.bounded(shared.dispatcher.release(r)).await;
         }
         let mapper = FailureReasonMapper::new(&job.features.failure_reasons);
-        let settings = trace_settings(shared, runner, job.debug_mode_enabled());
+        let settings = trace_settings(shared, runner, job.debug_mode_enabled(), job.timestamps());
         fail_uncommitted(runner, &settings, &creds, mapper, &msg, reason, exit_code).await;
         return;
     }
@@ -1222,6 +1230,7 @@ async fn run_job<D: Dispatcher>(
             .map(|r| r.0.clone())
             .collect(),
         debug_trace: job.debug_mode_enabled(),
+        timestamps: job.timestamps(),
         placement: runner.cfg.placement(),
         spec: Some(JobSpec::GitlabCi(translated.job)),
     };
@@ -1230,11 +1239,17 @@ async fn run_job<D: Dispatcher>(
     drive(shared, runner, rec, false).await;
 }
 
-fn trace_settings<D>(shared: &Shared<D>, runner: &Runner, debug_trace: bool) -> TraceSettings {
+fn trace_settings<D>(
+    shared: &Shared<D>,
+    runner: &Runner,
+    debug_trace: bool,
+    timestamps: bool,
+) -> TraceSettings {
     TraceSettings {
         output_limit: runner.cfg.output_limit_bytes(),
         final_update_retry_limit: runner.cfg.final_update_retry_limit(),
         debug_trace,
+        timestamps,
         ..shared.options.trace.clone()
     }
 }
@@ -1290,7 +1305,7 @@ async fn drive<D: Dispatcher>(
         .map(|r| FailureReason::new(r.clone()))
         .collect();
     let mapper = FailureReasonMapper::new(&reasons);
-    let settings = trace_settings(shared, runner, rec.debug_trace);
+    let settings = trace_settings(shared, runner, rec.debug_trace, rec.timestamps);
     let fail = |msg: String, reason: FailureReason| {
         let (mapper, settings, creds) = (mapper.clone(), settings.clone(), creds.clone());
         async move {
@@ -1604,7 +1619,7 @@ async fn follow<D: Dispatcher>(
         Arc::clone(&runner.client),
         creds,
         Some(mapper),
-        trace_settings(shared, runner, rec.debug_trace),
+        trace_settings(shared, runner, rec.debug_trace, rec.timestamps),
         &prefix,
     );
     if resumed {
@@ -1790,8 +1805,15 @@ mod tests {
     #[test]
     fn error_lines_match_gitlab_runner() {
         assert_eq!(
-            error_line("Job failed: exit code 1"),
-            "\x1b[31;1mERROR: Job failed: exit code 1\x1b[0;m\n"
+            error_line("Job failed: exit code 1", None),
+            b"\x1b[31;1mERROR: Job failed: exit code 1\x1b[0;m\n"
+        );
+        // Stamped as the logger's own lines, each line of a message on its own.
+        let at = std::time::UNIX_EPOCH + Duration::from_micros(1_791_547_843_123_456);
+        assert_eq!(
+            String::from_utf8(error_line("one\ntwo", Some(at))).unwrap(),
+            "2026-10-09T12:10:43.123456Z 00O \x1b[31;1mERROR: one\n\
+             2026-10-09T12:10:43.123456Z 00O two\x1b[0;m\n"
         );
     }
 

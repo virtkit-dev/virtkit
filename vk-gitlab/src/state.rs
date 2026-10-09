@@ -61,6 +61,9 @@ pub struct JobRecord {
     pub failure_reasons: Vec<String>,
     #[serde(default)]
     pub debug_trace: bool,
+    /// The job's `FF_TIMESTAMPS`; older records default to on.
+    #[serde(default = "timestamps_default")]
+    pub timestamps: bool,
     pub placement: Placement,
     /// The spec, until the hub has it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -76,6 +79,10 @@ impl std::fmt::Debug for JobRecord {
             .field("trace_offset", &self.trace_offset)
             .finish_non_exhaustive()
     }
+}
+
+fn timestamps_default() -> bool {
+    vk_hub_proto::stamp::DEFAULT
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -276,9 +283,22 @@ mod tests {
             trace_offset: 0,
             failure_reasons: vec!["script_failure".to_owned()],
             debug_trace: false,
+            timestamps: true,
             placement: Placement::default(),
             spec: None,
         }
+    }
+
+    #[test]
+    fn a_record_from_before_timestamps_has_them_on() {
+        let mut json = serde_json::to_value(JobRecord {
+            timestamps: false,
+            ..record(1)
+        })
+        .unwrap();
+        json.as_object_mut().unwrap().remove("timestamps");
+        let rec: JobRecord = serde_json::from_value(json).unwrap();
+        assert!(rec.timestamps);
     }
 
     #[test]
