@@ -129,9 +129,8 @@ pub struct Hub {
     pub(crate) fetches: crate::fetch::Fetches,
     /// Bumped whenever anything a page shows may have changed, for its live updates.
     changes: watch::Sender<u64>,
-    /// The same, for one node: what that node's page follows. An entry exists while someone
-    /// follows it.
-    node_changes: Mutex<HashMap<String, watch::Sender<u64>>>,
+    /// Per-node change counters followed by node pages.
+    node_changes: Followed,
     /// Bumped by [`Hub::touch`] alone, for pages that show nothing of a node's report or
     /// heartbeat.
     touched: watch::Sender<u64>,
@@ -189,7 +188,7 @@ impl Hub {
             tools_lock: Mutex::new(()),
             fetches: crate::fetch::Fetches::new(None),
             changes: watch::Sender::new(0),
-            node_changes: Mutex::new(HashMap::new()),
+            node_changes: Followed::default(),
             touched: watch::Sender::new(0),
             jobs: watch::Sender::new(0),
             sessions: watch::Sender::new(0),
@@ -226,17 +225,7 @@ impl Hub {
     /// heartbeat or session.
     pub(crate) fn changed(&self, node_id: &str) {
         self.changes.send_modify(|n| *n = n.wrapping_add(1));
-        let mut followed = self
-            .node_changes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(tx) = followed.get(node_id) {
-            if tx.receiver_count() == 0 {
-                followed.remove(node_id);
-            } else {
-                tx.send_modify(|n| *n = n.wrapping_add(1));
-            }
-        }
+        self.node_changes.bump(node_id);
     }
 
     /// Note that something a page shows beyond one node's row may have changed: a release, a
@@ -274,27 +263,15 @@ impl Hub {
         self.changes.subscribe()
     }
 
-    /// Wake on the next [`Hub::changed`] of node `node_id`. Entries no page follows any more
-    /// are dropped first, so the map holds no more than the streams open, plus this one.
+    /// Wake on the next [`Hub::changed`] of node `node_id`.
     pub(crate) fn subscribe_node(&self, node_id: &str) -> watch::Receiver<u64> {
-        let mut followed = self
-            .node_changes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        followed.retain(|_, tx| tx.receiver_count() > 0);
-        followed
-            .entry(node_id.to_string())
-            .or_insert_with(|| watch::Sender::new(0))
-            .subscribe()
+        self.node_changes.subscribe(node_id)
     }
 
     /// How many nodes have an entry in the map [`Hub::subscribe_node`] fills.
     #[cfg(test)]
     pub(crate) fn followed_nodes(&self) -> usize {
-        self.node_changes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.node_changes.len()
     }
 
     /// Note that a web UI session ended.
@@ -448,6 +425,49 @@ impl Hub {
     /// refusing over — each entry is replaced whole — so poisoning is ignored.
     fn lock_live(&self) -> std::sync::MutexGuard<'_, HashMap<String, Live>> {
         self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A change counter for each of the things pages follow one at a time, by key. An entry
+/// exists while someone follows it: those no page follows any more are dropped when one is
+/// bumped or another is followed, so following one leaves the map no larger than the streams
+/// open, plus that one.
+#[derive(Default)]
+struct Followed(Mutex<HashMap<String, watch::Sender<u64>>>);
+
+impl Followed {
+    /// Wake those following `key`, if any do.
+    fn bump(&self, key: &str) {
+        let mut followed = self.lock();
+        if let Some(tx) = followed.get(key) {
+            if tx.receiver_count() == 0 {
+                followed.remove(key);
+            } else {
+                tx.send_modify(|n| *n = n.wrapping_add(1));
+            }
+        }
+    }
+
+    /// Wake on the next [`Followed::bump`] of `key`.
+    fn subscribe(&self, key: &str) -> watch::Receiver<u64> {
+        let mut followed = self.lock();
+        followed.retain(|_, tx| tx.receiver_count() > 0);
+        followed
+            .entry(key.to_string())
+            .or_insert_with(|| watch::Sender::new(0))
+            .subscribe()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, watch::Sender<u64>>> {
+        // Senders are inserted and removed whole, so a panic leaves no partial entry.
+        self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
