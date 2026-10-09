@@ -4454,7 +4454,10 @@ async fn cli_main(cli: Cli) -> ExitCode {
                     Ok(result) => match (result.code, result.signal) {
                         (Some(0), _) => ExitCode::SUCCESS,
                         // non-zero exit: the script already reported its error
-                        (Some(_), _) => exit_code(ctx.build_failure),
+                        (Some(code), _) => {
+                            write_build_exit_code(std::env::var_os("BUILD_EXIT_CODE_FILE"), code);
+                            exit_code(ctx.build_failure)
+                        }
                         (None, signal) => {
                             eprintln!("virtkit: stage script killed by signal {signal:?}");
                             exit_code(ctx.build_failure)
@@ -5883,6 +5886,15 @@ fn exit_code(code: i32) -> ExitCode {
     ExitCode::from(code.clamp(1, 255) as u8)
 }
 
+/// Write a failing stage's exit code to `BUILD_EXIT_CODE_FILE`, if gitlab-runner provides it,
+/// for `allow_failure: exit_codes` and the job's reported exit code.
+fn write_build_exit_code(path: Option<std::ffi::OsString>, code: i32) {
+    if let Some(path) = path {
+        // Without it the job still fails, with the generic code.
+        let _ = std::fs::write(path, format!("{code}\n"));
+    }
+}
+
 /// Parse `--inject HOST:GUEST:OCTAL_MODE` specs into `(guest, host, mode)`, with
 /// the guest path normalized to the image-relative form (no leading slash) the
 /// ext4 writer expects. Shared by `mkext-tar` and `mkext-oci`.
@@ -6042,6 +6054,16 @@ impl<R: std::io::Read> std::io::Read for ProgressReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failing_scripts_exit_code_goes_to_build_exit_code_file() {
+        let path = std::env::temp_dir().join(format!("vk-exit-code-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        write_build_exit_code(Some(path.clone().into()), 3);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "3\n");
+        write_build_exit_code(None, 4);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn config_notes_an_omitted_default_executor() {

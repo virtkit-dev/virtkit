@@ -28,6 +28,9 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **`allow_failure: exit_codes` works with the vk executor.** `vk gitlab run` reports a
+  failing script's exit code through `BUILD_EXIT_CODE_FILE`, so gitlab-runner shows the job's
+  real exit code.
 - **A provider's application portal can start a `vk-hub` OIDC sign-in.** `/auth/login`
   accepts another site's page when the browser navigates the tab itself, so registering it
   as the application's login URL, as Trustelem's portal does, no longer ends on a refusal
