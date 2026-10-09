@@ -51,6 +51,10 @@ All notable changes to virtkit will be documented in this file.
 
 ### Changed
 
+- **`vk-hub`'s web UI is restyled.** The top bar marks the current page and shows your
+  identity and role. Coloured badges show node, job and rollout states. Tables keep their
+  headers visible and align figures. Light and dark themes follow the browser's preference,
+  and pages fit narrow windows.
 - **Node pages in `vk-hub` explain the current state and available actions.** The steering
   panel groups job intake, maintenance and a danger zone, shows the current state in plain
   language, and offers only applicable actions, each with a short explanation.

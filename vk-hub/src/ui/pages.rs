@@ -20,22 +20,62 @@ pub struct AuditPage {
     pub rows: Vec<(u64, AuditRow)>,
 }
 
-/// The page around `main`: head, stylesheet, the site's navigation `nav`, who is signed in.
-pub fn frame(title: &str, auth: &Auth, nav: &'static str, main: &Html) -> Html {
+/// A site's navigation: each entry's path and label, in order.
+pub type Nav = &'static [(&'static str, &'static str)];
+
+/// Wrap `main` with the head, stylesheet and top bar. The bar shows `nav`, marks the entry
+/// for `here`, and displays the signed-in identity and role.
+pub fn frame(title: &str, here: &str, auth: &Auth, nav: Nav, main: &Html) -> Html {
     let mut h = Html::new();
     head(&mut h, title);
-    h.raw("<body><header><nav>")
-        .raw(nav)
-        .raw("</nav><form class=\"who\" method=\"post\" action=\"/logout\"><span>")
-        .text(auth.session.principal())
-        .raw(", until ");
-    at(&mut h, auth.session.expires_at);
+    h.raw("<body><header class=\"topbar\"><a class=\"brand\" href=\"/\">vk-hub</a><nav>");
+    let current = current(nav, here);
+    for &(path, label) in nav {
+        h.raw("<a href=\"").raw(path).raw("\"");
+        if path == current {
+            h.raw(" aria-current=\"page\"");
+        }
+        h.raw(">").raw(label).raw("</a>");
+    }
+    let s = &auth.session;
+    let principal = s.principal();
+    h.raw("</nav><form class=\"who\" method=\"post\" action=\"/logout\">")
+        .raw("<span class=\"identity\" title=\"")
+        .text(&principal)
+        .raw("\" aria-label=\"")
+        .text(&principal)
+        .raw("\">");
+    match &s.identity {
+        Some(who) => h.text(who),
+        None => h.raw("link from ").text(&s.issued_by),
+    };
+    h.raw("</span> <span class=\"badge\">")
+        .raw(s.role.name())
+        .raw("</span> <span class=\"until\">until ");
+    at(&mut h, s.expires_at);
     h.raw("</span> ");
     csrf_field(&mut h, auth);
-    h.raw("<button>sign out</button></form></header><main>")
+    h.raw("<button class=\"secondary\">Sign out</button></form></header><main>")
         .html(main)
         .raw("</main></body></html>");
     h
+}
+
+/// The longest path in `nav` matching `here` or a parent, ignoring query and fragment.
+/// Fall back to `/` when no entry matches.
+fn current(nav: Nav, here: &str) -> &'static str {
+    let here = here.split(['?', '#']).next().unwrap_or(here);
+    nav.iter()
+        .map(|&(path, _)| path)
+        .filter(|&path| {
+            path == "/"
+                || here == path
+                || here
+                    .strip_prefix(path)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+        .max_by_key(|path| path.len())
+        .unwrap_or("/")
 }
 
 /// htmx's configuration: nothing evaluated, no script run from a swapped fragment, no
@@ -91,7 +131,7 @@ pub fn message(text: &str) -> Html {
 /// `GET /login`: the sign-in link's page, a button posting its token back.
 pub fn sign_in(token: &str) -> Html {
     let mut h = Html::new();
-    head(&mut h, "sign in");
+    head(&mut h, "Sign in");
     h.raw("<body><main><form class=\"message\" method=\"post\" action=\"/login\">")
         .raw("<input type=\"hidden\" name=\"t\" value=\"")
         .text(token)
@@ -104,7 +144,7 @@ pub fn sign_in(token: &str) -> Html {
 /// provider at `provider`.
 pub fn sign_in_with(text: &str, provider: &str) -> Html {
     let mut h = Html::new();
-    head(&mut h, "sign in");
+    head(&mut h, "Sign in");
     h.raw("<body><main><form class=\"message\" method=\"get\" action=\"/auth/login\"><p>")
         .text(text)
         .raw("</p><button>Sign in with ")
@@ -118,7 +158,7 @@ pub fn sign_in_with(text: &str, provider: &str) -> Html {
 /// marked their email unverified, so it was not looked up.
 pub fn refused(identity: &str, unverified: bool) -> Html {
     let mut h = Html::new();
-    head(&mut h, "sign in");
+    head(&mut h, "Sign in");
     h.raw("<body><main><p class=\"message\">You signed in as ")
         .text(identity)
         .raw(", who may not use this hub's web UI. Its operator lets people in by email, ")
@@ -154,19 +194,14 @@ pub fn signed_out_fragment(sign_in: &'static str) -> Html {
 ///
 /// `names` maps node IDs to names for the filter and node column; local mode has no nodes
 /// and passes `None`. `nav` is the site's navigation.
-pub fn audit(
-    auth: &Auth,
-    page: &AuditPage,
-    names: Option<&[(String, String)]>,
-    nav: &'static str,
-) -> Html {
+pub fn audit(auth: &Auth, page: &AuditPage, names: Option<&[(String, String)]>, nav: Nav) -> Html {
     let with_node = names.is_some();
     let names = names.unwrap_or_default();
     let mut main = Html::new();
     main.raw("<h1>Audit</h1>");
     if with_node {
         main.raw("<form class=\"filter\" method=\"get\" action=\"/audit\">")
-            .raw("<select name=\"node\"><option value=\"\">every node</option>");
+            .raw("<select name=\"node\"><option value=\"\">Every node</option>");
         let mut sorted: Vec<(&str, &str)> = names
             .iter()
             .map(|(id, name)| (id.as_str(), name.as_str()))
@@ -183,7 +218,7 @@ pub fn audit(
                 .text(id.get(..8).unwrap_or(id))
                 .raw(")</option>");
         }
-        main.raw("</select> <button>show</button></form>");
+        main.raw("</select> <button>Show</button></form>");
     }
     let names: HashMap<&str, &str> = names
         .iter()
@@ -197,9 +232,9 @@ pub fn audit(
         if let Some(node) = &page.node {
             main.raw("node=").text(node).raw("&amp;");
         }
-        main.raw("before=").text(oldest).raw("\">older</a></p>");
+        main.raw("before=").text(oldest).raw("\">Older</a></p>");
     }
-    frame("audit", auth, nav, &main)
+    frame("Audit", "/audit", auth, nav, &main)
 }
 
 fn audit_table(
@@ -324,6 +359,80 @@ pub fn kv_node(h: &mut Html, key: &'static str, value: &str) {
         .raw("</td></tr>");
 }
 
+/// Whether `columns[i]` is `name`, at compile time.
+pub const fn column_is(columns: &[&str], i: usize, name: &str) -> bool {
+    if i >= columns.len() {
+        return false;
+    }
+    let (a, b) = (columns[i].as_bytes(), name.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut k = 0;
+    while k < a.len() {
+        if a[k] != b[k] {
+            return false;
+        }
+        k += 1;
+    }
+    true
+}
+
+/// Right-aligned numeric columns in `vk-hub nodes` and node workloads.
+/// Compile-time checks reject names absent from both column lists.
+const NUMERIC: [&str; 9] = [
+    "CEILING", "CONC", "CPUS", "RAM", "ADMITTED", "VMS", "PID", "RESERVED", "IN USE",
+];
+const _: () = {
+    let mut i = 0;
+    while i < NUMERIC.len() {
+        let name = NUMERIC[i];
+        assert!(
+            has_column(&crate::NODE_COLUMNS, name) || has_column(&crate::workloads::COLUMNS, name)
+        );
+        i += 1;
+    }
+};
+
+/// Whether `columns` holds `name`, at compile time.
+const fn has_column(columns: &[&str], name: &str) -> bool {
+    let mut i = 0;
+    while i < columns.len() {
+        if column_is(columns, i, name) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether the column `name` holds figures.
+fn numeric(name: &str) -> bool {
+    NUMERIC.contains(&name)
+}
+
+/// A table's header cells for `columns`.
+pub fn header_cells(h: &mut Html, columns: &[&str]) {
+    for &column in columns {
+        h.raw(if numeric(column) {
+            "<th class=\"num\">"
+        } else {
+            "<th>"
+        })
+        .text(column)
+        .raw("</th>");
+    }
+}
+
+/// Open the cell of `column`.
+pub fn open_cell(h: &mut Html, column: &str) {
+    h.raw(if numeric(column) {
+        "<td class=\"num\">"
+    } else {
+        "<td>"
+    });
+}
+
 pub fn dash() -> String {
     "-".to_string()
 }
@@ -413,6 +522,23 @@ mod tests {
         assert_eq!(rough_bytes(197 << 20), "200 MiB");
         assert_eq!(rough_bytes(3 << 30), "3.0 GiB");
         assert_eq!(started(1_790_755_279), "2026-09-30T08:01Z");
+    }
+
+    /// The navigation marks the entry a page is under: its own, a parent's, else `/`.
+    #[test]
+    fn the_current_entry_is_the_nearest_above_the_page() {
+        const NAV: Nav = &[
+            ("/", "Nodes"),
+            ("/operations", "Operations"),
+            ("/audit", "Audit"),
+        ];
+        assert_eq!(current(NAV, "/"), "/");
+        assert_eq!(current(NAV, "/node/ab"), "/");
+        assert_eq!(current(NAV, "/operations"), "/operations");
+        assert_eq!(current(NAV, "/audit/x"), "/audit");
+        assert_eq!(current(NAV, "/auditx"), "/");
+        assert_eq!(current(NAV, "/audit?node=ab"), "/audit");
+        assert_eq!(current(NAV, "/operations#rollouts"), "/operations");
     }
 
     /// An instant carries its exact UTC time for the script and the title, and shows the

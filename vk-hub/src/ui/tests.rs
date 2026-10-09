@@ -270,6 +270,13 @@ async fn a_sign_in_link_opens_one_session_with_a_strict_cookie() {
     assert_secure(&reply);
     assert_eq!(reply.header("cache-control"), Some("no-store"));
     assert!(reply.body.contains("(viewer)"), "{}", reply.body);
+    assert!(
+        reply
+            .body
+            .contains("\">link from uid 0</span> <span class=\"badge\">viewer</span>"),
+        "{}",
+        reply.body
+    );
     // The database holds only the secret's hash, and the session lists by its prefix.
     let sessions = hub.db.ui_sessions(crate::now_secs()).unwrap();
     assert_eq!(sessions.len(), 1);
@@ -443,7 +450,16 @@ async fn the_vms_are_listed_each_with_a_page() {
         "{}",
         reply.body
     );
-    assert!(reply.body.contains("300 MiB"), "{}", reply.body);
+    assert!(
+        reply.body.contains("<td class=\"num\">300 MiB</td>"),
+        "{}",
+        reply.body
+    );
+    assert!(
+        reply.body.contains("<th class=\"num\">PID</th>"),
+        "{}",
+        reply.body
+    );
     // In UTC, for the page's script to show in the browser's zone.
     assert!(
         reply.body.contains(
@@ -1531,7 +1547,7 @@ esac"#,
     assert!(
         reply
             .body
-            .contains(&format!("<a href=\"/vm/{id}\">cancel</a>")),
+            .contains(&format!("<a href=\"/vm/{id}\">Cancel</a>")),
         "{}",
         reply.body
     );
@@ -1784,7 +1800,10 @@ esac"#,
     assert!(page.body.contains("2026-09-30T08:01Z"), "{}", page.body);
     assert!(page.body.contains("workspace-missing"), "{}", page.body);
     assert!(!page.body.contains("evil"), "{}", page.body);
-    assert!(page.body.contains("<a href=\"/dev\">dev environments</a>"));
+    assert!(
+        page.body
+            .contains("<a href=\"/dev\" aria-current=\"page\">Dev environments</a>")
+    );
     let _ = std::fs::remove_dir_all(vk.parent().unwrap());
 }
 
@@ -2406,25 +2425,25 @@ async fn workloads_are_shown_live_and_as_text() {
         "<h2>Workloads</h2>",
         "<td>ci-job</td>",
         "acme&lt;script&gt;alert(1)&lt;/script&gt;",
-        "<td>4321</td>",
-        "<td>2.0 GiB</td>",
-        "<td>3.0 GiB</td>",
+        "<td class=\"num\">4321</td>",
+        "<td class=\"num\">2.0 GiB</td>",
+        "<td class=\"num\">3.0 GiB</td>",
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);
     }
     assert!(!page.body.contains("<script>alert") && !page.body.contains("<img"));
     // When the node was heard from, in UTC for the page's script.
     assert!(
-        utc_time_after(&page.body, "<tr><th>heartbeat</th><td>"),
+        utc_time_after(&page.body, "<tr><th>Heartbeat</th><td>"),
         "{}",
         page.body
     );
 
     let mut nodes = Events::open(addr, "/events/nodes", &cookie).await;
     let first = nodes.next().await.unwrap();
-    assert!(first.contains("<th>VMS</th>"), "{first}");
+    assert!(first.contains("<th class=\"num\">VMS</th>"), "{first}");
     assert!(utc_time_after(&first, "<td>"), "{first}");
-    assert!(first.contains("<td>1</td></tr>"), "{first}");
+    assert!(first.contains("<td class=\"num\">1</td></tr>"), "{first}");
 
     let mut detail = Events::open(addr, &format!("/events/node/{node}"), &cookie).await;
     let first = detail.next().await.unwrap();
@@ -2445,7 +2464,7 @@ async fn workloads_are_shown_live_and_as_text() {
     hub.db.record_report(&node, report(Vec::new()), 4).unwrap();
     hub.changed(&node);
     next_with(&mut detail, "none running").await;
-    next_with(&mut nodes, "<td>0</td></tr>").await;
+    next_with(&mut nodes, "<td class=\"num\">0</td></tr>").await;
 }
 
 /// A CI job the node names a GitLab page for leads to it, in a tab of its own; a URL that is
@@ -2591,7 +2610,7 @@ async fn the_fleet_s_audit_log_is_shown_and_filtered_by_node() {
     let all = get(addr, "/audit", Some(&cookie)).await;
     assert_eq!(all.status, 200, "{}", all.body);
     for want in [
-        "<a href=\"/audit\">audit</a>",
+        "<a href=\"/audit\" aria-current=\"page\">Audit</a>",
         "<select name=\"node\">",
         &format!("<option value=\"{node}\">ci-&lt;1&gt; ("),
         "issued an enrollment token",
@@ -2789,7 +2808,7 @@ async fn an_operator_steers_a_node_from_its_page() {
     );
     assert_eq!(desired().ceiling, Some(3));
     // The node's page follows the change, and offers what applies now.
-    let fragment = next_with(&mut live, "<tr><th>ceiling</th><td>3</td></tr>").await;
+    let fragment = next_with(&mut live, "<tr><th>Ceiling</th><td>3</td></tr>").await;
     for want in [
         "<p class=\"now\">Max concurrent jobs: 3</p>",
         "<button>Remove the limit</button>",
@@ -2903,11 +2922,11 @@ async fn an_operator_steers_a_node_from_its_page() {
     hub.changed(&node);
     let fragment = next_with(&mut live, "draining").await;
     for want in [
-        "<tr><th>sync</th><td>ok</td></tr>",
-        "<tr><th>applied generation</th><td>4</td></tr>",
+        "<tr><th>Sync</th><td>ok</td></tr>",
+        "<tr><th>Applied generation</th><td>4</td></tr>",
         "runner stopped, admission ledger in use, 2 job(s) running",
-        "<tr><th>cannot comply</th><td>no &lt;script&gt;",
-        "<tr><th>cannot set its concurrency</th><td>cannot &lt;script&gt;",
+        "<tr><th>Cannot comply</th><td>no &lt;script&gt;",
+        "<tr><th>Cannot set its concurrency</th><td>cannot &lt;script&gt;",
         "refused: &lt;script&gt;",
         "not taken yet",
         &format!("<a href=\"/audit?node={node}\">"),
@@ -2981,6 +3000,22 @@ async fn a_node_is_steered_only_by_an_operator_s_own_page() {
     assert!(row.desired.is_none());
     assert!(hub.db.node_commands(&node).unwrap().is_empty());
     assert_eq!(hub.db.audits(None, 100).unwrap(), audit_before);
+
+    // Its reach, as a badge.
+    assert!(
+        page.body
+            .contains("<span class=\"badge bad\">unreachable</span>"),
+        "{}",
+        page.body
+    );
+    hub.open_session(&node);
+    let page = get(addr, &format!("/node/{node}"), Some(&viewer)).await;
+    assert!(
+        page.body
+            .contains("<span class=\"badge ok\">connected</span>"),
+        "{}",
+        page.body
+    );
 }
 
 /// A node whose latest session ran protocol version 1 is shown as monitored only, with no
@@ -3176,7 +3211,7 @@ async fn releases_and_rollouts_are_shown_live() {
     assert_eq!(page.status, 200, "{}", page.body);
     assert_secure(&page);
     for want in [
-        "<a href=\"/operations\">operations</a>",
+        "<a href=\"/operations\" aria-current=\"page\">Operations</a>",
         "sse-connect=\"/events/operations\"",
         &format!("<code title=\"{}\">abababababab</code>", "ab".repeat(32)),
         "<td>0.85.0</td><td>3.0 MiB</td><td>no</td>",
@@ -3259,7 +3294,7 @@ async fn placed_jobs_are_shown_live() {
         &format!("<code title=\"{id}\">cdcdcdcd</code>"),
         "<a href=\"https://gitlab.example.com/g/p/-/jobs/7\" target=\"_blank\" \
          rel=\"noopener noreferrer\">GitLab job 7 of g/&lt;b&gt;p&lt;/b&gt; (test)</a>",
-        "<td>gitlab</td><td>ci</td><td>queued</td><td>-</td>",
+        "<td>gitlab</td><td>ci</td><td><span class=\"badge\">queued</span></td><td>-</td>",
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);
     }
@@ -3297,8 +3332,8 @@ async fn an_operator_steers_a_rollout_from_operations() {
     assert_eq!(page.status, 200, "{}", page.body);
     for want in [
         &format!("action=\"{path}\" hx-post=\"{path}\""),
-        "<button>pause</button>",
-        "<button>abort</button>",
+        "<button>Pause</button>",
+        "<button>Abort</button>",
         &format!("X-CSRF-Token&quot;:&quot;{csrf}&quot;"),
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);
@@ -3340,7 +3375,7 @@ async fn an_operator_steers_a_rollout_from_operations() {
     );
     assert!(matches!(state(), RolloutState::Paused { .. }));
     let paused = next_with(&mut live, ">paused<").await;
-    assert!(paused.contains("<button>resume</button>"), "{paused}");
+    assert!(paused.contains("<button>Resume</button>"), "{paused}");
 
     // Pausing a paused rollout is the operation's refusal, said to the operator.
     let reply = steer(&format!("_csrf={csrf}&op=pause"), true).await;
@@ -3482,13 +3517,16 @@ async fn a_node_s_update_is_shown_on_the_nodes_table_and_its_page() {
     let mut nodes = Events::open(addr, "/events/nodes", &cookie).await;
     let first = nodes.next().await.unwrap();
     assert!(
-        first.contains("<td>maintenance, updating to 0.85&lt;b&gt;: validating</td>"),
+        first.contains(
+            "<td><span class=\"badge busy\">maintenance, updating to 0.85&lt;b&gt;: validating\
+             </span></td>",
+        ),
         "{first}"
     );
     let page = get(addr, &format!("/node/{node}"), Some(&cookie)).await;
     assert_eq!(page.status, 200, "{}", page.body);
     for want in [
-        "<tr><th>update</th><td>vk 0.85&lt;b&gt; (<code>abababababab</code>): validating</td>",
+        "<tr><th>Update</th><td>vk 0.85&lt;b&gt; (<code>abababababab</code>): validating</td>",
         &format!("<tr><th>vk sha256</th><td>{}</td></tr>", "12".repeat(32)),
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);
@@ -3777,8 +3815,9 @@ async fn an_oidc_sign_in_gets_its_own_grant_over_anyones() {
 /// refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_default_role_lets_whoever_no_grant_names_view() {
-    let claims =
-        serde_json::json!({"sub": "user-5", "email": "eve@example.com", "email_verified": true});
+    let claims = serde_json::json!({
+        "sub": "user-5", "email": "eve<\"&>@example.com", "email_verified": true,
+    });
     let grants = [("alice@example.com", Role::Operator)];
     for default_role in [None, Some(Role::Viewer)] {
         let (addr, hub) = start_oidc_with(claims.clone(), &grants, default_role).await;
@@ -3793,14 +3832,44 @@ async fn the_default_role_lets_whoever_no_grant_names_view() {
         assert_eq!(reply.status, 200, "{}", reply.body);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].role, Role::Viewer);
-        assert_eq!(sessions[0].identity.as_deref(), Some("eve@example.com"));
+        assert_eq!(
+            sessions[0].identity.as_deref(),
+            Some("eve<\"&>@example.com")
+        );
         let audit = hub.db.audits(None, 10).unwrap();
         assert!(
             audit.iter().any(|r| r
                 .event
-                .contains("signed in as eve@example.com through http://")),
+                .contains("signed in as eve<\"&>@example.com through http://")),
             "{audit:?}"
         );
+        // The top bar names who, escaped, with the full principal for the tooltip and label.
+        let pair = reply
+            .set_cookies()
+            .into_iter()
+            .find(|c| c.starts_with(&format!("{SECURE_COOKIE}=")))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let home = request(
+            addr,
+            "GET",
+            "/",
+            &["Sec-Fetch-Site: same-origin", &format!("Cookie: {pair}")],
+            "",
+        )
+        .await;
+        assert_eq!(home.status, 200, "{}", home.body);
+        let principal = format!(
+            "ui session {} (viewer, eve&lt;&quot;&amp;&gt;@example.com)",
+            sessions[0].id
+        );
+        let want = format!(
+            "<span class=\"identity\" title=\"{principal}\" aria-label=\"{principal}\">\
+             eve&lt;&quot;&amp;&gt;@example.com</span> <span class=\"badge\">viewer</span>"
+        );
+        assert!(home.body.contains(&want), "{want}: {}", home.body);
     }
 }
 
@@ -4064,7 +4133,7 @@ async fn an_operator_uploads_a_release() {
         page.body
     );
     // Fetching is off: no form for it.
-    assert!(!page.body.contains("fetch from GitHub"), "{}", page.body);
+    assert!(!page.body.contains("Fetch from GitHub"), "{}", page.body);
 
     let bin = crate::fetch::tests::fake_vk("0.85.0");
     let reply = post_upload(
@@ -4666,7 +4735,7 @@ async fn an_operator_fetches_a_release_from_github() {
     for want in [
         "action=\"/releases/fetch\" hx-post=\"/releases/fetch\"",
         "<input name=\"version\" value=\"latest\"",
-        "<button name=\"op\" value=\"fetch\">fetch from GitHub</button>",
+        "<button name=\"op\" value=\"fetch\">Fetch from GitHub</button>",
         &format!("From <code>{api}/virtkit-dev/virtkit</code>"),
     ] {
         assert!(page.body.contains(want), "{want}: {}", page.body);

@@ -61,7 +61,7 @@ pub(super) fn dev_key(name: &str) -> String {
 
 /// The actions a VM's page offers, as `(op, label)`: those [`vm_command`] has a command for.
 pub(super) fn vm_ops(w: &Workload) -> Vec<(&'static str, &'static str)> {
-    [("stop", "stop"), ("reboot", "reboot")]
+    [("stop", "Stop"), ("reboot", "Reboot")]
         .into_iter()
         .filter(|(op, _)| vm_command(w, op).is_some())
         .collect()
@@ -150,13 +150,13 @@ pub(super) async fn vm_action(
 pub(super) fn dev_ops(row: &DevRow) -> Vec<(&'static str, &'static str)> {
     let mut ops = Vec::new();
     if row.running() {
-        ops.push(("stop", "stop"));
+        ops.push(("stop", "Stop"));
     } else if row.workspace.is_some() && row.environment.is_some() && !row.has("workspace-missing")
     {
-        ops.push(("start", "start"));
+        ops.push(("start", "Start"));
     }
     if row.stale() {
-        ops.push(("gc", "remove"));
+        ops.push(("gc", "Remove"));
     }
     ops
 }
@@ -446,7 +446,7 @@ pub(super) fn ask_first(
 }
 
 /// Wrap a page's main content in the site's layout, as [`super::local::layout`].
-pub(super) type Layout = fn(&str, &Auth, &Html) -> Html;
+pub(super) type Layout = fn(&str, &str, &Auth, &Html) -> Html;
 
 /// Whether `form` answers `ask`, asked of this session, with what it was asked about as it is
 /// now.
@@ -505,7 +505,7 @@ fn confirm(
     form.raw("<input type=\"hidden\" name=\"nonce\" value=\"")
         .text(&nonce)
         .raw("\"><input type=\"hidden\" name=\"confirm\" value=\"yes\">")
-        .raw("<button>yes, ")
+        .raw("<button class=\"danger\">Yes, ")
         .text(&ask.op)
         .raw("</button></form>");
     if htmx {
@@ -527,8 +527,8 @@ fn confirm(
         .html(&form)
         .raw("<p><a href=\"")
         .text(&ask.back)
-        .raw("\">cancel</a></p>");
-    Ok(super::page(layout("confirm", auth, &main)))
+        .raw("\">Cancel</a></p>");
+    Ok(super::page(layout("Confirm", &ask.back, auth, &main)))
 }
 
 /// A refused action: for htmx, the line saying why, swapped in on its own.
@@ -641,7 +641,7 @@ mod tests {
     fn a_vm_is_offered_what_it_has_a_command_for() {
         let mut w = dev_workload();
         assert_eq!(key(&w), "dev/app-1234");
-        assert_eq!(vm_ops(&w), [("stop", "stop")]);
+        assert_eq!(vm_ops(&w), [("stop", "Stop")]);
         assert_eq!(
             vm_command(&w, "stop").unwrap(),
             ["dev", "stop", "--", "app-1234"].map(OsString::from)
@@ -654,7 +654,7 @@ mod tests {
         assert_eq!(key(&w), format!("vm/{}", w.id));
         w.kind = WorkloadKind::Run;
         // Its run is still named by its pid.
-        assert_eq!(vm_ops(&w), [("stop", "stop"), ("reboot", "reboot")]);
+        assert_eq!(vm_ops(&w), [("stop", "Stop"), ("reboot", "Reboot")]);
         assert_eq!(
             vm_command(&w, "reboot").unwrap(),
             ["reboot", "--", "7"].map(OsString::from)

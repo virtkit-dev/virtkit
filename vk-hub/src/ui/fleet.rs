@@ -21,8 +21,8 @@ use vk_hub_proto::{
 
 use super::html::Html;
 use super::pages::{
-    self, bytes, count, dash, end_section, kv, kv_html, kv_node, mib, rough_bytes, rough_count,
-    section, started,
+    self, bytes, column_is, count, dash, end_section, header_cells, kv, kv_html, kv_node, mib,
+    open_cell, rough_bytes, rough_count, section, started,
 };
 use super::sse::{self, Source};
 use super::{Auth, Body, Ui, actions, blocking, decode_form, field, message, operations, page};
@@ -510,13 +510,16 @@ pub(super) async fn rollout_action(
 }
 
 /// The page around `main`, with the fleet's navigation.
-pub(super) fn layout(title: &str, auth: &Auth, main: &Html) -> Html {
-    pages::frame(title, auth, NAV, main)
+pub(super) fn layout(title: &str, here: &str, auth: &Auth, main: &Html) -> Html {
+    pages::frame(title, here, auth, NAV, main)
 }
 
 /// The fleet's navigation.
-pub(super) const NAV: &str =
-    "<a href=\"/\">nodes</a> <a href=\"/operations\">operations</a> <a href=\"/audit\">audit</a>";
+pub(super) const NAV: pages::Nav = &[
+    ("/", "Nodes"),
+    ("/operations", "Operations"),
+    ("/audit", "Audit"),
+];
 
 /// `/`: the nodes table.
 fn nodes(auth: &Auth, nodes: &[NodeView], now: u64) -> Html {
@@ -528,7 +531,7 @@ fn nodes(auth: &Auth, nodes: &[NodeView], now: u64) -> Html {
     if auth.session.role >= Role::Operator {
         token_form(&mut main, auth);
     }
-    layout("nodes", auth, &main)
+    layout("Nodes", "/", auth, &main)
 }
 
 /// An operator's enrollment form, outside the live fragment. A plain POST returns the token
@@ -538,7 +541,7 @@ fn token_form(h: &mut Html, auth: &Auth) {
         .raw(TOKEN_PATH)
         .raw("\">");
     pages::csrf_field(h, auth);
-    h.raw("<label>valid for <select name=\"ttl\">");
+    h.raw("<label>Valid for <select name=\"ttl\">");
     for (secs, label) in TOKEN_TTLS {
         h.raw("<option value=\"")
             .text(secs.to_string())
@@ -546,7 +549,8 @@ fn token_form(h: &mut Html, auth: &Auth) {
             .text(label)
             .raw("</option>");
     }
-    h.raw("</select></label><button>issue an enrollment token</button></form>")
+    h.raw("</select></label>")
+        .raw("<button class=\"primary\">Issue an enrollment token</button></form>")
         .raw("<p class=\"sub\">Single-use: the node redeems it with <code>vk node join</code>, ")
         .raw("which pins the node's key. Shown a single time.</p></section>");
 }
@@ -606,14 +610,15 @@ pub(super) async fn create_token(req: Request<Incoming>, ui: &Ui) -> Result<Resp
     url(&mut main);
     main.raw(" --token -</code>, then <code>vk node service install</code>. Read on stdin, ")
         .raw("the token stays out of the shell's history and the process list.</p>")
-        .raw("<p><a href=\"/\">back to the nodes</a></p>");
-    Ok(page(layout("enrollment token", &auth, &main)))
+        .raw("<p><a href=\"/\">Back to the nodes</a></p>");
+    Ok(page(layout("Enrollment token", "/", &auth, &main)))
 }
 
 // Columns with custom rendering in `vk-hub nodes` and `vk workloads` (a node's VMs
 // here, the host's in local mode). Name checks make a reordering fail to build.
 const NODE_ID: usize = 0;
 const NODE_NAME: usize = 1;
+const NODE_REACH: usize = 2;
 const NODE_STATE: usize = 3;
 const NODE_SYNC: usize = 7;
 const NODE_LAST_SEEN: usize = 8;
@@ -628,6 +633,7 @@ pub(super) const VM_STARTED: usize = 7;
 const _: () = {
     let nodes = &crate::NODE_COLUMNS;
     assert!(column_is(nodes, NODE_ID, "ID") && column_is(nodes, NODE_NAME, "NAME"));
+    assert!(column_is(nodes, NODE_REACH, "REACH"));
     assert!(column_is(nodes, NODE_STATE, "STATE") && column_is(nodes, NODE_SYNC, "SYNC"));
     assert!(column_is(nodes, NODE_LAST_SEEN, "LAST SEEN") && column_is(nodes, NODE_VK, "VK"));
     let vms = &crate::workloads::COLUMNS;
@@ -638,23 +644,29 @@ const _: () = {
     assert!(column_is(vms, VM_STARTED, "STARTED"));
 };
 
-/// Whether `columns[i]` is `name`, at compile time.
-const fn column_is(columns: &[&str], i: usize, name: &str) -> bool {
-    if i >= columns.len() {
-        return false;
+/// The badge opening a node's reach: up or down.
+fn reach_badge(connected: bool) -> &'static str {
+    if connected {
+        "<span class=\"badge ok\">"
+    } else {
+        "<span class=\"badge bad\">"
     }
-    let (a, b) = (columns[i].as_bytes(), name.as_bytes());
-    if a.len() != b.len() {
-        return false;
+}
+
+/// The badge opening a node's state, coloured by where it stands: in service, out of it for
+/// a while, under maintenance, or taken out until an operator says otherwise.
+fn state_badge(v: &NodeView) -> &'static str {
+    use vk_hub_proto::NodeState;
+    if v.monitoring_only() {
+        return "<span class=\"badge\">";
     }
-    let mut k = 0;
-    while k < a.len() {
-        if a[k] != b[k] {
-            return false;
-        }
-        k += 1;
+    match v.report.as_ref().and_then(|r| r.state) {
+        Some(NodeState::Ready) => "<span class=\"badge ok\">",
+        Some(NodeState::Draining | NodeState::Drained) => "<span class=\"badge warn\">",
+        Some(NodeState::Maintenance | NodeState::Validating) => "<span class=\"badge busy\">",
+        Some(NodeState::Quarantined) => "<span class=\"badge bad\">",
+        None => "<span class=\"badge\">",
     }
-    true
 }
 
 /// The nodes table, with the columns of `vk-hub nodes`.
@@ -666,9 +678,7 @@ fn nodes_table(nodes: &[NodeView], now: u64) -> Html {
         return h;
     }
     h.raw("<table class=\"grid\"><thead><tr>");
-    for column in crate::NODE_COLUMNS {
-        h.raw("<th>").text(column).raw("</th>");
-    }
+    header_cells(&mut h, &crate::NODE_COLUMNS);
     h.raw("</tr></thead><tbody>");
     for n in nodes {
         let mut cells = crate::node_cells(n, now);
@@ -679,22 +689,30 @@ fn nodes_table(nodes: &[NodeView], now: u64) -> Html {
         h.raw("<tr class=\"")
             .raw(if n.connected { "up" } else { "down" })
             .raw("\">");
-        for (i, cell) in cells.iter().enumerate() {
-            h.raw("<td>");
+        for (i, (cell, column)) in cells.iter().zip(crate::NODE_COLUMNS).enumerate() {
+            open_cell(&mut h, column);
             match i {
                 // The ID, short, and the name, both leading to the node's page; the ID is
                 // one the hub issued and the router checks as hex.
                 NODE_ID | NODE_NAME => {
                     h.raw("<a href=\"/node/").text(&n.id).raw("\">");
                     if i == NODE_ID {
-                        h.text(n.id.get(..8).unwrap_or(&n.id));
+                        h.raw("<code>")
+                            .text(n.id.get(..8).unwrap_or(&n.id))
+                            .raw("</code>");
                     } else {
                         h.node(cell);
                     }
                     h.raw("</a>");
                 }
-                // What the node sent: its version, and the one it is updating to.
-                NODE_STATE | NODE_VK => {
+                NODE_REACH => {
+                    h.raw(reach_badge(n.connected)).text(cell).raw("</span>");
+                }
+                // What the node sent: its state, its version and the one it is updating to.
+                NODE_STATE => {
+                    h.raw(state_badge(n)).node(cell).raw("</span>");
+                }
+                NODE_VK => {
                     h.node(cell);
                 }
                 NODE_LAST_SEEN => {
@@ -733,7 +751,7 @@ fn node(auth: &Auth, detail: &NodeDetail, now: u64) -> Html {
         .raw("\" sse-swap=\"node\" sse-close=\"close\">")
         .html(&node_detail(detail, now, csrf))
         .raw("</div>");
-    layout(&detail.view.hostname, auth, &main)
+    layout(&detail.view.hostname, "/", auth, &main)
 }
 
 /// The session's CSRF token for node actions, or `None` to omit unauthorized controls.
@@ -960,7 +978,7 @@ fn steer_panel(h: &mut Html, v: &NodeView, csrf: Option<&str>) {
     if let Some(a) = &p.lift {
         act(h, a, "");
     }
-    h.raw("</div><div class=\"group\"><h3>Maintenance</h3><p class=\"now\">")
+    h.raw("</div><div class=\"group maintenance\"><h3>Maintenance</h3><p class=\"now\">")
         .raw(p.maintenance)
         .raw("</p>");
     for a in &p.maintenance_acts {
@@ -1027,12 +1045,13 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
     h.raw("<p class=\"sub\"><code>")
         .text(&v.id)
         .raw("</code> · ")
+        .raw(reach_badge(v.connected))
         .raw(if v.connected {
             "connected"
         } else {
             "unreachable"
         })
-        .raw(" · last seen ");
+        .raw("</span> · last seen ");
     match v.last_seen {
         Some(t) => time_ago(&mut h, now, t),
         None => h.raw("never"),
@@ -1047,19 +1066,19 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
     let heartbeat = d.row.heartbeat.as_ref();
     section(&mut h, "Load");
     if let Some(why) = &v.last_refusal {
-        kv_node(&mut h, "refuses reservations", why);
+        kv_node(&mut h, "Refuses reservations", why);
     }
     match heartbeat {
-        None => kv(&mut h, "heartbeat", "none yet"),
+        None => kv(&mut h, "Heartbeat", "none yet"),
         Some(hb) => {
             if let Some(at) = d.row.heartbeat_at {
-                kv_html(&mut h, "heartbeat", &time_ago_html(now, at));
+                kv_html(&mut h, "Heartbeat", &time_ago_html(now, at));
             }
             match &hb.admission {
                 Some(a) => {
                     kv(
                         &mut h,
-                        "admitted memory",
+                        "Admitted memory",
                         &format!(
                             "{} of {}",
                             mib(a.committed_mib),
@@ -1068,21 +1087,21 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
                     );
                     kv(
                         &mut h,
-                        "jobs",
+                        "Jobs",
                         &format!("{} admitted, {} waiting", a.running, a.waiting),
                     );
                 }
-                None => kv(&mut h, "admission", "unreadable"),
+                None => kv(&mut h, "Admission", "unreadable"),
             }
             kv(
                 &mut h,
-                "memory available",
+                "Memory available",
                 &hb.mem_available_mib
                     .map_or_else(dash, |m| rough_bytes(m.saturating_mul(1 << 20))),
             );
             kv(
                 &mut h,
-                "concurrency asked of the runner",
+                "Concurrency asked of the runner",
                 &count(hb.desired_concurrency),
             );
         }
@@ -1094,12 +1113,12 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
     let inventory = d.row.inventory.as_ref();
     section(&mut h, "Hardware");
     match inventory {
-        None => kv(&mut h, "inventory", "none yet"),
+        None => kv(&mut h, "Inventory", "none yet"),
         Some(inv) => {
             let hw = &inv.hardware;
             kv(&mut h, "CPUs", &hw.cpus.to_string());
             kv_node(&mut h, "CPU model", hw.cpu_model.as_deref().unwrap_or("-"));
-            kv(&mut h, "memory", &hw.mem_total_mib.map_or_else(dash, mib));
+            kv(&mut h, "Memory", &hw.mem_total_mib.map_or_else(dash, mib));
             for m in &hw.memory_nodes {
                 kv(
                     &mut h,
@@ -1108,7 +1127,7 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
                 );
             }
             for c in &hw.checks {
-                h.raw("<tr><th>check ").node(&c.name).raw("</th><td>");
+                h.raw("<tr><th>Check ").node(&c.name).raw("</th><td>");
                 if c.ok {
                     h.raw("ok");
                 } else {
@@ -1178,19 +1197,19 @@ fn node_detail(d: &NodeDetail, now: u64, csrf: Option<&str>) -> Html {
         );
         kv_node(
             &mut h,
-            "guest kernel",
+            "Guest kernel",
             inv.versions.guest_kernel.as_deref().unwrap_or("-"),
         );
-        kv_node(&mut h, "configuration hash", &inv.versions.config_hash);
+        kv_node(&mut h, "Configuration hash", &inv.versions.config_hash);
         end_section(&mut h);
 
         section(&mut h, "Runner");
         match &inv.runner {
-            None => kv(&mut h, "configuration", "unreadable"),
+            None => kv(&mut h, "Configuration", "unreadable"),
             Some(r) => {
-                kv_node(&mut h, "configuration", &r.config);
-                kv(&mut h, "concurrent", &count(r.concurrent));
-                h.raw("<tr><th>runners</th><td>");
+                kv_node(&mut h, "Configuration", &r.config);
+                kv(&mut h, "Concurrent", &count(r.concurrent));
+                h.raw("<tr><th>Runners</th><td>");
                 for (i, name) in r.runners.iter().enumerate() {
                     if i > 0 {
                         h.raw(", ");
@@ -1213,7 +1232,7 @@ fn steering(h: &mut Html, d: &NodeDetail, now: u64) {
         section(h, "Steering");
         kv(
             h,
-            "steering",
+            "Steering",
             &format!(
                 "none: the node speaks fleet protocol version {version}, so the hub monitors it \
                  and cannot steer it; update its vk"
@@ -1227,41 +1246,41 @@ fn steering(h: &mut Html, d: &NodeDetail, now: u64) {
     match &v.desired {
         None => kv(
             h,
-            "desired state",
+            "Desired state",
             "nothing asked: no ceiling, acquisition running",
         ),
         Some(desired) => {
-            kv(h, "generation", &desired.generation.to_string());
-            kv(h, "ceiling", &count(desired.ceiling));
+            kv(h, "Generation", &desired.generation.to_string());
+            kv(h, "Ceiling", &count(desired.ceiling));
             kv(
                 h,
-                "acquisition",
+                "Acquisition",
                 crate::acquisition_name(desired.acquisition),
             );
         }
     }
-    kv(h, "sync", &crate::node_cells(v, now)[NODE_SYNC]);
+    kv(h, "Sync", &crate::node_cells(v, now)[NODE_SYNC]);
     end_section(h);
 
     section(h, "Reported by the node");
     match &v.report {
-        None => kv(h, "report", "none yet"),
+        None => kv(h, "Report", "none yet"),
         Some(r) => {
             let or_dash = |s: Option<&str>| s.unwrap_or("-").to_string();
             kv(
                 h,
-                "applied generation",
+                "Applied generation",
                 &r.applied_generation().map_or_else(dash, |g| g.to_string()),
             );
-            kv(h, "state", &or_dash(r.state.map(crate::store::state_name)));
+            kv(h, "State", &or_dash(r.state.map(crate::store::state_name)));
             kv(
                 h,
-                "acquisition",
+                "Acquisition",
                 &or_dash(r.acquisition.map(crate::acquisition_name)),
             );
             kv(
                 h,
-                "runner",
+                "Runner",
                 &or_dash(r.runner.map(|m| match m {
                     RunnerMode::Managed => "managed",
                     RunnerMode::External => "external",
@@ -1270,7 +1289,7 @@ fn steering(h: &mut Html, d: &NodeDetail, now: u64) {
             if let Some(state) = r.runner_state {
                 kv(
                     h,
-                    "runner process",
+                    "Runner process",
                     match state {
                         RunnerState::Running => "running",
                         RunnerState::Quitting => "quitting: finishing its jobs",
@@ -1281,7 +1300,7 @@ fn steering(h: &mut Html, d: &NodeDetail, now: u64) {
             if let Some(c) = r.concurrency {
                 kv(
                     h,
-                    "concurrency",
+                    "Concurrency",
                     &format!(
                         "{}: the least of the estimate {}, the hub's ceiling {} and the local \
                          ceiling {}",
@@ -1295,7 +1314,7 @@ fn steering(h: &mut Html, d: &NodeDetail, now: u64) {
             if let Some(p) = r.drain {
                 kv(
                     h,
-                    "drain",
+                    "Drain",
                     &format!(
                         "runner {}, admission ledger {}, {} job(s) running",
                         if p.runner_stopped {
@@ -1309,13 +1328,13 @@ fn steering(h: &mut Html, d: &NodeDetail, now: u64) {
                 );
             }
             for note in &r.unsupported {
-                kv_node(h, "cannot comply", note);
+                kv_node(h, "Cannot comply", note);
             }
             if let Some(e) = &r.concurrency_error {
-                kv_node(h, "cannot set its concurrency", e);
+                kv_node(h, "Cannot set its concurrency", e);
             }
             if let Some(u) = &r.update {
-                h.raw("<tr><th>update</th><td>vk ")
+                h.raw("<tr><th>Update</th><td>vk ")
                     .node(&u.version)
                     .raw(" (<code>")
                     .node(crate::store::short(&u.sha256))
@@ -1366,7 +1385,7 @@ fn commands(h: &mut Html, d: &NodeDetail, now: u64) {
     // The node's ID: the router took it as hex.
     h.raw("<p><a href=\"/audit?node=")
         .text(&d.view.id)
-        .raw("\">the node's audit log</a></p></section>");
+        .raw("\">The node's audit log</a></p></section>");
 }
 
 /// The VMs the node reports running, with what each holds from the last heartbeat. Every
@@ -1383,9 +1402,7 @@ fn workloads(h: &mut Html, workloads: Option<&crate::store::Workloads>) {
         return;
     }
     h.raw("<table class=\"grid\"><thead><tr>");
-    for column in crate::workloads::COLUMNS {
-        h.raw("<th>").text(column).raw("</th>");
-    }
+    header_cells(h, &crate::workloads::COLUMNS);
     h.raw("</tr></thead><tbody>");
     for w in list {
         let mem = workloads.mem_bytes.get(&w.id).copied();
@@ -1396,8 +1413,8 @@ fn workloads(h: &mut Html, workloads: Option<&crate::store::Workloads>) {
         cells[VM_IN_USE] = mem.map_or_else(dash, rough_bytes);
         cells[VM_STARTED] = w.started_at.map_or_else(dash, started);
         h.raw("<tr>");
-        for (i, cell) in cells.iter().enumerate() {
-            h.raw("<td>");
+        for (i, (cell, column)) in cells.iter().zip(crate::workloads::COLUMNS).enumerate() {
+            open_cell(h, column);
             match i {
                 VM_STARTED => match w.started_at {
                     Some(t) => pages::time(h, t, cell),
@@ -1452,7 +1469,7 @@ fn operations(auth: &Auth, ops: &Operations, nodes: &[NodeView], now: u64) -> Ht
     if steer {
         main.raw("</div>");
     }
-    layout("operations", auth, &main)
+    layout("Operations", "/operations", auth, &main)
 }
 
 /// `/operations`' live part. With `steer`, each rollout still under way carries the buttons
@@ -1527,8 +1544,9 @@ fn placed_jobs(h: &mut Html, jobs: &[(String, crate::store::JobRow)], now: u64) 
             .raw("</td><td>")
             .text(&j.placement.pool)
             .raw("</td><td>")
+            .raw(job_badge(j))
             .text(state)
-            .raw("</td><td>");
+            .raw("</span></td><td>");
         match &j.node {
             // The router takes only hex for a node's ID.
             Some(node) if vk_hub_proto::valid_id(node) => {
@@ -1549,6 +1567,17 @@ fn placed_jobs(h: &mut Html, jobs: &[(String, crate::store::JobRow)], now: u64) 
             .raw("</td></tr>");
     }
     h.raw("</tbody></table></section>");
+}
+
+/// The badge opening a placed job's state: waiting, under way, or how it ended.
+fn job_badge(j: &crate::store::JobRow) -> &'static str {
+    use vk_hub_proto::client::JobState;
+    match (j.state, &j.result) {
+        (JobState::Finished, Some(r)) if r.failure.is_none() => "<span class=\"badge ok\">",
+        (JobState::Finished, Some(_)) => "<span class=\"badge bad\">",
+        (JobState::Starting | JobState::Running, _) => "<span class=\"badge busy\">",
+        _ => "<span class=\"badge\">",
+    }
 }
 
 /// One rollout: what it updates to and how, its state, and each node by wave.
@@ -1598,8 +1627,8 @@ fn rollout(h: &mut Html, r: &Rollout, steer: bool, now: u64) {
     if steer && row.state.active() {
         h.raw("<div class=\"actions\">");
         let ops: [(&str, &str); 2] = match row.state {
-            RolloutState::Running => [("pause", "pause"), ("abort", "abort")],
-            _ => [("resume", "resume"), ("abort", "abort")],
+            RolloutState::Running => [("pause", "Pause"), ("abort", "Abort")],
+            _ => [("resume", "Resume"), ("abort", "Abort")],
         };
         let path = format!("/rollout/{}/action", r.id);
         for (op, label) in ops {

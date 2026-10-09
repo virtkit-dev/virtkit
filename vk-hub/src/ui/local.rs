@@ -51,12 +51,15 @@ impl LocalSite {
 }
 
 /// Local mode's navigation.
-pub(super) const NAV: &str = "<a href=\"/\">VMs</a> <a href=\"/dev\">dev environments</a> \
-                              <a href=\"/audit\">audit</a>";
+pub(super) const NAV: pages::Nav = &[
+    ("/", "VMs"),
+    ("/dev", "Dev environments"),
+    ("/audit", "Audit"),
+];
 
 /// The page around `main`, with local mode's navigation.
-pub(super) fn layout(title: &str, auth: &Auth, main: &Html) -> Html {
-    pages::frame(title, auth, NAV, main)
+pub(super) fn layout(title: &str, here: &str, auth: &Auth, main: &Html) -> Html {
+    pages::frame(title, here, auth, NAV, main)
 }
 
 /// Start the task that renders the VMs table once for every page listing it.
@@ -434,7 +437,7 @@ fn list(auth: &Auth, listing: &Listing) -> Html {
         .raw("sse-close=\"close\">")
         .html(&vms_table(listing))
         .raw("</div>");
-    layout("VMs", auth, &main)
+    layout("VMs", "/", auth, &main)
 }
 
 /// The VMs as `vk workloads` last listed them, or why there is no list.
@@ -459,15 +462,13 @@ fn vms_table(listing: &Listing) -> Html {
         return h;
     }
     h.raw("<table class=\"grid\"><thead><tr>");
-    for column in crate::workloads::COLUMNS {
-        h.raw("<th>").text(column).raw("</th>");
-    }
+    pages::header_cells(&mut h, &crate::workloads::COLUMNS);
     h.raw("</tr></thead><tbody>");
     for w in &list.workloads {
         let cells = cells(w, list.mem_bytes.get(&w.id).copied());
         h.raw("<tr>");
-        for (i, cell) in cells.iter().enumerate() {
-            h.raw("<td>");
+        for (i, (cell, column)) in cells.iter().zip(crate::workloads::COLUMNS).enumerate() {
+            pages::open_cell(&mut h, column);
             match i {
                 VM_STARTED => {
                     match w.started_at {
@@ -578,7 +579,7 @@ fn vm(auth: &Auth, id: &str, w: &Workload, mem: Option<u64>, local: &Local, view
         .raw("<a href=\"/vm/")
         .text(id)
         .raw("\">reload</a> for newer.</p>");
-    layout(&crate::workloads::owner(w), auth, &main)
+    layout(&crate::workloads::owner(w), "/", auth, &main)
 }
 
 /// What a command printed, made [terminal-safe](Html::output).
@@ -601,28 +602,28 @@ fn gone() -> Html {
 fn vm_detail(w: &Workload, mem: Option<u64>, local: &Local) -> Html {
     let mut h = Html::new();
     section(&mut h, "VM");
-    kv(&mut h, "kind", crate::workloads::kind_name(w.kind));
-    kv_node(&mut h, "state dir", &w.state_dir);
+    kv(&mut h, "Kind", crate::workloads::kind_name(w.kind));
+    kv_node(&mut h, "State dir", &w.state_dir);
     for (key, value) in [
-        ("image", &w.label),
-        ("project", &w.project),
-        ("job", &w.job_name),
-        ("job ID", &w.job_id),
-        ("workspace", &w.workspace),
-        ("environment", &w.environment),
+        ("Image", &w.label),
+        ("Project", &w.project),
+        ("Job", &w.job_name),
+        ("Job ID", &w.job_id),
+        ("Workspace", &w.workspace),
+        ("Environment", &w.environment),
     ] {
         if let Some(value) = value {
             kv_node(&mut h, key, value);
         }
     }
     if let Some(url) = &w.job_url {
-        h.raw("<tr><th>on GitLab</th><td>")
+        h.raw("<tr><th>On GitLab</th><td>")
             .external_link(Some(url), url)
             .raw("</td></tr>");
     }
     kv(
         &mut h,
-        "managed by pid",
+        "Managed by pid",
         &w.pid.map_or_else(dash, |p| p.to_string()),
     );
     kv(
@@ -632,19 +633,19 @@ fn vm_detail(w: &Workload, mem: Option<u64>, local: &Local) -> Html {
     );
     kv(
         &mut h,
-        "memory reserved",
+        "Memory reserved",
         &w.mem_reserved_mib.map_or_else(dash, pages::mib),
     );
     kv(
         &mut h,
-        "memory held",
+        "Memory held",
         &mem.map_or_else(dash, pages::rough_bytes),
     );
     match w.started_at {
-        Some(t) => kv_html(&mut h, "started", &pages::at_html(t)),
-        None => kv(&mut h, "started", &dash()),
+        Some(t) => kv_html(&mut h, "Started", &pages::at_html(t)),
+        None => kv(&mut h, "Started", &dash()),
     }
-    h.raw("<tr><th>last action</th><td>");
+    h.raw("<tr><th>Last action</th><td>");
     super::actions::action_line(&mut h, local.action(&super::actions::key(w)).as_ref());
     h.raw("</td></tr>");
     end_section(&mut h);

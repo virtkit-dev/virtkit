@@ -994,6 +994,20 @@ extension and `time.js`, and no other script. htmx runs with `allowEval`, `allow
 and `includeIndicatorStyles` off and `selfRequestsOnly` on; the pages have no inline script
 or style for the policy to refuse.
 
+The stylesheet is the UI's only styling: no framework, font or other file. Each page opens on
+a top bar with the site's pages, the one it is under marked (`aria-current`), and who is
+signed in with their role and when the session ends. Sections are cards. Badges show node
+reach and state, placed job states and rollout states, with text and colour: green for
+connected, in service, succeeded or done; amber for draining or paused; blue for maintenance
+or work under way; red for unreachable, quarantined, failed or aborted; grey for monitored
+only, queued or unknown. Tables have sticky headers, right-aligned figures and monospace
+IDs. Links in text and table cells are underlined. Node steering groups have distinct
+borders, with a red background for the danger zone.
+Colours are custom properties set for light and dark, following the browser's
+`prefers-color-scheme`, with visible focus rings; in a window 760 pixels wide or less the top
+bar wraps and wide tables scroll on their own. A printed page is light, without the sign-out
+form, filters, buttons or steering.
+
 Node IDs, issued by the hub and checked as fixed-length lowercase hex — and in local mode the
 VM IDs `vk workloads` derives, checked the same way, and dev environment names, checked to be
 `[A-Za-z0-9._-]` not starting with `.` or `-` — are the only values in an attribute htmx reads
@@ -1104,7 +1118,10 @@ session: a random secret set as a cookie (`HttpOnly`, `SameSite=Strict`, `Path=/
 and valid for 12 hours. The page it answers moves on to `/` itself, so the token never stays
 in the address bar. `vk-hub ui sessions|logout <id>|--all` (`vk-hub local sessions|logout`)
 list and end sessions, each with who issued its link or whom the provider signed in; an ID,
-12 hex digits, ends every session that shares it, and one naming none is an error.
+12 hex digits, ends every session that shares it, and one naming none is an error. Each
+page's top bar names the session's identity, or "link from" whoever issued its link, with its
+role and a button that signs out; its full principal, with the session's ID for `logout`, is
+the name's tooltip and accessible label.
 
 Browsers keep cookies apart by host, not by port. On plain http — which the UI serves only
 on loopback — the session cookie therefore reaches every other http service on that host,

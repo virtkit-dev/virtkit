@@ -172,7 +172,12 @@ pub(super) async fn page(auth: &Auth, ui: &Ui, site: &LocalSite) -> Response<Bod
         Ok(rows) => table(&mut main, rows, &site.local, steer.then_some(auth)),
     }
     main.raw("<p class=\"sub\">Read as the page loads; <a href=\"/dev\">reload</a> for newer.</p>");
-    super::page(super::local::layout("dev environments", auth, &main))
+    super::page(super::local::layout(
+        "Dev environments",
+        "/dev",
+        auth,
+        &main,
+    ))
 }
 
 fn table(h: &mut Html, rows: &[DevRow], local: &Local, steer: Option<&Auth>) {

@@ -607,12 +607,12 @@ pub(super) fn forms(
         .raw("\" enctype=\"multipart/form-data\">");
     // Before the file: the hub checks them before it writes a byte of it.
     csrf_field(h, auth);
-    h.raw("<label>version <input name=\"version\" required size=\"10\" ")
+    h.raw("<label>Version <input name=\"version\" required size=\"10\" ")
         .raw("placeholder=\"0.85.0\"></label>")
-        .raw("<label>signature <input name=\"signature\" size=\"24\" ")
+        .raw("<label>Signature <input name=\"signature\" size=\"24\" ")
         .raw("placeholder=\"optional: vk release-key sign\"></label>")
         .raw("<label>vk binary <input type=\"file\" name=\"file\" required></label>")
-        .raw("<button>upload</button></form><p class=\"sub\">At most ")
+        .raw("<button class=\"primary\">Upload</button></form><p class=\"sub\">At most ")
         .text(pages::bytes(MAX_UPLOAD))
         .raw(", sent at ")
         .text(pages::bytes(MIN_RATE))
@@ -627,9 +627,9 @@ pub(super) fn forms(
             .raw(FETCH_PATH)
             .raw("\" hx-swap=\"none\">");
         csrf_field(h, auth);
-        h.raw("<label>version <input name=\"version\" value=\"latest\" size=\"10\"></label>")
-            .raw("<button name=\"op\" value=\"fetch\">fetch from GitHub</button>")
-            .raw("<button name=\"op\" value=\"check\">check the latest</button></form>")
+        h.raw("<label>Version <input name=\"version\" value=\"latest\" size=\"10\"></label>")
+            .raw("<button name=\"op\" value=\"fetch\">Fetch from GitHub</button>")
+            .raw("<button name=\"op\" value=\"check\">Check the latest</button></form>")
             .raw("<p class=\"sub\">From <code>")
             .text(source)
             .raw(
@@ -655,7 +655,7 @@ pub(super) fn forms(
         .raw("\" hx-swap=\"none\">");
     csrf_field(h, auth);
     h.raw("<input type=\"hidden\" name=\"op\" value=\"create\">")
-        .raw("<label>release <select name=\"release\" required>");
+        .raw("<label>Release <select name=\"release\" required>");
     for r in releases {
         h.raw("<option value=\"")
             .text(&r.sha256)
@@ -670,9 +670,9 @@ pub(super) fn forms(
             })
             .raw("</option>");
     }
-    h.raw("</select></label><fieldset><legend>nodes</legend>")
-        .raw("<label><input type=\"radio\" name=\"select\" value=\"all\" checked> all</label>")
-        .raw("<label><input type=\"radio\" name=\"select\" value=\"some\"> only:</label>");
+    h.raw("</select></label><fieldset><legend>Nodes</legend>")
+        .raw("<label><input type=\"radio\" name=\"select\" value=\"all\" checked> All</label>")
+        .raw("<label><input type=\"radio\" name=\"select\" value=\"some\"> Only:</label>");
     for n in nodes.iter().filter(|n| vk_hub_proto::valid_id(&n.id)) {
         h.raw("<label><input type=\"checkbox\" name=\"node\" value=\"")
             .text(&n.id)
@@ -681,19 +681,19 @@ pub(super) fn forms(
             .raw("</label>");
     }
     h.raw("</fieldset>")
-        .raw("<label>batch <input type=\"number\" name=\"batch\" min=\"1\" value=\"1\" ")
+        .raw("<label>Batch <input type=\"number\" name=\"batch\" min=\"1\" value=\"1\" ")
         .raw("required size=\"4\"></label>")
         .raw("<label><input type=\"checkbox\" name=\"canary_per_profile\" value=\"yes\"> ")
-        .raw("a canary per hardware profile first</label>")
-        .raw("<label>failures to absorb <input type=\"number\" name=\"max_failures\" ")
+        .raw("A canary per hardware profile first</label>")
+        .raw("<label>Failures to absorb <input type=\"number\" name=\"max_failures\" ")
         .raw("min=\"0\" value=\"0\" required size=\"4\"></label>")
-        .raw("<label>node timeout <input name=\"node_timeout\" value=\"30m\" required ")
+        .raw("<label>Node timeout <input name=\"node_timeout\" value=\"30m\" required ")
         .raw("size=\"5\"></label>")
-        .raw("<label>drain timeout <input name=\"drain_timeout\" value=\"4h\" required ")
+        .raw("<label>Drain timeout <input name=\"drain_timeout\" value=\"4h\" required ")
         .raw("size=\"5\"></label>")
         .raw("<label><input type=\"checkbox\" name=\"force\" value=\"yes\"> ")
-        .raw("include external runners, without a drain</label>")
-        .raw("<button>start rollout</button></form></section>");
+        .raw("Include external runners, without a drain</label>")
+        .raw("<button class=\"primary\">Start rollout</button></form></section>");
 }
 
 /// The fetch under way or last ended, and the latest release last asked about: a line of
