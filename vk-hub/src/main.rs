@@ -469,15 +469,20 @@ enum NodesCmd {
     },
     /// Stop the node's runner taking new jobs; running ones finish
     ///
-    /// Needs `[node] runner = "managed"` on the node; an external runner reports it cannot.
+    /// With `[node] runner = "external"`, the node stops taking the jobs the hub places and
+    /// reports that its runner may still take jobs. Drain and quarantine behave the same way.
     Stop { id: String },
     /// Let the node's runner take jobs again
     Resume { id: String },
     /// Stop taking jobs and report `drained` once everything running has finished
+    ///
+    /// With `[node] runner = "external"`, only the jobs the hub places.
     Drain { id: String },
     /// End a drain: back to `ready`, taking jobs
     Undrain { id: String },
     /// Stop taking jobs until `release`, whatever else the node is told
+    ///
+    /// With `[node] runner = "external"`, only the jobs the hub places.
     Quarantine { id: String },
     /// End a quarantine: back to `ready`
     Release { id: String },
@@ -505,8 +510,7 @@ enum NodesCmd {
         /// The release's sha256, or at least its first 8 hex digits
         #[arg(long)]
         release: String,
-        /// Ask a node whose runner is external, which cannot be drained, to update without
-        /// draining
+        /// Update without draining when vk node cannot drain the external runner
         #[arg(long)]
         force: bool,
     },

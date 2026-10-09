@@ -153,7 +153,9 @@ pub struct Trial {
 
 /// What a node can do, which decides what commands it takes.
 pub struct Abilities {
-    /// It runs its runner, so it can stop it: a drain, a quarantine and a reset need that.
+    /// The node runs and can stop its runner, as reset and update without `force` require.
+    /// Drain and quarantine also work with an external runner: the node runs hub-placed jobs
+    /// itself in either mode.
     pub managed: bool,
     /// Whether it can install the update a command names, or why not. Looked at only for an
     /// update.
@@ -301,23 +303,21 @@ impl Persisted {
 
     /// A drain, an update and a reset are `accepted` and settle later
     /// ([`Persisted::finish_drain`], [`Persisted::end_job`]); every other operation is done at
-    /// once. A drain, a quarantine and a reset stop the runner taking jobs, which this node
-    /// cannot do to a runner it does not run.
+    /// once. A reset clears what the runner's jobs leave behind, and a runner this node does
+    /// not run could still be using it; a drain and a quarantine stop only what the node runs
+    /// itself, the jobs the hub places.
     fn execute(&mut self, command: &Command, now: u64, can: &Abilities) -> Outcome {
         let refused = |reason: &str| Outcome::Refused {
             reason: reason.to_string(),
         };
         let (op, managed) = (&command.op, can.managed);
-        if let Some(outcome) = self.during_job(op, managed) {
+        if let Some(outcome) = self.during_job(op) {
             return outcome;
         }
         match (op, self.state) {
             (Operation::Drain | Operation::Undrain, NodeState::Quarantined) => {
                 refused("the node is quarantined; release it first")
             }
-            (Operation::Drain | Operation::Quarantine, _) if !managed => refused(
-                "vk node cannot stop a runner it does not run ([node] runner = \"external\")",
-            ),
             (Operation::Drain, NodeState::Ready) => {
                 self.state = NodeState::Draining;
                 Outcome::Accepted
@@ -392,7 +392,7 @@ impl Persisted {
                     signature: signature.clone(),
                 };
                 let (resume, next) = match state {
-                    // An external runner cannot be drained: straight to the download.
+                    // vk node cannot drain an external runner: straight to the download.
                     NodeState::Ready if !managed => (NodeState::Ready, NodeState::Maintenance),
                     NodeState::Ready => (NodeState::Ready, NodeState::Draining),
                     NodeState::Draining => (NodeState::Drained, NodeState::Draining),
@@ -460,7 +460,7 @@ impl Persisted {
     /// What `op` comes to while an update or a reset is under way, or `None` to handle it as
     /// usual. While the node drains for it, the job can still be called off; once maintenance
     /// has begun, it runs to its end and what an operator asks meanwhile is kept for after.
-    fn during_job(&mut self, op: &Operation, managed: bool) -> Option<Outcome> {
+    fn during_job(&mut self, op: &Operation) -> Option<Outcome> {
         let job = self.job.as_mut()?;
         let draining = self.state == NodeState::Draining;
         let busy = |job: &Job| Outcome::Refused {
@@ -475,8 +475,6 @@ impl Persisted {
         };
         Some(match op {
             Operation::Update { .. } | Operation::Reset { .. } => busy(job),
-            // Refused as at any other time.
-            Operation::Drain | Operation::Quarantine if !managed => return None,
             Operation::Drain if draining => {
                 job.resume = NodeState::Drained;
                 Outcome::Accepted
@@ -770,18 +768,34 @@ mod tests {
     }
 
     #[test]
-    fn an_external_runner_refuses_a_drain_and_a_quarantine() {
+    fn an_external_runner_drains_and_quarantines_what_the_node_runs_but_refuses_a_reset() {
         let mut p = Persisted::default();
-        for op in [Operation::Drain, Operation::Quarantine] {
-            let ack = p.command(command(&format!("{op:?}"), op), 1, false);
-            assert!(matches!(ack.outcome, Outcome::Refused { .. }), "{ack:?}");
-        }
+        let ack = p.command(command("d", Operation::Drain), 1, false);
+        assert_eq!(ack.outcome, Outcome::Accepted);
+        assert_eq!(p.state, NodeState::Draining);
+        assert!(p.acquisition_stopped());
+        assert_eq!(
+            p.command(command("u", Operation::Undrain), 1, false)
+                .outcome,
+            Outcome::Done
+        );
         assert_eq!(p.state, NodeState::Ready);
-        // Undrain and release have nothing to undo.
-        for op in [Operation::Undrain, Operation::Release] {
-            let ack = p.command(command(&format!("{op:?}"), op), 1, false);
-            assert_eq!(ack.outcome, Outcome::Done);
-        }
+        assert_eq!(
+            p.command(command("q", Operation::Quarantine), 1, false)
+                .outcome,
+            Outcome::Done
+        );
+        assert_eq!(p.state, NodeState::Quarantined);
+        assert_eq!(
+            p.command(command("r", Operation::Release), 1, false)
+                .outcome,
+            Outcome::Done
+        );
+        assert_eq!(p.state, NodeState::Ready);
+        let reset = command("x", Operation::Reset { images: false });
+        let ack = p.command(reset, 1, false);
+        assert!(matches!(ack.outcome, Outcome::Refused { .. }), "{ack:?}");
+        assert_eq!(p.state, NodeState::Ready);
     }
 
     #[test]
@@ -1027,13 +1041,13 @@ mod tests {
         // Not drained: an external runner cannot be.
         assert_eq!(p.state, NodeState::Maintenance);
         assert_eq!(p.job.as_ref().unwrap().resume, NodeState::Ready);
-        // Nor quarantined meanwhile: it could not be stopped from taking jobs after.
-        assert!(matches!(
+        // A quarantine meanwhile is entered after, for the jobs the hub places.
+        assert_eq!(
             p.command(command("q", Operation::Quarantine), 1, false)
                 .outcome,
-            Outcome::Refused { .. }
-        ));
-        assert!(!p.job.as_ref().unwrap().quarantine_after);
+            Outcome::Done
+        );
+        assert!(p.job.as_ref().unwrap().quarantine_after);
 
         let mut p = Persisted::default();
         let stuck = Abilities {

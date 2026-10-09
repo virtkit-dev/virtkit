@@ -228,8 +228,9 @@ A drain:
    ledger to empty;
 4. reports `drained` only once all three hold.
 
-Drain state survives a node restart or loss of the hub. Stopping acquisition requires a
-managed runner; the prototype refuses drain and quarantine with an external runner. See
+Drain state survives a node restart or loss of the hub. Stopping a runner's acquisition
+requires a managed runner; with an external runner the prototype's drain and quarantine stop
+only the jobs the hub places on the node, and say the runner goes on. See
 [drain and runner lifecycle](fleet-prototype.md#drain-and-runner-lifecycle) for observations,
 runner adoption and transitions.
 

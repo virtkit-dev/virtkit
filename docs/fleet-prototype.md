@@ -317,11 +317,13 @@ A drain is `accepted`, and its ack moves to `done` once the node is drained, or 
 an `undrain` or a `quarantine` ends it first; a drain of a drained node is `done` at once. An
 update and a reset are `accepted` too, and end `done` or `failed` ([Update trial and
 rollback](#update-trial-and-rollback), [Resets](#resets)). Any other command the node can carry
-out is `done` when received. Drain, quarantine and reset need a runner the node runs itself:
-with an external runner the node refuses them, and reports a stop of acquisition in the desired
-state as something it cannot carry out (`unsupported`), while still setting the runner's
-concurrency. Each change is written, and its directory fsynced, before the ack goes out: the
-hub does not send a command again once it has its ack.
+out is `done` when received. A reset needs a runner the node runs itself, and the node refuses
+it with an external runner. Drain, quarantine and a stop of acquisition in the desired state
+apply with either runner to the jobs the hub places on the node; with an external runner the
+node also reports that its runner may still take jobs (`unsupported`), and still sets the
+runner's concurrency ([Drain and runner lifecycle](#drain-and-runner-lifecycle)). Each change
+is written, and its directory fsynced, before the ack goes out: the hub does not send a command
+again once it has its ack.
 
 ## Concurrency control
 
@@ -369,6 +371,24 @@ and only `release` lifts it, returning the node to `drained` if that is where it
 quarantined and to `ready` otherwise. A quarantined node refuses `drain` and `undrain`. All of
 it is persisted on the node, and a restart or a lost hub leaves it where it was.
 
+Draining, drained or quarantined, or with acquisition stopped, the node also refuses the hub's
+offers and starts without a reservation ([Placed jobs on the node](#placed-jobs-on-the-node)),
+so the hub stops placing work on it. A start on a reservation granted before the drain is
+still accepted, as the hub may already hold its GitLab job, and the drain waits for that job.
+
+With `[node] runner = "external"`, placed jobs are all the node can stop: it does not run
+gitlab-runner. Drain and quarantine are accepted all the same, and apply to the jobs the hub
+places; the report says that the runner may still take jobs (`unsupported`, shown as `cannot
+comply`) for as long as acquisition is stopped. The drain does not wait for the runner to
+exit; it completes once the admission ledger holds nothing and no job supervisor is left, at a
+moment the external runner runs no vk job. A runner that keeps the ledger busy keeps the node
+`draining` until it is undrained or the runner is stopped by other means; a job the runner
+takes after `drained` is not noticed. A reset, which clears job dirs a running job may use,
+stays refused. An update needs `--force` ([Update trial and
+rollback](#update-trial-and-rollback)): a forced update from `ready` goes straight to
+maintenance, waiting for neither the runner's jobs nor placed jobs; on a node already draining
+it waits for that drain.
+
 ## Releases
 
 `vk-hub release add <file> --version <v>` copies a `vk` binary into `<data_dir>/releases/`,
@@ -380,8 +400,8 @@ database, its TLS key and every node's pinned key, so it only reads the file, ch
 is an x86-64 ELF of at most 1 GiB that holds the stated version as a string of its own. The
 version is the operator's to state; running the binary is left to the node. `vk-hub nodes
 update <id> --release <sha256>` issues the update, which names the release by digest and size;
-a prefix of at least 8 hex digits names a release too. `--force` asks a node whose runner is
-external, which cannot be drained, to update without draining. Like any command, it is refused
+a prefix of at least 8 hex digits names a release too. `--force` allows updating without
+draining when `vk node` cannot drain the external runner. Like any command, it is refused
 for a node monitored only.
 `release add --signature <file>` stores a release key's signature with the release, and the
 update carries it (see [Release signing](#release-signing)); the hub checks only that it is an
@@ -493,12 +513,14 @@ previous binary downloaded the release from the hub just before the switch, so t
 treats lost connectivity as a release failure: keeping it could leave the node unreachable
 by its hub. If the hub went down meanwhile, the update must be retried.
 
-An update is refused on a node whose runner is external unless issued with `--force`: such a
-runner cannot be drained, so jobs running across the switch run their later stages with the
-new `vk` — the one thing draining exists to prevent. It is refused, too, for an older version
-than the node runs unless the node's own `[node] allow_downgrade = true` allows it, and even
-then for one older than 0.85.0, the first release that takes part in a trial; versions are
-compared as `MAJOR.MINOR.PATCH`, and an older one that is not of that form is refused.
+An update is refused on a node whose runner is external unless issued with `--force`: vk node
+cannot drain such a runner, so jobs running across the switch run their later stages with the
+new `vk` — the one thing draining exists to prevent. A forced update from `ready` goes straight
+to maintenance without waiting for the jobs the hub placed on the node either; on a node
+already draining it waits for that drain. It is refused, too, for an older version than the
+node runs unless the node's own `[node] allow_downgrade = true` allows it, and even then for
+one older than 0.85.0, the first release that takes part in a trial; versions are compared as
+`MAJOR.MINOR.PATCH`, and an older one that is not of that form is refused.
 
 ## Release signing
 
@@ -546,7 +568,7 @@ past `--max-failures` aborts it instead; a node whose update ends after an abort
 but not counted. A node is skipped from the start, so canaries are picked among the others,
 when it is monitored only (its latest session at protocol version 1), already runs the
 release, is quarantined, has not reported its state yet, or — unless `--force` — has an
-external runner, which cannot be drained. When its wave comes, a node is skipped for any of
+external runner that `vk node` cannot drain. When its wave comes, a node is skipped for any of
 these, when it has been removed, when it is draining or in maintenance of its own, or when an
 update an operator issued it before the rollout reached it is still under way.
 `rollout status [<id>]`, `pause`, `resume` and `abort` steer it; pausing or aborting issues
@@ -1096,8 +1118,8 @@ They cover enrollment (single-use and expired tokens, re-enrollment with the sam
 removal), the session, inventory, heartbeats, workloads, and reconnecting after a hub restart,
 a node restart and a partition (`fleet-enrollment`, `fleet-monitoring`, `fleet-resilience`);
 a ceiling, stopping acquisition, drain, quarantine across a node restart, an external
-runner's refusals, and a reset that stops a leftover job process and removes its job dir
-(`fleet-steering`); hubs and nodes of protocol version 1 beside version 2
+runner's node draining and refusing a reset, and a reset that stops a leftover job process and
+removes its job dir (`fleet-steering`); hubs and nodes of protocol version 1 beside version 2
 (`fleet-mixed-versions`); and updates — a rollback on failed validation, a signature
 required, an update surviving a restart, a rollout a node per wave (`fleet-update`). The web
 UI and local mode have unit tests only.

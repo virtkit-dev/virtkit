@@ -1234,11 +1234,11 @@ mod tests {
         let mut f = fixture("steer").await;
         let (node, gatherer, stopped, listener, stop) = f.parts();
         let key = node.identity.public_key().to_vec();
-        // Refused, with an external runner to stop: still journaled, and its outcome still
+        // A reset, refused with an external runner: still journaled, and its outcome still
         // repeated until recorded.
-        let drain = command(Operation::Drain);
+        let reset = command(Operation::Reset { images: false });
         let hub = async {
-            // First session: desired state and a drain; the hub records nothing.
+            // First session: desired state and a reset; the hub records nothing.
             let mut ws = accept(listener).await;
             assert!(challenge(&mut ws, &key, PROTOCOL, STEERING).await);
             hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
@@ -1250,7 +1250,7 @@ mod tests {
             assert_eq!(applied.applied_generation(), Some(1));
             // A stop of acquisition this node cannot carry out, said so.
             assert_eq!(applied.unsupported.len(), 1);
-            hub_send(&mut ws, &HubMsg::Command(drain.clone())).await;
+            hub_send(&mut ws, &HubMsg::Command(reset.clone())).await;
             let ack = next_of(&mut ws, ack_of).await;
             assert!(matches!(ack.outcome, Outcome::Refused { .. }), "{ack:?}");
             drop(ws);
@@ -1263,7 +1263,7 @@ mod tests {
             let report = next_of(&mut ws, report_of).await;
             assert_eq!(report.applied_generation(), Some(1));
             assert_eq!(next_of(&mut ws, ack_of).await, ack);
-            hub_send(&mut ws, &HubMsg::Command(drain.clone())).await;
+            hub_send(&mut ws, &HubMsg::Command(reset.clone())).await;
             assert_eq!(next_of(&mut ws, ack_of).await, ack);
             hub_send(&mut ws, &HubMsg::Recorded(ack.clone())).await;
             for _ in 0..100 {

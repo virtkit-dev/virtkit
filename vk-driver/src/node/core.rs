@@ -73,10 +73,7 @@ impl Core {
             persisted.save(dir)?;
         }
         if runner.is_none() && persisted.state == NodeState::Draining {
-            say!(
-                "the node is draining but its runner is external: the drain cannot complete \
-                 until the hub undrains the node"
-            );
+            say!("the node is draining with an external runner, which may still take jobs");
         }
         let (acquire, _) = watch::channel(!persisted.acquisition_stopped());
         let (changed, _) = watch::channel(0);
@@ -133,9 +130,9 @@ impl Core {
         self.update(|p| p.apply_desired(desired))
     }
 
-    /// Journal `command` and carry it out. An external runner cannot be stopped, so a drain or
-    /// a quarantine is refused; an update is refused when the node could not install it, or
-    /// may not.
+    /// Journal `command` and carry it out. An external runner cannot be stopped, so a reset is
+    /// refused, and a drain or a quarantine stops only the jobs the hub places; an update is
+    /// refused when the node could not install it, or may not.
     pub fn command(&self, command: Command, now: u64) -> Result<CommandAck> {
         let update = match &command.op {
             // Looked at only for an update: it reads the filesystem.
@@ -282,7 +279,7 @@ impl Core {
         if stopped && runner.is_none() {
             unsupported.push(
                 "stopping acquisition: the runner is external ([node] runner = \"external\"), \
-                 so only its concurrency is steered"
+                 so the node stops taking the hub's jobs but the runner may still take jobs"
                     .to_string(),
             );
         }
@@ -465,7 +462,7 @@ impl Core {
             }
             progress.runner_stopped && held.ahead == 0 && preparing.is_empty()
         } else {
-            drained(&progress)
+            drained(&progress, self.runner.is_some())
         };
         if done && self.update(|p| p.finish_drain(now))? {
             say!("drained");
@@ -478,12 +475,14 @@ impl Core {
 /// How long a reset's drain waits on a job admitted but with no supervisor before it fails.
 const PREPARE_WAIT: Duration = Duration::from_secs(600);
 
-/// Whether a drain is complete: the runner has exited — which it does on `SIGQUIT` only once
-/// its jobs, their cleanup stage included, are over — the ledger holds and awaits nothing,
-/// and no job is left: no placed job without its result, and no job supervisor, which catches
-/// a job whose cleanup failed and left its VM up.
-fn drained(p: &DrainProgress) -> bool {
-    p.runner_stopped && p.ledger_empty && p.active_jobs == 0
+/// Whether a drain is complete: a `managed` runner has exited — which it does on `SIGQUIT`
+/// only once its jobs, their cleanup stage included, are over — the ledger holds and awaits
+/// nothing, and no job is left: no placed job without its result, and no job supervisor,
+/// which catches a job whose cleanup failed and left its VM up. An external runner is not
+/// waited for: it does not stop, and its jobs show in the ledger and as supervisors while they
+/// run.
+fn drained(p: &DrainProgress, managed: bool) -> bool {
+    (p.runner_stopped || !managed) && p.ledger_empty && p.active_jobs == 0
 }
 
 /// Once a managed runner's state changes. Never for an external runner, nor once the
@@ -550,7 +549,15 @@ mod tests {
             ledger_empty: true,
             active_jobs: 0,
         };
-        assert!(drained(&all));
+        assert!(drained(&all, true));
+        // An external runner never stops; the rest still binds.
+        assert!(drained(
+            &DrainProgress {
+                runner_stopped: false,
+                ..all
+            },
+            false
+        ));
         for p in [
             DrainProgress {
                 runner_stopped: false,
@@ -565,7 +572,7 @@ mod tests {
                 ..all
             },
         ] {
-            assert!(!drained(&p), "{p:?}");
+            assert!(!drained(&p, true), "{p:?}");
         }
     }
 
@@ -644,10 +651,62 @@ mod tests {
         assert_eq!(report.runner_state, None);
         assert_eq!(report.unsupported.len(), 1);
         assert!(!*core.acquire().borrow());
-        // Nor can it drain.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With an external runner, a drain stops the jobs the hub places and completes once
+    /// those and whatever holds the admission ledger are over, saying the runner goes on.
+    #[test]
+    fn an_external_runner_drains_once_the_placed_jobs_and_the_ledger_are_done() {
+        use crate::node::jobs::journal;
+        let dir = scratch("external-drain");
+        let core = Core::open(&dir, issuer(), None).unwrap();
+        let cfg = cfg(&dir);
+        // A placed job accepted, its supervisor not started yet.
+        let placed = dir.join("jobs").join(PLACED);
+        std::fs::create_dir_all(&placed).unwrap();
+        std::fs::write(
+            placed.join(journal::META),
+            r#"{"gitlab_id":41,"slot":0,"project_slot":0,"project_id":7}"#,
+        )
+        .unwrap();
+        // An admission the external runner's executor holds.
+        let admit = dir.join("state").join("admit");
+        std::fs::create_dir_all(&admit).unwrap();
+        std::fs::write(admit.join("42"), "1024 1 granted\n").unwrap();
+        let held = crate::admit::hold(&admit, "42").unwrap();
         let ack = core.command(drain(), 1).unwrap();
-        assert!(matches!(ack.outcome, Outcome::Refused { .. }), "{ack:?}");
-        assert_eq!(core.state(), NodeState::Ready);
+        assert_eq!(ack.outcome, Outcome::Accepted);
+        assert!(!crate::node::jobs::ready(
+            core.state(),
+            *core.acquire().borrow()
+        ));
+        core.step(&cfg, true).unwrap();
+        assert_eq!(core.state(), NodeState::Draining);
+        let report = core.report();
+        let progress = report.drain.unwrap();
+        assert!(!progress.runner_stopped && !progress.ledger_empty);
+        assert_eq!(progress.active_jobs, 1);
+        assert!(
+            report.unsupported[0].contains("may still take jobs"),
+            "{:?}",
+            report.unsupported
+        );
+        // The placed job ends.
+        std::fs::write(placed.join(journal::RESULT), "{}").unwrap();
+        core.step(&cfg, true).unwrap();
+        assert_eq!(core.state(), NodeState::Draining);
+        assert_eq!(core.report().drain.unwrap().active_jobs, 0);
+        // Then the runner's job.
+        drop(held);
+        // Retried: a test forking meanwhile can hold the dropped lock for an instant.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while core.state() == NodeState::Draining && std::time::Instant::now() < deadline {
+            core.step(&cfg, true).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(core.state(), NodeState::Drained);
+        assert_eq!(core.unrecorded()[0].outcome, Outcome::Done);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

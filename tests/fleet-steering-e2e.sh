@@ -11,7 +11,8 @@
 #    `drained`; undrained, the node is `ready` and its runner back.
 # 4. A quarantine stops the managed node's runner, and holds across a restart of its guest
 #    until released.
-# 5. The external node refuses a drain, and the audit log says why.
+# 5. The external node drains what it runs itself, saying its runner may still take jobs,
+#    and refuses a reset, the audit log saying why.
 # 6. Resetting the managed node passes through maintenance and validating back to ready.
 #    It stops a leftover process naming a past job's dir and removes the dir, preserving
 #    a plain `tail` of the same dir and the jobs dir's dot-directories.
@@ -119,11 +120,20 @@ hub nodes release "$m"
 wait_for 60 cell_is "$m" STATE ready || fail "managed is not ready once released"
 wait_for 30 runner_up || fail "the managed node did not start its runner once released"
 
-echo "== the external node refuses a drain =="
+echo "== the external node drains what it runs, and refuses a reset =="
 hub nodes drain "$x"
-wait_for 60 audit_says "$x" '\(drain\): refused: .*runner = "external"' ||
-  { hub_audit "$x"; fail "the audit log does not show the external node refusing a drain"; }
-cell_is "$x" STATE ready || fail "external is $(node_cell "$x" STATE) after refusing a drain"
+wait_for 60 cell_is "$x" STATE drained || fail "external did not drain: $(node_cell "$x" STATE)"
+wait_for 30 audit_says "$x" '\(drain\): done' ||
+  fail "the audit log misses the external node's drain"
+wait_for 30 notes ||
+  { hub nodes; fail "the drained external node does not say its runner goes on"; }
+hub nodes undrain "$x"
+wait_for 60 cell_is "$x" STATE ready || fail "external is not ready once undrained"
+wait_for 60 eval '! notes' || { hub nodes; fail "the undrained external node still has a note"; }
+hub nodes reset "$x"
+wait_for 60 audit_says "$x" '\(reset\): refused: .*runner = "external"' ||
+  { hub_audit "$x"; fail "the audit log does not show the external node refusing a reset"; }
+cell_is "$x" STATE ready || fail "external is $(node_cell "$x" STATE) after refusing a reset"
 hub_audit "$x"
 
 echo "== a reset clears what a past job left on the managed node =="

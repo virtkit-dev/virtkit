@@ -264,7 +264,7 @@ pub fn ineligible(f: &Facts, force: bool) -> Option<&'static str> {
         None => Some("it has not reported its state"),
         Some(NodeState::Quarantined) => Some("quarantined"),
         Some(_) if !f.managed && !force => {
-            Some("its runner is external, so it cannot be drained; --force includes it")
+            Some("vk node cannot drain its external runner; --force includes it")
         }
         Some(_) => None,
     }

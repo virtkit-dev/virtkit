@@ -39,6 +39,13 @@ All notable changes to virtkit will be documented in this file.
   outcome to GitLab, and picks its jobs up again after a restart. `vk-gitlab verify` checks
   each configured runner's token.
 
+### Changed
+
+- **Drain and quarantine on a fleet node with an external runner now stop the jobs the hub
+  places there** instead of being refused. The node says that its runner may still take jobs,
+  and reports `drained` once the jobs it runs, and any vk executor job already admitted, are
+  over. A reset is still refused there.
+
 ### Fixed
 
 - **`allow_failure: exit_codes` works with the vk executor.** `vk gitlab run` reports a

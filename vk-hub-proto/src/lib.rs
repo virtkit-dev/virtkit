@@ -887,8 +887,8 @@ pub enum Operation {
         /// A release key's ed25519 signature over [`release_message`], base64.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
-        /// Update a node whose runner is external, which cannot be drained, while its jobs
-        /// may still be running.
+        /// Update while jobs may still be running because `vk node` cannot drain the external
+        /// runner.
         #[serde(default)]
         force: bool,
         /// How long the update may take once the drain is over: past it, the node rolls the
