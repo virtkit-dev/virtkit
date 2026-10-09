@@ -2560,7 +2560,7 @@ async fn the_fleet_s_pages_load_only_the_embedded_scripts() {
         assert_only_embedded_scripts(&body);
         assert_eq!(
             body.matches("sse-close=\"close\"").count(),
-            usize::from(!["/audit", "/users", "/jobs"].contains(&path.as_str()))
+            usize::from(!["/audit", "/users"].contains(&path.as_str()))
         );
     }
     // The users page with its forms, on a hub with `[oidc]`.
@@ -3376,6 +3376,8 @@ async fn the_job_history_is_shown_filtered_and_paged() {
         hub.db
             .submit_job(&id, row, &n.to_string(), b"{}", "key gitlab", now)
             .unwrap();
+        // As the hub notes a job it records: the newest page holds its reading until then.
+        hub.jobs_changed();
     };
     // A page and a bit of jobs still queued, then three that ran.
     for n in 1..=101 {
@@ -3533,6 +3535,180 @@ async fn the_job_history_is_shown_filtered_and_paged() {
     assert!(
         page.contains(&format!("<a href=\"/jobs?node={node}\">Its jobs</a>")),
         "{page}"
+    );
+}
+
+/// Job `n` of `project`, as submitted.
+pub(super) fn history_job(n: u64, project: &str) -> crate::store::JobRow {
+    use vk_hub_proto::client::{JobState, Placement};
+    crate::store::JobRow {
+        key: "k".into(),
+        key_name: "gitlab".into(),
+        request_id: format!("{n:032}"),
+        placement: Placement {
+            pool: "ci".into(),
+            labels: vec![],
+            envelope: vk_hub_proto::job::Envelope::default(),
+        },
+        title: format!("GitLab job {n} of {project} (build)"),
+        job_url: None,
+        project: Some(project.to_string()),
+        name: Some(format!("build-{n}")),
+        created_at: crate::now_secs(),
+        state: JobState::Queued,
+        revision: 1,
+        node: None,
+        stage: None,
+        cancel: None,
+        result: None,
+        output_len: 0,
+        started_at: None,
+        finished_at: None,
+        settled_at: None,
+        expired_at: None,
+    }
+}
+
+/// `/jobs`' newest page follows the jobs as they change, filtered as the page is; an older
+/// page stays as loaded, and a stream with a filter the page would not take is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_newest_jobs_are_kept_live_in_their_filter() {
+    use vk_hub_proto::client::JobState;
+    use vk_hub_proto::job::{FailureClass, JobResult};
+    let (addr, hub, origin) = start_fleet().await;
+    let (viewer, csrf) = sign_in(addr, &hub, Role::Viewer).await;
+    let (operator, _) = sign_in(addr, &hub, Role::Operator).await;
+
+    let page = get(addr, "/jobs", Some(&viewer)).await.body;
+    assert!(
+        page.contains(
+            "<div id=\"jobs\" hx-ext=\"sse\" sse-connect=\"/events/jobs\" sse-swap=\"jobs\" \
+             sse-close=\"close\"><p class=\"empty\">none placed yet"
+        ),
+        "{page}"
+    );
+    // The filter's form is outside the live fragment.
+    assert!(
+        page.find("<form class=\"filter\"") < page.find("<div id=\"jobs\""),
+        "{page}"
+    );
+    let page = get(
+        addr,
+        "/jobs?project=acme%2Fweb&result=failed",
+        Some(&viewer),
+    )
+    .await
+    .body;
+    assert!(
+        page.contains("sse-connect=\"/events/jobs?project=acme%2Fweb&amp;result=failed\""),
+        "{page}"
+    );
+    // An older page has no stream, and says where the live one is.
+    let page = get(addr, "/jobs?result=failed&before=9", Some(&viewer))
+        .await
+        .body;
+    assert!(!page.contains("sse-connect"), "{page}");
+    assert!(
+        page.contains("when this page was loaded; <a href=\"/jobs?result=failed\">the newest</a>"),
+        "{page}"
+    );
+    for bad in [
+        "?result=lost",
+        "?node=zz",
+        "?before=9",
+        "?result=failed&result=success",
+    ] {
+        let reply = get(addr, &format!("/events/jobs{bad}"), Some(&viewer)).await;
+        assert_eq!(reply.status, 404, "{bad}");
+    }
+
+    let mut all = live(addr, "/events/jobs", &viewer).await;
+    let mut failed = Events::open(
+        addr,
+        "/events/jobs?project=acme%2Fweb&result=failed",
+        &operator,
+    )
+    .await;
+    let first = failed.next().await.unwrap();
+    assert_eq!(
+        first,
+        "event: jobs\ndata: <p class=\"empty\">none match</p>\n\n"
+    );
+
+    // A job submitted after the page opened.
+    let now = crate::now_secs();
+    let id = |n: u64| format!("{n:032x}");
+    let submit = |n: u64, row: &crate::store::JobRow| {
+        hub.db
+            .submit_job(&id(n), row, &n.to_string(), b"{}", "key gitlab", now)
+            .unwrap();
+        hub.jobs_changed();
+    };
+    submit(1, &history_job(1, "acme/web"));
+    let next = next_with(&mut all, "build-1").await;
+    assert!(
+        next.starts_with("event: jobs\ndata: <p class=\"sub\">1 job</p>"),
+        "{next}"
+    );
+    assert!(
+        next.contains("<span class=\"badge\">queued</span>"),
+        "{next}"
+    );
+
+    // It fails, and another is submitted: the filtered stream shows the one it matches.
+    let mut ended = history_job(1, "acme/web");
+    ended.state = JobState::Finished;
+    ended.revision = 2;
+    ended.started_at = Some(now - 5);
+    ended.finished_at = Some(now);
+    ended.result = Some(JobResult {
+        failure: Some(FailureClass::Script),
+        exit_code: Some(1),
+        message: None,
+        output_len: 0,
+        artifacts: Vec::new(),
+        usage: None,
+    });
+    hub.db.put_job(&id(1), &ended, &[], now).unwrap();
+    submit(2, &history_job(2, "acme/web"));
+    let next = failed.next().await.unwrap();
+    assert!(
+        next.contains("1 job · median run of finished jobs 5s"),
+        "{next}"
+    );
+    assert!(
+        next.contains(">build-1<") && !next.contains(">build-2<"),
+        "{next}"
+    );
+    assert!(next.contains("script failure, exit 1</span>"), "{next}");
+    let next = next_with(&mut all, "build-2").await;
+    assert!(
+        next.contains("2 jobs · 0% of 1 finished succeeded"),
+        "{next}"
+    );
+    assert!(next.contains("badge bad"), "{next}");
+
+    // Signed out, a jobs stream ends as any other does.
+    let reply = request(
+        addr,
+        "POST",
+        "/logout",
+        &[&format!("Cookie: {viewer}"), &format!("Origin: {origin}")],
+        &format!("_csrf={csrf}"),
+    )
+    .await;
+    assert_eq!(reply.status, 200);
+    assert_signed_out(&mut all).await;
+    let again = get(addr, "/events/jobs?result=failed", Some(&viewer)).await;
+    assert!(
+        again.body.starts_with("event: jobs\ndata: "),
+        "{}",
+        again.body
+    );
+    assert!(
+        again.body.ends_with("\n\nevent: close\ndata: \n\n"),
+        "{}",
+        again.body
     );
 }
 

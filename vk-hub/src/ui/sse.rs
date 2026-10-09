@@ -3,11 +3,12 @@
 //!
 //! A fragment that is the same for every viewer — the nodes table, local mode's VMs — is
 //! rendered once per change, by one task, and each page's stream only forwards it
-//! ([`Source::Shared`]). A page of one thing — a node, a VM — renders its own fragment, woken
-//! only by the changes it follows ([`Source::Own`]). Either way a fragment is rendered at most
-//! once per [`DEBOUNCE`] however fast what it shows changes, and sent only when it differs
-//! from the last one that stream sent; ages on the pages move in steps of a heartbeat, so a
-//! page with nothing new to show is sent nothing but keep-alives.
+//! ([`Source::Shared`]). A page of one thing — a node, a VM, the jobs a filter matches —
+//! renders its own fragment, woken only by the changes it follows ([`Source::Own`]). Either
+//! way a fragment is rendered at most once per [`DEBOUNCE`] however fast what it shows
+//! changes, and sent only when it differs from the last one that stream sent; ages on the
+//! pages move in steps of a heartbeat, so a page with nothing new to show is sent nothing but
+//! keep-alives.
 //!
 //! Streams hold connections, so there are at most [`MAX_STREAMS`] of them — the rest of the
 //! UI's connections stay for pages and posts — and [`MAX_SESSION_STREAMS`] per session. A

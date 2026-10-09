@@ -348,6 +348,7 @@ async fn persist(hub: &Hub, id: &str, row: JobRow, events: Vec<Event>) -> Result
         }
     }
     hub.touch();
+    hub.jobs_changed();
     Ok(())
 }
 
@@ -1402,6 +1403,7 @@ pub fn admit(
     );
     drop(state);
     hub.dispatch.bump();
+    hub.jobs_changed();
 }
 
 /// The view of `principal`'s job `id`, with the row, or 404.
@@ -1725,6 +1727,8 @@ async fn prune(hub: &Hub) {
             return;
         }
     };
+    // `gone` names only the jobs that held output: a settled job trimmed is not in it.
+    hub.jobs_changed();
     if let Some(dir) = hub.dispatch.output_dir.clone() {
         for id in gone {
             // A dropped job's output, or an unsettled one's past its keep. Stopped before

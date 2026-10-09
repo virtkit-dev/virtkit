@@ -405,10 +405,10 @@ fn event_name(event: &str, ui: &Ui) -> Option<&'static str> {
     }
 }
 
-/// What `/events/<event>` streams, if it is one of this site's, for `auth`'s page.
-fn source(event: &str, ui: &Ui, auth: &Auth) -> Option<sse::Source> {
+/// What `/events/<event>[?<query>]` streams, if it is one of this site's, for `auth`'s page.
+fn source(event: &str, query: Option<&str>, ui: &Ui, auth: &Auth) -> Option<sse::Source> {
     match &ui.site {
-        Site::Fleet(site) => fleet::source(event, &ui.hub, site, auth),
+        Site::Fleet(site) => fleet::source(event, query, &ui.hub, site, auth),
         Site::Local(site) => local::source(event, &ui.hub, site),
     }
 }
@@ -441,12 +441,12 @@ fn from_another_site(headers: &HeaderMap) -> bool {
 async fn get(path: &str, query: Option<&str>, auth: &Auth, ui: &Ui) -> Result<Response<Body>> {
     if let Some(source) = path
         .strip_prefix("/events/")
-        .and_then(|e| source(e, ui, auth))
+        .and_then(|e| source(e, query, ui, auth))
     {
         return Ok(stream(ui, auth, source));
     }
     let found = match &ui.site {
-        Site::Fleet(_) => fleet::get(path, query, auth, ui).await?,
+        Site::Fleet(site) => fleet::get(path, query, auth, ui, site).await?,
         Site::Local(site) => local::get(path, query, auth, ui, site).await?,
     };
     Ok(found.unwrap_or_else(|| message(StatusCode::NOT_FOUND, "There is no such page.")))

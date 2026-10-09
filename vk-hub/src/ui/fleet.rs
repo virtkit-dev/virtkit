@@ -64,6 +64,8 @@ pub(super) struct FleetSite {
     nodes_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
     steered_operations_feed: tokio::sync::watch::Sender<Option<bytes::Bytes>>,
+    /// `/jobs`' newest pages, by filter.
+    jobs: Arc<super::jobs::Renders>,
 }
 
 impl FleetSite {
@@ -82,6 +84,7 @@ impl FleetSite {
                 "operations",
                 render_operations(hub.clone(), true),
             ),
+            jobs: Arc::default(),
         }
     }
 }
@@ -91,6 +94,7 @@ pub(super) fn event_name(event: &str) -> Option<&'static str> {
     match event {
         "nodes" => Some("nodes"),
         "operations" => Some("operations"),
+        super::jobs::EVENT => Some(super::jobs::EVENT),
         _ => event
             .strip_prefix("node/")
             .filter(|id| vk_hub_proto::valid_id(id))
@@ -98,11 +102,22 @@ pub(super) fn event_name(event: &str) -> Option<&'static str> {
     }
 }
 
-/// A fleet `/events/<event>` stream for `auth`'s page. Operators see rollout buttons on
-/// `/operations` and node steering actions rendered per stream with the session's CSRF token.
-pub(super) fn source(event: &str, hub: &Arc<Hub>, site: &FleetSite, auth: &Auth) -> Option<Source> {
+/// A fleet `/events/<event>[?<query>]` stream for `auth`'s page. Operators see rollout buttons
+/// on `/operations` and node steering actions rendered per stream with the session's CSRF
+/// token. `/jobs`' stream follows the filter in `query`.
+pub(super) fn source(
+    event: &str,
+    query: Option<&str>,
+    hub: &Arc<Hub>,
+    site: &FleetSite,
+    auth: &Auth,
+) -> Option<Source> {
     let steer = auth.session.role >= Role::Operator;
     match event {
+        super::jobs::EVENT => {
+            let filter = super::jobs::stream_filter(query)?;
+            return Some(super::jobs::source(hub, &site.jobs, filter));
+        }
         "nodes" => {
             return Some(Source::Shared {
                 name: "nodes",
@@ -143,6 +158,7 @@ pub(super) async fn get(
     query: Option<&str>,
     auth: &Auth,
     ui: &Ui,
+    site: &FleetSite,
 ) -> Result<Option<Response<Body>>> {
     let hub = ui.hub.clone();
     let now = crate::now_secs();
@@ -189,7 +205,9 @@ pub(super) async fn get(
         return super::users::get(auth, ui).await.map(Some);
     }
     if path == super::jobs::PATH {
-        return super::jobs::get(query, auth, ui).await.map(Some);
+        return super::jobs::get(query, auth, &site.jobs, ui)
+            .await
+            .map(Some);
     }
     if let Some(id) = path.strip_prefix("/node/")
         && vk_hub_proto::valid_id(id)

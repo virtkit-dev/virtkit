@@ -2437,3 +2437,61 @@ fn a_history_page_shows_jobs_as_the_hub_holds_them() {
     // The summary is of the stored rows.
     assert_eq!(page.summary.matched, 2);
 }
+
+/// The job history's live pages wake on what changes a job's record — its submission, start,
+/// stage and result — and not on its output.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_job_s_record_wakes_the_history_and_its_output_does_not() {
+    let dir = scratch("wakes");
+    // Undriven: the submission alone, nothing placed after it.
+    let db = Arc::new(Db::open_memory().unwrap());
+    let (addr, hub) = serve_undriven(db, &dir.join("undriven"), Duration::from_secs(60)).await;
+    let jobs = hub.subscribe_jobs();
+    let key = jobs_key(&hub);
+    let body = job_body(1, None, 30);
+    let resp = api(addr, "POST", "/v1/jobs", Some(&key), Some(body)).await;
+    assert_eq!(resp.status, 201, "{resp:?}");
+    assert!(jobs.has_changed().unwrap());
+
+    let (addr, hub) = start_jobs(&dir, Duration::from_secs(60)).await;
+    let key = jobs_key(&hub);
+    let mut node = ready_node(addr, &hub, 16384).await;
+    let mut jobs = hub.subscribe_jobs();
+    let id = running_job(addr, &key, &mut node, 2).await;
+    assert!(jobs.has_changed().unwrap());
+    // A session handles its messages in order: once this output is acknowledged, the start
+    // before it is written and noted.
+    node.send(output(&id, 0, b"hello\n"));
+    assert_eq!(
+        node.job().await,
+        HubJobMsg::OutputAck {
+            job: id.clone(),
+            offset: 6
+        }
+    );
+    jobs.borrow_and_update();
+    node.send(output(&id, 6, b"world\n"));
+    assert_eq!(
+        node.job().await,
+        HubJobMsg::OutputAck {
+            job: id.clone(),
+            offset: 12
+        }
+    );
+    assert!(!jobs.has_changed().unwrap());
+    node.send(NodeJobMsg::Job {
+        job: id.clone(),
+        state: RunState::Running {
+            stage: "step_script".into(),
+        },
+    });
+    wait_until(|| jobs.has_changed().unwrap()).await;
+    jobs.borrow_and_update();
+    node.send(NodeJobMsg::Result {
+        job: id.clone(),
+        result: result(None, 6),
+    });
+    assert_eq!(node.job().await, HubJobMsg::Recorded { job: id.clone() });
+    assert!(jobs.has_changed().unwrap());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

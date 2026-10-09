@@ -135,6 +135,8 @@ pub struct Hub {
     /// Bumped by [`Hub::touch`] alone, for pages that show nothing of a node's report or
     /// heartbeat.
     touched: watch::Sender<u64>,
+    /// Bumped by [`Hub::jobs_changed`] alone, for the job history's pages.
+    jobs: watch::Sender<u64>,
     /// Bumped when a web UI session ends.
     sessions: watch::Sender<u64>,
     /// Permits for client API connections past their key's check ([`MAX_CLIENT_CONNS`]).
@@ -189,6 +191,7 @@ impl Hub {
             changes: watch::Sender::new(0),
             node_changes: Mutex::new(HashMap::new()),
             touched: watch::Sender::new(0),
+            jobs: watch::Sender::new(0),
             sessions: watch::Sender::new(0),
             clients: Arc::new(Semaphore::new(MAX_CLIENT_CONNS)),
             dispatch: crate::jobs::Dispatch::new(
@@ -239,6 +242,24 @@ impl Hub {
     /// Wake on the next [`Hub::touch`] only.
     pub(crate) fn subscribe_touched(&self) -> watch::Receiver<u64> {
         self.touched.subscribe()
+    }
+
+    /// Note that a placed job's record may have changed: one submitted, placed, accepted,
+    /// at a new stage, finished, canceled or settled, or records dropped from the history.
+    /// Its output is not followed.
+    pub(crate) fn jobs_changed(&self) {
+        self.jobs.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Wake on the next [`Hub::jobs_changed`] only.
+    pub(crate) fn subscribe_jobs(&self) -> watch::Receiver<u64> {
+        self.jobs.subscribe()
+    }
+
+    /// How many times [`Hub::jobs_changed`] has been called, wrapping: a rendering of the
+    /// history read at one count holds until the next.
+    pub(crate) fn jobs_generation(&self) -> u64 {
+        *self.jobs.borrow()
     }
 
     /// Wake on the next [`Hub::changed`] of any node, or [`Hub::touch`].

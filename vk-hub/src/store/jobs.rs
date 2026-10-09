@@ -143,7 +143,7 @@ impl JobRow {
 }
 
 /// Job outcome used by the history filter.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum JobOutcome {
     /// Queued, starting or running.
     Running,
@@ -186,7 +186,7 @@ impl JobOutcome {
 }
 
 /// Which jobs a page of history shows: those matching every filter set.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct JobFilter {
     /// The node it was sent to.
     pub node: Option<String>,

@@ -62,7 +62,9 @@ All notable changes to virtkit will be documented in this file.
   jobs it placed (`job_history` in `hub.toml`), and answers 410 to a retried create whose job
   it has dropped. `vk-hub jobs` shows how long each job ran and the most memory it used. The
   web UI's Jobs page shows job history and resource usage, with node, project and result
-  filters, success rate and median run time. Each node's page links to its jobs.
+  filters, success rate and median run time. Like the nodes page, the newest page of each
+  filter updates live: new jobs appear at the top, and running jobs show stage changes and
+  results. Each node's page links to its jobs.
 - `[node] labels` declares the labels the hub may place GitLab jobs by.
 - **`vk-hub`'s web UI links the jobs it placed to their GitLab pages.** A node's workloads,
   local mode's VMs and the jobs on the Jobs page open the job on GitLab in a new tab. A

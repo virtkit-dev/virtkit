@@ -17,7 +17,7 @@
 use std::fmt::Display;
 
 /// An HTML fragment under construction.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Html(String);
 
 impl Html {
