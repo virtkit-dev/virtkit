@@ -308,6 +308,12 @@ enum NodeCmd {
         /// The system's roots are then not trusted for the hub at all.
         #[arg(long, value_name = "FILE")]
         ca: Option<PathBuf>,
+        /// Enroll a host already enrolled again, as a new node
+        ///
+        /// The old identity is moved aside to `<state_dir>/node.replaced-<time>`, not deleted;
+        /// remove the old node from its hub with `vk-hub nodes remove <id>`.
+        #[arg(long)]
+        replace: bool,
     },
     /// Keep a session with the hub, and follow it, in the foreground
     ///
@@ -4367,6 +4373,7 @@ async fn cli_main(cli: Cli) -> ExitCode {
                 token,
                 token_file,
                 ca,
+                replace,
             } => {
                 let token = match (token, token_file) {
                     (_, Some(path)) => node::TokenSource::File(path),
@@ -4377,7 +4384,8 @@ async fn cli_main(cli: Cli) -> ExitCode {
                         return fail(&anyhow::anyhow!("give --token or --token-file"), 2);
                     }
                 };
-                match node::join(&ctx.cfg, &hub, &token, ca.as_deref()).await {
+                let opts = node::JoinOptions { replace };
+                match node::join(&ctx.cfg, &hub, &token, ca.as_deref(), &opts).await {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => fail(&e, 1),
                 }

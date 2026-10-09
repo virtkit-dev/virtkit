@@ -58,13 +58,17 @@ identity and signs the token with it, so the hub pins only a key the caller hold
 is `https`, or `http` only to a loopback hub. `--ca` verifies the hub against that bundle
 alone, not the system's roots. Enrollment speaks TLS 1.3 only, ignores `HTTP(S)_PROXY` and
 follows no redirect. `join` refuses while `vk check` fails on KVM, the VMM or the guest
-kernel, and on a host already enrolled.
+kernel, and on a host already enrolled unless given `--replace`, which enrolls it again as a new
+node: once the token is read and the checks pass, the old `<state_dir>/node/` is moved aside to
+`node.replaced-<time>` beside it, not deleted, and `join` prints the old node ID to remove from
+its hub. If the enrollment then fails, the error names where the old identity is, to move back.
+A running node holds the state dir, and `join` says so.
 
 A node whose enrollment answer was lost enrolls again with a new token and the same key, and
 gets its node ID back. The identity survives `vk` updates. `vk-hub nodes remove <id>` revokes
-it and ends its session. The host can then join again only as a new node: remove
-`<state_dir>/node/` and use a new token. Issuing a token, enrolling, re-enrolling and removing
-a node are recorded in the audit log.
+it and ends its session. The host can then join again only as a new node, with `vk node join
+--replace` and a new token. Issuing a token, enrolling, re-enrolling and removing a node are
+recorded in the audit log.
 
 ### Running the node
 

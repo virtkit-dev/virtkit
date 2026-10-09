@@ -4,6 +4,12 @@ All notable changes to virtkit will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`vk node join --replace` re-enrolls a host as a new node.** After reading the token and
+  passing checks, it preserves the old identity in `<state_dir>/node.replaced-<time>` and
+  prints the old node ID for `vk-hub nodes remove`.
+
 ### Fixed
 
 - **A provider's application portal can start a `vk-hub` OIDC sign-in.** `/auth/login`

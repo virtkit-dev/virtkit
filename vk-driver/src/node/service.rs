@@ -542,7 +542,7 @@ fn owned_by(dir: &Path, account: &Account) -> Result<()> {
         anyhow!(
             "{} belongs to {owner}: this host was enrolled as {owner}. Install with `--user \
              {owner}`, or, to run the node as {name}, remove it from the hub (`vk-hub nodes \
-             remove <id>`), delete {} and `vk node join` again as {name}",
+             remove <id>`), delete {} as root or {owner}, and `vk node join` again as {name}",
             dir.display(),
             dir.display(),
             name = account.name,

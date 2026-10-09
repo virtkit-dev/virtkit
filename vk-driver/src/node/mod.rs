@@ -173,24 +173,54 @@ fn not_enrolled(e: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// What `vk node join` does besides enrolling.
+#[derive(Debug, Default)]
+pub struct JoinOptions {
+    /// Re-enroll a host as a new node, preserving its old identity in a separate directory.
+    pub replace: bool,
+}
+
 /// `vk node join`.
-pub async fn join(cfg: &Config, hub: &str, token: &TokenSource, ca: Option<&Path>) -> Result<()> {
-    let dir = dir(cfg);
-    create_dir(&dir)?;
-    let _lock = lock(&dir)?;
-    match read_enrollment(&dir) {
-        Ok(existing) => bail!(
-            "this host is already enrolled as node {} with {} — remove {} to enroll it again, \
-             as a new node",
-            existing.node_id,
-            existing.hub,
-            dir.display()
-        ),
-        Err(e) if is_not_found(&e) => {}
-        Err(e) => return Err(e),
-    }
+pub async fn join(
+    cfg: &Config,
+    hub: &str,
+    token: &TokenSource,
+    ca: Option<&Path>,
+    opts: &JoinOptions,
+) -> Result<()> {
+    // The hub URL is checked, an enrolled host refused and the token read before anything
+    // changes on the host.
     let hub = normalize_hub_url(hub)?;
+    if !opts.replace {
+        match read_enrollment(&dir(cfg)) {
+            Ok(existing) => return Err(already_enrolled(&existing)),
+            Err(e) if is_not_found(&e) => {}
+            Err(e) => return Err(e),
+        }
+    }
     let token = token.read()?;
+    enroll_here(cfg, &hub, &token, ca, opts.replace).await
+}
+
+/// Report that `existing` cannot be replaced without `--replace`.
+fn already_enrolled(existing: &Enrollment) -> anyhow::Error {
+    anyhow!(
+        "this host is already enrolled as node {} with {} — pass --replace to enroll it again \
+         as a new node, its old identity kept aside",
+        existing.node_id,
+        existing.hub,
+    )
+}
+
+/// Enroll this host as the current user, moving any earlier enrollment aside if `replace`.
+async fn enroll_here(
+    cfg: &Config,
+    hub: &str,
+    token: &str,
+    ca: Option<&Path>,
+    replace: bool,
+) -> Result<()> {
+    let dir = dir(cfg);
     let failed: Vec<String> = inventory::checks(cfg)
         .into_iter()
         .filter(|c| !c.ok)
@@ -215,34 +245,99 @@ pub async fn join(cfg: &Config, hub: &str, token: &TokenSource, ca: Option<&Path
         }
         None => None,
     };
-    let identity = Identity::load_or_create(&dir)?;
-    let public_key = identity.public_key();
-    let ask = EnrollRequest {
-        token: token.clone(),
-        public_key: vk_hub_proto::to_hex(public_key),
-        signature: identity.sign(&vk_hub_proto::enroll_message(&token, public_key)),
-        hostname: inventory::hostname(),
-    };
-    let node_id = enroll(&hub, ca_pem.as_deref(), &ask).await?;
-    if let Some(pem) = &ca_pem {
-        let path = dir.join(CA_FILE);
-        vk_fs::write_atomic(&path, pem, 0o600)
+    // An enrollment to be replaced is moved aside only once the host passes its checks.
+    let (_lock, aside) = make_room(&dir, replace)?;
+    let enrolled = async {
+        let identity = Identity::load_or_create(&dir)?;
+        let public_key = identity.public_key();
+        let ask = EnrollRequest {
+            token: token.to_string(),
+            public_key: vk_hub_proto::to_hex(public_key),
+            signature: identity.sign(&vk_hub_proto::enroll_message(token, public_key)),
+            hostname: inventory::hostname(),
+        };
+        let node_id = enroll(hub, ca_pem.as_deref(), &ask).await?;
+        if let Some(pem) = &ca_pem {
+            let path = dir.join(CA_FILE);
+            vk_fs::write_atomic(&path, pem, 0o600)
+                .with_context(|| format!("writing {}", path.display()))?;
+        }
+        let enrollment = Enrollment {
+            hub: hub.to_string(),
+            node_id: node_id.clone(),
+            ca: ca_pem.is_some(),
+        };
+        let json = serde_json::to_vec_pretty(&enrollment).context("encoding the enrollment")?;
+        let path = dir.join(ENROLLMENT_FILE);
+        vk_fs::write_atomic(&path, &json, 0o600)
             .with_context(|| format!("writing {}", path.display()))?;
+        Ok::<_, anyhow::Error>(node_id)
     }
-    let enrollment = Enrollment {
-        hub: hub.clone(),
-        node_id: node_id.clone(),
-        ca: ca_pem.is_some(),
-    };
-    let json = serde_json::to_vec_pretty(&enrollment).context("encoding the enrollment")?;
-    let path = dir.join(ENROLLMENT_FILE);
-    vk_fs::write_atomic(&path, &json, 0o600)
-        .with_context(|| format!("writing {}", path.display()))?;
+    .await;
+    let node_id = enrolled.map_err(|e| match &aside {
+        Some(aside) => e.context(format!(
+            "the old identity is in {}: replace {} with it to stay the node it was",
+            aside.display(),
+            dir.display()
+        )),
+        None => e,
+    })?;
     println!(
         "vk node: enrolled with {hub} as node {node_id}; run it as a service with \
          `vk node service install`, or in the foreground with `vk node run`"
     );
     Ok(())
+}
+
+/// Lock `dir` and ensure it holds no enrollment. Refuse an existing enrollment unless
+/// `replace` is set; then move it to a unique sibling `node.replaced-<time>` and recreate
+/// `dir`. Return the lock and the previous enrollment's location.
+fn make_room(dir: &Path, replace: bool) -> Result<(std::fs::File, Option<PathBuf>)> {
+    create_dir(dir)?;
+    let lock = lock(dir).map_err(|e| {
+        if e.is::<Locked>() {
+            e.context("a node is running on this host: stop it first (`systemctl stop vk-node`)")
+        } else {
+            e
+        }
+    })?;
+    let existing = match read_enrollment(dir) {
+        Ok(existing) => existing,
+        Err(e) if is_not_found(&e) => return Ok((lock, None)),
+        Err(e) => return Err(e),
+    };
+    if !replace {
+        return Err(already_enrolled(&existing));
+    }
+    // Only a join holding this lock names these, so a name found free stays free; a rename
+    // onto an empty directory would replace it, hence the check.
+    let stem = format!("node.replaced-{}", session::now_secs());
+    let aside = (0..)
+        .map(|n| match n {
+            0 => dir.with_file_name(&stem),
+            n => dir.with_file_name(format!("{stem}.{n}")),
+        })
+        .find(|p| {
+            std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        })
+        .expect("an unbounded range");
+    std::fs::rename(dir, &aside)
+        .with_context(|| format!("moving {} aside to {}", dir.display(), aside.display()))?;
+    println!(
+        "vk node: moved this host's previous enrollment, node {} of {}, to {}",
+        existing.node_id,
+        existing.hub,
+        aside.display()
+    );
+    println!(
+        "vk node: {} still lists that node; remove it there: `vk-hub nodes remove {}`",
+        existing.hub, existing.node_id
+    );
+    // The old lock moved with its dir; a node starting meanwhile finds the new one taken.
+    create_dir(dir)?;
+    let new = self::lock(dir)?;
+    drop(lock);
+    Ok((new, Some(aside)))
 }
 
 /// `POST /v1/enroll`, answering with the node ID the hub assigned.
@@ -917,6 +1012,59 @@ concurrent = 4
                 "{d:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_enrolled_host_is_enrolled_again_only_when_asked_its_old_identity_kept() {
+        let parent = scratch("replace");
+        let dir = parent.join("node");
+        drop(make_room(&dir, false).unwrap());
+        let e = Enrollment {
+            hub: "https://old".into(),
+            node_id: "cd".repeat(16),
+            ca: false,
+        };
+        std::fs::write(dir.join(ENROLLMENT_FILE), serde_json::to_vec(&e).unwrap()).unwrap();
+        let refused = make_room(&dir, false).unwrap_err().to_string();
+        assert!(
+            refused.contains("--replace") && refused.contains(&e.node_id),
+            "{refused}"
+        );
+        let (lock, moved) = make_room(&dir, true).unwrap();
+        assert!(is_not_found(&read_enrollment(&dir).unwrap_err()));
+        let aside: Vec<_> = std::fs::read_dir(&parent)
+            .unwrap()
+            .map(|d| d.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("node.replaced-")
+            })
+            .collect();
+        assert_eq!(aside, [moved.unwrap()]);
+        assert_eq!(read_enrollment(&aside[0]).unwrap(), e);
+        // The new dir is held: no other node can take it until the join is done.
+        assert!(lock_tries(&dir, 1).is_err());
+        drop(lock);
+        // Replaced again within the same second, it is moved aside under a name of its own:
+        // neither an earlier identity nor an empty directory in the way is replaced.
+        let first = aside[0].clone();
+        let empty = PathBuf::from(format!("{}.1", first.display()));
+        std::fs::create_dir(&empty).unwrap();
+        let mut moved = Vec::new();
+        for _ in 0..2 {
+            std::fs::write(dir.join(ENROLLMENT_FILE), serde_json::to_vec(&e).unwrap()).unwrap();
+            let (lock, aside) = make_room(&dir, true).unwrap();
+            drop(lock);
+            moved.push(aside.unwrap());
+        }
+        assert!(!moved.contains(&first) && !moved.contains(&empty) && moved[0] != moved[1]);
+        for p in moved.iter().chain([&first]) {
+            assert_eq!(read_enrollment(p).unwrap(), e);
+        }
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+        std::fs::remove_dir_all(&parent).unwrap();
     }
 
     #[test]
