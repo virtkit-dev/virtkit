@@ -1,12 +1,19 @@
 //! The configuration file: a subset of gitlab-runner's `config.toml`, with the same key
 //! names where the setting is the same, plus each runner's placement on the fleet (the
-//! pool, node labels and envelope its jobs get; see virtkit's `docs/gitlab-dispatch.md`).
+//! pool, node labels and envelope its jobs get; see `docs/gitlab-dispatch.md`).
 //!
 //! ```toml
 //! concurrent = 8            # jobs at once, over all runners
 //! check_interval = 3        # seconds between job requests while idle
 //!
-//! [[runners]]               # `[[runner]]` is accepted too
+//! state_dir = "/var/lib/vk-gitlab"   # each runner's taken jobs
+//!
+//! [hub]
+//! url = "https://hub.example.com:8443"
+//! api_key_file = "/etc/vk-gitlab/hub.key"
+//! ca_file = "/etc/vk-gitlab/hub-ca.pem"
+//!
+//! [[runners]]
 //! name = "ci"
 //! url = "https://gitlab.example.com"
 //! token_file = "/etc/vk-gitlab/runner-ci.token"
@@ -30,6 +37,7 @@ use crate::secret::Secret;
 /// gitlab-runner's `CheckInterval`.
 pub const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 pub const DEFAULT_UNHEALTHY_REQUESTS_LIMIT: u32 = 3;
+pub const DEFAULT_STATE_DIR: &str = "/var/lib/vk-gitlab";
 pub const DEFAULT_UNHEALTHY_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,8 +59,71 @@ pub struct Config {
     /// Where the system ID is kept. Default: `.vk-gitlab-system-id` beside the config file.
     #[serde(default)]
     pub system_id_file: Option<PathBuf>,
-    #[serde(default, alias = "runner")]
+    /// Where each runner's state file (`<runner name>.json`) is kept. Default
+    /// `/var/lib/vk-gitlab`.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+    /// The vk fleet hub jobs are handed to; `vk-gitlab run` requires it.
+    #[serde(default)]
+    pub hub: Option<HubConfig>,
+    #[serde(default)]
     pub runners: Vec<RunnerConfig>,
+}
+
+/// `[hub]`: where the fleet hub is, and the API key it knows this daemon by.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubConfig {
+    /// `https://hub.example.com:8443`; `http://` only to a loopback hub.
+    pub url: String,
+    /// The API key (`vkk_…`). Prefer `api_key_file`.
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    api_key_file: Option<PathBuf>,
+    /// A PEM bundle the hub's certificate is verified against instead of the system roots.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    #[serde(skip)]
+    resolved_key: Secret,
+}
+
+impl std::fmt::Debug for HubConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HubConfig")
+            .field("url", &self.url)
+            .field("api_key", &self.resolved_key)
+            .field("ca_file", &self.ca_file)
+            .finish()
+    }
+}
+
+impl HubConfig {
+    pub fn api_key(&self) -> &Secret {
+        &self.resolved_key
+    }
+
+    fn resolve(&mut self, base: &Path) -> Result<()> {
+        // The raw key is not kept beside the resolved one.
+        self.resolved_key = match (self.api_key.take(), &self.api_key_file) {
+            (Some(k), None) => Secret::new(k.trim()),
+            (None, Some(file)) => {
+                let file = base.join(file);
+                let raw = std::fs::read_to_string(&file)
+                    .with_context(|| format!("hub: reading api_key_file {}", file.display()))?;
+                Secret::new(raw.trim())
+            }
+            (Some(_), Some(_)) => bail!("hub: set api_key or api_key_file, not both"),
+            (None, None) => bail!("hub: api_key or api_key_file is required"),
+        };
+        if !crate::hub::valid_api_key(self.resolved_key.expose()) {
+            bail!("hub: the API key is not `vkk_` and 64 lowercase hex digits");
+        }
+        if let Some(ca) = &self.ca_file {
+            self.ca_file = Some(base.join(ca));
+        }
+        Ok(())
+    }
 }
 
 fn one() -> usize {
@@ -62,7 +133,9 @@ fn one() -> usize {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
-    /// Shown in logs; defaults to the shortened token.
+    /// Shown in logs and names the runner's state file; defaults to the shortened token.
+    /// Set it explicitly: with the default, a new token starts an empty state file and
+    /// the old one's jobs are no longer resumed.
     #[serde(default)]
     pub name: String,
     /// The GitLab instance URL.
@@ -253,6 +326,16 @@ impl Config {
         if cfg.concurrent == 0 {
             bail!("concurrent must be at least 1");
         }
+        if let Some(hub) = cfg.hub.as_mut() {
+            hub.resolve(base)?;
+        }
+        cfg.state_dir = Some(
+            base.join(
+                cfg.state_dir
+                    .as_deref()
+                    .unwrap_or(Path::new(DEFAULT_STATE_DIR)),
+            ),
+        );
         if let Some(f) = &cfg.system_id_file {
             cfg.system_id_file = Some(base.join(f));
         }
@@ -308,6 +391,15 @@ impl Config {
                     bail!("{which}: label {l:?} is listed twice");
                 }
             }
+            // The runner name is used as a filename.
+            if !r
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                || r.name.starts_with('.')
+            {
+                bail!("{which}: a runner name is letters, digits, `-`, `_` and `.`");
+            }
             if !names.insert(r.name.clone()) {
                 bail!("{which}: runner names must be unique");
             }
@@ -349,7 +441,7 @@ mod tests {
     fn minimal_runner() {
         let cfg = parse(
             r#"
-            [[runner]]
+            [[runners]]
             url = "https://gitlab.example.com/"
             token = " glrt-t1_abcdefghijklmnop "
             "#,
@@ -442,6 +534,19 @@ mod tests {
             ("concurent = 2\n", "unknown field"),
             ("concurrent = 0\n", "at least 1"),
             (
+                "[[runner]]\nurl = \"https://g\"\ntoken = \"a\"\n",
+                "unknown field",
+            ),
+            (
+                "[[runners]]\nname = \"../x\"\nurl = \"https://g\"\ntoken = \"a\"\n",
+                "runner name",
+            ),
+            (
+                "[hub]\nurl = \"https://h\"\napi_key = \"nope\"\n",
+                "API key",
+            ),
+            ("[hub]\nurl = \"https://h\"\n", "api_key or api_key_file"),
+            (
                 "[[runners]]\nurl = \"https://g\"\ntoken = \"a\"\nenvelope = { mem = \"lots\", cpus = 1, disk = \"1G\" }\n",
                 "envelope mem",
             ),
@@ -480,6 +585,23 @@ mod tests {
             .unwrap();
             assert_eq!(cfg.runners[0].unhealthy_requests_limit(), want, "{set}");
         }
+    }
+
+    #[test]
+    fn hub_section() {
+        let key = format!("vkk_{}", "ab".repeat(32));
+        let cfg = parse(&format!(
+            "[hub]\nurl = \"https://hub:8443\"\napi_key = \"{key}\"\nca_file = \"ca.pem\"\n"
+        ))
+        .unwrap();
+        let hub = cfg.hub.as_ref().unwrap();
+        assert_eq!(hub.api_key().expose(), key);
+        assert_eq!(
+            hub.ca_file.as_deref(),
+            Some(Path::new("/etc/vk-gitlab/ca.pem"))
+        );
+        assert!(!format!("{cfg:?}").contains(&key));
+        assert_eq!(cfg.state_dir.as_deref(), Some(Path::new(DEFAULT_STATE_DIR)));
     }
 
     #[test]

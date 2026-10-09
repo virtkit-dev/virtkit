@@ -76,6 +76,12 @@ pub struct ClientOptions {
 #[derive(Debug)]
 pub struct ClientError(String);
 
+impl ClientError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)

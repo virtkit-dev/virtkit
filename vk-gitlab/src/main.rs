@@ -10,7 +10,7 @@ use log::LevelFilter;
 use tokio::signal::unix::{SignalKind, signal};
 
 use vk_gitlab::config::Config;
-use vk_gitlab::dispatch::NoCapacity;
+use vk_gitlab::hub::{HubClient, HubOptions};
 use vk_gitlab::poll::{self, RunOptions, ShutdownHandle};
 use vk_gitlab::{logging, system_id};
 
@@ -87,9 +87,19 @@ async fn run(config: PathBuf) -> Result<()> {
     }
     let system_id = system_id_for(&cfg)?;
     log::info!(system_id = system_id.as_str(), runners = cfg.runners.len(), concurrent = cfg.concurrent; "Starting vk-gitlab");
-    log::warn!(
-        "No hub dispatcher is available yet: runners report no capacity and request no jobs"
-    );
+    let Some(hub) = &cfg.hub else {
+        anyhow::bail!(
+            "{}: `vk-gitlab run` needs a [hub] section",
+            config.display()
+        );
+    };
+    let dispatcher = HubClient::new(HubOptions {
+        url: hub.url.clone(),
+        api_key: hub.api_key().clone(),
+        ca_file: hub.ca_file.clone(),
+        retry: Default::default(),
+    })
+    .context("the [hub] section")?;
     let (handle, shutdown) = ShutdownHandle::new();
     let shutdown_timeout = cfg.shutdown_timeout();
     let mut term = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
@@ -106,15 +116,21 @@ async fn run(config: PathBuf) -> Result<()> {
             _ = int.recv() => {}
             () = tokio::time::sleep(shutdown_timeout) => {}
         }
-        log::warn!("Aborting running jobs");
+        log::warn!("Aborting running jobs; a third signal exits at once");
         handle.abort();
-        // Keep the handle: the abort must stay visible to jobs still reporting.
-        std::future::pending::<()>().await;
+        // The handle stays alive meanwhile: the abort must stay visible to jobs still
+        // reporting.
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        log::error!("Exiting now; the jobs still in the state files resume on the next start");
+        std::process::exit(1);
     });
     let result = poll::run(
         &cfg,
         &system_id,
-        Arc::new(NoCapacity),
+        Arc::new(dispatcher),
         RunOptions::default(),
         shutdown,
     )

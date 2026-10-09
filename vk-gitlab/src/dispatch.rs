@@ -7,42 +7,16 @@
 //! acceptance. Copy its [output](Dispatcher::output) into the trace, report the result,
 //! then [settle](Dispatcher::settle) it.
 //!
-//! The types mirror `vk_hub_proto::client`. The HTTP hub client translates them and
-//! converts the job payload to the hub's job spec. [`FakeDispatcher`] is an in-memory
-//! test hub; `vk-gitlab run` uses [`NoCapacity`], which reports no room.
+//! The wire types are [`vk_hub_proto`]'s; [`crate::hub::HubClient`] implements the trait
+//! over HTTP, and [`FakeDispatcher`] is an in-memory hub for tests.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 
-use crate::failure::FailureReason;
-use crate::job::Job;
-
-/// Resources a reservation sets aside on a node.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Envelope {
-    pub mem_mib: u64,
-    pub cpus: u32,
-    pub disk_bytes: u64,
-}
-
-/// Where a runner's jobs go: a pool of nodes, the labels a node must declare, and the
-/// envelope each job reserves.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Placement {
-    pub pool: String,
-    pub labels: Vec<String>,
-    pub envelope: Envelope,
-}
-
-/// `POST /v1/capacity`'s answer: how many envelopes of the placement the ready nodes could
-/// take. Advisory: a reservation decides.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Capacity {
-    pub revision: u64,
-    pub fits: u32,
-}
+pub use vk_hub_proto::client::{CancelMode, Capacity, JobState as HubJobState, JobView, Placement};
+pub use vk_hub_proto::job::{Envelope, FailureClass, JobResult, JobSpec};
 
 /// An envelope set aside on a node, for one job request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,102 +28,31 @@ pub struct Reservation {
     pub lease: Duration,
 }
 
-/// A job handed to the hub. The hub client translates `job` into the hub's job spec.
-#[derive(Debug, Clone)]
+/// A job handed to the hub. `Debug` shows which job it is, none of the spec's secrets.
+#[derive(Clone)]
 pub struct Submission {
-    /// 32 hex digits, making the submission idempotent.
+    /// 32 hex digits for idempotent submission: reusing the ID after a restart returns
+    /// the same job.
     pub request_id: String,
     pub placement: Placement,
     /// The reservation the job was requested under; `None` when it was lost meanwhile, and
     /// the hub then places the job afresh within `place_within`.
     pub reservation: Option<String>,
     pub place_within: Duration,
-    /// The configured runner that took the job.
-    pub runner: String,
-    /// The GitLab URL the runner talks to (the spec's `server_url`).
-    pub server_url: String,
-    /// The payload exactly as GitLab sent it, job token and variables included.
-    pub job: Arc<Job>,
+    /// GitLab's job ID, for logs.
+    pub gitlab_job: i64,
+    pub spec: JobSpec,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HubJobState {
-    Queued,
-    /// Sent to a node, not yet accepted.
-    Starting,
-    /// Accepted by a node: the job may be committed to GitLab.
-    Running,
-    Finished,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CancelMode {
-    /// GitLab's `canceling`: stop the running step, run `after_script`, end as canceled.
-    Graceful,
-    /// Stop now; nothing more of the job runs or uploads.
-    Immediate,
-}
-
-/// How a job failed, as the hub classifies it (`vk_hub_proto::job::FailureClass`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FailureClass {
-    Script,
-    Timeout,
-    Canceled,
-    ImagePull,
-    Configuration,
-    ExternalDependency,
-    System,
-    Interrupted,
-    NoCapacity,
-    Lost,
-    Other,
-}
-
-impl FailureClass {
-    /// The GitLab `failure_reason` for the class, before mapping onto what the instance
-    /// supports (`FailureClass::gitlab_reason` in `vk-hub-proto`).
-    pub fn gitlab_reason(self) -> FailureReason {
-        FailureReason::new(match self {
-            FailureClass::Script => FailureReason::SCRIPT_FAILURE,
-            FailureClass::Timeout => FailureReason::JOB_EXECUTION_TIMEOUT,
-            FailureClass::Canceled => FailureReason::JOB_CANCELED,
-            FailureClass::ImagePull => FailureReason::IMAGE_PULL_FAILURE,
-            FailureClass::Configuration => FailureReason::CONFIGURATION_ERROR,
-            FailureClass::ExternalDependency => FailureReason::RUNNER_EXTERNAL_DEPENDENCY_FAILURE,
-            FailureClass::System | FailureClass::NoCapacity | FailureClass::Lost => {
-                FailureReason::RUNNER_SYSTEM_FAILURE
-            }
-            FailureClass::Interrupted => FailureReason::RUNNER_INTERRUPTED,
-            FailureClass::Other => FailureReason::UNKNOWN_FAILURE,
-        })
+impl std::fmt::Debug for Submission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Submission")
+            .field("request_id", &self.request_id)
+            .field("gitlab_job", &self.gitlab_job)
+            .field("placement", &self.placement)
+            .field("reservation", &self.reservation)
+            .finish_non_exhaustive()
     }
-}
-
-/// A finished job's outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JobResult {
-    /// `None` on success.
-    pub failure: Option<FailureClass>,
-    pub exit_code: Option<i32>,
-    pub message: Option<String>,
-    /// The output's final length.
-    pub output_len: u64,
-}
-
-/// The hub's view of a job (`GET /v1/jobs/<id>`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JobView {
-    pub id: String,
-    /// Moves with every change but the output's length.
-    pub revision: u64,
-    pub state: HubJobState,
-    pub node: Option<String>,
-    pub stage: Option<String>,
-    pub output_len: u64,
-    pub cancel: Option<CancelMode>,
-    /// Present once finished.
-    pub result: Option<JobResult>,
 }
 
 /// Output read from an offset (`GET /v1/jobs/<id>/output`).
@@ -282,82 +185,6 @@ pub trait Dispatcher: Send + Sync + 'static {
     fn settle(&self, id: &str) -> impl Future<Output = DispatchResult<()>> + Send;
 }
 
-/// A hub with no room anywhere: the runner never asks GitLab for a job.
-#[derive(Debug, Default, Clone)]
-pub struct NoCapacity;
-
-fn no_hub<T>() -> DispatchResult<T> {
-    Err(DispatchError::new(
-        ErrorKind::Unavailable,
-        "no hub dispatcher is configured",
-    ))
-}
-
-impl Dispatcher for NoCapacity {
-    async fn capacity(
-        &self,
-        _placement: &Placement,
-        after: Option<u64>,
-        wait: Duration,
-    ) -> DispatchResult<Capacity> {
-        if after.is_some() {
-            tokio::time::sleep(wait).await;
-        }
-        Ok(Capacity {
-            revision: 0,
-            fits: 0,
-        })
-    }
-
-    async fn reserve(
-        &self,
-        _request_id: &str,
-        _placement: &Placement,
-        _lease: Duration,
-        _wait: Duration,
-    ) -> DispatchResult<Reservation> {
-        no_hub()
-    }
-
-    async fn renew(&self, _reservation: &str, _lease: Duration) -> DispatchResult<Duration> {
-        no_hub()
-    }
-
-    async fn release(&self, _reservation: &str) -> DispatchResult<()> {
-        Ok(())
-    }
-
-    async fn submit(&self, _submission: Submission) -> DispatchResult<JobView> {
-        no_hub()
-    }
-
-    async fn job(
-        &self,
-        _id: &str,
-        _after: Option<u64>,
-        _wait: Duration,
-    ) -> DispatchResult<JobView> {
-        no_hub()
-    }
-
-    async fn output(
-        &self,
-        _id: &str,
-        _offset: u64,
-        _wait: Duration,
-    ) -> DispatchResult<OutputChunk> {
-        no_hub()
-    }
-
-    async fn cancel(&self, _id: &str, _mode: CancelMode) -> DispatchResult<JobView> {
-        no_hub()
-    }
-
-    async fn settle(&self, _id: &str) -> DispatchResult<()> {
-        no_hub()
-    }
-}
-
 pub use fake::{FakeCall, FakeDispatcher};
 
 mod fake {
@@ -386,6 +213,7 @@ mod fake {
         submission: Submission,
         view: JobView,
         output: Vec<u8>,
+        settled: bool,
     }
 
     #[derive(Default)]
@@ -422,6 +250,11 @@ mod fake {
         fn job_mut(&mut self, id: &str) -> Option<&mut FakeJob> {
             self.jobs.iter_mut().find(|j| j.view.id == id)
         }
+    }
+
+    /// What the hub's idempotency compares: the submission as `POST /v1/jobs` carries it.
+    fn body(s: &Submission) -> serde_json::Value {
+        serde_json::json!([s.placement, s.reservation, s.place_within.as_secs(), s.spec])
     }
 
     fn not_found(id: &str) -> DispatchError {
@@ -574,6 +407,7 @@ mod fake {
                     exit_code,
                     message: None,
                     output_len: j.output.len() as u64,
+                    artifacts: Vec::new(),
                 });
             });
         }
@@ -616,7 +450,7 @@ mod fake {
                     return None;
                 }
                 i.next_id += 1;
-                let id = format!("r-{}", i.next_id);
+                let id = format!("{:032x}", i.next_id);
                 i.reservations.insert(id.clone(), placement.pool.clone());
                 i.calls.push(FakeCall::Reserve(id.clone()));
                 Some(id)
@@ -661,18 +495,34 @@ mod fake {
         async fn submit(&self, submission: Submission) -> DispatchResult<JobView> {
             self.change(|i| {
                 i.calls.push(FakeCall::Submit {
-                    job: submission.job.id,
+                    job: submission.gitlab_job,
                     reservation: submission.reservation.clone(),
                 });
                 if let Some(err) = i.refuse_submit.clone() {
                     return Err(err);
+                }
+                if let Some(j) = i
+                    .jobs
+                    .iter()
+                    .find(|j| j.submission.request_id == submission.request_id)
+                {
+                    // Idempotent, as the hub: the same request_id and body answer the same
+                    // job; another body is a conflict.
+                    return if body(&j.submission) == body(&submission) {
+                        Ok(j.view.clone())
+                    } else {
+                        Err(DispatchError::new(
+                            ErrorKind::Conflict,
+                            "this request_id was used before with another body",
+                        ))
+                    };
                 }
                 if let Some(r) = &submission.reservation {
                     i.reservations.remove(r);
                 }
                 i.next_id += 1;
                 let view = JobView {
-                    id: format!("j-{}", i.next_id),
+                    id: format!("{:032x}", i.next_id),
                     revision: 1,
                     state: HubJobState::Queued,
                     node: None,
@@ -685,6 +535,7 @@ mod fake {
                     submission,
                     view: view.clone(),
                     output: Vec::new(),
+                    settled: false,
                 });
                 Ok(view)
             })
@@ -716,7 +567,7 @@ mod fake {
             wait: Duration,
         ) -> DispatchResult<OutputChunk> {
             let read = |i: &mut Inner, block: bool| -> Option<DispatchResult<OutputChunk>> {
-                let Some(j) = i.job_mut(id) else {
+                let Some(j) = i.job_mut(id).filter(|j| !j.settled) else {
                     return Some(Err(not_found(id)));
                 };
                 let len = j.output.len() as u64;
@@ -765,80 +616,20 @@ mod fake {
         }
 
         async fn settle(&self, id: &str) -> DispatchResult<()> {
-            self.change(|i| i.calls.push(FakeCall::Settle(id.to_owned())));
-            Ok(())
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::failure::FailureReasonMapper;
-
-    // The failure table of virtkit's docs/gitlab-dispatch.md, "Failures", against a GitLab
-    // that supports every reason, then one that supports only the three always accepted.
-    #[test]
-    fn failure_classes_map_as_the_contract_says() {
-        let all: Vec<FailureReason> = [
-            "script_failure",
-            "job_execution_timeout",
-            "image_pull_failure",
-            "runner_configuration_error",
-            "runner_external_dependency_failure",
-            "runner_system_failure",
-            "runner_interrupted",
-        ]
-        .map(FailureReason::from)
-        .to_vec();
-        let new = FailureReasonMapper::new(&all);
-        let old = FailureReasonMapper::new(&[]);
-        for (class, newer, older) in [
-            (FailureClass::Script, "script_failure", "script_failure"),
-            (
-                FailureClass::Timeout,
-                "job_execution_timeout",
-                "job_execution_timeout",
-            ),
-            (
-                FailureClass::ImagePull,
-                "image_pull_failure",
-                "runner_system_failure",
-            ),
-            (
-                FailureClass::Configuration,
-                "runner_configuration_error",
-                "script_failure",
-            ),
-            (
-                FailureClass::ExternalDependency,
-                "runner_external_dependency_failure",
-                "runner_system_failure",
-            ),
-            (
-                FailureClass::System,
-                "runner_system_failure",
-                "runner_system_failure",
-            ),
-            (
-                FailureClass::Interrupted,
-                "runner_interrupted",
-                "unknown_failure",
-            ),
-            (FailureClass::Canceled, "unknown_failure", "unknown_failure"),
-            (
-                FailureClass::NoCapacity,
-                "runner_system_failure",
-                "runner_system_failure",
-            ),
-            (
-                FailureClass::Lost,
-                "runner_system_failure",
-                "runner_system_failure",
-            ),
-        ] {
-            assert_eq!(new.map(&class.gitlab_reason()).as_str(), newer, "{class:?}");
-            assert_eq!(old.map(&class.gitlab_reason()).as_str(), older, "{class:?}");
+            self.change(|i| {
+                i.calls.push(FakeCall::Settle(id.to_owned()));
+                match i.job_mut(id) {
+                    None => Err(not_found(id)),
+                    Some(j) if j.view.state != HubJobState::Finished => Err(DispatchError::new(
+                        ErrorKind::Conflict,
+                        "the job has not finished",
+                    )),
+                    Some(j) => {
+                        j.settled = true;
+                        Ok(())
+                    }
+                }
+            })
         }
     }
 }

@@ -5,6 +5,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use vk_hub_proto::job::FailureClass;
 
 /// The `state` of a job update (`PUT /api/v4/jobs/:id`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +82,14 @@ impl FailureReason {
 impl From<&str> for FailureReason {
     fn from(value: &str) -> Self {
         Self::new(value)
+    }
+}
+
+/// GitLab's name for a class of failure the hub reports, before [`FailureReasonMapper`]
+/// fits it to what a GitLab accepts.
+impl From<FailureClass> for FailureReason {
+    fn from(class: FailureClass) -> Self {
+        Self::new(class.gitlab_reason())
     }
 }
 
@@ -251,5 +260,71 @@ mod tests {
             m.map(&FailureReason::JOB_CANCELED.into()).as_str(),
             "unknown_failure"
         );
+    }
+
+    // The failure table of docs/gitlab-dispatch.md, "Failures": against a GitLab that
+    // supports every reason, then one that supports only the three always accepted.
+    #[test]
+    fn failure_classes_map_as_the_contract_says() {
+        let all: Vec<FailureReason> = [
+            "image_pull_failure",
+            "runner_configuration_error",
+            "runner_external_dependency_failure",
+            "runner_interrupted",
+            "unknown_failure",
+        ]
+        .map(FailureReason::from)
+        .to_vec();
+        let new = FailureReasonMapper::new(&all);
+        let old = FailureReasonMapper::new(&[]);
+        for (class, newer, older) in [
+            (FailureClass::Script, "script_failure", "script_failure"),
+            (
+                FailureClass::Timeout,
+                "job_execution_timeout",
+                "job_execution_timeout",
+            ),
+            (
+                FailureClass::System,
+                "runner_system_failure",
+                "runner_system_failure",
+            ),
+            (
+                FailureClass::Lost,
+                "runner_system_failure",
+                "runner_system_failure",
+            ),
+            (
+                FailureClass::NoCapacity,
+                "runner_system_failure",
+                "runner_system_failure",
+            ),
+            (
+                FailureClass::ImagePull,
+                "image_pull_failure",
+                "runner_system_failure",
+            ),
+            (
+                FailureClass::Configuration,
+                "runner_configuration_error",
+                "script_failure",
+            ),
+            (
+                FailureClass::ExternalDependency,
+                "runner_external_dependency_failure",
+                "runner_system_failure",
+            ),
+            (
+                FailureClass::Interrupted,
+                "runner_interrupted",
+                "unknown_failure",
+            ),
+            (FailureClass::Canceled, "unknown_failure", "unknown_failure"),
+            (FailureClass::Other, "unknown_failure", "unknown_failure"),
+        ] {
+            let reason = FailureReason::from(class);
+            assert_eq!(new.map(&reason).as_str(), newer, "{class:?}");
+            assert_eq!(old.map(&reason).as_str(), older, "{class:?}");
+        }
     }
 }

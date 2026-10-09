@@ -78,9 +78,9 @@ Idle reservations are bounded: one per outstanding job request, so one per runne
 default `request_concurrency` of 1, each held for at most one request plus a renewal. A
 reservation that ends mid-request — its node lost, or the node's clock ran its lease out —
 leaves a job that arrives meanwhile without one; the hub then places it afresh within its
-`place_within_secs` (default 300), and failing that ends it `no_capacity`, which the daemon
-reports as `runner_system_failure`. That window is the only way a job taken from GitLab
-waits for capacity.
+`place_within_secs` (vk-gitlab asks for 300 seconds), and failing that ends it `no_capacity`,
+which the daemon reports as `runner_system_failure`. That window is the only way a job taken
+from GitLab waits for capacity.
 
 The lease is a duration on the node's monotonic clock from its acceptance; no wall-clock time
 crosses the wire. The daemon counts it from when it sent its request, so it always believes the
@@ -91,7 +91,8 @@ lease ends earlier than the node does.
 A runner in `vk-gitlab`'s configuration names its placement:
 
 ```toml
-[[runner]]
+[[runners]]
+name = "ci"
 url = "https://gitlab.example.com"
 token_file = "/etc/vk-gitlab/runner-ci.token"   # glrt-…
 pool = "ci"
@@ -283,6 +284,26 @@ job ID, job token, hub job ID, `request_id`s — before it submits or commits it
 daemon resumes each from the hub's view and GitLab's trace offset; a job it had not yet
 submitted is submitted with the same `request_id`.
 
+The state file is `<state_dir>/<runner name>.json`. `state_dir` defaults to
+`/var/lib/vk-gitlab` and is created `0700`; the daemon refuses to start when group or others
+can access it. A record stays until the hub has settled its job, including a job already
+reported to GitLab or abandoned before submission. A runner's `name` defaults to its token's
+short form, so a runner whose token may change needs an explicit `name`, or the new token
+starts an empty file and the old one's jobs are never resumed; the daemon warns at start about
+state files no configured runner owns.
+
+Hub jobs and reservations belong to the API key that created them, and the hub answers
+`not_found` for them to any other key. The state file records a fingerprint of the key, and a
+daemon started with another key refuses to start while the file holds jobs. Before rotating
+the key, stop the daemon (SIGTERM) and let its running jobs finish within
+`shutdown_timeout`; a job still recorded then keeps the new key from starting until the old
+key resumes it or the file is removed, which gives the job up to GitLab's timeout. A key
+expires (`--ttl`, 90 days by default, at most a year), and the hub does not tell the daemon
+when: its rotation is the operator's to schedule.
+
+The daemon does not rotate runner tokens. It verifies the token at start and daily, warns
+from a week before GitLab's `token_expires_at`, and logs an error once it has expired.
+
 ## Failures
 
 The hub never retries a GitLab job. It places a job again only while no node can have
@@ -393,7 +414,7 @@ Every field of the response, from gitlab-runner 19.5's `common/spec/spec.go`:
 | `run` | — | `native_steps_integration` is not advertised; a job with `run` fails `runner_configuration_error` |
 | `policy_options` | — | the daemon writes gitlab-runner's "Job triggered by policy" line to the trace |
 | `suspend_options` | — | ignored: no suspended environments |
-| TLS chain of GitLab's answer | `server_ca_pem` | the chain the daemon verified, for `CI_SERVER_TLS_CA_FILE` |
+| the runner's `tls_ca_file` | `server_ca_pem` | its contents, when set, for `CI_SERVER_TLS_CA_FILE`; without it `CI_SERVER_TLS_CA_FILE` is not set |
 
 `server_url` is the runner's configured URL; `job.runner_id` the ID `/runners/verify`
 returned.

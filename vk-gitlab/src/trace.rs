@@ -242,11 +242,27 @@ impl<A: JobApi> JobTrace<A> {
         mapper: Option<FailureReasonMapper>,
         settings: TraceSettings,
     ) -> Self {
+        Self::resume(api, job, mapper, settings, &[])
+    }
+
+    /// Like [`start`](Self::start), but resumes after a restart with the `prefix` GitLab
+    /// already holds. The log starts with it and the first patch follows it. A 416
+    /// corrects the offset if GitLab holds more.
+    pub fn resume(
+        api: Arc<A>,
+        job: JobCredentials,
+        mapper: Option<FailureReasonMapper>,
+        settings: TraceSettings,
+        prefix: &[u8],
+    ) -> Self {
+        let mut buffer = TraceBuffer::new(settings.output_limit.saturating_add(OUTPUT_LIMIT_SLACK));
+        buffer.write(prefix);
+        let sent = buffer.size();
         let state = State {
-            buffer: TraceBuffer::new(settings.output_limit.saturating_add(OUTPUT_LIMIT_SLACK)),
+            buffer,
             overflowed: false,
             closed: false,
-            sent: 0,
+            sent,
             sent_time: None,
             update_interval: settings.update_interval,
             force_send_interval: settings.force_send_interval,
@@ -283,6 +299,11 @@ impl<A: JobApi> JobTrace<A> {
         if st.buffer.write(data) > 0 && !std::mem::replace(&mut st.overflowed, true) {
             log::warn!(job = self.shared.job.id, limit = st.buffer.ceiling(); "Job log is past its output limit; dropping the rest");
         }
+    }
+
+    /// How much of the log GitLab has acknowledged.
+    pub fn sent(&self) -> usize {
+        self.shared.lock().sent
     }
 
     /// The log's length so far.
