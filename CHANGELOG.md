@@ -106,6 +106,12 @@ All notable changes to virtkit will be documented in this file.
 
 ### Fixed
 
+- **Registry pulls and pushes wait out a busy registry instead of failing the CI job.** When
+  the registry turns a request away — answering 503 or 429, or closing the connection before
+  answering, as `vk-registry` does past its per-host connection cap — `vk` retries with
+  growing, randomized delays for up to three minutes, with a note at most every 10 seconds,
+  where it gave up after three retries over 14 seconds. A missing blob, a refused login or a
+  digest mismatch still fails at once.
 - **The vk executor's host checkout logs in English on every host.** It ran `git` in the
   host's locale, so a job's log read in French on a host set to `fr_FR`; host `git` now runs
   with `LC_ALL=C`.

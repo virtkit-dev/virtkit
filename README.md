@@ -802,6 +802,10 @@ compiled units. In accounts mode, a key with `write:files/<dir>/*` fills the cac
 with `read:files/<dir>/*` only reads it. Cached files expire under `vk-registry gc`'s tag
 retention like any other tag. Set `webdav = false` in the server config to disable WebDAV.
 
+A registry that turns requests away, as a busy `vk-registry` does past its per-host
+connection cap, is waited out: `vk` retries a 503 or 429, or a connection closed before any
+answer, with growing randomized delays for up to three minutes before a pull or push fails.
+
 Use `vk registry push|pull|inspect` for guest bundles and `vk registry status|gc` for a
 local store. The central server and storage model are documented in
 [`vk-registry/DESIGN.md`](vk-registry/DESIGN.md).

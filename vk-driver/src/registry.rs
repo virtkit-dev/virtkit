@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use oci_client::Reference as OciReference;
+use oci_client::RegistryOperation;
 use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol};
 use oci_client::errors::{OciDistributionError, OciEnvelope, OciErrorCode};
 use oci_client::manifest::{OCI_IMAGE_MEDIA_TYPE, OciDescriptor, OciImageManifest, OciManifest};
@@ -287,7 +288,7 @@ async fn inspect_async(rg: &Registry, name: &str, reference: &Reference) -> Resu
         Reference::Tag(t) => make_ref(rg, name, t)?,
         Reference::Digest(d) => make_digest_ref(rg, name, d)?,
     };
-    manifest_digest(&client, &image, &auth)
+    resolve_digest(&client, &image, &auth)
         .await
         .with_context(|| format!("{}/{name}: reference not found in the registry", rg.repo))
 }
@@ -305,7 +306,7 @@ pub fn exists(rg: &Registry, name: &str, tag: &str) -> bool {
         let Ok(image) = make_ref(rg, name, tag) else {
             return false;
         };
-        manifest_digest(&client, &image, &auth).await.is_ok()
+        resolve_digest(&client, &image, &auth).await.is_ok()
     })
 }
 
@@ -323,24 +324,42 @@ pub fn record_build_stage(rg: &Registry, snapshot_tag: &str, digest: &str) -> Re
         store.put_manifest(name, &tag, &ctype, &body)?;
         return Ok(());
     }
-    block_on(async {
-        let (client, auth) = client(rg)?;
-        let source = make_digest_ref(rg, name, digest)?;
-        let target = make_ref(rg, name, &tag)?;
-        // Preserve the bytes: reserializing a manifest can change its digest.
-        let (manifest, _) = client
-            .pull_manifest_raw(&source, &auth, &[OCI_IMAGE_MEDIA_TYPE])
-            .await
-            .context("reading the completed stage manifest")?;
-        client
-            .store_auth_if_needed(target.resolve_registry(), &auth)
-            .await;
-        client
-            .push_manifest_raw(&target, manifest, OCI_IMAGE_MEDIA_TYPE.parse()?)
-            .await
-            .context("recording the completed stage")?;
-        Ok(())
-    })
+    block_on(record_build_stage_async(rg, name, digest, &tag))
+}
+
+async fn record_build_stage_async(
+    rg: &Registry,
+    name: &str,
+    digest: &str,
+    tag: &str,
+) -> Result<()> {
+    let (client, auth) = client(rg)?;
+    let source = make_digest_ref(rg, name, digest)?;
+    let target = make_ref(rg, name, tag)?;
+    // Preserve the bytes: reserializing a manifest can change its digest.
+    let (manifest, _) = async {
+        authenticate(&client, &source, &auth, &[RegistryOperation::Pull]).await?;
+        with_transfer_retry(&format!("reading the manifest of {name}@{digest}"), || {
+            client.pull_manifest_raw(&source, &auth, &[OCI_IMAGE_MEDIA_TYPE])
+        })
+        .await
+    }
+    .await
+    .context("reading the completed stage manifest")?;
+    client
+        .store_auth_if_needed(target.resolve_registry(), &auth)
+        .await;
+    let media_type: reqwest::header::HeaderValue = OCI_IMAGE_MEDIA_TYPE.parse()?;
+    async {
+        authenticate(&client, &target, &auth, &[RegistryOperation::Push]).await?;
+        with_transfer_retry(&format!("pushing the manifest to {target}"), || {
+            client.push_manifest_raw(&target, manifest.clone(), media_type.clone())
+        })
+        .await
+    }
+    .await
+    .context("recording the completed stage")?;
+    Ok(())
 }
 
 /// [`exists`] for every tag at once, in order — so a stage of thirty steps learns where it
@@ -374,6 +393,13 @@ pub fn exists_many(rg: &Registry, name: &str, tags: &[&str]) -> Vec<bool> {
             .iter()
             .map(|tag| make_ref(rg, name, tag).ok())
             .collect();
+        if let Some(image) = images.iter().flatten().next()
+            && authenticate(&client, image, &auth, &[RegistryOperation::Pull])
+                .await
+                .is_err()
+        {
+            return vec![false; tags.len()];
+        }
         let (client, auth) = (&client, &auth);
         futures::stream::iter(images)
             .map(|image| async move {
@@ -468,7 +494,7 @@ async fn try_pull_ext4_async(
     let image = make_ref(rg, name, tag)?;
     // Absent tag (or an unreachable registry) -> build locally; only a *found* bundle
     // that then fails to pull is a hard error.
-    let Ok(digest) = manifest_digest(&client, &image, &auth).await else {
+    let Ok(digest) = resolve_digest(&client, &image, &auth).await else {
         return Ok(None);
     };
     let bundle = staging_bundle(dest, ".vkpull-");
@@ -515,7 +541,7 @@ async fn try_pull_ext4_lazy_async(
 ) -> Result<Option<String>> {
     let (client, auth) = client(rg)?;
     let image = make_ref(rg, name, tag)?;
-    let Ok(digest) = manifest_digest(&client, &image, &auth).await else {
+    let Ok(digest) = resolve_digest(&client, &image, &auth).await else {
         return Ok(None);
     };
     let dref = make_digest_ref(rg, name, &digest)?;
@@ -673,7 +699,7 @@ async fn fetch_chunks_async(
     } else {
         make_ref(rg, name, tag)?
     };
-    let Ok(digest) = manifest_digest(&client, &image, &auth).await else {
+    let Ok(digest) = resolve_digest(&client, &image, &auth).await else {
         return Ok(None);
     };
     let dref = make_digest_ref(rg, name, &digest)?;
@@ -774,6 +800,10 @@ async fn push_ext4_diff_async(
     client
         .store_auth_if_needed(image.resolve_registry(), &auth)
         .await;
+    let ops = [RegistryOperation::Pull, RegistryOperation::Push];
+    authenticate(&client, &image, &auth, &ops)
+        .await
+        .with_context(|| format!("authenticating to {}", rg.repo))?;
     let transparent = match rg.transparent_zstd {
         Some(b) => b,
         None => detect_transparent_zstd(rg, &image).await,
@@ -1298,6 +1328,10 @@ async fn push_async(
     client
         .store_auth_if_needed(image.resolve_registry(), &auth)
         .await;
+    let ops = [RegistryOperation::Pull, RegistryOperation::Push];
+    authenticate(&client, &image, &auth, &ops)
+        .await
+        .with_context(|| format!("authenticating to {}", rg.repo))?;
 
     let ext4 = dir.join("runner.ext4");
     let total_size = std::fs::metadata(&ext4)
@@ -1477,7 +1511,7 @@ async fn ensure_bundle_pulled(
         Reference::Digest(d) => d.clone(),
         Reference::Tag(tag) => {
             let image = make_ref(rg, name, tag)?;
-            manifest_digest(client, &image, auth)
+            resolve_digest(client, &image, auth)
                 .await
                 .with_context(|| format!("resolving {name}:{tag} against {}", rg.repo))?
         }
@@ -1490,6 +1524,11 @@ async fn ensure_bundle_pulled(
         false
     } else {
         let image = make_digest_ref(rg, name, &digest)?;
+        if let Reference::Digest(_) = reference {
+            authenticate(client, &image, auth, &[RegistryOperation::Pull])
+                .await
+                .with_context(|| format!("authenticating to {}", rg.repo))?;
+        }
         pull_into(client, auth, &image, name, &digest, &dir, name).await?;
         true
     };
@@ -1894,11 +1933,52 @@ fn chunk_bytes(
     Ok((offset, raw))
 }
 
-/// Maximum attempts and initial retry delay; subsequent delays double (2 s, 4 s, 8 s).
+/// Maximum [`Retry::Transport`] attempts, including the first.
 const TRANSFER_ATTEMPTS: u32 = 4;
-const TRANSFER_RETRY_PAUSE: Duration = Duration::from_secs(2);
 
-/// Retry a registry request on transport failures.
+/// How a failed registry request is retried; see [`with_transfer_retry`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retry {
+    /// A registry answer, or a request that cannot succeed as sent: returned at once.
+    Never,
+    /// Lost in transit: retried until [`TRANSFER_ATTEMPTS`] were made.
+    Transport,
+    /// The registry turning the request away for want of room — a 503 or a 429, or a
+    /// connection it closed or reset before answering — retried until [`Backoff::budget`].
+    Pressure,
+}
+
+/// The delays between attempts.
+struct Backoff {
+    /// Initial [`Retry::Transport`] delay, doubled after each retry.
+    transport: Duration,
+    /// Initial [`Retry::Pressure`] delay, doubled after each retry up to `cap`.
+    /// Sample its upper half so rejected processes do not all retry together.
+    pressure: Duration,
+    cap: Duration,
+    /// Time budget from the first attempt for [`Retry::Pressure`] retries.
+    budget: Duration,
+}
+
+/// 2 s, 4 s, 8 s in transit. A registry turning connections away is waited out for up
+/// to three minutes: it sheds load in bursts, as the jobs on a host start their pulls
+/// together, and a pull that gives up fails the CI job that wanted it. The first delay
+/// matches the `Retry-After: 2` vk-registry sends with its 503; the header itself is not
+/// read.
+///
+/// Waiting is the whole of the client's part. Both sides speak HTTP/1.1 only (this reqwest
+/// is built without h2, and vk-registry offers only `http/1.1`), so each request in flight
+/// is a connection of its own: a pull or push holds up to 16, and a host as many as its
+/// jobs pull at once. A host-wide cap across `vk` processes would have to count the idle
+/// kept-alive connections the registry counts too, which a slot per request does not see.
+const TRANSFER_BACKOFF: Backoff = Backoff {
+    transport: Duration::from_secs(2),
+    pressure: Duration::from_secs(2),
+    cap: Duration::from_secs(20),
+    budget: Duration::from_secs(180),
+};
+
+/// Retry a registry request on transport failures and on the registry's back-pressure.
 ///
 /// Every request the registry gets is safe to make twice: a pull is a GET of
 /// content-addressed bytes, verified against their digest on arrival; a push puts a blob
@@ -1907,21 +1987,24 @@ const TRANSFER_RETRY_PAUSE: Duration = Duration::from_secs(2);
 /// or the response: on a lossy path a registry's send stalls in RTO backoff and reqwest's
 /// `TCP_USER_TIMEOUT` (30 s by default; `oci_client` offers no way to set it) has the
 /// kernel abort the socket mid-body, which a fresh connection a moment later serves fine.
-/// A registry *answer* — not found, unauthorized, a digest that does not match — comes
-/// back at once: repeating it would only hide it for a few seconds.
+/// A registry turning requests away — closing new connections, or answering 503 or 429, as
+/// vk-registry does past its per-client connection cap — is retried for longer (see
+/// [`TRANSFER_BACKOFF`]). Any other registry *answer* — not found, unauthorized, a digest
+/// that does not match — comes back at once: repeating it would only hide it for a few
+/// seconds.
 async fn with_transfer_retry<T, E, F, Fut>(what: &str, attempt: F) -> std::result::Result<T, E>
 where
     E: Transport + std::fmt::Display,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<T, E>>,
 {
-    retry_transfer(what, TRANSFER_RETRY_PAUSE, attempt).await
+    retry_transfer(what, &TRANSFER_BACKOFF, attempt).await
 }
 
-/// [`with_transfer_retry`] with an explicit initial delay, zero in tests.
+/// [`with_transfer_retry`] with explicit delays, shorter in tests.
 async fn retry_transfer<T, E, F, Fut>(
     what: &str,
-    mut pause: Duration,
+    backoff: &Backoff,
     mut attempt: F,
 ) -> std::result::Result<T, E>
 where
@@ -1929,26 +2012,103 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<T, E>>,
 {
-    for n in 1.. {
-        match attempt().await {
-            Err(e) if n < TRANSFER_ATTEMPTS && e.is_transport() => {
+    let start = tokio::time::Instant::now();
+    let (mut attempts, mut pause) = (1, backoff.transport);
+    let mut pressure = backoff.pressure;
+    let mut waiting = false;
+    loop {
+        let e = match attempt().await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        match e.retry() {
+            Retry::Transport if attempts < TRANSFER_ATTEMPTS => {
                 eprintln!(
-                    "virtkit: registry: {what}: {e:#}; retrying in {}s ({n}/{})",
+                    "virtkit: registry: {what}: {e:#}; retrying in {}s ({attempts}/{})",
                     pause.as_secs(),
                     TRANSFER_ATTEMPTS - 1
                 );
                 tokio::time::sleep(pause).await;
                 pause *= 2;
+                attempts += 1;
             }
-            r => return r,
+            Retry::Pressure => {
+                let delay = jitter(pressure);
+                if start.elapsed() + delay > backoff.budget {
+                    eprintln!(
+                        "virtkit: registry: {what}: still turned away after {}s: {e:#}",
+                        start.elapsed().as_secs()
+                    );
+                    return Err(e);
+                }
+                if !waiting {
+                    waiting = true;
+                    note_pressure(what, &e, backoff.budget);
+                }
+                tokio::time::sleep(delay).await;
+                pressure = (pressure * 2).min(backoff.cap);
+            }
+            _ => return Err(e),
         }
     }
-    unreachable!("the attempt loop returns from its last iteration")
 }
 
-/// Classify transport failures for [`with_transfer_retry`], excluding registry errors.
+/// Say that the registry is turning a request away, once for that request and at most once
+/// every [`PRESSURE_NOTE_EVERY`] for the whole process: a pull fetches many blobs at once,
+/// and a registry that turns one away turns its neighbours away too.
+fn note_pressure(what: &str, e: &dyn std::fmt::Display, budget: Duration) {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed() < PRESSURE_NOTE_EVERY) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    eprintln!(
+        "virtkit: registry: {what}: the registry is turning requests away ({e:#}); retrying \
+         with backoff for up to {}s",
+        budget.as_secs()
+    );
+}
+
+const PRESSURE_NOTE_EVERY: Duration = Duration::from_secs(10);
+
+/// `d` scaled by a random factor in [0.5, 1).
+fn jitter(d: Duration) -> Duration {
+    use std::hash::BuildHasher;
+    // A fresh `RandomState` is randomly keyed, which is all the randomness a delay needs.
+    let r = std::collections::hash_map::RandomState::new().hash_one(0u8);
+    d.mul_f64(0.5 + (r >> 11) as f64 / (1u64 << 54) as f64)
+}
+
+/// [`Retry::Pressure`] for the statuses a registry turns a request away with.
+///
+/// oci-client reads a 4xx with an OCI error body as a `RegistryError` that drops the status,
+/// so a 429 is seen there only by its `TOOMANYREQUESTS` code; any other code is final.
+fn status_retry(status: u16) -> Retry {
+    if matches!(status, 429 | 503) {
+        Retry::Pressure
+    } else {
+        Retry::Never
+    }
+}
+
+/// Convert back-pressure statuses to errors classified by [`Transport`], for callers
+/// that inspect statuses directly instead of using `error_for_status`.
+fn turned_away(resp: reqwest::Response) -> reqwest::Result<reqwest::Response> {
+    match status_retry(resp.status().as_u16()) {
+        Retry::Pressure => resp.error_for_status(),
+        _ => Ok(resp),
+    }
+}
+
+/// Classify failures for [`with_transfer_retry`].
 trait Transport {
-    fn is_transport(&self) -> bool;
+    fn retry(&self) -> Retry;
+
+    /// Whether the failure is retried at all.
+    fn retried(&self) -> bool {
+        self.retry() != Retry::Never
+    }
 }
 
 /// Retry connection failures, timeouts, unanswered requests and truncated bodies.
@@ -1956,52 +2116,130 @@ trait Transport {
 /// "connection closed". Parse errors are final: invalid JSON (serde), invalid HTTP
 /// or requests hyper refuses to send (hyper parse/user errors, also from `send()`),
 /// and malformed chunk framing (`InvalidInput`/`InvalidData` under a body error).
+///
+/// Back-pressure is a 503 or 429, or a connection the registry closed or reset before
+/// answering: during the TLS handshake (an EOF or a reset under a connect error) or with
+/// the request sent and no response begun. A refused connection is not — nothing is
+/// listening — and neither is a body cut short, which is the lossy path above. An idle
+/// pooled connection the registry closes as a request goes out on it reads as back-pressure
+/// too, and is retried all the same.
 impl Transport for reqwest::Error {
-    fn is_transport(&self) -> bool {
-        if self.is_connect() || self.is_timeout() {
-            return true;
+    fn retry(&self) -> Retry {
+        use std::io::ErrorKind;
+        if let Some(status) = self.status() {
+            return status_retry(status.as_u16());
         }
-        let mut transport = self.is_request();
+        let (mut parse, mut transport, mut closed) = (false, false, false);
         let mut source = std::error::Error::source(self);
         while let Some(cause) = source {
             if let Some(e) = cause.downcast_ref::<hyper::Error>() {
-                if e.is_parse() || e.is_user() {
-                    return false;
-                }
+                parse |= e.is_parse() || e.is_user();
+                closed |= e.is_incomplete_message();
                 transport = true;
             }
-            if let Some(e) = cause.downcast_ref::<std::io::Error>() {
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
-                ) {
-                    return false;
+            let mut io = cause.downcast_ref::<std::io::Error>();
+            while let Some(e) = io {
+                match e.kind() {
+                    ErrorKind::InvalidInput | ErrorKind::InvalidData => parse = true,
+                    ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe => closed = true,
+                    // A TLS handshake the peer hung up on; elsewhere, a body cut short.
+                    ErrorKind::UnexpectedEof => closed |= self.is_connect(),
+                    _ => {}
                 }
                 transport = true;
+                // `source` skips the error an `io::Error` wraps, as hyper-util's connect error
+                // wraps tokio-rustls's handshake EOF.
+                io = e
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<std::io::Error>());
             }
             source = cause.source();
         }
-        transport
+        if self.is_timeout() {
+            Retry::Transport
+        } else if self.is_connect() {
+            // A connection not made is retried whatever lies under it.
+            if closed {
+                Retry::Pressure
+            } else {
+                Retry::Transport
+            }
+        } else if parse {
+            Retry::Never
+        } else if closed && self.is_request() {
+            Retry::Pressure
+        } else if transport || self.is_request() {
+            Retry::Transport
+        } else {
+            Retry::Never
+        }
     }
 }
 
 impl Transport for OciDistributionError {
-    fn is_transport(&self) -> bool {
-        matches!(self, OciDistributionError::RequestError(e) if e.is_transport())
+    fn retry(&self) -> Retry {
+        match self {
+            OciDistributionError::RequestError(e) => e.retry(),
+            OciDistributionError::ServerError { code, .. } => status_retry(*code),
+            OciDistributionError::RegistryError { envelope, .. }
+                if envelope
+                    .errors
+                    .iter()
+                    .any(|e| e.code == OciErrorCode::Toomanyrequests) =>
+            {
+                Retry::Pressure
+            }
+            _ => Retry::Never,
+        }
     }
 }
 
 /// Transparent-zstd pushes wrap reqwest errors in context. Also check OCI errors:
 /// their transparent `RequestError` wrapper omits reqwest's node from the source chain.
 impl Transport for anyhow::Error {
-    fn is_transport(&self) -> bool {
-        self.chain().any(|e| {
-            e.downcast_ref::<OciDistributionError>()
-                .is_some_and(Transport::is_transport)
-                || e.downcast_ref::<reqwest::Error>()
-                    .is_some_and(Transport::is_transport)
-        })
+    fn retry(&self) -> Retry {
+        self.chain()
+            .map(|e| {
+                if let Some(e) = e.downcast_ref::<OciDistributionError>() {
+                    e.retry()
+                } else if let Some(e) = e.downcast_ref::<reqwest::Error>() {
+                    e.retry()
+                } else {
+                    Retry::Never
+                }
+            })
+            .find(|r| *r != Retry::Never)
+            .unwrap_or(Retry::Never)
     }
+}
+
+/// Authenticate `ops` on `image`'s repository before its first request, with retries.
+///
+/// oci-client first probes with an anonymous `GET /v2/`. If the probe fails, it sends the
+/// request anonymously and gets a final 401. `Client::auth` exposes probe failures and
+/// caches successful authentication. A 503 without a challenge returns success but caches
+/// nothing: the next request probes again and goes out anonymously only if that probe
+/// is also rejected.
+///
+/// Return retryable failures when retries run out: the request would reach the same
+/// registry. Leave other failures, such as a token endpoint's refusal, to the request,
+/// matching oci-client.
+async fn authenticate(
+    client: &oci_client::Client,
+    image: &OciReference,
+    auth: &RegistryAuth,
+    ops: &[RegistryOperation],
+) -> oci_client::errors::Result<()> {
+    let what = format!("authenticating to {}", image.resolve_registry());
+    for &op in ops {
+        match with_transfer_retry(&what, || client.auth(image, auth, op)).await {
+            Err(e) if e.retried() => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Check blob existence with transport retries.
@@ -2028,6 +2266,16 @@ async fn push_blob(
         client.push_blob(image, data.clone(), digest)
     })
     .await
+}
+
+/// [`authenticate`] for a pull, then [`manifest_digest`]: how most pulls begin.
+async fn resolve_digest(
+    client: &oci_client::Client,
+    image: &OciReference,
+    auth: &RegistryAuth,
+) -> oci_client::errors::Result<String> {
+    authenticate(client, image, auth, &[RegistryOperation::Pull]).await?;
+    manifest_digest(client, image, auth).await
 }
 
 /// `fetch_manifest_digest`, retried like every other pull. Its callers read a failure
@@ -2144,8 +2392,9 @@ fn sha256_hex(data: &[u8]) -> String {
 
 /// Probe `GET /v2/` for the [`TRANSPARENT_ZSTD_HEADER`] a cooperating `regserve`
 /// advertises. Failures (an unsupported registry, TLS errors, a missing CA) return
-/// `false`, falling back to compressed digests. Retry transport failures first: a dropped connection
-/// would otherwise switch this build's chunk digests and lose registry deduplication.
+/// `false`, falling back to compressed digests. Retry transport failures and back-pressure
+/// first: a dropped connection or a 503 would otherwise switch this build's chunk digests and
+/// lose registry deduplication.
 /// Only called in auto mode (`transparent_zstd` unset). Send configured Basic or bearer
 /// credentials because authenticated vk-registry challenges `/v2/` like other paths;
 /// an anonymous probe would misread the 401 as lack of support.
@@ -2163,9 +2412,9 @@ async fn detect_transparent_zstd(rg: &Registry, image: &OciReference) -> bool {
             req = c.apply(req);
         }
         async move {
-            match req.send().await {
+            match req.send().await.and_then(turned_away) {
                 Ok(resp) => Ok(resp.headers().contains_key(TRANSPARENT_ZSTD_HEADER)),
-                Err(e) if e.is_transport() => Err(e),
+                Err(e) if e.retried() => Err(e),
                 Err(_) => Ok(false),
             }
         }
@@ -2488,6 +2737,7 @@ async fn push_blob_zstd(
     )
     .send()
     .await
+    .and_then(turned_away)
     .context("POST blob upload")?;
     if resp.status() != reqwest::StatusCode::ACCEPTED {
         bail!("begin blob upload: HTTP {}", resp.status());
@@ -2513,6 +2763,7 @@ async fn push_blob_zstd(
     )
     .send()
     .await
+    .and_then(turned_away)
     .context("PUT blob")?;
     if resp.status() != reqwest::StatusCode::CREATED {
         bail!("blob PUT: HTTP {}", resp.status());
@@ -3410,6 +3661,7 @@ mod tests {
         path: String,
         /// Raw query string.
         query: String,
+        authorization: Option<String>,
         body: Vec<u8>,
     }
 
@@ -3476,16 +3728,18 @@ mod tests {
             Some((p, q)) => (p.to_string(), q.to_string()),
             None => (target, String::new()),
         };
-        let mut length = 0;
+        let (mut length, mut authorization) = (0, None);
         loop {
             let mut h = String::new();
             if reader.read_line(&mut h).ok()? == 0 || h.trim().is_empty() {
                 break;
             }
-            if let Some((name, value)) = h.split_once(':')
-                && name.eq_ignore_ascii_case("content-length")
-            {
-                length = value.trim().parse().ok()?;
+            if let Some((name, value)) = h.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = value.trim().parse().ok()?;
+                } else if name.eq_ignore_ascii_case("authorization") {
+                    authorization = Some(value.trim().to_string());
+                }
             }
         }
         let mut body = vec![0; length];
@@ -3494,6 +3748,7 @@ mod tests {
             method,
             path,
             query,
+            authorization,
             body,
         })
     }
@@ -3516,16 +3771,52 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
-    /// Unanswered connections and truncated bodies are transport failures.
+    /// A request to a port nothing listens on: refused, so lost in transit. The port is the
+    /// local end of a live connection, which no listener can bind while it lasts.
+    async fn refused() -> reqwest::Error {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let held = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let addr = held.local_addr().unwrap();
+        let err = reqwest::get(format!("http://{addr}/v2/"))
+            .await
+            .unwrap_err();
+        drop((held, listener));
+        err
+    }
+
+    /// A TLS handshake the server hangs up on once it has read the ClientHello.
+    async fn handshake_hung_up() -> reqwest::Error {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // The whole record, so the close is a FIN and not a reset over unread bytes.
+            let mut header = [0; 5];
+            stream.read_exact(&mut header).unwrap();
+            let len = u16::from_be_bytes([header[3], header[4]]) as usize;
+            stream.read_exact(&mut vec![0; len]).unwrap();
+        });
+        let err = reqwest::get(format!("https://{addr}/v2/"))
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        err
+    }
+
+    /// A refused connection and a truncated body are lost in transit; a connection closed
+    /// before any answer, TLS handshake included, and a 503 or 429 are the registry turning
+    /// the request away.
     #[test]
-    fn a_closed_connection_and_a_truncated_body_are_the_transport() {
+    fn transport_failures_and_back_pressure_are_told_apart() {
         install_crypto();
         block_on(async {
-            let server = FakeServer::start(vec![String::new()]);
-            let err = reqwest::get(format!("http://{}/", server.authority()))
-                .await
-                .unwrap_err();
-            assert!(err.is_transport(), "{err:#}");
+            let err = refused().await;
+            assert_eq!(err.retry(), Retry::Transport, "{err:#}");
+
+            let err = handshake_hung_up().await;
+            assert!(err.is_connect(), "{err:#}");
+            assert_eq!(err.retry(), Retry::Pressure, "{err:#}");
 
             let server = FakeServer::start(vec![
                 "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nshort".into(),
@@ -3536,8 +3827,39 @@ mod tests {
                 .bytes()
                 .await
                 .unwrap_err();
-            assert!(err.is_transport(), "{err:#}");
+            assert_eq!(err.retry(), Retry::Transport, "{err:#}");
+
+            let server = FakeServer::start(vec![
+                String::new(),
+                FakeServer::reply(503, "busy"),
+                FakeServer::reply(429, "slow down"),
+            ]);
+            let url = format!("http://{}/", server.authority());
+            let err = reqwest::get(&url).await.unwrap_err();
+            assert_eq!(err.retry(), Retry::Pressure, "{err:#}");
+            let err = reqwest::get(&url).await.and_then(turned_away).unwrap_err();
+            assert_eq!(err.retry(), Retry::Pressure, "{err:#}");
+            let err = reqwest::get(&url).await.and_then(turned_away).unwrap_err();
+            assert_eq!(err.retry(), Retry::Pressure, "{err:#}");
+            let err = anyhow::Error::new(err).context("PUT blob");
+            assert_eq!(err.retry(), Retry::Pressure, "{err:#}");
         });
+        let server_error = |code| OciDistributionError::ServerError {
+            code,
+            url: "https://registry/v2/".into(),
+            message: String::new(),
+        };
+        assert_eq!(server_error(503).retry(), Retry::Pressure);
+        assert_eq!(server_error(429).retry(), Retry::Pressure);
+        assert_eq!(server_error(500).retry(), Retry::Never);
+        let envelope: OciEnvelope =
+            serde_json::from_str(r#"{"errors":[{"code":"TOOMANYREQUESTS","message":""}]}"#)
+                .unwrap();
+        let too_many = OciDistributionError::RegistryError {
+            envelope,
+            url: "https://registry/v2/".into(),
+        };
+        assert_eq!(too_many.retry(), Retry::Pressure);
     }
 
     /// HTTP status errors, invalid JSON, invalid HTTP and malformed chunks are final.
@@ -3548,6 +3870,7 @@ mod tests {
             let server = FakeServer::start(vec![
                 FakeServer::reply(401, "denied"),
                 FakeServer::reply(200, "not JSON"),
+                FakeServer::reply(404, "unknown"),
             ]);
             let url = format!("http://{}/", server.authority());
             let status = reqwest::get(&url)
@@ -3555,20 +3878,22 @@ mod tests {
                 .unwrap()
                 .error_for_status()
                 .unwrap_err();
-            assert!(!status.is_transport(), "{status:#}");
+            assert!(!status.retried(), "{status:#}");
             let json = reqwest::get(&url)
                 .await
                 .unwrap()
                 .json::<serde_json::Value>()
                 .await
                 .unwrap_err();
-            assert!(!json.is_transport(), "{json:#}");
+            assert!(!json.retried(), "{json:#}");
+            let missing = reqwest::get(&url).await.and_then(turned_away).unwrap();
+            assert_eq!(missing.status(), 404);
 
             let server = FakeServer::start(vec!["NOT HTTP\r\n\r\n".into()]);
             let protocol = reqwest::get(format!("http://{}/", server.authority()))
                 .await
                 .unwrap_err();
-            assert!(!protocol.is_transport(), "{protocol:#}");
+            assert!(!protocol.retried(), "{protocol:#}");
 
             let server = FakeServer::start(vec![
                 "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\ninvalid-size\r\n".into(),
@@ -3579,37 +3904,39 @@ mod tests {
                 .bytes()
                 .await
                 .unwrap_err();
-            assert!(!framing.is_transport(), "{framing:#}");
+            assert!(!framing.retried(), "{framing:#}");
 
             assert!(
                 !OciDistributionError::UnauthorizedError {
                     url: "https://registry/v2/".into(),
                 }
-                .is_transport()
+                .retried()
             );
         });
     }
+
+    /// Delays short enough for a test.
+    const TEST_BACKOFF: Backoff = Backoff {
+        transport: Duration::ZERO,
+        pressure: Duration::from_millis(1),
+        cap: Duration::from_millis(4),
+        budget: Duration::from_millis(500),
+    };
 
     /// Retry transport failures up to `TRANSFER_ATTEMPTS`; registry errors are final.
     #[test]
     fn transfer_retry_repeats_transport_failures_only() {
         use std::sync::atomic::{AtomicU32, Ordering};
         install_crypto();
-        let disconnected = || async {
-            let server = FakeServer::start(vec![String::new()]);
-            let err = reqwest::get(format!("http://{}/v2/", server.authority()))
-                .await
-                .unwrap_err();
-            OciDistributionError::RequestError(err)
-        };
+        let lost = || async { OciDistributionError::RequestError(refused().await) };
         block_on(async {
             // Two transport failures, then the answer.
             let calls = AtomicU32::new(0);
-            let got = retry_transfer("probe", Duration::ZERO, || {
+            let got = retry_transfer("probe", &TEST_BACKOFF, || {
                 let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
                 async move {
                     if n < 3 {
-                        return Err(disconnected().await);
+                        return Err(lost().await);
                     }
                     Ok(n)
                 }
@@ -3620,18 +3947,18 @@ mod tests {
 
             // Return the last error after TRANSFER_ATTEMPTS failures.
             calls.store(0, Ordering::Relaxed);
-            let err = retry_transfer("probe", Duration::ZERO, || {
+            let err = retry_transfer("probe", &TEST_BACKOFF, || {
                 calls.fetch_add(1, Ordering::Relaxed);
-                async { Err::<(), _>(disconnected().await) }
+                async { Err::<(), _>(lost().await) }
             })
             .await
             .unwrap_err();
-            assert!(err.is_transport());
+            assert_eq!(err.retry(), Retry::Transport);
             assert_eq!(calls.load(Ordering::Relaxed), TRANSFER_ATTEMPTS);
 
             // A registry answer is final on the first attempt.
             calls.store(0, Ordering::Relaxed);
-            let err = retry_transfer("probe", Duration::ZERO, || {
+            let err = retry_transfer("probe", &TEST_BACKOFF, || {
                 calls.fetch_add(1, Ordering::Relaxed);
                 async {
                     Err::<(), _>(OciDistributionError::UnauthorizedError {
@@ -3647,6 +3974,182 @@ mod tests {
             ));
             assert_eq!(calls.load(Ordering::Relaxed), 1);
         });
+    }
+
+    /// Back-pressure is retried past `TRANSFER_ATTEMPTS`, until the budget is spent and no
+    /// longer.
+    #[tokio::test(start_paused = true)]
+    async fn back_pressure_is_retried_for_the_budget() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let busy = || OciDistributionError::ServerError {
+            code: 503,
+            url: "https://registry/v2/".into(),
+            message: String::new(),
+        };
+        let backoff = &TRANSFER_BACKOFF;
+        let calls = AtomicU32::new(0);
+        let got = retry_transfer("probe", backoff, || {
+            let n = calls.fetch_add(1, Ordering::Relaxed) + 1;
+            async move { if n < 8 { Err(busy()) } else { Ok(n) } }
+        })
+        .await
+        .unwrap();
+        assert_eq!(got, 8);
+
+        calls.store(0, Ordering::Relaxed);
+        let start = tokio::time::Instant::now();
+        let err = retry_transfer("probe", backoff, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            async { Err::<(), _>(busy()) }
+        })
+        .await
+        .unwrap_err();
+        let took = start.elapsed();
+        assert_eq!(err.retry(), Retry::Pressure);
+        // It stops before a delay that would end past the budget, so less than `cap` short
+        // of it; the paused clock rounds a sleep up to the millisecond.
+        assert!(
+            took > backoff.budget - backoff.cap
+                && took <= backoff.budget + Duration::from_millis(1),
+            "{took:?}"
+        );
+        // Delays of 1-2, 2-4, 4-8 and 8-16 s, then 10-20 s: 11 to 20 of them fit.
+        let n = calls.load(Ordering::Relaxed);
+        assert!((12..=21).contains(&n), "{n} attempts in {took:?}");
+    }
+
+    /// A delay is drawn from the upper half of its value.
+    #[test]
+    fn jitter_stays_in_the_upper_half() {
+        let d = Duration::from_secs(8);
+        let draws: Vec<Duration> = (0..1000).map(|_| jitter(d)).collect();
+        assert!(draws.iter().all(|j| *j >= d / 2 && *j < d), "{draws:?}");
+        assert!(draws.iter().any(|j| *j != draws[0]));
+    }
+
+    /// A pull turned away — its connection closed unanswered, then a 503 — is retried until
+    /// the blob arrives; a 404 is not retried.
+    #[tokio::test(start_paused = true)]
+    async fn a_blob_pull_waits_out_a_busy_registry() {
+        install_crypto();
+        let layer = chunk_descriptor(CHUNK_MEDIA_TYPE, &sha256_hex(b"complete"), 8, 0, 8);
+        let server = FakeServer::start(vec![
+            String::new(),
+            FakeServer::reply(
+                503,
+                r#"{"errors":[{"code":"TOOMANYREQUESTS","message":""}]}"#,
+            ),
+            FakeServer::reply(200, "complete"),
+        ]);
+        let rg = fake_registry(&server);
+        let (oci, _auth) = client(&rg).unwrap();
+        let image = make_ref(&rg, "repo", "tag").unwrap();
+        let body = pull_blob_bytes(&oci, &image, &layer, MAX_CHUNK_BLOB)
+            .await
+            .unwrap();
+        assert_eq!(body, b"complete");
+        assert_eq!(server.seen().len(), 3);
+
+        let server = FakeServer::start(vec![FakeServer::reply(
+            404,
+            r#"{"errors":[{"code":"BLOB_UNKNOWN","message":""}]}"#,
+        )]);
+        let rg = fake_registry(&server);
+        let (oci, _auth) = client(&rg).unwrap();
+        let image = make_ref(&rg, "repo", "tag").unwrap();
+        let err = pull_blob_bytes(&oci, &image, &layer, MAX_CHUNK_BLOB)
+            .await
+            .unwrap_err();
+        assert!(!err.retried(), "{err:#}");
+        assert_eq!(server.seen().len(), 1);
+    }
+
+    /// A registry that turns oci-client's `/v2/` probe away is waited out before the first
+    /// request, which then carries the credentials instead of going out anonymously.
+    #[tokio::test(start_paused = true)]
+    async fn the_auth_probe_waits_out_a_busy_registry() {
+        install_crypto();
+        let dir = retry_tmpdir("auth-probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let password = dir.join("password");
+        std::fs::write(&password, "p").unwrap();
+        let digest = sha256_hex(b"manifest");
+        let server = FakeServer::start(vec![
+            String::new(),
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"vk\"\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                .into(),
+            format!(
+                "HTTP/1.1 200 OK\r\nDocker-Content-Digest: {digest}\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            ),
+        ]);
+        let rg = Registry::for_share(
+            format!("{}/repo", server.authority()),
+            true,
+            None,
+            "u".into(),
+            Some(password),
+            None,
+            None,
+        );
+        let got = inspect_async(&rg, "app", &Reference::Tag("v1".into())).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got.unwrap(), digest);
+        let seen = server.seen();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(
+            (seen[1].method.as_str(), seen[1].path.as_str()),
+            ("GET", "/v2/")
+        );
+        assert_eq!(seen[2].method, "HEAD");
+        // `u:p`
+        assert_eq!(seen[2].authorization.as_deref(), Some("Basic dTpw"));
+    }
+
+    /// Recording a stage reads and writes its manifest through a busy registry: each request
+    /// turned away with a 503 is retried, and the manifest's bytes go back unchanged.
+    #[tokio::test(start_paused = true)]
+    async fn recording_a_stage_waits_out_a_busy_registry() {
+        install_crypto();
+        let dir = retry_tmpdir("record-stage");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A bearer token needs no `/v2/` probe, so every request below is a manifest's.
+        let token = dir.join("token");
+        std::fs::write(&token, "t").unwrap();
+        let manifest =
+            r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
+        let digest = sha256_hex(manifest.as_bytes());
+        let busy = FakeServer::reply(503, "busy");
+        let server = FakeServer::start(vec![
+            busy.clone(),
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{manifest}",
+                manifest.len()
+            ),
+            busy,
+            format!(
+                "HTTP/1.1 201 Created\r\nLocation: /v2/build-cache/manifests/{digest}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+        ]);
+        let rg = Registry::for_share(
+            format!("{}/repo", server.authority()),
+            true,
+            None,
+            String::new(),
+            None,
+            Some(token),
+            None,
+        );
+        let got = record_build_stage_async(&rg, "build-cache", &digest, "stage-x").await;
+        let _ = std::fs::remove_dir_all(&dir);
+        got.unwrap();
+        let seen = server.seen();
+        let requests: Vec<_> = seen.iter().map(|r| r.method.as_str()).collect();
+        assert_eq!(requests, ["GET", "GET", "PUT", "PUT"]);
+        assert_eq!(seen[3].body, manifest.as_bytes());
     }
 
     /// A chunk is held to its descriptor: exactly its length once decompressed, at most a
@@ -3779,7 +4282,7 @@ mod tests {
         let image = make_ref(&rg, "repo", "tag").unwrap();
         let layer = chunk_descriptor(CHUNK_MEDIA_TYPE, &sha256_hex(b"correct"), 7, 0, 7);
         let err = block_on(pull_blob_bytes(&client, &image, &layer, MAX_CHUNK_BLOB)).unwrap_err();
-        assert!(!err.is_transport(), "{err:#}");
+        assert!(!err.retried(), "{err:#}");
         assert!(format!("{err:#}").contains("digest"), "{err:#}");
         assert_eq!(server.seen().len(), 1);
     }
