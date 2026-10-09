@@ -61,10 +61,11 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
 
-/// The protocol versions this node speaks: placed jobs on top of what every peer shares.
+/// The protocol versions this node speaks: placed jobs and tools builds on top of what every
+/// peer shares.
 pub const NODE_PROTOCOL: VersionRange = VersionRange {
     min: PROTOCOL.min,
-    max: JOBS,
+    max: vk_hub_proto::TOOLS,
 };
 
 /// How often the node looks at its placed jobs for news: output, stages, results, leases.
@@ -463,6 +464,8 @@ impl Told {
         };
         if version < STEERING {
             report = report.without_steering();
+        } else if version < vk_hub_proto::TOOLS {
+            report = report.without_tools();
         }
         let mut msgs = Vec::new();
         if report != Report::default() && self.report.as_ref() != Some(&report) {
@@ -1330,6 +1333,57 @@ mod tests {
         let report = node.core.report();
         assert_eq!(report.state, Some(vk_hub_proto::NodeState::Ready));
         assert_eq!(report.update, None);
+    }
+
+    /// A tools build is accepted in a version-4 session and its progress reported there; a
+    /// session below it gets the report without the progress.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tools_build_is_taken_and_reported_from_version_4_only() {
+        let mut f = fixture("tools").await;
+        let (node, gatherer, stopped, listener, stop) = f.parts();
+        let key = node.identity.public_key().to_vec();
+        let build = command(Operation::Tools {
+            version: "2026.10".into(),
+            sha256: "ab".repeat(vk_hub_proto::SHA256_LEN),
+            size: 4096,
+        });
+        let v4 = VersionRange {
+            min: 1,
+            max: vk_hub_proto::TOOLS,
+        };
+        let v3 = VersionRange { min: 1, max: JOBS };
+        let hub = async {
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, v4, vk_hub_proto::TOOLS).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            next_of(&mut ws, report_of).await;
+            hub_send(&mut ws, &HubMsg::Command(build.clone())).await;
+            assert_eq!(next_of(&mut ws, ack_of).await.outcome, Outcome::Accepted);
+            let report = next_of(&mut ws, |m| report_of(m).filter(|r| r.tools.is_some())).await;
+            let progress = report.tools.unwrap();
+            assert_eq!(
+                (progress.command.as_str(), progress.phase),
+                (build.id.as_str(), vk_hub_proto::ToolsPhase::Downloading)
+            );
+            drop(ws);
+
+            let mut ws = accept(listener).await;
+            assert!(challenge(&mut ws, &key, v3, JOBS).await);
+            hub_send(&mut ws, &HubMsg::Welcome { heartbeat_secs: 1 }).await;
+            let report = next_of(&mut ws, report_of).await;
+            assert_eq!(report.state, Some(vk_hub_proto::NodeState::Ready));
+            assert_eq!(report.tools, None);
+            stop.send(true).unwrap();
+            while hub_receive(&mut ws).await.is_some() {}
+        };
+        let node_side = async {
+            let first = run(node, gatherer, stopped).await;
+            assert!(first.is_err(), "the hub dropped the first session");
+            run(node, gatherer, stopped).await
+        };
+        let (_, ended) = tokio::join!(hub, node_side);
+        ended.unwrap();
+        assert!(node.core.persisted().tools.is_some());
     }
 
     /// With a managed runner, a drain stops it and is reported draining until the runner has

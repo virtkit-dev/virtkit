@@ -1144,8 +1144,10 @@ fn gitlab(cfg: &Config) -> Outcome {
     } else {
         "no nesting"
     };
+    let tools = crate::node::tools::unused_warning(cfg)
+        .map_or_else(String::new, |why| format!("; note: {why}"));
     ok(format!(
-        "jobs dir {} writable, {stats}, {nesting}",
+        "jobs dir {} writable, {stats}, {nesting}{tools}",
         jobs.display()
     ))
 }

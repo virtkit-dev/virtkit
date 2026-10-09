@@ -13,6 +13,14 @@ All notable changes to virtkit will be documented in this file.
   `--all`, asks nodes to build one and give its tools to their jobs, skipping nodes too old to.
   `vk-hub nodes`, a node's page and the operations page show each node's tools and how its
   last build went, with the end of a failed build's output.
+- **`vk node` builds the CI tools its hub names, and gives them to jobs.** It builds the
+  definition with `vk build` in microVMs, without reading or filling its build cache, checks
+  that `git` and `gitlab-runner` are there and statically linked, and installs the tools as
+  `<state_dir>/tools/current`: once the first build is done, as `vk-hub nodes` shows, set
+  `[executor] tools_dir` to that path. Jobs that start afterwards get them, running jobs keep
+  theirs, and the previous tools are kept; a failed build changes nothing. `vk node run` warns,
+  and `vk check --feature gitlab` notes, when the tools are installed but `tools_dir` names
+  another directory.
 - **Operators manage OIDC sign-in grants from `vk-hub`'s Users page.** It lists each grant,
   who made it and when, and the access other users get. Operators grant, change and revoke
   roles as with `vk-hub accounts`, with confirmation before lowering or revoking a grant.

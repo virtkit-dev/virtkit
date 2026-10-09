@@ -931,7 +931,7 @@ async fn run_check(argv: &[String], timeout: Duration) -> Result<(), String> {
 }
 
 /// Kills the process group it names, `SIGKILL`, when dropped.
-struct KillGroup(Option<i32>);
+pub(super) struct KillGroup(pub(super) Option<i32>);
 
 impl Drop for KillGroup {
     fn drop(&mut self) {
@@ -948,7 +948,6 @@ pub(super) enum Kind {
     /// A `vk` release.
     Release,
     /// A CI tools definition.
-    #[cfg_attr(not(test), expect(dead_code, reason = "fleet CI tools fetch it next"))]
     Tools,
 }
 

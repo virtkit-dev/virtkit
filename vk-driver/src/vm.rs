@@ -1271,8 +1271,11 @@ pub async fn supervise(ctx: &JobCtx, job_dir_arg: &Path) -> Result<()> {
         let dir = guest_writable
             .resolve(dir)
             .with_context(|| format!("resolving share root {}", dir.display()))?;
-        // Best-effort: without it the report names only the configured tools_dir.
-        let _ = std::fs::write(ctx.tools_root_file(), dir.as_os_str().as_bytes());
+        // The job's tools report names this directory, and a node's tools build keeps it
+        // while a job dir names it: a job that cannot record it does not boot.
+        let record = ctx.tools_root_file();
+        std::fs::write(&record, dir.as_os_str().as_bytes())
+            .with_context(|| format!("writing {}", record.display()))?;
         shares.push(crate::vmm::FsShare {
             tag: "vktools".into(),
             host_dir: dir,

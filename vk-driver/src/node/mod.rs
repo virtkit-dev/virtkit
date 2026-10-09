@@ -9,9 +9,9 @@
 //! stopping acquisition, drain, quarantine, update, reset — through its persisted state
 //! ([`state`]), sets the runner's concurrency every half minute within the hub's ceiling
 //! ([`core`]), whether or not a session is up, with `[node] runner = "managed"` runs
-//! gitlab-runner itself ([`runner`]), updates its own `vk` on trial ([`update`]), and clears
-//! what past jobs left ([`reset`]). `vk node service` installs a systemd unit running it
-//! ([`service`]).
+//! gitlab-runner itself ([`runner`]), updates its own `vk` on trial ([`update`]), clears
+//! what past jobs left ([`reset`]), and builds the CI tools its jobs are given ([`tools`]).
+//! `vk node service` installs a systemd unit running it ([`service`]).
 //! See `docs/fleet-prototype.md`, "Hub and node".
 //!
 //! Everything the node keeps is under `<state_dir>/node/`, a `0700` directory: `key.pk8`
@@ -48,6 +48,7 @@ mod runner;
 pub mod service;
 mod session;
 mod state;
+pub(crate) mod tools;
 mod update;
 
 use std::io::{BufRead, Read};
@@ -530,6 +531,9 @@ pub async fn run(cfg: Config) -> Result<()> {
     if let Some(why) = ci_user::this_node(&cfg) {
         say!("warning: {why}");
     }
+    if let Some(why) = tools::unused_warning(&cfg) {
+        say!("warning: {why}");
+    }
     let identity = Identity::load(&dir).with_context(|| {
         format!(
             "loading the node's identity ({})",
@@ -608,6 +612,12 @@ pub async fn run(cfg: Config) -> Result<()> {
         incarnation,
         tls,
     });
+    tokio::spawn(tools::maintain(
+        core.clone(),
+        cfg.clone(),
+        node.clone(),
+        stop.clone(),
+    ));
     tokio::spawn(update::maintain(core, cfg, node.clone(), stop.clone()));
     let ended = hold_sessions(&node, &mut gatherer, &mut stop).await;
     // Stopping, or refused for good, the node quits a managed runner and waits for its jobs to

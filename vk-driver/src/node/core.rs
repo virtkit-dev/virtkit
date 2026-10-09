@@ -309,6 +309,7 @@ impl Core {
                 .then(|| *lock(&self.drain))
                 .flatten(),
             update: persisted.update.clone(),
+            tools: persisted.tools_progress.clone(),
             ..Report::default()
         }
     }

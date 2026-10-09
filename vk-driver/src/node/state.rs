@@ -13,13 +13,17 @@
 //! release is fetched or the node cleared, and in `validating` while the release runs on
 //! [`Trial`] or the node is checked, then returns the node to where it started, or to
 //! quarantine if one arrived meanwhile.
+//!
+//! A [`ToolsJob`] runs without changing node state: jobs keep the tools they started with.
+//! Tools builds, updates and resets are mutually exclusive.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use vk_hub_proto::{
-    Command, CommandAck, DesiredState, NodeState, Operation, Outcome, UpdatePhase, UpdateProgress,
+    Command, CommandAck, DesiredState, NodeState, Operation, Outcome, ToolsPhase, ToolsProgress,
+    UpdatePhase, UpdateProgress,
 };
 
 const STATE_FILE: &str = "state.json";
@@ -55,6 +59,22 @@ pub struct Persisted {
     /// started from a release executed, as the kernel names it — symlinks resolved.
     #[serde(default)]
     pub installed: Option<PathBuf>,
+    /// The tools build under way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolsJob>,
+    /// How the tools build under way, or the last one, is going.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_progress: Option<ToolsProgress>,
+}
+
+/// A tools build under way ([`Operation::Tools`]): accepted, and not yet done or failed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolsJob {
+    /// The command's ID, whose journal entry says how it ended.
+    pub command: String,
+    pub version: String,
+    pub sha256: String,
+    pub size: u64,
 }
 
 /// An update or a reset under way: accepted, and not yet done, failed or rolled back.
@@ -314,6 +334,13 @@ impl Persisted {
         if let Some(outcome) = self.during_job(op) {
             return outcome;
         }
+        if let (Operation::Update { .. } | Operation::Reset { .. }, Some(tools)) = (op, &self.tools)
+        {
+            return refused(&format!(
+                "a tools build is under way (command {})",
+                tools.command
+            ));
+        }
         match (op, self.state) {
             (Operation::Drain | Operation::Undrain, NodeState::Quarantined) => {
                 refused("the node is quarantined; release it first")
@@ -454,9 +481,91 @@ impl Persisted {
                 });
                 Outcome::Accepted
             }
-            // Not spoken below protocol version 4, which this node does not offer.
-            (Operation::Tools { .. }, _) => refused("this vk does not build tools"),
+            // The sha256 names files under the state dir: refused before any path is built
+            // from it.
+            (Operation::Tools { sha256, .. }, _) if !vk_hub_proto::valid_sha256(sha256) => {
+                refused("the tools definition's sha256 is not 64 lowercase hex digits")
+            }
+            (Operation::Tools { size, .. }, _) if *size > vk_hub_proto::MAX_TOOLS_DEFINITION => {
+                refused(&format!(
+                    "the tools definition is {size} bytes, past the {} a node takes",
+                    vk_hub_proto::MAX_TOOLS_DEFINITION
+                ))
+            }
+            // A release on trial executes another binary, which would leave a build behind.
+            (Operation::Tools { .. }, _) if self.job.is_some() => {
+                refused("an update or a reset is under way")
+            }
+            (Operation::Tools { .. }, _) if self.tools.is_some() => refused(&format!(
+                "a tools build is under way (command {})",
+                self.tools.as_ref().map_or("", |t| t.command.as_str())
+            )),
+            (
+                Operation::Tools {
+                    version,
+                    sha256,
+                    size,
+                },
+                _,
+            ) => {
+                self.tools = Some(ToolsJob {
+                    command: command.id.clone(),
+                    version: version.clone(),
+                    sha256: sha256.clone(),
+                    size: *size,
+                });
+                self.tools_progress = Some(ToolsProgress {
+                    command: command.id.clone(),
+                    version: version.clone(),
+                    sha256: sha256.clone(),
+                    phase: ToolsPhase::Downloading,
+                    message: None,
+                    log: Vec::new(),
+                });
+                Outcome::Accepted
+            }
         }
+    }
+
+    /// The tools build moved on to `phase`.
+    pub fn tools_phase(&mut self, phase: ToolsPhase) {
+        if let (Some(job), Some(progress)) = (&self.tools, self.tools_progress.as_mut())
+            && progress.command == job.command
+        {
+            progress.phase = phase;
+        }
+    }
+
+    /// End the tools build under way: done, or failed with `message` and the end of the
+    /// build's output, `log`. Its journal entry takes the outcome. Returns whether there was
+    /// one to end.
+    pub fn end_tools(&mut self, failed: Option<(String, Vec<String>)>) -> bool {
+        let Some(job) = self.tools.take() else {
+            return false;
+        };
+        let (outcome, phase, message, log) = match failed {
+            None => (Outcome::Done, ToolsPhase::Done, None, Vec::new()),
+            Some((message, log)) => (
+                Outcome::Failed {
+                    message: message.clone(),
+                },
+                ToolsPhase::Failed,
+                Some(message),
+                log,
+            ),
+        };
+        if let Some(entry) = self.journal.iter_mut().find(|e| e.id == job.command) {
+            entry.outcome = outcome;
+        }
+        self.tools_progress = Some(ToolsProgress {
+            command: job.command,
+            version: job.version,
+            sha256: job.sha256,
+            phase,
+            message,
+            log,
+        });
+        true
     }
 
     /// What `op` comes to while an update or a reset is under way, or `None` to handle it as
@@ -1214,5 +1323,96 @@ mod tests {
         let wire = serde_json::to_value(&job).unwrap();
         assert_eq!(wire["reset"], serde_json::json!({"images": true}));
         assert_eq!(serde_json::from_value::<Job>(wire).unwrap(), job);
+    }
+
+    fn tools(id: &str, sha256: &str) -> Command {
+        command(
+            id,
+            Operation::Tools {
+                version: "2026.10".into(),
+                sha256: sha256.into(),
+                size: 4096,
+            },
+        )
+    }
+
+    /// A tools build moves the node through no state, runs one at a time, excludes an update
+    /// and a reset either way, and survives a restart; its end settles its journal entry.
+    #[test]
+    fn a_tools_build_runs_alone_beside_the_node_s_state() {
+        let dir = scratch("tools");
+        let sha = "ab".repeat(vk_hub_proto::SHA256_LEN);
+        let mut p = Persisted::default();
+        assert_eq!(
+            p.command(tools("t", &sha), 1, false).outcome,
+            Outcome::Accepted
+        );
+        assert_eq!(p.state, NodeState::Ready);
+        assert_eq!(
+            p.tools_progress.as_ref().map(|t| t.phase),
+            Some(ToolsPhase::Downloading)
+        );
+        p.save(&dir).unwrap();
+        let mut p = Persisted::load(&dir).unwrap();
+        assert_eq!(p.tools.as_ref().unwrap().command, "t");
+        let busy = |p: &mut Persisted, c| match p.command(c, 1, true).outcome {
+            Outcome::Refused { reason } => reason,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        assert!(busy(&mut p, tools("t2", &sha)).contains("tools build is under way (command t)"));
+        assert!(busy(&mut p, update("u")).contains("tools build is under way"));
+        let reset = command("r", Operation::Reset { images: false });
+        assert!(busy(&mut p, reset).contains("tools build is under way"));
+        // A quarantine and a drain go ahead: the build takes no job.
+        p.command(command("q", Operation::Quarantine), 1, true);
+        assert_eq!(p.state, NodeState::Quarantined);
+        p.tools_phase(ToolsPhase::Building);
+        assert_eq!(
+            p.tools_progress.as_ref().map(|t| t.phase),
+            Some(ToolsPhase::Building)
+        );
+        assert!(p.end_tools(Some(("vk build failed".into(), vec!["e".into()]))));
+        assert!(!p.end_tools(None));
+        let entry = p.journal.iter().find(|e| e.id == "t").unwrap();
+        assert_eq!(
+            entry.outcome,
+            Outcome::Failed {
+                message: "vk build failed".into()
+            }
+        );
+        let progress = p.tools_progress.clone().unwrap();
+        assert_eq!(
+            (progress.phase, progress.message.as_deref(), progress.log),
+            (
+                ToolsPhase::Failed,
+                Some("vk build failed"),
+                vec!["e".to_string()]
+            )
+        );
+
+        // An update under way refuses a tools build in turn.
+        let mut p = Persisted::default();
+        p.command(update("u"), 1, true);
+        assert!(busy(&mut p, tools("t", &sha)).contains("an update or a reset is under way"));
+        // A malformed digest or an oversize definition is refused outright.
+        let mut p = Persisted::default();
+        assert!(busy(&mut p, tools("t", "AB")).contains("not 64 lowercase hex"));
+        let big = command(
+            "b",
+            Operation::Tools {
+                version: "v".into(),
+                sha256: sha.clone(),
+                size: vk_hub_proto::MAX_TOOLS_DEFINITION + 1,
+            },
+        );
+        assert!(busy(&mut p, big).contains("past the"));
+        assert!(p.tools.is_none());
+        p.command(tools("t3", &sha), 1, true);
+        assert!(p.end_tools(None));
+        assert_eq!(
+            p.journal.iter().find(|e| e.id == "t3").unwrap().outcome,
+            Outcome::Done
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

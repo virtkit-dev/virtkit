@@ -320,7 +320,11 @@ impl JobCtx {
     /// The directory `[executor] tools_dir` resolved to at boot, recorded by the supervisor.
     /// Prepare runs separately and must report that directory even if the link is repointed.
     pub fn tools_root_file(&self) -> PathBuf {
-        self.job_dir.join("tools.root")
+        Self::tools_root_file_in(&self.job_dir)
+    }
+    /// [`Self::tools_root_file`] of the job in `job_dir`.
+    pub fn tools_root_file_in(job_dir: &Path) -> PathBuf {
+        job_dir.join("tools.root")
     }
     /// Where prepare records the archive directory this job's guest statistics go to
     /// (`[executor] atop`), for the supervisor and the final stage — separate processes,

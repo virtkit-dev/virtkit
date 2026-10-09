@@ -309,6 +309,26 @@ Release downloads are authenticated and scoped to a pending update; their bytes 
 the control session. The hub stores and serves releases this way
 (see [Releases](fleet-prototype.md#releases)).
 
+### CI tools
+
+A node's CI tools (`[executor] tools_dir`: static git, git-lfs, gitlab-runner) can drift
+between hand-provisioned hosts just as its `vk` can. The hub distributes a build context,
+not binaries: its `tools` stage holds the tools, and a reproducible tar's sha256 identifies
+the definition. Each node builds it with `vk build` in microVMs, without reusing or leaving
+instruction-cache layers, checks the result, and switches `<state_dir>/tools/current`.
+See the implemented [CI tools](fleet-prototype.md#ci-tools).
+
+- No drain: a job resolves `tools_dir` as it boots and keeps that directory, so a switch only
+  affects jobs that start after it. The previous tools stay for the jobs started on them; that is
+  also the rollback, a build of the previous definition being a switch back.
+- Version 4 of the protocol carries it; a node that does not speak it is skipped, not sent a
+  command it could not parse.
+- Trust: tools run in every job VM that lacks its own, with the job's token, so registering them
+  is an admin operation. They run on a node's host only where the node already takes unsigned
+  releases from its hub. Proposed: a signature on the definition, checked against node-pinned
+  keys as releases are, and the version probe run in a VM so every node can report versions.
+- Proposed: rollouts of a definition by wave and canary, with the release rollouts' gates.
+
 ## Resets
 
 | Operation | Effect |
@@ -417,6 +437,9 @@ model, commands and process handling.
 - A release's signature is checked by the node against keys in its own configuration
   (`[node] release_keys`), made by a key kept off the hub: a compromised hub can hand a node
   any bytes, but not a signature it has no key for.
+- CI tools definitions are not signed: a compromised hub can put binaries of its choosing into
+  job VMs, which see the job's token, sources and secrets. It cannot have them run on a node's
+  host where the node requires signed releases: such a node never runs them outside a VM.
 - Proposed: runner authentication tokens stay on their nodes, and the hub's GitLab
   credential is a separate one, scoped to managing runners (pause, resume, list). With
   [GitLab jobs](#gitlab-jobs), runner tokens are `vk-gitlab`'s alone and leave no node.

@@ -27,6 +27,8 @@ The prototype provides, all experimentally:
   rollout`);
 - on the hub, CI tools definitions (`vk-hub tools`) and builds of one issued to nodes (`vk-hub
   nodes tools`), each definition served only to a node building it;
+- on the node, those builds, made with `vk build` apart from its build cache and installed as
+  `<state_dir>/tools/current`, the directory `[executor] tools_dir` names;
 - resets, which clear what a node's past jobs left (`vk-hub nodes reset`);
 - on the node, placed GitLab jobs (protocol version 3, [below](#placed-jobs-on-the-node)):
   reservations decided from the admission ledger, and jobs run stage by stage in microVMs,
@@ -230,9 +232,9 @@ placed jobs (see [Placed jobs](#placed-jobs)). Version 4 adds CI tools builds: t
 operation, which names a tools definition by sha256 and size; the build's progress on the
 report; and the definition's download, `GET /v1/tools/<sha256>`, signed as a release download is
 but under the label `vk-fleet tools-download v1` (see [CI tools](#ci-tools)). The hub speaks
-versions 1 to 4 and `vk node` 1 to 3, from ranges of their own; `vk_hub_proto::PROTOCOL` stays
-1 to 2.
-A session negotiates version 3 only with a node that implements it.
+versions 1 to 4, and so does `vk node`, from ranges of their own; `vk_hub_proto::PROTOCOL`
+stays 1 to 2.
+A session negotiates version 3 or 4 only with a node that implements it.
 
 The hub admits at most 256 connections that have not authenticated, each step of which (TLS,
 request headers, an enrollment body, a handshake message) has 10 seconds. One past that is
@@ -653,6 +655,53 @@ The hub serves it only to an enrolled node whose pinned key verifies, within fiv
 hub's clock, and which has a build of that definition still to finish, under the same limits as
 a release download.
 
+**On the node**, one build runs at a time in the background while the session continues.
+The node downloads the definition into `<state_dir>/tools/` with mode `0600`, retaining it
+only after checking its sha256 and the command's size limit. It unpacks only regular files
+and directories at plain relative paths into a private scratch directory beside it, then runs
+`vk build --file Dockerfile --context <it> --target tools --out <scratch>/tools.ext4 --no-journal
+--cache-registry none --build-jobs 1`. This child of the running `vk` receives the node's
+`--config`, with `XDG_CACHE_HOME` and `XDG_DATA_HOME` pointing into the scratch directory.
+It neither reads nor writes the node's instruction cache, local or shared through
+`vk-registry`. The scratch directory and everything the build stores there are removed
+whether the build succeeds or fails. Stages run one at a time, sized by `[build]` settings
+or their own `# vk:` lines, with network access as in any `vk build`. The build has an hour.
+Its microVMs belong to the child: neither the node's VM list nor its admission ledger counts
+them, so they run alongside jobs without reserved resources. Stopping the node ends the
+build; the next `vk node run` restarts it from the beginning.
+
+The stage's root is read out of the exported ext4 in-process, with no `debugfs`: each regular
+file, `0755`, and each symlink naming a regular file beside it (`git-remote-https` →
+`git-remote-http`); a directory such as `lost+found` is left out, and any other link refuses the
+build. `git` and `gitlab-runner` must be there, each an x86-64 ELF executable with no program
+interpreter: statically linked, since a job's image may lack the libc a dynamic one wants. The
+tools are run on the host — `--version`, an empty environment, ten seconds, the first line kept —
+only on a node that takes unsigned releases (no `[node] release_keys`, or `require_signed =
+false`), whose hub can run anything there already; a node that requires signed releases runs them
+nowhere but in job VMs, and reports no versions.
+
+The tools are installed as `<state_dir>/tools/<sha256>/`, `0755` with their files `0755`, with
+`<sha256>.json` beside it naming the label and versions, and `<state_dir>/tools/current` is
+pointed at them by renaming a new relative link over it. A job resolves `[executor] tools_dir` as
+it boots and keeps the directory it resolved, so jobs started from then on get the new tools and
+running ones keep theirs. The tools current before are kept, for the jobs started on them; older
+ones are removed, with their manifests, unless a job dir's `tools.root` still names them. A
+definition installed already — the previous one, asked for again — is switched to without a
+build. A failed build changes nothing: the tools current stay so. A tools build is refused while
+an update or a reset is under way, and an update or a reset while it builds; a release on trial
+executes another binary, which would leave a build behind. A quarantine or a drain does not stop
+it.
+
+The node does not change configuration. Once `vk-hub nodes` shows the first build is done,
+set `[executor] tools_dir = "<state_dir>/tools/current"` (`/var/lib/virtkit/tools/current`
+by default). Until then the link does not exist, and jobs configured to use it fail to boot.
+The link is followed from `<state_dir>/tools/`, owned by the node user and outside any
+guest-writable tree, so it passes `tools_dir`'s rules. If tools are installed but `tools_dir`
+names another directory, `vk node run` warns at startup and after each build,
+`vk check --feature gitlab` reports it, and inventory marks the tools as not in use.
+This includes a path directly to `<state_dir>/tools/<sha256>`, which stays pinned when
+`current` switches.
+
 The node's report carries the build's phase (`downloading`, `building`, `installing`, then `done`
 or `failed`, with the reason and the last 40 lines of a failed build's output), and its inventory
 the tools current: the definition, its label, the first line each tool printed for `--version`,
@@ -663,7 +712,12 @@ audit log has each phase as the node reports it.
 Whoever registers a definition can put any binary into every job VM of the nodes that build it:
 a job's PATH gets each tool its image lacks, and gitlab-runner handles the job's artifacts,
 caches and token. Registering and issuing tools is the admin socket's alone — the hub's user or
-root, audited as `uid <n>` — not the web UI's.
+root, audited as `uid <n>` — not the web UI's. The definition itself is code each node builds in
+microVMs, with network, as any `vk build` is.
+
+Not built: rolling tools out by wave and canary, as [rollouts](#rollouts) do releases; pinning a
+definition with a signature the node checks, as releases are; and running the version probe in a
+VM, which a node that requires signed releases would need to report versions.
 
 ## Resets
 

@@ -127,6 +127,12 @@ impl Policy {
         Ok(Policy { keys, required })
     }
 
+    /// Whether every release must carry a signature by one of the node's keys: the node does
+    /// not take its hub's word for what runs on it.
+    pub fn required(&self) -> bool {
+        self.required
+    }
+
     /// Check whether release `sha256` (hex) as `version` may be installed. A signature must
     /// be present when required. With keys configured, any supplied signature must verify,
     /// even when signatures are optional.
