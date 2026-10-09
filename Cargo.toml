@@ -9,6 +9,7 @@ members = [
     "vk-hub-proto",
     "vk-oidc",
     "vk-hub",
+    "vk-gitlab",
     "vk-runnerctl",
     "vk-selfupdate",
     "vk-tpm",

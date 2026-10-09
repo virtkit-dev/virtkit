@@ -1,0 +1,68 @@
+{
+  "id": 11,
+  "token": "job-token",
+  "inputs": [
+    {
+      "key": "username",
+      "value": {
+        "type": "string",
+        "content": "fred",
+        "sensitive": false
+      }
+    },
+    {
+      "key": "fullname",
+      "value": {
+        "type": "string",
+        "content": "fred tester",
+        "sensitive": false
+      }
+    },
+    {
+      "key": "password",
+      "value": {
+        "type": "string",
+        "content": "123456",
+        "sensitive": true
+      }
+    },
+    {
+      "key": "age",
+      "value": {
+        "type": "number",
+        "content": 1,
+        "sensitive": false
+      }
+    },
+    {
+      "key": "likes_spaghetti",
+      "value": {
+        "type": "boolean",
+        "content": false,
+        "sensitive": false
+      }
+    },
+    {
+      "key": "friends",
+      "value": {
+        "type": "array",
+        "content": [
+          "bob",
+          "sally"
+        ],
+        "sensitive": false
+      }
+    },
+    {
+      "key": "address",
+      "value": {
+        "type": "struct",
+        "content": {
+          "line1": "42 Wallaby Way",
+          "line2": "Sydney"
+        },
+        "sensitive": false
+      }
+    }
+  ]
+}

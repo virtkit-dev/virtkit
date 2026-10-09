@@ -1,0 +1,35 @@
+[package]
+name = "vk-gitlab"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "A GitLab runner that hands jobs to a virtkit fleet hub"
+
+# Integration tests drive the library against an in-process fake GitLab.
+[lib]
+name = "vk_gitlab"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bytes.workspace = true
+# `kv`: the structured fields every log line carries (runner, job, correlation_id, …).
+log = { workspace = true, features = ["kv", "std"] }
+reqwest.workspace = true
+# The API client installs ring as the process's crypto provider.
+rustls.workspace = true
+# HMAC-SHA256 for the system ID, and the OS RNG for correlation IDs and backoff jitter.
+ring.workspace = true
+# RateLimit-ResetTime / Retry-After dates.
+httpdate.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time", "sync"] }
+
+[dev-dependencies]
+# The fake GitLab the integration tests run in-process.
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "sync", "net", "test-util"] }

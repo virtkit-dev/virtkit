@@ -1,0 +1,131 @@
+{
+  "id": 42,
+  "token": "glcbt-64_jobtoken",
+  "allow_git_fetch": true,
+  "job_info": {
+    "name": "build",
+    "stage": "test",
+    "pipeline_id": 1001,
+    "project_id": 7,
+    "project_name": "app",
+    "project_full_path": "group/app",
+    "namespace_id": 3,
+    "root_namespace_id": 2,
+    "organization_id": 1,
+    "instance_id": "inst-1",
+    "instance_uuid": "c0ffee",
+    "user_id": 99,
+    "scoped_user_id": 100,
+    "time_in_queue_seconds": 1.5,
+    "project_jobs_running_on_instance_runners_count": "+Inf",
+    "queue_size": 4,
+    "queue_depth": 2
+  },
+  "git_info": {
+    "repo_url": "https://gitlab-ci-token:glcbt-64_jobtoken@gitlab.example.com/group/app.git",
+    "repo_object_format": "sha1",
+    "ref": "main",
+    "sha": "0123456789abcdef0123456789abcdef01234567",
+    "before_sha": "0000000000000000000000000000000000000000",
+    "ref_type": "branch",
+    "refspecs": ["+refs/heads/main:refs/remotes/origin/main"],
+    "depth": 20,
+    "protected": true
+  },
+  "runner_info": { "uuid": "runner-uuid", "timeout": 3600 },
+  "inputs": [
+    { "key": "env", "value": { "type": "string", "content": "prod", "sensitive": false } }
+  ],
+  "variables": [
+    { "key": "CI_JOB_ID", "value": "42", "public": true, "file": false, "masked": false, "raw": false },
+    { "key": "SECRET", "value": "s3cr3t-value", "public": false, "file": false, "masked": true, "raw": true },
+    { "key": "CI_DEBUG_TRACE", "value": "true", "public": false }
+  ],
+  "steps": [
+    { "name": "script", "script": ["make"], "timeout": 3600, "when": "on_success", "allow_failure": false },
+    { "name": "after_script", "script": ["make clean"], "timeout": 300, "when": "always", "allow_failure": true }
+  ],
+  "image": {
+    "name": "alpine:3.20",
+    "alias": "build",
+    "command": ["sh"],
+    "entrypoint": [""],
+    "ports": [{ "number": 8080, "protocol": "http", "name": "web" }],
+    "variables": [{ "key": "IMG", "value": "1" }],
+    "pull_policy": ["if-not-present"],
+    "executor_opts": { "docker": { "platform": "linux/amd64", "user": 1000 } }
+  },
+  "services": [
+    { "name": "postgres:16", "alias": "db,database", "executor_opts": { "kubernetes": { "user": "999" } } }
+  ],
+  "artifacts": [
+    { "name": "bin", "untracked": false, "paths": ["out/"], "exclude": ["out/tmp"], "when": "on_success",
+      "artifact_type": "archive", "artifact_format": "zip", "expire_in": "1 week" },
+    { "name": "", "paths": ["report.xml"], "when": "always", "artifact_type": "junit", "artifact_format": "gzip", "expire_in": null }
+  ],
+  "cache": [
+    { "key": "deps", "untracked": true, "policy": "pull", "paths": ["vendor/"], "when": "on_success", "fallback_keys": ["deps-main"] }
+  ],
+  "credentials": [
+    { "type": "registry", "url": "registry.example.com", "username": "gitlab-ci-token", "password": "glcbt-64_jobtoken" }
+  ],
+  "dependencies": [
+    { "id": 41, "token": "glcbt-64_dep", "name": "prepare", "artifacts_file": { "filename": "artifacts.zip", "size": 1024 } }
+  ],
+  "features": {
+    "trace_sections": true,
+    "token_mask_prefixes": ["ghp_"],
+    "failure_reasons": ["script_failure", "runner_system_failure", "job_execution_timeout", "image_pull_failure"],
+    "tracing": {
+      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "span_parent_id": "00f067aa0ba902b7",
+      "otel_endpoints": [
+        { "url": "https://otel.example.com", "auth": { "type": "http_bearer_gcp_oidc", "http_bearer_gcp_oidc": { "audience": "aud" } } }
+      ]
+    }
+  },
+  "secrets": {
+    "DB_PASSWORD": {
+      "vault": {
+        "server": { "url": "https://vault.example.com", "auth": { "name": "jwt", "path": "jwt", "data": { "jwt": "eyJ", "role": "ci" } }, "namespace": "ns" },
+        "engine": { "name": "kv-v2", "path": "kv" },
+        "path": "app/db",
+        "field": "password"
+      },
+      "file": false
+    },
+    "GCP_KEY": {
+      "gcp_secret_manager": {
+        "name": "key", "version": "latest",
+        "server": { "project_number": "123", "workload_identity_federation_pool_id": "pool", "workload_identity_federation_provider_id": "prov", "jwt": "eyJ" }
+      }
+    },
+    "AZURE_KEY": {
+      "azure_key_vault": { "name": "key", "version": "1", "server": { "client_id": "c", "tenant_id": "t", "jwt": "eyJ", "url": "https://vault.azure.net" } }
+    },
+    "AWS_KEY": {
+      "aws_secrets_manager": {
+        "secret_id": "arn:aws:secretsmanager:eu-west-1:1:secret:k", "version_id": "v1", "version_stage": "AWSCURRENT", "field": "f",
+        "region": "eu-west-1", "role_arn": "arn:aws:iam::1:role/ci", "role_session_name": "s",
+        "server": { "region": "eu-west-1", "jwt": "eyJ", "role_arn": "arn:aws:iam::1:role/ci", "role_session_name": "s" }
+      }
+    },
+    "GL_KEY": {
+      "gitlab_secrets_manager": {
+        "server": { "url": "https://openbao.example.com", "inline_auth": { "path": "auth/jwt/login", "jwt": "eyJ", "role": "r", "auth_mount": "jwt" } },
+        "engine": { "name": "kv-v2", "path": "secrets" },
+        "path": "p", "field": "f"
+      }
+    }
+  },
+  "hooks": [{ "name": "pre_get_sources_script", "script": ["echo pre"] }],
+  "run": "[{\"name\":\"hello\",\"script\":\"echo hello world\"}]",
+  "policy_options": {
+    "execution_policy_job": true,
+    "policy_name": "security",
+    "policy_variables_override_allowed": false,
+    "policy_variables_override_exceptions": ["SAFE"]
+  },
+  "suspend_options": { "suspend_on_failure": true, "runtime_environment_key": "env-1" },
+  "a_field_added_later": { "nested": [1, 2, 3] }
+}

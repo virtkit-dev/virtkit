@@ -1,0 +1,35 @@
+vk-gitlab
+Copyright © 2026 Vincent Vanackere and WALLIX
+
+This product includes software developed at WALLIX (https://www.wallix.com/).
+
+vk-gitlab reimplements the GitLab-facing side of GitLab Runner. Its protocol behaviour
+(job request, job update, incremental trace, retries and backoff, failure-reason
+mapping, token shortening, system ID) follows GitLab Runner v19.5.0, and the job trace
+reporter in src/trace.rs and the JobResponse types in src/job.rs are adapted from its Go
+sources. The tests in tests/api_compat.rs, tests/trace_compat.rs, tests/job_fixtures.rs
+and unit tests under src/ port test cases and fixtures from GitLab Runner's test suite;
+each names the upstream file and test it comes from.
+https://gitlab.com/gitlab-org/gitlab-runner/-/tree/v19.5.0
+
+The MIT License (MIT)
+
+Copyright (c) 2015-2019 GitLab Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
