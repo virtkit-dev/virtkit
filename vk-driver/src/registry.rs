@@ -518,18 +518,51 @@ async fn try_pull_ext4_async(
 /// normal restore would), then write a `.vk_ro_img` manifest at `dest` instead of
 /// reassembling a raw ext4 — the decompress-and-write of each chunk's bytes happens lazily,
 /// only for the ranges a guest boot actually reads. Returns `None` if the tag is absent,
-/// exactly like `try_pull_ext4`.
+/// exactly like `try_pull_ext4`. `meter`, when set, counts the chunks in as they land; a
+/// local store reads no chunk here, so it leaves the meter alone.
 pub fn try_pull_ext4_lazy(
     rg: &Registry,
     name: &str,
     tag: &str,
     dest: &Path,
     label: &str,
+    meter: Option<&TransferMeter>,
 ) -> Result<Option<String>> {
     if let Some(root) = rg.local_root() {
         return local::try_pull_ext4_lazy(&root, name, tag, dest);
     }
-    block_on(try_pull_ext4_lazy_async(rg, name, tag, dest, label))
+    block_on(try_pull_ext4_lazy_async(rg, name, tag, dest, label, meter))
+}
+
+/// How far a pull has got, in the compressed bytes its manifest lists — read by the build's
+/// plain-progress heartbeat while the pull runs on another thread. `total` is 0 until the
+/// pull has its manifest.
+#[derive(Debug, Default)]
+pub(crate) struct TransferMeter {
+    done: AtomicU64,
+    total: AtomicU64,
+}
+
+impl TransferMeter {
+    /// Zero both figures, for a phase about to start a pull of its own.
+    pub(crate) fn reset(&self) {
+        self.start(0);
+    }
+    /// A pull of `total` bytes is starting.
+    pub(crate) fn start(&self, total: u64) {
+        self.total.store(total, Ordering::Relaxed);
+        self.done.store(0, Ordering::Relaxed);
+    }
+    pub(crate) fn add(&self, n: u64) {
+        self.done.fetch_add(n, Ordering::Relaxed);
+    }
+    /// `(done, total)`.
+    pub(crate) fn get(&self) -> (u64, u64) {
+        (
+            self.done.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
 }
 
 async fn try_pull_ext4_lazy_async(
@@ -538,6 +571,7 @@ async fn try_pull_ext4_lazy_async(
     tag: &str,
     dest: &Path,
     label: &str,
+    meter: Option<&TransferMeter>,
 ) -> Result<Option<String>> {
     let (client, auth) = client(rg)?;
     let image = make_ref(rg, name, tag)?;
@@ -571,6 +605,10 @@ async fn try_pull_ext4_lazy_async(
         })
         .cloned()
         .collect();
+    let layer_size = |l: &OciDescriptor| u64::try_from(l.size).unwrap_or(0);
+    if let Some(m) = meter {
+        m.start(chunk_layers.iter().map(layer_size).sum());
+    }
 
     // The same shared local chunk cache `pull_into`'s eager path uses (same staging-bundle
     // path shape, see `chunks_cache_dir`), so a lazy and an eager restore of the same image
@@ -595,6 +633,9 @@ async fn try_pull_ext4_lazy_async(
                 // Ensures the blob is in the local cache (network fetch on a miss) — the
                 // decompress-and-place step the eager path does next is what we skip.
                 pull_chunk(client, dref, &layer, chunks_cache, fetched, reused).await?;
+                if let Some(m) = meter {
+                    m.add(layer_size(&layer));
+                }
                 let codec = if layer.media_type == CHUNK_MEDIA_TYPE {
                     VK_RO_IMG_CODEC_ZSTD
                 } else {

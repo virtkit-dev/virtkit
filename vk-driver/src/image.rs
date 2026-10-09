@@ -347,13 +347,38 @@ pub(crate) fn acquire_pull_lock(
     name: &str,
     digest: &str,
 ) -> Result<PullLock> {
+    // Off a terminal (a job log) nothing else shows the wait is still on; a terminal has the
+    // first line and the dashboard to come.
+    let beat = crate::build::plain_progress().then_some(crate::build::HEARTBEAT);
     acquire_pull_lock_with(
         dir,
         verb,
         name,
         digest,
         std::time::Duration::from_millis(200),
+        beat,
     )
+}
+
+/// Report a wait at intervals of `every`, or stay silent when unset.
+struct WaitBeat {
+    every: Option<std::time::Duration>,
+    /// How far into the wait the last report was.
+    last: std::time::Duration,
+}
+
+impl WaitBeat {
+    /// Check whether a report is due at elapsed time `waited`, and record it if so.
+    fn due(&mut self, waited: std::time::Duration) -> bool {
+        let Some(every) = self.every else {
+            return false;
+        };
+        if waited.saturating_sub(self.last) < every {
+            return false;
+        }
+        self.last = waited;
+        true
+    }
 }
 
 /// [`acquire_pull_lock`] without waiting: `None` when another process holds it. Held, it
@@ -364,19 +389,26 @@ fn try_acquire_pull_lock(dir: &Path) -> Option<PullLock> {
 }
 
 /// [`acquire_pull_lock`], retrying the bind every `poll`, and querying the holder at the first
-/// refusal and every 25 polls after.
+/// refusal and every 25 polls after; at those queries, saying the wait is still on every
+/// `beat`, if set.
 fn acquire_pull_lock_with(
     dir: &Path,
     verb: &str,
     name: &str,
     digest: &str,
     poll: std::time::Duration,
+    beat: Option<std::time::Duration>,
 ) -> Result<PullLock> {
     let addr = pull_lock_addr(pull_lock_hash(dir))?;
     let mut waiting = false;
     let mut polls: u32 = 0;
     // Consecutive unanswered queries while the name stays bound.
     let mut unanswered: u32 = 0;
+    let since = std::time::Instant::now();
+    let mut beat = WaitBeat {
+        every: beat,
+        last: std::time::Duration::ZERO,
+    };
     loop {
         polls = polls.wrapping_add(1);
         match UnixListener::bind_addr(&addr) {
@@ -403,7 +435,19 @@ fn acquire_pull_lock_with(
                          not answer — refusing to wait on it"
                     ),
                 }
-                if !waiting {
+                // "A concurrent" build or pull: the holder may also be a sweep reclaiming a dead
+                // staging dir of this entry (`TmpSweep::reclaim_if_dead`), which is brief.
+                if waiting {
+                    // A later query, `poll * 25` into the wait: say it is still on, at most
+                    // every `beat`, so a job log does not go quiet for the whole of it.
+                    let waited = since.elapsed();
+                    if beat.due(waited) {
+                        println!(
+                            "virtkit: still waiting for the concurrent {verb} of {name}, {}",
+                            crate::build::fmt_wait(waited)
+                        );
+                    }
+                } else {
                     match holder.and_then(|h| h.who) {
                         Some(who) => println!(
                             "virtkit: waiting for a concurrent {verb} of {name}@{digest} \
@@ -1156,6 +1200,7 @@ mod tests {
             "img",
             "sha256:x",
             std::time::Duration::from_millis(1),
+            None,
         )
         .err()
         .expect("a holder that never answers is refused")
@@ -1185,6 +1230,7 @@ mod tests {
                     "img",
                     "sha256:x",
                     std::time::Duration::from_millis(1),
+                    Some(std::time::Duration::ZERO),
                 )
                 .map(drop)
             })
@@ -1194,6 +1240,23 @@ mod tests {
         assert!(!waiter.is_finished(), "the waiter keeps waiting");
         drop(held);
         waiter.join().unwrap().unwrap();
+    }
+
+    // Report at most once per interval, and never when the interval is unset.
+    #[test]
+    fn a_wait_beats_at_its_cadence() {
+        let secs = std::time::Duration::from_secs;
+        let mut beat = WaitBeat {
+            every: Some(secs(10)),
+            last: secs(0),
+        };
+        let due: Vec<_> = [5, 10, 15, 19, 20, 31].map(|s| beat.due(secs(s))).into();
+        assert_eq!(due, [false, true, false, false, true, true]);
+        let mut quiet = WaitBeat {
+            every: None,
+            last: secs(0),
+        };
+        assert!(!quiet.due(secs(3600)));
     }
 
     #[test]

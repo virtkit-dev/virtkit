@@ -45,6 +45,9 @@ pub(crate) mod parser;
 pub(crate) use exec::vd_name;
 mod plan;
 mod progress;
+// The heartbeat cadence, wait format and plain-mode test, shared with the waits that run
+// before a build has a reporter (`image::acquire_pull_lock`).
+pub(crate) use progress::{HEARTBEAT, fmt_wait, plain_progress};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -2162,6 +2165,8 @@ fn build_stage(
     // Route this stage's guest output through the progress reporter (line-buffered +
     // stage-prefixed) so concurrent stages stay legible.
     ex.set_output_sink(progress.stage_sink(display));
+    // And its registry pulls through the stage's meter, which the plain heartbeat reads.
+    ex.set_transfer_meter(progress.stage_meter(display));
     // The actual build attempt, isolated in a closure so any error from here on is a
     // candidate to memoize against `final_key` (just below) before it propagates — the
     // memoization guard there filters out a cascaded cancellation or an environmental

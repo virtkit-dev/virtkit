@@ -255,6 +255,11 @@ pub trait Executor {
     /// microVM backend runs guests that produce output.
     fn set_output_sink(&mut self, _sink: crate::executor::OutputSink) {}
 
+    /// Count this stage's registry pulls into `meter` (the progress reporter's per-stage
+    /// meter), so a plain build's heartbeat can say how far a long restore has got. Default:
+    /// ignored — only the microVM backend pulls from a registry.
+    fn set_transfer_meter(&mut self, _meter: Arc<crate::registry::TransferMeter>) {}
+
     /// Give this stage the build-wide cancellation token so a RUN executing in its guest
     /// is interrupted when another stage fails. Default: ignored — only the microVM
     /// backend boots guests that a cancellation can interrupt.
@@ -634,6 +639,9 @@ pub struct MicroVm {
     /// where this stage's guest command output goes — set per stage by the driver to the
     /// progress reporter's stage sink. `Inherit` (the default) writes straight to stdout.
     output_sink: crate::executor::OutputSink,
+    /// where this stage's registry pulls count their bytes — set per stage by the driver to
+    /// the progress reporter's stage meter. `None` counts nothing.
+    meter: Option<Arc<crate::registry::TransferMeter>>,
     /// build-wide cancellation, set per stage by the driver: the first stage failure
     /// cancels it, interrupting the RUN steps still executing in every other stage's guest
     /// so the build stops promptly instead of running the in-flight steps to completion.
@@ -1228,6 +1236,7 @@ impl MicroVm {
             stage_last_digest: Arc::new(Mutex::new(HashMap::new())),
             parent_layers: None,
             output_sink: crate::executor::OutputSink::Inherit,
+            meter: None,
             cancel: None,
             stage_prev_extents: HashMap::new(),
             dirty_carry: HashMap::new(),
@@ -1355,6 +1364,7 @@ impl MicroVm {
             // A fresh worker inherits nothing; the driver sets the stage's sink before
             // its instructions run.
             output_sink: crate::executor::OutputSink::Inherit,
+            meter: None,
             // Set per stage by the driver (`build_stage`), before its instructions run.
             cancel: None,
             stage_prev_extents: HashMap::new(),
@@ -1719,9 +1729,14 @@ impl MicroVm {
             && crate::registry::exists(&rg, CACHE_REPO, &base_key)
         {
             let lazy = self.lazy_image_path(label);
-            if let Some(digest) =
-                crate::registry::try_pull_ext4_lazy(&rg, CACHE_REPO, &base_key, &lazy, image)?
-            {
+            if let Some(digest) = crate::registry::try_pull_ext4_lazy(
+                &rg,
+                CACHE_REPO,
+                &base_key,
+                &lazy,
+                image,
+                self.meter.as_deref(),
+            )? {
                 self.verify_lazy_view(&lazy, &format!("cached image {image} (after load)"))?;
                 return Ok((lazy, Some(digest)));
             }
@@ -2677,8 +2692,14 @@ impl Executor for MicroVm {
         // wrap it in a rw qcow2 so any remaining instructions can boot it directly and write
         // into the overlay.
         let lazy = self.lazy_image_path(&fs.label);
-        let Some(digest) =
-            crate::registry::try_pull_ext4_lazy(&rg, CACHE_REPO, key, &lazy, &fs.label)?
+        let Some(digest) = crate::registry::try_pull_ext4_lazy(
+            &rg,
+            CACHE_REPO,
+            key,
+            &lazy,
+            &fs.label,
+            self.meter.as_deref(),
+        )?
         else {
             bail!("cached instruction {key} vanished from the registry");
         };
@@ -2988,6 +3009,9 @@ impl Executor for MicroVm {
 
     fn set_output_sink(&mut self, sink: crate::executor::OutputSink) {
         self.output_sink = sink;
+    }
+    fn set_transfer_meter(&mut self, meter: Arc<crate::registry::TransferMeter>) {
+        self.meter = Some(meter);
     }
     fn set_cancel(&mut self, cancel: CancellationToken) {
         self.cancel = Some(cancel);

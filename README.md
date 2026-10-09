@@ -892,7 +892,7 @@ The small environment-variable surface is:
 | `VIRTKIT_DEBUG=1` | Enable verbose VMM and guest logging. |
 | `VK_SWITCH_LOG=debug` | Set the userspace network switch's log level in `switch.log` (default: `warn`). |
 | `VIRTKIT_TIMING=1` | Print per-phase build and boot timing. |
-| `VIRTKIT_PROGRESS=plain` | Use line-oriented build progress suitable for CI logs. |
+| `VIRTKIT_PROGRESS=plain` | Use line-oriented build progress suitable for CI logs (also the default off a terminal); a long step, cache restore or wait reports that it is still running every 10 s. |
 | `VIRTKIT_NO_TITLE` | Disable terminal-title updates without disabling the dashboard. |
 
 Two configuration values can point at the same content-addressed store:

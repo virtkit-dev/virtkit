@@ -16,6 +16,11 @@
 //!   (buildkit `--progress=plain`). Used off-terminal (CI logs) or `VIRTKIT_PROGRESS=plain`.
 //! - **Disabled**: every method is a no-op (used by `--print-plan`, which owns stdout).
 //!
+//! Plain and routed builds have no spinner to show that a long phase is still alive — a
+//! cache restore, a wait on another runner's build or on host memory, a RUN with no output —
+//! so a ticker thread prints a heartbeat line for each one every [`HEARTBEAT`]: what is in
+//! progress, for how long, and how many bytes a registry pull has restored when it knows.
+//!
 //! Because stages build concurrently, RUN output is routed here (via
 //! [`crate::executor::OutputSink`]) rather than written straight to stdout, so it can be
 //! line-buffered and stage-prefixed instead of interleaving unattributed.
@@ -24,7 +29,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle, TermLike};
@@ -33,6 +40,7 @@ use vk_core::messages::Fd;
 use vk_core::pty::get_winsize;
 
 use crate::executor::OutputSink;
+use crate::registry::TransferMeter;
 
 /// Stage identity as the build driver knows it (the plan's stage index).
 pub type StageId = usize;
@@ -123,6 +131,33 @@ const OUTPUT_TAIL_NUM: usize = usize::MAX - 2;
 /// are 1..=total; distinct from the other transient sentinels).
 const WAIT_MEM_NUM: usize = usize::MAX - 3;
 
+/// How often a plain/routed build reports each long phase still in flight.
+pub const HEARTBEAT: Duration = Duration::from_secs(10);
+
+/// How often the heartbeat thread looks for a phase that is due — the slack on [`HEARTBEAT`].
+const HEARTBEAT_TICK: Duration = Duration::from_secs(1);
+
+/// The longest step label a heartbeat repeats; its `#N` start line already has the whole of it.
+const HEARTBEAT_LABEL: usize = 48;
+
+/// One long phase in flight, as the plain/routed heartbeat reports it.
+struct Phase {
+    /// the `#N` the heartbeat line carries: the cell's own, or its stage's `FROM` line.
+    seq: usize,
+    /// what is in progress, e.g. `restoring stage builder from the cache`.
+    what: String,
+    /// a cell whose command is running: reported as `… still running, 2m10s`.
+    running: bool,
+    since: Instant,
+    /// when this phase last beat (its start until the first beat).
+    last: Instant,
+    /// the stage's pull meter, for a phase that pulls from the registry.
+    meter: Option<Arc<TransferMeter>>,
+}
+
+/// The heartbeat thread: dropping the sender stops it.
+type Ticker = (mpsc::Sender<()>, JoinHandle<()>);
+
 enum Backend {
     Tty(Box<Tty>),
     Plain,
@@ -157,6 +192,14 @@ pub struct Progress {
     /// is restored. Held here until [`Progress::restore_done`] moves it into `done`, so the
     /// header tracks real materialization instead of racing ahead of a running restore pull.
     pending: Mutex<HashMap<StageId, usize>>,
+    /// the long phases in flight, keyed like the tty bars (a cell, or a stage's transient
+    /// sentinel), for the heartbeat. Kept for the plain/routed backends only.
+    phases: Mutex<HashMap<(StageId, usize), Phase>>,
+    /// each stage's registry-pull meter, handed to its executor by [`Progress::stage_meter`].
+    meters: Mutex<HashMap<StageId, Arc<TransferMeter>>>,
+    /// the heartbeat thread, started by [`Progress::init`] and stopped by
+    /// [`Progress::finish`] (or drop).
+    ticker: Mutex<Option<Ticker>>,
 }
 
 /// braille spinner frames + a trailing space (the finished frame, never shown — bars are
@@ -172,12 +215,8 @@ impl Progress {
     /// A reporter for a real build. Picks the live dashboard vs plain streaming from stdout
     /// and the environment; [`Progress::init`] must be called before any event.
     pub fn new() -> Arc<Self> {
-        let forced_plain = std::env::var("VIRTKIT_PROGRESS")
-            .map(|v| v == "plain")
-            .unwrap_or(false);
-        let dumb = std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false);
         let color = std::env::var_os("NO_COLOR").is_none();
-        if !forced_plain && !dumb && std::io::stdout().is_terminal() {
+        if !plain_progress() {
             Arc::new(Progress::new_backend(
                 Backend::Tty(Box::new(Tty::new())),
                 color,
@@ -247,6 +286,9 @@ impl Progress {
             cell_start: Mutex::new(HashMap::new()),
             cell_ran: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            phases: Mutex::new(HashMap::new()),
+            meters: Mutex::new(HashMap::new()),
+            ticker: Mutex::new(None),
         }
     }
 
@@ -292,6 +334,13 @@ impl Progress {
             export_seqs,
         });
         self.refresh_header();
+        self.start_ticker();
+    }
+
+    /// `stage`'s registry-pull meter, for its executor to count pulls into. A phase that
+    /// pulls (a restore, a `FROM`) resets it as it starts, and its heartbeat reads it.
+    pub fn stage_meter(&self, stage: StageId) -> Arc<TransferMeter> {
+        Arc::clone(self.meters.lock().unwrap().entry(stage).or_default())
     }
 
     /// The output sink for `stage`'s guest commands: routes each chunk here (line-buffered,
@@ -331,6 +380,12 @@ impl Progress {
                 .unwrap()
                 .insert((stage, num), started.elapsed());
         }
+        if let Some(p) = self.phases.lock().unwrap().get_mut(&(stage, num)) {
+            let now = Instant::now();
+            p.what = "caching the step's snapshot".to_string();
+            p.running = false;
+            (p.since, p.last) = (now, now);
+        }
         if let Backend::Tty(tty) = &self.backend
             && let Some(pb) = tty.bars.lock().unwrap().get(&(stage, num))
         {
@@ -350,6 +405,7 @@ impl Progress {
         let num = step + 2;
         self.cell_start.lock().unwrap().remove(&(stage, num));
         self.cell_ran.lock().unwrap().remove(&(stage, num));
+        self.phase_end((stage, num));
         let Some(meta) = self.meta.get() else { return };
         let Some(sm) = meta.stages.get(&stage) else {
             return;
@@ -424,6 +480,13 @@ impl Progress {
     /// cells are already marked CACHED (so the header advances with nothing visibly running).
     /// Cleared by [`Progress::restore_done`], or drained by [`Progress::finish`] on error.
     pub fn restore_start(&self, stage: StageId, name: &str) {
+        self.phase_begin(
+            (stage, RESTORE_NUM),
+            self.stage_seq(stage),
+            format!("restoring stage {name} from the cache"),
+            false,
+            true,
+        );
         if let Backend::Tty(tty) = &self.backend {
             let pb = tty.mp.add(ProgressBar::new_spinner());
             pb.set_style(self.step_style());
@@ -438,6 +501,7 @@ impl Progress {
         if n > 0 {
             self.done.fetch_add(n, Ordering::Relaxed);
         }
+        self.phase_end((stage, RESTORE_NUM));
         if let Backend::Tty(tty) = &self.backend
             && let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, RESTORE_NUM))
         {
@@ -452,6 +516,13 @@ impl Progress {
     /// [`Progress::wait_lock_done`], or drained by [`Progress::finish`] on error.
     pub fn wait_lock_start(&self, stage: StageId, name: &str, holder: &str) {
         let msg = format!("[{name}] waiting for a concurrent build (held by {holder})");
+        self.phase_begin(
+            (stage, WAIT_LOCK_NUM),
+            self.stage_seq(stage),
+            format!("waiting for {holder}'s build of stage {name}"),
+            false,
+            false,
+        );
         match &self.backend {
             Backend::Tty(tty) => {
                 let pb = tty.mp.add(ProgressBar::new_spinner());
@@ -467,6 +538,7 @@ impl Progress {
         }
     }
     pub fn wait_lock_done(&self, stage: StageId) {
+        self.phase_end((stage, WAIT_LOCK_NUM));
         if let Backend::Tty(tty) = &self.backend
             && let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, WAIT_LOCK_NUM))
         {
@@ -481,6 +553,14 @@ impl Progress {
     /// [`Progress::finish`] on error.
     pub fn wait_mem_start(&self, stage: StageId, name: &str, short: u64) {
         let msg = format!("[{name}] waiting for host memory ({short} MiB short)");
+        self.phase_begin(
+            (stage, WAIT_MEM_NUM),
+            self.stage_seq(stage),
+            // Not the shortfall: it changes while the stage waits, and the start line has it.
+            format!("stage {name} waiting for host memory"),
+            false,
+            false,
+        );
         match &self.backend {
             Backend::Tty(tty) => {
                 let pb = tty.mp.add(ProgressBar::new_spinner());
@@ -502,6 +582,7 @@ impl Progress {
     /// shows every park and no resume cannot tell a two-second wait from a twenty-minute
     /// one, but a cancelled build must not claim a stage is starting.
     pub fn wait_mem_done(&self, stage: StageId, name: &str, started: bool) {
+        self.phase_end((stage, WAIT_MEM_NUM));
         match &self.backend {
             Backend::Tty(tty) => {
                 if let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, WAIT_MEM_NUM)) {
@@ -521,6 +602,13 @@ impl Progress {
     /// here (it drains in the background), so this covers only the guest flush + shutdown.
     /// Cleared by [`Progress::stage_finishing_done`], or drained by [`Progress::finish`] on error.
     pub fn stage_finishing_start(&self, stage: StageId, name: &str) {
+        self.phase_begin(
+            (stage, FINISH_NUM),
+            self.stage_seq(stage),
+            format!("finishing stage {name}"),
+            false,
+            false,
+        );
         if let Backend::Tty(tty) = &self.backend {
             let pb = tty.mp.add(ProgressBar::new_spinner());
             pb.set_style(self.step_style());
@@ -530,6 +618,7 @@ impl Progress {
         }
     }
     pub fn stage_finishing_done(&self, stage: StageId) {
+        self.phase_end((stage, FINISH_NUM));
         if let Backend::Tty(tty) = &self.backend
             && let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, FINISH_NUM))
         {
@@ -538,6 +627,13 @@ impl Progress {
     }
 
     pub fn export_start(&self, index: usize) {
+        self.phase_begin(
+            export_key(index),
+            self.export_seq(index),
+            "exporting to image".to_string(),
+            false,
+            false,
+        );
         match &self.backend {
             Backend::Tty(tty) => {
                 let pb = tty.mp.add(ProgressBar::new_spinner());
@@ -556,6 +652,7 @@ impl Progress {
 
     pub fn export_done(&self, index: usize) {
         self.done.fetch_add(1, Ordering::Relaxed);
+        self.phase_end(export_key(index));
         let seq = self.export_seq(index);
         match &self.backend {
             Backend::Tty(tty) => {
@@ -592,6 +689,9 @@ impl Progress {
     /// failed when `!ok`.
     pub fn finish(&self, ok: bool) {
         let tag = if ok { "FINISHED" } else { "FAILED" };
+        // No heartbeat may land after the closing line.
+        self.stop_ticker();
+        self.phases.lock().unwrap().clear();
         // A successful build restores every cached prefix, so all pending is already in
         // `done`; fold in any remainder (a build that stopped before a restore) so the final
         // count is never stuck below total.
@@ -641,6 +741,14 @@ impl Progress {
         let Some(sm) = meta.stages.get(&stage) else {
             return;
         };
+        // The FROM cell pulls its base, from the cache registry when that holds it.
+        self.phase_begin(
+            (stage, num),
+            sm.seq(num),
+            clip(sm.label(num), HEARTBEAT_LABEL),
+            true,
+            num == 1,
+        );
         match &self.backend {
             Backend::Tty(tty) => {
                 let msg = format!("[{} {}/{}] {}", sm.name, num, sm.total, sm.label(num));
@@ -683,6 +791,7 @@ impl Progress {
         let started = self.cell_start.lock().unwrap().remove(&(stage, num));
         let ran = self.cell_ran.lock().unwrap().remove(&(stage, num));
         let elapsed = ran.or_else(|| started.map(|t| t.elapsed()));
+        self.phase_end((stage, num));
         if let Backend::Tty(tty) = &self.backend
             && let Some(pb) = tty.bars.lock().unwrap().remove(&(stage, num))
         {
@@ -734,6 +843,113 @@ impl Progress {
                 )),
             },
             Backend::Disabled => {}
+        }
+    }
+
+    /// The `#N` of `stage`'s `FROM` line, which a stage-wide phase's heartbeat carries.
+    fn stage_seq(&self, stage: StageId) -> usize {
+        self.meta
+            .get()
+            .and_then(|m| m.stages.get(&stage))
+            .map_or(0, |sm| sm.seq(1))
+    }
+
+    /// Track a long phase for the heartbeat (plain/routed only: the tty animates its own).
+    /// `metered` attaches the stage's pull meter, reset so it shows only this phase's pull.
+    fn phase_begin(
+        &self,
+        key: (StageId, usize),
+        seq: usize,
+        what: String,
+        running: bool,
+        metered: bool,
+    ) {
+        if !matches!(self.backend, Backend::Plain | Backend::Routed(_)) {
+            return;
+        }
+        let meter = metered.then(|| self.stage_meter(key.0));
+        if let Some(m) = &meter {
+            m.reset();
+        }
+        let now = Instant::now();
+        let phase = Phase {
+            seq,
+            what,
+            running,
+            since: now,
+            last: now,
+            meter,
+        };
+        self.phases.lock().unwrap().insert(key, phase);
+    }
+
+    fn phase_end(&self, key: (StageId, usize)) {
+        self.phases.lock().unwrap().remove(&key);
+    }
+
+    /// The heartbeat lines due at `now`: one for each phase that has not reported for
+    /// `every`, in `#N` order. Marks each as just reported.
+    fn due_beats(&self, now: Instant, every: Duration) -> Vec<String> {
+        let mut due: Vec<(usize, String)> = self
+            .phases
+            .lock()
+            .unwrap()
+            .values_mut()
+            .filter(|p| now.saturating_duration_since(p.last) >= every)
+            .map(|p| {
+                p.last = now;
+                (p.seq, heartbeat_line(p, now))
+            })
+            .collect();
+        due.sort();
+        due.into_iter().map(|(_, l)| l).collect()
+    }
+
+    /// Print the heartbeats due now. Each is a whole line through [`Progress::plain_line`],
+    /// so it never splits a line of stage output.
+    fn beat(&self) {
+        for line in self.due_beats(Instant::now(), HEARTBEAT) {
+            self.plain_line(format_args!("{line}"));
+        }
+    }
+
+    /// Start the heartbeat thread (plain/routed only, once). It holds the reporter weakly,
+    /// so a reporter dropped without [`Progress::finish`] still ends it.
+    fn start_ticker(self: &Arc<Self>) {
+        if !matches!(self.backend, Backend::Plain | Backend::Routed(_)) {
+            return;
+        }
+        let mut slot = self.ticker.lock().unwrap();
+        if slot.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel::<()>();
+        let me = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("vk-build-heartbeat".into())
+            .spawn(move || {
+                while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(HEARTBEAT_TICK) {
+                    match me.upgrade() {
+                        Some(p) => p.beat(),
+                        None => break,
+                    }
+                }
+            });
+        // Without the thread the build only loses its heartbeats.
+        if let Ok(handle) = spawned {
+            *slot = Some((tx, handle));
+        }
+    }
+
+    fn stop_ticker(&self) {
+        let ticker = self.ticker.lock().unwrap().take();
+        if let Some((tx, handle)) = ticker {
+            drop(tx);
+            // The last reference can drop on the ticker itself, which cannot join itself.
+            if handle.thread().id() != std::thread::current().id() {
+                // Ignored: a ticker that panicked only lost heartbeats.
+                let _ = handle.join();
+            }
         }
     }
 
@@ -863,6 +1079,11 @@ impl Progress {
                 for l in lines {
                     self.plain_line(format_args!("#{seq} {l}"));
                 }
+                // Output says the running step is alive: its heartbeat waits a full interval.
+                let num = self.cur.lock().unwrap().get(&stage).copied().unwrap_or(1);
+                if let Some(p) = self.phases.lock().unwrap().get_mut(&(stage, num)) {
+                    p.last = Instant::now();
+                }
             }
             Backend::Disabled => {}
         }
@@ -892,6 +1113,53 @@ impl Progress {
         } else {
             s.to_string()
         }
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        self.stop_ticker();
+    }
+}
+
+/// Whether a build reports in plain lines rather than the live dashboard: stdout is not a
+/// terminal, `TERM=dumb`, or `VIRTKIT_PROGRESS=plain`.
+pub(crate) fn plain_progress() -> bool {
+    let forced_plain = std::env::var("VIRTKIT_PROGRESS")
+        .map(|v| v == "plain")
+        .unwrap_or(false);
+    let dumb = std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false);
+    forced_plain || dumb || !std::io::stdout().is_terminal()
+}
+
+/// One heartbeat line for `p` at `now`: `#7 restoring stage builder from the cache… 40s
+/// (1.2 GiB of 3.4 GiB)`, or `#12 RUN cargo build still running, 2m10s` for a running cell.
+/// The byte figures appear once the phase's pull has counted something.
+fn heartbeat_line(p: &Phase, now: Instant) -> String {
+    let waited = fmt_wait(now.saturating_duration_since(p.since));
+    let mut line = if p.running {
+        format!("#{} {} still running, {waited}", p.seq, p.what)
+    } else {
+        format!("#{} {}… {waited}", p.seq, p.what)
+    };
+    match p.meter.as_ref().map(|m| m.get()) {
+        Some((done, total)) if total > 0 => line.push_str(&format!(
+            " ({} of {})",
+            crate::usage::fmt_bytes(done),
+            crate::usage::fmt_bytes(total)
+        )),
+        _ => {}
+    }
+    line
+}
+
+/// A wait as `40s`, `2m10s` or `1h05m` — whole seconds, as a heartbeat needs no more.
+pub(crate) fn fmt_wait(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
     }
 }
 
@@ -2303,5 +2571,207 @@ mod tests {
             !done.ends_with(" 0.0s"),
             "DONE line lost the run time: {done}"
         );
+    }
+
+    /// A routed reporter whose lines go nowhere, for the heartbeat tests.
+    fn routed() -> Arc<Progress> {
+        Progress::routed(Arc::new(|_: &str| {}))
+    }
+
+    /// Pin every tracked phase's start (and last beat) to `t0`, so `due_beats` can be driven
+    /// with exact offsets from it.
+    fn backdate(p: &Progress, t0: Instant) {
+        for ph in p.phases.lock().unwrap().values_mut() {
+            (ph.since, ph.last) = (t0, t0);
+        }
+    }
+
+    #[test]
+    fn fmt_wait_is_whole_seconds_then_minutes_then_hours() {
+        assert_eq!(fmt_wait(Duration::from_millis(9_900)), "9s");
+        assert_eq!(fmt_wait(Duration::from_secs(40)), "40s");
+        assert_eq!(fmt_wait(Duration::from_secs(130)), "2m10s");
+        assert_eq!(fmt_wait(Duration::from_secs(65)), "1m05s");
+        assert_eq!(fmt_wait(Duration::from_secs(3_900)), "1h05m");
+    }
+
+    #[test]
+    fn a_restore_beats_every_interval_with_its_pull_progress() {
+        let p = routed();
+        p.init(two_stages(), 1);
+        p.restore_start(1, "build");
+        // The executor's pull starts after the phase does (which resets the meter).
+        let meter = p.stage_meter(1);
+        meter.start(2 << 30);
+        meter.add(512 << 20);
+        let t0 = Instant::now();
+        backdate(&p, t0);
+        assert!(
+            p.due_beats(t0 + Duration::from_secs(9), HEARTBEAT)
+                .is_empty()
+        );
+        assert_eq!(
+            p.due_beats(t0 + HEARTBEAT, HEARTBEAT),
+            ["#2 restoring stage build from the cache… 10s (512 MiB of 2.0 GiB)"]
+        );
+        // Not again until another full interval has gone by.
+        assert!(
+            p.due_beats(t0 + Duration::from_secs(15), HEARTBEAT)
+                .is_empty()
+        );
+        assert_eq!(
+            p.due_beats(t0 + Duration::from_secs(20), HEARTBEAT),
+            ["#2 restoring stage build from the cache… 20s (512 MiB of 2.0 GiB)"]
+        );
+        p.restore_done(1);
+        assert!(
+            p.due_beats(t0 + Duration::from_secs(60), HEARTBEAT)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_phase_with_nothing_measured_reports_its_elapsed_only() {
+        let p = routed();
+        p.init(two_stages(), 1);
+        p.wait_lock_start(1, "build", "runner-7 job 42");
+        p.wait_mem_start(0, "base", 512);
+        p.restore_start(0, "base"); // a meter that never started
+        let t0 = Instant::now();
+        backdate(&p, t0);
+        // In `#N` order: stage 0's FROM is #1, stage 1's #2.
+        assert_eq!(
+            p.due_beats(t0 + Duration::from_secs(30), HEARTBEAT),
+            [
+                "#1 restoring stage base from the cache… 30s",
+                "#1 stage base waiting for host memory… 30s",
+                "#2 waiting for runner-7 job 42's build of stage build… 30s",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_running_step_beats_until_done_and_then_as_caching() {
+        let p = routed();
+        p.init(two_stages(), 1);
+        p.step_start(1, 0);
+        let t0 = Instant::now();
+        backdate(&p, t0);
+        assert_eq!(
+            p.due_beats(t0 + Duration::from_secs(130), HEARTBEAT),
+            ["#3 RUN cargo fetch still running, 2m10s"]
+        );
+        // The command is done: what is left is the snapshot, timed from here.
+        p.step_committing(1, 0);
+        let t1 = Instant::now();
+        backdate(&p, t1);
+        assert_eq!(
+            p.due_beats(t1 + HEARTBEAT, HEARTBEAT),
+            ["#3 caching the step's snapshot… 10s"]
+        );
+        p.step_done(1, 0, Outcome::Ran);
+        assert!(
+            p.due_beats(t1 + Duration::from_secs(60), HEARTBEAT)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn output_from_a_running_step_holds_its_heartbeat_off() {
+        let p = routed();
+        p.init(two_stages(), 1);
+        p.step_start(1, 0);
+        let Some(t0) = Instant::now().checked_sub(HEARTBEAT) else {
+            return; // a clock too young to date a phase back
+        };
+        backdate(&p, t0);
+        p.emit(1, 1, b"Compiling foo\n");
+        let now = Instant::now();
+        assert!(p.due_beats(now, HEARTBEAT).is_empty());
+        assert_eq!(
+            p.due_beats(now + HEARTBEAT, HEARTBEAT).len(),
+            1,
+            "a full interval after the output, it beats again"
+        );
+    }
+
+    #[test]
+    fn export_and_finishing_beat_and_finish_stops_the_ticker() {
+        let p = routed();
+        p.init(two_stages(), 1);
+        assert!(p.ticker.lock().unwrap().is_some(), "init starts the ticker");
+        p.stage_finishing_start(1, "build");
+        p.export_start(0);
+        let t0 = Instant::now();
+        backdate(&p, t0);
+        assert_eq!(
+            p.due_beats(t0 + HEARTBEAT, HEARTBEAT),
+            [
+                "#2 finishing stage build… 10s",
+                "#5 exporting to image… 10s"
+            ]
+        );
+        p.finish(false);
+        assert!(
+            p.ticker.lock().unwrap().is_none(),
+            "finish stops the ticker"
+        );
+        assert!(p.phases.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_plain_and_routed_track_phases() {
+        for p in [
+            Arc::new(Progress::new_backend(
+                Backend::Tty(Box::new(Tty::new())),
+                false,
+            )),
+            Progress::disabled(),
+        ] {
+            p.init(two_stages(), 1);
+            p.restore_start(1, "build");
+            p.step_start(1, 0);
+            assert!(p.phases.lock().unwrap().is_empty());
+            assert!(p.ticker.lock().unwrap().is_none());
+        }
+    }
+
+    /// The thread itself: with a short interval it prints through the routed sink, and the
+    /// reporter's drop ends it.
+    #[test]
+    fn the_ticker_prints_due_beats_through_the_sink() {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |l: &str| lines.lock().unwrap().push(l.to_string()))
+                as Arc<dyn Fn(&str) + Send + Sync>
+        };
+        let p = Progress::routed(sink);
+        p.init(two_stages(), 1);
+        p.restore_start(1, "build");
+        let Some(due) = Instant::now().checked_sub(HEARTBEAT) else {
+            return; // a clock too young to date a phase back
+        };
+        backdate(&p, due);
+        let deadline = Instant::now() + 5 * HEARTBEAT_TICK;
+        while Instant::now() < deadline
+            && !lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("#2 restoring"))
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("#2 restoring")),
+            "no heartbeat: {:?}",
+            lines.lock().unwrap()
+        );
+        drop(p);
     }
 }

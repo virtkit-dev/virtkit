@@ -122,6 +122,12 @@ All notable changes to virtkit will be documented in this file.
   gitlab-runner shows — its systemd unit, unmasked, or a `gitlab-runner` on systemd's `PATH` —
   and `"none"` otherwise. A host whose runner `vk node` cannot see, such as one in a container,
   must set `[node] runner = "external"`.
+- **Build logs off a terminal no longer go quiet during long phases.** In a CI job's log, or
+  with `VIRTKIT_PROGRESS=plain`, a build says every 10 seconds what it is still doing and for
+  how long: a step with no output, restoring cached stages (with how much has been restored),
+  waiting on another runner's build of the same stage, a stage first in line for host memory,
+  finishing a stage, exporting the image. A wait on another job's pull or build of the same
+  image says so too.
 - **`vk check --feature gitlab` requires a `gitlab-runner` in `[executor] tools_dir` only where
   one runs on the host** — one `vk node` manages, or one on systemd's `PATH`. Jobs a hub places
   need only `git` there.
